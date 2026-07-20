@@ -1,6 +1,6 @@
 import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
 import { isPtyControlInput } from "./ptyCommandRuntime";
-import { applyShellCwd, looksDangerousShellCommand } from "./toolExecutionContract";
+import { looksDangerousShellCommand } from "./toolExecutionContract";
 
 type ShellPermissionPreflight = (
   command: string,
@@ -39,12 +39,7 @@ export function getShellPermissionCommandForTool(
 ): string | null {
   if (toolName === "run_command" || toolName === "execute_command") {
     const command = asNonEmptyString(args.command);
-    if (!command) return null;
-    try {
-      return applyShellCwd(command, args);
-    } catch {
-      return command;
-    }
+    return command;
   }
 
   if (toolName === "send_pty_input") {

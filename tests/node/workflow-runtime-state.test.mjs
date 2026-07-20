@@ -222,11 +222,11 @@ test("a terminal conclusion child is created only after its owner was already pa
   );
   assert.match(
     terminalSource,
-    /const preTerminalEvent = [\s\S]*isRunTerminalEvent\(event\)[\s\S]*event\.runId === preTerminalRunId/,
+    /const preConclusionLifecycleEvent = [\s\S]*isRunTerminalEvent\(event\) \|\| isRunBoundaryEvent\(event\)[\s\S]*event\.runId === preTerminalRunId/,
   );
   assert.match(
     terminalSource,
-    /if \(loopOutcome\.status !== "paused" && preTerminalEvent\?\.type === "run\.paused"\) \{\s*if \(!beginTerminalConclusionRun\(preTerminalRunId, loopOutcome\.reason\)\) \{[\s\S]*return true;[\s\S]*\}\s*\}/,
+    /if \(loopOutcome\.status !== "paused" && preConclusionLifecycleEvent\?\.type === "run\.paused"\) \{\s*if \(!beginTerminalConclusionRun\(preTerminalRunId, loopOutcome\.reason\)\) \{[\s\S]*return true;[\s\S]*\}\s*\}/,
   );
 });
 
@@ -1979,7 +1979,7 @@ test("read-only batch-loop exhaustion records a checkpoint and closes the Turn",
   );
   assert.match(
     workflowSource,
-    /const runTerminalEvent = outcome\.status === "completed"[\s\S]*type: "run\.completed"/,
+    /const runConclusionEvent = outcome\.status === "completed"[\s\S]*type: "run\.completed"/,
   );
   assert.match(workflowSource, /const turnTerminalEvent = closesLogicalTurn[\s\S]*type: "turn\.completed"/);
 });

@@ -1,9 +1,63 @@
 {
+  "schemaVersion": 1,
   "id": "unity-mcp-trace-loop",
   "category": "long_horizon",
-  "success": true,
-  "retries": 2,
-  "hallucinations": 0,
-  "latencyMs": 4200,
-  "toolCalls": 9
+  "trace": [
+    {
+      "sequence": 1,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "scene-snapshot",
+      "toolCall": "unity_scene_snapshot",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 2
+    },
+    {
+      "sequence": 2,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "apply-change",
+      "toolCall": "unity_apply_change",
+      "success": false,
+      "resultKind": "error",
+      "latencyMs": 3
+    },
+    {
+      "sequence": 3,
+      "attempt": 2,
+      "eventName": "tool_called",
+      "stepId": "apply-change",
+      "toolCall": "unity_apply_change",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 3
+    },
+    {
+      "sequence": 4,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "run-tests",
+      "toolCall": "unity_run_tests",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 4
+    },
+    {
+      "sequence": 5,
+      "attempt": 1,
+      "eventName": "task_completed",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 0
+    }
+  ],
+  "expect": {
+    "resultKind": "success",
+    "eventOrder": ["tool_called", "tool_called", "tool_called", "tool_called", "task_completed"],
+    "requiredTools": ["unity_scene_snapshot", "unity_apply_change", "unity_run_tests"],
+    "allowedTools": ["unity_scene_snapshot", "unity_apply_change", "unity_run_tests"],
+    "maxRetries": 1,
+    "maxToolCalls": 4
+  }
 }

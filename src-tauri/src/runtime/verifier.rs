@@ -1,10 +1,8 @@
 use crate::harness::permissions::PermissionGuard;
+use crate::trusted_execution::execute_trusted_shell;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-use tokio::process::Command;
-use tokio::time::timeout;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,38 +77,31 @@ impl Verifier {
             .validate(command)
             .map_err(|error| error.to_string())?;
 
-        let started_at = Instant::now();
-        let mut process = build_shell_command(command);
-        process
-            .current_dir(&self.workspace_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = match timeout(timeout_duration, process.output()).await {
-            Ok(output) => output.map_err(|error| format!("执行验证命令失败: {error}"))?,
-            Err(_) => {
-                return Ok(VerificationResult {
-                    command: command.to_string(),
-                    success: false,
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: format!("验证命令超时: {}ms", timeout_duration.as_millis()),
-                    timed_out: true,
-                    duration_ms: started_at.elapsed().as_millis(),
-                })
-            }
-        };
+        // Verification is production execution too: it must share the exact
+        // shell parser, argv path containment, canonical cwd, output bounds,
+        // process-group timeout, and child-reaping boundary used by tools.
+        let output = execute_trusted_shell(
+            &self.workspace_root,
+            &self.workspace_root,
+            command,
+            timeout_duration,
+            None,
+        )
+        .await
+        .map_err(|error| format!("执行验证命令失败: {error}"))?;
 
         Ok(VerificationResult {
             command: command.to_string(),
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            timed_out: false,
-            duration_ms: started_at.elapsed().as_millis(),
+            success: output.success,
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: if output.timed_out && output.stderr.is_empty() {
+                format!("验证命令超时: {}ms", timeout_duration.as_millis())
+            } else {
+                output.stderr
+            },
+            timed_out: output.timed_out,
+            duration_ms: output.duration_ms,
         })
     }
 
@@ -124,18 +115,6 @@ impl Verifier {
             results.push(self.verify(kind.clone(), timeout_duration).await?);
         }
         Ok(results)
-    }
-}
-
-fn build_shell_command(command: &str) -> Command {
-    if cfg!(target_os = "windows") {
-        let mut process = Command::new("cmd");
-        process.args(["/C", command]);
-        process
-    } else {
-        let mut process = Command::new("/bin/sh");
-        process.args(["-lc", command]);
-        process
     }
 }
 
@@ -174,5 +153,28 @@ mod tests {
         assert_eq!(VerificationKind::CargoTest.command(), "cargo test");
         assert_eq!(VerificationKind::NpmRunBuild.command(), "npm run build");
         assert_eq!(VerificationKind::NpmRunLint.command(), "npm run lint");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_rejects_argv_symlink_escape_after_permission_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        let verifier = Verifier::new(
+            workspace.path(),
+            PermissionGuard::new(PermissionConfig::default_runtime_foundation()),
+        );
+
+        runtime.block_on(async {
+            verifier
+                .verify_command("ls escape", Duration::from_secs(1))
+                .await
+                .expect_err("verification argv must not escape through a symlink");
+        });
     }
 }

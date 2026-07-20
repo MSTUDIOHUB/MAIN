@@ -523,7 +523,7 @@ test("run transition reducer atomically enforces action-request lifecycle invari
   assert.equal(terminal.activeActionRequest, null);
 });
 
-test("run transition reducer preserves requests on terminal conflicts and clears only accepted exact terminals", () => {
+test("run transition reducer accepts conclusions after pauses and clears only exact run controls", () => {
   const request = actionRequests.buildPlanReviewActionRequest({
     sessionKey: "session-conflict",
     turnId: "turn-conflict",
@@ -549,7 +549,7 @@ test("run transition reducer preserves requests on terminal conflicts and clears
     { type: "action_required", request, events: [paused] },
   );
 
-  const lateConflictingTerminal = runTransitions.reduceRunTransition(pending, {
+  const completedAfterPause = runTransitions.reduceRunTransition(pending, {
     type: "runtime_event",
     event: turnEvents.withEventSchema({
       type: "run.completed",
@@ -561,12 +561,12 @@ test("run transition reducer preserves requests on terminal conflicts and clears
       resultKind: "error",
     }),
   });
-  assert.equal(lateConflictingTerminal.activeActionRequest, request);
-  assert.deepEqual(lateConflictingTerminal.runtimeEvents.map((event) => event.type), ["run.paused"]);
+  assert.equal(completedAfterPause.activeActionRequest, null);
+  assert.deepEqual(completedAfterPause.runtimeEvents.map((event) => event.type), ["run.paused", "run.completed"]);
 
   const lateLegacyFailure = runTransitions.reduceRunTransition(pending, {
     type: "runtime_event",
-    event: turnEvents.withEventSchema({
+    event: turnEvents.normalizePersistedMainThreadEvent({
       type: "run.failed",
       threadId: "session-conflict",
       turnId: "turn-conflict",
@@ -576,8 +576,9 @@ test("run transition reducer preserves requests on terminal conflicts and clears
       error: { message: "persisted legacy terminal arrived late" },
     }),
   });
-  assert.equal(lateLegacyFailure.activeActionRequest, request);
-  assert.deepEqual(lateLegacyFailure.runtimeEvents.map((event) => event.type), ["run.paused"]);
+  assert.equal(lateLegacyFailure.activeActionRequest, null);
+  assert.deepEqual(lateLegacyFailure.runtimeEvents.map((event) => event.type), ["run.paused", "run.completed"]);
+  assert.equal(lateLegacyFailure.runtimeEvents.at(-1).resultKind, "error");
 
   const otherRunAborted = runTransitions.reduceRunTransition(
     { activeActionRequest: request, runtimeEvents: [] },

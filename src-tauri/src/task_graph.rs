@@ -48,6 +48,10 @@ pub struct TaskGraphStepResult {
 #[serde(rename_all = "camelCase")]
 pub struct TaskGraphExecution {
     pub graph_id: String,
+    /// Legacy serialized executions had no run identity. Deserialize them as
+    /// explicitly unscoped instead of inventing an identity that has no trace.
+    #[serde(default)]
+    pub run_id: String,
     pub success: bool,
     pub waves: Vec<Vec<String>>,
     pub results: Vec<TaskGraphStepResult>,
@@ -55,6 +59,10 @@ pub struct TaskGraphExecution {
 }
 
 pub trait TaskGraphRunner {
+    fn run_id(&self) -> Option<&str> {
+        None
+    }
+
     fn run<'a>(&'a self, node: TaskNode) -> TaskGraphFuture<'a, TaskGraphStepResult>;
 }
 
@@ -143,12 +151,20 @@ impl TaskGraph {
 
         Ok(TaskGraphExecution {
             graph_id: self.id.clone(),
+            run_id: runner
+                .run_id()
+                .map(str::to_string)
+                .unwrap_or_else(new_task_graph_run_id),
             success,
             waves: completed_waves,
             results,
             latency_ms: started_at.elapsed().as_millis(),
         })
     }
+}
+
+fn new_task_graph_run_id() -> String {
+    format!("graph-run-{:032x}", rand::random::<u128>())
 }
 
 #[cfg(test)]
@@ -223,6 +239,7 @@ mod tests {
             let execution = graph.execute(&EchoRunner).await.unwrap();
 
             assert!(execution.success);
+            assert!(execution.run_id.starts_with("graph-run-"));
             assert_eq!(execution.results.len(), 2);
             assert_eq!(execution.waves, vec![vec!["a"], vec!["b"]]);
         });

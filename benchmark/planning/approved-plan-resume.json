@@ -1,9 +1,43 @@
 {
+  "schemaVersion": 1,
   "id": "approved-plan-resume",
   "category": "planning",
-  "success": true,
-  "retries": 0,
-  "hallucinations": 0,
-  "latencyMs": 950,
-  "toolCalls": 3
+  "trace": [
+    {
+      "sequence": 1,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "restore-checkpoint",
+      "toolCall": "restore_plan_checkpoint",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 2
+    },
+    {
+      "sequence": 2,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "verify-artifact",
+      "toolCall": "verify_plan_artifact",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 3
+    },
+    {
+      "sequence": 3,
+      "attempt": 1,
+      "eventName": "task_completed",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 0
+    }
+  ],
+  "expect": {
+    "resultKind": "success",
+    "eventOrder": ["tool_called", "tool_called", "task_completed"],
+    "requiredTools": ["restore_plan_checkpoint", "verify_plan_artifact"],
+    "allowedTools": ["restore_plan_checkpoint", "verify_plan_artifact"],
+    "maxRetries": 0,
+    "maxToolCalls": 2
+  }
 }

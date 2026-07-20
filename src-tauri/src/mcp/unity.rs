@@ -3,6 +3,7 @@ use crate::mcp::{
     arg_bool, arg_str, descriptor, result, workspace_path, McpToolCall, McpToolDescriptor,
     McpToolDomain, McpToolResult,
 };
+use crate::trusted_execution::WorkspacePathMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -229,7 +230,7 @@ fn patch_text_asset(
     let find = arg_str(&call.arguments, "find").ok_or("Unity patch tool requires find")?;
     let replace = arg_str(&call.arguments, "replace").ok_or("Unity patch tool requires replace")?;
     let dry_run = arg_bool(&call.arguments, "dryRun", false);
-    let path = workspace_path(workspace, raw_path)?;
+    let path = workspace_path(workspace, raw_path, WorkspacePathMode::Existing)?;
     if path.extension().and_then(|extension| extension.to_str())
         != Some(expected_extension.trim_start_matches('.'))
     {
@@ -268,7 +269,7 @@ fn patch_text_asset(
 }
 
 fn read_workspace_text(workspace: &Path, raw_path: &str) -> Result<String, String> {
-    let path = workspace_path(workspace, raw_path)?;
+    let path = workspace_path(workspace, raw_path, WorkspacePathMode::Existing)?;
     std::fs::read_to_string(&path)
         .map_err(|error| format!("read scene failed {}: {error}", path.display()))
 }
@@ -342,6 +343,7 @@ mod tests {
                 &McpToolCall {
                     id: "prefab".to_string(),
                     task_id: "task".to_string(),
+                    run_id: None,
                     tool: "unity.edit_prefab".to_string(),
                     arguments: json!({
                         "path": "Assets/Cube.prefab",

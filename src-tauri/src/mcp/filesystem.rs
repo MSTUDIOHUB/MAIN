@@ -3,6 +3,7 @@ use crate::mcp::{
     arg_str, descriptor, result, workspace_path, McpToolCall, McpToolDescriptor, McpToolDomain,
     McpToolResult,
 };
+use crate::trusted_execution::WorkspacePathMode;
 use serde_json::json;
 use std::path::Path;
 use std::time::Instant;
@@ -50,7 +51,7 @@ pub async fn call(
         "filesystem.read" => {
             let raw_path =
                 arg_str(&call.arguments, "path").ok_or("filesystem.read requires path")?;
-            let path = workspace_path(workspace, raw_path)?;
+            let path = workspace_path(workspace, raw_path, WorkspacePathMode::Existing)?;
             let content = tokio::fs::read_to_string(&path).await.map_err(|error| {
                 format!("MCP filesystem.read failed {}: {error}", path.display())
             })?;
@@ -68,11 +69,18 @@ pub async fn call(
                 arg_str(&call.arguments, "path").ok_or("filesystem.write requires path")?;
             let content =
                 arg_str(&call.arguments, "content").ok_or("filesystem.write requires content")?;
-            let path = workspace_path(workspace, raw_path)?;
-            if let Some(parent) = path.parent() {
+            let initial_path =
+                workspace_path(workspace, raw_path, WorkspacePathMode::AllowMissing)?;
+            if let Some(parent) = initial_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|error| format!("MCP filesystem.write mkdir failed: {error}"))?;
+            }
+            let path = workspace_path(workspace, raw_path, WorkspacePathMode::AllowMissing)?;
+            if path != initial_path {
+                return Err(
+                    "MCP filesystem.write path changed before mutation; write rejected".to_string(),
+                );
             }
             tokio::fs::write(&path, content).await.map_err(|error| {
                 format!("MCP filesystem.write failed {}: {error}", path.display())
@@ -88,7 +96,7 @@ pub async fn call(
         }
         "filesystem.list" => {
             let raw_path = arg_str(&call.arguments, "path").unwrap_or(".");
-            let path = workspace_path(workspace, raw_path)?;
+            let path = workspace_path(workspace, raw_path, WorkspacePathMode::Existing)?;
             let mut entries = Vec::new();
             let mut reader = tokio::fs::read_dir(&path).await.map_err(|error| {
                 format!("MCP filesystem.list failed {}: {error}", path.display())

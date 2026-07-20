@@ -3,6 +3,8 @@ import type { GameStudioSlashResolution } from "../lib/gameStudio";
 import type {
   GameStudioLocalSlashAppendOptions,
   GameStudioLocalSlashAppendResult,
+  GameStudioLocalSlashConclusionResolution,
+  GameStudioLocalSlashTerminalContext,
 } from "./gameStudioLocalSlashBridge";
 import {
   getGameStudioSlashCommandSpec,
@@ -26,7 +28,13 @@ export interface GameStudioLocalSlashSubmissionInput {
   turnId: string;
   runtimeService: GameStudioLocalSlashRuntimeService;
   getGameStudioInitialized: () => boolean;
-  setActiveStudioAgentKey: (
+  /**
+   * Linearization boundary for the local side effect. The callback must check
+   * cancellation and commit synchronously before returning its Promise. Once
+   * invoked successfully, a later abort cannot rewrite the committed action as
+   * canceled.
+   */
+  commitActiveStudioAgentKey: (
     agent: StudioAgentKey,
     options: { persistToWorkspace: boolean },
   ) => Promise<void>;
@@ -34,6 +42,22 @@ export interface GameStudioLocalSlashSubmissionInput {
     systemContent: string,
     options?: GameStudioLocalSlashAppendOptions,
   ) => Promise<GameStudioLocalSlashAppendResult | void>;
+  /**
+   * Last-resort presentation repair when exact Turn adoption changed while a
+   * local-fast command was awaiting asynchronous work. The runtime terminal
+   * events are still authoritative; this callback guarantees their visible
+   * assistant conclusion without rerunning the command.
+   */
+  ensureVisibleConclusion: (input: {
+    content: string;
+    terminal: GameStudioLocalSlashTerminalContext;
+    rejectedAppend: Extract<GameStudioLocalSlashAppendResult, { disposition: "rejected" }> | null;
+    slashFailure: {
+      command: string;
+      executionMode: "local_fast" | "model_workflow";
+      error: { message: string };
+    };
+  }) => Promise<GameStudioLocalSlashConclusionResolution> | GameStudioLocalSlashConclusionResolution;
   emitRuntimeEvent: (event: MainThreadEventInput) => void;
   logStoreEvent: (event: string, data: Record<string, unknown>) => void;
   /** Optional exact run identity supplied by the workspace dispatcher. */
@@ -42,14 +66,27 @@ export interface GameStudioLocalSlashSubmissionInput {
   /** Local slash cancellation is terminal and still receives a visible conclusion. */
   abortSignal?: AbortSignal;
   nowMs?: () => number;
+  /** Absolute wall-clock budget shared by side effect, projection, and repair. */
+  executionTimeoutMs?: number;
 }
 
 export interface GameStudioLocalSlashCompletionResult {
   turnId: string;
   runId: string;
-  resultKind: "success" | "error" | "canceled";
+  resultKind: "success" | "partial" | "blocked" | "error" | "canceled";
   summary: string;
   conclusionAppended: boolean;
+  conclusionOwner: (
+    | GameStudioLocalSlashConclusionResolution
+    | {
+        disposition: "original_appended";
+        turnId: string;
+        runId: string;
+        parentRunId: string | null;
+        resultKind: "success" | "error" | "canceled";
+        summary: string;
+      }
+  ) | null;
   appendResult: GameStudioLocalSlashAppendResult | null;
   error?: { message: string };
 }
@@ -101,6 +138,44 @@ class LocalSlashCanceledError extends Error {
   }
 }
 
+class LocalSlashExecutionTimeoutError extends Error {
+  constructor(step: string, timeoutMs: number) {
+    super(`Local slash execution timed out after ${timeoutMs}ms while awaiting ${step}`);
+    this.name = "LocalSlashExecutionTimeoutError";
+  }
+}
+
+const DEFAULT_LOCAL_SLASH_EXECUTION_TIMEOUT_MS = 8_000;
+
+function awaitLocalSlashExecutionStep<T>(input: {
+  promise: PromiseLike<T> | T;
+  step: string;
+  deadlineAt: number;
+  timeoutMs: number;
+  now: () => number;
+}): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      callback();
+    };
+    const remainingMs = Math.max(0, input.deadlineAt - input.now());
+    const timeoutId = setTimeout(
+      () => finish(() => reject(
+        new LocalSlashExecutionTimeoutError(input.step, input.timeoutMs),
+      )),
+      remainingMs,
+    );
+    Promise.resolve(input.promise).then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
 function assertNotCanceled(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new LocalSlashCanceledError();
 }
@@ -134,6 +209,11 @@ export function startGameStudioLocalSlashSubmission(
   }
 
   const now = input.nowMs || Date.now;
+  const executionTimeoutMs = Math.max(
+    1,
+    Number(input.executionTimeoutMs) || DEFAULT_LOCAL_SLASH_EXECUTION_TIMEOUT_MS,
+  );
+  const executionDeadlineAt = Date.now() + executionTimeoutMs;
   const runId = input.runId || `run-local-slash-${input.turnId}`;
   const parentRunId = input.parentRunId ?? null;
   input.emitRuntimeEvent({
@@ -154,37 +234,21 @@ export function startGameStudioLocalSlashSubmission(
   });
 
   const completion: Promise<GameStudioLocalSlashCompletionResult> = (async () => {
-    let terminalEmitted = false;
-    const emitTerminal = (
-      resultKind: GameStudioLocalSlashCompletionResult["resultKind"],
-      summary: string,
-    ) => {
-      if (terminalEmitted) return;
-      terminalEmitted = true;
-      const timestampMs = now();
-      input.emitRuntimeEvent({
-        type: "run.completed",
-        threadId: input.runSessionKey,
-        turnId: input.turnId,
-        timestampMs,
-        runId,
-        parentRunId,
-        resultKind,
-        summary,
-      });
-      input.emitRuntimeEvent({
-        type: "turn.completed",
-        threadId: input.runSessionKey,
-        turnId: input.turnId,
-        timestampMs,
-        resultKind,
-      });
-    };
+    // Let the caller install the exact controller/claim lease before any local
+    // side effect or terminal transaction can run.
+    await Promise.resolve();
+    let sideEffectCommitted = false;
     const appendConclusion = async (
       content: string,
       options: GameStudioLocalSlashAppendOptions,
     ): Promise<GameStudioLocalSlashAppendResult | null> => normalizeAppendResult(
-      await input.appendLocalStudioTurn(content, options),
+      await awaitLocalSlashExecutionStep({
+        promise: input.appendLocalStudioTurn(content, options),
+        step: "the terminal projection",
+        deadlineAt: executionDeadlineAt,
+        timeoutMs: executionTimeoutMs,
+        now: Date.now,
+      }),
     );
 
     try {
@@ -192,88 +256,152 @@ export function startGameStudioLocalSlashSubmission(
       let appendResult: GameStudioLocalSlashAppendResult | null;
       if (resolution.kind === "agent") {
         const agent = normalizeStudioAgentKey(resolution.slug);
-        await input.setActiveStudioAgentKey(agent, {
+        assertNotCanceled(input.abortSignal);
+        const commit = input.commitActiveStudioAgentKey(agent, {
           persistToWorkspace: input.getGameStudioInitialized(),
         });
-        assertNotCanceled(input.abortSignal);
+        sideEffectCommitted = true;
+        await awaitLocalSlashExecutionStep({
+          promise: commit,
+          step: "the specialist switch persistence",
+          deadlineAt: executionDeadlineAt,
+          timeoutMs: executionTimeoutMs,
+          now: Date.now,
+        });
         const summary = buildAgentSwitchMessage(agent, input.preferredLanguage);
         appendResult = await appendConclusion(summary, {
-          terminal: {
-            runId,
-            parentRunId,
-            resultKind: "success",
-            reason: "local_slash_completed",
+          presentation: "assistant_final",
+          lifecycle: {
+            terminal: {
+              runId,
+              parentRunId,
+              resultKind: "success",
+              reason: "local_slash_completed",
+            },
+            slash: {
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+              outcome: "completed",
+            },
           },
         });
       } else if (resolution.kind === "auto") {
-        await input.setActiveStudioAgentKey("studio_auto", {
+        assertNotCanceled(input.abortSignal);
+        const commit = input.commitActiveStudioAgentKey("studio_auto", {
           persistToWorkspace: input.getGameStudioInitialized(),
         });
-        assertNotCanceled(input.abortSignal);
+        sideEffectCommitted = true;
+        await awaitLocalSlashExecutionStep({
+          promise: commit,
+          step: "the auto-orchestration persistence",
+          deadlineAt: executionDeadlineAt,
+          timeoutMs: executionTimeoutMs,
+          now: Date.now,
+        });
         const summary = buildAutoSwitchMessage(input.preferredLanguage);
         appendResult = await appendConclusion(summary, {
-          terminal: {
-            runId,
-            parentRunId,
-            resultKind: "success",
-            reason: "local_slash_completed",
+          presentation: "assistant_final",
+          lifecycle: {
+            terminal: {
+              runId,
+              parentRunId,
+              resultKind: "success",
+              reason: "local_slash_completed",
+            },
+            slash: {
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+              outcome: "completed",
+            },
           },
         });
       } else {
+        assertNotCanceled(input.abortSignal);
         appendResult = await appendConclusion(resolution.content, {
           systemVariant: resolution.systemVariant,
-          terminal: {
-            runId,
-            parentRunId,
-            resultKind: "success",
-            reason: "local_slash_completed",
+          presentation: "assistant_final",
+          lifecycle: {
+            terminal: {
+              runId,
+              parentRunId,
+              resultKind: "success",
+              reason: "local_slash_completed",
+            },
+            slash: {
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+              outcome: "completed",
+            },
           },
         });
       }
 
-      input.emitRuntimeEvent({
-        type: "slash.command.completed",
-        threadId: input.runSessionKey,
-        turnId: input.turnId,
-        timestampMs: now(),
-        command: spec.canonicalCommand,
-        executionMode: spec.executionMode,
-      });
       const summary = resolution.kind === "local_markdown"
         ? resolution.content
         : resolution.kind === "agent"
           ? buildAgentSwitchMessage(normalizeStudioAgentKey(resolution.slug), input.preferredLanguage)
           : buildAutoSwitchMessage(input.preferredLanguage);
-      emitTerminal("success", summary);
       return {
         turnId: input.turnId,
         runId,
         resultKind: "success" as const,
         summary,
         conclusionAppended: true,
+        conclusionOwner: {
+          disposition: "original_appended",
+          turnId: input.turnId,
+          runId,
+          parentRunId,
+          resultKind: "success",
+          summary,
+        },
         appendResult,
       };
     } catch (error) {
-      const canceled = input.abortSignal?.aborted === true || error instanceof LocalSlashCanceledError;
-      const message = error instanceof Error ? error.message : String(error || "Unknown slash command error");
+      const abortRequested = error instanceof LocalSlashCanceledError ||
+        input.abortSignal?.aborted === true;
+      const canceled = abortRequested && !sideEffectCommitted;
+      const rawMessage = error instanceof Error
+        ? error.message
+        : String(error || "Unknown slash command error");
+      const message = abortRequested && sideEffectCommitted
+        ? "Local slash execution was interrupted after its local side effect committed"
+        : rawMessage;
       const resultKind = canceled ? "canceled" as const : "error" as const;
       const summary = canceled
         ? buildSlashCanceledMessage(input.preferredLanguage)
         : buildSlashFailureMessage(message, input.preferredLanguage);
       let appendResult: GameStudioLocalSlashAppendResult | null = null;
       let conclusionAppended = false;
+      let conclusionOwner: GameStudioLocalSlashCompletionResult["conclusionOwner"] = null;
       let conclusionError: string | null = null;
       try {
         appendResult = await appendConclusion(summary, {
           presentation: "assistant_final",
-          terminal: {
-            runId,
-            parentRunId,
-            resultKind,
-            reason: canceled ? "local_slash_canceled" : "local_slash_error",
+          lifecycle: {
+            terminal: {
+              runId,
+              parentRunId,
+              resultKind,
+              reason: canceled ? "local_slash_canceled" : "local_slash_error",
+            },
+            slash: {
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+              outcome: "failed",
+              error: { message },
+            },
           },
         });
         conclusionAppended = true;
+        conclusionOwner = {
+          disposition: "original_appended",
+          turnId: input.turnId,
+          runId,
+          parentRunId,
+          resultKind,
+          summary,
+        };
       } catch (appendError) {
         conclusionError = appendError instanceof Error
           ? appendError.message
@@ -288,22 +416,54 @@ export function startGameStudioLocalSlashSubmission(
           message: conclusionError,
         });
       }
-      input.emitRuntimeEvent({
-        type: "slash.command.failed",
-        threadId: input.runSessionKey,
-        turnId: input.turnId,
-        timestampMs: now(),
-        command: spec.canonicalCommand,
-        executionMode: spec.executionMode,
-        error: { message },
-      });
-      emitTerminal(resultKind, summary);
+      if (!conclusionAppended) {
+        try {
+          const conclusionResolution = await awaitLocalSlashExecutionStep({
+            promise: input.ensureVisibleConclusion({
+              content: summary,
+              terminal: {
+                runId,
+                parentRunId,
+                resultKind,
+                reason: canceled ? "local_slash_canceled" : "local_slash_error",
+                timestampMs: now(),
+              },
+              rejectedAppend: appendResult?.disposition === "rejected" ? appendResult : null,
+              slashFailure: {
+                command: spec.canonicalCommand,
+                executionMode: spec.executionMode,
+                error: { message },
+              },
+            }),
+            step: "the visible conclusion repair",
+            deadlineAt: executionDeadlineAt,
+            timeoutMs: executionTimeoutMs,
+            now: Date.now,
+          });
+          conclusionAppended = true;
+          conclusionOwner = conclusionResolution;
+        } catch (repairError) {
+          const repairMessage = repairError instanceof Error
+            ? repairError.message
+            : String(repairError || "Unknown local slash conclusion repair error");
+          conclusionError = conclusionError
+            ? `${conclusionError}; ${repairMessage}`
+            : repairMessage;
+          input.logStoreEvent("game_studio_local_slash_conclusion_repair_failed", {
+            turnId: input.turnId,
+            runId,
+            resultKind,
+            message: repairMessage,
+          });
+        }
+      }
       return {
         turnId: input.turnId,
         runId,
-        resultKind,
-        summary,
+        resultKind: conclusionOwner?.resultKind || resultKind,
+        summary: conclusionOwner?.summary || summary,
         conclusionAppended,
+        conclusionOwner,
         appendResult,
         error: { message: conclusionError ? `${message}; ${conclusionError}` : message },
       };

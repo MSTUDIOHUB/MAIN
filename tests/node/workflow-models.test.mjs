@@ -115,6 +115,7 @@ const {
   normalizeConversationDisplayTitle,
   normalizeResponseLanguagePolicy,
   planTaskHasUnsatisfiedSourceMutationEvidence,
+  projectAgentLoopStatusToConversationTurnRuntimeStatus,
   reconcilePlanTaskCompletion,
   resolvePlanExecutionEvidenceIdentity,
   resolveTurnResponseLanguage,
@@ -643,7 +644,7 @@ test("deriveVisibleConversationTurnStatus never lets Plan globals reopen a termi
     hasTasksArtifact: true,
   };
 
-  for (const resultKind of ["success", "partial", "blocked", "error"]) {
+  for (const resultKind of ["success", "partial", "blocked", "error", "canceled"]) {
     const visibleStatus = deriveVisibleConversationTurnStatus({
       ...base,
       runtimeOutcome: {
@@ -669,6 +670,12 @@ test("deriveVisibleConversationTurnStatus never lets Plan globals reopen a termi
       updatedAt: 11,
     },
   }), "canceled");
+});
+
+test("agent-loop cancellation closes the UI Turn while legacy aborted outcomes remain readable", () => {
+  assert.equal(projectAgentLoopStatusToConversationTurnRuntimeStatus("completed"), "completed");
+  assert.equal(projectAgentLoopStatusToConversationTurnRuntimeStatus("paused"), "paused");
+  assert.equal(projectAgentLoopStatusToConversationTurnRuntimeStatus("aborted"), "completed");
 });
 
 test("deriveVisibleConversationTurnStatus keeps awaiting approval visible before plan execution starts", () => {

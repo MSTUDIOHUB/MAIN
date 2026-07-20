@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::process::{
     Child as ProcessChild, ChildStdin, Command as ProcessCommand, ExitStatus, Stdio,
@@ -22,6 +22,15 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
+
+use crate::network_guard::{
+    is_explicit_local_network_url, AuthorizedNetworkTarget, NetworkGrant, NetworkGuardError,
+};
+use crate::session_store::{
+    CompareAndSwapSessionSnapshotRequest, ImportLegacySnapshotIfAbsentRequest,
+    LegacyWorkspaceImportRecord, SessionKey, SessionSnapshotRecord, SessionStore,
+    SessionStoreError,
+};
 
 #[cfg(unix)]
 use std::os::raw::c_int;
@@ -37,9 +46,12 @@ pub mod indexer;
 pub mod knowledge;
 pub mod mcp;
 pub mod memory;
+pub mod network_guard;
 pub mod planner;
 pub mod runtime;
+pub mod session_store;
 pub mod task_graph;
+pub mod trusted_execution;
 pub mod web_search;
 
 // region: 全局常量与状态
@@ -335,6 +347,15 @@ struct PtyWriteResult {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyCloseResult {
+    session_key: String,
+    closed: bool,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+}
+
 struct CapturedPipe {
     text: String,
     truncated: bool,
@@ -500,9 +521,26 @@ impl FeishuAdapterProcess {
 }
 
 impl PtySession {
-    fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    fn shutdown(&mut self) -> Result<Option<i32>, String> {
+        let kill_error = self.child.kill().err();
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| format!("等待 PTY 进程退出失败: {error}"))?;
+        if let Some(error) = kill_error {
+            // A process that exited between removal and kill is still fully
+            // reaped by wait() above, so only report kill failure when the
+            // resulting status does not provide a terminal observation.
+            if self
+                .child
+                .try_wait()
+                .map_err(|wait_error| format!("检查 PTY 进程回收状态失败: {wait_error}"))?
+                .is_none()
+            {
+                return Err(format!("终止 PTY 进程失败: {error}"));
+            }
+        }
+        Ok(Some(status.exit_code() as i32))
     }
 }
 
@@ -878,8 +916,6 @@ fn sessions_project_root(
         .join("sessions")
         .join("projects")
         .join(&project_id);
-    fs::create_dir_all(data_root.join("sessions"))
-        .map_err(|e| format!("创建项目会话目录失败: {e}"))?;
     Ok((data_root, project_id, workspace_root))
 }
 
@@ -907,10 +943,6 @@ fn session_dir(project_root: &Path, session_id: &str) -> PathBuf {
         .join(sanitize_session_key(session_id))
 }
 
-fn session_index_path(project_root: &Path) -> PathBuf {
-    project_root.join("sessions.index.json")
-}
-
 fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建会话记录父目录失败: {e}"))?;
@@ -918,12 +950,6 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, content).map_err(|e| format!("写入会话记录临时文件失败: {e}"))?;
     fs::rename(&temp_path, path).map_err(|e| format!("替换会话记录失败: {e}"))
-}
-
-fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
-    let content =
-        serde_json::to_string_pretty(value).map_err(|e| format!("序列化会话记录失败: {e}"))?;
-    write_text_atomic(path, &(content + "\n"))
 }
 
 fn read_json_file(path: &Path) -> Result<Value, String> {
@@ -948,24 +974,6 @@ fn read_jsonl_file(path: &Path) -> Result<Vec<Value>, String> {
         rows.push(value);
     }
     Ok(rows)
-}
-
-fn write_jsonl_atomic(path: &Path, values: &[Value], error_label: &str) -> Result<(), String> {
-    let mut lines = String::new();
-    for row in values {
-        let line =
-            serde_json::to_string(row).map_err(|e| format!("序列化{error_label}失败: {e}"))?;
-        lines.push_str(&line);
-        lines.push('\n');
-    }
-    write_text_atomic(path, &lines)
-}
-
-fn strip_runtime_transcript_fields(runtime: &mut Value) {
-    if let Some(object) = runtime.as_object_mut() {
-        object.remove("taskFlow");
-        object.remove("conversationTurns");
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1193,107 +1201,6 @@ fn restore_runtime_transcript_fields(runtime: &mut Value, messages: Vec<Value>, 
     }
 }
 
-fn read_jsonl_rows_by_block_ids(
-    path: &Path,
-    block_ids: &HashSet<String>,
-) -> Result<Vec<Value>, String> {
-    if !path.exists() || block_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path).map_err(|e| format!("打开会话消息记录失败: {e}"))?;
-    let reader = BufReader::new(file);
-    let mut rows = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| format!("读取会话消息记录失败: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<Value>(&line)
-            .map_err(|e| format!("解析会话消息第 {} 行失败: {e}", index + 1))?;
-        let id_key = match value.get("id") {
-            Some(Value::Number(number)) => number.to_string(),
-            Some(Value::String(text)) => text.trim().to_string(),
-            _ => String::new(),
-        };
-        if block_ids.contains(&id_key) {
-            rows.push(value);
-        }
-    }
-    Ok(rows)
-}
-
-fn json_row_id_key(value: &Value) -> Option<String> {
-    match value.get("id") {
-        Some(Value::Number(number)) => Some(number.to_string()),
-        Some(Value::String(text)) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        _ => None,
-    }
-}
-
-fn merge_json_rows_by_id(existing: Vec<Value>, incoming: Vec<Value>) -> Vec<Value> {
-    let mut rows = existing;
-    let mut positions: HashMap<String, usize> = HashMap::new();
-    for (index, row) in rows.iter().enumerate() {
-        if let Some(key) = json_row_id_key(row) {
-            positions.insert(key, index);
-        }
-    }
-
-    for row in incoming {
-        if let Some(key) = json_row_id_key(&row) {
-            if let Some(index) = positions.get(&key).copied() {
-                rows[index] = row;
-                continue;
-            }
-            positions.insert(key, rows.len());
-        }
-        rows.push(row);
-    }
-    rows
-}
-
-fn resolve_session_transcript_to_write(
-    existing_transcript: &SessionTranscript,
-    incoming_messages: Vec<Value>,
-    incoming_turns: Vec<Value>,
-    transcript_partial: bool,
-) -> (Vec<Value>, Vec<Value>) {
-    let existing_messages = if transcript_partial {
-        existing_transcript.messages.clone()
-    } else {
-        Vec::new()
-    };
-    let existing_turns = if transcript_partial {
-        existing_transcript.turns.clone()
-    } else {
-        Vec::new()
-    };
-    let mut messages_to_write = if transcript_partial {
-        merge_json_rows_by_id(existing_messages, incoming_messages)
-    } else {
-        incoming_messages
-    };
-    let mut turns_to_write = if transcript_partial {
-        merge_json_rows_by_id(existing_turns, incoming_turns)
-    } else {
-        incoming_turns
-    };
-    if messages_to_write.is_empty() && !existing_transcript.messages.is_empty() {
-        messages_to_write = existing_transcript.messages.clone();
-    }
-    if turns_to_write.is_empty() && !existing_transcript.turns.is_empty() {
-        turns_to_write = existing_transcript.turns.clone();
-    }
-    (messages_to_write, turns_to_write)
-}
-
 fn session_detail_status(dir: &Path) -> &'static str {
     let has_messages = dir.join("messages.jsonl").exists();
     let has_runtime = dir.join("runtime.json").exists();
@@ -1375,13 +1282,15 @@ fn sort_sessions_by_recent(sessions: &mut Vec<Value>) {
     });
 }
 
-fn rebuild_sessions_index_for_project(
+fn scan_legacy_sessions_for_project(
     project_root: &Path,
     project_id: &str,
     workspace_root: &str,
 ) -> Result<Vec<Value>, String> {
     let sessions_root = project_root.join("sessions");
-    fs::create_dir_all(&sessions_root).map_err(|e| format!("创建会话目录失败: {e}"))?;
+    if !sessions_root.is_dir() {
+        return Ok(Vec::new());
+    }
 
     let mut sessions = Vec::new();
     for entry in fs::read_dir(&sessions_root).map_err(|e| format!("读取会话目录失败: {e}"))?
@@ -1392,10 +1301,26 @@ fn rebuild_sessions_index_for_project(
             continue;
         }
         let meta_path = path.join("session.json");
-        if !meta_path.exists() {
+        let meta = if meta_path.exists() {
+            read_json_file(&meta_path)?
+        } else if path.join("messages.jsonl").exists()
+            || path.join("turns.jsonl").exists()
+            || path.join("runtime.json").exists()
+        {
+            let session_id = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("session");
+            json!({
+                "id": session_id,
+                "title": "Recovered Session",
+                "date": "",
+                "active": false,
+                "recoveredFromPartialLegacyWrite": true,
+            })
+        } else {
             continue;
-        }
-        let meta = read_json_file(&meta_path)?;
+        };
         sessions.push(annotate_session_meta(
             meta,
             project_id,
@@ -1405,19 +1330,7 @@ fn rebuild_sessions_index_for_project(
     }
 
     sort_sessions_by_recent(&mut sessions);
-
-    let index = json!({
-        "projectId": project_id,
-        "workspaceRoot": workspace_root,
-        "updatedAt": now_millis(),
-        "sessions": sessions,
-    });
-    write_json_atomic(&session_index_path(project_root), &index)?;
-    Ok(index
-        .get("sessions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
+    Ok(sessions)
 }
 
 fn ensure_in_workspace(path: &Path, workspace: &Path) -> Result<(), String> {
@@ -1543,36 +1456,53 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
 }
 
 fn resolve_existing_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {
-    let raw = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        workspace.join(input)
-    };
-    let canonical = raw
-        .canonicalize()
-        .map_err(|e| format!("路径不存在或无法访问: {e}"))?;
-    ensure_in_workspace(&canonical, &workspace)?;
-    Ok(canonical)
+    trusted_execution::resolve_workspace_path(
+        workspace,
+        input,
+        trusted_execution::WorkspacePathMode::Existing,
+    )
+    .map(|trusted| trusted.path().to_path_buf())
+    .map_err(|error| format!("路径越界、不存在或无法访问: {error}"))
 }
 
 fn resolve_write_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {
-    let raw = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        workspace.join(input)
-    };
+    trusted_execution::resolve_workspace_path(
+        workspace,
+        input,
+        trusted_execution::WorkspacePathMode::AllowMissing,
+    )
+    .map(|trusted| trusted.path().to_path_buf())
+    .map_err(|error| format!("写入路径越界或无法访问: {error}"))
+}
 
-    let mut probe = raw.as_path();
-    while !probe.exists() {
-        probe = probe
-            .parent()
-            .ok_or_else(|| "写入路径非法：无法找到有效父目录".to_string())?;
+/// Resolve the destination again immediately before a write. The initial
+/// resolver canonicalizes existing parents; this identity check additionally
+/// rejects a parent or destination that was replaced by a symlink after that
+/// first decision.
+fn revalidate_write_path(path: &Path, workspace: &Path) -> Result<PathBuf, String> {
+    let current = trusted_execution::resolve_workspace_path(
+        workspace,
+        path,
+        trusted_execution::WorkspacePathMode::AllowMissing,
+    )
+    .map_err(|error| format!("写入前路径校验失败: {error}"))?;
+    if current.path() != path {
+        return Err("写入路径在执行前发生变化，已拒绝写入".to_string());
     }
-    let canonical_parent = probe
-        .canonicalize()
-        .map_err(|e| format!("无法解析写入路径父目录: {e}"))?;
-    ensure_in_workspace(&canonical_parent, &workspace)?;
-    Ok(raw)
+    Ok(current.path().to_path_buf())
+}
+
+fn revalidate_existing_write_path(path: &Path, workspace: &Path) -> Result<PathBuf, String> {
+    let current = trusted_execution::resolve_workspace_path(
+        workspace,
+        path,
+        trusted_execution::WorkspacePathMode::Existing,
+    )
+    .map_err(|error| format!("写入前现有路径校验失败: {error}"))?;
+    if current.path() != path {
+        return Err("现有写入路径在执行前发生变化，已拒绝操作".to_string());
+    }
+    Ok(current.path().to_path_buf())
 }
 
 fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
@@ -1760,6 +1690,11 @@ async fn proxy_request_via_curl(
         return Err("Aborted".to_string());
     }
 
+    let guarded_headers = headers.cloned().unwrap_or_default();
+    let grant = proxy_network_grant(url, &guarded_headers, true)?;
+    let resolved =
+        resolve_proxy_target(&grant, url, Some(GuardedRequestLease::Proxy(request_lease))).await?;
+
     let max_time_secs = if method.eq_ignore_ascii_case("POST")
         && (url.contains("/v1/responses")
             || url.contains("/v1/chat/completions")
@@ -1772,9 +1707,35 @@ async fn proxy_request_via_curl(
         HTTP_SHORT_TIMEOUT_SECS
     };
 
-    let owned_url = url.to_string();
+    let target_host = resolved
+        .target
+        .url
+        .host_str()
+        .ok_or_else(|| "NETWORK_GUARD_DENIED: network URL has no host".to_string())?
+        .to_string();
+    let target_port = resolved
+        .target
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| "NETWORK_GUARD_DENIED: network URL has no effective port".to_string())?;
+    let curl_resolve_entries = if target_host.parse::<IpAddr>().is_ok() {
+        Vec::new()
+    } else {
+        resolved
+            .addresses
+            .iter()
+            .map(|address| {
+                let ip = match address.ip() {
+                    IpAddr::V4(ip) => ip.to_string(),
+                    IpAddr::V6(ip) => format!("[{ip}]"),
+                };
+                format!("{target_host}:{target_port}:{ip}")
+            })
+            .collect::<Vec<_>>()
+    };
+    let owned_url = resolved.target.url.to_string();
     let owned_method = method.to_string();
-    let owned_headers = headers.cloned();
+    let owned_headers = Some(guarded_headers);
     let owned_body = body.map(str::to_string);
     let cancel_flag = request_lease.cancel_flag.clone();
     let supervisor_timeout =
@@ -1782,7 +1743,10 @@ async fn proxy_request_via_curl(
     let output = tauri::async_runtime::spawn_blocking(move || {
         let mut command = ProcessCommand::new("curl");
         command.arg("-sS");
-        command.arg("-L");
+        command.arg("--noproxy").arg("*");
+        for entry in &curl_resolve_entries {
+            command.arg("--resolve").arg(entry);
+        }
         command.arg("-X").arg(&owned_method);
         command.arg(&owned_url);
         command
@@ -2560,15 +2524,32 @@ fn build_workspace_shell_command(command: &str) -> ProcessCommand {
         cmd
     } else {
         let mut cmd = ProcessCommand::new("/bin/sh");
-        cmd.args(["-lc", command]);
+        // Login shells may replace current_dir. The application already
+        // supplies its normalized login environment, so preserve the exact
+        // trusted working directory selected below.
+        cmd.args(["-c", command]);
         apply_process_terminal_env(&mut cmd);
         isolate_process_group(&mut cmd);
         cmd
     }
 }
 
+fn resolve_command_working_directory(
+    workspace: &Path,
+    working_directory: Option<&str>,
+) -> Result<PathBuf, String> {
+    let requested = working_directory
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".");
+    trusted_execution::resolve_workspace_working_directory(workspace, requested)
+        .map(|trusted| trusted.path().to_path_buf())
+        .map_err(|error| format!("WORKING_DIRECTORY_REJECTED: {error}"))
+}
+
 fn run_workspace_shell_command(
     workspace: &Path,
+    working_directory: &Path,
     command: String,
     input: Option<String>,
     timeout: Duration,
@@ -2587,10 +2568,13 @@ fn run_workspace_shell_command(
     harness::permissions::PermissionGuard::from_workspace(workspace)
         .and_then(|guard| guard.validate_with_approval(trimmed, permission_approval.as_ref()))
         .map_err(|error| error.to_string())?;
+    let prepared =
+        trusted_execution::prepare_trusted_shell_execution(workspace, working_directory, trimmed)
+            .map_err(|error| format!("TRUSTED_EXECUTION_REJECTED: {error}"))?;
 
     let mut process = build_workspace_shell_command(trimmed);
     process
-        .current_dir(workspace)
+        .current_dir(prepared.working_directory())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2681,6 +2665,115 @@ fn validate_pty_input(
 
     *pending_command = next_pending;
     Ok(())
+}
+
+struct PreparedPtyAgentInput {
+    text: String,
+    launched_command: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+fn quote_posix_shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_trusted_pty_cwd_command(
+    working_directory: &Path,
+    command: &str,
+) -> Result<String, String> {
+    // The interactive shell only parses quoted argv. A fixed /bin/sh wrapper
+    // receives cwd and the already-inspected command as data, so user syntax
+    // cannot alter the trusted cd step or persistently change the PTY shell cwd.
+    let wrapper = "cd -- \"$1\" && exec /bin/sh -c \"$2\"";
+    Ok(format!(
+        "/bin/sh -c {} main-pty-cwd {} {}",
+        quote_posix_shell_word(wrapper),
+        quote_posix_shell_word(&working_directory.to_string_lossy()),
+        quote_posix_shell_word(command),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn build_trusted_pty_cwd_command(
+    working_directory: &Path,
+    command: &str,
+) -> Result<String, String> {
+    let working_directory = working_directory.to_string_lossy();
+    if working_directory.contains(['\r', '\n', '"', '%', '!']) {
+        return Err(
+            "WORKING_DIRECTORY_REJECTED: Windows PTY cwd contains unsafe cmd characters"
+                .to_string(),
+        );
+    }
+    Ok(format!(
+        "cmd.exe /D /S /C \"cd /D \"\"{}\"\" && ({})\"",
+        working_directory, command
+    ))
+}
+
+fn prepare_pty_agent_input(
+    workspace: &Path,
+    working_directory: &Path,
+    pending_command: &mut String,
+    input: &str,
+    permission_approval: Option<&harness::permissions::ShellPermissionApproval>,
+) -> Result<PreparedPtyAgentInput, String> {
+    let mut next_pending = pending_command.clone();
+    let mut text = String::new();
+    let mut launched_command = false;
+    let mut previous_was_carriage_return = false;
+
+    for ch in input.chars() {
+        if ch == '\n' && previous_was_carriage_return {
+            previous_was_carriage_return = false;
+            continue;
+        }
+        previous_was_carriage_return = ch == '\r';
+        match ch {
+            '\u{3}' => {
+                if next_pending.is_empty() {
+                    text.push(ch);
+                } else {
+                    next_pending.clear();
+                }
+            }
+            '\u{8}' | '\u{7f}' => {
+                let _ = next_pending.pop();
+            }
+            '\r' | '\n' => {
+                let command = next_pending.trim();
+                if command.is_empty() {
+                    text.push('\r');
+                } else {
+                    harness::permissions::PermissionGuard::from_workspace(workspace)
+                        .and_then(|guard| {
+                            guard.validate_with_approval(command, permission_approval)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    trusted_execution::prepare_trusted_shell_execution(
+                        workspace,
+                        working_directory,
+                        command,
+                    )
+                    .map_err(|error| format!("TRUSTED_EXECUTION_REJECTED: {error}"))?;
+                    text.push_str(&build_trusted_pty_cwd_command(working_directory, command)?);
+                    text.push('\r');
+                    launched_command = true;
+                }
+                next_pending.clear();
+            }
+            '\t' => next_pending.push(' '),
+            _ if !ch.is_control() => next_pending.push(ch),
+            _ => {}
+        }
+    }
+
+    *pending_command = next_pending;
+    Ok(PreparedPtyAgentInput {
+        text,
+        launched_command,
+    })
 }
 
 #[tauri::command]
@@ -3846,6 +3939,10 @@ fn write_file(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
+    if real_path.is_dir() {
+        return Err("write_file 目标是目录，无法写入".to_string());
+    }
     fs::write(real_path, content).map_err(|e| format!("写入文件失败: {e}"))
 }
 
@@ -3862,6 +3959,7 @@ fn write_file_create_new(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3893,15 +3991,46 @@ fn write_file_atomic(
 ) -> Result<(), String> {
     let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
-    let real_path = resolve_write_path(&path, &workspace)?;
+    let mut real_path = resolve_write_path(&path, &workspace)?;
     if real_path.exists() && real_path.is_dir() {
         return Err("write_file_atomic 目标是目录，无法写入".to_string());
     }
-    let parent = real_path.parent().ok_or_else(|| "无法解析目标父目录".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
-    let file_name = real_path.file_name().and_then(|value| value.to_str()).unwrap_or("goal-state");
-    let temp_path = parent.join(format!(".{file_name}.{}.tmp", now_millis()));
-    fs::write(&temp_path, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    let parent = real_path
+        .parent()
+        .ok_or_else(|| "无法解析目标父目录".to_string())?
+        .to_path_buf();
+    fs::create_dir_all(&parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+    real_path = revalidate_write_path(&real_path, &workspace)?;
+    if real_path.is_dir() {
+        return Err("write_file_atomic 目标是目录，无法写入".to_string());
+    }
+    let parent = real_path
+        .parent()
+        .ok_or_else(|| "无法解析目标父目录".to_string())?
+        .to_path_buf();
+    let file_name = real_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("goal-state")
+        .to_string();
+    let temp_path = revalidate_write_path(
+        &parent.join(format!(".{file_name}.{}.tmp", now_millis())),
+        &workspace,
+    )?;
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| format!("创建临时文件失败: {e}"))?;
+    if let Err(error) = temp_file.write_all(content.as_bytes()) {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("写入临时文件失败: {error}"));
+    }
+    drop(temp_file);
+
+    let temp_path = revalidate_existing_write_path(&temp_path, &workspace)?;
+    real_path = revalidate_write_path(&real_path, &workspace)?;
 
     if let Err(rename_error) = fs::rename(&temp_path, &real_path) {
         if !real_path.exists() {
@@ -3911,13 +4040,31 @@ fn write_file_atomic(
 
         // Windows does not replace an existing destination with rename. Keep a
         // recoverable backup while swapping the new file into place.
-        let backup_path = parent.join(format!(".{file_name}.{}.bak", now_millis()));
-        fs::rename(&real_path, &backup_path)
-            .map_err(|e| format!("创建原子写入备份失败: {e}"))?;
-        if let Err(swap_error) = fs::rename(&temp_path, &real_path) {
-            let _ = fs::rename(&backup_path, &real_path);
-            let _ = fs::remove_file(&temp_path);
-            return Err(format!("替换目标文件失败: {swap_error}"));
+        real_path = revalidate_existing_write_path(&real_path, &workspace)?;
+        let backup_path = revalidate_write_path(
+            &parent.join(format!(".{file_name}.{}.bak", now_millis())),
+            &workspace,
+        )?;
+        fs::rename(&real_path, &backup_path).map_err(|e| format!("创建原子写入备份失败: {e}"))?;
+        let swap_result = (|| -> Result<(), String> {
+            let temp_path = revalidate_existing_write_path(&temp_path, &workspace)?;
+            real_path = revalidate_write_path(&real_path, &workspace)?;
+            fs::rename(&temp_path, &real_path).map_err(|error| format!("替换目标文件失败: {error}"))
+        })();
+        if let Err(swap_error) = swap_result {
+            let rollback_result = (|| -> Result<(), String> {
+                let backup_path = revalidate_existing_write_path(&backup_path, &workspace)?;
+                let target_path = revalidate_write_path(&real_path, &workspace)?;
+                fs::rename(&backup_path, &target_path)
+                    .map_err(|error| format!("恢复原文件失败: {error}"))
+            })();
+            if let Ok(temp_path) = revalidate_existing_write_path(&temp_path, &workspace) {
+                let _ = fs::remove_file(temp_path);
+            }
+            return Err(match rollback_result {
+                Ok(()) => swap_error,
+                Err(rollback_error) => format!("{swap_error}；{rollback_error}"),
+            });
         }
         let _ = fs::remove_file(backup_path);
     }
@@ -3938,6 +4085,7 @@ fn write_chat_temp_file(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建聊天临时父目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     fs::write(&real_path, content).map_err(|e| format!("写入聊天临时文件失败: {e}"))?;
     Ok(real_path.to_string_lossy().to_string())
 }
@@ -3953,6 +4101,7 @@ fn write_chat_temp_file_create_new(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建聊天临时父目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4033,6 +4182,7 @@ fn ingest_attachment_file(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建附件临时目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     fs::copy(&source, &real_path).map_err(|e| format!("复制附件失败: {e}"))?;
     let metadata = fs::metadata(&real_path).map_err(|e| format!("读取附件元数据失败: {e}"))?;
 
@@ -4081,6 +4231,7 @@ fn ingest_attachment_bytes(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建附件临时目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     fs::write(&real_path, &bytes).map_err(|e| format!("写入附件失败: {e}"))?;
 
     Ok(AttachmentIngestResult {
@@ -4112,153 +4263,17 @@ fn read_attachment_image_data_url(source_path: String) -> Result<String, String>
     ))
 }
 
-#[tauri::command]
-fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
-    let index_path = session_index_path(&project_root);
-    if index_path.exists() {
-        if let Ok(index) = read_json_file(&index_path) {
-            if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
-                let mut index_sessions: Vec<Value> = sessions
-                    .iter()
-                    .map(|session| {
-                        let session_id = session_id_from_object(session)
-                            .unwrap_or_else(|_| "session".to_string());
-                        annotate_session_meta(
-                            session.clone(),
-                            &project_id,
-                            &workspace_root,
-                            &session_dir(&project_root, &session_id),
-                        )
-                    })
-                    .collect();
-                sort_sessions_by_recent(&mut index_sessions);
-                return Ok(index_sessions);
-            }
-        }
-    }
-    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+fn list_legacy_project_sessions(app: &AppHandle, workspace: &str) -> Result<Vec<Value>, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(app, workspace)?;
+    scan_legacy_sessions_for_project(&project_root, &project_id, &workspace_root)
 }
 
-#[tauri::command]
-fn rebuild_project_sessions_index(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
-    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
-}
-
-#[tauri::command]
-fn save_project_session(
-    app: AppHandle,
-    workspace: String,
-    session: Value,
-) -> Result<Value, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
-    let session_id = session_id_from_object(&session)?;
-    let dir = session_dir(&project_root, &session_id);
-    fs::create_dir_all(&dir).map_err(|e| format!("创建会话记录目录失败: {e}"))?;
-
-    let mut meta = session
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "会话记录必须是对象".to_string())?;
-    let messages = meta
-        .remove("messages")
-        .unwrap_or_else(|| Value::Array(Vec::new()));
-    let mut runtime = meta.remove("runtimeSnapshot");
-    let turns = runtime
-        .as_ref()
-        .and_then(|value| value.get("conversationTurns"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let transcript_partial = runtime
-        .as_ref()
-        .and_then(|value| value.get("transcriptPartial"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || meta
-            .get("transcriptPartial")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let messages_path = dir.join("messages.jsonl");
-    let turns_path = dir.join("turns.jsonl");
-    let runtime_path = dir.join("runtime.json");
-    let incoming_messages = messages.as_array().cloned().unwrap_or_default();
-    let existing_transcript = read_session_transcript_with_fallback(
-        &messages_path,
-        &turns_path,
-        &runtime_path,
-        &session_id,
-    )?;
-    let (messages_to_write, turns_to_write) = resolve_session_transcript_to_write(
-        &existing_transcript,
-        incoming_messages,
-        turns,
-        transcript_partial,
-    );
-    if let Some(runtime_value) = runtime.as_mut() {
-        if let Some(object) = runtime_value.as_object_mut() {
-            object.remove("transcriptPartial");
-            object.remove("transcriptLoadedTurns");
-            object.remove("transcriptTotalTurns");
-        }
-        strip_runtime_transcript_fields(runtime_value);
-    }
-    meta.remove("transcriptPartial");
-    meta.remove("transcriptLoadedTurns");
-    meta.remove("transcriptTotalTurns");
-    meta.insert(
-        "turnCount".to_string(),
-        Value::Number(turns_to_write.len().into()),
-    );
-    meta.insert(
-        "messageCount".to_string(),
-        Value::Number(messages_to_write.len().into()),
-    );
-    meta.insert("projectId".to_string(), Value::String(project_id.clone()));
-    meta.insert(
-        "workspaceRoot".to_string(),
-        Value::String(workspace_root.clone()),
-    );
-    let updated_at_ms = meta
-        .get("updatedAtMs")
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_i64(),
-            Value::String(text) => text.trim().parse::<i64>().ok(),
-            _ => None,
-        })
-        .filter(|value| *value > 0);
-    if let Some(value) = updated_at_ms {
-        meta.insert("updatedAtMs".to_string(), Value::Number(value.into()));
-    } else {
-        meta.remove("updatedAtMs");
-    }
-    meta.insert("storageStatus".to_string(), Value::String("ok".to_string()));
-
-    let meta_value = Value::Object(meta);
-    write_json_atomic(&dir.join("session.json"), &meta_value)?;
-
-    write_jsonl_atomic(&messages_path, &messages_to_write, "会话消息")?;
-    write_jsonl_atomic(&turns_path, &turns_to_write, "会话回合")?;
-
-    if let Some(runtime_value) = runtime {
-        write_json_atomic(&runtime_path, &runtime_value)?;
-    }
-
-    let sessions = rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
-    Ok(sessions
-        .into_iter()
-        .find(|item| item.get("id") == meta_value.get("id"))
-        .unwrap_or_else(|| annotate_session_meta(meta_value, &project_id, &workspace_root, &dir)))
-}
-
-#[tauri::command]
-fn load_project_session(
-    app: AppHandle,
-    workspace: String,
+fn load_legacy_project_session(
+    app: &AppHandle,
+    workspace: &str,
     session_id: Value,
 ) -> Result<Value, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let (project_root, project_id, workspace_root) = sessions_project_root(app, workspace)?;
     let session_id = session_id_from_value(&session_id)?;
     let dir = session_dir(&project_root, &session_id);
     let meta_path = dir.join("session.json");
@@ -4338,76 +4353,411 @@ fn load_project_session(
     Ok(session)
 }
 
+const PROJECT_SESSION_STORAGE_VERSION: u64 = 3;
+
+fn project_session_error(
+    code: &str,
+    message: impl Into<String>,
+    entity: Option<&str>,
+    details: Option<Value>,
+) -> String {
+    let mut error = serde_json::Map::new();
+    error.insert("code".to_string(), Value::String(code.to_string()));
+    error.insert("message".to_string(), Value::String(message.into()));
+    if let Some(entity) = entity {
+        error.insert("entity".to_string(), Value::String(entity.to_string()));
+    }
+    if let Some(details) = details {
+        error.insert("details".to_string(), details);
+    }
+    Value::Object(error).to_string()
+}
+
+fn project_session_store_error(error: SessionStoreError) -> String {
+    serde_json::to_string(&error).unwrap_or_else(|_| {
+        project_session_error("database", error.to_string(), Some("session_store"), None)
+    })
+}
+
+fn open_project_session_store(app: &AppHandle) -> Result<SessionStore, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| {
+            project_session_error(
+                "io",
+                format!("解析应用数据目录失败: {error}"),
+                Some("session_store.path"),
+                None,
+            )
+        })?
+        .join("sessions")
+        .join("session-store.sqlite3");
+    SessionStore::open(path).map_err(project_session_store_error)
+}
+
+fn project_session_now_ms() -> i64 {
+    i64::try_from(now_millis()).unwrap_or(i64::MAX)
+}
+
+fn project_session_json_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn project_session_json_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn project_session_updated_at_ms(snapshot: &Value, fallback: i64) -> i64 {
+    snapshot
+        .get("updatedAtMs")
+        .and_then(project_session_json_i64)
+        .or_else(|| snapshot.get("updatedAt").and_then(project_session_json_i64))
+        .or_else(|| snapshot.get("id").and_then(project_session_json_i64))
+        .filter(|value| *value >= 0)
+        .unwrap_or(fallback.max(0))
+}
+
+fn project_session_key(workspace: &str, session_id: String) -> SessionKey {
+    SessionKey {
+        workspace: normalize_workspace_for_sessions(workspace),
+        session_id,
+    }
+}
+
+fn project_session_snapshot_from_record(record: SessionSnapshotRecord) -> Result<Value, String> {
+    let workspace_root = record.workspace.clone();
+    let project_id = session_project_id(&workspace_root);
+    let mut snapshot = record.snapshot;
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        project_session_error(
+            "corrupt_data",
+            "SQLite Session snapshot is not a JSON object.",
+            Some("session_snapshot"),
+            Some(json!({
+                "workspace": record.workspace,
+                "sessionId": record.session_id,
+                "revision": record.revision,
+            })),
+        )
+    })?;
+    object.insert("projectId".to_string(), Value::String(project_id));
+    object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
+    object.insert(
+        "storageVersion".to_string(),
+        Value::Number(PROJECT_SESSION_STORAGE_VERSION.into()),
+    );
+    object.insert(
+        "storageRevision".to_string(),
+        Value::Number(record.revision.into()),
+    );
+    object.insert("storageStatus".to_string(), Value::String("ok".to_string()));
+    object.insert(
+        "updatedAtMs".to_string(),
+        Value::Number(record.updated_at_ms.into()),
+    );
+    Ok(snapshot)
+}
+
+fn project_session_list_snapshot(record: SessionSnapshotRecord) -> Result<Value, String> {
+    let mut snapshot = project_session_snapshot_from_record(record)?;
+    if let Some(object) = snapshot.as_object_mut() {
+        object.remove("messages");
+        object.remove("runtimeSnapshot");
+    }
+    Ok(snapshot)
+}
+
+fn project_session_meta_snapshot(record: SessionSnapshotRecord) -> Result<Value, String> {
+    let mut snapshot = project_session_snapshot_from_record(record)?;
+    if let Some(object) = snapshot.as_object_mut() {
+        object.remove("messages");
+    }
+    Ok(snapshot)
+}
+
+fn project_session_transcript(snapshot: &Value) -> SessionTranscript {
+    let messages = snapshot
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let turns = snapshot
+        .get("runtimeSnapshot")
+        .and_then(|runtime| runtime.get("conversationTurns"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let recovered_from_agent_messages = snapshot
+        .get("recoveredFromAgentMessages")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            snapshot
+                .get("runtimeSnapshot")
+                .and_then(|runtime| runtime.get("recoveredFromAgentMessages"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    SessionTranscript {
+        messages,
+        turns,
+        recovered_from_agent_messages,
+    }
+}
+
+fn import_legacy_project_sessions_if_needed(
+    app: &AppHandle,
+    store: &SessionStore,
+    workspace: &str,
+) -> Result<(), String> {
+    let workspace_root = normalize_workspace_for_sessions(workspace);
+    if store
+        .get_legacy_workspace_import(&workspace_root)
+        .map_err(project_session_store_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let (legacy_root, project_id, _) = sessions_project_root(app, workspace)?;
+    let legacy_sessions = list_legacy_project_sessions(app, workspace)?;
+    let imported_at_ms = project_session_now_ms();
+    let mut imported_sessions = 0_u64;
+    for (index, legacy_meta) in legacy_sessions.into_iter().enumerate() {
+        let session_id = session_id_from_object(&legacy_meta)?;
+        let legacy_dir = session_dir(&legacy_root, &session_id);
+        let has_legacy_payload = legacy_dir.join("session.json").exists()
+            || legacy_dir.join("messages.jsonl").exists()
+            || legacy_dir.join("turns.jsonl").exists()
+            || legacy_dir.join("runtime.json").exists();
+        if !has_legacy_payload {
+            continue;
+        }
+
+        let mut snapshot =
+            load_legacy_project_session(app, workspace, Value::String(session_id.clone()))?;
+        let fallback_updated_at_ms = imported_at_ms.saturating_sub(index as i64);
+        let updated_at_ms = project_session_updated_at_ms(&snapshot, fallback_updated_at_ms);
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("projectId".to_string(), Value::String(project_id.clone()));
+            object.insert(
+                "workspaceRoot".to_string(),
+                Value::String(workspace_root.clone()),
+            );
+            object.insert(
+                "storageVersion".to_string(),
+                Value::Number(PROJECT_SESSION_STORAGE_VERSION.into()),
+            );
+            object.insert("storageRevision".to_string(), Value::Number(1_u64.into()));
+            object.insert("storageStatus".to_string(), Value::String("ok".to_string()));
+            object.insert(
+                "updatedAtMs".to_string(),
+                Value::Number(updated_at_ms.into()),
+            );
+        }
+        store
+            .import_legacy_snapshot_if_absent(ImportLegacySnapshotIfAbsentRequest {
+                key: SessionKey {
+                    workspace: workspace_root.clone(),
+                    session_id,
+                },
+                snapshot,
+                updated_at_ms,
+            })
+            .map_err(project_session_store_error)?;
+        imported_sessions = imported_sessions.saturating_add(1);
+    }
+
+    store
+        .mark_legacy_workspace_imported(LegacyWorkspaceImportRecord {
+            workspace: workspace_root,
+            imported_at_ms,
+            imported_sessions,
+        })
+        .map_err(project_session_store_error)?;
+    Ok(())
+}
+
+fn list_sqlite_project_sessions(
+    store: &SessionStore,
+    workspace: &str,
+) -> Result<Vec<Value>, String> {
+    store
+        .list_session_snapshots(&normalize_workspace_for_sessions(workspace))
+        .map_err(project_session_store_error)?
+        .into_iter()
+        .map(project_session_list_snapshot)
+        .collect()
+}
+
+fn missing_project_session(workspace: &str, session_id: &str) -> Value {
+    let workspace_root = normalize_workspace_for_sessions(workspace);
+    json!({
+        "id": session_id,
+        "title": "Missing Session",
+        "date": "",
+        "active": false,
+        "messages": [],
+        "messageCount": 0,
+        "turnCount": 0,
+        "projectId": session_project_id(&workspace_root),
+        "workspaceRoot": workspace_root,
+        "storageVersion": PROJECT_SESSION_STORAGE_VERSION,
+        "storageRevision": 0,
+        "storageStatus": "missing",
+    })
+}
+
+#[tauri::command]
+fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    list_sqlite_project_sessions(&store, &workspace)
+}
+
+#[tauri::command]
+fn rebuild_project_sessions_index(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    list_sqlite_project_sessions(&store, &workspace)
+}
+
+#[tauri::command]
+fn save_project_session(
+    app: AppHandle,
+    workspace: String,
+    session: Value,
+    mutation_deadline_ms: Option<i64>,
+) -> Result<Value, String> {
+    if !session.is_object() {
+        return Err(project_session_error(
+            "invalid_input",
+            "Session snapshot must be a JSON object.",
+            Some("session"),
+            None,
+        ));
+    }
+    let session_id = session_id_from_object(&session)?;
+    let key = project_session_key(&workspace, session_id);
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+
+    let expected_revision = match session.get("storageRevision") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(project_session_json_u64(value).ok_or_else(|| {
+            project_session_error(
+                "invalid_input",
+                "storageRevision must be a non-negative integer.",
+                Some("storageRevision"),
+                None,
+            )
+        })?),
+    };
+    let expected_revision = expected_revision.unwrap_or(0);
+    let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
+        project_session_error(
+            "invalid_input",
+            "storageRevision overflowed.",
+            Some("storageRevision"),
+            None,
+        )
+    })?;
+
+    let mut snapshot = session;
+    let updated_at_ms = project_session_updated_at_ms(&snapshot, project_session_now_ms());
+    let object = snapshot
+        .as_object_mut()
+        .expect("Session snapshot object validated before storage envelope projection");
+    object.insert(
+        "projectId".to_string(),
+        Value::String(session_project_id(&key.workspace)),
+    );
+    object.insert(
+        "workspaceRoot".to_string(),
+        Value::String(key.workspace.clone()),
+    );
+    object.insert(
+        "storageVersion".to_string(),
+        Value::Number(PROJECT_SESSION_STORAGE_VERSION.into()),
+    );
+    object.insert(
+        "storageRevision".to_string(),
+        Value::Number(next_revision.into()),
+    );
+    object.insert("storageStatus".to_string(), Value::String("ok".to_string()));
+    object.insert(
+        "updatedAtMs".to_string(),
+        Value::Number(updated_at_ms.into()),
+    );
+
+    let result = store
+        .compare_and_swap_session_snapshot_before(
+            CompareAndSwapSessionSnapshotRequest {
+                key,
+                expected_revision,
+                snapshot,
+                updated_at_ms,
+            },
+            mutation_deadline_ms,
+        )
+        .map_err(project_session_store_error)?;
+    project_session_snapshot_from_record(result.snapshot)
+}
+
+#[tauri::command]
+fn load_project_session(
+    app: AppHandle,
+    workspace: String,
+    session_id: Value,
+) -> Result<Value, String> {
+    let session_id = session_id_from_value(&session_id)?;
+    let key = project_session_key(&workspace, session_id.clone());
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    match store
+        .get_session_snapshot(&key)
+        .map_err(project_session_store_error)?
+    {
+        Some(record) => project_session_snapshot_from_record(record),
+        None => Ok(missing_project_session(&workspace, &session_id)),
+    }
+}
+
 #[tauri::command]
 fn load_project_session_meta(
     app: AppHandle,
     workspace: String,
     session_id: Value,
 ) -> Result<Value, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
-    let dir = session_dir(&project_root, &session_id);
-    let meta_path = dir.join("session.json");
-
-    let mut session = if meta_path.exists() {
-        read_json_file(&meta_path)?
-    } else {
-        json!({
-            "id": session_id,
-            "title": "Missing Session",
-            "date": "",
-            "active": false,
-        })
-    };
-
-    let turns_path = dir.join("turns.jsonl");
-    let messages_path = dir.join("messages.jsonl");
-    let runtime_path = dir.join("runtime.json");
-    let transcript = read_session_transcript_with_fallback(
-        &messages_path,
-        &turns_path,
-        &runtime_path,
-        &session_id,
-    )?;
-
-    if let Some(object) = session.as_object_mut() {
-        object.insert("projectId".to_string(), Value::String(project_id));
-        object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
-        object.insert(
-            "storageStatus".to_string(),
-            Value::String(session_detail_status(&dir).to_string()),
-        );
-        object.insert("storageVersion".to_string(), Value::Number(2.into()));
-        object.insert(
-            "turnCount".to_string(),
-            Value::Number(transcript.turns.len().into()),
-        );
-        object.insert(
-            "messageCount".to_string(),
-            Value::Number(transcript.messages.len().into()),
-        );
-        object.insert(
-            "recoveredFromAgentMessages".to_string(),
-            Value::Bool(transcript.recovered_from_agent_messages),
-        );
-        if runtime_path.exists() {
-            let mut runtime_value = read_json_file(&runtime_path)?;
-            restore_runtime_transcript_fields(
-                &mut runtime_value,
-                transcript.messages.clone(),
-                transcript.turns.clone(),
-            );
-            if let Some(runtime_object) = runtime_value.as_object_mut() {
-                runtime_object.insert(
-                    "recoveredFromAgentMessages".to_string(),
-                    Value::Bool(transcript.recovered_from_agent_messages),
-                );
+    let key = project_session_key(&workspace, session_id.clone());
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    match store
+        .get_session_snapshot(&key)
+        .map_err(project_session_store_error)?
+    {
+        Some(record) => project_session_meta_snapshot(record),
+        None => {
+            let mut missing = missing_project_session(&workspace, &session_id);
+            if let Some(object) = missing.as_object_mut() {
+                object.remove("messages");
             }
-            object.insert("runtimeSnapshot".to_string(), runtime_value);
+            Ok(missing)
         }
     }
-
-    Ok(session)
 }
 
 #[tauri::command]
@@ -4418,24 +4768,24 @@ fn load_project_session_page(
     before_turn_index: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Value, String> {
-    let (project_root, _project_id, _workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
-    let dir = session_dir(&project_root, &session_id);
-    let turns_path = dir.join("turns.jsonl");
-    let messages_path = dir.join("messages.jsonl");
-    let runtime_path = dir.join("runtime.json");
-    let transcript = read_session_transcript_with_fallback(
-        &messages_path,
-        &turns_path,
-        &runtime_path,
-        &session_id,
-    )?;
-    let turns_all = transcript.turns.clone();
-    let total_turns = turns_all.len();
+    let key = project_session_key(&workspace, session_id.clone());
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    let transcript = store
+        .get_session_snapshot(&key)
+        .map_err(project_session_store_error)?
+        .map(|record| project_session_transcript(&record.snapshot))
+        .unwrap_or(SessionTranscript {
+            messages: Vec::new(),
+            turns: Vec::new(),
+            recovered_from_agent_messages: false,
+        });
+    let total_turns = transcript.turns.len();
     let page_limit = limit.unwrap_or(30).clamp(1, 120);
     let end = before_turn_index.unwrap_or(total_turns).min(total_turns);
     let start = end.saturating_sub(page_limit);
-    let page_turns = turns_all[start..end].to_vec();
+    let page_turns = transcript.turns[start..end].to_vec();
     let mut block_ids = HashSet::new();
     for turn in &page_turns {
         if let Some(ids) = turn.get("blockIds").and_then(Value::as_array) {
@@ -4452,40 +4802,18 @@ fn load_project_session_page(
             }
         }
     }
-    let messages = if messages_path.exists() && !block_ids.is_empty() {
-        read_jsonl_rows_by_block_ids(&messages_path, &block_ids)?
-    } else {
-        transcript
-            .messages
-            .clone()
-            .into_iter()
-            .filter(|value| {
-                let id_key = match value.get("id") {
-                    Some(Value::Number(number)) => number.to_string(),
-                    Some(Value::String(text)) => text.trim().to_string(),
-                    _ => String::new(),
-                };
-                block_ids.contains(&id_key)
-            })
-            .collect()
-    };
-    let messages = if messages.is_empty() && !block_ids.is_empty() {
-        transcript
-            .messages
-            .into_iter()
-            .filter(|value| {
-                let id_key = match value.get("id") {
-                    Some(Value::Number(number)) => number.to_string(),
-                    Some(Value::String(text)) => text.trim().to_string(),
-                    _ => String::new(),
-                };
-                block_ids.contains(&id_key)
-            })
-            .collect()
-    } else {
-        messages
-    };
-
+    let messages: Vec<Value> = transcript
+        .messages
+        .into_iter()
+        .filter(|value| {
+            let key = match value.get("id") {
+                Some(Value::Number(number)) => number.to_string(),
+                Some(Value::String(text)) => text.trim().to_string(),
+                _ => String::new(),
+            };
+            block_ids.contains(&key)
+        })
+        .collect();
     Ok(json!({
         "sessionId": session_id,
         "turns": page_turns,
@@ -4505,21 +4833,23 @@ fn delete_project_session(
     workspace: String,
     session_id: Value,
 ) -> Result<Vec<Value>, String> {
-    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
-    let dir = session_dir(&project_root, &session_id);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| format!("删除会话记录失败: {e}"))?;
-    }
-    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+    let key = project_session_key(&workspace, session_id);
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    store
+        .delete_session_snapshot(&key)
+        .map_err(project_session_store_error)?;
+    list_sqlite_project_sessions(&store, &workspace)
 }
 
 #[tauri::command]
 fn clear_project_sessions(app: AppHandle, workspace: String) -> Result<(), String> {
-    let (project_root, _project_id, _workspace_root) = sessions_project_root(&app, &workspace)?;
-    if project_root.exists() {
-        fs::remove_dir_all(&project_root).map_err(|e| format!("清空项目会话记录失败: {e}"))?;
-    }
+    let store = open_project_session_store(&app)?;
+    import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    store
+        .clear_workspace(&normalize_workspace_for_sessions(&workspace))
+        .map_err(project_session_store_error)?;
     Ok(())
 }
 
@@ -5060,7 +5390,7 @@ fn spawn_pty(
     let key = normalize_pty_session_key(session_key);
 
     if let Some(mut existing) = guard.remove(&key) {
-        existing.shutdown();
+        let _ = existing.shutdown();
     }
 
     let pty_system = native_pty_system();
@@ -5121,6 +5451,37 @@ fn spawn_pty(
 }
 
 #[tauri::command]
+fn close_pty(
+    state: State<PtyManager>,
+    session_key: Option<String>,
+) -> Result<PtyCloseResult, String> {
+    let key = normalize_pty_session_key(session_key);
+    let mut session = {
+        let mut guard = state
+            .sessions
+            .lock()
+            .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+        guard.remove(&key)
+    };
+    let Some(session) = session.as_mut() else {
+        return Ok(PtyCloseResult {
+            session_key: key,
+            closed: false,
+            pid: None,
+            exit_code: None,
+        });
+    };
+    let pid = session.child.process_id();
+    let exit_code = session.shutdown()?;
+    Ok(PtyCloseResult {
+        session_key: key,
+        closed: true,
+        pid,
+        exit_code,
+    })
+}
+
+#[tauri::command]
 fn resize_pty(
     state: State<PtyManager>,
     cols: u16,
@@ -5152,6 +5513,7 @@ fn write_pty(
     input: String,
     session_key: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
+    working_directory: Option<String>,
     user_terminal: Option<bool>,
     allow_foreground_input: Option<bool>,
     expected_foreground_pid: Option<u32>,
@@ -5222,19 +5584,38 @@ fn write_pty(
                 .unwrap_or_else(|| "unknown".to_string()),
         ));
     }
-    if user_terminal != Some(true) {
+    let ordinary_agent_command =
+        user_terminal != Some(true) && allow_foreground_input != Some(true);
+    let prepared_agent_input = if ordinary_agent_command {
+        let working_directory =
+            resolve_command_working_directory(&session.workspace, working_directory.as_deref())?;
+        Some(prepare_pty_agent_input(
+            &session.workspace,
+            &working_directory,
+            &mut session.pending_command,
+            &input,
+            permission_approval.as_ref(),
+        )?)
+    } else if user_terminal != Some(true) {
         validate_pty_input(
             &session.workspace,
             &mut session.pending_command,
             &input,
             permission_approval.as_ref(),
         )?;
+        None
     } else {
         session.pending_command.clear();
-    }
-    let starts_new_generation =
-        (user_terminal != Some(true) && allow_foreground_input != Some(true))
-            || (user_terminal == Some(true) && input.chars().any(|ch| ch == '\r' || ch == '\n'));
+        None
+    };
+    let outbound_input = prepared_agent_input
+        .as_ref()
+        .map(|prepared| prepared.text.as_str())
+        .unwrap_or(input.as_str());
+    let starts_new_generation = prepared_agent_input
+        .as_ref()
+        .is_some_and(|prepared| prepared.launched_command)
+        || (user_terminal == Some(true) && input.chars().any(|ch| ch == '\r' || ch == '\n'));
     if starts_new_generation {
         session.foreground_generation_start_offset = session
             .buffer
@@ -5255,7 +5636,7 @@ fn write_pty(
         .writer
         .lock()
         .map_err(|_| "无法写入 PTY：writer 锁已损坏".to_string())?;
-    if let Err(error) = writer.write_all(input.as_bytes()) {
+    if let Err(error) = writer.write_all(outbound_input.as_bytes()) {
         if control_id.is_some() {
             return Ok(PtyWriteResult {
                 accepted: true,
@@ -5492,14 +5873,24 @@ async fn run_command(
     timeout_ms: Option<u64>,
     workspace: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
+    working_directory: Option<String>,
 ) -> Result<TerminalCommandOutput, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
+    let working_directory =
+        resolve_command_working_directory(&workspace, working_directory.as_deref())?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(100, 600_000));
     tauri::async_runtime::spawn_blocking(move || {
         let _lock = get_workspace_write_lock().lock().map_err(|_| {
             "RUN_COMMAND_LOCK_POISONED: workspace command lock is unavailable".to_string()
         })?;
-        run_workspace_shell_command(&workspace, command, input, timeout, permission_approval)
+        run_workspace_shell_command(
+            &workspace,
+            &working_directory,
+            command,
+            input,
+            timeout,
+            permission_approval,
+        )
     })
     .await
     .map_err(|error| format!("RUN_COMMAND_TASK_FAILED: {error}"))?
@@ -7509,8 +7900,35 @@ enum ProxyPhaseError<E> {
     Inner(E),
 }
 
-async fn await_proxy_abortable_phase<F, T, E>(
-    request_lease: &ProxyRequestLease,
+#[derive(Clone, Copy)]
+enum GuardedRequestLease<'a> {
+    Proxy(&'a ProxyRequestLease),
+    Stream(&'a ChatStreamLease),
+    ImageStudio,
+}
+
+impl GuardedRequestLease<'_> {
+    fn is_cancelled(self) -> bool {
+        match self {
+            Self::Proxy(lease) => lease.is_cancelled(),
+            Self::Stream(lease) => lease.is_cancelled(),
+            Self::ImageStudio => {
+                IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Acquire)
+            }
+        }
+    }
+
+    fn set_abort_handle(self, handle: Option<futures_util::future::AbortHandle>) {
+        match self {
+            Self::Proxy(lease) => lease.set_abort_handle(handle),
+            Self::Stream(lease) => lease.set_abort_handle(handle),
+            Self::ImageStudio => set_image_studio_abort_handle(handle),
+        }
+    }
+}
+
+async fn await_guarded_abortable_phase<F, T, E>(
+    request_lease: GuardedRequestLease<'_>,
     timeout: Duration,
     future: F,
 ) -> Result<T, ProxyPhaseError<E>>
@@ -7539,6 +7957,388 @@ where
         Ok(Ok(Err(error))) => Err(ProxyPhaseError::Inner(error)),
         Ok(Ok(Ok(value))) => Ok(value),
     }
+}
+
+async fn await_proxy_abortable_phase<F, T, E>(
+    request_lease: &ProxyRequestLease,
+    timeout: Duration,
+    future: F,
+) -> Result<T, ProxyPhaseError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    await_guarded_abortable_phase(GuardedRequestLease::Proxy(request_lease), timeout, future).await
+}
+
+const PROXY_MAX_REDIRECT_HOPS: usize = 8;
+
+struct ResolvedProxyNetworkTarget {
+    target: AuthorizedNetworkTarget,
+    addresses: Vec<SocketAddr>,
+}
+
+fn proxy_network_grant(
+    url: &str,
+    headers: &HashMap<String, String>,
+    allow_explicit_local: bool,
+) -> Result<NetworkGrant, String> {
+    let allow_authorization = headers
+        .keys()
+        .any(|name| is_sensitive_cross_origin_header(name));
+    let grant = if allow_explicit_local && is_explicit_local_network_url(url) {
+        NetworkGrant::for_explicit_local_origin(url, allow_authorization)
+    } else {
+        NetworkGrant::from_urls([url], allow_authorization)
+    };
+    grant.map_err(|error| format!("NETWORK_GUARD_DENIED: {error}"))
+}
+
+async fn resolve_authorized_proxy_target(
+    target: AuthorizedNetworkTarget,
+    request_lease: Option<GuardedRequestLease<'_>>,
+) -> Result<ResolvedProxyNetworkTarget, String> {
+    let host = target
+        .url
+        .host_str()
+        .ok_or_else(|| "NETWORK_GUARD_DENIED: network URL has no host".to_string())?
+        .to_string();
+    let port = target
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| "NETWORK_GUARD_DENIED: network URL has no effective port".to_string())?;
+    let lookup_host = host.clone();
+    let lookup = async move {
+        tauri::async_runtime::spawn_blocking(move || {
+            (lookup_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+                .map_err(|error| format!("DNS 解析失败: {error}"))
+        })
+        .await
+        .map_err(|error| format!("DNS 解析任务失败: {error}"))?
+    };
+    let timeout = Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS);
+    let mut addresses = if let Some(request_lease) = request_lease {
+        match await_guarded_abortable_phase(request_lease, timeout, lookup).await {
+            Ok(addresses) => addresses,
+            Err(ProxyPhaseError::Aborted) => return Err("Aborted".to_string()),
+            Err(ProxyPhaseError::TimedOut) => {
+                return Err(format!("DNS 解析超过 {} 秒", HTTP_CONNECT_TIMEOUT_SECS))
+            }
+            Err(ProxyPhaseError::Inner(error)) => return Err(error),
+        }
+    } else {
+        tokio::time::timeout(timeout, lookup)
+            .await
+            .map_err(|_| format!("DNS 解析超过 {} 秒", HTTP_CONNECT_TIMEOUT_SECS))??
+    };
+    addresses.sort_unstable();
+    addresses.dedup();
+    let resolved_ips = addresses.iter().map(SocketAddr::ip).collect::<Vec<_>>();
+    target
+        .validate_resolved_addresses(&resolved_ips)
+        .map_err(|error| format!("NETWORK_GUARD_DENIED: {error}"))?;
+
+    Ok(ResolvedProxyNetworkTarget { target, addresses })
+}
+
+async fn resolve_proxy_target(
+    grant: &NetworkGrant,
+    url: &str,
+    request_lease: Option<GuardedRequestLease<'_>>,
+) -> Result<ResolvedProxyNetworkTarget, String> {
+    let target = grant
+        .authorize_url(url)
+        .map_err(|error| format!("NETWORK_GUARD_DENIED: {error}"))?;
+    resolve_authorized_proxy_target(target, request_lease).await
+}
+
+fn is_followable_proxy_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::FOUND
+            | reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn is_sensitive_cross_origin_header(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "cookie2"
+            | "api-key"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-goog-user-project"
+            | "chatgpt-account-id"
+            | "openai-organization"
+            | "openai-project"
+            | "x-csrf-token"
+            | "x-xsrf-token"
+    ) || normalized.ends_with("-api-key")
+        || normalized.contains("access-token")
+        || normalized.contains("auth-token")
+        || normalized.contains("security-token")
+        || normalized.contains("secret")
+}
+
+fn is_forbidden_proxy_request_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        // Request framing and routing belong to the trusted transport. A
+        // caller-controlled value here can override the URL authority or
+        // create an ambiguous HTTP message after reqwest attaches a body.
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "expect"
+    )
+}
+
+fn validate_proxy_request_headers(headers: &HashMap<String, String>) -> Result<(), String> {
+    for (name, value) in headers {
+        let normalized = name.trim();
+        reqwest::header::HeaderName::from_bytes(normalized.as_bytes()).map_err(|error| {
+            format!("NETWORK_GUARD_DENIED: invalid request header name `{name}`: {error}")
+        })?;
+        reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            format!("NETWORK_GUARD_DENIED: invalid request header value for `{name}`: {error}")
+        })?;
+        if is_forbidden_proxy_request_header(normalized) {
+            return Err(format!(
+                "NETWORK_GUARD_DENIED: request header `{name}` is owned by the trusted transport"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_cross_origin_proxy_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        // Unknown custom headers may contain credentials even when their
+        // names do not match today's provider-specific token conventions.
+        "accept"
+            | "accept-language"
+            | "accept-charset"
+            | "user-agent"
+            | "range"
+            | "cache-control"
+            | "pragma"
+            | "if-match"
+            | "if-none-match"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "content-type"
+    )
+}
+
+struct AuthorizedProxyRedirectHop {
+    grant: NetworkGrant,
+    target: AuthorizedNetworkTarget,
+    forward_sensitive_headers: bool,
+    cross_origin: bool,
+}
+
+fn authorize_proxy_redirect_hop(
+    grant: &NetworkGrant,
+    previous: &AuthorizedNetworkTarget,
+    redirect_url: &str,
+) -> Result<AuthorizedProxyRedirectHop, String> {
+    match grant.authorize_redirect(previous, redirect_url) {
+        Ok(redirect) => Ok(AuthorizedProxyRedirectHop {
+            grant: grant.clone(),
+            target: redirect.target,
+            forward_sensitive_headers: redirect.forward_authorization,
+            cross_origin: false,
+        }),
+        Err(NetworkGuardError::OriginNotGranted(_)) => {
+            // A public redirect may establish a new exact-origin grant, but
+            // it never inherits the local-endpoint exception or credentials.
+            let public_grant = NetworkGrant::from_urls([redirect_url], false)
+                .map_err(|error| format!("NETWORK_GUARD_DENIED: redirect rejected: {error}"))?;
+            let target = public_grant
+                .authorize_url(redirect_url)
+                .map_err(|error| format!("NETWORK_GUARD_DENIED: redirect rejected: {error}"))?;
+            if previous.url.scheme() == "https" && target.url.scheme() != "https" {
+                return Err(
+                    "NETWORK_GUARD_DENIED: HTTPS redirect cannot downgrade to HTTP".to_string(),
+                );
+            }
+            Ok(AuthorizedProxyRedirectHop {
+                grant: public_grant,
+                target,
+                forward_sensitive_headers: false,
+                cross_origin: true,
+            })
+        }
+        Err(error) => Err(format!("NETWORK_GUARD_DENIED: redirect rejected: {error}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_guarded_proxy_request(
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: Option<&str>,
+    client_timeout: Option<Duration>,
+    response_timeout: Duration,
+    http1_only: bool,
+    default_json_content_type: bool,
+    identity_encoding: bool,
+    allow_explicit_local: bool,
+    request_lease: Option<GuardedRequestLease<'_>>,
+) -> Result<reqwest::Response, String> {
+    validate_proxy_request_headers(headers)?;
+    let mut grant = proxy_network_grant(url, headers, allow_explicit_local)?;
+    let mut resolved = resolve_proxy_target(&grant, url, request_lease).await?;
+    let mut current_method = method.to_uppercase();
+    let mut current_body = body.map(str::to_string);
+    let mut forward_sensitive_headers = true;
+
+    for redirect_hops in 0..=PROXY_MAX_REDIRECT_HOPS {
+        let host = resolved
+            .target
+            .url
+            .host_str()
+            .ok_or_else(|| "NETWORK_GUARD_DENIED: network URL has no host".to_string())?;
+        let mut client_builder = reqwest::Client::builder()
+            .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(host, &resolved.addresses);
+        if let Some(client_timeout) = client_timeout {
+            client_builder = client_builder.timeout(client_timeout);
+        }
+        if http1_only {
+            client_builder = client_builder.http1_only();
+        }
+        let client = client_builder
+            .build()
+            .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))?;
+        let request_method = reqwest::Method::from_bytes(current_method.as_bytes())
+            .map_err(|_| format!("Unsupported HTTP method: {current_method}"))?;
+        let mut request = client.request(request_method, resolved.target.url.clone());
+
+        if default_json_content_type && !has_header_case_insensitive(headers, "Content-Type") {
+            request = request.header("Content-Type", "application/json");
+        }
+        if identity_encoding {
+            request = request.header("Accept-Encoding", "identity");
+        }
+        for (key, value) in headers {
+            if !forward_sensitive_headers && !is_safe_cross_origin_proxy_header(key) {
+                continue;
+            }
+            if identity_encoding && key.eq_ignore_ascii_case("Accept-Encoding") {
+                continue;
+            }
+            request = request.header(key.as_str(), value.as_str());
+        }
+        if let Some(body) = current_body.as_deref() {
+            request = request.body(body.to_string());
+        }
+
+        let response = if let Some(request_lease) = request_lease {
+            match await_guarded_abortable_phase(request_lease, response_timeout, request.send())
+                .await
+            {
+                Ok(response) => response,
+                Err(ProxyPhaseError::Aborted) => return Err("Aborted".to_string()),
+                Err(ProxyPhaseError::TimedOut) => {
+                    return Err(format!(
+                        "HTTP_RESPONSE_TIMEOUT: HTTP 请求超过 {} 秒",
+                        response_timeout.as_secs()
+                    ))
+                }
+                Err(ProxyPhaseError::Inner(error)) => return Err(error.to_string()),
+            }
+        } else {
+            request
+                .send()
+                .await
+                .map_err(|error| format!("请求失败: {error}"))?
+        };
+
+        let status = response.status();
+        if !is_followable_proxy_redirect(status) {
+            return Ok(response);
+        }
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Ok(response);
+        };
+        if redirect_hops == PROXY_MAX_REDIRECT_HOPS {
+            return Err(format!(
+                "NETWORK_GUARD_DENIED: redirect exceeded {} hops",
+                PROXY_MAX_REDIRECT_HOPS
+            ));
+        }
+        let location = location
+            .to_str()
+            .map_err(|_| "NETWORK_GUARD_DENIED: redirect Location is not valid text".to_string())?;
+        let redirect_url = resolved
+            .target
+            .url
+            .join(location)
+            .map_err(|error| format!("NETWORK_GUARD_DENIED: invalid redirect URL: {error}"))?;
+        let redirect =
+            authorize_proxy_redirect_hop(&grant, &resolved.target, redirect_url.as_str())?;
+        forward_sensitive_headers = redirect.forward_sensitive_headers;
+        let rewrite_to_get = status == reqwest::StatusCode::SEE_OTHER
+            || ((status == reqwest::StatusCode::MOVED_PERMANENTLY
+                || status == reqwest::StatusCode::FOUND)
+                && current_method == "POST");
+        if redirect.cross_origin && current_body.is_some() && !rewrite_to_get {
+            return Err(
+                "NETWORK_GUARD_DENIED: cross-origin redirect cannot forward a request body"
+                    .to_string(),
+            );
+        }
+        if rewrite_to_get {
+            current_method = "GET".to_string();
+            current_body = None;
+        }
+        grant = redirect.grant;
+        resolved = resolve_authorized_proxy_target(redirect.target, request_lease).await?;
+    }
+
+    unreachable!("redirect loop returns or advances within the configured bound")
+}
+
+pub(crate) async fn send_guarded_public_get(
+    url: &str,
+    user_agent: &str,
+    timeout_duration: Duration,
+) -> Result<reqwest::Response, String> {
+    let headers = HashMap::from([("User-Agent".to_string(), user_agent.to_string())]);
+    send_guarded_proxy_request(
+        url,
+        "GET",
+        &headers,
+        None,
+        Some(timeout_duration),
+        timeout_duration,
+        false,
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
 }
 
 async fn read_proxy_error_body(
@@ -7591,7 +8391,6 @@ async fn proxy_request(
         body
     };
     let body_for_debug = body.clone();
-    let body_for_request = body_for_debug.clone();
     let request_started_at = std::time::Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions")
@@ -7606,32 +8405,8 @@ async fn proxy_request(
         HTTP_SHORT_TIMEOUT_SECS
     };
 
-    let mut client_builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(request_timeout_secs))
-        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS));
-    if is_model_request {
-        client_builder = client_builder.http1_only();
-    }
-    let client = client_builder
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-
-    let mut req = match meth.as_str() {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        _ => return Err(format!("Unsupported HTTP method: {meth}")),
-    };
-
-    if !has_header_case_insensitive(&headers, "Content-Type") {
-        req = req.header("Content-Type", "application/json");
-    }
-    if is_model_request {
-        req = req.header("Accept-Encoding", "identity");
-    }
-
-    for (key, value) in &headers {
-        req = req.header(key.as_str(), value.as_str());
+    if !matches!(meth.as_str(), "GET" | "POST") {
+        return Err(format!("Unsupported HTTP method: {meth}"));
     }
 
     if is_model_request {
@@ -7708,24 +8483,20 @@ async fn proxy_request(
         record_debug_log(&app, "info", "proxy_request", debug_parts.join(" "));
     }
 
-    let req = if let Some(body_str) = body_for_request {
-        req.body(body_str)
-    } else {
-        req
-    };
-
-    let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
-    request_lease.set_abort_handle(Some(abort_handle));
-
-    let response = match futures_util::future::Abortable::new(req.send(), abort_registration).await
-    {
-        Err(_) => {
-            request_lease.set_abort_handle(None);
-            return Err("Aborted".to_string());
-        }
-        Ok(response) => response,
-    };
-    request_lease.set_abort_handle(None);
+    let response = send_guarded_proxy_request(
+        &url,
+        &meth,
+        &headers,
+        body_for_debug.as_deref(),
+        Some(Duration::from_secs(request_timeout_secs)),
+        Duration::from_secs(request_timeout_secs),
+        is_model_request,
+        true,
+        is_model_request,
+        true,
+        Some(GuardedRequestLease::Proxy(&request_lease)),
+    )
+    .await;
 
     let response = match response {
         Ok(response) => response,
@@ -8044,35 +8815,23 @@ async fn proxy_request_detailed(
 ) -> Result<ProxyDetailedResponse, String> {
     let headers = headers.unwrap_or_default();
     let meth = method.to_uppercase();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
-        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-
-    let mut req = match meth.as_str() {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "DELETE" => client.delete(&url),
-        _ => return Err(format!("Unsupported HTTP method: {meth}")),
-    };
-
-    if meth == "POST" && !has_header_case_insensitive(&headers, "Content-Type") {
-        req = req.header("Content-Type", "application/json");
+    if !matches!(meth.as_str(), "GET" | "POST" | "DELETE") {
+        return Err(format!("Unsupported HTTP method: {meth}"));
     }
-
-    for (key, value) in &headers {
-        req = req.header(key.as_str(), value.as_str());
-    }
-
-    let req = if let Some(body_str) = body {
-        req.body(body_str)
-    } else {
-        req
-    };
-
-    let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
+    let response = send_guarded_proxy_request(
+        &url,
+        &meth,
+        &headers,
+        body.as_deref(),
+        Some(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS)),
+        Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS),
+        false,
+        meth == "POST",
+        false,
+        true,
+        None,
+    )
+    .await?;
 
     let status = response.status();
     let content_type = response
@@ -8204,10 +8963,8 @@ fn is_allowed_image_studio_host(host: &str) -> bool {
         return true;
     }
     match normalized.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => addr.is_loopback() || addr.is_private() || addr.is_link_local(),
-        Ok(IpAddr::V6(addr)) => {
-            addr.is_loopback() || addr.is_unique_local() || addr.is_unicast_link_local()
-        }
+        Ok(IpAddr::V4(addr)) => addr.is_loopback() || addr.is_private(),
+        Ok(IpAddr::V6(addr)) => addr.is_loopback() || addr.is_unique_local(),
         Err(_) => false,
     }
 }
@@ -8244,10 +9001,15 @@ fn validate_image_studio_endpoint_for_engine(
         if !is_allowed_hugging_face_space_host(host) {
             return Err("HiDream Web fallback endpoint 仅允许官方托管 Space".to_string());
         }
+        NetworkGrant::from_urls([parsed.as_str()], false)
+            .map_err(|error| format!("图像工作室 endpoint 被网络安全策略拒绝: {error}"))?;
     } else if !is_allowed_image_studio_host(host) {
         return Err(
             "图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string(),
         );
+    } else {
+        NetworkGrant::for_explicit_local_origin(parsed.as_str(), false)
+            .map_err(|error| format!("图像工作室 endpoint 被网络安全策略拒绝: {error}"))?;
     }
     Ok(parsed)
 }
@@ -8280,15 +9042,25 @@ async fn check_image_studio_engine(
     endpoint: String,
 ) -> Result<ImageStudioEngineCheckResult, String> {
     let engine_kind = normalize_image_studio_engine(&engine)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|e| format!("创建图像工作室 HTTP 客户端失败: {e}"))?;
+    let headers = HashMap::new();
 
     if engine_kind == "local_image_service" {
         let health_url = build_image_studio_url(engine_kind, &endpoint, "/health")?;
-        match client.get(health_url.clone()).send().await {
+        match send_guarded_proxy_request(
+            health_url.as_str(),
+            "GET",
+            &headers,
+            None,
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5),
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await
+        {
             Ok(response) if response.status().is_success() => {
                 return Ok(ImageStudioEngineCheckResult {
                     ready: true,
@@ -8300,7 +9072,21 @@ async fn check_image_studio_engine(
         }
 
         let models_url = build_image_studio_url(engine_kind, &endpoint, "/v1/models")?;
-        return match client.get(models_url.clone()).send().await {
+        return match send_guarded_proxy_request(
+            models_url.as_str(),
+            "GET",
+            &headers,
+            None,
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5),
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await
+        {
             Ok(response) => {
                 let status = response.status();
                 let ready = status.is_success();
@@ -8322,20 +9108,28 @@ async fn check_image_studio_engine(
             }
             Err(error) => Ok(ImageStudioEngineCheckResult {
                 ready: false,
-                message: if error.is_connect() {
-                    "未连接到本地图片服务，请确认服务已启动并监听在回环或私网地址。".to_string()
-                } else if error.is_timeout() {
-                    "本地图片服务健康检查超时。".to_string()
-                } else {
-                    format!("本地图片服务健康检查失败: {error}")
-                },
+                message: format!("本地图片服务健康检查失败: {error}"),
                 capabilities: image_studio_default_capabilities(engine_kind),
             }),
         };
     }
 
     let url = build_image_studio_url(engine_kind, &endpoint, "/config")?;
-    match client.get(url.clone()).send().await {
+    match send_guarded_proxy_request(
+        url.as_str(),
+        "GET",
+        &headers,
+        None,
+        Some(Duration::from_secs(5)),
+        Duration::from_secs(5),
+        false,
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    {
         Ok(response) => {
             let status = response.status();
             let ready = !status.is_server_error();
@@ -8351,13 +9145,7 @@ async fn check_image_studio_engine(
         }
         Err(error) => Ok(ImageStudioEngineCheckResult {
             ready: false,
-            message: if error.is_connect() {
-                "无法连接 HiDream Web，请检查网络或稍后重试。".to_string()
-            } else if error.is_timeout() {
-                "HiDream Web 健康检查超时。".to_string()
-            } else {
-                format!("HiDream Web 健康检查失败: {error}")
-            },
+            message: format!("HiDream Web 健康检查失败: {error}"),
             capabilities: image_studio_default_capabilities(engine_kind),
         }),
     }
@@ -8377,42 +9165,54 @@ async fn proxy_image_studio_request(
         normalize_image_studio_engine(engine.as_deref().unwrap_or("local_image_service"))?;
     let meth = method.trim().to_ascii_uppercase();
     let url = build_image_studio_url(engine_kind, &endpoint, &path)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS))
-        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建图像工作室 HTTP 客户端失败: {e}"))?;
-
-    let mut req = match meth.as_str() {
-        "GET" => client.get(url.clone()),
-        "POST" => client.post(url.clone()),
-        "DELETE" => client.delete(url.clone()),
-        _ => return Err(format!("Unsupported Image Studio HTTP method: {meth}")),
-    };
-
-    if meth == "POST" {
-        req = req.header("Content-Type", "application/json");
+    if !matches!(meth.as_str(), "GET" | "POST" | "DELETE") {
+        return Err(format!("Unsupported Image Studio HTTP method: {meth}"));
     }
+    let stream_id = (meth == "GET")
+        .then_some(stream_id)
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let mut headers = HashMap::new();
     if stream_id.is_some() {
-        req = req.header("Accept", "text/event-stream");
+        headers.insert("Accept".to_string(), "text/event-stream".to_string());
+        IMAGE_STUDIO_STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Release);
+        set_image_studio_abort_handle(None);
     }
-    let req = if let Some(body_str) = body {
-        req.body(body_str)
-    } else {
-        req
-    };
-
-    if meth == "GET" {
-        if let Some(stream_id) = stream_id.filter(|value| !value.trim().is_empty()) {
-            return stream_image_studio_response(app, stream_id, url.to_string(), req).await;
+    let response = match send_guarded_proxy_request(
+        url.as_str(),
+        &meth,
+        &headers,
+        body.as_deref(),
+        Some(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS)),
+        Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS),
+        false,
+        meth == "POST",
+        false,
+        true,
+        stream_id.as_ref().map(|_| GuardedRequestLease::ImageStudio),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error)
+            if stream_id.is_some()
+                && (error == "Aborted"
+                    || IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Acquire)) =>
+        {
+            let stream_id = stream_id.as_deref().unwrap_or_default();
+            emit_image_studio_stream_done(&app, stream_id, "cancelled", None);
+            return Ok(ImageStudioProxyResponse {
+                status: 499,
+                ok: false,
+                body: String::new(),
+                content_type: None,
+            });
         }
+        Err(error) => return Err(format!("图像工作室请求失败: {error}")),
+    };
+    if let Some(stream_id) = stream_id {
+        return stream_image_studio_response(app, stream_id, response).await;
     }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("图像工作室请求失败: {e}"))?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -8435,33 +9235,9 @@ async fn proxy_image_studio_request(
 async fn stream_image_studio_response(
     app: AppHandle,
     stream_id: String,
-    _url: String,
-    req: reqwest::RequestBuilder,
+    response: reqwest::Response,
 ) -> Result<ImageStudioProxyResponse, String> {
     use futures_util::StreamExt;
-
-    IMAGE_STUDIO_STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
-    set_image_studio_abort_handle(None);
-
-    let (send_abort_handle, send_abort_registration) =
-        futures_util::future::AbortHandle::new_pair();
-    set_image_studio_abort_handle(Some(send_abort_handle));
-    let response_result =
-        futures_util::future::Abortable::new(req.send(), send_abort_registration).await;
-    set_image_studio_abort_handle(None);
-
-    let response = match response_result {
-        Err(_) => {
-            emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
-            return Ok(ImageStudioProxyResponse {
-                status: 499,
-                ok: false,
-                body: String::new(),
-                content_type: None,
-            });
-        }
-        Ok(result) => result.map_err(|e| format!("启动图像工作室流失败: {e}"))?,
-    };
 
     let status = response.status();
     let content_type = response
@@ -8617,6 +9393,7 @@ fn save_image_studio_output_bytes(
     if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建图像输出目录失败: {e}"))?;
     }
+    let real_path = revalidate_write_path(&real_path, &workspace)?;
     fs::write(&real_path, bytes).map_err(|e| format!("保存图像输出失败: {e}"))?;
     Ok(real_path.to_string_lossy().to_string())
 }
@@ -8666,16 +9443,21 @@ async fn save_image_studio_remote_output(
     image_url: String,
 ) -> Result<String, String> {
     let url = validate_image_studio_remote_image_url(&image_url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建远程图像下载客户端失败: {e}"))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载远程图像失败: {e}"))?;
+    let response = send_guarded_proxy_request(
+        url.as_str(),
+        "GET",
+        &HashMap::new(),
+        None,
+        Some(Duration::from_secs(120)),
+        Duration::from_secs(120),
+        false,
+        false,
+        false,
+        true,
+        None,
+    )
+    .await
+    .map_err(|error| format!("下载远程图像失败: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("下载远程图像失败: HTTP {status}"));
@@ -9098,37 +9880,41 @@ async fn start_chat_stream(
         record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
     }
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
-        // Do not set a total timeout for streaming model output: large code
-        // generations can legitimately run for more than five minutes.
-        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    let mut req_builder = client.post(&url);
-    if !has_header_case_insensitive(&headers, "Content-Type") {
-        req_builder = req_builder.header("Content-Type", "application/json");
-    }
-    if is_model_request {
-        req_builder = req_builder.header("Accept-Encoding", "identity");
-    }
-
-    for (key, value) in &headers {
-        req_builder = req_builder.header(key.as_str(), value.as_str());
-    }
-
-    req_builder = req_builder.body(body);
-
-    let (send_abort_handle, send_abort_registration) =
-        futures_util::future::AbortHandle::new_pair();
-    stream_lease.set_abort_handle(Some(send_abort_handle));
-    let response_result = match tokio::time::timeout(
+    // No total client timeout is installed: once headers arrive, the existing
+    // first-chunk and idle watchdogs continue supervising long generations.
+    // The send phase itself remains exact-cancelable and response-bounded.
+    let response = match send_guarded_proxy_request(
+        &url,
+        "POST",
+        &headers,
+        Some(&body),
+        None,
         Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
-        futures_util::future::Abortable::new(req_builder.send(), send_abort_registration),
+        is_model_request,
+        true,
+        is_model_request,
+        true,
+        Some(GuardedRequestLease::Stream(&stream_lease)),
     )
     .await
     {
-        Err(_) => {
+        Ok(response) => response,
+        Err(error) if error == "Aborted" || stream_lease.is_cancelled() => {
+            record_debug_log(
+                &app,
+                "info",
+                "stream_cancelled",
+                format!(
+                    "cancelled_before_response stream_id={} url={} elapsed_ms={}",
+                    stream_id,
+                    url,
+                    stream_started_at.elapsed().as_millis(),
+                ),
+            );
+            emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+            return Ok(());
+        }
+        Err(error) if error.starts_with("HTTP_RESPONSE_TIMEOUT:") => {
             stream_lease.abort_active_request();
             cancel_flag.store(true, std::sync::atomic::Ordering::Release);
             record_debug_log(
@@ -9159,37 +9945,16 @@ async fn start_chat_stream(
             );
             return Ok(());
         }
-        Ok(Err(_)) => {
-            stream_lease.set_abort_handle(None);
+        Err(error) => {
             record_debug_log(
                 &app,
-                "info",
-                "stream_cancelled",
-                format!(
-                    "cancelled_before_response stream_id={} url={} elapsed_ms={}",
-                    stream_id,
-                    url,
-                    stream_started_at.elapsed().as_millis(),
-                ),
+                "error",
+                "start_chat_stream",
+                format!("request_failed url={} err={}", url, error),
             );
-            emit_chat_stream_done(&app, &stream_id, "cancelled", None);
-            return Ok(());
-        }
-        Ok(Ok(result)) => {
-            stream_lease.set_abort_handle(None);
-            result
+            return Err(format!("请求失败: {error}"));
         }
     };
-
-    let response = response_result.map_err(|e| {
-        record_debug_log(
-            &app,
-            "error",
-            "start_chat_stream",
-            format!("request_failed url={} err={}", url, e),
-        );
-        format!("请求失败: {e}")
-    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -10252,8 +11017,15 @@ fn run_hook_command(
         return Err("Hook 命令不能为空".to_string());
     }
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(4_000).clamp(100, 60_000));
-    let output = run_workspace_shell_command(&workspace, trimmed.to_string(), input, timeout, None)
-        .map_err(|e| format!("Hook 命令执行失败: {e}"))?;
+    let output = run_workspace_shell_command(
+        &workspace,
+        &workspace,
+        trimmed.to_string(),
+        input,
+        timeout,
+        None,
+    )
+    .map_err(|e| format!("Hook 命令执行失败: {e}"))?;
 
     Ok(HookCommandOutput {
         stdout: output.stdout,
@@ -10571,7 +11343,9 @@ fn copy_knowledge_source_to_store(
 }
 
 #[tauri::command]
-fn knowledge_list_bases(state: State<'_, WorkspaceState>) -> Result<Vec<knowledge::KnowledgeBase>, String> {
+fn knowledge_list_bases(
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<knowledge::KnowledgeBase>, String> {
     let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::list_knowledge_bases(&app_data_dir)
 }
@@ -10678,27 +11452,42 @@ async fn knowledge_import_url(
     max_pages: Option<usize>,
 ) -> Result<knowledge::KnowledgeBase, String> {
     let app_data_dir = knowledge_app_data_dir(&state)?;
-    
+
     // Clear cancel flag
     set_import_cancelled(&kb_id, false);
 
     let mut entry_url = url::Url::parse(&url).map_err(|e| format!("无效的 URL: {e}"))?;
-    
+
     // Normalize path trailing slash for directory listings (e.g. without trailing slash)
-    if !entry_url.path().ends_with('/') && !entry_url.path().split('/').last().unwrap_or("").contains('.') {
+    if !entry_url.path().ends_with('/')
+        && !entry_url
+            .path()
+            .split('/')
+            .last()
+            .unwrap_or("")
+            .contains('.')
+    {
         let mut new_path = entry_url.path().to_string();
         new_path.push('/');
         entry_url.set_path(&new_path);
     }
-    
+
     // Calculate folder prefix
     let mut prefix = entry_url.to_string();
     if let Some(last_slash_idx) = prefix.rfind('/') {
         prefix.truncate(last_slash_idx + 1);
     }
-    
-    let depth_limit = if recursive { max_depth.unwrap_or(2).clamp(1, 3) } else { 1 };
-    let page_limit = if recursive { max_pages.unwrap_or(50).clamp(1, 100) } else { 1 };
+
+    let depth_limit = if recursive {
+        max_depth.unwrap_or(2).clamp(1, 3)
+    } else {
+        1
+    };
+    let page_limit = if recursive {
+        max_pages.unwrap_or(50).clamp(1, 100)
+    } else {
+        1
+    };
 
     let mut queue = VecDeque::new();
     queue.push_back((entry_url.clone(), 1));
@@ -10708,9 +11497,19 @@ async fn knowledge_import_url(
     queued.insert(url.clone());
 
     // Unity ScriptReference TOC Loader Optimization
-    if recursive && entry_url.path().to_ascii_lowercase().contains("/scriptreference") {
+    if recursive
+        && entry_url
+            .path()
+            .to_ascii_lowercase()
+            .contains("/scriptreference")
+    {
         if let Ok(toc_url) = entry_url.join("docdata/toc.json") {
-            record_debug_log(&app, "info", "knowledge", format!("检测到 Unity ScriptReference，尝试加载 TOC: {}", toc_url));
+            record_debug_log(
+                &app,
+                "info",
+                "knowledge",
+                format!("检测到 Unity ScriptReference，尝试加载 TOC: {}", toc_url),
+            );
             if let Ok(fetched_toc) = web_search::fetch_page_raw(toc_url.as_str()).await {
                 let link_re = Regex::new(r#""link":"([^"]+)""#).unwrap();
                 for caps in link_re.captures_iter(&fetched_toc.content) {
@@ -10719,7 +11518,9 @@ async fn knowledge_import_url(
                         if let Ok(mut resolved) = entry_url.join(&format!("{}.html", link)) {
                             resolved.set_fragment(None);
                             let link_str = resolved.to_string();
-                            if !queued.contains(&link_str) && visited.len() + queue.len() < page_limit {
+                            if !queued.contains(&link_str)
+                                && visited.len() + queue.len() < page_limit
+                            {
                                 queued.insert(link_str);
                                 queue.push_back((resolved, 1)); // Queue to crawl at depth 1
                             }
@@ -10732,7 +11533,12 @@ async fn knowledge_import_url(
 
     while let Some((current_url, depth)) = queue.pop_front() {
         if is_import_cancelled(&kb_id) {
-            record_debug_log(&app, "info", "knowledge", format!("网页导入任务被取消: {}", kb_id));
+            record_debug_log(
+                &app,
+                "info",
+                "knowledge",
+                format!("网页导入任务被取消: {}", kb_id),
+            );
             break;
         }
 
@@ -10758,7 +11564,11 @@ async fn knowledge_import_url(
                 let hash = {
                     use sha2::{Digest, Sha256};
                     let digest = Sha256::digest(content_bytes);
-                    digest.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
+                    digest
+                        .iter()
+                        .take(12)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
                 };
                 let sanitized_title = knowledge::sanitize_file_name(&fetched.title);
                 let file_name = if sanitized_title.is_empty() {
@@ -10816,7 +11626,12 @@ async fn knowledge_import_url(
                 }
             }
             Err(err) => {
-                record_debug_log(&app, "warn", "knowledge", format!("抓取网页失败 {}: {}", url_str, err));
+                record_debug_log(
+                    &app,
+                    "warn",
+                    "knowledge",
+                    format!("抓取网页失败 {}: {}", url_str, err),
+                );
                 let _ = app.emit(
                     "knowledge-import-progress",
                     json!({
@@ -11034,7 +11849,12 @@ fn runtime_script_path(file_name: &str) -> PathBuf {
             candidates.push(binary_dir.join("scripts").join(file_name));
             candidates.push(binary_dir.join("resources").join("scripts").join(file_name));
             if let Some(contents_dir) = binary_dir.parent() {
-                candidates.push(contents_dir.join("Resources").join("scripts").join(file_name));
+                candidates.push(
+                    contents_dir
+                        .join("Resources")
+                        .join("scripts")
+                        .join(file_name),
+                );
             }
         }
     }
@@ -11745,6 +12565,7 @@ pub fn run() {
             web_search::web_search,
             web_search::web_fetch,
             spawn_pty,
+            close_pty,
             resize_pty,
             write_pty,
             read_pty_buffer,
@@ -11849,20 +12670,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        await_proxy_abortable_phase, browser_evaluate_supervisor_timeout, cancel_chat_stream,
-        cancel_proxy_request, compare_file_nodes, delete_path_within_workspace,
-        delete_plan_files_in_dir, get_proxy_request_registry, get_stream_registry,
-        is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
-        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
-        parse_git_porcelain_entries, parse_git_porcelain_status, pty_foreground_state,
-        pty_shell_available, read_pty_current_generation_view, read_pty_generation_since,
-        read_pty_generation_tail, read_session_transcript_with_fallback, resolve_existing_path,
-        resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
-        run_cancellable_bounded_process, should_hide_list_directory_entry,
-        should_skip_recursive_search_dir, validate_pty_input, write_json_atomic,
-        write_jsonl_atomic, ChatStreamLease, FileNode, ProxyPhaseError, ProxyRequestLease,
-        SessionTranscript, EARLY_CANCELLED_PROXY_REQUEST_LIMIT, EARLY_CANCELLED_STREAM_LIMIT,
-        PTY_TAIL_DEFAULT_CHARS,
+        authorize_proxy_redirect_hop, await_proxy_abortable_phase,
+        browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
+        compare_file_nodes, delete_path_within_workspace, delete_plan_files_in_dir,
+        get_proxy_request_registry, get_stream_registry, is_safe_cross_origin_proxy_header,
+        is_sensitive_cross_origin_header, is_supported_attachment_path, is_valid_git_branch_name,
+        looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
+        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
+        prepare_pty_agent_input, proxy_network_grant, pty_foreground_state, pty_shell_available,
+        read_pty_current_generation_view, read_pty_generation_since, read_pty_generation_tail,
+        read_session_transcript_with_fallback, resolve_command_working_directory,
+        resolve_existing_path, resolve_open_file_external_path, resolve_write_path,
+        revalidate_write_path, run_cancellable_bounded_process, run_workspace_shell_command,
+        should_hide_list_directory_entry, should_skip_recursive_search_dir,
+        validate_image_studio_endpoint_for_engine, validate_image_studio_remote_image_url,
+        validate_proxy_request_headers, validate_pty_input, ChatStreamLease, FileNode,
+        ProxyPhaseError, ProxyRequestLease, EARLY_CANCELLED_PROXY_REQUEST_LIMIT,
+        EARLY_CANCELLED_STREAM_LIMIT, PTY_TAIL_DEFAULT_CHARS,
     };
     use serde_json::json;
     use std::fs;
@@ -11870,6 +12694,171 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     static CANCELLATION_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn proxy_redirects_regrant_only_public_origins_and_strip_sensitive_headers() {
+        let headers = std::collections::HashMap::from([
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("x-api-key".to_string(), "secret".to_string()),
+        ]);
+        let grant = proxy_network_grant("https://api.example.com/start", &headers, false).unwrap();
+        let initial = grant
+            .authorize_url("https://api.example.com/start")
+            .unwrap();
+
+        let same_origin =
+            authorize_proxy_redirect_hop(&grant, &initial, "https://api.example.com/next").unwrap();
+        assert!(same_origin.forward_sensitive_headers);
+        assert!(!same_origin.cross_origin);
+
+        let cross_origin =
+            authorize_proxy_redirect_hop(&grant, &initial, "https://cdn.example.com/model")
+                .unwrap();
+        assert!(!cross_origin.forward_sensitive_headers);
+        assert!(cross_origin.cross_origin);
+        assert!(cross_origin
+            .grant
+            .authorize_url("https://cdn.example.com/next")
+            .is_ok());
+        assert!(cross_origin
+            .grant
+            .authorize_url("https://api.example.com/next")
+            .is_err());
+
+        for forbidden in [
+            "http://127.0.0.1:8080/steal",
+            "http://cdn.example.com/insecure",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            assert!(authorize_proxy_redirect_hop(&grant, &initial, forbidden).is_err());
+        }
+        for header in [
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "api-key",
+            "x-goog-api-key",
+            "x-amz-security-token",
+            "client-secret",
+        ] {
+            assert!(is_sensitive_cross_origin_header(header), "{header}");
+        }
+        assert!(!is_sensitive_cross_origin_header("Content-Type"));
+    }
+
+    #[test]
+    fn proxy_request_headers_keep_authority_and_framing_transport_owned() {
+        for forbidden in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "Upgrade",
+            "TE",
+            "Trailer",
+            "Expect",
+        ] {
+            let headers = std::collections::HashMap::from([(
+                forbidden.to_string(),
+                "attacker-controlled".to_string(),
+            )]);
+            assert!(
+                validate_proxy_request_headers(&headers).is_err(),
+                "{forbidden}"
+            );
+        }
+
+        let invalid_value = std::collections::HashMap::from([(
+            "X-Test".to_string(),
+            "value\r\ninjected: true".to_string(),
+        )]);
+        assert!(validate_proxy_request_headers(&invalid_value).is_err());
+        let safe = std::collections::HashMap::from([
+            ("Accept".to_string(), "application/json".to_string()),
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+        ]);
+        validate_proxy_request_headers(&safe).unwrap();
+    }
+
+    #[test]
+    fn cross_origin_proxy_headers_use_a_safe_allowlist() {
+        for safe in [
+            "Accept",
+            "Accept-Language",
+            "User-Agent",
+            "Range",
+            "Cache-Control",
+            "If-None-Match",
+            "Content-Type",
+        ] {
+            assert!(is_safe_cross_origin_proxy_header(safe), "{safe}");
+        }
+        for stripped in [
+            "Authorization",
+            "Cookie",
+            "X-Api-Key",
+            "X-Custom-Session",
+            "OpenAI-Beta",
+            "Origin",
+            "Referer",
+            "Content-Length",
+        ] {
+            assert!(!is_safe_cross_origin_proxy_header(stripped), "{stripped}");
+        }
+    }
+
+    #[test]
+    fn curl_fallback_treats_redirects_as_explicit_errors() {
+        let output = "redirect body\n__HTTP_STATUS__:302".to_string();
+        let error = parse_curl_status_output(output, "https://api.example.com/start")
+            .expect_err("curl fallback must never silently accept a redirect");
+        assert!(error.starts_with("HTTP 302:"));
+    }
+
+    #[test]
+    fn image_studio_local_exceptions_never_include_metadata_or_link_local_hosts() {
+        for endpoint in [
+            "http://169.254.169.254",
+            "http://[fe80::1]",
+            "http://224.0.0.1",
+        ] {
+            validate_image_studio_endpoint_for_engine("local_image_service", endpoint)
+                .expect_err(endpoint);
+            validate_image_studio_remote_image_url(&format!("{endpoint}/output.png"))
+                .expect_err(endpoint);
+        }
+
+        validate_image_studio_endpoint_for_engine(
+            "local_image_service",
+            "http://192.168.1.10:8188",
+        )
+        .expect("an explicit RFC1918 image service remains supported");
+    }
+
+    fn write_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
+        let content = serde_json::to_string_pretty(value)
+            .map_err(|error| format!("serialize test Session JSON: {error}"))?;
+        fs::write(path, content + "\n").map_err(|error| format!("write test Session JSON: {error}"))
+    }
+
+    fn write_jsonl_atomic(
+        path: &std::path::Path,
+        values: &[serde_json::Value],
+        _error_label: &str,
+    ) -> Result<(), String> {
+        let mut content = String::new();
+        for value in values {
+            content.push_str(
+                &serde_json::to_string(value)
+                    .map_err(|error| format!("serialize test Session JSONL: {error}"))?,
+            );
+            content.push('\n');
+        }
+        fs::write(path, content).map_err(|error| format!("write test Session JSONL: {error}"))
+    }
 
     #[test]
     fn proxy_cancellation_is_scoped_by_request_id() {
@@ -12146,6 +13135,102 @@ mod tests {
         let root = std::env::temp_dir().join(format!("main-workspace-{name}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_shell_cwd_is_explicit_and_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let parent = make_temp_workspace("trusted-command-cwd");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        let subdir = workspace.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace.join("outside-cwd")).unwrap();
+        symlink(&outside, subdir.join("escape")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let subdir = subdir.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_command_working_directory(&workspace, None).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            resolve_command_working_directory(&workspace, Some(".")).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            resolve_command_working_directory(&workspace, Some("subdir")).unwrap(),
+            subdir
+        );
+        assert!(resolve_command_working_directory(&workspace, Some("outside-cwd")).is_err());
+
+        let output = run_workspace_shell_command(
+            &workspace,
+            &subdir,
+            "pwd".to_string(),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), subdir.to_string_lossy());
+
+        let command = "printf ok > escape/out.txt";
+        let approval = crate::harness::permissions::ShellPermissionApproval {
+            command: command.to_string(),
+            approved_at_ms: Some(1),
+            scope: Some("once".to_string()),
+            rules: Vec::new(),
+            risk_level: None,
+        };
+        let error = match run_workspace_shell_command(
+            &workspace,
+            &subdir,
+            command.to_string(),
+            None,
+            Duration::from_secs(2),
+            Some(approval),
+        ) {
+            Ok(_) => panic!("production redirection must revalidate symlink parents"),
+            Err(error) => error,
+        };
+        assert!(error.contains("TRUSTED_EXECUTION_REJECTED"));
+        assert!(!outside.join("out.txt").exists());
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_agent_input_buffers_raw_command_then_applies_trusted_cwd() {
+        let parent = make_temp_workspace("trusted-pty-cwd");
+        let workspace = parent.join("workspace");
+        let subdir = workspace.join("subdir-with-'quote");
+        fs::create_dir_all(&subdir).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let subdir = subdir.canonicalize().unwrap();
+        let mut pending = String::new();
+
+        let partial =
+            prepare_pty_agent_input(&workspace, &subdir, &mut pending, "pwd", None).unwrap();
+        assert!(partial.text.is_empty());
+        assert!(!partial.launched_command);
+        assert_eq!(pending, "pwd");
+
+        let completed =
+            prepare_pty_agent_input(&workspace, &subdir, &mut pending, "\r", None).unwrap();
+        assert!(completed.launched_command);
+        assert!(completed.text.starts_with("/bin/sh -c "));
+        assert!(completed.text.contains("main-pty-cwd"));
+        assert!(completed.text.contains("'\\''quote"));
+        assert!(completed.text.ends_with("'pwd'\r"));
+        assert!(pending.is_empty());
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -12428,27 +13513,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_json_rows_by_id_preserves_existing_rows_and_replaces_loaded_page() {
-        let existing = vec![
-            json!({"id": 1, "content": "old one"}),
-            json!({"id": 2, "content": "old two"}),
-            json!({"id": 3, "content": "old three"}),
-        ];
-        let incoming = vec![
-            json!({"id": 2, "content": "new two"}),
-            json!({"id": 4, "content": "new four"}),
-        ];
-
-        let merged = merge_json_rows_by_id(existing, incoming);
-
-        assert_eq!(merged.len(), 4);
-        assert_eq!(merged[0]["content"], "old one");
-        assert_eq!(merged[1]["content"], "new two");
-        assert_eq!(merged[2]["content"], "old three");
-        assert_eq!(merged[3]["content"], "new four");
-    }
-
-    #[test]
     fn session_transcript_readers_fall_back_to_legacy_runtime_snapshot() {
         let workspace = make_temp_workspace("legacy-session-runtime");
         let runtime_path = workspace.join("runtime.json");
@@ -12597,23 +13661,6 @@ mod tests {
     }
 
     #[test]
-    fn session_save_resolution_keeps_existing_transcript_when_incoming_is_empty() {
-        let existing = SessionTranscript {
-            messages: vec![json!({"id": 1, "type": "user", "content": "existing message"})],
-            turns: vec![json!({"id": "turn-existing", "blockIds": [1], "createdAt": 1})],
-            recovered_from_agent_messages: false,
-        };
-
-        let (messages, turns) =
-            resolve_session_transcript_to_write(&existing, Vec::new(), Vec::new(), false);
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["content"], "existing message");
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0]["id"], "turn-existing");
-    }
-
-    #[test]
     fn resolve_existing_path_allows_nested_workspace_directory() {
         let workspace = make_temp_workspace("nested-dir");
         let nested = workspace.join("gdjrpg-prepare");
@@ -12703,6 +13750,60 @@ mod tests {
         assert_eq!(file_path, workspace.join("notes").join("output.md"));
 
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn resolve_write_path_rejects_parent_components_before_missing_children() {
+        let parent = make_temp_workspace("write-parent-escape");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let error = resolve_write_path(
+            "newdir/../../outside/file.txt",
+            &workspace.canonicalize().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("越界") || error.contains("escapes"));
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_path_rejects_symlink_parents_for_existing_and_missing_targets() {
+        let parent = make_temp_workspace("write-symlink-parent");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("existing.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+
+        for path in ["escape/existing.txt", "escape/missing.txt"] {
+            resolve_write_path(path, &workspace).expect_err(path);
+        }
+
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_revalidation_rejects_parent_symlink_replacement() {
+        let parent = make_temp_workspace("write-parent-replacement");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        fs::create_dir_all(workspace.join("safe")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let planned = resolve_write_path("safe/output.txt", &workspace).unwrap();
+
+        fs::remove_dir(workspace.join("safe")).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("safe")).unwrap();
+
+        revalidate_write_path(&planned, &workspace)
+            .expect_err("parent replacement must be rejected before the write");
+        assert!(!outside.join("output.txt").exists());
+        fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]
@@ -12965,5 +14066,33 @@ def global_function(x):
         assert!(outline.contains("type serviceImpl struct"));
         assert!(outline.contains("  name string"));
         assert!(outline.contains("func NewService(name string) Service"));
+    }
+
+    #[test]
+    fn sqlite_session_projection_is_flat_and_revisioned() {
+        let record = crate::session_store::SessionSnapshotRecord {
+            workspace: "/workspace/main".to_string(),
+            session_id: "42".to_string(),
+            revision: 7,
+            snapshot: json!({
+                "id": 42,
+                "title": "SQLite owner",
+                "messages": [{"id": 1, "content": "hello"}],
+                "runtimeSnapshot": {"conversationTurns": []},
+            }),
+            updated_at_ms: 9_000,
+        };
+
+        let full = super::project_session_snapshot_from_record(record.clone()).unwrap();
+        assert_eq!(full["id"], 42);
+        assert_eq!(full["storageRevision"], 7);
+        assert_eq!(full["storageVersion"], 3);
+        assert_eq!(full["storageStatus"], "ok");
+        assert!(full.get("snapshot").is_none());
+
+        let listed = super::project_session_list_snapshot(record).unwrap();
+        assert_eq!(listed["storageRevision"], 7);
+        assert!(listed.get("messages").is_none());
+        assert!(listed.get("runtimeSnapshot").is_none());
     }
 }

@@ -1,9 +1,43 @@
 {
+  "schemaVersion": 1,
   "id": "runtime-harness-modularization",
   "category": "refactor",
-  "success": true,
-  "retries": 0,
-  "hallucinations": 0,
-  "latencyMs": 1800,
-  "toolCalls": 6
+  "trace": [
+    {
+      "sequence": 1,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "cargo-fmt",
+      "toolCall": "cargo_fmt_check",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 2
+    },
+    {
+      "sequence": 2,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "cargo-test",
+      "toolCall": "cargo_test_harness",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 4
+    },
+    {
+      "sequence": 3,
+      "attempt": 1,
+      "eventName": "task_completed",
+      "success": true,
+      "resultKind": "success",
+      "latencyMs": 0
+    }
+  ],
+  "expect": {
+    "resultKind": "success",
+    "eventOrder": ["tool_called", "tool_called", "task_completed"],
+    "requiredTools": ["cargo_fmt_check", "cargo_test_harness"],
+    "allowedTools": ["cargo_fmt_check", "cargo_test_harness"],
+    "maxRetries": 0,
+    "maxToolCalls": 2
+  }
 }

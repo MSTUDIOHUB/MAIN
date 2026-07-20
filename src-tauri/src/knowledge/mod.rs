@@ -1078,7 +1078,8 @@ mod tests {
 
     #[test]
     fn force_reindex_replaces_chunks_and_fts_rows() {
-        let root = std::env::temp_dir().join(format!("main-knowledge-reindex-test-{}", now_millis()));
+        let root =
+            std::env::temp_dir().join(format!("main-knowledge-reindex-test-{}", now_millis()));
         fs::create_dir_all(&root).unwrap();
         let base = create_knowledge_base(&root, "Unity Manual", "Unity API docs").unwrap();
         let source_path = root.join("source.md");

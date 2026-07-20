@@ -1,4 +1,4 @@
-use crate::harness::tracing::{TraceRecord, TraceRecorder};
+use crate::harness::tracing::{new_trace_run_id, TraceRecord, TraceRecorder, TraceResultKind};
 use crate::runtime::context::{ContextManager, RuntimeContext, RuntimeStepSummary};
 use crate::runtime::event_bus::{EventBus, RuntimeEventName};
 use crate::runtime::retry::{RetryDecision, RetryPolicy, RetryState};
@@ -23,6 +23,10 @@ pub struct RuntimeStep {
 pub struct ActionResult {
     pub stdout: String,
     pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub latency_ms: u128,
 }
 
@@ -34,6 +38,10 @@ pub struct Observation {
     pub tool_call: String,
     pub stdout: String,
     pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub latency_ms: u128,
 }
 
@@ -48,7 +56,9 @@ pub struct Verification {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeRunResult {
     pub task_id: String,
-    pub completed: bool,
+    pub run_id: String,
+    pub result_kind: TraceResultKind,
+    pub summary: String,
     pub steps_executed: usize,
 }
 
@@ -112,38 +122,101 @@ impl RuntimeLoop {
         O: RuntimeObserver + Send,
         V: RuntimeVerifier + Send,
     {
+        self.run_with_id(
+            task_id,
+            new_trace_run_id(),
+            planner,
+            executor,
+            observer,
+            verifier,
+        )
+        .await
+    }
+
+    pub async fn run_with_id<P, E, O, V>(
+        &self,
+        task_id: impl Into<String>,
+        run_id: impl Into<String>,
+        planner: &mut P,
+        executor: &mut E,
+        observer: &mut O,
+        verifier: &mut V,
+    ) -> Result<RuntimeRunResult, String>
+    where
+        P: RuntimePlanner + Send,
+        E: RuntimeExecutor + Send,
+        O: RuntimeObserver + Send,
+        V: RuntimeVerifier + Send,
+    {
         let task_id = task_id.into();
+        let run_id = run_id.into();
         let _ = self.event_bus.emit(
             RuntimeEventName::TaskStarted,
             task_id.clone(),
             None,
-            json!({}),
+            json!({"runId": &run_id}),
         );
 
         let mut retry_state = RetryState::new();
+        let mut pending_retry_step: Option<RuntimeStep> = None;
         let mut steps_executed = 0;
 
         loop {
             let context = self.context_manager.build().await;
-            let Some(step) = planner.next_step(context).await else {
-                let _ = self.event_bus.emit(
-                    RuntimeEventName::TaskCompleted,
-                    task_id.clone(),
-                    None,
-                    json!({"completed": true, "reason": "planner_exhausted"}),
-                );
-                return Ok(RuntimeRunResult {
-                    task_id,
-                    completed: true,
-                    steps_executed,
-                });
+            let next_step = match pending_retry_step.take() {
+                Some(step) => Some(step),
+                None => planner.next_step(context).await,
             };
+            let Some(step) = next_step else {
+                let (result_kind, reason) = if retry_state.attempts > 0 {
+                    (
+                        TraceResultKind::Error,
+                        "planner_exhausted_with_unresolved_verification",
+                    )
+                } else if steps_executed == 0 {
+                    (TraceResultKind::Blocked, "planner_exhausted_without_steps")
+                } else {
+                    (
+                        TraceResultKind::Partial,
+                        "planner_exhausted_without_terminal_verification",
+                    )
+                };
+                return self
+                    .complete_run(
+                        &task_id,
+                        &run_id,
+                        result_kind,
+                        reason,
+                        reason,
+                        steps_executed,
+                        None,
+                    )
+                    .await;
+            };
+
+            if step.task_id != task_id {
+                let summary = format!(
+                    "planner step task identity mismatch: expected={} actual={} step={}",
+                    task_id, step.task_id, step.step_id
+                );
+                return self
+                    .complete_run(
+                        &task_id,
+                        &run_id,
+                        TraceResultKind::Error,
+                        "planner_step_task_identity_mismatch",
+                        summary,
+                        steps_executed,
+                        Some(&step.step_id),
+                    )
+                    .await;
+            }
 
             let _ = self.event_bus.emit(
                 RuntimeEventName::ToolCalled,
                 task_id.clone(),
                 Some(step.step_id.clone()),
-                json!({"toolCall": step.tool_call}),
+                json!({"runId": &run_id, "toolCall": step.tool_call}),
             );
 
             let action = executor.execute(&step).await;
@@ -151,21 +224,40 @@ impl RuntimeLoop {
             let verification = verifier.verify(&observation).await;
             steps_executed += 1;
 
-            self.trace_recorder
-                .record(&TraceRecord {
-                    task_id: step.task_id.clone(),
-                    step_id: step.step_id.clone(),
-                    event_name: RuntimeEventName::ToolCalled.as_str().to_string(),
-                    tool_call: step.tool_call.clone(),
-                    stdout: observation.stdout.clone(),
-                    stderr: observation.stderr.clone(),
-                    verification: verification.summary.clone(),
-                    latency_ms: observation.latency_ms,
-                    metadata: json!({
-                        "verificationSuccess": verification.success,
-                    }),
-                })
-                .await?;
+            let mut trace = TraceRecord::tool_result(
+                step.task_id.clone(),
+                step.step_id.clone(),
+                step.tool_call.clone(),
+                observation.stdout.clone(),
+                observation.stderr.clone(),
+                verification.summary.clone(),
+                observation.latency_ms,
+                verification.success,
+            );
+            trace.run_id = Some(run_id.clone());
+            trace.attempt = retry_state.attempts.saturating_add(1) as u32;
+            trace.event_name = RuntimeEventName::ToolCalled.as_str().to_string();
+            trace.result_kind = if verification.success {
+                TraceResultKind::Success
+            } else {
+                TraceResultKind::Error
+            };
+            trace.exit_code = observation.exit_code;
+            trace.timed_out = observation.timed_out;
+            trace.stdout_truncated = observation.stdout_truncated;
+            trace.stderr_truncated = observation.stderr_truncated;
+            trace.events = vec![
+                RuntimeEventName::ToolCalled.as_str().to_string(),
+                if verification.success {
+                    "verification_completed".to_string()
+                } else {
+                    RuntimeEventName::VerificationFailed.as_str().to_string()
+                },
+            ];
+            trace.metadata = json!({
+                "verificationSuccess": verification.success,
+            });
+            self.trace_recorder.record(&trace).await?;
 
             self.context_manager
                 .record_step(RuntimeStepSummary {
@@ -179,17 +271,17 @@ impl RuntimeLoop {
             if verification.success {
                 retry_state = RetryState::new();
                 if step.terminal {
-                    let _ = self.event_bus.emit(
-                        RuntimeEventName::TaskCompleted,
-                        task_id.clone(),
-                        Some(step.step_id.clone()),
-                        json!({"completed": true}),
-                    );
-                    return Ok(RuntimeRunResult {
-                        task_id,
-                        completed: true,
-                        steps_executed,
-                    });
+                    return self
+                        .complete_run(
+                            &task_id,
+                            &run_id,
+                            TraceResultKind::Success,
+                            "terminal_step_verified",
+                            "terminal_step_verified",
+                            steps_executed,
+                            Some(&step.step_id),
+                        )
+                        .await;
                 }
                 continue;
             }
@@ -201,27 +293,81 @@ impl RuntimeLoop {
                 RuntimeEventName::VerificationFailed,
                 task_id.clone(),
                 Some(step.step_id.clone()),
-                json!({"verification": verification.summary}),
+                json!({"runId": &run_id, "verification": verification.summary}),
             );
 
             match self.retry_policy.handle(&mut retry_state).await {
                 RetryDecision::Retry { attempt } => {
+                    // A retry belongs to the exact failed step. Asking the
+                    // planner for another step here can skip the failure and
+                    // later publish a false success from unrelated evidence.
+                    pending_retry_step = Some(step.clone());
                     let _ = self.event_bus.emit(
                         RuntimeEventName::RetryStarted,
                         task_id.clone(),
                         Some(step.step_id.clone()),
-                        json!({"attempt": attempt}),
+                        json!({"runId": &run_id, "attempt": attempt}),
                     );
                 }
                 RetryDecision::Stop => {
-                    return Ok(RuntimeRunResult {
-                        task_id,
-                        completed: false,
-                        steps_executed,
-                    });
+                    let summary = format!(
+                        "verification retry budget exhausted at step {}: {}",
+                        step.step_id, verification.summary
+                    );
+                    return self
+                        .complete_run(
+                            &task_id,
+                            &run_id,
+                            TraceResultKind::Error,
+                            "verification_retry_exhausted",
+                            summary,
+                            steps_executed,
+                            Some(&step.step_id),
+                        )
+                        .await;
                 }
             }
         }
+    }
+
+    async fn complete_run(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        result_kind: TraceResultKind,
+        reason: &str,
+        summary: impl Into<String>,
+        steps_executed: usize,
+        owner_step_id: Option<&str>,
+    ) -> Result<RuntimeRunResult, String> {
+        let summary = summary.into();
+        let conclusion = TraceRecord::conclusion(
+            task_id,
+            run_id,
+            result_kind,
+            reason,
+            summary.clone(),
+            owner_step_id,
+        );
+        self.trace_recorder.record(&conclusion).await?;
+        let _ = self.event_bus.emit(
+            RuntimeEventName::TaskCompleted,
+            task_id.to_string(),
+            owner_step_id.map(str::to_string),
+            json!({
+                "runId": run_id,
+                "resultKind": result_kind,
+                "reason": reason,
+                "summary": summary,
+            }),
+        );
+        Ok(RuntimeRunResult {
+            task_id: task_id.to_string(),
+            run_id: run_id.to_string(),
+            result_kind,
+            summary,
+            steps_executed,
+        })
     }
 }
 
@@ -229,7 +375,7 @@ impl RuntimeLoop {
 mod tests {
     use super::{
         ActionResult, Observation, RuntimeExecutor, RuntimeLoop, RuntimeObserver, RuntimePlanner,
-        RuntimeStep, RuntimeVerifier, Verification,
+        RuntimeStep, RuntimeVerifier, TraceResultKind, Verification,
     };
     use crate::harness::tracing::TraceRecorder;
     use crate::runtime::context::{ContextManager, RuntimeContext};
@@ -271,6 +417,10 @@ mod tests {
                 ActionResult {
                     stdout: step.tool_call.clone(),
                     stderr: String::new(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     latency_ms: 1,
                 }
             })
@@ -292,6 +442,10 @@ mod tests {
                     tool_call: step.tool_call.clone(),
                     stdout: action.stdout,
                     stderr: action.stderr,
+                    exit_code: action.exit_code,
+                    timed_out: action.timed_out,
+                    stdout_truncated: action.stdout_truncated,
+                    stderr_truncated: action.stderr_truncated,
                     latency_ms: action.latency_ms,
                 }
             })
@@ -396,21 +550,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(result.completed);
+            assert_eq!(result.result_kind, TraceResultKind::Success);
             assert_eq!(result.steps_executed, 2);
-            assert_eq!(
-                TraceRecorder::new(&trace_root)
-                    .replay("task")
-                    .await
-                    .unwrap()
-                    .len(),
-                2
-            );
+            let traces = TraceRecorder::new(&trace_root)
+                .replay_run("task", &result.run_id)
+                .await
+                .unwrap();
+            assert_eq!(traces.len(), 3);
+            assert_eq!(traces[2].event_name, "task_completed");
+            assert_eq!(traces[2].result_kind, TraceResultKind::Success);
         });
     }
 
     #[test]
-    fn runtime_loop_emits_retry_after_failed_verification() {
+    fn runtime_loop_retries_the_exact_failed_step() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -426,20 +579,12 @@ mod tests {
                 RetryPolicy::new(1, 0),
             );
             let mut planner = VecPlanner {
-                steps: vec![
-                    RuntimeStep {
-                        task_id: "task".to_string(),
-                        step_id: "01".to_string(),
-                        tool_call: "cargo check".to_string(),
-                        terminal: false,
-                    },
-                    RuntimeStep {
-                        task_id: "task".to_string(),
-                        step_id: "01-retry".to_string(),
-                        tool_call: "cargo check".to_string(),
-                        terminal: true,
-                    },
-                ],
+                steps: vec![RuntimeStep {
+                    task_id: "task".to_string(),
+                    step_id: "01".to_string(),
+                    tool_call: "cargo check".to_string(),
+                    terminal: true,
+                }],
             };
             let mut executor = EchoExecutor;
             let mut observer = PassthroughObserver;
@@ -458,8 +603,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(result.completed);
+            assert_eq!(result.result_kind, TraceResultKind::Success);
             assert_eq!(result.steps_executed, 2);
+            let traces = TraceRecorder::new(&trace_root)
+                .replay("task")
+                .await
+                .unwrap();
+            assert_eq!(traces.len(), 3);
+            assert_eq!(traces[0].step_id, "01");
+            assert_eq!(traces[1].step_id, "01");
+            assert_eq!(traces[0].attempt, 1);
+            assert_eq!(traces[1].attempt, 2);
+            assert_eq!(traces[2].step_id, "__run_conclusion__");
+            assert_eq!(traces[2].result_kind, TraceResultKind::Success);
             let context = loop_runner.context_manager.build().await;
             assert_eq!(context.mistakes.len(), 1);
 
@@ -469,6 +625,235 @@ mod tests {
             }
             assert!(event_names.contains(&"verification_failed".to_string()));
             assert!(event_names.contains(&"retry_started".to_string()));
+        });
+    }
+
+    #[test]
+    fn verified_nonterminal_exhaustion_concludes_partial() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let trace_root = temp_trace_root();
+            let event_bus = EventBus::default();
+            let mut receiver = event_bus.subscribe();
+            let loop_runner = RuntimeLoop::new(
+                ContextManager::new(),
+                event_bus,
+                TraceRecorder::new(&trace_root),
+                RetryPolicy::new(0, 0),
+            );
+            let mut planner = VecPlanner {
+                steps: vec![RuntimeStep {
+                    task_id: "task-partial".to_string(),
+                    step_id: "01".to_string(),
+                    tool_call: "cargo check".to_string(),
+                    terminal: false,
+                }],
+            };
+            let mut executor = EchoExecutor;
+            let mut observer = PassthroughObserver;
+            let mut verifier = AlwaysPassVerifier;
+
+            let result = loop_runner
+                .run(
+                    "task-partial",
+                    &mut planner,
+                    &mut executor,
+                    &mut observer,
+                    &mut verifier,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_kind, TraceResultKind::Partial);
+            assert_eq!(
+                result.summary,
+                "planner_exhausted_without_terminal_verification"
+            );
+            let conclusions = std::iter::from_fn(|| receiver.try_recv().ok())
+                .filter(|event| event.event == "task_completed")
+                .collect::<Vec<_>>();
+            assert_eq!(conclusions.len(), 1);
+            assert_eq!(conclusions[0].payload["resultKind"], "partial");
+            let traces = TraceRecorder::new(&trace_root)
+                .replay_run("task-partial", &result.run_id)
+                .await
+                .unwrap();
+            assert_eq!(traces.len(), 2);
+            assert_eq!(traces[1].event_name, "task_completed");
+            assert_eq!(traces[1].result_kind, TraceResultKind::Partial);
+        });
+    }
+
+    #[test]
+    fn planner_exhaustion_without_execution_concludes_blocked() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let trace_root = temp_trace_root();
+            let event_bus = EventBus::default();
+            let mut receiver = event_bus.subscribe();
+            let loop_runner = RuntimeLoop::new(
+                ContextManager::new(),
+                event_bus,
+                TraceRecorder::new(&trace_root),
+                RetryPolicy::new(1, 0),
+            );
+            let mut planner = VecPlanner { steps: Vec::new() };
+            let mut executor = EchoExecutor;
+            let mut observer = PassthroughObserver;
+            let mut verifier = AlwaysPassVerifier;
+
+            let result = loop_runner
+                .run(
+                    "task-empty",
+                    &mut planner,
+                    &mut executor,
+                    &mut observer,
+                    &mut verifier,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_kind, TraceResultKind::Blocked);
+            assert_eq!(result.summary, "planner_exhausted_without_steps");
+            assert_eq!(result.steps_executed, 0);
+            let mut conclusion = None;
+            while let Ok(event) = receiver.try_recv() {
+                if event.event == "task_completed" {
+                    conclusion = Some(event);
+                    break;
+                }
+            }
+            let conclusion = conclusion.expect("task conclusion");
+            assert_eq!(conclusion.payload["resultKind"], "blocked");
+            let traces = TraceRecorder::new(&trace_root)
+                .replay_run("task-empty", &result.run_id)
+                .await
+                .unwrap();
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].result_kind, TraceResultKind::Blocked);
+        });
+    }
+
+    #[test]
+    fn an_unresolved_retry_concludes_error_instead_of_fake_success() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let trace_root = temp_trace_root();
+            let event_bus = EventBus::default();
+            let mut receiver = event_bus.subscribe();
+            let loop_runner = RuntimeLoop::new(
+                ContextManager::new(),
+                event_bus,
+                TraceRecorder::new(&trace_root),
+                RetryPolicy::new(1, 0),
+            );
+            let mut planner = VecPlanner {
+                steps: vec![RuntimeStep {
+                    task_id: "task-missing-retry".to_string(),
+                    step_id: "01".to_string(),
+                    tool_call: "cargo test".to_string(),
+                    terminal: false,
+                }],
+            };
+            let mut executor = EchoExecutor;
+            let mut observer = PassthroughObserver;
+            let mut verifier = SequenceVerifier {
+                results: vec![false, false],
+            };
+
+            let result = loop_runner
+                .run(
+                    "task-missing-retry",
+                    &mut planner,
+                    &mut executor,
+                    &mut observer,
+                    &mut verifier,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_kind, TraceResultKind::Error);
+            assert!(result.summary.contains("retry budget exhausted"));
+            assert_eq!(result.steps_executed, 2);
+            let mut conclusions = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                if event.event == "task_completed" {
+                    conclusions.push(event);
+                }
+            }
+            assert_eq!(conclusions.len(), 1);
+            assert_eq!(conclusions[0].payload["resultKind"], "error");
+        });
+    }
+
+    #[test]
+    fn retry_exhaustion_still_emits_one_structured_conclusion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let trace_root = temp_trace_root();
+            let event_bus = EventBus::default();
+            let mut receiver = event_bus.subscribe();
+            let loop_runner = RuntimeLoop::new(
+                ContextManager::new(),
+                event_bus,
+                TraceRecorder::new(&trace_root),
+                RetryPolicy::new(0, 0),
+            );
+            let mut planner = VecPlanner {
+                steps: vec![RuntimeStep {
+                    task_id: "task-exhausted".to_string(),
+                    step_id: "01".to_string(),
+                    tool_call: "cargo test".to_string(),
+                    terminal: true,
+                }],
+            };
+            let mut executor = EchoExecutor;
+            let mut observer = PassthroughObserver;
+            let mut verifier = SequenceVerifier {
+                results: vec![false],
+            };
+
+            let result = loop_runner
+                .run(
+                    "task-exhausted",
+                    &mut planner,
+                    &mut executor,
+                    &mut observer,
+                    &mut verifier,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_kind, TraceResultKind::Error);
+            assert!(result.summary.contains("retry budget exhausted"));
+            let mut conclusions = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                if event.event == "task_completed" {
+                    conclusions.push(event);
+                }
+            }
+            assert_eq!(conclusions.len(), 1);
+            assert_eq!(conclusions[0].payload["resultKind"], "error");
+            let traces = TraceRecorder::new(&trace_root)
+                .replay("task-exhausted")
+                .await
+                .unwrap();
+            assert_eq!(traces.len(), 2);
+            assert!(!traces[0].recorded_success());
+            assert_eq!(traces[1].event_name, "task_completed");
+            assert_eq!(traces[1].result_kind, TraceResultKind::Error);
         });
     }
 }

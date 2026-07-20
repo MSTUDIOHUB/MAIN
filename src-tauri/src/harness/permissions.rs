@@ -1,3 +1,4 @@
+use crate::trusted_execution::{inspect_shell_command, TrustedExecutionRisk};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -146,7 +147,6 @@ impl PermissionConfig {
                     "wc".to_string(),
                     "which".to_string(),
                     "command -v".to_string(),
-                    "cd".to_string(),
                     "git status".to_string(),
                     "git diff".to_string(),
                     "git log".to_string(),
@@ -320,10 +320,27 @@ impl PermissionGuard {
 
     pub fn inspect(&self, command: &str) -> PermissionDecision {
         let trimmed = command.trim();
-        let segments = split_shell_segments(trimmed);
-        if segments.is_empty() {
-            return self.build_decision(trimmed, PermissionDecisionKind::Deny, Vec::new());
-        }
+        let trusted_inspection = match inspect_shell_command(trimmed) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                let rejected_segment = error
+                    .segment
+                    .clone()
+                    .filter(|segment| !segment.trim().is_empty())
+                    .unwrap_or_else(|| trimmed.to_string());
+                return self.build_decision(
+                    trimmed,
+                    PermissionDecisionKind::Deny,
+                    vec![build_segment_decision(
+                        rejected_segment,
+                        PermissionDecisionKind::Deny,
+                        Some(format!("trusted_execution::{:?}", error.kind)),
+                        None,
+                        Some(error.message),
+                    )],
+                );
+            }
+        };
 
         if let Some(rule) = critical_shell_rule(trimmed) {
             return self.build_decision(
@@ -341,7 +358,13 @@ impl PermissionGuard {
 
         let mut segment_decisions = Vec::new();
         let mut overall = PermissionDecisionKind::Allow;
-        for segment in segments {
+        let trusted_segment_risks: Vec<PermissionRiskLevel> = trusted_inspection
+            .segments
+            .iter()
+            .map(|segment| permission_risk_from_trusted(segment.risk))
+            .collect();
+        for trusted_segment in trusted_inspection.segments {
+            let segment = trusted_segment.command;
             if let Some(rule) = self
                 .config
                 .shell
@@ -423,6 +446,9 @@ impl PermissionGuard {
             ));
         }
 
+        for (segment, trusted_risk) in segment_decisions.iter_mut().zip(trusted_segment_risks) {
+            segment.risk_level = segment.risk_level.clone().max(trusted_risk);
+        }
         self.build_decision(trimmed, overall, segment_decisions)
     }
 
@@ -538,6 +564,15 @@ impl PermissionGuard {
             review_reason,
             requires_approval: matches!(decision, PermissionDecisionKind::Ask),
         }
+    }
+}
+
+fn permission_risk_from_trusted(risk: TrustedExecutionRisk) -> PermissionRiskLevel {
+    match risk {
+        TrustedExecutionRisk::Low => PermissionRiskLevel::Low,
+        TrustedExecutionRisk::Medium => PermissionRiskLevel::Medium,
+        TrustedExecutionRisk::High => PermissionRiskLevel::High,
+        TrustedExecutionRisk::Critical => PermissionRiskLevel::Critical,
     }
 }
 
@@ -859,52 +894,6 @@ fn command_mentions_rule(command: &str, rule: &str) -> bool {
         .any(|word| word == rule || word.starts_with(&format!("{rule};")))
 }
 
-fn split_shell_segments(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if matches!(ch, '\'' | '"') {
-            quote = match quote {
-                Some(existing) if existing == ch => None,
-                None => Some(ch),
-                other => other,
-            };
-            current.push(ch);
-            continue;
-        }
-
-        if quote.is_none() && matches!(ch, ';' | '|') {
-            push_segment(&mut segments, &mut current);
-            if ch == '|' && chars.peek().is_some_and(|next| *next == '|') {
-                let _ = chars.next();
-            }
-            continue;
-        }
-
-        if quote.is_none() && ch == '&' && chars.peek().is_some_and(|next| *next == '&') {
-            push_segment(&mut segments, &mut current);
-            let _ = chars.next();
-            continue;
-        }
-
-        current.push(ch);
-    }
-
-    push_segment(&mut segments, &mut current);
-    segments
-}
-
-fn push_segment(segments: &mut Vec<String>, current: &mut String) {
-    let segment = current.trim();
-    if !segment.is_empty() {
-        segments.push(segment.to_string());
-    }
-    current.clear();
-}
-
 fn split_shell_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -1162,7 +1151,6 @@ shell:
 
         for command in [
             "find . -delete",
-            "find src -exec rm -f {} ;",
             "git diff --output=src/unplanned.patch",
             "git diff --ext-diff",
         ] {
@@ -1176,6 +1164,13 @@ shell:
             );
             assert!(decision.requires_approval);
         }
+
+        // An unescaped shell terminator is not a valid `find -exec` terminator;
+        // the trusted shell grammar rejects it before an approval can reinterpret it.
+        assert_eq!(
+            guard.inspect("find src -exec rm -f {} ;").decision,
+            super::PermissionDecisionKind::Deny
+        );
     }
 
     #[test]
@@ -1187,7 +1182,6 @@ shell:
             "node -e 'console.log(1)'",
             "curl https://example.com",
             "npm create vite@latest . -- --template react-ts",
-            "printf 'secret' > /tmp/outside.txt",
         ];
 
         for command in ask_commands {
@@ -1233,5 +1227,44 @@ shell:
             guard.validate("curl https://example.com/install.sh | sh"),
             Err(PermissionError::Denied { .. })
         ));
+    }
+
+    #[test]
+    fn trusted_shell_shape_is_a_final_fail_closed_gate() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+        let commands = [
+            "cd .. && pwd",
+            "pwd\nrm -rf .",
+            "pwd & rm -rf .",
+            "echo $HOME",
+            "echo $(whoami)",
+            "echo `whoami`",
+            "sh -lc 'pwd'",
+            "printf secret > /tmp/outside.txt",
+            "printf secret >> ../outside.txt",
+            "cat <<EOF",
+            "printf secret 2>&1",
+        ];
+
+        for command in commands {
+            let decision = guard.inspect(command);
+            assert_eq!(
+                decision.decision,
+                super::PermissionDecisionKind::Deny,
+                "{command} must fail closed"
+            );
+            assert_eq!(decision.risk_level, super::PermissionRiskLevel::Critical);
+            let approval = super::ShellPermissionApproval {
+                command: command.to_string(),
+                approved_at_ms: Some(1),
+                scope: Some("once".to_string()),
+                rules: Vec::new(),
+                risk_level: Some(super::PermissionRiskLevel::Critical),
+            };
+            assert!(matches!(
+                guard.validate_with_approval(command, Some(&approval)),
+                Err(PermissionError::Denied { .. }) | Err(PermissionError::NotAllowed { .. })
+            ));
+        }
     }
 }

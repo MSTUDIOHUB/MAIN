@@ -128,4 +128,8 @@ export interface WorkspaceTurnTerminalOwner {
   readonly sessionKey: string;
   readonly sessionEpoch: string;
   readonly turnId: string;
+  /** A turnId alone is not an owner: corrupted or replaced receipts may reuse it. */
+  readonly receiptId: string;
+  readonly clientSubmissionId: string;
+  readonly instructionEnvelopeIdentity: string;
 }

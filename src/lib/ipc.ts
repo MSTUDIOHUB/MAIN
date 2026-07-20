@@ -9,6 +9,150 @@ import {
 } from "./projectSessionMutationCoordinator";
 
 const projectSessionMutations = createProjectSessionMutationCoordinator();
+const projectSessionRevisionByOwner = new Map<string, number>();
+
+function projectSessionOwnerKey(workspace: string, sessionId: number | string): string {
+  return `${workspace}\u0000${String(sessionId)}`;
+}
+
+function normalizeProjectSessionStorageRevision(value: unknown): number | null {
+  const revision = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim()
+      ? Number(value)
+      : Number.NaN;
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function rememberProjectSessionRevision(ownerKey: string, session: unknown): void {
+  const revision = normalizeProjectSessionStorageRevision((session as any)?.storageRevision);
+  if (revision === null) return;
+  const current = projectSessionRevisionByOwner.get(ownerKey);
+  // Read APIs can settle after a newer save. Never let an older projection
+  // roll the process-local CAS fence backward.
+  if (current === undefined || revision > current) {
+    projectSessionRevisionByOwner.set(ownerKey, revision);
+  }
+}
+
+function rememberProjectSessionList(workspace: string, sessions: unknown): void {
+  if (!Array.isArray(sessions)) return;
+  sessions.forEach((session) => {
+    const sessionId = (session as any)?.id;
+    if (typeof sessionId !== "number" && typeof sessionId !== "string") return;
+    rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  });
+}
+
+function clearProjectSessionRevision(ownerKey: string): void {
+  projectSessionRevisionByOwner.delete(ownerKey);
+}
+
+function clearWorkspaceProjectSessionRevisions(workspace: string): void {
+  const ownerPrefix = `${workspace}\u0000`;
+  for (const ownerKey of projectSessionRevisionByOwner.keys()) {
+    if (ownerKey.startsWith(ownerPrefix)) {
+      projectSessionRevisionByOwner.delete(ownerKey);
+    }
+  }
+}
+
+function isProjectSessionObject(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function projectSessionTranscriptRows(value: unknown): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function projectSessionTranscriptRowId(value: unknown): string | null {
+  if (!isProjectSessionObject(value)) return null;
+  const id = value.id;
+  if (typeof id === "number" && Number.isFinite(id)) return String(id);
+  if (typeof id !== "string") return null;
+  const normalized = id.trim();
+  return normalized || null;
+}
+
+function mergeProjectSessionTranscriptRows(existing: readonly any[], incoming: readonly any[]): any[] {
+  const rows = [...existing];
+  const positions = new Map<string, number>();
+  rows.forEach((row, index) => {
+    const id = projectSessionTranscriptRowId(row);
+    if (id) positions.set(id, index);
+  });
+  incoming.forEach((row) => {
+    const id = projectSessionTranscriptRowId(row);
+    const position = id ? positions.get(id) : undefined;
+    if (position !== undefined) {
+      rows[position] = row;
+      return;
+    }
+    if (id) positions.set(id, rows.length);
+    rows.push(row);
+  });
+  return rows;
+}
+
+function projectSessionTranscriptIsPartial(session: unknown): boolean {
+  if (!isProjectSessionObject(session)) return false;
+  const runtime = isProjectSessionObject(session.runtimeSnapshot)
+    ? session.runtimeSnapshot
+    : null;
+  return session.transcriptPartial === true || runtime?.transcriptPartial === true;
+}
+
+function projectSessionSaveNeedsTranscriptBase(session: unknown): boolean {
+  if (!isProjectSessionObject(session)) return false;
+  const runtime = isProjectSessionObject(session.runtimeSnapshot)
+    ? session.runtimeSnapshot
+    : null;
+  return projectSessionTranscriptIsPartial(session) ||
+    projectSessionTranscriptRows(session.messages).length === 0 ||
+    projectSessionTranscriptRows(runtime?.conversationTurns).length === 0;
+}
+
+function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): any {
+  const incoming = isProjectSessionObject(session) ? session : {};
+  const current = isProjectSessionObject(existing) ? existing : {};
+  const incomingRuntime = isProjectSessionObject(incoming.runtimeSnapshot)
+    ? incoming.runtimeSnapshot
+    : null;
+  const currentRuntime = isProjectSessionObject(current.runtimeSnapshot)
+    ? current.runtimeSnapshot
+    : null;
+  const incomingMessages = projectSessionTranscriptRows(incoming.messages);
+  const incomingTurns = projectSessionTranscriptRows(incomingRuntime?.conversationTurns);
+  const existingMessages = projectSessionTranscriptRows(current.messages);
+  const existingTurns = projectSessionTranscriptRows(currentRuntime?.conversationTurns);
+  const partial = projectSessionTranscriptIsPartial(incoming);
+
+  let messages = partial
+    ? mergeProjectSessionTranscriptRows(existingMessages, incomingMessages)
+    : [...incomingMessages];
+  let turns = partial
+    ? mergeProjectSessionTranscriptRows(existingTurns, incomingTurns)
+    : [...incomingTurns];
+  if (messages.length === 0 && existingMessages.length > 0) {
+    messages = [...existingMessages];
+  }
+  if (turns.length === 0 && existingTurns.length > 0) {
+    turns = [...existingTurns];
+  }
+
+  const runtimeSnapshot = {
+    ...(incomingRuntime || currentRuntime || {}),
+    taskFlow: messages,
+    conversationTurns: turns,
+  };
+  return {
+    ...incoming,
+    messages,
+    messageCount: messages.length,
+    turnCount: turns.length,
+    runtimeSnapshot,
+  };
+}
 
 export interface PtyDataPayload {
   sessionKey?: string;
@@ -357,6 +501,19 @@ export interface EvalReport {
   avgLatency: number;
   avgToolCalls: number;
   categories: CategoryEvalReport[];
+  cases: EvalCaseResult[];
+}
+
+export interface EvalCaseResult {
+  id: string;
+  category: string;
+  success: boolean;
+  retries: number;
+  hallucinations: number;
+  latencyMs: number;
+  toolCalls: number;
+  resultKind: TraceResultKind;
+  failures: string[];
 }
 
 export interface CategoryEvalReport {
@@ -403,21 +560,37 @@ export interface RuntimeContext {
 }
 
 export interface TraceRecord {
+  schemaVersion: number;
+  runId: string | null;
+  sequence: number;
+  attempt: number;
   taskId: string;
   stepId: string;
   eventName: string;
   toolCall: string;
+  inputDigest: string;
   stdout: string;
   stderr: string;
+  structuredOutput: unknown;
+  outputDigest: string;
+  success: boolean;
+  resultKind: TraceResultKind;
+  exitCode: number | null;
+  timedOut: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
   verification: string;
   latencyMs: number;
+  events: string[];
   metadata: unknown;
 }
 
 export interface RuntimeHarnessReport {
   run: {
     taskId: string;
-    completed: boolean;
+    runId: string;
+    resultKind: TraceResultKind;
+    summary: string;
     stepsExecuted: number;
   };
   context: RuntimeContext;
@@ -426,6 +599,7 @@ export interface RuntimeHarnessReport {
 }
 
 export type AgentRole = "planner" | "executor" | "critic";
+export type TraceResultKind = "success" | "partial" | "blocked" | "error" | "canceled";
 
 export interface TaskNode {
   id: string;
@@ -456,6 +630,7 @@ export interface TaskGraphStepResult {
 
 export interface TaskGraphExecution {
   graphId: string;
+  runId: string;
   success: boolean;
   waves: string[][];
   results: TaskGraphStepResult[];
@@ -484,11 +659,14 @@ export interface McpToolDescriptor {
 export interface McpReplayRef {
   taskId: string;
   stepId: string;
+  runId?: string | null;
+  sequence?: number | null;
 }
 
 export interface McpToolCall {
   id: string;
   taskId: string;
+  runId?: string | null;
   tool: string;
   arguments: unknown;
   replay?: McpReplayRef | null;
@@ -499,11 +677,14 @@ export interface McpToolResult {
   taskId: string;
   tool: string;
   success: boolean;
+  resultKind: TraceResultKind;
   content: unknown;
   stdout: string;
   stderr: string;
   latencyMs: number;
   tracePath?: string | null;
+  runId: string | null;
+  traceSequence: number | null;
   replayed: boolean;
 }
 
@@ -606,6 +787,13 @@ export interface PtyWriteResult {
   foregroundState?: "busy" | "idle" | "unknown" | "stopped";
   foregroundGeneration?: number;
   error?: string | null;
+}
+
+export interface PtyCloseResult {
+  sessionKey: string;
+  closed: boolean;
+  pid?: number | null;
+  exitCode?: number | null;
 }
 
 export interface DocumentBlock {
@@ -923,12 +1111,16 @@ export function deleteChatSessionTempFiles(sessionKey: string): Promise<void> {
   return deleteChatTempPath(sessionKey, ".");
 }
 
-export function listProjectSessions(workspace: string): Promise<any[]> {
-  return invoke<any[]>("list_project_sessions", { workspace });
+export async function listProjectSessions(workspace: string): Promise<any[]> {
+  const sessions = await invoke<any[]>("list_project_sessions", { workspace });
+  rememberProjectSessionList(workspace, sessions);
+  return sessions;
 }
 
-export function rebuildProjectSessionsIndex(workspace: string): Promise<any[]> {
-  return invoke<any[]>("rebuild_project_sessions_index", { workspace });
+export async function rebuildProjectSessionsIndex(workspace: string): Promise<any[]> {
+  const sessions = await invoke<any[]>("rebuild_project_sessions_index", { workspace });
+  rememberProjectSessionList(workspace, sessions);
+  return sessions;
 }
 
 export function saveProjectSession(
@@ -937,7 +1129,16 @@ export function saveProjectSession(
   options?: ProjectSessionSaveOptions & { allowPersistingWorkspaceReceiptId?: string },
 ): Promise<any> {
   const sessionId = String(session?.id ?? "unknown");
-  const ownerKey = `${workspace}\u0000${sessionId}`;
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  const capturedStorageRevision = normalizeProjectSessionStorageRevision(
+    session?.storageRevision,
+  ) ?? 0;
+  const cachedRevisionAtEnqueue = projectSessionRevisionByOwner.get(ownerKey);
+  // A caller already behind the known owner revision is a genuine stale
+  // write. Preserve its revision so SQLite can reject it instead of silently
+  // rebasing stale content over a newer snapshot.
+  const mayAdvanceQueuedRevision = cachedRevisionAtEnqueue === undefined ||
+    capturedStorageRevision === cachedRevisionAtEnqueue;
   const isCurrent = () => (
     isProjectSessionAdmissionProjectionOwned(
       session,
@@ -947,13 +1148,66 @@ export function saveProjectSession(
   );
   return projectSessionMutations.save(
     ownerKey,
-    () => invoke<any>("save_project_session", { workspace, session }),
-    { isCurrent },
+    async (lease) => {
+      // The coordinator serializes the writes, but callers construct their
+      // snapshots before entering that queue. Resolve the CAS revision only
+      // when this owner reaches the queue head so two snapshots captured from
+      // revision N are persisted with expected revisions N and N + 1. The
+      // enqueue-time fence above deliberately excludes already-stale callers.
+      let existingSession: any = null;
+      let reconciledStorageRevision: number | null = null;
+      if (projectSessionSaveNeedsTranscriptBase(session)) {
+        existingSession = await invoke<any>("load_project_session", {
+          workspace,
+          sessionId,
+        });
+        rememberProjectSessionRevision(ownerKey, existingSession);
+        if (lease.revisionReconciliationRequired) {
+          reconciledStorageRevision = normalizeProjectSessionStorageRevision(
+            existingSession?.storageRevision,
+          ) ?? 0;
+        }
+      } else if (lease.revisionReconciliationRequired) {
+        // A previous invoke crossed the JavaScript settlement boundary. It
+        // may have committed before its response was lost, so refresh Rust's
+        // authoritative CAS revision before this writer selects its base.
+        const meta = await invoke<any>("load_project_session_meta", {
+          workspace,
+          sessionId,
+        });
+        rememberProjectSessionRevision(ownerKey, meta);
+        reconciledStorageRevision = normalizeProjectSessionStorageRevision(
+          meta?.storageRevision,
+        ) ?? 0;
+      }
+      const storageRevision = mayAdvanceQueuedRevision
+        ? reconciledStorageRevision ??
+          projectSessionRevisionByOwner.get(ownerKey) ??
+          capturedStorageRevision
+        : capturedStorageRevision;
+      const queuedSession = {
+        ...prepareProjectSessionSnapshotForSave(session, existingSession),
+        storageRevision,
+      };
+      const saved = await invoke<any>("save_project_session", {
+        workspace,
+        session: queuedSession,
+        mutationDeadlineMs: lease.mutationDeadlineMs,
+      });
+      rememberProjectSessionRevision(ownerKey, saved);
+      return saved;
+    },
+    {
+      isCurrent,
+      settlementTimeoutMs: options?.settlementTimeoutMs,
+    },
   );
 }
 
-export function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
-  return invoke<any>("load_project_session", { workspace, sessionId });
+export async function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
+  const session = await invoke<any>("load_project_session", { workspace, sessionId });
+  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  return session;
 }
 
 export interface ProjectSessionPage {
@@ -967,8 +1221,10 @@ export interface ProjectSessionPage {
   nextBeforeTurnIndex?: number | null;
 }
 
-export function loadProjectSessionMeta(workspace: string, sessionId: number | string): Promise<any> {
-  return invoke<any>("load_project_session_meta", { workspace, sessionId });
+export async function loadProjectSessionMeta(workspace: string, sessionId: number | string): Promise<any> {
+  const session = await invoke<any>("load_project_session_meta", { workspace, sessionId });
+  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  return session;
 }
 
 export function loadProjectSessionPage(
@@ -986,20 +1242,24 @@ export function loadProjectSessionPage(
 }
 
 export function deleteProjectSession(workspace: string, sessionId: number | string): Promise<any[]> {
-  const ownerKey = `${workspace}\u0000${String(sessionId)}`;
-  return projectSessionMutations.delete(ownerKey, () =>
-    invoke<any[]>("delete_project_session", { workspace, sessionId })
-  );
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  return projectSessionMutations.delete(ownerKey, async () => {
+    const sessions = await invoke<any[]>("delete_project_session", { workspace, sessionId });
+    clearProjectSessionRevision(ownerKey);
+    rememberProjectSessionList(workspace, sessions);
+    return sessions;
+  });
 }
 
 export function clearProjectSessions(
   workspace: string,
   sessionIds: readonly (number | string)[] = [],
 ): Promise<void> {
-  const ownerKeys = sessionIds.map((sessionId) => `${workspace}\u0000${String(sessionId)}`);
-  return projectSessionMutations.clear(workspace, ownerKeys, () =>
-    invoke<void>("clear_project_sessions", { workspace })
-  );
+  const ownerKeys = sessionIds.map((sessionId) => projectSessionOwnerKey(workspace, sessionId));
+  return projectSessionMutations.clear(workspace, ownerKeys, async () => {
+    await invoke<void>("clear_project_sessions", { workspace });
+    clearWorkspaceProjectSessionRevisions(workspace);
+  });
 }
 
 export function exportTextFile(path: string, content: string): Promise<void> {
@@ -1197,6 +1457,7 @@ export function runCommand(
   timeoutMs?: number,
   workspace?: string,
   permissionApproval?: ShellPermissionApproval,
+  workingDirectory?: string,
 ): Promise<TerminalCommandOutput> {
   return invoke<TerminalCommandOutput>("run_command", {
     command,
@@ -1204,6 +1465,7 @@ export function runCommand(
     timeoutMs,
     workspace,
     permissionApproval,
+    workingDirectory,
   });
 }
 
@@ -1367,6 +1629,10 @@ export function spawnPty(cols: number, rows: number, sessionKey?: string, worksp
   return invoke<void>("spawn_pty", { cols, rows, sessionKey, workspace });
 }
 
+export function closePty(sessionKey?: string): Promise<PtyCloseResult> {
+  return invoke<PtyCloseResult>("close_pty", { sessionKey });
+}
+
 export function resizePty(cols: number, rows: number, sessionKey?: string): Promise<void> {
   return invoke<void>("resize_pty", { cols, rows, sessionKey });
 }
@@ -1375,6 +1641,7 @@ export function writePty(
   input: string,
   sessionKey?: string,
   permissionApproval?: ShellPermissionApproval,
+  workingDirectory?: string,
   userTerminal?: boolean,
   allowForegroundInput?: boolean,
   expectedForegroundPid?: number,
@@ -1385,6 +1652,7 @@ export function writePty(
     input,
     sessionKey,
     permissionApproval,
+    workingDirectory,
     userTerminal,
     allowForegroundInput,
     expectedForegroundPid,

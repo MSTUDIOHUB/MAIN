@@ -8,6 +8,7 @@ import ts from "typescript";
 
 const workspaceRoot = process.cwd();
 const moduleCache = new Map();
+let tauriInvoke = async () => "";
 
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
@@ -35,7 +36,7 @@ function loadTranspiledModuleSync(sourcePath) {
   const runtimeRequire = (specifier) => {
     if (specifier.startsWith("@tauri-apps/")) {
       return {
-        invoke: async () => "",
+        invoke: (...args) => tauriInvoke(...args),
         isTauri: () => false,
         listen: async () => () => {},
         open: async () => null,
@@ -75,7 +76,7 @@ const {
   createWorkspaceTurnQueueState,
   reduceWorkspaceTurnQueue,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/workspaceTurnQueue.ts"));
-const { beginSessionCancellation } = loadTranspiledModuleSync(
+const { beginSessionCancellation, getPendingSessionCancellation } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/sessionCancellationBarrier.ts"),
 );
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
@@ -264,6 +265,132 @@ function buildQueuedWorkspaceTurn(
   return committed.state;
 }
 
+function buildDispatchingWorkspaceTurn(
+  sessionKey,
+  sessionEpoch,
+  suffix,
+  userBlockId = 10_001,
+  payload = { text: `queued ${suffix}` },
+) {
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    suffix,
+    userBlockId,
+    payload,
+  );
+  const claimed = reduceWorkspaceTurnQueue(queue, {
+    type: "claim",
+    expectedVersion: queue.version,
+    at: 12,
+    claimId: `claim-${suffix}`,
+    sessionKey,
+    sessionEpoch,
+  });
+  assert.equal(claimed.disposition, "applied", claimed.reason);
+  return claimed.state;
+}
+
+function appendQueuedWorkspaceTurn(
+  queue,
+  suffix,
+  userBlockId,
+  payload = { text: `queued ${suffix}` },
+) {
+  const submittedAt = queue.updatedAt + 10;
+  const clientSubmissionId = `submission-${suffix}`;
+  const receipt = {
+    schemaVersion: 1,
+    kind: "workspace_turn_receipt",
+    receiptId: `receipt-${suffix}`,
+    clientSubmissionId,
+    sessionKey: queue.sessionKey,
+    sessionEpoch: queue.sessionEpoch,
+    turnId: `turn-${suffix}`,
+    userBlockId,
+    acceptedAt: submittedAt,
+  };
+  const appended = reduceWorkspaceTurnQueue(queue, {
+    type: "append",
+    expectedVersion: queue.version,
+    at: submittedAt,
+    instruction: {
+      schemaVersion: 1,
+      kind: "workspace_instruction",
+      clientSubmissionId,
+      sessionKey: queue.sessionKey,
+      sessionEpoch: queue.sessionEpoch,
+      source: "composer",
+      submittedAt,
+      payload,
+    },
+    receipt,
+  });
+  assert.equal(appended.disposition, "applied", appended.reason);
+  const committed = reduceWorkspaceTurnQueue(appended.state, {
+    type: "commit",
+    expectedVersion: appended.state.version,
+    at: submittedAt + 1,
+    clientSubmissionId,
+    receiptId: receipt.receiptId,
+    sessionKey: queue.sessionKey,
+    sessionEpoch: queue.sessionEpoch,
+  });
+  assert.equal(committed.disposition, "applied", committed.reason);
+  return committed.state;
+}
+
+function buildExactWorkspaceInstructionProjection(
+  entry,
+  {
+    status = "executing",
+    summary = "",
+    runtimeOutcome,
+    finalBlock,
+  } = {},
+) {
+  const userBlock = {
+    id: entry.receipt.userBlockId,
+    turnId: entry.receipt.turnId,
+    type: "user",
+    content: entry.instruction.payload.text,
+    ...(entry.instruction.payload.images?.length
+      ? { images: [...entry.instruction.payload.images] }
+      : {}),
+  };
+  const taskFlow = [userBlock, ...(finalBlock ? [finalBlock] : [])];
+  return {
+    taskFlow,
+    conversationTurns: [{
+      id: entry.receipt.turnId,
+      clientSubmissionId: entry.instruction.clientSubmissionId,
+      workspaceInstructionReceiptId: entry.receipt.receiptId,
+      workspaceInstructionSource: entry.instruction.source,
+      userPrompt: entry.instruction.payload.text,
+      title: entry.instruction.payload.text,
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status,
+      summary,
+      blockIds: taskFlow.map((block) => block.id),
+      processCollapsed: false,
+      collapsed: false,
+      createdAt: entry.receipt.acceptedAt,
+      ...(runtimeOutcome ? { runtimeOutcome } : {}),
+    }],
+  };
+}
+
+async function waitForStoreState(predicate, attempts = 40) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const state = useAppStore.getState();
+    if (predicate(state)) return state;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return useAppStore.getState();
+}
+
 function buildApprovedPlanContent() {
   return [
     "# Plan 恢复批准边界",
@@ -332,6 +459,1202 @@ test("online snapshots preserve a live Turn and only cold restore pauses it", ()
   const restored = normalizeSessionRuntimeSnapshot(liveSnapshot);
   assert.equal(restored.conversationTurns[0].status, "paused");
   assert.match(restored.conversationTurns[0].summary, /application restart/i);
+});
+
+test("cold restore quarantines unresolved local-fast work and never silently replays its side effect", () => {
+  const workspace = "/tmp/session-local-fast-cold-restore";
+  const sessionId = 73;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-cold-restore";
+
+  const restorePersistedHead = ({
+    suffix,
+    text,
+    conclusion = "none",
+    queueStatus = "dispatching",
+    includeRunStart = true,
+    duplicateRunStart = false,
+    extraStreamingFinal = false,
+    startParentRunId = null,
+    completionParentRunId = startParentRunId,
+    outcomeParentRunId = startParentRunId,
+    completionRunId = null,
+  }) => {
+    const queue = (queueStatus === "queued"
+      ? buildQueuedWorkspaceTurn
+      : buildDispatchingWorkspaceTurn)(
+      sessionKey,
+      sessionEpoch,
+      suffix,
+      73_001,
+      { text },
+    );
+    const receipt = queue.entries[0].receipt;
+    const runId = `run-${suffix}`;
+    const runtimeEvents = includeRunStart
+      ? [{
+          schemaVersion: 2,
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: receipt.turnId,
+          timestampMs: 13,
+          runId,
+          parentRunId: startParentRunId,
+        }]
+      : [];
+    if (duplicateRunStart && runtimeEvents[0]) {
+      runtimeEvents.push({
+        ...runtimeEvents[0],
+        runId: `${runId}-duplicate`,
+      });
+    }
+    if (conclusion === "run_only" || conclusion === "canonical") {
+      runtimeEvents.push({
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId: receipt.turnId,
+        timestampMs: 14,
+        runId: completionRunId || runId,
+        parentRunId: completionParentRunId,
+        resultKind: "success",
+        summary: "Local command completed.",
+      });
+    }
+    if (conclusion === "canonical") {
+      runtimeEvents.push({
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId: receipt.turnId,
+        timestampMs: 14,
+        resultKind: "success",
+      });
+    }
+    const persistedSnapshot = JSON.parse(JSON.stringify(
+      buildSessionRuntimeSnapshotFromStoreState({
+        currentWorkspace: workspace,
+        currentSessionId: sessionId,
+        taskFlow: [
+          {
+            id: receipt.userBlockId,
+            turnId: receipt.turnId,
+            type: "user",
+            content: text,
+          },
+          ...(conclusion === "canonical"
+            ? [{
+                id: receipt.userBlockId + 1,
+                turnId: receipt.turnId,
+                type: "agent",
+                content: "Local command completed.",
+                streaming: false,
+                visibility: "assistant_final",
+              }, ...(extraStreamingFinal
+                ? [{
+                    id: receipt.userBlockId + 2,
+                    turnId: receipt.turnId,
+                    type: "agent",
+                    content: "Stale streaming final.",
+                    streaming: true,
+                    visibility: "assistant_final",
+                  }]
+                : [])]
+            : []),
+        ],
+        conversationTurns: [{
+          id: receipt.turnId,
+          clientSubmissionId: receipt.clientSubmissionId,
+          workspaceInstructionReceiptId: receipt.receiptId,
+          workspaceInstructionSource: queue.entries[0].instruction.source,
+          userPrompt: text,
+          title: text,
+          mode: "edit",
+          intent: "execute",
+          displayIntent: "execute",
+          status: conclusion === "none" ? "executing" : "done",
+          summary: conclusion === "none" ? "" : "Local command completed.",
+          blockIds: [
+            receipt.userBlockId,
+            ...(conclusion === "canonical"
+              ? [
+                  receipt.userBlockId + 1,
+                  ...(extraStreamingFinal ? [receipt.userBlockId + 2] : []),
+                ]
+              : []),
+          ],
+          collapsed: false,
+          createdAt: receipt.acceptedAt,
+          ...(conclusion !== "none"
+            ? {
+                runtimeOutcome: {
+                  status: "completed",
+                  resultKind: "success",
+                  runId,
+                  parentRunId: outcomeParentRunId,
+                  updatedAt: 14,
+                },
+              }
+            : {}),
+        }],
+        currentTurnId: receipt.turnId,
+        runtimeEvents,
+        harnessRunMarker: null,
+        workspaceTurnQueue: queue,
+        workspaceInstructionLedger: [],
+        selectedMainModeKey: "game_studio",
+        selectedNexusModeKey: "nexus_game_studio",
+        activeStudioAgentKey: "studio_auto",
+        gameStudioInitialized: true,
+      }),
+    ));
+    return {
+      receipt,
+      persistedSnapshot,
+      restored: normalizeSessionRuntimeSnapshot(persistedSnapshot, {
+        restoreInterruptedGoal: true,
+        workspacePath: workspace,
+        expectedSessionKey: sessionKey,
+        expectedSessionEpoch: sessionEpoch,
+        quarantineInterruptedLocalFast: true,
+      }),
+    };
+  };
+
+  const interruptedLocalFast = restorePersistedHead({
+    suffix: "local-fast-interrupted",
+    text: "/agent writer",
+  });
+  assert.equal(interruptedLocalFast.restored.workspaceTurnQueue.entries.length, 0);
+  const interruptedTurn = interruptedLocalFast.restored.conversationTurns.find(
+    (turn) => turn.id === interruptedLocalFast.receipt.turnId,
+  );
+  assert.equal(interruptedTurn.runtimeOutcome?.status, "completed");
+  assert.equal(interruptedTurn.runtimeOutcome?.resultKind, "error");
+  const interruptedFinals = interruptedLocalFast.restored.taskFlow.filter((block) =>
+    block.turnId === interruptedLocalFast.receipt.turnId &&
+    block.type === "agent" &&
+    block.visibility === "assistant_final"
+  );
+  assert.equal(interruptedFinals.length, 1);
+  assert.equal(interruptedFinals[0].content, interruptedTurn.summary);
+  assert.equal(
+    interruptedTurn.summary.length > 96,
+    true,
+    "the full authoritative quarantine summary must not be truncated",
+  );
+  assert.equal(
+    interruptedLocalFast.restored.runtimeEvents.some((event) =>
+      event.type === "run.completed" &&
+      event.turnId === interruptedLocalFast.receipt.turnId &&
+      event.resultKind === "error" &&
+      event.summary === interruptedTurn.summary
+    ),
+    true,
+  );
+
+  const runOnlyLocalFast = restorePersistedHead({
+    suffix: "local-fast-run-only",
+    text: "/agent writer",
+    conclusion: "run_only",
+  });
+  assert.equal(
+    runOnlyLocalFast.restored.workspaceTurnQueue.entries.length,
+    0,
+    "run.completed is repaired into one visible canonical Turn before retirement",
+  );
+  assert.equal(
+    runOnlyLocalFast.restored.conversationTurns.find(
+      (turn) => turn.id === runOnlyLocalFast.receipt.turnId,
+    )?.runtimeOutcome?.resultKind,
+    "success",
+  );
+
+  const completedLocalFast = restorePersistedHead({
+    suffix: "local-fast-completed",
+    text: "/agent writer",
+    conclusion: "canonical",
+  });
+  assert.equal(
+    completedLocalFast.restored.workspaceTurnQueue.entries.length,
+    0,
+    "matching run.completed and turn.completed may retire the local-fast FIFO head",
+  );
+
+  const completedWithoutStart = restorePersistedHead({
+    suffix: "local-fast-completed-without-start",
+    text: "/agent writer",
+    conclusion: "canonical",
+    includeRunStart: false,
+  });
+  const completedWithoutStartTurn = completedWithoutStart.restored.conversationTurns.find(
+    (turn) => turn.id === completedWithoutStart.receipt.turnId,
+  );
+  assert.equal(completedWithoutStart.restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(
+    completedWithoutStart.restored.runtimeEvents.filter((event) =>
+      event.type === "run.started" &&
+      event.turnId === completedWithoutStart.receipt.turnId &&
+      event.runId === completedWithoutStartTurn.runtimeOutcome?.runId
+    ).length,
+    1,
+    "a terminal projection without run.started is repaired under its exact Run owner",
+  );
+  const completedWithoutStartConclusions = completedWithoutStart.restored.runtimeEvents.filter(
+    (event) =>
+      event.type === "run.completed" &&
+      event.turnId === completedWithoutStart.receipt.turnId,
+  );
+  assert.equal(completedWithoutStartConclusions.length, 1);
+  assert.equal(completedWithoutStartConclusions[0].resultKind, "success");
+  assert.equal(completedWithoutStartConclusions[0].summary, "Local command completed.");
+  for (const conclusion of completedWithoutStartConclusions) {
+    assert.equal(
+      completedWithoutStart.restored.runtimeEvents.filter((event) =>
+        event.type === "run.started" &&
+        event.turnId === conclusion.turnId &&
+        event.runId === conclusion.runId &&
+        event.parentRunId === conclusion.parentRunId
+      ).length,
+      1,
+      "restore must not retain an orphan run.completed after repairing a missing start",
+    );
+  }
+  const repairedStartIndex = completedWithoutStart.restored.runtimeEvents.findIndex((event) =>
+    event.type === "run.started" &&
+    event.turnId === completedWithoutStart.receipt.turnId
+  );
+  const repairedRunConclusionIndex = completedWithoutStart.restored.runtimeEvents.findIndex(
+    (event) =>
+      event.type === "run.completed" &&
+      event.turnId === completedWithoutStart.receipt.turnId,
+  );
+  const repairedTurnConclusionIndex = completedWithoutStart.restored.runtimeEvents.findIndex(
+    (event) =>
+      event.type === "turn.completed" &&
+      event.turnId === completedWithoutStart.receipt.turnId,
+  );
+  assert.equal(
+    repairedStartIndex < repairedRunConclusionIndex &&
+      repairedRunConclusionIndex < repairedTurnConclusionIndex,
+    true,
+    "the repaired trace must preserve start -> run.completed -> turn.completed order",
+  );
+  assert.equal(
+    completedWithoutStart.restored.runtimeEvents[repairedStartIndex].timestampMs <=
+      completedWithoutStart.restored.runtimeEvents[repairedRunConclusionIndex].timestampMs,
+    true,
+  );
+  assert.equal(
+    completedWithoutStart.restored.conversationTurns.some((turn) =>
+      turn.id.startsWith("local-slash-recovery-")
+    ),
+    false,
+  );
+
+  const duplicateStart = restorePersistedHead({
+    suffix: "local-fast-duplicate-start",
+    text: "/agent writer",
+    conclusion: "canonical",
+    duplicateRunStart: true,
+  });
+  assert.equal(duplicateStart.restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(
+    duplicateStart.restored.conversationTurns.some((turn) =>
+      turn.id.startsWith("local-slash-recovery-") &&
+      turn.runtimeOutcome?.resultKind === "error"
+    ),
+    true,
+    "a duplicate source start is quarantined through a distinct recovery owner",
+  );
+  assert.equal(
+    duplicateStart.restored.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.turnId === duplicateStart.receipt.turnId
+    ).length,
+    1,
+    "the exact admitted source Turn retains its terminal lifecycle",
+  );
+  const duplicateSourceTurnTerminalIndex = duplicateStart.restored.runtimeEvents.findIndex(
+    (event) =>
+      event.type === "turn.completed" &&
+      event.turnId === duplicateStart.receipt.turnId,
+  );
+  const duplicateSourceStarts = duplicateStart.restored.runtimeEvents.filter((event) =>
+    event.type === "run.started" &&
+    event.turnId === duplicateStart.receipt.turnId
+  );
+  assert.equal(duplicateSourceStarts.length, 2);
+  for (const start of duplicateSourceStarts) {
+    const matchingConclusions = duplicateStart.restored.runtimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.turnId === start.turnId &&
+      event.runId === start.runId
+    );
+    assert.equal(matchingConclusions.length, 1);
+    assert.equal(
+      duplicateStart.restored.runtimeEvents.indexOf(start) <
+        duplicateStart.restored.runtimeEvents.indexOf(matchingConclusions[0]) &&
+        duplicateStart.restored.runtimeEvents.indexOf(matchingConclusions[0]) <
+          duplicateSourceTurnTerminalIndex,
+      true,
+      "every corrupt source Run must close before the admitted Turn terminal",
+    );
+  }
+  const duplicateSourceTurn = duplicateStart.restored.conversationTurns.find(
+    (turn) => turn.id === duplicateStart.receipt.turnId,
+  );
+  const duplicateSourceOutcome = duplicateSourceTurn.runtimeOutcome;
+  const duplicateOutcomeConclusions = duplicateStart.restored.runtimeEvents.filter((event) =>
+    event.type === "run.completed" &&
+    event.turnId === duplicateStart.receipt.turnId &&
+    event.runId === duplicateSourceOutcome?.runId
+  );
+  const duplicateSourceFinals = duplicateStart.restored.taskFlow.filter((block) =>
+    block.type === "agent" &&
+    block.turnId === duplicateStart.receipt.turnId &&
+    block.visibility === "assistant_final"
+  );
+  assert.equal(duplicateOutcomeConclusions.length, 1);
+  assert.equal(
+    duplicateSourceOutcome?.parentRunId,
+    duplicateOutcomeConclusions[0].parentRunId,
+  );
+  assert.equal(
+    duplicateSourceOutcome?.resultKind,
+    duplicateOutcomeConclusions[0].resultKind,
+  );
+  assert.equal(duplicateSourceTurn.summary, duplicateOutcomeConclusions[0].summary);
+  assert.equal(duplicateSourceFinals.length, 1);
+  assert.equal(duplicateSourceFinals[0].content, duplicateOutcomeConclusions[0].summary);
+
+  const unresolvedDuplicateStart = restorePersistedHead({
+    suffix: "local-fast-unresolved-duplicate-start",
+    text: "/agent writer",
+    duplicateRunStart: true,
+  });
+  const unresolvedDuplicateSource = unresolvedDuplicateStart.restored.conversationTurns.find(
+    (turn) => turn.id === unresolvedDuplicateStart.receipt.turnId,
+  );
+  assert.equal(unresolvedDuplicateStart.restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(unresolvedDuplicateSource.runtimeOutcome?.status, "completed");
+  assert.equal(unresolvedDuplicateSource.runtimeOutcome?.resultKind, "error");
+  assert.equal(
+    unresolvedDuplicateStart.restored.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.turnId === unresolvedDuplicateStart.receipt.turnId
+    ).length,
+    1,
+    "a corrupt multi-Run source without a terminal is closed before recovery presentation",
+  );
+  assert.equal(
+    unresolvedDuplicateStart.restored.conversationTurns.some((turn) =>
+      turn.id.startsWith("local-slash-recovery-") &&
+      turn.runtimeOutcome?.resultKind === "error"
+    ),
+    true,
+  );
+
+  const duplicateFinal = restorePersistedHead({
+    suffix: "local-fast-duplicate-final",
+    text: "/agent writer",
+    conclusion: "canonical",
+    extraStreamingFinal: true,
+  });
+  assert.equal(duplicateFinal.restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(
+    duplicateFinal.restored.taskFlow.filter((block) =>
+      block.turnId === duplicateFinal.receipt.turnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    ).length,
+    1,
+    "a streaming duplicate final is canonicalized instead of being ignored",
+  );
+
+  const parentConflict = restorePersistedHead({
+    suffix: "local-fast-parent-conflict",
+    text: "/agent writer",
+    conclusion: "canonical",
+    startParentRunId: "run-parent-start",
+    completionParentRunId: "run-parent-completion",
+    outcomeParentRunId: "run-parent-start",
+  });
+  assert.equal(
+    parentConflict.restored.workspaceTurnQueue.entries.length,
+    0,
+    "a conflicting persisted parent owner must not wedge the terminal FIFO head",
+  );
+  assert.equal(
+    parentConflict.restored.conversationTurns.some((turn) =>
+      turn.id.startsWith("local-slash-recovery-") &&
+      turn.runtimeOutcome?.resultKind === "error"
+    ),
+    true,
+    "parent ownership conflict is isolated under a recovery child",
+  );
+
+  const noStartOutcomeMismatch = restorePersistedHead({
+    suffix: "local-fast-no-start-outcome-mismatch",
+    text: "/agent writer",
+    conclusion: "canonical",
+    includeRunStart: false,
+    completionRunId: "run-local-fast-other-owner",
+  });
+  const mismatchTurnTerminalIndex = noStartOutcomeMismatch.restored.runtimeEvents.findIndex(
+    (event) =>
+      event.type === "turn.completed" &&
+      event.turnId === noStartOutcomeMismatch.receipt.turnId,
+  );
+  assert.equal(noStartOutcomeMismatch.restored.workspaceTurnQueue.entries.length, 0);
+  const mismatchSourceStarts = noStartOutcomeMismatch.restored.runtimeEvents.filter((event) =>
+    event.type === "run.started" &&
+    event.turnId === noStartOutcomeMismatch.receipt.turnId
+  );
+  assert.equal(mismatchSourceStarts.length, 2);
+  for (const start of mismatchSourceStarts) {
+    const conclusionIndex = noStartOutcomeMismatch.restored.runtimeEvents.findIndex((event) =>
+      event.type === "run.completed" &&
+      event.turnId === start.turnId &&
+      event.runId === start.runId
+    );
+    assert.equal(
+      noStartOutcomeMismatch.restored.runtimeEvents.indexOf(start) < conclusionIndex &&
+        conclusionIndex < mismatchTurnTerminalIndex,
+      true,
+      "all repaired source Runs must finish before the existing Turn terminal",
+    );
+  }
+
+  const queuedWithoutFence = restorePersistedHead({
+    suffix: "local-fast-queued-without-fence",
+    text: "/agent writer",
+    queueStatus: "queued",
+    includeRunStart: false,
+  });
+  assert.equal(
+    queuedWithoutFence.restored.workspaceTurnQueue.entries.length,
+    0,
+    "without a durable pre-execution fence, queued local-fast work is also quarantined",
+  );
+  assert.equal(
+    queuedWithoutFence.restored.conversationTurns.find(
+      (turn) => turn.id === queuedWithoutFence.receipt.turnId,
+    )?.runtimeOutcome?.resultKind,
+    "error",
+  );
+  const liveNormalization = normalizeSessionRuntimeSnapshot(
+    queuedWithoutFence.persistedSnapshot,
+    {
+      restoreInterruptedGoal: true,
+      workspacePath: workspace,
+      expectedSessionKey: sessionKey,
+      expectedSessionEpoch: sessionEpoch,
+    },
+  );
+  assert.equal(liveNormalization.workspaceTurnQueue.entries.length, 1);
+  assert.equal(liveNormalization.workspaceTurnQueue.entries[0].status, "queued");
+
+  const driftQueue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "local-fast-identity-drift",
+    73_101,
+    { text: "/agent writer" },
+  );
+  const driftReceipt = driftQueue.entries[0].receipt;
+  const sourceRunId = "run-local-fast-identity-drift";
+  const recoveryTurnId = "local-slash-recovery-identity-drift";
+  const recoveryRunId = `${sourceRunId}-presentation-recovery`;
+  const recoverySummary = "Slash command failed after its Turn identity changed.";
+  const driftSnapshot = JSON.parse(JSON.stringify(
+    buildSessionRuntimeSnapshotFromStoreState({
+      currentWorkspace: workspace,
+      currentSessionId: sessionId,
+      taskFlow: [
+        {
+          id: driftReceipt.userBlockId,
+          turnId: driftReceipt.turnId,
+          type: "user",
+          content: "same-ID replacement owner",
+        },
+        {
+          id: 73_102,
+          turnId: recoveryTurnId,
+          type: "user",
+          content: "/agent writer",
+        },
+        {
+          id: 73_103,
+          turnId: recoveryTurnId,
+          type: "agent",
+          content: recoverySummary,
+          streaming: false,
+          visibility: "assistant_final",
+        },
+      ],
+      conversationTurns: [
+        {
+          id: driftReceipt.turnId,
+          clientSubmissionId: "submission-replacement-owner",
+          workspaceInstructionReceiptId: "receipt-replacement-owner",
+          userPrompt: "same-ID replacement owner",
+          title: "Replacement",
+          mode: "edit",
+          intent: "execute",
+          displayIntent: "execute",
+          status: "executing",
+          summary: "",
+          blockIds: [driftReceipt.userBlockId],
+          collapsed: false,
+          createdAt: driftReceipt.acceptedAt + 1,
+        },
+        {
+          id: recoveryTurnId,
+          userPrompt: "/agent writer",
+          title: "Recovered local slash conclusion",
+          mode: "edit",
+          intent: "execute",
+          displayIntent: "execute",
+          status: "error",
+          summary: recoverySummary,
+          blockIds: [73_102, 73_103],
+          collapsed: false,
+          createdAt: 15,
+          runtimeOutcome: {
+            status: "completed",
+            reason: "local_slash_presentation_recovered",
+            resultKind: "error",
+            runId: recoveryRunId,
+            parentRunId: sourceRunId,
+            updatedAt: 15,
+          },
+        },
+      ],
+      currentTurnId: driftReceipt.turnId,
+      runtimeEvents: [
+        {
+          schemaVersion: 2,
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: driftReceipt.turnId,
+          timestampMs: 13,
+          runId: sourceRunId,
+          parentRunId: null,
+        },
+        {
+          schemaVersion: 2,
+          type: "run.completed",
+          threadId: sessionKey,
+          turnId: driftReceipt.turnId,
+          timestampMs: 15,
+          runId: sourceRunId,
+          parentRunId: null,
+          resultKind: "error",
+          summary: recoverySummary,
+        },
+        {
+          schemaVersion: 2,
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: recoveryTurnId,
+          timestampMs: 15,
+          runId: recoveryRunId,
+          parentRunId: sourceRunId,
+        },
+        {
+          schemaVersion: 2,
+          type: "run.completed",
+          threadId: sessionKey,
+          turnId: recoveryTurnId,
+          timestampMs: 15,
+          runId: recoveryRunId,
+          parentRunId: sourceRunId,
+          resultKind: "error",
+          summary: recoverySummary,
+        },
+        {
+          schemaVersion: 2,
+          type: "turn.completed",
+          threadId: sessionKey,
+          turnId: recoveryTurnId,
+          timestampMs: 15,
+          resultKind: "error",
+        },
+      ],
+      harnessRunMarker: null,
+      workspaceTurnQueue: driftQueue,
+      workspaceInstructionLedger: [],
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_writer",
+      gameStudioInitialized: true,
+    }),
+  ));
+  const restoredDrift = normalizeSessionRuntimeSnapshot(driftSnapshot, {
+    restoreInterruptedGoal: true,
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+    quarantineInterruptedLocalFast: true,
+  });
+  assert.equal(
+    restoredDrift.workspaceTurnQueue.entries.length,
+    0,
+    "a canonical recovery child proves the source receipt already executed",
+  );
+  assert.equal(
+    restoredDrift.conversationTurns.find((turn) => turn.id === driftReceipt.turnId)
+      ?.runtimeOutcome,
+    undefined,
+    "restore must not assign the source terminal to a same-ID replacement",
+  );
+  assert.equal(
+    restoredDrift.taskFlow.filter((block) =>
+      block.turnId === recoveryTurnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    ).length,
+    1,
+  );
+
+  const payloadDriftQueue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "local-fast-payload-drift",
+    73_201,
+    { text: "/agent writer" },
+  );
+  const payloadDriftReceipt = payloadDriftQueue.entries[0].receipt;
+  const payloadDriftRunId = "run-local-fast-payload-drift";
+  const payloadDriftSnapshot = JSON.parse(JSON.stringify(
+    buildSessionRuntimeSnapshotFromStoreState({
+      currentWorkspace: workspace,
+      currentSessionId: sessionId,
+      taskFlow: [{
+        id: payloadDriftReceipt.userBlockId,
+        turnId: payloadDriftReceipt.turnId,
+        type: "user",
+        content: "same identities, replaced payload",
+      }],
+      conversationTurns: [{
+        id: payloadDriftReceipt.turnId,
+        clientSubmissionId: payloadDriftReceipt.clientSubmissionId,
+        workspaceInstructionReceiptId: payloadDriftReceipt.receiptId,
+        userPrompt: "same identities, replaced payload",
+        title: "Replacement payload",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "executing",
+        summary: "",
+        blockIds: [payloadDriftReceipt.userBlockId],
+        collapsed: false,
+        createdAt: payloadDriftReceipt.acceptedAt,
+      }],
+      currentTurnId: payloadDriftReceipt.turnId,
+      runtimeEvents: [{
+        schemaVersion: 2,
+        type: "run.started",
+        threadId: sessionKey,
+        turnId: payloadDriftReceipt.turnId,
+        timestampMs: 17,
+        runId: payloadDriftRunId,
+        parentRunId: null,
+      }],
+      harnessRunMarker: null,
+      workspaceTurnQueue: payloadDriftQueue,
+      workspaceInstructionLedger: [],
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_writer",
+      gameStudioInitialized: true,
+    }),
+  ));
+  const restoredPayloadDrift = normalizeSessionRuntimeSnapshot(payloadDriftSnapshot, {
+    restoreInterruptedGoal: true,
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+    quarantineInterruptedLocalFast: true,
+  });
+  const payloadReplacement = restoredPayloadDrift.conversationTurns.find(
+    (turn) => turn.id === payloadDriftReceipt.turnId,
+  );
+  const payloadRecovery = restoredPayloadDrift.conversationTurns.find(
+    (turn) => turn.id !== payloadDriftReceipt.turnId &&
+      turn.id.startsWith("local-slash-recovery-") &&
+      turn.runtimeOutcome?.parentRunId === payloadDriftRunId,
+  );
+  assert.equal(restoredPayloadDrift.workspaceTurnQueue.entries.length, 0);
+  assert.equal(payloadReplacement.userPrompt, "same identities, replaced payload");
+  assert.equal(payloadReplacement.runtimeOutcome, undefined);
+  assert.equal(payloadRecovery?.runtimeOutcome?.resultKind, "error");
+  assert.equal(
+    restoredPayloadDrift.runtimeEvents.some((event) =>
+      event.type === "run.completed" &&
+      event.turnId === payloadDriftReceipt.turnId &&
+      event.runId === payloadDriftRunId &&
+      event.resultKind === "error"
+    ),
+    true,
+    "the immutable source Run must close before the recovery child owns presentation",
+  );
+
+  const admittedModelWorkflow = restorePersistedHead({
+    suffix: "model-workflow-started",
+    text: "Inspect the workspace",
+  });
+  assert.equal(
+    admittedModelWorkflow.restored.workspaceTurnQueue.entries.length,
+    0,
+    "non-local-fast admission keeps the existing run.started acknowledgement behavior",
+  );
+});
+
+test("cold restore never adopts same-turn lookalike lifecycle evidence for another FIFO owner", () => {
+  const workspace = "/tmp/session-model-workflow-lookalike";
+  const sessionId = 74;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-model-workflow-lookalike";
+
+  for (const variant of [
+    { suffix: "dispatching-terminal", queueStatus: "dispatching", terminal: true },
+    { suffix: "queued-start", queueStatus: "queued", terminal: false },
+  ]) {
+    const queue = (variant.queueStatus === "dispatching"
+      ? buildDispatchingWorkspaceTurn
+      : buildQueuedWorkspaceTurn)(
+      sessionKey,
+      sessionEpoch,
+      variant.suffix,
+      variant.terminal ? 74_001 : 74_101,
+      { text: `inspect exact owner ${variant.suffix}` },
+    );
+    const entry = queue.entries[0];
+    const replacementText = `unrelated replacement ${variant.suffix}`;
+    const replacementRunId = `run-lookalike-${variant.suffix}`;
+    const replacementFinalId = entry.receipt.userBlockId + 1;
+    const replacementSummary = `Unrelated ${variant.suffix} conclusion.`;
+    const runtimeEvents = [turnEvents.withEventSchema({
+      type: "run.started",
+      threadId: sessionKey,
+      turnId: entry.receipt.turnId,
+      runId: replacementRunId,
+      parentRunId: null,
+      timestampMs: 20,
+    })];
+    if (variant.terminal) {
+      runtimeEvents.push(
+        turnEvents.withEventSchema({
+          type: "run.completed",
+          threadId: sessionKey,
+          turnId: entry.receipt.turnId,
+          runId: replacementRunId,
+          parentRunId: null,
+          timestampMs: 21,
+          resultKind: "success",
+          summary: replacementSummary,
+        }),
+        turnEvents.withEventSchema({
+          type: "turn.completed",
+          threadId: sessionKey,
+          turnId: entry.receipt.turnId,
+          timestampMs: 22,
+          resultKind: "success",
+        }),
+      );
+    }
+
+    const restored = normalizeSessionRuntimeSnapshot({
+      taskFlow: [{
+        id: entry.receipt.userBlockId,
+        turnId: entry.receipt.turnId,
+        type: "user",
+        content: replacementText,
+      }, ...(variant.terminal
+        ? [{
+            id: replacementFinalId,
+            turnId: entry.receipt.turnId,
+            type: "agent",
+            content: replacementSummary,
+            streaming: false,
+            visibility: "assistant_final",
+          }]
+        : [])],
+      conversationTurns: [{
+        id: entry.receipt.turnId,
+        clientSubmissionId: `replacement-submission-${variant.suffix}`,
+        workspaceInstructionReceiptId: `replacement-receipt-${variant.suffix}`,
+        workspaceInstructionSource: "replay",
+        userPrompt: replacementText,
+        title: replacementText,
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: variant.terminal ? "done" : "executing",
+        summary: variant.terminal ? replacementSummary : "",
+        blockIds: [
+          entry.receipt.userBlockId,
+          ...(variant.terminal ? [replacementFinalId] : []),
+        ],
+        collapsed: false,
+        createdAt: entry.receipt.acceptedAt + 1,
+        ...(variant.terminal
+          ? {
+              runtimeOutcome: {
+                status: "completed",
+                reason: "unrelated_owner_completed",
+                resultKind: "success",
+                runId: replacementRunId,
+                parentRunId: null,
+                updatedAt: 22,
+              },
+            }
+          : {}),
+      }],
+      currentTurnId: entry.receipt.turnId,
+      runtimeEvents,
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+    }, {
+      workspacePath: workspace,
+      expectedSessionKey: sessionKey,
+      expectedSessionEpoch: sessionEpoch,
+    });
+
+    const replacement = restored.conversationTurns.find(
+      (turn) => turn.id === entry.receipt.turnId,
+    );
+    const recoveryTurns = restored.conversationTurns.filter((turn) =>
+      turn.id.startsWith(`workspace-recovery-${entry.receipt.receiptId}`)
+    );
+    assert.equal(
+      restored.workspaceTurnQueue.entries.length,
+      0,
+      `${variant.suffix}: the poisoned receipt may retire only through visible recovery`,
+    );
+    assert.equal(replacement.clientSubmissionId, `replacement-submission-${variant.suffix}`);
+    assert.equal(replacement.workspaceInstructionReceiptId, `replacement-receipt-${variant.suffix}`);
+    assert.equal(replacement.userPrompt, replacementText);
+    if (variant.terminal) {
+      assert.equal(replacement.runtimeOutcome?.runId, replacementRunId);
+      assert.equal(replacement.runtimeOutcome?.resultKind, "success");
+    } else {
+      assert.equal(replacement.runtimeOutcome, undefined);
+    }
+    assert.equal(recoveryTurns.length, 1, `${variant.suffix}: recovery must be visible`);
+
+    const recovery = recoveryTurns[0];
+    const recoveryEvents = restored.runtimeEvents.filter((event) =>
+      "turnId" in event && event.turnId === recovery.id
+    );
+    assert.deepEqual(
+      recoveryEvents.map((event) => event.type),
+      ["run.started", "run.completed", "turn.completed"],
+      `${variant.suffix}: recovery lifecycle must be canonical`,
+    );
+    assert.equal(recovery.runtimeOutcome?.status, "completed");
+    assert.equal(recovery.runtimeOutcome?.resultKind, "error");
+    assert.equal(recovery.runtimeOutcome?.parentRunId, null);
+    assert.equal(recoveryEvents[0].runId, recovery.runtimeOutcome?.runId);
+    assert.equal(recoveryEvents[1].runId, recovery.runtimeOutcome?.runId);
+    assert.equal(recoveryEvents[1].parentRunId, recovery.runtimeOutcome?.parentRunId);
+    assert.equal(recoveryEvents[1].resultKind, recovery.runtimeOutcome?.resultKind);
+    assert.equal(recoveryEvents[1].summary, recovery.summary);
+    assert.equal(recoveryEvents[2].resultKind, recovery.runtimeOutcome?.resultKind);
+    const recoveryFinals = restored.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === recovery.id &&
+      block.visibility === "assistant_final"
+    );
+    assert.equal(recoveryFinals.length, 1);
+    assert.equal(recoveryFinals[0].streaming, false);
+    assert.equal(recoveryFinals[0].content, recovery.summary);
+  }
+});
+
+test("cold restore rejects an exact-looking owner when its Turn omits the receipt user block", () => {
+  const workspace = "/tmp/session-model-workflow-missing-user-block-owner";
+  const sessionId = 741;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-model-workflow-missing-user-block-owner";
+  const queue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "model-workflow-missing-user-block-owner",
+    74_201,
+    { text: "Inspect the exact workspace owner" },
+  );
+  const entry = queue.entries[0];
+  const sourceRunId = "run-model-workflow-missing-user-block-owner";
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const restored = normalizeSessionRuntimeSnapshot({
+    ...projection,
+    conversationTurns: projection.conversationTurns.map((turn) => ({
+      ...turn,
+      blockIds: [],
+    })),
+    currentTurnId: entry.receipt.turnId,
+    runtimeEvents: [turnEvents.withEventSchema({
+      type: "run.started",
+      threadId: sessionKey,
+      turnId: entry.receipt.turnId,
+      runId: sourceRunId,
+      parentRunId: null,
+      timestampMs: 20,
+    })],
+    workspaceTurnQueue: queue,
+    workspaceInstructionLedger: [],
+  }, {
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+  });
+
+  const sourceTurn = restored.conversationTurns.find(
+    (turn) => turn.id === entry.receipt.turnId,
+  );
+  const sourceUserBlock = restored.taskFlow.find(
+    (block) => block.id === entry.receipt.userBlockId,
+  );
+  const sourceEvents = restored.runtimeEvents.filter((event) =>
+    "turnId" in event && event.turnId === entry.receipt.turnId
+  );
+  const recoveryTurns = restored.conversationTurns.filter((turn) =>
+    turn.id.startsWith(`workspace-recovery-${entry.receipt.receiptId}`)
+  );
+
+  assert.equal(restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(sourceTurn.clientSubmissionId, entry.instruction.clientSubmissionId);
+  assert.equal(sourceTurn.workspaceInstructionReceiptId, entry.receipt.receiptId);
+  assert.equal(sourceTurn.workspaceInstructionSource, entry.instruction.source);
+  assert.equal(sourceTurn.userPrompt, entry.instruction.payload.text);
+  assert.deepEqual(
+    sourceTurn.blockIds,
+    [],
+    "restore must not silently attach the receipt block to an unrelated source Turn",
+  );
+  assert.equal(sourceTurn.runtimeOutcome, undefined);
+  assert.deepEqual(sourceUserBlock, projection.taskFlow[0]);
+  assert.deepEqual(
+    sourceEvents.map((event) => event.type),
+    ["run.started"],
+    "fail-closed recovery must not append terminal events to the noncanonical source",
+  );
+  assert.equal(recoveryTurns.length, 1);
+  const recovery = recoveryTurns[0];
+  const recoveryEvents = restored.runtimeEvents.filter((event) =>
+    "turnId" in event && event.turnId === recovery.id
+  );
+  assert.deepEqual(recoveryEvents.map((event) => event.type), [
+    "run.started",
+    "run.completed",
+    "turn.completed",
+  ]);
+  assert.equal(recovery.runtimeOutcome?.status, "completed");
+  assert.equal(recovery.runtimeOutcome?.resultKind, "error");
+  assert.equal(recoveryEvents[1]?.resultKind, "error");
+  assert.equal(recoveryEvents[2]?.resultKind, "error");
+});
+
+test("cold restore reserves later queued receipt block IDs while fail-closing the FIFO head", () => {
+  const workspace = "/tmp/session-model-workflow-reserved-receipt-blocks";
+  const sessionId = 742;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-model-workflow-reserved-receipt-blocks";
+
+  for (const [index, variant] of [
+    { suffix: "source-final", projectionConflict: false },
+    { suffix: "recovery-final", projectionConflict: true },
+  ].entries()) {
+    const firstUserBlockId = 74_301 + (index * 100);
+    let queue = buildDispatchingWorkspaceTurn(
+      sessionKey,
+      sessionEpoch,
+      `reserved-${variant.suffix}`,
+      firstUserBlockId,
+      { text: `Inspect reserved IDs for ${variant.suffix}` },
+    );
+    queue = appendQueuedWorkspaceTurn(
+      queue,
+      `reserved-${variant.suffix}-next`,
+      firstUserBlockId + 1,
+      { text: `Continue after ${variant.suffix}` },
+    );
+    const [firstEntry, nextEntry] = queue.entries;
+    const exactProjection = buildExactWorkspaceInstructionProjection(firstEntry);
+    const unrelatedTurnId = `turn-unrelated-${variant.suffix}`;
+    const taskFlow = variant.projectionConflict
+      ? [{
+          id: firstEntry.receipt.userBlockId,
+          turnId: unrelatedTurnId,
+          type: "user",
+          content: `Unrelated history for ${variant.suffix}`,
+        }]
+      : exactProjection.taskFlow;
+    const conversationTurns = variant.projectionConflict
+      ? [{
+          id: unrelatedTurnId,
+          userPrompt: `Unrelated history for ${variant.suffix}`,
+          title: "Unrelated history",
+          mode: "edit",
+          intent: "execute",
+          displayIntent: "execute",
+          status: "done",
+          summary: "Unrelated history remains unchanged.",
+          blockIds: [firstEntry.receipt.userBlockId],
+          collapsed: false,
+          createdAt: firstEntry.receipt.acceptedAt - 1,
+        }]
+      : exactProjection.conversationTurns;
+    const runtimeEvents = variant.projectionConflict
+      ? []
+      : [turnEvents.withEventSchema({
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: firstEntry.receipt.turnId,
+          runId: `run-${variant.suffix}`,
+          parentRunId: null,
+          timestampMs: 20,
+        })];
+
+    const restored = normalizeSessionRuntimeSnapshot({
+      taskFlow,
+      conversationTurns,
+      currentTurnId: firstEntry.receipt.turnId,
+      runtimeEvents,
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+    }, {
+      workspacePath: workspace,
+      expectedSessionKey: sessionKey,
+      expectedSessionEpoch: sessionEpoch,
+    });
+
+    assert.deepEqual(
+      restored.workspaceTurnQueue.entries.map((entry) => entry.receipt.receiptId),
+      [nextEntry.receipt.receiptId],
+      `${variant.suffix}: only the fail-closed head may retire`,
+    );
+    const nextTurn = restored.conversationTurns.find(
+      (turn) => turn.id === nextEntry.receipt.turnId,
+    );
+    const nextUserBlocks = restored.taskFlow.filter(
+      (block) => block.id === nextEntry.receipt.userBlockId,
+    );
+    assert.equal(nextTurn?.workspaceInstructionReceiptId, nextEntry.receipt.receiptId);
+    assert.equal(nextTurn?.userPrompt, nextEntry.instruction.payload.text);
+    assert.deepEqual(nextTurn?.blockIds, [nextEntry.receipt.userBlockId]);
+    assert.equal(nextUserBlocks.length, 1);
+    assert.equal(nextUserBlocks[0].turnId, nextEntry.receipt.turnId);
+    assert.equal(nextUserBlocks[0].type, "user");
+
+    const conclusionTurn = variant.projectionConflict
+      ? restored.conversationTurns.find((turn) =>
+          turn.id.startsWith(`workspace-recovery-${firstEntry.receipt.receiptId}`)
+        )
+      : restored.conversationTurns.find((turn) => turn.id === firstEntry.receipt.turnId);
+    const conclusionFinals = restored.taskFlow.filter((block) =>
+      block.turnId === conclusionTurn?.id &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    );
+    assert.equal(conclusionTurn?.runtimeOutcome?.resultKind, "error");
+    assert.equal(conclusionFinals.length, 1);
+    assert.notEqual(
+      conclusionFinals[0].id,
+      nextEntry.receipt.userBlockId,
+      `${variant.suffix}: generated conclusion must not consume the next receipt block ID`,
+    );
+  }
+});
+
+test("cold restore completes an exact run-only FIFO projection without rewriting its result", () => {
+  const workspace = "/tmp/session-model-workflow-run-only";
+  const sessionId = 75;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-model-workflow-run-only";
+  const queue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "model-workflow-run-only",
+    75_001,
+    { text: "Verify the durable partial result" },
+  );
+  const entry = queue.entries[0];
+  const runId = "run-model-workflow-partial";
+  const summary = "The durable mutation is complete; an optional check remains.";
+  const projection = buildExactWorkspaceInstructionProjection(entry, {
+    status: "done",
+    summary,
+    runtimeOutcome: {
+      status: "completed",
+      reason: "durable_partial_result",
+      resultKind: "partial",
+      runId,
+      parentRunId: null,
+      updatedAt: 31,
+    },
+  });
+  const restored = normalizeSessionRuntimeSnapshot({
+    ...projection,
+    currentTurnId: entry.receipt.turnId,
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.started",
+        threadId: sessionKey,
+        turnId: entry.receipt.turnId,
+        runId,
+        parentRunId: null,
+        timestampMs: 30,
+      }),
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId: entry.receipt.turnId,
+        runId,
+        parentRunId: null,
+        timestampMs: 31,
+        resultKind: "partial",
+        summary,
+      }),
+    ],
+    workspaceTurnQueue: queue,
+    workspaceInstructionLedger: [],
+  }, {
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+  });
+
+  const restoredTurn = restored.conversationTurns.find(
+    (turn) => turn.id === entry.receipt.turnId,
+  );
+  const ownedEvents = restored.runtimeEvents.filter((event) =>
+    "turnId" in event && event.turnId === entry.receipt.turnId
+  );
+  const finals = restored.taskFlow.filter((block) =>
+    block.type === "agent" &&
+    block.turnId === entry.receipt.turnId &&
+    block.visibility === "assistant_final"
+  );
+  assert.equal(restored.workspaceTurnQueue.entries.length, 0);
+  assert.deepEqual(
+    ownedEvents.map((event) => event.type),
+    ["run.started", "run.completed", "turn.completed"],
+  );
+  assert.equal(ownedEvents[1].runId, runId);
+  assert.equal(ownedEvents[1].resultKind, "partial");
+  assert.equal(ownedEvents[1].summary, summary);
+  assert.equal(ownedEvents[2].resultKind, "partial");
+  assert.equal(restoredTurn.runtimeOutcome?.runId, runId);
+  assert.equal(restoredTurn.runtimeOutcome?.parentRunId, null);
+  assert.equal(restoredTurn.runtimeOutcome?.resultKind, "partial");
+  assert.equal(restoredTurn.summary, summary);
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].streaming, false);
+  assert.equal(finals[0].content, summary);
 });
 
 test("queued Goal continuation guidance survives session normalization only with authorization", () => {
@@ -950,6 +2273,334 @@ test("restore removes a genuine but stale choice whose run owner no longer match
   assert.equal(restored.harnessRunMarker.closeReason, "awaiting_user_choice");
 });
 
+test("turn.completed without a marker restores a missing final only for loaded terminal Turns", () => {
+  const sessionKey = "event-owned-missing-final-session";
+  const turnId = "turn-event-owned-missing-final";
+  const unrelatedTurnId = "turn-without-completion";
+  const unloadedTurnId = "turn-not-loaded";
+  const restored = normalizeSessionRuntimeSnapshot({
+    taskFlow: [],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "Recover the durable conclusion",
+        title: "Missing final",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "paused",
+        summary: "Waiting for projection",
+        blockIds: [],
+        collapsed: false,
+        createdAt: 100,
+      },
+      {
+        id: unrelatedTurnId,
+        userPrompt: "Leave this Turn alone",
+        title: "Unrelated Turn",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "paused",
+        summary: "Still paused",
+        blockIds: [],
+        collapsed: false,
+        createdAt: 200,
+      },
+    ],
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId,
+        runId: "run-event-owned-older",
+        parentRunId: null,
+        timestampMs: 400,
+        resultKind: "success",
+        summary: "Superseded run summary.",
+      }),
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId,
+        runId: "run-event-owned",
+        parentRunId: "run-parent",
+        timestampMs: 500,
+        resultKind: "partial",
+        summary: "The verified work is durable; one advisory remains.",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 510,
+        resultKind: "partial",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId: unloadedTurnId,
+        timestampMs: 520,
+        resultKind: "success",
+      }),
+    ],
+  });
+
+  const terminalTurn = restored.conversationTurns.find((turn) => turn.id === turnId);
+  const unrelatedTurn = restored.conversationTurns.find((turn) => turn.id === unrelatedTurnId);
+  const finals = restored.taskFlow.filter((block) =>
+    block.type === "agent" && block.visibility === "assistant_final"
+  );
+  assert.equal(terminalTurn.status, "done");
+  assert.deepEqual(terminalTurn.runtimeOutcome, {
+    status: "completed",
+    reason: "The verified work is durable; one advisory remains.",
+    resultKind: "partial",
+    runId: "run-event-owned",
+    parentRunId: "run-parent",
+    updatedAt: 510,
+  });
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].turnId, turnId);
+  assert.equal(finals[0].streaming, false);
+  assert.equal(finals[0].hiddenProcess, false);
+  assert.match(finals[0].content, /verified work is durable/i);
+  assert.equal(terminalTurn.blockIds.includes(finals[0].id), true);
+  assert.equal(unrelatedTurn.status, "paused");
+  assert.equal(unrelatedTurn.runtimeOutcome, undefined);
+  assert.equal(restored.taskFlow.some((block) => block.turnId === unloadedTurnId), false);
+});
+
+test("generic terminal-final repair reserves consecutive unprojected FIFO user block IDs", () => {
+  const workspace = "/tmp/session-terminal-final-reserved-receipts";
+  const sessionId = 743;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-terminal-final-reserved-receipts";
+  const terminalTurnId = "turn-terminal-final-before-queued-projections";
+  const terminalUserBlockId = 74_500;
+  let queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "terminal-final-reserved-first",
+    terminalUserBlockId + 1,
+    { text: "Project the first queued receipt" },
+  );
+  queue = appendQueuedWorkspaceTurn(
+    queue,
+    "terminal-final-reserved-second",
+    terminalUserBlockId + 2,
+    { text: "Project the second queued receipt" },
+  );
+  const reservedEntries = [...queue.entries];
+
+  const restored = normalizeSessionRuntimeSnapshot({
+    taskFlow: [{
+      id: terminalUserBlockId,
+      turnId: terminalTurnId,
+      type: "user",
+      content: "Repair this terminal conclusion",
+    }],
+    conversationTurns: [{
+      id: terminalTurnId,
+      userPrompt: "Repair this terminal conclusion",
+      title: "Terminal conclusion repair",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "paused",
+      summary: "Waiting for the durable conclusion projection.",
+      blockIds: [terminalUserBlockId],
+      collapsed: false,
+      createdAt: 100,
+    }],
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId: terminalTurnId,
+        runId: "run-terminal-final-before-queued-projections",
+        parentRunId: null,
+        timestampMs: 200,
+        resultKind: "success",
+        summary: "The durable terminal conclusion was recovered.",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId: terminalTurnId,
+        timestampMs: 201,
+        resultKind: "success",
+      }),
+    ],
+    workspaceTurnQueue: queue,
+    workspaceInstructionLedger: [],
+  }, {
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+  });
+
+  const reservedUserBlockIds = reservedEntries.map((entry) => entry.receipt.userBlockId);
+  const terminalFinals = restored.taskFlow.filter((block) =>
+    block.turnId === terminalTurnId &&
+    block.type === "agent" &&
+    block.visibility === "assistant_final"
+  );
+  assert.equal(terminalFinals.length, 1);
+  assert.equal(terminalFinals[0].id, terminalUserBlockId + 3);
+  assert.equal(reservedUserBlockIds.includes(terminalFinals[0].id), false);
+  assert.deepEqual(
+    restored.workspaceTurnQueue.entries.map((entry) => entry.receipt.receiptId),
+    reservedEntries.map((entry) => entry.receipt.receiptId),
+    "generic final repair must leave both never-started FIFO receipts replayable",
+  );
+
+  for (const entry of reservedEntries) {
+    const projectedTurn = restored.conversationTurns.find(
+      (turn) => turn.id === entry.receipt.turnId,
+    );
+    const projectedUserBlocks = restored.taskFlow.filter(
+      (block) => block.id === entry.receipt.userBlockId,
+    );
+    assert.equal(projectedTurn?.workspaceInstructionReceiptId, entry.receipt.receiptId);
+    assert.equal(projectedTurn?.userPrompt, entry.instruction.payload.text);
+    assert.deepEqual(projectedTurn?.blockIds, [entry.receipt.userBlockId]);
+    assert.equal(projectedUserBlocks.length, 1);
+    assert.equal(projectedUserBlocks[0].turnId, entry.receipt.turnId);
+    assert.equal(projectedUserBlocks[0].type, "user");
+  }
+});
+
+test("turn.completed without a marker keeps one canonical final when two were persisted", () => {
+  const sessionKey = "event-owned-duplicate-final-session";
+  const turnId = "turn-event-owned-duplicate-final";
+  const restored = normalizeSessionRuntimeSnapshot({
+    taskFlow: [
+      {
+        id: 901,
+        type: "agent",
+        turnId,
+        content: "Older final",
+        visibility: "assistant_final",
+      },
+      {
+        id: 902,
+        type: "agent",
+        turnId,
+        content: "Canonical final",
+        streaming: true,
+        hiddenProcess: true,
+        visibility: "assistant_final",
+      },
+    ],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "Deduplicate the conclusion",
+      title: "Duplicate final",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "paused",
+      summary: "Waiting",
+      blockIds: [901],
+      collapsed: false,
+      createdAt: 100,
+    }],
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId,
+        runId: "run-duplicate-final",
+        parentRunId: null,
+        timestampMs: 500,
+        resultKind: "success",
+        summary: "Completed once.",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 501,
+        resultKind: "success",
+      }),
+    ],
+  });
+
+  const finals = restored.taskFlow.filter((block) =>
+    block.type === "agent" &&
+    block.turnId === turnId &&
+    block.visibility === "assistant_final"
+  );
+  assert.deepEqual(finals.map((block) => block.id), [902]);
+  assert.equal(finals[0].content, "Canonical final");
+  assert.equal(finals[0].streaming, false);
+  assert.equal(finals[0].hiddenProcess, false);
+  assert.equal(restored.taskFlow.find((block) => block.id === 901)?.visibility, "assistant_update");
+  assert.deepEqual(restored.conversationTurns[0].blockIds, [901, 902]);
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.runId, "run-duplicate-final");
+});
+
+test("turn.completed without a marker closes an executing Turn and repairs its empty final", () => {
+  const sessionKey = "event-owned-executing-session";
+  const turnId = "turn-event-owned-executing";
+  const restored = normalizeSessionRuntimeSnapshot({
+    taskFlow: [{
+      id: 911,
+      type: "agent",
+      turnId,
+      content: "   ",
+      streaming: true,
+      hiddenProcess: true,
+      visibility: "assistant_final",
+    }],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "Finish despite the crash",
+      title: "Executing terminal Turn",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "executing",
+      summary: "Still executing",
+      blockIds: [911],
+      collapsed: false,
+      createdAt: 100,
+    }],
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId,
+        runId: "run-executing-terminal",
+        parentRunId: null,
+        timestampMs: 600,
+        resultKind: "error",
+        summary: "The executor ended with a durable error conclusion.",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 601,
+        resultKind: "error",
+      }),
+    ],
+  });
+
+  const final = restored.taskFlow.find((block) => block.id === 911);
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.status, "completed");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.resultKind, "error");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.runId, "run-executing-terminal");
+  assert.equal(final?.visibility, "assistant_final");
+  assert.equal(final?.streaming, false);
+  assert.equal(final?.hiddenProcess, false);
+  assert.match(final?.content || "", /durable error conclusion/i);
+  assert.equal(restored.runtimeEvents.some((event) => event.type === "run.paused"), false);
+});
+
 test("restore projects terminal markers instead of inventing a resumable pause", () => {
   for (const status of ["completed", "error"]) {
     const sessionKey = `terminal-${status}-session`;
@@ -1016,17 +2667,196 @@ test("restore projects terminal markers instead of inventing a resumable pause",
       status === "completed" ? "success" : "error",
     );
     const runEvents = restored.runtimeEvents.filter((event) => event.runId === runId);
-    assert.deepEqual(runEvents.map((event) => event.type), ["run.completed"]);
-    assert.equal(runEvents[0]?.resultKind, status === "completed" ? "success" : "error");
+    assert.deepEqual(runEvents.map((event) => event.type), [
+      "run.started",
+      "run.completed",
+    ]);
+    assert.equal(runEvents[1]?.resultKind, status === "completed" ? "success" : "error");
     assert.equal(runEvents.some((event) => event.type === "run.paused"), false);
     const turnTerminal = restored.runtimeEvents.find((event) =>
       event.type === "turn.completed" && event.turnId === turnId
     );
     assert.equal(turnTerminal?.resultKind, status === "completed" ? "success" : "error");
+    const visibleFinals = restored.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === turnId &&
+      block.visibility === "assistant_final"
+    );
+    assert.equal(visibleFinals.length, 1);
+    assert.equal(restored.conversationTurns[0].blockIds.includes(visibleFinals[0].id), true);
+    assert.match(
+      visibleFinals[0].content,
+      status === "error" ? /terminal failure/ : /completed/i,
+    );
   }
 });
 
-test("restore preserves an aborted run over its cleanly completed harness lease", () => {
+test("terminal marker restore keeps the last final and demotes only earlier same-Turn finals", () => {
+  const sessionKey = "terminal-duplicate-final-session";
+  const turnId = "turn-terminal-duplicate-final";
+  const unrelatedTurnId = "turn-unrelated-duplicate-final";
+  const runId = "run-terminal-duplicate-final";
+  const restored = normalizeSessionRuntimeSnapshot({
+    harnessRunMarker: {
+      schemaVersion: 1,
+      instanceId: "test-instance",
+      sessionKey,
+      turnId,
+      runId,
+      activeRunId: runId,
+      status: "completed",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      startedAt: 100,
+      updatedAt: 500,
+      closedAt: 500,
+      closeReason: "completed",
+      lastStreamError: null,
+    },
+    taskFlow: [
+      {
+        id: 601,
+        type: "agent",
+        turnId,
+        content: "Older final",
+        visibility: "assistant_final",
+      },
+      {
+        id: 602,
+        type: "agent",
+        turnId,
+        content: "Canonical final",
+        streaming: true,
+        hiddenProcess: true,
+        visibility: "assistant_final",
+      },
+      {
+        id: 603,
+        type: "agent",
+        turnId: unrelatedTurnId,
+        content: "Unrelated older final",
+        visibility: "assistant_final",
+      },
+      {
+        id: 604,
+        type: "agent",
+        turnId: unrelatedTurnId,
+        content: "Unrelated newer final",
+        visibility: "assistant_final",
+      },
+    ],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "Finish the run",
+      title: "Terminal duplicate final",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "done",
+      summary: "Completed",
+      blockIds: [601],
+      collapsed: false,
+      createdAt: 100,
+    }],
+    runtimeEvents: [],
+  });
+
+  const ownedFinals = restored.taskFlow.filter((block) =>
+    block.type === "agent" &&
+    block.turnId === turnId &&
+    block.visibility === "assistant_final"
+  );
+  assert.deepEqual(ownedFinals.map((block) => block.id), [602]);
+  assert.equal(ownedFinals[0].content, "Canonical final");
+  assert.equal(ownedFinals[0].streaming, false);
+  assert.equal(ownedFinals[0].hiddenProcess, false);
+  assert.equal(restored.taskFlow.find((block) => block.id === 601)?.visibility, "assistant_update");
+  assert.deepEqual(restored.conversationTurns[0].blockIds, [601, 602]);
+  assert.equal(
+    restored.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === unrelatedTurnId &&
+      block.visibility === "assistant_final"
+    ).length,
+    2,
+  );
+});
+
+test("terminal marker restore closes executing and planning owners and repairs empty streaming finals", () => {
+  for (const [index, initialStatus] of ["executing", "planning"].entries()) {
+    const sessionKey = `terminal-${initialStatus}-owner-session`;
+    const turnId = `turn-terminal-${initialStatus}-owner`;
+    const runId = `run-terminal-${initialStatus}-owner`;
+    const finalBlockId = 700 + index;
+    const restored = normalizeSessionRuntimeSnapshot({
+      harnessRunMarker: {
+        schemaVersion: 1,
+        instanceId: "test-instance",
+        sessionKey,
+        turnId,
+        runId,
+        activeRunId: runId,
+        status: "completed",
+        workflowMode: initialStatus === "planning" ? "plan" : "edit",
+        runtimeIntent: initialStatus === "planning" ? "plan" : "execute",
+        planStage: initialStatus === "planning" ? "plan" : "idle",
+        isPlanApproved: false,
+        startedAt: 100,
+        updatedAt: 500,
+        closedAt: 500,
+        closeReason: "partial_checkpoint",
+        lastStreamError: null,
+      },
+      taskFlow: [{
+        id: finalBlockId,
+        type: "agent",
+        turnId,
+        content: "   ",
+        streaming: true,
+        hiddenProcess: true,
+        visibility: "assistant_final",
+      }],
+      conversationTurns: [{
+        id: turnId,
+        userPrompt: "Complete this work",
+        title: "Terminal owner restore",
+        mode: initialStatus === "planning" ? "plan" : "edit",
+        intent: initialStatus === "planning" ? "plan" : "execute",
+        displayIntent: initialStatus === "planning" ? "plan" : "execute",
+        status: initialStatus,
+        summary: "In progress",
+        blockIds: [finalBlockId],
+        collapsed: false,
+        createdAt: 100,
+      }],
+      runtimeEvents: [turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: sessionKey,
+        turnId,
+        runId,
+        parentRunId: null,
+        timestampMs: 500,
+        resultKind: "partial",
+        summary: "Some work remains documented.",
+      })],
+    });
+
+    const restoredTurn = restored.conversationTurns[0];
+    const restoredFinal = restored.taskFlow.find((block) => block.id === finalBlockId);
+    assert.equal(restoredTurn.status, "done");
+    assert.equal(restoredTurn.runtimeOutcome?.status, "completed");
+    assert.equal(restoredTurn.runtimeOutcome?.resultKind, "partial");
+    assert.equal(restoredFinal?.visibility, "assistant_final");
+    assert.equal(restoredFinal?.streaming, false);
+    assert.equal(restoredFinal?.hiddenProcess, false);
+    assert.match(restoredFinal?.content || "", /partial/i);
+    assert.equal(restored.runtimeEvents.some((event) => event.type === "run.paused"), false);
+  }
+});
+
+test("restore canonicalizes an abort-only trace before preserving its canceled outcome", () => {
   const sessionKey = "terminal-aborted-session";
   const turnId = "turn-aborted";
   const runId = "run-aborted";
@@ -1103,13 +2933,18 @@ test("restore preserves an aborted run over its cleanly completed harness lease"
 
   assert.equal(restored.activeActionRequest, null);
   assert.equal(restored.conversationTurns[0].status, "done");
-  assert.equal(restored.conversationTurns[0].runtimeOutcome?.status, "aborted");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.status, "completed");
   assert.equal(restored.conversationTurns[0].runtimeOutcome?.resultKind, "canceled");
   assert.equal(restored.conversationTurns[0].runtimeOutcome?.reason, "user_cancelled");
   const runEvents = restored.runtimeEvents.filter((event) => event.runId === runId);
-  assert.deepEqual(runEvents.map((event) => event.type), ["run.aborted"]);
+  assert.deepEqual(runEvents.map((event) => event.type), [
+    "run.started",
+    "run.aborted",
+    "run.completed",
+  ]);
+  assert.equal(runEvents[2]?.resultKind, "canceled");
   const turnTerminals = restored.runtimeEvents.filter((event) =>
-    event.turnId === turnId && (event.type === "turn.completed" || event.type === "turn.failed")
+    event.turnId === turnId && event.type === "turn.completed"
   );
   assert.deepEqual(turnTerminals.map((event) => [event.type, event.resultKind]), [
     ["turn.completed", "canceled"],
@@ -1227,6 +3062,133 @@ test("restore emits run.paused when a running marker was interrupted by restart"
   assert.equal(restored.harnessRunMarker.status, "paused");
   assert.deepEqual(restored.runtimeEvents.map((event) => event.type), ["run.started", "run.paused"]);
   assert.equal(restored.runtimeEvents[1].reason, "application_restarted");
+});
+
+test("paused Harness restore adopts only one exact Run start and fail-closes corrupt starts", () => {
+  const workspace = "/tmp/session-paused-harness-owner";
+  const sessionId = 76;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-paused-harness-owner";
+
+  const restoreVariant = (variant) => {
+    const suffix = `paused-harness-${variant}`;
+    const queue = buildDispatchingWorkspaceTurn(
+      sessionKey,
+      sessionEpoch,
+      suffix,
+      variant === "missing" ? 76_001 : variant === "wrong_parent" ? 76_101 : 76_201,
+      { text: `Resume ${variant} Harness checkpoint` },
+    );
+    const entry = queue.entries[0];
+    const runId = `run-${suffix}`;
+    const projection = buildExactWorkspaceInstructionProjection(entry, {
+      status: "paused",
+      summary: "Waiting to resume the exact checkpoint.",
+    });
+    const starts = variant === "missing"
+      ? []
+      : variant === "wrong_parent"
+      ? [{ runId, parentRunId: "run-unrelated-parent", timestampMs: 100 }]
+      : [
+          { runId, parentRunId: null, timestampMs: 100 },
+          { runId, parentRunId: null, timestampMs: 101 },
+        ];
+    const restored = normalizeSessionRuntimeSnapshot({
+      ...projection,
+      currentTurnId: entry.receipt.turnId,
+      harnessRunMarker: {
+        schemaVersion: 1,
+        instanceId: `instance-${variant}`,
+        sessionKey,
+        turnId: entry.receipt.turnId,
+        runId,
+        activeRunId: runId,
+        parentRunId: null,
+        activeParentRunId: null,
+        status: "paused",
+        workflowMode: "edit",
+        runtimeIntent: "execute",
+        planStage: "idle",
+        isPlanApproved: false,
+        startedAt: 100,
+        updatedAt: 200,
+        closedAt: 200,
+        closeReason: "restored_paused_checkpoint",
+      },
+      runtimeEvents: starts.map((start) => turnEvents.withEventSchema({
+        type: "run.started",
+        threadId: sessionKey,
+        turnId: entry.receipt.turnId,
+        runId: start.runId,
+        parentRunId: start.parentRunId,
+        timestampMs: start.timestampMs,
+      })),
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+    }, {
+      workspacePath: workspace,
+      expectedSessionKey: sessionKey,
+      expectedSessionEpoch: sessionEpoch,
+    });
+    return { entry, restored, runId };
+  };
+
+  const adopted = restoreVariant("missing");
+  const adoptedEvents = adopted.restored.runtimeEvents.filter((event) =>
+    "turnId" in event &&
+    event.turnId === adopted.entry.receipt.turnId &&
+    "runId" in event &&
+    event.runId === adopted.runId
+  );
+  assert.equal(adopted.restored.workspaceTurnQueue.entries.length, 0);
+  assert.equal(adopted.restored.harnessRunMarker?.status, "paused");
+  assert.deepEqual(adoptedEvents.map((event) => event.type), ["run.started", "run.paused"]);
+  assert.equal(adoptedEvents[0].parentRunId, null);
+  assert.equal(adoptedEvents[1].parentRunId, null);
+  assert.equal(adoptedEvents[0].timestampMs <= adoptedEvents[1].timestampMs, true);
+  assert.equal(
+    adopted.restored.runtimeEvents.some((event) =>
+      event.type === "turn.completed" && event.turnId === adopted.entry.receipt.turnId
+    ),
+    false,
+    "a synthesized exact start is adopted as a resumable pause, not terminalized",
+  );
+  assert.equal(
+    adopted.restored.conversationTurns.find(
+      (turn) => turn.id === adopted.entry.receipt.turnId,
+    )?.runtimeOutcome,
+    undefined,
+  );
+
+  for (const variant of ["wrong_parent", "duplicate"]) {
+    const rejected = restoreVariant(variant);
+    const sourceTurn = rejected.restored.conversationTurns.find(
+      (turn) => turn.id === rejected.entry.receipt.turnId,
+    );
+    const sourceFinals = rejected.restored.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === rejected.entry.receipt.turnId &&
+      block.visibility === "assistant_final"
+    );
+    assert.equal(rejected.restored.workspaceTurnQueue.entries.length, 0, variant);
+    assert.equal(
+      rejected.restored.harnessRunMarker,
+      null,
+      `${variant}: a corrupt paused marker must not remain resumable`,
+    );
+    assert.equal(sourceTurn.runtimeOutcome?.status, "completed", variant);
+    assert.equal(sourceTurn.runtimeOutcome?.resultKind, "error", variant);
+    assert.equal(sourceFinals.length, 1, variant);
+    assert.equal(sourceFinals[0].streaming, false, variant);
+    assert.equal(sourceFinals[0].content, sourceTurn.summary, variant);
+    assert.equal(
+      rejected.restored.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" && event.turnId === rejected.entry.receipt.turnId
+      ).length,
+      1,
+      `${variant}: fail-close must create exactly one source Turn conclusion`,
+    );
+  }
 });
 
 test("a loaded durable Goal deletion fence prevents an old session snapshot from resurrecting", () => {
@@ -1692,6 +3654,1315 @@ test("dispatcher rebuilds a paged-out FIFO head and adopts its exact durable ide
   }
 });
 
+test("workspace-adopted async local-fast completion retains its FIFO claim until the terminal conclusion is durable", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-fifo";
+  const sessionId = 556;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-fifo";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "local-fast-fifo",
+    55_601,
+    { text: "/agent writer" },
+  );
+  const receipt = queue.entries[0].receipt;
+  const persistenceCheckpoints = [];
+  let claimedQueueSnapshot = null;
+  let agentSwitchStarted = 0;
+  let resolveAgentSwitch;
+  const pendingAgentSwitch = new Promise((resolve) => {
+    resolveAgentSwitch = resolve;
+  });
+
+  const captureStoreProjection = (source) => {
+    const current = useAppStore.getState();
+    persistenceCheckpoints.push({
+      source,
+      queueEntries: current.workspaceTurnQueue?.entries.map((entry) => ({
+        turnId: entry.receipt.turnId,
+        status: entry.status,
+      })) || [],
+      currentTurnId: current.currentTurnId,
+      hasTurnConclusion: current.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ),
+      runtimeOutcome: current.conversationTurns.find(
+        (turn) => turn.id === receipt.turnId,
+      )?.runtimeOutcome || null,
+    });
+  };
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, sessionRecordingEnabled: false },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Local-fast FIFO",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchStarted += 1;
+        return pendingAgentSwitch;
+      },
+      sendMessage: realSendMessage,
+      updateSession: (_scopeKey, _sessionId, patch) => {
+        const snapshot = patch.runtimeSnapshot?.snapshot || patch.runtimeSnapshot || null;
+        persistenceCheckpoints.push({
+          source: "local-fast-terminal",
+          queueEntries: snapshot?.workspaceTurnQueue?.entries?.map((entry) => ({
+            turnId: entry.receipt.turnId,
+            status: entry.status,
+          })) || [],
+          currentTurnId: snapshot?.currentTurnId || null,
+          hasTurnConclusion: snapshot?.runtimeEvents?.some((event) =>
+            event.type === "turn.completed" &&
+            event.threadId === sessionKey &&
+            event.turnId === receipt.turnId
+          ) === true,
+          runtimeOutcome: snapshot?.conversationTurns?.find(
+            (turn) => turn.id === receipt.turnId,
+          )?.runtimeOutcome || null,
+        });
+      },
+      saveCurrentRuntimeToSession: () => captureStoreProjection("fifo-dispatcher"),
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    for (let attempt = 0; attempt < 10 && agentSwitchStarted === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    let current = useAppStore.getState();
+    assert.equal(agentSwitchStarted, 1, "the real local-fast handler must own the pending work");
+    assert.equal(current.currentTurnId, receipt.turnId);
+    assert.equal(current.workspaceTurnQueue.entries.length, 1);
+    assert.equal(current.workspaceTurnQueue.entries[0].status, "dispatching");
+    claimedQueueSnapshot = current.workspaceTurnQueue;
+    assert.equal(
+      current.runtimeEvents.some((event) =>
+        event.type === "turn.completed" && event.turnId === receipt.turnId
+      ),
+      false,
+    );
+    assert.equal(
+      current.conversationTurns.find((turn) => turn.id === receipt.turnId)?.runtimeOutcome,
+      undefined,
+    );
+
+    // Merely observing the adopted Turn as current must not acknowledge the
+    // durable head while its asynchronous local-fast side effect is pending.
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), false);
+    current = useAppStore.getState();
+    assert.equal(current.currentTurnId, receipt.turnId);
+    assert.equal(current.workspaceTurnQueue.entries.length, 1);
+    assert.equal(current.workspaceTurnQueue.entries[0].status, "dispatching");
+    assert.equal(
+      persistenceCheckpoints.some((checkpoint) =>
+        checkpoint.source === "fifo-dispatcher" && checkpoint.queueEntries.length === 0
+      ),
+      false,
+      "currentTurnId alone must never persist a FIFO acknowledgement",
+    );
+
+    resolveAgentSwitch();
+    await pendingAgentSwitch;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (useAppStore.getState().workspaceTurnQueue?.entries.length === 0) break;
+    }
+
+    current = useAppStore.getState();
+    const ownedTurn = current.conversationTurns.find((turn) => turn.id === receipt.turnId);
+    const terminalEvents = current.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.threadId === sessionKey &&
+      event.turnId === receipt.turnId
+    );
+    const durableSession = current.sessionsByWorkspace[workspace].find(
+      (session) => session.id === sessionId,
+    );
+    const durableSnapshot = durableSession?.runtimeSnapshot?.snapshot ||
+      durableSession?.runtimeSnapshot ||
+      null;
+    const durableHead = durableSnapshot?.workspaceTurnQueue?.entries?.[0] || null;
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(terminalEvents.length, 1);
+    assert.equal(ownedTurn.runtimeOutcome?.status, "completed");
+    assert.equal(ownedTurn.runtimeOutcome?.resultKind, "success");
+    assert.equal(
+      current.taskFlow.filter((block) =>
+        block.turnId === receipt.turnId &&
+        block.type === "agent" &&
+        block.visibility === "assistant_final"
+      ).length,
+      1,
+    );
+    assert.ok(
+      durableHead &&
+        durableHead.receipt.receiptId === receipt.receiptId &&
+        durableHead.status === "dispatching",
+      "the durability barrier must persist terminal evidence with its exact dispatching head",
+    );
+    assert.equal(
+      durableSnapshot.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ),
+      true,
+    );
+    const durableTurn = durableSnapshot.conversationTurns.find(
+      (turn) => turn.id === receipt.turnId,
+    );
+    assert.equal(durableTurn.runtimeOutcome?.status, "completed");
+    assert.equal(durableTurn.runtimeOutcome?.resultKind, "success");
+    assert.equal(
+      persistenceCheckpoints.some((checkpoint) =>
+        checkpoint.source === "fifo-dispatcher" && checkpoint.queueEntries.length === 0
+      ),
+      false,
+      "in-memory FIFO retirement must not be persisted through the active-global save helper",
+    );
+
+    // Re-introduce the exact stale dispatching checkpoint to make transient
+    // map cleanup observable through public Store behavior. Before completion
+    // the duplicate dispatcher call above retained this head; after canonical
+    // verification and retirement, the lease must be gone/settled so restore
+    // reconciliation can discard the already-terminal checkpoint.
+    assert.ok(claimedQueueSnapshot);
+    useAppStore.setState({ workspaceTurnQueue: claimedQueueSnapshot });
+    assert.equal(
+      useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey),
+      false,
+    );
+    assert.equal(
+      useAppStore.getState().workspaceTurnQueue.entries.length,
+      0,
+      "the execution lease map must be cleaned only after the verifier retires the real head",
+    );
+  } finally {
+    resolveAgentSwitch?.();
+    await pendingAgentSwitch.catch(() => {});
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("permanent local-fast storage failure memory-closes the Turn and advances the next FIFO head exactly once", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-memory-fallback-fifo";
+  const sessionId = 564;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-memory-fallback-fifo";
+  let queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "memory-fallback-first",
+    56_401,
+    { text: "/agent writer" },
+  );
+  queue = appendQueuedWorkspaceTurn(
+    queue,
+    "memory-fallback-second",
+    56_501,
+    { text: "Follow-up after local-fast" },
+  );
+  const receipts = queue.entries.map((entry) => entry.receipt);
+  const handlerAgents = [];
+  let nextHeadDispatchCalls = 0;
+  let saveCalls = 0;
+  let metadataRefreshCalls = 0;
+  const defaultTauriInvoke = tauriInvoke;
+
+  try {
+    tauriInvoke = async (command) => {
+      if (command === "save_project_session") {
+        saveCalls += 1;
+        const error = new Error("permanent Project Session storage failure");
+        error.code = "database";
+        throw error;
+      }
+      if (command === "load_project_session_meta") {
+        metadataRefreshCalls += 1;
+        throw new Error("metadata unavailable with storage");
+      }
+      return "";
+    };
+    useAppStore.setState({
+      ...originalState,
+      config: {
+        ...originalState.config,
+        language: "en",
+        sessionRecordingEnabled: true,
+      },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Memory fallback FIFO",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          storageStatus: "temporary",
+          recordingDisabled: false,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 2,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async (agent) => {
+        handlerAgents.push(agent);
+        useAppStore.setState({ activeStudioAgentKey: agent });
+      },
+      sendMessage: (text, images, options) => {
+        if (options?.turnIdOverride === receipts[0].turnId) {
+          return realSendMessage(text, images, options);
+        }
+        if (options?.turnIdOverride === receipts[1].turnId) {
+          nextHeadDispatchCalls += 1;
+          // Make the next head fail synchronously after proving it reached the
+          // dispatcher. Its standard fail-closed path supplies the conclusion.
+          return false;
+        }
+        throw new Error(`unexpected FIFO Turn ${options?.turnIdOverride || "missing"}`);
+      },
+      // Keep this test focused on the terminal persistence boundary. The real
+      // durable adapter is still exercised by persistSubmitRuntimeProjection.
+      updateSession: () => {},
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const current = useAppStore.getState();
+      if (
+        current.workspaceTurnQueue?.entries.length === 0 &&
+        nextHeadDispatchCalls === 1 &&
+        metadataRefreshCalls >= 3
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const current = useAppStore.getState();
+    const session = current.sessionsByWorkspace[workspace].find(
+      (candidate) => candidate.id === sessionId,
+    );
+    assert.equal(saveCalls >= 1, true, "the real Project Session adapter is exercised");
+    assert.equal(
+      metadataRefreshCalls >= 3,
+      true,
+      "the permanent failure reaches the bounded retry/fallback path",
+    );
+    assert.deepEqual(handlerAgents, ["writer"], "the local side effect runs exactly once");
+    assert.equal(nextHeadDispatchCalls, 1, "the next FIFO head advances exactly once");
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(session.storageStatus, "temporary");
+    assert.equal(
+      session.recordingDisabled,
+      false,
+      "temporary fallback must leave durable recording eligible for a later save",
+    );
+    for (const [index, receipt] of receipts.entries()) {
+      const turn = current.conversationTurns.find((candidate) => candidate.id === receipt.turnId);
+      assert.equal(turn.runtimeOutcome?.status, "completed");
+      assert.equal(turn.runtimeOutcome?.resultKind, index === 0 ? "success" : "error");
+      assert.equal(
+        current.taskFlow.filter((block) =>
+          block.turnId === receipt.turnId &&
+          block.type === "agent" &&
+          block.visibility === "assistant_final"
+        ).length,
+        1,
+      );
+      assert.equal(
+        current.runtimeEvents.filter((event) =>
+          event.type === "turn.completed" &&
+          event.threadId === sessionKey &&
+          event.turnId === receipt.turnId
+        ).length,
+        1,
+      );
+    }
+  } finally {
+    tauriInvoke = defaultTauriInvoke;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("recording-disabled local-fast durable publication survives a real no-op updateSession", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const realUpdateSession = originalState.updateSession;
+  const workspace = "/tmp/session-local-fast-real-update-session";
+  const sessionId = 565;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-real-update-session";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "real-update-session",
+    56_501,
+    { text: "/agent writer" },
+  );
+  const receipt = queue.entries[0].receipt;
+  let resolveAgentSwitch;
+  let agentSwitchStarted = 0;
+  const pendingAgentSwitch = new Promise((resolve) => {
+    resolveAgentSwitch = resolve;
+  });
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, sessionRecordingEnabled: false },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Real updateSession local-fast",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          // rememberDurableState writes these exact values. The production
+          // updateSession call must therefore be a semantic no-op without
+          // replacing the opaque runtime revision token.
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchStarted += 1;
+        return pendingAgentSwitch;
+      },
+      sendMessage: realSendMessage,
+      updateSession: realUpdateSession,
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    await waitForStoreState(() => agentSwitchStarted === 1);
+    assert.equal(agentSwitchStarted, 1);
+    assert.equal(useAppStore.getState().workspaceTurnQueue.entries[0].status, "dispatching");
+    const ownerRevisionBeforeNoop = useAppStore.getState().runtimeBySessionKey[sessionKey];
+    useAppStore.getState().updateSession(workspace, sessionId, {
+      storageStatus: "temporary",
+      recordingDisabled: true,
+    });
+    assert.equal(
+      useAppStore.getState().runtimeBySessionKey[sessionKey],
+      ownerRevisionBeforeNoop,
+      "a no-op Session metadata write must preserve the opaque runtime revision token",
+    );
+
+    resolveAgentSwitch();
+    await pendingAgentSwitch;
+    const settled = await waitForStoreState((current) =>
+      current.workspaceTurnQueue?.entries.length === 0 &&
+      current.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ),
+      80,
+    );
+    const durableSession = settled.sessionsByWorkspace[workspace].find(
+      (session) => session.id === sessionId,
+    );
+    const durableSnapshot = durableSession?.runtimeSnapshot?.snapshot ||
+      durableSession?.runtimeSnapshot ||
+      null;
+
+    assert.equal(settled.workspaceTurnQueue.entries.length, 0);
+    assert.equal(
+      settled.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ).length,
+      1,
+    );
+    assert.equal(
+      settled.conversationTurns.find((turn) => turn.id === receipt.turnId)
+        ?.runtimeOutcome?.resultKind,
+      "success",
+    );
+    assert.equal(
+      durableSnapshot.workspaceTurnQueue.entries[0].receipt.receiptId,
+      receipt.receiptId,
+      "the memory durability barrier retains the dispatching receipt on its terminal snapshot",
+    );
+    assert.equal(
+      durableSnapshot.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ),
+      true,
+    );
+  } finally {
+    resolveAgentSwitch?.();
+    await pendingAgentSwitch.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("session sync treats return-current-state updaters as no-ops while preserving explicit replace restores", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-sync-noop";
+  const sessionId = 568;
+  const sessionKey = `${workspace}:${sessionId}`;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Session sync no-op",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: "epoch-session-sync-noop",
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+    }, true);
+    // Seed the active Session's opaque runtime object through the middleware.
+    useAppStore.setState({ isGenerating: false });
+    const runtimeBeforeNoop = useAppStore.getState().runtimeBySessionKey[sessionKey];
+    assert.ok(runtimeBeforeNoop);
+
+    useAppStore.getState().removeSession("/missing-workspace", 999_999);
+    assert.equal(
+      useAppStore.getState().runtimeBySessionKey[sessionKey],
+      runtimeBeforeNoop,
+      "an updater returning the current Store must not mint a new runtime revision token",
+    );
+
+    const replacement = {
+      ...useAppStore.getState(),
+      currentWorkspace: null,
+      currentSessionId: null,
+      input: "replace=true restore survived",
+    };
+    useAppStore.setState(replacement, true);
+    assert.equal(useAppStore.getState().input, "replace=true restore survived");
+    assert.equal(useAppStore.getState().currentWorkspace, null);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("workspace local-fast completion settles captured Session A after the UI switches to B", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-owner-switch";
+  const sessionAId = 566;
+  const sessionBId = 567;
+  const sessionAKey = `${workspace}:${sessionAId}`;
+  const sessionBKey = `${workspace}:${sessionBId}`;
+  const sessionEpoch = "epoch-local-fast-owner-switch";
+  const firstQueue = buildQueuedWorkspaceTurn(
+    sessionAKey,
+    sessionEpoch,
+    "owner-switch-a",
+    56_601,
+    { text: "/agent writer" },
+  );
+  const queue = appendQueuedWorkspaceTurn(
+    firstQueue,
+    "owner-switch-a-next",
+    56_602,
+    { text: "/auto" },
+  );
+  const receipt = queue.entries[0].receipt;
+  let agentSwitchStarted = 0;
+  let resolveAgentSwitch;
+  const pendingAgentSwitch = new Promise((resolve) => {
+    resolveAgentSwitch = resolve;
+  });
+
+  const bTaskFlow = [{
+    id: 56_700,
+    turnId: "turn-b-visible",
+    type: "user",
+    content: "B remains visible",
+  }];
+  const bConversationTurns = [{
+    id: "turn-b-visible",
+    userPrompt: "B remains visible",
+    title: "Session B",
+    mode: "chat",
+    intent: "respond",
+    displayIntent: "respond",
+    status: "done",
+    summary: "B unchanged",
+    blockIds: [56_700],
+    collapsed: false,
+    createdAt: 100,
+  }];
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, sessionRecordingEnabled: false },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionAId,
+      activeSessionByWorkspace: { [workspace]: sessionAId },
+      sessionsByWorkspace: {
+        [workspace]: [
+          {
+            id: sessionAId,
+            title: "Local-fast owner A",
+            date: "Today",
+            active: true,
+            planLifecycleEpoch: sessionEpoch,
+            recordingDisabled: true,
+            messages: [],
+          },
+          {
+            id: sessionBId,
+            title: "Visible B",
+            date: "Today",
+            active: false,
+            planLifecycleEpoch: "epoch-owner-switch-b",
+            recordingDisabled: true,
+            messages: bTaskFlow,
+          },
+        ],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 2,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchStarted += 1;
+        return pendingAgentSwitch;
+      },
+      sendMessage: realSendMessage,
+      updateSession: () => {},
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionAKey), true);
+    await waitForStoreState(() => agentSwitchStarted === 1);
+    const runningA = useAppStore.getState();
+    assert.equal(agentSwitchStarted, 1);
+    assert.ok(runningA.runtimeBySessionKey[sessionAKey]);
+    const bRuntime = {
+      ...runningA.runtimeBySessionKey[sessionAKey],
+      taskFlow: bTaskFlow,
+      conversationTurns: bConversationTurns,
+      runtimeEvents: [],
+      currentTurnId: "turn-b-visible",
+      workspaceTurnQueue: null,
+      workspaceInstructionLedger: [],
+      isGenerating: false,
+      agentStatus: "idle",
+      abortController: null,
+    };
+    useAppStore.setState((current) => ({
+      currentSessionId: sessionBId,
+      activeSessionByWorkspace: { [workspace]: sessionBId },
+      runtimeBySessionKey: {
+        ...current.runtimeBySessionKey,
+        [sessionBKey]: bRuntime,
+      },
+      taskFlow: bTaskFlow,
+      conversationTurns: bConversationTurns,
+      runtimeEvents: [],
+      currentTurnId: "turn-b-visible",
+      workspaceTurnQueue: null,
+      workspaceInstructionLedger: [],
+      isGenerating: false,
+      agentStatus: "idle",
+      abortController: null,
+    }));
+
+    resolveAgentSwitch();
+    await pendingAgentSwitch;
+    const settled = await waitForStoreState((current) => {
+      const owner = current.runtimeBySessionKey[sessionAKey];
+      return !!owner &&
+        owner.workspaceTurnQueue?.entries.length === 1 &&
+        owner.workspaceTurnQueue.entries[0].receipt.receiptId ===
+          "receipt-owner-switch-a-next" &&
+        owner.abortController === null;
+    });
+    const ownerA = settled.runtimeBySessionKey[sessionAKey];
+
+    assert.equal(settled.currentSessionId, sessionBId);
+    assert.equal(settled.currentTurnId, "turn-b-visible");
+    assert.deepEqual(settled.taskFlow, bTaskFlow);
+    assert.deepEqual(settled.conversationTurns, bConversationTurns);
+    assert.deepEqual(settled.runtimeEvents, []);
+    assert.equal(settled.workspaceTurnQueue, null);
+    assert.equal(settled.agentStatus, "idle");
+    assert.equal(settled.isGenerating, false);
+    assert.equal(agentSwitchStarted, 1, "background A must not dispatch its next FIFO item");
+    assert.equal(ownerA.workspaceTurnQueue.entries.length, 1);
+    assert.equal(
+      ownerA.workspaceTurnQueue.entries[0].receipt.receiptId,
+      "receipt-owner-switch-a-next",
+    );
+    assert.equal(
+      ownerA.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionAKey &&
+        event.turnId === receipt.turnId
+      ).length,
+      1,
+    );
+    assert.equal(
+      ownerA.conversationTurns.find((turn) => turn.id === receipt.turnId)
+        ?.runtimeOutcome?.resultKind,
+      "success",
+    );
+    assert.equal(ownerA.abortController, null);
+    assert.equal(ownerA.isGenerating, false);
+    assert.equal(ownerA.agentStatus, "idle");
+  } finally {
+    resolveAgentSwitch?.();
+    await pendingAgentSwitch.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("workspace local-fast cleanup does not reset a same-turn-id replacement owner", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-same-id-replacement";
+  const sessionId = 568;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-same-id-replacement";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "same-id-replacement",
+    56_801,
+    { text: "/agent writer" },
+  );
+  const receipt = queue.entries[0].receipt;
+  let resolveAgentSwitch;
+  let agentSwitchStarted = 0;
+  const pendingAgentSwitch = new Promise((resolve) => {
+    resolveAgentSwitch = resolve;
+  });
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, sessionRecordingEnabled: false },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Same-ID replacement",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchStarted += 1;
+        return pendingAgentSwitch;
+      },
+      sendMessage: realSendMessage,
+      updateSession: () => {},
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    await waitForStoreState(() => agentSwitchStarted === 1);
+    const running = useAppStore.getState();
+    const originalController = running.abortController;
+    const admittedTurn = running.conversationTurns.find(
+      (turn) => turn.id === receipt.turnId,
+    );
+    assert.ok(originalController);
+    assert.equal(admittedTurn.clientSubmissionId, receipt.clientSubmissionId);
+    assert.equal(admittedTurn.workspaceInstructionReceiptId, receipt.receiptId);
+
+    useAppStore.setState((current) => ({
+      taskFlow: current.taskFlow.map((block) =>
+        block.id === receipt.userBlockId
+          ? { ...block, content: "replacement owner" }
+          : block
+      ),
+      conversationTurns: current.conversationTurns.map((turn) =>
+        turn.id === receipt.turnId
+          ? {
+              ...turn,
+              clientSubmissionId: "submission-replacement-owner",
+              workspaceInstructionReceiptId: "receipt-replacement-owner",
+              userPrompt: "replacement owner",
+              status: "executing",
+              summary: "",
+              runtimeOutcome: undefined,
+            }
+          : turn
+      ),
+      currentTurnId: receipt.turnId,
+      isGenerating: true,
+      agentStatus: "running",
+      // Deliberately retain the same controller: immutable admission identity,
+      // not controller equality, must fence the old completion's UI cleanup.
+      abortController: originalController,
+    }));
+
+    resolveAgentSwitch();
+    await pendingAgentSwitch;
+    const settled = await waitForStoreState((current) =>
+      current.workspaceTurnQueue?.entries.length === 0 &&
+      current.conversationTurns.some((turn) =>
+        turn.id.startsWith("local-slash-recovery-") &&
+        turn.runtimeOutcome?.status === "completed"
+      )
+    );
+    const replacement = settled.conversationTurns.find(
+      (turn) => turn.id === receipt.turnId,
+    );
+    const recoveryTurns = settled.conversationTurns.filter((turn) =>
+      turn.id.startsWith("local-slash-recovery-") &&
+      turn.runtimeOutcome?.status === "completed"
+    );
+
+    assert.equal(settled.workspaceTurnQueue.entries.length, 0);
+    assert.equal(replacement.clientSubmissionId, "submission-replacement-owner");
+    assert.equal(replacement.workspaceInstructionReceiptId, "receipt-replacement-owner");
+    assert.equal(replacement.runtimeOutcome, undefined);
+    assert.equal(recoveryTurns.length, 1);
+    assert.equal(recoveryTurns[0].runtimeOutcome.resultKind, "error");
+    assert.equal(settled.currentTurnId, receipt.turnId);
+    assert.equal(settled.abortController, originalController);
+    assert.equal(settled.isGenerating, true);
+    assert.equal(settled.agentStatus, "running");
+    assert.equal(
+      settled.runtimeEvents.filter((event) =>
+        event.type === "run.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ).length,
+      1,
+      "the original Run is closed without assigning the replacement a Turn terminal",
+    );
+    assert.equal(
+      settled.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId
+      ),
+      false,
+    );
+  } finally {
+    resolveAgentSwitch?.();
+    await pendingAgentSwitch.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("workspace local-fast owner loss releases transient maps after completion rejection", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-owner-loss";
+  const sessionId = 569;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-owner-loss";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "owner-loss",
+    56_901,
+    { text: "/agent writer" },
+  );
+  let resolveAgentSwitch;
+  let agentSwitchStarted = 0;
+  const pendingAgentSwitch = new Promise((resolve) => {
+    resolveAgentSwitch = resolve;
+  });
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, sessionRecordingEnabled: false },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Local-fast owner loss",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchStarted += 1;
+        return pendingAgentSwitch;
+      },
+      sendMessage: realSendMessage,
+      updateSession: () => {},
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    await waitForStoreState(() => agentSwitchStarted === 1);
+    useAppStore.setState((current) => {
+      const runtimeBySessionKey = { ...current.runtimeBySessionKey };
+      delete runtimeBySessionKey[sessionKey];
+      return {
+        runtimeBySessionKey,
+        sessionsByWorkspace: { ...current.sessionsByWorkspace, [workspace]: [] },
+      };
+    });
+
+    resolveAgentSwitch();
+    await pendingAgentSwitch;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(getPendingSessionCancellation(sessionKey), null);
+
+    // Once the durable helper rejects with owner loss, the dispatcher must
+    // release only its transient lease maps. A subsequent Stop therefore takes
+    // the generic replacement/deletion path and creates a cancellation fence;
+    // a leaked local-fast map would intercept this call and return early.
+    useAppStore.getState().stopGeneration();
+    const cancellation = getPendingSessionCancellation(sessionKey);
+    assert.ok(cancellation, "owner-loss rejection must not leave a stale local-fast lease map");
+    await cancellation.promise;
+  } finally {
+    resolveAgentSwitch?.();
+    await pendingAgentSwitch.catch(() => {});
+    const cancellation = getPendingSessionCancellation(sessionKey);
+    await cancellation?.promise.catch(() => {});
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("stopGeneration cancels a workspace local-fast Turn before its deferred side-effect commit", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-local-fast-cancel";
+  const sessionId = 557;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-cancel";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "local-fast-cancel",
+    55_701,
+    { text: "/agent writer" },
+  );
+  const receipt = queue.entries[0].receipt;
+  let agentSwitchCommits = 0;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: {
+        ...originalState.config,
+        language: "en",
+        sessionRecordingEnabled: false,
+      },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Local-fast cancellation",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      imageStudio: {
+        ...originalState.imageStudio,
+        activeJobId: null,
+        activeStreamId: null,
+      },
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      setActiveStudioAgentKey: async () => {
+        agentSwitchCommits += 1;
+      },
+      sendMessage: realSendMessage,
+      updateSession: () => {},
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    const admitted = useAppStore.getState();
+    assert.equal(admitted.currentTurnId, receipt.turnId);
+    assert.equal(admitted.workspaceTurnQueue.entries.length, 1);
+    assert.equal(admitted.workspaceTurnQueue.entries[0].status, "dispatching");
+    assert.equal(admitted.isGenerating, true);
+
+    // startGameStudioLocalSlashSubmission deliberately defers the side-effect
+    // commit by one microtask so the production lease and AbortController are
+    // installed first. Cancel in this same call stack, before yielding.
+    useAppStore.getState().stopGeneration();
+    assert.equal(agentSwitchCommits, 0);
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const current = useAppStore.getState();
+      if (
+        current.workspaceTurnQueue?.entries.length === 0 &&
+        current.runtimeEvents.some((event) =>
+          event.type === "turn.completed" &&
+          event.threadId === sessionKey &&
+          event.turnId === receipt.turnId
+        )
+      ) break;
+    }
+
+    const current = useAppStore.getState();
+    const originalTurns = current.conversationTurns.filter(
+      (turn) => turn.id === receipt.turnId,
+    );
+    const assistantFinals = current.taskFlow.filter((block) =>
+      block.turnId === receipt.turnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    );
+    const cancellationLifecycle = current.runtimeEvents.filter((event) =>
+      event.threadId === sessionKey &&
+      event.turnId === receipt.turnId &&
+      (
+        event.type === "run.aborted" ||
+        event.type === "run.completed" ||
+        event.type === "turn.completed"
+      )
+    );
+
+    assert.equal(agentSwitchCommits, 0, "cancellation must win before the local side effect");
+    assert.equal(current.activeStudioAgentKey, "studio_auto");
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(originalTurns.length, 1);
+    assert.equal(originalTurns[0].runtimeOutcome?.status, "completed");
+    assert.equal(originalTurns[0].runtimeOutcome?.resultKind, "canceled");
+    assert.equal(assistantFinals.length, 1);
+    assert.match(assistantFinals[0].content, /canceled/i);
+    assert.deepEqual(
+      cancellationLifecycle.map((event) => event.type),
+      ["run.aborted", "run.completed", "turn.completed"],
+    );
+    assert.equal(cancellationLifecycle[1]?.resultKind, "canceled");
+    assert.equal(cancellationLifecycle[2]?.resultKind, "canceled");
+    assert.deepEqual(
+      current.conversationTurns.map((turn) => turn.id),
+      [receipt.turnId],
+      "cancellation must not fabricate a recovery error Turn",
+    );
+    assert.equal(
+      current.conversationTurns.some((turn) =>
+        turn.runtimeOutcome?.resultKind === "error" ||
+        turn.id.startsWith("local-slash-recovery-")
+      ),
+      false,
+    );
+  } finally {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher quarantines a live lost-lease local-fast head without rerunning its handler", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-local-fast-live-lost-lease";
+  const sessionId = 558;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-local-fast-live-lost-lease";
+  const queue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "local-fast-live-lost-lease",
+    55_801,
+    { text: "/agent writer" },
+  );
+  const receipt = queue.entries[0].receipt;
+  const runId = "run-local-fast-live-lost-lease";
+  let handlerCalls = 0;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, language: "en" },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Lost local-fast lease",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          recordingDisabled: true,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [{
+        id: receipt.userBlockId,
+        turnId: receipt.turnId,
+        type: "user",
+        content: "/agent writer",
+      }],
+      conversationTurns: [{
+        id: receipt.turnId,
+        clientSubmissionId: receipt.clientSubmissionId,
+        workspaceInstructionReceiptId: receipt.receiptId,
+        workspaceInstructionSource: queue.entries[0].instruction.source,
+        userPrompt: "/agent writer",
+        title: "Switch specialist",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "executing",
+        summary: "",
+        blockIds: [receipt.userBlockId],
+        collapsed: false,
+        createdAt: receipt.acceptedAt,
+      }],
+      runtimeEvents: [{
+        schemaVersion: 2,
+        type: "run.started",
+        threadId: sessionKey,
+        turnId: receipt.turnId,
+        timestampMs: 12,
+        runId,
+        parentRunId: null,
+      }],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      abortController: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        handlerCalls += 1;
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(
+      useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey),
+      false,
+    );
+    const current = useAppStore.getState();
+    const turn = current.conversationTurns.find((candidate) => candidate.id === receipt.turnId);
+    const finals = current.taskFlow.filter((block) =>
+      block.turnId === receipt.turnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    );
+
+    assert.equal(handlerCalls, 0, "a lost local-fast lease must never replay the side effect");
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(turn.runtimeOutcome?.status, "completed");
+    assert.equal(turn.runtimeOutcome?.resultKind, "error");
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].content, turn.summary);
+    assert.deepEqual(
+      current.runtimeEvents.filter((event) =>
+        event.threadId === sessionKey &&
+        event.turnId === receipt.turnId &&
+        (event.type === "run.completed" || event.type === "turn.completed")
+      ).map((event) => event.type),
+      ["run.completed", "turn.completed"],
+    );
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), false);
+    assert.equal(handlerCalls, 0);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
 test("dispatcher closes a poisoned paged head with a visible error before advancing FIFO", () => {
   const originalState = useAppStore.getState();
   const workspace = "/tmp/session-paged-conflict";
@@ -1756,8 +5027,12 @@ test("dispatcher closes a poisoned paged head with a visible error before advanc
 
     const dispatched = useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey);
     const current = useAppStore.getState();
-    const recoveryTurn = current.conversationTurns.find((turn) => turn.id === receipt.turnId);
-    const recoveryBlocks = current.taskFlow.filter((block) => block.turnId === receipt.turnId);
+    const recoveryTurn = current.conversationTurns.find((turn) =>
+      turn.id.startsWith(`workspace-recovery-${receipt.receiptId}`)
+    );
+    const recoveryBlocks = current.taskFlow.filter(
+      (block) => block.turnId === recoveryTurn?.id,
+    );
 
     assert.equal(dispatched, true);
     assert.equal(sendCalled, false, "conflicting history must never be adopted");
@@ -1775,11 +5050,1052 @@ test("dispatcher closes a poisoned paged head with a visible error before advanc
     assert.equal(
       current.runtimeEvents.some((event) =>
         event.type === "turn.completed" &&
-        event.turnId === receipt.turnId &&
+        event.turnId === recoveryTurn.id &&
         event.resultKind === "error"
       ),
       true,
     );
+    const recoveryRunEvents = current.runtimeEvents.filter((event) =>
+      "turnId" in event &&
+      event.turnId === recoveryTurn.id &&
+      (event.type === "run.started" || event.type === "run.completed")
+    );
+    assert.deepEqual(
+      recoveryRunEvents.map((event) => event.type),
+      ["run.started", "run.completed"],
+    );
+    assert.equal(recoveryRunEvents[0].runId, recoveryTurn.runtimeOutcome.runId);
+    assert.equal(recoveryRunEvents[1].runId, recoveryTurn.runtimeOutcome.runId);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher retires an exact terminal race and advances FIFO without duplicating its conclusion", async () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-terminal-race";
+  const sessionId = 607;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-terminal-race";
+  let queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "terminal-race-first",
+    61_001,
+  );
+  const firstEntry = queue.entries[0];
+  const secondReceipt = {
+    schemaVersion: 1,
+    kind: "workspace_turn_receipt",
+    receiptId: "receipt-terminal-race-second",
+    clientSubmissionId: "submission-terminal-race-second",
+    sessionKey,
+    sessionEpoch,
+    turnId: "turn-terminal-race-second",
+    userBlockId: 61_002,
+    acceptedAt: 20,
+  };
+  const secondInstruction = {
+    schemaVersion: 1,
+    kind: "workspace_instruction",
+    clientSubmissionId: secondReceipt.clientSubmissionId,
+    sessionKey,
+    sessionEpoch,
+    source: "composer",
+    submittedAt: 20,
+    payload: { text: "queued terminal-race-second" },
+  };
+  const appended = reduceWorkspaceTurnQueue(queue, {
+    type: "append",
+    expectedVersion: queue.version,
+    at: 20,
+    instruction: secondInstruction,
+    receipt: secondReceipt,
+  });
+  assert.equal(appended.disposition, "applied", appended.reason);
+  const committed = reduceWorkspaceTurnQueue(appended.state, {
+    type: "commit",
+    expectedVersion: appended.state.version,
+    at: 21,
+    clientSubmissionId: secondReceipt.clientSubmissionId,
+    receiptId: secondReceipt.receiptId,
+    sessionKey,
+    sessionEpoch,
+  });
+  assert.equal(committed.disposition, "applied", committed.reason);
+  queue = committed.state;
+
+  const firstRunId = "run-terminal-race-first";
+  const firstSummary = "The exact admitted Turn already completed.";
+  const firstFinalBlockId = 61_003;
+  const saveCheckpoints = [];
+  const sendCounts = new Map();
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Terminal race",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [{
+        id: firstEntry.receipt.userBlockId,
+        turnId: firstEntry.receipt.turnId,
+        type: "user",
+        content: firstEntry.instruction.payload.text,
+      }],
+      conversationTurns: [{
+        id: firstEntry.receipt.turnId,
+        clientSubmissionId: firstEntry.instruction.clientSubmissionId,
+        workspaceInstructionReceiptId: firstEntry.receipt.receiptId,
+        workspaceInstructionSource: firstEntry.instruction.source,
+        userPrompt: firstEntry.instruction.payload.text,
+        title: "Terminal race first",
+        mode: "chat",
+        intent: "respond",
+        displayIntent: "respond",
+        status: "executing",
+        summary: "",
+        blockIds: [firstEntry.receipt.userBlockId],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: firstEntry.receipt.acceptedAt,
+      }],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 2,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: (_text, _images, options) => {
+        const turnId = options?.turnIdOverride;
+        sendCounts.set(turnId, (sendCounts.get(turnId) || 0) + 1);
+        if (turnId === firstEntry.receipt.turnId) {
+          const timestampMs = 30;
+          let events = turnEvents.appendRuntimeEvent(
+            useAppStore.getState().runtimeEvents,
+            turnEvents.withEventSchema({
+              type: "run.started",
+              threadId: sessionKey,
+              turnId,
+              timestampMs,
+              runId: firstRunId,
+              parentRunId: null,
+            }),
+          );
+          events = turnEvents.appendRuntimeEvent(events, turnEvents.withEventSchema({
+            type: "run.completed",
+            threadId: sessionKey,
+            turnId,
+            timestampMs,
+            runId: firstRunId,
+            parentRunId: null,
+            resultKind: "success",
+            summary: firstSummary,
+          }));
+          events = turnEvents.appendRuntimeEvent(events, turnEvents.withEventSchema({
+            type: "turn.completed",
+            threadId: sessionKey,
+            turnId,
+            timestampMs,
+            resultKind: "success",
+          }));
+          useAppStore.setState((current) => ({
+            runtimeEvents: events,
+            taskFlow: [...current.taskFlow, {
+              id: firstFinalBlockId,
+              turnId,
+              type: "agent",
+              content: firstSummary,
+              streaming: false,
+              visibility: "assistant_final",
+            }],
+            conversationTurns: current.conversationTurns.map((turn) =>
+              turn.id === turnId
+                ? {
+                    ...turn,
+                    status: "done",
+                    summary: firstSummary,
+                    blockIds: [...turn.blockIds, firstFinalBlockId],
+                    runtimeOutcome: {
+                      status: "completed",
+                      reason: "terminal_race_fixture",
+                      resultKind: "success",
+                      runId: firstRunId,
+                      parentRunId: null,
+                      updatedAt: timestampMs,
+                    },
+                  }
+                : turn
+            ),
+          }));
+          return false;
+        }
+        useAppStore.setState({ currentTurnId: turnId });
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {
+        saveCheckpoints.push(
+          (useAppStore.getState().workspaceTurnQueue?.entries || []).map(
+            (entry) => entry.receipt.receiptId,
+          ),
+        );
+      },
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const current = useAppStore.getState();
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(sendCounts.get(firstEntry.receipt.turnId), 1);
+    assert.equal(sendCounts.get(secondReceipt.turnId), 1);
+    assert.deepEqual(saveCheckpoints, [[secondReceipt.receiptId], []]);
+    assert.equal(
+      current.runtimeEvents.filter((event) =>
+        event.type === "run.started" && event.turnId === firstEntry.receipt.turnId
+      ).length,
+      1,
+    );
+    assert.equal(
+      current.runtimeEvents.filter((event) =>
+        event.type === "run.completed" && event.turnId === firstEntry.receipt.turnId
+      ).length,
+      1,
+    );
+    assert.equal(
+      current.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" && event.turnId === firstEntry.receipt.turnId
+      ).length,
+      1,
+    );
+    assert.equal(
+      current.taskFlow.filter((block) =>
+        block.type === "agent" &&
+        block.turnId === firstEntry.receipt.turnId &&
+        block.visibility === "assistant_final"
+      ).length,
+      1,
+    );
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher fails closed an aged starting claim and advances the next FIFO Turn exactly once", async () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-aged-starting-claim";
+  const sessionId = 611;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-aged-starting-claim";
+  let queue = buildDispatchingWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "aged-starting-first",
+    61_401,
+  );
+  queue = appendQueuedWorkspaceTurn(
+    queue,
+    "aged-starting-second",
+    61_402,
+  );
+  const [firstEntry, secondEntry] = queue.entries;
+  const projection = buildExactWorkspaceInstructionProjection(firstEntry);
+  const sendCounts = new Map();
+  const dispatchQueueHeads = [];
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, language: "en" },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Aged starting claim",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 2,
+      isGenerating: true,
+      agentStatus: "running",
+      currentTurnId: firstEntry.receipt.turnId,
+      abortController: null,
+      harnessRunMarker: null,
+      sendMessage: (_text, _images, options) => {
+        const turnId = options?.turnIdOverride;
+        sendCounts.set(turnId, (sendCounts.get(turnId) || 0) + 1);
+        dispatchQueueHeads.push(
+          useAppStore.getState().workspaceTurnQueue?.entries.map(
+            (entry) => entry.receipt.turnId,
+          ) || [],
+        );
+        useAppStore.setState({
+          currentTurnId: turnId,
+          isGenerating: true,
+          agentStatus: "running",
+        });
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey);
+    const settled = await waitForStoreState((state) =>
+      sendCounts.get(secondEntry.receipt.turnId) === 1 &&
+      state.workspaceTurnQueue?.entries.length === 0
+    );
+    const firstTurn = settled.conversationTurns.find(
+      (turn) => turn.id === firstEntry.receipt.turnId,
+    );
+    const firstFinals = settled.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === firstEntry.receipt.turnId &&
+      block.visibility === "assistant_final"
+    );
+    const firstLifecycle = settled.runtimeEvents.filter((event) =>
+      "turnId" in event && event.turnId === firstEntry.receipt.turnId
+    );
+
+    assert.equal(sendCounts.get(firstEntry.receipt.turnId) || 0, 0);
+    assert.equal(sendCounts.get(secondEntry.receipt.turnId), 1);
+    assert.deepEqual(dispatchQueueHeads, [[secondEntry.receipt.turnId]]);
+    assert.equal(settled.workspaceTurnQueue.entries.length, 0);
+    assert.equal(firstTurn?.runtimeOutcome?.status, "completed");
+    assert.equal(firstTurn?.runtimeOutcome?.resultKind, "error");
+    assert.match(firstTurn?.summary || "", /stale dispatch claim|visible error/i);
+    assert.equal(firstFinals.length, 1);
+    assert.equal(firstFinals[0].content, firstTurn?.summary);
+    assert.deepEqual(firstLifecycle.map((event) => event.type), [
+      "run.started",
+      "run.completed",
+      "turn.completed",
+    ]);
+    assert.equal(firstLifecycle[1]?.resultKind, "error");
+    assert.equal(firstLifecycle[2]?.resultKind, "error");
+  } finally {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher gives a fresh exact starting claim one retry before failing closed", async () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-fresh-starting-claim";
+  const sessionId = 612;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-fresh-starting-claim";
+  const queued = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "fresh-starting",
+    61_501,
+  );
+  const claimed = reduceWorkspaceTurnQueue(queued, {
+    type: "claim",
+    expectedVersion: queued.version,
+    at: Date.now(),
+    claimId: "claim-fresh-starting",
+    sessionKey,
+    sessionEpoch,
+  });
+  assert.equal(claimed.disposition, "applied", claimed.reason);
+  const queue = claimed.state;
+  const entry = queue.entries[0];
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const originalDispatcher = originalState.dispatchNextWorkspaceInstruction;
+  let scheduledRetryCalls = 0;
+  let saveCalls = 0;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, language: "en" },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Fresh starting claim",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: true,
+      agentStatus: "running",
+      currentTurnId: entry.receipt.turnId,
+      abortController: null,
+      harnessRunMarker: null,
+      dispatchNextWorkspaceInstruction: (...args) => {
+        scheduledRetryCalls += 1;
+        return originalDispatcher(...args);
+      },
+      sendMessage: () => {
+        assert.fail("a claimed starting Turn must not be replayed");
+      },
+      saveCurrentRuntimeToSession: () => {
+        saveCalls += 1;
+      },
+    }, true);
+
+    assert.equal(originalDispatcher(sessionKey), false);
+    const immediate = useAppStore.getState();
+    assert.equal(scheduledRetryCalls, 0);
+    assert.equal(saveCalls, 0);
+    assert.equal(immediate.workspaceTurnQueue.entries.length, 1);
+    assert.equal(immediate.workspaceTurnQueue.entries[0].status, "dispatching");
+    assert.equal(
+      immediate.runtimeEvents.some((event) =>
+        event.type === "turn.completed" && event.turnId === entry.receipt.turnId
+      ),
+      false,
+    );
+    assert.equal(
+      immediate.taskFlow.some((block) =>
+        block.type === "agent" &&
+        block.turnId === entry.receipt.turnId &&
+        block.visibility === "assistant_final"
+      ),
+      false,
+    );
+
+    const settled = await waitForStoreState((state) =>
+      state.workspaceTurnQueue?.entries.length === 0
+    );
+    const turn = settled.conversationTurns.find(
+      (candidate) => candidate.id === entry.receipt.turnId,
+    );
+    assert.equal(scheduledRetryCalls, 1);
+    assert.equal(saveCalls, 1);
+    assert.equal(turn?.runtimeOutcome?.status, "completed");
+    assert.equal(turn?.runtimeOutcome?.resultKind, "error");
+  } finally {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("live FIFO completion cannot retire a same-ID replacement with a drifted envelope", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-live-envelope-replacement";
+  const sessionId = 608;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-live-envelope-replacement";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "live-envelope-replacement",
+    61_101,
+  );
+  const entry = queue.entries[0];
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const runId = "run-live-envelope-old-owner";
+  const summary = "The old envelope completed before replacement.";
+  const finalBlockId = 61_102;
+  let saveCalls = 0;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Live envelope replacement",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        useAppStore.setState((current) => {
+          const activeHead = current.workspaceTurnQueue.entries[0];
+          const replacementHead = {
+            ...activeHead,
+            instruction: {
+              ...activeHead.instruction,
+              source: "replay",
+              submittedAt: 9,
+              payload: { text: "replacement envelope payload" },
+            },
+            receipt: {
+              ...activeHead.receipt,
+              acceptedAt: 9,
+            },
+          };
+          return {
+            workspaceTurnQueue: {
+              ...current.workspaceTurnQueue,
+              entries: [replacementHead],
+            },
+            runtimeEvents: [
+              turnEvents.withEventSchema({
+                type: "run.started",
+                threadId: sessionKey,
+                turnId: entry.receipt.turnId,
+                runId,
+                parentRunId: null,
+                timestampMs: 30,
+              }),
+              turnEvents.withEventSchema({
+                type: "run.completed",
+                threadId: sessionKey,
+                turnId: entry.receipt.turnId,
+                runId,
+                parentRunId: null,
+                timestampMs: 31,
+                resultKind: "success",
+                summary,
+              }),
+              turnEvents.withEventSchema({
+                type: "turn.completed",
+                threadId: sessionKey,
+                turnId: entry.receipt.turnId,
+                timestampMs: 32,
+                resultKind: "success",
+              }),
+            ],
+            taskFlow: [...current.taskFlow, {
+              id: finalBlockId,
+              turnId: entry.receipt.turnId,
+              type: "agent",
+              content: summary,
+              streaming: false,
+              visibility: "assistant_final",
+            }],
+            conversationTurns: current.conversationTurns.map((turn) =>
+              turn.id === entry.receipt.turnId
+                ? {
+                    ...turn,
+                    status: "done",
+                    summary,
+                    blockIds: [...turn.blockIds, finalBlockId],
+                    runtimeOutcome: {
+                      status: "completed",
+                      reason: "old_envelope_completed",
+                      resultKind: "success",
+                      runId,
+                      parentRunId: null,
+                      updatedAt: 32,
+                    },
+                  }
+                : turn
+            ),
+          };
+        });
+        return false;
+      },
+      saveCurrentRuntimeToSession: () => {
+        saveCalls += 1;
+      },
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), false);
+    const current = useAppStore.getState();
+    const replacement = current.workspaceTurnQueue.entries[0];
+    assert.equal(current.workspaceTurnQueue.entries.length, 1);
+    assert.equal(replacement.status, "dispatching");
+    assert.equal(replacement.receipt.receiptId, entry.receipt.receiptId);
+    assert.equal(replacement.receipt.turnId, entry.receipt.turnId);
+    assert.equal(replacement.receipt.acceptedAt, 9);
+    assert.equal(replacement.instruction.clientSubmissionId, entry.instruction.clientSubmissionId);
+    assert.equal(replacement.instruction.submittedAt, 9);
+    assert.equal(replacement.instruction.source, "replay");
+    assert.equal(replacement.instruction.payload.text, "replacement envelope payload");
+    assert.equal(saveCalls, 0);
+    assert.equal(
+      current.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" && event.turnId === entry.receipt.turnId
+      ).length,
+      1,
+      "the old terminal is present but cannot authorize removal of the replacement envelope",
+    );
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher preserves an exact adapter error outcome while repairing missing terminals", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-adapter-error-outcome";
+  const sessionId = 609;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-adapter-error-outcome";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "adapter-error-outcome",
+    61_201,
+  );
+  const entry = queue.entries[0];
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const runId = "run-adapter-error-outcome";
+  const summary = "The exact adapter concluded with a durable error.";
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Adapter error outcome",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        useAppStore.setState((current) => ({
+          conversationTurns: current.conversationTurns.map((turn) =>
+            turn.id === entry.receipt.turnId
+              ? {
+                  ...turn,
+                  status: "done",
+                  summary,
+                  runtimeOutcome: {
+                    status: "completed",
+                    reason: "adapter_error",
+                    resultKind: "error",
+                    runId,
+                    parentRunId: null,
+                    updatedAt: 40,
+                  },
+                }
+              : turn
+          ),
+        }));
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    const current = useAppStore.getState();
+    const turn = current.conversationTurns.find((candidate) =>
+      candidate.id === entry.receipt.turnId
+    );
+    const ownedEvents = current.runtimeEvents.filter((event) =>
+      "turnId" in event && event.turnId === entry.receipt.turnId
+    );
+    const finals = current.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === entry.receipt.turnId &&
+      block.visibility === "assistant_final"
+    );
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(turn.runtimeOutcome?.runId, runId);
+    assert.equal(turn.runtimeOutcome?.resultKind, "error");
+    assert.equal(turn.summary, summary);
+    assert.deepEqual(ownedEvents.map((event) => event.type), [
+      "run.started",
+      "run.completed",
+      "turn.completed",
+    ]);
+    assert.equal(ownedEvents[1].runId, runId);
+    assert.equal(ownedEvents[1].resultKind, "error");
+    assert.equal(ownedEvents[1].summary, summary);
+    assert.equal(ownedEvents[2].resultKind, "error");
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].content, summary);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher canonicalizes an exact adapter aborted outcome under its original Run owner", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-adapter-aborted-outcome";
+  const sessionId = 610;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-adapter-aborted-outcome";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "adapter-aborted-outcome",
+    61_301,
+  );
+  const entry = queue.entries[0];
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const runId = "run-adapter-aborted-outcome";
+  const parentRunId = "run-adapter-aborted-parent";
+  const summary = "The exact adapter was canceled before it could finish.";
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Adapter aborted outcome",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        useAppStore.setState((current) => ({
+          conversationTurns: current.conversationTurns.map((turn) =>
+            turn.id === entry.receipt.turnId
+              ? {
+                  ...turn,
+                  status: "done",
+                  summary,
+                  runtimeOutcome: {
+                    status: "aborted",
+                    reason: "user_cancelled",
+                    runId,
+                    parentRunId,
+                    updatedAt: 40,
+                  },
+                }
+              : turn
+          ),
+        }));
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    const current = useAppStore.getState();
+    const turn = current.conversationTurns.find((candidate) =>
+      candidate.id === entry.receipt.turnId
+    );
+    const ownedEvents = current.runtimeEvents.filter((event) =>
+      "turnId" in event && event.turnId === entry.receipt.turnId
+    );
+    const finals = current.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === entry.receipt.turnId &&
+      block.visibility === "assistant_final"
+    );
+
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.deepEqual(ownedEvents.map((event) => event.type), [
+      "run.started",
+      "run.aborted",
+      "run.completed",
+      "turn.completed",
+    ]);
+    for (const event of ownedEvents.slice(0, 3)) {
+      assert.equal(event.runId, runId);
+      assert.equal(event.parentRunId, parentRunId);
+    }
+    assert.equal(ownedEvents[2]?.resultKind, "canceled");
+    assert.equal(ownedEvents[3]?.resultKind, "canceled");
+    assert.equal(turn.runtimeOutcome?.status, "completed");
+    assert.equal(turn.runtimeOutcome?.resultKind, "canceled");
+    assert.equal(turn.runtimeOutcome?.runId, runId);
+    assert.equal(turn.runtimeOutcome?.parentRunId, parentRunId);
+    assert.equal(turn.summary, summary);
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].content, summary);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher repairs a corrupt exact canceled source with one canonical abort sequence before recovery", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-corrupt-canceled-source-recovery";
+  const sessionId = 613;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-corrupt-canceled-source-recovery";
+  const queue = buildQueuedWorkspaceTurn(
+    sessionKey,
+    sessionEpoch,
+    "corrupt-canceled-source-recovery",
+    61_601,
+  );
+  const entry = queue.entries[0];
+  const projection = buildExactWorkspaceInstructionProjection(entry);
+  const sourceRunId = "run-corrupt-canceled-source";
+  const sourceParentRunId = "run-corrupt-canceled-parent";
+  const sourceSummary = "The exact source was canceled before its corrupt trace was isolated.";
+  const sourceFinalBlockId = entry.receipt.userBlockId + 1;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      config: { ...originalState.config, language: "en" },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Corrupt canceled source recovery",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      runtimeBySessionKey: {},
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      ...projection,
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        useAppStore.setState((current) => ({
+          taskFlow: [...current.taskFlow, {
+            id: sourceFinalBlockId,
+            turnId: entry.receipt.turnId,
+            type: "agent",
+            content: sourceSummary,
+            streaming: false,
+            visibility: "assistant_final",
+          }],
+          conversationTurns: current.conversationTurns.map((turn) =>
+            turn.id === entry.receipt.turnId
+              ? {
+                  ...turn,
+                  status: "done",
+                  summary: sourceSummary,
+                  blockIds: [...turn.blockIds, sourceFinalBlockId],
+                  runtimeOutcome: {
+                    status: "completed",
+                    reason: "adapter_canceled_with_corrupt_trace",
+                    resultKind: "canceled",
+                    runId: sourceRunId,
+                    parentRunId: sourceParentRunId,
+                    updatedAt: 44,
+                  },
+                }
+              : turn
+          ),
+          runtimeEvents: [
+            turnEvents.withEventSchema({
+              type: "run.started",
+              threadId: sessionKey,
+              turnId: entry.receipt.turnId,
+              runId: sourceRunId,
+              parentRunId: sourceParentRunId,
+              timestampMs: 40,
+            }),
+            turnEvents.withEventSchema({
+              type: "run.aborted",
+              threadId: sessionKey,
+              turnId: entry.receipt.turnId,
+              runId: sourceRunId,
+              parentRunId: sourceParentRunId,
+              timestampMs: 41,
+              reason: "user_cancelled",
+              message: sourceSummary,
+            }),
+            turnEvents.withEventSchema({
+              type: "run.completed",
+              threadId: sessionKey,
+              turnId: entry.receipt.turnId,
+              runId: sourceRunId,
+              parentRunId: sourceParentRunId,
+              timestampMs: 42,
+              resultKind: "canceled",
+              summary: sourceSummary,
+            }),
+            // A duplicate source conclusion makes the exact source trace
+            // corrupt while preserving its authoritative canceled Turn fact.
+            turnEvents.withEventSchema({
+              type: "run.completed",
+              threadId: sessionKey,
+              turnId: entry.receipt.turnId,
+              runId: sourceRunId,
+              parentRunId: sourceParentRunId,
+              timestampMs: 43,
+              resultKind: "canceled",
+              summary: sourceSummary,
+            }),
+            turnEvents.withEventSchema({
+              type: "turn.completed",
+              threadId: sessionKey,
+              turnId: entry.receipt.turnId,
+              timestampMs: 44,
+              resultKind: "canceled",
+            }),
+          ],
+        }));
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+    const current = useAppStore.getState();
+    const sourceTurn = current.conversationTurns.find(
+      (turn) => turn.id === entry.receipt.turnId,
+    );
+    const repairedSourceRunId = sourceTurn?.runtimeOutcome?.runId;
+    const repairedSourceEvents = current.runtimeEvents.filter((event) =>
+      event.threadId === sessionKey &&
+      "turnId" in event &&
+      event.turnId === entry.receipt.turnId &&
+      (
+        ("runId" in event && event.runId === repairedSourceRunId) ||
+        event.type === "turn.completed"
+      )
+    );
+    const recoveryTurn = current.conversationTurns.find((turn) =>
+      turn.id.startsWith(`workspace-recovery-${entry.receipt.receiptId}`)
+    );
+    const recoveryEvents = current.runtimeEvents.filter((event) =>
+      event.threadId === sessionKey &&
+      "turnId" in event &&
+      event.turnId === recoveryTurn?.id
+    );
+    const sourceFinals = current.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === entry.receipt.turnId &&
+      block.visibility === "assistant_final"
+    );
+    const recoveryFinals = current.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.turnId === recoveryTurn?.id &&
+      block.visibility === "assistant_final"
+    );
+
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.ok(repairedSourceRunId?.startsWith("run-admission-source-recovery-"));
+    assert.notEqual(repairedSourceRunId, sourceRunId);
+    assert.deepEqual(repairedSourceEvents.map((event) => event.type), [
+      "run.started",
+      "run.aborted",
+      "run.completed",
+      "turn.completed",
+    ]);
+    for (const event of repairedSourceEvents.slice(0, 3)) {
+      assert.equal(event.runId, repairedSourceRunId);
+      assert.equal(event.parentRunId, null);
+    }
+    assert.equal(repairedSourceEvents[2]?.resultKind, "canceled");
+    assert.equal(repairedSourceEvents[3]?.resultKind, "canceled");
+    assert.equal(sourceTurn?.runtimeOutcome?.status, "completed");
+    assert.equal(sourceTurn?.runtimeOutcome?.resultKind, "canceled");
+    assert.equal(sourceTurn?.runtimeOutcome?.parentRunId, null);
+    assert.equal(sourceFinals.length, 1);
+    assert.equal(sourceFinals[0].content, sourceTurn?.summary);
+
+    assert.ok(recoveryTurn, "a corrupt exact source must receive a distinct recovery child");
+    assert.deepEqual(recoveryEvents.map((event) => event.type), [
+      "run.started",
+      "run.completed",
+      "turn.completed",
+    ]);
+    assert.equal(recoveryEvents[0]?.runId, recoveryEvents[1]?.runId);
+    assert.equal(recoveryEvents[0]?.parentRunId, repairedSourceRunId);
+    assert.equal(recoveryEvents[1]?.parentRunId, repairedSourceRunId);
+    assert.equal(recoveryEvents[1]?.resultKind, "error");
+    assert.equal(recoveryEvents[2]?.resultKind, "error");
+    assert.equal(recoveryTurn?.runtimeOutcome?.status, "completed");
+    assert.equal(recoveryTurn?.runtimeOutcome?.resultKind, "error");
+    assert.equal(recoveryTurn?.runtimeOutcome?.runId, recoveryEvents[0]?.runId);
+    assert.equal(recoveryTurn?.runtimeOutcome?.parentRunId, repairedSourceRunId);
+    assert.equal(recoveryFinals.length, 1);
+    assert.equal(recoveryFinals[0].content, recoveryTurn?.summary);
   } finally {
     useAppStore.setState(originalState, true);
   }

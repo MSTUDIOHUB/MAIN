@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use regex::Regex;
-use reqwest::{Client, Response};
+use reqwest::Response;
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
@@ -77,8 +77,7 @@ pub async fn web_search(
 
     let provider = normalize_provider(provider.as_deref());
     let max_results = clamp_search_limit(max_results);
-    let client = build_client()?;
-    let mut attempt = search_provider(&client, &provider, &query).await?;
+    let mut attempt = search_provider(&provider, &query).await?;
     let mut results = parse_search_results(&attempt.provider, &attempt.html);
     let mut fallback_provider = None;
     let mut fallback_reason = None;
@@ -87,7 +86,7 @@ pub async fn web_search(
         let reason = build_search_fallback_reason(&attempt, &results);
         let mut last_reason = reason.clone();
         for fallback in fallback_providers(&provider) {
-            match search_provider(&client, fallback, &query).await {
+            match search_provider(fallback, &query).await {
                 Ok(next_attempt) => {
                     let next_results =
                         parse_search_results(&next_attempt.provider, &next_attempt.html);
@@ -145,17 +144,18 @@ pub async fn web_search(
 pub async fn web_fetch(url: String, max_chars: Option<usize>) -> Result<WebFetchResponse, String> {
     let requested_url = validate_http_url(&url)?.to_string();
     let max_chars = clamp_fetch_chars(max_chars);
-    let client = build_client()?;
-
-    if let Some(response) = fetch_github_url(&client, &requested_url, max_chars).await? {
+    if let Some(response) = fetch_github_url(&requested_url, max_chars).await? {
         return Ok(response);
     }
 
-    let (fetched, source) = match fetch_text(&client, &requested_url, MAX_RESPONSE_BYTES).await {
+    let (fetched, source) = match fetch_text(&requested_url, MAX_RESPONSE_BYTES).await {
         Ok(body) => (body, "web"),
+        Err(primary_error) if primary_error.contains("NETWORK_GUARD_DENIED") => {
+            return Err(primary_error);
+        }
         Err(primary_error) => {
             let reader_url = jina_reader_url(&requested_url);
-            match fetch_text(&client, &reader_url, MAX_RESPONSE_BYTES).await {
+            match fetch_text(&reader_url, MAX_RESPONSE_BYTES).await {
                 Ok(body) => (body, "jina_reader"),
                 Err(reader_error) => {
                     return Err(format!(
@@ -193,16 +193,6 @@ pub async fn web_fetch(url: String, max_chars: Option<usize>) -> Result<WebFetch
         truncated,
         source: source.to_string(),
     })
-}
-
-fn build_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to create web client: {e}"))
 }
 
 fn normalize_provider(provider: Option<&str>) -> String {
@@ -250,19 +240,15 @@ fn validate_http_url(raw: &str) -> Result<Url, String> {
     }
 }
 
-async fn fetch_search_page(client: &Client, url: &str) -> Result<(String, String, bool), String> {
+async fn fetch_search_page(url: &str) -> Result<(String, String, bool), String> {
     validate_http_url(url)?;
-    let fetched = fetch_text(client, url, MAX_RESPONSE_BYTES).await?;
+    let fetched = fetch_text(url, MAX_RESPONSE_BYTES).await?;
     Ok((fetched.final_url, fetched.text, fetched.truncated))
 }
 
-async fn search_provider(
-    client: &Client,
-    provider: &str,
-    query: &str,
-) -> Result<SearchAttempt, String> {
+async fn search_provider(provider: &str, query: &str) -> Result<SearchAttempt, String> {
     let url = search_url(provider, query);
-    let (source_url, html, truncated) = fetch_search_page(client, &url).await?;
+    let (source_url, html, truncated) = fetch_search_page(&url).await?;
     Ok(SearchAttempt {
         provider: provider.to_string(),
         source_url,
@@ -354,12 +340,10 @@ fn is_search_challenge(provider: &str, source_url: &str, html: &str) -> bool {
     body.contains("captcha") && (body.contains("verify") || body.contains("verification"))
 }
 
-async fn fetch_text(client: &Client, url: &str, max_bytes: usize) -> Result<FetchedBody, String> {
-    let response = client
-        .get(url)
-        .send()
+async fn fetch_text(url: &str, max_bytes: usize) -> Result<FetchedBody, String> {
+    let response = crate::send_guarded_public_get(url, USER_AGENT, Duration::from_secs(15))
         .await
-        .map_err(|e| format!("Network request failed: {e}"))?;
+        .map_err(|error| format!("Network request failed: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("HTTP request failed with status {status}"));
@@ -629,14 +613,13 @@ fn normalize_duckduckgo_url(raw: &str) -> String {
 }
 
 async fn fetch_github_url(
-    client: &Client,
     requested_url: &str,
     max_chars: usize,
 ) -> Result<Option<WebFetchResponse>, String> {
     let parsed = validate_http_url(requested_url)?;
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
     if host == "raw.githubusercontent.com" {
-        let fetched = fetch_text(client, requested_url, MAX_RESPONSE_BYTES).await?;
+        let fetched = fetch_text(requested_url, MAX_RESPONSE_BYTES).await?;
         let (content, char_count, char_truncated) = truncate_chars(&fetched.text, max_chars);
         return Ok(Some(WebFetchResponse {
             url: requested_url.to_string(),
@@ -673,7 +656,7 @@ async fn fetch_github_url(
             "https://raw.githubusercontent.com/{}/{}/{}/{}",
             owner, repo, reference, path
         );
-        let fetched = fetch_text(client, &raw_url, MAX_RESPONSE_BYTES).await?;
+        let fetched = fetch_text(&raw_url, MAX_RESPONSE_BYTES).await?;
         let (content, char_count, char_truncated) = truncate_chars(&fetched.text, max_chars);
         return Ok(Some(WebFetchResponse {
             url: requested_url.to_string(),
@@ -695,7 +678,7 @@ async fn fetch_github_url(
             None
         };
         let response =
-            fetch_github_tree(client, owner, repo, reference, prefix.as_deref(), max_chars).await?;
+            fetch_github_tree(owner, repo, reference, prefix.as_deref(), max_chars).await?;
         return Ok(Some(WebFetchResponse {
             url: requested_url.to_string(),
             ..response
@@ -703,12 +686,12 @@ async fn fetch_github_url(
     }
 
     if segments.len() == 2 {
-        let repo_info = fetch_github_repo_info(client, owner, repo).await?;
+        let repo_info = fetch_github_repo_info(owner, repo).await?;
         let branch = repo_info
             .get("default_branch")
             .and_then(Value::as_str)
             .unwrap_or("main");
-        let mut response = fetch_github_tree(client, owner, repo, branch, None, max_chars).await?;
+        let mut response = fetch_github_tree(owner, repo, branch, None, max_chars).await?;
         response.url = requested_url.to_string();
         if let Some(description) = repo_info.get("description").and_then(Value::as_str) {
             if !description.trim().is_empty() {
@@ -724,15 +707,14 @@ async fn fetch_github_url(
     Ok(None)
 }
 
-async fn fetch_github_repo_info(client: &Client, owner: &str, repo: &str) -> Result<Value, String> {
+async fn fetch_github_repo_info(owner: &str, repo: &str) -> Result<Value, String> {
     let api_url = format!("https://api.github.com/repos/{owner}/{repo}");
-    let fetched = fetch_text(client, &api_url, MAX_RESPONSE_BYTES).await?;
+    let fetched = fetch_text(&api_url, MAX_RESPONSE_BYTES).await?;
     serde_json::from_str(&fetched.text)
         .map_err(|e| format!("Failed to parse GitHub repository metadata: {e}"))
 }
 
 async fn fetch_github_tree(
-    client: &Client,
     owner: &str,
     repo: &str,
     reference: &str,
@@ -743,7 +725,7 @@ async fn fetch_github_tree(
         "https://api.github.com/repos/{owner}/{repo}/git/trees/{}?recursive=1",
         encode_query(reference)
     );
-    let fetched = fetch_text(client, &api_url, MAX_RESPONSE_BYTES).await?;
+    let fetched = fetch_text(&api_url, MAX_RESPONSE_BYTES).await?;
     let json: Value = serde_json::from_str(&fetched.text)
         .map_err(|e| format!("Failed to parse GitHub tree response: {e}"))?;
     let tree = json
@@ -799,17 +781,18 @@ fn github_title_from_url(url: &Url) -> String {
 
 pub async fn fetch_page_raw(url: &str) -> Result<WebFetchResponse, String> {
     let requested_url = validate_http_url(url)?.to_string();
-    let client = build_client()?;
-
-    if let Some(response) = fetch_github_url(&client, &requested_url, 1_000_000).await? {
+    if let Some(response) = fetch_github_url(&requested_url, 1_000_000).await? {
         return Ok(response);
     }
 
-    let (fetched, source) = match fetch_text(&client, &requested_url, MAX_RESPONSE_BYTES).await {
+    let (fetched, source) = match fetch_text(&requested_url, MAX_RESPONSE_BYTES).await {
         Ok(body) => (body, "web"),
+        Err(primary_error) if primary_error.contains("NETWORK_GUARD_DENIED") => {
+            return Err(primary_error);
+        }
         Err(primary_error) => {
             let reader_url = jina_reader_url(&requested_url);
-            match fetch_text(&client, &reader_url, MAX_RESPONSE_BYTES).await {
+            match fetch_text(&reader_url, MAX_RESPONSE_BYTES).await {
                 Ok(body) => (body, "jina_reader"),
                 Err(reader_error) => {
                     return Err(format!(
@@ -853,7 +836,7 @@ pub fn extract_links(text: &str, base_url: &Url, prefix: &str) -> Vec<Url> {
     let html_re = Regex::new(r#"(?is)<a\b[^>]*href=["']([^"']+)["']"#).unwrap();
     let md_re = Regex::new(r#"\[[^\]]*\]\(([^)]+)\)"#).unwrap();
     let mut links = Vec::new();
-    
+
     let mut process_href = |href: &str| {
         let href = href.trim();
         if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") {
@@ -887,12 +870,9 @@ pub fn extract_links(text: &str, base_url: &Url, prefix: &str) -> Vec<Url> {
 pub fn is_crawlable_url(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
     let static_extensions = [
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-        ".css", ".js",
-        ".zip", ".tar", ".gz", ".rar", ".7z",
-        ".pdf", ".epub",
-        ".mp3", ".wav", ".mp4", ".avi", ".mov",
-        ".woff", ".woff2", ".ttf", ".eot"
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".zip", ".tar", ".gz",
+        ".rar", ".7z", ".pdf", ".epub", ".mp3", ".wav", ".mp4", ".avi", ".mov", ".woff", ".woff2",
+        ".ttf", ".eot",
     ];
     !static_extensions.iter().any(|ext| path.ends_with(ext))
 }
@@ -1010,7 +990,7 @@ mod tests {
     fn extracts_links_html_and_markdown() {
         let base_url = Url::parse("https://docs.unity3d.com/ScriptReference/index.html").unwrap();
         let prefix = "https://docs.unity3d.com/ScriptReference/";
-        
+
         let text = "
             HTML link: <a href=\"Transform.html\">Transform</a>
             Markdown link: [GameObject](GameObject.html)
@@ -1018,18 +998,30 @@ mod tests {
             External Markdown: [Microsoft](https://microsoft.com)
             Anchor HTML: <a href=\"#top\">Anchor</a>
         ";
-        
+
         let links = extract_links(text, &base_url, prefix);
         assert_eq!(links.len(), 2);
-        assert!(links.contains(&Url::parse("https://docs.unity3d.com/ScriptReference/Transform.html").unwrap()));
-        assert!(links.contains(&Url::parse("https://docs.unity3d.com/ScriptReference/GameObject.html").unwrap()));
+        assert!(links.contains(
+            &Url::parse("https://docs.unity3d.com/ScriptReference/Transform.html").unwrap()
+        ));
+        assert!(links.contains(
+            &Url::parse("https://docs.unity3d.com/ScriptReference/GameObject.html").unwrap()
+        ));
     }
 
     #[test]
     fn detects_static_crawlable_urls() {
-        assert!(is_crawlable_url(&Url::parse("https://example.com/page.html").unwrap()));
-        assert!(is_crawlable_url(&Url::parse("https://example.com/directory/").unwrap()));
-        assert!(!is_crawlable_url(&Url::parse("https://example.com/logo.PNG").unwrap()));
-        assert!(!is_crawlable_url(&Url::parse("https://example.com/manual.pdf").unwrap()));
+        assert!(is_crawlable_url(
+            &Url::parse("https://example.com/page.html").unwrap()
+        ));
+        assert!(is_crawlable_url(
+            &Url::parse("https://example.com/directory/").unwrap()
+        ));
+        assert!(!is_crawlable_url(
+            &Url::parse("https://example.com/logo.PNG").unwrap()
+        ));
+        assert!(!is_crawlable_url(
+            &Url::parse("https://example.com/manual.pdf").unwrap()
+        ));
     }
 }

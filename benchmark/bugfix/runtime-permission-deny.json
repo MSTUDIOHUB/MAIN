@@ -1,9 +1,33 @@
 {
+  "schemaVersion": 1,
   "id": "runtime-permission-deny",
   "category": "bugfix",
-  "success": true,
-  "retries": 1,
-  "hallucinations": 0,
-  "latencyMs": 1200,
-  "toolCalls": 4
+  "trace": [
+    {
+      "sequence": 1,
+      "attempt": 1,
+      "eventName": "tool_called",
+      "stepId": "permission-preflight",
+      "toolCall": "shell_permission_preflight",
+      "success": false,
+      "resultKind": "blocked",
+      "latencyMs": 1
+    },
+    {
+      "sequence": 2,
+      "attempt": 1,
+      "eventName": "task_completed",
+      "success": true,
+      "resultKind": "blocked",
+      "latencyMs": 0
+    }
+  ],
+  "expect": {
+    "resultKind": "blocked",
+    "eventOrder": ["tool_called", "task_completed"],
+    "requiredTools": ["shell_permission_preflight"],
+    "allowedTools": ["shell_permission_preflight"],
+    "maxRetries": 0,
+    "maxToolCalls": 1
+  }
 }

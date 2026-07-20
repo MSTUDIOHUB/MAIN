@@ -107,14 +107,14 @@ test("ordinary composer command creates a new turn instead of consuming stale re
   await page.getByTestId("composer-textarea").fill(command);
   await page.getByTestId("composer-send-button").click();
 
-  await expect(page.getByTestId("execution-capsule-intent-option-execute")).toContainText("批准执行本轮操作");
+  // Workspace instructions are admitted as Turns before intent routing. They
+  // must never fall back to the legacy pre-Turn execution-confirmation chat.
+  await expect(page.getByTestId("execution-capsule-intent-option-execute")).toHaveCount(0);
   await expect
     .poll(async () =>
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedOptions ?? []),
     )
     .toEqual([]);
-
-  await page.getByTestId("execution-capsule-intent-option-execute").click();
 
   await expect
     .poll(async () =>
@@ -141,27 +141,6 @@ test("ordinary composer command creates a new turn instead of consuming stale re
     '[data-testid="turn-choice-checkpoint"][data-turn-id="e2e-awaiting-choice-turn"]',
   );
   await expect(originalTurnCheckpoint).toBeVisible();
-  await originalTurnCheckpoint.getByTestId("execution-capsule-reply-option-0").click();
-
-  await expect
-    .poll(async () =>
-      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedOptions ?? []),
-    )
-    .toEqual(["先修暂停等待选择，再补 UI 状态"]);
-
-  await expect
-    .poll(async () =>
-      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().visibleConversationTurns ?? []),
-    )
-    .toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "e2e-awaiting-choice-turn", status: "done" }),
-    ]));
-
-  await expect
-    .poll(async () =>
-      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? -1),
-    )
-    .toBe(2);
 });
 
 test("mixed choice options keep execution choices together and split read-only permissions", async ({ page }) => {

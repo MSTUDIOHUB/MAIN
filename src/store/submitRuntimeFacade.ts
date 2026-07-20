@@ -359,7 +359,19 @@ export function createSubmitSessionRuntimeFacade<
           ...latest.sessionsByWorkspace,
           [input.scopeKey]: latestSessions.map((candidate) =>
             candidate?.id === input.sessionId
-              ? { ...candidate, ...durableSessionPatch }
+              ? {
+                  ...candidate,
+                  ...durableSessionPatch,
+                  ...(typeof candidate.storageRevision === "number" ||
+                    typeof durableSessionPatch.storageRevision === "number"
+                    ? {
+                        storageRevision: Math.max(
+                          Number(candidate.storageRevision) || 0,
+                          Number(durableSessionPatch.storageRevision) || 0,
+                        ),
+                      }
+                    : {}),
+                }
               : candidate
           ),
         };

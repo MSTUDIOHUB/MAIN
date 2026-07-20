@@ -46,6 +46,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildWorkspaceTurnQueueEntryIdentity,
   createWorkspaceTurnQueueState,
   normalizeWorkspaceInstruction,
   reconcileWorkspaceTurnQueueOnRestore,
@@ -137,6 +138,18 @@ function claim(state, claimId, at) {
   });
 }
 
+function ownerForEntry(entry, overrides = {}) {
+  return {
+    sessionKey: entry.receipt.sessionKey,
+    sessionEpoch: entry.receipt.sessionEpoch,
+    turnId: entry.receipt.turnId,
+    receiptId: entry.receipt.receiptId,
+    clientSubmissionId: entry.instruction.clientSubmissionId,
+    instructionEnvelopeIdentity: buildWorkspaceTurnQueueEntryIdentity(entry),
+    ...overrides,
+  };
+}
+
 test("strict FIFO dispatch removes only the terminal head before advancing", () => {
   let state = createWorkspaceTurnQueueState({ sessionKey, sessionEpoch });
   state = append(state, "a", 10);
@@ -167,7 +180,7 @@ test("strict FIFO dispatch removes only the terminal head before advancing", () 
     claimId: "claim-a",
     sessionKey,
     sessionEpoch,
-    terminalOwner: { sessionKey, sessionEpoch, turnId: "turn-a" },
+    terminalOwner: ownerForEntry(state.entries[0]),
   });
   state = claim(state, "claim-b", 17);
   assert.equal(state.entries.length, 1);
@@ -188,7 +201,7 @@ test("a Run admission acknowledges its exact head without waiting for Turn termi
     claimId: "claim-accepted-run",
     sessionKey,
     sessionEpoch,
-    turnOwner: { sessionKey, sessionEpoch, turnId: "other-turn" },
+    turnOwner: ownerForEntry(state.entries[0], { turnId: "other-turn" }),
   });
   assert.equal(wrongTurn.disposition, "rejected");
   assert.equal(wrongTurn.reason, "terminal_owner_mismatch");
@@ -200,7 +213,7 @@ test("a Run admission acknowledges its exact head without waiting for Turn termi
     claimId: "claim-accepted-run",
     sessionKey,
     sessionEpoch,
-    turnOwner: { sessionKey, sessionEpoch, turnId: "turn-accepted-run" },
+    turnOwner: ownerForEntry(state.entries[0]),
   });
   assert.equal(state.entries.length, 0);
 });
@@ -312,7 +325,7 @@ test("every mutating transition requires exact version, Session epoch, claim, an
     {
       type: "remove", expectedVersion: state.version, at: 45,
       claimId: "claim-exact", sessionKey, sessionEpoch,
-      terminalOwner: { sessionKey, sessionEpoch, turnId: "other-turn" },
+      terminalOwner: ownerForEntry(state.entries[0], { turnId: "other-turn" }),
     },
   ]) {
     const rejected = reduceWorkspaceTurnQueue(state, command);
@@ -403,7 +416,7 @@ test("restore removes exact terminal Turn owners without accepting cross-epoch l
     snapshot: JSON.parse(JSON.stringify(state)),
     sessionKey,
     sessionEpoch,
-    terminalOwners: [{ sessionKey, sessionEpoch: "old-epoch", turnId: "turn-done" }],
+    terminalOwners: [ownerForEntry(state.entries[0], { sessionEpoch: "old-epoch" })],
     at: 90,
   });
   assert.equal(crossEpochOnly.entries.length, 2);
@@ -412,7 +425,7 @@ test("restore removes exact terminal Turn owners without accepting cross-epoch l
     snapshot: JSON.parse(JSON.stringify(state)),
     sessionKey,
     sessionEpoch,
-    terminalOwners: [{ sessionKey, sessionEpoch, turnId: "turn-done" }],
+    terminalOwners: [ownerForEntry(state.entries[0])],
     at: 90,
   });
   assert.deepEqual(
@@ -420,6 +433,42 @@ test("restore removes exact terminal Turn owners without accepting cross-epoch l
     ["still-pending"],
   );
   assert.equal(exactTerminal.entries[0].status, "queued");
+});
+
+test("restore owner identity cannot remove a different receipt that reuses the same turnId", () => {
+  let state = createWorkspaceTurnQueueState({ sessionKey, sessionEpoch });
+  state = append(state, "first-owner", 91);
+  state = commit(state, "first-owner", 92);
+  state = apply(state, {
+    type: "append",
+    expectedVersion: state.version,
+    at: 93,
+    instruction: instruction("replacement-owner", 93),
+    receipt: receipt("replacement-owner", 93, {
+      turnId: state.entries[0].receipt.turnId,
+      userBlockId: 1_093,
+    }),
+  });
+  state = commit(state, "replacement-owner", 94);
+
+  const firstOwner = ownerForEntry(state.entries[0]);
+  const restored = reconcileWorkspaceTurnQueueOnRestore({
+    snapshot: JSON.parse(JSON.stringify(state)),
+    sessionKey,
+    sessionEpoch,
+    terminalOwners: [firstOwner],
+    at: 95,
+  });
+
+  assert.deepEqual(
+    restored.entries.map((entry) => entry.instruction.clientSubmissionId),
+    ["replacement-owner"],
+  );
+  assert.equal(restored.entries[0].receipt.turnId, firstOwner.turnId);
+  assert.notEqual(
+    buildWorkspaceTurnQueueEntryIdentity(restored.entries[0]),
+    firstOwner.instructionEnvelopeIdentity,
+  );
 });
 
 test("queue contracts are deeply immutable and survive a JSON persistence round trip", () => {
@@ -739,6 +788,33 @@ test("projection recovery is idempotent and fails closed on exact ID collisions"
     language: "zh",
   });
   assert.deepEqual(turnCollision, {
+    disposition: "conflict",
+    reason: "turn_id_collision",
+  });
+
+  for (const driftedTurn of [
+    { ...first.turn, workspaceInstructionSource: "guide" },
+    { ...first.turn, createdAt: first.turn.createdAt + 1 },
+  ]) {
+    const drift = reconcileWorkspaceInstructionProjection({
+      entry: queue.entries[0],
+      taskFlow: first.taskFlow,
+      conversationTurns: [driftedTurn],
+      language: "zh",
+    });
+    assert.deepEqual(drift, {
+      disposition: "conflict",
+      reason: "turn_id_collision",
+    });
+  }
+
+  const duplicatedTurn = reconcileWorkspaceInstructionProjection({
+    entry: queue.entries[0],
+    taskFlow: first.taskFlow,
+    conversationTurns: [first.turn, { ...first.turn }],
+    language: "zh",
+  });
+  assert.deepEqual(duplicatedTurn, {
     disposition: "conflict",
     reason: "turn_id_collision",
   });

@@ -19,14 +19,14 @@ export type RunTransition =
   | { type: "action_required"; request: ActionRequest; events: MainThreadEvent[] }
   | { type: "runtime_event"; event: MainThreadEvent };
 
-function isClearingRunTerminal(
+function isRunControlClearingEvent(
   event: MainThreadEvent,
-): event is Extract<MainThreadEvent, { type: "run.completed" | "run.aborted" | "run.failed" }> {
-  return event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed";
+): event is Extract<MainThreadEvent, { type: "run.completed" | "run.aborted" }> {
+  return event.type === "run.completed" || event.type === "run.aborted";
 }
 
-function isTerminalOwnedByRequest(event: MainThreadEvent, request: ActionRequest): boolean {
-  return isClearingRunTerminal(event) && isActionRequestOwnedByRun(request, {
+function isControlClearingEventOwnedByRequest(event: MainThreadEvent, request: ActionRequest): boolean {
+  return isRunControlClearingEvent(event) && isActionRequestOwnedByRun(request, {
     sessionKey: event.threadId,
     turnId: event.turnId,
     runId: event.runId,
@@ -36,24 +36,24 @@ function isTerminalOwnedByRequest(event: MainThreadEvent, request: ActionRequest
 /** Single reducer for the coupled run-event/action-request lifecycle. */
 export function reduceRunTransition<T extends RunTransitionState>(state: T, transition: RunTransition): T {
   if (transition.type === "action_required") {
-    const alreadyTerminal = state.runtimeEvents.some((event) =>
-      isTerminalOwnedByRequest(event, transition.request)
+    const alreadyControlCleared = state.runtimeEvents.some((event) =>
+      isControlClearingEventOwnedByRequest(event, transition.request)
     );
     let runtimeEvents = state.runtimeEvents;
-    let transitionCommittedTerminal = false;
+    let transitionClearedControl = false;
     for (const event of transition.events) {
       const appendResult = appendRuntimeEventWithResult(runtimeEvents, event);
       runtimeEvents = appendResult.events;
       if (
         appendResult.disposition !== "conflict" &&
-        isTerminalOwnedByRequest(event, transition.request)
+        isControlClearingEventOwnedByRequest(event, transition.request)
       ) {
-        transitionCommittedTerminal = true;
+        transitionClearedControl = true;
       }
     }
     return {
       ...state,
-      activeActionRequest: alreadyTerminal || transitionCommittedTerminal ? null : transition.request,
+      activeActionRequest: alreadyControlCleared || transitionClearedControl ? null : transition.request,
       runtimeEvents,
     };
   }
@@ -64,7 +64,7 @@ export function reduceRunTransition<T extends RunTransitionState>(state: T, tran
   const shouldClearRequest = !!state.activeActionRequest && (
     (
       transitionAccepted &&
-      isClearingRunTerminal(transition.event) &&
+      isRunControlClearingEvent(transition.event) &&
       isActionRequestOwnedByRun(state.activeActionRequest, {
         sessionKey: transition.event.threadId,
         turnId: transition.event.turnId,

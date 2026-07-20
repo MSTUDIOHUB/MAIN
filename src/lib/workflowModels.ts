@@ -5,7 +5,7 @@ import {
 } from "./runIntent";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import { looksLongRunningShellCommand } from "./toolExecutionContract";
-import type { AgentLoopPauseKind, AgentLoopResultKind } from "./runOutcome";
+import type { AgentLoopOutcomeStatus, AgentLoopPauseKind, AgentLoopResultKind } from "./runOutcome";
 
 // lib/workflowModels.ts
 // 计划面板、回合视图、流式归一化共享模型。
@@ -560,6 +560,8 @@ export type VisibleConversationTurnStatus =
   | "canceled";
 
 export interface ConversationTurnRuntimeOutcome {
+  /** `aborted` is accepted only for persisted legacy reads. New cancellation
+   * projections close as `completed` with `resultKind: "canceled"`. */
   status: "completed" | "paused" | "aborted";
   reason: string;
   resultKind?: AgentLoopResultKind | "canceled";
@@ -569,6 +571,13 @@ export interface ConversationTurnRuntimeOutcome {
   updatedAt: number;
 }
 
+/** Project an internal Run stop into the logical Turn's UI lifecycle. */
+export function projectAgentLoopStatusToConversationTurnRuntimeStatus(
+  status: AgentLoopOutcomeStatus,
+): "completed" | "paused" {
+  return status === "paused" ? "paused" : "completed";
+}
+
 export function deriveRuntimeOutcomeVisibleStatus(
   runtimeOutcome: ConversationTurnRuntimeOutcome | null | undefined,
   fallbackStatus: ConversationTurnStatus,
@@ -576,6 +585,7 @@ export function deriveRuntimeOutcomeVisibleStatus(
   if (!runtimeOutcome) return fallbackStatus;
   if (runtimeOutcome.status === "aborted") return "canceled";
   if (runtimeOutcome.status === "paused") return "paused";
+  if (runtimeOutcome.resultKind === "canceled") return "canceled";
   if (
     runtimeOutcome.resultKind === "success" ||
     runtimeOutcome.resultKind === "partial" ||

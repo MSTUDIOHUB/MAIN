@@ -52,7 +52,7 @@ import {
   isRiskAutoExecutable,
   normalizeLocalFileReadPath,
 } from "./toolCapabilities";
-import { applyShellCwd } from "./toolExecutionContract";
+import { getShellToolCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
@@ -557,8 +557,9 @@ export async function executeTool(
       return await runGitDiffTool(args, workspace);
 
     case "execute_command": {
-      const command = applyShellCwd((args.command as string) || "", args, workspace);
+      const command = String(args.command || "").trim();
       if (!command) throw new Error("Missing required parameter 'command'.");
+      const workingDirectory = getShellToolCwd(args);
       const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 4000, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let initialStatus = await ensurePtySession(sessionKey, workspace);
@@ -566,13 +567,23 @@ export async function executeTool(
       if (!admission.allowed) throw new Error(admission.reason);
       let beforeOffset = initialStatus.bufferEndOffset;
       try {
-        await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
+        await writePty(
+          command + "\n",
+          sessionKey,
+          options.shellPermissionApproval,
+          workingDirectory,
+        );
       } catch (error) {
         if (!isMissingPtySessionError(error)) throw error;
         await spawnPty(140, 40, sessionKey, workspace);
         initialStatus = await getPtyStatus(sessionKey);
         beforeOffset = initialStatus.bufferEndOffset;
-        await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
+        await writePty(
+          command + "\n",
+          sessionKey,
+          options.shellPermissionApproval,
+          workingDirectory,
+        );
       }
       await sleep(waitMs);
       let output = await readPtySince(beforeOffset, maxChars, sessionKey);
@@ -710,6 +721,7 @@ export async function executeTool(
           normalizedInput.value + (appendNewline ? "\n" : ""),
           sessionKey,
           options.shellPermissionApproval,
+          undefined,
           false,
           true,
           typeof statusBefore.foregroundPid === "number" ? statusBefore.foregroundPid : undefined,
@@ -785,7 +797,7 @@ export async function executeTool(
     }
 
     case "run_command": {
-      const command = applyShellCwd((args.command as string) || "", args, workspace);
+      const command = String(args.command || "").trim();
       if (!command) throw new Error("Missing required parameter 'command'.");
       return await runCommand(
         command,
@@ -793,6 +805,7 @@ export async function executeTool(
         parseOptionalNumber(args.timeout_ms),
         workspace,
         options.shellPermissionApproval,
+        getShellToolCwd(args),
       );
     }
 

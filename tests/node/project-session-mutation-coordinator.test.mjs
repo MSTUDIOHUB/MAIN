@@ -43,6 +43,7 @@ const {
   ProjectSessionDeleteFencedError,
   ProjectSessionWorkspaceClearFencedError,
   ProjectSessionStaleWriteFencedError,
+  ProjectSessionSaveTimedOutError,
   isProjectSessionAdmissionProjectionOwned,
 } = loadTranspiledModuleSync(
   path.join(process.cwd(), "src/lib/projectSessionMutationCoordinator.ts"),
@@ -105,6 +106,102 @@ test("an owner save rechecks its runtime revision only when it reaches the mutat
     (error) => error instanceof ProjectSessionStaleWriteFencedError,
   );
   assert.deepEqual(calls, ["save-current"]);
+});
+
+test("a never-settling save releases the real owner queue and requires revision reconciliation", async () => {
+  const coordinator = createProjectSessionMutationCoordinator(undefined, {
+    saveSettlementTimeoutMs: 25,
+    deadlineLeadMs: 5,
+  });
+  const ownerKey = "workspace-timeout\u000061";
+  const never = new Promise(() => {});
+  let firstLease = null;
+  let secondLease = null;
+  let thirdLease = null;
+
+  const firstSave = coordinator.save(ownerKey, async (lease) => {
+    firstLease = lease;
+    return never;
+  });
+  await assert.rejects(
+    firstSave,
+    (error) => error instanceof ProjectSessionSaveTimedOutError &&
+      error.code === "project_session_save_timed_out",
+  );
+
+  assert.ok(firstLease);
+  assert.equal(firstLease.revisionReconciliationRequired, false);
+  const secondSaved = await coordinator.save(ownerKey, async (lease) => {
+    secondLease = lease;
+    return "saved-after-timeout";
+  });
+  assert.equal(secondSaved, "saved-after-timeout");
+  assert.equal(secondLease.revisionReconciliationRequired, true);
+  assert.ok(secondLease.mutationDeadlineMs > firstLease.mutationDeadlineMs);
+
+  await coordinator.save(ownerKey, async (lease) => {
+    thirdLease = lease;
+    return "saved-authoritative";
+  });
+  assert.equal(thirdLease.revisionReconciliationRequired, false);
+});
+
+test("an older late response cannot clear uncertainty from a newer timed-out save", async () => {
+  const coordinator = createProjectSessionMutationCoordinator(undefined, {
+    saveSettlementTimeoutMs: 20,
+    deadlineLeadMs: 4,
+  });
+  const ownerKey = "workspace-timeout\u000062";
+  const oldResponse = deferred();
+  const never = new Promise(() => {});
+
+  await assert.rejects(
+    coordinator.save(ownerKey, async () => oldResponse.promise),
+    (error) => error instanceof ProjectSessionSaveTimedOutError,
+  );
+  await assert.rejects(
+    coordinator.save(ownerKey, async () => never),
+    (error) => error instanceof ProjectSessionSaveTimedOutError,
+  );
+  oldResponse.resolve("late-old-success");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let recoveryLease = null;
+  await coordinator.save(ownerKey, async (lease) => {
+    recoveryLease = lease;
+    return "reconciled";
+  });
+  assert.equal(recoveryLease.revisionReconciliationRequired, true);
+});
+
+test("an older late rejection cannot recreate uncertainty after a newer authoritative save", async () => {
+  const coordinator = createProjectSessionMutationCoordinator(undefined, {
+    saveSettlementTimeoutMs: 20,
+    deadlineLeadMs: 4,
+  });
+  const ownerKey = "workspace-timeout\u000063";
+  const oldResponse = deferred();
+
+  await assert.rejects(
+    coordinator.save(ownerKey, async () => oldResponse.promise),
+    (error) => error instanceof ProjectSessionSaveTimedOutError,
+  );
+  let reconciliationLease = null;
+  await coordinator.save(ownerKey, async (lease) => {
+    reconciliationLease = lease;
+    return "new-authoritative-save";
+  });
+  assert.equal(reconciliationLease.revisionReconciliationRequired, true);
+
+  oldResponse.reject(new Error("late transport rejection"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let nextLease = null;
+  await coordinator.save(ownerKey, async (lease) => {
+    nextLease = lease;
+    return "still-authoritative";
+  });
+  assert.equal(nextLease.revisionReconciliationRequired, false);
 });
 
 function deferred() {

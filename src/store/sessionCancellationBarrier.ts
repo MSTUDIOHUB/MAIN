@@ -45,6 +45,7 @@ export function hasCanceledTurnTerminalProjection(input: {
     type?: string;
     threadId?: string;
     turnId?: string;
+    runId?: string;
     resultKind?: string;
   }>;
   taskFlow: Array<{
@@ -53,12 +54,24 @@ export function hasCanceledTurnTerminalProjection(input: {
     visibility?: string;
   }>;
 }): boolean {
-  const hasAbortedRun = input.runtimeEvents.some((event) =>
+  const abortedRunIndex = input.runtimeEvents.findIndex((event) =>
     event.type === "run.aborted" &&
     event.threadId === input.sessionKey &&
     event.turnId === input.turnId
   );
-  const hasCanceledTurn = input.runtimeEvents.some((event) =>
+  const abortedRunId = abortedRunIndex >= 0
+    ? input.runtimeEvents[abortedRunIndex]?.runId
+    : undefined;
+  const canceledRunIndex = input.runtimeEvents.findIndex((event, index) =>
+    index > abortedRunIndex &&
+    event.type === "run.completed" &&
+    event.threadId === input.sessionKey &&
+    event.turnId === input.turnId &&
+    event.resultKind === "canceled" &&
+    (!abortedRunId || event.runId === abortedRunId)
+  );
+  const canceledTurnIndex = input.runtimeEvents.findIndex((event, index) =>
+    index > canceledRunIndex &&
     event.type === "turn.completed" &&
     event.threadId === input.sessionKey &&
     event.turnId === input.turnId &&
@@ -69,7 +82,8 @@ export function hasCanceledTurnTerminalProjection(input: {
     block.turnId === input.turnId &&
     block.visibility === "assistant_final"
   );
-  return hasAbortedRun && hasCanceledTurn && hasVisibleFinal;
+  return abortedRunIndex >= 0 && canceledRunIndex > abortedRunIndex &&
+    canceledTurnIndex > canceledRunIndex && hasVisibleFinal;
 }
 
 const pendingBySessionKey = new Map<string, PendingSessionCancellation>();

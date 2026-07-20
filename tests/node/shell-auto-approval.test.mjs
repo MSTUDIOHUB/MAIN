@@ -104,7 +104,7 @@ test("shell auto approval resolves command text for shell tools", () => {
       command: "npm run dev",
       cwd: "tools/dev server",
     }),
-    "cd 'tools/dev server' && npm run dev",
+    "npm run dev",
   );
 
   assert.equal(

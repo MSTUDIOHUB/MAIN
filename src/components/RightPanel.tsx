@@ -375,12 +375,12 @@ function IntegratedTerminal({
     const writeInputToPty = async (data: string) => {
       await ensurePtyReady();
       try {
-        await writePty(data, sessionKey, undefined, true);
+        await writePty(data, sessionKey, undefined, undefined, true);
       } catch {
         ptyKnownRunning = false;
         statusCheckedAt = 0;
         await ensurePtyReady(true);
-        await writePty(data, sessionKey, undefined, true);
+        await writePty(data, sessionKey, undefined, undefined, true);
       }
     };
 

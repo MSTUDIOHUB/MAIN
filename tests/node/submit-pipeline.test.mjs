@@ -84,6 +84,7 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"),
 );
+const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
 function baseSnapshot(overrides = {}) {
   return {
@@ -402,16 +403,21 @@ test("hidden approved-plan execution can reuse its logical turn with execute int
   assert.equal(decision.turnReuse.isInternalTurn, false);
 });
 
-test("completed and aborted turns are immutable even under explicit reuse", () => {
-  for (const status of ["completed", "aborted"]) {
+test("canonical completed and legacy aborted turns are immutable even under explicit reuse", () => {
+  const cases = [
+    { suffix: "success", status: "completed", resultKind: "success" },
+    { suffix: "canceled", status: "completed", resultKind: "canceled" },
+    { suffix: "legacy-aborted", status: "aborted", resultKind: "canceled" },
+  ];
+  for (const { suffix, status, resultKind } of cases) {
     const closedTurn = turn({
-      id: `turn-${status}`,
+      id: `turn-${suffix}`,
       status: "done",
       runtimeOutcome: {
         status,
-        reason: `turn_${status}`,
-        resultKind: status === "aborted" ? "canceled" : "success",
-        runId: `run-${status}`,
+        reason: `turn_${suffix}`,
+        resultKind,
+        runId: `run-${suffix}`,
         parentRunId: null,
         updatedAt: 2,
       },
@@ -439,29 +445,27 @@ test("completed and aborted turns are immutable even under explicit reuse", () =
 });
 
 test("durable terminal turn events prevent reuse when the turn projection is stale", () => {
-  for (const type of ["turn.completed", "turn.failed"]) {
+  for (const source of ["canonical", "legacy_normalized"]) {
     const staleTurn = turn({
-      id: `turn-stale-${type}`,
+      id: `turn-stale-${source}`,
       status: "awaiting_input",
       runtimeOutcome: undefined,
     });
-    const terminalEvent = type === "turn.completed"
-      ? {
-          schemaVersion: 2,
-          type,
+    const terminalEvent = source === "canonical"
+      ? turnEvents.withEventSchema({
+          type: "turn.completed",
           threadId: "session-1",
           turnId: staleTurn.id,
           timestampMs: 2,
           resultKind: "error",
-        }
-      : {
-          schemaVersion: 2,
-          type,
+        })
+      : turnEvents.normalizePersistedMainThreadEvent({
+          type: "turn.failed",
           threadId: "session-1",
           turnId: staleTurn.id,
           timestampMs: 2,
           error: { message: "legacy persisted terminal" },
-        };
+        });
     const decision = buildSubmitPipelineDecision({
       text: "Continue execution",
       options: {

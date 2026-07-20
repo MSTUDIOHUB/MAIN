@@ -134,14 +134,17 @@ test("canceling a running run closes the same run and publishes one visible conc
   assert.deepEqual(result.state.runtimeEvents.map((event) => event.type), [
     "run.started",
     "run.aborted",
+    "run.completed",
     "turn.completed",
   ]);
+  assert.equal(result.state.runtimeEvents.at(-3).runId, "run-1");
+  assert.equal(result.state.runtimeEvents.at(-3).reason, "user_cancelled");
   assert.equal(result.state.runtimeEvents.at(-2).runId, "run-1");
-  assert.equal(result.state.runtimeEvents.at(-2).reason, "user_cancelled");
+  assert.equal(result.state.runtimeEvents.at(-2).resultKind, "canceled");
   assert.equal(result.state.runtimeEvents.at(-1).resultKind, "canceled");
   assert.equal(result.state.conversationTurns[0].status, "done");
   assert.deepEqual(result.state.conversationTurns[0].runtimeOutcome, {
-    status: "aborted",
+    status: "completed",
     reason: "user_cancelled",
     resultKind: "canceled",
     runId: "run-1",
@@ -234,7 +237,7 @@ test("canceling a pending user choice archives only its exact capability block",
   assert.equal(result.state.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
 });
 
-test("canceling after a paused run creates an aborted child instead of double-terminating the parent", () => {
+test("canceling a paused run concludes that same run through the canonical cancellation sequence", () => {
   const initial = state({
     runtimeEvents: [
       {
@@ -273,25 +276,25 @@ test("canceling after a paused run creates an aborted child instead of double-te
     nowMs: 10,
   });
 
-  assert.notEqual(result.cancellationRunId, "run-1");
-  assert.match(result.cancellationRunId, /^run-cancel-/);
+  assert.equal(result.cancellationRunId, "run-1");
   assert.deepEqual(result.state.runtimeEvents.map((event) => event.type), [
     "run.started",
     "run.paused",
-    "run.started",
     "run.aborted",
+    "run.completed",
     "turn.completed",
   ]);
-  const childStarted = result.state.runtimeEvents.at(-3);
-  const childAborted = result.state.runtimeEvents.at(-2);
-  assert.equal(childStarted.runId, result.cancellationRunId);
-  assert.equal(childStarted.parentRunId, "run-1");
-  assert.equal(childAborted.runId, result.cancellationRunId);
-  assert.equal(childAborted.parentRunId, "run-1");
-  assert.equal(result.state.conversationTurns[0].runtimeOutcome.runId, result.cancellationRunId);
-  assert.equal(result.state.conversationTurns[0].runtimeOutcome.parentRunId, "run-1");
-  assert.equal(result.harnessRunMarker.activeRunId, result.cancellationRunId);
-  assert.equal(result.harnessRunMarker.activeParentRunId, "run-1");
+  const aborted = result.state.runtimeEvents.at(-3);
+  const completed = result.state.runtimeEvents.at(-2);
+  assert.equal(aborted.runId, "run-1");
+  assert.equal(aborted.parentRunId, null);
+  assert.equal(completed.runId, "run-1");
+  assert.equal(completed.parentRunId, null);
+  assert.equal(completed.resultKind, "canceled");
+  assert.equal(result.state.conversationTurns[0].runtimeOutcome.runId, "run-1");
+  assert.equal(result.state.conversationTurns[0].runtimeOutcome.parentRunId, null);
+  assert.equal(result.harnessRunMarker.activeRunId, "run-1");
+  assert.equal(result.harnessRunMarker.activeParentRunId, null);
 });
 
 test("an already completed logical turn is immutable under a late cancel", () => {
@@ -371,8 +374,10 @@ test("closing an old turn preserves the control plane owned by a newer turn", ()
   assert.equal(result.state.pendingReviewResolve, newerPendingResolve);
   assert.equal(result.state.pendingReviewTaskId, 22);
   assert.deepEqual(result.state.pendingToolCall, { id: "tool-new" });
-  assert.equal(result.state.runtimeEvents.at(-2).type, "run.aborted");
-  assert.equal(result.state.runtimeEvents.at(-2).runId, "run-old");
+  assert.equal(result.state.runtimeEvents.at(-3).type, "run.aborted");
+  assert.equal(result.state.runtimeEvents.at(-3).runId, "run-old");
+  assert.equal(result.state.runtimeEvents.at(-2).type, "run.completed");
+  assert.equal(result.state.runtimeEvents.at(-2).resultKind, "canceled");
   assert.equal(result.state.runtimeEvents.at(-1).type, "turn.completed");
 });
 
@@ -456,8 +461,10 @@ test("an existing aborted run remains the canonical reason when the missing Turn
   assert.deepEqual(result.state.runtimeEvents.map((event) => event.type), [
     "run.started",
     "run.aborted",
+    "run.completed",
     "turn.completed",
   ]);
+  assert.equal(result.state.runtimeEvents.at(-2).resultKind, "canceled");
   assert.equal(result.state.conversationTurns[0].runtimeOutcome.reason, "provider_cancelled");
   assert.equal(result.state.conversationTurns[0].summary, "Provider request was canceled.");
   assert.equal(result.state.taskFlow.at(-1).content, "Provider request was canceled.");

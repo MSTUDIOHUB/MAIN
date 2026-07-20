@@ -15,7 +15,17 @@ import { buildGoalRuntimeSnapshot } from "./goalRuntime";
 import { buildAcceptedGoalContinuationState } from "./goalResumeBoundary";
 import { buildPlanReviewActionRequest, buildUserChoiceActionRequest } from "./actionRequest";
 import { buildToolPermissionActionRequest } from "./pendingToolReview";
-import { buildPlanApprovalIdentity } from "./planApprovalIdentity";
+import {
+  buildPlanApprovalIdentity,
+  buildPlanExecutionInstructionHash,
+} from "./planApprovalIdentity";
+import {
+  createPlanLifecycleState,
+  isPlanApprovalLeaseBoundToState,
+  PLAN_LIFECYCLE_SCHEMA_VERSION,
+  reducePlanLifecycle,
+} from "./planLifecycle";
+import { issuePlanExplicitResumeAttempt } from "./planExecutionContinuation";
 import type { HarnessRunMarker } from "./harnessCrashTelemetry";
 import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./turnEvents";
@@ -1035,12 +1045,21 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
 
 function hasReloadResumeState(workspace: string, sessionId: number): boolean {
   const state = useAppStore.getState();
+  const session = (state.sessionsByWorkspace[workspace] || []).find(
+    (candidate) => candidate.id === sessionId,
+  );
+  const expectedSessionKey = `${workspace}:${sessionId}`;
   return (
     state.currentWorkspace === workspace &&
     state.currentSessionId === sessionId &&
+    !!session?.planLifecycleEpoch &&
     state.taskFlow.length > 0 &&
     state.isPlanApproved &&
-    (state.planStage === "executing" || state.planStage === "completed") &&
+    state.planStage === "executing" &&
+    state.planLifecycle.status === "paused" &&
+    state.planLifecycle.sessionKey === expectedSessionKey &&
+    state.planLifecycle.sessionEpoch === session.planLifecycleEpoch &&
+    isPlanApprovalLeaseBoundToState(state.planLifecycle) &&
     state.planArtifacts.some((artifact) => artifact.kind === "tasks")
   );
 }
@@ -1063,6 +1082,162 @@ function seedPlanReloadResumeScenario() {
     const turnId = "e2e-plan-reload-turn";
     const userBlockId = useAppStore.getState()._nextTaskId();
     const agentBlockId = useAppStore.getState()._nextTaskId();
+    const sessionKey = `${workspace}:${sessionId}`;
+    const sessionEpoch = "plan-session-e2e-plan-reload";
+    const planArtifacts = [
+      {
+        kind: "requirements" as const,
+        path: ".MAIN/plans/requirements.md",
+        title: "Requirements",
+        updatedAt: now - 3_000,
+        content: "# Requirements\n\n- 批准后应允许继续执行剩余任务。\n",
+      },
+      {
+        kind: "design" as const,
+        path: ".MAIN/plans/plan.md",
+        title: "Design",
+        updatedAt: now - 2_000,
+        content: "# Design\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
+      },
+      {
+        kind: "tasks" as const,
+        path: ".MAIN/plans/tasks.md",
+        title: "Tasks",
+        updatedAt: now - 1_000,
+        content: [
+          "# Tasks",
+          "",
+          "- [x] 恢复计划工作区状态",
+          "- [ ] 恢复对话与执行任务进度",
+          "- [ ] 继续执行并完成收尾",
+        ].join("\n"),
+      },
+    ];
+    const artifactIdentity = buildPlanApprovalIdentity(planArtifacts);
+    if (!artifactIdentity) return undefined;
+    const reviewRunId = "run-e2e-plan-reload-review";
+    const requestId = "request-e2e-plan-reload-review";
+    const reviewIdentity = {
+      sessionKey,
+      sessionEpoch,
+      turnId,
+      runId: reviewRunId,
+      parentRunId: null,
+      requestId,
+      planRevision: artifactIdentity.revision,
+      artifactHash: artifactIdentity.artifactHash,
+      artifactPaths: artifactIdentity.artifactPaths,
+    };
+    const approvalLease = {
+      schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+      leaseId: "lease-e2e-plan-reload",
+      sessionKey,
+      sessionEpoch,
+      planTurnId: turnId,
+      reviewRunId,
+      requestId,
+      planRevision: artifactIdentity.revision,
+      artifactHash: artifactIdentity.artifactHash,
+      artifactPaths: artifactIdentity.artifactPaths,
+      approvedAt: now - 2_000,
+      approvalTurnId: turnId,
+      approvalRunId: reviewRunId,
+      approvalDecisionKind: "action_decision" as const,
+    };
+    const approvalDecision = {
+      sessionKey,
+      sessionEpoch,
+      turnId,
+      runId: reviewRunId,
+      requestId,
+      kind: "action_decision" as const,
+    };
+    const executionRunId = "run-e2e-plan-reload-execution-1";
+    const executionLeaseId = "execution-lease-e2e-plan-reload-1";
+    const executionInstructionHash = buildPlanExecutionInstructionHash(
+      "继续执行已批准计划的剩余任务。",
+    );
+    const executionLease = {
+      schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+      executionLeaseId,
+      approvalLeaseId: approvalLease.leaseId,
+      sessionKey,
+      sessionEpoch,
+      planTurnId: turnId,
+      executionTurnId: turnId,
+      executionRunId,
+      parentRunId: reviewRunId,
+      attempt: 1,
+      issuedAt: now - 3_000,
+      reason: "initial_approval" as const,
+      instructionHash: executionInstructionHash,
+      authorization: approvalDecision,
+    };
+    const executionOwner = {
+      turnId,
+      runId: executionRunId,
+      parentRunId: reviewRunId,
+      attempt: 1,
+      startedAt: now - 2_000,
+    };
+    let planLifecycle = createPlanLifecycleState({
+      sessionKey,
+      sessionEpoch,
+      updatedAt: now - 6_000,
+    });
+    const drafting = reducePlanLifecycle(planLifecycle, {
+      type: "start_drafting",
+      expectedVersion: planLifecycle.version,
+      at: now - 5_000,
+      planTurnId: turnId,
+      artifactIdentity,
+    });
+    if (drafting.disposition === "rejected") return undefined;
+    planLifecycle = drafting.state;
+    const review = reducePlanLifecycle(planLifecycle, {
+      type: "request_review",
+      expectedVersion: planLifecycle.version,
+      at: now - 4_000,
+      artifactIdentity,
+      reviewIdentity,
+    });
+    if (review.disposition === "rejected") return undefined;
+    planLifecycle = review.state;
+    const approved = reducePlanLifecycle(planLifecycle, {
+      type: "approve",
+      expectedVersion: planLifecycle.version,
+      at: now - 3_000,
+      expectedReviewIdentity: reviewIdentity,
+      decisionIdentity: approvalDecision,
+      lease: approvalLease,
+      executionLease,
+    });
+    if (approved.disposition === "rejected") return undefined;
+    planLifecycle = approved.state;
+    const started = reducePlanLifecycle(planLifecycle, {
+      type: "execution_started",
+      expectedVersion: planLifecycle.version,
+      at: now - 2_000,
+      executionLeaseId,
+      instructionHash: executionInstructionHash,
+      execution: executionOwner,
+    });
+    if (started.disposition === "rejected") return undefined;
+    planLifecycle = started.state;
+    const paused = reducePlanLifecycle(planLifecycle, {
+      type: "pause",
+      expectedVersion: planLifecycle.version,
+      at: now - 1_000,
+      expectedExecutionLeaseId: executionLeaseId,
+      expectedExecution: executionOwner,
+      pause: {
+        reason: "e2e_reload_checkpoint",
+        resultKind: "partial",
+        resumeCondition: "explicit_user_resume",
+      },
+    });
+    if (paused.disposition === "rejected") return undefined;
+    planLifecycle = paused.state;
 
     if (!hadSeededBefore) {
       incrementSeedCount(PLAN_RELOAD_RESUME_SCENARIO);
@@ -1080,6 +1255,7 @@ function seedPlanReloadResumeScenario() {
         [workspace]: [
           {
             id: sessionId,
+            planLifecycleEpoch: sessionEpoch,
             title: "E2E Plan Reload Resume",
             date: new Date(now).toISOString(),
             active: true,
@@ -1104,43 +1280,24 @@ function seedPlanReloadResumeScenario() {
           userPrompt: "这个方案已经批准了，请继续把剩余任务做完。",
           title: "重载恢复执行回归流",
           mode: "plan",
-          status: "executing",
+          status: "paused",
           summary: "已恢复到执行阶段，等待继续完成剩余任务。",
           blockIds: [userBlockId, agentBlockId],
           collapsed: false,
           createdAt: now,
+          runtimeOutcome: {
+            status: "paused",
+            reason: "e2e_reload_checkpoint",
+            resultKind: "partial",
+            pauseKind: "recoverable",
+            runId: executionRunId,
+            parentRunId: reviewRunId,
+            updatedAt: now - 1_000,
+          },
         },
       ],
       currentTurnId: turnId,
-      planArtifacts: [
-        {
-          kind: "requirements",
-          path: ".MAIN/plans/requirements.md",
-          title: "Requirements",
-          updatedAt: now - 3_000,
-          content: "# Requirements\n\n- 批准后应允许继续执行剩余任务。\n",
-        },
-        {
-          kind: "design",
-          path: ".MAIN/plans/plan.md",
-          title: "Design",
-          updatedAt: now - 2_000,
-          content: "# Design\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
-        },
-        {
-          kind: "tasks",
-          path: ".MAIN/plans/tasks.md",
-          title: "Tasks",
-          updatedAt: now - 1_000,
-          content: [
-            "# Tasks",
-            "",
-            "- [x] 恢复计划工作区状态",
-            "- [ ] 恢复对话与执行任务进度",
-            "- [ ] 继续执行并完成收尾",
-          ].join("\n"),
-        },
-      ],
+      planArtifacts,
       planTasks: [
         { id: "reload-task-1", text: "恢复计划工作区状态", status: "completed", evidenceStatus: "satisfied" },
         { id: "reload-task-2", text: "恢复对话与执行任务进度", status: "in_progress" },
@@ -1155,6 +1312,7 @@ function seedPlanReloadResumeScenario() {
         createdAt: now,
       }],
       planExecutionEvidenceCount: 1,
+      planLifecycle,
       planStage: "executing",
       isPlanApproved: true,
       showPlanPanel: true,
@@ -1206,6 +1364,7 @@ function seedAwaitingChoiceScenario() {
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const workspace = "/tmp/e2e-awaiting-choice";
   const runId = "run-e2e-awaiting-choice";
+  const sessionEpoch = "plan-session-e2e-awaiting-choice";
   const request = {
     ...buildUserChoiceActionRequest({
       sessionKey: `${workspace}:${sessionId}`,
@@ -1225,15 +1384,19 @@ function seedAwaitingChoiceScenario() {
       ...state.config,
       language: "zh",
       workflowMode: "plan",
+      sessionRecordingEnabled: false,
     },
     currentWorkspace: workspace,
     sessionsByWorkspace: {
       "/tmp/e2e-awaiting-choice": [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E Awaiting Choice",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -8202,9 +8365,51 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
   if (getScenarioName() !== PLAN_RELOAD_RESUME_SCENARIO) return null;
 
   return async () => {
+    const state = useAppStore.getState();
+    const approvalLease = state.planLifecycle.approvalLease;
+    const priorOwner = state.planLifecycle.execution || (approvalLease
+      ? {
+          turnId: approvalLease.approvalTurnId,
+          runId: approvalLease.approvalRunId,
+        }
+      : null);
+    if (!approvalLease || !priorOwner) return false;
+    const issuedAt = Date.now();
+    const instruction = "继续执行已批准计划的剩余任务。";
+    const issued = issuePlanExplicitResumeAttempt({
+      lifecycle: state.planLifecycle,
+      instruction,
+      executionRunId: "run-e2e-plan-reload-execution-2",
+      executionLeaseId: "execution-lease-e2e-plan-reload-2",
+      authorization: {
+        kind: "action_decision",
+        turnId: priorOwner.turnId,
+        runId: priorOwner.runId,
+        requestId: "request-e2e-plan-reload-resume",
+      },
+      issuedAt,
+    });
+    if (!issued.ok) return false;
+    const executionOwner = {
+      turnId: issued.handoff.executionTurnId,
+      runId: issued.handoff.executionRunId,
+      parentRunId: issued.handoff.parentRunId,
+      attempt: issued.handoff.executionAttempt,
+      startedAt: issuedAt + 1,
+    };
+    const started = reducePlanLifecycle(issued.lifecycle, {
+      type: "execution_started",
+      expectedVersion: issued.lifecycle.version,
+      at: issuedAt + 1,
+      executionLeaseId: issued.handoff.executionLeaseId,
+      instructionHash: issued.handoff.executionInstructionHash,
+      execution: executionOwner,
+    });
+    if (started.disposition === "rejected") return false;
     appendBridgeEvent("resume-requested");
     useAppStore.setState((state) => ({
       ...state,
+      planLifecycle: started.state,
       agentStatus: "running",
       isGenerating: true,
       showPlanPanel: true,
@@ -8212,10 +8417,45 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
       showTerminal: false,
       showFilePanel: false,
       rightPanelTab: "plan",
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === executionOwner.turnId
+          ? { ...turn, status: "executing", runtimeOutcome: undefined }
+          : turn
+      ),
     }));
 
     window.setTimeout(() => {
+      const latest = useAppStore.getState();
+      const lifecycle = latest.planLifecycle;
+      if (!lifecycle.executionLease || !lifecycle.execution) return;
+      const completedAt = Date.now();
+      const completed = reducePlanLifecycle(lifecycle, {
+        type: "complete",
+        expectedVersion: lifecycle.version,
+        at: completedAt,
+        expectedExecutionLeaseId: lifecycle.executionLease.executionLeaseId,
+        expectedExecution: lifecycle.execution,
+      });
+      if (completed.disposition === "rejected") return;
       finishPlanExecution("恢复执行完成，剩余任务已全部收尾。", "页面重载后的 Plan 已成功恢复，并顺利完成剩余任务。");
+      useAppStore.setState((current) => ({
+        planLifecycle: completed.state,
+        conversationTurns: current.conversationTurns.map((turn) =>
+          turn.id === executionOwner.turnId
+            ? {
+                ...turn,
+                runtimeOutcome: {
+                  status: "completed",
+                  reason: "e2e_plan_reload_completed",
+                  resultKind: "success",
+                  runId: executionOwner.runId,
+                  parentRunId: executionOwner.parentRunId,
+                  updatedAt: completedAt,
+                },
+              }
+            : turn
+        ),
+      }));
       appendBridgeEvent("completed");
     }, 80);
 

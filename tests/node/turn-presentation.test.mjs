@@ -143,6 +143,7 @@ test("canonical runtime outcomes own terminal presentation semantics", () => {
     ["partial", "partial", "partial", "Partially completed"],
     ["blocked", "blocked", "blocked", "Blocked"],
     ["error", "error", "error", "Error"],
+    ["canceled", "canceled", "canceled", "Canceled"],
   ];
 
   for (const [resultKind, lifecycle, kind, statusLabel] of terminalCases) {
@@ -173,7 +174,7 @@ test("canonical runtime outcomes own terminal presentation semantics", () => {
     assert.equal(model.actionKind, undefined);
   }
 
-  const canceled = buildTurnPresentationModel({
+  const legacyCanceled = buildTurnPresentationModel({
     language: "en",
     turn: turn({
       status: "executing",
@@ -189,8 +190,15 @@ test("canonical runtime outcomes own terminal presentation semantics", () => {
     statusOverride: "paused",
   });
   assert.deepEqual(
-    [canceled.status, canceled.lifecycle, canceled.kind, canceled.statusLabel, canceled.resultKind],
-    ["canceled", "canceled", "canceled", "Canceled", "canceled"],
+    [
+      legacyCanceled.status,
+      legacyCanceled.lifecycle,
+      legacyCanceled.kind,
+      legacyCanceled.statusLabel,
+      legacyCanceled.resultKind,
+      legacyCanceled.outcomeStatus,
+    ],
+    ["canceled", "canceled", "canceled", "Canceled", "canceled", "aborted"],
   );
 });
 

@@ -47,12 +47,13 @@ import {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
   appendRuntimeEventWithResult,
+  isRunBoundaryEvent,
   isRunTerminalEvent,
   isTerminalTurnEvent,
   withEventSchema,
   type MainThreadProgressUpdate,
 } from "../turnEvents";
-import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
+import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind, projectAgentLoopStatusToConversationTurnRuntimeStatus } from "../workflowModels";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
   buildChatMaxIterationsResumePrompt,
@@ -5134,7 +5135,36 @@ export class WorkflowEngine {
             const summary = projectedState.conversationTurns.find((candidate: any) =>
               terminalTurnIds.has(candidate.id)
             )?.summary || outcome.reason;
-            const runTerminalEvent = outcome.status === "completed"
+            const runBoundaryEvent = outcome.status === "aborted"
+              ? withEventSchema({
+                  type: "run.aborted",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  ...(terminalRunIdentity.goalSliceId
+                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
+                    : {}),
+                  reason: outcome.reason,
+                  message: summary,
+                })
+              : outcome.status === "paused"
+              ? withEventSchema({
+                  type: "run.paused",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  ...(terminalRunIdentity.goalSliceId
+                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
+                    : {}),
+                  reason: outcome.reason,
+                  message: summary,
+                })
+              : null;
+            const runConclusionEvent = outcome.status === "completed"
               ? withEventSchema({
                   type: "run.completed",
                   threadId: runSessionKey,
@@ -5150,7 +5180,7 @@ export class WorkflowEngine {
                 })
               : outcome.status === "aborted"
               ? withEventSchema({
-                  type: "run.aborted",
+                  type: "run.completed",
                   threadId: runSessionKey,
                   turnId,
                   timestampMs,
@@ -5159,35 +5189,26 @@ export class WorkflowEngine {
                   ...(terminalRunIdentity.goalSliceId
                     ? { goalSliceId: terminalRunIdentity.goalSliceId }
                     : {}),
-                  reason: outcome.reason,
-                  message: summary,
+                  resultKind: "canceled",
+                  summary,
                 })
-              : withEventSchema({
-                  type: "run.paused",
-                  threadId: runSessionKey,
+              : null;
+            const runLifecycleEvents = [runBoundaryEvent, runConclusionEvent]
+              .filter((event): event is NonNullable<typeof event> => !!event);
+            let validatedRuntimeEvents = projectedState.runtimeEvents;
+            for (const event of runLifecycleEvents) {
+              const append = appendRuntimeEventWithResult(validatedRuntimeEvents, event);
+              if (append.disposition === "conflict") {
+                logStoreEvent("terminal_run_projection_conflict", {
+                  sessionKey: runSessionKey,
                   turnId,
-                  timestampMs,
                   runId: terminalRunIdentity.runId,
-                  parentRunId: terminalRunIdentity.parentRunId,
-                  ...(terminalRunIdentity.goalSliceId
-                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
-                    : {}),
-                  reason: outcome.reason,
-                  message: summary,
+                  requestedType: event.type,
+                  existingType: append.existingEvent?.type || null,
                 });
-            const runAppend = appendRuntimeEventWithResult(
-              projectedState.runtimeEvents,
-              runTerminalEvent,
-            );
-            if (runAppend.disposition === "conflict") {
-              logStoreEvent("terminal_run_projection_conflict", {
-                sessionKey: runSessionKey,
-                turnId,
-                runId: terminalRunIdentity.runId,
-                requestedType: runTerminalEvent.type,
-                existingType: runAppend.existingEvent?.type || null,
-              });
-              return false;
+                return false;
+              }
+              validatedRuntimeEvents = append.events;
             }
             const turnTerminalEvent = closesLogicalTurn
               ? withEventSchema({
@@ -5199,7 +5220,7 @@ export class WorkflowEngine {
                 })
               : null;
             if (turnTerminalEvent) {
-              const turnAppend = appendRuntimeEventWithResult(runAppend.events, turnTerminalEvent);
+              const turnAppend = appendRuntimeEventWithResult(validatedRuntimeEvents, turnTerminalEvent);
               if (turnAppend.disposition === "conflict") {
                 logStoreEvent("terminal_turn_projection_conflict", {
                   sessionKey: runSessionKey,
@@ -5213,10 +5234,13 @@ export class WorkflowEngine {
 
             let planTerminalProjectionRejected = false;
             draft.set((state: any) => {
-              let nextState = reduceRunTransition(state, {
-                type: "runtime_event",
-                event: runTerminalEvent,
-              });
+              let nextState = state;
+              for (const event of runLifecycleEvents) {
+                nextState = reduceRunTransition(nextState, {
+                  type: "runtime_event",
+                  event,
+                });
+              }
               if (turnTerminalEvent) {
                 nextState = reduceRunTransition(nextState, {
                   type: "runtime_event",
@@ -5315,7 +5339,7 @@ export class WorkflowEngine {
                         status: isIntentionalActionPause ? candidate.status : terminalTurnStatus,
                         collapsed: false,
                         runtimeOutcome: {
-                          status: outcome.status,
+                          status: projectAgentLoopStatusToConversationTurnRuntimeStatus(outcome.status),
                           reason: outcome.reason,
                           ...(outcome.status === "completed"
                             ? { resultKind: outcome.resultKind }
@@ -6442,13 +6466,13 @@ export class WorkflowEngine {
         };
       }
       const preTerminalRunId = activeRuntimeRunIdentity.runId;
-      const preTerminalEvent = [...sessionGet().runtimeEvents].reverse().find((event: any) =>
-        isRunTerminalEvent(event) &&
+      const preConclusionLifecycleEvent = [...sessionGet().runtimeEvents].reverse().find((event: any) =>
+        (isRunTerminalEvent(event) || isRunBoundaryEvent(event)) &&
         event.threadId === runSessionKey &&
         event.turnId === turnId &&
         event.runId === preTerminalRunId
       );
-      if (loopOutcome.status !== "paused" && preTerminalEvent?.type === "run.paused") {
+      if (loopOutcome.status !== "paused" && preConclusionLifecycleEvent?.type === "run.paused") {
         if (!beginTerminalConclusionRun(preTerminalRunId, loopOutcome.reason)) {
           // A canonical cancellation or a newer run already owns closure. A
           // stale workflow must not append an unowned child run.
@@ -6674,8 +6698,8 @@ export class WorkflowEngine {
       return true;
     }).catch(async (err: any) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      const alreadyCommittedTerminal = sessionGet().runtimeEvents.find((event: any) =>
-        isRunTerminalEvent(event) &&
+      const alreadyCommittedRunLifecycleEvent = sessionGet().runtimeEvents.find((event: any) =>
+        (isRunTerminalEvent(event) || isRunBoundaryEvent(event)) &&
         event.threadId === runSessionKey &&
         event.turnId === turnId &&
         event.runId === activeRuntimeRunIdentity.runId
@@ -6686,7 +6710,7 @@ export class WorkflowEngine {
         event.turnId === turnId
       );
       if (
-        alreadyCommittedTerminal &&
+        alreadyCommittedRunLifecycleEvent &&
         alreadyCommittedTurn &&
         sessionGet().harnessRunMarker?.status !== "running"
       ) {
@@ -6694,14 +6718,14 @@ export class WorkflowEngine {
           sessionKey: runSessionKey,
           turnId,
           runId: activeRuntimeRunIdentity.runId,
-          terminalType: alreadyCommittedTerminal.type,
+          lifecycleEventType: alreadyCommittedRunLifecycleEvent.type,
           error: errorMessage,
         });
         return false;
       }
       const catchLifecycle = sessionGet().planLifecycle as PlanLifecycleState | undefined;
       const preservesRejectedPlanActionPause =
-        alreadyCommittedTerminal?.type === "run.paused" &&
+        alreadyCommittedRunLifecycleEvent?.type === "run.paused" &&
         !!rejectedPlanActionContinuationIdentity &&
         catchLifecycle?.status === "paused" &&
         catchLifecycle.pause?.reason === "plan_action_continuation_admission_rejected" &&
@@ -6760,7 +6784,7 @@ export class WorkflowEngine {
         });
         return !pauseProjection.committed;
       }
-      if (alreadyCommittedTerminal?.type === "run.paused") {
+      if (alreadyCommittedRunLifecycleEvent?.type === "run.paused") {
         beginTerminalConclusionRun(
           activeRuntimeRunIdentity.runId,
           "terminal_error_after_paused_run",

@@ -201,7 +201,7 @@ test("pending review transition closes the superseded source turn as canceled", 
   assert.equal(state.activeActionRequest, null);
   assert.equal(state.conversationTurns[0].status, "done");
   assert.deepEqual(state.conversationTurns[0].runtimeOutcome, {
-    status: "aborted",
+    status: "completed",
     reason: "superseded_by_new_user_turn",
     resultKind: "canceled",
     runId: "run-review-1",
@@ -223,6 +223,7 @@ test("pending review transition closes the superseded source turn as canceled", 
         resultKind: undefined,
         reason: "superseded_by_new_user_turn",
       },
+      { type: "run.completed", runId: "run-review-1", resultKind: "canceled", reason: undefined },
       { type: "turn.completed", runId: undefined, resultKind: "canceled", reason: undefined },
     ],
   );

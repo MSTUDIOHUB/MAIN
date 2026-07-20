@@ -56,6 +56,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeProgressLedger.ts"));
 const {
   withEventSchema,
+  normalizePersistedMainThreadEvent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
 test("runtime progress ledger keeps an approved child run separate from its parent plan-review pause", () => {
@@ -669,12 +670,13 @@ test("run status projection keeps cache-only stubs out of current activity and m
   assert.equal(projection.healthSignals[0].kind, "repetition");
 });
 
-test("newer canonical and legacy terminal states override older running activity", () => {
+test("canonical conclusions and nonterminal boundaries override older running activity", () => {
   for (const terminal of [
     "completed",
     "partial_conclusion",
     "blocked_conclusion",
     "error_conclusion",
+    "canceled_conclusion",
     "paused",
     "aborted",
     "legacy_failed",
@@ -700,6 +702,7 @@ test("newer canonical and legacy terminal states override older running activity
       "partial_conclusion",
       "blocked_conclusion",
       "error_conclusion",
+      "canceled_conclusion",
     ].includes(terminal)
       ? withEventSchema({
           type: "run.completed",
@@ -714,6 +717,8 @@ test("newer canonical and legacy terminal states override older running activity
             ? "blocked"
             : terminal === "error_conclusion"
             ? "error"
+            : terminal === "canceled_conclusion"
+            ? "canceled"
             : "success",
           summary: "All runtime evidence is complete.",
         })
@@ -739,7 +744,7 @@ test("newer canonical and legacy terminal states override older running activity
           reason: "user_cancelled",
           message: "The user canceled this run.",
         })
-      : withEventSchema({
+      : normalizePersistedMainThreadEvent({
           type: "run.failed",
           threadId: "thread-terminal",
           turnId: `turn-${terminal}`,
@@ -762,7 +767,8 @@ test("newer canonical and legacy terminal states override older running activity
       terminal === "partial_conclusion" ||
       terminal === "blocked_conclusion" ||
       terminal === "error_conclusion" ||
-      terminal === "aborted"
+      terminal === "canceled_conclusion" ||
+      terminal === "legacy_failed"
     ) {
       assert.ok(projection.milestones.some((item) => item.status === "completed"));
       assert.match(
@@ -773,7 +779,9 @@ test("newer canonical and legacy terminal states override older running activity
           ? /受阻结论/
           : terminal === "error_conclusion"
           ? /错误结论/
-          : terminal === "aborted"
+          : terminal === "legacy_failed"
+          ? /错误结论/
+          : terminal === "canceled_conclusion"
           ? /运行已取消/
           : /运行已完成/,
       );
@@ -783,7 +791,9 @@ test("newer canonical and legacy terminal states override older running activity
         `${terminal} is a closed conclusion, not an app-level failed or paused state`,
       );
     } else {
-      assert.ok(projection.healthSignals.some((signal) => signal.kind === (terminal === "paused" ? "pause" : "failure")));
+      assert.deepEqual(projection.milestones, []);
+      assert.ok(projection.healthSignals.some((signal) => signal.kind === "pause"));
+      assert.match(projection.activityText, terminal === "paused" ? /运行已暂停/ : /运行取消中/);
     }
     assert.doesNotMatch(projection.activityText, /正在读取 App\.tsx/);
   }

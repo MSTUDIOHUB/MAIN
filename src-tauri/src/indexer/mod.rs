@@ -102,8 +102,8 @@ impl RepositoryIndexer {
         tokio::fs::write(&path, json)
             .await
             .map_err(|error| format!("写入 repository index 失败 {}: {error}", path.display()))?;
-        let repo_map_json = serde_json::to_vec(&index)
-            .map_err(|error| format!("序列化 repo_map 失败: {error}"))?;
+        let repo_map_json =
+            serde_json::to_vec(&index).map_err(|error| format!("序列化 repo_map 失败: {error}"))?;
         tokio::fs::write(&repo_map_path, repo_map_json)
             .await
             .map_err(|error| format!("写入 repo_map 失败 {}: {error}", repo_map_path.display()))?;
@@ -341,11 +341,11 @@ fn extract_calls(relative: &str, path: &Path, content: &str) -> Vec<CallEdge> {
         return Vec::new();
     }
 
-    let call_regex = Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(")
-        .expect("static call regex must compile");
+    let call_regex =
+        Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(").expect("static call regex must compile");
     let skip: HashSet<&str> = [
-        "if", "for", "while", "switch", "catch", "function", "return", "typeof", "sizeof",
-        "match", "loop", "async", "await", "def", "class", "new",
+        "if", "for", "while", "switch", "catch", "function", "return", "typeof", "sizeof", "match",
+        "loop", "async", "await", "def", "class", "new",
     ]
     .into_iter()
     .collect();

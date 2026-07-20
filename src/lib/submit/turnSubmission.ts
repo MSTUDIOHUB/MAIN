@@ -62,6 +62,7 @@ import {
   type PlanStateHydrationReason,
 } from "../planStateHydration";
 import {
+  isConversationTurnRuntimeClosed,
   isGenericConversationTitle,
   normalizeConversationDisplayTitle,
   resolveTurnResponseLanguage,
@@ -1424,8 +1425,7 @@ export function resolveSubmitExistingTurnAdoptionDecision(params: {
   const matchingTurn = matchingTurns[0];
   if (
     CLOSED_SUBMIT_ADOPTION_TURN_STATUSES.has(matchingTurn.status) ||
-    matchingTurn.runtimeOutcome?.status === "completed" ||
-    matchingTurn.runtimeOutcome?.status === "aborted"
+    isConversationTurnRuntimeClosed(matchingTurn.runtimeOutcome)
   ) {
     return rejectSubmitExistingTurnAdoption({
       reason: "turn_closed",
@@ -2667,7 +2667,6 @@ export function buildSubmitVisibleTurnPatch(
           ...turn,
           ...(isAdoptedTurn
             ? {
-                userPrompt: params.text,
                 title: params.turnTitle,
               }
             : {}),
@@ -3274,8 +3273,7 @@ export function resolveSubmitTurnReuseDecision(input: {
       event.turnId === requestedReuseTurn.id
     );
   const requestedTurnIsClosed = requestedTurnHasTerminalEvent ||
-    requestedReuseTurn?.runtimeOutcome?.status === "completed" ||
-    requestedReuseTurn?.runtimeOutcome?.status === "aborted";
+    isConversationTurnRuntimeClosed(requestedReuseTurn?.runtimeOutcome);
   const reusableTurnId = requestedReuseTurn && !requestedTurnIsClosed
     ? requestedReuseTurn.id
     : null;

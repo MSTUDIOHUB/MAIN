@@ -108,6 +108,10 @@ export interface ReconcileWorkspaceTurnQueueOnRestoreInput {
   readonly sessionKey: string;
   readonly sessionEpoch: string;
   readonly terminalOwners?: readonly WorkspaceTurnTerminalOwner[];
+  /** Exact nonterminal Turns already adopted by a resumable runtime owner. */
+  readonly adoptedOwners?: readonly WorkspaceTurnTerminalOwner[];
+  /** Exact poisoned receipts represented by a separate visible recovery Turn. */
+  readonly recoveryOwners?: readonly WorkspaceTurnTerminalOwner[];
   readonly at?: number;
 }
 
@@ -352,6 +356,16 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/** Canonical immutable instruction+receipt identity used at every dequeue CAS. */
+export function buildWorkspaceTurnQueueEntryIdentity(
+  entry: Pick<WorkspaceTurnQueueEntry, "instruction" | "receipt">,
+): string {
+  return canonicalJson({
+    instruction: entry.instruction,
+    receipt: entry.receipt,
+  });
+}
+
 function instructionsEqual(left: WorkspaceInstruction, right: WorkspaceInstruction): boolean {
   return canonicalJson(left) === canonicalJson(right);
 }
@@ -593,7 +607,11 @@ export function reduceWorkspaceTurnQueue(
       if (!turnOwner ||
         turnOwner.sessionKey !== command.sessionKey ||
         turnOwner.sessionEpoch !== command.sessionEpoch ||
-        turnOwner.turnId !== head.receipt.turnId
+        turnOwner.turnId !== head.receipt.turnId ||
+        turnOwner.receiptId !== head.receipt.receiptId ||
+        turnOwner.clientSubmissionId !== head.instruction.clientSubmissionId ||
+        turnOwner.instructionEnvelopeIdentity !==
+          buildWorkspaceTurnQueueEntryIdentity(head)
       ) return rejected(state, "terminal_owner_mismatch", head);
       return applied(state, command.at, Object.freeze(state.entries.slice(1)), head);
     }
@@ -689,7 +707,10 @@ function isTerminalOwner(
   return terminalOwners.some((owner) =>
     owner.sessionKey === entry.receipt.sessionKey &&
     owner.sessionEpoch === entry.receipt.sessionEpoch &&
-    owner.turnId === entry.receipt.turnId
+    owner.turnId === entry.receipt.turnId &&
+    owner.receiptId === entry.receipt.receiptId &&
+    owner.clientSubmissionId === entry.instruction.clientSubmissionId &&
+    owner.instructionEnvelopeIdentity === buildWorkspaceTurnQueueEntryIdentity(entry)
   );
 }
 
@@ -723,10 +744,18 @@ export function reconcileWorkspaceTurnQueueOnRestore(
     });
   }
 
-  const terminalOwners = (input.terminalOwners || []).filter((owner) =>
-    owner && isRequiredIdentityPart(owner.sessionKey) &&
-    isRequiredIdentityPart(owner.sessionEpoch) && isRequiredIdentityPart(owner.turnId)
-  );
+  const normalizeOwners = (owners: readonly WorkspaceTurnTerminalOwner[] | undefined) =>
+    (owners || []).filter((owner) =>
+      owner && isRequiredIdentityPart(owner.sessionKey) &&
+      isRequiredIdentityPart(owner.sessionEpoch) &&
+      isRequiredIdentityPart(owner.turnId) &&
+      isRequiredIdentityPart(owner.receiptId) &&
+      isRequiredIdentityPart(owner.clientSubmissionId) &&
+      isRequiredIdentityPart(owner.instructionEnvelopeIdentity)
+    );
+  const terminalOwners = normalizeOwners(input.terminalOwners);
+  const adoptedOwners = normalizeOwners(input.adoptedOwners);
+  const recoveryOwners = normalizeOwners(input.recoveryOwners);
   const entries: WorkspaceTurnQueueEntry[] = [];
   const seenSubmissionIds = new Set<string>();
   let changed = false;
@@ -742,7 +771,11 @@ export function reconcileWorkspaceTurnQueueOnRestore(
       continue;
     }
     seenSubmissionIds.add(normalized.instruction.clientSubmissionId);
-    if (isTerminalOwner(normalized, terminalOwners)) {
+    if (
+      isTerminalOwner(normalized, terminalOwners) ||
+      isTerminalOwner(normalized, adoptedOwners) ||
+      isTerminalOwner(normalized, recoveryOwners)
+    ) {
       changed = true;
       continue;
     }

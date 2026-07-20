@@ -33,6 +33,36 @@ export class ProjectSessionStaleWriteFencedError extends Error {
   }
 }
 
+export const DEFAULT_PROJECT_SESSION_SAVE_SETTLEMENT_TIMEOUT_MS = 5_000;
+const DEFAULT_PROJECT_SESSION_DEADLINE_LEAD_MS = 100;
+
+export class ProjectSessionSaveTimedOutError extends Error {
+  readonly code = "project_session_save_timed_out";
+  readonly ownerKey: string;
+  readonly mutationDeadlineMs: number;
+
+  constructor(ownerKey: string, mutationDeadlineMs: number) {
+    super("Project Session persistence exceeded its bounded mutation lease.");
+    this.name = "ProjectSessionSaveTimedOutError";
+    this.ownerKey = ownerKey;
+    this.mutationDeadlineMs = mutationDeadlineMs;
+  }
+}
+
+export interface ProjectSessionSaveLease {
+  /**
+   * Rust must reject the CAS transaction if it cannot commit before this
+   * timestamp. The JavaScript owner queue settles only after this deadline,
+   * so a timed-out write cannot cross a later save/delete/clear mutation.
+   */
+  mutationDeadlineMs: number;
+  /**
+   * A previous mutation had an ambiguous response. The next writer must read
+   * the authoritative Rust revision before selecting its expected CAS value.
+   */
+  revisionReconciliationRequired: boolean;
+}
+
 export interface ProjectSessionSaveOptions {
   /**
    * Evaluated only after this owner reaches the head of its mutation queue.
@@ -40,6 +70,13 @@ export interface ProjectSessionSaveOptions {
    * older debounced save is waiting behind another durable mutation.
    */
   isCurrent?: () => boolean;
+  /** Primarily exposed for deterministic tests; production uses the default. */
+  settlementTimeoutMs?: number;
+}
+
+export interface ProjectSessionMutationCoordinatorOptions {
+  saveSettlementTimeoutMs?: number;
+  deadlineLeadMs?: number;
 }
 
 /**
@@ -62,7 +99,11 @@ export function isProjectSessionAdmissionProjectionOwned(
 }
 
 export interface ProjectSessionMutationCoordinator {
-  save<T>(ownerKey: string, task: () => Promise<T>, options?: ProjectSessionSaveOptions): Promise<T>;
+  save<T>(
+    ownerKey: string,
+    task: (lease: ProjectSessionSaveLease) => Promise<T>,
+    options?: ProjectSessionSaveOptions,
+  ): Promise<T>;
   delete<T>(ownerKey: string, task: () => Promise<T>): Promise<T>;
   clear<T>(workspaceKey: string, ownerKeys: readonly string[], task: () => Promise<T>): Promise<T>;
   isDeleteFenced(ownerKey: string): boolean;
@@ -90,19 +131,67 @@ interface ActiveWorkspaceClear {
 
 /**
  * Serialize durable mutations for one Project Session and fence stale saves as
- * soon as deletion is requested. An already-running save may finish, but the
- * shared owner queue guarantees that deletion runs after it. Saves that have
- * not started are rejected by the fence before they reach IPC.
+ * soon as deletion is requested. Each save receives a Rust-enforced mutation
+ * deadline that closes before its bounded JavaScript queue lease releases;
+ * deletion therefore runs only after the old writer can no longer commit.
+ * Saves that have not started are rejected before they reach IPC.
  */
 export function createProjectSessionMutationCoordinator(
   queue: KeyedAsyncQueue = createKeyedAsyncQueue(),
+  options: ProjectSessionMutationCoordinatorOptions = {},
 ): ProjectSessionMutationCoordinator {
   const ownerFenceClaims = new Map<string, Set<string>>();
   const activeDeletes = new Map<string, Promise<unknown>>();
   const activeWorkspaceClears = new Map<string, ActiveWorkspaceClear>();
   const knownOwnersByWorkspace = new Map<string, Set<string>>();
   const workspaceMutations = new Map<string, Set<Promise<unknown>>>();
+  const mutationGenerationByOwner = new Map<string, number>();
+  const uncertainRevisionGenerationByOwner = new Map<string, number>();
+  const authoritativeRevisionGenerationByOwner = new Map<string, number>();
   let fenceSequence = 0;
+
+  const normalizeTimeoutMs = (value: unknown): number => {
+    const configured = Number(value);
+    return Number.isFinite(configured)
+      ? Math.max(1, Math.min(60_000, Math.trunc(configured)))
+      : DEFAULT_PROJECT_SESSION_SAVE_SETTLEMENT_TIMEOUT_MS;
+  };
+  const defaultSaveSettlementTimeoutMs = normalizeTimeoutMs(
+    options.saveSettlementTimeoutMs,
+  );
+  const configuredDeadlineLeadMs = Number(options.deadlineLeadMs);
+  const deadlineLeadMs = Number.isFinite(configuredDeadlineLeadMs)
+    ? Math.max(0, Math.min(1_000, Math.trunc(configuredDeadlineLeadMs)))
+    : DEFAULT_PROJECT_SESSION_DEADLINE_LEAD_MS;
+  const nextMutationGeneration = (ownerKey: string): number => {
+    const generation = (mutationGenerationByOwner.get(ownerKey) || 0) + 1;
+    mutationGenerationByOwner.set(ownerKey, generation);
+    return generation;
+  };
+  const markRevisionUncertain = (ownerKey: string, generation: number) => {
+    // Once generation N has produced an authoritative CAS response, a late
+    // rejection from an older generation cannot make the owner uncertain
+    // again or force unrelated future saves through a stale recovery path.
+    if ((authoritativeRevisionGenerationByOwner.get(ownerKey) || 0) >= generation) {
+      return;
+    }
+    uncertainRevisionGenerationByOwner.set(
+      ownerKey,
+      Math.max(uncertainRevisionGenerationByOwner.get(ownerKey) || 0, generation),
+    );
+  };
+  const markMutationAuthoritative = (ownerKey: string, generation: number) => {
+    authoritativeRevisionGenerationByOwner.set(
+      ownerKey,
+      Math.max(authoritativeRevisionGenerationByOwner.get(ownerKey) || 0, generation),
+    );
+    const uncertainGeneration = uncertainRevisionGenerationByOwner.get(ownerKey) || 0;
+    // A late response from generation N must not clear uncertainty introduced
+    // by a newer timed-out generation N + 1.
+    if (uncertainGeneration > 0 && uncertainGeneration <= generation) {
+      uncertainRevisionGenerationByOwner.delete(ownerKey);
+    }
+  };
 
   const hasOwnerFence = (ownerKey: string) => (ownerFenceClaims.get(ownerKey)?.size || 0) > 0;
   const rememberOwner = (workspaceKey: string, ownerKey: string) => {
@@ -144,7 +233,7 @@ export function createProjectSessionMutationCoordinator(
   return {
     save<T>(
       ownerKey: string,
-      task: () => Promise<T>,
+      task: (lease: ProjectSessionSaveLease) => Promise<T>,
       options: ProjectSessionSaveOptions = {},
     ): Promise<T> {
       const normalizedOwnerKey = normalizeOwnerKey(ownerKey);
@@ -166,7 +255,58 @@ export function createProjectSessionMutationCoordinator(
         if (options.isCurrent && !options.isCurrent()) {
           throw new ProjectSessionStaleWriteFencedError();
         }
-        return task();
+        const generation = nextMutationGeneration(normalizedOwnerKey);
+        const settlementTimeoutMs = normalizeTimeoutMs(
+          options.settlementTimeoutMs ?? defaultSaveSettlementTimeoutMs,
+        );
+        // Close Rust's write window before the JavaScript queue releases. The
+        // small lead avoids timer jitter opening a delete/late-write race.
+        const effectiveLeadMs = Math.min(
+          deadlineLeadMs,
+          Math.max(0, settlementTimeoutMs - 1),
+        );
+        const mutationDeadlineMs = Date.now() + settlementTimeoutMs - effectiveLeadMs;
+        const lease: ProjectSessionSaveLease = {
+          mutationDeadlineMs,
+          revisionReconciliationRequired:
+            (uncertainRevisionGenerationByOwner.get(normalizedOwnerKey) || 0) > 0,
+        };
+        let taskPromise: Promise<T>;
+        try {
+          taskPromise = Promise.resolve(task(lease));
+        } catch (error) {
+          markRevisionUncertain(normalizedOwnerKey, generation);
+          throw error;
+        }
+
+        // Observe the underlying invoke even after the bounded queue lease has
+        // settled. Generation ordering prevents an older late response from
+        // clearing uncertainty owned by a newer mutation.
+        void taskPromise.then(
+          () => markMutationAuthoritative(normalizedOwnerKey, generation),
+          () => markRevisionUncertain(normalizedOwnerKey, generation),
+        );
+
+        return new Promise<T>((resolve, reject) => {
+          let settled = false;
+          const finish = (callback: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            callback();
+          };
+          const timer = setTimeout(() => finish(() => {
+            markRevisionUncertain(normalizedOwnerKey, generation);
+            reject(new ProjectSessionSaveTimedOutError(
+              normalizedOwnerKey,
+              mutationDeadlineMs,
+            ));
+          }), settlementTimeoutMs);
+          taskPromise.then(
+            (value) => finish(() => resolve(value)),
+            (error) => finish(() => reject(error)),
+          );
+        });
       });
       return trackWorkspaceMutation(workspaceKey, mutation);
     },

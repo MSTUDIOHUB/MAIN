@@ -466,7 +466,6 @@ export function buildRuntimeProgressLedger(input: {
       event.type === "run.paused" ||
       event.type === "run.completed" ||
       event.type === "run.aborted" ||
-      event.type === "run.failed" ||
       event.type === "harness.telemetry";
     if (activeRunId && isRunOwnedEvent && eventRunId !== activeRunId) continue;
     if (hasLivePlanExecution && event.type === "run.paused" && event.reason === "plan_review") continue;
@@ -496,6 +495,8 @@ export function buildRuntimeProgressLedger(input: {
     } else if (event.type === "run.completed") {
       const resultTitle = event.resultKind === "error"
         ? language === "zh" ? "运行已结束（错误结论）" : "Run concluded with an error"
+        : event.resultKind === "canceled"
+        ? language === "zh" ? "运行已取消" : "Run canceled"
         : event.resultKind === "blocked"
         ? language === "zh" ? "运行已结束（受阻结论）" : "Run concluded blocked"
         : event.resultKind === "partial"
@@ -517,23 +518,10 @@ export function buildRuntimeProgressLedger(input: {
       addItem(byKey, {
         key: `run-aborted:${eventRunId || event.turnId}`,
         runId: eventRunId,
-        phase: "completed",
-        title: language === "zh" ? "运行已取消" : "Run canceled",
-        status: "completed",
-        summary: compactLine(event.message || event.reason, 260),
-        target: "",
-        tool: "",
-        firstSeenAt: event.timestampMs,
-        lastSeenAt: event.timestampMs,
-      });
-    } else if (event.type === "run.failed") {
-      addItem(byKey, {
-        key: `run-failed:${eventRunId || event.turnId}`,
-        runId: eventRunId,
         phase: "blocked",
-        title: language === "zh" ? "运行失败" : "Run failed",
-        status: "failed",
-        summary: compactLine(event.error?.message || "", 260),
+        title: language === "zh" ? "运行取消中" : "Run cancellation requested",
+        status: "paused",
+        summary: compactLine(event.message || event.reason, 260),
         target: "",
         tool: "",
         firstSeenAt: event.timestampMs,

@@ -2605,11 +2605,7 @@ export default function ChatArea({
       const timestampMs = Number(event.timestampMs) || 0;
       if (
         event?.type === "turn.completed" ||
-        event?.type === "turn.failed" ||
-        event?.type === "run.completed" ||
-        event?.type === "run.aborted" ||
-        event?.type === "run.failed" ||
-        event?.type === "run.paused"
+        event?.type === "run.completed"
       ) {
         terminalAtByTurnId.set(turnId, Math.max(terminalAtByTurnId.get(turnId) || 0, timestampMs));
         continue;

@@ -42,8 +42,20 @@ test("runtime foundation validation assets are wired", async () => {
       assert.ok(jsonCases.length > 0, `benchmark/${category} should include at least one eval case`);
       const sample = JSON.parse(await fs.readFile(path.join(directory, jsonCases[0]), "utf8"));
       assert.equal(sample.category, category);
-      for (const field of ["success", "retries", "hallucinations", "latencyMs", "toolCalls"]) {
-        assert.ok(Object.hasOwn(sample, field), `${jsonCases[0]} should include ${field}`);
+      assert.equal(sample.schemaVersion, 1);
+      assert.ok(Array.isArray(sample.trace) && sample.trace.length > 0);
+      assert.equal(typeof sample.expect, "object");
+      for (const [index, record] of sample.trace.entries()) {
+        for (const field of ["sequence", "attempt", "eventName", "success", "resultKind", "latencyMs"]) {
+          assert.ok(Object.hasOwn(record, field), `${jsonCases[0]} trace[${index}] should include ${field}`);
+        }
+      }
+      for (const derivedField of ["success", "retries", "hallucinations", "latencyMs", "toolCalls"]) {
+        assert.equal(
+          Object.hasOwn(sample, derivedField),
+          false,
+          `${jsonCases[0]} must not supply derived metric ${derivedField}`,
+        );
       }
     }),
   );

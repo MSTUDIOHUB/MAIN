@@ -64,6 +64,7 @@ mod tests {
     fn critic_flags_missing_evidence() {
         let execution = TaskGraphExecution {
             graph_id: "g".to_string(),
+            run_id: "graph-run-test".to_string(),
             success: true,
             waves: vec![vec!["a".to_string()]],
             results: vec![TaskGraphStepResult {

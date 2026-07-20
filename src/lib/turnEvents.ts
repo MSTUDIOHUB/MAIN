@@ -22,6 +22,11 @@ export interface MainThreadError {
   message: string;
 }
 
+/** Persisted pre-v2 compatibility only. These events never enter live state. */
+export type LegacyFailedMainThreadEvent =
+  | { schemaVersion?: number; type: "turn.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError }
+  | ({ schemaVersion?: number; type: "run.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError } & MainThreadRunIdentity);
+
 export interface MainThreadHarnessTelemetry {
   name: string;
   details: Record<string, unknown>;
@@ -140,9 +145,6 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "thread.started"; threadId: string; timestampMs: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.started"; threadId: string; turnId: string; timestampMs: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.completed"; threadId: string; turnId: string; timestampMs: number; usage?: MainThreadUsage; resultKind?: TerminalResultKind }
-  // Read compatibility for persisted events; new application conclusions use
-  // turn.completed with resultKind="error".
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.started"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow" }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.completed"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow" }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.failed"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow"; error: MainThreadError }
@@ -180,9 +182,6 @@ export type MainThreadEvent =
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string; resultKind?: TerminalResultKind } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.aborted"; threadId: string; turnId: string; timestampMs: number; reason: string; message?: string } & MainThreadRunIdentity)
-  // Read compatibility for persisted events; new application conclusions use
-  // run.completed with resultKind="error".
-  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError } & MainThreadRunIdentity)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.started"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.updated"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.completed"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
@@ -206,6 +205,10 @@ export function normalizeToolFeedbackFormat(value: unknown, fallback: ToolFeedba
 }
 
 export function withEventSchema<T extends MainThreadEventInput>(event: T): MainThreadEvent {
+  const eventType = String((event as { type?: unknown }).type || "");
+  if (eventType === "turn.failed" || eventType === "run.failed") {
+    throw new Error(`${eventType} is a legacy persisted event; normalize it at the read boundary`);
+  }
   const normalizedEvent = event.type === "progress.updated"
     ? {
         ...event,
@@ -213,9 +216,45 @@ export function withEventSchema<T extends MainThreadEventInput>(event: T): MainT
       }
     : event;
   return {
-    schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     ...normalizedEvent,
+    // Persisted inputs can still carry a legacy schemaVersion at runtime even
+    // though MainThreadEventInput omits it statically. Write the live version
+    // last so a v1 payload cannot leak back into the v2 event stream.
+    schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
   } as MainThreadEvent;
+}
+
+/**
+ * Convert persisted legacy failure events into the sole application
+ * conclusion shape. Callers should perform their ordinary persisted-event
+ * validation before invoking this boundary helper.
+ */
+export function normalizePersistedMainThreadEvent(
+  event: MainThreadEventInput | LegacyFailedMainThreadEvent,
+): MainThreadEvent {
+  if (event.type === "turn.failed") {
+    return withEventSchema({
+      type: "turn.completed",
+      threadId: event.threadId,
+      turnId: event.turnId,
+      timestampMs: event.timestampMs,
+      resultKind: "error",
+    });
+  }
+  if (event.type === "run.failed") {
+    return withEventSchema({
+      type: "run.completed",
+      threadId: event.threadId,
+      turnId: event.turnId,
+      timestampMs: event.timestampMs,
+      runId: event.runId,
+      parentRunId: event.parentRunId,
+      ...(event.goalSliceId ? { goalSliceId: event.goalSliceId } : {}),
+      resultKind: "error",
+      summary: String(event.error?.message || "Persisted run error").trim() || "Persisted run error",
+    });
+  }
+  return withEventSchema(event);
 }
 
 export function appendRuntimeEvent(
@@ -240,7 +279,7 @@ function completedResultKind(
   return event.resultKind || "success";
 }
 
-function hasSameTerminalMeaning(existing: MainThreadEvent, incoming: MainThreadEvent): boolean {
+function hasSameLifecycleMeaning(existing: MainThreadEvent, incoming: MainThreadEvent): boolean {
   if (existing.type !== incoming.type) return false;
   if (existing.type === "run.completed" && incoming.type === "run.completed") {
     return completedResultKind(existing) === completedResultKind(incoming);
@@ -254,9 +293,7 @@ function hasSameTerminalMeaning(existing: MainThreadEvent, incoming: MainThreadE
   if (existing.type === "run.aborted" && incoming.type === "run.aborted") {
     return existing.reason === incoming.reason;
   }
-  // Legacy failed events have no stable reason code. Replays of the same
-  // terminal identity are idempotent even if wrapper text changed.
-  return existing.type === "run.failed" || existing.type === "turn.failed";
+  return false;
 }
 
 /**
@@ -299,6 +336,35 @@ export function appendRuntimeEventWithResult(
       };
     }
   }
+  if (isRunBoundaryEvent(event)) {
+    const existingConclusion = existing.find((candidate) =>
+      isRunTerminalEvent(candidate) &&
+      candidate.threadId === event.threadId &&
+      candidate.turnId === event.turnId &&
+      candidate.runId === event.runId
+    );
+    if (existingConclusion) {
+      return {
+        events: existing,
+        disposition: "conflict",
+        existingEvent: existingConclusion,
+      };
+    }
+    const existingBoundary = existing.find((candidate) =>
+      isRunBoundaryEvent(candidate) &&
+      candidate.type === event.type &&
+      candidate.threadId === event.threadId &&
+      candidate.turnId === event.turnId &&
+      candidate.runId === event.runId
+    );
+    if (existingBoundary) {
+      return {
+        events: existing,
+        disposition: hasSameLifecycleMeaning(existingBoundary, event) ? "idempotent" : "conflict",
+        existingEvent: existingBoundary,
+      };
+    }
+  }
   if (isRunTerminalEvent(event)) {
     const existingTerminal = existing.find((candidate) =>
       isRunTerminalEvent(candidate) &&
@@ -309,7 +375,7 @@ export function appendRuntimeEventWithResult(
     if (existingTerminal) {
       return {
         events: existing,
-        disposition: hasSameTerminalMeaning(existingTerminal, event) ? "idempotent" : "conflict",
+        disposition: hasSameLifecycleMeaning(existingTerminal, event) ? "idempotent" : "conflict",
         existingEvent: existingTerminal,
       };
     }
@@ -323,7 +389,7 @@ export function appendRuntimeEventWithResult(
     if (existingTerminal) {
       return {
         events: existing,
-        disposition: hasSameTerminalMeaning(existingTerminal, event) ? "idempotent" : "conflict",
+        disposition: hasSameLifecycleMeaning(existingTerminal, event) ? "idempotent" : "conflict",
         existingEvent: existingTerminal,
       };
     }
@@ -342,15 +408,19 @@ export function appendRuntimeEventWithResult(
 
 export function isRunTerminalEvent(
   event: MainThreadEvent,
-): event is Extract<MainThreadEvent, { type: "run.paused" | "run.completed" | "run.aborted" | "run.failed" }> {
-  return event.type === "run.paused" ||
-    event.type === "run.completed" ||
-    event.type === "run.aborted" ||
-    event.type === "run.failed";
+): event is Extract<MainThreadEvent, { type: "run.completed" }> {
+  return event.type === "run.completed";
+}
+
+/** A pause or abort is an observable boundary, never the Run conclusion. */
+export function isRunBoundaryEvent(
+  event: MainThreadEvent,
+): event is Extract<MainThreadEvent, { type: "run.paused" | "run.aborted" }> {
+  return event.type === "run.paused" || event.type === "run.aborted";
 }
 
 export function isTerminalTurnEvent(
   event: MainThreadEvent,
-): event is Extract<MainThreadEvent, { type: "turn.completed" | "turn.failed" }> {
-  return event.type === "turn.completed" || event.type === "turn.failed";
+): event is Extract<MainThreadEvent, { type: "turn.completed" }> {
+  return event.type === "turn.completed";
 }

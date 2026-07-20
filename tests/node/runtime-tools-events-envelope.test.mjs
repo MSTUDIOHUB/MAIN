@@ -67,8 +67,10 @@ const {
   withEventSchema,
   appendRuntimeEvent,
   appendRuntimeEventWithResult,
+  isRunBoundaryEvent,
   isRunTerminalEvent,
   isTerminalTurnEvent,
+  normalizePersistedMainThreadEvent,
 } = turnEvents;
 const {
   TOOL_FEEDBACK_ENVELOPE_PREFIX,
@@ -384,14 +386,28 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
   });
   assert.equal(isTerminalTurnEvent(completed), true);
 
-  const failed = withEventSchema({
+  const normalizedLegacyFailure = normalizePersistedMainThreadEvent({
+    schemaVersion: 1,
     type: "turn.failed",
     threadId: "thread-1",
     turnId: "turn-2",
     timestampMs: 3,
     error: { message: "boom" },
   });
-  assert.equal(isTerminalTurnEvent(failed), true);
+  assert.equal(normalizedLegacyFailure.type, "turn.completed");
+  assert.equal(normalizedLegacyFailure.schemaVersion, MAIN_THREAD_EVENT_SCHEMA_VERSION);
+  assert.equal(normalizedLegacyFailure.resultKind, "error");
+  assert.equal(isTerminalTurnEvent(normalizedLegacyFailure), true);
+  assert.throws(
+    () => withEventSchema({
+      type: "turn.failed",
+      threadId: "thread-1",
+      turnId: "turn-rejected",
+      timestampMs: 3,
+      error: { message: "live failure events are forbidden" },
+    }),
+    /legacy persisted event/,
+  );
 
   const buffered = appendRuntimeEvent(
     appendRuntimeEvent(
@@ -399,13 +415,13 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
       completed,
       2,
     ),
-    failed,
+    normalizedLegacyFailure,
     2,
   );
   assert.equal(buffered.length, 2);
   assert.deepEqual(
     buffered.map((event) => event.type),
-    ["turn.completed", "turn.failed"],
+    ["turn.completed", "turn.completed"],
   );
 
   const threadStarted = withEventSchema({
@@ -413,11 +429,11 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
     threadId: "thread-1",
     timestampMs: 0,
   });
-  const preservedThread = [started, completed, failed].reduce(
+  const preservedThread = [started, completed, normalizedLegacyFailure].reduce(
     (events, event) => appendRuntimeEvent(events, event, 2),
     appendRuntimeEvent([], threadStarted, 2),
   );
-  assert.deepEqual(preservedThread.map((event) => event.type), ["thread.started", "turn.failed"]);
+  assert.deepEqual(preservedThread.map((event) => event.type), ["thread.started", "turn.completed"]);
   assert.equal(appendRuntimeEvent(preservedThread, threadStarted, 2), preservedThread);
 
   const slash = withEventSchema({
@@ -444,7 +460,7 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
   assert.equal(alias.type, "path_alias_hit");
 });
 
-test("runtime event reducer keeps one terminal event per run and one terminal event per turn", () => {
+test("runtime event reducer allows a paused run to conclude and keeps one conclusion per turn", () => {
   const paused = withEventSchema({
     type: "run.paused",
     threadId: "thread-1",
@@ -469,7 +485,7 @@ test("runtime event reducer keeps one terminal event per run and one terminal ev
     turnId: "turn-1",
     timestampMs: 3,
   });
-  const failedSameTurn = withEventSchema({
+  const failedSameTurn = normalizePersistedMainThreadEvent({
     type: "turn.failed",
     threadId: "thread-1",
     turnId: "turn-1",
@@ -480,7 +496,7 @@ test("runtime event reducer keeps one terminal event per run and one terminal ev
     (current, event) => appendRuntimeEvent(current, event),
     appendRuntimeEvent([], paused),
   );
-  assert.deepEqual(events.map((event) => event.type), ["run.paused", "turn.completed"]);
+  assert.deepEqual(events.map((event) => event.type), ["run.paused", "run.completed", "turn.completed"]);
 });
 
 test("runtime terminal appends distinguish commit, replay, and semantic conflict", () => {
@@ -517,7 +533,7 @@ test("runtime terminal appends distinguish commit, replay, and semantic conflict
   assert.equal(conflictingResult.disposition, "conflict");
   assert.equal(conflictingResult.events, committed.events);
 
-  const legacyFailed = withEventSchema({
+  const legacyFailed = normalizePersistedMainThreadEvent({
     type: "run.failed",
     threadId: "thread-legacy",
     turnId: "turn-legacy",
@@ -526,6 +542,8 @@ test("runtime terminal appends distinguish commit, replay, and semantic conflict
     timestampMs: 4,
     error: { message: "persisted legacy failure" },
   });
+  assert.equal(legacyFailed.type, "run.completed");
+  assert.equal(legacyFailed.resultKind, "error");
   assert.equal(isRunTerminalEvent(legacyFailed), true);
 
   const aborted = withEventSchema({
@@ -537,7 +555,23 @@ test("runtime terminal appends distinguish commit, replay, and semantic conflict
     timestampMs: 5,
     reason: "user_cancelled",
   });
-  assert.equal(isRunTerminalEvent(aborted), true);
+  assert.equal(isRunTerminalEvent(aborted), false);
+  assert.equal(isRunBoundaryEvent(aborted), true);
+  const canceledConclusion = withEventSchema({
+    type: "run.completed",
+    threadId: "thread-aborted",
+    turnId: "turn-aborted",
+    runId: "run-aborted",
+    parentRunId: null,
+    timestampMs: 6,
+    resultKind: "canceled",
+  });
+  const canceledSequence = appendRuntimeEventWithResult(
+    appendRuntimeEventWithResult([], aborted).events,
+    canceledConclusion,
+  );
+  assert.equal(canceledSequence.disposition, "committed");
+  assert.deepEqual(canceledSequence.events.map((event) => event.type), ["run.aborted", "run.completed"]);
 
   for (const resultKind of ["success", "partial", "blocked", "error", "canceled"]) {
     const turn = withEventSchema({
@@ -635,6 +669,39 @@ test("turn event emitter preserves the committed pause reason and rejects a dupl
   ), false);
   assert.equal(emitter.getRunPauseReason(), "awaiting_user_choice");
   assert.equal(events.filter((event) => event.type === "run.paused").length, 1);
+});
+
+test("turn event emitter completes an aborted run with one canceled conclusion", () => {
+  const events = [];
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-canceled",
+    getCurrentTurnId: () => "turn-canceled",
+    getGoalTurnContract: () => null,
+    getCurrentRunIdentity: () => ({
+      runId: "run-canceled",
+      parentRunId: null,
+    }),
+    onTurnEvent: (event) => events.push(event),
+  });
+
+  emitter.emitTurnEvent({
+    type: "run.aborted",
+    threadId: "session-canceled",
+    turnId: "turn-canceled",
+    timestampMs: 1,
+    runId: "run-canceled",
+    parentRunId: null,
+    reason: "user_cancelled",
+  });
+  emitter.emitTurnCompletedEvent();
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "run.aborted",
+    "run.completed",
+    "turn.completed",
+  ]);
+  assert.equal(events[1].resultKind, "canceled");
+  assert.equal(events[2].resultKind, "canceled");
 });
 
 test("turn completion emitter stages exactly one terminal commit", () => {

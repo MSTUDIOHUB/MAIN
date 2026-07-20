@@ -572,7 +572,10 @@ test("paged restore admission persists a partial 30-Turn window as total plus on
     tauriInvoke = (command, payload) => {
       if (command === "save_project_session") {
         persistedSession = payload.session;
-        return Promise.resolve(payload.session);
+        return Promise.resolve({
+          ...payload.session,
+          storageRevision: 12,
+        });
       }
       return Promise.resolve("");
     };
@@ -617,6 +620,13 @@ test("paged restore admission persists a partial 30-Turn window as total plus on
       transcriptLoadedTurns: 31,
       transcriptTotalTurns: 45,
     });
+    assert.equal(
+      useAppStore.getState().sessionsByWorkspace[workspace].find(
+        (session) => session.id === sessionId,
+      ).storageRevision,
+      12,
+      "the admission acknowledgement must publish SQLite's new CAS revision",
+    );
   } finally {
     tauriInvoke = previousTauriInvoke;
     useAppStore.setState(originalState, true);
@@ -1481,7 +1491,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   const replayedState = useAppStore.getState();
   const oldTurn = replayedState.conversationTurns.find((turn) => turn.id === oldTurnId);
   assert.equal(oldTurn.status, "done");
-  assert.equal(oldTurn.runtimeOutcome.status, "aborted");
+  assert.equal(oldTurn.runtimeOutcome.status, "completed");
   assert.equal(replayedState.conversationTurns.length, 2);
   assert.notEqual(replayedState.currentTurnId, oldTurnId);
   assert.match(
@@ -1621,7 +1631,7 @@ test("failed real clear preserves a usable Session with a fresh safe runtime gen
   assert.equal(recovered.pendingReviewResolve, null);
   assert.equal(recovered.activeActionRequest, null);
   assert.equal(recovered.conversationTurns[0].status, "done");
-  assert.equal(recovered.conversationTurns[0].runtimeOutcome.status, "aborted");
+  assert.equal(recovered.conversationTurns[0].runtimeOutcome.status, "completed");
   assert.equal(recovered.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
   assert.match(recovered.conversationTurns[0].summary, /Session 已保留/);
   assert.equal(recovered.runtimeEvents.filter((event) =>
@@ -1850,7 +1860,7 @@ test("failed clear terminalizes active and background owners before sequential r
   await saveStarts[0].promise;
   assert.deepEqual(savePayloads.map((payload) => payload.session.id), [activeSessionId]);
   assert.equal(useAppStore.getState().currentSessionId, null);
-  assert.equal(savePayloads[0].session.runtimeSnapshot.conversationTurns[0].runtimeOutcome.status, "aborted");
+  assert.equal(savePayloads[0].session.runtimeSnapshot.conversationTurns[0].runtimeOutcome.status, "completed");
   saveGates[0].resolve(savePayloads[0].session);
 
   await saveStarts[1].promise;
@@ -1873,16 +1883,16 @@ test("failed clear terminalizes active and background owners before sequential r
   const recovered = useAppStore.getState();
   assert.equal(recovered.currentSessionId, activeSessionId);
   const recoveredOwners = [
-    [activeSessionKey, activeTurnId],
-    [backgroundSessionKey, backgroundTurnId],
-    [closedSessionKey, closedTurnId],
+    [activeSessionKey, activeTurnId, "completed"],
+    [backgroundSessionKey, backgroundTurnId, "completed"],
+    [closedSessionKey, closedTurnId, "aborted"],
   ];
-  for (const [sessionKey, turnId] of recoveredOwners) {
+  for (const [sessionKey, turnId, expectedRuntimeStatus] of recoveredOwners) {
     const runtime = recovered.runtimeBySessionKey[sessionKey];
     assert.ok(runtime, `missing recovered runtime ${sessionKey}`);
     const turn = runtime.conversationTurns.find((candidate) => candidate.id === turnId);
     assert.equal(turn.status, "done");
-    assert.equal(turn.runtimeOutcome.status, "aborted");
+    assert.equal(turn.runtimeOutcome.status, expectedRuntimeStatus);
     assert.equal(turn.runtimeOutcome.resultKind, "canceled");
     assert.equal(runtime.runtimeEvents.filter((event) =>
       event.type === "run.aborted" && event.turnId === turnId
@@ -1906,7 +1916,7 @@ test("failed clear terminalizes active and background owners before sequential r
     recovered.sessionsByWorkspace[workspace]
       .find((session) => session.id === backgroundSessionId)
       .runtimeSnapshot.conversationTurns[0].runtimeOutcome.status,
-    "aborted",
+    "completed",
   );
   for (const { controller, token } of oldOwners) {
     assert.equal(controller.hasSessionRuntimeOwnership(token), false);

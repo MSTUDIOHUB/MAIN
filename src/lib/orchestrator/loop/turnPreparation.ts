@@ -677,19 +677,18 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     };
   };
   let turnEventTerminalEmitted = false;
-  const terminalRunIds = new Set<string>();
+  const concludedRunIds = new Set<string>();
+  const pausedRunIds = new Set<string>();
+  const abortedRunIds = new Set<string>();
   const runPauseReasons = new Map<string, string>();
   let stagedTurnCompletion: (() => void) | null = null;
   const emitTurnEvent = (event: MainThreadEventInput): void => {
-    if (
-      event.type === "run.paused" ||
-      event.type === "run.completed" ||
-      event.type === "run.aborted" ||
-      event.type === "run.failed"
-    ) {
-      terminalRunIds.add(event.runId);
-      if (event.type === "run.paused") runPauseReasons.set(event.runId, event.reason);
+    if (event.type === "run.completed") concludedRunIds.add(event.runId);
+    if (event.type === "run.paused") {
+      pausedRunIds.add(event.runId);
+      runPauseReasons.set(event.runId, event.reason);
     }
+    if (event.type === "run.aborted") abortedRunIds.add(event.runId);
     // Progress is a run-scoped observation, not merely turn-scoped history.
     // Stamp newly emitted progress with the active run identity while keeping
     // the event field optional for persisted legacy sessions.
@@ -709,12 +708,17 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
   const emitTurnCompletedEvent = () => {
     if (turnEventTerminalEmitted) return;
     const runEventIdentity = resolveRunEventIdentity();
-    if (!terminalRunIds.has(runEventIdentity.runId)) {
+    if (pausedRunIds.has(runEventIdentity.runId) && !abortedRunIds.has(runEventIdentity.runId)) {
+      return;
+    }
+    const canceled = abortedRunIds.has(runEventIdentity.runId);
+    if (!concludedRunIds.has(runEventIdentity.runId)) {
       emitTurnEvent({
         type: "run.completed",
         threadId: eventThreadId,
         turnId: eventTurnId,
         timestampMs: Date.now(),
+        ...(canceled ? { resultKind: "canceled" as const } : {}),
         ...runEventIdentity,
       });
     }
@@ -729,13 +733,16 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
       threadId: eventThreadId,
       turnId: eventTurnId,
       timestampMs: Date.now(),
+      ...(canceled ? { resultKind: "canceled" as const } : {}),
     });
   };
   const stageTurnCompletion = (commit: () => void) => {
     if (
       stagedTurnCompletion ||
       turnEventTerminalEmitted ||
-      terminalRunIds.has(resolveRunEventIdentity().runId)
+      concludedRunIds.has(resolveRunEventIdentity().runId) ||
+      pausedRunIds.has(resolveRunEventIdentity().runId) ||
+      abortedRunIds.has(resolveRunEventIdentity().runId)
     ) return;
     stagedTurnCompletion = commit;
   };
@@ -763,7 +770,11 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     progress?: MainThreadProgressUpdate,
   ) => {
     const runEventIdentity = resolveRunEventIdentity();
-    if (terminalRunIds.has(runEventIdentity.runId)) return false;
+    if (
+      concludedRunIds.has(runEventIdentity.runId) ||
+      pausedRunIds.has(runEventIdentity.runId) ||
+      abortedRunIds.has(runEventIdentity.runId)
+    ) return false;
     emitTurnEvent({
       type: "run.paused",
       threadId: eventThreadId,

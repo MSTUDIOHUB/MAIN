@@ -115,18 +115,27 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     ) ||
     "",
   ).trim();
-  const ownerTerminal = ownerRunId
-    ? input.state.runtimeEvents.find((event) =>
+  const ownerConclusion = ownerRunId
+    ? input.state.runtimeEvents.find((event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
         isRunTerminalEvent(event) &&
         event.threadId === input.sessionKey &&
         turnIds.has(event.turnId) &&
         event.runId === ownerRunId
       )
     : undefined;
+  const ownerAbort = ownerRunId
+    ? input.state.runtimeEvents.find((event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+        event.type === "run.aborted" &&
+        event.threadId === input.sessionKey &&
+        turnIds.has(event.turnId) &&
+        event.runId === ownerRunId
+      )
+    : undefined;
   const requestedCancellationRunId = String(input.cancellationRunId || "").trim();
-  const cancellationRunId = ownerTerminal?.type === "run.aborted"
+  const ownerAlreadyCanceled = ownerConclusion?.resultKind === "canceled";
+  const cancellationRunId = ownerAlreadyCanceled || ownerAbort
     ? ownerRunId
-    : ownerTerminal
+    : ownerConclusion
       ? requestedCancellationRunId && requestedCancellationRunId !== ownerRunId
         ? requestedCancellationRunId
         : createCancellationRunId(timestampMs)
@@ -142,11 +151,11 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
       (ownsMarkerOwner ? marker.parentRunId : null) ||
       null
     : ownerRunId;
-  const cancellationReason = ownerTerminal?.type === "run.aborted"
-    ? ownerTerminal.reason
+  const cancellationReason = ownerAbort
+    ? ownerAbort.reason
     : input.reason;
-  const cancellationMessage = ownerTerminal?.type === "run.aborted" && ownerTerminal.message
-    ? ownerTerminal.message
+  const cancellationMessage = ownerAbort?.message
+    ? ownerAbort.message
     : input.message;
   let runtimeEvents = input.state.runtimeEvents;
   if (!runtimeEvents.some((event) =>
@@ -164,15 +173,32 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
       parentRunId: cancellationParentRunId,
     }));
   }
+  if (!runtimeEvents.some((event) =>
+    event.type === "run.aborted" &&
+    event.threadId === input.sessionKey &&
+    event.turnId === input.turnId &&
+    event.runId === cancellationRunId
+  )) {
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+      type: "run.aborted",
+      threadId: input.sessionKey,
+      turnId: input.turnId,
+      timestampMs,
+      runId: cancellationRunId,
+      parentRunId: cancellationParentRunId,
+      reason: cancellationReason,
+      message: cancellationMessage,
+    }));
+  }
   runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-    type: "run.aborted",
+    type: "run.completed",
     threadId: input.sessionKey,
     turnId: input.turnId,
     timestampMs,
     runId: cancellationRunId,
     parentRunId: cancellationParentRunId,
-    reason: cancellationReason,
-    message: cancellationMessage,
+    resultKind: "canceled",
+    summary: cancellationMessage,
   }));
   runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
     type: "turn.completed",
@@ -296,7 +322,7 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
               ? [...turn.blockIds, finalBlockId]
               : turn.blockIds,
             runtimeOutcome: {
-              status: "aborted" as const,
+              status: "completed" as const,
               reason: cancellationReason,
               resultKind: "canceled" as const,
               runId: cancellationRunId,

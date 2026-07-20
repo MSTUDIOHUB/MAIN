@@ -880,7 +880,7 @@ test("a Turn canceled during bootstrap cannot acquire a run lease or start tools
   harness.state.conversationTurns[0] = executionTurn({
     status: "done",
     runtimeOutcome: {
-      status: "aborted",
+      status: "completed",
       reason: "user_canceled",
       resultKind: "canceled",
       runId: "run-cancel",

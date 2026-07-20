@@ -262,8 +262,7 @@ function toExactBootstrapHarnessOwner(marker: HarnessRunMarker): HarnessRunOwner
 }
 
 function isRepairableBootstrapErrorTerminal(event: ReturnType<typeof withEventSchema> | undefined): boolean {
-  return event?.type === "run.failed" ||
-    (event?.type === "run.completed" && event.resultKind === "error");
+  return event?.type === "run.completed" && event.resultKind === "error";
 }
 
 export function projectSubmitBootstrapErrorConclusion<

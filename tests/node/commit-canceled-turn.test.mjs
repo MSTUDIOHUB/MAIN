@@ -168,7 +168,7 @@ test("persistence failure is an explicit memory fallback, not a missing conclusi
   assert.equal(harness.state.runtimeEvents.at(-1).type, "turn.completed");
 });
 
-test("a concurrent owner update retries and reuses one cancellation child id", async () => {
+test("a concurrent owner update retries and reuses the exact paused run id", async () => {
   const pausedState = createState({
     runtimeEvents: [
       createState().runtimeEvents[0],
@@ -200,11 +200,10 @@ test("a concurrent owner update retries and reuses one cancellation child id", a
   assert.equal(result.committed, true);
   assert.equal(result.attempts, 2);
   assert.deepEqual(harness.order, ["persist", "persist", "publish"]);
-  const childIds = harness.persisted.map((projected) =>
+  const cancellationRunIds = harness.persisted.map((projected) =>
     projected.runtimeEvents.find((event) => event.type === "run.aborted")?.runId
   );
-  assert.equal(childIds[0], childIds[1]);
-  assert.match(childIds[0], /^run-cancel-/);
+  assert.deepEqual(cancellationRunIds, ["run-1", "run-1"]);
 });
 
 test("a publication revision conflict does not settle Harness before the accepted retry", async () => {
@@ -270,7 +269,7 @@ test("a publication ownership loss performs no Harness settlement", async () => 
   assert.deepEqual(harness.order, ["persist", "publish"]);
 });
 
-test("a running owner that pauses during persistence is canceled by a new child run", async () => {
+test("a running owner that pauses during persistence is canceled on that same run", async () => {
   let first = true;
   const harness = createHarness();
   harness.input.persistProjection = async (projected) => {
@@ -306,21 +305,22 @@ test("a running owner that pauses during persistence is canceled by a new child 
 
   assert.equal(result.committed, true);
   assert.equal(result.attempts, 2);
-  assert.notEqual(result.cancellationRunId, "run-1");
-  assert.match(result.cancellationRunId, /^run-cancel-/);
+  assert.equal(result.cancellationRunId, "run-1");
   const terminalEvents = harness.state.runtimeEvents.filter((event) =>
-    event.type === "run.paused" || event.type === "run.aborted"
+    event.type === "run.paused" || event.type === "run.aborted" || event.type === "run.completed"
   );
   assert.deepEqual(terminalEvents.map((event) => [event.type, event.runId]), [
     ["run.paused", "run-1"],
-    ["run.aborted", result.cancellationRunId],
+    ["run.aborted", "run-1"],
+    ["run.completed", "run-1"],
   ]);
   assert.equal(
     harness.state.runtimeEvents.find((event) =>
       event.type === "run.started" && event.runId === result.cancellationRunId
     )?.parentRunId,
-    "run-1",
+    null,
   );
+  assert.equal(terminalEvents.at(-1).resultKind, "canceled");
   assert.equal(harness.state.runtimeEvents.at(-1).type, "turn.completed");
 });
 
@@ -591,6 +591,7 @@ test("deferred cancellation publishes the old terminal before a same-key control
   assert.deepEqual(stateRef.current.runtimeEvents.map((event) => [event.type, event.turnId]), [
     ["run.started", "turn-1"],
     ["run.aborted", "turn-1"],
+    ["run.completed", "turn-1"],
     ["turn.completed", "turn-1"],
     ["run.started", "turn-2"],
   ]);

@@ -97,7 +97,7 @@ test("a genuine paused Goal owner continues as a child Run in the same Turn", ()
 });
 
 test("canceled and blocked owner Turns resume the Goal in a fresh visible Turn", () => {
-  for (const [status, resultKind] of [["aborted", "canceled"], ["completed", "blocked"]]) {
+  for (const [status, resultKind] of [["completed", "canceled"], ["completed", "blocked"]]) {
     const ownerTurn = turn({
       status: "done",
       runtimeOutcome: closedOutcome(status, resultKind),

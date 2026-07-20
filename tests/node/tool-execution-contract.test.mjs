@@ -27,9 +27,10 @@ async function loadToolExecutionContractModule() {
 }
 
 const {
-  applyShellCwd,
+  getShellToolCwd,
   looksDangerousShellCommand,
   looksLongRunningShellCommand,
+  validateShellToolCwd,
   validateShellToolContract,
 } = await loadToolExecutionContractModule();
 
@@ -52,23 +53,16 @@ test("shell contract rejects missing description and validates cwd metadata", ()
   );
 });
 
-test("shell cwd is workspace-relative and can be applied to commands", () => {
+test("shell cwd remains a separate workspace-relative execution field", () => {
   assert.match(
     validateShellToolContract("execute_command", { command: "npm run dev", description: "Start dev server", cwd: "../MAIN" }),
     /cannot contain/,
   );
-  assert.equal(
-    applyShellCwd("npm test", { cwd: "apps/web", description: "Run tests" }),
-    "cd 'apps/web' && npm test",
-  );
-  assert.equal(
-    applyShellCwd("npm test", { cwd: ".", description: "Run tests" }, "/workspace/project"),
-    "cd '/workspace/project' && npm test",
-  );
-  assert.equal(
-    applyShellCwd("cargo check", { cwd: "src-tauri", description: "Check Rust" }, "/workspace/project"),
-    "cd '/workspace/project/src-tauri' && cargo check",
-  );
+  assert.equal(getShellToolCwd({ cwd: "apps\\web" }), "apps/web");
+  assert.equal(getShellToolCwd({ cwd: "." }), ".");
+  assert.equal(getShellToolCwd({ workdir: "src-tauri" }), "src-tauri");
+  assert.equal(validateShellToolCwd("apps/web"), null);
+  assert.match(validateShellToolCwd("../outside"), /cannot contain/);
 });
 
 test("dangerous shell detection catches destructive command shapes", () => {

@@ -18,6 +18,7 @@ import {
   deleteWorkspacePath,
   ingestAttachmentFile,
   listDirectory,
+  loadProjectSessionMeta,
   readChatTempFile,
   readDocument,
   readFile,
@@ -94,10 +95,12 @@ import {
   appendRuntimeEvent,
   isTerminalTurnEvent,
   normalizeEventStreamMode,
+  normalizePersistedMainThreadEvent,
   normalizeToolFeedbackFormat,
   withEventSchema,
   type MainThreadEvent,
   type MainThreadEventInput,
+  type LegacyFailedMainThreadEvent,
 } from "../lib/turnEvents";
 import {
   buildAnthropicRequestBody,
@@ -234,6 +237,7 @@ import {
 import {
   getGameStudioSlashCommandSpec,
   getDefaultStudioAgentForEngine,
+  parseGameStudioSlashCommand,
   parseSetupEngineArgs,
   normalizeStudioAgentKey,
   type StudioWorkflowCommandSlug,
@@ -335,13 +339,17 @@ import {
 } from "./submitRuntimeFacade";
 import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
 import { startSubmitBlockingPreflightEffect } from "./submitPreflightExecutor";
-import { startGameStudioLocalSlashSubmission } from "./gameStudioLocalSlashSubmission";
+import {
+  startGameStudioLocalSlashSubmission,
+  type GameStudioLocalSlashCompletionResult,
+} from "./gameStudioLocalSlashSubmission";
 import {
   applySubmitSeedSessionTitle,
   startSubmitSemanticMetadataEffect,
 } from "./submitTitleEffects";
 import { applySubmitSessionBootstrap } from "./submitSessionBootstrap";
 import { createGameStudioLocalSlashBridge } from "./gameStudioLocalSlashBridge";
+import { commitGameStudioLocalSlashProjection } from "./commitGameStudioLocalSlashProjection";
 import { applySubmitVisibleTurn } from "./submitVisibleTurn";
 import { prepareSubmitTurnDraft } from "./submitTurnDraft";
 import { startSubmitPlanHydrationEffect } from "./submitPlanHydration";
@@ -351,7 +359,10 @@ import { applySubmitPlanStateReset } from "./submitPlanStateReset";
 import { applySubmitSendGateEffects } from "./submitSendGateEffects";
 import { resolveAndApplySubmitIntentRouting } from "./submitIntentRouting";
 import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
-import { persistSubmitRuntimeProjection } from "./persistSubmitRuntimeProjection";
+import {
+  buildTemporarySubmitRuntimeProjection,
+  persistSubmitRuntimeProjection,
+} from "./persistSubmitRuntimeProjection";
 import { commitCanceledTurn } from "./commitCanceledTurn";
 import {
   beginSessionCancellation,
@@ -462,7 +473,9 @@ import {
   type WorkspaceInstructionReceipt,
   type WorkspaceInstructionSource,
   type WorkspaceJsonObject,
+  type WorkspaceTurnQueueEntry,
   type WorkspaceTurnQueueState,
+  type WorkspaceTurnTerminalOwner,
 } from "../lib/workspaceInstruction";
 import {
   GLOBAL_CHAT_KEY,
@@ -480,6 +493,7 @@ import type {
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import { compactThoughtContent } from "../lib/thoughtCompaction";
 import {
+  buildWorkspaceTurnQueueEntryIdentity,
   createWorkspaceTurnQueueState,
   normalizeWorkspaceInstructionLedger,
   reconcileWorkspaceTurnQueueOnRestore,
@@ -1085,6 +1099,8 @@ export interface Session {
   modelConfig?: SessionModelConfig;
   activeSkills?: string[];
   runtimeSnapshot?: SessionRuntimeSnapshot;
+  /** SQLite-owned CAS revision returned by Project Session persistence. */
+  storageRevision?: number;
   storageStatus?: "ok" | "missing" | "temporary";
   transcriptPartial?: boolean;
   transcriptLoadedTurns?: number;
@@ -1179,6 +1195,8 @@ export interface WorkspaceInstructionDispatchClaim {
   sessionEpoch: string;
   turnId: string;
   admittedUserBlockId: number;
+  /** Canonical immutable instruction+receipt envelope captured at claim time. */
+  instructionEnvelopeIdentity: string;
 }
 
 type CapsuleExplanationSource = "model" | "runtime";
@@ -1966,6 +1984,2030 @@ export function normalizeInterruptedConversationTurnsForRestore(
   });
 }
 
+function nextRestoredTaskBlockId(
+  taskFlow: TaskBlock[],
+  conversationTurns: ConversationTurn[],
+  reservedTaskBlockIds: readonly number[] = [],
+): number {
+  const occupied = new Set<number>();
+  for (const block of taskFlow) {
+    if (Number.isSafeInteger(block.id) && block.id > 0) occupied.add(block.id);
+  }
+  for (const turn of conversationTurns) {
+    for (const blockId of turn.blockIds) {
+      if (Number.isSafeInteger(blockId) && blockId > 0) occupied.add(blockId);
+    }
+  }
+  for (const blockId of reservedTaskBlockIds) {
+    if (Number.isSafeInteger(blockId) && blockId > 0) occupied.add(blockId);
+  }
+  let maxId = 0;
+  for (const id of occupied) maxId = Math.max(maxId, id);
+  if (maxId < Number.MAX_SAFE_INTEGER) return maxId + 1;
+  for (let candidate = 1; candidate < Number.MAX_SAFE_INTEGER; candidate += 1) {
+    if (!occupied.has(candidate)) return candidate;
+  }
+  throw new Error("RESTORE_TASK_BLOCK_ID_EXHAUSTED");
+}
+
+function buildRestoredTerminalFinalText(input: {
+  resultKind: "success" | "partial" | "blocked" | "error" | "canceled";
+  runSummary?: string | null;
+  markerError?: string | null;
+  markerReason?: string | null;
+  turn?: ConversationTurn | null;
+}): string {
+  const useChinese = /[^\x00-\x7F]/.test(String(input.turn?.userPrompt || ""));
+  const prefix = useChinese
+    ? {
+        success: "本轮运行已完成；恢复时已补齐此前未写入界面的最终结论。",
+        partial: "本轮已得出部分完成结论；恢复时已补齐最终说明。",
+        blocked: "本轮已得出受阻结论；恢复时已补齐最终说明。",
+        error: "本轮已得出错误结论；恢复时已补齐最终说明。",
+        canceled: "本轮已取消；恢复时已补齐最终说明。",
+      }[input.resultKind]
+    : {
+        success: "This run completed. Its missing final conclusion was recovered from the terminal checkpoint.",
+        partial: "This run concluded with a partial result. Its missing final explanation was recovered.",
+        blocked: "This run concluded as blocked. Its missing final explanation was recovered.",
+        error: "This run concluded with an error. Its missing final explanation was recovered.",
+        canceled: "This run was canceled. Its missing final explanation was recovered.",
+      }[input.resultKind];
+  const detail = String(
+    input.resultKind === "error"
+      ? input.markerError || input.runSummary || input.markerReason || input.turn?.summary || ""
+      : input.runSummary || input.markerReason || input.turn?.summary || "",
+  ).trim();
+  return detail && detail !== prefix ? `${prefix}\n\n${detail}` : prefix;
+}
+
+function canonicalizeRestoredTerminalTurnFinal(input: {
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  turnId: string;
+  resultKind: "success" | "partial" | "blocked" | "error" | "canceled";
+  runId?: string | null;
+  parentRunId?: string | null;
+  completedAt?: number | null;
+  runSummary?: string | null;
+  markerError?: string | null;
+  markerReason?: string | null;
+  finalText?: string | null;
+  forceFinalText?: boolean;
+  /** Durable FIFO receipts reserve their user block IDs before projection. */
+  reservedTaskBlockIds?: readonly number[];
+}): { taskFlow: TaskBlock[]; conversationTurns: ConversationTurn[] } {
+  const turn = input.conversationTurns.find((candidate) => candidate.id === input.turnId);
+  const restoredFinalText = String(input.finalText || "").trim() ||
+    buildRestoredTerminalFinalText({
+      resultKind: input.resultKind,
+      runSummary: input.runSummary,
+      markerError: input.markerError,
+      markerReason: input.markerReason,
+      turn,
+    });
+  const finalIndexes = input.taskFlow.flatMap((block, index) =>
+    block.type === "agent" &&
+    block.turnId === input.turnId &&
+    block.visibility === "assistant_final"
+      ? [index]
+      : []
+  );
+  const canonicalFinalIndex = finalIndexes.length > 0
+    ? finalIndexes[finalIndexes.length - 1]
+    : undefined;
+  const existingFinal = canonicalFinalIndex === undefined
+    ? null
+    : input.taskFlow[canonicalFinalIndex];
+  const finalBlockId = existingFinal?.id ?? nextRestoredTaskBlockId(
+    input.taskFlow,
+    input.conversationTurns,
+    input.reservedTaskBlockIds,
+  );
+  let taskFlow = input.taskFlow.map((block, index) => {
+    if (
+      index === canonicalFinalIndex &&
+      block.type === "agent" &&
+      block.turnId === input.turnId &&
+      block.visibility === "assistant_final"
+    ) {
+      return {
+        ...block,
+        content: input.forceFinalText || !String(block.content || "").trim()
+          ? restoredFinalText
+          : block.content,
+        streaming: false,
+        hiddenProcess: false,
+        visibility: "assistant_final" as const,
+      };
+    }
+    if (
+      index !== canonicalFinalIndex &&
+      block.type === "agent" &&
+      block.turnId === input.turnId &&
+      block.visibility === "assistant_final"
+    ) {
+      return { ...block, visibility: "assistant_update" as const };
+    }
+    return block;
+  });
+  if (canonicalFinalIndex === undefined) {
+    taskFlow = [...taskFlow, {
+      id: finalBlockId,
+      turnId: input.turnId,
+      type: "agent",
+      content: restoredFinalText,
+      streaming: false,
+      hiddenProcess: false,
+      visibility: "assistant_final",
+    }];
+  }
+  const runId = String(input.runId || turn?.runtimeOutcome?.runId || "").trim() ||
+    `restored-run-${input.turnId}`;
+  const parentRunId = input.parentRunId !== undefined
+    ? input.parentRunId
+    : turn?.runtimeOutcome?.parentRunId || null;
+  const completedAt = Math.max(
+    0,
+    Number(input.completedAt) || Number(turn?.runtimeOutcome?.updatedAt) || Date.now(),
+  );
+  const reason = String(
+    input.markerError ||
+    input.markerReason ||
+    input.runSummary ||
+    turn?.runtimeOutcome?.reason ||
+    "restored_turn_completion",
+  ).trim() || "restored_turn_completion";
+  const authoritativeSummary = String(
+    input.runSummary || input.markerError || input.markerReason || turn?.summary || "",
+  ).trim();
+  const restoredSummary = input.forceFinalText
+    ? authoritativeSummary || restoredFinalText
+    : summarizeAssistantText(authoritativeSummary);
+  return {
+    taskFlow,
+    conversationTurns: input.conversationTurns.map((turn) =>
+      turn.id === input.turnId
+        ? {
+            ...turn,
+            status: input.forceFinalText && input.resultKind === "error"
+              ? "error" as const
+              : "done" as const,
+            ...(restoredSummary ? { summary: restoredSummary } : {}),
+            runtimeOutcome: {
+              status: "completed" as const,
+              reason,
+              resultKind: input.resultKind,
+              runId,
+              parentRunId,
+              updatedAt: completedAt,
+            },
+            blockIds: turn.blockIds.includes(finalBlockId)
+              ? turn.blockIds
+              : [...turn.blockIds, finalBlockId],
+          }
+        : turn
+    ),
+  };
+}
+
+type WorkspaceInstructionTerminalResultKind =
+  | "success"
+  | "partial"
+  | "blocked"
+  | "error"
+  | "canceled";
+
+function workspaceInstructionEnvelopeIdentity(
+  entry: WorkspaceTurnQueueEntry,
+): string {
+  return buildWorkspaceTurnQueueEntryIdentity(entry);
+}
+
+function sameStringSequence(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean {
+  const normalizedLeft = left || [];
+  const normalizedRight = right || [];
+  return normalizedLeft.length === normalizedRight.length &&
+    normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function resolveExactWorkspaceInstructionProjection(input: {
+  entry: WorkspaceTurnQueueEntry;
+  taskFlow: readonly TaskBlock[];
+  conversationTurns: readonly ConversationTurn[];
+}): { turn: ConversationTurn; userBlock: Extract<TaskBlock, { type: "user" }> } | null {
+  const { entry } = input;
+  const expectedContextItems = buildWorkspaceInstructionUserContext({
+    contextMentions: entry.instruction.payload.contextMentions
+      ? [...entry.instruction.payload.contextMentions]
+      : [],
+    attachedFiles: entry.instruction.payload.attachedFiles
+      ? entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+      : [],
+    images: entry.instruction.payload.images
+      ? [...entry.instruction.payload.images]
+      : [],
+    workspace: "",
+    language: "en",
+  });
+  const contextItemIdentitiesEqual = (
+    left: Extract<TaskBlock, { type: "user" }>["contextItems"],
+  ) => {
+    const normalizedLeft = sanitizeUserContextItemsForPersist(left) || [];
+    const normalizedRight = sanitizeUserContextItemsForPersist(expectedContextItems) || [];
+    return normalizedLeft.length === normalizedRight.length &&
+      normalizedLeft.every((item, index) => {
+        const candidate = normalizedRight[index];
+        return item.id === candidate.id &&
+          item.kind === candidate.kind &&
+          (item.path || "") === (candidate.path || "");
+      });
+  };
+  const sourceTurns = input.conversationTurns.filter(
+    (candidate) => candidate.id === entry.receipt.turnId,
+  );
+  const submissionTurns = input.conversationTurns.filter(
+    (candidate) =>
+      candidate.clientSubmissionId === entry.instruction.clientSubmissionId,
+  );
+  const receiptTurns = input.conversationTurns.filter(
+    (candidate) =>
+      candidate.workspaceInstructionReceiptId === entry.receipt.receiptId,
+  );
+  const turn = sourceTurns.length === 1 &&
+      submissionTurns.length === 1 &&
+      receiptTurns.length === 1 &&
+      sourceTurns[0] === submissionTurns[0] &&
+      sourceTurns[0] === receiptTurns[0] &&
+      sourceTurns[0].id === entry.receipt.turnId &&
+    sourceTurns[0].clientSubmissionId === entry.instruction.clientSubmissionId &&
+    sourceTurns[0].workspaceInstructionReceiptId === entry.receipt.receiptId &&
+    sourceTurns[0].workspaceInstructionSource === entry.instruction.source &&
+    sourceTurns[0].userPrompt === entry.instruction.payload.text &&
+    sourceTurns[0].blockIds.filter(
+      (blockId) => blockId === entry.receipt.userBlockId,
+    ).length === 1 &&
+    sourceTurns[0].createdAt === entry.receipt.acceptedAt
+    ? sourceTurns[0]
+    : null;
+  const userBlockIdCandidates = input.taskFlow.filter(
+    (block) => block.id === entry.receipt.userBlockId,
+  );
+  const sourceUserBlocks = input.taskFlow.filter((block) =>
+    block.type === "user" && block.turnId === entry.receipt.turnId
+  );
+  const userBlock = userBlockIdCandidates.length === 1 &&
+      sourceUserBlocks.length === 1 &&
+      userBlockIdCandidates[0] === sourceUserBlocks[0] &&
+      userBlockIdCandidates[0].type === "user" &&
+      userBlockIdCandidates[0].id === entry.receipt.userBlockId &&
+      userBlockIdCandidates[0].turnId === entry.receipt.turnId &&
+      userBlockIdCandidates[0].content === entry.instruction.payload.text &&
+      sameStringSequence(
+        userBlockIdCandidates[0].images,
+        entry.instruction.payload.images,
+      ) &&
+      contextItemIdentitiesEqual(userBlockIdCandidates[0].contextItems)
+    ? userBlockIdCandidates[0]
+    : null;
+  return turn && userBlock ? { turn, userBlock } : null;
+}
+
+function inspectWorkspaceInstructionTerminalProjection(input: {
+  entry: WorkspaceTurnQueueEntry;
+  sessionKey: string;
+  taskFlow: readonly TaskBlock[];
+  conversationTurns: readonly ConversationTurn[];
+  runtimeEvents: readonly MainThreadEvent[];
+}): {
+  owner: { turn: ConversationTurn; userBlock: Extract<TaskBlock, { type: "user" }> } | null;
+  terminals: Extract<MainThreadEvent, { type: "turn.completed" }>[];
+  canonical: boolean;
+} {
+  const owner = resolveExactWorkspaceInstructionProjection(input);
+  const terminals = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
+      event.type === "turn.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.entry.receipt.turnId,
+  );
+  const outcome = owner?.turn.runtimeOutcome?.status === "completed"
+    ? owner.turn.runtimeOutcome
+    : null;
+  const starts = outcome
+    ? input.runtimeEvents.filter((event) =>
+        event.type === "run.started" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === input.entry.receipt.turnId &&
+        event.runId === outcome.runId &&
+        event.parentRunId === outcome.parentRunId
+      )
+    : [];
+  const conclusions = outcome
+    ? input.runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === input.entry.receipt.turnId &&
+          event.runId === outcome.runId &&
+          event.parentRunId === outcome.parentRunId,
+      )
+    : [];
+  const aborts = outcome
+    ? input.runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+          event.type === "run.aborted" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === input.entry.receipt.turnId &&
+          event.runId === outcome.runId &&
+          event.parentRunId === outcome.parentRunId,
+      )
+    : [];
+  const allOutcomeRunStarts = outcome
+    ? input.runtimeEvents.filter((event) =>
+        event.type === "run.started" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === input.entry.receipt.turnId &&
+        event.runId === outcome.runId
+      )
+    : [];
+  const allOutcomeRunConclusions = outcome
+    ? input.runtimeEvents.filter((event) =>
+        event.type === "run.completed" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === input.entry.receipt.turnId &&
+        event.runId === outcome.runId
+      )
+    : [];
+  const allOutcomeRunAborts = outcome
+    ? input.runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+          event.type === "run.aborted" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === input.entry.receipt.turnId &&
+          event.runId === outcome.runId,
+      )
+    : [];
+  const finals = input.taskFlow.filter(
+    (block): block is Extract<TaskBlock, { type: "agent" }> =>
+      block.type === "agent" &&
+      block.turnId === input.entry.receipt.turnId &&
+      block.visibility === "assistant_final",
+  );
+  const terminal = terminals[0];
+  const start = starts[0];
+  const conclusion = conclusions[0];
+  const sourceStarts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+      event.type === "run.started" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.entry.receipt.turnId,
+  );
+  const sourceConclusions = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.entry.receipt.turnId,
+  );
+  const sourceAborts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+      event.type === "run.aborted" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.entry.receipt.turnId,
+  );
+  const everySourceRunIsClosed = !!terminal &&
+    sourceStarts.every((candidateStart) => {
+      const matching = sourceConclusions.filter((candidateConclusion) =>
+        candidateConclusion.runId === candidateStart.runId &&
+        candidateConclusion.parentRunId === candidateStart.parentRunId
+      );
+      return sourceStarts.filter(
+        (candidate) => candidate.runId === candidateStart.runId,
+      ).length === 1 &&
+        matching.length === 1 &&
+        input.runtimeEvents.indexOf(candidateStart) < input.runtimeEvents.indexOf(matching[0]) &&
+        input.runtimeEvents.indexOf(matching[0]) < input.runtimeEvents.indexOf(terminal);
+    }) &&
+    sourceConclusions.every((candidateConclusion) => {
+      const matching = sourceStarts.filter((candidateStart) =>
+        candidateStart.runId === candidateConclusion.runId &&
+        candidateStart.parentRunId === candidateConclusion.parentRunId
+      );
+      const matchingAborts = sourceAborts.filter((candidateAbort) =>
+        candidateAbort.runId === candidateConclusion.runId &&
+        candidateAbort.parentRunId === candidateConclusion.parentRunId
+      );
+      return sourceConclusions.filter(
+        (candidate) => candidate.runId === candidateConclusion.runId,
+      ).length === 1 &&
+        matching.length === 1 &&
+        ((candidateConclusion.resultKind || "success") === "canceled"
+          ? matchingAborts.length === 1 &&
+            input.runtimeEvents.indexOf(matching[0]) < input.runtimeEvents.indexOf(matchingAborts[0]) &&
+            input.runtimeEvents.indexOf(matchingAborts[0]) < input.runtimeEvents.indexOf(candidateConclusion)
+          : matchingAborts.length === 0) &&
+        input.runtimeEvents.indexOf(matching[0]) <
+          input.runtimeEvents.indexOf(candidateConclusion) &&
+        input.runtimeEvents.indexOf(candidateConclusion) < input.runtimeEvents.indexOf(terminal);
+    }) &&
+    sourceAborts.every((candidateAbort) => {
+      const matchingStarts = sourceStarts.filter((candidateStart) =>
+        candidateStart.runId === candidateAbort.runId &&
+        candidateStart.parentRunId === candidateAbort.parentRunId
+      );
+      const matchingConclusions = sourceConclusions.filter((candidateConclusion) =>
+        candidateConclusion.runId === candidateAbort.runId &&
+        candidateConclusion.parentRunId === candidateAbort.parentRunId &&
+        (candidateConclusion.resultKind || "success") === "canceled"
+      );
+      return sourceAborts.filter(
+        (candidate) => candidate.runId === candidateAbort.runId,
+      ).length === 1 &&
+        matchingStarts.length === 1 &&
+        matchingConclusions.length === 1 &&
+        input.runtimeEvents.indexOf(matchingStarts[0]) < input.runtimeEvents.indexOf(candidateAbort) &&
+        input.runtimeEvents.indexOf(candidateAbort) < input.runtimeEvents.indexOf(matchingConclusions[0]) &&
+        input.runtimeEvents.indexOf(matchingConclusions[0]) < input.runtimeEvents.indexOf(terminal);
+    });
+  const exactCancellationBoundaryIsCanonical = outcome?.resultKind === "canceled"
+    ? aborts.length === 1 &&
+      allOutcomeRunAborts.length === 1 &&
+      !!start &&
+      !!conclusion &&
+      input.runtimeEvents.indexOf(start) < input.runtimeEvents.indexOf(aborts[0]) &&
+      input.runtimeEvents.indexOf(aborts[0]) < input.runtimeEvents.indexOf(conclusion)
+    : aborts.length === 0 && allOutcomeRunAborts.length === 0;
+  return {
+    owner,
+    terminals,
+    canonical: !!owner &&
+      terminals.length === 1 &&
+      starts.length === 1 &&
+      conclusions.length === 1 &&
+      allOutcomeRunStarts.length === 1 &&
+      allOutcomeRunConclusions.length === 1 &&
+      exactCancellationBoundaryIsCanonical &&
+      everySourceRunIsClosed &&
+      finals.length === 1 &&
+      !!terminal &&
+      !!start &&
+      !!conclusion &&
+      input.runtimeEvents.indexOf(start) < input.runtimeEvents.indexOf(conclusion) &&
+      input.runtimeEvents.indexOf(conclusion) < input.runtimeEvents.indexOf(terminal) &&
+      (terminal.resultKind || "success") === outcome?.resultKind &&
+      (conclusion.resultKind || "success") === outcome?.resultKind &&
+      conclusion.summary === owner.turn.summary &&
+      finals[0].streaming !== true &&
+      finals[0].content === conclusion.summary,
+  };
+}
+
+function uniqueWorkspaceRecoveryTurnId(input: {
+  receiptId: string;
+  taskFlow: readonly TaskBlock[];
+  conversationTurns: readonly ConversationTurn[];
+  runtimeEvents: readonly MainThreadEvent[];
+}): string {
+  const safeReceiptId = input.receiptId
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "receipt";
+  const base = `workspace-recovery-${safeReceiptId}`;
+  let candidate = base;
+  let suffix = 2;
+  const occupied = (turnId: string) =>
+    input.conversationTurns.some((turn) => turn.id === turnId) ||
+    input.taskFlow.some((block) => block.turnId === turnId) ||
+    input.runtimeEvents.some((event) => "turnId" in event && event.turnId === turnId);
+  while (occupied(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
+}
+
+function uniqueWorkspaceConclusionRunId(
+  runtimeEvents: readonly MainThreadEvent[],
+  preferredId: string,
+): string {
+  const base = preferredId
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "run-workspace-conclusion";
+  let candidate = base;
+  let suffix = 2;
+  while (runtimeEvents.some((event) => "runId" in event && event.runId === candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
+}
+
+/**
+ * Close one exact durable FIFO receipt without trusting a lookalike turnId.
+ * Exact owners are repaired in place; ambiguous history is left untouched and
+ * receives a separate visible recovery child with a self-consistent lifecycle.
+ */
+function concludeWorkspaceInstructionEntry(input: {
+  entry: WorkspaceTurnQueueEntry;
+  sessionKey: string;
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  runtimeEvents: MainThreadEvent[];
+  resultKind: WorkspaceInstructionTerminalResultKind;
+  summary: string;
+  timestampMs: number;
+  forceRecovery?: boolean;
+  recoveryReason?: string | null;
+  language: "zh" | "en";
+  reservedTaskBlockIds?: readonly number[];
+}): {
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  runtimeEvents: MainThreadEvent[];
+  disposition: "canonical" | "source_completed" | "recovery_completed";
+  presentationTurnId: string;
+} {
+  const inspection = inspectWorkspaceInstructionTerminalProjection(input);
+  const sourceTurnId = input.entry.receipt.turnId;
+  if (inspection.canonical && !input.forceRecovery) {
+    return {
+      taskFlow: input.taskFlow,
+      conversationTurns: input.conversationTurns,
+      runtimeEvents: input.runtimeEvents,
+      disposition: "canonical",
+      presentationTurnId: sourceTurnId,
+    };
+  }
+
+  const persistedSourceStarts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+      event.type === "run.started" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  const persistedSourceConclusions = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  const persistedSourceAborts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+      event.type === "run.aborted" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  const ownerRuntimeOutcome = inspection.owner?.turn.runtimeOutcome;
+  const persistedClosedOutcome = ownerRuntimeOutcome?.status === "completed" ||
+      ownerRuntimeOutcome?.status === "aborted"
+    ? ownerRuntimeOutcome
+    : null;
+  const persistedOutcomeResultKind: WorkspaceInstructionTerminalResultKind | null =
+    persistedClosedOutcome?.status === "aborted"
+      ? "canceled"
+      : persistedClosedOutcome?.resultKind || null;
+  const sourceRunOwnersAreUnambiguous = persistedSourceStarts.every((start) => {
+    const sameRunStarts = persistedSourceStarts.filter(
+      (candidate) => candidate.runId === start.runId,
+    );
+    const sameRunConclusions = persistedSourceConclusions.filter(
+      (candidate) => candidate.runId === start.runId,
+    );
+    return sameRunStarts.length === 1 &&
+      sameRunConclusions.length <= 1 &&
+      sameRunConclusions.every(
+        (conclusion) => conclusion.parentRunId === start.parentRunId,
+      );
+  }) && persistedSourceConclusions.every((conclusion) => {
+    const sameRunConclusions = persistedSourceConclusions.filter(
+      (candidate) => candidate.runId === conclusion.runId,
+    );
+    const sameRunStarts = persistedSourceStarts.filter(
+      (candidate) => candidate.runId === conclusion.runId,
+    );
+    return sameRunConclusions.length === 1 &&
+      sameRunStarts.length <= 1 &&
+      sameRunStarts.every((start) => start.parentRunId === conclusion.parentRunId);
+  }) && persistedSourceAborts.every((abort) => {
+    const sameRunAborts = persistedSourceAborts.filter(
+      (candidate) => candidate.runId === abort.runId,
+    );
+    const sameRunStarts = persistedSourceStarts.filter(
+      (candidate) => candidate.runId === abort.runId,
+    );
+    const sameRunConclusions = persistedSourceConclusions.filter(
+      (candidate) => candidate.runId === abort.runId,
+    );
+    return sameRunAborts.length === 1 &&
+      sameRunStarts.length <= 1 &&
+      sameRunStarts.every((start) => start.parentRunId === abort.parentRunId) &&
+      sameRunConclusions.length <= 1 &&
+      sameRunConclusions.every(
+        (conclusion) => conclusion.parentRunId === abort.parentRunId,
+      );
+  });
+  const persistedOutcomeLifecycleEvents = persistedClosedOutcome
+    ? input.runtimeEvents.filter((event) =>
+        (event.type === "run.started" ||
+          event.type === "run.paused" ||
+          event.type === "run.aborted" ||
+          event.type === "run.completed") &&
+        event.runId === persistedClosedOutcome.runId
+      )
+    : [];
+  const persistedOutcomeIdentityIsCompatible = !persistedClosedOutcome ||
+    persistedOutcomeLifecycleEvents.every((event) =>
+      "turnId" in event &&
+      "parentRunId" in event &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId &&
+      event.parentRunId === persistedClosedOutcome.parentRunId
+    ) &&
+    persistedSourceStarts.filter(
+      (event) => event.runId === persistedClosedOutcome.runId,
+    ).length <= 1 &&
+    persistedSourceConclusions.filter(
+      (event) => event.runId === persistedClosedOutcome.runId,
+    ).length <= 1 &&
+    (persistedOutcomeResultKind === "canceled"
+      ? persistedSourceAborts.filter(
+          (event) => event.runId === persistedClosedOutcome.runId,
+        ).length <= 1
+      : persistedSourceAborts.every(
+          (event) => event.runId !== persistedClosedOutcome.runId,
+        ));
+  const canRepairSource = !!inspection.owner &&
+    !input.forceRecovery &&
+    inspection.terminals.length <= 1 &&
+    sourceRunOwnersAreUnambiguous &&
+    persistedOutcomeIdentityIsCompatible;
+  if (canRepairSource) {
+    const terminal = inspection.terminals[0] || null;
+    let resultKind: WorkspaceInstructionTerminalResultKind =
+      terminal?.resultKind || persistedOutcomeResultKind || input.resultKind;
+    let runtimeEvents = input.runtimeEvents;
+    for (const orphanConclusion of persistedSourceConclusions) {
+      runtimeEvents = insertRestoredRunStartBeforeTerminal({
+        runtimeEvents,
+        sessionKey: input.sessionKey,
+        turnId: sourceTurnId,
+        runId: orphanConclusion.runId,
+        parentRunId: orphanConclusion.parentRunId,
+        timestampMs: Math.min(input.timestampMs, orphanConclusion.timestampMs),
+      });
+    }
+    let selectedRunId = "";
+    let selectedParentRunId: string | null = null;
+    let selectedSummary = input.summary;
+
+    if (terminal) {
+      const terminalIndex = runtimeEvents.indexOf(terminal);
+      const sourceConclusions = runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId,
+      );
+      const sourceStarts = runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+          event.type === "run.started" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId,
+      );
+      const openStarts = sourceStarts.filter((start) =>
+        !runtimeEvents.some((event) =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId &&
+          event.runId === start.runId
+        )
+      );
+      const reusable = sourceConclusions.filter((conclusion) => {
+        if (
+          runtimeEvents.indexOf(conclusion) >= terminalIndex ||
+          (conclusion.resultKind || "success") !== resultKind ||
+          !String(conclusion.summary || "").trim()
+        ) return false;
+        const sameRunConclusions = sourceConclusions.filter(
+          (candidate) => candidate.runId === conclusion.runId,
+        );
+        const sameRunStarts = runtimeEvents.filter(
+          (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+            event.type === "run.started" &&
+            event.threadId === input.sessionKey &&
+            event.turnId === sourceTurnId &&
+            event.runId === conclusion.runId,
+        );
+        return sameRunConclusions.length === 1 &&
+          sameRunStarts.length <= 1 &&
+          sameRunStarts.every((start) => start.parentRunId === conclusion.parentRunId);
+      });
+      const exactOutcomeConclusion = persistedClosedOutcome
+        ? reusable.find((conclusion) =>
+            conclusion.runId === persistedClosedOutcome.runId &&
+            conclusion.parentRunId === persistedClosedOutcome.parentRunId &&
+            persistedOutcomeResultKind === resultKind
+          )
+        : null;
+      const selected = exactOutcomeConclusion || (
+        !persistedClosedOutcome ? reusable[reusable.length - 1] || null : null
+      );
+      if (selected) {
+        selectedRunId = selected.runId;
+        selectedParentRunId = selected.parentRunId;
+        selectedSummary = String(selected.summary || "").trim();
+        runtimeEvents = insertRestoredRunStartBeforeTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+          timestampMs: Math.min(input.timestampMs, selected.timestampMs),
+        });
+      } else {
+        selectedRunId = persistedClosedOutcome?.runId || uniqueWorkspaceConclusionRunId(
+          runtimeEvents,
+          `run-admission-repair-${input.entry.receipt.receiptId}`,
+        );
+        selectedParentRunId = persistedClosedOutcome?.parentRunId || null;
+        resultKind = persistedOutcomeResultKind || resultKind;
+        selectedSummary = String(inspection.owner!.turn.summary || "").trim() || selectedSummary;
+        runtimeEvents = insertRestoredRunStartBeforeTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+          timestampMs: Math.min(input.timestampMs, terminal.timestampMs),
+        });
+        runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+          timestampMs: Math.min(input.timestampMs, terminal.timestampMs),
+          resultKind,
+          summary: selectedSummary,
+        });
+      }
+      if (resultKind === "canceled") {
+        runtimeEvents = insertRestoredRunAbortBeforeConclusion({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+          timestampMs: Math.min(input.timestampMs, terminal.timestampMs),
+          reason: input.recoveryReason || "workspace_instruction_canceled",
+          message: selectedSummary,
+        });
+      }
+      for (const openStart of openStarts) {
+        runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          runId: openStart.runId,
+          parentRunId: openStart.parentRunId,
+          timestampMs: Math.min(input.timestampMs, terminal.timestampMs),
+          resultKind: "error",
+          summary: input.language === "en"
+            ? "A stale admitted Run was closed while repairing the Turn's durable terminal projection."
+            : "修复回合持久化终态时，已将遗留运行收口。",
+        });
+      }
+    } else {
+      const sourceStarts = runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+          event.type === "run.started" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId,
+      );
+      const sourceConclusions = runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId,
+      );
+      const openStarts = sourceStarts.filter((start) =>
+        !runtimeEvents.some((event) =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId &&
+          event.runId === start.runId
+        )
+      );
+      const trustworthyConclusions = sourceConclusions.filter((conclusion) => {
+        if (!String(conclusion.summary || "").trim()) return false;
+        const sameRunConclusions = sourceConclusions.filter(
+          (candidate) => candidate.runId === conclusion.runId,
+        );
+        const matchingStarts = sourceStarts.filter((start) =>
+          start.runId === conclusion.runId &&
+          start.parentRunId === conclusion.parentRunId
+        );
+        const allSameRunStarts = sourceStarts.filter(
+          (start) => start.runId === conclusion.runId,
+        );
+        return sameRunConclusions.length === 1 &&
+          matchingStarts.length === 1 &&
+          allSameRunStarts.length === 1 &&
+          runtimeEvents.indexOf(matchingStarts[0]) < runtimeEvents.indexOf(conclusion);
+      });
+      const exactOutcomeConclusion = persistedClosedOutcome
+        ? trustworthyConclusions.find((conclusion) =>
+            conclusion.runId === persistedClosedOutcome.runId &&
+            conclusion.parentRunId === persistedClosedOutcome.parentRunId &&
+            (conclusion.resultKind || "success") === persistedOutcomeResultKind
+          )
+        : null;
+      const preservedConclusion = exactOutcomeConclusion || (
+        !persistedClosedOutcome && trustworthyConclusions.length === 1
+          ? trustworthyConclusions[0]
+          : null
+      );
+      if (preservedConclusion) {
+        selectedRunId = preservedConclusion.runId;
+        selectedParentRunId = preservedConclusion.parentRunId;
+        selectedSummary = String(preservedConclusion.summary || "").trim();
+        resultKind = preservedConclusion.resultKind || "success";
+        for (const openStart of openStarts) {
+          runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+            type: "run.completed",
+            threadId: input.sessionKey,
+            turnId: sourceTurnId,
+            timestampMs: input.timestampMs,
+            runId: openStart.runId,
+            parentRunId: openStart.parentRunId,
+            resultKind: "error",
+            summary: input.language === "en"
+              ? "A stale admitted Run was closed while preserving the Turn's durable conclusion."
+              : "保留回合持久化结论时，已将遗留运行收口。",
+          }));
+        }
+        if (resultKind === "canceled") {
+          runtimeEvents = insertRestoredRunAbortBeforeConclusion({
+            runtimeEvents,
+            sessionKey: input.sessionKey,
+            turnId: sourceTurnId,
+            runId: selectedRunId,
+            parentRunId: selectedParentRunId,
+            timestampMs: input.timestampMs,
+            reason: input.recoveryReason || "workspace_instruction_canceled",
+            message: selectedSummary,
+          });
+        }
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "turn.completed",
+          threadId: input.sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: input.timestampMs,
+          resultKind,
+        }));
+      } else {
+        const selectableStarts = openStarts.filter((start) =>
+          sourceStarts.filter((candidate) => candidate.runId === start.runId).length === 1
+        );
+        const exactOutcomeStart = persistedClosedOutcome
+          ? selectableStarts.find((start) =>
+              start.runId === persistedClosedOutcome.runId &&
+              start.parentRunId === persistedClosedOutcome.parentRunId
+            ) || null
+          : null;
+        const selectedStart = exactOutcomeStart || (
+          !persistedClosedOutcome
+            ? selectableStarts[selectableStarts.length - 1] || null
+            : null
+        );
+        selectedRunId = persistedClosedOutcome?.runId || selectedStart?.runId ||
+          uniqueWorkspaceConclusionRunId(
+            runtimeEvents,
+            `run-admission-${input.entry.receipt.receiptId}`,
+          );
+        selectedParentRunId = persistedClosedOutcome?.parentRunId ||
+          selectedStart?.parentRunId || null;
+        resultKind = persistedOutcomeResultKind || resultKind;
+        selectedSummary = String(inspection.owner!.turn.summary || "").trim() || selectedSummary;
+        runtimeEvents = insertRestoredRunStartBeforeTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: input.timestampMs,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+        });
+        for (const openStart of openStarts) {
+          if (openStart.runId === selectedRunId &&
+              openStart.parentRunId === selectedParentRunId) continue;
+          runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+            type: "run.completed",
+            threadId: input.sessionKey,
+            turnId: sourceTurnId,
+            timestampMs: input.timestampMs,
+            runId: openStart.runId,
+            parentRunId: openStart.parentRunId,
+            resultKind: "error",
+            summary: input.language === "en"
+              ? "A stale admitted Run was closed while reconciling its durable Turn owner."
+              : "协调持久化回合所有权时，已将遗留运行收口。",
+          }));
+        }
+        if (resultKind === "canceled") {
+          runtimeEvents = insertRestoredRunAbortBeforeConclusion({
+            runtimeEvents,
+            sessionKey: input.sessionKey,
+            turnId: sourceTurnId,
+            runId: selectedRunId,
+            parentRunId: selectedParentRunId,
+            timestampMs: input.timestampMs,
+            reason: input.recoveryReason || "workspace_instruction_canceled",
+            message: selectedSummary,
+          });
+        }
+        runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+          runtimeEvents,
+          sessionKey: input.sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: input.timestampMs,
+          runId: selectedRunId,
+          parentRunId: selectedParentRunId,
+          resultKind,
+          summary: selectedSummary,
+        });
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "turn.completed",
+          threadId: input.sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: input.timestampMs,
+          resultKind,
+        }));
+      }
+    }
+    const canonical = canonicalizeRestoredTerminalTurnFinal({
+      taskFlow: input.taskFlow,
+      conversationTurns: input.conversationTurns,
+      turnId: sourceTurnId,
+      resultKind,
+      runId: selectedRunId,
+      parentRunId: selectedParentRunId,
+      completedAt: input.timestampMs,
+      runSummary: selectedSummary,
+      finalText: selectedSummary,
+      forceFinalText: true,
+      markerReason: input.recoveryReason || (
+        input.resultKind === "error"
+          ? "workspace_instruction_dispatch_rejected"
+          : "workspace_instruction_action_applied"
+      ),
+      reservedTaskBlockIds: input.reservedTaskBlockIds,
+    });
+    return {
+      ...canonical,
+      runtimeEvents,
+      disposition: "source_completed",
+      presentationTurnId: sourceTurnId,
+    };
+  }
+
+  const recoverySummary = String(input.summary || "").trim() || (
+    input.language === "en"
+      ? "MAIN found an ownership conflict while closing this workspace Turn. Unrelated history was preserved and a separate recovery Turn recorded the error."
+      : "MAIN 在收口工作区回合时发现所有权冲突；无关历史保持不变，并由独立恢复回合记录该错误。"
+  );
+  let recoveryBaseTaskFlow = input.taskFlow;
+  let recoveryBaseConversationTurns = input.conversationTurns;
+  let recoveryBaseRuntimeEvents = input.runtimeEvents;
+  let repairedSourceRunId: string | null = null;
+  if (inspection.owner) {
+    const sourceTerminal = inspection.terminals[0] || null;
+    const sourceResultKind: WorkspaceInstructionTerminalResultKind =
+      sourceTerminal?.resultKind || "error";
+    const preservedSourceSummary = sourceResultKind === "error"
+      ? recoverySummary
+      : String(inspection.owner.turn.summary || "").trim() || (
+          input.language === "en"
+            ? "The existing terminal result was preserved while its corrupt Run trace was isolated."
+            : "已保留现有终态结果，并隔离损坏的运行轨迹。"
+        );
+    const closedCorruptRunIds = new Set<string>();
+    for (const sourceStart of persistedSourceStarts) {
+      if (closedCorruptRunIds.has(sourceStart.runId)) continue;
+      closedCorruptRunIds.add(sourceStart.runId);
+      const hasRunBoundary = persistedSourceConclusions.some(
+        (conclusion) => conclusion.runId === sourceStart.runId,
+      );
+      if (hasRunBoundary) continue;
+      recoveryBaseRuntimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+        runtimeEvents: recoveryBaseRuntimeEvents,
+        sessionKey: input.sessionKey,
+        turnId: sourceTurnId,
+        runId: sourceStart.runId,
+        parentRunId: sourceStart.parentRunId,
+        timestampMs: sourceTerminal
+          ? Math.min(input.timestampMs, sourceTerminal.timestampMs)
+          : input.timestampMs,
+        resultKind: "error",
+        summary: input.language === "en"
+          ? "This ambiguous Run owner was closed while isolating a corrupt workspace Turn trace."
+          : "隔离损坏的工作区回合轨迹时，已将这个含歧义的运行所有者收口。",
+      });
+    }
+    repairedSourceRunId = uniqueWorkspaceConclusionRunId(
+      recoveryBaseRuntimeEvents,
+      `run-admission-source-recovery-${input.entry.receipt.receiptId}`,
+    );
+    recoveryBaseRuntimeEvents = insertRestoredRunStartBeforeTerminal({
+      runtimeEvents: recoveryBaseRuntimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      runId: repairedSourceRunId,
+      parentRunId: null,
+      timestampMs: sourceTerminal
+        ? Math.min(input.timestampMs, sourceTerminal.timestampMs)
+        : input.timestampMs,
+    });
+    recoveryBaseRuntimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+      runtimeEvents: recoveryBaseRuntimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      runId: repairedSourceRunId,
+      parentRunId: null,
+      timestampMs: sourceTerminal
+        ? Math.min(input.timestampMs, sourceTerminal.timestampMs)
+        : input.timestampMs,
+      resultKind: sourceResultKind,
+      summary: preservedSourceSummary,
+    });
+    if (sourceResultKind === "canceled") {
+      recoveryBaseRuntimeEvents = insertRestoredRunAbortBeforeConclusion({
+        runtimeEvents: recoveryBaseRuntimeEvents,
+        sessionKey: input.sessionKey,
+        turnId: sourceTurnId,
+        runId: repairedSourceRunId,
+        parentRunId: null,
+        timestampMs: sourceTerminal
+          ? Math.min(input.timestampMs, sourceTerminal.timestampMs)
+          : input.timestampMs,
+        reason: input.recoveryReason || "workspace_instruction_canceled",
+        message: preservedSourceSummary,
+      });
+    }
+    if (!sourceTerminal) {
+      recoveryBaseRuntimeEvents = appendRuntimeEvent(
+        recoveryBaseRuntimeEvents,
+        withEventSchema({
+          type: "turn.completed",
+          threadId: input.sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: input.timestampMs,
+          resultKind: sourceResultKind,
+        }),
+      );
+    }
+    const closedSource = canonicalizeRestoredTerminalTurnFinal({
+      taskFlow: recoveryBaseTaskFlow,
+      conversationTurns: recoveryBaseConversationTurns,
+      turnId: sourceTurnId,
+      resultKind: sourceResultKind,
+      runId: repairedSourceRunId,
+      parentRunId: null,
+      completedAt: input.timestampMs,
+      runSummary: preservedSourceSummary,
+      finalText: preservedSourceSummary,
+      forceFinalText: true,
+      markerReason: "workspace_instruction_source_trace_corrupt",
+      reservedTaskBlockIds: input.reservedTaskBlockIds,
+    });
+    recoveryBaseTaskFlow = closedSource.taskFlow;
+    recoveryBaseConversationTurns = closedSource.conversationTurns;
+  }
+  const recoveryTurnId = uniqueWorkspaceRecoveryTurnId({
+    receiptId: input.entry.receipt.receiptId,
+    taskFlow: recoveryBaseTaskFlow,
+    conversationTurns: recoveryBaseConversationTurns,
+    runtimeEvents: recoveryBaseRuntimeEvents,
+  });
+  const exactOutcome = inspection.owner?.turn.runtimeOutcome?.status === "completed"
+    ? inspection.owner.turn.runtimeOutcome
+    : null;
+  const trustworthyParentConclusions = exactOutcome
+    ? recoveryBaseRuntimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+          event.type === "run.completed" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId &&
+          event.runId === exactOutcome.runId &&
+          event.parentRunId === exactOutcome.parentRunId &&
+          (event.resultKind || "success") === exactOutcome.resultKind,
+      )
+    : [];
+  const trustworthyParentStarts = exactOutcome
+    ? recoveryBaseRuntimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+          event.type === "run.started" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === sourceTurnId &&
+          event.runId === exactOutcome.runId &&
+          event.parentRunId === exactOutcome.parentRunId,
+      )
+    : [];
+  const parentRunId = repairedSourceRunId || (
+    trustworthyParentConclusions.length === 1 &&
+      trustworthyParentStarts.length === 1 &&
+      recoveryBaseRuntimeEvents.indexOf(trustworthyParentStarts[0]) <
+        recoveryBaseRuntimeEvents.indexOf(trustworthyParentConclusions[0])
+    ? trustworthyParentConclusions[0].runId
+    : null
+  );
+  const recoveryRunId = uniqueWorkspaceConclusionRunId(
+    recoveryBaseRuntimeEvents,
+    `run-workspace-recovery-${input.entry.receipt.receiptId}`,
+  );
+  const recoveryUserBlockId = nextRestoredTaskBlockId(
+    recoveryBaseTaskFlow,
+    recoveryBaseConversationTurns,
+    input.reservedTaskBlockIds,
+  );
+  const recoveryFinalBlockId = nextRestoredTaskBlockId(
+    [...recoveryBaseTaskFlow, {
+      id: recoveryUserBlockId,
+      turnId: recoveryTurnId,
+      type: "user",
+      content: input.entry.instruction.payload.text,
+    }],
+    recoveryBaseConversationTurns,
+    input.reservedTaskBlockIds,
+  );
+  let runtimeEvents = appendRuntimeEvent(recoveryBaseRuntimeEvents, withEventSchema({
+    type: "run.started",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.timestampMs,
+    runId: recoveryRunId,
+    parentRunId,
+  }));
+  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+    type: "run.completed",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.timestampMs,
+    runId: recoveryRunId,
+    parentRunId,
+    resultKind: "error",
+    summary: recoverySummary,
+  }));
+  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+    type: "turn.completed",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.timestampMs,
+    resultKind: "error",
+  }));
+  const conversationTurns = [...recoveryBaseConversationTurns, {
+    id: recoveryTurnId,
+    userPrompt: input.entry.instruction.payload.text,
+    title: normalizeConversationDisplayTitle(
+      input.entry.instruction.payload.text,
+      input.language === "en" ? 48 : 40,
+      input.language === "en" ? "Workspace recovery" : "工作区恢复",
+    ),
+    intentSummary: input.language === "en"
+      ? "A durable workspace receipt was closed at an ownership recovery boundary."
+      : "持久化工作区回执已在所有权恢复边界收口。",
+    mode: "chat" as const,
+    intent: "respond" as const,
+    displayIntent: "respond" as const,
+    status: "error" as const,
+    summary: recoverySummary,
+    blockIds: [recoveryUserBlockId, recoveryFinalBlockId],
+    processCollapsed: false,
+    collapsed: false,
+    createdAt: input.timestampMs,
+    runtimeOutcome: {
+      status: "completed" as const,
+      reason: input.recoveryReason || "workspace_instruction_projection_conflict",
+      resultKind: "error" as const,
+      runId: recoveryRunId,
+      parentRunId,
+      updatedAt: input.timestampMs,
+    },
+  }];
+  return {
+    taskFlow: [
+      ...recoveryBaseTaskFlow,
+      {
+        id: recoveryUserBlockId,
+        turnId: recoveryTurnId,
+        type: "user",
+        content: input.entry.instruction.payload.text,
+        ...(input.entry.instruction.payload.images?.length
+          ? { images: [...input.entry.instruction.payload.images] }
+          : {}),
+      },
+      {
+        id: recoveryFinalBlockId,
+        turnId: recoveryTurnId,
+        type: "agent",
+        content: recoverySummary,
+        streaming: false,
+        visibility: "assistant_final",
+      },
+    ],
+    conversationTurns,
+    runtimeEvents,
+    disposition: "recovery_completed",
+    presentationTurnId: recoveryTurnId,
+  };
+}
+
+function isRestoredLocalFastQueueEntry(
+  entry: WorkspaceTurnQueueEntry,
+): boolean {
+  const command = parseGameStudioSlashCommand(entry.instruction.payload.text);
+  return !!command &&
+    getGameStudioSlashCommandSpec(command)?.executionMode === "local_fast";
+}
+
+function hasCanonicalRestoredLocalFastConclusion(input: {
+  entry: WorkspaceTurnQueueEntry;
+  sessionKey: string;
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  runtimeEvents: MainThreadEvent[];
+  workspacePath?: string | null;
+}): boolean {
+  const sourceTurnId = input.entry.receipt.turnId;
+  const useChinese = /[^\x00-\x7F]/.test(input.entry.instruction.payload.text);
+  const projection = reconcileWorkspaceInstructionProjection({
+    entry: input.entry,
+    taskFlow: input.taskFlow,
+    conversationTurns: input.conversationTurns,
+    userContextItems: buildWorkspaceInstructionUserContext({
+      contextMentions: input.entry.instruction.payload.contextMentions
+        ? [...input.entry.instruction.payload.contextMentions]
+        : [],
+      attachedFiles: input.entry.instruction.payload.attachedFiles
+        ? input.entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+        : [],
+      images: input.entry.instruction.payload.images
+        ? [...input.entry.instruction.payload.images]
+        : [],
+      workspace: input.workspacePath || "",
+      language: useChinese ? "zh" : "en",
+    }),
+    language: useChinese ? "zh" : "en",
+  });
+  if (
+    projection.disposition === "ready" &&
+    !projection.changed &&
+    projection.turn.createdAt === input.entry.receipt.acceptedAt
+  ) {
+    const turn = projection.turn;
+    const outcome = turn.runtimeOutcome;
+    const sourceStarts = input.runtimeEvents.filter(
+      (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+        event.type === "run.started" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === sourceTurnId,
+    );
+    const exactSourceStarts = sourceStarts.filter(
+      (event) => event.runId === outcome?.runId,
+    );
+    const allSourceRunConclusions = input.runtimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId
+    );
+    const runConclusions = allSourceRunConclusions.filter(
+      (event) => event.type === "run.completed" && event.runId === outcome?.runId,
+    );
+    const turnConclusions = input.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId
+    );
+    const finals = input.taskFlow.filter(
+      (block): block is Extract<TaskBlock, { type: "agent" }> =>
+        block.type === "agent" &&
+        block.turnId === sourceTurnId &&
+        block.visibility === "assistant_final",
+    );
+    const sourceStart = exactSourceStarts[0];
+    const runConclusion = runConclusions[0];
+    const turnConclusion = turnConclusions[0];
+    const sourceStartIndex = sourceStart
+      ? input.runtimeEvents.indexOf(sourceStart)
+      : -1;
+    const runConclusionIndex = runConclusion
+      ? input.runtimeEvents.indexOf(runConclusion)
+      : -1;
+    const turnConclusionIndex = turnConclusion
+      ? input.runtimeEvents.indexOf(turnConclusion)
+      : -1;
+    if (
+      outcome?.status === "completed" &&
+      !!outcome.resultKind &&
+      sourceStarts.length === 1 &&
+      exactSourceStarts.length === 1 &&
+      sourceStart?.type === "run.started" &&
+      sourceStart.parentRunId === outcome.parentRunId &&
+      sourceStartIndex >= 0 &&
+      sourceStartIndex < runConclusionIndex &&
+      runConclusionIndex < turnConclusionIndex &&
+      allSourceRunConclusions.length === 1 &&
+      runConclusions.length === 1 &&
+      runConclusion?.type === "run.completed" &&
+      runConclusion.parentRunId === outcome.parentRunId &&
+      runConclusion.resultKind === outcome.resultKind &&
+      typeof runConclusion.summary === "string" &&
+      runConclusion.summary === turn.summary &&
+      turnConclusions.length === 1 &&
+      turnConclusion?.type === "turn.completed" &&
+      turnConclusion.resultKind === outcome.resultKind &&
+      finals.length === 1 &&
+      finals[0].streaming !== true &&
+      finals[0].content === runConclusion.summary
+    ) return true;
+  }
+
+  // A same-ID replacement cannot own the source receipt's Turn terminal. The
+  // immutable source Run is closed, while a visible recovery child owns the
+  // final/Turn pair and links back through parentRunId.
+  const sourceRunConclusions = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  return sourceRunConclusions.some((sourceConclusion) =>
+    input.runtimeEvents.some((recoveryStart) => {
+      if (
+        recoveryStart.type !== "run.started" ||
+        recoveryStart.threadId !== input.sessionKey ||
+        recoveryStart.turnId === sourceTurnId ||
+        recoveryStart.parentRunId !== sourceConclusion.runId
+      ) return false;
+      const recoveryStarts = input.runtimeEvents.filter(
+        (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+          event.type === "run.started" &&
+          event.threadId === input.sessionKey &&
+          event.turnId === recoveryStart.turnId,
+      );
+      const recoveryRunConclusions = input.runtimeEvents.filter((event) =>
+        event.type === "run.completed" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === recoveryStart.turnId &&
+        event.runId === recoveryStart.runId
+      );
+      const recoveryTurnConclusions = input.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === input.sessionKey &&
+        event.turnId === recoveryStart.turnId
+      );
+      const recoveryTurn = input.conversationTurns.find(
+        (candidate) => candidate.id === recoveryStart.turnId,
+      );
+      const recoveryFinals = input.taskFlow.filter(
+        (block): block is Extract<TaskBlock, { type: "agent" }> =>
+          block.type === "agent" &&
+          block.turnId === recoveryStart.turnId &&
+          block.visibility === "assistant_final",
+      );
+      const recoveryRunConclusion = recoveryRunConclusions[0];
+      const recoveryTurnConclusion = recoveryTurnConclusions[0];
+      const recoveryStartIndex = input.runtimeEvents.indexOf(recoveryStart);
+      const recoveryRunConclusionIndex = recoveryRunConclusion
+        ? input.runtimeEvents.indexOf(recoveryRunConclusion)
+        : -1;
+      const recoveryTurnConclusionIndex = recoveryTurnConclusion
+        ? input.runtimeEvents.indexOf(recoveryTurnConclusion)
+        : -1;
+      return recoveryStarts.length === 1 &&
+        recoveryStarts[0]?.runId === recoveryStart.runId &&
+        recoveryStarts[0]?.parentRunId === sourceConclusion.runId &&
+        recoveryStartIndex >= 0 &&
+        recoveryStartIndex < recoveryRunConclusionIndex &&
+        recoveryRunConclusionIndex < recoveryTurnConclusionIndex &&
+        recoveryRunConclusions.length === 1 &&
+        recoveryTurnConclusions.length === 1 &&
+        recoveryRunConclusion?.type === "run.completed" &&
+        recoveryTurnConclusion?.type === "turn.completed" &&
+        recoveryRunConclusion.resultKind === recoveryTurnConclusion.resultKind &&
+        recoveryRunConclusion.summary === recoveryTurn?.summary &&
+        recoveryTurn?.runtimeOutcome?.status === "completed" &&
+        recoveryTurn.runtimeOutcome.runId === recoveryStart.runId &&
+        recoveryTurn.runtimeOutcome.parentRunId === sourceConclusion.runId &&
+        recoveryTurn.runtimeOutcome.resultKind === recoveryRunConclusion.resultKind &&
+        recoveryFinals.length === 1 &&
+        recoveryFinals[0].streaming !== true &&
+        recoveryFinals[0].content === recoveryRunConclusion.summary;
+    })
+  );
+}
+
+function insertRestoredRunStartBeforeTerminal(input: {
+  runtimeEvents: MainThreadEvent[];
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  timestampMs: number;
+}): MainThreadEvent[] {
+  const matchingStarts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+      event.type === "run.started" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.runId === input.runId &&
+      event.parentRunId === input.parentRunId,
+  );
+  const sameRunStarts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+      event.type === "run.started" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.runId === input.runId,
+  );
+  const findTerminalIndex = (events: MainThreadEvent[]) => events.findIndex((event) =>
+    event.threadId === input.sessionKey &&
+    "turnId" in event &&
+      event.turnId === input.turnId &&
+      (
+      (
+        (event.type === "run.paused" ||
+          event.type === "run.aborted" ||
+          event.type === "run.completed") &&
+        event.runId === input.runId &&
+        event.parentRunId === input.parentRunId
+      ) ||
+      event.type === "turn.completed"
+    )
+  );
+  const terminalIndex = findTerminalIndex(input.runtimeEvents);
+  const placeExistingStartBeforeTerminal = (
+    existingStart: Extract<MainThreadEvent, { type: "run.started" }>,
+  ): MainThreadEvent[] => {
+    const startIndex = input.runtimeEvents.indexOf(existingStart);
+    if (terminalIndex < 0 || startIndex < terminalIndex) return input.runtimeEvents;
+    const withoutLateStart = input.runtimeEvents.filter((event) => event !== existingStart);
+    const nextTerminalIndex = findTerminalIndex(withoutLateStart);
+    return [
+      ...withoutLateStart.slice(0, nextTerminalIndex),
+      existingStart,
+      ...withoutLateStart.slice(nextTerminalIndex),
+    ];
+  };
+  if (matchingStarts.length === 1) {
+    return placeExistingStartBeforeTerminal(matchingStarts[0]);
+  }
+  if (matchingStarts.length > 1) return input.runtimeEvents;
+  // A parent mismatch is corrupt ownership evidence and forces recovery, but
+  // the existing same-run start still precedes this completion. Do not invent
+  // a second start with the same runId merely to paper over that conflict.
+  if (sameRunStarts.length === 1) {
+    return placeExistingStartBeforeTerminal(sameRunStarts[0]);
+  }
+  if (sameRunStarts.length > 1) return input.runtimeEvents;
+  const start = withEventSchema({
+    type: "run.started",
+    threadId: input.sessionKey,
+    turnId: input.turnId,
+    timestampMs: input.timestampMs,
+    runId: input.runId,
+    parentRunId: input.parentRunId,
+  });
+  if (terminalIndex < 0) {
+    return appendRuntimeEvent(input.runtimeEvents, start);
+  }
+  return [
+    ...input.runtimeEvents.slice(0, terminalIndex),
+    start,
+    ...input.runtimeEvents.slice(terminalIndex),
+  ];
+}
+
+function insertRestoredRunConclusionBeforeTurnTerminal(input: {
+  runtimeEvents: MainThreadEvent[];
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  timestampMs: number;
+  resultKind: "success" | "partial" | "blocked" | "error" | "canceled";
+  summary: string;
+}): MainThreadEvent[] {
+  const matchingConclusions = input.runtimeEvents.filter((event) =>
+    event.type === "run.completed" &&
+    event.threadId === input.sessionKey &&
+    event.turnId === input.turnId &&
+    event.runId === input.runId
+  );
+  const findTurnTerminalIndex = (events: MainThreadEvent[]) => events.findIndex((event) =>
+    event.type === "turn.completed" &&
+    event.threadId === input.sessionKey &&
+    event.turnId === input.turnId
+  );
+  const turnTerminalIndex = findTurnTerminalIndex(input.runtimeEvents);
+  if (matchingConclusions.length === 1) {
+    const existingConclusion = matchingConclusions[0];
+    const conclusionIndex = input.runtimeEvents.indexOf(existingConclusion);
+    if (turnTerminalIndex < 0 || conclusionIndex < turnTerminalIndex) {
+      return input.runtimeEvents;
+    }
+    const withoutLateConclusion = input.runtimeEvents.filter(
+      (event) => event !== existingConclusion,
+    );
+    const nextTurnTerminalIndex = findTurnTerminalIndex(withoutLateConclusion);
+    return [
+      ...withoutLateConclusion.slice(0, nextTurnTerminalIndex),
+      existingConclusion,
+      ...withoutLateConclusion.slice(nextTurnTerminalIndex),
+    ];
+  }
+  if (matchingConclusions.length > 1) return input.runtimeEvents;
+  const conclusion = withEventSchema({
+    type: "run.completed",
+    threadId: input.sessionKey,
+    turnId: input.turnId,
+    timestampMs: input.timestampMs,
+    runId: input.runId,
+    parentRunId: input.parentRunId,
+    resultKind: input.resultKind,
+    summary: input.summary,
+  });
+  if (turnTerminalIndex < 0) {
+    return appendRuntimeEvent(input.runtimeEvents, conclusion);
+  }
+  return [
+    ...input.runtimeEvents.slice(0, turnTerminalIndex),
+    conclusion,
+    ...input.runtimeEvents.slice(turnTerminalIndex),
+  ];
+}
+
+function insertRestoredRunAbortBeforeConclusion(input: {
+  runtimeEvents: MainThreadEvent[];
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  timestampMs: number;
+  reason: string;
+  message: string;
+}): MainThreadEvent[] {
+  const matchingAborts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+      event.type === "run.aborted" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.runId === input.runId &&
+      event.parentRunId === input.parentRunId,
+  );
+  const sameRunAborts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+      event.type === "run.aborted" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.runId === input.runId,
+  );
+  const findConclusionIndex = (events: MainThreadEvent[]) => events.findIndex((event) =>
+    event.threadId === input.sessionKey &&
+    "turnId" in event &&
+    event.turnId === input.turnId &&
+    (
+      (event.type === "run.completed" &&
+        event.runId === input.runId &&
+        event.parentRunId === input.parentRunId) ||
+      event.type === "turn.completed"
+    )
+  );
+  const conclusionIndex = findConclusionIndex(input.runtimeEvents);
+  if (matchingAborts.length === 1) {
+    const existingAbort = matchingAborts[0];
+    const abortIndex = input.runtimeEvents.indexOf(existingAbort);
+    if (conclusionIndex < 0 || abortIndex < conclusionIndex) return input.runtimeEvents;
+    const withoutLateAbort = input.runtimeEvents.filter((event) => event !== existingAbort);
+    const nextConclusionIndex = findConclusionIndex(withoutLateAbort);
+    return [
+      ...withoutLateAbort.slice(0, nextConclusionIndex),
+      existingAbort,
+      ...withoutLateAbort.slice(nextConclusionIndex),
+    ];
+  }
+  if (matchingAborts.length > 1 || sameRunAborts.length > 0) {
+    return input.runtimeEvents;
+  }
+  const abort = withEventSchema({
+    type: "run.aborted",
+    threadId: input.sessionKey,
+    turnId: input.turnId,
+    timestampMs: input.timestampMs,
+    runId: input.runId,
+    parentRunId: input.parentRunId,
+    reason: input.reason,
+    message: input.message,
+  });
+  if (conclusionIndex < 0) {
+    return appendRuntimeEvent(input.runtimeEvents, abort);
+  }
+  return [
+    ...input.runtimeEvents.slice(0, conclusionIndex),
+    abort,
+    ...input.runtimeEvents.slice(conclusionIndex),
+  ];
+}
+
+function quarantineRestoredLocalFastEntry(input: {
+  entry: WorkspaceTurnQueueEntry;
+  sessionKey: string;
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  runtimeEvents: MainThreadEvent[];
+  at: number;
+  workspacePath?: string | null;
+  reservedTaskBlockIds?: readonly number[];
+}): {
+  taskFlow: TaskBlock[];
+  conversationTurns: ConversationTurn[];
+  runtimeEvents: MainThreadEvent[];
+  presentationTurnId: string;
+} {
+  const sourceTurnId = input.entry.receipt.turnId;
+  const sourceStarts = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+      event.type === "run.started" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  const useChinese = /[^\x00-\x7F]/.test(input.entry.instruction.payload.text);
+  const quarantineSummary = useChinese
+    ? "应用重启时无法确认这条本地命令是否已经执行。为避免重复副作用，MAIN 未自动重放，并将本回合以错误结论收口；请发送一条新指令重试。"
+    : "MAIN could not prove whether this local command already executed before restart. To prevent a duplicate side effect, it was not replayed; this turn is closed with an error. Submit a new instruction to retry.";
+  const projection = reconcileWorkspaceInstructionProjection({
+    entry: input.entry,
+    taskFlow: input.taskFlow,
+    conversationTurns: input.conversationTurns,
+    userContextItems: buildWorkspaceInstructionUserContext({
+      contextMentions: input.entry.instruction.payload.contextMentions
+        ? [...input.entry.instruction.payload.contextMentions]
+        : [],
+      attachedFiles: input.entry.instruction.payload.attachedFiles
+        ? input.entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+        : [],
+      images: input.entry.instruction.payload.images
+        ? [...input.entry.instruction.payload.images]
+        : [],
+      workspace: input.workspacePath || "",
+      language: useChinese ? "zh" : "en",
+    }),
+    language: useChinese ? "zh" : "en",
+  });
+  const exactTurn = projection.disposition === "ready" &&
+      projection.turn.createdAt === input.entry.receipt.acceptedAt
+    ? projection.turn
+    : null;
+  const allSourceConclusions = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  // A crash may persist the terminal projection while omitting run.started.
+  // Repair that exact immutable Turn using its recorded run owner; do not
+  // invent a second Run and leave the already-completed Run orphaned.
+  const latestSourceStart = sourceStarts[sourceStarts.length - 1] || null;
+  const sourceRunId = latestSourceStart?.runId ||
+    exactTurn?.runtimeOutcome?.runId ||
+    (allSourceConclusions.length === 1 ? allSourceConclusions[0].runId : "") ||
+    `run-local-fast-quarantine-${input.entry.receipt.receiptId}`;
+  const sourceParentRunId = latestSourceStart
+    ? latestSourceStart.parentRunId
+    : exactTurn?.runtimeOutcome
+    ? exactTurn.runtimeOutcome.parentRunId
+    : allSourceConclusions.length === 1
+    ? allSourceConclusions[0].parentRunId
+    : null;
+  const sourceConclusions = allSourceConclusions.filter(
+    (event) => event.runId === sourceRunId,
+  );
+  const existingSourceConclusion = sourceConclusions[0];
+  const turnConclusions = input.runtimeEvents.filter(
+    (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
+      event.type === "turn.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId,
+  );
+  const existingTurnConclusion = turnConclusions[0];
+  const preservedSummary = String(existingSourceConclusion?.summary || "").trim();
+  const resultKind = existingSourceConclusion?.resultKind ||
+    existingTurnConclusion?.resultKind ||
+    "error";
+  const directSummary = preservedSummary || quarantineSummary;
+  const exactOutcome = exactTurn?.runtimeOutcome;
+  const existingSourceParentMatches = !existingSourceConclusion ||
+    existingSourceConclusion.parentRunId === sourceParentRunId;
+  const exactOutcomeOwnerMatches = !exactOutcome ||
+    (
+      exactOutcome.runId === sourceRunId &&
+      exactOutcome.parentRunId === sourceParentRunId
+    );
+  const trustedExactOutcomeSummary = exactOutcome?.status === "completed" &&
+      exactOutcomeOwnerMatches
+    ? String(exactTurn?.summary || "").trim()
+    : "";
+  const canPreserveExactOutcome = !!trustedExactOutcomeSummary &&
+    exactOutcome?.status === "completed" &&
+    exactOutcome.resultKind === resultKind;
+  const allSourceConclusionsMatchOwner = allSourceConclusions.length ===
+      sourceConclusions.length &&
+    allSourceConclusions.every((event) =>
+      event.runId === sourceRunId && event.parentRunId === sourceParentRunId
+    );
+  const existingTerminalOrderIsValid = !existingTurnConclusion ||
+    (
+      !!existingSourceConclusion &&
+      input.runtimeEvents.indexOf(existingSourceConclusion) <
+        input.runtimeEvents.indexOf(existingTurnConclusion)
+    );
+  const canCloseExactTurn = !!exactTurn &&
+    sourceStarts.length <= 1 &&
+    sourceConclusions.length <= 1 &&
+    existingSourceParentMatches &&
+    exactOutcomeOwnerMatches &&
+    allSourceConclusionsMatchOwner &&
+    existingTerminalOrderIsValid &&
+    turnConclusions.length <= 1 &&
+    (!existingTurnConclusion || existingTurnConclusion.resultKind === resultKind) &&
+    (!existingSourceConclusion || !!preservedSummary);
+  let runtimeEvents = input.runtimeEvents;
+  // A terminal record without a start is still useful owner evidence. Insert
+  // the missing start before its first terminal event so replay/golden traces
+  // retain the required start -> run.completed -> turn.completed order.
+  for (const conclusion of allSourceConclusions) {
+    runtimeEvents = insertRestoredRunStartBeforeTerminal({
+      runtimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      runId: conclusion.runId,
+      parentRunId: conclusion.parentRunId,
+      timestampMs: Math.min(input.at, conclusion.timestampMs),
+    });
+    runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+      runtimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      runId: conclusion.runId,
+      parentRunId: conclusion.parentRunId,
+      timestampMs: conclusion.timestampMs,
+      resultKind: conclusion.resultKind || "success",
+      summary: String(conclusion.summary || ""),
+    });
+  }
+  if (sourceStarts.length === 0) {
+    const firstSourceTerminalAt = Math.min(
+      ...[
+        ...sourceConclusions.map((event) => event.timestampMs),
+        ...turnConclusions.map((event) => event.timestampMs),
+      ].filter((timestampMs) => Number.isFinite(timestampMs)),
+    );
+    runtimeEvents = insertRestoredRunStartBeforeTerminal({
+      runtimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      runId: sourceRunId,
+      parentRunId: sourceParentRunId,
+      timestampMs: Number.isFinite(firstSourceTerminalAt)
+        ? Math.min(input.at, firstSourceTerminalAt)
+        : input.at,
+    });
+  }
+  // Corrupt traces may contain more than one admitted source Run. Every old
+  // Run is closed before the receipt leaves FIFO; none is silently abandoned.
+  for (const sourceStart of sourceStarts) {
+    const hasConclusion = runtimeEvents.some((event) =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId &&
+      event.runId === sourceStart.runId
+    );
+    if (hasConclusion) continue;
+    runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+      runtimeEvents,
+      sessionKey: input.sessionKey,
+      turnId: sourceTurnId,
+      timestampMs: existingTurnConclusion
+        ? Math.min(input.at, existingTurnConclusion.timestampMs)
+        : input.at,
+      runId: sourceStart.runId,
+      parentRunId: sourceStart.parentRunId,
+      resultKind: sourceStart.runId === sourceRunId && canCloseExactTurn
+        ? resultKind
+        : "error",
+      summary: sourceStart.runId === sourceRunId && canCloseExactTurn
+        ? directSummary
+        : quarantineSummary,
+    });
+  }
+  if (!existingSourceConclusion) {
+    const nowHasSourceConclusion = runtimeEvents.some((event) =>
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === sourceTurnId &&
+      event.runId === sourceRunId
+    );
+    if (!nowHasSourceConclusion) {
+      runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+        runtimeEvents,
+        sessionKey: input.sessionKey,
+        turnId: sourceTurnId,
+        timestampMs: existingTurnConclusion
+          ? Math.min(input.at, existingTurnConclusion.timestampMs)
+          : input.at,
+        runId: sourceRunId,
+        parentRunId: sourceParentRunId,
+        resultKind: canCloseExactTurn || canPreserveExactOutcome
+          ? resultKind
+          : "error",
+        summary: canCloseExactTurn
+          ? directSummary
+          : canPreserveExactOutcome
+          ? trustedExactOutcomeSummary
+          : quarantineSummary,
+      });
+    }
+  }
+
+  if (canCloseExactTurn) {
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+      type: "turn.completed",
+      threadId: input.sessionKey,
+      turnId: sourceTurnId,
+      timestampMs: input.at,
+      resultKind,
+    }));
+    const canonical = canonicalizeRestoredTerminalTurnFinal({
+      taskFlow: projection.disposition === "ready" ? projection.taskFlow : input.taskFlow,
+      conversationTurns: projection.disposition === "ready"
+        ? projection.conversationTurns
+        : input.conversationTurns,
+      turnId: sourceTurnId,
+      resultKind,
+      runId: sourceRunId,
+      parentRunId: sourceParentRunId,
+      completedAt: input.at,
+      runSummary: directSummary,
+      finalText: directSummary,
+      forceFinalText: true,
+      markerReason: "local_fast_restart_quarantined",
+      reservedTaskBlockIds: input.reservedTaskBlockIds,
+    });
+    return {
+      ...canonical,
+      runtimeEvents,
+      presentationTurnId: sourceTurnId,
+    };
+  }
+
+  let recoveryBaseTaskFlow = input.taskFlow;
+  let recoveryBaseConversationTurns = input.conversationTurns;
+  if (exactTurn && turnConclusions.length === 0) {
+    // Identity is still the admitted receipt, but its persisted Run set is
+    // corrupt. Close that exact source Turn before adding the diagnostic child
+    // so every admitted Turn retains one terminal lifecycle event.
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+      type: "turn.completed",
+      threadId: input.sessionKey,
+      turnId: sourceTurnId,
+      timestampMs: input.at,
+      resultKind: "error",
+    }));
+    const closedSource = canonicalizeRestoredTerminalTurnFinal({
+      taskFlow: projection.disposition === "ready" ? projection.taskFlow : input.taskFlow,
+      conversationTurns: projection.disposition === "ready"
+        ? projection.conversationTurns
+        : input.conversationTurns,
+      turnId: sourceTurnId,
+      resultKind: "error",
+      runId: sourceRunId,
+      parentRunId: sourceParentRunId,
+      completedAt: input.at,
+      runSummary: quarantineSummary,
+      finalText: quarantineSummary,
+      forceFinalText: true,
+      markerReason: "local_fast_restart_source_trace_corrupt",
+      reservedTaskBlockIds: input.reservedTaskBlockIds,
+    });
+    recoveryBaseTaskFlow = closedSource.taskFlow;
+    recoveryBaseConversationTurns = closedSource.conversationTurns;
+  }
+
+  const safeReceiptId = input.entry.receipt.receiptId
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "receipt";
+  const baseRecoveryTurnId = `local-slash-recovery-${safeReceiptId}`;
+  let recoveryTurnId = baseRecoveryTurnId;
+  let suffix = 2;
+  const recoveryTurnIdOccupied = (turnId: string) =>
+    recoveryBaseConversationTurns.some((turn) => turn.id === turnId) ||
+    recoveryBaseTaskFlow.some((block) => block.turnId === turnId) ||
+    runtimeEvents.some((event) => "turnId" in event && event.turnId === turnId);
+  while (recoveryTurnIdOccupied(recoveryTurnId)) {
+    recoveryTurnId = `${baseRecoveryTurnId}-${suffix}`;
+    suffix += 1;
+  }
+  const recoveryRunId = `${sourceRunId}-restart-quarantine`;
+  const recoveryUserBlockId = nextRestoredTaskBlockId(
+    recoveryBaseTaskFlow,
+    recoveryBaseConversationTurns,
+    input.reservedTaskBlockIds,
+  );
+  const recoveryFinalBlockId = nextRestoredTaskBlockId(
+    [...recoveryBaseTaskFlow, {
+      id: recoveryUserBlockId,
+      turnId: recoveryTurnId,
+      type: "user",
+      content: input.entry.instruction.payload.text,
+    }],
+    recoveryBaseConversationTurns,
+    input.reservedTaskBlockIds,
+  );
+  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+    type: "run.started",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.at,
+    runId: recoveryRunId,
+    parentRunId: sourceRunId,
+  }));
+  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+    type: "run.completed",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.at,
+    runId: recoveryRunId,
+    parentRunId: sourceRunId,
+    resultKind: "error",
+    summary: quarantineSummary,
+  }));
+  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+    type: "turn.completed",
+    threadId: input.sessionKey,
+    turnId: recoveryTurnId,
+    timestampMs: input.at,
+    resultKind: "error",
+  }));
+  return {
+    taskFlow: [
+      ...recoveryBaseTaskFlow,
+      {
+        id: recoveryUserBlockId,
+        turnId: recoveryTurnId,
+        type: "user",
+        content: input.entry.instruction.payload.text,
+      },
+      {
+        id: recoveryFinalBlockId,
+        turnId: recoveryTurnId,
+        type: "agent",
+        content: quarantineSummary,
+        streaming: false,
+        visibility: "assistant_final",
+      },
+    ],
+    conversationTurns: [
+      ...recoveryBaseConversationTurns,
+      {
+        id: recoveryTurnId,
+        userPrompt: input.entry.instruction.payload.text,
+        title: useChinese ? "本地命令恢复隔离" : "Local command recovery quarantine",
+        intentSummary: quarantineSummary,
+        mode: "chat",
+        intent: "respond",
+        displayIntent: "respond",
+        status: "error",
+        summary: quarantineSummary,
+        blockIds: [recoveryUserBlockId, recoveryFinalBlockId],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: input.entry.receipt.acceptedAt,
+        runtimeOutcome: {
+          status: "completed",
+          reason: "local_fast_restart_quarantined",
+          resultKind: "error",
+          runId: recoveryRunId,
+          parentRunId: sourceRunId,
+          updatedAt: input.at,
+        },
+      },
+    ],
+    runtimeEvents,
+    presentationTurnId: recoveryTurnId,
+  };
+}
+
 
 
 function normalizeStoredPlanExecutionProgressSnapshot(
@@ -2064,10 +4106,26 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
               : null,
           }
         : record;
-      normalized = appendRuntimeEvent(
-        normalized,
-        withEventSchema(eventRecord as MainThreadEventInput),
+      const event = normalizePersistedMainThreadEvent(
+        eventRecord as MainThreadEventInput | LegacyFailedMainThreadEvent,
       );
+      normalized = appendRuntimeEvent(normalized, event);
+      // Persisted abort-only traces predate the unique Run conclusion. Repair
+      // them at the read boundary so live consumers always see the canonical
+      // cancellation sequence before any Turn conclusion.
+      if (event.type === "run.aborted") {
+        normalized = appendRuntimeEvent(normalized, withEventSchema({
+          type: "run.completed",
+          threadId: event.threadId,
+          turnId: event.turnId,
+          timestampMs: event.timestampMs,
+          runId: event.runId,
+          parentRunId: event.parentRunId,
+          ...(event.goalSliceId ? { goalSliceId: event.goalSliceId } : {}),
+          resultKind: "canceled",
+          summary: event.message || event.reason,
+        }));
+      }
     } catch {
       // ignore malformed runtime events
     }
@@ -2099,6 +4157,8 @@ export function normalizeSessionRuntimeSnapshot(
     workspacePath?: string | null;
     expectedSessionKey?: string | null;
     expectedSessionEpoch?: string | null;
+    /** True only while hydrating a persisted snapshot after process loss. */
+    quarantineInterruptedLocalFast?: boolean;
   },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
@@ -2112,6 +4172,15 @@ export function normalizeSessionRuntimeSnapshot(
     snapshot.autoApproveToolScopes,
   );
   const rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
+  const persistedWorkspaceQueueEntries = Array.isArray(
+    snapshot.workspaceTurnQueue?.entries,
+  )
+    ? snapshot.workspaceTurnQueue.entries
+    : [];
+  const reservedWorkspaceInstructionBlockIds = persistedWorkspaceQueueEntries.flatMap((entry) => {
+    const blockId = Number(entry?.receipt?.userBlockId);
+    return Number.isSafeInteger(blockId) && blockId > 0 ? [blockId] : [];
+  });
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
   const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
@@ -2407,7 +4476,7 @@ export function normalizeSessionRuntimeSnapshot(
     }
   }
   let invalidatedChoiceText = "";
-  const taskFlow = rawTaskFlow.map((block) => {
+  let taskFlow = rawTaskFlow.map((block) => {
     if (
       invalidatedActionRequest?.kind === "tool_permission" &&
       block.type === "tool" &&
@@ -2481,13 +4550,17 @@ export function normalizeSessionRuntimeSnapshot(
     : "The pending choice no longer matches the active run; stale controls were removed and context was preserved.";
   const restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents);
   const restoredMarkerRunId = getHarnessActionRunId(restoredHarnessRunMarker);
-  const restoredMarkerRunTerminal = restoredMarkerRunId
-    ? [...restoredRuntimeEvents].reverse().find((event) =>
-        (
-          event.type === "run.completed" ||
-          event.type === "run.aborted" ||
-          event.type === "run.failed"
-        ) &&
+  const restoredMarkerRunConclusion = restoredMarkerRunId
+    ? [...restoredRuntimeEvents].reverse().find((event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+        event.type === "run.completed" &&
+        event.threadId === restoredHarnessRunMarker?.sessionKey &&
+        event.turnId === restoredHarnessRunMarker?.turnId &&
+        event.runId === restoredMarkerRunId
+      )
+    : undefined;
+  const restoredMarkerRunAbort = restoredMarkerRunId
+    ? [...restoredRuntimeEvents].reverse().find((event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+        event.type === "run.aborted" &&
         event.threadId === restoredHarnessRunMarker?.sessionKey &&
         event.turnId === restoredHarnessRunMarker?.turnId &&
         event.runId === restoredMarkerRunId
@@ -2496,30 +4569,25 @@ export function normalizeSessionRuntimeSnapshot(
   const restoredMarkerTerminalStatus = restoredHarnessRunMarker?.status === "completed" || restoredHarnessRunMarker?.status === "error"
     ? restoredHarnessRunMarker.status
     : null;
-  const conversationTurns = normalizeInterruptedConversationTurnsForRestore(
+  let conversationTurns = normalizeInterruptedConversationTurnsForRestore(
     snapshot.conversationTurns,
     taskFlow,
   ).map((turn) => {
-    if (turn.status !== "awaiting_input" && turn.status !== "awaiting_approval") return turn;
-    if (restoredActionRequest?.turnId === turn.id) return turn;
+    const ownsTerminalMarker = !!restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
+    const hasRecoverableAwaitingState = turn.status === "awaiting_input" || turn.status === "awaiting_approval";
+    if (!ownsTerminalMarker && !hasRecoverableAwaitingState) return turn;
+    if (!ownsTerminalMarker && restoredActionRequest?.turnId === turn.id) return turn;
     const ownsInvalidatedRequest = invalidatedActionRequest?.turnId === turn.id;
     const useChinese = /[^\x00-\x7F]/.test(String(turn.userPrompt || ""));
-    const ownsTerminalMarker = restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
-    const terminalWasAborted = restoredMarkerRunTerminal?.type === "run.aborted";
-    const terminalResultKind = terminalWasAborted
-      ? "canceled" as const
-      : restoredMarkerRunTerminal?.type === "run.completed" && restoredMarkerRunTerminal.resultKind
-      ? restoredMarkerRunTerminal.resultKind
-      : restoredMarkerRunTerminal?.type === "run.failed" || restoredMarkerTerminalStatus === "error"
+    const terminalResultKind = restoredMarkerRunConclusion?.type === "run.completed" && restoredMarkerRunConclusion.resultKind
+      ? restoredMarkerRunConclusion.resultKind
+      : restoredMarkerTerminalStatus === "error"
       ? "error" as const
       : "success" as const;
-    const terminalReason = restoredMarkerRunTerminal?.type === "run.aborted"
-      ? restoredMarkerRunTerminal.reason
-      : restoredMarkerRunTerminal?.type === "run.failed"
-      ? restoredMarkerRunTerminal.error.message
-      : restoredMarkerRunTerminal?.type === "run.completed"
-      ? restoredMarkerRunTerminal.summary || restoredHarnessRunMarker?.closeReason
-      : restoredHarnessRunMarker?.closeReason;
+    const terminalWasAborted = terminalResultKind === "canceled" && !!restoredMarkerRunAbort;
+    const terminalReason = terminalWasAborted
+      ? restoredMarkerRunAbort?.reason
+      : restoredMarkerRunConclusion?.summary || restoredHarnessRunMarker?.closeReason;
     return {
       ...turn,
       status: ownsTerminalMarker
@@ -2537,7 +4605,7 @@ export function normalizeSessionRuntimeSnapshot(
       ...(ownsTerminalMarker
         ? {
             runtimeOutcome: {
-              status: terminalWasAborted ? "aborted" as const : "completed" as const,
+              status: "completed" as const,
               reason: terminalReason || "restored_terminal_checkpoint",
               resultKind: terminalResultKind,
               runId: restoredHarnessRunMarker?.activeRunId || restoredHarnessRunMarker?.runId || "restored-run",
@@ -2548,12 +4616,13 @@ export function normalizeSessionRuntimeSnapshot(
         : {}),
     };
   });
-  const sanitizedHarnessRunMarker = invalidatedRequestOwnsProjectedMarkerRun && restoredHarnessRunMarker?.status === "paused"
+  let sanitizedHarnessRunMarker = invalidatedRequestOwnsProjectedMarkerRun && restoredHarnessRunMarker?.status === "paused"
     ? {
         ...restoredHarnessRunMarker,
         closeReason: invalidatedActionReason,
       }
     : restoredHarnessRunMarker;
+  let reconciledRestoredActionRequest = restoredActionRequest;
   const invalidatedOwnerRequest = invalidatedActionRequest;
   const replacementPauseReason = invalidatedActionReason;
   const replacementPauseMessage = invalidatedActionMessage;
@@ -2595,13 +4664,13 @@ export function normalizeSessionRuntimeSnapshot(
         message: replacementPauseMessage,
       });
     });
-  const ownerHasHardTerminal = !!invalidatedOwnerRequest && runtimeEvents.some((event) =>
-    (event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
+  const ownerHasConclusion = !!invalidatedOwnerRequest && runtimeEvents.some((event) =>
+    event.type === "run.completed" &&
     event.threadId === invalidatedOwnerRequest.sessionKey &&
     event.turnId === invalidatedOwnerRequest.turnId &&
     event.runId === invalidatedOwnerRequest.runId
   );
-  if (invalidatedOwnerRequest && !replacedOwnerPause && !ownerHasHardTerminal) {
+  if (invalidatedOwnerRequest && !replacedOwnerPause && !ownerHasConclusion) {
     const timestampMs = sanitizedHarnessRunMarker?.closedAt || Date.now();
     runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema(
       restoredMarkerTerminalStatus && invalidatedRequestOwnsProjectedMarkerRun
@@ -2640,8 +4709,8 @@ export function normalizeSessionRuntimeSnapshot(
   }
   const interruptedActionRunId = getHarnessActionRunId(sanitizedHarnessRunMarker);
   const interruptedTurnId = sanitizedHarnessRunMarker?.turnId || null;
-  const interruptedRunHasTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
-    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
+  const interruptedRunHasLifecycleBoundary = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
+    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.aborted") &&
     event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
     event.turnId === interruptedTurnId &&
     event.runId === interruptedActionRunId
@@ -2650,7 +4719,7 @@ export function normalizeSessionRuntimeSnapshot(
     sanitizedHarnessRunMarker?.status === "paused" &&
     interruptedActionRunId &&
     interruptedTurnId &&
-    !interruptedRunHasTerminal
+    !interruptedRunHasLifecycleBoundary
   ) {
     const interruptedTurn = conversationTurns.find((turn) => turn.id === interruptedTurnId);
     const useChinese = /[^\x00-\x7F]/.test(String(interruptedTurn?.userPrompt || ""));
@@ -2685,8 +4754,8 @@ export function normalizeSessionRuntimeSnapshot(
       message: pauseMessage,
     }));
   }
-  const projectedRunHasHardTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
-    (event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
+  const projectedRunHasConclusion = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
+    event.type === "run.completed" &&
     event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
     event.turnId === interruptedTurnId &&
     event.runId === interruptedActionRunId
@@ -2695,7 +4764,7 @@ export function normalizeSessionRuntimeSnapshot(
     sanitizedHarnessRunMarker &&
     interruptedActionRunId &&
     interruptedTurnId &&
-    !projectedRunHasHardTerminal &&
+    !projectedRunHasConclusion &&
     (sanitizedHarnessRunMarker.status === "completed" || sanitizedHarnessRunMarker.status === "error")
   ) {
     runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema(
@@ -2722,27 +4791,23 @@ export function normalizeSessionRuntimeSnapshot(
           }
     ));
   }
-  const restoredProjectedRunTerminal = interruptedActionRunId && interruptedTurnId
+  const restoredProjectedRunConclusion = interruptedActionRunId && interruptedTurnId
     ? [...runtimeEvents].reverse().find((event) =>
-        (
-          event.type === "run.completed" ||
-          event.type === "run.aborted" ||
-          event.type === "run.failed"
-        ) &&
+        event.type === "run.completed" &&
         event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
         event.turnId === interruptedTurnId &&
         event.runId === interruptedActionRunId
       )
     : undefined;
-  const restoredTurnHasTerminal = !!interruptedTurnId && runtimeEvents.some((event) =>
-    (event.type === "turn.completed" || event.type === "turn.failed") &&
+  const restoredTurnHasConclusion = !!interruptedTurnId && runtimeEvents.some((event) =>
+    event.type === "turn.completed" &&
     event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
     event.turnId === interruptedTurnId
   );
   if (
     sanitizedHarnessRunMarker &&
     interruptedTurnId &&
-    !restoredTurnHasTerminal &&
+    !restoredTurnHasConclusion &&
     (sanitizedHarnessRunMarker.status === "completed" || sanitizedHarnessRunMarker.status === "error")
   ) {
     runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
@@ -2750,14 +4815,136 @@ export function normalizeSessionRuntimeSnapshot(
       threadId: sanitizedHarnessRunMarker.sessionKey,
       turnId: interruptedTurnId,
       timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
-      resultKind: restoredProjectedRunTerminal?.type === "run.aborted"
-        ? "canceled"
-        : restoredProjectedRunTerminal?.type === "run.failed" || sanitizedHarnessRunMarker.status === "error"
+      resultKind: sanitizedHarnessRunMarker.status === "error"
         ? "error"
-        : restoredProjectedRunTerminal?.type === "run.completed" && restoredProjectedRunTerminal.resultKind
-        ? restoredProjectedRunTerminal.resultKind
+        : restoredProjectedRunConclusion?.type === "run.completed" && restoredProjectedRunConclusion.resultKind
+        ? restoredProjectedRunConclusion.resultKind
         : "success",
     }));
+  }
+  // A durable Turn conclusion is authoritative even when its Harness marker
+  // was already cleared before a crash. Project every currently loaded Turn;
+  // events for paged-out Turns remain untouched until those Turns are loaded.
+  for (const loadedTurn of conversationTurns) {
+    const hasColdLocalFastQueueOwner = !!options?.quarantineInterruptedLocalFast &&
+      !!snapshot.workspaceTurnQueue?.entries.some((entry) =>
+        entry.receipt.turnId === loadedTurn.id &&
+        isRestoredLocalFastQueueEntry(entry)
+      );
+    if (hasColdLocalFastQueueOwner) {
+      // The strict local-fast quarantine below must evaluate the persisted Turn
+      // identity before generic terminal projection can select another Run.
+      continue;
+    }
+    const restoredTurnConclusion = [...runtimeEvents].reverse().find(
+      (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
+        event.type === "turn.completed" && event.turnId === loadedTurn.id,
+    );
+    if (!restoredTurnConclusion) continue;
+    let restoredTurnConclusionIndex = runtimeEvents.indexOf(restoredTurnConclusion);
+    let restoredRunConclusions = runtimeEvents.filter(
+      (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+        event.type === "run.completed" &&
+        event.threadId === restoredTurnConclusion.threadId &&
+        event.turnId === loadedTurn.id &&
+        runtimeEvents.indexOf(event) < restoredTurnConclusionIndex,
+    );
+    // Older snapshots may have persisted terminal events without their starts.
+    // Repair every pre-Turn completion by exact owner before selecting the
+    // authoritative completion. This is restore-only compatibility and does
+    // not weaken the live writer contract.
+    for (const legacyConclusion of restoredRunConclusions) {
+      runtimeEvents = insertRestoredRunStartBeforeTerminal({
+        runtimeEvents,
+        sessionKey: legacyConclusion.threadId,
+        turnId: legacyConclusion.turnId,
+        runId: legacyConclusion.runId,
+        parentRunId: legacyConclusion.parentRunId,
+        timestampMs: Math.min(
+          legacyConclusion.timestampMs,
+          restoredTurnConclusion.timestampMs,
+        ),
+      });
+    }
+    restoredTurnConclusionIndex = runtimeEvents.indexOf(restoredTurnConclusion);
+    restoredRunConclusions = runtimeEvents.filter(
+      (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+        event.type === "run.completed" &&
+        event.threadId === restoredTurnConclusion.threadId &&
+        event.turnId === loadedTurn.id &&
+        runtimeEvents.indexOf(event) < restoredTurnConclusionIndex,
+    );
+    const orderedRunConclusions = restoredRunConclusions.filter((conclusion) => {
+      const matchingStarts = runtimeEvents.filter((event) =>
+        event.type === "run.started" &&
+        event.threadId === conclusion.threadId &&
+        event.turnId === conclusion.turnId &&
+        event.runId === conclusion.runId &&
+        event.parentRunId === conclusion.parentRunId
+      );
+      return matchingStarts.length === 1 &&
+        runtimeEvents.indexOf(matchingStarts[0]) < runtimeEvents.indexOf(conclusion);
+    });
+    const loadedOutcome = loadedTurn.runtimeOutcome?.status === "completed"
+      ? loadedTurn.runtimeOutcome
+      : null;
+    const turnResultKind = restoredTurnConclusion.resultKind || "success";
+    const exactOutcomeConclusions = loadedOutcome
+      ? orderedRunConclusions.filter((conclusion) =>
+          conclusion.runId === loadedOutcome.runId &&
+          conclusion.parentRunId === loadedOutcome.parentRunId &&
+          (conclusion.resultKind || "success") === loadedOutcome.resultKind &&
+          loadedOutcome.resultKind === turnResultKind
+        )
+      : [];
+    const restoredRunConclusion = exactOutcomeConclusions.length === 1
+      ? exactOutcomeConclusions[0]
+      : [...orderedRunConclusions].reverse().find(
+          (conclusion) => (conclusion.resultKind || "success") === turnResultKind,
+        );
+    const restoredRunAbort = [...runtimeEvents].reverse().find(
+      (event): event is Extract<MainThreadEvent, { type: "run.aborted" }> =>
+        event.type === "run.aborted" &&
+        event.threadId === restoredTurnConclusion.threadId &&
+        event.turnId === loadedTurn.id &&
+        (!restoredRunConclusion || event.runId === restoredRunConclusion.runId),
+    );
+    const terminalMarkerOwnsTurn = !!sanitizedHarnessRunMarker &&
+      sanitizedHarnessRunMarker.turnId === loadedTurn.id &&
+      sanitizedHarnessRunMarker.sessionKey === restoredTurnConclusion.threadId &&
+      (sanitizedHarnessRunMarker.status === "completed" || sanitizedHarnessRunMarker.status === "error");
+    const resultKind = restoredTurnConclusion.resultKind ||
+      restoredRunConclusion?.resultKind ||
+      (terminalMarkerOwnsTurn && sanitizedHarnessRunMarker?.status === "error"
+        ? "error" as const
+        : "success" as const);
+    const restoredFinal = canonicalizeRestoredTerminalTurnFinal({
+      taskFlow,
+      conversationTurns,
+      turnId: loadedTurn.id,
+      resultKind,
+      runId: restoredRunConclusion?.runId || (
+        terminalMarkerOwnsTurn ? getHarnessActionRunId(sanitizedHarnessRunMarker) : null
+      ),
+      parentRunId: restoredRunConclusion?.parentRunId ?? (
+        terminalMarkerOwnsTurn
+          ? sanitizedHarnessRunMarker?.activeParentRunId || sanitizedHarnessRunMarker?.parentRunId || null
+          : undefined
+      ),
+      completedAt: restoredTurnConclusion.timestampMs || restoredRunConclusion?.timestampMs || (
+        terminalMarkerOwnsTurn
+          ? sanitizedHarnessRunMarker?.closedAt || sanitizedHarnessRunMarker?.updatedAt
+          : null
+      ),
+      runSummary: restoredRunConclusion?.summary,
+      markerError: terminalMarkerOwnsTurn ? sanitizedHarnessRunMarker?.lastStreamError : null,
+      markerReason: restoredRunAbort?.reason || (
+        terminalMarkerOwnsTurn ? sanitizedHarnessRunMarker?.closeReason : null
+      ),
+      reservedTaskBlockIds: reservedWorkspaceInstructionBlockIds,
+    });
+    taskFlow = restoredFinal.taskFlow;
+    conversationTurns = restoredFinal.conversationTurns;
   }
   if (options?.restoreInterruptedGoal) {
     const beforeReconcileCount = runtimeEvents.length;
@@ -2812,40 +4999,330 @@ export function normalizeSessionRuntimeSnapshot(
       restoredIsPlanApproved,
     });
   }
-  const restoredWorkspaceTurnQueue =
-    suppliedLifecycleSessionEpoch &&
+  const canRestoreWorkspaceQueue = suppliedLifecycleSessionEpoch &&
     restoredLifecycleSessionKey !== UNBOUND_PLAN_SESSION_KEY &&
-    !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+    !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`);
+  const restoreAt = Date.now();
+  const restoredQueueCandidate = canRestoreWorkspaceQueue
+    ? reconcileWorkspaceTurnQueueOnRestore({
+        snapshot: snapshot.workspaceTurnQueue,
+        sessionKey: restoredLifecycleSessionKey,
+        sessionEpoch: restoredLifecycleSessionEpoch,
+        terminalOwners: [],
+        at: restoreAt,
+      })
+    : null;
+  const restoredLocalFastQueueEntries = options?.quarantineInterruptedLocalFast
+    ? restoredQueueCandidate?.entries.filter(isRestoredLocalFastQueueEntry) || []
+    : [];
+
+  // There is no durable pre-execution fence in this schema generation. A disk
+  // snapshot may therefore still say `queued` even if a local side effect ran
+  // and its terminal save later failed. Cold restore cannot distinguish that
+  // case from never-started work without risking duplicate side effects. Close
+  // every noncanonical local-fast receipt visibly and require an explicit new
+  // Turn to retry; model-workflow queue semantics remain unchanged.
+  for (const entry of restoredLocalFastQueueEntries) {
+    if (hasCanonicalRestoredLocalFastConclusion({
+      entry,
+      sessionKey: restoredLifecycleSessionKey,
+      taskFlow,
+      conversationTurns,
+      runtimeEvents,
+      workspacePath: options?.workspacePath,
+    })) continue;
+    const quarantined = quarantineRestoredLocalFastEntry({
+      entry,
+      sessionKey: restoredLifecycleSessionKey,
+      taskFlow,
+      conversationTurns,
+      runtimeEvents,
+      at: restoreAt,
+      workspacePath: options?.workspacePath,
+      reservedTaskBlockIds: reservedWorkspaceInstructionBlockIds,
+    });
+    taskFlow = quarantined.taskFlow;
+    conversationTurns = quarantined.conversationTurns;
+    runtimeEvents = quarantined.runtimeEvents;
+    logStoreEvent("workspace_local_fast_restore_quarantined", {
+      sessionKey: restoredLifecycleSessionKey,
+      sessionEpoch: restoredLifecycleSessionEpoch,
+      receiptId: entry.receipt.receiptId,
+      sourceTurnId: entry.receipt.turnId,
+      presentationTurnId: quarantined.presentationTurnId,
+      reason: "missing_durable_pre_execution_fence",
+    });
+  }
+  const restoredTerminalOwners: WorkspaceTurnTerminalOwner[] = [];
+  const restoredAdoptedOwners: WorkspaceTurnTerminalOwner[] = [];
+  const restoredRecoveryOwners: WorkspaceTurnTerminalOwner[] = [];
+  const ownerIdentityForEntry = (
+    entry: WorkspaceTurnQueueEntry,
+  ): WorkspaceTurnTerminalOwner => ({
+    sessionKey: restoredLifecycleSessionKey,
+    sessionEpoch: restoredLifecycleSessionEpoch,
+    turnId: entry.receipt.turnId,
+    receiptId: entry.receipt.receiptId,
+    clientSubmissionId: entry.instruction.clientSubmissionId,
+    instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(entry),
+  });
+  const settlePausedHarnessOwnerForCompletedEntry = (
+    entry: WorkspaceTurnQueueEntry,
+  ) => {
+    if (
+      sanitizedHarnessRunMarker?.status !== "paused" ||
+      sanitizedHarnessRunMarker.sessionKey !== restoredLifecycleSessionKey ||
+      sanitizedHarnessRunMarker.turnId !== entry.receipt.turnId
+    ) return;
+    const markerRunId = getHarnessActionRunId(sanitizedHarnessRunMarker);
+    sanitizedHarnessRunMarker = null;
+    if (
+      reconciledRestoredActionRequest?.sessionKey === restoredLifecycleSessionKey &&
+      reconciledRestoredActionRequest.turnId === entry.receipt.turnId &&
+      (!markerRunId || reconciledRestoredActionRequest.runId === markerRunId)
+    ) {
+      reconciledRestoredActionRequest = null;
+    }
+  };
+
+  for (const entry of restoredQueueCandidate?.entries || []) {
+    const ownerIdentity = ownerIdentityForEntry(entry);
+    if (isRestoredLocalFastQueueEntry(entry)) {
+      if (!hasCanonicalRestoredLocalFastConclusion({
+        entry,
+        sessionKey: restoredLifecycleSessionKey,
+        taskFlow,
+        conversationTurns,
+        runtimeEvents,
+        workspacePath: options?.workspacePath,
+      })) continue;
+      const sourceInspection = inspectWorkspaceInstructionTerminalProjection({
+        entry,
+        sessionKey: restoredLifecycleSessionKey,
+        taskFlow,
+        conversationTurns,
+        runtimeEvents,
+      });
+      (sourceInspection.canonical
+        ? restoredTerminalOwners
+        : restoredRecoveryOwners).push(ownerIdentity);
+      settlePausedHarnessOwnerForCompletedEntry(entry);
+      continue;
+    }
+
+    let inspection = inspectWorkspaceInstructionTerminalProjection({
+      entry,
+      sessionKey: restoredLifecycleSessionKey,
+      taskFlow,
+      conversationTurns,
+      runtimeEvents,
+    });
+    if (inspection.canonical) {
+      restoredTerminalOwners.push(ownerIdentity);
+      settlePausedHarnessOwnerForCompletedEntry(entry);
+      continue;
+    }
+
+    const turnIdOccupied = conversationTurns.some(
+      (turn) => turn.id === entry.receipt.turnId,
+    );
+    const userBlockIdOccupied = taskFlow.some(
+      (block) => block.id === entry.receipt.userBlockId,
+    );
+    let projectionConflict = !inspection.owner &&
+      (turnIdOccupied || userBlockIdOccupied);
+    if (!inspection.owner && !projectionConflict) {
+      const useChinese = /[^\x00-\x7F]/.test(entry.instruction.payload.text);
+      const projection = reconcileWorkspaceInstructionProjection({
+        entry,
+        taskFlow,
+        conversationTurns,
+        userContextItems: buildWorkspaceInstructionUserContext({
+          contextMentions: entry.instruction.payload.contextMentions
+            ? [...entry.instruction.payload.contextMentions]
+            : [],
+          attachedFiles: entry.instruction.payload.attachedFiles
+            ? entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+            : [],
+          images: entry.instruction.payload.images
+            ? [...entry.instruction.payload.images]
+            : [],
+          workspace: options?.workspacePath || "",
+          language: useChinese ? "zh" : "en",
+        }),
+        language: useChinese ? "zh" : "en",
+      });
+      if (projection.disposition === "ready") {
+        taskFlow = projection.taskFlow;
+        conversationTurns = projection.conversationTurns;
+        inspection = inspectWorkspaceInstructionTerminalProjection({
+          entry,
+          sessionKey: restoredLifecycleSessionKey,
+          taskFlow,
+          conversationTurns,
+          runtimeEvents,
+        });
+        projectionConflict = !inspection.owner;
+      } else {
+        projectionConflict = true;
+      }
+    }
+
+    const actionRunId = getHarnessActionRunId(sanitizedHarnessRunMarker);
+    const markerParentRunId = sanitizedHarnessRunMarker?.activeParentRunId ||
+      sanitizedHarnessRunMarker?.parentRunId ||
+      null;
+    const rawMarkerStarts = actionRunId && Array.isArray(snapshot.runtimeEvents)
+      ? snapshot.runtimeEvents.filter((rawEvent) => {
+          if (!rawEvent || typeof rawEvent !== "object") return false;
+          const event = rawEvent as Record<string, unknown>;
+          return event.type === "run.started" &&
+            event.threadId === restoredLifecycleSessionKey &&
+            event.turnId === entry.receipt.turnId &&
+            event.runId === actionRunId;
+        })
+      : [];
+    let allMarkerStarts = actionRunId
+      ? runtimeEvents.filter((event) =>
+          event.type === "run.started" &&
+          event.threadId === restoredLifecycleSessionKey &&
+          event.turnId === entry.receipt.turnId &&
+          event.runId === actionRunId
+        )
+      : [];
+    const markerHasTerminalBoundary = !!actionRunId && runtimeEvents.some((event) =>
+      event.threadId === restoredLifecycleSessionKey &&
+      "turnId" in event &&
+      event.turnId === entry.receipt.turnId &&
+      (
+        event.type === "turn.completed" ||
+        ((event.type === "run.completed" || event.type === "run.aborted") &&
+          event.runId === actionRunId)
+      )
+    );
+    if (
+      inspection.owner &&
+      sanitizedHarnessRunMarker?.sessionKey === restoredLifecycleSessionKey &&
+      sanitizedHarnessRunMarker.turnId === entry.receipt.turnId &&
+      sanitizedHarnessRunMarker.status === "paused" &&
+      actionRunId &&
+      allMarkerStarts.length === 0 &&
+      inspection.terminals.length === 0 &&
+      !markerHasTerminalBoundary
+    ) {
+      const firstPauseIndex = runtimeEvents.findIndex((event) =>
+        event.type === "run.paused" &&
+        event.threadId === restoredLifecycleSessionKey &&
+        event.turnId === entry.receipt.turnId &&
+        event.runId === actionRunId
+      );
+      const pauseTimestamp = firstPauseIndex >= 0
+        ? runtimeEvents[firstPauseIndex].timestampMs
+        : sanitizedHarnessRunMarker.updatedAt;
+      const restoredStart = withEventSchema({
+        type: "run.started",
+        threadId: restoredLifecycleSessionKey,
+        turnId: entry.receipt.turnId,
+        timestampMs: Math.min(
+          Number(sanitizedHarnessRunMarker.updatedAt) || restoreAt,
+          Number(pauseTimestamp) || restoreAt,
+        ),
+        runId: actionRunId,
+        parentRunId: markerParentRunId,
+      });
+      runtimeEvents = firstPauseIndex >= 0
+        ? [
+            ...runtimeEvents.slice(0, firstPauseIndex),
+            restoredStart,
+            ...runtimeEvents.slice(firstPauseIndex),
+          ]
+        : appendRuntimeEvent(runtimeEvents, restoredStart);
+      allMarkerStarts = [restoredStart];
+    }
+    const exactMarkerStarts = actionRunId
+      ? runtimeEvents.filter((event) =>
+          event.type === "run.started" &&
+          event.threadId === restoredLifecycleSessionKey &&
+          event.turnId === entry.receipt.turnId &&
+          event.runId === actionRunId &&
+          event.parentRunId === markerParentRunId
+        )
+      : [];
+    const markerOwnsExactPausedRun = !!inspection.owner &&
+      !!sanitizedHarnessRunMarker &&
+      sanitizedHarnessRunMarker.sessionKey === restoredLifecycleSessionKey &&
+      sanitizedHarnessRunMarker.turnId === entry.receipt.turnId &&
+      sanitizedHarnessRunMarker.status === "paused" &&
+      !!actionRunId &&
+      rawMarkerStarts.length <= 1 &&
+      allMarkerStarts.length === 1 &&
+      exactMarkerStarts.length === 1 &&
+      inspection.terminals.length === 0 &&
+      !markerHasTerminalBoundary;
+    if (markerOwnsExactPausedRun) {
+      restoredAdoptedOwners.push(ownerIdentity);
+      continue;
+    }
+
+    const hasSourceLifecycleEvidence = runtimeEvents.some((event) =>
+      event.threadId === restoredLifecycleSessionKey &&
+      "turnId" in event &&
+      event.turnId === entry.receipt.turnId
+    ) || !!inspection.owner?.turn.runtimeOutcome;
+    if (!projectionConflict && inspection.owner && !hasSourceLifecycleEvidence) {
+      // Never-started model workflow work remains FIFO-queued for exact replay.
+      continue;
+    }
+
+    const useChinese = /[^\x00-\x7F]/.test(entry.instruction.payload.text);
+    const summary = projectionConflict
+      ? useChinese
+        ? "恢复工作区回合时发现不可变所有权冲突。无关历史保持不变，并已通过独立恢复回合给出可见错误结论。"
+        : "Restore found an immutable ownership conflict for this workspace Turn. Unrelated history was preserved and a separate recovery Turn recorded the visible error conclusion."
+      : useChinese
+      ? "应用重启后无法证明这条已接纳指令的运行仍由可恢复执行器持有。为避免重复执行，本回合已用可见错误结论收口；请发送新指令重试。"
+      : "After restart, MAIN could not prove that a resumable executor still owned this admitted instruction. To prevent duplicate execution, the Turn was closed with a visible error; submit a new instruction to retry.";
+    const conclusion = concludeWorkspaceInstructionEntry({
+      entry,
+      sessionKey: restoredLifecycleSessionKey,
+      taskFlow,
+      conversationTurns,
+      runtimeEvents,
+      resultKind: "error",
+      summary,
+      timestampMs: restoreAt,
+      forceRecovery: projectionConflict,
+      recoveryReason: projectionConflict
+        ? "workspace_instruction_restore_projection_conflict"
+        : "workspace_instruction_restore_owner_unverified",
+      language: useChinese ? "zh" : "en",
+      reservedTaskBlockIds: reservedWorkspaceInstructionBlockIds,
+    });
+    taskFlow = conclusion.taskFlow;
+    conversationTurns = conclusion.conversationTurns;
+    runtimeEvents = conclusion.runtimeEvents;
+    (conclusion.disposition === "recovery_completed"
+      ? restoredRecoveryOwners
+      : restoredTerminalOwners).push(ownerIdentity);
+    settlePausedHarnessOwnerForCompletedEntry(entry);
+    logStoreEvent("workspace_instruction_restore_reconciled", {
+      sessionKey: restoredLifecycleSessionKey,
+      sessionEpoch: restoredLifecycleSessionEpoch,
+      receiptId: entry.receipt.receiptId,
+      sourceTurnId: entry.receipt.turnId,
+      presentationTurnId: conclusion.presentationTurnId,
+      disposition: conclusion.disposition,
+    });
+  }
+  const restoredWorkspaceTurnQueue = canRestoreWorkspaceQueue && restoredQueueCandidate
       ? reconcileWorkspaceTurnQueueOnRestore({
-          snapshot: snapshot.workspaceTurnQueue,
+          snapshot: restoredQueueCandidate,
           sessionKey: restoredLifecycleSessionKey,
           sessionEpoch: restoredLifecycleSessionEpoch,
-          terminalOwners: [
-            ...conversationTurns
-              .filter((turn) => isConversationTurnRuntimeClosed(turn.runtimeOutcome))
-              .map((turn) => ({
-                sessionKey: restoredLifecycleSessionKey,
-                sessionEpoch: restoredLifecycleSessionEpoch,
-                turnId: turn.id,
-              })),
-            ...runtimeEvents.flatMap((event) =>
-              event.type === "run.started" ||
-              event.type === "turn.completed" ||
-              event.type === "turn.failed"
-              ? [{
-                  sessionKey: restoredLifecycleSessionKey,
-                  sessionEpoch: restoredLifecycleSessionEpoch,
-                  turnId: event.turnId,
-                }]
-              : []),
-            ...(sanitizedHarnessRunMarker?.turnId
-              ? [{
-                  sessionKey: restoredLifecycleSessionKey,
-                  sessionEpoch: restoredLifecycleSessionEpoch,
-                  turnId: sanitizedHarnessRunMarker.turnId,
-                }]
-              : []),
-          ],
+          at: restoreAt,
+          terminalOwners: restoredTerminalOwners,
+          adoptedOwners: restoredAdoptedOwners,
+          recoveryOwners: restoredRecoveryOwners,
         })
       : null;
   const restoredWorkspaceInstructionLedger =
@@ -2862,7 +5339,7 @@ export function normalizeSessionRuntimeSnapshot(
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents,
     harnessRunMarker: sanitizedHarnessRunMarker,
-    activeActionRequest: restoredActionRequest,
+    activeActionRequest: reconciledRestoredActionRequest,
     taskFlow,
     agentMessages,
     contextMemoryState: normalizedContextMemoryState,
@@ -3845,6 +6322,7 @@ export function buildRestoredSessionRuntimePatch(input: {
     : input.snapshot;
   const normalized = normalizeSessionRuntimeSnapshot(mergedSnapshot, {
     restoreInterruptedGoal: true,
+    quarantineInterruptedLocalFast: true,
     workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
     expectedSessionKey: input.expectedSessionKey,
     expectedSessionEpoch: input.expectedSessionEpoch,
@@ -3908,6 +6386,7 @@ function normalizeSessionsByWorkspace(
         messages: sanitizeTaskBlocksForPersist(session.messages || []),
         runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
           restoreInterruptedGoal: true,
+          quarantineInterruptedLocalFast: true,
           workspacePath: scopeKey,
           expectedSessionKey: resolveSessionRuntimeKey(scopeKey, session.id),
           expectedSessionEpoch: planLifecycleEpoch,
@@ -5477,6 +7956,11 @@ const sessionSyncMiddleware =
           typeof patchOrUpdater === "function"
             ? (patchOrUpdater as (state: AppState) => Partial<AppState>)(s)
             : patchOrUpdater;
+        // A Zustand updater that returns the current Store object is a semantic
+        // no-op. Treating it as an authored patch would feed every runtime field
+        // back through the Session synchronizer and replace the opaque owner CAS
+        // token. Preserve explicit `replace=true` restores unchanged.
+        if (patch === s && replace !== true) return {};
         const currentSessionKey = resolveSessionRuntimeKey(
           resolveSessionWorkspaceKey(s.currentWorkspace),
           s.currentSessionId,
@@ -5540,6 +8024,150 @@ const workspaceInstructionCancellationFailureBySession = new Map<
   string,
   WorkspaceInstructionCancellationFailure
 >();
+const WORKSPACE_INSTRUCTION_START_GRACE_MS = 250;
+const workspaceInstructionStartingGraceByClaim = new Map<
+  string,
+  "scheduled" | "consumed"
+>();
+const workspaceInstructionStartingGraceTimeoutByClaim = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
+
+function clearWorkspaceInstructionStartingGrace(claimId: string): void {
+  const timeoutId = workspaceInstructionStartingGraceTimeoutByClaim.get(claimId);
+  if (timeoutId !== undefined) clearTimeout(timeoutId);
+  workspaceInstructionStartingGraceTimeoutByClaim.delete(claimId);
+  workspaceInstructionStartingGraceByClaim.delete(claimId);
+}
+
+interface LocalFastExecutionLease {
+  readonly sessionKey: string;
+  readonly turnId: string;
+  readonly runId: string;
+  readonly clientSubmissionId: string | null;
+  readonly receiptId: string | null;
+  readonly controller: AbortController;
+  readonly claim: WorkspaceInstructionDispatchClaim | null;
+  readonly completion: Promise<GameStudioLocalSlashCompletionResult>;
+  readonly hasRuntimeOwnership: () => boolean;
+  readonly retireWorkspaceClaim: () => boolean;
+  readonly release: () => void;
+  settled: boolean;
+  dispatcherObserved: boolean;
+}
+
+const localFastExecutionLeasesByOwner = new Map<string, LocalFastExecutionLease>();
+const localFastExecutionLeasesByClaim = new Map<string, LocalFastExecutionLease>();
+
+function localFastExecutionOwnerKey(sessionKey: string, turnId: string): string {
+  return `${sessionKey}\u0000${turnId}`;
+}
+
+function readLocalFastOwnerState(
+  state: AppState,
+  sessionKey: string,
+): AppState | null {
+  if (isSessionRuntimeActive(state, sessionKey)) return state;
+  const runtime = state.runtimeBySessionKey[sessionKey];
+  return runtime ? ({ ...state, ...runtime } as AppState) : null;
+}
+
+function hasVerifiedLocalFastConclusion(
+  state: AppState,
+  claim: WorkspaceInstructionDispatchClaim,
+  result: GameStudioLocalSlashCompletionResult,
+): boolean {
+  const ownerState = readLocalFastOwnerState(state, claim.sessionKey);
+  const owner = result.conclusionOwner;
+  if (!ownerState || !result.conclusionAppended || !owner) return false;
+  if (
+    owner.disposition === "recovery_completed"
+      ? owner.parentRunId !== result.runId
+      : owner.runId !== result.runId
+  ) return false;
+  const hasCanonicalProjection = (
+    runtimeEvents: readonly MainThreadEvent[],
+    conversationTurns: readonly ConversationTurn[],
+    taskFlow: readonly TaskBlock[],
+  ) => {
+    const turn = conversationTurns.find((candidate) => candidate.id === owner.turnId);
+    const outcome = turn?.runtimeOutcome;
+    const runConclusions = runtimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.threadId === claim.sessionKey &&
+      event.turnId === owner.turnId &&
+      event.runId === owner.runId
+    );
+    const turnConclusions = runtimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.threadId === claim.sessionKey &&
+      event.turnId === owner.turnId
+    );
+    const runConclusion = runConclusions[0];
+    const turnConclusion = turnConclusions[0];
+    const finals = taskFlow.filter(
+      (block): block is Extract<TaskBlock, { type: "agent" }> =>
+      block.turnId === owner.turnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final"
+    );
+    if (
+      !turn ||
+      outcome?.status !== "completed" ||
+      outcome.runId !== owner.runId ||
+      outcome.parentRunId !== owner.parentRunId ||
+      outcome.resultKind !== owner.resultKind ||
+      runConclusions.length !== 1 ||
+      runConclusion?.type !== "run.completed" ||
+      runConclusion.parentRunId !== owner.parentRunId ||
+      runConclusion.resultKind !== owner.resultKind ||
+      runConclusion.summary !== owner.summary ||
+      turnConclusions.length !== 1 ||
+      turnConclusion?.type !== "turn.completed" ||
+      turnConclusion.resultKind !== owner.resultKind ||
+      finals.length !== 1 ||
+      finals[0].content !== owner.summary ||
+      finals[0].streaming === true
+    ) return false;
+    if (
+      owner.disposition !== "recovery_completed" &&
+      (
+        turn.clientSubmissionId !== claim.clientSubmissionId ||
+        turn.workspaceInstructionReceiptId !== claim.receiptId
+      )
+    ) return false;
+    if (owner.disposition !== "recovery_completed") return true;
+    return runtimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.threadId === claim.sessionKey &&
+      event.turnId === claim.turnId &&
+      event.runId === result.runId
+    ).length === 1;
+  };
+  if (!hasCanonicalProjection(
+    ownerState.runtimeEvents,
+    ownerState.conversationTurns,
+    ownerState.taskFlow,
+  )) {
+    return false;
+  }
+  const queue = ownerState.workspaceTurnQueue;
+  const head = queue?.entries[0];
+  // The durability barrier deliberately persists the terminal projection
+  // while retaining its dispatching FIFO head. This prevents an older generic
+  // autosave from resurrecting a nonterminal snapshot. The dispatcher may
+  // retire the head in memory only after observing both halves together.
+  return !!queue &&
+    queue.sessionKey === claim.sessionKey &&
+    queue.sessionEpoch === claim.sessionEpoch &&
+    head?.status === "dispatching" &&
+    head.claim?.claimId === claim.claimId &&
+    head.receipt.receiptId === claim.receiptId &&
+    head.receipt.clientSubmissionId === claim.clientSubmissionId &&
+    head.receipt.turnId === claim.turnId &&
+    workspaceInstructionEnvelopeIdentity(head) === claim.instructionEnvelopeIdentity;
+}
 
 function createWorkspaceRuntimeIdentity(prefix: string, at = Date.now()): string {
   const randomPart = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -5777,6 +8405,37 @@ export const useAppStore = create<AppState>()(
       } else {
         set({ isGenerating: false, abortController: null, agentStatus: "idle" });
       }
+      return;
+    }
+    const currentSessionKey = get().getCurrentSessionKey();
+    const localFastLease = currentTurnId && currentSessionKey
+      ? localFastExecutionLeasesByOwner.get(
+          localFastExecutionOwnerKey(currentSessionKey, currentTurnId),
+        ) || null
+      : null;
+    const localFastLeaseOwnsCurrentTurn = !!localFastLease && (
+      !localFastLease.claim || get().conversationTurns.some((turn) =>
+        turn.id === currentTurnId &&
+        turn.clientSubmissionId === localFastLease.clientSubmissionId &&
+        turn.workspaceInstructionReceiptId === localFastLease.receiptId
+      )
+    );
+    if (
+      localFastLease &&
+      !localFastLease.settled &&
+      localFastLeaseOwnsCurrentTurn &&
+      get().abortController === localFastLease.controller
+    ) {
+      // The local-fast completion owns the only cancellation conclusion. Do
+      // not let the generic cancel path race it with a second Turn terminal.
+      localFastLease.controller.abort();
+      set((s) => ({
+        taskFlow: s.taskFlow.map((block) =>
+          block.turnId === currentTurnId && block.type === "agent" && block.options?.length
+            ? { ...block, options: undefined }
+            : block
+        ),
+      }));
       return;
     }
     get().abortController?.abort();
@@ -6934,7 +9593,6 @@ export const useAppStore = create<AppState>()(
             turn.id === turnId
               ? {
                   ...turn,
-                  userPrompt: prompt,
                   title: turnTitle,
                   intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
                   mode: "chat" as const,
@@ -7999,7 +10657,11 @@ export const useAppStore = create<AppState>()(
   updateSession: (workspacePath: string, sessionId: number, patch: Partial<Session>) => {
     set((s) => {
       const wsSessions = s.sessionsByWorkspace[workspacePath];
-      if (!wsSessions) return s;
+      // Returning the whole Store for a semantic no-op makes the Session sync
+      // middleware interpret every runtime field as an authored patch. That
+      // needlessly replaces the opaque owner runtime object and invalidates
+      // revision-token CAS used by durable local-fast publication.
+      if (!wsSessions) return {};
       let changed = false;
       const nextSessions = wsSessions.map((sess) => {
         if (sess.id !== sessionId) return sess;
@@ -8015,7 +10677,7 @@ export const useAppStore = create<AppState>()(
         changed = true;
         return { ...sess, ...patch };
       });
-      if (!changed) return s;
+      if (!changed) return {};
       return {
         sessionsByWorkspace: {
           ...s.sessionsByWorkspace,
@@ -12385,6 +15047,9 @@ export const useAppStore = create<AppState>()(
             ...(typeof savedProjection.messageCount === "number"
               ? { messageCount: savedProjection.messageCount }
               : {}),
+            ...(typeof savedProjection.storageRevision === "number"
+              ? { storageRevision: savedProjection.storageRevision }
+              : {}),
             updatedAt: keepCurrentTimestamp
               ? currentOwner.updatedAt
               : savedProjection.updatedAt ?? sessionRecord.updatedAt,
@@ -12755,48 +15420,335 @@ export const useAppStore = create<AppState>()(
 
     const terminalHead = queue.entries[0];
     if (terminalHead?.status === "dispatching" && terminalHead.claim) {
-      const turn = state.conversationTurns.find(
-        (candidate) => candidate.id === terminalHead.receipt.turnId,
+      const activeLocalFastLease = localFastExecutionLeasesByClaim.get(
+        terminalHead.claim.claimId,
       );
-      const hasStartedEvent = state.runtimeEvents.some((event) =>
-        event.type === "run.started" &&
-        event.threadId === sessionKey &&
-        event.turnId === terminalHead.receipt.turnId
+      if (
+        activeLocalFastLease &&
+        !activeLocalFastLease.settled &&
+        activeLocalFastLease.sessionKey === sessionKey &&
+        activeLocalFastLease.turnId === terminalHead.receipt.turnId &&
+        activeLocalFastLease.claim?.receiptId === terminalHead.receipt.receiptId &&
+        activeLocalFastLease.claim.instructionEnvelopeIdentity ===
+          workspaceInstructionEnvelopeIdentity(terminalHead)
+      ) {
+        // A live local-fast lease has accepted the Run but has no recoverable
+        // executor checkpoint. Retain its durable FIFO head until the verified
+        // atomic conclusion callback removes it.
+        return false;
+      }
+      const terminalCommand = parseGameStudioSlashCommand(
+        terminalHead.instruction.payload.text,
       );
-      const hasTerminalEvent = state.runtimeEvents.some((event) =>
-        (event.type === "turn.completed" || event.type === "turn.failed") &&
-        event.threadId === sessionKey &&
-        event.turnId === terminalHead.receipt.turnId
-      );
-      if (hasStartedEvent || hasTerminalEvent || isConversationTurnRuntimeClosed(turn?.runtimeOutcome)) {
-        const removed = reduceWorkspaceTurnQueue(queue, {
-          ...(hasTerminalEvent || isConversationTurnRuntimeClosed(turn?.runtimeOutcome)
-            ? {
-                type: "remove" as const,
-                terminalOwner: {
-                  sessionKey: queue.sessionKey,
-                  sessionEpoch: queue.sessionEpoch,
-                  turnId: terminalHead.receipt.turnId,
-                },
-              }
-            : {
-                type: "ack" as const,
-                turnOwner: {
-                  sessionKey: queue.sessionKey,
-                  sessionEpoch: queue.sessionEpoch,
-                  turnId: terminalHead.receipt.turnId,
-                },
-              }),
+      const terminalHeadIsLocalFast = !!terminalCommand &&
+        getGameStudioSlashCommandSpec(terminalCommand)?.executionMode === "local_fast";
+      if (terminalHeadIsLocalFast) {
+        const at = Date.now();
+        const alreadyCanonical = hasCanonicalRestoredLocalFastConclusion({
+          entry: terminalHead,
+          sessionKey,
+          taskFlow: state.taskFlow,
+          conversationTurns: state.conversationTurns,
+          runtimeEvents: state.runtimeEvents,
+          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
+        });
+        const quarantined = alreadyCanonical
+          ? {
+              taskFlow: state.taskFlow,
+              conversationTurns: state.conversationTurns,
+              runtimeEvents: state.runtimeEvents,
+              presentationTurnId: terminalHead.receipt.turnId,
+            }
+          : quarantineRestoredLocalFastEntry({
+              entry: terminalHead,
+              sessionKey,
+              taskFlow: state.taskFlow,
+              conversationTurns: state.conversationTurns,
+              runtimeEvents: state.runtimeEvents,
+              at,
+              workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
+              reservedTaskBlockIds: queue.entries.map(
+                (entry) => entry.receipt.userBlockId,
+              ),
+            });
+        const canonicalAfterReconcile = hasCanonicalRestoredLocalFastConclusion({
+          entry: terminalHead,
+          sessionKey,
+          taskFlow: quarantined.taskFlow,
+          conversationTurns: quarantined.conversationTurns,
+          runtimeEvents: quarantined.runtimeEvents,
+          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
+        });
+        const removed = canonicalAfterReconcile
+          ? reduceWorkspaceTurnQueue(queue, {
+          type: "remove",
           expectedVersion: queue.version,
-          at: Date.now(),
+          at,
           claimId: terminalHead.claim.claimId,
           sessionKey: queue.sessionKey,
           sessionEpoch: queue.sessionEpoch,
-        });
-        if (removed.disposition === "applied") {
-          set({ workspaceTurnQueue: removed.state });
+          terminalOwner: {
+            sessionKey: queue.sessionKey,
+            sessionEpoch: queue.sessionEpoch,
+            turnId: terminalHead.receipt.turnId,
+            receiptId: terminalHead.receipt.receiptId,
+            clientSubmissionId: terminalHead.instruction.clientSubmissionId,
+            instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(terminalHead),
+          },
+        })
+          : null;
+        if (removed?.disposition === "applied") {
+          set({
+            workspaceTurnQueue: removed.state,
+            taskFlow: quarantined.taskFlow,
+            conversationTurns: quarantined.conversationTurns,
+            runtimeEvents: quarantined.runtimeEvents,
+            transcriptLoadedTurns: Math.max(
+              state.transcriptLoadedTurns,
+              quarantined.conversationTurns.length,
+            ),
+            transcriptTotalTurns: Math.max(
+              state.transcriptTotalTurns,
+              quarantined.conversationTurns.length,
+            ),
+          });
           get().saveCurrentRuntimeToSession();
+          logStoreEvent("workspace_local_fast_lost_lease_quarantined", {
+            sessionKey,
+            receiptId: terminalHead.receipt.receiptId,
+            sourceTurnId: terminalHead.receipt.turnId,
+            presentationTurnId: quarantined.presentationTurnId,
+            preservedCanonicalConclusion: alreadyCanonical,
+          });
           queue = removed.state;
+          state = get();
+        } else {
+          logStoreEvent("workspace_local_fast_lost_lease_quarantine_rejected", {
+            sessionKey,
+            receiptId: terminalHead.receipt.receiptId,
+            sourceTurnId: terminalHead.receipt.turnId,
+            canonicalAfterReconcile,
+            queueDisposition: removed?.disposition || null,
+          });
+        }
+      } else {
+        const inspection = inspectWorkspaceInstructionTerminalProjection({
+          entry: terminalHead,
+          sessionKey,
+          taskFlow: state.taskFlow,
+          conversationTurns: state.conversationTurns,
+          runtimeEvents: state.runtimeEvents,
+        });
+        const sourceStarts = state.runtimeEvents.filter(
+          (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
+            event.type === "run.started" &&
+            event.threadId === sessionKey &&
+            event.turnId === terminalHead.receipt.turnId,
+        );
+        const openSourceStarts = sourceStarts.filter((start) =>
+          !state.runtimeEvents.some((event) =>
+            (event.type === "run.completed" || event.type === "run.aborted") &&
+            event.threadId === sessionKey &&
+            event.turnId === terminalHead.receipt.turnId &&
+            event.runId === start.runId
+          )
+        );
+        const sourceHasTerminalBoundary = inspection.terminals.length > 0 ||
+          isConversationTurnRuntimeClosed(inspection.owner?.turn.runtimeOutcome);
+        const liveMarkerRunId = getHarnessActionRunId(state.harnessRunMarker);
+        const liveMarkerParentRunId = state.harnessRunMarker?.activeParentRunId ||
+          state.harnessRunMarker?.parentRunId ||
+          null;
+        const exactLiveMarkerStarts = liveMarkerRunId
+          ? sourceStarts.filter((start) =>
+              start.runId === liveMarkerRunId &&
+              start.parentRunId === liveMarkerParentRunId
+            )
+          : [];
+        const allLiveMarkerStarts = liveMarkerRunId
+          ? sourceStarts.filter((start) => start.runId === liveMarkerRunId)
+          : [];
+        const markerProvesRuntimeOwner = !!state.harnessRunMarker &&
+          state.harnessRunMarker.sessionKey === sessionKey &&
+          state.harnessRunMarker.turnId === terminalHead.receipt.turnId &&
+          (state.harnessRunMarker.status === "running" ||
+            state.harnessRunMarker.status === "paused") &&
+          !!liveMarkerRunId &&
+          exactLiveMarkerStarts.length === 1 &&
+          allLiveMarkerStarts.length === 1 &&
+          openSourceStarts.some((start) => start === exactLiveMarkerStarts[0]);
+        const activeGenerationProvesRuntimeOwner =
+          state.currentTurnId === terminalHead.receipt.turnId &&
+          (state.isGenerating ||
+            state.agentStatus === "running" ||
+            state.agentStatus === "pending_review") &&
+          openSourceStarts.length === 1 &&
+          sourceStarts.filter(
+            (start) => start.runId === openSourceStarts[0].runId,
+          ).length === 1;
+        const exactRuntimeIsActive = !!inspection.owner &&
+          !sourceHasTerminalBoundary &&
+          (markerProvesRuntimeOwner || activeGenerationProvesRuntimeOwner);
+        const exactRuntimeIsStarting = !!inspection.owner &&
+          !sourceHasTerminalBoundary &&
+          sourceStarts.length === 0 &&
+          state.currentTurnId === terminalHead.receipt.turnId &&
+          (state.isGenerating || state.agentStatus === "running");
+        if (exactRuntimeIsStarting) {
+          const claimId = terminalHead.claim.claimId;
+          const graceState = workspaceInstructionStartingGraceByClaim.get(claimId);
+          const claimAgeMs = Math.max(0, Date.now() - terminalHead.claim.claimedAt);
+          if (claimAgeMs <= WORKSPACE_INSTRUCTION_START_GRACE_MS && !graceState) {
+            // A synchronous re-entrant dispatch can observe the adopted Turn
+            // immediately before run.started. Give that handoff exactly one
+            // next-paint retry; a second observation fails closed below.
+            workspaceInstructionStartingGraceByClaim.set(claimId, "scheduled");
+            const retryStartingClaim = () => {
+              if (workspaceInstructionStartingGraceByClaim.get(claimId) !== "scheduled") {
+                return;
+              }
+              workspaceInstructionStartingGraceByClaim.set(claimId, "consumed");
+              const timeoutId = workspaceInstructionStartingGraceTimeoutByClaim.get(claimId);
+              if (timeoutId !== undefined) clearTimeout(timeoutId);
+              workspaceInstructionStartingGraceTimeoutByClaim.delete(claimId);
+              try {
+                if (isSessionRuntimeActive(get(), sessionKey)) {
+                  get().dispatchNextWorkspaceInstruction(sessionKey);
+                }
+              } finally {
+                if (workspaceInstructionStartingGraceByClaim.get(claimId) === "consumed") {
+                  clearWorkspaceInstructionStartingGrace(claimId);
+                }
+              }
+            };
+            workspaceInstructionStartingGraceTimeoutByClaim.set(
+              claimId,
+              setTimeout(retryStartingClaim, WORKSPACE_INSTRUCTION_START_GRACE_MS),
+            );
+            runAfterNextPaint(retryStartingClaim);
+            return false;
+          }
+          if (graceState === "scheduled") return false;
+          clearWorkspaceInstructionStartingGrace(claimId);
+        } else {
+          clearWorkspaceInstructionStartingGrace(terminalHead.claim.claimId);
+        }
+        const at = Date.now();
+        const exactOwner = {
+          sessionKey: queue.sessionKey,
+          sessionEpoch: queue.sessionEpoch,
+          turnId: terminalHead.receipt.turnId,
+          receiptId: terminalHead.receipt.receiptId,
+          clientSubmissionId: terminalHead.instruction.clientSubmissionId,
+          instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(terminalHead),
+        };
+        const transition = exactRuntimeIsActive
+          ? reduceWorkspaceTurnQueue(queue, {
+              type: "ack",
+              expectedVersion: queue.version,
+              at,
+              claimId: terminalHead.claim.claimId,
+              sessionKey: queue.sessionKey,
+              sessionEpoch: queue.sessionEpoch,
+              turnOwner: exactOwner,
+            })
+          : reduceWorkspaceTurnQueue(queue, {
+              type: "remove",
+              expectedVersion: queue.version,
+              at,
+              claimId: terminalHead.claim.claimId,
+              sessionKey: queue.sessionKey,
+              sessionEpoch: queue.sessionEpoch,
+              terminalOwner: exactOwner,
+            });
+        if (transition.disposition === "applied") {
+          if (exactRuntimeIsActive) {
+            set({ workspaceTurnQueue: transition.state });
+          } else {
+            const useChinese = /[^\x00-\x7F]/.test(
+              terminalHead.instruction.payload.text,
+            );
+            const conclusion = concludeWorkspaceInstructionEntry({
+              entry: terminalHead,
+              sessionKey,
+              taskFlow: state.taskFlow,
+              conversationTurns: state.conversationTurns,
+              runtimeEvents: state.runtimeEvents,
+              resultKind: "error",
+              summary: useChinese
+                ? "MAIN 无法证明这个遗留调度声明仍由精确执行器持有。为避免重复执行，已保留无关历史，并用可见错误结论收口。"
+                : "MAIN could not prove that this stale dispatch claim was still owned by its exact executor. To prevent duplicate execution, unrelated history was preserved and a visible error conclusion was recorded.",
+              timestampMs: at,
+              forceRecovery: !inspection.owner,
+              recoveryReason: inspection.owner
+                ? "workspace_instruction_stale_claim_unverified"
+                : "workspace_instruction_stale_claim_owner_conflict",
+              language: useChinese ? "zh" : "en",
+              reservedTaskBlockIds: queue.entries.map(
+                (entry) => entry.receipt.userBlockId,
+              ),
+            });
+            const staleExactTurnOwnsControlPlane = !!inspection.owner &&
+              state.currentTurnId === terminalHead.receipt.turnId;
+            const staleActionOwnsControlPlane =
+              state.activeActionRequest?.sessionKey === sessionKey &&
+              state.activeActionRequest.turnId === terminalHead.receipt.turnId;
+            const staleDecisionOwnsControlPlane =
+              state.pendingRunDecision?.turnId === terminalHead.receipt.turnId;
+            if (staleExactTurnOwnsControlPlane) {
+              state.abortController?.abort();
+            }
+            set({
+              workspaceTurnQueue: transition.state,
+              taskFlow: conclusion.taskFlow,
+              conversationTurns: conclusion.conversationTurns,
+              runtimeEvents: conclusion.runtimeEvents,
+              transcriptLoadedTurns: Math.max(
+                state.transcriptLoadedTurns,
+                conclusion.conversationTurns.length,
+              ),
+              transcriptTotalTurns: Math.max(
+                state.transcriptTotalTurns,
+                conclusion.conversationTurns.length,
+              ),
+              ...(staleExactTurnOwnsControlPlane
+                ? {
+                    currentTurnId: null,
+                    currentTurnState: createDefaultCurrentTurnState(),
+                    isGenerating: false,
+                    agentStatus: "idle" as const,
+                    abortController: null,
+                    harnessRunMarker:
+                      state.harnessRunMarker?.sessionKey === sessionKey &&
+                        state.harnessRunMarker.turnId === terminalHead.receipt.turnId
+                        ? null
+                        : state.harnessRunMarker,
+                    activeActionRequest:
+                      staleActionOwnsControlPlane
+                        ? null
+                        : state.activeActionRequest,
+                    pendingReviewResolve: staleActionOwnsControlPlane
+                      ? null
+                      : state.pendingReviewResolve,
+                    pendingReviewTaskId: staleActionOwnsControlPlane
+                      ? null
+                      : state.pendingReviewTaskId,
+                    pendingToolCall: staleActionOwnsControlPlane
+                      ? null
+                      : state.pendingToolCall,
+                    pendingRunDecision: staleDecisionOwnsControlPlane
+                      ? null
+                      : state.pendingRunDecision,
+                    pendingRunDecisionResolver: staleDecisionOwnsControlPlane
+                      ? null
+                      : state.pendingRunDecisionResolver,
+                    normalizedStreamState: defaultNormalizedStreamState,
+                  }
+                : {}),
+            });
+          }
+          get().saveCurrentRuntimeToSession();
+          queue = transition.state;
           state = get();
         }
       }
@@ -12904,6 +15856,7 @@ export const useAppStore = create<AppState>()(
       sessionEpoch: queue.sessionEpoch,
       turnId: head.receipt.turnId,
       admittedUserBlockId: head.receipt.userBlockId,
+      instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(head),
     };
     const hints = head.instruction.payload.dispatchHints || {};
     const candidateGoalCreation = isGoalCreationAuthorization(hints.goalCreationAuthorization)
@@ -13113,7 +16066,7 @@ export const useAppStore = create<AppState>()(
     );
 
     const completeAdmittedTurn = (
-      resultKind: "success" | "error",
+      resultKind: WorkspaceInstructionTerminalResultKind,
       summary: string,
     ) => {
       let completed = false;
@@ -13124,20 +16077,17 @@ export const useAppStore = create<AppState>()(
           !activeQueue ||
           activeHead?.status !== "dispatching" ||
           activeHead.claim?.claimId !== claimId ||
-          activeHead.receipt.receiptId !== head.receipt.receiptId
+          activeHead.receipt.receiptId !== head.receipt.receiptId ||
+          activeHead.receipt.turnId !== head.receipt.turnId ||
+          activeHead.receipt.userBlockId !== head.receipt.userBlockId ||
+          activeHead.instruction.clientSubmissionId !==
+            head.instruction.clientSubmissionId ||
+          workspaceInstructionEnvelopeIdentity(activeHead) !==
+            exactClaim.instructionEnvelopeIdentity ||
+          activeQueue.sessionKey !== head.receipt.sessionKey ||
+          activeQueue.sessionEpoch !== head.receipt.sessionEpoch
         ) return {};
-        const existingTerminal = current.runtimeEvents.some((event) =>
-          (event.type === "turn.completed" || event.type === "turn.failed") &&
-          event.threadId === sessionKey &&
-          event.turnId === head.receipt.turnId
-        );
-        // A projection ownership conflict must consume the exact FIFO head even
-        // when corrupt history already contains a lookalike terminal event.
-        // Otherwise every retry would release and reclaim the same poisoned head.
-        if (existingTerminal && !projectionConflictReason) return {};
         const timestampMs = Date.now();
-        const runId = `run-admission-${head.receipt.turnId}`;
-        const finalBlockId = current._nextTaskId();
         const removed = reduceWorkspaceTurnQueue(activeQueue, {
           type: "remove",
           expectedVersion: activeQueue.version,
@@ -13149,147 +16099,48 @@ export const useAppStore = create<AppState>()(
             sessionKey: activeQueue.sessionKey,
             sessionEpoch: activeQueue.sessionEpoch,
             turnId: head.receipt.turnId,
+            receiptId: head.receipt.receiptId,
+            clientSubmissionId: head.instruction.clientSubmissionId,
+            instructionEnvelopeIdentity: exactClaim.instructionEnvelopeIdentity,
           },
         });
         if (removed.disposition !== "applied") return {};
         completed = true;
-        let runtimeEvents = appendRuntimeEvent(current.runtimeEvents, withEventSchema({
-          type: "run.started",
-          threadId: sessionKey,
-          turnId: head.receipt.turnId,
-          timestampMs,
-          runId,
-          parentRunId: null,
-        }));
-        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-          type: "run.completed",
-          threadId: sessionKey,
-          turnId: head.receipt.turnId,
-          timestampMs,
-          runId,
-          parentRunId: null,
+        const conclusion = concludeWorkspaceInstructionEntry({
+          entry: activeHead,
+          sessionKey,
+          taskFlow: current.taskFlow,
+          conversationTurns: current.conversationTurns,
+          runtimeEvents: current.runtimeEvents,
           resultKind,
           summary,
-        }));
-        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-          type: "turn.completed",
-          threadId: sessionKey,
-          turnId: head.receipt.turnId,
           timestampMs,
-          resultKind,
-        }));
-        const ownedTurnExists = current.conversationTurns.some((turn) =>
-          turn.id === head.receipt.turnId &&
-          turn.clientSubmissionId === head.instruction.clientSubmissionId &&
-          turn.workspaceInstructionReceiptId === head.receipt.receiptId
-        );
-        const recoveryPresentationTurnId = ownedTurnExists
-          ? head.receipt.turnId
-          : current.conversationTurns.some((turn) => turn.id === head.receipt.turnId)
-            ? `workspace-recovery-${head.receipt.receiptId}-${timestampMs}`
-            : head.receipt.turnId;
-        const recoveryUserBlockId = ownedTurnExists ? null : current._nextTaskId();
-        const recoveryTurn: ConversationTurn | null = ownedTurnExists
-          ? null
-          : {
-              id: recoveryPresentationTurnId,
-              ...(recoveryPresentationTurnId === head.receipt.turnId
-                ? {
-                    clientSubmissionId: head.instruction.clientSubmissionId,
-                    workspaceInstructionReceiptId: head.receipt.receiptId,
-                    workspaceInstructionSource: head.instruction.source,
-                  }
-                : {}),
-              userPrompt: head.instruction.payload.text,
-              title: normalizeConversationDisplayTitle(
-                head.instruction.payload.text,
-                current.config.language === "en" ? 48 : 40,
-                current.config.language === "en" ? "Workspace instruction" : "工作区指令",
-              ),
-              intentSummary: current.config.language === "en"
-                ? "The durable workspace Turn was closed at a recovery ownership boundary."
-                : "持久化工作区回合已在恢复所有权边界收口。",
-              mode: "chat",
-              intent: "respond",
-              displayIntent: "respond",
-              status: "error",
-              summary,
-              blockIds: [recoveryUserBlockId!, finalBlockId],
-              processCollapsed: false,
-              collapsed: false,
-              createdAt: head.receipt.acceptedAt,
-              runtimeOutcome: {
-                status: "completed",
-                reason: "workspace_instruction_projection_conflict",
-                resultKind: "error",
-                runId,
-                parentRunId: null,
-                updatedAt: timestampMs,
-              },
-            };
-        const nextConversationTurns = recoveryTurn
-          ? [...current.conversationTurns, recoveryTurn]
-          : current.conversationTurns.map((turn) =>
-              turn.id === head.receipt.turnId &&
-                turn.clientSubmissionId === head.instruction.clientSubmissionId &&
-                turn.workspaceInstructionReceiptId === head.receipt.receiptId
-                ? {
-                    ...turn,
-                    status: resultKind === "error" ? "error" as const : "done" as const,
-                    summary,
-                    blockIds: turn.blockIds.includes(finalBlockId)
-                      ? turn.blockIds
-                      : [...turn.blockIds, finalBlockId],
-                    runtimeOutcome: {
-                      status: "completed" as const,
-                      reason: resultKind === "error"
-                        ? "workspace_instruction_dispatch_rejected"
-                        : "workspace_instruction_action_applied",
-                      resultKind,
-                      runId,
-                      parentRunId: null,
-                      updatedAt: timestampMs,
-                    },
-                  }
-                : turn
-            );
+          forceRecovery: !!projectionConflictReason,
+          recoveryReason: projectionConflictReason,
+          language: current.config.language === "en" ? "en" : "zh",
+          reservedTaskBlockIds: activeQueue.entries.map(
+            (entry) => entry.receipt.userBlockId,
+          ),
+        });
         return {
           workspaceTurnQueue: removed.state,
-          taskFlow: [
-            ...current.taskFlow,
-            ...(recoveryTurn
-              ? [{
-                  id: recoveryUserBlockId!,
-                  turnId: recoveryPresentationTurnId,
-                  type: "user" as const,
-                  content: head.instruction.payload.text,
-                  ...(head.instruction.payload.images?.length
-                    ? { images: [...head.instruction.payload.images] }
-                    : {}),
-                }]
-              : []),
-            {
-              id: finalBlockId,
-              turnId: recoveryPresentationTurnId,
-              type: "agent" as const,
-              content: summary,
-              streaming: false,
-              visibility: "assistant_final" as const,
-            },
-          ],
-          runtimeEvents,
-          conversationTurns: nextConversationTurns,
+          taskFlow: conclusion.taskFlow,
+          runtimeEvents: conclusion.runtimeEvents,
+          conversationTurns: conclusion.conversationTurns,
           transcriptLoadedTurns: Math.max(
             current.transcriptLoadedTurns,
-            nextConversationTurns.length,
+            conclusion.conversationTurns.length,
           ),
           transcriptTotalTurns: Math.max(
             current.transcriptTotalTurns,
-            nextConversationTurns.length,
+            conclusion.conversationTurns.length,
           ),
         };
       });
-      if (completed) get().saveCurrentRuntimeToSession();
+      if (completed) {
+        get().saveCurrentRuntimeToSession();
+        runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+      }
       return completed;
     };
 
@@ -13302,7 +16153,9 @@ export const useAppStore = create<AppState>()(
           !activeQueue ||
           activeHead?.status !== "dispatching" ||
           activeHead.claim?.claimId !== claimId ||
-          activeHead.receipt.receiptId !== head.receipt.receiptId
+          activeHead.receipt.receiptId !== head.receipt.receiptId ||
+          workspaceInstructionEnvelopeIdentity(activeHead) !==
+            exactClaim.instructionEnvelopeIdentity
         ) return {};
         const transition = reduceWorkspaceTurnQueue(activeQueue, {
           type: "ack",
@@ -13315,6 +16168,9 @@ export const useAppStore = create<AppState>()(
             sessionKey: activeQueue.sessionKey,
             sessionEpoch: activeQueue.sessionEpoch,
             turnId: head.receipt.turnId,
+            receiptId: head.receipt.receiptId,
+            clientSubmissionId: head.instruction.clientSubmissionId,
+            instructionEnvelopeIdentity: exactClaim.instructionEnvelopeIdentity,
           },
         });
         if (transition.disposition !== "applied") return {};
@@ -13337,7 +16193,9 @@ export const useAppStore = create<AppState>()(
           !activeQueue ||
           activeHead?.status !== "dispatching" ||
           activeHead.claim?.claimId !== claimId ||
-          activeHead.receipt.receiptId !== head.receipt.receiptId
+          activeHead.receipt.receiptId !== head.receipt.receiptId ||
+          workspaceInstructionEnvelopeIdentity(activeHead) !==
+            exactClaim.instructionEnvelopeIdentity
         ) return {};
         const released = reduceWorkspaceTurnQueue(activeQueue, {
           type: "release",
@@ -13378,7 +16236,6 @@ export const useAppStore = create<AppState>()(
           ) {
             workspaceInstructionCancellationFailureBySession.delete(sessionKey);
           }
-          runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
           return true;
         }
         releaseAdmittedTurnClaim();
@@ -13400,24 +16257,121 @@ export const useAppStore = create<AppState>()(
       releaseAdmittedTurnClaim();
       return false;
     }
+    const localFastLease = localFastExecutionLeasesByClaim.get(claimId);
+    if (
+      localFastLease &&
+      localFastLease.claim?.receiptId === head.receipt.receiptId &&
+      localFastLease.sessionKey === sessionKey &&
+      localFastLease.turnId === head.receipt.turnId
+    ) {
+      if (!localFastLease.dispatcherObserved) {
+        localFastLease.dispatcherObserved = true;
+        const releaseUnverifiedLeaseForFailClosedReconcile = (detail: string) => {
+          logStoreEvent("workspace_local_fast_conclusion_unverified", {
+            sessionKey,
+            turnId: head.receipt.turnId,
+            receiptId: head.receipt.receiptId,
+            runId: localFastLease.runId,
+            detail,
+          });
+          const ownerStillCurrent = localFastLease.hasRuntimeOwnership();
+          // Never retain a rejected completion as a permanent execution lease.
+          // The still-dispatching head is not released back to queued: once the
+          // transient map is gone, the dispatcher's lost-lease branch closes it
+          // through the identity-safe quarantine projection without rerunning
+          // the local handler.
+          localFastLease.release();
+          if (ownerStillCurrent && isSessionRuntimeActive(get(), sessionKey)) {
+            runAfterNextPaint(() => {
+              if (isSessionRuntimeActive(get(), sessionKey)) {
+                get().dispatchNextWorkspaceInstruction(sessionKey);
+              }
+            });
+          }
+        };
+        void localFastLease.completion.then(
+          (result) => {
+            if (hasVerifiedLocalFastConclusion(get(), exactClaim, result)) {
+              if (!localFastLease.retireWorkspaceClaim()) {
+                releaseUnverifiedLeaseForFailClosedReconcile(
+                  "terminal_verified_but_fifo_retirement_rejected",
+                );
+                return;
+              }
+              localFastLease.release();
+              if (isSessionRuntimeActive(get(), sessionKey)) {
+                runAfterNextPaint(() => {
+                  if (isSessionRuntimeActive(get(), sessionKey)) {
+                    get().dispatchNextWorkspaceInstruction(sessionKey);
+                  }
+                });
+              }
+              return;
+            }
+            releaseUnverifiedLeaseForFailClosedReconcile(
+              result.error?.message || "terminal_projection_unverified",
+            );
+          },
+          (error) => {
+            releaseUnverifiedLeaseForFailClosedReconcile(
+              error instanceof Error ? error.message : String(error),
+            );
+          },
+        );
+      }
+      return true;
+    }
     const postDispatch = get();
-    const adoptedTurnOwnsRuntime = postDispatch.currentTurnId === head.receipt.turnId ||
-      postDispatch.harnessRunMarker?.turnId === head.receipt.turnId;
-    const admittedTurnAlreadyTerminal = postDispatch.runtimeEvents.some((event) =>
-      (event.type === "turn.completed" || event.type === "turn.failed") &&
-      event.threadId === sessionKey &&
-      event.turnId === head.receipt.turnId
+    const postDispatchInspection = inspectWorkspaceInstructionTerminalProjection({
+      entry: head,
+      sessionKey,
+      taskFlow: postDispatch.taskFlow,
+      conversationTurns: postDispatch.conversationTurns,
+      runtimeEvents: postDispatch.runtimeEvents,
+    });
+    const adoptedTurnOwnsRuntime = !!postDispatchInspection.owner && (
+      postDispatch.currentTurnId === head.receipt.turnId ||
+      (
+        postDispatch.harnessRunMarker?.sessionKey === sessionKey &&
+        postDispatch.harnessRunMarker.turnId === head.receipt.turnId
+      )
     );
-    if (adoptedTurnOwnsRuntime || admittedTurnAlreadyTerminal) {
+    const admittedTurnAlreadyTerminal = postDispatchInspection.terminals.length > 0 ||
+      isConversationTurnRuntimeClosed(
+        postDispatchInspection.owner?.turn.runtimeOutcome,
+    );
+    if (admittedTurnAlreadyTerminal) {
+      const closedOutcome = postDispatchInspection.owner?.turn.runtimeOutcome;
+      const completedOutcome = closedOutcome?.status === "completed" ? closedOutcome : null;
+      const outcomeResultKind: WorkspaceInstructionTerminalResultKind =
+        closedOutcome?.status === "aborted"
+          ? "canceled"
+          : completedOutcome?.resultKind || "success";
+      const durableResultKind = postDispatchInspection.terminals.length === 1
+        ? postDispatchInspection.terminals[0].resultKind || outcomeResultKind
+        : outcomeResultKind;
+      const terminalSummary = String(
+        postDispatchInspection.owner?.turn.summary || "",
+      ).trim() || (
+        postDispatch.config.language === "en"
+          ? "The admitted workspace Turn reached its terminal conclusion."
+          : "已接纳的工作区回合已得出最终结论。"
+      );
+      completeAdmittedTurn(durableResultKind, terminalSummary);
+      return true;
+    }
+    if (adoptedTurnOwnsRuntime) {
       acknowledgeAdmittedTurn();
       return true;
     }
-    if (!adoptedTurnOwnsRuntime && !admittedTurnAlreadyTerminal) {
-      const summary = postDispatch.config.language === "en"
+    const summary = postDispatchInspection.owner
+      ? postDispatch.config.language === "en"
         ? "The instruction was accepted and applied to the active workflow. Any resulting execution continues in its owning Turn."
-        : "该指令已接纳并应用到当前工作流；由它触发的后续执行将在所属回合中继续。";
-      completeAdmittedTurn("success", summary);
-    }
+        : "该指令已接纳并应用到当前工作流；由它触发的后续执行将在所属回合中继续。"
+      : postDispatch.config.language === "en"
+      ? "The execution adapter lost the exact admitted Turn owner. Unrelated history was preserved and a recovery Turn recorded the visible error."
+      : "执行适配器失去了已接纳回合的精确所有权；无关历史保持不变，并由恢复回合记录可见错误。";
+    completeAdmittedTurn(postDispatchInspection.owner ? "success" : "error", summary);
     return true;
   },
   setAgentStatus: (s) => set({ agentStatus: s }),
@@ -14871,6 +17825,9 @@ export const useAppStore = create<AppState>()(
       shouldSeedSessionTitleForTurn,
       seededSessionTitleCandidate,
     } = titleDecision;
+    const localSlashRuntimeOwnerToken = getSessionRuntimeOwnerToken();
+    const workspaceInstructionClaim = options?.workspaceInstructionClaim || null;
+    const localSlashAbortController = new AbortController();
     const localSlashBridge = createGameStudioLocalSlashBridge({
       sessionGet,
       sessionSet,
@@ -14893,9 +17850,139 @@ export const useAppStore = create<AppState>()(
       shouldSeedSessionTitleForTurn,
       ensuredSessionId,
       sessionScopeKey,
+      runSessionKey,
       titleIntentSignature,
       sanitizeTaskBlocksForPersist,
       normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+      commitLocalSlashProjection: (context) => {
+        if (!isHidden && ensuredSessionId != null) {
+          sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
+            storageStatus: "temporary",
+          });
+        }
+        return commitGameStudioLocalSlashProjection({
+          context,
+          claim: workspaceInstructionClaim,
+          sessionGet,
+          getSessionRevisionToken,
+          hasSessionRuntimeOwnership: () =>
+            hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken),
+          scopeKey: sessionScopeKey,
+          sessionId: ensuredSessionId,
+          decorateProjection: (projectedState, commitContext) => {
+            if (isHidden || ensuredSessionId == null) return projectedState;
+            const sessions = projectedState.sessionsByWorkspace[sessionScopeKey] || [];
+            const maySeedTitle = commitContext.includeTitle &&
+              shouldSeedSessionTitleForTurn &&
+              projectedState.currentTurnId === turnId;
+            return {
+              ...projectedState,
+              sessionsByWorkspace: {
+                ...projectedState.sessionsByWorkspace,
+                [sessionScopeKey]: sessions.map((candidate) =>
+                  candidate.id === ensuredSessionId
+                    ? {
+                        ...candidate,
+                        ...(maySeedTitle
+                          ? {
+                              title: turnTitle,
+                              titleSource: "local_seed" as const,
+                              titleIntentSignature,
+                            }
+                          : {}),
+                        // `ok` is owned by the Rust save response. Until that
+                        // boundary this projection is explicitly temporary.
+                        storageStatus: "temporary" as const,
+                        recordingDisabled:
+                          !projectedState.config.sessionRecordingEnabled ||
+                          candidate.recordingDisabled === true,
+                      }
+                    : candidate
+                ),
+              },
+            };
+          },
+          persistProjection: async (projectedState, expectedRevisionToken) =>
+            persistSubmitRuntimeProjection({
+              state: projectedState,
+              scopeKey: sessionScopeKey,
+              sessionId: ensuredSessionId,
+              sanitizeTaskBlocksForPersist,
+              buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
+              persistSessionRecord: async (scopeKey, sessionRecord) => {
+                try {
+                  return await saveProjectSession(scopeKey, sessionRecord, {
+                    isCurrent: () =>
+                      hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken) &&
+                      getSessionRevisionToken() === expectedRevisionToken,
+                  });
+                } catch (error) {
+                  // An external writer may have advanced SQLite's CAS
+                  // revision. Refresh both the IPC cache and the in-memory
+                  // Session metadata before the durability loop retries.
+                  if (ensuredSessionId != null) {
+                    try {
+                      const meta = await loadProjectSessionMeta(scopeKey, ensuredSessionId);
+                      if (typeof meta?.storageRevision === "number") {
+                        sessionGet().updateSession(scopeKey, ensuredSessionId, {
+                          storageRevision: meta.storageRevision,
+                        });
+                      }
+                    } catch {
+                      // Preserve the original persistence error and retry with
+                      // exponential backoff; metadata refresh is best effort.
+                    }
+                  }
+                  throw error;
+                }
+              },
+              nowMs,
+            }),
+          buildMemoryFallbackProjection: (projectedState) =>
+            buildTemporarySubmitRuntimeProjection({
+              state: projectedState,
+              scopeKey: sessionScopeKey,
+              sessionId: ensuredSessionId,
+              sanitizeTaskBlocksForPersist,
+              buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
+              nowMs,
+            }),
+          rememberDurableState: (durableState) => {
+            if (ensuredSessionId == null) return;
+            const durableRecord = (
+              durableState.sessionsByWorkspace[sessionScopeKey] || []
+            ).find((candidate) => candidate.id === ensuredSessionId);
+            const requiresSessionDurability =
+              durableState.config.sessionRecordingEnabled &&
+              durableRecord?.recordingDisabled !== true;
+            if (
+              requiresSessionDurability &&
+              (!durableRecord || !(Number(durableRecord.storageRevision) > 0))
+            ) {
+              throw new Error("LOCAL_SLASH_DURABLE_STORAGE_REVISION_MISSING");
+            }
+            if (!durableRecord) return;
+            const latestRecord = (
+              sessionGet().sessionsByWorkspace[sessionScopeKey] || []
+            ).find((candidate) => candidate.id === ensuredSessionId);
+            sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
+              ...(typeof durableRecord.storageRevision === "number"
+                ? {
+                    storageRevision: Math.max(
+                      Number(latestRecord?.storageRevision) || 0,
+                      durableRecord.storageRevision,
+                    ),
+                  }
+                : {}),
+              storageStatus: requiresSessionDurability ? "ok" : "temporary",
+              recordingDisabled: !requiresSessionDurability,
+            });
+          },
+          publishProjection: publishOwnerScopedRuntimeProjection,
+          abortSignal: localSlashAbortController.signal,
+          log: logStoreEvent,
+        });
+      },
     });
 
     const localSlashSubmission = startGameStudioLocalSlashSubmission({
@@ -14905,27 +17992,139 @@ export const useAppStore = create<AppState>()(
       turnId,
       runtimeService: gameStudioRuntimeService,
       getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
-      setActiveStudioAgentKey: (agent, options) => sessionGet().setActiveStudioAgentKey(agent, options),
+      commitActiveStudioAgentKey: (agent, commitOptions) => {
+        // JavaScript cannot interleave an AbortSignal event between this check
+        // and the synchronous state mutation at the start of the Store setter.
+        // That call is therefore the local side-effect commit point.
+        if (localSlashAbortController.signal.aborted) {
+          const error = new Error("Local slash command canceled before side-effect commit");
+          error.name = "AbortError";
+          throw error;
+        }
+        return sessionGet().setActiveStudioAgentKey(agent, commitOptions);
+      },
       appendLocalStudioTurn: localSlashBridge.appendLocalStudioTurn,
+      ensureVisibleConclusion: localSlashBridge.ensureVisibleConclusion,
       emitRuntimeEvent: localSlashBridge.emitLocalSlashRuntimeEvent,
       logStoreEvent,
+      runId: options?.runIdOverride,
+      parentRunId: options?.parentRunIdOverride ?? null,
+      abortSignal: localSlashAbortController.signal,
     });
     if (localSlashSubmission.handled) {
+      if (!localSlashSubmission.runId || !localSlashSubmission.completion) {
+        throw new Error("Handled local slash submission did not expose an execution lease");
+      }
       // Local-fast commands may await workspace metadata before appending their
       // conclusion. Mark the exact admitted Turn as the live owner immediately
       // so the FIFO dispatcher cannot mistake the accepted command for a
       // synchronous ActionDecision and close it ahead of its real result.
-      if (options?.adoptExistingTurn) {
-        sessionSet((current) => ({
-          currentTurnId: turnId,
-          conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
-            turn.id === turnId && !isConversationTurnRuntimeClosed(turn.runtimeOutcome)
-              ? { ...turn, status: "executing" as const }
-              : turn
-          ),
-        }));
+      sessionSet((current) => ({
+        currentTurnId: turnId,
+        conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
+          turn.id === turnId && !isConversationTurnRuntimeClosed(turn.runtimeOutcome)
+            ? { ...turn, status: "executing" as const }
+            : turn
+        ),
+        isGenerating: true,
+        agentStatus: "running",
+        abortController: localSlashAbortController,
+      }));
+      const claim = workspaceInstructionClaim;
+      const ownerKey = localFastExecutionOwnerKey(runSessionKey, turnId);
+      let lease!: LocalFastExecutionLease;
+      const retireWorkspaceClaim = () => {
+        if (!claim) return true;
+        let retired = false;
+        sessionSet((current) => {
+          const queue = current.workspaceTurnQueue;
+          const activeHead = queue?.entries[0];
+          if (
+            !queue ||
+            queue.sessionKey !== claim.sessionKey ||
+            queue.sessionEpoch !== claim.sessionEpoch ||
+            activeHead?.status !== "dispatching" ||
+            activeHead.claim?.claimId !== claim.claimId ||
+            activeHead.receipt.receiptId !== claim.receiptId ||
+            activeHead.receipt.clientSubmissionId !== claim.clientSubmissionId ||
+            activeHead.receipt.turnId !== claim.turnId ||
+            workspaceInstructionEnvelopeIdentity(activeHead) !==
+              claim.instructionEnvelopeIdentity
+          ) return {};
+          const transition = reduceWorkspaceTurnQueue(queue, {
+            type: "remove",
+            expectedVersion: queue.version,
+            at: Date.now(),
+            claimId: claim.claimId,
+            sessionKey: claim.sessionKey,
+            sessionEpoch: claim.sessionEpoch,
+            terminalOwner: {
+              sessionKey: claim.sessionKey,
+              sessionEpoch: claim.sessionEpoch,
+              turnId: claim.turnId,
+              receiptId: claim.receiptId,
+              clientSubmissionId: claim.clientSubmissionId,
+              instructionEnvelopeIdentity: claim.instructionEnvelopeIdentity,
+            },
+          });
+          if (transition.disposition !== "applied") return {};
+          retired = true;
+          return { workspaceTurnQueue: transition.state };
+        });
+        return retired;
+      };
+      const releaseLease = () => {
+        if (lease.settled) return;
+        lease.settled = true;
+        if (localFastExecutionLeasesByOwner.get(ownerKey) === lease) {
+          localFastExecutionLeasesByOwner.delete(ownerKey);
+        }
+        if (claim && localFastExecutionLeasesByClaim.get(claim.claimId) === lease) {
+          localFastExecutionLeasesByClaim.delete(claim.claimId);
+        }
+        sessionSet((current) => {
+          const exactTurnIdentity = !claim || current.conversationTurns.some(
+            (candidate: ConversationTurn) =>
+              candidate.id === turnId &&
+              candidate.clientSubmissionId === claim.clientSubmissionId &&
+              candidate.workspaceInstructionReceiptId === claim.receiptId,
+          );
+          return exactTurnIdentity &&
+              current.currentTurnId === turnId &&
+              current.abortController === localSlashAbortController
+            ? {
+                abortController: null,
+                isGenerating: false,
+                agentStatus: "idle",
+              }
+            : {};
+        });
+      };
+      lease = {
+        sessionKey: runSessionKey,
+        turnId,
+        runId: localSlashSubmission.runId,
+        clientSubmissionId: claim?.clientSubmissionId || null,
+        receiptId: claim?.receiptId || null,
+        controller: localSlashAbortController,
+        claim,
+        completion: localSlashSubmission.completion,
+        hasRuntimeOwnership: () =>
+          hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken),
+        retireWorkspaceClaim,
+        release: releaseLease,
+        settled: false,
+        dispatcherObserved: false,
+      };
+      localFastExecutionLeasesByOwner.set(ownerKey, lease);
+      if (claim) localFastExecutionLeasesByClaim.set(claim.claimId, lease);
+      // Workspace claims are released only by the dispatcher's owner-scoped
+      // verifier. Registering an eager cleanup here races that verifier because
+      // Promise callbacks run in registration order. Direct (non-workspace)
+      // local-fast submissions have no FIFO owner and may clean themselves up.
+      if (!claim) {
+        void localSlashSubmission.completion.then(releaseLease, releaseLease);
       }
-      void localSlashSubmission.completion;
       return true;
     }
 
@@ -15367,6 +18566,7 @@ export const useAppStore = create<AppState>()(
             goalProgress: hydratedCurrentSession?.runtimeSnapshot?.goalProgress || persistedState.goalProgress,
           }, {
             restoreInterruptedGoal: true,
+            quarantineInterruptedLocalFast: true,
             workspacePath: hydratedCurrentScopeKey,
             expectedSessionKey: resolveSessionRuntimeKey(
               hydratedCurrentScopeKey,

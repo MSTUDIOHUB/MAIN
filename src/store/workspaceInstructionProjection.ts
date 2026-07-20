@@ -228,13 +228,25 @@ export function reconcileWorkspaceInstructionProjection(input: {
     return { disposition: "conflict", reason: "receipt_owner_mismatch" };
   }
 
-  const exactTurn = input.conversationTurns.find((turn) => turn.id === receipt.turnId);
-  const sameSubmission = input.conversationTurns.find(
+  const exactTurnCandidates = input.conversationTurns.filter(
+    (turn) => turn.id === receipt.turnId,
+  );
+  const sameSubmissionCandidates = input.conversationTurns.filter(
     (turn) => turn.clientSubmissionId === instruction.clientSubmissionId,
   );
-  const sameReceipt = input.conversationTurns.find(
+  const sameReceiptCandidates = input.conversationTurns.filter(
     (turn) => turn.workspaceInstructionReceiptId === receipt.receiptId,
   );
+  const exactTurn = exactTurnCandidates.length === 1 ? exactTurnCandidates[0] : null;
+  if (
+    exactTurnCandidates.length > 1 ||
+    sameSubmissionCandidates.length > 1 ||
+    sameReceiptCandidates.length > 1
+  ) {
+    return { disposition: "conflict", reason: "turn_id_collision" };
+  }
+  const sameSubmission = sameSubmissionCandidates[0] || null;
+  const sameReceipt = sameReceiptCandidates[0] || null;
   if (sameSubmission && sameSubmission.id !== receipt.turnId) {
     return { disposition: "conflict", reason: "submission_id_collision" };
   }
@@ -244,7 +256,9 @@ export function reconcileWorkspaceInstructionProjection(input: {
   if (exactTurn && (
     exactTurn.clientSubmissionId !== instruction.clientSubmissionId ||
     exactTurn.workspaceInstructionReceiptId !== receipt.receiptId ||
-    exactTurn.userPrompt !== instruction.payload.text
+    exactTurn.workspaceInstructionSource !== instruction.source ||
+    exactTurn.userPrompt !== instruction.payload.text ||
+    exactTurn.createdAt !== receipt.acceptedAt
   )) {
     return { disposition: "conflict", reason: "turn_id_collision" };
   }

@@ -48,7 +48,7 @@ portable-pty = "0.8"
 # HTTP client for cloud endpoint connectivity test, model discovery & streaming (bypasses CORS)
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["fs", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "sync", "time"] }
 # System memory info for VRAM pressure estimation
 sysinfo = "0.34"
 # Protocol Package ZIP extraction
@@ -73,3 +73,6 @@ security-framework = "3.7.0"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-window-state = "2.4.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
