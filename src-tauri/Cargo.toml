@@ -1,8 +1,10 @@
 [package]
 name = "tauri-app"
 version = "2.3.3"
-description = "MAIN desktop app"
-authors = ["you"]
+description = "MAIN open-source local-first desktop agent workbench"
+authors = ["The MAIN Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/MSTUDIOHUB/MAIN"
 edition = "2021"
 default-run = "tauri-app"
 

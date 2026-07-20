@@ -20,7 +20,7 @@ const toolIterationPhaseSource = fsSync.readFileSync(
 test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /export async function handleToolResultRecoveryPhase/);
   assert.match(phaseSource, /handlePlanQualityRecoveryAfterToolResults\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
-  assert.match(phaseSource, /handleNoProgressRecovery\(\{[\s\S]*?appendToolResultsToHistory\(\{/);
+  assert.match(phaseSource, /appendToolResultsToHistory\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
   assert.doesNotMatch(
     phaseSource,
     /handleReadFileRepeatLimitRecovery|handleCrossIterationReadFileLoopRecovery|handleRepeatedEditValidationRecovery/,
@@ -44,7 +44,7 @@ test("no-progress exits close tool lifecycle and provider history first", () => 
   const noProgressIndex = phaseSource.indexOf(
     "const noProgressRecovery = handleNoProgressRecovery({",
   );
-  const appendIndex = phaseSource.indexOf(
+  const appendIndex = phaseSource.lastIndexOf(
     "appendToolResultsToHistory({",
     noProgressIndex,
   );
@@ -60,8 +60,13 @@ test("no-progress exits close tool lifecycle and provider history first", () => 
   assert.notEqual(appendIndex, -1);
   assert.notEqual(stoppedIndex, -1);
   assert.notEqual(continueIndex, -1);
+  assert.ok(appendIndex < noProgressIndex);
   assert.ok(appendIndex < stoppedIndex);
   assert.ok(appendIndex < continueIndex);
+  assert.match(
+    phaseSource.slice(continueIndex, phaseSource.indexOf("let pendingExecuteRecoveryPrompt", continueIndex)),
+    /pendingExecuteRecoveryPrompt[\s\S]*?appendMessage\(\{[\s\S]*?role: "user"/,
+  );
 });
 
 test("desktop environment failures pause once instead of entering a retry loop", () => {
@@ -98,7 +103,8 @@ test("parent overlap with an active child joins before generic no-progress accou
 });
 
 test("Goal evidence is checked immediately after tool results enter history", () => {
-  const appendIndex = phaseSource.indexOf("appendToolResultsToHistory({", phaseSource.indexOf("handleNoProgressRecovery({"));
+  const noProgressIndex = phaseSource.indexOf("handleNoProgressRecovery({");
+  const appendIndex = phaseSource.lastIndexOf("appendToolResultsToHistory({", noProgressIndex);
   const checkpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
 
   assert.notEqual(appendIndex, -1);
@@ -276,10 +282,8 @@ test("a long-process result atomically narrows the next turn to PTY observation 
 });
 
 test("Plan and Direct Edit finite command failures split invocation recovery from source repair", () => {
-  const appendIndex = phaseSource.indexOf(
-    "appendToolResultsToHistory({",
-    phaseSource.indexOf("handleNoProgressRecovery({"),
-  );
+  const noProgressIndex = phaseSource.indexOf("handleNoProgressRecovery({");
+  const appendIndex = phaseSource.lastIndexOf("appendToolResultsToHistory({", noProgressIndex);
   const recoveryIndex = phaseSource.indexOf("approved_plan_finite_validation_recovery");
   const goalCheckpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
 

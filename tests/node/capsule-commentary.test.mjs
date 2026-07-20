@@ -39,6 +39,9 @@ function loadTranspiledModuleSync(sourcePath) {
 const { selectCapsulePublicCommentary } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/capsuleCommentary.ts"),
 );
+const { stripAssistantPublicProgress } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/assistantPublicProgress.ts"),
+);
 
 function commentaryBlock(overrides = {}) {
   return {
@@ -66,6 +69,7 @@ function commentaryBlock(overrides = {}) {
 
 const exactOwner = {
   sessionKey: "session-a",
+  logicalTurnId: "turn-a",
   displayTurnId: "turn-a",
   runId: "run-a",
 };
@@ -86,6 +90,9 @@ test("Capsule rejects legacy, cross-owner, final, streaming, and hidden blocks",
   const rejected = [
     { ...commentaryBlock(), publicProgress: undefined },
     commentaryBlock({ publicProgress: { ...commentaryBlock().publicProgress, sessionKey: "session-old" } }),
+    commentaryBlock({ turnId: "turn-display-old" }),
+    commentaryBlock({ publicProgress: { ...commentaryBlock().publicProgress, turnId: "turn-logical-old" } }),
+    commentaryBlock({ publicProgress: { ...commentaryBlock().publicProgress, displayTurnId: "turn-display-old" } }),
     commentaryBlock({ publicProgress: { ...commentaryBlock().publicProgress, runId: "run-old" } }),
     commentaryBlock({ visibility: "assistant_final" }),
     commentaryBlock({ streaming: true }),
@@ -109,4 +116,21 @@ test("Capsule sanitizes protocol and reasoning blocks and applies a hard length 
   assert.doesNotMatch(selected, /hidden chain of thought|thinking/i);
   assert.match(selected, /^公开进展/);
   assert.ok(selected.length <= 180);
+});
+
+test("terminal promotion and later demotion cannot revive public progress", () => {
+  const commentary = commentaryBlock();
+  const finalBlock = {
+    ...stripAssistantPublicProgress(commentary),
+    content: "最终结论",
+    visibility: "assistant_final",
+  };
+  const demotedFinal = {
+    ...stripAssistantPublicProgress(finalBlock),
+    visibility: "assistant_update",
+  };
+
+  assert.equal(finalBlock.publicProgress, undefined);
+  assert.equal(demotedFinal.publicProgress, undefined);
+  assert.equal(selectCapsulePublicCommentary({ blocks: [demotedFinal], ...exactOwner }), "");
 });

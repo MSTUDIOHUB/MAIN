@@ -1,7 +1,17 @@
 {
-  "name": "tauri-app",
+  "name": "main-local-agent",
   "private": true,
   "version": "2.3.3",
+  "description": "An open-source, local-first desktop agent workbench for building and operating model-agnostic AI agents.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MSTUDIOHUB/MAIN.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MSTUDIOHUB/MAIN/issues"
+  },
+  "homepage": "https://github.com/MSTUDIOHUB/MAIN#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",

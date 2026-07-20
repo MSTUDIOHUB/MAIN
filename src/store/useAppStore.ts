@@ -9926,7 +9926,7 @@ export const useAppStore = create<AppState>()(
           if (block.id !== finalBlockId || block.type !== "agent") return block;
           foundFinal = true;
           return {
-            ...block,
+            ...stripAssistantPublicProgress(block),
             content: summary,
             streaming: false,
             hiddenProcess: false,

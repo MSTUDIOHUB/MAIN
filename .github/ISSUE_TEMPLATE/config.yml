@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/MSTUDIOHUB/MAIN/security
+    about: 请按 SECURITY.md 使用私密渠道，不要公开漏洞细节。
+  - name: 使用文档
+    url: https://github.com/MSTUDIOHUB/MAIN/tree/main/docs/main-manual
+    about: 提问前先查看快速开始、模型配置和故障排查。

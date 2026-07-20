@@ -268,7 +268,7 @@ function buildReleaseNotes({ version, channel, publicRepo, repositoryUrl, latest
     "## Rollout",
     "- Upload the generated assets to the public GitHub Release.",
     "- Keep the homepage download button pointing at the stable latest URL.",
-    "- Leave the private source repository closed; only publish binaries here.",
+    "- Source code and contribution instructions are available at https://github.com/MSTUDIOHUB/MAIN.",
     "",
     "## Suggested gh CLI",
     "```bash",

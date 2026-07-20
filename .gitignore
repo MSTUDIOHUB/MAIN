@@ -13,6 +13,7 @@ dist-ssr
 *.local
 .env
 .env.*
+!cloud-gateway/aimax/.env.example
 
 # Editor directories and files
 .vscode/*
@@ -50,3 +51,11 @@ __pycache__/
 
 # Nested workspace planning artifacts
 **/.MAIN/plans/
+
+# Local MAIN runtime state (never commit personal sessions or traces)
+.MAIN/index/*
+!.MAIN/index/.gitkeep
+.MAIN/memory/*
+!.MAIN/memory/.gitkeep
+.MAIN/traces/*
+!.MAIN/traces/.gitkeep

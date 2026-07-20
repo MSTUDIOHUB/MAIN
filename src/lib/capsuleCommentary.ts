@@ -30,17 +30,20 @@ function compactPublicCommentary(value: unknown): string {
 export function selectCapsulePublicCommentary(input: {
   blocks: TaskBlock[];
   sessionKey: string;
+  logicalTurnId: string;
   displayTurnId: string;
   runId: string;
 }): string {
   const sessionKey = String(input.sessionKey || "").trim();
+  const logicalTurnId = String(input.logicalTurnId || "").trim();
   const displayTurnId = String(input.displayTurnId || "").trim();
   const runId = String(input.runId || "").trim();
-  if (!sessionKey || !displayTurnId || !runId) return "";
+  if (!sessionKey || !logicalTurnId || !displayTurnId || !runId) return "";
 
   const candidate = [...(input.blocks || [])]
     .filter((block): block is Extract<TaskBlock, { type: "agent" }> =>
       block.type === "agent" &&
+      block.turnId === displayTurnId &&
       block.visibility === "assistant_update" &&
       block.hiddenProcess !== true &&
       block.streaming !== true &&
@@ -49,6 +52,7 @@ export function selectCapsulePublicCommentary(input: {
       block.publicProgress.kind === "assistant_commentary" &&
       block.publicProgress.source === "model_visible_content" &&
       block.publicProgress.sessionKey === sessionKey &&
+      block.publicProgress.turnId === logicalTurnId &&
       block.publicProgress.displayTurnId === displayTurnId &&
       block.publicProgress.runId === runId
     )

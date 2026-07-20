@@ -5,15 +5,15 @@
 
 ## 仓库与密钥边界
 
-MAIN 使用一个私有源码仓库和两个公开二进制仓库：
+MAIN 使用一个公开源码仓库和两个公开二进制分发仓库。仓库公开不代表 Secrets 公开；GitHub Actions Secrets、签名私钥、证书和本地运行状态始终留在仓库内容之外。
 
 | 仓库 | 可公开内容 | 禁止内容 |
 | --- | --- | --- |
-| `MSTUDIOHUB/MAIN` | 不公开 | 源码、构建脚本、内部文档与 Secrets 只留在私有仓库 |
+| `MSTUDIOHUB/MAIN` | 源码、构建脚本、架构文档、测试与社区文件 | Secrets、签名材料、个人会话、真实用户数据、构建产物与本地 Debug Log |
 | `MSTUDIOHUB/MAIN-Releases` | 用户下载 zip 与 `release_notes.md` | 源码、构建目录、签名私钥 |
 | `MSTUDIOHUB/MAIN-UpdateFeed` | updater 包、`.sig` 与 `latest.json` | 源码与签名私钥 |
 
-GitHub Actions 使用私有仓库中的 `PUBLIC_RELEASES_TOKEN`、`TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。Token 和 updater 私钥不得写入仓库、命令历史、发布说明或 Debug Log。
+GitHub Actions 使用源码仓库中加密存储的 `PUBLIC_RELEASES_TOKEN`、`TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。Token 和 updater 私钥不得写入仓库、命令历史、发布说明或 Debug Log；公开仓库的 fork PR 也不应获得这些 Secrets。
 
 Apple Developer 与 Windows Authenticode 签名是分发身份；Tauri updater 签名是更新完整性校验。二者职责不同，不能互相替代。
 
@@ -42,7 +42,7 @@ npm run release:desktop -- <version>
 本地 preflight 会验证：
 
 - `gh` 已安装并登录 GitHub；
-- 私有仓库和两个公开仓库均可访问；
+- 源码仓库和两个公开分发仓库均可访问；
 - 三个必需 Actions Secrets 存在；
 - 两个公开仓库中尚不存在同版本 Release；
 - 工作树干净；
@@ -157,7 +157,7 @@ MAIN_<version>_updater_windows_x86_64.exe.sig
 latest.json
 ```
 
-发布说明可以包含 commit 摘要与变更文件名，但不能包含源码 diff、Secrets 或私有构建日志。
+发布说明可以包含源码仓库链接、commit 摘要与变更文件名，但不能包含 Secrets、签名材料、个人会话或私有构建日志。
 
 ## 发布后验收
 

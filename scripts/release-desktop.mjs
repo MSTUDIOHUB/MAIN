@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 
 import { parseAppVersion } from "./release_tools.mjs";
 
-const PRIVATE_REPO = "MSTUDIOHUB/MAIN";
+const SOURCE_REPO = "MSTUDIOHUB/MAIN";
 const RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
 const UPDATE_REPO = "MSTUDIOHUB/MAIN-UpdateFeed";
 const WORKFLOW_FILE = "build-desktop.yml";
@@ -38,7 +38,7 @@ Notes:
   - The version is required and must not start with "v".
   - Default behavior publishes downloads to ${RELEASE_REPO}.
   - Updater feed assets publish to ${UPDATE_REPO}.
-  - The workflow requires PUBLIC_RELEASES_TOKEN and Tauri updater signing secrets in ${PRIVATE_REPO}.
+  - The workflow requires PUBLIC_RELEASES_TOKEN and Tauri updater signing secrets in ${SOURCE_REPO}.
 `);
 }
 
@@ -157,7 +157,7 @@ function workflowArgs(options) {
     "run",
     WORKFLOW_FILE,
     "--repo",
-    PRIVATE_REPO,
+    SOURCE_REPO,
     "--ref",
     WORKFLOW_REF,
     "-f",
@@ -188,7 +188,7 @@ function ensureGhReady() {
 }
 
 function ensureRepoAccess() {
-  requireSuccess("gh", ["repo", "view", PRIVATE_REPO, "--json", "nameWithOwner"], `Cannot access private repo: ${PRIVATE_REPO}`);
+  requireSuccess("gh", ["repo", "view", SOURCE_REPO, "--json", "nameWithOwner"], `Cannot access source repo: ${SOURCE_REPO}`);
   requireSuccess("gh", ["repo", "view", RELEASE_REPO, "--json", "nameWithOwner"], `Cannot access public downloads repo: ${RELEASE_REPO}`);
   requireSuccess("gh", ["repo", "view", UPDATE_REPO, "--json", "nameWithOwner"], `Cannot access public updater repo: ${UPDATE_REPO}`);
 }
@@ -196,8 +196,8 @@ function ensureRepoAccess() {
 function ensureSecretExists() {
   const result = requireSuccess(
     "gh",
-    ["secret", "list", "--repo", PRIVATE_REPO, "--app", "actions"],
-    `Cannot list Actions secrets for ${PRIVATE_REPO}`,
+    ["secret", "list", "--repo", SOURCE_REPO, "--app", "actions"],
+    `Cannot list Actions secrets for ${SOURCE_REPO}`,
   );
 
   const secretNames = new Set(
@@ -209,7 +209,7 @@ function ensureSecretExists() {
 
   const missingSecrets = REQUIRED_SECRET_NAMES.filter((secretName) => !secretNames.has(secretName));
   if (missingSecrets.length > 0) {
-    fail(`Missing Actions secrets in ${PRIVATE_REPO}: ${missingSecrets.join(", ")}.`);
+    fail(`Missing Actions secrets in ${SOURCE_REPO}: ${missingSecrets.join(", ")}.`);
   }
 }
 
@@ -281,7 +281,7 @@ function findRun(headSha, startedAtMs) {
       "run",
       "list",
       "--repo",
-      PRIVATE_REPO,
+      SOURCE_REPO,
       "--workflow",
       WORKFLOW_FILE,
       "--branch",
@@ -335,7 +335,7 @@ async function triggerWorkflow(options, headSha) {
   }
 
   console.log("Watching workflow run...");
-  const watchResult = run("gh", ["run", "watch", String(runItem.databaseId), "--repo", PRIVATE_REPO, "--compact", "--exit-status"], {
+  const watchResult = run("gh", ["run", "watch", String(runItem.databaseId), "--repo", SOURCE_REPO, "--compact", "--exit-status"], {
     stdio: "inherit",
   });
 

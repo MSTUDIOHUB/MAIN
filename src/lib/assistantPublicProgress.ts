@@ -7,8 +7,9 @@ import type { TaskBlock } from "./taskTypes";
  * current model progress.
  */
 export function stripAssistantPublicProgress<T extends TaskBlock>(block: T): T {
-  if (block.type !== "agent" || block.publicProgress === undefined) return block;
-  const stripped = { ...block };
+  if (block.type !== "agent") return block;
+  const stripped = { ...block } as Extract<TaskBlock, { type: "agent" }>;
+  if (stripped.publicProgress === undefined) return block;
   delete stripped.publicProgress;
   return stripped as T;
 }

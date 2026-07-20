@@ -3038,6 +3038,13 @@ export default function ChatArea({
   // The approved child snapshot is installed before the old review lease has
   // fully closed, so it wins over a briefly still-running parent marker.
   const capsuleActiveRunId = capsulePlanExecutionSnapshot?.runId || capsuleHarnessRunId || null;
+  const capsuleActiveLogicalTurnId =
+    capsulePlanExecutionSnapshot?.runId === capsuleActiveRunId
+      ? capsulePlanExecutionSnapshot.turnId
+      : capsuleHarnessRunId === capsuleActiveRunId &&
+        harnessRunMarker?.sessionKey === activeSessionKey
+      ? harnessRunMarker.turnId
+      : null;
   const capsuleProgressLedger = useMemo(() => {
     if (!capsuleTurn) return [];
     return buildRuntimeProgressLedger({
@@ -4252,12 +4259,14 @@ export default function ChatArea({
     activeSessionKey &&
     capsuleTurn?.id &&
     capsuleActiveRunId &&
+    capsuleActiveLogicalTurnId &&
     ["analyzing", "planning", "executing", "validating", "recovering"].includes(
       capsuleStatusProjection.kind,
     )
       ? selectCapsulePublicCommentary({
           blocks: capsuleTurnBlocks,
           sessionKey: activeSessionKey,
+          logicalTurnId: capsuleActiveLogicalTurnId,
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
         })

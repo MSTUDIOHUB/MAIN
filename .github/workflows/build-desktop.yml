@@ -373,9 +373,9 @@ jobs:
             fi
 
             echo ""
-            echo "## Privacy boundary"
+            echo "## Source and release boundary"
             echo ""
-            echo "This public release contains only packaged desktop binaries and a commit summary. Source code remains in the private MAIN repository."
+            echo "This release repository contains packaged desktop binaries. Source code and contribution instructions are available at https://github.com/MSTUDIOHUB/MAIN."
           } > release-assets/release_notes.md
 
           ls -lah release-assets

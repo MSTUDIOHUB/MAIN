@@ -1469,6 +1469,18 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("continue");
   }
 
+  // Fold tool results before recovery policy may append a user/system pivot.
+  // Native tool protocols require assistant(tool_calls) -> tool(result) before
+  // any recovery message, including branches that immediately continue/pause.
+  appendToolResultsToHistory({
+    callbacks: input.callbacks,
+    toolFeedbackFormat: input.toolFeedbackFormat,
+    results: input.results,
+    toolArgsByCallId: input.toolArgsByCallId,
+    iterationContext: input.iterationContext,
+    emitTurnEvent: input.emitTurnEvent,
+  });
+
   const noProgressRecovery = handleNoProgressRecovery({
     callbacks: input.callbacks,
     workflowMode: input.workflowMode,
@@ -1500,21 +1512,16 @@ export async function handleToolResultRecoveryPhase(input: {
     loopGuardRuntimeState,
     noProgressRecovery.tracking,
   );
-  // A no-progress decision is still downstream of real tool execution. Close
-  // every started item and satisfy native provider tool-call history before a
-  // continue/pause branch can leave this phase.
-  appendToolResultsToHistory({
-    callbacks: input.callbacks,
-    toolFeedbackFormat: input.toolFeedbackFormat,
-    results: input.results,
-    toolArgsByCallId: input.toolArgsByCallId,
-    iterationContext: input.iterationContext,
-    emitTurnEvent: input.emitTurnEvent,
-  });
   if (noProgressRecovery.status === "stopped") {
     return finish("stopped");
   }
   if (noProgressRecovery.status === "continue") {
+    if (noProgressRecovery.pendingExecuteRecoveryPrompt) {
+      input.callbacks.appendMessage({
+        role: "user",
+        content: noProgressRecovery.pendingExecuteRecoveryPrompt,
+      });
+    }
     return finish("continue");
   }
   let pendingExecuteRecoveryPrompt = noProgressRecovery.pendingExecuteRecoveryPrompt;

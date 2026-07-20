@@ -784,9 +784,9 @@ async function writeReleaseNotes({ rootDir, version, outputPath }) {
 
   lines.push(
     "",
-    "## Privacy boundary",
+    "## Source and release boundary",
     "",
-    "This public release contains only packaged desktop binaries and a commit summary. Source code remains in the private MAIN repository.",
+    "This release repository contains packaged desktop binaries. Source code and contribution instructions are available at https://github.com/MSTUDIOHUB/MAIN.",
   );
 
   await fs.writeFile(outputPath, `${lines.join("\n")}\n`, "utf8");
