@@ -1,6 +1,6 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield, IconSubagent } from "./Icons";
+import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconGlobe, IconShield, IconSubagent } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import MainModeSwitcher from "./composer/MainModeSwitcher";
 import GameStudioOnboardingPanel from "./gameStudio/GameStudioOnboardingPanel";
@@ -237,7 +237,6 @@ export default function Composer({
   const slashAnchorRef = useRef(-1);
   const previousMainModeRef = useRef(selectedMainModeKey);
   const previousWorkspaceRef = useRef(currentWorkspace);
-  const submitUnlockTimerRef = useRef<number | null>(null);
   const submitPendingRef = useRef(false);
   const isComposingRef = useRef(false);
   const compositionEndedAtRef = useRef(0);
@@ -256,16 +255,6 @@ export default function Composer({
   const language = useAppStore((s) => s.config.language);
   const storeInput = useAppStore((s) => s.input);
   const setStoreInput = useAppStore((s) => s.setInput);
-  const queuedUserMessage = useAppStore((s) => s.queuedUserMessage);
-  const activeGuidance = useAppStore((s) => s.activeGuidance);
-  const captureVisibleGoalSubmissionEnvelope = useAppStore(
-    (s) => s.captureVisibleGoalSubmissionEnvelope,
-  );
-  const queueUserMessage = useAppStore((s) => s.queueUserMessage);
-  const clearQueuedUserMessage = useAppStore((s) => s.clearQueuedUserMessage);
-  const setActiveGuidance = useAppStore((s) => s.setActiveGuidance);
-  const clearActiveGuidance = useAppStore((s) => s.clearActiveGuidance);
-  const currentTurnId = useAppStore((s) => s.currentTurnId);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const isPlanApproved = useAppStore((s) => s.isPlanApproved);
   const planTasks = useAppStore((s) => s.planTasks);
@@ -350,15 +339,9 @@ export default function Composer({
   const mentionHintUpDown = language === "en" ? "↑↓ Navigate" : "↑↓ 导航";
   const mentionHintEnter = language === "en" ? "↵ Select" : "↵ 选择";
   const mentionHintEsc = language === "en" ? "Esc Close" : "Esc 关闭";
-  const queuedStatusLabel = language === "en" ? "Queued" : "已排队";
-  const guidanceStatusLabel = language === "en" ? "Guidance" : "已引导";
-  const guidanceButtonLabel = language === "en" ? "Guide" : "引导";
-  const guidanceButtonTitle = language === "en"
-    ? "Move this queued message into the current run at the next model iteration."
-    : "把这条已排队指令注入当前运行的下一次模型迭代，不中断本轮执行。";
-  const queueButtonTitle = language === "en"
-    ? "Queue this message and send it automatically after the current run stops."
-    : "将当前输入排队，当前模型停止后自动发送。";
+  const concurrentSubmitButtonTitle = language === "en"
+    ? "Submit as a durable next turn."
+    : "作为持久化的新回合提交。";
   const autoReviewTitle = language === "en"
     ? "Auto Review: approve non-destructive tool requests in this session, including file changes, commands, local file reads, MCP actions, and browser validation."
     : "自动审查：本会话内自动批准非破坏性工具请求，包括文件修改、终端命令、本地文件读取、MCP 动作和浏览器验证。";
@@ -380,15 +363,7 @@ export default function Composer({
     contextMentions.length > 0 ||
     attachedFiles.length > 0 ||
     pendingImages.length > 0;
-  const streamingPrimaryQueuesMessage = isStreaming && hasDraftPayload;
-  const queuedMessagePreview = queuedUserMessage?.text?.trim() || (queuedUserMessage ? (language === "en" ? "Attachment message" : "含附件消息") : "");
-  const activeGuidancePreview = activeGuidance?.text?.trim() || "";
-  const queuedIsGoalContinuation = Boolean(
-    queuedUserMessage?.goalContinuationAuthorization,
-  );
-  const queuedCanGuide = Boolean(
-    queuedUserMessage?.text?.trim() && !queuedIsGoalContinuation,
-  );
+  const streamingPrimarySubmitsMessage = isStreaming && hasDraftPayload;
   const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
   const subagentPreferenceToggleDisabled = Boolean(isStreaming);
@@ -552,38 +527,7 @@ export default function Composer({
   }, [isStreaming, storeInput]);
 
   useEffect(() => {
-    if (isStreaming && isSubmitPending) {
-      submitPendingRef.current = false;
-      setIsSubmitPending(false);
-    }
-  }, [isStreaming, isSubmitPending]);
-
-  useEffect(() => {
-    if (!isSubmitPending || isStreaming) return;
-
-    if (submitUnlockTimerRef.current !== null) {
-      window.clearTimeout(submitUnlockTimerRef.current);
-    }
-
-    submitUnlockTimerRef.current = window.setTimeout(() => {
-      submitUnlockTimerRef.current = null;
-      submitPendingRef.current = false;
-      setIsSubmitPending(false);
-    }, 1200);
-
     return () => {
-      if (submitUnlockTimerRef.current !== null) {
-        window.clearTimeout(submitUnlockTimerRef.current);
-        submitUnlockTimerRef.current = null;
-      }
-    };
-  }, [isStreaming, isSubmitPending]);
-
-  useEffect(() => {
-    return () => {
-      if (submitUnlockTimerRef.current !== null) {
-        window.clearTimeout(submitUnlockTimerRef.current);
-      }
       submitPendingRef.current = false;
     };
   }, []);
@@ -1250,13 +1194,17 @@ export default function Composer({
     setShowWebSearchPanel(false);
   }, [setWebSearchEnabled, setWebSearchProvider]);
 
-  const handleSubmitComposerMessage = useCallback(() => {
+  const handleSubmitComposerMessage = useCallback(async () => {
     const textToSend = draftInput;
+    const imagesToSend = [...pendingImages];
+    const contextMentionsToSend = [...contextMentions];
+    const attachedFilesToSend = attachedFiles.map((file) => normalizeAttachedFile(file));
+    const lockedIntentToConsume = lockedComposerIntent;
     const hasPayload =
       textToSend.trim().length > 0 ||
       contextMentions.length > 0 ||
       attachedFiles.length > 0 ||
-      pendingImages.length > 0;
+      imagesToSend.length > 0;
 
     if (!hasPayload || submitPendingRef.current) {
       return;
@@ -1272,93 +1220,77 @@ export default function Composer({
       return;
     }
 
-    if (isStreaming) {
-      const visibleGoalSubmissionEnvelope =
-        captureVisibleGoalSubmissionEnvelope(textToSend);
-      queueUserMessage(textToSend, pendingImages, {
-        contextMentions,
-        attachedFiles: attachedFiles.map((file) => normalizeAttachedFile(file)),
-        ...(visibleGoalSubmissionEnvelope ? { visibleGoalSubmissionEnvelope } : {}),
-      });
-      closeSlashMenu();
-      setDraftInput("");
-      if (lockedComposerIntent === "goal") {
-        setLockedComposerIntent(null);
-      }
-      setStoreInput("");
-      setContextMentions([]);
-      setAttachedFiles([]);
-      setPendingImages([]);
-      return;
-    }
-
     submitPendingRef.current = true;
     setIsSubmitPending(true);
-    if (isGameStudioMode) {
-      markStudioOnboardingUsed();
-    }
     closeSlashMenu();
-    const didSend = onSendMessage(textToSend, pendingImages);
-    if (didSend === false) {
+    try {
+      const accepted = await Promise.resolve(onSendMessage(textToSend, imagesToSend, {
+        workspaceComposerIntentSnapshot: {
+          mainModeKey: selectedMainModeKey,
+          lockedComposerIntent: lockedIntentToConsume,
+        },
+        workspaceSubmissionPayloadSnapshot: {
+          contextMentions: contextMentionsToSend,
+          attachedFiles: attachedFilesToSend,
+        },
+      }));
+      if (accepted !== true) {
+        return;
+      }
+
+      if (isGameStudioMode) {
+        markStudioOnboardingUsed();
+      }
+      setDraftInput((currentDraft) => currentDraft === textToSend ? "" : currentDraft);
+
+      const latestState = useAppStore.getState();
+      // A locked intent is a one-shot capability owned by this exact accepted
+      // submission. Clear it with a value CAS even if a busy Run kept or
+      // changed the Store input while durable admission was pending.
+      if (
+        lockedIntentToConsume &&
+        latestState.lockedComposerIntent === lockedIntentToConsume
+      ) {
+        setLockedComposerIntent(null);
+      }
+      if (latestState.input === textToSend) {
+        if (lockedIntentToConsume === "goal") {
+          setStoreInput("", { preserveLockedComposerIntent: true });
+        } else {
+          setStoreInput("", { preserveLockedComposerIntent: true });
+        }
+      }
+
+      setPendingImages((currentImages) => (
+        currentImages.length === imagesToSend.length &&
+        currentImages.every((image, index) => image === imagesToSend[index])
+          ? []
+          : currentImages
+      ));
+      if (
+        latestState.contextMentions.length === contextMentionsToSend.length &&
+        latestState.contextMentions.every(
+          (mention, index) => mention === contextMentionsToSend[index],
+        )
+      ) {
+        setContextMentions([]);
+      }
+      const latestAttachedFiles = latestState.attachedFiles.map((file) => normalizeAttachedFile(file));
+      if (
+        latestAttachedFiles.length === attachedFilesToSend.length &&
+        latestAttachedFiles.every((file, index) => (
+          JSON.stringify(file) === JSON.stringify(attachedFilesToSend[index])
+        ))
+      ) {
+        setAttachedFiles([]);
+      }
+    } catch (error) {
+      console.error("Failed to admit composer submission:", error);
+    } finally {
       submitPendingRef.current = false;
       setIsSubmitPending(false);
-      return;
     }
-    setDraftInput("");
-    if (lockedComposerIntent === "goal") {
-      setLockedComposerIntent(null);
-      setStoreInput("");
-    } else {
-      setStoreInput("", { preserveLockedComposerIntent: true });
-    }
-    setPendingImages([]);
-  }, [attachedFiles, captureVisibleGoalSubmissionEnvelope, closeSlashMenu, contextMentions, currentWorkspace, draftInput, isGameStudioMode, isStreaming, language, lockedComposerIntent, markStudioOnboardingUsed, onSendMessage, pendingImages, queueUserMessage, selectedMainModeKey, setAttachedFiles, setContextMentions, setLockedComposerIntent, setStoreInput]);
-
-  const handleGuideQueuedMessage = useCallback(() => {
-    const guidance = queuedUserMessage?.text?.trim() || "";
-    if (!guidance) return;
-
-    // A queued Goal continuation is a pending run-lease handoff, not ordinary
-    // guidance for whichever run happens to be streaming. Never downgrade it
-    // into `activeGuidance`, which would inject it into a foreign run.
-    if (queuedUserMessage?.goalContinuationAuthorization) {
-      clearQueuedUserMessage({
-        expectedId: queuedUserMessage.id,
-        disposition: "discarded",
-        reason: "goal_continuation_cannot_guide_foreign_run",
-      });
-      closeSlashMenu();
-      setStoreInput("");
-      return;
-    }
-
-    const appState = useAppStore.getState();
-    if (appState.agentStatus === "pending_review") {
-      appState.stopGeneration();
-      closeSlashMenu();
-      setStoreInput("");
-      onSendMessage(guidance, queuedUserMessage.images || [], {
-        queuedUserMessageId: queuedUserMessage.id,
-      });
-      return;
-    }
-
-    if (isStreaming) {
-      setActiveGuidance(guidance, currentTurnId);
-      clearQueuedUserMessage({
-        expectedId: queuedUserMessage.id,
-        disposition: "consumed",
-        reason: "moved_to_active_guidance",
-      });
-      closeSlashMenu();
-      setStoreInput("");
-    } else {
-      closeSlashMenu();
-      onSendMessage(guidance, queuedUserMessage.images || [], {
-        queuedUserMessageId: queuedUserMessage.id,
-      });
-    }
-  }, [clearQueuedUserMessage, closeSlashMenu, currentTurnId, isStreaming, queuedUserMessage, setActiveGuidance, setStoreInput, onSendMessage]);
+  }, [attachedFiles, closeSlashMenu, contextMentions, currentWorkspace, draftInput, isGameStudioMode, language, lockedComposerIntent, markStudioOnboardingUsed, onSendMessage, pendingImages, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {
@@ -2158,71 +2090,6 @@ export default function Composer({
             )}
           </div>
 
-          {!isImageStudioMode && (queuedUserMessage || activeGuidance) && (
-            <div className="border-t border-[#27272a] bg-[#070709] px-3 py-2">
-              {queuedUserMessage && (
-                <div
-                  data-testid="composer-queued-message"
-                  className="flex min-h-9 items-center gap-2 rounded-md border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.08)] px-3 py-2 text-[11px] text-[#dbeafe] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#93c5fd]">{queuedStatusLabel}</div>
-                    <div className="mt-0.5 truncate text-[12px] leading-snug text-[#e0f2fe]">{queuedMessagePreview}</div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    <button
-                      type="button"
-                      data-testid="composer-guidance-button"
-                      onClick={handleGuideQueuedMessage}
-                      disabled={!queuedCanGuide}
-                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] px-2.5 text-[11px] font-semibold text-[#bbf7d0] transition-colors hover:bg-[rgba(16,185,129,0.18)] disabled:cursor-not-allowed disabled:opacity-45"
-                      title={queuedIsGoalContinuation
-                        ? (language === "en"
-                            ? "Goal continuation is reserved for its own run and cannot guide the current run."
-                            : "Goal 续跑指令只能启动所属运行，不能注入当前运行。")
-                        : guidanceButtonTitle}
-                    >
-                      <IconZap className="h-3.5 w-3.5" />
-                      {guidanceButtonLabel}
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="composer-queued-delete-button"
-                      onClick={() => clearQueuedUserMessage({
-                        expectedId: queuedUserMessage.id,
-                        disposition: "discarded",
-                        reason: "user_deleted_queue_entry",
-                      })}
-                      className="flex h-7 w-7 items-center justify-center rounded-md border border-[#34343b] bg-[#050507] text-[#a1a1aa] transition-colors hover:border-[#52525b] hover:text-white"
-                      title={language === "en" ? "Delete queued message" : "删除这条排队指令"}
-                    >
-                      <IconTrash className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              )}
-              {activeGuidance && (
-                <div
-                  data-testid="composer-active-guidance"
-                  className={`${queuedUserMessage ? "mt-2" : ""} flex min-h-9 items-center gap-2 rounded-md border border-[rgba(52,211,153,0.24)] bg-[rgba(16,185,129,0.08)] px-3 py-2 text-[11px] text-[#bbf7d0] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#86efac]">{guidanceStatusLabel}</div>
-                    <div className="mt-0.5 truncate text-[12px] leading-snug text-[#dcfce7]">{activeGuidancePreview}</div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={clearActiveGuidance}
-                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#34343b] bg-[#050507] text-[#a1a1aa] transition-colors hover:border-[#52525b] hover:text-white"
-                    title={language === "en" ? "Undo guidance" : "撤销引导"}
-                  >
-                    <IconTrash className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-
           <div className="flex items-center justify-between gap-3 px-3 py-2.5 bg-[#09090b] rounded-b-xl border-t border-[#27272a]">
             <div className="relative flex min-w-0 flex-wrap items-center gap-2">
 
@@ -2442,17 +2309,17 @@ export default function Composer({
               {!activeDiffTask && (
                 isStreaming ? (
                   <button
-                    data-testid={streamingPrimaryQueuesMessage ? "composer-send-button" : "composer-stop-button"}
-                    disabled={streamingPrimaryQueuesMessage ? (isSubmitPending || cooldownSec > 0) : false}
-                    onClick={streamingPrimaryQueuesMessage ? handleSubmitComposerMessage : onStopGeneration}
+                    data-testid={streamingPrimarySubmitsMessage ? "composer-send-button" : "composer-stop-button"}
+                    disabled={streamingPrimarySubmitsMessage ? (isSubmitPending || cooldownSec > 0) : false}
+                    onClick={streamingPrimarySubmitsMessage ? handleSubmitComposerMessage : onStopGeneration}
                     className={`flex h-8 w-8 items-center justify-center rounded-md border shadow-sm transition-colors disabled:opacity-50 ${
-                      streamingPrimaryQueuesMessage
+                      streamingPrimarySubmitsMessage
                         ? "border-[#27272a] bg-[#09090b] text-[#d4d4d8] hover:bg-white hover:text-black"
                         : "border-[#7f1d1d] bg-[#09090b] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white"
                     }`}
-                    title={streamingPrimaryQueuesMessage ? queueButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
+                    title={streamingPrimarySubmitsMessage ? concurrentSubmitButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
                   >
-                    {streamingPrimaryQueuesMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
+                    {streamingPrimarySubmitsMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
                   </button>
                 ) : (
                   <button

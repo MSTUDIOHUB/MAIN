@@ -1,8 +1,10 @@
 import {
   buildSubmitRunStatePatch,
   buildSubmitVisibleTurnPatch,
+  type SubmitExistingTurnAdoptionDecision,
 } from "../lib/submit/turnSubmission";
 import type { TaskBlock } from "../lib/taskTypes";
+import type { UserChoiceResolutionIdentity } from "../lib/actionRequest";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "../lib/runIntent";
 import type { PendingSlashCommand } from "../lib/gameStudio/catalog";
@@ -25,6 +27,8 @@ export interface ApplySubmitVisibleTurnInput {
   currentImages: string[];
   isHidden: boolean;
   reuseCurrentTurn: boolean;
+  adoptExistingTurn?: boolean;
+  admittedUserBlockId?: number;
   uiParentTurnId?: string | null;
   parentPlanTurnId?: string | null;
   isInternalTurn: boolean;
@@ -33,6 +37,7 @@ export interface ApplySubmitVisibleTurnInput {
   currentTurnHasReplyOptions: boolean;
   explicitReplyOptionSourceTurnId?: string;
   selectedReplyOptionText?: string;
+  submittedChoiceIdentity?: UserChoiceResolutionIdentity;
   effectiveRunIntent: ResolvedRunIntent;
   effectiveDisplayIntent: ResolvedRunIntent;
   effectiveIntentSummary: string;
@@ -50,6 +55,7 @@ export interface ApplySubmitVisibleTurnInput {
 
 export interface ApplySubmitVisibleTurnResult {
   selectedChoiceText: string;
+  adoptionDecision: SubmitExistingTurnAdoptionDecision;
   markUserContextItemFailed: (path: string | undefined | null) => void;
 }
 
@@ -77,7 +83,11 @@ export function markSubmitUserContextItemFailed(input: {
 export function applySubmitVisibleTurn(
   input: ApplySubmitVisibleTurnInput,
 ): ApplySubmitVisibleTurnResult {
-  const visibleTurnUserBlockId = input.isHidden ? null : input.nextTaskId();
+  const visibleTurnUserBlockId = input.isHidden
+    ? null
+    : input.adoptExistingTurn
+      ? input.admittedUserBlockId ?? null
+      : input.nextTaskId();
   const parentPlanTurnDoneSummary = input.preferredLanguage === "en"
     ? "Plan approved; execution was handed off to a new turn."
     : "计划已批准，执行已交接到新的回合。";
@@ -92,6 +102,8 @@ export function applySubmitVisibleTurn(
     images: input.currentImages,
     isHidden: input.isHidden,
     reuseCurrentTurn: input.reuseCurrentTurn,
+    adoptExistingTurn: input.adoptExistingTurn,
+    admittedUserBlockId: input.admittedUserBlockId,
     uiParentTurnId: input.uiParentTurnId || undefined,
     parentPlanTurnId: input.parentPlanTurnId || undefined,
     parentPlanTurnDoneSummary,
@@ -101,6 +113,7 @@ export function applySubmitVisibleTurn(
     currentTurnHasReplyOptions: input.currentTurnHasReplyOptions,
     explicitReplyOptionSourceTurnId: !input.isHidden ? input.explicitReplyOptionSourceTurnId : undefined,
     selectedReplyOptionText: input.selectedReplyOptionText,
+    submittedChoiceIdentity: !input.isHidden ? input.submittedChoiceIdentity : undefined,
     effectiveRunIntent: input.effectiveRunIntent,
     effectiveDisplayIntent: input.effectiveDisplayIntent,
     effectiveIntentSummary: input.effectiveIntentSummary,
@@ -111,6 +124,20 @@ export function applySubmitVisibleTurn(
     turnTitle: input.turnTitle,
     createdAtMs: Date.now(),
   });
+  if (visibleTurnPatch.adoptionDecision.kind === "rejected") {
+    input.logStoreEvent("visible_turn_adoption_rejected", {
+      turnId: input.turnId || null,
+      userBlockId: input.admittedUserBlockId ?? null,
+      reason: visibleTurnPatch.adoptionDecision.reason,
+      sessionKey: input.runSessionKey,
+      workspace: input.runWorkspace || null,
+    });
+    return {
+      selectedChoiceText: "",
+      adoptionDecision: visibleTurnPatch.adoptionDecision,
+      markUserContextItemFailed: () => undefined,
+    };
+  }
   input.sessionSet({
     taskFlow: visibleTurnPatch.taskFlow,
     conversationTurns: visibleTurnPatch.conversationTurns,
@@ -171,6 +198,7 @@ export function applySubmitVisibleTurn(
 
   return {
     selectedChoiceText,
+    adoptionDecision: visibleTurnPatch.adoptionDecision,
     markUserContextItemFailed: (path) =>
       markSubmitUserContextItemFailed({
         sessionSet: input.sessionSet,

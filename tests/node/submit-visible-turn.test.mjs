@@ -166,3 +166,116 @@ test("submit visible turn can mark context items failed after attachment read er
 
   assert.equal(state.taskFlow[0].contextItems[0].status, "failed");
 });
+
+test("submit visible turn adopts the exact admitted Turn and consumes its exact source choice", () => {
+  const admittedUserBlock = {
+    id: 41,
+    turnId: "turn-admitted",
+    type: "user",
+    content: "Please fix the bug",
+  };
+  const unrelatedOptionBlock = {
+    id: 42,
+    turnId: "turn-other",
+    type: "agent",
+    content: "Choose an unrelated action",
+    options: [{ label: "Other", value: "Other" }],
+  };
+  const state = createState({
+    taskFlow: [admittedUserBlock, unrelatedOptionBlock],
+    conversationTurns: [
+      {
+        id: "turn-other",
+        userPrompt: "Other request",
+        title: "Other request",
+        mode: "chat",
+        intent: "respond",
+        status: "awaiting_input",
+        summary: "",
+        blockIds: [42],
+        collapsed: false,
+        createdAt: 1,
+      },
+      {
+        id: "turn-admitted",
+        userPrompt: "Please fix the bug",
+        title: "Queued workspace instruction",
+        intentSummary: "Queued",
+        mode: "chat",
+        intent: "respond",
+        status: "awaiting_input",
+        summary: "",
+        blockIds: [41],
+        collapsed: false,
+        createdAt: 2,
+      },
+    ],
+  });
+  const harness = createHarness(state);
+
+  const result = applySubmitVisibleTurn(baseInput(state, harness, {
+    turnId: "turn-admitted",
+    adoptExistingTurn: true,
+    admittedUserBlockId: 41,
+    nextTaskId: () => {
+      throw new Error("adoption must not allocate another user block");
+    },
+    shouldExplicitlyReuseCurrentTurn: true,
+    currentTurnHasReplyOptions: true,
+    explicitReplyOptionSourceTurnId: "turn-other",
+    selectedReplyOptionText: "Other",
+  }));
+
+  assert.deepEqual(result.adoptionDecision, {
+    kind: "adopted",
+    turnId: "turn-admitted",
+    userBlockId: 41,
+  });
+  assert.equal(state.taskFlow.length, 2);
+  assert.equal(state.taskFlow.filter((block) => block.id === 41).length, 1);
+  assert.equal(state.taskFlow[0], admittedUserBlock);
+  assert.notEqual(state.taskFlow[1], unrelatedOptionBlock);
+  assert.equal(state.taskFlow[1].archivedAfterChoice, true);
+  assert.equal(state.taskFlow[1].options, undefined);
+  assert.equal(state.taskFlow[1].selectedOption, "Other");
+  assert.equal(state.conversationTurns.length, 2);
+  assert.equal(state.conversationTurns[1].status, "executing");
+  assert.equal(state.conversationTurns[1].title, "Fix the bug");
+  assert.equal(state.conversationTurns[1].intent, "execute");
+  assert.equal(state.conversationTurns[1].intentSummary, "Fix the bug");
+  assert.equal(state.conversationTurns[1].mode, "edit");
+  assert.deepEqual(state.conversationTurns[1].blockIds, [41]);
+  assert.equal(harness.logs[0].event, "reply_options_archived");
+  assert.equal(harness.logs[0].data.sourceTurnId, "turn-other");
+  assert.equal(harness.logs[1].data.shouldArchiveChoiceFeedback, true);
+});
+
+test("submit visible turn rejection is side-effect free for a missing admitted Turn", () => {
+  const state = createState({
+    taskFlow: [],
+    conversationTurns: [],
+  });
+  const harness = createHarness(state);
+
+  const result = applySubmitVisibleTurn(baseInput(state, harness, {
+    turnId: "turn-missing",
+    adoptExistingTurn: true,
+    admittedUserBlockId: 41,
+    nextTaskId: () => {
+      throw new Error("rejected adoption must not allocate a user block");
+    },
+  }));
+
+  assert.deepEqual(result.adoptionDecision, {
+    kind: "rejected",
+    reason: "turn_not_found",
+    turnId: "turn-missing",
+    userBlockId: 41,
+  });
+  assert.deepEqual(state.taskFlow, []);
+  assert.deepEqual(state.conversationTurns, []);
+  assert.equal(state.currentTurnId, null);
+  assert.equal(state.isGenerating, false);
+  assert.equal(harness.logs.length, 1);
+  assert.equal(harness.logs[0].event, "visible_turn_adoption_rejected");
+});

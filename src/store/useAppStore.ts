@@ -214,6 +214,7 @@ import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   sanitizeUserContextItemsForPersist,
 } from "../lib/userContextItems";
+import { resolveSessionTranscriptPageMetadata } from "../lib/sessionTranscriptPaging";
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
@@ -255,6 +256,7 @@ import {
 } from "../lib/runIntent";
 import {
   archiveConsumedReplyOptionsFromTaskFlow,
+  archiveReplyOptionBlocksForChoice,
   buildSubmitInputEnvelope,
   buildLocalTurnTitle,
   buildMainDebugPrompt,
@@ -454,6 +456,15 @@ import type {
   SessionModelConfig,
 } from "../lib/sessionTypes";
 import {
+  WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
+  type WorkspaceInstruction,
+  type WorkspaceInstructionLedgerEntry,
+  type WorkspaceInstructionReceipt,
+  type WorkspaceInstructionSource,
+  type WorkspaceJsonObject,
+  type WorkspaceTurnQueueState,
+} from "../lib/workspaceInstruction";
+import {
   GLOBAL_CHAT_KEY,
   resolveGlobalChatSessionKey,
   resolveSessionRuntimeKey,
@@ -468,6 +479,26 @@ import type {
 } from "../lib/taskTypes";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import { compactThoughtContent } from "../lib/thoughtCompaction";
+import {
+  createWorkspaceTurnQueueState,
+  normalizeWorkspaceInstructionLedger,
+  reconcileWorkspaceTurnQueueOnRestore,
+  reduceWorkspaceTurnQueue,
+} from "./workspaceTurnQueue";
+import {
+  buildWorkspaceInstructionPayloadIdentity,
+  buildWorkspaceInstructionUserContext,
+} from "./workspaceInstructionAdmission";
+import {
+  buildWorkspaceInstructionConversationTurn,
+  normalizeWorkspaceInstructionIntentHint,
+  reconcileWorkspaceInstructionProjection,
+} from "./workspaceInstructionProjection";
+import {
+  resolveWorkspaceInstructionActionDecision,
+  resolveWorkspaceInstructionExecutionConsent,
+} from "./workspaceInstructionApproval";
+import { waitForSessionAdmissionReadiness } from "./sessionAdmissionReadiness";
 import {
   parseIntentTitleCandidate,
 } from "../lib/intentTitlePolicy";
@@ -971,6 +1002,10 @@ export interface SessionRuntimeSnapshot {
   approvedShellPermissionRules?: string[];
   queuedUserMessage?: QueuedUserMessage | null;
   activeGuidance?: ActiveGuidance | null;
+  /** Durable per-Session FIFO for workspace-visible instructions. */
+  workspaceTurnQueue?: WorkspaceTurnQueueState | null;
+  /** Retry tombstones remain available when older Turns are paged out. */
+  workspaceInstructionLedger?: readonly WorkspaceInstructionLedgerEntry[];
   
   // Goal Mode State
   activeGoal?: GoalDefinition | null;
@@ -1000,6 +1035,11 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   readOnlyAutoApproveForSession: boolean;
   queuedUserMessage: QueuedUserMessage | null;
   activeGuidance: ActiveGuidance | null;
+  workspaceTurnQueue: WorkspaceTurnQueueState | null;
+  workspaceInstructionLedger: readonly WorkspaceInstructionLedgerEntry[];
+  transcriptPartial: boolean;
+  transcriptLoadedTurns: number;
+  transcriptTotalTurns: number;
   planLifecycle: PlanLifecycleState;
   planApprovalChoice: string | null;
   pendingPlanApprovalHandoff: PlanApprovalHandoff | null;
@@ -1092,6 +1132,54 @@ export type FeishuApprovalProcessResult =
       reason: "not_found" | "wrong_user" | "wrong_chat" | "nonce_mismatch" | "expired" | "already_resolved";
       approval?: FeishuPendingApproval;
     };
+
+export interface AcceptWorkspaceInstructionInput {
+  text: string;
+  images?: string[];
+  contextMentions?: string[];
+  attachedFiles?: Array<AttachedFile | string>;
+  source?: WorkspaceInstructionSource;
+  /** Stable id supplied by remote/UI clients for retry-safe admission. */
+  clientSubmissionId?: string;
+  /** JSON-only routing candidates. Every capability is revalidated at dispatch. */
+  dispatchHints?: WorkspaceJsonObject;
+  /** Transient broker envelope consumed during admission; never persisted. */
+  goalContinuationEnvelope?: GoalContinuationEnvelope;
+  /** Remote reply target copied into JSON-safe dispatch hints. */
+  remoteFeishu?: FeishuRemoteContext;
+  /** Internal fail-closed path after a clear replay exhausts safe retries. */
+  forceVisibleErrorConclusion?: "workspace_clear_replay_exhausted";
+}
+
+export type WorkspaceInstructionAcceptance =
+  | {
+      accepted: true;
+      receipt: WorkspaceInstructionReceipt;
+      disposition: "admitted" | "duplicate";
+      durability: "session" | "memory";
+      queuePosition: number;
+    }
+  | {
+      accepted: false;
+      reason:
+        | "empty"
+        | "workspace_required"
+        | "session_required"
+        | "session_changed"
+        | "admission_conflict"
+        | "persistence_failed";
+      retryable: boolean;
+    };
+
+export interface WorkspaceInstructionDispatchClaim {
+  claimId: string;
+  receiptId: string;
+  clientSubmissionId: string;
+  sessionKey: string;
+  sessionEpoch: string;
+  turnId: string;
+  admittedUserBlockId: number;
+}
 
 type CapsuleExplanationSource = "model" | "runtime";
 type CapsuleExplanationState = {
@@ -1224,7 +1312,11 @@ export interface AppState {
   setImageStudioStatus: (status: Partial<ImageStudioEngineStatus>) => void;
   setImageStudioSetupGuideOpen: (value: boolean) => void;
   checkImageStudioEngine: () => Promise<ImageStudioEngineStatus>;
-  runImageStudioGeneration: (text: string, images?: string[]) => boolean;
+  runImageStudioGeneration: (
+    text: string,
+    images?: string[],
+    admittedOwner?: WorkspaceInstructionDispatchClaim,
+  ) => boolean;
   refreshGameStudioWorkspaceState: () => Promise<void>;
   initializeGameStudioWorkspace: () => Promise<void>;
   removeGameStudioWorkspace: () => Promise<void>;
@@ -1415,6 +1507,11 @@ export interface AppState {
   readOnlyAutoApproveForSession: boolean;
   queuedUserMessage: QueuedUserMessage | null;
   activeGuidance: ActiveGuidance | null;
+  workspaceTurnQueue: WorkspaceTurnQueueState | null;
+  workspaceInstructionLedger: readonly WorkspaceInstructionLedgerEntry[];
+  transcriptPartial: boolean;
+  transcriptLoadedTurns: number;
+  transcriptTotalTurns: number;
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
@@ -1462,6 +1559,11 @@ export interface AppState {
   setActiveGuidance: (text: string, turnId?: string | null) => void;
   clearActiveGuidance: () => void;
   consumeActiveGuidance: (turnId?: string | null) => ActiveGuidance | null;
+  acceptWorkspaceInstruction: (
+    input: AcceptWorkspaceInstructionInput,
+  ) => Promise<WorkspaceInstructionAcceptance>;
+  /** Reconcile a terminal head and claim at most one exact FIFO entry. */
+  dispatchNextWorkspaceInstruction: (expectedSessionKey?: string) => boolean;
   setAgentStatus: (s: AgentStatus) => void;
   resolveReview: (action: "accept" | "reject") => void;
   allowToolAction: (taskId: number, identity?: ToolPermissionResolutionIdentity) => void;
@@ -1516,6 +1618,10 @@ export interface AppState {
       /** Exact one-shot Plan execution attempt consumed only after Run admission. */
       planExecutionLeaseId?: string;
       planExecutionInstructionHash?: string;
+      /** Internal proof that an already-admitted Turn owns this dispatch. */
+      workspaceInstructionClaim?: WorkspaceInstructionDispatchClaim;
+      adoptExistingTurn?: boolean;
+      admittedUserBlockId?: number;
     },
   ) => boolean;
   // Resume loop after human review
@@ -1833,16 +1939,24 @@ function normalizePendingSlashCommand(
   return null;
 }
 
-export function normalizeInterruptedConversationTurnsForRestore(
+function normalizeLiveConversationTurns(
   turns: ConversationTurn[] | undefined,
-  _taskFlow: TaskBlock[],
 ): ConversationTurn[] {
   return (turns || []).map((turn) => {
-    const normalizedTurn = {
+    return {
       ...turn,
       processCollapsed: turn.processCollapsed ?? turn.collapsed ?? false,
       collapsed: turn.processCollapsed ?? turn.collapsed ?? false,
     };
+  });
+}
+
+export function normalizeInterruptedConversationTurnsForRestore(
+  turns: ConversationTurn[] | undefined,
+  _taskFlow: TaskBlock[],
+): ConversationTurn[] {
+  return normalizeLiveConversationTurns(turns).map((normalizedTurn) => {
+    const turn = normalizedTurn;
     if (turn.status !== "executing" && turn.status !== "planning") return normalizedTurn;
     return {
       ...normalizedTurn,
@@ -2698,6 +2812,52 @@ export function normalizeSessionRuntimeSnapshot(
       restoredIsPlanApproved,
     });
   }
+  const restoredWorkspaceTurnQueue =
+    suppliedLifecycleSessionEpoch &&
+    restoredLifecycleSessionKey !== UNBOUND_PLAN_SESSION_KEY &&
+    !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+      ? reconcileWorkspaceTurnQueueOnRestore({
+          snapshot: snapshot.workspaceTurnQueue,
+          sessionKey: restoredLifecycleSessionKey,
+          sessionEpoch: restoredLifecycleSessionEpoch,
+          terminalOwners: [
+            ...conversationTurns
+              .filter((turn) => isConversationTurnRuntimeClosed(turn.runtimeOutcome))
+              .map((turn) => ({
+                sessionKey: restoredLifecycleSessionKey,
+                sessionEpoch: restoredLifecycleSessionEpoch,
+                turnId: turn.id,
+              })),
+            ...runtimeEvents.flatMap((event) =>
+              event.type === "run.started" ||
+              event.type === "turn.completed" ||
+              event.type === "turn.failed"
+              ? [{
+                  sessionKey: restoredLifecycleSessionKey,
+                  sessionEpoch: restoredLifecycleSessionEpoch,
+                  turnId: event.turnId,
+                }]
+              : []),
+            ...(sanitizedHarnessRunMarker?.turnId
+              ? [{
+                  sessionKey: restoredLifecycleSessionKey,
+                  sessionEpoch: restoredLifecycleSessionEpoch,
+                  turnId: sanitizedHarnessRunMarker.turnId,
+                }]
+              : []),
+          ],
+        })
+      : null;
+  const restoredWorkspaceInstructionLedger =
+    suppliedLifecycleSessionEpoch &&
+    restoredLifecycleSessionKey !== UNBOUND_PLAN_SESSION_KEY &&
+    !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+      ? normalizeWorkspaceInstructionLedger(
+          snapshot.workspaceInstructionLedger,
+          restoredLifecycleSessionKey,
+          restoredLifecycleSessionEpoch,
+        )
+      : [];
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents,
@@ -2767,6 +2927,8 @@ export function normalizeSessionRuntimeSnapshot(
       : [],
     queuedUserMessage: restoredQueuedUserMessage,
     activeGuidance,
+    workspaceTurnQueue: restoredWorkspaceTurnQueue,
+    workspaceInstructionLedger: restoredWorkspaceInstructionLedger,
     activeGoal: normalizedGoalRuntime?.goal ?? legacyGoal,
     goalProgress: goalDeletionFenced
       ? null
@@ -2924,6 +3086,9 @@ const sessionRuntimeKeys = [
   "showFilePanel",
   "rightPanelTab",
   "selectedDiffTaskId",
+  "transcriptPartial",
+  "transcriptLoadedTurns",
+  "transcriptTotalTurns",
   "input",
   "contextMentions",
   "attachedFiles",
@@ -2942,6 +3107,8 @@ const sessionRuntimeKeys = [
   "readOnlyAutoApproveForSession",
   "queuedUserMessage",
   "activeGuidance",
+  "workspaceTurnQueue",
+  "workspaceInstructionLedger",
   "normalizedStreamState",
   "currentTurnState",
   "isGenerating",
@@ -3157,6 +3324,9 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     showFilePanel: state.showFilePanel === true,
     rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    transcriptPartial: state.transcriptPartial === true,
+    transcriptLoadedTurns: Math.max(0, Number(state.transcriptLoadedTurns) || 0),
+    transcriptTotalTurns: Math.max(0, Number(state.transcriptTotalTurns) || 0),
     input: state.input ?? "",
     contextMentions: state.contextMentions || [],
     attachedFiles: Array.isArray(state.attachedFiles)
@@ -3181,6 +3351,10 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
     queuedUserMessage: normalizeQueuedUserMessage(state.queuedUserMessage),
     activeGuidance: normalizeActiveGuidance(state.activeGuidance),
+    workspaceTurnQueue: state.workspaceTurnQueue || null,
+    workspaceInstructionLedger: Array.isArray(state.workspaceInstructionLedger)
+      ? state.workspaceInstructionLedger
+      : [],
     normalizedStreamState: state.normalizedStreamState || defaultNormalizedStreamState,
     currentTurnState: state.currentTurnState || createDefaultCurrentTurnState(),
     isGenerating: state.isGenerating === true,
@@ -3364,6 +3538,11 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
           ? {
               currentSessionId: null,
               queuedUserMessage: null,
+              workspaceTurnQueue: null,
+              workspaceInstructionLedger: [],
+              transcriptPartial: false,
+              transcriptLoadedTurns: 0,
+              transcriptTotalTurns: 0,
               input: "",
               contextMentions: [],
               attachedFiles: [],
@@ -3796,7 +3975,7 @@ function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void
   const workspaceKey = resolveSessionWorkspaceKey(workspaceKeyInput);
   if (scheduledWorkspaceClearSubmissionReplays.has(workspaceKey)) return;
   scheduledWorkspaceClearSubmissionReplays.add(workspaceKey);
-  setTimeout(() => {
+  setTimeout(async () => {
     scheduledWorkspaceClearSubmissionReplays.delete(workspaceKey);
     if (workspaceClearSubmissionReplayNotReady.has(workspaceKey)) return;
     const latest = useAppStore.getState();
@@ -3829,7 +4008,7 @@ function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void
     if (!pending) return;
     let started = false;
     try {
-      started = pending.replay(pending.outcome) === true;
+      started = await pending.replay(pending.outcome) === true;
     } catch (error) {
       logStoreEvent("workspace_clear_submission_replay_failed", {
         workspaceKey,
@@ -3839,8 +4018,36 @@ function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void
       });
     }
     if (!started) {
-      const retained = restoreSettledWorkspaceClearSubmission(pending);
       const attempt = (workspaceClearSubmissionReplayAttempts.get(pending.id)?.attempt || 0) + 1;
+      if (attempt >= WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS) {
+        workspaceClearSubmissionReplayAttempts.delete(pending.id);
+        try {
+          pending.onDiscard?.("replay_failed");
+        } catch {
+          // The head is already removed. A diagnostic callback must not block
+          // later user instructions from reaching their own conclusion.
+        }
+        logStoreEvent("workspace_clear_submission_replay_exhausted", {
+          workspaceKey,
+          submissionId: pending.id,
+          outcome: pending.outcome,
+          attempt,
+          maxAutoReplays: WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS,
+          disposition: "discarded_after_visible_failure",
+        });
+        const exhaustedState = useAppStore.getState();
+        if (resolveSessionWorkspaceKey(exhaustedState.currentWorkspace) === workspaceKey) {
+          workspaceClearSubmissionReplayReadySessionKeys.set(
+            workspaceKey,
+            resolveSessionRuntimeKey(workspaceKey, exhaustedState.currentSessionId),
+          );
+        }
+        if (peekSettledWorkspaceClearSubmission(workspaceKey)) {
+          scheduleWorkspaceClearSubmissionReplay(workspaceKey);
+        }
+        return;
+      }
+      const retained = restoreSettledWorkspaceClearSubmission(pending);
       if (retained) {
         workspaceClearSubmissionReplayAttempts.set(pending.id, { workspaceKey, attempt });
       }
@@ -3853,7 +4060,7 @@ function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void
         attempt,
         maxAutoReplays: WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS,
       });
-      if (retained && attempt < WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS) {
+      if (retained) {
         setTimeout(
           () => scheduleWorkspaceClearSubmissionReplay(workspaceKey),
           attempt * 75,
@@ -3868,6 +4075,21 @@ function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void
       outcome: pending.outcome,
       targetSessionKey: pending.targetSessionKey,
     });
+    const replayedState = useAppStore.getState();
+    if (resolveSessionWorkspaceKey(replayedState.currentWorkspace) === workspaceKey) {
+      // The first cleared replay can create the replacement Session. Carry the
+      // already-published drain lease onto that exact Session so later FIFO
+      // entries do not stall behind the obsolete pre-replay null owner.
+      workspaceClearSubmissionReplayReadySessionKeys.set(
+        workspaceKey,
+        resolveSessionRuntimeKey(workspaceKey, replayedState.currentSessionId),
+      );
+    }
+    // Advance only after the exact head reports successful acceptance. A
+    // failed head is restored above and therefore always blocks later items.
+    if (peekSettledWorkspaceClearSubmission(workspaceKey)) {
+      scheduleWorkspaceClearSubmissionReplay(workspaceKey);
+    }
   }, 0);
 }
 
@@ -4265,7 +4487,9 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
     contextMemoryStateByRuntimeKey: normalizeContextMemoryStateByRuntimeKey(state.contextMemoryStateByRuntimeKey),
     providerCompatibilityByRuntimeKey: normalizeProviderCompatibilityByRuntimeKey(state.providerCompatibilityByRuntimeKey),
-    conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
+    // Building an online persistence snapshot must preserve the live Turn.
+    // Restart-only interruption normalization is applied by the restore path.
+    conversationTurns: normalizeLiveConversationTurns(state.conversationTurns),
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey: state.selectedMainModeKey,
     selectedNexusModeKey: state.selectedNexusModeKey,
@@ -4301,6 +4525,9 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     showFilePanel: state.showFilePanel === true,
     rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    transcriptPartial: state.transcriptPartial === true,
+    transcriptLoadedTurns: Math.max(0, Number(state.transcriptLoadedTurns) || 0),
+    transcriptTotalTurns: Math.max(0, Number(state.transcriptTotalTurns) || 0),
     autoApproveTools: state.autoApproveTools === true,
     autoApproveToolScopes: state.autoApproveToolScopes || [],
     preferSubagents: state.preferSubagents === true,
@@ -4311,6 +4538,10 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
       : [],
     queuedUserMessage: state.queuedUserMessage ?? null,
     activeGuidance: state.activeGuidance ?? null,
+    workspaceTurnQueue: state.workspaceTurnQueue ?? null,
+    workspaceInstructionLedger: Array.isArray(state.workspaceInstructionLedger)
+      ? state.workspaceInstructionLedger
+      : [],
     activeGoal: state.activeGoal ?? null,
     goalProgress: state.goalProgress ?? null,
     goalStatus: state.goalStatus ?? "paused",
@@ -4365,6 +4596,9 @@ function buildEmptySessionRuntimeSnapshot(
       showFilePanel: false,
       rightPanelTab: "plan",
       selectedDiffTaskId: null,
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 0,
       autoApproveTools: false,
       autoApproveToolScopes: [],
       preferSubagents: false,
@@ -4373,6 +4607,14 @@ function buildEmptySessionRuntimeSnapshot(
       approvedShellPermissionRules: [],
       queuedUserMessage: null,
       activeGuidance: null,
+      workspaceTurnQueue: owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+        ? null
+        : createWorkspaceTurnQueueState({
+            sessionKey: owner.sessionKey,
+            sessionEpoch: owner.sessionEpoch,
+            updatedAt: Number(state?.currentSessionId) || Date.now(),
+          }),
+      workspaceInstructionLedger: [],
     }),
     sessionModeAffinity: selectedMainModeKey,
   };
@@ -5235,11 +5477,21 @@ const sessionSyncMiddleware =
           typeof patchOrUpdater === "function"
             ? (patchOrUpdater as (state: AppState) => Partial<AppState>)(s)
             : patchOrUpdater;
+        const currentSessionKey = resolveSessionRuntimeKey(
+          resolveSessionWorkspaceKey(s.currentWorkspace),
+          s.currentSessionId,
+        );
         const nextWorkspace = patch.currentWorkspace !== undefined ? patch.currentWorkspace : s.currentWorkspace;
         const nextSessionId = patch.currentSessionId !== undefined ? patch.currentSessionId : s.currentSessionId;
         const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(nextWorkspace), nextSessionId);
         const runtimePatch = pickSessionRuntimePatch(patch);
-        if (sessionKey && Object.keys(runtimePatch).length > 0) {
+        // A patch that changes the visible Session owner is a UI/bootstrap
+        // transition, not an implicit publication to the destination runtime.
+        // Destination runtime state must be restored or written explicitly via
+        // runtimeBySessionKey/updateRuntimeForSession; inferring ownership from
+        // the post-transition key can overwrite a live background Session.
+        const changesSessionOwner = currentSessionKey !== sessionKey;
+        if (sessionKey && !changesSessionOwner && Object.keys(runtimePatch).length > 0) {
           const existing = s.runtimeBySessionKey[sessionKey] || createSessionRuntimeFromState(s);
           return {
             ...patch,
@@ -5265,6 +5517,52 @@ const visibleGoalSubmissionAuthorizationBroker =
   createVisibleGoalSubmissionAuthorizationBroker();
 const goalContinuationAuthorizationBroker =
   createGoalContinuationAuthorizationBroker();
+
+// Admission persistence is serialized per exact Session. This prevents a
+// later A/B/C snapshot from overtaking an earlier one while still allowing
+// unrelated Sessions to persist independently.
+const workspaceInstructionAdmissionPipelines = new Map<string, Promise<void>>();
+const workspaceInstructionAdmissionsByIdentity = new Map<
+  string,
+  Promise<WorkspaceInstructionAcceptance>
+>();
+const workspaceInstructionCancellationRedispatchBySession = new Map<
+  string,
+  Promise<SessionCancellationSettlement>
+>();
+interface WorkspaceInstructionCancellationFailure {
+  sessionEpoch: string;
+  receiptId: string;
+  turnId: string;
+  disposition: string;
+}
+const workspaceInstructionCancellationFailureBySession = new Map<
+  string,
+  WorkspaceInstructionCancellationFailure
+>();
+
+function createWorkspaceRuntimeIdentity(prefix: string, at = Date.now()): string {
+  const randomPart = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2, 12);
+  return `${prefix}-${at}-${randomPart}`;
+}
+
+function enqueueWorkspaceInstructionAdmission<T>(
+  sessionKey: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const previous = workspaceInstructionAdmissionPipelines.get(sessionKey) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(task);
+  const settled = current.then(() => undefined, () => undefined);
+  workspaceInstructionAdmissionPipelines.set(sessionKey, settled);
+  void settled.finally(() => {
+    if (workspaceInstructionAdmissionPipelines.get(sessionKey) === settled) {
+      workspaceInstructionAdmissionPipelines.delete(sessionKey);
+    }
+  });
+  return current;
+}
 
 // ── The Store ─────────────────────────────────────────────────────────
 
@@ -6493,7 +6791,7 @@ export const useAppStore = create<AppState>()(
     }));
     return status;
   },
-  runImageStudioGeneration: (text, images) => {
+  runImageStudioGeneration: (text, images, admittedOwner) => {
     const prompt = String(text || "").trim();
     if (!prompt && (!images || images.length === 0)) return false;
     if (get().isGenerating) return false;
@@ -6581,8 +6879,8 @@ export const useAppStore = create<AppState>()(
     const runSessionKey = resolveSessionRuntimeKey(sessionScopeKey, ensuredSessionId)!;
     const issuedAt = Date.now();
     const issuedAtIso = new Date(issuedAt).toISOString();
-    const turnId = `image-turn-${issuedAt}-${Math.random().toString(36).slice(2, 8)}`;
-    const userBlockId = get()._nextTaskId();
+    const turnId = admittedOwner?.turnId || `image-turn-${issuedAt}-${Math.random().toString(36).slice(2, 8)}`;
+    const userBlockId = admittedOwner?.admittedUserBlockId ?? get()._nextTaskId();
     const generationBlockId = get()._nextTaskId();
     const params: ImageGenerationParams = buildImageGenerationParams(state.imageStudio.config);
     const variantGroupId = `image-variant-${ensuredSessionId}-${issuedAt}`;
@@ -6628,29 +6926,54 @@ export const useAppStore = create<AppState>()(
     };
 
     set((s) => ({
-      taskFlow: [...s.taskFlow, userBlock, generationBlock],
-      conversationTurns: [
-        ...s.conversationTurns.map((turn) =>
-          (turn.processCollapsed ?? turn.collapsed)
-            ? turn
-            : { ...turn, processCollapsed: true, collapsed: true }
-        ),
-        {
-          id: turnId,
-          userPrompt: prompt,
-          title: turnTitle,
-          intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
-          mode: "chat",
-          intent: "respond",
-          displayIntent: "respond",
-          status: "executing",
-          summary: "",
-          blockIds: [userBlockId, generationBlockId],
-          processCollapsed: false,
-          collapsed: false,
-          createdAt: Date.now(),
-        },
-      ],
+      taskFlow: admittedOwner
+        ? [...s.taskFlow, generationBlock]
+        : [...s.taskFlow, userBlock, generationBlock],
+      conversationTurns: admittedOwner
+        ? s.conversationTurns.map((turn) =>
+            turn.id === turnId
+              ? {
+                  ...turn,
+                  userPrompt: prompt,
+                  title: turnTitle,
+                  intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
+                  mode: "chat" as const,
+                  intent: "respond" as const,
+                  displayIntent: "respond" as const,
+                  status: "executing" as const,
+                  summary: "",
+                  blockIds: turn.blockIds.includes(generationBlockId)
+                    ? turn.blockIds
+                    : [...turn.blockIds, generationBlockId],
+                  processCollapsed: false,
+                  collapsed: false,
+                }
+              : (turn.processCollapsed ?? turn.collapsed)
+              ? turn
+              : { ...turn, processCollapsed: true, collapsed: true }
+          )
+        : [
+            ...s.conversationTurns.map((turn) =>
+              (turn.processCollapsed ?? turn.collapsed)
+                ? turn
+                : { ...turn, processCollapsed: true, collapsed: true }
+            ),
+            {
+              id: turnId,
+              userPrompt: prompt,
+              title: turnTitle,
+              intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
+              mode: "chat" as const,
+              intent: "respond" as const,
+              displayIntent: "respond" as const,
+              status: "executing" as const,
+              summary: "",
+              blockIds: [userBlockId, generationBlockId],
+              processCollapsed: false,
+              collapsed: false,
+              createdAt: Date.now(),
+            },
+          ],
       currentTurnId: turnId,
       input: "",
       contextMentions: [],
@@ -7471,6 +7794,11 @@ export const useAppStore = create<AppState>()(
         readOnlyAutoApproveForSession: false,
         queuedUserMessage: null,
         activeGuidance: null,
+        workspaceTurnQueue: null,
+        workspaceInstructionLedger: [],
+        transcriptPartial: false,
+        transcriptLoadedTurns: 0,
+        transcriptTotalTurns: 0,
         showWorkspaceTreePanel: false,
       }));
       void get().refreshInstructionAndHookState()
@@ -7516,6 +7844,11 @@ export const useAppStore = create<AppState>()(
         readOnlyAutoApproveForSession: false,
         queuedUserMessage: null,
         activeGuidance: null,
+        workspaceTurnQueue: null,
+        workspaceInstructionLedger: [],
+        transcriptPartial: false,
+        transcriptLoadedTurns: 0,
+        transcriptTotalTurns: 0,
       };
     });
     // Register the workspace as a trusted root in the Rust backend before tools run.
@@ -7652,6 +7985,11 @@ export const useAppStore = create<AppState>()(
               readOnlyAutoApproveForSession: false,
               queuedUserMessage: null,
               activeGuidance: null,
+              workspaceTurnQueue: null,
+              workspaceInstructionLedger: [],
+              transcriptPartial: false,
+              transcriptLoadedTurns: 0,
+              transcriptTotalTurns: 0,
             }
           : {}),
       };
@@ -7704,7 +8042,17 @@ export const useAppStore = create<AppState>()(
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
       ...(s.currentSessionId !== id ? { approvedShellPermissionRules: [] } : {}),
-      ...(s.currentSessionId !== id ? { queuedUserMessage: null, activeGuidance: null } : {}),
+      ...(s.currentSessionId !== id
+        ? {
+            queuedUserMessage: null,
+            activeGuidance: null,
+            workspaceTurnQueue: null,
+            workspaceInstructionLedger: [],
+            transcriptPartial: false,
+            transcriptLoadedTurns: 0,
+            transcriptTotalTurns: 0,
+          }
+        : {}),
     }));
     scheduleWorkspaceClearSubmissionReplay(workspaceKey);
   },
@@ -8627,6 +8975,11 @@ export const useAppStore = create<AppState>()(
         readOnlyAutoApproveForSession: false,
         queuedUserMessage: null,
         activeGuidance: null,
+        workspaceTurnQueue: null,
+        workspaceInstructionLedger: [],
+        transcriptPartial: false,
+        transcriptLoadedTurns: 0,
+        transcriptTotalTurns: 0,
         planArtifacts: [],
         planTasks: [],
         planExecutionEvidenceLedger: [],
@@ -8813,6 +9166,11 @@ export const useAppStore = create<AppState>()(
       readOnlyAutoApproveForSession: false,
       queuedUserMessage: null,
       activeGuidance: null,
+      workspaceTurnQueue: null,
+      workspaceInstructionLedger: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 0,
       resolvedInstructionSet: null,
       instructionSources: [],
       loadedHookDefinitions: defaultHookDefinitions,
@@ -10961,6 +11319,11 @@ export const useAppStore = create<AppState>()(
   currentTurnExecutionConsent: { turnId: null, granted: false },
   queuedUserMessage: null,
   activeGuidance: null,
+  workspaceTurnQueue: null,
+  workspaceInstructionLedger: [],
+  transcriptPartial: false,
+  transcriptLoadedTurns: 0,
+  transcriptTotalTurns: 0,
   pendingRunDecisionResolver: null,
   setAutoApproveTools: (v) => {
     const state = get();
@@ -11218,6 +11581,1845 @@ export const useAppStore = create<AppState>()(
     });
     return consumed;
   },
+  acceptWorkspaceInstruction: async (input) => {
+    let initial = get();
+    const text = String(input.text || "");
+    const images = Array.isArray(input.images)
+      ? input.images.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+    const contextMentions = Array.isArray(input.contextMentions)
+      ? input.contextMentions.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : [...initial.contextMentions];
+    const attachedFiles = (input.attachedFiles || initial.attachedFiles)
+      .map((file) => normalizeAttachedFile(file));
+    if (!text.trim() && images.length === 0 && contextMentions.length === 0 && attachedFiles.length === 0) {
+      return { accepted: false, reason: "empty", retryable: false };
+    }
+
+    const workspace = String(initial.currentWorkspace || "").trim();
+    const scopeKey = resolveSessionWorkspaceKey(workspace);
+    if (!workspace || scopeKey === GLOBAL_CHAT_KEY) {
+      return { accepted: false, reason: "workspace_required", retryable: false };
+    }
+    const requestedAt = Date.now();
+    const clientSubmissionId = String(input.clientSubmissionId || "").trim() ||
+      createWorkspaceRuntimeIdentity("workspace-submission", requestedAt);
+    const instructionSource = input.source || "composer";
+    const originSessionId = initial.currentSessionId;
+    const originSession = originSessionId == null
+      ? null
+      : (initial.sessionsByWorkspace[scopeKey] || []).find(
+          (candidate) => candidate.id === originSessionId,
+        ) || null;
+    const originSessionKey = originSession
+      ? resolveSessionRuntimeKey(scopeKey, originSession.id)
+      : null;
+    const workspaceClearBarrierWorkspace = resolveWorkspaceClearBarrierForSubmission({
+      currentWorkspaceKey: scopeKey,
+      submissionOriginSessionKey: originSessionKey,
+    });
+    if (workspaceClearBarrierWorkspace) {
+      let deferredGoalContinuationAuthorization: GoalContinuationAuthorization | null = null;
+      let settleDeferredAdmission!: (result: WorkspaceInstructionAcceptance) => void;
+      const deferredAdmission = new Promise<WorkspaceInstructionAcceptance>((resolve) => {
+        settleDeferredAdmission = resolve;
+      });
+      let admissionSettled = false;
+      const settleOnce = (result: WorkspaceInstructionAcceptance) => {
+        if (admissionSettled) return;
+        admissionSettled = true;
+        settleDeferredAdmission(result);
+      };
+      const deferred = deferSubmissionForWorkspaceClear({
+        currentWorkspaceKey: scopeKey,
+        submissionOriginSessionKey: originSessionKey,
+        submission: {
+          id: `workspace-clear-admission-${clientSubmissionId}`,
+          targetSessionKey: originSessionKey,
+          createdAt: requestedAt,
+          replay: async () => {
+            const acceptance = await get().acceptWorkspaceInstruction({
+              text,
+              ...(images.length > 0 ? { images: [...images] } : {}),
+              contextMentions: [...contextMentions],
+              attachedFiles: attachedFiles.map((file) => ({ ...file })),
+              source: instructionSource,
+              clientSubmissionId,
+              ...(input.dispatchHints ? { dispatchHints: input.dispatchHints } : {}),
+              ...(deferredGoalContinuationAuthorization
+                ? {
+                    goalContinuationEnvelope: goalContinuationAuthorizationBroker.issueValidated({
+                      text,
+                      authorization: deferredGoalContinuationAuthorization,
+                    }),
+                  }
+                : {}),
+              ...(input.remoteFeishu ? { remoteFeishu: input.remoteFeishu } : {}),
+            });
+            if (acceptance.accepted || !acceptance.retryable) {
+              settleOnce(acceptance);
+              return true;
+            }
+            return false;
+          },
+          onDiscard: (reason) => {
+            if (reason === "replay_failed") {
+              void get().acceptWorkspaceInstruction({
+                text,
+                ...(images.length > 0 ? { images: [...images] } : {}),
+                contextMentions: [...contextMentions],
+                attachedFiles: attachedFiles.map((file) => ({ ...file })),
+                source: instructionSource,
+                clientSubmissionId,
+                ...(input.remoteFeishu ? { remoteFeishu: input.remoteFeishu } : {}),
+                forceVisibleErrorConclusion: "workspace_clear_replay_exhausted",
+              }).then(settleOnce, () => {
+                settleOnce({ accepted: false, reason: "session_changed", retryable: true });
+              });
+              return;
+            }
+            settleOnce({ accepted: false, reason: "session_changed", retryable: true });
+          },
+        },
+      });
+      if (deferred.deferred) {
+        // The UI envelope is a short-lived, one-shot transport capability.
+        // Consume it only after the synchronous fence accepted this item, then
+        // retain the exact authorization in this closure and mint a fresh
+        // envelope for each replay attempt. Long clears cannot expire it.
+        deferredGoalContinuationAuthorization =
+          goalContinuationAuthorizationBroker.consume({
+            envelope: input.goalContinuationEnvelope,
+            text,
+          });
+        logStoreEvent("workspace_instruction_admission_deferred_for_clear", {
+          workspaceKey: deferred.workspaceKey,
+          clientSubmissionId,
+          queuePosition: deferred.queuePosition,
+          source: instructionSource,
+          queuePolicy: "strict_fifo",
+        });
+        return deferredAdmission;
+      }
+    }
+    let sessionId = initial.currentSessionId;
+    let sessionKey = resolveSessionRuntimeKey(scopeKey, sessionId);
+    let session = sessionId == null
+      ? null
+      : (initial.sessionsByWorkspace[scopeKey] || []).find((candidate) => candidate.id === sessionId) || null;
+    if (!sessionId || !sessionKey || !session) {
+      const language = initial.config.language === "en" ? "en" : "zh";
+      const autoSession = buildNewSessionRecord({
+        state: initial,
+        scopeKey,
+        affinity: initial.selectedMainModeKey === "image_studio" ? "image_studio" : "main_mode",
+        language,
+      });
+      const autoSessionRuntimePatch = getSessionRuntimeUiPatch(
+        createSessionRuntimeFromState(autoSession.runtimeSnapshot || {}),
+        { resetPanels: true },
+      );
+      set((state) => ({
+        sessionsByWorkspace: {
+          ...state.sessionsByWorkspace,
+          [scopeKey]: [
+            autoSession,
+            ...(state.sessionsByWorkspace[scopeKey] || []).map((candidate) => ({
+              ...candidate,
+              active: false,
+            })),
+          ],
+        },
+        activeSessionByWorkspace: {
+          ...state.activeSessionByWorkspace,
+          [scopeKey]: autoSession.id,
+        },
+        currentSessionId: autoSession.id,
+        ...autoSessionRuntimePatch,
+        // Composer evidence and its one-shot intent belong to the submission
+        // that is creating this Session. Preserve them until admission has
+        // captured the exact payload/capability and the UI performs its
+        // acceptance CAS cleanup.
+        input: state.input,
+        contextMentions: state.contextMentions,
+        attachedFiles: state.attachedFiles,
+        lockedComposerIntent: state.lockedComposerIntent,
+      }));
+      initial = get();
+      sessionId = autoSession.id;
+      sessionKey = resolveSessionRuntimeKey(scopeKey, sessionId);
+      session = autoSession;
+    }
+    if (!sessionKey || !session) {
+      return { accepted: false, reason: "session_required", retryable: true };
+    }
+    if (resolveWorkspaceClearBarrierForSubmission({
+      currentWorkspaceKey: scopeKey,
+      submissionOriginSessionKey: sessionKey,
+    })) {
+      return { accepted: false, reason: "session_changed", retryable: true };
+    }
+
+    if (input.forceVisibleErrorConclusion === "workspace_clear_replay_exhausted") {
+      const sessionEpoch = String(session.planLifecycleEpoch || "").trim();
+      if (!sessionEpoch) {
+        return { accepted: false, reason: "session_changed", retryable: true };
+      }
+      const existing = initial.workspaceInstructionLedger.find(
+        (entry) => entry.clientSubmissionId === clientSubmissionId,
+      );
+      if (existing) {
+        return {
+          accepted: true,
+          receipt: existing.receipt,
+          disposition: "duplicate",
+          durability: "memory",
+          queuePosition: 0,
+        };
+      }
+      const concludedAt = Date.now();
+      const turnId = createWorkspaceRuntimeIdentity("turn", concludedAt);
+      const userBlockId = initial._nextTaskId();
+      const finalBlockId = initial._nextTaskId();
+      const receipt: WorkspaceInstructionReceipt = {
+        schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
+        kind: "workspace_turn_receipt",
+        receiptId: createWorkspaceRuntimeIdentity("workspace-receipt", concludedAt),
+        clientSubmissionId,
+        sessionKey,
+        sessionEpoch,
+        turnId,
+        userBlockId,
+        acceptedAt: concludedAt,
+      };
+      const summary = initial.config.language === "en"
+        ? "MAIN could not safely replay this instruction after workspace history clearing. The instruction was preserved as a Turn and closed with a visible error; retrying creates a new Turn."
+        : "工作区历史清理后，MAIN 无法安全重放这条指令。该指令已保留为独立回合并以可见错误结论收口；重试会创建新的回合。";
+      const runId = `run-clear-replay-${turnId}`;
+      const payloadIdentity = buildWorkspaceInstructionPayloadIdentity({
+        text,
+        images,
+        contextMentions,
+        attachedFiles,
+        source: instructionSource,
+      });
+      let terminalized = false;
+      set((state) => {
+        const activeSessionKey = resolveSessionRuntimeKey(
+          resolveSessionWorkspaceKey(state.currentWorkspace),
+          state.currentSessionId,
+        );
+        const activeSession = (state.sessionsByWorkspace[scopeKey] || []).find(
+          (candidate) => candidate.id === sessionId,
+        );
+        if (
+          activeSessionKey !== sessionKey ||
+          !activeSession ||
+          String(activeSession.planLifecycleEpoch || "").trim() !== sessionEpoch ||
+          state.workspaceInstructionLedger.some(
+            (entry) => entry.clientSubmissionId === clientSubmissionId,
+          )
+        ) return {};
+        const userContextItems = buildWorkspaceInstructionUserContext({
+          contextMentions,
+          attachedFiles,
+          images,
+          workspace,
+          language: state.config.language === "en" ? "en" : "zh",
+        });
+        let runtimeEvents = appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+          type: "run.started",
+          threadId: sessionKey,
+          turnId,
+          timestampMs: concludedAt,
+          runId,
+          parentRunId: null,
+        }));
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "run.completed",
+          threadId: sessionKey,
+          turnId,
+          timestampMs: concludedAt,
+          runId,
+          parentRunId: null,
+          resultKind: "error",
+          summary,
+        }));
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "turn.completed",
+          threadId: sessionKey,
+          turnId,
+          timestampMs: concludedAt,
+          resultKind: "error",
+        }));
+        const conversationTurns = [...state.conversationTurns, {
+          id: turnId,
+          clientSubmissionId,
+          workspaceInstructionReceiptId: receipt.receiptId,
+          workspaceInstructionSource: instructionSource,
+          userPrompt: text,
+          title: normalizeConversationDisplayTitle(
+            text,
+            state.config.language === "en" ? 48 : 40,
+            state.config.language === "en" ? "Workspace instruction" : "工作区指令",
+          ),
+          intentSummary: summary,
+          mode: "chat" as const,
+          intent: "respond" as const,
+          displayIntent: "respond" as const,
+          status: "error" as const,
+          summary,
+          blockIds: [userBlockId, finalBlockId],
+          processCollapsed: false,
+          collapsed: false,
+          createdAt: concludedAt,
+          runtimeOutcome: {
+            status: "completed" as const,
+            reason: "workspace_clear_replay_exhausted",
+            resultKind: "error" as const,
+            runId,
+            parentRunId: null,
+            updatedAt: concludedAt,
+          },
+        }];
+        const transcriptMetadata = resolveSessionTranscriptPageMetadata({
+          loadedTurns: conversationTurns.length,
+          totalTurns: Math.max(
+            state.conversationTurns.length,
+            Number(state.transcriptLoadedTurns) || 0,
+            Number(state.transcriptTotalTurns) || 0,
+          ) + 1,
+          hasMore: state.transcriptPartial === true,
+        });
+        terminalized = true;
+        return {
+          workspaceInstructionLedger: [
+            ...state.workspaceInstructionLedger,
+            { clientSubmissionId, payloadIdentity, receipt },
+          ],
+          taskFlow: [
+            ...state.taskFlow,
+            {
+              id: userBlockId,
+              turnId,
+              type: "user" as const,
+              content: text,
+              ...(images.length > 0 ? { images: [...images] } : {}),
+              ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
+            },
+            {
+              id: finalBlockId,
+              turnId,
+              type: "agent" as const,
+              content: summary,
+              streaming: false,
+              visibility: "assistant_final" as const,
+            },
+          ],
+          runtimeEvents,
+          conversationTurns,
+          currentTurnId: turnId,
+          ...transcriptMetadata,
+        };
+      });
+      if (!terminalized) {
+        return { accepted: false, reason: "session_changed", retryable: true };
+      }
+      logStoreEvent("workspace_clear_submission_memory_terminalized", {
+        sessionKey,
+        sessionEpoch,
+        clientSubmissionId,
+        receiptId: receipt.receiptId,
+        turnId,
+        durability: "memory",
+        resultKind: "error",
+      });
+      return {
+        accepted: true,
+        receipt,
+        disposition: "admitted",
+        durability: "memory",
+        queuePosition: 0,
+      };
+    }
+
+    const initialSessionEpoch = String(session.planLifecycleEpoch || "").trim();
+    const admissionReadiness = await waitForSessionAdmissionReadiness({
+      sessionKey,
+      sessionEpoch: initialSessionEpoch,
+    });
+    initial = get();
+    const readySessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(initial.currentWorkspace),
+      initial.currentSessionId,
+    );
+    session = (initial.sessionsByWorkspace[scopeKey] || []).find(
+      (candidate) => candidate.id === sessionId,
+    ) || null;
+    if (
+      admissionReadiness !== "ready" ||
+      readySessionKey !== sessionKey ||
+      !session ||
+      String(session.planLifecycleEpoch || "").trim() !== initialSessionEpoch
+    ) {
+      return { accepted: false, reason: "session_changed", retryable: true };
+    }
+
+    const submittedAt = Date.now();
+    const payloadIdentity = buildWorkspaceInstructionPayloadIdentity({
+      text,
+      images,
+      contextMentions,
+      attachedFiles,
+      source: instructionSource,
+      dispatchHints: input.dispatchHints,
+      remoteContext: input.remoteFeishu,
+    });
+    const admissionIdentityKey = JSON.stringify([sessionKey, clientSubmissionId]);
+    const existingLedgerEntry = initial.workspaceInstructionLedger.find(
+      (entry) => entry.clientSubmissionId === clientSubmissionId,
+    );
+    const duplicateTurn = initial.conversationTurns.find(
+      (turn) => turn.clientSubmissionId === clientSubmissionId,
+    );
+    if (existingLedgerEntry || duplicateTurn) {
+      if (
+        (existingLedgerEntry && existingLedgerEntry.payloadIdentity !== payloadIdentity) ||
+        (!existingLedgerEntry && duplicateTurn?.userPrompt !== text)
+      ) {
+        return { accepted: false, reason: "admission_conflict", retryable: false };
+      }
+      const inFlight = workspaceInstructionAdmissionsByIdentity.get(admissionIdentityKey);
+      if (inFlight) {
+        const settled = await inFlight;
+        return settled.accepted
+          ? { ...settled, disposition: "duplicate" as const }
+          : settled;
+      }
+      const existingEntry = initial.workspaceTurnQueue?.entries.find(
+        (entry) => entry.instruction.clientSubmissionId === clientSubmissionId,
+      );
+      const durableReceipt = existingLedgerEntry?.receipt || existingEntry?.receipt;
+      const duplicateUserBlock = durableReceipt
+        ? null
+        : duplicateTurn!.blockIds
+          .map((blockId) => initial.taskFlow.find((block) => block.id === blockId))
+          .find((block) => block?.type === "user" && block.turnId === duplicateTurn!.id);
+      if (!durableReceipt && (!duplicateUserBlock || duplicateUserBlock.type !== "user")) {
+        return { accepted: false, reason: "admission_conflict", retryable: false };
+      }
+      const receipt: WorkspaceInstructionReceipt = durableReceipt || {
+          schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
+          kind: "workspace_turn_receipt",
+          receiptId: duplicateTurn!.workspaceInstructionReceiptId ||
+            createWorkspaceRuntimeIdentity("workspace-receipt", duplicateTurn!.createdAt),
+          clientSubmissionId,
+          sessionKey,
+          sessionEpoch: String(session.planLifecycleEpoch || initial.planLifecycle.sessionEpoch || ""),
+          turnId: duplicateTurn!.id,
+          userBlockId: duplicateUserBlock!.id,
+          acceptedAt: duplicateTurn!.createdAt,
+        };
+      return {
+        accepted: true,
+        receipt,
+        disposition: "duplicate",
+        durability: session.recordingDisabled || !initial.config.sessionRecordingEnabled
+          ? "memory"
+          : "session",
+        queuePosition: existingEntry
+          ? Math.max(1, (initial.workspaceTurnQueue?.entries.indexOf(existingEntry) ?? 0) + 1)
+          : 0,
+      };
+    }
+
+    const visibleGoalEnvelope = initial.captureVisibleGoalSubmissionEnvelope(text);
+    const goalCreationAuthorization = visibleGoalSubmissionAuthorizationBroker.consume({
+      envelope: visibleGoalEnvelope,
+      text,
+      sessionKey,
+    });
+    const goalContinuationAuthorization = goalContinuationAuthorizationBroker.consume({
+      envelope: input.goalContinuationEnvelope,
+      text,
+    });
+    let admissionAuthorizationsSettled = false;
+    const restoreAdmissionAuthorizations = () => {
+      if (admissionAuthorizationsSettled) return;
+      admissionAuthorizationsSettled = true;
+      if (goalCreationAuthorization) {
+        visibleGoalSubmissionAuthorizationBroker.restoreConsumed({
+          envelope: visibleGoalEnvelope,
+          text,
+          sessionKey,
+          authorization: goalCreationAuthorization,
+        });
+      }
+      if (goalContinuationAuthorization) {
+        goalContinuationAuthorizationBroker.restoreConsumed({
+          envelope: input.goalContinuationEnvelope,
+          text,
+          authorization: goalContinuationAuthorization,
+        });
+      }
+    };
+    const commitAdmissionAuthorizations = () => {
+      admissionAuthorizationsSettled = true;
+    };
+    let dispatchHints: WorkspaceJsonObject;
+    try {
+      dispatchHints = JSON.parse(JSON.stringify({
+        ...(input.dispatchHints || {}),
+        ...(goalCreationAuthorization ? { goalCreationAuthorization } : {}),
+        ...(goalContinuationAuthorization ? { goalContinuationAuthorization } : {}),
+        ...(input.remoteFeishu ? { remoteFeishu: input.remoteFeishu } : {}),
+      })) as WorkspaceJsonObject;
+    } catch {
+      restoreAdmissionAuthorizations();
+      return { accepted: false, reason: "admission_conflict", retryable: false };
+    }
+
+    let receipt: WorkspaceInstructionReceipt | null = null;
+    let queuePosition = 0;
+    let admissionEpoch = String(session.planLifecycleEpoch || "").trim();
+    let admissionApplied = false;
+    set((state) => {
+      const activeSessionKey = resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(state.currentWorkspace),
+        state.currentSessionId,
+      );
+      if (activeSessionKey !== sessionKey) return {};
+      const activeSession = (state.sessionsByWorkspace[scopeKey] || []).find(
+        (candidate) => candidate.id === sessionId,
+      );
+      if (!activeSession) return {};
+      admissionEpoch = String(activeSession.planLifecycleEpoch || admissionEpoch).trim() ||
+        createPlanLifecycleSessionEpoch(submittedAt);
+      const currentQueue = state.workspaceTurnQueue?.sessionKey === sessionKey &&
+        state.workspaceTurnQueue.sessionEpoch === admissionEpoch
+        ? state.workspaceTurnQueue
+        : createWorkspaceTurnQueueState({
+            sessionKey,
+            sessionEpoch: admissionEpoch,
+            updatedAt: submittedAt,
+          });
+      const turnId = createWorkspaceRuntimeIdentity("turn", submittedAt);
+      const userBlockId = state._nextTaskId();
+      const nextReceipt: WorkspaceInstructionReceipt = {
+        schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
+        kind: "workspace_turn_receipt",
+        receiptId: createWorkspaceRuntimeIdentity("workspace-receipt", submittedAt),
+        clientSubmissionId,
+        sessionKey,
+        sessionEpoch: admissionEpoch,
+        turnId,
+        userBlockId,
+        acceptedAt: submittedAt,
+      };
+      const instruction: WorkspaceInstruction = {
+        schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
+        kind: "workspace_instruction",
+        clientSubmissionId,
+        sessionKey,
+        sessionEpoch: admissionEpoch,
+        source: instructionSource,
+        submittedAt,
+        payload: {
+          text,
+          ...(images.length > 0 ? { images } : {}),
+          ...(contextMentions.length > 0 ? { contextMentions } : {}),
+          ...(attachedFiles.length > 0 ? { attachedFiles } : {}),
+          ...(Object.keys(dispatchHints).length > 0 ? { dispatchHints } : {}),
+        },
+      };
+      const appended = reduceWorkspaceTurnQueue(currentQueue, {
+        type: "append",
+        expectedVersion: currentQueue.version,
+        at: submittedAt,
+        instruction,
+        receipt: nextReceipt,
+      });
+      if (appended.disposition !== "applied") return {};
+
+      const language = state.config.language === "en" ? "en" : "zh";
+      const userContextItems = buildWorkspaceInstructionUserContext({
+        contextMentions,
+        attachedFiles,
+        images,
+        workspace,
+        language,
+      });
+      const userBlock: TaskBlock = {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: text,
+        ...(images.length > 0 ? { images: [...images] } : {}),
+        ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
+      };
+      const turn = buildWorkspaceInstructionConversationTurn({
+        instruction,
+        receipt: nextReceipt,
+        language,
+        blockIds: [userBlockId],
+      });
+      const conversationTurns = [...state.conversationTurns, turn];
+      const transcriptMetadata = resolveSessionTranscriptPageMetadata({
+        loadedTurns: conversationTurns.length,
+        totalTurns: Math.max(
+          state.conversationTurns.length,
+          Number(state.transcriptLoadedTurns) || 0,
+          Number(state.transcriptTotalTurns) || 0,
+        ) + 1,
+        hasMore: state.transcriptPartial === true,
+      });
+      receipt = nextReceipt;
+      queuePosition = appended.state.entries.length;
+      admissionApplied = true;
+      const ledgerEntry: WorkspaceInstructionLedgerEntry = {
+        clientSubmissionId,
+        payloadIdentity,
+        receipt: nextReceipt,
+      };
+      return {
+        workspaceTurnQueue: appended.state,
+        workspaceInstructionLedger: [
+          ...state.workspaceInstructionLedger,
+          ledgerEntry,
+        ],
+        taskFlow: [...state.taskFlow, userBlock],
+        conversationTurns,
+        ...transcriptMetadata,
+        sessionsByWorkspace: activeSession.planLifecycleEpoch
+          ? state.sessionsByWorkspace
+          : {
+              ...state.sessionsByWorkspace,
+              [scopeKey]: (state.sessionsByWorkspace[scopeKey] || []).map((candidate) =>
+                candidate.id === sessionId
+                  ? { ...candidate, planLifecycleEpoch: admissionEpoch }
+                  : candidate
+              ),
+            },
+      };
+    });
+
+    if (!admissionApplied || !receipt) {
+      restoreAdmissionAuthorizations();
+      return { accepted: false, reason: "session_changed", retryable: true };
+    }
+    const admittedReceipt = receipt as WorkspaceInstructionReceipt;
+
+    const persistOwnerProjection = async (): Promise<"session" | "memory"> => {
+      const latest = get();
+      const ownerSession = (latest.sessionsByWorkspace[scopeKey] || []).find(
+        (candidate) => candidate.id === sessionId,
+      );
+      if (!ownerSession || ownerSession.planLifecycleEpoch !== admissionEpoch) {
+        throw new Error("workspace instruction Session owner changed before persistence");
+      }
+      const ownerRuntime = isSessionRuntimeActive(latest, sessionKey)
+        ? createSessionRuntimeFromState(latest)
+        : latest.runtimeBySessionKey[sessionKey];
+      if (!ownerRuntime) {
+        throw new Error("workspace instruction runtime owner disappeared before persistence");
+      }
+      const ownerQueue = ownerRuntime.workspaceTurnQueue;
+      const exactPersistingEntry = ownerQueue?.entries.find((entry) =>
+        entry.receipt.receiptId === admittedReceipt.receiptId &&
+        entry.instruction.clientSubmissionId === clientSubmissionId &&
+        entry.status === "persisting"
+      );
+      if (!ownerQueue || !exactPersistingEntry) {
+        throw new Error("workspace instruction persistence owner is no longer exact");
+      }
+      // Concurrent callers may already have materialized later persisting
+      // placeholders in memory. They are not durable yet and must never hitch
+      // a ride in this transaction's snapshot.
+      const excludedPendingTurnIds = new Set(
+        ownerQueue.entries
+          .filter((entry) =>
+            entry.status === "persisting" &&
+            entry.receipt.receiptId !== admittedReceipt.receiptId
+          )
+          .map((entry) => entry.receipt.turnId),
+      );
+      const persistenceRuntimeBase: SessionRuntimeState = excludedPendingTurnIds.size === 0
+        ? ownerRuntime
+        : {
+            ...ownerRuntime,
+            workspaceTurnQueue: {
+              ...ownerQueue,
+              entries: ownerQueue.entries.filter((entry) =>
+                !excludedPendingTurnIds.has(entry.receipt.turnId)
+              ),
+            },
+            workspaceInstructionLedger: ownerRuntime.workspaceInstructionLedger.filter((entry) =>
+              !excludedPendingTurnIds.has(entry.receipt.turnId)
+            ),
+            taskFlow: ownerRuntime.taskFlow.filter((block) =>
+              !block.turnId || !excludedPendingTurnIds.has(block.turnId)
+            ),
+            conversationTurns: ownerRuntime.conversationTurns.filter((turn) =>
+              !excludedPendingTurnIds.has(turn.id)
+            ),
+          };
+      const omittedLoadedTurnCount = Math.max(
+        0,
+        ownerRuntime.conversationTurns.length - persistenceRuntimeBase.conversationTurns.length,
+      );
+      const persistenceTranscriptMetadata = resolveSessionTranscriptPageMetadata({
+        loadedTurns: persistenceRuntimeBase.conversationTurns.length,
+        totalTurns: Math.max(
+          ownerRuntime.conversationTurns.length,
+          Number(ownerRuntime.transcriptLoadedTurns) || 0,
+          Number(ownerRuntime.transcriptTotalTurns) || 0,
+        ) - omittedLoadedTurnCount,
+        hasMore: ownerRuntime.transcriptPartial === true,
+      });
+      const persistenceRuntime: SessionRuntimeState = {
+        ...persistenceRuntimeBase,
+        ...persistenceTranscriptMetadata,
+      };
+      const runtimeSnapshot = sanitizeSessionRuntimeSnapshotForPersist(
+        buildSessionRuntimeSnapshotFromStoreState({
+          ...latest,
+          ...persistenceRuntime,
+          currentWorkspace: scopeKey,
+          currentSessionId: sessionId,
+        }),
+      );
+      const messages = sanitizeTaskBlocksForPersist(persistenceRuntime.taskFlow || []);
+      const updatedAtMs = Date.now();
+      const sessionRecord: Session = {
+        ...ownerSession,
+        messages,
+        runtimeSnapshot,
+        ...persistenceTranscriptMetadata,
+        updatedAt: new Date(updatedAtMs).toISOString(),
+        updatedAtMs,
+        storageStatus: latest.config.sessionRecordingEnabled && ownerSession.recordingDisabled !== true
+          ? "ok"
+          : "temporary",
+        recordingDisabled: !latest.config.sessionRecordingEnabled || ownerSession.recordingDisabled === true,
+      };
+      const persistedProjectionIdentity = JSON.stringify({
+        messages,
+        runtimeSnapshot,
+        transcriptPartial: sessionRecord.transcriptPartial === true,
+        transcriptLoadedTurns: sessionRecord.transcriptLoadedTurns || 0,
+        transcriptTotalTurns: sessionRecord.transcriptTotalTurns || 0,
+      });
+      if (!latest.config.sessionRecordingEnabled || ownerSession.recordingDisabled === true) {
+        get().updateSession(scopeKey, sessionId, sessionRecord);
+        return "memory";
+      }
+      const saved = await saveProjectSession(scopeKey, sessionRecord, {
+        allowPersistingWorkspaceReceiptId: admittedReceipt.receiptId,
+      });
+      const postSave = get();
+      const currentOwner = (postSave.sessionsByWorkspace[scopeKey] || []).find(
+        (candidate) => candidate.id === sessionId,
+      );
+      if (currentOwner?.planLifecycleEpoch === admissionEpoch) {
+        const currentRuntime = isSessionRuntimeActive(postSave, sessionKey)
+          ? createSessionRuntimeFromState(postSave)
+          : postSave.runtimeBySessionKey[sessionKey];
+        const currentRuntimeSnapshot = currentRuntime
+          ? sanitizeSessionRuntimeSnapshotForPersist(
+              buildSessionRuntimeSnapshotFromStoreState({
+                ...postSave,
+                ...currentRuntime,
+                currentWorkspace: scopeKey,
+                currentSessionId: sessionId,
+              }),
+            )
+          : null;
+        const currentProjectionIdentity = currentRuntime && currentRuntimeSnapshot
+          ? JSON.stringify({
+              messages: sanitizeTaskBlocksForPersist(currentRuntime.taskFlow || []),
+              runtimeSnapshot: currentRuntimeSnapshot,
+              transcriptPartial: currentRuntime.transcriptPartial === true,
+              transcriptLoadedTurns: Math.max(
+                0,
+                Number(currentRuntime.transcriptLoadedTurns) || currentRuntime.conversationTurns.length,
+              ),
+              transcriptTotalTurns: Math.max(
+                currentRuntime.conversationTurns.length,
+                Number(currentRuntime.transcriptTotalTurns) || 0,
+              ),
+            })
+          : "";
+        const projectionStillCurrent =
+          currentProjectionIdentity === persistedProjectionIdentity;
+        const recordingStillEnabled =
+          postSave.config.sessionRecordingEnabled && currentOwner.recordingDisabled !== true;
+        const savedProjection = saved && typeof saved === "object"
+          ? saved as Partial<Session>
+          : {};
+        if (projectionStillCurrent && recordingStillEnabled) {
+          const savedUpdatedAtMs = Number(savedProjection.updatedAtMs) ||
+            (typeof savedProjection.updatedAt === "string"
+              ? Date.parse(savedProjection.updatedAt)
+              : Number(savedProjection.updatedAt)) ||
+            Number(sessionRecord.updatedAtMs) || 0;
+          const currentUpdatedAtMs = Number(currentOwner.updatedAtMs) ||
+            (typeof currentOwner.updatedAt === "string"
+              ? Date.parse(currentOwner.updatedAt)
+              : Number(currentOwner.updatedAt)) ||
+            0;
+          const keepCurrentTimestamp = currentUpdatedAtMs > savedUpdatedAtMs;
+          // The disk writer owns transcript/runtime persistence fields only.
+          // Keep the live Session container's title, active flag, mode
+          // affinity, and any newer timestamp written while I/O was pending.
+          get().updateSession(scopeKey, sessionId, {
+            messages,
+            runtimeSnapshot,
+            transcriptPartial: savedProjection.transcriptPartial ?? sessionRecord.transcriptPartial,
+            transcriptLoadedTurns:
+              savedProjection.transcriptLoadedTurns ?? sessionRecord.transcriptLoadedTurns,
+            transcriptTotalTurns:
+              savedProjection.transcriptTotalTurns ?? sessionRecord.transcriptTotalTurns,
+            ...(typeof savedProjection.turnCount === "number"
+              ? { turnCount: savedProjection.turnCount }
+              : {}),
+            ...(typeof savedProjection.messageCount === "number"
+              ? { messageCount: savedProjection.messageCount }
+              : {}),
+            updatedAt: keepCurrentTimestamp
+              ? currentOwner.updatedAt
+              : savedProjection.updatedAt ?? sessionRecord.updatedAt,
+            updatedAtMs: keepCurrentTimestamp
+              ? currentOwner.updatedAtMs
+              : savedProjection.updatedAtMs ?? sessionRecord.updatedAtMs,
+            ...(typeof savedProjection.workspaceRoot === "string"
+              ? { workspaceRoot: savedProjection.workspaceRoot }
+              : {}),
+            ...(typeof savedProjection.projectId === "string"
+              ? { projectId: savedProjection.projectId }
+              : {}),
+            storageStatus: "ok",
+            recordingDisabled: false,
+          });
+        } else {
+          logStoreEvent("workspace_instruction_persistence_ack_stale", {
+            sessionKey,
+            sessionEpoch: admissionEpoch,
+            receiptId: admittedReceipt.receiptId,
+            projectionStillCurrent,
+            recordingStillEnabled,
+          });
+        }
+      }
+      return "session";
+    };
+
+    const admissionPromise = enqueueWorkspaceInstructionAdmission(sessionKey, async () => {
+      let durability: "session" | "memory";
+      try {
+        durability = await persistOwnerProjection();
+        // The one-shot capabilities are now part of the durable (or explicitly
+        // memory-only) queue projection. From this point a retry must resolve
+        // through the receipt ledger, never by restoring the UI envelope.
+        commitAdmissionAuthorizations();
+      } catch (error) {
+        const failureSummary = get().config.language === "en"
+          ? "MAIN accepted this workspace instruction, but durable Session recording failed. The Turn was closed with a visible error; retrying creates a new Turn."
+          : "MAIN 已接纳这条工作区指令，但 Session 持久化失败。本回合已以可见错误结论收口；重试会创建新的回合。";
+        let memoryTerminalized = false;
+        set((state) => {
+          const ownerActive = isSessionRuntimeActive(state, sessionKey);
+          const ownerRuntime = ownerActive
+            ? createSessionRuntimeFromState(state)
+            : state.runtimeBySessionKey[sessionKey];
+          const ownerQueue = ownerRuntime?.workspaceTurnQueue;
+          if (!ownerRuntime || !ownerQueue) return {};
+          const rolledBack = reduceWorkspaceTurnQueue(ownerQueue, {
+            type: "rollback",
+            expectedVersion: ownerQueue.version,
+            at: Date.now(),
+            clientSubmissionId,
+            receiptId: admittedReceipt.receiptId,
+            sessionKey,
+            sessionEpoch: admissionEpoch,
+          });
+          if (rolledBack.disposition !== "applied") return {};
+          const ownedTurn = ownerRuntime.conversationTurns.find((turn) =>
+            turn.id === admittedReceipt.turnId &&
+            turn.clientSubmissionId === clientSubmissionId &&
+            turn.workspaceInstructionReceiptId === admittedReceipt.receiptId
+          );
+          const ownedUserBlock = ownerRuntime.taskFlow.find((block) =>
+            block.id === admittedReceipt.userBlockId &&
+            block.turnId === admittedReceipt.turnId &&
+            block.type === "user"
+          );
+          if (!ownedTurn || !ownedUserBlock) return {};
+          const timestampMs = Date.now();
+          const runId = `run-admission-persistence-${admittedReceipt.turnId}`;
+          const finalBlockId = state._nextTaskId();
+          let runtimeEvents = appendRuntimeEvent(ownerRuntime.runtimeEvents, withEventSchema({
+            type: "run.started",
+            threadId: sessionKey,
+            turnId: admittedReceipt.turnId,
+            timestampMs,
+            runId,
+            parentRunId: null,
+          }));
+          runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+            type: "run.completed",
+            threadId: sessionKey,
+            turnId: admittedReceipt.turnId,
+            timestampMs,
+            runId,
+            parentRunId: null,
+            resultKind: "error",
+            summary: failureSummary,
+          }));
+          runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+            type: "turn.completed",
+            threadId: sessionKey,
+            turnId: admittedReceipt.turnId,
+            timestampMs,
+            resultKind: "error",
+          }));
+          const conversationTurns = ownerRuntime.conversationTurns.map((turn) =>
+            turn.id === admittedReceipt.turnId &&
+              turn.clientSubmissionId === clientSubmissionId &&
+              turn.workspaceInstructionReceiptId === admittedReceipt.receiptId
+              ? {
+                  ...turn,
+                  status: "error" as const,
+                  summary: failureSummary,
+                  blockIds: turn.blockIds.includes(finalBlockId)
+                    ? turn.blockIds
+                    : [...turn.blockIds, finalBlockId],
+                  runtimeOutcome: {
+                    status: "completed" as const,
+                    reason: "workspace_instruction_persistence_failed",
+                    resultKind: "error" as const,
+                    runId,
+                    parentRunId: null,
+                    updatedAt: timestampMs,
+                  },
+                }
+              : turn
+          );
+          const runtimePatch = {
+            workspaceTurnQueue: rolledBack.state,
+            // Keep the receipt ledger in memory so a client retry with the
+            // same id resolves to this exact concluded Turn instead of
+            // materializing a duplicate after the failed durable write.
+            workspaceInstructionLedger: ownerRuntime.workspaceInstructionLedger,
+            taskFlow: [
+              ...ownerRuntime.taskFlow,
+              {
+                id: finalBlockId,
+                turnId: admittedReceipt.turnId,
+                type: "agent" as const,
+                content: failureSummary,
+                streaming: false,
+                visibility: "assistant_final" as const,
+              },
+            ],
+            runtimeEvents,
+            conversationTurns,
+            transcriptLoadedTurns: Math.max(
+              ownerRuntime.transcriptLoadedTurns,
+              conversationTurns.length,
+            ),
+            transcriptTotalTurns: Math.max(
+              ownerRuntime.transcriptTotalTurns,
+              conversationTurns.length,
+            ),
+          };
+          memoryTerminalized = true;
+          return ownerActive
+            ? runtimePatch
+            : {
+                runtimeBySessionKey: {
+                  ...state.runtimeBySessionKey,
+                  [sessionKey]: { ...ownerRuntime, ...runtimePatch },
+                },
+              };
+        });
+        logStoreEvent("workspace_instruction_admission_rolled_back", {
+          sessionKey,
+          sessionEpoch: admissionEpoch,
+          clientSubmissionId,
+          receiptId: admittedReceipt.receiptId,
+          error: error instanceof Error ? error.message : String(error),
+          memoryTerminalized,
+        });
+        if (memoryTerminalized) {
+          commitAdmissionAuthorizations();
+          logStoreEvent("workspace_instruction_admission_memory_terminalized", {
+            sessionKey,
+            sessionEpoch: admissionEpoch,
+            clientSubmissionId,
+            receiptId: admittedReceipt.receiptId,
+            turnId: admittedReceipt.turnId,
+            durability: "memory",
+            resultKind: "error",
+          });
+          runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+          return {
+            accepted: true,
+            receipt: admittedReceipt,
+            disposition: "admitted",
+            durability: "memory",
+            queuePosition: 0,
+          } as const;
+        }
+        restoreAdmissionAuthorizations();
+        return { accepted: false, reason: "persistence_failed", retryable: true } as const;
+      }
+
+      let committed = false;
+      set((state) => {
+        const ownerActive = isSessionRuntimeActive(state, sessionKey);
+        const ownerRuntime = ownerActive
+          ? createSessionRuntimeFromState(state)
+          : state.runtimeBySessionKey[sessionKey];
+        const ownerQueue = ownerRuntime?.workspaceTurnQueue;
+        if (!ownerRuntime || !ownerQueue) return {};
+        const transition = reduceWorkspaceTurnQueue(ownerQueue, {
+          type: "commit",
+          expectedVersion: ownerQueue.version,
+          at: Date.now(),
+          clientSubmissionId,
+          receiptId: admittedReceipt.receiptId,
+          sessionKey,
+          sessionEpoch: admissionEpoch,
+        });
+        if (transition.disposition === "rejected") return {};
+        committed = true;
+        return ownerActive
+          ? { workspaceTurnQueue: transition.state }
+          : {
+              runtimeBySessionKey: {
+                ...state.runtimeBySessionKey,
+                [sessionKey]: { ...ownerRuntime, workspaceTurnQueue: transition.state },
+              },
+            };
+      });
+      if (!committed) {
+        logStoreEvent("workspace_instruction_admitted_restore_pending", {
+          sessionKey,
+          sessionEpoch: admissionEpoch,
+          clientSubmissionId,
+          receiptId: admittedReceipt.receiptId,
+          turnId: admittedReceipt.turnId,
+          queuePosition,
+          durability,
+        });
+        // Persistence is the admission commit point. The durable `persisting`
+        // entry is intentionally reconciled to `queued` on the next exact
+        // Session restore, so a UI owner switch must not tell the caller to
+        // resend and create a second Turn.
+        return {
+          accepted: true,
+          receipt: admittedReceipt,
+          disposition: "admitted",
+          durability,
+          queuePosition,
+        } as const;
+      }
+      logStoreEvent("workspace_instruction_admitted", {
+        sessionKey,
+        sessionEpoch: admissionEpoch,
+        clientSubmissionId,
+        receiptId: admittedReceipt.receiptId,
+        turnId: admittedReceipt.turnId,
+        queuePosition,
+        durability,
+      });
+      runAfterNextPaint(() => {
+        get().dispatchNextWorkspaceInstruction(sessionKey);
+      });
+      return {
+        accepted: true,
+        receipt: admittedReceipt,
+        disposition: "admitted",
+        durability,
+        queuePosition,
+      } as const;
+    });
+    workspaceInstructionAdmissionsByIdentity.set(admissionIdentityKey, admissionPromise);
+    const clearAdmissionIdentity = () => {
+      if (workspaceInstructionAdmissionsByIdentity.get(admissionIdentityKey) === admissionPromise) {
+        workspaceInstructionAdmissionsByIdentity.delete(admissionIdentityKey);
+      }
+    };
+    // Observe both outcomes directly. `finally()` would create an unobserved
+    // derived rejection if an unexpected admission bug escaped the task.
+    void admissionPromise.then(clearAdmissionIdentity, clearAdmissionIdentity);
+    return admissionPromise;
+  },
+  dispatchNextWorkspaceInstruction: (expectedSessionKey) => {
+    let state = get();
+    const sessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    );
+    if (!sessionKey || (expectedSessionKey && expectedSessionKey !== sessionKey)) return false;
+    let queue = state.workspaceTurnQueue;
+    if (!queue || queue.sessionKey !== sessionKey) return false;
+    const deferDispatchUntilCancellationSettles = (phase: "before_claim" | "claim_race") => {
+      const pendingCancellation = getPendingSessionCancellation(sessionKey);
+      if (!pendingCancellation) return false;
+      const fencedEntry = queue?.entries[0] || null;
+      if (
+        workspaceInstructionCancellationRedispatchBySession.get(sessionKey) !==
+          pendingCancellation.promise
+      ) {
+        workspaceInstructionCancellationRedispatchBySession.set(
+          sessionKey,
+          pendingCancellation.promise,
+        );
+        void pendingCancellation.promise.then(
+          (settlement) => {
+            const ownsFence =
+              workspaceInstructionCancellationRedispatchBySession.get(sessionKey) ===
+                pendingCancellation.promise;
+            if (!ownsFence) return;
+            workspaceInstructionCancellationRedispatchBySession.delete(sessionKey);
+            logStoreEvent("workspace_instruction_cancellation_fence_settled", {
+              sessionKey,
+              canceledTurnId: settlement.turnId,
+              terminalSettled: settlement.terminalSettled,
+              queueDisposition: settlement.queueDisposition || null,
+              disposition: settlement.disposition,
+            });
+            if (fencedEntry) {
+              const existingFailure = workspaceInstructionCancellationFailureBySession.get(
+                sessionKey,
+              );
+              const exactFailure = !!existingFailure &&
+                existingFailure.sessionEpoch === fencedEntry.receipt.sessionEpoch &&
+                existingFailure.receiptId === fencedEntry.receipt.receiptId &&
+                existingFailure.turnId === fencedEntry.receipt.turnId;
+              if (settlement.terminalSettled || settlement.queueDisposition === "discard") {
+                if (exactFailure) {
+                  workspaceInstructionCancellationFailureBySession.delete(sessionKey);
+                }
+              } else {
+                workspaceInstructionCancellationFailureBySession.set(sessionKey, {
+                  sessionEpoch: fencedEntry.receipt.sessionEpoch,
+                  receiptId: fencedEntry.receipt.receiptId,
+                  turnId: fencedEntry.receipt.turnId,
+                  disposition: settlement.disposition,
+                });
+              }
+            }
+            if (settlement.terminalSettled || settlement.queueDisposition === "discard") {
+              runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+              return;
+            }
+            // Reconciliation exhausted without a terminal cancel conclusion.
+            // The fence has been released, so retry the dispatcher in an exact
+            // fail-closed mode that completes the admitted Turn with a visible
+            // error instead of executing it or leaving FIFO silently wedged.
+            runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+          },
+          (error) => {
+            const ownsFence =
+              workspaceInstructionCancellationRedispatchBySession.get(sessionKey) ===
+                pendingCancellation.promise;
+            if (!ownsFence) return;
+            workspaceInstructionCancellationRedispatchBySession.delete(sessionKey);
+            if (fencedEntry) {
+              workspaceInstructionCancellationFailureBySession.set(sessionKey, {
+                sessionEpoch: fencedEntry.receipt.sessionEpoch,
+                receiptId: fencedEntry.receipt.receiptId,
+                turnId: fencedEntry.receipt.turnId,
+                disposition: error instanceof Error ? error.message : String(error),
+              });
+            }
+            logStoreEvent("workspace_instruction_cancellation_fence_retained", {
+              sessionKey,
+              canceledTurnId: pendingCancellation.turnId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+          },
+        );
+      }
+      logStoreEvent("workspace_instruction_dispatch_deferred_for_cancellation", {
+        sessionKey,
+        canceledTurnId: pendingCancellation.turnId,
+        queuedTurnId: queue?.entries[0]?.receipt.turnId || null,
+        phase,
+      });
+      return true;
+    };
+
+    const terminalHead = queue.entries[0];
+    if (terminalHead?.status === "dispatching" && terminalHead.claim) {
+      const turn = state.conversationTurns.find(
+        (candidate) => candidate.id === terminalHead.receipt.turnId,
+      );
+      const hasStartedEvent = state.runtimeEvents.some((event) =>
+        event.type === "run.started" &&
+        event.threadId === sessionKey &&
+        event.turnId === terminalHead.receipt.turnId
+      );
+      const hasTerminalEvent = state.runtimeEvents.some((event) =>
+        (event.type === "turn.completed" || event.type === "turn.failed") &&
+        event.threadId === sessionKey &&
+        event.turnId === terminalHead.receipt.turnId
+      );
+      if (hasStartedEvent || hasTerminalEvent || isConversationTurnRuntimeClosed(turn?.runtimeOutcome)) {
+        const removed = reduceWorkspaceTurnQueue(queue, {
+          ...(hasTerminalEvent || isConversationTurnRuntimeClosed(turn?.runtimeOutcome)
+            ? {
+                type: "remove" as const,
+                terminalOwner: {
+                  sessionKey: queue.sessionKey,
+                  sessionEpoch: queue.sessionEpoch,
+                  turnId: terminalHead.receipt.turnId,
+                },
+              }
+            : {
+                type: "ack" as const,
+                turnOwner: {
+                  sessionKey: queue.sessionKey,
+                  sessionEpoch: queue.sessionEpoch,
+                  turnId: terminalHead.receipt.turnId,
+                },
+              }),
+          expectedVersion: queue.version,
+          at: Date.now(),
+          claimId: terminalHead.claim.claimId,
+          sessionKey: queue.sessionKey,
+          sessionEpoch: queue.sessionEpoch,
+        });
+        if (removed.disposition === "applied") {
+          set({ workspaceTurnQueue: removed.state });
+          get().saveCurrentRuntimeToSession();
+          queue = removed.state;
+          state = get();
+        }
+      }
+    }
+
+    const head = queue.entries[0];
+    if (!head || head.status !== "queued") return false;
+    // A cancel transaction owns the Session until its terminal projection is
+    // durable. Keep the exact FIFO head queued; it must never become a second
+    // owner or fall back to the legacy latest-wins message slot.
+    if (deferDispatchUntilCancellationSettles("before_claim")) return false;
+    const candidateCancellationFailure =
+      workspaceInstructionCancellationFailureBySession.get(sessionKey) || null;
+    const cancellationFailure =
+      candidateCancellationFailure &&
+      candidateCancellationFailure.sessionEpoch === queue.sessionEpoch &&
+      candidateCancellationFailure.receiptId === head.receipt.receiptId &&
+      candidateCancellationFailure.turnId === head.receipt.turnId
+        ? candidateCancellationFailure
+        : null;
+    if (candidateCancellationFailure && !cancellationFailure) {
+      workspaceInstructionCancellationFailureBySession.delete(sessionKey);
+    }
+    if (
+      !cancellationFailure &&
+      state.agentStatus !== "pending_review" &&
+      (state.isGenerating || state.agentStatus === "running")
+    ) {
+      return false;
+    }
+    const projection = reconcileWorkspaceInstructionProjection({
+      entry: head,
+      taskFlow: state.taskFlow,
+      conversationTurns: state.conversationTurns,
+      userContextItems: buildWorkspaceInstructionUserContext({
+        contextMentions: head.instruction.payload.contextMentions
+          ? [...head.instruction.payload.contextMentions]
+          : [],
+        attachedFiles: head.instruction.payload.attachedFiles
+          ? head.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+          : [],
+        images: head.instruction.payload.images
+          ? [...head.instruction.payload.images]
+          : [],
+        workspace: resolveSessionWorkspaceKey(state.currentWorkspace),
+        language: state.config.language === "en" ? "en" : "zh",
+      }),
+      language: state.config.language === "en" ? "en" : "zh",
+    });
+    const projectionConflictReason = projection.disposition === "conflict"
+      ? projection.reason
+      : null;
+    if (projection.disposition === "ready" && projection.changed) {
+      syncTaskIdCounterFromBlocks(projection.taskFlow);
+      set({
+        taskFlow: projection.taskFlow,
+        conversationTurns: projection.conversationTurns,
+        transcriptLoadedTurns: Math.max(
+          state.transcriptLoadedTurns,
+          projection.conversationTurns.length,
+        ),
+        transcriptTotalTurns: Math.max(
+          state.transcriptTotalTurns,
+          projection.conversationTurns.length,
+        ),
+      });
+      state = get();
+      logStoreEvent("workspace_instruction_projection_rebuilt", {
+        sessionKey,
+        sessionEpoch: queue.sessionEpoch,
+        receiptId: head.receipt.receiptId,
+        turnId: head.receipt.turnId,
+        userBlockId: head.receipt.userBlockId,
+      });
+    } else if (projectionConflictReason) {
+      logStoreEvent("workspace_instruction_projection_conflict", {
+        sessionKey,
+        sessionEpoch: queue.sessionEpoch,
+        receiptId: head.receipt.receiptId,
+        turnId: head.receipt.turnId,
+        userBlockId: head.receipt.userBlockId,
+        reason: projectionConflictReason,
+      });
+    }
+    const admittedUserBlock = projection.disposition === "ready"
+      ? projection.userBlock
+      : null;
+
+    const claimId = createWorkspaceRuntimeIdentity("workspace-claim");
+    const claimed = reduceWorkspaceTurnQueue(queue, {
+      type: "claim",
+      expectedVersion: queue.version,
+      at: Date.now(),
+      claimId,
+      sessionKey: queue.sessionKey,
+      sessionEpoch: queue.sessionEpoch,
+    });
+    if (claimed.disposition !== "applied" || !claimed.entry?.claim) return false;
+    set({ workspaceTurnQueue: claimed.state });
+    const exactClaim: WorkspaceInstructionDispatchClaim = {
+      claimId,
+      receiptId: head.receipt.receiptId,
+      clientSubmissionId: head.instruction.clientSubmissionId,
+      sessionKey: queue.sessionKey,
+      sessionEpoch: queue.sessionEpoch,
+      turnId: head.receipt.turnId,
+      admittedUserBlockId: head.receipt.userBlockId,
+    };
+    const hints = head.instruction.payload.dispatchHints || {};
+    const candidateGoalCreation = isGoalCreationAuthorization(hints.goalCreationAuthorization)
+      ? hints.goalCreationAuthorization
+      : null;
+    const candidateGoalContinuation = isGoalContinuationAuthorization(hints.goalContinuationAuthorization)
+      ? hints.goalContinuationAuthorization
+      : null;
+    const visibleGoalSubmissionEnvelope = candidateGoalCreation
+      ? visibleGoalSubmissionAuthorizationBroker.carryValidated({
+          text: head.instruction.payload.text,
+          sessionKey,
+          authorization: candidateGoalCreation,
+        })
+      : undefined;
+    const goalContinuationEnvelope = candidateGoalContinuation
+      ? goalContinuationAuthorizationBroker.issueValidated({
+          text: head.instruction.payload.text,
+          authorization: candidateGoalContinuation,
+        })
+      : undefined;
+    const remoteFeishu = hints.remoteFeishu && typeof hints.remoteFeishu === "object" && !Array.isArray(hints.remoteFeishu)
+      ? hints.remoteFeishu as unknown as FeishuRemoteContext
+      : undefined;
+    const hintedIntent = normalizeWorkspaceInstructionIntentHint(
+      hints.resolvedIntent,
+    ) || undefined;
+    const hintedRuntimeIntent = normalizeWorkspaceInstructionIntentHint(
+      hints.runtimeIntentOverride,
+    ) || undefined;
+    const executionConsentDecision = resolveWorkspaceInstructionExecutionConsent({
+      sessionKey,
+      taskFlow: state.taskFlow,
+      hints,
+      activeActionRequest: state.activeActionRequest,
+    });
+    const pendingReviewActionDecision = state.agentStatus === "pending_review"
+      ? resolveWorkspaceInstructionActionDecision({
+          sessionKey,
+          taskFlow: state.taskFlow,
+          hints,
+          activeActionRequest: state.activeActionRequest,
+        })
+      : { actionDecision: null, reason: "not_requested" as const };
+    const hintedReplyRequestId =
+      hints.replyOptionRequestIdentity &&
+      typeof hints.replyOptionRequestIdentity === "object" &&
+      !Array.isArray(hints.replyOptionRequestIdentity)
+        ? (hints.replyOptionRequestIdentity as WorkspaceJsonObject).requestId
+        : null;
+    if (hints.executionConsentGranted === true && !executionConsentDecision.granted) {
+      logStoreEvent("workspace_instruction_execution_consent_rejected", {
+        sessionKey,
+        turnId: head.receipt.turnId,
+        receiptId: head.receipt.receiptId,
+        reason: executionConsentDecision.reason,
+        requestId: typeof hintedReplyRequestId === "string" ? hintedReplyRequestId : null,
+      });
+    }
+
+    let pendingReviewActionApplied = false;
+    if (
+      !projectionConflictReason &&
+      !cancellationFailure &&
+      pendingReviewActionDecision.actionDecision
+    ) {
+      const current = get();
+      const identity = pendingReviewActionDecision.identity;
+      const pendingResolver = current.pendingReviewResolve;
+      if (pendingResolver) {
+        try {
+          pendingResolver({
+            action: pendingReviewActionDecision.actionDecision === "approve"
+              ? "accept"
+              : "reject",
+          });
+        } catch (error) {
+          logStoreEvent("workspace_instruction_pending_review_resolver_error", {
+            sessionKey,
+            sourceTurnId: identity.turnId,
+            requestId: identity.requestId,
+            actionDecision: pendingReviewActionDecision.actionDecision,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        const selectedText = typeof hints.selectedReplyOptionText === "string"
+          ? hints.selectedReplyOptionText
+          : head.instruction.payload.text;
+        const baseState = pendingReviewActionDecision.actionDecision === "reject"
+          ? (() => {
+              current.abortController?.abort();
+              return projectCanceledTurn({
+                state: current,
+                sessionKey,
+                turnId: identity.turnId,
+                runId: identity.runId,
+                parentRunId: identity.parentRunId,
+                reason: "operation_cancelled",
+                message: current.config.language === "en"
+                  ? "The proposed operation was rejected; the previous turn is now closed."
+                  : "用户已拒绝拟议操作，旧回合已完成收口。",
+                nextTaskId: () => get()._nextTaskId(),
+                nowMs: Date.now(),
+              });
+            })()
+          : { state: current, disposition: "committed" as const };
+        const archived = archiveReplyOptionBlocksForChoice(
+          baseState.state.taskFlow,
+          identity.turnId,
+          selectedText,
+          identity,
+        );
+        if (baseState.disposition !== "ownership_lost") {
+          const actionDecision = pendingReviewActionDecision.actionDecision;
+          set({
+            ...baseState.state,
+            taskFlow: archived.taskFlow,
+            activeActionRequest: null,
+            pendingReviewResolve: null,
+            pendingReviewTaskId: null,
+            pendingToolCall: null,
+            agentStatus: actionDecision === "approve" ? "running" : "idle",
+            isGenerating: actionDecision === "approve",
+            ...(actionDecision === "reject" ? { abortController: null } : {}),
+            conversationTurns: baseState.state.conversationTurns.map((turn) =>
+              turn.id === identity.turnId && turn.pendingOperationProposal
+                ? {
+                    ...turn,
+                    pendingOperationProposal: {
+                      ...turn.pendingOperationProposal,
+                      approvalStatus: actionDecision === "approve"
+                        ? "approved" as const
+                        : "cancelled" as const,
+                      ...(actionDecision === "approve" ? { approvedAt: Date.now() } : {}),
+                    },
+                  }
+                : turn
+            ),
+          });
+          pendingReviewActionApplied = true;
+          logStoreEvent("workspace_instruction_pending_review_action_applied", {
+            sessionKey,
+            sourceTurnId: identity.turnId,
+            admittedTurnId: head.receipt.turnId,
+            requestId: identity.requestId,
+            actionDecision,
+          });
+        }
+      }
+    }
+
+    const started = projectionConflictReason || cancellationFailure
+      ? false
+      : pendingReviewActionDecision.actionDecision
+        ? pendingReviewActionApplied
+      : get().sendMessage(
+      head.instruction.payload.text,
+      head.instruction.payload.images ? [...head.instruction.payload.images] : undefined,
+      {
+        contextMentionsSnapshot: head.instruction.payload.contextMentions
+          ? [...head.instruction.payload.contextMentions]
+          : [],
+        attachedFilesSnapshot: head.instruction.payload.attachedFiles
+          ? head.instruction.payload.attachedFiles.map((file) => ({ ...file }))
+          : [],
+        submissionOriginSessionKey: sessionKey,
+        turnIdOverride: head.receipt.turnId,
+        adoptExistingTurn: true,
+        admittedUserBlockId: admittedUserBlock!.id,
+        workspaceInstructionClaim: exactClaim,
+        suppressGameStudioSuggestion: true,
+        skipAutoPlanHydration: true,
+        ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
+        ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
+        ...(hintedIntent || hints.skipIntentResolution === true
+          ? { skipIntentResolution: true }
+          : {}),
+        ...(typeof hints.turnTitle === "string" ? { turnTitle: hints.turnTitle } : {}),
+        ...(typeof hints.intentSummary === "string" ? { intentSummary: hints.intentSummary } : {}),
+        ...(executionConsentDecision.granted ? { executionConsentGranted: true } : {}),
+        ...(typeof hints.replyOptionSourceTurnId === "string"
+          ? { replyOptionSourceTurnId: hints.replyOptionSourceTurnId }
+          : {}),
+        ...(typeof hints.selectedReplyOptionText === "string"
+          ? { selectedReplyOptionText: hints.selectedReplyOptionText }
+          : {}),
+        ...(hints.replyOptionRequestIdentity && typeof hints.replyOptionRequestIdentity === "object" && !Array.isArray(hints.replyOptionRequestIdentity)
+          ? { replyOptionRequestIdentity: hints.replyOptionRequestIdentity as unknown as UserChoiceResolutionIdentity }
+          : {}),
+        ...(hints.replyOptionIsCustom === true ? { replyOptionIsCustom: true } : {}),
+        ...(typeof hints.parentRunIdOverride === "string"
+          ? { parentRunIdOverride: hints.parentRunIdOverride }
+          : {}),
+        ...(typeof hints.parentPlanTurnId === "string"
+          ? { parentPlanTurnId: hints.parentPlanTurnId }
+          : {}),
+        ...(hints.preservePlanState === true ? { preservePlanState: true } : {}),
+        ...(visibleGoalSubmissionEnvelope ? { visibleGoalSubmissionEnvelope } : {}),
+        ...(goalContinuationEnvelope
+          ? {
+              goalContinuationEnvelope,
+              goalContinuationGuidance: head.instruction.payload.text,
+            }
+          : {}),
+        ...(remoteFeishu ? { remoteFeishu } : {}),
+      },
+    );
+
+    const completeAdmittedTurn = (
+      resultKind: "success" | "error",
+      summary: string,
+    ) => {
+      let completed = false;
+      set((current) => {
+        const activeQueue = current.workspaceTurnQueue;
+        const activeHead = activeQueue?.entries[0];
+        if (
+          !activeQueue ||
+          activeHead?.status !== "dispatching" ||
+          activeHead.claim?.claimId !== claimId ||
+          activeHead.receipt.receiptId !== head.receipt.receiptId
+        ) return {};
+        const existingTerminal = current.runtimeEvents.some((event) =>
+          (event.type === "turn.completed" || event.type === "turn.failed") &&
+          event.threadId === sessionKey &&
+          event.turnId === head.receipt.turnId
+        );
+        // A projection ownership conflict must consume the exact FIFO head even
+        // when corrupt history already contains a lookalike terminal event.
+        // Otherwise every retry would release and reclaim the same poisoned head.
+        if (existingTerminal && !projectionConflictReason) return {};
+        const timestampMs = Date.now();
+        const runId = `run-admission-${head.receipt.turnId}`;
+        const finalBlockId = current._nextTaskId();
+        const removed = reduceWorkspaceTurnQueue(activeQueue, {
+          type: "remove",
+          expectedVersion: activeQueue.version,
+          at: timestampMs,
+          claimId,
+          sessionKey: activeQueue.sessionKey,
+          sessionEpoch: activeQueue.sessionEpoch,
+          terminalOwner: {
+            sessionKey: activeQueue.sessionKey,
+            sessionEpoch: activeQueue.sessionEpoch,
+            turnId: head.receipt.turnId,
+          },
+        });
+        if (removed.disposition !== "applied") return {};
+        completed = true;
+        let runtimeEvents = appendRuntimeEvent(current.runtimeEvents, withEventSchema({
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: head.receipt.turnId,
+          timestampMs,
+          runId,
+          parentRunId: null,
+        }));
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "run.completed",
+          threadId: sessionKey,
+          turnId: head.receipt.turnId,
+          timestampMs,
+          runId,
+          parentRunId: null,
+          resultKind,
+          summary,
+        }));
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "turn.completed",
+          threadId: sessionKey,
+          turnId: head.receipt.turnId,
+          timestampMs,
+          resultKind,
+        }));
+        const ownedTurnExists = current.conversationTurns.some((turn) =>
+          turn.id === head.receipt.turnId &&
+          turn.clientSubmissionId === head.instruction.clientSubmissionId &&
+          turn.workspaceInstructionReceiptId === head.receipt.receiptId
+        );
+        const recoveryPresentationTurnId = ownedTurnExists
+          ? head.receipt.turnId
+          : current.conversationTurns.some((turn) => turn.id === head.receipt.turnId)
+            ? `workspace-recovery-${head.receipt.receiptId}-${timestampMs}`
+            : head.receipt.turnId;
+        const recoveryUserBlockId = ownedTurnExists ? null : current._nextTaskId();
+        const recoveryTurn: ConversationTurn | null = ownedTurnExists
+          ? null
+          : {
+              id: recoveryPresentationTurnId,
+              ...(recoveryPresentationTurnId === head.receipt.turnId
+                ? {
+                    clientSubmissionId: head.instruction.clientSubmissionId,
+                    workspaceInstructionReceiptId: head.receipt.receiptId,
+                    workspaceInstructionSource: head.instruction.source,
+                  }
+                : {}),
+              userPrompt: head.instruction.payload.text,
+              title: normalizeConversationDisplayTitle(
+                head.instruction.payload.text,
+                current.config.language === "en" ? 48 : 40,
+                current.config.language === "en" ? "Workspace instruction" : "工作区指令",
+              ),
+              intentSummary: current.config.language === "en"
+                ? "The durable workspace Turn was closed at a recovery ownership boundary."
+                : "持久化工作区回合已在恢复所有权边界收口。",
+              mode: "chat",
+              intent: "respond",
+              displayIntent: "respond",
+              status: "error",
+              summary,
+              blockIds: [recoveryUserBlockId!, finalBlockId],
+              processCollapsed: false,
+              collapsed: false,
+              createdAt: head.receipt.acceptedAt,
+              runtimeOutcome: {
+                status: "completed",
+                reason: "workspace_instruction_projection_conflict",
+                resultKind: "error",
+                runId,
+                parentRunId: null,
+                updatedAt: timestampMs,
+              },
+            };
+        const nextConversationTurns = recoveryTurn
+          ? [...current.conversationTurns, recoveryTurn]
+          : current.conversationTurns.map((turn) =>
+              turn.id === head.receipt.turnId &&
+                turn.clientSubmissionId === head.instruction.clientSubmissionId &&
+                turn.workspaceInstructionReceiptId === head.receipt.receiptId
+                ? {
+                    ...turn,
+                    status: resultKind === "error" ? "error" as const : "done" as const,
+                    summary,
+                    blockIds: turn.blockIds.includes(finalBlockId)
+                      ? turn.blockIds
+                      : [...turn.blockIds, finalBlockId],
+                    runtimeOutcome: {
+                      status: "completed" as const,
+                      reason: resultKind === "error"
+                        ? "workspace_instruction_dispatch_rejected"
+                        : "workspace_instruction_action_applied",
+                      resultKind,
+                      runId,
+                      parentRunId: null,
+                      updatedAt: timestampMs,
+                    },
+                  }
+                : turn
+            );
+        return {
+          workspaceTurnQueue: removed.state,
+          taskFlow: [
+            ...current.taskFlow,
+            ...(recoveryTurn
+              ? [{
+                  id: recoveryUserBlockId!,
+                  turnId: recoveryPresentationTurnId,
+                  type: "user" as const,
+                  content: head.instruction.payload.text,
+                  ...(head.instruction.payload.images?.length
+                    ? { images: [...head.instruction.payload.images] }
+                    : {}),
+                }]
+              : []),
+            {
+              id: finalBlockId,
+              turnId: recoveryPresentationTurnId,
+              type: "agent" as const,
+              content: summary,
+              streaming: false,
+              visibility: "assistant_final" as const,
+            },
+          ],
+          runtimeEvents,
+          conversationTurns: nextConversationTurns,
+          transcriptLoadedTurns: Math.max(
+            current.transcriptLoadedTurns,
+            nextConversationTurns.length,
+          ),
+          transcriptTotalTurns: Math.max(
+            current.transcriptTotalTurns,
+            nextConversationTurns.length,
+          ),
+        };
+      });
+      if (completed) get().saveCurrentRuntimeToSession();
+      return completed;
+    };
+
+    const acknowledgeAdmittedTurn = () => {
+      let acknowledged = false;
+      set((current) => {
+        const activeQueue = current.workspaceTurnQueue;
+        const activeHead = activeQueue?.entries[0];
+        if (
+          !activeQueue ||
+          activeHead?.status !== "dispatching" ||
+          activeHead.claim?.claimId !== claimId ||
+          activeHead.receipt.receiptId !== head.receipt.receiptId
+        ) return {};
+        const transition = reduceWorkspaceTurnQueue(activeQueue, {
+          type: "ack",
+          expectedVersion: activeQueue.version,
+          at: Date.now(),
+          claimId,
+          sessionKey: activeQueue.sessionKey,
+          sessionEpoch: activeQueue.sessionEpoch,
+          turnOwner: {
+            sessionKey: activeQueue.sessionKey,
+            sessionEpoch: activeQueue.sessionEpoch,
+            turnId: head.receipt.turnId,
+          },
+        });
+        if (transition.disposition !== "applied") return {};
+        acknowledged = true;
+        return { workspaceTurnQueue: transition.state };
+      });
+      if (acknowledged) {
+        get().saveCurrentRuntimeToSession();
+        runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+      }
+      return acknowledged;
+    };
+
+    const releaseAdmittedTurnClaim = () => {
+      let releasedClaim = false;
+      set((current) => {
+        const activeQueue = current.workspaceTurnQueue;
+        const activeHead = activeQueue?.entries[0];
+        if (
+          !activeQueue ||
+          activeHead?.status !== "dispatching" ||
+          activeHead.claim?.claimId !== claimId ||
+          activeHead.receipt.receiptId !== head.receipt.receiptId
+        ) return {};
+        const released = reduceWorkspaceTurnQueue(activeQueue, {
+          type: "release",
+          expectedVersion: activeQueue.version,
+          at: Date.now(),
+          claimId,
+          sessionKey: activeQueue.sessionKey,
+          sessionEpoch: activeQueue.sessionEpoch,
+        });
+        if (released.disposition !== "applied") return {};
+        releasedClaim = true;
+        return { workspaceTurnQueue: released.state };
+      });
+      return releasedClaim;
+    };
+
+    const latest = get();
+    if (!started) {
+      if (getPendingSessionCancellation(sessionKey)) {
+        releaseAdmittedTurnClaim();
+        deferDispatchUntilCancellationSettles("claim_race");
+        return false;
+      }
+      if (cancellationFailure) {
+        const summary = latest.config.language === "en"
+          ? "MAIN could not verify the preceding cancellation terminal state, so this admitted workspace Turn was not executed and was closed with a visible error. Retry creates a new Turn after the Session is reconciled."
+          : "MAIN 无法确认前一回合的取消终态，因此未执行这条已接纳的工作区指令，并已用可见错误结论收口；Session 完成协调后，重试会创建新回合。";
+        logStoreEvent("workspace_instruction_cancellation_fence_failed_closed", {
+          sessionKey,
+          turnId: head.receipt.turnId,
+          receiptId: head.receipt.receiptId,
+          disposition: cancellationFailure.disposition,
+        });
+        if (completeAdmittedTurn("error", summary)) {
+          if (
+            workspaceInstructionCancellationFailureBySession.get(sessionKey) ===
+              cancellationFailure
+          ) {
+            workspaceInstructionCancellationFailureBySession.delete(sessionKey);
+          }
+          runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+          return true;
+        }
+        releaseAdmittedTurnClaim();
+        return false;
+      }
+      const busyRace = latest.isGenerating ||
+        latest.agentStatus === "running" ||
+        latest.agentStatus === "pending_review";
+      if (!busyRace) {
+        const summary = projectionConflictReason
+          ? latest.config.language === "en"
+            ? "MAIN found an ownership conflict while restoring this admitted workspace Turn. It was closed with a visible error without adopting unrelated history."
+            : "MAIN 在恢复这条已接纳的工作区回合时发现所有权冲突；已在不采用无关历史记录的前提下，以可见错误结论收口。"
+          : latest.config.language === "en"
+            ? "MAIN could not start this admitted workspace instruction. The turn was closed with an error; retrying creates a new Turn."
+            : "MAIN 无法启动这条已接纳的工作区指令；本回合已按错误结论收口，重试会创建新的回合。";
+        if (completeAdmittedTurn("error", summary)) return true;
+      }
+      releaseAdmittedTurnClaim();
+      return false;
+    }
+    const postDispatch = get();
+    const adoptedTurnOwnsRuntime = postDispatch.currentTurnId === head.receipt.turnId ||
+      postDispatch.harnessRunMarker?.turnId === head.receipt.turnId;
+    const admittedTurnAlreadyTerminal = postDispatch.runtimeEvents.some((event) =>
+      (event.type === "turn.completed" || event.type === "turn.failed") &&
+      event.threadId === sessionKey &&
+      event.turnId === head.receipt.turnId
+    );
+    if (adoptedTurnOwnsRuntime || admittedTurnAlreadyTerminal) {
+      acknowledgeAdmittedTurn();
+      return true;
+    }
+    if (!adoptedTurnOwnsRuntime && !admittedTurnAlreadyTerminal) {
+      const summary = postDispatch.config.language === "en"
+        ? "The instruction was accepted and applied to the active workflow. Any resulting execution continues in its owning Turn."
+        : "该指令已接纳并应用到当前工作流；由它触发的后续执行将在所属回合中继续。";
+      completeAdmittedTurn("success", summary);
+    }
+    return true;
+  },
   setAgentStatus: (s) => set({ agentStatus: s }),
   resolveReview: (action) => {
     const state = get();
@@ -11417,6 +13619,11 @@ export const useAppStore = create<AppState>()(
       readOnlyAutoApproveForSession: false,
       queuedUserMessage: null,
       activeGuidance: null,
+      workspaceTurnQueue: null,
+      workspaceInstructionLedger: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 0,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
       planTasks: [],
@@ -11528,8 +13735,43 @@ export const useAppStore = create<AppState>()(
     goalContinuationEnvelope?: GoalContinuationEnvelope;
     queuedUserMessageId?: string;
     submissionOriginSessionKey?: string;
+    workspaceInstructionClaim?: WorkspaceInstructionDispatchClaim;
+    adoptExistingTurn?: boolean;
+    admittedUserBlockId?: number;
   }) => {
     let state = get();
+    if (options?.adoptExistingTurn) {
+      const claim = options.workspaceInstructionClaim;
+      const head = state.workspaceTurnQueue?.entries[0];
+      const exactClaimMatches = !!claim &&
+        state.workspaceTurnQueue?.sessionKey === claim.sessionKey &&
+        state.workspaceTurnQueue?.sessionEpoch === claim.sessionEpoch &&
+        head?.status === "dispatching" &&
+        head.claim?.claimId === claim.claimId &&
+        head.receipt.receiptId === claim.receiptId &&
+        head.receipt.turnId === claim.turnId &&
+        head.receipt.userBlockId === claim.admittedUserBlockId &&
+        head.instruction.clientSubmissionId === claim.clientSubmissionId &&
+        options.turnIdOverride === claim.turnId &&
+        options.admittedUserBlockId === claim.admittedUserBlockId;
+      if (!exactClaimMatches) {
+        logStoreEvent("workspace_turn_dispatch_claim_rejected", {
+          expectedSessionKey: claim?.sessionKey || null,
+          activeSessionKey: state.workspaceTurnQueue?.sessionKey || null,
+          expectedTurnId: claim?.turnId || null,
+          activeTurnId: head?.receipt.turnId || null,
+          expectedClaimId: claim?.claimId || null,
+          activeClaimId: head?.claim?.claimId || null,
+        });
+        return false;
+      }
+    } else if (options?.workspaceInstructionClaim) {
+      logStoreEvent("workspace_turn_dispatch_claim_rejected", {
+        reason: "claim_without_adoption",
+        claimId: options.workspaceInstructionClaim.claimId,
+      });
+      return false;
+    }
     const suppliedSubmissionOriginSessionKey = String(
       options?.submissionOriginSessionKey || "",
     ).trim();
@@ -11546,6 +13788,15 @@ export const useAppStore = create<AppState>()(
       currentWorkspaceKey: resolveSessionWorkspaceKey(state.currentWorkspace),
       submissionOriginSessionKey: suppliedSubmissionOriginSessionKey,
     });
+    if (workspaceClearBarrierWorkspace && options?.workspaceInstructionClaim) {
+      logStoreEvent("workspace_turn_dispatch_deferred_for_clear", {
+        workspaceKey: workspaceClearBarrierWorkspace,
+        sessionKey: options.workspaceInstructionClaim.sessionKey,
+        turnId: options.workspaceInstructionClaim.turnId,
+        claimId: options.workspaceInstructionClaim.claimId,
+      });
+      return false;
+    }
     const staleContinuationDuringClear = !!workspaceClearBarrierWorkspace && (
       options?.hidden === true ||
       !!options?.queuedUserMessageId ||
@@ -11575,38 +13826,43 @@ export const useAppStore = create<AppState>()(
       });
       return true;
     }
+    const workspaceClearSubmissionId =
+      `workspace-clear-submission-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let deferredGoalContinuationAuthorization: GoalContinuationAuthorization | null = null;
     const workspaceClearDeferral = deferSubmissionForWorkspaceClear({
       currentWorkspaceKey: resolveSessionWorkspaceKey(state.currentWorkspace),
       submissionOriginSessionKey: suppliedSubmissionOriginSessionKey,
       submission: {
-        id: `workspace-clear-submission-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: workspaceClearSubmissionId,
         targetSessionKey:
           suppliedSubmissionOriginSessionKey &&
           !suppliedSubmissionOriginSessionKey.startsWith("workspace-only:")
             ? suppliedSubmissionOriginSessionKey
             : null,
         createdAt: Date.now(),
-        replay: (outcome) => {
-          // Rebuild a fresh visible submission from user-owned input only.
-          // A successful clear invalidates every old Session capability. A
+        replay: async (outcome) => {
+          // Rebuild a fresh durable Turn from user-owned input only. A
+          // successful clear invalidates every old Session capability. A
           // preserved clear may carry only the exact Goal continuation envelope
-          // so normal validation can accept or reject it for the fresh Turn.
-          const replayOptions = {
-            ...capturedUserContext,
+          // so admission can revalidate it for the new Turn.
+          const acceptance = await get().acceptWorkspaceInstruction({
+            text,
+            ...(capturedImages?.length ? { images: capturedImages } : {}),
+            contextMentions: capturedUserContext.contextMentionsSnapshot,
+            attachedFiles: capturedUserContext.attachedFilesSnapshot,
+            source: options?.remoteFeishu ? "im_adapter" : "replay",
+            clientSubmissionId: workspaceClearSubmissionId,
             ...(options?.remoteFeishu ? { remoteFeishu: options.remoteFeishu } : {}),
-            ...(outcome === "preserved" && suppliedSubmissionOriginSessionKey
-              ? { submissionOriginSessionKey: suppliedSubmissionOriginSessionKey }
-              : {}),
-            ...(outcome === "preserved" && options?.goalContinuationEnvelope
+            ...(outcome === "preserved" && deferredGoalContinuationAuthorization
               ? {
-                  goalContinuationEnvelope: options.goalContinuationEnvelope,
-                  ...(options.goalContinuationGuidance?.trim()
-                    ? { goalContinuationGuidance: options.goalContinuationGuidance.trim() }
-                    : {}),
+                  goalContinuationEnvelope: goalContinuationAuthorizationBroker.issueValidated({
+                    text,
+                    authorization: deferredGoalContinuationAuthorization,
+                  }),
                 }
               : {}),
-          };
-          return get().sendMessage(text, capturedImages, replayOptions);
+          });
+          return acceptance.accepted;
         },
         onDiscard: (reason) => {
           logStoreEvent("workspace_clear_submission_discarded", {
@@ -11614,18 +13870,35 @@ export const useAppStore = create<AppState>()(
             reason,
             textChars: text.length,
           });
+          if (reason === "replay_failed") {
+            void get().acceptWorkspaceInstruction({
+              text,
+              ...(capturedImages?.length ? { images: capturedImages } : {}),
+              contextMentions: capturedUserContext.contextMentionsSnapshot,
+              attachedFiles: capturedUserContext.attachedFilesSnapshot,
+              source: options?.remoteFeishu ? "im_adapter" : "replay",
+              clientSubmissionId: workspaceClearSubmissionId,
+              ...(options?.remoteFeishu ? { remoteFeishu: options.remoteFeishu } : {}),
+              forceVisibleErrorConclusion: "workspace_clear_replay_exhausted",
+            });
+          }
         },
       },
     });
     if (workspaceClearDeferral.deferred) {
+      deferredGoalContinuationAuthorization =
+        goalContinuationAuthorizationBroker.consume({
+          envelope: options?.goalContinuationEnvelope,
+          text,
+        });
       logStoreEvent("workspace_clear_submission_deferred", {
         workspaceKey: workspaceClearDeferral.workspaceKey,
         disposition: workspaceClearDeferral.disposition,
         submissionOriginSessionKey: suppliedSubmissionOriginSessionKey || null,
-        replacedSubmissionId: workspaceClearDeferral.replacedSubmissionId,
+        queuePosition: workspaceClearDeferral.queuePosition,
         textChars: text.length,
         images: capturedImages?.length || 0,
-        queuePolicy: "single_slot_latest_wins",
+        queuePolicy: "strict_fifo",
       });
       return true;
     }
@@ -11651,6 +13924,10 @@ export const useAppStore = create<AppState>()(
       goalContinuationAuthorization?: GoalContinuationAuthorization;
       goalContinuationGuidance?: string;
     };
+    type CancellationSubmissionGate =
+      | "none"
+      | "legacy_deferred"
+      | "workspace_claim_fenced";
     const readCancellationQueuedMessage = (
       candidate: AppState,
     ): QueuedUserMessage | null => normalizeQueuedUserMessage(
@@ -11661,8 +13938,24 @@ export const useAppStore = create<AppState>()(
     const deferCurrentSubmissionForCancellation = (
       replayOptions: typeof options = options,
       queuedWorkflowContext: CancellationQueueContext = {},
-    ): boolean => {
-      if (!getPendingSessionCancellation(submissionOriginSessionKey)) return false;
+    ): CancellationSubmissionGate => {
+      const pendingCancellation = getPendingSessionCancellation(
+        submissionOriginSessionKey,
+      );
+      if (!pendingCancellation) return "none";
+      if (replayOptions?.workspaceInstructionClaim) {
+        // Durable workspace FIFO already owns this exact Turn. Returning false
+        // lets its dispatcher release the claim and retry it after cancel
+        // settlement; copying it into queuedUserMessage would lose identity and
+        // let the dispatcher fabricate a successful completion.
+        logStoreEvent("workspace_turn_dispatch_claim_fenced_by_cancellation", {
+          sessionKey: submissionOriginSessionKey,
+          canceledTurnId: pendingCancellation.turnId,
+          queuedTurnId: replayOptions.workspaceInstructionClaim.turnId,
+          claimId: replayOptions.workspaceInstructionClaim.claimId,
+        });
+        return "workspace_claim_fenced";
+      }
       const replayOptionsWithoutSessionOrigin = replayOptions
         ? { ...replayOptions }
         : undefined;
@@ -11715,7 +14008,7 @@ export const useAppStore = create<AppState>()(
           textChars: text.length,
           images: images?.length || 0,
         });
-        return true;
+        return "legacy_deferred";
       }
 
       const queuedMessageId = queued.id;
@@ -11794,9 +14087,11 @@ export const useAppStore = create<AppState>()(
           decision: "barrier_changed_before_registration",
         });
       }
-      return true;
+      return "legacy_deferred";
     };
-    if (deferCurrentSubmissionForCancellation()) {
+    const entryCancellationGate = deferCurrentSubmissionForCancellation();
+    if (entryCancellationGate !== "none") {
+      if (entryCancellationGate === "workspace_claim_fenced") return false;
       logStoreEvent("send_deferred_for_cancellation_barrier", {
         sessionKey: submissionOriginSessionKey,
         phase: "entry",
@@ -11816,7 +14111,9 @@ export const useAppStore = create<AppState>()(
     });
     if (pendingReviewTransition.aborted) {
       state = pendingReviewTransition.state;
-      if (deferCurrentSubmissionForCancellation()) {
+      const supersededCancellationGate = deferCurrentSubmissionForCancellation();
+      if (supersededCancellationGate !== "none") {
+        if (supersededCancellationGate === "workspace_claim_fenced") return false;
         logStoreEvent("send_deferred_for_cancellation_barrier", {
           sessionKey: submissionOriginSessionKey,
           phase: "pending_review_superseded",
@@ -11867,7 +14164,11 @@ export const useAppStore = create<AppState>()(
           cleanText = parts.slice(1).join(" ");
         }
       }
-      return get().runImageStudioGeneration(cleanText, images);
+      return get().runImageStudioGeneration(
+        cleanText,
+        images,
+        options?.adoptExistingTurn ? options.workspaceInstructionClaim : undefined,
+      );
     }
     const inputEnvelope = buildSubmitInputEnvelope({
       text,
@@ -12061,8 +14362,8 @@ export const useAppStore = create<AppState>()(
     });
     const deferResetSubmissionForCancellation = (
       queuedWorkflowContext?: CancellationQueueContext,
-    ): boolean => {
-      if (!getPendingSessionCancellation(submissionOriginSessionKey)) return false;
+    ): CancellationSubmissionGate => {
+      if (!getPendingSessionCancellation(submissionOriginSessionKey)) return "none";
       return deferCurrentSubmissionForCancellation(options, {
         ...queuedWorkflowContext,
         goalCreationAuthorization:
@@ -12113,10 +14414,12 @@ export const useAppStore = create<AppState>()(
         state,
         earlyGoalQueuedWorkflowContext,
       );
-      if (
-        planResumeSendGateEffect.decision.action.kind === "reset_stuck_state" &&
-        deferResetSubmissionForCancellation(earlyGoalQueuedWorkflowContext)
-      ) {
+      const earlyResetCancellationGate =
+        planResumeSendGateEffect.decision.action.kind === "reset_stuck_state"
+          ? deferResetSubmissionForCancellation(earlyGoalQueuedWorkflowContext)
+          : "none";
+      if (earlyResetCancellationGate !== "none") {
+        if (earlyResetCancellationGate === "workspace_claim_fenced") return false;
         logStoreEvent("send_deferred_for_cancellation_barrier", {
           sessionKey: submissionOriginSessionKey,
           phase: "early_stuck_state_reset",
@@ -12439,10 +14742,12 @@ export const useAppStore = create<AppState>()(
       state,
       sendGateQueuedWorkflowContext,
     );
-    if (
-      sendGateEffect.decision.action.kind === "reset_stuck_state" &&
-      deferResetSubmissionForCancellation(sendGateQueuedWorkflowContext)
-    ) {
+    const resetCancellationGate =
+      sendGateEffect.decision.action.kind === "reset_stuck_state"
+        ? deferResetSubmissionForCancellation(sendGateQueuedWorkflowContext)
+        : "none";
+    if (resetCancellationGate !== "none") {
+      if (resetCancellationGate === "workspace_claim_fenced") return false;
       logStoreEvent("send_deferred_for_cancellation_barrier", {
         sessionKey: submissionOriginSessionKey,
         phase: "stuck_state_reset",
@@ -12534,6 +14839,8 @@ export const useAppStore = create<AppState>()(
       effectiveRunIntent,
       isMainDebugShortcut: !!mainDebugShortcut,
       reuseCurrentTurn,
+      adoptExistingTurn: options?.adoptExistingTurn,
+      admittedUserBlockId: options?.admittedUserBlockId,
       reusableTurnId,
       turnIdOverride: options?.turnIdOverride,
       uiParentTurnId,
@@ -12541,6 +14848,15 @@ export const useAppStore = create<AppState>()(
       sessionScopeKey,
       optionTurnTitle: options?.turnTitle,
     });
+    if (turnDraft.adoptionDecision.kind === "rejected") {
+      logStoreEvent("workspace_turn_adoption_rejected_before_run", {
+        sessionKey: runSessionKey,
+        turnId: options?.turnIdOverride || null,
+        admittedUserBlockId: options?.admittedUserBlockId ?? null,
+        reason: turnDraft.adoptionDecision.reason,
+      });
+      return false;
+    }
     const nextId = turnDraft.nextTaskId;
     const turnId = turnDraft.turnId;
     const uiDisplayTurnId = turnDraft.uiDisplayTurnId;
@@ -12564,6 +14880,8 @@ export const useAppStore = create<AppState>()(
       userContextItems,
       isHidden,
       reuseCurrentTurn,
+      adoptExistingTurn: options?.adoptExistingTurn,
+      admittedUserBlockId: options?.admittedUserBlockId,
       parentPlanTurnId,
       preferredLanguage,
       effectiveRunIntent,
@@ -12593,6 +14911,20 @@ export const useAppStore = create<AppState>()(
       logStoreEvent,
     });
     if (localSlashSubmission.handled) {
+      // Local-fast commands may await workspace metadata before appending their
+      // conclusion. Mark the exact admitted Turn as the live owner immediately
+      // so the FIFO dispatcher cannot mistake the accepted command for a
+      // synchronous ActionDecision and close it ahead of its real result.
+      if (options?.adoptExistingTurn) {
+        sessionSet((current) => ({
+          currentTurnId: turnId,
+          conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
+            turn.id === turnId && !isConversationTurnRuntimeClosed(turn.runtimeOutcome)
+              ? { ...turn, status: "executing" as const }
+              : turn
+          ),
+        }));
+      }
       void localSlashSubmission.completion;
       return true;
     }
@@ -12612,6 +14944,8 @@ export const useAppStore = create<AppState>()(
       currentImages,
       isHidden,
       reuseCurrentTurn,
+      adoptExistingTurn: options?.adoptExistingTurn,
+      admittedUserBlockId: options?.admittedUserBlockId,
       uiParentTurnId,
       parentPlanTurnId,
       isInternalTurn,
@@ -12620,6 +14954,7 @@ export const useAppStore = create<AppState>()(
       currentTurnHasReplyOptions,
       explicitReplyOptionSourceTurnId: !isHidden ? options?.replyOptionSourceTurnId : undefined,
       selectedReplyOptionText: options?.selectedReplyOptionText,
+      submittedChoiceIdentity: !isHidden ? options?.replyOptionRequestIdentity : undefined,
       effectiveRunIntent,
       effectiveDisplayIntent,
       effectiveIntentSummary,
@@ -12634,6 +14969,9 @@ export const useAppStore = create<AppState>()(
       shouldGrantExecutionConsentForTurn,
       requiresPlanExecutionAdmission,
     });
+    if (visibleTurnSubmission.adoptionDecision.kind === "rejected") {
+      return false;
+    }
     const selectedChoiceText = visibleTurnSubmission.selectedChoiceText;
     const markUserContextItemFailed = visibleTurnSubmission.markUserContextItemFailed;
 
@@ -13118,6 +15456,17 @@ export const useAppStore = create<AppState>()(
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
         pendingSlashCommand: normalizedHydratedRuntime?.pendingSlashCommand || null,
+        workspaceTurnQueue: normalizedHydratedRuntime?.workspaceTurnQueue || null,
+        workspaceInstructionLedger: normalizedHydratedRuntime?.workspaceInstructionLedger || [],
+        transcriptPartial: normalizedHydratedRuntime?.transcriptPartial === true,
+        transcriptLoadedTurns: Math.max(
+          0,
+          Number(normalizedHydratedRuntime?.transcriptLoadedTurns) || 0,
+        ),
+        transcriptTotalTurns: Math.max(
+          0,
+          Number(normalizedHydratedRuntime?.transcriptTotalTurns) || 0,
+        ),
         lockedComposerIntent: sanitizeHydratedLockedComposerIntent(
           persistedState.lockedComposerIntent,
         ) as MainIntentShortcut | null,

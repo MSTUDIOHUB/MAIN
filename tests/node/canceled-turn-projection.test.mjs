@@ -163,6 +163,77 @@ test("canceling a running run closes the same run and publishes one visible conc
   assert.equal(result.harnessRunMarker.closeReason, "user_cancelled");
 });
 
+test("canceling a pending user choice archives only its exact capability block", () => {
+  const choiceRequest = {
+    schemaVersion: 1,
+    requestId: "choice-request-1",
+    kind: "user_choice",
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    parentRunId: null,
+    title: "Choose a direction",
+    status: "pending",
+    createdAt: 2,
+    optionValues: ["Continue", "Pause"],
+    allowCustomReply: true,
+  };
+  const staleChoiceRequest = {
+    ...choiceRequest,
+    requestId: "choice-request-stale",
+  };
+  const initial = state({
+    activeActionRequest: choiceRequest,
+    taskFlow: [
+      {
+        id: 1,
+        turnId: "turn-1",
+        type: "agent",
+        content: "Choose the next step.",
+        streaming: false,
+        options: [
+          { label: "Continue", value: "Continue" },
+          { label: "Pause", value: "Pause" },
+        ],
+        choiceRequest,
+      },
+      {
+        id: 2,
+        turnId: "turn-1",
+        type: "agent",
+        content: "Stale choice must remain untouched.",
+        streaming: false,
+        options: [{ label: "Old", value: "Old" }],
+        choiceRequest: staleChoiceRequest,
+      },
+    ],
+    conversationTurns: [turn({ blockIds: [1, 2] })],
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+  });
+
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    reason: "goal_cleared",
+    message: "Goal cleared; turn closed.",
+    nextTaskId: () => 3,
+    nowMs: 10,
+  });
+
+  assert.equal(result.disposition, "committed");
+  assert.equal(result.state.activeActionRequest, null);
+  assert.equal(result.state.taskFlow[0].options, undefined);
+  assert.equal(result.state.taskFlow[0].choiceRequest, undefined);
+  assert.equal(result.state.taskFlow[0].archivedAfterChoice, true);
+  assert.deepEqual(result.state.taskFlow[1].options, [{ label: "Old", value: "Old" }]);
+  assert.equal(result.state.taskFlow[1].choiceRequest.requestId, "choice-request-stale");
+  assert.equal(result.state.conversationTurns[0].status, "done");
+  assert.equal(result.state.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
+});
+
 test("canceling after a paused run creates an aborted child instead of double-terminating the parent", () => {
   const initial = state({
     runtimeEvents: [

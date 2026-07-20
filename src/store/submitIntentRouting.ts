@@ -108,6 +108,35 @@ function looksLikeExecutionIntent(params: {
   );
 }
 
+/**
+ * In a workspace, semantic "respond" remains a valid Turn intent, but it is
+ * never allowed to suppress an independently detected mutation capability.
+ * This is provider- and language-neutral because it consumes the normalized
+ * command directive rather than model wording.
+ */
+export function resolveWorkspaceTurnRuntimeIntent(input: {
+  hasWorkspace: boolean;
+  currentMainModeKey: MainModeKey;
+  shouldExecuteOnceFromReplyOption: boolean;
+  resolution: RunIntentResolution;
+}): ResolvedRunIntent {
+  const mutationSignal = input.hasWorkspace && looksLikeExecutionIntent({
+    shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
+    resolution: input.resolution,
+  });
+  if (
+    mutationSignal &&
+    (input.resolution.intent === "respond" ||
+      input.resolution.intent === "discuss" ||
+      input.resolution.intent === "analyze")
+  ) {
+    return input.currentMainModeKey === "game_studio"
+      ? "studio_workflow"
+      : "execute";
+  }
+  return input.resolution.intent;
+}
+
 function normalizeSubmitPendingDecisionInputKey(input: string): string {
   return String(input || "")
     .replace(/\s+/g, " ")
@@ -304,11 +333,17 @@ export function resolveAndApplySubmitIntentRouting<
           hasPlanArtifacts: input.hasPlanArtifacts,
           planStage: input.planStage,
           isPlanApproved: input.isPlanApproved,
-          previousTurnIntent: input.currentTurnIntent,
-        });
+        previousTurnIntent: input.currentTurnIntent,
+      });
+    const workspaceResolvedIntent = resolveWorkspaceTurnRuntimeIntent({
+      hasWorkspace: input.hasWorkspace,
+      currentMainModeKey: input.currentMainModeKey,
+      shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
+      resolution,
+    });
     effectiveIntentSummary = buildRunIntentSummary({
       input: input.text,
-      intent: resolution.intent,
+      intent: workspaceResolvedIntent,
       language: input.preferredLanguage,
       reason: resolution.reason,
     });
@@ -317,7 +352,9 @@ export function resolveAndApplySubmitIntentRouting<
 
     if (input.hasWorkspace) {
       input.logStoreEvent("workspace_turn_intent_resolved", {
-        intent: resolution.intent,
+        intent: workspaceResolvedIntent,
+        routerIntent: resolution.intent,
+        mutationSurfaceElevated: workspaceResolvedIntent !== resolution.intent,
         riskLevel: resolution.riskLevel,
         confidence: resolution.confidence,
         controlAction: resolution.controlAction ?? null,
@@ -413,7 +450,7 @@ export function resolveAndApplySubmitIntentRouting<
       }
     }
 
-    effectiveRunIntent = resolution.intent;
+    effectiveRunIntent = workspaceResolvedIntent;
   }
 
   const shouldInferCommandDirective = !(

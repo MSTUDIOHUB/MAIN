@@ -2,6 +2,7 @@ import type { AppConfig, Skill } from "../../appTypes";
 import {
   discoverAllMcpTools,
   getMcpToolServerMap,
+  getMcpToolServerUrl,
   setMcpToolServerMap,
   type MCPServer,
   type MCPServerStatusSnapshot,
@@ -24,7 +25,8 @@ import {
   type McpRoutingPriorityMode,
   type ToolCapabilityRegistry,
 } from "../../toolCapabilities";
-import { buildToolDefinitions, type ToolDefinition } from "../../toolSchemas";
+import { buildToolCatalog, type ToolCatalog } from "../../toolCatalog";
+import type { ToolDefinition } from "../../toolSchemas";
 import { UNITY_MCP_STRICT_RETRY_FORCED_TOOLS } from "./unityMcpRuntime";
 
 export interface AgentLoopToolRegistryState {
@@ -36,6 +38,7 @@ export interface AgentLoopToolRegistryState {
   effectivePreferredUnityUrls: string[];
   effectiveUnityMcpToolNameSet: Set<string>;
   routedToolDefinitions: ToolDefinition[];
+  toolCatalog: ToolCatalog;
   toolCapabilityRegistry: ToolCapabilityRegistry;
   webSearchEnabled: boolean;
   knowledgeToolsEnabled: boolean;
@@ -161,11 +164,11 @@ export async function prepareAgentLoopToolRegistry(input: {
       .map((server) => server.url),
   );
   const hiddenGameEngineMcpTools = mcpTools.filter((tool) =>
-    hiddenGameEngineMcpServerUrls.has(mcpToolServerMap[tool.name] || "")
+    hiddenGameEngineMcpServerUrls.has(getMcpToolServerUrl(tool, mcpToolServerMap) || "")
   );
   if (hiddenGameEngineMcpTools.length > 0) {
     mcpTools = mcpTools.filter((tool) =>
-      !hiddenGameEngineMcpServerUrls.has(mcpToolServerMap[tool.name] || "")
+      !hiddenGameEngineMcpServerUrls.has(getMcpToolServerUrl(tool, mcpToolServerMap) || "")
     );
     logAgentEvent("mcp_game_engine_tools_scoped", {
       gameStudioEngineContext,
@@ -233,8 +236,30 @@ export async function prepareAgentLoopToolRegistry(input: {
   mcpTools = annotateUnityEditToolDescriptions(mcpRoutingResult.tools, unityCommandRequested);
   logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
 
+  const toolCatalog = buildToolCatalog({
+    skills,
+    mcpTools,
+    mcpServers: connectedMcpServers,
+    mcpToolServerMap,
+  });
+  mcpTools = toolCatalog.mcpTools;
+  mcpToolServerMap = toolCatalog.mcpToolServerMap;
+  setMcpToolServerMap(mcpToolServerMap);
+  if (toolCatalog.diagnostics.length > 0) {
+    logAgentEvent("tool_catalog_diagnostics", {
+      count: toolCatalog.diagnostics.length,
+      diagnostics: toolCatalog.diagnostics.slice(0, 24).map((diagnostic) => ({
+        code: diagnostic.code,
+        severity: diagnostic.severity,
+        requestedName: diagnostic.requestedName,
+        winner: diagnostic.winner?.canonicalName || null,
+        candidates: diagnostic.candidates.map((candidate) => candidate.canonicalName),
+      })),
+    });
+  }
+
   const knowledgeToolsEnabled = enabledKnowledgeBaseIds.length > 0;
-  let routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) => {
+  let routedToolDefinitions = toolCatalog.toolDefinitions.filter((tool) => {
     if (!webSearchEnabled && WEB_RESEARCH_TOOL_NAMES.has(tool.function.name)) return false;
     if (!knowledgeToolsEnabled && KNOWLEDGE_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
@@ -245,6 +270,7 @@ export async function prepareAgentLoopToolRegistry(input: {
     mcpTools,
     mcpServers: connectedMcpServers,
     mcpToolServerMap,
+    toolCatalog,
     policy: config.toolPermissionPolicy,
   });
   if (subagentDepth > 0) {
@@ -267,13 +293,14 @@ export async function prepareAgentLoopToolRegistry(input: {
       mcpTools,
       mcpServers: connectedMcpServers,
       mcpToolServerMap,
+      toolCatalog,
       policy: config.toolPermissionPolicy,
     });
   }
   const preferredUnityServerUrlSet = new Set(effectivePreferredUnityUrls);
   const preferredUnityMcpToolNameSet = new Set(
     mcpTools
-      .filter((tool) => preferredUnityServerUrlSet.has(mcpToolServerMap[tool.name] || ""))
+      .filter((tool) => preferredUnityServerUrlSet.has(getMcpToolServerUrl(tool, mcpToolServerMap) || ""))
       .map((tool) => tool.name),
   );
   const fallbackUnityMcpToolNameSet = new Set(mcpTools.map((tool) => tool.name));
@@ -290,6 +317,7 @@ export async function prepareAgentLoopToolRegistry(input: {
     effectivePreferredUnityUrls,
     effectiveUnityMcpToolNameSet,
     routedToolDefinitions,
+    toolCatalog,
     toolCapabilityRegistry,
     webSearchEnabled,
     knowledgeToolsEnabled,

@@ -308,12 +308,14 @@ test("Goal deletion clears its exact pending user choice and reply options", asy
       actionKind: snapshot?.activeActionRequestKind,
       replyOptionBlocks: snapshot?.pendingReplyOptionBlocks,
       turnStatus: snapshot?.currentTurnStatus,
+      resultKind: snapshot?.currentTurnResultKind,
     };
   })).toEqual({
     goalId: null,
     actionKind: null,
     replyOptionBlocks: 0,
-    turnStatus: "stopped_no_action",
+    turnStatus: "done",
+    resultKind: "canceled",
   });
 });
 
@@ -357,6 +359,9 @@ test("pausing a Goal cancels only its exact queued continuation", async ({ page 
     source: "goal_manual_resume",
     guidance: "继续修复按钮交互",
   });
+  await expect(page.getByTestId("composer-guidance-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
 
   await page.getByTestId("goal-capsule-trigger").click();
   await page.getByTestId("goal-pause-button").click();
@@ -372,7 +377,7 @@ test("pausing a Goal cancels only its exact queued continuation", async ({ page 
   });
 });
 
-test("a manual Goal resume queued behind a busy run is not misreported as rejected", async ({ page }) => {
+test("a manual Goal resume queued behind a busy run remains paused until its Run lease", async ({ page }) => {
   await page.goto("/?e2eScenario=goal-capsule");
   await page.evaluate(() => (window as any).__CODELY_E2E__?.resumeGoalIntoBusyQueue?.());
 
@@ -384,40 +389,9 @@ test("a manual Goal resume queued behind a busy run is not misreported as reject
       guidance: snapshot?.queuedGoalContinuationGuidance,
     };
   })).toEqual({
-    goalStatus: "active",
+    goalStatus: "paused",
     queuedSource: "goal_manual_resume",
     guidance: "从最近检查点继续执行当前目标 e2e_goal_capsule。",
-  });
-});
-
-test("deleting an unleased Goal continuation pauses its Goal and never injects foreign guidance", async ({ page }) => {
-  await page.goto("/?e2eScenario=goal-capsule");
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.resumeGoalIntoBusyQueue?.());
-
-  await expect.poll(async () => page.evaluate(() => {
-    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-    return {
-      goalStatus: snapshot?.goalStatus,
-      queuedSource: snapshot?.queuedGoalContinuationSource,
-    };
-  })).toEqual({
-    goalStatus: "active",
-    queuedSource: "goal_manual_resume",
-  });
-  await expect(page.getByTestId("composer-guidance-button")).toBeDisabled();
-
-  await page.getByTestId("composer-queued-delete-button").click();
-  await expect.poll(async () => page.evaluate(() => {
-    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-    return {
-      goalStatus: snapshot?.goalStatus,
-      queuedMessage: snapshot?.queuedUserMessage ?? null,
-      activeGuidance: snapshot?.activeGuidance ?? null,
-    };
-  })).toEqual({
-    goalStatus: "paused",
-    queuedMessage: null,
-    activeGuidance: null,
   });
 });
 

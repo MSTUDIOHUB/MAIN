@@ -45,6 +45,7 @@ import {
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
 import { isMcpTool, executeMcpTool, getMcpServerUrl } from "./mcpClient";
+import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import {
   classifyBuiltInTool,
   classifyMcpToolName,
@@ -252,6 +253,7 @@ function buildChatTempSuccessMessage(
 export interface ToolExecutionOptions {
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
+  toolCatalog?: ToolCatalog;
 }
 
 async function prepareExternalLocalReadArgs(
@@ -307,16 +309,69 @@ export async function executeTool(
   sessionKey?: string,
   options: ToolExecutionOptions = {},
 ): Promise<unknown> {
+  let executionName = name;
+  if (options.toolCatalog) {
+    const resolution = options.toolCatalog.lookup(name);
+    if (resolution.status === "ambiguous") {
+      throw new Error(
+        `AMBIGUOUS_TOOL: "${name}" matches ${resolution.candidates.map((entry) => entry.canonicalName).join(", ")}.`,
+      );
+    }
+    if (resolution.status === "unknown") {
+      throw new Error(`UNKNOWN_TOOL: "${name}" is not registered for this Turn.`);
+    }
+    executionName = resolution.entry.executionName;
+    if (resolution.entry.source === "mcp") {
+      if (!resolution.entry.serverUrl) {
+        throw new Error(`MCP server URL not found for tool "${resolution.entry.canonicalName}".`);
+      }
+      return await executeMcpTool(
+        resolution.entry.serverUrl,
+        resolution.entry.executionName,
+        args,
+      );
+    }
+    if (resolution.entry.source === "skill") {
+      if (!resolution.entry.skillId) {
+        throw new Error(
+          `SKILL_IDENTITY_REQUIRED: "${resolution.entry.canonicalName}" has no stable Skill identity.`,
+        );
+      }
+      try {
+        return await invoke<string>("execute_skill", {
+          name: resolution.entry.executionName,
+          skillId: resolution.entry.skillId,
+          packagePath: resolution.entry.packagePath ?? null,
+          entryPoint: resolution.entry.entryPoint ?? null,
+          args,
+        });
+      } catch (err) {
+        const msg = (err as Error).message || String(err);
+        if (msg.includes("not found") || msg.includes("Unknown")) {
+          throw new Error(
+            `Skill tool "${resolution.entry.executionName}" is not registered in the backend. ` +
+            `MAIN currently exposes Tool Skills as function schemas only; real execution needs a built-in tool, MCP tool, or a Rust "execute_skill" handler.`
+          );
+        }
+        throw new Error(`Skill tool "${resolution.entry.executionName}" execution failed: ${msg}`);
+      }
+    }
+  }
+
   // ── MCP tool routing ────────────────────────────────────────
   // If the tool was discovered from an MCP server, forward the call
   // via HTTP JSON-RPC to that server instead of using Tauri IPC.
-  if (isMcpTool(name)) {
+  // Built-ins own their bare names even while legacy callers still rely on
+  // the process-wide MCP map. Turn execution uses the ToolCatalog above.
+  if (!isBuiltInToolName(name) && isMcpTool(name)) {
     const serverUrl = getMcpServerUrl(name);
     if (!serverUrl) {
       throw new Error(`MCP server URL not found for tool "${name}". The server may have been disconnected.`);
     }
     return await executeMcpTool(serverUrl, name, args);
   }
+
+  name = executionName;
 
   const prepared = await prepareExternalLocalReadArgs(name, args, workspace, sessionKey, options);
   args = prepared.args;
@@ -960,22 +1015,14 @@ export async function executeTool(
       });
     }
 
-    // ── Custom skill tools → route to Tauri backend ──────────
+    // Unknown names cannot safely fall through to Skill execution. Tool
+    // Skills are admitted above only after the Turn catalog resolves their
+    // exact package identity.
     default:
-      try {
-        const result = await invoke<string>("execute_skill", { name, args });
-        return result;
-      } catch (err) {
-        // If the Tauri command doesn't exist, provide a clear message
-        const msg = (err as Error).message || String(err);
-        if (msg.includes("not found") || msg.includes("Unknown")) {
-          throw new Error(
-            `Skill tool "${name}" is not registered in the backend. ` +
-            `MAIN currently exposes Tool Skills as function schemas only; real execution needs a built-in tool, MCP tool, or a Rust "execute_skill" handler.`
-          );
-        }
-        throw new Error(`Skill tool "${name}" execution failed: ${msg}`);
-      }
+      throw new Error(
+        `UNKNOWN_TOOL: "${name}" is not a built-in or MCP tool. ` +
+        "Tool Skills require an exact ToolCatalog identity.",
+      );
   }
 }
 
@@ -985,6 +1032,8 @@ export async function executeTool(
  * can refine this default classification.
  */
 export function isReadOnlyTool(name: string): boolean {
-  const risk = isMcpTool(name) ? classifyMcpToolName(name) : classifyBuiltInTool(name);
+  const risk = !isBuiltInToolName(name) && isMcpTool(name)
+    ? classifyMcpToolName(name)
+    : classifyBuiltInTool(name);
   return isRiskAutoExecutable(risk);
 }

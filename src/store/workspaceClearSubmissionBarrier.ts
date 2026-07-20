@@ -11,13 +11,13 @@ export interface WorkspaceClearDeferredSubmission {
   /** Exact pre-clear Session owner, when the submission came from one. */
   targetSessionKey: string | null;
   createdAt: number;
-  replay: (outcome: WorkspaceClearSettlementOutcome) => boolean;
-  onDiscard?: (reason: "replaced" | "workspace_removed" | "settings_reset") => void;
+  replay: (outcome: WorkspaceClearSettlementOutcome) => boolean | Promise<boolean>;
+  onDiscard?: (reason: "workspace_removed" | "settings_reset" | "replay_failed") => void;
 }
 
 interface ActiveWorkspaceClearBarrier {
   generations: Set<number>;
-  pending: WorkspaceClearDeferredSubmission | null;
+  pending: WorkspaceClearDeferredSubmission[];
   clearedObserved: boolean;
 }
 
@@ -27,7 +27,7 @@ export interface DeferredWorkspaceClearSubmission extends WorkspaceClearDeferred
 
 let nextBarrierGeneration = 0;
 const activeBarriers = new Map<string, ActiveWorkspaceClearBarrier>();
-const settledSubmissions = new Map<string, DeferredWorkspaceClearSubmission>();
+const settledSubmissions = new Map<string, DeferredWorkspaceClearSubmission[]>();
 
 function normalizeWorkspaceKey(value: unknown): string {
   return String(value || "").trim();
@@ -44,7 +44,7 @@ function sessionKeyBelongsToWorkspace(sessionKey: string, workspaceKey: string):
 
 function discardSubmission(
   submission: WorkspaceClearDeferredSubmission,
-  reason: "replaced" | "workspace_removed" | "settings_reset",
+  reason: "workspace_removed" | "settings_reset" | "replay_failed",
 ): void {
   try {
     submission.onDiscard?.(reason);
@@ -77,13 +77,17 @@ export function beginWorkspaceClearSubmissionBarrier(
   const workspaceKey = normalizeWorkspaceKey(workspaceKeyInput);
   const generation = ++nextBarrierGeneration;
   const existing = activeBarriers.get(workspaceKey);
-  const previouslySettled = settledSubmissions.get(workspaceKey) || null;
-  if (previouslySettled) settledSubmissions.delete(workspaceKey);
+  const previouslySettled = settledSubmissions.get(workspaceKey) || [];
+  if (previouslySettled.length > 0) settledSubmissions.delete(workspaceKey);
   activeBarriers.set(workspaceKey, {
     generations: new Set([...(existing?.generations || []), generation]),
-    pending: existing?.pending || previouslySettled || null,
+    pending: [
+      ...previouslySettled,
+      ...(existing?.pending || []),
+    ],
     clearedObserved:
-      existing?.clearedObserved === true || previouslySettled?.outcome === "cleared",
+      existing?.clearedObserved === true ||
+      previouslySettled.some((submission) => submission.outcome === "cleared"),
   });
   return { workspaceKey, generation };
 }
@@ -94,8 +98,8 @@ export function isWorkspaceClearSubmissionBarrierActive(workspaceKeyInput: strin
 }
 
 /**
- * A clear fence owns one explicit bounded slot per workspace. New input wins,
- * and callers must surface/log the replaced id so the policy is never silent.
+ * A clear fence owns a strict FIFO per workspace. Every accepted submission is
+ * retained in arrival order until the final nested clear generation settles.
  */
 export function deferSubmissionForWorkspaceClear(input: {
   currentWorkspaceKey: string;
@@ -106,30 +110,28 @@ export function deferSubmissionForWorkspaceClear(input: {
   | {
       deferred: true;
       workspaceKey: string;
-      disposition: "queued" | "replaced";
-      replacedSubmissionId: string | null;
+      disposition: "queued";
+      queuePosition: number;
     } {
   const workspaceKey = resolveWorkspaceClearBarrierForSubmission(input);
   if (!workspaceKey) return { deferred: false };
   const barrier = activeBarriers.get(workspaceKey);
   if (!barrier) return { deferred: false };
-  const previous = barrier.pending;
-  if (previous) discardSubmission(previous, "replaced");
-  barrier.pending = {
+  barrier.pending.push({
     ...input.submission,
     workspaceKey,
-  };
+  });
   return {
     deferred: true,
     workspaceKey,
-    disposition: previous ? "replaced" : "queued",
-    replacedSubmissionId: previous?.id || null,
+    disposition: "queued",
+    queuePosition: barrier.pending.length,
   };
 }
 
 /**
- * Release one clear generation. The final generation moves its latest payload
- * to a settled queue; replay remains separately gated by workspace activation.
+ * Release one clear generation. The final generation moves every pending
+ * payload to the settled FIFO; replay remains gated by workspace activation.
  */
 export function settleWorkspaceClearSubmissionBarrier(input: {
   token: WorkspaceClearBarrierToken;
@@ -144,22 +146,23 @@ export function settleWorkspaceClearSubmissionBarrier(input: {
   }
   if (input.outcome === "cleared") barrier.clearedObserved = true;
   if (barrier.generations.size > 0) {
-    return { settled: false, pendingReplay: !!barrier.pending };
+    return { settled: false, pendingReplay: barrier.pending.length > 0 };
   }
   activeBarriers.delete(workspaceKey);
-  if (barrier.pending) {
-    settledSubmissions.set(workspaceKey, {
-      ...barrier.pending,
-      outcome: barrier.clearedObserved ? "cleared" : "preserved",
-    });
+  if (barrier.pending.length > 0) {
+    const outcome = barrier.clearedObserved ? "cleared" : "preserved";
+    settledSubmissions.set(
+      workspaceKey,
+      barrier.pending.map((submission) => ({ ...submission, outcome })),
+    );
   }
-  return { settled: true, pendingReplay: !!barrier.pending };
+  return { settled: true, pendingReplay: barrier.pending.length > 0 };
 }
 
 export function peekSettledWorkspaceClearSubmission(
   workspaceKeyInput: string,
 ): DeferredWorkspaceClearSubmission | null {
-  return settledSubmissions.get(normalizeWorkspaceKey(workspaceKeyInput)) || null;
+  return settledSubmissions.get(normalizeWorkspaceKey(workspaceKeyInput))?.[0] || null;
 }
 
 /** Remove-before-replay gives exact-once invocation even if replay re-enters sendMessage. */
@@ -170,19 +173,21 @@ export function takeSettledWorkspaceClearSubmission(input: {
   const workspaceKey = normalizeWorkspaceKey(input.workspaceKey);
   if (activeBarriers.has(workspaceKey)) return null;
   const pending = settledSubmissions.get(workspaceKey);
-  if (!pending) return null;
+  const head = pending?.[0];
+  if (!pending || !head) return null;
   if (
-    pending.outcome === "preserved" &&
-    pending.targetSessionKey &&
-    pending.targetSessionKey !== input.activeSessionKey
+    head.outcome === "preserved" &&
+    head.targetSessionKey &&
+    head.targetSessionKey !== input.activeSessionKey
   ) {
     return null;
   }
-  settledSubmissions.delete(workspaceKey);
-  return pending;
+  pending.shift();
+  if (pending.length === 0) settledSubmissions.delete(workspaceKey);
+  return head;
 }
 
-/** Retain an invocation that could not be accepted without overwriting newer input. */
+/** Restore a failed head before all later submissions so retries cannot overtake it. */
 export function restoreSettledWorkspaceClearSubmission(
   submission: DeferredWorkspaceClearSubmission,
 ): boolean {
@@ -190,13 +195,14 @@ export function restoreSettledWorkspaceClearSubmission(
   if (!workspaceKey) return false;
   const activeBarrier = activeBarriers.get(workspaceKey);
   if (activeBarrier) {
-    if (activeBarrier.pending) return false;
-    activeBarrier.pending = submission;
+    if (activeBarrier.pending.some((pending) => pending.id === submission.id)) return false;
+    activeBarrier.pending.unshift(submission);
     if (submission.outcome === "cleared") activeBarrier.clearedObserved = true;
     return true;
   }
-  if (settledSubmissions.has(workspaceKey)) return false;
-  settledSubmissions.set(workspaceKey, submission);
+  const settled = settledSubmissions.get(workspaceKey) || [];
+  if (settled.some((pending) => pending.id === submission.id)) return false;
+  settledSubmissions.set(workspaceKey, [submission, ...settled]);
   return true;
 }
 
@@ -214,8 +220,8 @@ export function discardWorkspaceClearSubmissionState(
   if (!active && !settled) return false;
   activeBarriers.delete(workspaceKey);
   settledSubmissions.delete(workspaceKey);
-  if (active?.pending) discardSubmission(active.pending, reason);
-  if (settled) discardSubmission(settled, reason);
+  active?.pending.forEach((submission) => discardSubmission(submission, reason));
+  settled?.forEach((submission) => discardSubmission(submission, reason));
   return true;
 }
 
@@ -226,9 +232,8 @@ export function discardAllWorkspaceClearSubmissionStateForSettingsReset(): numbe
     ...settledSubmissions.keys(),
   ]);
   const activePending = [...activeBarriers.values()]
-    .map((barrier) => barrier.pending)
-    .filter((submission): submission is WorkspaceClearDeferredSubmission => !!submission);
-  const settledPending = [...settledSubmissions.values()];
+    .flatMap((barrier) => barrier.pending);
+  const settledPending = [...settledSubmissions.values()].flat();
   activeBarriers.clear();
   settledSubmissions.clear();
   activePending.forEach((submission) => discardSubmission(submission, "settings_reset"));

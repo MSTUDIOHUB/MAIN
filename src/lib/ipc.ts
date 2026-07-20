@@ -2,7 +2,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { createProjectSessionMutationCoordinator } from "./projectSessionMutationCoordinator";
+import {
+  createProjectSessionMutationCoordinator,
+  isProjectSessionAdmissionProjectionOwned,
+  type ProjectSessionSaveOptions,
+} from "./projectSessionMutationCoordinator";
 
 const projectSessionMutations = createProjectSessionMutationCoordinator();
 
@@ -927,11 +931,24 @@ export function rebuildProjectSessionsIndex(workspace: string): Promise<any[]> {
   return invoke<any[]>("rebuild_project_sessions_index", { workspace });
 }
 
-export function saveProjectSession(workspace: string, session: any): Promise<any> {
+export function saveProjectSession(
+  workspace: string,
+  session: any,
+  options?: ProjectSessionSaveOptions & { allowPersistingWorkspaceReceiptId?: string },
+): Promise<any> {
   const sessionId = String(session?.id ?? "unknown");
   const ownerKey = `${workspace}\u0000${sessionId}`;
-  return projectSessionMutations.save(ownerKey, () =>
-    invoke<any>("save_project_session", { workspace, session })
+  const isCurrent = () => (
+    isProjectSessionAdmissionProjectionOwned(
+      session,
+      options?.allowPersistingWorkspaceReceiptId,
+    ) &&
+    (options?.isCurrent ? options.isCurrent() : true)
+  );
+  return projectSessionMutations.save(
+    ownerKey,
+    () => invoke<any>("save_project_session", { workspace, session }),
+    { isCurrent },
   );
 }
 

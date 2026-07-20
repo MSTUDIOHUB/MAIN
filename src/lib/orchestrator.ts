@@ -24,6 +24,7 @@ import {
   type StreamResult,
 } from "./streaming";
 import { type ToolDefinition } from "./toolSchemas";
+import type { ToolCatalog } from "./toolCatalog";
 import { executeTool } from "./toolExecutor";
 import { computeContextTokenBreakdown, estimateMessagesTokens, estimateTokens, manageContext, type TrimMessage } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
@@ -3481,6 +3482,7 @@ interface ExecuteToolLifecycleOptions {
   turnContext?: TurnInputContextSignals;
   recentPlanToolActivity?: PlanToolActivitySummary[];
   attemptedPlanWriteTargets?: string[];
+  toolCatalog?: ToolCatalog;
 }
 
 const SCOPED_READ_FAN_OUT_TOOLS = new Set([
@@ -3657,6 +3659,7 @@ async function executeScopedReadFanOutWithLifecycle(input: {
         {
           allowExternalLocalRead: options.allowExternalLocalRead === true,
           shellPermissionApproval: options.shellPermissionApproval,
+          toolCatalog: options.toolCatalog,
         },
       );
       const content = typeof value === "string" ? value : JSON.stringify(value);
@@ -4049,6 +4052,7 @@ async function executeToolCallWithLifecycle(
       : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
             allowExternalLocalRead: options.allowExternalLocalRead === true,
             shellPermissionApproval: options.shellPermissionApproval,
+            toolCatalog: options.toolCatalog,
           });
     let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 
@@ -4761,7 +4765,7 @@ export async function executeReadOnlyToolsConcurrently(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog"> = {},
 ): Promise<ToolExecutionResult[]> {
   const promises = toolCalls.map(tc =>
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
@@ -4771,6 +4775,7 @@ export async function executeReadOnlyToolsConcurrently(
       turnContext: options.turnContext,
       recentPlanToolActivity: options.recentPlanToolActivity,
       attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
+      toolCatalog: options.toolCatalog,
     }),
   );
   return Promise.all(promises);
@@ -4784,6 +4789,7 @@ export async function executeLocalFileReadToolWithReview(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
+  options: Pick<ExecuteToolLifecycleOptions, "toolCatalog"> = {},
 ): Promise<ToolExecutionResult> {
   const target = getToolTarget(tc.name, toolArgs);
 
@@ -4820,7 +4826,7 @@ export async function executeLocalFileReadToolWithReview(
       callbacks,
       allTools,
       hooksConfig,
-      { allowExternalLocalRead },
+      { allowExternalLocalRead, toolCatalog: options.toolCatalog },
     );
   }
 
@@ -5231,7 +5237,7 @@ export async function executeWriteToolWithReview(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> & { skipUserReview?: boolean } = {},
+  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog"> & { skipUserReview?: boolean } = {},
 ): Promise<ToolExecutionResult> {
   let toolArgs: Record<string, unknown>;
   try {
@@ -5370,6 +5376,7 @@ export async function executeWriteToolWithReview(
         turnContext: options.turnContext,
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
+        toolCatalog: options.toolCatalog,
       },
     );
   }
@@ -5428,6 +5435,7 @@ export async function executeWriteToolWithReview(
         turnContext: options.turnContext,
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
+        toolCatalog: options.toolCatalog,
       },
     );
     return execution;

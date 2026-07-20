@@ -49,7 +49,10 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { resolveAndApplySubmitIntentRouting } = loadTranspiledModuleSync(
+const {
+  resolveAndApplySubmitIntentRouting,
+  resolveWorkspaceTurnRuntimeIntent,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitIntentRouting.ts"),
 );
 
@@ -215,6 +218,38 @@ test("workspace submissions continue into Turn creation without pre-turn intent 
   assert.deepEqual(harness.calls.preRunPatches, []);
   assert.deepEqual(harness.calls.preflights, []);
   assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
+});
+
+test("workspace mutation directives reopen execution even when semantic intent says respond", () => {
+  const resolution = {
+    intent: "respond",
+    reason: "router classified this as ordinary conversation",
+    confidence: 0.4,
+    riskLevel: "low",
+    commandDirective: {
+      kind: "file_modify",
+      action: "update",
+      target: "src/App.tsx",
+      source: "natural_language",
+      requiresWorkspace: true,
+      requiresApproval: true,
+      confidence: 0.9,
+      reason: "normalized mutation directive",
+    },
+  };
+
+  assert.equal(resolveWorkspaceTurnRuntimeIntent({
+    hasWorkspace: true,
+    currentMainModeKey: "main_mode",
+    shouldExecuteOnceFromReplyOption: false,
+    resolution,
+  }), "execute");
+  assert.equal(resolveWorkspaceTurnRuntimeIntent({
+    hasWorkspace: false,
+    currentMainModeKey: "main_mode",
+    shouldExecuteOnceFromReplyOption: false,
+    resolution,
+  }), "respond");
 });
 
 test("complex workspace submissions enter Plan without a pre-turn decision", () => {

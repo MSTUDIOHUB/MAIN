@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  archiveConsumedReplyOptionsFromTaskFlow,
   buildSubmitBlockingPreflightEffect,
   buildSubmitHarnessRunMarkerDraft,
   buildSubmitInputEnvelope,
@@ -680,6 +681,18 @@ test("visible Goal submission envelope is exact, session-bound, expiring, and on
     sessionKey: "workspace::1",
   }), null);
 
+  assert.equal(broker.restoreConsumed({
+    envelope,
+    text: "keep fixing until verified",
+    sessionKey: "workspace::1",
+    authorization: createGoalCreationAuthorization("visible_goal_composer_capsule"),
+  }), true);
+  assert.deepEqual(broker.consume({
+    envelope,
+    text: "keep fixing until verified",
+    sessionKey: "workspace::1",
+  }), createGoalCreationAuthorization("visible_goal_composer_capsule"));
+
   const mismatched = broker.capture({
     text: "/goal exact request",
     sessionKey: "workspace::1",
@@ -774,6 +787,24 @@ test("Goal continuation envelope is one-shot and exact-text bound", () => {
     envelope,
     text: "resume exact goal",
   }), null);
+
+  const retryEnvelope = broker.issueValidated({
+    text: "resume exact goal",
+    authorization,
+  });
+  assert.deepEqual(broker.consume({
+    envelope: retryEnvelope,
+    text: "resume exact goal",
+  }), authorization);
+  assert.equal(broker.restoreConsumed({
+    envelope: retryEnvelope,
+    text: "resume exact goal",
+    authorization,
+  }), true);
+  assert.deepEqual(broker.consume({
+    envelope: retryEnvelope,
+    text: "resume exact goal",
+  }), authorization);
 });
 
 test("Goal continuation authorization rejects Goal replacement deletion and session races", () => {
@@ -2002,6 +2033,83 @@ test("visible turn patch archives selected reply options and appends a new user 
   assert.equal(patch.conversationTurns[0].collapsed, true);
   assert.equal(patch.conversationTurns[1].id, "turn-2");
   assert.deepEqual(patch.conversationTurns[1].blockIds, [8]);
+});
+
+test("visible turn patch archives only the submitted choice identity when old and new requests share a Turn", () => {
+  const oldIdentity = {
+    sessionKey: "session-1",
+    turnId: "turn-choice",
+    runId: "run-old",
+    requestId: "request-old",
+    parentRunId: null,
+    optionValues: ["Run once"],
+    allowCustomReply: false,
+    status: "pending",
+  };
+  const newIdentity = {
+    ...oldIdentity,
+    runId: "run-new",
+    requestId: "request-new",
+  };
+  const oldChoiceBlock = {
+    id: 21,
+    turnId: "turn-choice",
+    type: "agent",
+    content: "Run the old request?",
+    options: [{ label: "Run once", value: "Run once", action: "execute_once" }],
+    choiceRequest: oldIdentity,
+  };
+  const newChoiceBlock = {
+    ...oldChoiceBlock,
+    id: 22,
+    content: "Run the new request?",
+    choiceRequest: newIdentity,
+  };
+  const patch = buildSubmitVisibleTurnPatch({
+    taskFlow: [oldChoiceBlock, newChoiceBlock],
+    conversationTurns: [turn({
+      id: "turn-choice",
+      blockIds: [21, 22],
+      status: "awaiting_input",
+    })],
+    text: "Run once",
+    turnId: "turn-result",
+    userBlockId: 23,
+    isHidden: false,
+    reuseCurrentTurn: false,
+    parentPlanTurnDoneSummary: "done",
+    isInternalTurn: false,
+    shouldExplicitlyReuseCurrentTurn: false,
+    shouldAutoResumeChoiceTurn: false,
+    currentTurnHasReplyOptions: false,
+    explicitReplyOptionSourceTurnId: "turn-choice",
+    selectedReplyOptionText: "Run once",
+    submittedChoiceIdentity: oldIdentity,
+    effectiveRunIntent: "execute",
+    effectiveDisplayIntent: "execute",
+    effectiveIntentSummary: "Execute: Run once",
+    effectiveCommandDirective: null,
+    effectiveWorkflowMode: "edit",
+    initialTurnStatus: "executing",
+    turnTitle: "Run once",
+    createdAtMs: 124,
+  });
+
+  assert.equal(patch.archiveSummary.optionBlocks, 1);
+  assert.equal(patch.archiveSummary.archivedOptionBlocks, 1);
+  assert.equal(patch.taskFlow[0].archivedAfterChoice, true);
+  assert.equal(patch.taskFlow[0].choiceRequest, undefined);
+  assert.equal(patch.taskFlow[1], newChoiceBlock);
+  assert.equal(patch.taskFlow[1].archivedAfterChoice, undefined);
+  assert.equal(patch.taskFlow[1].choiceRequest.requestId, "request-new");
+
+  const normalized = archiveConsumedReplyOptionsFromTaskFlow([
+    oldChoiceBlock,
+    newChoiceBlock,
+    { id: 24, turnId: "turn-choice", type: "user", content: "Run once" },
+  ]);
+  assert.equal(normalized[0], oldChoiceBlock);
+  assert.equal(normalized[1], newChoiceBlock);
 });
 
 test("visible turn patch appends user blocks to reused turns without duplicating ids", () => {

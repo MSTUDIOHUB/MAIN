@@ -24,8 +24,45 @@ export class ProjectSessionWorkspaceClearFencedError extends Error {
   }
 }
 
+export class ProjectSessionStaleWriteFencedError extends Error {
+  readonly code = "project_session_stale_write_fenced";
+
+  constructor() {
+    super("Project Session persistence was superseded by a newer runtime revision.");
+    this.name = "ProjectSessionStaleWriteFencedError";
+  }
+}
+
+export interface ProjectSessionSaveOptions {
+  /**
+   * Evaluated only after this owner reaches the head of its mutation queue.
+   * This closes the gap where a newer runtime revision is published while an
+   * older debounced save is waiting behind another durable mutation.
+   */
+  isCurrent?: () => boolean;
+}
+
+/**
+ * A `persisting` queue entry is an uncommitted admission projection. Only the
+ * exact admission transaction that owns its receipt may serialize it; every
+ * generic autosave/Goal/session mutation must wait for a later clean snapshot.
+ */
+export function isProjectSessionAdmissionProjectionOwned(
+  session: unknown,
+  allowedReceiptId?: string,
+): boolean {
+  const entries = (session as any)?.runtimeSnapshot?.workspaceTurnQueue?.entries;
+  if (!Array.isArray(entries)) return true;
+  const persisting = entries.filter((entry: any) => entry?.status === "persisting");
+  if (persisting.length === 0) return true;
+  const exactReceiptId = String(allowedReceiptId || "").trim();
+  return !!exactReceiptId &&
+    persisting.length === 1 &&
+    persisting[0]?.receipt?.receiptId === exactReceiptId;
+}
+
 export interface ProjectSessionMutationCoordinator {
-  save<T>(ownerKey: string, task: () => Promise<T>): Promise<T>;
+  save<T>(ownerKey: string, task: () => Promise<T>, options?: ProjectSessionSaveOptions): Promise<T>;
   delete<T>(ownerKey: string, task: () => Promise<T>): Promise<T>;
   clear<T>(workspaceKey: string, ownerKeys: readonly string[], task: () => Promise<T>): Promise<T>;
   isDeleteFenced(ownerKey: string): boolean;
@@ -105,7 +142,11 @@ export function createProjectSessionMutationCoordinator(
   };
 
   return {
-    save<T>(ownerKey: string, task: () => Promise<T>): Promise<T> {
+    save<T>(
+      ownerKey: string,
+      task: () => Promise<T>,
+      options: ProjectSessionSaveOptions = {},
+    ): Promise<T> {
       const normalizedOwnerKey = normalizeOwnerKey(ownerKey);
       const workspaceKey = resolveOwnerWorkspaceKey(normalizedOwnerKey);
       rememberOwner(workspaceKey, normalizedOwnerKey);
@@ -121,6 +162,9 @@ export function createProjectSessionMutationCoordinator(
         }
         if (hasOwnerFence(normalizedOwnerKey)) {
           throw new ProjectSessionDeleteFencedError();
+        }
+        if (options.isCurrent && !options.isCurrent()) {
+          throw new ProjectSessionStaleWriteFencedError();
         }
         return task();
       });

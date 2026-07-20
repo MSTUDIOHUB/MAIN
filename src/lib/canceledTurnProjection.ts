@@ -1,4 +1,7 @@
-import type { ActionRequest } from "./actionRequest";
+import {
+  isExactUserChoiceResolutionIdentity,
+  type ActionRequest,
+} from "./actionRequest";
 import { getHarnessActionRunId, type HarnessRunMarker } from "./harnessCrashTelemetry";
 import type { TaskBlock } from "./taskTypes";
 import {
@@ -179,7 +182,36 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     resultKind: "canceled",
   }));
 
-  const existingFinal = [...input.state.taskFlow].reverse().find((block) =>
+  const ownedUserChoiceRequest = ownsActionRequest && actionRequest?.kind === "user_choice"
+    ? actionRequest
+    : null;
+  const archivedTaskFlow = ownedUserChoiceRequest
+    ? input.state.taskFlow.map((block) => {
+        if (
+          block.type !== "agent" ||
+          !Array.isArray(block.options) ||
+          block.options.length === 0 ||
+          !isExactUserChoiceResolutionIdentity(block.choiceRequest, ownedUserChoiceRequest)
+        ) {
+          return block;
+        }
+        const archivesProposal = block.options.some((option) =>
+          option.action === "approve_operation_once" ||
+          option.action === "execute_once" ||
+          option.source === "proposal_follow_up" ||
+          option.source === "operation_approval"
+        );
+        return {
+          ...block,
+          options: undefined,
+          choiceRequest: undefined,
+          archivedAfterChoice: true,
+          ...(archivesProposal ? { archivedProposal: true } : {}),
+        };
+      })
+    : input.state.taskFlow;
+
+  const existingFinal = [...archivedTaskFlow].reverse().find((block) =>
     block.type === "agent" &&
     block.visibility === "assistant_final" &&
     !!block.turnId &&
@@ -187,7 +219,7 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
   );
   const finalBlockId = existingFinal?.id ?? input.nextTaskId();
   let foundFinal = false;
-  let taskFlow = input.state.taskFlow.map((block) => {
+  let taskFlow = archivedTaskFlow.map((block) => {
     if (block.id === finalBlockId && block.type === "agent") {
       foundFinal = true;
       return {

@@ -161,7 +161,7 @@ test("IPC bulk clear is routed through the workspace mutation coordinator", () =
   assert.match(body, /invoke<void>\("clear_project_sessions"/);
 });
 
-test("workspace clear barrier is latest-wins, owner-aware, and monotonic across nested clears", () => {
+test("workspace clear barrier is strict FIFO, owner-aware, and monotonic across nested clears", () => {
   const barrier = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/workspaceClearSubmissionBarrier.ts"),
   );
@@ -185,7 +185,7 @@ test("workspace clear barrier is latest-wins, owner-aware, and monotonic across 
     deferred: true,
     workspaceKey: workspace,
     disposition: "queued",
-    replacedSubmissionId: null,
+    queuePosition: 1,
   });
   assert.deepEqual(barrier.deferSubmissionForWorkspaceClear({
     currentWorkspaceKey: "/another-workspace",
@@ -199,10 +199,10 @@ test("workspace clear barrier is latest-wins, owner-aware, and monotonic across 
   }), {
     deferred: true,
     workspaceKey: workspace,
-    disposition: "replaced",
-    replacedSubmissionId: "submission-first",
+    disposition: "queued",
+    queuePosition: 2,
   });
-  assert.deepEqual(discarded, [["first", "replaced"]]);
+  assert.deepEqual(discarded, []);
   assert.deepEqual(barrier.settleWorkspaceClearSubmissionBarrier({
     token: first,
     outcome: "cleared",
@@ -212,13 +212,26 @@ test("workspace clear barrier is latest-wins, owner-aware, and monotonic across 
     outcome: "preserved",
   }), { settled: true, pendingReplay: true });
   assert.equal(barrier.peekSettledWorkspaceClearSubmission(workspace).outcome, "cleared");
-  const pending = barrier.takeSettledWorkspaceClearSubmission({
+  const firstPending = barrier.takeSettledWorkspaceClearSubmission({
     workspaceKey: workspace,
     activeSessionKey: null,
   });
-  assert.equal(pending.id, "submission-latest");
-  assert.equal(pending.replay(pending.outcome), true);
-  assert.deepEqual(replayed, [["latest", "cleared"]]);
+  assert.equal(firstPending.id, "submission-first");
+  // A failed head is restored ahead of every later item.
+  assert.equal(barrier.restoreSettledWorkspaceClearSubmission(firstPending), true);
+  assert.equal(barrier.peekSettledWorkspaceClearSubmission(workspace).id, "submission-first");
+  const retriedFirst = barrier.takeSettledWorkspaceClearSubmission({
+    workspaceKey: workspace,
+    activeSessionKey: null,
+  });
+  assert.equal(retriedFirst.replay(retriedFirst.outcome), true);
+  assert.equal(barrier.peekSettledWorkspaceClearSubmission(workspace).id, "submission-latest");
+  const secondPending = barrier.takeSettledWorkspaceClearSubmission({
+    workspaceKey: workspace,
+    activeSessionKey: null,
+  });
+  assert.equal(secondPending.replay(secondPending.outcome), true);
+  assert.deepEqual(replayed, [["first", "cleared"], ["latest", "cleared"]]);
   assert.equal(barrier.peekSettledWorkspaceClearSubmission(workspace), null);
 });
 
@@ -268,10 +281,20 @@ test("workspace removal invalidates an active clear generation and its pending i
       onDiscard: (reason) => discarded.push(reason),
     },
   });
+  barrier.deferSubmissionForWorkspaceClear({
+    currentWorkspaceKey: workspace,
+    submission: {
+      id: "submission-active-remove-second",
+      targetSessionKey: null,
+      createdAt: 5,
+      replay: () => true,
+      onDiscard: (reason) => discarded.push(reason),
+    },
+  });
 
   assert.equal(barrier.discardWorkspaceClearSubmissionState(workspace, "workspace_removed"), true);
   assert.equal(barrier.isWorkspaceClearSubmissionBarrierActive(workspace), false);
-  assert.deepEqual(discarded, ["workspace_removed"]);
+  assert.deepEqual(discarded, ["workspace_removed", "workspace_removed"]);
   assert.deepEqual(barrier.settleWorkspaceClearSubmissionBarrier({
     token,
     outcome: "cleared",
@@ -281,7 +304,7 @@ test("workspace removal invalidates an active clear generation and its pending i
     submission: {
       id: "submission-after-remove",
       targetSessionKey: null,
-      createdAt: 5,
+      createdAt: 6,
       replay: () => true,
     },
   }), { deferred: false });
@@ -342,6 +365,9 @@ test("Feishu enters the workspace clear fence before preparing a remote Session"
   const body = source.slice(start, end);
   assert.ok(body.indexOf("deferSubmissionForWorkspaceClear({") >= 0);
   assert.ok(body.indexOf("deferSubmissionForWorkspaceClear({") < body.indexOf("ensureFeishuRemoteSession(message)"));
+  assert.match(body, /queuePolicy:\s*"strict_fifo"/);
+  assert.match(body, /await latest\.acceptWorkspaceInstruction\(/);
+  assert.doesNotMatch(body, /latest remote task|最新远程任务|single_slot_latest_wins/);
 });
 
 function executionTurn(id) {
@@ -359,7 +385,16 @@ function executionTurn(id) {
   };
 }
 
-function seedWorkspaceSession(useAppStore, workspace, sessionId, turnId) {
+function seedWorkspaceSession(
+  useAppStore,
+  workspace,
+  sessionId,
+  turnId,
+  sessionEpoch = `test-session-epoch-${sessionId}`,
+) {
+  const { createPlanLifecycleState } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/lib/planLifecycle.ts"),
+  );
   useAppStore.setState({
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
@@ -371,6 +406,7 @@ function seedWorkspaceSession(useAppStore, workspace, sessionId, turnId) {
         date: "Today",
         active: true,
         messages: [],
+        planLifecycleEpoch: sessionEpoch,
       }],
     },
     activeSessionByWorkspace: { [workspace]: sessionId },
@@ -380,6 +416,13 @@ function seedWorkspaceSession(useAppStore, workspace, sessionId, turnId) {
     taskFlow: [],
     runtimeEvents: [],
     harnessRunMarker: null,
+    workspaceTurnQueue: null,
+    workspaceInstructionLedger: [],
+    planLifecycle: createPlanLifecycleState({
+      sessionKey: `${workspace}:${sessionId}`,
+      sessionEpoch,
+      updatedAt: 1,
+    }),
     activeActionRequest: null,
     pendingRunDecision: null,
     pendingRunDecisionResolver: null,
@@ -395,6 +438,407 @@ function seedWorkspaceSession(useAppStore, workspace, sessionId, turnId) {
     abortController: null,
   });
 }
+
+test("workspace admission waits behind the clear fence and creates one FIFO Turn per instruction", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const workspace = "/workspace-clear-admission-fifo";
+  const sessionId = 805;
+  seedWorkspaceSession(useAppStore, workspace, sessionId, "turn-clear-admission-old");
+
+  const durableClear = deferred();
+  tauriInvoke = (command, payload) => {
+    if (command === "clear_project_sessions") return durableClear.promise;
+    if (command === "save_project_session") return Promise.resolve(payload.session);
+    return Promise.resolve("");
+  };
+  const realDispatchNextWorkspaceInstruction =
+    useAppStore.getState().dispatchNextWorkspaceInstruction;
+  useAppStore.setState({ dispatchNextWorkspaceInstruction: () => true });
+
+  const clear = useAppStore.getState().clearChatHistory();
+  await new Promise((resolve) => setImmediate(resolve));
+  let firstSettled = false;
+  const firstAdmission = useAppStore.getState().acceptWorkspaceInstruction({
+    text: "清理期间第一条 Composer 指令",
+    source: "composer",
+    clientSubmissionId: "clear-admission-first",
+  }).then((result) => {
+    firstSettled = true;
+    return result;
+  });
+  const secondAdmission = useAppStore.getState().acceptWorkspaceInstruction({
+    text: "清理期间第二条 Composer 指令",
+    source: "composer",
+    clientSubmissionId: "clear-admission-second",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstSettled, false);
+  assert.equal(useAppStore.getState().currentSessionId, null);
+
+  durableClear.resolve();
+  await clear;
+  useAppStore.getState().markWorkspaceClearSubmissionReplayReady(
+    workspace,
+    useAppStore.getState().currentSessionId,
+  );
+  const [first, second] = await withTimeout(
+    Promise.all([firstAdmission, secondAdmission]),
+    "FIFO workspace admissions after clear",
+  );
+  assert.equal(first.accepted, true);
+  assert.equal(second.accepted, true);
+  assert.notEqual(first.receipt.turnId, second.receipt.turnId);
+  assert.deepEqual(
+    useAppStore.getState().conversationTurns.map((turn) => turn.userPrompt),
+    ["清理期间第一条 Composer 指令", "清理期间第二条 Composer 指令"],
+  );
+  assert.deepEqual(
+    useAppStore.getState().workspaceTurnQueue?.entries.map(
+      (entry) => entry.instruction.clientSubmissionId,
+    ),
+    ["clear-admission-first", "clear-admission-second"],
+  );
+
+  useAppStore.setState({
+    dispatchNextWorkspaceInstruction: realDispatchNextWorkspaceInstruction,
+  });
+});
+
+test("paged restore admission persists a partial 30-Turn window as total plus one", async () => {
+  const storeModule = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const { useAppStore, syncTaskIdCounterFromBlocks } = storeModule;
+  const { resolveSessionTranscriptPageMetadata } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/lib/sessionTranscriptPaging.ts"),
+  );
+  const originalState = useAppStore.getState();
+  const previousTauriInvoke = tauriInvoke;
+  const workspace = "/workspace-paged-admission-persistence";
+  const sessionId = 8_051;
+  const loadedTurns = Array.from({ length: 30 }, (_, index) => ({
+    id: `paged-existing-turn-${index}`,
+    userPrompt: `existing ${index}`,
+    title: `Existing ${index}`,
+    mode: "chat",
+    intent: "respond",
+    displayIntent: "respond",
+    status: "done",
+    summary: "done",
+    blockIds: [80_000 + index],
+    collapsed: false,
+    createdAt: index + 1,
+  }));
+  const loadedBlocks = loadedTurns.map((turn, index) => ({
+    id: 80_000 + index,
+    turnId: turn.id,
+    type: "user",
+    content: turn.userPrompt,
+  }));
+  const restoredMetadata = resolveSessionTranscriptPageMetadata({
+    loadedTurns: loadedTurns.length,
+    totalTurns: 44,
+    hasMore: true,
+  });
+  let persistedSession = null;
+
+  try {
+    seedWorkspaceSession(useAppStore, workspace, sessionId, loadedTurns.at(-1).id);
+    syncTaskIdCounterFromBlocks(loadedBlocks);
+    useAppStore.setState((state) => ({
+      config: { ...state.config, sessionRecordingEnabled: true },
+      taskFlow: loadedBlocks,
+      conversationTurns: loadedTurns,
+      currentTurnId: loadedTurns.at(-1).id,
+      ...restoredMetadata,
+      sessionsByWorkspace: {
+        ...state.sessionsByWorkspace,
+        [workspace]: state.sessionsByWorkspace[workspace].map((session) => ({
+          ...session,
+          messages: loadedBlocks,
+          ...restoredMetadata,
+          runtimeSnapshot: {
+            ...(session.runtimeSnapshot || {}),
+            taskFlow: loadedBlocks,
+            conversationTurns: loadedTurns,
+            ...restoredMetadata,
+          },
+        })),
+      },
+      dispatchNextWorkspaceInstruction: () => true,
+    }));
+    tauriInvoke = (command, payload) => {
+      if (command === "save_project_session") {
+        persistedSession = payload.session;
+        return Promise.resolve(payload.session);
+      }
+      return Promise.resolve("");
+    };
+
+    const acceptance = await useAppStore.getState().acceptWorkspaceInstruction({
+      text: "append after a paged restore",
+      source: "composer",
+      clientSubmissionId: "paged-restore-admission",
+    });
+
+    assert.equal(acceptance.accepted, true);
+    assert.ok(persistedSession, "admission must reach durable Session persistence");
+    assert.deepEqual({
+      transcriptPartial: persistedSession.transcriptPartial,
+      transcriptLoadedTurns: persistedSession.transcriptLoadedTurns,
+      transcriptTotalTurns: persistedSession.transcriptTotalTurns,
+    }, {
+      transcriptPartial: true,
+      transcriptLoadedTurns: 31,
+      transcriptTotalTurns: 45,
+    });
+    assert.deepEqual({
+      transcriptPartial: persistedSession.runtimeSnapshot.transcriptPartial,
+      transcriptLoadedTurns: persistedSession.runtimeSnapshot.transcriptLoadedTurns,
+      transcriptTotalTurns: persistedSession.runtimeSnapshot.transcriptTotalTurns,
+    }, {
+      transcriptPartial: true,
+      transcriptLoadedTurns: 31,
+      transcriptTotalTurns: 45,
+    });
+    assert.equal(persistedSession.runtimeSnapshot.conversationTurns.length, 31);
+    assert.equal(
+      persistedSession.runtimeSnapshot.conversationTurns.at(-1).id,
+      acceptance.receipt.turnId,
+    );
+    assert.deepEqual({
+      transcriptPartial: useAppStore.getState().transcriptPartial,
+      transcriptLoadedTurns: useAppStore.getState().transcriptLoadedTurns,
+      transcriptTotalTurns: useAppStore.getState().transcriptTotalTurns,
+    }, {
+      transcriptPartial: true,
+      transcriptLoadedTurns: 31,
+      transcriptTotalTurns: 45,
+    });
+  } finally {
+    tauriInvoke = previousTauriInvoke;
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("a delayed admission save cannot overwrite newer Session runtime or recording policy", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const originalState = useAppStore.getState();
+  const previousTauriInvoke = tauriInvoke;
+  const workspace = "/workspace-admission-stale-save";
+  const sessionId = 8_052;
+  const saveStarted = deferred();
+  const saveRelease = deferred();
+  let persistedSession = null;
+
+  try {
+    seedWorkspaceSession(useAppStore, workspace, sessionId, "turn-before-stale-save");
+    useAppStore.setState((state) => ({
+      config: { ...state.config, sessionRecordingEnabled: true },
+      agentStatus: "idle",
+      isGenerating: false,
+      dispatchNextWorkspaceInstruction: () => true,
+    }));
+    tauriInvoke = (command, payload) => {
+      if (command === "save_project_session") {
+        persistedSession = payload.session;
+        saveStarted.resolve();
+        return saveRelease.promise.then(() => payload.session);
+      }
+      return Promise.resolve("");
+    };
+
+    const acceptancePromise = useAppStore.getState().acceptWorkspaceInstruction({
+      text: "persist me without overwriting newer state",
+      source: "composer",
+      clientSubmissionId: "admission-stale-save",
+    });
+    await withTimeout(saveStarted.promise, "admission save start");
+
+    const sentinelBlock = {
+      id: 90_052,
+      turnId: "newer-runtime-turn",
+      type: "system",
+      content: "newer runtime mutation",
+    };
+    useAppStore.setState((state) => ({
+      config: { ...state.config, sessionRecordingEnabled: false },
+      taskFlow: [...state.taskFlow, sentinelBlock],
+      sessionsByWorkspace: {
+        ...state.sessionsByWorkspace,
+        [workspace]: state.sessionsByWorkspace[workspace].map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                title: "Renamed while save was pending",
+                titleSource: "manual",
+                recordingDisabled: true,
+                updatedAt: "2099-01-01T00:00:00.000Z",
+                updatedAtMs: 4_071_001_600_000,
+              }
+            : session
+        ),
+      },
+    }));
+    saveRelease.resolve();
+
+    const acceptance = await withTimeout(acceptancePromise, "stale admission save settlement");
+    assert.equal(acceptance.accepted, true);
+    assert.ok(persistedSession);
+    const state = useAppStore.getState();
+    const session = state.sessionsByWorkspace[workspace].find(
+      (candidate) => candidate.id === sessionId,
+    );
+    assert.equal(session.title, "Renamed while save was pending");
+    assert.equal(session.titleSource, "manual");
+    assert.equal(session.recordingDisabled, true);
+    assert.equal(session.updatedAtMs, 4_071_001_600_000);
+    assert.equal(state.config.sessionRecordingEnabled, false);
+    assert.equal(state.taskFlow.some((block) => block.id === sentinelBlock.id), true);
+  } finally {
+    tauriInvoke = previousTauriInvoke;
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("workspace admission persistence failure still closes one visible error Turn in memory", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const workspace = "/workspace-admission-memory-error";
+  const sessionId = 806;
+  seedWorkspaceSession(useAppStore, workspace, sessionId, "turn-admission-memory-old");
+  useAppStore.setState((state) => ({
+    agentStatus: "idle",
+    isGenerating: false,
+    config: { ...state.config, sessionRecordingEnabled: true },
+  }));
+  tauriInvoke = (command) => {
+    if (command === "save_project_session") {
+      return Promise.reject(new Error("simulated admission persistence failure"));
+    }
+    return Promise.resolve("");
+  };
+
+  const acceptance = await useAppStore.getState().acceptWorkspaceInstruction({
+    text: "持久化失败也必须得到可见回合结论",
+    source: "composer",
+    clientSubmissionId: "admission-memory-terminal",
+  });
+  assert.equal(acceptance.accepted, true);
+  assert.equal(acceptance.durability, "memory");
+  const state = useAppStore.getState();
+  const turn = state.conversationTurns.find((candidate) =>
+    candidate.id === acceptance.receipt.turnId
+  );
+  assert.equal(turn.runtimeOutcome.status, "completed");
+  assert.equal(turn.runtimeOutcome.resultKind, "error");
+  assert.equal(turn.runtimeOutcome.reason, "workspace_instruction_persistence_failed");
+  assert.equal(state.workspaceTurnQueue.entries.length, 0);
+  assert.equal(
+    state.workspaceInstructionLedger.at(-1).receipt.receiptId,
+    acceptance.receipt.receiptId,
+  );
+  assert.equal(state.taskFlow.some((block) =>
+    block.turnId === turn.id &&
+    block.type === "user" &&
+    block.content === "持久化失败也必须得到可见回合结论"
+  ), true);
+  assert.equal(state.taskFlow.some((block) =>
+    block.turnId === turn.id &&
+    block.type === "agent" &&
+    block.visibility === "assistant_final"
+  ), true);
+  assert.deepEqual(
+    state.runtimeEvents
+      .filter((event) => event.turnId === turn.id)
+      .map((event) => event.type),
+    ["run.started", "run.completed", "turn.completed"],
+  );
+});
+
+test("exhausted clear replay closes the head as an error Turn before advancing FIFO", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const workspace = "/workspace-clear-replay-exhausted";
+  seedWorkspaceSession(useAppStore, workspace, 807, "turn-clear-exhausted-old");
+  const durableClear = deferred();
+  tauriInvoke = (command, payload) => {
+    if (command === "clear_project_sessions") return durableClear.promise;
+    if (command === "save_project_session") return Promise.resolve(payload.session);
+    return Promise.resolve("");
+  };
+  const realAcceptWorkspaceInstruction = useAppStore.getState().acceptWorkspaceInstruction;
+  const realDispatchNextWorkspaceInstruction =
+    useAppStore.getState().dispatchNextWorkspaceInstruction;
+  useAppStore.setState({ dispatchNextWorkspaceInstruction: () => true });
+  const clear = useAppStore.getState().clearChatHistory();
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstAdmission = realAcceptWorkspaceInstruction({
+    text: "第一条重放持续失败",
+    source: "composer",
+    clientSubmissionId: "clear-replay-exhausted-first",
+  });
+  const secondAdmission = realAcceptWorkspaceInstruction({
+    text: "第二条必须在首项收口后接纳",
+    source: "composer",
+    clientSubmissionId: "clear-replay-exhausted-second",
+  });
+  let firstReplayAttempts = 0;
+  useAppStore.setState({
+    acceptWorkspaceInstruction: async (input) => {
+      if (
+        input.clientSubmissionId === "clear-replay-exhausted-first" &&
+        !input.forceVisibleErrorConclusion
+      ) {
+        firstReplayAttempts += 1;
+        return { accepted: false, reason: "session_changed", retryable: true };
+      }
+      return realAcceptWorkspaceInstruction(input);
+    },
+  });
+  durableClear.resolve();
+  await clear;
+  useAppStore.getState().markWorkspaceClearSubmissionReplayReady(
+    workspace,
+    useAppStore.getState().currentSessionId,
+  );
+  await waitFor(
+    () => firstReplayAttempts >= 3,
+    `three replay attempts (observed ${firstReplayAttempts})`,
+  );
+  const first = await withTimeout(firstAdmission, "exhausted replay terminal");
+  const second = await withTimeout(secondAdmission, "FIFO successor after exhausted replay");
+  assert.equal(firstReplayAttempts, 3);
+  assert.equal(first.accepted, true);
+  assert.equal(first.durability, "memory");
+  assert.equal(second.accepted, true);
+  const state = useAppStore.getState();
+  assert.deepEqual(
+    state.conversationTurns.map((turn) => turn.userPrompt),
+    ["第一条重放持续失败", "第二条必须在首项收口后接纳"],
+  );
+  assert.equal(state.conversationTurns[0].runtimeOutcome.status, "completed");
+  assert.equal(state.conversationTurns[0].runtimeOutcome.resultKind, "error");
+  assert.equal(
+    state.conversationTurns[0].runtimeOutcome.reason,
+    "workspace_clear_replay_exhausted",
+  );
+  assert.equal(state.workspaceTurnQueue.entries.length, 1);
+  assert.equal(
+    state.workspaceTurnQueue.entries[0].instruction.clientSubmissionId,
+    "clear-replay-exhausted-second",
+  );
+  useAppStore.setState({
+    acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
+    dispatchNextWorkspaceInstruction: realDispatchNextWorkspaceInstruction,
+  });
+});
 
 function createRealRuntimeOwnerController(useAppStore, runSessionKey) {
   const { createSubmitSessionRuntimeController } = loadTranspiledModuleSync(
@@ -746,7 +1190,7 @@ test("failed in-flight clear cannot restore an old runtime after workspace remov
   assert.equal(terminalSaveInvocations, 0);
 });
 
-test("successful deferred clear replays only the latest visible user input into one fresh Session", async () => {
+test("successful deferred clear replays every visible user input in strict FIFO order", async () => {
   const { useAppStore } = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/useAppStore.ts"),
   );
@@ -790,8 +1234,9 @@ test("successful deferred clear replays only the latest visible user input into 
   await new Promise((resolve) => setImmediate(resolve));
   const realSendMessage = useAppStore.getState().sendMessage;
   const oldSessionKey = `${workspace}:${sessionId}`;
-  assert.equal(realSendMessage("/分析 第一条应被替换的输入"), true);
-  const latestText = "/分析 最新用户输入必须只重放一次";
+  const firstText = "/分析 第一条用户输入必须保留";
+  assert.equal(realSendMessage(firstText), true);
+  const secondText = "/分析 第二条用户输入必须按序重放";
   const staleVisibleGoalEnvelope = {
     kind: "visible_goal_submission_envelope",
     id: "old-visible-goal-envelope",
@@ -800,7 +1245,7 @@ test("successful deferred clear replays only the latest visible user input into 
     kind: "goal_continuation_envelope",
     id: "old-goal-continuation-envelope",
   };
-  assert.equal(realSendMessage(latestText, undefined, {
+  assert.equal(realSendMessage(secondText, undefined, {
     resolvedIntent: "execute",
     runtimeIntentOverride: "goal",
     commandDirective: {
@@ -834,10 +1279,16 @@ test("successful deferred clear replays only the latest visible user input into 
   assert.deepEqual(commands.filter((command) => command === "get_project_skeleton"), []);
 
   const replayCalls = [];
+  const admissionCalls = [];
+  const realAcceptWorkspaceInstruction = useAppStore.getState().acceptWorkspaceInstruction;
   useAppStore.setState({
     sendMessage: (...args) => {
       replayCalls.push(args);
       return realSendMessage(...args);
+    },
+    acceptWorkspaceInstruction: async (input) => {
+      admissionCalls.push(input);
+      return realAcceptWorkspaceInstruction(input);
     },
   });
   useAppStore.getState().setCurrentWorkspace(otherWorkspace);
@@ -866,10 +1317,11 @@ test("successful deferred clear replays only the latest visible user input into 
     useAppStore.getState().markWorkspaceClearSubmissionReplayReady(workspace, null),
     true,
   );
+  await waitFor(() => admissionCalls.length >= 2, "both successful clear submissions admitted");
+  assert.equal(admissionCalls.length, 2);
+  assert.deepEqual(admissionCalls.map((call) => call.text), [firstText, secondText]);
   await withTimeout(workspaceTreeStarted.promise, "success clear replay workspace tree");
-  assert.equal(replayCalls.length, 1);
-  assert.equal(replayCalls[0][0], latestText);
-  const replayOptions = replayCalls[0][2];
+  const replayOptions = admissionCalls[1];
   for (const staleKey of [
     "resolvedIntent",
     "runtimeIntentOverride",
@@ -887,14 +1339,18 @@ test("successful deferred clear replays only the latest visible user input into 
   const replayedState = useAppStore.getState();
   assert.equal(replayedState.sessionsByWorkspace[workspace].length, 1);
   assert.notEqual(replayedState.currentSessionId, sessionId);
-  assert.equal(replayedState.conversationTurns.length, 1);
-  assert.match(replayedState.conversationTurns[0].userPrompt, /最新用户输入/);
-  assert.equal(replayedState.taskFlow.filter((block) => block.type === "user").length, 1);
+  assert.equal(replayedState.conversationTurns.length, 2);
+  assert.match(replayedState.conversationTurns[0].userPrompt, /第一条用户输入必须保留/);
+  assert.match(replayedState.conversationTurns[1].userPrompt, /第二条用户输入必须按序重放/);
+  assert.equal(replayedState.taskFlow.filter((block) => block.type === "user").length, 2);
   assert.equal(replayedState.abortController, null);
   assert.equal(replayedState.harnessRunMarker, null);
-  assert.equal(workspaceTreeInvocations, 1);
+  assert.equal(workspaceTreeInvocations, 2);
 
-  useAppStore.setState({ sendMessage: realSendMessage });
+  useAppStore.setState({
+    sendMessage: realSendMessage,
+    acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
+  });
   await useAppStore.getState().clearChatHistory();
   workspaceTree.resolve("");
   await new Promise((resolve) => setImmediate(resolve));
@@ -958,10 +1414,17 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   assert.equal(workspaceTreeInvocations, 0);
 
   const replayCalls = [];
+  const admissionResults = [];
+  const realAcceptWorkspaceInstruction = useAppStore.getState().acceptWorkspaceInstruction;
   useAppStore.setState({
     sendMessage: (...args) => {
       replayCalls.push(args);
       return realSendMessage(...args);
+    },
+    acceptWorkspaceInstruction: async (input) => {
+      const result = await realAcceptWorkspaceInstruction(input);
+      admissionResults.push({ input, result });
+      return result;
     },
   });
   useAppStore.getState().setCurrentWorkspace(otherWorkspace);
@@ -982,11 +1445,25 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     useAppStore.getState().markWorkspaceClearSubmissionReplayReady(workspace, sessionId),
     true,
   );
+  await waitFor(() => admissionResults.length > 0, "failed clear submission admission");
+  assert.equal(
+    admissionResults[0].result.accepted,
+    true,
+    JSON.stringify(admissionResults[0].result),
+  );
   await withTimeout(workspaceTreeStarted.promise, "failed clear replay workspace tree");
+  // The first call is the synchronous cache warm-up. The workflow's own
+  // bootstrap read advances on a later microtask, so under a busy full-suite
+  // runner observing only the first call races the behavior asserted below.
+  await waitFor(
+    () => workspaceTreeInvocations >= 2,
+    "failed clear replay workflow workspace tree",
+  );
   assert.equal(replayCalls.length, 1);
   assert.equal(replayCalls[0][0], latestText);
   assert.equal(replayCalls[0][2].submissionOriginSessionKey, oldSessionKey);
-  assert.equal(Object.hasOwn(replayCalls[0][2], "goalContinuationEnvelope"), false);
+  assert.notEqual(replayCalls[0][2].turnIdOverride, oldTurnId);
+  assert.equal(Object.hasOwn(admissionResults[0].input, "goalContinuationEnvelope"), false);
   for (const staleKey of [
     "hidden",
     "reuseCurrentTurn",
@@ -995,7 +1472,11 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     "parentRunIdOverride",
     "executionConsentGranted",
   ]) {
-    assert.equal(Object.hasOwn(replayCalls[0][2], staleKey), false, `stale replay key ${staleKey}`);
+    assert.equal(
+      Object.hasOwn(admissionResults[0].input, staleKey),
+      false,
+      `stale replay key ${staleKey}`,
+    );
   }
   const replayedState = useAppStore.getState();
   const oldTurn = replayedState.conversationTurns.find((turn) => turn.id === oldTurnId);
@@ -1007,15 +1488,18 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     replayedState.conversationTurns.find((turn) => turn.id !== oldTurnId).userPrompt,
     /清理失败后作为全新回合重放/,
   );
-  assert.equal(workspaceTreeInvocations, 1);
+  assert.equal(workspaceTreeInvocations, 2);
 
-  useAppStore.setState({ sendMessage: realSendMessage });
+  useAppStore.setState({
+    sendMessage: realSendMessage,
+    acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
+  });
   await useAppStore.getState().clearChatHistory();
   workspaceTree.resolve("");
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("failed clear revalidates a broker-issued exact Goal continuation for the fresh Turn", async (t) => {
+test("failed clear preserves exact Goal continuation authority for fresh Turn admission", async (t) => {
   // Harness ownership fails closed when durable WebView storage is unavailable.
   // This integration test supplies the persistence surface present in desktop.
   t.after(installFakeLocalStorageWindow());
@@ -1048,17 +1532,11 @@ test("failed clear revalidates a broker-issued exact Goal continuation for the f
   assert.ok(exactEnvelope);
 
   const durableClear = deferred();
-  const workspaceTree = deferred();
-  const workspaceTreeStarted = deferred();
   let clearInvocations = 0;
   tauriInvoke = (command, payload) => {
     if (command === "clear_project_sessions") {
       clearInvocations += 1;
       return clearInvocations === 1 ? durableClear.promise : Promise.resolve();
-    }
-    if (command === "get_project_skeleton") {
-      workspaceTreeStarted.resolve();
-      return workspaceTree.promise;
     }
     if (command === "save_project_session") return Promise.resolve(payload.session);
     return Promise.resolve("");
@@ -1074,35 +1552,38 @@ test("failed clear revalidates a broker-issued exact Goal continuation for the f
     goalContinuationGuidance: text,
   }), true);
 
-  const replayCalls = [];
+  const admissionCalls = [];
+  const realAcceptWorkspaceInstruction = useAppStore.getState().acceptWorkspaceInstruction;
+  const realDispatchNextWorkspaceInstruction =
+    useAppStore.getState().dispatchNextWorkspaceInstruction;
   useAppStore.setState({
-    sendMessage: (...args) => {
-      replayCalls.push(args);
-      return realSendMessage(...args);
+    acceptWorkspaceInstruction: async (input) => {
+      admissionCalls.push(input);
+      return realAcceptWorkspaceInstruction(input);
     },
+    dispatchNextWorkspaceInstruction: () => true,
   });
   durableClear.reject(new Error("goal continuation clear failed"));
   await clearRejected;
-  await withTimeout(workspaceTreeStarted.promise, "Goal continuation replay workspace tree");
-  assert.equal(replayCalls.length, 1);
-  assert.deepEqual(replayCalls[0][2].goalContinuationEnvelope, exactEnvelope);
-  assert.equal(replayCalls[0][2].submissionOriginSessionKey, oldSessionKey);
+  await waitFor(() => admissionCalls.length > 0, "Goal continuation admission replay");
+  assert.equal(admissionCalls[0].goalContinuationEnvelope.kind, "goal_continuation_envelope");
+  assert.notEqual(admissionCalls[0].goalContinuationEnvelope.id, exactEnvelope.id);
   assert.equal(useAppStore.getState().conversationTurns.length, 2);
-  const freshTurnId = useAppStore.getState().currentTurnId;
+  const freshTurnId = useAppStore.getState().conversationTurns.find(
+    (turn) => turn.id !== oldTurnId,
+  ).id;
   assert.notEqual(freshTurnId, oldTurnId);
+  const continuationAuthorization = useAppStore.getState()
+    .workspaceTurnQueue.entries[0].instruction.payload.dispatchHints.goalContinuationAuthorization;
+  assert.equal(continuationAuthorization.goalId, goalBeforeClear.id);
+  assert.equal(continuationAuthorization.goalRevision, goalBeforeClear.revision);
+  assert.equal(continuationAuthorization.ownerTurnId, oldTurnId);
+  assert.equal(continuationAuthorization.sessionKey, oldSessionKey);
 
-  workspaceTree.resolve("");
-  await waitFor(
-    () => useAppStore.getState().activeGoal?.ownerTurnId === freshTurnId,
-    "broker-issued Goal continuation acceptance",
-  );
-  const continuedGoal = useAppStore.getState().activeGoal;
-  assert.equal(continuedGoal.id, goalBeforeClear.id);
-  assert.equal(continuedGoal.revision, goalBeforeClear.revision);
-  assert.equal(continuedGoal.ownerTurnId, freshTurnId);
-  assert.equal(useAppStore.getState().harnessRunMarker?.runtimeIntent, "goal");
-
-  useAppStore.setState({ sendMessage: realSendMessage });
+  useAppStore.setState({
+    acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
+    dispatchNextWorkspaceInstruction: realDispatchNextWorkspaceInstruction,
+  });
   await useAppStore.getState().clearChatHistory();
   await new Promise((resolve) => setImmediate(resolve));
 });
@@ -1711,7 +2192,13 @@ for (const pendingReview of [false, true]) {
       currentContent,
       pendingReview,
     });
-    seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+    seedWorkspaceSession(
+      useAppStore,
+      workspace,
+      sessionId,
+      fixture.turnId,
+      fixture.lifecycle.sessionEpoch,
+    );
     const decisions = [];
     const abortController = new AbortController();
     let aborts = 0;
@@ -1807,7 +2294,13 @@ test("explicit Plan resume revokes a resumable owner whose logical Turn is alrea
     currentContent,
     pendingReview: true,
   });
-  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   useAppStore.setState({
     planArtifacts: [fixture.artifact],
     planTasks: [],
@@ -1881,7 +2374,13 @@ test("an in-flight Plan Diff revert publishes only to its exact source Session a
     currentContent,
     pendingReview: false,
   });
-  seedWorkspaceSession(useAppStore, workspace, sourceSessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sourceSessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   const sourceAbortController = new AbortController();
   let sourceAborts = 0;
   sourceAbortController.signal.addEventListener("abort", () => { sourceAborts += 1; });
@@ -2034,7 +2533,13 @@ test("settings reset invalidates an in-flight Plan Diff revert without reinjecti
     currentContent,
     pendingReview: false,
   });
-  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   useAppStore.setState({
     planArtifacts: [fixture.artifact],
     planTasks: [],
@@ -2114,7 +2619,13 @@ test("Plan Diff authority invalidation does not abort an unrelated generic Run",
     currentContent,
     pendingReview: false,
   });
-  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   const genericAbortController = new AbortController();
   let genericAborts = 0;
   genericAbortController.signal.addEventListener("abort", () => { genericAborts += 1; });
@@ -2187,7 +2698,13 @@ test("a throwing Plan abort observer cannot turn a committed Diff revert into fa
     currentContent,
     pendingReview: false,
   });
-  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   let abortCalls = 0;
   useAppStore.setState({
     planArtifacts: [fixture.artifact],
@@ -2256,7 +2773,13 @@ test("a stale Plan permission click rejects instead of approving artifact repres
     currentContent,
     pendingReview: true,
   });
-  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    sessionId,
+    fixture.turnId,
+    fixture.lifecycle.sessionEpoch,
+  );
   const decisions = [];
   const abortController = new AbortController();
   let aborts = 0;

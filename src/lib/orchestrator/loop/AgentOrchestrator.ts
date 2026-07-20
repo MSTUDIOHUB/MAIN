@@ -173,6 +173,7 @@ export class AgentOrchestrator {
           effectivePreferredUnityUrls,
           effectiveUnityMcpToolNameSet,
           routedToolDefinitions,
+          toolCatalog,
           toolCapabilityRegistry,
           webSearchEnabled,
         } = toolRegistryState;
@@ -886,6 +887,7 @@ export class AgentOrchestrator {
           hasStructuredProposal,
           iterationAllTools,
           availableToolNames,
+          toolCatalog,
           toolCapabilityRegistry,
           toolPermissionPolicy: config.toolPermissionPolicy,
           recentPlanToolActivity: loopState.recentPlanToolActivity,

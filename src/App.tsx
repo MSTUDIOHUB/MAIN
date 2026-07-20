@@ -56,21 +56,23 @@ import {
   canonicalizeWorkspacePath,
   writeFile,
 } from "./lib/ipc";
+import { resolveSessionTranscriptPageMetadata } from "./lib/sessionTranscriptPaging";
 import {
   type AttachmentPickerResult,
+  type AttachedFile,
   classifyAttachment,
   createAttachedFileDescriptor,
   getAttachmentDisplayName,
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
-import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
+import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode, type MainModeKey } from "./lib/mainModes";
 import { createDefaultImageStudioRuntime } from "./lib/imageStudio";
 import {
   resolveSessionModeAffinity,
   type SessionModeAffinity,
   type SessionModeAffinityLike,
 } from "./lib/imageStudioSessions";
-import { resolveConversationTurnIntent } from "./lib/runIntent";
+import { resolveConversationTurnIntent, type MainIntentShortcut } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { shouldContinueGoalFromUserChoice } from "./lib/goalChoiceContinuation";
 import {
@@ -98,6 +100,16 @@ import {
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./lib/turnEvents";
 import { resolveVisibleGoalSubmissionSessionKey } from "./lib/submit/turnSubmission";
 import { deferSubmissionForWorkspaceClear } from "./store/workspaceClearSubmissionBarrier";
+import {
+  captureSessionRestoreRevisionFence,
+  isSessionRestoreRevisionFenceCurrent,
+  type SessionRestoreRevisionFence,
+} from "./store/sessionRestoreRevisionFence";
+import {
+  beginSessionAdmissionRestore,
+  settleSessionAdmissionRestore,
+} from "./store/sessionAdmissionReadiness";
+import { buildWorkspaceComposerIntentDispatchHints } from "./store/workspaceComposerIntentAdmission";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -321,20 +333,24 @@ function buildStoredSessionSnapshot(
   const sessionKey = resolveSessionRuntimeKey(scopeKey, sessionId);
   const cachedTranscript = sessionKey ? transcriptCache?.get(sessionKey) || null : null;
   const loadedTurnCount = Array.isArray(state.conversationTurns) ? state.conversationTurns.length : 0;
-  const totalTurns = Number(cachedTranscript?.totalTurns ?? session.turnCount ?? loadedTurnCount) || loadedTurnCount;
-  const transcriptPartial = totalTurns > loadedTurnCount;
+  const transcriptMetadata = resolveSessionTranscriptPageMetadata({
+    loadedTurns: loadedTurnCount,
+    totalTurns: Math.max(
+      Number(cachedTranscript?.totalTurns) || 0,
+      Number(state.transcriptTotalTurns) || 0,
+      Number(session.transcriptTotalTurns) || 0,
+      Number(session.turnCount) || 0,
+    ),
+    hasMore: cachedTranscript?.hasMore === true || state.transcriptPartial === true,
+  });
   const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(state);
   return {
     ...session,
     messages: sanitizeTaskBlocksForPersist(state.taskFlow || []),
-    transcriptPartial,
-    transcriptLoadedTurns: loadedTurnCount,
-    transcriptTotalTurns: totalTurns,
+    ...transcriptMetadata,
     runtimeSnapshot: {
       ...runtimeSnapshot,
-      transcriptPartial,
-      transcriptLoadedTurns: loadedTurnCount,
-      transcriptTotalTurns: totalTurns,
+      ...transcriptMetadata,
     },
   };
 }
@@ -565,6 +581,8 @@ function stableRuntimeSignature(value: unknown): string {
     showFilePanel: snapshot.showFilePanel === true,
     rightPanelTab: snapshot.rightPanelTab ?? null,
     selectedDiffTaskId: snapshot.selectedDiffTaskId ?? null,
+    workspaceTurnQueue: compactTextSignature(JSON.stringify(snapshot.workspaceTurnQueue || null)),
+    workspaceInstructionLedger: compactTextSignature(JSON.stringify(snapshot.workspaceInstructionLedger || [])),
     transcriptPartial: (value as any)?.transcriptPartial === true,
     transcriptLoadedTurns: (value as any)?.transcriptLoadedTurns ?? 0,
     transcriptTotalTurns: (value as any)?.transcriptTotalTurns ?? 0,
@@ -975,12 +993,18 @@ function mergeSessionPage(
 
 function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackState: any) {
   const restoredTaskFlow = sanitizeTaskBlocksForPersist(entry.taskFlow || []);
+  const transcriptMetadata = resolveSessionTranscriptPageMetadata({
+    loadedTurns: entry.conversationTurns.length,
+    totalTurns: entry.totalTurns,
+    hasMore: entry.hasMore,
+  });
   const expectedSessionKey = resolveSessionRuntimeKey(entry.scopeKey, entry.sessionId);
   const restoredPatch = buildRestoredSessionRuntimePatch({
     snapshot: {
       ...(entry.runtimeSnapshot || {}),
       taskFlow: restoredTaskFlow,
       conversationTurns: entry.conversationTurns || [],
+      ...transcriptMetadata,
     },
     fallbackState,
     workspacePath: entry.scopeKey,
@@ -996,6 +1020,7 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
   });
   return {
     ...restoredPatch,
+    ...transcriptMetadata,
     taskFlow: restoredPatch.taskFlow || restoredTaskFlow,
     conversationTurns: restoredPatch.conversationTurns ||
       normalizeInterruptedConversationTurnsForRestore(entry.conversationTurns || [], restoredTaskFlow),
@@ -1036,7 +1061,6 @@ export default function App() {
   const setConfig = useAppStore((s) => s.setConfig);
 
   const t = translations[config.language] || translations.en;
-  const remoteFeishuQueueRef = useRef<FeishuInboundMessage[]>([]);
   const feishuStartingRef = useRef(false);
   const sessionSaveTimerRef = useRef<number | null>(null);
   const sessionTranscriptCacheRef = useRef<Map<string, SessionTranscriptCacheEntry>>(new Map());
@@ -1075,6 +1099,8 @@ export default function App() {
   const isStreaming = useAppStore((s) => s.isGenerating);
   const agentStatus = useAppStore((s) => s.agentStatus);
   const runtimeBySessionKey = useAppStore((s) => s.runtimeBySessionKey);
+  const workspaceTurnQueueVersion = useAppStore((s) => s.workspaceTurnQueue?.version ?? -1);
+  const dispatchNextWorkspaceInstruction = useAppStore((s) => s.dispatchNextWorkspaceInstruction);
 
   // ── Composer State ────────────────────────────────────────────────────
   const contextMentions = useAppStore((s) => s.contextMentions);
@@ -1097,6 +1123,20 @@ export default function App() {
     () => resolveSessionRuntimeKey(activeSessionScope, currentSessionId),
     [activeSessionScope, currentSessionId],
   );
+  useEffect(() => {
+    if (!activeSessionKey || activeSessionScope === GLOBAL_CHAT_KEY) return;
+    runAfterNextPaint(() => {
+      useAppStore.getState().dispatchNextWorkspaceInstruction(activeSessionKey);
+    });
+  }, [
+    activeSessionKey,
+    activeSessionScope,
+    agentStatus,
+    dispatchNextWorkspaceInstruction,
+    isStreaming,
+    runtimeEvents.length,
+    workspaceTurnQueueVersion,
+  ]);
   const cacheSessionTranscript = useCallback((
     sessionKey: string,
     entry: Omit<SessionTranscriptCacheEntry, "lastAccessedAt">,
@@ -1374,22 +1414,28 @@ export default function App() {
 
     if (sessionKey) {
       const taskFlowSnapshot = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+      const previousCachedTranscript = sessionTranscriptCacheRef.current.get(sessionKey) || null;
       cacheSessionTranscript(sessionKey, {
         scopeKey,
         sessionId: state.currentSessionId,
         planLifecycleEpoch,
         taskFlow: taskFlowSnapshot,
-        conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns || [], taskFlowSnapshot),
+        conversationTurns: snapshot.runtimeSnapshot.conversationTurns || [],
         runtimeSnapshot: snapshot.runtimeSnapshot,
-        hasMore: false,
-        nextBeforeTurnIndex: null,
-        totalTurns: state.conversationTurns?.length || 0,
+        hasMore: snapshot.transcriptPartial === true,
+        nextBeforeTurnIndex: snapshot.transcriptPartial === true
+          ? previousCachedTranscript?.nextBeforeTurnIndex ?? null
+          : null,
+        totalTurns: snapshot.transcriptTotalTurns,
       });
     }
 
     state.updateSession(scopeKey, state.currentSessionId, {
       messages: snapshot.messages,
       runtimeSnapshot: snapshot.runtimeSnapshot,
+      transcriptPartial: snapshot.transcriptPartial,
+      transcriptLoadedTurns: snapshot.transcriptLoadedTurns,
+      transcriptTotalTurns: snapshot.transcriptTotalTurns,
     });
 
     if (!state.config.sessionRecordingEnabled || snapshot.recordingDisabled) return;
@@ -1537,11 +1583,35 @@ export default function App() {
       return;
     }
 
+    // Cancel the older debounce before inspecting the new revision. In
+    // particular, an admission publishes its `persisting` placeholder before
+    // its own durable save starts; an older timer must not survive that render
+    // and serialize the placeholder (or later overwrite the accepted Turn).
+    if (sessionSaveTimerRef.current !== null) {
+      window.clearTimeout(sessionSaveTimerRef.current);
+      sessionSaveTimerRef.current = null;
+    }
+    const admissionQueue = useAppStore.getState().workspaceTurnQueue;
+    const admissionPersistencePending = admissionQueue?.sessionKey === autosaveSessionKey &&
+      admissionQueue.entries.some((entry) => entry.status === "persisting");
+    if (admissionPersistencePending) {
+      return;
+    }
+
     const messages = sanitizeTaskBlocksForPersist(taskFlow);
     const cachedTranscript = activeSessionKey ? getCachedSessionTranscript(activeSessionKey) : null;
     const loadedTurnCount = Array.isArray(conversationTurns) ? conversationTurns.length : 0;
-    const transcriptTotalTurns = Number(cachedTranscript?.totalTurns ?? loadedTurnCount) || loadedTurnCount;
-    const transcriptPartial = transcriptTotalTurns > loadedTurnCount;
+    const {
+      transcriptPartial,
+      transcriptTotalTurns,
+    } = resolveSessionTranscriptPageMetadata({
+      loadedTurns: loadedTurnCount,
+      totalTurns: Math.max(
+        Number(cachedTranscript?.totalTurns) || 0,
+        Number(useAppStore.getState().transcriptTotalTurns) || 0,
+      ),
+      hasMore: cachedTranscript?.hasMore === true || useAppStore.getState().transcriptPartial === true,
+    });
     const runtimeSnapshot = {
       ...buildSessionRuntimeSnapshotFromStoreState(useAppStore.getState()),
       runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
@@ -1585,11 +1655,6 @@ export default function App() {
       messages.length === 0 &&
       (!Array.isArray(conversationTurns) || conversationTurns.length === 0);
 
-    if (sessionSaveTimerRef.current !== null) {
-      window.clearTimeout(sessionSaveTimerRef.current);
-      sessionSaveTimerRef.current = null;
-    }
-
     if (shouldSkipDiskSave) {
       return;
     }
@@ -1630,14 +1695,62 @@ export default function App() {
         if (!hasPersistableSessionTranscript({ ...session, messages, runtimeSnapshot })) {
           return;
         }
-        void saveProjectSession(activeSessionScope, {
-          ...session,
-          messages,
-          transcriptPartial,
-          transcriptLoadedTurns: loadedTurnCount,
-          transcriptTotalTurns,
-          runtimeSnapshot,
-        })
+        void saveProjectSession(
+          activeSessionScope,
+          {
+            ...session,
+            messages,
+            transcriptPartial,
+            transcriptLoadedTurns: loadedTurnCount,
+            transcriptTotalTurns,
+            runtimeSnapshot,
+          },
+          {
+            // The owner mutation coordinator evaluates this fence only when
+            // this debounced write reaches the queue head. Therefore a save
+            // captured before durable admission can never run after and
+            // overwrite that admission with an obsolete snapshot.
+            isCurrent: () => {
+              const latest = useAppStore.getState();
+              if (
+                latest.currentSessionId !== currentSessionId ||
+                resolveSessionWorkspaceKey(latest.currentWorkspace) !== activeSessionScope
+              ) {
+                return false;
+              }
+              const latestSessionKey = resolveSessionRuntimeKey(activeSessionScope, currentSessionId);
+              const latestQueue = latest.workspaceTurnQueue;
+              if (
+                latestQueue?.sessionKey === latestSessionKey &&
+                latestQueue.entries.some((entry) => entry.status === "persisting")
+              ) {
+                return false;
+              }
+              const latestMessages = sanitizeTaskBlocksForPersist(latest.taskFlow || []);
+              const latestRuntimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(latest);
+              const latestCachedTranscript = latestSessionKey
+                ? getCachedSessionTranscript(latestSessionKey)
+                : null;
+              const latestLoadedTurnCount = Array.isArray(latest.conversationTurns)
+                ? latest.conversationTurns.length
+                : 0;
+              const latestTranscriptMetadata = resolveSessionTranscriptPageMetadata({
+                loadedTurns: latestLoadedTurnCount,
+                totalTurns: Math.max(
+                  Number(latestCachedTranscript?.totalTurns) || 0,
+                  Number(latest.transcriptTotalTurns) || 0,
+                ),
+                hasMore: latestCachedTranscript?.hasMore === true || latest.transcriptPartial === true,
+              });
+              const latestSignature = `${activeSessionScope}:${currentSessionId}:${stableRuntimeSignature({
+                messages: latestMessages,
+                runtimeSnapshot: latestRuntimeSnapshot,
+                ...latestTranscriptMetadata,
+              })}`;
+              return latestSignature === runtimeSignature;
+            },
+          },
+        )
           .then((saved) => {
             useAppStore.getState().updateSession(activeSessionScope, currentSessionId, {
               ...saved,
@@ -1646,6 +1759,14 @@ export default function App() {
             });
           })
           .catch((error) => {
+            if ((error as { code?: string })?.code === "project_session_stale_write_fenced") {
+              appendDebugLog("info", "session.storage", {
+                phase: "debounced_save_skipped_stale_revision",
+                scopeKey: activeSessionScope,
+                sessionId: currentSessionId,
+              });
+              return;
+            }
             appendDebugLog("warn", "session.storage", {
               phase: "debounced_save_failed",
               scopeKey: activeSessionScope,
@@ -1750,12 +1871,59 @@ export default function App() {
   // ── Send Message: delegates to store's sendMessage ─────────────────────
   // This replaces the old inline handleSendMessage + runAgentLoop + 
   // executeToolCall + parseFullText + SSE parsing monolith.
-  const handleSendMessage = useCallback((
+  const handleSendMessage = useCallback(async (
     text: string,
     images?: string[],
-    submitOptions?: { queuedUserMessageId?: string },
+    submitOptions?: {
+      queuedUserMessageId?: string;
+      workspaceComposerIntentSnapshot?: {
+        mainModeKey: MainModeKey;
+        lockedComposerIntent: MainIntentShortcut | null;
+      };
+      workspaceSubmissionPayloadSnapshot?: {
+        contextMentions: string[];
+        attachedFiles: AttachedFile[];
+      };
+    },
   ) => {
     const state = useAppStore.getState();
+    const isWorkspaceSession = !!String(state.currentWorkspace || "").trim() &&
+      resolveSessionWorkspaceKey(state.currentWorkspace) !== GLOBAL_CHAT_KEY;
+    if (isWorkspaceSession && !submitOptions?.queuedUserMessageId) {
+      const dispatchHints = submitOptions?.workspaceComposerIntentSnapshot
+        ? buildWorkspaceComposerIntentDispatchHints({
+            text,
+            language: state.config.language === "en" ? "en" : "zh",
+            snapshot: submitOptions.workspaceComposerIntentSnapshot,
+          })
+        : undefined;
+      const acceptance = await state.acceptWorkspaceInstruction({
+        text,
+        images,
+        contextMentions: submitOptions?.workspaceSubmissionPayloadSnapshot
+          ? [...submitOptions.workspaceSubmissionPayloadSnapshot.contextMentions]
+          : [...state.contextMentions],
+        attachedFiles: submitOptions?.workspaceSubmissionPayloadSnapshot
+          ? [...submitOptions.workspaceSubmissionPayloadSnapshot.attachedFiles]
+          : [...state.attachedFiles],
+        source: "composer",
+        ...(dispatchHints ? { dispatchHints } : {}),
+      });
+      appendDebugLog(acceptance.accepted ? "info" : "warn", "ui.workspaceInstruction", {
+        phase: acceptance.accepted ? "accepted" : "rejected",
+        ...(acceptance.accepted
+          ? {
+              receiptId: acceptance.receipt.receiptId,
+              turnId: acceptance.receipt.turnId,
+              queuePosition: acceptance.queuePosition,
+              durability: acceptance.durability,
+            }
+          : { reason: acceptance.reason, retryable: acceptance.retryable }),
+        textChars: text.length,
+        images: images?.length ?? 0,
+      });
+      return acceptance.accepted;
+    }
     const queuedReplay = submitOptions?.queuedUserMessageId
       ? state.queuedUserMessage?.id === submitOptions.queuedUserMessageId &&
         state.queuedUserMessage.text === text
@@ -2095,19 +2263,44 @@ export default function App() {
         }
       : undefined;
 
-    if (optionAction === "adjust_plan") {
-      state.abortController?.abort();
-    }
-
-    useAppStore.setState({
-      ...(shouldReuseSourceTurn ? { currentTurnId: sourceTurnId } : {}),
-      input: "",
-      contextMentions: [],
-      attachedFiles: [],
-      ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
-      ...(optionAction === "adjust_plan"
-        ? {
-            agentStatus: "idle" as const,
+    if (isCustomReply || optionAction === "adjust_plan") {
+      void (async () => {
+        const acceptance = await useAppStore.getState().acceptWorkspaceInstruction({
+          text,
+          source: optionAction === "adjust_plan" ? "plan_adjustment" : "custom_reply",
+          goalContinuationEnvelope: goalContinuationEnvelope || undefined,
+          dispatchHints: {
+            ...(optionAction === "adjust_plan"
+              ? { resolvedIntent: "plan", skipIntentResolution: true }
+              : {}),
+            ...(hasAuthorizedGoalContinuation
+              ? {
+                  resolvedIntent: "goal",
+                  runtimeIntentOverride: "goal",
+                  executionConsentGranted: true,
+                  skipIntentResolution: true,
+                }
+              : {}),
+            replyOptionSourceTurnId: sourceTurnId || "",
+            selectedReplyOptionText: text,
+            ...(choiceRequest ? { replyOptionRequestIdentity: choiceRequest } : {}),
+            replyOptionIsCustom: isCustomReply,
+            ...(choiceRequest?.runId ? { parentRunIdOverride: choiceRequest.runId } : {}),
+          },
+        });
+        if (!acceptance.accepted) {
+          appendDebugLog("warn", "ui.quickReply_workspace_admission_rejected", {
+            sourceTurnId: sourceTurnId || null,
+            requestId: choiceRequest?.requestId || null,
+            reason: acceptance.reason,
+          });
+          return;
+        }
+        if (optionAction === "adjust_plan") {
+          const latest = useAppStore.getState();
+          latest.abortController?.abort();
+          useAppStore.setState({
+            agentStatus: "idle",
             isGenerating: false,
             abortController: null,
             isPlanApproved: false,
@@ -2116,23 +2309,18 @@ export default function App() {
             planExecutionEvidenceCount: 0,
             planAutoResumeCount: 0,
             planExecutionProgressSnapshot: null,
-            ...(sourceTurnId
-              ? {
-                  conversationTurns: state.conversationTurns.map((turn) =>
-                    turn.id === sourceTurnId && turn.pendingOperationProposal
-                      ? {
-                          ...turn,
-                          pendingOperationProposal: {
-                            ...turn.pendingOperationProposal,
-                            approvalStatus: "adjusting",
-                          },
-                        }
-                      : turn,
-                  ),
-                }
-              : {}),
-          }
-        : {}),
+          });
+        }
+      })();
+      return;
+    }
+
+    useAppStore.setState({
+      ...(shouldReuseSourceTurn ? { currentTurnId: sourceTurnId } : {}),
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+      ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
       ...(shouldExecuteFromQuickReply && sourceTurnId
         ? { currentTurnExecutionConsent: { turnId: sourceTurnId, granted: true } }
         : {}),
@@ -2200,6 +2388,7 @@ export default function App() {
   const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
     const restoreToken = ++sessionRestoreTokenRef.current;
     const expectedSessionKey = resolveSessionRuntimeKey(scopeKey, id);
+    if (!expectedSessionKey) return;
     const restoreStartState = useAppStore.getState();
     const outerSession = (restoreStartState.sessionsByWorkspace[scopeKey] || [])
       .find((session: any) => session.id === id);
@@ -2216,6 +2405,11 @@ export default function App() {
       ...(target || { id }),
       planLifecycleEpoch: expectedSessionEpoch,
     };
+    const admissionRestoreLease = beginSessionAdmissionRestore({
+      sessionKey: expectedSessionKey,
+      sessionEpoch: expectedSessionEpoch,
+    });
+    try {
     const liveRuntimeCandidate = expectedSessionKey && existingSessionEpoch
       ? restoreStartState.runtimeBySessionKey?.[expectedSessionKey]
       : null;
@@ -2231,6 +2425,11 @@ export default function App() {
     if (!liveRuntime) {
       resetToEmptyChatView();
     }
+    // The bootstrap/reset above is synchronous and intentionally precedes the
+    // revision capture. From this point onward a newer runtime publication for
+    // this exact Session wins over any cache or IPC result loaded below.
+    let restoreRevisionFence: SessionRestoreRevisionFence | null =
+      captureSessionRestoreRevisionFence(useAppStore.getState(), expectedSessionKey);
     const isCurrentRestore = () => {
       const state = useAppStore.getState();
       const currentOuterSession = (state.sessionsByWorkspace[scopeKey] || [])
@@ -2242,10 +2441,48 @@ export default function App() {
         resolveSessionPlanLifecycleEpoch(currentOuterSession) === expectedSessionEpoch
       );
     };
-    const finishRestore = () => {
+    let revisionConflictLogged = false;
+    const releaseRestoreAutosaveSuspension = () => {
       if (expectedSessionKey && autosaveSuspendedForSessionRef.current === expectedSessionKey) {
         autosaveSuspendedForSessionRef.current = "";
       }
+    };
+    const canPublishRestore = (phase: string) => {
+      if (!isCurrentRestore()) return false;
+      if (isSessionRestoreRevisionFenceCurrent(
+        restoreRevisionFence,
+        useAppStore.getState(),
+      )) {
+        return true;
+      }
+      if (!revisionConflictLogged) {
+        revisionConflictLogged = true;
+        appendDebugLog("info", "session.restore", {
+          sessionId: id,
+          scopeKey,
+          mode: "skipped_revision_conflict",
+          phase,
+        });
+      }
+      releaseRestoreAutosaveSuspension();
+      lastSessionRuntimeSignatureRef.current = "";
+      return false;
+    };
+    const refreshRestoreRevisionFence = () => {
+      restoreRevisionFence = captureSessionRestoreRevisionFence(
+        useAppStore.getState(),
+        expectedSessionKey,
+      );
+    };
+    const saveRestoredRuntimeToSession = () => {
+      useAppStore.getState().saveCurrentRuntimeToSession();
+      // Advancing after our own synchronous publication preserves the fence
+      // for finishRestore without accepting a competing Session revision.
+      refreshRestoreRevisionFence();
+    };
+    const finishRestore = () => {
+      if (!canPublishRestore("finish")) return;
+      releaseRestoreAutosaveSuspension();
       lastSessionRuntimeSignatureRef.current = "";
       if (isCurrentRestore()) {
         useAppStore.getState().markWorkspaceClearSubmissionReplayReady(scopeKey, id);
@@ -2257,7 +2494,7 @@ export default function App() {
       hasStoredSessionDetailPointer(target) ||
       hasRecoverableSessionTranscript(target);
     if (isEmptyTemporarySession(target)) {
-      if (!isCurrentRestore()) return;
+      if (!canPublishRestore("temporary_empty")) return;
       resetToEmptyChatView();
       appendDebugLog("info", "session.restore", {
         sessionId: id,
@@ -2278,7 +2515,7 @@ export default function App() {
         liveRuntime.agentStatus === "running" ||
         liveRuntime.agentStatus === "pending_review"
       );
-    if (shouldUseLiveRuntime && useAppStore.getState().restoreRuntimeForSession(liveSessionKey, {
+    if (shouldUseLiveRuntime && canPublishRestore("live_runtime") && useAppStore.getState().restoreRuntimeForSession(liveSessionKey, {
       resetPanels: true,
       requireTranscript: targetHasPersistedTranscript,
     })) {
@@ -2297,6 +2534,7 @@ export default function App() {
       ? cachedTranscriptCandidate
       : null;
     if (cachedTranscriptCandidate && !cachedTranscript) {
+      if (!canPublishRestore("stale_transcript_cache_discard")) return;
       if (liveSessionKey) sessionTranscriptCacheRef.current.delete(liveSessionKey);
       appendDebugLog("warn", "session.restore", {
         sessionId: id,
@@ -2305,9 +2543,9 @@ export default function App() {
       });
     }
     if (cachedTranscript && (cachedTranscript.taskFlow.length > 0 || cachedTranscript.conversationTurns.length > 0 || !targetHasPersistedTranscript)) {
+      if (!canPublishRestore("transcript_cache")) return;
       const patch = buildPagedRuntimePatch(cachedTranscript, useAppStore.getState());
       syncTaskIdCounterFromBlocks(patch.taskFlow);
-      if (!isCurrentRestore()) return;
       useAppStore.setState(patch);
       appendDebugLog("info", "session.restore", {
         sessionId: id,
@@ -2317,7 +2555,7 @@ export default function App() {
         taskFlowBlocks: patch.taskFlow.length,
         conversationTurns: patch.conversationTurns.length,
       });
-      useAppStore.getState().saveCurrentRuntimeToSession();
+      saveRestoredRuntimeToSession();
       finishRestore();
       return;
     }
@@ -2335,8 +2573,13 @@ export default function App() {
           loadProjectSessionMeta(scopeKey, id),
           loadProjectSessionPage(scopeKey, id, null, SESSION_INITIAL_PAGE_TURNS),
         ]);
-        if (!isCurrentRestore()) return;
+        if (!canPublishRestore("paged_load")) return;
         const merged = mergeSessionPage(null, page);
+        const transcriptMetadata = resolveSessionTranscriptPageMetadata({
+          loadedTurns: merged.conversationTurns.length,
+          totalTurns: page.totalTurns,
+          hasMore: page.hasMore,
+        });
         const cacheEntry = {
           scopeKey,
           sessionId: id,
@@ -2368,7 +2611,7 @@ export default function App() {
           merged.taskFlow.length === 0 &&
           merged.conversationTurns.length === 0;
         if (shouldDiscardMissingMeta) {
-          if (!isCurrentRestore()) return;
+          if (!canPublishRestore("missing_prune")) return;
           const state = useAppStore.getState();
           const sessions = state.sessionsByWorkspace[scopeKey] || [];
           const fallbackSession = chooseSessionAfterDelete(sessions, id);
@@ -2382,6 +2625,7 @@ export default function App() {
           if (fallbackSession) {
             void restoreSessionState(fallbackSession, fallbackSession.id, scopeKey);
           } else {
+            releaseRestoreAutosaveSuspension();
             resetToEmptyChatView();
             finishRestore();
           }
@@ -2392,10 +2636,12 @@ export default function App() {
               ...target,
               planLifecycleEpoch: expectedSessionEpoch,
               messages: [],
+              ...transcriptMetadata,
               runtimeSnapshot: {
                 ...(target.runtimeSnapshot || {}),
                 taskFlow: [],
                 conversationTurns: [],
+                ...transcriptMetadata,
               },
             }
           : {
@@ -2403,13 +2649,15 @@ export default function App() {
               ...meta,
               planLifecycleEpoch: expectedSessionEpoch,
               messages: merged.taskFlow,
+              ...transcriptMetadata,
               runtimeSnapshot: {
                 ...(meta.runtimeSnapshot || {}),
                 taskFlow: merged.taskFlow,
                 conversationTurns: merged.conversationTurns,
+                ...transcriptMetadata,
               },
             };
-        if (!isCurrentRestore()) return;
+        if (!canPublishRestore("paged_hydration")) return;
         if (!shouldIgnoreMissingMetaForLocalTemporary) {
           updateSession(scopeKey, id, hydratedTarget);
         }
@@ -2425,7 +2673,7 @@ export default function App() {
             ...(await loadProjectSession(scopeKey, id)),
             planLifecycleEpoch: expectedSessionEpoch,
           };
-          if (!isCurrentRestore()) return;
+          if (!canPublishRestore("legacy_load")) return;
           updateSession(scopeKey, id, hydratedTarget);
         } catch (fallbackError) {
           appendDebugLog("warn", "session.restore", {
@@ -2438,7 +2686,7 @@ export default function App() {
         }
       }
     }
-    if (!isCurrentRestore()) return;
+    if (!canPublishRestore("hydrated_target")) return;
 
     if (
       hydratedTarget?.storageStatus === "missing" &&
@@ -2458,6 +2706,7 @@ export default function App() {
       if (fallbackSession) {
         void restoreSessionState(fallbackSession, fallbackSession.id, scopeKey);
       } else {
+        releaseRestoreAutosaveSuspension();
         resetToEmptyChatView();
         finishRestore();
       }
@@ -2477,6 +2726,7 @@ export default function App() {
         restoredTaskFlow,
       );
       syncTaskIdCounterFromBlocks(restoredTaskFlow);
+      if (!canPublishRestore("runtime_snapshot")) return;
       useAppStore.setState(buildRestoredSessionRuntimePatch({
         snapshot: {
           ...snapshot,
@@ -2500,12 +2750,13 @@ export default function App() {
         agentMessages: (snapshot.agentMessages || []).length,
         conversationTurns: restoredConversationTurns.length,
       });
-      useAppStore.getState().saveCurrentRuntimeToSession();
+      saveRestoredRuntimeToSession();
       finishRestore();
       return;
     }
 
     if (target?.messages?.length) {
+      if (!canPublishRestore("legacy_messages")) return;
       syncTaskIdCounterFromBlocks(target.messages);
       const turnId = `loaded-${id}-${Date.now()}`;
       const restoredMainMode = resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode");
@@ -2561,12 +2812,13 @@ export default function App() {
         elapsedMs: Math.round(performance.now() - startedAt),
         taskFlowBlocks: target.messages.length,
       });
-      useAppStore.getState().saveCurrentRuntimeToSession();
+      saveRestoredRuntimeToSession();
       finishRestore();
       return;
     }
 
     const restoredMainMode = resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode");
+    if (!canPublishRestore("empty")) return;
     useAppStore.setState({
       taskFlow: [],
       selectedMainModeKey: restoredMainMode,
@@ -2628,9 +2880,12 @@ export default function App() {
       hydrateWorkspacePlanForEmptySession("empty_session_restore");
     }
     if (target?.storageStatus !== "ok") {
-      useAppStore.getState().saveCurrentRuntimeToSession();
+      saveRestoredRuntimeToSession();
     }
     finishRestore();
+    } finally {
+      settleSessionAdmissionRestore(admissionRestoreLease);
+    }
   };
 
   const openSessionScope = (scopeKey: string) => {
@@ -3195,7 +3450,7 @@ export default function App() {
     return target.id;
   }, []);
 
-  const runFeishuRemoteMessage = useCallback(function runFeishuRemoteMessage(
+  const runFeishuRemoteMessage = useCallback(async function runFeishuRemoteMessage(
     message: FeishuInboundMessage,
     fromQueue = false,
   ) {
@@ -3244,6 +3499,33 @@ export default function App() {
             messageId: message.messageId || null,
             reason,
           });
+          if (reason === "replay_failed") {
+            void useAppStore.getState().acceptWorkspaceInstruction({
+              text: message.text,
+              source: "im_adapter",
+              clientSubmissionId: `feishu-${message.messageId || `${message.chatId}-${message.timestamp || Date.now()}`}`,
+              remoteFeishu: {
+                adapter: "feishu",
+                chatId: message.chatId,
+                userId: message.userId,
+                userName: message.userName,
+                messageId: message.messageId,
+              },
+              forceVisibleErrorConclusion: "workspace_clear_replay_exhausted",
+            }).then((acceptance) => {
+              void sendFeishuText(
+                message,
+                acceptance.accepted
+                  ? useAppStore.getState().config.language === "en"
+                    ? `MAIN preserved this task as Turn ${acceptance.receipt.turnId} and closed it with a visible error after replay retries were exhausted.`
+                    : `MAIN 已将该任务保留为回合 ${acceptance.receipt.turnId}，并在重放重试耗尽后以可见错误结论收口。`
+                  : useAppStore.getState().config.language === "en"
+                    ? "MAIN could not preserve this task because its workspace owner changed. Please send it again."
+                    : "工作区所有者已变化，MAIN 无法保留该任务；请重新发送。",
+              );
+            });
+            return;
+          }
           void sendFeishuText(
             message,
             state.config.language === "en"
@@ -3257,32 +3539,18 @@ export default function App() {
       appendDebugLog("info", "feishu.workspace_clear_submission_deferred", {
         workspaceKey,
         disposition: workspaceClearDeferral.disposition,
-        replacedSubmissionId: workspaceClearDeferral.replacedSubmissionId,
-        queuePolicy: "single_slot_latest_wins",
+        queuePosition: workspaceClearDeferral.queuePosition,
+        queuePolicy: "strict_fifo",
       });
       if (!fromQueue) {
         void sendFeishuText(
           message,
           state.config.language === "en"
-            ? "Workspace history is being cleared. This latest remote task is retained and will run after clearing settles."
-            : "工作区历史正在清理；这条最新远程任务已保留，将在清理完成后执行。",
+            ? `Workspace history is being cleared. This remote task is held in the current app process at FIFO position ${workspaceClearDeferral.queuePosition}. Keep MAIN open until it runs; if MAIN exits, send it again.`
+            : `工作区历史正在清理；这条远程任务当前仅由应用进程保留在 FIFO 第 ${workspaceClearDeferral.queuePosition} 位。请保持 MAIN 运行直到任务开始；若 MAIN 退出，请重新发送。`,
         );
       }
       return true;
-    }
-
-    const busy = state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review";
-    if (busy) {
-      if (!fromQueue) {
-        remoteFeishuQueueRef.current.push(message);
-        void sendFeishuText(
-          message,
-          state.config.language === "en"
-            ? `MAIN is busy. Your message has been queued at position ${remoteFeishuQueueRef.current.length}.`
-            : `MAIN 正在处理上一条任务，已将这条消息加入队列（第 ${remoteFeishuQueueRef.current.length} 位）。`,
-        );
-      }
-      return false;
     }
 
     const scopeKey = workspaceKey;
@@ -3307,32 +3575,56 @@ export default function App() {
     } else {
       ensureFeishuRemoteSession(message);
     }
-    void sendFeishuText(
-      message,
-      state.config.language === "en" ? "MAIN received the remote task and started processing." : "MAIN 已收到远程任务，开始处理。",
-    );
-    runAfterNextPaint(() => {
-      const intentOverride = resolveFeishuRemoteIntentOverride(message.text);
-      useAppStore.getState().sendMessage(message.text, undefined, {
+    await new Promise<void>((resolve) => runAfterNextPaint(resolve));
+    const latest = useAppStore.getState();
+    const intentOverride = resolveFeishuRemoteIntentOverride(message.text);
+    const acceptance = await latest.acceptWorkspaceInstruction({
+      text: message.text,
+      source: "im_adapter",
+      clientSubmissionId: `feishu-${message.messageId || `${message.chatId}-${message.timestamp || Date.now()}`}`,
+      dispatchHints: {
         ...intentOverride,
         ...(intentOverride.resolvedIntent === "analyze"
           ? {
-              turnTitle: state.config.language === "en" ? "Feishu remote analysis" : "飞书远程分析",
-              intentSummary: state.config.language === "en"
+              turnTitle: latest.config.language === "en" ? "Feishu remote analysis" : "飞书远程分析",
+              intentSummary: latest.config.language === "en"
                 ? "Feishu remote private-chat message defaults to read-only analysis in the current workspace."
                 : "飞书私聊远程消息默认按当前工作区的只读分析处理。",
             }
           : {}),
-        remoteFeishu: {
-          adapter: "feishu",
-          chatId: message.chatId,
-          userId: message.userId,
-          userName: message.userName,
-          messageId: message.messageId,
-        },
-      });
+      },
+      remoteFeishu: {
+        adapter: "feishu",
+        chatId: message.chatId,
+        userId: message.userId,
+        userName: message.userName,
+        messageId: message.messageId,
+      },
     });
-    return true;
+    if (acceptance.accepted) {
+      void sendFeishuText(
+        message,
+        latest.config.language === "en"
+          ? `MAIN accepted this as Turn ${acceptance.receipt.turnId} (queue position ${acceptance.queuePosition}).`
+          : `MAIN 已将该指令接纳为回合 ${acceptance.receipt.turnId}（队列位置 ${acceptance.queuePosition}）。`,
+      );
+      return true;
+    }
+    appendDebugLog("warn", "feishu.workspace_instruction_acceptance_failed", {
+      workspaceKey,
+      messageId: message.messageId || null,
+      reason: acceptance.reason,
+      retainedForReplay: fromQueue,
+    });
+    if (!fromQueue) {
+      void sendFeishuText(
+        message,
+        latest.config.language === "en"
+          ? `MAIN could not accept this task (${acceptance.reason}). Please retry.`
+          : `MAIN 无法接纳该任务（${acceptance.reason}），请重试。`,
+      );
+    }
+    return false;
   }, [ensureFeishuRemoteSession, sendFeishuText]);
 
   const handleFeishuCardAction = useCallback((event: FeishuCardActionEvent) => {
@@ -3561,16 +3853,15 @@ export default function App() {
       const status = state.feishuAdapterStatus;
       const workspaceLabel = state.currentWorkspace || (state.config.language === "en" ? "No workspace" : "未打开工作区");
       const text = state.config.language === "en"
-        ? `Feishu adapter: ${status.status}\nMAIN: ${state.agentStatus}\nWorkspace: ${workspaceLabel}\nQueue: ${remoteFeishuQueueRef.current.length}`
-        : `飞书适配器：${status.status}\nMAIN 状态：${state.agentStatus}\n工作区：${workspaceLabel}\n队列：${remoteFeishuQueueRef.current.length}`;
+        ? `Feishu adapter: ${status.status}\nMAIN: ${state.agentStatus}\nWorkspace: ${workspaceLabel}\nQueue: ${state.workspaceTurnQueue?.entries.length || 0}`
+        : `飞书适配器：${status.status}\nMAIN 状态：${state.agentStatus}\n工作区：${workspaceLabel}\n队列：${state.workspaceTurnQueue?.entries.length || 0}`;
       void sendFeishuText(message, text);
       return;
     }
 
     if (command.kind === "stop") {
       state.stopGeneration();
-      remoteFeishuQueueRef.current = [];
-      void sendFeishuText(message, state.config.language === "en" ? "Stopped current generation and cleared the remote queue." : "已停止当前生成，并清空远程队列。");
+      void sendFeishuText(message, state.config.language === "en" ? "Stopped the current generation. Admitted Turns remain in the durable queue." : "已停止当前生成；已接纳的回合仍保留在持久化队列中。");
       return;
     }
 
@@ -3671,14 +3962,6 @@ export default function App() {
       unlisten?.();
     };
   }, [handleFeishuCardAction, handleFeishuInboundMessage]);
-
-  useEffect(() => {
-    const state = useAppStore.getState();
-    const busy = state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review";
-    if (busy || remoteFeishuQueueRef.current.length === 0) return;
-    const next = remoteFeishuQueueRef.current.shift();
-    if (next) runFeishuRemoteMessage(next, true);
-  }, [agentStatus, isStreaming, runFeishuRemoteMessage]);
 
   const startResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsResizing(true); };
   const startFilePanelResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsFilePanelResizing(true); };

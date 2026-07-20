@@ -372,7 +372,7 @@ test("Plan review Capsule approves the exact request while the right panel is cl
   await expect(page.getByTestId("execution-capsule-tool-review")).toHaveCount(0);
 });
 
-test("double-clicking PlanPanel approval does not create a queued instruction", async ({ page }) => {
+test("double-clicking PlanPanel approval remains one same-Turn ActionDecision", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await prepareFormalPlanReview(page);
 
@@ -387,26 +387,14 @@ test("double-clicking PlanPanel approval does not create a queued instruction", 
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false))
     .toBe(true);
   await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage?.text ?? null))
-    .toBeNull();
-  await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? null))
     .toBe(1);
   await expect
-    .poll(async () => page.evaluate(() => {
-      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-      const consentTurnId = snapshot?.currentTurnExecutionConsent?.turnId ?? "";
-      return {
-        consentTurnId,
-        currentTurnId: snapshot?.currentTurnId ?? "",
-        executionStartedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? "",
-      };
-    }))
-    .toEqual({
-      consentTurnId: "e2e-execution-capsule-panel-stability-turn",
-      currentTurnId: "e2e-execution-capsule-panel-stability-turn",
-      executionStartedForTurnId: "e2e-execution-capsule-panel-stability-turn",
-    });
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowUserCount ?? null))
+    .toBe(1);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId ?? ""))
+    .toBe("e2e-execution-capsule-panel-stability-turn");
   await expect
     .poll(async () => page.evaluate(() => {
       const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
@@ -427,7 +415,12 @@ test("double-clicking PlanPanel approval does not create a queued instruction", 
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().executionChildTurns ?? null))
     .toBe(0);
-  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    return entries.filter(
+      (entry: { source?: string }) => entry.source === "store.workspace_instruction_admitted",
+    ).length;
+  })).toBe(0);
 });
 
 test("plan approval without a live loop restarts execution on the same conversation turn", async ({ page }) => {
@@ -468,13 +461,15 @@ test("revoked plan approval cannot be executed by a stale store fallback", async
       return {
         isPlanApproved: snapshot?.isPlanApproved ?? null,
         currentTurnStatus: snapshot?.currentTurnStatus ?? null,
+        currentTurnResultKind: snapshot?.currentTurnResultKind ?? null,
         startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
         pendingHandoff: snapshot?.pendingPlanApprovalHandoff ?? null,
       };
     }))
     .toEqual({
       isPlanApproved: false,
-      currentTurnStatus: "stopped_no_action",
+      currentTurnStatus: "done",
+      currentTurnResultKind: "canceled",
       startedForTurnId: null,
       pendingHandoff: null,
   });
@@ -510,6 +505,7 @@ test("failed same-turn execution submission rolls back the started marker and pr
         conversationTurns: snapshot?.conversationTurns ?? null,
         currentTurnStatus: snapshot?.currentTurnStatus ?? null,
         agentStatus: snapshot?.agentStatus ?? null,
+        planLifecycleStatus: snapshot?.planLifecycleStatus ?? null,
         startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
         pendingPlanTurnId: snapshot?.pendingPlanApprovalHandoff?.planTurnId ?? null,
       };
@@ -518,8 +514,9 @@ test("failed same-turn execution submission rolls back the started marker and pr
       conversationTurns: 1,
       currentTurnStatus: "paused",
       agentStatus: "idle",
+      planLifecycleStatus: "paused",
       startedForTurnId: null,
-      pendingPlanTurnId: "e2e-execution-capsule-panel-stability-turn",
+      pendingPlanTurnId: null,
     });
 
   await page.getByTestId("plan-resume-button").click();

@@ -982,6 +982,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rejectPlan,
     rejectPlanAndDeleteFiles,
     sendMessage,
+    acceptWorkspaceInstruction,
     deletePersistedPlanFiles,
     deleteBrowserValidationArtifacts,
     agentStatus,
@@ -1020,6 +1021,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rejectPlan: useAppStore((s) => s.rejectPlan),
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     sendMessage: useAppStore((s) => s.sendMessage),
+    acceptWorkspaceInstruction: useAppStore((s) => s.acceptWorkspaceInstruction),
     deletePersistedPlanFiles: useAppStore((s) => s.deletePersistedPlanFiles),
     deleteBrowserValidationArtifacts: useAppStore((s) => s.deleteBrowserValidationArtifacts),
     agentStatus: useAppStore((s) => s.agentStatus),
@@ -1216,12 +1218,16 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     const planTurnId = latestPlanTurn?.id || currentTurnId || undefined;
     const e2eQuickReplyHandler = getE2EQuickReplyHandler();
     if (e2eQuickReplyHandler?.(text, planTurnId)) return;
-    sendMessage(text, undefined, {
-      resolvedIntent: "plan",
-      skipIntentResolution: true,
-      reuseCurrentTurn: !!planTurnId,
-      turnIdOverride: planTurnId,
-      preservePlanState: true,
+    void acceptWorkspaceInstruction({
+      text,
+      source: "plan_adjustment",
+      dispatchHints: {
+        resolvedIntent: "plan",
+        runtimeIntentOverride: "plan",
+        skipIntentResolution: true,
+        preservePlanState: true,
+        ...(planTurnId ? { parentPlanTurnId: planTurnId } : {}),
+      },
     });
   };
   const handleResumeExecution = () => {

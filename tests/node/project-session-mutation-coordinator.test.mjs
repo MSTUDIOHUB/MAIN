@@ -42,9 +42,70 @@ const {
   createProjectSessionMutationCoordinator,
   ProjectSessionDeleteFencedError,
   ProjectSessionWorkspaceClearFencedError,
+  ProjectSessionStaleWriteFencedError,
+  isProjectSessionAdmissionProjectionOwned,
 } = loadTranspiledModuleSync(
   path.join(process.cwd(), "src/lib/projectSessionMutationCoordinator.ts"),
 );
+
+test("only an exact admission receipt may serialize a persisting queue projection", () => {
+  const session = {
+    runtimeSnapshot: {
+      workspaceTurnQueue: {
+        entries: [{
+          status: "persisting",
+          receipt: { receiptId: "receipt-1" },
+        }],
+      },
+    },
+  };
+
+  assert.equal(isProjectSessionAdmissionProjectionOwned(session), false);
+  assert.equal(isProjectSessionAdmissionProjectionOwned(session, "receipt-other"), false);
+  assert.equal(isProjectSessionAdmissionProjectionOwned(session, "receipt-1"), true);
+  session.runtimeSnapshot.workspaceTurnQueue.entries.push({
+    status: "persisting",
+    receipt: { receiptId: "receipt-2" },
+  });
+  assert.equal(isProjectSessionAdmissionProjectionOwned(session, "receipt-1"), false);
+  session.runtimeSnapshot.workspaceTurnQueue.entries = [{
+    status: "queued",
+    receipt: { receiptId: "receipt-1" },
+  }];
+  assert.equal(isProjectSessionAdmissionProjectionOwned(session), true);
+});
+
+test("an owner save rechecks its runtime revision only when it reaches the mutation head", async () => {
+  const coordinator = createProjectSessionMutationCoordinator();
+  const ownerKey = "workspace-a\u00006";
+  const firstGate = deferred();
+  let currentRevision = 1;
+  const calls = [];
+  const firstSave = coordinator.save(ownerKey, async () => {
+    calls.push("save-current");
+    await firstGate.promise;
+    return "saved-current";
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const staleSave = coordinator.save(
+    ownerKey,
+    async () => {
+      calls.push("save-stale");
+      return "saved-stale";
+    },
+    { isCurrent: () => currentRevision === 1 },
+  );
+  currentRevision = 2;
+  firstGate.resolve();
+
+  assert.equal(await firstSave, "saved-current");
+  await assert.rejects(
+    staleSave,
+    (error) => error instanceof ProjectSessionStaleWriteFencedError,
+  );
+  assert.deepEqual(calls, ["save-current"]);
+});
 
 function deferred() {
   let resolve;

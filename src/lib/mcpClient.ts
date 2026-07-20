@@ -14,6 +14,36 @@ export interface MCPTool {
   name: string;
   description: string;
   inputSchema: any;
+  /**
+   * MAIN-owned discovery identity. MCP servers never author this field.
+   * Keeping the remote name and server identity on the discovered value lets
+   * the ToolCatalog resolve duplicate bare names without relying on discovery
+   * completion order.
+   */
+  _mainMcpOrigin?: MCPToolOrigin;
+}
+
+export interface MCPToolOrigin {
+  serverName: string;
+  serverUrl: string;
+  remoteName: string;
+}
+
+export function getMcpToolOrigin(tool: MCPTool): MCPToolOrigin | undefined {
+  const origin = tool._mainMcpOrigin;
+  if (!origin?.serverUrl || !origin.remoteName) return undefined;
+  return origin;
+}
+
+export function getMcpToolServerUrl(
+  tool: MCPTool,
+  fallbackMap?: Record<string, string>,
+): string | undefined {
+  return getMcpToolOrigin(tool)?.serverUrl || fallbackMap?.[tool.name];
+}
+
+export function getMcpToolRemoteName(tool: MCPTool): string {
+  return getMcpToolOrigin(tool)?.remoteName || tool.name;
 }
 
 interface JsonRpcRequest {
@@ -605,7 +635,14 @@ export async function discoverAllMcpTools(
         const tools = await discoverMcpTools(server);
         mcpDiscoveryFailureCache.delete(getMcpDiscoveryFailureCacheKey(server));
         for (const tool of tools) {
-          allTools.push(tool);
+          allTools.push({
+            ...tool,
+            _mainMcpOrigin: {
+              serverName: server.name,
+              serverUrl: server.url,
+              remoteName: tool.name,
+            },
+          });
           map[tool.name] = server.url;
         }
         statusSnapshots.push({
@@ -665,7 +702,26 @@ export async function discoverAllMcpTools(
     return (statusOrder.get(keyA) ?? Number.MAX_SAFE_INTEGER) - (statusOrder.get(keyB) ?? Number.MAX_SAFE_INTEGER);
   });
 
-  return { tools: allTools, toolServerMap: map, serverStatuses: statusSnapshots };
+  allTools.sort((left, right) => {
+    const leftOrigin = getMcpToolOrigin(left);
+    const rightOrigin = getMcpToolOrigin(right);
+    const leftKey = `${leftOrigin?.serverName || ""}\u0000${leftOrigin?.serverUrl || ""}\u0000${leftOrigin?.remoteName || left.name}`;
+    const rightKey = `${rightOrigin?.serverName || ""}\u0000${rightOrigin?.serverUrl || ""}\u0000${rightOrigin?.remoteName || right.name}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+
+  // Preserve the legacy bare-name map for callers that have not adopted the
+  // ToolCatalog yet, but make its fallback winner deterministic. The catalog
+  // retains every registration and never uses this lossy map for conflicts.
+  const deterministicToolServerMap: Record<string, string> = {};
+  for (const tool of allTools) {
+    const serverUrl = getMcpToolServerUrl(tool, map);
+    if (serverUrl && !(tool.name in deterministicToolServerMap)) {
+      deterministicToolServerMap[tool.name] = serverUrl;
+    }
+  }
+
+  return { tools: allTools, toolServerMap: deterministicToolServerMap, serverStatuses: statusSnapshots };
 }
 
 export async function executeMcpTool(

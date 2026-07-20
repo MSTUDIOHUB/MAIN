@@ -159,3 +159,81 @@ test("a preallocated fresh Turn id remains valid for a new continuation", () => 
 
   assert.equal(draft.turnId, "turn-preallocated");
 });
+
+test("durable admission adopts the exact open Turn and linked user block", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    conversationTurns: [conversationTurn({
+      id: "turn-admitted",
+      status: "awaiting_input",
+      blockIds: [41],
+    })],
+    adoptExistingTurn: true,
+    admittedUserBlockId: 41,
+    turnIdOverride: "turn-admitted",
+    createTurnId: () => {
+      throw new Error("adoption must not allocate another Turn id");
+    },
+  }));
+
+  assert.deepEqual(draft.adoptionDecision, {
+    kind: "adopted",
+    turnId: "turn-admitted",
+    userBlockId: 41,
+  });
+  assert.equal(draft.turnId, "turn-admitted");
+  assert.equal(draft.existingTurn?.id, "turn-admitted");
+});
+
+test("durable admission replaces its provisional title with an exact intent title", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    conversationTurns: [conversationTurn({
+      id: "turn-admitted-debug",
+      title: "/MDEBUG Terminal output is missing",
+      status: "planning",
+      blockIds: [43],
+    })],
+    text: "[MDEBUG: USER FEEDBACK SELF-REPAIR]",
+    effectiveRunIntent: "plan",
+    isMainDebugShortcut: true,
+    optionTurnTitle: "MDEBUG：用户反馈自修复",
+    adoptExistingTurn: true,
+    admittedUserBlockId: 43,
+    turnIdOverride: "turn-admitted-debug",
+  }));
+
+  assert.equal(draft.adoptionDecision.kind, "adopted");
+  assert.equal(draft.titleDecision.turnTitle, "MDEBUG：用户反馈自修复");
+});
+
+test("durable admission deterministically rejects missing and closed Turns", () => {
+  const missing = prepareSubmitTurnDraft(baseInput({
+    adoptExistingTurn: true,
+    admittedUserBlockId: 41,
+    turnIdOverride: "turn-missing",
+  }));
+  assert.deepEqual(missing.adoptionDecision, {
+    kind: "rejected",
+    reason: "turn_not_found",
+    turnId: "turn-missing",
+    userBlockId: 41,
+  });
+  assert.equal(missing.existingTurn, null);
+
+  const closed = prepareSubmitTurnDraft(baseInput({
+    conversationTurns: [conversationTurn({
+      id: "turn-closed",
+      status: "done",
+      blockIds: [42],
+    })],
+    adoptExistingTurn: true,
+    admittedUserBlockId: 42,
+    turnIdOverride: "turn-closed",
+  }));
+  assert.deepEqual(closed.adoptionDecision, {
+    kind: "rejected",
+    reason: "turn_closed",
+    turnId: "turn-closed",
+    userBlockId: 42,
+  });
+  assert.equal(closed.existingTurn, null);
+});

@@ -6,6 +6,31 @@ test.beforeEach(async ({ page }) => {
       window.localStorage.clear();
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    const admission = ((window as any).__WORKSPACE_ADMISSION_E2E__ ??= {
+      savedSessions: [] as unknown[],
+      failNextSave: false,
+    });
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return 1;
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "save_project_session") {
+        if (admission.failNextSave) {
+          admission.failNextSave = false;
+          throw new Error("forced workspace admission save failure");
+        }
+        admission.savedSessions.push(args?.session ?? null);
+        return args?.session ?? null;
+      }
+      if (cmd === "list_project_sessions") return [];
+      return null;
+    };
   });
 });
 
@@ -196,7 +221,7 @@ for (const submissionKind of ["capsule", "slash"] as const) {
   });
 }
 
-test("Goal capsule keeps one-shot authority when App queues an agentStatus-busy submit", async ({ page }) => {
+test("Goal capsule keeps one-shot authority when a busy workspace durably admits the Turn", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -210,30 +235,43 @@ test("Goal capsule keeps one-shot authority when App queues an agentStatus-busy 
   }));
   await page.getByTestId("composer-send-button").click();
 
-  await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage),
-  ).toMatchObject({
-    text: "排队后继续修复直到验证完成",
-    goalCreationAuthorizationSource: "visible_goal_composer_capsule",
+  await expect(page.getByTestId("user-message-content").last()).toHaveText("排队后继续修复直到验证完成");
+  await expect.poll(async () => page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    const admitted = entries
+      .filter((entry: { source?: string }) => entry.source === "store.workspace_instruction_admitted")
+      .map((entry: { message?: string }) => JSON.parse(String(entry.message || "{}")));
+    return admitted.at(-1) || null;
+  })).toMatchObject({
+    queuePosition: 1,
+    durability: "session",
   });
+  await expect.poll(async () => page.evaluate(() => {
+    const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
+    const entries = savedSessions.flatMap(
+      (session: any) => session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [],
+    );
+    const admitted = entries.find((entry: any) =>
+      entry?.instruction?.payload?.text === "排队后继续修复直到验证完成"
+    );
+    return {
+      turnId: admitted?.receipt?.turnId ?? null,
+      authorizationSource:
+        admitted?.instruction?.payload?.dispatchHints?.goalCreationAuthorization?.source ?? null,
+    };
+  })).toMatchObject({
+    turnId: expect.any(String),
+    authorizationSource: "visible_goal_composer_capsule",
+  });
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
   await expect.poll(async () =>
     page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
   ).toBe(null);
-
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
-    isGenerating: false,
-    agentStatus: "idle",
-  }));
-  await page.getByTestId("composer-guidance-button").click();
-  await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
-  ).toBe("排队后继续修复直到验证完成");
-  await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
-  ).toBe("goal");
+  await expect(page.getByTestId("user-message-content")).toHaveCount(1);
 });
 
-test("Goal capsule keeps one-shot authority through Composer's streaming direct queue", async ({ page }) => {
+test("Goal capsule keeps one-shot authority when streaming admission waits for dispatch", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -247,27 +285,126 @@ test("Goal capsule keeps one-shot authority through Composer's streaming direct 
   }));
   await page.getByTestId("composer-send-button").click();
 
+  await expect(page.getByTestId("user-message-content").last()).toHaveText("当前轮结束后继续完成这个目标");
+  await expect.poll(async () => page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    const admitted = entries
+      .filter((entry: { source?: string }) => entry.source === "store.workspace_instruction_admitted")
+      .map((entry: { message?: string }) => JSON.parse(String(entry.message || "{}")));
+    return admitted.at(-1) || null;
+  })).toMatchObject({
+    queuePosition: 1,
+    durability: "session",
+  });
+  await expect.poll(async () => page.evaluate(() => {
+    const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
+    const entries = savedSessions.flatMap(
+      (session: any) => session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [],
+    );
+    const admitted = entries.find((entry: any) =>
+      entry?.instruction?.payload?.text === "当前轮结束后继续完成这个目标"
+    );
+    return {
+      turnId: admitted?.receipt?.turnId ?? null,
+      authorizationSource:
+        admitted?.instruction?.payload?.dispatchHints?.goalCreationAuthorization?.source ?? null,
+    };
+  })).toMatchObject({
+    turnId: expect.any(String),
+    authorizationSource: "visible_goal_composer_capsule",
+  });
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
   await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage),
-  ).toMatchObject({
-    text: "当前轮结束后继续完成这个目标",
-    goalCreationAuthorizationSource: "visible_goal_composer_capsule",
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+  ).toBe(null);
+  await expect(page.getByTestId("user-message-content")).toHaveCount(1);
+});
+
+test("locked Plan intent remains exact while its durable Turn waits in FIFO", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-plan").click();
+  await textarea.fill("先检查运行时边界，再输出修复计划");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
+    isGenerating: true,
+    agentStatus: "running",
+  }));
+  await page.getByTestId("composer-send-button").click();
+
+  await expect.poll(async () => page.evaluate(() => {
+    const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
+    for (const session of savedSessions as any[]) {
+      const entries = session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [];
+      const admitted = entries.find((entry: any) =>
+        entry?.instruction?.payload?.text === "先检查运行时边界，再输出修复计划"
+      );
+      if (!admitted) continue;
+      const turn = (session?.runtimeSnapshot?.conversationTurns || []).find(
+        (candidate: any) => candidate?.id === admitted?.receipt?.turnId,
+      );
+      return {
+        hints: admitted.instruction.payload.dispatchHints || null,
+        turnIntent: turn?.intent ?? null,
+        turnDisplayIntent: turn?.displayIntent ?? null,
+      };
+    }
+    return null;
+  })).toMatchObject({
+    hints: {
+      resolvedIntent: "plan",
+      runtimeIntentOverride: "plan",
+      skipIntentResolution: true,
+    },
+    turnIntent: "plan",
+    turnDisplayIntent: "plan",
   });
   await expect.poll(async () =>
     page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
   ).toBe(null);
+});
 
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
-    isGenerating: false,
-    agentStatus: "idle",
-  }));
-  await page.getByTestId("composer-guidance-button").click();
+test("persistence failure closes one memory-accepted Plan Turn and consumes its draft once", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-plan").click();
+  const prompt = "这条 Plan 即使持久化失败也必须作为回合收口";
+  await textarea.fill(prompt);
+  await page.evaluate(() => {
+    (window as any).__WORKSPACE_ADMISSION_E2E__.failNextSave = true;
+  });
+
+  await page.getByTestId("composer-send-button").click();
+
+  await expect(textarea).toHaveValue("");
   await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
-  ).toBe("当前轮结束后继续完成这个目标");
-  await expect.poll(async () =>
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
-  ).toBe("goal");
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+  ).toBe(null);
+  await expect(page.getByTestId("user-message-content")).toHaveCount(1);
+  await expect(page.getByTestId("user-message-content")).toHaveText(prompt);
+  await expect(page.getByTestId("assistant-final")).toHaveCount(1);
+  await expect(page.getByTestId("assistant-final")).toContainText("Session 持久化失败");
+
+  await expect.poll(async () => page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    return entries
+      .filter((entry: { source?: string }) =>
+        entry.source === "store.workspace_instruction_admission_memory_terminalized"
+      )
+      .map((entry: { message?: string }) => JSON.parse(String(entry.message || "{}")));
+  })).toEqual([
+    expect.objectContaining({
+      turnId: expect.any(String),
+      durability: "memory",
+      resultKind: "error",
+    }),
+  ]);
+  await expect(page.getByTestId("composer-send-button")).toBeDisabled();
 });
 
 test("user message bubble preserves multiline composer input", async ({ page }) => {

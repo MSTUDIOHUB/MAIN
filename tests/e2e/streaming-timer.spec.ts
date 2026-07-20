@@ -6,6 +6,20 @@ test.beforeEach(async ({ page }) => {
       window.localStorage.clear();
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return 1;
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "save_project_session") return args?.session ?? null;
+      if (cmd === "list_project_sessions") return [];
+      return null;
+    };
   });
 });
 
@@ -17,7 +31,7 @@ test("ordinary running turn stays in the continuous flow while streaming", async
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 });
 
-test("composer queues and guides additional input while a run is active", async ({ page }) => {
+test("composer durably admits additional workspace Turns in FIFO order while a run is active", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-running-guidance");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -37,26 +51,66 @@ test("composer queues and guides additional input while a run is active", async 
     .toBe(true);
   await expect(autoReviewToggle).toBeDisabled();
 
-  await textarea.fill("追加检查导入后的空状态");
+  const firstInstruction = "追加检查导入后的空状态";
+  const secondInstruction = "然后验证恢复后的焦点状态";
+  await textarea.fill(firstInstruction);
   await expect(page.getByTestId("composer-send-button")).toBeVisible();
   await expect(page.getByTestId("composer-stop-button")).toHaveCount(0);
 
   await page.getByTestId("composer-send-button").click();
   await expect(textarea).toHaveValue("");
-  await expect(page.getByTestId("composer-queued-message")).toContainText("追加检查导入后的空状态");
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().input ?? "missing"))
     .toBe("");
-  await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage?.text ?? null))
-    .toBe("追加检查导入后的空状态");
 
-  await page.getByTestId("composer-guidance-button").click();
+  await textarea.fill(secondInstruction);
+  await page.getByTestId("composer-send-button").click();
+  await expect(textarea).toHaveValue("");
+
+  await expect.poll(async () => page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    return entries
+      .filter((entry: { source?: string }) => entry.source === "store.workspace_instruction_admitted")
+      .map((entry: { message?: string }) => {
+        const message = JSON.parse(String(entry.message || "{}"));
+        return {
+          queuePosition: message.queuePosition,
+          turnId: message.turnId,
+          durability: message.durability,
+        };
+      });
+  })).toEqual([
+    expect.objectContaining({ queuePosition: 1, durability: "session" }),
+    expect.objectContaining({ queuePosition: 2, durability: "session" }),
+  ]);
+  const admittedTurns = await page.evaluate(() => {
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    return entries
+      .filter((entry: { source?: string }) => entry.source === "store.workspace_instruction_admitted")
+      .map((entry: { message?: string }) => JSON.parse(String(entry.message || "{}"))?.turnId);
+  });
+  expect(new Set(admittedTurns).size).toBe(2);
+
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      conversationTurns: snapshot?.conversationTurns ?? null,
+      taskFlowUserCount: snapshot?.taskFlowUserCount ?? null,
+      agentStatus: snapshot?.agentStatus ?? null,
+    };
+  })).toEqual({
+    conversationTurns: 3,
+    taskFlowUserCount: 3,
+    agentStatus: "running",
+  });
+  await expect(page.getByTestId("user-message-content")).toHaveText([
+    "请检查运行中输入体验。",
+    firstInstruction,
+    secondInstruction,
+  ]);
   await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
-  await expect(page.getByTestId("composer-active-guidance")).toContainText("追加检查导入后的空状态");
-  await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().activeGuidance?.text ?? null))
-    .toBe("追加检查导入后的空状态");
+  await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
+  await expect(page.getByTestId("composer-guidance-button")).toHaveCount(0);
 });
 
 test("composer subagent preference toggle activates after the current run stops", async ({ page }, testInfo) => {

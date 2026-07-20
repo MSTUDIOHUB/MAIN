@@ -230,23 +230,53 @@ test("a terminal conclusion child is created only after its owner was already pa
   );
 });
 
-test("queued guidance supersedes a permission wait through canonical cancellation", () => {
+test("composer waits for durable turn admission before clearing the submitted draft", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/Composer.tsx"), "utf8");
-  const start = source.indexOf("const handleGuideQueuedMessage");
+  const start = source.indexOf("const handleSubmitComposerMessage");
   const end = source.indexOf("// ── Handle textarea change", start);
   const handler = source.slice(start, end);
 
   assert.notEqual(start, -1);
   assert.ok(end > start);
-  assert.match(handler, /appState\.stopGeneration\(\)/);
-  assert.match(handler, /onSendMessage\(guidance, queuedUserMessage\.images \|\| \[\]/);
-  assert.doesNotMatch(handler, /appState\.abortController\?\.abort\(\)/);
-  assert.doesNotMatch(handler, /useAppStore\.setState\(/);
-  const pendingReviewBranch = handler.slice(
-    handler.indexOf('if (appState.agentStatus === "pending_review")'),
-    handler.indexOf("if (isStreaming)"),
+  assert.match(handler, /useCallback\(async \(\) =>/);
+  assert.match(
+    handler,
+    /const accepted = await Promise\.resolve\(onSendMessage\(textToSend, imagesToSend, \{[\s\S]*workspaceComposerIntentSnapshot:[\s\S]*mainModeKey: selectedMainModeKey,[\s\S]*lockedComposerIntent: lockedIntentToConsume/,
   );
-  assert.doesNotMatch(pendingReviewBranch, /clearQueuedUserMessage\(/);
+  assert.match(handler, /if \(accepted !== true\) \{\s*return;/);
+  assert.ok(
+    handler.indexOf("await Promise.resolve(onSendMessage") < handler.indexOf("setDraftInput((currentDraft)"),
+    "the submitted draft must remain visible until admission resolves true",
+  );
+  assert.ok(
+    handler.indexOf("if (accepted !== true)") < handler.indexOf("setLockedComposerIntent(null)"),
+    "a one-shot intent may only be consumed after durable admission succeeds",
+  );
+  assert.match(
+    handler,
+    /latestState\.lockedComposerIntent === lockedIntentToConsume[\s\S]*setLockedComposerIntent\(null\)/,
+  );
+  assert.doesNotMatch(handler, /if \(isStreaming\)/);
+  assert.doesNotMatch(handler, /queueUserMessage|activeGuidance|handleGuideQueuedMessage/);
+  assert.doesNotMatch(source, /composer-queued-message|composer-guidance-button|composer-active-guidance/);
+});
+
+test("workspace Composer persists its exact intent snapshot as dispatch hints", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
+  const start = source.indexOf("const handleSendMessage = useCallback");
+  const end = source.indexOf("const handleQuickReply", start);
+  const handler = source.slice(start, end);
+
+  assert.notEqual(start, -1);
+  assert.ok(end > start);
+  assert.match(handler, /buildWorkspaceComposerIntentDispatchHints\(\{/);
+  assert.match(handler, /snapshot: submitOptions\.workspaceComposerIntentSnapshot/);
+  assert.match(handler, /acceptWorkspaceInstruction\(\{[\s\S]*source: "composer",[\s\S]*dispatchHints/);
+  assert.doesNotMatch(
+    handler,
+    /snapshot:\s*\{[\s\S]*lockedComposerIntent:\s*state\.lockedComposerIntent/,
+    "the durable intent must come from the exact submit event, not mutable Store state",
+  );
 });
 
 test("desktop permission review is explicitly per-call in the ChatArea capsule", () => {

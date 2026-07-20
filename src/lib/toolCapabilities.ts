@@ -1,5 +1,11 @@
-import type { MCPServer, MCPTool } from "./mcpClient";
+import {
+  getMcpToolRemoteName,
+  getMcpToolServerUrl,
+  type MCPServer,
+  type MCPTool,
+} from "./mcpClient";
 import type { ResolvedUserIntent } from "./runIntent";
+import type { ToolCatalog } from "./toolCatalog";
 import type { ToolDefinition } from "./toolSchemas";
 import { looksDangerousShellCommand } from "./toolExecutionContract";
 
@@ -573,8 +579,9 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
 }
 
 export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
-  const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
-  if (EXTERNAL_READ_MCP_TOOL_NAMES.has(tool.name)) return "external_read";
+  const remoteName = getMcpToolRemoteName(tool);
+  const text = normalizeText(`${server?.name || ""} ${remoteName} ${tool.description || ""}`);
+  if (EXTERNAL_READ_MCP_TOOL_NAMES.has(remoteName)) return "external_read";
 
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
   if (containsAny(text, DESKTOP_CONTROL_TERMS)) return "desktop_control";
@@ -630,6 +637,8 @@ export function buildToolCapabilityRegistry(params: {
   mcpTools?: MCPTool[];
   mcpServers?: MCPServer[];
   mcpToolServerMap?: Record<string, string>;
+  /** Exact source/name projection used by the current Turn. */
+  toolCatalog?: ToolCatalog;
   policy?: ToolPermissionPolicy;
 }): ToolCapabilityRegistry {
   const policy = normalizeToolPermissionPolicy(params.policy);
@@ -651,10 +660,17 @@ export function buildToolCapabilityRegistry(params: {
 
   for (const definition of params.toolDefinitions) {
     const name = definition.function.name;
-    const serverUrl = params.mcpToolServerMap?.[name];
-    const mcpTool = mcpToolByName.get(name);
+    const catalogLookup = params.toolCatalog?.lookup(name);
+    const catalogEntry = catalogLookup?.status === "resolved" ? catalogLookup.entry : undefined;
+    const mcpTool = catalogEntry?.source === "mcp"
+      ? catalogEntry.mcpTool
+      : mcpToolByName.get(name);
+    const serverUrl = mcpTool
+      ? getMcpToolServerUrl(mcpTool, params.mcpToolServerMap)
+      : params.mcpToolServerMap?.[name];
     const server = serverUrl ? serverByUrl[serverUrl] : undefined;
-    const source: ToolSourceKind = mcpTool ? "mcp" : skillToolNames.has(name) ? "skill" : "built_in";
+    const source: ToolSourceKind = catalogEntry?.source ||
+      (mcpTool ? "mcp" : skillToolNames.has(name) ? "skill" : "built_in");
     const risk =
       source === "mcp" && mcpTool
         ? classifyMcpTool(mcpTool, server)
@@ -1544,6 +1560,8 @@ export function routeMcpToolsForPrompt(params: {
   const config = normalizeMcpRoutingConfig(params.config);
   const disabledKeys = new Set(config.disabledToolKeys);
   const enabledTools = params.tools.filter((tool) => !disabledKeys.has(tool.name));
+  const serverUrlFor = (tool: MCPTool): string =>
+    getMcpToolServerUrl(tool, params.toolServerMap) || "";
   const baseTelemetry = {
     selectedServerCount: 0,
     selectedToolCount: enabledTools.length,
@@ -1560,7 +1578,7 @@ export function routeMcpToolsForPrompt(params: {
   ) => {
     const serverUrls = new Set(
       selectedTools
-        .map((tool) => params.toolServerMap[tool.name])
+        .map(serverUrlFor)
         .filter((url): url is string => typeof url === "string" && url.length > 0),
     );
     const latencyMs = Date.now() - startedAt;
@@ -1597,14 +1615,14 @@ export function routeMcpToolsForPrompt(params: {
       (params.preferredServerUrls ?? []).filter((url) => typeof url === "string" && url.trim().length > 0),
     );
     const scopedTools = preferredServerUrls.size > 0
-      ? enabledTools.filter((tool) => preferredServerUrls.has(params.toolServerMap[tool.name] || ""))
+      ? enabledTools.filter((tool) => preferredServerUrls.has(serverUrlFor(tool)))
       : enabledTools;
     const candidateTools = scopedTools.length > 0 ? scopedTools : enabledTools;
 
     const serverByUrl = buildServerLookup(params.servers);
     const scoredEntries = candidateTools
       .map((tool) => {
-        const server = serverByUrl[params.toolServerMap[tool.name]];
+        const server = serverByUrl[serverUrlFor(tool)];
         return {
           tool,
           score:
@@ -1613,7 +1631,7 @@ export function routeMcpToolsForPrompt(params: {
         };
       });
     const scoredTools = scoredEntries
-      .filter((entry) => entry.score > 0 || preferredServerUrls.has(params.toolServerMap[entry.tool.name] || ""))
+      .filter((entry) => entry.score > 0 || preferredServerUrls.has(serverUrlFor(entry.tool)))
       .sort((a, b) => b.score - a.score || compareGameStudioPriorityToolNames(a.tool, b.tool, gameStudioRoutingContext))
       .map((entry) => entry.tool);
 
@@ -1667,7 +1685,7 @@ export function routeMcpToolsForPrompt(params: {
   const serverByUrl = buildServerLookup(params.servers);
   const scored = enabledTools
     .map((tool) => {
-      const server = serverByUrl[params.toolServerMap[tool.name]];
+      const server = serverByUrl[serverUrlFor(tool)];
       return { tool, score: scoreMcpToolForPrompt(tool, server, params.userPrompt) };
     })
     .filter((item) => item.score > 0)

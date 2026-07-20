@@ -25,6 +25,7 @@ import { extractReadFileWindowMetadata } from "../../readFileWindow";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase, TaskTargetingProfile } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
+import type { ToolCatalog } from "../../toolCatalog";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
@@ -315,6 +316,7 @@ export async function executeToolCallPhase(input: {
   hasStructuredProposal: boolean;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
+  toolCatalog: ToolCatalog;
   toolCapabilityRegistry: ToolCapabilityRegistry;
   toolPermissionPolicy: ToolPermissionPolicy;
   recentPlanToolActivity: PlanToolActivitySummary[];
@@ -444,12 +446,12 @@ export async function executeToolCallPhase(input: {
         executeRecoveryState.protocolNoProgressFingerprint,
     },
   );
-  const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
+  const leaseNormalizedToolCalls = normalizeLeaseBackedReadToolCalls(
     input.effectiveToolCalls,
     executeRecoveryState,
     recoveryActionContract,
   );
-  if (effectiveToolCalls.some((call, index) =>
+  if (leaseNormalizedToolCalls.some((call, index) =>
     call.arguments !== input.effectiveToolCalls[index]?.arguments
   )) {
     logAgentEvent("execute_recovery_read_args_normalized", {
@@ -460,6 +462,19 @@ export async function executeToolCallPhase(input: {
       coverageMode: executeRecoveryState.readLease?.coverageMode || "exact",
     });
   }
+  const effectiveToolCalls = leaseNormalizedToolCalls.map((call) => {
+    const resolution = input.toolCatalog.lookup(call.name);
+    if (resolution.status !== "resolved") return call;
+    const exposedName = resolution.entry.exposedName;
+    if (exposedName === call.name || !input.availableToolNames.has(exposedName)) return call;
+    logAgentEvent("tool_catalog_alias_resolved", {
+      requestedName: call.name,
+      exposedName,
+      canonicalName: resolution.entry.canonicalName,
+      source: resolution.entry.source,
+    });
+    return { ...call, name: exposedName };
+  });
 
   logAgentEvent("tool_calls_detected", {
     iteration: input.iteration,
@@ -534,6 +549,7 @@ export async function executeToolCallPhase(input: {
     callbacks: input.callbacks,
     iteration: input.iteration,
     iterationAllTools: input.iterationAllTools,
+    toolCatalog: input.toolCatalog,
     hooksConfig: input.hooksConfig,
     turnInputContextSignals: input.turnInputContextSignals,
     recentPlanToolActivity: input.recentPlanToolActivity,

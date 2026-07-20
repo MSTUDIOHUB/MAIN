@@ -1,7 +1,9 @@
 import type { AttachedFile } from "../lib/attachments";
 import { normalizeAttachedFile } from "../lib/attachments";
 import {
+  resolveSubmitExistingTurnAdoptionDecision,
   resolveSubmitTurnTitleDecision,
+  type SubmitExistingTurnAdoptionDecision,
   type SubmitTurnTitleDecision,
 } from "../lib/submit/turnSubmission";
 import type { TaskBlock } from "../lib/taskTypes";
@@ -34,6 +36,8 @@ export interface PrepareSubmitTurnDraftInput {
   isMainDebugShortcut: boolean;
   optionTurnTitle?: string | null;
   reuseCurrentTurn: boolean;
+  adoptExistingTurn?: boolean;
+  admittedUserBlockId?: number;
   reusableTurnId?: string | null;
   turnIdOverride?: string;
   uiParentTurnId?: string | null;
@@ -52,19 +56,31 @@ export interface SubmitTurnDraft {
   existingTurn: ConversationTurn | null;
   activeSession: SessionTitleSeedState | null;
   titleDecision: SubmitTurnTitleDecision;
+  adoptionDecision: SubmitExistingTurnAdoptionDecision;
 }
 
 export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): SubmitTurnDraft {
   const sessionState = input.sessionGet();
   const nextTaskId = sessionState._nextTaskId;
   const requestedTurnId = String(input.turnIdOverride || "").trim();
+  const adoptionDecision = resolveSubmitExistingTurnAdoptionDecision({
+    adoptExistingTurn: input.adoptExistingTurn,
+    reuseCurrentTurn: input.reuseCurrentTurn,
+    turnIdOverride: requestedTurnId,
+    admittedUserBlockId: input.admittedUserBlockId,
+    conversationTurns: input.conversationTurns,
+  });
   const availableNewTurnId = requestedTurnId &&
     !input.conversationTurns.some((turn) => turn.id === requestedTurnId)
     ? requestedTurnId
     : null;
-  const turnId = input.reuseCurrentTurn
-    ? input.reusableTurnId!
-    : availableNewTurnId || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const turnId = adoptionDecision.kind === "adopted"
+    ? adoptionDecision.turnId
+    : adoptionDecision.kind === "rejected"
+      ? requestedTurnId
+      : input.reuseCurrentTurn
+        ? input.reusableTurnId!
+        : availableNewTurnId || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const uiDisplayTurnId = input.uiParentTurnId || turnId;
   const currentImages = input.images || [];
   const turnInputContextSignals = normalizeTurnInputContextSignals({
@@ -86,7 +102,7 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
     workspace: input.runWorkspace,
     language: input.preferredLanguage,
   });
-  const existingTurn = input.reuseCurrentTurn
+  const existingTurn = input.reuseCurrentTurn || adoptionDecision.kind === "adopted"
     ? input.conversationTurns.find((turn) => turn.id === turnId) || null
     : null;
   const activeSession = input.ensuredSessionId
@@ -98,7 +114,13 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
     preferredLanguage: input.preferredLanguage,
     isMainDebugShortcut: input.isMainDebugShortcut,
     contextSignals: turnInputContextSignals,
-    existingTurnTitle: existingTurn?.title,
+    // Durable admission creates a provisional title before dispatch. An exact
+    // persisted Composer/MDEBUG title must replace that placeholder when this
+    // existing Turn is adopted; ordinary turn reuse still keeps its title.
+    existingTurnTitle:
+      input.adoptExistingTurn && input.optionTurnTitle
+        ? null
+        : existingTurn?.title,
     optionTurnTitle: input.optionTurnTitle,
     activeSession,
   });
@@ -113,5 +135,6 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
     existingTurn,
     activeSession,
     titleDecision,
+    adoptionDecision,
   };
 }

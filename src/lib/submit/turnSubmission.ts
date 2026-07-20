@@ -262,6 +262,13 @@ export function buildMainDebugPrompt(feedback: string): string {
 export interface SubmitPipelineOptions {
   hidden?: boolean;
   reuseCurrentTurn?: boolean;
+  /**
+   * Internal durable-admission handoff. Unlike reuseCurrentTurn, this adopts a
+   * Turn and user block that must already exist with the exact supplied ids.
+   */
+  adoptExistingTurn?: boolean;
+  /** Exact user block created by durable workspace-instruction admission. */
+  admittedUserBlockId?: number;
   turnIdOverride?: string;
   preservePlanState?: boolean;
   resolvedIntent?: ResolvedRunIntent;
@@ -653,6 +660,13 @@ export interface VisibleGoalSubmissionAuthorizationBroker {
     sessionKey: string;
     isHidden?: boolean;
   }): GoalCreationAuthorization | null;
+  /** Restore the exact consumed envelope when its enclosing admission rolls back. */
+  restoreConsumed(input: {
+    envelope?: VisibleGoalSubmissionEnvelope | null;
+    text: string;
+    sessionKey: string;
+    authorization: GoalCreationAuthorization;
+  }): boolean;
 }
 
 /**
@@ -751,6 +765,27 @@ export function createVisibleGoalSubmissionAuthorizationBroker(options?: {
       }
       return entry.authorization;
     },
+    restoreConsumed(input) {
+      const restoredAt = now();
+      pruneExpired(restoredAt);
+      const envelope = input.envelope;
+      if (
+        !envelope ||
+        envelope.kind !== "visible_goal_submission_envelope" ||
+        !String(envelope.id || "").trim() ||
+        pending.has(envelope.id) ||
+        !isGoalCreationAuthorization(input.authorization)
+      ) {
+        return false;
+      }
+      pending.set(envelope.id, {
+        text: input.text,
+        sessionKey: input.sessionKey,
+        authorization: input.authorization,
+        expiresAt: restoredAt + ttlMs,
+      });
+      return true;
+    },
   };
 }
 
@@ -763,6 +798,12 @@ export interface GoalContinuationAuthorizationBroker {
     envelope?: GoalContinuationEnvelope | null;
     text: string;
   }): GoalContinuationAuthorization | null;
+  /** Restore the exact consumed envelope when its enclosing admission rolls back. */
+  restoreConsumed(input: {
+    envelope?: GoalContinuationEnvelope | null;
+    text: string;
+    authorization: GoalContinuationAuthorization;
+  }): boolean;
 }
 
 export function createGoalContinuationAuthorizationBroker(options?: {
@@ -814,6 +855,26 @@ export function createGoalContinuationAuthorizationBroker(options?: {
       const entry = pending.get(envelope.id);
       pending.delete(envelope.id);
       return entry && entry.text === input.text ? entry.authorization : null;
+    },
+    restoreConsumed(input) {
+      const restoredAt = now();
+      pruneExpired(restoredAt);
+      const envelope = input.envelope;
+      if (
+        !envelope ||
+        envelope.kind !== "goal_continuation_envelope" ||
+        !String(envelope.id || "").trim() ||
+        pending.has(envelope.id) ||
+        !isGoalContinuationAuthorization(input.authorization)
+      ) {
+        return false;
+      }
+      pending.set(envelope.id, {
+        text: input.text,
+        authorization: input.authorization,
+        expiresAt: restoredAt + ttlMs,
+      });
+      return true;
     },
   };
 }
@@ -1197,6 +1258,8 @@ export interface SubmitVisibleTurnPatchInput {
   images?: string[];
   isHidden: boolean;
   reuseCurrentTurn: boolean;
+  adoptExistingTurn?: boolean;
+  admittedUserBlockId?: number;
   uiParentTurnId?: string;
   parentPlanTurnId?: string;
   parentPlanTurnDoneSummary: string;
@@ -1206,6 +1269,7 @@ export interface SubmitVisibleTurnPatchInput {
   currentTurnHasReplyOptions: boolean;
   explicitReplyOptionSourceTurnId?: string;
   selectedReplyOptionText?: string;
+  submittedChoiceIdentity?: UserChoiceResolutionIdentity;
   effectiveRunIntent: ResolvedRunIntent;
   effectiveDisplayIntent: ResolvedRunIntent;
   effectiveIntentSummary: string;
@@ -1244,6 +1308,7 @@ export interface SubmitVisibleTurnPatch {
   taskFlow: TaskBlock[];
   conversationTurns: ConversationTurn[];
   userBlock: Extract<TaskBlock, { type: "user" }> | null;
+  adoptionDecision: SubmitExistingTurnAdoptionDecision;
   replyOptionArchiveTurnId?: string;
   shouldArchiveChoiceFeedback: boolean;
   selectedChoiceText: string;
@@ -1253,6 +1318,162 @@ export interface SubmitVisibleTurnPatch {
     selectedFallbackBlocks: number;
     matchMode: "turn" | "selected_fallback" | "none";
   };
+}
+
+export type SubmitExistingTurnAdoptionRejectionReason =
+  | "conflicting_turn_ownership"
+  | "visible_turn_required"
+  | "turn_id_required"
+  | "turn_not_found"
+  | "turn_identity_not_exact"
+  | "turn_closed"
+  | "user_block_id_required"
+  | "user_block_not_linked"
+  | "user_block_not_found"
+  | "user_block_identity_not_exact"
+  | "user_block_mismatch";
+
+export type SubmitExistingTurnAdoptionDecision =
+  | { kind: "not_requested" }
+  | { kind: "adopted"; turnId: string; userBlockId: number }
+  | {
+      kind: "rejected";
+      reason: SubmitExistingTurnAdoptionRejectionReason;
+      turnId: string | null;
+      userBlockId: number | null;
+    };
+
+const CLOSED_SUBMIT_ADOPTION_TURN_STATUSES = new Set<ConversationTurnStatus>([
+  "completed_with_changes",
+  "stopped_no_action",
+  "stopped_no_output",
+  "done",
+  "error",
+]);
+
+function rejectSubmitExistingTurnAdoption(params: {
+  reason: SubmitExistingTurnAdoptionRejectionReason;
+  turnId?: string | null;
+  userBlockId?: number | null;
+}): SubmitExistingTurnAdoptionDecision {
+  return {
+    kind: "rejected",
+    reason: params.reason,
+    turnId: params.turnId || null,
+    userBlockId: params.userBlockId ?? null,
+  };
+}
+
+/**
+ * Validates the exact durable Turn/user-block identity before execution may
+ * adopt it. `taskFlow` is optional during draft preparation and required by
+ * the visible-patch boundary, where the concrete user block is revalidated.
+ */
+export function resolveSubmitExistingTurnAdoptionDecision(params: {
+  adoptExistingTurn?: boolean;
+  reuseCurrentTurn?: boolean;
+  isHidden?: boolean;
+  turnIdOverride?: string;
+  admittedUserBlockId?: number;
+  conversationTurns: ConversationTurn[];
+  taskFlow?: TaskBlock[];
+}): SubmitExistingTurnAdoptionDecision {
+  if (params.adoptExistingTurn !== true) return { kind: "not_requested" };
+
+  const turnId = String(params.turnIdOverride || "").trim();
+  const userBlockId = Number.isSafeInteger(params.admittedUserBlockId)
+    ? params.admittedUserBlockId!
+    : null;
+  if (params.reuseCurrentTurn === true) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "conflicting_turn_ownership",
+      turnId,
+      userBlockId,
+    });
+  }
+  if (params.isHidden === true) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "visible_turn_required",
+      turnId,
+      userBlockId,
+    });
+  }
+  if (!turnId) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "turn_id_required",
+      userBlockId,
+    });
+  }
+
+  const matchingTurns = params.conversationTurns.filter((turn) => turn.id === turnId);
+  if (matchingTurns.length === 0) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "turn_not_found",
+      turnId,
+      userBlockId,
+    });
+  }
+  if (matchingTurns.length !== 1) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "turn_identity_not_exact",
+      turnId,
+      userBlockId,
+    });
+  }
+
+  const matchingTurn = matchingTurns[0];
+  if (
+    CLOSED_SUBMIT_ADOPTION_TURN_STATUSES.has(matchingTurn.status) ||
+    matchingTurn.runtimeOutcome?.status === "completed" ||
+    matchingTurn.runtimeOutcome?.status === "aborted"
+  ) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "turn_closed",
+      turnId,
+      userBlockId,
+    });
+  }
+  if (userBlockId == null) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "user_block_id_required",
+      turnId,
+    });
+  }
+  if (!matchingTurn.blockIds.includes(userBlockId)) {
+    return rejectSubmitExistingTurnAdoption({
+      reason: "user_block_not_linked",
+      turnId,
+      userBlockId,
+    });
+  }
+
+  if (params.taskFlow) {
+    const matchingBlocks = params.taskFlow.filter((block) => block.id === userBlockId);
+    if (matchingBlocks.length === 0) {
+      return rejectSubmitExistingTurnAdoption({
+        reason: "user_block_not_found",
+        turnId,
+        userBlockId,
+      });
+    }
+    if (matchingBlocks.length !== 1) {
+      return rejectSubmitExistingTurnAdoption({
+        reason: "user_block_identity_not_exact",
+        turnId,
+        userBlockId,
+      });
+    }
+    const matchingBlock = matchingBlocks[0];
+    if (matchingBlock.type !== "user" || matchingBlock.turnId !== turnId) {
+      return rejectSubmitExistingTurnAdoption({
+        reason: "user_block_mismatch",
+        turnId,
+        userBlockId,
+      });
+    }
+  }
+
+  return { kind: "adopted", turnId, userBlockId };
 }
 
 export interface SubmitLocalStudioTurnPatch {
@@ -1807,17 +2028,9 @@ export function resolveSubmitSendGateDecision(params: {
   const allowHiddenExecutionWhileBusy = false;
   const allowedBusyReasons: SubmitSendGateAllowedBusyReason[] = [];
 
-  if (params.isGenerating) {
-    if (!allowHiddenExecutionWhileBusy) {
-      return {
-        allowHiddenExecutionWhileBusy,
-        allowedBusyReasons,
-        action: { kind: "queue", reason: "generation_in_progress" },
-      };
-    }
-    allowedBusyReasons.push("generation_in_progress");
-  }
-
+  // An exact pending-review ActionDecision resolves the existing owner; it is
+  // not a second Run. Handle it before the generic generation busy gate so a
+  // durable workspace Turn cannot fall into the legacy queued-message slot.
   if (
     params.agentStatus === "pending_review" &&
     params.hasAbortController &&
@@ -1828,6 +2041,17 @@ export function resolveSubmitSendGateDecision(params: {
       allowedBusyReasons,
       action: { kind: "approve_pending_review" },
     };
+  }
+
+  if (params.isGenerating) {
+    if (!allowHiddenExecutionWhileBusy) {
+      return {
+        allowHiddenExecutionWhileBusy,
+        allowedBusyReasons,
+        action: { kind: "queue", reason: "generation_in_progress" },
+      };
+    }
+    allowedBusyReasons.push("generation_in_progress");
   }
 
   if (params.agentStatus === "running" || params.agentStatus === "pending_review") {
@@ -2163,6 +2387,7 @@ export function archiveReplyOptionBlocksForChoice(
   taskFlow: TaskBlock[],
   turnId: string | undefined,
   selectedChoiceText: string,
+  submittedChoiceIdentity?: UserChoiceResolutionIdentity,
 ): {
   taskFlow: TaskBlock[];
   archivedCount: number;
@@ -2170,15 +2395,22 @@ export function archiveReplyOptionBlocksForChoice(
   selectedFallbackBlocks: number;
   matchMode: "turn" | "selected_fallback" | "none";
 } {
+  const hasSubmittedChoiceIdentity = !!submittedChoiceIdentity;
   const exactTurnOptionBlocks = turnId
     ? taskFlow.filter((block) =>
         block.turnId === turnId &&
         block.type === "agent" &&
         Array.isArray(block.options) &&
-        block.options.length > 0
+        block.options.length > 0 &&
+        (hasSubmittedChoiceIdentity
+          ? isExactUserChoiceResolutionIdentity(block.choiceRequest, submittedChoiceIdentity)
+          : !block.choiceRequest)
       ).length
     : 0;
-  const useSelectedFallback = exactTurnOptionBlocks === 0 && selectedChoiceText.trim().length > 0;
+  const useSelectedFallback =
+    !hasSubmittedChoiceIdentity &&
+    exactTurnOptionBlocks === 0 &&
+    selectedChoiceText.trim().length > 0;
   let archivedCount = 0;
   let selectedFallbackBlocks = 0;
   const nextTaskFlow = taskFlow.map((block) => {
@@ -2189,9 +2421,18 @@ export function archiveReplyOptionBlocksForChoice(
     ) {
       return block;
     }
-    const matchesTurn = !!turnId && block.turnId === turnId;
+    // Structured choices are one-shot capabilities. Only the exact submitted
+    // identity may consume them; legacy Turn/text matching is intentionally
+    // limited to option blocks that predate choiceRequest identities.
+    const matchesTurn = !!turnId && block.turnId === turnId && (
+      hasSubmittedChoiceIdentity
+        ? isExactUserChoiceResolutionIdentity(block.choiceRequest, submittedChoiceIdentity)
+        : !block.choiceRequest
+    );
     const matchesFallback =
-      useSelectedFallback && replyOptionMatchesSelectedText(block.options, selectedChoiceText);
+      useSelectedFallback &&
+      !block.choiceRequest &&
+      replyOptionMatchesSelectedText(block.options, selectedChoiceText);
     if (!matchesTurn && !matchesFallback) return block;
     archivedCount += 1;
     if (matchesFallback && !matchesTurn) selectedFallbackBlocks += 1;
@@ -2231,7 +2472,10 @@ export function archiveConsumedReplyOptionsFromTaskFlow(taskFlow: TaskBlock[]): 
     if (
       block.type !== "agent" ||
       !Array.isArray(block.options) ||
-      block.options.length === 0
+      block.options.length === 0 ||
+      // There is no submitted request identity in this normalization path.
+      // Never infer consumption of a structured permission from Turn/text.
+      !!block.choiceRequest
     ) {
       return block;
     }
@@ -2305,16 +2549,46 @@ export function applyOperationProposalChoice(
 export function buildSubmitVisibleTurnPatch(
   params: SubmitVisibleTurnPatchInput,
 ): SubmitVisibleTurnPatch {
+  const adoptionDecision = resolveSubmitExistingTurnAdoptionDecision({
+    adoptExistingTurn: params.adoptExistingTurn,
+    reuseCurrentTurn: params.reuseCurrentTurn,
+    isHidden: params.isHidden,
+    turnIdOverride: params.turnId,
+    admittedUserBlockId: params.admittedUserBlockId,
+    conversationTurns: params.conversationTurns,
+    taskFlow: params.taskFlow,
+  });
+  if (adoptionDecision.kind === "rejected") {
+    return {
+      taskFlow: params.taskFlow,
+      conversationTurns: params.conversationTurns,
+      userBlock: null,
+      adoptionDecision,
+      replyOptionArchiveTurnId: undefined,
+      shouldArchiveChoiceFeedback: false,
+      selectedChoiceText: "",
+      archiveSummary: {
+        optionBlocks: 0,
+        archivedOptionBlocks: 0,
+        selectedFallbackBlocks: 0,
+        matchMode: "none",
+      },
+    };
+  }
   if (!params.isHidden && params.userBlockId == null) {
     throw new Error("userBlockId is required for visible submit turns");
   }
 
-  const replyOptionArchiveTurnId =
-    params.explicitReplyOptionSourceTurnId ||
-    ((params.shouldExplicitlyReuseCurrentTurn || params.shouldAutoResumeChoiceTurn) &&
-    params.currentTurnHasReplyOptions
-      ? params.turnId
-      : undefined);
+  const isAdoptedTurn = adoptionDecision.kind === "adopted";
+  const replyOptionArchiveTurnId = params.explicitReplyOptionSourceTurnId ||
+    params.submittedChoiceIdentity?.turnId ||
+    (isAdoptedTurn
+      ? undefined
+      :
+      ((params.shouldExplicitlyReuseCurrentTurn || params.shouldAutoResumeChoiceTurn) &&
+      params.currentTurnHasReplyOptions
+        ? params.turnId
+        : undefined));
   const shouldArchiveChoiceFeedback = !params.isHidden && !!replyOptionArchiveTurnId;
   const selectedChoiceText = shouldArchiveChoiceFeedback
     ? String(params.selectedReplyOptionText || params.text || "").trim()
@@ -2324,6 +2598,7 @@ export function buildSubmitVisibleTurnPatch(
         params.taskFlow,
         replyOptionArchiveTurnId,
         selectedChoiceText,
+        params.submittedChoiceIdentity,
       )
     : {
         taskFlow: params.taskFlow,
@@ -2332,9 +2607,19 @@ export function buildSubmitVisibleTurnPatch(
         selectedFallbackBlocks: 0,
         matchMode: "none" as const,
       };
-  const userBlock: Extract<TaskBlock, { type: "user" }> | null = params.isHidden
-    ? null
-    : {
+  const adoptedUserBlock = isAdoptedTurn
+    ? params.taskFlow.find(
+        (block): block is Extract<TaskBlock, { type: "user" }> =>
+          block.id === adoptionDecision.userBlockId &&
+          block.type === "user" &&
+          block.turnId === adoptionDecision.turnId,
+      ) || null
+    : null;
+  const userBlock: Extract<TaskBlock, { type: "user" }> | null = isAdoptedTurn
+    ? adoptedUserBlock
+    : params.isHidden
+      ? null
+      : {
         id: params.userBlockId!,
         turnId: params.turnId,
         type: "user",
@@ -2343,13 +2628,13 @@ export function buildSubmitVisibleTurnPatch(
           ? { contextItems: params.userContextItems }
           : {}),
         ...(params.images && params.images.length > 0 ? { images: params.images } : {}),
-      };
-  const taskFlow = userBlock
+        };
+  const taskFlow = userBlock && !isAdoptedTurn
     ? [...archiveResult.taskFlow, userBlock]
     : archiveResult.taskFlow;
 
   const autoCollapsePreviousTurnForNewTurn = (turns: ConversationTurn[]): ConversationTurn[] => {
-    if (params.isHidden || params.reuseCurrentTurn || turns.length === 0) return turns;
+    if (params.isHidden || params.reuseCurrentTurn || isAdoptedTurn || turns.length === 0) return turns;
     const previousTurnIndex = turns.length - 1;
     const previousTurn = turns[previousTurnIndex];
     if (!previousTurn || (previousTurn.processCollapsed ?? previousTurn.collapsed)) return turns;
@@ -2375,15 +2660,26 @@ export function buildSubmitVisibleTurnPatch(
     turn.id === params.turnId
       ? (() => {
           const preservePlanIdentity =
+            !isAdoptedTurn &&
             turn.intent === "plan" &&
             params.effectiveRunIntent === "execute";
           return {
           ...turn,
+          ...(isAdoptedTurn
+            ? {
+                userPrompt: params.text,
+                title: params.turnTitle,
+              }
+            : {}),
           status: params.initialTurnStatus,
           intent: preservePlanIdentity ? "plan" : params.effectiveRunIntent,
           displayIntent: params.effectiveDisplayIntent,
-          intentSummary: turn.intentSummary || params.effectiveIntentSummary,
-          commandDirective: turn.commandDirective || params.effectiveCommandDirective || undefined,
+          intentSummary: isAdoptedTurn
+            ? params.effectiveIntentSummary
+            : turn.intentSummary || params.effectiveIntentSummary,
+          commandDirective: isAdoptedTurn
+            ? params.effectiveCommandDirective || undefined
+            : turn.commandDirective || params.effectiveCommandDirective || undefined,
           pendingOperationProposal: applyOperationProposalChoice(
             turn.pendingOperationProposal,
             params.operationProposalChoiceAction,
@@ -2396,11 +2692,12 @@ export function buildSubmitVisibleTurnPatch(
         })()
       : turn;
 
-  if (params.reuseCurrentTurn) {
+  if (params.reuseCurrentTurn || isAdoptedTurn) {
     return {
       taskFlow,
       conversationTurns: params.conversationTurns.map(updateExistingTurn),
       userBlock,
+      adoptionDecision,
       replyOptionArchiveTurnId,
       shouldArchiveChoiceFeedback,
       selectedChoiceText,
@@ -2465,6 +2762,7 @@ export function buildSubmitVisibleTurnPatch(
     taskFlow,
     conversationTurns: [...baseTurns, newTurn],
     userBlock,
+    adoptionDecision,
     replyOptionArchiveTurnId,
     shouldArchiveChoiceFeedback,
     selectedChoiceText,

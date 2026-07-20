@@ -69,7 +69,15 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildSessionRuntimeSnapshotFromStoreState,
   normalizeSessionRuntimeSnapshot,
+  useAppStore,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/useAppStore.ts"));
+const {
+  createWorkspaceTurnQueueState,
+  reduceWorkspaceTurnQueue,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/workspaceTurnQueue.ts"));
+const { beginSessionCancellation } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/store/sessionCancellationBarrier.ts"),
+);
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
 const pendingToolReview = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/pendingToolReview.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
@@ -200,6 +208,62 @@ const exactPlanRestoreOptions = {
   expectedSessionEpoch: exactPlanSessionEpoch,
 };
 
+function buildQueuedWorkspaceTurn(
+  sessionKey,
+  sessionEpoch,
+  suffix,
+  userBlockId = 10_001,
+  payload = { text: `queued ${suffix}` },
+) {
+  const submittedAt = 10;
+  const clientSubmissionId = `submission-${suffix}`;
+  const receipt = {
+    schemaVersion: 1,
+    kind: "workspace_turn_receipt",
+    receiptId: `receipt-${suffix}`,
+    clientSubmissionId,
+    sessionKey,
+    sessionEpoch,
+    turnId: `turn-${suffix}`,
+    userBlockId,
+    acceptedAt: submittedAt,
+  };
+  let queue = createWorkspaceTurnQueueState({
+    sessionKey,
+    sessionEpoch,
+    updatedAt: 1,
+  });
+  const appended = reduceWorkspaceTurnQueue(queue, {
+    type: "append",
+    expectedVersion: queue.version,
+    at: submittedAt,
+    instruction: {
+      schemaVersion: 1,
+      kind: "workspace_instruction",
+      clientSubmissionId,
+      sessionKey,
+      sessionEpoch,
+      source: "composer",
+      submittedAt,
+      payload,
+    },
+    receipt,
+  });
+  assert.equal(appended.disposition, "applied", appended.reason);
+  queue = appended.state;
+  const committed = reduceWorkspaceTurnQueue(queue, {
+    type: "commit",
+    expectedVersion: queue.version,
+    at: submittedAt + 1,
+    clientSubmissionId,
+    receiptId: receipt.receiptId,
+    sessionKey,
+    sessionEpoch,
+  });
+  assert.equal(committed.disposition, "applied", committed.reason);
+  return committed.state;
+}
+
 function buildApprovedPlanContent() {
   return [
     "# Plan 恢复批准边界",
@@ -242,6 +306,32 @@ test("subagent collaboration preference is session-scoped and backward compatibl
     buildSessionRuntimeSnapshotFromStoreState({ preferSubagents: true }).preferSubagents,
     true,
   );
+});
+
+test("online snapshots preserve a live Turn and only cold restore pauses it", () => {
+  const liveTurn = {
+    id: "turn-live",
+    userPrompt: "continue the workspace task",
+    title: "continue the workspace task",
+    mode: "edit",
+    intent: "execute",
+    status: "executing",
+    summary: "",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 1,
+  };
+  const liveSnapshot = buildSessionRuntimeSnapshotFromStoreState({
+    taskFlow: [],
+    conversationTurns: [liveTurn],
+  });
+
+  assert.equal(liveSnapshot.conversationTurns[0].status, "executing");
+  assert.equal(liveSnapshot.conversationTurns[0].processCollapsed, false);
+
+  const restored = normalizeSessionRuntimeSnapshot(liveSnapshot);
+  assert.equal(restored.conversationTurns[0].status, "paused");
+  assert.match(restored.conversationTurns[0].summary, /application restart/i);
 });
 
 test("queued Goal continuation guidance survives session normalization only with authorization", () => {
@@ -1359,5 +1449,984 @@ test("a Goal deletion fence preserves an unrelated pending request in the same s
     assert.equal(restored.conversationTurns[0].status, "awaiting_input");
   } finally {
     goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
+  }
+});
+
+test("switching A to B preserves B background runtime and queued workspace Turns", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-owner-switch";
+  const sessionAId = 101;
+  const sessionBId = 202;
+  const sessionAKey = `${workspace}:${sessionAId}`;
+  const sessionBKey = `${workspace}:${sessionBId}`;
+  const sessionAEpoch = "epoch-a";
+  const sessionBEpoch = "epoch-b";
+  const queueB = buildQueuedWorkspaceTurn(sessionBKey, sessionBEpoch, "background-b");
+  const backgroundRuntimeB = {
+    owner: "background-b",
+    agentStatus: "running",
+    isGenerating: true,
+    currentTurnId: "turn-running-b",
+    workspaceTurnQueue: queueB,
+    workspaceInstructionLedger: [{
+      clientSubmissionId: "submission-completed-b",
+      payloadIdentity: "payload-completed-b",
+      receipt: {
+        schemaVersion: 1,
+        kind: "workspace_turn_receipt",
+        receiptId: "receipt-completed-b",
+        clientSubmissionId: "submission-completed-b",
+        sessionKey: sessionBKey,
+        sessionEpoch: sessionBEpoch,
+        turnId: "turn-completed-b",
+        userBlockId: 10_002,
+        acceptedAt: 1,
+      },
+    }],
+    transcriptPartial: true,
+    transcriptLoadedTurns: 30,
+    transcriptTotalTurns: 44,
+  };
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionAId,
+      activeSessionByWorkspace: { [workspace]: sessionAId },
+      sessionsByWorkspace: {
+        [workspace]: [
+          {
+            id: sessionAId,
+            title: "Session A",
+            date: "Today",
+            active: true,
+            planLifecycleEpoch: sessionAEpoch,
+            messages: [],
+          },
+          {
+            id: sessionBId,
+            title: "Session B",
+            date: "Today",
+            active: false,
+            planLifecycleEpoch: sessionBEpoch,
+            messages: [],
+          },
+        ],
+      },
+      runtimeBySessionKey: {
+        [sessionAKey]: { owner: "visible-a" },
+        [sessionBKey]: backgroundRuntimeB,
+      },
+    });
+
+    useAppStore.getState().setCurrentSessionId(sessionBId);
+
+    const switched = useAppStore.getState();
+    assert.equal(switched.currentSessionId, sessionBId);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey], backgroundRuntimeB);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].agentStatus, "running");
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].isGenerating, true);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].workspaceTurnQueue, queueB);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].workspaceTurnQueue.entries.length, 1);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].workspaceInstructionLedger.length, 1);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].transcriptTotalTurns, 44);
+    assert.equal(switched.workspaceTurnQueue, null, "visible UI remains blank until B restore publishes");
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("switching to a recording-disabled Session preserves its memory-only FIFO", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-owner-switch-memory";
+  const sessionAId = 303;
+  const sessionBId = 404;
+  const sessionBKey = `${workspace}:${sessionBId}`;
+  const sessionBEpoch = "epoch-memory-b";
+  const queueB = buildQueuedWorkspaceTurn(sessionBKey, sessionBEpoch, "memory-b");
+  const memoryRuntimeB = {
+    owner: "memory-b",
+    agentStatus: "idle",
+    isGenerating: false,
+    workspaceTurnQueue: queueB,
+    workspaceInstructionLedger: [],
+    transcriptPartial: false,
+    transcriptLoadedTurns: 1,
+    transcriptTotalTurns: 1,
+  };
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionAId,
+      activeSessionByWorkspace: { [workspace]: sessionAId },
+      sessionsByWorkspace: {
+        [workspace]: [
+          {
+            id: sessionAId,
+            title: "Session A",
+            date: "Today",
+            active: true,
+            planLifecycleEpoch: "epoch-memory-a",
+            messages: [],
+          },
+          {
+            id: sessionBId,
+            title: "Session B memory only",
+            date: "Today",
+            active: false,
+            planLifecycleEpoch: sessionBEpoch,
+            storageStatus: "temporary",
+            recordingDisabled: true,
+            messages: [],
+          },
+        ],
+      },
+      runtimeBySessionKey: { [sessionBKey]: memoryRuntimeB },
+    });
+
+    useAppStore.getState().setCurrentSessionId(sessionBId);
+
+    const switched = useAppStore.getState();
+    const sessionB = switched.sessionsByWorkspace[workspace].find(
+      (session) => session.id === sessionBId,
+    );
+    assert.equal(sessionB.recordingDisabled, true);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey], memoryRuntimeB);
+    assert.equal(switched.runtimeBySessionKey[sessionBKey].workspaceTurnQueue, queueB);
+    assert.equal(
+      switched.runtimeBySessionKey[sessionBKey].workspaceTurnQueue.entries[0].receipt.turnId,
+      "turn-memory-b",
+    );
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher rebuilds a paged-out FIFO head and adopts its exact durable identities", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-paged-queue";
+  const sessionId = 505;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-paged-queue";
+  const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "paged-head", 50_001);
+  const newerTurns = Array.from({ length: 30 }, (_, index) => ({
+    id: `turn-newer-${index}`,
+    userPrompt: `newer ${index}`,
+    title: `Newer ${index}`,
+    mode: "chat",
+    intent: "respond",
+    displayIntent: "respond",
+    status: "done",
+    summary: "done",
+    blockIds: [20_000 + index],
+    collapsed: false,
+    createdAt: 100 + index,
+  }));
+  const newerBlocks = newerTurns.map((turn, index) => ({
+    id: 20_000 + index,
+    turnId: turn.id,
+    type: "user",
+    content: turn.userPrompt,
+  }));
+  let capturedDispatch = null;
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Paged queue",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: newerBlocks,
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      taskFlow: newerBlocks,
+      conversationTurns: newerTurns,
+      runtimeEvents: [],
+      transcriptPartial: true,
+      transcriptLoadedTurns: 30,
+      transcriptTotalTurns: 31,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: (text, images, options) => {
+        capturedDispatch = { text, images, options };
+        useAppStore.setState({ currentTurnId: options.turnIdOverride });
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    });
+
+    const dispatched = useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey);
+    const current = useAppStore.getState();
+    const receipt = queue.entries[0].receipt;
+    const rebuiltTurn = current.conversationTurns.find((turn) => turn.id === receipt.turnId);
+    const rebuiltBlock = current.taskFlow.find((block) => block.id === receipt.userBlockId);
+
+    assert.equal(dispatched, true);
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(capturedDispatch.options.turnIdOverride, receipt.turnId);
+    assert.equal(capturedDispatch.options.admittedUserBlockId, receipt.userBlockId);
+    assert.equal(capturedDispatch.options.workspaceInstructionClaim.turnId, receipt.turnId);
+    assert.equal(rebuiltTurn.clientSubmissionId, receipt.clientSubmissionId);
+    assert.deepEqual(rebuiltTurn.blockIds, [receipt.userBlockId]);
+    assert.equal(rebuiltBlock.type, "user");
+    assert.equal(rebuiltBlock.turnId, receipt.turnId);
+    assert.equal(current.transcriptLoadedTurns, 31);
+    assert.equal(current.transcriptTotalTurns, 31);
+    assert.equal(current._nextTaskId() > receipt.userBlockId, true);
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher closes a poisoned paged head with a visible error before advancing FIFO", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-paged-conflict";
+  const sessionId = 606;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-paged-conflict";
+  const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "conflict-head");
+  const receipt = queue.entries[0].receipt;
+  let sendCalled = false;
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Paged conflict",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      taskFlow: [{
+        id: receipt.userBlockId,
+        turnId: "unrelated-turn",
+        type: "user",
+        content: "unrelated history",
+      }],
+      conversationTurns: [{
+        id: "unrelated-turn",
+        userPrompt: "unrelated history",
+        title: "Unrelated",
+        mode: "chat",
+        intent: "respond",
+        displayIntent: "respond",
+        status: "done",
+        summary: "done",
+        blockIds: [receipt.userBlockId],
+        collapsed: false,
+        createdAt: 100,
+      }],
+      runtimeEvents: [],
+      transcriptPartial: true,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 2,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: () => {
+        sendCalled = true;
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    });
+
+    const dispatched = useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey);
+    const current = useAppStore.getState();
+    const recoveryTurn = current.conversationTurns.find((turn) => turn.id === receipt.turnId);
+    const recoveryBlocks = current.taskFlow.filter((block) => block.turnId === receipt.turnId);
+
+    assert.equal(dispatched, true);
+    assert.equal(sendCalled, false, "conflicting history must never be adopted");
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(recoveryTurn.status, "error");
+    assert.equal(recoveryTurn.runtimeOutcome.status, "completed");
+    assert.equal(recoveryTurn.runtimeOutcome.resultKind, "error");
+    assert.equal(recoveryBlocks.some((block) => block.type === "user"), true);
+    assert.equal(
+      recoveryBlocks.some((block) =>
+        block.type === "agent" && block.visibility === "assistant_final"
+      ),
+      true,
+    );
+    assert.equal(
+      current.runtimeEvents.some((event) =>
+        event.type === "turn.completed" &&
+        event.turnId === receipt.turnId &&
+        event.resultKind === "error"
+      ),
+      true,
+    );
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("pending cancellation keeps a newly admitted workspace Turn queued until terminal settlement", async () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/tmp/session-cancellation-fifo";
+  const sessionId = 707;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-cancellation-fifo";
+  const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "after-cancel", 60_001);
+  const receipt = queue.entries[0].receipt;
+  let settleCancellation;
+  const cancellationSettlement = new Promise((resolve) => {
+    settleCancellation = resolve;
+  });
+  let dispatchCount = 0;
+  let dispatchedClaim = null;
+
+  const cancellation = beginSessionCancellation(
+    sessionKey,
+    "turn-being-canceled",
+    () => cancellationSettlement,
+  );
+  assert.equal(cancellation.started, true);
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Cancellation FIFO",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: true,
+      agentStatus: "running",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: (_text, _images, options) => {
+        dispatchCount += 1;
+        dispatchedClaim = options.workspaceInstructionClaim;
+        useAppStore.setState({ currentTurnId: options.turnIdOverride });
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    });
+
+    assert.equal(
+      useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey),
+      false,
+    );
+    let current = useAppStore.getState();
+    assert.equal(dispatchCount, 0, "the cancel fence must prevent claim execution");
+    assert.equal(current.workspaceTurnQueue.entries[0].status, "queued");
+    assert.equal(current.queuedUserMessage, null);
+    assert.equal(
+      current.runtimeEvents.some((event) =>
+        event.turnId === receipt.turnId && event.type === "turn.completed"
+      ),
+      false,
+      "the fenced Turn must not receive a fabricated completion",
+    );
+
+    // The cancellation terminal transaction publishes idle before releasing
+    // the fence; the registered FIFO callback must then retry the exact head.
+    useAppStore.setState({ isGenerating: false, agentStatus: "idle" });
+    settleCancellation({
+      sessionKey,
+      turnId: "turn-being-canceled",
+      terminalSettled: true,
+      disposition: "committed",
+      queueDisposition: "replay",
+    });
+    await cancellation.cancellation.promise;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    current = useAppStore.getState();
+    assert.equal(dispatchCount, 1);
+    assert.equal(dispatchedClaim.turnId, receipt.turnId);
+    assert.equal(dispatchedClaim.receiptId, receipt.receiptId);
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(current.queuedUserMessage, null);
+  } finally {
+    settleCancellation?.({
+      sessionKey,
+      turnId: "turn-being-canceled",
+      terminalSettled: true,
+      disposition: "test_cleanup",
+      queueDisposition: "discard",
+    });
+    await cancellation.cancellation.promise.catch(() => {});
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("a cancellation that races a durable claim releases and retries the exact FIFO Turn", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-cancellation-claim-race";
+  const sessionId = 808;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-cancellation-claim-race";
+  const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "claim-race", 70_001);
+  const receipt = queue.entries[0].receipt;
+  let cancellation = null;
+  let settleCancellation;
+  const cancellationSettlement = new Promise((resolve) => {
+    settleCancellation = resolve;
+  });
+  let firstClaim = null;
+  let replayClaim = null;
+  let replayCount = 0;
+  let claimAwareSendResult = null;
+
+  const replaySend = (_text, _images, options) => {
+    replayCount += 1;
+    replayClaim = options.workspaceInstructionClaim;
+    useAppStore.setState({ currentTurnId: options.turnIdOverride });
+    return true;
+  };
+
+  try {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Cancellation claim race",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 0,
+      transcriptTotalTurns: 1,
+      isGenerating: false,
+      agentStatus: "idle",
+      currentTurnId: null,
+      harnessRunMarker: null,
+      sendMessage: (text, images, options) => {
+        firstClaim = options.workspaceInstructionClaim;
+        cancellation = beginSessionCancellation(
+          sessionKey,
+          "turn-racing-cancel",
+          () => cancellationSettlement,
+        );
+        assert.equal(cancellation.started, true);
+        useAppStore.setState({ sendMessage: replaySend });
+        claimAwareSendResult = realSendMessage(text, images, options);
+        return claimAwareSendResult;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    });
+
+    assert.equal(
+      useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey),
+      false,
+    );
+    let current = useAppStore.getState();
+    assert.equal(claimAwareSendResult, false);
+    assert.equal(firstClaim.turnId, receipt.turnId);
+    assert.equal(current.workspaceTurnQueue.entries[0].status, "queued");
+    assert.equal(current.queuedUserMessage, null, "durable claim must not enter the legacy queue");
+    assert.equal(
+      current.runtimeEvents.some((event) =>
+        event.turnId === receipt.turnId && event.type === "turn.completed"
+      ),
+      false,
+      "claim rejection during cancel must not fabricate success",
+    );
+
+    settleCancellation({
+      sessionKey,
+      turnId: "turn-racing-cancel",
+      terminalSettled: true,
+      disposition: "committed",
+      queueDisposition: "replay",
+    });
+    await cancellation.cancellation.promise;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    current = useAppStore.getState();
+    assert.equal(replayCount, 1);
+    assert.equal(replayClaim.turnId, receipt.turnId);
+    assert.equal(replayClaim.receiptId, receipt.receiptId);
+    assert.notEqual(replayClaim.claimId, firstClaim.claimId);
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(current.queuedUserMessage, null);
+  } finally {
+    settleCancellation?.({
+      sessionKey,
+      turnId: "turn-racing-cancel",
+      terminalSettled: true,
+      disposition: "test_cleanup",
+      queueDisposition: "discard",
+    });
+    await cancellation?.cancellation.promise.catch(() => {});
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("unverified cancellation settlement fail-closes the exact admitted Turn with a visible conclusion", async () => {
+  const originalState = useAppStore.getState();
+  const cases = [
+    { suffix: "unsettled", rejects: false },
+    { suffix: "rejected", rejects: true },
+  ];
+
+  try {
+    for (const [index, testCase] of cases.entries()) {
+      const workspace = `/tmp/session-cancellation-${testCase.suffix}`;
+      const sessionId = 900 + index;
+      const sessionKey = `${workspace}:${sessionId}`;
+      const sessionEpoch = `epoch-cancellation-${testCase.suffix}`;
+      const queue = buildQueuedWorkspaceTurn(
+        sessionKey,
+        sessionEpoch,
+        testCase.suffix,
+        80_001 + index,
+      );
+      const receipt = queue.entries[0].receipt;
+      let sendCount = 0;
+
+      useAppStore.setState({
+        ...originalState,
+        currentWorkspace: workspace,
+        selectedWorkspace: workspace,
+        currentSessionId: sessionId,
+        activeSessionByWorkspace: { [workspace]: sessionId },
+        sessionsByWorkspace: {
+          [workspace]: [{
+            id: sessionId,
+            title: `Cancellation ${testCase.suffix}`,
+            date: "Today",
+            active: true,
+            planLifecycleEpoch: sessionEpoch,
+            messages: [],
+          }],
+        },
+        workspaceTurnQueue: queue,
+        workspaceInstructionLedger: [],
+        queuedUserMessage: null,
+        taskFlow: [],
+        conversationTurns: [],
+        runtimeEvents: [],
+        transcriptPartial: false,
+        transcriptLoadedTurns: 0,
+        transcriptTotalTurns: 1,
+        isGenerating: true,
+        agentStatus: "running",
+        currentTurnId: "turn-being-canceled",
+        harnessRunMarker: null,
+        sendMessage: () => {
+          sendCount += 1;
+          return true;
+        },
+        saveCurrentRuntimeToSession: () => {},
+      }, true);
+
+      const cancellation = beginSessionCancellation(
+        sessionKey,
+        "turn-being-canceled",
+        () => testCase.rejects
+          ? Promise.reject(new Error("cancel persistence unavailable"))
+          : Promise.resolve({
+              sessionKey,
+              turnId: "turn-being-canceled",
+              terminalSettled: false,
+              disposition: "terminal_projection_unverified",
+            }),
+      );
+      assert.equal(cancellation.started, true);
+      assert.equal(
+        useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey),
+        false,
+      );
+      assert.equal(useAppStore.getState().workspaceTurnQueue.entries[0].status, "queued");
+
+      await cancellation.cancellation.promise.catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const current = useAppStore.getState();
+      const closedTurn = current.conversationTurns.find(
+        (turn) => turn.id === receipt.turnId,
+      );
+      const visibleFinal = current.taskFlow.find((block) =>
+        block.turnId === receipt.turnId &&
+        block.type === "agent" &&
+        block.visibility === "assistant_final"
+      );
+      assert.equal(sendCount, 0, "unverified cancellation must never execute the new Turn");
+      assert.equal(current.workspaceTurnQueue.entries.length, 0);
+      assert.equal(current.queuedUserMessage, null);
+      assert.equal(closedTurn.status, "error");
+      assert.equal(closedTurn.runtimeOutcome.status, "completed");
+      assert.equal(closedTurn.runtimeOutcome.resultKind, "error");
+      assert.equal(typeof visibleFinal?.content, "string");
+      assert.equal(
+        current.runtimeEvents.some((event) =>
+          event.type === "turn.completed" &&
+          event.turnId === receipt.turnId &&
+          event.resultKind === "error"
+        ),
+        true,
+      );
+      assert.equal(
+        current.runtimeEvents.some((event) =>
+          event.type === "turn.completed" &&
+          event.turnId === receipt.turnId &&
+          event.resultKind === "success"
+        ),
+        false,
+      );
+    }
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("dispatcher applies exact pending-review approve and reject decisions without duplicating the admitted user block", () => {
+  const originalState = useAppStore.getState();
+  const cases = [
+    { actionDecision: "approve", optionAction: "execute_once", text: "Run once", resolverAction: "accept" },
+    { actionDecision: "reject", optionAction: "cancel_operation", text: "Cancel", resolverAction: "reject" },
+  ];
+
+  try {
+    for (const [index, testCase] of cases.entries()) {
+      const workspace = `/tmp/session-pending-review-${testCase.actionDecision}`;
+      const sessionId = 1_100 + index;
+      const sessionKey = `${workspace}:${sessionId}`;
+      const sessionEpoch = `epoch-pending-review-${testCase.actionDecision}`;
+      const sourceTurnId = `turn-review-${testCase.actionDecision}`;
+      const sourceRunId = `run-review-${testCase.actionDecision}`;
+      const requestId = `request-review-${testCase.actionDecision}`;
+      const optionValues = [testCase.text];
+      const choiceIdentity = {
+        sessionKey,
+        turnId: sourceTurnId,
+        runId: sourceRunId,
+        requestId,
+        parentRunId: null,
+        optionValues,
+        allowCustomReply: false,
+        status: "pending",
+      };
+      const payload = {
+        text: testCase.text,
+        dispatchHints: {
+          ...(testCase.actionDecision === "approve" ? { executionConsentGranted: true } : {}),
+          replyOptionSourceTurnId: sourceTurnId,
+          selectedReplyOptionText: testCase.text,
+          replyOptionRequestIdentity: choiceIdentity,
+        },
+      };
+      const queue = buildQueuedWorkspaceTurn(
+        sessionKey,
+        sessionEpoch,
+        `pending-review-${testCase.actionDecision}`,
+        90_001 + index,
+        payload,
+      );
+      const receipt = queue.entries[0].receipt;
+      const resolverCalls = [];
+      let sendCount = 0;
+      let abortCount = 0;
+
+      useAppStore.setState({
+        ...originalState,
+        currentWorkspace: workspace,
+        selectedWorkspace: workspace,
+        currentSessionId: sessionId,
+        activeSessionByWorkspace: { [workspace]: sessionId },
+        sessionsByWorkspace: {
+          [workspace]: [{
+            id: sessionId,
+            title: `Pending review ${testCase.actionDecision}`,
+            date: "Today",
+            active: true,
+            planLifecycleEpoch: sessionEpoch,
+            messages: [],
+          }],
+        },
+        workspaceTurnQueue: queue,
+        workspaceInstructionLedger: [],
+        queuedUserMessage: null,
+        taskFlow: [
+          { id: 1, turnId: sourceTurnId, type: "user", content: "Review this operation" },
+          {
+            id: 2,
+            turnId: sourceTurnId,
+            type: "agent",
+            content: "Choose",
+            options: [{
+              label: testCase.text,
+              value: testCase.text,
+              action: testCase.optionAction,
+            }],
+            choiceRequest: choiceIdentity,
+          },
+        ],
+        conversationTurns: [{
+          id: sourceTurnId,
+          userPrompt: "Review this operation",
+          title: "Review",
+          mode: "edit",
+          intent: "execute",
+          displayIntent: "execute",
+          status: "awaiting_approval",
+          summary: "",
+          blockIds: [1, 2],
+          collapsed: false,
+          createdAt: 1,
+        }],
+        runtimeEvents: [{
+          schemaVersion: 2,
+          type: "run.started",
+          threadId: sessionKey,
+          turnId: sourceTurnId,
+          timestampMs: 1,
+          runId: sourceRunId,
+          parentRunId: null,
+        }],
+        transcriptPartial: false,
+        transcriptLoadedTurns: 1,
+        transcriptTotalTurns: 2,
+        isGenerating: true,
+        agentStatus: "pending_review",
+        currentTurnId: sourceTurnId,
+        harnessRunMarker: null,
+        activeActionRequest: {
+          schemaVersion: 1,
+          requestId,
+          kind: "user_choice",
+          sessionKey,
+          turnId: sourceTurnId,
+          runId: sourceRunId,
+          parentRunId: null,
+          title: "Review",
+          status: "pending",
+          createdAt: 1,
+          optionValues,
+          allowCustomReply: false,
+        },
+        pendingReviewResolve: (decision) => resolverCalls.push(decision),
+        pendingReviewTaskId: 2,
+        abortController: {
+          abort() {
+            abortCount += 1;
+          },
+        },
+        sendMessage: () => {
+          sendCount += 1;
+          return true;
+        },
+        saveCurrentRuntimeToSession: () => {},
+      }, true);
+
+      assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
+      const current = useAppStore.getState();
+      const admittedUserBlocks = current.taskFlow.filter((block) =>
+        block.type === "user" && block.turnId === receipt.turnId
+      );
+      const admittedFinals = current.taskFlow.filter((block) =>
+        block.type === "agent" &&
+        block.turnId === receipt.turnId &&
+        block.visibility === "assistant_final"
+      );
+      const sourceChoice = current.taskFlow.find((block) => block.id === 2);
+      assert.deepEqual(resolverCalls, [{ action: testCase.resolverAction }]);
+      assert.equal(sendCount, 0, "an exact ActionDecision must not launch a second agent Run");
+      assert.equal(abortCount, testCase.actionDecision === "reject" ? 1 : 0);
+      assert.equal(current.workspaceTurnQueue.entries.length, 0);
+      assert.equal(admittedUserBlocks.length, 1);
+      assert.equal(admittedUserBlocks[0].id, receipt.userBlockId);
+      assert.equal(admittedFinals.length, 1);
+      assert.equal(sourceChoice.archivedAfterChoice, true);
+      assert.equal(sourceChoice.options, undefined);
+      assert.equal(current.activeActionRequest, null);
+      assert.equal(
+        current.runtimeEvents.some((event) =>
+          event.type === "turn.completed" &&
+          event.turnId === receipt.turnId &&
+          event.resultKind === "success"
+        ),
+        true,
+      );
+    }
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("an unrelated pending-review Turn cancels the old review, releases its claim, and then takes FIFO ownership", async () => {
+  const originalState = useAppStore.getState();
+  const realSendMessage = originalState.sendMessage;
+  const workspace = "/tmp/session-pending-review-unrelated";
+  const sessionId = 1_200;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "epoch-pending-review-unrelated";
+  const sourceTurnId = "turn-review-unrelated";
+  const sourceRunId = "run-review-unrelated";
+  const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "pending-review-unrelated", 91_001);
+  const receipt = queue.entries[0].receipt;
+  let settleCancellation;
+  const cancellationSettlement = new Promise((resolve) => {
+    settleCancellation = resolve;
+  });
+  let cancellation = null;
+  const reviewDecisions = [];
+  const dispatchClaims = [];
+  let sendInvocations = 0;
+
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: sessionId,
+      activeSessionByWorkspace: { [workspace]: sessionId },
+      sessionsByWorkspace: {
+        [workspace]: [{
+          id: sessionId,
+          title: "Pending review unrelated",
+          date: "Today",
+          active: true,
+          planLifecycleEpoch: sessionEpoch,
+          messages: [],
+        }],
+      },
+      workspaceTurnQueue: queue,
+      workspaceInstructionLedger: [],
+      queuedUserMessage: null,
+      taskFlow: [],
+      conversationTurns: [{
+        id: sourceTurnId,
+        userPrompt: "Old review",
+        title: "Old review",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "awaiting_approval",
+        summary: "",
+        blockIds: [],
+        collapsed: false,
+        createdAt: 1,
+      }],
+      runtimeEvents: [],
+      transcriptPartial: false,
+      transcriptLoadedTurns: 1,
+      transcriptTotalTurns: 2,
+      isGenerating: true,
+      agentStatus: "pending_review",
+      currentTurnId: sourceTurnId,
+      activeActionRequest: null,
+      pendingReviewResolve: (decision) => reviewDecisions.push(decision),
+      pendingReviewTaskId: 5,
+      abortController: { abort() {} },
+      closeTurnAsCanceled: () => {
+        cancellation = beginSessionCancellation(
+          sessionKey,
+          sourceTurnId,
+          () => cancellationSettlement,
+        );
+        return true;
+      },
+      sendMessage: (text, images, options) => {
+        sendInvocations += 1;
+        dispatchClaims.push(options.workspaceInstructionClaim);
+        if (sendInvocations === 1) return realSendMessage(text, images, options);
+        useAppStore.setState({ currentTurnId: options.turnIdOverride });
+        return true;
+      },
+      saveCurrentRuntimeToSession: () => {},
+    }, true);
+
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), false);
+    let current = useAppStore.getState();
+    assert.deepEqual(reviewDecisions, [{ action: "reject" }]);
+    assert.equal(current.workspaceTurnQueue.entries[0].status, "queued");
+    assert.equal(current.queuedUserMessage, null);
+    assert.equal(sendInvocations, 1);
+
+    useAppStore.setState({
+      agentStatus: "idle",
+      isGenerating: false,
+      currentTurnId: null,
+      activeActionRequest: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      abortController: null,
+    });
+    settleCancellation({
+      sessionKey,
+      turnId: sourceTurnId,
+      terminalSettled: true,
+      disposition: "committed",
+      queueDisposition: "replay",
+    });
+    await cancellation.cancellation.promise;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    current = useAppStore.getState();
+    assert.equal(sendInvocations, 2);
+    assert.equal(dispatchClaims[0].turnId, receipt.turnId);
+    assert.equal(dispatchClaims[1].turnId, receipt.turnId);
+    assert.notEqual(dispatchClaims[0].claimId, dispatchClaims[1].claimId);
+    assert.equal(current.workspaceTurnQueue.entries.length, 0);
+    assert.equal(current.queuedUserMessage, null);
+  } finally {
+    settleCancellation?.({
+      sessionKey,
+      turnId: sourceTurnId,
+      terminalSettled: true,
+      disposition: "test_cleanup",
+      queueDisposition: "discard",
+    });
+    await cancellation?.cancellation.promise.catch(() => {});
+    useAppStore.setState(originalState, true);
   }
 });

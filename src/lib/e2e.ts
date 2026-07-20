@@ -12,6 +12,7 @@ import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
 import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
 import { buildGoalRuntimeSnapshot } from "./goalRuntime";
+import { buildAcceptedGoalContinuationState } from "./goalResumeBoundary";
 import { buildPlanReviewActionRequest, buildUserChoiceActionRequest } from "./actionRequest";
 import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import { buildPlanApprovalIdentity } from "./planApprovalIdentity";
@@ -354,6 +355,8 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnId: currentTurn?.id ?? null,
       currentTurnTitle: currentTurn?.title ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnRuntimeStatus: currentTurn?.runtimeOutcome?.status ?? null,
+      currentTurnResultKind: currentTurn?.runtimeOutcome?.resultKind ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       currentTurnParentPlanTurnId: currentTurn?.parentPlanTurnId ?? null,
@@ -362,6 +365,7 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnExecutionConsent: state.currentTurnExecutionConsent,
       pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
       planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
+      planLifecycleStatus: state.planLifecycle.status,
       visibleConversationTurns,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       agentTexts: agentBlocks.map((block) => block.content),
@@ -5666,7 +5670,28 @@ function seedGoalCapsuleScenario() {
   };
   bridge.consumeQueuedGoalContinuation = () => {
     const queued = useAppStore.getState().queuedUserMessage;
-    if (!queued) return false;
+    const authorization = queued?.goalContinuationAuthorization;
+    if (!queued || !authorization) return false;
+    let runLeaseAccepted = false;
+    useAppStore.setState((latest) => {
+      if (latest.queuedUserMessage?.id !== queued.id) return {};
+      const transition = buildAcceptedGoalContinuationState({
+        goal: latest.activeGoal,
+        progress: latest.goalProgress || latest.goalRuntime?.progress,
+        runtime: latest.goalRuntime,
+        authorization,
+        ownerTurnId: authorization.ownerTurnId,
+      });
+      if (!transition) return {};
+      runLeaseAccepted = true;
+      return {
+        activeGoal: transition.goal,
+        goalProgress: transition.progress,
+        goalStatus: "active" as const,
+        goalRuntime: transition.runtime,
+      };
+    });
+    if (!runLeaseAccepted) return false;
     return useAppStore.getState().clearQueuedUserMessage({
       expectedId: queued.id,
       disposition: "consumed",
@@ -6285,6 +6310,7 @@ function seedComposerRunningGuidanceScenario() {
 
   const now = Date.now();
   const turnId = "e2e-composer-running-guidance-turn";
+  const planLifecycleEpoch = "plan-session-e2e-composer-running-guidance";
   const userBlockId = useAppStore.getState()._nextTaskId();
 
   useAppStore.setState((state) => ({
@@ -6303,6 +6329,12 @@ function seedComposerRunningGuidanceScenario() {
           title: "E2E Composer Running Guidance",
           date: new Date(now).toISOString(),
           active: true,
+          planLifecycleEpoch,
+          // Keep the in-memory fixture authoritative until the first
+          // admission persists it. Otherwise the app's async disk refresh
+          // correctly treats this unsaved fixture as missing and replaces the
+          // active Run with a newly-created empty Session.
+          storageStatus: "temporary",
           messages: [],
         },
       ],

@@ -15,6 +15,7 @@ import {
 import { buildRepeatLoopArgsKey } from "../../repetitionGuard";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ToolDefinition } from "../../toolSchemas";
+import type { ToolCatalog } from "../../toolCatalog";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import { isWorkspaceMutationToolCall } from "../../workspaceMutationTools";
 import { isPtyControlInput } from "../../ptyCommandRuntime";
@@ -94,6 +95,7 @@ export async function executeToolExecutionRound(input: {
   callbacks: OrchestratorCallbacks;
   iteration: number;
   iterationAllTools: ToolDefinition[];
+  toolCatalog: ToolCatalog;
   hooksConfig: HooksConfig;
   turnInputContextSignals: TurnInputContextSignals;
   recentPlanToolActivity: PlanToolActivitySummary[];
@@ -115,6 +117,7 @@ export async function executeToolExecutionRound(input: {
     callbacks,
     iteration,
     iterationAllTools,
+    toolCatalog,
     hooksConfig,
     turnInputContextSignals,
     recentPlanToolActivity,
@@ -148,6 +151,7 @@ export async function executeToolExecutionRound(input: {
         turnContext: turnInputContextSignals,
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
+        toolCatalog,
       },
     );
     const normalizedReadResults: ToolExecutionResult[] = [];
@@ -277,6 +281,7 @@ export async function executeToolExecutionRound(input: {
       callbacks,
       iterationAllTools,
       hooksConfig,
+      { toolCatalog },
     );
     allResults.push(result);
 
@@ -296,6 +301,7 @@ export async function executeToolExecutionRound(input: {
         turnContext: turnInputContextSignals,
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
+        toolCatalog,
       },
     );
     allResults.push(...specResults);
@@ -315,6 +321,7 @@ export async function executeToolExecutionRound(input: {
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
         skipUserReview: tc.skipUserReview === true,
+        toolCatalog,
       },
     );
     allResults.push(result);
