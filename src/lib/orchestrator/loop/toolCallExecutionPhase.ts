@@ -29,6 +29,7 @@ import type { ToolCatalog } from "../../toolCatalog";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
+import { hasCompletedToolExecution } from "../../toolResultEffect";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type {
   AgentMessage,
@@ -257,6 +258,25 @@ function normalizeLeaseBackedReadToolCalls(
   });
 }
 
+/**
+ * Provider-native call ids are only unique inside one response. Some local
+ * providers synthesize the same id (for example `native_call_1`) on every
+ * iteration, so retaining that id would let a later lifecycle callback own an
+ * earlier tool card. Assign one runtime identity before the call enters either
+ * assistant history or execution; both sides of the tool protocol then share
+ * the same Turn-scoped id.
+ */
+export function assignRuntimeToolCallIds(
+  calls: ToolCallToExecute[],
+  iterationTurnId: string,
+): ToolCallToExecute[] {
+  const turnIdentity = String(iterationTurnId || "").trim() || "iteration";
+  return calls.map((call, index) => ({
+    ...call,
+    id: `${turnIdentity}-tool-${index + 1}`,
+  }));
+}
+
 type SetPlanRuntimePhase = (
   phase: PlanRuntimePhase,
   reason?: string,
@@ -345,6 +365,7 @@ export async function executeToolCallPhase(input: {
     TurnIterationContext,
     | "eventThreadId"
     | "eventTurnId"
+    | "iterationTurnId"
     | "turnContext"
     | "startedToolCallIds"
     | "completedToolCallIds"
@@ -469,7 +490,7 @@ export async function executeToolCallPhase(input: {
       coverageMode: executeRecoveryState.readLease?.coverageMode || "exact",
     });
   }
-  const effectiveToolCalls = leaseNormalizedToolCalls.map((call) => {
+  const aliasResolvedToolCalls = leaseNormalizedToolCalls.map((call) => {
     const resolution = input.toolCatalog.lookup(call.name);
     if (resolution.status !== "resolved") return call;
     const exposedName = resolution.entry.exposedName;
@@ -481,6 +502,18 @@ export async function executeToolCallPhase(input: {
       source: resolution.entry.source,
     });
     return { ...call, name: exposedName };
+  });
+  const effectiveToolCalls = assignRuntimeToolCallIds(
+    aliasResolvedToolCalls,
+    input.iterationContext.iterationTurnId,
+  );
+  logAgentEvent("tool_call_ids_canonicalized", {
+    iteration: input.iteration,
+    iterationTurnId: input.iterationContext.iterationTurnId,
+    mappings: effectiveToolCalls.slice(0, 12).map((call, index) => ({
+      providerToolCallId: aliasResolvedToolCalls[index]?.id || null,
+      runtimeToolCallId: call.id,
+    })),
   });
 
   logAgentEvent("tool_calls_detected", {
@@ -519,6 +552,7 @@ export async function executeToolCallPhase(input: {
     planRuntimePhase: planRuntimeState.planRuntimePhase,
     availableToolNames: input.availableToolNames,
     toolCapabilityRegistry: input.toolCapabilityRegistry,
+    toolCatalog: input.toolCatalog,
     toolPermissionPolicy: input.toolPermissionPolicy,
     recentPlanToolActivity: input.recentPlanToolActivity,
     recentToolActivity: input.recentToolActivity,
@@ -557,6 +591,7 @@ export async function executeToolCallPhase(input: {
     iteration: input.iteration,
     iterationAllTools: input.iterationAllTools,
     toolCatalog: input.toolCatalog,
+    toolCapabilityRegistry: input.toolCapabilityRegistry,
     hooksConfig: input.hooksConfig,
     turnInputContextSignals: input.turnInputContextSignals,
     recentPlanToolActivity: input.recentPlanToolActivity,
@@ -610,7 +645,7 @@ export async function executeToolCallPhase(input: {
       ? activeRecoveryReadLease
       : null;
   const freshReadResult = allResults.find((result) => {
-    if (result.name !== "read_file" || result.isError || result.internalFeedback) return false;
+    if (result.name !== "read_file" || !hasCompletedToolExecution(result)) return false;
     const detail = String(result.displayContent || result.content || "");
     const overlapExtension = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail);
     const satisfiesActiveReadLease = Boolean(
@@ -635,10 +670,16 @@ export async function executeToolCallPhase(input: {
       : !isReadOnlyNoProgressDetail(detail);
   });
   const mutationResult = allResults.find((result) =>
-    !result.internalFeedback && isProjectSourceWriteResult(result)
+    !result.internalFeedback && isProjectSourceWriteResult(
+      result,
+      toolArgsByCallId.get(result.toolCallId) || {},
+    )
   );
   const mutationTargets = mutationResult
-    ? extractStructuredChangedPaths(mutationResult.content, mutationResult.displayContent)
+    ? [...new Set([
+        ...(mutationResult.workspaceMutationEvidence?.changedPaths || []),
+        ...extractStructuredChangedPaths(mutationResult.content, mutationResult.displayContent),
+      ])]
     : [];
   const validationResult = allResults.find(isVerificationEvidenceResult);
   const recoveryIterationBudgetNeutral =
@@ -648,12 +689,12 @@ export async function executeToolCallPhase(input: {
       result.internalFeedback === true ||
       (
         result.name === "read_file" &&
-        !result.isError &&
+        hasCompletedToolExecution(result) &&
         isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
       ) ||
       (
         ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(result.name) &&
-        !result.isError
+        hasCompletedToolExecution(result)
       )
     );
   const expectedRecoveryTarget = executeRecoveryState.expectedTarget;

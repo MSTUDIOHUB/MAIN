@@ -47,7 +47,6 @@ import {
 } from "../lib/toolUiGrouping";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
-  buildCapsuleActivityText,
   buildRuntimeProgressLedger,
   buildRunStatusProjection,
 } from "../lib/runtimeProgressLedger";
@@ -71,6 +70,7 @@ import {
   isTransparentToolNarrationBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
+  shouldSuppressSupersededPlanCandidate,
   shouldSuppressAgentAsExplanation,
   shouldSuppressAgentToolEcho,
 } from "../lib/chat/chatBlockVisibility";
@@ -89,7 +89,11 @@ import {
   isCommandLikeToolName,
   shouldGroupPlanExecutionTools,
 } from "../lib/chat/chatToolSummary";
-import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
+import {
+  getPendingToolReviewArgumentDisclosure,
+  isExactPendingToolReviewOwner,
+  resolveVisiblePendingToolReview,
+} from "../lib/pendingToolReview";
 import {
   getToolPermissionResolutionIdentity,
   shouldRenderPermissionCapsule,
@@ -105,7 +109,7 @@ import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
-import { selectCapsulePublicCommentary } from "../lib/capsuleCommentary";
+import { selectCapsuleThoughtSummary } from "../lib/capsuleCommentary";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -3123,6 +3127,21 @@ export default function ChatArea({
     permissionRequestHasExactRuntimeOwner,
     taskFlow,
   ]);
+  const pendingToolArgumentDisclosure = useMemo(() => {
+    if (
+      !permissionRequestHasExactRuntimeOwner ||
+      !permissionActionRequest?.toolCallId ||
+      pendingToolCall?.toolCallId !== permissionActionRequest.toolCallId ||
+      pendingToolCall?.name !== permissionActionRequest.toolName
+    ) {
+      return null;
+    }
+    return getPendingToolReviewArgumentDisclosure(pendingToolCall);
+  }, [
+    pendingToolCall,
+    permissionActionRequest,
+    permissionRequestHasExactRuntimeOwner,
+  ]);
   const capsuleControlHasChoiceContext =
     !!pendingToolReviewForExecutionCapsule;
   const shouldShowExecutionCapsuleNormally =
@@ -3367,8 +3386,14 @@ export default function ChatArea({
       const autoCollapse = index < taskFlow.length - 1 && taskFlow.findIndex((t, i) => i > index && t.type === "agent") !== -1;
       const blockPermissionIdentity = permissionRequestHasExactRuntimeOwner &&
         permissionResolutionIdentity &&
-        permissionResolutionIdentity.taskId === block.id &&
-        permissionResolutionIdentity.turnId === block.turnId
+        permissionActionRequest &&
+        isExactPendingToolReviewOwner(block, {
+          taskId: permissionResolutionIdentity.taskId,
+          turnIds: [permissionResolutionIdentity.turnId],
+          toolCallId: permissionActionRequest.toolCallId,
+          toolName: permissionActionRequest.toolName,
+          target: permissionActionRequest.target,
+        })
         ? permissionResolutionIdentity
         : null;
       return (
@@ -3381,13 +3406,20 @@ export default function ChatArea({
             message={block.message}
             diff={block.diff}
             shellPermissionDecision={block.shellPermissionDecision}
+            permissionRisk={blockPermissionIdentity ? permissionActionRequest?.risk : undefined}
             intentSummary={block.intentSummary}
             why={block.why}
             evidence={block.evidence}
             observationSummary={block.observationSummary}
-            onAllow={() => blockPermissionIdentity && allowToolAction?.(block.id, blockPermissionIdentity)}
-            onAllowForSession={() => blockPermissionIdentity && approvePendingReviewForSession?.(blockPermissionIdentity)}
-            onReject={() => blockPermissionIdentity && rejectToolAction?.(block.id, blockPermissionIdentity)}
+            onAllow={blockPermissionIdentity
+              ? () => allowToolAction?.(block.id, blockPermissionIdentity)
+              : undefined}
+            onAllowForSession={blockPermissionIdentity
+              ? () => approvePendingReviewForSession?.(blockPermissionIdentity)
+              : undefined}
+            onReject={blockPermissionIdentity
+              ? () => rejectToolAction?.(block.id, blockPermissionIdentity)
+              : undefined}
             autoApproveTools={autoApproveTools}
             onToggleAutoApprove={onToggleAutoApprove}
             autoCollapse={autoCollapse}
@@ -3712,6 +3744,11 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        if (shouldSuppressSupersededPlanCandidate({
+          block: item.block,
+          hasReviewableArtifact: hasReviewablePlanArtifact,
+          ownsReviewableArtifact: turn.id === planArtifactOwnerTurnId,
+        })) return null;
         // `user_progress` is runtime/process narration, including legacy
         // persisted model prose that used to be promoted from tool-call text.
         // Its structured tool evidence is rendered by the process timeline and
@@ -4245,16 +4282,7 @@ export default function ChatArea({
     agentStatus,
     isRunActive: capsuleIsRunActive,
   });
-  const capsuleActivityText = capsuleIsRunActive && [
-    "analyzing",
-    "planning",
-    "executing",
-    "validating",
-    "recovering",
-  ].includes(capsuleStatusProjection.kind)
-    ? buildCapsuleActivityText(capsuleRunStatus, language)
-    : "";
-  const capsuleCommentaryText = capsuleIsRunActive &&
+  const capsuleThoughtSummaryText = capsuleIsRunActive &&
     !capsuleActionKind &&
     activeSessionKey &&
     capsuleTurn?.id &&
@@ -4263,12 +4291,13 @@ export default function ChatArea({
     ["analyzing", "planning", "executing", "validating", "recovering"].includes(
       capsuleStatusProjection.kind,
     )
-      ? selectCapsulePublicCommentary({
+      ? selectCapsuleThoughtSummary({
           blocks: capsuleTurnBlocks,
           sessionKey: activeSessionKey,
           logicalTurnId: capsuleActiveLogicalTurnId,
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
+          language,
         })
       : "";
 
@@ -4343,6 +4372,9 @@ export default function ChatArea({
       requestId={permissionActionRequest?.requestId || undefined}
       permissionIdentity={permissionResolutionIdentity || undefined}
       permissionRisk={permissionActionRequest?.risk}
+      permissionToolName={permissionActionRequest?.toolName}
+      permissionTarget={permissionActionRequest?.target}
+      permissionArgumentDisclosure={pendingToolArgumentDisclosure}
       status={capsuleStatusLabel}
       statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
       language={language}
@@ -5093,6 +5125,11 @@ export default function ChatArea({
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
               >
+                <div
+                  aria-hidden="true"
+                  className="capsule-rotate-beam"
+                  data-testid="capsule-rotate-beam"
+                />
                 {isCapsuleCollapsed ? (
                   <div
                     className={`flex items-center justify-center w-full h-full ${activeGoal ? `capsule-goal-icon is-${goalStatus}` : "animate-pulse"}`}
@@ -5121,43 +5158,33 @@ export default function ChatArea({
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
-                          <span className="min-w-0 block flex-1 text-left">
-                            <span
-                              data-testid="capsule-status-label"
-                              className={`block truncate whitespace-nowrap font-semibold ${
-                                isLightThemeMode ? "text-[#18181b]" : "text-white"
-                              }`}
-                            >
-                              {headerLabel}
-                            </span>
-                            {capsuleCommentaryText && (
-                              <span
-                                data-testid="capsule-commentary-label"
+                          <div className="min-w-0 flex-1 text-left">
+                            {capsuleThoughtSummaryText ? (
+                              <div
+                                data-testid="capsule-thought-summary-label"
                                 aria-live="polite"
                                 aria-atomic="true"
-                                title={capsuleCommentaryText}
-                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-medium ${
-                                  isLightThemeMode ? "text-[#3f3f46]" : "text-[#d4d4d8]"
-                                }`}
+                                className="capsule-thought-markdown block min-w-0 font-medium"
                               >
-                                {language === "zh" ? "模型进展：" : "Model update: "}
-                                {capsuleCommentaryText}
-                              </span>
-                            )}
-                            {capsuleActivityText && (
+                                <MarkdownRenderer
+                                  content={capsuleThoughtSummaryText}
+                                  baseFontSize={Math.max(12, resolvedChatFontSize - 1)}
+                                  sourceId={`capsule-thought-${capsuleTurn?.id || "active"}`}
+                                />
+                              </div>
+                            ) : (
                               <span
-                                data-testid="capsule-activity-label"
+                                data-testid="capsule-status-label"
                                 aria-live="polite"
                                 aria-atomic="true"
-                                title={capsuleActivityText}
-                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-normal ${
-                                  isLightThemeMode ? "text-[#52525b]" : "text-[#a1a1aa]"
+                                className={`block whitespace-normal break-words font-semibold ${
+                                  isLightThemeMode ? "text-[#18181b]" : "text-white"
                                 }`}
                               >
-                                {capsuleActivityText}
+                                {headerLabel}
                               </span>
                             )}
-                          </span>
+                          </div>
                         </div>
 
                         {capsuleHasTasks && (

@@ -63,7 +63,12 @@ export type AssistantTextVisibility =
 
 export interface PublicAssistantProgressIdentity {
   schemaVersion: 1;
-  kind: "assistant_commentary";
+  /**
+   * `capsule_activity` is provisional live model prose owned by one exact Run.
+   * It may be promoted to durable `assistant_commentary` only after the
+   * runtime has classified it as a real stage update.
+   */
+  kind: "assistant_commentary" | "capsule_activity";
   source: "model_visible_content";
   sessionKey: string;
   /** Logical Turn owner used by the runtime event ledger. */
@@ -97,13 +102,18 @@ export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & {
       type: "tool";
+      /** Provider-facing name retained for display and lifecycle matching. */
       toolName: string;
+      /** Canonical runtime capability used for semantic UI classification. */
+      executionName?: string;
       target: string;
       status: string;
       toolStatus: "pending" | "executed" | "rejected" | "running" | "failed";
       toolCallId?: string;
       message?: string;
       diff?: ToolDiffSnapshot;
+      /** A terminal diff is verified on success and partial after a failed tool. */
+      workspaceEffect?: "verified" | "partial";
       shellPermissionDecision?: ShellPermissionDecision;
       revertStatus?: DiffRevertStatus;
       revertMessage?: string;

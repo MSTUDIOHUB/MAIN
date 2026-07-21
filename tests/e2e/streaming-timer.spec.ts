@@ -16,7 +16,11 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "plugin:event|listen") return 1;
       if (cmd === "plugin:event|unlisten") return null;
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
-      if (cmd === "save_project_session") return args?.session ?? null;
+      if (cmd === "save_project_session") {
+        const capture = ((window as any).__COMPOSER_PREFERENCE_E2E__ ??= { savedSessions: [] });
+        capture.savedSessions.push(JSON.parse(JSON.stringify(args?.session ?? null)));
+        return args?.session ?? null;
+      }
       if (cmd === "list_project_sessions") return [];
       return null;
     };
@@ -158,6 +162,22 @@ test("composer subagent preference toggle activates after the current run stops"
   await expect
     .poll(async () => page.evaluate(() => Boolean((window as any).__CODELY_E2E__?.getSnapshot?.().preferSubagents)))
     .toBe(true);
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({ status: "running" }));
+  const preferenceInstruction = "检查启动和菜单模块";
+  await page.getByTestId("composer-textarea").fill(preferenceInstruction);
+  await page.getByTestId("composer-send-button").click();
+  await expect.poll(async () => page.evaluate((text) => {
+    const savedSessions = (window as any).__COMPOSER_PREFERENCE_E2E__?.savedSessions || [];
+    for (const session of savedSessions) {
+      const entries = session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [];
+      const admitted = entries.find((entry: any) => entry?.instruction?.payload?.text === text);
+      if (admitted) {
+        return admitted.instruction.payload.dispatchHints?.subagentPreference ?? null;
+      }
+    }
+    return null;
+  }, preferenceInstruction)).toBe("preferred");
 
   const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
   await expect(

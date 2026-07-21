@@ -1,5 +1,57 @@
 import { expect, test, type Page } from "@playwright/test";
 
+const ACTIVE_CAPSULE_STATUSES = ["analyzing", "planning", "executing", "validating", "recovering"] as const;
+const INACTIVE_CAPSULE_STATUSES = [
+  "awaiting_approval",
+  "awaiting_permission",
+  "awaiting_choice",
+  "paused",
+  "completed",
+  "partial",
+  "blocked",
+  "canceled",
+  "error",
+] as const;
+
+async function readCapsuleBeam(page: Page) {
+  return page.getByTestId("agent-explanation-capsule").evaluate((capsule) => {
+    const beam = capsule.querySelector<HTMLElement>("[data-testid='capsule-rotate-beam']");
+    const beamStyle = beam ? getComputedStyle(beam) : null;
+    const glowStyle = getComputedStyle(capsule, "::before");
+    const surfaceBorderProbe = document.createElement("span");
+    surfaceBorderProbe.style.color = "var(--surface-border)";
+    document.body.appendChild(surfaceBorderProbe);
+    const surfaceBorderColor = getComputedStyle(surfaceBorderProbe).color;
+    surfaceBorderProbe.remove();
+    return {
+      capsuleBorderColor: getComputedStyle(capsule).borderTopColor,
+      surfaceBorderColor,
+      beamOpacity: Number(beamStyle?.opacity || 0),
+      beamPointerEvents: beamStyle?.pointerEvents || "",
+      beamTransitionDuration: beamStyle?.transitionDuration || "",
+      beamMaskComposite: beamStyle?.maskComposite || beamStyle?.getPropertyValue("-webkit-mask-composite") || "",
+      childElementCount: beam?.childElementCount || 0,
+      inheritedAccentLight: beamStyle?.getPropertyValue("--accent-light").trim() || "",
+      animationName: beamStyle?.animationName || "",
+      animationDuration: beamStyle?.animationDuration || "",
+      animationTimingFunction: beamStyle?.animationTimingFunction || "",
+      animationIterationCount: beamStyle?.animationIterationCount || "",
+      animationPlayState: beamStyle?.animationPlayState || "",
+      backgroundImage: beamStyle?.backgroundImage || "",
+      filter: beamStyle?.filter || "",
+      glow: {
+        opacity: Number(glowStyle.opacity || 0),
+        animationName: glowStyle.animationName,
+        animationDuration: glowStyle.animationDuration,
+        animationTimingFunction: glowStyle.animationTimingFunction,
+        animationPlayState: glowStyle.animationPlayState,
+        backgroundImage: glowStyle.backgroundImage,
+        filter: glowStyle.filter,
+      },
+    };
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
@@ -7,6 +59,108 @@ test.beforeEach(async ({ page }) => {
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
   });
+});
+
+test("Capsule beam uses one continuous masked Rotate gradient", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(page.getByTestId("capsule-rotate-beam")).toHaveCount(1);
+
+  for (const status of ACTIVE_CAPSULE_STATUSES) {
+    await capsule.evaluate((element, nextStatus) => element.setAttribute("data-capsule-status", nextStatus), status);
+    const beam = await readCapsuleBeam(page);
+    expect(beam.beamOpacity).toBeGreaterThan(0);
+    expect(beam.beamPointerEvents).toBe("none");
+    expect(beam.beamTransitionDuration).toBe("0.2s");
+    expect(beam.beamMaskComposite).toMatch(/exclude|xor/);
+    expect(beam.childElementCount).toBe(0);
+    expect(beam.animationName).toBe("capsule-beam-travel");
+    expect(beam.animationDuration).toBe("4.2s");
+    expect(beam.animationTimingFunction).toBe("linear");
+    expect(beam.animationIterationCount).toBe("infinite");
+    expect(beam.animationPlayState).toBe("running");
+    expect(beam.backgroundImage).toContain("conic-gradient");
+    expect(beam.filter).toBe("none");
+    expect(beam.glow.opacity).toBeGreaterThan(0);
+    expect(beam.glow.animationName).toBe("capsule-beam-travel");
+    expect(beam.glow.animationDuration).toBe("4.2s");
+    expect(beam.glow.animationTimingFunction).toBe("linear");
+    expect(beam.glow.animationPlayState).toBe("running");
+    expect(beam.glow.backgroundImage).toContain("conic-gradient");
+    expect(beam.glow.filter).toContain("blur(9px)");
+  }
+
+  for (const status of INACTIVE_CAPSULE_STATUSES) {
+    await capsule.evaluate((element, nextStatus) => element.setAttribute("data-capsule-status", nextStatus), status);
+    await expect.poll(async () => (await readCapsuleBeam(page)).beamOpacity).toBeLessThan(0.01);
+    const beam = await readCapsuleBeam(page);
+    expect(beam.animationPlayState).toBe("paused");
+    expect(beam.glow.animationPlayState).toBe("paused");
+    expect(beam.glow.opacity).toBeLessThan(0.01);
+  }
+});
+
+test("Capsule beam follows theme intensity and keeps the same motion when collapsed", async ({ page }, testInfo) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setTheme?.("green"));
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  const snapshotStyle = await page.addStyleTag({ content: `
+    html[data-capsule-beam-snapshot] .capsule-rotate-beam {
+      animation: none !important;
+      --capsule-beam-angle: 0deg !important;
+    }
+    html[data-capsule-beam-snapshot] .agent-explanation-capsule::before {
+      animation: none !important;
+      --capsule-beam-angle: 0deg !important;
+    }
+  ` });
+  await page.evaluate(() => document.documentElement.setAttribute("data-capsule-beam-snapshot", ""));
+  const expectedStrength = { light: 0.56, dark: 0.72, black: 0.78 } as const;
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", mode);
+    await expect.poll(async () => (await readCapsuleBeam(page)).beamOpacity).toBeCloseTo(expectedStrength[mode], 2);
+
+    const beam = await readCapsuleBeam(page);
+    const accentLight = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--accent-light").trim());
+    expect(beam.beamOpacity).toBeCloseTo(expectedStrength[mode], 2);
+    expect(beam.inheritedAccentLight).toBe(accentLight);
+    expect(beam.capsuleBorderColor).toBe(beam.surfaceBorderColor);
+    const screenshotPath = testInfo.outputPath(`capsule-rotate-beam-${mode}.png`);
+    await capsule.screenshot({ path: screenshotPath });
+    await testInfo.attach(`capsule-rotate-beam-${mode}`, { path: screenshotPath, contentType: "image/png" });
+  }
+  await page.evaluate(() => document.documentElement.removeAttribute("data-capsule-beam-snapshot"));
+  await snapshotStyle.evaluate((element) => element.remove());
+
+  await page.getByTitle("隐藏").click();
+  await expect(capsule).toHaveClass(/collapsed-ring/);
+  const collapsed = await readCapsuleBeam(page);
+  expect(collapsed.animationPlayState).toBe("running");
+  const collapsedAnimations = await capsule.evaluate((element) => ({
+    capsule: getComputedStyle(element).animationName,
+    icon: getComputedStyle(element.querySelector<HTMLElement>(".animate-pulse")!).animationName,
+  }));
+  expect(collapsedAnimations.capsule).toBe("none");
+  expect(collapsedAnimations.icon).toBe("none");
+  const collapsedScreenshotPath = testInfo.outputPath("capsule-rotate-beam-collapsed.png");
+  await capsule.screenshot({ path: collapsedScreenshotPath });
+  await testInfo.attach("capsule-rotate-beam-collapsed", { path: collapsedScreenshotPath, contentType: "image/png" });
+});
+
+test("Capsule beam becomes a static low-intensity indicator for reduced motion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+
+  const beam = await readCapsuleBeam(page);
+  expect(beam.beamOpacity).toBeCloseTo(0.72 * 0.42, 2);
+  expect(beam.animationName).toBe("none");
 });
 
 test("ExecutionCapsule does not invent execution step progress from plain tool activity", async ({ page }) => {
@@ -17,16 +171,16 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
-test("active Capsule shows exact-run public model commentary alongside structured activity", async ({ page }) => {
+test("active Capsule renders exact-run public model commentary as its primary Markdown", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
-  await expect(capsule.getByTestId("capsule-commentary-label")).toHaveText(
-    "模型进展：当前判断：已确认展示层入口，正在核对活动状态与运行身份。",
-  );
-  await expect(capsule.getByTestId("capsule-activity-label")).toBeVisible();
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
+  const thoughtSummary = capsule.getByTestId("capsule-thought-summary-label");
+  await expect(thoughtSummary).toHaveText("当前判断：已确认展示层入口，正在核对活动状态与运行身份。");
+  await expect(thoughtSummary.locator("strong")).toHaveText("当前判断");
+  await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("**");
 });
 
@@ -38,7 +192,8 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
-  await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在执行已批准计划");
+  await expect(capsule.getByTestId("capsule-thought-summary-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("apply_patch");
   await expect(capsule).not.toContainText("src/task-9.ts");
   await expect(capsule).not.toContainText("阶段：tool_start");
@@ -115,10 +270,38 @@ test("ExecutionCapsule keeps approval buttons visible for a long command with pl
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("拒绝");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("开启自动审查并批准");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("批准此工具请求");
-  await expect(page.getByTestId("execution-capsule-tool-review")).not.toContainText("printf");
+  await expect(page.getByTestId("execution-capsule-tool-review-risk")).toContainText("Shell 命令");
+  await expect(page.getByTestId("execution-capsule-tool-review-target")).toContainText("printf");
+  await expect(page.getByTestId("execution-capsule-tool-review-argument")).toContainText("Created valid icon.png");
   await expect(page.getByTestId("execution-capsule-plan-badge")).toContainText("任务 8/12");
   await expect(page.getByTestId("execution-capsule-plan-progress")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-current-plan-task")).toHaveCount(0);
+});
+
+test("destructive approval shows exact risk and target and cannot enable session approval", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+  await page.evaluate(() => {
+    (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.();
+    (window as any).__CODELY_E2E__?.makePendingToolReviewDestructive?.();
+  });
+
+  const identity = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.getPendingToolReviewIdentity?.() as PermissionIdentity | null
+  );
+  expect(identity).not.toBeNull();
+  await expect(page.getByTestId("execution-capsule-tool-review-risk")).toContainText("破坏性操作");
+  await expect(page.getByTestId("execution-capsule-tool-review-target")).toContainText("DELETE FROM users WHERE id = 42");
+  await expect(page.getByTestId("execution-capsule-tool-approve-session")).toHaveCount(0);
+  await expect(page.getByTestId("action-card-approve-session")).toHaveCount(0);
+  await expect(page.getByTestId("action-card-auto-approve")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-tool-approve-once")).toBeVisible();
+
+  await page.evaluate(
+    (exactIdentity) =>
+      (window as any).__CODELY_E2E__?.resolvePendingToolReviewWithIdentity?.("approve_session", exactIdentity),
+    identity,
+  );
+  await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
 });
 
 type PermissionIdentity = {
@@ -218,7 +401,7 @@ test("task tracking popover preserves authored checklist order with runtime-only
   expect(styles.borderLeftColor).not.toBe("rgb(5, 150, 105)");
 
   await expect(page.getByTestId("capsule-status-label")).toHaveText("等待权限");
-  await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("run_command");
+  await expect(page.getByTestId("execution-capsule-tool-review-name")).toContainText("run_command");
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("阶段：waiting_review");
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
 });
@@ -232,7 +415,7 @@ test("ExecutionCapsule renders approval controls from pendingToolCall when the p
   await page.evaluate(() => (window as any).__CODELY_E2E__?.showOrphanPendingReviewPrompt?.());
   await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("批准此工具请求");
-  await expect(page.getByTestId("execution-capsule-tool-review")).not.toContainText("SnakeController.cs");
+  await expect(page.getByTestId("execution-capsule-tool-review-target")).toContainText("SnakeController.cs");
 
   await page.getByTestId("execution-capsule-tool-approve-once").click();
   await expect

@@ -35,7 +35,10 @@ import {
   type TurnInputContextSignals,
 } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
-import { scopeExecutionEvidenceLedger } from "../../verificationEvidence";
+import {
+  isSuccessfulStructuredEvidence,
+  scopeExecutionEvidenceLedger,
+} from "../../verificationEvidence";
 import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 
@@ -76,6 +79,9 @@ const DIRECT_FILE_MODIFY_SOURCE_TOOLS = new Set([
 ]);
 
 const DIRECT_FILE_MODIFY_VALIDATION_TOOLS = new Set([
+  "replace_in_file",
+  "write_file",
+  "apply_patch",
   "run_command",
 ]);
 
@@ -174,15 +180,18 @@ export function hasStructuredWorkspaceMutationEvidence(input: {
   callbacks: OrchestratorCallbacks;
   recentToolActivity: PlanToolActivitySummary[];
 }): boolean {
-  if (input.recentToolActivity.some((activity) =>
-    activity.status === "succeeded" && isWorkspaceMutationToolName(activity.name)
-  )) return true;
-
+  // Activity summaries intentionally omit arguments and execution disposition;
+  // a declined/no-op write, Plan artifact update, or inspect-shaped dynamic
+  // tool can therefore look like a successful mutation by name alone. Phase
+  // advancement trusts only the Turn-scoped durable file ledger produced from
+  // the verified tool result and diff.
   return scopeExecutionEvidenceLedger(
     input.callbacks.getPlanExecutionEvidenceLedger(),
     input.callbacks.getCurrentTurnId?.(),
   ).some((entry) =>
-    entry.kind === "file" && isWorkspaceMutationToolName(entry.sourceTool)
+    entry.kind === "file" &&
+    isWorkspaceMutationToolName(entry.sourceTool) &&
+    isSuccessfulStructuredEvidence(entry)
   );
 }
 
@@ -217,7 +226,8 @@ export function buildDirectFileModifyActionContractCard(input: {
         "run_command is available only for finite diagnostics in this phase. Do not use Python, shell redirection, sed, or temporary scripts to write workspace source, and do not start a dev server before structured file-mutation evidence exists.",
       ]
     : [
-        "Structured workspace mutation evidence exists. Validate it with the finite run_command tool now.",
+        "Structured workspace mutation evidence exists. Complete every remaining source edit with apply_patch, replace_in_file, or write_file; a file-modification turn may require more than one structured mutation.",
+        "After the last required source edit, validate the current workspace state with the finite run_command tool. Set its cwd field instead of prefixing the command with cd; trusted execution rejects shell-level working-directory changes. A newer mutation makes any earlier validation stale.",
         "Long-running process and browser tools are not part of this finite checkpoint; MAIN exposes them only through an explicit process-lifecycle validation contract.",
       ];
   return [
@@ -464,7 +474,7 @@ export function resolveIterationToolSurface(input: {
     .find((activity) =>
       activity.status === "succeeded" &&
       (
-        isWorkspaceMutationToolName(activity.name) ||
+        activity.mutationObserved === true ||
         EXECUTION_VERIFICATION_TOOL_NAMES.has(activity.name)
       )
     );
@@ -483,7 +493,7 @@ export function resolveIterationToolSurface(input: {
     delegationPhase = "validation";
   } else if (
     latestDecisiveRuntimeActivity &&
-    isWorkspaceMutationToolName(latestDecisiveRuntimeActivity.name)
+    latestDecisiveRuntimeActivity.mutationObserved === true
   ) {
     delegationPhase = "mutation";
   } else if (

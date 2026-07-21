@@ -15,6 +15,10 @@ export interface ToolFeedbackEnvelopeV1 {
   tool_call_id: string;
   tool: string;
   target: string;
+  /** Additive execution truth for a call that changed disk before failing. */
+  workspace_effect?: "partial";
+  changedPaths?: string[];
+  next_action?: "reread_changed_paths_before_retry";
   truncated?: boolean;
   summary?: string;
   hints?: string[];
@@ -26,6 +30,9 @@ export interface BuildToolFeedbackEnvelopeInput {
   tool: string;
   target: string;
   content: string;
+  workspaceEffect?: "partial";
+  changedPaths?: string[];
+  nextAction?: "reread_changed_paths_before_retry";
   truncated?: boolean;
   summary?: string;
   hints?: string[];
@@ -40,12 +47,25 @@ function compactLine(value: unknown, maxChars: number): string {
 export function buildToolFeedbackEnvelope(input: BuildToolFeedbackEnvelopeInput): ToolFeedbackEnvelopeV1 {
   const summary = compactLine(input.summary || input.content, 180);
   const hints = (input.hints || []).map((hint) => compactLine(hint, 180)).filter(Boolean);
+  const changedPaths = [...new Set(
+    (input.changedPaths || [])
+      .map((path) => compactLine(path, 180))
+      .filter(Boolean),
+  )].slice(0, 12);
+  const workspaceEffect = input.workspaceEffect === "partial" && changedPaths.length > 0
+    ? "partial" as const
+    : undefined;
   return {
     version: 1,
     status: input.status,
     tool_call_id: String(input.toolCallId || ""),
     tool: compactLine(input.tool, 80),
     target: compactLine(input.target, 180),
+    ...(workspaceEffect ? { workspace_effect: workspaceEffect } : {}),
+    ...(workspaceEffect ? { changedPaths } : {}),
+    ...(workspaceEffect && input.nextAction === "reread_changed_paths_before_retry"
+      ? { next_action: input.nextAction }
+      : {}),
     ...(input.truncated ? { truncated: true } : {}),
     ...(summary ? { summary } : {}),
     ...(hints.length > 0 ? { hints } : {}),
@@ -73,6 +93,14 @@ export function parseToolFeedbackEnvelope(text: string): { envelope: ToolFeedbac
     if (typeof parsed.tool_call_id !== "string") return null;
     if (typeof parsed.tool !== "string") return null;
     if (typeof parsed.target !== "string") return null;
+    const changedPaths = Array.isArray(parsed.changedPaths)
+      ? [...new Set(parsed.changedPaths
+          .map((path) => compactLine(path, 180))
+          .filter(Boolean))].slice(0, 12)
+      : [];
+    const workspaceEffect = parsed.workspace_effect === "partial" && changedPaths.length > 0
+      ? "partial" as const
+      : undefined;
     return {
       envelope: {
         version: 1,
@@ -80,6 +108,11 @@ export function parseToolFeedbackEnvelope(text: string): { envelope: ToolFeedbac
         tool_call_id: parsed.tool_call_id,
         tool: parsed.tool,
         target: parsed.target,
+        ...(workspaceEffect ? { workspace_effect: workspaceEffect } : {}),
+        ...(workspaceEffect ? { changedPaths } : {}),
+        ...(workspaceEffect && parsed.next_action === "reread_changed_paths_before_retry"
+          ? { next_action: parsed.next_action }
+          : {}),
         ...(parsed.truncated ? { truncated: true } : {}),
         ...(typeof parsed.summary === "string" ? { summary: parsed.summary } : {}),
         ...(Array.isArray(parsed.hints) ? { hints: parsed.hints.filter((hint): hint is string => typeof hint === "string") } : {}),

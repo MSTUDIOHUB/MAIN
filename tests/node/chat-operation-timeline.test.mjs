@@ -128,6 +128,37 @@ test("commands and failed tools are not swallowed by read/search clusters", () =
   assert.equal(segments[3].block.toolStatus, "failed");
 });
 
+test("canonical tool cards classify by execution name while preserving the provider-facing display name", () => {
+  const canonicalToolName = "mcp__unity__manage_script__f09a";
+  const diff = { old: "before", new: "after", path: "Assets/Scripts/Player.cs" };
+  const segments = buildChatRenderSegments({
+    language: "zh",
+    includeUser: false,
+    completedToolGrouping: {
+      enabled: true,
+      includeDiff: true,
+      minGroupSize: 1,
+    },
+    blocks: [{
+      id: 91,
+      type: "tool",
+      toolName: canonicalToolName,
+      executionName: "manage_script",
+      target: "Assets/Scripts/Player.cs",
+      toolStatus: "executed",
+      workspaceEffect: "verified",
+      diff,
+    }],
+  });
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].kind, "operationCluster");
+  assert.equal(segments[0].cluster.kind, "edit");
+  assert.equal(segments[0].cluster.items[0].toolName, canonicalToolName);
+  assert.equal(segments[0].cluster.items[0].executionName, "manage_script");
+  assert.equal(segments[0].cluster.items[0].block.diff, diff);
+});
+
 test("single project skeleton renders as the opencode-style Explore cluster", () => {
   const segments = buildChatRenderSegments({
     language: "zh",

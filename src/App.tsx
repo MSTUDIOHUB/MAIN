@@ -65,14 +65,14 @@ import {
   getAttachmentDisplayName,
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
-import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode, type MainModeKey } from "./lib/mainModes";
+import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { createDefaultImageStudioRuntime } from "./lib/imageStudio";
 import {
   resolveSessionModeAffinity,
   type SessionModeAffinity,
   type SessionModeAffinityLike,
 } from "./lib/imageStudioSessions";
-import { resolveConversationTurnIntent, type MainIntentShortcut } from "./lib/runIntent";
+import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { shouldContinueGoalFromUserChoice } from "./lib/goalChoiceContinuation";
 import {
@@ -109,7 +109,10 @@ import {
   beginSessionAdmissionRestore,
   settleSessionAdmissionRestore,
 } from "./store/sessionAdmissionReadiness";
-import { buildWorkspaceComposerIntentDispatchHints } from "./store/workspaceComposerIntentAdmission";
+import {
+  buildWorkspaceComposerIntentDispatchHints,
+  type WorkspaceComposerIntentSnapshot,
+} from "./store/workspaceComposerIntentAdmission";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -1876,10 +1879,7 @@ export default function App() {
     images?: string[],
     submitOptions?: {
       queuedUserMessageId?: string;
-      workspaceComposerIntentSnapshot?: {
-        mainModeKey: MainModeKey;
-        lockedComposerIntent: MainIntentShortcut | null;
-      };
+      workspaceComposerIntentSnapshot?: WorkspaceComposerIntentSnapshot;
       workspaceSubmissionPayloadSnapshot?: {
         contextMentions: string[];
         attachedFiles: AttachedFile[];

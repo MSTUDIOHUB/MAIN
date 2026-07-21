@@ -607,6 +607,8 @@ export interface PlanToolActivitySummary {
   target: string;
   status: PlanToolActivityStatus;
   detail?: string;
+  /** Runtime-observed mutation truth; tool names and success prose are insufficient. */
+  mutationObserved?: boolean;
   facts?: string[];
   /** Exact versioned read window retained across checkpoints and compaction. */
   readFileObservation?: FileReadObservationIdentity;

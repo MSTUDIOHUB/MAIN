@@ -41,6 +41,106 @@ export interface CanceledTurnProjectionResult<TState> {
 export interface CanceledTurnControlPlaneFence {
   /** Exact controller observed when the user requested Stop. */
   abortController: AbortController | null;
+  /** Exact active Harness owner observed for this Turn/Run, if one existed. */
+  harnessOwner: CanceledTurnHarnessOwnerIdentity | null;
+  /** Exact pending Action owner observed for this Turn/Run, if one existed. */
+  actionOwner: CanceledTurnActionOwnerIdentity | null;
+}
+
+interface CanceledTurnHarnessOwnerIdentity {
+  sessionKey: string;
+  turnId: string;
+  leaseRunId: string;
+  actionRunId: string | null;
+  instanceId: string;
+}
+
+interface CanceledTurnActionOwnerIdentity {
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  requestId: string;
+  kind: ActionRequest["kind"];
+  taskId: number | null;
+}
+
+function toHarnessOwnerIdentity(marker: HarnessRunMarker): CanceledTurnHarnessOwnerIdentity {
+  return {
+    sessionKey: marker.sessionKey,
+    turnId: marker.turnId || "",
+    leaseRunId: marker.runId,
+    actionRunId: getHarnessActionRunId(marker),
+    instanceId: marker.instanceId,
+  };
+}
+
+function toActionOwnerIdentity(action: ActionRequest): CanceledTurnActionOwnerIdentity {
+  return {
+    sessionKey: action.sessionKey,
+    turnId: action.turnId,
+    runId: action.runId,
+    requestId: action.requestId,
+    kind: action.kind,
+    taskId: "taskId" in action && typeof action.taskId === "number" ? action.taskId : null,
+  };
+}
+
+function isSameHarnessOwner(
+  current: CanceledTurnHarnessOwnerIdentity,
+  expected: CanceledTurnHarnessOwnerIdentity | null,
+): boolean {
+  return !!expected &&
+    current.sessionKey === expected.sessionKey &&
+    current.turnId === expected.turnId &&
+    current.leaseRunId === expected.leaseRunId &&
+    current.actionRunId === expected.actionRunId &&
+    current.instanceId === expected.instanceId;
+}
+
+function isSameActionOwner(
+  current: CanceledTurnActionOwnerIdentity,
+  expected: CanceledTurnActionOwnerIdentity | null,
+): boolean {
+  return !!expected &&
+    current.sessionKey === expected.sessionKey &&
+    current.turnId === expected.turnId &&
+    current.runId === expected.runId &&
+    current.requestId === expected.requestId &&
+    current.kind === expected.kind &&
+    current.taskId === expected.taskId;
+}
+
+export function captureCanceledTurnControlPlaneFence(input: {
+  state: Pick<CanceledTurnProjectionState, "abortController" | "harnessRunMarker" | "activeActionRequest">;
+  sessionKey: string;
+  turnId: string;
+  uiDisplayTurnId?: string | null;
+  runId?: string | null;
+}): CanceledTurnControlPlaneFence {
+  const turnIds = new Set([input.turnId, input.uiDisplayTurnId].filter(Boolean) as string[]);
+  const requestedRunId = String(input.runId || "").trim();
+  const marker = input.state.harnessRunMarker || null;
+  const action = input.state.activeActionRequest || null;
+  const ownedMarker = marker &&
+    marker.sessionKey === input.sessionKey &&
+    !!marker.turnId &&
+    turnIds.has(marker.turnId) &&
+    (marker.status === "running" || marker.status === "paused") &&
+    (!requestedRunId || getHarnessActionRunId(marker) === requestedRunId)
+      ? marker
+      : null;
+  const ownedAction = action &&
+    action.status === "pending" &&
+    action.sessionKey === input.sessionKey &&
+    turnIds.has(action.turnId) &&
+    (!requestedRunId || action.runId === requestedRunId)
+      ? action
+      : null;
+  return {
+    abortController: input.state.abortController ?? null,
+    harnessOwner: ownedMarker ? toHarnessOwnerIdentity(ownedMarker) : null,
+    actionOwner: ownedAction ? toActionOwnerIdentity(ownedAction) : null,
+  };
 }
 
 function createCancellationRunId(nowMs: number): string {
@@ -106,6 +206,16 @@ function reconcileAlreadyClosedControlPlane<
     actionRequest.status === "pending" &&
     input.turnIds.has(actionRequest.turnId) &&
     (!input.requestedRunId || actionRequest.runId === input.requestedRunId);
+  const activeMarkerOwnerChanged = markerOwnsTarget && !!marker &&
+    !isSameHarnessOwner(
+      toHarnessOwnerIdentity(marker),
+      input.controlPlaneFence.harnessOwner,
+    );
+  const activeActionOwnerChanged = actionOwnsTarget && !!actionRequest &&
+    !isSameActionOwner(
+      toActionOwnerIdentity(actionRequest),
+      input.controlPlaneFence.actionOwner,
+    );
   const hasSameSessionSuccessorControl = (
     markerBelongsToSession &&
     (marker.status === "running" || marker.status === "paused") &&
@@ -151,27 +261,37 @@ function reconcileAlreadyClosedControlPlane<
     !terminalRunIds.has(event.runId) &&
     (!input.requestedRunId || event.runId !== input.requestedRunId)
   );
-  if (hasSameSessionSuccessorControl || hasOpenSuccessorRun) {
+  if (
+    activeMarkerOwnerChanged ||
+    activeActionOwnerChanged ||
+    hasSameSessionSuccessorControl ||
+    hasOpenSuccessorRun
+  ) {
     return { state: input.state, harnessRunMarker: marker };
   }
 
-  const quarantinesCrossSessionMarker = !!marker && !markerBelongsToSession;
-  const quarantinesCrossSessionAction = !!actionRequest && !actionBelongsToSession;
+  const pendingBelongsToTargetAction = (
+    actionOwnsTarget &&
+    actionRequest?.kind === "tool_permission" &&
+    input.state.pendingReviewTaskId === actionRequest.taskId
+  ) || (
+    !actionRequest &&
+    input.controlPlaneFence.actionOwner?.kind === "tool_permission" &&
+    input.state.pendingReviewTaskId === input.controlPlaneFence.actionOwner.taskId
+  );
   const needsCleanup = input.state.isGenerating === true ||
     (typeof input.state.agentStatus === "string" && input.state.agentStatus !== "idle") ||
     !!input.state.abortController ||
     markerOwnsTarget ||
     actionOwnsTarget ||
-    quarantinesCrossSessionMarker ||
-    quarantinesCrossSessionAction ||
-    !!input.state.pendingReviewResolve ||
-    input.state.pendingReviewTaskId != null ||
-    input.state.pendingToolCall != null;
+    (pendingBelongsToTargetAction && (
+      !!input.state.pendingReviewResolve ||
+      input.state.pendingReviewTaskId != null ||
+      input.state.pendingToolCall != null
+    ));
   if (!needsCleanup) return { state: input.state, harnessRunMarker: marker };
 
-  const harnessRunMarker = quarantinesCrossSessionMarker
-    ? null
-    : markerOwnsTarget && marker
+  const harnessRunMarker = markerOwnsTarget && marker
       ? {
           ...marker,
           status: canonicalResultKind === "error" ? "error" as const : "completed" as const,
@@ -188,12 +308,16 @@ function reconcileAlreadyClosedControlPlane<
       isGenerating: false,
       abortController: null,
       harnessRunMarker,
-      activeActionRequest: actionOwnsTarget || quarantinesCrossSessionAction
+      activeActionRequest: actionOwnsTarget
         ? null
         : actionRequest,
-      pendingReviewResolve: null,
-      pendingReviewTaskId: null,
-      pendingToolCall: null,
+      ...(pendingBelongsToTargetAction
+        ? {
+            pendingReviewResolve: null,
+            pendingReviewTaskId: null,
+            pendingToolCall: null,
+          }
+        : {}),
     },
     harnessRunMarker,
   };
@@ -466,10 +590,11 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
   const ownsPendingReview = ownsActionRequest &&
     actionRequest.kind === "tool_permission" &&
     input.state.pendingReviewTaskId === actionRequest.taskId;
-  const shouldClearPendingReview = !hasForeignControlOwner || ownsPendingReview;
-  const harnessRunMarker = marker && !markerBelongsToSession
-    ? null
-    : ownsMarkerTurn && marker
+  const hasUnrelatedActionOwner = !!actionRequest && !ownsActionRequest;
+  const shouldClearPendingReview = ownsPendingReview || (
+    !hasForeignControlOwner && !hasUnrelatedActionOwner
+  );
+  const harnessRunMarker = ownsMarkerTurn && marker
     ? {
         ...marker,
         status: "completed" as const,
@@ -486,7 +611,7 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     taskFlow,
     runtimeEvents,
     harnessRunMarker,
-    activeActionRequest: ownsActionRequest || (actionRequest && !actionBelongsToSession)
+    activeActionRequest: ownsActionRequest
       ? null
       : actionRequest,
     conversationTurns: input.state.conversationTurns.map((turn) =>

@@ -1228,6 +1228,7 @@ export default function Composer({
         workspaceComposerIntentSnapshot: {
           mainModeKey: selectedMainModeKey,
           lockedComposerIntent: lockedIntentToConsume,
+          subagentPreference: preferSubagents ? "preferred" : "unspecified",
         },
         workspaceSubmissionPayloadSnapshot: {
           contextMentions: contextMentionsToSend,

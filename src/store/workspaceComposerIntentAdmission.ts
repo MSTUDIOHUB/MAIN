@@ -10,6 +10,10 @@ import {
   buildLocalTurnTitle,
   buildRunIntentSummary,
 } from "../lib/submit/turnSubmission";
+import {
+  normalizeSubagentDelegationPreference,
+  type SubagentDelegationPreference,
+} from "../lib/turnIntake";
 import type { WorkspaceJsonObject } from "../lib/workspaceInstruction";
 
 /**
@@ -19,6 +23,7 @@ import type { WorkspaceJsonObject } from "../lib/workspaceInstruction";
 export interface WorkspaceComposerIntentSnapshot {
   readonly mainModeKey: MainModeKey;
   readonly lockedComposerIntent: MainIntentShortcut | null;
+  readonly subagentPreference: SubagentDelegationPreference;
 }
 
 export interface WorkspaceComposerIntentAdmissionInput {
@@ -35,8 +40,11 @@ export interface WorkspaceComposerIntentAdmissionInput {
  */
 export function buildWorkspaceComposerIntentDispatchHints(
   input: WorkspaceComposerIntentAdmissionInput,
-): WorkspaceJsonObject | undefined {
+): WorkspaceJsonObject {
   const { mainModeKey } = input.snapshot;
+  const subagentPreference = normalizeSubagentDelegationPreference(
+    input.snapshot.subagentPreference,
+  );
   const mainDebugShortcut = mainModeKey === "main_mode"
     ? parseMainDebugShortcut(input.text)
     : null;
@@ -59,7 +67,7 @@ export function buildWorkspaceComposerIntentDispatchHints(
   const resolvedIntent: ResolvedRunIntent | null = mainDebugShortcut
     ? "plan"
     : lockedComposerIntent || mainIntentShortcut?.intent || modeIntent;
-  if (!resolvedIntent) return undefined;
+  if (!resolvedIntent) return { subagentPreference };
 
   const semanticInput = mainDebugShortcut
     ? mainDebugShortcut.rest
@@ -81,6 +89,7 @@ export function buildWorkspaceComposerIntentDispatchHints(
       });
 
   return {
+    subagentPreference,
     resolvedIntent,
     runtimeIntentOverride: resolvedIntent,
     skipIntentResolution: true,

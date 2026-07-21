@@ -2440,16 +2440,34 @@ test("only real mutations and opaque workspace actions refresh unversioned obser
     isError: false,
   }), false);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("apply_patch", {
+    name: "apply_patch",
+    target: "src/App.tsx",
+    toolCallId: "built-in-apply-patch",
+    catalogIdentity: { source: "built_in", canonicalName: "apply_patch" },
     content: "patched",
     isError: false,
-  }), true);
+  }, { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n*** End Patch" }), true);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("delete_workspace_path", {
+    name: "delete_workspace_path",
+    target: "src/old.ts",
+    toolCallId: "built-in-delete-path",
+    catalogIdentity: { source: "built_in", canonicalName: "delete_workspace_path" },
     content: JSON.stringify({ success: true }),
     isError: false,
-  }), true);
+  }, { path: "src/old.ts" }), true);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("script_apply_edits", {
     content: "updated method",
     isError: false,
+  }, { path: "Assets/Scripts", name: "Foo" }), false);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("script_apply_edits", {
+    name: "script_apply_edits",
+    target: "Assets/Scripts/Foo.cs",
+    toolCallId: "verified-external-edit",
+    content: "updated method",
+    isError: false,
+    executionAttempted: true,
+    workspaceEffect: "verified",
+    workspaceMutationEvidence: { changedPaths: ["Assets/Scripts/Foo.cs"] },
   }, { path: "Assets/Scripts", name: "Foo" }), true);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("manage_script", {
     content: "inspected script",
@@ -2458,7 +2476,7 @@ test("only real mutations and opaque workspace actions refresh unversioned obser
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("manage_script", {
     content: "created script",
     isError: false,
-  }, { action: "create", path: "Assets/Scripts", name: "Foo" }), true);
+  }, { action: "create", path: "Assets/Scripts", name: "Foo" }), false);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("run_command", {
     content: JSON.stringify({ exitCode: 0, stdout: "no-op appears in test output" }),
     isError: false,
@@ -2471,6 +2489,15 @@ test("only real mutations and opaque workspace actions refresh unversioned obser
     content: "interactive answer sent",
     isError: false,
   }, { input: "y" }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("run_command", {
+    name: "run_command",
+    target: "build",
+    toolCallId: "failed-after-invocation",
+    content: JSON.stringify({ exitCode: 1 }),
+    isError: true,
+    lifecycleState: "failed",
+    executionAttempted: true,
+  }), true, "a failed shell may have changed files before exiting");
 });
 
 test("same-batch reads suppress only the exact duplicate signature", async () => {
@@ -2841,10 +2868,12 @@ test("chat recovery cannot expand a respond turn into a mutation surface", () =>
   ]);
 });
 
-test("direct file modification exposes source tools before mutation and only finite validation after it", () => {
+test("direct file modification retains structured repair tools until final validation", () => {
   const tools = [
     "spawn_subagent",
     "read_file",
+    "replace_in_file",
+    "write_file",
     "apply_patch",
     "run_command",
     "execute_command",
@@ -2856,14 +2885,14 @@ test("direct file modification exposes source tools before mutation and only fin
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
   }));
-  const makeInput = (recentToolActivity = []) => ({
+  const makeInput = (recentToolActivity = [], evidenceLedger = []) => ({
     callbacks: {
       getCommandDirective: () => ({ kind: "file_modify", action: "workspace_file_change" }),
       getConfig: () => createLocalRuntimeConfig(),
       getCurrentTurnId: () => "turn-file-modify",
       getIsPlanApproved: () => false,
       getPlanTasks: () => [],
-      getPlanExecutionEvidenceLedger: () => [],
+      getPlanExecutionEvidenceLedger: () => evidenceLedger,
       getMessages: () => [],
       getPlanStage: () => "idle",
       getPendingSubagentIds: () => [],
@@ -2888,6 +2917,8 @@ test("direct file modification exposes source tools before mutation and only fin
   const sourceChange = resolveIterationToolSurface(makeInput());
   assert.equal(sourceChange.directFileModifyPhase, "source_change");
   assert.equal(sourceChange.availableToolNames.has("read_file"), true);
+  assert.equal(sourceChange.availableToolNames.has("replace_in_file"), true);
+  assert.equal(sourceChange.availableToolNames.has("write_file"), true);
   assert.equal(sourceChange.availableToolNames.has("apply_patch"), true);
   assert.equal(sourceChange.availableToolNames.has("run_command"), true);
   assert.equal(sourceChange.availableToolNames.has("execute_command"), false);
@@ -2895,20 +2926,71 @@ test("direct file modification exposes source tools before mutation and only fin
   assert.equal(sourceChange.availableToolNames.has("browser_evaluate"), false);
   assert.equal(sourceChange.availableToolNames.has("web_search"), false);
 
-  const validation = resolveIterationToolSurface(makeInput([{
-    name: "apply_patch",
+  const validation = resolveIterationToolSurface(makeInput([], [{
+    id: "evidence-source-change",
+    transactionId: "turn-file-modify",
+    kind: "file",
+    value: "src/main.js",
     target: "src/main.js",
-    status: "succeeded",
+    sourceTool: "apply_patch",
+    createdAt: 1,
   }]));
   assert.equal(validation.directFileModifyPhase, "validation");
   assert.deepEqual(
     validation.iterationAllTools.map((tool) => tool.function.name),
-    ["run_command"],
+    ["replace_in_file", "write_file", "apply_patch", "run_command"],
   );
+  assert.equal(validation.availableToolNames.has("read_file"), false);
+  assert.equal(validation.availableToolNames.has("replace_in_file"), true);
+  assert.equal(validation.availableToolNames.has("write_file"), true);
+  assert.equal(validation.availableToolNames.has("apply_patch"), true);
   assert.equal(validation.availableToolNames.has("execute_command"), false);
   assert.equal(validation.availableToolNames.has("get_pty_status"), false);
   assert.equal(validation.availableToolNames.has("browser_evaluate"), false);
   assert.equal(validation.availableToolNames.has("web_search"), false);
+
+  const blockedMutation = resolveIterationToolSurface(makeInput([{
+    name: "replace_in_file",
+    target: "src/main.js",
+    status: "failed",
+    detail: "tool_unavailable_for_turn_phase",
+  }]));
+  assert.equal(
+    blockedMutation.directFileModifyPhase,
+    "source_change",
+    "policy/internal feedback without a successful write cannot advance the mutation phase",
+  );
+
+  const noEffectMutation = resolveIterationToolSurface(makeInput([{
+    name: "replace_in_file",
+    target: "src/main.js",
+    status: "called",
+    detail: "NO_EFFECT_MUTATION",
+  }]));
+  assert.equal(noEffectMutation.directFileModifyPhase, "source_change");
+
+  const planArtifactActivity = resolveIterationToolSurface(makeInput([{
+    name: "write_file",
+    target: ".MAIN/plans/plan.md",
+    status: "succeeded",
+  }]));
+  assert.equal(planArtifactActivity.directFileModifyPhase, "source_change");
+
+  const failedDurableMutation = resolveIterationToolSurface(makeInput([], [{
+    id: "failed-source-change",
+    transactionId: "turn-file-modify",
+    kind: "file",
+    value: "src/main.js",
+    target: "src/main.js",
+    sourceTool: "apply_patch",
+    observationStatus: "failed",
+    createdAt: 2,
+  }]));
+  assert.equal(
+    failedDurableMutation.directFileModifyPhase,
+    "source_change",
+    "failed durable evidence cannot claim that a workspace mutation occurred",
+  );
 });
 
 test("file modification defers Python source writes as invisible internal feedback", async () => {
@@ -3166,6 +3248,7 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
         name: "apply_patch",
         target: "src/main.js",
         status: "succeeded",
+        mutationObserved: true,
       },
       {
         name: "read_file",
@@ -5574,6 +5657,96 @@ test("validation reopens distinct edit obligations independently from generic re
     protocolViolation: "required_tool_call_not_available",
     protocolActualTools: ["read_file"],
   }), null);
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["manage_script"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "inspect-only",
+      name: "manage_script",
+      arguments: JSON.stringify({ action: "inspect", path: "Assets/Scripts", name: "Player" }),
+    }],
+  }), null, "a dynamic read action cannot reopen the validation mutation budget");
+});
+
+test("validation mutation reopen resolves provider-facing tool names through the current catalog", () => {
+  const recoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/main.js",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "src-main-v1",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src-main-v1",
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+    },
+  };
+  const exposedMutationName = "mcp__editor__replace__7acbd820";
+  const exposedReadName = "mcp__reader__replace_in_file__98ba01e1";
+  const toolCatalog = {
+    lookup(name) {
+      if (name === exposedMutationName) {
+        return {
+          status: "resolved",
+          requestedName: name,
+          via: "exposed",
+          entry: { executionName: "replace_in_file" },
+        };
+      }
+      if (name === exposedReadName) {
+        return {
+          status: "resolved",
+          requestedName: name,
+          via: "exposed",
+          entry: { executionName: "read_file" },
+        };
+      }
+      return { status: "unknown", requestedName: name };
+    },
+  };
+  const providerCall = {
+    index: 0,
+    id: "canonical-edit",
+    name: exposedMutationName,
+    arguments: JSON.stringify({
+      path: "src/main.js",
+      search_text: "oldValue",
+      replace_text: "newValue",
+    }),
+  };
+  const reopen = resolveValidationMutationReopen({
+    recoveryState,
+    toolCatalog,
+    protocolViolation: "required_function_call_mismatch",
+    protocolActualTools: [exposedMutationName],
+    protocolActualToolCalls: [providerCall],
+  });
+
+  assert.deepEqual(reopen?.requestedTools, [exposedMutationName]);
+  assert.deepEqual(reopen?.requestedTargets, ["src/main.js"]);
+  assert.match(reopen?.semanticFingerprints[0] || "", /^tool:replace_in_file\|/);
+  assert.doesNotMatch(reopen?.semanticFingerprints[0] || "", /mcp__editor/);
+  assert.equal(providerCall.name, exposedMutationName, "semantic resolution must not rewrite the provider protocol call");
+
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    toolCatalog,
+    protocolViolation: "required_function_call_mismatch",
+    protocolActualTools: [exposedReadName],
+    protocolActualToolCalls: [{
+      ...providerCall,
+      id: "canonical-read",
+      name: exposedReadName,
+    }],
+  }), null, "an exposed name that looks mutating cannot reopen when its execution tool is read-only");
 });
 
 test("direct-edit validation reopens only after a finite command is pinned", () => {

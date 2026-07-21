@@ -26,14 +26,21 @@ const LATIN_OR_CJK_RE = /[A-Za-z\u4e00-\u9fff]/;
 const UNEXPECTED_SHORT_SCRIPT_RE =
   /[\u0900-\u097F\u0590-\u05FF\u0600-\u06FF\u0E00-\u0E7F\u3040-\u30FF\uAC00-\uD7AF]/;
 
+export function shouldProjectStreamingAssistantToCapsule(input: Pick<
+  StreamingAssistantDisplayInput,
+  "workflowMode" | "runIntent"
+>): boolean {
+  if (input.workflowMode === "plan") return true;
+  const intent = String(input.runIntent || "");
+  return intent === "execute" || intent === "studio_workflow" || intent === "plan";
+}
+
 function shouldGateStreamingText(input: StreamingAssistantDisplayInput): boolean {
   // Plan mode: gate on protocol fragments and unstable short text only.
   // Previously: plan mode gated all output, causing short structured plans
   // to be hidden behind buffering. Now we allow stable markdown content to
   // show immediately while still filtering out noise and partial output.
-  if (input.workflowMode === "plan") return true;
-  const intent = String(input.runIntent || "");
-  return intent === "execute" || intent === "studio_workflow" || intent === "plan";
+  return shouldProjectStreamingAssistantToCapsule(input);
 }
 
 function hasStableMarkdownShape(text: string): boolean {

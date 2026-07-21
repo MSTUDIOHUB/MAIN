@@ -34,7 +34,10 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { projectCanceledTurn } = loadTranspiledModuleSync(
+const {
+  captureCanceledTurnControlPlaneFence,
+  projectCanceledTurn,
+} = loadTranspiledModuleSync(
   path.join(process.cwd(), "src/lib/canceledTurnProjection.ts"),
 );
 
@@ -151,11 +154,11 @@ test("cross-Session control residue cannot keep the canceled Session busy", () =
   assert.equal(result.state.agentStatus, "idle");
   assert.equal(result.state.isGenerating, false);
   assert.equal(result.state.abortController, null);
-  assert.equal(result.state.harnessRunMarker, null);
-  assert.equal(result.state.activeActionRequest, null);
-  assert.equal(result.state.pendingReviewResolve, null);
-  assert.equal(result.state.pendingReviewTaskId, null);
-  assert.equal(result.state.pendingToolCall, null);
+  assert.equal(result.state.harnessRunMarker, foreignMarker);
+  assert.equal(result.state.activeActionRequest, foreignAction);
+  assert.equal(result.state.pendingReviewResolve, initial.pendingReviewResolve);
+  assert.equal(result.state.pendingReviewTaskId, initial.pendingReviewTaskId);
+  assert.equal(result.state.pendingToolCall, initial.pendingToolCall);
   assert.equal(
     result.state.runtimeEvents.filter((event) =>
       event.type === "turn.completed" && event.threadId === "session-1"
@@ -424,7 +427,12 @@ test("an already closed current Turn repairs only stale transient controls", () 
     message: "Canceled and closed.",
     nextTaskId: () => 2,
     nowMs: 10,
-    controlPlaneFence: { abortController: initial.abortController ?? null },
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({
+      state: initial,
+      sessionKey: "session-1",
+      turnId: "turn-1",
+      runId: "run-1",
+    }),
   });
 
   assert.equal(result.disposition, "already_closed");
@@ -484,7 +492,12 @@ test("an already closed Turn cannot clear a successor controller before its mark
     message: "Must not clear successor.",
     nextTaskId: () => 2,
     nowMs: 10,
-    controlPlaneFence: { abortController: capturedController },
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({
+      state: { ...initial, abortController: capturedController },
+      sessionKey: "session-1",
+      turnId: "turn-1",
+      runId: "run-1",
+    }),
   });
 
   assert.equal(result.disposition, "already_closed");
@@ -492,6 +505,154 @@ test("an already closed Turn cannot clear a successor controller before its mark
   assert.equal(result.state.abortController, successorController);
   assert.equal(result.state.isGenerating, true);
   assert.equal(result.state.agentStatus, "running");
+});
+
+test("an already closed Turn preserves cross-Session residue while converging its own busy flags", () => {
+  const foreignMarker = {
+    ...state().harnessRunMarker,
+    sessionKey: "session-foreign",
+    turnId: "turn-foreign",
+    runId: "lease-foreign",
+    activeRunId: "run-foreign",
+  };
+  const foreignAction = pendingRequest({
+    requestId: "request-foreign",
+    sessionKey: "session-foreign",
+    turnId: "turn-foreign",
+    runId: "run-foreign",
+  });
+  const initial = state({
+    conversationTurns: [turn({ status: "done" })],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Already complete.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      state().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 8,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Already complete.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+    harnessRunMarker: foreignMarker,
+    activeActionRequest: foreignAction,
+  });
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    reason: "late_cancel",
+    message: "Must not rewrite the conclusion.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({
+      state: initial,
+      sessionKey: "session-1",
+      turnId: "turn-1",
+      runId: "run-1",
+    }),
+  });
+
+  assert.equal(result.disposition, "already_closed");
+  assert.deepEqual(result.state.runtimeEvents, initial.runtimeEvents);
+  assert.deepEqual(result.state.taskFlow, initial.taskFlow);
+  assert.equal(result.state.isGenerating, false);
+  assert.equal(result.state.agentStatus, "idle");
+  assert.equal(result.state.abortController, null);
+  assert.equal(result.state.harnessRunMarker, foreignMarker);
+  assert.equal(result.state.activeActionRequest, foreignAction);
+  assert.equal(result.state.pendingReviewResolve, initial.pendingReviewResolve);
+  assert.equal(result.state.pendingReviewTaskId, initial.pendingReviewTaskId);
+  assert.equal(result.state.pendingToolCall, initial.pendingToolCall);
+});
+
+test("an already closed Turn cannot clear a newer attempt that reuses its Run and controller", () => {
+  const terminalState = state({
+    conversationTurns: [turn({ status: "done" })],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Already complete.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      state().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 8,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Already complete.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+  });
+  const fence = captureCanceledTurnControlPlaneFence({
+    state: terminalState,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+  });
+  const successorMarker = {
+    ...terminalState.harnessRunMarker,
+    runId: "lease-attempt-2",
+    activeRunId: "run-1",
+    instanceId: "instance-attempt-2",
+  };
+  const successorState = {
+    ...terminalState,
+    harnessRunMarker: successorMarker,
+  };
+  const result = projectCanceledTurn({
+    state: successorState,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    reason: "late_cancel",
+    message: "Must not clear the replacement attempt.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+    controlPlaneFence: fence,
+  });
+
+  assert.equal(result.disposition, "already_closed");
+  assert.equal(result.state, successorState);
+  assert.equal(result.state.harnessRunMarker, successorMarker);
+  assert.equal(result.state.isGenerating, true);
+  assert.equal(result.state.abortController, terminalState.abortController);
 });
 
 test("a late Stop cannot rewrite a successful Turn's Harness meaning as cancellation", () => {
@@ -548,7 +709,12 @@ test("a late Stop cannot rewrite a successful Turn's Harness meaning as cancella
     message: "Must not become canceled.",
     nextTaskId: () => 2,
     nowMs: 10,
-    controlPlaneFence: { abortController: initial.abortController ?? null },
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({
+      state: initial,
+      sessionKey: "session-1",
+      turnId: "turn-1",
+      runId: "run-1",
+    }),
   });
 
   assert.equal(result.disposition, "already_closed");
@@ -601,7 +767,12 @@ for (const [resultKind, expectedCloseReason] of [
       message: "Must not rewrite the terminal meaning.",
       nextTaskId: () => 2,
       nowMs: 10,
-      controlPlaneFence: { abortController: initial.abortController ?? null },
+      controlPlaneFence: captureCanceledTurnControlPlaneFence({
+        state: initial,
+        sessionKey: "session-1",
+        turnId: "turn-1",
+        runId: "run-1",
+      }),
     });
 
     assert.equal(result.disposition, "already_closed");

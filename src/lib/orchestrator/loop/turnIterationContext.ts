@@ -6,6 +6,7 @@ export interface TurnIterationContext {
   iteration: number;
   eventThreadId: string;
   eventTurnId: string;
+  runId: string;
   iterationTurnId: string;
   thread: LegacyConversationThread;
   turn: ExecutionTurn;
@@ -20,6 +21,7 @@ export function startTurnIteration(input: {
   currentThread: LegacyConversationThread | null;
   eventThreadId: string;
   eventTurnId: string;
+  runId: string;
   iteration: number;
   messages: AgentMessage[];
 }): TurnIterationContext {
@@ -27,7 +29,7 @@ export function startTurnIteration(input: {
     input.currentThread?.threadId === input.eventThreadId
       ? input.currentThread
       : createThread(input.eventThreadId);
-  const iterationTurnId = `${input.eventTurnId}-${input.iteration}`;
+  const iterationTurnId = `${input.eventTurnId}-${input.runId}-${input.iteration}`;
   const turn = createTurn(iterationTurnId, input.messages);
   thread.turns.push(turn);
 
@@ -38,6 +40,7 @@ export function startTurnIteration(input: {
     iteration: input.iteration,
     eventThreadId: input.eventThreadId,
     eventTurnId: input.eventTurnId,
+    runId: input.runId,
     iterationTurnId,
     thread,
     turn,

@@ -574,6 +574,7 @@ export function handleAssistantOutputPhase(input: {
     runtimeNarrationInjected,
     visibleAssistantText,
     shouldSuppressApprovedPlanNoToolText,
+    hasPriorToolEvidence: input.recentToolActivity.length > 0,
   });
   const {
     shouldRenderToolProgress,

@@ -7,6 +7,7 @@ import {
 import type { HarnessRunMarker } from "./harnessCrashTelemetry";
 import { isHarnessMarkerOwnedByPlanExecution } from "./planExecutionOwnership";
 import type { PlanLifecycleState } from "./planLifecycle";
+import { isPerCallOnlyToolRisk, type ToolRiskLevel } from "./toolCapabilities";
 
 export const ACTION_REQUEST_SCHEMA_VERSION = 1 as const;
 
@@ -35,11 +36,19 @@ export interface ActionRequestBase {
 export interface ToolPermissionActionRequest extends ActionRequestBase {
   kind: "tool_permission";
   taskId: number;
+  /** Exact provider/runtime call identity used to bind in-memory final arguments. */
+  toolCallId?: string;
   toolName: string;
   target: string;
-  risk?: "local_file_read" | "browser_control" | "desktop_control" | "shell" | "write" | "external_write" | "unknown";
+  risk?: ToolRiskLevel | "write" | "unknown";
   /** Immutable Plan-attempt provenance; once present this request may never downgrade to a generic continuation. */
   readonly planExecution?: ToolPermissionPlanExecutionIdentity;
+}
+
+export function requiresPerCallToolPermissionApproval(
+  risk: ToolPermissionActionRequest["risk"],
+): boolean {
+  return isPerCallOnlyToolRisk(risk);
 }
 
 export type ToolPermissionPlanExecutionIdentity = PlanExecutionRunProvenance;
@@ -590,6 +599,9 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
       ...base,
       kind,
       taskId,
+      ...(normalizeNonEmptyString(record.toolCallId)
+        ? { toolCallId: normalizeNonEmptyString(record.toolCallId) }
+        : {}),
       toolName,
       target: normalizeNonEmptyString(record.target) || toolName,
       ...(typeof record.risk === "string" ? { risk: record.risk as ToolPermissionActionRequest["risk"] } : {}),

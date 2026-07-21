@@ -50,19 +50,27 @@ const { buildWorkspaceComposerIntentDispatchHints } = loadTranspiledModuleSync(
 );
 
 function build(input = {}) {
+  const defaultSnapshot = {
+    mainModeKey: "main_mode",
+    lockedComposerIntent: null,
+    subagentPreference: "unspecified",
+  };
   return buildWorkspaceComposerIntentDispatchHints({
     text: "Inspect the runtime",
     language: "en",
-    snapshot: {
-      mainModeKey: "main_mode",
-      lockedComposerIntent: null,
-    },
     ...input,
+    snapshot: {
+      ...defaultSnapshot,
+      ...(input.snapshot || {}),
+    },
   });
 }
 
-test("ordinary Composer text does not mint an intent dispatch hint", () => {
-  assert.equal(build(), undefined);
+test("ordinary Composer text captures an explicit immutable subagent preference", () => {
+  assert.deepEqual(build(), { subagentPreference: "unspecified" });
+  assert.deepEqual(build({
+    snapshot: { subagentPreference: "preferred" },
+  }), { subagentPreference: "preferred" });
 });
 
 test("a locked Composer intent becomes an immutable dispatch decision", () => {
@@ -132,6 +140,7 @@ test("MDEBUG is durably classified as Plan with its canonical metadata", () => {
   });
 
   assert.deepEqual(hints, {
+    subagentPreference: "unspecified",
     resolvedIntent: "plan",
     runtimeIntentOverride: "plan",
     skipIntentResolution: true,

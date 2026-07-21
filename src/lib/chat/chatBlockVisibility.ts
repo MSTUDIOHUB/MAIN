@@ -176,6 +176,16 @@ export function isPlanCandidateBlock(block: any): boolean {
   return getPlanCandidatePreview(block).length > 0;
 }
 
+export function shouldSuppressSupersededPlanCandidate(input: {
+  block: any;
+  hasReviewableArtifact: boolean;
+  ownsReviewableArtifact: boolean;
+}): boolean {
+  if (!input.hasReviewableArtifact || !input.ownsReviewableArtifact) return false;
+  if (input.block?.archivedProposal) return false;
+  return isPlanCandidateBlock(input.block) && !isReviewablePlanBlock(input.block);
+}
+
 export function selectLatestPlanCandidatePreview(blocks: any[]): string {
   for (const block of [...blocks].reverse()) {
     const preview = getPlanCandidatePreview(block);

@@ -10,7 +10,8 @@ import { workspacePathsReferToSameFile } from "../../workspacePaths";
 
 export type MutationPreflightRecoveryReason =
   | "mutation_preflight_invalid_patch"
-  | "mutation_preflight_search_text_mismatch";
+  | "mutation_preflight_search_text_mismatch"
+  | "mutation_partial_effect_requires_reread";
 
 interface MutationFailureResultLike {
   toolCallId?: string;
@@ -23,6 +24,10 @@ interface MutationFailureResultLike {
   qualityGateReason?: string;
   mutationPreflightReason?: string;
   patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
+  workspaceEffect?: string;
+  workspaceMutationEvidence?: {
+    changedPaths?: string[];
+  };
 }
 
 /**
@@ -38,7 +43,7 @@ export interface DirectMutationPreflightRecoveryDecision {
   readLease: {
     purpose: "patch_recovery";
     target: string;
-    requestedRange: NonNullable<PatchRecoveryMismatchEvidence["requestedRange"]>;
+    requestedRange?: NonNullable<PatchRecoveryMismatchEvidence["requestedRange"]>;
     observedVersion: string | null;
     mismatchFingerprint: string;
     state: "available";
@@ -108,6 +113,49 @@ export function resolveDirectMutationPreflightRecovery(input: {
     !["normal", "mutation_first", "action_plus_targeting"].includes(input.executeRecoveryMode)
   ) {
     return null;
+  }
+
+  // Execution failure and workspace mutation are orthogonal. If the runtime
+  // observed a changed path before the tool failed, every pre-call source
+  // window is stale. Grant one fresh read and prohibit an immediate retry
+  // from the old content; the failed call remains failed evidence.
+  for (const result of input.results) {
+    const changedPaths = [...new Set(
+      (result.workspaceMutationEvidence?.changedPaths || [])
+        .map((path) => String(path || "").trim())
+        .filter(Boolean),
+    )];
+    if (
+      !result.isError ||
+      result.workspaceEffect !== "partial" ||
+      changedPaths.length === 0
+    ) {
+      continue;
+    }
+    const target = changedPaths[0];
+    const mismatchFingerprint = [
+      "partial_mutation",
+      String(result.toolCallId || result.name || "tool"),
+      target,
+    ].join("::");
+    return {
+      mode: "patch_recovery_read",
+      reason: "mutation_partial_effect_requires_reread",
+      target,
+      readLease: {
+        purpose: "patch_recovery",
+        target,
+        observedVersion: null,
+        mismatchFingerprint,
+        state: "available",
+      },
+      sourceObservationKey: null,
+      decisionCheckpoint: {
+        expectedTarget: target,
+        sourceObservationKey: null,
+        nextRequiredCapability: "targeted_read",
+      },
+    };
   }
 
   for (const result of input.results) {

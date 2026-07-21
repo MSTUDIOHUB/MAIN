@@ -911,6 +911,7 @@ export async function executeTool(
       await writeFile(replacePath, updated, workspace);
       return JSON.stringify({
         success: true,
+        changedPaths: [replacePath],
         message: `File ${replacePath} updated successfully.`,
       });
     }
@@ -940,7 +941,11 @@ export async function executeTool(
         // Missing file is fine; the write below will create it.
       }
       await writeFile(writePath, writeContent, workspace);
-      return JSON.stringify({ success: true, message: `File ${writePath} written successfully.` });
+      return JSON.stringify({
+        success: true,
+        changedPaths: [writePath],
+        message: `File ${writePath} written successfully.`,
+      });
     }
 
     case "apply_patch": {

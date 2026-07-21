@@ -51,6 +51,11 @@ export function findToolLifecycleBlockIndex(input: FindToolBlockIndexInput): num
   if (toolCallId) {
     const exact = findByToolCallId(input, toolCallId);
     if (exact >= 0) return exact;
+    // A supplied id is the lifecycle owner. Never let an unstarted, stale, or
+    // policy-only callback fall back onto another call merely because it used
+    // the same tool and target. Legacy name+target matching is available only
+    // to callers that do not claim an explicit owner id.
+    return -1;
   }
   return findByNameAndTarget(input);
 }

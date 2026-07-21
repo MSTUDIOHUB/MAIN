@@ -24,7 +24,7 @@ import {
   type StreamResult,
 } from "./streaming";
 import { type ToolDefinition } from "./toolSchemas";
-import type { ToolCatalog } from "./toolCatalog";
+import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import { executeTool } from "./toolExecutor";
 import { computeContextTokenBreakdown, estimateMessagesTokens, estimateTokens, manageContext, type TrimMessage } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
@@ -47,7 +47,10 @@ import {
   workspacePathsReferToSameFile,
 } from "./workspacePaths";
 import { recordSubagentScopeBlockedTool } from "./subagents";
+import { resolveToolArgumentAuthorization } from "./toolArgumentAuthorization";
 import {
+  BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES,
+  isWorkspaceMutationToolCall,
   WORKSPACE_MUTATION_TOOL_NAMES,
   resolveWorkspaceMutationTargets,
 } from "./workspaceMutationTools";
@@ -73,6 +76,7 @@ import {
 } from "./orchestrator/agentRecovery";
 import type {
   MaxIterationsCheckpointHandling,
+  ToolCatalogIdentity,
   ToolCallToExecute,
   ToolErrorLifecycleMeta,
   ToolExecutionResult,
@@ -127,6 +131,7 @@ export {
   resolveApprovedPlanValidationBoundary,
 } from "./orchestrator/prompts/planPrompts";
 import {
+  isAllowedBySessionAutoApprove,
   type SessionAutoApproveScope,
   type ToolLifecycleState,
 } from "./runtimeTools";
@@ -171,12 +176,18 @@ import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameSt
 import {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
+  getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
   type TargetProgressOutcome,
 } from "./repetitionGuard";
 import {
+  getLocalFileReadPathForToolCall,
+  getToolRiskLevelForCall,
   isUnityApplyTextPrecisePatchArgs,
   isLocalFileReadApproved,
+  isToolAutoExecutableForCall,
+  type ToolCapabilityRegistry,
+  type ToolRiskLevel,
 } from "./toolCapabilities";
 import {
   buildCompatibilityRetryMessages,
@@ -214,6 +225,12 @@ import {
   formatToolFeedbackEnvelope,
   type ToolFeedbackStatus,
 } from "./toolFeedbackEnvelope";
+import {
+  getObservedWorkspaceMutationPaths,
+  getToolExecutionName,
+  hasCompletedToolExecution,
+  hasVerifiedWorkspaceMutationEffect,
+} from "./toolResultEffect";
 import {
   withEventSchema,
   type MainThreadEvent,
@@ -645,15 +662,14 @@ export function emitToolPreflightBlocked(
   callbacks.onDebugEvent?.("agent.tool_preflight_blocked", payload);
 }
 
-export function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
-  if (
-    /"noOp"\s*:\s*true|NO_EFFECT_MUTATION|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")
-  ) {
-    return false;
-  }
+export function isProjectSourceWriteResult(
+  result: ToolExecutionResult,
+  args: Record<string, unknown> = {},
+): boolean {
+  if (!hasVerifiedWorkspaceMutationEffect(result, args)) return false;
+  const executionName = getToolExecutionName(result);
   return (
-    !result.isError &&
-    EDIT_PROGRESS_TOOL_NAMES.has(result.name) &&
+    EDIT_PROGRESS_TOOL_NAMES.has(executionName) &&
     !!result.target &&
     !isPlanArtifactPath(result.target)
   );
@@ -1625,7 +1641,7 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     diff?: ToolDiffPreview,
-    meta?: { toolCallId?: string },
+    meta?: { toolCallId?: string; executionName?: string; catalogIdentity?: ToolCatalogIdentity },
   ) => void;
   onToolDone: (
     toolName: string,
@@ -1633,6 +1649,8 @@ export interface OrchestratorCallbacks {
     result: string,
     meta?: {
       toolCallId?: string;
+      executionName?: string;
+      catalogIdentity?: ToolCatalogIdentity;
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
@@ -1655,7 +1673,7 @@ export interface OrchestratorCallbacks {
     toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
-    risk?: "local_file_read" | "browser_control" | "desktop_control";
+    risk?: ToolRiskLevel;
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   }) => Promise<ReviewDecision>;
@@ -1900,7 +1918,7 @@ function normalizeNoProgressResultContent(result: ToolExecutionResult): string {
 }
 
 export function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
-  const usable = results.filter((result) => !result.isError && !result.internalFeedback);
+  const usable = results.filter(hasCompletedToolExecution);
   if (usable.length === 0) return "";
   if (usable.every((result) => NO_PROGRESS_EXCLUDED_TOOLS.has(result.name))) return "";
   const fragments = usable
@@ -2011,8 +2029,7 @@ export function buildPlanReviewReadyMessage(
 
 export function isSuccessfulPlanArtifactWriteResult(result: ToolExecutionResult): boolean {
   return (
-    !result.isError &&
-    !result.internalFeedback &&
+    hasCompletedToolExecution(result) &&
     PLAN_ARTIFACT_MUTATION_TOOLS.has(result.name) &&
     !!result.target &&
     isPlanArtifactPath(result.target)
@@ -3519,7 +3536,6 @@ function isSameFileMetadata(
   left: { path: string; sizeBytes: number; modifiedMs: number } | null,
   right: { path: string; sizeBytes: number; modifiedMs: number } | null,
 ): boolean {
-  if (!left && !right) return true;
   if (!left || !right) return false;
   return (
     normalizePathLike(left.path) === normalizePathLike(right.path) &&
@@ -3533,10 +3549,36 @@ function isNoEffectMutationResult(input: {
   before: { path: string; sizeBytes: number; modifiedMs: number } | null;
   after: { path: string; sizeBytes: number; modifiedMs: number } | null;
 }): boolean {
+  if (!input.before || !input.after) return false;
   const normalized = input.result.trim();
   const emptyPayload = normalized === "" || normalized === "{}" || normalized === "null";
   const unchanged = isSameFileMetadata(input.before, input.after);
   return emptyPayload && unchanged;
+}
+
+export function isVerifiedNoEffectMutation(input: {
+  supportsDiffVerification: boolean;
+  beforeDiffSnapshot: unknown | null;
+  afterDiffSnapshot: unknown | null;
+  observedDiffPreview?: ToolDiffPreview;
+  result: string;
+  beforeMetadata: { path: string; sizeBytes: number; modifiedMs: number } | null;
+  afterMetadata: { path: string; sizeBytes: number; modifiedMs: number } | null;
+}): boolean {
+  if (input.supportsDiffVerification) {
+    return (
+      input.beforeDiffSnapshot !== null &&
+      input.beforeDiffSnapshot !== undefined &&
+      input.afterDiffSnapshot !== null &&
+      input.afterDiffSnapshot !== undefined &&
+      !input.observedDiffPreview
+    );
+  }
+  return isNoEffectMutationResult({
+    result: input.result,
+    before: input.beforeMetadata,
+    after: input.afterMetadata,
+  });
 }
 
 async function readMutationDiffSnapshot(input: {
@@ -3544,7 +3586,12 @@ async function readMutationDiffSnapshot(input: {
   workspace: string;
   sessionKey?: string;
   allowExternalLocalRead?: boolean;
-}): Promise<{ path: string; content: string; existed: boolean }> {
+}): Promise<{ path: string; content: string; existed: boolean } | null> {
+  const availability = await probeFileMetadataAvailability(input.path, input.workspace);
+  if (availability.status === "absent") {
+    return { path: input.path, content: "", existed: false };
+  }
+  if (availability.status === "unknown") return null;
   try {
     const content = await executeTool(
       "read_file",
@@ -3559,11 +3606,14 @@ async function readMutationDiffSnapshot(input: {
       existed: true,
     };
   } catch {
-    return {
-      path: input.path,
-      content: "",
-      existed: false,
-    };
+    // The file may have been removed between metadata and content reads. Only
+    // a second confirmed ENOENT can represent that as a deletion snapshot;
+    // permission/IPC/path-resolution failures remain unknown and cannot
+    // manufacture a diff or durable mutation evidence.
+    const afterFailure = await probeFileMetadataAvailability(input.path, input.workspace);
+    return afterFailure.status === "absent"
+      ? { path: input.path, content: "", existed: false }
+      : null;
   }
 }
 
@@ -3574,6 +3624,7 @@ function buildMutationDiffPreviewFromSnapshots(input: {
   after: { path: string; content: string; existed: boolean } | null;
 }): ToolDiffPreview | undefined {
   if (!supportsToolDiffPreview(input.toolName)) return undefined;
+  if (!input.before || !input.after) return undefined;
   const path = String(input.after?.path || input.before?.path || input.target || "").trim();
   if (!path || isEphemeralPlanArtifactPath(path)) return undefined;
   const oldText = input.before?.content ?? "";
@@ -3635,6 +3686,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
 }
 
 export function inferLifecycleStateFromToolResult(result: ToolExecutionResult): ToolLifecycleState {
+  if (result.internalFeedback) return "blocked";
   if (result.lifecycleState) return result.lifecycleState;
   if (!result.isError) {
     if (/"noOp"\s*:\s*true/.test(result.content || "")) return "completed";
@@ -3657,6 +3709,11 @@ export function inferLifecycleStateFromToolResult(result: ToolExecutionResult): 
 
 function buildToolResultHistoryContent(result: ToolExecutionResult): string {
   const lifecycleState = inferLifecycleStateFromToolResult(result);
+  const observedMutationPaths = getObservedWorkspaceMutationPaths(result);
+  const failedAfterWorkspaceMutation =
+    lifecycleState === "failed" &&
+    result.workspaceEffect === "partial" &&
+    observedMutationPaths.length > 0;
   const isNoOp = /"noOp"\s*:\s*true/.test(result.content || "");
   const isNoEffectMutation = /NO_EFFECT_MUTATION/i.test(result.content || "");
   const isCachedReuse =
@@ -3667,6 +3724,8 @@ function buildToolResultHistoryContent(result: ToolExecutionResult): string {
       ? "declined"
     : lifecycleState === "blocked"
       ? "blocked"
+    : failedAfterWorkspaceMutation
+      ? "failed"
     : isNoEffectMutation
       ? "no_effect_mutation"
     : lifecycleState === "failed"
@@ -3685,7 +3744,20 @@ function buildToolResultHistoryContent(result: ToolExecutionResult): string {
     tool: result.name,
     target: result.target,
     content: result.content,
-    summary: noOpSummary || result.displayContent || result.content,
+    workspaceEffect: failedAfterWorkspaceMutation ? "partial" : undefined,
+    changedPaths: failedAfterWorkspaceMutation ? observedMutationPaths : undefined,
+    nextAction: failedAfterWorkspaceMutation
+      ? "reread_changed_paths_before_retry"
+      : undefined,
+    summary: failedAfterWorkspaceMutation
+      ? "Tool failed after changing the workspace; the changed source context is stale."
+      : noOpSummary || result.displayContent || result.content,
+    hints: failedAfterWorkspaceMutation
+      ? [
+          `Reread the current changed path${observedMutationPaths.length === 1 ? "" : "s"}: ${observedMutationPaths.join(", ")}.`,
+          "Do not retry the failed mutation from the pre-call source content or with identical arguments.",
+        ]
+      : undefined,
     truncated:
       typeof result.displayContent === "string" &&
       result.displayContent.length > 0 &&
@@ -3697,7 +3769,25 @@ export function buildToolResultHistoryContentByFormat(
   result: ToolExecutionResult,
   format: AppConfig["toolFeedbackFormat"],
 ): string {
-  if (format !== "envelope_v1") return result.content;
+  if (format !== "envelope_v1") {
+    const observedMutationPaths = getObservedWorkspaceMutationPaths(result);
+    if (
+      inferLifecycleStateFromToolResult(result) === "failed" &&
+      result.workspaceEffect === "partial" &&
+      observedMutationPaths.length > 0
+    ) {
+      return [
+        `PARTIAL_WORKSPACE_MUTATION:${JSON.stringify({
+          workspace_effect: "partial",
+          changedPaths: observedMutationPaths,
+          next_action: "reread_changed_paths_before_retry",
+        })}`,
+        "The tool failed after changing the workspace. Reread the current changed path before repair; do not retry from pre-call source content or with identical arguments.",
+        result.content,
+      ].join("\n");
+    }
+    return result.content;
+  }
   return buildToolResultHistoryContent(result);
 }
 
@@ -3711,6 +3801,20 @@ interface ExecuteToolLifecycleOptions {
   recentPlanToolActivity?: PlanToolActivitySummary[];
   attemptedPlanWriteTargets?: string[];
   toolCatalog?: ToolCatalog;
+  /** Authorization that was computed before PreToolUse ran. */
+  authorizationMode?: "automatic" | "session" | "user" | "plan_artifact";
+  toolCapabilityRegistry?: ToolCapabilityRegistry;
+}
+
+function stableToolArgumentIdentity(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableToolArgumentIdentity(entry)).join(",")}]`;
+  }
+  if (!value || typeof value !== "object") return JSON.stringify(value) ?? String(value);
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stableToolArgumentIdentity(entry)}`)
+    .join(",")}}`;
 }
 
 const SCOPED_READ_FAN_OUT_TOOLS = new Set([
@@ -4034,17 +4138,32 @@ async function executeToolCallWithLifecycle(
   options: ExecuteToolLifecycleOptions = {},
 ): Promise<ToolExecutionResult> {
   const sessionKey = callbacks.getSessionKey();
+  const catalogResolution = options.toolCatalog?.lookup(tc.name);
+  const executionName = catalogResolution?.status === "resolved"
+    ? catalogResolution.entry.executionName
+    : tc.name;
+  const catalogIdentity: ToolCatalogIdentity = catalogResolution?.status === "resolved"
+    ? {
+        source: catalogResolution.entry.source,
+        canonicalName: catalogResolution.entry.canonicalName,
+      }
+    : {
+        source: !options.toolCatalog && isBuiltInToolName(tc.name) ? "built_in" : "unknown",
+        canonicalName: tc.name,
+      };
   let toolArgs: Record<string, unknown>;
   try {
     const parsed = JSON.parse(tc.arguments);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("Tool call arguments must be a JSON object.");
     }
-    toolArgs = normalizeToolCallForExecution(tc.name, parsed as Record<string, unknown>, workspace);
+    toolArgs = normalizeToolCallForExecution(executionName, parsed as Record<string, unknown>, workspace);
   } catch {
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
       target: "",
       content: `Error: Invalid JSON in tool call arguments: ${tc.arguments}`,
       isError: true,
@@ -4058,7 +4177,12 @@ async function executeToolCallWithLifecycle(
     callbacks,
   );
   if (shellReadValidationErrorBeforeContract) {
-    return shellReadValidationErrorBeforeContract;
+    return {
+      ...shellReadValidationErrorBeforeContract,
+      executionName,
+      catalogIdentity,
+      executedArgs: toolArgs,
+    };
   }
 
   const scopedReadPaths = [...new Set(
@@ -4070,7 +4194,7 @@ async function executeToolCallWithLifecycle(
     scopedReadPaths.length > 1 &&
     SCOPED_READ_FAN_OUT_TOOLS.has(tc.name)
   ) {
-    return executeScopedReadFanOutWithLifecycle({
+    const scopedResult = await executeScopedReadFanOutWithLifecycle({
       tc,
       baseToolArgs: toolArgs,
       scopedReadPaths,
@@ -4080,15 +4204,24 @@ async function executeToolCallWithLifecycle(
       hooksConfig,
       options,
     });
+    return {
+      ...scopedResult,
+      executionName,
+      catalogIdentity,
+      executedArgs: toolArgs,
+    };
   }
 
   // Validate required parameters before execution
   const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
-    callbacks.onToolError(tc.name, "", validationError, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, "", validationError, { toolCallId: tc.id, executionName, catalogIdentity });
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: toolArgs,
       target: "",
       content: `Error: ${validationError}`,
       isError: true,
@@ -4106,7 +4239,7 @@ async function executeToolCallWithLifecycle(
   });
 
   const effectiveArgs = preHookResult.updatedToolArgs ?? toolArgs;
-  const compatResolved = resolveStudioCompatToolArgs(tc.name, effectiveArgs);
+  const compatResolved = resolveStudioCompatToolArgs(executionName, effectiveArgs);
   const compatArgs = compatResolved.args;
   if (compatResolved.hits.length > 0) {
     const threadId = callbacks.getSessionKey() || "default";
@@ -4139,16 +4272,21 @@ async function executeToolCallWithLifecycle(
           provider: callbacks.getWebSearchProvider?.() || "duckduckgo",
         }
       : baseResolvedArgs;
+  const hookArgumentsChanged =
+    stableToolArgumentIdentity(toolArgs) !== stableToolArgumentIdentity(effectiveArgs);
   const target = scopedReadPaths.length > 1
     ? scopedReadPaths.join(", ")
-    : getToolTarget(tc.name, resolvedArgs);
+    : getToolTarget(executionName, resolvedArgs);
 
   if (preHookResult.blocked) {
     const reason = preHookResult.blockedReason ?? `${tc.name} was blocked by a PreToolUse hook.`;
-    callbacks.onToolError(tc.name, target, reason, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, reason, { toolCallId: tc.id, executionName, catalogIdentity });
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
       target,
       content: `Error: ${reason}`,
       isError: true,
@@ -4157,6 +4295,135 @@ async function executeToolCallWithLifecycle(
         ? { additionalContexts: preHookResult.additionalContexts }
         : {}),
     };
+  }
+
+  const postHookValidationError = validateToolExecutionContract(tc.name, resolvedArgs, allTools);
+  if (postHookValidationError) {
+    callbacks.onToolError(tc.name, target, postHookValidationError, {
+      toolCallId: tc.id,
+      executionName,
+      catalogIdentity,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
+      target,
+      content: `Error: ${postHookValidationError}`,
+      isError: true,
+      lifecycleState: "blocked",
+      additionalContexts: [...preHookResult.additionalContexts],
+    };
+  }
+
+  const finalShellMutationTarget = getShellMutationTargetForLoopGuard(executionName, resolvedArgs);
+  if (
+    hookArgumentsChanged &&
+    callbacks.getCommandDirective?.()?.kind === "file_modify" &&
+    finalShellMutationTarget
+  ) {
+    const message = callbacks.getPreferredLanguage() === "zh"
+      ? `PRE_TOOL_USE_SHELL_SOURCE_MUTATION_BLOCKED: PreToolUse 将最终命令改成了写入动作 ${finalShellMutationTarget}。文件修改回合必须使用结构化文件工具；该命令未执行。`
+      : `PRE_TOOL_USE_SHELL_SOURCE_MUTATION_BLOCKED: PreToolUse changed the final command into the write action ${finalShellMutationTarget}. File-modification turns must use structured file tools; this command did not run.`;
+    callbacks.onToolError(tc.name, target, message, {
+      toolCallId: tc.id,
+      executionName,
+      catalogIdentity,
+      failureKind: "policy",
+    });
+    logAgentEvent("pre_tool_hook_shell_source_mutation_blocked", {
+      tool: tc.name,
+      executionName,
+      target,
+      finalShellMutationTarget,
+      diskWritten: false,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+      qualityGateReason: "pre_tool_hook_shell_source_mutation_blocked",
+      additionalContexts: [...preHookResult.additionalContexts],
+    };
+  }
+
+  if (hookArgumentsChanged) {
+    const argumentAuthorization = resolveToolArgumentAuthorization({
+      executionName,
+      args: resolvedArgs,
+      target,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      planTasks: callbacks.getPlanTasks(),
+      subagentScope: callbacks.getSubagentScope?.() ?? null,
+      threadId: callbacks.getSessionKey(),
+    });
+    if (!argumentAuthorization.allowed) {
+      const commandScope = argumentAuthorization.approvedPlanCommandScope;
+      const mutationScope = argumentAuthorization.approvedPlanMutationScope;
+      const childScope = callbacks.getSubagentScope?.() ?? null;
+      const message = argumentAuthorization.blockReason === "approved_plan_command_scope"
+        ? `PRE_TOOL_USE_APPROVED_PLAN_COMMAND_BLOCKED: the final command '${commandScope.requestedCommand || "<missing>"}' is outside the approved Plan command scope (${commandScope.plannedCommands.join(" | ") || "none"}).`
+        : argumentAuthorization.blockReason === "approved_plan_mutation_scope"
+        ? `PRE_TOOL_USE_APPROVED_PLAN_SCOPE_BLOCKED: the final mutation target(s) '${mutationScope.unexpectedTargets.join(", ") || mutationScope.requestedTargets.join(", ") || target || "<missing>"}' are outside the approved Plan scope (${mutationScope.plannedTargets.join(", ") || "none"}).`
+        : argumentAuthorization.blockReason === "parent_subagent_scope_overlap"
+        ? `PRE_TOOL_USE_PARENT_SCOPE_DEFERRED: the final target '${argumentAuthorization.parentScopeConflictTarget || target || "<missing>"}' overlaps the active lease held by ${argumentAuthorization.parentScopeConflict?.subagentId || "an active subagent"} (${argumentAuthorization.parentScopeConflict?.scopeKey || "unknown"}).`
+        : `PRE_TOOL_USE_SUBAGENT_SCOPE_BLOCKED: the final target(s) '${argumentAuthorization.blockedSubagentTargets.join(", ") || "<missing>"}' are outside allowed_paths for scope '${childScope?.scopeKey || "unknown"}'.`;
+      if (argumentAuthorization.blockReason === "subagent_path_scope" && childScope) {
+        recordSubagentScopeBlockedTool(childScope, tc.name);
+      }
+      callbacks.onToolError(tc.name, target, message, {
+        toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
+        failureKind: "policy",
+      });
+      logAgentEvent("pre_tool_hook_scope_reauthorization_blocked", {
+        tool: tc.name,
+        executionName,
+        target,
+        reason: argumentAuthorization.blockReason,
+        requestedCommand: commandScope.requestedCommand || null,
+        plannedCommands: commandScope.plannedCommands,
+        requestedTargets: mutationScope.requestedTargets,
+        unexpectedTargets: mutationScope.unexpectedTargets,
+        plannedTargets: mutationScope.plannedTargets,
+        subagentScopeKey: childScope?.scopeKey || null,
+        blockedSubagentTargets: argumentAuthorization.blockedSubagentTargets,
+        parentScopeConflictTarget: argumentAuthorization.parentScopeConflictTarget || null,
+        conflictingSubagentId: argumentAuthorization.parentScopeConflict?.subagentId || null,
+        conflictingScopeKey: argumentAuthorization.parentScopeConflict?.scopeKey || null,
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "blocked",
+        qualityGateReason: "pre_tool_hook_scope_reauthorization_blocked",
+        ...(mutationScope.applies && !mutationScope.allowed
+          ? {
+              approvedPlanScopeConflict: {
+                requestedTargets: mutationScope.requestedTargets,
+                unexpectedTargets: mutationScope.unexpectedTargets,
+                plannedTargets: mutationScope.plannedTargets,
+              },
+            }
+          : {}),
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
   }
 
   const planArtifactValidationError = await buildPlanArtifactMutationValidationError(
@@ -4171,7 +4438,7 @@ async function executeToolCallWithLifecycle(
     },
   );
   if (planArtifactValidationError) {
-    return planArtifactValidationError;
+    return { ...planArtifactValidationError, executionName, catalogIdentity, executedArgs: resolvedArgs };
   }
 
   const loopDetectionValidationError = buildLoopDetectionValidationError(
@@ -4180,7 +4447,7 @@ async function executeToolCallWithLifecycle(
     callbacks,
   );
   if (loopDetectionValidationError) {
-    return loopDetectionValidationError;
+    return { ...loopDetectionValidationError, executionName, catalogIdentity, executedArgs: resolvedArgs };
   }
 
   const readBeforeModifyValidationError = await buildReadBeforeModifyValidationError(
@@ -4190,7 +4457,7 @@ async function executeToolCallWithLifecycle(
     callbacks,
   );
   if (readBeforeModifyValidationError) {
-    return readBeforeModifyValidationError;
+    return { ...readBeforeModifyValidationError, executionName, catalogIdentity, executedArgs: resolvedArgs };
   }
 
   const unityExecutionContext = isUnityExecutionContext(callbacks);
@@ -4200,10 +4467,13 @@ async function executeToolCallWithLifecycle(
     !isUnityApplyTextPrecisePatchArgs(resolvedArgs)
   ) {
     const message = buildUnityApplyTextPolicyBlockedMessage(callbacks.getPreferredLanguage());
-    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id, executionName, catalogIdentity });
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
       target,
       content: `Error: ${message}`,
       isError: true,
@@ -4212,28 +4482,198 @@ async function executeToolCallWithLifecycle(
     };
   }
 
-  const mutationVerificationPath = resolveMutationVerificationPath(tc.name, resolvedArgs);
+  let effectiveAllowExternalLocalRead = options.allowExternalLocalRead === true;
+  let effectiveShellPermissionApproval = options.shellPermissionApproval;
+  if (hookArgumentsChanged) {
+    const capabilityRegistry = options.toolCapabilityRegistry;
+    const finalRisk = getToolRiskLevelForCall(tc.name, resolvedArgs, capabilityRegistry, {
+      workspace,
+      approvedLocalFileReadPaths: callbacks.getApprovedLocalFileReadPaths(),
+    });
+    const capability = capabilityRegistry?.tools[tc.name];
+    const source = capability?.source ?? "unknown";
+    const policy = capabilityRegistry?.policy;
+    const finalLocalFileReadPath = getLocalFileReadPathForToolCall(tc.name, resolvedArgs, workspace) || "";
+    const shellApprovalResolution = await resolveShellAutoApproval({
+      toolName: tc.name,
+      args: resolvedArgs,
+      workspace,
+      preflight: shellPermissionPreflight,
+    });
+
+    logAgentEvent("pre_tool_hook_arguments_reauthorized", {
+      tool: tc.name,
+      executionName,
+      target,
+      authorizationMode: options.authorizationMode || "unscoped",
+      finalRisk,
+      source,
+      shellCommandChanged: !!shellApprovalResolution.command,
+    });
+
+    if (policy?.disabledRiskLevels.includes(finalRisk)) {
+      const message = `PRE_TOOL_USE_ARGUMENT_POLICY_BLOCKED: ${tc.name} arguments changed after authorization and the final ${finalRisk} risk is disabled.`;
+      callbacks.onToolError(tc.name, target, message, {
+        toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
+        failureKind: "policy",
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "blocked",
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
+
+    if (shellApprovalResolution.decision?.decision === "deny") {
+      const message = `PRE_TOOL_USE_ARGUMENT_POLICY_BLOCKED: the final shell command produced by PreToolUse was denied by the shell permission policy.`;
+      callbacks.onToolError(tc.name, target, message, {
+        toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
+        failureKind: "policy",
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "blocked",
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
+
+    const automaticallyAuthorized = !!capabilityRegistry && isToolAutoExecutableForCall(
+      tc.name,
+      resolvedArgs,
+      capabilityRegistry,
+      policy,
+      {
+        workspace,
+        approvedLocalFileReadPaths: callbacks.getApprovedLocalFileReadPaths(),
+      },
+    );
+    const sessionAuthorized = !!capabilityRegistry && !!policy && isAllowedBySessionAutoApprove(
+      finalRisk,
+      source,
+      callbacks.getAutoApproveToolScopes?.() || [],
+      policy,
+    );
+    const shellAuthorizationCurrent = !shellApprovalResolution.command ||
+      canApplyShellAutoReview(shellApprovalResolution);
+    const mayContinueWithoutReview =
+      options.authorizationMode === "automatic"
+        ? automaticallyAuthorized && shellAuthorizationCurrent
+        : options.authorizationMode === "session"
+        ? (automaticallyAuthorized || sessionAuthorized) && shellAuthorizationCurrent
+        : false;
+
+    if (mayContinueWithoutReview) {
+      if (finalRisk === "local_file_read" && (automaticallyAuthorized || sessionAuthorized)) {
+        effectiveAllowExternalLocalRead = true;
+      }
+      if (shellApprovalResolution.command) {
+        effectiveShellPermissionApproval = shellApprovalResolution.approval;
+      }
+    } else {
+      let decision: ReviewDecision;
+      try {
+        decision = await callbacks.requestReview({
+          toolCallId: tc.id,
+          name: tc.name,
+          arguments: resolvedArgs,
+          risk: finalRisk,
+          ...(finalLocalFileReadPath ? { localFileReadPath: finalLocalFileReadPath } : {}),
+          ...(shellApprovalResolution.decision
+            ? { shellPermissionDecision: shellApprovalResolution.decision }
+            : {}),
+        });
+      } catch {
+        callbacks.onStatusChange("idle");
+        return {
+          toolCallId: tc.id,
+          name: tc.name,
+          executionName,
+          catalogIdentity,
+          executedArgs: resolvedArgs,
+          target,
+          content: "User cancelled approval for the final PreToolUse arguments.",
+          isError: true,
+          lifecycleState: "declined",
+          additionalContexts: [...preHookResult.additionalContexts],
+        };
+      }
+      callbacks.onStatusChange("running");
+      if (decision.action !== "accept") {
+        const content = decision.action === "reject"
+          ? "User rejected the final PreToolUse arguments."
+          : `Tool execution failed: ${decision.error}`;
+        return {
+          toolCallId: tc.id,
+          name: tc.name,
+          executionName,
+          catalogIdentity,
+          executedArgs: resolvedArgs,
+          target,
+          content,
+          isError: decision.action !== "reject",
+          lifecycleState: decision.action === "reject" ? "declined" : "failed",
+          additionalContexts: [...preHookResult.additionalContexts],
+        };
+      }
+      effectiveShellPermissionApproval = decision.shellPermissionApproval;
+      if (
+        finalLocalFileReadPath &&
+        (
+          isLocalFileReadApproved(decision.grantLocalFileReadPath || "", [finalLocalFileReadPath]) ||
+          isLocalFileReadApproved(finalLocalFileReadPath, callbacks.getApprovedLocalFileReadPaths())
+        )
+      ) {
+        effectiveAllowExternalLocalRead = true;
+      }
+    }
+  }
+
+  const mutationVerificationPath = resolveMutationVerificationPath(executionName, resolvedArgs);
   const shouldCaptureMutationDiff =
     !!mutationVerificationPath &&
-    supportsToolDiffPreview(tc.name) &&
+    supportsToolDiffPreview(executionName) &&
     !isEphemeralPlanArtifactPath(mutationVerificationPath);
   const mutationBeforeDiffSnapshot = shouldCaptureMutationDiff && mutationVerificationPath
     ? await readMutationDiffSnapshot({
         path: mutationVerificationPath,
         workspace,
         sessionKey,
-        allowExternalLocalRead: options.allowExternalLocalRead === true,
+        allowExternalLocalRead: effectiveAllowExternalLocalRead,
       })
     : null;
-  const diffPreview = isEphemeralPlanArtifactMutation(tc.name, resolvedArgs)
+  const diffPreview = isEphemeralPlanArtifactMutation(executionName, resolvedArgs)
     ? undefined
-    : await buildToolDiffPreview(tc.name, resolvedArgs, { workspace, sessionKey });
-  callbacks.onToolExecuting(tc.name, target, diffPreview, { toolCallId: tc.id });
+    : await buildToolDiffPreview(executionName, resolvedArgs, { workspace, sessionKey });
+  callbacks.onToolExecuting(tc.name, target, diffPreview, {
+    toolCallId: tc.id,
+    executionName,
+    catalogIdentity,
+  });
   const mutationBeforeMeta = mutationVerificationPath
     ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
     : null;
 
+  let executionAttempted = false;
   try {
+    executionAttempted = true;
     let rawResult = tc.name === "spawn_subagent"
       ? await (async () => {
           if (!callbacks.runSubagent) {
@@ -4278,8 +4718,8 @@ async function executeToolCallWithLifecycle(
             return JSON.stringify(joined);
           })()
       : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
-            allowExternalLocalRead: options.allowExternalLocalRead === true,
-            shellPermissionApproval: options.shellPermissionApproval,
+            allowExternalLocalRead: effectiveAllowExternalLocalRead,
+            shellPermissionApproval: effectiveShellPermissionApproval,
             toolCatalog: options.toolCatalog,
           });
     let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
@@ -4317,6 +4757,8 @@ async function executeToolCallWithLifecycle(
         const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
         callbacks.onToolError(tc.name, target, displayFailureContent, {
           toolCallId: tc.id,
+          executionName,
+          catalogIdentity,
           failureKind: "actual",
         });
         const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4332,11 +4774,15 @@ async function executeToolCallWithLifecycle(
         return {
           toolCallId: tc.id,
           name: tc.name,
+          executionName,
+          catalogIdentity,
+          executedArgs: resolvedArgs,
           target,
           content: modelFailureContent,
           displayContent: displayFailureContent,
           isError: true,
           lifecycleState: "failed",
+          executionAttempted,
           additionalContexts: [
             ...preHookResult.additionalContexts,
             ...postHookResult.additionalContexts,
@@ -4378,6 +4824,8 @@ async function executeToolCallWithLifecycle(
         const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
         callbacks.onToolError(tc.name, target, displayFailureContent, {
           toolCallId: tc.id,
+          executionName,
+          catalogIdentity,
           failureKind: "actual",
         });
         const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4393,11 +4841,15 @@ async function executeToolCallWithLifecycle(
         return {
           toolCallId: tc.id,
           name: tc.name,
+          executionName,
+          catalogIdentity,
+          executedArgs: resolvedArgs,
           target,
           content: modelFailureContent,
           displayContent: displayFailureContent,
           isError: true,
           lifecycleState: "failed",
+          executionAttempted,
           additionalContexts: [
             ...preHookResult.additionalContexts,
             ...postHookResult.additionalContexts,
@@ -4443,16 +4895,29 @@ async function executeToolCallWithLifecycle(
           path: mutationVerificationPath,
           workspace,
           sessionKey,
-          allowExternalLocalRead: options.allowExternalLocalRead === true,
+          allowExternalLocalRead: effectiveAllowExternalLocalRead,
         })
       : null;
+    const observedMutationDiffPreview = buildMutationDiffPreviewFromSnapshots({
+      toolName: executionName,
+      target: mutationVerificationPath || target,
+      before: mutationBeforeDiffSnapshot,
+      after: mutationAfterDiffSnapshot,
+    });
+    const verifiedNoEffectMutation =
+      isWorkspaceMutationToolCall(executionName, resolvedArgs) &&
+      isVerifiedNoEffectMutation({
+        supportsDiffVerification: supportsToolDiffPreview(executionName),
+        beforeDiffSnapshot: mutationBeforeDiffSnapshot,
+        afterDiffSnapshot: mutationAfterDiffSnapshot,
+        observedDiffPreview: observedMutationDiffPreview,
+        result: resultStr,
+        beforeMetadata: mutationBeforeMeta,
+        afterMetadata: mutationAfterMeta,
+      });
     if (
       mutationVerificationPath &&
-      isNoEffectMutationResult({
-        result: resultStr,
-        before: mutationBeforeMeta,
-        after: mutationAfterMeta,
-      })
+      verifiedNoEffectMutation
     ) {
       const noEffectMessage = buildNoEffectMutationMessage({
         language: callbacks.getPreferredLanguage(),
@@ -4463,6 +4928,8 @@ async function executeToolCallWithLifecycle(
       });
       callbacks.onToolError(tc.name, target, noEffectMessage, {
         toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
         failureKind: "actual",
       });
       const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4478,10 +4945,15 @@ async function executeToolCallWithLifecycle(
       return {
         toolCallId: tc.id,
         name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
         target,
         content: `Error: ${noEffectMessage}`,
         isError: true,
         lifecycleState: "failed",
+        executionAttempted,
+        workspaceEffect: "none",
         additionalContexts: [
           ...preHookResult.additionalContexts,
           ...postHookResult.additionalContexts,
@@ -4500,6 +4972,8 @@ async function executeToolCallWithLifecycle(
     if (tc.name === "run_command" && !commandResultLooksSuccessful(tc.name, resultStr)) {
       callbacks.onToolError(tc.name, target, displayContent, {
         toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
         failureKind: "actual",
       });
       const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4515,11 +4989,15 @@ async function executeToolCallWithLifecycle(
       return {
         toolCallId: tc.id,
         name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
         target,
         content: modelContent,
         displayContent,
         isError: true,
         lifecycleState: "failed",
+        executionAttempted,
         additionalContexts: [
           ...preHookResult.additionalContexts,
           ...postHookResult.additionalContexts,
@@ -4534,7 +5012,7 @@ async function executeToolCallWithLifecycle(
     const planArtifactSyncOptions = {
       readFile: async (path: string) => {
         const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey, {
-          allowExternalLocalRead: options.allowExternalLocalRead === true,
+          allowExternalLocalRead: effectiveAllowExternalLocalRead,
         });
         return String(content ?? "");
       },
@@ -4688,15 +5166,30 @@ async function executeToolCallWithLifecycle(
     }
 
     const completedTarget = mutationVerificationPath || target;
-    const completedDiffPreview =
-      buildMutationDiffPreviewFromSnapshots({
-        toolName: tc.name,
-        target: completedTarget,
-        before: mutationBeforeDiffSnapshot,
-        after: mutationAfterDiffSnapshot,
-      }) || diffPreview;
+    const trustedBuiltInMutation =
+      catalogIdentity.source === "built_in" &&
+      BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES.has(executionName) &&
+      isWorkspaceMutationToolCall(executionName, resolvedArgs);
+    // A proposed built-in diff can be accepted after its trusted executor
+    // completes. MCP/Skill tools must contribute an observed before/after diff;
+    // sharing an executionName with a built-in editor grants no trust.
+    const completedDiffPreview = observedMutationDiffPreview ||
+      (trustedBuiltInMutation ? diffPreview : undefined);
+    const mutationChangedPaths = observedMutationDiffPreview?.path
+      ? [observedMutationDiffPreview.path]
+      : trustedBuiltInMutation
+      ? resolveWorkspaceMutationTargets(executionName, resolvedArgs, completedTarget)
+      : [];
+    const workspaceMutationEvidence = mutationChangedPaths.length > 0
+      ? {
+          changedPaths: [...new Set(mutationChangedPaths)],
+          ...(completedDiffPreview ? { diff: completedDiffPreview } : {}),
+        }
+      : undefined;
     callbacks.onToolDone(tc.name, completedTarget, finalDisplayContent, {
       toolCallId: tc.id,
+      executionName,
+      catalogIdentity,
       diff: completedDiffPreview,
       ...(isInternalFeedback ? { internalFeedback: true } : {}),
       ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
@@ -4709,11 +5202,17 @@ async function executeToolCallWithLifecycle(
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
       target: completedTarget,
       content: finalContent,
       displayContent: finalDisplayContent,
       isError: false,
       lifecycleState: "completed",
+      executionAttempted,
+      ...(workspaceMutationEvidence ? { workspaceEffect: "verified" as const } : {}),
+      ...(workspaceMutationEvidence ? { workspaceMutationEvidence } : {}),
       ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
       ...(finalPlanRecoveryAction ? { planRecoveryAction: finalPlanRecoveryAction } : {}),
       ...(finalMissingPlanSections ? { missingPlanSections: finalMissingPlanSections } : {}),
@@ -4728,6 +5227,23 @@ async function executeToolCallWithLifecycle(
     // Instead of throwing, we return the error as a tool result.
     // The AI sees the error and can self-correct (e.g., try a different path).
     const errorMsg = (err as Error).message || String(err);
+    const failedMutationAfterSnapshot = executionAttempted && shouldCaptureMutationDiff && mutationVerificationPath
+      ? await readMutationDiffSnapshot({
+          path: mutationVerificationPath,
+          workspace,
+          sessionKey,
+          allowExternalLocalRead: effectiveAllowExternalLocalRead,
+        })
+      : null;
+    const failedMutationDiff = buildMutationDiffPreviewFromSnapshots({
+      toolName: executionName,
+      target: mutationVerificationPath || target,
+      before: mutationBeforeDiffSnapshot,
+      after: failedMutationAfterSnapshot,
+    });
+    const failedMutationEvidence = failedMutationDiff?.path
+      ? { changedPaths: [failedMutationDiff.path], diff: failedMutationDiff }
+      : undefined;
     if (
       (tc.name === "execute_command" || tc.name === "send_pty_input") &&
       /^PTY_[A-Z_]+:/.test(errorMsg)
@@ -4742,7 +5258,11 @@ async function executeToolCallWithLifecycle(
     }
     if (isOptionalTasksMdRead(tc.name, target) && isMissingOptionalTasksMdReadError(errorMsg)) {
       const optionalMessage = buildOptionalTasksMdMissingResult(callbacks.getPreferredLanguage(), target);
-      callbacks.onToolDone(tc.name, target, optionalMessage, { toolCallId: tc.id });
+      callbacks.onToolDone(tc.name, target, optionalMessage, {
+        toolCallId: tc.id,
+        executionName,
+        catalogIdentity,
+      });
       const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
         toolName: tc.name,
         toolArgs: resolvedArgs,
@@ -4756,11 +5276,19 @@ async function executeToolCallWithLifecycle(
       return {
         toolCallId: tc.id,
         name: tc.name,
+        executionName,
+        catalogIdentity,
+        executedArgs: resolvedArgs,
         target,
         content: optionalMessage,
         displayContent: optionalMessage,
         isError: false,
         lifecycleState: "completed",
+        executionAttempted,
+        ...(isWorkspaceMutationToolCall(executionName, resolvedArgs)
+          ? { workspaceEffect: failedMutationEvidence ? "partial" as const : "possible" as const }
+          : {}),
+        ...(failedMutationEvidence ? { workspaceMutationEvidence: failedMutationEvidence } : {}),
         additionalContexts: [
           ...preHookResult.additionalContexts,
           ...postHookResult.additionalContexts,
@@ -4769,6 +5297,10 @@ async function executeToolCallWithLifecycle(
     }
     callbacks.onToolError(tc.name, target, errorMsg, {
       toolCallId: tc.id,
+      executionName,
+      catalogIdentity,
+      ...(failedMutationDiff ? { diff: failedMutationDiff } : {}),
+      ...(failedMutationEvidence ? { workspaceMutationEvidence: failedMutationEvidence } : {}),
       failureKind: "actual",
     });
     const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4784,10 +5316,18 @@ async function executeToolCallWithLifecycle(
     return {
       toolCallId: tc.id,
       name: tc.name,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
       target,
       content: `Error: ${errorMsg}`,
       isError: true,
       lifecycleState: "failed",
+      executionAttempted,
+      ...(isWorkspaceMutationToolCall(executionName, resolvedArgs)
+        ? { workspaceEffect: failedMutationEvidence ? "partial" as const : "possible" as const }
+        : {}),
+      ...(failedMutationEvidence ? { workspaceMutationEvidence: failedMutationEvidence } : {}),
       additionalContexts: [
         ...preHookResult.additionalContexts,
         ...postHookResult.additionalContexts,
@@ -5024,15 +5564,16 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
 export async function executeReadOnlyToolsConcurrently(
   toolCalls: Array<ToolCallToExecute & {
     allowExternalLocalRead?: boolean;
+    authorizationMode?: ExecuteToolLifecycleOptions["authorizationMode"];
     scopedReadPaths?: string[];
   }>,
   workspace: string,
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog" | "toolCapabilityRegistry" | "authorizationMode"> = {},
 ): Promise<ToolExecutionResult[]> {
-  const promises = toolCalls.map(tc =>
+  const execute = (tc: typeof toolCalls[number]) =>
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
       allowExternalLocalRead: tc.allowExternalLocalRead === true,
       scopedReadPaths: tc.scopedReadPaths,
@@ -5041,9 +5582,43 @@ export async function executeReadOnlyToolsConcurrently(
       recentPlanToolActivity: options.recentPlanToolActivity,
       attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
       toolCatalog: options.toolCatalog,
-    }),
-  );
-  return Promise.all(promises);
+      toolCapabilityRegistry: options.toolCapabilityRegistry,
+      authorizationMode: tc.authorizationMode || options.authorizationMode || "automatic",
+    });
+  const indexedCalls = toolCalls.map((tc, index) => ({ tc, index }));
+  const registrationCalls = indexedCalls.filter(({ tc }) => tc.name !== "wait_subagents");
+  const waitCalls = indexedCalls.filter(({ tc }) => tc.name === "wait_subagents");
+  const resultsByIndex = new Map<number, ToolExecutionResult>();
+  const hooksCanRequestReview = hooksConfig.hooks.PreToolUse.some((hook) => hook.enabled);
+  const executeRegistrationCalls = async () => {
+    if (hooksCanRequestReview) {
+      for (const { tc, index } of registrationCalls) {
+        resultsByIndex.set(index, await execute(tc));
+      }
+      return;
+    }
+    const results = await Promise.all(registrationCalls.map(({ tc }) => execute(tc)));
+    results.forEach((result, resultIndex) => {
+      resultsByIndex.set(registrationCalls[resultIndex].index, result);
+    });
+  };
+
+  // A hook can promote an otherwise read-only call into a reviewed action.
+  // Serialize hook-bearing calls so pending-review ownership cannot be
+  // overwritten by a second concurrent request. A same-response
+  // wait_subagents is also held behind every spawn/registration call; the
+  // model cannot race its join against children that are not registered yet.
+  await executeRegistrationCalls();
+  if (waitCalls.length > 0) {
+    logAgentEvent("subagent_wait_registration_barrier", {
+      spawnCalls: registrationCalls.filter(({ tc }) => tc.name === "spawn_subagent").length,
+      waitCalls: waitCalls.length,
+    });
+    for (const { tc, index } of waitCalls) {
+      resultsByIndex.set(index, await execute(tc));
+    }
+  }
+  return indexedCalls.map(({ index }) => resultsByIndex.get(index) as ToolExecutionResult);
 }
 
 export async function executeLocalFileReadToolWithReview(
@@ -5054,7 +5629,7 @@ export async function executeLocalFileReadToolWithReview(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "toolCatalog"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "toolCatalog" | "toolCapabilityRegistry"> = {},
 ): Promise<ToolExecutionResult> {
   const target = getToolTarget(tc.name, toolArgs);
 
@@ -5091,7 +5666,12 @@ export async function executeLocalFileReadToolWithReview(
       callbacks,
       allTools,
       hooksConfig,
-      { allowExternalLocalRead, toolCatalog: options.toolCatalog },
+      {
+        allowExternalLocalRead,
+        toolCatalog: options.toolCatalog,
+        toolCapabilityRegistry: options.toolCapabilityRegistry,
+        authorizationMode: "user",
+      },
     );
   }
 
@@ -5540,7 +6120,7 @@ export async function executeWriteToolWithReview(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog"> & { skipUserReview?: boolean } = {},
+  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog" | "toolCapabilityRegistry"> & { skipUserReview?: boolean } = {},
 ): Promise<ToolExecutionResult> {
   let toolArgs: Record<string, unknown>;
   try {
@@ -5680,6 +6260,8 @@ export async function executeWriteToolWithReview(
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
         toolCatalog: options.toolCatalog,
+        toolCapabilityRegistry: options.toolCapabilityRegistry,
+        authorizationMode: "session",
       },
     );
   }
@@ -5697,16 +6279,20 @@ export async function executeWriteToolWithReview(
 
   let decision: ReviewDecision;
   try {
-    const controlRisk = tc.name === "browser_evaluate"
-      ? "browser_control"
-      : tc.name === "computer_use"
-      ? "desktop_control"
-      : undefined;
+    const reviewRisk = getToolRiskLevelForCall(
+      tc.name,
+      toolArgs,
+      options.toolCapabilityRegistry,
+      {
+        workspace,
+        approvedLocalFileReadPaths: callbacks.getApprovedLocalFileReadPaths(),
+      },
+    );
     decision = await callbacks.requestReview({
       toolCallId: tc.id,
       name: tc.name,
       arguments: toolArgs,
-      ...(controlRisk ? { risk: controlRisk } : {}),
+      risk: reviewRisk,
       ...(shellApprovalResolution.decision ? { shellPermissionDecision: shellApprovalResolution.decision } : {}),
     });
   } catch {
@@ -5739,6 +6325,8 @@ export async function executeWriteToolWithReview(
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
         toolCatalog: options.toolCatalog,
+        toolCapabilityRegistry: options.toolCapabilityRegistry,
+        authorizationMode: "user",
       },
     );
     return execution;

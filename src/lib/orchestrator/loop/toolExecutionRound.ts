@@ -16,9 +16,17 @@ import { buildRepeatLoopArgsKey } from "../../repetitionGuard";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { ToolCatalog } from "../../toolCatalog";
+import type { ToolCapabilityRegistry } from "../../toolCapabilities";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import { isWorkspaceMutationToolCall } from "../../workspaceMutationTools";
 import { isPtyControlInput } from "../../ptyCommandRuntime";
+import {
+  getToolExecutionArgs,
+  getToolExecutionName,
+  hasCompletedToolExecution,
+  hasVerifiedWorkspaceMutationEffect,
+  mayHaveWorkspaceSideEffects,
+} from "../../toolResultEffect";
 import {
   executeLocalFileReadToolWithReview,
   executeReadOnlyToolsConcurrently,
@@ -37,6 +45,7 @@ import type {
 
 export type ReadOnlyToolCallForRound = ToolCallToExecute & {
   allowExternalLocalRead?: boolean;
+  authorizationMode?: "automatic" | "session";
   /** Runtime-only lease roots; never accepted from model-authored arguments. */
   scopedReadPaths?: string[];
 };
@@ -51,29 +60,30 @@ export type WriteToolCallForRound = ToolCallToExecute & {
 
 export function shouldAdvanceWorkspaceObservationEpoch(
   toolName: string,
-  result: Pick<ToolExecutionResult, "content" | "displayContent" | "isError" | "lifecycleState">,
+  result: ToolExecutionResult,
   toolArgs: Record<string, unknown> = {},
 ): boolean {
-  const isExplicitWorkspaceMutation = isWorkspaceMutationToolCall(toolName, toolArgs);
+  const executionName = getToolExecutionName(result) || toolName;
+  const executedArgs = getToolExecutionArgs(result, toolArgs);
+  const isExplicitWorkspaceMutation = isWorkspaceMutationToolCall(executionName, executedArgs);
   const isNonControlPtyInteraction = toolName === "send_pty_input" &&
     !isPtyControlInput(
-      typeof toolArgs.input === "string" ? toolArgs.input : "",
-      typeof toolArgs.control === "string" ? toolArgs.control : undefined,
+      typeof executedArgs.input === "string" ? executedArgs.input : "",
+      typeof executedArgs.control === "string" ? executedArgs.control : undefined,
     );
   const isOpaqueWorkspaceAction =
     toolName === "run_command" ||
     toolName === "execute_command" ||
     isNonControlPtyInteraction;
   if (!isExplicitWorkspaceMutation && !isOpaqueWorkspaceAction) return false;
-  if (
-    result.isError ||
-    result.lifecycleState === "blocked" ||
-    result.lifecycleState === "declined"
-  ) return false;
-  if (!isExplicitWorkspaceMutation) return true;
-  return !/"noOp"\s*:\s*true|NO_EFFECT_MUTATION|"status"\s*:\s*"(?:no_op|no_effect_mutation)"/i.test(
-    result.content || result.displayContent || "",
-  );
+  if (isExplicitWorkspaceMutation) {
+    const effectResult = result.name
+      ? result
+      : { ...result, name: executionName, target: result.target || "", toolCallId: result.toolCallId || "" };
+    return hasVerifiedWorkspaceMutationEffect(effectResult, executedArgs) ||
+      mayHaveWorkspaceSideEffects(effectResult, executedArgs);
+  }
+  return hasCompletedToolExecution(result) || mayHaveWorkspaceSideEffects(result, executedArgs);
 }
 
 export type ToolExecutionRoundResult =
@@ -96,6 +106,7 @@ export async function executeToolExecutionRound(input: {
   iteration: number;
   iterationAllTools: ToolDefinition[];
   toolCatalog: ToolCatalog;
+  toolCapabilityRegistry: ToolCapabilityRegistry;
   hooksConfig: HooksConfig;
   turnInputContextSignals: TurnInputContextSignals;
   recentPlanToolActivity: PlanToolActivitySummary[];
@@ -118,6 +129,7 @@ export async function executeToolExecutionRound(input: {
     iteration,
     iterationAllTools,
     toolCatalog,
+    toolCapabilityRegistry,
     hooksConfig,
     turnInputContextSignals,
     recentPlanToolActivity,
@@ -152,6 +164,7 @@ export async function executeToolExecutionRound(input: {
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
         toolCatalog,
+        toolCapabilityRegistry,
       },
     );
     const normalizedReadResults: ToolExecutionResult[] = [];
@@ -281,7 +294,7 @@ export async function executeToolExecutionRound(input: {
       callbacks,
       iterationAllTools,
       hooksConfig,
-      { toolCatalog },
+      { toolCatalog, toolCapabilityRegistry },
     );
     allResults.push(result);
 
@@ -302,6 +315,8 @@ export async function executeToolExecutionRound(input: {
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
         toolCatalog,
+        toolCapabilityRegistry,
+        authorizationMode: "plan_artifact",
       },
     );
     allResults.push(...specResults);
@@ -322,10 +337,12 @@ export async function executeToolExecutionRound(input: {
         attemptedPlanWriteTargets,
         skipUserReview: tc.skipUserReview === true,
         toolCatalog,
+        toolCapabilityRegistry,
       },
     );
     allResults.push(result);
-    const toolArgs = parseToolCallArguments(tc, workspace);
+    const toolArgs = getToolExecutionArgs(result, parseToolCallArguments(tc, workspace));
+    const executionName = getToolExecutionName(result) || tc.name;
     const refreshAfterPtyControl = tc.name === "send_pty_input" &&
       isPtyControlInput(
         typeof toolArgs.input === "string" ? toolArgs.input : "",
@@ -334,10 +351,13 @@ export async function executeToolExecutionRound(input: {
       !result.isError &&
       result.lifecycleState !== "blocked" &&
       result.lifecycleState !== "declined";
-    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result, toolArgs) || refreshAfterPtyControl) {
-      const changedPaths = extractStructuredChangedPaths(result.content);
+    if (shouldAdvanceWorkspaceObservationEpoch(executionName, result, toolArgs) || refreshAfterPtyControl) {
+      const changedPaths = [
+        ...(result.workspaceMutationEvidence?.changedPaths || []),
+        ...extractStructuredChangedPaths(result.content),
+      ];
       const invalidation = invalidateWorkspaceReadCachesAfterMutation({
-        toolName: tc.name,
+        toolName: executionName,
         args: toolArgs,
         target: result.target,
         changedPaths,
@@ -347,7 +367,7 @@ export async function executeToolExecutionRound(input: {
       });
       logAgentEvent("workspace_read_cache_invalidated_after_mutation", {
         iteration,
-        tool: tc.name,
+        tool: executionName,
         target: result.target,
         changedPaths,
         invalidatedFileReadStates: invalidation.invalidatedFileReadSignatures.length,
@@ -357,8 +377,7 @@ export async function executeToolExecutionRound(input: {
     if (
       tc.name !== "browser_evaluate" &&
       browserValidationCache.size > 0 &&
-      result.lifecycleState !== "blocked" &&
-      result.lifecycleState !== "declined"
+      (hasCompletedToolExecution(result) || mayHaveWorkspaceSideEffects(result, toolArgs))
     ) {
       browserValidationCache.clear();
       logAgentEvent("browser_validation_cache_invalidated", {

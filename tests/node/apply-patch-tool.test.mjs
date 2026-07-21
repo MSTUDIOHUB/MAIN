@@ -249,6 +249,36 @@ test("applyWorkspacePatch writes path= header changes to the canonical workspace
   assert.equal(files.has("path=src/main.js"), false);
 });
 
+test("applyWorkspacePatch rolls back earlier files when a later write fails", async () => {
+  const files = new Map([
+    ["src/a.ts", "export const a = 'old';\n"],
+    ["src/b.ts", "export const b = 'old';\n"],
+  ]);
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/a.ts",
+    "@@",
+    "-export const a = 'old';",
+    "+export const a = 'new';",
+    "*** Update File: src/b.ts",
+    "@@",
+    "-export const b = 'old';",
+    "+export const b = 'new';",
+    "*** End Patch",
+  ].join("\n");
+
+  await assert.rejects(() => applyWorkspacePatch(patch, {
+    readFile: async (file) => files.get(file),
+    writeFile: async (file, content) => {
+      if (file === "src/b.ts" && content.includes("'new'")) throw new Error("disk full");
+      files.set(file, content);
+    },
+  }), /disk full/);
+
+  assert.equal(files.get("src/a.ts"), "export const a = 'old';\n");
+  assert.equal(files.get("src/b.ts"), "export const b = 'old';\n");
+});
+
 test("applyWorkspacePatch performs a real move and reports both destination and source", async () => {
   const files = new Map([["src/old.ts", "export const value = 'old';\n"]]);
   const patch = [
@@ -339,6 +369,6 @@ test("applyWorkspacePatch requires atomic create-new support for Add File", asyn
   );
 
   assert.equal(result.ok, false);
-  assert.match(result.error || "", /Atomic Add File is not supported/);
+  assert.match(result.error || "", /Atomic Add File .*not supported/);
   assert.deepEqual(writes, []);
 });

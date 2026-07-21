@@ -86,13 +86,86 @@ test("tool execution reasserts running state for stop button and timer", () => {
 test("tool lifecycle keeps edit diff previews through completion", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
-  assert.match(source, /onToolExecuting: \(toolName: string, target: string, diffPreview\?: any/);
+  assert.match(
+    source,
+    /onToolExecuting:\s*\(\s*toolName: string,\s*target: string,\s*diffPreview\?: any/,
+  );
   assert.match(source, /supportsToolDiffPreview\(toolName\)/);
   assert.match(source, /isEphemeralPlanArtifactPath\(diffPath\)/);
   assert.match(source, /\.\.\.\(diff \? \{ diff \} : \{\}\)/);
   assert.match(source, /findToolLifecycleBlockIndex/);
   assert.match(source, /summarizeToolObservation/);
   assert.match(source, /withTurnRuntimePhaseStatus/);
+});
+
+test("canonical MCP mutations keep execution identity, UI diff, and durable file evidence", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const doneStart = source.indexOf("onToolDone:");
+  const errorStart = source.indexOf("onToolError:", doneStart);
+  const doneSource = source.slice(doneStart, errorStart);
+  const errorEnd = source.indexOf("requestReview:", errorStart);
+  const errorSource = source.slice(errorStart, errorEnd);
+
+  assert.match(doneSource, /const executionName = String\(meta\?\.executionName \|\| toolName\)/);
+  assert.match(doneSource, /shouldAttachToolDiffPreview\(executionName, target, meta\?\.diff\)/);
+  assert.match(doneSource, /createPlanExecutionEvidenceEntry\(\{\s*toolName: executionName,/s);
+  assert.match(doneSource, /executionName,\s*status: operationStatus,/);
+  assert.match(doneSource, /diff: completedDiff,\s*workspaceEffect,/);
+  assert.match(doneSource, /if \(!completedDiff\) return evidencePatch;[\s\S]*taskFlow: \[\.\.\.s\.taskFlow, completedBlock\]/);
+  assert.match(errorSource, /const failedMutationDiff = shouldAttachToolDiffPreview\(executionName, target, meta\?\.diff\)/);
+  assert.match(errorSource, /\.\.\.unownedMutationEntry,\s*observationStatus: "failed" as const/);
+  assert.match(errorSource, /const mutationLedger = appendPlanEvidenceEntry\([\s\S]*mutationEntry/);
+  assert.match(errorSource, /const nextLedger = appendPlanEvidenceEntry\(mutationLedger, failureEntry\)/);
+  assert.match(errorSource, /executionName,\s*status: "error",/);
+  assert.match(errorSource, /diff: failedMutationDiff,\s*workspaceEffect: failedMutationDiff \? "partial"/);
+
+  const persistSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const toolPersistStart = persistSource.indexOf('case "tool":');
+  const toolPersistEnd = persistSource.indexOf('case "system":', toolPersistStart);
+  const toolPersistSource = persistSource.slice(toolPersistStart, toolPersistEnd);
+  assert.match(toolPersistSource, /b\.executionName \? \{ executionName: String\(b\.executionName\) \}/);
+  assert.match(toolPersistSource, /b\.workspaceEffect === "verified" \|\| b\.workspaceEffect === "partial"/);
+});
+
+test("PreToolUse argument rewrites are re-authorized before execution", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const lifecycleStart = source.indexOf("async function executeToolCallWithLifecycle");
+  const lifecycleEnd = source.indexOf("export async function autoMaterializePlanArtifactFromVisibleText", lifecycleStart);
+  const lifecycleSource = source.slice(lifecycleStart, lifecycleEnd);
+  const roundSource = source.slice(
+    source.indexOf("export async function executeReadOnlyToolsConcurrently"),
+    source.indexOf("export async function executeLocalFileReadToolWithReview"),
+  );
+
+  assert.match(lifecycleSource, /stableToolArgumentIdentity\(toolArgs\) !== stableToolArgumentIdentity\(effectiveArgs\)/);
+  assert.match(lifecycleSource, /getToolRiskLevelForCall\(tc\.name, resolvedArgs, capabilityRegistry/);
+  assert.match(lifecycleSource, /policy\?\.disabledRiskLevels\.includes\(finalRisk\)/);
+  assert.match(lifecycleSource, /isToolAutoExecutableForCall\([\s\S]*resolvedArgs/);
+  assert.match(lifecycleSource, /isAllowedBySessionAutoApprove\([\s\S]*finalRisk/);
+  assert.match(lifecycleSource, /callbacks\.requestReview\(\{[\s\S]*arguments: resolvedArgs/);
+  assert.match(lifecycleSource, /shellPermissionDecision: shellApprovalResolution\.decision/);
+  assert.match(lifecycleSource, /shellPermissionApproval: effectiveShellPermissionApproval/);
+  assert.match(roundSource, /hooksConfig\.hooks\.PreToolUse\.some\(\(hook\) => hook\.enabled\)/);
+  assert.match(roundSource, /if \(hooksCanRequestReview\) \{[\s\S]*for \(const \{ tc, index \} of registrationCalls\)/);
+});
+
+test("mutation snapshots fail closed on unknown reads and subagent waits follow registration", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const snapshotStart = source.indexOf("async function readMutationDiffSnapshot");
+  const snapshotEnd = source.indexOf("function buildMutationDiffPreviewFromSnapshots", snapshotStart);
+  const snapshotSource = source.slice(snapshotStart, snapshotEnd + 700);
+  const concurrentStart = source.indexOf("export async function executeReadOnlyToolsConcurrently");
+  const concurrentEnd = source.indexOf("export async function executeLocalFileReadToolWithReview", concurrentStart);
+  const concurrentSource = source.slice(concurrentStart, concurrentEnd);
+
+  assert.match(snapshotSource, /probeFileMetadataAvailability\(input\.path, input\.workspace\)/);
+  assert.match(snapshotSource, /if \(availability\.status === "unknown"\) return null/);
+  assert.match(snapshotSource, /afterFailure\.status === "absent"[\s\S]*: null/);
+  assert.match(snapshotSource, /if \(!input\.before \|\| !input\.after\) return undefined/);
+  assert.match(concurrentSource, /registrationCalls = indexedCalls\.filter\(\(\{ tc \}\) => tc\.name !== "wait_subagents"\)/);
+  assert.match(concurrentSource, /await executeRegistrationCalls\(\);[\s\S]*for \(const \{ tc, index \} of waitCalls\)/);
+  assert.match(concurrentSource, /subagent_wait_registration_barrier/);
+  assert.match(concurrentSource, /return indexedCalls\.map\(\(\{ index \}\) => resultsByIndex\.get\(index\)/);
 });
 
 test("scoped read fan-out applies lifecycle hooks per target and exposes partial coverage", () => {
@@ -137,6 +210,21 @@ test("pending review materializes a visible tool card for ExecutionCapsule", () 
   assert.match(source, /status: "pending_review",\s*toolStatus: "pending"/);
   assert.match(source, /taskFlow: \[\.\.\.s\.taskFlow, pendingBlock\]/);
   assert.match(reviewSource, /pendingReviewTaskId: taskId/);
+  assert.match(
+    reviewSource,
+    /const reviewOwner = \{[\s\S]*toolCallId: reviewToolCallId \|\| undefined,[\s\S]*toolName,[\s\S]*target: reviewTarget,[\s\S]*block\.toolStatus !== "running"[\s\S]*isExactPendingToolReviewOwner\(block, reviewOwner\)/,
+  );
+  assert.doesNotMatch(
+    reviewSource,
+    /if \(reviewToolCallId[^\n]*return true;[\s\S]{0,180}block\.toolStatus === "running"/,
+  );
+  assert.match(
+    reviewSource,
+    /const exactReviewOwner = \{ \.\.\.reviewOwner, taskId \};[\s\S]*isExactPendingToolReviewOwner\(block, exactReviewOwner\)[\s\S]*\? updatePendingBlock\(block\)/,
+  );
+  assert.match(reviewSource, /target: reviewTarget,[\s\S]*message: pendingMessage/);
+  assert.doesNotMatch(reviewSource, /target: block\.target \|\| reviewTarget/);
+  assert.doesNotMatch(reviewSource, /message: block\.message \|\| pendingMessage/);
   assert.match(reviewSource, /type: "run\.paused"[\s\S]*reason: "tool_permission"/);
   assert.match(reviewSource, /const reviewSettlement = createAbortableReviewSettlement\(\{/);
   assert.match(reviewSource, /pendingReviewResolve: reviewSettlement\.resolve/);
@@ -241,7 +329,7 @@ test("composer waits for durable turn admission before clearing the submitted dr
   assert.match(handler, /useCallback\(async \(\) =>/);
   assert.match(
     handler,
-    /const accepted = await Promise\.resolve\(onSendMessage\(textToSend, imagesToSend, \{[\s\S]*workspaceComposerIntentSnapshot:[\s\S]*mainModeKey: selectedMainModeKey,[\s\S]*lockedComposerIntent: lockedIntentToConsume/,
+    /const accepted = await Promise\.resolve\(onSendMessage\(textToSend, imagesToSend, \{[\s\S]*workspaceComposerIntentSnapshot:[\s\S]*mainModeKey: selectedMainModeKey,[\s\S]*lockedComposerIntent: lockedIntentToConsume,[\s\S]*subagentPreference: preferSubagents \? "preferred" : "unspecified"/,
   );
   assert.match(handler, /if \(accepted !== true\) \{\s*return;/);
   assert.ok(
@@ -279,14 +367,58 @@ test("workspace Composer persists its exact intent snapshot as dispatch hints", 
   );
 });
 
-test("desktop permission review is explicitly per-call in the ChatArea capsule", () => {
+test("workspace FIFO dispatch carries the captured subagent preference into Turn intake", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const dispatchStart = source.indexOf("dispatchNextWorkspaceInstruction: (expectedSessionKey) => {");
+  const dispatchEnd = source.indexOf("\n  setAgentStatus:", dispatchStart);
+  const dispatcher = source.slice(dispatchStart, dispatchEnd);
+  const sendStart = source.indexOf("sendMessage: (text: string", dispatchEnd);
+  const sendMessage = source.slice(sendStart);
+
+  assert.notEqual(dispatchStart, -1);
+  assert.ok(dispatchEnd > dispatchStart);
+  assert.match(
+    dispatcher,
+    /typeof hints\.subagentPreference === "string"[\s\S]*normalizeSubagentDelegationPreference\(hints\.subagentPreference\)/,
+  );
+  assert.match(
+    dispatcher,
+    /subagentPreferenceOverride: hintedSubagentPreference/,
+  );
+  assert.notEqual(sendStart, -1);
+  assert.match(
+    sendMessage,
+    /prepareSubmitTurnDraft\(\{[\s\S]*subagentPreference: options\?\.subagentPreferenceOverride/,
+  );
+});
+
+test("desktop and destructive permission reviews are explicitly per-call and show final evidence", () => {
   const chatSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
   const capsuleSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ExecutionCapsule.tsx"), "utf8");
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
 
   assert.match(chatSource, /permissionRisk=\{permissionActionRequest\?\.risk\}/);
-  assert.match(capsuleSource, /permissionRisk === "desktop_control"/);
-  assert.match(capsuleSource, /!desktopControlRequiresPerCallApproval && \(/);
-  assert.match(capsuleSource, /真实桌面控制每次只能单独审批/);
+  assert.match(chatSource, /permissionTarget=\{permissionActionRequest\?\.target\}/);
+  assert.match(chatSource, /permissionArgumentDisclosure=\{pendingToolArgumentDisclosure\}/);
+  assert.match(
+    chatSource,
+    /isExactPendingToolReviewOwner\(block, \{[\s\S]*toolCallId: permissionActionRequest\.toolCallId,[\s\S]*toolName: permissionActionRequest\.toolName,[\s\S]*target: permissionActionRequest\.target/,
+  );
+  assert.match(chatSource, /permissionRisk=\{blockPermissionIdentity \? permissionActionRequest\?\.risk : undefined\}/);
+  assert.match(capsuleSource, /requiresPerCallToolPermissionApproval\(permissionRisk\)/);
+  assert.match(capsuleSource, /execution-capsule-tool-review-risk/);
+  assert.match(capsuleSource, /execution-capsule-tool-review-target/);
+  assert.match(capsuleSource, /execution-capsule-tool-review-argument/);
+  assert.match(capsuleSource, /!requiresPerCallApproval && \(/);
+  assert.match(storeSource, /tool_permission_session_approval_blocked/);
+  assert.match(
+    storeSource,
+    /const reviewOwner = \{[\s\S]*toolCallId: request\.toolCallId,[\s\S]*toolName: request\.toolName,[\s\S]*target: request\.target,[\s\S]*taskFlow: s\.taskFlow\.map\(\(task\) =>\s*isExactPendingToolReviewOwner\(task, reviewOwner\)/,
+  );
+  assert.match(
+    storeSource,
+    /rejectToolAction:[\s\S]*taskFlow: s\.taskFlow\.map\(\(t\) =>\s*isExactPendingToolReviewOwner\(t, reviewOwner\)/,
+  );
 });
 
 test("chat rendering keeps substantive intermediate conclusions out of process archive", () => {
@@ -363,14 +495,17 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(source, /const gainedDurableExecutionEvidence = nextLedger !== currentLedger/);
   assert.match(source, /gainedDurableExecutionEvidence \? \{ planAutoResumeCount: 0 \} : \{\}/);
   assert.match(source, /reconcilePlanTaskCompletion/);
-  assert.match(source, /const unownedEntry = createPlanExecutionEvidenceEntry/);
+  assert.match(
+    source,
+    /const unownedEntry = canRecordPlanExecutionEvidenceForTool\(\{[\s\S]*?catalogIdentity: meta\?\.catalogIdentity,[\s\S]*?hasObservedDiff: !!completedDiff,[\s\S]*?\}\)\s*\? createPlanExecutionEvidenceEntry/,
+  );
   assert.match(source, /const operationOutcome = classifyCommandResultOutcome/);
   assert.match(source, /const operationRunning = operationOutcome === "running"/);
   assert.match(source, /const operationStatus = operationFailed \? "failed" : "done"/);
   assert.match(source, /resolvePlanExecutionEvidenceIdentity\(\{[\s\S]*?record,[\s\S]*?preferredPlanTaskId/);
-  const lifecycleMissReturn = source.indexOf("if (existingIndex < 0) return evidencePatch", evidenceCreation);
+  const lifecycleMissBranch = source.indexOf("if (existingIndex < 0) {", evidenceCreation);
   const evidenceAppend = source.indexOf("appendPlanEvidenceEntry", evidenceCreation);
-  assert.ok(evidenceAppend > evidenceCreation && evidenceAppend < lifecycleMissReturn);
+  assert.ok(evidenceAppend > evidenceCreation && evidenceAppend < lifecycleMissBranch);
   assert.ok(internalFeedbackGuard > onToolDoneStart);
   assert.ok(
     evidenceCreation > internalFeedbackGuard,
@@ -409,11 +544,11 @@ test("onToolError records only explicit executor failures in the evidence ledger
     onToolError,
     /shouldRecordPlanExecutionFailure\(meta\)\s*\? createPlanExecutionFailureEntry/,
   );
-  assert.match(onToolError, /const evidencePatch = failureEntry\s*\?/);
+  assert.match(onToolError, /const evidencePatch = failureEntry \|\| mutationEntry\s*\?/);
   assert.match(onToolError, /if \(meta\?\.internalFeedback === true\)[\s\S]*return;/);
   assert.match(
     orchestratorSource,
-    /catch \(err\)[\s\S]*callbacks\.onToolError\(tc\.name, target, errorMsg, \{\s*toolCallId: tc\.id,\s*failureKind: "actual",/,
+    /catch \(err\)[\s\S]*callbacks\.onToolError\(tc\.name, target, errorMsg, \{\s*toolCallId: tc\.id,\s*executionName,[\s\S]{0,260}failureKind: "actual",/,
   );
 });
 
@@ -1377,6 +1512,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
   const toolActivityTrackingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolActivityTracking.ts"), "utf8");
+  const toolResultEffectSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolResultEffect.ts"), "utf8");
   const toolFeedbackSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"), "utf8");
   const toolIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"), "utf8");
   const toolCallExecutionPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"), "utf8");
@@ -1403,7 +1539,8 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(toolActivityTrackingSource, /parseToolFeedbackEnvelope/);
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_op"/);
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_effect_mutation"/);
-  assert.match(toolActivityTrackingSource, /isNoOpToolFeedback/);
+  assert.match(toolActivityTrackingSource, /hasVerifiedWorkspaceMutationEffect/);
+  assert.match(toolResultEffectSource, /isNoOpToolFeedback/);
   assert.match(toolFeedbackSource, /already matched requested content/);
   assert.match(toolActivityTrackingSource, /classifyCommandResultOutcome/);
   assert.match(toolActivityTrackingSource, /browserResultLooksSuccessful/);
@@ -1411,7 +1548,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(toolActivityTrackingSource, /export function isEditProgressResult/);
   assert.match(toolActivityTrackingSource, /export function isVerificationEvidenceResult/);
   assert.match(orchestrator, /export function isProjectSourceWriteResult/);
-  assert.match(orchestrator, /"noOp"\\s\*:\\s\*true\|NO_EFFECT_MUTATION/);
+  assert.match(orchestrator, /hasVerifiedWorkspaceMutationEffect/);
   assert.match(workflowEngine, /getExecutionConsentGranted/);
   assert.match(workflowEngine, /currentTurnExecutionConsent/);
 });

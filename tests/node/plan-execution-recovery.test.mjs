@@ -472,7 +472,29 @@ const {
   buildPlanClosureEvidenceRecoveryPrompt,
   handlePlanNoToolRecovery,
   resolvePlanNoToolRecoveryDecision,
+  selectPlanMaterializationSourceText,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planNoToolRecovery.ts"));
+
+test("structured Plan materialization keeps the raw proposal instead of the display-trimmed prefix", () => {
+  const streamText = [
+    "简短说明。",
+    "<proposed_plan>",
+    "# 完整修复计划",
+    "- 修改 src/main.js 的文件打开事件。",
+    "- 修复新建文档标题状态。",
+    "</proposed_plan>",
+  ].join("\n");
+  assert.equal(selectPlanMaterializationSourceText({
+    hasStructuredProposal: true,
+    streamText,
+    sourceVisibleText: "简短说明。",
+  }), streamText);
+  assert.equal(selectPlanMaterializationSourceText({
+    hasStructuredProposal: false,
+    streamText,
+    sourceVisibleText: "可见的非结构化计划。",
+  }), "可见的非结构化计划。");
+});
 const {
   handlePlanQualityRecoveryAfterVisibleMaterialization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));

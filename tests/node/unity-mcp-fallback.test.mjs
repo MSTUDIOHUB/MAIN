@@ -68,6 +68,26 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/unityDiagnostics.ts"),
 );
+const { formatMcpToolCallResult } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/mcpClient.ts"),
+);
+
+test("MCP CallToolResult isError cannot cross the adapter as a success", () => {
+  assert.throws(
+    () => formatMcpToolCallResult("manage_script", {
+      isError: true,
+      content: [{ type: "text", text: "script creation failed" }],
+    }),
+    /MCP_TOOL_ERROR\[manage_script\].*script creation failed/,
+  );
+  assert.equal(
+    formatMcpToolCallResult("manage_script", {
+      isError: false,
+      content: [{ type: "text", text: "created" }],
+    }),
+    "created",
+  );
+});
 
 test("game engine MCP servers stay out of unrelated workspaces", () => {
   const unityServer = { name: "unityMCP", url: "http://localhost:8080/mcp" };

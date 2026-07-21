@@ -10,6 +10,7 @@ import {
   logAgentEvent,
 } from "../../orchestrator";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
+import { hasCompletedToolExecution } from "../../toolResultEffect";
 
 export const UNITY_MCP_STRICT_RETRY_FORCED_TOOLS = ["read_console", "set_active_instance"] as const;
 
@@ -161,7 +162,7 @@ export function resolveUnityMcpForcedConsoleResult(input: {
   if (!readConsoleResult) {
     const hasSuccessfulReadOnlyActivity = results.some(
       (result) =>
-        !result.isError &&
+        hasCompletedToolExecution(result) &&
         (
           result.name === "set_active_instance" ||
           UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES.has(result.name)

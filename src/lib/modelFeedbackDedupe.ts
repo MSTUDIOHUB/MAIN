@@ -67,8 +67,8 @@ export function isThinModelToolNarration(text: string): boolean {
     /\b(?:(?:confirmed|found|located|verified|proved|ruled out).{0,80}(?:root cause|cause|issue|behavior|boundary|state|result|constraint|approach|decision)|(?:root cause|conclusion|result|decision|trade-?off|constraint)\s*(?:is|was|:|shows?|indicates?))\b/i.test(raw);
   if (hasMaterialFindingOrDecision) return false;
   const futureToolNarration =
-    /(?:^|[。,，；;！!？?：:])(?:我(?:会|將|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,56}(?:读取|查看|检查|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
-    /(?:continuingto|i(?:'|’)llread|iwillread|iread|readcomplete|searchcomplete|runningcommand)/i.test(normalized);
+    /(?:^|[。,，；;！!？?：:])(?:我(?:会|將|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,56}(?:读取|查看|检查|搜索|调查|执行|运行|调用|写入|修改|修复|替换|打补丁|验证|整理|完成)/.test(normalized) ||
+    /(?:continuingto|(?:letme|i(?:'|’)?ll|iwill|i(?:'|’)?mgoingto).{0,72}(?:read|inspect|check|search|run|execute|call|write|edit|modify|fix|patch|replace|validate)|iread|readcomplete|searchcomplete|runningcommand)/i.test(normalized);
   if (futureToolNarration) return true;
   if (isSubstantiveModelFeedback(raw)) return false;
   return /(?:已读取|已搜索|已执行|读取完成|搜索完成|命令完成|工具调用完成)/i.test(normalized);

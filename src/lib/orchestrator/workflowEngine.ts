@@ -21,7 +21,10 @@ import {
   compactThoughtContentForPersist,
   pickProcessAssistantText,
 } from "../thoughtCompaction";
-import { resolveStreamingAssistantDisplay } from "../streamDisplayPolicy";
+import {
+  resolveStreamingAssistantDisplay,
+  shouldProjectStreamingAssistantToCapsule,
+} from "../streamDisplayPolicy";
 import {
   makeTurnRuntimePhase,
   normalizeTurnRuntimePhase,
@@ -39,7 +42,10 @@ import {
   type ProviderCompatibilityRuntimeLaneState,
 } from "../sessionTypes";
 import type { TaskBlock } from "../taskTypes";
-import { stripAssistantPublicProgress } from "../assistantPublicProgress";
+import {
+  buildPublicAssistantProgressIdentity,
+  stripAssistantPublicProgress,
+} from "../assistantPublicProgress";
 import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
@@ -92,7 +98,7 @@ import { generateId } from "../utils";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
-import type { ToolErrorLifecycleMeta } from "./types";
+import type { ToolCatalogIdentity, ToolErrorLifecycleMeta } from "./types";
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
@@ -123,7 +129,10 @@ import {
   type PendingPlanToolPermissionInvalidation,
   type UserChoiceActionRequest,
 } from "../actionRequest";
-import { buildToolPermissionActionRequest } from "../pendingToolReview";
+import {
+  buildToolPermissionActionRequest,
+  isExactPendingToolReviewOwner,
+} from "../pendingToolReview";
 import { createAbortableReviewSettlement } from "../actionReviewSettlement";
 import {
   buildPlanApprovalIdentity,
@@ -168,6 +177,7 @@ import {
 } from "../executeRecoveryTools";
 import { scopeExecutionEvidenceLedger } from "../verificationEvidence";
 import { isNoOpToolFeedback } from "../toolFeedbackEnvelope";
+import { canRecordPlanExecutionEvidenceForTool } from "../toolResultEffect";
 import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
 import {
   isThinModelToolNarration,
@@ -1060,15 +1070,6 @@ export class WorkflowEngine {
           meta,
         });
         if (index >= 0) return index;
-      }
-
-      const toolCallId = String(meta?.toolCallId || "").trim();
-      if (!toolCallId) return -1;
-      for (let index = taskFlow.length - 1; index >= 0; index -= 1) {
-        const block = taskFlow[index];
-        if (block?.type !== "tool") continue;
-        if (!allowedStatuses.includes(String(block.toolStatus || ""))) continue;
-        if (String(block.toolCallId || block.executionId || "") === toolCallId) return index;
       }
       return -1;
     };
@@ -2001,7 +2002,33 @@ export class WorkflowEngine {
             } else {
               const blockId = sessionGet()._nextTaskId();
               context.currentStreamingBlockId = blockId;
-              appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
+              const capsuleActivityIdentity = shouldProjectStreamingAssistantToCapsule({
+                workflowMode: sessionGet().config.workflowMode,
+                runIntent: effectiveRunIntent,
+              })
+                ? buildPublicAssistantProgressIdentity({
+                    kind: "capsule_activity",
+                    sessionKey: runSessionKey,
+                    turnId,
+                    displayTurnId: toolDisplayTurnId,
+                    runId: activeRuntimeRunIdentity.runId,
+                    parentRunId: activeRuntimeRunIdentity.parentRunId,
+                  })
+                : undefined;
+              appendTurnBlock({
+                id: blockId,
+                turnId: toolDisplayTurnId,
+                type: "agent",
+                content: remainingAgent,
+                streaming: true,
+                ...(capsuleActivityIdentity
+                  ? {
+                      hiddenProcess: false,
+                      visibility: "user_progress" as const,
+                      publicProgress: capsuleActivityIdentity,
+                    }
+                  : {}),
+              });
             }
           } else {
             const blockId = context.currentStreamingBlockId;
@@ -2477,6 +2504,15 @@ export class WorkflowEngine {
                 visibility: meta.visibility,
               }
             : {};
+          const settleAssistantPresentation = (block: TaskBlock): TaskBlock => {
+            if (block.type !== "agent") return block;
+            const keepsLiveCapsuleActivity =
+              block.visibility === "user_progress" &&
+              block.publicProgress?.kind === "capsule_activity";
+            return keepsLiveCapsuleActivity
+              ? block
+              : stripAssistantPublicProgress(block);
+          };
 
           // Merge answer/progress block. When this text precedes tool calls, close
           // the visible block but keep the overall run active for tool execution
@@ -2505,7 +2541,14 @@ export class WorkflowEngine {
             } else {
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
+                  ? settleAssistantPresentation({
+                      ...t,
+                      content: visibleText,
+                      streaming: false,
+                      options: replyOptions,
+                      choiceRequest: choiceRequestIdentity,
+                      ...assistantPresentationPatch,
+                    } as TaskBlock)
                   : t
               );
             }
@@ -2531,7 +2574,14 @@ export class WorkflowEngine {
               const blockId = existingAgentBlock.id;
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
+                  ? settleAssistantPresentation({
+                      ...t,
+                      content: visibleText,
+                      streaming: false,
+                      options: replyOptions,
+                      choiceRequest: choiceRequestIdentity,
+                      ...assistantPresentationPatch,
+                    } as TaskBlock)
                   : t
               );
             } else {
@@ -2640,18 +2690,25 @@ export class WorkflowEngine {
         });
       },
 
-      onToolExecuting: (toolName: string, target: string, diffPreview?: any, meta?: { toolCallId?: string }) => {
+      onToolExecuting: (
+        toolName: string,
+        target: string,
+        diffPreview?: any,
+        meta?: { toolCallId?: string; executionName?: string },
+      ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
+        const executionName = String(meta?.executionName || toolName).trim() || toolName;
         const isInternalPlanArtifactMutation =
           isUnapprovedPlanRuntime() &&
-          (toolName === "write_file" || toolName === "replace_in_file") &&
+          (executionName === "write_file" || executionName === "replace_in_file") &&
           detectPlanArtifactKind(target) !== null;
         logStoreEvent("tool_start", {
           turnId,
           sessionKey: runSessionKey,
           workspace: runWorkspace || null,
           toolName,
+          executionName,
           executionId,
         });
 
@@ -2687,13 +2744,13 @@ export class WorkflowEngine {
 
         const blockId = sessionGet()._nextTaskId();
         const turnPhase = deriveTurnRuntimePhaseForTool({
-          toolName,
+          toolName: executionName,
           target,
           language: phaseLanguage,
           status: "running",
         });
         const progress = buildToolProgressNarration({
-          toolName,
+          toolName: executionName,
           target,
           language: phaseLanguage,
           status: "running",
@@ -2702,9 +2759,9 @@ export class WorkflowEngine {
           workflowMode: sessionGet().config.workflowMode,
           sourceToolCallIds: executionId ? [executionId] : [],
         });
-        const diff = shouldAttachToolDiffPreview(toolName, target, diffPreview) ? diffPreview : undefined;
+        const diff = shouldAttachToolDiffPreview(executionName, target, diffPreview) ? diffPreview : undefined;
         const intentSummary = deriveToolIntentSummary({
-          toolName,
+          toolName: executionName,
           target,
           language: phaseLanguage,
           status: "running",
@@ -2728,6 +2785,7 @@ export class WorkflowEngine {
             turnId: block.turnId || toolDisplayTurnId,
             type: "tool",
             toolName,
+            executionName,
             target,
             status: "running",
             toolStatus: "running",
@@ -2778,10 +2836,13 @@ export class WorkflowEngine {
           internalFeedback?: boolean;
           qualityGateReason?: string | null;
           evidenceResult?: string;
+          executionName?: string;
+          catalogIdentity?: ToolCatalogIdentity;
         },
       ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
+        const executionName = String(meta?.executionName || toolName).trim() || toolName;
         const resultText = String(result || "");
         if (meta?.internalFeedback === true) {
           logStoreEvent("tool_result_internal_feedback", {
@@ -2789,6 +2850,7 @@ export class WorkflowEngine {
             sessionKey: runSessionKey,
             workspace: runWorkspace || null,
             toolName,
+            executionName,
             target,
             executionId,
             qualityGateReason: meta.qualityGateReason || null,
@@ -2815,11 +2877,11 @@ export class WorkflowEngine {
           });
           return;
         }
-        const completedDiff = shouldAttachToolDiffPreview(toolName, target, meta?.diff) ? meta?.diff : undefined;
+        const completedDiff = shouldAttachToolDiffPreview(executionName, target, meta?.diff) ? meta?.diff : undefined;
         const evidenceResultText = typeof meta?.evidenceResult === "string"
           ? meta.evidenceResult
           : resultText;
-        const operationOutcome = classifyCommandResultOutcome(toolName, evidenceResultText);
+        const operationOutcome = classifyCommandResultOutcome(executionName, evidenceResultText);
         const operationFailed = operationOutcome === "failed";
         const operationRunning = operationOutcome === "running";
         // The tool call itself finished even when it reported an already-live
@@ -2827,28 +2889,37 @@ export class WorkflowEngine {
         // the tool card running would make later lifecycle matching ambiguous.
         const operationStatus = operationFailed ? "failed" : "done";
         const operationToolStatus = operationFailed ? "failed" : "executed";
+        const workspaceEffect = completedDiff
+          ? operationFailed ? "partial" as const : "verified" as const
+          : undefined;
         const noOp = isNoOpToolFeedback(evidenceResultText);
-        const unownedEntry = createPlanExecutionEvidenceEntry({
-          toolName,
-          target,
-          result: evidenceResultText,
-          noOp,
-          diff: completedDiff,
-          transactionId: turnId,
-          runId: activeRuntimeRunIdentity.runId,
-        });
+        const unownedEntry = canRecordPlanExecutionEvidenceForTool({
+          executionName,
+          catalogIdentity: meta?.catalogIdentity,
+          hasObservedDiff: !!completedDiff,
+        })
+          ? createPlanExecutionEvidenceEntry({
+              toolName: executionName,
+              target,
+              result: evidenceResultText,
+              noOp,
+              diff: completedDiff,
+              transactionId: turnId,
+              runId: activeRuntimeRunIdentity.runId,
+            })
+          : null;
         const entry = unownedEntry
           ? { ...unownedEntry, ...resolveCurrentPlanEvidenceIdentity(unownedEntry) }
           : null;
         const observationSummary = summarizeToolObservation({
-          toolName,
+          toolName: executionName,
           target,
           result: resultText,
           language: phaseLanguage,
           noOp,
         });
         const progress = buildToolProgressNarration({
-          toolName,
+          toolName: executionName,
           target,
           language: phaseLanguage,
           status: operationStatus,
@@ -2870,11 +2941,13 @@ export class WorkflowEngine {
           sessionKey: runSessionKey,
           workspace: runWorkspace || null,
           toolName,
+          executionName,
           executionId,
           resultChars: result?.length ?? 0,
           isError: operationFailed,
         });
 
+        const synthesizedDoneBlockId = sessionGet()._nextTaskId();
         sessionSet((s: any) => {
           const existingIndex = findCurrentToolLifecycleBlockIndex(
             s.taskFlow,
@@ -2910,7 +2983,52 @@ export class WorkflowEngine {
             // pivot epoch when unfinished work remains.
             ...(gainedDurableExecutionEvidence ? { planAutoResumeCount: 0 } : {}),
           };
-          if (existingIndex < 0) return evidencePatch;
+          if (existingIndex < 0) {
+            if (!completedDiff) return evidencePatch;
+            const completedPhase = deriveTurnRuntimePhaseForTool({
+              toolName: executionName,
+              target,
+              language: phaseLanguage,
+              status: operationStatus,
+            });
+            const completedBlock = attachRuntimePhase({
+              id: synthesizedDoneBlockId,
+              turnId: toolDisplayTurnId,
+              type: "tool",
+              toolName,
+              executionName,
+              target,
+              status: operationStatus,
+              toolStatus: operationToolStatus,
+              toolCallId: executionId,
+              executionId,
+              output: executionName === "apply_patch" ? evidenceResultText : resultText,
+              message: resultText,
+              diff: completedDiff,
+              workspaceEffect,
+              intentSummary: deriveToolIntentSummary({
+                toolName: executionName,
+                target,
+                language: phaseLanguage,
+                status: operationStatus,
+                toolStatus: operationToolStatus,
+              }),
+              why: progress.why,
+              evidence: progress.evidence,
+              observationSummary,
+              turnPhase: completedPhase,
+            } as any, completedPhase);
+            return {
+              ...evidencePatch,
+              taskFlow: [...s.taskFlow, completedBlock],
+              conversationTurns: s.conversationTurns.map((turn: any) =>
+                (turn.id === turnId || turn.id === toolDisplayTurnId) &&
+                !turn.blockIds.includes(synthesizedDoneBlockId)
+                  ? { ...turn, blockIds: [...turn.blockIds, synthesizedDoneBlockId] }
+                  : turn
+              ),
+            };
+          }
 
           return {
             ...evidencePatch,
@@ -2918,7 +3036,7 @@ export class WorkflowEngine {
               if (index !== existingIndex) return block;
               const completedPhase = withTurnRuntimePhaseStatus(
                 block.turnPhase || deriveTurnRuntimePhaseForTool({
-                  toolName,
+                  toolName: executionName,
                   target,
                   language: phaseLanguage,
                   status: operationStatus,
@@ -2928,16 +3046,18 @@ export class WorkflowEngine {
               );
               return {
                 ...block,
+                executionName,
                 status: operationStatus,
                 toolStatus: operationToolStatus,
                 // Preserve the exact structured apply_patch evidence (not its
                 // UI-truncated display) so terminal summaries retain every
                 // changed source/destination path.
-                output: toolName === "apply_patch" ? evidenceResultText : resultText,
+                output: executionName === "apply_patch" ? evidenceResultText : resultText,
                 message: resultText,
-                ...(completedDiff ? { diff: completedDiff } : block.diff ? { diff: block.diff } : {}),
+                diff: completedDiff,
+                workspaceEffect,
                 intentSummary: block.intentSummary || deriveToolIntentSummary({
-                  toolName,
+                  toolName: executionName,
                   target,
                   language: phaseLanguage,
                   status: operationStatus,
@@ -2981,6 +3101,7 @@ export class WorkflowEngine {
       ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
+        const executionName = String(meta?.executionName || toolName).trim() || toolName;
         const errorText = String(error || "");
         const failureKind = meta?.failureKind || "policy";
         if (meta?.internalFeedback === true) {
@@ -2989,6 +3110,7 @@ export class WorkflowEngine {
             sessionKey: runSessionKey,
             workspace: runWorkspace || null,
             toolName,
+            executionName,
             target,
             executionId,
             failureKind,
@@ -3018,13 +3140,13 @@ export class WorkflowEngine {
           return;
         }
         const observationSummary = summarizeToolObservation({
-          toolName,
+          toolName: executionName,
           target,
           result: errorText,
           language: phaseLanguage,
         });
         const progress = buildToolProgressNarration({
-          toolName,
+          toolName: executionName,
           target,
           language: phaseLanguage,
           status: "failed",
@@ -3036,9 +3158,29 @@ export class WorkflowEngine {
           hypothesisStatus: "blocked",
           sourceToolCallIds: executionId ? [executionId] : [],
         });
+        const failedMutationDiff = shouldAttachToolDiffPreview(executionName, target, meta?.diff)
+          ? meta?.diff
+          : undefined;
+        const unownedMutationEntry = failedMutationDiff
+          ? createPlanExecutionEvidenceEntry({
+              toolName: executionName,
+              target: String(failedMutationDiff.path || target || "").trim(),
+              result: errorText,
+              diff: failedMutationDiff,
+              transactionId: turnId,
+              runId: activeRuntimeRunIdentity.runId,
+            })
+          : null;
+        const mutationEntry = unownedMutationEntry
+          ? {
+              ...unownedMutationEntry,
+              observationStatus: "failed" as const,
+              ...resolveCurrentPlanEvidenceIdentity(unownedMutationEntry),
+            }
+          : null;
         const unownedFailureEntry = shouldRecordPlanExecutionFailure(meta)
           ? createPlanExecutionFailureEntry({
-              toolName,
+              toolName: executionName,
               target,
               error: errorText,
               transactionId: turnId,
@@ -3056,14 +3198,17 @@ export class WorkflowEngine {
           sessionKey: runSessionKey,
           workspace: runWorkspace || null,
           toolName,
+          executionName,
           executionId,
           resultChars: error?.length ?? 0,
           isError: true,
           failureKind,
           failureKindExplicit: meta?.failureKind != null,
           ledgerRecorded: failureEntry != null,
+          mutationLedgerRecorded: mutationEntry != null,
         });
 
+        const synthesizedFailureBlockId = sessionGet()._nextTaskId();
         sessionSet((s: any) => {
           const existingIndex = findCurrentToolLifecycleBlockIndex(
             s.taskFlow,
@@ -3072,12 +3217,13 @@ export class WorkflowEngine {
             ["pending", "running", "failed"],
             lifecycleMeta,
           );
-          const evidencePatch = failureEntry
+          const evidencePatch = failureEntry || mutationEntry
             ? (() => {
-                const nextLedger = appendPlanEvidenceEntry(
+                const mutationLedger = appendPlanEvidenceEntry(
                   s.planExecutionEvidenceLedger || [],
-                  failureEntry,
+                  mutationEntry,
                 );
+                const nextLedger = appendPlanEvidenceEntry(mutationLedger, failureEntry);
                 const nextTasks = reconcilePlanTaskCompletion(
                   s.planTasks || [],
                   s.planTasks || [],
@@ -3098,14 +3244,59 @@ export class WorkflowEngine {
                 };
               })()
             : {};
-          if (existingIndex < 0) return evidencePatch;
+          if (existingIndex < 0) {
+            const failedPhase = deriveTurnRuntimePhaseForTool({
+              toolName: executionName,
+              target,
+              language: phaseLanguage,
+              status: "failed",
+            });
+            const failedBlock = attachRuntimePhase({
+              id: synthesizedFailureBlockId,
+              turnId: toolDisplayTurnId,
+              type: "tool",
+              toolName,
+              executionName,
+              target,
+              status: "error",
+              toolStatus: "failed",
+              toolCallId: executionId,
+              executionId,
+              output: errorText,
+              message: errorText,
+              ...(failedMutationDiff
+                ? { diff: failedMutationDiff, workspaceEffect: "partial" as const }
+                : {}),
+              intentSummary: deriveToolIntentSummary({
+                toolName: executionName,
+                target,
+                language: phaseLanguage,
+                status: "failed",
+                toolStatus: "failed",
+              }),
+              why: progress.why,
+              evidence: progress.evidence,
+              observationSummary,
+              turnPhase: failedPhase,
+            } as any, failedPhase);
+            return {
+              ...evidencePatch,
+              taskFlow: [...s.taskFlow, failedBlock],
+              conversationTurns: s.conversationTurns.map((turn: any) =>
+                (turn.id === turnId || turn.id === toolDisplayTurnId) &&
+                !turn.blockIds.includes(synthesizedFailureBlockId)
+                  ? { ...turn, blockIds: [...turn.blockIds, synthesizedFailureBlockId] }
+                  : turn
+              ),
+            };
+          }
           return {
             ...evidencePatch,
             taskFlow: s.taskFlow.map((block: any, index: number) => {
               if (index !== existingIndex) return block;
               const failedPhase = withTurnRuntimePhaseStatus(
                 block.turnPhase || deriveTurnRuntimePhaseForTool({
-                  toolName,
+                  toolName: executionName,
                   target,
                   language: phaseLanguage,
                   status: "failed",
@@ -3115,12 +3306,15 @@ export class WorkflowEngine {
               );
               return {
                 ...block,
+                executionName,
                 status: "error",
                 toolStatus: "failed",
                 output: errorText,
                 message: errorText,
+                diff: failedMutationDiff,
+                workspaceEffect: failedMutationDiff ? "partial" as const : undefined,
                 intentSummary: block.intentSummary || deriveToolIntentSummary({
-                  toolName,
+                  toolName: executionName,
                   target,
                   language: phaseLanguage,
                   status: "failed",
@@ -3218,13 +3412,17 @@ export class WorkflowEngine {
           enterRealPendingReviewState();
 
           const taskFlow = sessionGet().taskFlow;
+          const reviewOwner = {
+            turnIds: [turnId, toolDisplayTurnId],
+            toolCallId: reviewToolCallId || undefined,
+            toolName,
+            target: reviewTarget,
+          };
           const toolBlock = [...taskFlow]
             .reverse()
             .find((block: any) => {
-              if (block.turnId !== turnId && block.turnId !== toolDisplayTurnId) return false;
-              if (block.type !== "tool" || block.toolName !== toolName) return false;
-              if (reviewToolCallId && String(block.toolCallId || block.executionId || "") === reviewToolCallId) return true;
-              return block.toolStatus === "running" && String(block.target || "") === reviewTarget;
+              if (block.toolStatus !== "running") return false;
+              return isExactPendingToolReviewOwner(block, reviewOwner);
             });
           const taskId = toolBlock ? toolBlock.id : sessionGet()._nextTaskId();
           const pendingPhase = deriveTurnRuntimePhaseForTool({
@@ -3253,29 +3451,33 @@ export class WorkflowEngine {
               turnId: block.turnId || toolDisplayTurnId,
               type: "tool",
               toolName,
-              target: block.target || reviewTarget,
+              target: reviewTarget,
               status: "pending_review",
               toolStatus: "pending",
-              ...(reviewToolCallId ? { toolCallId: reviewToolCallId, executionId: reviewToolCallId } : {}),
-              ...(toolCall?.shellPermissionDecision ? { shellPermissionDecision: toolCall.shellPermissionDecision } : {}),
-              message: block.message || pendingMessage,
-              intentSummary: block.intentSummary || deriveToolIntentSummary({
+              toolCallId: reviewToolCallId || undefined,
+              executionId: reviewToolCallId || undefined,
+              shellPermissionDecision: toolCall?.shellPermissionDecision,
+              message: pendingMessage,
+              intentSummary: deriveToolIntentSummary({
                 toolName,
                 target: reviewTarget,
                 language: phaseLanguage,
                 status: "running",
                 toolStatus: "pending",
               }),
-              why: block.why || progress.why,
-              evidence: block.evidence || progress.evidence,
-              observationSummary: block.observationSummary || progress.observedFact,
+              why: progress.why,
+              evidence: progress.evidence,
+              observationSummary: progress.observedFact,
               turnPhase: pendingPhase,
             } as any, pendingPhase);
 
             if (toolBlock) {
+              const exactReviewOwner = { ...reviewOwner, taskId };
               return {
                 taskFlow: s.taskFlow.map((block: any) =>
-                  block.id === taskId ? updatePendingBlock(block) : block
+                  isExactPendingToolReviewOwner(block, exactReviewOwner)
+                    ? updatePendingBlock(block)
+                    : block
                 ),
               };
             }

@@ -68,6 +68,14 @@ const {
   formatToolFeedbackEnvelope,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 const {
+  isProjectSourceWriteResult,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
+const {
+  hasObservedWorkspaceMutationEffect,
+  hasVerifiedWorkspaceMutationEffect,
+  mayHaveWorkspaceSideEffects,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolResultEffect.ts"));
+const {
   buildBrowserValidationCacheSignature,
   buildBrowserValidationFailureContent,
   isBrowserValidationResultCacheable,
@@ -79,6 +87,7 @@ function result(overrides) {
   return {
     toolCallId: "call_1",
     name: "replace_in_file",
+    catalogIdentity: { source: "built_in", canonicalName: "replace_in_file" },
     target: "src/App.tsx",
     content: "patched file",
     isError: false,
@@ -197,6 +206,49 @@ test("tool activity tracking excludes no-op cached and plan-artifact writes from
     target: ".MAIN/plans/plan.md",
     content: "PLAN_ARTIFACT_WRITE path: .MAIN/plans/plan.md",
   }), { path: ".MAIN/plans/plan.md" }), false);
+
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    lifecycleState: "declined",
+    content: "User rejected the tool call. Try a different approach.",
+  }), { path: "src/App.tsx" }), false, "review rejection is not execution evidence");
+});
+
+test("dynamic script inspection cannot masquerade as a project source write", () => {
+  const inspected = result({
+    toolCallId: "call_inspect",
+    name: "manage_script",
+    target: "Assets/Scripts/Player.cs",
+    content: "Inspected Player.cs",
+    lifecycleState: "completed",
+  });
+  assert.equal(
+    isProjectSourceWriteResult(inspected, { action: "inspect", path: "Assets/Scripts", name: "Player" }),
+    false,
+  );
+
+  const created = result({
+    toolCallId: "call_create",
+    name: "manage_script",
+    target: "Assets/Scripts/Player.cs",
+    content: "Created Player.cs",
+    lifecycleState: "completed",
+  });
+  assert.equal(
+    isProjectSourceWriteResult(created, { action: "create", path: "Assets/Scripts", name: "Player" }),
+    false,
+    "external success prose without a runtime-observed diff is not a durable write",
+  );
+  assert.equal(
+    isProjectSourceWriteResult({
+      ...created,
+      executionAttempted: true,
+      workspaceEffect: "verified",
+      workspaceMutationEvidence: {
+        changedPaths: ["Assets/Scripts/Player.cs"],
+      },
+    }, { action: "create", path: "Assets/Scripts", name: "Player" }),
+    true,
+  );
 });
 
 test("tool activity tracking counts only successful commands browser checks and source edits as execution evidence", () => {
@@ -285,6 +337,100 @@ test("tool activity records a nonzero command as failed even when transport comp
     isError: false,
   }));
   assert.equal(activities.at(-1).status, "called");
+});
+
+test("declined and no-effect mutations cannot become successful mutation activity", () => {
+  const activities = [];
+  const declined = result({
+    lifecycleState: "declined",
+    content: "User rejected the tool call. Try a different approach.",
+  });
+  rememberToolActivity(activities, declined);
+  assert.equal(activities.at(-1).status, "failed");
+  assert.equal(isEditProgressResult(declined), false);
+
+  const noEffect = result({
+    lifecycleState: "completed",
+    content: JSON.stringify({ success: true, noOp: true }),
+  });
+  rememberToolActivity(activities, noEffect);
+  assert.equal(activities.at(-1).status, "called");
+  assert.equal(isEditProgressResult(noEffect), false);
+});
+
+test("mutation activity carries runtime-observed truth instead of inferring from the tool name", () => {
+  const activities = [];
+  rememberToolActivity(activities, result({
+    toolCallId: "external-no-diff",
+    name: "manage_script",
+    executionName: "manage_script",
+    catalogIdentity: { source: "mcp", canonicalName: "mcp__unity__manage_script__1234" },
+    target: "Assets/Scripts/Player.cs",
+    content: "Created Player.cs",
+    executionAttempted: true,
+  }), { args: { action: "create", path: "Assets/Scripts", name: "Player" } });
+  assert.equal(activities.at(-1).status, "called");
+  assert.equal(activities.at(-1).mutationObserved, false);
+
+  rememberToolActivity(activities, result({
+    toolCallId: "external-with-diff",
+    name: "mcp__unity__manage_script__1234",
+    executionName: "manage_script",
+    catalogIdentity: { source: "mcp", canonicalName: "mcp__unity__manage_script__1234" },
+    target: "Assets/Scripts/Player.cs",
+    content: "Created Player.cs",
+    executionAttempted: true,
+    workspaceEffect: "verified",
+    workspaceMutationEvidence: { changedPaths: ["Assets/Scripts/Player.cs"] },
+  }), { args: { action: "create", path: "Assets/Scripts", name: "Player" } });
+  assert.equal(activities.at(-1).status, "succeeded");
+  assert.equal(activities.at(-1).mutationObserved, true);
+});
+
+test("execution success and possible workspace side effects remain orthogonal", () => {
+  const failedAfterInvocation = result({
+    name: "run_command",
+    target: "npm test",
+    content: JSON.stringify({ exitCode: 1 }),
+    isError: true,
+    lifecycleState: "failed",
+    executionAttempted: true,
+  });
+  assert.equal(hasVerifiedWorkspaceMutationEffect(failedAfterInvocation, {}), false);
+  assert.equal(mayHaveWorkspaceSideEffects(failedAfterInvocation, {}), true);
+
+  const checkedNoEffect = result({
+    content: "NO_EFFECT_MUTATION",
+    isError: true,
+    lifecycleState: "failed",
+    executionAttempted: true,
+    workspaceEffect: "none",
+  });
+  assert.equal(mayHaveWorkspaceSideEffects(checkedNoEffect, { path: "src/App.tsx" }), false);
+});
+
+test("failed partial mutations remain failed while retaining observed workspace change", () => {
+  const activities = [];
+  const failedAfterWrite = result({
+    toolCallId: "partial-write",
+    executionName: "replace_in_file",
+    executedArgs: { path: "src/App.tsx", search: "old", replace: "new" },
+    content: "Error: verification failed after write",
+    isError: true,
+    lifecycleState: "failed",
+    executionAttempted: true,
+    workspaceEffect: "partial",
+    workspaceMutationEvidence: { changedPaths: ["src/App.tsx"] },
+  });
+
+  rememberToolActivity(activities, failedAfterWrite);
+
+  assert.equal(hasObservedWorkspaceMutationEffect(failedAfterWrite), true);
+  assert.equal(hasVerifiedWorkspaceMutationEffect(failedAfterWrite), false);
+  assert.equal(toolResultCountsAsExecutionEvidence(failedAfterWrite, failedAfterWrite.executedArgs), false);
+  assert.equal(activities.at(-1).status, "failed");
+  assert.equal(activities.at(-1).mutationObserved, true);
+  assert.equal(isEditProgressResult(failedAfterWrite, failedAfterWrite.executedArgs), false);
 });
 
 test("browser validation cache ignores timeout-only retries while preserving meaningful checks", () => {
