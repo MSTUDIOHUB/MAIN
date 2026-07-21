@@ -177,6 +177,34 @@ test("tool failure signatures use semantic command outcomes and preserve PTY run
   assert.equal(state.failedToolCallCounts.has(signature), false);
 });
 
+test("declined or blocked calls cannot erase a retained failure signature", () => {
+  const state = createAgentLoopGuardRuntimeState();
+  const signature = "replace_in_file:src/App.tsx";
+  state.failedToolCallCounts.set(signature, 2);
+  const signatures = new Map([["declined-write", signature], ["blocked-write", signature]]);
+
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: signatures,
+    results: [
+      {
+        toolCallId: "declined-write",
+        name: "replace_in_file",
+        content: "User rejected the tool call",
+        isError: false,
+        lifecycleState: "declined",
+      },
+      {
+        toolCallId: "blocked-write",
+        name: "replace_in_file",
+        content: "policy blocked",
+        isError: false,
+        lifecycleState: "blocked",
+      },
+    ],
+  });
+  assert.equal(state.failedToolCallCounts.get(signature), 2);
+});
+
 test("a durable mutation starts a fresh loop-guard progress epoch", () => {
   const state = createAgentLoopGuardRuntimeState();
   state.lastNoProgressBatchSignature = "run_command:npm-test";

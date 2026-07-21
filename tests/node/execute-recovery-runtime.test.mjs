@@ -102,6 +102,57 @@ test("PTY observation policy deferral is recognized only from structured browser
   }]), null, "other browser preflight outcomes keep their own recovery policy");
 });
 
+test("a failed mutation with an observed partial effect forces a fresh target read", () => {
+  const decision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "mutation_first",
+    retainedSourceObservation: {
+      key: "stale-observation",
+      path: "src/main.js",
+      versionToken: "before-write",
+      requestSignature: "src/main.js::1-80",
+      source: "fresh",
+    },
+    results: [{
+      toolCallId: "call-partial-write",
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "Error: post-write verification failed",
+      isError: true,
+      lifecycleState: "failed",
+      workspaceEffect: "partial",
+      workspaceMutationEvidence: { changedPaths: ["src/main.js"] },
+    }],
+  });
+
+  assert.equal(decision?.reason, "mutation_partial_effect_requires_reread");
+  assert.equal(decision?.mode, "patch_recovery_read");
+  assert.equal(decision?.target, "src/main.js");
+  assert.equal(decision?.sourceObservationKey, null, "the pre-call observation is stale");
+  assert.equal(decision?.readLease?.target, "src/main.js");
+  assert.equal(decision?.readLease?.state, "available");
+  assert.equal(decision?.decisionCheckpoint.nextRequiredCapability, "targeted_read");
+  assert.equal(decision?.decisionCheckpoint.sourceObservationKey, null);
+
+  const contract = executeRecoveryTools.resolveExecuteRecoveryActionContract(decision.mode, {
+    expectedTarget: decision.target,
+    readLease: decision.readLease,
+    sourceObservationKey: decision.sourceObservationKey,
+    decisionCheckpoint: decision.decisionCheckpoint,
+  });
+  const prompt = executeRecoveryTools.buildExecuteRecoveryPrompt({
+    language: "en",
+    reason: decision.reason,
+    contract,
+    repeatedTargets: [decision.target],
+  });
+  assert.match(prompt, /observed.*failed tool already changed/i);
+  assert.match(prompt, /pre-call source is stale/i);
+  assert.match(prompt, /reread the current target now/i);
+  assert.match(prompt, /do not retry the same mutation or arguments/i);
+});
+
 test("only a policy-owned protocol boundary with durable evidence releases recovery", () => {
   const policyState = createExecuteRecoveryRuntimeState({
     workflowMode: "edit",

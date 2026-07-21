@@ -39,6 +39,9 @@ function loadTranspiledModuleSync(sourcePath) {
 const { appendToolResultsToHistory } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultHistory.ts"),
 );
+const { parseToolFeedbackEnvelope } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"),
+);
 
 function createFixture(startedIds = []) {
   const events = [];
@@ -118,6 +121,29 @@ test("unstarted internal feedback does not synthesize an orphan completion", () 
   assert.deepEqual(fixture.events, []);
 });
 
+test("unstarted external preflight results synthesize one matched lifecycle pair", () => {
+  const fixture = createFixture();
+  const result = {
+    toolCallId: "call-external-preflight",
+    name: "apply_patch",
+    target: "src/main.js",
+    content: "Error: invalid patch",
+    isError: true,
+    lifecycleState: "blocked",
+  };
+
+  appendToolResultsToHistory({ ...fixture.input, results: [result] });
+  appendToolResultsToHistory({ ...fixture.input, results: [result] });
+
+  assert.deepEqual(fixture.events.map((event) => event.type), [
+    "item.started",
+    "item.completed",
+  ]);
+  assert.equal(fixture.events[0].item.id, "call-external-preflight");
+  assert.equal(fixture.events[1].item.id, "call-external-preflight");
+  assert.equal(fixture.events[1].item.details.status, "blocked");
+});
+
 test("normal started results retain the public tool_result completion shape", () => {
   const fixture = createFixture(["call-read"]);
   appendToolResultsToHistory({
@@ -136,4 +162,60 @@ test("normal started results retain the public tool_result completion shape", ()
   assert.equal(fixture.events[0].item.details.type, "tool_result");
   assert.equal(fixture.events[0].item.details.status, "completed");
   assert.equal(fixture.events[0].item.details.text, "const ready = true;");
+});
+
+test("failed tools that changed a file tell model history to reread stale source", () => {
+  const fixture = createFixture(["call-partial-write"]);
+  appendToolResultsToHistory({
+    ...fixture.input,
+    results: [{
+      toolCallId: "call-partial-write",
+      name: "replace_in_file",
+      executionName: "replace_in_file",
+      executedArgs: { path: "src/main.js", search: "old", replace: "new" },
+      target: "src/main.js",
+      content: "Error: post-write verification failed",
+      isError: true,
+      lifecycleState: "failed",
+      executionAttempted: true,
+      workspaceEffect: "partial",
+      workspaceMutationEvidence: {
+        changedPaths: ["src/main.js"],
+      },
+    }],
+  });
+
+  const parsed = parseToolFeedbackEnvelope(fixture.messages[0].content);
+  assert.ok(parsed);
+  assert.equal(parsed.envelope.status, "failed", "the invocation remains failed");
+  assert.equal(parsed.envelope.workspace_effect, "partial");
+  assert.deepEqual(parsed.envelope.changedPaths, ["src/main.js"]);
+  assert.equal(parsed.envelope.next_action, "reread_changed_paths_before_retry");
+  assert.match(parsed.envelope.summary, /failed after changing the workspace/i);
+  assert.match(parsed.envelope.hints.join("\n"), /reread.*src\/main\.js/i);
+  assert.match(parsed.envelope.hints.join("\n"), /do not retry.*pre-call source/i);
+  assert.equal(parsed.body, "Error: post-write verification failed");
+});
+
+test("legacy tool history also preserves partial mutation recovery truth", () => {
+  const fixture = createFixture(["call-partial-legacy"]);
+  appendToolResultsToHistory({
+    ...fixture.input,
+    toolFeedbackFormat: "legacy",
+    results: [{
+      toolCallId: "call-partial-legacy",
+      name: "apply_patch",
+      target: "src/main.js",
+      content: "Error: write completed before backend disconnected",
+      isError: true,
+      lifecycleState: "failed",
+      workspaceEffect: "partial",
+      workspaceMutationEvidence: { changedPaths: ["src/main.js"] },
+    }],
+  });
+
+  assert.match(fixture.messages[0].content, /^PARTIAL_WORKSPACE_MUTATION:/);
+  assert.match(fixture.messages[0].content, /"workspace_effect":"partial"/);
+  assert.match(fixture.messages[0].content, /"next_action":"reread_changed_paths_before_retry"/);
+  assert.match(fixture.messages[0].content, /do not retry from pre-call source content/i);
 });

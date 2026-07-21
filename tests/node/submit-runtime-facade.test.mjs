@@ -53,6 +53,7 @@ const {
   buildOwnerScopedDurableSessionPatch,
   createSubmitPreRunSessionPatcher,
   createSubmitSessionRuntimeFacade,
+  preserveSubmitSessionRuntimeOwnership,
   startSubmitElapsedTimer,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitRuntimeFacade.ts"),
@@ -1050,6 +1051,60 @@ test("a recreated Session with the same runtime key cannot inherit an old facade
   assert.equal(stateRef.current.agentStatus, "idle");
   assert.equal(stateRef.current.elapsedTime, 1);
   assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].agentStatus, "idle");
+});
+
+test("ordinary snapshots preserve only the exact Session generation owner", () => {
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/run",
+      currentSessionId: 42,
+      runtimeBySessionKey: {},
+      sessionsByWorkspace: {
+        "/tmp/run": [{ id: 42, planLifecycleEpoch: "epoch-old" }],
+      },
+      currentTurnId: "turn-owner",
+      agentStatus: "running",
+      elapsedTime: 1,
+      taskFlow: [],
+    },
+  };
+  const facade = createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/run:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  facade.seedSessionRuntime();
+  const ownerToken = facade.getSessionRuntimeOwnerToken();
+  const previous = stateRef.current.runtimeBySessionKey["/tmp/run:42"];
+
+  stateRef.current = {
+    ...stateRef.current,
+    runtimeBySessionKey: {
+      ...stateRef.current.runtimeBySessionKey,
+      "/tmp/run:42": preserveSubmitSessionRuntimeOwnership(
+        previous,
+        createRuntimeFromState({ ...stateRef.current, elapsedTime: 2 }),
+        "epoch-old",
+      ),
+    },
+  };
+  assert.equal(facade.hasSessionRuntimeOwnership(ownerToken), true);
+  assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].elapsedTime, 2);
+
+  stateRef.current = {
+    ...stateRef.current,
+    runtimeBySessionKey: {
+      ...stateRef.current.runtimeBySessionKey,
+      "/tmp/run:42": preserveSubmitSessionRuntimeOwnership(
+        stateRef.current.runtimeBySessionKey["/tmp/run:42"],
+        createRuntimeFromState({ ...stateRef.current, elapsedTime: 3 }),
+        "epoch-new",
+      ),
+    },
+  };
+  assert.equal(facade.hasSessionRuntimeOwnership(ownerToken), false);
 });
 
 test("durable Session patch excludes mutable metadata returned by a save adapter", () => {

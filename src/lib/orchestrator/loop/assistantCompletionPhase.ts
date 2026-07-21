@@ -2,6 +2,7 @@ import type { MainModeKey } from "../../mainModes";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { EffectiveTurnContract } from "../../runIntent";
+import type { ToolCatalog } from "../../toolCatalog";
 import { logAgentEvent } from "../../orchestrator";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { MainThreadEventInput } from "../../turnEvents";
@@ -33,7 +34,7 @@ import type { ExecuteRecoveryMode, RecoveryReadLease } from "../../executeRecove
 import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
 import { resolveCommandEvidenceRequirements } from "../../verificationEvidence";
 import {
-  isWorkspaceMutationToolName,
+  isWorkspaceMutationToolCall,
   resolveWorkspaceMutationTargets,
 } from "../../workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
@@ -200,6 +201,7 @@ function resolveEditLocusSeed(
 
 export function resolveValidationMutationReopen(input: {
   recoveryState: ExecuteRecoveryRuntimeState;
+  toolCatalog?: Pick<ToolCatalog, "lookup"> | null;
   protocolViolation?: NormalizedStreamState["protocolViolation"];
   protocolActualTools?: string[];
   protocolActualToolCalls?: NormalizedStreamState["protocolActualToolCalls"];
@@ -223,22 +225,23 @@ export function resolveValidationMutationReopen(input: {
     input.protocolViolation !== "required_function_call_mismatch"
   ) return null;
 
-  const requestedTools = [...new Set((input.protocolActualTools || [])
-    .filter((name) => isWorkspaceMutationToolName(name)))];
-  if (requestedTools.length === 0) return null;
-
   const requestedMutationIntents = (input.protocolActualToolCalls || [])
-    .filter((call) => isWorkspaceMutationToolName(call.name))
     .flatMap((call) => {
       try {
+        const catalogResolution = input.toolCatalog?.lookup(call.name);
+        const executionName = catalogResolution?.status === "resolved"
+          ? catalogResolution.entry.executionName
+          : call.name;
         const parsed = JSON.parse(call.arguments || "{}");
         const args = parsed && typeof parsed === "object" && !Array.isArray(parsed)
           ? parsed as Record<string, unknown>
           : {};
-        const locusHash = stableEditFingerprintHash(resolveEditLocusSeed(call.name, args));
-        const targets = resolveWorkspaceMutationTargets(call.name, args);
+        if (!isWorkspaceMutationToolCall(executionName, args)) return [];
+        const locusHash = stableEditFingerprintHash(resolveEditLocusSeed(executionName, args));
+        const targets = resolveWorkspaceMutationTargets(executionName, args);
         return (targets.length > 0 ? targets : [""]).map((target) => ({
-          toolName: call.name,
+          exposedName: call.name,
+          executionName,
           target: target.replace(/\\/g, "/").trim(),
           locusHash,
         }));
@@ -246,6 +249,11 @@ export function resolveValidationMutationReopen(input: {
         return [];
       }
     });
+  // Keep provider-facing names in feedback so a retry uses the exposed
+  // protocol surface. Mutation classification, target extraction, and
+  // semantic retry identity are all owned by the canonical execution name.
+  const requestedTools = [...new Set(requestedMutationIntents.map((intent) => intent.exposedName))];
+  if (requestedTools.length === 0) return null;
   const canonicalMutationIntents = requestedMutationIntents.map((intent) => ({
     ...intent,
     target:
@@ -262,7 +270,7 @@ export function resolveValidationMutationReopen(input: {
   const requirementRef = checkpoint?.requirementRef?.trim().toLowerCase() || "";
   const semanticFingerprints = canonicalMutationIntents.length > 0
     ? canonicalMutationIntents.map((intent) => [
-        `tool:${intent.toolName.toLowerCase()}`,
+        `tool:${intent.executionName.toLowerCase()}`,
         intent.target ? `target:${intent.target.toLowerCase()}` : "target:(unknown)",
         `locus:${intent.locusHash}`,
         requirementRef ? `requirement:${requirementRef}` : "",
@@ -311,6 +319,7 @@ export async function handleAssistantCompletionPhase(input: {
   latestUserPromptText: string;
   forceXmlTools: boolean;
   availableToolNames: Set<string>;
+  toolCatalog: ToolCatalog;
   effectiveToolCalls: ToolCallToExecute[];
   finalReplyOptions: ReplyOption[];
   shouldPauseForUserChoice: boolean;
@@ -524,6 +533,7 @@ export async function handleAssistantCompletionPhase(input: {
 
   const validationMutationReopen = resolveValidationMutationReopen({
     recoveryState: currentExecuteRecoveryState,
+    toolCatalog: input.toolCatalog,
     protocolViolation: input.normalized.protocolViolation,
     protocolActualTools: input.normalized.protocolActualTools,
     protocolActualToolCalls: input.normalized.protocolActualToolCalls,

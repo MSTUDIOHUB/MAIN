@@ -2,7 +2,6 @@ import { buildExecutionDigest } from "../../executionDigest";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   collectPlanClosureMaterializationInput,
-  EDIT_PROGRESS_TOOL_NAMES,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   compactDiagnosticText,
   inferLifecycleStateFromToolResult,
@@ -32,6 +31,7 @@ import {
   toolResultCountsAsExecutionEvidence,
 } from "./toolActivityTracking";
 import { resolveUnityMcpForcedConsoleResult } from "./unityMcpRuntime";
+import { getToolExecutionArgs, hasCompletedToolExecution } from "../../toolResultEffect";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -137,14 +137,14 @@ export function handleToolResultPostProcessing(input: {
   );
 
   const resultCountsAsExecutionEvidence = (result: ToolExecutionResult): boolean => {
-    const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
+    const resultArgs = getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {});
     return toolResultCountsAsExecutionEvidence(result, resultArgs) ||
       isVerificationEvidenceResult(result);
   };
 
   for (const result of externalResults) {
-    if (result.isError) continue;
-    const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
+    if (!hasCompletedToolExecution(result)) continue;
+    const resultArgs = getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {});
     const countsAsExecutionEvidence = resultCountsAsExecutionEvidence(result);
     if (countsAsExecutionEvidence) {
       markExecuteOperationEvidence();
@@ -166,7 +166,7 @@ export function handleToolResultPostProcessing(input: {
       }
     }
 
-    if (isProjectSourceWriteResult(result)) {
+    if (isProjectSourceWriteResult(result, resultArgs)) {
       recentSuccessfulProjectWrite = {
         name: result.name,
         target: result.target,
@@ -216,7 +216,9 @@ export function handleToolResultPostProcessing(input: {
   unityConsoleMissingFirstToolRepromptIssued = unityConsoleResult.unityConsoleMissingFirstToolRepromptIssued;
   const unityMcpFallbackPrompt = unityConsoleResult.prompt;
 
-  directlyTrackedResults.forEach((result) => rememberToolActivity(recentToolActivity, result));
+  directlyTrackedResults.forEach((result) => rememberToolActivity(recentToolActivity, result, {
+    args: getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {}),
+  }));
   rememberDelegatedSubagentActivities(recentToolActivity, delegatedActivities);
   const remainingTaskText =
     callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task))?.text ?? null;
@@ -244,7 +246,10 @@ export function handleToolResultPostProcessing(input: {
     directlyTrackedResults.forEach((result) => rememberToolActivity(
       recentPlanToolActivity,
       result,
-      { evidenceLedger: true },
+      {
+        evidenceLedger: true,
+        args: getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {}),
+      },
     ));
     rememberDelegatedSubagentActivities(
       recentPlanToolActivity,
@@ -343,7 +348,7 @@ export function handleToolResultPostProcessing(input: {
     } else if (
       planRuntimePhase === "explore_structure" &&
       externalResults.some((result) =>
-        !result.isError &&
+        hasCompletedToolExecution(result) &&
         result.name !== "get_project_skeleton" &&
         PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
       )
@@ -358,7 +363,7 @@ export function handleToolResultPostProcessing(input: {
         previousPhase: planRuntimePhase,
         nextPhase: "grounding",
         toolNames: externalResults
-          .filter((result) => !result.isError)
+          .filter(hasCompletedToolExecution)
           .map((result) => result.name)
           .slice(0, 8),
       });
@@ -372,7 +377,7 @@ export function handleToolResultPostProcessing(input: {
   ) {
     const structureSucceeded = externalResults.some((result) =>
       result.name === "get_project_skeleton" &&
-      !result.isError
+      hasCompletedToolExecution(result)
     );
     if (structureSucceeded) {
       setPlanRuntimePhase("explore_structure", "project structure explored", "done");
@@ -383,7 +388,9 @@ export function handleToolResultPostProcessing(input: {
   }
 
   const resultOutcomeForEvidence = (result: ToolExecutionResult) =>
-    result.isError ? "failed" : classifyCommandResultOutcome(result.name, result.content || "");
+    !hasCompletedToolExecution(result)
+      ? "failed"
+      : classifyCommandResultOutcome(result.name, result.content || "");
   const failedEvidenceResults = externalResults.filter((result) =>
     resultOutcomeForEvidence(result) === "failed"
   );
@@ -416,7 +423,10 @@ export function handleToolResultPostProcessing(input: {
     results: externalResults.length,
     successfulResults: successfulResultCount,
     internalFeedbackResults: results.length - externalResults.length,
-    editResults: externalResults.filter((result) => !result.isError && EDIT_PROGRESS_TOOL_NAMES.has(result.name)).length,
+    editResults: externalResults.filter((result) => isProjectSourceWriteResult(
+      result,
+      getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {}),
+    )).length,
     verificationResults: externalResults.filter(isVerificationEvidenceResult).length,
     runtimeIntent,
     workflowMode,
@@ -424,7 +434,7 @@ export function handleToolResultPostProcessing(input: {
   });
 
   const successfulReadOnlyExplorationResultCount = externalResults.filter((result) =>
-    !result.isError && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    hasCompletedToolExecution(result) && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
   ).length;
   const nonReadOnlySuccessfulResultCount = externalResults.filter((result) =>
     resultCountsAsExecutionEvidence(result) &&

@@ -580,7 +580,7 @@ test("pause then completion reuses one assistant_final for the same logical turn
   assert.match(completedSource, /const finalBlockId = reusableFinalBlock\?\.id \?\? current\._nextTaskId\(\)/);
   assert.match(
     completedSource,
-    /block\.visibility === "assistant_final"[\s\S]*block\.id !== finalBlockId[\s\S]*visibility: "assistant_update"/,
+    /block\.visibility === "assistant_final"[\s\S]*block\.id !== finalBlockId[\s\S]*\.\.\.stripAssistantPublicProgress\(block\)[\s\S]*visibility: "assistant_update"/,
   );
 });
 

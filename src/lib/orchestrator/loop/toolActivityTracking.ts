@@ -18,10 +18,17 @@ import {
   mergePlanEvidenceFacts,
   summarizePlanEvidenceDetail,
 } from "../../planMaterialization";
-import { isNoOpToolFeedback, parseToolFeedbackEnvelope } from "../../toolFeedbackEnvelope";
+import { parseToolFeedbackEnvelope } from "../../toolFeedbackEnvelope";
 import type { ToolExecutionResult } from "../types";
 import { isSuccessfulVerificationToolObservation } from "../../verificationEvidence";
 import { normalizeWorkspacePathIdentity } from "../../workspacePaths";
+import {
+  getToolExecutionArgs,
+  getToolExecutionName,
+  hasCompletedToolExecution,
+  hasObservedWorkspaceMutationEffect,
+  hasVerifiedWorkspaceMutationEffect,
+} from "../../toolResultEffect";
 
 const SUBAGENT_EVIDENCE_TOOLS = new Set([
   "read_file",
@@ -138,6 +145,7 @@ function appendBoundedToolActivity(
             : {}),
         };
       }
+      existing.mutationObserved = existing.mutationObserved === true || activity.mutationObserved === true;
       const details = [existing.detail, activity.detail]
         .map((detail) => String(detail || "").trim())
         .filter((detail, index, all) => detail && all.indexOf(detail) === index);
@@ -163,6 +171,7 @@ function appendBoundedToolActivity(
 
 export interface ToolActivityRetentionOptions {
   evidenceLedger?: boolean;
+  args?: Record<string, unknown>;
 }
 
 export function extractDelegatedSubagentActivities(
@@ -418,35 +427,35 @@ export function toolResultCountsAsExecutionEvidence(
   result: ToolExecutionResult,
   args: Record<string, unknown>,
 ): boolean {
-  if (result.isError) return false;
-  if (result.name === "send_pty_input") return false;
+  if (!hasCompletedToolExecution(result)) return false;
+  const executionName = getToolExecutionName(result);
+  const executedArgs = getToolExecutionArgs(result, args);
+  if (executionName === "send_pty_input") return false;
   // Coordination lifecycle is not task execution evidence. Only concrete
   // child tool observations promoted below, or a parent-side verification of
   // them, may contribute evidence to the execution ledger.
-  if (result.name === "spawn_subagent" || result.name === "wait_subagents") return false;
+  if (executionName === "spawn_subagent" || executionName === "wait_subagents") return false;
   const envelope = parseToolFeedbackEnvelope(result.content || "");
   const feedbackStatus = envelope?.envelope.status || "";
   if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {
     return false;
   }
-  const isWorkspaceMutation = isWorkspaceMutationToolCall(result.name, args);
-  if (isWorkspaceMutationToolName(result.name) && !isWorkspaceMutation) return false;
-  if (isWorkspaceMutation && isNoOpToolFeedback(result.content || result.displayContent || "")) {
-    return false;
-  }
-  if (isSuccessfulPlanArtifactWriteResult(result) || isExecutionPlanArtifactWrite(result.name, args) || isTasksPlanWrite(result.name, args)) {
+  const isWorkspaceMutation = isWorkspaceMutationToolCall(executionName, executedArgs);
+  if (isWorkspaceMutationToolName(executionName) && !isWorkspaceMutation) return false;
+  if (isWorkspaceMutation && !hasVerifiedWorkspaceMutationEffect(result, executedArgs)) return false;
+  if (isSuccessfulPlanArtifactWriteResult(result) || isExecutionPlanArtifactWrite(executionName, executedArgs) || isTasksPlanWrite(executionName, executedArgs)) {
     return false;
   }
   if (
-    (result.name === "run_command" || result.name === "execute_command") &&
-    classifyCommandResultOutcome(result.name, result.content || "") !== "succeeded"
+    (executionName === "run_command" || executionName === "execute_command") &&
+    classifyCommandResultOutcome(executionName, result.content || "") !== "succeeded"
   ) {
     return false;
   }
-  if (result.name === "browser_evaluate" && !browserResultLooksSuccessful(result.content || "")) {
+  if (executionName === "browser_evaluate" && !browserResultLooksSuccessful(result.content || "")) {
     return false;
   }
-  return !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name);
+  return !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(executionName);
 }
 
 export function rememberToolActivity(
@@ -468,12 +477,24 @@ export function rememberToolActivity(
     extractPlanEvidenceFacts(planEvidenceDetail),
   );
   const astObservation = extractAstObservation(result);
-  const commandOutcome = result.isError
+  const executionName = getToolExecutionName(result);
+  const executedArgs = getToolExecutionArgs(result, options.args || {});
+  // A failed editor may still have changed disk before returning its error.
+  // Retain that runtime-observed mutation while keeping the activity failed;
+  // downstream evidence gates continue to require successful execution.
+  const mutationObserved = hasVerifiedWorkspaceMutationEffect(result, executedArgs) ||
+    hasObservedWorkspaceMutationEffect(result);
+  const noEffectWorkspaceMutation =
+    isWorkspaceMutationToolCall(executionName, executedArgs) && !mutationObserved;
+  const commandOutcome = !hasCompletedToolExecution(result)
     ? "failed"
+    : noEffectWorkspaceMutation
+    ? "running"
     : classifyCommandResultOutcome(result.name, result.content || "");
   appendBoundedToolActivity(targetList, {
     name: result.name,
     target: result.target,
+    mutationObserved,
     status: commandOutcome === "failed"
       ? "failed"
       : commandOutcome === "running"
@@ -503,13 +524,16 @@ export function rememberDelegatedSubagentActivities(
   ));
 }
 
-export function isEditProgressResult(result: ToolExecutionResult): boolean {
-  if (result.isError || result.internalFeedback) return false;
-  if (isNoOpToolFeedback(result.content || result.displayContent || "")) return false;
-  if (EDIT_PROGRESS_TOOL_NAMES.has(result.name)) {
-    return hasResolvedWorkspaceMutationTarget(result.name, result.target || "");
+export function isEditProgressResult(
+  result: ToolExecutionResult,
+  args: Record<string, unknown> = {},
+): boolean {
+  const executionName = getToolExecutionName(result);
+  if (EDIT_PROGRESS_TOOL_NAMES.has(executionName)) {
+    return hasVerifiedWorkspaceMutationEffect(result, args) &&
+      hasResolvedWorkspaceMutationTarget(executionName, result.target || "");
   }
-  return String(result.target || "").startsWith("shell-write:");
+  return hasCompletedToolExecution(result) && String(result.target || "").startsWith("shell-write:");
 }
 
 export function isVerificationEvidenceResult(result: ToolExecutionResult): boolean {

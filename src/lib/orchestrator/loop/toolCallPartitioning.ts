@@ -64,6 +64,7 @@ import type { ResolvedUserIntent } from "../../runIntent";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
+import type { ToolCatalog } from "../../toolCatalog";
 import {
   getShellToolCwd,
   looksDangerousShellCommand,
@@ -92,6 +93,7 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../workspaceMutationTools";
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
+import { resolveToolArgumentAuthorizationTargets } from "../../toolArgumentAuthorization";
 import {
   extractLocalDevServerPort,
   isLocalDevServerHealthProbeCommand,
@@ -456,6 +458,7 @@ export async function partitionToolCallsForExecution(input: {
   planRuntimePhase: PlanRuntimePhase;
   availableToolNames: Set<string>;
   toolCapabilityRegistry: ToolCapabilityRegistry;
+  toolCatalog?: ToolCatalog;
   toolPermissionPolicy: ToolPermissionPolicy;
   recentPlanToolActivity: PlanToolActivitySummary[];
   recentToolActivity: PlanToolActivitySummary[];
@@ -486,6 +489,7 @@ export async function partitionToolCallsForExecution(input: {
     planRuntimePhase,
     availableToolNames,
     toolCapabilityRegistry,
+    toolCatalog,
     toolPermissionPolicy,
     recentPlanToolActivity,
     recentToolActivity,
@@ -523,6 +527,10 @@ export async function partitionToolCallsForExecution(input: {
   const preExecutionResults: ToolExecutionResult[] = [];
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
+  const resolveExecutionName = (name: string): string => {
+    const lookup = toolCatalog?.lookup(name);
+    return lookup?.status === "resolved" ? lookup.entry.executionName : name;
+  };
   const executeRecoveryContract = recoveryActionContract;
   const structuredMutationObserved = hasStructuredWorkspaceMutationEvidence({
     callbacks,
@@ -535,7 +543,7 @@ export async function partitionToolCallsForExecution(input: {
       return {
         id: call.id,
         name: call.name,
-        target: getToolTarget(call.name, args),
+        target: getToolTarget(resolveExecutionName(call.name), args),
       };
     }),
     recentActivity: recentToolActivity,
@@ -544,6 +552,7 @@ export async function partitionToolCallsForExecution(input: {
   });
 
   for (const tc of toolCalls) {
+    const executionName = resolveExecutionName(tc.name);
     let toolArgs = parseToolCallArguments(tc, workspace);
     const subagentScope = callbacks.getSubagentScope?.() ?? null;
     if (subagentScope && SUBAGENT_SCOPE_NARROWABLE_READ_TOOLS.has(tc.name)) {
@@ -596,7 +605,7 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     toolArgsByCallId.set(tc.id, toolArgs);
-    let target = getToolTarget(tc.name, toolArgs);
+    let target = getToolTarget(executionName, toolArgs);
     callbacks.onHarnessRunUpdate?.({
       latestTool: tc.name,
       latestToolTarget: target || null,
@@ -802,10 +811,10 @@ export async function partitionToolCallsForExecution(input: {
       isPreApprovalPlanDraftWrite(tc.name, toolArgs);
     const isSelectedCurrentRecoveryMutation =
       executeRecoveryBatchDecision.selectedCallId === tc.id &&
-      isWorkspaceMutationToolCall(tc.name, toolArgs) &&
+      isWorkspaceMutationToolCall(executionName, toolArgs) &&
       (
         !executeRecoveryState.expectedTarget ||
-        resolveWorkspaceMutationTargets(tc.name, toolArgs, target).some((mutationTarget) =>
+        resolveWorkspaceMutationTargets(executionName, toolArgs, target).some((mutationTarget) =>
           workspacePathsReferToSameFile(
             mutationTarget,
             executeRecoveryState.expectedTarget || "",
@@ -987,16 +996,16 @@ export async function partitionToolCallsForExecution(input: {
 
     if (
       executeRecoveryMode === "objective_audit" &&
-      isWorkspaceMutationToolCall(tc.name, toolArgs)
+      isWorkspaceMutationToolCall(executionName, toolArgs)
     ) {
-      const mutationTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+      const mutationTargets = resolveWorkspaceMutationTargets(executionName, toolArgs, target);
       const creationTargets = resolveWorkspaceMutationCreationTargets(
-        tc.name,
+        executionName,
         toolArgs,
         target,
       );
       const createOnlyTargets = resolveWorkspaceMutationCreateOnlyTargets(
-        tc.name,
+        executionName,
         toolArgs,
       );
       const knownTargets = [
@@ -1047,7 +1056,7 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     const isOrderSensitiveWorkspaceAction =
-      isWorkspaceMutationToolCall(tc.name, toolArgs) ||
+      isWorkspaceMutationToolCall(executionName, toolArgs) ||
       tc.name === "run_command" ||
       tc.name === "execute_command" ||
       tc.name === "send_pty_input";
@@ -1171,10 +1180,19 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     const directScopeTarget = typeof toolArgs.path === "string" ? toolArgs.path.trim() : "";
-    const mutationScopeTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+    const mutationScopeTargets = resolveWorkspaceMutationTargets(executionName, toolArgs, target);
+    const shellScopeTargets = executionName === "run_command" || executionName === "execute_command"
+      ? resolveToolArgumentAuthorizationTargets({
+          executionName,
+          args: toolArgs,
+          target,
+        })
+      : [];
     const scopeTargets = mutationScopeTargets.length > 0
       ? mutationScopeTargets
-      : tc.name === "grep_search" || tc.name === "find_symbol_references" || tc.name === "git_diff"
+      : shellScopeTargets.length > 0
+        ? shellScopeTargets
+      : executionName === "grep_search" || executionName === "find_symbol_references" || executionName === "git_diff"
         ? [directScopeTarget || "."]
         : new Set([
             "read_file",
@@ -1183,7 +1201,7 @@ export async function partitionToolCallsForExecution(input: {
             "get_file_outline",
             "code_ast_query",
             "list_directory",
-          ] as string[]).has(tc.name)
+          ] as string[]).has(executionName)
           ? [directScopeTarget]
           : [];
     if (scopeTargets.length > 0) {
@@ -1466,7 +1484,7 @@ export async function partitionToolCallsForExecution(input: {
         toolArgs = { ...toolArgs, url: browserPreflight.url };
         tc.arguments = JSON.stringify(toolArgs);
         toolArgsByCallId.set(tc.id, toolArgs);
-        target = getToolTarget(tc.name, toolArgs);
+        target = getToolTarget(executionName, toolArgs);
         logAgentEvent("browser_validation_url_corrected_from_runtime_evidence", {
           iteration,
           requestedUrl,
@@ -1520,7 +1538,7 @@ export async function partitionToolCallsForExecution(input: {
 
     const approvedPlanCommandScope = resolveApprovedPlanCommandScope({
       isPlanApproved: callbacks.getIsPlanApproved(),
-      toolName: tc.name,
+      toolName: executionName,
       args: toolArgs,
       tasks: callbacks.getPlanTasks(),
     });
@@ -1528,7 +1546,7 @@ export async function partitionToolCallsForExecution(input: {
       approvedPlanCommandScope.applies &&
       !approvedPlanCommandScope.allowed &&
       recoveryContractAuthorizesApprovedPlanCommand({
-        toolName: tc.name,
+        toolName: executionName,
         command: approvedPlanCommandScope.requestedCommand,
         plannedCommands: approvedPlanCommandScope.plannedCommands,
         contract: executeRecoveryContract,
@@ -1574,7 +1592,7 @@ export async function partitionToolCallsForExecution(input: {
     }
     const approvedPlanMutationScope = resolveApprovedPlanMutationScope({
       isPlanApproved: callbacks.getIsPlanApproved(),
-      toolName: tc.name,
+      toolName: executionName,
       args: toolArgs,
       target,
       tasks: callbacks.getPlanTasks(),
@@ -1610,8 +1628,8 @@ export async function partitionToolCallsForExecution(input: {
       continue;
     }
 
-    if (isWorkspaceMutationToolCall(tc.name, toolArgs)) {
-      const mutationTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+    if (isWorkspaceMutationToolCall(executionName, toolArgs)) {
+      const mutationTargets = resolveWorkspaceMutationTargets(executionName, toolArgs, target);
       const delegatedSource = findDelegatedObservationRequiringParentReread({
         mutationTargets,
         recentToolActivity,
@@ -1633,7 +1651,7 @@ export async function partitionToolCallsForExecution(input: {
         });
         const reuseDecision = resolveVersionedDelegatedObservationReuse({
           activity: delegatedSource,
-          mutationToolName: tc.name,
+          mutationToolName: executionName,
           mutationArgs: toolArgs,
           currentVersion,
           currentContentHash: currentSource?.contentHash || null,
@@ -2217,6 +2235,7 @@ export async function partitionToolCallsForExecution(input: {
         id: tc.id,
         name: tc.name,
         arguments: JSON.stringify(effectiveToolArgs),
+        authorizationMode: planned.sessionAutoApproved ? "session" : "automatic",
         ...(scopedReadPaths.length > 0 ? { scopedReadPaths } : {}),
         allowExternalLocalRead:
           !!planned.localFileReadPath &&
@@ -2304,6 +2323,8 @@ export async function partitionToolCallsForExecution(input: {
           displayContent: `${cachedBrowserFailed ? "REUSED_BROWSER_VALIDATION_FAILED" : "REUSED_BROWSER_VALIDATION"}: ${target || cachedBrowserValidation.target || "browser_evaluate"}`,
           isError: cachedBrowserFailed,
           lifecycleState: cachedBrowserFailed ? "failed" : "completed",
+          internalFeedback: true,
+          qualityGateReason: "browser_validation_reused_without_state_change",
         });
         continue;
       }

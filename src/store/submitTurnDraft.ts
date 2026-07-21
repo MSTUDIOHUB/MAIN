@@ -10,6 +10,7 @@ import type { TaskBlock } from "../lib/taskTypes";
 import {
   normalizeTurnInputContextSignals,
   resolveEffectiveSubagentDelegationPreference,
+  type SubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../lib/turnIntake";
 import { buildUserContextItems } from "../lib/userContextItems";
@@ -32,6 +33,7 @@ export interface PrepareSubmitTurnDraftInput {
   runWorkspace?: string | null;
   preferredLanguage: "zh" | "en";
   preferSubagents?: boolean;
+  subagentPreference?: SubagentDelegationPreference;
   effectiveRunIntent: ResolvedRunIntent;
   isMainDebugShortcut: boolean;
   optionTurnTitle?: string | null;
@@ -92,7 +94,8 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
     }),
     subagentPreference: resolveEffectiveSubagentDelegationPreference({
       rawUserInput: input.text,
-      defaultPreference: input.preferSubagents ? "preferred" : "unspecified",
+      defaultPreference: input.subagentPreference ??
+        (input.preferSubagents ? "preferred" : "unspecified"),
     }),
   });
   const userContextItems = buildUserContextItems({

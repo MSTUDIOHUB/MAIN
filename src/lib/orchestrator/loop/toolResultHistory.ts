@@ -6,6 +6,7 @@ import {
 import { buildRepeatLoopArgsKey } from "../../repetitionGuard";
 import type { MainThreadEventInput, MainThreadItem, ToolFeedbackFormat } from "../../turnEvents";
 import type { AgentMessage, OrchestratorCallbacks, ToolExecutionResult } from "../types";
+import { getToolExecutionArgs } from "../../toolResultEffect";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 export function appendToolResultsToHistory(input: {
@@ -43,7 +44,10 @@ export function appendToolResultsToHistory(input: {
       turnContext.registerToolExecution({
         toolCallId: result.toolCallId,
         toolName: result.name,
-        argumentsHash: buildRepeatLoopArgsKey(toolArgsByCallId.get(result.toolCallId) ?? {}),
+        argumentsHash: buildRepeatLoopArgsKey(getToolExecutionArgs(
+          result,
+          toolArgsByCallId.get(result.toolCallId) ?? {},
+        )),
         resultLength: resultChars,
         resultTruncated: resultChars > 2000,
       });
@@ -66,12 +70,30 @@ export function appendToolResultsToHistory(input: {
     });
     const started = startedToolCallIds.has(result.toolCallId);
     if (completedToolCallIds.has(result.toolCallId)) continue;
-    // Some pre-execution protocol feedback is synthesized before any visible
-    // lifecycle item exists. Keep it in model history without inventing an
-    // orphan completion. Once item.started was emitted, however, every policy
-    // deferral must close that exact id even though it is not execution
-    // evidence and its internal prose must stay out of the user-facing event.
-    if (result.internalFeedback && !started) continue;
+    // Hidden protocol feedback remains 0-start/0-complete. A user-visible
+    // external preflight result, however, still owns a real lifecycle item;
+    // synthesize its start immediately before completion so the event stream
+    // can never contain an orphan completion.
+    if (!started) {
+      if (result.internalFeedback) continue;
+      emitTurnEvent({
+        type: "item.started",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        item: {
+          id: result.toolCallId,
+          details: {
+            type: "tool_lifecycle",
+            toolCallId: result.toolCallId,
+            tool: result.name,
+            target: result.target,
+            status: inferLifecycleStateFromToolResult(result),
+          },
+        } as MainThreadItem,
+      });
+      startedToolCallIds.add(result.toolCallId);
+    }
 
     startedToolCallIds.delete(result.toolCallId);
     completedToolCallIds.add(result.toolCallId);

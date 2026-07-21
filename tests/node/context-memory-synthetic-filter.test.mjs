@@ -287,3 +287,143 @@ test("tool feedback envelopes produce compact evidence without raw JSON headers"
   assert.doesNotMatch(evidence, /MAIN_TOOL_FEEDBACK_V1/);
   assert.doesNotMatch(evidence, /"version"/);
 });
+
+test("legacy repeated provider ids keep each result paired with its own tool and feedback target", () => {
+  const repeatedId = "native_call_1";
+  const state = buildContextMemoryState([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: repeatedId,
+        function: {
+          name: "read_file",
+          // Simulate stale legacy arguments: the runtime feedback envelope is
+          // authoritative for the observation that actually completed.
+          arguments: JSON.stringify({ path: "src/stale-a.ts" }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: repeatedId,
+      content: `[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"${repeatedId}","tool":"read_file","target":"src/a.ts","summary":"read A"}\nexport const a = 1;`,
+    },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: repeatedId,
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({ path: "src/stale-b.ts" }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: repeatedId,
+      content: `[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"${repeatedId}","tool":"replace_in_file","target":"src/b.ts","summary":"changed B"}\nREPLACE_IN_FILE_RESULT path: src/b.ts`,
+    },
+  ], { now: 25 });
+
+  assert.deepEqual(
+    state.files.map((item) => item.path).sort(),
+    ["src/a.ts", "src/b.ts"],
+  );
+  assert.equal(
+    state.evidence.some((item) => item.source.toolName === "read_file" && item.source.path === "src/a.ts"),
+    true,
+  );
+  assert.equal(
+    state.evidence.some((item) => item.source.toolName === "replace_in_file" && item.source.path === "src/b.ts"),
+    true,
+  );
+  assert.equal(state.files.some((item) => /stale-[ab]\.ts/.test(item.path)), false);
+});
+
+test("legacy repeated provider ids without envelopes pair results by occurrence", () => {
+  const repeatedId = "native_call_1";
+  const state = buildContextMemoryState([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: repeatedId,
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/a.ts" }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: repeatedId,
+      content: "READ_FILE_RESULT path: src/a.ts\nexport const a = 1;",
+    },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: repeatedId,
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({ path: "src/b.ts" }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: repeatedId,
+      content: "REPLACE_IN_FILE_RESULT path: src/b.ts",
+    },
+  ], { now: 26 });
+
+  assert.equal(
+    state.evidence.some((item) => item.source.toolName === "read_file" && item.source.path === "src/a.ts"),
+    true,
+  );
+  assert.equal(
+    state.evidence.some((item) => item.source.toolName === "replace_in_file" && item.source.path === "src/b.ts"),
+    true,
+  );
+  assert.deepEqual(state.files.map((item) => item.path).sort(), ["src/a.ts", "src/b.ts"]);
+});
+
+test("blocked mutation feedback cannot become a changed relevant file", () => {
+  const call = {
+    id: "call_blocked_replace",
+    function: {
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        old_string: "before",
+        new_string: "after",
+      }),
+    },
+  };
+
+  const state = buildContextMemoryState([
+    { role: "assistant", content: "", tool_calls: [call] },
+    {
+      role: "tool",
+      tool_call_id: "call_blocked_replace",
+      content: '[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"blocked","tool_call_id":"call_blocked_replace","tool":"replace_in_file","target":"src/main.js","summary":"Tool unavailable for this turn phase"}\nThe requested mutation did not execute.',
+    },
+  ], { now: 30 });
+
+  assert.equal(
+    state.files.some((item) => item.path === "src/main.js"),
+    false,
+    "policy feedback must not claim a relevant file was changed",
+  );
+  assert.equal(
+    state.evidence.some((item) => /replace_in_file src\/main\.js; status=changed/.test(item.text)),
+    false,
+  );
+  assert.equal(
+    state.blockers.some((item) => /replace_in_file src\/main\.js/.test(item.text)),
+    true,
+    "the blocked attempt remains available as a diagnostic",
+  );
+});

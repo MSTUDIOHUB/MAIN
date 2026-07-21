@@ -14,6 +14,10 @@ import {
   normalizeChatFeedbackStatus,
 } from "../lib/chatFeedback";
 import { useAppStore } from "../store/useAppStore";
+import {
+  requiresPerCallToolPermissionApproval,
+  type ToolPermissionActionRequest,
+} from "../lib/actionRequest";
 
 // Map tool names to human-readable action labels
 const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: React.FC<{ className?: string }> }> = {
@@ -78,6 +82,7 @@ interface ActionCardProps {
   message?: string;
   diff?: { old: string; new: string; path?: string };
   shellPermissionDecision?: { requiresApproval?: boolean };
+  permissionRisk?: ToolPermissionActionRequest["risk"];
   intentSummary?: string;
   why?: string;
   evidence?: string;
@@ -141,7 +146,7 @@ function compactExplanation(text?: string, maxChars = 180) {
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
+export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, permissionRisk, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
   const language = useAppStore((s) => s.config.language);
   const activeProfile = useAppStore((s) => s.config.activeProfile);
   const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
@@ -161,6 +166,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const isDone = isExecuted || isRejected || isFailed;
   const isSystemErrorCard = toolName === "Error";
   const isShellApprovalGated = !!shellPermissionDecision?.requiresApproval;
+  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk);
 
   // ── Collapsible state: expanded while pending/running, collapsed when done ──
   const [expanded, setExpanded] = useState(!isDone);
@@ -426,8 +432,9 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 >
                   {language === "zh" ? "拒绝" : "Reject"}
                 </button>
-                {isShellApprovalGated && onAllowForSession && (
+                {isShellApprovalGated && !requiresPerCallApproval && onAllowForSession && (
                   <button
+                    data-testid="action-card-approve-session"
                     onClick={onAllowForSession}
                     className="px-3 py-1.5 text-[11px] font-medium rounded-md border border-[rgba(124,58,237,0.35)] bg-[rgba(124,58,237,0.14)] text-[#ddd6fe] hover:bg-[rgba(124,58,237,0.22)] transition-colors"
                   >
@@ -551,8 +558,8 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
         )}
 
         {/* Auto-approve toggle — only when pending */}
-        {isPending && onToggleAutoApprove && !isShellApprovalGated && (
-          <div className="mt-2.5 pt-2.5 border-t border-[#27272a] flex items-center gap-2">
+        {isPending && onToggleAutoApprove && !isShellApprovalGated && !requiresPerCallApproval && (
+          <div data-testid="action-card-auto-approve" className="mt-2.5 pt-2.5 border-t border-[#27272a] flex items-center gap-2">
             <label className="flex items-center gap-2 cursor-pointer select-none group">
               <input
                 type="checkbox"

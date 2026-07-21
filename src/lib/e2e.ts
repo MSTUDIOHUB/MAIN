@@ -4300,6 +4300,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     title: "长命令审批回归",
     taskId: reviewBlockId,
     toolCall: {
+      toolCallId: "call-e2e-pending-tool-review",
       name: "run_command",
       arguments: { command: longCommand },
       shellPermissionDecision: { requiresApproval: true },
@@ -4307,6 +4308,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     now,
   });
   const pendingToolCall = {
+    toolCallId: "call-e2e-pending-tool-review",
     name: "run_command",
     arguments: { command: longCommand },
     shellPermissionDecision: {
@@ -4353,6 +4355,8 @@ function seedExecutionCapsulePendingToolReviewScenario() {
         id: reviewBlockId,
         turnId,
         type: "tool" as const,
+        toolCallId: "call-e2e-pending-tool-review",
+        executionId: "call-e2e-pending-tool-review",
         toolName: "run_command",
         target: longCommand,
         status: "pending_review",
@@ -4527,6 +4531,31 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     };
   };
 
+  bridge.makePendingToolReviewDestructive = () => {
+    const destructiveTarget = "DELETE FROM users WHERE id = 42";
+    useAppStore.setState((state) => ({
+      activeActionRequest: state.activeActionRequest?.kind === "tool_permission"
+        ? {
+            ...state.activeActionRequest,
+            toolName: "postgres_query",
+            target: destructiveTarget,
+            risk: "destructive" as const,
+          }
+        : state.activeActionRequest,
+      pendingToolCall: {
+        toolCallId: "call-e2e-pending-tool-review",
+        name: "postgres_query",
+        arguments: { sql: destructiveTarget },
+        risk: "destructive" as const,
+      },
+      taskFlow: state.taskFlow.map((block) =>
+        block.id === reviewBlockId && block.type === "tool"
+          ? { ...block, toolName: "postgres_query", target: destructiveTarget }
+          : block
+      ),
+    }));
+  };
+
   bridge.resolvePendingToolReviewWithIdentity = (
     action: "approve_once" | "approve_session" | "reject",
     identity: {
@@ -4636,15 +4665,15 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
     showTerminal: false,
     showFilePanel: false,
     rightPanelTab: "plan",
-    agentStatus: "pending_review",
+    // Start from a deterministic idle control plane. The bridge below creates
+    // the actual orphan-card case (owned ActionRequest + pendingToolCall but no
+    // TaskBlock) without depending on Session hydration effect ordering.
+    agentStatus: "idle",
     isGenerating: false,
     abortController: null,
-    pendingReviewResolve: (decision: unknown) => appendBridgeEvent("orphan_review_resolved", { decision }),
-    pendingReviewTaskId,
-    pendingToolCall: {
-      name: "apply_patch",
-      arguments: { patch },
-    },
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
     selectedDiffTaskId: null,
     input: "",
     attachedFiles: [],
@@ -5545,11 +5574,22 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       content: "已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
       visibility: "assistant_update" as const,
       streaming: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "assistant_commentary" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now - 20,
+      },
     }, {
       id: liveActivityId,
       turnId,
       type: "agent" as const,
-      content: "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
+      content: "让我继续查看 **ChatArea.tsx**，确认 Capsule 的实时投影入口。",
       visibility: "user_progress" as const,
       streaming: true,
       hiddenProcess: false,
@@ -5595,9 +5635,20 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: secondUpdateId,
       turnId,
       type: "agent" as const,
-      content: "展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。",
+      content: "已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
       visibility: "assistant_update" as const,
       streaming: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "assistant_commentary" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now - 10,
+      },
     }] : []),
     {
       id: runningToolId,

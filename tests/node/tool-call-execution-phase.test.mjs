@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fsSync from "node:fs";
 import path from "node:path";
+import ts from "typescript";
 
 const workspaceRoot = process.cwd();
 const phaseSource = fsSync.readFileSync(
@@ -17,6 +18,23 @@ const toolIterationPhaseSource = fsSync.readFileSync(
   "utf8",
 );
 
+function loadExecutionPhaseWithStubbedDependencies() {
+  const transpiled = ts.transpileModule(phaseSource, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: "toolCallExecutionPhase.ts",
+  }).outputText;
+  const module = { exports: {} };
+  const dependencyStub = new Proxy({}, {
+    get: (_target, property) => property === "__esModule" ? true : () => undefined,
+  });
+  const factory = new Function("exports", "module", "require", transpiled);
+  factory(module.exports, module, () => dependencyStub);
+  return module.exports;
+}
+
 test("tool call execution phase owns the tool handoff and execution ordering", () => {
   assert.match(phaseSource, /export async function executeToolCallPhase/);
   assert.match(phaseSource, /resetConsecutiveNoToolRuntimeState\(/);
@@ -27,6 +45,38 @@ test("tool call execution phase owns the tool handoff and execution ordering", (
   assert.match(phaseSource, /input\.emitTaskOrchestratorPhase\("EXECUTE_STEP"/);
   assert.match(phaseSource, /buildAssistantHistoryMessage\([\s\S]*?\{ tool_calls: toolCallsForMsg \}/);
   assert.match(phaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeToolExecutionRound\(\{/);
+});
+
+test("provider tool ids are replaced with iteration-scoped runtime ids before history and execution", () => {
+  const { assignRuntimeToolCallIds } = loadExecutionPhaseWithStubbedDependencies();
+  const firstIteration = assignRuntimeToolCallIds([
+    { id: "native_call_1", name: "read_file", arguments: "{}" },
+    { id: "native_call_1", name: "grep_search", arguments: "{}" },
+  ], "turn-a-run-source-1");
+  const nextIteration = assignRuntimeToolCallIds([
+    { id: "native_call_1", name: "replace_in_file", arguments: "{}" },
+  ], "turn-a-run-source-2");
+  const recoveredRun = assignRuntimeToolCallIds([
+    { id: "native_call_1", name: "read_file", arguments: "{}" },
+  ], "turn-a-run-recovery-1");
+
+  assert.deepEqual(firstIteration.map((call) => call.id), [
+    "turn-a-run-source-1-tool-1",
+    "turn-a-run-source-1-tool-2",
+  ]);
+  assert.deepEqual(nextIteration.map((call) => call.id), ["turn-a-run-source-2-tool-1"]);
+  assert.deepEqual(recoveredRun.map((call) => call.id), ["turn-a-run-recovery-1-tool-1"]);
+  assert.equal(
+    new Set([...firstIteration, ...nextIteration, ...recoveredRun].map((call) => call.id)).size,
+    4,
+  );
+
+  const assignmentIndex = phaseSource.indexOf("assignRuntimeToolCallIds(", phaseSource.indexOf("export async function executeToolCallPhase"));
+  const historyIndex = phaseSource.indexOf("buildAssistantHistoryMessage(", assignmentIndex);
+  const executionIndex = phaseSource.indexOf("partitionToolCallsForExecution({", assignmentIndex);
+  assert.ok(assignmentIndex >= 0 && assignmentIndex < historyIndex);
+  assert.ok(assignmentIndex < executionIndex);
+  assert.match(phaseSource, /\| "iterationTurnId"/);
 });
 
 test("tool call execution phase owns post-processing runtime state updates", () => {

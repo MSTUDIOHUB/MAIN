@@ -22,6 +22,8 @@ import { type MainThreadEvent } from "../turnEvents";
 import { type PlanMaterializationSource } from "../planMaterialization";
 import { type ProgressNarration } from "../progressNarration";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "../ipc";
+import type { ToolRiskLevel } from "../toolCapabilities";
+import type { ToolCatalogSource } from "../toolCatalog";
 import { type TurnInputContextSignals } from "../turnIntake";
 import type {
   RuntimeTraceContext,
@@ -75,8 +77,25 @@ export type MaxIterationsCheckpointHandling =
 
 export type ToolFailureKind = "actual" | "policy";
 
+export interface ToolCatalogIdentity {
+  /** Runtime-owned registration source. External tool output cannot set this value. */
+  source: ToolCatalogSource | "unknown";
+  /** Stable catalog name used to resolve this invocation. */
+  canonicalName: string;
+}
+
 export interface ToolErrorLifecycleMeta {
   toolCallId?: string;
+  /** Runtime-resolved backend name; keep the provider-facing name for display only. */
+  executionName?: string;
+  /** Runtime-owned catalog provenance for the resolved invocation. */
+  catalogIdentity?: ToolCatalogIdentity;
+  /** Observed workspace mutation even when the executor ultimately failed. */
+  diff?: ToolDiffPreview;
+  workspaceMutationEvidence?: {
+    changedPaths: string[];
+    diff?: ToolDiffPreview;
+  };
   qualityGateReason?: string | null;
   planRecoveryReason?: string | null;
   failureKind?: ToolFailureKind;
@@ -312,7 +331,7 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     diff?: ToolDiffPreview,
-    meta?: { toolCallId?: string },
+    meta?: { toolCallId?: string; executionName?: string; catalogIdentity?: ToolCatalogIdentity },
   ) => void;
   onToolDone: (
     toolName: string,
@@ -320,6 +339,8 @@ export interface OrchestratorCallbacks {
     result: string,
     meta?: {
       toolCallId?: string;
+      executionName?: string;
+      catalogIdentity?: ToolCatalogIdentity;
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
@@ -342,7 +363,7 @@ export interface OrchestratorCallbacks {
     toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
-    risk?: "local_file_read" | "browser_control" | "desktop_control";
+    risk?: ToolRiskLevel;
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   }) => Promise<ReviewDecision>;
@@ -368,13 +389,28 @@ export interface ToolCallToExecute {
 export interface ToolExecutionResult {
   toolCallId: string;
   name: string;
+  /** Runtime-resolved backend tool name; provider-facing aliases are not execution identity. */
+  executionName?: string;
+  /** Runtime-owned registration provenance; absent/unknown identities are never trusted as built-ins. */
+  catalogIdentity?: ToolCatalogIdentity;
+  /** Final runtime-owned arguments after compatibility resolution and PreToolUse hooks. */
+  executedArgs?: Record<string, unknown>;
   target: string;
   content: string; // model-facing result or error message
   displayContent?: string; // UI-facing result, can differ from model-facing content
   isError: boolean;
   lifecycleState?: ToolLifecycleState;
+  /** The backend invocation was entered; failure may still have produced side effects. */
+  executionAttempted?: boolean;
+  /** Workspace-side-effect disposition is independent from execution success. */
+  workspaceEffect?: "none" | "verified" | "possible" | "partial";
   additionalContexts?: string[];
   internalFeedback?: boolean;
+  /** Observed workspace change owned by the runtime, never inferred from tool prose. */
+  workspaceMutationEvidence?: {
+    changedPaths: string[];
+    diff?: ToolDiffPreview;
+  };
   qualityGateReason?: string;
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];

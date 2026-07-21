@@ -22,6 +22,7 @@ import {
   logAgentEvent,
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { hasCompletedToolExecution } from "../../toolResultEffect";
 import {
   canDeterministicallyMaterializePlan,
   classifyPlanArtifactQualityResult,
@@ -576,7 +577,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           missingSections: planLastMissingSections,
         });
       }
-    } else if (evidenceRecoveryBatchResults.some((result) => !result.isError)) {
+    } else if (evidenceRecoveryBatchResults.some(hasCompletedToolExecution)) {
       // Persist the current semantic/coverage baseline even when this batch did
       // not advance it. Some recovery entry points can begin without a prior
       // fingerprint; leaving it empty would let a later unchanged read claim

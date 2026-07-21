@@ -518,6 +518,8 @@ export interface ChangeEntry {
   editCount: number;
   order: number;
   isPlanFile: boolean;
+  /** `partial` means the workspace changed before the tool reported failure. */
+  workspaceEffect: "verified" | "partial";
 }
 
 export interface ReplyOption {
@@ -5509,9 +5511,11 @@ export function collectChangeEntries(
     id: number;
     type: string;
     toolName?: string;
+    executionName?: string;
     toolStatus?: string;
     target?: string;
     diff?: { old: string; new: string; path?: string; existed?: boolean; fullFile?: boolean };
+    workspaceEffect?: "verified" | "partial";
     revertStatus?: string;
   }>,
   getStats: (oldText: string, newText: string) => { added: number; removed: number },
@@ -5531,12 +5535,17 @@ export function collectChangeEntries(
   ]);
 
   blocks.forEach((block, order) => {
-    if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
-    if (!editToolNames.has(String(block.toolName || ""))) return;
+    if (block.type !== "tool" || !block.diff) return;
+    if (block.toolStatus !== "executed" && block.toolStatus !== "failed") return;
+    const executionName = String(block.executionName || block.toolName || "");
+    if (!editToolNames.has(executionName)) return;
     if (block.revertStatus === "reverted") return;
 
-    const target = String(block.target || block.diff.path || block.toolName || "");
+    const target = String(block.diff.path || block.target || block.toolName || "");
     if (isEphemeralPlanArtifactPath(target)) return;
+    const workspaceEffect = block.workspaceEffect === "partial" || block.toolStatus === "failed"
+      ? "partial" as const
+      : "verified" as const;
 
     totalExecutedEdits++;
     const displayTarget = target.split("/").pop() || target;
@@ -5554,6 +5563,7 @@ export function collectChangeEntries(
         editCount: 1,
         order,
         isPlanFile: target.replace(/\\/g, "/").toLowerCase().includes(".main/plans/"),
+        workspaceEffect,
       });
       return;
     }
@@ -5565,6 +5575,9 @@ export function collectChangeEntries(
       removed: stats.removed,
       editCount: entries[existingIndex].editCount + 1,
       order,
+      workspaceEffect: entries[existingIndex].workspaceEffect === "partial" || workspaceEffect === "partial"
+        ? "partial"
+        : "verified",
     };
   });
 

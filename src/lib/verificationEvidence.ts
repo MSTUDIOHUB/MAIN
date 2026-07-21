@@ -104,7 +104,7 @@ export function scopeExecutionEvidenceLedger(
     : [...ledger];
 }
 
-function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry): boolean {
+export function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry): boolean {
   return !["failed", "pending", "unknown", "running", "stopped"].includes(
     String(entry.observationStatus || ""),
   );

@@ -173,6 +173,7 @@ import {
 } from "../lib/attachments";
 import {
   buildSemanticMetadataContextLines,
+  normalizeSubagentDelegationPreference,
   normalizeTurnInputContextSignals,
   type SubagentDelegationPreference,
   type TurnInputContextSignals,
@@ -196,6 +197,7 @@ import {
   isCurrentGoalAdministrativeControl,
   isCurrentGoalControlResolution,
   isExactToolPermissionResolutionIdentity,
+  requiresPerCallToolPermissionApproval,
   isToolPermissionPlanExecutionIdentityCurrent,
   isToolPermissionActionRequest,
   normalizeActionRequest,
@@ -203,10 +205,12 @@ import {
   type ActionRequest,
   type PendingPlanToolPermissionInvalidation,
   type ToolPermissionResolutionIdentity,
+  type ToolPermissionActionRequest,
   type UserChoiceResolutionIdentity,
   type PlanReviewResolutionIdentity,
   type GoalControlIdentity,
 } from "../lib/actionRequest";
+import { isExactPendingToolReviewOwner } from "../lib/pendingToolReview";
 import { issuePlanExplicitResumeAttempt } from "../lib/planExecutionContinuation";
 import { isHarnessMarkerOwnedByPlanExecution } from "../lib/planExecutionOwnership";
 import {
@@ -390,7 +394,11 @@ import {
   settleWorkspaceClearSubmissionBarrier,
   takeSettledWorkspaceClearSubmission,
 } from "./workspaceClearSubmissionBarrier";
-import { projectCanceledTurn } from "../lib/canceledTurnProjection";
+import {
+  captureCanceledTurnControlPlaneFence,
+  projectCanceledTurn,
+  type CanceledTurnControlPlaneFence,
+} from "../lib/canceledTurnProjection";
 import { createSubmitHarnessRunId } from "./submitRunLease";
 import {
   buildApprovedPlanExecutionPrompt,
@@ -1073,8 +1081,10 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   /** Current in-memory checkpoint owner. Not persisted because resolver closures cannot survive reload. */
   activeActionRequest: ActionRequest | null;
   pendingToolCall: {
+    toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
+    risk?: ToolPermissionActionRequest["risk"];
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   } | null;
@@ -1512,8 +1522,10 @@ export interface AppState {
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   pendingToolCall: {
+    toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
+    risk?: ToolPermissionActionRequest["risk"];
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   } | null;
@@ -6138,7 +6150,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
   parentRunId: string | null;
   reason: string;
   message: string;
-  expectedAbortController: AbortController | null;
+  controlPlaneFence: CanceledTurnControlPlaneFence;
   nextTaskId: () => number;
 }): Promise<SessionCancellationSettlement> {
   let sessionDeleted = false;
@@ -6217,7 +6229,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
     );
     if (
       !targetAlreadyTerminal &&
-      (scopedState.abortController ?? null) !== input.expectedAbortController
+      (scopedState.abortController ?? null) !== input.controlPlaneFence.abortController
     ) {
       ownerTransferred = true;
       return {};
@@ -6231,9 +6243,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       reason: input.reason,
       message: input.message,
       nextTaskId: input.nextTaskId,
-      controlPlaneFence: {
-        abortController: input.expectedAbortController,
-      },
+      controlPlaneFence: input.controlPlaneFence,
     });
     if (projection.disposition === "ownership_lost") {
       ownerTransferred = true;
@@ -7082,6 +7092,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id, turnId: b.turnId, ...persistedTurnPhase(b), type: "tool" as const,
           toolName: String(b.toolName), target: String(b.target),
+          ...(b.executionName ? { executionName: String(b.executionName) } : {}),
           status: String(b.status),
           toolStatus: b.toolStatus,
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
@@ -7103,6 +7114,9 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
                   ...(typeof b.diff.fullFile === "boolean" ? { fullFile: b.diff.fullFile } : {}),
                 },
               }
+            : {}),
+          ...(b.workspaceEffect === "verified" || b.workspaceEffect === "partial"
+            ? { workspaceEffect: b.workspaceEffect }
             : {}),
           ...(b.revertStatus ? { revertStatus: b.revertStatus } : {}),
           ...(b.revertMessage ? { revertMessage: String(b.revertMessage) } : {}),
@@ -8474,7 +8488,12 @@ export const useAppStore = create<AppState>()(
         : null;
     const ownerRunId = ownedActionRequest?.runId || getHarnessActionRunId(ownedMarker);
     const ownerParentRunId = ownedActionRequest?.parentRunId || ownedMarker?.parentRunId || null;
-    const expectedAbortController = current.abortController;
+    const controlPlaneFence = captureCanceledTurnControlPlaneFence({
+      state: current,
+      sessionKey,
+      turnId,
+      runId: ownerRunId,
+    });
     const {
       sessionGet,
       sessionSet,
@@ -8503,7 +8522,7 @@ export const useAppStore = create<AppState>()(
         parentRunId: ownerParentRunId,
         reason,
         message,
-        expectedAbortController,
+        controlPlaneFence,
         nextTaskId: () => get()._nextTaskId(),
         sessionGet,
         getSessionRevisionToken,
@@ -8576,7 +8595,7 @@ export const useAppStore = create<AppState>()(
           parentRunId: ownerParentRunId,
           reason,
           message,
-          expectedAbortController,
+          controlPlaneFence,
           nextTaskId: () => get()._nextTaskId(),
         });
       },
@@ -10610,13 +10629,16 @@ export const useAppStore = create<AppState>()(
         s.currentSessionId,
       );
       if (!sessionKey) return {};
+      const previous = s.runtimeBySessionKey[sessionKey];
       const replacement = createSessionRuntimeFromState(s);
+      const currentSessionGeneration = resolveActiveSessionPlanLifecycleEpoch(s, sessionKey);
       return {
         runtimeBySessionKey: {
           ...s.runtimeBySessionKey,
           [sessionKey]: preserveSubmitSessionRuntimeOwnership(
-            s.runtimeBySessionKey[sessionKey],
+            previous,
             replacement,
+            currentSessionGeneration,
           ),
         },
       };
@@ -16132,6 +16154,9 @@ export const useAppStore = create<AppState>()(
     const hintedRuntimeIntent = normalizeWorkspaceInstructionIntentHint(
       hints.runtimeIntentOverride,
     ) || undefined;
+    const hintedSubagentPreference = typeof hints.subagentPreference === "string"
+      ? normalizeSubagentDelegationPreference(hints.subagentPreference)
+      : undefined;
     const executionConsentDecision = resolveWorkspaceInstructionExecutionConsent({
       sessionKey,
       taskFlow: state.taskFlow,
@@ -16276,6 +16301,9 @@ export const useAppStore = create<AppState>()(
         skipAutoPlanHydration: true,
         ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
         ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
+        ...(hintedSubagentPreference !== undefined
+          ? { subagentPreferenceOverride: hintedSubagentPreference }
+          : {}),
         ...(hintedIntent || hints.skipIntentResolution === true
           ? { skipIntentResolution: true }
           : {}),
@@ -16641,6 +16669,17 @@ export const useAppStore = create<AppState>()(
     const state = get();
     const taskId = identity?.taskId ?? state.pendingReviewTaskId;
     if (taskId == null) return;
+    if (
+      isToolPermissionActionRequest(state.activeActionRequest) &&
+      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk)
+    ) {
+      logStoreEvent("tool_permission_session_approval_blocked", {
+        taskId,
+        toolName: state.activeActionRequest.toolName,
+        risk: state.activeActionRequest.risk || "unknown",
+      });
+      return;
+    }
     if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_session")) {
       invalidateStalePendingPlanToolPermission({
         state,
@@ -16690,7 +16729,15 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
-    const reviewTurnId = state.taskFlow.find((block) => block.id === taskId)?.turnId || state.currentTurnId;
+    const request = state.activeActionRequest as ToolPermissionActionRequest;
+    const reviewOwner = {
+      taskId: request.taskId,
+      turnIds: [request.turnId],
+      toolCallId: request.toolCallId,
+      toolName: request.toolName,
+      target: request.target,
+    };
+    const reviewTurnId = request.turnId;
     const localFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
     const shellDecision = state.pendingToolCall?.shellPermissionDecision || null;
     const shellApproval = shellDecision?.requiresApproval
@@ -16711,7 +16758,7 @@ export const useAppStore = create<AppState>()(
       agentStatus: "running",
       isGenerating: true,
       taskFlow: s.taskFlow.map((task) =>
-        task.id === taskId && task.type === "tool"
+        isExactPendingToolReviewOwner(task, reviewOwner)
           ? {
               ...task,
               status: "running",
@@ -16752,6 +16799,14 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
+    const request = state.activeActionRequest as ToolPermissionActionRequest;
+    const reviewOwner = {
+      taskId: request.taskId,
+      turnIds: [request.turnId],
+      toolCallId: request.toolCallId,
+      toolName: request.toolName,
+      target: request.target,
+    };
 
     // Clear pending state
     set({ pendingReviewResolve: null, pendingReviewTaskId: null, activeActionRequest: null, pendingToolCall: null });
@@ -16759,7 +16814,7 @@ export const useAppStore = create<AppState>()(
     // Update the Action Card
     set((s) => ({
       taskFlow: s.taskFlow.map((t) =>
-        t.id === taskId && t.type === "tool"
+        isExactPendingToolReviewOwner(t, reviewOwner)
           ? { ...t, toolStatus: "rejected" as const, status: "error", message: "Rejected by user." }
           : t
       ),
@@ -16937,6 +16992,7 @@ export const useAppStore = create<AppState>()(
     workspaceInstructionClaim?: WorkspaceInstructionDispatchClaim;
     adoptExistingTurn?: boolean;
     admittedUserBlockId?: number;
+    subagentPreferenceOverride?: SubagentDelegationPreference;
   }) => {
     let state = get();
     if (options?.adoptExistingTurn) {
@@ -18038,6 +18094,7 @@ export const useAppStore = create<AppState>()(
       runWorkspace,
       preferredLanguage,
       preferSubagents: state.preferSubagents,
+      subagentPreference: options?.subagentPreferenceOverride,
       effectiveRunIntent,
       isMainDebugShortcut: !!mainDebugShortcut,
       reuseCurrentTurn,

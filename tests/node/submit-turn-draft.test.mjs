@@ -125,6 +125,30 @@ test("submit turn draft builds deterministic new turn context and title seed", (
   assert.equal(draft.titleDecision.seededSessionTitleCandidate, draft.titleDecision.turnTitle);
 });
 
+test("captured subagent preference wins over later mutable Session state", () => {
+  const capturedPreferred = prepareSubmitTurnDraft(baseInput({
+    preferSubagents: false,
+    subagentPreference: "preferred",
+  }));
+  const capturedUnspecified = prepareSubmitTurnDraft(baseInput({
+    preferSubagents: true,
+    subagentPreference: "unspecified",
+  }));
+
+  assert.equal(capturedPreferred.turnInputContextSignals.subagentPreference, "preferred");
+  assert.equal(capturedUnspecified.turnInputContextSignals.subagentPreference, "unspecified");
+});
+
+test("raw user prohibition overrides a captured preferred subagent preference", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    text: "检查启动和菜单模块，但本轮不要使用子智能体。",
+    preferSubagents: true,
+    subagentPreference: "preferred",
+  }));
+
+  assert.equal(draft.turnInputContextSignals.subagentPreference, "forbidden");
+});
+
 test("submit turn draft reuses existing turn title and UI parent", () => {
   const draft = prepareSubmitTurnDraft(baseInput({
     reuseCurrentTurn: true,

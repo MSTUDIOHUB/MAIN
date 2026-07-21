@@ -38,6 +38,7 @@ import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
+import { getToolExecutionArgs, hasCompletedToolExecution } from "../../toolResultEffect";
 import type {
   PlanExecutionProgressPhase,
   PlanExecutionProgressUpdate,
@@ -61,7 +62,6 @@ import {
   relativizeToWorkspacePath,
   workspacePathsReferToSameFile,
 } from "../../workspacePaths";
-import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import {
   handleExecuteConvergencePrompt,
@@ -375,7 +375,7 @@ function resolveFiniteValidationRepairTarget(input: {
   }
   const latestMutationTarget = [...input.recentToolActivity].reverse().find((activity) =>
     activity.status === "succeeded" &&
-    isWorkspaceMutationToolName(activity.name) &&
+    activity.mutationObserved === true &&
     !!String(activity.target || "").trim()
   )?.target;
   return String(latestMutationTarget || input.fallbackTarget || "").trim() || null;
@@ -604,8 +604,7 @@ export function resolveApprovedPlanMutationContextDecision(input: {
   if (pendingTargets.length === 0) return { status: "none" };
   const readResults = input.results.filter((result) =>
     result.name === "read_file" &&
-    !result.isError &&
-    !result.internalFeedback &&
+    hasCompletedToolExecution(result) &&
     result.readFileObservation?.source !== "stub" &&
     pendingTargets.some((target) => workspacePathsReferToSameFile(result.target, target))
   );
@@ -674,7 +673,7 @@ export function resolveApprovedPlanMutationContextDecision(input: {
   )?.astObservation;
   const currentBatchHasAstQuery = input.results.some((result) =>
     result.name === "code_ast_query" &&
-    !result.isError &&
+    hasCompletedToolExecution(result) &&
     workspacePathsReferToSameFile(result.target, target)
   );
   const astObservation = newestAstObservation && (
@@ -1535,7 +1534,10 @@ export async function handleToolResultRecoveryPhase(input: {
     },
   );
   const durableStructuredMutation = input.results.find((result) =>
-    !result.internalFeedback && isProjectSourceWriteResult(result)
+    !result.internalFeedback && isProjectSourceWriteResult(
+      result,
+      getToolExecutionArgs(result, input.toolArgsByCallId.get(result.toolCallId) || {}),
+    )
   );
   if (durableStructuredMutation) {
     loopGuardRuntimeState = resetLoopGuardRuntimeStateAfterMutation(
@@ -1634,7 +1636,7 @@ export async function handleToolResultRecoveryPhase(input: {
     });
     const attributedGrep = input.results.find((result) => {
       if (result.name !== "grep_search" || result.isError || result.internalFeedback) return false;
-      const args = input.toolArgsByCallId.get(result.toolCallId) || {};
+      const args = getToolExecutionArgs(result, input.toolArgsByCallId.get(result.toolCallId) || {});
       const query = String(args.query || args.pattern || "").trim();
       return queryMatchesBrowserDiagnostic(query, browserDiagnosticCheckpoint) &&
         sourcePathsFromGrepResult(result.content || result.displayContent || "", input.workspace).length === 1;
@@ -1724,7 +1726,10 @@ export async function handleToolResultRecoveryPhase(input: {
       outcome?.consoleErrors[0] ||
       outcome?.error ||
       "browser validation failed";
-    const failedArgs = input.toolArgsByCallId.get(failedBrowserValidation.toolCallId) || {};
+    const failedArgs = getToolExecutionArgs(
+      failedBrowserValidation,
+      input.toolArgsByCallId.get(failedBrowserValidation.toolCallId) || {},
+    );
     const browserFailureCallSignature = resolvePersistentBrowserFailureCallSignature(
       failedArgs,
       failedBrowserValidation.content || "",
@@ -1876,20 +1881,26 @@ export async function handleToolResultRecoveryPhase(input: {
     ) {
       return false;
     }
-    const args = input.toolArgsByCallId.get(result.toolCallId) || {};
+    const args = getToolExecutionArgs(result, input.toolArgsByCallId.get(result.toolCallId) || {});
     const command = String(args.command || args.cmd || result.target || "").trim();
     return shouldEnterFailedFiniteValidationRecovery(command);
   });
   const failedFiniteValidationCommand = failedFiniteValidation
     ? (() => {
-        const args = input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {};
+        const args = getToolExecutionArgs(
+          failedFiniteValidation,
+          input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {},
+        );
         return String(
           args.command || args.cmd || failedFiniteValidation.target || "",
         ).trim();
       })()
     : "";
   const failedFiniteValidationArgs = failedFiniteValidation
-    ? input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {}
+    ? getToolExecutionArgs(
+        failedFiniteValidation,
+        input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {},
+      )
     : {};
   const pendingFiniteValidation = failedFiniteValidationCommand
     ? {
@@ -2163,7 +2174,7 @@ export async function handleToolResultRecoveryPhase(input: {
 
   if (
     input.callbacks.getIsPlanApproved() &&
-    input.results.some((result) => !result.isError)
+    input.results.some(hasCompletedToolExecution)
   ) {
     input.callbacks.onPlanStageChanged("executing");
   }
@@ -2171,7 +2182,7 @@ export async function handleToolResultRecoveryPhase(input: {
   if (input.callbacks.getIsPlanApproved()) {
     if (input.results.some((result) => result.isError)) {
       input.emitPlanExecutionProgress("tool_error");
-    } else if (input.results.some((result) => !result.isError)) {
+    } else if (input.results.some(hasCompletedToolExecution)) {
       input.emitPlanExecutionProgress("tool_done");
     }
   }

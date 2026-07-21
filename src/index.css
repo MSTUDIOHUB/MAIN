@@ -618,14 +618,20 @@ html[data-theme="light"] #root {
 [data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #71717a; }
 
 /* ── Agent Explanation Capsule Styles ── */
+@property --capsule-beam-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
 @keyframes capsule-beam-travel {
-  from { stroke-dashoffset: 0; }
-  to { stroke-dashoffset: -100; }
+  to { --capsule-beam-angle: 360deg; }
 }
 
 .agent-explanation-capsule {
   --capsule-beam-duration: 4.2s;
   --capsule-beam-strength: 0.72;
+  --capsule-beam-glow-strength: 0.34;
   pointer-events: auto;
   position: relative;
   overflow: hidden;
@@ -634,70 +640,86 @@ html[data-theme="light"] #root {
   justify-content: center;
   padding: 0.65em 1.5em;
   border-radius: 9999px;
-  border: 1px solid color-mix(in srgb, var(--accent, #9333ea) 26%, rgba(255, 255, 255, 0.14));
+  border: 1px solid var(--surface-border);
   background: rgba(10, 10, 12, 0.62);
   backdrop-filter: blur(16px);
   color: #ffffff;
   font-weight: 500;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 
-              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.28)),
-              0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.18)),
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5),
               inset 0 1px 1px rgba(255, 255, 255, 0.1);
   transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1), padding 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-radius 0.35s cubic-bezier(0.4, 0, 0.2, 1);
   letter-spacing: 0;
   text-align: center;
 }
 
-/*
- * A normalized SVG path keeps motion proportional to the real rounded-rect
- * perimeter. Unlike a rotating conic gradient, its speed does not change at
- * the corners. 40/100 path units gives the beam a 144-degree-equivalent tail.
- */
+.agent-explanation-capsule::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  z-index: 1;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: conic-gradient(
+    from var(--capsule-beam-angle),
+    transparent 0%,
+    transparent 50%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 8%, transparent) 55%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 42%, transparent) 62%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 78%, transparent) 68%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 36%, transparent) 75%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 8%, transparent) 80%,
+    transparent 85%,
+    transparent 100%
+  );
+  -webkit-mask-image:
+    linear-gradient(#fff, rgba(255, 255, 255, 0.6) 12px, transparent 36px, transparent calc(100% - 36px), rgba(255, 255, 255, 0.6) calc(100% - 12px), #fff),
+    linear-gradient(90deg, #fff, rgba(255, 255, 255, 0.6) 12px, transparent 36px, transparent calc(100% - 36px), rgba(255, 255, 255, 0.6) calc(100% - 12px), #fff);
+  -webkit-mask-composite: source-over;
+  mask-image:
+    linear-gradient(#fff, rgba(255, 255, 255, 0.6) 12px, transparent 36px, transparent calc(100% - 36px), rgba(255, 255, 255, 0.6) calc(100% - 12px), #fff),
+    linear-gradient(90deg, #fff, rgba(255, 255, 255, 0.6) 12px, transparent 36px, transparent calc(100% - 36px), rgba(255, 255, 255, 0.6) calc(100% - 12px), #fff);
+  mask-composite: add;
+  filter: blur(9px) saturate(1.15);
+  animation: capsule-beam-travel var(--capsule-beam-duration) linear infinite;
+  animation-play-state: paused;
+  transition: opacity 200ms ease-out;
+  will-change: opacity, filter;
+}
+
+/* Border Beam Rotate: one continuous theme gradient painted into a thin ring. */
 .capsule-rotate-beam {
   position: absolute;
   inset: 0;
   z-index: 2;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
+  box-sizing: border-box;
+  overflow: hidden;
+  border-radius: inherit;
+  padding: 1.5px;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 200ms ease-out;
-}
-
-.capsule-rotate-beam__segment {
-  x: 1px;
-  y: 1px;
-  width: calc(100% - 2px);
-  height: calc(100% - 2px);
-  rx: 15px;
-  ry: 15px;
-  fill: none;
-  stroke: var(--accent-light, #a855f7);
-  stroke-width: 1.5px;
-  stroke-linecap: round;
+  background: conic-gradient(
+    from var(--capsule-beam-angle),
+    transparent 0%,
+    transparent 52%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 10%, transparent) 56%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 38%, transparent) 61%,
+    var(--accent-light, #a855f7) 66%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 88%, #ffffff 12%) 68%,
+    var(--accent-light, #a855f7) 70%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 38%, transparent) 75%,
+    color-mix(in srgb, var(--accent-light, #a855f7) 10%, transparent) 79%,
+    transparent 83%,
+    transparent 100%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
   animation: capsule-beam-travel var(--capsule-beam-duration) linear infinite;
   animation-play-state: paused;
-}
-
-.capsule-rotate-beam__segment--tail {
-  stroke-dasharray: 40 60;
-  stroke-opacity: 0.16;
-}
-
-.capsule-rotate-beam__segment--body {
-  stroke-dasharray: 30 70;
-  stroke-opacity: 0.28;
-}
-
-.capsule-rotate-beam__segment--core {
-  stroke-dasharray: 18 82;
-  stroke-opacity: 0.46;
-}
-
-.capsule-rotate-beam__segment--head {
-  stroke-dasharray: 6 94;
-  stroke-opacity: 0.78;
+  transition: opacity 200ms ease-out;
+  will-change: opacity;
 }
 
 .agent-explanation-capsule:is(
@@ -716,7 +738,18 @@ html[data-theme="light"] #root {
   [data-capsule-status="executing"],
   [data-capsule-status="validating"],
   [data-capsule-status="recovering"]
-) .capsule-rotate-beam__segment {
+)::before {
+  opacity: var(--capsule-beam-glow-strength);
+  animation-play-state: running;
+}
+
+.agent-explanation-capsule:is(
+  [data-capsule-status="analyzing"],
+  [data-capsule-status="planning"],
+  [data-capsule-status="executing"],
+  [data-capsule-status="validating"],
+  [data-capsule-status="recovering"]
+) .capsule-rotate-beam {
   animation-play-state: running;
 }
 
@@ -756,35 +789,54 @@ html[data-theme="light"] #root {
   background: var(--accent, #9333ea);
 }
 
-.agent-explanation-capsule > span {
-  position: relative;
-  z-index: 1;
+/* The live model focus owns the Capsule's primary text surface, matching the
+ * 2.3.2 flow presentation. Markdown must stay fully readable in every theme
+ * instead of inheriting the transcript renderer's muted paragraph colors. */
+.capsule-thought-markdown .markdown-body,
+.capsule-thought-markdown .markdown-body :where(p, li, strong, h1, h2, h3, h4, h5, h6) {
+  color: var(--surface-text-strong) !important;
+}
+
+.capsule-thought-markdown .markdown-body {
+  line-height: 1.55 !important;
+}
+
+.capsule-thought-markdown .markdown-body :where(p, ul, ol) {
+  margin-bottom: 0.35rem;
+}
+
+.capsule-thought-markdown .markdown-body :where(p, ul, ol):last-child {
+  margin-bottom: 0;
 }
 
 /* Light Mode Overrides */
 html[data-theme="light"] .agent-explanation-capsule {
   --capsule-beam-strength: 0.56;
-  border-color: color-mix(in srgb, var(--accent, #9333ea) 22%, rgba(24, 24, 27, 0.16));
+  --capsule-beam-glow-strength: 0.22;
+  border-color: var(--surface-border);
   background: rgba(255, 255, 255, 0.68);
   color: var(--accent-hover, #7e22ce);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), 
-              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.18)),
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06),
               inset 0 1px 1px rgba(255, 255, 255, 0.6);
 }
 
 html[data-theme="black"] .agent-explanation-capsule {
   --capsule-beam-strength: 0.78;
+  --capsule-beam-glow-strength: 0.42;
   background: rgba(0, 0, 0, 0.7);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.58),
-              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.3)),
-              0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.2)),
               inset 0 1px 1px rgba(255, 255, 255, 0.08);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .capsule-rotate-beam__segment {
+  .capsule-rotate-beam {
     animation: none !important;
-    stroke-dashoffset: 0;
+    --capsule-beam-angle: 52deg;
+  }
+
+  .agent-explanation-capsule::before {
+    animation: none !important;
+    --capsule-beam-angle: 52deg;
   }
 
   .agent-explanation-capsule:is(
@@ -795,6 +847,16 @@ html[data-theme="black"] .agent-explanation-capsule {
     [data-capsule-status="recovering"]
   ) .capsule-rotate-beam {
     opacity: calc(var(--capsule-beam-strength) * 0.42);
+  }
+
+  .agent-explanation-capsule:is(
+    [data-capsule-status="analyzing"],
+    [data-capsule-status="planning"],
+    [data-capsule-status="executing"],
+    [data-capsule-status="validating"],
+    [data-capsule-status="recovering"]
+  )::before {
+    opacity: calc(var(--capsule-beam-glow-strength) * 0.45);
   }
 }
 
@@ -809,15 +871,15 @@ html[data-theme="black"] .agent-explanation-capsule {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid color-mix(in srgb, var(--accent, #9333ea) 30%, rgba(255, 255, 255, 0.16));
-  box-shadow: 0 0 16px var(--accent-subtle, rgba(147, 51, 234, 0.4)),
-              inset 0 0 8px var(--accent-subtle, rgba(147, 51, 234, 0.2));
+  border: 1px solid var(--surface-border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28),
+              inset 0 1px 1px rgba(255, 255, 255, 0.08);
   transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.agent-explanation-capsule.collapsed-ring .capsule-rotate-beam__segment {
-  rx: 20px;
-  ry: 20px;
+.agent-explanation-capsule.collapsed-ring::before {
+  inset: -3px;
+  filter: blur(5px) saturate(1.1);
 }
 
 .agent-explanation-capsule.collapsed-ring .animate-pulse {

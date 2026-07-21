@@ -1,5 +1,6 @@
 import { classifyCommandResultOutcome } from "../../planEvidence";
 import type { ExecuteNoProgressStrategyPivot } from "../../executeRecoveryTools";
+import { hasCompletedToolExecution } from "../../toolResultEffect";
 
 export type RecentLoopGuardToolCall = {
   name: string;
@@ -40,6 +41,7 @@ export type ToolFailureSignatureResult = {
   content?: string;
   isError?: boolean;
   internalFeedback?: boolean;
+  lifecycleState?: string;
 };
 
 export function createAgentLoopGuardRuntimeState(): AgentLoopGuardRuntimeState {
@@ -96,7 +98,13 @@ export function applyToolFailureSignatureRuntimeState(
     if (result.internalFeedback) continue;
     const outcome = result.isError
       ? "failed"
-      : classifyCommandResultOutcome(result.name || "", result.content || "");
+      : hasCompletedToolExecution({
+          isError: false,
+          internalFeedback: result.internalFeedback,
+          lifecycleState: result.lifecycleState as any,
+        })
+      ? classifyCommandResultOutcome(result.name || "", result.content || "")
+      : "ignored";
     if (outcome === "failed") {
       state.failedToolCallCounts.set(
         signature,

@@ -252,6 +252,32 @@ test("thin tool preambles stay internal instead of becoming assistant updates", 
   assert.equal(decision.capsuleCandidate, false);
 });
 
+test("repair tool preambles stay process-only even after the Run has tool evidence", () => {
+  for (const visibleAssistantText of [
+    "让我 apply_patch 来修复：",
+    "让我 write_file 来修复：",
+    "让我 sed 来修复：",
+    "Let me use apply_patch to fix this.",
+  ]) {
+    const decision = resolveToolProgressPresentation({
+      progressEligibleToolCallCount: 1,
+      unsupportedToolCallCount: 0,
+      finalReplyOptionCount: 0,
+      hasSubstantivePlanAssistantText: false,
+      workflowMode: "edit",
+      isPlanApproved: true,
+      runtimeNarrationInjected: false,
+      visibleAssistantText,
+      shouldSuppressApprovedPlanNoToolText: false,
+      hasPriorToolEvidence: true,
+    });
+
+    assert.equal(decision.visibility, "user_progress", visibleAssistantText);
+    assert.equal(decision.shouldPreserveApprovedExecutionText, false, visibleAssistantText);
+    assert.equal(decision.capsuleCandidate, false, visibleAssistantText);
+  }
+});
+
 test("unsupported-tool narration remains hidden even when it describes a next attempt", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 0,

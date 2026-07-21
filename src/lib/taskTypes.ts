@@ -102,13 +102,18 @@ export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & {
       type: "tool";
+      /** Provider-facing name retained for display and lifecycle matching. */
       toolName: string;
+      /** Canonical runtime capability used for semantic UI classification. */
+      executionName?: string;
       target: string;
       status: string;
       toolStatus: "pending" | "executed" | "rejected" | "running" | "failed";
       toolCallId?: string;
       message?: string;
       diff?: ToolDiffSnapshot;
+      /** A terminal diff is verified on success and partial after a failed tool. */
+      workspaceEffect?: "verified" | "partial";
       shellPermissionDecision?: ShellPermissionDecision;
       revertStatus?: DiffRevertStatus;
       revertMessage?: string;

@@ -21,7 +21,7 @@ export interface CommitCanceledTurnInput<
   parentRunId?: string | null;
   reason: string;
   message: string;
-  expectedAbortController: AbortController | null;
+  controlPlaneFence: CanceledTurnControlPlaneFence;
   nextTaskId: () => number;
   sessionGet: () => TState;
   getSessionRevisionToken: () => unknown;
@@ -64,9 +64,7 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
 ): Promise<CommitCanceledTurnResult> {
   const maxAttempts = Math.max(1, Math.min(5, input.maxAttempts ?? 3));
   let stableCancellationRunId = "";
-  const controlPlaneFence: CanceledTurnControlPlaneFence = {
-    abortController: input.expectedAbortController,
-  };
+  const controlPlaneFence = input.controlPlaneFence;
 
   const createHarnessSettlement = (
     projectedMarker: HarnessRunMarker | null | undefined,
@@ -113,6 +111,14 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
     stableCancellationRunId = projection.cancellationRunId || stableCancellationRunId;
 
     if (projection.disposition === "already_closed") {
+      if (projection.state === baseState) {
+        return {
+          committed: true,
+          disposition: "already_closed",
+          cancellationRunId: stableCancellationRunId,
+          attempts: attempt,
+        };
+      }
       let durableState: TState | undefined;
       let persistError: unknown = null;
       try {
@@ -255,6 +261,14 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
     controlPlaneFence,
   });
   if (finalProjection.disposition === "already_closed") {
+    if (finalProjection.state === finalBaseState) {
+      return {
+        committed: true,
+        disposition: "already_closed",
+        cancellationRunId: finalProjection.cancellationRunId || stableCancellationRunId,
+        attempts: maxAttempts,
+      };
+    }
     if (finalProjection.state !== finalBaseState) {
       const finalBeforePublish = createHarnessSettlement(
         finalProjection.harnessRunMarker,

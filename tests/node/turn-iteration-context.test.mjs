@@ -67,27 +67,30 @@ test("turn iteration context creates and reuses the session thread", () => {
     currentThread: null,
     eventThreadId: "session-a",
     eventTurnId: "turn-root",
+    runId: "run-a",
     iteration: 1,
     messages: [{ role: "user", content: "hello" }],
   });
 
   assert.equal(first.thread.threadId, "session-a");
-  assert.equal(first.iterationTurnId, "turn-root-1");
-  assert.equal(first.turn.turnId, "turn-root-1");
+  assert.equal(first.runId, "run-a");
+  assert.equal(first.iterationTurnId, "turn-root-run-a-1");
+  assert.equal(first.turn.turnId, "turn-root-run-a-1");
   assert.equal(first.thread.turns.length, 1);
-  assert.equal(first.turnContext.turnId, "turn-root-1");
+  assert.equal(first.turnContext.turnId, "turn-root-run-a-1");
 
   const second = startTurnIteration({
     currentThread: first.thread,
     eventThreadId: "session-a",
     eventTurnId: "turn-root",
+    runId: "run-a",
     iteration: 2,
     messages: [{ role: "user", content: "continue" }],
   });
 
   assert.equal(second.thread, first.thread);
   assert.equal(second.thread.turns.length, 2);
-  assert.equal(second.turn.turnId, "turn-root-2");
+  assert.equal(second.turn.turnId, "turn-root-run-a-2");
 });
 
 test("turn iteration context resets the thread when the event thread changes", () => {
@@ -95,6 +98,7 @@ test("turn iteration context resets the thread when the event thread changes", (
     currentThread: null,
     eventThreadId: "session-a",
     eventTurnId: "turn-root",
+    runId: "run-a",
     iteration: 1,
     messages: [],
   });
@@ -102,6 +106,7 @@ test("turn iteration context resets the thread when the event thread changes", (
     currentThread: first.thread,
     eventThreadId: "session-b",
     eventTurnId: "turn-root",
+    runId: "run-b",
     iteration: 1,
     messages: [],
   });
@@ -109,4 +114,27 @@ test("turn iteration context resets the thread when the event thread changes", (
   assert.notEqual(next.thread, first.thread);
   assert.equal(next.thread.threadId, "session-b");
   assert.equal(next.thread.turns.length, 1);
+});
+
+test("turn iteration identity is scoped by Run when one logical Turn resumes", () => {
+  const firstRun = startTurnIteration({
+    currentThread: null,
+    eventThreadId: "session-a",
+    eventTurnId: "turn-shared",
+    runId: "run-source",
+    iteration: 1,
+    messages: [],
+  });
+  const resumedRun = startTurnIteration({
+    currentThread: firstRun.thread,
+    eventThreadId: "session-a",
+    eventTurnId: "turn-shared",
+    runId: "run-recovery",
+    iteration: 1,
+    messages: [],
+  });
+
+  assert.equal(firstRun.iterationTurnId, "turn-shared-run-source-1");
+  assert.equal(resumedRun.iterationTurnId, "turn-shared-run-recovery-1");
+  assert.notEqual(resumedRun.iterationTurnId, firstRun.iterationTurnId);
 });

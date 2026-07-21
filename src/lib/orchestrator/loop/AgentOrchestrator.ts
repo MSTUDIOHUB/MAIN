@@ -488,6 +488,7 @@ export class AgentOrchestrator {
           currentThread: this.loopThread,
           eventThreadId,
           eventTurnId,
+          runId: callbacks.getCurrentRunIdentity?.()?.runId || turnEvents.eventRunId,
           iteration,
           messages: callbacks.getMessages(),
         });
@@ -833,6 +834,7 @@ export class AgentOrchestrator {
           assistantMsgId,
           finalTextOnlyStep,
           availableToolNames,
+          toolCatalog,
           webSearchEnabled,
           latestUserPromptText,
           repairExecutionRequestInChat,

@@ -5,8 +5,10 @@ import { compactToolPresentationTarget, getToolPresentationLabel } from "./toolP
 export interface ToolUiGroupBlock {
   type?: string;
   toolName?: string;
+  executionName?: string;
   toolStatus?: string;
   diff?: unknown;
+  workspaceEffect?: "verified" | "partial";
   id?: string | number;
   target?: string;
   message?: string;
@@ -17,6 +19,10 @@ export interface ToolUiGroupBlock {
   streaming?: boolean;
   hiddenProcess?: boolean;
   evidence?: string;
+}
+
+function getSemanticToolName(block: ToolUiGroupBlock): string {
+  return String(block.executionName || block.toolName || "");
 }
 
 const REPEATED_BROWSER_FAILURE_GROUP_TYPE = "MAIN_REPEATED_BROWSER_FAILURE";
@@ -221,7 +227,7 @@ function normalizeBrowserFailureFingerprintText(value: unknown): string {
 export function buildRepeatedBrowserFailureSignature(block: ToolUiGroupBlock): string | null {
   if (
     block.type !== "tool" ||
-    block.toolName !== "browser_evaluate" ||
+    getSemanticToolName(block) !== "browser_evaluate" ||
     String(block.toolStatus || "") !== "failed"
   ) {
     return null;
@@ -296,7 +302,7 @@ function isCompletedToolGroupCandidate(
   if (block.type !== "tool") return false;
   if (String(block.toolStatus || "") !== "executed") return false;
   if (block.diff && !includeDiff) return false;
-  if (excludedToolNames.has(String(block.toolName || ""))) return false;
+  if (excludedToolNames.has(getSemanticToolName(block))) return false;
   return true;
 }
 
@@ -350,7 +356,10 @@ export interface ChatOperationItem {
   block: ToolUiGroupBlock;
   blocks: ToolUiGroupBlock[];
   kind: ChatOperationKind;
+  /** Provider-facing display name. */
   toolName: string;
+  /** Canonical capability used only for semantic classification. */
+  executionName: string;
   label: string;
   target: string;
   displayTarget: string;
@@ -477,7 +486,7 @@ function isCachedToolBlock(block: ToolUiGroupBlock): boolean {
 }
 
 function getFullToolTarget(block: ToolUiGroupBlock, language: "zh" | "en"): string {
-  const toolName = String(block.toolName || "");
+  const toolName = getSemanticToolName(block);
   const target = String(block.target || "").trim();
   if (target) return target;
   if (toolName === "get_project_skeleton") return language === "en" ? "Project skeleton" : "项目骨架";
@@ -488,7 +497,7 @@ function isContextOperationCandidate(block: ToolUiGroupBlock): boolean {
   if (block.type !== "tool") return false;
   if (String(block.toolStatus || "") !== "executed") return false;
   if (block.diff) return false;
-  const kind = classifyOperationTool(String(block.toolName || ""));
+  const kind = classifyOperationTool(getSemanticToolName(block));
   return kind === "explore" || kind === "search" || kind === "read" || kind === "table";
 }
 
@@ -500,7 +509,7 @@ function isGenericCompletedOperationCandidate(
   if (block.type !== "tool") return false;
   if (String(block.toolStatus || "") !== "executed") return false;
   if (block.diff && !config.includeDiff) return false;
-  const kind = classifyOperationTool(String(block.toolName || ""));
+  const kind = classifyOperationTool(getSemanticToolName(block));
   if (!config.includeReadContextTools && (kind === "explore" || kind === "search" || kind === "read" || kind === "table")) {
     return false;
   }
@@ -581,7 +590,7 @@ function buildClusterTitle(input: {
   const onlyProjectSkeleton =
     totalCount === 1 &&
     items.length === 1 &&
-    items[0]?.toolName === "get_project_skeleton";
+    items[0]?.executionName === "get_project_skeleton";
   if (onlyProjectSkeleton) {
     return language === "en" ? "Explore project structure" : "Explore · 探索项目结构";
   }
@@ -610,9 +619,10 @@ function buildOperationCluster(
   const byKey = new Map<string, ChatOperationItem>();
   for (const block of blocks) {
     const toolName = String(block.toolName || "");
-    const kind = classifyOperationTool(toolName);
+    const executionName = getSemanticToolName(block);
+    const kind = classifyOperationTool(executionName);
     const target = getFullToolTarget(block, language);
-    const displayTarget = compactToolPresentationTarget(String(block.target || ""), toolName, language);
+    const displayTarget = compactToolPresentationTarget(String(block.target || ""), executionName, language);
     const key = `${toolName}:${target.replace(/\\/g, "/").toLowerCase()}`;
     const summary = String(block.observationSummary || block.intentSummary || block.why || "").trim();
     const cached = isCachedToolBlock(block) ? 1 : 0;
@@ -631,6 +641,7 @@ function buildOperationCluster(
       blocks: [block],
       kind,
       toolName,
+      executionName,
       label: getToolPresentationLabel(toolName, language),
       target,
       displayTarget,
@@ -764,7 +775,7 @@ export function buildChatRenderSegments(input: BuildChatRenderSegmentsInput): Ch
       const groupFamily = isContextOperationCandidate(block) ? "context" : "generic";
       const groupStartsWithProjectSkeleton =
         input.completedToolGrouping?.splitProjectStructureExplore === true &&
-        String(block.toolName || "") === "get_project_skeleton";
+        getSemanticToolName(block) === "get_project_skeleton";
       while (index < blocks.length) {
         const current = blocks[index];
         const currentMatchesFamily = groupFamily === "context"
@@ -774,7 +785,7 @@ export function buildChatRenderSegments(input: BuildChatRenderSegmentsInput): Ch
           if (
             groupStartsWithProjectSkeleton &&
             clusterBlocks.length > 0 &&
-            String(current.toolName || "") !== "get_project_skeleton"
+            getSemanticToolName(current) !== "get_project_skeleton"
           ) {
             break;
           }

@@ -3371,6 +3371,17 @@ test("terminal marker restore keeps the last final and demotes only earlier same
         turnId,
         content: "Older final",
         visibility: "assistant_final",
+        publicProgress: {
+          schemaVersion: 1,
+          kind: "assistant_commentary",
+          source: "model_visible_content",
+          sessionKey,
+          turnId,
+          displayTurnId: turnId,
+          runId,
+          parentRunId: null,
+          createdAt: 200,
+        },
       },
       {
         id: 602,
@@ -3380,6 +3391,17 @@ test("terminal marker restore keeps the last final and demotes only earlier same
         streaming: true,
         hiddenProcess: true,
         visibility: "assistant_final",
+        publicProgress: {
+          schemaVersion: 1,
+          kind: "assistant_commentary",
+          source: "model_visible_content",
+          sessionKey,
+          turnId,
+          displayTurnId: turnId,
+          runId,
+          parentRunId: null,
+          createdAt: 300,
+        },
       },
       {
         id: 603,
@@ -3421,7 +3443,10 @@ test("terminal marker restore keeps the last final and demotes only earlier same
   assert.equal(ownedFinals[0].content, "Canonical final");
   assert.equal(ownedFinals[0].streaming, false);
   assert.equal(ownedFinals[0].hiddenProcess, false);
-  assert.equal(restored.taskFlow.find((block) => block.id === 601)?.visibility, "assistant_update");
+  const demotedFinal = restored.taskFlow.find((block) => block.id === 601);
+  assert.equal(demotedFinal?.visibility, "assistant_update");
+  assert.equal(demotedFinal?.publicProgress, undefined);
+  assert.equal(ownedFinals[0].publicProgress, undefined);
   assert.deepEqual(restored.conversationTurns[0].blockIds, [601, 602]);
   assert.equal(
     restored.taskFlow.filter((block) =>

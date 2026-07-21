@@ -772,6 +772,40 @@ test("reconcilePlanTaskCompletion only completes tasks with matching execution e
   assert.equal(readmeTask.evidenceStatus, "missing");
 });
 
+test("a failed partial file mutation cannot complete its Plan task until a verified mutation follows", () => {
+  const [task] = extractPlanTasks(
+    "- [ ] 修复 src/App.tsx 的状态投影 — 证据: file:src/App.tsx",
+  );
+  const partialMutation = {
+    id: "evidence-partial",
+    kind: "file",
+    value: "src/App.tsx",
+    target: "src/App.tsx",
+    sourceTool: "replace_in_file",
+    observationStatus: "failed",
+    createdAt: 1,
+  };
+  const afterPartial = reconcilePlanTaskCompletion([], [task], [partialMutation]);
+
+  assert.equal(isPlanTaskTrustedComplete(afterPartial[0]), false);
+  assert.notEqual(afterPartial[0].status, "completed");
+
+  const verifiedMutation = {
+    ...partialMutation,
+    id: "evidence-verified",
+    observationStatus: undefined,
+    createdAt: 2,
+  };
+  const afterVerified = reconcilePlanTaskCompletion(
+    afterPartial,
+    [task],
+    [partialMutation, verifiedMutation],
+  );
+
+  assert.equal(isPlanTaskTrustedComplete(afterVerified[0]), true);
+  assert.equal(afterVerified[0].status, "completed");
+});
+
 test("syncPlanTaskCheckboxesFromTrustedTasks mirrors trusted evidence without trusting claims", () => {
   const markdown = [
     "# Tasks",
@@ -4545,6 +4579,61 @@ test("collectChangeEntries includes MCP Unity edit diffs", () => {
   assert.equal(result.entries[0].target, "Assets/Scripts/Managers/GameManager.cs");
   assert.equal(result.entries[0].displayTarget, "GameManager.cs");
   assert.equal(result.entries[0].taskId, 41);
+});
+
+test("collectChangeEntries projects canonical success and failed-after-change without inventing no-diff edits", () => {
+  const canonicalToolName = "mcp__unity__manage_script__f09a";
+  const result = collectChangeEntries([
+    {
+      id: 51,
+      type: "tool",
+      toolName: canonicalToolName,
+      executionName: "manage_script",
+      toolStatus: "executed",
+      target: "Assets/Scripts/Player.cs",
+      workspaceEffect: "verified",
+      diff: {
+        old: "class Player {}",
+        new: "class Player { void Start() {} }",
+        path: "Assets/Scripts/Player.cs",
+      },
+    },
+    {
+      id: 52,
+      type: "tool",
+      toolName: canonicalToolName,
+      executionName: "manage_script",
+      toolStatus: "failed",
+      target: "Assets/Scripts/Enemy.cs",
+      workspaceEffect: "partial",
+      diff: {
+        old: "class Enemy {}",
+        new: "class Enemy { void Awake() {} }",
+        path: "Assets/Scripts/Enemy.cs",
+      },
+    },
+    {
+      id: 53,
+      type: "tool",
+      toolName: canonicalToolName,
+      executionName: "manage_script",
+      toolStatus: "failed",
+      target: "Assets/Scripts/Untouched.cs",
+    },
+  ], (oldText, newText) => ({
+    added: newText === oldText ? 0 : 1,
+    removed: newText === oldText ? 0 : 1,
+  }));
+
+  assert.equal(result.totalExecutedEdits, 2);
+  assert.deepEqual(
+    result.entries.map((entry) => [entry.taskId, entry.target, entry.workspaceEffect]),
+    [
+      [51, "Assets/Scripts/Player.cs", "verified"],
+      [52, "Assets/Scripts/Enemy.cs", "partial"],
+    ],
+  );
+  assert.equal(result.entries.some((entry) => entry.target.endsWith("Untouched.cs")), false);
 });
 
 test("Plan evidence identity isolates same-file tasks and legacy records are consumed one-to-one", () => {

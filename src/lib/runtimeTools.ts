@@ -4,6 +4,7 @@ import {
   getToolRiskLevelForCall,
   getLocalFileReadPathForToolCall,
   isLocalFileReadApproved,
+  isPerCallOnlyToolRisk,
   isToolAutoExecutableForCall,
   type ToolCapabilityRegistry,
   type ToolRiskLevel,
@@ -129,7 +130,7 @@ export function isAllowedBySessionAutoApprove(
   scopes: Iterable<SessionAutoApproveScope> | null | undefined,
   policy: ToolPermissionPolicy,
 ): boolean {
-  if (risk === "destructive") return false;
+  if (isPerCallOnlyToolRisk(risk)) return false;
   if (policy.disabledRiskLevels.includes(risk)) return false;
   if (source === "mcp" && sessionAutoApproveScopesInclude(scopes, "mcp_action")) {
     return true;

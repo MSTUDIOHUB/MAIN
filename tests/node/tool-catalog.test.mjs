@@ -44,6 +44,12 @@ function loadTranspiledModuleSync(sourcePath) {
 const { buildToolCatalog } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/toolCatalog.ts"),
 );
+const {
+  canRecordPlanExecutionEvidenceForTool,
+  hasVerifiedWorkspaceMutationEffect,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/toolResultEffect.ts"),
+);
 
 function definition(name) {
   return {
@@ -139,6 +145,105 @@ test("built-ins retain bare-name ownership when an MCP server registers the same
   );
   assert.ok(diagnostic);
   assert.equal(diagnostic.winner.source, "built_in");
+});
+
+test("same-name external editors cannot inherit built-in mutation trust", () => {
+  const catalog = buildToolCatalog({
+    builtInDefinitions: [definition("replace_in_file")],
+    mcpTools: [mcpTool("Files", "http://files.example/mcp", "replace_in_file")],
+    skills: [toolSkill({
+      id: "skill-replace-in-file",
+      name: "replace in file",
+      desc: "External replacement implementation",
+      packagePath: ".protocols/replace-in-file",
+      entryPoint: "SKILL.md",
+    })],
+  });
+  const builtIn = catalog.lookup("replace_in_file").entry;
+  const mcp = catalog.entries.find((entry) => entry.source === "mcp");
+  const skill = catalog.entries.find((entry) => entry.source === "skill");
+  assert.ok(mcp);
+  assert.ok(skill);
+  assert.equal(mcp.executionName, "replace_in_file");
+  assert.equal(skill.executionName, "replace_in_file");
+
+  const resultFor = (entry, workspaceMutationEvidence) => ({
+    toolCallId: `call-${entry.source}`,
+    name: entry.exposedName,
+    executionName: entry.executionName,
+    catalogIdentity: {
+      source: entry.source,
+      canonicalName: entry.canonicalName,
+    },
+    executedArgs: {
+      path: "src/example.ts",
+      old_string: "before",
+      new_string: "after",
+    },
+    target: "src/example.ts",
+    content: "replacement completed",
+    isError: false,
+    lifecycleState: "completed",
+    ...(workspaceMutationEvidence ? { workspaceMutationEvidence } : {}),
+  });
+
+  assert.equal(hasVerifiedWorkspaceMutationEffect(resultFor(builtIn)), true);
+  assert.equal(hasVerifiedWorkspaceMutationEffect(resultFor(mcp)), false);
+  assert.equal(hasVerifiedWorkspaceMutationEffect(resultFor(skill)), false);
+  assert.equal(hasVerifiedWorkspaceMutationEffect({
+    ...resultFor(builtIn),
+    catalogIdentity: undefined,
+  }), false, "missing provenance is fail-closed");
+
+  const observed = { changedPaths: ["src/example.ts"] };
+  assert.equal(hasVerifiedWorkspaceMutationEffect(resultFor(mcp, observed)), true);
+  assert.equal(hasVerifiedWorkspaceMutationEffect(resultFor(skill, observed)), true);
+
+  assert.equal(canRecordPlanExecutionEvidenceForTool({
+    executionName: builtIn.executionName,
+    catalogIdentity: resultFor(builtIn).catalogIdentity,
+    hasObservedDiff: false,
+  }), true);
+  assert.equal(canRecordPlanExecutionEvidenceForTool({
+    executionName: mcp.executionName,
+    catalogIdentity: resultFor(mcp).catalogIdentity,
+    hasObservedDiff: false,
+  }), false);
+  assert.equal(canRecordPlanExecutionEvidenceForTool({
+    executionName: skill.executionName,
+    catalogIdentity: resultFor(skill).catalogIdentity,
+    hasObservedDiff: false,
+  }), false);
+  assert.equal(canRecordPlanExecutionEvidenceForTool({
+    executionName: mcp.executionName,
+    catalogIdentity: resultFor(mcp).catalogIdentity,
+    hasObservedDiff: true,
+  }), true);
+});
+
+test("tool lifecycle gates built-in mutation fallback on catalog provenance", () => {
+  const source = fs.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const lifecycle = source.slice(
+    source.indexOf("async function executeToolCallWithLifecycle"),
+    source.indexOf("export async function autoMaterializePlanArtifactFromVisibleText"),
+  );
+
+  assert.match(
+    lifecycle,
+    /const catalogIdentity: ToolCatalogIdentity = catalogResolution\?\.status === "resolved"[\s\S]*source: catalogResolution\.entry\.source/,
+  );
+  assert.match(
+    lifecycle,
+    /const trustedBuiltInMutation =[\s\S]*catalogIdentity\.source === "built_in"[\s\S]*BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES\.has\(executionName\)/,
+  );
+  assert.match(
+    lifecycle,
+    /const completedDiffPreview = observedMutationDiffPreview \|\|[\s\S]*trustedBuiltInMutation \? diffPreview : undefined/,
+  );
+  assert.doesNotMatch(
+    lifecycle,
+    /: BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES\.has\(executionName\)[\s\S]{0,160}\? resolveWorkspaceMutationTargets/,
+  );
 });
 
 test("a skill conflicting with a built-in keeps a distinct execution source", () => {

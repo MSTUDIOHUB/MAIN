@@ -2,6 +2,7 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { EffectiveTurnContract, ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
+import type { ToolCatalog } from "../../toolCatalog";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { OrchestratorCallbacks, ToolCallToExecute } from "../types";
 import { handleAssistantCompletionPhase } from "./assistantCompletionPhase";
@@ -71,6 +72,7 @@ export async function handleAssistantIterationPhase(input: {
   assistantMsgId: string;
   finalTextOnlyStep: boolean;
   availableToolNames: Set<string>;
+  toolCatalog: ToolCatalog;
   webSearchEnabled: boolean;
   latestUserPromptText: string;
   repairExecutionRequestInChat: boolean;
@@ -325,6 +327,7 @@ export async function handleAssistantIterationPhase(input: {
     latestUserPromptText: input.latestUserPromptText,
     forceXmlTools: input.forceXmlTools,
     availableToolNames: input.availableToolNames,
+    toolCatalog: input.toolCatalog,
     effectiveToolCalls,
     finalReplyOptions: assistantDisplayActionPhase.finalReplyOptions,
     shouldPauseForUserChoice: assistantOutputPhase.shouldPauseForUserChoice,

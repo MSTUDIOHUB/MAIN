@@ -86,6 +86,7 @@ test("mcp_action scope auto-approves non-destructive MCP tools", () => {
 test("mcp_action scope does NOT auto-approve destructive MCP tools", () => {
   const scopes = ["workspace_write", "shell", "local_file_read", "external_write", "browser_control", "mcp_action"];
   assert.equal(isAllowedBySessionAutoApprove("destructive", "mcp", scopes, DEFAULT_POLICY), false);
+  assert.equal(isAllowedBySessionAutoApprove("desktop_control", "mcp", scopes, DEFAULT_POLICY), false);
 });
 
 test("without mcp_action scope, MCP tools use risk-based scope matching", () => {

@@ -85,7 +85,7 @@ test("orchestrator commits resolved plan bytes only after the quality gate accep
   assert.match(source.slice(rejectionIndex, guardedCommitIndex), /storePublished:\s*false/);
   assert.match(
     source,
-    /export function isSuccessfulPlanArtifactWriteResult[\s\S]{0,220}!result\.internalFeedback/,
+    /export function isSuccessfulPlanArtifactWriteResult[\s\S]{0,220}hasCompletedToolExecution/,
     "a quality-rejected disk write must not become a successful Plan artifact result",
   );
 });
