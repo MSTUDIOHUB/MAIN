@@ -618,13 +618,14 @@ html[data-theme="light"] #root {
 [data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #71717a; }
 
 /* ── Agent Explanation Capsule Styles ── */
-@keyframes capsule-fill-flow {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
+@keyframes capsule-beam-travel {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -100; }
 }
 
 .agent-explanation-capsule {
+  --capsule-beam-duration: 4.2s;
+  --capsule-beam-strength: 0.72;
   pointer-events: auto;
   position: relative;
   overflow: hidden;
@@ -633,7 +634,7 @@ html[data-theme="light"] #root {
   justify-content: center;
   padding: 0.65em 1.5em;
   border-radius: 9999px;
-  border: 1.5px solid var(--accent, #9333ea);
+  border: 1px solid color-mix(in srgb, var(--accent, #9333ea) 26%, rgba(255, 255, 255, 0.14));
   background: rgba(10, 10, 12, 0.62);
   backdrop-filter: blur(16px);
   color: #ffffff;
@@ -645,6 +646,83 @@ html[data-theme="light"] #root {
   transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1), padding 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-radius 0.35s cubic-bezier(0.4, 0, 0.2, 1);
   letter-spacing: 0;
   text-align: center;
+}
+
+/*
+ * A normalized SVG path keeps motion proportional to the real rounded-rect
+ * perimeter. Unlike a rotating conic gradient, its speed does not change at
+ * the corners. 40/100 path units gives the beam a 144-degree-equivalent tail.
+ */
+.capsule-rotate-beam {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease-out;
+}
+
+.capsule-rotate-beam__segment {
+  x: 1px;
+  y: 1px;
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  rx: 15px;
+  ry: 15px;
+  fill: none;
+  stroke: var(--accent-light, #a855f7);
+  stroke-width: 1.5px;
+  stroke-linecap: round;
+  animation: capsule-beam-travel var(--capsule-beam-duration) linear infinite;
+  animation-play-state: paused;
+}
+
+.capsule-rotate-beam__segment--tail {
+  stroke-dasharray: 40 60;
+  stroke-opacity: 0.16;
+}
+
+.capsule-rotate-beam__segment--body {
+  stroke-dasharray: 30 70;
+  stroke-opacity: 0.28;
+}
+
+.capsule-rotate-beam__segment--core {
+  stroke-dasharray: 18 82;
+  stroke-opacity: 0.46;
+}
+
+.capsule-rotate-beam__segment--head {
+  stroke-dasharray: 6 94;
+  stroke-opacity: 0.78;
+}
+
+.agent-explanation-capsule:is(
+  [data-capsule-status="analyzing"],
+  [data-capsule-status="planning"],
+  [data-capsule-status="executing"],
+  [data-capsule-status="validating"],
+  [data-capsule-status="recovering"]
+) .capsule-rotate-beam {
+  opacity: var(--capsule-beam-strength);
+}
+
+.agent-explanation-capsule:is(
+  [data-capsule-status="analyzing"],
+  [data-capsule-status="planning"],
+  [data-capsule-status="executing"],
+  [data-capsule-status="validating"],
+  [data-capsule-status="recovering"]
+) .capsule-rotate-beam__segment {
+  animation-play-state: running;
+}
+
+.agent-explanation-capsule > :not(.capsule-rotate-beam) {
+  position: relative;
+  z-index: 3;
 }
 
 .agent-explanation-scroll-container {
@@ -678,22 +756,6 @@ html[data-theme="light"] #root {
   background: var(--accent, #9333ea);
 }
 
-.agent-explanation-capsule::before {
-  content: "";
-  position: absolute;
-  inset: 1px;
-  z-index: 0;
-  border-radius: inherit;
-  background: linear-gradient(135deg,
-    color-mix(in srgb, var(--accent, #9333ea) 24%, transparent),
-    color-mix(in srgb, var(--accent-light, #a855f7) 28%, transparent),
-    rgba(10, 10, 12, 0.14),
-    color-mix(in srgb, var(--accent, #9333ea) 20%, transparent)
-  );
-  background-size: 300% 300%;
-  animation: capsule-fill-flow 18s ease infinite;
-}
-
 .agent-explanation-capsule > span {
   position: relative;
   z-index: 1;
@@ -701,7 +763,8 @@ html[data-theme="light"] #root {
 
 /* Light Mode Overrides */
 html[data-theme="light"] .agent-explanation-capsule {
-  border-color: var(--accent, #9333ea);
+  --capsule-beam-strength: 0.56;
+  border-color: color-mix(in srgb, var(--accent, #9333ea) 22%, rgba(24, 24, 27, 0.16));
   background: rgba(255, 255, 255, 0.68);
   color: var(--accent-hover, #7e22ce);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), 
@@ -709,17 +772,8 @@ html[data-theme="light"] .agent-explanation-capsule {
               inset 0 1px 1px rgba(255, 255, 255, 0.6);
 }
 
-html[data-theme="light"] .agent-explanation-capsule::before {
-  background: linear-gradient(135deg,
-    color-mix(in srgb, var(--accent, #9333ea) 8%, transparent),
-    color-mix(in srgb, var(--accent-light, #a855f7) 10%, transparent),
-    rgba(255, 255, 255, 0.2),
-    color-mix(in srgb, var(--accent, #9333ea) 7%, transparent)
-  );
-  background-size: 300% 300%;
-}
-
 html[data-theme="black"] .agent-explanation-capsule {
+  --capsule-beam-strength: 0.78;
   background: rgba(0, 0, 0, 0.7);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.58),
               0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.3)),
@@ -728,12 +782,23 @@ html[data-theme="black"] .agent-explanation-capsule {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .agent-explanation-capsule::before {
-    animation: none;
+  .capsule-rotate-beam__segment {
+    animation: none !important;
+    stroke-dashoffset: 0;
+  }
+
+  .agent-explanation-capsule:is(
+    [data-capsule-status="analyzing"],
+    [data-capsule-status="planning"],
+    [data-capsule-status="executing"],
+    [data-capsule-status="validating"],
+    [data-capsule-status="recovering"]
+  ) .capsule-rotate-beam {
+    opacity: calc(var(--capsule-beam-strength) * 0.42);
   }
 }
 
-/* Collapsed ring styles and animation */
+/* Collapsed ring geometry; motion remains owned by the perimeter beam. */
 .agent-explanation-capsule.collapsed-ring {
   width: 42px;
   height: 42px;
@@ -744,33 +809,19 @@ html[data-theme="black"] .agent-explanation-capsule {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1.8px solid var(--accent, #9333ea);
+  border: 1px solid color-mix(in srgb, var(--accent, #9333ea) 30%, rgba(255, 255, 255, 0.16));
   box-shadow: 0 0 16px var(--accent-subtle, rgba(147, 51, 234, 0.4)),
               inset 0 0 8px var(--accent-subtle, rgba(147, 51, 234, 0.2));
   transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
-  animation: collapsed-pulse 2s ease-in-out infinite;
 }
 
-.agent-explanation-capsule.collapsed-ring::before {
-  display: none !important; /* Hide gradient background in collapsed mode */
+.agent-explanation-capsule.collapsed-ring .capsule-rotate-beam__segment {
+  rx: 20px;
+  ry: 20px;
 }
 
-@keyframes collapsed-pulse {
-  0% {
-    box-shadow: 0 0 10px var(--accent-subtle, rgba(147, 51, 234, 0.3)),
-                inset 0 0 5px var(--accent-subtle, rgba(147, 51, 234, 0.15));
-    transform: scale(1);
-  }
-  50% {
-    box-shadow: 0 0 22px var(--accent-subtle, rgba(147, 51, 234, 0.7)),
-                inset 0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.35));
-    transform: scale(1.05);
-  }
-  100% {
-    box-shadow: 0 0 10px var(--accent-subtle, rgba(147, 51, 234, 0.3)),
-                inset 0 0 5px var(--accent-subtle, rgba(147, 51, 234, 0.15));
-    transform: scale(1);
-  }
+.agent-explanation-capsule.collapsed-ring .animate-pulse {
+  animation: none;
 }
 
 /* ── Goal Runtime capsule popover ─────────────────────────────────── */

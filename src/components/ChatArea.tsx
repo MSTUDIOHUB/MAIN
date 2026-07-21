@@ -5099,6 +5099,33 @@ export default function ChatArea({
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
               >
+                <svg
+                  aria-hidden="true"
+                  className="capsule-rotate-beam"
+                  data-testid="capsule-rotate-beam"
+                  focusable="false"
+                >
+                  <rect
+                    className="capsule-rotate-beam__segment capsule-rotate-beam__segment--tail"
+                    pathLength="100"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  <rect
+                    className="capsule-rotate-beam__segment capsule-rotate-beam__segment--body"
+                    pathLength="100"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  <rect
+                    className="capsule-rotate-beam__segment capsule-rotate-beam__segment--core"
+                    pathLength="100"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  <rect
+                    className="capsule-rotate-beam__segment capsule-rotate-beam__segment--head"
+                    pathLength="100"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                </svg>
                 {isCapsuleCollapsed ? (
                   <div
                     className={`flex items-center justify-center w-full h-full ${activeGoal ? `capsule-goal-icon is-${goalStatus}` : "animate-pulse"}`}

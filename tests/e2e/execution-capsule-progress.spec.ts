@@ -1,5 +1,46 @@
 import { expect, test, type Page } from "@playwright/test";
 
+const ACTIVE_CAPSULE_STATUSES = ["analyzing", "planning", "executing", "validating", "recovering"] as const;
+const INACTIVE_CAPSULE_STATUSES = [
+  "awaiting_approval",
+  "awaiting_permission",
+  "awaiting_choice",
+  "paused",
+  "completed",
+  "partial",
+  "blocked",
+  "canceled",
+  "error",
+] as const;
+
+async function readCapsuleBeam(page: Page) {
+  return page.getByTestId("agent-explanation-capsule").evaluate((capsule) => {
+    const beam = capsule.querySelector<SVGSVGElement>("[data-testid='capsule-rotate-beam']");
+    const segments = Array.from(capsule.querySelectorAll<SVGRectElement>(".capsule-rotate-beam__segment"));
+    const beamStyle = beam ? getComputedStyle(beam) : null;
+    return {
+      beamOpacity: Number(beamStyle?.opacity || 0),
+      beamPointerEvents: beamStyle?.pointerEvents || "",
+      beamTransitionDuration: beamStyle?.transitionDuration || "",
+      segments: segments.map((segment) => {
+        const style = getComputedStyle(segment);
+        return {
+          animationName: style.animationName,
+          animationDuration: style.animationDuration,
+          animationTimingFunction: style.animationTimingFunction,
+          animationIterationCount: style.animationIterationCount,
+          animationPlayState: style.animationPlayState,
+          dashArray: style.strokeDasharray,
+          filter: style.filter,
+          pathLength: Number(segment.getAttribute("pathLength")),
+          perimeter: segment.getTotalLength(),
+          stroke: style.stroke,
+        };
+      }),
+    };
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
@@ -7,6 +48,96 @@ test.beforeEach(async ({ page }) => {
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
   });
+});
+
+test("Capsule beam follows a normalized rounded-rect path at constant speed", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(page.getByTestId("capsule-rotate-beam")).toHaveCount(1);
+
+  for (const status of ACTIVE_CAPSULE_STATUSES) {
+    await capsule.evaluate((element, nextStatus) => element.setAttribute("data-capsule-status", nextStatus), status);
+    const beam = await readCapsuleBeam(page);
+    expect(beam.beamOpacity).toBeGreaterThan(0);
+    expect(beam.beamPointerEvents).toBe("none");
+    expect(beam.beamTransitionDuration).toBe("0.2s");
+    expect(beam.segments).toHaveLength(4);
+    for (const segment of beam.segments) {
+      expect(segment.animationName).toBe("capsule-beam-travel");
+      expect(segment.animationDuration).toBe("4.2s");
+      expect(segment.animationTimingFunction).toBe("linear");
+      expect(segment.animationIterationCount).toBe("infinite");
+      expect(segment.animationPlayState).toBe("running");
+      expect(segment.pathLength).toBe(100);
+      expect(segment.perimeter).toBeGreaterThan(0);
+      expect(segment.filter).toBe("none");
+    }
+    expect(beam.segments[0]?.dashArray).toMatch(/40(?:px)?[, ]+60(?:px)?/);
+  }
+
+  for (const status of INACTIVE_CAPSULE_STATUSES) {
+    await capsule.evaluate((element, nextStatus) => element.setAttribute("data-capsule-status", nextStatus), status);
+    await expect.poll(async () => (await readCapsuleBeam(page)).beamOpacity).toBeLessThan(0.01);
+    expect((await readCapsuleBeam(page)).segments.every((segment) => segment.animationPlayState === "paused")).toBe(true);
+  }
+});
+
+test("Capsule beam follows theme intensity and keeps the same motion when collapsed", async ({ page }, testInfo) => {
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setTheme?.("green"));
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  const expectedStrength = { light: 0.56, dark: 0.72, black: 0.78 } as const;
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", mode);
+    await expect.poll(async () => (await readCapsuleBeam(page)).beamOpacity).toBeCloseTo(expectedStrength[mode], 2);
+
+    const colors = await capsule.evaluate((element) => {
+      const segment = element.querySelector<SVGRectElement>(".capsule-rotate-beam__segment--head");
+      const accentLight = getComputedStyle(document.documentElement).getPropertyValue("--accent-light").trim();
+      const probe = document.createElement("span");
+      probe.style.color = accentLight;
+      document.body.appendChild(probe);
+      const normalizedAccentLight = getComputedStyle(probe).color;
+      probe.remove();
+      return {
+        normalizedAccentLight,
+        segmentStroke: segment ? getComputedStyle(segment).stroke : "",
+      };
+    });
+    const beam = await readCapsuleBeam(page);
+    expect(beam.beamOpacity).toBeCloseTo(expectedStrength[mode], 2);
+    expect(colors.segmentStroke).toBe(colors.normalizedAccentLight);
+    await capsule.screenshot({ path: testInfo.outputPath(`capsule-rotate-beam-${mode}.png`) });
+  }
+
+  await page.getByTitle("隐藏").click();
+  await expect(capsule).toHaveClass(/collapsed-ring/);
+  const collapsed = await readCapsuleBeam(page);
+  expect(collapsed.segments.every((segment) => segment.animationPlayState === "running")).toBe(true);
+  const collapsedAnimations = await capsule.evaluate((element) => ({
+    capsule: getComputedStyle(element).animationName,
+    icon: getComputedStyle(element.querySelector<HTMLElement>(".animate-pulse")!).animationName,
+  }));
+  expect(collapsedAnimations.capsule).toBe("none");
+  expect(collapsedAnimations.icon).toBe("none");
+  await capsule.screenshot({ path: testInfo.outputPath("capsule-rotate-beam-collapsed.png") });
+});
+
+test("Capsule beam becomes a static low-intensity indicator for reduced motion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+
+  const beam = await readCapsuleBeam(page);
+  expect(beam.beamOpacity).toBeCloseTo(0.72 * 0.42, 2);
+  expect(beam.segments.every((segment) => segment.animationName === "none")).toBe(true);
+  expect(beam.segments.every((segment) => segment.animationPlayState === "running")).toBe(true);
 });
 
 test("ExecutionCapsule does not invent execution step progress from plain tool activity", async ({ page }) => {
