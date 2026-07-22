@@ -17,6 +17,7 @@ import {
 } from "../../browserValidation";
 import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
+  autoMaterializePlanArtifactFromEvidence,
   isReviewablePlanStage,
   isProjectSourceWriteResult,
   isSuccessfulPlanArtifactWriteResult,
@@ -95,6 +96,10 @@ import {
   shouldPauseForReviewablePlanArtifactAfterToolResults,
 } from "./planQualityRecovery";
 import { handlePlanReadOnlyConvergence } from "./planConvergence";
+import {
+  buildPlanGenerationFailedMessage,
+  buildPlanGenerationFailedProgress,
+} from "./planNoToolRecovery";
 import { appendToolResultsToHistory } from "./toolResultHistory";
 import {
   joinPendingSubagentsForParent,
@@ -994,6 +999,8 @@ export async function handleToolResultRecoveryPhase(input: {
     planQualityRecovery,
   );
   const pendingPlanRuntimeRecoveryPrompt = planQualityRecovery.pendingPlanRuntimeRecoveryPrompt;
+  const shouldMaterializeRejectedToolPlanFromEvidence =
+    planQualityRecovery.deterministicEvidenceMaterializationCandidate;
   const approvedPlanScopeConflict = getApprovedPlanScopeConflict(input.results);
   const approvedPlanScopeBlockedTargets = approvedPlanScopeConflict.unexpectedTargets;
 
@@ -1479,6 +1486,66 @@ export async function handleToolResultRecoveryPhase(input: {
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
   });
+
+  if (shouldMaterializeRejectedToolPlanFromEvidence) {
+    const materialized = await autoMaterializePlanArtifactFromEvidence({
+      workspace: input.workspace,
+      callbacks: input.callbacks,
+      userGoal: input.latestUserPromptText,
+      recentToolActivity: input.recentPlanToolActivity,
+      attemptedTargets: input.attemptedPlanWriteTargets,
+      turnContext: input.turnInputContextSignals,
+    });
+    logAgentEvent(
+      materialized.ok
+        ? "plan_tool_rejection_evidence_materialization_succeeded"
+        : "plan_tool_rejection_evidence_materialization_failed",
+      {
+        iteration: input.iteration,
+        qualityGateReason: planQualityRecovery.planLastQualityGateReason,
+        qualityRejectCount: planQualityRecovery.planQualityRejectCount,
+        path: materialized.path || "",
+        source: materialized.source || "",
+        reason: materialized.reason || "",
+      },
+    );
+    if (materialized.ok) {
+      planRuntimeState = applyPlanQualityRuntimeState(planRuntimeState, {
+        ...planQualityRecovery,
+        planArtifactQualityRejected: false,
+        planLastQualityGateReason: "",
+        planLastMissingSections: [],
+        planEvidenceRecoveryObjective: "none",
+      });
+      const currentStage = input.callbacks.getPlanStage();
+      if (isReviewablePlanStage(currentStage)) {
+        const reviewResult = await input.pauseForReviewablePlanArtifact(
+          "post_tool_runtime_evidence_materialization",
+          { planArtifactQualityRejected: false },
+        );
+        if (reviewResult === "approved_continue") return finish("continue");
+        if (reviewResult === "stopped") return finish("stopped");
+      }
+    } else if (planQualityRecovery.planQualityRejectCount >= 2) {
+      const failureReason = materialized.reason ||
+        planQualityRecovery.planLastQualityGateReason ||
+        "persisted_plan_quality_recovery_exhausted";
+      logAgentEvent("loop_stop", {
+        reason: "persisted_plan_quality_recovery_exhausted",
+        iteration: input.iteration,
+        qualityGateReason: planQualityRecovery.planLastQualityGateReason,
+        qualityRejectCount: planQualityRecovery.planQualityRejectCount,
+        materializationReason: materialized.reason || "",
+      });
+      input.callbacks.onNonActionableStop(
+        buildPlanGenerationFailedMessage(input.callbacks.getPreferredLanguage(), failureReason),
+        "incomplete_plan",
+        buildPlanGenerationFailedProgress(failureReason),
+      );
+      input.callbacks.onStatusChange("idle");
+      return finish("stopped");
+    }
+  }
 
   const noProgressRecovery = handleNoProgressRecovery({
     callbacks: input.callbacks,

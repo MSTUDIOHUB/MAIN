@@ -1,5 +1,6 @@
 import { getReviewablePlanArtifacts } from "./planApprovalIdentity";
 import {
+  extractShellCommandsFromText,
   isFinitePlanValidationCommand,
   normalizeRuntimePlanSectionHeadings,
   requiresPtyObservationForPlanCommand,
@@ -71,7 +72,21 @@ export function findPlanValidationSectionHeadingLineIndex(content: string): numb
 }
 
 export function planArtifactRequiresExecutableValidation(artifact: PlanArtifact): boolean {
-  return collectValidationSectionLines(artifact.content).length > 0;
+  const validationLines = collectValidationSectionLines(artifact.content);
+  if (validationLines.length === 0) return false;
+
+  // An execution Plan promises a runnable implementation transaction, so any
+  // validation section in plan.md must project to an executable task. Earlier
+  // design/requirements artifacts describe architecture and acceptance intent;
+  // prose such as sample-data checks is reviewable before the concrete command
+  // surface exists. Preserve explicit commands when the author already supplied
+  // them, but do not make every design.md unreviewable merely for naming a
+  // validation strategy.
+  if (artifact.kind === "plan") return true;
+  return extractShellCommandsFromText(validationLines.join("\n")).some((command) =>
+    isFinitePlanValidationCommand(command) ||
+    requiresPtyObservationForPlanCommand(command)
+  );
 }
 
 export function isExecutablePlanValidationTask(task: PlanTask): boolean {

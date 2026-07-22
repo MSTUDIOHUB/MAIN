@@ -79,16 +79,22 @@ function compactText(value: unknown, maxChars: number): string {
 
 function normalizeDeclaredRemainingWorkValue(value: unknown): string {
   const normalized = String(value ?? "")
+    .replace(/^[ \t]*(?:[-*_][ \t]*){3,}$/gm, "")
+    .replace(/\*\*|__/g, "")
     .replace(/^[ \t]*(?:[-*]|\d+[.)、])?[ \t]*/gm, "")
     .replace(/[`~]/g, "")
-    .replace(/\*\*|__/g, "")
     .trim();
   const contradictsNegation = /(?:但|不过|然而|可是|but|however|except).{0,80}(?:仍?需|需要|尚需|待处理|未完成|need|required|remain|pending|left)/i.test(normalized);
   const chineseNoRemainingStatement = /^(?:(?:无|没有|暂无)(?:任何)?(?:(?:剩余|后续|待办)(?:工作|任务|事项))?(?:[。.！!\s]*(?:[（(]\s*已(?:完成|检查|核实|覆盖)[^）)]*[）)]|已(?:完成|检查|核实|覆盖)[\s\S]*))?[。.！!\s]*|已(?:完成|检查|核实|覆盖)[^,，;；。\n]{0,80}[,，;；。\s]+(?:无|没有)(?:任何)?(?:剩余|后续|待办)(?:工作|任务|事项)[。.！!\s]*)$/i.test(normalized);
   const englishNoRemainingStatement = /^(?:no\s+(?:remaining|further|additional)\s+(?:work|tasks?|actions?|steps?)(?:\s+(?:is|are))?(?:\s+(?:required|needed|pending))?(?:\s+(?:within|in)\b[^.!]*)?|nothing\s+remains(?:\s+to\s+be\s+done)?)[.!\s]*$/i.test(normalized);
+  const chineseLeadingNoWithCompletion =
+    /^(?:无|没有|暂无)[。.！!]/.test(normalized) &&
+    /(?:已[\s\S]{0,180}(?:完成|完毕|覆盖|达成)|(?:完成|覆盖)了)/.test(normalized);
   const noRemainingCompletionStatement =
     chineseNoRemainingStatement ||
+    chineseLeadingNoWithCompletion ||
     englishNoRemainingStatement ||
+    /^(?:无|没有|暂无)[。.！!]\s*(?:(?!但|不过|然而|可是|仍?需|需要|尚需|待处理|未完成)[\s\S]){0,240}(?:已(?:(?!未完成)[^,，;；。\n]){0,24}(?:完成|检查|核实|覆盖|达成|完毕)|目标已达成|范围已覆盖)[\s\S]*$/i.test(normalized) ||
     /^(?:none|nothing|n\/?a|not applicable)(?:(?:[.!;\s]+|\s*[—–-]\s*)(?:the\s+|all\s+)?(?:(?:requested|assigned|scoped)\s+)?(?:work|scope)?\s*(?:is\s+)?(?:complete(?:d)?|done)[\s\S]*)?[.!\s]*$/i.test(normalized);
   const explicitlyNegated = (
     /^(?:无需|不需要|no further\b|not required\b|nothing (?:else|further)\b)/i.test(normalized) ||
@@ -139,7 +145,11 @@ function collectRemainingWorkLeafValues(
       "work",
       "remainingwork",
       "remainingtasks",
+      "remaininginscopework",
+      "remainingscopedwork",
       "剩余工作",
+      "剩余范围内工作",
+      "剩余作用域内工作",
     ]);
     for (const [key, item] of Object.entries(record)) {
       const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
@@ -166,7 +176,15 @@ function collectStructuredRemainingWorkValues(
   if (typeof value !== "object") return;
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
-    if (["remainingwork", "remainingtasks", "剩余工作"].includes(normalizedKey)) {
+    if ([
+      "remainingwork",
+      "remainingtasks",
+      "remaininginscopework",
+      "remainingscopedwork",
+      "剩余工作",
+      "剩余范围内工作",
+      "剩余作用域内工作",
+    ].includes(normalizedKey)) {
       collectRemainingWorkLeafValues(item, output, depth + 1);
       continue;
     }
@@ -245,7 +263,71 @@ export function extractDeclaredSubagentRemainingWork(summary: string): string {
     if (uniqueValues.length > 0) return compactText(uniqueValues.join("\n"), 1_000);
   }
 
-  const marker = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:剩余工作|Remaining Work)(?:\*\*|__)?\s*[:：]?[ \t]*/i.exec(text);
+  const marker = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:剩余(?:范围内|作用域内)?工作|Remaining (?:In-Scope |Scoped )?Work)(?:\*\*|__)?\s*[:：]?[ \t]*/i.exec(text);
+  if (!marker || marker.index === undefined) return "";
+  const tail = text.slice(marker.index + marker[0].length);
+  const section = tail.split(/\n\s*(?:#{1,6}\s+|(?:\*\*|__)[^*\n]{1,48}(?:\*\*|__)\s*[:：])/)[0] || "";
+  return normalizeDeclaredRemainingWorkValue(section);
+}
+
+function hasDeclaredSubagentRemainingWorkSection(summary: string): boolean {
+  const text = String(summary || "");
+  if (/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:剩余(?:范围内|作用域内)?工作|Remaining (?:In-Scope |Scoped )?Work)(?:\*\*|__)?\s*[:：]?[ \t]*/i.test(text)) {
+    return true;
+  }
+  const structured = parseStructuredSubagentSummary(text);
+  if (structured === null) return false;
+  const visit = (value: unknown, depth = 0): boolean => {
+    if (depth > 12 || value === null || value === undefined) return false;
+    if (Array.isArray(value)) return value.some((item) => visit(item, depth + 1));
+    if (typeof value !== "object") return false;
+    return Object.entries(value as Record<string, unknown>).some(([key, item]) => {
+      const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
+      if ([
+        "remainingwork",
+        "remainingtasks",
+        "remaininginscopework",
+        "remainingscopedwork",
+        "剩余工作",
+        "剩余范围内工作",
+        "剩余作用域内工作",
+      ].includes(normalizedKey)) return true;
+      if (["data", "example", "examples", "input", "inputs", "properties", "schema", "schemas", "source", "sources", "toolresult", "toolresults"].includes(normalizedKey)) {
+        return false;
+      }
+      return visit(item, depth + 1);
+    });
+  };
+  return visit(structured);
+}
+
+export function extractDeclaredSubagentParentHandoff(summary: string): string {
+  const text = String(summary || "");
+  const structured = parseStructuredSubagentSummary(text);
+  if (structured && typeof structured === "object") {
+    const candidates: string[] = [];
+    const visit = (value: unknown, depth = 0): void => {
+      if (depth > 10 || value === null || value === undefined) return;
+      if (Array.isArray(value)) {
+        value.forEach((item) => visit(item, depth + 1));
+        return;
+      }
+      if (typeof value !== "object") return;
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
+        if (["parenthandoff", "parentdecisions", "parentfollowup", "父任务交接", "父任务确认", "父任务事项"].includes(normalizedKey)) {
+          collectRemainingWorkLeafValues(item, candidates, depth + 1);
+        } else {
+          visit(item, depth + 1);
+        }
+      }
+    };
+    visit(structured);
+    const uniqueCandidates = [...new Set(candidates)];
+    if (uniqueCandidates.length > 0) return compactText(uniqueCandidates.join("\n"), 1_000);
+  }
+
+  const marker = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:父任务(?:交接|确认|事项)|Parent (?:Handoff|Decisions?|Follow-Up))(?:\*\*|__)?\s*[:：]?[ \t]*/i.exec(text);
   if (!marker || marker.index === undefined) return "";
   const tail = text.slice(marker.index + marker[0].length);
   const section = tail.split(/\n\s*(?:#{1,6}\s+|(?:\*\*|__)[^*\n]{1,48}(?:\*\*|__)\s*[:：])/)[0] || "";
@@ -557,7 +639,9 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
       expectedOutput ? `Expected output: ${expectedOutput}` : "",
       "Use only the read/search tools exposed to you. Do not modify files, run shell commands, request approval, or spawn another agent.",
       "Do not finish by proposing a tool call that is still available to you. A complete report needs at least one source-backed observation; if an outline or search is empty, read an exact allowed file before summarizing.",
-      "Stay inside the allowed paths. Return a concise evidence summary with file paths, findings, uncertainty, and remaining work. Never offer approval choices or address the end user directly.",
+      "Completion is measured only against your assigned read-only scope, not the parent task. Stay inside the allowed paths and return concise Findings, Uncertainty, Remaining In-Scope Work, and Parent Handoff sections.",
+      "Remaining In-Scope Work lists only an allowed read/search action required by the objective or expected output that you did not complete. If all assigned investigation is complete, write 'none'. Put edits, implementation suggestions, user/parent decisions, and checks outside allowed paths under Parent Handoff; those do not make the child incomplete.",
+      "Never offer approval choices or address the end user directly.",
     ].filter(Boolean).join("\n\n");
   }
   return [
@@ -570,7 +654,9 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
     expectedOutput ? `预期产出：${expectedOutput}` : "",
     "只使用当前暴露的读取与搜索工具。不得修改文件、运行 Shell 命令、请求用户批准或继续创建子智能体。",
     "不要以“稍后再调用当前可用工具”结束任务。完整报告至少需要一条源码支撑的观察；若 outline 或搜索为空，应先读取一个允许的精确文件再总结。",
-    "严格限制在允许路径内。返回简洁的证据摘要，包含文件路径、结论、不确定项与剩余工作；不要提供批准选项，也不要直接面向最终用户说话。",
+    "完成状态只按分配给你的只读范围判断，不按父任务是否全部完成判断。严格限制在允许路径内，并用“结论 / 不确定项 / 剩余范围内工作 / 父任务交接”四个部分返回简洁证据摘要。",
+    "“剩余范围内工作”只能列出目标或预期产出要求、允许路径内且你尚未完成的读取/搜索动作；如果分配的调查已经完成，明确写“无”。文件修改、实施建议、用户或父任务决策、允许路径外的核对都放入“父任务交接”，它们不代表子任务未完成。",
+    "不要提供批准选项，也不要直接面向最终用户说话。",
   ].filter(Boolean).join("\n\n");
 }
 
@@ -1128,7 +1214,10 @@ export async function executeControlledSubagent(input: {
           content: rawObservation,
           maxChars: 400,
         }) || compactText(rawObservation, 1_000);
-        const facts = extractPlanEvidenceFacts(detail);
+        const facts = mergePlanEvidenceFacts(
+          extractPlanEvidenceFacts(rawObservation),
+          extractPlanEvidenceFacts(detail),
+        );
         const isSourceRead = ["read_file", "read_file_window", "read_document"].includes(result.name);
         const isStructureRead = result.name === "get_file_outline";
         const isDiffRead = result.name === "git_diff";
@@ -1351,10 +1440,30 @@ export async function executeControlledSubagent(input: {
         finalSummary = candidateSummary;
         const compactedEvidence = compactEvidence(evidence);
         const declaredRemainingWork = extractDeclaredSubagentRemainingWork(candidateSummary);
+        const declaredRemainingWorkSection = hasDeclaredSubagentRemainingWorkSection(candidateSummary);
+        const parentHandoff = extractDeclaredSubagentParentHandoff(candidateSummary);
         const requiresEvidence = String(input.request.expectedOutput || "").trim().length > 0;
         const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
         const hasSubstantiveEvidence = substantiveEvidence.length > 0;
         const pathCoverage = resolvePathCoverage();
+        if (
+          finalStatus !== "completed" &&
+          outcome.status === "completed" &&
+          outcome.reason === "subagent_max_iterations_partial_handoff" &&
+          declaredRemainingWorkSection &&
+          !declaredRemainingWork &&
+          hasSubstantiveEvidence &&
+          pathCoverage.uncoveredPaths.length === 0
+        ) {
+          finalStatus = "completed";
+          lastError = "";
+          emitChildDebug("subagent_bounded_handoff_closed", {
+            reason: "explicit_scope_closure_with_evidence",
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
+            coveredPaths: pathCoverage.coveredPaths,
+          });
+        }
         if (finalStatus === "completed" && declaredRemainingWork) {
           finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
           lastError = "SUBAGENT_REMAINING_WORK_DECLARED: the child report explicitly identifies unfinished in-scope work.";
@@ -1466,6 +1575,7 @@ export async function executeControlledSubagent(input: {
           closureState,
           ...(remainingWork ? { remainingWork } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
+          ...(parentHandoff ? { parentHandoff } : {}),
           progress: {
             phase: "done",
             title: finalStatus === "completed"
@@ -1516,6 +1626,7 @@ export async function executeControlledSubagent(input: {
           summaryTrust: "unverified_hypothesis",
           evidence: compactedEvidence,
           closureAudit,
+          ...(parentHandoff ? { parentHandoff } : {}),
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
           ...(finalStatus === "blocked" || finalStatus === "degraded"
             ? { remainingWork }

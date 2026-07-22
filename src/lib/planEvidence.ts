@@ -1,5 +1,8 @@
 import { extractPrimaryUserRequestText } from "./turnIntake";
-import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  resolveUniqueWorkspaceFileReference,
+  workspacePathsReferToSameFile,
+} from "./workspacePaths";
 import {
   analyzePtyObservationResult,
   classifyPtyCommandFailure,
@@ -90,8 +93,8 @@ const PLAN_PATH_RE = /(?:^|[\\/])\.MAIN[\\/]plans[\\/]/i;
 const LOW_SIGNAL_TARGET_RE = /(?:^|[\\/])(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
 const PATH_LIKE_RE = /(?:^|[\s`'"(])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+)(?=$|[\s`'"),:;])/g;
 const OBJECTIVE_SOURCE_REFERENCE_RE = /(?:\.{1,2}\/|[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.-]+\.(?:tsx?|jsx?|mjs|cjs|rs|py|go|swift|java|kt|cs|cpp|c|h|hpp|vue|svelte|css|scss|html|json|toml|ya?ml)/gi;
-const OBJECTIVE_MUTATION_VERB_RE = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|替换|重构|删除|创建|implement|change|update|modify|fix|add|replace|refactor|delete|create)/gi;
-const PLAN_CANDIDATE_MUTATION_RE = /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|补全|完善|调整|替换|重构|删除|创建|统一|对齐|implement|change|update|modify|fix|add|replace|refactor|delete|create|complete|align)/i;
+const OBJECTIVE_MUTATION_VERB_RE = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|移除|替换|重构|删除|创建|implement|change|update|modify|fix|add|remove|replace|refactor|delete|create)/gi;
+const PLAN_CANDIDATE_MUTATION_RE = /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|补全|完善|调整|移除|替换|重构|删除|创建|统一|对齐|implement|change|update|modify|fix|add|remove|replace|refactor|delete|create|complete|align)/i;
 const MAX_PLAN_EVIDENCE_FACTS = 24;
 
 function stableHash(value: string): string {
@@ -312,6 +315,94 @@ function planEvidenceFactPriority(fact: PlanEvidenceFact, objective: string, ind
   return score;
 }
 
+interface StructuredFieldContractObservation {
+  target: string;
+  required: Set<string>;
+  optional: Set<string>;
+  returned: Set<string>;
+  read: Set<string>;
+  selected: Set<string>;
+  displayNames: Map<string, string>;
+}
+
+function collectStructuredFieldContractObservations(
+  facts: PlanEvidenceFact[],
+): StructuredFieldContractObservation[] {
+  return facts.map((fact) => {
+    const observation: StructuredFieldContractObservation = {
+      target: fact.target,
+      required: new Set<string>(),
+      optional: new Set<string>(),
+      returned: new Set<string>(),
+      read: new Set<string>(),
+      selected: new Set<string>(),
+      displayNames: new Map<string, string>(),
+    };
+    const remember = (raw: string, bucket: Set<string>) => {
+      const display = String(raw || "").split(".").pop() || "";
+      const key = display.toLowerCase();
+      if (!key) return;
+      bucket.add(key);
+      if (!observation.displayNames.has(key)) observation.displayNames.set(key, display);
+    };
+    for (const match of fact.summary.matchAll(/\bfield_contract\s*\(\s*([^,()]+)\s*,\s*(required|optional)\s*\)/gi)) {
+      remember(match[1] || "", match[2]?.toLowerCase() === "required" ? observation.required : observation.optional);
+    }
+    for (const match of fact.summary.matchAll(/\breturned_field_contract\s*\(\s*([^,()]+)\s*\)/gi)) {
+      remember(match[1] || "", observation.returned);
+    }
+    for (const match of fact.summary.matchAll(/\bfield_read_contract\s*\(\s*([^,()]+)\s*\)/gi)) {
+      remember(match[1] || "", observation.read);
+    }
+    for (const match of fact.summary.matchAll(/\bfield_fallback_contract\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)/gi)) {
+      remember(match[1] || "", observation.read);
+      remember(match[2] || "", observation.read);
+    }
+    for (const match of fact.summary.matchAll(/\bfield_selector_contract\s*\(\s*([^,()]+)\s*\)/gi)) {
+      remember(match[1] || "", observation.selected);
+    }
+    return observation;
+  });
+}
+
+function objectiveMentionsContractField(objective: string, field: string): boolean {
+  return new RegExp(`(?:^|[^A-Za-z0-9_$])${escapeRegExp(field)}(?:$|[^A-Za-z0-9_$])`, "i")
+    .test(String(objective || ""));
+}
+
+function collectStructuredFieldContractMismatches(
+  facts: PlanEvidenceFact[],
+  objective: string,
+): string[] {
+  const observations = collectStructuredFieldContractObservations(facts);
+  const requiredFields = new Map<string, string>();
+  for (const observation of observations) {
+    for (const field of observation.required) {
+      requiredFields.set(field, observation.displayNames.get(field) || field);
+    }
+  }
+
+  const mismatches: string[] = [];
+  for (const [field, display] of requiredFields) {
+    if (!objectiveMentionsContractField(objective, display)) continue;
+    const requiredOwners = observations.filter((item) => item.required.has(field));
+    const consumerOwners = observations.filter((item) => item.read.has(field) || item.selected.has(field));
+    const producerOwners = observations.filter((item) =>
+      item.optional.has(field) && item.returned.size > 0 && !item.returned.has(field)
+    );
+    const hasIndependentRequiredOwner = producerOwners.some((producer) =>
+      requiredOwners.some((owner) => owner.target !== producer.target)
+    );
+    const hasIndependentConsumer = producerOwners.some((producer) =>
+      consumerOwners.some((owner) => owner.target !== producer.target)
+    );
+    if (producerOwners.length > 0 && hasIndependentRequiredOwner && hasIndependentConsumer) {
+      mismatches.push(`producer_missing_required_field:${display}`);
+    }
+  }
+  return mismatches;
+}
+
 function collectContractMismatchKinds(facts: PlanEvidenceFact[], objective = ""): string[] {
   const invokedCommands = new Set<string>();
   const registeredCommands = new Set<string>();
@@ -384,6 +475,7 @@ function collectContractMismatchKinds(facts: PlanEvidenceFact[], objective = "")
       mismatches.push(`config_value_mismatch:${contract.key}`);
     }
   }
+  mismatches.push(...collectStructuredFieldContractMismatches(facts, objective));
   return [...new Set(mismatches)].slice(0, 8);
 }
 
@@ -466,6 +558,20 @@ function factIsChangeTargetForContractMismatch(
       if (extractComparableConfigurationObservations(fact).some((observation) => observation.key === key)) {
         return true;
       }
+    }
+    if (kind.startsWith("producer_missing_required_field:")) {
+      const field = kind.slice("producer_missing_required_field:".length);
+      const escapedField = escapeRegExp(field);
+      const declaresOptionalField = new RegExp(
+        `field_contract\\s*\\(\\s*[^,()]*\\.${escapedField}\\s*,\\s*optional\\s*\\)`,
+        "i",
+      ).test(summary);
+      const returnsAnyField = /\breturned_field_contract\s*\(/i.test(summary);
+      const returnsRequiredField = new RegExp(
+        `returned_field_contract\\s*\\(\\s*${escapedField}\\s*\\)`,
+        "i",
+      ).test(summary);
+      if (declaresOptionalField && returnsAnyField && !returnsRequiredField) return true;
     }
   }
   return false;
@@ -733,10 +839,8 @@ function isPlanCandidateMutationLine(text: string): boolean {
 function findTargetRef(text: string, bundle: PlanEvidenceBundle): string {
   const explicitPaths = findExplicitPlanPaths(text);
   for (const path of explicitPaths) {
-    const exact = bundle.changeTargets.find((target) =>
-      workspacePathsReferToSameFile(target, path)
-    );
-    if (exact) return exact;
+    const resolved = resolveUniqueWorkspaceFileReference(path, bundle.changeTargets);
+    if (resolved) return resolved;
   }
   // An explicit file reference is a hard claim. Preserve it when it is not
   // grounded so validation can reject a false relative suffix instead of

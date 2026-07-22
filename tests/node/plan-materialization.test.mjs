@@ -1113,6 +1113,31 @@ test("Plan diagnostic absence claims are rejected when read evidence contains th
   assert.match(materialized.reason || "", /plan_diagnostic_claim_contradicted:DOMContentLoaded/);
 });
 
+test("a missing returned-field mapping is not contradicted by a type declaration", () => {
+  const content = [
+    "# CSV creatorName 整改计划",
+    "## 根因",
+    "- `src/hooks/useCsvParser.ts` 的返回对象缺少 creatorName 映射。",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，从 creator 归一化赋值 creatorName。",
+    "## 测试方案",
+    "- 运行 `npm test` 验证 creatorName 输出。",
+    "## 风险",
+    "- 保留 creator 回退字段。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    summary: [
+      "interface CsvOrder { creator?: string; creatorName?: string }",
+      "function normalizeCsvOrder(row) { return { creator: row.creator || '' }; }",
+    ].join("\n"),
+  }];
+
+  assert.equal(findContradictedPlanDiagnosticClaim({ content, evidenceRecords }), null);
+});
+
 test("Plan diagnostic absence claims stay scoped to the named tabular source", () => {
   const content = [
     "# CSV creatorName 整改计划",
@@ -1431,6 +1456,91 @@ test("plan evidence keeps related CSV consumers as facts without turning them in
 
   assert.equal(bundle.facts.length, 4);
   assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+});
+
+test("source-backed field contracts detect a generic producer-to-consumer mismatch and preserve the established contract", () => {
+  const sourceRecord = (target, source) => {
+    const content = [
+      "READ_FILE_RESULT",
+      `path: ${target}`,
+      "---CONTENT START---",
+      source,
+      "---CONTENT END---",
+    ].join("\n");
+    return {
+      tool: "read_file",
+      target,
+      status: "succeeded",
+      summary: summarizePlanEvidenceDetail({ tool: "read_file", target, content, maxChars: 400 }),
+      facts: extractPlanEvidenceFacts(content),
+    };
+  };
+  const records = [
+    sourceRecord("src/hooks/useCsvParser.ts", [
+      "export interface CsvOrder {",
+      "  creator?: string;",
+      "  creatorName?: string;",
+      "}",
+      "export function normalizeCsvOrder(row: Record<string, string>): CsvOrder {",
+      "  return { creator: row.creator || row['创建者'] || '' };",
+      "}",
+    ].join("\n")),
+    sourceRecord("src/hooks/useChartData.ts", [
+      "export function buildCourseRanking(orders: any[]) {",
+      "  return orders.map((order) => ({ name: order.creatorName || order.creator || 'unknown', amount: 1 }));",
+      "}",
+    ].join("\n")),
+    sourceRecord("src/store/dashboardStore.ts", "export const creatorField = 'creatorName';"),
+    sourceRecord("src/types/order.ts", "export interface Order { creatorName: string; amount: number; status?: string; }"),
+  ];
+
+  assert.ok(records[0].facts.includes("field_contract(CsvOrder.creatorName,optional)"));
+  assert.ok(records[0].facts.includes("returned_field_contract(creator)"));
+  assert.ok(records[1].facts.includes("field_fallback_contract(creatorName,creator)"));
+  assert.ok(records[3].facts.includes("field_contract(Order.creatorName,required)"));
+
+  const objective = "请为 CSV creatorName 数据链路生成一个可审批的整改计划。";
+  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const closure = assessPlanClosureEvidence(bundle);
+  assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+  assert.deepEqual(closure.contractMismatchKinds, [
+    "producer_missing_required_field:creatorName",
+  ]);
+  assert.equal(closure.ready, true);
+
+  const deterministic = composePlanArtifactFromEvidence({
+    userGoal: objective,
+    evidence: [],
+    evidenceRecords: records,
+    evidenceBundle: bundle,
+    language: "zh",
+  });
+  assert.match(deterministic, /归一化输出/);
+  assert.match(deterministic, /保留已经建立的公共\/类型契约/);
+  assert.doesNotMatch(deterministic, /移除[^\n]*creatorName/);
+
+  const unsupportedBreakingPlan = [
+    "# creatorName 整改计划",
+    "## 已确认证据",
+    "- 解析器未填充 creatorName，但下游类型与消费方要求该字段。",
+    "## 关键改动",
+    "- 修改 `src/types/order.ts`，从 Order 中移除 creatorName 字段。",
+    "- 修改 `src/hooks/useCsvParser.ts`，继续只返回 creator。",
+    "## 公共 API / 接口 / 类型",
+    "- 删除 creatorName 公共类型字段。",
+    "## 测试方案",
+    "- 运行类型检查并断言无错误。",
+    "## 假设与默认值",
+    "- 假设下游不再需要 creatorName。",
+  ].join("\n");
+  const grounding = validatePlanEvidenceGrounding({
+    content: unsupportedBreakingPlan,
+    userGoal: objective,
+    evidenceRecords: records,
+    evidenceBundle: bundle,
+  });
+  assert.equal(grounding.ok, false);
+  assert.equal(grounding.reason, "unsupported_breaking_contract_removal:creatorName");
 });
 
 test("plan evidence separates an explicit mutation owner from a referenced contract file", () => {
@@ -3605,6 +3715,52 @@ test("materialization repairs only the missing evidence section without broadeni
   assert.ok(repairedContent.indexOf("## 已确认证据") < repairedContent.indexOf("## 关键改动"));
 });
 
+test("materialization can repair a missing evidence section from the frozen evidence bundle alone", () => {
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/importer.ts",
+    status: "succeeded",
+    summary: "normalizeRow currently forwards creator but does not assign creatorName",
+  }];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-frozen-evidence-repair",
+    objective: "修改 src/importer.ts，补齐 creatorName 映射。",
+    evidenceRecords,
+  });
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan: 补齐 CSV 姓名映射",
+      "",
+      "## 摘要",
+      "- 修复导入数据缺少 creatorName 的问题。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/importer.ts`，由 normalizeRow 将 creator 确定性映射到 creatorName，并保持现有字段回退关系。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 保持现有导入结果类型，不新增公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test`，验证有姓名、缺姓名和兼容旧 creator 字段三种输入。",
+      "",
+      "## 假设与默认值",
+      "- 不改变其它 CSV 字段的归一化行为。",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "evidence_section_repaired_visible_plan");
+  assert.equal(result.evidenceBundleHash, bundle.hash);
+  assert.match(result.content || "", /## 已确认证据/);
+  assert.match(result.content || "", /src\/importer\.ts/);
+  assert.match(result.content || "", /does not assign creatorName/);
+  assert.deepEqual(validatePlanCandidate(result.candidate, bundle.hash), []);
+});
+
 test("materialization does not project metadata-only or failed reads into confirmed evidence", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [
@@ -3663,6 +3819,79 @@ test("plan evidence grounding accepts read-backed change targets with confirmed 
   });
 
   assert.equal(validation.ok, true);
+});
+
+test("a basename-only Plan target resolves to one unique read-backed workspace file", () => {
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    summary: "normalizeCsvOrder forwards creator but does not assign creatorName",
+  }];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-unique-basename",
+    objective: "修改 src/hooks/useCsvParser.ts，补齐 creatorName 映射。",
+    evidenceRecords,
+  });
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan: 补齐 CSV 姓名映射",
+      "",
+      "## 摘要",
+      "- 让 CSV 解析结果稳定提供 creatorName。",
+      "",
+      "## 已确认证据",
+      "- `src/hooks/useCsvParser.ts` 的 normalizeCsvOrder 当前只返回 creator。",
+      "",
+      "## 关键改动",
+      "- 修改 `useCsvParser.ts`，在 normalizeCsvOrder 中增加 creator 到 creatorName 的确定性映射，并保留旧字段回退。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 保持现有返回类型，不新增公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test`，使用包含 creator、creatorName 和空姓名的三类输入验证结果。",
+      "",
+      "## 假设与默认值",
+      "- 不改变其它 CSV 字段的归一化行为。",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.candidate?.changes[0]?.targetRef, "src/hooks/useCsvParser.ts");
+  assert.ok((result.candidate?.changes[0]?.evidenceRefs.length || 0) > 0);
+});
+
+test("a basename-only Plan target stays ungrounded when multiple read files share it", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- 已读取两个不同目录中的 index.ts。",
+      "",
+      "## 关键改动",
+      "- 修改 `index.ts` 的初始化逻辑。",
+    ].join("\n"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/client/index.ts",
+      status: "succeeded",
+      summary: "client bootstrap",
+    }, {
+      tool: "read_file",
+      target: "src/server/index.ts",
+      status: "succeeded",
+      summary: "server bootstrap",
+    }],
+  });
+
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "ungrounded_plan_change_targets:index.ts");
 });
 
 test("plan evidence grounding requires a concrete change target after source reads", () => {

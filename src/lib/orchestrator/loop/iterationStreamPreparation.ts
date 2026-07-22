@@ -19,6 +19,10 @@ import {
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
 import {
+  createPlanAuthoringContract,
+  formatPlanAuthoringContractForModel,
+} from "../../planAuthoringContract";
+import {
   resolveApprovedPlanRecoveryReconciliation,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
@@ -551,6 +555,38 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
+    const planAuthoringContract = createPlanAuthoringContract({
+      objective: latestUserPromptText,
+      contextSignals: turnInputContextSignals,
+      recentPlanToolActivity,
+    });
+    const planAuthoringCard = formatPlanAuthoringContractForModel({
+      contract: planAuthoringContract,
+      runtime: {
+        phase: planRuntimeState.planRuntimePhase,
+        qualityGateReason: planRuntimeState.planLastQualityGateReason,
+        missingSections: planRuntimeState.planLastMissingSections,
+      },
+      language: MODEL_CONTROL_LANGUAGE,
+    });
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      { role: "system", content: planAuthoringCard },
+    ];
+    logAgentEvent("plan_authoring_contract_injected", {
+      iteration,
+      contractVersion: planAuthoringContract.version,
+      contractId: planAuthoringContract.contractId,
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+      qualityGateReason: planRuntimeState.planLastQualityGateReason,
+      missingSections: planRuntimeState.planLastMissingSections,
+      contextTargets: planAuthoringContract.contextTargets,
+      reusableEvidenceTargets: planAuthoringContract.reusableEvidenceTargets,
+      imageCount: planAuthoringContract.imageCount,
+      criteria: planAuthoringContract.criteria,
+    });
+  }
   if (toolSurfaceDecision.preferredDelegationRequirement.required) {
     const delegationContract = buildPreferredDelegationActionContract({
       language: callbacks.getPreferredLanguage(),

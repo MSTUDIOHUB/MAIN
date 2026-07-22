@@ -267,7 +267,7 @@ test("incomplete child closure creates exact parent reread obligations without p
   assert.ok(obligations.every((item) => !item.delegatedObservation.sourceToolCallId));
 });
 
-test("structured child closure and observation quality gate parent join promotion", () => {
+test("structured child closure keeps task status separate from reusable planning observations", () => {
   const promoted = toolActivityTracking.extractDelegatedSubagentActivities({
     toolCallId: "wait-child-closure",
     name: "wait_subagents",
@@ -326,7 +326,7 @@ test("structured child closure and observation quality gate parent join promotio
   assert.equal(promoted[0].name, "read_file");
   assert.equal(promoted[0].delegatedObservation.sourceToolCallId, "child-read-main");
 
-  const rejected = toolActivityTracking.extractDelegatedSubagentActivities({
+  const partial = toolActivityTracking.extractDelegatedSubagentActivities({
     toolCallId: "wait-child-inconsistent",
     name: "wait_subagents",
     target: "subagent-evidence",
@@ -364,7 +364,9 @@ test("structured child closure and observation quality gate parent join promotio
     }),
   });
 
-  assert.deepEqual(rejected, []);
+  assert.equal(partial.length, 1);
+  assert.equal(partial[0].delegatedObservation.planningEvidenceState, "reusable");
+  assert.equal(partial[0].delegatedObservation.requiresParentReread, true);
 });
 
 test("only current versioned child evidence can back a self-verifying mutation", () => {
@@ -470,4 +472,42 @@ test("only current versioned child evidence can back a self-verifying mutation",
     currentContentHash: "abc",
     currentSourceContent: "old exact source",
   }).reason, "mutation_not_self_verifying", "multi-target apply_patch requires a parent reread");
+});
+
+test("Plan rereads reuse accepted child evidence while unresolved paths remain readable", () => {
+  const reusable = {
+    name: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    delegatedObservation: {
+      owner: { agentKind: "subagent", subagentId: "subagent-evidence" },
+      planningEvidenceState: "reusable",
+      parentContextState: "reference_only",
+      requiresParentReread: true,
+    },
+  };
+  assert.equal(toolCallPartitioning.findReusableDelegatedPlanningEvidenceForRead({
+    toolName: "read_file",
+    target: "./src/main.js",
+    recentPlanToolActivity: [reusable],
+  }), reusable);
+
+  assert.equal(toolCallPartitioning.findReusableDelegatedPlanningEvidenceForRead({
+    toolName: "read_file",
+    target: "src/main.js",
+    recentPlanToolActivity: [reusable, {
+      ...reusable,
+      status: "failed",
+      delegatedObservation: {
+        ...reusable.delegatedObservation,
+        planningEvidenceState: "unresolved",
+      },
+    }],
+  }), null);
+
+  assert.equal(toolCallPartitioning.findReusableDelegatedPlanningEvidenceForRead({
+    toolName: "read_file",
+    target: "src/other.js",
+    recentPlanToolActivity: [reusable],
+  }), null);
 });

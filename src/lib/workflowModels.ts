@@ -1362,7 +1362,7 @@ const TAURI_VALIDATION_RE =
 const MANUAL_VALIDATION_RE =
   /(?:人工|用户(?:自己)?|你自己|自行|肉眼|手动(?:验证|确认|检查|验收)|需(?:要)?\s*手动(?:验证|确认|检查|验收)|由用户手动|human|user confirmation|user validation|manual(?:ly)? validation|manually confirmed by (?:the )?user|visually inspect)/i;
 const SOURCE_MUTATION_TASK_RE =
-  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|映射(?:为|成|到)|赋值|设置|写入|填充|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export|map|assign|set|populate)\b/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|移除|替换|重构|保存|导出|映射(?:为|成|到)|赋值|设置|写入|填充|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|remove|replace|refactor|save|export|map|assign|set|populate)\b/i;
 const PRIMARY_VALIDATION_TASK_RE =
   /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:运行|执行)\s+(?:(?:npm|pnpm|yarn|bun|npx|node|cargo|pytest|python|go|swift|dotnet|mvn|gradle)\b|[^\r\n]{0,100}(?:测试|验证|检查|验收|构建|编译|lint|类型检查))|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
 const NEGATED_SOURCE_MUTATION_SPAN_RE =
@@ -3006,11 +3006,11 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 }
 
 const RUNTIME_TASK_ACTION_RE =
-  /(?:实现|修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)\b/i;
+  /(?:实现|修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|创建|删除|移除|替换|重构|执行|运行|验证|测试|检查|落地)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|remove|replace|refactor|run|verify|test|check|validate)\b/i;
 const RUNTIME_TASK_STANDALONE_ACTION_RE =
-  /^(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)|^(?:`?[^`\s]+\.[A-Za-z0-9]{1,10}`?)\s*[:：—-]\s*(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)/i;
+  /^(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|移除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|remove|replace|refactor|save)\b)|^(?:`?[^`\s]+\.[A-Za-z0-9]{1,10}`?)\s*[:：—-]\s*(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|移除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|remove|replace|refactor|save)\b)/i;
 const RUNTIME_TASK_MUTATION_RE =
-  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|移除|替换|重构|保存|导出)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|remove|replace|refactor|save|export)\b/i;
 const RUNTIME_TASK_VERIFICATION_RE =
   /(?:执行|运行|验证|测试|验收)|\b(?:run|verify|test|validate|acceptance)\b/i;
 const RUNTIME_TASK_READ_ONLY_RE =
@@ -3042,9 +3042,9 @@ const RUNTIME_TASK_CHANGE_DETAIL_RE =
 const RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE =
   /^(?:改动(?:内容)?|变更(?:内容)?|实现细节|修改说明|修改为|改为|变更为|调整为|changes?|change to|replace with|implementation(?: details)?)\s*[:：]?\s*$/i;
 const RUNTIME_TASK_INLINE_DIAGNOSTIC_LABEL_RE =
-  /^(?:(?:当前|现有|原有|观察到的|已确认的?)?(?:行为|状态|实现|现状)|根(?:本)?原因|根因(?:分析)?|问题(?:分析|诊断)|诊断(?:结果|结论|分析)?|已确认(?:事实|发现)|(?:current|existing|observed|confirmed)\s+(?:behavior|state|implementation|findings?)|root\s+cause(?:\s+analysis)?|problem\s+(?:analysis|diagnosis)|diagnosis|diagnostic\s+(?:findings|results|analysis))$/i;
+  /^(?:(?:当前|现有|原有|观察到的|已确认的?)(?:行为|状态|实现|现状)|根(?:本)?原因|根因(?:分析)?|问题(?:分析|诊断)|诊断(?:结果|结论|分析)?|已确认(?:事实|发现)|(?:current|existing|observed|confirmed)\s+(?:behavior|state|implementation|findings?)|root\s+cause(?:\s+analysis)?|problem\s+(?:analysis|diagnosis)|diagnosis|diagnostic\s+(?:findings|results|analysis))$/i;
 const RUNTIME_TASK_INLINE_IMPLEMENTATION_LABEL_RE =
-  /^(?:修改方案|改动方案|变更方案|修复方案|实现方案|实施方案|具体改动|改动内容|变更内容|修改内容|修改说明|实现细节|修改为|改为|变更为|调整为|modification\s+plan|change\s+plan|implementation\s+plan|fix\s+plan|proposed\s+changes?|specific\s+changes?|changes?|implementation(?:\s+details)?|change\s+to|replace\s+with)$/i;
+  /^(?:行为|目标行为|预期行为|改后行为|修改后行为|修改方案|改动方案|变更方案|修复方案|实现方案|实施方案|具体改动|改动内容|变更内容|修改内容|修改说明|实现细节|修改为|改为|变更为|调整为|behavior|target\s+behavior|desired\s+behavior|expected\s+behavior|post[- ]change\s+behavior|modification\s+plan|change\s+plan|implementation\s+plan|fix\s+plan|proposed\s+changes?|specific\s+changes?|changes?|implementation(?:\s+details)?|change\s+to|replace\s+with)$/i;
 const RUNTIME_TASK_CHANGE_CHILD_REMOVAL_RE =
   /^(?:(?:移除|删去|注销|取消注册)|(?:remove|drop|unregister)\b)/i;
 const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
@@ -3081,6 +3081,14 @@ function isRuntimeTaskExcludedSectionHeading(heading: string): boolean {
   // descendants. The action role wins at the parent; explicit diagnostic
   // child headings are still excluded by the level-aware scanners below.
   if (isRuntimeTaskActionSectionHeading(normalized)) return false;
+  // A numbered concrete action may legitimately name an interface or type,
+  // for example "1. Remove the creatorName type constraint". Exclusion words
+  // describe section roles, not arbitrary substrings inside an action title.
+  const withoutOrdinal = normalized.replace(/^\d+\s*[.)、:：-]?\s*/, "").trim();
+  if (
+    RUNTIME_TASK_STANDALONE_ACTION_RE.test(withoutOrdinal) ||
+    RUNTIME_TASK_CHANGE_CHILD_REMOVAL_RE.test(withoutOrdinal)
+  ) return false;
   return RUNTIME_TASK_EXCLUDED_SECTION_RE.test(normalized) ||
     RUNTIME_TASK_DIAGNOSTIC_SECTION_RE.test(normalized) ||
     RUNTIME_TASK_SCOPE_SECTION_RE.test(normalized);
@@ -3600,7 +3608,7 @@ function selectMutationOwnerFileReferences(text: string, files: string[]): strin
   }
   if (references.length === 0) return [];
 
-  const mutationVerbRe = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|替换|重构|删除|创建|implement|change|update|modify|fix|add|replace|refactor|delete|create)/gi;
+  const mutationVerbRe = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|移除|替换|重构|删除|创建|implement|change|update|modify|fix|add|remove|replace|refactor|delete|create)/gi;
   for (const verb of clean.matchAll(mutationVerbRe)) {
     const verbStart = verb.index || 0;
     const verbEnd = verbStart + String(verb[0] || "").length;
@@ -4319,7 +4327,7 @@ function normalizeMutationOutcomeForApproval(task: PlanTask): string {
       .split(value).join(" ");
   }
   return outcome
-    .replace(/^(?:(?:修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export|implement)\b)\s*(?:文件|file)?\s*/i, "")
+    .replace(/^(?:(?:修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|移除|替换|重构|保存|导出|实现)|(?:change|update|modify|fix|add|wire|integrate|generate|write|create|delete|remove|replace|refactor|save|export|implement)\b)\s*(?:文件|file)?\s*/i, "")
     .replace(/^[\s的中内里:：—–,，.。;；()（）'"`-]+|[\s:：—–,，.。;；'"`-]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -4328,7 +4336,7 @@ function normalizeMutationOutcomeForApproval(task: PlanTask): string {
 function normalizeMutationOutcomeIdentity(value: string): string {
   return String(value || "")
     .toLowerCase()
-    .replace(/(?:修改|更新|变更|改动|调整|修复|实现|change|update|modify|fix|adjust|implement)/gi, "")
+    .replace(/(?:修改|更新|变更|改动|调整|修复|删除|移除|替换|实现|change|update|modify|fix|adjust|delete|remove|replace|implement)/gi, "")
     .replace(/[\s:：—–,，.。;；()（）'"`_-]+/g, "");
 }
 
@@ -5128,7 +5136,7 @@ function stripPlanQualityLine(line: string): string {
  * write can ever satisfy. Nested list content and ordinary following prose are
  * accepted; a sibling item, the next heading, or end-of-document is empty.
  */
-function hasEmptyPlanImplementationDetail(content: string): boolean {
+function findEmptyPlanImplementationDetail(content: string): string | null {
   const lines = String(content || "").split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
     const rawLine = lines[index] || "";
@@ -5164,9 +5172,13 @@ function hasEmptyPlanImplementationDetail(content: string): boolean {
       hasOwnedBody = true;
       break;
     }
-    if (!hasOwnedBody) return true;
+    if (!hasOwnedBody) return cleanLine || rawLine.trim();
   }
-  return false;
+  return null;
+}
+
+function hasEmptyPlanImplementationDetail(content: string): boolean {
+  return findEmptyPlanImplementationDetail(content) !== null;
 }
 
 interface ExplicitPlanAcceptanceAssertion {

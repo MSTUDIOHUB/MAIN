@@ -459,22 +459,32 @@ export async function executeToolCallPhase(input: {
     });
     return true;
   };
-  rebaseApprovedPlanRecovery(
+  const recoveryRebasedBeforePartition = rebaseApprovedPlanRecovery(
     "approved_plan_recovery_rebased_before_partition",
   );
-  let recoveryActionContract = resolveExecuteRecoveryActionContract(
-    executeRecoveryState.mode,
-    {
-      expectedTarget: executeRecoveryState.expectedTarget,
-      readLease: executeRecoveryState.readLease,
-      sourceObservationKey: executeRecoveryState.sourceObservationKey,
-      decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
-      phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
-      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
-      protocolNoProgressFingerprint:
-        executeRecoveryState.protocolNoProgressFingerprint,
-    },
-  );
+  // The request tool surface and the execution partition must use one
+  // capability contract. Recomputing here without the stream preparation's
+  // dev-server/PTY observation can regress browser_validation to validation,
+  // causing the only advertised browser_evaluate call to defer itself.
+  let recoveryActionContract = recoveryRebasedBeforePartition
+    ? resolveExecuteRecoveryActionContract(
+        executeRecoveryState.mode,
+        {
+          expectedTarget: executeRecoveryState.expectedTarget,
+          readLease: executeRecoveryState.readLease,
+          sourceObservationKey: executeRecoveryState.sourceObservationKey,
+          decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+          phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+          protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+          protocolNoProgressFingerprint:
+            executeRecoveryState.protocolNoProgressFingerprint,
+          devServerStatus: input.recoveryActionContract.devServerStatus,
+          devServerUrl: input.recoveryActionContract.devServerUrl,
+          ptyGeneration: input.recoveryActionContract.ptyGeneration,
+          ptyOutputSequence: input.recoveryActionContract.ptyOutputSequence,
+        },
+      )
+    : input.recoveryActionContract;
   const leaseNormalizedToolCalls = normalizeLeaseBackedReadToolCalls(
     input.effectiveToolCalls,
     executeRecoveryState,
@@ -867,6 +877,10 @@ export async function executeToolCallPhase(input: {
         protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
         protocolNoProgressFingerprint:
           executeRecoveryState.protocolNoProgressFingerprint,
+        devServerStatus: input.recoveryActionContract.devServerStatus,
+        devServerUrl: input.recoveryActionContract.devServerUrl,
+        ptyGeneration: input.recoveryActionContract.ptyGeneration,
+        ptyOutputSequence: input.recoveryActionContract.ptyOutputSequence,
       },
     );
   }

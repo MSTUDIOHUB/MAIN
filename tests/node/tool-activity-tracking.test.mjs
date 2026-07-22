@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   extractDelegatedSubagentActivities,
+  extractSubagentParentRereadObligations,
   isEditProgressResult,
   isVerificationEvidenceResult,
   rememberToolActivity,
@@ -949,7 +950,7 @@ test("structured non-substantive child observations stay out of the parent evide
   assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
 });
 
-test("a completed child with a non-satisfied closure audit cannot promote evidence", () => {
+test("a partial child can promote an independently accepted planning observation", () => {
   const waitResult = result({
     toolCallId: "wait_partial_closure",
     name: "wait_subagents",
@@ -983,7 +984,11 @@ test("a completed child with a non-satisfied closure audit cannot promote eviden
     }),
   });
 
-  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+  const promoted = extractDelegatedSubagentActivities(waitResult);
+  assert.equal(promoted.length, 1);
+  assert.equal(promoted[0].target, "src/main.js");
+  assert.equal(promoted[0].delegatedObservation.planningEvidenceState, "reusable");
+  assert.equal(promoted[0].delegatedObservation.requiresParentReread, true);
 });
 
 test("a satisfied structured closure promotes only substantive observations", () => {
@@ -1038,7 +1043,54 @@ test("a satisfied structured closure promotes only substantive observations", ()
   assert.equal(promoted[0].delegatedObservation.sourceToolCallId, "child-read-source");
 });
 
-test("a nominally satisfied closure with partial path coverage is not promoted", () => {
+test("delegated evidence uses the exact runtime payload when the model-facing join result is truncated", () => {
+  const runtimeEvidenceContent = JSON.stringify({
+    results: [{
+      subagentId: "subagent-a",
+      status: "completed",
+      closureAudit: {
+        state: "satisfied",
+        observationCount: 1,
+        substantiveEvidenceCount: 1,
+        acceptedEvidenceToolCallIds: ["child-read-runtime"],
+        requiredPaths: ["src/runtime.ts"],
+        coveredPaths: ["src/runtime.ts"],
+        failedPaths: [],
+        uncoveredPaths: [],
+        reason: "The scoped source was observed.",
+      },
+      evidence: [{
+        tool: "read_file",
+        target: "src/runtime.ts",
+        detail: "Observed the runtime-owned source payload.",
+        observation: {
+          kind: "source",
+          sourcePath: "src/runtime.ts",
+          contentChars: 43,
+          negative: false,
+          substantive: true,
+        },
+        provenance: toolObservationProvenance("child-read-runtime"),
+      }],
+    }],
+    pendingIds: [],
+  });
+  const waitResult = result({
+    toolCallId: "wait_runtime_payload",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: '{"results":[',
+    runtimeEvidenceContent,
+  });
+
+  const promoted = extractDelegatedSubagentActivities(waitResult);
+  assert.equal(promoted.length, 1);
+  assert.equal(promoted[0].target, "src/runtime.ts");
+  assert.equal(promoted[0].delegatedObservation.planningEvidenceState, "reusable");
+  assert.deepEqual(extractSubagentParentRereadObligations(waitResult), []);
+});
+
+test("partial path coverage promotes only covered evidence and preserves the unresolved obligation", () => {
   const waitResult = result({
     toolCallId: "wait_incomplete_coverage",
     name: "wait_subagents",
@@ -1076,10 +1128,15 @@ test("a nominally satisfied closure with partial path coverage is not promoted",
     }),
   });
 
-  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+  const promoted = extractDelegatedSubagentActivities(waitResult);
+  assert.deepEqual(promoted.map((item) => item.target), ["src/main.js"]);
+  assert.equal(promoted[0].delegatedObservation.planningEvidenceState, "reusable");
+  const obligations = extractSubagentParentRereadObligations(waitResult);
+  assert.deepEqual(obligations.map((item) => item.target), ["src/components/editor.js"]);
+  assert.equal(obligations[0].delegatedObservation.planningEvidenceState, "unresolved");
 });
 
-test("a nominally covered path still requires substantive evidence before parent promotion", () => {
+test("a nominally covered path without substantive evidence becomes an unresolved obligation", () => {
   const waitResult = result({
     toolCallId: "wait_non_substantive_coverage",
     name: "wait_subagents",
@@ -1129,7 +1186,14 @@ test("a nominally covered path still requires substantive evidence before parent
     }),
   });
 
-  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+  assert.deepEqual(
+    extractDelegatedSubagentActivities(waitResult).map((item) => item.target),
+    ["src/main.js"],
+  );
+  assert.deepEqual(
+    extractSubagentParentRereadObligations(waitResult).map((item) => item.target),
+    ["src/components/editor.js"],
+  );
 });
 
 test("tool result post-processing records source-write evidence without clearing recovery before validation", () => {

@@ -232,6 +232,8 @@ test("plan, web, tabular, game studio, and goal modules are conditional", () => 
   const plan = buildPrompt({ intent: "plan", available: ["read_file"], toolDefinitions: [tools[0]] });
   assert.match(plan, /\[PLAN\]/);
   assert.match(plan, /<proposed_plan>/);
+  assert.match(plan, /versioned PLAN AUTHORING CONTRACT/);
+  assert.match(plan, /quality gate checks the criteria disclosed before drafting/i);
 
   const webTool = {
     type: "function",

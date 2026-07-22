@@ -49,6 +49,47 @@ export function workspacePathsReferToSameFile(left: string, right: string): bool
   return absolute.endsWith(`/${relative}`);
 }
 
+/**
+ * Resolve a model/user file reference against a closed set of runtime-known
+ * workspace files. Exact identities retain the strict path policy above. A
+ * basename-only reference is accepted only when it identifies exactly one
+ * candidate; relative suffixes such as `src/main.rs` never alias a different
+ * tree such as `src-tauri/src/main.rs`.
+ */
+export function resolveUniqueWorkspaceFileReference(
+  reference: string,
+  candidates: Iterable<string>,
+): string | null {
+  const rawCandidates = [...candidates]
+    .map((candidate) => String(candidate || "").trim())
+    .filter(Boolean);
+  const exactMatches = rawCandidates.filter((candidate) =>
+    workspacePathsReferToSameFile(reference, candidate)
+  );
+  const uniqueExact = [...new Map(exactMatches.map((candidate) => [
+    normalizeWorkspacePathIdentity(candidate),
+    candidate,
+  ])).values()];
+  if (uniqueExact.length === 1) return uniqueExact[0];
+  if (uniqueExact.length > 1) return null;
+
+  const normalizedReference = normalizeWorkspacePathIdentity(reference);
+  if (
+    !normalizedReference ||
+    isAbsoluteWorkspacePath(normalizedReference) ||
+    normalizedReference.includes("/")
+  ) return null;
+  const basenameMatches = rawCandidates.filter((candidate) => {
+    const normalizedCandidate = normalizeWorkspacePathIdentity(candidate);
+    return (normalizedCandidate.split("/").pop() || normalizedCandidate) === normalizedReference;
+  });
+  const uniqueBasenameMatches = [...new Map(basenameMatches.map((candidate) => [
+    normalizeWorkspacePathIdentity(candidate),
+    candidate,
+  ])).values()];
+  return uniqueBasenameMatches.length === 1 ? uniqueBasenameMatches[0] : null;
+}
+
 export function relativizeToWorkspacePath(fullPath: string, workspace: string): string {
   const normalizedFullPath = normalizePath(fullPath);
   const normalizedWorkspace = normalizePath(workspace);

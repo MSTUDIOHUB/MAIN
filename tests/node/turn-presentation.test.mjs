@@ -125,6 +125,18 @@ test("ordinary turns hide the heavy state anchor while legacy collapsed only fol
   assert.equal(migrated.processCollapsed, false);
 });
 
+test("workspace ordinary turns retain a visible Turn title and lifecycle anchor", () => {
+  const model = buildTurnPresentationModel({
+    turn: turn({ title: "Inspect the editor launch flow" }),
+    language: "en",
+    showStateAnchorOverride: true,
+  });
+
+  assert.equal(model.kind, "ordinary");
+  assert.equal(model.showStateAnchor, true);
+  assert.equal(model.title, "Inspect the editor launch flow");
+});
+
 test("Plan Goal and exceptional states retain a presentation anchor", () => {
   const plan = buildTurnPresentationModel({
     turn: turn({ intent: "plan", displayIntent: "execute", mode: "plan", status: "done", title: "Plan runtime changes" }),

@@ -263,6 +263,20 @@ export function hasExplicitPlanProposal(text: string): boolean {
   return proposal !== null && (!("kind" in proposal) || proposal.kind === "tier2_proposed_plan");
 }
 
+/**
+ * Some reasoning-capable providers occasionally route an explicitly tagged
+ * final Plan through their reasoning field after a revision prompt. Recover
+ * only the complete public protocol block; never promote surrounding chain of
+ * thought or untagged reasoning into assistant-visible content.
+ */
+export function extractExplicitPlanProtocolFromReasoning(text: string): string | null {
+  const reasoning = String(text || "");
+  const matched = reasoning.match(/<proposed_plan(?:\s[^>]*)?>[\s\S]*?<\/proposed_plan>/i);
+  if (!matched?.[0]) return null;
+  const candidate = matched[0].trim();
+  return hasExplicitPlanProposal(candidate) ? candidate : null;
+}
+
 // Normalize any tier to a unified format that the runtime can consume
 export function normalizePlanProposal(proposal: TieredPlanResult): StructuredPlanProposal {
   if ("jobs" in proposal) {

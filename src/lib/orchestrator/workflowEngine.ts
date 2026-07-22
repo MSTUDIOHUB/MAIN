@@ -5097,13 +5097,13 @@ export class WorkflowEngine {
         ? resultKind === "canceled"
           ? `This turn was canceled and is now closed. ${reason}`
           : resultKind === "blocked"
-          ? `This turn is complete with a blocked result. ${reason}`
-          : `This turn is complete, but MAIN could not finish the requested work. ${reason}`
+          ? `This turn stopped and is now closed with a blocked result. ${reason}`
+          : `This turn failed and is now closed. MAIN did not finish the requested work. ${reason}`
         : resultKind === "canceled"
         ? `本回合已取消并完成收口。${reason}`
         : resultKind === "blocked"
-        ? `本回合已完成收口，但结果受到阻塞。原因：${reason}`
-        : `本回合已完成收口，但 MAIN 未能完成所请求的工作。原因：${reason}`;
+        ? `本回合已停止并收口，结果受到阻塞。原因：${reason}`
+        : `本回合执行失败并已收口，MAIN 未能完成所请求的工作。原因：${reason}`;
       const turnBlocks = current.taskFlow.filter((block: TaskBlock) =>
         !!block.turnId && terminalTurnIds.has(block.turnId)
       );
@@ -5423,6 +5423,8 @@ export class WorkflowEngine {
               });
             const terminalTurnStatus = isSameTurnExecutionContinuation
               ? "executing"
+              : outcome.status === "completed" && outcome.resultKind === "error"
+              ? "error"
               : outcome.status === "completed"
               ? completedTurnHasChanges ? "completed_with_changes" : "done"
               : outcome.status === "aborted"
@@ -5753,6 +5755,8 @@ export class WorkflowEngine {
             agentStatus: committedIsIntentionalActionPause &&
               (committedPendingAction?.kind === "plan_review" || committedPendingAction?.kind === "tool_permission")
               ? "pending_review"
+              : outcome.status === "completed" && outcome.resultKind === "error"
+              ? "error"
               : "idle",
             isGenerating: false,
             abortController: null,
@@ -7133,7 +7137,7 @@ export class WorkflowEngine {
         resultKind: "error",
       };
       const errorHarnessProjection = projectCurrentHarnessRunMarker(
-        "completed",
+        "error",
         "agent_loop_error_conclusion",
         { terminalResultKind: "error", allowErrorOverride: true },
       );

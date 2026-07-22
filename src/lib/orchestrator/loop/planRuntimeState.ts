@@ -49,6 +49,45 @@ export interface PlanRuntimePhaseQualitySnapshot {
   missingSections?: string[];
 }
 
+const ALLOWED_PLAN_PHASE_TRANSITIONS: Record<PlanRuntimePhase, ReadonlySet<PlanRuntimePhase>> = {
+  explore_structure: new Set([
+    "explore_structure", "grounding", "needs_evidence", "synthesis", "drafting", "review_ready", "blocked",
+  ]),
+  grounding: new Set([
+    "grounding", "needs_evidence", "synthesis", "drafting", "review_ready", "blocked",
+  ]),
+  synthesis: new Set([
+    "synthesis", "needs_evidence", "drafting", "needs_rewrite", "review_ready", "blocked",
+  ]),
+  drafting: new Set([
+    "drafting", "needs_evidence", "needs_rewrite", "review_ready", "blocked",
+  ]),
+  needs_evidence: new Set([
+    "needs_evidence", "grounding", "synthesis", "drafting", "needs_rewrite", "review_ready", "blocked",
+  ]),
+  needs_rewrite: new Set([
+    "needs_rewrite", "needs_evidence", "drafting", "review_ready", "blocked",
+  ]),
+  // Review and blocked are terminal for one unapproved Plan run. Approval or
+  // retry starts a child/new run with fresh state rather than silently
+  // downgrading the terminal phase in an old branch.
+  review_ready: new Set(["review_ready"]),
+  blocked: new Set(["blocked"]),
+};
+
+export function resolvePlanRuntimePhaseTransition(input: {
+  current: PlanRuntimePhase;
+  next: PlanRuntimePhase;
+}): { allowed: boolean; reason?: string } {
+  if (ALLOWED_PLAN_PHASE_TRANSITIONS[input.current].has(input.next)) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    reason: `invalid_plan_phase_transition:${input.current}->${input.next}`,
+  };
+}
+
 export function createPlanLoopRuntimeState(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
@@ -85,7 +124,18 @@ export function createPlanLoopRuntimeState(input: {
 export function applyPlanRuntimePhase(
   state: PlanLoopRuntimeState,
   input: { phase: PlanRuntimePhase; reason?: string },
-): { state: PlanLoopRuntimeState; changed: boolean } {
+): { state: PlanLoopRuntimeState; changed: boolean; rejectedReason?: string } {
+  const transition = resolvePlanRuntimePhaseTransition({
+    current: state.planRuntimePhase,
+    next: input.phase,
+  });
+  if (!transition.allowed) {
+    return {
+      state,
+      changed: false,
+      rejectedReason: transition.reason,
+    };
+  }
   if (state.planRuntimePhase === input.phase && !input.reason) {
     return { state, changed: false };
   }

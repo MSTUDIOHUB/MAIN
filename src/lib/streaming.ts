@@ -928,7 +928,11 @@ function isRecoverableRustStreamReadError(message: string): boolean {
     normalized.includes("error reading a body from connection") ||
     normalized.includes("error reading response body") ||
     normalized.includes("connection closed before message completed") ||
-    normalized.includes("unexpected eof")
+    normalized.includes("unexpected eof") ||
+    normalized.includes("incomplete chunked encoding") ||
+    normalized.includes("premature eof") ||
+    normalized.includes("premature close") ||
+    normalized === "terminated"
   );
 }
 
@@ -950,7 +954,13 @@ function isRecoverableFrontendTransportError(err: unknown): boolean {
     normalized.includes("load failed") ||
     normalized.includes("failed to fetch") ||
     normalized.includes("networkerror") ||
-    normalized.includes("network request failed")
+    normalized.includes("network request failed") ||
+    normalized.includes("incomplete chunked encoding") ||
+    normalized.includes("connection closed before message completed") ||
+    normalized.includes("unexpected eof") ||
+    normalized.includes("premature eof") ||
+    normalized.includes("premature close") ||
+    normalized === "terminated"
   );
 }
 
@@ -2634,6 +2644,34 @@ export async function streamChatCompletion(
       }
     }
   } catch (err) {
+    if (
+      (err as Error).name !== "AbortError" &&
+      isLocalProfile(settings) &&
+      isRecoverableFrontendTransportError(err)
+    ) {
+      const normalizedError = toError(err, "Streaming request failed.");
+      emitStreamingConsole("streaming", "warn", "frontend response body ended early; retrying once through Rust proxy", {
+        url: apiUrl,
+        model: settings.model,
+        error: normalizedError.message,
+      });
+      callbacks.onLifecycle?.({
+        phase: "stream_error",
+        status: "frontend_body_retry_rust_proxy",
+        error: normalizedError.message,
+      });
+      await reader.cancel().catch(() => {});
+      onToken("__ESCALATION_RESET__:");
+      return streamViaRustProxy(
+        messages,
+        { ...settings, useRustProxy: true },
+        callbacks,
+        signal,
+        tools,
+        maxTokensOverride,
+        options,
+      );
+    }
     if ((err as Error).name !== "AbortError") onError(toError(err, "Streaming request failed."));
     throw err;
   }

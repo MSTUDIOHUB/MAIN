@@ -64,13 +64,13 @@ export function selectPlanMaterializationSourceText(input: {
     : sourceVisibleText || streamText;
 }
 
-function buildPlanGenerationFailedMessage(language: "zh" | "en", reason: string): string {
+export function buildPlanGenerationFailedMessage(language: "zh" | "en", reason: string): string {
   return language === "zh"
     ? `计划生成失败：经过有界的计划物化恢复后，仍未得到通过校验的计划产物（${reason}）。请补充约束或重试计划生成。`
     : `Plan generation failed: bounded materialization recovery did not produce a validated plan artifact (${reason}). Add constraints or retry plan generation.`;
 }
 
-function buildPlanGenerationFailedProgress(reason: string) {
+export function buildPlanGenerationFailedProgress(reason: string) {
   return {
     recoveryReason: "plan_generation_failed",
     nextStep: reason,
@@ -389,11 +389,13 @@ export async function handlePlanNoToolRecovery(input: {
 
   const recoverRejectedVisibleCandidate = async (
     materialized: Awaited<ReturnType<typeof autoMaterializePlanArtifactFromVisibleText>>,
+    candidateSourceText = sourceVisibleText,
   ): Promise<PlanNoToolRecoveryResult> => {
+    const rejectedCandidateText = String(candidateSourceText || "").trim();
     let rejectedCandidateContextPreserved = false;
     const preserveRejectedCandidateForRecovery = () => {
       if (rejectedCandidateContextPreserved) return;
-      const candidate = sourceVisibleText.trim();
+      const candidate = rejectedCandidateText;
       if (!candidate) return;
       callbacks.appendMessage(buildAssistantHistoryMessage(candidate));
       rejectedCandidateContextPreserved = true;
@@ -409,7 +411,7 @@ export async function handlePlanNoToolRecovery(input: {
       ok: false,
       reason: materialized.reason || "quality_gate",
     });
-    const candidateMappingSource = sourceVisibleText.trim();
+    const candidateMappingSource = rejectedCandidateText;
     if (
       quality.recoveryAction === "targeted_evidence" &&
       candidateMappingSource.length >= 120
@@ -483,7 +485,7 @@ export async function handlePlanNoToolRecovery(input: {
         recentToolActivity: recentPlanToolActivity,
         attemptedTargets: attemptedPlanWriteTargets,
         turnContext: turnInputContextSignals,
-        facetMappingSource: currentPlanFacetMappingSource || sourceVisibleText,
+        facetMappingSource: currentPlanFacetMappingSource || rejectedCandidateText,
       });
       logAgentEvent(
         evidenceMaterialized.ok
@@ -709,7 +711,7 @@ export async function handlePlanNoToolRecovery(input: {
       },
     );
     if (!materializedProposal.ok) {
-      return recoverRejectedVisibleCandidate(materializedProposal);
+      return recoverRejectedVisibleCandidate(materializedProposal, visibleText);
     }
 
     currentPlanArtifactQualityRejected = false;

@@ -367,6 +367,17 @@ export function createAgentLoopRuntimeActions(input: {
       qualityState,
       { phase, reason },
     );
+    if (phaseUpdate.rejectedReason) {
+      logAgentEvent("plan_runtime_phase_transition_rejected", {
+        currentPhase: currentState.planRuntimePhase,
+        requestedPhase: phase,
+        reason: phaseUpdate.rejectedReason,
+        triggerReason: reason || "",
+        iteration: getIteration(),
+        status,
+      });
+      return;
+    }
     if (!phaseUpdate.changed) return;
     setPlanRuntimeState(phaseUpdate.state);
     publishPlanRuntimeNarration(phase);

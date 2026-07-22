@@ -178,8 +178,9 @@ export function extractDelegatedSubagentActivities(
   result: ToolExecutionResult,
 ): PlanToolActivitySummary[] {
   if (result.name !== "wait_subagents" || result.isError) return [];
-  const parsedFeedback = parseToolFeedbackEnvelope(result.content || "");
-  const body = parsedFeedback?.body || result.content || "";
+  const evidenceContent = result.runtimeEvidenceContent || result.content || "";
+  const parsedFeedback = parseToolFeedbackEnvelope(evidenceContent);
+  const body = parsedFeedback?.body || evidenceContent;
   let payload: unknown;
   try {
     payload = JSON.parse(body);
@@ -200,12 +201,6 @@ export function extractDelegatedSubagentActivities(
     const closureAudit = record.closureAudit && typeof record.closureAudit === "object"
       ? record.closureAudit as Record<string, unknown>
       : null;
-    // A runtime that publishes a structured closure audit owns the stronger
-    // completion contract. Partial child observations remain visible in the
-    // child run, but cannot be promoted as completed parent-plan evidence.
-    // Older envelopes without closureAudit remain compatible and are still
-    // checked evidence-by-evidence below.
-    if (closureAudit && closureAudit.state !== "satisfied") continue;
     const requiredPaths = Array.isArray(closureAudit?.requiredPaths)
       ? closureAudit.requiredPaths.map((path) => String(path || "").trim()).filter(Boolean)
       : [];
@@ -220,33 +215,18 @@ export function extractDelegatedSubagentActivities(
     const uncoveredPaths = Array.isArray(closureAudit?.uncoveredPaths)
       ? closureAudit.uncoveredPaths.map((path) => String(path || "").trim()).filter(Boolean)
       : [];
-    const hasPathCoverageAudit = requiredPaths.length > 0 ||
-      Array.isArray(closureAudit?.coveredPaths) ||
-      Array.isArray(closureAudit?.failedPaths) ||
-      Array.isArray(closureAudit?.uncoveredPaths);
-    const substantiveEvidencePaths = new Set(record.evidence.flatMap((item) => {
-      if (!item || typeof item !== "object") return [];
-      const evidence = item as Record<string, unknown>;
-      const observation = evidence.observation && typeof evidence.observation === "object"
-        ? evidence.observation as Record<string, unknown>
-        : null;
-      if (observation?.substantive !== true) return [];
-      const path = String(observation.sourcePath || evidence.target || "").trim();
-      const identity = normalizeWorkspacePathIdentity(path);
-      return identity ? [identity] : [];
-    }));
-    if (
-      closureAudit &&
-      hasPathCoverageAudit &&
-      (
-        failedPaths.length > 0 ||
-        uncoveredPaths.length > 0 ||
-        requiredPaths.some((path) => {
-          const identity = normalizeWorkspacePathIdentity(path);
-          return !identity || !coveredPaths.has(identity) || !substantiveEvidencePaths.has(identity);
-        })
-      )
-    ) continue;
+    const unresolvedPathIdentities = new Set([...failedPaths, ...uncoveredPaths]
+      .map((path) => normalizeWorkspacePathIdentity(path))
+      .filter(Boolean));
+    const acceptedEvidenceToolCallIds = new Set(Array.isArray(closureAudit?.acceptedEvidenceToolCallIds)
+      ? closureAudit.acceptedEvidenceToolCallIds
+        .map((toolCallId) => String(toolCallId || "").trim())
+        .filter(Boolean)
+      : []);
+    // allowedPaths is an authorization ceiling, not automatically a mandatory
+    // fan-out. Enforce per-path coverage only when the child runtime publishes
+    // a non-empty requiredPaths contract.
+    const hasPathCoverageAudit = requiredPaths.length > 0;
     for (const item of record.evidence) {
       const evidence = item && typeof item === "object" ? item as Record<string, unknown> : {};
       const observation = evidence.observation && typeof evidence.observation === "object"
@@ -285,6 +265,28 @@ export function extractDelegatedSubagentActivities(
       const name = String(evidence.tool || "").trim();
       const target = String(evidence.target || "").trim();
       if (!SUBAGENT_EVIDENCE_TOOLS.has(name) || !target) continue;
+      const evidencePathIdentity = normalizeWorkspacePathIdentity(
+        String(observation?.sourcePath || target),
+      );
+      // Child-task closure and observation usability are separate contracts.
+      // A partial/degraded child does not become "completed", but each
+      // substantive runtime observation may still support Plan authoring when
+      // its exact path is covered and not unresolved. Failed/uncovered paths
+      // remain explicit parent obligations below.
+      if (
+        closureAudit &&
+        acceptedEvidenceToolCallIds.size > 0 &&
+        (!sourceToolCallId || !acceptedEvidenceToolCallIds.has(sourceToolCallId))
+      ) continue;
+      if (
+        closureAudit &&
+        hasPathCoverageAudit &&
+        (
+          !evidencePathIdentity ||
+          !coveredPaths.has(evidencePathIdentity) ||
+          unresolvedPathIdentities.has(evidencePathIdentity)
+        )
+      ) continue;
       const rawFacts = Array.isArray(evidence.facts)
         ? evidence.facts.map((fact) => String(fact || ""))
         : [];
@@ -349,6 +351,7 @@ export function extractDelegatedSubagentActivities(
             ? { sourceContentChars: Math.max(0, Math.floor(Number(provenance.sourceContentChars))) }
             : {}),
           ...(sourceRange ? { sourceRange } : {}),
+          planningEvidenceState: "reusable",
           parentContextState: "reference_only",
           requiresParentReread: true,
         },
@@ -360,17 +363,17 @@ export function extractDelegatedSubagentActivities(
 }
 
 /**
- * Preserve an incomplete child's exact path handoff without promoting any of
- * its partial observations as trusted parent evidence. The child lease is
- * already released at join; this marker only exposes a targeted parent read
- * when the user's instructions permit it.
+ * Preserve an incomplete child's exact unresolved path handoff. Independently
+ * valid covered observations may already be reusable for planning; this marker
+ * only exposes the paths that still require a targeted parent read.
  */
 export function extractSubagentParentRereadObligations(
   result: ToolExecutionResult,
 ): PlanToolActivitySummary[] {
   if (result.name !== "wait_subagents" || result.isError) return [];
-  const parsedFeedback = parseToolFeedbackEnvelope(result.content || "");
-  const body = parsedFeedback?.body || result.content || "";
+  const evidenceContent = result.runtimeEvidenceContent || result.content || "";
+  const parsedFeedback = parseToolFeedbackEnvelope(evidenceContent);
+  const body = parsedFeedback?.body || evidenceContent;
   let payload: unknown;
   try {
     payload = JSON.parse(body);
@@ -397,9 +400,49 @@ export function extractSubagentParentRereadObligations(
         const identity = normalizeWorkspacePathIdentity(path);
         return identity ? [[identity, path] as const] : [];
       }));
-    const unresolvedPaths = [closureAudit.failedPaths, closureAudit.uncoveredPaths]
+    const acceptedEvidenceToolCallIds = new Set(Array.isArray(closureAudit.acceptedEvidenceToolCallIds)
+      ? closureAudit.acceptedEvidenceToolCallIds
+        .map((toolCallId) => String(toolCallId || "").trim())
+        .filter(Boolean)
+      : []);
+    const substantiveEvidencePathIdentities = new Set((Array.isArray(record.evidence)
+      ? record.evidence
+      : []).flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const evidence = item as Record<string, unknown>;
+        const observation = evidence.observation && typeof evidence.observation === "object"
+          ? evidence.observation as Record<string, unknown>
+          : null;
+        const provenance = evidence.provenance && typeof evidence.provenance === "object"
+          ? evidence.provenance as Record<string, unknown>
+          : null;
+        const owner = provenance?.owner && typeof provenance.owner === "object"
+          ? provenance.owner as Record<string, unknown>
+          : null;
+        const sourceToolCallId = String(provenance?.sourceToolCallId || "").trim();
+        if (
+          observation?.substantive !== true ||
+          provenance?.source !== "tool_observation" ||
+          owner?.agentKind !== "subagent" ||
+          String(owner.subagentId || "").trim() !== subagentId ||
+          (
+            acceptedEvidenceToolCallIds.size > 0 &&
+            (!sourceToolCallId || !acceptedEvidenceToolCallIds.has(sourceToolCallId))
+          )
+        ) return [];
+        const identity = normalizeWorkspacePathIdentity(
+          String(observation.sourcePath || evidence.target || ""),
+        );
+        return identity ? [identity] : [];
+      }));
+    const unresolvedPaths = [
+      ...[closureAudit.failedPaths, closureAudit.uncoveredPaths]
       .flatMap((value) => Array.isArray(value) ? value : [])
-      .map((value) => String(value || "").trim());
+      .map((value) => String(value || "").trim()),
+      ...[...requiredPaths.entries()].flatMap(([identity, path]) =>
+        substantiveEvidencePathIdentities.has(identity) ? [] : [path]
+      ),
+    ];
     for (const path of unresolvedPaths) {
       const identity = normalizeWorkspacePathIdentity(path);
       const requiredPath = identity ? requiredPaths.get(identity) : "";
@@ -414,6 +457,7 @@ export function extractSubagentParentRereadObligations(
         detail: "Incomplete child closure left this exact scoped path unresolved; parent reread is permitted after join only when consistent with the user instruction.",
         delegatedObservation: {
           owner: { agentKind: "subagent", subagentId },
+          planningEvidenceState: "unresolved",
           parentContextState: "reference_only",
           requiresParentReread: true,
         },

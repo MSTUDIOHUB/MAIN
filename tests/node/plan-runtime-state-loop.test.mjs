@@ -58,6 +58,7 @@ const {
   applyPlanQualityRuntimeState,
   applyPlanReadOnlyConvergenceRuntimeState,
   applyPlanRuntimePhase,
+  resolvePlanRuntimePhaseTransition,
   applyReasoningNoToolPlanRuntimeState,
   applyToolResultPlanRuntimeState,
   createPlanLoopRuntimeState,
@@ -142,6 +143,41 @@ test("plan phase reducer keeps no-op transitions stable but logs reasoned repeat
   const changed = applyPlanRuntimePhase(state, { phase: "drafting" });
   assert.equal(changed.changed, true);
   assert.equal(changed.state.planRuntimePhase, "drafting");
+});
+
+test("Plan phase transitions keep review and blocked terminal within one run", () => {
+  assert.deepEqual(resolvePlanRuntimePhaseTransition({
+    current: "drafting",
+    next: "needs_rewrite",
+  }), { allowed: true });
+  assert.deepEqual(resolvePlanRuntimePhaseTransition({
+    current: "needs_rewrite",
+    next: "review_ready",
+  }), { allowed: true });
+
+  const reviewState = { ...createFixtureState(), planRuntimePhase: "review_ready" };
+  const reviewDowngrade = applyPlanRuntimePhase(reviewState, {
+    phase: "grounding",
+    reason: "stale tool-result branch",
+  });
+  assert.equal(reviewDowngrade.changed, false);
+  assert.equal(reviewDowngrade.state, reviewState);
+  assert.equal(
+    reviewDowngrade.rejectedReason,
+    "invalid_plan_phase_transition:review_ready->grounding",
+  );
+
+  const blockedState = { ...createFixtureState(), planRuntimePhase: "blocked" };
+  const blockedReopen = applyPlanRuntimePhase(blockedState, {
+    phase: "drafting",
+    reason: "late recovery prompt",
+  });
+  assert.equal(blockedReopen.changed, false);
+  assert.equal(blockedReopen.state, blockedState);
+  assert.equal(
+    blockedReopen.rejectedReason,
+    "invalid_plan_phase_transition:blocked->drafting",
+  );
 });
 
 test("plan runtime reducers update only their owned fields", () => {

@@ -601,6 +601,19 @@ test("workflow terminal contract routes canonical conclusions through supported 
   assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
   assert.match(workflowSource, /completedTurnHasChanges \? "completed_with_changes" : "done"/);
+  assert.match(
+    workflowSource,
+    /outcome\.status === "completed" && outcome\.resultKind === "error"\s*\? "error"/,
+  );
+  assert.match(
+    workflowSource,
+    /agentStatus:[\s\S]*?outcome\.status === "completed" && outcome\.resultKind === "error"[\s\S]*?\? "error"/,
+  );
+  assert.match(workflowSource, /本回合执行失败并已收口，MAIN 未能完成所请求的工作/);
+  assert.match(
+    workflowSource,
+    /const errorHarnessProjection = projectCurrentHarnessRunMarker\(\s*"error"/,
+  );
   assert.match(workflowSource, /collectPlanTaskTerminalProjection\(\{/);
   assert.match(workflowSource, /resolveTerminalTurnOwnership\(\{/);
   assert.match(workflowSource, /candidate\.id === terminalOwnership\.ownerTurnId/);

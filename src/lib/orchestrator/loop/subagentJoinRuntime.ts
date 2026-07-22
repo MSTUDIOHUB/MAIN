@@ -40,8 +40,8 @@ export async function joinPendingSubagentsForParent(input: {
   input.callbacks.appendMessage({
     role: "user",
     content: input.callbacks.getPreferredLanguage() === "zh"
-      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner、工具调用身份、版本和内容哈希的 evidence 才可复用。缺少完整版本身份或不具备自校验能力的修改，只能在租约释放后把对应路径作为定向 parent read_file 候选。degraded/blocked 子任务不会提升为完成证据；其 failed/uncovered 精确路径也仅作为父任务补读候选。若用户禁止主线程重读，则必须保留为未解决阻塞，不能把补读或 partial output 宣称为完成。\n${content}`
-      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself. Evidence is reusable only with tool_observation provenance, owner, tool-call identity, version, and content hash. Evidence without complete version identity, or a mutation that cannot self-verify its source context, remains only a targeted parent read_file candidate after the lease is released. A degraded/blocked child is never promoted as completion evidence; exact failed/uncovered paths are also only parent-reread candidates. If the user forbids parent rereads, keep them as unresolved blockers and do not claim the reread or partial output as completion.\n${content}`,
+      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner 和工具调用身份的实质性 evidence 才能进入计划证据账本。degraded/blocked 子任务本身不会提升为完成，但其中被运行时接受且路径已覆盖的独立观察仍可用于制定计划；failed/uncovered 精确路径继续作为父任务补读候选。执行阶段的修改仍需完整版本身份和父级验证。若用户禁止主线程重读，则必须把未覆盖路径保留为未解决阻塞，不能把 partial output 宣称为完成。\n${content}`
+      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself. Only substantive evidence with tool_observation provenance, an owner, and tool-call identity may enter the Plan evidence ledger. A degraded or blocked child is never promoted as task completion, but independently accepted observations on covered paths remain usable for Plan authoring; exact failed or uncovered paths remain targeted parent read_file candidates. Execution mutations still require complete version identity and parent verification. If the user forbids parent rereads, keep uncovered paths as unresolved blockers and do not claim partial output as completion.\n${content}`,
   });
   const syntheticResult: ToolExecutionResult = {
     toolCallId: `runtime-wait-subagents-${Date.now()}`,
@@ -89,7 +89,7 @@ export async function joinPendingSubagentsForParent(input: {
     baselineComparison: "not_available",
     summaryProseTrusted: false,
     provenanceBackedEvidenceCount: delegatedEvidenceActivities.length,
-    delegatedObservationReuse: "version_checked_self_verifying_mutations_only",
+    delegatedObservationReuse: "plan_observations_reused_execution_mutations_parent_verified",
     pendingIds: joined.pendingIds,
   });
   return true;

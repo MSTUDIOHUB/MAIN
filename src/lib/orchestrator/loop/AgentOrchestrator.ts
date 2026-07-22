@@ -54,6 +54,7 @@ import { resolveRecoverySourceContextFreshness } from "./contextManagement";
 import { executeTool } from "../../toolExecutor";
 import { resolveTrustedProjectValidationCommands } from "../../projectValidationCommands";
 import type { PendingFiniteValidationCheckpoint } from "../../executeRecoveryTools";
+import { resolveStoppedRunDisposition } from "./stoppedRunDisposition";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -127,6 +128,44 @@ export class AgentOrchestrator {
           const emitted = emitPreparedRunPausedEvent(reason, message, progress);
           if (emitted) this.latestRunPauseReason = reason;
           return emitted;
+        };
+        const finishStoppedRun = (input: {
+          iteration: number;
+          fallbackReason: string;
+          fallbackMessage: string;
+        }) => {
+          const committedPauseReason = turnEvents.getRunPauseReason();
+          const stoppedDisposition = resolveStoppedRunDisposition({
+            workflowMode,
+            isPlanApproved: callbacks.getIsPlanApproved(),
+            status: callbacks.getStatus(),
+            hasStagedTurnCompletion: turnEvents.hasStagedTurnCompletion(),
+            committedPauseReason,
+          });
+          if (stoppedDisposition === "plan_review") {
+            // Review readiness can be discovered after either assistant text
+            // materialization or a Plan artifact tool result. Both paths must
+            // supersede stale generic completion/stop projections.
+            const discardedStagedCompletion =
+              turnEvents.discardStagedTurnCompletion();
+            callbacks.onDebugEvent?.("plan_review_completion_superseded", {
+              iteration: input.iteration,
+              discardedStagedCompletion,
+              planStage: callbacks.getPlanStage(),
+              fallbackReason: input.fallbackReason,
+            });
+            emitRunPausedEvent(
+              "plan_review_required",
+              "The reviewed Plan artifact is awaiting approval in the same logical turn.",
+            );
+            return;
+          }
+          if (stoppedDisposition === "staged_completion") return;
+          if (stoppedDisposition === "committed_pause" && committedPauseReason) {
+            this.latestRunPauseReason = committedPauseReason;
+            return;
+          }
+          emitRunPausedEvent(input.fallbackReason, input.fallbackMessage);
         };
         emitInitialTurnPreparationEvents({
           callbacks,
@@ -935,18 +974,11 @@ export class AgentOrchestrator {
               recentToolNames: [...new Set(loopState.recentToolActivity.map((activity) => activity.name))].slice(0, 12),
             });
           }
-          if (turnEvents.hasStagedTurnCompletion()) {
-            return;
-          }
-          const committedPauseReason = turnEvents.getRunPauseReason();
-          if (committedPauseReason) {
-            this.latestRunPauseReason = committedPauseReason;
-            return;
-          }
-          const pauseReason = workflowMode === "plan" && !callbacks.getIsPlanApproved() && callbacks.getStatus() === "pending_review"
-            ? "plan_review_required"
-            : "assistant_stopped";
-          emitRunPausedEvent(pauseReason, "The assistant run stopped in a resumable state.");
+          finishStoppedRun({
+            iteration,
+            fallbackReason: "assistant_stopped",
+            fallbackMessage: "The assistant run stopped in a resumable state.",
+          });
           return;
         }
         if (assistantIterationPhase.status === "continue") {
@@ -1071,7 +1103,11 @@ export class AgentOrchestrator {
           return;
         }
         if (toolIterationPhase.status === "stopped") {
-          emitRunPausedEvent("tool_loop_stopped", "The tool loop stopped in a resumable state.");
+          finishStoppedRun({
+            iteration,
+            fallbackReason: "tool_loop_stopped",
+            fallbackMessage: "The tool loop stopped in a resumable state.",
+          });
           return;
         }
         if (toolIterationPhase.status === "continue") {

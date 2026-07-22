@@ -7400,6 +7400,7 @@ function seedRealOmlxPlanFlowScenario() {
       substantiveEvidenceCount: run.substantiveEvidenceCount || 0,
       closureState: run.closureState || "",
       remainingWork: run.remainingWork || "",
+      parentHandoff: run.parentHandoff || "",
       activityCount: run.activities.length,
       activities: run.activities.map((activity) => ({
         status: activity.status,
@@ -8057,6 +8058,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planTasks: state.planTasks,
       currentTurnId: currentTurn?.id ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnRuntimeStatus: currentTurn?.runtimeOutcome?.status ?? null,
+      currentTurnResultKind: currentTurn?.runtimeOutcome?.resultKind ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       turnStartedEvents: state.runtimeEvents

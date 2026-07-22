@@ -397,6 +397,52 @@ test("plan convergence helper emits the first convergence prompt and updates cou
   assert.deepEqual(phases.map((item) => item.phase), ["synthesis", "drafting"]);
 });
 
+test("reusable delegated evidence plus one parent read converges after two bounded batches", () => {
+  const recentToolActivity = [{
+    name: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    detail: "creator is read but creatorName is not assigned by CSV normalization",
+    delegatedObservation: { planningEvidenceState: "reusable" },
+  }, {
+    name: "read_file",
+    target: "src/hooks/useChartData.ts",
+    status: "succeeded",
+    detail: "chart grouping consumes order.creatorName as its creator dimension",
+    delegatedObservation: { planningEvidenceState: "reusable" },
+  }, {
+    name: "analyze_tabular_document",
+    target: "fixtures/orders.csv",
+    status: "succeeded",
+    detail: "CSV header provides creator while the normalized consumer contract requires creatorName",
+  }];
+
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 2,
+    toolCount: 2,
+    userGoal: "Plan the creatorName CSV data-flow repair.",
+    recentToolActivity,
+    hasGroundedVisualContext: true,
+  }), true);
+
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 2,
+    toolCount: 2,
+    userGoal: "Plan the creatorName CSV data-flow repair.",
+    recentToolActivity: recentToolActivity.map((activity) => ({
+      ...activity,
+      ...(activity.delegatedObservation
+        ? { delegatedObservation: { planningEvidenceState: "unresolved" } }
+        : {}),
+    })),
+    hasGroundedVisualContext: true,
+  }), false);
+});
+
 test("plan convergence names an unresolved contract instead of allowing more broad reads", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];

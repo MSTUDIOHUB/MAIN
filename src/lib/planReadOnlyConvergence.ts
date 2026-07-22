@@ -31,6 +31,9 @@ export interface PlanToolActivityLike {
   target?: string;
   status?: string;
   detail?: string;
+  delegatedObservation?: {
+    planningEvidenceState?: "reusable" | "unresolved";
+  };
 }
 
 const PLAN_READ_ONLY_TOOL_NAMES = new Set([
@@ -308,9 +311,30 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     hasGroundedVisualContext:
       input.hasGroundedVisualContext ?? input.hasObservedUserContext,
   });
+  const successfulActivity = (input.recentToolActivity || []).filter(isSuccessfulActivity);
+  const reusableDelegatedTargets = new Set(successfulActivity.flatMap((activity) => {
+    if (activity.delegatedObservation?.planningEvidenceState !== "reusable") return [];
+    const target = normalizeEvidencePath(String(activity.target || ""));
+    return target ? [target] : [];
+  }));
+  const hasParentOwnedTargetedRead = successfulActivity.some((activity) =>
+    !activity.delegatedObservation &&
+    isPlanTargetedEvidenceRead(String(activity.name || "")) &&
+    hasConcreteTarget(activity)
+  );
+  // Joined child evidence is already one bounded exploration batch. Once two
+  // independently scoped, provenance-backed observations and a parent-owned
+  // targeted read exist, a second batch is enough to make the runtime decide
+  // whether to draft or request one exact missing contract. This is based on
+  // evidence shape, never provider/model identity or response wording.
+  const reusableDelegatedConvergenceReady =
+    reusableDelegatedTargets.size >= 2 &&
+    hasParentOwnedTargetedRead &&
+    input.batchCount >= 2;
   if (
     readiness.status === "needs_targeted_read" &&
     (
+      reusableDelegatedConvergenceReady ||
       (readiness.successfulSearches > 0 && input.batchCount >= 1) ||
       (
         readiness.successfulTargetedReads >= 2 &&
@@ -324,6 +348,7 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     return false;
   }
   return (
+    reusableDelegatedConvergenceReady ||
     input.batchCount >= batchLimit ||
     input.toolCount >= toolLimit
   );

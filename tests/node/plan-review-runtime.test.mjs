@@ -262,6 +262,36 @@ test("plan review fails closed when a validation section has no executable task"
   );
 });
 
+test("design review accepts validation strategy before an execution command is chosen", async () => {
+  const artifact = {
+    kind: "design",
+    path: ".MAIN/plans/design.md",
+    title: "Design",
+    content: [
+      "# Design",
+      "",
+      "## Data flow",
+      "- Parse the selected CSV, aggregate course sales, then render and export the report.",
+      "",
+      "## Validation",
+      "- Use the supplied sample to check aggregation output and malformed-row handling.",
+    ].join("\n"),
+    revision: 1,
+    updatedAt: 1,
+  };
+  const { events, handlers } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "design",
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("design_strategy"), "stopped");
+  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), true);
+});
+
 test("plan review accepts an explicit finite non-Node validation command without manifest repair", async () => {
   const artifact = {
     kind: "plan",

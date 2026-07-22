@@ -9,10 +9,10 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("Feishu remote analysis stays in the continuous flow without inferred choice buttons", async ({ page }) => {
+test("Feishu remote analysis remains a titled workspace Turn without inferred choice buttons", async ({ page }) => {
   await page.goto("/?e2eScenario=feishu-remote-analysis");
 
-  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(1);
   await expect(page.getByTestId("turn-intent-badge-analyze")).toHaveCount(0);
   await expect(page.getByText("检查html版本和pygame版本的界面差别")).toBeVisible();
   await expect(page.getByText(/High score loaded from .*highscore\.json.* file/)).toBeVisible();

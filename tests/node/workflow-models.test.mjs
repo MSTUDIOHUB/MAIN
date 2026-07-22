@@ -2354,6 +2354,54 @@ test("plan quality rejects an implementation label that owns no concrete body", 
   assert.equal(result.reason, "empty_plan_implementation_detail");
 });
 
+test("plan quality accepts nested owner behavior and dependency bullets as concrete implementation detail", () => {
+  const content = [
+    "# Plan: CSV creatorName 数据链路整改",
+    "",
+    "## Summary",
+    "- 统一 CSV 解析、Order 类型和图表消费端的创建者字段。",
+    "",
+    "## Confirmed Evidence",
+    "- `src/types/order.ts` 要求 creatorName，而 CSV 只有 creator。",
+    "- `src/hooks/useCsvParser.ts` 当前没有把 creator 映射到 creatorName。",
+    "",
+    "## Key Changes",
+    "### 1. 移除 creatorName 类型约束",
+    "- **文件**: `src/types/order.ts`",
+    "- **行为**: 从 Order 接口中移除 creatorName，保留 creator 作为唯一标识符。",
+    "- **上游/下游**: 上游解析器只需提供 creator；下游图表改为消费 creator。",
+    "### 2. 简化 CSV 解析器",
+    "- **文件**: `src/hooks/useCsvParser.ts`",
+    "- **行为**: 从 CsvOrder 中移除 creatorName，并保持 normalizeCsvOrder 对 creator 的现有映射。",
+    "- **上游/下游**: CSV 数据源不变；下游统一依赖 creator。",
+    "",
+    "## Public APIs/Interfaces/Types",
+    "- **Order 接口** (`src/types/order.ts`):",
+    "  - 修改前: `{ creatorName: string; amount: number; }`",
+    "  - 修改后: `{ creator: string; amount: number; }`",
+    "",
+    "## Test Plan",
+    "- 运行 `npx tsc --noEmit` 并断言退出码为 0。",
+    "- 加载 `cn_tutorial_orders_by_creator_20260512.csv`，断言图表显示 alice 且无 creatorName 访问错误。",
+    "",
+    "## Assumptions/Defaults",
+    "- creator 和 creatorName 在当前业务中指代同一实体。",
+  ].join("\n");
+  const result = validateActionablePlanArtifact(content);
+  const derivedTasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "CSV creatorName 数据链路整改",
+    content,
+    updatedAt: 0,
+  }]);
+
+  assert.equal(result.ok, true, result.reason || "");
+  const mutationTasks = derivedTasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutationTasks.length, 2, JSON.stringify(derivedTasks, null, 2));
+  assert.ok(mutationTasks.every((task) => /移除/.test(task.text)), JSON.stringify(mutationTasks, null, 2));
+});
+
 test("plan quality rejects only explicit conflicting values for the same acceptance subject", () => {
   const fixtures = [[
     "# 修复启动状态",

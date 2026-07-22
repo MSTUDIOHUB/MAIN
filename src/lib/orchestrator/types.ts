@@ -398,6 +398,8 @@ export interface ToolExecutionResult {
   target: string;
   content: string; // model-facing result or error message
   displayContent?: string; // UI-facing result, can differ from model-facing content
+  /** Exact runtime-owned payload for structured evidence parsing when content is truncated. */
+  runtimeEvidenceContent?: string;
   isError: boolean;
   /** Runtime-owned child registration outcome; do not reconstruct this from model-facing text. */
   subagentSpawnOutcome?: SpawnSubagentResult;

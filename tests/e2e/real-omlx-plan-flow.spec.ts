@@ -194,6 +194,39 @@ function summarizePlanDebugTail(entries: unknown[]): string[] {
     .map((line) => line.slice(0, 1_200));
 }
 
+function summarizeSubagentPlanFailureDebug(entries: unknown[]): unknown[] {
+  return (Array.isArray(entries) ? entries : []).flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    const source = String(record.source || record.target || "");
+    if (!/(?:plan_|subagent_evidence|parent_(?:wait|resume|join)|tool_surface|loop_stop|non_actionable)/i.test(source)) {
+      return [];
+    }
+    let message: unknown = record.message;
+    if (typeof message === "string") {
+      try {
+        message = JSON.parse(message);
+      } catch {
+        message = message.slice(0, 2_400);
+      }
+    }
+    return [{ source, level: record.level, message }];
+  }).slice(-80);
+}
+
+function summarizeTaskFlowForFailure(entries: unknown[]): unknown[] {
+  return (Array.isArray(entries) ? entries : []).slice(-50).map((entry) => {
+    const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
+    return {
+      type: record.type,
+      toolName: record.toolName,
+      target: record.target,
+      status: record.status,
+      content: String(record.content || "").slice(0, 800),
+    };
+  });
+}
+
 test.describe.configure({ timeout: 1_200_000 });
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
 
@@ -1778,7 +1811,30 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   let terminalOutcome = "running";
   let stableTerminalPolls = 0;
   let sawRunActivity = false;
-  await expect.poll(async () => {
+  const logTerminalFailure = (snapshot: any) => {
+    console.log(`[real-omlx-subagents-terminal:${subagentModel}] ${JSON.stringify({
+      terminalOutcome,
+      agentStatus: snapshot?.agentStatus,
+      currentTurnStatus: snapshot?.currentTurnStatus,
+      planStage: snapshot?.planStage,
+      isGenerating: snapshot?.isGenerating,
+      runs: (snapshot?.subagentRuns || []).map((run: Record<string, unknown>) => ({
+        id: run.id,
+        scopeKey: run.scopeKey,
+        status: run.status,
+        evidenceCount: run.evidenceCount,
+        substantiveEvidenceCount: run.substantiveEvidenceCount,
+        closureState: run.closureState,
+        remainingWork: run.remainingWork,
+        parentHandoff: run.parentHandoff,
+        error: run.error,
+      })),
+      taskFlow: summarizeTaskFlowForFailure(snapshot?.taskFlowPreview),
+      debug: summarizeSubagentPlanFailureDebug(snapshot?.debugTail),
+    }).slice(-60_000)}`);
+  };
+  try {
+    await expect.poll(async () => {
     const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     if (snapshot?.dispatchError) {
       terminalOutcome = `dispatch_error:${snapshot.dispatchError}`;
@@ -1833,18 +1889,16 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
     stableTerminalPolls = 0;
     terminalOutcome = `running:${runs.length}:${maxActiveChildren}`;
     return false;
-  }, { timeout: 600_000 }).toBe(true);
+    }, { timeout: 600_000 }).toBe(true);
+  } catch (error) {
+    const timeoutSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    terminalOutcome = `poll_timeout:${timeoutSnapshot?.currentTurnStatus}:${timeoutSnapshot?.agentStatus}:${timeoutSnapshot?.planStage}`;
+    logTerminalFailure(timeoutSnapshot);
+    throw error;
+  }
   const terminalSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
   if (terminalOutcome !== "joined_plan_ready") {
-    console.log(`[real-omlx-subagents-terminal:${subagentModel}] ${JSON.stringify({
-      terminalOutcome,
-      agentStatus: terminalSnapshot?.agentStatus,
-      currentTurnStatus: terminalSnapshot?.currentTurnStatus,
-      planStage: terminalSnapshot?.planStage,
-      runs: terminalSnapshot?.subagentRuns,
-      taskFlow: terminalSnapshot?.taskFlowPreview,
-      debug: terminalSnapshot?.debugTail,
-    }).slice(0, 40_000)}`);
+    logTerminalFailure(terminalSnapshot);
   }
   expect(terminalOutcome).toBe("joined_plan_ready");
 
@@ -1868,6 +1922,7 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
     substantiveEvidenceCount: number;
     closureState: string;
     remainingWork: string;
+    parentHandoff: string;
     error: string;
   }>;
   const expectedScopeKeys = new Set(["csv-parser", "chart-consumer", "type-contract"]);
@@ -1906,16 +1961,12 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
     run.summary.trim().length > 0
   ))).toBe(true);
   expect(selectedRuns.every((run) => run.evidenceCount === run.substantiveEvidenceCount)).toBe(true);
-  expect(selectedRuns.every((run) => {
-    if (run.status === "completed") {
-      return run.closureState === "satisfied" && run.evidenceCount > 0 && !run.remainingWork.trim();
-    }
-    if (run.status === "degraded") {
-      return run.closureState === "partial" && run.evidenceCount > 0 && run.remainingWork.trim().length > 0;
-    }
-    return run.closureState === "blocked" &&
-      (run.error.trim().length > 0 || run.remainingWork.trim().length > 0);
-  })).toBe(true);
+  expect(selectedRuns.every((run) => (
+    run.status === "completed" &&
+    run.closureState === "satisfied" &&
+    run.evidenceCount > 0 &&
+    !run.remainingWork.trim()
+  ))).toBe(true);
   expect(Math.max(...selectedRuns.map((run) => run.createdAt)))
     .toBeLessThan(Math.min(...selectedRuns.map((run) => run.completedAt || Number.MAX_SAFE_INTEGER)));
   expect(parsedDebugEntries.some((entry) =>
@@ -1953,7 +2004,32 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   ));
   expect(elasticBurstObserved || safeCapacityFallbackObserved).toBe(true);
   expect(debugText).not.toMatch(/out of memory|\bOOM\b|uncaught|unhandled rejection/i);
+  const planAuthoringContractSnapshots = parsedDebugEntries.filter((entry) => (
+    entry.source === "agent.plan_authoring_contract_injected" &&
+    entry.contractVersion === 2
+  )).map((entry) => ({
+    iteration: entry.iteration,
+    phase: entry.planRuntimePhase,
+    reusableEvidenceTargets: Array.isArray(entry.reusableEvidenceTargets)
+      ? entry.reusableEvidenceTargets
+      : [],
+  }));
+  expect(planAuthoringContractSnapshots.some((entry) => (
+    [
+      "src/hooks/useCsvParser.ts",
+      "src/hooks/useChartData.ts",
+      "src/store/dashboardStore.ts",
+      "src/types/order.ts",
+    ].every((target) => entry.reusableEvidenceTargets.includes(target))
+  )), `Plan contract snapshots: ${JSON.stringify(planAuthoringContractSnapshots)}`).toBe(true);
+  expect(parsedDebugEntries.some((entry) => (
+    ["agent.plan_evidence_bundle_ready", "agent.plan_evidence_bundle_injected"].includes(String(entry.source || "")) &&
+    Array.isArray(entry.contractMismatchKinds) &&
+    entry.contractMismatchKinds.includes("producer_missing_required_field:creatorName")
+  ))).toBe(true);
   expect(snapshot.planArtifacts[0].content).toMatch(/useCsvParser|creatorName/);
   expect(snapshot.planArtifacts[0].content).toMatch(/useChartData|dashboardStore/);
   expect(snapshot.planArtifacts[0].content).toMatch(/src\/types\/order\.ts/);
+  expect(snapshot.planArtifacts[0].content).toMatch(/(?:normalizeCsvOrder|归一化)[^\n]{0,180}creatorName|creatorName[^\n]{0,180}(?:normalizeCsvOrder|归一化)/i);
+  expect(snapshot.planArtifacts[0].content).not.toMatch(/(?:移除|删除|去掉|remove|delete|drop)[^\n]{0,120}creatorName/i);
 });

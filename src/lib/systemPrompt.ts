@@ -309,8 +309,10 @@ function buildIntentModule(input: {
 
   if (intent === "plan") {
     return makeSection("PLAN", [
-      "Gather only the read-only evidence needed to remove material uncertainty.",
-      "Describe the desired result, grounded current state, affected boundary, implementation path, and executable validation.",
+      "The runtime injects a versioned PLAN AUTHORING CONTRACT before every model step. Treat its canonical objective, acceptance criteria, current stage, and explicit violations as the single planning protocol.",
+      "Follow the fixed sequence: understand the objective, gather only decision-changing read-only evidence, draft against the declared criteria, revise only declared violations, then stop for review.",
+      "Before the first action, identify the exact objective, known inputs, and smallest material unknown from that contract. Do not begin with an unconstrained draft or broad repository scan.",
+      "The quality gate checks the criteria disclosed before drafting. A rejection may request evidence or revision, but must not silently redefine the user's task or acceptance boundary.",
       "Do not turn your own read/check/fix ordering into user choices. Ask only when a user-owned product, scope, technology, or priority decision blocks the plan.",
       "When ready, output one visible `<proposed_plan>` Markdown block and stop. MAIN runtime, not the model, validates and materializes `.MAIN/plans/plan.md`.",
       "For a multi-step turn, optionally give a brief user-facing update only when a material finding changes the plan. Do not narrate file reads, searches, or tool names.",

@@ -24,7 +24,10 @@ import {
   type PlanConfigurationContractAssessment,
   type PlanEvidenceBundle,
 } from "./planEvidence";
-import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  resolveUniqueWorkspaceFileReference,
+  workspacePathsReferToSameFile,
+} from "./workspacePaths";
 import {
   extractNumberedUserGoalFacets,
   preserveNumberedUserGoalLines,
@@ -918,9 +921,71 @@ export function summarizePlanEvidenceDetail(input: {
 }
 
 const STRUCTURED_PLAN_EVIDENCE_FACT_RE =
-  /\b(?:(?:handler|permission|event_(?:emit|dom_listener|tauri_listener)|command_invoke)_contract|listener_calls)\([^\n)]{1,240}\)/gi;
+  /\b(?:(?:handler|permission|event_(?:emit|dom_listener|tauri_listener)|command_invoke|field|returned_field|field_read|field_fallback|field_selector)_contract|listener_calls)\([^\n)]{1,240}\)/gi;
 const STRUCTURED_PLAN_CONFIG_FACT_RE =
   /\b(?:devUrl\s*["']?\s*[:=]\s*["']?[^\s"']{1,160}|port\s*["']?\s*[:=]\s*\d{1,5}|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d{1,5})/gi;
+
+const NON_CONTRACT_PROPERTY_NAMES = new Set([
+  "catch",
+  "filter",
+  "find",
+  "forEach",
+  "join",
+  "length",
+  "map",
+  "push",
+  "reduce",
+  "slice",
+  "some",
+  "sort",
+  "then",
+  "trim",
+]);
+
+function extractStructuredDataFieldFacts(value: string): string[] {
+  const body = extractDelimitedReadFileBody(value) || String(value || "");
+  const facts: string[] = [];
+  const add = (fact: string) => {
+    if (fact && !facts.includes(fact)) facts.push(fact);
+  };
+
+  for (const declaration of body.matchAll(/\b(?:interface|type)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:=\s*)?\{([\s\S]{0,5000}?)\}/g)) {
+    const owner = declaration[1] || "Anonymous";
+    const fields = declaration[2] || "";
+    for (const property of fields.matchAll(/(?:^|[;,{\n])\s*(?:readonly\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(\?)?\s*:\s*[^;,}\n]+/g)) {
+      const field = property[1] || "";
+      if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+      add(`field_contract(${owner}.${field},${property[2] ? "optional" : "required"})`);
+    }
+  }
+
+  for (const returnedObject of body.matchAll(/\breturn\s*\{([\s\S]{0,4000}?)\}\s*;?/g)) {
+    const objectBody = returnedObject[1] || "";
+    for (const property of objectBody.matchAll(/(?:^|[,\n])\s*(?:\.\.\.[^,\n]+\s*,\s*)?(?:["']([^"']+)["']|([A-Za-z_$][A-Za-z0-9_$]*))\s*(?::|,|$)/g)) {
+      const field = property[1] || property[2] || "";
+      if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+      add(`returned_field_contract(${field})`);
+    }
+  }
+
+  for (const fallback of body.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\|\||\?\?)\s*\1\.([A-Za-z_$][A-Za-z0-9_$]*)/g)) {
+    const primary = fallback[2] || "";
+    const secondary = fallback[3] || "";
+    if (!primary || !secondary) continue;
+    add(`field_fallback_contract(${primary},${secondary})`);
+    add(`field_read_contract(${primary})`);
+    add(`field_read_contract(${secondary})`);
+  }
+  for (const access of body.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*\.([A-Za-z_$][A-Za-z0-9_$]*)\b/g)) {
+    const field = access[1] || "";
+    if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+    add(`field_read_contract(${field})`);
+  }
+  for (const selector of body.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:Field|Key|Property|Column)\s*=\s*["']([A-Za-z_$][A-Za-z0-9_$]*)["']/g)) {
+    if (selector[1]) add(`field_selector_contract(${selector[1]})`);
+  }
+  return facts.slice(0, 24);
+}
 
 function planEvidenceFactPriority(value: string): number {
   if (/event_dom_listener_contract\(DOMContentLoaded\)/i.test(value)) return 120;
@@ -929,6 +994,10 @@ function planEvidenceFactPriority(value: string): number {
   if (/\b(?:handler|permission)_contract\(/i.test(value)) return 105;
   if (/\bevent_(?:emit|dom_listener|tauri_listener)_contract\(/i.test(value)) return 100;
   if (/\bcommand_invoke_contract\(/i.test(value)) return 90;
+  if (/\bfield_contract\([^,]+,required\)/i.test(value)) return 88;
+  if (/\bfield_(?:fallback|selector)_contract\(/i.test(value)) return 86;
+  if (/\bfield_contract\([^,]+,optional\)|\breturned_field_contract\(/i.test(value)) return 84;
+  if (/\bfield_read_contract\(/i.test(value)) return 70;
   return 50;
 }
 
@@ -942,6 +1011,7 @@ export function extractPlanEvidenceFacts(value: unknown): string[] {
   const candidates = [
     ...Array.from(text.matchAll(STRUCTURED_PLAN_EVIDENCE_FACT_RE), (match) => match[0] || ""),
     ...Array.from(text.matchAll(STRUCTURED_PLAN_CONFIG_FACT_RE), (match) => match[0] || ""),
+    ...extractStructuredDataFieldFacts(text),
   ];
   return mergePlanEvidenceFacts(candidates);
 }
@@ -1588,6 +1658,16 @@ function planGroundingPathsMatch(left: string, right: string): boolean {
   );
 }
 
+function planGroundingTargetResolvesToEvidence(
+  target: string,
+  evidenceTargets: string[],
+): boolean {
+  return resolveUniqueWorkspaceFileReference(
+    normalizePlanGroundingPath(target),
+    evidenceTargets.map(normalizePlanGroundingPath),
+  ) !== null;
+}
+
 function isPlanMutationLine(value: string): boolean {
   const line = String(value || "")
     .replace(/^\s*(?:[-*]|\d+[.)、])\s+/, "")
@@ -2051,8 +2131,17 @@ function collectDirectAbsenceClaimIdentifiers(line: string): string[] {
   // Source-presence assertions. Deliberately exclude relational verbs such as
   // 未使用、未实现、未注册 and phrases such as 没有在 ...; seeing an identifier
   // elsewhere in source is not evidence that those relationships exist.
-  addMatches(/(?:缺少|没有|不存在|未定义)\s*(?:必要的|对应的|任何)?\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
-  addMatches(/(?:missing|absent)\s+(?:an?\s+|the\s+)?[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  // A missing relationship is not a declaration-absence claim. For example,
+  // "the returned object is missing creatorName" is not contradicted by an
+  // interface declaration that mentions creatorName. Relationship claims are
+  // grounded by the later mutation/evidence checks, not this identifier-
+  // presence shortcut.
+  const isRelationalAbsenceClaim =
+    /(?:返回(?:对象|值)?|输出|结果|映射|赋值|绑定|注册|引用|消费|回退).{0,28}(?:缺少|没有|不存在|未定义)|(?:return(?:ed)?\s+(?:object|value)|output|result|mapping|assignment|binding|registration|reference|consumer|fallback).{0,28}(?:missing|absent|does\s+not\s+(?:contain|include|map|assign|bind|register|reference))/i.test(line);
+  if (!isRelationalAbsenceClaim) {
+    addMatches(/(?:缺少|没有|不存在|未定义)\s*(?:必要的|对应的|任何)?\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+    addMatches(/(?:missing|absent)\s+(?:an?\s+|the\s+)?[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  }
   addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s*(?:函数|方法|变量|监听器|保护)?\s*(?:不存在|未定义)/gi);
   addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s+is\s+(?:missing|absent|not\s+(?:present|defined))/gi);
 
@@ -2104,8 +2193,44 @@ export function findContradictedPlanDiagnosticClaim(input: {
   return null;
 }
 
+function textExplicitlyRemovesContractField(value: string, field: string): boolean {
+  const escapedField = escapePlanRegExp(field);
+  for (const rawLine of String(value || "").split(/\r?\n/)) {
+    const line = rawLine.replace(/[`*_]/g, " ").replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    const removesField = new RegExp(
+      `(?:移除|删除|去掉|废弃|重命名|替换|remove|delete|drop|deprecate|rename|replace)[^\\n。.!?]{0,140}(?:^|[^A-Za-z0-9_$])${escapedField}(?:$|[^A-Za-z0-9_$])`,
+      "i",
+    ).test(line);
+    if (!removesField) continue;
+    if (/(?:不(?:要|应|会|得|再)?|无需|避免)\s*(?:移除|删除|去掉|废弃|重命名|替换)|(?:do\s+not|don't|must\s+not|without|avoid)\s+(?:remove|delet|drop|deprecat|renam|replac)/i.test(line)) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function findUnsupportedBreakingFieldContractChange(input: {
+  content: string;
+  userGoal?: string;
+  evidenceBundle?: PlanEvidenceBundle;
+}): string | null {
+  if (!input.evidenceBundle) return null;
+  const mismatchKinds = assessPlanClosureEvidence(input.evidenceBundle).contractMismatchKinds;
+  for (const kind of mismatchKinds) {
+    if (!kind.startsWith("producer_missing_required_field:")) continue;
+    const field = kind.slice("producer_missing_required_field:".length);
+    if (!field || !textExplicitlyRemovesContractField(input.content, field)) continue;
+    if (textExplicitlyRemovesContractField(input.userGoal || "", field)) continue;
+    return field;
+  }
+  return null;
+}
+
 export function validatePlanEvidenceGrounding(input: {
   content: string;
+  userGoal?: string;
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
@@ -2116,6 +2241,13 @@ export function validatePlanEvidenceGrounding(input: {
     return classifyPlanArtifactQualityResult({
       ok: false,
       reason: `plan_diagnostic_claim_contradicted:${contradictedClaim}`,
+    });
+  }
+  const unsupportedBreakingField = findUnsupportedBreakingFieldContractChange(input);
+  if (unsupportedBreakingField) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: `unsupported_breaking_contract_removal:${unsupportedBreakingField}`,
     });
   }
   const readTargets = [
@@ -2147,7 +2279,7 @@ export function validatePlanEvidenceGrounding(input: {
   }
 
   const ungroundedTargets = changeTargets.filter((target) =>
-    !readTargets.some((readTarget) => planGroundingPathsMatch(target, readTarget))
+    !planGroundingTargetResolvesToEvidence(target, readTargets)
   );
   if (ungroundedTargets.length > 0) {
     return classifyPlanArtifactQualityResult({
@@ -2163,6 +2295,7 @@ export function validatePlanEvidenceGrounding(input: {
 
 export function validateGroundedActionablePlanArtifact(input: {
   content: string;
+  userGoal?: string;
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
@@ -2178,6 +2311,7 @@ function repairMissingPlanEvidenceSection(input: {
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
+  evidenceBundle?: PlanEvidenceBundle;
   language: "zh" | "en";
 }): string | null {
   const changeTargets = collectPlanChangeTargets(input.content);
@@ -2185,7 +2319,9 @@ function repairMissingPlanEvidenceSection(input: {
 
   const matchesChangedTarget = (value: string): boolean => {
     const normalized = normalizePlanGroundingPath(value);
-    return changeTargets.some((target) => planGroundingPathsMatch(target, normalized));
+    return changeTargets.some((target) =>
+      planGroundingTargetResolvesToEvidence(target, [normalized])
+    );
   };
   const evidenceLines = uniquePlanItems([
     ...(input.evidence || [])
@@ -2206,6 +2342,12 @@ function repairMissingPlanEvidenceSection(input: {
       )
       .map((activity) => summarizeEvidenceLine(
         summarizeToolActivityForEvidence(activity),
+        input.language,
+      )),
+    ...(input.evidenceBundle?.facts || [])
+      .filter((fact) => matchesChangedTarget(fact.target))
+      .map((fact) => summarizeEvidenceLine(
+        `${fact.tool} ${fact.target}; excerpt=${fact.summary}`,
         input.language,
       )),
   ], 6, 1200, true).filter(isConcretePlanEvidence);
@@ -2786,6 +2928,11 @@ function buildDeterministicContractFindings(
       findings.push(language === "zh"
         ? `已确认同一启动链路的多个配置对 \`${key}\` 给出了不同值。`
         : `Multiple configurations in the same startup path define conflicting values for \`${key}\`.`);
+    } else if (kind.startsWith("producer_missing_required_field:")) {
+      const field = kind.slice("producer_missing_required_field:".length);
+      findings.push(language === "zh"
+        ? `已确认上游归一化输出没有填充下游类型与消费方要求的 \`${field}\` 字段。`
+        : `The upstream normalization output does not populate the \`${field}\` field required by the downstream type and consumer contract.`);
     }
   }
   return findings;
@@ -2837,6 +2984,14 @@ function evidenceSupportsContractMismatch(evidence: string, kind: string): boole
     return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i
       .test(value);
   }
+  if (kind.startsWith("producer_missing_required_field:")) {
+    const field = kind.slice("producer_missing_required_field:".length);
+    const escapedField = escapePlanRegExp(field);
+    return new RegExp(
+      `(?:field_contract\\s*\\(\\s*[^,()]*\\.${escapedField}\\s*,\\s*(?:required|optional)\\s*\\)|field_(?:read|selector)_contract\\s*\\(\\s*${escapedField}\\s*\\)|returned_field_contract\\s*\\()`,
+      "i",
+    ).test(value);
+  }
   return false;
 }
 
@@ -2877,6 +3032,16 @@ function buildDeterministicChangeLine(input: {
     if (kind.startsWith("config_value_mismatch:")) {
       return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i.test(evidence);
     }
+    if (kind.startsWith("producer_missing_required_field:")) {
+      const field = kind.slice("producer_missing_required_field:".length);
+      const escapedField = escapePlanRegExp(field);
+      return new RegExp(
+        `field_contract\\s*\\(\\s*[^,()]*\\.${escapedField}\\s*,\\s*optional\\s*\\)`,
+        "i",
+      ).test(evidence) &&
+        /\breturned_field_contract\s*\(/i.test(evidence) &&
+        !new RegExp(`returned_field_contract\\s*\\(\\s*${escapedField}\\s*\\)`, "i").test(evidence);
+    }
     return false;
   });
   const missingCommands = localContractMismatchKinds
@@ -2894,6 +3059,10 @@ function buildDeterministicChangeLine(input: {
   const mismatchedConfigurationKeys = localContractMismatchKinds
     .filter((kind) => kind.startsWith("config_value_mismatch:"))
     .map((kind) => kind.slice("config_value_mismatch:".length))
+    .filter(Boolean);
+  const missingRequiredFields = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("producer_missing_required_field:"))
+    .map((kind) => kind.slice("producer_missing_required_field:".length))
     .filter(Boolean);
   const pluginPermissionList = missingPluginPermissions
     .map((plugin) => `\`${plugin}:default\``)
@@ -2921,6 +3090,10 @@ function buildDeterministicChangeLine(input: {
     if (mismatchedConfigurationKeys.length > 0) {
       return `Align \`${mismatchedConfigurationKeys.join("`, `")}\` in \`${file}\` with the other read-backed configuration owner in the same startup path, changing only the side that differs from the canonical development command. Grounding evidence: ${evidence}.`;
     }
+    if (missingRequiredFields.length > 0) {
+      const fields = missingRequiredFields.map((field) => `\`${field}\``).join(", ");
+      return `Update the normalization output in \`${file}\` to populate the required downstream field${missingRequiredFields.length > 1 ? "s" : ""} ${fields} from the existing source value, preserving the established public/type contract and compatibility fields. Grounding evidence: ${evidence}.`;
+    }
     return `Repair the concrete implementation mismatch recorded for \`${file}\` (${evidence}) so it satisfies the reviewed objective: ${summarizeGoalForPlanChange(input.goal, "en")}. Preserve unrelated behavior and verify that exact path.`;
   }
 
@@ -2943,6 +3116,10 @@ function buildDeterministicChangeLine(input: {
   }
   if (mismatchedConfigurationKeys.length > 0) {
     return `将 \`${file}\` 中的 \`${mismatchedConfigurationKeys.join("`、`")}\` 与同一启动链路的另一已读配置所有者对齐，只修改偏离规范开发命令的一侧。依据证据：${evidence}。`;
+  }
+  if (missingRequiredFields.length > 0) {
+    const fields = missingRequiredFields.map((field) => `\`${field}\``).join("、");
+    return `修改 \`${file}\` 的归一化输出：从现有来源值填充下游必需字段 ${fields}，保留已经建立的公共/类型契约与兼容字段。依据证据：${evidence}。`;
   }
   return `修复 \`${file}\` 中已读证据明确记录的实现不一致（${evidence}），使其满足已审核目标“${summarizeGoalForPlanChange(input.goal, "zh")}”；保持无关行为不变，并验证这条精确链路。`;
 }
@@ -3695,6 +3872,7 @@ export function materializePlanArtifactFromVisibleText(input: {
 
   let grounding = validatePlanEvidenceGrounding({
     content,
+    userGoal: input.userGoal,
     evidence: input.evidence,
     evidenceRecords: input.evidenceRecords,
     recentToolActivity: input.recentToolActivity,
@@ -3721,6 +3899,7 @@ export function materializePlanArtifactFromVisibleText(input: {
           : "grounding_repaired_visible_plan";
         grounding = validatePlanEvidenceGrounding({
           content,
+          userGoal: input.userGoal,
           evidence: input.evidence,
           evidenceRecords: input.evidenceRecords,
           recentToolActivity: input.recentToolActivity,
@@ -3736,11 +3915,13 @@ export function materializePlanArtifactFromVisibleText(input: {
         evidence: input.evidence,
         evidenceRecords: input.evidenceRecords,
         recentToolActivity: input.recentToolActivity,
+        evidenceBundle: input.evidenceBundle,
         language,
       });
       if (repaired) {
         const repairedQuality = validateGroundedActionablePlanArtifact({
           content: repaired,
+          userGoal: input.userGoal,
           evidence: input.evidence,
           evidenceRecords: input.evidenceRecords,
           recentToolActivity: input.recentToolActivity,

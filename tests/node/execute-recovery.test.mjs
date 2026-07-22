@@ -4580,6 +4580,32 @@ test("recovery batch selection serializes different model call shapes by phase",
   );
   assert.deepEqual(finiteBrowserValidation.deferredCallIds, ["stale-command", "browser"]);
 
+  const readyBrowserContract = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "browser_validation",
+      objectiveClosurePending: true,
+    },
+    devServerStatus: "ready",
+    devServerNextCapability: "browser",
+    devServerUrl: "http://localhost:1420/",
+  });
+  const soleReadyBrowserValidation = resolveExecuteRecoveryBatchDecision({
+    mode: "validation_only",
+    contract: readyBrowserContract,
+    expectedTarget: "src/main.js",
+    calls: [{ id: "browser-only", name: "browser_evaluate", target: "http://localhost:1420/" }],
+  });
+  assert.equal(readyBrowserContract.nextRequiredCapability, "browser_validation");
+  assert.equal(
+    soleReadyBrowserValidation.selectedCallId,
+    "browser-only",
+    "the sole tool advertised for the active recovery capability must execute rather than self-defer",
+  );
+  assert.deepEqual(soleReadyBrowserValidation.deferredCallIds, []);
+
   const commandValidationContract = resolveExecuteRecoveryActionContract("validation_only", {
     decisionCheckpoint: {
       expectedTarget: null,

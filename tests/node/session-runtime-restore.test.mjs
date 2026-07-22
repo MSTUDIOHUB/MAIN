@@ -997,10 +997,11 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
     assert.equal(ownedEvents.filter((event) => event.type === "turn.completed").length, 1);
     assert.equal(ownedEvents.find((event) => event.type === "run.completed")?.resultKind, "error");
     assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "error");
-    assert.equal(turn?.status, "done");
+    assert.equal(turn?.status, "error");
     assert.equal(turn?.runtimeOutcome?.resultKind, "error");
     assert.equal(settled.isGenerating, false);
-    assert.equal(settled.agentStatus, "idle");
+    assert.equal(settled.agentStatus, "error");
+    assert.match(turn?.summary || "", /turn failed|did not finish/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
         block.type === "agent" &&

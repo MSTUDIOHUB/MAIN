@@ -5221,6 +5221,7 @@ async function executeToolCallWithLifecycle(
       target: completedTarget,
       content: finalContent,
       displayContent: finalDisplayContent,
+      ...(tc.name === "wait_subagents" ? { runtimeEvidenceContent: resultStr } : {}),
       isError: false,
       ...(subagentSpawnOutcome ? { subagentSpawnOutcome } : {}),
       lifecycleState: "completed",

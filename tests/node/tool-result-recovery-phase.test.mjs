@@ -31,6 +31,16 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
     phaseSource,
     /pauseForReviewablePlanArtifact\([\s\S]*?post_tool_plan_artifact_write[\s\S]*?planArtifactQualityRejected:\s*planRuntimeState\.planArtifactQualityRejected/,
   );
+  assert.match(
+    phaseSource,
+    /deterministicEvidenceMaterializationCandidate[\s\S]*?autoMaterializePlanArtifactFromEvidence\([\s\S]*?post_tool_runtime_evidence_materialization/,
+    "a rejected tool-written Plan must use the same bounded runtime evidence fallback as a visible candidate",
+  );
+  assert.match(
+    phaseSource,
+    /planQualityRejectCount >= 2[\s\S]*?persisted_plan_quality_recovery_exhausted[\s\S]*?return finish\("stopped"\)/,
+    "persisted Plan quality rejection cannot loop without a terminal boundary",
+  );
   assert.match(phaseSource, /handleStrictRepeatGuardRecovery\(\{[\s\S]*?handleTargetProgressLoopRecovery\(\{/);
   assert.match(
     phaseSource,

@@ -937,6 +937,91 @@ test("local Rust stream read errors fall back to a non-streaming request", async
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream", "proxy_request"]);
 });
 
+test("a local frontend response body terminated mid-stream retries once through Rust", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push({ command, args });
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: 'data: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}\n\n',
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: { stream_id: streamId, status: "ok", error: null },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: {
+      getReader() {
+        let readCount = 0;
+        return {
+          async read() {
+            readCount += 1;
+            if (readCount === 1) {
+              return {
+                done: false,
+                value: new TextEncoder().encode(
+                  'data: {"choices":[{"delta":{"content":"partial "}}]}\n\n',
+                ),
+              };
+            }
+            throw new TypeError("terminated");
+          },
+          async cancel() {},
+        };
+      },
+    },
+  });
+
+  const tokens = [];
+  const errors = [];
+  const lifecycle = [];
+  let doneCount = 0;
+  try {
+    const result = await streamChatCompletion(
+      [{ role: "user", content: "inspect the workspace" }],
+      {
+        baseUrl: "http://127.0.0.1:1234/v1",
+        apiKey: "not-needed",
+        model: "local-model",
+        provider: "Local Gateway",
+        useRustProxy: false,
+      },
+      {
+        onToken: (token) => tokens.push(token),
+        onDone: () => { doneCount += 1; },
+        onError: (error) => { errors.push(error.message); },
+        onLifecycle: (event) => { lifecycle.push(event); },
+      },
+    );
+    assert.equal(result.content, "recovered");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(tokens, ["partial ", "__ESCALATION_RESET__:", "recovered"]);
+  assert.deepEqual(errors, []);
+  assert.equal(doneCount, 1);
+  assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream"]);
+  assert.equal(lifecycle.some((event) => event.status === "frontend_body_retry_rust_proxy"), true);
+});
+
 test("Ollama frontend Load failed retries through the Rust stream proxy", async () => {
   const listeners = new Map();
   const invokeCalls = [];

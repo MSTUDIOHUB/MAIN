@@ -851,7 +851,7 @@ test("controlled child runtime isolates messages and returns its summary through
   ));
 });
 
-test("partial scoped fan-out coverage cannot close the child or parent join", async () => {
+test("partial scoped fan-out stays degraded while covered evidence remains reusable for planning", async () => {
   subagents.resetSubagentRuntimeForTests();
   const result = await subagentRuntime.executeControlledSubagent({
     request: {
@@ -925,7 +925,16 @@ test("partial scoped fan-out coverage cannot close the child or parent join", as
     content: JSON.stringify({ results: [result], pendingIds: [] }),
     isError: false,
   });
-  assert.deepEqual(promoted, []);
+  assert.deepEqual(promoted.map((item) => item.target), ["src/main.js"]);
+  assert.equal(promoted[0].delegatedObservation.planningEvidenceState, "reusable");
+  const obligations = toolActivityTracking.extractSubagentParentRereadObligations({
+    toolCallId: "wait-partial-fanout",
+    name: "wait_subagents",
+    target: result.subagentId,
+    content: JSON.stringify({ results: [result], pendingIds: [] }),
+    isError: false,
+  });
+  assert.deepEqual(obligations.map((item) => item.target), ["src/components/editor.js"]);
 });
 
 test("allowed paths remain an authorization ceiling rather than mandatory coverage", async () => {
@@ -1062,6 +1071,61 @@ test("child reports with declared remaining work cannot be marked completed", as
   assert.equal(result.evidence.length, 1);
 });
 
+test("parent-owned decisions and implementation handoff do not downgrade a completed read-only child", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      name: "Euler",
+      objective: "Inspect parser normalization",
+      scopeKey: "csv-parser-parent-handoff",
+      allowedPaths: "src/hooks/useCsvParser.ts",
+      expectedOutput: "Source-backed mapping evidence",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "zh",
+      getSessionKey: () => "thread-parent-handoff",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-parent-handoff",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/hooks/useCsvParser.ts",
+        [
+          "READ_FILE_RESULT",
+          "path: src/hooks/useCsvParser.ts",
+          "---CONTENT START---",
+          "export function normalizeRow(row) {",
+          "  return { creator: row.creator || '' };",
+          "}",
+          "---CONTENT END---",
+        ].join("\n"),
+      );
+      childCallbacks.onAssistantFinalText([
+        "## 结论",
+        "`src/hooks/useCsvParser.ts` 只输出 creator。",
+        "## 不确定项",
+        "无。",
+        "## 剩余范围内工作",
+        "无。",
+        "## 父任务交接",
+        "父任务决定兼容策略，并在获批后实施字段映射；另行核对允许路径外的数据样本。",
+      ].join("\n"));
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.closureAudit?.state, "satisfied");
+  assert.equal(result.remainingWork, undefined);
+  assert.match(result.parentHandoff || "", /父任务决定兼容策略/);
+  assert.equal(result.evidence.length, 1);
+});
+
 test("structured child reports and empty outlines cannot produce false completion", async () => {
   subagents.resetSubagentRuntimeForTests();
   const result = await subagentRuntime.executeControlledSubagent({
@@ -1129,6 +1193,10 @@ test("negated remaining-work sections do not downgrade a completed child", () =>
   ].join("\n")), "");
   for (const completedStatement of [
     "无（已完成指定范围内的消费逻辑分析）。",
+    "无。在允许的只读范围 src/hooks/useCsvParser.ts 内，已完成字段映射分析。",
+    "**无**。在允许路径 src/hooks/useChartData.ts 和 src/store/dashboardStore.ts 内，消费逻辑已完整分析完毕。",
+    "无。已读取并分析所有允许路径内的文件，完成了对 creatorName 消费逻辑的调查。",
+    "无。目标已达成，creatorName 的类型约束已完整分析。\n\n---",
     "无剩余工作。",
     "已完成，无剩余工作。",
     "No remaining work.",
@@ -1710,6 +1778,52 @@ test("iteration boundary with substantive evidence is a degraded partial result,
   assert.match(result.summary, /bounded partial result/);
   assert.equal(result.evidence.length, 1);
   assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
+});
+
+test("a bounded child handoff with evidence and explicit no remaining scoped work closes as completed", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const traceEvents = [];
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect a bounded file",
+      scopeKey: "bounded-file-complete",
+      scope: "One file",
+      allowedPaths: "src/lib/subagents.ts",
+      expectedOutput: "Source-backed contract finding",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "zh",
+      getSessionKey: () => "thread-boundary-complete",
+      getMessages: () => [],
+      onDebugEvent: (event, data) => traceEvents.push({ event, data }),
+    },
+    parentTurnId: "turn-boundary-complete",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(childCallbacks, "read_file", "src/lib/subagents.ts", "Coordinator evidence");
+      childCallbacks.onAssistantFinalText([
+        "## 结论",
+        "已核实协调器契约。",
+        "## 剩余范围内工作",
+        "无。在允许范围内已完成调查。",
+        "## 父任务交接",
+        "实现修改由父任务决定。",
+      ].join("\n"));
+      return {
+        status: "completed",
+        resultKind: "blocked",
+        reason: "subagent_max_iterations_partial_handoff",
+      };
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.closureAudit?.state, "satisfied");
+  assert.equal(result.remainingWork, undefined);
+  assert.match(result.parentHandoff || "", /父任务决定/);
+  assert.ok(traceEvents.some((entry) => entry.event === "subagent_bounded_handoff_closed"));
 });
 
 test("a completed error conclusion never projects as subagent success", async () => {

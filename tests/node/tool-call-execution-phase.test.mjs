@@ -45,6 +45,11 @@ test("tool call execution phase owns the tool handoff and execution ordering", (
   assert.match(phaseSource, /input\.emitTaskOrchestratorPhase\("EXECUTE_STEP"/);
   assert.match(phaseSource, /buildAssistantHistoryMessage\([\s\S]*?\{ tool_calls: toolCallsForMsg \}/);
   assert.match(phaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeToolExecutionRound\(\{/);
+  assert.match(
+    phaseSource,
+    /let recoveryActionContract = recoveryRebasedBeforePartition[\s\S]*?: input\.recoveryActionContract/,
+    "execution must reuse the exact recovery contract used to advertise the request tool surface",
+  );
 });
 
 test("provider tool ids are replaced with iteration-scoped runtime ids before history and execution", () => {

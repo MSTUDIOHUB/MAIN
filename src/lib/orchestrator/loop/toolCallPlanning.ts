@@ -396,7 +396,14 @@ export function resolveIterationToolSurface(input: {
   const initialBaseIterationAllTools = recoveryIterationAllTools;
   const recoveryScopesDelegation = executeContractOwnsSurface;
   const joinedChildNeedsParentReread = [...recentToolActivity, ...recentPlanToolActivity]
-    .some((activity) => activity.delegatedObservation?.requiresParentReread === true);
+    .some((activity) =>
+      activity.delegatedObservation?.requiresParentReread === true &&
+      (
+        workflowMode !== "plan" ||
+        callbacks.getIsPlanApproved() ||
+        activity.delegatedObservation.planningEvidenceState !== "reusable"
+      )
+    );
   const canExposeParentReread =
     recoveryActionContract.phase === "normal" ||
     (

@@ -3529,6 +3529,10 @@ export default function ChatArea({
       turn,
       language,
       statusLabel: copy.turnStatusLabels[turn.status] || turn.status,
+      // A workspace submission is always a durable Turn. Keep its title,
+      // lifecycle, and timer visible even when intent resolution says respond.
+      // Only global chat uses the anchorless continuous transcript.
+      showStateAnchorOverride: !isGlobalChat,
     });
     // Compatibility: persisted `collapsed` now projects to process-only collapse.
     // The user request and final assistant response remain part of the continuous flow.

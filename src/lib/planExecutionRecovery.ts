@@ -628,6 +628,12 @@ export interface PlanToolActivitySummary {
     sourceContentHash?: string;
     sourceContentChars?: number;
     sourceRange?: FileReadWindowIdentity;
+    /**
+     * Planning may reuse a provenance-backed child observation without
+     * pretending that the child's whole delegated task completed. Execution
+     * mutations still obey parentContextState/requiresParentReread below.
+     */
+    planningEvidenceState?: "reusable" | "unresolved";
     parentContextState: "reference_only" | "version_verified";
     requiresParentReread: boolean;
   };

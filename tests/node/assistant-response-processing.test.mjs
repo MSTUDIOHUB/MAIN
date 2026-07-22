@@ -150,3 +150,65 @@ test("assistant response processing returns normalized tool calls without reason
   assert.equal(result.normalized.toolCalls.length, 1);
   assert.equal(result.normalized.toolCalls[0].name, "read_file");
 });
+
+test("Plan processing recovers only an explicitly tagged revised plan from provider reasoning", () => {
+  const plan = [
+    "<proposed_plan>",
+    "# 修订计划",
+    "",
+    "## 改动",
+    "- 修改 `src/runtime.ts`，统一计划审核终态。",
+    "- 保留既有证据并修复明确的类型契约矛盾。",
+    "",
+    "## 验证",
+    "- 运行 `node --test tests/node/plan-runtime.test.mjs` 并确认通过。",
+    "</proposed_plan>",
+  ].join("\n");
+  const reasoningContent = `Private analysis must stay hidden.\n${plan}\nMore private analysis.`;
+  const events = [];
+  const result = processAssistantStreamResponse(baseInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+    streamResult: {
+      content: "",
+      reasoningContent,
+      reasoningField: "reasoning_content",
+      toolCalls: [],
+      finishReason: "stop",
+    },
+  }));
+
+  assert.equal(result.streamText, plan);
+  assert.equal(result.streamText.includes("Private analysis"), false);
+  assert.equal(result.providerReasoningForHistory.reasoningContent, reasoningContent);
+  assert.equal(events.some((item) => item.event === "agent.plan_protocol_recovered_from_reasoning"), true);
+});
+
+test("non-Plan and untagged reasoning never become a Plan materialization channel", () => {
+  const edit = processAssistantStreamResponse(baseInput({
+    streamResult: {
+      content: "",
+      reasoningContent: "<proposed_plan>\n# Hidden\n- one\n- two\n- three\n</proposed_plan>",
+      reasoningField: "reasoning_content",
+      toolCalls: [],
+      finishReason: "stop",
+    },
+  }));
+  assert.equal(edit.streamText, "");
+
+  const untaggedPlan = processAssistantStreamResponse(baseInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    streamResult: {
+      content: "",
+      reasoningContent: "# Hidden plan\n- inspect files\n- change code\n- run tests",
+      reasoningField: "reasoning_content",
+      toolCalls: [],
+      finishReason: "stop",
+    },
+  }));
+  assert.equal(untaggedPlan.streamText, "");
+});

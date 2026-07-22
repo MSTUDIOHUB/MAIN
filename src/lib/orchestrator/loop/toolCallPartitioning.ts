@@ -305,6 +305,24 @@ export function findDelegatedObservationRequiringParentReread(input: {
   return null;
 }
 
+export function findReusableDelegatedPlanningEvidenceForRead(input: {
+  toolName: string;
+  target: string;
+  recentPlanToolActivity: PlanToolActivitySummary[];
+}): PlanToolActivitySummary | null {
+  if (input.toolName !== "read_file" || !input.target) return null;
+  const matching = [...input.recentPlanToolActivity].reverse().filter((activity) =>
+    workspacePathsReferToSameFile(activity.target, input.target)
+  );
+  if (matching.some((activity) =>
+    activity.delegatedObservation?.planningEvidenceState === "unresolved"
+  )) return null;
+  return matching.find((activity) =>
+    activity.status === "succeeded" &&
+    activity.delegatedObservation?.planningEvidenceState === "reusable"
+  ) || null;
+}
+
 export type DelegatedObservationReuseDecision = {
   reusable: boolean;
   reason:
@@ -631,6 +649,47 @@ export async function partitionToolCallsForExecution(input: {
       ? `${baseFailureSignature}::recovery=${recoveryFailureScope}`
       : baseFailureSignature;
     toolFailureSignatures.set(tc.id, failureSignature);
+
+    const reusableDelegatedPlanningEvidence =
+      workflowMode === "plan" && !callbacks.getIsPlanApproved()
+        ? findReusableDelegatedPlanningEvidenceForRead({
+            toolName: executionName,
+            target,
+            recentPlanToolActivity,
+          })
+        : null;
+    if (reusableDelegatedPlanningEvidence) {
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? `PLAN_DELEGATED_EVIDENCE_REUSED: ${target} 已有带来源且已验收的子智能体观察，可直接用于制定计划；本次父级重复读取未执行。请复用该证据并继续起草。`
+        : `PLAN_DELEGATED_EVIDENCE_REUSED: ${target} already has a provenance-backed accepted child observation for Plan authoring, so the duplicate parent read was not executed. Reuse that evidence and continue drafting.`;
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "plan_delegated_evidence_reused",
+      });
+      logAgentEvent("plan_delegated_evidence_reread_suppressed", {
+        iteration,
+        tool: tc.name,
+        target,
+        ownerSubagentId:
+          reusableDelegatedPlanningEvidence.delegatedObservation?.owner.subagentId || null,
+        sourceObservationKey:
+          reusableDelegatedPlanningEvidence.delegatedObservation?.sourceObservationKey || null,
+        providerNeutral: true,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "plan_delegated_evidence_reused",
+      });
+      continue;
+    }
 
     const browserCallSignature = tc.name === "browser_evaluate"
       ? buildBrowserValidationCacheSignature(toolArgs)

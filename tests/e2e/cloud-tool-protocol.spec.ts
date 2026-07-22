@@ -1159,6 +1159,8 @@ test("plan executable reply options are ignored when the same turn has tool call
         const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
         return {
           status: snapshot?.currentTurnStatus,
+          runtimeStatus: snapshot?.currentTurnRuntimeStatus,
+          resultKind: snapshot?.currentTurnResultKind,
           currentTurnIntent: snapshot?.currentTurnIntent,
           optionBlockCount: snapshot?.optionBlockCount,
           archivedOptionCount: snapshot?.archivedOptionCount,
@@ -1170,7 +1172,12 @@ test("plan executable reply options are ignored when the same turn has tool call
       }),
     )
     .toEqual({
-      status: "paused",
+      // `done` closes the logical Turn; the structured outcome owns whether
+      // that closure succeeded. This read-only Plan must remain visibly
+      // blocked rather than being mistaken for successful completion.
+      status: "done",
+      runtimeStatus: "completed",
+      resultKind: "blocked",
       currentTurnIntent: "plan",
       archivedOptionCount: 0,
       optionBlockCount: 0,
@@ -1942,8 +1949,8 @@ test("ordinary continue after stopped execute turn starts a new visible turn", a
           continueUserOnPreviousTurn: userBlocks.filter((block: any) =>
             block.turnId === turnId && block.content === "继续"
           ).length,
-          hasFinalText: (snapshot?.agentTexts || []).some((text: string) =>
-            String(text || "").includes("已在新回合继续处理旧任务上下文")
+          hasBlockedConclusion: (snapshot?.agentTexts || []).some((text: string) =>
+            String(text || "").includes("结果受到阻塞")
           ),
         };
       }, previousTurnId),
@@ -1956,7 +1963,7 @@ test("ordinary continue after stopped execute turn starts a new visible turn", a
       newTurnIntent: "execute",
       continueUserOnNewTurn: 1,
       continueUserOnPreviousTurn: 0,
-      hasFinalText: true,
+      hasBlockedConclusion: true,
     });
 
   const turnSections = page.locator("section[data-turn-id]");
@@ -1970,7 +1977,7 @@ test("ordinary continue after stopped execute turn starts a new visible turn", a
   await expect(continuedSection).toHaveAttribute("data-turn-presentation", "blocked");
   await expect(continuedSection.getByTestId("turn-state-anchor")).toHaveCount(1);
   await expect(continuedSection).toContainText("继续");
-  await expect(continuedSection).toContainText("已在新回合继续处理旧任务上下文");
+  await expect(continuedSection).toContainText("结果受到阻塞");
 
   const respondSent = await page.evaluate(() =>
     (window as any).__CODELY_E2E__?.sendCloudRespondMessage?.("请只解释当前上下文，不要执行操作。"),
@@ -1990,7 +1997,7 @@ test("ordinary continue after stopped execute turn starts a new visible turn", a
   const ordinaryTurnId = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId ?? "");
   const ordinarySection = page.locator(`section[data-turn-id='${ordinaryTurnId}']`);
   await expect(ordinarySection).toHaveAttribute("data-turn-presentation", "ordinary");
-  await expect(ordinarySection.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(ordinarySection.getByTestId("turn-state-anchor")).toHaveCount(1);
   await expect(ordinarySection).toContainText("请只解释当前上下文，不要执行操作");
   await expect(ordinarySection).toContainText("已在新回合继续处理旧任务上下文");
 

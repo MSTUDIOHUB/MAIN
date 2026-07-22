@@ -72,6 +72,7 @@ export interface SubagentRunSnapshot {
   substantiveEvidenceCount?: number;
   closureState?: "satisfied" | "partial" | "blocked";
   remainingWork?: string;
+  parentHandoff?: string;
   progress?: SubagentProgress;
 }
 
@@ -89,6 +90,7 @@ export type SubagentRunPatch = Partial<Pick<
   | "substantiveEvidenceCount"
   | "closureState"
   | "remainingWork"
+  | "parentHandoff"
   | "progress"
 >>;
 
@@ -306,6 +308,8 @@ export interface SubagentResultEnvelope {
   };
   blocker?: string;
   remainingWork?: string;
+  /** Work that is intentionally outside the child's read-only ownership. */
+  parentHandoff?: string;
   error?: string;
 }
 
