@@ -66,11 +66,18 @@ export function resolveRecoveryToolChoice(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   llmToolNames: string[];
   forceXmlTools: boolean;
+  preferredDelegationRequired?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
   recoveryActionContract?: RecoveryActionContract;
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
   if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
+  if (
+    input.preferredDelegationRequired &&
+    availableToolNames.has("spawn_subagent")
+  ) {
+    return "required";
+  }
   const recoveryActionContract = input.recoveryActionContract ||
     resolveExecuteRecoveryActionContract(input.executeRecoveryMode);
   const executeRecoveryRequiresAction =
@@ -145,6 +152,7 @@ export async function invokeInitialStreamForIteration(input: {
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
+  preferredDelegationRequired: boolean;
 }): Promise<InitialStreamInvocationResult> {
   const {
     callbacks,
@@ -176,6 +184,7 @@ export async function invokeInitialStreamForIteration(input: {
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
+    preferredDelegationRequired,
   } = input;
   const {
     config,
@@ -278,6 +287,7 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
+    preferredDelegationRequired,
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     recoveryActionContract,
@@ -339,6 +349,7 @@ export async function invokeInitialStreamForIteration(input: {
     allTools: summarizeToolsForDiagnostics(iterationAllTools),
     llmTools: summarizeToolsForDiagnostics(llmTools),
     toolChoice: recoveryToolChoice ?? null,
+    preferredDelegationRequired,
     watchdog: {
       hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
       label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,

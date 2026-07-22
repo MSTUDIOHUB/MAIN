@@ -328,6 +328,30 @@ test("normal execution does not require a tool before recovery is activated", ()
   }), undefined);
 });
 
+test("admitted preferred delegation requires the provider-neutral spawn tool call", () => {
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["spawn_subagent"],
+    forceXmlTools: false,
+    preferredDelegationRequired: true,
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["spawn_subagent"],
+    forceXmlTools: true,
+    preferredDelegationRequired: true,
+  }), undefined, "XML fallback remains prompt-driven instead of emitting an unsupported tool_choice");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["read_file"],
+    forceXmlTools: false,
+    preferredDelegationRequired: true,
+  }), undefined, "a missing spawn capability must never force an unrelated tool");
+});
+
 test("preapproval plan quality recovery requires a native plan artifact call", () => {
   const common = {
     isExecuteRecoveryEligible: false,

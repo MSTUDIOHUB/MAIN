@@ -9,17 +9,17 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("settled updates stay ordered in ChatArea while live model flow replaces the Capsule status", async ({ page }) => {
+test("ChatArea checkpoints stay durable while Capsule shows only live guidance", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-model-explanation");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
-  const thoughtSummary = capsule.getByTestId("capsule-thought-summary-label");
+  const guidance = capsule.getByTestId("capsule-guidance-label");
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
-  await expect(thoughtSummary).toHaveText(
+  await expect(guidance).toHaveText(
     "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
   );
-  await expect(thoughtSummary.locator("strong")).toHaveText("ChatArea.tsx");
+  await expect(guidance.locator("strong")).toHaveText("ChatArea.tsx");
   await expect(capsule).not.toContainText("保留这条模型说明");
   await expect(capsule).not.toContainText("read_file");
   await expect(capsule).not.toContainText("grep_search");
@@ -59,11 +59,11 @@ test("settled updates stay ordered in ChatArea while live model flow replaces th
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null)
     )).toBe(mode);
     await expect(progressPopover).toBeVisible();
-    await expect(thoughtSummary).toHaveText("让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。");
+    await expect(guidance).toHaveText("让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。");
     const capsuleSurface = await capsule.evaluate((element) => {
       const capsuleStyle = getComputedStyle(element);
-      const thought = element.querySelector<HTMLElement>('[data-testid="capsule-thought-summary-label"]');
-      const paragraph = thought?.querySelector<HTMLElement>("p") || null;
+      const guidance = element.querySelector<HTMLElement>('[data-testid="capsule-guidance-label"]');
+      const paragraph = guidance?.querySelector<HTMLElement>("p") || null;
       const paragraphStyle = paragraph ? getComputedStyle(paragraph) : null;
       return {
         backgroundColor: capsuleStyle.backgroundColor,
@@ -104,7 +104,7 @@ test("settled updates stay ordered in ChatArea while live model flow replaces th
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
   await expect(timeline).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  await expect(thoughtSummary).toContainText("让我继续查看 ChatArea.tsx");
+  await expect(guidance).toContainText("让我继续查看 ChatArea.tsx");
   await expect(firstUpdate).toHaveCount(1);
   await expect(secondUpdate).toHaveCount(1);
 
@@ -123,17 +123,19 @@ test("settled updates stay ordered in ChatArea while live model flow replaces th
   await expect(page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。")).toHaveCount(1);
   await expect(page.getByText("已确认重复展示来自同一工具前言被同时投影；Capsule 只保留精简判断。")).toHaveCount(1);
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
-  await expect(page.getByTestId("capsule-thought-summary-label")).toContainText("让我继续查看 ChatArea.tsx");
+  await expect(page.getByTestId("capsule-guidance-label")).toContainText("让我继续查看 ChatArea.tsx");
   await expect(page.getByTestId("capsule-activity-label")).toHaveCount(0);
 });
 
-test("capsule falls back to the lifecycle status until real model flow is available", async ({ page }) => {
+test("Capsule turns structured runtime activity into conversational guidance", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-progress-only");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
-  await expect(capsule.getByTestId("capsule-thought-summary-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
+    "我正在搜索 ChatArea.tsx，缩小接下来要检查的范围。",
+  );
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("grep_search");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
@@ -146,9 +148,9 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
 
   await expect(page.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(page.getByTestId("capsule-activity-label")).toHaveCount(0);
-  const thoughtSummary = page.getByTestId("capsule-thought-summary-label");
-  await expect(thoughtSummary).toContainText("让我继续查看 ChatArea.tsx");
-  const thoughtMetrics = await thoughtSummary.evaluate((element) => {
+  const guidance = page.getByTestId("capsule-guidance-label");
+  await expect(guidance).toContainText("让我继续查看 ChatArea.tsx");
+  const thoughtMetrics = await guidance.evaluate((element) => {
     const paragraph = element.querySelector<HTMLElement>("p");
     const style = paragraph ? getComputedStyle(paragraph) : null;
     return {

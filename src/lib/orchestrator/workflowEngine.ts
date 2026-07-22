@@ -183,6 +183,7 @@ import {
   isThinModelToolNarration,
   normalizeModelFeedbackForDedupe,
 } from "../modelFeedbackDedupe";
+import { buildAssistantStageCheckpoint } from "../assistantProgressPresentation";
 
 type WorkflowStoreState = any;
 
@@ -2238,25 +2239,39 @@ export class WorkflowEngine {
       },
 
       onAssistantCommentary: (text, meta) => {
-        const visibleText = String(text || "").trim();
+        const sourceVisibleText = String(text || "").trim();
         if (
           meta?.modelAuthored !== true ||
-          !visibleText ||
-          isThinModelToolNarration(visibleText)
+          !sourceVisibleText ||
+          isThinModelToolNarration(sourceVisibleText)
         ) {
           logStoreEvent("assistant_commentary_suppressed", {
             turnId,
             reason: meta?.modelAuthored !== true
               ? "not_model_visible_content"
-              : visibleText
+              : sourceVisibleText
               ? "thin_tool_narration"
               : "empty",
           });
           return;
         }
 
-        const normalized = normalizeModelFeedbackForDedupe(visibleText);
-        if (!normalized) return;
+        const visibleText = buildAssistantStageCheckpoint(
+          sourceVisibleText,
+          phaseLanguage,
+        );
+        if (!visibleText) {
+          logStoreEvent("assistant_commentary_suppressed", {
+            turnId,
+            reason: "no_durable_checkpoint",
+            sourceVisibleChars: sourceVisibleText.length,
+          });
+          return;
+        }
+
+        const sourceNormalized = normalizeModelFeedbackForDedupe(sourceVisibleText);
+        const checkpointNormalized = normalizeModelFeedbackForDedupe(visibleText);
+        if (!checkpointNormalized) return;
 
         sessionSet((state: any) => {
           const ownedTurnIds = new Set([turnId, toolDisplayTurnId].filter(Boolean));
@@ -2284,14 +2299,18 @@ export class WorkflowEngine {
                 block.publicProgress?.runId === activeRuntimeRunIdentity.runId
               )
             ) &&
-            normalizeModelFeedbackForDedupe(String(block.content || "")) === normalized
+            (
+              normalizeModelFeedbackForDedupe(String(block.content || "")) === sourceNormalized ||
+              normalizeModelFeedbackForDedupe(String(block.content || "")) === checkpointNormalized
+            )
           );
           const existing = matchingBlocks[matchingBlocks.length - 1];
           if (
             existing?.visibility === "assistant_update" &&
             existing.publicProgress?.source === "model_visible_content" &&
             existing.publicProgress?.sessionKey === runSessionKey &&
-            existing.publicProgress?.runId === activeRuntimeRunIdentity.runId
+            existing.publicProgress?.runId === activeRuntimeRunIdentity.runId &&
+            normalizeModelFeedbackForDedupe(String(existing.content || "")) === checkpointNormalized
           ) {
             logStoreEvent("assistant_commentary_deduped", {
               turnId,
@@ -2339,6 +2358,7 @@ export class WorkflowEngine {
 
         logStoreEvent("assistant_commentary_published", {
           turnId,
+          sourceVisibleChars: sourceVisibleText.length,
           visibleChars: visibleText.length,
           modelAuthored: true,
           toolCalls: meta?.toolCalls?.length || 0,

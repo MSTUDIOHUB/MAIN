@@ -80,6 +80,7 @@ const {
 
 const {
   resolveStreamingAssistantDisplay,
+  shouldProjectStreamingAssistantToCapsule,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/streamDisplayPolicy.ts"));
 
 const {
@@ -456,7 +457,7 @@ test("Gemma4 proposal markers and user options are protocol, not chat text", () 
   assert.equal(normalized.toolCalls[0].name, "read_file");
 });
 
-test("streaming display policy buffers short protocol/noise tokens in plan execution", () => {
+test("streaming display policy holds every preapproval Plan candidate outside Capsule", () => {
   const odd = resolveStreamingAssistantDisplay({
     text: "कल",
     language: "zh",
@@ -481,9 +482,14 @@ test("streaming display policy buffers short protocol/noise tokens in plan execu
     workflowMode: "plan",
     runIntent: "plan",
   });
-  assert.equal(plan.action, "show");
-  assert.match(plan.text, /# 修复计划/);
-  assert.doesNotMatch(plan.text, /PROPOSAL/);
+  assert.equal(plan.action, "buffer");
+  assert.equal(plan.text, "");
+  assert.match(plan.bufferText, /# 修复计划/);
+  assert.equal(plan.reason, "plan_candidate_pending_quality_gate");
+  assert.equal(shouldProjectStreamingAssistantToCapsule({
+    workflowMode: "plan",
+    runIntent: "plan",
+  }), false);
 
   const continuation = resolveStreamingAssistantDisplay({
     text: " world",
@@ -533,7 +539,7 @@ test("visual observation metadata never appears in streaming or final assistant 
   );
 });
 
-test("streaming display policy preserves normal markdown tables", () => {
+test("streaming display policy buffers Plan markdown tables until materialization", () => {
   const decision = resolveStreamingAssistantDisplay({
     text: "| 文件 | 状态 |\n| --- | --- |\n| src/App.tsx | 已读 |",
     language: "zh",
@@ -541,8 +547,9 @@ test("streaming display policy preserves normal markdown tables", () => {
     runIntent: "plan",
   });
 
-  assert.equal(decision.action, "show");
-  assert.match(decision.text, /\| 文件 \| 状态 \|/);
+  assert.equal(decision.action, "buffer");
+  assert.equal(decision.text, "");
+  assert.match(decision.bufferText, /\| 文件 \| 状态 \|/);
 });
 
 test("chat feedback normalizes statuses and classifies common errors", () => {

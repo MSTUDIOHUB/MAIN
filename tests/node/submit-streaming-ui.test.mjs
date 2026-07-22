@@ -206,6 +206,33 @@ test("execution stream projects provisional model activity to the exact-run Caps
   assert.deepEqual(harness.state.conversationTurns[0].blockIds, [block.id]);
 });
 
+test("preapproval Plan stream stays buffered outside ChatArea and Capsule", () => {
+  const context = baseContext({
+    effectiveRunIntent: "plan",
+    runtimeRunIntent: "plan",
+  });
+  const harness = createSessionHarness();
+  harness.state.config.workflowMode = "plan";
+  const lease = startSubmitStreamingUi({
+    context,
+    sessionGet: harness.get,
+    sessionSet: harness.set,
+    nextTaskId: () => 350,
+    currentImageCount: 0,
+    contextSignals: { mentionedFilePaths: [], attachedFilePaths: [] },
+    effectiveIntentSummary: "",
+    isHidden: false,
+    createVisibleTurnForHiddenMessage: false,
+  });
+
+  lease.streamBuffer.append("# 修复计划\n\n- 修改 src/main.js 并完成验证。");
+  lease.streamBuffer.flush();
+
+  assert.equal(harness.state.taskFlow.length, 0);
+  assert.deepEqual(harness.state.conversationTurns[0].blockIds, []);
+  assert.match(context.streamingAssistantDisplayBuffer, /# 修复计划/);
+});
+
 test("ordinary chat stream remains a visible ChatArea assistant block", () => {
   const context = baseContext({
     effectiveRunIntent: "respond",

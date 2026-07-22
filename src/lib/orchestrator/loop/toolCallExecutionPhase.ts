@@ -380,6 +380,7 @@ export async function executeToolCallPhase(input: {
     resetTarget?: string,
     stateOverride?: ExecuteRecoveryRuntimeState,
   ) => ExecuteRecoveryRuntimeState;
+  onSubagentSpawnCreated?: () => void;
 }): Promise<ToolCallExecutionPhaseResult> {
   let noToolRuntimeState = resetConsecutiveNoToolRuntimeState(
     input.noToolRuntimeState,
@@ -600,6 +601,7 @@ export async function executeToolCallPhase(input: {
     readOnlyCallSignatures,
     readFileWindowNarrowedNotes,
     ...input.toolExecutionRuntimeState,
+    onSubagentSpawnCreated: input.onSubagentSpawnCreated,
   });
   allResults.push(...toolExecutionRound.results);
   const wasAborted = toolExecutionRound.status === "aborted";

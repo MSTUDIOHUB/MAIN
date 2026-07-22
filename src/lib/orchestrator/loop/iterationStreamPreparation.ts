@@ -23,6 +23,7 @@ import {
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import { buildPreferredDelegationActionContract } from "../../subagents";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanExecutionProgressPhase } from "../../workflowModels";
@@ -140,6 +141,7 @@ export async function prepareIterationStreamRequest(input: {
   iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
   turnInputContextSignals: TurnInputContextSignals;
   latestUserPromptText?: string;
+  preferredDelegationSatisfied?: boolean;
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   lastAssistantTextForCheckpoint: string;
@@ -166,6 +168,7 @@ export async function prepareIterationStreamRequest(input: {
     iterationContext,
     turnInputContextSignals,
     latestUserPromptText = "",
+    preferredDelegationSatisfied = false,
     recentToolActivity,
     recentPlanToolActivity,
     lastAssistantTextForCheckpoint,
@@ -518,6 +521,7 @@ export async function prepareIterationStreamRequest(input: {
     turnInputContextSignals,
     latestUserPromptText,
     lastAssistantTextForCheckpoint,
+    preferredDelegationSatisfied,
   });
   applySystemPromptForRuntime(capabilityRuntimeIntent, toolSurfaceDecision.iterationAllTools);
 
@@ -547,6 +551,26 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  if (toolSurfaceDecision.preferredDelegationRequirement.required) {
+    const delegationContract = buildPreferredDelegationActionContract({
+      language: callbacks.getPreferredLanguage(),
+      candidateScopeKeys:
+        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
+    });
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      { role: "system", content: delegationContract },
+    ];
+    logAgentEvent("preferred_delegation_action_contract_injected", {
+      iteration,
+      candidateScopeKeys:
+        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
+      toolNames: toolSurfaceDecision.iterationAllTools.map((tool) =>
+        tool.function.name
+      ),
+      toolChoiceRequired: !contextManagementResult.forceXmlTools,
+    });
+  }
   if (recoveryBoundaryReleaseNotice) {
     managedAgentMessages = [
       ...managedAgentMessages,

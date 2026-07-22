@@ -179,10 +179,14 @@ function keyForProgress(input: {
 }): string {
   const runId = compactLine(input.runId || "", 96).toLowerCase();
   const runPrefix = runId ? `run:${runId}:` : "legacy:";
+  const explicit = compactLine(input.dedupeKey || "", 180);
+  // A Plan execution checkpoint is one evolving run-owned snapshot. Its
+  // structured tool identity may appear one event later during migration, so
+  // the typed checkpoint key must remain authoritative across that enrichment.
+  if (/^plan-execution-progress:/i.test(explicit)) return `${runPrefix}${explicit}`;
   const tool = String(input.tool || "").trim();
   const target = normalizeTarget(input.target || "");
   if (tool || target) return `${runPrefix}${toolFamily(tool)}:${tool}:${target}`.toLowerCase();
-  const explicit = compactLine(input.dedupeKey || "", 180);
   if (explicit) return `${runPrefix}${explicit}`;
   return `${runPrefix}progress:${String(input.phase || "").toLowerCase()}:${compactLine(input.title || "", 120).toLowerCase()}`;
 }
@@ -798,4 +802,85 @@ export function buildCapsuleActivityText(
       : ` · ${activity.repeatCount}x`
     : "";
   return `${structuredTitle}${repeatText}`;
+}
+
+function markdownTarget(value: unknown, language: RuntimeProgressLanguage): string {
+  const target = compactTarget(value).replace(/`/g, "");
+  if (target) return `\`${target}\``;
+  return language === "zh" ? "当前工作区" : "the current workspace";
+}
+
+/**
+ * Build the conversational live guidance shown in Capsule. Unlike the M
+ * popover's terse evidence labels, this projection explains the purpose of the
+ * current structured action. A lifecycle fallback keeps the primary surface
+ * useful before the first tool event without reusing raw model prose.
+ */
+export function buildCapsuleGuidanceText(
+  projection: RunStatusProjection,
+  language: RuntimeProgressLanguage = "zh",
+  fallbackPhase = "",
+): string {
+  const normalizedLanguage = normalizeLanguage(language);
+  const activity = projection.currentActivity;
+  if (activity && LIVE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
+    const family = toolFamily(activity.tool);
+    const target = markdownTarget(activity.target, normalizedLanguage);
+    const done = activity.status === "done" || activity.status === "completed";
+    if (normalizedLanguage === "en") {
+      if (family === "read") return done
+        ? `I've read ${target}; now I'm organizing what it shows.`
+        : `I'm reading ${target} to confirm the implementation related to this issue.`;
+      if (family === "search") return done
+        ? `I've searched ${target}; now I'm narrowing down the relevant path.`
+        : `I'm searching ${target} to narrow down where to look next.`;
+      if (family === "edit") return done
+        ? `The change is in ${target}; next I'll verify the result.`
+        : `I'm updating ${target} to put the confirmed approach into the code.`;
+      if (family === "command") return done
+        ? `I've run ${target}; now I'm checking the result for regressions.`
+        : `I'm running ${target} to verify the latest change.`;
+      if (family === "browser") return done
+        ? `I've checked ${target} in the browser; now I'm reviewing the visible result.`
+        : `I'm checking ${target} in the browser to confirm the real UI behavior.`;
+      return done
+        ? `I've finished this pass on ${target}; now I'm deciding the next step.`
+        : `I'm working through ${target} and checking what it changes.`;
+    }
+
+    if (family === "read") return done
+      ? `我已读完 ${target}，正在整理它说明了什么。`
+      : `我正在读取 ${target}，确认与当前问题相关的实现。`;
+    if (family === "search") return done
+      ? `我已搜索 ${target}，正在收窄真正相关的路径。`
+      : `我正在搜索 ${target}，缩小接下来要检查的范围。`;
+    if (family === "edit") return done
+      ? `修改已写入 ${target}，接下来我会验证结果。`
+      : `我正在修改 ${target}，把已确认的方案落实到代码。`;
+    if (family === "command") return done
+      ? `我已运行 ${target}，正在检查结果和回归风险。`
+      : `我正在运行 ${target}，验证刚才的修改。`;
+    if (family === "browser") return done
+      ? `我已在浏览器里检查 ${target}，正在整理可见结果。`
+      : `我正在通过浏览器检查 ${target} 的实际表现。`;
+    return done
+      ? `我已完成对 ${target} 的这一轮处理，正在判断下一步。`
+      : `我正在处理 ${target}，确认这一步带来的变化。`;
+  }
+
+  const phase = String(fallbackPhase || "").toLowerCase();
+  if (normalizedLanguage === "en") {
+    if (/analy|understand|investigat/.test(phase)) return "I'm tracing the request now and locating where the issue begins.";
+    if (/plan/.test(phase)) return "I'm organizing the approach so the next changes follow a clear path.";
+    if (/execut|edit|implement/.test(phase)) return "I'm applying the confirmed approach to the actual implementation.";
+    if (/valid|verif|test/.test(phase)) return "I'm validating the result in the real flow before I call it finished.";
+    if (/recover|reconcil/.test(phase)) return "I'm checking the latest blocker and choosing a safe way to continue.";
+    return "";
+  }
+  if (/analy|understand|investigat/.test(phase)) return "我正在梳理你的需求，先确认问题从哪里发生。";
+  if (/plan/.test(phase)) return "我正在整理方案，让接下来的修改有清晰顺序。";
+  if (/execut|edit|implement/.test(phase)) return "我正在把已确认的方案落实到实际修改中。";
+  if (/valid|verif|test/.test(phase)) return "我正在验证修改结果，确认它在真实流程里生效。";
+  if (/recover|reconcil/.test(phase)) return "我正在检查刚才的阻塞点，并选择安全的继续方式。";
+  return "";
 }

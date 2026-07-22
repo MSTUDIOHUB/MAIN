@@ -274,6 +274,12 @@ function bindCloudServerBridgeControls() {
       isGenerating: false,
     }));
   };
+  bridge.setPreferSubagents = (enabled = true) => {
+    useAppStore.getState().setPreferSubagents(enabled === true);
+  };
+  bridge.stopGeneration = () => {
+    useAppStore.getState().stopGeneration();
+  };
 }
 
 function getSeedCountKey(scenario: string): string {
@@ -5571,7 +5577,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: firstUpdateId,
       turnId,
       type: "agent" as const,
-      content: "已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
+      content: "阶段结论：\n- 已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
       visibility: "assistant_update" as const,
       streaming: false,
       publicProgress: {
@@ -5635,7 +5641,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: secondUpdateId,
       turnId,
       type: "agent" as const,
-      content: "已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
+      content: "阶段结论：\n- 已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
       visibility: "assistant_update" as const,
       streaming: false,
       publicProgress: {

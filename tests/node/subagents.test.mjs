@@ -308,6 +308,88 @@ test("adaptive delegation admits only useful context or diagnostic fan-out", () 
   assert.equal(overlappingHints.independentScopeCount, 1);
 });
 
+test("checked collaboration becomes a bounded delegation obligation after parallel scopes are proven", () => {
+  const readyRuntimeHealth = {
+    laneKey: "local:test",
+    profile: "local",
+    state: "ready",
+    activeChildren: 0,
+    queuedChildren: 0,
+    capacityLimit: 2,
+    memorySafety: "safe",
+    recentSuccessfulRuns: 1,
+    latestStartupMs: 120,
+    latestCapacityWaitMs: 0,
+  };
+  const decision = subagents.resolveDelegationDecision({
+    preference: "preferred",
+    phase: "diagnostic",
+    hasWorkspace: true,
+    independentScopeKeys: [
+      "src/components/editor.js",
+      "src/components/ToolbarPanel.tsx",
+      "src-tauri/src/main.rs",
+    ],
+    runtimeHealth: readyRuntimeHealth,
+  });
+  const requirement = subagents.resolvePreferredDelegationRequirement({
+    decision,
+    independentScopeKeys: [
+      "src/components/editor.js",
+      "src/components/ToolbarPanel.tsx",
+      "src-tauri/src/main.rs",
+    ],
+    alreadySatisfied: false,
+    spawnToolAvailable: true,
+  });
+
+  assert.equal(decision.action, "admit");
+  assert.deepEqual(requirement, {
+    required: true,
+    reason: "required",
+    candidateScopeKeys: [
+      "src-tauri/src/main.rs",
+      "src/components/editor.js",
+      "src/components/ToolbarPanel.tsx",
+    ],
+  });
+  const actionContract = subagents.buildPreferredDelegationActionContract({
+    language: "zh",
+    candidateScopeKeys: requirement.candidateScopeKeys,
+  });
+  assert.match(actionContract, /必须先调用 spawn_subagent/);
+  assert.match(actionContract, /src\/components\/ToolbarPanel\.tsx/);
+
+  assert.equal(subagents.resolvePreferredDelegationRequirement({
+    decision,
+    independentScopeKeys: ["src/components/editor.js"],
+    alreadySatisfied: false,
+    spawnToolAvailable: true,
+  }).reason, "insufficient_parallel_scope");
+  assert.equal(subagents.resolvePreferredDelegationRequirement({
+    decision,
+    independentScopeKeys: requirement.candidateScopeKeys,
+    alreadySatisfied: true,
+    spawnToolAvailable: true,
+  }).reason, "already_satisfied");
+
+  const unsafeDecision = subagents.resolveDelegationDecision({
+    preference: "preferred",
+    phase: "diagnostic",
+    hasWorkspace: true,
+    independentScopeKeys: requirement.candidateScopeKeys,
+    runtimeHealth: { ...readyRuntimeHealth, state: "degraded", memorySafety: "unsafe" },
+  });
+  const unsafeRequirement = subagents.resolvePreferredDelegationRequirement({
+    decision: unsafeDecision,
+    independentScopeKeys: requirement.candidateScopeKeys,
+    alreadySatisfied: false,
+    spawnToolAvailable: true,
+  });
+  assert.equal(unsafeRequirement.required, false);
+  assert.equal(unsafeRequirement.reason, "runtime_capacity_degraded");
+});
+
 test("runtime event projection preserves completion while recording thread closure", () => {
   const base = {
     id: "subagent-1",

@@ -13,6 +13,14 @@ const orchestratorSource = fsSync.readFileSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
   "utf8",
 );
+const runtimeOrchestratorSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+  "utf8",
+);
+const orchestratorTypesSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/types.ts"),
+  "utf8",
+);
 
 test("tool iteration phase owns the execution-to-recovery handoff", () => {
   const executeIndex = phaseSource.indexOf("executeToolCallPhase(input)");
@@ -38,6 +46,24 @@ test("tool iteration phase returns one folded runtime-state result to the orches
   assert.match(phaseSource, /loopGuardRuntimeState: toolResultRecoveryPhase\.loopGuardRuntimeState/);
   assert.match(phaseSource, /executeRecoveryState: toolResultRecoveryPhase\.executeRecoveryState/);
   assert.match(phaseSource, /recoveryPromptState: toolResultRecoveryPhase\.recoveryPromptState/);
+});
+
+test("preferred delegation satisfaction uses the runtime-owned child registration outcome", () => {
+  assert.match(orchestratorTypesSource, /subagentSpawnOutcome\?: SpawnSubagentResult/);
+  assert.match(runtimeOrchestratorSource, /subagentSpawnOutcome = result/);
+  assert.match(runtimeOrchestratorSource, /options\.onSubagentSpawnCreated\?\.\(result\)/);
+  assert.match(runtimeOrchestratorSource, /\{ subagentSpawnOutcome \}/);
+  assert.match(phaseSource, /const runtimeOutcome = result\.subagentSpawnOutcome/);
+  assert.match(phaseSource, /runtimeOutcome\.subagentId !== null/);
+  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_satisfied"/);
+  assert.ok(
+    runtimeOrchestratorSource.indexOf("options.onSubagentSpawnCreated?.(result)") <
+      runtimeOrchestratorSource.indexOf("return JSON.stringify(result)"),
+  );
+  assert.ok(
+    phaseSource.indexOf("const runtimeOutcome = result.subagentSpawnOutcome") <
+      phaseSource.indexOf("JSON.parse(String(result.content || \"\"))"),
+  );
 });
 
 test("agent orchestrator delegates tool execution and result recovery to one iteration phase", () => {

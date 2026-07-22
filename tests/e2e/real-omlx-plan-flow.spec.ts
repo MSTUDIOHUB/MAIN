@@ -1688,6 +1688,64 @@ for (const model of models) {
 const subagentModel = process.env.OMLX_SUBAGENT_MODEL ||
   models[0];
 
+test(`real OMLX honors the captured collaboration toggle after runtime admission with ${subagentModel}`, async ({ page }) => {
+  await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
+
+  const prompt = [
+    "请比较 src/hooks/useCsvParser.ts 与 src/hooks/useChartData.ts 的 creatorName 数据契约，并生成一份只读整改计划。",
+    "先收集两个文件的独立证据，不修改工作区。",
+  ].join("\n");
+  await page.evaluate((text) => {
+    const bridge = (window as any).__CODELY_E2E__;
+    Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
+      bridge.dispatchError = error instanceof Error ? error.message : String(error);
+    });
+  }, prompt);
+
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    const debugEntries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    const parsedDebug = debugEntries.map((entry: { source?: string; message?: string }) => {
+      try {
+        return { source: entry.source, ...JSON.parse(entry.message || "{}") };
+      } catch {
+        return { source: entry.source };
+      }
+    });
+    return {
+      dispatchError: snapshot?.dispatchError || null,
+      intakePreferred: parsedDebug.some((entry: { source?: string; subagentPreference?: string }) =>
+        entry.source === "agent.task_orchestrator_phase" && entry.subagentPreference === "preferred"
+      ),
+      requirementInjected: parsedDebug.some((entry: { source?: string }) =>
+        entry.source === "agent.preferred_delegation_action_contract_injected"
+      ),
+      requiredToolChoice: parsedDebug.some((entry: { source?: string; preferredDelegationRequired?: boolean; toolChoice?: string }) =>
+        entry.source === "agent.llm_request_shape" &&
+        entry.preferredDelegationRequired === true &&
+        entry.toolChoice === "required"
+      ),
+      satisfied: parsedDebug.some((entry: { source?: string }) =>
+        entry.source === "agent.preferred_delegation_satisfied"
+      ),
+      hasSubagent: (snapshot?.subagentRuns?.length || 0) >= 1,
+    };
+  }), { timeout: 180_000 }).toEqual({
+    dispatchError: null,
+    intakePreferred: true,
+    requirementInjected: true,
+    requiredToolChoice: true,
+    satisfied: true,
+    hasSubagent: true,
+  });
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration?.());
+  await expect.poll(async () => page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.getSnapshot?.().isGenerating === false
+  ), { timeout: 30_000 }).toBe(true);
+});
+
 test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }) => {
   page.on("console", (message) => {
     const text = message.text();

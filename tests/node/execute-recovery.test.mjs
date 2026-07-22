@@ -189,6 +189,7 @@ const {
   advanceExecuteRecoveryRuntimeIteration,
   createExecuteRecoveryRuntimeState,
   pinExecuteRecoveryFiniteValidationCheckpoint,
+  shouldPinExecuteRecoveryFiniteValidationCheckpoint,
   transitionExecuteRecoveryRuntimeState,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"));
 
@@ -5850,6 +5851,49 @@ test("pinning a trusted validation command is attempt-neutral and closes the gen
     kind: "required_named",
     toolName: "run_command",
   });
+});
+
+test("finite validation pinning preserves an approved Plan browser handoff", () => {
+  const browserHandoff = createExecuteRecoveryRuntimeState({
+    workflowMode: "edit",
+    forcedState: {
+      mode: "validation_only",
+      reason: "approved_plan_browser_handoff",
+      expectedTarget: null,
+      decisionCheckpoint: {
+        expectedTarget: null,
+        sourceObservationKey: null,
+        nextRequiredCapability: "browser_validation",
+        planTaskId: "browser-check",
+      },
+    },
+  });
+
+  assert.equal(
+    shouldPinExecuteRecoveryFiniteValidationCheckpoint(browserHandoff),
+    false,
+  );
+  const unchanged = pinExecuteRecoveryFiniteValidationCheckpoint(
+    browserHandoff,
+    { command: "npm run build", cwd: "." },
+  );
+  assert.strictEqual(unchanged, browserHandoff);
+  assert.equal(
+    unchanged.decisionCheckpoint?.nextRequiredCapability,
+    "browser_validation",
+  );
+  assert.equal(
+    unchanged.decisionCheckpoint?.pendingFiniteValidation,
+    undefined,
+  );
+
+  const contract = resolveExecuteRecoveryActionContract(unchanged.mode, {
+    ...unchanged,
+    devServerStatus: "none",
+    devServerNextCapability: "launch",
+  });
+  assert.equal(contract.nextRequiredCapability, "launch_long_process");
+  assert.deepEqual([...contract.allowedToolNames], ["execute_command"]);
 });
 
 test("validation cannot escape into mutation without a retained finite validation", () => {

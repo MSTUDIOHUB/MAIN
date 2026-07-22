@@ -2252,6 +2252,87 @@ test("MD Viewer change blocks derive three mutations without promoting rationale
   assert.equal(mutations.some((task) => /修改为\s*[:：]\s*$/.test(task.text)), false);
 });
 
+test("MD Viewer labeled prose excludes observed behavior and root cause from runtime mutations", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "design",
+    path: ".MAIN/plans/design.md",
+    title: "Design",
+    updatedAt: 1,
+    content: [
+      "# MD Viewer 问题修复计划",
+      "",
+      "## 关键实现改动",
+      "",
+      "### 问题1：标签页显示优化",
+      "**文件**: `src/main.js`",
+      "**位置**: `createTab()` 和 `updateTabTitle()`",
+      "**当前行为**: 标签页显示 `文件名 *`（`*` 表示未保存）",
+      "**修改方案**:",
+      "- 保留 `*` 标记逻辑（这是合理的未保存状态指示）",
+      "- 但确保初始打开的文件 `isDirty=false`，不显示 `*`",
+      "**根因分析**: 标签页可能被重复渲染，需检查调用方。",
+      "",
+      "### 问题2：保存文件对话框错误",
+      "**文件**: `src/main.js`",
+      "**位置**: `saveAsFile()`",
+      "**当前行为**: `openDialog` 被用于另存为，并读取 `selected.path`。",
+      "**根本原因**:",
+      "1. `openDialog` 是打开文件对话框，不是保存文件对话框",
+      "2. `selected.path` 为 undefined，导致保存命令收到空路径",
+      "**修改方案**:",
+      "1. 导入 `@tauri-apps/plugin-dialog` 的 `save` 方法（而非 `open`）",
+      "2. 修改 `saveAsFile()` 使用 `save` 对话框",
+      "3. 正确处理 Tauri v2 返回的路径字符串",
+      "",
+      "## 测试方案",
+      "1. 打开本地文件并确认标签页无 `*` 标记。",
+      "2. 新建文件后保存并确认不再出现保存失败对话框。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutations = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(
+    tasks.some((task) => /当前行为|根本原因|根因分析|openDialog.*不是保存|selected\.path.*undefined|修改方案\s*[:：]?\s*$/.test(task.text)),
+    false,
+    JSON.stringify(tasks, null, 2),
+  );
+  assert.equal(
+    mutations.some((task) => /保留.*未保存状态指示/.test(task.text)),
+    false,
+    JSON.stringify(tasks, null, 2),
+  );
+  assert.equal(mutations.some((task) => /save.*方法/.test(task.text)), true, JSON.stringify(tasks, null, 2));
+  assert.equal(mutations.some((task) => /saveAsFile.*save.*对话框/.test(task.text)), true, JSON.stringify(tasks, null, 2));
+});
+
+test("English inline diagnosis labels do not inherit a source file owner", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Save dialog repair",
+      "",
+      "## Key Implementation Changes",
+      "### File: `src/main.ts`",
+      "**Current behavior**: `saveFile` reuses the open dialog.",
+      "**Root cause**:",
+      "1. The open-dialog result is read as a save path.",
+      "**Implementation plan**:",
+      "- Modify `saveFile` to call `saveDialog` and persist the returned path.",
+      "",
+      "## Testing",
+      "- Run `npm test`.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  const mutations = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutations.length, 1, JSON.stringify(tasks, null, 2));
+  assert.match(mutations[0].text, /saveFile.*saveDialog/);
+  assert.equal(tasks.some((task) => /Current behavior|Root cause|open-dialog result/.test(task.text)), false);
+});
+
 test("plan quality rejects an implementation label that owns no concrete body", () => {
   const result = validateActionablePlanArtifact([
     "# 修复启动状态",

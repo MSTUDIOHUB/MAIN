@@ -171,15 +171,18 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
-test("active Capsule renders exact-run public model commentary as its primary Markdown", async ({ page }) => {
+test("newer structured editing activity replaces settled ChatArea commentary in Capsule", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  const thoughtSummary = capsule.getByTestId("capsule-thought-summary-label");
-  await expect(thoughtSummary).toHaveText("当前判断：已确认展示层入口，正在核对活动状态与运行身份。");
-  await expect(thoughtSummary.locator("strong")).toHaveText("当前判断");
+  const guidance = capsule.getByTestId("capsule-guidance-label");
+  await expect(guidance).toHaveText("我正在修改 ExecutionCapsule.tsx，把已确认的方案落实到代码。");
+  await expect(capsule).not.toContainText("当前判断");
+  await expect(page.locator('[data-testid="chat-scroll-container"]')).toContainText(
+    "当前判断：已确认展示层入口，正在核对活动状态与运行身份。",
+  );
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("**");
 });
@@ -191,8 +194,10 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
-  await expect(capsule.getByTestId("capsule-thought-summary-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
+    "我正在修改 task-9.ts，把已确认的方案落实到代码。",
+  );
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("apply_patch");
   await expect(capsule).not.toContainText("src/task-9.ts");
@@ -223,7 +228,10 @@ test("preapproval Plan recovery keeps internal phases and heartbeats out of user
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在制定计划");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
+    "我正在整理方案，让接下来的修改有清晰顺序。",
+  );
   await expect(capsule).not.toContainText("正在整理已确认信息，生成可审批计划");
   await expect(capsule).not.toContainText("我已读取 tauri.conf.json");
   await expect(capsule).not.toHaveAttribute("data-plan-runtime-phase", /.+/);

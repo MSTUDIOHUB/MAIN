@@ -345,8 +345,13 @@ test("composer waits for durable turn admission before clearing the submitted dr
     /latestState\.lockedComposerIntent === lockedIntentToConsume[\s\S]*setLockedComposerIntent\(null\)/,
   );
   assert.doesNotMatch(handler, /if \(isStreaming\)/);
-  assert.doesNotMatch(handler, /queueUserMessage|activeGuidance|handleGuideQueuedMessage/);
-  assert.doesNotMatch(source, /composer-queued-message|composer-guidance-button|composer-active-guidance/);
+  assert.doesNotMatch(handler, /queueUserMessage|handleGuideQueuedMessage/);
+  assert.match(source, /const handleGuideCurrentRun = useCallback/);
+  assert.match(source, /latest\.setActiveGuidance\(guidanceText, latest\.currentTurnId\)/);
+  assert.match(source, /data-testid="composer-queue-button"/);
+  assert.match(source, /data-testid="composer-guidance-button"/);
+  assert.match(source, /data-testid="composer-queued-message"/);
+  assert.match(source, /data-testid="composer-active-guidance"/);
 });
 
 test("workspace Composer persists its exact intent snapshot as dispatch hints", () => {
@@ -390,6 +395,39 @@ test("workspace FIFO dispatch carries the captured subagent preference into Turn
     sendMessage,
     /prepareSubmitTurnDraft\(\{[\s\S]*subagentPreference: options\?\.subagentPreferenceOverride/,
   );
+});
+
+test("preferred subagent collaboration is enforced only after runtime admission", () => {
+  const planningSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"),
+    "utf8",
+  );
+  const preparationSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
+    "utf8",
+  );
+  const invocationSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
+    "utf8",
+  );
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(planningSource, /resolvePreferredDelegationRequirement\(\{/);
+  assert.match(
+    planningSource,
+    /preferredDelegationRequirement\.required[\s\S]*filter\(\(tool\) => tool\.function\.name === "spawn_subagent"\)/,
+  );
+  assert.match(preparationSource, /buildPreferredDelegationActionContract\(\{/);
+  assert.match(preparationSource, /preferred_delegation_action_contract_injected/);
+  assert.match(
+    invocationSource,
+    /input\.preferredDelegationRequired[\s\S]*availableToolNames\.has\("spawn_subagent"\)[\s\S]*return "required"/,
+  );
+  assert.match(orchestratorSource, /onSubagentSpawnCreated:\s*\(\) =>/);
+  assert.match(orchestratorSource, /preferred_delegation_satisfied/);
 });
 
 test("desktop and destructive permission reviews are explicitly per-call and show final evidence", () => {
@@ -459,6 +497,7 @@ test("assistant commentary is durable, deduped, and independent from final evide
   assert.notEqual(commentaryStart, -1);
   assert.ok(finalTextStart > commentaryStart);
   assert.match(callbackSource, /isThinModelToolNarration/);
+  assert.match(callbackSource, /buildAssistantStageCheckpoint/);
   assert.match(callbackSource, /normalizeModelFeedbackForDedupe/);
   assert.match(callbackSource, /visibility:\s*"assistant_update"/);
   assert.match(callbackSource, /block\.visibility !== "assistant_final"/);

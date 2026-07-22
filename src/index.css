@@ -789,23 +789,23 @@ html[data-theme="light"] #root {
   background: var(--accent, #9333ea);
 }
 
-/* The live model focus owns the Capsule's primary text surface, matching the
- * 2.3.2 flow presentation. Markdown must stay fully readable in every theme
- * instead of inheriting the transcript renderer's muted paragraph colors. */
-.capsule-thought-markdown .markdown-body,
-.capsule-thought-markdown .markdown-body :where(p, li, strong, h1, h2, h3, h4, h5, h6) {
+/* Conversational live guidance owns the Capsule's primary text surface.
+ * Markdown stays fully readable in every theme instead of inheriting the
+ * transcript renderer's muted paragraph colors. */
+.capsule-guidance-markdown .markdown-body,
+.capsule-guidance-markdown .markdown-body :where(p, li, strong, h1, h2, h3, h4, h5, h6) {
   color: var(--surface-text-strong) !important;
 }
 
-.capsule-thought-markdown .markdown-body {
+.capsule-guidance-markdown .markdown-body {
   line-height: 1.55 !important;
 }
 
-.capsule-thought-markdown .markdown-body :where(p, ul, ol) {
+.capsule-guidance-markdown .markdown-body :where(p, ul, ol) {
   margin-bottom: 0.35rem;
 }
 
-.capsule-thought-markdown .markdown-body :where(p, ul, ol):last-child {
+.capsule-guidance-markdown .markdown-body :where(p, ul, ol):last-child {
   margin-bottom: 0;
 }
 

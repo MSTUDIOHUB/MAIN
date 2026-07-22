@@ -47,6 +47,7 @@ import {
 } from "../lib/toolUiGrouping";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
+  buildCapsuleGuidanceText,
   buildRuntimeProgressLedger,
   buildRunStatusProjection,
 } from "../lib/runtimeProgressLedger";
@@ -109,7 +110,7 @@ import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
-import { selectCapsuleThoughtSummary } from "../lib/capsuleCommentary";
+import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -4282,7 +4283,18 @@ export default function ChatArea({
     agentStatus,
     isRunActive: capsuleIsRunActive,
   });
-  const capsuleThoughtSummaryText = capsuleIsRunActive &&
+  const capsuleStructuredGuidanceText = capsuleIsRunActive &&
+    !capsuleActionKind &&
+    ["analyzing", "planning", "executing", "validating", "recovering"].includes(
+      capsuleStatusProjection.kind,
+    )
+      ? buildCapsuleGuidanceText(
+          capsuleRunStatus,
+          language,
+          capsuleStatusProjection.kind,
+        )
+      : "";
+  const capsuleLiveGuidanceText = capsuleIsRunActive &&
     !capsuleActionKind &&
     activeSessionKey &&
     capsuleTurn?.id &&
@@ -4291,15 +4303,17 @@ export default function ChatArea({
     ["analyzing", "planning", "executing", "validating", "recovering"].includes(
       capsuleStatusProjection.kind,
     )
-      ? selectCapsuleThoughtSummary({
+      ? selectCapsuleLiveGuidance({
           blocks: capsuleTurnBlocks,
           sessionKey: activeSessionKey,
           logicalTurnId: capsuleActiveLogicalTurnId,
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
           language,
+          notOlderThan: capsuleRunStatus.currentActivity?.lastSeenAt || 0,
         })
       : "";
+  const capsuleGuidanceText = capsuleLiveGuidanceText || capsuleStructuredGuidanceText;
 
   useEffect(() => {
     setIsCapsuleCollapsed(false);
@@ -5159,17 +5173,17 @@ export default function ChatArea({
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
                           <div className="min-w-0 flex-1 text-left">
-                            {capsuleThoughtSummaryText ? (
+                            {capsuleGuidanceText ? (
                               <div
-                                data-testid="capsule-thought-summary-label"
+                                data-testid="capsule-guidance-label"
                                 aria-live="polite"
                                 aria-atomic="true"
-                                className="capsule-thought-markdown block min-w-0 font-medium"
+                                className="capsule-guidance-markdown block min-w-0 font-medium"
                               >
                                 <MarkdownRenderer
-                                  content={capsuleThoughtSummaryText}
+                                  content={capsuleGuidanceText}
                                   baseFontSize={Math.max(12, resolvedChatFontSize - 1)}
-                                  sourceId={`capsule-thought-${capsuleTurn?.id || "active"}`}
+                                  sourceId={`capsule-guidance-${capsuleTurn?.id || "active"}`}
                                 />
                               </div>
                             ) : (

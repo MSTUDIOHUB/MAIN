@@ -2398,6 +2398,8 @@ test("plan execution checkpoints map to canonical runtime progress states", () =
     },
   );
   assert.match(running.summary, /修复保存命令/);
+  assert.equal(running.tool, "replace_in_file");
+  assert.equal(running.canonicalTarget, "src-tauri/src/main.rs");
   assert.equal(paused.status, "paused");
   assert.equal(paused.title, "计划执行已暂停");
   assert.equal(failed.status, "failed");

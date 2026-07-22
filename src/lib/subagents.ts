@@ -159,6 +159,20 @@ export interface DelegationDecision {
   runtimeHealthState: DelegationRuntimeHealth["state"] | "not_provided";
 }
 
+export type PreferredDelegationRequirementReason =
+  | "required"
+  | "not_preferred"
+  | "already_satisfied"
+  | "insufficient_parallel_scope"
+  | "spawn_unavailable"
+  | DelegationDecisionReason;
+
+export interface PreferredDelegationRequirement {
+  required: boolean;
+  reason: PreferredDelegationRequirementReason;
+  candidateScopeKeys: string[];
+}
+
 export type SpawnSubagentResult =
   | {
       subagentId: string;
@@ -371,24 +385,67 @@ function normalizeSubagentScopePathIdentity(value: string): string {
   return joined || ".";
 }
 
+function normalizeSubagentScopeDisplayPath(value: unknown): string {
+  const normalized = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^[`'\"]+|[`'\"]+$/g, "")
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "")
+    .trim();
+  if (!normalized) return "";
+  const drive = normalized.match(/^([a-z]:)\/(.*)$/i);
+  const absolute = normalized.startsWith("/");
+  const source = drive ? drive[2] : absolute ? normalized.slice(1) : normalized;
+  const segments: string[] = [];
+  for (const segment of source.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length === 0) return "";
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const joined = segments.join("/");
+  if (drive) return joined ? `${drive[1]}/${joined}` : `${drive[1]}/`;
+  if (absolute) return joined ? `/${joined}` : "/";
+  return joined || ".";
+}
+
+function collectIndependentDelegationScopes(values: unknown[]): Array<{
+  identity: string;
+  displayPath: string;
+}> {
+  const displayPathByIdentity = new Map<string, string>();
+  for (const value of values) {
+    const displayPath = normalizeSubagentScopeDisplayPath(value);
+    const identity = normalizeSubagentScopePathIdentity(displayPath);
+    if (!identity || identity === "." || displayPathByIdentity.has(identity)) continue;
+    displayPathByIdentity.set(identity, displayPath);
+  }
+  const normalized = [...displayPathByIdentity.entries()]
+    .map(([identity, displayPath]) => ({ identity, displayPath }))
+    .sort((left, right) => left.identity.length - right.identity.length
+      || left.identity.localeCompare(right.identity));
+  const independent: typeof normalized = [];
+  for (const candidate of normalized) {
+    if (independent.some((scope) =>
+      pathContains(scope.identity, candidate.identity)
+      || pathContains(candidate.identity, scope.identity))) {
+      continue;
+    }
+    independent.push(candidate);
+  }
+  return independent;
+}
+
 /**
  * Reduce path-like delegation hints to non-overlapping, canonical scopes.
  * Task count is deliberately excluded: several checklist items can still own
  * the same file and therefore do not prove that parallel work is independent.
  */
 export function normalizeIndependentDelegationScopeKeys(values: unknown[]): string[] {
-  const normalized = [...new Set(values
-    .map((value) => normalizeSubagentScopePathIdentity(String(value || "")))
-    .filter((value) => value && value !== "."))]
-    .sort((left, right) => left.length - right.length || left.localeCompare(right));
-  const independent: string[] = [];
-  for (const candidate of normalized) {
-    if (independent.some((scope) => pathContains(scope, candidate) || pathContains(candidate, scope))) {
-      continue;
-    }
-    independent.push(candidate);
-  }
-  return independent;
+  return collectIndependentDelegationScopes(values).map((scope) => scope.identity);
 }
 
 /**
@@ -482,6 +539,73 @@ export function resolveDelegationDecision(input: {
     return decision("admit", "adaptive_multi_scope");
   }
   return decision("defer", "insufficient_independent_scope");
+}
+
+/**
+ * A checked collaboration preference is stronger than a prompt hint once the
+ * runtime has proved that useful parallel work exists. Keep this obligation
+ * behind the normal delegation admission decision so workspace, recursion,
+ * phase, capacity, and memory-safety boundaries remain authoritative.
+ *
+ * Two independent scopes are required: one can remain with the parent while
+ * the other is delegated without manufacturing duplicate work.
+ */
+export function resolvePreferredDelegationRequirement(input: {
+  decision: DelegationDecision;
+  independentScopeKeys: string[];
+  alreadySatisfied: boolean;
+  spawnToolAvailable: boolean;
+}): PreferredDelegationRequirement {
+  const candidateScopeKeys = collectIndependentDelegationScopes(
+    input.independentScopeKeys,
+  ).slice(0, 8).map((scope) => scope.displayPath);
+  const result = (
+    required: boolean,
+    reason: PreferredDelegationRequirementReason,
+  ): PreferredDelegationRequirement => ({ required, reason, candidateScopeKeys });
+
+  if (input.decision.preference !== "preferred") {
+    return result(false, "not_preferred");
+  }
+  if (input.alreadySatisfied) {
+    return result(false, "already_satisfied");
+  }
+  if (input.decision.action !== "admit") {
+    return result(false, input.decision.reason);
+  }
+  if (candidateScopeKeys.length < 2) {
+    return result(false, "insufficient_parallel_scope");
+  }
+  if (!input.spawnToolAvailable) {
+    return result(false, "spawn_unavailable");
+  }
+  return result(true, "required");
+}
+
+export function buildPreferredDelegationActionContract(input: {
+  language: "zh" | "en";
+  candidateScopeKeys: string[];
+}): string {
+  const scopes = collectIndependentDelegationScopes(input.candidateScopeKeys)
+    .slice(0, 8)
+    .map((scope) => `- ${scope.displayPath}`)
+    .join("\n");
+  if (input.language === "en") {
+    return [
+      "PREFERRED_DELEGATION_ACTION_REQUIRED: The user enabled subagent collaboration, and the runtime has admitted useful parallel read-only work.",
+      "Call spawn_subagent now before any additional parent read, mutation, validation, or final response. Do not emit a progress paragraph before the tool call.",
+      "Delegate at least one bounded scope that does not overlap the work the parent will continue. You may issue multiple spawn_subagent calls in this response when the scopes are disjoint; do not invent paths or filler work.",
+      "Runtime-observed candidate scopes:",
+      scopes || "- Select a concrete non-overlapping scope from the current evidence.",
+    ].join("\n");
+  }
+  return [
+    "PREFERRED_DELEGATION_ACTION_REQUIRED：用户已开启子智能体协作，且运行时已确认存在可并行的有价值只读范围。",
+    "现在必须先调用 spawn_subagent，再进行主体追加读取、修改、验证或最终回答；工具调用前不要输出进度段落。",
+    "至少委派一个与主体后续工作不重叠的有界范围；若范围彼此独立，可以在本次响应中并列调用多个 spawn_subagent。不要虚构路径，也不要为了凑数制造任务。",
+    "运行时观察到的候选范围：",
+    scopes || "- 请从当前证据中选择一个具体且不重叠的范围。",
+  ].join("\n");
 }
 
 export function buildSubagentPolicyDeferral(input: {

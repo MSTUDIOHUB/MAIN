@@ -28,7 +28,10 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import { pinExecuteRecoveryFiniteValidationCheckpoint } from "./executeRecoveryRuntime";
+import {
+  pinExecuteRecoveryFiniteValidationCheckpoint,
+  shouldPinExecuteRecoveryFiniteValidationCheckpoint,
+} from "./executeRecoveryRuntime";
 import { buildExecutionCheckpointPresentation } from "./completionGuards";
 import {
   parseVisualContextRecognition,
@@ -38,6 +41,7 @@ import {
   type VisualContextDeliveryStatus,
 } from "../../visualContext";
 import { resolveEffectiveSubagentDelegationPreference } from "../../turnIntake";
+import type { PreferredDelegationRequirement } from "../../subagents";
 import {
   getFileReadObservationForState,
   selectFileReadStateForRecoveryContext,
@@ -194,6 +198,9 @@ export class AgentOrchestrator {
           workflowMode,
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
+        let preferredDelegationSatisfied = false;
+        let preferredDelegationRequirementActivations = 0;
+        let lastPreferredDelegationRequirement: PreferredDelegationRequirement | null = null;
         const publishExecuteRecoveryState = () => {
           this.latestExecuteRecoveryState = {
             ...loopState.executeRecoveryState,
@@ -448,11 +455,9 @@ export class AgentOrchestrator {
           return;
         }
 
-        if (
-          (loopState.executeRecoveryState.mode === "validation_only" ||
-            loopState.executeRecoveryState.mode === "finite_validation_only") &&
-          !loopState.executeRecoveryState.decisionCheckpoint?.pendingFiniteValidation
-        ) {
+        if (shouldPinExecuteRecoveryFiniteValidationCheckpoint(
+          loopState.executeRecoveryState,
+        )) {
           const checkpoint = await resolveTrustedValidationCheckpoint();
           if (abortController.signal.aborted) {
             callbacks.onStatusChange("idle");
@@ -508,6 +513,7 @@ export class AgentOrchestrator {
           iterationContext: turnIterationContext,
           turnInputContextSignals,
           latestUserPromptText,
+          preferredDelegationSatisfied,
           recentToolActivity: loopState.recentToolActivity,
           recentPlanToolActivity: loopState.recentPlanToolActivity,
           lastAssistantTextForCheckpoint:
@@ -524,6 +530,11 @@ export class AgentOrchestrator {
           loopState,
           iterationStreamPreparation,
         );
+        lastPreferredDelegationRequirement =
+          iterationStreamPreparation.toolSurfaceDecision.preferredDelegationRequirement;
+        if (lastPreferredDelegationRequirement.required) {
+          preferredDelegationRequirementActivations += 1;
+        }
         publishExecuteRecoveryState();
         if (iterationStreamPreparation.recoveryPause) {
           const pause = iterationStreamPreparation.recoveryPause;
@@ -635,6 +646,8 @@ export class AgentOrchestrator {
           getPlanStreamWatchdogOptions,
           approvedPlanRecoveryStreamMaxElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
+          preferredDelegationRequired:
+            toolSurfaceDecision.preferredDelegationRequirement.required,
           fileReadStates: loopState.toolExecutionRuntimeState.fileReadStates,
           pauseApprovedPlanStreamWatchdog,
           emitPlanExecutionProgress,
@@ -903,18 +916,22 @@ export class AgentOrchestrator {
         if (assistantIterationPhase.status === "stopped") {
           if (
             effectiveSubagentPreference === "preferred" &&
-            !loopState.recentToolActivity.some((activity) =>
-              activity.name === "spawn_subagent" && activity.status === "succeeded"
-            )
+            !preferredDelegationSatisfied
           ) {
             callbacks.onDebugEvent?.("preferred_delegation_not_used", {
               iteration,
-              reason: availableToolNames.has("spawn_subagent")
-                ? "model_declined_after_admission"
-                : "phase_scope_or_capacity_not_admitted",
+              reason: preferredDelegationRequirementActivations > 0
+                ? "required_delegation_protocol_not_satisfied"
+                : lastPreferredDelegationRequirement?.reason ||
+                  (availableToolNames.has("spawn_subagent")
+                    ? "model_declined_after_admission"
+                    : "phase_scope_or_capacity_not_admitted"),
               workflowMode,
               runtimeIntent,
               spawnToolExposed: availableToolNames.has("spawn_subagent"),
+              requirementActivations: preferredDelegationRequirementActivations,
+              candidateScopeKeys:
+                lastPreferredDelegationRequirement?.candidateScopeKeys || [],
               recentToolNames: [...new Set(loopState.recentToolActivity.map((activity) => activity.name))].slice(0, 12),
             });
           }
@@ -998,6 +1015,15 @@ export class AgentOrchestrator {
           activateExecuteRecovery,
           activateChatFinalSynthesis,
           pauseForReviewablePlanArtifact,
+          onSubagentSpawnCreated: () => {
+            if (preferredDelegationSatisfied) return;
+            preferredDelegationSatisfied = true;
+            callbacks.onDebugEvent?.("agent.preferred_delegation_satisfied", {
+              iteration,
+              requirementActivations: preferredDelegationRequirementActivations,
+              pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+            });
+          },
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
         publishExecuteRecoveryState();

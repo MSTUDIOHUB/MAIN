@@ -385,6 +385,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
+  preferredDelegationRequired: boolean;
   fileReadStates: Map<string, FileReadState>;
   pauseApprovedPlanStreamWatchdog: (message: string, logContext?: Record<string, unknown>) => boolean;
   emitPlanExecutionProgress: (
@@ -421,6 +422,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
+    preferredDelegationRequired,
     fileReadStates,
     pauseApprovedPlanStreamWatchdog,
     emitPlanExecutionProgress,
@@ -482,6 +484,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       getPlanStreamWatchdogOptions,
       approvedPlanRecoveryStreamMaxElapsedMs,
       preapprovalPlanQualityRecoveryStreamPolicy,
+      preferredDelegationRequired,
     });
     observeFileReadContextForMessagesSent({
       fileReadStates,

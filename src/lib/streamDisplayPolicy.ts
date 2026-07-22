@@ -30,16 +30,15 @@ export function shouldProjectStreamingAssistantToCapsule(input: Pick<
   StreamingAssistantDisplayInput,
   "workflowMode" | "runIntent"
 >): boolean {
-  if (input.workflowMode === "plan") return true;
+  // Pre-approval Plan output is a quality candidate, not public progress.
+  // The runtime phase narration owns the Capsule until one candidate passes
+  // the gate and is materialized in PlanPanel.
+  if (input.workflowMode === "plan") return false;
   const intent = String(input.runIntent || "");
   return intent === "execute" || intent === "studio_workflow" || intent === "plan";
 }
 
 function shouldGateStreamingText(input: StreamingAssistantDisplayInput): boolean {
-  // Plan mode: gate on protocol fragments and unstable short text only.
-  // Previously: plan mode gated all output, causing short structured plans
-  // to be hidden behind buffering. Now we allow stable markdown content to
-  // show immediately while still filtering out noise and partial output.
   return shouldProjectStreamingAssistantToCapsule(input);
 }
 
@@ -59,6 +58,20 @@ export function resolveStreamingAssistantDisplay(
 ): StreamingAssistantDisplayDecision {
   const raw = String(input.text || "");
   if (!raw) return { action: "suppress", text: "", reason: "empty" };
+
+  // A Plan stream can contain several rejected proposals before the quality
+  // gate accepts one. Keep the raw stream available to the parser, but never
+  // publish candidate Markdown into ChatArea or ExecutionCapsule. Structured
+  // runtime narration remains visible while the accepted artifact is exposed
+  // by PlanPanel after materialization.
+  if (input.workflowMode === "plan") {
+    return {
+      action: "buffer",
+      text: "",
+      bufferText: raw,
+      reason: "plan_candidate_pending_quality_gate",
+    };
+  }
 
   const partialProtocol = hasPartialProtocol(raw);
   if (input.hasVisibleAgentBlock && !partialProtocol && !VISUAL_OBSERVATION_START_RE.test(raw)) {
@@ -90,12 +103,6 @@ export function resolveStreamingAssistantDisplay(
     !LATIN_OR_CJK_RE.test(compact)
   ) {
     return { action: "buffer", text: "", bufferText: raw, reason: "unexpected_short_script" };
-  }
-
-  // Plan mode: show content immediately if it has stable markdown shape or is long enough.
-  // This prevents the "content appears then disappears" effect from unnecessary buffering.
-  if (input.workflowMode === "plan" && (hasStableMarkdownShape(sanitized) || compact.length >= 24)) {
-    return { action: "show", text: sanitized, reason: "plan_mode_stable_content" };
   }
 
   if (

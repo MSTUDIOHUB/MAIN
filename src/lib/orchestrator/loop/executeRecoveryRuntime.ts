@@ -579,6 +579,24 @@ export function clearExecuteRecoveryRuntimeState(
 }
 
 /**
+ * A finite project command may be synthesized only for the generic validation
+ * lane. Browser, desktop, and process-lifecycle checkpoints are already exact
+ * obligations; replacing one with `validation` would hide its required tool
+ * surface and strand the loop on an unrelated build/test command.
+ */
+export function shouldPinExecuteRecoveryFiniteValidationCheckpoint(
+  state: ExecuteRecoveryRuntimeState,
+): boolean {
+  if (
+    state.mode !== "validation_only" &&
+    state.mode !== "finite_validation_only"
+  ) return false;
+  if (state.decisionCheckpoint?.pendingFiniteValidation) return false;
+  const nextCapability = state.decisionCheckpoint?.nextRequiredCapability;
+  return !nextCapability || nextCapability === "validation";
+}
+
+/**
  * Attach the runtime-selected finite acceptance boundary without spending a
  * recovery attempt or resetting no-progress accounting. Discovery is an
  * internal policy step; only executing the command is model-visible progress.
@@ -587,11 +605,7 @@ export function pinExecuteRecoveryFiniteValidationCheckpoint(
   state: ExecuteRecoveryRuntimeState,
   checkpoint: PendingFiniteValidationCheckpoint,
 ): ExecuteRecoveryRuntimeState {
-  if (
-    state.mode !== "validation_only" &&
-    state.mode !== "finite_validation_only"
-  ) return state;
-  if (state.decisionCheckpoint?.pendingFiniteValidation) return state;
+  if (!shouldPinExecuteRecoveryFiniteValidationCheckpoint(state)) return state;
   const command = checkpoint.command.trim();
   const cwd = checkpoint.cwd.trim() || ".";
   if (!command) return state;

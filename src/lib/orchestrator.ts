@@ -46,7 +46,10 @@ import {
   normalizeWorkspacePathIdentity,
   workspacePathsReferToSameFile,
 } from "./workspacePaths";
-import { recordSubagentScopeBlockedTool } from "./subagents";
+import {
+  recordSubagentScopeBlockedTool,
+  type SpawnSubagentResult,
+} from "./subagents";
 import { resolveToolArgumentAuthorization } from "./toolArgumentAuthorization";
 import {
   BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES,
@@ -3801,6 +3804,8 @@ interface ExecuteToolLifecycleOptions {
   recentPlanToolActivity?: PlanToolActivitySummary[];
   attemptedPlanWriteTargets?: string[];
   toolCatalog?: ToolCatalog;
+  /** Fires at the child registration boundary, before any same-batch wait_subagents call. */
+  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
   /** Authorization that was computed before PreToolUse ran. */
   authorizationMode?: "automatic" | "session" | "user" | "plan_artifact";
   toolCapabilityRegistry?: ToolCapabilityRegistry;
@@ -4674,6 +4679,7 @@ async function executeToolCallWithLifecycle(
   let executionAttempted = false;
   try {
     executionAttempted = true;
+    let subagentSpawnOutcome: SpawnSubagentResult | undefined;
     let rawResult = tc.name === "spawn_subagent"
       ? await (async () => {
           if (!callbacks.runSubagent) {
@@ -4695,6 +4701,13 @@ async function executeToolCallWithLifecycle(
               ? resolvedArgs.expected_output
               : typeof resolvedArgs.expectedOutput === "string" ? resolvedArgs.expectedOutput : undefined,
           }, { signal: options.abortSignal });
+          subagentSpawnOutcome = result;
+          if (
+            result.subagentId !== null &&
+            (result.status === "queued" || result.status === "running")
+          ) {
+            options.onSubagentSpawnCreated?.(result);
+          }
           return JSON.stringify(result);
         })()
       : tc.name === "wait_subagents"
@@ -5209,6 +5222,7 @@ async function executeToolCallWithLifecycle(
       content: finalContent,
       displayContent: finalDisplayContent,
       isError: false,
+      ...(subagentSpawnOutcome ? { subagentSpawnOutcome } : {}),
       lifecycleState: "completed",
       executionAttempted,
       ...(workspaceMutationEvidence ? { workspaceEffect: "verified" as const } : {}),
@@ -5571,7 +5585,7 @@ export async function executeReadOnlyToolsConcurrently(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog" | "toolCapabilityRegistry" | "authorizationMode"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets" | "toolCatalog" | "toolCapabilityRegistry" | "authorizationMode" | "onSubagentSpawnCreated"> = {},
 ): Promise<ToolExecutionResult[]> {
   const execute = (tc: typeof toolCalls[number]) =>
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
@@ -5583,6 +5597,7 @@ export async function executeReadOnlyToolsConcurrently(
       attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
       toolCatalog: options.toolCatalog,
       toolCapabilityRegistry: options.toolCapabilityRegistry,
+      onSubagentSpawnCreated: options.onSubagentSpawnCreated,
       authorizationMode: tc.authorizationMode || options.authorizationMode || "automatic",
     });
   const indexedCalls = toolCalls.map((tc, index) => ({ tc, index }));

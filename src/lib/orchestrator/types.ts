@@ -399,6 +399,8 @@ export interface ToolExecutionResult {
   content: string; // model-facing result or error message
   displayContent?: string; // UI-facing result, can differ from model-facing content
   isError: boolean;
+  /** Runtime-owned child registration outcome; do not reconstruct this from model-facing text. */
+  subagentSpawnOutcome?: SpawnSubagentResult;
   lifecycleState?: ToolLifecycleState;
   /** The backend invocation was entered; failure may still have produced side effects. */
   executionAttempted?: boolean;

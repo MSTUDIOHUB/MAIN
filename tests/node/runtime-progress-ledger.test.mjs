@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildCapsuleActivityText,
+  buildCapsuleGuidanceText,
   buildRuntimeProgressLedger,
   buildRuntimeProgressProjection,
   buildRunStatusProjection,
@@ -214,6 +215,51 @@ test("Capsule activity is regenerated from structured tool fields without model 
   assert.equal(activityText, "正在搜索 ChatArea.tsx · 2 次");
   assert.doesNotMatch(activityText, /grep_search|secret reasoning|模型声称/);
   assert.equal(buildCapsuleActivityText({ ...projection, currentActivity: null }, "zh"), "");
+});
+
+test("Capsule guidance explains the purpose of the latest structured action", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:edit",
+    runId: "run-1",
+    phase: "tool_start",
+    title: "raw model prose",
+    status: "running",
+    summary: "replace_in_file · private detail",
+    target: "src/components/ChatArea.tsx",
+    tool: "replace_in_file",
+    sourceToolCallIds: ["call-1"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "zh", "executing"),
+    "我正在修改 `ChatArea.tsx`，把已确认的方案落实到代码。",
+  );
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "en", "executing"),
+    "I'm updating `ChatArea.tsx` to put the confirmed approach into the code.",
+  );
+  assert.doesNotMatch(buildCapsuleGuidanceText(projection, "zh"), /replace_in_file|private detail|raw model prose/);
+});
+
+test("Capsule guidance uses a conversational lifecycle fallback before tool evidence exists", () => {
+  const emptyProjection = {
+    currentActivity: null,
+    milestones: [],
+    healthSignals: [],
+    activityText: "",
+  };
+  assert.equal(
+    buildCapsuleGuidanceText(emptyProjection, "zh", "analyzing"),
+    "我正在梳理你的需求，先确认问题从哪里发生。",
+  );
+  assert.equal(
+    buildCapsuleGuidanceText(emptyProjection, "en", "validating"),
+    "I'm validating the result in the real flow before I call it finished.",
+  );
 });
 
 test("Capsule activity never falls back to an unproven progress title", () => {

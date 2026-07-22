@@ -118,6 +118,7 @@ export async function executeToolExecutionRound(input: {
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
   browserValidationCache: Map<string, ToolExecutionResult>;
+  onSubagentSpawnCreated?: () => void;
 }): Promise<ToolExecutionRoundResult> {
   const {
     readOnlyCalls,
@@ -165,6 +166,7 @@ export async function executeToolExecutionRound(input: {
         attemptedPlanWriteTargets,
         toolCatalog,
         toolCapabilityRegistry,
+        onSubagentSpawnCreated: input.onSubagentSpawnCreated,
       },
     );
     const normalizedReadResults: ToolExecutionResult[] = [];
@@ -316,6 +318,7 @@ export async function executeToolExecutionRound(input: {
         attemptedPlanWriteTargets,
         toolCatalog,
         toolCapabilityRegistry,
+        onSubagentSpawnCreated: input.onSubagentSpawnCreated,
         authorizationMode: "plan_artifact",
       },
     );

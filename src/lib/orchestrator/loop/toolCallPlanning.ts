@@ -24,9 +24,11 @@ import {
   getSubagentAdmissionHealth,
   normalizeIndependentDelegationScopeKeys,
   resolveDelegationDecision,
+  resolvePreferredDelegationRequirement,
   resolveSubagentCapacityPolicy,
   type DelegationDecision,
   type DelegationRuntimePhase,
+  type PreferredDelegationRequirement,
   type SubagentExecutionScope,
 } from "../../subagents";
 import type { ToolDefinition } from "../../toolSchemas";
@@ -48,6 +50,7 @@ export interface IterationToolSurfaceDecision {
   recoveryActionContract: RecoveryActionContract;
   directFileModifyPhase: DirectFileModifyPhase;
   delegationDecision: DelegationDecision;
+  preferredDelegationRequirement: PreferredDelegationRequirement;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
 }
@@ -265,6 +268,7 @@ export function resolveIterationToolSurface(input: {
   turnInputContextSignals: TurnInputContextSignals;
   lastAssistantTextForCheckpoint: string;
   latestUserPromptText?: string;
+  preferredDelegationSatisfied?: boolean;
 }): IterationToolSurfaceDecision {
   const {
     callbacks,
@@ -290,6 +294,7 @@ export function resolveIterationToolSurface(input: {
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
     latestUserPromptText = "",
+    preferredDelegationSatisfied = false,
   } = input;
 
   const devServerRuntimeObservation = resolveDevServerRuntimeState(
@@ -560,6 +565,14 @@ export function resolveIterationToolSurface(input: {
     subagentDepth: callbacks.getSubagentDepth?.() || 0,
     runtimeHealth: delegationRuntimeHealth,
   });
+  const preferredDelegationRequirement = resolvePreferredDelegationRequirement({
+    decision: delegationDecision,
+    independentScopeKeys: normalizedIndependentScopeKeys,
+    alreadySatisfied: preferredDelegationSatisfied,
+    spawnToolAvailable: phaseScopedIterationAllTools.some((tool) =>
+      tool.function.name === "spawn_subagent"
+    ),
+  });
   const delegationScopedIterationAllTools = delegationDecision.action === "admit"
     ? phaseScopedIterationAllTools
     : phaseScopedIterationAllTools.filter((tool) => tool.function.name !== "spawn_subagent");
@@ -625,9 +638,25 @@ export function resolveIterationToolSurface(input: {
       scopedTools: afterNames,
     });
   }
+  const preferredDelegationScopedIterationAllTools = preferredDelegationRequirement.required
+    ? subagentScopedIterationAllTools.filter((tool) => tool.function.name === "spawn_subagent")
+    : subagentScopedIterationAllTools;
   const iterationAllTools = shouldClosePlanToolSurface
     ? []
-    : subagentScopedIterationAllTools;
+    : preferredDelegationScopedIterationAllTools;
+
+  if (delegationDecision.preference === "preferred") {
+    logAgentEvent("preferred_delegation_requirement", {
+      iteration,
+      required: preferredDelegationRequirement.required,
+      reason: preferredDelegationRequirement.reason,
+      candidateScopeKeys: preferredDelegationRequirement.candidateScopeKeys,
+      delegationAction: delegationDecision.action,
+      delegationReason: delegationDecision.reason,
+      effectiveTools: iterationAllTools.map((tool) => tool.function.name),
+      providerNeutral: true,
+    });
+  }
 
   const shouldLogToolSurfaceDecision =
     rawIterationAllTools.length !== iterationAllTools.length ||
@@ -677,6 +706,7 @@ export function resolveIterationToolSurface(input: {
     recoveryActionContract,
     directFileModifyPhase,
     delegationDecision,
+    preferredDelegationRequirement,
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),
   };

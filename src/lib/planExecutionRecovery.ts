@@ -1169,6 +1169,21 @@ export function resolveRestoredPlanExecutionTaskIdentity(input: {
  * The checkpoint intentionally retains richer plan fields for the task UI;
  * consumers of runtimeEvents must not receive that incompatible object.
  */
+function parsePlanExecutionToolIdentity(value: unknown): {
+  tool: string;
+  canonicalTarget: string;
+} {
+  const parts = String(value || "")
+    .split(/\s*[·|]\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const tool = parts[0] && /^[a-z][a-z0-9_-]*$/i.test(parts[0]) ? parts[0] : "";
+  return {
+    tool,
+    canonicalTarget: tool ? parts.slice(1).join(" · ") : "",
+  };
+}
+
 export function toPlanExecutionRuntimeProgressUpdate(input: {
   snapshot: PlanExecutionProgressSnapshot;
   language: "zh" | "en";
@@ -1211,12 +1226,17 @@ export function toPlanExecutionRuntimeProgressUpdate(input: {
     .map((value) => compactLine(value, 180))
     .filter(Boolean)
     .join(" · ");
+  const toolIdentity = parsePlanExecutionToolIdentity(snapshot.currentTool);
 
   return {
     phase: `plan_execution:${snapshot.phase}`,
     title,
     status,
     summary,
+    ...(toolIdentity.tool ? { tool: toolIdentity.tool } : {}),
+    ...(toolIdentity.canonicalTarget
+      ? { canonicalTarget: toolIdentity.canonicalTarget }
+      : {}),
     ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
   };
 }

@@ -8,6 +8,7 @@ import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
 import type { UnityMcpRuntimeState } from "./unityMcpRuntime";
 import type { PlanTask } from "../../workflowModels";
+import type { ToolExecutionResult } from "../types";
 
 type ToolCallPhaseInput = Parameters<typeof executeToolCallPhase>[0];
 type ToolResultRecoveryInput = Parameters<typeof handleToolResultRecoveryPhase>[0];
@@ -24,10 +25,13 @@ type ToolIterationPhaseInput = ToolCallPhaseInput &
     | "remainingTaskText"
     | "successfulReadOnlyExplorationResultCount"
     | "isUnapprovedPlanReadOnlyBatch"
-  >;
+  > & {
+    onSubagentSpawnCreated?: () => void;
+  };
 
 export type ToolIterationPhaseResult = {
   status: "aborted" | "stopped" | "continue" | "completed" | "plan_completed" | "goal_completed";
+  subagentSpawnCreated: boolean;
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;
@@ -42,13 +46,44 @@ export type ToolIterationPhaseResult = {
   };
 };
 
+export function didCreateSubagentFromToolResults(
+  results: ToolExecutionResult[],
+): boolean {
+  return results.some((result) => {
+    if (result.name !== "spawn_subagent" || result.isError) return false;
+    const runtimeOutcome = result.subagentSpawnOutcome;
+    if (runtimeOutcome) {
+      return runtimeOutcome.subagentId !== null &&
+        (runtimeOutcome.status === "queued" || runtimeOutcome.status === "running");
+    }
+    try {
+      const outcome = JSON.parse(String(result.content || "")) as {
+        subagentId?: unknown;
+        status?: unknown;
+      };
+      return typeof outcome.subagentId === "string" &&
+        outcome.subagentId.trim().length > 0 &&
+        (outcome.status === "queued" || outcome.status === "running");
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function handleToolIterationPhase(
   input: ToolIterationPhaseInput,
 ): Promise<ToolIterationPhaseResult> {
   const toolCallPhase = await executeToolCallPhase(input);
+  const subagentSpawnCreated = didCreateSubagentFromToolResults(
+    toolCallPhase.allResults,
+  );
+  if (subagentSpawnCreated) {
+    input.onSubagentSpawnCreated?.();
+  }
   if (toolCallPhase.status === "aborted") {
     return {
       status: "aborted",
+      subagentSpawnCreated,
       noToolRuntimeState: toolCallPhase.noToolRuntimeState,
       planRuntimeState: toolCallPhase.planRuntimeState,
       loopGuardRuntimeState: toolCallPhase.loopGuardRuntimeState,
@@ -80,6 +115,7 @@ export async function handleToolIterationPhase(
 
   return {
     status: toolResultRecoveryPhase.status,
+    subagentSpawnCreated,
     noToolRuntimeState: toolCallPhase.noToolRuntimeState,
     planRuntimeState: toolResultRecoveryPhase.planRuntimeState,
     loopGuardRuntimeState: toolResultRecoveryPhase.loopGuardRuntimeState,

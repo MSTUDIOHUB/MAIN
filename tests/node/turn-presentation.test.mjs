@@ -77,9 +77,10 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     "utf8",
   );
   assert.match(chatAreaSource, /data-testid="capsule-status-label"/);
-  assert.match(chatAreaSource, /data-testid="capsule-thought-summary-label"/);
-  assert.match(chatAreaSource, /selectCapsuleThoughtSummary/);
-  assert.match(chatAreaSource, /content=\{capsuleThoughtSummaryText\}/);
+  assert.match(chatAreaSource, /data-testid="capsule-guidance-label"/);
+  assert.match(chatAreaSource, /selectCapsuleLiveGuidance/);
+  assert.match(chatAreaSource, /buildCapsuleGuidanceText/);
+  assert.match(chatAreaSource, /content=\{capsuleGuidanceText\}/);
   assert.doesNotMatch(chatAreaSource, /data-testid="capsule-activity-label"/);
   assert.doesNotMatch(chatAreaSource, /buildCapsuleActivityText\(capsuleRunStatus, language\)/);
   assert.match(chatAreaSource, /aria-live="polite"/);

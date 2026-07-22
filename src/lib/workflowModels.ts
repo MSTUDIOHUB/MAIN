@@ -1366,7 +1366,7 @@ const SOURCE_MUTATION_TASK_RE =
 const PRIMARY_VALIDATION_TASK_RE =
   /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:运行|执行)\s+(?:(?:npm|pnpm|yarn|bun|npx|node|cargo|pytest|python|go|swift|dotnet|mvn|gradle)\b|[^\r\n]{0,100}(?:测试|验证|检查|验收|构建|编译|lint|类型检查))|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
 const NEGATED_SOURCE_MUTATION_SPAN_RE =
-  /(?:无需|不(?:需要|必|要)|不会)\s*(?:进行|做|作)?\s*(?:任何|额外)?\s*(?:修改|改动|变更|更新|调整)|(?:无|没有)\s*(?:任何|实际|具体)?\s*(?:修改|改动|变更|更新|调整)|保持(?:现有|当前)?[^，。；;]{0,40}不变|(?:no|without)\s+(?:code\s+)?changes?\s+(?:are\s+)?(?:needed|required)|does\s+not\s+require[^.;]{0,50}(?:changes?|updates?|modifications?)|(?:leave|keep|remain)\s+[^.;]{0,50}\s+unchanged|without\s+(?:modifying|changing|updating)|do\s+not\s+(?:modify|change|update)|(?:^|[\s—–:;,.])unchanged(?:$|[\s:;,.])/gi;
+  /(?:无需|不(?:需要|必|要)|不会)\s*(?:进行|做|作)?\s*(?:任何|额外)?\s*(?:修改|改动|变更|更新|调整)|(?:无|没有)\s*(?:任何|实际|具体)?\s*(?:修改|改动|变更|更新|调整)|保持(?:现有|当前)?[^，。；;]{0,40}不变|未保存|(?:no|without)\s+(?:code\s+)?changes?\s+(?:are\s+)?(?:needed|required)|does\s+not\s+require[^.;]{0,50}(?:changes?|updates?|modifications?)|(?:leave|keep|remain)\s+[^.;]{0,50}\s+unchanged|without\s+(?:modifying|changing|updating)|do\s+not\s+(?:modify|change|update)|(?:^|[\s—–:;,.])unchanged(?:$|[\s:;,.])/gi;
 const CODE_IDENTIFIER_REF_RE =
   /`([A-Za-z_$][\w$]*)`|(?:^|[\s（(【\[{:：，,])((?:use[A-Z][A-Za-z0-9_]*|[a-z][A-Za-z0-9_]*Store))(?=$|[\s）)】\]}，,。.;；:：])/g;
 
@@ -3041,6 +3041,10 @@ const RUNTIME_TASK_CHANGE_DETAIL_RE =
   /^(?:改动(?:内容)?|变更(?:内容)?|修改为|改为|变更为|调整为|根因|原因|changes?|change to|replace with|root cause|reason|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE =
   /^(?:改动(?:内容)?|变更(?:内容)?|实现细节|修改说明|修改为|改为|变更为|调整为|changes?|change to|replace with|implementation(?: details)?)\s*[:：]?\s*$/i;
+const RUNTIME_TASK_INLINE_DIAGNOSTIC_LABEL_RE =
+  /^(?:(?:当前|现有|原有|观察到的|已确认的?)?(?:行为|状态|实现|现状)|根(?:本)?原因|根因(?:分析)?|问题(?:分析|诊断)|诊断(?:结果|结论|分析)?|已确认(?:事实|发现)|(?:current|existing|observed|confirmed)\s+(?:behavior|state|implementation|findings?)|root\s+cause(?:\s+analysis)?|problem\s+(?:analysis|diagnosis)|diagnosis|diagnostic\s+(?:findings|results|analysis))$/i;
+const RUNTIME_TASK_INLINE_IMPLEMENTATION_LABEL_RE =
+  /^(?:修改方案|改动方案|变更方案|修复方案|实现方案|实施方案|具体改动|改动内容|变更内容|修改内容|修改说明|实现细节|修改为|改为|变更为|调整为|modification\s+plan|change\s+plan|implementation\s+plan|fix\s+plan|proposed\s+changes?|specific\s+changes?|changes?|implementation(?:\s+details)?|change\s+to|replace\s+with)$/i;
 const RUNTIME_TASK_CHANGE_CHILD_REMOVAL_RE =
   /^(?:(?:移除|删去|注销|取消注册)|(?:remove|drop|unregister)\b)/i;
 const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
@@ -3429,6 +3433,61 @@ function stripRuntimeOptionalTasks(content: string): string {
       continue;
     }
     kept.push(rawLine);
+  }
+
+  return kept.join("\n");
+}
+
+/**
+ * Reviewable plans often use bold inline labels instead of Markdown headings,
+ * for example `**Current behavior**:` followed by diagnosis bullets and then
+ * `**Implementation plan**:`. Treat those labels as structural boundaries so
+ * observed state cannot inherit the preceding file owner and become a source
+ * mutation. The implementation label itself is metadata; only its concrete
+ * body remains eligible for runtime task projection.
+ */
+function stripRuntimeInlineDiagnosticBlocks(content: string): string {
+  const kept: string[] = [];
+  let inDiagnosticBlock = false;
+  let inCodeFence = false;
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    if (/^\s*```/.test(rawLine)) {
+      inCodeFence = !inCodeFence;
+      if (!inDiagnosticBlock) kept.push(rawLine);
+      continue;
+    }
+    if (inCodeFence) {
+      if (!inDiagnosticBlock) kept.push(rawLine);
+      continue;
+    }
+
+    if (/^\s*#{1,6}\s+/.test(rawLine)) {
+      inDiagnosticBlock = false;
+      kept.push(rawLine);
+      continue;
+    }
+
+    const normalized = stripMarkdownTaskLine(rawLine.replace(/\*\*/g, "")).trim();
+    const labeled = normalized.match(/^([^:：]{1,48})[:：]\s*(.*)$/s);
+    if (labeled) {
+      const label = (labeled[1] || "").trim();
+      const body = (labeled[2] || "").trim();
+      if (RUNTIME_TASK_INLINE_DIAGNOSTIC_LABEL_RE.test(label)) {
+        inDiagnosticBlock = true;
+        continue;
+      }
+      if (RUNTIME_TASK_INLINE_IMPLEMENTATION_LABEL_RE.test(label)) {
+        inDiagnosticBlock = false;
+        if (body) {
+          const indent = rawLine.match(/^\s*/)?.[0] || "";
+          kept.push(`${indent}- ${body}`);
+        }
+        continue;
+      }
+    }
+
+    if (!inDiagnosticBlock) kept.push(rawLine);
   }
 
   return kept.join("\n");
@@ -4117,7 +4176,9 @@ export function deriveRuntimePlanTasksFromArtifacts(
   if (!combinedContent.trim()) return [];
   const normalizedRuntimeContent = normalizeRuntimePlanSectionHeadings(combinedContent);
   const runtimeRelevantContent = stripRuntimeOptionalTasks(
-    stripRuntimeExcludedSections(normalizedRuntimeContent),
+    stripRuntimeExcludedSections(
+      stripRuntimeInlineDiagnosticBlocks(normalizedRuntimeContent),
+    ),
   );
   const runtimeCommands = extractShellCommandsFromText(runtimeRelevantContent);
   const canonicalFilePaths = collectCanonicalRuntimePlanFilePaths(normalizedRuntimeContent);
