@@ -156,6 +156,7 @@ const {
 
 const {
   findDelegatedObservationRequiringParentReread,
+  normalizeFiniteValidationCheckpointCommand,
   objectiveAuditTargetsMissingReadObservation,
   partitionToolCallsForExecution,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
@@ -194,10 +195,17 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"));
 
 const {
+  createAgentLoopRuntimeActions,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRuntimeActions.ts"));
+
+const {
+  isFiniteValidationRecoveryExecution,
   resolveApprovedPlanMutationContextDecision,
+  resolveFiniteValidationRepairTarget,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"));
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
+const preferredScopes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"));
 
 const {
   buildReadOnlyCacheSignature,
@@ -446,7 +454,7 @@ test("ordinary chat max-iteration boundary synthesizes, then uses one bounded al
     "run:paused:max_iterations_auto_resume",
     "status:idle",
     "run:paused:max_iterations_boundary",
-    "stop:no_action:chat_max_iterations_strategy_exhausted",
+    "stop:no_action:max_iterations_boundary",
     "status:idle",
   ]);
 
@@ -1007,7 +1015,11 @@ test("execute protocol no-action exhausts provider-neutral strategy pivots befor
   }));
   assert.equal(second.status, "continue");
   assert.match(secondHarness.appended.at(-1)?.content || "", /alternate_capability_reframe/);
-  assert.deepEqual(secondHarness.protocolFallbacks, ["execute_no_progress_alternate_protocol"]);
+  assert.deepEqual(
+    secondHarness.protocolFallbacks,
+    [],
+    "a no-progress strategy may reframe the action but must not replace a working native tool transport",
+  );
 
   const exhaustedHarness = createExecuteNoToolHarness("en");
   const exhausted = handleExecuteNoToolRecovery(createExecuteNoToolInput(exhaustedHarness, {
@@ -1056,7 +1068,7 @@ test("active evidence recovery handles protocol violations without opening gener
   assert.match(violationHarness.appended[0].content, /active recovery surface/);
 });
 
-test("execute recovery exposes only the current capability surface", () => {
+test("execute recovery exposes only the capability owned by the current phase", () => {
   const names = [
     "list_directory",
     "glob_search",
@@ -1106,7 +1118,7 @@ test("execute recovery exposes only the current capability surface", () => {
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
-  }), false);
+  }), false, "legacy read hints cannot widen the mutation contract");
   assert.equal(isExecuteRecoveryToolName("grep_search", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
@@ -1154,8 +1166,8 @@ test("one recovery contract atomically advances long-running validation from PTY
   assert.equal(targeting.nextRequiredCapability, "targeting");
   assert.equal(targeting.surfaceDescription, "capability:targeting");
   assert.equal(targeting.allowedToolNames.has("code_ast_query"), true);
-  assert.equal(targeting.allowedToolNames.has("find_symbol_references"), false);
-  assert.equal(targeting.allowedToolNames.has("read_file"), false);
+  assert.equal(targeting.allowedToolNames.has("find_symbol_references"), true);
+  assert.equal(targeting.allowedToolNames.has("read_file"), true);
   assert.equal(targeting.allowedToolNames.has("apply_patch"), false);
   const targetingBatch = resolveExecuteRecoveryBatchDecision({
     mode: "action_plus_targeting",
@@ -1365,7 +1377,7 @@ test("one recovery contract atomically advances long-running validation from PTY
 
   const card = buildExecutionActionContractCard({ contract: targeting, language: "en" });
   assert.match(card, /availableTools=/);
-  assert.match(card, /read_file is unavailable now/);
+  assert.match(card, /same file version and covered window returns a cache stub/i);
   assert.match(card, /next=targeting/);
 
   const filteredCard = buildExecutionActionContractCard({
@@ -2939,9 +2951,9 @@ test("direct file modification retains structured repair tools until final valid
   assert.equal(validation.directFileModifyPhase, "validation");
   assert.deepEqual(
     validation.iterationAllTools.map((tool) => tool.function.name),
-    ["replace_in_file", "write_file", "apply_patch", "run_command"],
+    ["read_file", "replace_in_file", "write_file", "apply_patch", "run_command"],
   );
-  assert.equal(validation.availableToolNames.has("read_file"), false);
+  assert.equal(validation.availableToolNames.has("read_file"), true);
   assert.equal(validation.availableToolNames.has("replace_in_file"), true);
   assert.equal(validation.availableToolNames.has("write_file"), true);
   assert.equal(validation.availableToolNames.has("apply_patch"), true);
@@ -3161,7 +3173,76 @@ test("post-repair validation rejects a different command while keeping the exact
   assert.match(result.preExecutionResults[0].content, /cargo check/);
 });
 
-test("adaptive delegation exposes spawn only during useful context or diagnosis phases", () => {
+test("finite validation checkpoint accepts output merging but not compound shell work", async () => {
+  const executeRecoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: null,
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: {
+        command: "npm run build",
+        cwd: ".",
+      },
+    },
+  };
+  const recoveryActionContract = resolveExecuteRecoveryActionContract(
+    executeRecoveryState.mode,
+    executeRecoveryState,
+  );
+  const accepted = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "equivalent-validation",
+      name: "run_command",
+      arguments: JSON.stringify({
+        command: "npm run build 2>&1",
+        description: "build with merged output",
+        cwd: ".",
+      }),
+    }],
+    executeRecoveryState,
+    recoveryActionContract,
+    availableToolNames: new Set(["run_command"]),
+  }));
+
+  assert.equal(
+    normalizeFiniteValidationCheckpointCommand("npm   run build 2> &1"),
+    "npm run build",
+  );
+  assert.equal(accepted.preExecutionResults.length, 0);
+  assert.equal(accepted.writeCalls.length, 1);
+
+  const rejected = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "compound-validation",
+      name: "run_command",
+      arguments: JSON.stringify({
+        command: "npm run build && touch escaped",
+        description: "compound command",
+        cwd: ".",
+      }),
+    }],
+    executeRecoveryState,
+    recoveryActionContract,
+    availableToolNames: new Set(["run_command"]),
+  }));
+  assert.equal(rejected.writeCalls.length, 0);
+  assert.equal(
+    rejected.preExecutionResults[0].qualityGateReason,
+    "finite_validation_checkpoint_mismatch",
+  );
+});
+
+test("delegation uses initial fan-out plus runtime-owned lifecycle review waves", () => {
   const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
@@ -3231,6 +3312,397 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
   assert.equal(sessionPreferred.delegationDecision.action, "admit");
   assert.equal(sessionPreferred.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
 
+  const evidenceTools = [
+    ...tools,
+    {
+      type: "function",
+      function: {
+        name: "find_symbol_references",
+        description: "find_symbol_references",
+        parameters: {
+          type: "object",
+          properties: { symbol: { type: "string" } },
+          required: ["symbol"],
+        },
+      },
+    },
+  ];
+  const openEvidenceTopology = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "needs_evidence",
+    rawIterationAllTools: evidenceTools,
+    latestUserPromptText: "Diagnose the editor and save-path symptoms before preparing a Plan",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        structuredFacts: [{
+          kind: "event_contract",
+          authority: "runtime_observation",
+          relation: "dom_dispatch",
+          event: "input",
+        }],
+      },
+      {
+        name: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+      },
+    ],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(openEvidenceTopology.delegationDecision.action, "admit");
+  assert.equal(
+    openEvidenceTopology.preferredDelegationRequirement.reason,
+    "evidence_topology_open",
+  );
+  assert.equal(openEvidenceTopology.preferredDelegationRequirement.required, false);
+  assert.equal(
+    openEvidenceTopology.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
+    false,
+  );
+  assert.equal(openEvidenceTopology.planEvidenceObligation?.kind, "find_symbol_references");
+  assert.equal(openEvidenceTopology.planEvidenceObligation?.symbol, "input");
+  assert.deepEqual(
+    openEvidenceTopology.iterationAllTools.map((tool) => tool.function.name),
+    ["find_symbol_references"],
+  );
+
+  const earlyDisjointPlanTopology = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "grounding",
+    rawIterationAllTools: evidenceTools,
+    latestUserPromptText: "Trace the frontend event and backend command owners before drafting",
+    recentPlanToolActivity: [{
+      name: "get_project_skeleton",
+      target: "get_project_skeleton",
+      status: "succeeded",
+      discoveryObservation: {
+        kind: "project_structure",
+        targetRefs: [
+          "package.json",
+          "README.md",
+          "src/main.js",
+          "src/components/editor.js",
+          "src-tauri/src/main.rs",
+        ],
+      },
+    }],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(earlyDisjointPlanTopology.delegationDecision.phase, "diagnostic");
+  assert.equal(earlyDisjointPlanTopology.delegationDecision.action, "admit");
+  assert.equal(earlyDisjointPlanTopology.preferredDelegationRequirement.required, true);
+  assert.deepEqual(
+    earlyDisjointPlanTopology.preferredDelegationRequirement.requiredScopes.map((scope) =>
+      scope.scopeKey
+    ),
+    ["src", "src-tauri"],
+  );
+  assert.deepEqual(
+    earlyDisjointPlanTopology.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+    "typed project topology activates preferred delegation before parent source reads or Plan finalization",
+  );
+
+  const earlyScopeContract = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes: earlyDisjointPlanTopology.preferredDelegationRequirement.requiredScopes,
+    maxCreatedPerTurn: 3,
+  });
+  const releasedAfterEarlyCapacityFailure = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "grounding",
+    rawIterationAllTools: evidenceTools,
+    latestUserPromptText: "Trace the frontend event and backend command owners before drafting",
+    recentPlanToolActivity: [{
+      name: "get_project_skeleton",
+      target: "get_project_skeleton",
+      status: "succeeded",
+      discoveryObservation: {
+        kind: "project_structure",
+        targetRefs: ["src/main.js", "src-tauri/src/main.rs"],
+      },
+    }],
+    preferredDelegationScopeContract: earlyScopeContract,
+    preferredDelegationMaterializationBlockedScopeKeys: ["src", "src-tauri"],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(
+    releasedAfterEarlyCapacityFailure.preferredDelegationRequirement.reason,
+    "runtime_materialization_failed",
+  );
+  assert.equal(
+    releasedAfterEarlyCapacityFailure.preferredDelegationRequirement.contractOpen,
+    false,
+  );
+  assert.equal(
+    releasedAfterEarlyCapacityFailure.iterationAllTools.some((tool) =>
+      tool.function.name === "spawn_subagent"
+    ),
+    false,
+  );
+  assert.equal(
+    releasedAfterEarlyCapacityFailure.iterationAllTools.some((tool) =>
+      tool.function.name === "read_file"
+    ),
+    true,
+    "a rejected preferred materialization releases evidence work back to the parent",
+  );
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    orchestratorSource,
+    /turnIterationContext\.turn\.status\s*=\s*["']completed["']/,
+    "a control-plane-only delegation iteration cannot publish a false completion",
+  );
+
+  const closedMdViewerTopology = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "drafting",
+    usedPlanReadOnlyConvergencePrompt: true,
+    rawIterationAllTools: evidenceTools,
+    latestUserPromptText: "Prepare the grounded Plan for the editor and save-path symptoms",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        structuredFacts: [{
+          kind: "event_contract",
+          authority: "runtime_observation",
+          relation: "dom_dispatch",
+          event: "input",
+        }],
+      },
+      { name: "read_file", target: "src/components/toolbar.js", status: "succeeded" },
+      { name: "read_file", target: "src/components/preview.js", status: "succeeded" },
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        structuredFacts: [{
+          kind: "event_contract",
+          authority: "runtime_observation",
+          relation: "dom_listener",
+          event: "input",
+        }, {
+          kind: "command_contract",
+          authority: "runtime_observation",
+          relation: "invoke",
+          command: "save_file_content",
+          arguments: ["filePath"],
+        }],
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        structuredFacts: [{
+          kind: "command_contract",
+          authority: "runtime_observation",
+          relation: "handler",
+          command: "save_file_content",
+          arguments: ["file_path"],
+        }],
+      },
+    ],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(closedMdViewerTopology.preferredDelegationRequirement.required, true);
+  assert.deepEqual(
+    closedMdViewerTopology.preferredDelegationRequirement.requiredScopes.map((scope) => scope.scopeKey),
+    ["src", "src-tauri"],
+  );
+  assert.deepEqual(
+    closedMdViewerTopology.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+  );
+
+  const planDraftCheckpoint = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "drafting",
+    usedPlanReadOnlyConvergencePrompt: true,
+    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+      },
+    ],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(planDraftCheckpoint.delegationDecision.phase, "diagnostic");
+  assert.equal(planDraftCheckpoint.delegationDecision.action, "admit");
+  assert.equal(planDraftCheckpoint.preferredDelegationRequirement.required, true);
+  assert.deepEqual(
+    planDraftCheckpoint.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+  );
+
+  let settledDelegation = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes,
+    maxCreatedPerTurn: 3,
+  });
+  for (const [index, scope] of settledDelegation.requiredScopes.entries()) {
+    const subagentId = `settled-${index}`;
+    settledDelegation = preferredScopes.recordPreferredDelegationScopeSpawn({
+      contract: settledDelegation,
+      outcome: {
+        subagentId,
+        name: subagentId,
+        status: "queued",
+        scopeKey: scope.scopeKey,
+        allowedPaths: scope.allowedPaths,
+      },
+    });
+    settledDelegation = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+      contract: settledDelegation,
+      outcomes: [{
+        subagentId,
+        scopeKey: scope.scopeKey,
+        status: "completed",
+        closureState: "satisfied",
+        adoptedEvidenceCount: 1,
+        adoptedEvidenceTargets: [scope.allowedPaths[0]],
+        consumed: true,
+      }],
+    });
+  }
+  const satisfiedPlanDraft = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "drafting",
+    usedPlanReadOnlyConvergencePrompt: true,
+    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
+    recentPlanToolActivity: planDraftCheckpoint.preferredDelegationRequirement.candidateScopeKeys
+      .map((target) => ({ name: "read_file", target, status: "succeeded" })),
+    preferredDelegationScopeContract: settledDelegation,
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(satisfiedPlanDraft.delegationDecision.phase, "finalization");
+  assert.equal(satisfiedPlanDraft.preferredDelegationRequirement.reason, "all_required_scopes_consumed");
+  assert.deepEqual(satisfiedPlanDraft.iterationAllTools, []);
+
+  let exhaustedDelegation = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes,
+    maxCreatedPerTurn: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes.length,
+  });
+  for (const [index, scope] of exhaustedDelegation.requiredScopes.entries()) {
+    const subagentId = `exhausted-${index}`;
+    exhaustedDelegation = preferredScopes.recordPreferredDelegationScopeSpawn({
+      contract: exhaustedDelegation,
+      outcome: {
+        subagentId,
+        name: subagentId,
+        status: "queued",
+        scopeKey: scope.scopeKey,
+        allowedPaths: scope.allowedPaths,
+      },
+    });
+    exhaustedDelegation = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+      contract: exhaustedDelegation,
+      outcomes: [{
+        subagentId,
+        scopeKey: scope.scopeKey,
+        status: "degraded",
+        closureState: "partial",
+        adoptedEvidenceCount: 1,
+        adoptedEvidenceTargets: [scope.allowedPaths[0]],
+        consumed: false,
+      }],
+    });
+  }
+  const exhaustedPlanGrounding = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "grounding",
+    latestUserPromptText: "Inspect src/main.js and src-tauri/src/main.rs before planning",
+    recentPlanToolActivity: [
+      { name: "read_file", target: "src/main.js", status: "succeeded" },
+      { name: "read_file", target: "src-tauri/src/main.rs", status: "succeeded" },
+    ],
+    preferredDelegationScopeContract: exhaustedDelegation,
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(exhaustedPlanGrounding.preferredDelegationRequirement.contractOpen, false);
+  assert.equal(exhaustedPlanGrounding.preferredDelegationRequirement.reason, "scope_creation_capacity_reached");
+  assert.ok(exhaustedPlanGrounding.iterationAllTools.length > 0);
+  assert.equal(
+    exhaustedPlanGrounding.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
+    false,
+  );
+
+  const singleScopePlanDraft = resolveIterationToolSurface(makeInput({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "drafting",
+    usedPlanReadOnlyConvergencePrompt: true,
+    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+    }],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(singleScopePlanDraft.delegationDecision.phase, "finalization");
+  assert.equal(singleScopePlanDraft.preferredDelegationRequirement.required, false);
+  assert.deepEqual(singleScopePlanDraft.iterationAllTools, []);
+
   const sessionForbidden = resolveIterationToolSurface(makeInput({
     latestUserPromptText: "检查启动和菜单模块",
     turnInputContextSignals: {
@@ -3256,12 +3728,19 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
         target: "src/main.js",
         status: "succeeded",
       },
+      {
+        name: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+      },
     ],
   }));
-  assert.equal(mutation.delegationDecision.action, "defer");
+  assert.equal(mutation.delegationDecision.action, "admit");
   assert.equal(mutation.delegationDecision.phase, "mutation");
-  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
-  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"), true);
+  assert.equal(mutation.preferredDelegationRequirement.required, true);
+  assert.equal(mutation.preferredDelegationRequirement.lifecyclePhase, "mutation");
+  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
+  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"), false);
 
   const validation = resolveIterationToolSurface(makeInput({
     recentToolActivity: [
@@ -3275,10 +3754,18 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
         target: "src/main.js",
         status: "succeeded",
       },
+      {
+        name: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+      },
     ],
   }));
+  assert.equal(validation.delegationDecision.action, "admit");
   assert.equal(validation.delegationDecision.phase, "validation");
-  assert.equal(validation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+  assert.equal(validation.preferredDelegationRequirement.required, true);
+  assert.equal(validation.preferredDelegationRequirement.lifecyclePhase, "validation");
+  assert.equal(validation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
 
   const simple = resolveIterationToolSurface(makeInput({
     latestUserPromptText: "读取 src/main.js",
@@ -3900,10 +4387,11 @@ test("normal approved Plan execute workflow is not narrowed by tool history alon
   }));
   assert.equal(recovery.isExecuteRecoveryEligible, true);
   assert.equal(recovery.availableToolNames.has("read_file"), false);
+  assert.equal(recovery.availableToolNames.has("apply_patch"), true);
   assert.equal(recovery.recoveryActionContract.allowTargetedFileRead, false);
 });
 
-test("unpinned validation recovery exposes only manifest discovery and finite command execution", () => {
+test("validation recovery closes adjacent workspace actions until structured failure", () => {
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
     mode: "validation_only",
   }), true);
@@ -3915,7 +4403,7 @@ test("unpinned validation recovery exposes only manifest discovery and finite co
   }), false);
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "validation_only",
-  }), true);
+  }), false);
 
   const prompt = buildExecuteValidationRecoveryPrompt({
     language: "zh",
@@ -3926,11 +4414,12 @@ test("unpinned validation recovery exposes only manifest discovery and finite co
   });
   assert.match(prompt, /连续修改同一目标/);
   assert.match(prompt, /下一证据优先级是一条成功验证结果/);
-  assert.match(prompt, /只暴露当前验证检查点拥有的工具/);
+  assert.match(prompt, /验证是当前阶段唯一开放能力/);
+  assert.match(prompt, /结构化验证失败/);
   assert.match(prompt, /不能声称任务完成/);
 });
 
-test("failed finite validation recovery keeps an exact run_command checkpoint", () => {
+test("failed finite validation keeps a command-only checkpoint until structured repair", () => {
   const contract = resolveExecuteRecoveryActionContract("finite_validation_only", {
     decisionCheckpoint: {
       expectedTarget: "src/example.js",
@@ -3948,13 +4437,15 @@ test("failed finite validation recovery keeps an exact run_command checkpoint", 
   for (const available of [
     "execute_command",
     "read_pty_since",
-    "replace_in_file",
     "browser_evaluate",
   ]) {
     assert.equal(isExecuteRecoveryToolName(available, readOnlyTools, {
       contract,
     }), false, available);
   }
+  assert.equal(isExecuteRecoveryToolName("replace_in_file", readOnlyTools, {
+    contract,
+  }), false);
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     contract,
   }), false);
@@ -3963,8 +4454,8 @@ test("failed finite validation recovery keeps an exact run_command checkpoint", 
     result: '{"exitCode":1,"stderr":"module not found"}',
   });
   assert.match(prompt, /next required evidence is one compatible finite command/);
-  assert.match(prompt, /finite-command capability only/);
-  assert.match(prompt, /cannot replace this command evidence/);
+  assert.match(prompt, /exposes only the finite command boundary/);
+  assert.match(prompt, /reads and edits are not adjacent validation actions/);
   assert.match(prompt, /exitCode 0/);
 });
 
@@ -4024,8 +4515,14 @@ test("finite validation checkpoints persist command, cwd, and timeout in the act
   const card = buildExecutionActionContractCard({ contract, language: "en" });
   assert.match(card, /validationCommand=cargo check/);
   assert.match(card, /validationCwd=src-tauri/);
-  assert.match(card, /do not substitute a different acceptance boundary/);
-  assert.deepEqual([...contract.allowedToolNames], ["run_command"]);
+  assert.match(card, /only acceptance boundary/);
+  assert.equal(contract.allowedToolNames.has("run_command"), true);
+  assert.equal(contract.allowedToolNames.has("read_file"), false);
+  assert.equal(contract.allowedToolNames.has("replace_in_file"), false);
+  assert.deepEqual(contract.toolCallRequirement, {
+    kind: "required_named",
+    toolName: "run_command",
+  });
 });
 
 test("failed finite validation recovery preserves explicit command evidence", () => {
@@ -4064,6 +4561,99 @@ test("failed finite validation recovery preserves explicit command evidence", ()
   });
   assert.match(runtimeOwnedPrompt, /No exact command was reviewed/);
   assert.match(runtimeOwnedPrompt, /one compatible finite command/);
+});
+
+test("finite validation repair binds only a uniquely attributed diagnostic path", () => {
+  const attributed = resolveFiniteValidationRepairTarget({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stderr: "src/components/editor.js:180:7: error synthetic input is forbidden",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/workspace",
+  });
+  assert.equal(attributed, "src/components/editor.js");
+
+  const inlineAttributed = resolveFiniteValidationRepairTarget({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stdout: "Fresh acceptance failed: src/main.js existing-file save still uses the wrong payload.",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/workspace",
+  });
+  assert.equal(inlineAttributed, "src/main.js");
+
+  const multiOwner = resolveFiniteValidationRepairTarget({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stdout: "Repair src/main.js and src/components/editor.js before rerunning.",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/workspace",
+  });
+  assert.equal(
+    multiOwner,
+    null,
+    "multiple diagnostic owners must retain a workspace-scoped repair",
+  );
+
+  const objectiveLevel = resolveFiniteValidationRepairTarget({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stdout: "Three acceptance obligations remain across the workspace.",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/workspace",
+  });
+  assert.equal(
+    objectiveLevel,
+    null,
+    "the latest mutation target must not be invented as the cause of an unattributed validation failure",
+  );
+});
+
+test("finite validation recovery follows Execute semantics instead of a transient command directive", () => {
+  assert.equal(isFiniteValidationRecoveryExecution({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    isPlanApproved: false,
+  }), true);
+  assert.equal(isFiniteValidationRecoveryExecution({
+    workflowMode: "edit",
+    runtimeIntent: "goal",
+    isPlanApproved: false,
+  }), true);
+  assert.equal(isFiniteValidationRecoveryExecution({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+  }), true);
+  assert.equal(isFiniteValidationRecoveryExecution({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    isPlanApproved: false,
+  }), false);
 });
 
 test("failed finite validation recovery ignores runtime availability probes", () => {
@@ -4161,7 +4751,102 @@ test("real validation failure grants one current-version repair read before muta
   });
   assert.equal(contract.phase, "context");
   assert.equal(contract.nextRequiredCapability, "targeted_read");
-  assert.deepEqual([...contract.allowedToolNames], ["read_file"]);
+  assert.equal(contract.allowedToolNames.has("read_file"), true);
+  assert.equal(contract.allowedToolNames.has("replace_in_file"), false);
+  assert.equal(contract.allowedToolNames.has("run_command"), false);
+});
+
+test("latest Execute incident keeps an unbounded parent reread satisfiable and the workspace surface stable", () => {
+  let recoveryState = createExecuteRecoveryRuntimeState({ workflowMode: "edit" });
+  const runtimeActions = createAgentLoopRuntimeActions({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPreferredLanguage: () => "en",
+    },
+    runtimeState: { workflowMode: "edit" },
+    recentToolActivity: [],
+    getIteration: () => 9,
+    getExecuteRecoveryState: () => recoveryState,
+    setExecuteRecoveryState: (next) => {
+      recoveryState = next;
+    },
+    getStreamRuntimeState: () => ({}),
+    setStreamRuntimeState: () => {},
+    getPlanRuntimeState: () => ({ planRuntimePhase: "idle" }),
+    setPlanRuntimeState: () => {},
+  });
+
+  recoveryState = runtimeActions.activateExecuteRecovery(
+    "patch_recovery_read",
+    "subagent_parent_source_reread_required",
+    {
+      target: "src/main.js",
+      readLease: {
+        purpose: "context_restore",
+        target: "src/main.js",
+        observationKey: "child-observation-diagnostic-only",
+        observedVersion: null,
+        state: "available",
+      },
+      sourceObservationKey: "child-observation-diagnostic-only",
+    },
+  );
+
+  assert.equal(recoveryState.readLease?.purpose, "context_restore");
+  assert.equal(recoveryState.readLease?.requestedRange, undefined);
+  assert.equal(recoveryState.sourceObservationKey, null);
+  const contextContract = resolveExecuteRecoveryActionContract(
+    recoveryState.mode,
+    recoveryState,
+  );
+  assert.equal(contextContract.nextRequiredCapability, "targeted_read");
+  assert.equal(contextContract.allowedToolNames.has("read_file"), true);
+  assert.equal(contextContract.allowedToolNames.has("replace_in_file"), false);
+  assert.equal(contextContract.allowedToolNames.has("run_command"), false);
+  assert.deepEqual(contextContract.toolCallRequirement, {
+    kind: "required_named",
+    toolName: "read_file",
+  });
+
+  const refreshed = transitionExecuteRecoveryRuntimeState(recoveryState, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "src/main.js::33890:1784775202670::500-529",
+    sourceRequestedRange: { startLine: 500, endLine: 529, maxLines: 30 },
+    sourceObservedVersion: "33890:1784775202670",
+  });
+  assert.equal(refreshed.transition, "context_to_mutation");
+  assert.equal(refreshed.state.mode, "mutation_first");
+  assert.equal(refreshed.state.readLease?.state, "consumed");
+
+  const mutationContract = resolveExecuteRecoveryActionContract(
+    refreshed.state.mode,
+    refreshed.state,
+  );
+  const pendingEdit = resolveExecuteRecoveryBatchDecision({
+    mode: refreshed.state.mode,
+    contract: mutationContract,
+    expectedTarget: "src/main.js",
+    calls: [{
+      id: "replace-after-parent-reread",
+      name: "replace_in_file",
+      target: "src/main.js",
+    }],
+  });
+  assert.equal(pendingEdit.selectedCallId, "replace-after-parent-reread");
+  assert.deepEqual(pendingEdit.deferredCallIds, []);
+
+  const adjacentValidation = resolveExecuteRecoveryBatchDecision({
+    mode: refreshed.state.mode,
+    contract: mutationContract,
+    expectedTarget: "src/main.js",
+    calls: [{
+      id: "finite-check-before-next-edit",
+      name: "run_command",
+      target: "npm test",
+    }],
+  });
+  assert.equal(adjacentValidation.selectedCallId, null);
+  assert.deepEqual(adjacentValidation.deferredCallIds, ["finite-check-before-next-edit"]);
 });
 
 test("patch mismatch recovery reuses versioned observations without cache bypass", () => {
@@ -4371,6 +5056,42 @@ test("mutation mismatch grants only a precise one-shot read and otherwise reuses
     "targeted_read",
   );
 
+  for (const activeMode of [
+    "validation_only",
+    "finite_validation_only",
+    "objective_audit",
+  ]) {
+    const phaseReplacementDecision = resolveDirectMutationPreflightRecovery({
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      executeRecoveryMode: activeMode,
+      results: [{
+        name: "replace_in_file",
+        target: "src/main.js",
+        content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+        isError: true,
+        lifecycleState: "blocked",
+        mutationPreflightReason: "search_text_mismatch",
+        patchRecoveryMismatch: {
+          mismatchFingerprint:
+            `patch_mismatch::src/main.js::search_text_mismatch::${activeMode}`,
+          target: "src/main.js",
+          requestedRange: { startLine: 900, endLine: 980, maxLines: 81 },
+          observedVersion: "16384:1700000000000",
+        },
+      }],
+    });
+    assert.equal(
+      phaseReplacementDecision?.mode,
+      "patch_recovery_read",
+      `${activeMode} must yield to a concrete mutation mismatch`,
+    );
+    assert.equal(
+      phaseReplacementDecision?.decisionCheckpoint.nextRequiredCapability,
+      "targeted_read",
+    );
+  }
+
   assert.equal(resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
     runtimeIntent: "execute",
@@ -4410,8 +5131,8 @@ test("recovery batch selection serializes different model call shapes by phase",
     }),
   });
   assert.equal(context.phase, "need_context");
-  assert.equal(context.selectedCallId, "edit", "a current-target mutation must win over the read lease");
-  assert.deepEqual(context.deferredCallIds.sort(), ["target-read", "validate-first", "wrong-read"]);
+  assert.equal(context.selectedCallId, "target-read", "an active source lease remains the preferred action");
+  assert.deepEqual(context.deferredCallIds.sort(), ["edit", "validate-first", "wrong-read"]);
 
   const mutationBeatsLease = resolveExecuteRecoveryBatchDecision({
     mode: "patch_recovery_read",
@@ -4431,8 +5152,8 @@ test("recovery batch selection serializes different model call shapes by phase",
       },
     }),
   });
-  assert.equal(mutationBeatsLease.selectedCallId, "current-edit");
-  assert.deepEqual(mutationBeatsLease.deferredCallIds, ["cached-read", "new-window"]);
+  assert.equal(mutationBeatsLease.selectedCallId, "cached-read");
+  assert.deepEqual(mutationBeatsLease.deferredCallIds, ["current-edit", "new-window"]);
 
   const wrongTargetOnly = resolveExecuteRecoveryBatchDecision({
     mode: "patch_recovery_read",
@@ -4474,6 +5195,61 @@ test("recovery batch selection serializes different model call shapes by phase",
   assert.equal(mutationContract.allowTargetedFileRead, false);
   assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
   assert.equal(mutationContract.surfaceDescription, "capability:mutation");
+
+  const mutationAfterReadNoProgress = resolveExecuteRecoveryActionContract("mutation_first", {
+    expectedTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::1-100",
+    protocolNoProgressCount: 1,
+    protocolNoProgressFingerprint:
+      "mutation_first::::read_file:src/App.tsx:read_unchanged::mutation::src/App.tsx::v1::unleased::same_window::::mutation::::::",
+  });
+  assert.equal(mutationAfterReadNoProgress.allowTargetedFileRead, false);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("read_file"), false);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("grep_search"), false);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("run_command"), false);
+  assert.equal(
+    mutationAfterReadNoProgress.surfaceDescription,
+    "capability:mutation",
+  );
+  const stableReadBatch = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    contract: mutationAfterReadNoProgress,
+    expectedTarget: "src/App.tsx",
+    calls: [{ id: "read-again", name: "read_file", target: "src/App.tsx" }],
+  });
+  assert.equal(stableReadBatch.selectedCallId, null);
+  assert.deepEqual(stableReadBatch.deferredCallIds, ["read-again"]);
+
+  const mutationAfterNoToolProgress = resolveExecuteRecoveryActionContract("mutation_first", {
+    expectedTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::1-100",
+    phaseNoProgressCount: 2,
+  });
+  assert.equal(mutationAfterNoToolProgress.allowTargetedFileRead, false);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("read_file"), false);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("grep_search"), false);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("run_command"), false);
+  assert.equal(
+    mutationAfterNoToolProgress.surfaceDescription,
+    "capability:mutation",
+  );
+
+  const validationAfterNoToolProgress = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::1-100",
+    phaseNoProgressCount: 2,
+  });
+  assert.equal(validationAfterNoToolProgress.allowTargetedFileRead, false);
+  assert.equal(validationAfterNoToolProgress.allowedToolNames.has("read_file"), false);
+  assert.equal(validationAfterNoToolProgress.allowedToolNames.has("grep_search"), false);
+  assert.equal(validationAfterNoToolProgress.allowedToolNames.has("apply_patch"), false);
+  assert.equal(validationAfterNoToolProgress.allowedToolNames.has("run_command"), true);
+  assert.equal(
+    validationAfterNoToolProgress.surfaceDescription,
+    "capability:validation",
+  );
 
   const mutationValidationOnly = resolveExecuteRecoveryBatchDecision({
     mode: "mutation_first",
@@ -4639,10 +5415,13 @@ test("recovery batch selection serializes different model call shapes by phase",
       objectiveClosurePending: true,
     },
   });
-  assert.equal(unpinnedValidationContract.surfaceDescription, "capability:validation-discovery");
-  assert.deepEqual(unpinnedValidationContract.toolCallRequirement, { kind: "required_any" });
+  assert.equal(unpinnedValidationContract.surfaceDescription, "capability:validation");
+  assert.deepEqual(unpinnedValidationContract.toolCallRequirement, {
+    kind: "required_named",
+    toolName: "run_command",
+  });
   assert.equal(unpinnedValidationContract.allowedToolNames.has("run_command"), true);
-  assert.equal(unpinnedValidationContract.allowedToolNames.has("read_file"), true);
+  assert.equal(unpinnedValidationContract.allowedToolNames.has("read_file"), false);
 
   const toolCallPartitioningSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
@@ -4663,7 +5442,7 @@ test("recovery batch selection serializes different model call shapes by phase",
   );
 });
 
-test("a fresh unleased target window refreshes observation but keeps the mutation checkpoint", () => {
+test("a fresh unleased target window cannot refresh the mutation checkpoint", () => {
   const state = activateExecuteRecoveryRuntimeState(createExecuteRecoveryRuntimeState({ workflowMode: "edit" }), {
     mode: "mutation_first",
     reason: "approved_plan_target_context_observed",
@@ -4685,9 +5464,9 @@ test("a fresh unleased target window refreshes observation but keeps the mutatio
     sourceObservedVersion: "v1",
   });
 
-  assert.equal(transition.transition, "context_refreshed");
-  assert.equal(transition.state.phaseNoProgressCount, 0);
-  assert.equal(transition.state.sourceObservationKey, "src/App.tsx::v1::101-200");
+  assert.equal(transition.transition, "none");
+  assert.equal(transition.state.phaseNoProgressCount, 1);
+  assert.equal(transition.state.sourceObservationKey, "src/App.tsx::v1::1-100");
   assert.equal(transition.state.expectedTarget, "src/App.tsx");
   assert.equal(transition.state.decisionCheckpoint?.nextRequiredCapability, "mutation");
 });
@@ -5367,7 +6146,7 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
     /contextForceForManagement\.shouldForce \|\| cloudResponsesCompact/,
     "low-pressure local turns must not prune source observations every iteration",
   );
-  assert.match(source, /activateExecuteRecovery\("mutation_first", "execute_convergence_prompt"/);
+  assert.match(source, /activateExecuteRecovery\(recoveryMode, "execute_convergence_prompt"/);
   assert.match(streamInvocationSource, /const recoveryToolChoice =[\s\S]*toolChoice: recoveryToolChoice/);
   assert.match(executeRecoveryRuntimeSource, /attempts: state\.attempts \+ 1/);
   assert.match(executeRecoveryRuntimeSource, /MAX_EXECUTE_RECOVERY_ITERATIONS = 6/);
@@ -5375,8 +6154,8 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
   assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
-  assert.match(source, /recoveryReason: handling\.checkpoint\.autoResumeEligible/);
-  assert.match(source, /"chat_max_iterations_strategy_exhausted"/);
+  assert.match(source, /emitRunPausedEvent\([\s\S]*"max_iterations_boundary"/);
+  assert.match(source, /recoveryReason: "max_iterations_boundary"/);
   assert.match(source, /normalizeNoProgressResultContent/);
   assert.match(source, /resolveReadOnlyNoProgressTrigger/);
   assert.match(streamInvocationSource, /buildChatFinalSynthesisPrompt/);
@@ -5837,7 +6616,7 @@ test("direct-edit validation reopens only after a finite command is pinned", () 
 
 });
 
-test("pinning a trusted validation command is attempt-neutral and closes the generic surface", () => {
+test("pinning a trusted validation command is attempt-neutral on the command-only surface", () => {
   const mutationTransition = transitionExecuteRecoveryRuntimeState(
     {
       mode: "mutation_first",
@@ -5872,7 +6651,9 @@ test("pinning a trusted validation command is attempt-neutral and closes the gen
     cwd: ".",
   });
   const contract = resolveExecuteRecoveryActionContract(pinned.mode, pinned);
-  assert.deepEqual([...contract.allowedToolNames], ["run_command"]);
+  assert.equal(contract.allowedToolNames.has("run_command"), true);
+  assert.equal(contract.allowedToolNames.has("read_file"), false);
+  assert.equal(contract.allowedToolNames.has("replace_in_file"), false);
   assert.deepEqual(contract.toolCallRequirement, {
     kind: "required_named",
     toolName: "run_command",
@@ -6202,7 +6983,7 @@ test("recovery action cards retain the original turn objective and finite valida
   assert.match(card, /mutationEvidence=src\/main\.js@REQ-OPEN/);
 });
 
-test("objective audit action cards restore the full surface and allow no-tool closure", () => {
+test("objective audit action cards keep a bounded workspace surface and allow no-tool closure", () => {
   const contract = resolveExecuteRecoveryActionContract("objective_audit", {
     expectedTarget: "src/main.js",
     decisionCheckpoint: {
@@ -6222,7 +7003,15 @@ test("objective audit action cards restore the full surface and allow no-tool cl
       objectiveClosurePending: true,
     },
   });
-  assert.equal(contract.allowsAllTools, true);
+  assert.equal(contract.allowsAllTools, false);
+  assert.equal(contract.allowedToolNames.has("read_file"), true);
+  assert.equal(contract.allowedToolNames.has("replace_in_file"), true);
+  assert.equal(contract.allowedToolNames.has("run_command"), true);
+  assert.equal(contract.allowedToolNames.has("execute_command"), false);
+  assert.equal(contract.allowedToolNames.has("send_pty_input"), false);
+  assert.equal(contract.allowedToolNames.has("get_pty_status"), false);
+  assert.equal(contract.allowedToolNames.has("browser_evaluate"), false);
+  assert.equal(contract.allowedToolNames.has("computer_use"), false);
   assert.deepEqual(contract.toolCallRequirement, { kind: "optional" });
   const card = buildExecutionActionContractCard({
     contract,
@@ -6231,7 +7020,8 @@ test("objective audit action cards restore the full surface and allow no-tool cl
     turnObjective: "Finish every requested Open File behavior.",
   });
   assert.match(card, /phase=objective_audit/);
-  assert.match(card, /full tool surface restored/i);
+  assert.match(card, /stable workspace surface restored/i);
+  assert.match(card, /do not repeat an already-successful finite validation through an interactive terminal/i);
   assert.match(card, /make no tool call and output the final user-facing conclusion summary/i);
   assert.doesNotMatch(card, /Call one tool from availableTools/);
 

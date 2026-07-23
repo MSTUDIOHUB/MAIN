@@ -6,6 +6,7 @@ import {
   compactDiagnosticText,
   inferLifecycleStateFromToolResult,
   isProjectSourceWriteResult,
+  hasPlanVisualContextGrounding,
   logAgentEvent,
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
   targetProgressReasonForToolResult,
@@ -14,10 +15,15 @@ import { isUnityScriptWriteToolCall } from "../../orchestrator/unityDiagnostics"
 import {
   assessPlanClosureEvidence,
   classifyCommandResultOutcome,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
+  isPlanEvidenceReadyForModelDraft,
 } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import type { PlanEvidenceObligation } from "../../planEvidenceObligations";
+import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import type { ResolvedUserIntent } from "../../runIntent";
+import type { TurnInputContextSignals } from "../../turnIntake";
 import { getTaskTargetingEvidenceKey, type TaskOrchestratorPhase } from "../../taskTargeting";
 import { isPlanTaskTrustedComplete, type PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
@@ -73,9 +79,11 @@ export function handleToolResultPostProcessing(input: {
   iteration: number;
   results: ToolExecutionResult[];
   toolArgsByCallId: Map<string, Record<string, unknown>>;
+  planEvidenceObligationClosuresByCallId?: Map<string, PlanEvidenceObligation>;
   taskTargetingEvidence: Set<string>;
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
+  turnInputContextSignals: TurnInputContextSignals;
   planRuntimePhase: PlanRuntimePhase;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planDraftingRecoveryReadCount: number;
@@ -120,6 +128,8 @@ export function handleToolResultPostProcessing(input: {
   let unityMcpForceConsoleFirstPending = input.unityMcpForceConsoleFirstPending;
   let unityConsoleMissingFirstToolRepromptIssued = input.unityConsoleMissingFirstToolRepromptIssued;
   let planDraftingRecoveryReadCount = input.planDraftingRecoveryReadCount;
+  const planEvidenceObligationClosuresByCallId =
+    input.planEvidenceObligationClosuresByCallId || new Map<string, PlanEvidenceObligation>();
   let effectivePlanRuntimePhase = planRuntimePhase;
   const setPlanRuntimePhase: SetPlanRuntimePhase = (phase, reason, status) => {
     effectivePlanRuntimePhase = phase;
@@ -129,8 +139,12 @@ export function handleToolResultPostProcessing(input: {
   // become user progress, execution evidence, task targeting or success usage.
   const externalResults = results.filter((result) => !result.internalFeedback);
   externalResults.forEach((result) => callbacks.onToolResultObserved?.(result));
-  const delegatedEvidenceActivities = externalResults.flatMap(extractDelegatedSubagentActivities);
-  const parentRereadObligations = externalResults.flatMap(extractSubagentParentRereadObligations);
+  const delegatedEvidenceActivities = externalResults.flatMap((result) =>
+    extractDelegatedSubagentActivities(result, { evidenceLedger: true })
+  );
+  const parentRereadObligations = externalResults.flatMap((result) =>
+    extractSubagentParentRereadObligations(result, { evidenceLedger: true })
+  );
   const delegatedActivities = [...delegatedEvidenceActivities, ...parentRereadObligations];
   const directlyTrackedResults = externalResults.filter((result) =>
     result.name !== "spawn_subagent" && result.name !== "wait_subagents"
@@ -218,6 +232,8 @@ export function handleToolResultPostProcessing(input: {
 
   directlyTrackedResults.forEach((result) => rememberToolActivity(recentToolActivity, result, {
     args: getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {}),
+    closingEvidenceObligation:
+      planEvidenceObligationClosuresByCallId.get(result.toolCallId),
   }));
   rememberDelegatedSubagentActivities(recentToolActivity, delegatedActivities);
   const remainingTaskText =
@@ -249,6 +265,8 @@ export function handleToolResultPostProcessing(input: {
       {
         evidenceLedger: true,
         args: getToolExecutionArgs(result, toolArgsByCallId.get(result.toolCallId) ?? {}),
+        closingEvidenceObligation:
+          planEvidenceObligationClosuresByCallId.get(result.toolCallId),
       },
     ));
     rememberDelegatedSubagentActivities(
@@ -290,22 +308,51 @@ export function handleToolResultPostProcessing(input: {
     );
     const bundle = closureInput.evidenceBundle;
     const closureAssessment = assessPlanClosureEvidence(bundle);
-    const modelAuthoredDraftReady = isPlanEvidenceBundleReady(bundle);
-    const shouldAdvanceToDrafting = closureAssessment.ready;
+    const bundleReady = isPlanEvidenceBundleReady(bundle);
+    const modelAuthoredDraftReady = isPlanEvidenceReadyForModelDraft(
+      bundle,
+      closureAssessment,
+    );
+    const evidenceReadiness = assessPlanEvidenceReadiness({
+      userGoal: closureInput.userGoal,
+      userContext: input.turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasGroundedVisualContext: hasPlanVisualContextGrounding(
+        callbacks.getMessages(),
+        callbacks.getCurrentTurnId?.(),
+      ),
+    });
+    const deterministicMaterializationReady =
+      hasDeterministicPlanMaterializationEvidence(bundle);
+    // Model synthesis and deterministic fallback share the same runtime-owned
+    // readiness gate. Deterministic fallback retains its additional proof bar.
+    const shouldAdvanceToDrafting = evidenceReadiness.status === "ready_for_plan" && (
+      input.planEvidenceRecoveryObjective === "deterministic_closure"
+        ? deterministicMaterializationReady
+        : modelAuthoredDraftReady
+    );
     if (shouldAdvanceToDrafting) {
+      const draftingReason = input.planEvidenceRecoveryObjective === "deterministic_closure"
+        ? "deterministic Plan evidence ready"
+        : closureAssessment.ready
+          ? "plan closure evidence ready"
+          : "model-authored Plan evidence ready";
       setPlanRuntimePhase(
         "drafting",
-        "plan closure evidence ready",
+        draftingReason,
       );
       logAgentEvent("plan_evidence_bundle_ready", {
         iteration,
         evidenceBundleId: bundle.bundleId,
         evidenceBundleHash: bundle.hash,
         evidenceLedgerEntries: recentPlanToolActivity.length,
-        bundleReady: true,
-        closureReady: closureAssessment.ready,
+        bundleReady,
+        closureReady: deterministicMaterializationReady,
+        rationaleReady: closureAssessment.ready,
         modelAuthoredDraftReady,
-        deterministicMaterializationReady: closureAssessment.ready,
+        evidenceReadiness: evidenceReadiness.status,
+        evidenceReadinessReason: evidenceReadiness.reason,
+        deterministicMaterializationReady,
         evidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
@@ -319,16 +366,19 @@ export function handleToolResultPostProcessing(input: {
         verificationTargets: bundle.verificationTargets.length,
         previousPhase: planRuntimePhase,
       });
-    } else if (modelAuthoredDraftReady) {
+    } else if (bundleReady) {
       logAgentEvent("plan_evidence_bundle_open", {
         iteration,
         evidenceBundleId: bundle.bundleId,
         evidenceBundleHash: bundle.hash,
         evidenceLedgerEntries: recentPlanToolActivity.length,
-        bundleReady: true,
-        closureReady: false,
+        bundleReady,
+        closureReady: deterministicMaterializationReady,
+        rationaleReady: closureAssessment.ready,
         modelAuthoredDraftReady,
-        deterministicMaterializationReady: false,
+        evidenceReadiness: evidenceReadiness.status,
+        evidenceReadinessReason: evidenceReadiness.reason,
+        deterministicMaterializationReady,
         evidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,

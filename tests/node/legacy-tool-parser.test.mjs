@@ -1,9 +1,64 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
 
-import { parseTextForTools } from "../../src/lib/textToolParser.ts";
-import { sanitizeAIOutput } from "../../src/lib/sanitize.ts";
-import { TOOL_DEFINITIONS } from "../../src/lib/toolSchemas.ts";
+import ts from "typescript";
+
+const require = createRequire(import.meta.url);
+const workspaceRoot = process.cwd();
+const transpiledModuleCache = new Map();
+
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: normalizedPath,
+  }).outputText;
+
+  const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      for (const candidate of [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ]) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return require(specifier);
+  };
+  const factory = new Function("exports", "module", "require", transpiled);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  return module.exports;
+}
+
+const { parseTextForTools } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/textToolParser.ts"),
+);
+const { sanitizeAIOutput } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/sanitize.ts"),
+);
+const { TOOL_DEFINITIONS } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/toolSchemas.ts"),
+);
 
 test("parses legacy execute_command wrapper into a real read-only tool call", () => {
   const parsed = parseTextForTools([

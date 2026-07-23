@@ -67,6 +67,16 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantOutputRouting.ts"),
 );
+const {
+  annotateRequiredToolCallProtocolResult,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/requiredToolProtocol.ts"),
+);
+const {
+  normalizeAssistantTurn,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/normalizedTurn.ts"),
+);
 
 test("assistant output routing clears raw tool protocol unless unapproved plan text should remain", () => {
   const clear = resolveToolProtocolStreamClearDecision({
@@ -283,6 +293,49 @@ test("assistant output routing resolves executable plan reply options and pause 
 
   assert.equal(decision.hasExecutablePlanProposalOptions, true);
   assert.equal(decision.shouldPauseForUserChoice, true);
+});
+
+test("required typed Plan surface still pauses for explicit blocking user options", () => {
+  const requiredResult = annotateRequiredToolCallProtocolResult({
+    content: [
+      "A user-owned product decision blocks the Plan.",
+      "<user_options>",
+      "<option>Keep local-only storage</option>",
+      "<option>Enable cloud synchronization</option>",
+      "</user_options>",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  }, "required", ["submit_plan_candidate"]);
+  assert.equal(requiredResult.protocolViolation, "required_tool_call_missing");
+
+  const normalized = normalizeAssistantTurn(requiredResult);
+  assert.deepEqual(normalized.replyOptions.map((option) => option.source), [
+    "explicit_user_options",
+    "explicit_user_options",
+  ]);
+  const decision = resolveAssistantReplyOptionRouting({
+    rawFinalReplyOptions: normalized.replyOptions,
+    finalReplyOptions: normalized.replyOptions,
+    toolCallCount: 0,
+    workflowMode: "plan",
+    hasStructuredProposal: false,
+    hasReadyPlanArtifacts: false,
+    isPlanApproved: false,
+    forcePause: false,
+    finishReason: "stop",
+  });
+  assert.equal(decision.shouldPauseForUserChoice, true);
+
+  const completionSource = fsSync.readFileSync(path.join(
+    workspaceRoot,
+    "src/lib/orchestrator/loop/assistantCompletionPhase.ts",
+  ), "utf8");
+  assert.ok(
+    completionSource.indexOf("handleReplyOptionsPause({") <
+      completionSource.indexOf("handlePlanNoToolRecovery({"),
+    "blocking reply options must pause before required-tool recovery",
+  );
 });
 
 test("assistant output routing keeps inferred diagnostic options from pausing tool execution", () => {

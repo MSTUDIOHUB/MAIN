@@ -1,7 +1,7 @@
 # MAIN Session 持久化与 Workspace Turn 接纳
 
 > 状态：现行规范
-> 事实源：`src/store/workspaceTurnQueue.ts`、`src/store/useAppStore.ts`、`src/store/submitRunLease.ts`、`src/lib/projectSessionMutationCoordinator.ts`、`src/lib/ipc.ts`、`src-tauri/src/session_store.rs` 与 `src-tauri/src/lib.rs` 的 project-session commands。
+> 事实源：`src/store/workspaceTurnQueue.ts`、`src/store/useAppStore.ts`、`src/store/submitRunLease.ts`、`src/lib/turnRuntimeCheckpoint.ts`、`src/lib/projectSessionMutationCoordinator.ts`、`src/lib/ipc.ts`、`src-tauri/src/session_store.rs` 与 `src-tauri/src/lib.rs` 的 project-session commands。
 
 ## 唯一所有权
 
@@ -11,6 +11,7 @@ Session 的“业务含义”和“存储机制”必须分开：
 | --- | --- | --- |
 | `WorkspaceInstruction`、receipt ledger、`WorkspaceTurnQueueState`、FIFO、claim/ack/remove 与恢复协调 | TypeScript | 验证身份、推进队列、决定能否分发或重放 |
 | Run 尝试身份与 Harness marker | TypeScript | 以精确 Session/Turn/Run 身份取得执行槽、建立 lineage，并防止旧尝试覆盖新 owner |
+| canonical Turn checkpoint、Plan review 状态与 durable delegated planning evidence | TypeScript | 回放 typed Turn/Run 状态，校验 exact owner，保存 Plan artifact/review 与已经 join/consume 的 scoped 证据 |
 | partial transcript 补基线、按 ID 合并、`taskFlow` 同步与 message/turn count | TypeScript | 在同一 Session 保存队头完成 transcript 投影，再把完整快照交给 Rust CAS |
 | Session 快照、revision CAS、存储 envelope、schema migration 与旧数据导入 | Rust | 不透明保存 TypeScript 生成的 JSON，维护 storage metadata，并在读路径提供 transcript 分页投影；不裁决生命周期语义 |
 | Trace、Replay、Golden 与 Eval | Rust Harness | 验证确定性执行契约，不取得生产 Session 或模型循环所有权 |
@@ -44,9 +45,49 @@ schema v1 曾短暂创建 `workspace_turn_outbox` 和 `run_leases`。升级到 v
 - `(workspace, session_id)` 对应的完整 Session JSON 快照及单调 revision；
 - 每个 workspace 的一次性 legacy import 标记。
 
-Workspace Turn 队列、receipt ledger、Conversation Turn、事件和 Harness marker 都是 Session JSON 内的 TypeScript 投影，不是 Rust 可独立修改的关系表。
+Workspace Turn 队列、receipt ledger、Conversation Turn、canonical Turn checkpoints、事件、Plan/执行证据和 Harness marker 都是 Session JSON 内的 TypeScript 投影，不是 Rust 可独立修改的关系表。
 
 关闭 Session recording 或 Session 被明确标为 temporary 时，接纳可以只保留在内存中；此模式不承诺进程重启恢复，UI 必须把 durability 区分为 `memory`，不能伪称已经落盘。瞬时保存超时也只能把本次投影降级为 `temporary`，不得永久改写用户的 `recordingDisabled` 策略；后续保存或新接纳可以修复持久化状态。
+
+## Canonical Turn checkpoint
+
+`runtimeSnapshot.turnRuntimeCheckpoints` 保存按 `turnId` 索引的 `TurnRuntimeCheckpointV1`。每个 checkpoint 包含：
+
+- schema version 与单调 `revision`；
+- exact owner：`workspaceKey + sessionKey + sessionEpoch + clientSubmissionId + turnId`；
+- canonical Turn/Run state 及其完整有序 event ledger；
+- Plan planning checkpoint：`PreferredDelegationScopeContract` 与 runtime-issued closure receipt refs；
+- `updatedAt`。
+
+checkpoint 不是 UI cache。读取时 `normalizeCanonicalTurnRuntimeState()` 从 `turn.admitted` 开始逐条运行纯 reducer，再把重建结果与持久化 projection 比较；任何 schema、sequence、时间、identity、Run lineage、Plan review 或 event/state 不一致都会拒绝整条 checkpoint。Store 只采用与当前 workspace、Session/epoch 和 map key 精确匹配的记录。当前每个 Session 最多保留最近 32 个 checkpoint。
+
+生产 Run 在接纳后尽早创建 checkpoint，planning/协作状态和 terminal canonical transaction 都通过 revision 更新。终态投影先通过 canonical reducer，成功后才映射 legacy runtime events、Conversation Turn、agent status 与 UI；持久化层不得从这些兼容投影反向重写 checkpoint。
+
+### 冷恢复规则
+
+- 持久化时已经 `completed` 的 Turn 保留原结论；不存在第二次完成。
+- 持久化时仍 `running` 的 Run 在 cold restore 中确定性转换为 `paused(kind=recoverable, reason=application_restarted)`。进程内 controller/AbortController 不会被伪造恢复。
+- 已经进入 Plan review 的 canonical state 不转换成 done/idle。只有当 checkpoint、Plan artifact path/digest/revision、pending `plan_review` ActionRequest、Plan lifecycle review identity、Session/epoch、Turn、Run/parent Run 全部相符时，恢复 UI 才投影 `agentStatus=pending_review` 与 `awaiting_approval`；执行 authority 仍保持关闭，等待用户审批。
+- pending review 任一 identity 不匹配时，恢复方拒绝失效审批并把可见 Turn 降为可恢复暂停；不得仅凭存在 `plan.md` 或旧 `agentStatus` 重新授予批准能力。
+
+这条规则修复了“Plan artifact 已创建但恢复/收尾显示 done/idle”的双重事实源：审核态只由 canonical checkpoint 与 exact review identity 共同证明。
+
+### 子智能体协作的 durable 状态
+
+`PreferredDelegationScopeContract` 持久化冻结的非重叠 required scopes、每个 child registration 和 per-Turn `maxCreatedPerTurn`。registration 只能是 `spawned | consumed | incomplete`；registration 数量本身也是创建预算，恢复时不能丢弃失败尝试并凭空获得更多 child。
+
+完整的 child observation 不再内嵌到 Turn checkpoint。runtime 在 join/consume 边界签发 `CanonicalSubagentClosureReceipt`，并写入 Session 顶层独立的 `subagentClosureReceiptLedger`；checkpoint 只保存 receipt ID。receipt 把 `workspace + Session/epoch + parent Turn/Run + subagent + scope + frozen allowedPaths + closure state` 与每条 observation identity、source content hash 和完整 canonical activity digest 绑定。
+
+只有满足以下条件的 child observation 才能进入 canonical receipt：
+
+1. 来自成功的 read-only tool observation，而不是 child summary；
+2. 有 `subagentId`、source tool-call/observation identity 和 `joinState=consumed`；
+3. closure=`satisfied`、planning evidence=`reusable`；
+4. target 位于 registration 的 frozen `allowedPaths` 内。
+
+每个 Session 最多保留 48 个 closure receipts，每个 receipt 最多包含 24 条 observation，并有 1 MiB 总账本上限。冷恢复时，进程内 child promise/controller 已不存在，因此 `spawned` 一律变为 `incomplete`；`consumed` 只有在 checkpoint ref 能在独立 ledger 中 exact lookup、receipt digest 能从 canonical payload 重算、owner/Run/scope/path 全部匹配时才保留。任一失败都删除该 ref、丢弃其 adopted evidence 并把 registration 降为 `incomplete`，但 registration 仍计入 per-Turn 创建预算。
+
+这里的独立性是运行时所有权边界，不是密码学防篡改声明：Rust 继续只把完整 Session snapshot 当作 opaque bytes 做 CAS，不解释子智能体语义。本契约防止模型输出、局部 checkpoint 污染和 owner 漂移自证成功；它不承诺抵抗能够任意重写整个本地 Session snapshot 的恶意操作者。
 
 ## 快照 CAS
 
@@ -92,6 +133,14 @@ Rust CAS 只裁决“这是不是基于当前快照的写入”；TypeScript tra
 
 Chat、Plan、Fast、Slash command 或模型是否需要工具都不能绕过这条接纳路径。工作区中每次用户提交都是 Turn。
 
+### Queue 与 Guide 的持久化区别
+
+active Run 中点击 Queue 或按回车发送，走完整 Workspace Turn 接纳：新 instruction 获得自己的 receipt、`turnId`、用户块、标题与 FIFO 状态，因此可以跨当前 Run 的剩余时间和 Session 保存继续排队。
+
+Guide 不进入 `WorkspaceTurnQueueState`，不创建 receipt、用户块、标题或 Conversation Turn。它是 Session runtime snapshot 中绑定当前 `turnId` / Run owner 的一次性 `activeGuidance`，只能由 exact active Run 的下一次模型迭代消费；消费后清除。若它在 provider 请求进行中到达，终态提交必须先让出一次有界额外迭代；若终态已提交，Guide admission 失败且 Composer 输入保持可用。Guide 只接收文本，附件、图片和显式 Plan/Goal 意图必须 Queue 为新 Turn。持久化中两者必须保持不同 schema，不能在恢复时把 guidance 提升为 queued Turn，或把 queued instruction 注入当前 Run。
+
+旧版单槽 `queuedUserMessage` 只允许保留在无 Workspace 生命周期的 global chat 兼容边界。工作区恢复如果遇到该字段，必须把它迁移为具备 receipt、`turnId`、用户块、标题和 Conversation Turn 的 durable FIFO entry，或形成可见 error Turn；生产分发器不得再把它直接注入当前 Run，也不得与 `WorkspaceTurnQueueState` 重复计数。
+
 ## TypeScript FIFO 状态机
 
 队列只使用以下持久化状态：
@@ -122,6 +171,8 @@ persisting -> queued -> dispatching
 
 因此，进程退出不会把 Turn 变成“失败”。恢复方必须继续执行，或形成合法的 `turn.completed(resultKind=...)` 结论。
 
+canonical checkpoint 为恢复方提供比旧 Harness marker 更严格的 adopted-owner 证据：未完成的 model workflow 队头只有在 exact checkpoint/Run owner 可恢复时才视为已被接管；否则仍依既有 at-most-once/可见结论规则处理。checkpoint 不允许仅凭相似 user text、Plan stage 或 agent status 认领队头。
+
 ### local-fast 的 fail-closed 恢复
 
 local-fast 命令可能产生不可逆的本地副作用。当前快照在 handler 前没有 durable execution fence，所以冷启动时即使磁盘仍显示 `queued`，也不能证明该命令从未执行。真实 Session hydration 因而在通用队列规范化之后执行一层 local-fast 隔离：
@@ -141,6 +192,8 @@ local-fast 命令可能产生不可逆的本地副作用。当前快照在 handl
 2. 用调用者看到的 expected marker 做 identity CAS；如果更新的 owner 已经取得全局槽，旧 bootstrap 以 `HARNESS_RUN_LEASE_OWNER_LOST` 停止，不能覆盖新 owner。
 3. marker、消息索引、意图和计划阶段随 Session runtime snapshot 持久化，用于精确恢复与诊断。
 4. marker 只是尝试所有权和恢复证据，不是完成事实；结论仍只能来自结构化 `run.completed` / `turn.completed`。
+
+canonical Turn checkpoint 与 attempt marker 也不能混用：marker 证明某次执行槽/attempt ownership，checkpoint 证明可回放的 Turn/Run/Plan review 状态。恢复或终态提交必须同时尊重两者各自的 exact identity fence，任何一个都不能从另一个推断完成。
 
 不要把这里的 Harness marker 与 Rust Harness 混为一谈：前者属于生产 TypeScript Session，后者只负责确定性验证。
 
@@ -170,5 +223,9 @@ Rust 暴露的产品 Session 接口只有快照/分页/删除边界：
 5. 普通可恢复工作可把未完成 claim 重新排队；冷恢复中的 unresolved local-fast 一律隔离并退队，不重放 handler。
 6. attempt marker CAS 会拒绝陈旧 owner；重启恢复不会重复用户块、Turn 或最终结论。
 7. local-fast 结论快照必须已包含唯一 final、runtime outcome、`run.completed` 和 `turn.completed`；adoption 漂移时只能新建隔离的 presentation-recovery Turn/Run，不得关闭原 Turn 或重跑本地副作用。
+8. canonical checkpoint 必须能从有序 events 完整回放；owner、projection 或 revision 漂移时拒绝采用，running 冷恢复只可变为 `application_restarted` recoverable pause。
+9. exact Plan review checkpoint 恢复为 `pending_review / awaiting_approval` 且保持非终态；artifact/ActionRequest/lifecycle 任一身份不符时撤销失效审批，不得显示 done 或授予执行权。
+10. durable child registration 在恢复后不得重置 per-Turn 创建预算；`spawned` 变 incomplete，`consumed` 只有 scope 内 typed adopted evidence 仍有效时才保留。
+11. Queue 创建新 durable Turn 并遵守 FIFO；Guide 不创建 Turn、只由 exact active Run 消费，二者不能相互恢复或投影。
 
 生命周期语义见 [运行时生命周期](RUNTIME_LIFECYCLE.md)。

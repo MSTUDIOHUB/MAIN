@@ -160,33 +160,9 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
   await expect(page.getByTestId("plan-reject-delete-button")).toBeVisible();
   await expect(page.getByTestId("plan-adjust-input")).toBeVisible();
   await expect(page.getByTestId("plan-adjust-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
-  await page.getByTestId("plan-adjust-input").fill("请把验证步骤写得更具体");
-  await page.getByTestId("plan-adjust-submit").click();
-  await expect
-    .poll(async () =>
-      page.evaluate(() =>
-        (window as any).__CODELY_E2E__?.events?.some(
-          (item: { type: string; text?: string }) =>
-            item.type === "plan-adjustment-submitted" &&
-            item.text === "请把验证步骤写得更具体",
-        ) ?? false,
-      ),
-    )
-    .toBe(true);
-  await expect
-    .poll(async () =>
-      page.evaluate(() => {
-        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-        return {
-          isPlanApproved: snapshot?.isPlanApproved,
-          planStage: snapshot?.planStage,
-        };
-      }),
-    )
-    .toEqual({
-      isPlanApproved: false,
-      planStage: "design",
-    });
+  // Adjustment is covered by the dedicated test above. Submitting one here
+  // would intentionally invalidate this exact review lease, so approving the
+  // stale bytes afterward would contradict the production contract.
 
   const userCountBeforeApproval = await page.evaluate(
     () => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowUserCount ?? 0,
@@ -349,7 +325,7 @@ test("plan approval quick reply cannot bypass a formal PlanPanel review request"
 });
 
 for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-materialize-qwen"] as const) {
-  test(`${scenario} materializes visible plan but still requires formal review`, async ({ page }) => {
+  test(`${scenario} blocks visible chat Markdown instead of materializing it as a Plan`, async ({ page }) => {
     await page.goto(`/?e2eScenario=${scenario}`);
 
     await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
@@ -373,8 +349,8 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
       )
       .toEqual({
         isPlanApproved: false,
-        planStage: "plan",
-        planArtifactPaths: [".MAIN/plans/plan.md"],
+        planStage: "idle",
+        planArtifactPaths: [],
         taskFlowUserCount: 1,
       });
     await expect(page.getByTestId("plan-approve-button")).toHaveCount(0);
@@ -393,12 +369,12 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
               String(entry.message || "").includes('"planStage":"idle"'),
             ),
             blockedWithoutReviewRequest: entries.some((entry: { source?: string }) =>
-              entry.source === "store.plan_approval_blocked_missing_review_request"),
+              entry.source === "ui.quickReply_plan_approval_blocked"),
           };
         }),
       )
       .toEqual({
-        materialized: true,
+        materialized: false,
         bypassedExecute: false,
         blockedWithoutReviewRequest: true,
       });

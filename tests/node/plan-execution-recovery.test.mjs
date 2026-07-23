@@ -463,6 +463,10 @@ const {
   handleApprovedPlanFinalization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"));
 
+const { evaluateApprovedPlanExecution } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planExecutionEvaluation.ts"),
+);
+
 const {
   handleExecuteConvergencePrompt,
   handleStrictRepeatGuardRecovery,
@@ -698,12 +702,14 @@ function createPlanNoToolHarness(language = "zh") {
   const finalTexts = [];
   const stops = [];
   const phases = [];
+  const streamTokens = [];
   return {
     appended,
     statuses,
     finalTexts,
     stops,
     phases,
+    streamTokens,
     callbacks: {
       getPreferredLanguage: () => language,
       getMessages: () => [],
@@ -712,6 +718,7 @@ function createPlanNoToolHarness(language = "zh") {
       appendMessage: (message) => appended.push(message),
       onStatusChange: (status) => statuses.push(status),
       onAssistantFinalText: (text, replyOptions, meta) => finalTexts.push({ text, replyOptions, meta }),
+      onStreamToken: (token, messageId) => streamTokens.push({ token, messageId }),
       onNonActionableStop: (message, reason) => stops.push({ message, reason }),
       onPlanStageChanged: (stage) => phases.push({ type: "stage", stage }),
     },
@@ -743,6 +750,10 @@ function createPlanNoToolInput(harness, overrides = {}) {
     hasMeaningfulVisibleText: false,
     normalizedVisibleText: "",
     normalizedFinishReason: "stop",
+    protocolViolation: undefined,
+    protocolAllowedTools: [],
+    protocolActualTools: [],
+    assistantMsgId: "assistant-plan-recovery",
     recentPlanToolActivity: [],
     attemptedPlanWriteTargets: [],
     turnInputContextSignals: {},
@@ -862,6 +873,49 @@ test("blocked Plan evidence recovery cannot materialize a later contradictory pr
   assert.equal(harness.stops.length, 1);
   assert.equal(harness.stops[0].reason, "incomplete_plan");
   assert.match(harness.stops[0].message, /change_targets_lack_confirmed_rationale/);
+});
+
+test("complete typed candidates reach typed ingress before blocked and required-tool legacy gates", () => {
+  const common = {
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "blocked",
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: false,
+    currentPlanStage: "requirements",
+    sourceVisibleText: '<plan_candidate>{"schemaVersion":1}</plan_candidate>',
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: false,
+    wasTruncated: false,
+    hasExecutablePlanProposalOptions: false,
+    planReplyOptionsRoutedToArtifact: false,
+    finalReplyOptionsCount: 0,
+    turnIntent: "plan",
+    commandDirectiveAction: null,
+    effectiveToolCallCount: 0,
+    protocolViolation: "required_tool_call_missing",
+  };
+  const typed = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasTypedPlanCandidate: true,
+  });
+  assert.equal(typed.shouldRecoverRequiredToolProtocol, false);
+  assert.equal(typed.shouldMaterializeStructuredProposal, true);
+
+  const legacy = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasTypedPlanCandidate: false,
+  });
+  assert.equal(legacy.shouldRecoverRequiredToolProtocol, false);
+  assert.equal(legacy.shouldMaterializeStructuredProposal, false);
+
+  const legacyGrounding = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    planRuntimePhase: "grounding",
+    hasTypedPlanCandidate: false,
+  });
+  assert.equal(legacyGrounding.shouldRecoverRequiredToolProtocol, true);
+  assert.equal(legacyGrounding.shouldMaterializeStructuredProposal, false);
 });
 
 test("Plan evidence materialization is derived only from typed recovery and closure", () => {
@@ -1044,6 +1098,12 @@ test("plan no-tool decision separates visible candidates from accepted artifacts
     hasReviewablePlanArtifacts: true,
     planArtifactQualityRejected: true,
   });
+  const markdownReplacementCandidate = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasStructuredProposal: false,
+    hasReviewablePlanArtifacts: true,
+    planArtifactQualityRejected: true,
+  });
 
   assert.equal(visibleCandidate.shouldMaterializeStructuredProposal, true);
   assert.equal(visibleCandidate.shouldEnterReview, false);
@@ -1051,6 +1111,89 @@ test("plan no-tool decision separates visible candidates from accepted artifacts
   assert.equal(acceptedArtifact.shouldEnterReview, true);
   assert.equal(replacementCandidate.shouldMaterializeStructuredProposal, true);
   assert.equal(replacementCandidate.shouldEnterReview, false);
+  assert.equal(markdownReplacementCandidate.shouldTryPlanTextMaterialization, true);
+  assert.equal(markdownReplacementCandidate.shouldMaterializeFallbackPlan, true);
+});
+
+test("Plan required-tool violations are quarantined before materialization without spending quality budget", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const transitionText = "现在让我继续读取 main.js 的剩余部分和 toolbar.js：";
+  const decision = resolvePlanNoToolRecoveryDecision({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "grounding",
+    hasStructuredProposal: false,
+    hasReviewablePlanArtifacts: false,
+    currentPlanStage: "requirements",
+    sourceVisibleText: transitionText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    wasTruncated: false,
+    hasExecutablePlanProposalOptions: false,
+    planReplyOptionsRoutedToArtifact: false,
+    finalReplyOptionsCount: 0,
+    turnIntent: "plan",
+    commandDirectiveAction: null,
+    effectiveToolCallCount: 0,
+    protocolViolation: "required_tool_call_not_available",
+  });
+  assert.equal(decision.shouldRecoverRequiredToolProtocol, true);
+  assert.equal(decision.shouldTryPlanTextMaterialization, false);
+  assert.equal(decision.shouldMaterializeFallbackPlan, false);
+
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 2,
+    planRuntimePhase: "grounding",
+    sourceVisibleText: transitionText,
+    streamText: transitionText,
+    normalizedVisibleText: transitionText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    protocolViolation: "required_tool_call_not_available",
+    protocolAllowedTools: ["spawn_subagent"],
+    protocolActualTools: ["read_file"],
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planQualityRejectCount, 0);
+  assert.equal(result.planLastQualityGateReason, "");
+  assert.equal(harness.finalTexts.length, 0);
+  assert.equal(harness.stops.length, 0);
+  assert.deepEqual(harness.streamTokens, [{
+    token: "__ESCALATION_RESET__:plan_tool_protocol",
+    messageId: "assistant-plan-recovery",
+  }]);
+  assert.match(harness.appended.at(-1)?.content || "", /spawn_subagent/);
+});
+
+test("Plan required-tool exhaustion emits a recoverable Plan checkpoint instead of review", async () => {
+  const harness = createPlanNoToolHarness("en");
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    callbacks: {
+      ...harness.callbacks,
+      onNonActionableStop: (message, reason, progress) => {
+        harness.stops.push({ message, reason, progress });
+      },
+    },
+    planRuntimePhase: "grounding",
+    consecutiveNoToolCount: 99,
+    sourceVisibleText: "I will keep inspecting the requested source.",
+    streamText: "I will keep inspecting the requested source.",
+    normalizedVisibleText: "I will keep inspecting the requested source.",
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    protocolViolation: "required_tool_call_missing",
+    protocolAllowedTools: ["read_file"],
+  }));
+
+  assert.equal(result.status, "stopped");
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "missing_tool_loop");
+  assert.equal(
+    harness.stops[0].progress?.recoveryReason,
+    "plan_required_tool_protocol_violation",
+  );
 });
 
 test("visible plan materialization rejection enters typed recovery instead of falling through", async () => {
@@ -1073,7 +1216,7 @@ test("visible plan materialization rejection enters typed recovery instead of fa
     "- 不新增公共 API，只调整内部启动流程。",
     "",
     "## 测试方案",
-    "- 运行前端构建，并手动验证双击文件和工具栏按钮。",
+    "- 运行 `npm run build`，断言构建以退出码 0 完成；桌面入口保留为后续交互复核。",
     "",
     "## 假设与默认值",
     "- 保持编辑器、保存和预览行为不变。",
@@ -1089,7 +1232,7 @@ test("visible plan materialization rejection enters typed recovery instead of fa
       name: "read_file",
       target: "src/main.js",
       status: "succeeded",
-      detail: "前端当前监听 open-file-event",
+      detail: "src/main.js 的 open-file-event 处理器缺失 Markdown 路径转发，必须修复该入口。",
     }],
     waitForPlanApprovalIfNeeded: async () => {
       approvalWaitCalls += 1;
@@ -1100,29 +1243,30 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(result.status, "continue");
   assert.equal(result.planQualityRejectCount, 1);
   assert.equal(result.planArtifactQualityRejected, false);
-  assert.match(result.planLastQualityGateReason, /ungrounded_plan_change_targets:index\.html/);
-  assert.equal(result.planFacetMappingSource, visiblePlan);
+  assert.equal(result.planLastQualityGateReason, "typed_plan_draft_missing");
+  assert.equal(result.planFacetMappingSource, "");
   assert.equal(approvalWaitCalls, 0);
   assert.equal(harness.statuses.includes("pending_review"), false);
   assert.equal(harness.stops.length, 0);
-  assert.ok(harness.phases.some((entry) => entry.phase === "needs_evidence"));
+  assert.ok(harness.phases.some((entry) => entry.phase === "needs_rewrite"));
   assert.equal(harness.appended.at(-2)?.role, "assistant");
   assert.equal(harness.appended.at(-2)?.content, visiblePlan);
-  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
+  assert.match(harness.appended.at(-1)?.content || "", /\[PLAN AUTHORING CONTRACT\]/);
 
-  const needsEvidencePhase = harness.phases.findLast((entry) => entry.phase === "needs_evidence");
-  assert.equal(needsEvidencePhase.qualitySnapshot?.qualityRejectCount, 1);
-  assert.deepEqual(needsEvidencePhase.qualitySnapshot?.missingSections, []);
+  const rewritePhase = harness.phases.findLast((entry) => entry.phase === "needs_rewrite");
+  assert.equal(rewritePhase.qualitySnapshot?.qualityRejectCount, 1);
+  assert.deepEqual(rewritePhase.qualitySnapshot?.missingSections, []);
   let foldedState = createPlanLoopRuntimeState({ workflowMode: "plan", isPlanApproved: false });
   foldedState = applyPlanRuntimePhase(foldedState, {
-    phase: needsEvidencePhase.phase,
-    reason: needsEvidencePhase.reason,
+    phase: rewritePhase.phase,
+    reason: rewritePhase.reason,
   }).state;
   foldedState = applyPlanNoToolRuntimeState(foldedState, result);
-  assert.equal(foldedState.planRuntimePhase, "needs_evidence");
+  assert.equal(foldedState.planRuntimePhase, "needs_rewrite");
   assert.equal(foldedState.planQualityRejectCount, 1);
   assert.equal(foldedState.planArtifactQualityRejected, false);
-  assert.equal(foldedState.planFacetMappingSource, visiblePlan);
+  assert.equal(foldedState.planFacetMappingSource, "");
 
   const nextCandidate = resolvePlanNoToolRecoveryDecision({
     workflowMode: "plan",
@@ -1144,7 +1288,76 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(nextCandidate.shouldMaterializeStructuredProposal, true);
 });
 
-test("closure-incomplete rewrite stays model-owned before exhausting Plan recovery", async () => {
+test("a closure-ready rejected draft is revised before deterministic fallback", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const objective = [
+    "问题：",
+    "1、编辑界面同时显示文件名和未保存文档名。",
+    "2、打开本地 Markdown 后意外进入保存流程。",
+  ].join("\n");
+  const rejectedDraft = [
+    "<proposed_plan>",
+    "# 修复文件打开与编辑状态",
+    "## 已确认证据",
+    "- `src/main.js` 调用保存命令。",
+    "## 关键改动",
+    "- 修改 `src/main.js` 的保存参数。",
+    "## 测试方案",
+    "- 分别验证两个问题。",
+    "</proposed_plan>",
+    "<tool_call>read_file</tool_call>",
+  ].join("\n");
+
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 3,
+    latestUserPromptText: objective,
+    sourceVisibleText: rejectedDraft,
+    streamText: rejectedDraft,
+    normalizedVisibleText: rejectedDraft,
+    hasStructuredProposal: true,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        detail: "src/main.js 的程序化 setValue 不正确地触发 input、标记 isDirty 并进入 scheduleAutoSave。",
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        detail: "src-tauri/src/main.rs 的 save_file_content 参数映射不正确，与前端调用键不一致。",
+      },
+      {
+        name: "read_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        detail: "src/components/editor.js 的 setValue 分派 input 不正确，无法区分加载和用户编辑。",
+      },
+      {
+        name: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+        detail: "src/components/toolbar.js 的文件名映射不正确，重复呈现文件名与未保存文档标题。",
+      },
+    ],
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planQualityRejectCount, 1);
+  assert.equal(result.planLastQualityGateReason, "typed_plan_draft_missing");
+  assert.equal(result.planFacetMappingSource, "");
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.appended.at(-2)?.role, "assistant");
+  assert.equal(harness.appended.at(-2)?.content, rejectedDraft);
+  assert.equal(harness.appended.at(-1)?.role, "user");
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
+});
+
+test("closure-incomplete draft opens one typed evidence transaction and then holds it", async () => {
   const sourceVisibleText = "我会继续分析白屏问题并稍后给出方案。";
   const activity = [{
     name: "read_file",
@@ -1161,6 +1374,7 @@ test("closure-incomplete rewrite stays model-owned before exhausting Plan recove
     normalizedVisibleText: sourceVisibleText,
     hasMeaningfulVisibleText: true,
     sawPlanModeToolActivity: true,
+    planRuntimePhase: "needs_evidence",
     planQualityRejectCount: 1,
     planLastQualityGateReason: "unsupported_hypothesis_as_plan",
     planClosureEvidenceRecoveryIssued: true,
@@ -1175,10 +1389,10 @@ test("closure-incomplete rewrite stays model-owned before exhausting Plan recove
   assert.equal(harness.appended.at(-2)?.role, "assistant");
   assert.equal(harness.appended.at(-2)?.content, sourceVisibleText);
   assert.equal(harness.appended.at(-1)?.role, "user");
-  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
 
-  const exhaustedHarness = createPlanNoToolHarness("zh");
-  const exhausted = await handlePlanNoToolRecovery(createPlanNoToolInput(exhaustedHarness, {
+  const secondRevisionHarness = createPlanNoToolHarness("zh");
+  const secondRevision = await handlePlanNoToolRecovery(createPlanNoToolInput(secondRevisionHarness, {
     iteration: 9,
     latestUserPromptText: "启动软件测试白屏，无任何 UI 显示，找到原因并修复。",
     sourceVisibleText,
@@ -1186,17 +1400,23 @@ test("closure-incomplete rewrite stays model-owned before exhausting Plan recove
     normalizedVisibleText: sourceVisibleText,
     hasMeaningfulVisibleText: true,
     sawPlanModeToolActivity: true,
+    planRuntimePhase: "needs_evidence",
     planQualityRejectCount: recovered.planQualityRejectCount,
     planLastQualityGateReason: recovered.planLastQualityGateReason,
-    planClosureEvidenceRecoveryIssued: true,
+    planClosureEvidenceRecoveryIssued: recovered.planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryObjective: recovered.planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses: recovered.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: recovered.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: recovered.planEvidenceProgressFingerprint,
     planAutoScaffoldPromptIssued: recovered.planAutoScaffoldPromptIssued,
+    planVisibleQualityPromptBudget: recovered.planVisibleQualityPromptBudget,
     recentPlanToolActivity: activity,
   }));
 
-  assert.equal(exhausted.status, "stopped");
-  assert.equal(exhaustedHarness.stops.length, 1);
-  assert.equal(exhaustedHarness.appended.length, 0);
+  assert.equal(secondRevision.status, "continue");
+  assert.equal(secondRevisionHarness.stops.length, 0);
+  assert.equal(secondRevisionHarness.appended.length, 0);
+  assert.equal(secondRevisionHarness.phases.at(-1)?.phase, "needs_evidence");
 });
 
 test("grounded rewrite recovery supersedes stale deterministic evidence without reopening reads", async () => {
@@ -1219,13 +1439,13 @@ test("grounded rewrite recovery supersedes stale deterministic evidence without 
         name: "read_file",
         target: "src/store/detailStore.ts",
         status: "succeeded",
-        detail: "function saveDetail writes the record and updates the detail cache",
+        detail: "saveDetail does not set the visible detail cache after writing the record.",
       },
       {
         name: "read_file",
         target: "src/store/listStore.ts",
         status: "succeeded",
-        detail: "function deleteRecord removes an item and exposes a derived count",
+        detail: "deleteRecord does not set the derived list count after removing an item.",
       },
     ],
   }));
@@ -1253,32 +1473,128 @@ test("grounded rewrite recovery supersedes stale deterministic evidence without 
     planEvidenceRecoveryObjective: result.planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses: result.planEvidenceRecoveryPasses,
     planAutoScaffoldPromptIssued: result.planAutoScaffoldPromptIssued,
+    planVisibleQualityPromptBudget: result.planVisibleQualityPromptBudget,
     recentPlanToolActivity: [
       {
         name: "read_file",
         target: "src/store/detailStore.ts",
         status: "succeeded",
-        detail: "function saveDetail writes the record and updates the detail cache",
+        detail: "saveDetail does not set the visible detail cache after writing the record.",
       },
       {
         name: "read_file",
         target: "src/store/listStore.ts",
         status: "succeeded",
-        detail: "function deleteRecord removes an item and exposes a derived count",
+        detail: "deleteRecord does not set the derived list count after removing an item.",
       },
     ],
   }));
 
-  assert.equal(repeated.status, "stopped");
-  assert.equal(repeatedHarness.stops.length, 1);
-  assert.match(repeatedHarness.stops[0].message, /有界的计划物化恢复/);
+  assert.equal(repeated.status, "continue");
+  assert.equal(repeatedHarness.stops.length, 0);
+  assert.match(repeatedHarness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
   assert.equal(
     repeatedHarness.appended.some((message) => /PLAN_CLOSURE_NEEDS_EVIDENCE/.test(message.content || "")),
     false,
   );
+
+  const exhaustedHarness = createPlanNoToolHarness("zh");
+  const exhausted = await handlePlanNoToolRecovery(createPlanNoToolInput(exhaustedHarness, {
+    iteration: 7,
+    latestUserPromptText: "找到保存后详情未刷新和删除后列表计数未更新的原因并制定整改方案。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: repeated.planQualityRejectCount,
+    planLastQualityGateReason: repeated.planLastQualityGateReason,
+    planClosureEvidenceRecoveryIssued: repeated.planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryObjective: repeated.planEvidenceRecoveryObjective,
+    planEvidenceRecoveryPasses: repeated.planEvidenceRecoveryPasses,
+    planAutoScaffoldPromptIssued: repeated.planAutoScaffoldPromptIssued,
+    planVisibleQualityPromptBudget: repeated.planVisibleQualityPromptBudget,
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/store/detailStore.ts",
+        status: "succeeded",
+        detail: "saveDetail does not set the visible detail cache after writing the record.",
+      },
+      {
+        name: "read_file",
+        target: "src/store/listStore.ts",
+        status: "succeeded",
+        detail: "deleteRecord does not set the derived list count after removing an item.",
+      },
+    ],
+  }));
+
+  assert.equal(exhausted.status, "stopped");
+  assert.equal(exhaustedHarness.stops.length, 1);
+  assert.match(exhaustedHarness.stops[0].message, /有界的计划物化恢复/);
 });
 
-test("accepted artifact pauses the review run even when the same response also looks structured", async () => {
+test("typed rewrite supersedes a stale model-draft evidence objective", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const sourceVisibleText = "我会继续分析当前调用链。";
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 7,
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "missing_plan_required_sections:public_interfaces",
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryObjective: "model_draft",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "switchToTab incorrectly calls setEditorValue and reaches the input listener that schedules auto save.",
+    }],
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planQualityRejectCount, 2);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.planEvidenceRecoveryObjective, "none");
+  assert.equal(harness.phases.at(-1)?.phase, "needs_rewrite");
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
+});
+
+test("a visible candidate quietly holds an active evidence transaction instead of stopping", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const sourceVisibleText = "我会在确认文件打开链路后再给出计划。";
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 8,
+    latestUserPromptText: "找到打开本地 Markdown 后弹出保存窗口的原因并制定修复计划。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planRuntimePhase: "needs_evidence",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "unverified_diagnostic_claim_as_confirmed",
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryObjective: "model_draft",
+    planEvidenceRecoveryPasses: 0,
+    recentPlanToolActivity: [],
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.appended.length, 0);
+  assert.equal(harness.statuses.at(-1), "running");
+  assert.equal(harness.phases.at(-1)?.phase, "needs_evidence");
+});
+
+test("legacy artifact cannot pause a new review run even when the response looks structured", async () => {
   const harness = createPlanNoToolHarness("en");
   let currentStatus = "running";
   let approvalWaitCalls = 0;
@@ -1286,6 +1602,14 @@ test("accepted artifact pauses the review run even when the same response also l
     callbacks: {
       ...harness.callbacks,
       getPlanStage: () => "plan",
+      getPlanArtifacts: () => [{
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        title: "Plan",
+        content: "# Plan\n\n## Summary\nThe accepted artifact remains the review source.",
+        revision: 3,
+        updatedAt: 1,
+      }],
       getStatus: () => currentStatus,
       onStatusChange: (status) => {
         currentStatus = status;
@@ -1302,11 +1626,85 @@ test("accepted artifact pauses the review run even when the same response also l
     },
   }));
 
-  assert.equal(result.status, "stopped");
+  assert.equal(result.status, "continue");
   assert.equal(approvalWaitCalls, 0);
-  assert.equal(currentStatus, "pending_review");
-  assert.equal(harness.statuses.filter((status) => status === "pending_review").length, 1);
-  assert.ok(harness.phases.some((entry) => entry.phase === "review_ready"));
+  assert.equal(currentStatus, "running");
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.stops.length, 0);
+  assert.ok(harness.phases.some((entry) =>
+    entry.phase === "needs_rewrite" &&
+    entry.reason === "typed_plan_review_authority:primary_plan_not_typed"
+  ));
+  assert.match(harness.appended.at(-1)?.content || "", /\[PLAN AUTHORING CONTRACT\]/);
+});
+
+test("review handoff without a typed primary artifact continues typed recovery", async () => {
+  const harness = createPlanNoToolHarness("en");
+  let currentStatus = "running";
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    callbacks: {
+      ...harness.callbacks,
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [],
+      getStatus: () => currentStatus,
+      onStatusChange: (status) => {
+        currentStatus = status;
+        harness.statuses.push(status);
+      },
+      onNonActionableStop: (message, reason, progress) => {
+        harness.stops.push({ message, reason, progress });
+      },
+    },
+    hasReviewablePlanArtifacts: true,
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(currentStatus, "running");
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.stops.length, 0);
+  assert.ok(harness.phases.some((entry) =>
+    entry.phase === "needs_rewrite" &&
+    entry.reason === "typed_plan_review_authority:primary_plan_missing"
+  ));
+  assert.match(harness.appended.at(-1)?.content || "", /\[PLAN AUTHORING CONTRACT\]/);
+});
+
+test("legacy artifact cannot manufacture review state from a stale runtime stage", async () => {
+  const harness = createPlanNoToolHarness("en");
+  let currentStatus = "running";
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    callbacks: {
+      ...harness.callbacks,
+      getPlanStage: () => "requirements",
+      getPlanArtifacts: () => [{
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        title: "Plan",
+        content: "# Plan\n\n## Summary\nA stale artifact must not manufacture review state.",
+        revision: 1,
+        updatedAt: 1,
+      }],
+      getStatus: () => currentStatus,
+      onStatusChange: (status) => {
+        currentStatus = status;
+        harness.statuses.push(status);
+      },
+      onNonActionableStop: (message, reason, progress) => {
+        harness.stops.push({ message, reason, progress });
+      },
+    },
+    hasReviewablePlanArtifacts: true,
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(currentStatus, "running");
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.stops.length, 0);
+  assert.ok(harness.phases.some((entry) =>
+    entry.phase === "needs_rewrite" &&
+    entry.reason === "typed_plan_review_authority:primary_plan_not_typed"
+  ));
+  assert.match(harness.appended.at(-1)?.content || "", /\[PLAN AUTHORING CONTRACT\]/);
 });
 
 test("plan no-tool recovery prompts continuation when planning ends with no visible output", async () => {
@@ -1317,8 +1715,8 @@ test("plan no-tool recovery prompts continuation when planning ends with no visi
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.equal(harness.appended.length, 1);
   assert.match(harness.appended[0].content, /current plan has not reached an executable stage/i);
-  assert.match(harness.appended[0].content, /<proposed_plan>/);
-  assert.match(harness.appended[0].content, /runtime.*materializes?/i);
+  assert.match(harness.appended[0].content, /\[PLAN AUTHORING CONTRACT\]/);
+  assert.match(harness.appended[0].content, /runtime.*validates and renders/i);
   assert.equal(harness.statuses.length, 0);
 });
 
@@ -1341,8 +1739,9 @@ test("rejected plan artifact cannot enter review on the next no-tool iteration",
   assert.equal(result.status, "continue");
   assert.equal(approvalWaitCalls, 0);
   assert.equal(harness.statuses.includes("pending_review"), false);
-  assert.match(harness.appended.at(-1)?.content || "", /visible `<proposed_plan>`/i);
-  assert.match(harness.appended.at(-1)?.content || "", /runtime validates and materializes/i);
+  assert.match(harness.appended.at(-1)?.content || "", /complete typed graph/i);
+  assert.match(harness.appended.at(-1)?.content || "", /\[PLAN AUTHORING CONTRACT\]/);
+  assert.match(harness.appended.at(-1)?.content || "", /runtime validates and renders/i);
 });
 
 test("plan closure evidence recovery prompt keeps planning read-only and targeted", () => {
@@ -1357,7 +1756,7 @@ test("plan closure evidence recovery prompt keeps planning read-only and targete
   assert.match(zh, /2\. 删除后列表计数没有更新/);
   assert.doesNotMatch(zh, /保存后详情页仍显示旧标题/);
   assert.match(zh, /只做一次能够把它绑定到具体源码/);
-  assert.match(zh, /每个用户编号分面都必须映射到已确认证据、具体改动和可执行验证/);
+  assert.match(zh, /每个用户编号分面都必须映射到已确认证据、具体改动\/决策和可执行验证/);
   assert.match(zh, /批准前不要修改源码/);
   assert.match(en, /2\. 删除后列表计数没有更新/);
   assert.match(en, /exactly one targeted read\/search/);
@@ -1533,6 +1932,72 @@ test("approved plan finalization marks the plan completed when all evidence is t
   assert.deepEqual(harness.taskPhases, [{ phase: "DONE", extra: { reason: "plan_evidence_complete", iteration: 7, pendingUserValidation: 0 } }]);
   assert.deepEqual(harness.progress, [{ phase: "completed", overrides: undefined }]);
   assert.deepEqual(harness.stages, ["completed"]);
+  assert.equal(evaluateApprovedPlanExecution({
+    tasks: completeAudit.tasks,
+    evidenceLedger: [...evidenceLedger, {
+      id: "validation",
+      kind: "cmd",
+      value: "npm test",
+      target: "npm test",
+      sourceTool: "run_command",
+      createdAt: 3,
+    }],
+    availableToolNames: new Set(["read_file", "run_command"]),
+  }).completionAllowed, true);
+});
+
+test("approved plan finalization ignores a stale completed snapshot when current task evidence is incomplete", () => {
+  const harness = createApprovedPlanNoToolHarness("en");
+  const requiredTask = {
+    id: "required-source",
+    text: "Update the required source",
+    status: "completed",
+    evidenceStatus: "satisfied",
+    evidence: [{ kind: "file", value: "src/required.ts" }],
+  };
+  const staleAudit = createApprovedPlanNoToolAudit({
+    tasks: [requiredTask],
+    completedCount: 1,
+    totalCount: 1,
+    remainingTasks: [],
+    automationComplete: true,
+    allTrustedComplete: true,
+    acceptedCompletion: true,
+  });
+  const result = handleApprovedPlanFinalization({
+    callbacks: {
+      ...harness.callbacks,
+      getPlanTasks: () => [requiredTask],
+      getPlanExecutionEvidenceLedger: () => [{
+        id: "unrelated-mutation",
+        kind: "file",
+        value: "src/unrelated.ts",
+        target: "src/unrelated.ts",
+        sourceTool: "apply_patch",
+        createdAt: 1,
+      }, {
+        id: "validation",
+        kind: "cmd",
+        value: "npm test",
+        target: "npm test",
+        sourceTool: "run_command",
+        createdAt: 2,
+      }],
+    },
+    activeProfile: "cloud",
+    iteration: 8,
+    approvedPlanAuditForNoTool: staleAudit,
+    rejectedCompletionClaim: false,
+    availableToolNames: new Set(["read_file", "run_command"]),
+    consecutiveNoToolCount: 0,
+    emitTaskOrchestratorPhase: (phase, extra) => harness.taskPhases.push({ phase, extra }),
+    emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
+  });
+
+  assert.equal(result.status, "continue");
+  assert.deepEqual(harness.stages, []);
+  assert.deepEqual(harness.taskPhases, []);
+  assert.match(harness.appended.at(-1)?.content || "", /Next priority tasks/);
 });
 
 test("approved plan finalization does not publish completed before post-mutation validation", () => {
@@ -2531,6 +2996,57 @@ test("approved plan convergence activates mutation recovery for an unfinished so
   assert.equal(activations.length, 1);
   assert.equal(activations[0][0], "mutation_first");
   assert.equal(activations[0][1], "execute_convergence_prompt");
+  assert.equal(activations[0][2].resetExpectedTarget, true);
+  assert.equal(appended.length, 1);
+});
+
+test("direct Execute converges at the same bounded checkpoint and validates existing mutations", () => {
+  const appended = [];
+  const activations = [];
+  const callbacks = {
+    appendMessage: (message) => appended.push(message),
+    getIsPlanApproved: () => false,
+    getCurrentTurnId: () => "turn-direct",
+    getPlanTasks: () => [],
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "direct-write",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "apply_patch",
+      transactionId: "turn-direct",
+      createdAt: 1,
+    }],
+  };
+
+  const beforeBoundary = handleExecuteConvergencePrompt({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 11,
+    effectiveMaxIterations: 50,
+    usedExecuteConvergencePrompt: false,
+    recentToolActivity: [],
+    executeRecoveryMode: "normal",
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(beforeBoundary.usedExecuteConvergencePrompt, false);
+
+  const atBoundary = handleExecuteConvergencePrompt({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 12,
+    effectiveMaxIterations: 50,
+    usedExecuteConvergencePrompt: false,
+    recentToolActivity: [],
+    executeRecoveryMode: "normal",
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(atBoundary.usedExecuteConvergencePrompt, true);
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0][0], "validation_only");
+  assert.equal(activations[0][2].resetExpectedTarget, true);
   assert.equal(appended.length, 1);
 });
 
@@ -2647,12 +3163,15 @@ test("approved plan no-progress recovery uses the unified execution contract", (
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
     "utf8",
   );
-  assert.match(toolCallPlanningSource, /const initialBaseIterationAllTools = recoveryIterationAllTools/);
+  assert.match(
+    toolCallPlanningSource,
+    /const initialBaseIterationAllTools =[\s\S]*?workflowMode === "plan"[\s\S]*?recoveryIterationAllTools/,
+  );
   assert.match(toolCallPlanningSource, /recoveryToolSurface: recoveryActionContract\.surfaceDescription/);
   assert.doesNotMatch(toolCallPartitioningSource, /patch_recovery_read_cache_bypass/);
 });
 
-test("approved source task consumes one initial read lease then becomes mutation-only", () => {
+test("approved source task consumes one initial read lease then opens mutation only", () => {
   const initial = resolveApprovedPlanInitialExecutionRecovery([{
     id: "edit-main",
     text: "Modify the backend",
@@ -2666,7 +3185,9 @@ test("approved source task consumes one initial read lease then becomes mutation
     forcedState: initial,
   });
   const initialContract = resolveExecuteRecoveryActionContract(state.mode, state);
-  assert.deepEqual([...initialContract.allowedToolNames], ["read_file"]);
+  assert.equal(initialContract.allowedToolNames.has("read_file"), true);
+  assert.equal(initialContract.allowedToolNames.has("apply_patch"), false);
+  assert.equal(initialContract.allowedToolNames.has("run_command"), false);
 
   const observed = transitionExecuteRecoveryRuntimeState(state, {
     freshReadTarget: "src/main.rs",
@@ -2775,13 +3296,20 @@ test("approved plan recovery keeps watchdogs and derives tool scope from the act
   const streamInvocationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"), "utf8");
   const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
 
-  assert.match(source, /APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS\s*=\s*90_000/);
-  assert.match(source, /approvedPlanRecoveryStreamMaxElapsedMs:\s*APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS/);
+  assert.match(source, /EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS\s*=\s*120_000/);
+  assert.match(
+    source,
+    /executeRecoveryStreamMaxElapsedMs:\s*EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS/,
+  );
   assert.match(streamInvocationSource, /maxStreamElapsedMs:\s*minPositive\([\s\S]*?recoveryStreamMaxElapsedMs/);
-  assert.match(streamInvocationSource, /boundedMaxElapsedMs[\s\S]*?120_000/);
-  assert.match(streamInvocationSource, /APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS\s*=\s*45_000/);
+  assert.match(
+    streamInvocationSource,
+    /boundedMaxElapsedMs[\s\S]*?EXECUTE_STREAM_MAX_ELAPSED_MS/,
+  );
+  assert.match(streamInvocationSource, /EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS\s*=\s*90_000/);
+  assert.match(streamInvocationSource, /EXECUTE_STREAM_MAX_ELAPSED_MS\s*=\s*120_000/);
   assert.match(streamInvocationSource, /recoveryActionContract[\s\S]*?resolveRecoveryToolChoice/);
-  assert.match(streamInvocationSource, /maxStreamElapsedLabel:\s*"approved_plan_recovery"/);
+  assert.match(streamInvocationSource, /maxStreamElapsedLabel:\s*"execute_recovery"/);
   assert.match(source, /prepareIterationStreamRequest\(\{/);
   assert.match(iterationStreamPreparationSource, /resolveIterationToolSurface\(\{/);
   assert.match(toolCallPlanningSource, /logAgentEvent\("tool_surface_decision"/);

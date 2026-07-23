@@ -71,7 +71,7 @@ const planDraftWrite = {
   arguments: JSON.stringify({ path: ".MAIN/plans/plan.md", content: "# Plan" }),
 };
 
-test("tool progress routing allows unapproved plan draft artifact writes", () => {
+test("tool progress routing quarantines unapproved runtime-owned plan artifact writes", () => {
   assert.equal(
     isAllowedUnapprovedPlanDraftMutationCallForRuntime({
       call: planDraftWrite,
@@ -79,7 +79,7 @@ test("tool progress routing allows unapproved plan draft artifact writes", () =>
       isPlanApproved: false,
       workspace: workspaceRoot,
     }),
-    true,
+    false,
   );
 
   const decision = resolveToolProgressRouting({
@@ -91,9 +91,9 @@ test("tool progress routing allows unapproved plan draft artifact writes", () =>
     visibleAssistantText: "",
   });
 
-  assert.equal(decision.progressEligibleToolCalls.length, 1);
-  assert.equal(decision.unsupportedToolCalls.length, 0);
-  assert.equal(decision.hasSuppressedUnsupportedPlanToolCalls, false);
+  assert.equal(decision.progressEligibleToolCalls.length, 0);
+  assert.deepEqual(decision.unsupportedToolCalls, [planDraftWrite]);
+  assert.equal(decision.hasSuppressedUnsupportedPlanToolCalls, true);
 });
 
 test("tool progress routing suppresses unsupported unapproved plan tool calls", () => {

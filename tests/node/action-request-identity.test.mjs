@@ -330,12 +330,17 @@ test("runtime restore revives only exact resumable action checkpoints", () => {
   assert.equal(actionRequestRestore.restorePendingActionRequest({
     request: planReview,
     runOwner: owner,
-    planIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
+    planReviewIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
   })?.requestId, planReview.requestId);
   assert.equal(actionRequestRestore.restorePendingActionRequest({
     request: planReview,
     runOwner: owner,
-    planIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
+    planIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
+  }), null, "a generic legacy identity cannot restore a Plan review control");
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: planReview,
+    runOwner: owner,
+    planReviewIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
   }), null);
 
   const confirmation = actionRequests.buildGoalConfirmationActionRequest({
@@ -1220,6 +1225,8 @@ test("plan approval identity changes whenever a reviewable artifact changes", ()
     artifact.path,
     String(artifact.revision),
     artifact.content,
+    "legacy-no-candidate",
+    "",
   ].join("\u001f");
   assert.equal(
     first.artifactHash,

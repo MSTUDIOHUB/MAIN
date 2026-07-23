@@ -1,6 +1,7 @@
 import { sanitizePlanArtifactContent } from "./sanitize";
 import {
   detectPlanArtifactKind,
+  deriveRuntimePlanTasksFromArtifacts,
   extractPlanTasks,
   getPlanArtifactTitle,
   validateActionablePlanArtifact,
@@ -84,7 +85,17 @@ export async function hydratePlanArtifactsFromReader(
   }
 
   const taskArtifact = artifacts.find((artifact) => artifact.kind === "tasks" || artifact.kind === "bugfix");
-  const tasks = taskArtifact ? extractPlanTasks(taskArtifact.content) : [];
+  const explicitTasks = taskArtifact ? extractPlanTasks(taskArtifact.content) : [];
+  const legacyTasks = explicitTasks.length > 0
+    ? explicitTasks
+    : deriveRuntimePlanTasksFromArtifacts(artifacts, { language });
+  if (!artifacts.some((artifact) => artifact.candidate)) {
+    const owner = artifacts.find((artifact) => artifact.kind === "plan");
+    // Presence, including an empty projection, is the explicit one-time
+    // legacy-import authority. New Plan writes may never infer this marker.
+    if (owner) owner.legacyTaskProjection = legacyTasks;
+  }
+  const tasks = legacyTasks;
 
   return {
     artifacts: artifacts.sort((a, b) => artifactSortOrder(a.kind) - artifactSortOrder(b.kind)),

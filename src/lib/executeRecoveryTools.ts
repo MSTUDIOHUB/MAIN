@@ -358,10 +358,6 @@ export type RecoveryToolCallRequirement =
   | { kind: "required_any" }
   | { kind: "required_named"; toolName: string };
 
-export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
-  "code_ast_query",
-]);
-
 export const EXECUTE_RECOVERY_PATCH_READ_TOOLS = new Set([
   "read_file",
 ]);
@@ -385,20 +381,39 @@ export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
   "run_command",
 ]);
 
+export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
+
 /**
- * A validation transaction without a pinned finite command must retain a
- * truthful discovery surface. In particular, `run_command` cannot be the only
- * advertised action while the runtime has supplied no admissible command.
- * Manifest/source reads may discover a real finite command, but mutation stays
- * unavailable until that exact retained validation fails. The bounded
- * validation-to-mutation reopen owns only that evidence-backed transition.
+ * Broad workspace surface retained only for objective auditing. An ordinary
+ * recovery transaction uses the phase-specific sets below: once runtime has
+ * advanced to mutation, another unleased search/read is not a valid adjacent
+ * action and must not remain selectable.
  */
-export const EXECUTE_RECOVERY_UNPINNED_VALIDATION_TOOLS = new Set([
+export const EXECUTE_RECOVERY_STABLE_WORKSPACE_TOOLS = new Set([
+  "glob_search",
+  "grep_search",
+  "code_ast_query",
+  "find_symbol_references",
+  "get_file_outline",
+  "read_file",
+  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
+  "git_status",
+  "git_diff",
   "run_command",
+]);
+
+export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
+  "glob_search",
+  "grep_search",
+  "code_ast_query",
+  "find_symbol_references",
+  "get_file_outline",
   "read_file",
 ]);
 
-export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
+const EXECUTE_RECOVERY_TARGETED_READ_TOOLS = new Set([
+  "read_file",
+]);
 
 const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
   "read_pty_buffer",
@@ -429,10 +444,6 @@ const EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS = new Set([
   "execute_command",
 ]);
 
-const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set(
-  EXECUTE_RECOVERY_MUTATION_TOOLS,
-);
-
 const EXECUTE_RECOVERY_RECONCILE_SERVER_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
   ...EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS,
@@ -445,26 +456,24 @@ export const EXECUTE_RECOVERY_CORE_TOOLS = new Set([
 ]);
 
 /**
- * One capability owns both the next action and its real schema surface. This
- * prevents a model from selecting a visible-but-guaranteed-to-be-deferred
- * tool for six rounds. A consumed read lease closes read_file immediately;
- * mutation never carries an ambient reread capability.
+ * Every recovery capability owns its executable surface. This turns the
+ * runtime state machine into an actual control boundary instead of a prompt
+ * preference: context may discover/read, mutation may write, and validation
+ * may run a finite check. A fresh read is reopened only through an explicit
+ * one-shot read lease.
  */
 function resolveRecoveryAllowedToolNames(
   nextCapability: ExecuteRecoveryNextCapability,
-  options: { hasPinnedFiniteValidation?: boolean } = {},
 ): ReadonlySet<string> {
   switch (nextCapability) {
     case "targeted_read":
-      return EXECUTE_RECOVERY_PATCH_READ_TOOLS;
+      return EXECUTE_RECOVERY_TARGETED_READ_TOOLS;
     case "targeting":
       return EXECUTE_RECOVERY_TARGETING_TOOLS;
     case "mutation":
-      return EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS;
+      return EXECUTE_RECOVERY_MUTATION_TOOLS;
     case "validation":
-      return options.hasPinnedFiniteValidation
-        ? EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS
-        : EXECUTE_RECOVERY_UNPINNED_VALIDATION_TOOLS;
+      return EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS;
     case "browser_diagnostic":
       return EXECUTE_RECOVERY_BROWSER_DIAGNOSTIC_CONTRACT_TOOLS;
     case "desktop_validation":
@@ -486,17 +495,16 @@ function resolveRecoveryAllowedToolNames(
 
 function resolveRecoveryToolCallRequirement(
   nextCapability: ExecuteRecoveryNextCapability,
-  options: { hasPinnedFiniteValidation?: boolean } = {},
 ): RecoveryToolCallRequirement {
-  const toolName = nextCapability === "targeted_read"
-    ? "read_file"
-    : nextCapability === "browser_validation"
+  const toolName = nextCapability === "browser_validation"
     ? "browser_evaluate"
     : nextCapability === "desktop_validation"
     ? "computer_use"
     : nextCapability === "launch_long_process"
     ? "execute_command"
-    : nextCapability === "validation" && options.hasPinnedFiniteValidation
+    : nextCapability === "targeted_read"
+    ? "read_file"
+    : nextCapability === "validation"
     ? "run_command"
     : null;
   return toolName
@@ -676,9 +684,15 @@ export function resolveExecuteRecoveryActionContract(
       phase: "normal",
       nextRequiredCapability: "any",
       allowTargetedFileRead: true,
-      allowsAllTools: true,
-      allowedToolNames: new Set<string>(),
-      surfaceDescription: "objective-audit:full-surface",
+      // Closure auditing may discover another ordinary workspace repair, but
+      // it must not reopen long-process, PTY, browser, or desktop lifecycles
+      // without a concrete checkpoint. Those capabilities each have their own
+      // evidence-owned transition. Keeping only the stable workspace surface
+      // prevents an already-successful finite validation from drifting into
+      // an unrelated interactive terminal loop.
+      allowsAllTools: false,
+      allowedToolNames: EXECUTE_RECOVERY_STABLE_WORKSPACE_TOOLS,
+      surfaceDescription: "objective-audit:workspace-core",
       toolCallRequirement: { kind: "optional" },
     };
   }
@@ -721,12 +735,7 @@ export function resolveExecuteRecoveryActionContract(
     nextRequiredCapability = "validation";
   }
 
-  const hasPinnedFiniteValidation = Boolean(
-    context.decisionCheckpoint?.pendingFiniteValidation?.command?.trim(),
-  );
-  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability, {
-    hasPinnedFiniteValidation,
-  });
+  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability);
   return {
     ...shared,
     modeLabel: mode,
@@ -737,13 +746,8 @@ export function resolveExecuteRecoveryActionContract(
     allowTargetedFileRead: allowedToolNames.has("read_file"),
     allowsAllTools: false,
     allowedToolNames,
-    surfaceDescription:
-      nextRequiredCapability === "validation" && !hasPinnedFiniteValidation
-        ? "capability:validation-discovery"
-        : `capability:${nextRequiredCapability}`,
-    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability, {
-      hasPinnedFiniteValidation,
-    }),
+    surfaceDescription: `capability:${nextRequiredCapability}`,
+    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability),
   };
 }
 
@@ -1281,20 +1285,20 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     calls.length === 1 &&
     calls[0]?.name === "apply_patch" &&
     /^(?:workspace patch)?$/i.test(String(calls[0]?.target || "").trim());
-  // A concrete current-target mutation is already actionable and always wins
-  // over a read lease emitted in the same model batch. Normal permission and
-  // mutation-preflight checks still run after this serialization decision.
-  const mutationMayPreempt =
-    contract.nextRequiredCapability === "mutation" ||
-    contract.nextRequiredCapability === "targeted_read";
+  // Select only the capability owned by the current runtime checkpoint.
+  // Adjacent workspace operations are deliberately not a fallback here:
+  // allowing an unleased read during mutation made the phase boundary
+  // advisory and let repeated-read loops run past the recovery budget.
+  const mutationMayPreempt = contract.nextRequiredCapability === "mutation";
   const matchingMutation = mutationMayPreempt
     ? scopedCalls.find((call) => EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)) ||
       (soleUnresolvedPatch ? calls[0] : undefined)
     : undefined;
   const matchingRead = scopedEligible.find((call) => call.name === "read_file");
   const matchingTargeting = scopedEligible.find((call) =>
+    call.name !== "read_file" &&
     EXECUTE_RECOVERY_TARGETING_TOOLS.has(call.name)
-  );
+  ) || matchingRead;
   const matchingJoin = scopedEligible.find((call) => call.name === "wait_subagents");
   const matchingValidation = scopedEligible.find((call) =>
     call.name === "run_command" &&
@@ -1335,10 +1339,9 @@ export function resolveExecuteRecoveryBatchDecision(input: {
         return undefined;
     }
   })();
-  // The current transaction action always wins. Coordination is a fallback
-  // only when the phase capability is absent; it must not starve a mutation or
-  // the one precise leased read emitted in the same model batch.
-  const selected = matchingMutation || matchingNextCapability || matchingJoin;
+  const selected =
+    matchingNextCapability ||
+    matchingJoin;
   return {
     active: true,
     phase,
@@ -1428,8 +1431,9 @@ export function buildExecutionActionContractCard(input: {
           `validationEvidence=${evidenceLine}`,
           ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
           `availableTools=${tools}`,
-          "这是动态 objective closure audit，完整工具面已恢复。逐项核对用户要求与当前 revision 的真实 mutation + validation 证据。",
+          "这是动态 objective closure audit，稳定工作区工具面已恢复。逐项核对用户要求与当前 revision 的真实 mutation + validation 证据。",
           "若仍有未完成工作，立即调用对应的具体工具；切换到新文件目标时先 read_file，再修改并重新验证。",
+          "长驻进程、PTY、浏览器或桌面能力只能由对应的具体生命周期检查点重新开启；不要用交互终端重复已经成功的有限验证。",
           "只有全部 objective outcome 均已覆盖时才不调用工具，并直接输出面向用户的最终结论总结。不要为了结束审查而虚构工具调用。",
         ].join("\n")
       : [
@@ -1439,8 +1443,9 @@ export function buildExecutionActionContractCard(input: {
           `validationEvidence=${evidenceLine}`,
           ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
           `availableTools=${tools}`,
-          "This is a dynamic objective-closure audit with the full tool surface restored. Check every requested outcome against real mutation and validation evidence from the current revision.",
+          "This is a dynamic objective-closure audit with the stable workspace surface restored. Check every requested outcome against real mutation and validation evidence from the current revision.",
           "If work remains, call the concrete tool now; when switching to a new file target, read_file first, then mutate and validate again.",
+          "Long-process, PTY, browser, and desktop capabilities reopen only from their concrete lifecycle checkpoints; do not repeat an already-successful finite validation through an interactive terminal.",
           "Only when every objective outcome is covered, make no tool call and output the final user-facing conclusion summary. Do not invent a tool call merely to end the audit.",
         ].join("\n");
   }
@@ -1480,10 +1485,10 @@ export function buildExecutionActionContractCard(input: {
           ]
         : []),
       pendingFiniteValidation && contract.nextRequiredCapability === "validation"
-        ? "只用 run_command 在 validationCwd 重新运行 validationCommand；不要替换验收边界。"
+        ? "用 run_command 在 validationCwd 重新运行 validationCommand；该命令是当前唯一验收边界。若失败，运行时会依据结构化失败结果另行开启修复阶段。"
         : contract.nextRequiredCapability === "validation"
-        ? "当前没有可冒充为验收边界的固定命令。优先用 read_file 检查 package.json、Cargo.toml 等可信清单，或从已有上下文选择一条真实、有限的 run_command；在精确校验失败并保留检查点之前不要请求修改工具。不要用 Shell 文件读取替代 read_file。"
-        : "只调用 availableTools 中能够完成 next 的一个工具；不要重启诊断或请求当前工具面之外的能力。",
+        ? "从已保留的清单与任务上下文选择一条真实、有限的 run_command。当前阶段不开放读取或修改；失败后由运行时结构化切回修复。"
+        : "只选择 availableTools 中能完成 next 的工具；相邻能力不会在当前阶段隐式开放。不要重启宽泛诊断。",
     ].join("\n");
   }
   return [
@@ -1519,10 +1524,10 @@ export function buildExecutionActionContractCard(input: {
         ]
       : []),
     pendingFiniteValidation && contract.nextRequiredCapability === "validation"
-      ? "Use run_command in validationCwd to rerun validationCommand; do not substitute a different acceptance boundary."
+      ? "Use run_command in validationCwd to rerun validationCommand; it is the only acceptance boundary for this phase. A structured failure lets runtime reopen repair separately."
       : contract.nextRequiredCapability === "validation"
-      ? "No command is pinned, so do not invent an acceptance boundary. First use read_file to inspect a trusted manifest such as package.json or Cargo.toml, or choose one real finite run_command from retained context. Do not request a mutation tool until that exact validation fails and its checkpoint is retained. Never substitute a shell file read for read_file."
-      : "Call one tool from availableTools that satisfies next; do not restart diagnosis or request a capability outside the current surface.",
+      ? "Choose one real finite run_command from the retained manifest and task context. Reads and edits are closed in this phase; a structured failure lets runtime reopen repair."
+      : "Choose only an availableTools action that satisfies next. Adjacent capabilities are not implicitly open in this phase. Do not restart broad diagnosis.",
   ].join("\n");
 }
 
@@ -1819,7 +1824,7 @@ export function buildExecuteValidationRecoveryPrompt(input: {
       tools ? `Available validation tools: ${tools}.` : "",
       recent ? `Recent tool activity: ${recent}.` : "",
       "The next evidence priority is one successful validation result: use a finite command for build/test/lint evidence or browser validation for DOM/screenshot evidence.",
-      "The request schema now exposes only tools owned by this validation checkpoint. A real validation failure may transition the contract back to diagnosis or repair; do not use unrelated tools to bypass the current obligation. If automated validation is impossible, state the exact blocker without claiming completion.",
+      "Validation is the only open capability in this phase. Reads and edits reopen only through a structured validation failure or a distinct runtime-owned objective transition. If automated validation is impossible, state the exact blocker without claiming completion.",
     ].filter(Boolean).join("\n");
   }
 
@@ -1830,7 +1835,7 @@ export function buildExecuteValidationRecoveryPrompt(input: {
     tools ? `本轮可用验证工具：${tools}。` : "",
     recent ? `最近工具活动：${recent}。` : "",
     "下一证据优先级是一条成功验证结果：构建/测试/lint 使用有限命令，页面 DOM/截图使用浏览器验证。",
-    "本轮请求只暴露当前验证检查点拥有的工具。真实验证失败后，契约可以再转回诊断或修复；不要用无关工具绕过当前义务。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
+    "验证是当前阶段唯一开放能力。读取和修改只能由结构化验证失败或新的运行时 objective 转换重新开启。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
   ].filter(Boolean).join("\n");
 }
 
@@ -1854,7 +1859,7 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     allowAlternativeCommand
       ? "No exact command was reviewed for this runtime-owned post-mutation check. The next required evidence is one compatible finite command for the actual project runtime and source format."
       : `The approved Plan requires this exact command evidence: ${requiredCommand}. Correct its prerequisites or invocation, then retry that command; a different command cannot replace the reviewed acceptance boundary.`,
-    "This checkpoint exposes the finite-command capability only. A real source failure may open a later repair transaction, but reads, edits, long-running commands, and PTY observations cannot replace this command evidence. Do not infer that a successful edit was reverted merely because the command invocation was invalid.",
+    "This phase exposes only the finite command boundary. A structured source/test failure reopens a separate targeting or repair transaction; reads and edits are not adjacent validation actions. Long-running commands and PTY observations remain outside this boundary. Do not infer that a successful edit was reverted merely because the command invocation was invalid.",
     allowAlternativeCommand
       ? "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0."
       : `Use stdout, stderr, and exitCode to diagnose and correct the failure, but keep \`${requiredCommand}\` as the acceptance boundary. Retry that exact command and do not claim completion until that command returns exitCode 0.`,

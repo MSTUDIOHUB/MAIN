@@ -19,7 +19,12 @@ import {
   type PlanExecutionEvidenceEntry,
   type PlanTask,
 } from "../lib/workflowModels";
-import { assessPlanExecutableValidation } from "../lib/planExecutableValidation";
+import {
+  assessPlanExecutableValidation,
+  isExecutablePlanValidationTask,
+} from "../lib/planExecutableValidation";
+import { derivePlanTasksFromCandidate } from "../lib/planContract";
+import { validatePlanArtifactCandidateIntegrity } from "../lib/planArtifactRestore";
 
 export type ApprovedPlanExecutionReadinessReason =
   | "missing_reviewable_plan_artifact"
@@ -39,6 +44,23 @@ export interface ApprovedPlanExecutionReadiness {
   concreteMutationTaskCount: number;
   executableValidationTaskCount: number;
   taskCount: number;
+}
+
+function deriveApprovedPlanRuntimeTasks(
+  artifacts: PlanArtifact[],
+  language: "zh" | "en",
+): PlanTask[] {
+  const typedTasks = artifacts.flatMap((artifact) =>
+    artifact.candidate?.state === "sealed"
+      ? derivePlanTasksFromCandidate(artifact.candidate)
+      : []
+  );
+  if (typedTasks.length > 0) return typedTasks;
+  const importedTasks = artifacts.flatMap((artifact) => artifact.legacyTaskProjection || []);
+  if (importedTasks.length > 0) return importedTasks;
+  // Persisted plans created before the typed contract are imported once at
+  // this boundary. New materialized plans never reparse Markdown here.
+  return deriveRuntimePlanTasksFromArtifacts(artifacts, { language });
 }
 
 const LEADING_READ_OR_VALIDATION_INTENT_RE =
@@ -120,6 +142,14 @@ function isConcreteMutationOrDeliverableTask(task: PlanTask): boolean {
   return isPlanTaskSourceMutationObligation(task) && hasExplicitMutationIntent(task.text);
 }
 
+function isTypedCandidateMutationTask(task: PlanTask): boolean {
+  if (task.executionKind !== "mutation" && task.executionKind !== "deliverable") return false;
+  return (task.evidence || []).some((item) =>
+    (item.kind === "file" || item.kind === "deliverable") &&
+    Boolean(String(item.value || "").trim())
+  );
+}
+
 function failedPlanExecutionReadiness(input: Omit<ApprovedPlanExecutionReadiness, "ok" | "stopClass">): ApprovedPlanExecutionReadiness {
   return {
     ok: false,
@@ -130,16 +160,15 @@ function failedPlanExecutionReadiness(input: Omit<ApprovedPlanExecutionReadiness
 
 /**
  * Defense-in-depth check at the approval boundary. The plan artifact may have
- * been persisted or restored since materialization, so approval must re-run
- * semantic validation and prove that the derived task projection is capable
- * of executing the reviewed plan before a child run is created.
+ * been persisted or restored since materialization, so approval revalidates
+ * typed integrity or the legacy/native semantic contract, then proves that
+ * the authoritative task projection can execute before creating a child run.
  */
 export function evaluateApprovedPlanExecutionReadiness(input: {
   planArtifacts: PlanArtifact[];
   executionPlanTasks: PlanTask[];
 }): ApprovedPlanExecutionReadiness {
   const reviewableArtifacts = getReviewablePlanArtifacts(input.planArtifacts);
-  const taskCount = input.executionPlanTasks.length;
   if (reviewableArtifacts.length === 0) {
     return failedPlanExecutionReadiness({
       reason: "missing_reviewable_plan_artifact",
@@ -148,56 +177,68 @@ export function evaluateApprovedPlanExecutionReadiness(input: {
       requiresExecutableValidation: false,
       concreteMutationTaskCount: 0,
       executableValidationTaskCount: 0,
-      taskCount,
+      taskCount: input.executionPlanTasks.length,
     });
   }
 
+  const typedPlanArtifacts: Array<PlanArtifact & { candidate: NonNullable<PlanArtifact["candidate"]> }> = [];
   for (const artifact of reviewableArtifacts) {
-    // plan.md follows the full executable Plan contract. Design/bugfix
-    // artifacts have their own persisted schemas and must not be rejected for
-    // lacking plan-only headings, but still pass their native noise/structure
-    // validation before their task projection is trusted.
-    const quality = artifact.kind === "plan"
-      ? validateActionablePlanArtifact(artifact.content)
-      : validatePlanArtifactContent(artifact.content, artifact.kind);
-    if (!quality.ok) {
+    if (artifact.kind !== "plan") continue;
+    const integrity = validatePlanArtifactCandidateIntegrity(artifact);
+    if (!integrity.ok) {
       return failedPlanExecutionReadiness({
         reason: "plan_artifact_quality_rejected",
-        qualityReason: quality.reason || "unknown_plan_quality_failure",
+        qualityReason: integrity.reason,
         mutationOriented: false,
         requiresExecutableValidation: false,
         concreteMutationTaskCount: 0,
         executableValidationTaskCount: 0,
-        taskCount,
+        taskCount: input.executionPlanTasks.length,
+      });
+    }
+    if (integrity.mode === "typed") {
+      typedPlanArtifacts.push(artifact as PlanArtifact & {
+        candidate: NonNullable<PlanArtifact["candidate"]>;
       });
     }
   }
 
-  const derivedTaskQuality = validateDerivedPlanTasksForApproval(
-    input.executionPlanTasks,
+  // A typed plan owns its executable projection. Caller-supplied tasks may
+  // carry reconciled statuses or additional advisory context, but readiness
+  // is proven from the sealed candidate rather than from reparsed Markdown.
+  const typedCandidateTasks = typedPlanArtifacts.flatMap((artifact) =>
+    derivePlanTasksFromCandidate(artifact.candidate)
   );
-  if (!derivedTaskQuality.ok) {
-    return failedPlanExecutionReadiness({
-      reason: "plan_artifact_quality_rejected",
-      qualityReason: derivedTaskQuality.reason || "invalid_runtime_plan_task_graph",
-      mutationOriented: false,
-      requiresExecutableValidation: false,
-      concreteMutationTaskCount: 0,
-      executableValidationTaskCount: 0,
-      taskCount,
-    });
-  }
-
-  const mutationOriented = reviewableArtifacts.some((artifact) =>
-    collectSectionLines(artifact.content, isRuntimeTaskMutationSectionHeading).some(hasExplicitMutationIntent)
-  );
-  const executableValidation = assessPlanExecutableValidation({
-    planArtifacts: reviewableArtifacts,
-    executionPlanTasks: input.executionPlanTasks,
-  });
-  const requiresExecutableValidation = executableValidation.requiresExecutableValidation;
-  const concreteMutationTaskCount = input.executionPlanTasks.filter(isConcreteMutationOrDeliverableTask).length;
-  const executableValidationTaskCount = executableValidation.executableValidationTaskCount;
+  const readinessTasks = typedPlanArtifacts.length > 0
+    ? typedCandidateTasks
+    : input.executionPlanTasks;
+  const taskCount = readinessTasks.length;
+  const legacyExecutableValidation = typedPlanArtifacts.length === 0
+    ? assessPlanExecutableValidation({
+        planArtifacts: reviewableArtifacts,
+        executionPlanTasks: readinessTasks,
+      })
+    : null;
+  const mutationOriented = typedPlanArtifacts.length > 0
+    ? typedPlanArtifacts.some((artifact) =>
+        artifact.candidate.changes.some((change) => change.operation !== "preserve")
+      ) || readinessTasks.some(isTypedCandidateMutationTask)
+    : reviewableArtifacts.some((artifact) =>
+        collectSectionLines(artifact.content, isRuntimeTaskMutationSectionHeading).some(hasExplicitMutationIntent)
+      );
+  const requiresExecutableValidation = typedPlanArtifacts.length > 0
+    ? typedPlanArtifacts.some((artifact) =>
+        artifact.candidate.validations.some((validation) => validation.blocking)
+      )
+    : legacyExecutableValidation!.requiresExecutableValidation;
+  const concreteMutationTaskCount = readinessTasks.filter(
+    typedPlanArtifacts.length > 0
+      ? isTypedCandidateMutationTask
+      : isConcreteMutationOrDeliverableTask,
+  ).length;
+  const executableValidationTaskCount = typedPlanArtifacts.length > 0
+    ? readinessTasks.filter(isExecutablePlanValidationTask).length
+    : legacyExecutableValidation!.executableValidationTaskCount;
   const counts = {
     mutationOriented,
     requiresExecutableValidation,
@@ -205,6 +246,38 @@ export function evaluateApprovedPlanExecutionReadiness(input: {
     executableValidationTaskCount,
     taskCount,
   };
+
+  for (const artifact of reviewableArtifacts) {
+    // plan.md follows the full executable Plan contract. Design/bugfix
+    // artifacts have their own persisted schemas and must not be rejected for
+    // lacking plan-only headings, but still pass their native noise/structure
+    // validation before their task projection is trusted.
+    const isTypedPlan = artifact.kind === "plan" && typedPlanArtifacts.some(
+      (typedArtifact) => typedArtifact.path === artifact.path,
+    );
+    if (isTypedPlan) continue;
+    const quality = artifact.kind === "plan"
+      ? validateActionablePlanArtifact(artifact.content)
+      : validatePlanArtifactContent(artifact.content, artifact.kind);
+    if (!quality.ok) {
+      return failedPlanExecutionReadiness({
+        reason: "plan_artifact_quality_rejected",
+        qualityReason: quality.reason || "unknown_plan_quality_failure",
+        ...counts,
+      });
+    }
+  }
+
+  const derivedTaskQuality = validateDerivedPlanTasksForApproval(
+    readinessTasks,
+  );
+  if (!derivedTaskQuality.ok) {
+    return failedPlanExecutionReadiness({
+      reason: "plan_artifact_quality_rejected",
+      qualityReason: derivedTaskQuality.reason || "invalid_runtime_plan_task_graph",
+      ...counts,
+    });
+  }
 
   if (taskCount === 0) {
     return failedPlanExecutionReadiness({
@@ -339,9 +412,7 @@ export function ensureApprovedPlanRuntimeTasksForState(
       state.isPlanApproved,
     );
     if (!hasPersistedTasksArtifact) {
-      const derivedRuntimeTasks = deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
-        language,
-      });
+      const derivedRuntimeTasks = deriveApprovedPlanRuntimeTasks(state.planArtifacts, language);
       if (derivedRuntimeTasks.length > 0) {
         return withUserRequestValidation(reconcilePlanTaskCompletion(
           normalizedTasks,
@@ -359,9 +430,7 @@ export function ensureApprovedPlanRuntimeTasksForState(
   if (hasPersistedTasksArtifact) {
     return withUserRequestValidation(state.planTasks);
   }
-  return withUserRequestValidation(deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
-    language,
-  }));
+  return withUserRequestValidation(deriveApprovedPlanRuntimeTasks(state.planArtifacts, language));
 }
 
 export function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", limit = 12): string {

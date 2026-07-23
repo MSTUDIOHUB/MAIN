@@ -106,11 +106,16 @@ import {
   isPlanReviewCapsulePresentationEligible,
   shouldRenderTurnBoundary,
 } from "../lib/turnPresentation";
-import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
 import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
+import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
+import {
+  resolveTurnStrategyFromIntent,
+  selectTurnIngressAvailability,
+} from "../lib/turnIngress";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -2603,6 +2608,18 @@ export default function ChatArea({
     goalRuntime: useAppStore((s) => s.goalRuntime),
   };
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  const turnRuntimeCheckpoints = useAppStore((s) => s.turnRuntimeCheckpoints);
+  const activeSessionEpoch = useAppStore((s) => {
+    const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
+    const session = (s.sessionsByWorkspace[workspaceKey] || []).find(
+      (candidate) => candidate.id === s.currentSessionId,
+    );
+    const persistedEpoch = String(session?.planLifecycleEpoch || "").trim();
+    if (persistedEpoch) return persistedEpoch;
+    return s.planLifecycle?.sessionKey === activeSessionKey
+      ? String(s.planLifecycle.sessionEpoch || "").trim() || null
+      : null;
+  });
   const visualContextProgressByTurnId = useMemo(() => {
     const latestByTurnId = new Map<string, { timestampMs: number; progress: any }>();
     const terminalAtByTurnId = new Map<string, number>();
@@ -2825,6 +2842,52 @@ export default function ChatArea({
   const pinnedTurn = useMemo(() => {
     return resolvePinnedConversationTurn(visibleConversationTurns, currentTurnId);
   }, [visibleConversationTurns, currentTurnId]);
+  const composerHasLiveTurnOwner = Boolean(
+    currentWorkspace &&
+    pinnedTurn &&
+    !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
+    (
+      (
+        harnessRunMarker?.status === "running" &&
+        harnessRunMarker.sessionKey === activeSessionKey &&
+        harnessRunMarker.turnId === pinnedTurn.id
+      ) ||
+      (
+        agentStatus === "running" &&
+        (pinnedTurn.status === "planning" || pinnedTurn.status === "executing")
+      )
+    )
+  );
+  // Streaming is still a valid immediate signal. The durable Turn/Run owner
+  // covers the gaps between model chunks where isGenerating may briefly drop.
+  const composerRunActive = isStreaming || composerHasLiveTurnOwner;
+  const composerRuntimeOwnerObserved = composerRunActive ||
+    agentStatus === "pending_review" ||
+    (
+      activeActionRequest?.status === "pending" &&
+      activeActionRequest.sessionKey === activeSessionKey &&
+      activeActionRequest.turnId === pinnedTurn?.id
+    );
+  const composerTurnIngress = useMemo(() => selectTurnIngressAvailability({
+    checkpoint: pinnedTurn ? turnRuntimeCheckpoints?.[pinnedTurn.id] : null,
+    expectedOwner: pinnedTurn && activeSessionKey && activeSessionEpoch
+      ? {
+          workspaceKey: resolveSessionWorkspaceKey(currentWorkspace),
+          sessionKey: activeSessionKey,
+          sessionEpoch: activeSessionEpoch,
+          turnId: pinnedTurn.id,
+        }
+      : null,
+    strategy: resolveTurnStrategyFromIntent(pinnedTurn?.intent, pinnedTurn?.mode),
+    runtimeOwnerObserved: composerRuntimeOwnerObserved,
+  }), [
+    activeSessionEpoch,
+    activeSessionKey,
+    composerRuntimeOwnerObserved,
+    currentWorkspace,
+    pinnedTurn,
+    turnRuntimeCheckpoints,
+  ]);
   const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
     !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
@@ -2850,7 +2913,7 @@ export default function ChatArea({
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
   const currentPlanApprovalIdentity = useMemo(
-    () => buildPlanApprovalIdentity(planArtifacts),
+    () => buildTypedPlanApprovalIdentity(planArtifacts),
     [planArtifacts],
   );
   const hasReviewablePlanArtifact = !!currentPlanApprovalIdentity;
@@ -3268,6 +3331,16 @@ export default function ChatArea({
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-end">
           <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4">
+            {block.runtimeGuidance?.id && (
+              <div
+                data-testid="runtime-guidance-record"
+                data-guidance-id={block.runtimeGuidance.id}
+                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold text-emerald-400"
+              >
+                <IconZap className="h-3 w-3" />
+                {language === "en" ? "Guided this Turn" : "已引导本回合"}
+              </div>
+            )}
             {block.content && (
               <div
                 data-testid="user-message-content"
@@ -4314,7 +4387,13 @@ export default function ChatArea({
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
           language,
-          notOlderThan: capsuleRunStatus.currentActivity?.lastSeenAt || 0,
+          // Any newer structured runtime event retires an older model
+          // preamble, including when the event has already completed and is no
+          // longer eligible as the Capsule's current activity.
+          notOlderThan: Math.max(
+            0,
+            ...capsuleProgressLedger.map((item) => item.lastSeenAt),
+          ),
         })
       : "";
   const capsuleGuidanceText = capsuleLiveGuidanceText || capsuleStructuredGuidanceText;
@@ -5314,6 +5393,9 @@ export default function ChatArea({
         setShowDiff={setShowDiff}
         onSendMessage={onSendMessage}
         isStreaming={isStreaming}
+        isRunActive={composerRunActive}
+        turnIngressMode={composerTurnIngress.mode}
+        guidanceTarget={composerTurnIngress.guidanceTarget}
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}

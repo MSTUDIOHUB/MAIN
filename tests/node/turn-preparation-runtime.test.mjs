@@ -124,6 +124,94 @@ test("Goal turn intake uses the canonical objective instead of an internal conti
   assert.equal(debugEvents[0].payload.goalObjectiveChars, objective.length);
 });
 
+test("same-Turn child Run inherits admitted payload signals instead of synthetic continuation zeros", () => {
+  const debugEvents = [];
+  const admittedSignals = {
+    imageParts: 1,
+    mentionedFilePaths: ["src/ChatArea.tsx"],
+    attachedFilePaths: ["notes/incident.md"],
+    subagentPreference: "preferred",
+    diagnosisRequirement: "required",
+  };
+  const result = resolveAgentLoopTurnInputContext(baseRuntimeState({
+    initialMessages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:image/png;base64,first-only" } },
+          {
+            type: "text",
+            text: "[turn_intake]\nimageParts: 1\n@file: src/ChatArea.tsx\nattachment: notes/incident.md\n[user_request]\n修复截图中的计划流程\n[/user_request]\n[/turn_intake]",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: "请在新的恢复上下文中继续执行已批准计划。这是 MAIN 的自动恢复。",
+      },
+    ],
+  }), {
+    getSessionKey: () => "workspace:7",
+    getCurrentTurnId: () => "turn-image-plan",
+    getMainModeKey: () => "agent",
+    getTurnRuntimeCheckpoint: () => ({
+      revision: 4,
+      owner: { sessionKey: "workspace:7", turnId: "turn-image-plan" },
+      input: {
+        admittedUserContext: admittedSignals,
+        visualContext: {
+          status: "delivered",
+          expectedImageParts: 1,
+          deliveredImageParts: 1,
+          omittedImageParts: 0,
+          recognition: "observed",
+          observationSummary: "截图显示计划卡片在修正版后消失。",
+          observationId: "visual-1",
+        },
+      },
+    }),
+    onDebugEvent: (name, payload) => debugEvents.push({ name, payload }),
+  });
+
+  assert.equal(result.latestUserPromptText, "修复截图中的计划流程");
+  assert.deepEqual(result.turnInputContextSignals, admittedSignals);
+  assert.equal(
+    debugEvents.find((event) => event.name === "agent.turn_input_context_resolved")?.payload.source,
+    "durable_turn_admission",
+  );
+});
+
+test("a checkpoint owned by another Turn cannot leak image or file signals", () => {
+  const result = resolveAgentLoopTurnInputContext(baseRuntimeState({
+    initialMessages: [{
+      role: "user",
+      content: "[turn_intake]\nimageParts: 0\n[user_request]\n开始新的纯文本任务\n[/user_request]\n[/turn_intake]",
+    }],
+  }), {
+    getSessionKey: () => "workspace:7",
+    getCurrentTurnId: () => "turn-new",
+    getMainModeKey: () => "agent",
+    getTurnRuntimeCheckpoint: () => ({
+      revision: 9,
+      owner: { sessionKey: "workspace:7", turnId: "turn-old" },
+      input: {
+        admittedUserContext: {
+          imageParts: 2,
+          mentionedFilePaths: ["old.ts"],
+          attachedFilePaths: ["old.md"],
+          subagentPreference: "preferred",
+        },
+      },
+    }),
+  });
+
+  assert.equal(result.latestUserPromptText, "开始新的纯文本任务");
+  assert.equal(result.turnInputContextSignals.imageParts, 0);
+  assert.deepEqual(result.turnInputContextSignals.mentionedFilePaths, []);
+  assert.deepEqual(result.turnInputContextSignals.attachedFilePaths, []);
+  assert.equal(result.turnInputContextSignals.subagentPreference, "unspecified");
+});
+
 test("chat repair recovery requires formal mutation intent instead of lexical repair wording", () => {
   const baseCallbacks = {
     getSessionKey: () => "chat-repair-authorization",

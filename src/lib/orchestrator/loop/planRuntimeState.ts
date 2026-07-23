@@ -1,4 +1,5 @@
 import type { PlanRuntimePhase } from "../../workflowModels";
+import type { PlanCandidateRepairCheckpoint } from "../../planCandidateRepair";
 
 /**
  * `needs_evidence` serves two different runtime transactions. A model-authored
@@ -11,6 +12,96 @@ export type PlanEvidenceRecoveryObjective =
   | "none"
   | "model_draft"
   | "deterministic_closure";
+
+export interface PlanEvidenceProgressState {
+  bundleHash: string;
+  coverageKeys: Set<string>;
+  /** Stable runtime obligations open when the current evidence transaction began. */
+  obligationKeys: Set<string>;
+}
+
+export function parsePlanEvidenceProgressFingerprint(
+  value: string,
+): PlanEvidenceProgressState {
+  if (!value) return { bundleHash: "", coverageKeys: new Set(), obligationKeys: new Set() };
+  try {
+    const parsed = JSON.parse(value) as {
+      bundleHash?: unknown;
+      coverageKeys?: unknown;
+      obligationKeys?: unknown;
+    };
+    return {
+      bundleHash:
+        typeof parsed.bundleHash === "string" ? parsed.bundleHash : "",
+      coverageKeys: new Set(
+        Array.isArray(parsed.coverageKeys)
+          ? parsed.coverageKeys.filter(
+              (item): item is string => typeof item === "string" && !!item,
+            )
+          : [],
+      ),
+      obligationKeys: new Set(
+        Array.isArray(parsed.obligationKeys)
+          ? parsed.obligationKeys.filter(
+              (item): item is string => typeof item === "string" && !!item,
+            )
+          : [],
+      ),
+    };
+  } catch {
+    // Older snapshots stored only the semantic bundle hash.
+    return { bundleHash: value, coverageKeys: new Set(), obligationKeys: new Set() };
+  }
+}
+
+export function buildPlanEvidenceProgressFingerprint(
+  input: PlanEvidenceProgressState,
+): string {
+  return JSON.stringify({
+    bundleHash: input.bundleHash,
+    // Set preserves insertion order. Retain the latest bounded identities so
+    // a genuinely new source window remains observable across recovery turns.
+    coverageKeys: Array.from(input.coverageKeys).slice(-64),
+    obligationKeys: Array.from(input.obligationKeys).slice(0, 16),
+  });
+}
+
+export interface PlanVisibleQualityPromptBudgetEntry {
+  signature: string;
+  evidenceEpochHash: string;
+  promptsIssued: number;
+}
+
+export type PlanVisibleQualityPromptBudgetState =
+  readonly PlanVisibleQualityPromptBudgetEntry[];
+
+const MAX_TRACKED_PLAN_QUALITY_PROMPT_EPOCHS = 16;
+
+export function getPlanVisibleQualityPromptCount(
+  state: PlanVisibleQualityPromptBudgetState | null | undefined,
+  identity: Pick<PlanVisibleQualityPromptBudgetEntry, "signature" | "evidenceEpochHash">,
+): number {
+  const entry = (state || []).find((candidate) =>
+    candidate.signature === identity.signature &&
+    candidate.evidenceEpochHash === identity.evidenceEpochHash
+  );
+  return entry ? Math.max(0, Math.floor(entry.promptsIssued)) : 0;
+}
+
+export function recordPlanVisibleQualityPrompt(
+  state: PlanVisibleQualityPromptBudgetState | null | undefined,
+  identity: Pick<PlanVisibleQualityPromptBudgetEntry, "signature" | "evidenceEpochHash">,
+): PlanVisibleQualityPromptBudgetState {
+  const promptsIssued = getPlanVisibleQualityPromptCount(state, identity) + 1;
+  const retained = (state || []).filter((candidate) =>
+    candidate.signature !== identity.signature ||
+    candidate.evidenceEpochHash !== identity.evidenceEpochHash
+  );
+  return [
+    ...retained,
+    { ...identity, promptsIssued },
+  ].slice(-MAX_TRACKED_PLAN_QUALITY_PROMPT_EPOCHS);
+}
 
 export interface PlanLoopRuntimeState {
   planRuntimePhase: PlanRuntimePhase;
@@ -29,6 +120,10 @@ export interface PlanLoopRuntimeState {
    * coverage advances.
    */
   planEvidenceProgressFingerprint: string;
+  /** Bounded visible-rewrite budget scoped to one quality signature and evidence epoch. */
+  planVisibleQualityPromptBudget: PlanVisibleQualityPromptBudgetState;
+  /** Runtime-owned local repair transaction for one frozen typed candidate. */
+  planCandidateRepairCheckpoint: PlanCandidateRepairCheckpoint | null;
   planReasoningOnlyRecoveryPasses: number;
   planAutoScaffoldPromptIssued: boolean;
   planDraftingRecoveryReadCount: number;
@@ -51,10 +146,10 @@ export interface PlanRuntimePhaseQualitySnapshot {
 
 const ALLOWED_PLAN_PHASE_TRANSITIONS: Record<PlanRuntimePhase, ReadonlySet<PlanRuntimePhase>> = {
   explore_structure: new Set([
-    "explore_structure", "grounding", "needs_evidence", "synthesis", "drafting", "review_ready", "blocked",
+    "explore_structure", "grounding", "needs_evidence", "synthesis", "drafting", "needs_rewrite", "review_ready", "blocked",
   ]),
   grounding: new Set([
-    "grounding", "needs_evidence", "synthesis", "drafting", "review_ready", "blocked",
+    "grounding", "needs_evidence", "synthesis", "drafting", "needs_rewrite", "review_ready", "blocked",
   ]),
   synthesis: new Set([
     "synthesis", "needs_evidence", "drafting", "needs_rewrite", "review_ready", "blocked",
@@ -106,6 +201,8 @@ export function createPlanLoopRuntimeState(input: {
     planEvidenceRecoveryPasses: 0,
     planEvidenceNoProgressPasses: 0,
     planEvidenceProgressFingerprint: "",
+    planVisibleQualityPromptBudget: [],
+    planCandidateRepairCheckpoint: null,
     planReasoningOnlyRecoveryPasses: 0,
     planAutoScaffoldPromptIssued: false,
     planDraftingRecoveryReadCount: 0,
@@ -186,6 +283,7 @@ export function applyPlanPostConvergenceRuntimeState(
     | "planDraftingRecoveryReadCount"
     | "planReasoningOnlyRecoveryPasses"
     | "planEvidenceRecoveryObjective"
+    | "planEvidenceProgressFingerprint"
     | "planAutoScaffoldPromptIssued"
   > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceRecoveryPasses">>,
 ): PlanLoopRuntimeState {
@@ -198,6 +296,8 @@ export function applyPlanPostConvergenceRuntimeState(
     planReasoningOnlyRecoveryPasses: input.planReasoningOnlyRecoveryPasses,
     planEvidenceRecoveryObjective:
       input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
+    planEvidenceProgressFingerprint:
+      input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
   };
 }
@@ -217,6 +317,8 @@ export function applyPlanNoToolRuntimeState(
     | "planAutoScaffoldPromptIssued"
     | "planEvidenceRecoveryPasses"
     | "planEvidenceNoProgressPasses"
+    | "planVisibleQualityPromptBudget"
+    | "planCandidateRepairCheckpoint"
   > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceProgressFingerprint">>,
 ): PlanLoopRuntimeState {
   return {
@@ -236,6 +338,13 @@ export function applyPlanNoToolRuntimeState(
       input.planEvidenceNoProgressPasses ?? state.planEvidenceNoProgressPasses,
     planEvidenceProgressFingerprint:
       input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint ?? "",
+    planVisibleQualityPromptBudget:
+      input.planVisibleQualityPromptBudget ?? state.planVisibleQualityPromptBudget ?? [],
+    ...(Object.prototype.hasOwnProperty.call(input, "planCandidateRepairCheckpoint")
+      ? { planCandidateRepairCheckpoint: input.planCandidateRepairCheckpoint }
+      : Object.prototype.hasOwnProperty.call(state, "planCandidateRepairCheckpoint")
+        ? { planCandidateRepairCheckpoint: state.planCandidateRepairCheckpoint }
+        : {}),
   };
 }
 
@@ -269,6 +378,7 @@ export function applyPlanQualityRuntimeState(
     | "planEvidenceRecoveryObjective"
     | "planEvidenceRecoveryPasses"
     | "planEvidenceNoProgressPasses"
+    | "planVisibleQualityPromptBudget"
   > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceProgressFingerprint">>,
 ): PlanLoopRuntimeState {
   return {
@@ -285,6 +395,8 @@ export function applyPlanQualityRuntimeState(
     planEvidenceNoProgressPasses: input.planEvidenceNoProgressPasses,
     planEvidenceProgressFingerprint:
       input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint ?? "",
+    planVisibleQualityPromptBudget:
+      input.planVisibleQualityPromptBudget ?? state.planVisibleQualityPromptBudget ?? [],
   };
 }
 
@@ -296,6 +408,7 @@ export function applyPlanReadOnlyConvergenceRuntimeState(
     | "planReadOnlyConvergenceTools"
     | "usedPlanReadOnlyConvergencePrompt"
     | "planEvidenceRecoveryObjective"
+    | "planEvidenceProgressFingerprint"
   >,
 ): PlanLoopRuntimeState {
   return {
@@ -305,6 +418,8 @@ export function applyPlanReadOnlyConvergenceRuntimeState(
     usedPlanReadOnlyConvergencePrompt: input.usedPlanReadOnlyConvergencePrompt,
     planEvidenceRecoveryObjective:
       input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
+    planEvidenceProgressFingerprint:
+      input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint,
   };
 }
 

@@ -15,6 +15,7 @@ import { browserResultLooksSuccessful, classifyCommandResultOutcome } from "../.
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
   extractPlanEvidenceFacts,
+  extractPlanEvidenceSourceFacts,
   mergePlanEvidenceFacts,
   summarizePlanEvidenceDetail,
 } from "../../planMaterialization";
@@ -23,12 +24,29 @@ import type { ToolExecutionResult } from "../types";
 import { isSuccessfulVerificationToolObservation } from "../../verificationEvidence";
 import { normalizeWorkspacePathIdentity } from "../../workspacePaths";
 import {
+  createRuntimePlanStructuredEvidenceFacts,
+  extractRuntimeValidationCapabilityFacts,
+  mergePlanStructuredEvidenceFacts,
+  type PlanStructuredEvidenceFact,
+} from "../../planStructuredEvidence";
+import {
+  extractRuntimePlanEvidenceDiscovery,
+  extractSymbolReferenceOccurrences,
+  getPlanEvidenceObligationKey,
+  type PlanEvidenceObligation,
+} from "../../planEvidenceObligations";
+import { isAuthoritativeSubagentClosure } from "../../subagents";
+import {
   getToolExecutionArgs,
   getToolExecutionName,
   hasCompletedToolExecution,
   hasObservedWorkspaceMutationEffect,
   hasVerifiedWorkspaceMutationEffect,
 } from "../../toolResultEffect";
+import {
+  extractRuntimePlanSourceObservations,
+  normalizePlanSourceObservations,
+} from "../../planSourceObservation";
 
 const SUBAGENT_EVIDENCE_TOOLS = new Set([
   "read_file",
@@ -48,6 +66,170 @@ function compactLatestActivityDetail(value: string, maxChars: number): string {
   const headBudget = Math.min(80, Math.max(0, maxChars - separator.length));
   const tailBudget = Math.max(0, maxChars - separator.length - headBudget);
   return `${detail.slice(0, headBudget)}${separator}${detail.slice(-tailBudget)}`;
+}
+
+function sourceReadVersionKey(item: PlanToolActivitySummary): string {
+  if (!/^(?:read_file|read_file_window)$/.test(String(item.name || ""))) return "";
+  const observation = item.readFileObservation;
+  const version = String(observation?.versionToken || "").trim();
+  if (version) return `version:${version}`;
+  const request = String(observation?.requestSignature || "").trim();
+  return request ? `request:${request}` : "";
+}
+
+function replaceSourceDerivedActivity(
+  existing: PlanToolActivitySummary,
+  incoming: PlanToolActivitySummary,
+): void {
+  existing.facts = incoming.facts ? [...incoming.facts] : undefined;
+  existing.structuredFacts = incoming.structuredFacts
+    ? incoming.structuredFacts.map((fact) => ({ ...fact }))
+    : undefined;
+  existing.sourceObservations = incoming.sourceObservations
+    ? normalizePlanSourceObservations(incoming.sourceObservations)
+    : undefined;
+  existing.detail = incoming.detail;
+  existing.status = incoming.status;
+  existing.mutationObserved = incoming.mutationObserved;
+  existing.readFileObservation = incoming.readFileObservation
+    ? {
+        ...incoming.readFileObservation,
+        ...(incoming.readFileObservation.window
+          ? { window: { ...incoming.readFileObservation.window } }
+          : {}),
+      }
+    : undefined;
+  existing.astObservation = incoming.astObservation
+    ? {
+        ...incoming.astObservation,
+        symbols: incoming.astObservation.symbols.map((symbol) => ({ ...symbol })),
+      }
+    : undefined;
+  existing.discoveryObservation = incoming.discoveryObservation
+    ? {
+        ...incoming.discoveryObservation,
+        targetRefs: [...incoming.discoveryObservation.targetRefs],
+        ...(incoming.discoveryObservation.occurrences
+          ? { occurrences: incoming.discoveryObservation.occurrences.map((item) => ({ ...item })) }
+          : {}),
+      }
+    : undefined;
+  existing.evidenceObligation = incoming.evidenceObligation
+    ? { ...incoming.evidenceObligation }
+    : undefined;
+  existing.obligationClosure = incoming.obligationClosure
+    ? {
+        role: "obligation_closure",
+        obligation: {
+          ...incoming.obligationClosure.obligation,
+          ...(incoming.obligationClosure.obligation.occurrence
+            ? { occurrence: { ...incoming.obligationClosure.obligation.occurrence } }
+            : {}),
+        },
+      }
+    : undefined;
+}
+
+function sourceObservationPriority(
+  activity: PlanToolActivitySummary,
+  observationRef: string,
+  startLine: number,
+  endLine: number,
+  incoming: boolean,
+): number {
+  const window = activity.readFileObservation?.window;
+  const isExactReturnedWindow = !!window &&
+    window.startLine === startLine &&
+    window.endLine === endLine;
+  const occurrence = activity.obligationClosure?.obligation.occurrence;
+  const closesExactObligation = activity.obligationClosure?.role === "obligation_closure" && (
+    occurrence
+      ? startLine <= occurrence.startLine && endLine >= occurrence.endLine
+      : isExactReturnedWindow
+  );
+  const supportingFacts = (activity.structuredFacts || []).filter((fact) =>
+    fact.sourceObservationRefs?.includes(observationRef)
+  );
+  const strongestFact = supportingFacts.reduce((priority, fact) => {
+    if (fact.kind === "command_contract") return Math.max(priority, 900);
+    if (fact.kind === "event_contract") return Math.max(priority, 850);
+    if (
+      fact.kind === "symbol_relation" ||
+      fact.kind === "interaction_target" ||
+      fact.kind === "execution_surface" ||
+      fact.kind === "validation_capability"
+    ) return Math.max(priority, 800);
+    if (fact.kind === "permission_contract" || fact.kind === "configuration") {
+      return Math.max(priority, 600);
+    }
+    if (fact.kind === "field_contract" && fact.relation !== "read") {
+      return Math.max(priority, 400);
+    }
+    return Math.max(priority, 100);
+  }, 0);
+  return (closesExactObligation ? 20_000 : 0) +
+    (isExactReturnedWindow ? 10_000 : 0) +
+    strongestFact +
+    Math.min(99, supportingFacts.length) +
+    (incoming ? 1 : 0);
+}
+
+/**
+ * Source observations and the runtime facts derived from them are one
+ * provenance unit. Rank exact/obligation-closing windows before bounded
+ * context, then remove every fact reference whose observation was not
+ * retained. This prevents a same-version paginated read from producing a
+ * receipt with dangling sourceObservationRefs.
+ */
+function mergeSourceDerivedProvenance(
+  existing: PlanToolActivitySummary,
+  incoming: PlanToolActivitySummary,
+): {
+  sourceObservations: PlanToolActivitySummary["sourceObservations"];
+  structuredFacts: PlanStructuredEvidenceFact[];
+} {
+  const candidates = [
+    ...(existing.sourceObservations || []).map((observation, index) => ({
+      observation,
+      priority: sourceObservationPriority(
+        existing,
+        observation.observationRef,
+        observation.startLine,
+        observation.endLine,
+        false,
+      ),
+      index,
+    })),
+    ...(incoming.sourceObservations || []).map((observation, index) => ({
+      observation,
+      priority: sourceObservationPriority(
+        incoming,
+        observation.observationRef,
+        observation.startLine,
+        observation.endLine,
+        true,
+      ),
+      index: (existing.sourceObservations || []).length + index,
+    })),
+  ].sort((left, right) => right.priority - left.priority || right.index - left.index);
+  const sourceObservations = normalizePlanSourceObservations(
+    candidates.map((candidate) => candidate.observation),
+  );
+  const retainedRefs = new Set(sourceObservations.map((item) => item.observationRef));
+  const structuredFacts = mergePlanStructuredEvidenceFacts(
+    existing.structuredFacts,
+    incoming.structuredFacts,
+  ).flatMap((fact): PlanStructuredEvidenceFact[] => {
+    const originalRefs = fact.sourceObservationRefs || [];
+    if (fact.authority !== "runtime_observation") return [fact];
+    const sourceObservationRefs = originalRefs.filter((reference) => retainedRefs.has(reference));
+    if (sourceObservationRefs.length === 0) return [];
+    return [{ ...fact, sourceObservationRefs } as PlanStructuredEvidenceFact];
+  });
+  return {
+    sourceObservations,
+    structuredFacts: mergePlanStructuredEvidenceFacts(structuredFacts),
+  };
 }
 
 function extractAstObservation(
@@ -117,23 +299,89 @@ function appendBoundedToolActivity(
       ].filter(Boolean).join("::");
     };
     const activityDelegatedIdentity = delegatedIdentity(activity);
+    const obligationClosureIdentity = (item: PlanToolActivitySummary): string =>
+      item.obligationClosure?.role === "obligation_closure"
+        ? getPlanEvidenceObligationKey(item.obligationClosure.obligation)
+        : "";
+    const activityObligationClosureIdentity = obligationClosureIdentity(activity);
     const existing = targetList.find((item) =>
       item.name === activity.name &&
       String(item.target || "").replace(/\\/g, "/").toLowerCase() === normalizedTarget &&
+      obligationClosureIdentity(item) === activityObligationClosureIdentity &&
       (
         !activityDelegatedIdentity ||
         delegatedIdentity(item) === activityDelegatedIdentity
       )
     );
     if (existing) {
+      const existingSourceVersion = sourceReadVersionKey(existing);
+      const incomingSourceVersion = sourceReadVersionKey(activity);
+      if (
+        incomingSourceVersion &&
+        existingSourceVersion !== incomingSourceVersion
+      ) {
+        // A target path is not a source snapshot identity. Never combine facts,
+        // exact excerpts, AST/discovery data, or summaries across file versions.
+        // Same-version pagination still merges below because each window carries
+        // the same version token and its own request/range observation.
+        replaceSourceDerivedActivity(existing, activity);
+        return;
+      }
       existing.facts = mergePlanEvidenceFacts(existing.facts, activity.facts);
+      const sourceProvenance = mergeSourceDerivedProvenance(existing, activity);
+      existing.structuredFacts = sourceProvenance.structuredFacts;
+      existing.sourceObservations = sourceProvenance.sourceObservations;
       if (activity.readFileObservation) {
-        existing.readFileObservation = { ...activity.readFileObservation };
+        existing.readFileObservation = {
+          ...activity.readFileObservation,
+          ...(activity.readFileObservation.window
+            ? { window: { ...activity.readFileObservation.window } }
+            : {}),
+        };
       }
       if (activity.astObservation) {
         existing.astObservation = {
           ...activity.astObservation,
           symbols: activity.astObservation.symbols.map((symbol) => ({ ...symbol })),
+        };
+      }
+      if (activity.discoveryObservation) {
+        const existingRefs = existing.discoveryObservation?.targetRefs || [];
+        const mergedOccurrences = [
+          ...(existing.discoveryObservation?.occurrences || []),
+          ...(activity.discoveryObservation.occurrences || []),
+        ].filter((occurrence, index, all) => all.findIndex((candidate) =>
+          normalizeWorkspacePathIdentity(candidate.targetRef) === normalizeWorkspacePathIdentity(occurrence.targetRef) &&
+          candidate.anchorLine === occurrence.anchorLine &&
+          candidate.startLine === occurrence.startLine &&
+          candidate.endLine === occurrence.endLine
+        ) === index).slice(0, 40);
+        existing.discoveryObservation = {
+          ...activity.discoveryObservation,
+          targetRefs: [...new Set([
+            ...existingRefs,
+            ...activity.discoveryObservation.targetRefs,
+          ])].slice(0, 80),
+          ...(mergedOccurrences.length > 0 ? { occurrences: mergedOccurrences } : {}),
+        };
+      }
+      if (activity.evidenceObligation) {
+        existing.evidenceObligation = {
+          ...activity.evidenceObligation,
+          ...(activity.evidenceObligation.occurrence
+            ? { occurrence: { ...activity.evidenceObligation.occurrence } }
+            : {}),
+        };
+      }
+      if (activity.obligationClosure) {
+        existing.obligationClosure = {
+          role: "obligation_closure",
+          obligation: {
+            ...activity.obligationClosure.obligation,
+            ...(activity.obligationClosure.obligation.occurrence
+              ? { occurrence: { ...activity.obligationClosure.obligation.occurrence } }
+              : {}),
+          },
         };
       }
       if (activity.delegatedObservation) {
@@ -172,10 +420,13 @@ function appendBoundedToolActivity(
 export interface ToolActivityRetentionOptions {
   evidenceLedger?: boolean;
   args?: Record<string, unknown>;
+  /** Runtime sidecar from exact needs_evidence tool-surface admission. */
+  closingEvidenceObligation?: PlanEvidenceObligation;
 }
 
 export function extractDelegatedSubagentActivities(
   result: ToolExecutionResult,
+  options: ToolActivityRetentionOptions = {},
 ): PlanToolActivitySummary[] {
   if (result.name !== "wait_subagents" || result.isError) return [];
   const evidenceContent = result.runtimeEvidenceContent || result.content || "";
@@ -191,6 +442,9 @@ export function extractDelegatedSubagentActivities(
     ? (payload as { results: unknown[] }).results
     : [];
   const activities: PlanToolActivitySummary[] = [];
+  const maxItems = options.evidenceLedger
+    ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY
+    : MAX_RECENT_PLAN_TOOL_ACTIVITY;
   for (const envelope of results) {
     const record = envelope && typeof envelope === "object"
       ? envelope as Record<string, unknown>
@@ -201,6 +455,20 @@ export function extractDelegatedSubagentActivities(
     const closureAudit = record.closureAudit && typeof record.closureAudit === "object"
       ? record.closureAudit as Record<string, unknown>
       : null;
+    const recordScopeKey = String(record.scopeKey || "").trim();
+    const closureIsAuthoritative = !!closureAudit &&
+      !!recordScopeKey &&
+      isAuthoritativeSubagentClosure(closureAudit, {
+        subagentId: envelopeSubagentId,
+        scopeKey: recordScopeKey,
+      }) &&
+      closureAudit.status === status;
+    const obligationClosureState: "satisfied" | "partial" | "unverified" =
+      closureIsAuthoritative && closureAudit.state === "satisfied" && status === "completed"
+        ? "satisfied"
+        : closureIsAuthoritative
+          ? "partial"
+          : "unverified";
     const requiredPaths = Array.isArray(closureAudit?.requiredPaths)
       ? closureAudit.requiredPaths.map((path) => String(path || "").trim()).filter(Boolean)
       : [];
@@ -322,12 +590,41 @@ export function extractDelegatedSubagentActivities(
             truncated: Boolean(sourceRangeRecord.truncated),
           }
         : undefined;
+      const observedTargetRefs = Array.isArray(observation?.observedTargetRefs)
+        ? observation.observedTargetRefs.map((value) => String(value || "").trim()).filter(Boolean)
+        : [];
+      const observedOccurrences = Array.isArray(observation?.observedOccurrences)
+        ? extractSymbolReferenceOccurrences({
+            occurrences: observation.observedOccurrences.map((value) => {
+              const occurrence = value && typeof value === "object" && !Array.isArray(value)
+                ? value as Record<string, unknown>
+                : {};
+              return {
+                ...occurrence,
+                path: occurrence.targetRef,
+              };
+            }),
+          })
+        : [];
+      const discoveryObservation = name === "find_symbol_references"
+        ? {
+            kind: "symbol_references" as const,
+            ...(String(observation?.queryRef || "").trim()
+              ? { queryRef: String(observation?.queryRef || "").trim() }
+              : {}),
+            targetRefs: observedTargetRefs,
+            ...(observedOccurrences.length > 0
+              ? { occurrences: observedOccurrences }
+              : {}),
+          }
+        : undefined;
       appendBoundedToolActivity(activities, {
         name,
         target,
         status: "succeeded",
         ...(detail ? { detail } : {}),
         ...(facts.length > 0 ? { facts } : {}),
+        ...(discoveryObservation ? { discoveryObservation } : {}),
         delegatedObservation: {
           owner: {
             agentKind: "subagent",
@@ -352,11 +649,13 @@ export function extractDelegatedSubagentActivities(
             : {}),
           ...(sourceRange ? { sourceRange } : {}),
           planningEvidenceState: "reusable",
+          joinState: "consumed",
+          closureState: obligationClosureState,
           parentContextState: "reference_only",
           requiresParentReread: true,
         },
-      }, MAX_RECENT_PLAN_TOOL_ACTIVITY, true);
-      if (activities.length >= MAX_RECENT_PLAN_TOOL_ACTIVITY) return activities;
+      }, maxItems, true);
+      if (activities.length >= maxItems) return activities;
     }
   }
   return activities;
@@ -369,6 +668,7 @@ export function extractDelegatedSubagentActivities(
  */
 export function extractSubagentParentRereadObligations(
   result: ToolExecutionResult,
+  options: ToolActivityRetentionOptions = {},
 ): PlanToolActivitySummary[] {
   if (result.name !== "wait_subagents" || result.isError) return [];
   const evidenceContent = result.runtimeEvidenceContent || result.content || "";
@@ -384,6 +684,9 @@ export function extractSubagentParentRereadObligations(
     ? (payload as { results: unknown[] }).results
     : [];
   const obligations: PlanToolActivitySummary[] = [];
+  const maxItems = options.evidenceLedger
+    ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY
+    : MAX_RECENT_PLAN_TOOL_ACTIVITY;
   for (const envelope of results) {
     const record = envelope && typeof envelope === "object"
       ? envelope as Record<string, unknown>
@@ -392,7 +695,14 @@ export function extractSubagentParentRereadObligations(
     const closureAudit = record.closureAudit && typeof record.closureAudit === "object"
       ? record.closureAudit as Record<string, unknown>
       : null;
-    if (!subagentId || !closureAudit) continue;
+    const scopeKey = String(record.scopeKey || "").trim();
+    if (
+      !subagentId ||
+      !closureAudit ||
+      !scopeKey ||
+      !isAuthoritativeSubagentClosure(closureAudit, { subagentId, scopeKey }) ||
+      closureAudit.status !== String(record.status || "")
+    ) continue;
     const requiredPaths = new Map((Array.isArray(closureAudit.requiredPaths)
       ? closureAudit.requiredPaths
       : []).flatMap((value) => {
@@ -455,13 +765,20 @@ export function extractSubagentParentRereadObligations(
         target: requiredPath,
         status: "failed",
         detail: "Incomplete child closure left this exact scoped path unresolved; parent reread is permitted after join only when consistent with the user instruction.",
+        evidenceObligation: {
+          kind: "read_target",
+          source: "subagent_unresolved",
+          targetRef: requiredPath,
+        },
         delegatedObservation: {
           owner: { agentKind: "subagent", subagentId },
           planningEvidenceState: "unresolved",
+          joinState: "consumed",
+          closureState: closureAudit.state === "satisfied" ? "satisfied" : "partial",
           parentContextState: "reference_only",
           requiresParentReread: true,
         },
-      }, MAX_RECENT_PLAN_TOOL_ACTIVITY, true);
+      }, maxItems, true);
     }
   }
   return obligations;
@@ -508,7 +825,15 @@ export function rememberToolActivity(
   options: ToolActivityRetentionOptions = {},
 ): void {
   if (result.internalFeedback) return;
-  const rawDetail = result.displayContent || result.content || "";
+  const trustedSourceRead = /^(?:read_file|read_file_window)$/.test(result.name) &&
+    /\.(?:[cm]?[jt]sx?|rs|py|go|swift|java|kt|cs|cpp|c|h|hpp|vue|svelte|css|scss|html|json|toml|ya?ml)$/i.test(result.target);
+  // Keep UI summaries stable for non-source tools. Source evidence follows the
+  // exact/runtime or model-facing payload because displayContent is a shorter
+  // UI projection that can end before decisive implementation lines.
+  const rawDetail = trustedSourceRead
+    ? result.runtimeEvidenceContent || result.content || result.displayContent || ""
+    : result.displayContent || result.content || "";
+  const evidencePayload = result.runtimeEvidenceContent || result.content || result.displayContent || "";
   const planEvidenceDetail = summarizePlanEvidenceDetail({
     tool: result.name,
     target: result.target,
@@ -517,10 +842,45 @@ export function rememberToolActivity(
   });
   const detail = planEvidenceDetail || (/\bREAD_FILE_RESULT\b/i.test(rawDetail) ? "" : truncateForLog(rawDetail, 120));
   const facts = mergePlanEvidenceFacts(
-    extractPlanEvidenceFacts(rawDetail),
+    extractPlanEvidenceFacts(evidencePayload),
+    trustedSourceRead ? extractPlanEvidenceSourceFacts(evidencePayload) : [],
     extractPlanEvidenceFacts(planEvidenceDetail),
   );
+  const sourceObservations = trustedSourceRead
+    ? extractRuntimePlanSourceObservations({
+        target: result.target,
+        content: evidencePayload,
+        readFileObservation: result.readFileObservation,
+      })
+    : [];
+  // Only exact runtime-owned source reads promote the historical extractor's
+  // bounded tokens into acceptance-authoritative typed observations. Child
+  // summaries and arbitrary prose remain legacy context until parent-verified.
+  const structuredFacts = trustedSourceRead
+    ? mergePlanStructuredEvidenceFacts(...sourceObservations.map((observation) =>
+        createRuntimePlanStructuredEvidenceFacts(
+          [
+            ...mergePlanEvidenceFacts(
+              extractPlanEvidenceFacts(observation.excerpt),
+              extractPlanEvidenceSourceFacts(observation.excerpt),
+            ),
+            ...extractRuntimeValidationCapabilityFacts({
+              path: observation.path,
+              source: observation.excerpt,
+            }),
+          ],
+          { sourceObservationRefs: [observation.observationRef] },
+        )
+      ))
+    : [];
   const astObservation = extractAstObservation(result);
+  const discoveryObservation = !result.isError
+    ? extractRuntimePlanEvidenceDiscovery({
+        tool: result.name,
+        content: result.runtimeEvidenceContent || result.content || "",
+        args: options.args,
+      })
+    : undefined;
   const executionName = getToolExecutionName(result);
   const executedArgs = getToolExecutionArgs(result, options.args || {});
   // A failed editor may still have changed disk before returning its error.
@@ -546,8 +906,31 @@ export function rememberToolActivity(
       : "succeeded",
     ...(detail ? { detail } : {}),
     ...(facts.length > 0 ? { facts } : {}),
+    ...(structuredFacts.length > 0 ? { structuredFacts } : {}),
+    ...(sourceObservations.length > 0 ? { sourceObservations } : {}),
+    ...(discoveryObservation ? { discoveryObservation } : {}),
+    ...(options.closingEvidenceObligation
+      ? {
+          obligationClosure: {
+            role: "obligation_closure" as const,
+            obligation: {
+              ...options.closingEvidenceObligation,
+              ...(options.closingEvidenceObligation.occurrence
+                ? { occurrence: { ...options.closingEvidenceObligation.occurrence } }
+                : {}),
+            },
+          },
+        }
+      : {}),
     ...(result.readFileObservation
-      ? { readFileObservation: { ...result.readFileObservation } }
+      ? {
+          readFileObservation: {
+            ...result.readFileObservation,
+            ...(result.readFileObservation.window
+              ? { window: { ...result.readFileObservation.window } }
+              : {}),
+          },
+        }
       : {}),
     ...(astObservation
       ? { astObservation }

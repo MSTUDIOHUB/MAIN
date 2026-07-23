@@ -980,6 +980,15 @@ export function compactCloudResponsesInstructions(
     .map((match) => String(match[0] || "").trim())
     .filter(Boolean);
   const protectedVisualProtocol = visualProtocolBlocks[visualProtocolBlocks.length - 1] || "";
+  // Once image bytes have been compacted, this owner-fenced observation is
+  // the only durable visual continuity available to later Responses calls.
+  // Keep the newest block verbatim alongside the protocol contract.
+  const visualContextObservationPattern = /\[visual_context_observation\][\s\S]*?\[\/visual_context_observation\]/gi;
+  const visualContextObservationBlocks = [...instructions.matchAll(visualContextObservationPattern)]
+    .map((match) => String(match[0] || "").trim())
+    .filter(Boolean);
+  const protectedVisualContextObservation =
+    visualContextObservationBlocks[visualContextObservationBlocks.length - 1] || "";
   const toolProtocolPattern = /(?:^|\n)\[TOOLS\]\n[\s\S]*?(?=\n\n\[[A-Z0-9 _():/.-]+\]\n|$)/g;
   const existingToolProtocolBlocks = [...instructions.matchAll(toolProtocolPattern)]
     .map((match) => String(match[0] || "").trim())
@@ -987,6 +996,7 @@ export function compactCloudResponsesInstructions(
   const existingToolProtocol = existingToolProtocolBlocks[existingToolProtocolBlocks.length - 1] || "";
   const compactableInstructions = instructions
     .replace(visualProtocolPattern, "")
+    .replace(visualContextObservationPattern, "")
     .replace(toolProtocolPattern, "");
   const lines = compactableInstructions.split(/\r?\n/);
   const keepPatterns = [
@@ -1054,6 +1064,7 @@ export function compactCloudResponsesInstructions(
     ...compactReminder,
     ...(generatedToolProtocol ? ["", generatedToolProtocol] : []),
     ...(protectedVisualProtocol ? ["", protectedVisualProtocol] : []),
+    ...(protectedVisualContextObservation ? ["", protectedVisualContextObservation] : []),
   ].join("\n");
   const compactSuffix = [
     ...keptLines,

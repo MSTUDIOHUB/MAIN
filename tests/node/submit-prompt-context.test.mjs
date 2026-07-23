@@ -89,6 +89,12 @@ test("submit prompt context prepends plan-mode instructions and turn intake", ()
   assert.match(result, /workflowMode: plan/);
   assert.match(result, /本轮处于 PLAN 模式/);
   assert.match(result, /\.MAIN\/plans\/plan\.md/);
+  assert.match(result, /最新注入的 `\[PLAN AUTHORING CONTRACT\]`/);
+  assert.match(result, /声明的当前提交入口/);
+  assert.doesNotMatch(result, /<plan_candidate>/);
+  assert.match(result, /由 runtime 校验并封存 typed candidate/);
+  assert.match(result, /不得.*`write_file`.*`replace_in_file`/);
+  assert.doesNotMatch(result, /唯一允许的写入|opencode 风格|增量编辑，否则创建完整计划/);
   assert.match(result, /制定迁移计划$/);
 });
 
@@ -106,6 +112,13 @@ test("submit prompt context keeps plan-continuation replacement semantics", () =
   assert.match(result, /^\[turn_intake\]/);
   assert.match(result, /Continue the previous PLAN turn/);
   assert.match(result, /Original plan request: Refactor MAIN/);
+  assert.match(result, /complete replacement typed graph/);
+  assert.match(result, /latest injected `\[PLAN AUTHORING CONTRACT\]`/);
+  assert.match(result, /declared active submission transport/);
+  assert.doesNotMatch(result, /<plan_candidate>/);
+  assert.match(result, /runtime alone validates, seals, and renders/);
+  assert.match(result, /Do not call write_file, replace_in_file, or any write tool/);
+  assert.doesNotMatch(result, /write plan\.md directly|short staged ledger/);
   assert.doesNotMatch(result, /ATTACHED_CONTEXT_SHOULD_NOT_SURVIVE/);
 });
 

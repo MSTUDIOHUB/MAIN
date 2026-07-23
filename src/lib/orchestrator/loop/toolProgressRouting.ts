@@ -1,4 +1,3 @@
-import { isPreApprovalPlanDraftWrite, parseToolCallArguments } from "../../orchestrator";
 import { isThinModelToolNarration } from "../../modelFeedbackDedupe";
 import type { LegacyWorkflowMode } from "../../runIntent";
 import { looksLikeSubstantivePlanAssistantText } from "../../workflowModels";
@@ -25,12 +24,11 @@ export function isAllowedUnapprovedPlanDraftMutationCallForRuntime(input: {
   isPlanApproved: boolean;
   workspace: string;
 }): boolean {
-  return input.workflowMode === "plan" &&
-    !input.isPlanApproved &&
-    isPreApprovalPlanDraftWrite(
-      input.call.name,
-      parseToolCallArguments(input.call, input.workspace),
-    );
+  // Compatibility shim for callers compiled against the old policy. Typed
+  // Plan runtime never treats a model-authored artifact mutation as eligible
+  // progress; tool partitioning quarantines it and requests typed submission.
+  void input;
+  return false;
 }
 
 export function resolveToolProgressRouting(input: {

@@ -15,6 +15,7 @@ import {
   registerCoordinatedSubagentRun,
   recordSubagentRuntimeSample,
   reportSubagentCapacityFailure,
+  normalizeSubagentSessionEpoch,
   parseSubagentAllowedPaths,
   releaseSubagentScopeLease,
   reserveSubagentScope,
@@ -22,10 +23,12 @@ import {
   resolveSubagentCapacityPolicy,
   unregisterSubagentAbortController,
   withSubagentCapacity,
+  SUBAGENT_CLOSURE_SCHEMA_VERSION,
   type SpawnSubagentRequest,
   type SpawnSubagentResult,
   type SubagentActivity,
   type SubagentPathCoverageAudit,
+  type SubagentClosureEnvelope,
   type SubagentProgress,
   type SubagentRunPatch,
   type SubagentExecutionScope,
@@ -42,9 +45,12 @@ import {
 } from "./orchestrator/fileReadCache";
 import {
   extractPlanEvidenceFacts,
+  extractPlanEvidenceSourceFacts,
   mergePlanEvidenceFacts,
   summarizePlanEvidenceDetail,
 } from "./planMaterialization";
+import { extractRuntimePlanEvidenceDiscovery } from "./planEvidenceObligations";
+import { normalizeWorkspacePathIdentity } from "./workspacePaths";
 
 const SUBAGENT_NAMES = ["Euler", "Mendel", "Herschel", "Noether", "Turing", "Curie"];
 const SUBAGENT_EVIDENCE_TOOL_NAMES = new Set([
@@ -253,6 +259,7 @@ function parseStructuredSubagentSummary(summary: string): unknown {
   }
 }
 
+/** Legacy presentation extractor. Never use this output as closure authority. */
 export function extractDeclaredSubagentRemainingWork(summary: string): string {
   const text = String(summary || "");
   const structured = parseStructuredSubagentSummary(text);
@@ -268,37 +275,6 @@ export function extractDeclaredSubagentRemainingWork(summary: string): string {
   const tail = text.slice(marker.index + marker[0].length);
   const section = tail.split(/\n\s*(?:#{1,6}\s+|(?:\*\*|__)[^*\n]{1,48}(?:\*\*|__)\s*[:：])/)[0] || "";
   return normalizeDeclaredRemainingWorkValue(section);
-}
-
-function hasDeclaredSubagentRemainingWorkSection(summary: string): boolean {
-  const text = String(summary || "");
-  if (/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:剩余(?:范围内|作用域内)?工作|Remaining (?:In-Scope |Scoped )?Work)(?:\*\*|__)?\s*[:：]?[ \t]*/i.test(text)) {
-    return true;
-  }
-  const structured = parseStructuredSubagentSummary(text);
-  if (structured === null) return false;
-  const visit = (value: unknown, depth = 0): boolean => {
-    if (depth > 12 || value === null || value === undefined) return false;
-    if (Array.isArray(value)) return value.some((item) => visit(item, depth + 1));
-    if (typeof value !== "object") return false;
-    return Object.entries(value as Record<string, unknown>).some(([key, item]) => {
-      const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
-      if ([
-        "remainingwork",
-        "remainingtasks",
-        "remaininginscopework",
-        "remainingscopedwork",
-        "剩余工作",
-        "剩余范围内工作",
-        "剩余作用域内工作",
-      ].includes(normalizedKey)) return true;
-      if (["data", "example", "examples", "input", "inputs", "properties", "schema", "schemas", "source", "sources", "toolresult", "toolresults"].includes(normalizedKey)) {
-        return false;
-      }
-      return visit(item, depth + 1);
-    });
-  };
-  return visit(structured);
 }
 
 export function extractDeclaredSubagentParentHandoff(summary: string): string {
@@ -573,6 +549,19 @@ function compactEvidence(
               contentChars: Math.max(previousObservation.contentChars, item.observation.contentChars),
               negative: previousObservation.negative && item.observation.negative,
               substantive: previousObservation.substantive || item.observation.substantive,
+              observedTargetRefs: [...new Set([
+                ...(previousObservation.observedTargetRefs || []),
+                ...(item.observation.observedTargetRefs || []),
+              ])].slice(0, 80),
+              observedOccurrences: [
+                ...(previousObservation.observedOccurrences || []),
+                ...(item.observation.observedOccurrences || []),
+              ].filter((occurrence, index, all) => all.findIndex((candidate) =>
+                normalizeWorkspacePathIdentity(candidate.targetRef) === normalizeWorkspacePathIdentity(occurrence.targetRef) &&
+                candidate.anchorLine === occurrence.anchorLine &&
+                candidate.startLine === occurrence.startLine &&
+                candidate.endLine === occurrence.endLine
+              ) === index).slice(0, 40),
             }
           : { ...item.observation };
       }
@@ -692,8 +681,48 @@ function resolveOutcomeStatus(outcome: AgentLoopOutcome, aborted: boolean): Suba
   return "blocked";
 }
 
+function buildRuntimeSubagentClosure(input: {
+  owner: SubagentClosureEnvelope["owner"];
+  scopeKey: string;
+  status: SubagentClosureEnvelope["status"];
+  remainingWork: string | null;
+  evidence: SubagentResultEnvelope["evidence"];
+  pathCoverage: SubagentPathCoverageAudit;
+  reasonCode: string;
+  reason: string;
+}): SubagentClosureEnvelope {
+  const substantiveEvidence = input.evidence.filter(isSubagentEvidenceSubstantive);
+  const state: SubagentClosureEnvelope["state"] = input.status === "completed"
+    ? "satisfied"
+    : input.status === "degraded" && substantiveEvidence.length > 0
+    ? "partial"
+    : "blocked";
+  return {
+    schemaVersion: SUBAGENT_CLOSURE_SCHEMA_VERSION,
+    owner: input.owner,
+    scopeKey: input.scopeKey,
+    status: input.status,
+    state,
+    remainingWork: input.status === "completed"
+      ? null
+      : compactText(input.remainingWork, 1_000) || "The assigned child scope remains unresolved.",
+    observationCount: input.evidence.length,
+    substantiveEvidenceCount: substantiveEvidence.length,
+    acceptedEvidenceToolCallIds: [...new Set(substantiveEvidence
+      .map((item) => String(item.provenance.sourceToolCallId || "").trim())
+      .filter(Boolean))],
+    requiredPaths: input.pathCoverage.requiredPaths,
+    coveredPaths: input.pathCoverage.coveredPaths,
+    failedPaths: input.pathCoverage.failedPaths,
+    uncoveredPaths: input.pathCoverage.uncoveredPaths,
+    reasonCode: compactText(input.reasonCode, 120) || "subagent_closure_unknown",
+    reason: compactText(input.reason, 1_000) || "The controlled child runtime did not publish a closure reason.",
+  };
+}
+
 interface PreparedSubagentRun {
   subagentId: string;
+  generation: string;
   name: string;
   role: string;
   objective: string;
@@ -705,6 +734,7 @@ export function scheduleControlledSubagent(input: {
   request: SpawnSubagentRequest;
   parentCallbacks: OrchestratorCallbacks;
   parentTurnId: string;
+  parentSessionEpoch?: string;
   parentSignal?: AbortSignal;
   existingRunCount: number;
   emitEvent: (event: MainThreadEvent) => void;
@@ -712,6 +742,9 @@ export function scheduleControlledSubagent(input: {
 }): SpawnSubagentResult {
   const parentConfig = input.parentCallbacks.getConfig();
   const policy = resolveSubagentCapacityPolicy(parentConfig);
+  // existingRunCount is the number of currently registered children, not a
+  // lifetime Turn counter. Completed children are joined and released, after
+  // which a later diagnostic/verification wave may use the capacity again.
   if (input.existingRunCount >= policy.maxCreatedPerTurn) {
     const deferred = buildSubagentPolicyDeferral({
       name: input.request.name,
@@ -721,7 +754,7 @@ export function scheduleControlledSubagent(input: {
     input.parentCallbacks.onDebugEvent?.("delegation_admission_decision", {
       decision: "deferred",
       reason: deferred.reason,
-      existingRunCount: input.existingRunCount,
+      activeRunCount: input.existingRunCount,
       maxCreatedPerTurn: policy.maxCreatedPerTurn,
       profile: policy.profile,
     });
@@ -729,6 +762,8 @@ export function scheduleControlledSubagent(input: {
   }
 
   const subagentId = `subagent-${generateId()}`;
+  const generation = `subagent-generation-${generateId()}`;
+  const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
   const name = sanitizeName(input.request.name, input.existingRunCount);
   const requestedRole = compactText(input.request.role || "", 48);
   const role = resolveReadOnlySubagentRole(requestedRole);
@@ -748,6 +783,7 @@ export function scheduleControlledSubagent(input: {
   const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
   const leaseOverlap = findSubagentLeaseOverlap({
     threadId: input.parentCallbacks.getSessionKey(),
+    sessionEpoch: parentSessionEpoch,
     workspace: parentConfig.workspace,
     allowedPaths,
   });
@@ -769,6 +805,7 @@ export function scheduleControlledSubagent(input: {
   }
   const prepared: PreparedSubagentRun = {
     subagentId,
+    generation,
     name,
     role,
     objective,
@@ -792,19 +829,25 @@ export function scheduleControlledSubagent(input: {
   const completion = executeControlledSubagent({ ...input, prepared });
   registerCoordinatedSubagentRun({
     threadId: input.parentCallbacks.getSessionKey(),
+    sessionEpoch: parentSessionEpoch,
     parentTurnId: input.parentTurnId,
     subagentId,
+    generation,
     name,
     scopeKey,
+    objective,
+    runId: `run-${subagentId}`,
+    parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
     completion,
   });
-  return { subagentId, name, status: "queued", scopeKey };
+  return { subagentId, name, status: "queued", scopeKey, allowedPaths };
 }
 
 export async function executeControlledSubagent(input: {
   request: SpawnSubagentRequest;
   parentCallbacks: OrchestratorCallbacks;
   parentTurnId: string;
+  parentSessionEpoch?: string;
   parentSignal?: AbortSignal;
   existingRunCount: number;
   emitEvent: (event: MainThreadEvent) => void;
@@ -818,6 +861,7 @@ export async function executeControlledSubagent(input: {
     const objective = compactText(input.request.objective, 800);
     return {
       subagentId: `subagent-${generateId()}`,
+      generation: `subagent-generation-${generateId()}`,
       name: sanitizeName(input.request.name, input.existingRunCount),
       role: resolveReadOnlySubagentRole(input.request.role),
       objective,
@@ -825,7 +869,14 @@ export async function executeControlledSubagent(input: {
       allowedPaths: parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace),
     };
   })();
-  const { subagentId, name, role, objective, scopeKey, allowedPaths } = prepared;
+  const { subagentId, generation, name, role, objective, scopeKey, allowedPaths } = prepared;
+  const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
+  const runtimeOwnership = {
+    threadId: input.parentCallbacks.getSessionKey(),
+    sessionEpoch: parentSessionEpoch,
+    parentTurnId: input.parentTurnId,
+    generation,
+  };
   const childRunId = `run-${subagentId}`;
   const parentRunId = input.parentCallbacks.getCurrentRunIdentity?.().runId || null;
   const emitChildDebug = (event: string, data: Record<string, unknown> = {}) => {
@@ -852,6 +903,8 @@ export async function executeControlledSubagent(input: {
     scope: compactText(input.request.scope, 500),
     allowedPaths,
     expectedOutput: compactText(input.request.expectedOutput, 500),
+    runId: childRunId,
+    parentRunId,
     status: "queued",
     profile: policy.profile,
     provider: policy.provider,
@@ -881,8 +934,10 @@ export async function executeControlledSubagent(input: {
   });
   reserveSubagentScope({
     threadId: snapshot.threadId,
+    sessionEpoch: parentSessionEpoch,
     parentTurnId: input.parentTurnId,
     subagentId,
+    generation,
     scopeKey,
     workspace: parentConfig.workspace,
     allowedPaths,
@@ -895,7 +950,7 @@ export async function executeControlledSubagent(input: {
   });
 
   const childAbortController = new AbortController();
-  registerSubagentAbortController(subagentId, childAbortController);
+  registerSubagentAbortController(subagentId, childAbortController, runtimeOwnership);
   const abortFromParent = () => childAbortController.abort();
   if (input.parentSignal?.aborted) {
     childAbortController.abort();
@@ -1144,7 +1199,7 @@ export async function executeControlledSubagent(input: {
     onContextCompress: () => {},
     onToolExecuting: (tool, target) => {
       if (!scopeLeaseActivated) {
-        scopeLeaseActivated = activateSubagentScopeLease(subagentId);
+        scopeLeaseActivated = activateSubagentScopeLease(subagentId, runtimeOwnership);
         emitChildDebug("subagent_scope_lease_activated", {
           scopeKey,
           tool,
@@ -1214,26 +1269,29 @@ export async function executeControlledSubagent(input: {
           content: rawObservation,
           maxChars: 400,
         }) || compactText(rawObservation, 1_000);
+        const isSourceObservation = ["read_file", "read_file_window", "read_document"].includes(result.name);
+        const supportsStructuredSourceContracts = ["read_file", "read_file_window"].includes(result.name) &&
+          /\.(?:[cm]?[jt]sx?|rs|py|go|swift|java|kt|cs|cpp|c|h|hpp|vue|svelte|css|scss|html|json|toml|ya?ml)$/i.test(sourcePath);
         const facts = mergePlanEvidenceFacts(
           extractPlanEvidenceFacts(rawObservation),
+          supportsStructuredSourceContracts ? extractPlanEvidenceSourceFacts(rawObservation) : [],
           extractPlanEvidenceFacts(detail),
         );
-        const isSourceRead = ["read_file", "read_file_window", "read_document"].includes(result.name);
         const isStructureRead = result.name === "get_file_outline";
         const isDiffRead = result.name === "git_diff";
-        const observationKind = isSourceRead
+        const observationKind = isSourceObservation
           ? "source"
           : isStructureRead
           ? "structure"
           : isDiffRead
           ? "diff"
           : "search";
-        const envelopedSourceContent = isSourceRead
+        const envelopedSourceContent = isSourceObservation
           ? extractObservedReadFileWindowContent(rawObservation)
           : null;
-        const isCachedSourceStub = isSourceRead &&
+        const isCachedSourceStub = isSourceObservation &&
           /FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|READ_FILE_REPEAT_LIMIT/i.test(rawObservation);
-        const effectiveSourceContent = isSourceRead
+        const effectiveSourceContent = isSourceObservation
           ? envelopedSourceContent !== null
             ? envelopedSourceContent
             : isCachedSourceStub ? null : rawObservation
@@ -1243,11 +1301,11 @@ export async function executeControlledSubagent(input: {
             isEmptySubagentStructureObservation(rawObservation) ||
             isEmptySubagentStructureObservation(detail)
           )
-        ) || (isSourceRead && effectiveSourceContent !== null && effectiveSourceContent.trim() === "");
+        ) || (isSourceObservation && effectiveSourceContent !== null && effectiveSourceContent.trim() === "");
         const sourceContentChars = effectiveSourceContent === null
           ? 0
           : [...effectiveSourceContent].length;
-        const substantive = isSourceRead
+        const substantive = isSourceObservation
           ? effectiveSourceContent !== null
           : isStructureRead
           ? !negative && detail.trim().length > 0
@@ -1258,12 +1316,17 @@ export async function executeControlledSubagent(input: {
         const sourceObservation = !result.scopedReadObservations?.length && result.readFileObservation
           ? { ...result.readFileObservation }
           : undefined;
-        const sourceRange = isSourceRead && envelopedSourceContent !== null
+        const sourceRange = isSourceObservation && envelopedSourceContent !== null
           ? buildFileReadWindowIdentity(rawObservation)
           : undefined;
         const sourceContentHash = effectiveSourceContent !== null
           ? hashString(effectiveSourceContent)
           : "";
+        const discoveryObservation = extractRuntimePlanEvidenceDiscovery({
+          tool: result.name,
+          content: rawObservation,
+          args: result.executedArgs,
+        });
         const factReferences = facts.map((fact) => ({
           fact,
           sourceToolCallId: result.toolCallId,
@@ -1284,9 +1347,22 @@ export async function executeControlledSubagent(input: {
           observation: {
             kind: observationKind,
             sourcePath,
-            contentChars: isSourceRead ? sourceContentChars : [...rawObservation].length,
+            contentChars: isSourceObservation ? sourceContentChars : [...rawObservation].length,
             negative,
             substantive,
+            ...(discoveryObservation?.targetRefs.length
+              ? { observedTargetRefs: discoveryObservation.targetRefs }
+              : {}),
+            ...(discoveryObservation?.occurrences?.length
+              ? {
+                  observedOccurrences: discoveryObservation.occurrences.map((occurrence) => ({
+                    ...occurrence,
+                  })),
+                }
+              : {}),
+            ...(discoveryObservation?.queryRef
+              ? { queryRef: discoveryObservation.queryRef }
+              : {}),
           },
           provenance: {
             source: "tool_observation",
@@ -1302,7 +1378,7 @@ export async function executeControlledSubagent(input: {
               ? { sourceVersion: sourceObservation.versionToken }
               : {}),
             ...(sourceContentHash ? { sourceContentHash } : {}),
-            ...(isSourceRead ? { sourceContentChars } : {}),
+            ...(isSourceObservation ? { sourceContentChars } : {}),
             ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
             ...(factReferences.length > 0 ? { factReferences } : {}),
           },
@@ -1333,6 +1409,7 @@ export async function executeControlledSubagent(input: {
   };
 
   let finalStatus: SubagentStatus = "failed";
+  let finalClosureAudit: SubagentClosureEnvelope | null = null;
   let runtimeCompletedSuccessfully = false;
   let finalSummary = "";
   let wallClockTimedOut = false;
@@ -1439,42 +1516,26 @@ export async function executeControlledSubagent(input: {
         );
         finalSummary = candidateSummary;
         const compactedEvidence = compactEvidence(evidence);
-        const declaredRemainingWork = extractDeclaredSubagentRemainingWork(candidateSummary);
-        const declaredRemainingWorkSection = hasDeclaredSubagentRemainingWorkSection(candidateSummary);
+        // The report is presentation-only. In particular, translated phrases
+        // such as "none" / "无" must not change a runtime terminal state.
         const parentHandoff = extractDeclaredSubagentParentHandoff(candidateSummary);
         const requiresEvidence = String(input.request.expectedOutput || "").trim().length > 0;
         const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
         const hasSubstantiveEvidence = substantiveEvidence.length > 0;
         const pathCoverage = resolvePathCoverage();
-        if (
-          finalStatus !== "completed" &&
-          outcome.status === "completed" &&
-          outcome.reason === "subagent_max_iterations_partial_handoff" &&
-          declaredRemainingWorkSection &&
-          !declaredRemainingWork &&
-          hasSubstantiveEvidence &&
-          pathCoverage.uncoveredPaths.length === 0
-        ) {
-          finalStatus = "completed";
-          lastError = "";
-          emitChildDebug("subagent_bounded_handoff_closed", {
-            reason: "explicit_scope_closure_with_evidence",
-            observationCount: compactedEvidence.length,
-            substantiveEvidenceCount: substantiveEvidence.length,
-            coveredPaths: pathCoverage.coveredPaths,
-          });
-        }
-        if (finalStatus === "completed" && declaredRemainingWork) {
-          finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
-          lastError = "SUBAGENT_REMAINING_WORK_DECLARED: the child report explicitly identifies unfinished in-scope work.";
-          emitChildDebug("subagent_completion_downgraded", {
-            reason: "declared_remaining_work",
-            observationCount: compactedEvidence.length,
-            substantiveEvidenceCount: substantiveEvidence.length,
-            remainingWork: declaredRemainingWork,
-          });
-        } else if (finalStatus === "completed" && requiresEvidence && !hasSubstantiveEvidence) {
+        let closureReasonCode = finalStatus === "completed"
+          ? "runtime_completed"
+          : finalStatus === "canceled"
+          ? "runtime_canceled"
+          : finalStatus === "failed"
+          ? "runtime_failed"
+          : finalStatus === "degraded"
+          ? "runtime_partial"
+          : "runtime_blocked";
+        if (wallClockTimedOut) closureReasonCode = "wall_clock_timeout";
+        if (finalStatus === "completed" && requiresEvidence && !hasSubstantiveEvidence) {
           finalStatus = "blocked";
+          closureReasonCode = "missing_substantive_evidence";
           lastError = "SUBAGENT_EVIDENCE_REQUIRED: the expected output requires source evidence, but no substantive tool observation was returned.";
           emitChildDebug("subagent_completion_downgraded", {
             reason: "missing_substantive_evidence",
@@ -1484,6 +1545,7 @@ export async function executeControlledSubagent(input: {
         }
         if (finalStatus === "completed" && pathCoverage.uncoveredPaths.length > 0) {
           finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
+          closureReasonCode = "incomplete_required_path_coverage";
           lastError = [
             "SUBAGENT_SCOPE_COVERAGE_INCOMPLETE: required path observations are incomplete.",
             `uncovered=[${pathCoverage.uncoveredPaths.join(", ")}]`,
@@ -1514,6 +1576,7 @@ export async function executeControlledSubagent(input: {
           (candidateSummary.length > 0 || evidence.length > 0)
         ) {
           finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
+          closureReasonCode = "runtime_partial_outcome";
           emitChildDebug("subagent_partial_result_preserved", {
             outcomeStatus: outcome.status,
             outcomePauseKind: outcome.status === "paused" ? outcome.pauseKind : null,
@@ -1526,6 +1589,7 @@ export async function executeControlledSubagent(input: {
         }
         if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, lastError || outcome.reason)) {
           finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
+          closureReasonCode = "runtime_capacity_failure";
         }
         if (!finalSummary) {
           finalSummary = finalStatus === "completed"
@@ -1534,36 +1598,36 @@ export async function executeControlledSubagent(input: {
         }
         const completedAt = Date.now();
         const coverageRemainingWork = buildCoverageRemainingWork(pathCoverage);
-        const remainingWork = finalStatus === "completed"
-          ? ""
-          : declaredRemainingWork || coverageRemainingWork || objective;
-        const closureState: NonNullable<SubagentResultEnvelope["closureAudit"]>["state"] =
-          finalStatus === "completed"
-            ? "satisfied"
-            : finalStatus === "degraded" && hasSubstantiveEvidence
-            ? "partial"
-            : "blocked";
-        const closureReason = closureState === "satisfied"
+        const runtimeRemainingWork = finalStatus === "completed"
+          ? null
+          : coverageRemainingWork || objective;
+        const closureReason = finalStatus === "completed"
           ? requiresEvidence
-            ? "The expected output is backed by substantive tool observations and no remaining work was declared."
-            : "The child runtime completed and declared no remaining work."
-          : closureState === "partial"
+            ? "The expected output is backed by substantive runtime tool observations."
+            : "The controlled child runtime completed successfully."
+          : finalStatus === "degraded" && hasSubstantiveEvidence
           ? lastError || outcome.reason || "Substantive evidence was returned, but in-scope work remains."
           : lastError || outcome.reason || "The child did not produce sufficient evidence to close the objective.";
-        const acceptedEvidenceToolCallIds = [...new Set(substantiveEvidence
-          .map((item) => String(item.provenance.sourceToolCallId || "").trim())
-          .filter(Boolean))];
-        const closureAudit: NonNullable<SubagentResultEnvelope["closureAudit"]> = {
-          state: closureState,
-          observationCount: compactedEvidence.length,
-          substantiveEvidenceCount: substantiveEvidence.length,
-          acceptedEvidenceToolCallIds,
-          requiredPaths: pathCoverage.requiredPaths,
-          coveredPaths: pathCoverage.coveredPaths,
-          failedPaths: pathCoverage.failedPaths,
-          uncoveredPaths: pathCoverage.uncoveredPaths,
+        const closureAudit = buildRuntimeSubagentClosure({
+          owner: {
+            agentKind: "subagent",
+            threadId: snapshot.threadId,
+            parentTurnId: input.parentTurnId,
+            subagentId,
+            runId: childRunId,
+            parentRunId,
+          },
+          scopeKey,
+          status: finalStatus as SubagentClosureEnvelope["status"],
+          remainingWork: runtimeRemainingWork,
+          evidence: compactedEvidence,
+          pathCoverage,
+          reasonCode: closureReasonCode,
           reason: closureReason,
-        };
+        });
+        finalClosureAudit = closureAudit;
+        const closureState = closureAudit.state;
+        const remainingWork = closureAudit.remainingWork || "";
         runtimeCompletedSuccessfully = finalStatus === "completed";
         emitUpdate({
           status: finalStatus,
@@ -1573,6 +1637,7 @@ export async function executeControlledSubagent(input: {
           observationCount: compactedEvidence.length,
           substantiveEvidenceCount: substantiveEvidence.length,
           closureState,
+          closureAudit,
           ...(remainingWork ? { remainingWork } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
           ...(parentHandoff ? { parentHandoff } : {}),
@@ -1628,9 +1693,7 @@ export async function executeControlledSubagent(input: {
           closureAudit,
           ...(parentHandoff ? { parentHandoff } : {}),
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
-          ...(finalStatus === "blocked" || finalStatus === "degraded"
-            ? { remainingWork }
-            : {}),
+          ...(closureAudit.remainingWork ? { remainingWork: closureAudit.remainingWork } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
         };
       },
@@ -1651,24 +1714,46 @@ export async function executeControlledSubagent(input: {
     if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, error)) {
       finalStatus = substantiveEvidence.length > 0 ? "degraded" : "blocked";
     }
-    const remainingWork = extractDeclaredSubagentRemainingWork(finalSummary) ||
-      buildCoverageRemainingWork(pathCoverage) ||
-      objective;
-    const closureState: NonNullable<SubagentResultEnvelope["closureAudit"]>["state"] =
-      finalStatus === "degraded" && substantiveEvidence.length > 0 ? "partial" : "blocked";
-    const closureAudit: NonNullable<SubagentResultEnvelope["closureAudit"]> = {
-      state: closureState,
-      observationCount: compactedEvidence.length,
-      substantiveEvidenceCount: substantiveEvidence.length,
-      acceptedEvidenceToolCallIds: [...new Set(substantiveEvidence
-        .map((item) => String(item.provenance.sourceToolCallId || "").trim())
-        .filter(Boolean))],
-      requiredPaths: pathCoverage.requiredPaths,
-      coveredPaths: pathCoverage.coveredPaths,
-      failedPaths: pathCoverage.failedPaths,
-      uncoveredPaths: pathCoverage.uncoveredPaths,
+    // Child synthesis and child tool observations have separate authority.
+    // A stream/protocol failure after substantive runtime observations must
+    // not erase those observations from the parent join. Preserve them under
+    // a partial closure while keeping the child summary untrusted.
+    if (finalStatus === "failed" && substantiveEvidence.length > 0) {
+      finalStatus = "degraded";
+      emitChildDebug("subagent_partial_evidence_preserved_after_runtime_failure", {
+        observationCount: compactedEvidence.length,
+        substantiveEvidenceCount: substantiveEvidence.length,
+        reason: compactText(lastError, 240) || "runtime_failure",
+      });
+    }
+    const remainingWork = buildCoverageRemainingWork(pathCoverage) || objective;
+    const closureAudit = buildRuntimeSubagentClosure({
+      owner: {
+        agentKind: "subagent",
+        threadId: snapshot.threadId,
+        parentTurnId: input.parentTurnId,
+        subagentId,
+        runId: childRunId,
+        parentRunId,
+      },
+      scopeKey,
+      status: finalStatus as SubagentClosureEnvelope["status"],
+      remainingWork,
+      evidence: compactedEvidence,
+      pathCoverage,
+      reasonCode: wallClockTimedOut
+        ? "wall_clock_timeout"
+        : finalStatus === "canceled"
+        ? "runtime_canceled"
+        : finalStatus === "degraded"
+        ? "runtime_partial_failure"
+        : finalStatus === "blocked"
+        ? "runtime_blocked"
+        : "runtime_failed",
       reason: lastError || "The child runtime failed before the objective could be closed.",
-    };
+    });
+    finalClosureAudit = closureAudit;
+    const closureState = closureAudit.state;
     emitUpdate({
       status: finalStatus,
       completedAt: Date.now(),
@@ -1678,18 +1763,27 @@ export async function executeControlledSubagent(input: {
       observationCount: compactedEvidence.length,
       substantiveEvidenceCount: substantiveEvidence.length,
       closureState,
+      closureAudit,
       remainingWork,
       progress: {
         phase: "done",
         title: finalStatus === "canceled"
           ? language === "zh" ? "已取消" : "Canceled"
+          : finalStatus === "degraded"
+          ? language === "zh" ? "已返回可用的部分结果" : "Usable partial result returned"
           : language === "zh" ? "执行失败" : "Execution failed",
         completedToolCalls,
       },
     }, makeActivity(
-      finalStatus === "canceled" ? "canceled" : "failed",
+      finalStatus === "canceled"
+        ? "canceled"
+        : finalStatus === "degraded"
+        ? "completed"
+        : "failed",
       finalStatus === "canceled"
         ? language === "zh" ? "用户已停止子智能体" : "Subagent stopped by the user"
+        : finalStatus === "degraded"
+        ? language === "zh" ? "返回部分摘要" : "Partial summary returned"
         : language === "zh" ? "子智能体执行失败" : "Subagent execution failed",
       undefined,
       undefined,
@@ -1705,7 +1799,7 @@ export async function executeControlledSubagent(input: {
       evidence: compactedEvidence,
       closureAudit,
       blocker: lastError,
-      ...(finalStatus === "blocked" || finalStatus === "degraded" ? { remainingWork } : {}),
+      ...(closureAudit.remainingWork ? { remainingWork: closureAudit.remainingWork } : {}),
       error: lastError,
     };
   } finally {
@@ -1736,6 +1830,10 @@ export async function executeControlledSubagent(input: {
       coveredPaths: finalPathCoverage.coveredPaths,
       failedPaths: finalPathCoverage.failedPaths,
       uncoveredPaths: finalPathCoverage.uncoveredPaths,
+      closureSchemaVersion: finalClosureAudit?.schemaVersion || null,
+      closureState: finalClosureAudit?.state || "blocked",
+      closureReasonCode: finalClosureAudit?.reasonCode || "subagent_closure_missing",
+      closureOwner: finalClosureAudit?.owner || null,
       summaryTrust: "unverified_hypothesis",
       blocker: compactText(lastError, 300) || null,
       scopeLeaseActivated,
@@ -1750,7 +1848,7 @@ export async function executeControlledSubagent(input: {
       reason: finalStatus,
     }));
     input.parentSignal?.removeEventListener("abort", abortFromParent);
-    unregisterSubagentAbortController(subagentId);
-    releaseSubagentScopeLease(subagentId);
+    unregisterSubagentAbortController(subagentId, runtimeOwnership);
+    releaseSubagentScopeLease(subagentId, runtimeOwnership);
   }
 }

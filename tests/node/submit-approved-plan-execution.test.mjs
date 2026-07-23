@@ -393,7 +393,7 @@ test("approval readiness rejects a bogus read-only runtime task for a mutation p
   assert.equal(readiness.executableValidationTaskCount, 0);
 });
 
-test("approval readiness preserves a nested mutation under a themed diagnosis plan", () => {
+test("approval readiness rejects a themed diagnosis plan with only dev-server and generic browser checks", () => {
   const artifact = reviewablePlanArtifact(themedDiagnosisNestedMutationPlan());
   const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
     planArtifacts: [artifact],
@@ -405,7 +405,9 @@ test("approval readiness preserves a nested mutation under a themed diagnosis pl
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
   assert.equal(readiness.mutationOriented, true);
   assert.equal(readiness.concreteMutationTaskCount, 1);
   assert.equal(
@@ -433,7 +435,8 @@ test("approval readiness rejects a recovered Plan whose validation prose has no 
   });
 
   assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
   assert.equal(readiness.concreteMutationTaskCount, 1);
   assert.equal(readiness.executableValidationTaskCount, 0);
   assert.ok(executionPlanTasks.some((task) =>
@@ -707,7 +710,8 @@ test("approval readiness rejects flattened validation prose without a concrete c
   });
 
   assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
   assert.equal(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "cmd")
   ), false, JSON.stringify(executionPlanTasks));
@@ -820,7 +824,8 @@ test("approval task projection keeps the OMLX mutation but rejects its vague val
     directEvidence: inferPlanTaskEvidence("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creatorName 正确赋值。"),
     actionable: isRuntimeTaskActionableText("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：read file src/hooks/useCsvParser.ts: L1: export interface CsvOrder L2: creator?: string; L6: export function normalizeCsvOrder(row: Record<string, string ): CsvOrder L7: return L8: creator: row.creator || row '创建者' || ''...。"),
   }));
-  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
   ));
@@ -1155,7 +1160,9 @@ test("approval readiness treats a plain prose change section as mutation-oriente
 
   assert.equal(readiness.mutationOriented, true);
   assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
-  assert.equal(readiness.ok, true, JSON.stringify(readiness));
+  assert.equal(readiness.ok, false, JSON.stringify(readiness));
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
 });
 
 test("approval task projection keeps an explicit modification file while rejecting vague validation", () => {
@@ -1186,7 +1193,8 @@ test("approval task projection keeps an explicit modification file while rejecti
   });
 
   assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
   assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) =>
@@ -1195,7 +1203,7 @@ test("approval task projection keeps an explicit modification file while rejecti
   ));
 });
 
-test("approval readiness preserves the native contract for a design-only review artifact", () => {
+test("approval readiness rejects a design-only supporting artifact without a primary Plan", () => {
   const artifact = reviewablePlanArtifact([
     "# 文件打开链路设计",
     "",
@@ -1227,11 +1235,9 @@ test("approval readiness preserves the native contract for a design-only review 
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true);
-  assert.equal(readiness.mutationOriented, true);
-  assert.equal(readiness.requiresExecutableValidation, true);
-  assert.ok(readiness.concreteMutationTaskCount >= 1);
-  assert.ok(readiness.executableValidationTaskCount >= 1);
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.reason, "missing_reviewable_plan_artifact");
+  assert.equal(readiness.mutationOriented, false);
 });
 
 test("approvePlan applies readiness failure before queuing a same-turn child run", () => {

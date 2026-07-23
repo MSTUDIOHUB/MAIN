@@ -135,20 +135,23 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   assert.equal(autoRead.action, "auto_execute");
   assert.equal(initialLifecycleStateForPlanAction(autoRead.action), "queued");
 
-  const specAutoApproved = planRuntimeToolCall(createPlanInput({
+  const blockedRuntimeOwnedPlanArtifact = planRuntimeToolCall(createPlanInput({
     toolCall: { id: "d", name: "write_file", arguments: JSON.stringify({ path: ".MAIN/plans/plan.md", content: "# design" }) },
     workflowMode: "plan",
     runtimeIntent: "plan",
     isPlanApproved: false,
+    autoApproveToolScopes: ["workspace_write"],
   }));
-  assert.equal(specAutoApproved.action, "spec_file_auto_approved");
-  assert.equal(initialLifecycleStateForPlanAction(specAutoApproved.action), "queued");
+  assert.equal(blockedRuntimeOwnedPlanArtifact.action, "blocked_plan_gate");
+  assert.equal(blockedRuntimeOwnedPlanArtifact.reason, "pre_approval_plan_artifact_write");
+  assert.equal(initialLifecycleStateForPlanAction(blockedRuntimeOwnedPlanArtifact.action), "blocked");
 
   const blockedPlanGate = planRuntimeToolCall(createPlanInput({
     toolCall: { id: "e", name: "write_file", arguments: JSON.stringify({ path: "src/core.ts", content: "x" }) },
     workflowMode: "plan",
     runtimeIntent: "plan",
     isPlanApproved: false,
+    autoApproveToolScopes: ["workspace_write"],
   }));
   assert.equal(blockedPlanGate.action, "blocked_plan_gate");
   assert.equal(blockedPlanGate.reason, "pre_approval_source_write");

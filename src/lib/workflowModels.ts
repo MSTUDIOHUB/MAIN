@@ -4,8 +4,18 @@ import {
   resolveRunIntentFromLegacyWorkflowMode,
 } from "./runIntent";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
-import { looksLongRunningShellCommand } from "./toolExecutionContract";
 import type { AgentLoopOutcomeStatus, AgentLoopPauseKind, AgentLoopResultKind } from "./runOutcome";
+import type { PlanCandidateV2 } from "./planContract";
+import {
+  analyzeValidationCommand,
+  commandContainsServiceProcess,
+  evaluateValidationSpec,
+  isAcceptanceCapableValidationSpec,
+  type FiniteValidationCommandCapability as ContractFiniteValidationCommandCapability,
+  type ValidationEvidence,
+  type ValidationEvaluation,
+  type ValidationPrimitiveSpec,
+} from "./validationContract";
 
 // lib/workflowModels.ts
 // 计划面板、回合视图、流式归一化共享模型。
@@ -336,6 +346,8 @@ export interface BrowserInteractionAssertion {
   changedAfterAction?: boolean;
   /** Runtime-derived temporal/observable link; never inferred from model prose. */
   causallyLinked?: boolean;
+  /** Structured value observed by the automation adapter, when available. */
+  actual?: unknown;
 }
 
 export interface BrowserInteractionState {
@@ -383,6 +395,22 @@ export interface PlanExecutionEvidenceEntry {
   planTaskId?: string;
   /** Stable requirement reference retained alongside the concrete task id. */
   requirementRef?: string;
+  /** Typed execution binding; legacy records may omit these fields. */
+  phase?: "planning" | "mutation" | "service" | "validation";
+  operationId?: string;
+  obligationIds?: string[];
+  outcome?: {
+    status: "succeeded" | "failed" | "running" | "ready" | "stopped";
+    exitCode?: number | null;
+    timedOut?: boolean;
+  };
+  /** Runtime-resolved working directory for a shell invocation. */
+  executionCwd?: string;
+  observation?: {
+    summary: string;
+    facts: string[];
+    hash: string;
+  };
   kind: PlanTaskEvidenceKind;
   value: string;
   sourceTool: string;
@@ -396,6 +424,8 @@ export interface PlanExecutionEvidenceEntry {
   interactionBehaviorTargets?: string[];
   /** Browser actions/checks, when the adapter returned structured evidence. */
   browserInteraction?: BrowserInteractionEvidence;
+  /** Desktop actions/checks, kept separate so browser proof cannot satisfy desktop acceptance. */
+  desktopInteraction?: BrowserInteractionEvidence;
   /** True only for a completed automation adapter result, never for an external-review marker. */
   automaticValidation?: boolean;
   /** Runtime-owned state for long-lived PTY commands and their observations. */
@@ -450,6 +480,12 @@ export interface PlanArtifact {
   path: string;
   title: string;
   content: string;
+  /** Typed approval/execution truth; content is only its review projection. */
+  candidate?: PlanCandidateV2;
+  candidateHash?: string;
+  authoringContractId?: string;
+  /** One-time cold-import result for pre-v2 Markdown artifacts. */
+  legacyTaskProjection?: PlanTask[];
   /** Monotonic revision of this materialized artifact within the session. */
   revision?: number;
   updatedAt: number;
@@ -468,8 +504,17 @@ export interface PlanTask {
   executionKind?: "mutation" | "validation" | "deliverable" | "observation";
   claimedStatus?: PlanTaskStatus;
   requirementRef?: string;
+  goalRefs?: string[];
+  changeRef?: string;
+  validationRef?: string;
   commands?: string[];
   evidence?: PlanTaskEvidence[];
+  /**
+   * Runtime validation work projected once at the Plan boundary. Legacy
+   * commands/evidence remain readable inputs, but acceptance policy is owned
+   * by validationContract instead of being re-inferred by each consumer.
+   */
+  validation?: ValidationPrimitiveSpec[];
   validationCapability?: PlanTaskValidationCapability;
   evidenceStatus?: PlanTaskEvidenceStatus;
   blockedReason?: string;
@@ -501,6 +546,10 @@ export interface PlanArtifactValidationResult {
   missingSections?: string[];
   recoveryAction?: PlanArtifactRecoveryAction;
   canAutoRepair?: boolean;
+  /** Bounded protocol-adapter diagnostic; never used as approval evidence. */
+  failureStage?: "protocol_markup" | "markdown_container" | "derived_projection";
+  /** The rejected structural owner/task, not the full model response. */
+  failurePreview?: string;
 }
 
 export interface PlanArtifactQualityResult extends PlanArtifactValidationResult {
@@ -973,8 +1022,8 @@ export function planStageFromArtifactKind(kind: PlanArtifactKind): PlanStage {
   }
 }
 
-const SHELL_COMMAND_START_RE = /^(?:pnpm|npm|npx|yarn|bun|corepack|cargo|rustup|pip3?|pytest|python3?|uv|go|swift|dotnet|mvn|(?:\.\/)?gradle(?:w)?|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)\b/i;
-const SHELL_COMMAND_FRAGMENT_RE = /(?:\.\/gradlew\b|\b(?:pnpm|npm|npx|yarn|bun|corepack|cargo|rustup|pip3?|pytest|python3?|uv|go|swift|dotnet|mvn|gradle|gradlew|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)\b)[^\n`"'，。；;)]*/gi;
+const SHELL_COMMAND_START_RE = /^(?:pnpm|npm|npx|yarn|bun|corepack|cargo|rustup|pip3?|pytest|python3?|uv|go|swift|dotnet|mvn|mvnw|(?:\.\/)?(?:gradle|gradlew|mvnw)|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|phpunit|ruby|rails|bundle|rspec|make|cmake|ctest|xcodebuild|eslint|biome|ruff|mypy)\b/i;
+const SHELL_COMMAND_FRAGMENT_RE = /(?:\.\/(?:gradlew|mvnw)\b|\b(?:pnpm|npm|npx|yarn|bun|corepack|cargo|rustup|pip3?|pytest|python3?|uv|go|swift|dotnet|mvn|mvnw|gradle|gradlew|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|phpunit|ruby|rails|bundle|rspec|make|cmake|ctest|xcodebuild|eslint|biome|ruff|mypy)\b)[^\n`"'，。；;)]*/gi;
 const SHELL_COMMAND_CODE_IDENTIFIER_RE = /^(?:tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)::|^[A-Za-z_$][\w$]*(?:::|[.[(])/;
 const SHELL_COMMAND_REQUIRED_OPERAND_RE = /^(?:tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)$/i;
 
@@ -1171,37 +1220,16 @@ const PTY_OBSERVATION_TOOL_NAMES = new Set([
 ]);
 
 export function requiresPtyObservationForPlanCommand(value: string): boolean {
-  return looksLongRunningShellCommand(value);
+  return commandContainsServiceProcess(value);
 }
 
-export type FiniteValidationCommandCapability =
-  | "test"
-  | "build"
-  | "lint"
-  | "typecheck"
-  | "check"
-  | "inline_assertion";
+export type FiniteValidationCommandCapability = ContractFiniteValidationCommandCapability;
 
 export function classifyFiniteValidationCommandCapability(
   value: string,
 ): FiniteValidationCommandCapability | null {
-  const command = String(value || "").trim();
-  if (!command || requiresPtyObservationForPlanCommand(command)) return null;
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|\bnpx\s+(?:playwright|vitest|jest)\b|\b(?:node\s+--test|cargo\s+test|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(command)) return "test";
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b/i.test(command)) return "build";
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?lint\b|\bcargo\s+clippy\b/i.test(command)) return "lint";
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?typecheck\b|\bnpx\s+tsc\b/i.test(command)) return "typecheck";
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?check\b|\bcargo\s+check\b/i.test(command)) return "check";
-
-  // Small repositories and one-file fixes do not always expose a package
-  // script. A bounded inline assertion is still a legitimate finite check;
-  // classifying it as non-validation made successful `node -e` / `python -c`
-  // evidence invisible and sent compatible models back into recovery loops.
-  const inlineAssertion = /(?:^|\s*(?:&&|\|\||;)\s*)(?:node|bun|deno)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command) ||
-    /(?:^|\s*(?:&&|\|\||;)\s*)python3?\b[^\n;&|]{0,200}\s-c(?:\s|$)/i.test(command) ||
-    /(?:^|\s*(?:&&|\|\||;)\s*)(?:ruby\b[^\n;&|]{0,200}\s-e|php\b[^\n;&|]{0,200}\s-r)(?:\s|$)/i.test(command) ||
-    /(?:^|\s*(?:&&|\|\||;)\s*)npx\s+(?:tsx|ts-node)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command);
-  return inlineAssertion ? "inline_assertion" : null;
+  const spec = analyzeValidationCommand(value).spec;
+  return spec?.kind === "finite_command" ? spec.capability : null;
 }
 
 export function isFinitePlanValidationCommand(value: string): boolean {
@@ -1543,6 +1571,95 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
   }
 
   return withAdvisoryEvidence([]);
+}
+
+function projectValidationPrimitivesFromInputs(input: {
+  text: string;
+  commands: string[];
+  evidence: PlanTaskEvidence[];
+}): ValidationPrimitiveSpec[] {
+  const projected: ValidationPrimitiveSpec[] = [];
+  for (const command of input.commands) {
+    const spec = analyzeValidationCommand(command).spec;
+    if (spec) projected.push(spec);
+  }
+  for (const target of extractExplicitValidationAssertionTargets(input.text)) {
+    projected.push({
+      kind: "assertion",
+      // Plain Markdown can describe an expected observation, but it does not
+      // bind that observation to a runtime executor or trusted result
+      // adapter. Keep the assertion visible as advisory planning context;
+      // required acceptance must come from a finite command or a structured
+      // browser/desktop interaction whose result provenance is executable.
+      acceptance: "advisory",
+      target,
+      matcher: "runtime_result",
+      expected: true,
+    });
+  }
+
+  const hasManualOwner = input.evidence.some((item) => item.kind === "manual_user_validation");
+  const hasDesktopSurface = input.evidence.some((item) => item.kind === "tauri_required");
+  const hasBrowserSurface = input.evidence.some((item) =>
+    item.kind === "browser_dom" || item.kind === "browser_screenshot"
+  );
+  const interaction = parseStructuredBrowserInteraction(input.text);
+  const selectorTargets = extractExplicitDomAssertionTargets(input.text);
+  const acceptance = hasManualOwner ? "advisory" as const : "required" as const;
+
+  if ((hasBrowserSurface || hasDesktopSurface) && (interaction || selectorTargets.length > 0)) {
+    const actions = interaction
+      ? [{ kind: "direct_action", target: interaction.actionTarget }]
+      : [];
+    const assertions = interaction
+      ? [{ kind: "observable_state", target: interaction.assertionTarget }]
+      : selectorTargets.map((target) => ({ kind: "dom_state", target }));
+    projected.push({
+      kind: hasDesktopSurface ? "desktop_interaction" : "browser_interaction",
+      acceptance,
+      actions,
+      assertions,
+      requireCausalAssertion: actions.length > 0,
+    });
+  }
+
+  if (hasManualOwner) {
+    projected.push({
+      kind: "advisory",
+      acceptance: "advisory",
+      note: "user confirmation",
+      owner: "user",
+    });
+  } else if (hasDesktopSurface && !projected.some((spec) => spec.kind === "desktop_interaction")) {
+    projected.push({
+      kind: "advisory",
+      acceptance: "advisory",
+      note: "desktop runtime review",
+      owner: "external",
+    });
+  }
+
+  return projected;
+}
+
+/**
+ * Legacy PlanTask adapter. Natural-language projection happens once here;
+ * consumers evaluate the resulting typed primitives instead of running their
+ * own browser/command heuristics.
+ */
+export function projectPlanTaskValidationPrimitives(
+  task: Pick<PlanTask, "text" | "commands" | "evidence" | "validation">,
+): ValidationPrimitiveSpec[] {
+  if (task.validation && task.validation.length > 0) return task.validation;
+  const commands = task.commands || [];
+  const evidence = task.evidence && task.evidence.length > 0
+    ? task.evidence
+    : inferValidationTaskEvidence(task.text, commands);
+  return projectValidationPrimitivesFromInputs({
+    text: task.text,
+    commands,
+    evidence,
+  });
 }
 
 function planTaskEvidenceStatusForUnmatchedValidation(evidence: PlanTaskEvidence[]): {
@@ -2509,11 +2626,239 @@ export function findFirstPlanTaskEvidenceRecord(
   return null;
 }
 
+function typedValidationObligationId(
+  task: Pick<PlanTask, "validationRef">,
+  spec: ValidationPrimitiveSpec,
+): string {
+  return String(spec.id || task.validationRef || "").trim();
+}
+
+function recordBelongsToTypedValidationObligation(
+  task: Pick<PlanTask, "validationRef">,
+  spec: ValidationPrimitiveSpec,
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  const obligationId = typedValidationObligationId(task, spec);
+  if (!obligationId || record.phase !== "validation") return false;
+  return (record.obligationIds || []).some((candidate) => candidate === obligationId);
+}
+
+function validationInteractionEvidence(
+  kind: "browser_interaction_result" | "desktop_interaction_result",
+  record: PlanExecutionEvidenceEntry,
+  interaction: BrowserInteractionEvidence,
+): ValidationEvidence {
+  return {
+    kind,
+    evidenceId: record.id,
+    actions: interaction.actions.map((action) => ({
+      ...(action.id ? { id: action.id } : {}),
+      kind: action.kind,
+      target: action.target,
+      succeeded: action.succeeded,
+    })),
+    assertions: interaction.assertions.map((assertion) => ({
+      kind: assertion.kind,
+      target: assertion.target,
+      passed: assertion.passed,
+      ...(assertion.afterActionId ? { afterActionId: assertion.afterActionId } : {}),
+      ...(typeof assertion.beforePassed === "boolean"
+        ? { beforePassed: assertion.beforePassed }
+        : {}),
+      ...(typeof assertion.changedAfterAction === "boolean"
+        ? { changedAfterAction: assertion.changedAfterAction }
+        : {}),
+      ...(typeof assertion.causallyLinked === "boolean"
+        ? { causallyLinked: assertion.causallyLinked }
+        : {}),
+      ...(assertion.actual !== undefined ? { actual: assertion.actual } : {}),
+    })),
+    ...(interaction.pageErrors.length > 0 ? { pageErrors: [...interaction.pageErrors] } : {}),
+    ...(interaction.consoleErrors.length > 0 ? { consoleErrors: [...interaction.consoleErrors] } : {}),
+  };
+}
+
+function serviceObservationStatus(
+  record: PlanExecutionEvidenceEntry,
+): Extract<ValidationEvidence, { kind: "service_observation_result" }>["status"] {
+  if (record.outcome?.status === "ready" || record.observationStatus === "ready") return "ready";
+  if (record.outcome?.status === "running" || record.observationStatus === "running") return "running";
+  if (record.outcome?.status === "failed" || record.observationStatus === "failed") return "failed";
+  if (record.outcome?.status === "stopped" || record.observationStatus === "stopped") return "stopped";
+  if (record.observationStatus === "pending") return "pending";
+  return "unknown";
+}
+
+/**
+ * Adapt runtime-owned ledger records to one reviewed validation primitive.
+ * Typed acceptance requires both the exact validation obligation identity and
+ * a structured producer result; nearby prose or a generic success entry is
+ * deliberately ignored.
+ */
+export function adaptPlanExecutionEvidenceForValidationSpec(input: {
+  task: Pick<PlanTask, "validationRef">;
+  spec: ValidationPrimitiveSpec;
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+}): ValidationEvidence[] {
+  const records = input.evidenceLedger.filter((record) =>
+    recordBelongsToTypedValidationObligation(input.task, input.spec, record)
+  );
+  if (input.spec.kind === "finite_command") {
+    return records.flatMap((record): ValidationEvidence[] => {
+      if (record.sourceTool !== "run_command") return [];
+      const status = record.outcome?.status;
+      return [{
+        kind: "finite_command_result",
+        evidenceId: record.id,
+        command: String(record.target || record.value || "").trim(),
+        ...(record.executionCwd ? { cwd: record.executionCwd } : {}),
+        completed: status === "succeeded" || status === "failed",
+        ...(record.outcome && "exitCode" in record.outcome
+          ? { exitCode: record.outcome.exitCode }
+          : {}),
+        ...(record.outcome?.timedOut === true ? { timedOut: true } : {}),
+      }];
+    });
+  }
+  if (input.spec.kind === "service_observation") {
+    const spec = input.spec;
+    const launchCommand = normalizeCommandEvidenceValue(spec.launchCommand);
+    return records.flatMap((record): ValidationEvidence[] => {
+      const isLaunch = record.sourceTool === "execute_command" &&
+        normalizeCommandEvidenceValue(record.target || record.value || "") === launchCommand &&
+        (!spec.cwd || record.executionCwd === spec.cwd);
+      const isObservation = PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool);
+      if (!isLaunch && !isObservation) return [];
+      return [{
+        kind: "service_observation_result",
+        evidenceId: record.id,
+        ownerKey: spec.ownerKey,
+        status: serviceObservationStatus(record),
+      }];
+    });
+  }
+  if (input.spec.kind === "browser_interaction") {
+    return records.flatMap((record): ValidationEvidence[] =>
+      record.browserInteraction && sourceToolLooksLikeBrowserAutomation(record.sourceTool)
+        ? [validationInteractionEvidence("browser_interaction_result", record, record.browserInteraction)]
+        : []
+    );
+  }
+  if (input.spec.kind === "desktop_interaction") {
+    return records.flatMap((record): ValidationEvidence[] =>
+      record.desktopInteraction && sourceToolLooksLikeTauriAutomation(record.sourceTool)
+        ? [validationInteractionEvidence("desktop_interaction_result", record, record.desktopInteraction)]
+        : []
+    );
+  }
+  // Assertion results must come from a dedicated producer adapter. Generic
+  // text/tool observations are never upgraded into assertion_result here.
+  return [];
+}
+
+export interface TypedPlanTaskValidationAudit {
+  evaluations: Array<{
+    specId: string;
+    acceptance: ValidationPrimitiveSpec["acceptance"];
+    evaluation: ValidationEvaluation;
+  }>;
+  requiredCount: number;
+  satisfiedRequiredCount: number;
+  acceptanceSatisfied: boolean;
+}
+
+export function evaluateTypedPlanTaskValidation(input: {
+  task: PlanTask;
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+}): TypedPlanTaskValidationAudit | null {
+  if (!input.task.validationRef || !input.task.validation?.length) return null;
+  const evaluations = input.task.validation.map((spec, index) => ({
+    specId: typedValidationObligationId(input.task, spec) || `${input.task.validationRef}:${index + 1}`,
+    acceptance: spec.acceptance,
+    evaluation: evaluateValidationSpec(
+      spec,
+      adaptPlanExecutionEvidenceForValidationSpec({
+        task: input.task,
+        spec,
+        evidenceLedger: input.evidenceLedger,
+      }),
+    ),
+  }));
+  const required = evaluations.filter((entry) => entry.acceptance === "required");
+  const satisfiedRequiredCount = required.filter((entry) =>
+    entry.evaluation.acceptanceSatisfied
+  ).length;
+  return {
+    evaluations,
+    requiredCount: required.length,
+    satisfiedRequiredCount,
+    acceptanceSatisfied: required.length > 0 && satisfiedRequiredCount === required.length,
+  };
+}
+
+function resolveTypedPlanTaskValidationStatus(
+  task: PlanTask,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string; validationCapability?: PlanTaskValidationCapability } | null {
+  const audit = evaluateTypedPlanTaskValidation({ task, evidenceLedger });
+  if (!audit) return null;
+  if (audit.requiredCount === 0) {
+    return {
+      status: "requires_user_confirmation",
+      matched: 0,
+      total: 0,
+      blockedReason: "typed validation contains advisory checks only; advisory evidence does not gate completion",
+      validationCapability: "manual_user_validation",
+    };
+  }
+  if (audit.acceptanceSatisfied) {
+    return {
+      status: "satisfied",
+      matched: audit.satisfiedRequiredCount,
+      total: audit.requiredCount,
+    };
+  }
+  const required = audit.evaluations.filter((entry) => entry.acceptance === "required");
+  const rejected = required.find((entry) =>
+    entry.evaluation.status === "invalid" || entry.evaluation.status === "failed"
+  );
+  const pendingBrowser = required.some((entry) =>
+    entry.evaluation.status === "pending" &&
+    task.validation?.some((spec) =>
+      typedValidationObligationId(task, spec) === entry.specId && spec.kind === "browser_interaction"
+    )
+  );
+  const pendingDesktop = required.some((entry) =>
+    entry.evaluation.status === "pending" &&
+    task.validation?.some((spec) =>
+      typedValidationObligationId(task, spec) === entry.specId && spec.kind === "desktop_interaction"
+    )
+  );
+  return {
+    status: rejected
+      ? "blocked"
+      : pendingBrowser
+      ? "requires_browser_validation"
+      : audit.satisfiedRequiredCount > 0
+      ? "partial"
+      : "missing",
+    matched: audit.satisfiedRequiredCount,
+    total: audit.requiredCount,
+    blockedReason: rejected
+      ? `typed validation ${rejected.specId} rejected: ${rejected.evaluation.reason}`
+      : `typed validation pending (${audit.satisfiedRequiredCount}/${audit.requiredCount} required checks satisfied)`,
+    ...(pendingBrowser ? { validationCapability: "browser_dom" as const } : {}),
+    ...(pendingDesktop ? { validationCapability: "tauri_runtime" as const } : {}),
+  };
+}
+
 function resolvePlanTaskEvidenceStatus(
   task: PlanTask,
   evidenceLedger: PlanExecutionEvidenceEntry[],
   ledgerAlreadyScoped = false,
 ): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string; validationCapability?: PlanTaskValidationCapability } {
+  const typedValidation = resolveTypedPlanTaskValidationStatus(task, evidenceLedger);
+  if (typedValidation) return typedValidation;
   const evidence = planTaskEvidenceItems(task);
   if (evidence.length === 0) {
     return {
@@ -2776,6 +3121,10 @@ export function reconcilePlanTaskCompletion(
       ? task.evidence
       : inferPlanTaskEvidence(task.text, task.commands || []);
     const taskEvidenceLedger = evidenceLedger.filter((record, ledgerIndex) => {
+      const exactTypedValidationBinding = !!task.validationRef &&
+        record.phase === "validation" &&
+        (record.obligationIds || []).includes(task.validationRef);
+      if (exactTypedValidationBinding) return true;
       const browserRecord =
         record.kind === "browser_dom" ||
         record.kind === "browser_screenshot" ||
@@ -2983,6 +3332,11 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
       ...inferredEvidence,
       ...inheritedHeadingEvidence,
     ]);
+    const validation = projectValidationPrimitivesFromInputs({
+      text,
+      commands,
+      evidence,
+    });
     const claimedStatus: PlanTaskStatus = matched[1].toLowerCase() === "x" ? "completed" : "pending";
 
     tasks.push({
@@ -2996,6 +3350,7 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
       ...(requirementMatched ? { requirementRef: requirementMatched[0] } : {}),
       ...(commands.length > 0 ? { commands } : {}),
       ...(evidence.length > 0 ? { evidence } : {}),
+      ...(validation.length > 0 ? { validation } : {}),
       ...(validationCapabilityForEvidence(evidence) ? { validationCapability: validationCapabilityForEvidence(evidence) } : {}),
       evidenceStatus: initialEvidenceStatusForEvidence(evidence),
       ...(claimedStatus === "completed" ? { blockedReason: "等待真实执行证据确认完成" } : {}),
@@ -3022,7 +3377,7 @@ const RUNTIME_TASK_SECTION_RE =
 const RUNTIME_TASK_HEADING_PREFIX = String.raw`(?:\d+\s*[.)、:：-]?\s*)?`;
 const RUNTIME_TASK_HEADING_SUFFIX = String.raw`(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?`;
 const RUNTIME_TASK_VALIDATION_SECTION_RE = new RegExp(
-  `^${RUNTIME_TASK_HEADING_PREFIX}(?:(?:目标\\s*与\\s*)?(?:关键\\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?)|(?:Goals?\\s+and\\s+)?(?:Key\\s+)?(?:Validation(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\\s+(?:Criteria|Tests?|Steps|Results))?))${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
+  `^${RUNTIME_TASK_HEADING_PREFIX}(?:(?:目标\\s*与\\s*)?(?:关键\\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?)|(?:Goals?\\s+and\\s+)?(?:Key\\s+)?(?:Validation(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Tests?(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\\s+(?:Criteria|Tests?|Steps|Results))?))${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
   "i",
 );
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
@@ -3513,20 +3868,31 @@ function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
   const inferredEvidence = parsedEvidence.evidence.length > 0
     ? []
     : inferPlanTaskEvidence(taskText, commands);
-  const evidence = dedupePlanTaskEvidence([
+  let evidence = dedupePlanTaskEvidence([
     ...parsedEvidence.evidence,
     ...inferredEvidence,
   ]);
-  if (evidence.length === 0) return null;
+  const validation = projectValidationPrimitivesFromInputs({
+    text: taskText,
+    commands,
+    evidence,
+  });
+  if (evidence.length === 0 && validation.some(isAcceptanceCapableValidationSpec)) {
+    evidence = [{ kind: "text", value: taskText }];
+  }
+  if (evidence.length === 0 && validation.length === 0) return null;
 
   return {
     id: createPlanTaskId(taskText),
     text: taskText,
     status: "pending",
-    executionKind: inferPlanTaskExecutionKind(taskText, evidence, commands),
+    executionKind: validation.some(isAcceptanceCapableValidationSpec)
+      ? "validation"
+      : inferPlanTaskExecutionKind(taskText, evidence, commands),
     claimedStatus: "pending",
     ...(commands.length > 0 ? { commands } : {}),
     ...(evidence.length > 0 ? { evidence } : {}),
+    ...(validation.length > 0 ? { validation } : {}),
     ...(validationCapabilityForEvidence(evidence) ? { validationCapability: validationCapabilityForEvidence(evidence) } : {}),
     evidenceStatus: initialEvidenceStatusForEvidence(evidence),
     blockedReason: initialEvidenceDecisionForEvidence(evidence).reason ||
@@ -3542,6 +3908,12 @@ function makeRuntimeTaskFromEvidenceText(
   language: "zh" | "en",
   executionKind?: NonNullable<PlanTask["executionKind"]>,
 ): PlanTask {
+  const commands = evidence.kind === "cmd" ? [evidence.value] : [];
+  const validation = projectValidationPrimitivesFromInputs({
+    text,
+    commands,
+    evidence: [evidence],
+  });
   return {
     id: createPlanTaskId(text),
     text,
@@ -3549,11 +3921,12 @@ function makeRuntimeTaskFromEvidenceText(
     executionKind: executionKind || inferPlanTaskExecutionKind(
       text,
       [evidence],
-      evidence.kind === "cmd" ? [evidence.value] : [],
+      commands,
     ),
     claimedStatus: "pending",
     evidence: [evidence],
-    ...(evidence.kind === "cmd" ? { commands: [evidence.value] } : {}),
+    ...(commands.length > 0 ? { commands } : {}),
+    ...(validation.length > 0 ? { validation } : {}),
     ...(validationCapabilityForEvidence([evidence]) ? { validationCapability: validationCapabilityForEvidence([evidence]) } : {}),
     evidenceStatus: initialEvidenceStatusForEvidence([evidence]),
     blockedReason: initialEvidenceDecisionForEvidence([evidence]).reason ||
@@ -4282,7 +4655,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
   }
 
   for (const scenario of collectConcreteStepExpectationScenarios(
-    extractPlanTestSectionBody(normalizedRuntimeContent),
+    extractPlanValidationSectionBody(normalizedRuntimeContent),
   )) {
     if (tasks.length >= maxTasks) break;
     pushTask(makeRuntimeTask(scenario, language));
@@ -4365,7 +4738,12 @@ export function validateDerivedPlanTasksForApproval(
     const normalizedOutcome = normalizeMutationOutcomeIdentity(outcome);
     const identifierOnly = /^(?:[A-Za-z_$][\w$]*(?:\(\))?|[\w.-]+\.[A-Za-z0-9]{1,10})$/u.test(outcome);
     if (!normalizedOutcome || identifierOnly) {
-      return { ok: false, reason: "empty_plan_implementation_detail" };
+      return {
+        ok: false,
+        reason: "empty_plan_implementation_detail",
+        failureStage: "derived_projection",
+        failurePreview: String(task.text || "").replace(/\s+/g, " ").trim().slice(0, 240),
+      };
     }
     // `file`/`deliverable` is the runtime-owned acceptance obligation for a
     // mutation: it can be satisfied only by a fresh trusted change to that
@@ -4499,15 +4877,31 @@ export function classifyPlanArtifactQualityResult(
     ? result.missingSections
     : parseMissingPlanRequiredSections(result.reason);
   const reason = result.reason || "quality_gate";
+
+  // Typed ingress failures describe an invalid model graph, not a missing
+  // source observation and not a Markdown shape that MAIN may scaffold. Keep
+  // the frozen evidence bundle and request exactly one complete typed rewrite.
+  if (/^typed_plan_(?:draft_missing|ingress_invalid|candidate_invalid|executable_validation_missing)/i.test(reason)) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    };
+  }
   
   // Evidence gap: only when the validation reason explicitly mentions evidence problems.
   // Evidence sections are no longer part of missingRequiredSections in the unified path,
   // so we only classify as evidence gap for explicit evidence issues.
-  const hasEvidenceGap = /insufficient_grounded_evidence|noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets|unverified_plan_contract_counterpart|plan_before_state_not_observed/.test(reason);
+  const hasEvidenceGap = /insufficient_grounded_evidence|insufficient_facet_specific_diagnostic_evidence|noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets|unverified_plan_contract_counterpart|plan_before_state_not_observed/.test(reason);
   const hasEvidencePresentationGap = /missing_plan_evidence_section/.test(reason);
+  const hasDiagnosticClassificationGap = /unverified_diagnostic_claim_as_confirmed/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
     missingSections.every((section) => PLAN_STRUCTURAL_REQUIRED_SECTIONS.has(section));
+  const hasValidationContractGap = missingSections.some((section) =>
+    section === "validation" || section === "test_plan"
+  );
 
   if (hasEvidenceGap) {
     return {
@@ -4531,21 +4925,42 @@ export function classifyPlanArtifactQualityResult(
     };
   }
 
+  // The candidate already contains a diagnosis; the defect is that it labels
+  // speculative language as confirmed. Re-reading the same sources cannot
+  // repair that epistemic classification and previously caused a redundant
+  // evidence loop. Ask the model to rewrite the claim against the evidence it
+  // already has (or move it under unverified assumptions) instead.
+  if (hasDiagnosticClassificationGap) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    };
+  }
+
   if (hasOnlyStructuralGaps) {
     return {
       ...result,
       missingSections,
       recoveryAction: "rewrite",
-      canAutoRepair: true,
+      // A title or goal can be copied from already-visible input. A validation
+      // primitive cannot be invented safely: the runtime must know a bounded
+      // command or a concrete action/assertion pair. Keep this as a model
+      // rewrite so structural repair never manufactures acceptance evidence.
+      canAutoRepair: !hasValidationContractGap,
     };
   }
 
-  if (/unsupported_(?:hypothesis|debug_log)_advice/i.test(reason)) {
+  if (/unsupported_hypothesis_as_plan/i.test(reason)) {
     return {
       ...result,
       missingSections,
       recoveryAction: "rewrite",
-      canAutoRepair: true,
+      // A speculative implementation commitment cannot be made truthful by
+      // deterministic formatting/scaffolding. The model must re-emit a full
+      // candidate that either grounds the change or labels it as a hypothesis.
+      canAutoRepair: false,
     };
   }
 
@@ -4636,6 +5051,13 @@ export function repairActionablePlanArtifactContent(input: {
   if (!missingSections.every((section) => allowed.has(section))) {
     return { content: input.content, repairedSections: [] };
   }
+  if (missingSections.some((section) => section === "validation" || section === "test_plan")) {
+    // Unlike headings copied from the user goal, an executable validation
+    // contract cannot be inferred from document structure alone. Require the
+    // revised candidate to name a finite command or a concrete causal
+    // action/assertion scenario instead of appending generic "run tests" text.
+    return { content: input.content, repairedSections: [] };
+  }
 
   const language = input.language || detectPlanLanguage(input.content);
   const goal = String(input.userGoal || "").replace(/\s+/g, " ").trim();
@@ -4659,15 +5081,6 @@ export function repairActionablePlanArtifactContent(input: {
       : `## 关键改动\n${keyChangesBody}`;
     repaired = insertPlanSectionAfterTitle(repaired, section);
     repairedSections.push("key_changes");
-  }
-
-  if (missingSections.includes("validation") || missingSections.includes("test_plan")) {
-    const isTestPlan = missingSections.includes("test_plan");
-    const section = language === "en"
-      ? (isTestPlan ? "## Test Plan\n- Run focused runtime-executable tests or builds for the affected surface. Report optional user/manual review separately in the final conclusion; it is not a completion gate." : "## Validation Standards\n- Run focused runtime-executable tests or builds for the affected surface. Report optional user/manual review separately in the final conclusion; it is not a completion gate.")
-      : (isTestPlan ? "## 测试方案\n- 运行与受影响范围匹配、runtime 可执行的测试或构建。可选用户/人工复核在最终结论中单列，不作为完成闸门。" : "## 验证标准\n- 运行与受影响范围匹配、runtime 可执行的测试或构建。可选用户/人工复核在最终结论中单列，不作为完成闸门。");
-    repaired = `${repaired}\n\n${section}`.trim();
-    repairedSections.push(isTestPlan ? "test_plan" : "validation");
   }
 
   if (missingSections.includes("public_interfaces")) {
@@ -4706,16 +5119,21 @@ export function repairActionablePlanArtifactContent(input: {
 }
 
 function hasGoalLikePlanTitle(content: string): boolean {
-  const firstHeading = String(content || "")
+  const headings = String(content || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => /^#{1,2}\s+\S/.test(line));
-  if (!firstHeading) return false;
-  if (!/(?:计划|方案|设计|实施|修复|排查|诊断|改造|Plan|Proposal|Design|Implementation|Fix|Repair|Diagnosis|Remediation)/i.test(firstHeading)) {
+    .map((line) => line.match(/^(#{1,2})\s+(\S.*?)\s*$/))
+    .filter((match): match is RegExpMatchArray => !!match);
+  // A document may legitimately begin with contextual H2 sections (for
+  // example screenshot observations) before its H1 title. Treat H1 as the
+  // document-title role and only fall back to H2 when the document has no H1.
+  const titleHeading = headings.find((match) => match[1].length === 1) || headings[0];
+  const title = String(titleHeading?.[2] || "").trim();
+  if (!title) return false;
+  if (!/(?:计划|方案|设计|实施|修复|排查|诊断|改造|Plan|Proposal|Design|Implementation|Fix|Repair|Diagnosis|Remediation)/i.test(title)) {
     return false;
   }
-  const qualifier = firstHeading
-    .replace(/^#{1,2}\s+/, "")
+  const qualifier = title
     .replace(/(?:正式|建议|可审批|计划|方案|设计|实施|修复|排查|诊断|改造|Proposed|Proposal|Plan|Design|Implementation|Fix|Repair|Diagnosis|Remediation)/gi, " ")
     .replace(/[^A-Za-z0-9_\u4e00-\u9fff]+/g, "")
     .trim();
@@ -4910,17 +5328,24 @@ export function validatePlanArtifactContent(
 }
 
 export function hasAnyContentUnderSection(text: string, sectionRegex: RegExp): boolean {
-  const lines = text.split('\n');
+  const lines = String(text || "").split(/\r?\n/);
   let inSection = false;
+  let sectionLevel = 0;
   let contentChars = 0;
   for (const line of lines) {
     const trimmed = line.trim();
-    if (trimmed.startsWith('#')) {
+    const heading = trimmed.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
       if (inSection) {
-        break; // reached next section
+        if (heading[1].length <= sectionLevel) break;
+        // Descendant headings remain inside the owning section. Their body is
+        // counted below; the heading label alone is not substantive content.
+        continue;
       }
-      if (sectionRegex.test(trimmed)) {
+      sectionRegex.lastIndex = 0;
+      if (sectionRegex.test(heading[2])) {
         inSection = true;
+        sectionLevel = heading[1].length;
       }
     } else if (inSection && trimmed.length > 0) {
       contentChars += trimmed.length;
@@ -4982,6 +5407,31 @@ function isConcreteStructuredTestValue(value: string): boolean {
   return !/^(?:tbd|todo|to\s+do|n\/?a|none|null|待补充|待填写|待定|待确认|稍后补充|暂无|占位|略)$/i.test(normalized);
 }
 
+function extractExplicitValidationAssertionTargets(text: string): string[] {
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/^\s*\[V\d+\]\s*/i, "")
+      .replace(/[`*_~]/g, "")
+      .trim();
+    const match = line.match(/^(?:断言|可判定断言|Assertion|Decidable Assertion)\s*[:：]\s*(.+)$/i);
+    const target = String(match?.[1] || "").replace(/\s+/g, " ").trim();
+    const signal = target.replace(/[\s:：,，.。;；()（）'"-]/g, "");
+    if (
+      !isConcreteStructuredTestValue(target) ||
+      signal.length < 10 ||
+      /^(?:功能正常|行为正确|结果正确|测试通过|构建通过|记录结果|works?(?: correctly)?|behavio[u]?r is correct|tests? pass(?:es)?|build passes?)$/i.test(target)
+    ) continue;
+    const key = target.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push(target);
+  }
+  return targets;
+}
+
 function hasConcreteStructuredTestScenario(testPlanBody: string): boolean {
   const lines = String(testPlanBody || "").split(/\r?\n/);
   for (let index = 0; index < lines.length; index++) {
@@ -5040,32 +5490,98 @@ function hasConcreteNarrativeTestScenario(testPlanBody: string): boolean {
   });
 }
 
-function extractPlanTestSectionBody(text: string): string {
+function analyzePlanDiagnosticClaims(raw: string): {
+  speculativeConfirmedDiagnosticLines: string[];
+  unsupportedHypothesisLines: string[];
+} {
+  const unsupportedHypothesisLines: string[] = [];
+  const speculativeConfirmedDiagnosticLines: string[] = [];
+  const headingStack: Array<{ level: number; text: string }> = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const heading = line.match(/^#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      const level = line.match(/^(#{1,6})/)?.[1]?.length || 1;
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1]!.level >= level) {
+        headingStack.pop();
+      }
+      headingStack.push({ level, text: heading[1] || "" });
+      continue;
+    }
+    const currentPlanQualityHeading = headingStack.map((entry) => entry.text).join(" / ");
+    const isSpeculationAllowedSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults|摘要|Summary|用户目标|User Goal|现象|Symptom|背景|Background)/i
+      .test(currentPlanQualityHeading);
+    const isConfirmedDiagnosticSection = /(?:已确认证据|已确认事实|真实发现|当前状态|当前实现|Confirmed Evidence|Confirmed Facts|Findings|Current State|Current Implementation|根因分析|根本原因|原因分析|Root Causes?|Cause Analysis)/i
+      .test(currentPlanQualityHeading) &&
+      !/(?:未验证|待验证|假设|可能根因|Unverified|Hypotheses|Assumptions|Likely Root Cause)/i
+        .test(currentPlanQualityHeading);
+    const isImplementationCommitmentSection = /(?:关键(?:实现)?改动|实现(?:方案|步骤)?|实施(?:方案|步骤)?|执行步骤|改动内容|公共\s*API|接口|类型|Key Changes?|Implementation|Execution Steps?|Changes?|Public APIs?|Interfaces?|Types?)/i
+      .test(currentPlanQualityHeading);
+    const isInputCoverageRequirement =
+      /(?:兼容|支持|处理|覆盖|接受|验证|测试).{0,32}(?:可能(?:出现)?的?|潜在的?).{0,32}(?:输入|字段|列名|值|格式|情况|分支|变体|错误|CSV|TSV|XLSX)/i.test(line) ||
+      /(?:support|handle|cover|accept|validate|test).{0,32}(?:possible|potential|optional).{0,32}(?:input|field|column|value|format|case|branch|variant|error|CSV|TSV|XLSX)/i.test(line);
+    const hasSpeculativeDiagnosticLanguage = /(?:可能|也许|推测|猜测|大概|高概率|中概率|低概率|某些情况下|更可能|perhaps|possibly|probably|likely|\bmay\b|\bmight\b|\bcould\b)/i.test(line) ||
+      /(?:如果|若)(?:这|该|此)?(?:是|属于)?(?:根因|原因|问题|故障|缺陷)|\bif\s+(?:this|that|it|the\s+(?:root\s+)?cause|the\s+(?:issue|problem|bug|failure))\b/i.test(line);
+    const isExplicitlyUnverifiedClaim = /(?:未验证|待验证|需验证|假设\s*[:：]|推测\s*[:：]|Unverified|Needs? validation|Hypothesis\s*:)/i.test(line);
+    const hasDiagnosticSubject = /(?:\.[a-z0-9]+|\b(?:function|class|interface|type|const|let|var|import|export|handler|listener|state|path|field|event|command)\b|\/|\\|根因|原因|导致|触发|误判|残留|because|due to|causes?|triggers?)/i.test(line);
+    if (
+      isConfirmedDiagnosticSection &&
+      hasSpeculativeDiagnosticLanguage &&
+      hasDiagnosticSubject &&
+      !isExplicitlyUnverifiedClaim &&
+      !isInputCoverageRequirement
+    ) {
+      speculativeConfirmedDiagnosticLines.push(line);
+    }
+    if (
+      isImplementationCommitmentSection &&
+      !isSpeculationAllowedSection &&
+      /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
+      !isInputCoverageRequirement &&
+      !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
+    ) {
+      const mentionsCodeTargets = /(?:\.[a-z0-9]+|\b(?:function|class|interface|type|const|let|var|import|export|useEffect|useState)\b|\/|\\)/i.test(line);
+      if (mentionsCodeTargets) unsupportedHypothesisLines.push(line);
+    }
+  }
+  return { speculativeConfirmedDiagnosticLines, unsupportedHypothesisLines };
+}
+
+function extractPlanValidationSectionBody(text: string): string {
   const body: string[] = [];
   let inSection = false;
   let sectionLevel = 0;
-  const testSection = new RegExp(
-    `^${RUNTIME_TASK_HEADING_PREFIX}(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
-    "i",
-  );
+  let inFence = false;
   const testSubsection = new RegExp(
     `^${RUNTIME_TASK_HEADING_PREFIX}(?:单元测试|集成测试|端到端测试|功能测试|回归测试|手动验证|测试用例|测试场景|Unit Tests?|Integration Tests?|End-to-End Tests?|E2E Tests?|Functional Tests?|Regression Tests?|Manual Verification|Test Cases?|Test Scenarios?)${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
     "i",
   );
   for (const line of String(text || "").split(/\r?\n/)) {
+    if (/^\s*```/.test(line)) {
+      if (inSection) body.push(line);
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) {
+      if (inSection) body.push(line);
+      continue;
+    }
     const heading = line.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
     if (heading) {
       const level = (heading[1] || "").length;
       const title = heading[2] || "";
-      if (inSection) {
-        if (level > sectionLevel || testSubsection.test(title)) {
-          body.push(line);
-          continue;
-        }
-        break;
+      if (inSection && level > sectionLevel) {
+        body.push(line);
+        continue;
       }
-      inSection = testSection.test(title);
-      if (inSection) sectionLevel = level;
+      if (inSection && level <= sectionLevel) inSection = false;
+      if (
+        RUNTIME_TASK_VALIDATION_SECTION_RE.test(title) ||
+        testSubsection.test(title)
+      ) {
+        inSection = true;
+        sectionLevel = level;
+      }
       continue;
     }
     if (inSection) body.push(line);
@@ -5119,8 +5635,102 @@ function collectConcreteStepExpectationScenarios(testPlanBody: string): string[]
   return scenarios;
 }
 
-function hasConcreteStepExpectationScenario(testPlanBody: string): boolean {
-  return collectConcreteStepExpectationScenarios(testPlanBody).length > 0;
+const EXPLICIT_AUTOMATION_VALIDATOR_RE =
+  /(?:Playwright|Cypress|Puppeteer|browser[_ -]?(?:evaluate|screenshot)|浏览器工具|automated?\s+(?:browser|UI|E2E)\s+(?:test|check|validation)|自动化(?:浏览器|UI|E2E)(?:测试|验证|检查))/i;
+
+function collectExplicitAutomationValidationBlocks(testPlanBody: string): string[] {
+  const lines = String(testPlanBody || "").split(/\r?\n/);
+  const blocks: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const owner = lines[index] || "";
+    if (!EXPLICIT_AUTOMATION_VALIDATOR_RE.test(owner)) continue;
+
+    const ownerHeading = owner.trim().match(/^(#{1,6})\s+/);
+    const ownerList = owner.match(/^(\s*)(?:[-*+]\s+|\d+[.)、:：-]\s+)/);
+    const ownerLevel = ownerHeading?.[1]?.length || 0;
+    const ownerIndent = String(ownerList?.[1] || "").length;
+    const block = [owner];
+    for (let cursor = index + 1; cursor < Math.min(lines.length, index + 12); cursor += 1) {
+      const next = lines[cursor] || "";
+      if (/^\s*```/.test(next)) break;
+      const nextHeading = next.trim().match(/^(#{1,6})\s+/);
+      if (nextHeading && (!ownerLevel || (nextHeading[1]?.length || 0) <= ownerLevel)) break;
+      const nextList = next.match(/^(\s*)(?:[-*+]\s+|\d+[.)、:：-]\s+)/);
+      if (ownerList && nextList && String(nextList[1] || "").length <= ownerIndent) break;
+      if (!ownerHeading && !ownerList && next.trim()) break;
+      block.push(next);
+    }
+    blocks.push(block.join("\n"));
+  }
+  return blocks;
+}
+
+/**
+ * True only when the Plan describes a decidable automatic assertion without
+ * relying on a shell command. Merely naming Playwright/a browser tool, or
+ * listing manual click-through steps, is intentionally insufficient.
+ */
+export function hasConcreteAutomatedPlanValidationAssertion(
+  testPlanBody: string,
+): boolean {
+  const blocks = [testPlanBody, ...collectExplicitAutomationValidationBlocks(testPlanBody)];
+  return blocks.some((text) => {
+    const commands = extractShellCommandsFromText(text);
+    const evidence = inferValidationTaskEvidence(text, commands);
+    return projectValidationPrimitivesFromInputs({
+      text,
+      commands,
+      evidence,
+    }).some((spec) =>
+      spec.kind !== "finite_command" && isAcceptanceCapableValidationSpec(spec)
+    );
+  });
+}
+
+function hasConcreteCausalAcceptanceScenario(testPlanBody: string): boolean {
+  const lines = String(testPlanBody || "")
+    .split(/\r?\n/)
+    .map((line) => line
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/[`*_~]/g, "")
+      .trim())
+    .filter(Boolean);
+
+  return lines.some((line) => {
+    // User-owned/manual review is advisory. It may accompany an executable
+    // primitive, but it cannot become the acceptance primitive by prose.
+    if (/(?:手动|人工|由用户|用户(?:自己)?|\bmanual(?:ly)?\b|\buser\s+(?:review|validation|confirmation)\b)/i.test(line)) {
+      return false;
+    }
+
+    // Accept compact acceptance criteria only when they contain two distinct
+    // clauses: a state-changing action and a post-action observable outcome.
+    // This deliberately does not recognize broad "run/check" wording.
+    const boundary = /(?:[,，;；]\s*|\s+)(?:并(?:验证|确认|断言|确保)|然后(?:验证|确认|断言|确保)?|随后(?:验证|确认|断言|确保)?|接着(?:验证|确认|断言|确保)?|预期|验证|确认|断言|确保|then\s+(?:verify|confirm|assert|ensure)|and\s+(?:verify|confirm|assert|ensure)|expected(?:\s+(?:result|state))?\s*[:：]?|expect(?:ed)?\s+that)\s*/i.exec(line);
+    if (!boundary || boundary.index === undefined) return false;
+
+    const action = line.slice(0, boundary.index).trim();
+    const outcome = line.slice(boundary.index + boundary[0].length).trim();
+    const hasCausalOrder = /(?:后|之后|先.{1,80}再|\bafter\b|\bthen\b|\bwhen\b|\bgiven\b)/i.test(action) ||
+      /^(?:然后|随后|接着|预期|then\b|expected\b|expect(?:ed)?\b)/i.test(boundary[0].trim().replace(/^[,，;；]\s*/, ""));
+    const hasConcreteAction = /(?:断网|联网|恢复(?:网络|连接)|新增|创建|上传|导入|打开|点击|选择|切换|填写|输入|提交|保存|刷新|删除|重连|重试|调用|写入|发送|接收|create|upload|import|open|click|select|toggle|fill|enter|submit|save|refresh|delete|reconnect|retry|invoke|write|send|receive)/i.test(action);
+    const hasObservableOutcome = /(?:显示|返回|包含|同步|提交|更新|保持|不再|不会|未|没有|失败|成功|出现|消失|顺序|重复|计数|状态|一致|可见|display|return|contain|sync|submit|update|preserve|remain|no\s+longer|not\b|fail|succeed|appear|disappear|order|duplicate|count|state|match|visible)/i.test(outcome);
+    const actionSignal = action.replace(/[\s:：,，.。;；()（）'"-]/g, "");
+    const outcomeSignal = outcome.replace(/[\s:：,，.。;；()（）'"-]/g, "");
+    return hasCausalOrder &&
+      hasConcreteAction &&
+      hasObservableOutcome &&
+      actionSignal.length >= 6 &&
+      outcomeSignal.length >= 8;
+  });
+}
+
+function hasConcretePlanValidationScenario(testPlanBody: string): boolean {
+  return hasConcreteStructuredTestScenario(testPlanBody) ||
+    hasConcreteNarrativeTestScenario(testPlanBody) ||
+    hasConcreteCausalAcceptanceScenario(testPlanBody) ||
+    extractExplicitValidationAssertionTargets(testPlanBody).length > 0 ||
+    collectConcreteStepExpectationScenarios(testPlanBody).length > 0;
 }
 
 function stripPlanQualityLine(line: string): string {
@@ -5175,10 +5785,6 @@ function findEmptyPlanImplementationDetail(content: string): string | null {
     if (!hasOwnedBody) return cleanLine || rawLine.trim();
   }
   return null;
-}
-
-function hasEmptyPlanImplementationDetail(content: string): boolean {
-  return findEmptyPlanImplementationDetail(content) !== null;
 }
 
 interface ExplicitPlanAcceptanceAssertion {
@@ -5373,8 +5979,14 @@ export function validateActionablePlanArtifact(
   if (/(?:以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change|for the approved goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_approved_goal_plan" });
   }
-  if (hasEmptyPlanImplementationDetail(raw)) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_plan_implementation_detail" });
+  const emptyImplementationOwner = findEmptyPlanImplementationDetail(raw);
+  if (emptyImplementationOwner) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: "empty_plan_implementation_detail",
+      failureStage: "markdown_container",
+      failurePreview: emptyImplementationOwner.replace(/\s+/g, " ").trim().slice(0, 240),
+    });
   }
   if (hasConflictingPlanAcceptanceAssertions(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "conflicting_plan_acceptance_assertions" });
@@ -5413,7 +6025,8 @@ export function validateActionablePlanArtifact(
   const declaresSourceMutation = isLikelySourceMutationTask(
     `${documentTitle}\n${declaredGoalText}`,
   );
-  const planHeadings = normalizeRuntimePlanSectionHeadings(raw)
+  const normalizedPlanSectionContent = normalizeRuntimePlanSectionHeadings(raw);
+  const planHeadings = normalizedPlanSectionContent
     .split(/\r?\n/)
     .map((line) => {
       const trimmed = line.trim();
@@ -5448,20 +6061,39 @@ export function validateActionablePlanArtifact(
     /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw) ||
     hasAnyContentUnderSection(raw, /(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i);
   const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
-  const testPlanBody = extractPlanTestSectionBody(raw);
-  const hasConcreteTestCommand = /`\s*(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:-]+|npx\s+\S+|node\s+--test\b|cargo\s+(?:test|check|build|clippy)\b|pytest\b|python\d*\s+-m\s+\S+|go\s+test\b|swift\s+test\b|dotnet\s+test\b|mvn\s+test\b|gradle\w*\s+\S+)/i.test(testPlanBody);
-  const hasStructuredInputExpectationScenario = hasConcreteStructuredTestScenario(testPlanBody);
-  const hasConcreteManualOrToolScenario =
-    hasStructuredInputExpectationScenario ||
-    hasConcreteNarrativeTestScenario(testPlanBody) ||
-    hasConcreteStepExpectationScenario(testPlanBody) ||
-    /(?:运行|执行).{0,100}(?:单元测试|集成测试|端到端测试|E2E|Playwright|测试套件|测试|构建|编译|lint|类型检查)/i.test(testPlanBody) ||
-    /(?:运行|执行|启动|构建|编译|手动|浏览器|桌面|Playwright|E2E|双击|拖放|打开|点击|导入|保存|刷新).{0,140}(?:验证|确认|检查|断言|比较|预期|应当|成功|失败|通过|结果)/i.test(testPlanBody) ||
-    /(?:验证|确认|检查|断言|比较).{0,140}(?:打开|点击|双击|拖放|导入|保存|渲染|事件|窗口|状态|输出|结果|错误|回退|流程|链路)/i.test(testPlanBody) ||
-    /(?:run|execute).{0,100}(?:unit tests?|integration tests?|end-to-end tests?|E2E|Playwright|test suites?|tests?|build|compile|lint|typecheck)/i.test(testPlanBody) ||
-    /(?:run|execute|start|build|compile|manually|browser|desktop|Playwright|E2E|double[- ]click|drag|drop|open|click|import|save|reload).{0,140}(?:verify|assert|check|compare|expect|should|success|failure|pass|result)/i.test(testPlanBody) ||
-    /(?:verify|assert|check|compare).{0,140}(?:open|click|double[- ]click|drag|drop|import|save|render|event|window|state|output|result|error|fallback|flow)/i.test(testPlanBody);
-  if (hasTestPlan && !hasConcreteTestCommand && !hasConcreteManualOrToolScenario) {
+  const validationPlanBody = extractPlanValidationSectionBody(normalizedPlanSectionContent);
+  const validationCommands = extractShellCommandsFromText(validationPlanBody);
+  const hasFiniteValidationCommand = validationCommands.some(isFinitePlanValidationCommand);
+  const hasAutomatedValidationAssertion =
+    hasConcreteAutomatedPlanValidationAssertion(validationPlanBody);
+  const hasConcreteValidationScenario =
+    hasConcretePlanValidationScenario(validationPlanBody);
+  // Truthfulness is an earlier contract than executability. A speculative
+  // claim placed under confirmed evidence must never be hidden behind a later
+  // validation-quality error, because automatic validation repair cannot turn
+  // an unverified diagnosis into observed fact.
+  const diagnosticClaims = analyzePlanDiagnosticClaims(raw);
+  if (diagnosticClaims.speculativeConfirmedDiagnosticLines.length > 0) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: "unverified_diagnostic_claim_as_confirmed",
+      failurePreview: diagnosticClaims.speculativeConfirmedDiagnosticLines[0]
+        ?.replace(/\s+/g, " ")
+        .slice(0, 240),
+    });
+  }
+  if (diagnosticClaims.unsupportedHypothesisLines.length > 0) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_hypothesis_as_plan" });
+  }
+  if (
+    hasSemanticValidationSection &&
+    !hasFiniteValidationCommand &&
+    !hasAutomatedValidationAssertion &&
+    (
+      !hasConcreteValidationScenario ||
+      EXPLICIT_AUTOMATION_VALIDATOR_RE.test(validationPlanBody)
+    )
+  ) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "non_executable_test_plan" });
   }
   const hasConcreteChangeSignal =
@@ -5513,54 +6145,6 @@ export function validateActionablePlanArtifact(
       reason: `missing_plan_required_sections:${missingRequiredSections.join(",")}`,
       missingSections: missingRequiredSections,
     });
-  }
-
-  const unsupportedHypothesisLines: string[] = [];
-  let currentPlanQualityHeading = "";
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    const heading = line.match(/^#{1,6}\s+(.+?)\s*$/);
-    if (heading) {
-      currentPlanQualityHeading = heading[1] || "";
-      continue;
-    }
-    const isSpeculationAllowedSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults|摘要|Summary|用户目标|User Goal|现象|Symptom|根因|Root Cause|背景|Background)/i
-      .test(currentPlanQualityHeading);
-    const isImplementationCommitmentSection = /(?:关键(?:实现)?改动|实现(?:方案|步骤)?|实施(?:方案|步骤)?|执行步骤|改动内容|公共\s*API|接口|类型|Key Changes?|Implementation|Execution Steps?|Changes?|Public APIs?|Interfaces?|Types?)/i
-      .test(currentPlanQualityHeading);
-    const isInputCoverageRequirement =
-      /(?:兼容|支持|处理|覆盖|接受|验证|测试).{0,32}(?:可能(?:出现)?的?|潜在的?).{0,32}(?:输入|字段|列名|值|格式|情况|分支|变体|错误|CSV|TSV|XLSX)/i.test(line) ||
-      /(?:support|handle|cover|accept|validate|test).{0,32}(?:possible|potential|optional).{0,32}(?:input|field|column|value|format|case|branch|variant|error|CSV|TSV|XLSX)/i.test(line);
-    if (
-      isImplementationCommitmentSection &&
-      !isSpeculationAllowedSection &&
-      /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
-      !isInputCoverageRequirement &&
-      !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
-    ) {
-      // Only implementation commitments can become unsupported speculative
-      // changes. Evidence/current-state sections may accurately describe a
-      // possible risk without committing that hypothesis as an edit.
-      const mentionsCodeTargets = /(?:\.[a-z0-9]+|\b(?:function|class|interface|type|const|let|var|import|export|useEffect|useState)\b|\/|\\)/i.test(line);
-      if (mentionsCodeTargets) {
-        unsupportedHypothesisLines.push(line);
-      }
-    }
-  }
-  if (unsupportedHypothesisLines.length > 0) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_hypothesis_as_plan" });
-  }
-
-  const unsupportedDebugAdviceLines = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) =>
-      !/^#{1,6}\s+/.test(line) &&
-      /(?:console\.log|debug\s+log|调试日志|打印日志|临时日志)/i.test(line) &&
-      !/(?:证据|依据|观察|已读|已确认|Evidence|Observed|Confirmed|Read)/i.test(line)
-    );
-  if (unsupportedDebugAdviceLines.length > 0) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_debug_log_advice" });
   }
 
   const derivedTaskValidation = validateDerivedPlanTasksForApproval(

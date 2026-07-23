@@ -5,6 +5,11 @@
 
 import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
+import {
+  SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS,
+  SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS,
+  SUPPORTED_INTERACTION_ASSERTION_KINDS,
+} from "./validationContract";
 
 export interface ToolDefinition {
   type: "function";
@@ -18,6 +23,361 @@ export interface ToolDefinition {
     };
   };
 }
+
+export const SUBMIT_PLAN_CANDIDATE_TOOL_NAME = "submit_plan_candidate";
+
+const PLAN_EXPECTED_SCALAR_SCHEMA = {
+  anyOf: [
+    { type: "string" },
+    { type: "number" },
+    { type: "boolean" },
+    { type: "null" },
+  ],
+  description: "Expected scalar value. Strings, numbers, booleans, and null use the same contract on native-tool and text-envelope transports.",
+};
+
+const PLAN_READINESS_EXPECTED_SCALAR_SCHEMA = {
+  anyOf: [
+    { type: "string" },
+    { type: "number" },
+    { type: "boolean" },
+  ],
+  description: "Expected service-readiness value. Strings, numbers, and booleans use the same contract on native-tool and text-envelope transports.",
+};
+
+const PLAN_INTERACTION_ASSERTION_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: {
+      type: "string",
+      enum: [...SUPPORTED_INTERACTION_ASSERTION_KINDS],
+    },
+    target: { type: "string" },
+    afterActionId: {
+      type: "string",
+      description: "ID of the action that must precede and cause this assertion. Required whenever actions are present.",
+    },
+    expected: { ...PLAN_EXPECTED_SCALAR_SCHEMA },
+  },
+  required: ["kind", "target"],
+};
+
+function planInteractionActionSchema(kinds: readonly string[]) {
+  return {
+    type: "object",
+    properties: {
+      id: {
+        type: "string",
+        description: "Stable action ID. Required so a post-action assertion can name the exact causal action.",
+      },
+      kind: {
+        type: "string",
+        enum: [...kinds],
+      },
+      target: { type: "string" },
+    },
+    required: ["id", "kind", "target"],
+  };
+}
+
+const PLAN_VALIDATION_PRIMITIVE_SCHEMA = {
+  description: "Tagged validation primitive. Select exactly one kind branch and provide every field required by that branch; shared typed ingress performs semantic validation after transport decoding.",
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["finite_command"] },
+        command: { type: "string" },
+        cwd: { type: "string" },
+        timeoutMs: { type: "number" },
+        description: { type: "string" },
+      },
+      required: ["kind", "command"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["service_observation"] },
+        launchCommand: { type: "string" },
+        cwd: { type: "string" },
+        ownerKey: { type: "string" },
+        readiness: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["process_status", "output_pattern", "port", "custom"] },
+            expected: { ...PLAN_READINESS_EXPECTED_SCALAR_SCHEMA },
+            target: { type: "string" },
+          },
+          required: ["kind", "expected"],
+        },
+        description: { type: "string" },
+      },
+      required: ["kind", "launchCommand", "ownerKey", "readiness"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["browser_interaction"] },
+        actions: {
+          type: "array",
+          items: planInteractionActionSchema(SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS),
+        },
+        assertions: {
+          type: "array",
+          minItems: 1,
+          items: PLAN_INTERACTION_ASSERTION_SCHEMA,
+        },
+        requireCausalAssertion: { type: "boolean" },
+        description: { type: "string" },
+      },
+      required: ["kind", "actions", "assertions"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["desktop_interaction"] },
+        actions: {
+          type: "array",
+          items: planInteractionActionSchema(SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS),
+        },
+        assertions: {
+          type: "array",
+          minItems: 1,
+          items: PLAN_INTERACTION_ASSERTION_SCHEMA,
+        },
+        requireCausalAssertion: { type: "boolean" },
+        description: { type: "string" },
+      },
+      required: ["kind", "actions", "assertions"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["assertion"] },
+        acceptance: {
+          type: "string",
+          enum: ["advisory"],
+          description: "Standalone assertions are non-blocking observations and never close Plan acceptance.",
+        },
+        target: { type: "string" },
+        matcher: {
+          type: "string",
+          enum: ["equals", "not_equals", "contains", "matches", "exists", "not_exists", "runtime_result"],
+        },
+        producer: {
+          type: "string",
+          enum: ["runtime_evidence_ledger", "workspace_file_state", "artifact_store"],
+        },
+        expected: { ...PLAN_EXPECTED_SCALAR_SCHEMA },
+        description: { type: "string" },
+      },
+      required: ["kind", "acceptance", "target", "matcher", "producer"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["advisory"] },
+        note: { type: "string" },
+        owner: { type: "string", enum: ["user", "external", "runtime"] },
+        description: { type: "string" },
+      },
+      required: ["kind", "note"],
+    },
+  ],
+};
+
+/**
+ * Runtime-control tool used only after Plan evidence has been frozen.  The
+ * schema mirrors TypedPlanDraftV1 and makes each primitive's required field
+ * shape explicit. Shared typed ingress still owns semantic, causal, and
+ * acceptance-capability validation so every provider follows the same
+ * validate/seal/render path.
+ */
+export const SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION = {
+  type: "function",
+  function: {
+    name: SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+    description: "Submit the complete typed Plan graph for runtime validation and review. This is a runtime control action: it never writes files or executes the Plan. Submit one complete replacement object; use textual <user_options> instead only when a genuinely user-owned choice blocks planning.",
+    parameters: {
+      type: "object",
+      properties: {
+        schemaVersion: {
+          type: "number",
+          description: "Typed Plan draft schema version. Must be 2.",
+        },
+        evidenceRefs: {
+          type: "array",
+          description: "Frozen evidence IDs used by this Plan, such as E1. Include every E listed by runtime Q coverage obligations.",
+          items: { type: "string" },
+        },
+        goalEvidenceBases: {
+          type: "array",
+          description: "Explicit semantic G-to-B mapping. Assign every required B and at least one selected B to every G. Optional B may be omitted; one G may use several B, but one B cannot be assigned to different goals.",
+          items: {
+            type: "object",
+            properties: {
+              goalRef: { type: "string" },
+              componentRef: { type: "string" },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              ownerRefs: { type: "array", items: { type: "string" } },
+              relationRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["goalRef", "componentRef", "evidenceRefs", "ownerRefs", "relationRefs", "diagnosisRefs"],
+          },
+        },
+        summary: {
+          type: "array",
+          description: "Short review summary lines. May be empty.",
+          items: { type: "string" },
+        },
+        diagnoses: {
+          type: "array",
+          description: "Root-cause or inference nodes with explicit evidence and goal edges.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique R-number ID, for example R1." },
+              text: { type: "string", description: "Diagnosis statement." },
+              certainty: {
+                type: "string",
+                enum: ["observed", "inferred", "hypothesis"],
+                description: "Evidence status of this diagnosis.",
+              },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              goalRefs: { type: "array", items: { type: "string" } },
+              chainRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["id", "text", "certainty", "evidenceRefs", "goalRefs", "chainRefs"],
+          },
+        },
+        changes: {
+          type: "array",
+          description: "Explicit change operations. A non-mutation Plan may leave this empty and use decisions.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique C-number ID, for example C1." },
+              text: { type: "string", description: "Concrete change description." },
+              targetRef: { type: "string", description: "Exact target path or boundary from frozen evidence." },
+              targetOwnerRef: { type: "string", description: "For create only: an existing evidence-backed owner in the same boundary." },
+              operation: {
+                type: "string",
+                enum: ["modify", "create", "delete", "preserve"],
+              },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: { type: "array", items: { type: "string" } },
+              goalRefs: { type: "array", items: { type: "string" } },
+              expectedOutcome: { type: "string", description: "Observable outcome of this change." },
+              relationships: { type: "array", items: { type: "string" } },
+              plannedValidationHarness: {
+                type: "object",
+                description: "Optional future executable harness created or modified by this C. V must bind it with harnessChangeRef and a structurally matching finite command.",
+                properties: {
+                  surface: { type: "string", enum: ["browser", "desktop"] },
+                  ownerRef: { type: "string", description: "Evidence-backed owner; for create match targetOwnerRef, for modify match targetRef." },
+                  binding: {
+                    oneOf: [{
+                      type: "object",
+                      properties: {
+                        kind: { type: "string", enum: ["direct_target"] },
+                        targetRef: { type: "string" },
+                      },
+                      required: ["kind", "targetRef"],
+                    }, {
+                      type: "object",
+                      properties: {
+                        kind: { type: "string", enum: ["manifest_script"] },
+                        manifestRef: { type: "string" },
+                        scriptName: { type: "string" },
+                      },
+                      required: ["kind", "manifestRef", "scriptName"],
+                    }],
+                  },
+                },
+                required: ["surface", "ownerRef", "binding"],
+              },
+            },
+            required: [
+              "id",
+              "text",
+              "targetRef",
+              "operation",
+              "evidenceRefs",
+              "diagnosisRefs",
+              "goalRefs",
+              "expectedOutcome",
+            ],
+          },
+        },
+        decisions: {
+          type: "array",
+          description: "Explicit design or preservation decisions.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique D-number ID, for example D1." },
+              text: { type: "string", description: "Decision statement." },
+              disposition: { type: "string", enum: ["change", "preserve"] },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: {
+                type: "array",
+                items: { type: "string" },
+                description: "Covering R-number diagnoses for this disposition; required for relationship evidence.",
+              },
+              goalRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["id", "text", "disposition", "evidenceRefs", "diagnosisRefs", "goalRefs"],
+          },
+        },
+        interfaces: {
+          type: "array",
+          description: "Public API, interface, or type impacts. May be empty.",
+          items: { type: "string" },
+        },
+        validations: {
+          type: "array",
+          description: "Required validations or advisory observations with explicit V/G/C references and one runtime primitive each. Every goal still needs a required finite command or browser/desktop interaction. Interaction targets must come from runtime-observed interaction evidence and match the required execution surface.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique V-number ID, for example V1." },
+              goalRefs: { type: "array", items: { type: "string" } },
+              changeRefs: { type: "array", items: { type: "string" } },
+              primitive: PLAN_VALIDATION_PRIMITIVE_SCHEMA,
+              harnessChangeRef: { type: "string", description: "Optional exact C reference that creates/modifies the planned executable harness used by this finite command." },
+              expectedOutcome: { type: "string", description: "Decidable expected outcome." },
+            },
+            required: ["id", "goalRefs", "changeRefs", "primitive", "expectedOutcome"],
+          },
+        },
+        assumptions: {
+          type: "array",
+          description: "Explicit non-blocking assumptions. May be empty.",
+          items: { type: "string" },
+        },
+        blockingChoices: {
+          type: "array",
+          description: "Must be empty for submission. Use textual <user_options> instead when a real user choice blocks planning.",
+          items: { type: "string" },
+        },
+      },
+      required: [
+        "schemaVersion",
+        "evidenceRefs",
+        "goalEvidenceBases",
+        "summary",
+        "diagnoses",
+        "changes",
+        "decisions",
+        "interfaces",
+        "validations",
+        "assumptions",
+        "blockingChoices",
+      ],
+    },
+  },
+} as unknown as ToolDefinition;
 
 function cloneJsonValue<T>(value: T): T {
   if (Array.isArray(value)) {
@@ -90,6 +450,7 @@ export function normalizeToolDefinitions(tools: ToolDefinition[]): ToolDefinitio
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION,
   {
     type: "function",
     function: {

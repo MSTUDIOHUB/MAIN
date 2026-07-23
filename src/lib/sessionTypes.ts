@@ -4,6 +4,7 @@ import type {
   GoalContinuationAuthorization,
   GoalCreationAuthorization,
 } from "./submit/turnSubmission";
+import type { CanonicalRunIdentity } from "./turnRuntimeContract";
 
 export const GLOBAL_CHAT_KEY = "__MAIN_GLOBAL_CHAT__";
 
@@ -61,9 +62,11 @@ export interface QueuedUserMessage {
 }
 
 export interface ActiveGuidance {
+  schemaVersion: 1;
   id: string;
   text: string;
-  turnId: string | null;
+  /** Guidance is a one-shot input owned by one exact Run attempt. */
+  target: CanonicalRunIdentity;
   createdAt: number;
   consumedAt?: number | null;
 }

@@ -62,6 +62,114 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"),
 );
+const {
+  createDraftPlanCandidate,
+  hashPlanCandidate,
+  sealPlanCandidate,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planContract.ts"),
+);
+
+function buildTypedReviewArtifact(overrides = {}) {
+  const variant = String(overrides.variant || "").trim();
+  const content = [
+    "# Proposed Plan",
+    "",
+    "## User goal",
+    `- Keep the reviewed Plan bound to one sealed runtime task graph.${variant ? ` ${variant}` : ""}`,
+    "",
+    "## Confirmed evidence",
+    "- [E1] `src/main.ts` owns the state transition that must change.",
+    "",
+    "## Key changes",
+    "- [C1] Modify `src/main.ts` so the state transition preserves the reviewed invariant.",
+    "",
+    "## Test Plan",
+    "- [V1] For C1, run `npm test` and require exit status 0.",
+  ].join("\n");
+  const authoringContract = {
+    version: 7,
+    contractId: "review-runtime-contract",
+    objective: "Keep the reviewed Plan bound to one sealed runtime task graph.",
+    facets: [{
+      id: "G1",
+      index: 1,
+      text: "Keep the reviewed Plan bound to one sealed runtime task graph.",
+    }],
+    contextTargets: [],
+    reusableEvidenceTargets: [],
+    imageCount: 0,
+    diagnosisRequired: false,
+    criteria: [],
+  };
+  const bundle = {
+    bundleId: "review-runtime-bundle",
+    hash: "review-runtime-bundle-hash",
+    turnId: "turn-review-runtime",
+    objective: authoringContract.objective,
+    constraints: [],
+    facts: [{
+      id: "E1",
+      tool: "read_file",
+      target: "src/main.ts",
+      summary: "src/main.ts owns the reviewed state transition.",
+      hash: "review-runtime-e1",
+    }],
+    changeTargets: ["src/main.ts"],
+    verificationTargets: [],
+  };
+  const draft = createDraftPlanCandidate({
+    content,
+    bundle,
+    authoringContract,
+    summary: ["Bind review and execution to the same typed Plan."],
+    findings: [],
+    diagnoses: [],
+    changes: [{
+      text: "[C1] Modify src/main.ts so the state transition preserves the reviewed invariant.",
+      targetRef: "src/main.ts",
+      evidenceRefs: ["E1"],
+    }],
+    interfaces: [],
+    tests: ["V1"],
+    assumptions: [],
+    blockingChoices: [],
+  });
+  const candidate = sealPlanCandidate({
+    candidate: draft,
+    content,
+    runtimeTasks: [{
+      id: "review-runtime-validation",
+      text: "[V1] Run npm test and require exit status 0.",
+      status: "pending",
+      executionKind: "validation",
+      requirementRef: "G1",
+      validation: [{
+        kind: "finite_command",
+        acceptance: "required",
+        command: "npm test",
+        capability: "test",
+        segments: [{
+          command: "npm test",
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      }],
+    }],
+  });
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content,
+    candidate,
+    candidateHash: hashPlanCandidate(candidate),
+    authoringContractId: candidate.authoringContractId,
+    revision: overrides.revision ?? 1,
+    updatedAt: 1,
+  };
+}
 
 function basePlanRuntimeState(overrides = {}) {
   return {
@@ -134,7 +242,12 @@ test("plan review wait returns immediately outside plan mode", async () => {
 });
 
 test("plan review wait enters pending review and resolves false when aborted", async () => {
-  const { abortController, events, handlers } = createHandlers();
+  const artifact = buildTypedReviewArtifact();
+  const { abortController, events, handlers } = createHandlers({
+    callbacks: {
+      getPlanArtifacts: () => [artifact],
+    },
+  });
 
   const wait = handlers.waitForPlanApprovalIfNeeded();
   assert.deepEqual(events, [{ type: "status", status: "pending_review" }]);
@@ -173,44 +286,151 @@ test("plan review cannot open from a stale stage without a materialized artifact
   assert.deepEqual(events, []);
 });
 
-test("plan approval is rejected when the reviewed artifact changes before execution", async () => {
-  let approved = false;
-  let artifactContent = "# Plan\n\n- Change A";
-  const { handlers } = createHandlers({
-    onStatusObserved: (status) => {
-      if (status !== "pending_review") return;
-      artifactContent = "# Plan\n\n- Change B";
-      approved = true;
-    },
+test("plan review accepts a coherent sealed typed candidate", async () => {
+  const artifact = buildTypedReviewArtifact();
+  const { events, handlers } = createHandlers({
     callbacks: {
-      getIsPlanApproved: () => approved,
       getPlanStage: () => "plan",
-      getPlanArtifacts: () => [{
-        kind: "plan",
-        path: ".MAIN/plans/plan.md",
-        title: "Plan",
-        content: artifactContent,
-        revision: artifactContent.endsWith("B") ? 2 : 1,
-        updatedAt: 1,
-      }],
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("typed_candidate"), "stopped");
+  assert.equal(
+    events.some((event) => event.type === "status" && event.status === "pending_review"),
+    true,
+  );
+});
+
+test("plan review fail-closes typed metadata when its candidate is missing", async () => {
+  const { candidate: _candidate, ...partialArtifact } = buildTypedReviewArtifact();
+  const { events, handlers, getPlanRuntimeState } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [partialArtifact],
       getPreferredLanguage: () => "en",
       onAssistantFinalText: () => {},
     },
   });
 
   assert.equal(
-    await handlers.pauseForReviewablePlanArtifact("artifact_changed"),
-    "stopped",
+    await handlers.pauseForReviewablePlanArtifact("partial_typed_candidate"),
+    "not_reviewable",
+  );
+  assert.equal(getPlanRuntimeState().planArtifactQualityRejected, true);
+  assert.equal(
+    getPlanRuntimeState().planLastQualityGateReason,
+    "candidate_metadata_without_candidate",
+  );
+  assert.equal(
+    events.some((event) => event.type === "status" && event.status === "pending_review"),
+    false,
   );
 });
 
+test("plan review rejects malformed candidate payloads without throwing", async () => {
+  const malformedCandidate = { schemaVersion: 4, state: "sealed" };
+  malformedCandidate.circular = malformedCandidate;
+  const artifact = {
+    ...buildTypedReviewArtifact(),
+    candidate: malformedCandidate,
+    candidateHash: "plan-candidate-sha256-malformed",
+    authoringContractId: "review-runtime-contract",
+  };
+  const { events, handlers, getPlanRuntimeState } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  await assert.doesNotReject(() =>
+    handlers.pauseForReviewablePlanArtifact("malformed_typed_candidate")
+  );
+  assert.equal(getPlanRuntimeState().planLastQualityGateReason, "candidate_payload_malformed");
+  assert.equal(
+    events.some((event) => event.type === "status" && event.status === "pending_review"),
+    false,
+  );
+});
+
+test("plan review rejects candidate hash and authoring-contract drift", async () => {
+  for (const [field, value, expectedReason] of [
+    ["candidateHash", "plan-candidate-sha256-drift", "candidate_hash_mismatch"],
+    ["authoringContractId", "other-authoring-contract", "candidate_authoring_contract_mismatch"],
+  ]) {
+    const artifact = { ...buildTypedReviewArtifact(), [field]: value };
+    const { handlers, getPlanRuntimeState } = createHandlers({
+      callbacks: {
+        getPlanStage: () => "plan",
+        getPlanArtifacts: () => [artifact],
+        getPreferredLanguage: () => "en",
+        onAssistantFinalText: () => {},
+      },
+    });
+
+    assert.equal(
+      await handlers.pauseForReviewablePlanArtifact(`drift_${field}`),
+      "not_reviewable",
+    );
+    assert.equal(getPlanRuntimeState().planLastQualityGateReason, expectedReason);
+  }
+});
+
+test("approval wait invalidates an already-approved partial typed candidate", async () => {
+  const { candidate: _candidate, ...partialArtifact } = buildTypedReviewArtifact();
+  const invalidations = [];
+  const { handlers } = createHandlers({
+    callbacks: {
+      getIsPlanApproved: () => true,
+      getPlanArtifacts: () => [partialArtifact],
+      onPlanApprovalInvalidated: (reason) => invalidations.push(reason),
+    },
+  });
+
+  assert.equal(await handlers.waitForPlanApprovalIfNeeded(), false);
+  assert.deepEqual(invalidations, [
+    "typed_plan_review_authority:primary_plan_integrity:candidate_metadata_without_candidate",
+  ]);
+});
+
+test("plan approval is rejected when the reviewed artifact changes before execution", async () => {
+  let approved = false;
+  let artifact = buildTypedReviewArtifact();
+  const invalidations = [];
+  const { handlers } = createHandlers({
+    onStatusObserved: (status) => {
+      if (status !== "pending_review") return;
+      artifact = buildTypedReviewArtifact({ variant: "Reviewed rewrite.", revision: 2 });
+      approved = true;
+    },
+    callbacks: {
+      getIsPlanApproved: () => approved,
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+      onPlanApprovalInvalidated: (reason) => invalidations.push(reason),
+    },
+  });
+
+  assert.equal(await handlers.waitForPlanApprovalIfNeeded(), false);
+  assert.deepEqual(invalidations, ["typed_plan_review_identity_changed"]);
+});
+
 test("an accepted rewrite can enter review with the current tool-phase quality state", async () => {
+  const artifact = buildTypedReviewArtifact();
   const { abortController, events, handlers } = createHandlers({
     // This deliberately models the outer loop before the tool phase has been
     // folded: it still holds the previous rejection.
     planRuntimeState: { planArtifactQualityRejected: true },
     callbacks: {
       getPlanStage: () => "plan",
+      getPlanArtifacts: () => [artifact],
       getPreferredLanguage: () => "en",
       onAssistantFinalText: () => {},
     },
@@ -227,7 +447,7 @@ test("an accepted rewrite can enter review with the current tool-phase quality s
   assert.equal(events.some((event) => event.type === "phase" && event.phase === "review_ready"), true);
 });
 
-test("plan review fails closed when a validation section has no executable task", async () => {
+test("legacy Plan Markdown fails closed before executable validation", async () => {
   const artifact = {
     kind: "plan",
     path: ".MAIN/plans/plan.md",
@@ -258,11 +478,11 @@ test("plan review fails closed when a validation section has no executable task"
   assert.equal(getPlanRuntimeState().planArtifactQualityRejected, true);
   assert.equal(
     getPlanRuntimeState().planLastQualityGateReason,
-    "executable_validation_task_missing",
+    "primary_plan_not_typed",
   );
 });
 
-test("design review accepts validation strategy before an execution command is chosen", async () => {
+test("a supporting design artifact cannot become the primary review authority", async () => {
   const artifact = {
     kind: "design",
     path: ".MAIN/plans/design.md",
@@ -288,11 +508,11 @@ test("design review accepts validation strategy before an execution command is c
     },
   });
 
-  assert.equal(await handlers.pauseForReviewablePlanArtifact("design_strategy"), "stopped");
-  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), true);
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("design_strategy"), "not_reviewable");
+  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), false);
 });
 
-test("plan review accepts an explicit finite non-Node validation command without manifest repair", async () => {
+test("legacy Plan Markdown with a finite command still cannot enter new review", async () => {
   const artifact = {
     kind: "plan",
     path: ".MAIN/plans/plan.md",
@@ -318,11 +538,12 @@ test("plan review accepts an explicit finite non-Node validation command without
     },
   });
 
-  assert.equal(await handlers.pauseForReviewablePlanArtifact("explicit_cargo_test"), "stopped");
-  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), true);
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("explicit_cargo_test"), "not_reviewable");
+  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), false);
 });
 
 test("plan review pauses the current run and approved execution keeps the normal tool surface", async () => {
+  const artifact = buildTypedReviewArtifact();
   const trace = [];
   const lifecycle = [];
   const appendedMessages = [];
@@ -344,6 +565,7 @@ test("plan review pauses the current run and approved execution keeps the normal
     callbacks: {
       getIsPlanApproved: () => false,
       getPlanStage: () => "design",
+      getPlanArtifacts: () => [artifact],
       getPreferredLanguage: () => "en",
       getPlanApprovalChoice: () => null,
       getPlanTasks: () => tasks,

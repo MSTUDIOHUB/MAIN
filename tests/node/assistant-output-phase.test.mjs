@@ -60,7 +60,7 @@ test("assistant output phase owns progress and no-tool presentation telemetry", 
   assert.match(phaseSource, /readonly_permission_auto_continue_limit/);
   assert.match(phaseSource, /plan_non_blocking_choice_auto_continue_limit/);
   assert.match(phaseSource, /force_plan_finalization/);
-  assert.match(phaseSource, /MAIN runtime owns the plan artifact/);
+  assert.match(phaseSource, /MAIN runtime owns validation and rendering/);
   assert.doesNotMatch(phaseSource, /This turn paused because the model repeatedly emitted planning options/);
   assert.match(phaseSource, /normalized_turn/);
   assert.match(phaseSource, /reply_options_rejected/);

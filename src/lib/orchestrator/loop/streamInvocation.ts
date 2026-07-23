@@ -13,10 +13,20 @@ import {
   summarizeMessagesForDiagnostics,
   summarizeToolsForDiagnostics,
 } from "../../orchestrator";
-import type { ResolvedUserIntent } from "../../runIntent";
+import {
+  isMutationRuntimeIntent,
+  type ResolvedUserIntent,
+} from "../../runIntent";
 import type { OpenAiToolChoice, StreamResult } from "../../streaming";
-import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
-import type { ToolDefinition } from "../../toolSchemas";
+import {
+  adaptRequiredPreferredDelegationReadIntent,
+  annotateRequiredToolCallProtocolResult,
+  hasSuccessfulAllowedRawNativeToolCall,
+} from "../../requiredToolProtocol";
+import {
+  SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+  type ToolDefinition,
+} from "../../toolSchemas";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { AgentMessage, FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
@@ -31,9 +41,12 @@ export type PlanStreamWatchdogOptionsResolver = (
   nativeToolCount: number,
 ) => FetchLLMStreamOptions | undefined;
 
-// Shared timeout policy for the bounded approved-Plan watchdog retry. It no
-// longer activates or narrows an action-only tool surface.
-export const APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS = 45_000;
+// Execute streams are transactions, not open-ended prose generation. Keep the
+// initial request large enough for local reasoning, then make the one recovery
+// request deliberately smaller and action-only.
+export const EXECUTE_STREAM_NO_VISIBLE_PROGRESS_MS = 105_000;
+export const EXECUTE_STREAM_MAX_ELAPSED_MS = 120_000;
+export const EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS = 90_000;
 export const SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS = 4_096;
 export const SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS = 2_048;
 
@@ -67,11 +80,24 @@ export function resolveRecoveryToolChoice(input: {
   llmToolNames: string[];
   forceXmlTools: boolean;
   preferredDelegationRequired?: boolean;
+  planEvidenceObligationRequired?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
   recoveryActionContract?: RecoveryActionContract;
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
   if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
+  // Drafting and rewrite expose only this runtime-control capability. Use the
+  // portable required-any shape because the real schema surface already makes
+  // the required function exact across OpenAI-compatible providers.
+  if (
+    availableToolNames.size === 1 &&
+    availableToolNames.has(SUBMIT_PLAN_CANDIDATE_TOOL_NAME)
+  ) {
+    return "required";
+  }
+  if (input.planEvidenceObligationRequired && availableToolNames.size === 1) {
+    return "required";
+  }
   if (
     input.preferredDelegationRequired &&
     availableToolNames.has("spawn_subagent")
@@ -150,9 +176,10 @@ export async function invokeInitialStreamForIteration(input: {
   markChatFinalSynthesisPromptUsed: () => void;
   recentToolActivity: PlanToolActivitySummary[];
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
-  approvedPlanRecoveryStreamMaxElapsedMs: number;
+  executeRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
   preferredDelegationRequired: boolean;
+  planEvidenceObligationRequired?: boolean;
 }): Promise<InitialStreamInvocationResult> {
   const {
     callbacks,
@@ -182,9 +209,10 @@ export async function invokeInitialStreamForIteration(input: {
     markChatFinalSynthesisPromptUsed,
     recentToolActivity,
     getPlanStreamWatchdogOptions,
-    approvedPlanRecoveryStreamMaxElapsedMs,
+    executeRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
     preferredDelegationRequired,
+    planEvidenceObligationRequired,
   } = input;
   const {
     config,
@@ -227,20 +255,23 @@ export async function invokeInitialStreamForIteration(input: {
   }
 
   const baseStreamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
-  const approvedPlanRecoveryStreamHardTimeoutActive =
-    config.activeProfile === "local" &&
-    callbacks.getIsPlanApproved() &&
-    runtimeIntent === "execute" &&
+  const executeEvidenceRuntime =
+    workflowMode === "edit" ||
+    isMutationRuntimeIntent(runtimeIntent) ||
+    runtimeIntent === "studio_workflow";
+  const executeRecoveryStreamHardTimeoutActive =
+    executeEvidenceRuntime &&
     isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
-  const recoveryStreamMaxElapsedMs = approvedPlanRecoveryStreamMaxElapsedMs;
+  const recoveryStreamMaxElapsedMs = executeRecoveryStreamMaxElapsedMs;
   const subagentDepth = callbacks.getSubagentDepth?.() ?? 0;
   const childStreamBounded = subagentDepth > 0;
-  const normalApprovedLocalExecutionBounded =
-    config.activeProfile === "local" &&
-    callbacks.getIsPlanApproved() &&
-    runtimeIntent === "execute";
-  const boundedNoVisibleMs = childStreamBounded || normalApprovedLocalExecutionBounded ? 45_000 : 0;
-  const boundedMaxElapsedMs = childStreamBounded || normalApprovedLocalExecutionBounded ? 120_000 : 0;
+  const executeStreamBounded = executeEvidenceRuntime;
+  const boundedNoVisibleMs = childStreamBounded || executeStreamBounded
+    ? EXECUTE_STREAM_NO_VISIBLE_PROGRESS_MS
+    : 0;
+  const boundedMaxElapsedMs = childStreamBounded || executeStreamBounded
+    ? EXECUTE_STREAM_MAX_ELAPSED_MS
+    : 0;
   const minPositive = (current: number | undefined, next: number): number | undefined => {
     if (next <= 0) return current;
     if (!current || current <= 0) return next;
@@ -256,23 +287,23 @@ export async function invokeInitialStreamForIteration(input: {
           ),
           noVisibleTokenTimeoutLabel: childStreamBounded
             ? "subagent_no_visible_progress"
-            : "approved_plan_no_visible_progress",
+            : "execute_no_visible_progress",
           maxStreamElapsedMs: minPositive(
             baseStreamWatchdogOptions.maxStreamElapsedMs,
             boundedMaxElapsedMs,
           ),
           maxStreamElapsedLabel: childStreamBounded
             ? "subagent_stream_boundary"
-            : "approved_plan_stream_boundary",
+            : "execute_stream_boundary",
         }
       : {}),
-    ...(approvedPlanRecoveryStreamHardTimeoutActive
+    ...(executeRecoveryStreamHardTimeoutActive
       ? {
           maxStreamElapsedMs: minPositive(
             boundedMaxElapsedMs > 0 ? boundedMaxElapsedMs : baseStreamWatchdogOptions.maxStreamElapsedMs,
             recoveryStreamMaxElapsedMs,
           ),
-          maxStreamElapsedLabel: "approved_plan_recovery",
+          maxStreamElapsedLabel: "execute_recovery",
         }
       : {}),
   };
@@ -288,6 +319,7 @@ export async function invokeInitialStreamForIteration(input: {
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
     preferredDelegationRequired,
+    planEvidenceObligationRequired,
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     recoveryActionContract,
@@ -392,11 +424,39 @@ export async function invokeInitialStreamForIteration(input: {
       runtimeIntent,
     },
   );
+  const preferredDelegationAdaptation =
+    adaptRequiredPreferredDelegationReadIntent({
+      result: rawStreamResult,
+      preferredDelegationRequired,
+      allowedToolNames: llmTools.map((tool) => tool.function.name),
+    });
+  if (preferredDelegationAdaptation.adapted) {
+    logAgentEvent("preferred_delegation_read_intent_adapted", {
+      iteration,
+      sourceToolName: preferredDelegationAdaptation.sourceToolName,
+      target: preferredDelegationAdaptation.target,
+      toolCallId: preferredDelegationAdaptation.toolCallId,
+      adaptedToolName: "spawn_subagent",
+      boundedReadOnlyIntent: true,
+      providerNeutral: true,
+    });
+  }
   const streamResult = annotateRequiredToolCallProtocolResult(
-    rawStreamResult,
+    preferredDelegationAdaptation.result,
     recoveryToolChoice,
     llmTools.map((tool) => tool.function.name),
   );
+  if (streamResult.protocolTransportAdaptation) {
+    logAgentEvent("required_plan_submission_transport_adapted", {
+      iteration,
+      adaptation: streamResult.protocolTransportAdaptation,
+      source: streamResult.protocolTransportSource || "content",
+      protocolChars: streamResult.content.length,
+      allowedTools: llmTools.map((tool) => tool.function.name),
+      typedIngressStillRequired: true,
+      providerNeutral: true,
+    });
+  }
   if (streamResult.protocolViolation) {
     logAgentEvent("required_tool_call_protocol_violation", {
       iteration,
@@ -411,7 +471,11 @@ export async function invokeInitialStreamForIteration(input: {
     });
   }
 
-  if (llmTools.length > 0) {
+  if (hasSuccessfulAllowedRawNativeToolCall({
+    rawResult: rawStreamResult,
+    normalizedResult: streamResult,
+    allowedToolNames: llmTools.map((tool) => tool.function.name),
+  })) {
     callbacks.onProviderNativeToolSuccess?.();
   }
   const completionClass = classifyAssistantCompletion(streamResult);

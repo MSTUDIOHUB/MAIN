@@ -2,6 +2,7 @@ import type { AttachedFile } from "../lib/attachments";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import {
   getHarnessActionRunId,
+  isExactHarnessRunGeneration,
   type HarnessRunMarker,
   type HarnessRunOwner,
 } from "../lib/harnessCrashTelemetry";
@@ -17,7 +18,10 @@ import type {
   ResolvedRunIntent,
 } from "../lib/runIntent";
 import type { AgentMessage } from "../lib/orchestrator";
-import type { WorkflowEngineStoreHelpers } from "../lib/orchestrator/workflowEngine";
+import type {
+  WorkflowEngineStoreHelpers,
+  WorkflowRunSettlement,
+} from "../lib/orchestrator/workflowEngine";
 import type { TaskBlock } from "../lib/taskTypes";
 import { stripAssistantPublicProgress } from "../lib/assistantPublicProgress";
 import type {
@@ -62,6 +66,7 @@ import type { GameStudioTurnRuntimeService } from "./gameStudioTurnPreparation";
 import {
   appendRuntimeEvent,
   appendRuntimeEventWithResult,
+  isRunBoundaryEvent,
   isRunTerminalEvent,
   isTerminalTurnEvent,
   withEventSchema,
@@ -695,6 +700,8 @@ export function finalizeSubmitBootstrapFailure<
           turnId: input.turnId,
           runId: owner.submissionRunId,
           activeRunId: marker?.activeRunId || marker?.runId || null,
+          error: detail,
+          staleControlSource: newerRunOwnsTurn ? "harness_run" : "action_request",
         });
         return;
       }
@@ -984,6 +991,307 @@ export function finalizeSubmitBootstrapFailure<
   };
 
   return finalize();
+}
+
+export type WorkflowProjectionFailureReconciliationDisposition =
+  | "reconciled"
+  | "already_quiescent"
+  | "superseded"
+  | "runtime_owner_lost";
+
+/**
+ * Last-resort settlement for a workflow whose model/tool loop returned but
+ * whose durable terminal transaction was rejected. This is deliberately a
+ * pause, never an invented completion. The exact Session generation, Harness
+ * generation, active child Run, action request, and AbortController are fenced
+ * before the busy UI owner is released.
+ */
+export async function reconcileSubmitWorkflowProjectionFailure<
+  TState extends SubmitAsyncWorkflowRunState,
+  TAbortController extends AbortController,
+>(input: {
+  request: StartSubmitAsyncWorkflowRunInput<TState, TAbortController>;
+  settlement: Extract<WorkflowRunSettlement, { disposition: "projection_failed" }>;
+  owner: SubmitBootstrapRunOwner;
+  abortController: TAbortController;
+  runtimeOwnerToken: object;
+}): Promise<WorkflowProjectionFailureReconciliationDisposition> {
+  const { request, settlement, owner, abortController, runtimeOwnerToken } = input;
+  if (!request.hasSessionRuntimeOwnership(runtimeOwnerToken)) {
+    request.logStoreEvent("workflow_projection_failure_reconciliation_skipped", {
+      sessionKey: request.runSessionKey,
+      turnId: request.turnId,
+      runId: settlement.identity.runId,
+      reason: "runtime_owner_lost",
+    });
+    return "runtime_owner_lost";
+  }
+
+  const resolution: { disposition: WorkflowProjectionFailureReconciliationDisposition } = {
+    disposition: "superseded",
+  };
+  let projectedMarker: HarnessRunMarker | null = null;
+  let projectedMarkerOwner: HarnessRunOwner | null = null;
+  const ownerTurnIds = new Set([request.turnId, request.uiDisplayTurnId].filter(Boolean));
+  const ownedRunIds = new Set([
+    owner.harnessRunId,
+    owner.runId,
+    owner.parentRunId,
+    settlement.identity.outerRunId,
+    settlement.identity.runId,
+    settlement.identity.parentRunId,
+  ].filter((candidate): candidate is string => !!candidate));
+  const pauseReason = settlement.outcome.status === "paused"
+    ? settlement.outcome.reason
+    : `terminal_projection_failed:${settlement.reason}`;
+  const pauseKind = settlement.outcome.status === "paused"
+    ? settlement.outcome.pauseKind
+    : "recoverable" as const;
+  const timestampMs = request.nowMs();
+
+  request.sessionSet((state: TState) => {
+    if (!request.hasSessionRuntimeOwnership(runtimeOwnerToken)) {
+      resolution.disposition = "runtime_owner_lost";
+      return {};
+    }
+    const marker = state.harnessRunMarker || null;
+    const exactMarkerOwner: HarnessRunOwner = {
+      runId: owner.harnessRunId,
+      sessionKey: request.runSessionKey,
+      turnId: request.turnId,
+      instanceId: owner.instanceId,
+      startedAt: owner.startedAt,
+    };
+    const ownsExactHarnessGeneration = isExactHarnessRunGeneration(marker, {
+      ...exactMarkerOwner,
+      instanceId: owner.instanceId,
+      startedAt: owner.startedAt,
+    });
+    const markerActionRunId = getHarnessActionRunId(marker);
+    const foreignHarnessChild = !!markerActionRunId && !ownedRunIds.has(markerActionRunId);
+    const actionRequest = state.activeActionRequest as (
+      SubmitAsyncWorkflowRunState["activeActionRequest"] & { status?: string; kind?: string }
+    ) | null | undefined;
+    const foreignActionOwner = !!actionRequest &&
+      actionRequest.status === "pending" &&
+      actionRequest.sessionKey === request.runSessionKey &&
+      actionRequest.turnId === request.turnId &&
+      !ownedRunIds.has(actionRequest.runId);
+    const foreignAbortOwner = !!state.abortController && state.abortController !== abortController;
+    if (
+      !ownsExactHarnessGeneration ||
+      foreignHarnessChild ||
+      foreignActionOwner ||
+      foreignAbortOwner
+    ) {
+      resolution.disposition = "superseded";
+      return {};
+    }
+    if (state.isGenerating !== true && state.agentStatus !== "running") {
+      resolution.disposition = "already_quiescent";
+      return {};
+    }
+
+    const hasTerminalTurn = (state.runtimeEvents || []).some((event) =>
+      isTerminalTurnEvent(event) &&
+      event.threadId === request.runSessionKey &&
+      event.turnId === request.turnId
+    );
+    let runtimeEvents = state.runtimeEvents || [];
+    if (!hasTerminalTurn) {
+      const existingRunBoundary = runtimeEvents.find((event) =>
+        (isRunBoundaryEvent(event) || isRunTerminalEvent(event)) &&
+        event.threadId === request.runSessionKey &&
+        event.turnId === request.turnId &&
+        event.runId === settlement.identity.runId
+      );
+      if (!existingRunBoundary) {
+        runtimeEvents = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+          type: "run.paused",
+          threadId: request.runSessionKey,
+          turnId: request.turnId,
+          timestampMs,
+          runId: settlement.identity.runId,
+          parentRunId: settlement.identity.parentRunId,
+          reason: pauseReason,
+          message: pauseReason,
+        })).events;
+      }
+    }
+
+    const ownsPendingAction = !!actionRequest &&
+      actionRequest.status === "pending" &&
+      actionRequest.sessionKey === request.runSessionKey &&
+      actionRequest.turnId === request.turnId &&
+      ownedRunIds.has(actionRequest.runId);
+    const pausedTurnStatus = ownsPendingAction
+      ? actionRequest.kind === "user_choice"
+        ? "awaiting_input"
+        : "awaiting_approval"
+      : "paused";
+    const lifecycle = state.planLifecycle;
+    const executionLease = lifecycle?.executionLease || null;
+    const executionOwner = lifecycle?.execution || null;
+    const ownsPlanExecution = !!executionLease && !!executionOwner &&
+      ownedRunIds.has(executionOwner.runId) &&
+      isPlanLifecycleExecutionAuthorizedForRun(lifecycle, {
+        executionLeaseId: executionLease.executionLeaseId,
+        turnId: executionOwner.turnId,
+        runId: executionOwner.runId,
+        parentRunId: executionOwner.parentRunId,
+        attempt: executionOwner.attempt,
+      });
+    const planPause = ownsPlanExecution && executionLease && executionOwner
+      ? reducePlanLifecycle(lifecycle, {
+          type: "pause",
+          expectedVersion: lifecycle.version,
+          at: timestampMs,
+          expectedExecutionLeaseId: executionLease.executionLeaseId,
+          expectedExecution: executionOwner,
+          pause: {
+            reason: pauseReason,
+            resultKind: settlement.outcome.status === "completed" &&
+              settlement.outcome.resultKind !== "success"
+              ? settlement.outcome.resultKind
+              : "blocked",
+            resumeCondition: ownsPendingAction
+              ? "resolve_action_request"
+              : "explicit_resume",
+          },
+        })
+      : null;
+    const pausedPlanLifecycle = planPause && planPause.disposition !== "rejected"
+      ? planPause.state
+      : null;
+    const nextMarker: HarnessRunMarker = {
+      ...marker!,
+      status: "paused",
+      terminalResultKind: null,
+      ...(pausedPlanLifecycle
+        ? { isPlanApproved: false, planStage: "ready_to_execute" }
+        : {}),
+      closeReason: pauseReason,
+      closedAt: timestampMs,
+      updatedAt: timestampMs,
+    };
+    projectedMarker = nextMarker;
+    projectedMarkerOwner = exactMarkerOwner;
+    resolution.disposition = "reconciled";
+    return {
+      runtimeEvents,
+      harnessRunMarker: nextMarker,
+      ...(pausedPlanLifecycle
+        ? {
+            planLifecycle: pausedPlanLifecycle,
+            isPlanApproved: false,
+            planStage: "ready_to_execute" as const,
+            pendingPlanApprovalHandoff: null,
+            planApprovalExecutionStartedForTurnId: null,
+            currentTurnExecutionConsent: { turnId: null, granted: false },
+          }
+        : {}),
+      conversationTurns: state.conversationTurns.map((turn) =>
+        ownerTurnIds.has(turn.id) && !hasTerminalTurn
+          ? {
+              ...turn,
+              status: pausedTurnStatus,
+              collapsed: false,
+              runtimeOutcome: {
+                status: "paused" as const,
+                checkpointKind: "paused" as const,
+                reason: pauseReason,
+                pauseKind,
+                runId: settlement.identity.runId,
+                parentRunId: settlement.identity.parentRunId,
+                updatedAt: timestampMs,
+              },
+            }
+          : turn
+      ),
+      agentStatus: ownsPendingAction ? "pending_review" as const : "idle" as const,
+      isGenerating: false,
+      abortController: null,
+      elapsedTime: request.elapsedTimer.getElapsedSeconds(),
+    } as unknown as Partial<TState>;
+  });
+
+  const disposition = resolution.disposition;
+  if (disposition !== "reconciled") {
+    request.logStoreEvent("workflow_projection_failure_reconciliation_skipped", {
+      sessionKey: request.runSessionKey,
+      turnId: request.turnId,
+      runId: settlement.identity.runId,
+      reason: disposition,
+      currentOwner: settlement.currentOwner,
+    });
+    return disposition;
+  }
+
+  request.elapsedTimer.dispose();
+  if (projectedMarker && projectedMarkerOwner) {
+    try {
+      const persistedMarker = request.persistHarnessRunMarkerIfOwned(
+        projectedMarker,
+        projectedMarkerOwner,
+      );
+      if (persistedMarker) {
+        request.sessionSet((state: TState) =>
+          state.harnessRunMarker &&
+          isExactHarnessRunGeneration(state.harnessRunMarker, {
+            ...projectedMarkerOwner!,
+            instanceId: owner.instanceId,
+            startedAt: owner.startedAt,
+          }) &&
+          state.harnessRunMarker.status === "paused"
+            ? { harnessRunMarker: persistedMarker }
+            : {}
+        );
+      }
+    } catch (error) {
+      request.logStoreEvent("workflow_projection_failure_harness_persist_unavailable", {
+        sessionKey: request.runSessionKey,
+        turnId: request.turnId,
+        runId: settlement.identity.runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  try {
+    const revisionToken = request.getSessionRevisionToken();
+    const projectedState = request.sessionGet();
+    const durableState = await request.persistBootstrapProjection(projectedState);
+    const publication = request.publishOwnerScopedRuntimeProjection({
+      projectedState,
+      durableState,
+      scopeKey: request.runScopeKey,
+      sessionId: request.runSessionId,
+      expectedRevisionToken: revisionToken,
+    });
+    if (!publication.published) {
+      request.logStoreEvent("workflow_projection_failure_durable_publish_skipped", {
+        sessionKey: request.runSessionKey,
+        turnId: request.turnId,
+        runId: settlement.identity.runId,
+        disposition: publication.disposition,
+      });
+    }
+  } catch (error) {
+    request.logStoreEvent("workflow_projection_failure_persist_unavailable", {
+      sessionKey: request.runSessionKey,
+      turnId: request.turnId,
+      runId: settlement.identity.runId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  request.logStoreEvent("workflow_projection_failure_reconciled", {
+    sessionKey: request.runSessionKey,
+    turnId: request.turnId,
+    runId: settlement.identity.runId,
+    reason: settlement.reason,
+    pauseReason,
+  });
+  return "reconciled";
 }
 
 export type PlanExecutionAdmissionResult =
@@ -1481,6 +1789,7 @@ export async function runSubmitAsyncWorkflowRun<
     sendStartedAt: input.sendStartedAt,
     harnessRunId: runLease.harnessRunMarker.runId,
     planExecution: planExecutionAdmission.planExecution,
+    turnInputContextSignals: input.turnInputContextSignals,
     turnAgentMessagesStart: runLease.turnAgentMessagesStart,
     getElapsedSeconds: input.elapsedTimer.getElapsedSeconds,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: input.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
@@ -1500,7 +1809,7 @@ export async function runSubmitAsyncWorkflowRun<
     createVisibleTurnForHiddenMessage: input.createVisibleTurnForHiddenMessage,
   } satisfies StartSubmitStreamingUiInput);
 
-  await (phaseRunners.runWorkflowEngine || runSubmitWorkflowEngine)({
+  const workflowSettlement = await (phaseRunners.runWorkflowEngine || runSubmitWorkflowEngine)({
     get: input.sessionGet,
     set: input.sessionSet,
     getSessionRevisionToken: input.getSessionRevisionToken,
@@ -1515,6 +1824,23 @@ export async function runSubmitAsyncWorkflowRun<
     startApprovedPlanExecutionInCurrentTurn: input.startApprovedPlanExecutionInCurrentTurn,
     logStoreEvent: input.logStoreEvent,
   } satisfies RunSubmitWorkflowEngineInput);
+  if (workflowSettlement?.disposition === "projection_failed" && acquiredRunOwner) {
+    await reconcileSubmitWorkflowProjectionFailure({
+      request: input,
+      settlement: workflowSettlement,
+      owner: acquiredRunOwner,
+      abortController: runLease.abortController,
+      runtimeOwnerToken: initialRuntimeOwnerToken,
+    });
+  } else if (workflowSettlement?.disposition === "superseded") {
+    input.logStoreEvent("workflow_settlement_superseded", {
+      sessionKey: input.runSessionKey,
+      turnId: input.turnId,
+      runId: workflowSettlement.identity.runId,
+      reason: workflowSettlement.reason,
+      currentOwner: workflowSettlement.currentOwner,
+    });
+  }
   } catch (error) {
     await finalizeSubmitBootstrapFailure(input, error, {
       submissionRunId: acquiredRunOwner?.runId || submissionRunId,

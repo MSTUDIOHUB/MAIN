@@ -69,6 +69,17 @@ const {
   formatToolFeedbackEnvelope,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 const {
+  assessPlanClosureEvidence,
+  buildPlanEvidenceBundle,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
+const {
+  createPlanEvidenceReceipt,
+  validatePlanEvidenceReceipt,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidenceReceipt.ts"));
+const {
+  createRuntimePlanStructuredEvidenceFacts,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planStructuredEvidence.ts"));
+const {
   isProjectSourceWriteResult,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 const {
@@ -85,7 +96,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/browserValidation.ts"));
 
 function result(overrides) {
-  return {
+  const value = {
     toolCallId: "call_1",
     name: "replace_in_file",
     catalogIdentity: { source: "built_in", canonicalName: "replace_in_file" },
@@ -94,6 +105,21 @@ function result(overrides) {
     isError: false,
     ...overrides,
   };
+  if (
+    /^(?:read_file|read_file_window)$/.test(value.name) &&
+    !value.readFileObservation
+  ) {
+    const lines = String(value.runtimeEvidenceContent || value.content || "").split("\n").length;
+    value.readFileObservation = {
+      key: `${value.target}::${value.toolCallId}::test-version`,
+      path: value.target,
+      requestSignature: value.toolCallId,
+      versionToken: `test-version:${value.target}`,
+      source: "fresh",
+      window: { startLine: 1, endLine: lines, totalLines: lines, truncated: false },
+    };
+  }
+  return value;
 }
 
 function toolObservationProvenance(sourceToolCallId, overrides = {}) {
@@ -138,6 +164,12 @@ function createPostProcessingInput(overrides = {}) {
     taskTargetingEvidence,
     recentToolActivity,
     recentPlanToolActivity,
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "unspecified",
+    },
     planRuntimePhase: "drafting",
     planEvidenceRecoveryObjective: "none",
     planDraftingRecoveryReadCount: 0,
@@ -756,6 +788,304 @@ test("Plan evidence activity outlives the short loop-detection window and merges
   assert.match(ledger[0].detail || "", /additionalBoundary/);
 });
 
+test("Plan source evidence replaces stale fields across versions and merges same-version windows", () => {
+  const ledger = [];
+  const observedRead = ({ toolCallId, versionToken, requestSignature, content }) => result({
+    toolCallId,
+    name: "read_file",
+    target: "src/runtime.ts",
+    content,
+    readFileObservation: {
+      key: `src/runtime.ts::${requestSignature}::${versionToken}`,
+      path: "src/runtime.ts",
+      requestSignature,
+      versionToken,
+      source: "fresh",
+      window: { startLine: 1, endLine: content.split("\n").length, totalLines: 20, truncated: true },
+    },
+  });
+
+  rememberToolActivity(ledger, observedRead({
+    toolCallId: "read-v1",
+    versionToken: "version-v1",
+    requestSignature: "1-20",
+    content: "await invoke('legacy_save', { file_path: path });",
+  }), { evidenceLedger: true });
+  assert.match((ledger[0].facts || []).join(" "), /legacy_save/);
+
+  rememberToolActivity(ledger, observedRead({
+    toolCallId: "read-v2",
+    versionToken: "version-v2",
+    requestSignature: "1-20",
+    content: "document.dispatchEvent(new Event('document-ready'));",
+  }), { evidenceLedger: true });
+  assert.equal(ledger.length, 1);
+  assert.doesNotMatch((ledger[0].facts || []).join(" "), /legacy_save/);
+  assert.match((ledger[0].facts || []).join(" "), /document-ready/);
+  assert.ok((ledger[0].sourceObservations || []).every((item) =>
+    item.versionToken === "version-v2"
+  ));
+
+  rememberToolActivity(ledger, observedRead({
+    toolCallId: "read-v2-window",
+    versionToken: "version-v2",
+    requestSignature: "21-40",
+    content: "window.addEventListener('document-ready', () => scheduleSave());",
+  }), { evidenceLedger: true });
+  assert.match((ledger[0].facts || []).join(" "), /document-ready/);
+  assert.match(
+    (ledger[0].sourceObservations || []).map((item) => item.excerpt).join(" "),
+    /scheduleSave/,
+  );
+  assert.equal(ledger[0].readFileObservation.versionToken, "version-v2");
+});
+
+test("same-version source pagination retains atomic provenance for decisive exact windows", () => {
+  const sourceLines = Array.from({ length: 420 }, (_, index) => `// context ${index + 1}`);
+  for (const [line, event] of [[20, "alpha"], [90, "beta"], [160, "gamma"], [230, "delta"]]) {
+    sourceLines[line - 1] = `function bind${event}() {`;
+    sourceLines[line] = `  document.addEventListener('${event}', () => refresh${event}());`;
+    sourceLines[line + 1] = "}";
+  }
+  sourceLines[349] = "await invoke('persist_record', {";
+  sourceLines[350] = "  record_path: record.path,";
+  sourceLines[351] = "  content: record.content";
+  sourceLines[352] = "});";
+  const source = sourceLines.join("\n");
+  const ledger = [];
+  const observedRead = ({ toolCallId, content, startLine, endLine }) => result({
+    toolCallId,
+    name: "read_file",
+    target: "src/runtime.js",
+    content,
+    readFileObservation: {
+      key: `src/runtime.js::${startLine}-${endLine}::source-v1`,
+      path: "src/runtime.js",
+      requestSignature: `${startLine}-${endLine}`,
+      versionToken: "source-v1",
+      source: "fresh",
+      window: {
+        startLine,
+        endLine,
+        totalLines: sourceLines.length,
+        truncated: startLine !== 1 || endLine !== sourceLines.length,
+      },
+    },
+  });
+
+  rememberToolActivity(ledger, observedRead({
+    toolCallId: "full-source",
+    content: source,
+    startLine: 1,
+    endLine: sourceLines.length,
+  }), { evidenceLedger: true });
+  assert.equal(ledger[0].sourceObservations.length, 4);
+  assert.equal(
+    ledger[0].sourceObservations.some((item) => item.startLine <= 350 && item.endLine >= 350),
+    false,
+  );
+
+  rememberToolActivity(ledger, observedRead({
+    toolCallId: "exact-command-window",
+    content: sourceLines.slice(339, 360).join("\n"),
+    startLine: 340,
+    endLine: 360,
+  }), { evidenceLedger: true });
+
+  assert.equal(ledger[0].sourceObservations.length, 4);
+  assert.ok(ledger[0].sourceObservations.some((item) =>
+    item.startLine === 340 && item.endLine === 360
+  ));
+  assert.ok(ledger[0].structuredFacts.some((fact) =>
+    fact.kind === "command_contract" &&
+    fact.relation === "invoke" &&
+    fact.command === "persist_record" &&
+    fact.arguments?.includes("record_path")
+  ));
+
+  const bundle = buildPlanEvidenceBundle({
+    objective: "Repair the observed persistence contract.",
+    evidenceRecords: ledger.map((item) => ({
+      tool: item.name,
+      target: item.target,
+      status: item.status,
+      summary: item.detail,
+      facts: item.facts,
+      structuredFacts: item.structuredFacts,
+      sourceObservations: item.sourceObservations,
+    })),
+  });
+  assert.deepEqual(validatePlanEvidenceReceipt(createPlanEvidenceReceipt(bundle)), []);
+});
+
+test("Plan source evidence uses model content instead of the shorter UI projection", () => {
+  const activity = [];
+  rememberToolActivity(activity, result({
+    toolCallId: "read-contract-after-display-cutoff",
+    name: "read_file",
+    target: "src/main.js",
+    displayContent: "import { invoke } from '@tauri-apps/api/core';",
+    content: [
+      "import { invoke } from '@tauri-apps/api/core';",
+      "editor.addEventListener('input', () => {",
+      "  markDirty();",
+      "  scheduleAutoSave();",
+      "});",
+      "await invoke('save_file_content', {",
+      "  file_path: file.path,",
+      "  content: editor.value",
+      "});",
+    ].join("\n"),
+  }), { evidenceLedger: true });
+
+  assert.ok(activity[0].facts.includes(
+    "command_invoke_argument_contract(save_file_content,file_path,content)",
+  ));
+  assert.ok(activity[0].facts.includes("listener_calls(markDirty,scheduleAutoSave)"));
+  assert.ok(
+    activity[0].structuredFacts?.some((fact) =>
+      fact.kind === "command_contract" &&
+      fact.relation === "invoke" &&
+      fact.command === "save_file_content" &&
+      fact.arguments?.includes("file_path")
+    ),
+    JSON.stringify(activity[0].structuredFacts),
+  );
+  assert.match(activity[0].sourceObservations?.[0]?.excerpt || "", /scheduleAutoSave/);
+  assert.match(activity[0].sourceObservations?.[0]?.excerptHash || "", /^source-sha256-/);
+
+  const noisyHandlers = Array.from({ length: 12 }, (_, index) => [
+    "#[tauri::command]",
+    `fn auxiliary_command_${index}(value_${index}: String) -> Result<(), String> { Ok(()) }`,
+  ].join("\n"));
+  rememberToolActivity(activity, result({
+    toolCallId: "read-handler-after-summary-budget",
+    name: "read_file",
+    target: "src-tauri/src/main.rs",
+    displayContent: noisyHandlers.slice(0, 2).join("\n"),
+    content: [
+      ...noisyHandlers,
+      "#[tauri::command]",
+      "fn save_file_content(content: String, file_path: Option<String>) -> Result<(), String> {",
+      "  let path = file_path.ok_or_else(|| \"missing path\".to_string())?;",
+      "  std::fs::write(path, content).map_err(|error| error.to_string())",
+      "}",
+    ].join("\n"),
+  }), { evidenceLedger: true });
+
+  assert.doesNotMatch(activity[1].detail || "", /save_file_content/);
+  assert.ok(activity[1].facts.includes(
+    "command_handler_argument_contract(save_file_content,content,filePath)",
+  ));
+  assert.ok(
+    activity[1].structuredFacts?.some((fact) =>
+      fact.kind === "command_contract" &&
+      fact.relation === "handler" &&
+      fact.command === "save_file_content" &&
+      fact.arguments?.includes("filePath")
+    ),
+    JSON.stringify(activity[1].structuredFacts),
+  );
+  const bundle = buildPlanEvidenceBundle({
+    objective: "修复打开文件后自动保存时提示缺少保存路径的问题。",
+    evidenceRecords: activity.map((item) => ({
+      tool: item.name,
+      target: item.target,
+      status: item.status,
+      summary: item.detail,
+      facts: item.facts,
+      structuredFacts: item.structuredFacts,
+      sourceObservations: item.sourceObservations,
+    })),
+  });
+  assert.match(
+    bundle.facts.find((fact) => fact.target === "src/main.js")
+      ?.sourceObservations?.[0]?.excerpt || "",
+    /file_path: file\.path/,
+  );
+  assert.doesNotMatch(
+    bundle.facts.find((fact) => fact.target === "src-tauri/src/main.rs")?.summary || "",
+    /save_file_content/,
+    "the bounded display summary should stay noisy enough to prove structured facts are independent",
+  );
+  assert.ok(assessPlanClosureEvidence(bundle).contractMismatchKinds.includes(
+    "command_argument_case:save_file_content:file_path->filePath",
+  ));
+});
+
+test("real four-owner Plan evidence keeps causal and command-contract components independent", () => {
+  const ledger = [];
+  const sources = new Map([
+    ["src/components/toolbar.js", [
+      "export function setCurrentFile(filePath) {",
+      "  const filePathEl = document.getElementById('file-path');",
+      "  filePathEl.textContent = filePath ? filePath.split('/').pop() : '';",
+      "}",
+    ].join("\n")],
+    ["src/components/editor.js", [
+      "editor.setValue = function(value) {",
+      "  this.value = value;",
+      "  this.dispatchEvent(new Event('input'));",
+      "};",
+    ].join("\n")],
+    ["src/main.js", [
+      "editorEl.addEventListener('input', () => {",
+      "  if (activeTab >= 0) {",
+      "    activeFiles[activeTab].isDirty = true;",
+      "    scheduleAutoSave();",
+      "  }",
+      "});",
+      "await invoke('save_file_content', {",
+      "  file_path: file.path,",
+      "  content: editorEl.value",
+      "});",
+    ].join("\n")],
+    ["src-tauri/src/main.rs", [
+      "#[tauri::command]",
+      "fn save_file_content(content: String, file_path: Option<String>) -> Result<(), String> {",
+      "  std::fs::write(file_path.unwrap(), content).map_err(|error| error.to_string())",
+      "}",
+    ].join("\n")],
+  ]);
+  for (const [target, content] of sources) {
+    rememberToolActivity(ledger, result({
+      toolCallId: `four-owner-${target}`,
+      name: "read_file",
+      target,
+      content,
+    }), { evidenceLedger: true });
+  }
+  const bundle = buildPlanEvidenceBundle({
+    objective: [
+      "1. Remove the duplicate filename presentation.",
+      "2. Stop programmatic file opening from entering dirty autosave and the invalid save call.",
+    ].join("\n"),
+    evidenceRecords: ledger.map((item) => ({
+      tool: item.name,
+      target: item.target,
+      status: item.status,
+      summary: item.detail,
+      facts: item.facts,
+      structuredFacts: item.structuredFacts,
+      sourceObservations: item.sourceObservations,
+    })),
+  });
+  const causal = bundle.coverageObligations.find((item) => item.kind === "causal_relation");
+  const mismatch = bundle.coverageObligations.find((item) => item.kind === "contract_mismatch");
+  assert.deepEqual(causal?.targetRefs.sort(), ["src/components/editor.js", "src/main.js"]);
+  assert.deepEqual(mismatch?.targetRefs.sort(), ["src-tauri/src/main.rs", "src/main.js"]);
+  assert.ok(bundle.evidenceComponents.some((item) =>
+    item.requiredForClosure && item.relationRefs.includes(causal.id)
+  ));
+  assert.ok(bundle.evidenceComponents.some((item) =>
+    item.requiredForClosure && item.relationRefs.includes(mismatch.id)
+  ));
+  assert.ok(bundle.evidenceComponents.some((item) =>
+    item.requiredForClosure === false && item.ownerRefs.includes("src/components/toolbar.js")
+  ));
+  assert.deepEqual(validatePlanEvidenceReceipt(createPlanEvidenceReceipt(bundle)), []);
+});
+
 test("wait_subagents promotes child file evidence instead of recording orchestration noise", () => {
   const waitResult = result({
     toolCallId: "wait_1",
@@ -850,6 +1180,41 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
   assert.ok(debugEvents.some((entry) =>
     entry.event === "subagent_evidence_promoted" && entry.data.evidenceCount === 2
   ));
+
+  const unobservedVisualHarness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "grounding",
+    results: [waitResult],
+    toolArgsByCallId: new Map([["wait_1", { subagent_ids: "subagent-a,subagent-b" }]]),
+    turnInputContextSignals: {
+      imageParts: 1,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  unobservedVisualHarness.input.callbacks = {
+    ...unobservedVisualHarness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: [{ type: "text", text: "Use the screenshot and source evidence to prepare a plan." }, {
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,AA==" },
+      }],
+    }],
+    getCurrentTurnId: () => "turn-subagent-plan-visual",
+    getContextMemoryState: () => null,
+  };
+
+  const unobservedVisualPost = handleToolResultPostProcessing(
+    unobservedVisualHarness.input,
+  );
+  assert.equal(unobservedVisualPost.planRuntimePhase, "grounding");
+  assert.deepEqual(unobservedVisualHarness.planRuntimePhases, []);
 
   const executionHarness = createPostProcessingInput({
     workflowMode: "edit",
@@ -1098,9 +1463,22 @@ test("partial path coverage promotes only covered evidence and preserves the unr
     content: JSON.stringify({
       results: [{
         subagentId: "subagent-a",
-        status: "completed",
+        scopeKey: "src/main.js,src/components/editor.js",
+        status: "degraded",
         closureAudit: {
-          state: "satisfied",
+          schemaVersion: 1,
+          owner: {
+            agentKind: "subagent",
+            threadId: "thread-parent",
+            parentTurnId: "turn-parent",
+            subagentId: "subagent-a",
+            runId: "run-subagent-a",
+            parentRunId: "run-parent",
+          },
+          scopeKey: "src/main.js,src/components/editor.js",
+          status: "degraded",
+          state: "partial",
+          remainingWork: "Read src/components/editor.js",
           observationCount: 1,
           substantiveEvidenceCount: 1,
           acceptedEvidenceToolCallIds: ["child-read-main"],
@@ -1108,6 +1486,7 @@ test("partial path coverage promotes only covered evidence and preserves the unr
           coveredPaths: ["src/main.js"],
           failedPaths: ["src/components/editor.js"],
           uncoveredPaths: ["src/components/editor.js"],
+          reasonCode: "incomplete_required_path_coverage",
           reason: "Inconsistent fixture that must be rejected defensively.",
         },
         evidence: [{
@@ -1144,9 +1523,22 @@ test("a nominally covered path without substantive evidence becomes an unresolve
     content: JSON.stringify({
       results: [{
         subagentId: "subagent-a",
+        scopeKey: "src/main.js,src/components/editor.js",
         status: "completed",
         closureAudit: {
+          schemaVersion: 1,
+          owner: {
+            agentKind: "subagent",
+            threadId: "thread-parent",
+            parentTurnId: "turn-parent",
+            subagentId: "subagent-a",
+            runId: "run-subagent-a",
+            parentRunId: "run-parent",
+          },
+          scopeKey: "src/main.js,src/components/editor.js",
+          status: "completed",
           state: "satisfied",
+          remainingWork: null,
           observationCount: 2,
           substantiveEvidenceCount: 1,
           acceptedEvidenceToolCallIds: ["child-read-main"],
@@ -1154,6 +1546,7 @@ test("a nominally covered path without substantive evidence becomes an unresolve
           coveredPaths: ["src/main.js", "src/components/editor.js"],
           failedPaths: [],
           uncoveredPaths: [],
+          reasonCode: "runtime_completed",
           reason: "Inconsistent fixture that must be rejected defensively.",
         },
         evidence: [{
@@ -1241,7 +1634,7 @@ test("tool result post-processing tracks plan read-only batches for convergence"
   assert.deepEqual([...harness.taskTargetingEvidence], ["path:src/App.tsx"]);
 });
 
-test("tool result post-processing freezes a semantic evidence bundle before repeat guards", () => {
+test("tool result post-processing keeps an explicit target read-only until runtime evidence covers it", () => {
   const harness = createPostProcessingInput({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -1269,10 +1662,10 @@ test("tool result post-processing freezes a semantic evidence bundle before repe
 
   const post = handleToolResultPostProcessing(harness.input);
 
-  assert.equal(post.planRuntimePhase, "drafting");
+  assert.equal(post.planRuntimePhase, "grounding");
   assert.deepEqual(harness.planRuntimePhases, [{
-    phase: "drafting",
-    reason: "plan closure evidence ready",
+    phase: "grounding",
+    reason: "confirmed_change_rationale_available",
     status: "running",
   }]);
 });
@@ -1344,6 +1737,118 @@ test("targeted evidence recovery still waits for confirmed closure rationale", (
 
   assert.equal(post.planRuntimePhase, "needs_evidence");
   assert.deepEqual(harness.planRuntimePhases, []);
+});
+
+test("deterministic multi-facet recovery does not draft from one confirmed rationale", () => {
+  const seededSourceEvidence = [
+    {
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "command_transport_contract(tauri,save_file_content) command_invoke_argument_contract(save_file_content,file_path,content)",
+      facts: [
+        "command_transport_contract(tauri,save_file_content)",
+        "command_invoke_argument_contract(save_file_content,file_path,content)",
+      ],
+    },
+    {
+      name: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      detail: "command_handler_argument_contract(save_file_content,content,filePath)",
+      facts: ["command_handler_argument_contract(save_file_content,content,filePath)"],
+    },
+    {
+      name: "read_file",
+      target: "src/components/editor.js",
+      status: "succeeded",
+      detail: "event_dom_dispatch_contract(input) field_read_contract(value)",
+      facts: ["event_dom_dispatch_contract(input)", "field_read_contract(value)"],
+    },
+    {
+      name: "read_file",
+      target: "src/components/toolbar.js",
+      status: "succeeded",
+      detail: "field_read_contract(textContent) field_read_contract(filePath)",
+      facts: ["field_read_contract(textContent)", "field_read_contract(filePath)"],
+    },
+  ];
+  const seededPlanEvidence = [];
+  for (const [index, entry] of seededSourceEvidence.entries()) {
+    rememberToolActivity(seededPlanEvidence, result({
+      toolCallId: `seeded-source-${index + 1}`,
+      name: "read_file",
+      target: entry.target,
+      content: entry.detail,
+    }), { evidenceLedger: true });
+  }
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "deterministic_closure",
+    results: [],
+    toolArgsByCallId: new Map(),
+    recentPlanToolActivity: seededPlanEvidence,
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: [
+        "问题：",
+        "1、编辑界面同时显示文件名和未保存文档名。",
+        "2、打开本地 Markdown 后意外进入保存流程。",
+      ].join("\n"),
+    }],
+    getCurrentTurnId: () => "turn-plan-partial-multi-facet",
+    getContextMemoryState: () => null,
+  };
+
+  const bundle = buildPlanEvidenceBundle({
+    objective: harness.input.callbacks.getMessages()[0].content,
+    evidenceRecords: seededPlanEvidence.map((entry) => ({
+      tool: entry.name,
+      target: entry.target,
+      status: entry.status,
+      summary: entry.detail,
+      facts: entry.facts,
+      structuredFacts: entry.structuredFacts,
+    })),
+  });
+  assert.equal(assessPlanClosureEvidence(bundle).ready, true, "the rationale gate alone is satisfied");
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "needs_evidence");
+  assert.deepEqual(harness.planRuntimePhases, []);
+});
+
+test("Plan readiness telemetry projects the deterministic materialization contract", () => {
+  const postProcessingSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultPostProcessing.ts"),
+    "utf8",
+  );
+  const streamPreparationSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
+    "utf8",
+  );
+  const runtimeOrchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(postProcessingSource, /closureReady: deterministicMaterializationReady/);
+  assert.match(postProcessingSource, /rationaleReady: closureAssessment\.ready/);
+  assert.doesNotMatch(postProcessingSource, /deterministicMaterializationReady:\s*closureAssessment\.ready/);
+  assert.match(streamPreparationSource, /ready: deterministicMaterializationReady/);
+  assert.match(streamPreparationSource, /closureReady: deterministicMaterializationReady/);
+  assert.match(streamPreparationSource, /rationaleReady: closureAssessment\.ready/);
+  assert.match(runtimeOrchestratorSource, /closureReady: hasDeterministicEvidence/);
+  assert.match(runtimeOrchestratorSource, /deterministicMaterializationReady: hasDeterministicEvidence/);
 });
 
 test("model-draft evidence recovery also waits for confirmed closure rationale", () => {

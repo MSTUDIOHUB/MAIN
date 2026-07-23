@@ -55,6 +55,9 @@ const toolCallPartitioning = loadTranspiledModuleSync(
 const toolActivityTracking = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/toolActivityTracking.ts"),
 );
+const subagentJoinRuntime = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/subagentJoinRuntime.ts"),
+);
 
 function tool(name, properties = {}, required = []) {
   return {
@@ -81,6 +84,103 @@ function exactFileScope(overrides = {}) {
     ...overrides,
   };
 }
+
+test("needs-evidence scopes one exact runtime obligation primitive and argument", () => {
+  const tools = [
+    tool("read_file", { path: { type: "string" } }, ["path"]),
+    tool("find_symbol_references", {
+      symbol: { type: "string" },
+      path: { type: "string" },
+    }, ["symbol"]),
+    tool("grep_search", { query: { type: "string" } }, ["query"]),
+  ];
+  const scoped = toolCallPlanning.scopePlanEvidenceObligationToolDefinitions({
+    tools,
+    obligation: {
+      kind: "find_symbol_references",
+      source: "contract_counterpart",
+      symbol: "save_file_content",
+    },
+  });
+  assert.deepEqual(scoped.map((entry) => entry.function.name), ["find_symbol_references"]);
+  assert.deepEqual(
+    scoped[0].function.parameters.properties.symbol.enum,
+    ["save_file_content"],
+  );
+  assert.deepEqual(scoped[0].function.parameters.required, ["symbol"]);
+});
+
+test("an explicit wait_subagents result closes the same typed scope ledger as a runtime join", () => {
+  const result = {
+    toolCallId: "wait-explicit",
+    name: "wait_subagents",
+    target: "child-src",
+    isError: false,
+    lifecycleState: "completed",
+    content: JSON.stringify({
+      pendingIds: [],
+      results: [{
+        subagentId: "child-src",
+        scopeKey: "src",
+        status: "completed",
+        closureAudit: {
+          schemaVersion: 1,
+          owner: {
+            agentKind: "subagent",
+            threadId: "thread-parent",
+            parentTurnId: "turn-parent",
+            subagentId: "child-src",
+            runId: "run-child-src",
+            parentRunId: "run-parent",
+          },
+          scopeKey: "src",
+          status: "completed",
+          state: "satisfied",
+          remainingWork: null,
+          observationCount: 1,
+          substantiveEvidenceCount: 1,
+          acceptedEvidenceToolCallIds: ["child-read-main"],
+          requiredPaths: ["src/main.js"],
+          coveredPaths: ["src/main.js"],
+          failedPaths: [],
+          uncoveredPaths: [],
+          reasonCode: "runtime_completed",
+          reason: "The bounded source scope was inspected.",
+        },
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "Observed the programmatic editor update path.",
+          observation: {
+            kind: "source",
+            sourcePath: "src/main.js",
+            contentChars: 48,
+            negative: false,
+            substantive: true,
+          },
+          provenance: {
+            source: "tool_observation",
+            owner: { agentKind: "subagent", subagentId: "child-src" },
+            sourceToolCallId: "child-read-main",
+          },
+        }],
+      }],
+    }),
+  };
+
+  assert.deepEqual(
+    subagentJoinRuntime.extractPreferredDelegationScopeJoinOutcomes(result),
+    [{
+      subagentId: "child-src",
+      scopeKey: "src",
+      status: "completed",
+      closureState: "satisfied",
+      adoptedEvidenceCount: 1,
+      adoptedEvidenceTargets: ["src/main.js"],
+      consumed: true,
+    }],
+  );
+});
 
 test("subagent scope path resolution keeps exact files separate from directories", async () => {
   const resolved = await subagentRuntime.resolveSubagentExecutionScopePaths({
@@ -246,13 +346,31 @@ test("incomplete child closure creates exact parent reread obligations without p
       pendingIds: [],
       results: [{
         subagentId: "child-degraded",
-        status: "degraded",
+        scopeKey: "src/a.ts,src/b.ts",
+        status: "blocked",
         closureAudit: {
-          state: "partial",
+          schemaVersion: 1,
+          owner: {
+            agentKind: "subagent",
+            threadId: "thread-parent",
+            parentTurnId: "turn-parent",
+            subagentId: "child-degraded",
+            runId: "run-child-degraded",
+            parentRunId: "run-parent",
+          },
+          scopeKey: "src/a.ts,src/b.ts",
+          status: "blocked",
+          state: "blocked",
+          remainingWork: "Read both required paths.",
+          observationCount: 0,
+          substantiveEvidenceCount: 0,
+          acceptedEvidenceToolCallIds: [],
           requiredPaths: ["src/a.ts", "src/b.ts"],
           coveredPaths: [],
           failedPaths: ["src/a.ts", "outside.ts"],
           uncoveredPaths: ["src/a.ts", "src/b.ts"],
+          reasonCode: "incomplete_required_path_coverage",
+          reason: "The required paths remain unread.",
         },
         evidence: [],
       }],
@@ -474,7 +592,7 @@ test("only current versioned child evidence can back a self-verifying mutation",
   }).reason, "mutation_not_self_verifying", "multi-target apply_patch requires a parent reread");
 });
 
-test("Plan rereads reuse accepted child evidence while unresolved paths remain readable", () => {
+test("Plan parent rereads remain available until delegated evidence is parent-verified", () => {
   const reusable = {
     name: "read_file",
     target: "src/main.js",
@@ -482,6 +600,8 @@ test("Plan rereads reuse accepted child evidence while unresolved paths remain r
     delegatedObservation: {
       owner: { agentKind: "subagent", subagentId: "subagent-evidence" },
       planningEvidenceState: "reusable",
+      joinState: "consumed",
+      closureState: "satisfied",
       parentContextState: "reference_only",
       requiresParentReread: true,
     },
@@ -490,7 +610,21 @@ test("Plan rereads reuse accepted child evidence while unresolved paths remain r
     toolName: "read_file",
     target: "./src/main.js",
     recentPlanToolActivity: [reusable],
-  }), reusable);
+  }), null);
+
+  const parentVerified = {
+    ...reusable,
+    delegatedObservation: {
+      ...reusable.delegatedObservation,
+      parentContextState: "full",
+      requiresParentReread: false,
+    },
+  };
+  assert.equal(toolCallPartitioning.findReusableDelegatedPlanningEvidenceForRead({
+    toolName: "read_file",
+    target: "./src/main.js",
+    recentPlanToolActivity: [parentVerified],
+  }), parentVerified);
 
   assert.equal(toolCallPartitioning.findReusableDelegatedPlanningEvidenceForRead({
     toolName: "read_file",

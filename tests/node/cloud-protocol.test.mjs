@@ -1025,6 +1025,33 @@ test("cloud responses compact instructions preserve the current visual observati
   assert.match(compacted, /\[\/visual_observation_protocol\]/);
 });
 
+test("aggressive Responses compaction preserves accepted visual continuity after image bytes are removed", () => {
+  const olderObservation = [
+    "[visual_context_observation]",
+    '{"turnId":"turn-image-old","observationId":"visual-old","summary":"old pixels"}',
+    "[/visual_context_observation]",
+  ].join("\n");
+  const currentObservation = [
+    "[visual_context_observation]",
+    '{"turnId":"turn-image-current","observationId":"visual-current","summary":"The current screenshot visibly shows the editor."}',
+    "[/visual_context_observation]",
+  ].join("\n");
+  const compacted = compactCloudResponsesInstructions([
+    "当前工作区绝对路径为：/tmp/workspace",
+    olderObservation,
+    "low priority filler ".repeat(1200),
+    currentObservation,
+    "more low priority filler ".repeat(1200),
+  ].join("\n"), { aggressive: true });
+
+  assert.ok(compacted.length <= 3000);
+  assert.equal((compacted.match(/\[visual_context_observation\]/g) || []).length, 1);
+  assert.match(compacted, /turn-image-current/);
+  assert.match(compacted, /visual-current/);
+  assert.match(compacted, /current screenshot visibly shows the editor/);
+  assert.doesNotMatch(compacted, /turn-image-old|visual-old|old pixels/);
+});
+
 test("cloud responses compact messages keep recent context and summarize old history", () => {
   const messages = [
     { role: "system", content: "system" },

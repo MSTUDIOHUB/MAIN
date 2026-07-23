@@ -2,7 +2,6 @@ import {
   EXECUTE_CONVERGENCE_PROMPT_RATIO,
   MAX_NO_PROGRESS_LOOP_REPEATS,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
-  PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO,
   buildExecuteConvergencePrompt,
   buildNoProgressBatchSignature,
   getToolTarget,
@@ -50,7 +49,6 @@ import {
 import {
   isPlanTaskTrustedComplete,
 } from "../../workflowModels";
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import {
   isToolAutoExecutableForCall,
   type ToolCapabilityRegistry,
@@ -58,7 +56,7 @@ import {
 } from "../../toolCapabilities";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
+import { hasSuccessfulWorkspaceMutationEvidence } from "../../verificationEvidence";
 
 export { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
 
@@ -159,7 +157,6 @@ export function handleNoProgressRecovery(input: {
   executeRecoveryReason: string;
   executeRecoveryAttempts: number;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
-  executeRecoverySourceObservationKey?: string | null;
   repairExecutionRequestInChat: boolean;
   latestUserPromptText: string;
   isUnapprovedPlanReadOnlyBatch: boolean;
@@ -271,52 +268,6 @@ export function handleNoProgressRecovery(input: {
     if (activatedState) currentExecuteRecoveryState = activatedState;
     return currentExecuteRecoveryState;
   };
-
-  const mutationFailureTargets = results
-    .filter((result) =>
-      result.isError &&
-      (result.name === "apply_patch" || result.name === "replace_in_file") &&
-      !!String(result.target || "").trim()
-    )
-    .map((result) => result.target);
-  const retainedMutationSourceObservation = [...recentToolActivity]
-    .reverse()
-    .find((activity) =>
-      activity.readFileObservation &&
-      mutationFailureTargets.some((target) =>
-        workspacePathsReferToSameFile(activity.readFileObservation!.path, target)
-      )
-    )?.readFileObservation || null;
-  const directMutationPreflightRecovery = resolveDirectMutationPreflightRecovery({
-    workflowMode,
-    runtimeIntent,
-    executeRecoveryMode: currentExecuteRecoveryMode,
-    retainedSourceObservation: retainedMutationSourceObservation,
-    results,
-  });
-  if (directMutationPreflightRecovery) {
-    const repeatedTargets = directMutationPreflightRecovery.target
-      ? [directMutationPreflightRecovery.target]
-      : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    const activatedRecovery = activateTrackedExecuteRecovery(
-      directMutationPreflightRecovery.mode,
-      directMutationPreflightRecovery.reason,
-      {
-        expectedTarget: directMutationPreflightRecovery.target,
-        repeatedTargets,
-        sourceObservationKey: directMutationPreflightRecovery.sourceObservationKey,
-        readLease: directMutationPreflightRecovery.readLease,
-        decisionCheckpoint: directMutationPreflightRecovery.decisionCheckpoint,
-      },
-    );
-    pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
-      language: MODEL_CONTROL_LANGUAGE,
-      reason: directMutationPreflightRecovery.reason,
-      contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
-      repeatedTargets,
-      recentActivity: recentToolActivity,
-    });
-  }
 
   const executeReadOnlyRecovery =
     executeMutationRecoveryEligible &&
@@ -913,15 +864,13 @@ export function handleExecuteConvergencePrompt(input: {
   } = input;
 
   const shouldConvergeExecuteTurn = workflowMode === "edit";
-  const convergencePromptRatio =
-    callbacks.getIsPlanApproved()
-      ? PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO
-      : EXECUTE_CONVERGENCE_PROMPT_RATIO;
-
   if (
     !shouldConvergeExecuteTurn ||
     usedExecuteConvergencePrompt ||
-    iteration < Math.max(8, Math.floor(effectiveMaxIterations * convergencePromptRatio))
+    iteration < Math.max(
+      8,
+      Math.floor(effectiveMaxIterations * EXECUTE_CONVERGENCE_PROMPT_RATIO),
+    )
   ) {
     return { usedExecuteConvergencePrompt };
   }
@@ -933,9 +882,21 @@ export function handleExecuteConvergencePrompt(input: {
     executeRecoveryMode,
   });
   if (isExecuteMutationRecoveryEligible({ callbacks, workflowMode, runtimeIntent })) {
-    activateExecuteRecovery("mutation_first", "execute_convergence_prompt", {
+    const recoveryMode = !callbacks.getIsPlanApproved() &&
+        hasSuccessfulWorkspaceMutationEvidence({
+          ledger: callbacks.getPlanExecutionEvidenceLedger(),
+          transactionId: callbacks.getCurrentTurnId?.(),
+        })
+      ? "validation_only"
+      : "mutation_first";
+    activateExecuteRecovery(recoveryMode, "execute_convergence_prompt", {
       maxIterations: effectiveMaxIterations,
       recentToolActivity: recentToolActivity.length,
+      recoveryMode,
+      // A convergence checkpoint audits the whole objective. A single-file
+      // lock belongs only to the preceding read/mutate transaction and must
+      // not prevent the model from fixing another file in the same turn.
+      resetExpectedTarget: true,
     });
   }
   callbacks.appendMessage({

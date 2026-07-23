@@ -151,19 +151,19 @@ test("assistant response processing returns normalized tool calls without reason
   assert.equal(result.normalized.toolCalls[0].name, "read_file");
 });
 
-test("Plan processing recovers only an explicitly tagged revised plan from provider reasoning", () => {
-  const plan = [
-    "<proposed_plan>",
-    "# 修订计划",
-    "",
-    "## 改动",
-    "- 修改 `src/runtime.ts`，统一计划审核终态。",
-    "- 保留既有证据并修复明确的类型契约矛盾。",
-    "",
-    "## 验证",
-    "- 运行 `node --test tests/node/plan-runtime.test.mjs` 并确认通过。",
-    "</proposed_plan>",
-  ].join("\n");
+test("Plan processing never promotes a complete typed revision from provider reasoning", () => {
+  const plan = `<plan_candidate>${JSON.stringify({
+    schemaVersion: 1,
+    evidenceRefs: ["E1"],
+    summary: [],
+    diagnoses: [],
+    changes: [],
+    decisions: [{ id: "D1", text: "Preserve the runtime contract.", disposition: "preserve", evidenceRefs: ["E1"], goalRefs: ["G1"] }],
+    interfaces: [],
+    validations: [{ id: "V1", goalRefs: ["G1"], changeRefs: [], primitive: { kind: "assertion", target: "D1", matcher: "runtime_result" }, expectedOutcome: "The decision remains sealed." }],
+    assumptions: [],
+    blockingChoices: [],
+  })}</plan_candidate>`;
   const reasoningContent = `Private analysis must stay hidden.\n${plan}\nMore private analysis.`;
   const events = [];
   const result = processAssistantStreamResponse(baseInput({
@@ -180,17 +180,16 @@ test("Plan processing recovers only an explicitly tagged revised plan from provi
     },
   }));
 
-  assert.equal(result.streamText, plan);
-  assert.equal(result.streamText.includes("Private analysis"), false);
+  assert.equal(result.streamText, "");
   assert.equal(result.providerReasoningForHistory.reasoningContent, reasoningContent);
-  assert.equal(events.some((item) => item.event === "agent.plan_protocol_recovered_from_reasoning"), true);
+  assert.equal(events.some((item) => item.event === "agent.plan_protocol_recovered_from_reasoning"), false);
 });
 
 test("non-Plan and untagged reasoning never become a Plan materialization channel", () => {
   const edit = processAssistantStreamResponse(baseInput({
     streamResult: {
       content: "",
-      reasoningContent: "<proposed_plan>\n# Hidden\n- one\n- two\n- three\n</proposed_plan>",
+      reasoningContent: "<plan_candidate>{\"schemaVersion\":1}</plan_candidate>",
       reasoningField: "reasoning_content",
       toolCalls: [],
       finishReason: "stop",

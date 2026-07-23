@@ -92,15 +92,15 @@ const {
   resolveExecuteMaxIterationsRecoveryDecision,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
 const {
-  APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
+  EXECUTE_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
   PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
-  buildApprovedPlanStreamWatchdogRecoveryPrompt,
+  buildExecuteStreamWatchdogRecoveryPrompt,
   buildPreapprovalPlanStreamWatchdogRecoveryPrompt,
   observeFileReadContextForMessagesSent,
   replaceMessagesForRetry,
   resolvePreapprovalPlanStreamWatchdogReadFallback,
   resolvePreapprovalPlanStreamWatchdogRecoveryTools,
-  shouldAttemptApprovedPlanStreamWatchdogRecovery,
+  shouldAttemptExecuteStreamWatchdogRecovery,
   shouldAttemptPreapprovalPlanStreamWatchdogRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
 
@@ -239,7 +239,10 @@ test("preapproval Plan watchdog failures get one provider-neutral bounded recove
     qualityRecoveryActive: false,
   }), false);
   assert.match(buildPreapprovalPlanStreamWatchdogRecoveryPrompt("en", true), /exactly one targeted read-only tool/i);
-  assert.match(buildPreapprovalPlanStreamWatchdogRecoveryPrompt("zh", false), /完整可审批/);
+  const zhRecovery = buildPreapprovalPlanStreamWatchdogRecoveryPrompt("zh", false);
+  assert.match(zhRecovery, /提交完整 typed graph/);
+  assert.match(zhRecovery, /最新注入的 `\[PLAN AUTHORING CONTRACT\]`/);
+  assert.doesNotMatch(zhRecovery, /<plan_candidate>/);
 });
 
 test("preapproval Plan watchdog recovery narrows to core read-only evidence tools", () => {
@@ -328,6 +331,38 @@ test("normal execution does not require a tool before recovery is activated", ()
   }), undefined);
 });
 
+test("typed Plan drafting requires its sole native submission capability", () => {
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["submit_plan_candidate"],
+    forceXmlTools: false,
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["submit_plan_candidate"],
+    forceXmlTools: true,
+  }), undefined, "text envelope fallback stays prompt-driven");
+});
+
+test("an exact Plan evidence obligation requires its sole native primitive", () => {
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["find_symbol_references"],
+    forceXmlTools: false,
+    planEvidenceObligationRequired: true,
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    llmToolNames: ["find_symbol_references"],
+    forceXmlTools: true,
+    planEvidenceObligationRequired: true,
+  }), undefined, "XML fallback remains action-contract driven");
+});
+
 test("admitted preferred delegation requires the provider-neutral spawn tool call", () => {
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
@@ -370,7 +405,7 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
   }), undefined);
 });
 
-test("recovery uses a narrow capability surface with provider-neutral required-any", () => {
+test("recovery tool choice follows the phase-owned capability surface", () => {
   const streamInvocationSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
     "utf8",
@@ -417,14 +452,14 @@ test("recovery uses a narrow capability surface with provider-neutral required-a
     llmToolNames: ["run_command"],
     forceXmlTools: false,
     recoveryActionContract: targetedReadContract,
-  }), undefined, "a missing named capability must not force an unrelated tool call");
+  }), undefined, "a targeted-read checkpoint must not force an adjacent validation action");
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["run_command", "wait_subagents"],
     forceXmlTools: false,
     recoveryActionContract: targetedReadContract,
-  }), undefined, "a child join does not turn a missing exact capability into required-any");
+  }), undefined, "coordination cannot substitute for the missing exact read capability");
 
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
@@ -434,7 +469,7 @@ test("recovery uses a narrow capability surface with provider-neutral required-a
   }), "required", "a pending child join must not be quarantined by named read_file choice");
 });
 
-test("max-iteration continuation exposes command validation with required-any", () => {
+test("max-iteration continuation exposes only its named finite validation capability", () => {
   const decision = resolveExecuteMaxIterationsRecoveryDecision({
     evidenceLedger: [{
       id: "mutation-before-boundary",
@@ -447,10 +482,14 @@ test("max-iteration continuation exposes command validation with required-any", 
   });
 
   assert.equal(decision.mode, "finite_validation_only");
+  assert.deepEqual(
+    resolveExecuteRecoveryActionContract(decision.mode).toolCallRequirement,
+    { kind: "required_named", toolName: "run_command" },
+  );
   assert.deepEqual(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: decision.mode,
-    llmToolNames: ["read_file", "run_command"],
+    llmToolNames: ["run_command"],
     forceXmlTools: false,
   }), "required");
 });
@@ -479,7 +518,7 @@ test("recovery required-any follows the contract capability surface, not the leg
     ...common,
     recoveryActionContract: targeting,
     llmToolNames: ["run_command"],
-  }), undefined, "required-any applies only when an allowed capability tool is truly present");
+  }), undefined, "required-any must reject an adjacent action outside the targeting surface");
 
   const observePty = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "running",
@@ -531,42 +570,57 @@ test("recovery required-any follows the contract capability surface, not the leg
     executeRecoveryMode: "validation_only",
     recoveryActionContract: migratedPostMutation,
     llmToolNames: ["read_file"],
-  }), "required", "an unpinned validation checkpoint requires its remaining manifest-discovery action");
+  }), undefined, "validation cannot reopen an unleased read");
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    executeRecoveryMode: "validation_only",
+    recoveryActionContract: migratedPostMutation,
+    llmToolNames: ["run_command"],
+  }), "required", "validation requires its exact finite command capability");
 });
 
 test("validation recovery requires one call from the command capability surface", () => {
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "validation_only",
-    llmToolNames: ["run_command", "execute_command", "browser_evaluate"],
+    llmToolNames: ["run_command"],
     forceXmlTools: false,
   }), "required");
 });
 
-test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {
-  const message = createStreamMaxElapsedTimeoutError(45_000, "approved_plan_recovery").message;
+test("every Execute watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {
+  const message = createStreamMaxElapsedTimeoutError(45_000, "execute_recovery").message;
   const base = {
     message,
-    activeProfile: "local",
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
-    isPlanApproved: true,
-    isExecuteRecoveryEligible: false,
     llmToolCount: 7,
     forceXmlTools: false,
   };
-  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery(base), true);
+  assert.equal(shouldAttemptExecuteStreamWatchdogRecovery(base), true);
   assert.equal(
-    shouldAttemptApprovedPlanStreamWatchdogRecovery(base),
+    shouldAttemptExecuteStreamWatchdogRecovery({
+      ...base,
+      workflowMode: "chat",
+    }),
     true,
-    "normal approved execution gets one bounded watchdog retry",
+    "direct Execute gets the same bounded recovery outside Plan",
   );
-  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
+  assert.equal(shouldAttemptExecuteStreamWatchdogRecovery({
     ...base,
     forceXmlTools: true,
   }), false);
-  assert.equal(APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS, 45_000);
-  assert.match(buildApprovedPlanStreamWatchdogRecoveryPrompt("zh"), /直接调用一个可用工具/);
+  assert.equal(shouldAttemptExecuteStreamWatchdogRecovery({
+    ...base,
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+  }), false);
+  assert.equal(shouldAttemptExecuteStreamWatchdogRecovery({
+    ...base,
+    llmToolCount: 0,
+  }), false);
+  assert.equal(EXECUTE_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS, 90_000);
+  assert.match(buildExecuteStreamWatchdogRecoveryPrompt("zh"), /直接调用一个可用工具/);
 });
 
 test("detects reasoning-dominated length results before max output escalation", () => {

@@ -18,6 +18,7 @@ import type { ToolDefinition } from "../../toolSchemas";
 import type { ToolCatalog } from "../../toolCatalog";
 import type { ToolCapabilityRegistry } from "../../toolCapabilities";
 import type { TurnInputContextSignals } from "../../turnIntake";
+import type { SpawnSubagentResult } from "../../subagents";
 import { isWorkspaceMutationToolCall } from "../../workspaceMutationTools";
 import { isPtyControlInput } from "../../ptyCommandRuntime";
 import {
@@ -118,7 +119,7 @@ export async function executeToolExecutionRound(input: {
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
   browserValidationCache: Map<string, ToolExecutionResult>;
-  onSubagentSpawnCreated?: () => void;
+  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
 }): Promise<ToolExecutionRoundResult> {
   const {
     readOnlyCalls,
@@ -207,6 +208,7 @@ export async function executeToolExecutionRound(input: {
         const path = typeof args.path === "string" ? args.path : result.target;
         const metadata = await readFileMetadataIfAvailable(path, workspace);
         const contentHash = hashString(result.content);
+        const window = buildFileReadWindowIdentity(result.content);
         const observation = metadata
           ? buildFileReadObservationIdentity({
               requestSignature: fileReadSignature,
@@ -215,9 +217,9 @@ export async function executeToolExecutionRound(input: {
               modifiedMs: metadata.modifiedMs,
               contentHash,
               source: "fresh",
+              ...(window ? { window } : {}),
             })
           : undefined;
-        const window = buildFileReadWindowIdentity(result.content);
         if (metadata) {
           resultForModel = {
             ...resultForModel,

@@ -267,6 +267,46 @@ test("first real send creates and activates a project session", async ({ page })
     });
 });
 
+test("first workspace Composer submission renders one durable Turn title", async ({ page }) => {
+  await page.goto("/?e2eScenario=session-auto-create");
+
+  await expect.poll(async () => page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.getSnapshot?.().sessionCount ?? -1
+  )).toBe(0);
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/agent writer");
+  // Close the command picker so Enter exercises the Composer submission path.
+  await textarea.press("Escape");
+  await textarea.press("Enter");
+
+  const snapshot = await expect.poll(async () => page.evaluate(() => {
+    const current = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      sessionCount: current?.sessionCount,
+      conversationTurns: current?.conversationTurns,
+      taskFlowUserCount: current?.taskFlowUserCount,
+      currentTurnId: current?.currentTurnId,
+      currentTurnTitle: current?.currentTurnTitle,
+      currentTurnReceiptId: current?.currentTurnReceiptId,
+    };
+  })).toMatchObject({
+    sessionCount: 1,
+    conversationTurns: 1,
+    taskFlowUserCount: 1,
+    currentTurnId: expect.any(String),
+    currentTurnTitle: expect.any(String),
+    currentTurnReceiptId: expect.any(String),
+  });
+
+  const current = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  expect(String(current.currentTurnTitle || "").trim()).not.toBe("");
+  const turnSection = page.locator(`section[data-turn-id="${current.currentTurnId}"]`);
+  await expect(turnSection).toHaveCount(1);
+  await expect(turnSection.getByTestId("turn-state-anchor")).toHaveCount(1);
+  await expect(turnSection.getByTestId("turn-state-anchor")).toContainText(current.currentTurnTitle);
+});
+
 test("missing currentSessionId creates a new session instead of reusing an old one", async ({ page }) => {
   await page.goto("/?e2eScenario=session-auto-create");
 

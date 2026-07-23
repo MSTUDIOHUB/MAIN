@@ -35,6 +35,10 @@ interface MutationFailureResultLike {
  * structured mismatch evidence grants one target/range read lease. Without an
  * exact range the transaction stays mutation-only and must correct the call
  * from its retained observation instead of reopening broad diagnosis.
+ *
+ * A concrete mutation failure may replace any surrounding Execute phase
+ * (including validation or objective audit). Only an already-active recovery
+ * read owns the next transition and must not be reinitialized.
  */
 export interface DirectMutationPreflightRecoveryDecision {
   mode: "mutation_first" | "patch_recovery_read";
@@ -110,7 +114,7 @@ export function resolveDirectMutationPreflightRecovery(input: {
   if (
     !eligibleWorkflow ||
     !isMutationRuntimeIntent(input.runtimeIntent) ||
-    !["normal", "mutation_first", "action_plus_targeting"].includes(input.executeRecoveryMode)
+    input.executeRecoveryMode === "patch_recovery_read"
   ) {
     return null;
   }

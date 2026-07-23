@@ -1,6 +1,8 @@
 import type { PlanRuntimePhase } from "./workflowModels";
 import type { PlanEvidenceReadiness } from "./planReadOnlyConvergence";
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
+import { SUBMIT_PLAN_CANDIDATE_TOOL_NAME } from "./toolSchemas";
+import { buildPlanSubmissionGuidance } from "./planSubmissionGuidance";
 
 export type PlanRuntimeMode = "chat" | "edit" | "plan";
 
@@ -118,8 +120,17 @@ export function filterPlanToolNamesForRuntimePhase(input: {
     return input.toolNames.filter((name) => name === "spawn_subagent" || name === "wait_subagents" || isPlanReadOnlyToolName(name));
   }
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
-    // Runtime owns plan.md materialization. The model drafts visible Markdown
-    // against the frozen evidence bundle and receives no tools in this phase.
+    // Runtime owns plan.md materialization. During authoring/rewrite the only
+    // native capability is a control-plane submission of the typed graph;
+    // review-ready/blocked phases expose no Plan authoring tool.
+    if (
+      input.planRuntimePhase === "drafting" ||
+      input.planRuntimePhase === "needs_rewrite"
+    ) {
+      return input.toolNames.filter((name) =>
+        name === SUBMIT_PLAN_CANDIDATE_TOOL_NAME
+      );
+    }
     return [];
   }
   return input.toolNames;
@@ -246,7 +257,8 @@ export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
         : "PLAN_TARGETED_EVIDENCE_RECOVERY: The previous planning turn ended in hidden reasoning without a reviewable plan.",
       input.reason ? `Evidence readiness: ${input.reason}.` : "",
       "Do tightly scoped read-only evidence pass(es) now. Prefer the most specific file/path/symbol from the user request or the latest evidence.",
-      "After the read/search result, stop exploring and output a concise visible `<proposed_plan>`. MAIN runtime owns `.MAIN/plans/plan.md` materialization.",
+      "After the read/search result, stop exploring and submit one complete typed graph. MAIN runtime validates it and renders `.MAIN/plans/plan.md`.",
+      buildPlanSubmissionGuidance("en"),
       "Do not ask for approval again and do not modify source or deliverable files before approval.",
     ].filter(Boolean).join("\n");
   }
@@ -256,7 +268,8 @@ export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
       : "PLAN_TARGETED_EVIDENCE_RECOVERY: 上一条计划回复只有隐藏推理，没有形成可审批计划。",
     input.reason ? `证据状态：${input.reason}。` : "",
     "现在只做精确定向的只读补证。优先读取用户请求或已有证据里最具体的文件、路径或符号。",
-    "拿到读取/搜索结果后，停止探索并输出精简的可见 `<proposed_plan>`；`.MAIN/plans/plan.md` 由 MAIN runtime 负责物化。",
+    "拿到读取/搜索结果后，停止探索并提交一个完整 typed graph；MAIN runtime 校验后渲染 `.MAIN/plans/plan.md`。",
+    buildPlanSubmissionGuidance("zh"),
     "不要再次询问是否批准，也不要在批准前修改源码或最终交付文件。",
   ].filter(Boolean).join("\n");
 }

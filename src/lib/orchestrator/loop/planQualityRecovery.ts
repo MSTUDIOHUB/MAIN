@@ -7,21 +7,28 @@ import {
 } from "../../orchestrator/planOrchestration";
 import {
   assessPlanClosureEvidence,
+  buildPlanEvidenceEpochHash,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
+  isPlanEvidenceReadyForModelDraft,
 } from "../../planEvidence";
-import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import {
-  buildPlanTargetedEvidenceRecoveryPrompt,
-  MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
-} from "../../planRuntime";
+  derivePlanEvidenceObligations,
+  getPlanEvidenceObligationKey,
+} from "../../planEvidenceObligations";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import { MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES } from "../../planRuntime";
 import { isReadOnlyNoProgressDetail } from "../../executeRecoveryTools";
 import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   collectPlanClosureMaterializationInput,
+  hasPlanVisualContextGrounding,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import type { TurnInputContextSignals } from "../../turnIntake";
 import { hasCompletedToolExecution } from "../../toolResultEffect";
 import {
   canDeterministicallyMaterializePlan,
@@ -33,6 +40,14 @@ import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
 import type {
   PlanEvidenceRecoveryObjective,
   PlanRuntimePhaseQualitySnapshot,
+  PlanVisibleQualityPromptBudgetState,
+} from "./planRuntimeState";
+import {
+  buildPlanEvidenceProgressFingerprint,
+  getPlanVisibleQualityPromptCount,
+  parsePlanEvidenceProgressFingerprint,
+  recordPlanVisibleQualityPrompt,
+  type PlanEvidenceProgressState,
 } from "./planRuntimeState";
 
 export type PlanQualityRecoveryResult = {
@@ -45,9 +60,14 @@ export type PlanQualityRecoveryResult = {
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses: number;
   planEvidenceProgressFingerprint: string;
+  planVisibleQualityPromptBudget: PlanVisibleQualityPromptBudgetState;
   planArtifactQualityRejected: boolean;
   pendingPlanRuntimeRecoveryPrompt: string | null;
   deterministicEvidenceMaterializationCandidate: boolean;
+  effectiveRecoveryAction: PlanArtifactRecoveryAction;
+  awaitingPlanEvidenceResult: boolean;
+  qualityEvidenceBundleHash: string;
+  qualityEvidenceEpochHash: string;
 };
 
 export type PlanQualityRejectionSource = "visible_candidate" | "persisted_artifact";
@@ -59,6 +79,198 @@ export type PlanQualityRejection = {
   missingSections: string[];
 };
 
+const MAX_VISIBLE_PLAN_QUALITY_REJECTIONS = 6;
+const MAX_VISIBLE_PLAN_QUALITY_PROMPTS_PER_SIGNATURE_EPOCH = 2;
+
+export type PlanQualityRecoveryClassification = {
+  recoveryAction: PlanArtifactRecoveryAction;
+  reasonType: string;
+  signature: string;
+};
+
+export type PlanQualityEvidenceState =
+  | "absent"
+  | "present"
+  | "counterpart_missing";
+
+export type PlanQualityRecoveryTransition = {
+  effectiveAction: PlanArtifactRecoveryAction;
+  evidenceObjective: PlanEvidenceRecoveryObjective;
+  holdActiveEvidenceTransaction: boolean;
+  openEvidenceTransaction: boolean;
+  clearStaleEvidenceTransaction: boolean;
+  reason: string;
+};
+
+export function assessPlanEvidenceTransactionProgress(input: {
+  previousObligationKeys: Iterable<string>;
+  nextObligationKeys: Iterable<string>;
+  hasSuccessfulEvidence: boolean;
+  semanticEvidenceAdvanced: boolean;
+  readCoverageAdvanced: boolean;
+}): {
+  advanced: boolean;
+  firstOpenObligationKey: string | null;
+  firstExactObligationClosed: boolean;
+} {
+  const previous = [...input.previousObligationKeys];
+  const next = new Set(input.nextObligationKeys);
+  const firstOpenObligationKey = previous[0] || null;
+  const firstExactObligationClosed = !!firstOpenObligationKey &&
+    !next.has(firstOpenObligationKey);
+  return {
+    advanced: input.hasSuccessfulEvidence && (
+      firstOpenObligationKey
+        ? firstExactObligationClosed
+        : input.semanticEvidenceAdvanced || input.readCoverageAdvanced
+    ),
+    firstOpenObligationKey,
+    firstExactObligationClosed,
+  };
+}
+
+const PLAN_QUALITY_REASON_TYPES_REQUIRING_GROUNDED_EVIDENCE = new Set([
+  "insufficient_actionable_plan_signals",
+  "unverified_diagnostic_claim_as_confirmed",
+  "unsupported_hypothesis_as_plan",
+  "generic_fallback_plan",
+]);
+
+/**
+ * Resolve the runtime transition separately from the textual quality
+ * classification. A validator describes what is wrong with a candidate;
+ * this resolver decides whether the runtime may rewrite it yet.
+ *
+ * An active evidence transaction is owned by the `needs_evidence` phase and
+ * can only be consumed by tool-result reconciliation. A later model draft is
+ * therefore not allowed to cancel it. Conversely, an objective left behind
+ * in any other phase is stale and may be replaced by the new typed decision.
+ */
+export function resolvePlanQualityRecoveryTransition(input: {
+  intrinsicAction: PlanArtifactRecoveryAction;
+  rejectionSource: PlanQualityRejectionSource;
+  reasonType: string;
+  evidenceState: PlanQualityEvidenceState;
+  planRuntimePhase: PlanRuntimePhase;
+  evidenceRecoveryIssued: boolean;
+  evidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
+  hasRecoveryReadBatch: boolean;
+  evidenceBudgetAvailable: boolean;
+}): PlanQualityRecoveryTransition {
+  if (input.intrinsicAction === "ask_user") {
+    return {
+      effectiveAction: "ask_user",
+      evidenceObjective: "none",
+      holdActiveEvidenceTransaction: false,
+      openEvidenceTransaction: false,
+      clearStaleEvidenceTransaction:
+        input.evidenceRecoveryIssued || input.evidenceRecoveryObjective !== "none",
+      reason: "user_decision_required",
+    };
+  }
+
+  const hasActiveEvidenceTransaction =
+    input.evidenceRecoveryObjective !== "none" &&
+    (
+      input.planRuntimePhase === "needs_evidence" ||
+      input.hasRecoveryReadBatch
+    );
+  if (hasActiveEvidenceTransaction) {
+    return {
+      effectiveAction: "targeted_evidence",
+      evidenceObjective: input.evidenceRecoveryObjective,
+      holdActiveEvidenceTransaction: true,
+      openEvidenceTransaction: false,
+      clearStaleEvidenceTransaction: false,
+      reason: "active_evidence_transaction",
+    };
+  }
+
+  const requiresCounterpartEvidence = input.evidenceState === "counterpart_missing";
+  const requiresInitialModelDraftEvidence =
+    input.rejectionSource === "visible_candidate" &&
+    input.evidenceState === "absent" &&
+    PLAN_QUALITY_REASON_TYPES_REQUIRING_GROUNDED_EVIDENCE.has(input.reasonType);
+  const requiresEvidence =
+    input.intrinsicAction === "targeted_evidence" ||
+    requiresCounterpartEvidence ||
+    requiresInitialModelDraftEvidence;
+  const openEvidenceTransaction = requiresEvidence && input.evidenceBudgetAvailable;
+
+  return {
+    effectiveAction: requiresEvidence ? "targeted_evidence" : input.intrinsicAction,
+    evidenceObjective: openEvidenceTransaction
+      ? (input.rejectionSource === "visible_candidate"
+          ? "model_draft"
+          : "deterministic_closure")
+      : "none",
+    holdActiveEvidenceTransaction: false,
+    openEvidenceTransaction,
+    clearStaleEvidenceTransaction:
+      input.evidenceRecoveryIssued || input.evidenceRecoveryObjective !== "none",
+    reason: requiresInitialModelDraftEvidence
+      ? "initial_model_draft_evidence"
+      : requiresCounterpartEvidence
+        ? "contract_counterpart_evidence"
+        : input.intrinsicAction === "targeted_evidence"
+          ? "validator_targeted_evidence"
+          : requiresEvidence
+            ? "evidence_budget_exhausted"
+            : "intrinsic_quality_action",
+  };
+}
+
+/**
+ * Convert a quality rejection into a stable recovery identity. The reason
+ * type prevents cosmetic message changes from looking like progress, while
+ * normalized details preserve genuinely new validator findings such as a new
+ * missing section or uncovered goal facet.
+ */
+export function classifyPlanQualityRecovery(input: {
+  reason?: string | null;
+  missingSections?: string[];
+  recoveryAction?: PlanArtifactRecoveryAction | null;
+}): PlanQualityRecoveryClassification {
+  const rawReason = String(input.reason || "quality_gate").trim() || "quality_gate";
+  const reasonSeparator = rawReason.indexOf(":");
+  const reasonType = (reasonSeparator >= 0
+    ? rawReason.slice(0, reasonSeparator)
+    : rawReason
+  ).trim().toLowerCase().replace(/\s+/g, "_");
+  const classified = classifyPlanArtifactQualityResult({
+    ok: false,
+    reason: rawReason,
+    ...(input.missingSections?.length
+      ? { missingSections: input.missingSections }
+      : {}),
+  });
+  // This reason describes an epistemic labeling error in the candidate, not a
+  // missing source observation. Keep this defensive normalization here as
+  // well as in the artifact classifier so restored/stale quality envelopes
+  // cannot reopen discovery with the old action.
+  const recoveryAction = reasonType === "unverified_diagnostic_claim_as_confirmed"
+    ? "rewrite"
+    : input.recoveryAction || classified.recoveryAction || "rewrite";
+  const missingSections = [...new Set(
+    (input.missingSections?.length
+      ? input.missingSections
+      : classified.missingSections || [])
+      .map((section) => String(section || "").trim().toLowerCase())
+      .filter(Boolean),
+  )].sort();
+  const rawDetails = reasonSeparator >= 0
+    ? rawReason.slice(reasonSeparator + 1).trim().toLowerCase().replace(/\s+/g, "_")
+    : "";
+  const details = missingSections.length > 0
+    ? `sections=${missingSections.join(",")}`
+    : rawDetails;
+  return {
+    recoveryAction,
+    reasonType,
+    signature: [recoveryAction, reasonType, details].filter(Boolean).join("|"),
+  };
+}
+
 type PlanQualityRecoveryInput = {
   callbacks: OrchestratorCallbacks;
   workflowMode: "chat" | "edit" | "plan";
@@ -67,6 +279,7 @@ type PlanQualityRecoveryInput = {
   recentPlanToolActivity: PlanToolActivitySummary[];
   attemptedPlanWriteTargets: string[];
   latestUserPromptText: string;
+  turnInputContextSignals: TurnInputContextSignals;
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
@@ -77,6 +290,7 @@ type PlanQualityRecoveryInput = {
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses?: number;
   planEvidenceProgressFingerprint?: string;
+  planVisibleQualityPromptBudget?: PlanVisibleQualityPromptBudgetState;
   setPlanRuntimePhase: (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -98,39 +312,6 @@ function isPlanArtifactQualityRejectionResult(
 function evidenceRecoveryResultProvidesNewEvidence(result: ToolExecutionResult): boolean {
   if (result.isError) return false;
   return !isReadOnlyNoProgressDetail(result.displayContent || result.content || "");
-}
-
-type PlanEvidenceProgressState = {
-  bundleHash: string;
-  coverageKeys: Set<string>;
-};
-
-function parsePlanEvidenceProgressFingerprint(value: string): PlanEvidenceProgressState {
-  if (!value) return { bundleHash: "", coverageKeys: new Set() };
-  try {
-    const parsed = JSON.parse(value) as { bundleHash?: unknown; coverageKeys?: unknown };
-    return {
-      bundleHash: typeof parsed.bundleHash === "string" ? parsed.bundleHash : "",
-      coverageKeys: new Set(
-        Array.isArray(parsed.coverageKeys)
-          ? parsed.coverageKeys.filter((item): item is string => typeof item === "string" && !!item)
-          : [],
-      ),
-    };
-  } catch {
-    // Old snapshots stored only a bundle hash. Treat it as the semantic
-    // baseline and rebuild structured coverage from later fresh reads.
-    return { bundleHash: value, coverageKeys: new Set() };
-  }
-}
-
-function buildPlanEvidenceProgressFingerprint(input: PlanEvidenceProgressState): string {
-  return JSON.stringify({
-    bundleHash: input.bundleHash,
-    // Set preserves insertion order; retain the most recent identities so a
-    // newly observed window cannot be discarded merely by lexical sorting.
-    coverageKeys: Array.from(input.coverageKeys).slice(-64),
-  });
 }
 
 function collectFreshPlanReadCoverageKeys(results: ToolExecutionResult[]): string[] {
@@ -191,9 +372,14 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
   let planEvidenceNoProgressPasses = input.planEvidenceNoProgressPasses ?? 0;
   let planEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
+  let planVisibleQualityPromptBudget = input.planVisibleQualityPromptBudget ?? [];
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
   let deterministicEvidenceMaterializationCandidate = false;
+  let effectiveRecoveryAction: PlanArtifactRecoveryAction = "accept";
+  let awaitingPlanEvidenceResult = false;
+  let qualityEvidenceBundleHash = "";
+  let qualityEvidenceEpochHash = "";
   const hasOutstandingEvidenceRecoveryRead =
     planClosureEvidenceRecoveryIssued &&
     input.evidenceRecoveryResults.some((result) =>
@@ -231,9 +417,14 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses,
     planEvidenceProgressFingerprint,
+    planVisibleQualityPromptBudget,
     planArtifactQualityRejected,
     pendingPlanRuntimeRecoveryPrompt,
     deterministicEvidenceMaterializationCandidate,
+    effectiveRecoveryAction,
+    awaitingPlanEvidenceResult,
+    qualityEvidenceBundleHash,
+    qualityEvidenceEpochHash,
   });
 
   if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) {
@@ -248,28 +439,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     const latestQualityResult = input.rejections[input.rejections.length - 1];
     planLastQualityGateReason = latestQualityResult.qualityGateReason || "quality_gate";
     planLastMissingSections = latestQualityResult.missingSections || [];
-    const supersedesDeterministicEvidenceRecovery =
-      latestQualityResult.source === "visible_candidate" &&
-      latestQualityResult.recoveryAction !== "targeted_evidence" &&
-      planClosureEvidenceRecoveryIssued &&
-      planEvidenceRecoveryObjective !== "model_draft";
-    if (supersedesDeterministicEvidenceRecovery) {
-      // A new model-authored candidate is the result of the previous turn. Its
-      // typed quality action now owns recovery; a stale deterministic-read flag
-      // must not reopen discovery before the candidate can be repaired.
-      planClosureEvidenceRecoveryIssued = false;
-      planEvidenceRecoveryObjective = "none";
-      planEvidenceNoProgressPasses = 0;
-    }
-    logAgentEvent("plan_quality_recovery_action", {
-      iteration,
-      source: latestQualityResult.source,
-      recoveryAction: latestQualityResult.recoveryAction,
-      qualityRejectCount: planQualityRejectCount,
-      qualityGateReason: planLastQualityGateReason,
+    const latestQualityClassification = classifyPlanQualityRecovery({
+      reason: planLastQualityGateReason,
       missingSections: planLastMissingSections,
-      evidenceRecoveryPasses: planEvidenceRecoveryPasses,
-      supersededDeterministicEvidenceRecovery: supersedesDeterministicEvidenceRecovery,
+      recoveryAction: latestQualityResult.recoveryAction,
     });
 
     const qualityClosureEvidence = collectPlanClosureMaterializationInput(
@@ -278,38 +451,86 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       attemptedPlanWriteTargets,
       latestUserPromptText,
     );
+    qualityEvidenceBundleHash = qualityClosureEvidence.evidenceBundle.hash;
+    qualityEvidenceEpochHash = buildPlanEvidenceEpochHash(
+      qualityClosureEvidence.evidenceBundle,
+    );
     const hasQualityClosureEvidence = isPlanEvidenceBundleReady(
       qualityClosureEvidence.evidenceBundle,
     );
     const closureEvidenceAssessment = assessPlanClosureEvidence(
       qualityClosureEvidence.evidenceBundle,
     );
+    const qualityEvidenceReadiness = assessPlanEvidenceReadiness({
+      userGoal: latestUserPromptText,
+      userContext: input.turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasGroundedVisualContext: hasPlanVisualContextGrounding(
+        callbacks.getMessages(),
+        callbacks.getCurrentTurnId?.(),
+      ),
+    });
+    const qualityEvidenceObligations = derivePlanEvidenceObligations({
+      objective: latestUserPromptText,
+      activities: recentPlanToolActivity,
+    });
+    const deterministicClosureReady =
+      qualityEvidenceReadiness.status === "ready_for_plan" &&
+      hasDeterministicPlanMaterializationEvidence(
+        qualityClosureEvidence.evidenceBundle,
+      );
     const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
-    // The quality gate owns the recovery action. A stricter deterministic
-    // closure assessment must not turn a requested rewrite/scaffold into more
-    // discovery merely because already-grounded source facts do not yet state
-    // the final rationale in the exact shape used by fallback materialization.
-    // Reopen one read only when the quality gate explicitly requests evidence
-    // or the structured assessment names an unresolved source-side contract
-    // counterpart.
-    const explicitSourceEvidenceGap =
-      latestQualityResult.recoveryAction !== "ask_user" &&
-      closureEvidenceAssessment.reason === "contract_counterpart_unverified";
+    const qualityEvidenceState: PlanQualityEvidenceState =
+      qualityEvidenceObligations.length > 0 ||
+      closureEvidenceAssessment.reason === "contract_counterpart_unverified"
+        ? "counterpart_missing"
+        : qualityClosureEvidence.evidenceBundle.facts.length > 0
+          ? "present"
+          : "absent";
+    const recoveryTransition = resolvePlanQualityRecoveryTransition({
+      intrinsicAction: latestQualityClassification.recoveryAction,
+      rejectionSource: latestQualityResult.source,
+      reasonType: latestQualityClassification.reasonType,
+      evidenceState: qualityEvidenceState,
+      planRuntimePhase,
+      evidenceRecoveryIssued: planClosureEvidenceRecoveryIssued,
+      evidenceRecoveryObjective: planEvidenceRecoveryObjective,
+      hasRecoveryReadBatch:
+        hasOutstandingEvidenceRecoveryRead || hasObjectiveRecoveryRead,
+      evidenceBudgetAvailable:
+        planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
+    });
+    if (recoveryTransition.clearStaleEvidenceTransaction) {
+      planClosureEvidenceRecoveryIssued = false;
+      planEvidenceRecoveryObjective = "none";
+    }
     const shouldRequestTargetedEvidenceAfterQualityGate =
-      (
-        latestQualityResult.recoveryAction === "targeted_evidence" ||
-        explicitSourceEvidenceGap
-      ) &&
-      !planClosureEvidenceRecoveryIssued &&
-      planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES;
-    const effectiveRecoveryAction = shouldRequestTargetedEvidenceAfterQualityGate
-      ? "targeted_evidence"
-      : latestQualityResult.recoveryAction;
+      recoveryTransition.openEvidenceTransaction;
+    effectiveRecoveryAction = recoveryTransition.effectiveAction;
+    const needsInitialModelDraftEvidence =
+      recoveryTransition.reason === "initial_model_draft_evidence";
+    const explicitSourceEvidenceGap = qualityEvidenceState === "counterpart_missing";
+    logAgentEvent("plan_quality_recovery_action", {
+      iteration,
+      source: latestQualityResult.source,
+      recoveryAction: latestQualityResult.recoveryAction,
+      effectiveRecoveryAction,
+      qualityRejectCount: planQualityRejectCount,
+      qualityGateReason: planLastQualityGateReason,
+      missingSections: planLastMissingSections,
+      evidenceRecoveryPasses: planEvidenceRecoveryPasses,
+      evidenceState: qualityEvidenceState,
+      transitionReason: recoveryTransition.reason,
+      heldActiveEvidenceTransaction: recoveryTransition.holdActiveEvidenceTransaction,
+      clearedStaleEvidenceTransaction: recoveryTransition.clearStaleEvidenceTransaction,
+    });
     deterministicEvidenceMaterializationCandidate =
       latestQualityResult.source === "visible_candidate" &&
+      !recoveryTransition.holdActiveEvidenceTransaction &&
+      qualityEvidenceReadiness.status === "ready_for_plan" &&
       canDeterministicallyMaterializePlan({
         recoveryAction: latestQualityResult.recoveryAction,
-        closureReady: closureEvidenceAssessment.ready,
+        closureReady: deterministicClosureReady,
       });
     logAgentEvent("plan_quality_gate_recovery_decision", {
       iteration,
@@ -321,8 +542,13 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       hasGroundedEvidence: hasQualityClosureEvidence,
       hasStructuredEvidence: hasStructuredQualityClosureEvidence,
       explicitSourceEvidenceGap,
-      closureEvidenceReady: closureEvidenceAssessment.ready,
+      needsInitialModelDraftEvidence,
+      closureEvidenceReady: deterministicClosureReady,
+      rationaleReady: closureEvidenceAssessment.ready,
       closureEvidenceReason: closureEvidenceAssessment.reason,
+      evidenceReadiness: qualityEvidenceReadiness.status,
+      evidenceReadinessReason: qualityEvidenceReadiness.reason,
+      evidenceObligations: qualityEvidenceObligations.length,
       objectiveTargetMatches: closureEvidenceAssessment.objectiveTargetMatches,
       defectSignalMatches: closureEvidenceAssessment.defectSignalMatches,
       contractMismatchMatches: closureEvidenceAssessment.contractMismatchMatches,
@@ -347,14 +573,19 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       );
       if (progressState.bundleHash !== baselineFingerprint) {
         progressState.bundleHash = baselineFingerprint;
-        planEvidenceProgressFingerprint = buildPlanEvidenceProgressFingerprint(progressState);
         planEvidenceNoProgressPasses = 0;
       }
+      progressState.obligationKeys = new Set(
+        qualityEvidenceObligations.map(getPlanEvidenceObligationKey),
+      );
+      planEvidenceProgressFingerprint = buildPlanEvidenceProgressFingerprint(progressState);
       planClosureEvidenceRecoveryIssued = true;
-      planEvidenceRecoveryObjective = "deterministic_closure";
+      planEvidenceRecoveryObjective = recoveryTransition.evidenceObjective;
       setQualityPhase(
         "needs_evidence",
-        closureEvidenceAssessment.ready
+        qualityEvidenceReadiness.status !== "ready_for_plan"
+          ? qualityEvidenceReadiness.reason
+          : closureEvidenceAssessment.ready
           ? "quality gate needs model-authored plan evidence"
           : closureEvidenceAssessment.reason,
       );
@@ -365,18 +596,16 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         {
           unresolvedContractKinds: closureEvidenceAssessment.unresolvedContractKinds,
           confirmedChangeTargets: qualityClosureEvidence.evidenceBundle.changeTargets,
+          evidenceObligations: qualityEvidenceObligations,
         },
       );
-    } else if (
-      planClosureEvidenceRecoveryIssued &&
-      planEvidenceRecoveryObjective !== "none" &&
-      !closureEvidenceAssessment.ready
-    ) {
+    } else if (recoveryTransition.holdActiveEvidenceTransaction) {
       // A typed recovery objective represents a real outstanding read
       // transaction. Do not replace it with a scaffold merely because another
       // weak draft arrived before the requested evidence result.
+      awaitingPlanEvidenceResult = true;
       setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
-    } else if (latestQualityResult.recoveryAction === "auto_scaffold") {
+    } else if (effectiveRecoveryAction === "auto_scaffold") {
       if (!planAutoScaffoldPromptIssued) {
         planAutoScaffoldPromptIssued = true;
         planEvidenceRecoveryObjective = "none";
@@ -392,15 +621,20 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         planEvidenceRecoveryObjective = "none";
         setQualityPhase("needs_rewrite", planLastQualityGateReason);
       }
-    } else if (
-      planClosureEvidenceRecoveryIssued &&
-      !closureEvidenceAssessment.ready
-    ) {
-      setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
-    } else if (
-      latestQualityResult.recoveryAction === "targeted_evidence"
-    ) {
-      setQualityPhase("needs_evidence", planLastQualityGateReason);
+    } else if (effectiveRecoveryAction === "targeted_evidence") {
+      if (planEvidenceNoProgressPasses >= MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES) {
+        planEvidenceRecoveryObjective = "none";
+        setQualityPhase("blocked", "evidence recovery budget exhausted", "failed");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
+          language: MODEL_CONTROL_LANGUAGE,
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: planLastQualityGateReason,
+          missingSections: planLastMissingSections,
+          requireResolvedEvidence: true,
+        });
+      } else {
+        setQualityPhase("needs_evidence", planLastQualityGateReason);
+      }
     } else {
       planEvidenceRecoveryObjective = "none";
       setQualityPhase("needs_rewrite", planLastQualityGateReason);
@@ -413,6 +647,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planEvidenceRecoveryObjective = "none";
     planEvidenceNoProgressPasses = 0;
     planEvidenceProgressFingerprint = "";
+    planVisibleQualityPromptBudget = [];
     planLastQualityGateReason = "";
     planLastMissingSections = [];
   }
@@ -431,6 +666,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     // still-uncovered facet may open another targeted transaction; without a
     // read, the flag remains set and duplicate prompts stay suppressed.
     planClosureEvidenceRecoveryIssued = false;
+    awaitingPlanEvidenceResult = false;
     const successfulEvidenceResults = evidenceRecoveryBatchResults.filter(
       evidenceRecoveryResultProvidesNewEvidence,
     );
@@ -442,9 +678,28 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       attemptedPlanWriteTargets,
       latestUserPromptText,
     );
-    const recoveredModelDraftReady = isPlanEvidenceBundleReady(
+    const recoveredClosureAssessment = assessPlanClosureEvidence(
       recoveredModelDraftInput.evidenceBundle,
     );
+    const recoveredEvidenceReadiness = assessPlanEvidenceReadiness({
+      userGoal: latestUserPromptText,
+      userContext: input.turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasGroundedVisualContext: hasPlanVisualContextGrounding(
+        callbacks.getMessages(),
+        callbacks.getCurrentTurnId?.(),
+      ),
+    });
+    const recoveredEvidenceObligations = derivePlanEvidenceObligations({
+      objective: latestUserPromptText,
+      activities: recentPlanToolActivity,
+    });
+    const recoveredModelDraftReady =
+      recoveredEvidenceReadiness.status === "ready_for_plan" &&
+      isPlanEvidenceReadyForModelDraft(
+        recoveredModelDraftInput.evidenceBundle,
+        recoveredClosureAssessment,
+      );
     const recoveredEvidenceBundleHash = recoveredModelDraftInput.evidenceBundle.hash;
     const previousProgressState = parsePlanEvidenceProgressFingerprint(
       planEvidenceProgressFingerprint,
@@ -457,27 +712,39 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     );
     const semanticEvidenceAdvanced =
       hasSuccessfulEvidence &&
-      (
-        !previousProgressState.bundleHash ||
-        previousProgressState.bundleHash !== recoveredEvidenceBundleHash
-      );
+      !!previousProgressState.bundleHash &&
+      previousProgressState.bundleHash !== recoveredEvidenceBundleHash;
     const readCoverageAdvanced = newCoverageKeys.length > 0;
-    const decisionEvidenceAdvanced =
-      hasSuccessfulEvidence &&
-      (semanticEvidenceAdvanced || readCoverageAdvanced);
+    const recoveredObligationKeys = new Set(
+      recoveredEvidenceObligations.map(getPlanEvidenceObligationKey),
+    );
+    // While an exact runtime obligation is open, unrelated bundle growth or a
+    // fresh window cannot advance the evidence transaction. This keeps a read
+    // of an arbitrary new file from resetting no-progress while the required
+    // symbol/path remains unresolved.
+    const transactionProgress = assessPlanEvidenceTransactionProgress({
+      previousObligationKeys: previousProgressState.obligationKeys,
+      nextObligationKeys: recoveredObligationKeys,
+      hasSuccessfulEvidence,
+      semanticEvidenceAdvanced,
+      readCoverageAdvanced,
+    });
+    const decisionEvidenceAdvanced = transactionProgress.advanced;
     const nextProgressState: PlanEvidenceProgressState = {
       bundleHash: recoveredEvidenceBundleHash,
       coverageKeys: new Set(previousProgressState.coverageKeys),
+      obligationKeys: recoveredObligationKeys,
     };
     freshCoverageKeys.forEach((key) => nextProgressState.coverageKeys.add(key));
     const nextProgressFingerprint = buildPlanEvidenceProgressFingerprint(nextProgressState);
-    if (planEvidenceRecoveryObjective === "model_draft" && decisionEvidenceAdvanced) {
+    if (
+      planEvidenceRecoveryObjective === "model_draft" &&
+      (decisionEvidenceAdvanced || recoveredModelDraftReady)
+    ) {
       // The finalization surface was reopened for one model-requested read.
-      // Re-enter drafting only when that read closes the same evidence contract
-      // used by plan validation; file/symbol presence alone is not a diagnosis.
-      const recoveredClosureAssessment = assessPlanClosureEvidence(
-        recoveredModelDraftInput.evidenceBundle,
-      );
+      // Resume model drafting once its frozen evidence contract is complete.
+      // A mechanically confirmed diagnosis is required only by deterministic
+      // fallback materialization, not by a reviewable model-authored candidate.
       planEvidenceProgressFingerprint = nextProgressFingerprint;
       planEvidenceNoProgressPasses = 0;
       logAgentEvent("plan_evidence_recovery_assessed", {
@@ -487,17 +754,22 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         modelAuthoredDraftReady: recoveredModelDraftReady,
         closureReady: recoveredClosureAssessment.ready,
         closureReason: recoveredClosureAssessment.reason,
+        evidenceReadiness: recoveredEvidenceReadiness.status,
+        evidenceReadinessReason: recoveredEvidenceReadiness.reason,
+        evidenceObligations: recoveredEvidenceObligations.length,
         resultProvidedNewEvidence: hasSuccessfulEvidence,
         semanticEvidenceAdvanced,
         readCoverageAdvanced,
+        firstOpenObligationKey: transactionProgress.firstOpenObligationKey,
+        firstExactObligationClosed: transactionProgress.firstExactObligationClosed,
         newCoverageKeys,
         evidenceBundleHash: recoveredEvidenceBundleHash,
         semanticFacts: recoveredModelDraftInput.evidenceBundle.facts.length,
         changeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets.length,
       });
-      if (recoveredClosureAssessment.ready) {
+      if (recoveredModelDraftReady) {
         planEvidenceRecoveryObjective = "none";
-        setQualityPhase("drafting", "plan closure evidence recovery complete");
+        setQualityPhase("drafting", "model-authored Plan evidence recovery complete");
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
           language: MODEL_CONTROL_LANGUAGE,
           recentToolActivity: recentPlanToolActivity,
@@ -505,17 +777,21 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           missingSections: planLastMissingSections,
         });
       } else {
-        // New source is progress, but it has not yet connected the objective to
-        // a confirmed rationale. Preserve the read transaction instead of
-        // forcing a speculative draft.
+        // A missing evidence owner is still a real open contract. Preserve the
+        // targeted transaction until that counterpart is observed.
         planClosureEvidenceRecoveryIssued = true;
         planEvidenceRecoveryObjective = "model_draft";
-        setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
-        pendingPlanRuntimeRecoveryPrompt = buildPlanTargetedEvidenceRecoveryPrompt({
-          language: MODEL_CONTROL_LANGUAGE,
-          reason: recoveredClosureAssessment.reason,
-          trigger: "closed_read_request",
-        });
+        setQualityPhase("needs_evidence", recoveredEvidenceReadiness.reason);
+        pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
+          MODEL_CONTROL_LANGUAGE,
+          recoveredEvidenceReadiness.reason,
+          latestUserPromptText,
+          {
+            unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+            confirmedChangeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets,
+            evidenceObligations: recoveredEvidenceObligations,
+          },
+        );
       }
     } else if (decisionEvidenceAdvanced) {
       planEvidenceRecoveryPasses += 1;
@@ -530,20 +806,36 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       const recoveredClosureAssessment = assessPlanClosureEvidence(
         recoveredClosureInput.evidenceBundle,
       );
+      const recoveredModelDraftReady = isPlanEvidenceReadyForModelDraft(
+        recoveredClosureInput.evidenceBundle,
+        recoveredClosureAssessment,
+      ) && recoveredEvidenceReadiness.status === "ready_for_plan";
+      const recoveredDeterministicReady =
+        recoveredEvidenceReadiness.status === "ready_for_plan" &&
+        hasDeterministicPlanMaterializationEvidence(
+          recoveredClosureInput.evidenceBundle,
+        );
+      const recoveredClosureReason = recoveredEvidenceReadiness.status !== "ready_for_plan"
+        ? recoveredEvidenceReadiness.reason
+        : recoveredClosureAssessment.ready && !recoveredDeterministicReady
+        ? "insufficient_facet_specific_diagnostic_evidence"
+        : recoveredClosureAssessment.reason;
       logAgentEvent("plan_evidence_recovery_assessed", {
         iteration,
         recoveryPass: planEvidenceRecoveryPasses,
         recoveryObjective: planEvidenceRecoveryObjective || "deterministic_closure",
-        modelAuthoredDraftReady: isPlanEvidenceBundleReady(
-          recoveredClosureInput.evidenceBundle,
-        ),
-        closureReady: recoveredClosureAssessment.ready,
-        closureReason: recoveredClosureAssessment.reason,
+        modelAuthoredDraftReady: recoveredModelDraftReady,
+        closureReady: recoveredDeterministicReady,
+        rationaleReady: recoveredClosureAssessment.ready,
+        closureReason: recoveredClosureReason,
         objectiveTargetMatches: recoveredClosureAssessment.objectiveTargetMatches,
         defectSignalMatches: recoveredClosureAssessment.defectSignalMatches,
         contractMismatchMatches: recoveredClosureAssessment.contractMismatchMatches,
         contractMismatchKinds: recoveredClosureAssessment.contractMismatchKinds,
         unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+        evidenceReadiness: recoveredEvidenceReadiness.status,
+        evidenceReadinessReason: recoveredEvidenceReadiness.reason,
+        evidenceObligations: recoveredEvidenceObligations.length,
         semanticEvidenceAdvanced,
         readCoverageAdvanced,
         newCoverageKeys,
@@ -551,20 +843,21 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         semanticFacts: recoveredClosureInput.evidenceBundle.facts.length,
         changeTargets: recoveredClosureInput.evidenceBundle.changeTargets.length,
       });
-      if (!recoveredClosureAssessment.ready) {
+      if (!recoveredDeterministicReady) {
         planClosureEvidenceRecoveryIssued = true;
         planEvidenceRecoveryObjective = "deterministic_closure";
-        setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
+        setQualityPhase("needs_evidence", recoveredClosureReason);
         pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
           MODEL_CONTROL_LANGUAGE,
-          recoveredClosureAssessment.reason,
+          recoveredClosureReason,
           latestUserPromptText,
           {
             unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
             confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
+            evidenceObligations: recoveredEvidenceObligations,
           },
         );
-      } else if (recoveredClosureAssessment.ready) {
+      } else {
         planEvidenceRecoveryObjective = "none";
         setQualityPhase(
           "drafting",
@@ -622,14 +915,17 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
         pendingPlanRuntimeRecoveryPrompt = recoveryObjectiveForBatch === "model_draft"
           ? [
-              buildPlanTargetedEvidenceRecoveryPrompt({
-                language: MODEL_CONTROL_LANGUAGE,
-                reason: "requested window produced no new evidence",
-                trigger: "closed_read_request",
-              }),
-              avoidTargets.length > 0
-                ? `Do not repeat unchanged target/window(s): ${avoidTargets.join(", ")}. Request a missing range or a different evidence owner.`
-                : "Request a missing range or a different evidence owner.",
+              buildPlanClosureEvidenceRecoveryPrompt(
+                MODEL_CONTROL_LANGUAGE,
+                recoveredEvidenceReadiness.reason,
+                latestUserPromptText,
+                {
+                  unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+                  confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
+                  avoidTargets,
+                  evidenceObligations: recoveredEvidenceObligations,
+                },
+              ),
             ].join("\n")
           : buildPlanClosureEvidenceRecoveryPrompt(
               MODEL_CONTROL_LANGUAGE,
@@ -639,6 +935,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
                 unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
                 confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
                 avoidTargets,
+                evidenceObligations: recoveredEvidenceObligations,
               },
             );
       } else {
@@ -682,21 +979,20 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           : "deterministic_closure";
         setQualityPhase("needs_evidence", "evidence read failed; choose another target");
         pendingPlanRuntimeRecoveryPrompt = recoveryObjectiveForBatch === "model_draft"
-          ? [
-              buildPlanTargetedEvidenceRecoveryPrompt({
-                language: MODEL_CONTROL_LANGUAGE,
-                reason: "evidence read failed; choose another target",
-                trigger: "closed_read_request",
-              }),
-              avoidTargets.length > 0
-                ? `Do not retry failed target(s): ${avoidTargets.join(", ")}. Use a different path, range, or evidence owner.`
-                : "Use a different path, range, or evidence owner.",
-            ].join("\n")
+          ? buildPlanClosureEvidenceRecoveryPrompt(
+              MODEL_CONTROL_LANGUAGE,
+              recoveredEvidenceReadiness.reason,
+              latestUserPromptText,
+              {
+                avoidTargets,
+                evidenceObligations: recoveredEvidenceObligations,
+              },
+            )
           : buildPlanClosureEvidenceRecoveryPrompt(
               MODEL_CONTROL_LANGUAGE,
               "evidence read failed; choose another target",
               latestUserPromptText,
-              { avoidTargets },
+              { avoidTargets, evidenceObligations: recoveredEvidenceObligations },
             );
       } else {
         planEvidenceRecoveryObjective = "none";
@@ -740,33 +1036,80 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
   const quality = input.quality.ok
     ? classifyPlanArtifactQualityResult({ ok: false, reason: "quality_gate" })
     : input.quality;
-  const recoveryAction = quality.recoveryAction || "rewrite";
+  const previousRecovery = classifyPlanQualityRecovery({
+    reason: input.planLastQualityGateReason,
+    missingSections: input.planLastMissingSections,
+  });
+  const currentRecovery = classifyPlanQualityRecovery({
+    reason: quality.reason,
+    missingSections: quality.missingSections,
+    recoveryAction: quality.recoveryAction,
+  });
+  const intrinsicRecoveryAction = currentRecovery.recoveryAction;
   const result = handlePlanQualityRejections({
     ...input,
     rejections: [{
       source: "visible_candidate",
       qualityGateReason: quality.reason || "quality_gate",
-      recoveryAction,
+      recoveryAction: intrinsicRecoveryAction,
       missingSections: quality.missingSections || [],
     }],
     acceptedPersistedArtifact: false,
     evidenceRecoveryResults: [],
   });
 
-  // Tool-written rejections are already visible to the model as tool
-  // feedback. A visible candidate has no such channel, so allow two bounded
-  // prompts for the typed recovery action. Retry count limits the loop; it must
-  // not convert a rewrite into evidence discovery or a different action.
-  if (result.pendingPlanRuntimeRecoveryPrompt == null && result.planQualityRejectCount <= 2) {
+  // Tool-written rejections are already visible as tool feedback. Visible
+  // candidates need an explicit channel, but the budget belongs to the exact
+  // quality signature and frozen evidence epoch—not to unrelated defects that
+  // happened earlier in the same Plan run.
+  const isNewQualityIssue = !input.planLastQualityGateReason ||
+    previousRecovery.signature !== currentRecovery.signature;
+  const qualityEpochIdentity = {
+    signature: currentRecovery.signature,
+    evidenceEpochHash: result.qualityEvidenceEpochHash,
+  };
+  const promptsIssuedForQualityEpoch = getPlanVisibleQualityPromptCount(
+    input.planVisibleQualityPromptBudget,
+    qualityEpochIdentity,
+  );
+  const withinQualityEpochPromptBudget =
+    promptsIssuedForQualityEpoch < MAX_VISIBLE_PLAN_QUALITY_PROMPTS_PER_SIGNATURE_EPOCH;
+  const withinGlobalRejectionLimit =
+    result.planQualityRejectCount <= MAX_VISIBLE_PLAN_QUALITY_REJECTIONS;
+  const recoveryAction = result.effectiveRecoveryAction === "accept"
+    ? intrinsicRecoveryAction
+    : result.effectiveRecoveryAction;
+  const hasOutstandingEvidenceTransaction =
+    result.awaitingPlanEvidenceResult ||
+    (
+      result.planClosureEvidenceRecoveryIssued &&
+      result.planEvidenceRecoveryObjective !== "none"
+    );
+  const shouldIssueVisibleRecoveryPrompt =
+    result.pendingPlanRuntimeRecoveryPrompt == null &&
+    !hasOutstandingEvidenceTransaction &&
+    withinGlobalRejectionLimit &&
+    withinQualityEpochPromptBudget;
+  if (shouldIssueVisibleRecoveryPrompt) {
+    result.planVisibleQualityPromptBudget = recordPlanVisibleQualityPrompt(
+      input.planVisibleQualityPromptBudget,
+      qualityEpochIdentity,
+    );
     if (
       recoveryAction === "targeted_evidence"
     ) {
       result.planClosureEvidenceRecoveryIssued = true;
-      result.planEvidenceRecoveryObjective = "deterministic_closure";
+      result.planEvidenceRecoveryObjective = "model_draft";
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
         result.planLastQualityGateReason,
         input.latestUserPromptText,
+        {
+          evidenceObligations: derivePlanEvidenceObligations({
+            objective: input.latestUserPromptText,
+            activities: input.recentPlanToolActivity,
+          }),
+        },
       );
     } else if (recoveryAction === "ask_user") {
       result.planEvidenceRecoveryObjective = "none";
@@ -780,6 +1123,7 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
         qualityGateReason: result.planLastQualityGateReason,
         missingSections: result.planLastMissingSections,
         rejectCount: result.planQualityRejectCount,
+        failurePreview: quality.failurePreview,
       });
     }
   }
@@ -791,6 +1135,19 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
     qualityRejectCount: result.planQualityRejectCount,
     artifactQualityRejected: result.planArtifactQualityRejected,
     recoveryPromptIssued: result.pendingPlanRuntimeRecoveryPrompt != null,
+    outstandingEvidenceTransaction: hasOutstandingEvidenceTransaction,
+    recoveryReasonType: currentRecovery.reasonType,
+    recoverySignature: currentRecovery.signature,
+    previousRecoverySignature: previousRecovery.signature,
+    isNewQualityIssue,
+    evidenceBundleHash: result.qualityEvidenceBundleHash,
+    evidenceEpochHash: result.qualityEvidenceEpochHash,
+    promptsIssuedForQualityEpoch:
+      promptsIssuedForQualityEpoch + (shouldIssueVisibleRecoveryPrompt ? 1 : 0),
+    withinQualityEpochPromptBudget,
+    maxPromptsPerQualityEpoch: MAX_VISIBLE_PLAN_QUALITY_PROMPTS_PER_SIGNATURE_EPOCH,
+    withinGlobalRejectionLimit,
+    maxVisibleQualityRejections: MAX_VISIBLE_PLAN_QUALITY_REJECTIONS,
   });
   return result;
 }

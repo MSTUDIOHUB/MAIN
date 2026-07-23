@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 import ts from "typescript";
 
@@ -279,6 +280,60 @@ test("OpenAI Responses reports image delivery from the accepted serialized reque
     serializedImageParts: 1,
     omittedImageParts: 0,
   });
+});
+
+test("owner-bound visual receipts never borrow an older Turn image", async () => {
+  const { streamChatCompletion } = await loadStreamingModule(async () =>
+    JSON.stringify({ output_text: "no current image" })
+  );
+  const owner = {
+    sessionKey: "session-current",
+    sessionEpoch: "epoch-current",
+    turnId: "turn-current",
+    runId: "run-current",
+    attemptId: "attempt-current",
+  };
+  const expectedCurrentDigest = createHash("sha256")
+    .update(JSON.stringify(["base64:CURRENT"]))
+    .digest("hex");
+  const result = await streamChatCompletion(
+    [
+      {
+        role: "user",
+        runtimeTurnId: "turn-old",
+        content: [{ type: "image_url", image_url: { url: "data:image/png;base64,OLD" } }],
+      },
+      {
+        role: "user",
+        runtimeTurnId: "turn-current",
+        content: "Current payload was compacted before this request",
+      },
+    ],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+    undefined,
+    undefined,
+    undefined,
+    {
+      visualTransportBinding: {
+        owner,
+        expectedImageParts: 1,
+        payloadDigest: expectedCurrentDigest,
+      },
+    },
+  );
+
+  assert.deepEqual(result.visualTransportReceipt?.owner, owner);
+  assert.equal(result.visualTransportReceipt?.logicalImageParts, 0);
+  assert.equal(result.visualTransportReceipt?.serializedImageParts, 0);
+  assert.notEqual(result.visualTransportReceipt?.payloadDigest, expectedCurrentDigest);
 });
 
 test("OpenAI Responses gateway timeouts preserve the current image in aggressive structured fallback", async () => {

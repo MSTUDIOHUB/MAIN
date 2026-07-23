@@ -228,3 +228,18 @@ test("turn intake persists a session-supplied subagent preference for runtime re
   assert.match(block, /subagentPreference: preferred/);
   assert.equal(signals.subagentPreference, "preferred");
 });
+
+test("turn intake round-trips explicit diagnosis outcome authority", () => {
+  const block = buildTurnIntakeContextBlock({
+    rawUserInput: "Identifique la causa raíz y repare el flujo.",
+    signals: { diagnosisRequirement: "required" },
+    language: "en",
+    workflowMode: "plan",
+  });
+  const signals = extractTurnInputContextSignalsFromMessages([
+    { role: "user", content: block },
+  ]);
+
+  assert.match(block, /diagnosisRequirement: required/);
+  assert.equal(signals.diagnosisRequirement, "required");
+});

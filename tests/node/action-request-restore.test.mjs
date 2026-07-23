@@ -200,7 +200,7 @@ test("restore clears plan_review requests when the hash or artifact is invalid",
   assert.equal(restorePendingActionRequest({
     request: staleHashRequest,
     runOwner: owner,
-    planIdentity: validIdentity,
+    planReviewIdentity: validIdentity,
   }), null);
 
   const sanitized = sanitizeRestoredPlanArtifacts({

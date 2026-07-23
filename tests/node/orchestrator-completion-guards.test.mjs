@@ -65,6 +65,9 @@ const {
   runApprovedPlanCompletionGuard,
   runExecutionEvidenceCompletionGuard,
 } = completionGuardsModule;
+const { evaluateApprovedPlanExecution } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planExecutionEvaluation.ts"),
+);
 const { handleReplyOptionsPause } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/finalTurnCompletion.ts"),
 );
@@ -217,6 +220,14 @@ function assertCompletedOutcome(actual, resultKind, reason) {
   });
 }
 
+function assertRecoverablePause(actual, reason) {
+  assert.deepEqual(actual, {
+    status: "paused",
+    pauseKind: "recoverable",
+    reason,
+  });
+}
+
 test("non-actionable stops always close with an explicit result quality", () => {
   assertCompletedOutcome(
     resolveNonActionableStopOutcome("no_output"),
@@ -242,6 +253,32 @@ test("non-actionable stops always close with an explicit result quality", () => 
     "blocked",
     "approved_plan_completion_guard_no_evidence",
   );
+  assertRecoverablePause(
+    resolveNonActionableStopOutcome("incomplete_plan", {
+      recoveryReason: "plan_generation_failed",
+    }),
+    "plan_generation_failed",
+  );
+  assertRecoverablePause(
+    resolveNonActionableStopOutcome("missing_tool_loop", {
+      recoveryReason: "plan_required_tool_protocol_violation",
+    }),
+    "plan_required_tool_protocol_violation",
+  );
+  for (const recoveryReason of [
+    "stream_no_visible_progress_timeout",
+    "stream_max_elapsed_timeout",
+    "plan_max_iterations_checkpoint",
+    "execute_max_iterations_checkpoint",
+    "chat_max_iterations_strategy_exhausted",
+    "execute_recovery_no_progress_limit",
+    "execute_no_progress_batch_loop",
+  ]) {
+    assertRecoverablePause(
+      resolveNonActionableStopOutcome("no_output", { recoveryReason }),
+      recoveryReason,
+    );
+  }
   assertCompletedOutcome(
     resolveNonActionableStopOutcome("incomplete_plan", {
       recoveryReason: "preapproval_plan_quality_recovery_stream_timeout",
@@ -258,21 +295,28 @@ test("non-actionable stops always close with an explicit result quality", () => 
     "partial",
     "required_tool_call_protocol_violation_after_change",
   );
-  assertCompletedOutcome(
+  assertRecoverablePause(
     resolveNonActionableStopOutcome("no_action", {
       recoveryReason: "execute_recovery_no_progress_limit",
     }),
-    "blocked",
     "execute_recovery_no_progress_limit",
   );
-  assertCompletedOutcome(
+  assertRecoverablePause(
     resolveNonActionableStopOutcome("no_action", {
       recoveryReason: "execute_no_progress_batch_loop",
     }, {
       sawExecutionEvidence: true,
     }),
-    "partial",
     "execute_no_progress_batch_loop",
+  );
+  assertRecoverablePause(
+    resolveNonActionableStopOutcome("no_action", {
+      phase: "paused",
+      recoveryReason: "provider_neutral_runtime_checkpoint",
+    }, {
+      sawExecutionEvidence: true,
+    }),
+    "provider_neutral_runtime_checkpoint",
   );
 });
 
@@ -961,6 +1005,96 @@ test("approved plan completion keeps user review advisory without disabling auto
   assert.equal(validated.events.stops.length, 0);
 });
 
+test("approved Plan completion truth rejects a completed stage when task evidence belongs to another target", () => {
+  const tasks = [{
+    id: "required-source",
+    text: "Update the required source",
+    status: "completed",
+    evidenceStatus: "satisfied",
+    evidence: [{ kind: "file", value: "src/required.ts" }],
+  }];
+  const ledger = [{
+    id: "unrelated-mutation",
+    kind: "file",
+    value: "src/unrelated.ts",
+    target: "src/unrelated.ts",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  }, {
+    id: "validation",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 2,
+  }];
+  const evaluation = evaluateApprovedPlanExecution({
+    tasks,
+    evidenceLedger: ledger,
+  });
+  assert.equal(evaluation.evidenceClosure.completionAllowed, true);
+  assert.equal(evaluation.taskAudit.acceptedCompletion, false);
+  assert.equal(evaluation.completionAllowed, false);
+  assert.equal(evaluation.gap.kind, "task_evidence_incomplete");
+
+  const { callbacks, events } = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getPlanStage: () => "completed",
+    getPlanTasks: () => tasks,
+    getPlanExecutionEvidenceLedger: () => ledger,
+  });
+  const result = runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    sawExecutionEvidence: true,
+  });
+
+  assertCompletedOutcome(result, "partial", "approved_plan_completion_guard");
+  assert.equal(events.stops.length, 1);
+});
+
+test("approved Plan evaluator and terminal guard agree on trusted completion", () => {
+  const tasks = [{
+    id: "source",
+    text: "Update the source",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/App.tsx" }],
+  }];
+  const ledger = [{
+    id: "mutation",
+    kind: "file",
+    value: "src/App.tsx",
+    target: "src/App.tsx",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  }, {
+    id: "validation",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 2,
+  }];
+  const evaluation = evaluateApprovedPlanExecution({ tasks, evidenceLedger: ledger });
+  assert.equal(evaluation.completionAllowed, true);
+  assert.equal(evaluation.gap.kind, "none");
+
+  const { callbacks, events } = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getPlanStage: () => "executing",
+    getPlanTasks: () => tasks,
+    getPlanExecutionEvidenceLedger: () => ledger,
+  });
+  assert.equal(runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    sawExecutionEvidence: true,
+  }), null);
+  assert.equal(events.stops.length, 0);
+});
+
 test("approved plan completion is deferred until the current loop consumes the execution transition", () => {
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "plan",
@@ -1158,6 +1292,228 @@ test("user-choice pause stays idempotent from assistant completion through workf
   );
   assert.equal(terminalAppend.disposition, "idempotent");
   assert.equal(terminalAppend.events.length, emittedEvents.length);
+});
+
+test("recoverable Plan generation failure settles its exact pause even when presentation callback throws", async () => {
+  const emittedEvents = [];
+  const callbackLogs = [];
+  const runIdentity = { runId: "run-plan-generation", parentRunId: null };
+
+  class RecoverablePlanFailureOrchestrator {
+    async execute(callbacks) {
+      callbacks.onNonActionableStop(
+        "Plan generation failed after bounded recovery.",
+        "incomplete_plan",
+        { recoveryReason: "plan_generation_failed" },
+      );
+      this.pauseActiveRun(
+        "assistant_stopped",
+        "The assistant run stopped in a resumable state.",
+      );
+    }
+
+    getLatestRunPauseReason() {
+      return emittedEvents.find((event) => event.type === "run.paused")?.reason || null;
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+
+    discardPendingTurnCompletion() {
+      return false;
+    }
+
+    pauseActiveRun(reason, message) {
+      if (emittedEvents.some((event) =>
+        event.type === "run.paused" && event.runId === runIdentity.runId
+      )) return false;
+      emittedEvents.push(withEventSchema({
+        type: "run.paused",
+        threadId: "session-plan-generation",
+        turnId: "turn-plan-generation",
+        timestampMs: 2,
+        ...runIdentity,
+        reason,
+        message,
+      }));
+      return true;
+    }
+  }
+
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(
+    RecoverablePlanFailureOrchestrator,
+    callbackLogs,
+  );
+  const outcome = await executeAgentLoop({
+    getPreferredLanguage: () => "en",
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {
+      throw new Error("presentation projection failed");
+    },
+    onStatusChange: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "paused",
+    pauseKind: "recoverable",
+    reason: "plan_generation_failed",
+  });
+  const pauses = emittedEvents.filter((event) => event.type === "run.paused");
+  assert.equal(pauses.length, 1);
+  assert.equal(pauses[0].reason, outcome.reason);
+  const terminalAppend = appendRuntimeEventWithResult(
+    emittedEvents,
+    withEventSchema({
+      type: "run.paused",
+      threadId: "session-plan-generation",
+      turnId: "turn-plan-generation",
+      timestampMs: 3,
+      ...runIdentity,
+      reason: outcome.reason,
+      message: "Plan generation failed after bounded recovery.",
+    }),
+  );
+  assert.equal(terminalAppend.disposition, "idempotent");
+  assert.equal(callbackLogs.some((entry) =>
+    entry.event === "agent_loop_presentation_callback_failed" &&
+    entry.data?.callbackName === "onNonActionableStop"
+  ), true);
+});
+
+test("stream watchdog timeouts remain one recoverable pause without a terminal completion", async () => {
+  for (const recoveryReason of [
+    "stream_no_visible_progress_timeout",
+    "stream_max_elapsed_timeout",
+  ]) {
+    const emittedEvents = [];
+    const runIdentity = {
+      runId: `run-${recoveryReason}`,
+      parentRunId: null,
+    };
+
+    class StreamWatchdogOrchestrator {
+      async execute(callbacks) {
+        callbacks.onNonActionableStop(
+          "The model stream stopped at a recoverable watchdog boundary.",
+          "no_output",
+          { recoveryReason },
+        );
+        this.pauseActiveRun(
+          "stream_stopped",
+          "A generic stopped fallback must not replace the exact watchdog pause.",
+        );
+      }
+
+      getLatestRunPauseReason() {
+        return emittedEvents.find((event) => event.type === "run.paused")?.reason || null;
+      }
+
+      hasExecuteOperationEvidence() {
+        return false;
+      }
+
+      discardPendingTurnCompletion() {
+        return false;
+      }
+
+      pauseActiveRun(reason, message) {
+        if (emittedEvents.some((event) =>
+          event.type === "run.paused" && event.runId === runIdentity.runId
+        )) return false;
+        emittedEvents.push(withEventSchema({
+          type: "run.paused",
+          threadId: "session-stream-watchdog",
+          turnId: "turn-stream-watchdog",
+          timestampMs: 2,
+          ...runIdentity,
+          reason,
+          message,
+        }));
+        return true;
+      }
+    }
+
+    const { executeAgentLoop } = loadAgentLoopRunnerWithFake(
+      StreamWatchdogOrchestrator,
+      [],
+    );
+    const outcome = await executeAgentLoop({
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+      onNonActionableStop: () => {},
+      onStatusChange: () => {},
+      onError: () => {},
+    }, new AbortController());
+
+    assertRecoverablePause(outcome, recoveryReason);
+    assert.deepEqual(emittedEvents.map((event) => event.type), ["run.paused"]);
+    assert.equal(emittedEvents[0].reason, recoveryReason);
+    assert.equal(emittedEvents.some((event) =>
+      event.type === "run.completed" || event.type === "turn.completed"
+    ), false);
+  }
+});
+
+test("maximum-iteration runtime boundary remains one recoverable pause", async () => {
+  const emittedEvents = [];
+  const runIdentity = { runId: "run-max-iterations", parentRunId: null };
+
+  class MaxIterationsBoundaryOrchestrator {
+    async execute() {
+      this.pauseActiveRun(
+        "max_iterations_boundary",
+        "Execution is paused at its saved iteration checkpoint.",
+      );
+    }
+
+    getLatestRunPauseReason() {
+      return emittedEvents.find((event) => event.type === "run.paused")?.reason || null;
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+
+    discardPendingTurnCompletion() {
+      return false;
+    }
+
+    pauseActiveRun(reason, message) {
+      if (emittedEvents.some((event) =>
+        event.type === "run.paused" && event.runId === runIdentity.runId
+      )) return false;
+      emittedEvents.push(withEventSchema({
+        type: "run.paused",
+        threadId: "session-max-iterations",
+        turnId: "turn-max-iterations",
+        timestampMs: 2,
+        ...runIdentity,
+        reason,
+        message,
+      }));
+      return true;
+    }
+  }
+
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(
+    MaxIterationsBoundaryOrchestrator,
+    [],
+  );
+  const outcome = await executeAgentLoop({
+    getPreferredLanguage: () => "en",
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onStatusChange: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assertRecoverablePause(outcome, "max_iterations_boundary");
+  assert.deepEqual(emittedEvents.map((event) => event.type), ["run.paused"]);
+  assert.equal(emittedEvents.some((event) =>
+    event.type === "run.completed" || event.type === "turn.completed"
+  ), false);
 });
 
 test("subagent runner strips reply options and preserves the evidence summary", async () => {

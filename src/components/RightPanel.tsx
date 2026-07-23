@@ -23,7 +23,7 @@ import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTur
 import { safeConfirmAsync } from "../lib/safeConfirm";
 import SubagentsPanel from "./SubagentsPanel";
 import { projectSubagentRuns, resolveSubagentCapacityPolicy } from "../lib/subagents";
-import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import {
   buildTurnPresentationModel,
   canOfferPlanContinuation,
@@ -1078,7 +1078,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       : taskFlow;
     return collectChangeEntries(scopedTaskFlow, getDiffStats);
   }, [latestPlanTurn, taskFlow]);
-  const planApprovalIdentity = buildPlanApprovalIdentity(planArtifacts);
+  const planApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
   const hasReviewablePlanArtifact = !!planApprovalIdentity;
   const fallbackPlanPreview = useMemo(() => {
     if (hasReviewablePlanArtifact || !latestPlanEntry) return "";
@@ -1205,11 +1205,11 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     sendMessage(
       language === "zh"
         ? isRequirementsStage
-          ? "已存在旧流程 requirements.md。请不要重复读取已读文件，直接基于已有上下文生成或更新 `.MAIN/plans/plan.md`；如果计划方向不明确，用 `<user_options>` 给出用户可点击选择并停止。不要生成 tasks.md 或修改源码。"
-          : "请基于当前已经生成的计划草案继续收敛，不要重复前文。优先补齐关键分叉点，并在需要用户确认时用面向用户的口吻给出可点击选项；如果已经足够清晰，就输出正式 Proposal 供用户确认。未经明确批准，不要提前生成执行用的 tasks.md。"
+          ? "已存在旧流程 requirements.md；它只作为上下文，不是审批 authority。请不要重复读取已读文件，也不要直接生成或更新 plan.md。继续收敛证据；方向清晰后输出一个完整 `<plan_candidate>`，由 MAIN runtime 校验并渲染 plan.md。只有真实阻塞决策才用 `<user_options>` 并停止。不要生成 tasks.md 或修改源码。"
+          : "请基于当前上下文继续收敛证据和关键分叉，不要重复前文，也不要直接写 plan.md 或另写 Proposal 文本。若存在真实阻塞决策，用 `<user_options>` 给出可点击选项并停止；否则输出一个完整 `<plan_candidate>`，由 MAIN runtime 校验并渲染审批计划。未经明确批准，不要生成 tasks.md 或修改源码。"
         : isRequirementsStage
-        ? "A legacy requirements.md exists. Do not reread files already in context; generate or update `.MAIN/plans/plan.md` from the existing context. If the plan direction is unclear, offer `<user_options>` and stop. Do not generate tasks.md or edit source files."
-        : "Continue refining the current plan draft without repeating earlier content. Use clickable options when a real decision is needed; once the plan is clear enough, produce the formal proposal for approval. Do not generate execution tasks.md before the user explicitly approves execution.",
+        ? "A legacy requirements.md exists only as context, not approval authority. Do not reread known files or directly generate/update plan.md. Continue converging evidence; once the direction is clear, output one complete `<plan_candidate>` for MAIN runtime to validate and render. Use `<user_options>` only for a genuinely blocking decision, then stop. Do not generate tasks.md or edit source files."
+        : "Continue converging evidence and real decision points without repeating earlier content. Do not write plan.md directly or emit a second free-form Proposal authority. If a decision genuinely blocks execution, offer `<user_options>` and stop; otherwise output one complete `<plan_candidate>` for MAIN runtime to validate and render as the review Plan. Do not generate tasks.md or edit source before approval.",
       undefined,
       { hidden: true, reuseCurrentTurn: true, preservePlanState: true, resolvedIntent: "plan", skipIntentResolution: true },
     );

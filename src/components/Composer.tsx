@@ -31,6 +31,8 @@ import {
   normalizeAttachedFile,
 } from "../lib/attachments";
 import { safeConfirmAsync } from "../lib/safeConfirm";
+import type { CanonicalRunIdentity } from "../lib/turnRuntimeContract";
+import type { TurnIngressMode } from "../lib/turnIngress";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -200,6 +202,9 @@ export default function Composer({
   setShowDiff,
   onSendMessage,
   isStreaming = false,
+  isRunActive,
+  turnIngressMode,
+  guidanceTarget,
   onStopGeneration,
   autoApproveTools,
   onToggleAutoApprove,
@@ -295,6 +300,15 @@ export default function Composer({
   const isMainMode = selectedMainModeKey === "main_mode";
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isLightTheme = themeMode === "light";
+  const composerCanStop = typeof isRunActive === "boolean" ? isRunActive : isStreaming;
+  const resolvedTurnIngressMode: TurnIngressMode = turnIngressMode || (
+    composerCanStop ? "guidance_or_queue" : "submit"
+  );
+  // An open owner includes a paused review owner. Only composerCanStop means
+  // that a live process can be canceled from this surface.
+  const composerRunActive = resolvedTurnIngressMode !== "submit";
+  const composerGuidanceAvailable = resolvedTurnIngressMode === "guidance_or_queue" &&
+    !!(guidanceTarget as CanonicalRunIdentity | null | undefined);
   const isComposerSubmitting = isSubmitPending;
   const resolvedComposerFontSize = Math.min(20, Math.max(10, Number(chatFontSize ?? useAppStore.getState().config.chatFontSize) || 13));
   const showExecutionProgress =
@@ -367,13 +381,15 @@ export default function Composer({
     contextMentions.length > 0 ||
     attachedFiles.length > 0 ||
     pendingImages.length > 0;
-  const streamingPrimarySubmitsMessage = isStreaming && hasDraftPayload;
+  const streamingPrimarySubmitsMessage = composerRunActive && hasDraftPayload;
   const queuedWorkspaceEntries = (workspaceTurnQueue?.entries || []).filter((entry) =>
     entry?.status === "persisting" || entry?.status === "queued" || entry?.status === "dispatching"
   );
-  const queuedTurnCount = queuedWorkspaceEntries.length + (queuedUserMessage ? 1 : 0);
+  const workspaceComposer = Boolean(String(currentWorkspace || "").trim());
+  const visibleLegacyQueuedMessage = workspaceComposer ? null : queuedUserMessage;
+  const queuedTurnCount = queuedWorkspaceEntries.length + (visibleLegacyQueuedMessage ? 1 : 0);
   const queuedTurnPreview = String(
-    queuedWorkspaceEntries[0]?.instruction?.payload?.text || queuedUserMessage?.text || "",
+    queuedWorkspaceEntries[0]?.instruction?.payload?.text || visibleLegacyQueuedMessage?.text || "",
   ).trim() || (language === "en" ? "Turn with attachments or images" : "包含附件或图片的回合");
   const activeGuidancePreview = String(activeGuidance?.text || "").trim();
   const hasGuidanceUnsupportedPayload =
@@ -384,7 +400,7 @@ export default function Composer({
     parseMainIntentShortcutForMode(draftInput, selectedMainModeKey),
   );
   const guidanceEligible = Boolean(
-    isStreaming &&
+    composerGuidanceAvailable &&
     !isImageStudioMode &&
     draftInput.trim() &&
     !hasGuidanceUnsupportedPayload &&
@@ -406,9 +422,9 @@ export default function Composer({
         : draftHasExplicitTurnIntent
           ? "计划、目标等显式意图必须排队为独立回合。"
           : "在下一次模型迭代引导当前执行，不创建新回合。";
-  const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
+  const autoReviewToggleDisabled = Boolean(autoApproveTools && composerRunActive);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
-  const subagentPreferenceToggleDisabled = Boolean(isStreaming);
+  const subagentPreferenceToggleDisabled = Boolean(composerRunActive);
   const subagentPreferenceButtonTitle = subagentPreferenceToggleDisabled
     ? subagentPreferenceLockedTitle
     : subagentPreferenceTitle;
@@ -564,9 +580,9 @@ export default function Composer({
   }, [draftInput]);
 
   useEffect(() => {
-    if (isStreaming) return;
+    if (composerRunActive) return;
     setDraftInput(storeInput || "");
-  }, [isStreaming, storeInput]);
+  }, [composerRunActive, storeInput]);
 
   useEffect(() => {
     return () => {
@@ -1205,7 +1221,7 @@ export default function Composer({
 
   const handleToggleAutoReview = useCallback(async () => {
     if (!onToggleAutoApprove) return;
-    if (autoApproveTools && isStreaming) return;
+    if (autoApproveTools && composerRunActive) return;
     const nextValue = !autoApproveTools;
     if (nextValue) {
       const confirmed = await safeConfirmAsync(
@@ -1217,12 +1233,12 @@ export default function Composer({
       if (!confirmed) return;
     }
     onToggleAutoApprove(nextValue);
-  }, [autoApproveTools, isStreaming, language, onToggleAutoApprove]);
+  }, [autoApproveTools, composerRunActive, language, onToggleAutoApprove]);
 
   const handleToggleSubagentPreference = useCallback(() => {
-    if (!onTogglePreferSubagents || isStreaming) return;
+    if (!onTogglePreferSubagents || composerRunActive) return;
     onTogglePreferSubagents(!preferSubagents);
-  }, [isStreaming, onTogglePreferSubagents, preferSubagents]);
+  }, [composerRunActive, onTogglePreferSubagents, preferSubagents]);
 
   const handleToggleWebSearch = useCallback(() => {
     const nextValue = !webSearchEnabled;
@@ -1340,22 +1356,14 @@ export default function Composer({
     if (!guidanceEligible || !guidanceText) return;
 
     const latest = useAppStore.getState();
-    if (
-      !(latest.isGenerating || latest.agentStatus === "running") ||
-      !latest.currentTurnId ||
-      latest.activeGuidance
-    ) {
-      return;
-    }
-
-    latest.setActiveGuidance(guidanceText, latest.currentTurnId);
+    if (!guidanceTarget || !latest.setActiveGuidance(guidanceText, guidanceTarget)) return;
     closeMentionMenu();
     closeSlashMenu();
     setDraftInput((currentDraft) => currentDraft === draftInput ? "" : currentDraft);
     if (latest.input === draftInput) {
       setStoreInput("", { preserveLockedComposerIntent: true });
     }
-  }, [closeMentionMenu, closeSlashMenu, draftInput, guidanceEligible, setStoreInput]);
+  }, [closeMentionMenu, closeSlashMenu, draftInput, guidanceEligible, guidanceTarget, setStoreInput]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {
@@ -1676,7 +1684,7 @@ export default function Composer({
           />
         )}
 
-        {suggestedComposerIntent && suggestedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !isStreaming && (
+        {suggestedComposerIntent && suggestedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !composerRunActive && (
           <div className="relative z-30 mb-2 flex justify-center px-3">
             <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8]">
               <span className="truncate">
@@ -1723,7 +1731,7 @@ export default function Composer({
           </div>
         )}
 
-        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={isImageStudioMode ? imageStudioPanelStyle : undefined}>
+        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${composerRunActive ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={isImageStudioMode ? imageStudioPanelStyle : undefined}>
 
           {attachmentNotice && (
             <div className="flex items-center justify-between gap-3 px-4 pt-3 text-[11px] text-[#fbbf24]">
@@ -2416,7 +2424,7 @@ export default function Composer({
             </div>
 
             <div className="flex items-center gap-2">
-              {lockedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !isStreaming && (
+              {lockedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !composerRunActive && (
                 <button
                   type="button"
                   onClick={() => setLockedComposerIntent(null)}
@@ -2432,40 +2440,44 @@ export default function Composer({
 
               {/* Send / Stop button */}
               {!activeDiffTask && (
-                isStreaming ? (
+                composerRunActive ? (
                   isImageStudioMode ? (
-                    <button
-                      data-testid={streamingPrimarySubmitsMessage ? "composer-send-button" : "composer-stop-button"}
-                      disabled={streamingPrimarySubmitsMessage ? (isSubmitPending || cooldownSec > 0) : false}
-                      onClick={streamingPrimarySubmitsMessage ? handleSubmitComposerMessage : onStopGeneration}
-                      className={`flex h-8 w-8 items-center justify-center rounded-md border shadow-sm transition-colors disabled:opacity-50 ${
-                        streamingPrimarySubmitsMessage
-                          ? "border-[#27272a] bg-[#09090b] text-[#d4d4d8] hover:bg-white hover:text-black"
-                          : "border-[#7f1d1d] bg-[#09090b] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white"
-                      }`}
-                      title={streamingPrimarySubmitsMessage ? concurrentSubmitButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
-                    >
-                      {streamingPrimarySubmitsMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
-                    </button>
+                    streamingPrimarySubmitsMessage || composerCanStop ? (
+                      <button
+                        data-testid={streamingPrimarySubmitsMessage ? "composer-send-button" : "composer-stop-button"}
+                        disabled={streamingPrimarySubmitsMessage ? (isSubmitPending || cooldownSec > 0) : false}
+                        onClick={streamingPrimarySubmitsMessage ? handleSubmitComposerMessage : onStopGeneration}
+                        className={`flex h-8 w-8 items-center justify-center rounded-md border shadow-sm transition-colors disabled:opacity-50 ${
+                          streamingPrimarySubmitsMessage
+                            ? "border-[#27272a] bg-[#09090b] text-[#d4d4d8] hover:bg-white hover:text-black"
+                            : "border-[#7f1d1d] bg-[#09090b] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white"
+                        }`}
+                        title={streamingPrimarySubmitsMessage ? concurrentSubmitButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
+                      >
+                        {streamingPrimarySubmitsMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
+                      </button>
+                    ) : null
                   ) : (
                     <>
                       {hasDraftPayload && (
                         <>
-                          <button
-                            type="button"
-                            data-testid="composer-guidance-button"
-                            disabled={!guidanceEligible}
-                            onClick={handleGuideCurrentRun}
-                            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
-                              isLightTheme
-                                ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
-                                : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
-                            }`}
-                            title={guidanceButtonTitle}
-                          >
-                            <IconZap className="h-3.5 w-3.5" />
-                            {language === "en" ? "Guide" : "引导"}
-                          </button>
+                          {composerGuidanceAvailable && (
+                            <button
+                              type="button"
+                              data-testid="composer-guidance-button"
+                              disabled={!guidanceEligible}
+                              onClick={handleGuideCurrentRun}
+                              className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                                isLightTheme
+                                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                                  : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
+                              }`}
+                              title={guidanceButtonTitle}
+                            >
+                              <IconZap className="h-3.5 w-3.5" />
+                              {language === "en" ? "Guide" : "引导"}
+                            </button>
+                          )}
                           <button
                             type="button"
                             data-testid="composer-queue-button"
@@ -2483,15 +2495,17 @@ export default function Composer({
                           </button>
                         </>
                       )}
-                      <button
-                        type="button"
-                        data-testid="composer-stop-button"
-                        onClick={onStopGeneration}
-                        className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
-                        title={language === "en" ? "Stop current run" : "停止当前执行"}
-                      >
-                        <IconStop className="h-4 w-4" />
-                      </button>
+                      {composerCanStop && (
+                        <button
+                          type="button"
+                          data-testid="composer-stop-button"
+                          onClick={onStopGeneration}
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
+                          title={language === "en" ? "Stop current run" : "停止当前执行"}
+                        >
+                          <IconStop className="h-4 w-4" />
+                        </button>
+                      )}
                     </>
                   )
                 ) : (

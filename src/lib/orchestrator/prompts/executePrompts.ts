@@ -1,3 +1,5 @@
+import { buildPlanSubmissionGuidance } from "../../planSubmissionGuidance";
+
 export function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecutiveNoToolCount: number): string {
   return language === "zh"
     ? [
@@ -61,7 +63,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
       "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
       "Do not ask for permission again and do not narrate a future read.",
       workflowMode === "plan"
-        ? "If the evidence is sufficient, output visible `<proposed_plan>` for MAIN runtime to materialize; if one fact is still missing, call exactly one targeted read/search tool now. Reuse cached content instead of rereading it."
+        ? `If the evidence is sufficient, submit the complete typed graph for MAIN runtime to validate and render; if one fact is still missing, call exactly one targeted read/search tool now. Reuse cached content instead of rereading it. ${buildPlanSubmissionGuidance("en")}`
         : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
     ].join("\n");
   }
@@ -69,7 +71,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
     "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
     "不要再次询问许可，也不要只描述接下来要读取什么。",
     workflowMode === "plan"
-      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交由 MAIN runtime 物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取。"
+      ? `如果证据已经足够，直接提交完整 typed graph 交由 MAIN runtime 校验并渲染；如果只缺一个事实，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取。${buildPlanSubmissionGuidance("zh")}`
       : "如果还需要证据，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取，然后进入写入/替换、有限命令、浏览器验证或精确阻塞。",
   ].join("\n");
 }

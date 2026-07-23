@@ -54,7 +54,6 @@ import {
   saveProjectSession,
   setWorkspaceRoot as setWorkspaceRootIpc,
   canonicalizeWorkspacePath,
-  writeFile,
 } from "./lib/ipc";
 import { resolveSessionTranscriptPageMetadata } from "./lib/sessionTranscriptPaging";
 import {
@@ -84,10 +83,9 @@ import {
   shouldRetainGoalDeletionFenceForCurrentProcess,
   type GoalDeletionFence,
 } from "./lib/goalPersistence";
-import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
-import { runAfterNextPaint } from "./lib/uiScheduling";
+import { scheduleRuntimeTask } from "./lib/runtimeScheduling";
 import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
-import { getPlanArtifactTitle, normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
+import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
 import { safeConfirmAsync } from "./lib/safeConfirm";
@@ -110,7 +108,7 @@ import {
   settleSessionAdmissionRestore,
 } from "./store/sessionAdmissionReadiness";
 import {
-  buildWorkspaceComposerIntentDispatchHints,
+  acceptWorkspaceComposerInstruction,
   type WorkspaceComposerIntentSnapshot,
 } from "./store/workspaceComposerIntentAdmission";
 import {
@@ -132,17 +130,6 @@ function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
   return value === "diff" || value === "terminal" || value === "plan"
     ? value
     : "plan";
-}
-
-function getLatestVisibleAgentTextForTurn(taskFlow: TaskBlock[], turnId?: string | null): string {
-  if (!turnId) return "";
-  for (let index = taskFlow.length - 1; index >= 0; index--) {
-    const block = taskFlow[index];
-    if (block.turnId !== turnId || block.type !== "agent" || block.hiddenProcess) continue;
-    const content = String(block.content || "").trim();
-    if (content) return content;
-  }
-  return "";
 }
 
 function archiveReplyOptionsForTurn(taskFlow: TaskBlock[], turnId: string | undefined, selectedOption?: string): TaskBlock[] {
@@ -198,8 +185,8 @@ function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, rea
       ).length
     : 0;
   const content = language === "en"
-    ? `Plan approval was blocked because MAIN could not find or materialize a reviewable .MAIN/plans/plan.md artifact${reason ? ` (${reason})` : ""}. Ask the model to update plan.md, then approve the plan again.`
-    : `已阻止计划批准：MAIN 没有找到可审批的 .MAIN/plans/plan.md，也无法从上一条方案自动物化${reason ? `（${reason}）` : ""}。请先让模型更新 plan.md，再批准执行。`;
+    ? `Plan approval was blocked because MAIN could not find a valid typed .MAIN/plans/plan.md artifact${reason ? ` (${reason})` : ""}. Ask the Plan runtime to update plan.md, then review and approve it again.`
+    : `已阻止计划批准：MAIN 没有找到通过类型契约校验的 .MAIN/plans/plan.md${reason ? `（${reason}）` : ""}。请先让 Plan 运行时更新 plan.md，再审阅并批准执行。`;
 
   appendDebugLog("warn", "ui.quickReply_plan_approval_blocked", {
     sourceTurnId: turnId ?? null,
@@ -234,64 +221,6 @@ function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, rea
         )
       : s.conversationTurns,
   }));
-}
-
-async function materializePlanQuickReplyAndApprove(params: {
-  sourceTurnId?: string;
-  approvalText: string;
-  visiblePlanText: string;
-}): Promise<void> {
-  const state = useAppStore.getState();
-  const sourceTurn = params.sourceTurnId
-    ? state.conversationTurns.find((turn) => turn.id === params.sourceTurnId) || null
-    : null;
-  const materialized = materializePlanArtifactFromVisibleText({
-    visibleText: params.visiblePlanText,
-    planStage: state.planStage,
-    userGoal: sourceTurn?.userPrompt || "",
-    evidence: [
-      state.config.language === "en"
-        ? "The user explicitly approved the visible plan text in ChatArea; materialize that reviewed text before execution."
-        : "用户已在聊天区明确批准当前可见方案；先将这份已审阅文本物化为计划文件再进入执行。",
-    ],
-  });
-
-  if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
-    appendPlanQuickReplyBlockedNotice(params.sourceTurnId, materialized.reason || "quality_gate", params.approvalText);
-    return;
-  }
-
-  try {
-    await writeFile(materialized.path, materialized.content, state.currentWorkspace || undefined);
-    const latest = useAppStore.getState();
-    latest.upsertPlanArtifact({
-      kind: materialized.kind,
-      path: materialized.path,
-      title: getPlanArtifactTitle(materialized.kind, latest.config.language === "en" ? "en" : "zh"),
-      content: materialized.content,
-      updatedAt: Date.now(),
-    });
-    appendDebugLog("info", "ui.quickReply_plan_materialized", {
-      sourceTurnId: params.sourceTurnId ?? null,
-      path: materialized.path,
-      contentChars: materialized.content.length,
-    });
-    useAppStore.setState({
-      ...(params.sourceTurnId ? { currentTurnId: params.sourceTurnId } : {}),
-      input: "",
-      contextMentions: [],
-      attachedFiles: [],
-    });
-    runAfterNextPaint(() => {
-      useAppStore.getState().approvePlan(params.approvalText);
-    });
-  } catch (error) {
-    appendPlanQuickReplyBlockedNotice(
-      params.sourceTurnId,
-      error instanceof Error ? error.message : String(error || "write_failed"),
-      params.approvalText,
-    );
-  }
 }
 
 type MainUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "error";
@@ -1128,7 +1057,7 @@ export default function App() {
   );
   useEffect(() => {
     if (!activeSessionKey || activeSessionScope === GLOBAL_CHAT_KEY) return;
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       useAppStore.getState().dispatchNextWorkspaceInstruction(activeSessionKey);
     });
   }, [
@@ -1890,24 +1819,20 @@ export default function App() {
     const isWorkspaceSession = !!String(state.currentWorkspace || "").trim() &&
       resolveSessionWorkspaceKey(state.currentWorkspace) !== GLOBAL_CHAT_KEY;
     if (isWorkspaceSession && !submitOptions?.queuedUserMessageId) {
-      const dispatchHints = submitOptions?.workspaceComposerIntentSnapshot
-        ? buildWorkspaceComposerIntentDispatchHints({
-            text,
-            language: state.config.language === "en" ? "en" : "zh",
-            snapshot: submitOptions.workspaceComposerIntentSnapshot,
-          })
-        : undefined;
-      const acceptance = await state.acceptWorkspaceInstruction({
+      const acceptance = await acceptWorkspaceComposerInstruction({
         text,
         images,
-        contextMentions: submitOptions?.workspaceSubmissionPayloadSnapshot
-          ? [...submitOptions.workspaceSubmissionPayloadSnapshot.contextMentions]
-          : [...state.contextMentions],
-        attachedFiles: submitOptions?.workspaceSubmissionPayloadSnapshot
-          ? [...submitOptions.workspaceSubmissionPayloadSnapshot.attachedFiles]
-          : [...state.attachedFiles],
-        source: "composer",
-        ...(dispatchHints ? { dispatchHints } : {}),
+        language: state.config.language === "en" ? "en" : "zh",
+        intentSnapshot: submitOptions?.workspaceComposerIntentSnapshot,
+        payloadSnapshot: {
+          contextMentions: submitOptions?.workspaceSubmissionPayloadSnapshot
+            ? submitOptions.workspaceSubmissionPayloadSnapshot.contextMentions
+            : state.contextMentions,
+          attachedFiles: submitOptions?.workspaceSubmissionPayloadSnapshot
+            ? submitOptions.workspaceSubmissionPayloadSnapshot.attachedFiles
+            : state.attachedFiles,
+        },
+        acceptWorkspaceInstruction: state.acceptWorkspaceInstruction,
       });
       appendDebugLog(acceptance.accepted ? "info" : "warn", "ui.workspaceInstruction", {
         phase: acceptance.accepted ? "accepted" : "rejected",
@@ -1981,7 +1906,7 @@ export default function App() {
       agentMessages: state.agentMessages.length,
     });
 
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       const latest = useAppStore.getState();
       const started = latest.sendMessage(text, images, {
         contextMentionsSnapshot,
@@ -2091,19 +2016,6 @@ export default function App() {
       optionAction: optionAction ?? null,
     });
     const sourceIntent = resolveConversationTurnIntent(sourceTurn);
-    const sourceVisiblePlanText = getLatestVisibleAgentTextForTurn(state.taskFlow, sourceTurn?.id);
-    const sourcePlanMaterialization = sourceVisiblePlanText
-      ? materializePlanArtifactFromVisibleText({
-          visibleText: sourceVisiblePlanText,
-          planStage: state.planStage,
-          userGoal: sourceTurn?.userPrompt || "",
-          evidence: [
-            state.config.language === "en"
-              ? "The user can approve this visible plan text from ChatArea; use it as review evidence for quick-reply materialization."
-              : "用户可以从聊天区批准这份可见方案；将其作为 quick reply 物化的审阅证据。",
-          ],
-        })
-      : { ok: false, reason: "missing_visible_plan" };
     const planApprovalQuickReplyAction = resolvePlanApprovalQuickReplyAction({
       text,
       optionAction,
@@ -2111,7 +2023,6 @@ export default function App() {
       isPlanApproved: state.isPlanApproved,
       planArtifacts: state.planArtifacts,
       planStage: state.planStage,
-      sourceHasMaterializablePlan: sourcePlanMaterialization.ok,
     });
 
     if (planApprovalQuickReplyAction === "approve_existing_plan") {
@@ -2128,37 +2039,14 @@ export default function App() {
         contextMentions: [],
         attachedFiles: [],
       });
-      runAfterNextPaint(() => {
+      scheduleRuntimeTask(() => {
         useAppStore.getState().approvePlan(text);
       });
       return;
     }
 
-    if (planApprovalQuickReplyAction === "materialize_then_approve") {
-      appendDebugLog("info", "ui.quickReply_plan_materialize_then_approve", {
-        text,
-        sourceTurnId,
-        currentTurnId: state.currentTurnId,
-        visiblePlanChars: sourceVisiblePlanText.length,
-      });
-      useAppStore.setState({
-        ...(sourceTurnId ? { currentTurnId: sourceTurnId } : {}),
-        input: "",
-        contextMentions: [],
-        attachedFiles: [],
-      });
-      runAfterNextPaint(() => {
-        void materializePlanQuickReplyAndApprove({
-          sourceTurnId,
-          approvalText: text,
-          visiblePlanText: sourceVisiblePlanText,
-        });
-      });
-      return;
-    }
-
     if (planApprovalQuickReplyAction === "block_missing_plan_artifact") {
-      appendPlanQuickReplyBlockedNotice(sourceTurnId, sourcePlanMaterialization.reason || "missing_plan_artifact", text);
+      appendPlanQuickReplyBlockedNotice(sourceTurnId, "typed_plan_artifact_missing_or_invalid", text);
       return;
     }
 
@@ -2326,7 +2214,7 @@ export default function App() {
         : {}),
     });
 
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       useAppStore.getState().sendMessage(text, undefined, {
         ...(sendOptions || {}),
         submissionOriginSessionKey,
@@ -3575,7 +3463,7 @@ export default function App() {
     } else {
       ensureFeishuRemoteSession(message);
     }
-    await new Promise<void>((resolve) => runAfterNextPaint(resolve));
+    await new Promise<void>((resolve) => scheduleRuntimeTask(resolve));
     const latest = useAppStore.getState();
     const intentOverride = resolveFeishuRemoteIntentOverride(message.text);
     const acceptance = await latest.acceptWorkspaceInstruction({

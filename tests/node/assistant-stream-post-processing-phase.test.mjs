@@ -20,12 +20,17 @@ test("assistant stream post-processing phase owns recovery and normalization ord
 
   assert.match(phaseSource, /export async function handleAssistantStreamPostProcessingPhase/);
 
+  const consumePlanSubmission = indexOfRequired(
+    phaseSource,
+    /consumeNativePlanCandidateSubmission\(\{/,
+  );
   const processResponse = indexOfRequired(phaseSource, /processAssistantStreamResponse\(\{/);
   const reasoningRecovery = indexOfRequired(phaseSource, /handleReasoningDominatedNoToolRecovery\(\{/);
   const emptyRecovery = indexOfRequired(phaseSource, /handleEmptyResponseRecovery\(\{/);
   const normalizeToolCall = indexOfRequired(phaseSource, /normalizeToolCallToExecute\(\{/);
   const finalTextOnly = indexOfRequired(phaseSource, /handleFinalTextOnlyToolCalls\(\{/);
 
+  assert.ok(consumePlanSubmission < processResponse);
   assert.ok(processResponse < reasoningRecovery);
   assert.ok(reasoningRecovery < emptyRecovery);
   assert.ok(emptyRecovery < normalizeToolCall);

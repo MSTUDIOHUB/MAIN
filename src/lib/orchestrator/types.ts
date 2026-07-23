@@ -20,6 +20,7 @@ import {
 } from "../executeRecoveryTools";
 import { type MainThreadEvent } from "../turnEvents";
 import { type PlanMaterializationSource } from "../planMaterialization";
+import type { PlanCandidateV2 } from "../planContract";
 import { type ProgressNarration } from "../progressNarration";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "../ipc";
 import type { ToolRiskLevel } from "../toolCapabilities";
@@ -33,6 +34,10 @@ import type {
   WaitSubagentsRequest,
   WaitSubagentsResult,
 } from "../subagents";
+import type { PreferredDelegationScopeContract } from "../preferredDelegationScopes";
+import type { TurnRuntimeCheckpointV1 } from "../turnRuntimeCheckpoint";
+import type { SubagentClosureReceiptLedger } from "../subagentClosureReceipts";
+import type { VisualContextDeliveryState } from "../visualContext";
 export type {
   AgentLoopOutcome,
   AgentLoopOutcomeStatus,
@@ -62,6 +67,10 @@ export interface ImageUrlContentPart {
 export interface AgentMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | ContentPart[];
+  /** Runtime-only Turn owner for exact multimodal transport receipts. */
+  runtimeTurnId?: string;
+  runtimeVisualImageParts?: number;
+  runtimeVisualPayloadDigest?: string;
   tool_calls?: ToolCallInMessage[];
   tool_call_id?: string;
   reasoning_content?: string;
@@ -90,6 +99,10 @@ export interface ToolErrorLifecycleMeta {
   executionName?: string;
   /** Runtime-owned catalog provenance for the resolved invocation. */
   catalogIdentity?: ToolCatalogIdentity;
+  /** Runtime-owned final arguments after compatibility normalization. */
+  executedArgs?: Record<string, unknown>;
+  /** Exact structured payload when the visible error has been compacted. */
+  evidenceResult?: string;
   /** Observed workspace mutation even when the executor ultimately failed. */
   diff?: ToolDiffPreview;
   workspaceMutationEvidence?: {
@@ -166,7 +179,15 @@ export interface OrchestratorCallbacks {
   getIsApprovedPlanExecutionTransitionPending?: () => boolean;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
-  onGuidanceInjected?: (text: string) => void;
+  onGuidanceInjected?: (guidance: { id: string; text: string; turnId: string | null }) => void;
+  tryAcquireRunCompletionFence?: (input: {
+    completionCandidate: boolean;
+    lateGuidanceContinuationsUsed: number;
+  }) => import("../runtimeGuidanceCompletion").RuntimeGuidanceCompletionFenceDecision;
+  onLateGuidanceContinuation?: (input: {
+    guidanceId: string;
+    iteration: number;
+  }) => void;
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
@@ -195,6 +216,21 @@ export interface OrchestratorCallbacks {
     supportingEvidenceIds: string[];
   };
   getPendingSubagentIds?: () => string[];
+  /** Exact owner-fenced checkpoint for this Turn, never a cross-Session fallback. */
+  getTurnRuntimeCheckpoint?: () => TurnRuntimeCheckpointV1 | null;
+  /** Independent runtime-issued closure receipts used to restore child evidence. */
+  getSubagentClosureReceiptLedger?: () => SubagentClosureReceiptLedger | null;
+  /** Persist collaboration progress before the loop advances past its boundary. */
+  publishTurnRuntimePlanningCheckpoint?: (input: {
+    preferredDelegationScopeContract: PreferredDelegationScopeContract | null;
+    recentPlanToolActivity: PlanToolActivitySummary[];
+    updatedAt: number;
+  }) => void | Promise<void>;
+  /** Persist exact-Turn visual transport/recognition state without image bytes. */
+  publishTurnRuntimeVisualContextCheckpoint?: (input: {
+    visualContext: VisualContextDeliveryState;
+    updatedAt: number;
+  }) => void | Promise<void>;
   runSubagent?: (
     request: SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
@@ -258,7 +294,12 @@ export interface OrchestratorCallbacks {
     reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan",
     progress?: Partial<PlanExecutionProgressUpdate>,
   ) => void;
-  onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
+  onPlanArtifactUpdated: (
+    path: string,
+    content: string,
+    kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
+    metadata?: { candidate?: PlanCandidateV2 },
+  ) => void;
   onPlanArtifactRejected?: (
     path: string,
     kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
@@ -341,6 +382,8 @@ export interface OrchestratorCallbacks {
       toolCallId?: string;
       executionName?: string;
       catalogIdentity?: ToolCatalogIdentity;
+      /** Runtime-owned final arguments after compatibility normalization. */
+      executedArgs?: Record<string, unknown>;
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
@@ -378,12 +421,24 @@ export interface FetchLLMStreamOptions {
   workflowMode?: string;
   runtimeIntent?: string;
   responseFormat?: Record<string, unknown>;
+  visualTransportBinding?: import("../visualContext").VisualTransportRequestBinding;
 }
 
 export interface ToolCallToExecute {
   id: string;
   name: string;
   arguments: string;
+  /**
+   * Runtime-only Plan commit authority prepared before a model-requested disk
+   * write. It is never serialized back to the provider or reconstructed from
+   * tool-result prose.
+   */
+  preparedPlanArtifact?: {
+    path: string;
+    content: string;
+    evidenceBundleHash: string;
+    candidate: PlanCandidateV2;
+  };
 }
 
 export interface ToolExecutionResult {

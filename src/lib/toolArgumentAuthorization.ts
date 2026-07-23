@@ -92,6 +92,7 @@ export function resolveToolArgumentAuthorization(input: {
   planTasks: PlanTask[];
   subagentScope?: SubagentExecutionScope | null;
   threadId?: string;
+  sessionEpoch?: string;
 }): ToolArgumentAuthorizationDecision {
   const approvedPlanCommandScope = resolveApprovedPlanCommandScope({
     isPlanApproved: input.isPlanApproved,
@@ -123,6 +124,7 @@ export function resolveToolArgumentAuthorization(input: {
       if (!scopeTarget) continue;
       const conflict = findSubagentScopeConflict({
         threadId: input.threadId,
+        sessionEpoch: input.sessionEpoch,
         targetPath: scopeTarget,
       });
       if (!conflict) continue;

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
 import path from "node:path";
 
 const endpoint = String(
@@ -12,23 +13,61 @@ const authHeaders = apiKey
     }
   : {};
 
-let loadedModelIds = [];
-try {
+async function readSingleModelStatus(expectedModelId, phase) {
   const statusResponse = await fetch(`${endpoint}/models/status`, {
     headers: authHeaders,
     signal: AbortSignal.timeout(5_000),
   });
   if (!statusResponse.ok) throw new Error(`status HTTP ${statusResponse.status}`);
   const status = await statusResponse.json();
-  loadedModelIds = Array.isArray(status?.models)
-    ? status.models
-        .filter((model) => model?.loaded === true && model?.is_loading !== true)
-        .map((model) => String(model?.id || "").trim())
-        .filter(Boolean)
-    : [];
+  const statusModels = Array.isArray(status?.models) ? status.models : [];
+  const loadedModelIds = statusModels
+    .filter((model) => model?.loaded === true && model?.is_loading !== true)
+    .map((model) => String(model?.id || "").trim())
+    .filter(Boolean);
+  const transitioningModelIds = statusModels
+    .filter((model) => model?.is_loading === true)
+    .map((model) => String(model?.id || "").trim())
+    .filter(Boolean);
   if (loadedModelIds.length === 0) {
     throw new Error("no fully loaded model; refusing to trigger an implicit large-model load");
   }
+  if (
+    loadedModelIds.length !== 1 ||
+    Number(status?.loaded_count) !== 1 ||
+    transitioningModelIds.length > 0
+  ) {
+    throw new Error(
+      `single-model safety gate failed (loaded=${loadedModelIds.join(",") || "none"}; ` +
+      `transitioning=${transitioningModelIds.join(",") || "none"}); refusing to validate with overlapping model memory`,
+    );
+  }
+  if (expectedModelId && loadedModelIds[0] !== expectedModelId) {
+    throw new Error(
+      `${phase} model identity changed (expected=${expectedModelId}; loaded=${loadedModelIds[0] || "none"})`,
+    );
+  }
+  return { loadedModelIds, transitioningModelIds };
+}
+
+async function readSingleModelStatusWithRetry(expectedModelId, phase) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await readSingleModelStatus(expectedModelId, phase);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    }
+  }
+  throw lastError;
+}
+
+let initialStatus;
+try {
+  initialStatus = await readSingleModelStatusWithRetry(undefined, "preflight");
 
   const modelsResponse = await fetch(`${endpoint}/models`, {
     headers: authHeaders,
@@ -40,11 +79,20 @@ try {
   process.exit(2);
 }
 
+const loadedModelIds = initialStatus.loadedModelIds;
+
 const requestedModelIds = String(process.env.OMLX_MODELS || "")
   .split(",")
   .map((model) => model.trim())
   .filter(Boolean);
 const selectedModelIds = requestedModelIds.length > 0 ? requestedModelIds : [loadedModelIds[0]];
+if (selectedModelIds.length !== 1) {
+  console.error(
+    `[real-omlx-plan] 验收未完成：一次只能指定一个模型（收到 ${selectedModelIds.length} 个）。` +
+    "请先完全卸载当前模型、确认 loaded_count=0，再加载下一个模型。",
+  );
+  process.exit(2);
+}
 const unloadedRequestedModels = selectedModelIds.filter((model) => !loadedModelIds.includes(model));
 if (unloadedRequestedModels.length > 0) {
   console.error(
@@ -52,6 +100,32 @@ if (unloadedRequestedModels.length > 0) {
     `当前已加载：${loadedModelIds.join(", ")}。为避免隐式加载第二个大模型，本脚本不会继续。`,
   );
   process.exit(2);
+}
+try {
+  await readSingleModelStatusWithRetry(selectedModelIds[0], "preflight");
+} catch (error) {
+  console.error(
+    `[real-omlx-plan] 验收未完成：启动 Playwright 前模型状态发生变化。${error instanceof Error ? error.message : String(error)}`,
+  );
+  process.exit(2);
+}
+
+const preparedWorkspace = String(process.env.REAL_OMLX_WORKSPACE || "").trim();
+if (preparedWorkspace) {
+  try {
+    const workspaceStat = await fs.stat(preparedWorkspace);
+    if (!workspaceStat.isDirectory()) throw new Error("path is not a directory");
+    const workspaceEntries = await fs.readdir(preparedWorkspace);
+    if (workspaceEntries.length === 0) {
+      throw new Error("directory is empty");
+    }
+  } catch (error) {
+    console.error(
+      `[real-omlx-plan] 验收未完成：REAL_OMLX_WORKSPACE 必须是调用方预先复制好的非空工作区（${preparedWorkspace}）。` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(2);
+  }
 }
 console.log(`[real-omlx-plan] 使用已加载模型：${selectedModelIds.join(", ")}（加载状态未改变）`);
 
@@ -71,6 +145,16 @@ const result = spawnSync(
     },
   },
 );
+
+try {
+  await readSingleModelStatusWithRetry(selectedModelIds[0], "postflight");
+  console.log(`[real-omlx-plan] 验收后模型状态未改变：${selectedModelIds[0]} 仍是唯一已加载模型`);
+} catch (error) {
+  console.error(
+    `[real-omlx-plan] 验收未完成：验收后单模型安全检查失败。${error instanceof Error ? error.message : String(error)}`,
+  );
+  process.exit(2);
+}
 
 if (result.error) {
   console.error(`[real-omlx-plan] 验收未完成：${result.error.message}`);

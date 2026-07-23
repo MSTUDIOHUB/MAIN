@@ -65,7 +65,6 @@ export function resolveExecuteNoToolStrategyAtBoundary(input: {
 export function applyExecuteNoToolStrategyPivot(input: {
   callbacks: OrchestratorCallbacks;
   decision: Extract<ExecuteNoProgressStrategyDecision, { action: "continue_with_pivot" }>;
-  forceXmlTools: boolean;
   assistantMsgId?: string;
   iteration: number;
   cause: string;
@@ -76,14 +75,6 @@ export function applyExecuteNoToolStrategyPivot(input: {
       input.callbacks.onStreamToken("__ESCALATION_RESET__:", input.assistantMsgId);
     }
     input.callbacks.onStatusChange("running");
-  }
-  if (
-    input.decision.strategy === "alternate_capability_reframe" &&
-    !input.forceXmlTools
-  ) {
-    input.callbacks.onProviderCompatibilityFallback?.(
-      "execute_no_progress_alternate_protocol",
-    );
   }
   input.callbacks.appendMessage({ role: "user", content: input.decision.prompt });
   logAgentEvent("execute_no_progress_strategy_pivot", {
@@ -197,7 +188,6 @@ export function handleExecuteNoToolRecovery(input: {
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
-          forceXmlTools,
           assistantMsgId,
           iteration,
           cause: input.protocolViolation,
@@ -286,7 +276,6 @@ export function handleExecuteNoToolRecovery(input: {
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
-          forceXmlTools,
           assistantMsgId,
           iteration,
           cause: "execute_xml_text_without_action",

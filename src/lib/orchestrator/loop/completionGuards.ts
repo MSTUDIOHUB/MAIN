@@ -1,8 +1,8 @@
 import { buildEffectiveTurnContract, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
 import {
-  buildPlanTaskEvidenceAudit,
   type PlanExecutionEvidenceEntry,
 } from "../../workflowModels";
+import { evaluateApprovedPlanExecution } from "../../planExecutionEvaluation";
 import {
   buildApprovedPlanNoToolPauseMessage,
   formatPlanAuditRemainingTasks,
@@ -248,12 +248,50 @@ export function resolveNonActionableStopOutcome(
   options: { sawExecutionEvidence?: boolean } = {},
 ): AgentLoopOutcome {
   const recoveryReason = progress?.recoveryReason || reason;
+  if (recoveryReason === "plan_candidate_repair_budget_exhausted") {
+    return {
+      status: "paused",
+      pauseKind: "action_required",
+      reason: recoveryReason,
+    };
+  }
+  if (
+    progress?.phase === "paused" ||
+    isRecoverableRuntimePauseReason(recoveryReason)
+  ) {
+    return {
+      status: "paused",
+      pauseKind: "recoverable",
+      reason: recoveryReason,
+    };
+  }
   const resultKind = reason === "no_output"
     ? "error" as const
     : options.sawExecutionEvidence
     ? "partial" as const
     : "blocked" as const;
   return { status: "completed", resultKind, reason: recoveryReason };
+}
+
+/**
+ * These boundaries preserve a resumable runtime checkpoint. Keep the mapping
+ * provider-, model-, language-, and project-neutral: the runtime reason owns
+ * the lifecycle meaning, not the prose that happened to accompany it.
+ */
+export function isRecoverableRuntimePauseReason(reason: string): boolean {
+  return new Set([
+    "plan_generation_failed",
+    "plan_required_tool_protocol_violation",
+    "stream_no_visible_progress_timeout",
+    "stream_max_elapsed_timeout",
+    "max_iterations_auto_resume",
+    "max_iterations_boundary",
+    "plan_max_iterations_checkpoint",
+    "execute_max_iterations_checkpoint",
+    "chat_max_iterations_strategy_exhausted",
+    "execute_recovery_no_progress_limit",
+    "execute_no_progress_batch_loop",
+  ]).has(String(reason || "").trim());
 }
 
 export function resolveFinalTurnContractForCompletion(input: {
@@ -305,30 +343,17 @@ export function runApprovedPlanCompletionGuard(input: {
     };
   }
 
-  const audit = buildPlanTaskEvidenceAudit({
+  const evaluation = evaluateApprovedPlanExecution({
     tasks: callbacks.getPlanTasks(),
     evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-    highlightNext: true,
+    activeRecovery: input.executeRecoveryState || null,
+    turnId: callbacks.getCurrentTurnId?.() || null,
+    commandDirective: callbacks.getCommandDirective?.() || null,
   });
-  const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
-    ledger: callbacks.getPlanExecutionEvidenceLedger(),
-    validationExpected: true,
-    transactionId: callbacks.getCurrentTurnId?.() || null,
-    requiredCommandEvidence: resolveCommandEvidenceRequirements({
-      tasks: callbacks.getPlanTasks(),
-      commandDirective: callbacks.getCommandDirective?.() || null,
-    }),
-  });
-  const activeRecoveryPending = Boolean(
-    input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",
-  );
-  if (
-    audit.totalCount > 0 &&
-    (audit.acceptedCompletion || callbacks.getPlanStage?.() === "completed") &&
-    sawExecutionEvidence &&
-    evidenceClosureAudit.completionAllowed &&
-    !activeRecoveryPending
-  ) {
+  const audit = evaluation.taskAudit;
+  const evidenceClosureAudit = evaluation.evidenceClosure;
+  const activeRecoveryPending = evaluation.activeRecoveryPending;
+  if (evaluation.completionAllowed) {
     return null;
   }
 
@@ -365,6 +390,7 @@ export function runApprovedPlanCompletionGuard(input: {
     unresolvedFailures: evidenceClosureAudit.unresolvedFailureCount,
     activeRecoveryMode: input.executeRecoveryState?.mode || "normal",
     activeRecoveryNextCapability: recoveryGap?.nextRequiredCapability || null,
+    completionGap: evaluation.gap,
   });
   callbacks.onNonActionableStop(
     closureGap?.message || buildApprovedPlanNoToolPauseMessage(

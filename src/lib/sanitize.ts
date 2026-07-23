@@ -180,10 +180,44 @@ export function stripUserOptionsProtocol(text: string): string {
   return out.replace(/<\/?\s*(?:user_options|option)\b[^>\n]*>/gi, "");
 }
 
+/**
+ * Typed Plan candidates are an internal runtime protocol, not assistant prose.
+ * Remove complete and in-flight envelopes as a block so their JSON can never
+ * leak into chat, progress capsules, or completion summaries.
+ */
+export function stripTypedPlanCandidateProtocol(text: string): string {
+  if (!text) return "";
+  const lower = text.toLowerCase();
+  const openPrefix = "<plan_candidate";
+  const closeToken = "</plan_candidate>";
+  let result = "";
+  let cursor = 0;
+  while (cursor < text.length) {
+    let openIndex = lower.indexOf(openPrefix, cursor);
+    while (openIndex >= 0) {
+      const next = lower[openIndex + openPrefix.length] || "";
+      if (!/[a-z0-9_-]/i.test(next)) break;
+      openIndex = lower.indexOf(openPrefix, openIndex + openPrefix.length);
+    }
+    if (openIndex < 0) {
+      result += text.slice(cursor);
+      break;
+    }
+    result += text.slice(cursor, openIndex);
+    const openEnd = text.indexOf(">", openIndex);
+    if (openEnd < 0) break;
+    const closeIndex = lower.indexOf(closeToken, openEnd + 1);
+    if (closeIndex < 0) break;
+    cursor = closeIndex + closeToken.length;
+  }
+  return result;
+}
+
 export function stripModelProtocolMarkers(text: string): string {
   if (!text) return "";
 
-  let out = stripUserOptionsProtocol(text);
+  let out = stripTypedPlanCandidateProtocol(text);
+  out = stripUserOptionsProtocol(out);
   out = out.replace(PROPOSED_PLAN_TAG_RE, "");
   out = out
     .split(/\r?\n/)

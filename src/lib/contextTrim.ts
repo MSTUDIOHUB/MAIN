@@ -20,6 +20,10 @@ import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
 export interface TrimMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | TrimContentPart[];
+  /** Runtime-only Turn owner; persistence removes it together with image bytes. */
+  runtimeTurnId?: string;
+  runtimeVisualImageParts?: number;
+  runtimeVisualPayloadDigest?: string;
   tool_calls?: unknown[];
   tool_call_id?: string;
   reasoning_content?: string;

@@ -466,6 +466,25 @@ async function prepareFormalPlanReview(
   await expect(page.getByTestId("plan-approve-button")).toBeVisible();
 }
 
+async function installTauriSessionPersistenceMock(page: Page) {
+  await page.addInitScript(() => {
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return 1;
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "save_project_session") return args?.session ?? null;
+      if (cmd === "list_project_sessions") return [];
+      return null;
+    };
+  });
+}
+
 test("typed Plan review Capsule preserves the exact request and artifact identity", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await prepareFormalPlanReview(page, {
@@ -498,6 +517,48 @@ test("typed Plan review Capsule preserves the exact request and artifact identit
       requestId: "request-e2e-plan-review",
       turnId: "e2e-execution-capsule-panel-stability-turn",
     });
+});
+
+test("pending Plan review makes Composer Queue-only and Enter cannot start a second Run", async ({ page }) => {
+  await installTauriSessionPersistenceMock(page);
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await prepareFormalPlanReview(page, { reset: false });
+
+  const textarea = page.getByTestId("composer-textarea");
+  const queuedInstruction = "把验证步骤补充到下一回合，但不要打断当前计划审核";
+  await textarea.fill(queuedInstruction);
+
+  await expect(page.getByTestId("composer-queue-button")).toBeVisible();
+  await expect(page.getByTestId("composer-guidance-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-stop-button")).toHaveCount(0);
+
+  await textarea.press("Enter");
+  await expect(textarea).toHaveValue("");
+  await expect(page.getByTestId("plan-review-capsule")).toBeVisible();
+  await expect(page.getByTestId("composer-queued-message")).toContainText(queuedInstruction);
+
+  await expect.poll(async () => page.evaluate((expectedText) => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      agentStatus: snapshot?.agentStatus ?? null,
+      activeActionRequestKind: snapshot?.activeActionRequestKind ?? null,
+      isPlanApproved: snapshot?.isPlanApproved ?? null,
+      executionChildTurns: snapshot?.executionChildTurns ?? null,
+      queued: snapshot?.workspaceTurnQueueEntries?.map((entry: any) => ({
+        status: entry.status,
+        text: entry.text,
+      })) ?? null,
+      expectedText,
+    };
+  }, queuedInstruction)).toEqual({
+    agentStatus: "pending_review",
+    activeActionRequestKind: "plan_review",
+    isPlanApproved: false,
+    executionChildTurns: 0,
+    queued: [{ status: "queued", text: queuedInstruction }],
+    expectedText: queuedInstruction,
+  });
 });
 
 const panelModes = ["plan", "diff", "terminal", "closed"] as const;
@@ -681,6 +742,7 @@ test("revoked plan approval cannot be executed by a stale store fallback", async
 });
 
 test("busy plan resume queues the visible request without replacing the active owner", async ({ page }) => {
+  await installTauriSessionPersistenceMock(page);
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
 
   const result = await page.evaluate(() =>

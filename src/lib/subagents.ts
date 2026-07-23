@@ -12,6 +12,13 @@ import {
   normalizeWorkspacePathIdentity,
   relativizeToWorkspacePath,
 } from "./workspacePaths";
+import {
+  buildPreferredDelegationScopeFingerprint,
+  getPreferredDelegationScopeProgress,
+  preferredDelegationScopeContractMatchesWave,
+  type PreferredDelegationScopeCandidate,
+  type PreferredDelegationScopeContract,
+} from "./preferredDelegationScopes";
 
 export type SubagentStatus =
   | "queued"
@@ -44,6 +51,42 @@ export interface SubagentProgress {
   completedToolCalls?: number;
 }
 
+export const SUBAGENT_CLOSURE_SCHEMA_VERSION = 1 as const;
+
+export interface SubagentClosureOwner {
+  agentKind: "subagent";
+  threadId: string;
+  parentTurnId: string;
+  subagentId: string;
+  runId: string;
+  parentRunId: string | null;
+}
+
+/**
+ * Runtime-authored closure truth for one controlled child run. The model's
+ * report remains display-only and must never be parsed to manufacture this
+ * contract or to promote a partial handoff to completed.
+ */
+export interface SubagentClosureEnvelope {
+  schemaVersion: typeof SUBAGENT_CLOSURE_SCHEMA_VERSION;
+  owner: SubagentClosureOwner;
+  scopeKey: string;
+  status: Extract<SubagentStatus, "completed" | "blocked" | "degraded" | "failed" | "canceled">;
+  state: "satisfied" | "partial" | "blocked";
+  /** Null is the sole completed representation; incomplete closures carry runtime-owned work. */
+  remainingWork: string | null;
+  observationCount: number;
+  substantiveEvidenceCount: number;
+  acceptedEvidenceToolCallIds: string[];
+  requiredPaths: string[];
+  coveredPaths: string[];
+  failedPaths: string[];
+  uncoveredPaths: string[];
+  /** Stable runtime code. `reason` is presentation detail and is not parsed. */
+  reasonCode: string;
+  reason: string;
+}
+
 export interface SubagentRunSnapshot {
   id: string;
   parentTurnId: string;
@@ -55,6 +98,9 @@ export interface SubagentRunSnapshot {
   scope?: string;
   allowedPaths?: string[];
   expectedOutput?: string;
+  /** Fresh runtime identity; absent only on persisted pre-closure-contract records. */
+  runId?: string;
+  parentRunId?: string | null;
   status: SubagentStatus;
   profile: "local" | "cloud";
   provider: string;
@@ -71,6 +117,7 @@ export interface SubagentRunSnapshot {
   observationCount?: number;
   substantiveEvidenceCount?: number;
   closureState?: "satisfied" | "partial" | "blocked";
+  closureAudit?: SubagentClosureEnvelope;
   remainingWork?: string;
   parentHandoff?: string;
   progress?: SubagentProgress;
@@ -89,6 +136,7 @@ export type SubagentRunPatch = Partial<Pick<
   | "observationCount"
   | "substantiveEvidenceCount"
   | "closureState"
+  | "closureAudit"
   | "remainingWork"
   | "parentHandoff"
   | "progress"
@@ -164,7 +212,11 @@ export interface DelegationDecision {
 export type PreferredDelegationRequirementReason =
   | "required"
   | "not_preferred"
-  | "already_satisfied"
+  | "all_required_scopes_consumed"
+  | "awaiting_scope_join"
+  | "scope_creation_capacity_reached"
+  | "runtime_materialization_failed"
+  | "evidence_topology_open"
   | "insufficient_parallel_scope"
   | "spawn_unavailable"
   | DelegationDecisionReason;
@@ -173,6 +225,16 @@ export interface PreferredDelegationRequirement {
   required: boolean;
   reason: PreferredDelegationRequirementReason;
   candidateScopeKeys: string[];
+  /** Frozen runtime-owned scopes that must each cross spawn -> join -> consume. */
+  requiredScopes: import("./preferredDelegationScopes").PreferredDelegationScopeCandidate[];
+  /** Exact scopes eligible for the next bounded spawn batch. */
+  remainingScopes: import("./preferredDelegationScopes").PreferredDelegationScopeCandidate[];
+  contractOpen: boolean;
+  consumedScopeKeys: string[];
+  /** Runtime phase that owns this bounded collaboration wave. */
+  lifecyclePhase: DelegationRuntimePhase;
+  /** Concrete path-scope identity used to prevent duplicate waves. */
+  scopeFingerprint: string;
 }
 
 export type SpawnSubagentResult =
@@ -181,6 +243,8 @@ export type SpawnSubagentResult =
       name: string;
       status: "queued" | "running";
       scopeKey: string;
+      /** Runtime-normalized authorization roots used to settle scope ownership. */
+      allowedPaths: string[];
     }
   | {
       subagentId: null;
@@ -231,6 +295,19 @@ export interface SubagentEvidenceItem {
     contentChars: number;
     negative: boolean;
     substantive: boolean;
+    /** Exact paths parsed from a runtime-owned search/reference result. */
+    observedTargetRefs?: string[];
+    /** Exact syntax occurrences parsed from that result; child prose cannot author these. */
+    observedOccurrences?: Array<{
+      targetRef: string;
+      anchorLine: number;
+      startLine: number;
+      endLine: number;
+      role?: string;
+      syntaxKind?: string;
+    }>;
+    /** Exact symbol used by the runtime-owned reference query. */
+    queryRef?: string;
   };
   provenance: SubagentEvidenceProvenance;
 }
@@ -295,17 +372,8 @@ export interface SubagentResultEnvelope {
   /** Child-authored synthesis is a hypothesis; only provenance-backed evidence is trusted. */
   summaryTrust: "unverified_hypothesis";
   evidence: SubagentEvidenceItem[];
-  closureAudit?: {
-    state: "satisfied" | "partial" | "blocked";
-    observationCount: number;
-    substantiveEvidenceCount: number;
-    acceptedEvidenceToolCallIds: string[];
-    requiredPaths: string[];
-    coveredPaths: string[];
-    failedPaths: string[];
-    uncoveredPaths: string[];
-    reason: string;
-  };
+  /** Sole runtime authority for whether this child scope is closed. */
+  closureAudit: SubagentClosureEnvelope;
   blocker?: string;
   remainingWork?: string;
   /** Work that is intentionally outside the child's read-only ownership. */
@@ -453,9 +521,10 @@ export function normalizeIndependentDelegationScopeKeys(values: unknown[]): stri
 }
 
 /**
- * Provider-neutral delegation admission. The runtime exposes delegation only
- * while independent read-only work can still improve context or diagnosis;
- * model/provider identity never participates in the decision.
+ * Provider-neutral delegation admission. Adaptive fan-out remains an initial
+ * context optimization. An explicit preferred lifecycle may also open bounded
+ * mutation/validation review waves after decisive runtime evidence; model and
+ * provider identity never participate in the decision.
  */
 export function resolveDelegationDecision(input: {
   preference?: SubagentDelegationPreference;
@@ -498,7 +567,14 @@ export function resolveDelegationDecision(input: {
   }
   if (!input.hasWorkspace) return decision("deny", "workspace_unavailable");
   if (preference === "forbidden") return decision("deny", "user_forbidden");
-  if (input.phase !== "context" && input.phase !== "diagnostic") {
+  const preferredLifecyclePhase =
+    preference === "preferred" &&
+    (input.phase === "mutation" || input.phase === "validation");
+  if (
+    input.phase !== "context" &&
+    input.phase !== "diagnostic" &&
+    !preferredLifecyclePhase
+  ) {
     return decision("defer", "phase_not_eligible");
   }
   if (pendingSubagentCount > 0) {
@@ -557,59 +633,166 @@ export function resolveDelegationDecision(input: {
 export function resolvePreferredDelegationRequirement(input: {
   decision: DelegationDecision;
   independentScopeKeys: string[];
-  alreadySatisfied: boolean;
+  scopeCandidates?: PreferredDelegationScopeCandidate[];
+  scopeContract?: PreferredDelegationScopeContract | null;
+  /** False while a Plan still has typed evidence owners left to discover. */
+  activationAllowed?: boolean;
+  /** Process-local scheduler failures already returned to the parent runtime. */
+  blockedScopeKeys?: Iterable<string>;
   spawnToolAvailable: boolean;
 }): PreferredDelegationRequirement {
-  const candidateScopeKeys = collectIndependentDelegationScopes(
+  const fallbackScopes = collectIndependentDelegationScopes(
     input.independentScopeKeys,
-  ).slice(0, 8).map((scope) => scope.displayPath);
+  ).slice(0, 8).map((scope) => ({
+    scopeKey: scope.displayPath,
+    allowedPaths: [scope.displayPath],
+  }));
+  const initialScopes = (input.scopeCandidates?.length
+    ? input.scopeCandidates
+    : fallbackScopes).map((scope) => ({
+      scopeKey: scope.scopeKey,
+      allowedPaths: [...scope.allowedPaths],
+    }));
+  const storedProgress = getPreferredDelegationScopeProgress(input.scopeContract || null);
+  const scopeContractMatchesWave = preferredDelegationScopeContractMatchesWave({
+    contract: input.scopeContract || null,
+    lifecyclePhase: input.decision.phase,
+    scopes: initialScopes,
+  });
+  // An active wave must always be joined before phase rebasing. A settled wave
+  // belongs only to its phase+scope fingerprint and cannot permanently close
+  // collaboration for the rest of the parent Turn.
+  const effectiveScopeContract =
+    storedProgress.activeScopeKeys.length > 0 ||
+    storedProgress.open ||
+    scopeContractMatchesWave
+      ? input.scopeContract || null
+      : null;
+  const progress = getPreferredDelegationScopeProgress(effectiveScopeContract);
+  const requiredScopes = effectiveScopeContract?.requiredScopes || initialScopes;
+  const rawRemainingScopes = effectiveScopeContract
+    ? progress.remainingScopes.slice(0, progress.creationCapacityRemaining)
+    : initialScopes;
+  const blockedScopeKeys = new Set(
+    [...(
+      input.scopeContract && !effectiveScopeContract
+        ? []
+        : input.blockedScopeKeys || []
+    )].map((value) => String(value || "").trim()),
+  );
+  const remainingScopes = rawRemainingScopes.filter((scope) =>
+    !blockedScopeKeys.has(scope.scopeKey)
+  );
+  const candidateScopeKeys = requiredScopes.map((scope) => scope.scopeKey);
   const result = (
     required: boolean,
     reason: PreferredDelegationRequirementReason,
-  ): PreferredDelegationRequirement => ({ required, reason, candidateScopeKeys });
+    contractOpen = false,
+  ): PreferredDelegationRequirement => ({
+    required,
+    reason,
+    candidateScopeKeys,
+    requiredScopes,
+    remainingScopes,
+    contractOpen,
+    consumedScopeKeys: progress.consumedScopeKeys,
+    lifecyclePhase: input.decision.phase,
+    scopeFingerprint: buildPreferredDelegationScopeFingerprint(requiredScopes),
+  });
 
   if (input.decision.preference !== "preferred") {
     return result(false, "not_preferred");
   }
-  if (input.alreadySatisfied) {
-    return result(false, "already_satisfied");
+  if (!effectiveScopeContract && input.activationAllowed === false) {
+    return result(false, "evidence_topology_open");
+  }
+  if (effectiveScopeContract && progress.satisfied) {
+    return result(false, "all_required_scopes_consumed");
+  }
+  if (effectiveScopeContract && progress.activeScopeKeys.length > 0) {
+    return result(false, "awaiting_scope_join", true);
+  }
+  if (effectiveScopeContract && progress.creationCapacityRemaining <= 0) {
+    return result(false, "scope_creation_capacity_reached", progress.open);
+  }
+  if (rawRemainingScopes.length > 0 && remainingScopes.length === 0) {
+    // Admission/scheduler failures are bounded for this process run. Release
+    // the evidence surface to the parent instead of repeatedly asking either
+    // the runtime or the model to recreate the same rejected child scopes.
+    return result(false, "runtime_materialization_failed", false);
   }
   if (input.decision.action !== "admit") {
-    return result(false, input.decision.reason);
+    return result(false, input.decision.reason, progress.open);
   }
-  if (candidateScopeKeys.length < 2) {
+  if (!effectiveScopeContract && requiredScopes.length < 2) {
     return result(false, "insufficient_parallel_scope");
   }
   if (!input.spawnToolAvailable) {
-    return result(false, "spawn_unavailable");
+    return result(false, "spawn_unavailable", progress.open);
   }
-  return result(true, "required");
+  return result(true, "required", true);
 }
 
 export function buildPreferredDelegationActionContract(input: {
   language: "zh" | "en";
   candidateScopeKeys: string[];
+  remainingScopes?: PreferredDelegationScopeCandidate[];
 }): string {
-  const scopes = collectIndependentDelegationScopes(input.candidateScopeKeys)
-    .slice(0, 8)
-    .map((scope) => `- ${scope.displayPath}`)
+  const scopes = (input.remainingScopes?.length
+    ? input.remainingScopes
+    : collectIndependentDelegationScopes(input.candidateScopeKeys)
+      .slice(0, 8)
+      .map((scope) => ({ scopeKey: scope.displayPath, allowedPaths: [scope.displayPath] })))
+    .map((scope) => `- scope_key=${scope.scopeKey}; allowed_paths=${scope.allowedPaths.join(",")}`)
     .join("\n");
   if (input.language === "en") {
     return [
       "PREFERRED_DELEGATION_ACTION_REQUIRED: The user enabled subagent collaboration, and the runtime has admitted useful parallel read-only work.",
-      "Call spawn_subagent now before any additional parent read, mutation, validation, or final response. Do not emit a progress paragraph before the tool call.",
-      "Delegate at least one bounded scope that does not overlap the work the parent will continue. You may issue multiple spawn_subagent calls in this response when the scopes are disjoint; do not invent paths or filler work.",
-      "Runtime-observed candidate scopes:",
+      "This is the final action contract for the current request. The only available action is spawn_subagent. Call it now before any additional parent read, mutation, validation, or final response; do not emit a progress paragraph first.",
+      "If the evidence contract names a missing source owner, delegate that exact bounded observation to the child instead of calling read_file or search from the parent. Use a concrete path already present in the project structure or evidence; do not invent one.",
+      "Create one child for every remaining runtime-owned scope listed below. Use role=reviewer for each pre-draft independent audit. You may issue all listed spawn_subagent calls in this response; the runtime enforces the existing concurrency and memory-safety policy. allowed_paths is the authorization ceiling for that scope, not a claim that every file below a directory was inspected. A scope is consumed only after join returns a satisfied typed closure with at least one material provenance-backed observation; any exact evidence obligations left open return to the parent runtime.",
+      "Remaining required scopes:",
       scopes || "- Select a concrete non-overlapping scope from the current evidence.",
     ].join("\n");
   }
   return [
     "PREFERRED_DELEGATION_ACTION_REQUIRED：用户已开启子智能体协作，且运行时已确认存在可并行的有价值只读范围。",
-    "现在必须先调用 spawn_subagent，再进行主体追加读取、修改、验证或最终回答；工具调用前不要输出进度段落。",
-    "至少委派一个与主体后续工作不重叠的有界范围；若范围彼此独立，可以在本次响应中并列调用多个 spawn_subagent。不要虚构路径，也不要为了凑数制造任务。",
-    "运行时观察到的候选范围：",
+    "这是当前请求最后生效的动作契约，唯一可用动作是 spawn_subagent。现在必须先调用 spawn_subagent，再进行主体追加读取、修改、验证或最终回答；工具调用前不要输出进度段落。",
+    "如果证据契约指出缺失的源码拥有者，就把该精确且有界的观察委派给子智能体，不要由主体调用 read_file 或搜索。路径必须已经出现在项目结构或证据中，不得虚构。",
+    "下面每个尚未完成的运行时 scope 都必须各创建一个子智能体，并设置 role=reviewer。可以在本次响应中并列调用全部列出的 spawn_subagent；运行时会继续执行既有并发和内存安全策略。allowed_paths 是该 scope 的授权上限，不表示目录下每个文件均已检查。只有 join 返回 typed closure=satisfied 且至少包含一条有实质内容的 provenance 观察，该 scope 才算 consumed；仍未关闭的精确证据义务会交回父运行时，partial 或无证据结果不算完成。",
+    "尚未完成的必需 scope：",
     scopes || "- 请从当前证据中选择一个具体且不重叠的范围。",
   ].join("\n");
+}
+
+/**
+ * A required preferred-delegation checkpoint happens after the parent has
+ * proved useful independent scopes. Normal discovery correctly rejects a
+ * child that merely repeats parent-owned evidence, but this checkpoint asks
+ * for an independent pre-draft audit. Normalize only spawn calls admitted by
+ * that runtime checkpoint to the existing reviewer contract; all adaptive and
+ * optional delegation keeps the ordinary duplicate-work policy.
+ */
+export function normalizeRequiredPreferredDelegationReviewerCalls<
+  T extends { name: string; arguments: string },
+>(calls: T[], required: boolean): T[] {
+  if (!required) return calls;
+  return calls.map((call) => {
+    if (call.name !== "spawn_subagent") return call;
+    try {
+      const parsed = JSON.parse(call.arguments) as Record<string, unknown>;
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return call;
+      if (/reviewer|independent[_ -]?review/i.test(String(parsed.role || ""))) {
+        return call;
+      }
+      return {
+        ...call,
+        arguments: JSON.stringify({ ...parsed, role: "reviewer" }),
+      };
+    } catch {
+      return call;
+    }
+  });
 }
 
 export function buildSubagentPolicyDeferral(input: {
@@ -648,6 +831,99 @@ const ACTIVE_SUBAGENT_STATUSES = new Set<SubagentStatus>([
   "running",
   "summarizing",
 ]);
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+/**
+ * Validate a child closure at a persistence or join boundary. Missing and
+ * pre-contract payloads deliberately return false: compatibility is
+ * fail-closed, never a prose-based completion upgrade.
+ */
+export function isAuthoritativeSubagentClosure(
+  value: unknown,
+  expectedOwner?: Partial<SubagentClosureOwner> & { scopeKey?: string },
+): value is SubagentClosureEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const closure = value as Partial<SubagentClosureEnvelope>;
+  const owner = closure.owner;
+  if (
+    closure.schemaVersion !== SUBAGENT_CLOSURE_SCHEMA_VERSION ||
+    !owner ||
+    owner.agentKind !== "subagent" ||
+    !String(owner.threadId || "").trim() ||
+    !String(owner.parentTurnId || "").trim() ||
+    !String(owner.subagentId || "").trim() ||
+    !String(owner.runId || "").trim() ||
+    !(owner.parentRunId === null || typeof owner.parentRunId === "string") ||
+    !String(closure.scopeKey || "").trim() ||
+    !["completed", "blocked", "degraded", "failed", "canceled"].includes(String(closure.status || "")) ||
+    !["satisfied", "partial", "blocked"].includes(String(closure.state || "")) ||
+    !(closure.remainingWork === null || typeof closure.remainingWork === "string") ||
+    !isNonNegativeInteger(closure.observationCount) ||
+    !isNonNegativeInteger(closure.substantiveEvidenceCount) ||
+    Number(closure.substantiveEvidenceCount) > Number(closure.observationCount) ||
+    !isStringArray(closure.acceptedEvidenceToolCallIds) ||
+    !isStringArray(closure.requiredPaths) ||
+    !isStringArray(closure.coveredPaths) ||
+    !isStringArray(closure.failedPaths) ||
+    !isStringArray(closure.uncoveredPaths) ||
+    !String(closure.reasonCode || "").trim() ||
+    !String(closure.reason || "").trim()
+  ) {
+    return false;
+  }
+
+  for (const [key, expected] of Object.entries(expectedOwner || {})) {
+    if (expected === undefined) continue;
+    const actual = key === "scopeKey"
+      ? closure.scopeKey
+      : owner[key as keyof SubagentClosureOwner];
+    if (actual !== expected) return false;
+  }
+
+  const remainingWork = String(closure.remainingWork || "").trim();
+  if (closure.status === "completed") {
+    return closure.state === "satisfied" &&
+      closure.remainingWork === null &&
+      closure.uncoveredPaths.length === 0 &&
+      closure.failedPaths.length === 0;
+  }
+  if (closure.status === "degraded") {
+    return closure.state === "partial" &&
+      closure.substantiveEvidenceCount > 0 &&
+      remainingWork.length > 0;
+  }
+  return closure.state === "blocked" && remainingWork.length > 0;
+}
+
+function projectFailClosedSubagentCompletion(
+  record: SubagentRunRecord,
+): SubagentRunRecord {
+  if (record.status !== "completed") return record;
+  const closureIsAuthoritative = isAuthoritativeSubagentClosure(record.closureAudit, {
+    threadId: record.threadId,
+    parentTurnId: record.parentTurnId,
+    subagentId: record.id,
+    ...(record.runId ? { runId: record.runId } : {}),
+    ...(record.parentRunId !== undefined ? { parentRunId: record.parentRunId } : {}),
+    ...(record.scopeKey ? { scopeKey: record.scopeKey } : {}),
+  }) && record.closureAudit.status === record.status;
+  if (closureIsAuthoritative) return record;
+  const error = "SUBAGENT_CLOSURE_CONTRACT_MISSING: a persisted completion has no matching runtime-authored closure envelope.";
+  return {
+    ...record,
+    status: "blocked",
+    closureState: "blocked",
+    remainingWork: record.objective,
+    error: record.error || error,
+  };
+}
 
 function resolveConfiguredModel(config: AppConfig): { provider: string; model: string } {
   if (config.activeProfile === "local") {
@@ -707,23 +983,26 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
       const activities = event.activity
         ? [...current.activities, event.activity].slice(-80)
         : current.activities;
-      records.set(event.subagentId, {
+      records.set(event.subagentId, projectFailClosedSubagentCompletion({
         ...current,
         ...event.patch,
         activities,
-      });
+      }));
       continue;
     }
 
     if (event.type === "subagent.closed") {
       const current = records.get(event.subagentId);
       if (!current) continue;
-      const terminalStatus = isSubagentTerminalStatus(event.reason as SubagentStatus)
+      const requestedTerminalStatus = isSubagentTerminalStatus(event.reason as SubagentStatus)
         ? event.reason as SubagentStatus
         : event.reason === "orphaned_after_restart" || event.reason === "runtime_controller_missing"
           ? "canceled"
           : current.status;
-      records.set(event.subagentId, {
+      const terminalStatus = requestedTerminalStatus === "completed" && current.status !== "completed"
+        ? "blocked"
+        : requestedTerminalStatus;
+      records.set(event.subagentId, projectFailClosedSubagentCompletion({
         ...current,
         status: terminalStatus,
         closedAt: event.closedAt,
@@ -731,7 +1010,7 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
           ? { completedAt: event.closedAt }
           : {}),
         updatedAt: Math.max(current.updatedAt, event.closedAt),
-      });
+      }));
       continue;
     }
 
@@ -767,7 +1046,19 @@ interface CapacityLaneState {
 
 const capacityLanes = new Map<string, CapacityLaneState>();
 const degradedUntilByLane = new Map<string, number>();
-const childAbortControllers = new Map<string, AbortController>();
+interface SubagentRuntimeOwnership {
+  sessionEpoch: string;
+  generation: string;
+}
+
+interface OwnedSubagentAbortController extends SubagentRuntimeOwnership {
+  subagentId: string;
+  threadId: string;
+  parentTurnId: string;
+  controller: AbortController;
+}
+
+const childAbortControllers = new Map<string, OwnedSubagentAbortController>();
 const SUBAGENT_RUNTIME_HEALTH_TTL_MS = 10 * 60_000;
 
 interface SubagentRuntimeSample {
@@ -781,10 +1072,17 @@ const runtimeSamplesByLane = new Map<string, SubagentRuntimeSample[]>();
 
 export interface CoordinatedSubagentRun {
   threadId: string;
+  /** Session-instance fence. Runtime registrations always normalize this value. */
+  sessionEpoch?: string;
   parentTurnId: string;
   subagentId: string;
+  /** Runtime-instance fence for same-owner replacement races. */
+  generation?: string;
   name: string;
   scopeKey: string;
+  objective?: string;
+  runId?: string;
+  parentRunId?: string | null;
   completion: Promise<SubagentResultEnvelope>;
   result?: SubagentResultEnvelope;
   createdAt?: number;
@@ -794,8 +1092,12 @@ export interface CoordinatedSubagentRun {
 
 export interface SubagentScopeLease {
   threadId: string;
+  /** Session-instance fence. Runtime leases always normalize this value. */
+  sessionEpoch?: string;
   parentTurnId: string;
   subagentId: string;
+  /** Runtime-instance fence for same-owner replacement races. */
+  generation?: string;
   scopeKey: string;
   workspace: string;
   allowedPaths: string[];
@@ -807,26 +1109,77 @@ const scopeLeases = new Map<string, SubagentScopeLease>();
 // Reservations serialize child ownership without blocking the parent. They
 // become active leases only when a child begins a real source-tool operation.
 const scopeReservations = new Map<string, SubagentScopeLease>();
-const createdRunCounts = new Map<string, number>();
 const COORDINATED_RESULT_TTL_MS = 10 * 60_000;
+const LEGACY_SUBAGENT_SESSION_EPOCH = "legacy-session-epoch";
+let coordinationGenerationSequence = 0;
 
-function coordinationKey(threadId: string, parentTurnId: string, subagentId: string): string {
-  return `${threadId}::${parentTurnId}::${subagentId}`;
+export function normalizeSubagentSessionEpoch(value: unknown): string {
+  return String(value || "").trim() || LEGACY_SUBAGENT_SESSION_EPOCH;
 }
 
-function parentCoordinationKey(threadId: string, parentTurnId: string): string {
-  return `${threadId}::${parentTurnId}`;
+function normalizeSubagentGeneration(value: unknown): string {
+  return String(value || "").trim() || `subagent-generation-${++coordinationGenerationSequence}`;
 }
 
-function releaseCoordinatedRun(key: string): boolean {
+function normalizedRuntimeOwnership(
+  input: Partial<SubagentRuntimeOwnership>,
+  legacyGeneration?: string,
+): SubagentRuntimeOwnership {
+  return {
+    sessionEpoch: normalizeSubagentSessionEpoch(input.sessionEpoch),
+    generation: String(input.generation || "").trim() ||
+      String(legacyGeneration || "").trim() ||
+      normalizeSubagentGeneration(undefined),
+  };
+}
+
+function coordinationKey(
+  threadId: string,
+  sessionEpoch: string | undefined,
+  parentTurnId: string,
+  subagentId: string,
+): string {
+  return `${threadId}::${normalizeSubagentSessionEpoch(sessionEpoch)}::${parentTurnId}::${subagentId}`;
+}
+
+function scopeOwnershipKey(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  subagentId: string;
+  generation?: string;
+}): string {
+  return [
+    input.threadId,
+    normalizeSubagentSessionEpoch(input.sessionEpoch),
+    input.parentTurnId,
+    input.subagentId,
+    String(input.generation || "").trim(),
+  ].join("::");
+}
+
+function hasRuntimeOwnership(
+  value: Pick<CoordinatedSubagentRun, "sessionEpoch" | "generation">,
+  expected: SubagentRuntimeOwnership,
+): boolean {
+  return normalizeSubagentSessionEpoch(value.sessionEpoch) === expected.sessionEpoch &&
+    String(value.generation || "").trim() === expected.generation;
+}
+
+function releaseCoordinatedRun(key: string, expected: SubagentRuntimeOwnership): boolean {
   const run = coordinatedRuns.get(key);
-  if (!run) return false;
+  if (!run || !hasRuntimeOwnership(run, expected)) return false;
   if (run.cleanupTimer) clearTimeout(run.cleanupTimer);
   coordinatedRuns.delete(key);
   // Coordination records can be released by join, TTL cleanup, or parent
   // finalization. All are terminal ownership boundaries for this parent turn,
   // so a stale scope lease must never survive the record that owned it.
-  releaseSubagentScopeLease(run.subagentId);
+  releaseSubagentScopeLease(run.subagentId, {
+    threadId: run.threadId,
+    sessionEpoch: expected.sessionEpoch,
+    parentTurnId: run.parentTurnId,
+    generation: expected.generation,
+  });
   return true;
 }
 
@@ -886,34 +1239,77 @@ function pathContains(scopePath: string, targetPath: string): boolean {
 }
 
 export function acquireSubagentScopeLease(input: SubagentScopeLease): void {
-  scopeLeases.set(input.subagentId, {
+  const ownership = normalizedRuntimeOwnership(input, `legacy-generation:${input.subagentId}`);
+  const lease: SubagentScopeLease = {
     ...input,
+    ...ownership,
     allowedPaths: input.allowedPaths.map(normalizeSubagentScopePathIdentity).filter(Boolean),
-  });
+  };
+  scopeLeases.set(scopeOwnershipKey(lease), lease);
 }
 
 export function reserveSubagentScope(input: SubagentScopeLease): void {
-  scopeReservations.set(input.subagentId, {
+  const ownership = normalizedRuntimeOwnership(input, `legacy-generation:${input.subagentId}`);
+  const lease: SubagentScopeLease = {
     ...input,
+    ...ownership,
     allowedPaths: input.allowedPaths.map(normalizeSubagentScopePathIdentity).filter(Boolean),
-  });
+  };
+  scopeReservations.set(scopeOwnershipKey(lease), lease);
 }
 
-export function activateSubagentScopeLease(subagentId: string): boolean {
-  if (scopeLeases.has(subagentId)) return true;
-  const reservation = scopeReservations.get(subagentId);
-  if (!reservation) return false;
-  scopeLeases.set(subagentId, reservation);
+interface SubagentScopeOwnershipExpectation extends SubagentRuntimeOwnership {
+  threadId: string;
+  parentTurnId: string;
+}
+
+function matchesScopeOwnership(
+  lease: SubagentScopeLease,
+  subagentId: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): boolean {
+  if (lease.subagentId !== subagentId) return false;
+  if (!expected) return true;
+  return lease.threadId === expected.threadId &&
+    lease.parentTurnId === expected.parentTurnId &&
+    normalizeSubagentSessionEpoch(lease.sessionEpoch) === expected.sessionEpoch &&
+    String(lease.generation || "").trim() === expected.generation;
+}
+
+export function activateSubagentScopeLease(
+  subagentId: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): boolean {
+  const alreadyActive = [...scopeLeases.values()].some((lease) =>
+    matchesScopeOwnership(lease, subagentId, expected)
+  );
+  if (alreadyActive) return true;
+  const reservations = [...scopeReservations.entries()].filter(([, lease]) =>
+    matchesScopeOwnership(lease, subagentId, expected)
+  );
+  if (reservations.length === 0) return false;
+  for (const [key, reservation] of reservations) {
+    scopeReservations.delete(key);
+    scopeLeases.set(key, reservation);
+  }
   return true;
 }
 
-export function releaseSubagentScopeLease(subagentId: string): void {
-  scopeLeases.delete(subagentId);
-  scopeReservations.delete(subagentId);
+export function releaseSubagentScopeLease(
+  subagentId: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): void {
+  for (const [key, lease] of scopeLeases.entries()) {
+    if (matchesScopeOwnership(lease, subagentId, expected)) scopeLeases.delete(key);
+  }
+  for (const [key, reservation] of scopeReservations.entries()) {
+    if (matchesScopeOwnership(reservation, subagentId, expected)) scopeReservations.delete(key);
+  }
 }
 
 export function findSubagentScopeConflict(input: {
   threadId: string;
+  sessionEpoch?: string;
   targetPath: string;
   currentSubagentId?: string | null;
 }): SubagentScopeLease | null {
@@ -926,6 +1322,10 @@ export function findSubagentScopeConflict(input: {
   ]);
   for (const lease of childOwnership.values()) {
     if (lease.threadId !== input.threadId) continue;
+    if (
+      input.sessionEpoch &&
+      normalizeSubagentSessionEpoch(lease.sessionEpoch) !== normalizeSubagentSessionEpoch(input.sessionEpoch)
+    ) continue;
     if (lease.subagentId === input.currentSubagentId) continue;
     const target = normalizeSubagentScopePathIdentity(
       relativizeToWorkspacePath(input.targetPath, lease.workspace),
@@ -940,6 +1340,7 @@ export function findSubagentScopeConflict(input: {
 
 export function findSubagentLeaseOverlap(input: {
   threadId: string;
+  sessionEpoch?: string;
   workspace: string;
   allowedPaths: string[];
 }): SubagentScopeLease | null {
@@ -952,6 +1353,10 @@ export function findSubagentLeaseOverlap(input: {
   ]);
   for (const lease of childOwnership.values()) {
     if (lease.threadId !== input.threadId) continue;
+    if (
+      input.sessionEpoch &&
+      normalizeSubagentSessionEpoch(lease.sessionEpoch) !== normalizeSubagentSessionEpoch(input.sessionEpoch)
+    ) continue;
     if (candidates.some((candidate) => lease.allowedPaths.some((allowed) =>
       pathContains(allowed, candidate) || pathContains(candidate, allowed)
     ))) return lease;
@@ -1029,32 +1434,126 @@ export function recordSubagentScopeBlockedTool(
   return true;
 }
 
+function normalizeCoordinatedSubagentResult(
+  run: CoordinatedSubagentRun,
+  value: unknown,
+): SubagentResultEnvelope {
+  const record = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Partial<SubagentResultEnvelope>
+    : {};
+  const expectedRunId = run.runId || `run-${run.subagentId}`;
+  const expectedParentRunId = run.parentRunId ?? null;
+  const authoritative =
+    record.subagentId === run.subagentId &&
+    record.scopeKey === run.scopeKey &&
+    isAuthoritativeSubagentClosure(record.closureAudit, {
+      threadId: run.threadId,
+      parentTurnId: run.parentTurnId,
+      subagentId: run.subagentId,
+      runId: expectedRunId,
+      parentRunId: expectedParentRunId,
+      scopeKey: run.scopeKey,
+    }) &&
+    record.status === record.closureAudit.status;
+  if (authoritative) return record as SubagentResultEnvelope;
+
+  const summary = typeof record.summary === "string" ? record.summary : "";
+  const evidence = Array.isArray(record.evidence) ? record.evidence : [];
+  const remainingWork = String(run.objective || run.scopeKey || "The assigned child scope remains unresolved.").trim();
+  const reason = "SUBAGENT_CLOSURE_CONTRACT_INVALID: joined child result was missing a matching runtime-authored closure envelope.";
+  const closureAudit: SubagentClosureEnvelope = {
+    schemaVersion: SUBAGENT_CLOSURE_SCHEMA_VERSION,
+    owner: {
+      agentKind: "subagent",
+      threadId: run.threadId,
+      parentTurnId: run.parentTurnId,
+      subagentId: run.subagentId,
+      runId: expectedRunId,
+      parentRunId: expectedParentRunId,
+    },
+    scopeKey: run.scopeKey,
+    status: "blocked",
+    state: "blocked",
+    remainingWork,
+    observationCount: evidence.length,
+    substantiveEvidenceCount: 0,
+    acceptedEvidenceToolCallIds: [],
+    requiredPaths: [],
+    coveredPaths: [],
+    failedPaths: [],
+    uncoveredPaths: [],
+    reasonCode: "invalid_closure_envelope",
+    reason,
+  };
+  return {
+    subagentId: run.subagentId,
+    name: run.name,
+    scopeKey: run.scopeKey,
+    status: "blocked",
+    summary,
+    summaryTrust: "unverified_hypothesis",
+    evidence,
+    closureAudit,
+    blocker: reason,
+    remainingWork,
+    error: reason,
+  };
+}
+
 export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): void {
-  const key = coordinationKey(input.threadId, input.parentTurnId, input.subagentId);
-  const parentKey = parentCoordinationKey(input.threadId, input.parentTurnId);
-  if (!coordinatedRuns.has(key)) {
-    createdRunCounts.set(parentKey, (createdRunCounts.get(parentKey) || 0) + 1);
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
+  const explicitGeneration = String(input.generation || "").trim();
+  const existingScopeGeneration = [...scopeReservations.values(), ...scopeLeases.values()]
+    .find((lease) =>
+      lease.threadId === input.threadId &&
+      normalizeSubagentSessionEpoch(lease.sessionEpoch) === sessionEpoch &&
+      lease.parentTurnId === input.parentTurnId &&
+      lease.subagentId === input.subagentId
+    )?.generation;
+  const generation = normalizeSubagentGeneration(explicitGeneration || existingScopeGeneration);
+  const ownership = { sessionEpoch, generation };
+  const key = coordinationKey(input.threadId, sessionEpoch, input.parentTurnId, input.subagentId);
+  const previous = coordinatedRuns.get(key);
+  if (previous) {
+    if (previous.cleanupTimer) clearTimeout(previous.cleanupTimer);
+    releaseSubagentScopeLease(previous.subagentId, {
+      threadId: previous.threadId,
+      sessionEpoch: normalizeSubagentSessionEpoch(previous.sessionEpoch),
+      parentTurnId: previous.parentTurnId,
+      generation: String(previous.generation || "").trim(),
+    });
   }
   const run: CoordinatedSubagentRun = {
     ...input,
+    ...ownership,
     createdAt: input.createdAt || Date.now(),
   };
+  run.completion = input.completion.then((result) => normalizeCoordinatedSubagentResult(run, result));
   coordinatedRuns.set(key, run);
-  void input.completion.then((result) => {
+  void run.completion.then((result) => {
     const current = coordinatedRuns.get(key);
-    if (!current) return;
-    current.result = result;
-    current.completedAt = Date.now();
-    current.cleanupTimer = setTimeout(() => {
-      releaseCoordinatedRun(key);
+    // A completion callback belongs to the exact registration instance that
+    // installed it. A same-key replacement must remain untouched when an old
+    // promise settles later.
+    if (current !== run || !hasRuntimeOwnership(current, ownership)) return;
+    run.result = result;
+    run.completedAt = Date.now();
+    run.cleanupTimer = setTimeout(() => {
+      releaseCoordinatedRun(key, ownership);
     }, COORDINATED_RESULT_TTL_MS);
   });
 }
 
-export function getPendingCoordinatedSubagentIds(threadId: string, parentTurnId: string): string[] {
+export function getPendingCoordinatedSubagentIds(
+  threadId: string,
+  parentTurnId: string,
+  sessionEpoch?: string,
+): string[] {
+  const normalizedSessionEpoch = normalizeSubagentSessionEpoch(sessionEpoch);
   return [...coordinatedRuns.values()]
     .filter((run) =>
       run.threadId === threadId &&
+      normalizeSubagentSessionEpoch(run.sessionEpoch) === normalizedSessionEpoch &&
       run.parentTurnId === parentTurnId
     )
     .map((run) => run.subagentId);
@@ -1062,25 +1561,83 @@ export function getPendingCoordinatedSubagentIds(threadId: string, parentTurnId:
 
 export async function waitForCoordinatedSubagents(input: {
   threadId: string;
+  sessionEpoch?: string;
   parentTurnId: string;
   subagentIds?: string[];
+  signal?: AbortSignal;
 }): Promise<WaitSubagentsResult> {
-  const requestedIds = new Set((input.subagentIds || []).filter(Boolean));
-  const runs = [...coordinatedRuns.values()].filter((run) =>
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
+  const parentRuns = [...coordinatedRuns.values()].filter((run) =>
     run.threadId === input.threadId &&
-    run.parentTurnId === input.parentTurnId &&
-    (requestedIds.size === 0 || requestedIds.has(run.subagentId))
+    normalizeSubagentSessionEpoch(run.sessionEpoch) === sessionEpoch &&
+    run.parentTurnId === input.parentTurnId
   );
-  if (runs.length === 0) return { results: [], pendingIds: [...requestedIds] };
-  const results = await Promise.all(runs.map((run) => run.completion));
-  for (const run of runs) {
-    releaseCoordinatedRun(coordinationKey(run.threadId, run.parentTurnId, run.subagentId));
+  if (parentRuns.length === 0) return { results: [], pendingIds: [] };
+
+  const requestedIds = new Set((input.subagentIds || [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean));
+  const requestsAllRegistered = [...requestedIds].some((value) => value.toLowerCase() === "all");
+  const explicitlyMatchedRuns = requestedIds.size > 0
+    ? parentRuns.filter((run) => requestedIds.has(run.subagentId))
+    : [];
+  // The coordination ledger, not model-authored IDs, owns the wait boundary.
+  // Empty, wildcard-like, stale, or otherwise unmatched requests therefore
+  // mean "join the currently registered children for this parent Turn". This
+  // prevents an invalid ID from returning an empty result and spending another
+  // model iteration on the same wait. A genuinely matching subset remains a
+  // supported way to join only selected children.
+  const runs = requestedIds.size === 0 || requestsAllRegistered || explicitlyMatchedRuns.length === 0
+    ? parentRuns
+    : explicitlyMatchedRuns;
+
+  const completions = Promise.all(runs.map((run) => run.completion));
+  const waitSignal = input.signal;
+  const settledResults = waitSignal
+    ? await new Promise<SubagentResultEnvelope[]>((resolve, reject) => {
+        if (waitSignal.aborted) {
+          reject(makeAbortError());
+          return;
+        }
+        const onAbort = () => reject(makeAbortError());
+        const settle = <T>(handler: (value: T) => void) => (value: T) => {
+          waitSignal.removeEventListener("abort", onAbort);
+          handler(value);
+        };
+        waitSignal.addEventListener("abort", onAbort, { once: true });
+        completions.then(settle(resolve), settle(reject));
+      })
+    : await completions;
+  const results: SubagentResultEnvelope[] = [];
+  for (const [index, run] of runs.entries()) {
+    const ownership = {
+      sessionEpoch: normalizeSubagentSessionEpoch(run.sessionEpoch),
+      generation: String(run.generation || "").trim(),
+    };
+    const key = coordinationKey(run.threadId, ownership.sessionEpoch, run.parentTurnId, run.subagentId);
+    // If the slot was replaced while this wait was blocked, the old result is
+    // stale evidence. Do not consume it or release the replacement.
+    if (coordinatedRuns.get(key) !== run) continue;
+    results.push(settledResults[index]);
+    releaseCoordinatedRun(key, ownership);
   }
-  return { results, pendingIds: [] };
+  return {
+    results,
+    pendingIds: getPendingCoordinatedSubagentIds(input.threadId, input.parentTurnId, sessionEpoch),
+  };
 }
 
-export function getCoordinatedSubagentRunCount(threadId: string, parentTurnId: string): number {
-  return createdRunCounts.get(parentCoordinationKey(threadId, parentTurnId)) || 0;
+export function getCoordinatedSubagentRunCount(
+  threadId: string,
+  parentTurnId: string,
+  sessionEpoch?: string,
+): number {
+  const normalizedSessionEpoch = normalizeSubagentSessionEpoch(sessionEpoch);
+  return [...coordinatedRuns.values()].filter((run) =>
+    run.threadId === threadId &&
+    normalizeSubagentSessionEpoch(run.sessionEpoch) === normalizedSessionEpoch &&
+    run.parentTurnId === parentTurnId
+  ).length;
 }
 
 export interface ParentSubagentFinalizationResult {
@@ -1094,17 +1651,27 @@ export interface ParentSubagentFinalizationResult {
 
 export async function finalizeCoordinatedSubagentsForParent(input: {
   threadId: string;
+  sessionEpoch?: string;
   parentTurnId: string;
   graceMs?: number;
 }): Promise<ParentSubagentFinalizationResult> {
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
   const runs = [...coordinatedRuns.values()].filter((run) =>
-    run.threadId === input.threadId && run.parentTurnId === input.parentTurnId
+    run.threadId === input.threadId &&
+    normalizeSubagentSessionEpoch(run.sessionEpoch) === sessionEpoch &&
+    run.parentTurnId === input.parentTurnId
   );
   const requestedIds = runs.filter((run) => !run.result).map((run) => run.subagentId);
   const canceledIds: string[] = [];
   const controllerMissingIds: string[] = [];
   for (const id of requestedIds) {
-    if (cancelSubagentRun(id)) canceledIds.push(id);
+    const run = runs.find((candidate) => candidate.subagentId === id);
+    if (run && cancelSubagentRun(id, {
+      threadId: run.threadId,
+      sessionEpoch,
+      parentTurnId: run.parentTurnId,
+      generation: String(run.generation || "").trim(),
+    })) canceledIds.push(id);
     else controllerMissingIds.push(id);
   }
 
@@ -1126,11 +1693,17 @@ export async function finalizeCoordinatedSubagentsForParent(input: {
 
   let releasedCount = 0;
   for (const run of runs) {
-    if (releaseCoordinatedRun(coordinationKey(run.threadId, run.parentTurnId, run.subagentId))) {
+    const ownership = {
+      sessionEpoch: normalizeSubagentSessionEpoch(run.sessionEpoch),
+      generation: String(run.generation || "").trim(),
+    };
+    if (releaseCoordinatedRun(
+      coordinationKey(run.threadId, ownership.sessionEpoch, run.parentTurnId, run.subagentId),
+      ownership,
+    )) {
       releasedCount += 1;
     }
   }
-  createdRunCounts.delete(parentCoordinationKey(input.threadId, input.parentTurnId));
   return {
     requestedIds,
     canceledIds,
@@ -1356,23 +1929,94 @@ export function reportSubagentCapacityFailure(
   return true;
 }
 
-export function registerSubagentAbortController(id: string, controller: AbortController): void {
-  childAbortControllers.set(id, controller);
+function abortControllerOwnershipKey(input: {
+  subagentId: string;
+  threadId: string;
+  sessionEpoch: string;
+  parentTurnId: string;
+  generation: string;
+}): string {
+  return [
+    input.threadId,
+    input.sessionEpoch,
+    input.parentTurnId,
+    input.subagentId,
+    input.generation,
+  ].join("::");
 }
 
-export function unregisterSubagentAbortController(id: string): void {
-  childAbortControllers.delete(id);
+export function registerSubagentAbortController(
+  id: string,
+  controller: AbortController,
+  expected?: SubagentScopeOwnershipExpectation,
+): void {
+  const existingScope = [...scopeReservations.values(), ...scopeLeases.values()]
+    .find((lease) => lease.subagentId === id);
+  const ownership = expected || (existingScope
+    ? {
+        threadId: existingScope.threadId,
+        sessionEpoch: normalizeSubagentSessionEpoch(existingScope.sessionEpoch),
+        parentTurnId: existingScope.parentTurnId,
+        generation: String(existingScope.generation || "").trim(),
+      }
+    : {
+        threadId: "legacy-thread",
+        sessionEpoch: LEGACY_SUBAGENT_SESSION_EPOCH,
+        parentTurnId: "legacy-parent-turn",
+        generation: `legacy-generation:${id}`,
+      });
+  const entry: OwnedSubagentAbortController = {
+    subagentId: id,
+    threadId: ownership.threadId,
+    parentTurnId: ownership.parentTurnId,
+    sessionEpoch: ownership.sessionEpoch,
+    generation: ownership.generation,
+    controller,
+  };
+  childAbortControllers.set(abortControllerOwnershipKey({
+    subagentId: id,
+    ...ownership,
+  }), entry);
 }
 
-export function cancelSubagentRun(id: string): boolean {
-  const controller = childAbortControllers.get(id);
-  if (!controller) return false;
-  controller.abort();
-  return true;
+function matchingAbortControllerEntries(
+  id: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): Array<[string, OwnedSubagentAbortController]> {
+  return [...childAbortControllers.entries()].filter(([, entry]) =>
+    entry.subagentId === id &&
+    (!expected || (
+      entry.threadId === expected.threadId &&
+      entry.parentTurnId === expected.parentTurnId &&
+      entry.sessionEpoch === expected.sessionEpoch &&
+      entry.generation === expected.generation
+    ))
+  );
 }
 
-export function hasLiveSubagentController(id: string): boolean {
-  return childAbortControllers.has(id);
+export function unregisterSubagentAbortController(
+  id: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): void {
+  for (const [key] of matchingAbortControllerEntries(id, expected)) {
+    childAbortControllers.delete(key);
+  }
+}
+
+export function cancelSubagentRun(
+  id: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): boolean {
+  const entries = matchingAbortControllerEntries(id, expected);
+  for (const [, entry] of entries) entry.controller.abort();
+  return entries.length > 0;
+}
+
+export function hasLiveSubagentController(
+  id: string,
+  expected?: SubagentScopeOwnershipExpectation,
+): boolean {
+  return matchingAbortControllerEntries(id, expected).length > 0;
 }
 
 export function reconcileOrphanedSubagentEvents(
@@ -1431,7 +2075,7 @@ export function resetSubagentRuntimeForTests(): void {
   childAbortControllers.clear();
   runtimeSamplesByLane.clear();
   coordinatedRuns.clear();
-  createdRunCounts.clear();
   scopeLeases.clear();
   scopeReservations.clear();
+  coordinationGenerationSequence = 0;
 }

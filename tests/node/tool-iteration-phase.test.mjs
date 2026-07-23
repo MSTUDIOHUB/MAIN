@@ -13,6 +13,10 @@ const orchestratorSource = fsSync.readFileSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
   "utf8",
 );
+const assistantCompletionSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantCompletionPhase.ts"),
+  "utf8",
+);
 const runtimeOrchestratorSource = fsSync.readFileSync(
   path.join(workspaceRoot, "src/lib/orchestrator.ts"),
   "utf8",
@@ -48,14 +52,31 @@ test("tool iteration phase returns one folded runtime-state result to the orches
   assert.match(phaseSource, /recoveryPromptState: toolResultRecoveryPhase\.recoveryPromptState/);
 });
 
-test("preferred delegation satisfaction uses the runtime-owned child registration outcome", () => {
+test("preferred delegation spawn state uses the runtime-owned child registration outcome", () => {
   assert.match(orchestratorTypesSource, /subagentSpawnOutcome\?: SpawnSubagentResult/);
   assert.match(runtimeOrchestratorSource, /subagentSpawnOutcome = result/);
   assert.match(runtimeOrchestratorSource, /options\.onSubagentSpawnCreated\?\.\(result\)/);
   assert.match(runtimeOrchestratorSource, /\{ subagentSpawnOutcome \}/);
   assert.match(phaseSource, /const runtimeOutcome = result\.subagentSpawnOutcome/);
   assert.match(phaseSource, /runtimeOutcome\.subagentId !== null/);
-  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_satisfied"/);
+  assert.match(phaseSource, /extractPreferredDelegationScopeJoinOutcomes/);
+  assert.match(phaseSource, /input\.onSubagentScopeOutcomes\?\.\(subagentScopeOutcomes\)/);
+  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_spawned"/);
+  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_consumed"/);
+  assert.match(
+    orchestratorSource,
+    /applyPreferredDelegationScopeJoinOutcomes\(\{[\s\S]*joinResult\.scopeOutcomes/,
+  );
+  assert.match(orchestratorSource, /delegationProgress\.consumedScopeKeys\.length > 0/);
+  assert.match(orchestratorSource, /preferred_delegation_joined_without_evidence/);
+  assert.match(
+    orchestratorSource,
+    /joinResult\.adoptedEvidenceCount > 0[\s\S]*setPlanRuntimePhase\(\s*"needs_evidence"/,
+  );
+  assert.match(
+    assistantCompletionSource,
+    /joinResult\.adoptedEvidenceCount === 0[\s\S]*input\.setPlanRuntimePhase\("needs_evidence"/,
+  );
   assert.ok(
     runtimeOrchestratorSource.indexOf("options.onSubagentSpawnCreated?.(result)") <
       runtimeOrchestratorSource.indexOf("return JSON.stringify(result)"),

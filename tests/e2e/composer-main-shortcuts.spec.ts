@@ -61,6 +61,64 @@ test("composer keeps a two-line minimum height and grows until it scrolls", asyn
   expect(emptyAgainBox?.height ?? 0).toBeGreaterThanOrEqual(initialBox?.height ?? 0);
 });
 
+test("first workspace Composer admission renders one titled Turn that owns its user block", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const prompt = "检查首回合标题、消息归属与持久化收据";
+  await page.getByTestId("composer-textarea").fill(prompt);
+  await page.getByTestId("composer-send-button").click();
+
+  await expect.poll(async () => page.evaluate((expectedPrompt) => {
+    const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
+    for (const session of [...savedSessions].reverse()) {
+      const snapshot = session?.runtimeSnapshot;
+      const turn = (snapshot?.conversationTurns || []).find(
+        (candidate: any) => candidate?.userPrompt === expectedPrompt,
+      );
+      if (!turn) continue;
+      const ledgerEntry = (snapshot?.workspaceInstructionLedger || []).find(
+        (entry: any) => entry?.receipt?.turnId === turn.id,
+      );
+      const userBlockId = ledgerEntry?.receipt?.userBlockId ?? null;
+      const userBlock = (snapshot?.taskFlow || []).find(
+        (block: any) => block?.id === userBlockId && block?.type === "user",
+      );
+      return {
+        turnId: turn.id,
+        title: turn.title,
+        userBlockId,
+        turnOwnsUserBlock: turn.blockIds?.includes(userBlockId) === true,
+        userBlockTurnId: userBlock?.turnId ?? null,
+      };
+    }
+    return null;
+  }, prompt)).toMatchObject({
+    turnId: expect.any(String),
+    title: expect.stringMatching(/\S/),
+    userBlockId: expect.any(Number),
+    turnOwnsUserBlock: true,
+    userBlockTurnId: expect.any(String),
+  });
+
+  const ownership = await page.evaluate((expectedPrompt) => {
+    const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
+    for (const session of [...savedSessions].reverse()) {
+      const turn = (session?.runtimeSnapshot?.conversationTurns || []).find(
+        (candidate: any) => candidate?.userPrompt === expectedPrompt,
+      );
+      if (turn) return { turnId: turn.id, title: turn.title };
+    }
+    return null;
+  }, prompt);
+  expect(ownership).not.toBeNull();
+
+  const turnSection = page.locator(`section[data-turn-id='${ownership!.turnId}']`);
+  await expect(page.locator("section[data-turn-id]")).toHaveCount(1);
+  await expect(turnSection).toHaveCount(1);
+  await expect(turnSection.getByTestId("turn-state-anchor")).toContainText(ownership!.title);
+  await expect(turnSection.getByTestId("user-message-content")).toHaveText(prompt);
+});
+
 test("MAIN shortcut menu works from a leading slash before existing content", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
@@ -283,7 +341,7 @@ test("Goal capsule keeps one-shot authority when streaming admission waits for d
     isGenerating: true,
     agentStatus: "running",
   }));
-  await page.getByTestId("composer-send-button").click();
+  await page.getByTestId("composer-queue-button").click();
 
   await expect(page.getByTestId("user-message-content").last()).toHaveText("当前轮结束后继续完成这个目标");
   await expect.poll(async () => page.evaluate(() => {
@@ -333,7 +391,7 @@ test("locked Plan intent remains exact while its durable Turn waits in FIFO", as
     isGenerating: true,
     agentStatus: "running",
   }));
-  await page.getByTestId("composer-send-button").click();
+  await page.getByTestId("composer-queue-button").click();
 
   await expect.poll(async () => page.evaluate(() => {
     const savedSessions = (window as any).__WORKSPACE_ADMISSION_E2E__?.savedSessions || [];
@@ -504,7 +562,7 @@ test("MAIN shortcut intent survives transient empty Chinese IME composition", as
   expect(snapshot?.currentTurnPrompt).not.toContain("/计划");
 });
 
-test("MDEBUG stays hidden from shortcut menu but submits as a plan turn", async ({ page }) => {
+test("MDEBUG stays hidden, preserves the admitted prompt, and submits as a plan turn", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -530,6 +588,9 @@ test("MDEBUG stays hidden from shortcut menu but submits as a plan turn", async 
 
   const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
   expect(snapshot?.currentTurnTitle).toBe("MDEBUG：用户反馈自修复");
-  expect(snapshot?.currentTurnPrompt).toContain("[MDEBUG: USER FEEDBACK SELF-REPAIR]");
-  expect(snapshot?.currentTurnPrompt).toContain(".MAIN/plans/bugfix.md");
+  expect(snapshot?.currentTurnIntent).toBe("plan");
+  expect(snapshot?.currentTurnPrompt).toBe(
+    "/MDEBUG\n# MAIN 用户反馈修复请求\n\n## 问题描述与复现步骤\n点击 Terminal 后没有显示输出。",
+  );
+  expect(snapshot?.currentTurnPrompt).not.toContain("[MDEBUG: USER FEEDBACK SELF-REPAIR]");
 });

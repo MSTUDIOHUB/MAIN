@@ -1,27 +1,61 @@
 import { expect, test, type Page } from "@playwright/test";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   isFinitePlanValidationCommand,
-  validateActionablePlanArtifact,
 } from "../../src/lib/workflowModels";
+import {
+  hashPlanCandidate,
+  PLAN_CANDIDATE_SCHEMA_VERSION,
+  validateSealedPlanCandidate,
+} from "../../src/lib/planContract";
+import { PLAN_AUTHORING_CONTRACT_VERSION } from "../../src/lib/planAuthoringContract";
+import { isAcceptanceCapableValidationSpec } from "../../src/lib/validationContract";
+import {
+  collectBoundedRealOmlxWorkspaceFiles,
+  createRealOmlxAcceptanceState,
+  projectRealOmlxCollaborationScopes,
+  readBoundedRealOmlxWorkspaceTextFile,
+  readBoundedRealOmlxWorkspaceTextFiles,
+  readRealOmlxWorkspaceFileWindow,
+  recordRealOmlxAcceptanceDebugEvent,
+  REAL_OMLX_WORKSPACE_PROXY_LIMITS,
+  selectBoundedRealOmlxSearchFiles,
+  shouldPruneRealOmlxWorkspaceDirectory,
+  type RealOmlxAcceptanceState,
+  type RealOmlxWorkspaceInventory,
+} from "./realOmlxWorkspaceProxy";
+import {
+  getMdViewerExecutionGaps,
+  getMdViewerReadablePlanGaps,
+  getMdViewerTypedPlanGaps,
+} from "./realOmlxMdViewerPlanOracle";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
   process.env.OMLX_ENDPOINT || process.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1",
 ).replace(/\/+$/, "");
 const omlxApiKey = String(process.env.OMLX_API_KEY || "mmnn");
-const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-A3B-6bit")
+const models = (process.env.OMLX_MODELS || (runRealOmlx ? "" : "e2e-placeholder-model"))
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
+if (runRealOmlx && models.length !== 1) {
+  throw new Error(
+    `Real OMLX validation requires exactly one explicit OMLX_MODELS id; received ${models.length}.`,
+  );
+}
 const realOmlxRequest =
   process.env.REAL_OMLX_REQUEST ||
   "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
+const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
+const realOmlxImagePath = String(process.env.REAL_OMLX_IMAGE_PATH || "").trim();
 const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
+const runExecuteIncidentReplay = process.env.REAL_OMLX_EXECUTE_INCIDENT === "1";
 const realOmlxFixture = String(process.env.REAL_OMLX_FIXTURE || "csv").trim().toLowerCase();
 const realOmlxMutationFile = String(
   process.env.REAL_OMLX_MUTATION_FILE ||
@@ -45,6 +79,33 @@ const realOmlxPlanExpectAll = String(process.env.REAL_OMLX_PLAN_EXPECT_ALL || ""
   .map((pattern) => pattern.trim())
   .filter(Boolean)
   .map((pattern) => new RegExp(pattern, "i"));
+const realOmlxPlanEvidenceTargets = String(
+  process.env.REAL_OMLX_PLAN_EVIDENCE_TARGETS || (
+    realOmlxFixture === "csv" ? "src/hooks/useCsvParser.ts" : ""
+  ),
+).split(";;").map((target) => target.trim()).filter(Boolean);
+const realOmlxExpectedSubagentScopes = String(
+  process.env.REAL_OMLX_EXPECT_SUBAGENT_SCOPES || "",
+).split(";;").map((scope) => scope.trim()).filter(Boolean);
+if (
+  runRealOmlx &&
+  realOmlxFixture === "md-viewer" &&
+  !String(process.env.REAL_OMLX_WORKSPACE || "").trim()
+) {
+  throw new Error(
+    "The md-viewer real-model fixture requires a caller-prepared REAL_OMLX_WORKSPACE copy.",
+  );
+}
+if (runRealOmlx && realOmlxPlanEvidenceTargets.length === 0) {
+  throw new Error(
+    "Real OMLX validation requires explicit REAL_OMLX_PLAN_EVIDENCE_TARGETS for non-default fixtures.",
+  );
+}
+if (runRealOmlx && realOmlxPreferSubagents && realOmlxExpectedSubagentScopes.length === 0) {
+  throw new Error(
+    "REAL_OMLX_PREFER_SUBAGENTS=1 requires explicit REAL_OMLX_EXPECT_SUBAGENT_SCOPES.",
+  );
+}
 const realOmlxPlanTimeoutMs = Math.max(
   30_000,
   Number(process.env.REAL_OMLX_PLAN_TIMEOUT_MS || 600_000),
@@ -56,14 +117,26 @@ const realOmlxExecutionTimeoutMs = Math.max(
 const allowSafeExecutionPause = process.env.REAL_OMLX_ALLOW_SAFE_PAUSE === "1";
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
-const completedTurnStatuses = new Set(["done", "completed", "completed_with_changes"]);
+const completedTurnStatuses = new Set([
+  "done",
+  "completed",
+  "completed_with_changes",
+]);
 const reviewablePlanStages = new Set(["plan", "design", "bugfix", "ready_to_execute"]);
+const isMdViewerSavePathIncident =
+  realOmlxFixture === "md-viewer" &&
+  /(?:未保存|保存路径|打开本地|save\s*path|unsaved)/i.test(realOmlxRequest);
 
 const useSemanticMdViewerMutationOracle =
   realOmlxFixture === "md-viewer" &&
   process.env.REAL_OMLX_MUTATION_ORACLE !== "exact";
 const realOmlxMutationOracleFiles = useSemanticMdViewerMutationOracle
-  ? ["src/main.js", "src/components/toolbar.js"]
+  ? [
+      "src/main.js",
+      "src/components/editor.js",
+      "src/components/toolbar.js",
+      "src-tauri/src/main.rs",
+    ]
   : [realOmlxMutationFile];
 
 type FixtureMutationState = {
@@ -80,23 +153,50 @@ async function readFixtureMutationContents(workspace: string): Promise<Record<st
   ])));
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const PLAN_ONLY_FINGERPRINT_IGNORED_DIRECTORIES = new Set([
+  ".git",
+  ".MAIN",
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+]);
+
+async function fingerprintPlanOnlyWorkspace(workspace: string): Promise<string> {
+  const hash = createHash("sha256");
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (entry.isDirectory() && PLAN_ONLY_FINGERPRINT_IGNORED_DIRECTORIES.has(entry.name)) continue;
+      const absolutePath = path.join(directory, entry.name);
+      const relativePath = path.relative(workspace, absolutePath).replace(/\\/g, "/");
+      if (entry.isDirectory()) {
+        await visit(absolutePath);
+      } else if (entry.isFile()) {
+        hash.update(relativePath);
+        hash.update("\0");
+        hash.update(await fs.readFile(absolutePath));
+        hash.update("\0");
+      }
+    }
+  };
+  await visit(workspace);
+  return hash.digest("hex");
 }
 
-function mdViewerToolbarAndListenerIdsAgree(contents: Record<string, string>): boolean {
-  const mainSource = contents["src/main.js"] || "";
-  const toolbarSource = contents["src/components/toolbar.js"] || "";
-  return ["new", "open", "save"].every((role) =>
-    [`${role}-btn`, `btn-${role}`].some((id) => {
-      const escapedId = escapeRegExp(id);
-      const rendered = new RegExp(`\\bid\\s*=\\s*["']${escapedId}["']`).test(toolbarSource);
-      const observed = new RegExp(
-        `(?:["']${escapedId}["']\\s*:|getElementById\\(\\s*["']${escapedId}["']\\s*\\))`,
-      ).test(mainSource);
-      return rendered && observed;
-    })
-  );
+async function loadRealOmlxReplayImages(): Promise<string[]> {
+  if (!realOmlxImagePath) return [];
+  const extension = path.extname(realOmlxImagePath).toLowerCase();
+  const mime = extension === ".jpg" || extension === ".jpeg"
+    ? "image/jpeg"
+    : extension === ".gif"
+      ? "image/gif"
+      : extension === ".webp"
+        ? "image/webp"
+        : "image/png";
+  const body = await fs.readFile(realOmlxImagePath);
+  return [`data:${mime};base64,${body.toString("base64")}`];
 }
 
 async function inspectFixtureMutation(
@@ -107,15 +207,25 @@ async function inspectFixtureMutation(
   const changedFiles = baseline
     ? realOmlxMutationOracleFiles.filter((relativePath) => contents[relativePath] !== baseline[relativePath])
     : [];
+  const executionGaps = useSemanticMdViewerMutationOracle
+    ? getMdViewerExecutionGaps({
+        caller: contents["src/main.js"] || "",
+        editor: contents["src/components/editor.js"] || "",
+        handler: contents["src-tauri/src/main.rs"] || "",
+        toolbar: contents["src/components/toolbar.js"] || "",
+      })
+    : [];
   const satisfied = useSemanticMdViewerMutationOracle
-    ? mdViewerToolbarAndListenerIdsAgree(contents)
+    ? executionGaps.length === 0
     : realOmlxMutationExpectation.test(contents[realOmlxMutationFile] || "");
   return {
     satisfied,
     changedFiles,
     contents,
     detail: useSemanticMdViewerMutationOracle
-      ? "toolbar render IDs and main listener IDs agree for New/Open/Save"
+      ? executionGaps.length === 0
+        ? "redundant filename UI is removed, programmatic open stays clean, and save_file_content uses filePath"
+        : executionGaps.join("; ")
       : `${realOmlxMutationFile} matches ${realOmlxMutationExpectation.source}`,
   };
 }
@@ -181,7 +291,7 @@ function summarizePlanDebugTail(entries: unknown[]): string[] {
       if (!entry || typeof entry !== "object") return String(entry || "");
       const record = entry as Record<string, unknown>;
       const source = String(record.source || record.target || "");
-      if (!/(?:^agent\.plan_|^agent\.loop_stop$|^store\.(?:non_actionable_stop|agent_loop_stop_summary)$|^app\.instance\.closed$|stream_(?:error|timeout|watchdog))/i.test(source)) {
+      if (!/(?:^agent\.(?:plan_|loop_stop$|agent_loop_)|^store\.(?:non_actionable_stop|agent_loop_stop_summary|agent_loop_crashed|parent_subagents_finalized|terminal_|workflow_|harness_close_|stale_run_error_)|^app\.instance\.closed$|stream_(?:error|timeout|watchdog))/i.test(source)) {
         return "";
       }
       return [record.level, source, record.message]
@@ -225,6 +335,140 @@ function summarizeTaskFlowForFailure(entries: unknown[]): unknown[] {
       content: String(record.content || "").slice(0, 800),
     };
   });
+}
+
+type StructuredDebugEntry = Record<string, unknown> & { source: string };
+
+function parseStructuredDebugEntries(entries: unknown[]): StructuredDebugEntry[] {
+  return (Array.isArray(entries) ? entries : []).flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    let payload: Record<string, unknown> = {};
+    if (record.message && typeof record.message === "object") {
+      payload = record.message as Record<string, unknown>;
+    } else if (typeof record.message === "string") {
+      try {
+        const parsed = JSON.parse(record.message);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          payload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Human-readable debug text is intentionally excluded from assertions.
+      }
+    }
+    return [{ ...payload, source: String(record.source || "") }];
+  });
+}
+
+function inspectPreferredSubagentCollaboration(snapshot: any): {
+  ready: boolean;
+  detail: Record<string, unknown>;
+} {
+  const runs = (Array.isArray(snapshot?.subagentRuns) ? snapshot.subagentRuns : []) as Array<Record<string, unknown>>;
+  const acceptance = snapshot?.acceptanceState && typeof snapshot.acceptanceState === "object"
+    ? snapshot.acceptanceState as RealOmlxAcceptanceState
+    : createRealOmlxAcceptanceState();
+  const scopes = projectRealOmlxCollaborationScopes({
+    acceptance,
+    runs,
+    expectedScopeKeys: realOmlxExpectedSubagentScopes,
+  }).map((scope) => {
+    const scopeRuns = runs.filter((run) => scope.subagentIds.includes(String(run.id || "")));
+    const authoritativeRun = scopeRuns.some((run) =>
+      String(run.status || "") === "completed" &&
+      String(run.closureState || "") === "satisfied" &&
+      Number(run.substantiveEvidenceCount || 0) > 0 &&
+      Number.isFinite(run.startedAt) &&
+      Number.isFinite(run.completedAt) &&
+      Number(run.completedAt) >= Number(run.startedAt)
+    );
+    return { ...scope, authoritativeRun };
+  });
+  const intakePreferred = acceptance.observedSubagentPreferences.includes("preferred");
+  const allExpectedScopesSatisfied = scopes.length > 0 && scopes.every((scope) =>
+    scope.spawned && scope.joined && scope.consumed && scope.authoritativeRun
+  );
+  return {
+    ready:
+      snapshot?.preferSubagents === true &&
+      intakePreferred &&
+      allExpectedScopesSatisfied,
+    detail: {
+      preferSubagents: snapshot?.preferSubagents === true,
+      intakePreferred,
+      expectedScopeKeys: realOmlxExpectedSubagentScopes,
+      scopes,
+      acceptance,
+    },
+  };
+}
+
+async function assertPreferredSubagentCollaboration(page: Page): Promise<void> {
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    const inspection = inspectPreferredSubagentCollaboration(snapshot);
+    return inspection.ready ? "joined" : JSON.stringify(inspection.detail);
+  }, { timeout: 120_000 }).toBe("joined");
+}
+
+function assertFirstPlanWorkspaceTurnAdmission(snapshot: any): string {
+  const acceptanceReceipt = snapshot?.lastWorkspaceInstructionAcceptance?.accepted
+    ? snapshot.lastWorkspaceInstructionAcceptance.receipt
+    : null;
+  const admittedTurnId = String(acceptanceReceipt?.turnId || "");
+  const admittedReceiptId = String(acceptanceReceipt?.receiptId || "");
+  const admittedClientSubmissionId = String(acceptanceReceipt?.clientSubmissionId || "");
+  const admittedTurn = (snapshot?.conversationTurnPreview || []).find(
+    (turn: { id?: string }) => turn.id === admittedTurnId,
+  );
+  const ownedUserBlocks = (snapshot?.taskFlowPreview || []).filter(
+    (block: { turnId?: string; type?: string }) =>
+      block.type === "user" && block.turnId === admittedTurnId,
+  );
+  const receipt = (snapshot?.workspaceInstructionLedger || []).find(
+    (entry: { receiptId?: string; turnId?: string; clientSubmissionId?: string }) =>
+      entry.receiptId === admittedReceiptId &&
+      entry.turnId === admittedTurnId &&
+      entry.clientSubmissionId === admittedClientSubmissionId,
+  );
+  const admissionDiagnostic = JSON.stringify({
+    admittedTurnId,
+    activeTurnId: snapshot?.currentTurnId ?? null,
+    currentWorkspace: snapshot?.currentWorkspace ?? null,
+    currentSessionId: snapshot?.currentSessionId ?? null,
+    dispatchError: snapshot?.dispatchError ?? null,
+    acceptance: snapshot?.lastWorkspaceInstructionAcceptance ?? null,
+    ledger: snapshot?.workspaceInstructionLedger ?? [],
+    turns: snapshot?.conversationTurns ?? null,
+  });
+  expect(admittedTurnId, admissionDiagnostic).not.toBe("");
+  expect(admittedReceiptId).not.toBe("");
+  expect(admittedClientSubmissionId).not.toBe("");
+  expect(admittedTurn?.workspaceInstructionSource).toBe("composer");
+  expect(String(admittedTurn?.title || "").trim()).not.toBe("");
+  expect(admittedTurn?.intent).toBe("plan");
+  expect(admittedTurn?.displayIntent).toBe("plan");
+  expect(admittedTurn?.userPrompt).toBe(realOmlxRequest);
+  expect(String(admittedTurn?.status || "").trim()).not.toBe("");
+  expect(snapshot?.conversationTurns).toBe(1);
+  expect(ownedUserBlocks).toHaveLength(1);
+  expect(receipt).toEqual(expect.objectContaining({
+    receiptId: admittedReceiptId,
+    turnId: admittedTurnId,
+    clientSubmissionId: admittedClientSubmissionId,
+    userBlockId: ownedUserBlocks[0]?.id,
+  }));
+  expect(admittedTurn?.blockIds).toContain(ownedUserBlocks[0]?.id);
+  expect(snapshot?.lastWorkspaceInstructionAcceptance).toEqual(expect.objectContaining({
+    accepted: true,
+    receipt: expect.objectContaining({
+      receiptId: admittedReceiptId,
+      turnId: admittedTurnId,
+      clientSubmissionId: admittedClientSubmissionId,
+      userBlockId: ownedUserBlocks[0]?.id,
+    }),
+  }));
+  return admittedTurnId;
 }
 
 test.describe.configure({ timeout: 1_200_000 });
@@ -328,20 +572,54 @@ test.beforeEach(async ({ page }) => {
   }
 
   const resolveDiskPath = (rawPath: string) => {
-    const normalized = String(rawPath || ".")
-      .replace(workspace, "")
-      .replace(/^[/\\]+/, "")
-      .replace(/\\/g, "/");
-    return path.join(workspace, normalized || ".");
+    const candidate = path.isAbsolute(String(rawPath || ""))
+      ? path.resolve(String(rawPath))
+      : path.resolve(workspace, String(rawPath || "."));
+    if (!isPathInsideWorkspace(candidate, workspace)) {
+      throw new Error(`E2E_WORKSPACE_PATH_OUT_OF_SCOPE: ${rawPath}`);
+    }
+    return candidate;
   };
 
+  let workspaceInventoryPromise: Promise<RealOmlxWorkspaceInventory> | null = null;
+  const getWorkspaceInventory = () => {
+    workspaceInventoryPromise ??= collectBoundedRealOmlxWorkspaceFiles(workspace, {
+      maxFiles: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxWorkspaceFiles,
+    });
+    return workspaceInventoryPromise;
+  };
+  const invalidateWorkspaceInventory = () => {
+    workspaceInventoryPromise = null;
+  };
+  let acceptanceState = createRealOmlxAcceptanceState();
+  await page.exposeFunction("__MAIN_E2E_RECORD_ACCEPTANCE_EVENT", async (
+    source: string,
+    message: unknown,
+  ) => {
+    acceptanceState = recordRealOmlxAcceptanceDebugEvent(
+      acceptanceState,
+      source,
+      message,
+    );
+    return acceptanceState;
+  });
+
   await page.exposeFunction("__MAIN_E2E_DISK_READ", async (rawPath: string) => {
-    return await fs.readFile(resolveDiskPath(rawPath), "utf8");
+    const result = await readBoundedRealOmlxWorkspaceTextFile(workspace, rawPath, {
+      maxBytes: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxExplicitReadBytes,
+    });
+    if (!result.ok) {
+      throw new Error(
+        `E2E_WORKSPACE_READ_BLOCKED: ${result.path || rawPath} (${result.reason}, ${result.sizeBytes} bytes)`,
+      );
+    }
+    return result.content;
   });
   await page.exposeFunction("__MAIN_E2E_DISK_WRITE", async (rawPath: string, content: string) => {
     const absolute = resolveDiskPath(rawPath);
     await fs.mkdir(path.dirname(absolute), { recursive: true });
     await fs.writeFile(absolute, content, "utf8");
+    invalidateWorkspaceInventory();
     return null;
   });
   await page.exposeFunction("__MAIN_E2E_DISK_METADATA", async (rawPath: string) => {
@@ -349,35 +627,70 @@ test.beforeEach(async ({ page }) => {
     const stat = await fs.stat(absolute);
     return { path: rawPath, sizeBytes: stat.size, modifiedMs: stat.mtimeMs };
   });
-  await page.exposeFunction("__MAIN_E2E_DISK_GLOB", async () => {
-    const output: string[] = [];
-    const walk = async (dir: string) => {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const absolute = path.join(dir, entry.name);
-        const relative = path.relative(workspace, absolute).replace(/\\/g, "/");
-        if (entry.isDirectory()) {
-          await walk(absolute);
-        } else {
-          output.push(relative);
-        }
-      }
+  await page.exposeFunction("__MAIN_E2E_DISK_GLOB", async () => await getWorkspaceInventory());
+  await page.exposeFunction("__MAIN_E2E_DISK_SEARCH_FILES", async () => {
+    const inventory = await getWorkspaceInventory();
+    return {
+      ...selectBoundedRealOmlxSearchFiles(inventory.files, {
+        maxFiles: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxSearchFiles,
+      }),
+      inventoryTruncated: inventory.truncated,
     };
-    await walk(workspace);
-    return output;
   });
+  await page.exposeFunction("__MAIN_E2E_DISK_READ_TEXT_BATCH", async (rawPaths: string[]) =>
+    await readBoundedRealOmlxWorkspaceTextFiles(workspace, rawPaths, {
+      concurrency: REAL_OMLX_WORKSPACE_PROXY_LIMITS.searchReadConcurrency,
+      maxFileBytes: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxSearchFileBytes,
+      maxFiles: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxSearchFiles,
+      maxTotalBytes: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxSearchTotalBytes,
+    })
+  );
+  await page.exposeFunction("__MAIN_E2E_DISK_READ_WINDOW", async (
+    rawPath: string,
+    options: Record<string, unknown>,
+  ) => await readRealOmlxWorkspaceFileWindow(workspace, rawPath, {
+    startLine: Number(options?.startLine) || undefined,
+    endLine: Number(options?.endLine) || undefined,
+    maxLines: Number(options?.maxLines) || undefined,
+    maxChars: Number(options?.maxChars) || undefined,
+    maxScanBytes: REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxWindowScanBytes,
+  }));
   await page.exposeFunction("__MAIN_E2E_DISK_LIST", async (rawPath: string) => {
     const absolute = resolveDiskPath(rawPath);
     const entries = await fs.readdir(absolute, { withFileTypes: true });
-    return entries.map((entry) => {
+    return entries.flatMap((entry) => {
       const child = path.join(absolute, entry.name);
-      return {
+      const relativePath = path.relative(workspace, child).replace(/\\/g, "/");
+      if (entry.isDirectory() && shouldPruneRealOmlxWorkspaceDirectory(relativePath)) return [];
+      if (!entry.isDirectory() && !entry.isFile()) return [];
+      return [{
         name: entry.name,
-        path: path.relative(workspace, child).replace(/\\/g, "/"),
+        path: relativePath,
         is_dir: entry.isDirectory(),
-      };
+      }];
     });
   });
+  const initialWorkspaceInventory = await getWorkspaceInventory();
+  if (customWorkspace && initialWorkspaceInventory.files.length === 0) {
+    throw new Error(
+      "E2E_REAL_OMLX_CUSTOM_WORKSPACE_EMPTY: copy the real fixture into REAL_OMLX_WORKSPACE before starting validation.",
+    );
+  }
+  const leakedIgnoredPath = initialWorkspaceInventory.files.find((filePath) =>
+    /(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/i.test(filePath) ||
+    /^src-tauri\/(?:gen|icons)\//i.test(filePath)
+  );
+  if (leakedIgnoredPath) {
+    throw new Error(`E2E_WORKSPACE_INVENTORY_PRUNE_FAILED: ${leakedIgnoredPath}`);
+  }
+  console.log(`[real-omlx-workspace-inventory] ${JSON.stringify({
+    files: initialWorkspaceInventory.files.length,
+    maxFiles: initialWorkspaceInventory.maxFiles,
+    truncated: initialWorkspaceInventory.truncated,
+    visitedDirectories: initialWorkspaceInventory.visitedDirectories,
+    prunedDirectories: initialWorkspaceInventory.prunedDirectories,
+    skippedEntries: initialWorkspaceInventory.skippedEntries,
+  })}`);
   await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
     await inspectFixtureMutation(workspace)
   );
@@ -520,11 +833,56 @@ test.beforeEach(async ({ page }) => {
     return true;
   });
 
-  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture }) => {
+  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
+    (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ ??= {
+      authoringContractIds: [],
+      evidenceBundleHashes: [],
+      observedSubagentPreferences: [],
+      spawnedScopes: [],
+      joinedSubagentIds: [],
+      joinedScopeKeys: [],
+      consumedScopeKeys: [],
+    };
+    const acceptanceEventSources = new Set([
+      "agent.plan_authoring_contract_injected",
+      "agent.plan_evidence_bundle_ready",
+      "agent.plan_evidence_bundle_injected",
+      "agent.task_orchestrator_phase",
+      "agent.preferred_delegation_spawned",
+      "agent.preferred_delegation_scope_outcomes",
+      "agent.preferred_delegation_consumed",
+      "parent_join_injected",
+      "parent_resume",
+    ]);
     const canceledStreamIds = new Set<string>();
     const readText = async (path: string) => {
       return await (window as any).__MAIN_E2E_DISK_READ(path);
+    };
+    const readWorkspaceInventory = async () => {
+      const inventory = await (window as any).__MAIN_E2E_DISK_GLOB();
+      return Array.isArray(inventory)
+        ? { files: inventory, truncated: false, maxFiles: inventory.length }
+        : inventory;
+    };
+    const readSearchFileSelection = async () => {
+      const selection = await (window as any).__MAIN_E2E_DISK_SEARCH_FILES();
+      return Array.isArray(selection)
+        ? { files: selection, truncated: false, inventoryTruncated: false }
+        : selection;
+    };
+    const readTextBatch = async (paths: string[]) =>
+      await (window as any).__MAIN_E2E_DISK_READ_TEXT_BATCH(paths);
+    const normalizedWorkspacePath = (value: unknown) => String(value || ".")
+      .replace(/\\/g, "/")
+      .replace(String(workspace).replace(/\\/g, "/"), "")
+      .replace(/^\.\//, "")
+      .replace(/^\/+|\/+$/g, "");
+    const isPathInRequestedScope = (filePath: string, requestedPath: unknown) => {
+      const normalizedFile = normalizedWorkspacePath(filePath);
+      const normalizedScope = normalizedWorkspacePath(requestedPath);
+      return !normalizedScope || normalizedScope === "." ||
+        normalizedFile === normalizedScope || normalizedFile.startsWith(`${normalizedScope}/`);
     };
     const writeText = async (path: string, content: string) => {
       await (window as any).__MAIN_E2E_DISK_WRITE(path, content);
@@ -599,8 +957,24 @@ test.beforeEach(async ({ page }) => {
     });
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "append_debug_log") {
-        debugEntries.push(args || {});
-        if (debugEntries.length > 1_200) debugEntries.splice(0, debugEntries.length - 1_200);
+        const raw = args || {};
+        const message = String(raw.message || "");
+        debugEntries.push({
+          timestamp: String(raw.timestamp || ""),
+          level: String(raw.level || ""),
+          source: String(raw.source || ""),
+          message: message.length <= limits.maxDebugMessageChars
+            ? message
+            : `${message.slice(0, limits.maxDebugMessageChars)}...<e2e-debug-truncated:${message.length}>`,
+        });
+        if (debugEntries.length > limits.maxDebugEntries) {
+          debugEntries.splice(0, debugEntries.length - limits.maxDebugEntries);
+        }
+        if (acceptanceEventSources.has(String(raw.source || ""))) {
+          (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ = await (
+            window as any
+          ).__MAIN_E2E_RECORD_ACCEPTANCE_EVENT(String(raw.source || ""), raw.message);
+        }
         return null;
       }
       if (cmd === "plugin:event|listen") {
@@ -736,69 +1110,30 @@ test.beforeEach(async ({ page }) => {
         return null;
       }
       if (cmd === "get_project_skeleton") {
-        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
+        const inventory = await readWorkspaceInventory();
+        const filePaths = Array.isArray(inventory?.files) ? inventory.files : [];
         const visiblePaths = filePaths
           .filter((filePath: string) =>
-            !/(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/.test(filePath) &&
             !/(?:^|\/)\.[^/]+(?:\/|$)/.test(filePath) &&
-            !/^src-tauri\/(?:gen|icons)\//.test(filePath) &&
             !/(?:^|\/)package-lock\.json$/.test(filePath)
           )
           .slice(0, 120);
-        return [".", ...visiblePaths.map((filePath: string) => `- ${filePath}`)].join("\n");
+        return [
+          ".",
+          ...visiblePaths.map((filePath: string) => `- ${filePath}`),
+          ...(inventory?.truncated ? [`... (workspace inventory capped at ${inventory.maxFiles} files)`] : []),
+        ].join("\n");
       }
       if (cmd === "list_directory") {
         const path = String(args?.path || ".");
         try {
           return await (window as any).__MAIN_E2E_DISK_LIST(path === workspace ? "." : path);
-        } catch {
-          // Fall back to the deterministic fixture structure below.
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error || "unknown error");
+          throw new Error(
+            `E2E_${String(fixture || "workspace").toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_LIST_DIRECTORY_FAILED: ${path}: ${detail}`,
+          );
         }
-        if (path === "." || path.includes("e2e-real-omlx")) {
-          return [
-            { name: "src", path: "src", is_dir: true },
-            { name: "cn_tutorial_orders_by_creator_20260512.csv", path: "cn_tutorial_orders_by_creator_20260512.csv", is_dir: false },
-          ];
-        }
-        if (path === "src") {
-          return [
-            { name: "components", path: "src/components", is_dir: true },
-            { name: "hooks", path: "src/hooks", is_dir: true },
-            { name: "store", path: "src/store", is_dir: true },
-            { name: "types", path: "src/types", is_dir: true },
-            { name: "App.tsx", path: "src/App.tsx", is_dir: false },
-            { name: "index.css", path: "src/index.css", is_dir: false },
-          ];
-        }
-        if (path === "src/components") {
-          return [
-            { name: "Dashboard", path: "src/components/Dashboard", is_dir: true },
-            { name: "FileUploader", path: "src/components/FileUploader", is_dir: true },
-          ];
-        }
-        if (path === "src/components/Dashboard") {
-          return [
-            { name: "CourseBarChart.tsx", path: "src/components/Dashboard/CourseBarChart.tsx", is_dir: false },
-            { name: "TrendLineChart.tsx", path: "src/components/Dashboard/TrendLineChart.tsx", is_dir: false },
-            { name: "StatusPieChart.tsx", path: "src/components/Dashboard/StatusPieChart.tsx", is_dir: false },
-          ];
-        }
-        if (path === "src/components/FileUploader") {
-          return [{ name: "DragUpload.tsx", path: "src/components/FileUploader/DragUpload.tsx", is_dir: false }];
-        }
-        if (path === "src/hooks") {
-          return [
-            { name: "useChartData.ts", path: "src/hooks/useChartData.ts", is_dir: false },
-            { name: "useCsvParser.ts", path: "src/hooks/useCsvParser.ts", is_dir: false },
-          ];
-        }
-        if (path === "src/store") {
-          return [{ name: "dashboardStore.ts", path: "src/store/dashboardStore.ts", is_dir: false }];
-        }
-        if (path === "src/types") {
-          return [{ name: "order.ts", path: "src/types/order.ts", is_dir: false }];
-        }
-        return [];
       }
       if (cmd === "glob_search") {
         const requestedGlob = String(args?.glob || args?.pattern || args?.query || args?.path || "**/*")
@@ -839,21 +1174,48 @@ test.beforeEach(async ({ page }) => {
           return new RegExp(`${source}$`, "i");
         };
         const matcher = globToRegex(requestedGlob || "**/*");
-        return (await (window as any).__MAIN_E2E_DISK_GLOB())
-          .filter((filePath: string) =>
-            !/(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/.test(filePath) &&
-            !/(?:^|\/)\.[^/]+(?:\/|$)/.test(filePath)
-          )
-          .filter((filePath: string) => matcher.test(filePath));
+        const inventory = await readWorkspaceInventory();
+        return (Array.isArray(inventory?.files) ? inventory.files : [])
+          .filter((filePath: string) => !/(?:^|\/)\.[^/]+(?:\/|$)/.test(filePath))
+          .filter((filePath: string) => matcher.test(filePath))
+          .slice(0, limits.maxGlobResults);
       }
       if (cmd === "grep_search") {
         const query = String(args?.query || args?.pattern || "");
-        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
-        const entries = await Promise.all(filePaths.map(async (filePath: string) => [filePath, await readText(filePath)] as const));
-        return entries
-          .filter(([, content]) => !query || String(content).includes(query))
-          .map(([path, content]) => `${path}:1:${String(content).split("\n")[0]}`)
-          .join("\n");
+        const selection = await readSearchFileSelection();
+        const requestedPath = args?.path || ".";
+        const scopedFiles = (Array.isArray(selection?.files) ? selection.files : [])
+          .filter((filePath: string) => isPathInRequestedScope(filePath, requestedPath));
+        const batch = await readTextBatch(scopedFiles);
+        let matcher: RegExp | null = null;
+        try {
+          matcher = query ? new RegExp(query, "i") : null;
+        } catch {
+          matcher = query ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+        }
+        const hits: string[] = [];
+        let outputChars = 0;
+        let truncated = Boolean(selection?.truncated || selection?.inventoryTruncated || batch?.truncated);
+        for (const entry of Array.isArray(batch?.files) ? batch.files : []) {
+          const lines = String(entry.content || "").split(/\r?\n/);
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            if (matcher && !matcher.test(line)) continue;
+            const hit = `${entry.path}:${index + 1}:${line}`;
+            if (
+              hits.length >= limits.maxSearchResults ||
+              outputChars + hit.length + 1 > limits.maxGrepOutputChars
+            ) {
+              truncated = true;
+              break;
+            }
+            hits.push(hit);
+            outputChars += hit.length + 1;
+          }
+          if (hits.length >= limits.maxSearchResults || outputChars >= limits.maxGrepOutputChars) break;
+        }
+        if (truncated) hits.push("... (E2E workspace search truncated at bounded file/result limits)");
+        return hits.join("\n");
       }
       if (cmd === "code_ast_query") {
         const filePath = String(args?.path || "");
@@ -885,16 +1247,21 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "find_symbol_references") {
         const symbol = String(args?.symbol || "");
         const requestedPath = String(args?.path || "");
-        const allPaths = await (window as any).__MAIN_E2E_DISK_GLOB();
-        const filePaths = requestedPath
-          ? allPaths.filter((filePath: string) => filePath.startsWith(requestedPath))
-          : allPaths;
+        const selection = await readSearchFileSelection();
+        const filePaths = (Array.isArray(selection?.files) ? selection.files : [])
+          .filter((filePath: string) => /\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|cs)$/.test(filePath))
+          .filter((filePath: string) => isPathInRequestedScope(filePath, requestedPath));
+        const batch = await readTextBatch(filePaths);
         const occurrences: Array<Record<string, unknown>> = [];
-        for (const filePath of filePaths) {
-          const content = await readText(filePath);
+        let totalOccurrences = 0;
+        for (const entry of Array.isArray(batch?.files) ? batch.files : []) {
+          const filePath = String(entry.path || "");
+          const content = String(entry.content || "");
           String(content).split(/\r?\n/).forEach((line, index) => {
             const column = line.indexOf(symbol);
             if (column < 0) return;
+            totalOccurrences += 1;
+            if (occurrences.length >= limits.maxSearchResults) return;
             occurrences.push({
               path: filePath,
               language: filePath.endsWith(".tsx") ? "tsx" : "typescript",
@@ -909,38 +1276,59 @@ test.beforeEach(async ({ page }) => {
         return {
           symbol,
           scope: requestedPath || workspace,
-          scannedFiles: filePaths.length,
-          skippedFiles: 0,
+          scannedFiles: Array.isArray(batch?.files) ? batch.files.length : 0,
+          skippedFiles: Array.isArray(batch?.skipped) ? batch.skipped.length : 0,
           parseFailures: 0,
           occurrences,
-          truncated: false,
-          note: "E2E structured reference fixture",
+          truncated: Boolean(
+            selection?.truncated || selection?.inventoryTruncated || batch?.truncated ||
+            totalOccurrences > limits.maxSearchResults
+          ),
+          note: "E2E structured reference fixture with production-like file and result bounds",
         };
       }
       if (cmd === "build_repository_index") {
-        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
-        const sourceFiles = filePaths.filter((filePath: string) => /\.(?:ts|tsx|js|jsx|css)$/.test(filePath));
+        const selection = await readSearchFileSelection();
+        const sourceFiles = (Array.isArray(selection?.files) ? selection.files : [])
+          .filter((filePath: string) => /\.(?:ts|tsx|js|jsx|mjs|cjs|css|rs|py|json|toml|md)$/.test(filePath));
+        const batch = await readTextBatch(sourceFiles);
         const symbols: Array<Record<string, unknown>> = [];
         const imports: Array<Record<string, unknown>> = [];
         const calls: Array<Record<string, unknown>> = [];
-        for (const filePath of sourceFiles) {
-          const content = await readText(filePath);
+        let indexTruncated = Boolean(selection?.truncated || selection?.inventoryTruncated || batch?.truncated);
+        for (const entry of Array.isArray(batch?.files) ? batch.files : []) {
+          const filePath = String(entry.path || "");
+          const content = String(entry.content || "");
           const lines = String(content).split(/\r?\n/);
           lines.forEach((line, index) => {
             const symbol = line.match(/\b(?:export\s+)?(?:function|const|interface|type|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
             if (symbol) {
-              symbols.push({
-                name: symbol[1],
-                kind: line.includes("interface") ? "interface" : line.includes("type") ? "type" : line.includes("class") ? "class" : line.includes("function") ? "function" : "constant",
-                file: filePath,
-                line: index + 1,
-                signature: line.trim(),
-              });
+              if (symbols.length < limits.maxIndexEntries) {
+                symbols.push({
+                  name: symbol[1],
+                  kind: line.includes("interface") ? "interface" : line.includes("type") ? "type" : line.includes("class") ? "class" : line.includes("function") ? "function" : "constant",
+                  file: filePath,
+                  line: index + 1,
+                  signature: line.trim(),
+                });
+              } else {
+                indexTruncated = true;
+              }
             }
             const imported = line.match(/from\s+['"]([^'"]+)['"]/);
-            if (imported) imports.push({ from: filePath, to: imported[1], kind: "import", line: index + 1 });
+            if (imported) {
+              if (imports.length < limits.maxIndexEntries) {
+                imports.push({ from: filePath, to: imported[1], kind: "import", line: index + 1 });
+              } else {
+                indexTruncated = true;
+              }
+            }
             for (const call of line.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
-              calls.push({ from: filePath, symbol: call[1], line: index + 1 });
+              if (calls.length < limits.maxIndexEntries) {
+                calls.push({ from: filePath, symbol: call[1], line: index + 1 });
+              } else {
+                indexTruncated = true;
+              }
             }
           });
         }
@@ -952,21 +1340,28 @@ test.beforeEach(async ({ page }) => {
           calls,
           dependencies: [],
           embeddings: [],
+          truncated: indexTruncated,
         };
       }
       if (cmd === "read_file") return await readText(String(args?.path || ""));
       if (cmd === "read_file_window") {
         const path = String(args?.path || "");
-        const content = await readText(path);
+        const windowResult = await (window as any).__MAIN_E2E_DISK_READ_WINDOW(path, {
+          startLine: args?.startLine ?? args?.start_line,
+          endLine: args?.endLine ?? args?.end_line,
+          maxLines: args?.maxLines ?? args?.max_lines,
+          maxChars: args?.maxChars ?? args?.max_chars,
+        });
         return {
           path,
-          content,
-          startLine: 1,
-          endLine: content.split(/\r?\n/).length,
-          totalLines: content.split(/\r?\n/).length,
-          totalChars: content.length,
-          returnedChars: content.length,
-          truncated: false,
+          content: String(windowResult?.content || ""),
+          startLine: Number(windowResult?.startLine || 0),
+          endLine: Number(windowResult?.endLine || 0),
+          totalLines: Number(windowResult?.totalLines || 0),
+          totalChars: Number(windowResult?.totalChars || 0),
+          returnedChars: Number(windowResult?.returnedChars || 0),
+          truncated: Boolean(windowResult?.truncated),
+          nextStartLine: windowResult?.nextStartLine ?? null,
         };
       }
       if (cmd === "read_document") {
@@ -1130,6 +1525,7 @@ test.beforeEach(async ({ page }) => {
     apiKey: omlxApiKey,
     devServerUrl: realOmlxDevServerUrl,
     fixture: realOmlxFixture,
+    limits: REAL_OMLX_WORKSPACE_PROXY_LIMITS,
   });
 });
 
@@ -1137,6 +1533,10 @@ for (const model of models) {
   test(`real OMLX MAIN plan/approve/execute reaches closure or bounded pause with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     const originalMutationContents = await readFixtureMutationContents(workspace);
+    const originalPlanOnlyWorkspaceFingerprint = realOmlxPlanOnly
+      ? await fingerprintPlanOnlyWorkspace(workspace)
+      : "";
+    const replayImages = await loadRealOmlxReplayImages();
     const approvedBrowserRequestIds = new Set<string>();
     page.on("console", (message) => {
       const text = message.text();
@@ -1148,12 +1548,24 @@ for (const model of models) {
     });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
-    await page.evaluate((text) => {
+    const immediateAdmissionSnapshot = await page.evaluate(async ({ text, images, preferSubagents }) => {
       const bridge = (window as any).__CODELY_E2E__;
-      Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
+      if (preferSubagents) bridge?.setPreferSubagents?.(true);
+      try {
+        await Promise.resolve(bridge?.sendCloudMessage?.(text, images));
+      } catch (error) {
         bridge.dispatchError = error instanceof Error ? error.message : String(error);
-      });
-    }, realOmlxRequest);
+      }
+      return bridge?.getSnapshot?.();
+    }, {
+      text: realOmlxRequest,
+      images: replayImages,
+      preferSubagents: realOmlxPreferSubagents,
+    });
+
+    const admittedPlanTurnId = realOmlxPlanOnly
+      ? assertFirstPlanWorkspaceTurnAdmission(immediateAdmissionSnapshot)
+      : "";
 
     let lastPlanPollSignature = "";
     let lastPlanTerminalSignature = "";
@@ -1183,7 +1595,15 @@ for (const model of models) {
         }
         if (snapshot?.dispatchError) throw new Error(`dispatch_error:${snapshot.dispatchError}`);
         const artifactCount = snapshot?.planArtifacts?.length ?? 0;
-        if (artifactCount > 0) return "artifact_ready";
+        if (
+          artifactCount > 0 &&
+          snapshot?.isGenerating === false &&
+          snapshot?.agentStatus === "pending_review" &&
+          snapshot?.currentTurnStatus === "awaiting_approval" &&
+          reviewablePlanStages.has(String(snapshot?.planStage || ""))
+        ) {
+          return "artifact_ready";
+        }
         if (
           snapshot?.isGenerating === false &&
           (
@@ -1240,18 +1660,77 @@ for (const model of models) {
     }
 
     const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
-    const planQuality = validateActionablePlanArtifact(plan);
-    expect(planQuality.ok, planQuality.reason || "semantic plan validation failed").toBe(true);
-    expect(plan).toMatch(realOmlxPlanExpectation);
-    for (const expectation of realOmlxPlanExpectAll) {
-      expect(plan).toMatch(expectation);
+    if (isMdViewerSavePathIncident) {
+      expect(
+        getMdViewerReadablePlanGaps(plan),
+        "MD Viewer Markdown is a review projection and must expose readable R/C/V sections.",
+      ).toEqual([]);
+    } else {
+      expect(plan).toMatch(realOmlxPlanExpectation);
+      for (const expectation of realOmlxPlanExpectAll) {
+        expect(plan).toMatch(expectation);
+      }
     }
     expect(plan).not.toMatch(/用户目标：\s*(?:\n|$)/);
     expect(plan).not.toMatch(/以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change/i);
     expect(plan).not.toMatch(/直接相关的最小改动|写入前先用证据确认|依据证据：已搜索文件|依据证据：已查看目录/i);
     expect(plan).not.toMatch(/(?:已读证据|证据引用|Read Evidence)[\s\S]{0,800}\.MAIN\/plans\/plan\.md/i);
     const planSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    expect(planSnapshot?.planArtifacts || []).toHaveLength(1);
+    expect(planSnapshot?.planArtifacts?.[0]?.path).toBe(".MAIN/plans/plan.md");
+    const typedPlanArtifact = planSnapshot?.planArtifacts?.[0];
+    expect(typedPlanArtifact?.candidate).toBeTruthy();
+    expect(typedPlanArtifact?.candidate?.schemaVersion).toBe(PLAN_CANDIDATE_SCHEMA_VERSION);
+    expect(typedPlanArtifact?.candidate?.ingress).toBe("typed_runtime");
+    expect(typedPlanArtifact?.candidate?.validations?.some(
+      (validation: { primitive: Parameters<typeof isAcceptanceCapableValidationSpec>[0] }) =>
+        isAcceptanceCapableValidationSpec(validation.primitive),
+    )).toBe(true);
+    expect(validateSealedPlanCandidate({
+      candidate: typedPlanArtifact.candidate,
+      expectedContent: typedPlanArtifact.content,
+    })).toEqual([]);
+    expect(typedPlanArtifact?.candidateHash).toBe(
+      hashPlanCandidate(typedPlanArtifact.candidate),
+    );
+    expect(typedPlanArtifact?.authoringContractId).toBe(
+      typedPlanArtifact?.candidate?.authoringContractId,
+    );
+    const candidateEvidenceTargets = new Set(
+      typedPlanArtifact.candidate.evidence.map(
+        (entry: { target: string }) => String(entry.target || "").trim(),
+      ),
+    );
+    for (const target of realOmlxPlanEvidenceTargets) {
+      expect(
+        candidateEvidenceTargets.has(target),
+        `Typed Plan evidence must contain exact required target: ${target}`,
+      ).toBe(true);
+    }
+    const acceptanceState = planSnapshot?.acceptanceState as RealOmlxAcceptanceState | null;
+    expect(acceptanceState?.authoringContractIds || []).toContain(
+      typedPlanArtifact?.authoringContractId,
+    );
+    if (isMdViewerSavePathIncident) {
+      expect(
+        getMdViewerTypedPlanGaps(typedPlanArtifact.candidate),
+        "MD Viewer acceptance is owned by the typed evidence/diagnosis/change/validation graph, not Markdown keywords.",
+      ).toEqual([]);
+    }
+    expect(acceptanceState?.evidenceBundleHashes || []).toContain(
+      typedPlanArtifact?.candidate?.bundleHash,
+    );
+    const persistedPlan = await fs.readFile(
+      path.join(workspace, String(planSnapshot?.planArtifacts?.[0]?.path || "")),
+      "utf8",
+    );
+    expect(persistedPlan.trim()).toBe(plan.trim());
+    expect(reviewablePlanStages.has(String(planSnapshot?.planStage || ""))).toBe(true);
+    if (realOmlxPreferSubagents) {
+      await assertPreferredSubagentCollaboration(page);
+    }
     const planChatText = JSON.stringify(planSnapshot?.taskFlowPreview || []);
+    console.log(`[real-omlx-plan-artifact:${model}]\n${plan}`);
     console.log(`[real-omlx-chat-plan:${model}] ${planChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(planChatText).toMatch(realOmlxPlanOnly
       ? /read_file|grep_search|code_ast_query|读取|搜索|计划|根因|修复/i
@@ -1280,9 +1759,27 @@ for (const model of models) {
         return "running";
       }, { timeout: 120_000 }).toBe("pending_review");
       const finalPlanSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      expect(finalPlanSnapshot?.agentStatus).toBe("pending_review");
+      expect(finalPlanSnapshot?.currentTurnStatus).toBe("awaiting_approval");
+      expect(finalPlanSnapshot?.currentTurnId).toBe(admittedPlanTurnId);
+      expect(String(finalPlanSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
+      expect(finalPlanSnapshot?.currentTurnIntent).toBe("plan");
+      expect(finalPlanSnapshot?.planArtifacts || []).toHaveLength(1);
+      expect(finalPlanSnapshot?.planArtifacts?.[0]?.path).toBe(".MAIN/plans/plan.md");
+      expect(reviewablePlanStages.has(String(finalPlanSnapshot?.planStage || ""))).toBe(true);
       expect(JSON.stringify(finalPlanSnapshot?.debugTail || [])).not.toMatch(
         /plan_generation_failed|plan_evidence_materialization_exhausted/i,
       );
+      expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(originalPlanOnlyWorkspaceFingerprint);
+      if (isMdViewerSavePathIncident) {
+        expect(
+          getMdViewerReadablePlanGaps(plan),
+          "MD Viewer review projection must retain readable typed-node sections while awaiting approval.",
+        ).toEqual([]);
+        if (/\bopenFile\b/.test(plan)) {
+          expect(plan).toMatch(/openFile[^\n]{0,180}(?:未被调用|无调用|无引用|非主因|死代码|not\s+(?:called|referenced|the\s+cause)|dead\s+code)/i);
+        }
+      }
       return;
     }
 
@@ -1607,6 +2104,130 @@ for (const model of models) {
     expect(debugText).not.toMatch(/repeated_failure_policy_no_progress/);
   });
 
+  test(`real OMLX Execute completes the MD Viewer incident with ${model}`, async ({ page }) => {
+    test.skip(!runExecuteIncidentReplay || realOmlxFixture !== "md-viewer");
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const originalMainSource = await fs.readFile(path.join(workspace, "src/main.js"), "utf8");
+    const replayImages = await loadRealOmlxReplayImages();
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+
+    const immediateSnapshot = await page.evaluate(async ({ text, images }) => {
+      const bridge = (window as any).__CODELY_E2E__;
+      try {
+        await bridge?.sendDirectEditMessage?.(text, images);
+      } catch (error) {
+        bridge.dispatchError = error instanceof Error ? error.message : String(error);
+      }
+      return bridge?.getSnapshot?.();
+    }, {
+      text: realOmlxRequest,
+      images: replayImages,
+    });
+
+    expect(immediateSnapshot?.dispatchError).toBeNull();
+    expect(immediateSnapshot?.lastWorkspaceInstructionAcceptance?.accepted).toBe(true);
+    expect(immediateSnapshot?.conversationTurns).toBe(1);
+    const admittedTurnId = String(
+      immediateSnapshot?.lastWorkspaceInstructionAcceptance?.receipt?.turnId || "",
+    );
+    const admittedTurn = (immediateSnapshot?.conversationTurnPreview || []).find(
+      (turn: { id?: string }) => turn.id === admittedTurnId,
+    );
+    expect(admittedTurnId).not.toBe("");
+    expect(admittedTurn?.intent).toBe("execute");
+    expect(admittedTurn?.displayIntent).toBe("execute");
+    expect(admittedTurn?.userPrompt).toBe(realOmlxRequest);
+    expect(String(admittedTurn?.title || "").trim()).not.toBe("");
+
+    let observedRuntimeStart = false;
+    let terminalSnapshot: any = null;
+    let latestRuntimeSnapshot: any = immediateSnapshot;
+    const admissionStartedAt = Date.now();
+    try {
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+        latestRuntimeSnapshot = snapshot;
+        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+        if (
+          snapshot?.isGenerating === true ||
+          snapshot?.agentStatus !== "idle" ||
+          (snapshot?.toolBlocks || []).length > 0
+        ) {
+          observedRuntimeStart = true;
+        }
+        if (
+          observedRuntimeStart &&
+          snapshot?.isGenerating === false &&
+          ["idle", "error"].includes(String(snapshot?.agentStatus || ""))
+        ) {
+          terminalSnapshot = snapshot;
+          return "terminal";
+        }
+        if (!observedRuntimeStart && Date.now() - admissionStartedAt > 15_000) {
+          return "admitted_without_runtime_start";
+        }
+        return "running";
+      }, { timeout: realOmlxExecutionTimeoutMs }).toBe("terminal");
+    } catch (error) {
+      console.log(`[real-omlx-execute-timeout:${model}] ${JSON.stringify({
+        currentTurnStatus: latestRuntimeSnapshot?.currentTurnStatus,
+        currentTurnIntent: latestRuntimeSnapshot?.currentTurnIntent,
+        currentTurnTitle: latestRuntimeSnapshot?.currentTurnTitle,
+        agentStatus: latestRuntimeSnapshot?.agentStatus,
+        isGenerating: latestRuntimeSnapshot?.isGenerating,
+        iteration: latestRuntimeSnapshot?.harness?.iteration,
+        toolBlocks: latestRuntimeSnapshot?.toolBlocks,
+        debugTail: latestRuntimeSnapshot?.debugTail,
+      }).slice(-120_000)}`);
+      throw error;
+    }
+
+    console.log(`[real-omlx-execute-incident:${model}] ${JSON.stringify({
+      currentTurnStatus: terminalSnapshot?.currentTurnStatus,
+      currentTurnIntent: terminalSnapshot?.currentTurnIntent,
+      currentTurnTitle: terminalSnapshot?.currentTurnTitle,
+      agentStatus: terminalSnapshot?.agentStatus,
+      toolBlocks: terminalSnapshot?.toolBlocks,
+      debugTail: terminalSnapshot?.debugTail,
+    }).slice(-120_000)}`);
+
+    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    expect(terminalSnapshot?.currentTurnIntent).toBe("execute");
+    expect(String(terminalSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
+    const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
+    expect(terminalTurnId).not.toBe("");
+    const finalAssistantMessage = page.locator(
+      `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
+    );
+    await expect(finalAssistantMessage).toBeVisible();
+    expect(String(await finalAssistantMessage.textContent() || "").trim().length).toBeGreaterThan(0);
+
+    const toolBlocks = terminalSnapshot?.toolBlocks || [];
+    expect(toolBlocks.some((block: { name?: string; status?: string }) =>
+      ["apply_patch", "replace_in_file", "write_file", "write_file_atomic"].includes(String(block.name || "")) &&
+      block.status === "completed"
+    )).toBe(true);
+    expect(toolBlocks.some((block: { name?: string; status?: string }) =>
+      block.name === "run_command" && block.status === "completed"
+    )).toBe(true);
+
+    const finalMainSource = await fs.readFile(path.join(workspace, "src/main.js"), "utf8");
+    expect(finalMainSource).not.toBe(originalMainSource);
+    expect(finalMainSource).toMatch(/\bfilePath\s*:/);
+    expect(finalMainSource).not.toMatch(/\bfile_path\s*:/);
+    expect(getMdViewerExecutionGaps({
+      caller: finalMainSource,
+      editor: await fs.readFile(path.join(workspace, "src/components/editor.js"), "utf8"),
+      handler: await fs.readFile(path.join(workspace, "src-tauri/src/main.rs"), "utf8"),
+      toolbar: await fs.readFile(path.join(workspace, "src/components/toolbar.js"), "utf8"),
+    })).toEqual([]);
+
+    const debugText = JSON.stringify(terminalSnapshot?.debugTail || []);
+    expect(debugText).not.toMatch(
+      /TURN_RUNTIME_PLANNING_CHECKPOINT_OWNER_MISMATCH|closure_ledger_owner_mismatch|repeated_failure_policy_no_progress|required_tool_protocol_violation/,
+    );
+  });
+
   test(`real OMLX Goal Runtime completes with evidence or pauses safely with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     page.on("console", (message) => {
@@ -1718,8 +2339,13 @@ for (const model of models) {
   });
 }
 
-const subagentModel = process.env.OMLX_SUBAGENT_MODEL ||
-  models[0];
+const explicitSubagentModel = String(process.env.OMLX_SUBAGENT_MODEL || "").trim();
+if (runRealOmlx && explicitSubagentModel && explicitSubagentModel !== models[0]) {
+  throw new Error(
+    "Real OMLX validation requires parent and subagents to share the one explicitly loaded model.",
+  );
+}
+const subagentModel = explicitSubagentModel || models[0];
 
 test(`real OMLX honors the captured collaboration toggle after runtime admission with ${subagentModel}`, async ({ page }) => {
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
@@ -1759,8 +2385,8 @@ test(`real OMLX honors the captured collaboration toggle after runtime admission
         entry.preferredDelegationRequired === true &&
         entry.toolChoice === "required"
       ),
-      satisfied: parsedDebug.some((entry: { source?: string }) =>
-        entry.source === "agent.preferred_delegation_satisfied"
+      spawned: parsedDebug.some((entry: { source?: string }) =>
+        entry.source === "agent.preferred_delegation_spawned"
       ),
       hasSubagent: (snapshot?.subagentRuns?.length || 0) >= 1,
     };
@@ -1769,7 +2395,7 @@ test(`real OMLX honors the captured collaboration toggle after runtime admission
     intakePreferred: true,
     requirementInjected: true,
     requiredToolChoice: true,
-    satisfied: true,
+    spawned: true,
     hasSubagent: true,
   });
 
@@ -1906,8 +2532,34 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   expect(snapshot.agentStatus).toBe("pending_review");
   expect(snapshot.currentTurnStatus).toBe("awaiting_approval");
   expect(reviewablePlanStages.has(String(snapshot.planStage || ""))).toBe(true);
-  const planQuality = validateActionablePlanArtifact(snapshot.planArtifacts[0].content);
-  expect(planQuality.ok, planQuality.reason || "plan should be actionable").toBe(true);
+  expect(snapshot.planArtifacts[0].candidate.ingress).toBe("typed_runtime");
+  expect(snapshot.planArtifacts[0].candidate.validations.some(
+    (validation: { primitive: Parameters<typeof isAcceptanceCapableValidationSpec>[0] }) =>
+      isAcceptanceCapableValidationSpec(validation.primitive),
+  )).toBe(true);
+  expect(validateSealedPlanCandidate({
+    candidate: snapshot.planArtifacts[0].candidate,
+    expectedContent: snapshot.planArtifacts[0].content,
+  })).toEqual([]);
+  expect(snapshot.planArtifacts[0].candidateHash).toBe(
+    hashPlanCandidate(snapshot.planArtifacts[0].candidate),
+  );
+  expect(snapshot.planArtifacts[0].authoringContractId).toBe(
+    snapshot.planArtifacts[0].candidate.authoringContractId,
+  );
+  const candidateEvidenceTargets = new Set(
+    snapshot.planArtifacts[0].candidate.evidence.map(
+      (entry: { target: string }) => entry.target,
+    ),
+  );
+  for (const target of [
+    "src/hooks/useCsvParser.ts",
+    "src/hooks/useChartData.ts",
+    "src/store/dashboardStore.ts",
+    "src/types/order.ts",
+  ]) {
+    expect(candidateEvidenceTargets.has(target)).toBe(true);
+  }
   const runs = snapshot.subagentRuns as Array<{
     id: string;
     scopeKey: string;
@@ -2006,7 +2658,7 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   expect(debugText).not.toMatch(/out of memory|\bOOM\b|uncaught|unhandled rejection/i);
   const planAuthoringContractSnapshots = parsedDebugEntries.filter((entry) => (
     entry.source === "agent.plan_authoring_contract_injected" &&
-    entry.contractVersion === 2
+    entry.contractVersion === PLAN_AUTHORING_CONTRACT_VERSION
   )).map((entry) => ({
     iteration: entry.iteration,
     phase: entry.planRuntimePhase,

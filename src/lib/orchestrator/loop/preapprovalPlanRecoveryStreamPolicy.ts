@@ -1,7 +1,12 @@
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { FetchLLMStreamOptions } from "../types";
+import { SUBMIT_PLAN_CANDIDATE_TOOL_NAME } from "../../toolSchemas";
 
-export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS = 2_048;
+// The lease must fit the typed replacement graph and bounded provider output
+// overhead. Scale from the frozen graph shape, while retaining a hard ceiling
+// and zero automatic escalation so a malformed rewrite cannot grow forever.
+export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS = 4_096;
+export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS = 8_192;
 export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS = 120_000;
 export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS =
   "preapproval_plan_quality_recovery_stream_timeout";
@@ -21,6 +26,41 @@ export interface PreapprovalPlanQualityRecoveryStreamPolicy {
   stopClass: string | undefined;
 }
 
+export interface PreapprovalPlanGraphSize {
+  goals?: number;
+  evidence?: number;
+  changes?: number;
+  validations?: number;
+  interfaces?: number;
+}
+
+function boundedCount(value: number | undefined, max: number): number {
+  const parsed = Number(value) || 0;
+  return Math.min(max, Math.max(0, Math.floor(parsed)));
+}
+
+export function resolvePreapprovalPlanQualityRecoveryOutputTokens(
+  graphSize: PreapprovalPlanGraphSize | undefined,
+): number {
+  if (!graphSize) return PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS;
+  const goals = boundedCount(graphSize.goals, 32);
+  const evidence = boundedCount(graphSize.evidence, 96);
+  const changes = boundedCount(graphSize.changes, 48);
+  const validations = boundedCount(graphSize.validations, 48);
+  const interfaces = boundedCount(graphSize.interfaces, 48);
+  const estimated =
+    PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS +
+    Math.max(0, goals - 1) * 220 +
+    evidence * 72 +
+    changes * 120 +
+    validations * 160 +
+    interfaces * 72;
+  return Math.min(
+    PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
+    Math.max(PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS, estimated),
+  );
+}
+
 const INACTIVE_POLICY: PreapprovalPlanQualityRecoveryStreamPolicy = {
   active: false,
   stage: "none",
@@ -38,6 +78,7 @@ export function resolvePreapprovalPlanQualityRecoveryStreamPolicy(input: {
   planAutoScaffoldPromptIssued: boolean;
   llmToolNames: string[];
   forceXmlTools: boolean;
+  graphSize?: PreapprovalPlanGraphSize;
 }): PreapprovalPlanQualityRecoveryStreamPolicy {
   const active =
     input.workflowMode === "plan" &&
@@ -51,13 +92,18 @@ export function resolvePreapprovalPlanQualityRecoveryStreamPolicy(input: {
   return {
     active: true,
     stage,
-    maxOutputTokens: PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
+    maxOutputTokens: resolvePreapprovalPlanQualityRecoveryOutputTokens(input.graphSize),
     maxStreamElapsedMs: PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS,
     maxStreamElapsedLabel: `preapproval_plan_quality_recovery_${stage}`,
-    // Plan finalization is a visible-text turn. MAIN owns artifact
-    // materialization, so this policy must never manufacture a write-tool
-    // requirement from a stale or synthetic tool list.
-    toolChoice: undefined,
+    // The control-plane submission is not a write tool. Require it only when
+    // it is the exact native surface; compatibility providers follow the
+    // replacement authoring contract injected for their actual transport.
+    toolChoice:
+      !input.forceXmlTools &&
+      input.llmToolNames.length === 1 &&
+      input.llmToolNames[0] === SUBMIT_PLAN_CANDIDATE_TOOL_NAME
+        ? "required"
+        : undefined,
     stopClass: PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS,
   };
 }

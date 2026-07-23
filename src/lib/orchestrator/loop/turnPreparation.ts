@@ -25,6 +25,7 @@ import { withEventSchema, type MainThreadEventInput, type MainThreadProgressUpda
 import {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
+  normalizeTurnInputContextSignals,
   resolveEffectiveSubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../../turnIntake";
@@ -42,8 +43,10 @@ import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import { formatWebResearchLocalDate } from "../../webResearchGuard";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
+  appendVisualContextObservationContinuity,
   appendVisualObservationProtocol,
   preserveVisualContextDeliveryObservationsInSystemPrompt,
+  type VisualContextRecognitionObservation,
 } from "../../visualContext";
 import { resolveApprovedPlanTurnExpectations } from "./turnContractRuntime";
 
@@ -225,7 +228,26 @@ export function resolveAgentLoopTurnInputContext(
     runtimeState.workflowMode === "chat" &&
     isMutationRuntimeIntent(runtimeState.turnIntent) &&
     looksLikeRepairExecutionRequest(latestUserPromptText);
-  const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(runtimeState.initialMessages);
+  const turnRuntimeCheckpoint = callbacks.getTurnRuntimeCheckpoint?.() || null;
+  const checkpointOwnsTurn = !!turnRuntimeCheckpoint &&
+    turnRuntimeCheckpoint.owner.sessionKey === sessionKey &&
+    turnRuntimeCheckpoint.owner.turnId === turnId;
+  const turnInputContextSignals = checkpointOwnsTurn
+    ? normalizeTurnInputContextSignals(
+        turnRuntimeCheckpoint.input.admittedUserContext,
+      )
+    : extractTurnInputContextSignalsFromMessages(runtimeState.initialMessages);
+  callbacks.onDebugEvent?.("agent.turn_input_context_resolved", {
+    sessionKey,
+    turnId: turnId || null,
+    source: checkpointOwnsTurn ? "durable_turn_admission" : "legacy_message_fallback",
+    checkpointRevision: checkpointOwnsTurn ? turnRuntimeCheckpoint.revision : null,
+    imageParts: turnInputContextSignals.imageParts,
+    mentionedFiles: turnInputContextSignals.mentionedFilePaths.length,
+    attachedFiles: turnInputContextSignals.attachedFilePaths.length,
+    subagentPreference: turnInputContextSignals.subagentPreference,
+    syntheticMessagesExcludedFromAuthority: true,
+  });
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
   const gameStudioConfig = callbacks.getGameStudioConfig?.() ?? null;
   const gameStudioEngine = normalizeGameStudioEngineKey(gameStudioConfig?.engine);
@@ -271,6 +293,8 @@ export function createSystemPromptApplier(input: {
   getUnityMcpFirstPhaseActive: () => boolean;
   setLatestTurnContract: (contract: EffectiveTurnContract) => void;
   visualObservationRequest?: { turnId: string; imageCount: number } | null;
+  getVisualContextRecognitionObservation?: () =>
+    VisualContextRecognitionObservation | null;
 }): SystemPromptApplier {
   const {
     callbacks,
@@ -284,6 +308,7 @@ export function createSystemPromptApplier(input: {
     getUnityMcpFirstPhaseActive,
     setLatestTurnContract,
     visualObservationRequest,
+    getVisualContextRecognitionObservation,
   } = input;
   const {
     config,
@@ -338,6 +363,8 @@ export function createSystemPromptApplier(input: {
     const goalTurnContract = runtimeIntent === "goal"
       ? callbacks.getGoalTurnContract?.() ?? null
       : null;
+    const visualContextRecognitionObservation =
+      getVisualContextRecognitionObservation?.() || null;
     const systemPromptKey = [
       runtimeIntent,
       workflowMode,
@@ -366,6 +393,7 @@ export function createSystemPromptApplier(input: {
       toolSchemaFingerprint,
       visualObservationRequest?.turnId || "no-visual-turn",
       visualObservationRequest?.imageCount || 0,
+      visualContextRecognitionObservation?.observationId || "no-visual-observation",
     ].join("|");
     if (systemPromptKey === appliedSystemPromptKey) return;
 
@@ -431,9 +459,14 @@ export function createSystemPromptApplier(input: {
       effectiveTurnContract,
       goalTurnContract,
     );
-    const systemPrompt = visualObservationRequest
-      ? appendVisualObservationProtocol(baseSystemPrompt, visualObservationRequest)
-      : baseSystemPrompt;
+    const systemPrompt = visualContextRecognitionObservation
+      ? appendVisualContextObservationContinuity(
+          baseSystemPrompt,
+          visualContextRecognitionObservation,
+        )
+      : visualObservationRequest
+        ? appendVisualObservationProtocol(baseSystemPrompt, visualObservationRequest)
+        : baseSystemPrompt;
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {
       callbacks.appendMessage({ role: "system", content: systemPrompt });

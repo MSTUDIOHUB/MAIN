@@ -2,6 +2,7 @@ import {
   WorkflowEngine,
   type WorkflowContext,
   type WorkflowEngineStoreHelpers,
+  type WorkflowRunSettlement,
 } from "../lib/orchestrator/workflowEngine";
 import { saveProjectSession } from "../lib/ipc";
 
@@ -36,7 +37,7 @@ export function createSubmitWorkflowEngineHelpers(
 
 export function runSubmitWorkflowEngine(
   input: RunSubmitWorkflowEngineInput,
-): Promise<boolean> {
+): Promise<WorkflowRunSettlement> {
   const engine = new WorkflowEngine(
     input.get,
     input.set,

@@ -4,6 +4,10 @@ import type { StudioConfig } from "../lib/gameStudio/catalog";
 import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { WorkflowContext } from "../lib/orchestrator/workflowEngine";
 import type { PlanExecutionRunProvenance } from "../lib/planExecutionProvenance";
+import {
+  normalizeTurnInputContextSignals,
+  type TurnInputContextSignals,
+} from "../lib/turnIntake";
 
 export interface CreateSubmitWorkflowContextInput {
   turnId: string;
@@ -27,6 +31,8 @@ export interface CreateSubmitWorkflowContextInput {
   sendStartedAt: number;
   harnessRunId: string;
   planExecution: PlanExecutionRunProvenance | null;
+  /** First-admission payload facts; contains no image bytes. */
+  turnInputContextSignals: TurnInputContextSignals;
   turnAgentMessagesStart: number;
   getElapsedSeconds: () => number;
   PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: number;
@@ -61,6 +67,9 @@ export function createSubmitWorkflowContext(
     planExecution: input.planExecution
       ? Object.freeze({ ...input.planExecution })
       : null,
+    turnInputContextSignals: normalizeTurnInputContextSignals(
+      input.turnInputContextSignals,
+    ),
     streamBuffer: null,
     thinkingInterceptor: null,
     turnAgentMessagesStart: input.turnAgentMessagesStart,

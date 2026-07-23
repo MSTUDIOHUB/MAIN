@@ -27,6 +27,14 @@ import {
   hasSuccessfulTabularActivity,
 } from "../../orchestrator/planOrchestration";
 import { browserResultLooksSuccessful } from "../../planEvidence";
+import {
+  canonicalizePlanEvidenceObligationArgs,
+  derivePlanEvidenceObligations,
+  formatPlanEvidenceObligation,
+  getPlanEvidenceObligationToolName,
+  planEvidenceActivitySatisfiesReadTarget,
+  type PlanEvidenceObligation,
+} from "../../planEvidenceObligations";
 import { buildBrowserValidationCacheSignature } from "../../browserValidation";
 import {
   appendPlanRepeatReadLimitGuidance,
@@ -65,6 +73,7 @@ import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../r
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
 import type { ToolCatalog } from "../../toolCatalog";
+import { SUBMIT_PLAN_CANDIDATE_TOOL_NAME } from "../../toolSchemas";
 import {
   getShellToolCwd,
   looksDangerousShellCommand,
@@ -121,6 +130,8 @@ export interface ToolCallPartitioningResult {
   specFileCalls: ToolCallToExecute[];
   writeCalls: WriteToolCallForRound[];
   toolArgsByCallId: Map<string, Record<string, unknown>>;
+  /** Runtime-only exact obligations admitted for closure by call id. */
+  planEvidenceObligationClosuresByCallId: Map<string, PlanEvidenceObligation>;
   readOnlyCallSignatures: Map<string, string>;
   readFileWindowNarrowedNotes: Map<string, string>;
   toolFailureSignatures: Map<string, string>;
@@ -133,14 +144,26 @@ const SUBAGENT_SCOPE_NARROWABLE_READ_TOOLS = new Set([
   "git_diff",
 ]);
 
+export function normalizeFiniteValidationCheckpointCommand(value: unknown): string {
+  return String(value || "")
+    // Merging stderr into stdout changes only presentation, not command
+    // identity. Keep all other shell operators intact so compound commands
+    // cannot escape an exact finite-validation checkpoint.
+    .replace(/\s+(?:2>\s*&1|1>\s*&2)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function finiteValidationCheckpointMatchesArgs(input: {
   checkpoint: NonNullable<RecoveryActionContract["decisionCheckpoint"]>["pendingFiniteValidation"];
   args: Record<string, unknown>;
 }): boolean {
   const checkpoint = input.checkpoint;
   if (!checkpoint) return true;
-  const command = String(input.args.command || input.args.cmd || "").trim();
-  if (command !== checkpoint.command.trim()) return false;
+  const command = normalizeFiniteValidationCheckpointCommand(
+    input.args.command || input.args.cmd,
+  );
+  if (command !== normalizeFiniteValidationCheckpointCommand(checkpoint.command)) return false;
   if (getShellToolCwd(input.args) !== checkpoint.cwd) return false;
   if (checkpoint.timeoutMs !== undefined) {
     const requestedTimeout = Number(input.args.timeout_ms);
@@ -318,8 +341,9 @@ export function findReusableDelegatedPlanningEvidenceForRead(input: {
     activity.delegatedObservation?.planningEvidenceState === "unresolved"
   )) return null;
   return matching.find((activity) =>
-    activity.status === "succeeded" &&
-    activity.delegatedObservation?.planningEvidenceState === "reusable"
+    activity.delegatedObservation?.planningEvidenceState === "reusable" &&
+    activity.delegatedObservation.requiresParentReread !== true &&
+    planEvidenceActivitySatisfiesReadTarget(activity, input.target)
   ) || null;
 }
 
@@ -533,6 +557,7 @@ export async function partitionToolCallsForExecution(input: {
   const specFileCalls: ToolCallToExecute[] = [];
   const writeCalls: WriteToolCallForRound[] = [];
   const toolArgsByCallId = new Map<string, Record<string, unknown>>();
+  const planEvidenceObligationClosuresByCallId = new Map<string, PlanEvidenceObligation>();
   // Runtime-owned fan-out targets for broad child reads. This sidecar never
   // enters model-authored JSON, so it cannot be forged by a child response.
   const scopedReadPathsByCallId = new Map<string, string[]>();
@@ -554,6 +579,26 @@ export async function partitionToolCallsForExecution(input: {
     callbacks,
     recentToolActivity,
   });
+  const derivedPlanEvidenceObligation =
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
+    planRuntimePhase === "needs_evidence"
+      ? derivePlanEvidenceObligations({
+          objective: latestUserPromptText,
+          activities: recentPlanToolActivity,
+        })[0]
+      : undefined;
+  const expectedPlanEvidenceTool = derivedPlanEvidenceObligation
+    ? getPlanEvidenceObligationToolName(derivedPlanEvidenceObligation)
+    : null;
+  // The action contract is active only when tool-surface planning narrowed the
+  // iteration to this exact primitive. This preserves pending joins and an
+  // unfulfilled user-requested delegation checkpoint.
+  const exactPlanEvidenceContractActive =
+    !!derivedPlanEvidenceObligation &&
+    !!expectedPlanEvidenceTool &&
+    availableToolNames.size === 1 &&
+    availableToolNames.has(expectedPlanEvidenceTool);
   const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
     mode: executeRecoveryMode,
     calls: toolCalls.map((call) => {
@@ -595,6 +640,29 @@ export async function partitionToolCallsForExecution(input: {
         });
       }
     }
+    if (
+      exactPlanEvidenceContractActive &&
+      derivedPlanEvidenceObligation &&
+      tc.name === expectedPlanEvidenceTool
+    ) {
+      const requestedArgs = toolArgs;
+      toolArgs = canonicalizePlanEvidenceObligationArgs(
+        derivedPlanEvidenceObligation,
+        toolArgs,
+      );
+      tc.arguments = JSON.stringify(toolArgs);
+      planEvidenceObligationClosuresByCallId.set(tc.id, {
+        ...derivedPlanEvidenceObligation,
+      });
+      if (JSON.stringify(requestedArgs) !== JSON.stringify(toolArgs)) {
+        logAgentEvent("plan_evidence_obligation_args_canonicalized", {
+          iteration,
+          tool: tc.name,
+          obligation: formatPlanEvidenceObligation(derivedPlanEvidenceObligation),
+          providerNeutral: true,
+        });
+      }
+    }
     const targetingProfile = buildCurrentTaskTargetingProfile();
     const isPlanStructureExploreTool =
       workflowMode === "plan" &&
@@ -624,6 +692,32 @@ export async function partitionToolCallsForExecution(input: {
 
     toolArgsByCallId.set(tc.id, toolArgs);
     let target = getToolTarget(executionName, toolArgs);
+    if (tc.name === SUBMIT_PLAN_CANDIDATE_TOOL_NAME) {
+      // This call must be consumed by assistant stream post-processing and
+      // converted to typed ingress before partitioning. Fail closed here so a
+      // future routing regression can never turn it into an executor or disk
+      // operation.
+      const message = "PLAN_SUBMISSION_INGRESS_REQUIRED: submit_plan_candidate is runtime control-plane ingress and was not executed as an ordinary tool.";
+      logAgentEvent("native_plan_candidate_submission_partition_blocked", {
+        iteration,
+        toolCallId: tc.id,
+        workflowMode,
+        planRuntimePhase,
+        diskWritten: false,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target: "typed_plan_ingress",
+        content: message,
+        displayContent: "",
+        isError: true,
+        lifecycleState: "blocked",
+        internalFeedback: true,
+        qualityGateReason: "plan_submission_ingress_required",
+      });
+      continue;
+    }
     callbacks.onHarnessRunUpdate?.({
       latestTool: tc.name,
       latestToolTarget: target || null,
@@ -651,7 +745,9 @@ export async function partitionToolCallsForExecution(input: {
     toolFailureSignatures.set(tc.id, failureSignature);
 
     const reusableDelegatedPlanningEvidence =
-      workflowMode === "plan" && !callbacks.getIsPlanApproved()
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      availableToolNames.has(tc.name)
         ? findReusableDelegatedPlanningEvidenceForRead({
             toolName: executionName,
             target,
@@ -864,7 +960,11 @@ export async function partitionToolCallsForExecution(input: {
       continue;
     }
 
-    const isAllowedPlanDraftMutation =
+    // Keep runtime-owned Plan artifact attempts in the permission planner even
+    // when mutation tools are absent from the authoring tool surface. They are
+    // classified as a typed-ingress violation and blocked with actionable
+    // typed-submission feedback; they are never made executable here.
+    const isPreApprovalPlanArtifactMutationAttempt =
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
       isPreApprovalPlanDraftWrite(tc.name, toolArgs);
@@ -882,7 +982,7 @@ export async function partitionToolCallsForExecution(input: {
       );
     if (
       !availableToolNames.has(tc.name) &&
-      !isAllowedPlanDraftMutation &&
+      !isPreApprovalPlanArtifactMutationAttempt &&
       !isSelectedCurrentRecoveryMutation
     ) {
       const unsupportedMessage = planUnsupportedToolFeedbackMessage({
@@ -1268,6 +1368,7 @@ export async function partitionToolCallsForExecution(input: {
       const scopeConflict = activeSubagentScope ? null : scopeTargets
         .map((scopeTarget) => findSubagentScopeConflict({
           threadId: callbacks.getSessionKey(),
+          sessionEpoch: callbacks.getTurnRuntimeCheckpoint?.()?.owner.sessionEpoch,
           targetPath: scopeTarget,
         }))
         .find(Boolean) || null;
@@ -1776,7 +1877,7 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
-    const effectiveAvailableToolNames = isAllowedPlanDraftMutation
+    const effectiveAvailableToolNames = isPreApprovalPlanArtifactMutationAttempt
       ? new Set([...availableToolNames, tc.name])
       : availableToolNames;
     const planned = planRuntimeToolCall({
@@ -2008,6 +2109,7 @@ export async function partitionToolCallsForExecution(input: {
                 modifiedMs: fileReadState.modifiedMs,
                 contentHash: fileReadState.contentHash,
                 source: "replay",
+                ...(fileReadState.window ? { window: fileReadState.window } : {}),
               }),
             });
             continue;
@@ -2075,6 +2177,7 @@ export async function partitionToolCallsForExecution(input: {
               modifiedMs: fileReadState.modifiedMs,
               contentHash: fileReadState.contentHash,
               source: "stub",
+              ...(fileReadState.window ? { window: fileReadState.window } : {}),
             }),
           });
           continue;
@@ -2122,6 +2225,7 @@ export async function partitionToolCallsForExecution(input: {
               modifiedMs: coverage.fullFileState.modifiedMs,
               contentHash: coverage.fullFileState.contentHash,
               source: "stub",
+              ...(coverage.fullFileState.window ? { window: coverage.fullFileState.window } : {}),
             }),
           });
           continue;
@@ -2209,6 +2313,7 @@ export async function partitionToolCallsForExecution(input: {
                   modifiedMs: fileReadState.modifiedMs,
                   contentHash: fileReadState.contentHash,
                   source: "stub",
+                  ...(fileReadState.window ? { window: fileReadState.window } : {}),
                 }),
               });
               continue;
@@ -2401,6 +2506,7 @@ export async function partitionToolCallsForExecution(input: {
     specFileCalls,
     writeCalls,
     toolArgsByCallId,
+    planEvidenceObligationClosuresByCallId,
     readOnlyCallSignatures,
     readFileWindowNarrowedNotes,
     toolFailureSignatures,

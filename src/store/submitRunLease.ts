@@ -5,6 +5,10 @@ import type { ResolvedRunIntent } from "../lib/runIntent";
 import { resolveSubmitRunLineage } from "../lib/runIdentity";
 import type { SubagentDelegationPreference } from "../lib/turnIntake";
 import {
+  digestVisualPayloadIdentities,
+  visualPayloadIdentitiesFromContent,
+} from "../lib/visualContext";
+import {
   buildSubmitHarnessRunMarkerDraft,
   isGoalCreationAuthorization,
   type GoalCreationAuthorization,
@@ -74,9 +78,15 @@ export function createSubmitHarnessRunId(startedAtMs: number): string {
 export function buildSubmitAgentUserMessage(params: {
   userContent: string;
   currentImages: string[];
+  runtimeTurnId?: string;
 }): AgentMessage {
+  const runtimeTurnId = String(params.runtimeTurnId || "").trim();
   if (params.currentImages.length <= 0) {
-    return { role: "user", content: params.userContent };
+    return {
+      role: "user",
+      content: params.userContent,
+      ...(runtimeTurnId ? { runtimeTurnId } : {}),
+    };
   }
 
   const parts: ContentPart[] = params.currentImages.map((dataUrl) => ({
@@ -86,7 +96,18 @@ export function buildSubmitAgentUserMessage(params: {
   if (params.userContent.trim()) {
     parts.push({ type: "text", text: params.userContent });
   }
-  return { role: "user", content: parts };
+  const payloadIdentities = visualPayloadIdentitiesFromContent(parts);
+  return {
+    role: "user",
+    content: parts,
+    ...(runtimeTurnId ? { runtimeTurnId } : {}),
+    ...(runtimeTurnId
+      ? {
+          runtimeVisualImageParts: payloadIdentities.length,
+          runtimeVisualPayloadDigest: digestVisualPayloadIdentities(payloadIdentities),
+        }
+      : {}),
+  };
 }
 
 export function startSubmitRunLease<TAbortController>(
@@ -97,6 +118,7 @@ export function startSubmitRunLease<TAbortController>(
   const agentUserMessage = buildSubmitAgentUserMessage({
     userContent: input.userContent,
     currentImages: input.currentImages,
+    runtimeTurnId: input.turnId,
   });
   const hasExplicitGoalCreationAuthorization = isGoalCreationAuthorization(
     input.goalCreationAuthorization,

@@ -89,6 +89,40 @@ test("published model final remains canonical while durable evidence determines 
   assert.deepEqual(result.execution.validations, ["run_command: npm test"]);
 });
 
+test("a later successful retry reconciles the same failed validation in durable context", () => {
+  const failedValidation = {
+    ...validationBlock,
+    id: 30,
+    status: "error",
+    toolStatus: "failed",
+    message: JSON.stringify({
+      command: "npm test",
+      exitCode: 1,
+      stdout: "1 test failed",
+      stderr: "",
+    }),
+  };
+  const successfulRetry = {
+    ...validationBlock,
+    id: 31,
+    message: JSON.stringify({
+      command: "npm test",
+      exitCode: 0,
+      stdout: "12 tests passed",
+      stderr: "",
+    }),
+  };
+  const result = resolveCompletedTurnFinalPresentation({
+    turnBlocks: [userBlock, writeBlock, failedValidation, successfulRetry],
+    publishedModelFinalText: "修复完成，测试已通过。",
+    language: "zh",
+  });
+
+  assert.equal(result.source, "model_final");
+  assert.deepEqual(result.execution.validations, ["run_command: npm test"]);
+  assert.deepEqual(result.execution.failures, []);
+});
+
 test("tool-only completion gets a deterministic Codex-style final from durable evidence", () => {
   const result = resolveCompletedTurnFinalPresentation({
     turnBlocks: [userBlock, writeBlock, validationBlock],
@@ -600,15 +634,11 @@ test("workflow terminal contract routes canonical conclusions through supported 
   assert.match(workflowSource, /paused_turn_final_presentation_staged/);
   assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
-  assert.match(workflowSource, /completedTurnHasChanges \? "completed_with_changes" : "done"/);
-  assert.match(
-    workflowSource,
-    /outcome\.status === "completed" && outcome\.resultKind === "error"\s*\? "error"/,
-  );
-  assert.match(
-    workflowSource,
-    /agentStatus:[\s\S]*?outcome\.status === "completed" && outcome\.resultKind === "error"[\s\S]*?\? "error"/,
-  );
+  assert.match(workflowSource, /projectTurnRuntimeCheckpointTransaction\(\{/);
+  assert.match(workflowSource, /turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint\(/);
+  assert.match(workflowSource, /canonicalCompatibility\.conversationTurnStatus === "done" && completedTurnHasChanges/);
+  assert.match(workflowSource, /committedCanonicalAgentStatus = canonicalCompatibility\.agentStatus/);
+  assert.match(workflowSource, /agentStatus: committedCanonicalAgentStatus/);
   assert.match(workflowSource, /本回合执行失败并已收口，MAIN 未能完成所请求的工作/);
   assert.match(
     workflowSource,
@@ -636,7 +666,7 @@ test("Feishu completion cards are emitted only after completed terminal commitme
   const callbackStart = workflowSource.indexOf("onAssistantFinalText:");
   const callbackEnd = workflowSource.indexOf("onToolExecuting:", callbackStart);
   const callbackSource = workflowSource.slice(callbackStart, callbackEnd);
-  const terminalStart = workflowSource.indexOf("return prepareSubagentsForNewTurn().then(executeLoopStrategy)");
+  const terminalStart = workflowSource.indexOf("return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop)");
   const terminalCommit = workflowSource.indexOf("const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(", terminalStart);
   const terminalCommitGuard = workflowSource.indexOf("if (!terminalProjection.committed)", terminalCommit);
   const committedFinal = workflowSource.indexOf("const completedFinalTextForRemote = terminalProjection.finalText", terminalCommitGuard);

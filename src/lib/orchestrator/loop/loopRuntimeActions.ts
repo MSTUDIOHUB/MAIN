@@ -159,11 +159,11 @@ export function createAgentLoopRuntimeActions(input: {
       explicitObservation?.versionToken ||
       "",
     ).trim() || null;
-    const declarationContextLease =
+    const explicitContextLease =
       mode === "patch_recovery_read" &&
       expectedTarget &&
-      (explicitReadLease?.purpose === "initial_targeting" ||
-        explicitReadLease?.purpose === "plan_line_context")
+      explicitReadLease &&
+      explicitReadLease.purpose !== "patch_recovery"
         ? {
             ...explicitReadLease,
             target: expectedTarget,
@@ -172,7 +172,7 @@ export function createAgentLoopRuntimeActions(input: {
             state: "available" as const,
           }
         : null;
-    const patchReadLeaseCandidate: RecoveryReadLease | null = declarationContextLease || (
+    const patchReadLeaseCandidate: RecoveryReadLease | null = explicitContextLease || (
       mode === "patch_recovery_read" && expectedTarget
         ? {
             purpose: "patch_recovery",

@@ -1,10 +1,6 @@
 import { summarizeThought, thoughtSummaryToString } from "../../chat/StreamingThoughtSummarizer";
 import { ensureVisibleConclusionWithPolicy, normalizeAssistantTurn } from "../../normalizedTurn";
 import { logAgentEvent } from "../../orchestrator";
-import {
-  extractExplicitPlanProtocolFromReasoning,
-  hasExplicitPlanProposal,
-} from "../../planProposal";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
 import type { NormalizedStreamState } from "../../workflowModels";
@@ -77,34 +73,16 @@ export function processAssistantStreamResponse(input: {
           reasoningField: streamResult.reasoningField,
         }
       : null;
-  const recoveredReasoningPlan =
-    workflowMode === "plan" &&
-    !hasExplicitPlanProposal(providerVisibleText) &&
-    providerReasoningForHistory
-      ? extractExplicitPlanProtocolFromReasoning(
-          providerReasoningForHistory.reasoningContent,
-        )
-      : null;
-  // This channel is consumed by Plan protocol parsing/materialization only.
-  // Normalization still receives the original provider response below, so no
-  // hidden prose becomes user-visible.
-  const streamText = recoveredReasoningPlan || providerVisibleText;
+  // Provider reasoning remains diagnostic history only. Plan authority may
+  // enter through a raw native call or visible protocol content, never by
+  // promoting private scratchpad text into the materialization channel.
+  const streamText = providerVisibleText;
   const contentShort = providerVisibleText.length < 10;
   const toolCallsFew = streamResult.toolCalls.length < 2;
   const emitDebug = (event: string, data: Record<string, unknown>) => {
     if (input.onDebugEvent) input.onDebugEvent(`agent.${event}`, data);
     else logAgentEvent(event, data);
   };
-
-  if (recoveredReasoningPlan) {
-    emitDebug("plan_protocol_recovered_from_reasoning", {
-      iteration,
-      protocolChars: recoveredReasoningPlan.length,
-      providerVisibleChars: providerVisibleText.length,
-      reasoningChars: providerReasoningForHistory?.reasoningContent.length ?? 0,
-      surroundingReasoningExposed: false,
-    });
-  }
 
   emitDebug("stream_done", {
     iteration,
@@ -168,7 +146,7 @@ export function processAssistantStreamResponse(input: {
     try { turnContext.accumulateReasoning(providerReasoningForHistory.reasoningContent.length); } catch {}
   }
 
-  if (providerVisibleText.length === 0 && streamResult.toolCalls.length === 0 && !recoveredReasoningPlan) {
+  if (providerVisibleText.length === 0 && streamResult.toolCalls.length === 0) {
     emitDebug("llm_empty_response_diagnostic", {
       iteration,
       elapsedMs: Date.now() - iterationRequestStartedAt,

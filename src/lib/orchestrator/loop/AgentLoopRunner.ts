@@ -8,7 +8,11 @@ import {
 } from "../../runOutcome";
 import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
 import { AgentOrchestrator } from "./AgentOrchestrator";
-import { resolveNonActionableStopOutcome, runAgentLoopCompletionGuards } from "./completionGuards";
+import {
+  isRecoverableRuntimePauseReason,
+  resolveNonActionableStopOutcome,
+  runAgentLoopCompletionGuards,
+} from "./completionGuards";
 
 function buildAgentLoopErrorReason(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error || "");
@@ -31,6 +35,19 @@ export async function executeAgentLoop(
     if (outcome && isErrorAgentLoopOutcome(outcome)) return;
     if (isErrorAgentLoopOutcome(next) || outcome === null) outcome = next;
   };
+  const invokePresentationCallback = (
+    callbackName: "onAssistantFinalText" | "onNonActionableStop" | "onStatusChange" | "onError",
+    invoke: () => void,
+  ) => {
+    try {
+      invoke();
+    } catch (error) {
+      logAgentEvent("agent_loop_presentation_callback_failed", {
+        callbackName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
   const wrappedCallbacks: OrchestratorCallbacks = {
     ...callbacks,
     onAssistantFinalText: (text, replyOptions = [], meta) => {
@@ -41,21 +58,36 @@ export async function executeAgentLoop(
           replyOptions: replyOptions.length,
         });
       }
-      callbacks.onAssistantFinalText(
-        text,
-        isSubagent ? [] : replyOptions,
-        isSubagent ? { ...meta, awaitingInput: false } : meta,
-      );
+      invokePresentationCallback("onAssistantFinalText", () => {
+        callbacks.onAssistantFinalText(
+          text,
+          isSubagent ? [] : replyOptions,
+          isSubagent ? { ...meta, awaitingInput: false } : meta,
+        );
+      });
     },
     onNonActionableStop: (message, reason, progress) => {
-      setOutcome(resolveNonActionableStopOutcome(reason, progress, {
+      const nonActionableOutcome = resolveNonActionableStopOutcome(reason, progress, {
         sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
-      }));
-      callbacks.onNonActionableStop(message, reason, progress);
+      });
+      setOutcome(nonActionableOutcome);
+      // Commit the exact recoverable boundary before AgentOrchestrator's
+      // generic stopped-run fallback can publish `assistant_stopped`.
+      // Otherwise the terminal transaction sees two different run.paused
+      // meanings, rejects the projection, and can leave the UI owner running.
+      if (nonActionableOutcome.status === "paused") {
+        orchestrator.pauseActiveRun?.(nonActionableOutcome.reason, message);
+      }
+      invokePresentationCallback("onNonActionableStop", () => {
+        callbacks.onNonActionableStop(message, reason, progress);
+      });
     },
     onError: (error) => {
       setOutcome(completedAgentLoopOutcome(buildAgentLoopErrorReason(error), "error"));
-      callbacks.onError(error);
+      invokePresentationCallback("onError", () => callbacks.onError(error));
+    },
+    onStatusChange: (status) => {
+      invokePresentationCallback("onStatusChange", () => callbacks.onStatusChange(status));
     },
   };
 
@@ -74,7 +106,7 @@ export async function executeAgentLoop(
 
   const runPauseReason = orchestrator.getLatestRunPauseReason?.();
   if (runPauseReason && outcome === null) {
-    if (runPauseReason === "max_iterations_auto_resume") {
+    if (isRecoverableRuntimePauseReason(runPauseReason)) {
       setOutcome(pausedAgentLoopOutcome(runPauseReason, "recoverable"));
     } else if (
       runPauseReason === "plan_review_required" ||
@@ -103,12 +135,12 @@ export async function executeAgentLoop(
     logAgentEvent("agent_loop_missing_terminal_outcome", {
       pendingTurnCompletion: orchestrator.hasPendingTurnCompletion?.() === true,
     });
-    callbacks.onNonActionableStop?.(message, "no_action", {
+    wrappedCallbacks.onNonActionableStop?.(message, "no_action", {
       phase: "paused",
       recoveryReason: "agent_loop_no_terminal_outcome",
       nextStep: message,
     });
-    callbacks.onStatusChange?.("idle");
+    wrappedCallbacks.onStatusChange?.("idle");
     setOutcome(completedAgentLoopOutcome("agent_loop_no_terminal_outcome", "error"));
   }
   const resolvedOutcome = outcome as AgentLoopOutcome | null;
@@ -124,7 +156,7 @@ export async function executeAgentLoop(
         completionGuardRequestedIdle = true;
         return;
       }
-      callbacks.onStatusChange(status);
+      wrappedCallbacks.onStatusChange(status);
     },
   };
   const guardedOutcome = resolvedOutcome.status === "completed" && resolvedOutcome.resultKind === "success"
@@ -152,7 +184,7 @@ export async function executeAgentLoop(
         : `The run was not committed as complete: ${guardedOutcome.reason}.`,
     );
     if (completionGuardRequestedIdle) {
-      callbacks.onStatusChange("idle");
+      wrappedCallbacks.onStatusChange("idle");
     }
   }
   return guardedOutcome;

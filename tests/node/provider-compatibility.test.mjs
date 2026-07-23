@@ -173,6 +173,53 @@ test("provider compatibility replaces a native tool card instead of appending a 
   assert.match(text, /\[ROLE\][\s\S]*\[COMPLETION\]/);
 });
 
+test("Plan native fallback atomically replaces the authoring card with its text transport twin", () => {
+  const nativePlanCard = [
+    "[PLAN AUTHORING CONTRACT]",
+    "version=1; id=plan-contract; stage=revise; runtimePhase=needs_rewrite.",
+    "Submission transport: native tool submit_plan_candidate.",
+    "Call `submit_plan_candidate` exactly once and do not emit `<plan_candidate>`.",
+    "[/PLAN AUTHORING CONTRACT]",
+  ].join("\n");
+  const textPlanCard = [
+    "[PLAN AUTHORING CONTRACT]",
+    "version=1; id=plan-contract; stage=revise; runtimePhase=needs_rewrite.",
+    "Submission transport: text envelope <plan_candidate>.",
+    "Emit exactly one complete `<plan_candidate>` and no surrounding prose.",
+    "[/PLAN AUTHORING CONTRACT]",
+  ].join("\n");
+
+  const messages = ensureProviderCompatibilityMode([{
+    role: "system",
+    content: nativePlanCard,
+  }], "plan", [], {
+    replacementPlanAuthoringContract: textPlanCard,
+  });
+  const text = messages.map((message) => String(message.content || "")).join("\n");
+
+  assert.equal((text.match(/\[PLAN AUTHORING CONTRACT\]/g) || []).length, 1);
+  assert.equal((text.match(/\[\/PLAN AUTHORING CONTRACT\]/g) || []).length, 1);
+  assert.match(text, /Submission transport: text envelope <plan_candidate>/);
+  assert.doesNotMatch(text, /native tool submit_plan_candidate|Call `submit_plan_candidate`/);
+  assert.match(text, /native_tools_disabled=true/);
+});
+
+test("Plan compatibility retry wiring carries the replacement card and removes submit from XML tools", () => {
+  const preparationSource = fsSync.readFileSync(path.join(
+    workspaceRoot,
+    "src/lib/orchestrator/loop/iterationStreamPreparation.ts",
+  ), "utf8");
+  const recoverySource = fsSync.readFileSync(path.join(
+    workspaceRoot,
+    "src/lib/orchestrator/loop/streamRecovery.ts",
+  ), "utf8");
+
+  assert.match(preparationSource, /providerCompatibilityPlanAuthoringCard\s*=\s*formatPlanAuthoringContractForModel/);
+  assert.match(preparationSource, /submissionTransport:\s*"text_envelope"/);
+  assert.match(recoverySource, /replacementPlanAuthoringContract:\s*providerCompatibilityPlanAuthoringCard/);
+  assert.match(recoverySource, /tool\.function\.name\s*!==\s*SUBMIT_PLAN_CANDIDATE_TOOL_NAME/);
+});
+
 test("XML tool compatibility preserves multimodal user content while flattening tool history", () => {
   const messages = buildCompatibilityRetryMessages([
     {
@@ -215,6 +262,9 @@ test("XML tool compatibility preserves multimodal user content while flattening 
 test("explicit image incompatibility omits images with structured unsupported state", () => {
   const [message] = buildCompatibilityRetryMessages([{
     role: "user",
+    runtimeTurnId: "turn-image-owner",
+    runtimeVisualImageParts: 1,
+    runtimeVisualPayloadDigest: "digest-image-owner",
     content: [
       { type: "text", text: "Inspect the screenshot" },
       { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
@@ -228,6 +278,9 @@ test("explicit image incompatibility omits images with structured unsupported st
   assert.match(message.content, /imageCount: 1/);
   assert.match(message.content, /Do not infer or claim visual details/);
   assert.doesNotMatch(message.content, /data:image/);
+  assert.equal(message.runtimeTurnId, "turn-image-owner");
+  assert.equal(message.runtimeVisualImageParts, 1);
+  assert.equal(message.runtimeVisualPayloadDigest, "digest-image-owner");
 });
 
 test("transcript compatibility retry collapses history into one plain-text user message", () => {

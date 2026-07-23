@@ -601,9 +601,11 @@ test("runtime progress events normalize structured tool identity before ledger a
   assert.equal(items[0].repeatCount, 4);
   assert.deepEqual(items[0].sourceToolCallIds, ["read-1", "read-2", "read-3", "read-4"]);
   const projection = buildRunStatusProjection(items, "zh");
-  assert.equal(projection.currentActivity.repeatCount, 4);
+  assert.equal(projection.currentActivity, null);
   assert.deepEqual(projection.milestones, []);
-  assert.deepEqual(projection.healthSignals, []);
+  assert.equal(projection.healthSignals.length, 1);
+  assert.equal(projection.healthSignals[0].kind, "repetition");
+  assert.match(projection.healthSignals[0].title, /重复读取/);
 });
 
 test("runtime progress ledger counts a tool call once across running, done, and transcript block", () => {
@@ -1050,4 +1052,19 @@ test("visual progress preserves an explicit bounded observation separately from 
   assert.equal(observed.progress.visualContext.recognition, "observed");
   assert.equal(observed.progress.visualContext.observationSummary, "A compact toolbar is visible.");
   assert.equal(observed.progress.visualContext.observationId, "visual-observed-1");
+  const items = buildRuntimeProgressLedger({
+    events: [observed],
+    turnId: "turn-visual-observed",
+    activeRunId: "run-visual-observed",
+    language: "zh",
+  });
+  const projection = buildRunStatusProjection(items, "zh");
+  assert.equal(
+    projection.currentActivity,
+    null,
+    "a delivered/observed screenshot is a milestone, not perpetual current activity",
+  );
+  const guidance = buildCapsuleGuidanceText(projection, "zh", "executing");
+  assert.match(guidance, /实际修改/);
+  assert.doesNotMatch(guidance, /images:1/);
 });

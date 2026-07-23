@@ -58,6 +58,12 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
 );
+const {
+  decideRuntimeGuidanceCompletionFence,
+  shouldTransitionRunToFinalizing,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/runtimeGuidanceCompletion.ts"),
+);
 
 test("iteration stream preparation builds localized runtime guidance messages", () => {
   const en = buildRuntimeGuidanceMessage({
@@ -79,6 +85,7 @@ test("iteration stream preparation builds localized runtime guidance messages", 
 
 test("iteration stream preparation appends active runtime guidance to model messages", () => {
   const appended = [];
+  const injected = [];
   const baseMessages = [{ role: "user", content: "Original task" }];
   const callbacks = {
     getPreferredLanguage: () => "en",
@@ -88,6 +95,7 @@ test("iteration stream preparation appends active runtime guidance to model mess
       turnId: "turn_1",
     }),
     appendMessage: (message) => appended.push(message),
+    onGuidanceInjected: (guidance) => injected.push(guidance),
   };
 
   const nextMessages = appendActiveRuntimeGuidance({
@@ -100,6 +108,11 @@ test("iteration stream preparation appends active runtime guidance to model mess
   assert.equal(baseMessages.length, 1);
   assert.equal(appended.length, 1);
   assert.deepEqual(appended[0], nextMessages[1]);
+  assert.deepEqual(injected, [{
+    id: "guidance_1",
+    text: "Use the cached context.",
+    turnId: "turn_1",
+  }]);
   assert.match(nextMessages[1].content, /Use the cached context\.$/);
 });
 
@@ -111,6 +124,9 @@ test("iteration stream preparation leaves messages unchanged without active guid
     appendMessage: () => {
       throw new Error("appendMessage should not be called");
     },
+    onGuidanceInjected: () => {
+      throw new Error("onGuidanceInjected should not be called");
+    },
   };
 
   const nextMessages = appendActiveRuntimeGuidance({
@@ -120,4 +136,71 @@ test("iteration stream preparation leaves messages unchanged without active guid
   });
 
   assert.equal(nextMessages, baseMessages);
+});
+
+test("late Guide wins completion, is consumed next iteration, then completion alone finalizes", () => {
+  let runPhase = "executing";
+  let pendingGuidance = {
+    id: "guidance-late-1",
+    text: "Inspect the exact failing assertion.",
+    turnId: "turn-1",
+  };
+  let lateGuidanceContinuationsUsed = 0;
+
+  const firstFence = decideRuntimeGuidanceCompletionFence({
+    completionCandidate: true,
+    runStatus: "running",
+    runPhase,
+    exactPendingGuidanceId: pendingGuidance.id,
+    lateGuidanceContinuationsUsed,
+  });
+  assert.equal(firstFence.kind, "continue_with_guidance");
+  if (shouldTransitionRunToFinalizing(firstFence)) runPhase = "finalizing";
+  assert.equal(runPhase, "executing", "Guide continuation must keep the Run consumable");
+  lateGuidanceContinuationsUsed += 1;
+
+  const appended = [];
+  const injected = [];
+  const nextMessages = appendActiveRuntimeGuidance({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      consumeActiveGuidance: () => {
+        const consumed = pendingGuidance;
+        pendingGuidance = null;
+        return consumed;
+      },
+      appendMessage: (message) => appended.push(message),
+      onGuidanceInjected: (guidance) => injected.push(guidance),
+    },
+    managedAgentMessages: [{ role: "user", content: "Original task" }],
+    iteration: 2,
+  });
+  assert.equal(pendingGuidance, null);
+  assert.equal(appended.length, 1);
+  assert.equal(injected[0].id, "guidance-late-1");
+  assert.match(nextMessages.at(-1).content, /Inspect the exact failing assertion\.$/);
+
+  const secondFence = decideRuntimeGuidanceCompletionFence({
+    completionCandidate: true,
+    runStatus: "running",
+    runPhase,
+    exactPendingGuidanceId: null,
+    lateGuidanceContinuationsUsed,
+  });
+  assert.equal(secondFence.kind, "acquire_completion");
+  if (shouldTransitionRunToFinalizing(secondFence)) runPhase = "finalizing";
+  assert.equal(runPhase, "finalizing");
+
+  const racedSecondGuide = decideRuntimeGuidanceCompletionFence({
+    completionCandidate: true,
+    runStatus: "running",
+    runPhase: "executing",
+    exactPendingGuidanceId: "guidance-late-2",
+    lateGuidanceContinuationsUsed,
+  });
+  assert.deepEqual(racedSecondGuide, {
+    kind: "reject_completion",
+    reason: "late_guidance_budget_exhausted",
+  });
+  assert.equal(shouldTransitionRunToFinalizing(racedSecondGuide), false);
 });

@@ -108,7 +108,10 @@ function isExactPausedRunOwner(
 export function restorePendingActionRequest(input: {
   request: unknown;
   runOwner: RestorableRunOwner | null | undefined;
+  /** Generic identity retained for legacy Plan/history compatibility. */
   planIdentity?: PlanApprovalIdentity | null;
+  /** Typed authority required to restore a pending Plan review control. */
+  planReviewIdentity?: PlanApprovalIdentity | null;
   taskFlow?: TaskBlock[];
   goalRuntime?: RestorableGoalRuntimeIdentity | null;
   unapprovedPlanTurnIds?: string[];
@@ -119,9 +122,9 @@ export function restorePendingActionRequest(input: {
   }
 
   if (request.kind === "plan_review") {
-    return input.planIdentity &&
-      input.planIdentity.revision === request.planRevision &&
-      input.planIdentity.artifactHash === request.artifactHash
+    return input.planReviewIdentity &&
+      input.planReviewIdentity.revision === request.planRevision &&
+      input.planReviewIdentity.artifactHash === request.artifactHash
       ? request
       : null;
   }

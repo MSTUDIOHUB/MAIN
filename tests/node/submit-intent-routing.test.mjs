@@ -220,6 +220,22 @@ test("workspace submissions continue into Turn creation without pre-turn intent 
   assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
 });
 
+test("real compound repair instructions cannot degrade into workspace search", () => {
+  const harness = createHarness({
+    text: "The editor must not show filename or Unsaved document tabs. Opening a local Markdown file still opens an erroneous save-path dialog. Find the root causes fix the underlying operation order and run real validation to confirm completion.",
+    preferredLanguage: "en",
+    hasWorkspace: true,
+  });
+  const result = harness.resolve();
+
+  assert.equal(result.handled, false);
+  assert.equal(result.effectiveRunIntent, "execute");
+  assert.equal(result.effectiveCommandDirective.kind, "file_modify");
+  assert.equal(result.effectiveCommandDirective.action, "workspace_file_change");
+  assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
+  assert.equal(harness.calls.logs[0].data.mutationSurfaceElevated, false);
+});
+
 test("workspace mutation directives reopen execution even when semantic intent says respond", () => {
   const resolution = {
     intent: "respond",

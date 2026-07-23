@@ -38,6 +38,7 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import type { PreferredDelegationScopeJoinOutcome } from "../../preferredDelegationScopes";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -362,6 +363,9 @@ export async function handleAssistantCompletionPhase(input: {
   emitTurnCompletedEvent: () => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
+  onSubagentScopeOutcomes?: (
+    outcomes: PreferredDelegationScopeJoinOutcome[],
+  ) => void | Promise<void>;
   setPlanRuntimePhase: Parameters<typeof handlePlanNoToolRecovery>[0]["setPlanRuntimePhase"];
   waitForPlanApprovalIfNeeded: Parameters<typeof handlePlanNoToolRecovery>[0]["waitForPlanApprovalIfNeeded"];
   tryClosePlanWithEvidence: Parameters<typeof handlePlanNoToolRecovery>[0]["tryClosePlanWithEvidence"];
@@ -392,17 +396,30 @@ export async function handleAssistantCompletionPhase(input: {
     emitTurnCompletedEvent: input.emitTurnCompletedEvent,
   };
 
-  if (
-    effectiveToolCallCount === 0 &&
-    await joinPendingSubagentsForParent({
+  if (effectiveToolCallCount === 0) {
+    const joinResult = await joinPendingSubagentsForParent({
       callbacks: input.callbacks,
       recentToolActivity: input.recentToolActivity,
       recentPlanToolActivity: input.recentPlanToolActivity,
       reason: "parent_final_response",
-    })
-  ) {
-    input.callbacks.onStatusChange("running");
-    return finish("continue");
+    });
+    if (joinResult.joined) {
+      await input.onSubagentScopeOutcomes?.(joinResult.scopeOutcomes);
+      if (
+        input.workflowMode === "plan" &&
+        !input.callbacks.getIsPlanApproved() &&
+        joinResult.adoptedEvidenceCount === 0
+      ) {
+        const reason = "joined subagents returned no adoptable provenance evidence";
+        input.setPlanRuntimePhase("needs_evidence", reason);
+        planRuntimeState = applyPlanRuntimePhase(
+          planRuntimeState,
+          { phase: "needs_evidence", reason },
+        ).state;
+      }
+      input.callbacks.onStatusChange("running");
+      return finish("continue");
+    }
   }
 
   const replyOptionsPause = handleReplyOptionsPause({
@@ -748,6 +765,10 @@ export async function handleAssistantCompletionPhase(input: {
     hasMeaningfulVisibleText: input.hasMeaningfulVisibleText,
     normalizedVisibleText: input.normalized.visibleText,
     normalizedFinishReason: input.normalized.finishReason,
+    protocolViolation: input.normalized.protocolViolation,
+    protocolAllowedTools: input.normalized.protocolAllowedTools || Array.from(input.availableToolNames),
+    protocolActualTools: input.normalized.protocolActualTools,
+    assistantMsgId: input.assistantMsgId,
     recentPlanToolActivity: input.recentPlanToolActivity,
     attemptedPlanWriteTargets: input.attemptedPlanWriteTargets,
     turnInputContextSignals: input.turnInputContextSignals,

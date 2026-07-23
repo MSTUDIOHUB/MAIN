@@ -29,6 +29,7 @@ import type { ToolCatalog } from "../../toolCatalog";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
+import type { SpawnSubagentResult } from "../../subagents";
 import { hasCompletedToolExecution } from "../../toolResultEffect";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type {
@@ -380,7 +381,7 @@ export async function executeToolCallPhase(input: {
     resetTarget?: string,
     stateOverride?: ExecuteRecoveryRuntimeState,
   ) => ExecuteRecoveryRuntimeState;
-  onSubagentSpawnCreated?: () => void;
+  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
 }): Promise<ToolCallExecutionPhaseResult> {
   let noToolRuntimeState = resetConsecutiveNoToolRuntimeState(
     input.noToolRuntimeState,
@@ -584,6 +585,7 @@ export async function executeToolCallPhase(input: {
     specFileCalls,
     writeCalls,
     toolArgsByCallId,
+    planEvidenceObligationClosuresByCallId,
     readOnlyCallSignatures,
     readFileWindowNarrowedNotes,
     toolFailureSignatures,
@@ -823,9 +825,11 @@ export async function executeToolCallPhase(input: {
     iteration: input.iteration,
     results: allResults,
     toolArgsByCallId,
+    planEvidenceObligationClosuresByCallId,
     taskTargetingEvidence: input.taskTargetingEvidence,
     recentToolActivity: input.recentToolActivity,
     recentPlanToolActivity: input.recentPlanToolActivity,
+    turnInputContextSignals: input.turnInputContextSignals,
     ...planRuntimeState,
     hasPlanDecisionOutput,
     unityConsoleDiagnosticsRequested: input.unityConsoleDiagnosticsRequested,

@@ -48,6 +48,9 @@ import {
 } from "./visibleTextRepetition";
 import {
   countProviderOmittedVisualParts,
+  digestVisualPayloadIdentities,
+  visualPayloadIdentitiesFromContent,
+  type VisualTransportRequestBinding,
   type VisualTransportReceipt,
 } from "./visualContext";
 
@@ -92,6 +95,9 @@ type ContentPart = TextContentPart | ImageUrlContentPart;
 interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | ContentPart[];
+  runtimeTurnId?: string;
+  runtimeVisualImageParts?: number;
+  runtimeVisualPayloadDigest?: string;
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
   reasoning_content?: string;
@@ -129,6 +135,7 @@ export type OpenAiToolChoice =
 export interface StreamRequestOptions {
   toolChoice?: OpenAiToolChoice;
   responseFormat?: Record<string, unknown>;
+  visualTransportBinding?: VisualTransportRequestBinding;
 }
 
 /** A tool call accumulated from streaming deltas. */
@@ -163,6 +170,10 @@ export interface StreamResult {
   protocolActualToolCalls?: StreamedToolCall[];
   /** Tools exposed by the active capability contract when returned calls were outside it. */
   protocolAllowedTools?: string[];
+  /** Exact typed Plan envelope accepted as a transport fallback on the sole Plan submission surface. */
+  protocolTransportAdaptation?: "typed_plan_text_envelope";
+  /** The provider channel that carried the exact typed Plan envelope. */
+  protocolTransportSource?: "content";
   usage?: {
     inputTokens: number;
     outputTokens: number;
@@ -674,18 +685,33 @@ function visualPayloadIdentity(value: unknown, rawBase64 = false): string | null
 }
 
 function visualPayloadIdentitiesFromMessage(message: ChatMessage): string[] {
-  if (!Array.isArray(message.content)) return [];
-  return message.content.flatMap((part) => {
-    if (part.type !== "image_url") return [];
-    const identity = visualPayloadIdentity(part.image_url.url);
-    return identity ? [identity] : [];
-  });
+  return visualPayloadIdentitiesFromContent(message.content);
 }
 
-function latestLogicalVisualPayload(messages: ChatMessage[]): {
+function latestLogicalVisualPayload(
+  messages: ChatMessage[],
+  binding?: VisualTransportRequestBinding,
+): {
   identities: string[];
   omittedParts: number;
 } {
+  if (binding) {
+    // Exact runtime ownership disables the historical fallback entirely. A
+    // missing/compacted current payload must produce a failed receipt, never
+    // borrow an older Turn's screenshot.
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.role !== "user" ||
+        String(message.runtimeTurnId || "").trim() !== binding.owner.turnId
+      ) continue;
+      return {
+        identities: visualPayloadIdentitiesFromMessage(message),
+        omittedParts: countProviderOmittedVisualParts([message]),
+      };
+    }
+    return { identities: [], omittedParts: 0 };
+  }
   // Bind the receipt to the newest visual-bearing logical message. An image
   // left in history must never make a newer image that was dropped during
   // provider serialization look delivered.
@@ -774,9 +800,14 @@ function buildVisualTransportReceipt(
   messages: ChatMessage[],
   body: Record<string, unknown>,
   protocol: string,
+  binding?: VisualTransportRequestBinding,
 ): VisualTransportReceipt {
-  const currentVisual = latestLogicalVisualPayload(messages);
-  const logicalImageParts = currentVisual.identities.length;
+  const currentVisual = latestLogicalVisualPayload(messages, binding);
+  const logicalImageParts = currentVisual.identities.length > 0
+    ? currentVisual.identities.length
+    : binding && currentVisual.omittedParts >= binding.expectedImageParts
+    ? binding.expectedImageParts
+    : 0;
   const serializedImageParts = countCurrentSerializedVisualParts(currentVisual.identities, body);
   const providerOmittedParts = currentVisual.omittedParts;
   const omittedImageParts = Math.max(
@@ -786,6 +817,17 @@ function buildVisualTransportReceipt(
   return {
     protocol,
     requestAccepted: true,
+    ...(binding
+      ? {
+          owner: { ...binding.owner },
+          expectedImageParts: binding.expectedImageParts,
+          payloadDigest: currentVisual.identities.length > 0
+            ? digestVisualPayloadIdentities(currentVisual.identities)
+            : logicalImageParts > 0
+            ? binding.payloadDigest
+            : digestVisualPayloadIdentities([]),
+        }
+      : {}),
     logicalImageParts,
     serializedImageParts,
     omittedImageParts,
@@ -802,10 +844,11 @@ function attachVisualTransportReceipt(
   messages: ChatMessage[],
   body: Record<string, unknown>,
   protocol: string,
+  binding?: VisualTransportRequestBinding,
 ): StreamResult {
   return {
     ...result,
-    visualTransportReceipt: buildVisualTransportReceipt(messages, body, protocol),
+    visualTransportReceipt: buildVisualTransportReceipt(messages, body, protocol, binding),
   };
 }
 
@@ -1445,6 +1488,7 @@ async function requestOpenAiNonStreaming(
           messages,
           acceptedRequestBody,
           acceptedRequestProtocol,
+          options.visualTransportBinding,
         )
       : baseResult;
 
@@ -1565,7 +1609,7 @@ async function streamViaRustProxy(
         toolCalls: [],
         finishReason: "stop",
         ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
-      }, messages, body, visualProtocol);
+      }, messages, body, visualProtocol, options.visualTransportBinding);
       onDone(result);
       return result;
     } catch (err) {
@@ -1709,7 +1753,7 @@ async function streamViaRustProxy(
           ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
         }
       : {}),
-  }, messages, body, visualProtocol);
+  }, messages, body, visualProtocol, options.visualTransportBinding);
 
   const stopReasoningOnlyRunaway = () => {
     if (resolved || anthropicProcessor) return false;
@@ -2097,7 +2141,13 @@ async function streamViaRustProxy(
         reasoningGarbled = true; // prevent further buffering
 
         const result: StreamResult = anthropicProcessor
-          ? attachVisualTransportReceipt(anthropicProcessor.getResult(), messages, body, visualProtocol)
+          ? attachVisualTransportReceipt(
+              anthropicProcessor.getResult(),
+              messages,
+              body,
+              visualProtocol,
+              options.visualTransportBinding,
+            )
           : buildCurrentOpenAiCompatibleResult();
         onDone(result);
         resolveResult?.(result);
@@ -2273,7 +2323,7 @@ export async function streamChatCompletion(
         toolCalls: [],
         finishReason: "stop",
         ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
-      }, messages, body, visualProtocol);
+      }, messages, body, visualProtocol, options.visualTransportBinding);
       onDone(result);
       return result;
     } catch (err) {
@@ -2450,7 +2500,7 @@ export async function streamChatCompletion(
           ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
         }
       : {}),
-  }, messages, body, visualProtocol);
+  }, messages, body, visualProtocol, options.visualTransportBinding);
 
   const throwIfVisibleTextRepetition = () => {
     if (toolCallsMap.size > 0) return;
@@ -2737,7 +2787,13 @@ export async function streamChatCompletion(
   reasoningGarbled = true;
 
   const result: StreamResult = anthropicProcessor
-    ? attachVisualTransportReceipt(anthropicProcessor.getResult(), messages, body, visualProtocol)
+    ? attachVisualTransportReceipt(
+        anthropicProcessor.getResult(),
+        messages,
+        body,
+        visualProtocol,
+        options.visualTransportBinding,
+      )
     : buildCurrentOpenAiCompatibleResult();
 
   if (result.finishReason === "length") {

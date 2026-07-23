@@ -9,6 +9,9 @@ import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import type { UnityMcpRuntimeState } from "./unityMcpRuntime";
 import type { PlanTask } from "../../workflowModels";
 import type { ToolExecutionResult } from "../types";
+import type { SpawnSubagentResult } from "../../subagents";
+import type { PreferredDelegationScopeJoinOutcome } from "../../preferredDelegationScopes";
+import { extractPreferredDelegationScopeJoinOutcomes } from "./subagentJoinRuntime";
 
 type ToolCallPhaseInput = Parameters<typeof executeToolCallPhase>[0];
 type ToolResultRecoveryInput = Parameters<typeof handleToolResultRecoveryPhase>[0];
@@ -26,7 +29,10 @@ type ToolIterationPhaseInput = ToolCallPhaseInput &
     | "successfulReadOnlyExplorationResultCount"
     | "isUnapprovedPlanReadOnlyBatch"
   > & {
-    onSubagentSpawnCreated?: () => void;
+    onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void | Promise<void>;
+    onSubagentScopeOutcomes?: (
+      outcomes: PreferredDelegationScopeJoinOutcome[],
+    ) => void | Promise<void>;
   };
 
 export type ToolIterationPhaseResult = {
@@ -70,6 +76,21 @@ export function didCreateSubagentFromToolResults(
   });
 }
 
+export function getCreatedSubagentOutcomesFromToolResults(
+  results: ToolExecutionResult[],
+): SpawnSubagentResult[] {
+  return results.flatMap((result) => {
+    if (result.name !== "spawn_subagent" || result.isError) return [];
+    const outcome = result.subagentSpawnOutcome;
+    if (
+      !outcome ||
+      outcome.subagentId === null ||
+      (outcome.status !== "queued" && outcome.status !== "running")
+    ) return [];
+    return [outcome];
+  });
+}
+
 export async function handleToolIterationPhase(
   input: ToolIterationPhaseInput,
 ): Promise<ToolIterationPhaseResult> {
@@ -78,7 +99,15 @@ export async function handleToolIterationPhase(
     toolCallPhase.allResults,
   );
   if (subagentSpawnCreated) {
-    input.onSubagentSpawnCreated?.();
+    for (const outcome of getCreatedSubagentOutcomesFromToolResults(toolCallPhase.allResults)) {
+      await input.onSubagentSpawnCreated?.(outcome);
+    }
+  }
+  const subagentScopeOutcomes = toolCallPhase.allResults.flatMap(
+    extractPreferredDelegationScopeJoinOutcomes,
+  );
+  if (subagentScopeOutcomes.length > 0) {
+    await input.onSubagentScopeOutcomes?.(subagentScopeOutcomes);
   }
   if (toolCallPhase.status === "aborted") {
     return {

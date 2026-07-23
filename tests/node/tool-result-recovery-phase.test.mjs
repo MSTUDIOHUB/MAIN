@@ -132,8 +132,24 @@ test("tool result recovery phase owns runtime state folds", () => {
   );
   assert.match(
     phaseSource,
-    /handleNoProgressRecovery\(\{[\s\S]*?activateExecuteRecovery: activateExecuteRecoveryAndSync/,
-    "direct mutation mismatch recovery must use the synchronized activation path",
+    /resolveDirectMutationPreflightRecovery\(\{[\s\S]*?activateExecuteRecoveryAndSync\(/,
+    "direct mutation mismatch recovery must replace the active phase through the synchronized activation path",
+  );
+  const mutationFailureIndex = phaseSource.indexOf(
+    "const directMutationPreflightRecovery = resolveDirectMutationPreflightRecovery({",
+  );
+  const noProgressIndex = phaseSource.indexOf(
+    "const noProgressRecovery = handleNoProgressRecovery({",
+  );
+  assert.notEqual(mutationFailureIndex, -1);
+  assert.notEqual(noProgressIndex, -1);
+  assert.ok(
+    mutationFailureIndex < noProgressIndex,
+    "structured mutation failure recovery must run before soft no-progress accounting",
+  );
+  assert.match(
+    phaseSource.slice(mutationFailureIndex, noProgressIndex),
+    /mutation_preflight_recovery_activated[\s\S]*?return finish\("continue"\)/,
   );
   assert.match(phaseSource, /applyPlanQualityRuntimeState\(/);
   assert.match(phaseSource, /applyNoProgressTrackingRuntimeState\(/);
@@ -144,6 +160,11 @@ test("tool result recovery phase owns runtime state folds", () => {
   assert.match(phaseSource, /applyExecuteConvergencePromptState\(/);
   assert.match(phaseSource, /activateExecuteRecoveryAndSync\(/);
   assert.match(phaseSource, /executeRecoveryState,/);
+  assert.match(
+    phaseSource,
+    /"subagent_parent_source_reread_required"[\s\S]*?readLease:\s*\{[\s\S]*?purpose:\s*"context_restore"[\s\S]*?state:\s*"available"/,
+    "a parent reread without a delegated range must carry a satisfiable context lease",
+  );
 });
 
 test("approved plan scope blocks recover within the reviewed scope before completion can be audited", () => {
@@ -302,23 +323,43 @@ test("Plan and Direct Edit finite command failures split invocation recovery fro
   assert.notEqual(goalCheckpointIndex, -1);
   assert.ok(appendIndex < recoveryIndex);
   assert.ok(recoveryIndex < goalCheckpointIndex);
+  assert.ok(
+    recoveryIndex < noProgressIndex,
+    "a concrete validation failure must enter source repair before the soft no-progress policy can pivot or pause",
+  );
   assert.match(phaseSource, /classifyFailedFiniteValidationOutcome\(\{/);
   assert.match(phaseSource, /failedFiniteValidationOutcome === "invocation_error"[\s\S]*?"finite_validation_only"/);
   assert.match(phaseSource, /"finite_validation_only",\s*"failed_finite_validation_command"/);
   assert.match(phaseSource, /shouldEnterFailedFiniteValidationRecovery\(command\)/);
-  assert.match(phaseSource, /remainingPlanTasksAfterFailedFiniteValidation[\s\S]*?hasPendingPlanCommandEvidence\(remainingPlanTasksAfterFailedFiniteValidation\)/);
-  assert.match(phaseSource, /resolveFailedFiniteValidationRecoveryPolicy\(\{/);
-  assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
-  assert.match(phaseSource, /failedFiniteValidationOutcome === "validation_failure"[\s\S]*?failedFiniteValidationMatchesPendingPlanEvidence\(\{/);
-  const sourceRepairBranch = phaseSource.slice(
-    phaseSource.indexOf("const failedValidationMatchesPendingTask"),
-    phaseSource.indexOf("const goalCheckpoint", phaseSource.indexOf("const failedValidationMatchesPendingTask")),
+  assert.match(
+    phaseSource,
+    /resolveFailedFiniteValidationRecoveryPolicy\(\{[\s\S]*?tasks:\s*remainingPlanTasksAfterFailedFiniteValidation/,
   );
-  assert.match(sourceRepairBranch, /"mutation_first",\s*"failed_finite_validation_requires_repair"/);
+  assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
+  assert.match(
+    phaseSource,
+    /failedFiniteValidationOutcome === "validation_failure"[\s\S]*?finiteValidationRecoveryExecution/,
+  );
+  const sourceRepairBranch = phaseSource.slice(
+    phaseSource.indexOf("const failedValidationRequiresRepair"),
+    phaseSource.indexOf("const goalCheckpoint", phaseSource.indexOf("const failedValidationRequiresRepair")),
+  );
+  assert.match(
+    sourceRepairBranch,
+    /repairTarget\s*\?\s*"patch_recovery_read"\s*:\s*"action_plus_targeting"/,
+  );
+  assert.match(sourceRepairBranch, /finiteValidationRecoveryExecution/);
+  assert.doesNotMatch(
+    sourceRepairBranch,
+    /getCommandDirective/,
+    "finite validation repair is owned by Execute state, not a transient lexical directive",
+  );
   assert.match(sourceRepairBranch, /sourceObservationKey: null/);
-  assert.match(sourceRepairBranch, /nextRequiredCapability: "mutation"/);
-  assert.doesNotMatch(sourceRepairBranch, /buildFailedValidationRepairReadLease/);
-  assert.doesNotMatch(sourceRepairBranch, /nextRequiredCapability: "targeted_read"/);
+  assert.match(sourceRepairBranch, /buildFailedValidationRepairReadLease/);
+  assert.match(
+    sourceRepairBranch,
+    /nextRequiredCapability:\s*repairTarget\s*\?\s*"targeted_read"\s*:\s*"targeting"/,
+  );
   assert.match(phaseSource, /approved_plan_finite_validation_requires_repair/);
   assert.match(phaseSource, /direct_edit_finite_validation_recovery/);
   assert.match(phaseSource, /direct_edit_finite_validation_requires_repair/);

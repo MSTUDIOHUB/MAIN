@@ -246,7 +246,7 @@ export async function handleMaxIterationBoundary(input: {
         "incomplete_plan",
         {
           phase: "paused",
-          recoveryReason: "plan_max_iterations_checkpoint",
+          recoveryReason: "max_iterations_boundary",
           repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
           progressSignature: buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity),
           nextStep: callbacks.getPreferredLanguage() === "zh"
@@ -255,7 +255,15 @@ export async function handleMaxIterationBoundary(input: {
         },
       );
     } else {
-      callbacks.onNonActionableStop(boundaryNotice, "no_action");
+      callbacks.onNonActionableStop(boundaryNotice, "no_action", {
+        phase: "paused",
+        recoveryReason: "max_iterations_boundary",
+        repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+        progressSignature: buildPlanProgressSignatureFromToolActivity(recentToolActivity),
+        nextStep: callbacks.getPreferredLanguage() === "zh"
+          ? "从已保存的执行检查点恢复，并继续尚未闭环的最小写入或验证动作"
+          : "resume from the saved execution checkpoint and continue the smallest unfinished mutation or validation action",
+      });
       callbacks.onStatusChange("idle");
     }
     return { status: "handled" };
@@ -380,9 +388,7 @@ export async function handleMaxIterationBoundary(input: {
     {
       progressSignature,
       repeatedTargets,
-      recoveryReason: handling.checkpoint.autoResumeEligible
-        ? "chat_max_iterations_dispatch_unavailable"
-        : "chat_max_iterations_strategy_exhausted",
+      recoveryReason: "max_iterations_boundary",
       nextStep: callbacks.getPreferredLanguage() === "zh"
         ? "复用已有上下文直接回答；只有确有信息缺口时才做一次不同的有界观察"
         : "reuse retained context and answer directly; make one different bounded observation only for a genuine information gap",

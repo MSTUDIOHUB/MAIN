@@ -7,7 +7,7 @@ import {
   resolveTurnPresentationLifecycle,
   type TurnPresentationModel,
 } from "../lib/turnPresentation";
-import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
+import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 
 interface PlanPanelProps {
   presentation?: TurnPresentationModel;
@@ -220,7 +220,7 @@ export default function PlanPanel({
   const approvingRef = useRef(false);
   const previewMarkdown = fallbackPreview.trim();
   const hasReviewablePlanArtifact = useMemo(
-    () => getReviewablePlanArtifacts(artifacts).length > 0,
+    () => !!buildTypedPlanApprovalIdentity(artifacts),
     [artifacts],
   );
   const displayArtifacts = useMemo(

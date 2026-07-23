@@ -196,7 +196,6 @@ export function handleMissingToolNoToolRecovery(input: {
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
-          forceXmlTools,
           assistantMsgId,
           iteration,
           cause: hiddenThoughtOnlyNoToolStop

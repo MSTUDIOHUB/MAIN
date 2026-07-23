@@ -4,11 +4,15 @@ export type SubagentDelegationPreference =
   | "allowed"
   | "preferred";
 
+/** Structured Turn-admission authority; never infer this field from model prose. */
+export type DiagnosisOutcomeRequirement = "required" | "optional";
+
 export interface TurnInputContextSignals {
   imageParts: number;
   mentionedFilePaths: string[];
   attachedFilePaths: string[];
   subagentPreference: SubagentDelegationPreference;
+  diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
 export interface TurnInputContextLike {
@@ -16,6 +20,7 @@ export interface TurnInputContextLike {
   mentionedFilePaths?: string[];
   attachedFilePaths?: string[];
   subagentPreference?: SubagentDelegationPreference;
+  diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
 const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
@@ -79,11 +84,16 @@ function uniq(values: string[] = []): string[] {
 
 export function normalizeTurnInputContextSignals(input: TurnInputContextLike = {}): TurnInputContextSignals {
   const imageParts = Math.max(0, Math.floor(Number(input.imageParts || 0)));
+  const diagnosisRequirement = input.diagnosisRequirement === "required" ||
+      input.diagnosisRequirement === "optional"
+    ? input.diagnosisRequirement
+    : undefined;
   return {
     imageParts,
     mentionedFilePaths: uniq(input.mentionedFilePaths),
     attachedFilePaths: uniq(input.attachedFilePaths),
     subagentPreference: normalizeSubagentDelegationPreference(input.subagentPreference),
+    ...(diagnosisRequirement ? { diagnosisRequirement } : {}),
   };
 }
 
@@ -92,7 +102,8 @@ export function hasTurnProvidedContext(signals: TurnInputContextLike = {}): bool
   return (
     normalized.imageParts > 0 ||
     normalized.mentionedFilePaths.length > 0 ||
-    normalized.attachedFilePaths.length > 0
+    normalized.attachedFilePaths.length > 0 ||
+    normalized.diagnosisRequirement !== undefined
   );
 }
 
@@ -114,6 +125,9 @@ export function buildTurnIntakeContextBlock(input: {
   const lines: string[] = ["[turn_intake]"];
   lines.push(`workflowMode: ${input.workflowMode || "chat"}`);
   lines.push(`subagentPreference: ${subagentPreference}`);
+  if (signals.diagnosisRequirement) {
+    lines.push(`diagnosisRequirement: ${signals.diagnosisRequirement}`);
+  }
   lines.push(`imageParts: ${signals.imageParts}`);
   lines.push(`mentionedFiles: ${signals.mentionedFilePaths.length}`);
   for (const path of signals.mentionedFilePaths.slice(0, 12)) {
@@ -227,11 +241,17 @@ export function extractTurnInputContextSignalsFromMessages(messages: MessageLike
   const intakeSubagentPreference = intakeBlock.match(
     /^subagentPreference:\s*(unspecified|forbidden|allowed|preferred)\s*$/mi,
   )?.[1];
+  const intakeDiagnosisRequirement = intakeBlock.match(
+    /^diagnosisRequirement:\s*(required|optional)\s*$/mi,
+  )?.[1];
   return normalizeTurnInputContextSignals({
     imageParts: Math.max(countImageParts(latestUser.content), Number.isFinite(imagePartsFromIntake) ? imagePartsFromIntake : 0),
     mentionedFilePaths,
     attachedFilePaths,
     subagentPreference: normalizeSubagentDelegationPreference(intakeSubagentPreference),
+    diagnosisRequirement: intakeDiagnosisRequirement === "required" || intakeDiagnosisRequirement === "optional"
+      ? intakeDiagnosisRequirement
+      : undefined,
   });
 }
 
@@ -248,6 +268,9 @@ export function buildSemanticMetadataContextLines(input: {
     `Attached files: ${signals.attachedFilePaths.length}`,
     ...signals.attachedFilePaths.slice(0, 6).map((path) => `- attachment ${path}`),
   ];
+  if (signals.diagnosisRequirement) {
+    lines.push(`Diagnosis outcome requirement: ${signals.diagnosisRequirement}`);
+  }
   lines.push(input.language === "en"
     ? "Title/summary must reflect the user's actual task plus this visual/file context."
     : "标题/摘要必须体现用户真实任务以及这次图片/文件上下文。");

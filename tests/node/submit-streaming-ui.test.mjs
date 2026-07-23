@@ -79,6 +79,12 @@ function baseContext(overrides = {}) {
     sendStartedAt: 123,
     harnessRunId: "run-outer",
     planExecution: null,
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "unspecified",
+    },
     turnAgentMessagesStart: 0,
     getElapsedSeconds: () => 1,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: 50,

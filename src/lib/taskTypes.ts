@@ -99,7 +99,14 @@ export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
 };
 
 export type TaskBlock =
-  | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
+  | (TaskBlockBase & {
+      type: "user";
+      content: string;
+      images?: string[];
+      contextItems?: UserContextItem[];
+      /** Stable identity for user guidance injected into an already-running Turn. */
+      runtimeGuidance?: { id: string };
+    })
   | (TaskBlockBase & {
       type: "tool";
       /** Provider-facing name retained for display and lifecycle matching. */

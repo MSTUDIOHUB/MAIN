@@ -102,7 +102,58 @@ test("non-executable test plans get a reason-specific rewrite contract", () => {
   assert.doesNotMatch(prompt, /补齐.*缺失章节/);
 });
 
+test("empty implementation owners get a reason-specific rewrite contract", () => {
+  const prompt = buildPlanPostConvergenceToolRedirectPrompt({
+    language: "zh",
+    toolNames: [],
+    phase: "needs_rewrite",
+    qualityGateReason: "empty_plan_implementation_detail",
+    missingSections: [],
+  });
+
+  assert.match(prompt, /关键改动中存在没有正文的实施容器/);
+  assert.match(prompt, /文件\/组件所有者/);
+  assert.match(prompt, /具体改后行为/);
+  assert.match(prompt, /上下游关系/);
+  assert.match(prompt, /修改为：\/实现：\/修改：/);
+  assert.doesNotMatch(prompt, /补齐.*缺失章节/);
+});
+
+test("protocol noise gets a cleanup-only rewrite contract", () => {
+  const prompt = buildPlanPostConvergenceToolRedirectPrompt({
+    language: "en",
+    toolNames: [],
+    phase: "needs_rewrite",
+    qualityGateReason: "protocol_noise",
+    missingSections: [],
+  });
+
+  assert.match(prompt, /tool\/function\/parameter protocol markup/);
+  assert.match(prompt, /submission transport declared by the latest \[PLAN AUTHORING CONTRACT\]/);
+  assert.match(prompt, /Remove every unrelated tool call, function\/parameter transcript/);
+  assert.match(prompt, /Preserve accepted typed fields and references/);
+});
+
+test("unverified diagnostics get an epistemic rewrite contract without reopening reads", () => {
+  const prompt = buildPlanPostConvergenceToolRedirectPrompt({
+    language: "zh",
+    toolNames: [],
+    phase: "needs_rewrite",
+    qualityGateReason: "unverified_diagnostic_claim_as_confirmed",
+    failurePreview: "`scheduleAutoSave` 可能把程序化加载误判成用户编辑。",
+  });
+
+  assert.match(prompt, /认知分类错误/);
+  assert.match(prompt, /触发门禁的模型原句/);
+  assert.match(prompt, /源码直接呈现的确定条件行为/);
+  assert.match(prompt, /未验证假设/);
+  assert.match(prompt, /禁止只删除“可能\/也许”/);
+  assert.match(prompt, /不要再调用只读工具/);
+  assert.doesNotMatch(prompt, /补齐.*缺失章节/);
+});
+
 const allPlanTools = [
+  "submit_plan_candidate",
   "get_project_skeleton",
   "grep_search",
   "read_file",
@@ -139,7 +190,7 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "drafting",
-  }), []);
+  }), ["submit_plan_candidate"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
@@ -170,7 +221,7 @@ test("targeted reads advance structure exploration without opening mutations", (
   }), false);
 });
 
-test("needs_rewrite closes the tool surface before the old convergence prompt", () => {
+test("needs_rewrite closes execution tools and exposes only typed Plan submission", () => {
   assert.equal(shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({
     workflowMode: "plan",
     isPlanApproved: false,
@@ -186,7 +237,7 @@ test("needs_rewrite closes the tool surface before the old convergence prompt", 
     isPlanApproved: false,
     planRuntimePhase: "needs_rewrite",
     toolNames: allPlanTools,
-  }), []);
+  }), ["submit_plan_candidate"]);
 });
 
 test("needs_evidence reopens read-only tools after convergence", () => {

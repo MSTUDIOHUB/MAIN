@@ -262,6 +262,37 @@ test("send gate effects approve pending review reply options without queueing", 
   assert.equal(harness.calls.logs[0].data.pendingReviewTaskId, 42);
 });
 
+test("a durable workspace claim never leaks into the legacy latest-wins queue", () => {
+  const harness = createHarness({
+    agentStatus: "pending_review",
+    abortController: {},
+  });
+  const result = harness.apply({
+    text: "durable queued instruction",
+    options: {
+      workspaceInstructionClaim: {
+        claimId: "claim-a",
+        turnId: "turn-a",
+        receiptId: "receipt-a",
+      },
+    },
+  });
+
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.returnValue, false);
+  assert.equal(result.decision.action.kind, "queue");
+  assert.deepEqual(harness.calls.queued, []);
+  assert.deepEqual(harness.calls.logs, [{
+    event: "workspace_turn_send_gate_queue_rejected",
+    data: {
+      reason: "agent_running_or_pending_review",
+      claimId: "claim-a",
+      turnId: "turn-a",
+      receiptId: "receipt-a",
+    },
+  }]);
+});
+
 test("send gate effects reset stuck running state and continue submission", () => {
   const harness = createHarness({
     agentStatus: "running",

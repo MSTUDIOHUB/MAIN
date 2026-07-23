@@ -75,6 +75,12 @@ function baseInput(overrides = {}) {
     timerInterval: "timer-1",
     sendStartedAt: 123,
     harnessRunId: "run-124",
+    turnInputContextSignals: {
+      imageParts: 1,
+      mentionedFilePaths: ["src/App.tsx"],
+      attachedFilePaths: ["README.md"],
+      subagentPreference: "preferred",
+    },
     turnAgentMessagesStart: 4,
     getElapsedSeconds: () => 9,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: 50,
@@ -101,6 +107,7 @@ test("submit workflow context carries immutable turn parameters and initializes 
   assert.equal(context.abortCtrl, input.abortCtrl);
   assert.equal(context.timerInterval, "timer-1");
   assert.equal(context.harnessRunId, "run-124");
+  assert.deepEqual(context.turnInputContextSignals, input.turnInputContextSignals);
   assert.equal(context.getElapsedSeconds(), 9);
   assert.equal(context.streamBuffer, null);
   assert.equal(context.thinkingInterceptor, null);

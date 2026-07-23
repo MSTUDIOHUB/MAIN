@@ -16,19 +16,33 @@ import {
 import {
   assessPlanClosureEvidence,
   formatPlanEvidenceBundleForModel,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
+import {
+  buildPlanEvidenceObligationContractCard,
+  derivePlanEvidenceObligations,
+  getPlanEvidenceObligationKey,
+} from "../../planEvidenceObligations";
 import {
   createPlanAuthoringContract,
   formatPlanAuthoringContractForModel,
 } from "../../planAuthoringContract";
+import {
+  buildPlanCandidateRepairIterationProtocol,
+  replacePlanCandidateSubmissionToolForRepair,
+} from "../../planCandidateRepair";
 import {
   resolveApprovedPlanRecoveryReconciliation,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import { buildPreferredDelegationActionContract } from "../../subagents";
-import type { ToolDefinition } from "../../toolSchemas";
+import type { PreferredDelegationScopeContract } from "../../preferredDelegationScopes";
+import {
+  SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+  type ToolDefinition,
+} from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanExecutionProgressPhase } from "../../workflowModels";
 import { hasDurableExecutionProgress } from "../../verificationEvidence";
@@ -49,6 +63,7 @@ import {
 } from "./executeRecoveryRuntime";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
+import { buildPlanEvidenceProgressFingerprint } from "./planRuntimeState";
 import {
   resolveFinalTextOnlyStepState,
   type AgentLoopStreamRuntimeState,
@@ -68,7 +83,7 @@ import {
 
 type RuntimeGuidanceCallbacks = Pick<
   OrchestratorCallbacks,
-  "appendMessage" | "consumeActiveGuidance" | "getPreferredLanguage"
+  "appendMessage" | "consumeActiveGuidance" | "getPreferredLanguage" | "onGuidanceInjected"
 >;
 
 export function buildRuntimeGuidanceMessage(input: {
@@ -100,9 +115,15 @@ export function appendActiveRuntimeGuidance(input: {
     text: guidanceText,
   });
   input.callbacks.appendMessage(guidanceMessage);
+  input.callbacks.onGuidanceInjected?.({
+    id: activeGuidance.id,
+    text: guidanceText,
+    turnId: activeGuidance.turnId,
+  });
   logAgentEvent("runtime_guidance_injected", {
     iteration: input.iteration,
     guidanceId: activeGuidance.id,
+    turnId: activeGuidance.turnId,
     chars: guidanceText.length,
   });
   return [...input.managedAgentMessages, guidanceMessage];
@@ -110,6 +131,7 @@ export function appendActiveRuntimeGuidance(input: {
 
 export interface IterationStreamPreparationResult {
   runtimeIntent: ResolvedUserIntent;
+  planRuntimeState: PlanLoopRuntimeState;
   streamRuntimeState: AgentLoopStreamRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   executeRecoveryIterationAdvance: ReturnType<typeof advanceExecuteRecoveryRuntimeIteration>;
@@ -130,6 +152,8 @@ export interface IterationStreamPreparationResult {
   maxOutputEscalations: number;
   iterationRequestStartedAt: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
+  /** Text-envelope card generated from the same frozen contract for a native-tool compatibility retry. */
+  providerCompatibilityPlanAuthoringCard?: string;
 }
 
 export async function prepareIterationStreamRequest(input: {
@@ -145,7 +169,8 @@ export async function prepareIterationStreamRequest(input: {
   iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
   turnInputContextSignals: TurnInputContextSignals;
   latestUserPromptText?: string;
-  preferredDelegationSatisfied?: boolean;
+  preferredDelegationScopeContract?: PreferredDelegationScopeContract | null;
+  preferredDelegationMaterializationBlockedScopeKeys?: string[];
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   lastAssistantTextForCheckpoint: string;
@@ -167,12 +192,12 @@ export async function prepareIterationStreamRequest(input: {
     iteration,
     effectiveMaxIterations,
     snapshotContextLimit,
-    planRuntimeState,
     toolExecutionRuntimeState,
     iterationContext,
     turnInputContextSignals,
     latestUserPromptText = "",
-    preferredDelegationSatisfied = false,
+    preferredDelegationScopeContract = null,
+    preferredDelegationMaterializationBlockedScopeKeys = [],
     recentToolActivity,
     recentPlanToolActivity,
     lastAssistantTextForCheckpoint,
@@ -184,6 +209,7 @@ export async function prepareIterationStreamRequest(input: {
     getMaxOutputEscalations,
     emitPlanExecutionProgress,
   } = input;
+  let planRuntimeState = input.planRuntimeState;
   const {
     config,
     isCloudProfile,
@@ -192,6 +218,53 @@ export async function prepareIterationStreamRequest(input: {
     turnIntent,
     workflowMode,
   } = runtimeState;
+
+  if (
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
+    planRuntimeState.planEvidenceRecoveryObjective !== "none" &&
+    !planRuntimeState.planEvidenceProgressFingerprint
+  ) {
+    const baselineInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      [],
+      latestUserPromptText,
+    );
+    const coverageKeys = new Set(
+      recentPlanToolActivity.flatMap((activity) => {
+        const observation = activity.readFileObservation;
+        if (!observation) return [];
+        const key = observation.key || [
+          observation.path,
+          observation.versionToken,
+          observation.requestSignature,
+        ].join("::");
+        return key ? [key] : [];
+      }),
+    );
+    const obligationKeys = new Set(derivePlanEvidenceObligations({
+      objective: latestUserPromptText,
+      activities: recentPlanToolActivity,
+    }).map(getPlanEvidenceObligationKey));
+    planRuntimeState = {
+      ...planRuntimeState,
+      planEvidenceProgressFingerprint: buildPlanEvidenceProgressFingerprint({
+        bundleHash: baselineInput.evidenceBundle.hash,
+        coverageKeys,
+        obligationKeys,
+      }),
+    };
+    logAgentEvent("plan_evidence_recovery_baseline_frozen", {
+      iteration,
+      recoveryObjective: planRuntimeState.planEvidenceRecoveryObjective,
+      evidenceBundleHash: baselineInput.evidenceBundle.hash,
+      semanticFacts: baselineInput.evidenceBundle.facts.length,
+      changeTargets: baselineInput.evidenceBundle.changeTargets.length,
+      coverageKeys: coverageKeys.size,
+      obligationKeys: obligationKeys.size,
+    });
+  }
 
   callbacks.startNewTurn();
   const runtimeIntent = resolveRuntimeIntent();
@@ -501,7 +574,7 @@ export async function prepareIterationStreamRequest(input: {
     }
   }
 
-  const toolSurfaceDecision = resolveIterationToolSurface({
+  const resolvedToolSurfaceDecision = resolveIterationToolSurface({
     callbacks,
     iteration,
     workflowMode,
@@ -525,8 +598,21 @@ export async function prepareIterationStreamRequest(input: {
     turnInputContextSignals,
     latestUserPromptText,
     lastAssistantTextForCheckpoint,
-    preferredDelegationSatisfied,
+    preferredDelegationScopeContract,
+    preferredDelegationMaterializationBlockedScopeKeys,
   });
+  const activePlanCandidateRepair = planRuntimeState.planCandidateRepairCheckpoint?.exhausted === false
+    ? planRuntimeState.planCandidateRepairCheckpoint
+    : null;
+  const toolSurfaceDecision = activePlanCandidateRepair
+    ? {
+        ...resolvedToolSurfaceDecision,
+        iterationAllTools: replacePlanCandidateSubmissionToolForRepair(
+          resolvedToolSurfaceDecision.iterationAllTools,
+          activePlanCandidateRepair,
+        ),
+      }
+    : resolvedToolSurfaceDecision;
   applySystemPromptForRuntime(capabilityRuntimeIntent, toolSurfaceDecision.iterationAllTools);
 
   const contextManagementResult = prepareManagedMessagesForIteration({
@@ -555,21 +641,66 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  let providerCompatibilityPlanAuthoringCard: string | undefined;
+  let preapprovalPlanGraphSize:
+    | { goals: number; evidence: number; changes: number; validations: number; interfaces: number }
+    | undefined;
   if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
     const planAuthoringContract = createPlanAuthoringContract({
       objective: latestUserPromptText,
       contextSignals: turnInputContextSignals,
       recentPlanToolActivity,
     });
-    const planAuthoringCard = formatPlanAuthoringContractForModel({
-      contract: planAuthoringContract,
-      runtime: {
-        phase: planRuntimeState.planRuntimePhase,
-        qualityGateReason: planRuntimeState.planLastQualityGateReason,
-        missingSections: planRuntimeState.planLastMissingSections,
-      },
-      language: MODEL_CONTROL_LANGUAGE,
-    });
+    const planAuthoringRuntime = {
+      phase: planRuntimeState.planRuntimePhase,
+      qualityGateReason: planRuntimeState.planLastQualityGateReason,
+      missingSections: planRuntimeState.planLastMissingSections,
+    };
+    const planSubmissionTransport =
+      !contextManagementResult.forceXmlTools &&
+      contextManagementResult.llmTools.length === 1 &&
+      contextManagementResult.llmTools[0]?.function.name ===
+        SUBMIT_PLAN_CANDIDATE_TOOL_NAME
+        ? "native_tool" as const
+        : "text_envelope" as const;
+    const graphEvidence = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      [],
+      latestUserPromptText,
+    ).evidenceBundle;
+    preapprovalPlanGraphSize = {
+      goals: planAuthoringContract.facets.length,
+      evidence: graphEvidence?.facts.length || 0,
+      changes: graphEvidence?.changeTargets.length || 0,
+      validations: planAuthoringContract.facets.length,
+      interfaces: graphEvidence?.verificationTargets.length || 0,
+    };
+    const repairIterationProtocol = activePlanCandidateRepair
+      ? buildPlanCandidateRepairIterationProtocol({
+          checkpoint: activePlanCandidateRepair,
+          submissionTransport: planSubmissionTransport,
+        })
+      : null;
+    const planAuthoringCard = repairIterationProtocol
+      ? repairIterationProtocol.primaryCard
+      : formatPlanAuthoringContractForModel({
+          contract: planAuthoringContract,
+          runtime: planAuthoringRuntime,
+          language: MODEL_CONTROL_LANGUAGE,
+          submissionTransport: planSubmissionTransport,
+        });
+    if (planSubmissionTransport === "native_tool") {
+      providerCompatibilityPlanAuthoringCard = formatPlanAuthoringContractForModel({
+        contract: planAuthoringContract,
+        runtime: planAuthoringRuntime,
+        language: MODEL_CONTROL_LANGUAGE,
+        submissionTransport: "text_envelope",
+      });
+      if (repairIterationProtocol?.providerCompatibilityCard) {
+        providerCompatibilityPlanAuthoringCard = repairIterationProtocol.providerCompatibilityCard;
+      }
+    }
     managedAgentMessages = [
       ...managedAgentMessages,
       { role: "system", content: planAuthoringCard },
@@ -585,26 +716,9 @@ export async function prepareIterationStreamRequest(input: {
       reusableEvidenceTargets: planAuthoringContract.reusableEvidenceTargets,
       imageCount: planAuthoringContract.imageCount,
       criteria: planAuthoringContract.criteria,
-    });
-  }
-  if (toolSurfaceDecision.preferredDelegationRequirement.required) {
-    const delegationContract = buildPreferredDelegationActionContract({
-      language: callbacks.getPreferredLanguage(),
-      candidateScopeKeys:
-        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
-    });
-    managedAgentMessages = [
-      ...managedAgentMessages,
-      { role: "system", content: delegationContract },
-    ];
-    logAgentEvent("preferred_delegation_action_contract_injected", {
-      iteration,
-      candidateScopeKeys:
-        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
-      toolNames: toolSurfaceDecision.iterationAllTools.map((tool) =>
-        tool.function.name
-      ),
-      toolChoiceRequired: !contextManagementResult.forceXmlTools,
+      submissionTransport: planSubmissionTransport,
+      candidateRepairMode: !!activePlanCandidateRepair,
+      candidateRepairBaseDraftHash: activePlanCandidateRepair?.baseDraftHash || null,
     });
   }
   if (recoveryBoundaryReleaseNotice) {
@@ -660,10 +774,26 @@ export async function prepareIterationStreamRequest(input: {
         toolSurfaceDecision.directFileModifyPhase === "validation",
     });
   }
+  if (toolSurfaceDecision.planEvidenceObligation) {
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      {
+        role: "system",
+        content: buildPlanEvidenceObligationContractCard(
+          toolSurfaceDecision.planEvidenceObligation,
+        ),
+      },
+    ];
+    logAgentEvent("plan_evidence_obligation_action_contract_injected", {
+      iteration,
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+      toolCount: toolSurfaceDecision.iterationAllTools.length,
+    });
+  }
   const shouldInjectPlanEvidenceBundle =
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&
-    ["synthesis", "drafting", "needs_rewrite", "review_ready"].includes(planRuntimeState.planRuntimePhase);
+    ["grounding", "needs_evidence", "synthesis", "drafting", "needs_rewrite", "review_ready"].includes(planRuntimeState.planRuntimePhase);
   if (shouldInjectPlanEvidenceBundle) {
     const closureInput = collectPlanClosureMaterializationInput(
       callbacks,
@@ -673,11 +803,17 @@ export async function prepareIterationStreamRequest(input: {
     );
     const bundle = closureInput.evidenceBundle;
     const closureAssessment = assessPlanClosureEvidence(bundle);
+    const deterministicMaterializationReady =
+      hasDeterministicPlanMaterializationEvidence(bundle);
     managedAgentMessages = [
       ...managedAgentMessages,
       {
         role: "system",
-        content: formatPlanEvidenceBundleForModel(bundle, MODEL_CONTROL_LANGUAGE),
+        content: formatPlanEvidenceBundleForModel(
+          bundle,
+          MODEL_CONTROL_LANGUAGE,
+          closureAssessment,
+        ),
       },
     ];
     logAgentEvent("plan_evidence_bundle_injected", {
@@ -690,8 +826,10 @@ export async function prepareIterationStreamRequest(input: {
       changeTargets: bundle.changeTargets.length,
       verificationTargets: bundle.verificationTargets.length,
       bundleReady: isPlanEvidenceBundleReady(bundle),
-      closureReady: closureAssessment.ready,
-      ready: closureAssessment.ready,
+      closureReady: deterministicMaterializationReady,
+      ready: deterministicMaterializationReady,
+      rationaleReady: closureAssessment.ready,
+      deterministicMaterializationReady,
       closureReason: closureAssessment.reason,
       objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
       defectSignalMatches: closureAssessment.defectSignalMatches,
@@ -699,6 +837,35 @@ export async function prepareIterationStreamRequest(input: {
       contractMismatchKinds: closureAssessment.contractMismatchKinds,
       unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
       transcriptToolMessages: managedAgentMessages.filter((message) => message.role === "tool").length,
+    });
+  }
+  // The action contract must be the final runtime-owned instruction. Evidence
+  // cards can legitimately name a missing source owner, but they must not
+  // override a stricter collaboration checkpoint by making a parent read look
+  // available. This ordering is part of the protocol and applies equally to
+  // native-tool and XML-compatible providers.
+  if (toolSurfaceDecision.preferredDelegationRequirement.required) {
+    const delegationContract = buildPreferredDelegationActionContract({
+      language: callbacks.getPreferredLanguage(),
+      candidateScopeKeys:
+        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
+      remainingScopes:
+        toolSurfaceDecision.preferredDelegationRequirement.remainingScopes,
+    });
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      { role: "system", content: delegationContract },
+    ];
+    logAgentEvent("preferred_delegation_action_contract_injected", {
+      iteration,
+      candidateScopeKeys:
+        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
+      toolNames: toolSurfaceDecision.iterationAllTools.map((tool) =>
+        tool.function.name
+      ),
+      toolChoiceRequired: !contextManagementResult.forceXmlTools,
+      injectionOrder: "after_plan_evidence",
+      providerNeutral: true,
     });
   }
 
@@ -716,6 +883,7 @@ export async function prepareIterationStreamRequest(input: {
         (tool) => tool.function.name,
       ),
       forceXmlTools: contextManagementResult.forceXmlTools,
+      graphSize: preapprovalPlanGraphSize,
     });
 
   callbacks.onToolSurfaceResolved?.(
@@ -766,6 +934,7 @@ export async function prepareIterationStreamRequest(input: {
 
   return {
     runtimeIntent,
+    planRuntimeState,
     streamRuntimeState,
     executeRecoveryState,
     executeRecoveryIterationAdvance,
@@ -781,5 +950,6 @@ export async function prepareIterationStreamRequest(input: {
     maxOutputEscalations,
     iterationRequestStartedAt,
     preapprovalPlanQualityRecoveryStreamPolicy,
+    providerCompatibilityPlanAuthoringCard,
   };
 }

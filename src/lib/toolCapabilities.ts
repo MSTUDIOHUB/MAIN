@@ -144,6 +144,9 @@ type SkillLike = {
 };
 
 const READ_ONLY_BUILT_INS = new Set([
+  // Runtime-control ingress: it never executes a workspace read/write and is
+  // consumed before ordinary tool partitioning.
+  "submit_plan_candidate",
   "spawn_subagent",
   "wait_subagents",
   "list_directory",
@@ -179,6 +182,33 @@ const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
 const DESKTOP_CONTROL_BUILT_INS = new Set(["computer_use"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
 const EXTERNAL_READ_BUILT_INS = new Set(["web_search", "web_fetch"]);
+
+export interface BuiltInValidationAdapterCapability {
+  surface: "browser" | "desktop";
+  toolName: string;
+  risk: "browser_control" | "desktop_control";
+}
+
+/**
+ * Runtime adapter registry used by typed Plan validation. Registration proves
+ * that MAIN has a structured executor for the primitive; task completion still
+ * requires an actual result from that executor and its ordinary permission gate.
+ */
+export function getBuiltInValidationAdapterCapability(
+  surface: "browser" | "desktop",
+): BuiltInValidationAdapterCapability | null {
+  const toolName = surface === "browser" ? "browser_evaluate" : "computer_use";
+  const registered = surface === "browser"
+    ? BROWSER_CONTROL_BUILT_INS.has(toolName)
+    : DESKTOP_CONTROL_BUILT_INS.has(toolName);
+  return registered
+    ? {
+        surface,
+        toolName,
+        risk: surface === "browser" ? "browser_control" : "desktop_control",
+      }
+    : null;
+}
 
 const LOCAL_FILE_READ_BUILT_INS = new Set([
   "read_file",

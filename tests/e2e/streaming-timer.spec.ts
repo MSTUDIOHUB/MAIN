@@ -69,7 +69,7 @@ test("stopping a running Turn atomically projects one canceled conclusion and re
   });
 });
 
-test("composer explicitly queues additional durable Turns while a run is active", async ({ page }) => {
+test("composer explicitly queues additional durable Turns while a run is active and Enter defaults to Queue", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-running-guidance");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -97,7 +97,7 @@ test("composer explicitly queues additional durable Turns while a run is active"
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
   await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
 
-  await page.getByTestId("composer-queue-button").click();
+  await textarea.press("Enter");
   await expect(textarea).toHaveValue("");
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().input ?? "missing"))
@@ -153,6 +153,33 @@ test("composer explicitly queues additional durable Turns while a run is active"
   await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
   await expect(page.getByTestId("composer-guidance-button")).toHaveCount(0);
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+});
+
+test("composer keeps queue, guide, and stop controls for a live Turn owner between model chunks", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-running-guidance");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({
+    status: "running",
+    isGenerating: false,
+  }));
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      isGenerating: snapshot?.isGenerating,
+      agentStatus: snapshot?.agentStatus,
+      currentTurnStatus: snapshot?.currentTurnStatus,
+    };
+  })).toEqual({
+    isGenerating: false,
+    agentStatus: "running",
+    currentTurnStatus: "executing",
+  });
+
+  await page.getByTestId("composer-textarea").fill("继续核对当前回合的焦点恢复");
+  await expect(page.getByTestId("composer-guidance-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-queue-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
 });
 
 test("composer guides the current run without admitting a new Turn", async ({ page }) => {

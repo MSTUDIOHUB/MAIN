@@ -35,6 +35,7 @@ type WaitForPlanApprovalIfNeeded = Parameters<typeof handleAssistantCompletionPh
 type EmitTaskOrchestratorPhase = Parameters<typeof handleAssistantCompletionPhase>[0]["emitTaskOrchestratorPhase"];
 type EmitPlanExecutionProgress = Parameters<typeof handleAssistantCompletionPhase>[0]["emitPlanExecutionProgress"];
 type EmitTurnEvent = Parameters<typeof handleAssistantCompletionPhase>[0]["emitTurnEvent"];
+type OnSubagentScopeOutcomes = Parameters<typeof handleAssistantCompletionPhase>[0]["onSubagentScopeOutcomes"];
 
 type AssistantIterationBaseResult = {
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
@@ -75,6 +76,7 @@ export async function handleAssistantIterationPhase(input: {
   toolCatalog: ToolCatalog;
   webSearchEnabled: boolean;
   latestUserPromptText: string;
+  preferredDelegationRequired?: boolean;
   repairExecutionRequestInChat: boolean;
   commandDirectiveAction?: string | null;
   unityConsoleDiagnosticsRequested: boolean;
@@ -94,6 +96,7 @@ export async function handleAssistantIterationPhase(input: {
   emitTurnCompletedEvent: () => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
+  onSubagentScopeOutcomes?: OnSubagentScopeOutcomes;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   activateExecuteRecovery: ActivateExecuteRecovery;
   clearExecuteRecovery: ClearExecuteRecovery;
@@ -266,6 +269,7 @@ export async function handleAssistantIterationPhase(input: {
     runtimeIntent,
     workspace,
     latestUserPromptText: input.latestUserPromptText,
+    preferredDelegationRequired: input.preferredDelegationRequired,
     availableToolNames: input.availableToolNames,
     effectiveToolCalls,
     normalized,
@@ -374,6 +378,7 @@ export async function handleAssistantIterationPhase(input: {
     emitTurnCompletedEvent: input.emitTurnCompletedEvent,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
     emitPlanExecutionProgress: input.emitPlanExecutionProgress,
+    onSubagentScopeOutcomes: input.onSubagentScopeOutcomes,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     waitForPlanApprovalIfNeeded: input.waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,

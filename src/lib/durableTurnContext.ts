@@ -99,7 +99,8 @@ export function collectDurableTurnExecutionSummary(input: {
   const decisions: string[] = [];
   const modifiedFiles: string[] = [];
   const validations: string[] = [];
-  const failures: string[] = [];
+  const persistentFailures: string[] = [];
+  const unresolvedToolFailures = new Map<string, string>();
 
   for (const block of input.turnBlocks) {
     if (block.type === "agent" && block.selectedOption) {
@@ -107,7 +108,7 @@ export function collectDurableTurnExecutionSummary(input: {
       continue;
     }
     if (block.type === "system" && /^\s*❌/.test(block.content || "")) {
-      failures.push(block.content);
+      persistentFailures.push(block.content);
       continue;
     }
     if (block.type !== "tool") continue;
@@ -124,6 +125,10 @@ export function collectDurableTurnExecutionSummary(input: {
       : null;
     const commandFailed = commandOutcome === "failed";
     const noOp = isNoOpToolFeedback(resultText);
+    const failureKey = [
+      String(block.executionName || block.toolName || "").trim().toLowerCase(),
+      String(block.target || "").trim().replace(/\s+/g, " ").toLowerCase(),
+    ].join("::");
     if (
       block.toolStatus === "executed" &&
       !noOp &&
@@ -148,7 +153,14 @@ export function collectDurableTurnExecutionSummary(input: {
       validations.push(`${block.toolName}: ${target}`);
     }
     if (block.toolStatus === "failed" || commandFailed) {
-      failures.push(`${block.toolName}: ${target}`);
+      unresolvedToolFailures.set(failureKey, `${block.toolName}: ${target}`);
+    } else if (block.toolStatus === "executed" && !noOp) {
+      // The durable terminal summary represents unresolved outcomes, while
+      // the process timeline still retains every failed attempt. A later
+      // successful retry of the same runtime capability and target therefore
+      // reconciles the earlier failure instead of poisoning future Turn
+      // context after the acceptance boundary has passed.
+      unresolvedToolFailures.delete(failureKey);
     }
   }
 
@@ -156,7 +168,10 @@ export function collectDurableTurnExecutionSummary(input: {
     decisions: unique(decisions),
     modifiedFiles: unique(modifiedFiles),
     validations: unique(validations),
-    failures: unique(failures),
+    failures: unique([
+      ...persistentFailures,
+      ...unresolvedToolFailures.values(),
+    ]),
     unfinished: unique(input.unfinished || []),
     advisories: unique(input.advisories || []),
     artifacts: unique(input.artifactPaths || []),

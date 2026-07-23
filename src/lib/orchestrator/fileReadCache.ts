@@ -42,6 +42,8 @@ export interface FileReadObservationIdentity {
   versionToken: string;
   contentHash?: string;
   source: FileReadObservationSource;
+  /** Actual returned source range, not merely the model-requested range. */
+  window?: FileReadWindowIdentity;
 }
 
 export interface FileReadWindowIdentity {
@@ -307,6 +309,7 @@ export function buildFileReadObservationIdentity(input: {
   modifiedMs: number;
   contentHash?: string;
   source: FileReadObservationSource;
+  window?: FileReadWindowIdentity;
 }): FileReadObservationIdentity {
   const versionToken = `${input.sizeBytes}:${input.modifiedMs}`;
   const contentToken = String(input.contentHash || "unknown");
@@ -317,6 +320,7 @@ export function buildFileReadObservationIdentity(input: {
     versionToken,
     ...(input.contentHash ? { contentHash: input.contentHash } : {}),
     source: input.source,
+    ...(input.window ? { window: { ...input.window } } : {}),
   };
 }
 
@@ -343,7 +347,10 @@ export function getFileReadObservationForState(
     contentHash: state.contentHash,
     source,
   });
-  return observation.source === source ? observation : { ...observation, source };
+  const withWindow = state.window && !observation.window
+    ? { ...observation, window: { ...state.window } }
+    : observation;
+  return withWindow.source === source ? withWindow : { ...withWindow, source };
 }
 
 /**

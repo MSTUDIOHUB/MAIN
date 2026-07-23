@@ -810,6 +810,247 @@ test("submit async workflow run awaits the workflow engine terminal transaction"
   assert.equal(settled, true);
 });
 
+test("a failed terminal projection quiesces only its exact workflow owner without completing the Turn", async () => {
+  const runId = "run-terminal-projection-failed";
+  const abortController = new AbortController();
+  const marker = {
+    schemaVersion: 1,
+    runId,
+    activeRunId: runId,
+    activeParentRunId: null,
+    parentRunId: null,
+    instanceId: "instance-terminal-failure",
+    sessionKey: "workspace::7",
+    workspace: "/tmp/workspace",
+    sessionId: 7,
+    turnId: "turn-1",
+    status: "running",
+    terminalResultKind: null,
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planStage: "drafting",
+    isPlanApproved: false,
+    iteration: 2,
+    maxIterations: 12,
+    messagesLen: 1,
+    toolCount: 0,
+    latestTool: null,
+    latestToolTarget: null,
+    activeStreamId: null,
+    streamStatus: null,
+    streamChunkCount: 0,
+    streamByteCount: 0,
+    streamElapsedMs: null,
+    streamLifecycleStatus: null,
+    lastStreamError: null,
+    startedAt: 1_100,
+    updatedAt: 1_100,
+    closedAt: null,
+    closeReason: null,
+  };
+  const harness = createHarness({
+    input: {
+      runIdOverride: runId,
+      effectiveRunIntent: "plan",
+      runtimeRunIntent: "plan",
+      effectiveWorkflowMode: "plan",
+    },
+  });
+  harness.input.phaseRunners = {
+    buildAttachmentContext: async () => ({
+      userContent: "plan",
+      attachmentRefs: [],
+      failedAttachmentCount: 0,
+    }),
+    buildPromptContext: () => ({ userContent: "plan" }),
+    runGameStudioPreparation: async () => ({
+      ok: true,
+      userContent: "plan",
+      activeStudioAgentKey: "coder",
+      gameStudioInitialized: false,
+      gameStudioConfigForTurn: null,
+    }),
+    startRunLease: (input) => {
+      input.setHarnessRunMarker(marker);
+      input.setAbortController(abortController);
+      return {
+        runId,
+        parentRunId: null,
+        turnAgentMessagesStart: 0,
+        agentUserMessage: { role: "user", content: "plan" },
+        abortController,
+        harnessRunMarker: marker,
+      };
+    },
+    createWorkflowContext: (input) => ({
+      ...input,
+      streamBuffer: null,
+      thinkingInterceptor: null,
+      agentBlockIdsCreatedThisRun: new Set(),
+    }),
+    startStreamingUi: () => {},
+    runWorkflowEngine: async () => ({
+      disposition: "projection_failed",
+      reason: "terminal_projection_not_committed",
+      identity: {
+        sessionKey: "workspace::7",
+        turnId: "turn-1",
+        runId,
+        parentRunId: null,
+        outerRunId: runId,
+      },
+      outcome: {
+        status: "paused",
+        pauseKind: "recoverable",
+        reason: "plan_generation_failed",
+      },
+      currentOwner: {
+        harnessRunId: runId,
+        actionRunId: runId,
+        actionRequestRunId: null,
+        sessionKey: "workspace::7",
+        turnId: "turn-1",
+        status: "running",
+        instanceId: marker.instanceId,
+        startedAt: marker.startedAt,
+      },
+    }),
+  };
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(harness.state.agentStatus, "idle");
+  assert.equal(harness.state.isGenerating, false);
+  assert.equal(harness.state.abortController, null);
+  assert.equal(harness.state.harnessRunMarker.status, "paused");
+  assert.equal(harness.state.harnessRunMarker.closeReason, "plan_generation_failed");
+  assert.equal(harness.state.conversationTurns[0].status, "paused");
+  assert.equal(harness.state.conversationTurns[0].runtimeOutcome.status, "paused");
+  assert.equal(harness.state.conversationTurns[0].runtimeOutcome.reason, "plan_generation_failed");
+  assert.equal(
+    harness.state.runtimeEvents.some((event) => event.type === "turn.completed"),
+    false,
+  );
+  assert.equal(
+    harness.state.runtimeEvents.filter((event) => event.type === "run.paused").length,
+    1,
+  );
+  assert.equal(harness.calls.some((entry) =>
+    entry[0] === "log" && entry[1] === "workflow_projection_failure_reconciled"
+  ), true);
+});
+
+test("terminal projection reconciliation never clears a newer exact workflow owner", async () => {
+  const oldRunId = "run-terminal-old";
+  const oldAbortController = new AbortController();
+  const oldMarker = {
+    schemaVersion: 1,
+    runId: oldRunId,
+    activeRunId: oldRunId,
+    parentRunId: null,
+    instanceId: "instance-old",
+    sessionKey: "workspace::7",
+    workspace: "/tmp/workspace",
+    sessionId: 7,
+    turnId: "turn-1",
+    status: "running",
+    startedAt: 1_100,
+    updatedAt: 1_100,
+    closedAt: null,
+    closeReason: null,
+  };
+  const newAbortController = new AbortController();
+  const newMarker = {
+    ...oldMarker,
+    runId: "run-terminal-new",
+    activeRunId: "run-terminal-new",
+    instanceId: "instance-new",
+    startedAt: 1_200,
+    updatedAt: 1_200,
+  };
+  const harness = createHarness({ input: { runIdOverride: oldRunId } });
+  harness.input.phaseRunners = {
+    buildAttachmentContext: async () => ({
+      userContent: "execute",
+      attachmentRefs: [],
+      failedAttachmentCount: 0,
+    }),
+    buildPromptContext: () => ({ userContent: "execute" }),
+    runGameStudioPreparation: async () => ({
+      ok: true,
+      userContent: "execute",
+      activeStudioAgentKey: "coder",
+      gameStudioInitialized: false,
+      gameStudioConfigForTurn: null,
+    }),
+    startRunLease: (input) => {
+      input.setHarnessRunMarker(oldMarker);
+      input.setAbortController(oldAbortController);
+      return {
+        runId: oldRunId,
+        parentRunId: null,
+        turnAgentMessagesStart: 0,
+        agentUserMessage: { role: "user", content: "execute" },
+        abortController: oldAbortController,
+        harnessRunMarker: oldMarker,
+      };
+    },
+    createWorkflowContext: (input) => ({
+      ...input,
+      streamBuffer: null,
+      thinkingInterceptor: null,
+      agentBlockIdsCreatedThisRun: new Set(),
+    }),
+    startStreamingUi: () => {},
+    runWorkflowEngine: async () => {
+      harness.state.harnessRunMarker = newMarker;
+      harness.state.abortController = newAbortController;
+      harness.state.agentStatus = "running";
+      harness.state.isGenerating = true;
+      return {
+        disposition: "projection_failed",
+        reason: "terminal_projection_not_committed",
+        identity: {
+          sessionKey: "workspace::7",
+          turnId: "turn-1",
+          runId: oldRunId,
+          parentRunId: null,
+          outerRunId: oldRunId,
+        },
+        outcome: {
+          status: "paused",
+          pauseKind: "recoverable",
+          reason: "runtime_projection_failed",
+        },
+        currentOwner: {
+          harnessRunId: oldRunId,
+          actionRunId: oldRunId,
+          actionRequestRunId: null,
+          sessionKey: "workspace::7",
+          turnId: "turn-1",
+          status: "running",
+          instanceId: oldMarker.instanceId,
+          startedAt: oldMarker.startedAt,
+        },
+      };
+    },
+  };
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(harness.state.harnessRunMarker, newMarker);
+  assert.equal(harness.state.abortController, newAbortController);
+  assert.equal(harness.state.agentStatus, "running");
+  assert.equal(harness.state.isGenerating, true);
+  assert.equal(harness.state.conversationTurns[0].status, "executing");
+  assert.equal(harness.state.runtimeEvents.length, 0);
+  assert.equal(harness.calls.some((entry) =>
+    entry[0] === "log" &&
+    entry[1] === "workflow_projection_failure_reconciliation_skipped" &&
+    entry[2]?.reason === "superseded"
+  ), true);
+});
+
 test("a Turn canceled during bootstrap cannot acquire a run lease or start tools", async () => {
   let releaseWorkspaceTree;
   let workspaceTreeStarted;

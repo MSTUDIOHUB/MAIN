@@ -147,7 +147,11 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   });
 
   assert.equal(lease.turnAgentMessagesStart, 1);
-  assert.deepEqual(lease.agentUserMessage, { role: "user", content: "ship the goal" });
+  assert.deepEqual(lease.agentUserMessage, {
+    role: "user",
+    content: "ship the goal",
+    runtimeTurnId: "turn-1",
+  });
   assert.equal(lease.abortController, abortController);
   assert.deepEqual(goals, [
     {
@@ -400,7 +404,11 @@ test("Goal choice continuations append guidance without creating a replacement G
     nowMs: () => 792,
   });
 
-  assert.deepEqual(agentMessages.at(-1), { role: "user", content: "显示欢迎页" });
+  assert.deepEqual(agentMessages.at(-1), {
+    role: "user",
+    content: "显示欢迎页",
+    runtimeTurnId: "turn-goal",
+  });
   assert.equal(lease.parentRunId, "run-goal:slice:1");
   assert.equal(persisted.workflowMode, "edit");
   assert.equal(persisted.runtimeIntent, "goal");

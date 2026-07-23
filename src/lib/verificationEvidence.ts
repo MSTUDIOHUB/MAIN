@@ -110,6 +110,17 @@ export function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry
   );
 }
 
+export function hasSuccessfulWorkspaceMutationEvidence(input: {
+  ledger: PlanExecutionEvidenceEntry[];
+  transactionId?: string | null;
+}): boolean {
+  return scopeExecutionEvidenceLedger(input.ledger, input.transactionId).some((entry) =>
+    entry.kind === "file" &&
+    isWorkspaceMutationToolName(entry.sourceTool) &&
+    isSuccessfulStructuredEvidence(entry)
+  );
+}
+
 /**
  * Decide max-iteration continuation from trusted transaction evidence only.
  * Tool-call prose and successful cache/policy responses never participate.

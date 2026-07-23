@@ -3,6 +3,7 @@ import { isExplicitContextWindowError, resolveReactiveContextLimit } from "../..
 import { estimateMessagesTokens, manageContext } from "../../contextTrim";
 import { getErrorMessage } from "../../errorUtils";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import { buildPlanSubmissionGuidance } from "../../planSubmissionGuidance";
 import { buildPlanStreamTimeoutPauseMessage } from "../../orchestrator/planOrchestration";
 import {
   buildCompatibilityRetryMessages,
@@ -12,9 +13,15 @@ import {
   isProviderCompatibilityErrorMessage,
 } from "../../providerCompatibility";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import type { ResolvedUserIntent } from "../../runIntent";
+import {
+  isMutationRuntimeIntent,
+  type ResolvedUserIntent,
+} from "../../runIntent";
 import type { StreamedToolCall, StreamResult } from "../../streaming";
-import type { ToolDefinition } from "../../toolSchemas";
+import {
+  SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+  type ToolDefinition,
+} from "../../toolSchemas";
 import { generateId } from "../../utils";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type { PlanExecutionProgressPhase, PlanExecutionProgressUpdate } from "../../workflowModels";
@@ -31,13 +38,20 @@ import type { FileReadState } from "../fileReadCache";
 import { advanceFileReadContextEvictionEpochs } from "./contextManagement";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
 import {
-  APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS,
+  EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS,
   invokeInitialStreamForIteration,
   type PlanStreamWatchdogOptionsResolver,
 } from "./streamInvocation";
-import type { ExecuteRecoveryMode, RecoveryActionContract } from "../../executeRecoveryTools";
+import {
+  summarizeRepeatedExecuteTargets,
+  type ExecuteRecoveryMode,
+  type RecoveryActionContract,
+} from "../../executeRecoveryTools";
 import { countVisualContentParts } from "../../visualContext";
-import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
+import {
+  annotateRequiredToolCallProtocolResult,
+  hasSuccessfulAllowedRawNativeToolCall,
+} from "../../requiredToolProtocol";
 import {
   applyPreapprovalPlanQualityRecoveryStreamOptions,
   capPreapprovalPlanQualityRecoveryMaxEscalations,
@@ -46,9 +60,9 @@ import {
   type PreapprovalPlanQualityRecoveryStreamPolicy,
 } from "./preapprovalPlanRecoveryStreamPolicy";
 
-export const APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS =
-  APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS;
-export const APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS = 2_048;
+export const EXECUTE_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS =
+  EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS;
+export const EXECUTE_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS = 2_048;
 export const PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS = 120_000;
 export const PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS = 2_048;
 
@@ -117,34 +131,32 @@ export function resolvePreapprovalPlanStreamWatchdogReadFallback(input: {
   };
 }
 
-export function shouldAttemptApprovedPlanStreamWatchdogRecovery(input: {
+export function shouldAttemptExecuteStreamWatchdogRecovery(input: {
   message: string;
-  activeProfile: string;
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
-  isPlanApproved: boolean;
-  isExecuteRecoveryEligible: boolean;
   llmToolCount: number;
   forceXmlTools: boolean;
 }): boolean {
-  return input.activeProfile === "local" &&
-    input.workflowMode === "plan" &&
-    input.runtimeIntent === "execute" &&
-    input.isPlanApproved &&
+  const executeEvidenceRuntime =
+    input.workflowMode === "edit" ||
+    isMutationRuntimeIntent(input.runtimeIntent) ||
+    input.runtimeIntent === "studio_workflow";
+  return executeEvidenceRuntime &&
     isStreamWatchdogTimeoutMessage(input.message) &&
     input.llmToolCount > 0 &&
     !input.forceXmlTools;
 }
 
-export function buildApprovedPlanStreamWatchdogRecoveryPrompt(language: "zh" | "en"): string {
+export function buildExecuteStreamWatchdogRecoveryPrompt(language: "zh" | "en"): string {
   return language === "en"
     ? [
-        "APPROVED_PLAN_STREAM_RECOVERY: The previous recovery stream timed out without producing a tool result.",
+        "EXECUTE_STREAM_RECOVERY: The previous execution stream timed out without producing a tool result.",
         "Call exactly one available tool now. Do not emit analysis, a plan, or a progress paragraph before the tool call.",
         "If the previous edit had a patch mismatch, use one targeted read_file for the exact target; otherwise patch, run validation, or use browser validation now.",
       ].join("\n")
     : [
-        "APPROVED_PLAN_STREAM_RECOVERY: 上一次恢复流超时，且没有产生工具结果。",
+        "EXECUTE_STREAM_RECOVERY: 上一次执行流超时，且没有产生工具结果。",
         "现在必须直接调用一个可用工具；工具调用前不要输出分析、计划或进度段落。",
         "如果上一笔编辑是 patch mismatch，只对精确目标调用一次 read_file；否则现在直接修改、运行验证或执行浏览器验证。",
       ].join("\n");
@@ -167,15 +179,36 @@ export function shouldAttemptPreapprovalPlanStreamWatchdogRecovery(input: {
 export function buildPreapprovalPlanStreamWatchdogRecoveryPrompt(
   language: "zh" | "en",
   hasTools: boolean,
+  planCandidateRepairActive = false,
 ): string {
-  if (language === "en") {
-    return hasTools
-      ? "PLAN_STREAM_RECOVERY: The previous model stream stalled or degenerated into repetitive output. Continue the same task now. If grounded evidence is still missing, call exactly one targeted read-only tool; otherwise output the complete reviewable <proposed_plan>. Do not ask whether to continue and do not emit user choices unless a real user-owned decision blocks the plan."
-      : "PLAN_STREAM_RECOVERY: The previous model stream stalled or degenerated into repetitive output. Continue the same task now and output the complete reviewable <proposed_plan>. Do not ask whether to continue, emit filler, or return another protocol-only response.";
+  if (planCandidateRepairActive) {
+    return language === "en"
+      ? [
+          "PLAN_CANDIDATE_LOCAL_REPAIR_STREAM_RECOVERY: The previous stream stalled during an active bounded repair transaction.",
+          "Follow the latest [PLAN AUTHORING CONTRACT] and active submit_plan_candidate schema exactly. Submit only the local repair patch; every earlier instruction to submit or resubmit a complete draft or full typed graph remains suspended.",
+          "Do not restart analysis, reread accepted evidence, emit user choices, or include accepted nodes.",
+        ].join("\n")
+      : [
+          "PLAN_CANDIDATE_LOCAL_REPAIR_STREAM_RECOVERY：上一次模型流在有界局部修复事务中卡住。",
+          "请严格遵循最新的 [PLAN AUTHORING CONTRACT] 与当前 submit_plan_candidate schema，只提交局部 repair patch；此前要求提交或重新提交完整草稿、完整 typed graph 的指令继续暂停。",
+          "不要重新开始分析，不要重读已接受证据，不要输出用户选项，也不要包含已接受节点。",
+        ].join("\n");
   }
-  return hasTools
-    ? "PLAN_STREAM_RECOVERY：上一条模型流卡住或退化为重复输出。现在继续同一任务；若仍缺少可靠证据，立即调用一个精确的只读工具，否则直接输出完整可审批的 `<proposed_plan>`。不要询问是否继续；只有真实的用户决策会阻塞计划时才能输出选项。"
-    : "PLAN_STREAM_RECOVERY：上一条模型流卡住或退化为重复输出。现在继续同一任务并直接输出完整可审批的 `<proposed_plan>`；不要询问是否继续，不要输出过渡内容或再次返回协议占位。";
+  const submissionGuidance = buildPlanSubmissionGuidance(language);
+  if (language === "en") {
+    return [
+      hasTools
+        ? "PLAN_STREAM_RECOVERY: The previous model stream stalled or degenerated into repetitive output. Continue the same task now. If grounded evidence is still missing, call exactly one targeted read-only tool; otherwise submit the complete typed graph. Do not ask whether to continue and do not emit user choices unless a real user-owned decision blocks the plan."
+        : "PLAN_STREAM_RECOVERY: The previous model stream stalled or degenerated into repetitive output. Continue the same task now and submit the complete typed graph. Do not ask whether to continue, emit filler, or return another protocol-only response.",
+      submissionGuidance,
+    ].join("\n");
+  }
+  return [
+    hasTools
+      ? "PLAN_STREAM_RECOVERY：上一条模型流卡住或退化为重复输出。现在继续同一任务；若仍缺少可靠证据，立即调用一个精确的只读工具，否则直接提交完整 typed graph。不要询问是否继续；只有真实的用户决策会阻塞计划时才能输出选项。"
+      : "PLAN_STREAM_RECOVERY：上一条模型流卡住或退化为重复输出。现在继续同一任务并直接提交完整 typed graph；不要询问是否继续，不要输出过渡内容或再次返回协议占位。",
+    submissionGuidance,
+  ].join("\n");
 }
 
 export type StreamWithRecoveryResult =
@@ -238,6 +271,75 @@ function handlePlanDraftStreamTimeout(input: {
     },
   );
   callbacks.onStatusChange("idle");
+  return true;
+}
+
+function pauseDirectExecuteStreamWatchdog(input: {
+  callbacks: OrchestratorCallbacks;
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: ResolvedUserIntent;
+  iteration: number;
+  recentToolActivity: PlanToolActivitySummary[];
+  message: string;
+  logContext?: Record<string, unknown>;
+}): boolean {
+  const executeEvidenceRuntime =
+    input.workflowMode === "edit" ||
+    isMutationRuntimeIntent(input.runtimeIntent) ||
+    input.runtimeIntent === "studio_workflow";
+  if (
+    input.callbacks.getIsPlanApproved() ||
+    !executeEvidenceRuntime ||
+    !isStreamWatchdogTimeoutMessage(input.message)
+  ) {
+    return false;
+  }
+
+  const language = input.callbacks.getPreferredLanguage();
+  const recoveryReason = /stream_max_elapsed_timeout/i.test(input.message)
+    ? "stream_max_elapsed_timeout"
+    : "stream_no_visible_progress_timeout";
+  const repeatedTargets = summarizeRepeatedExecuteTargets(
+    input.recentToolActivity.slice(-12),
+  );
+  const nextStep = language === "zh"
+    ? "从已保留的工作区状态恢复，并直接调用当前阶段允许的真实工具"
+    : "resume from the preserved workspace state by calling a real tool allowed by the active phase";
+  const pauseNotice = language === "zh"
+    ? [
+        recoveryReason === "stream_max_elapsed_timeout"
+          ? "执行已暂停：模型流超过有限时间边界，且一次强制工具恢复仍未产生工具结果。"
+          : "执行已暂停：模型持续输出但没有形成可见内容或工具调用，且一次强制工具恢复仍未推进。",
+        "当前工作区、回合和执行检查点均已保留；MAIN 没有把这次停滞投影为完成。",
+        `最近目标：${repeatedTargets.length > 0 ? repeatedTargets.join("、") : "尚未锁定单一目标"}`,
+        `建议恢复动作：${nextStep}。`,
+      ].join("\n")
+    : [
+        recoveryReason === "stream_max_elapsed_timeout"
+          ? "Execution paused because the model stream exceeded its finite boundary and one forced-tool recovery still produced no tool result."
+          : "Execution paused because the model kept streaming without visible content or a tool call, and one forced-tool recovery still made no progress.",
+        "The workspace, Turn, and execution checkpoint were preserved; MAIN did not project this stall as completion.",
+        `Recent targets: ${repeatedTargets.length > 0 ? repeatedTargets.join(", ") : "no single target locked yet"}`,
+        `Suggested recovery: ${nextStep}.`,
+      ].join("\n");
+
+  logAgentEvent("execute_stream_watchdog_paused", {
+    iteration: input.iteration,
+    message: input.message.slice(0, 240),
+    recoveryReason,
+    repeatedTargets,
+    ...(input.logContext || {}),
+  });
+  input.callbacks.onNonActionableStop(
+    pauseNotice,
+    "no_output",
+    {
+      recoveryReason,
+      repeatedTargets,
+      nextStep,
+    },
+  );
+  input.callbacks.onStatusChange("idle");
   return true;
 }
 
@@ -383,9 +485,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   markChatFinalSynthesisPromptUsed: () => void;
   recentToolActivity: PlanToolActivitySummary[];
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
-  approvedPlanRecoveryStreamMaxElapsedMs: number;
+  executeRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
+  providerCompatibilityPlanAuthoringCard?: string;
   preferredDelegationRequired: boolean;
+  planEvidenceObligationRequired?: boolean;
+  planCandidateRepairActive?: boolean;
   fileReadStates: Map<string, FileReadState>;
   pauseApprovedPlanStreamWatchdog: (message: string, logContext?: Record<string, unknown>) => boolean;
   emitPlanExecutionProgress: (
@@ -420,9 +525,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     markChatFinalSynthesisPromptUsed,
     recentToolActivity,
     getPlanStreamWatchdogOptions,
-    approvedPlanRecoveryStreamMaxElapsedMs,
+    executeRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
+    providerCompatibilityPlanAuthoringCard,
     preferredDelegationRequired,
+    planEvidenceObligationRequired,
+    planCandidateRepairActive = false,
     fileReadStates,
     pauseApprovedPlanStreamWatchdog,
     emitPlanExecutionProgress,
@@ -452,6 +560,20 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     options,
     nativeToolCount,
   );
+  const pauseExecutionStreamWatchdog = (
+    message: string,
+    logContext?: Record<string, unknown>,
+  ): boolean =>
+    pauseApprovedPlanStreamWatchdog(message, logContext) ||
+    pauseDirectExecuteStreamWatchdog({
+      callbacks,
+      workflowMode,
+      runtimeIntent,
+      iteration,
+      recentToolActivity,
+      message,
+      logContext,
+    });
 
   try {
     const initialStreamInvocation = await invokeInitialStreamForIteration({
@@ -482,9 +604,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       markChatFinalSynthesisPromptUsed,
       recentToolActivity,
       getPlanStreamWatchdogOptions,
-      approvedPlanRecoveryStreamMaxElapsedMs,
+      executeRecoveryStreamMaxElapsedMs,
       preapprovalPlanQualityRecoveryStreamPolicy,
       preferredDelegationRequired,
+      planEvidenceObligationRequired,
     });
     observeFileReadContextForMessagesSent({
       fileReadStates,
@@ -507,28 +630,25 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     }
 
     let errMsg = (activeError as Error).message || "";
-    if (shouldAttemptApprovedPlanStreamWatchdogRecovery({
+    if (shouldAttemptExecuteStreamWatchdogRecovery({
       message: errMsg,
-      activeProfile: config.activeProfile,
       workflowMode,
       runtimeIntent,
-      isPlanApproved: callbacks.getIsPlanApproved(),
-      isExecuteRecoveryEligible,
       llmToolCount: llmTools.length,
       forceXmlTools,
     })) {
       const retryMaxElapsedMs = Math.min(
-        APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
-        approvedPlanRecoveryStreamMaxElapsedMs,
+        EXECUTE_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
+        executeRecoveryStreamMaxElapsedMs,
       );
       const retryMaxTokens = Math.min(
-        currentMaxTokens ?? APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
-        APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
+        currentMaxTokens ?? EXECUTE_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
+        EXECUTE_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
       );
-      const retryPrompt = buildApprovedPlanStreamWatchdogRecoveryPrompt(
+      const retryPrompt = buildExecuteStreamWatchdogRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
       );
-      logAgentEvent("approved_plan_stream_watchdog_recovery_started", {
+      logAgentEvent("execute_stream_watchdog_recovery_started", {
         iteration,
         previousError: errMsg.slice(0, 240),
         retryMaxElapsedMs,
@@ -566,7 +686,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           applyRecoveryStreamOptions({
             ...getPlanStreamWatchdogOptions(llmTools.length),
             maxStreamElapsedMs: retryMaxElapsedMs,
-            maxStreamElapsedLabel: "approved_plan_action_retry",
+            maxStreamElapsedLabel: "execute_action_retry",
             toolChoice: "required",
             workflowMode,
             runtimeIntent,
@@ -577,8 +697,14 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           "required",
           llmTools.map((tool) => tool.function.name),
         );
-        callbacks.onProviderNativeToolSuccess?.();
-        logAgentEvent("approved_plan_stream_watchdog_recovered", {
+        if (hasSuccessfulAllowedRawNativeToolCall({
+          rawResult: rawStreamResult,
+          normalizedResult: streamResult,
+          allowedToolNames: llmTools.map((tool) => tool.function.name),
+        })) {
+          callbacks.onProviderNativeToolSuccess?.();
+        }
+        logAgentEvent("execute_stream_watchdog_recovered", {
           iteration,
           toolCalls: streamResult.toolCalls?.length || 0,
           finishReason: streamResult.finishReason || null,
@@ -588,7 +714,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           beforeMessages: retrySourceMessages,
           messagesSentToLLM: retryMessages,
           iteration,
-          reason: "approved_plan_watchdog_retry_protocol_messages",
+          reason: "execute_watchdog_retry_protocol_messages",
         });
         return { status: "streamed", streamResult, snapshotContextLimit, messagesSentToLLM: retryMessages };
       } catch (retryError) {
@@ -598,18 +724,18 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         }
         activeError = retryError;
         errMsg = (retryError as Error).message || "";
-        logAgentEvent("approved_plan_stream_watchdog_recovery_failed", {
+        logAgentEvent("execute_stream_watchdog_recovery_failed", {
           iteration,
           error: errMsg.slice(0, 240),
           retryMaxElapsedMs,
           toolCount: llmTools.length,
         });
-        if (pauseApprovedPlanStreamWatchdog(errMsg, { stage: "bounded_action_retry" })) {
+        if (pauseExecutionStreamWatchdog(errMsg, { stage: "bounded_action_retry" })) {
           return { status: "stopped", snapshotContextLimit };
         }
       }
     }
-    if (pauseApprovedPlanStreamWatchdog(errMsg, { stage: "initial_stream" })) {
+    if (pauseExecutionStreamWatchdog(errMsg, { stage: "initial_stream" })) {
       return { status: "stopped", snapshotContextLimit };
     }
     if (shouldAttemptPreapprovalPlanStreamWatchdogRecovery({
@@ -665,6 +791,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       const retryPrompt = buildPreapprovalPlanStreamWatchdogRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
         recoveryTools.length > 0,
+        planCandidateRepairActive,
       );
       logAgentEvent("preapproval_plan_stream_watchdog_recovery_started", {
         iteration,
@@ -712,7 +839,11 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           recoveryTools.length > 0 ? "required" : undefined,
           recoveryTools.map((tool) => tool.function.name),
         );
-        if (recoveryTools.length > 0) {
+        if (hasSuccessfulAllowedRawNativeToolCall({
+          rawResult: rawStreamResult,
+          normalizedResult: streamResult,
+          allowedToolNames: recoveryTools.map((tool) => tool.function.name),
+        })) {
           callbacks.onProviderNativeToolSuccess?.();
         }
         logAgentEvent("preapproval_plan_stream_watchdog_recovered", {
@@ -862,7 +993,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             runtimeIntent,
           }, llmTools.length),
         );
-        if (llmTools.length > 0) {
+        if (hasSuccessfulAllowedRawNativeToolCall({
+          rawResult: streamResult,
+          allowedToolNames: llmTools.map((tool) => tool.function.name),
+        })) {
           callbacks.onProviderNativeToolSuccess?.();
         }
         observeFileReadContextForMessagesSent({
@@ -884,7 +1018,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           return { status: "stopped", snapshotContextLimit };
         }
         const retryErrMsg = (retryErr as Error).message || "";
-        if (pauseApprovedPlanStreamWatchdog(retryErrMsg, { stage: "context_compaction_retry" })) {
+        if (pauseExecutionStreamWatchdog(retryErrMsg, { stage: "context_compaction_retry" })) {
           return { status: "stopped", snapshotContextLimit };
         }
         if (
@@ -963,7 +1097,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
               runtimeIntent,
             }, llmTools.length),
           );
-          if (llmTools.length > 0) {
+          if (hasSuccessfulAllowedRawNativeToolCall({
+            rawResult: streamResult,
+            allowedToolNames: llmTools.map((tool) => tool.function.name),
+          })) {
             callbacks.onProviderNativeToolSuccess?.();
           }
           observeFileReadContextForMessagesSent({
@@ -985,7 +1122,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             return { status: "stopped", snapshotContextLimit };
           }
           const finalErrMsg = (finalErr as Error).message || "";
-          if (pauseApprovedPlanStreamWatchdog(finalErrMsg, { stage: "emergency_compaction_retry" })) {
+          if (pauseExecutionStreamWatchdog(finalErrMsg, { stage: "emergency_compaction_retry" })) {
             return { status: "stopped", snapshotContextLimit };
           }
           if (
@@ -1091,7 +1228,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             runtimeIntent,
           }, llmTools.length),
         );
-        if (llmTools.length > 0) {
+        if (hasSuccessfulAllowedRawNativeToolCall({
+          rawResult: streamResult,
+          allowedToolNames: llmTools.map((tool) => tool.function.name),
+        })) {
           callbacks.onProviderNativeToolSuccess?.();
         }
         observeFileReadContextForMessagesSent({
@@ -1113,7 +1253,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           return { status: "stopped", snapshotContextLimit };
         }
         const cloudRetryErrMsg = (cloudRetryErr as Error).message || "";
-        if (pauseApprovedPlanStreamWatchdog(cloudRetryErrMsg, { stage: "cloud_compaction_retry" })) {
+        if (pauseExecutionStreamWatchdog(cloudRetryErrMsg, { stage: "cloud_compaction_retry" })) {
           return { status: "stopped", snapshotContextLimit };
         }
         if (
@@ -1148,12 +1288,21 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         visualContext: hasVisualContext ? compatibilityImageHandling : "none",
       });
       callbacks.onProviderCompatibilityFallback?.(errMsg);
+      const compatibilityTools = providerCompatibilityPlanAuthoringCard
+        ? iterationAllTools.filter((tool) =>
+            tool.function.name !== SUBMIT_PLAN_CANDIDATE_TOOL_NAME
+          )
+        : iterationAllTools;
       const compatibilityMessages = ensureProviderCompatibilityMode(
         buildCompatibilityRetryMessages(managedAgentMessages, {
           imageHandling: compatibilityImageHandling,
         }),
         workflowMode,
-        iterationAllTools,
+        compatibilityTools,
+        {
+          replacementPlanAuthoringContract:
+            providerCompatibilityPlanAuthoringCard,
+        },
       );
       replaceMessagesForRetry({
         callbacks,
@@ -1168,7 +1317,8 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         allTools: iterationAllTools.length,
         llmToolsBeforeFallback: llmTools.length,
         llmToolsAfterFallback: 0,
-        xmlToolsEnabled: true,
+        xmlToolsEnabled: compatibilityTools.length > 0,
+        planTextEnvelopeEnabled: !!providerCompatibilityPlanAuthoringCard,
         reason: errMsg.slice(0, 240),
       });
 
@@ -1201,7 +1351,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         }
 
         const retryMsg = (retryErr as Error).message || "";
-        if (pauseApprovedPlanStreamWatchdog(retryMsg, { stage: "provider_compatibility_retry" })) {
+        if (pauseExecutionStreamWatchdog(retryMsg, { stage: "provider_compatibility_retry" })) {
           return { status: "stopped", snapshotContextLimit };
         }
         if (
@@ -1276,7 +1426,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             return { status: "stopped", snapshotContextLimit };
           }
           const finalErrMsg = (finalErr as Error).message || "";
-          if (pauseApprovedPlanStreamWatchdog(finalErrMsg, { stage: "provider_compatibility_final_retry" })) {
+          if (pauseExecutionStreamWatchdog(finalErrMsg, { stage: "provider_compatibility_final_retry" })) {
             return { status: "stopped", snapshotContextLimit };
           }
           if (
@@ -1334,7 +1484,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
               lastErr,
               language === "zh" ? "未知错误" : "Unknown error",
             );
-            if (pauseApprovedPlanStreamWatchdog(lastErrorMessage, { stage: "provider_compatibility_transcript_retry" })) {
+            if (pauseExecutionStreamWatchdog(lastErrorMessage, { stage: "provider_compatibility_transcript_retry" })) {
               return { status: "stopped", snapshotContextLimit };
             }
             if (

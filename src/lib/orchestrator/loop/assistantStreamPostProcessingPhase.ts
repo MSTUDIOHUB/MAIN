@@ -6,6 +6,10 @@ import {
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
+import {
+  consumeNativePlanCandidateSubmission,
+} from "../../requiredToolProtocol";
+import { SUBMIT_PLAN_CANDIDATE_TOOL_NAME } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import { generateId } from "../../utils";
 import type { NormalizedStreamState } from "../../workflowModels";
@@ -35,6 +39,7 @@ import {
 } from "./recoveryPromptRuntimeState";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import {
+  applyPlanRuntimePhase,
   applyReasoningNoToolPlanRuntimeState,
 } from "./planRuntimeState";
 import { handleReasoningDominatedNoToolRecovery } from "./reasoningNoToolRecovery";
@@ -118,7 +123,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     iteration,
     runtimeIntent,
     forceXmlTools,
-    streamResult,
   } = input;
   const {
     config,
@@ -129,6 +133,38 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     turnIntent,
     workspace,
   } = runtimeState;
+
+  const nativePlanSubmission = consumeNativePlanCandidateSubmission({
+    result: input.streamResult,
+    enabled:
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      input.availableToolNames.has(SUBMIT_PLAN_CANDIDATE_TOOL_NAME),
+  });
+  const streamResult = nativePlanSubmission.result;
+  if (
+    nativePlanSubmission.consumed ||
+    nativePlanSubmission.quarantinedToolNames.length > 0
+  ) {
+    callbacks.onStreamToken(
+      "__ESCALATION_RESET__:native_plan_candidate_submission",
+      input.assistantMsgId,
+    );
+    logAgentEvent(
+      nativePlanSubmission.consumed
+        ? "native_plan_candidate_submission_consumed"
+        : "native_plan_candidate_submission_quarantined",
+      {
+        iteration,
+        callCount: nativePlanSubmission.callIds.length,
+        discardedVisibleChars: nativePlanSubmission.discardedVisibleChars,
+        quarantinedToolNames: nativePlanSubmission.quarantinedToolNames,
+        diskWritten: false,
+        ingress: "typed_runtime",
+        providerNeutral: true,
+      },
+    );
+  }
 
   const assistantResponse = processAssistantStreamResponse({
     streamResult,
@@ -215,6 +251,8 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
       recoveryPromptState.usedMalformedToolUseRecoveryPrompt,
     recoveringFromEmptyAssistantReplyAfterWrite:
       noToolRuntimeState.recoveringFromEmptyAssistantReplyAfterWrite,
+    planCandidateRepairCheckpoint:
+      planRuntimeState.planCandidateRepairCheckpoint,
     pauseForReviewablePlanArtifact: input.pauseForReviewablePlanArtifact,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,
   });
@@ -226,6 +264,32 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     recoveryPromptState,
     emptyResponseRecovery,
   );
+  if (Object.prototype.hasOwnProperty.call(
+    emptyResponseRecovery,
+    "planCandidateRepairCheckpoint",
+  )) {
+    planRuntimeState = {
+      ...planRuntimeState,
+      planCandidateRepairCheckpoint:
+        emptyResponseRecovery.planCandidateRepairCheckpoint ?? null,
+    };
+    const repairCheckpoint =
+      emptyResponseRecovery.planCandidateRepairCheckpoint;
+    if (repairCheckpoint?.exhausted) {
+      const terminalReason = repairCheckpoint.terminalReason ||
+        "typed_plan_candidate_repair_attempts_exhausted";
+      planRuntimeState = applyPlanRuntimePhase(planRuntimeState, {
+        phase: "blocked",
+        reason: terminalReason,
+      }).state;
+      planRuntimeState = {
+        ...planRuntimeState,
+        planArtifactQualityRejected: true,
+        planLastQualityGateReason: terminalReason,
+      };
+      input.setPlanRuntimePhase("blocked", terminalReason, "failed");
+    }
+  }
   if (emptyResponseRecovery.status === "stopped") {
     return finish("stopped");
   }

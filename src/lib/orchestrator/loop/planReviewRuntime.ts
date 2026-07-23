@@ -9,12 +9,17 @@ import {
 import { resolvePlanClosureArtifactKind } from "../../orchestrator/planOrchestration";
 import { composeReviewablePlanFromEvidence } from "../../planMaterialization";
 import { assessPlanExecutableValidation } from "../../planExecutableValidation";
-import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
+import {
+  buildTypedPlanApprovalIdentity,
+  resolveTypedPlanReviewAuthority,
+  type TypedPlanReviewAuthorityResolution,
+} from "../../planApprovalIdentity";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
   deriveRuntimePlanTasksFromArtifacts,
   type PlanRuntimePhase,
 } from "../../workflowModels";
+import { derivePlanTasksFromCandidate } from "../../planContract";
 import type { OrchestratorCallbacks } from "../types";
 import {
   markPlanClosurePromptIssued,
@@ -86,9 +91,61 @@ export function createPlanReviewRuntimeHandlers(input: {
     prepareReviewablePlanArtifact,
   } = input;
 
+  const resolveReviewAuthority = (): TypedPlanReviewAuthorityResolution =>
+    resolveTypedPlanReviewAuthority(callbacks.getPlanArtifacts?.() || []);
+
+  const authorityFailureDetail = (
+    resolution: Extract<TypedPlanReviewAuthorityResolution, { ok: false }>,
+  ) => ({
+    path: resolution.path || ".MAIN/plans/plan.md",
+    reason: resolution.reason.startsWith("primary_plan_integrity:")
+      ? resolution.reason.slice("primary_plan_integrity:".length)
+      : resolution.reason,
+  });
+
+  const blockReviewForCandidateIntegrity = (
+    trigger: string,
+    stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+    failure: { path: string; reason: string },
+  ): PlanReviewPauseResult => {
+    const state = getPlanRuntimeState();
+    setPlanRuntimeState({
+      ...state,
+      planRuntimePhase: "needs_rewrite",
+      planQualityRejectCount: state.planQualityRejectCount + 1,
+      planLastQualityGateReason: failure.reason,
+      planArtifactQualityRejected: true,
+    });
+    setPlanRuntimePhase("needs_rewrite", failure.reason, "failed");
+    logAgentEvent("plan_review_blocked_typed_contract", {
+      trigger,
+      iteration: getIteration(),
+      planStage: stage,
+      path: failure.path,
+      reason: failure.reason,
+    });
+    return "not_reviewable";
+  };
+
   const waitForPlanApprovalIfNeeded = async (): Promise<boolean> => {
     if (workflowMode !== "plan") return true;
-    if (callbacks.getIsPlanApproved()) return true;
+    if (callbacks.getIsPlanApproved()) {
+      const authority = resolveReviewAuthority();
+      if (authority.ok) return true;
+      const failure = authorityFailureDetail(authority);
+      callbacks.onPlanApprovalInvalidated?.(`typed_plan_review_authority:${authority.reason}`);
+      logAgentEvent("plan_approval_readiness_blocked_typed_authority", failure);
+      return false;
+    }
+    const authority = resolveReviewAuthority();
+    if (!authority.ok) {
+      logAgentEvent("plan_review_wait_blocked_typed_authority", {
+        ...authorityFailureDetail(authority),
+      });
+      return false;
+    }
+    const reviewIdentity = buildTypedPlanApprovalIdentity([authority.artifact]);
+    if (!reviewIdentity) return false;
     if (callbacks.getStatus() !== "pending_review") {
       callbacks.onStatusChange("pending_review");
     }
@@ -101,7 +158,32 @@ export function createPlanReviewRuntimeHandlers(input: {
         }
         if (callbacks.getIsPlanApproved()) {
           clearInterval(checkInterval);
-          resolve(true);
+          const currentAuthority = resolveReviewAuthority();
+          if (currentAuthority.ok) {
+            const currentIdentity = buildTypedPlanApprovalIdentity([currentAuthority.artifact]);
+            if (
+              currentIdentity?.revision === reviewIdentity.revision &&
+              currentIdentity.artifactHash === reviewIdentity.artifactHash
+            ) {
+              resolve(true);
+              return;
+            }
+            callbacks.onPlanApprovalInvalidated?.("typed_plan_review_identity_changed");
+            logAgentEvent("plan_approval_readiness_blocked_identity_changed", {
+              expectedRevision: reviewIdentity.revision,
+              expectedArtifactHash: reviewIdentity.artifactHash,
+              currentRevision: currentIdentity?.revision ?? null,
+              currentArtifactHash: currentIdentity?.artifactHash ?? null,
+            });
+            resolve(false);
+            return;
+          }
+          const failure = authorityFailureDetail(currentAuthority);
+          callbacks.onPlanApprovalInvalidated?.(
+            `typed_plan_review_authority:${currentAuthority.reason}`,
+          );
+          logAgentEvent("plan_approval_readiness_blocked_typed_authority", failure);
+          resolve(false);
         }
       }, 300);
     });
@@ -124,15 +206,16 @@ export function createPlanReviewRuntimeHandlers(input: {
       });
       return "not_reviewable";
     }
-    if (callbacks.getPlanArtifacts && !buildPlanApprovalIdentity(callbacks.getPlanArtifacts())) {
-      logAgentEvent("plan_review_blocked_missing_artifact", {
+    const initialAuthority = resolveReviewAuthority();
+    if (!initialAuthority.ok) {
+      if (initialAuthority.reason === "primary_plan_missing") return "not_reviewable";
+      return blockReviewForCandidateIntegrity(
         trigger,
-        iteration: getIteration(),
-        planStage: stage,
-      });
-      return "not_reviewable";
+        stage,
+        authorityFailureDetail(initialAuthority),
+      );
     }
-    if (callbacks.getPlanArtifacts && prepareReviewablePlanArtifact) {
+    if (prepareReviewablePlanArtifact) {
       const preparation = await prepareReviewablePlanArtifact();
       if (!preparation.ok) {
         const reason = preparation.reason || "executable_validation_task_missing";
@@ -154,11 +237,22 @@ export function createPlanReviewRuntimeHandlers(input: {
         return "not_reviewable";
       }
     }
+    const preparedAuthority = resolveReviewAuthority();
+    if (!preparedAuthority.ok) {
+      return blockReviewForCandidateIntegrity(
+        trigger,
+        stage,
+        authorityFailureDetail(preparedAuthority),
+      );
+    }
     if (callbacks.getPlanArtifacts) {
       const artifacts = callbacks.getPlanArtifacts();
-      const tasks = deriveRuntimePlanTasksFromArtifacts(artifacts, {
-        language: callbacks.getPreferredLanguage(),
-      });
+      const typedTasks = derivePlanTasksFromCandidate(preparedAuthority.artifact.candidate);
+      const tasks = typedTasks.length > 0
+        ? typedTasks
+        : deriveRuntimePlanTasksFromArtifacts(artifacts, {
+            language: callbacks.getPreferredLanguage(),
+          });
       const executableValidation = assessPlanExecutableValidation({
         planArtifacts: artifacts,
         executionPlanTasks: tasks,
@@ -185,10 +279,8 @@ export function createPlanReviewRuntimeHandlers(input: {
         return "not_reviewable";
       }
     }
-    const reviewIdentity = callbacks.getPlanArtifacts
-      ? buildPlanApprovalIdentity(callbacks.getPlanArtifacts())
-      : null;
-    if (callbacks.getPlanArtifacts && !reviewIdentity) {
+    const reviewIdentity = buildTypedPlanApprovalIdentity(callbacks.getPlanArtifacts?.() || []);
+    if (!reviewIdentity) {
       logAgentEvent("plan_review_blocked_missing_artifact", {
         trigger,
         iteration: getIteration(),

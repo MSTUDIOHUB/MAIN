@@ -48,7 +48,7 @@ export interface RunStatusProjection {
   activityText: string;
 }
 
-const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running", "done"]);
+const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running"]);
 
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
@@ -666,11 +666,7 @@ export function buildRunStatusProjection(
     ? null
     : [...ordered].reverse().find((item) =>
         item.status === "running" && item.phase !== "blocked"
-      ) || (latest &&
-    (latest.status === "done" || latest.status === "completed") &&
-    latest.cacheHits < latest.repeatCount
-      ? latest
-      : null);
+      ) || null;
   const milestones = ordered
     .filter((item) =>
       (item.status === "done" || item.status === "completed") &&

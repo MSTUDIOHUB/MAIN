@@ -34,19 +34,37 @@ import {
 } from "./executeRecoveryRuntime";
 import { buildExecutionCheckpointPresentation } from "./completionGuards";
 import {
+  compactObservedVisualContextPayload,
+  normalizeReservedVisualObservationProtocol,
   parseVisualContextRecognition,
   persistVisualContextDeliveryObservation,
   resolveMonotonicVisualContextStatus,
+  resolveTurnVisualPayloadBinding,
   resolveVisualContextDeliveryStateFromReceipt,
   type VisualContextDeliveryStatus,
 } from "../../visualContext";
 import { resolveEffectiveSubagentDelegationPreference } from "../../turnIntake";
-import type { PreferredDelegationRequirement } from "../../subagents";
+import {
+  resolveSubagentCapacityPolicy,
+  type PreferredDelegationRequirement,
+} from "../../subagents";
+import {
+  activatePreferredDelegationScopeContract,
+  applyPreferredDelegationScopeJoinOutcomes,
+  getPreferredDelegationScopeProgress,
+  materializePreferredDelegationScopesEarly,
+  normalizeRequiredPreferredDelegationScopeCalls,
+  recordPreferredDelegationScopeSpawn,
+  type PreferredDelegationScopeContract,
+  type PreferredDelegationScopeJoinOutcome,
+} from "../../preferredDelegationScopes";
+import { restoreDurableTurnPlanningActivities } from "../../turnRuntimeCheckpoint";
 import {
   getFileReadObservationForState,
   selectFileReadStateForRecoveryContext,
 } from "../fileReadCache";
 import {
+  hasPlanVisualContextGrounding,
   prepareReviewablePlanArtifactForReview,
   readFileMetadataIfAvailable,
 } from "../../orchestrator";
@@ -55,8 +73,10 @@ import { executeTool } from "../../toolExecutor";
 import { resolveTrustedProjectValidationCommands } from "../../projectValidationCommands";
 import type { PendingFiniteValidationCheckpoint } from "../../executeRecoveryTools";
 import { resolveStoppedRunDisposition } from "./stoppedRunDisposition";
+import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
+import type { RuntimeGuidanceCompletionFenceDecision } from "../../runtimeGuidanceCompletion";
 
-const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
+const EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS = 120_000;
 
 export class AgentOrchestrator {
     private sawExecutionEvidence = false;
@@ -129,6 +149,59 @@ export class AgentOrchestrator {
           if (emitted) this.latestRunPauseReason = reason;
           return emitted;
         };
+        let lateGuidanceContinuationsUsed = 0;
+        let lateGuidanceIterationAllowance = 0;
+        const resolveStagedCompletionFence = (
+          iteration: number,
+        ): "continue" | "complete" | "pause" => {
+          if (!turnEvents.hasStagedTurnCompletion()) return "complete";
+          // A review-ready Plan is a pause inside the same Turn, not a Run
+          // completion candidate. Preserve the existing review projection.
+          if (
+            workflowMode === "plan" &&
+            !callbacks.getIsPlanApproved() &&
+            callbacks.getStatus() === "pending_review"
+          ) {
+            return "complete";
+          }
+          const decision: RuntimeGuidanceCompletionFenceDecision =
+            callbacks.tryAcquireRunCompletionFence?.({
+              completionCandidate: true,
+              lateGuidanceContinuationsUsed,
+            }) || { kind: "acquire_completion", alreadyFinalizing: false };
+          if (decision.kind === "continue_with_guidance") {
+            turnEvents.discardStagedTurnCompletion();
+            lateGuidanceContinuationsUsed += 1;
+            if (iteration >= getEffectiveMaxIterations() + lateGuidanceIterationAllowance) {
+              lateGuidanceIterationAllowance += 1;
+            }
+            callbacks.onLateGuidanceContinuation?.({
+              guidanceId: decision.guidanceId,
+              iteration,
+            });
+            callbacks.onDebugEvent?.("runtime_guidance_completion_continued", {
+              iteration,
+              guidanceId: decision.guidanceId,
+              lateGuidanceContinuationsUsed,
+              lateGuidanceIterationAllowance,
+            });
+            return "continue";
+          }
+          if (decision.kind === "reject_completion") {
+            turnEvents.discardStagedTurnCompletion();
+            emitRunPausedEvent(
+              "runtime_guidance_completion_fence_rejected",
+              "Completion paused because pending runtime guidance could not be consumed safely.",
+            );
+            callbacks.onDebugEvent?.("runtime_guidance_completion_rejected", {
+              iteration,
+              reason: decision.reason,
+              lateGuidanceContinuationsUsed,
+            });
+            return "pause";
+          }
+          return "complete";
+        };
         const finishStoppedRun = (input: {
           iteration: number;
           fallbackReason: string;
@@ -194,9 +267,39 @@ export class AgentOrchestrator {
             ? turnInputContextSignals.subagentPreference
             : callbacks.getGoalTurnContract?.()?.subagentPreference,
         });
+        const restoredTurnRuntimeCheckpoint = callbacks.getTurnRuntimeCheckpoint?.() || null;
+        const checkpointOwnsCurrentTurn = !!restoredTurnRuntimeCheckpoint &&
+          restoredTurnRuntimeCheckpoint.owner.sessionKey === callbacks.getSessionKey() &&
+          restoredTurnRuntimeCheckpoint.owner.turnId === callbacks.getCurrentTurnId?.();
+        const restoredVisualContext = checkpointOwnsCurrentTurn
+          ? restoredTurnRuntimeCheckpoint.input.visualContext
+          : null;
         let visualContextRunStatus: VisualContextDeliveryStatus =
-          turnInputContextSignals.imageParts > 0 ? "queued" : "none";
-        let visualRecognitionObservation = null as ReturnType<typeof parseVisualContextRecognition>["observation"];
+          restoredVisualContext?.status ||
+          (turnInputContextSignals.imageParts > 0 ? "queued" : "none");
+        let visualRecognitionObservation = (
+          restoredVisualContext?.recognition === "observed" &&
+          restoredVisualContext.observationSummary &&
+          restoredVisualContext.observationId
+        )
+          ? {
+              turnId: eventTurnId,
+              imageCount: restoredVisualContext.expectedImageParts,
+              summary: restoredVisualContext.observationSummary,
+              observationId: restoredVisualContext.observationId,
+              recognition: "observed" as const,
+              evidenceMeaning: "model_visual_observation" as const,
+            }
+          : null as ReturnType<typeof parseVisualContextRecognition>["observation"];
+        if (restoredVisualContext) {
+          callbacks.onDebugEvent?.("agent.turn_runtime_visual_checkpoint_restored", {
+            checkpointRevision: restoredTurnRuntimeCheckpoint!.revision,
+            status: restoredVisualContext.status,
+            recognition: restoredVisualContext.recognition || null,
+            expectedImageParts: restoredVisualContext.expectedImageParts,
+            observationId: restoredVisualContext.observationId || null,
+          });
+        }
         const toolRegistryState = await prepareAgentLoopToolRegistry({
           config,
           skills,
@@ -237,9 +340,79 @@ export class AgentOrchestrator {
           workflowMode,
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
-        let preferredDelegationSatisfied = false;
+        let preferredDelegationScopeContract: PreferredDelegationScopeContract | null =
+          checkpointOwnsCurrentTurn
+            ? restoredTurnRuntimeCheckpoint.planning.preferredDelegationScopeContract
+            : null;
+        if (checkpointOwnsCurrentTurn) {
+          const restoredPlanningActivities = restoreDurableTurnPlanningActivities(
+            restoredTurnRuntimeCheckpoint,
+            callbacks.getSubagentClosureReceiptLedger?.() || null,
+          );
+          loopState.recentPlanToolActivity.push(...restoredPlanningActivities);
+          loopState.recentToolActivity.push(...restoredPlanningActivities);
+          callbacks.onDebugEvent?.("agent.turn_runtime_planning_checkpoint_restored", {
+            checkpointRevision: restoredTurnRuntimeCheckpoint.revision,
+            preferredRegistrationCount:
+              preferredDelegationScopeContract?.registrations.length || 0,
+            adoptedEvidenceCount: restoredPlanningActivities.length,
+          });
+        } else if (restoredTurnRuntimeCheckpoint) {
+          callbacks.onDebugEvent?.("agent.turn_runtime_planning_checkpoint_rejected", {
+            reason: "turn_owner_mismatch",
+            checkpointSessionKey: restoredTurnRuntimeCheckpoint.owner.sessionKey,
+            checkpointTurnId: restoredTurnRuntimeCheckpoint.owner.turnId,
+          });
+        }
         let preferredDelegationRequirementActivations = 0;
         let lastPreferredDelegationRequirement: PreferredDelegationRequirement | null = null;
+        const preferredDelegationMaterializationAttemptedScopeKeys = new Set<string>();
+        const preferredDelegationMaterializationBlockedScopeKeys = new Set<string>();
+        const publishPreferredDelegationCheckpoint = async () => {
+          await callbacks.publishTurnRuntimePlanningCheckpoint?.({
+            preferredDelegationScopeContract,
+            recentPlanToolActivity: loopState.recentPlanToolActivity,
+            updatedAt: Date.now(),
+          });
+        };
+        const applyAndEmitPreferredDelegationScopeOutcomes = async (
+          outcomes: PreferredDelegationScopeJoinOutcome[],
+          joinBoundary:
+            | "preferred_early_materialization"
+            | "plan_finalization"
+            | "parent_final_response"
+            | "explicit_wait",
+        ) => {
+          preferredDelegationScopeContract = applyPreferredDelegationScopeJoinOutcomes({
+            contract: preferredDelegationScopeContract,
+            outcomes,
+          });
+          const appliedContract = preferredDelegationScopeContract;
+          await publishPreferredDelegationCheckpoint();
+          callbacks.onDebugEvent?.("agent.preferred_delegation_scope_outcomes", {
+            iteration: loopState.iteration,
+            joinBoundary,
+            outcomes: outcomes.map((outcome) => {
+              const registration = appliedContract?.registrations.find((candidate) =>
+                candidate.subagentId === outcome.subagentId &&
+                candidate.childScopeKey === outcome.scopeKey
+              );
+              return {
+                subagentId: outcome.subagentId,
+                scopeKey: outcome.scopeKey,
+                status: outcome.status,
+                closureState: outcome.closureState,
+                adoptedEvidenceCount: outcome.adoptedEvidenceCount,
+                adoptedEvidenceTargets: outcome.adoptedEvidenceTargets,
+                // Emit the reconciled contract truth. The raw child outcome may
+                // claim consumed before scope identity/ownership validation.
+                consumed: registration?.state === "consumed",
+              };
+            }),
+            providerNeutral: true,
+          });
+          return getPreferredDelegationScopeProgress(preferredDelegationScopeContract);
+        };
         const publishExecuteRecoveryState = () => {
           this.latestExecuteRecoveryState = {
             ...loopState.executeRecoveryState,
@@ -372,9 +545,11 @@ export class AgentOrchestrator {
           setLatestTurnContract: (contract) => {
             this.latestTurnContract = contract;
           },
-          visualObservationRequest: turnInputContextSignals.imageParts > 0
+          visualObservationRequest:
+            turnInputContextSignals.imageParts > 0
             ? { turnId: eventTurnId, imageCount: turnInputContextSignals.imageParts }
             : null,
+          getVisualContextRecognitionObservation: () => visualRecognitionObservation,
         });
         const initialRuntimeIntent = resolveRuntimeIntent();
         applySystemPromptForRuntime(initialRuntimeIntent, resolveAllToolsForRuntime(initialRuntimeIntent));
@@ -482,7 +657,10 @@ export class AgentOrchestrator {
           allowRootSkeleton: loopStartTargetingProfile.allowRootSkeleton,
         });
 
-        while (loopState.iteration < getEffectiveMaxIterations()) {
+        while (
+          loopState.iteration <
+          getEffectiveMaxIterations() + lateGuidanceIterationAllowance
+        ) {
         loopState.iteration++;
         const iteration = loopState.iteration;
         const effectiveMaxIterations = getEffectiveMaxIterations();
@@ -517,14 +695,56 @@ export class AgentOrchestrator {
           !callbacks.getIsPlanApproved() &&
           isPlanRuntimeFinalizationPhase(loopState.planRuntimeState.planRuntimePhase)
         ) {
-          const joined = await joinPendingSubagentsForParent({
+          const joinResult = await joinPendingSubagentsForParent({
             callbacks,
             recentToolActivity: loopState.recentToolActivity,
             recentPlanToolActivity: loopState.recentPlanToolActivity,
             reason: "plan_finalization",
           });
-          if (joined) {
-            setPlanRuntimePhase("drafting", "subagent results joined before plan drafting");
+          if (joinResult.joined) {
+            const delegationProgress = await applyAndEmitPreferredDelegationScopeOutcomes(
+              joinResult.scopeOutcomes,
+              "plan_finalization",
+            );
+            if (delegationProgress.consumedScopeKeys.length > 0 && joinResult.adoptedEvidenceCount > 0) {
+              callbacks.onDebugEvent?.("agent.preferred_delegation_consumed", {
+                iteration,
+                requirementActivations: preferredDelegationRequirementActivations,
+                pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+                joinBoundary: "plan_finalization",
+                adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
+                consumedScopeKeys: delegationProgress.consumedScopeKeys,
+                remainingScopes: delegationProgress.remainingScopes,
+                providerNeutral: true,
+              });
+            }
+            const joinedEvidenceReadiness = assessPlanEvidenceReadiness({
+              userGoal: latestUserPromptText,
+              userContext: turnInputContextSignals,
+              recentToolActivity: loopState.recentPlanToolActivity,
+              hasGroundedVisualContext: hasPlanVisualContextGrounding(
+                callbacks.getMessages(),
+                callbacks.getCurrentTurnId?.(),
+              ),
+            });
+            if (joinedEvidenceReadiness.status === "ready_for_plan") {
+              setPlanRuntimePhase("drafting", "joined evidence passed Plan readiness gate");
+            } else {
+              if (preferredDelegationScopeContract) {
+                callbacks.onDebugEvent?.("agent.preferred_delegation_joined_without_evidence", {
+                  iteration,
+                  requirementActivations: preferredDelegationRequirementActivations,
+                  resultIds: joinResult.resultIds,
+                  sourceEvidenceCount: joinResult.sourceEvidenceCount,
+                  joinBoundary: "plan_finalization",
+                  providerNeutral: true,
+                });
+              }
+              setPlanRuntimePhase(
+                "needs_evidence",
+                joinedEvidenceReadiness.reason,
+              );
+            }
           }
         }
 
@@ -552,7 +772,13 @@ export class AgentOrchestrator {
           iterationContext: turnIterationContext,
           turnInputContextSignals,
           latestUserPromptText,
-          preferredDelegationSatisfied,
+          preferredDelegationScopeContract,
+          preferredDelegationMaterializationBlockedScopeKeys: [
+            ...new Set([
+              ...preferredDelegationMaterializationAttemptedScopeKeys,
+              ...preferredDelegationMaterializationBlockedScopeKeys,
+            ]),
+          ],
           recentToolActivity: loopState.recentToolActivity,
           recentPlanToolActivity: loopState.recentPlanToolActivity,
           lastAssistantTextForCheckpoint:
@@ -572,6 +798,33 @@ export class AgentOrchestrator {
         lastPreferredDelegationRequirement =
           iterationStreamPreparation.toolSurfaceDecision.preferredDelegationRequirement;
         if (lastPreferredDelegationRequirement.required) {
+          const previousContract = preferredDelegationScopeContract;
+          preferredDelegationScopeContract = activatePreferredDelegationScopeContract(
+            preferredDelegationScopeContract,
+            lastPreferredDelegationRequirement,
+            resolveSubagentCapacityPolicy(config).maxCreatedPerTurn,
+          );
+          if (preferredDelegationScopeContract !== previousContract) {
+            // Attempts are scoped to one collaboration wave. A settled
+            // diagnostic/review wave must not consume the capacity of a later
+            // phase in the same parent Turn.
+            preferredDelegationMaterializationAttemptedScopeKeys.clear();
+            preferredDelegationMaterializationBlockedScopeKeys.clear();
+            await publishPreferredDelegationCheckpoint();
+            callbacks.onDebugEvent?.("agent.preferred_delegation_lifecycle_wave_opened", {
+              iteration,
+              wave: preferredDelegationScopeContract?.wave || null,
+              lifecyclePhase:
+                preferredDelegationScopeContract?.lifecyclePhase || null,
+              scopeFingerprint:
+                preferredDelegationScopeContract?.scopeFingerprint || null,
+              scopeKeys:
+                preferredDelegationScopeContract?.requiredScopes.map((scope) =>
+                  scope.scopeKey
+                ) || [],
+              providerNeutral: true,
+            });
+          }
           preferredDelegationRequirementActivations += 1;
         }
         publishExecuteRecoveryState();
@@ -618,6 +871,129 @@ export class AgentOrchestrator {
           callbacks.onStatusChange("idle");
           return;
         }
+
+        if (lastPreferredDelegationRequirement.required) {
+          const collaborationRuntimeAvailable =
+            !!callbacks.runSubagent && !!callbacks.waitSubagents;
+          const materialization = await materializePreferredDelegationScopesEarly({
+            requirement: lastPreferredDelegationRequirement,
+            parentObjective: latestUserPromptText,
+            attemptedScopeKeys: preferredDelegationMaterializationAttemptedScopeKeys,
+            runSubagent: collaborationRuntimeAvailable
+              ? callbacks.runSubagent
+              : undefined,
+            signal: abortController.signal,
+          });
+          callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_decision", {
+            iteration,
+            action: materialization.plan.action,
+            reason: materialization.plan.reason,
+            obligation: materialization.plan.obligation,
+            blockedBy: materialization.plan.blockedBy,
+            scopeKeys: materialization.plan.requests.map((entry) => entry.scopeKey),
+            collaborationRuntimeAvailable,
+            providerNeutral: true,
+          });
+
+          if (
+            materialization.plan.action === "skip" &&
+            materialization.plan.reason === "runtime_spawn_unavailable"
+          ) {
+            for (const scope of lastPreferredDelegationRequirement.remainingScopes) {
+              preferredDelegationMaterializationAttemptedScopeKeys.add(scope.scopeKey);
+              preferredDelegationMaterializationBlockedScopeKeys.add(scope.scopeKey);
+            }
+            callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_outcome", {
+              iteration,
+              admittedScopeKeys: [],
+              failedScopes: lastPreferredDelegationRequirement.remainingScopes.map((scope) => ({
+                scopeKey: scope.scopeKey,
+                kind: "runtime_error",
+                reason: "collaboration_runtime_unavailable",
+              })),
+              parentFallback: "release_scope_obligation",
+              providerNeutral: true,
+            });
+            continue;
+          }
+
+          if (materialization.plan.action === "materialize") {
+            for (const scopeKey of materialization.attemptedScopeKeys) {
+              preferredDelegationMaterializationAttemptedScopeKeys.add(scopeKey);
+            }
+            for (const failure of materialization.failures) {
+              preferredDelegationMaterializationBlockedScopeKeys.add(failure.scopeKey);
+            }
+
+            const previousRegistrationCount =
+              preferredDelegationScopeContract?.registrations.length || 0;
+            for (const outcome of materialization.outcomes) {
+              if (outcome.subagentId === null) continue;
+              preferredDelegationScopeContract = recordPreferredDelegationScopeSpawn({
+                contract: preferredDelegationScopeContract,
+                outcome,
+              });
+              callbacks.onDebugEvent?.("agent.preferred_delegation_spawned", {
+                iteration,
+                requirementActivations: preferredDelegationRequirementActivations,
+                pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+                subagentId: outcome.subagentId,
+                scopeKey: outcome.scopeKey,
+                allowedPaths: outcome.allowedPaths,
+                materialization: "runtime_early",
+              });
+            }
+            if (
+              (preferredDelegationScopeContract?.registrations.length || 0) !==
+              previousRegistrationCount
+            ) {
+              await publishPreferredDelegationCheckpoint();
+            }
+
+            const admittedScopeKeys = materialization.outcomes.flatMap((outcome) =>
+              outcome.subagentId === null ? [] : [outcome.scopeKey]
+            );
+            callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_outcome", {
+              iteration,
+              admittedScopeKeys,
+              failures: materialization.failures,
+              parentFallback: materialization.failures.length > 0
+                ? "release_failed_scopes"
+                : "none",
+              providerNeutral: true,
+            });
+
+            if (admittedScopeKeys.length > 0) {
+              const joinResult = await joinPendingSubagentsForParent({
+                callbacks,
+                recentToolActivity: loopState.recentToolActivity,
+                recentPlanToolActivity: loopState.recentPlanToolActivity,
+                reason: "preferred_early_materialization",
+              });
+              if (joinResult.joined) {
+                const delegationProgress = await applyAndEmitPreferredDelegationScopeOutcomes(
+                  joinResult.scopeOutcomes,
+                  "preferred_early_materialization",
+                );
+                callbacks.onDebugEvent?.("agent.preferred_delegation_consumed", {
+                  iteration,
+                  requirementActivations: preferredDelegationRequirementActivations,
+                  pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+                  joinBoundary: "preferred_early_materialization",
+                  adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
+                  consumedScopeKeys: delegationProgress.consumedScopeKeys,
+                  remainingScopes: delegationProgress.remainingScopes,
+                  providerNeutral: true,
+                });
+              }
+            }
+
+            // This was a control-plane-only iteration: no provider stream was
+            // opened. Recompute Plan/evidence state from the joined observations
+            // before allowing another parent read or any draft synthesis.
+            continue;
+          }
+        }
         const {
           runtimeIntent,
           finalTextOnlyStep,
@@ -630,6 +1006,7 @@ export class AgentOrchestrator {
           maxOutputEscalations,
           iterationRequestStartedAt,
           preapprovalPlanQualityRecoveryStreamPolicy,
+          providerCompatibilityPlanAuthoringCard,
         } = iterationStreamPreparation;
         const {
           isExecuteRecoveryEligible,
@@ -683,10 +1060,16 @@ export class AgentOrchestrator {
           },
           recentToolActivity: loopState.recentToolActivity,
           getPlanStreamWatchdogOptions,
-          approvedPlanRecoveryStreamMaxElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
+          executeRecoveryStreamMaxElapsedMs: EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
+          providerCompatibilityPlanAuthoringCard,
           preferredDelegationRequired:
             toolSurfaceDecision.preferredDelegationRequirement.required,
+          planEvidenceObligationRequired:
+            !!toolSurfaceDecision.planEvidenceObligation,
+          planCandidateRepairActive:
+            iterationStreamPreparation.planRuntimeState
+              .planCandidateRepairCheckpoint?.exhausted === false,
           fileReadStates: loopState.toolExecutionRuntimeState.fileReadStates,
           pauseApprovedPlanStreamWatchdog,
           emitPlanExecutionProgress,
@@ -702,8 +1085,29 @@ export class AgentOrchestrator {
         }
         let streamResult = streamInvocation.streamResult;
         const messagesSentToLLM = streamInvocation.messagesSentToLLM;
+        const currentTurnRuntimeCheckpoint = callbacks.getTurnRuntimeCheckpoint?.() || null;
+        const currentCanonicalRunIdentity = currentTurnRuntimeCheckpoint?.canonical.run?.identity || null;
+        const expectedVisualTransportBinding = currentTurnRuntimeCheckpoint &&
+          currentCanonicalRunIdentity &&
+          currentTurnRuntimeCheckpoint.owner.sessionKey === callbacks.getSessionKey() &&
+          currentTurnRuntimeCheckpoint.owner.turnId === eventTurnId &&
+          currentCanonicalRunIdentity.sessionKey === currentTurnRuntimeCheckpoint.owner.sessionKey &&
+          currentCanonicalRunIdentity.sessionEpoch === currentTurnRuntimeCheckpoint.owner.sessionEpoch &&
+          currentCanonicalRunIdentity.turnId === eventTurnId
+          ? resolveTurnVisualPayloadBinding(messagesSentToLLM, {
+              owner: {
+                sessionKey: currentCanonicalRunIdentity.sessionKey,
+                sessionEpoch: currentCanonicalRunIdentity.sessionEpoch,
+                turnId: currentCanonicalRunIdentity.turnId,
+                runId: currentCanonicalRunIdentity.runId,
+                attemptId: currentCanonicalRunIdentity.attemptId,
+              },
+              expectedImageParts: turnInputContextSignals.imageParts,
+            })
+          : null;
         const currentVisualContextDelivery = resolveVisualContextDeliveryStateFromReceipt({
           expectedImageParts: turnInputContextSignals.imageParts,
+          expectedBinding: expectedVisualTransportBinding,
           receipt: streamResult.visualTransportReceipt,
         });
         if (turnInputContextSignals.imageParts > 0) {
@@ -739,6 +1143,10 @@ export class AgentOrchestrator {
                 }
               : { ...visualContext, recognition: "unverified" as const };
             const alreadyObserved = delivered && !!visualRecognitionObservation;
+            await callbacks.publishTurnRuntimeVisualContextCheckpoint?.({
+              visualContext: publishedVisualContext,
+              updatedAt: Date.now(),
+            });
             emitTurnEvent({
               type: "progress.updated",
               threadId: eventThreadId,
@@ -786,46 +1194,61 @@ export class AgentOrchestrator {
             });
           }
         }
-        if (turnInputContextSignals.imageParts > 0) {
-          const parsedVisualRecognition = parseVisualContextRecognition({
-            text: streamResult.content,
-            expectedTurnId: eventTurnId,
+        const normalizedVisualProtocol = normalizeReservedVisualObservationProtocol({
+          text: streamResult.content,
+          toolCalls: streamResult.toolCalls,
+          expectedTurnId: eventTurnId,
+          expectedImageParts: turnInputContextSignals.imageParts,
+          // Recognition belongs to the exact provider request that produced
+          // this response. A prior delivered request cannot authorize metadata
+          // emitted after later context trimming removed the image.
+          deliveryStatus: currentVisualContextDelivery.status,
+        });
+        const stripVisualProtocol = (text: string | undefined): string | undefined =>
+          typeof text === "string"
+            ? parseVisualContextRecognition({
+                text,
+                expectedTurnId: eventTurnId,
+                expectedImageParts: turnInputContextSignals.imageParts,
+                deliveryStatus: "not_delivered",
+              }).cleanedText
+            : text;
+        const strippedActionableContent = stripVisualProtocol(streamResult.actionableContent);
+        const strippedSemanticContent = stripVisualProtocol(streamResult.semanticContent);
+        const strippedReasoningContent = stripVisualProtocol(streamResult.reasoningContent);
+        if (
+          normalizedVisualProtocol.cleanedText !== streamResult.content ||
+          normalizedVisualProtocol.isolatedToolCallCount > 0 ||
+          strippedActionableContent !== streamResult.actionableContent ||
+          strippedSemanticContent !== streamResult.semanticContent ||
+          strippedReasoningContent !== streamResult.reasoningContent
+        ) {
+          streamResult = {
+            ...streamResult,
+            content: normalizedVisualProtocol.cleanedText,
+            actionableContent: strippedActionableContent,
+            semanticContent: strippedSemanticContent,
+            reasoningContent: strippedReasoningContent,
+            toolCalls: normalizedVisualProtocol.toolCalls,
+          };
+        }
+        if (normalizedVisualProtocol.isolatedToolCallCount > 0) {
+          callbacks.onDebugEvent?.("agent.visual_observation_reserved_tool_isolated", {
+            iteration,
+            isolatedToolCallCount: normalizedVisualProtocol.isolatedToolCallCount,
+            isolatedToolCallIds: normalizedVisualProtocol.isolatedToolCallIds,
+            observationAccepted:
+              normalizedVisualProtocol.observationSource === "reserved_tool_call",
             expectedImageParts: turnInputContextSignals.imageParts,
-            // Recognition belongs to the exact provider request that produced
-            // this response. A prior delivered request cannot authorize a
-            // marker emitted after later context trimming removed the image.
             deliveryStatus: currentVisualContextDelivery.status,
+            providerNeutral: true,
           });
-          const stripVisualProtocol = (text: string | undefined): string | undefined =>
-            typeof text === "string"
-              ? parseVisualContextRecognition({
-                  text,
-                  expectedTurnId: eventTurnId,
-                  expectedImageParts: turnInputContextSignals.imageParts,
-                  deliveryStatus: "not_delivered",
-                }).cleanedText
-              : text;
-          if (
-            parsedVisualRecognition.cleanedText !== streamResult.content ||
-            (typeof streamResult.actionableContent === "string" &&
-              stripVisualProtocol(streamResult.actionableContent) !== streamResult.actionableContent) ||
-            (typeof streamResult.semanticContent === "string" &&
-              stripVisualProtocol(streamResult.semanticContent) !== streamResult.semanticContent) ||
-            (typeof streamResult.reasoningContent === "string" &&
-              stripVisualProtocol(streamResult.reasoningContent) !== streamResult.reasoningContent)
-          ) {
-            streamResult = {
-              ...streamResult,
-              content: parsedVisualRecognition.cleanedText,
-              actionableContent: stripVisualProtocol(streamResult.actionableContent),
-              semanticContent: stripVisualProtocol(streamResult.semanticContent),
-              reasoningContent: stripVisualProtocol(streamResult.reasoningContent),
-            };
-          }
-          const observation = parsedVisualRecognition.observation;
+        }
+        if (turnInputContextSignals.imageParts > 0) {
+          const observation = normalizedVisualProtocol.observation;
           if (
             observation &&
-            observation.observationId !== visualRecognitionObservation?.observationId
+            !visualRecognitionObservation
           ) {
             visualRecognitionObservation = observation;
             const language = callbacks.getPreferredLanguage();
@@ -838,6 +1261,28 @@ export class AgentOrchestrator {
               observationSummary: observation.summary,
               observationId: observation.observationId,
             };
+            await callbacks.publishTurnRuntimeVisualContextCheckpoint?.({
+              visualContext,
+              updatedAt: Date.now(),
+            });
+            const compactedVisualPayload = compactObservedVisualContextPayload(
+              callbacks.getMessages(),
+              {
+                expectedImageParts: observation.imageCount,
+                turnId: eventTurnId,
+                payloadDigest: expectedVisualTransportBinding?.payloadDigest,
+              },
+            );
+            if (compactedVisualPayload.changed) {
+              callbacks.replaceMessages(compactedVisualPayload.messages);
+            }
+            callbacks.onDebugEvent?.("agent.visual_payload_compacted_after_observation", {
+              turnId: eventTurnId,
+              observationId: observation.observationId,
+              removedImageParts: compactedVisualPayload.removedImageParts,
+              changed: compactedVisualPayload.changed,
+              providerRequestWillRetainDataUrl: !compactedVisualPayload.changed,
+            });
             emitTurnEvent({
               type: "progress.updated",
               threadId: eventThreadId,
@@ -889,6 +1334,8 @@ export class AgentOrchestrator {
           toolCatalog,
           webSearchEnabled,
           latestUserPromptText,
+          preferredDelegationRequired:
+            toolSurfaceDecision.preferredDelegationRequirement.required,
           repairExecutionRequestInChat,
           commandDirectiveAction: commandDirective?.action,
           unityConsoleDiagnosticsRequested,
@@ -908,6 +1355,12 @@ export class AgentOrchestrator {
           emitTurnCompletedEvent,
           emitTaskOrchestratorPhase,
           emitPlanExecutionProgress,
+          onSubagentScopeOutcomes: async (outcomes) => {
+            await applyAndEmitPreferredDelegationScopeOutcomes(
+              outcomes,
+              "parent_final_response",
+            );
+          },
           setPlanRuntimePhase,
           activateExecuteRecovery,
           clearExecuteRecovery,
@@ -955,7 +1408,7 @@ export class AgentOrchestrator {
         if (assistantIterationPhase.status === "stopped") {
           if (
             effectiveSubagentPreference === "preferred" &&
-            !preferredDelegationSatisfied
+            !getPreferredDelegationScopeProgress(preferredDelegationScopeContract).satisfied
           ) {
             callbacks.onDebugEvent?.("preferred_delegation_not_used", {
               iteration,
@@ -974,6 +1427,9 @@ export class AgentOrchestrator {
               recentToolNames: [...new Set(loopState.recentToolActivity.map((activity) => activity.name))].slice(0, 12),
             });
           }
+          const completionFence = resolveStagedCompletionFence(iteration);
+          if (completionFence === "continue") continue;
+          if (completionFence === "pause") return;
           finishStoppedRun({
             iteration,
             fallbackReason: "assistant_stopped",
@@ -991,6 +1447,23 @@ export class AgentOrchestrator {
           finalReplyOptionCount,
           hasStructuredProposal,
         } = assistantIterationPhase;
+        const executionToolCalls =
+          normalizeRequiredPreferredDelegationScopeCalls(
+            effectiveToolCalls,
+            toolSurfaceDecision.preferredDelegationRequirement,
+          );
+        const normalizedReviewerCalls = executionToolCalls.filter((call, index) =>
+          call.arguments !== effectiveToolCalls[index]?.arguments
+        );
+        if (normalizedReviewerCalls.length > 0) {
+          callbacks.onDebugEvent?.("agent.preferred_delegation_reviewer_normalized", {
+            iteration,
+            toolCallIds: normalizedReviewerCalls.map((call) => call.id),
+            normalizedCount: normalizedReviewerCalls.length,
+            reason: "required_pre_draft_independent_review",
+            providerNeutral: true,
+          });
+        }
 
         const toolIterationPhase = await handleToolIterationPhase({
           callbacks,
@@ -1003,7 +1476,7 @@ export class AgentOrchestrator {
           workflowMode,
           turnIntent,
           runtimeIntent,
-          effectiveToolCalls,
+          effectiveToolCalls: executionToolCalls,
           historyAssistantText,
           providerReasoningForHistory,
           finalReplyOptionCount,
@@ -1047,14 +1520,29 @@ export class AgentOrchestrator {
           activateExecuteRecovery,
           activateChatFinalSynthesis,
           pauseForReviewablePlanArtifact,
-          onSubagentSpawnCreated: () => {
-            if (preferredDelegationSatisfied) return;
-            preferredDelegationSatisfied = true;
-            callbacks.onDebugEvent?.("agent.preferred_delegation_satisfied", {
+          onSubagentSpawnCreated: async (outcome) => {
+            const previousRegistrationCount =
+              preferredDelegationScopeContract?.registrations.length || 0;
+            preferredDelegationScopeContract = recordPreferredDelegationScopeSpawn({
+              contract: preferredDelegationScopeContract,
+              outcome,
+            });
+            if (
+              (preferredDelegationScopeContract?.registrations.length || 0) ===
+              previousRegistrationCount
+            ) return;
+            await publishPreferredDelegationCheckpoint();
+            callbacks.onDebugEvent?.("agent.preferred_delegation_spawned", {
               iteration,
               requirementActivations: preferredDelegationRequirementActivations,
               pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+              subagentId: outcome.subagentId,
+              scopeKey: outcome.scopeKey,
+              allowedPaths: outcome.subagentId === null ? [] : outcome.allowedPaths,
             });
+          },
+          onSubagentScopeOutcomes: async (outcomes) => {
+            await applyAndEmitPreferredDelegationScopeOutcomes(outcomes, "explicit_wait");
           },
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
@@ -1066,6 +1554,8 @@ export class AgentOrchestrator {
             reason: "goal_tool_result_checkpoint_completed",
             pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
           });
+          const completionFence = resolveStagedCompletionFence(iteration);
+          if (completionFence === "continue") continue;
           return;
         }
         if (toolIterationPhase.status === "plan_completed") {
@@ -1096,6 +1586,8 @@ export class AgentOrchestrator {
             emitTurnEvent,
             emitTurnCompletedEvent,
           });
+          const completionFence = resolveStagedCompletionFence(iteration);
+          if (completionFence === "continue") continue;
           return;
         }
         if (toolIterationPhase.status === "aborted") {
@@ -1103,6 +1595,9 @@ export class AgentOrchestrator {
           return;
         }
         if (toolIterationPhase.status === "stopped") {
+          const completionFence = resolveStagedCompletionFence(iteration);
+          if (completionFence === "continue") continue;
+          if (completionFence === "pause") return;
           finishStoppedRun({
             iteration,
             fallbackReason: "tool_loop_stopped",

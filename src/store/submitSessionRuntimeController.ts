@@ -1,10 +1,5 @@
-import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import {
-  canonicalizePlanArtifactPath,
-  detectPlanArtifactKind,
-  extractPlanTasks,
   reconcilePlanTaskCompletion,
-  validatePlanArtifactContent,
   type ConversationTurn,
   type ConversationTurnStatus,
   type NormalizedStreamState,
@@ -15,12 +10,14 @@ import {
   type RightPanelTab,
 } from "../lib/workflowModels";
 import {
+  preparePlanArtifactCommit,
+  reducePlanArtifactCommit,
+} from "../lib/planArtifactCommit";
+import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   type LegacyWorkflowMode,
 } from "../lib/runIntent";
-import { normalizeApprovedPlanTaskStatuses } from "./submitApprovedPlanExecution";
-import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
 import { isHarnessMarkerOwnedByPlanExecution } from "../lib/planExecutionOwnership";
 import {
@@ -183,73 +180,87 @@ export function createSubmitSessionRuntimeController<
     } = { current: null };
     const revokedPlanExecutionAbortRef: { current: (() => void) | null } = { current: null };
     sessionSet((s) => {
-      const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
-      const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
-      if (!canonicalPath || detectPlanArtifactKind(canonicalPath) !== artifact.kind) {
-        input.logStoreEvent("plan_artifact_rejected_by_identity_gate", {
-          path: artifact.path,
-          canonicalPath,
-          kind: artifact.kind,
-        });
+      const preparedCommit = preparePlanArtifactCommit(artifact);
+      if (!preparedCommit.accepted) {
+        if (preparedCommit.gate === "authority") {
+          input.logStoreEvent("plan_artifact_rejected_by_authority_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: preparedCommit.reason,
+          });
+        } else if (preparedCommit.gate === "typed_contract") {
+          input.logStoreEvent("plan_artifact_rejected_by_typed_contract_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            failures: preparedCommit.failures,
+            candidateHashMismatch: preparedCommit.candidateHashMismatch,
+            authoringContractMismatch: preparedCommit.authoringContractMismatch,
+          });
+        } else {
+          input.logStoreEvent("plan_artifact_rejected_before_commit", {
+            path: artifact.path,
+            kind: artifact.kind,
+            gate: preparedCommit.gate,
+          });
+        }
         return {} as Partial<TState>;
       }
-      const normalizedArtifact = { ...artifact, path: canonicalPath };
-      const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
-      if (!validation.ok) {
-        input.logStoreEvent("plan_artifact_rejected_by_quality_gate", {
-          path: artifact.path,
-          kind: artifact.kind,
-          reason: validation.reason,
-          contentChars: sanitizedContent.length,
-        });
+      const commit = reducePlanArtifactCommit({
+        state: {
+          artifacts: s.planArtifacts,
+          tasks: s.planTasks,
+          evidenceLedger: s.planExecutionEvidenceLedger,
+          isApproved: s.isPlanApproved,
+          stage: s.planStage,
+        },
+        commit: preparedCommit.commit,
+      });
+      if (!commit.accepted) {
+        if (commit.gate === "authority") {
+          input.logStoreEvent("plan_artifact_rejected_by_authority_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: commit.reason,
+          });
+        } else if (commit.gate === "identity") {
+          input.logStoreEvent("plan_artifact_rejected_by_identity_gate", {
+            path: artifact.path,
+            canonicalPath: commit.canonicalPath,
+            kind: artifact.kind,
+          });
+        } else if (commit.gate === "typed_contract") {
+          input.logStoreEvent("plan_artifact_rejected_by_typed_contract_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            failures: commit.failures,
+            candidateHashMismatch: commit.candidateHashMismatch,
+            authoringContractMismatch: commit.authoringContractMismatch,
+          });
+        } else {
+          input.logStoreEvent("plan_artifact_rejected_by_quality_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: commit.reason,
+            contentChars: commit.contentChars,
+          });
+        }
         return {} as Partial<TState>;
       }
 
-      const nextArtifacts = [...s.planArtifacts];
-      const currentMaxPlanRevision = s.planArtifacts.reduce(
-        (max, candidate) => Math.max(max, Number(candidate.revision) || 0),
-        0,
-      );
-      const existingIndex = nextArtifacts.findIndex(
-        (item) => canonicalizePlanArtifactPath(item.path) === canonicalPath,
-      );
-      if (existingIndex >= 0) {
-        const existingArtifact = nextArtifacts[existingIndex];
-        const contentChanged = existingArtifact.content !== sanitizedContent || existingArtifact.kind !== artifact.kind;
-        nextArtifacts[existingIndex] = {
-          ...normalizedArtifact,
-          content: sanitizedContent,
-          revision: contentChanged
-            ? Math.max(1, currentMaxPlanRevision + 1)
-            : Math.max(1, Number(existingArtifact.revision) || Number(artifact.revision) || 1),
-        };
-      } else {
-        nextArtifacts.push({
-          ...normalizedArtifact,
-          content: sanitizedContent,
-          revision: Math.max(1, currentMaxPlanRevision + 1),
+      const {
+        artifacts: nextArtifacts,
+        tasks: normalizedTasks,
+        droppedTasks,
+        artifactIdentity: nextArtifactIdentity,
+        reviewIdentity: nextReviewIdentity,
+      } = commit;
+      if (droppedTasks.length > 0) {
+        input.logStoreEvent("plan_tasks_preserved_missing_history", {
+          path: artifact.path,
+          droppedTasks: droppedTasks.map((task) => task.text).slice(0, 8),
+          droppedCount: droppedTasks.length,
         });
       }
-
-      const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? extractPlanTasks(sanitizedContent)
-        : s.planTasks;
-      const preserveTaskHistory =
-        s.isPlanApproved ||
-        s.planStage === "executing" ||
-        s.planStage === "completed" ||
-        s.planTasks.length > 0;
-      const normalizedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? reconcilePlanTaskCompletion(s.planTasks, parsedTasks, s.planExecutionEvidenceLedger, {
-            preserveMissing: preserveTaskHistory,
-            highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-          })
-        : normalizeApprovedPlanTaskStatuses(
-            s.planTasks,
-            s.planExecutionEvidenceLedger,
-            s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-          );
-      const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
       const lifecycleAt = nowMs();
       const lifecycleOwner = ensurePlanLifecycleOwner({
         lifecycle: s.planLifecycle,
@@ -259,11 +270,11 @@ export function createSubmitSessionRuntimeController<
       let nextPlanLifecycle = applyPlanArtifactIdentity({
         lifecycle: lifecycleOwner,
         sessionKey: input.runSessionKey,
-        artifactIdentity: nextApprovalIdentity
+        artifactIdentity: nextArtifactIdentity
           ? {
-              revision: nextApprovalIdentity.revision,
-              artifactHash: nextApprovalIdentity.artifactHash,
-              artifactPaths: nextApprovalIdentity.artifactPaths,
+              revision: nextArtifactIdentity.revision,
+              artifactHash: nextArtifactIdentity.artifactHash,
+              artifactPaths: nextArtifactIdentity.artifactPaths,
             }
           : null,
         at: lifecycleAt,
@@ -293,29 +304,31 @@ export function createSubmitSessionRuntimeController<
         isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
       const shouldRefreshPlanReviewRequest =
         s.activeActionRequest?.kind === "plan_review" &&
-        !!nextApprovalIdentity &&
+        !!nextReviewIdentity &&
         (
-          s.activeActionRequest.planRevision !== nextApprovalIdentity.revision ||
-          s.activeActionRequest.artifactHash !== nextApprovalIdentity.artifactHash
+          s.activeActionRequest.planRevision !== nextReviewIdentity.revision ||
+          s.activeActionRequest.artifactHash !== nextReviewIdentity.artifactHash
         );
+      const clearsPlanReviewRequest =
+        s.activeActionRequest?.kind === "plan_review" && !nextReviewIdentity;
       const nextPlanReviewRequest = shouldRefreshPlanReviewRequest &&
         s.activeActionRequest?.kind === "plan_review" &&
-        nextApprovalIdentity
+        nextReviewIdentity
         ? buildPlanReviewActionRequest({
             sessionKey: s.activeActionRequest.sessionKey,
             turnId: s.activeActionRequest.turnId,
             runId: s.activeActionRequest.runId,
             parentRunId: s.activeActionRequest.parentRunId,
             title: s.activeActionRequest.title,
-            planRevision: nextApprovalIdentity.revision,
-            artifactHash: nextApprovalIdentity.artifactHash,
-            artifactPaths: nextApprovalIdentity.artifactPaths,
+            planRevision: nextReviewIdentity.revision,
+            artifactHash: nextReviewIdentity.artifactHash,
+            artifactPaths: nextReviewIdentity.artifactPaths,
           })
         : s.activeActionRequest;
       if (
         shouldRefreshPlanReviewRequest &&
         nextPlanReviewRequest?.kind === "plan_review" &&
-        nextApprovalIdentity
+        nextReviewIdentity
       ) {
         const reviewIdentity: PlanReviewIdentity = {
           sessionKey: nextPlanReviewRequest.sessionKey,
@@ -331,9 +344,9 @@ export function createSubmitSessionRuntimeController<
         const aligned = applyPlanReviewIdentity({
           lifecycle: nextPlanLifecycle,
           artifactIdentity: {
-            revision: nextApprovalIdentity.revision,
-            artifactHash: nextApprovalIdentity.artifactHash,
-            artifactPaths: nextApprovalIdentity.artifactPaths,
+            revision: nextReviewIdentity.revision,
+            artifactHash: nextReviewIdentity.artifactHash,
+            artifactPaths: nextReviewIdentity.artifactPaths,
           },
           reviewIdentity,
           at: lifecycleAt,
@@ -342,7 +355,7 @@ export function createSubmitSessionRuntimeController<
       }
       return {
         planLifecycle: nextPlanLifecycle,
-        planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
+        planArtifacts: nextArtifacts,
         planStage: input.derivePlanStageFromArtifacts(
           nextArtifacts,
           approvalInvalidated ? [] : normalizedTasks,
@@ -350,7 +363,11 @@ export function createSubmitSessionRuntimeController<
           s.planStage,
         ),
         planTasks: approvalInvalidated ? [] : normalizedTasks,
-        ...(shouldRefreshPlanReviewRequest ? { activeActionRequest: nextPlanReviewRequest } : {}),
+        ...(shouldRefreshPlanReviewRequest
+          ? { activeActionRequest: nextPlanReviewRequest }
+          : clearsPlanReviewRequest
+            ? { activeActionRequest: null }
+            : {}),
         ...(planToolInvalidation?.patch || {}),
         clearedPlanTurnId: null,
         ...(approvalInvalidated

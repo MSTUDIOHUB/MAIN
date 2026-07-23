@@ -222,9 +222,6 @@ export function handleReasoningDominatedNoToolRecovery(input: {
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
-          forceXmlTools: input.forceXmlTools ?? Boolean(
-            callbacks.shouldForceXmlForProviderCompatibility?.(),
-          ),
           assistantMsgId,
           iteration,
           cause: "reasoning_dominated_no_action",

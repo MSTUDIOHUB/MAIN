@@ -1,4 +1,4 @@
-import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
+import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, logAgentEvent, type AgentLoopOutcome } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { isGoalRuntimeDeleted } from "../goalPersistence";
 import { isCurrentGoalWorkflowOwner } from "../goalRunOwnership";
@@ -36,6 +36,7 @@ import {
   resolveRuntimeLaneKey,
 } from "../appConfig";
 import {
+  GLOBAL_CHAT_KEY,
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
   type PlanApprovalHandoff,
@@ -60,7 +61,7 @@ import {
   withEventSchema,
   type MainThreadProgressUpdate,
 } from "../turnEvents";
-import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind, projectAgentLoopStatusToConversationTurnRuntimeStatus } from "../workflowModels";
+import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, type PlanTask, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind, projectAgentLoopStatusToConversationTurnRuntimeStatus } from "../workflowModels";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
   buildChatMaxIterationsResumePrompt,
@@ -95,10 +96,10 @@ import {
   type HarnessRunMarker,
 } from "../harnessCrashTelemetry";
 import { generateId } from "../utils";
-import { runAfterNextPaint } from "../uiScheduling";
+import { scheduleRuntimeTask } from "../runtimeScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
-import type { ToolCatalogIdentity, ToolErrorLifecycleMeta } from "./types";
+import type { OrchestratorCallbacks, ToolCatalogIdentity, ToolErrorLifecycleMeta } from "./types";
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
@@ -137,7 +138,9 @@ import { createAbortableReviewSettlement } from "../actionReviewSettlement";
 import {
   buildPlanApprovalIdentity,
   buildPlanExecutionInstructionHash,
+  buildTypedPlanApprovalIdentity,
 } from "../planApprovalIdentity";
+import { hashPlanCandidate } from "../planContract";
 import {
   issuePlanAutoResumeAttempt,
   issuePlanExplicitResumeAttempt,
@@ -169,6 +172,40 @@ import {
   shouldCommitPausedTurnFinalPresentation,
 } from "../terminalAssistantFinal";
 import { reduceRunTransition } from "../runTransitionReducer";
+import {
+  TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+  createCanonicalTurnRuntime,
+  projectTurnRuntimeCompatibility,
+  reduceCanonicalTurnRuntime,
+  type TurnRunPauseKind,
+  type TurnStrategy,
+} from "../turnRuntimeContract";
+import {
+  createTurnRuntimeCheckpoint,
+  normalizeTurnRuntimeCheckpoint,
+  projectTurnRuntimeCheckpointTransaction,
+  restoreDurableTurnPlanningActivities,
+  updateTurnRuntimeCheckpointCanonical,
+  updateTurnRuntimeVisualContextCheckpoint,
+  updateTurnRuntimePlanningCheckpoint,
+  upsertTurnRuntimeCheckpoint,
+  type TurnRuntimeCheckpointV1,
+} from "../turnRuntimeCheckpoint";
+import type { TurnInputContextSignals } from "../turnIntake";
+import {
+  issueSubagentClosureReceipts,
+  normalizeSubagentClosureReceiptLedger,
+  type SubagentClosureReceiptLedger,
+} from "../subagentClosureReceipts";
+import {
+  isActiveGuidanceOwnedByRun,
+  normalizeActiveGuidance,
+} from "../runtimeGuidance";
+import {
+  decideRuntimeGuidanceCompletionFence,
+  shouldTransitionRunToFinalizing,
+  type RuntimeGuidanceCompletionFenceDecision,
+} from "../runtimeGuidanceCompletion";
 import { createTerminalStatusPublicationGate } from "../terminalStatusPublication";
 import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
 import {
@@ -291,6 +328,8 @@ export interface WorkflowContext {
   harnessRunId: string;
   /** Immutable Plan attempt captured when this Harness Run crossed admission. */
   planExecution: PlanExecutionRunProvenance | null;
+  /** Typed first-admission payload metadata. Raw image data stays in transport. */
+  turnInputContextSignals: TurnInputContextSignals;
   streamBuffer: any; // StreamingCadenceBuffer
   thinkingInterceptor: any; // StreamingThinkingInterceptor
   turnAgentMessagesStart: number;
@@ -321,6 +360,53 @@ export interface WorkflowContext {
   PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK: number;
 }
 
+export interface WorkflowRunSettlementIdentity {
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  outerRunId: string;
+}
+
+export interface WorkflowRunSettlementOwnerSnapshot {
+  harnessRunId: string | null;
+  actionRunId: string | null;
+  actionRequestRunId: string | null;
+  sessionKey: string | null;
+  turnId: string | null;
+  status: string | null;
+  instanceId: string | null;
+  startedAt: number | null;
+}
+
+/**
+ * The workflow caller must distinguish a durable terminal projection from an
+ * ownership handoff and from a failed projection that still owns the UI. A
+ * boolean cannot express that distinction and previously allowed a failed
+ * terminal transaction to resolve normally while `isGenerating` stayed true.
+ */
+export type WorkflowRunSettlement =
+  | {
+      disposition: "projected";
+      reason: string;
+      identity: WorkflowRunSettlementIdentity;
+      outcome: AgentLoopOutcome;
+    }
+  | {
+      disposition: "superseded";
+      reason: string;
+      identity: WorkflowRunSettlementIdentity;
+      outcome: AgentLoopOutcome;
+      currentOwner: WorkflowRunSettlementOwnerSnapshot;
+    }
+  | {
+      disposition: "projection_failed";
+      reason: string;
+      identity: WorkflowRunSettlementIdentity;
+      outcome: AgentLoopOutcome;
+      currentOwner: WorkflowRunSettlementOwnerSnapshot;
+    };
+
 export class WorkflowEngine {
   constructor(
     private get: () => WorkflowStoreState,
@@ -328,7 +414,7 @@ export class WorkflowEngine {
     private helpers: WorkflowEngineStoreHelpers,
   ) {}
 
-  public run(context: WorkflowContext): Promise<boolean> {
+  public run(context: WorkflowContext): Promise<WorkflowRunSettlement> {
     const sessionGet = this.get;
     const sessionSet = this.set;
     const {
@@ -370,17 +456,57 @@ export class WorkflowEngine {
     const resolveCurrentPlanEvidenceIdentity = (record: PlanExecutionEvidenceEntry): {
       planTaskId?: string;
       requirementRef?: string;
+      phase: "planning" | "mutation" | "service" | "validation";
+      operationId?: string;
+      obligationIds?: string[];
+      outcome: NonNullable<PlanExecutionEvidenceEntry["outcome"]>;
     } => {
       const state = sessionGet();
-      if (!state.isPlanApproved) return {};
+      const outcomeStatus = record.observationStatus === "failed"
+        ? "failed" as const
+        : record.observationStatus === "running" || record.observationStatus === "pending"
+          ? "running" as const
+          : record.observationStatus === "ready"
+            ? "ready" as const
+            : record.observationStatus === "stopped"
+              ? "stopped" as const
+              : "succeeded" as const;
+      const outcome = {
+        ...record.outcome,
+        status: outcomeStatus,
+      };
+      if (!state.isPlanApproved) {
+        return { phase: "planning", outcome };
+      }
       const checkpoint = latestExecuteRecoveryState?.decisionCheckpoint;
-      return resolvePlanExecutionEvidenceIdentity({
+      const identity: { planTaskId?: string; requirementRef?: string } = resolvePlanExecutionEvidenceIdentity({
         tasks: state.planTasks || [],
         evidenceLedger: state.planExecutionEvidenceLedger || [],
         record,
         preferredPlanTaskId: checkpoint?.planTaskId || null,
         preferredRequirementRef: checkpoint?.requirementRef || null,
       }) || {};
+      const task = (state.planTasks || []).find((candidate: PlanTask) =>
+        candidate.id === identity.planTaskId
+      );
+      const phase = task?.executionKind === "validation"
+        ? "validation" as const
+        : record.observationStatus === "running" ||
+          record.observationStatus === "ready" ||
+          record.kind === "dev_server_url"
+          ? "service" as const
+          : record.kind === "file"
+            ? "mutation" as const
+            : "validation" as const;
+      const operationId = task?.changeRef || task?.validationRef || task?.id;
+      const obligationIds = task?.validationRef ? [task.validationRef] : undefined;
+      return {
+        ...identity,
+        phase,
+        ...(operationId ? { operationId } : {}),
+        ...(obligationIds ? { obligationIds } : {}),
+        outcome,
+      };
     };
     // const attachedFilesSnapshot = context.attachedFilesSnapshot;
     // const mentionSnapshot = context.mentionSnapshot;
@@ -460,6 +586,468 @@ export class WorkflowEngine {
         stopClass: state.goalRuntime?.stopClass || state.goalProgress?.stopClass || null,
         actionRequestId: state.activeActionRequest?.requestId || null,
       });
+    };
+    const resolveCanonicalTurnStrategy = (state: any): TurnStrategy => {
+      const ownerTurn = (state.conversationTurns || []).find((candidate: any) =>
+        candidate.id === turnId
+      );
+      const turnIntent = String(
+        ownerTurn?.intent || ownerTurn?.mode || effectiveRunIntent || "",
+      );
+      return turnIntent === "plan"
+        ? "plan"
+        : turnIntent === "goal"
+          ? "goal"
+          : turnIntent === "execute" || turnIntent === "studio_workflow"
+            ? "execute"
+            : "chat";
+    };
+    const resolveCanonicalCheckpointOwner = (state: any) => {
+      const ownerTurn = (state.conversationTurns || []).find((candidate: any) =>
+        candidate.id === turnId
+      );
+      const ownerSession = (state.sessionsByWorkspace?.[runScopeKey] || []).find(
+        (candidate: any) => candidate.id === runSessionId,
+      );
+      const lifecycleOwnsSession = state.planLifecycle?.sessionKey === runSessionKey;
+      return {
+        // Use the same workspace identity source as Session bootstrap and
+        // cold restore. `runScopeKey` is duplicated transport state and must
+        // not be able to redefine a durable checkpoint owner.
+        workspaceKey: resolveSessionWorkspaceKey(runWorkspace),
+        sessionKey: runSessionKey,
+        sessionEpoch: String(
+          ownerSession?.planLifecycleEpoch ||
+          (lifecycleOwnsSession ? state.planLifecycle?.sessionEpoch : "") ||
+          initialHarnessMarker?.instanceId ||
+          `epoch:${runSessionKey}`
+        ),
+        clientSubmissionId: String(ownerTurn?.clientSubmissionId || turnId),
+        turnId,
+      };
+    };
+    const resolveCanonicalRunIdentity = (state: any) => ({
+      sessionKey: runSessionKey,
+      sessionEpoch: resolveCanonicalCheckpointOwner(state).sessionEpoch,
+      turnId,
+      runId: activeRuntimeRunIdentity.runId,
+      parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+      attemptId: activeRuntimeRunIdentity.runId,
+    });
+    const getExactTurnRuntimeCheckpoint = (
+      state: any = sessionGet(),
+    ): TurnRuntimeCheckpointV1 | null => {
+      const owner = resolveCanonicalCheckpointOwner(state);
+      return normalizeTurnRuntimeCheckpoint(
+        state.turnRuntimeCheckpoints?.[turnId],
+        { expectedOwner: owner },
+      );
+    };
+    const getExactSubagentClosureReceiptLedger = (
+      state: any = sessionGet(),
+    ): SubagentClosureReceiptLedger | null => {
+      const owner = resolveCanonicalCheckpointOwner(state);
+      return normalizeSubagentClosureReceiptLedger(
+        state.subagentClosureReceiptLedger,
+        {
+          expectedOwner: {
+            workspaceKey: owner.workspaceKey,
+            sessionKey: owner.sessionKey,
+            sessionEpoch: owner.sessionEpoch,
+          },
+        },
+      );
+    };
+    const ensureLiveTurnRuntimeCheckpoint = (): TurnRuntimeCheckpointV1 | null => {
+      let accepted: TurnRuntimeCheckpointV1 | null = null;
+      let rejectionReason: string | null = null;
+      sessionSet((state: any) => {
+        const owner = resolveCanonicalCheckpointOwner(state);
+        const rawExisting = state.turnRuntimeCheckpoints?.[turnId];
+        const existing = normalizeTurnRuntimeCheckpoint(rawExisting, {
+          expectedOwner: owner,
+        });
+        if (rawExisting && !existing) {
+          rejectionReason = "invalid_or_stale_existing_checkpoint";
+          return {};
+        }
+        const run = resolveCanonicalRunIdentity(state);
+        if (!existing) {
+          let canonical = createCanonicalTurnRuntime({
+            turn: owner,
+            strategy: resolveCanonicalTurnStrategy(state),
+            admittedAt: Math.max(0, Number(sendStartedAt) || Date.now()),
+          });
+          const started = reduceCanonicalTurnRuntime(canonical, {
+            schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+            type: "run.started",
+            sequence: canonical.nextSequence,
+            at: Math.max(canonical.lastEventAt, Date.now()),
+            run,
+            phase: canonical.turn.strategy === "plan"
+              ? "planning"
+              : canonical.turn.strategy === "chat"
+                ? "preparing"
+                : "executing",
+          });
+          if (started.disposition === "rejected") {
+            rejectionReason = started.reason;
+            return {};
+          }
+          canonical = started.state;
+          accepted = createTurnRuntimeCheckpoint({
+            canonical,
+            admittedUserContext: context.turnInputContextSignals,
+            updatedAt: canonical.lastEventAt,
+          });
+        } else {
+          let canonical = existing.canonical;
+          if (
+            canonical.run?.identity.runId === run.runId &&
+            canonical.run.identity.parentRunId === run.parentRunId
+          ) {
+            accepted = existing;
+          } else {
+            const previousRunId = canonical.run?.identity.runId || null;
+            const exactApprovedPlanChild =
+              canonical.planReviewStatus === "pending" &&
+              canonical.run?.status === "paused" &&
+              canonical.run.pause?.subject === "plan" &&
+              run.parentRunId === previousRunId &&
+              !!activePlanExecutionIdentity;
+            if (exactApprovedPlanChild && canonical.run) {
+              const reviewed = reduceCanonicalTurnRuntime(canonical, {
+                schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+                type: "plan.review_resolved",
+                sequence: canonical.nextSequence,
+                at: Math.max(canonical.lastEventAt, Date.now()),
+                run: canonical.run.identity,
+                decision: "approved",
+                reason: "plan_review_approved",
+              });
+              if (reviewed.disposition === "rejected") {
+                rejectionReason = reviewed.reason;
+                return {};
+              }
+              canonical = reviewed.state;
+            }
+            const exactRecoverableChild =
+              canonical.run?.status === "paused" &&
+              canonical.run.pause?.kind === "recoverable" &&
+              run.parentRunId === canonical.run.identity.runId;
+            if (!exactRecoverableChild) {
+              rejectionReason = "run_identity_mismatch";
+              return {};
+            }
+            const started = reduceCanonicalTurnRuntime(canonical, {
+              schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+              type: "run.started",
+              sequence: canonical.nextSequence,
+              at: Math.max(canonical.lastEventAt, Date.now()),
+              run,
+              phase: activePlanExecutionIdentity ? "executing" : "preparing",
+            });
+            if (started.disposition === "rejected") {
+              rejectionReason = started.reason;
+              return {};
+            }
+            accepted = updateTurnRuntimeCheckpointCanonical({
+              checkpoint: existing,
+              canonical: started.state,
+              updatedAt: started.state.lastEventAt,
+            });
+          }
+        }
+        if (!accepted) {
+          rejectionReason ||= "checkpoint_update_rejected";
+          return {};
+        }
+        return {
+          turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+            state.turnRuntimeCheckpoints,
+            accepted,
+          ),
+        };
+      });
+      if (!accepted) {
+        logStoreEvent("turn_runtime_checkpoint_admission_rejected", {
+          reason: rejectionReason || "unknown",
+          checkpointPresent: !!sessionGet().turnRuntimeCheckpoints?.[turnId],
+        });
+      }
+      return accepted;
+    };
+    ensureLiveTurnRuntimeCheckpoint();
+    let turnRuntimeCheckpointPersistChain = Promise.resolve();
+    const publishTurnRuntimePlanningCheckpoint = (
+      input: Parameters<NonNullable<
+        OrchestratorCallbacks["publishTurnRuntimePlanningCheckpoint"]
+      >>[0],
+    ): Promise<void> => {
+      const persist = async () => {
+        let published: TurnRuntimeCheckpointV1 | null = null;
+        let publishedLedger: SubagentClosureReceiptLedger | null = null;
+        let rejectionReason: string | null = null;
+        sessionSet((state: any) => {
+          const current = getExactTurnRuntimeCheckpoint(state);
+          if (!current || !current.canonical.run) {
+            rejectionReason = "turn_or_run_owner_missing";
+            return {};
+          }
+          const rawLedger = state.subagentClosureReceiptLedger;
+          const existingLedger = getExactSubagentClosureReceiptLedger(state);
+          if (rawLedger && !existingLedger) {
+            rejectionReason = "closure_ledger_owner_mismatch";
+            return {};
+          }
+          const issued = issueSubagentClosureReceipts({
+            ledger: existingLedger,
+            owner: {
+              workspaceKey: current.owner.workspaceKey,
+              sessionKey: current.owner.sessionKey,
+              sessionEpoch: current.owner.sessionEpoch,
+              parentTurnId: current.owner.turnId,
+              parentRunId: current.canonical.run.identity.runId,
+            },
+            contract: input.preferredDelegationScopeContract,
+            activities: input.recentPlanToolActivity,
+            issuedAt: input.updatedAt,
+          });
+          if (issued.missingConsumedScopeKeys.length > 0) {
+            rejectionReason = `consumed_scope_without_canonical_receipt:${issued.missingConsumedScopeKeys.join(",")}`;
+            return {};
+          }
+          const next = updateTurnRuntimePlanningCheckpoint({
+            checkpoint: current,
+            preferredDelegationScopeContract:
+              input.preferredDelegationScopeContract,
+            closureReceiptRefs: issued.receiptRefs,
+            updatedAt: input.updatedAt,
+          });
+          if (!next) {
+            rejectionReason = "checkpoint_update_rejected";
+            return {};
+          }
+          published = next;
+          publishedLedger = issued.ledger;
+          return {
+            subagentClosureReceiptLedger: issued.ledger,
+            turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+              state.turnRuntimeCheckpoints,
+              next,
+            ),
+          };
+        });
+        const committedCheckpoint = published as TurnRuntimeCheckpointV1 | null;
+        const committedLedger = publishedLedger as SubagentClosureReceiptLedger | null;
+        if (!committedCheckpoint) {
+          throw new Error(
+            `TURN_RUNTIME_PLANNING_CHECKPOINT_OWNER_MISMATCH:${rejectionReason || "unknown"}`,
+          );
+        }
+        const durableState = await persistCurrentSessionRuntime(sessionGet());
+        const savedSession = (durableState.sessionsByWorkspace?.[runScopeKey] || []).find(
+          (candidate: any) => candidate.id === runSessionId,
+        );
+        if (savedSession && runSessionId != null) {
+          sessionSet((latest: any) => {
+            const latestCheckpoint = getExactTurnRuntimeCheckpoint(latest);
+            const checkpointStillCurrent =
+              latestCheckpoint?.revision === committedCheckpoint.revision;
+            return {
+              sessionsByWorkspace: {
+                ...latest.sessionsByWorkspace,
+                [runScopeKey]: (latest.sessionsByWorkspace?.[runScopeKey] || []).map(
+                  (candidate: any) => candidate.id === runSessionId
+                    ? checkpointStillCurrent
+                      ? { ...candidate, ...savedSession }
+                      : {
+                          ...candidate,
+                          storageRevision: savedSession.storageRevision,
+                          storageStatus: savedSession.storageStatus,
+                          updatedAt: savedSession.updatedAt,
+                          updatedAtMs: savedSession.updatedAtMs,
+                        }
+                    : candidate,
+                ),
+              },
+            };
+          });
+        }
+        logStoreEvent("turn_runtime_planning_checkpoint_persisted", {
+          checkpointRevision: committedCheckpoint.revision,
+          preferredRegistrationCount:
+            committedCheckpoint.planning.preferredDelegationScopeContract?.registrations.length || 0,
+          closureReceiptRefCount: committedCheckpoint.planning.closureReceiptRefs.length,
+          closureReceiptCount: committedLedger?.receipts.length || 0,
+          adoptedEvidenceCount: committedLedger?.receipts.reduce(
+            (count, receipt) => count + receipt.acceptedEvidence.length,
+            0,
+          ) || 0,
+        });
+      };
+      turnRuntimeCheckpointPersistChain = turnRuntimeCheckpointPersistChain.then(
+        persist,
+        persist,
+      );
+      return turnRuntimeCheckpointPersistChain;
+    };
+    const publishTurnRuntimeVisualContextCheckpoint = (
+      input: Parameters<NonNullable<
+        OrchestratorCallbacks["publishTurnRuntimeVisualContextCheckpoint"]
+      >>[0],
+    ): Promise<void> => {
+      const persist = async () => {
+        let published: TurnRuntimeCheckpointV1 | null = null;
+        let rejectionReason: string | null = null;
+        sessionSet((state: any) => {
+          const current = getExactTurnRuntimeCheckpoint(state);
+          if (!current || !current.canonical.run) {
+            rejectionReason = "turn_or_run_owner_missing";
+            return {};
+          }
+          const next = updateTurnRuntimeVisualContextCheckpoint({
+            checkpoint: current,
+            visualContext: input.visualContext,
+            updatedAt: input.updatedAt,
+          });
+          if (!next) {
+            rejectionReason = "checkpoint_update_rejected";
+            return {};
+          }
+          published = next;
+          return {
+            turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+              state.turnRuntimeCheckpoints,
+              next,
+            ),
+          };
+        });
+        const committedCheckpoint = published as TurnRuntimeCheckpointV1 | null;
+        if (!committedCheckpoint) {
+          throw new Error(
+            `TURN_RUNTIME_VISUAL_CHECKPOINT_OWNER_MISMATCH:${rejectionReason || "unknown"}`,
+          );
+        }
+        const durableState = await persistCurrentSessionRuntime(sessionGet());
+        const savedSession = (durableState.sessionsByWorkspace?.[runScopeKey] || []).find(
+          (candidate: any) => candidate.id === runSessionId,
+        );
+        if (savedSession && runSessionId != null) {
+          sessionSet((latest: any) => {
+            const latestCheckpoint = getExactTurnRuntimeCheckpoint(latest);
+            const checkpointStillCurrent =
+              latestCheckpoint?.revision === committedCheckpoint.revision;
+            return {
+              sessionsByWorkspace: {
+                ...latest.sessionsByWorkspace,
+                [runScopeKey]: (latest.sessionsByWorkspace?.[runScopeKey] || []).map(
+                  (candidate: any) => candidate.id === runSessionId
+                    ? checkpointStillCurrent
+                      ? { ...candidate, ...savedSession }
+                      : {
+                          ...candidate,
+                          storageRevision: savedSession.storageRevision,
+                          storageStatus: savedSession.storageStatus,
+                          updatedAt: savedSession.updatedAt,
+                          updatedAtMs: savedSession.updatedAtMs,
+                        }
+                    : candidate,
+                ),
+              },
+            };
+          });
+        }
+        logStoreEvent("turn_runtime_visual_checkpoint_persisted", {
+          checkpointRevision: committedCheckpoint.revision,
+          status: committedCheckpoint.input.visualContext.status,
+          recognition: committedCheckpoint.input.visualContext.recognition || null,
+          expectedImageParts:
+            committedCheckpoint.input.visualContext.expectedImageParts,
+          observationId:
+            committedCheckpoint.input.visualContext.observationId || null,
+          rawImagePayloadPersisted: false,
+        });
+      };
+      turnRuntimeCheckpointPersistChain = turnRuntimeCheckpointPersistChain.then(
+        persist,
+        persist,
+      );
+      return turnRuntimeCheckpointPersistChain;
+    };
+    const buildSettlementIdentity = (): WorkflowRunSettlementIdentity => ({
+      sessionKey: runSessionKey,
+      turnId,
+      runId: activeRuntimeRunIdentity.runId,
+      parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+      outerRunId: activeRuntimeRunIdentity.outerRunId || context.harnessRunId,
+    });
+    const snapshotSettlementOwner = (): WorkflowRunSettlementOwnerSnapshot => {
+      const state = sessionGet();
+      const marker = state.harnessRunMarker as HarnessRunMarker | null;
+      const actionRequest = state.activeActionRequest as ActionRequest | null;
+      return {
+        harnessRunId: marker?.runId || null,
+        actionRunId: getHarnessActionRunId(marker),
+        actionRequestRunId: actionRequest?.runId || null,
+        sessionKey: marker?.sessionKey || actionRequest?.sessionKey || null,
+        turnId: marker?.turnId || actionRequest?.turnId || null,
+        status: marker?.status || null,
+        instanceId: marker?.instanceId || null,
+        startedAt: marker?.startedAt ?? null,
+      };
+    };
+    const projectedSettlement = (
+      reason: string,
+      outcome: AgentLoopOutcome,
+    ): WorkflowRunSettlement => ({
+      disposition: "projected",
+      reason,
+      identity: buildSettlementIdentity(),
+      outcome,
+    });
+    const unprojectedSettlement = (
+      reason: string,
+      outcome: AgentLoopOutcome,
+    ): WorkflowRunSettlement => {
+      const state = sessionGet();
+      const marker = state.harnessRunMarker as HarnessRunMarker | null;
+      const actionRequest = state.activeActionRequest as ActionRequest | null;
+      const identity = buildSettlementIdentity();
+      const ownedRunIds = new Set([
+        identity.runId,
+        identity.parentRunId,
+        identity.outerRunId,
+      ].filter((candidate): candidate is string => !!candidate));
+      const markerControlsRuntime = !!marker &&
+        (marker.status === "running" || marker.status === "paused");
+      const exactHarnessGeneration = isExactHarnessRunGeneration(marker, harnessRunOwner);
+      const markerActionRunId = getHarnessActionRunId(marker);
+      const foreignHarnessOwner = markerControlsRuntime && (
+        !exactHarnessGeneration ||
+        (!!markerActionRunId && !ownedRunIds.has(markerActionRunId))
+      );
+      const foreignActionOwner = !!actionRequest &&
+        actionRequest.status === "pending" &&
+        actionRequest.sessionKey === runSessionKey &&
+        actionRequest.turnId === turnId &&
+        !ownedRunIds.has(actionRequest.runId);
+      const currentOwner = snapshotSettlementOwner();
+      return foreignHarnessOwner || foreignActionOwner
+        ? {
+            disposition: "superseded",
+            reason,
+            identity,
+            outcome,
+            currentOwner,
+          }
+        : {
+            disposition: "projection_failed",
+            reason,
+            identity,
+            outcome,
+            currentOwner,
+          };
     };
     const streamBuffer = context.streamBuffer;
     const thinkingInterceptor = context.thinkingInterceptor;
@@ -560,6 +1148,7 @@ export class WorkflowEngine {
 
     const prepareSubagentsForNewTurn = async (): Promise<void> => {
       const currentParentTurnId = context.uiDisplayTurnId || turnId;
+      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
       const priorRuns = projectSubagentRuns(sessionGet().runtimeEvents).filter((run) =>
         run.threadId === runSessionKey &&
         run.parentTurnId !== currentParentTurnId &&
@@ -581,6 +1170,7 @@ export class WorkflowEngine {
       for (const parentTurnId of priorParentTurnIds) {
         const result = await finalizeCoordinatedSubagentsForParent({
           threadId: runSessionKey,
+          sessionEpoch: parentSessionEpoch,
           parentTurnId,
           graceMs: 2_000,
         });
@@ -1418,6 +2008,10 @@ export class WorkflowEngine {
           ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
           : {}),
       }),
+      getTurnRuntimeCheckpoint: () => getExactTurnRuntimeCheckpoint(),
+      getSubagentClosureReceiptLedger: () => getExactSubagentClosureReceiptLedger(),
+      publishTurnRuntimePlanningCheckpoint,
+      publishTurnRuntimeVisualContextCheckpoint,
       getRuntimeTraceContext: () => ({
         threadId: runSessionKey,
         turnId,
@@ -1506,16 +2100,171 @@ export class WorkflowEngine {
           latest.pendingPlanApprovalHandoff?.planTurnId === turnId;
       },
       getStatus: () => sessionGet().agentStatus,
-      consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
-      onGuidanceInjected: (text: string) => {
-        sessionSet((s: any) => {
-          const blockWithTurn = {
-            id: generateId(),
-            type: "user",
-            turnId,
-            content: text,
+      tryAcquireRunCompletionFence: ({
+        completionCandidate,
+        lateGuidanceContinuationsUsed,
+      }): RuntimeGuidanceCompletionFenceDecision => {
+        let fenceDecision: RuntimeGuidanceCompletionFenceDecision = {
+          kind: "reject_completion",
+          reason: "run_not_running",
+        };
+        sessionSet((state: any) => {
+          const owner = resolveCanonicalCheckpointOwner(state);
+          const checkpoint = normalizeTurnRuntimeCheckpoint(
+            state.turnRuntimeCheckpoints?.[turnId],
+            { expectedOwner: owner },
+          );
+          const canonicalRun = checkpoint?.canonical.run || null;
+          const expectedRun = resolveCanonicalRunIdentity(state);
+          const exactRun =
+            canonicalRun?.identity.runId === expectedRun.runId &&
+            canonicalRun.identity.parentRunId === expectedRun.parentRunId &&
+            canonicalRun.identity.attemptId === expectedRun.attemptId &&
+            canonicalRun.identity.turnId === expectedRun.turnId &&
+            canonicalRun.identity.sessionKey === expectedRun.sessionKey &&
+            canonicalRun.identity.sessionEpoch === expectedRun.sessionEpoch;
+          const pendingGuidance = normalizeActiveGuidance(state.activeGuidance);
+          fenceDecision = decideRuntimeGuidanceCompletionFence({
+            completionCandidate,
+            runStatus: exactRun ? canonicalRun?.status || null : null,
+            runPhase: exactRun ? canonicalRun?.phase || null : null,
+            exactPendingGuidanceId:
+              exactRun &&
+              pendingGuidance &&
+              isActiveGuidanceOwnedByRun(pendingGuidance, canonicalRun!.identity)
+                ? pendingGuidance.id
+                : null,
+            lateGuidanceContinuationsUsed,
+          });
+          if (
+            !checkpoint ||
+            !canonicalRun ||
+            !exactRun ||
+            !shouldTransitionRunToFinalizing(fenceDecision) ||
+            canonicalRun.phase === "finalizing"
+          ) {
+            return {};
+          }
+          const phased = reduceCanonicalTurnRuntime(checkpoint.canonical, {
+            schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+            type: "run.phase_changed",
+            sequence: checkpoint.canonical.nextSequence,
+            at: Math.max(checkpoint.canonical.lastEventAt, Date.now()),
+            run: canonicalRun.identity,
+            phase: "finalizing",
+          });
+          if (phased.disposition === "rejected") {
+            fenceDecision = {
+              kind: "reject_completion",
+              reason: "run_not_running",
+            };
+            return {};
+          }
+          const updatedCheckpoint = updateTurnRuntimeCheckpointCanonical({
+            checkpoint,
+            canonical: phased.state,
+            updatedAt: phased.state.lastEventAt,
+          });
+          if (!updatedCheckpoint) {
+            fenceDecision = {
+              kind: "reject_completion",
+              reason: "run_not_running",
+            };
+            return {};
+          }
+          return {
+            turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+              state.turnRuntimeCheckpoints,
+              updatedCheckpoint,
+            ),
           };
-          return { taskFlow: [...s.taskFlow, blockWithTurn] };
+        });
+        logStoreEvent("runtime_guidance_completion_fence", {
+          decision: fenceDecision.kind,
+          reason:
+            fenceDecision.kind === "reject_completion"
+              ? fenceDecision.reason
+              : null,
+          lateGuidanceContinuationsUsed,
+        });
+        return fenceDecision;
+      },
+      consumeActiveGuidance: () => {
+        const guidance = sessionGet().consumeActiveGuidance(
+          resolveCanonicalRunIdentity(sessionGet()),
+        );
+        return guidance
+          ? {
+              id: guidance.id,
+              text: guidance.text,
+              turnId: guidance.target.turnId,
+            }
+          : null;
+      },
+      onGuidanceInjected: (guidance) => {
+        sessionSet((s: any) => {
+          const ownerTurnId = guidance.turnId || turnId;
+          const alreadyProjected = s.taskFlow.some((block: any) =>
+            block?.type === "user" && block?.runtimeGuidance?.id === guidance.id
+          );
+          if (alreadyProjected) return {};
+
+          const ownerTurnExists = s.conversationTurns.some((turn: any) => turn.id === ownerTurnId);
+          if (!ownerTurnExists) {
+            logAgentEvent("runtime_guidance_projection_skipped", {
+              guidanceId: guidance.id,
+              turnId: ownerTurnId,
+              reason: "owner_turn_missing",
+            });
+            return {};
+          }
+
+          const blockId = s._nextTaskId();
+          const blockWithTurn = {
+            id: blockId,
+            type: "user",
+            turnId: ownerTurnId,
+            content: guidance.text,
+            runtimeGuidance: { id: guidance.id },
+          };
+          return {
+            taskFlow: [...s.taskFlow, blockWithTurn],
+            conversationTurns: s.conversationTurns.map((turn: any) =>
+              turn.id === ownerTurnId && !turn.blockIds.includes(blockId)
+                ? { ...turn, blockIds: [...turn.blockIds, blockId] }
+                : turn
+            ),
+          };
+        });
+      },
+      onLateGuidanceContinuation: ({ guidanceId, iteration }) => {
+        sessionSet((state: any) => {
+          const displayTurnId = context.uiDisplayTurnId || turnId;
+          const candidate = findLatestRunOwnedAgentBlock(
+            state.taskFlow,
+            displayTurnId,
+            context.agentBlockIdsCreatedThisRun,
+            { requireSettled: true },
+          );
+          if (!candidate) return {};
+          if (context.currentStreamingBlockId === candidate.id) {
+            context.currentStreamingBlockId = null;
+          }
+          return {
+            taskFlow: state.taskFlow.map((block: TaskBlock) =>
+              block.id === candidate.id && block.type === "agent"
+                ? {
+                    ...block,
+                    hiddenProcess: true,
+                    visibility: "hidden_process" as const,
+                  }
+                : block,
+            ),
+          };
+        });
+        logStoreEvent("runtime_guidance_completion_candidate_superseded", {
+          guidanceId,
+          iteration,
         });
       },
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
@@ -2856,6 +3605,7 @@ export class WorkflowEngine {
           internalFeedback?: boolean;
           qualityGateReason?: string | null;
           evidenceResult?: string;
+          executedArgs?: Record<string, unknown>;
           executionName?: string;
           catalogIdentity?: ToolCatalogIdentity;
         },
@@ -2922,6 +3672,7 @@ export class WorkflowEngine {
               toolName: executionName,
               target,
               result: evidenceResultText,
+              executedArgs: meta?.executedArgs,
               noOp,
               diff: completedDiff,
               transactionId: turnId,
@@ -3123,6 +3874,9 @@ export class WorkflowEngine {
         const executionId = lifecycleMeta.toolCallId || undefined;
         const executionName = String(meta?.executionName || toolName).trim() || toolName;
         const errorText = String(error || "");
+        const evidenceErrorText = typeof meta?.evidenceResult === "string"
+          ? meta.evidenceResult
+          : errorText;
         const failureKind = meta?.failureKind || "policy";
         if (meta?.internalFeedback === true) {
           logStoreEvent("tool_error_internal_feedback", {
@@ -3185,7 +3939,8 @@ export class WorkflowEngine {
           ? createPlanExecutionEvidenceEntry({
               toolName: executionName,
               target: String(failedMutationDiff.path || target || "").trim(),
-              result: errorText,
+              result: evidenceErrorText,
+              executedArgs: meta?.executedArgs,
               diff: failedMutationDiff,
               transactionId: turnId,
               runId: activeRuntimeRunIdentity.runId,
@@ -3202,7 +3957,8 @@ export class WorkflowEngine {
           ? createPlanExecutionFailureEntry({
               toolName: executionName,
               target,
-              error: errorText,
+              error: evidenceErrorText,
+              executedArgs: meta?.executedArgs,
               transactionId: turnId,
               runId: activeRuntimeRunIdentity.runId,
             })
@@ -4390,7 +5146,7 @@ export class WorkflowEngine {
         }
         const latest = sessionGet();
         const planApprovalIdentity = status === "pending_review"
-          ? buildPlanApprovalIdentity(latest.planArtifacts)
+          ? buildTypedPlanApprovalIdentity(latest.planArtifacts)
           : null;
         const shouldMarkPlanAwaitingApproval =
           status === "pending_review" &&
@@ -4580,7 +5336,12 @@ export class WorkflowEngine {
         });
       },
 
-      onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => {
+      onPlanArtifactUpdated: (
+        path: string,
+        content: string,
+        kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
+        metadata,
+      ) => {
         const wasApproved = sessionGet().isPlanApproved === true;
         const previousIdentity = buildPlanApprovalIdentity(sessionGet().planArtifacts);
         sessionGet().upsertPlanArtifact({
@@ -4588,6 +5349,13 @@ export class WorkflowEngine {
           path,
           title: getPlanArtifactTitle(kind, sessionGet().config.language === "en" ? "en" : "zh"),
           content,
+          ...(metadata?.candidate
+            ? {
+                candidate: metadata.candidate,
+                candidateHash: hashPlanCandidate(metadata.candidate),
+                authoringContractId: metadata.candidate.authoringContractId,
+              }
+            : {}),
           updatedAt: Date.now(),
         });
         const nextIdentity = buildPlanApprovalIdentity(sessionGet().planArtifacts);
@@ -4752,12 +5520,17 @@ export class WorkflowEngine {
       },
 
       onPlanApprovalInvalidated: (reason: string) => {
-        const currentIdentity = buildPlanApprovalIdentity(sessionGet().planArtifacts);
+        const currentArtifactIdentity = buildPlanApprovalIdentity(
+          sessionGet().planArtifacts,
+        );
+        const currentReviewIdentity = buildTypedPlanApprovalIdentity(
+          sessionGet().planArtifacts,
+        );
         sessionSet((state: any) => {
           const planLifecycle = applyPlanArtifactIdentity({
             lifecycle: state.planLifecycle,
             sessionKey: runSessionKey,
-            artifactIdentity: toWorkflowPlanArtifactIdentity(currentIdentity),
+            artifactIdentity: toWorkflowPlanArtifactIdentity(currentArtifactIdentity),
             at: Date.now(),
           });
           return {
@@ -4772,14 +5545,14 @@ export class WorkflowEngine {
             planExecutionEvidenceCount: 0,
             planAutoResumeCount: 0,
             planExecutionProgressSnapshot: null,
-            ...(currentIdentity
+            ...(currentReviewIdentity
               ? { agentStatus: "pending_review", isGenerating: false }
               : {}),
             conversationTurns: state.conversationTurns.map((candidate: any) =>
               candidate.id === turnId
                 ? {
                     ...candidate,
-                    ...(currentIdentity ? { status: "awaiting_approval" as const } : {}),
+                    ...(currentReviewIdentity ? { status: "awaiting_approval" as const } : {}),
                     summary: phaseLanguage === "zh"
                       ? "计划内容在批准后发生变化，旧批准已失效。"
                       : "The plan changed after review, so the previous approval is stale.",
@@ -4788,20 +5561,20 @@ export class WorkflowEngine {
             ),
           };
         });
-        if (currentIdentity) {
+        if (currentReviewIdentity) {
           const request = buildPlanReviewActionRequest({
             sessionKey: runSessionKey,
             turnId,
             runId: activeRuntimeRunIdentity.runId,
             parentRunId: activeRuntimeRunIdentity.parentRunId,
             title: resolveCurrentTurnTitle(),
-            planRevision: currentIdentity.revision,
-            artifactHash: currentIdentity.artifactHash,
-            artifactPaths: currentIdentity.artifactPaths,
+            planRevision: currentReviewIdentity.revision,
+            artifactHash: currentReviewIdentity.artifactHash,
+            artifactPaths: currentReviewIdentity.artifactPaths,
           });
           publishActionRequest(request, {
             reason: "plan_revision_changed",
-            target: currentIdentity.artifactPaths.join(", "),
+            target: currentReviewIdentity.artifactPaths.join(", "),
             pauseMessage: phaseLanguage === "zh"
               ? "计划内容已变化，旧批准失效；请审核新的修订。"
               : "The plan changed, invalidating the old approval; review the new revision.",
@@ -4812,7 +5585,7 @@ export class WorkflowEngine {
           sessionKey: runSessionKey,
           turnId,
           runId: activeRuntimeRunIdentity.runId,
-          planRevision: currentIdentity?.revision || null,
+          planRevision: currentReviewIdentity?.revision || null,
           reason,
         });
       },
@@ -4845,7 +5618,12 @@ export class WorkflowEngine {
 
     callbacks.runSubagent = (request, runOptions) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
-      const existingRunCount = getCoordinatedSubagentRunCount(runSessionKey, parentTurnId);
+      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const existingRunCount = getCoordinatedSubagentRunCount(
+        runSessionKey,
+        parentTurnId,
+        parentSessionEpoch,
+      );
       const allowedPaths = parseSubagentAllowedPaths(request.allowedPaths, runWorkspace);
       const duplicateCount = countParentObservedDelegationPaths({
         allowedPaths,
@@ -4871,6 +5649,7 @@ export class WorkflowEngine {
         request,
         parentCallbacks: callbacks,
         parentTurnId,
+        parentSessionEpoch,
         parentSignal: runOptions?.signal || abortCtrl.signal,
         existingRunCount,
         emitEvent: (event) => {
@@ -4881,25 +5660,46 @@ export class WorkflowEngine {
         executeAgentLoop,
       }));
     };
-    callbacks.getPendingSubagentIds = () => getPendingCoordinatedSubagentIds(
-      runSessionKey,
-      context.uiDisplayTurnId || turnId,
-    );
-    callbacks.waitSubagents = async (request) => {
+    callbacks.getPendingSubagentIds = () => {
+      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      return getPendingCoordinatedSubagentIds(
+        runSessionKey,
+        context.uiDisplayTurnId || turnId,
+        parentSessionEpoch,
+      );
+    };
+    callbacks.waitSubagents = async (request, waitOptions) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
+      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
       const waitStartedAt = Date.now();
+      const availableSubagentIds = getPendingCoordinatedSubagentIds(
+        runSessionKey,
+        parentTurnId,
+        parentSessionEpoch,
+      );
+      const requestedSubagentIds = request.subagentIds || [];
+      const matchedRequestedIds = requestedSubagentIds.filter((id) =>
+        availableSubagentIds.includes(id)
+      );
       callbacks.onDebugEvent?.("parent_wait", {
-        subagentIds: request.subagentIds || [],
+        subagentIds: requestedSubagentIds,
+        availableSubagentIds,
+        waitSelection: requestedSubagentIds.length === 0 || matchedRequestedIds.length === 0
+          ? "all_registered"
+          : "matched_subset",
         parentTurnId,
       });
       const result = await waitForCoordinatedSubagents({
         threadId: runSessionKey,
+        sessionEpoch: parentSessionEpoch,
         parentTurnId,
-        subagentIds: request.subagentIds,
+        subagentIds: requestedSubagentIds,
+        signal: waitOptions?.signal || abortCtrl.signal,
       });
       callbacks.onDebugEvent?.("parent_resume", {
         subagentIds: result.results.map((entry) => entry.subagentId),
         statuses: result.results.map((entry) => entry.status),
+        pendingIds: result.pendingIds,
         parentTurnId,
         parentBlockedMs: Math.max(0, Date.now() - waitStartedAt),
       });
@@ -5335,8 +6135,7 @@ export class WorkflowEngine {
         : "canceled" as const;
       let committedFinalText: string | null = null;
       let committedTurnStatus = "paused";
-      let committedIsIntentionalActionPause = false;
-      let committedPendingAction: ActionRequest | null = null;
+      let committedCanonicalAgentStatus: "idle" | "running" | "pending_review" | "error" = "idle";
       const terminalCommitted = await terminalStatusPublicationGate.commitTerminal({
         runKey: terminalRunIdentity.runId,
         persistTerminalProjection: async () => {
@@ -5352,6 +6151,30 @@ export class WorkflowEngine {
                 phase: "snapshot",
               });
               continue;
+            }
+            if (outcome.status === "completed") {
+              const exactCheckpoint = getExactTurnRuntimeCheckpoint(baseState);
+              const exactRun = exactCheckpoint?.canonical.run || null;
+              const pendingGuidance = normalizeActiveGuidance(baseState.activeGuidance);
+              if (
+                exactRun &&
+                exactRun.identity.runId === terminalRunIdentity.runId &&
+                exactRun.identity.parentRunId === terminalRunIdentity.parentRunId &&
+                pendingGuidance &&
+                isActiveGuidanceOwnedByRun(pendingGuidance, exactRun.identity)
+              ) {
+                // Last-resort CAS backstop. The completion fence normally
+                // consumes this before terminal publication; if a stale path
+                // bypasses it, preserve the Guide and reject completion.
+                logStoreEvent("terminal_projection_rejected_pending_guidance", {
+                  sessionKey: runSessionKey,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  guidanceId: pendingGuidance.id,
+                  attempt: attempt + 1,
+                });
+                return false;
+              }
             }
             let attemptHarnessProjection: Exclude<TerminalHarnessProjectionResult, "ownership_lost"> = "absent";
             if (requestedHarnessProjection !== "absent") {
@@ -5412,28 +6235,93 @@ export class WorkflowEngine {
 
             const projectedState = draft.get();
             const pendingAction = projectedState.activeActionRequest as ActionRequest | null;
-            const isIntentionalActionPause =
-              !isSameTurnExecutionContinuation &&
-              outcome.status === "paused" &&
-              pendingAction?.status === "pending" &&
-              isActionRequestOwnedByRun(pendingAction, {
-                sessionKey: runSessionKey,
-                turnId,
-                runId: terminalRunIdentity.runId,
-              });
-            const terminalTurnStatus = isSameTurnExecutionContinuation
-              ? "executing"
-              : outcome.status === "completed" && outcome.resultKind === "error"
-              ? "error"
-              : outcome.status === "completed"
-              ? completedTurnHasChanges ? "completed_with_changes" : "done"
-              : outcome.status === "aborted"
-              ? "done"
-              : "paused";
             const timestampMs = Date.now();
             const summary = projectedState.conversationTurns.find((candidate: any) =>
               terminalTurnIds.has(candidate.id)
             )?.summary || outcome.reason;
+            const canonicalStrategy = resolveCanonicalTurnStrategy(projectedState);
+            const planReviewIdentity = pendingAction?.kind === "plan_review"
+              ? buildTypedPlanApprovalIdentity(projectedState.planArtifacts || [])
+              : null;
+            const canonicalPauseKind: TurnRunPauseKind =
+              pendingAction?.kind === "plan_review" || pendingAction?.kind === "tool_permission"
+              ? "approval"
+              : outcome.status === "paused" && outcome.pauseKind === "action_required"
+                ? "input"
+                : "recoverable";
+            const checkpointOwner = resolveCanonicalCheckpointOwner(projectedState);
+            const rawTurnRuntimeCheckpoint = projectedState.turnRuntimeCheckpoints?.[turnId];
+            const existingTurnRuntimeCheckpoint = normalizeTurnRuntimeCheckpoint(
+              rawTurnRuntimeCheckpoint,
+              { expectedOwner: checkpointOwner },
+            );
+            if (rawTurnRuntimeCheckpoint && !existingTurnRuntimeCheckpoint) {
+              logStoreEvent("canonical_turn_transaction_rejected", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                reason: "invalid_or_stale_turn_runtime_checkpoint",
+                outcomeStatus: outcome.status,
+              });
+              return false;
+            }
+            const canonicalRunIdentity =
+              existingTurnRuntimeCheckpoint?.canonical.run?.identity.runId ===
+                  terminalRunIdentity.runId &&
+                existingTurnRuntimeCheckpoint.canonical.run.identity.parentRunId ===
+                  terminalRunIdentity.parentRunId
+                ? existingTurnRuntimeCheckpoint.canonical.run.identity
+                : {
+                    sessionKey: runSessionKey,
+                    sessionEpoch: checkpointOwner.sessionEpoch,
+                    turnId,
+                    runId: terminalRunIdentity.runId,
+                    parentRunId: terminalRunIdentity.parentRunId,
+                    attemptId: terminalRunIdentity.runId,
+                  };
+            const canonicalOutcome = outcome.status === "completed"
+              ? { status: "completed" as const, resultKind: outcome.resultKind, reason: outcome.reason }
+              : outcome.status === "aborted"
+                ? { status: "aborted" as const, reason: outcome.reason }
+                : { status: "paused" as const, pauseKind: canonicalPauseKind, reason: outcome.reason };
+            const canonicalPlanArtifact = planReviewIdentity && pendingAction?.kind === "plan_review"
+              ? {
+                  path: planReviewIdentity.artifactPaths[0] || ".MAIN/plans/plan.md",
+                  digest: planReviewIdentity.artifactHash,
+                  revision: planReviewIdentity.revision,
+                }
+              : undefined;
+            const canonicalAt = Math.max(
+              timestampMs,
+              existingTurnRuntimeCheckpoint?.canonical.lastEventAt || 0,
+            );
+            const canonicalTransaction = projectTurnRuntimeCheckpointTransaction({
+              checkpoint: existingTurnRuntimeCheckpoint,
+              owner: checkpointOwner,
+              run: canonicalRunIdentity,
+              strategy: canonicalStrategy,
+              outcome: canonicalOutcome,
+              at: canonicalAt,
+              closesTurn: closesLogicalTurn,
+              ...(canonicalPlanArtifact ? { planArtifact: canonicalPlanArtifact } : {}),
+            });
+            if (canonicalTransaction.disposition === "rejected") {
+              logStoreEvent("canonical_turn_transaction_rejected", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                reason: canonicalTransaction.reason,
+                outcomeStatus: outcome.status,
+              });
+              return false;
+            }
+            const canonicalTurnRuntimeCheckpoint = canonicalTransaction.checkpoint;
+            const canonicalCompatibility = canonicalTransaction.compatibility;
+            const terminalTurnStatus = isSameTurnExecutionContinuation
+              ? "executing"
+              : canonicalCompatibility.conversationTurnStatus === "done" && completedTurnHasChanges
+                ? "completed_with_changes"
+                : canonicalCompatibility.conversationTurnStatus;
             const runBoundaryEvent = outcome.status === "aborted"
               ? withEventSchema({
                   type: "run.aborted",
@@ -5618,6 +6506,16 @@ export class WorkflowEngine {
               return {
                 ...nextState,
                 ...planLifecyclePatch,
+                activeGuidance: (() => {
+                  const guidance = normalizeActiveGuidance(state.activeGuidance);
+                  return guidance && !isActiveGuidanceOwnedByRun(guidance, canonicalRunIdentity)
+                    ? guidance
+                    : null;
+                })(),
+                turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+                  state.turnRuntimeCheckpoints,
+                  canonicalTurnRuntimeCheckpoint,
+                ),
                 ...(attemptHarnessProjection === "absent"
                   ? {}
                   : {
@@ -5635,16 +6533,11 @@ export class WorkflowEngine {
                   terminalTurnIds.has(candidate.id)
                     ? {
                         ...candidate,
-                        status: isIntentionalActionPause ? candidate.status : terminalTurnStatus,
+                        status: terminalTurnStatus,
                         collapsed: false,
-                        runtimeOutcome: {
+                        runtimeOutcome: canonicalCompatibility.runtimeOutcome || {
                           status: projectAgentLoopStatusToConversationTurnRuntimeStatus(outcome.status),
                           reason: outcome.reason,
-                          ...(outcome.status === "completed"
-                            ? { resultKind: outcome.resultKind }
-                            : outcome.status === "paused"
-                            ? { pauseKind: outcome.pauseKind }
-                            : { resultKind: "canceled" as const }),
                           runId: terminalRunIdentity.runId,
                           parentRunId: terminalRunIdentity.parentRunId,
                           updatedAt: timestampMs,
@@ -5744,20 +6637,14 @@ export class WorkflowEngine {
             }
             committedFinalText = finalText;
             committedTurnStatus = terminalTurnStatus;
-            committedIsIntentionalActionPause = isIntentionalActionPause;
-            committedPendingAction = pendingAction;
+            committedCanonicalAgentStatus = canonicalCompatibility.agentStatus;
             return true;
           }
           throw new Error("TERMINAL_PROJECTION_CONCURRENT_UPDATE_LIMIT");
         },
         publishTerminalStatus: () => {
           sessionSet({
-            agentStatus: committedIsIntentionalActionPause &&
-              (committedPendingAction?.kind === "plan_review" || committedPendingAction?.kind === "tool_permission")
-              ? "pending_review"
-              : outcome.status === "completed" && outcome.resultKind === "error"
-              ? "error"
-              : "idle",
+            agentStatus: committedCanonicalAgentStatus,
             isGenerating: false,
             abortController: null,
           });
@@ -5920,6 +6807,7 @@ export class WorkflowEngine {
           runtimeEvents: state.runtimeEvents,
           harnessRunMarker: state.harnessRunMarker,
           activeActionRequest: state.activeActionRequest,
+          turnRuntimeCheckpoints: state.turnRuntimeCheckpoints,
           taskFlow: messages,
           agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages),
           contextMemoryState: state.contextMemoryState,
@@ -6025,17 +6913,113 @@ export class WorkflowEngine {
       const terminalTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
       const baseRevisionToken = getSessionRevisionToken();
       const current = sessionGet();
-      if (current.runtimeEvents.some((event: any) =>
-        isTerminalTurnEvent(event) &&
-        event.threadId === runSessionKey &&
-        terminalTurnIds.has(event.turnId)
-      )) {
-        return { committed: true, finalText: null };
+      const timestampMs = Date.now();
+      const pendingAction = current.activeActionRequest as ActionRequest | null;
+      const canonicalStrategy = resolveCanonicalTurnStrategy(current);
+      const checkpointOwner = resolveCanonicalCheckpointOwner(current);
+      const rawTurnRuntimeCheckpoint = current.turnRuntimeCheckpoints?.[turnId];
+      const existingTurnRuntimeCheckpoint = normalizeTurnRuntimeCheckpoint(
+        rawTurnRuntimeCheckpoint,
+        { expectedOwner: checkpointOwner },
+      );
+      if (rawTurnRuntimeCheckpoint && !existingTurnRuntimeCheckpoint) {
+        logStoreEvent("terminal_error_memory_fallback_checkpoint_quarantined", {
+          runId: terminalRunIdentity.runId,
+          reason: "invalid_or_stale_turn_runtime_checkpoint",
+          triggerError: input.triggerError,
+        });
       }
+      const canonicalRunIdentity =
+        existingTurnRuntimeCheckpoint?.canonical.run?.identity.runId === terminalRunIdentity.runId &&
+          existingTurnRuntimeCheckpoint.canonical.run.identity.parentRunId === terminalRunIdentity.parentRunId
+          ? existingTurnRuntimeCheckpoint.canonical.run.identity
+          : {
+              sessionKey: runSessionKey,
+              sessionEpoch: checkpointOwner.sessionEpoch,
+              turnId,
+              runId: terminalRunIdentity.runId,
+              parentRunId: terminalRunIdentity.parentRunId,
+              attemptId: terminalRunIdentity.runId,
+            };
+      const planReviewIdentity = pendingAction?.kind === "plan_review"
+        ? buildTypedPlanApprovalIdentity(current.planArtifacts || [])
+        : null;
+      const canonicalPlanArtifact = planReviewIdentity && pendingAction?.kind === "plan_review"
+        ? {
+            path: planReviewIdentity.artifactPaths[0] || ".MAIN/plans/plan.md",
+            digest: planReviewIdentity.artifactHash,
+            revision: planReviewIdentity.revision,
+          }
+        : undefined;
+      const canonicalAt = Math.max(
+        timestampMs,
+        existingTurnRuntimeCheckpoint?.canonical.lastEventAt || 0,
+      );
+      const existingCompatibility = existingTurnRuntimeCheckpoint
+        ? projectTurnRuntimeCompatibility(existingTurnRuntimeCheckpoint.canonical)
+        : null;
+      const existingAlreadySettled = !!existingCompatibility && (
+        existingCompatibility.isTerminal ||
+        existingTurnRuntimeCheckpoint?.canonical.planReviewStatus === "pending" ||
+        existingTurnRuntimeCheckpoint?.canonical.run?.status === "paused"
+      );
+      let canonicalTransaction = existingAlreadySettled && existingTurnRuntimeCheckpoint && existingCompatibility
+        ? {
+            disposition: "projected" as const,
+            checkpoint: existingTurnRuntimeCheckpoint,
+            compatibility: existingCompatibility,
+          }
+        : projectTurnRuntimeCheckpointTransaction({
+            checkpoint: existingTurnRuntimeCheckpoint,
+            owner: checkpointOwner,
+            run: canonicalRunIdentity,
+            strategy: canonicalStrategy,
+            outcome: { status: "completed", resultKind: "error", reason: input.reason },
+            at: canonicalAt,
+            closesTurn: true,
+            ...(canonicalPlanArtifact ? { planArtifact: canonicalPlanArtifact } : {}),
+          });
+      if (canonicalTransaction.disposition === "rejected") {
+        logStoreEvent("terminal_error_canonical_projection_rejected", {
+          runId: terminalRunIdentity.runId,
+          reason: canonicalTransaction.reason,
+          triggerError: input.triggerError,
+        });
+        canonicalTransaction = projectTurnRuntimeCheckpointTransaction({
+          checkpoint: existingTurnRuntimeCheckpoint,
+          owner: checkpointOwner,
+          run: canonicalRunIdentity,
+          strategy: canonicalStrategy,
+          outcome: {
+            status: "paused",
+            pauseKind: "recoverable",
+            reason: "terminal_error_recovery_required",
+          },
+          at: canonicalAt,
+          closesTurn: false,
+        });
+      }
+      if (canonicalTransaction.disposition === "rejected") {
+        logStoreEvent("terminal_error_recoverable_pause_rejected", {
+          runId: terminalRunIdentity.runId,
+          reason: canonicalTransaction.reason,
+          triggerError: input.triggerError,
+        });
+        return { committed: false, finalText: null };
+      }
+
+      const canonicalTurnRuntimeCheckpoint = canonicalTransaction.checkpoint;
+      const canonicalCompatibility = canonicalTransaction.compatibility;
+      const canonicalRuntimeOutcome = canonicalCompatibility.runtimeOutcome;
+      if (!canonicalRuntimeOutcome) return { committed: false, finalText: null };
       const harnessProjection = projectCurrentHarnessRunMarker(
-        "completed",
-        "terminal_error_memory_fallback",
-        { terminalResultKind: "error", allowErrorOverride: true },
+        canonicalCompatibility.isTerminal ? "error" : "paused",
+        canonicalCompatibility.isTerminal
+          ? "terminal_error_memory_fallback"
+          : "terminal_error_recoverable_pause",
+        canonicalCompatibility.isTerminal
+          ? { terminalResultKind: "error", allowErrorOverride: true }
+          : {},
       );
       if (harnessProjection === "ownership_lost") {
         return { committed: false, finalText: null };
@@ -6043,77 +7027,141 @@ export class WorkflowEngine {
 
       const draft = createTerminalDraftAccess(current);
       commitFinalElapsedTime(draft);
-      const finalText = ensureClosedTurnConclusion(outcome, draft);
-      commitTerminalTurnContext(outcome, draft);
-      const timestampMs = Date.now();
-      const runTerminalEvent = withEventSchema({
-        type: "run.completed",
-        threadId: runSessionKey,
-        turnId,
-        timestampMs,
-        runId: terminalRunIdentity.runId,
-        parentRunId: terminalRunIdentity.parentRunId,
-        ...(terminalRunIdentity.goalSliceId
-          ? { goalSliceId: terminalRunIdentity.goalSliceId }
-          : {}),
-        resultKind: "error",
-        summary: finalText || input.reason,
+      let finalText: string | null = null;
+      if (canonicalCompatibility.isTerminal) {
+        finalText = ensureClosedTurnConclusion(outcome, draft);
+        commitTerminalTurnContext(outcome, draft);
+      } else {
+        const language = (current.preferredResponseLanguage || current.config.language) === "en"
+          ? "en"
+          : "zh";
+        const reviewPreserved = canonicalCompatibility.conversationTurnStatus === "awaiting_approval";
+        finalText = language === "en"
+          ? reviewPreserved
+            ? `Terminal publication failed, but the validated Plan remains pending review and the Turn was not completed. ${input.reason}`
+            : `Terminal publication failed. The Turn was safely paused for recovery and was not marked complete. ${input.reason}`
+          : reviewPreserved
+          ? `终态发布失败，但已校验的计划仍保持待审核，本回合未被标记完成。原因：${input.reason}`
+          : `终态发布失败，本回合已安全暂停以便恢复，未被标记完成。原因：${input.reason}`;
+        const existingErrorBlock = [...draft.get().taskFlow].reverse().find((block: TaskBlock) =>
+          block.turnId === turnId &&
+          block.type === "agent" &&
+          block.visibility === "assistant_update" &&
+          block.content === finalText
+        );
+        const errorBlockId = existingErrorBlock?.id ?? draft.get()._nextTaskId();
+        draft.set((state: any) => ({
+          taskFlow: existingErrorBlock
+            ? state.taskFlow
+            : [...state.taskFlow, {
+                id: errorBlockId,
+                turnId,
+                type: "agent" as const,
+                content: finalText,
+                streaming: false,
+                visibility: "assistant_update" as const,
+              }],
+          conversationTurns: state.conversationTurns.map((candidate: any) =>
+            terminalTurnIds.has(candidate.id)
+              ? {
+                  ...candidate,
+                  summary: finalText,
+                  blockIds: candidate.id === turnId && !candidate.blockIds.includes(errorBlockId)
+                    ? [...candidate.blockIds, errorBlockId]
+                    : candidate.blockIds,
+                }
+              : candidate
+          ),
+        }));
+      }
+      const summary = draft.get().conversationTurns.find((candidate: any) =>
+        terminalTurnIds.has(candidate.id)
+      )?.summary || finalText || input.reason;
+      const runLifecycleEvent = canonicalCompatibility.isTerminal
+        ? withEventSchema({
+            type: "run.completed",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: canonicalAt,
+            runId: canonicalRuntimeOutcome.runId,
+            parentRunId: canonicalRuntimeOutcome.parentRunId,
+            ...(terminalRunIdentity.goalSliceId && canonicalRuntimeOutcome.runId === terminalRunIdentity.runId
+              ? { goalSliceId: terminalRunIdentity.goalSliceId }
+              : {}),
+            resultKind: canonicalCompatibility.resultKind || "error",
+            summary,
+          })
+        : withEventSchema({
+            type: "run.paused",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: canonicalAt,
+            runId: canonicalRuntimeOutcome.runId,
+            parentRunId: canonicalRuntimeOutcome.parentRunId,
+            ...(terminalRunIdentity.goalSliceId && canonicalRuntimeOutcome.runId === terminalRunIdentity.runId
+              ? { goalSliceId: terminalRunIdentity.goalSliceId }
+              : {}),
+            reason: canonicalRuntimeOutcome.reason,
+            message: summary,
+          });
+      const turnTerminalEvent = canonicalCompatibility.isTerminal
+        ? withEventSchema({
+            type: "turn.completed",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: canonicalAt,
+            resultKind: canonicalCompatibility.resultKind || "error",
+          })
+        : null;
+      const compatibleRuntimeEvents = draft.get().runtimeEvents.filter((event: any) => {
+        if (event.threadId !== runSessionKey || !terminalTurnIds.has(event.turnId)) return true;
+        if (
+          (isRunTerminalEvent(event) || isRunBoundaryEvent(event)) &&
+          event.runId === canonicalRuntimeOutcome.runId
+        ) return false;
+        return !isTerminalTurnEvent(event);
       });
-      const runAppend = appendRuntimeEventWithResult(
-        draft.get().runtimeEvents,
-        runTerminalEvent,
-      );
-      if (runAppend.disposition === "conflict") {
-        logStoreEvent("terminal_error_memory_fallback_conflict", {
-          runId: terminalRunIdentity.runId,
-          existingType: runAppend.existingEvent?.type || null,
-          triggerError: input.triggerError,
-        });
+      const runAppend = appendRuntimeEventWithResult(compatibleRuntimeEvents, runLifecycleEvent);
+      if (runAppend.disposition === "conflict") return { committed: false, finalText: null };
+      const projectedRuntimeEvents = turnTerminalEvent
+        ? appendRuntimeEventWithResult(runAppend.events, turnTerminalEvent)
+        : { disposition: "appended" as const, events: runAppend.events };
+      if (projectedRuntimeEvents.disposition === "conflict") {
         return { committed: false, finalText: null };
       }
-      const turnTerminalEvent = withEventSchema({
-        type: "turn.completed",
-        threadId: runSessionKey,
-        turnId,
-        timestampMs,
-        resultKind: "error",
-      });
-      const turnAppend = appendRuntimeEventWithResult(runAppend.events, turnTerminalEvent);
-      if (turnAppend.disposition === "conflict") {
-        return { committed: false, finalText: null };
-      }
-
       draft.set((state: any) => {
-        let nextState = reduceRunTransition(state, {
+        let nextState = reduceRunTransition({
+          ...state,
+          runtimeEvents: compatibleRuntimeEvents,
+        }, {
           type: "runtime_event",
-          event: runTerminalEvent,
+          event: runLifecycleEvent,
         });
-        nextState = reduceRunTransition(nextState, {
-          type: "runtime_event",
-          event: turnTerminalEvent,
-        });
+        if (turnTerminalEvent) {
+          nextState = reduceRunTransition(nextState, {
+            type: "runtime_event",
+            event: turnTerminalEvent,
+          });
+        }
         return {
           ...nextState,
           ...(harnessProjection === "absent"
             ? {}
             : { harnessRunMarker: harnessProjection.terminal }),
-          agentStatus: "idle",
+          turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint(
+            state.turnRuntimeCheckpoints,
+            canonicalTurnRuntimeCheckpoint,
+          ),
+          agentStatus: canonicalCompatibility.agentStatus,
           isGenerating: false,
           abortController: null,
           conversationTurns: nextState.conversationTurns.map((candidate: any) =>
             terminalTurnIds.has(candidate.id)
               ? {
                   ...candidate,
-                  status: "done",
+                  status: canonicalCompatibility.conversationTurnStatus,
                   collapsed: false,
-                  runtimeOutcome: {
-                    status: "completed",
-                    reason: input.reason,
-                    resultKind: "error",
-                    runId: terminalRunIdentity.runId,
-                    parentRunId: terminalRunIdentity.parentRunId,
-                    updatedAt: timestampMs,
-                  },
+                  runtimeOutcome: canonicalRuntimeOutcome,
                 }
               : candidate
           ),
@@ -6722,10 +7770,28 @@ export class WorkflowEngine {
       return executeAgentLoop(callbacks, abortCtrl);
     };
 
-    return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) => {
+    const executeDurablyAdmittedLoop = async (): Promise<AgentLoopOutcome> => {
+      const checkpoint = getExactTurnRuntimeCheckpoint();
+      if (!checkpoint) {
+        throw new Error("TURN_RUNTIME_CHECKPOINT_ADMISSION_REJECTED");
+      }
+      await publishTurnRuntimePlanningCheckpoint({
+        preferredDelegationScopeContract:
+          checkpoint.planning.preferredDelegationScopeContract,
+        recentPlanToolActivity: restoreDurableTurnPlanningActivities(
+          checkpoint,
+          getExactSubagentClosureReceiptLedger(),
+        ),
+        updatedAt: Date.now(),
+      });
+      return executeLoopStrategy();
+    };
+
+    return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop).then(async (loopOutcome) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
         threadId: runSessionKey,
+        sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
         parentTurnId,
       });
       if (subagentFinalization.requestedIds.length > 0 || subagentFinalization.releasedCount > 0) {
@@ -6747,7 +7813,9 @@ export class WorkflowEngine {
       });
       clearInterval(timerInterval);
       let latestState = sessionGet();
-      const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
+      const queuedAfterRun = runSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+        ? normalizeQueuedUserMessage(latestState.queuedUserMessage)
+        : null;
       const pendingPlanHandoff = latestState.pendingPlanApprovalHandoff as PlanApprovalHandoff | null;
       const pendingPlanLifecycle = latestState.planLifecycle as PlanLifecycleState | undefined;
       const pendingExecutionLease = pendingPlanLifecycle?.executionLease || null;
@@ -6817,7 +7885,7 @@ export class WorkflowEngine {
         if (!beginTerminalConclusionRun(preTerminalRunId, loopOutcome.reason)) {
           // A canonical cancellation or a newer run already owns closure. A
           // stale workflow must not append an unowned child run.
-          return true;
+          return unprojectedSettlement("terminal_conclusion_run_not_admitted", loopOutcome);
         }
       }
       // Approval is a lease boundary, not completion of the logical turn. Close
@@ -6832,7 +7900,7 @@ export class WorkflowEngine {
           turnId,
           runId: activeRuntimeRunIdentity.runId,
         });
-        return true;
+        return unprojectedSettlement("harness_ownership_lost", loopOutcome);
       }
       if (pendingMaxIterationsAutoResume && (pendingSameTurnExecution || queuedAfterRun)) {
         pendingMaxIterationsAutoResume.cancel(
@@ -6855,7 +7923,7 @@ export class WorkflowEngine {
           turnId,
           runId: activeRuntimeRunIdentity.runId,
         });
-        return true;
+        return unprojectedSettlement("terminal_projection_not_committed", loopOutcome);
       }
       const completedFinalTextForRemote = terminalProjection.finalText;
       if (remoteFeishu && completedFinalTextForRemote) {
@@ -6931,7 +7999,7 @@ export class WorkflowEngine {
               agentStatus: latest.agentStatus,
               isGenerating: latest.isGenerating,
             });
-            runAfterNextPaint(() => attemptSameTurnExecutionFallback(busyRetryAttempt + 1));
+            scheduleRuntimeTask(() => attemptSameTurnExecutionFallback(busyRetryAttempt + 1));
             return;
           }
           if (decision === "busy_retry_exhausted") {
@@ -6956,14 +8024,14 @@ export class WorkflowEngine {
             source: "workflow_fallback",
           });
         };
-        runAfterNextPaint(() => attemptSameTurnExecutionFallback(0));
+        scheduleRuntimeTask(() => attemptSameTurnExecutionFallback(0));
       } else if (queuedAfterRun) {
         if (latestState.agentStatus === "pending_review") {
           // Skip dequeuing if agentStatus is pending_review so the message stays in composer queue bar
-          return false;
+          return projectedSettlement("terminal_projection_committed_pending_review", loopOutcome);
         }
 
-        runAfterNextPaint(() => {
+        scheduleRuntimeTask(() => {
           const latest = sessionGet();
           const latestSessionKey = resolveSessionRuntimeKey(
             resolveSessionWorkspaceKey(latest.currentWorkspace),
@@ -7033,12 +8101,17 @@ export class WorkflowEngine {
         const pending = pendingMaxIterationsAutoResume;
         pendingMaxIterationsAutoResume = null;
         logStoreEvent(`${pending.kind}_max_iterations_auto_resume_scheduled`, {});
-        runAfterNextPaint(() => pending.start());
+        scheduleRuntimeTask(() => pending.start());
       }
 
-      return true;
+      return projectedSettlement("terminal_projection_committed", loopOutcome);
     }).catch(async (err: any) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      const caughtErrorOutcome: AgentLoopOutcome = {
+        status: "completed",
+        reason: errorMessage,
+        resultKind: "error",
+      };
       const alreadyCommittedRunLifecycleEvent = sessionGet().runtimeEvents.find((event: any) =>
         (isRunTerminalEvent(event) || isRunBoundaryEvent(event)) &&
         event.threadId === runSessionKey &&
@@ -7062,7 +8135,7 @@ export class WorkflowEngine {
           lifecycleEventType: alreadyCommittedRunLifecycleEvent.type,
           error: errorMessage,
         });
-        return false;
+        return projectedSettlement("terminal_projection_already_committed", caughtErrorOutcome);
       }
       const catchLifecycle = sessionGet().planLifecycle as PlanLifecycleState | undefined;
       const preservesRejectedPlanActionPause =
@@ -7091,11 +8164,15 @@ export class WorkflowEngine {
             reason: "harness_ownership_lost",
             error: errorMessage,
           });
-          return true;
+          return unprojectedSettlement(
+            "plan_action_pause_harness_ownership_lost",
+            pauseOutcome,
+          );
         }
         const parentTurnId = context.uiDisplayTurnId || turnId;
         const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
           threadId: runSessionKey,
+          sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
           parentTurnId,
         }).catch(() => null);
         if (subagentFinalization) {
@@ -7123,7 +8200,9 @@ export class WorkflowEngine {
           triggerError: errorMessage,
           committed: pauseProjection.committed,
         });
-        return !pauseProjection.committed;
+        return pauseProjection.committed
+          ? projectedSettlement("plan_action_pause_projection_committed", pauseOutcome)
+          : unprojectedSettlement("plan_action_pause_projection_not_committed", pauseOutcome);
       }
       if (alreadyCommittedRunLifecycleEvent?.type === "run.paused") {
         beginTerminalConclusionRun(
@@ -7131,11 +8210,7 @@ export class WorkflowEngine {
           "terminal_error_after_paused_run",
         );
       }
-      const errorOutcome: AgentLoopOutcome = {
-        status: "completed",
-        reason: errorMessage,
-        resultKind: "error",
-      };
+      const errorOutcome = caughtErrorOutcome;
       const errorHarnessProjection = projectCurrentHarnessRunMarker(
         "error",
         "agent_loop_error_conclusion",
@@ -7149,11 +8224,12 @@ export class WorkflowEngine {
           runId: activeRuntimeRunIdentity.runId,
           error: errorMessage,
         });
-        return true;
+        return unprojectedSettlement("error_harness_ownership_lost", errorOutcome);
       }
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
         threadId: runSessionKey,
+        sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
         parentTurnId,
       }).catch(() => null);
       if (subagentFinalization) {
@@ -7233,7 +8309,9 @@ export class WorkflowEngine {
         }).catch(() => {});
       }
 
-      return false;
+      return terminalProjection.committed
+        ? projectedSettlement("error_projection_committed", errorOutcome)
+        : unprojectedSettlement("error_projection_not_committed", errorOutcome);
     });
   }
 }

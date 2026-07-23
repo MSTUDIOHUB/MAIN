@@ -62,8 +62,10 @@ const {
   applyReasoningNoToolPlanRuntimeState,
   applyToolResultPlanRuntimeState,
   createPlanLoopRuntimeState,
+  getPlanVisibleQualityPromptCount,
   markPlanClosurePromptIssued,
   markPlanModeToolActivity,
+  recordPlanVisibleQualityPrompt,
   resetPlanRecoveryPromptRuntimeState,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/planRuntimeState.ts"),
@@ -81,6 +83,7 @@ function createFixtureState() {
     planEvidenceRecoveryPasses: 1,
     planEvidenceNoProgressPasses: 2,
     planEvidenceProgressFingerprint: "",
+    planVisibleQualityPromptBudget: [],
     planReasoningOnlyRecoveryPasses: 3,
     planAutoScaffoldPromptIssued: true,
     planDraftingRecoveryReadCount: 4,
@@ -146,6 +149,14 @@ test("plan phase reducer keeps no-op transitions stable but logs reasoned repeat
 });
 
 test("Plan phase transitions keep review and blocked terminal within one run", () => {
+  assert.deepEqual(resolvePlanRuntimePhaseTransition({
+    current: "explore_structure",
+    next: "needs_rewrite",
+  }), { allowed: true });
+  assert.deepEqual(resolvePlanRuntimePhaseTransition({
+    current: "grounding",
+    next: "needs_rewrite",
+  }), { allowed: true });
   assert.deepEqual(resolvePlanRuntimePhaseTransition({
     current: "drafting",
     next: "needs_rewrite",
@@ -267,4 +278,18 @@ test("plan runtime action helpers own activity, closure, and recovery prompt fla
   const withRecoveryPromptReset = resetPlanRecoveryPromptRuntimeState(state);
   assert.equal(withRecoveryPromptReset.usedPlanRecoveryPrompt, false);
   assert.equal(resetPlanRecoveryPromptRuntimeState(withRecoveryPromptReset), withRecoveryPromptReset);
+});
+
+test("visible quality prompt budget is keyed by quality signature and evidence epoch", () => {
+  const qualityA = { signature: "rewrite|not_structured", evidenceEpochHash: "bundle-1" };
+  const qualityB = { signature: "rewrite|missing_test_plan", evidenceEpochHash: "bundle-1" };
+  const nextEvidenceEpoch = { ...qualityA, evidenceEpochHash: "bundle-2" };
+
+  let budget = recordPlanVisibleQualityPrompt([], qualityA);
+  budget = recordPlanVisibleQualityPrompt(budget, qualityB);
+  budget = recordPlanVisibleQualityPrompt(budget, qualityA);
+
+  assert.equal(getPlanVisibleQualityPromptCount(budget, qualityA), 2);
+  assert.equal(getPlanVisibleQualityPromptCount(budget, qualityB), 1);
+  assert.equal(getPlanVisibleQualityPromptCount(budget, nextEvidenceEpoch), 0);
 });

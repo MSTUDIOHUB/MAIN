@@ -18,7 +18,7 @@ export interface StreamingAssistantDisplayInput {
 }
 
 const PARTIAL_PROTOCOL_RE =
-  /(?:<\s*\/?\s*(?:tool_use|tool_call|function_call|tool|parameter|user_options|option|proposed_plan)\b|^\s*\[\s*(?:PROPOSAL|START[_\s-]*PROPOSAL|END[_\s-]*PROPOSAL)\b)/i;
+  /(?:<\s*\/?\s*(?:tool_use|tool_call|function_call|tool|parameter|user_options|option|plan_candidate|proposed_plan)\b|^\s*\[\s*(?:PROPOSAL|START[_\s-]*PROPOSAL|END[_\s-]*PROPOSAL)\b)/i;
 const VISUAL_OBSERVATION_START_RE = /<!--\s*MAIN_VISUAL_OBSERVATION\b/i;
 const VISUAL_OBSERVATION_COMPLETE_RE = /<!--\s*MAIN_VISUAL_OBSERVATION\b[\s\S]*?-->/i;
 const MARKDOWN_STRUCTURE_RE = /(?:^|\n)\s*(?:#{1,6}\s+\S+|[-*]\s+\S+|\d+[.)、]\s+\S+|\|.+\|)\s*/;

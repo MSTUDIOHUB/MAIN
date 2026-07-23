@@ -60,6 +60,11 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/workspaceInstructionProjection.ts"),
 );
+const {
+  shouldDeferWorkspaceInstructionDispatchForActiveOwner,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/store/workspaceInstructionApproval.ts"),
+);
 
 const sessionKey = "/repo::session-7";
 const sessionEpoch = "session-epoch-7";
@@ -186,6 +191,61 @@ test("strict FIFO dispatch removes only the terminal head before advancing", () 
   assert.equal(state.entries.length, 1);
   assert.equal(state.entries[0].receipt.turnId, "turn-b");
   assert.equal(state.entries[0].claim.claimId, "claim-b");
+});
+
+test("pending review keeps durable A/B queued, then dispatches each exactly once in FIFO order", () => {
+  let state = createWorkspaceTurnQueueState({ sessionKey, sessionEpoch });
+  state = append(state, "a", 100);
+  state = commit(state, "a", 101);
+  state = append(state, "b", 102);
+  state = commit(state, "b", 103);
+  const dispatchOrder = [];
+  let legacyLatestWinsSlot = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const deferred = shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+      isGenerating: attempt === 0,
+      agentStatus: "pending_review",
+      hasPendingActionRequest: true,
+      hasExactPendingReviewActionDecision: false,
+      cancellationFenceFailed: false,
+    });
+    if (!deferred) {
+      legacyLatestWinsSlot = state.entries[0].instruction.payload.text;
+    }
+  }
+
+  assert.equal(legacyLatestWinsSlot, null);
+  assert.deepEqual(state.entries.map((entry) => [
+    entry.instruction.clientSubmissionId,
+    entry.status,
+  ]), [["a", "queued"], ["b", "queued"]]);
+
+  for (const expectedId of ["a", "b"]) {
+    assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+      isGenerating: false,
+      agentStatus: "idle",
+      hasPendingActionRequest: false,
+      hasExactPendingReviewActionDecision: false,
+      cancellationFenceFailed: false,
+    }), false);
+    state = claim(state, `claim-${expectedId}`, state.updatedAt + 1);
+    const head = state.entries[0];
+    dispatchOrder.push(head.instruction.clientSubmissionId);
+    state = apply(state, {
+      type: "ack",
+      expectedVersion: state.version,
+      at: state.updatedAt + 1,
+      claimId: `claim-${expectedId}`,
+      sessionKey,
+      sessionEpoch,
+      turnOwner: ownerForEntry(head),
+    });
+  }
+
+  assert.deepEqual(dispatchOrder, ["a", "b"]);
+  assert.equal(new Set(dispatchOrder).size, 2);
+  assert.equal(state.entries.length, 0);
 });
 
 test("a Run admission acknowledges its exact head without waiting for Turn terminality", () => {
@@ -646,6 +706,28 @@ test("Turn projection rejects unknown intent strings without granting a runtime 
   assert.equal(turn.intent, "respond");
   assert.equal(turn.displayIntent, "respond");
   assert.equal(turn.mode, "chat");
+});
+
+test("ordinary repair instructions project as Execute before authoritative dispatch", () => {
+  const repairInstruction = instruction("execute-projection", 148, {
+    payload: {
+      text: "找到根本原因，修复底层操作顺序，并运行真实验证确认完成。",
+      dispatchHints: {
+        subagentPreference: "unspecified",
+      },
+    },
+  });
+  const turn = buildWorkspaceInstructionConversationTurn({
+    instruction: repairInstruction,
+    receipt: receipt("execute-projection", 148),
+    language: "zh",
+  });
+
+  assert.equal(turn.intent, "execute");
+  assert.equal(turn.displayIntent, "execute");
+  assert.equal(turn.mode, "edit");
+  assert.notEqual(turn.title.trim(), "");
+  assert.equal(turn.status, "planning");
 });
 
 test("projection recovery is idempotent and fails closed on exact ID collisions", () => {

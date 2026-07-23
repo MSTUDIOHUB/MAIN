@@ -162,7 +162,7 @@ test("nonstandard but complete proposed plan does not enter quality recovery", (
     "- `src/components/Dashboard/OverviewCards.tsx`",
     "",
     "## Validation",
-    "- 运行相关 Node/Vitest 测试。",
+    "- 运行 `node --test tests/node/dashboard-store.test.mjs`；命令必须以 0 退出并覆盖 CSV 导入后指标刷新。",
     "- 手动导入 CSV 并确认 Dashboard 指标刷新。",
   ].join("\n");
 
@@ -225,7 +225,7 @@ test("generic fallback plan escalates to auto scaffold", () => {
   assert.equal(result.recoveryAction, "auto_scaffold");
 });
 
-test("a flexible plan only repairs the missing semantic validation contract", () => {
+test("a flexible plan does not fabricate a missing semantic validation contract", () => {
   const plan = [
     "# CSV Dashboard 修复计划",
     "",
@@ -250,7 +250,7 @@ test("a flexible plan only repairs the missing semantic validation contract", ()
   const initial = validateActionablePlanArtifact(plan);
   assert.equal(initial.ok, false);
   assert.equal(initial.recoveryAction, "rewrite");
-  assert.ok(initial.canAutoRepair === true);
+  assert.equal(initial.canAutoRepair, false);
   assert.deepEqual(initial.missingSections, ["validation"]);
 
   const repaired = repairActionablePlanArtifactContent({
@@ -260,9 +260,9 @@ test("a flexible plan only repairs the missing semantic validation contract", ()
     language: "zh",
   });
 
-  assert.deepEqual(repaired.repairedSections, ["validation"]);
-  assert.equal(validateActionablePlanArtifact(repaired.content).ok, true);
-  assert.match(repaired.content, /## 验证标准/);
+  assert.deepEqual(repaired.repairedSections, []);
+  assert.equal(validateActionablePlanArtifact(repaired.content).ok, false);
+  assert.doesNotMatch(repaired.content, /## 验证标准/);
   assert.doesNotMatch(repaired.content, /## 公共 API \/ 接口 \/ 类型/);
 });
 

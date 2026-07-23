@@ -23,7 +23,10 @@ import {
   type StreamSettings,
   type StreamResult,
 } from "./streaming";
-import { type ToolDefinition } from "./toolSchemas";
+import {
+  SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+  type ToolDefinition,
+} from "./toolSchemas";
 import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import { executeTool } from "./toolExecutor";
 import { computeContextTokenBreakdown, estimateMessagesTokens, estimateTokens, manageContext, type TrimMessage } from "./contextTrim";
@@ -90,7 +93,6 @@ import {
 } from "./orchestrator/unityDiagnostics";
 import {
   buildPlanRecoveryPromptFromContext,
-  resolvePlanClosureArtifactKind,
 } from "./orchestrator/planOrchestration";
 import {
   detectRequestedRootMarkdownDeliverables,
@@ -199,6 +201,7 @@ import {
 } from "./providerCompatibility";
 import {
   latestVisualContextIsModelVisible,
+  resolveTurnVisualPayloadBinding,
 } from "./visualContext";
 import {
   getProtocolInstructionProfile,
@@ -241,7 +244,6 @@ import {
 import { normalizeToolCallForExecution } from "./toolCallNormalization";
 import {
   appendTrustedValidationCommandsToPlan,
-  composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
@@ -260,10 +262,24 @@ import {
   browserResultLooksSuccessful,
   buildPlanEvidenceBundle,
   commandResultLooksSuccessful,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
   resolveStructuredDesktopAutomationOutcome,
   type PlanEvidenceBundle,
 } from "./planEvidence";
+import { createPlanAuthoringContract } from "./planAuthoringContract";
+import { buildPlanSubmissionGuidance } from "./planSubmissionGuidance";
+import {
+  createRuntimeSynthesizedPlanCandidate,
+  hasTypedPlanDraftEnvelope,
+} from "./planDraftIngress";
+import type { PlanCandidateRepairCheckpoint } from "./planCandidateRepair";
+import {
+  derivePlanTasksFromCandidate,
+  sealPlanCandidate,
+  validateSealedPlanCandidate,
+  type PlanCandidateV2,
+} from "./planContract";
 import { compactStructuredCommandResult } from "./commandValidationOutcome";
 import { VERIFICATION_TOOL_NAMES } from "./verificationEvidence";
 import {
@@ -280,8 +296,13 @@ import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
 import { canApplyShellAutoReview, resolveShellAutoApproval } from "./shellAutoApproval";
 import {
+  assessPlanEvidenceReadiness,
   isPlanReadOnlyToolName,
 } from "./planReadOnlyConvergence";
+import {
+  derivePlanEvidenceObligations,
+  formatPlanEvidenceObligation,
+} from "./planEvidenceObligations";
 import {
   filterPlanToolNamesForRuntimePhase,
 } from "./planRuntime";
@@ -427,8 +448,8 @@ export function planUnsupportedToolFeedbackMessage(input: {
     }
     if (phase === "drafting" || phase === "synthesis" || phase === "needs_rewrite" || phase === "review_ready" || phase === "blocked") {
       return input.language === "zh"
-        ? `PLAN_DRAFTING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，工具面已关闭。不要继续调用 ${input.toolName}；请基于冻结的证据包直接输出可审阅 Markdown，MAIN runtime 会负责校验并原子物化 .MAIN/plans/plan.md。`
-        : `PLAN_DRAFTING_TOOL_BLOCKED: The ${phase} phase has a closed tool surface. Do not call ${input.toolName}; return reviewable Markdown from the frozen evidence bundle and MAIN runtime will validate and atomically materialize .MAIN/plans/plan.md.`;
+        ? `PLAN_DRAFTING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，不能调用 ${input.toolName}。请严格遵循最新的 [PLAN AUTHORING CONTRACT] 与当前 ${SUBMIT_PLAN_CANDIDATE_TOOL_NAME} schema；当前 schema 决定本轮接收完整 typed graph 还是有界局部 repair patch。MAIN runtime 负责校验与原子渲染 .MAIN/plans/plan.md。真正阻塞的用户选择仍用 <user_options>。`
+        : `PLAN_DRAFTING_TOOL_BLOCKED: The ${phase} phase cannot call ${input.toolName}. Follow the latest [PLAN AUTHORING CONTRACT] and the active ${SUBMIT_PLAN_CANDIDATE_TOOL_NAME} schema exactly; that active schema determines whether this turn accepts a complete typed graph or a bounded local repair patch. MAIN runtime owns validation and atomic rendering of .MAIN/plans/plan.md. A genuinely blocking user choice still uses <user_options>.`;
     }
     if ((phase === "grounding" || phase === "needs_evidence" || phase === "explore_structure") && !readOnly) {
       return input.language === "zh"
@@ -541,9 +562,10 @@ export function getSessionTaskTargetingEvidence(sessionKey: string): Set<string>
 }
 
 /**
- * Returns true if a mutation targets a spec file inside `.MAIN/plans/`.
- * These are auto-executed in Plan Mode, but the allowed file set depends
- * on the current plan stage.
+ * Legacy artifact classifier retained for import/restore and for identifying
+ * model attempts to mutate runtime-owned Plan files. A true result is not an
+ * authorization: typed Plan authoring must use the active submission transport
+ * declared by the latest Plan authoring contract.
  */
 function getPlanArtifactMutationTargets(name: string, args: Record<string, unknown>): Array<{ path: string; fileName: string }> {
   if (!PLAN_ARTIFACT_MUTATION_TOOLS.has(name)) return [];
@@ -1374,6 +1396,10 @@ export type ContentPart = TextContentPart | ImageUrlContentPart;
 export interface AgentMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | ContentPart[];
+  /** Runtime-only Turn owner for exact multimodal transport receipts. */
+  runtimeTurnId?: string;
+  runtimeVisualImageParts?: number;
+  runtimeVisualPayloadDigest?: string;
   tool_calls?: ToolCallInMessage[];
   tool_call_id?: string;
   reasoning_content?: string;
@@ -1442,6 +1468,8 @@ export interface OrchestratorCallbacks {
   getSubagentDepth?: () => number;
   getSubagentScope?: () => import("./subagents").SubagentExecutionScope | null;
   getRuntimeTraceContext?: () => import("./subagents").RuntimeTraceContext;
+  /** Exact owner-fenced checkpoint for the active Turn. */
+  getTurnRuntimeCheckpoint?: () => import("./turnRuntimeCheckpoint").TurnRuntimeCheckpointV1 | null;
   getSnapshotContextLimit?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
@@ -1479,7 +1507,7 @@ export interface OrchestratorCallbacks {
   getIsApprovedPlanExecutionTransitionPending?: () => boolean;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
-  onGuidanceInjected?: (text: string) => void;
+  onGuidanceInjected?: (guidance: { id: string; text: string; turnId: string | null }) => void;
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
@@ -1571,7 +1599,12 @@ export interface OrchestratorCallbacks {
     reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan",
     progress?: Partial<PlanExecutionProgressUpdate>,
   ) => void;
-  onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
+  onPlanArtifactUpdated: (
+    path: string,
+    content: string,
+    kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
+    metadata?: { candidate?: PlanCandidateV2 },
+  ) => void;
   onPlanArtifactRejected?: (
     path: string,
     kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
@@ -1654,6 +1687,8 @@ export interface OrchestratorCallbacks {
       toolCallId?: string;
       executionName?: string;
       catalogIdentity?: ToolCatalogIdentity;
+      /** Runtime-owned final arguments after compatibility normalization. */
+      executedArgs?: Record<string, unknown>;
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
@@ -1855,8 +1890,7 @@ const PROSE_CODE_DUMP_MIN_CHARS = 12_000;
 const PROSE_CODE_DUMP_LARGE_CHARS = 32_000;
 export const MAX_NO_ACTION_RETRIES = 2;
 const PLAN_EXPLORATION_REPEAT_READ_LIMIT = 1;
-export const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
-export const PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
+export const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
 export const MAX_NO_PROGRESS_LOOP_REPEATS = 5;
 export const MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS = 2;
 export const MAX_CONSECUTIVE_READ_FILE_CALLS = 3;
@@ -2156,13 +2190,30 @@ export function collectPlanClosureMaterializationInput(
     .map((item) => {
       const summary = item.detail || "";
       const facts = item.facts || [];
-      const hashInput = [item.name, item.target, summary, ...facts].filter(Boolean).join("\n");
+      const structuredFacts = item.structuredFacts || [];
+      const sourceObservations = item.sourceObservations || [];
+      const hashInput = [
+        item.name,
+        item.target,
+        summary,
+        ...facts,
+        JSON.stringify(structuredFacts),
+        JSON.stringify(sourceObservations.map((observation) => ({
+          path: observation.path,
+          startLine: observation.startLine,
+          endLine: observation.endLine,
+          excerptHash: observation.excerptHash,
+          versionToken: observation.versionToken,
+        }))),
+      ].filter(Boolean).join("\n");
       return {
         tool: item.name,
         target: item.target,
         status: "succeeded",
         ...(summary ? { summary } : {}),
         ...(facts.length > 0 ? { facts } : {}),
+        ...(structuredFacts.length > 0 ? { structuredFacts } : {}),
+        ...(sourceObservations.length > 0 ? { sourceObservations } : {}),
         hash: stableProgressHash(hashInput),
       };
     });
@@ -2348,6 +2399,7 @@ interface FetchLLMStreamOptions {
   responseFormat?: Record<string, unknown>;
   workflowMode?: string;
   runtimeIntent?: string;
+  visualTransportBinding?: import("./visualContext").VisualTransportRequestBinding;
 }
 
 export function permitsConfiguredMaxOutputEscalation(
@@ -2525,6 +2577,27 @@ export async function fetchLLMStream(
   options: FetchLLMStreamOptions = {},
 ): Promise<StreamResult> {
   let fullText = "";
+  const turnRuntimeCheckpoint = callbacks.getTurnRuntimeCheckpoint?.() || null;
+  const canonicalRunIdentity = turnRuntimeCheckpoint?.canonical.run?.identity || null;
+  const visualTransportBinding = options.visualTransportBinding || (
+    turnRuntimeCheckpoint &&
+    canonicalRunIdentity &&
+    turnRuntimeCheckpoint.owner.sessionKey === callbacks.getSessionKey() &&
+    canonicalRunIdentity.sessionKey === turnRuntimeCheckpoint.owner.sessionKey &&
+    canonicalRunIdentity.sessionEpoch === turnRuntimeCheckpoint.owner.sessionEpoch &&
+    canonicalRunIdentity.turnId === turnRuntimeCheckpoint.owner.turnId
+      ? resolveTurnVisualPayloadBinding(messages, {
+          owner: {
+            sessionKey: canonicalRunIdentity.sessionKey,
+            sessionEpoch: canonicalRunIdentity.sessionEpoch,
+            turnId: canonicalRunIdentity.turnId,
+            runId: canonicalRunIdentity.runId,
+            attemptId: canonicalRunIdentity.attemptId,
+          },
+          expectedImageParts: turnRuntimeCheckpoint.input.admittedUserContext.imageParts,
+        }) || undefined
+      : undefined
+  );
   // P1: Constrain local output length while retaining room for provider-reported hidden reasoning.
   const isLocal = isLocalProfile(settings);
   let currentMaxTokens: number;
@@ -2697,6 +2770,7 @@ export async function fetchLLMStream(
           {
             toolChoice: options.toolChoice,
             responseFormat: options.responseFormat,
+            visualTransportBinding,
           },
         ).catch((err) => {
           safeReject(err instanceof Error ? err : new Error(getErrorMessage(err, "LLM stream failed")));
@@ -2945,6 +3019,10 @@ interface PlanMaterializationResultForLoop {
   reason?: string;
   source?: PlanMaterializationSource;
   quality?: PlanArtifactQualityResult;
+  evidenceBundleHash?: string;
+  candidate?: PlanCandidateV2;
+  candidateRepairCheckpoint?: PlanCandidateRepairCheckpoint;
+  candidateRepairExhausted?: boolean;
   toolResult?: ToolExecutionResult;
   /** Extracted reply options from <user_options> blocks. */
   replyOptions?: string[];
@@ -3004,14 +3082,40 @@ async function prepareExecutablePlanCandidate(input: {
     path: materialized.path,
     content: materialized.content,
   });
-  const tasks = deriveRuntimePlanTasksFromArtifacts([artifact], {
-    language: input.callbacks.getPreferredLanguage(),
-  });
+  const typedRuntimeAuthority = materialized.candidate?.ingress === "typed_runtime" ||
+    materialized.candidate?.ingress === "runtime_synthesized";
+  const tasks = typedRuntimeAuthority
+    ? derivePlanTasksFromCandidate(materialized.candidate!)
+    : deriveRuntimePlanTasksFromArtifacts([artifact], {
+        language: input.callbacks.getPreferredLanguage(),
+      });
   const assessment = assessPlanExecutableValidation({
     planArtifacts: [artifact],
     executionPlanTasks: tasks,
   });
-  if (!assessment.missing) return { ...materialized, repaired: false };
+  if (!assessment.missing) {
+    if (!materialized.candidate) return { ...materialized, repaired: false };
+    const candidate = sealPlanCandidate({
+      candidate: materialized.candidate,
+      content: materialized.content,
+      runtimeTasks: tasks,
+    });
+    const failures = validateSealedPlanCandidate({
+      candidate,
+      expectedContent: materialized.content,
+      expectedBundleHash: materialized.evidenceBundleHash,
+    });
+    return failures.length === 0
+      ? { ...materialized, candidate, repaired: false }
+      : rejectExecutablePlanCandidate(`typed_plan_contract_invalid:${failures.join(",")}`);
+  }
+
+  if (typedRuntimeAuthority) {
+    // A typed proposal must carry an acceptance-capable primitive itself.
+    // Manifest/Markdown repair is a legacy compatibility path and must never
+    // manufacture authority missing from a new runtime candidate.
+    return rejectExecutablePlanCandidate("typed_plan_executable_validation_missing");
+  }
 
   let packageManifest: string;
   try {
@@ -3083,6 +3187,24 @@ async function prepareExecutablePlanCandidate(input: {
     return rejectExecutablePlanCandidate("executable_validation_task_missing");
   }
 
+  const sealedCandidate = materialized.candidate
+    ? sealPlanCandidate({
+        candidate: materialized.candidate,
+        content: repair.content,
+        runtimeTasks: repairedTasks,
+      })
+    : undefined;
+  if (sealedCandidate) {
+    const failures = validateSealedPlanCandidate({
+      candidate: sealedCandidate,
+      expectedContent: repair.content,
+      expectedBundleHash: materialized.evidenceBundleHash,
+    });
+    if (failures.length > 0) {
+      return rejectExecutablePlanCandidate(`typed_plan_contract_invalid:${failures.join(",")}`);
+    }
+  }
+
   logAgentEvent("plan_manifest_validation_repaired", {
     path: materialized.path,
     command: commandResolution.commands[0]?.command || "",
@@ -3092,6 +3214,7 @@ async function prepareExecutablePlanCandidate(input: {
   return {
     ...materialized,
     content: repair.content,
+    ...(sealedCandidate ? { candidate: sealedCandidate } : {}),
     source: "manifest_validation_repaired_plan",
     repaired: true,
   };
@@ -3106,6 +3229,8 @@ async function writeMaterializedPlanArtifact(input: {
     reason?: string;
     source?: PlanMaterializationSource;
     quality?: PlanArtifactQualityResult;
+    evidenceBundleHash?: string;
+    candidate?: PlanCandidateV2;
   };
   workspace: string;
   callbacks: OrchestratorCallbacks;
@@ -3173,6 +3298,7 @@ async function writeMaterializedPlanArtifact(input: {
           message,
           error: error instanceof Error ? error.message : String(error || ""),
         }),
+        candidate: materialized.candidate,
       },
     );
     input.callbacks.onToolDone("write_file", materialized.path, resultStr, { toolCallId });
@@ -3182,6 +3308,8 @@ async function writeMaterializedPlanArtifact(input: {
       kind: materialized.kind,
       content: materialized.content,
       source: materialized.source,
+      evidenceBundleHash: materialized.evidenceBundleHash,
+      candidate: materialized.candidate,
       toolResult: {
         toolCallId,
         name: "write_file",
@@ -3229,9 +3357,16 @@ export async function prepareReviewablePlanArtifactForReview(input: {
 }): Promise<ReviewablePlanPreparationResult> {
   const artifacts = input.callbacks.getPlanArtifacts?.() || [];
   if (artifacts.length === 0) return { ok: true, repaired: false };
-  const tasks = deriveRuntimePlanTasksFromArtifacts(artifacts, {
-    language: input.callbacks.getPreferredLanguage(),
-  });
+  const typedTasks = artifacts.flatMap((artifact) =>
+    artifact.candidate?.state === "sealed"
+      ? derivePlanTasksFromCandidate(artifact.candidate)
+      : []
+  );
+  const tasks = typedTasks.length > 0
+    ? typedTasks
+    : deriveRuntimePlanTasksFromArtifacts(artifacts, {
+        language: input.callbacks.getPreferredLanguage(),
+      });
   const assessment = assessPlanExecutableValidation({
     planArtifacts: artifacts,
     executionPlanTasks: tasks,
@@ -3255,6 +3390,12 @@ export async function prepareReviewablePlanArtifactForReview(input: {
       path: artifact.path,
       content: artifact.content,
       source: "visible_plan",
+      ...(artifact.candidate
+        ? {
+            candidate: artifact.candidate,
+            evidenceBundleHash: artifact.candidate.bundleHash,
+          }
+        : {}),
     },
     workspace: input.workspace,
     callbacks: input.callbacks,
@@ -3464,11 +3605,11 @@ export function appendPlanRepeatReadLimitGuidance(
 ): string {
   const guidance = language === "zh"
     ? stage === "requirements"
-      ? "PLAN_REPEAT_READ_LIMIT: 你正在计划阶段重复读取已经缓存且未变化的上下文。请停止重复读取，直接基于 requirements.md 和已有文件上下文输出可见 `<proposed_plan>`；如果存在真正由用户决定的阻塞分叉，再用 `<user_options>` 提问并立刻停止。"
-      : "PLAN_REPEAT_READ_LIMIT: 你正在重复读取已经缓存且未变化的上下文。请停止重复读取，输出可见 `<proposed_plan>`；只有真正阻塞的用户决策才能使用 `<user_options>`。"
+      ? `PLAN_REPEAT_READ_LIMIT: 你正在计划阶段重复读取已经缓存且未变化的上下文。请停止重复读取，直接基于 requirements.md 和已有文件上下文提交完整 typed graph；如果存在真正由用户决定的阻塞分叉，再用 <user_options> 提问并立刻停止。${buildPlanSubmissionGuidance("zh")}`
+      : `PLAN_REPEAT_READ_LIMIT: 你正在重复读取已经缓存且未变化的上下文。请停止重复读取并提交完整 typed graph；只有真正阻塞的用户决策才能使用 <user_options>。${buildPlanSubmissionGuidance("zh")}`
     : stage === "requirements"
-    ? "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads during planning. Stop rereading files and output visible `<proposed_plan>` from requirements.md and existing context; use `<user_options>` only for a genuinely blocking user-owned decision."
-    : "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads. Stop rereading and output visible `<proposed_plan>`; use `<user_options>` only for a genuinely blocking user-owned decision.";
+    ? `PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads during planning. Stop rereading files and submit the complete typed graph from requirements.md and existing context; use <user_options> only for a genuinely blocking user-owned decision. ${buildPlanSubmissionGuidance("en")}`
+    : `PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads. Stop rereading and submit the complete typed graph; use <user_options> only for a genuinely blocking user-owned decision. ${buildPlanSubmissionGuidance("en")}`;
   return `${content}\n\n${guidance}`;
 }
 
@@ -4369,6 +4510,7 @@ async function executeToolCallWithLifecycle(
       planTasks: callbacks.getPlanTasks(),
       subagentScope: callbacks.getSubagentScope?.() ?? null,
       threadId: callbacks.getSessionKey(),
+      sessionEpoch: callbacks.getTurnRuntimeCheckpoint?.()?.owner.sessionEpoch,
     });
     if (!argumentAuthorization.allowed) {
       const commandScope = argumentAuthorization.approvedPlanCommandScope;
@@ -4772,6 +4914,8 @@ async function executeToolCallWithLifecycle(
           toolCallId: tc.id,
           executionName,
           catalogIdentity,
+          executedArgs: resolvedArgs,
+          evidenceResult: resultStr,
           failureKind: "actual",
         });
         const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4839,6 +4983,8 @@ async function executeToolCallWithLifecycle(
           toolCallId: tc.id,
           executionName,
           catalogIdentity,
+          executedArgs: resolvedArgs,
+          evidenceResult: resultStr,
           failureKind: "actual",
         });
         const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -4987,6 +5133,8 @@ async function executeToolCallWithLifecycle(
         toolCallId: tc.id,
         executionName,
         catalogIdentity,
+        executedArgs: resolvedArgs,
+        evidenceResult: resultStr,
         failureKind: "actual",
       });
       const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
@@ -5153,10 +5301,10 @@ async function executeToolCallWithLifecycle(
 
         const feedbackMessage = language === "zh"
           ? shouldUseInternalFeedback
-            ? `[WARNING] 检测到模型直接写入的计划候选 ${path}，但当前内容未达到可审批质量（原因：${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要继续直接写计划文件；请输出可见 \`<proposed_plan>\` 补齐缺失章节，并确保每个改动有具体依据。${recoveryHintZh}`
+            ? `[WARNING] 检测到模型直接写入的计划候选 ${path}，但当前内容未达到可审批质量（原因：${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要继续直接写计划文件；请提交完整 typed graph，并确保每个改动有具体证据引用。${buildPlanSubmissionGuidance("zh")}${recoveryHintZh}`
             : `[WARNING] ${path} 已成功写入并保存到磁盘。但是，其内容不像可审批的正式计划（原因：${validation.reason || "质量不足"}）。`
           : shouldUseInternalFeedback
-          ? `[WARNING] A model-authored plan file candidate was detected at ${path}, but it does not meet reviewable quality (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not keep writing the plan file directly; output a visible \`<proposed_plan>\` with the missing sections and concrete evidence. ${recoveryHintEn}`
+          ? `[WARNING] A model-authored plan file candidate was detected at ${path}, but it does not meet reviewable quality (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not keep writing the plan file directly; submit the complete typed graph with concrete evidence references. ${buildPlanSubmissionGuidance("en")} ${recoveryHintEn}`
           : `[WARNING] ${path} has been successfully written and saved to disk. However, the content does not look like a reviewable plan artifact (${validation.reason || "quality gate"}).`;
 
         finalContent = `${modelContent}\n\n${feedbackMessage}`;
@@ -5171,10 +5319,49 @@ async function executeToolCallWithLifecycle(
       }
     }
 
+    if (
+      resolvedPlanArtifactUpdate?.kind === "plan" &&
+      planArtifactAccepted
+    ) {
+      const prepared = tc.preparedPlanArtifact;
+      const typedCommitMismatch = !prepared ||
+        canonicalizePlanArtifactPath(prepared.path) !== resolvedPlanArtifactUpdate.path ||
+        prepared.content !== resolvedPlanArtifactUpdate.content ||
+        prepared.candidate.state !== "sealed" ||
+        prepared.candidate.bundleHash !== prepared.evidenceBundleHash;
+      if (typedCommitMismatch) {
+        planArtifactAccepted = false;
+        isInternalFeedback = true;
+        finalQualityGateReason = "typed_plan_commit_authority_missing_or_mismatched";
+        finalPlanRecoveryAction = "rewrite";
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? "[WARNING] 计划文件虽然已写入磁盘，但其最终字节与写前密封的 typed Plan 权限不一致，因此没有发布到 Session、没有创建审批，也没有替换任务图。请基于当前证据重新输出一个完整可见计划候选。"
+          : "[WARNING] The plan file was written, but its final bytes do not match the sealed typed Plan authority prepared before the write. MAIN did not publish it to the Session, create approval, or replace the task graph. Re-emit one complete visible Plan candidate from the current evidence.";
+        finalContent = `${finalContent}\n\n${message}`;
+        finalDisplayContent = `${finalDisplayContent}\n\n${message}`;
+        callbacks.onPlanArtifactRejected?.(
+          resolvedPlanArtifactUpdate.path,
+          "plan",
+          finalQualityGateReason,
+        );
+        logAgentEvent("plan_artifact_typed_commit_rejected", {
+          path: resolvedPlanArtifactUpdate.path,
+          tool: tc.name,
+          hasPreparedAuthority: !!prepared,
+          contentMatches: prepared?.content === resolvedPlanArtifactUpdate.content,
+          candidateState: prepared?.candidate.state || null,
+          storePublished: false,
+        });
+      }
+    }
+
     if (resolvedPlanArtifactUpdate && planArtifactAccepted) {
       commitResolvedPlanArtifactUpdate(
         resolvedPlanArtifactUpdate,
         planArtifactSyncCallbacks,
+        tc.preparedPlanArtifact
+          ? { candidate: tc.preparedPlanArtifact.candidate }
+          : undefined,
       );
     }
 
@@ -5200,17 +5387,20 @@ async function executeToolCallWithLifecycle(
         }
       : undefined;
     callbacks.onToolDone(tc.name, completedTarget, finalDisplayContent, {
-      toolCallId: tc.id,
-      executionName,
-      catalogIdentity,
-      diff: completedDiffPreview,
-      ...(isInternalFeedback ? { internalFeedback: true } : {}),
-      ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
       ...(
-        tc.name === "browser_evaluate" || tc.name === "computer_use" || tc.name === "apply_patch"
+        tc.name === "browser_evaluate"
+          ? { evidenceResult: resultStr }
+          : tc.name === "computer_use" || tc.name === "run_command" || tc.name === "apply_patch"
           ? { evidenceResult: resultStr }
           : {}
       ),
+      toolCallId: tc.id,
+      executionName,
+      catalogIdentity,
+      executedArgs: resolvedArgs,
+      diff: completedDiffPreview,
+      ...(isInternalFeedback ? { internalFeedback: true } : {}),
+      ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
     });
     return {
       toolCallId: tc.id,
@@ -5314,6 +5504,8 @@ async function executeToolCallWithLifecycle(
       toolCallId: tc.id,
       executionName,
       catalogIdentity,
+      executedArgs: resolvedArgs,
+      evidenceResult: errorMsg,
       ...(failedMutationDiff ? { diff: failedMutationDiff } : {}),
       ...(failedMutationEvidence ? { workspaceMutationEvidence: failedMutationEvidence } : {}),
       failureKind: "actual",
@@ -5351,6 +5543,40 @@ async function executeToolCallWithLifecycle(
   }
 }
 
+function assessPlanMaterializationReadiness(input: {
+  userGoal: string;
+  recentToolActivity: PlanToolActivitySummary[];
+  turnContext?: TurnInputContextSignals;
+  hasGroundedVisualContext: boolean;
+}): {
+  ready: boolean;
+  status: ReturnType<typeof assessPlanEvidenceReadiness>["status"];
+  reason: string;
+  obligations: ReturnType<typeof derivePlanEvidenceObligations>;
+  rejectionReason: string;
+} {
+  const readiness = assessPlanEvidenceReadiness({
+    userGoal: input.userGoal,
+    userContext: input.turnContext,
+    recentToolActivity: input.recentToolActivity,
+    hasGroundedVisualContext: input.hasGroundedVisualContext,
+  });
+  const obligations = derivePlanEvidenceObligations({
+    objective: input.userGoal,
+    activities: input.recentToolActivity,
+  });
+  const rejectionReason = obligations.length > 0
+    ? `unverified_plan_contract_counterpart:${obligations.map(formatPlanEvidenceObligation).join(",")}`
+    : `insufficient_grounded_evidence:${readiness.reason}`;
+  return {
+    ready: readiness.status === "ready_for_plan",
+    status: readiness.status,
+    reason: readiness.reason,
+    obligations,
+    rejectionReason,
+  };
+}
+
 export async function autoMaterializePlanArtifactFromVisibleText(input: {
   visibleText: string;
   workspace: string;
@@ -5359,6 +5585,7 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
   recentToolActivity?: PlanToolActivitySummary[];
   attemptedTargets?: string[];
   turnContext?: TurnInputContextSignals;
+  candidateRepairCheckpoint?: PlanCandidateRepairCheckpoint | null;
 }): Promise<PlanMaterializationResultForLoop> {
   const closureInput = collectPlanClosureMaterializationInput(
     input.callbacks,
@@ -5366,6 +5593,38 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     input.attemptedTargets || [],
     input.userGoal || "",
   );
+  // A complete typed candidate owns its own graph/evidence validation. Parse it
+  // before legacy readiness inference so a valid decision-only Plan (or an
+  // invalid typed field) cannot be hidden behind a prose/read heuristic. The
+  // fallback path remains fail-closed on the existing readiness gate.
+  const hasTypedCandidate = hasTypedPlanDraftEnvelope(input.visibleText);
+  const planReadiness = assessPlanMaterializationReadiness({
+    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
+    recentToolActivity: input.recentToolActivity || [],
+    turnContext: input.turnContext,
+    hasGroundedVisualContext: hasPlanVisualContextGrounding(
+      input.callbacks.getMessages() as AgentMessage[],
+      input.callbacks.getCurrentTurnId?.(),
+    ),
+  });
+  if (!hasTypedCandidate && !planReadiness.ready) {
+    logAgentEvent("plan_visible_materialization_rejected", {
+      reason: planReadiness.rejectionReason,
+      evidenceReadiness: planReadiness.status,
+      evidenceReadinessReason: planReadiness.reason,
+      evidenceObligations: planReadiness.obligations.map(formatPlanEvidenceObligation),
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+    });
+    return {
+      ok: false,
+      reason: planReadiness.rejectionReason,
+      quality: classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: planReadiness.rejectionReason,
+      }),
+    };
+  }
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: input.visibleText,
     planStage: input.callbacks.getPlanStage(),
@@ -5378,11 +5637,15 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     language: input.callbacks.getPreferredLanguage(),
     evidenceBundle: closureInput.evidenceBundle,
     expectedEvidenceBundleHash: closureInput.evidenceBundle.hash,
+    ingressMode: "typed_runtime",
+    candidateRepairCheckpoint: input.candidateRepairCheckpoint,
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
     logAgentEvent("plan_visible_materialization_rejected", {
       reason: materialized.reason || "quality_gate",
+      failureStage: materialized.quality?.failureStage || null,
+      failurePreview: materialized.quality?.failurePreview || null,
       replyOptions: materialized.replyOptions?.length || 0,
       decisionFork: materialized.decisionFork || null,
       evidenceBundleId: closureInput.evidenceBundle.bundleId,
@@ -5395,6 +5658,8 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
       reason: materialized.reason || "quality_gate",
       quality: materialized.quality,
       replyOptions: materialized.replyOptions,
+      candidateRepairCheckpoint: materialized.candidateRepairCheckpoint,
+      candidateRepairExhausted: materialized.candidateRepairExhausted,
     };
   }
 
@@ -5406,6 +5671,8 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
   if (!prepared.ok || !prepared.path || !prepared.content || !prepared.kind) {
     logAgentEvent("plan_visible_materialization_rejected", {
       reason: prepared.reason || "executable_validation_task_missing",
+      failureStage: prepared.quality?.failureStage || null,
+      failurePreview: prepared.quality?.failurePreview || null,
       evidenceBundleId: closureInput.evidenceBundle.bundleId,
       evidenceBundleHash: closureInput.evidenceBundle.hash,
     });
@@ -5439,7 +5706,6 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
   recentToolActivity?: PlanToolActivitySummary[];
   attemptedTargets?: string[];
   turnContext?: TurnInputContextSignals;
-  facetMappingSource?: string;
 }): Promise<PlanMaterializationResultForLoop> {
   const closureInput = collectPlanClosureMaterializationInput(
     input.callbacks,
@@ -5447,15 +5713,31 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     input.attemptedTargets || [],
     input.userGoal || "",
   );
+  const planReadiness = assessPlanMaterializationReadiness({
+    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
+    recentToolActivity: input.recentToolActivity || [],
+    turnContext: input.turnContext,
+    hasGroundedVisualContext: hasPlanVisualContextGrounding(
+      input.callbacks.getMessages() as AgentMessage[],
+      input.callbacks.getCurrentTurnId?.(),
+    ),
+  });
   const hasBundleEvidence = isPlanEvidenceBundleReady(closureInput.evidenceBundle);
   const closureAssessment = assessPlanClosureEvidence(closureInput.evidenceBundle);
-  const hasDeterministicEvidence = closureAssessment.ready;
-  if (!hasBundleEvidence || !hasDeterministicEvidence) {
-    const rejectionReason = !hasBundleEvidence
+  const hasDeterministicEvidence = planReadiness.ready &&
+    hasDeterministicPlanMaterializationEvidence(
+      closureInput.evidenceBundle,
+    );
+  if (!planReadiness.ready || !hasBundleEvidence || !hasDeterministicEvidence) {
+    const rejectionReason = !planReadiness.ready
+      ? planReadiness.rejectionReason
+      : !hasBundleEvidence
       ? "insufficient_relevant_plan_evidence"
       : closureAssessment.unresolvedContractKinds.length > 0
         ? `unverified_plan_contract_counterpart:${closureAssessment.unresolvedContractKinds.join(",")}`
-        : "insufficient_diagnostic_plan_evidence";
+        : closureAssessment.ready
+          ? "insufficient_facet_specific_diagnostic_evidence"
+          : "insufficient_diagnostic_plan_evidence";
     logAgentEvent("plan_evidence_materialization_rejected", {
       reason: rejectionReason,
       evidenceCount: closureInput.evidence.length,
@@ -5466,7 +5748,12 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
       evidenceBundleId: closureInput.evidenceBundle.bundleId,
       evidenceBundleHash: closureInput.evidenceBundle.hash,
       bundleReady: hasBundleEvidence,
-      closureReady: closureAssessment.ready,
+      closureReady: hasDeterministicEvidence,
+      rationaleReady: closureAssessment.ready,
+      deterministicMaterializationReady: hasDeterministicEvidence,
+      evidenceReadiness: planReadiness.status,
+      evidenceReadinessReason: planReadiness.reason,
+      evidenceObligations: planReadiness.obligations.map(formatPlanEvidenceObligation),
       closureReason: closureAssessment.reason,
       objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
       defectSignalMatches: closureAssessment.defectSignalMatches,
@@ -5485,36 +5772,38 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
       }),
     };
   }
-  const closureKind = resolvePlanClosureArtifactKind(
-    closureInput,
-    input.callbacks.getPlanStage(),
-    input.recentToolActivity || [],
-  );
-  const content = composePlanArtifactFromEvidence({
-    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
-    evidence: closureInput.evidence,
-    evidenceRecords: closureInput.evidenceRecords,
-    files: closureInput.files,
-    constraints: closureInput.constraints,
-    language: input.callbacks.getPreferredLanguage(),
-    evidenceBundle: closureInput.evidenceBundle,
-    facetMappingSource: input.facetMappingSource,
+  const language = input.callbacks.getPreferredLanguage();
+  const objective = closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks);
+  const authoringContract = createPlanAuthoringContract({
+    objective,
+    contextSignals: normalizeTurnInputContextSignals(input.turnContext || {}),
+    recentPlanToolActivity: input.recentToolActivity,
   });
-  const materialized = materializePlanArtifactFromVisibleText({
-    visibleText: content,
-    planStage: input.callbacks.getPlanStage(),
-    preferredKind: closureKind,
-    sourceHint: "deterministic_evidence",
-    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
-    evidence: closureInput.evidence,
-    evidenceRecords: closureInput.evidenceRecords,
-    files: closureInput.files,
-    recentToolActivity: input.recentToolActivity,
-    turnContext: input.turnContext,
-    language: input.callbacks.getPreferredLanguage(),
-    evidenceBundle: closureInput.evidenceBundle,
-    expectedEvidenceBundleHash: closureInput.evidenceBundle.hash,
+  const diagnosisText = closureAssessment.contractMismatchKinds.length > 0
+    ? `${language === "zh" ? "已确认运行时契约不一致" : "Confirmed runtime contract mismatch"}: ${closureAssessment.contractMismatchKinds.join(", ")}`
+    : `${language === "zh" ? "已确认的证据依据" : "Confirmed evidence-backed rationale"}: ${closureInput.evidenceBundle.facts.map((fact) => fact.summary).join("; ")}`;
+  const typed = createRuntimeSynthesizedPlanCandidate({
+    bundle: closureInput.evidenceBundle,
+    authoringContract,
+    language,
+    validationCommands: closureInput.evidenceBundle.verificationTargets,
+    diagnosisText,
   });
+  const materialized: PlanMaterializationResult = typed.ok
+    ? {
+        ok: true,
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        content: typed.candidate.projection.content,
+        source: "deterministic_evidence",
+        evidenceBundleHash: closureInput.evidenceBundle.hash,
+        candidate: typed.candidate,
+        replyOptions: [],
+      }
+    : {
+        ok: false,
+        reason: `typed_plan_ingress_invalid:${typed.failures.join(",")}`,
+      };
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
     logAgentEvent("plan_evidence_materialization_rejected", {
@@ -5716,21 +6005,32 @@ export function buildPlanGateBlockedResult(
   tc: ToolCallToExecute,
   toolArgs: Record<string, unknown>,
   callbacks: OrchestratorCallbacks,
-  reason: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source",
+  reason:
+    | "pre_approval_plan_artifact_write"
+    | "pre_approval_source_write"
+    | "pre_approval_tasks"
+    | "missing_tasks_before_source",
 ): ToolExecutionResult {
   const target = getToolTarget(tc.name, toolArgs);
   const language = callbacks.getPreferredLanguage();
-  const message = language === "zh"
-    ? reason === "pre_approval_tasks"
-      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先输出可见 `<proposed_plan>`，由 runtime 物化 plan.md 并等待用户批准。"
+  const baseMessage = language === "zh"
+    ? reason === "pre_approval_plan_artifact_write"
+      ? "`.MAIN/plans/plan.md` 是 runtime 拥有的审批投影，模型在 PLAN 阶段不得直接创建、替换或增量编辑。请提交完整 typed graph，由 runtime 校验、封存并单向渲染。"
+      : reason === "pre_approval_tasks"
+      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先提交完整 typed graph，由 runtime 渲染 plan.md 并等待用户批准。"
       : reason === "missing_tasks_before_source"
       ? "计划已批准，但还没有可执行的任务清单。请先从 plan.md 派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再按任务修改源码或交付文档。"
-      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请输出可见 `<proposed_plan>`，由 MAIN runtime 校验并物化 `.MAIN/plans/plan.md`。"
+      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请提交完整 typed graph，由 MAIN runtime 校验并渲染 `.MAIN/plans/plan.md`。"
+    : reason === "pre_approval_plan_artifact_write"
+    ? "`.MAIN/plans/plan.md` is a runtime-owned review projection; the model must not create, replace, or incrementally edit it during PLAN authoring. Submit one complete typed graph for the runtime to validate, seal, and render."
     : reason === "pre_approval_tasks"
-    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Output visible `<proposed_plan>` for runtime materialization and wait for approval."
+    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Submit the complete typed graph for runtime rendering and wait for approval."
     : reason === "missing_tasks_before_source"
     ? "The plan is approved, but there is no executable task list yet. First derive a runtime task list from plan.md; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs before editing source or final deliverables."
-    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Output visible `<proposed_plan>` for MAIN runtime to validate and materialize as `.MAIN/plans/plan.md`.";
+    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Submit the complete typed graph for MAIN runtime to validate and render as `.MAIN/plans/plan.md`.";
+  const message = reason === "missing_tasks_before_source"
+    ? baseMessage
+    : `${baseMessage}\n${buildPlanSubmissionGuidance(language)}`;
 
   callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
   callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
@@ -5956,6 +6256,7 @@ export async function buildPlanArtifactMutationValidationError(
         recentToolActivity: options.recentToolActivity,
         turnContext: options.turnContext,
         language,
+        ingressMode: "legacy_markdown_import",
       });
       if (canonicalized.ok && canonicalized.content) {
         const canonicalValidation = validateGroundedActionablePlanArtifact({
@@ -6008,6 +6309,39 @@ export async function buildPlanArtifactMutationValidationError(
         }
       }
     }
+  let manifestRepairedPlanCandidate: ExecutablePlanCandidatePreparation | null = null;
+  if (
+    kind === "plan" &&
+    !validation.ok &&
+    /(?:^|:)non_executable_test_plan(?:$|:)/i.test(validation.reason || "")
+  ) {
+    // A trusted workspace manifest may supply the exact finite validation
+    // command that model prose omitted. Attempt that provider-neutral repair
+    // before rejecting the write, then rerun the complete grounded quality
+    // gate so an executable command cannot mask evidence or scope defects.
+    const prepared = await prepareExecutablePlanCandidate({
+      materialized: {
+        ok: true,
+        kind: "plan",
+        path,
+        content: nextContent,
+        source: "visible_plan",
+      },
+      workspace,
+      callbacks,
+    });
+    if (prepared.ok && prepared.content) {
+      const repairedValidation = validateGroundedActionablePlanArtifact({
+        content: prepared.content,
+        recentToolActivity: options.recentToolActivity,
+      });
+      if (repairedValidation.ok) {
+        nextContent = prepared.content;
+        validation = repairedValidation;
+        manifestRepairedPlanCandidate = prepared;
+      }
+    }
+  }
   if (!validation.ok) {
     return buildPlanArtifactQualityPreflightRejection({
       tc,
@@ -6020,18 +6354,27 @@ export async function buildPlanArtifactMutationValidationError(
   }
 
   if (kind === "plan") {
-    const prepared = await prepareExecutablePlanCandidate({
-      materialized: {
-        ok: true,
-        kind: "plan",
-        path,
-        content: nextContent,
-        source: "visible_plan",
-      },
-      workspace,
+    const closureInput = collectPlanClosureMaterializationInput(
       callbacks,
+      options.recentToolActivity || [],
+      options.attemptedTargets || [],
+    );
+    const materialized = materializePlanArtifactFromVisibleText({
+      visibleText: manifestRepairedPlanCandidate?.content || nextContent,
+      planStage: callbacks.getPlanStage(),
+      sourceHint: manifestRepairedPlanCandidate?.source || "visible_plan",
+      userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(callbacks),
+      evidence: closureInput.evidence,
+      evidenceRecords: closureInput.evidenceRecords,
+      files: closureInput.files,
+      recentToolActivity: options.recentToolActivity,
+      turnContext: options.turnContext,
+      language,
+      evidenceBundle: closureInput.evidenceBundle,
+      expectedEvidenceBundleHash: closureInput.evidenceBundle.hash,
+      ingressMode: "typed_runtime",
     });
-    if (!prepared.ok || !prepared.content) {
+    if (!materialized.ok || !materialized.content || !materialized.candidate) {
       return buildPlanArtifactQualityPreflightRejection({
         tc,
         target,
@@ -6040,21 +6383,44 @@ export async function buildPlanArtifactMutationValidationError(
         callbacks,
         validation: {
           ok: false,
-          reason: prepared.reason || "executable_validation_task_missing",
+          reason: materialized.reason || "typed_plan_candidate_missing",
+          recoveryAction: materialized.quality?.recoveryAction || "rewrite",
+          missingSections: materialized.quality?.missingSections,
+        },
+      });
+    }
+    const prepared = await prepareExecutablePlanCandidate({
+      materialized,
+      workspace,
+      callbacks,
+    });
+    if (!prepared.ok || !prepared.content || !prepared.candidate || !prepared.evidenceBundleHash) {
+      return buildPlanArtifactQualityPreflightRejection({
+        tc,
+        target,
+        path,
+        kind,
+        callbacks,
+        validation: {
+          ok: false,
+          reason: prepared.reason || "typed_plan_candidate_missing",
           recoveryAction: "rewrite",
         },
       });
     }
-    if (prepared.repaired) {
-      nextContent = prepared.content;
-      if (tc.name === "write_file") {
-        args.content = prepared.content;
-        tc.arguments = JSON.stringify({ ...args, content: prepared.content });
-      }
-      // replace_in_file is promoted below to one validated full-content
-      // write. Do not mix a synthetic `content` field into its original
-      // search/replace contract before that atomic promotion.
+    nextContent = prepared.content;
+    tc.preparedPlanArtifact = {
+      path: canonicalizePlanArtifactPath(prepared.path || path),
+      content: prepared.content,
+      evidenceBundleHash: prepared.evidenceBundleHash,
+      candidate: prepared.candidate,
+    };
+    if (tc.name === "write_file") {
+      args.content = prepared.content;
+      tc.arguments = JSON.stringify({ ...args, content: prepared.content });
     }
+    // replace_in_file is promoted below to one validated full-content write.
+    // Keep its search/replace transport untouched until that atomic promotion.
   }
 
   if (kind === "tasks") {

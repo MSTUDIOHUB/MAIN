@@ -60,6 +60,7 @@ const {
   composeReviewablePlanFromEvidence,
   extractNumberedUserGoalFacets,
   extractPlanEvidenceFacts,
+  extractPlanEvidenceSourceFacts,
   findContradictedPlanDiagnosticClaim,
   isMaterializablePlanLikeText,
   materializePlanArtifactFromVisibleText,
@@ -67,6 +68,7 @@ const {
   sanitizePlanEvidenceInput,
   summarizePlanEvidenceDetail,
   validateExplicitPlanCodeChangeGrounding,
+  validateConfirmedContractMismatchDisposition,
   validatePlanEvidenceGrounding,
   validateNumberedUserGoalFacetCoverage,
 } = loadTranspiledModuleSync(
@@ -114,7 +116,7 @@ test("explicit plan code changes must be non-noop and match observed source stat
   assert.equal(observedBefore.ok, true);
 });
 
-test("numbered user-goal facets require change or decision plus validation coverage", () => {
+test("multi-facet user goals require an explicit G/E/C-or-D/V traceability ledger", () => {
   const userGoal = [
     "1、CSV 导入后课程名称为空。",
     "2、筛选订单状态后总金额没有更新。",
@@ -133,24 +135,182 @@ test("numbered user-goal facets require change or decision plus validation cover
     ].join("\n"),
   });
   assert.equal(incomplete.ok, false);
-  assert.match(incomplete.reason || "", /uncovered_user_goal_facets:2,3/);
+  assert.match(incomplete.reason || "", /uncovered_user_goal_facets:1,2,3/);
   assert.equal(incomplete.recoveryAction, "rewrite");
 
   const complete = validateNumberedUserGoalFacetCoverage({
     userGoal,
     content: [
       "# 修复方案",
+      "## 已确认证据",
+      "- [E1] CSV 导入映射丢失课程名称字段。",
+      "- [E2] 订单状态筛选后总金额仍使用筛选前集合。",
+      "- [E3] 导出报告的列映射未包含日期列。",
       "## 关键改动",
-      "- 修复 CSV 课程名称字段的导入映射。",
-      "- 让订单状态筛选后的总金额使用筛选结果。",
-      "- 在导出报告中补齐日期列。",
+      "- [C1] 修复 CSV 课程名称字段的导入映射。",
+      "- [C2] 让订单状态筛选后的总金额使用筛选结果。",
+      "- [C3] 在导出报告中补齐日期列。",
       "## 测试方案",
-      "- 导入 CSV 并验证课程名称不再为空。",
-      "- 筛选订单状态并验证总金额同步更新。",
-      "- 导出报告并验证包含日期列。",
+      "- [V1] 导入 CSV 并验证课程名称不再为空。",
+      "- [V2] 筛选订单状态并验证总金额同步更新。",
+      "- [V3] 导出报告并验证包含日期列。",
+      "## 需求分面追踪",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E2 -> C2 -> V2",
+      "- G3 -> E3 -> C3 -> V3",
     ].join("\n"),
   });
   assert.equal(complete.ok, true, complete.reason);
+});
+
+test("diagnostic multi-facet goals require grounded R links in the same trace graph", () => {
+  const userGoal = [
+    "1、找出详情页保存后仍显示旧标题的根本原因。",
+    "2、找出删除后列表计数不更新的根本原因。",
+  ].join("\n");
+  const base = [
+    "# 诊断修复计划",
+    "## 已确认证据",
+    "- [E1] `src/detail.ts` 保存成功后仍从旧缓存读取标题。",
+    "- [E2] `src/list.ts` 删除成功后仍从旧集合读取计数。",
+    "## 诊断 / 推断",
+    "- [R1 inferred, E1] 详情标题刷新链遗漏了保存后的缓存同步。",
+    "- [R2 inferred, E2] 列表删除链遗漏了基于最新集合的计数派生。",
+    "## 关键改动",
+    "- [C1, R1] 修改 `src/detail.ts`，保存后同步详情标题缓存。",
+    "- [C2, R2] 修改 `src/list.ts`，删除后从最新集合派生计数。",
+    "## 测试方案",
+    "- [V1] 保存新标题并断言详情页显示新标题。",
+    "- [V2] 删除记录并断言列表计数立即减少。",
+    "## 需求分面追踪",
+    "- G1 -> E1 -> R1 -> C1 -> V1",
+    "- G2 -> E2 -> R2 -> C2 -> V2",
+  ].join("\n");
+
+  const complete = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: base,
+    diagnosisRequired: true,
+  });
+  assert.equal(complete.ok, true, complete.reason);
+
+  const missingDiagnosisLink = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: base.replace("G2 -> E2 -> R2 -> C2 -> V2", "G2 -> E2 -> C2 -> V2"),
+    diagnosisRequired: true,
+  });
+  assert.equal(missingDiagnosisLink.ok, false);
+  assert.match(missingDiagnosisLink.reason || "", /uncovered_user_goal_facets:2/);
+
+  const danglingDiagnosis = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: base.replace("R2 -> C2", "R9 -> C2"),
+    diagnosisRequired: true,
+  });
+  assert.equal(danglingDiagnosis.ok, false);
+  assert.match(danglingDiagnosis.reason || "", /uncovered_user_goal_facets:2/);
+});
+
+test("a single user-goal facet does not require a multi-facet traceability ledger", () => {
+  const result = validateNumberedUserGoalFacetCoverage({
+    userGoal: "1、CSV 导入后课程名称为空。",
+    content: [
+      "# 修复方案",
+      "## 已确认证据",
+      "- CSV 导入映射丢失课程名称字段。",
+      "## 关键改动",
+      "- 修复 CSV 课程名称字段的导入映射。",
+      "## 测试方案",
+      "- 导入 CSV 并验证课程名称不再为空。",
+    ].join("\n"),
+  });
+  assert.equal(result.ok, true, result.reason);
+});
+
+test("numbered goal facets accept colon delimiters without bypassing traceability", () => {
+  const userGoal = [
+    "1: Repair the stale detail title after save.",
+    "2：删除记录后立即更新列表计数。",
+  ].join("\n");
+  assert.deepEqual(
+    extractNumberedUserGoalFacets(userGoal).map((facet) => facet.index),
+    [1, 2],
+  );
+  const result = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# Plan",
+      "## Confirmed Evidence",
+      "- [E1] `src/detail.ts` owns the current state.",
+      "## Key Changes",
+      "- [C1] Modify `src/detail.ts` state handling.",
+      "## Test Plan",
+      "- [V1] Verify the resulting state.",
+      "## Traceability Matrix",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E1 -> C1 -> V1",
+    ].join("\n"),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /uncovered_user_goal_facets:1,2/);
+});
+
+test("multi-facet traceability rejects one generic binding reused for every outcome", () => {
+  const userGoal = [
+    "1、在编辑界面重复显示文件名和未保存文档名字。",
+    "2、打开本地 md 文件后会错误弹出保存窗口。",
+  ].join("\n");
+  const result = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# MD Viewer repair plan",
+      "## Confirmed Evidence",
+      "- [E1] `src/main.js` currently handles file state.",
+      "## Key Changes",
+      "- [C1] Modify `src/main.js` file save behavior.",
+      "## Test Plan",
+      "- [V1] Verify the file save result.",
+      "## Traceability Matrix",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E1 -> C1 -> V1",
+    ].join("\n"),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /uncovered_user_goal_facets:1,2/);
+});
+
+test("materialization rejects the real multi-facet incident shape when prose omits the trace ledger", () => {
+  const userGoal = [
+    "1、在编辑界面显示了文件名和未保存的文档名字，这是不合理的。",
+    "2、打开本地 md 文件后随后会弹出窗口，看起来是文件保存执行路径有关的问题。",
+  ].join("\n");
+  const visibleText = [
+    "# MD Viewer 问题修复计划",
+    "## 摘要",
+    "- 修复编辑界面重复显示文件名和未保存文档名字。",
+    "- 修复打开本地 md 文件后错误弹出保存窗口。",
+    "## 已确认证据",
+    "- `src/main.js` 初始文件对象的 title 为空，且 isDirty 会让标签追加未保存标记。",
+    "- `src/main.js` 存在两条本地文件打开路径，返回值解析不一致。",
+    "## 关键改动",
+    "- 修改 `src/main.js` 的标签标题与 isDirty 同步，避免编辑界面重复显示文件名和未保存名称。",
+    "- 统一 `src/main.js` 的本地 md 文件打开路径，打开后不得触发保存窗口。",
+    "## 公共 API / 接口 / 类型",
+    "- 保持已有公共接口与文件数据结构不变。",
+    "## 测试方案",
+    "- 运行 `npm test`，断言编辑界面只保留一个文件名称所有者，并正确显示 isDirty 状态。",
+    "- 运行 `npm test`，断言打开本地 md 文件后不会弹出保存窗口。",
+    "## 假设与默认值",
+    "- 保持未点名的文件与契约不变。",
+  ].join("\n");
+
+  const directCoverage = validateNumberedUserGoalFacetCoverage({ userGoal, content: visibleText });
+  assert.equal(directCoverage.ok, false);
+  assert.match(directCoverage.reason || "", /uncovered_user_goal_facets:1,2/);
+
+  const materialized = materializePlanArtifactFromVisibleText({ visibleText, userGoal });
+  assert.equal(materialized.ok, false);
+  assert.match(materialized.reason || "", /uncovered_user_goal_facets:1,2/);
 });
 
 test("numbered subagent assignment descriptors are collaboration metadata, not acceptance facets", () => {
@@ -175,26 +335,39 @@ test("numbered subagent assignment descriptors are collaboration metadata, not a
   assert.equal(coverage.ok, true, coverage.reason || "");
 });
 
-test("numbered facets can use a C/V traceability ledger without duplicating evidence", () => {
+test("numbered facets require referenced E/C/V bodies to support each traceability row", () => {
   const userGoal = [
     "1、保存后详情页仍显示旧标题。",
     "2、删除后列表计数没有更新。",
   ].join("\n");
   const content = [
     "# 计划",
+    "## 已确认证据",
+    "- [E1] `src/detail.ts` 保存成功后仍从旧标题缓存读取详情标题。",
+    "- [E2] `src/list.ts` 删除成功后仍从删除前集合派生列表计数。",
     "## 关键改动",
-    "- [C1] 修改 `src/detail.ts` 的缓存提交边界。",
-    "- [C2] 修改 `src/list.ts` 的派生值更新边界。",
+    "- [C1] 修改 `src/detail.ts`，保存成功后同步详情页标题缓存，不再显示旧标题。",
+    "- [C2] 修改 `src/list.ts`，删除成功后从最新集合重新计算列表计数。",
     "## 测试方案",
-    "- [V1] 对第一个用户分面执行独立行为验收。",
-    "- [V2] 对第二个用户分面执行独立行为验收。",
+    "- [V1] 保存新标题并断言详情页显示新标题而不是旧标题。",
+    "- [V2] 删除一项并断言列表计数按最新集合减少。",
     "## 需求分面追踪",
-    "- 分面 1（保存后详情页仍显示旧标题）：对应 C1，并由 V1 验收。",
-    "- 分面 2（删除后列表计数没有更新）：对应 C2，并由 V2 验收。",
+    "- 分面 1：由 E1 约束，对应 C1，并由 V1 验收。",
+    "- 分面 2：由 E2 约束，对应 C2，并由 V2 验收。",
   ].join("\n");
 
   const result = validateNumberedUserGoalFacetCoverage({ userGoal, content });
   assert.equal(result.ok, true, result.reason);
+
+  const compactTableLedger = content
+    .replace("## 需求分面追踪", "## Traceability Matrix")
+    .replace("- 分面 1：由 E1 约束，对应 C1，并由 V1 验收。", "| G1 | E1 | C1 | V1 |")
+    .replace("- 分面 2：由 E2 约束，对应 C2，并由 V2 验收。", "| G2 | E2 | C2 | V2 |");
+  const compactTableResult = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: compactTableLedger,
+  });
+  assert.equal(compactTableResult.ok, true, compactTableResult.reason);
 
   const missingReference = validateNumberedUserGoalFacetCoverage({
     userGoal,
@@ -202,6 +375,90 @@ test("numbered facets can use a C/V traceability ledger without duplicating evid
   });
   assert.equal(missingReference.ok, false);
   assert.match(missingReference.reason || "", /uncovered_user_goal_facets:2/);
+
+  const danglingReference = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: content.replace("对应 C1，", "对应 C1、C9，"),
+  });
+  assert.equal(danglingReference.ok, false);
+  assert.match(danglingReference.reason || "", /uncovered_user_goal_facets:1/);
+
+  const duplicateGoalRow = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: content.replace(
+      "- 分面 2：由 E2 约束，对应 C2，并由 V2 验收。",
+      [
+        "- 分面 1：由 E1 约束，对应 C1，并由 V1 验收。",
+        "- 分面 2：由 E2 约束，对应 C2，并由 V2 验收。",
+      ].join("\n"),
+    ),
+  });
+  assert.equal(duplicateGoalRow.ok, false);
+  assert.match(duplicateGoalRow.reason || "", /uncovered_user_goal_facets:1/);
+
+  const selfCertifiedUnrelated = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# 计划",
+      "## 已确认证据",
+      "- [E1] `src/save.ts` 的 file_path 参数与 filePath 契约不一致。",
+      "## 关键改动",
+      "- [C1] 修改 `src/save.ts` 的保存参数名。",
+      "## 测试方案",
+      "- [V1] 保存文件并断言参数契约一致。",
+      "- [V2] 保存文件并断言参数契约一致。",
+      "## 需求分面追踪",
+      "- 分面 1（保存后详情页仍显示旧标题）：由 E1 约束，对应 C1，并由 V1 验收。",
+      "- 分面 2（删除后列表计数没有更新）：由 E1 约束，对应 C1，并由 V2 验收。",
+    ].join("\n"),
+  });
+  assert.equal(selfCertifiedUnrelated.ok, false);
+  assert.match(selfCertifiedUnrelated.reason || "", /uncovered_user_goal_facets:1,2/);
+
+  const ledgerNestedUnderEvidence = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# 计划",
+      "## 已确认证据",
+      "### 需求分面追踪",
+      "- [G1] 保存后详情页仍显示旧标题 -> [E1] `src/detail.ts` -> C1 -> V1",
+      "- [G2] 删除后列表计数没有更新 -> [E2] `src/list.ts` -> C2 -> V2",
+      "## 关键改动",
+      "- [C1] 修改 `src/detail.ts`，保存成功后同步详情页标题缓存。",
+      "- [C2] 修改 `src/list.ts`，删除成功后从最新集合重新计算列表计数。",
+      "## 测试方案",
+      "- [V1] 保存新标题并断言详情页显示新标题。",
+      "- [V2] 删除一项并断言列表计数按最新集合减少。",
+    ].join("\n"),
+  });
+  assert.equal(ledgerNestedUnderEvidence.ok, false);
+  assert.match(ledgerNestedUnderEvidence.reason || "", /uncovered_user_goal_facets:1,2/);
+});
+
+test("a grounded no-change decision can close its own numbered facet", () => {
+  const userGoal = [
+    "1、保存后详情页仍显示旧标题。",
+    "2、确认开发启动端口是否一致。",
+  ].join("\n");
+  const content = [
+    "# 计划",
+    "## 已确认证据",
+    "- [E1] `src/detail.ts` 保存成功后仍读取旧标题缓存。",
+    "- [E2] `vite.config.js` 与 `desktop/app.json` 的开发启动端口都为 1420。",
+    "## 关键改动",
+    "- [C1] 修改 `src/detail.ts`，保存成功后同步详情页标题缓存。",
+    "## 决策与约束",
+    "- [D1] 保持 `vite.config.js` 与 `desktop/app.json` 已一致的开发启动端口 1420，不制造端口改动。",
+    "## 测试方案",
+    "- [V1] 保存新标题并断言详情页显示新标题。",
+    "- [V2] 启动开发环境并断言两端使用一致端口 1420。",
+    "## 需求分面追踪",
+    "- 分面 1：由 E1 约束，对应 C1，并由 V1 验收。",
+    "- 分面 2：由 E2 约束，对应 D1，并由 V2 验收。",
+  ].join("\n");
+
+  const result = validateNumberedUserGoalFacetCoverage({ userGoal, content });
+  assert.equal(result.ok, true, result.reason);
 });
 
 test("numbered facets inherit evidence, change, and validation roles from parent sections", () => {
@@ -215,19 +472,22 @@ test("numbered facets inherit evidence, change, and validation roles from parent
       "# Proposed Plan",
       "## 根因与证据",
       "### 问题 1：保存后详情页仍显示旧标题",
-      "- 详情页继续读取旧标题缓存。",
+      "- [E1] 详情页继续读取旧标题缓存。",
       "### 问题 2：删除后列表计数没有更新",
-      "- 列表计数继续使用删除前集合。",
+      "- [E2] 列表计数继续使用删除前集合。",
       "## 具体改动",
       "### 改动 1：同步保存后的详情标题",
-      "- 保存成功后更新详情页标题缓存。",
+      "- [C1] 保存成功后更新详情页标题缓存。",
       "### 改动 2：同步删除后的列表计数",
-      "- 删除成功后从最新集合重新计算列表计数。",
+      "- [C2] 删除成功后从最新集合重新计算列表计数。",
       "## 验证方式",
       "### 验证 1：保存标题",
-      "- 保存新标题并验证详情页不再显示旧标题。",
+      "- [V1] 保存新标题并验证详情页不再显示旧标题。",
       "### 验证 2：删除记录",
-      "- 删除记录并验证列表计数立即更新。",
+      "- [V2] 删除记录并验证列表计数立即更新。",
+      "## 需求分面追踪",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E2 -> C2 -> V2",
     ].join("\n"),
   });
 
@@ -245,18 +505,21 @@ test("numbered facets remain traceable when role sections are nested under each 
       "# Proposed Plan",
       "## 二、问题 1：保存后详情页仍显示旧标题",
       "### 已确认证据",
-      "- `src/detail.ts` 仍读取旧标题缓存。",
+      "- [E1] `src/detail.ts` 仍读取旧标题缓存。",
       "### 具体改动",
-      "- 保存成功后更新详情页标题缓存。",
+      "- [C1] 保存成功后更新详情页标题缓存。",
       "### 验证方式",
-      "- 保存新标题并验证详情页不再显示旧标题。",
+      "- [V1] 保存新标题并验证详情页不再显示旧标题。",
       "## 三、问题 2：删除后列表计数没有更新",
       "### 已确认证据",
-      "- `src/list.ts` 仍使用删除前集合计算列表计数。",
+      "- [E2] `src/list.ts` 仍使用删除前集合计算列表计数。",
       "### 具体改动",
-      "- 删除成功后从最新集合重新计算列表计数。",
+      "- [C2] 删除成功后从最新集合重新计算列表计数。",
       "### 验证方式",
-      "- 删除记录并验证列表计数立即更新。",
+      "- [V2] 删除记录并验证列表计数立即更新。",
+      "## 需求分面追踪",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E2 -> C2 -> V2",
     ].join("\n"),
   });
 
@@ -272,22 +535,25 @@ test("numbered feature facets use current boundaries and acceptance without requ
     userGoal,
     content: [
       "# 离线草稿功能计划",
-      "## 当前实现",
-      "- 离线创建草稿目前只保存在内存，恢复网络后没有同步队列。",
-      "- 同步冲突目前覆盖本地版本，无法同时保留本地和远端版本。",
+      "## 已确认证据 / 当前实现",
+      "- [E1] 离线创建草稿目前只保存在内存，恢复网络后没有同步队列。",
+      "- [E2] 同步冲突目前覆盖本地版本，无法同时保留本地和远端版本。",
       "## 架构改动",
-      "- 为离线创建草稿增加持久化同步队列，并在恢复网络后顺序同步。",
-      "- 为同步冲突增加双版本记录，分别保留本地版本和远端版本。",
+      "- [C1] 为离线创建草稿增加持久化同步队列，并在恢复网络后顺序同步。",
+      "- [C2] 为同步冲突增加双版本记录，分别保留本地版本和远端版本。",
       "## 验收标准",
-      "- 断网创建草稿后恢复网络，验证草稿完成同步。",
-      "- 制造同步冲突，验证本地和远端两个版本都可查看。",
+      "- [V1] 断网创建草稿后恢复网络，验证草稿完成同步。",
+      "- [V2] 制造同步冲突，验证本地和远端两个版本都可查看。",
+      "## 需求分面追踪",
+      "- G1 -> E1 -> C1 -> V1",
+      "- G2 -> E2 -> C2 -> V2",
     ].join("\n"),
   });
 
   assert.equal(result.ok, true, result.reason);
 });
 
-test("canonicalization preserves numbered facet context from ordinal nested headings", () => {
+test("canonicalization preserves facet prose but cannot bypass a missing trace ledger", () => {
   const userGoal = [
     "1、保存后详情页仍显示旧标题。",
     "2、删除后列表计数没有更新。",
@@ -337,7 +603,10 @@ test("canonicalization preserves numbered facet context from ordinal nested head
 
   assert.ok(canonical);
   const coverage = validateNumberedUserGoalFacetCoverage({ userGoal, content: canonical });
-  assert.equal(coverage.ok, true, `${coverage.reason}\n${canonical}`);
+  assert.equal(coverage.ok, false);
+  assert.match(coverage.reason || "", /uncovered_user_goal_facets:1,2/);
+  assert.match(canonical, /src\/detail\.ts/);
+  assert.match(canonical, /src\/list\.ts/);
 });
 
 test("plan evidence sanitization preserves numbered goal facets for quality coverage", () => {
@@ -362,21 +631,267 @@ test("plan evidence sanitization preserves numbered goal facets for quality cove
     ].join("\n"),
   });
   assert.equal(incomplete.ok, false);
-  assert.match(incomplete.reason || "", /uncovered_user_goal_facets:2/);
+  assert.match(incomplete.reason || "", /uncovered_user_goal_facets:1,2/);
 });
 const {
   assessPlanClosureEvidence,
   buildPlanCandidate,
   buildPlanEvidenceBundle,
+  buildPlanEvidenceEpochHash,
   formatPlanEvidenceBundleForModel,
   hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
+  isPlanEvidenceReadyForModelDraft,
   validatePlanCandidate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
+const {
+  createRuntimePlanStructuredEvidenceFacts,
+  formatPlanStructuredEvidenceFacts,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planStructuredEvidence.ts"));
+const {
+  extractRuntimePlanSourceObservations,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planSourceObservation.ts"));
 const {
   deriveRuntimePlanTasksFromArtifacts,
   validateActionablePlanArtifact,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
+
+function asRuntimePlanEvidenceRecord(record) {
+  const facts = [
+    ...(Array.isArray(record.facts) ? record.facts : []),
+    ...formatPlanStructuredEvidenceFacts(record.structuredFacts),
+    ...extractPlanEvidenceFacts(record.summary || ""),
+  ];
+  const observedSource = facts.join("\n") || String(record.summary || "");
+  const lineCount = observedSource.split("\n").length;
+  const sourceObservations = extractRuntimePlanSourceObservations({
+    target: record.target,
+    content: observedSource,
+    readFileObservation: {
+      path: record.target,
+      requestSignature: `fixture-read:${record.target}:1-${lineCount}`,
+      versionToken: `fixture-version:${record.target}`,
+      window: { startLine: 1, endLine: lineCount },
+    },
+  });
+  return {
+    ...record,
+    structuredFacts: createRuntimePlanStructuredEvidenceFacts(facts, {
+      sourceObservationRefs: sourceObservations.map((item) => item.observationRef),
+    }),
+    sourceObservations,
+  };
+}
+
+function buildRuntimePlanEvidenceBundle(input) {
+  return buildPlanEvidenceBundle({
+    ...input,
+    evidenceRecords: (input.evidenceRecords || []).map(asRuntimePlanEvidenceRecord),
+  });
+}
+
+test("typed Plan evidence closes command contracts independently of record order", () => {
+  const frontendFacts = createRuntimePlanStructuredEvidenceFacts([
+    "command_transport_contract(tauri,save_file_content)",
+    "command_invoke_argument_contract(save_file_content,file_path,content)",
+  ]);
+  const backendFacts = createRuntimePlanStructuredEvidenceFacts([
+    "command_handler_argument_contract(save_file_content,content,filePath)",
+  ]);
+  const records = [
+    {
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "The frontend command boundary forwards the document path and content.",
+      structuredFacts: frontendFacts,
+    },
+    {
+      tool: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      summary: "The backend handler boundary receives the document path and content.",
+      structuredFacts: backendFacts,
+    },
+  ].map(asRuntimePlanEvidenceRecord);
+  const objective = "Opening a local document unexpectedly enters the save flow.";
+  const forward = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const reversed = buildPlanEvidenceBundle({ objective, evidenceRecords: [...records].reverse() });
+
+  assert.deepEqual(
+    assessPlanClosureEvidence(forward).contractMismatchKinds,
+    ["command_argument_case:save_file_content:file_path->filePath"],
+  );
+  assert.deepEqual(
+    assessPlanClosureEvidence(reversed).contractMismatchKinds,
+    ["command_argument_case:save_file_content:file_path->filePath"],
+  );
+  assert.equal(buildPlanEvidenceEpochHash(forward), buildPlanEvidenceEpochHash(reversed));
+});
+
+test("legacy and unknown structured-fact strings cannot close Plan acceptance", () => {
+  const objective = "Opening a local document unexpectedly enters the save flow.";
+  const legacyBundle = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "The frontend command boundary forwards the document path and content.",
+        facts: ["command_invoke_argument_contract(save_file_content,file_path,content)"],
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "The backend handler boundary receives the document path and content.",
+        // Older persisted bundles used this field name with string values.
+        structuredFacts: ["command_handler_argument_contract(save_file_content,content,filePath)"],
+      },
+    ],
+  });
+  const unknownBundle = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "The frontend function forwards observed values across a boundary.",
+      facts: ["command_magic_completion_contract(save_file_content,verified)"],
+    }],
+  });
+
+  assert.equal(assessPlanClosureEvidence(legacyBundle).ready, false);
+  assert.deepEqual(assessPlanClosureEvidence(legacyBundle).contractMismatchKinds, []);
+  assert.ok(legacyBundle.facts.every((fact) =>
+    (fact.structuredFacts || []).every((structured) => structured.authority === "legacy_import")
+  ));
+  assert.equal(assessPlanClosureEvidence(unknownBundle).ready, false);
+  assert.ok(unknownBundle.facts.every((fact) => (fact.structuredFacts || []).length === 0));
+});
+
+test("plan evidence retry epochs ignore fact order, ids, and duplicate replay", () => {
+  const objective = "Fix the local document open flow.";
+  const first = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "openDocument records the selected path before loading content",
+        facts: [
+          "function_contract(openDocument,path)",
+          "state_transition_contract(filePath,selected_path)",
+        ],
+      },
+      {
+        tool: "read_file",
+        target: "src/editor.js",
+        status: "succeeded",
+        summary: "setValue dispatches the editor input event after replacing content",
+        facts: ["function_contract(setValue,content)"],
+      },
+    ],
+  });
+  const replayed = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/editor.js",
+        status: "succeeded",
+        summary: "setValue dispatches the editor input event after replacing content",
+        facts: ["function_contract(setValue,content)"],
+      },
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "openDocument records the selected path before loading content",
+        facts: [
+          "state_transition_contract(filePath,selected_path)",
+          "function_contract(openDocument,path)",
+          "state_transition_contract(filePath,selected_path)",
+        ],
+      },
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "openDocument records the selected path before loading content",
+        facts: [
+          "function_contract(openDocument,path)",
+          "state_transition_contract(filePath,selected_path)",
+        ],
+      },
+    ],
+  });
+  const advanced = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [
+      ...replayed.facts.map((fact) => ({
+        tool: fact.tool,
+        target: fact.target,
+        status: "succeeded",
+        summary: fact.summary,
+        facts: fact.structuredFacts,
+      })),
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "save_file_content accepts the canonical filePath argument",
+        facts: ["command_handler_argument_contract(save_file_content,content,filePath)"],
+      },
+    ],
+  });
+
+  assert.equal(buildPlanEvidenceEpochHash(first), buildPlanEvidenceEpochHash(replayed));
+  assert.notEqual(buildPlanEvidenceEpochHash(first), buildPlanEvidenceEpochHash(advanced));
+});
+
+test("duplicate evidence cannot displace a unique fact at the bounded bundle limit", () => {
+  const evidenceRecords = Array.from({ length: 24 }, (_unused, index) => ({
+    tool: "read_file",
+    target: `src/evidence-${index}.ts`,
+    status: "succeeded",
+    summary: `function owner${index} returns the observed state value`,
+    facts: [`function_contract(owner${index},state)`],
+  }));
+  const objective = "Modify src/evidence-24.ts after reviewing the evidence owners.";
+  const baseline = buildPlanEvidenceBundle({ objective, evidenceRecords });
+  const duplicateReplay = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [...evidenceRecords, { ...evidenceRecords[23] }],
+  });
+  const advanced = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [
+      ...evidenceRecords,
+      {
+        tool: "read_file",
+        target: "src/evidence-24.ts",
+        status: "succeeded",
+        summary: "function owner24 returns the newly observed state value",
+        facts: ["function_contract(owner24,state)"],
+      },
+    ],
+  });
+
+  assert.equal(baseline.facts.length, 24);
+  assert.equal(new Set(duplicateReplay.facts.map((fact) => fact.target)).size, 24);
+  assert.equal(
+    buildPlanEvidenceEpochHash(baseline),
+    buildPlanEvidenceEpochHash(duplicateReplay),
+  );
+  assert.equal(advanced.facts.some((fact) => fact.target === "src/evidence-24.ts"), true);
+  assert.notEqual(
+    buildPlanEvidenceEpochHash(baseline),
+    buildPlanEvidenceEpochHash(advanced),
+  );
+});
 
 test("trusted manifest validation repair adds an exact executable task without guessing a build command", () => {
   const content = [
@@ -463,8 +978,8 @@ test("materializes valid visible plan text into plan.md artifact", () => {
       "- 只允许 design 自动物化，避免越权写源码。",
       "",
       "## 验证方式",
-      "- 增加并运行 Node 单测，覆盖解析、清洗、提示词和计划物化。",
-      "- 运行 E2E，复现空响应与伪工具链路并检查恢复状态。",
+      "- 运行 `node --test tests/node/plan-materialization.test.mjs`，断言解析、清洗、提示词和计划物化用例全部通过。",
+      "- 运行 `npx playwright test tests/e2e/cloud-tool-protocol.spec.ts`，断言空响应与伪工具链路进入预期恢复状态。",
       "",
       "## 开放问题",
       "- 是否需要为更多本地模型格式继续扩展兼容。",
@@ -662,8 +1177,53 @@ test("grounded model inference is reviewable while deterministic auto-materializ
   assert.equal(deterministicDraft.quality?.recoveryAction, "targeted_evidence");
 });
 
+test("one confirmed mismatch cannot close every facet of a deterministic fallback", () => {
+  const bundle = buildRuntimePlanEvidenceBundle({
+    turnId: "turn-multi-facet-partial-diagnosis",
+    objective: [
+      "问题：",
+      "1、编辑界面同时显示文件名和未保存文档名。",
+      "2、打开本地 Markdown 后意外进入保存流程。",
+    ].join("\n"),
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "command_transport_contract(tauri,save_file_content) command_invoke_argument_contract(save_file_content,file_path,content)",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "command_handler_argument_contract(save_file_content,content,filePath)",
+      },
+      {
+        tool: "read_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        summary: "event_dom_dispatch_contract(input) field_read_contract(value)",
+      },
+      {
+        tool: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+        summary: "field_read_contract(textContent) field_read_contract(filePath)",
+      },
+    ],
+  });
+
+  assert.equal(assessPlanClosureEvidence(bundle).ready, true);
+  assert.deepEqual(bundle.changeTargets, ["src/main.js"]);
+  assert.equal(
+    hasDeterministicPlanMaterializationEvidence(bundle),
+    false,
+    "the runtime may draft from the observations, but it must not invent closure for the undiagnosed facet",
+  );
+});
+
 test("source-derived structured facts survive bundle construction", () => {
-  const bundle = buildPlanEvidenceBundle({
+  const bundle = buildRuntimePlanEvidenceBundle({
     objective: "检查 src/main.js 并规划初始化修复。",
     evidenceRecords: [{
       tool: "read_file",
@@ -679,6 +1239,645 @@ test("source-derived structured facts survive bundle construction", () => {
 
   assert.match(bundle.facts[0]?.summary || "", /event_dom_listener_contract\(DOMContentLoaded\)/);
   assert.match(bundle.facts[0]?.summary || "", /listener_calls\(initToolbar,initEditor\)/);
+});
+
+test("source evidence exposes DOM side effects and Tauri command argument casing across owners", () => {
+  const editorSummary = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src/components/editor.js",
+    maxChars: 420,
+    content: [
+      "READ_FILE_RESULT",
+      "path: src/components/editor.js",
+      "---CONTENT START---",
+      "editor.setValue = function(val) {",
+      "  this.value = val;",
+      "  this.dispatchEvent(new Event('input'));",
+      "};",
+      "---CONTENT END---",
+    ].join("\n"),
+  });
+  const mainSummary = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src/main.js",
+    maxChars: 600,
+    content: [
+      "READ_FILE_RESULT",
+      "path: src/main.js",
+      "---CONTENT START---",
+      "editorEl.addEventListener('input', () => {",
+      "  activeFiles[activeTab].isDirty = true;",
+      "  scheduleAutoSave();",
+      "});",
+      "await invoke('save_file_content', {",
+      "  file_path: file.path,",
+      "  content: content",
+      "});",
+      "---CONTENT END---",
+    ].join("\n"),
+  });
+  const rustSummary = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src-tauri/src/main.rs",
+    maxChars: 420,
+    content: [
+      "READ_FILE_RESULT",
+      "path: src-tauri/src/main.rs",
+      "---CONTENT START---",
+      "#[tauri::command]",
+      "fn save_file_content(content: String, file_path: Option<String>) -> Result<(), String> {",
+      "  let path = file_path.ok_or_else(|| \"missing path\".to_string())?;",
+      "  std::fs::write(path, content).map_err(|error| error.to_string())",
+      "}",
+      "---CONTENT END---",
+    ].join("\n"),
+  });
+
+  assert.match(editorSummary, /event_dom_dispatch_contract\(input\)/);
+  assert.match(mainSummary, /event_dom_listener_contract\(input\)/);
+  assert.match(mainSummary, /listener_calls\(scheduleAutoSave\)/);
+  assert.match(mainSummary, /command_invoke_argument_contract\(save_file_content,file_path,content\)/);
+  assert.match(rustSummary, /command_handler_argument_contract\(save_file_content,content,filePath\)/);
+
+  const bundle = buildRuntimePlanEvidenceBundle({
+    objective: "修复打开文件后立即显示未保存状态并弹出缺少保存路径的问题。",
+    evidenceRecords: [
+      { tool: "read_file", target: "src/components/editor.js", status: "succeeded", summary: editorSummary },
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: mainSummary },
+      { tool: "read_file", target: "src-tauri/src/main.rs", status: "succeeded", summary: rustSummary },
+    ],
+  });
+  const closure = assessPlanClosureEvidence(bundle);
+  assert.ok(closure.contractMismatchKinds.includes(
+    "command_argument_case:save_file_content:file_path->filePath",
+  ));
+  assert.equal(closure.ready, true);
+  assert.ok(bundle.changeTargets.includes("src/main.js"));
+});
+
+test("listener evidence includes effects inside control flow but excludes nested callable bodies", () => {
+  const source = [
+    "surface.addEventListener('record-change', () => {",
+    "  if (record.active) {",
+    "    markRecordDirty();",
+    "    scheduleRecordSave();",
+    "  }",
+    "  for (const item of record.items) {",
+    "    updateRecordPreview(item);",
+    "  }",
+    "  function deferredWork() { hiddenFunctionEffect(); }",
+    "  const deferredArrow = () => hiddenArrowEffect();",
+    "  class DeferredWorker { run() { hiddenClassEffect(); } }",
+    "});",
+  ].join("\n");
+  const facts = extractPlanEvidenceSourceFacts(source);
+  const listenerCalls = facts.find((fact) => fact.startsWith("listener_calls(")) || "";
+
+  assert.match(listenerCalls, /markRecordDirty/);
+  assert.match(listenerCalls, /scheduleRecordSave/);
+  assert.match(listenerCalls, /updateRecordPreview/);
+  assert.doesNotMatch(listenerCalls, /deferredWork|hiddenFunctionEffect/);
+  assert.doesNotMatch(listenerCalls, /deferredArrow|hiddenArrowEffect/);
+  assert.doesNotMatch(listenerCalls, /DeferredWorker|hiddenClassEffect/);
+});
+
+test("raw source reads preserve contracts without a READ_FILE_RESULT envelope", () => {
+  const rawMain = [
+    "export function bindEditor(editorEl) {",
+    "  editorEl.addEventListener('input', () => {",
+    "    markDirty();",
+    "    scheduleAutoSave();",
+    "  });",
+    "}",
+    "await invoke('save_file_content', {",
+    "  file_path: file.path,",
+    "  content",
+    "});",
+  ].join("\n");
+  const summary = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src/main.js",
+    content: rawMain,
+    maxChars: 500,
+  });
+  const facts = extractPlanEvidenceSourceFacts(rawMain);
+
+  assert.match(summary, /bindEditor/);
+  assert.ok(facts.includes("command_invoke_argument_contract(save_file_content,file_path,content)"));
+  assert.ok(facts.includes("listener_calls(markDirty,scheduleAutoSave)"));
+});
+
+test("Tauri invoke transport keeps model drafting open until the handler contract is read", () => {
+  const frontendFacts = extractPlanEvidenceSourceFacts([
+    "import { invoke } from '@tauri-apps/api/core';",
+    "export async function save(file) {",
+    "  return invoke('save_file_content', { file_path: file.path, content: file.content });",
+    "}",
+  ].join("\n"));
+  assert.ok(frontendFacts.includes("command_transport_contract(tauri)"));
+  assert.ok(frontendFacts.includes("command_transport_contract(tauri,save_file_content)"));
+
+  const buildBundle = (extraRecords = []) => buildRuntimePlanEvidenceBundle({
+    objective: "修复打开本地文件后保存路径异常的问题。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "save(file) invokes the runtime save command with the document path and content",
+      facts: frontendFacts,
+    }, {
+      tool: "read_file",
+      target: "src/components/editor.js",
+      status: "succeeded",
+      summary: "setValue assigns loaded content and dispatches an input event",
+    }, ...extraRecords],
+  });
+  const openBundle = buildBundle();
+  const openClosure = assessPlanClosureEvidence(openBundle);
+  assert.deepEqual(openClosure.unresolvedContractKinds, [
+    "command_handler_contract:save_file_content",
+  ]);
+  assert.equal(isPlanEvidenceReadyForModelDraft(openBundle, openClosure), false);
+  const openPacket = formatPlanEvidenceBundleForModel(openBundle, "zh", openClosure);
+  assert.match(openPacket, /证据门：未闭合/);
+  assert.match(openPacket, /后端命令 `save_file_content` 的处理器定义和参数签名/);
+  const prematurePlan = composePlanArtifactFromEvidence({
+    userGoal: openBundle.objective,
+    evidence: [],
+    evidenceRecords: [],
+    files: openBundle.changeTargets,
+    language: "zh",
+    evidenceBundle: openBundle,
+  });
+  const prematureMaterialization = materializePlanArtifactFromVisibleText({
+    visibleText: prematurePlan,
+    userGoal: openBundle.objective,
+    evidenceBundle: openBundle,
+    expectedEvidenceBundleHash: openBundle.hash,
+    language: "zh",
+  });
+  assert.equal(prematureMaterialization.ok, false);
+  assert.match(
+    prematureMaterialization.reason || "",
+    /unverified_plan_contract_counterpart:command_handler_contract:save_file_content/,
+  );
+
+  const handlerFacts = extractPlanEvidenceSourceFacts([
+    "#[tauri::command]",
+    "fn save_file_content(content: String, file_path: String) -> Result<(), String> { Ok(()) }",
+  ].join("\n"));
+  const closedBundle = buildBundle([{
+    tool: "read_file",
+    target: "src-tauri/src/main.rs",
+    status: "succeeded",
+    summary: "the backend save handler accepts content and a required file path",
+    facts: handlerFacts,
+  }]);
+  const closedClosure = assessPlanClosureEvidence(closedBundle);
+  assert.deepEqual(closedClosure.unresolvedContractKinds, []);
+  assert.ok(closedClosure.contractMismatchKinds.includes(
+    "command_argument_case:save_file_content:file_path->filePath",
+  ));
+  assert.equal(isPlanEvidenceReadyForModelDraft(closedBundle, closedClosure), true);
+});
+
+function buildCommandArgumentMismatchDispositionBundle() {
+  return buildRuntimePlanEvidenceBundle({
+    objective: "修复打开本地文件后保存路径参数不一致的问题。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "command_invoke_argument_contract(save_file_content,file_path,content)",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "command_handler_argument_contract(save_file_content,content,filePath)",
+      },
+      {
+        tool: "read_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        summary: "setValue assigns loaded content and dispatches input to the editor state owner",
+      },
+    ],
+  });
+}
+
+test("confirmed command argument mismatch rejects a plan that omits its disposition", () => {
+  const bundle = buildCommandArgumentMismatchDispositionBundle();
+  assert.ok(assessPlanClosureEvidence(bundle).contractMismatchKinds.includes(
+    "command_argument_case:save_file_content:file_path->filePath",
+  ));
+  const content = [
+    "# 保存流程修复计划",
+    "## 已确认证据",
+    "- `src/main.js` 与后端保存命令存在已确认的参数边界差异。",
+    "## 关键改动",
+    "- 修改 `src/main.js`，强化有路径文件的直接保存分支并避免误弹对话框。",
+    "## 测试方案",
+    "- 打开文件并保存，断言不会误弹另存为窗口。",
+  ].join("\n");
+
+  const validation = validateConfirmedContractMismatchDisposition({
+    content,
+    evidenceBundle: bundle,
+  });
+  assert.equal(validation.ok, false);
+  assert.match(
+    validation.reason || "",
+    /uncovered_confirmed_contract_mismatches:command_argument_case:save_file_content:file_path->filePath/,
+  );
+  assert.equal(validation.recoveryAction, "rewrite");
+  assert.equal(
+    validateConfirmedContractMismatchDisposition({ content }).ok,
+    true,
+    "plans without a frozen evidence bundle keep their existing admission semantics",
+  );
+
+  const generatedPlan = composePlanArtifactFromEvidence({
+    userGoal: bundle.objective,
+    evidence: [],
+    evidenceRecords: [],
+    files: bundle.changeTargets,
+    language: "zh",
+    evidenceBundle: bundle,
+  });
+  const omittedGeneratedPlan = generatedPlan.replace(
+    /^-\s*修改[^\n]*`save_file_content`[^\n]*`file_path`[^\n]*`filePath`[^\n]*$/m,
+    "- 修改 `src/main.js`，强化有路径文件的直接保存分支并避免误弹对话框。",
+  );
+  assert.notEqual(omittedGeneratedPlan, generatedPlan, "the fixture must remove the exact disposition line");
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: omittedGeneratedPlan,
+    userGoal: bundle.objective,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+  assert.equal(materialized.ok, false);
+  assert.match(materialized.reason || "", /uncovered_confirmed_contract_mismatches/);
+});
+
+test("confirmed command argument mismatch accepts an explicit owner-bound actual-to-expected change", () => {
+  const bundle = buildCommandArgumentMismatchDispositionBundle();
+  const content = [
+      "# 保存流程修复计划",
+      "## 关键改动",
+      "- 修改 `src/main.js` 的 `save_file_content` 调用，将 `file_path` 改为命令边界要求的 `filePath`，保持后端签名不变。",
+      "## 测试方案",
+      "- 打开本地文件并保存，断言直接写回原路径且不弹出另存为窗口。",
+    ].join("\n");
+  const validation = validateConfirmedContractMismatchDisposition({
+    content,
+    evidenceBundle: bundle,
+  });
+
+  assert.equal(validation.ok, true, validation.reason || "");
+
+  const generatedPlan = composePlanArtifactFromEvidence({
+    userGoal: bundle.objective,
+    evidence: [],
+    evidenceRecords: [],
+    files: bundle.changeTargets,
+    language: "zh",
+    evidenceBundle: bundle,
+  });
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: generatedPlan,
+    userGoal: bundle.objective,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+  assert.equal(materialized.ok, true, materialized.reason || "");
+  assert.match(materialized.content || "", /`save_file_content`：`file_path` -> `filePath`/);
+});
+
+test("confirmed mismatch terms in evidence, scattered roles, or an unrelated grounded owner do not fake disposition", () => {
+  const bundle = buildCommandArgumentMismatchDispositionBundle();
+  const scattered = validateConfirmedContractMismatchDisposition({
+    content: [
+      "# 保存流程修复计划",
+      "## 已确认证据",
+      "- `save_file_content` 当前发送 `file_path`，处理器暴露 `filePath`。",
+      "## 关键改动",
+      "- 修改 `src/main.js` 的路径保存逻辑。",
+      "## 公共 API / 接口 / 类型",
+      "- 保持 `filePath` 类型不变。",
+      "## 测试方案",
+      "- 验证 `save_file_content` 保存成功。",
+    ].join("\n"),
+    evidenceBundle: bundle,
+  });
+  assert.equal(scattered.ok, false);
+
+  const unrelatedOwner = validateConfirmedContractMismatchDisposition({
+    content: [
+      "# 保存流程修复计划",
+      "## 关键改动",
+      "- 修改 `src/components/editor.js`，将 `save_file_content` 的 `file_path` 改为 `filePath`。",
+      "## 测试方案",
+      "- 验证编辑器加载行为。",
+    ].join("\n"),
+    evidenceBundle: bundle,
+  });
+  assert.equal(unrelatedOwner.ok, false);
+  assert.match(unrelatedOwner.reason || "", /uncovered_confirmed_contract_mismatches/);
+
+  const casingBundle = buildRuntimePlanEvidenceBundle({
+    objective: "修复 create_user 参数命名契约。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/users.js",
+        status: "succeeded",
+        summary: "command_invoke_argument_contract(create_user,userID)",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/src/users.rs",
+        status: "succeeded",
+        summary: "command_handler_argument_contract(create_user,userId)",
+      },
+    ],
+  });
+  const wrongCasingDirection = validateConfirmedContractMismatchDisposition({
+    content: [
+      "# 用户参数修复计划",
+      "## 关键改动",
+      "- 修改 `src/users.js` 的 `create_user` 参数：`userID` -> `userID`；`userId` 仅用于补充接口说明。",
+    ].join("\n"),
+    evidenceBundle: casingBundle,
+  });
+  assert.equal(wrongCasingDirection.ok, false, "actual -> actual must not borrow an expected token later in the line");
+});
+
+test("confirmed mismatch disposition parser covers the existing command, event, and permission vocabulary", () => {
+  const bundle = buildRuntimePlanEvidenceBundle({
+    objective: "修复桌面文件打开链路中的命令注册、事件监听和对话框权限问题。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "command_invoke_contract(read_file_content) event_dom_listener_contract(file-open) import open from '@tauri-apps/plugin-dialog'",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "handler_contract(save_file_content) event_emit_contract(file-open) tauri_plugin_dialog::init()",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/capabilities/default.json",
+        status: "succeeded",
+        summary: "permission_contract(core:default,opener:default)",
+      },
+    ],
+  });
+  assert.deepEqual(assessPlanClosureEvidence(bundle).contractMismatchKinds, [
+    "unregistered_command:read_file_content",
+    "event_listener_api:file-open",
+    "missing_permission:dialog",
+  ]);
+  const generatedPlan = composePlanArtifactFromEvidence({
+    userGoal: bundle.objective,
+    evidence: [],
+    evidenceRecords: [],
+    files: bundle.changeTargets,
+    language: "zh",
+    evidenceBundle: bundle,
+  });
+  const validation = validateConfirmedContractMismatchDisposition({
+    content: generatedPlan,
+    evidenceBundle: bundle,
+  });
+
+  assert.equal(validation.ok, true, `${validation.reason || ""}\n${generatedPlan}`);
+});
+
+test("confirmed mismatch disposition parser covers configuration and producer-field contracts", () => {
+  const fixtures = [
+    {
+      expected: "config_value_mismatch:development_server_port",
+      bundle: buildRuntimePlanEvidenceBundle({
+        objective: "统一桌面开发启动链路的端口配置。",
+        evidenceRecords: [
+          {
+            tool: "read_file",
+            target: "desktop/app.conf.json",
+            status: "succeeded",
+            summary: "devUrl: http://localhost:1420",
+          },
+          {
+            tool: "read_file",
+            target: "vite.config.js",
+            status: "succeeded",
+            summary: "server port: 5173",
+          },
+        ],
+      }),
+    },
+    {
+      expected: "producer_missing_required_field:creatorName",
+      bundle: buildRuntimePlanEvidenceBundle({
+        objective: "修复 creatorName 从解析器到图表消费方的字段契约。",
+        evidenceRecords: [
+          {
+            tool: "read_file",
+            target: "src/parser.ts",
+            status: "succeeded",
+            summary: "field_contract(row.creatorName,optional) returned_field_contract(id) returned_field_contract(value)",
+          },
+          {
+            tool: "read_file",
+            target: "src/types.ts",
+            status: "succeeded",
+            summary: "field_contract(ChartPoint.creatorName,required)",
+          },
+          {
+            tool: "read_file",
+            target: "src/chart.ts",
+            status: "succeeded",
+            summary: "field_read_contract(creatorName)",
+          },
+        ],
+      }),
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    assert.ok(
+      assessPlanClosureEvidence(fixture.bundle).contractMismatchKinds.includes(fixture.expected),
+      fixture.expected,
+    );
+    const generatedPlan = composePlanArtifactFromEvidence({
+      userGoal: fixture.bundle.objective,
+      evidence: [],
+      evidenceRecords: [],
+      files: fixture.bundle.changeTargets,
+      language: "zh",
+      evidenceBundle: fixture.bundle,
+    });
+    const validation = validateConfirmedContractMismatchDisposition({
+      content: generatedPlan,
+      evidenceBundle: fixture.bundle,
+    });
+    assert.equal(validation.ok, true, `${fixture.expected}: ${validation.reason || ""}\n${generatedPlan}`);
+  }
+});
+
+test("a generic local function named invoke creates no backend obligation but still needs a confirmed rationale", () => {
+  const facts = extractPlanEvidenceSourceFacts([
+    "export function run(request) {",
+    "  return invoke('save_user', { request, traceId: request.id });",
+    "}",
+  ].join("\n"));
+  assert.equal(facts.some((fact) => fact.startsWith("command_transport_contract")), false);
+  const bundle = buildPlanEvidenceBundle({
+    objective: "修复本地任务调度失败的问题。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/local-runner.js",
+      status: "succeeded",
+      summary: "run(request) forwards a request and trace ID into the local dispatcher",
+      facts,
+    }, {
+      tool: "read_file",
+      target: "src/request-store.js",
+      status: "succeeded",
+      summary: "the store owns request lifecycle state and failure reporting",
+    }],
+  });
+  const closure = assessPlanClosureEvidence(bundle);
+  assert.deepEqual(closure.unresolvedContractKinds, []);
+  assert.equal(closure.ready, false);
+  assert.equal(isPlanEvidenceReadyForModelDraft(bundle, closure), false);
+});
+
+test("command argument mismatch detection is casing-style neutral", () => {
+  const bundle = buildRuntimePlanEvidenceBundle({
+    objective: "修复 create_user 命令参数契约不一致的问题。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/users.js",
+      status: "succeeded",
+      summary: "command_invoke_argument_contract(create_user,user_id,display-name)",
+    }, {
+      tool: "read_file",
+      target: "src-tauri/src/users.rs",
+      status: "succeeded",
+      summary: "command_handler_argument_contract(create_user,UserId,displayName)",
+    }],
+  });
+  const mismatches = assessPlanClosureEvidence(bundle).contractMismatchKinds;
+  assert.ok(mismatches.includes("command_argument_case:create_user:user_id->UserId"));
+  assert.ok(mismatches.includes("command_argument_case:create_user:display-name->displayName"));
+});
+
+test("invoke argument contracts keep shorthand keys but do not promote nested payload fields", () => {
+  const facts = extractPlanEvidenceSourceFacts([
+    "await invoke('save_flat', { filePath, content });",
+    "await invoke('save_wrapped', {",
+    "  request: {",
+    "    file_path: file.path,",
+    "    content,",
+    "  },",
+    "  traceId,",
+    "});",
+  ].join("\n"));
+
+  assert.ok(facts.includes(
+    "command_invoke_argument_contract(save_flat,filePath,content)",
+  ), JSON.stringify(facts));
+  assert.ok(facts.includes(
+    "command_invoke_argument_contract(save_wrapped,request,traceId)",
+  ), JSON.stringify(facts));
+  const wrappedFact = facts.find((fact) => fact.startsWith(
+    "command_invoke_argument_contract(save_wrapped",
+  )) || "";
+  assert.doesNotMatch(wrappedFact, /file_path|content/);
+});
+
+test("model-authored map-reduce summaries cannot become source contract facts", () => {
+  const facts = extractPlanEvidenceSourceFacts([
+    "[FILE MAP-REDUCE SUMMARY]",
+    "The file contains invoke('save_file_content', { file_path, content }).",
+    "It also appears to define #[tauri::command] fn save_file_content(content: String, file_path: Option<String>),",
+  ].join("\n"));
+  assert.deepEqual(facts, []);
+});
+
+test("source fact extraction does not let an inline handler registry swallow a following command", () => {
+  const facts = extractPlanEvidenceSourceFacts([
+    "use tauri::{AppHandle, Manager};",
+    "tauri::Builder::default().invoke_handler(tauri::generate_handler![save_file_content]);",
+    "#[tauri::command]",
+    "fn save_file_content(app: AppHandle, content: String, file_path: Option<String>) -> Result<(), String> {",
+    "  let path = file_path.ok_or_else(|| \"missing path\".to_string())?;",
+    "  std::fs::write(path, content).map_err(|error| error.to_string())",
+    "}",
+  ].join("\n"));
+  assert.ok(facts.includes(
+    "command_handler_argument_contract(save_file_content,content,filePath)",
+  ), JSON.stringify(facts));
+});
+
+test("Tauri command argument contracts honor supported rename strategies without guessing", () => {
+  const extractArgumentFact = (attribute) => extractPlanEvidenceSourceFacts([
+    attribute,
+    "fn save_file_content(content: String, file_path: Option<String>) -> Result<(), String> { Ok(()) }",
+  ].join("\n")).find((fact) => fact.startsWith("command_handler_argument_contract")) || "";
+
+  assert.equal(
+    extractArgumentFact("#[tauri::command]"),
+    "command_handler_argument_contract(save_file_content,content,filePath)",
+  );
+  assert.equal(
+    extractArgumentFact("#[tauri::command(rename_all = \"snake_case\")]"),
+    "command_handler_argument_contract(save_file_content,content,file_path)",
+  );
+  assert.equal(
+    extractArgumentFact("#[tauri::command(rename_all = \"kebab-case\")]"),
+    "command_handler_argument_contract(save_file_content,content,file-path)",
+  );
+  assert.equal(
+    extractArgumentFact("#[tauri::command(rename_all = \"PascalCase\")]"),
+    "command_handler_argument_contract(save_file_content,Content,FilePath)",
+  );
+  assert.equal(
+    extractArgumentFact("#[tauri::command(rename_all = \"provider-special\")]"),
+    "command_handler_argument_contract(save_file_content)",
+  );
+});
+
+test("model drafting and deterministic fallback both reject unrelated source excerpts", () => {
+  const bundle = buildPlanEvidenceBundle({
+    objective: "找到打开文件后界面异常的原因并制定修复计划。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "function switchToTab loads editor content and updates the active document UI",
+    }, {
+      tool: "read_file",
+      target: "src/components/editor.js",
+      status: "succeeded",
+      summary: "function setValue assigns editor content and dispatches an input event",
+    }],
+  });
+  const closure = assessPlanClosureEvidence(bundle);
+
+  assert.equal(isPlanEvidenceBundleReady(bundle), true);
+  assert.equal(closure.ready, false);
+  assert.equal(closure.reason, "change_targets_lack_confirmed_rationale");
+  assert.equal(isPlanEvidenceReadyForModelDraft(bundle, closure), false);
+  assert.equal(hasDeterministicPlanMaterializationEvidence(bundle), false);
 });
 
 test("error-handling strings from the logged MD Viewer run cannot become a reviewable repair plan", () => {
@@ -708,7 +1907,7 @@ test("error-handling strings from the logged MD Viewer run cannot become a revie
   );
 });
 
-test("source evidence preserves interface contracts and detects cross-file mismatches", () => {
+test("source evidence detects cross-file mismatches without trusting a prose facet mapping", () => {
   const summarizeRead = (target, body) => summarizePlanEvidenceDetail({
     tool: "read_file",
     target,
@@ -760,7 +1959,7 @@ test("source evidence preserves interface contracts and detects cross-file misma
     "1、双击 Markdown 文件后显示空白界面。",
     "2、应用内打开按钮不能弹出文件选择窗口。",
   ].join("\n");
-  const bundle = buildPlanEvidenceBundle({
+  const bundle = buildRuntimePlanEvidenceBundle({
     objective,
     evidenceRecords: [
       { tool: "read_file", target: "src/main.js", status: "succeeded", summary: frontendSummary },
@@ -821,10 +2020,8 @@ test("source evidence preserves interface contracts and detects cross-file misma
     expectedEvidenceBundleHash: bundle.hash,
     language: "zh",
   });
-  assert.equal(materialized.ok, true, `${materialized.reason || ""}\n${plan}`);
-  assert.match(materialized.content || "", /## 需求分面追踪/);
-  assert.match(materialized.content || "", /分面 1（[^\n]+）：[^\n]+改动目标 C1、C2/);
-  assert.match(materialized.content || "", /分面 2（[^\n]+）：[^\n]+改动目标 C3/);
+  assert.equal(materialized.ok, false);
+  assert.match(materialized.reason || "", /uncovered_user_goal_facets:1,2/);
 });
 
 test("logged MD Viewer diagnostics keep contract owners as change targets instead of error-reporting consumers", () => {
@@ -853,7 +2050,7 @@ test("logged MD Viewer diagnostics keep contract owners as change targets instea
       summary: "L175: event_dom_listener_contract(click) L7: import open from '@tauri-apps/plugin-dialog'; L211: console.error('保存文件失败:', error)",
     },
   ];
-  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const bundle = buildRuntimePlanEvidenceBundle({ objective, evidenceRecords: records });
   const assessment = assessPlanClosureEvidence(bundle);
 
   assert.deepEqual(bundle.changeTargets, [
@@ -895,7 +2092,7 @@ test("logged MD Viewer diagnostics keep contract owners as change targets instea
     language: "zh",
   });
   assert.equal(materialized.ok, false);
-  assert.match(materialized.reason || "", /uncovered_user_goal_facets:2/);
+  assert.match(materialized.reason || "", /uncovered_user_goal_facets:1,2/);
   assert.equal(materialized.quality?.recoveryAction, "rewrite");
 });
 
@@ -938,7 +2135,7 @@ test("facet mapping cannot borrow unrelated changes for unread or unowned target
       summary: "L18: a development server setting declaration is present; value omitted from captured evidence",
     },
   ];
-  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const bundle = buildRuntimePlanEvidenceBundle({ objective, evidenceRecords: records });
 
   assert.deepEqual(bundle.changeTargets, [
     "desktop/src/main.rs",
@@ -973,7 +2170,7 @@ test("facet mapping cannot borrow unrelated changes for unread or unowned target
   });
 
   assert.equal(materialized.ok, false);
-  assert.match(materialized.reason || "", /uncovered_user_goal_facets:2,3/);
+  assert.match(materialized.reason || "", /uncovered_user_goal_facets:1,2,3/);
   assert.equal(materialized.quality?.recoveryAction, "rewrite");
   assert.doesNotMatch(plan, /分面 2（/);
   assert.doesNotMatch(plan, /分面 3（/);
@@ -995,7 +2192,7 @@ test("read-backed startup configuration values expose a generic cross-file misma
       summary: "L18: server port: 5173",
     },
   ];
-  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const bundle = buildRuntimePlanEvidenceBundle({ objective, evidenceRecords: records });
   const assessment = assessPlanClosureEvidence(bundle);
 
   assert.deepEqual(bundle.changeTargets, [
@@ -1093,7 +2290,7 @@ test("Plan diagnostic absence claims are rejected when read evidence contains th
     "## 关键改动",
     "- 修改 `src/main.js` 的初始化顺序。",
     "## 验证标准",
-    "- 运行测试。",
+    "- 运行 `npm test`，断言初始化顺序回归用例通过。",
     "## 风险",
     "- 保持行为兼容。",
   ].join("\n");
@@ -1288,11 +2485,11 @@ test("Plan diagnostic ordering uses structured listener facts and does not confu
     ].join("\n"),
   });
   const facts = extractPlanEvidenceFacts(summary);
-  assert.match(summary, /listener_calls\(initToolbar,initEditor,initPreview,initOutline\)/);
+  assert.match(summary, /listener_calls\(initToolbar,initEditor,initPreview,initOutline,nestedConditionalCall\)/);
   assert.ok(facts.some((fact) => /event_dom_listener_contract\(DOMContentLoaded\)/.test(fact)));
   const listenerCallsFact = facts.find((fact) => /listener_calls\(/.test(fact)) || "";
-  assert.match(listenerCallsFact, /listener_calls\(initToolbar,initEditor,initPreview,initOutline\)/);
-  assert.doesNotMatch(listenerCallsFact, /localDefinition|nestedDefinitionCall|localArrow|nestedArrowCall|nestedConditionalCall/);
+  assert.match(listenerCallsFact, /listener_calls\(initToolbar,initEditor,initPreview,initOutline,nestedConditionalCall\)/);
+  assert.doesNotMatch(listenerCallsFact, /localDefinition|nestedDefinitionCall|localArrow|nestedArrowCall/);
 
   const orderingClaim = "- `src/main.js` 中 `initToolbar()` 在 DOM 元素就绪前被调用（主因）。";
   assert.equal(findContradictedPlanDiagnosticClaim({
@@ -1317,7 +2514,7 @@ test("Plan diagnostic ordering uses structured listener facts and does not confu
   }), null);
 });
 
-test("numbered facets may close through an evidence-backed no-change decision", () => {
+test("evidence-backed no-change decisions do not let prose mappings close an unrelated mutation facet", () => {
   const objective = [
     "完成两个独立目标：",
     "1、外部打开文档后内容没有载入。",
@@ -1349,7 +2546,7 @@ test("numbered facets may close through an evidence-backed no-change decision", 
       summary: "L18: server port: 1420",
     },
   ];
-  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const bundle = buildRuntimePlanEvidenceBundle({ objective, evidenceRecords: records });
   assert.deepEqual(assessPlanClosureEvidence(bundle).contractMismatchKinds, [
     "unregistered_command:load_document",
   ]);
@@ -1379,7 +2576,8 @@ test("numbered facets may close through an evidence-backed no-change decision", 
     expectedEvidenceBundleHash: bundle.hash,
     language: "zh",
   });
-  assert.equal(materialized.ok, true, materialized.reason);
+  assert.equal(materialized.ok, false);
+  assert.match(materialized.reason || "", /uncovered_user_goal_facets:1/);
 });
 
 test("source evidence summaries retain development port assignments", () => {
@@ -1500,7 +2698,7 @@ test("source-backed field contracts detect a generic producer-to-consumer mismat
   assert.ok(records[3].facts.includes("field_contract(Order.creatorName,required)"));
 
   const objective = "请为 CSV creatorName 数据链路生成一个可审批的整改计划。";
-  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const bundle = buildRuntimePlanEvidenceBundle({ objective, evidenceRecords: records });
   const closure = assessPlanClosureEvidence(bundle);
   assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
   assert.deepEqual(closure.contractMismatchKinds, [
@@ -1562,6 +2760,10 @@ test("plan evidence separates an explicit mutation owner from a referenced contr
 
   assert.equal(bundle.facts.length, 2);
   assert.deepEqual(bundle.changeTargets, ["src/main.js"]);
+  assert.deepEqual(bundle.observedTargets, [
+    "src/components/toolbar.js",
+    "src/main.js",
+  ]);
   assert.equal(assessPlanClosureEvidence(bundle).ready, true);
 });
 
@@ -1742,7 +2944,7 @@ test("materializes Gemma-style markdown fix plan without structured proposal tag
     "",
     "### 验证方式",
     "- 运行 Node 单测，覆盖 Gemma4 普通方案和 quick reply 路由。",
-    "- 使用 Browser/Playwright 打开审批流程并验证批准后的证据工具仍可调用。",
+    "- 使用 Browser/Playwright 点击批准按钮，然后断言 Plan Review 状态显示 executing，且工具调用列表包含 read_file。",
   ].join("\n");
 
   const result = materializePlanArtifactFromVisibleText({ visibleText });
@@ -1843,8 +3045,8 @@ test("materializes Gemma4 proposal plan with tables without leaking protocol mar
       "- 无公共 API、接口或类型变化；仅新增内部映射 helper 和渲染回归测试。",
       "",
       "### Test Plan",
-      "- 运行 focused node 测试。",
-      "- 用浏览器确认 PlanPanel table 可见。",
+      "- 运行 `node --test tests/node/plan-materialization.test.mjs`，断言字段映射与 GFM 表格用例通过。",
+      "- 断言：导入带中文键名的 CSV 后 PlanPanel 的 artifact 与 preview 两条路径都显示 GFM 表格。",
       "",
       "### 假设与默认值",
       "- 保留现有交互结构，只修复数据映射和渲染。",
@@ -1992,6 +3194,49 @@ test("repairs visible plan text that has evidence but no explicit user goal sect
   assert.match(result.content || "", /- 修复 CSV 导入后 Dashboard 指标没有正确更新/);
 });
 
+test("accepts a repair plan whose document title follows visual context and whose interface role owns nested sections", () => {
+  const content = [
+    "根据已收集的证据，我现在输出完整的修复计划。",
+    "",
+    "## 视觉观察",
+    "- 截图显示打开本地 Markdown 文件后出现保存路径错误。",
+    "",
+    "# 修复计划：编辑标题与本地文件保存路径",
+    "",
+    "## Summary",
+    "- 修复编辑界面的标题显示，并修复打开本地文件后的保存路径链路。",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` 的文件打开入口把对话框结果传给 `openFiles`。",
+    "- `src-tauri/src/main.rs` 的保存命令要求存在文件路径。",
+    "",
+    "## Key Changes",
+    "### 变更 1：统一文件打开结果",
+    "- 修改 `src/main.js`，在对话框适配边界规范化路径，再传给读取和保存链路。",
+    "### 变更 2：统一标题状态",
+    "- 修改 `src/main.js`，让标签标题和窗口标题各自只呈现约定的信息。",
+    "",
+    "## Public APIs/Interfaces/Types",
+    "### 前端 API 变更",
+    "| API | 变更 |",
+    "| --- | --- |",
+    "| `handleOpenFile()` | 统一返回值归一化 |",
+    "| `openFiles(filePaths)` | 保持接收字符串路径数组 |",
+    "### 后端 API 无变更",
+    "- `save_file_content(content, file_path)` 保持现有签名。",
+    "",
+    "## Test Plan",
+    "- 运行 `npm run build`，预期退出码为 0。",
+    "- 打开一个本地 Markdown 文件并保存，预期不出现缺少保存路径错误。",
+    "",
+    "## Assumptions/Defaults",
+    "- 保持现有 Tauri 命令签名和文件格式支持范围。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason);
+});
+
 test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [
@@ -2012,8 +3257,8 @@ test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", ()
       "- `src/components/Dashboard/OverviewCards.tsx`",
       "",
       "## Validation",
-      "- 运行相关 Node/Vitest 测试。",
-      "- 手动导入 CSV，确认 Dashboard 指标刷新。",
+      "- 运行 `npm test`，断言上传组件到 store 的数据写入回归用例通过。",
+      "- 断言：导入 CSV 后 Dashboard 概览指标读取并显示 store 中的最新状态。",
     ].join("\n"),
     userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
     evidence: [
@@ -2042,12 +3287,12 @@ test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", ()
   assert.match(result.content || "", /src\/components\/FileUploader\/DragUpload\.tsx/);
 });
 
-test("canonicalizes Chinese formal repair plan with likely root causes", () => {
+test("canonicalizes Chinese formal repair plan with explicitly unverified root-cause hypotheses", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [
       "正式计划：修复计划：数据不显示 + 深色模式",
       "",
-      "根因分析",
+      "未验证假设",
       "问题 1：数据不显示",
       "可能根因：CSV 数据已经被 useChartData 解析，但 dashboardStore 聚合指标时没有把最新 dataset 同步到概览状态。",
       "",
@@ -2116,7 +3361,7 @@ test("canonicalizes missing confirmed facts from the evidence ledger", () => {
       "- `src/lib/orchestrator.ts`",
       "",
       "## Validation",
-      "- Run focused Node tests and the production build.",
+      "- Run `node --test tests/node/plan-materialization.test.mjs` and `npm run build`; both commands must exit with status 0.",
     ].join("\n"),
     evidence: [
       "read_file src/lib/planMaterialization.ts; excerpt=visible markdown plans are materialized before review",
@@ -2153,6 +3398,26 @@ test("rejects tool-log noise instead of canonicalizing it", () => {
 
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /tool_log_noise|not_structured|quality_gate|too_short/);
+});
+
+test("protocol markup rejection reports the bounded offending tag", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "<proposed_plan>",
+      "# Repair plan",
+      "## Key Changes",
+      "- Modify `src/main.ts` so the startup state remains consistent.",
+      "<tool_call>read_file</tool_call>",
+      "## Test Plan",
+      "- Run `npm test` and require exit code 0.",
+      "</proposed_plan>",
+    ].join("\n"),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "protocol_noise");
+  assert.equal(result.quality?.failureStage, "protocol_markup");
+  assert.equal(result.quality?.failurePreview, "<tool_call");
 });
 
 test("rejects low quality visible text instead of materializing a plan", () => {
@@ -2205,6 +3470,57 @@ test("materialization preserves the quality rejection for an empty change body",
   assert.equal(result.ok, false);
   assert.equal(result.reason, "empty_plan_implementation_detail");
   assert.equal(result.quality?.canAutoRepair, false);
+  assert.equal(result.quality?.failureStage, "markdown_container");
+  assert.equal(result.quality?.failurePreview, "Change to:");
+});
+
+test("materialization removes a redundant empty list container when its sibling is a complete mutation", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Repair startup state",
+      "",
+      "## Summary",
+      "- Repair the incorrect startup title in `src/main.ts`.",
+      "",
+      "## Confirmed Evidence",
+      "- `src/main.ts` initializes the tab title from the stale `draftTitle` value before the tab renderer consumes it.",
+      "",
+      "## Key Changes",
+      "- **Change to:**",
+      "- Modify `src/main.ts` so initialization supplies the canonical document title to the existing tab renderer while preserving the renderer contract for downstream consumers.",
+      "",
+      "## Public APIs / Interfaces / Types",
+      "- No public API, interface, or type changes.",
+      "",
+      "## Test Plan",
+      "- Run `npm test` and require exit code 0.",
+      "",
+      "## Acceptance Criteria",
+      "- Assert that startup passes the canonical document title to the tab renderer and never passes `draftTitle`.",
+      "",
+      "## Assumptions / Defaults",
+      "- Preserve all unrelated startup behavior.",
+    ].join("\n"),
+    userGoal: "Repair the incorrect startup title in src/main.ts.",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      summary: "initialization passes stale draftTitle to the tab renderer",
+    }],
+    recentToolActivity: [{
+      name: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      detail: "initialization passes stale draftTitle to the tab renderer",
+    }],
+    language: "en",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "formatting_repaired_visible_plan");
+  assert.doesNotMatch(result.content || "", /Change to:/);
+  assert.match(result.content || "", /canonical document title/);
 });
 
 test("materialization rejects an empty named action heading before evidence repair", () => {
@@ -2538,7 +3854,12 @@ test("deterministic closure drops runtime plan instructions from assumptions", (
   assert.match(content, /useChartData\.ts/);
   assert.match(content, /CourseBarChart\.tsx/);
   assert.match(content, /分面 2/);
-  assert.equal(validateNumberedUserGoalFacetCoverage({ userGoal: sanitized.userGoal, content }).ok, true);
+  const facetCoverage = validateNumberedUserGoalFacetCoverage({
+    userGoal: sanitized.userGoal,
+    content,
+  });
+  assert.equal(facetCoverage.ok, false);
+  assert.match(facetCoverage.reason || "", /uncovered_user_goal_facets:1,2/);
   assert.doesNotMatch(content, /如果确实缺少关键业务选择|tsx 约束|imageParts|创建 plan\.md 是 runtime|user_options|excerpt=/i);
 });
 
@@ -2614,7 +3935,7 @@ test("deterministic plan preserves the exact creator to creatorName repair contr
   assert.match(content, /`src\/hooks\/useCsvParser\.ts`/);
   assert.match(content, /normalizeCsvOrder 目前只返回 creator/);
   assert.doesNotMatch(content, /npm run build/);
-  assert.match(content, /聚焦测试、构建检查或浏览器\/桌面验证/);
+  assert.match(content, /断言：针对/);
   assert.doesNotMatch(content, /course、date、status、amount/);
 });
 
@@ -3183,6 +4504,113 @@ test("canonicalization preserves long detailed lines and markdown formatting in 
   assert.doesNotMatch(result.content || "", /优雅降级\.\.\./);
 });
 
+test("canonicalized materialization preserves explicit diagnosis chains and typed R to E bindings", () => {
+  const evidenceRecords = [
+    {
+      tool: "read_file",
+      target: "src/editor.js",
+      status: "succeeded",
+      summary: "setValue incorrectly dispatches the same input event used for user edits",
+    },
+    {
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "the input listener sets isDirty and calls scheduleAutoSave",
+    },
+  ];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-canonical-diagnosis",
+    objective: "Fix the save dialog that appears after opening an existing document.",
+    evidenceRecords,
+  });
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Summary",
+      "- User goal: Fix the save dialog that appears after opening an existing document.",
+      "- Read file: src/editor.js; setValue dispatches the user-edit input event.",
+      "## Confirmed Evidence",
+      "- [E1] `src/editor.js` setValue dispatches the user-edit input event.",
+      "- [E2] `src/main.js` handles that event by setting isDirty and scheduling auto-save.",
+      "## Diagnosis / Inference",
+      "- [R1 inferred, E1 -> E2] Programmatic document loading enters the user-edit event chain and therefore schedules auto-save.",
+      "## Key Changes",
+      "- [C1, R1] Modify `src/editor.js` so programmatic value assignment does not dispatch the user-edit event.",
+      "## Test Plan",
+      "- [V1] Run `npm test` and assert that opening an existing document does not schedule auto-save or show a save dialog.",
+      "## Assumptions / Defaults",
+      "- Preserve the existing user-edit event behavior.",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceRecords,
+    files: bundle.observedTargets,
+    language: "en",
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "canonicalized_visible_plan");
+  assert.match(result.content || "", /^## Diagnosis \/ Inference$/m);
+  assert.match(result.content || "", /\[R1 inferred, E1 -> E2\]/);
+  assert.deepEqual(result.candidate?.diagnoses.map((diagnosis) => ({
+    id: diagnosis.id,
+    evidenceRefs: diagnosis.evidenceRefs,
+    chainRefs: diagnosis.chainRefs,
+  })), [{
+    id: "R1",
+    evidenceRefs: bundle.facts.map((fact) => fact.id),
+    chainRefs: bundle.facts.map((fact) => fact.id),
+  }]);
+  assert.deepEqual(result.candidate?.changes[0]?.diagnosisRefs, ["R1"]);
+});
+
+test("canonicalization preserves the multi-facet G/E/R/C/V traceability ledger", () => {
+  const userGoal = [
+    "1、找出保存后旧标题未刷新的根本原因。",
+    "2、找出删除后计数未更新的根本原因。",
+  ].join("\n");
+  const canonical = canonicalizePlanArtifactContent({
+    content: [
+      "# Summary",
+      "- 覆盖两个状态同步问题。",
+      "## 已确认证据",
+      "- [E1] `src/detail.ts` 保存后仍读取旧标题缓存。",
+      "- [E2] `src/list.ts` 删除后仍读取旧集合计数。",
+      "## 诊断 / 推断",
+      "- [R1 inferred, E1] 保存链遗漏详情标题缓存刷新。",
+      "- [R2 inferred, E2] 删除链遗漏最新集合计数派生。",
+      "## 关键改动",
+      "- [C1, R1] 修改 `src/detail.ts`，保存后刷新详情标题缓存。",
+      "- [C2, R2] 修改 `src/list.ts`，删除后从最新集合派生计数。",
+      "## 测试方案",
+      "- [V1] 保存新标题并断言详情页显示新标题。",
+      "- [V2] 删除记录并断言列表计数立即减少。",
+      "## 需求分面追踪",
+      "- G1 -> E1 -> R1 -> C1 -> V1",
+      "- G2 -> E2 -> R2 -> C2 -> V2",
+      "## 假设与默认值",
+      "- 保持未点名接口不变。",
+    ].join("\n"),
+    userGoal,
+    evidence: [
+      "read_file src/detail.ts; excerpt=保存后仍读取旧标题缓存",
+      "read_file src/list.ts; excerpt=删除后仍读取旧集合计数",
+    ],
+    files: ["src/detail.ts", "src/list.ts"],
+    language: "zh",
+  });
+
+  assert.ok(canonical);
+  assert.match(canonical, /## 需求分面追踪/);
+  assert.match(canonical, /G1 -> E1 -> R1 -> C1 -> V1/);
+  assert.equal(validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: canonical,
+    diagnosisRequired: true,
+  }).ok, true);
+});
+
 test("auto-detects framework design and game dev keywords to route to design.md kind", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [
@@ -3363,6 +4791,57 @@ test("candidate evidence binding does not misclassify validation references as s
 
   assert.equal(candidate.changes.length > 0, true);
   assert.equal(candidate.changes.every((change) => change.targetRef === "src/hooks/useCsvParser.ts"), true);
+  assert.deepEqual(validatePlanCandidate(candidate, bundle.hash), []);
+});
+
+test("candidate diagnosis binds an ordered evidence chain and its supported change", () => {
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-typed-diagnosis",
+    objective: "修复打开本地文件后误触发保存窗口的问题。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/editor.js",
+        status: "succeeded",
+        summary: "setValue dispatches the same input event used for user edits",
+      },
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "the input listener sets isDirty and calls scheduleAutoSave",
+      },
+    ],
+  });
+  const candidate = buildPlanCandidate({
+    content: [
+      "# 保存窗口修复计划",
+      "## 用户目标",
+      "- 修复打开本地文件后误触发保存窗口。",
+      "## 已确认证据",
+      "- [E1] `src/editor.js` 的 `setValue` 会派发输入事件。",
+      "- [E2] `src/main.js` 的输入监听器设置 `isDirty` 并调用 `scheduleAutoSave`。",
+      "## 诊断 / 推断",
+      "- [R1 inferred, E1 -> E2] 程序化加载复用了用户输入事件链，因而进入自动保存调度。",
+      "## 关键改动",
+      "- [C1, R1] 修改 `src/editor.js`，把程序化赋值与用户输入事件分离。",
+      "## 测试方案",
+      "- [V1] 打开已有文件，断言不出现保存窗口。",
+    ].join("\n"),
+    bundle,
+  });
+
+  assert.equal(candidate.schemaVersion, 5);
+  assert.deepEqual(candidate.diagnoses.map((diagnosis) => ({
+    certainty: diagnosis.certainty,
+    evidenceRefs: diagnosis.evidenceRefs,
+    chainRefs: diagnosis.chainRefs,
+  })), [{
+    certainty: "inferred",
+    evidenceRefs: bundle.facts.map((fact) => fact.id),
+    chainRefs: bundle.facts.map((fact) => fact.id),
+  }]);
+  assert.deepEqual(candidate.changes[0]?.diagnosisRefs, ["R1"]);
   assert.deepEqual(validatePlanCandidate(candidate, bundle.hash), []);
 });
 
@@ -3578,7 +5057,7 @@ test("materialization rejects the logged MD Viewer plan when index.html was prop
       "- 内部事件 payload 会变化，不新增公共 API。",
       "",
       "## 测试方案",
-      "- 运行构建并手动验证双击与工具栏打开。",
+      "- 运行 `npm run build`，断言构建退出码为 0；桌面双击与工具栏打开保留为后续交互复核。",
       "",
       "## 假设与默认值",
       "- 默认保持其他编辑功能不变。",
@@ -3686,7 +5165,8 @@ test("materialization repairs only the missing evidence section without broadeni
       "- 不新增公共 API；只统一现有内部 Tauri 事件 payload。",
       "",
       "## 测试方案",
-      "- 运行前端构建和 Rust 检查，并手动验证双击文件与工具栏按钮两条入口。",
+      "- 运行 `npm run build` 和 `cargo check --manifest-path src-tauri/Cargo.toml`，两个有限命令都必须以退出码 0 完成。",
+      "- 断言：双击文件与工具栏按钮两条入口都复用同一打开流程并显示所选 Markdown 内容。",
       "",
       "## 假设与默认值",
       "- 保持编辑器、保存和预览行为不变。",
@@ -3776,7 +5256,7 @@ test("materialization does not project metadata-only or failed reads into confir
       "- 不新增公共 API，保持内部事件 payload 类型不变。",
       "",
       "## 测试方案",
-      "- 运行前端构建并手动验证双击文件与工具栏按钮。",
+      "- 运行 `npm run build`，断言构建以退出码 0 完成；桌面入口保留为后续交互复核。",
       "- 同时验证启动参数为空、路径包含空格、重复打开同一文件时仍沿用现有错误处理和编辑器状态，不引入额外行为变化。",
       "",
       "## 假设与默认值",
@@ -3997,6 +5477,59 @@ test("rejects a structurally complete MD Viewer plan whose test plan is only dia
       { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "openFile" },
     ],
     language: "zh",
+  });
+  assert.equal(materialized.ok, false);
+  assert.equal(materialized.reason, "non_executable_test_plan");
+  assert.equal(materialized.repairableProjection?.path, ".MAIN/plans/plan.md");
+  assert.equal(materialized.repairableProjection?.content, content);
+});
+
+test("rejects the real MD Viewer validation shape that substitutes tauri dev, manual steps, and vague Playwright", () => {
+  const content = [
+    "# MD Viewer 问题修复计划",
+    "",
+    "## 摘要",
+    "- 修复初始标签页命名和打开本地文件后弹出保存对话框的问题。",
+    "",
+    "## 确认证据",
+    "- `src/main.js` 同时管理标签页状态和本地文件打开流程。",
+    "",
+    "## 关键实现改动",
+    "- 修改 `src/main.js` 的初始标签页状态与文件打开状态切换。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "### 验证步骤",
+    "1. **启动应用**：运行 `npm run tauri dev`",
+    "2. **验证初始标签页**：",
+    "   - 应用启动后，标签页应显示\"未命名文档\"而非空白",
+    "   - 编辑内容后，标签页应显示\"未命名文档 *\"",
+    "3. **验证文件打开**：",
+    "   - 点击\"打开\"按钮，选择本地 md 文件",
+    "   - 文件应正确打开，且不应弹出保存对话框",
+    "",
+    "### 自动化测试",
+    "```bash",
+    "# 运行开发服务器",
+    "npm run tauri dev",
+    "",
+    "# 手动验证上述测试步骤",
+    "# 或使用 Playwright 等工具进行自动化测试",
+    "```",
+    "",
+    "## 假设与默认值",
+    "- 保持其他编辑器行为不变。",
+  ].join("\n");
+
+  const quality = validateActionablePlanArtifact(content);
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reason, "non_executable_test_plan");
+
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    userGoal: "修复 MD Viewer 的标签页命名与打开文件后弹出保存对话框问题。",
   });
   assert.equal(materialized.ok, false);
   assert.equal(materialized.reason, "non_executable_test_plan");
@@ -4248,7 +5781,7 @@ test("empty structured test labels remain non-executable placeholders", () => {
   assert.equal(quality.reason, "non_executable_test_plan");
 });
 
-test("structured test labels cannot borrow content from the following line", () => {
+test("a standalone decidable assertion is a typed validation primitive", () => {
   const content = [
     "# 字段修复计划",
     "## 用户目标",
@@ -4271,8 +5804,7 @@ test("structured test labels cannot borrow content from the following line", () 
   ].join("\n");
 
   const quality = validateActionablePlanArtifact(content);
-  assert.equal(quality.ok, false);
-  assert.equal(quality.reason, "non_executable_test_plan");
+  assert.equal(quality.ok, true, quality.reason);
 });
 
 test("structured test rows reject placeholders and cannot span scenario blocks", () => {
@@ -4510,7 +6042,7 @@ test("implementation-heavy plan drafts are deterministically compacted without a
       "- 无公共 API、接口或类型变化。",
       "",
       "## 测试方案",
-      "- 运行构建并验证双击打开文件。",
+      "- 运行 `npm run build`，断言构建退出码为 0，并在桌面复核双击打开文件。",
       "",
       "## 假设与默认值",
       "- 默认保持其他行为不变。",
@@ -4657,4 +6189,39 @@ test("code dump compaction preserves progress so a remaining structural gap can 
   assert.equal(result.source, "deterministically_compacted_visible_plan");
   assert.match(result.content || "", /## 关键改动/);
   assert.doesNotMatch(result.content || "", /const selected/);
+});
+
+test("section auto-repair preserves progress and reports the next implementation violation", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 修复文件保存路径",
+      "",
+      "## 摘要",
+      "- 修复打开本地文件后的保存路径问题。",
+      "",
+      "## 已确认证据",
+      "- `src-tauri/src/main.rs` 保留缺少路径的保护。",
+      "",
+      "## 关键改动",
+      "### 变更 1：`src-tauri/src/main.rs`",
+      "- 保持现有实现不变，如有需要可以增强。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build`，预期退出码为 0。",
+      "",
+      "## 假设与默认值",
+      "- 保持后端命令签名不变。",
+    ].join("\n"),
+    userGoal: "修复打开本地文件后的保存路径问题。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      summary: "save_file_content rejects a missing file path",
+    }],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "empty_plan_implementation_detail");
 });

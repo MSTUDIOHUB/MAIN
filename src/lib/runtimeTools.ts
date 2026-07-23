@@ -75,7 +75,11 @@ export interface RuntimeToolPlanResult {
   risk?: ToolRiskLevel;
   localFileReadPath?: string;
   sessionAutoApproved?: boolean;
-  reason?: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source";
+  reason?:
+    | "pre_approval_plan_artifact_write"
+    | "pre_approval_source_write"
+    | "pre_approval_tasks"
+    | "missing_tasks_before_source";
 }
 
 export interface PlanRuntimeToolCallInput {
@@ -289,7 +293,19 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     };
   }
 
-  if (sessionAutoApproved) {
+  const planAuthoringGateActive =
+    input.workflowMode === "plan" &&
+    input.runtimeIntent !== "execute" &&
+    input.runtimeIntent !== "studio_workflow";
+  const isSafePlanAuthoringRead =
+    risk === "read_only" ||
+    risk === "external_read" ||
+    risk === "local_file_read";
+
+  // Session approval may authorize ordinary workspace writes, but it cannot
+  // transfer ownership of the typed Plan review artifact to the model. Safe
+  // read-only tools still pass through the normal auto-execution check below.
+  if (sessionAutoApproved && !planAuthoringGateActive) {
     return {
       action: "auto_execute",
       ...planMetadata,
@@ -300,16 +316,19 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     };
   }
 
-  if (isToolAutoExecutableForCall(
-    input.toolCall.name,
-    toolArgs,
-    input.capabilityRegistry,
-    input.toolPermissionPolicy,
-    {
-      workspace: input.workspace,
-      approvedLocalFileReadPaths: input.approvedLocalFileReadPaths,
-    },
-  )) {
+  if (
+    (!planAuthoringGateActive || isSafePlanAuthoringRead) &&
+    isToolAutoExecutableForCall(
+      input.toolCall.name,
+      toolArgs,
+      input.capabilityRegistry,
+      input.toolPermissionPolicy,
+      {
+        workspace: input.workspace,
+        approvedLocalFileReadPaths: input.approvedLocalFileReadPaths,
+      },
+    )
+  ) {
     return {
       action: "auto_execute",
       ...planMetadata,
@@ -319,13 +338,14 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     };
   }
 
-  if (input.workflowMode === "plan" && input.runtimeIntent !== "execute" && input.runtimeIntent !== "studio_workflow") {
+  if (planAuthoringGateActive) {
     if (!input.isPlanApproved && input.isPreApprovalPlanDraftWrite(input.toolCall.name, toolArgs)) {
       return {
-        action: "spec_file_auto_approved",
+        action: "blocked_plan_gate",
         ...planMetadata,
         toolArgs,
         target,
+        reason: "pre_approval_plan_artifact_write",
       };
     }
 

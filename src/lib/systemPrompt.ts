@@ -314,7 +314,7 @@ function buildIntentModule(input: {
       "Before the first action, identify the exact objective, known inputs, and smallest material unknown from that contract. Do not begin with an unconstrained draft or broad repository scan.",
       "The quality gate checks the criteria disclosed before drafting. A rejection may request evidence or revision, but must not silently redefine the user's task or acceptance boundary.",
       "Do not turn your own read/check/fix ordering into user choices. Ask only when a user-owned product, scope, technology, or priority decision blocks the plan.",
-      "When ready, output one visible `<proposed_plan>` Markdown block and stop. MAIN runtime, not the model, validates and materializes `.MAIN/plans/plan.md`.",
+      "When ready, submit one complete typed Plan graph through the transport declared by the latest injected [PLAN AUTHORING CONTRACT], then stop. MAIN runtime, not the model, validates it and renders `.MAIN/plans/plan.md`.",
       "For a multi-step turn, optionally give a brief user-facing update only when a material finding changes the plan. Do not narrate file reads, searches, or tool names.",
       "Do not edit source files or write plan artifacts before approval.",
     ]);

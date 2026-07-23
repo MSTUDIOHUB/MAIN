@@ -32,6 +32,9 @@ export type CompatibilityContentPart =
 export interface CompatibilityMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | CompatibilityContentPart[];
+  runtimeTurnId?: string;
+  runtimeVisualImageParts?: number;
+  runtimeVisualPayloadDigest?: string;
   tool_calls?: CompatibilityToolCall[];
   tool_call_id?: string;
   reasoning_content?: string;
@@ -39,6 +42,15 @@ export interface CompatibilityMessage {
 }
 
 export const PROVIDER_COMPATIBILITY_TAG = "[PROVIDER_COMPATIBILITY_MODE]";
+
+export interface ProviderCompatibilityModeOptions {
+  /**
+   * Replacement generated from the same frozen Plan contract for the actual
+   * compatibility transport. When present, the stale native-only card is
+   * removed atomically instead of leaving contradictory submission rules.
+   */
+  replacementPlanAuthoringContract?: string;
+}
 
 export function isProviderCompatibilityErrorMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
@@ -165,26 +177,48 @@ export function buildProviderCompatibilitySystemMessage(
 }
 
 const TOOL_PROTOCOL_SECTION_PATTERN = /(?:^|\n)\[TOOLS\]\n[\s\S]*?(?=\n\n\[[A-Z0-9 _():/.-]+\]\n|$)/g;
+const PLAN_AUTHORING_CONTRACT_SECTION_PATTERN =
+  /(?:^|\n)\[PLAN AUTHORING CONTRACT\]\n[\s\S]*?\n\[\/PLAN AUTHORING CONTRACT\](?=\n|$)/g;
 
 function stripToolProtocolSection(content: string): string {
   return content.replace(TOOL_PROTOCOL_SECTION_PATTERN, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function stripPlanAuthoringContractSection(content: string): string {
+  return content
+    .replace(PLAN_AUTHORING_CONTRACT_SECTION_PATTERN, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export function ensureProviderCompatibilityMode(
   messages: CompatibilityMessage[],
   workflowMode: "chat" | "edit" | "plan",
   toolDefinitions: ToolDefinition[] = [],
+  options: ProviderCompatibilityModeOptions = {},
 ): CompatibilityMessage[] {
+  const replacementPlanAuthoringContract = String(
+    options.replacementPlanAuthoringContract || "",
+  ).trim();
   const sanitized = messages.flatMap((message): CompatibilityMessage[] => {
     if (message.role !== "system" || typeof message.content !== "string") return [message];
     if (
       message.content.includes(PROVIDER_COMPATIBILITY_TAG) &&
       message.content.includes("native_tools_disabled=true")
     ) return [];
-    const content = stripToolProtocolSection(message.content);
+    const withoutNativeToolCard = stripToolProtocolSection(message.content);
+    const content = replacementPlanAuthoringContract
+      ? stripPlanAuthoringContractSection(withoutNativeToolCard)
+      : withoutNativeToolCard;
     return content ? [{ ...message, content }] : [];
   });
-  return [...sanitized, buildProviderCompatibilitySystemMessage(workflowMode, toolDefinitions)];
+  return [
+    ...sanitized,
+    buildProviderCompatibilitySystemMessage(workflowMode, toolDefinitions),
+    ...(replacementPlanAuthoringContract
+      ? [{ role: "system" as const, content: replacementPlanAuthoringContract }]
+      : []),
+  ];
 }
 
 export function buildCompatibilityRetryMessages(
@@ -231,6 +265,13 @@ export function buildCompatibilityRetryMessages(
         content: message.content.map((part) => part.type === "text"
           ? { type: "text" as const, text: part.text }
           : { type: "image_url" as const, image_url: { url: part.image_url.url } }),
+        ...(message.runtimeTurnId ? { runtimeTurnId: message.runtimeTurnId } : {}),
+        ...(message.runtimeVisualImageParts
+          ? { runtimeVisualImageParts: message.runtimeVisualImageParts }
+          : {}),
+        ...(message.runtimeVisualPayloadDigest
+          ? { runtimeVisualPayloadDigest: message.runtimeVisualPayloadDigest }
+          : {}),
       };
     }
 
@@ -274,6 +315,15 @@ export function buildCompatibilityRetryMessages(
     return {
       role: message.role,
       content: compatibilityText,
+      ...(message.role === "user" && message.runtimeTurnId
+        ? { runtimeTurnId: message.runtimeTurnId }
+        : {}),
+      ...(message.role === "user" && message.runtimeVisualImageParts
+        ? { runtimeVisualImageParts: message.runtimeVisualImageParts }
+        : {}),
+      ...(message.role === "user" && message.runtimeVisualPayloadDigest
+        ? { runtimeVisualPayloadDigest: message.runtimeVisualPayloadDigest }
+        : {}),
     };
   });
 }

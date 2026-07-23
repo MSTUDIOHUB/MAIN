@@ -26,12 +26,28 @@ function loadPlanControlModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planControl.ts"));
 }
 
+function loadPlanApprovalIdentityModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"));
+}
+
+function loadPlanAuthoringContractModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planAuthoringContract.ts"));
+}
+
+function loadPlanContractModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planContract.ts"));
+}
+
 function loadPlanExecutionNoToolModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionNoTool.ts"));
 }
 
 function loadPlanLifecycleModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
+}
+
+function loadPlanExecutableValidationModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutableValidation.ts"));
 }
 
 function loadTurnProgressModule() {
@@ -90,6 +106,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildPlanTaskEvidenceAudit,
   analyzePlanDecisionFork,
+  classifyPlanArtifactQualityResult,
   collectChangeEntries,
   detectExplicitLanguageOverride,
   detectResponseLanguageMismatch,
@@ -137,6 +154,11 @@ const {
 } = loadPlanEvidenceModule();
 
 const {
+  assessPlanExecutableValidation,
+  isExecutablePlanValidationTask,
+} = loadPlanExecutableValidationModule();
+
+const {
   buildApprovedPlanScopeConflictFingerprint,
   resolveApprovedPlanCommandScope,
   resolveApprovedPlanMutationScope,
@@ -146,9 +168,111 @@ const {
   buildPlanApprovalChoiceHint,
   hasReviewablePlanArtifact,
   hasReviewablePlanContext,
+  isTypedReviewablePlanArtifact,
   resolvePlanApprovalQuickReplyAction,
   shouldRouteQuickReplyToPlanApproval,
 } = loadPlanControlModule();
+
+const {
+  createDraftPlanCandidate,
+  hashPlanCandidate,
+  sealPlanCandidate,
+} = loadPlanContractModule();
+
+const {
+  createPlanAuthoringContract,
+} = loadPlanAuthoringContractModule();
+
+const {
+  buildPlanApprovalIdentity,
+  buildTypedPlanApprovalIdentity,
+  resolveTypedPlanReviewAuthority,
+} = loadPlanApprovalIdentityModule();
+
+function createTypedReviewablePlanArtifact(overrides = {}) {
+  const content = overrides.content || "# Plan\n\n- Update `src/main.ts`.\n- Run `npm test`.";
+  const authoringContractId = overrides.authoringContractId || "authoring-contract:test";
+  const objective = "Update the implementation and validate it.";
+  const authoringContract = {
+    ...createPlanAuthoringContract({
+      objective,
+      contextSignals: {
+        mentionedFilePaths: ["src/main.ts"],
+        attachedFilePaths: [],
+        imageParts: 0,
+      },
+    }),
+    contractId: authoringContractId,
+  };
+  const evidenceBundle = {
+    bundleId: "evidence-bundle:test",
+    hash: "evidence-bundle:test",
+    turnId: "turn:test-plan-approval",
+    objective: authoringContract.objective,
+    constraints: [],
+    facts: [{
+      id: "E1",
+      tool: "read_file",
+      target: "src/main.ts",
+      summary: "The scoped implementation is owned by src/main.ts.",
+      hash: "evidence:test-src-main",
+    }],
+    changeTargets: ["src/main.ts"],
+    verificationTargets: ["npm test"],
+  };
+  const draftCandidate = createDraftPlanCandidate({
+    content,
+    bundle: evidenceBundle,
+    authoringContract,
+    summary: ["Apply the scoped update."],
+    findings: [],
+    diagnoses: [],
+    changes: [{
+      text: "Update `src/main.ts`.",
+      targetRef: "src/main.ts",
+      evidenceRefs: ["E1"],
+    }],
+    interfaces: [],
+    tests: ["Run `npm test`."],
+    assumptions: [],
+    blockingChoices: [],
+  });
+  const generatedCandidate = sealPlanCandidate({
+    candidate: draftCandidate,
+    content,
+    runtimeTasks: [{
+      id: "fixture-validation",
+      text: "Run `npm test` and require exit status 0.",
+      status: "pending",
+      executionKind: "validation",
+      requirementRef: "G1",
+      validation: [{
+        kind: "finite_command",
+        acceptance: "required",
+        command: "npm test",
+        capability: "test",
+        segments: [{
+          command: "npm test",
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      }],
+    }],
+  });
+  const candidate = overrides.candidate || generatedCandidate;
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content,
+    candidate,
+    candidateHash: overrides.candidateHash || hashPlanCandidate(candidate),
+    authoringContractId,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
 
 const {
   buildPlanExecutionNoToolRecoveryPrompt,
@@ -264,13 +388,15 @@ test("summarizeUserPrompt turns slash plan CTB request into a stable intent titl
 });
 
 test("plan approval quick reply routes through approvePlan control path", () => {
+  const reviewablePlan = createTypedReviewablePlanArtifact();
+
   assert.equal(
     shouldRouteQuickReplyToPlanApproval({
       text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     true,
   );
@@ -281,7 +407,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     false,
   );
@@ -293,7 +419,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     true,
   );
@@ -305,7 +431,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     true,
   );
@@ -317,7 +443,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     false,
   );
@@ -328,7 +454,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "execute",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     false,
   );
@@ -339,7 +465,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: true,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
+      planArtifacts: [reviewablePlan],
     }),
     false,
   );
@@ -356,8 +482,8 @@ test("plan approval quick reply routes through approvePlan control path", () => 
   );
 });
 
-test("plan approval quick reply resolves materialization and blocking branches", () => {
-  const designArtifact = { kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 };
+test("plan approval quick reply approves only an existing typed artifact and otherwise blocks", () => {
+  const designArtifact = createTypedReviewablePlanArtifact();
 
   assert.equal(
     resolvePlanApprovalQuickReplyAction({
@@ -367,7 +493,6 @@ test("plan approval quick reply resolves materialization and blocking branches",
       isPlanApproved: false,
       planStage: "design",
       planArtifacts: [designArtifact],
-      sourceHasMaterializablePlan: false,
     }),
     "approve_existing_plan",
   );
@@ -380,20 +505,6 @@ test("plan approval quick reply resolves materialization and blocking branches",
       isPlanApproved: false,
       planStage: "idle",
       planArtifacts: [],
-      sourceHasMaterializablePlan: true,
-    }),
-    "materialize_then_approve",
-  );
-
-  assert.equal(
-    resolvePlanApprovalQuickReplyAction({
-      text: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
-      optionAction: "approve_operation_once",
-      sourceIntent: "plan",
-      isPlanApproved: false,
-      planStage: "idle",
-      planArtifacts: [],
-      sourceHasMaterializablePlan: false,
     }),
     "block_missing_plan_artifact",
   );
@@ -406,21 +517,71 @@ test("plan approval quick reply resolves materialization and blocking branches",
       isPlanApproved: false,
       planStage: "idle",
       planArtifacts: [],
-      sourceHasMaterializablePlan: true,
     }),
     "not_plan_approval",
   );
 });
 
-test("reviewable plan approval requires a materialized non-empty artifact", () => {
+test("reviewable plan approval requires a valid sealed typed artifact", () => {
+  const typed = createTypedReviewablePlanArtifact();
   assert.equal(hasReviewablePlanArtifact([]), false);
   assert.equal(hasReviewablePlanArtifact([
     { kind: "plan", path: ".MAIN/plans/plan.md", title: "Plan", content: "   ", updatedAt: 1 },
   ]), false);
   assert.equal(hasReviewablePlanArtifact([
     { kind: "plan", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 },
+  ]), false);
+  assert.equal(hasReviewablePlanArtifact([typed]), true);
+  assert.equal(isTypedReviewablePlanArtifact(typed), true);
+  assert.equal(isTypedReviewablePlanArtifact({
+    ...typed,
+    candidateHash: "plan-candidate-sha256-tampered",
+  }), false);
+  assert.equal(isTypedReviewablePlanArtifact({
+    ...typed,
+    authoringContractId: "authoring-contract:other",
+  }), false);
+  assert.equal(isTypedReviewablePlanArtifact({
+    ...typed,
+    content: `${typed.content}\n\nUnreviewed mutation`,
+  }), false);
+  assert.equal(hasReviewablePlanArtifact([
+    typed,
+    { kind: "bugfix", path: ".MAIN/plans/bugfix.md", title: "Bugfix", content: "# Legacy", updatedAt: 2 },
   ]), true);
   assert.equal(hasReviewablePlanContext({ planStage: "design", planArtifacts: [] }), false);
+});
+
+test("one sealed primary Plan owns approval while supporting artifacts remain non-authoritative", () => {
+  const typed = createTypedReviewablePlanArtifact({ revision: 3 });
+  const support = {
+    kind: "design",
+    path: ".MAIN/plans/design.md",
+    title: "Design notes",
+    content: "# Supporting design\n\nContext only.",
+    revision: 9,
+    updatedAt: 2,
+  };
+  const primaryIdentity = buildTypedPlanApprovalIdentity([typed]);
+  const mixedIdentity = buildTypedPlanApprovalIdentity([support, typed]);
+  const changedSupportIdentity = buildTypedPlanApprovalIdentity([
+    { ...support, content: `${support.content}\n\nUpdated context.`, revision: 10 },
+    typed,
+  ]);
+
+  assert.ok(primaryIdentity);
+  assert.deepEqual(mixedIdentity, primaryIdentity);
+  assert.deepEqual(changedSupportIdentity, primaryIdentity);
+  assert.deepEqual(buildPlanApprovalIdentity([support, typed]), primaryIdentity);
+  assert.equal(resolveTypedPlanReviewAuthority([support]).ok, false);
+  assert.equal(buildTypedPlanApprovalIdentity([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Legacy Plan",
+    content: "# Legacy Plan",
+    updatedAt: 1,
+  }]), null);
+  assert.equal(buildTypedPlanApprovalIdentity([typed, { ...typed, updatedAt: 3 }]), null);
 });
 
 test("plan approval choice hint preserves the selected execution branch", () => {
@@ -2352,6 +2513,8 @@ test("plan quality rejects an implementation label that owns no concrete body", 
 
   assert.equal(result.ok, false);
   assert.equal(result.reason, "empty_plan_implementation_detail");
+  assert.equal(result.failureStage, "markdown_container");
+  assert.equal(result.failurePreview, "修改为：");
 });
 
 test("plan quality accepts nested owner behavior and dependency bullets as concrete implementation detail", () => {
@@ -3880,7 +4043,7 @@ test("bounded inline runtime assertions count as finite Plan validation", () => 
     "python3 -c \"assert 1 == 1\"",
   ), true);
   assert.equal(isFinitePlanValidationCommand(
-    "npx ts-node --eval \"console.log('ok')\"",
+    "npx ts-node --eval \"if (1 !== 1) throw new Error('mismatch')\"",
   ), true);
   assert.equal(isFinitePlanValidationCommand("npm run dev"), false);
   assert.equal(isFinitePlanValidationCommand("node src/server.js"), false);
@@ -3900,6 +4063,152 @@ test("bounded inline runtime assertions count as finite Plan validation", () => 
   assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
   assert.match(plannedCommand, /^node -e /);
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
+test("finite Plan validation classification is provider-neutral and excludes resident modes", () => {
+  const finiteCommands = [
+    "npm test",
+    "pnpm run test:unit",
+    "yarn run build",
+    "bun run lint",
+    "npx tsc --noEmit",
+    "npx playwright test",
+    "cargo test",
+    "cargo check",
+    "python -m pytest",
+    "go test ./...",
+    "swift test",
+    "dotnet test",
+    "./mvnw verify",
+    "./gradlew check",
+    "cmake --build build",
+    "bundle exec rspec",
+    "cd frontend && npm test",
+  ];
+  for (const command of finiteCommands) {
+    assert.equal(isFinitePlanValidationCommand(command), true, command);
+  }
+
+  const residentCommands = [
+    "npm run dev",
+    "pnpm run serve",
+    "yarn watch",
+    "bun run preview",
+    "npm run tauri dev",
+    "cargo watch -x test",
+    "npx vitest --watch",
+    "npx cypress open",
+    "npm test && node server.js",
+    "node -e \"setInterval(() => {}, 1000)\"",
+    "python3 -c \"while True: pass\"",
+  ];
+  for (const command of residentCommands) {
+    assert.equal(isFinitePlanValidationCommand(command), false, command);
+  }
+});
+
+test("tauri dev plus manual checks and a vague Playwright alternative cannot satisfy executable validation", () => {
+  const content = [
+    "# MD Viewer repair plan",
+    "## Key Changes",
+    "- Modify `src/main.js` to correct file-open state transitions.",
+    "## Test Plan",
+    "1. Start the app with `npm run tauri dev`.",
+    "2. Manually click Open, choose a Markdown file, and confirm no save dialog appears.",
+    "3. Or use Playwright or a similar tool for automated testing.",
+  ].join("\n");
+  const artifact = {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content,
+    updatedAt: 1,
+  };
+  const tasks = deriveRuntimePlanTasksFromArtifacts([artifact], { language: "en" });
+  const assessment = assessPlanExecutableValidation({
+    planArtifacts: [artifact],
+    executionPlanTasks: tasks,
+  });
+
+  assert.equal(tasks.some((task) => task.commands?.includes("npm run tauri dev")), true);
+  assert.equal(tasks.some(isExecutablePlanValidationTask), false, JSON.stringify(tasks, null, 2));
+  assert.equal(assessment.requiresExecutableValidation, true);
+  assert.equal(assessment.executableValidationTaskCount, 0);
+  assert.equal(assessment.missing, true);
+  assert.equal(assessment.reason, "executable_validation_task_missing");
+});
+
+test("a concrete manual-only scenario remains advisory and cannot close Plan acceptance", () => {
+  const artifact = {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: [
+      "# Plan",
+      "## Key Changes",
+      "- Modify `src/main.ts` to keep the opened document clean.",
+      "## Test Plan",
+      "- Manually click Open, choose `sample.md`, and confirm the save dialog stays closed.",
+    ].join("\n"),
+    updatedAt: 1,
+  };
+  const tasks = deriveRuntimePlanTasksFromArtifacts([artifact], { language: "en" });
+  const assessment = assessPlanExecutableValidation({
+    planArtifacts: [artifact],
+    executionPlanTasks: tasks,
+  });
+
+  assert.equal(tasks.some(isExecutablePlanValidationTask), false, JSON.stringify(tasks, null, 2));
+  assert.equal(assessment.missing, true);
+  assert.equal(assessment.executableValidationTaskCount, 0);
+});
+
+test("plain Markdown assertions remain advisory and cannot close Plan acceptance", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] Assertion: debug.log contains no save-dialog error after opening sample.md.",
+  );
+  const primitives = parsed.flatMap((task) => task.validation || []);
+
+  assert.equal(primitives.length, 1, JSON.stringify(parsed, null, 2));
+  assert.equal(primitives[0].kind, "assertion");
+  assert.equal(primitives[0].acceptance, "advisory");
+  assert.equal(parsed.some(isExecutablePlanValidationTask), false);
+});
+
+test("finite commands and concrete browser assertions satisfy executable validation", () => {
+  const finitePlan = {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: [
+      "# Plan",
+      "## Key Changes",
+      "- Modify `src/main.ts` to preserve the parsed field.",
+      "## Test Plan",
+      "- Run `npm run build` and require exit code 0.",
+    ].join("\n"),
+    updatedAt: 1,
+  };
+  const browserPlan = {
+    ...finitePlan,
+    content: [
+      "# Plan",
+      "## Key Changes",
+      "- Modify `src/main.ts` to preserve the dialog state.",
+      "## Test Plan",
+      "- Use Playwright to click `#open-button`, then assert `#save-dialog` remains not visible.",
+    ].join("\n"),
+  };
+
+  for (const artifact of [finitePlan, browserPlan]) {
+    const tasks = deriveRuntimePlanTasksFromArtifacts([artifact], { language: "en" });
+    const assessment = assessPlanExecutableValidation({
+      planArtifacts: [artifact],
+      executionPlanTasks: tasks,
+    });
+    assert.equal(assessment.missing, false, JSON.stringify({ tasks, assessment }, null, 2));
+    assert.ok(assessment.executableValidationTaskCount > 0);
+  }
 });
 
 test("test build or manual alternatives do not accept an unplanned command", () => {
@@ -4219,6 +4528,169 @@ test("validateActionablePlanArtifact rejects import-only weak plan from debug lo
   const result = validateActionablePlanArtifact(bad);
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/);
+});
+
+test("validateActionablePlanArtifact rejects speculative diagnostics presented as confirmed evidence", () => {
+  const bad = [
+    "# 修复打开文件后的保存弹窗",
+    "",
+    "## 用户目标",
+    "- 修复打开本地 Markdown 文件后意外出现保存窗口的问题。",
+    "",
+    "## 已确认证据",
+    "- `src/main.js` 的 `handleSaveFile` 在某些情况下可能把空路径误判为新文件，因此更可能触发 `saveAsFile()`。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/main.js` 的路径分支，让已有路径直接保存并保持其他行为不变。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，保持现有命令签名不变。",
+    "",
+    "## 测试方案",
+    "- 打开一个已有路径的 Markdown 文件并点击保存，预期不会出现另存为窗口。",
+    "",
+    "## 假设与默认值",
+    "- 保持新建文件首次保存时显示保存窗口。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(bad);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "unverified_diagnostic_claim_as_confirmed");
+  assert.equal(result.recoveryAction, "rewrite");
+  assert.equal(result.canAutoRepair, false);
+  assert.match(result.failurePreview || "", /handleSaveFile/);
+});
+
+test("validateActionablePlanArtifact treats observed conditional control flow as evidence, not speculation", () => {
+  const plan = [
+    "# 修复打开文件后的保存弹窗",
+    "",
+    "## 用户目标",
+    "- 修复打开本地 Markdown 文件后意外出现保存窗口的问题。",
+    "",
+    "## 已确认证据",
+    "- [E1] `src/main.js` 中，如果 `filePath` 存在，`handleSaveFile` 将该路径传给 `save_file_content`；否则才调用 `saveAsFile()`。",
+    "",
+    "## 关键改动",
+    "- [C1] 修改 `src/main.js`，让程序化加载不再进入用户编辑的自动保存分支，并保持现有路径保存契约。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，保持现有命令签名不变。",
+    "",
+    "## 测试方案",
+    "- [V1] 测试场景：打开已有路径的 Markdown 文件，预期不出现保存窗口；输入一个字符后，预期进入未保存状态。",
+    "",
+    "## 假设与默认值",
+    "- 保持新建文件首次保存时显示保存窗口。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, true, result.reason);
+});
+
+test("validateActionablePlanArtifact allows diagnostic logs as advisory observations", () => {
+  const plan = [
+    "# 修复打开文件后的保存弹窗",
+    "",
+    "## 用户目标",
+    "- 修复打开本地 Markdown 文件后意外出现保存窗口的问题。",
+    "",
+    "## 已确认证据",
+    "- [E1] `src/main.js` 的 `setValue` 进入输入监听链，`scheduleAutoSave` 会在脏状态下安排保存。",
+    "",
+    "## 关键改动",
+    "- [C1] 修改 `src/main.js`，区分程序化加载与真实用户输入，并保持现有保存命令签名。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，保持现有命令签名不变。",
+    "",
+    "## 测试方案",
+    "- [V1] 运行 `npm test`，要求命令以退出码 0 完成。",
+    "- 检查调试日志仅用于定位失败分支；没有错误日志本身不作为通过证据。",
+    "",
+    "## 假设与默认值",
+    "- 保持新建文件首次保存时显示保存窗口。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, true, result.reason);
+});
+
+test("diagnostic classification inherits nested section roles", () => {
+  const base = [
+    "# 修复打开文件后的保存弹窗",
+    "",
+    "## 用户目标",
+    "- 修复打开本地 Markdown 文件后意外出现保存窗口的问题。",
+    "",
+    "## 已确认证据",
+    "### 打开链路",
+    "__EVIDENCE_LINE__",
+    "",
+    "## 关键改动",
+    "- [C1] 修改 `src/main.js`，让程序化加载不再进入用户编辑的自动保存分支。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，保持现有命令签名不变。",
+    "",
+    "## 测试方案",
+    "- [V1] 测试场景：打开已有路径的 Markdown 文件，预期不出现保存窗口。",
+    "",
+    "## 假设与默认值",
+    "- 保持新建文件首次保存时显示保存窗口。",
+  ].join("\n");
+  const nestedConfirmed = base.replace(
+    "__EVIDENCE_LINE__",
+    "- `src/main.js` 的 `setValue` 可能触发输入监听器并导致自动保存。",
+  );
+  const rejected = validateActionablePlanArtifact(nestedConfirmed);
+  assert.equal(rejected.reason, "unverified_diagnostic_claim_as_confirmed");
+
+  const nestedHypothesis = base
+    .replace("## 已确认证据\n### 打开链路", "## 未验证假设\n### 根因分析")
+    .replace(
+      "__EVIDENCE_LINE__",
+      "- `src/main.js` 的 `setValue` 可能触发输入监听器并导致自动保存；执行前需验证。",
+    );
+  const allowed = validateActionablePlanArtifact(nestedHypothesis);
+  assert.equal(allowed.ok, true, allowed.reason);
+});
+
+test("validateActionablePlanArtifact permits hypotheses only when they are labeled unverified", () => {
+  const plan = [
+    "# 修复打开文件后的保存弹窗",
+    "",
+    "## 用户目标",
+    "- 修复打开本地 Markdown 文件后意外出现保存窗口的问题。",
+    "",
+    "## 已确认证据",
+    "- `src/main.js` 的 `switchToTab` 调用编辑器的 `setValue`。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/main.js` 和 `src/editor.js`，区分加载赋值与真实用户输入，并保持保存命令签名不变。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，保持现有命令签名不变。",
+    "",
+    "## 测试方案",
+    "- 打开已有 Markdown 文件，预期不进入未保存状态；输入一个字符后，预期进入未保存状态。",
+    "",
+    "## 未验证假设",
+    "- 编辑器包装层可能还有其他程序化赋值入口，实施前用引用搜索核对。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, true, result.reason);
+});
+
+test("unsupported implementation hypotheses require a model rewrite instead of auto-repair", () => {
+  const result = classifyPlanArtifactQualityResult({
+    ok: false,
+    reason: "unsupported_hypothesis_as_plan",
+  });
+
+  assert.equal(result.recoveryAction, "rewrite");
+  assert.equal(result.canAutoRepair, false);
 });
 
 test("validateActionablePlanArtifact rejects blocking plan forks without user options", () => {

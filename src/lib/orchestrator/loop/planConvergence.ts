@@ -23,6 +23,10 @@ import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import { assessPlanClosureEvidence } from "../../planEvidence";
 import {
+  derivePlanEvidenceObligations,
+  getPlanEvidenceObligationKey,
+} from "../../planEvidenceObligations";
+import {
   buildAssistantHistoryMessage,
   collectPlanClosureMaterializationInput,
   getOriginalUserPromptForPlanFallback,
@@ -31,6 +35,7 @@ import {
 } from "../../orchestrator";
 import type { AgentMessage, OrchestratorCallbacks, ToolCallToExecute } from "../types";
 import type { PlanEvidenceRecoveryObjective } from "./planRuntimeState";
+import { buildPlanEvidenceProgressFingerprint } from "./planRuntimeState";
 
 export type PlanReadOnlyConvergenceResult = {
   status: "none" | "continue";
@@ -38,6 +43,7 @@ export type PlanReadOnlyConvergenceResult = {
   planReadOnlyConvergenceTools: number;
   usedPlanReadOnlyConvergencePrompt: boolean;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
+  planEvidenceProgressFingerprint: string;
 };
 
 export type PlanPostConvergenceToolRedirectResult = {
@@ -47,10 +53,42 @@ export type PlanPostConvergenceToolRedirectResult = {
   planEvidenceRecoveryPasses: number;
   planReasoningOnlyRecoveryPasses: number;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
+  planEvidenceProgressFingerprint: string;
   planAutoScaffoldPromptIssued: boolean;
 };
 
 export const MAX_PLAN_POST_CONVERGENCE_TOOL_REDIRECTS = 3;
+
+function freezePlanEvidenceRecoveryBaseline(input: {
+  callbacks: OrchestratorCallbacks;
+  recentPlanToolActivity: PlanToolActivitySummary[];
+  latestUserPromptText: string;
+}): string {
+  const closureInput = collectPlanClosureMaterializationInput(
+    input.callbacks,
+    input.recentPlanToolActivity,
+    [],
+    input.latestUserPromptText,
+  );
+  const coverageKeys = new Set(input.recentPlanToolActivity.flatMap((activity) => {
+    const observation = activity.readFileObservation;
+    if (!observation) return [];
+    const key = observation.key || [
+      observation.path,
+      observation.versionToken,
+      observation.requestSignature,
+    ].join("::");
+    return key ? [key] : [];
+  }));
+  return buildPlanEvidenceProgressFingerprint({
+    bundleHash: closureInput.evidenceBundle.hash,
+    coverageKeys,
+    obligationKeys: new Set(derivePlanEvidenceObligations({
+      objective: input.latestUserPromptText,
+      activities: input.recentPlanToolActivity,
+    }).map(getPlanEvidenceObligationKey)),
+  });
+}
 
 export function handlePlanReadOnlyConvergence(input: {
   callbacks: OrchestratorCallbacks;
@@ -62,6 +100,7 @@ export function handlePlanReadOnlyConvergence(input: {
   planReadOnlyConvergenceTools: number;
   usedPlanReadOnlyConvergencePrompt: boolean;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
+  planEvidenceProgressFingerprint?: string;
   planRuntimePhase?: PlanRuntimePhase;
   turnInputContextSignals: TurnInputContextSignals;
   recentPlanToolActivity: PlanToolActivitySummary[];
@@ -83,6 +122,7 @@ export function handlePlanReadOnlyConvergence(input: {
   let planReadOnlyConvergenceTools = input.planReadOnlyConvergenceTools;
   let usedPlanReadOnlyConvergencePrompt = input.usedPlanReadOnlyConvergencePrompt;
   let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
+  let planEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
   const userGoal = getOriginalUserPromptForPlanFallback(callbacks);
 
   // Tool-result reconciliation may already have moved this exact batch into a
@@ -95,6 +135,7 @@ export function handlePlanReadOnlyConvergence(input: {
       planReadOnlyConvergenceTools,
       usedPlanReadOnlyConvergencePrompt,
       planEvidenceRecoveryObjective,
+      planEvidenceProgressFingerprint,
     };
   }
 
@@ -134,6 +175,7 @@ export function handlePlanReadOnlyConvergence(input: {
       planReadOnlyConvergenceTools,
       usedPlanReadOnlyConvergencePrompt,
       planEvidenceRecoveryObjective,
+      planEvidenceProgressFingerprint,
     };
   }
 
@@ -147,6 +189,19 @@ export function handlePlanReadOnlyConvergence(input: {
   planEvidenceRecoveryObjective = convergencePhase === "needs_evidence"
     ? "model_draft"
     : "none";
+  if (
+    convergencePhase === "needs_evidence" &&
+    (
+      input.planEvidenceRecoveryObjective !== "model_draft" ||
+      !planEvidenceProgressFingerprint
+    )
+  ) {
+    planEvidenceProgressFingerprint = freezePlanEvidenceRecoveryBaseline({
+      callbacks,
+      recentPlanToolActivity,
+      latestUserPromptText: userGoal,
+    });
+  }
   setPlanRuntimePhase(convergencePhase, convergenceReason);
   logAgentEvent("plan_readonly_convergence_threshold", {
     iteration,
@@ -184,6 +239,10 @@ export function handlePlanReadOnlyConvergence(input: {
         userGoal,
       );
       const closureAssessment = assessPlanClosureEvidence(closureInput.evidenceBundle);
+      const evidenceObligations = derivePlanEvidenceObligations({
+        objective: userGoal,
+        activities: recentPlanToolActivity,
+      });
       convergencePrompt = buildPlanClosureEvidenceRecoveryPrompt(
         language,
         planEvidenceReadinessForConvergence.reason,
@@ -191,6 +250,7 @@ export function handlePlanReadOnlyConvergence(input: {
         {
           unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
           confirmedChangeTargets: closureInput.evidenceBundle.changeTargets,
+          evidenceObligations,
         },
       );
     }
@@ -201,6 +261,7 @@ export function handlePlanReadOnlyConvergence(input: {
       planReadOnlyConvergenceTools,
       usedPlanReadOnlyConvergencePrompt,
       planEvidenceRecoveryObjective,
+      planEvidenceProgressFingerprint,
     };
   }
 
@@ -210,6 +271,7 @@ export function handlePlanReadOnlyConvergence(input: {
     planReadOnlyConvergenceTools,
     usedPlanReadOnlyConvergencePrompt,
     planEvidenceRecoveryObjective,
+    planEvidenceProgressFingerprint,
   };
 }
 
@@ -235,11 +297,13 @@ export function handlePlanPostConvergenceToolRedirect(input: {
   planReasoningOnlyRecoveryPasses: number;
   planEvidenceRecoveryPasses: number;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
+  planEvidenceProgressFingerprint?: string;
   planQualityRejectCount: number;
   planAutoScaffoldPromptIssued: boolean;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
   latestUserPromptText: string;
+  preferredDelegationRequired?: boolean;
   setPlanRuntimePhase: (phase: PlanRuntimePhase, reason: string) => void;
 }): PlanPostConvergenceToolRedirectResult {
   const {
@@ -262,6 +326,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     planLastQualityGateReason,
     planLastMissingSections,
     latestUserPromptText,
+    preferredDelegationRequired = false,
     setPlanRuntimePhase,
   } = input;
 
@@ -270,6 +335,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
   let planReasoningOnlyRecoveryPasses = input.planReasoningOnlyRecoveryPasses;
   let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
+  let planEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
 
   const finish = (status: PlanPostConvergenceToolRedirectResult["status"]): PlanPostConvergenceToolRedirectResult => ({
@@ -279,6 +345,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     planEvidenceRecoveryPasses,
     planReasoningOnlyRecoveryPasses,
     planEvidenceRecoveryObjective,
+    planEvidenceProgressFingerprint,
     planAutoScaffoldPromptIssued,
   });
 
@@ -291,14 +358,16 @@ export function handlePlanPostConvergenceToolRedirect(input: {
       callbacks.getCurrentTurnId?.(),
     ),
   });
+  const redirectEligibleToolCalls = effectiveToolCalls.filter((call) =>
+    !isAllowedUnapprovedPlanDraftMutationCall(call) &&
+    !(preferredDelegationRequired && call.name === "spawn_subagent")
+  );
   const shouldRedirectPostConvergenceToolCalls = shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
     convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
     hasPlanDecisionOutput,
-    toolNames: effectiveToolCalls
-      .filter((call) => !isAllowedUnapprovedPlanDraftMutationCall(call))
-      .map((call) => call.name),
+    toolNames: redirectEligibleToolCalls.map((call) => call.name),
     evidenceReadiness: planEvidenceReadinessForRedirect.status,
     planRuntimePhase,
   });
@@ -306,8 +375,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     return finish("none");
   }
 
-  const requestedTargetedEvidence = effectiveToolCalls
-    .filter((call) => !isAllowedUnapprovedPlanDraftMutationCall(call))
+  const requestedTargetedEvidence = redirectEligibleToolCalls
     .some((call) => isPlanTargetedEvidenceToolName(call.name));
 
   const nextRedirectCount = planPostConvergenceToolRedirectCount + 1;
@@ -393,6 +461,16 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     // Reopen the read-only surface without consuming a count-based budget;
     // duplicate unchanged windows are bounded after their result is known.
     planEvidenceRecoveryObjective = "model_draft";
+    if (
+      input.planEvidenceRecoveryObjective !== "model_draft" ||
+      !planEvidenceProgressFingerprint
+    ) {
+      planEvidenceProgressFingerprint = freezePlanEvidenceRecoveryBaseline({
+        callbacks,
+        recentPlanToolActivity,
+        latestUserPromptText,
+      });
+    }
     setPlanRuntimePhase("needs_evidence", planEvidenceReadinessForRedirect.reason);
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -429,6 +507,16 @@ export function handlePlanPostConvergenceToolRedirect(input: {
   if (suppressedRecoveryDecision.action === "targeted_evidence") {
     planEvidenceRecoveryPasses += 1;
     planEvidenceRecoveryObjective = "model_draft";
+    if (
+      input.planEvidenceRecoveryObjective !== "model_draft" ||
+      !planEvidenceProgressFingerprint
+    ) {
+      planEvidenceProgressFingerprint = freezePlanEvidenceRecoveryBaseline({
+        callbacks,
+        recentPlanToolActivity,
+        latestUserPromptText,
+      });
+    }
     setPlanRuntimePhase("needs_evidence", planEvidenceReadinessForRedirect.reason);
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -449,7 +537,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
-      content: `[FORCED CONVERGENCE] Targeted evidence recovery is exhausted and the evidence bundle is frozen. Stop attempting tools and output visible <proposed_plan> for MAIN runtime to validate and materialize; expose only a genuine blocking choice. Keep user-visible content in MAIN's configured response language.`,
+      content: `[FORCED CONVERGENCE] Targeted evidence recovery is exhausted and the evidence bundle is frozen. Stop attempting discovery tools and submit the complete typed graph through the transport declared by the latest [PLAN AUTHORING CONTRACT]; MAIN runtime validates and renders it. Expose only a genuine blocking choice. Keep typed field text in MAIN's configured response language.`,
     });
     logAgentEvent("plan_suppressed_tool_forced_write_injected", {
       iteration,

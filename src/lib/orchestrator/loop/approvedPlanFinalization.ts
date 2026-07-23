@@ -1,10 +1,10 @@
 import {
-  buildPlanTaskEvidenceAudit,
   type PlanExecutionProgressPhase,
   type PlanExecutionProgressUpdate,
   type PlanTask,
   type PlanTaskEvidenceAudit,
 } from "../../workflowModels";
+import { evaluateApprovedPlanExecution } from "../../planExecutionEvaluation";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import {
   buildApprovedPlanContinuationPrompt,
@@ -21,10 +21,6 @@ import {
   resolveExecuteNoToolStrategyAtBoundary,
   resolveProviderNeutralExecuteNoToolCheckpointLimit,
 } from "./executeNoToolRecovery";
-import {
-  buildExecuteEvidenceClosureAudit,
-  resolveCommandEvidenceRequirements,
-} from "../../verificationEvidence";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 export type ApprovedPlanFinalizationResult = {
@@ -155,7 +151,6 @@ export function handleApprovedPlanFinalization(input: {
   const {
     callbacks,
     iteration,
-    approvedPlanAuditForNoTool,
     rejectedCompletionClaim,
     availableToolNames,
     emitTaskOrchestratorPhase,
@@ -171,19 +166,17 @@ export function handleApprovedPlanFinalization(input: {
     return finish("none");
   }
 
-  const baseApprovedPlanAudit = approvedPlanAuditForNoTool ||
-    buildPlanTaskEvidenceAudit({
-      tasks: callbacks.getPlanTasks(),
-      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-      highlightNext: true,
-    });
-  const approvedPlanValidationBoundary = resolveApprovedPlanValidationBoundary({
-    audit: baseApprovedPlanAudit,
+  // The no-tool route carries a presentation snapshot, but completion truth
+  // must be recalculated once from the current tasks and evidence ledger.
+  const approvedPlanEvaluation = evaluateApprovedPlanExecution({
+    tasks: callbacks.getPlanTasks(),
+    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
     availableToolNames,
+    activeRecovery: input.executeRecoveryState || null,
+    turnId: callbacks.getCurrentTurnId?.() || null,
+    commandDirective: callbacks.getCommandDirective?.() || null,
   });
-  const approvedPlanAudit = approvedPlanValidationBoundary === "pause_external_validation"
-    ? { ...baseApprovedPlanAudit, acceptedCompletion: true }
-    : baseApprovedPlanAudit;
+  const approvedPlanAudit = approvedPlanEvaluation.taskAudit;
   const approvedPlanTasks = approvedPlanAudit.tasks || [];
   const approvedPlanMissingTasks = (approvedPlanAudit.totalCount || 0) === 0;
   const hasRemainingApprovedPlanTasks =
@@ -214,7 +207,6 @@ export function handleApprovedPlanFinalization(input: {
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
-          forceXmlTools: Boolean(callbacks.shouldForceXmlForProviderCompatibility?.()),
           iteration,
           cause: "remaining_plan_tasks",
           runtimeAlreadyPrepared: true,
@@ -263,30 +255,9 @@ export function handleApprovedPlanFinalization(input: {
     return finish("continue");
   }
 
-  const baseFinalPlanAudit = buildPlanTaskEvidenceAudit({
-    tasks: callbacks.getPlanTasks(),
-    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-    highlightNext: true,
-  });
-  const finalValidationBoundary = resolveApprovedPlanValidationBoundary({
-    audit: baseFinalPlanAudit,
-    availableToolNames,
-  });
-  const finalPlanAudit = finalValidationBoundary === "pause_external_validation"
-    ? { ...baseFinalPlanAudit, acceptedCompletion: true }
-    : baseFinalPlanAudit;
-  const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
-    ledger: callbacks.getPlanExecutionEvidenceLedger(),
-    validationExpected: true,
-    transactionId: callbacks.getCurrentTurnId?.() || null,
-    requiredCommandEvidence: resolveCommandEvidenceRequirements({
-      tasks: callbacks.getPlanTasks(),
-      commandDirective: callbacks.getCommandDirective?.() || null,
-    }),
-  });
-  const activeRecoveryPending = Boolean(
-    input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",
-  );
+  const finalPlanAudit = approvedPlanEvaluation.taskAudit;
+  const evidenceClosureAudit = approvedPlanEvaluation.evidenceClosure;
+  const activeRecoveryPending = approvedPlanEvaluation.activeRecoveryPending;
   if (
     finalPlanAudit.totalCount > 0 &&
     finalPlanAudit.acceptedCompletion &&
@@ -307,10 +278,7 @@ export function handleApprovedPlanFinalization(input: {
     return finish("none");
   }
   if (
-    finalPlanAudit.totalCount === 0 ||
-    !finalPlanAudit.acceptedCompletion ||
-    !evidenceClosureAudit.completionAllowed ||
-    activeRecoveryPending
+    !approvedPlanEvaluation.completionAllowed
   ) {
     logAgentEvent("plan_completion_guard_reprompt", {
       iteration,
@@ -321,6 +289,7 @@ export function handleApprovedPlanFinalization(input: {
       pendingUserValidation: finalPlanAudit.pendingUserValidationTasks.length,
       evidenceClosureGap: evidenceClosureAudit.gap,
       activeRecoveryMode: input.executeRecoveryState?.mode || "normal",
+      completionGap: approvedPlanEvaluation.gap,
     });
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -328,11 +297,11 @@ export function handleApprovedPlanFinalization(input: {
       content: callbacks.getPreferredLanguage() === "zh"
           ? [
             "MAIN 的完成闸门没有通过：当前已批准 Plan 不能仅凭模型正文或单次工具结果结束。",
-            `请继续补齐仍可自动执行的文件、命令或浏览器证据（当前闭环缺口：${activeRecoveryPending ? `active_recovery:${input.executeRecoveryState?.mode}` : evidenceClosureAudit.gap}）；纯用户/Tauri/外部复核只写入最终结论，不作为任务成功闸门。`,
+            `请继续补齐仍可自动执行的文件、命令或浏览器证据（当前闭环缺口：${activeRecoveryPending ? approvedPlanEvaluation.gap.code : evidenceClosureAudit.gap}）；纯用户/Tauri/外部复核只写入最终结论，不作为任务成功闸门。`,
           ].join("\n")
         : [
             "MAIN's completion gate did not pass: the approved Plan cannot end from assistant prose or a single tool result alone.",
-            `Continue with any still-automatable file, command, or browser evidence (current closure gap: ${activeRecoveryPending ? `active_recovery:${input.executeRecoveryState?.mode}` : evidenceClosureAudit.gap}). Pure user/Tauri/external review belongs in the final conclusion and is not a success gate.`,
+            `Continue with any still-automatable file, command, or browser evidence (current closure gap: ${activeRecoveryPending ? approvedPlanEvaluation.gap.code : evidenceClosureAudit.gap}). Pure user/Tauri/external review belongs in the final conclusion and is not a success gate.`,
           ].join("\n"),
     });
     return finish("continue");

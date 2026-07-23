@@ -4,6 +4,12 @@ import {
 } from "../../agentLoopSafety";
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import {
+  advancePlanCandidateRepairCheckpoint,
+  buildPlanCandidateRepairPrompt,
+  type PlanCandidateRepairCheckpoint,
+} from "../../planCandidateRepair";
+import { buildPlanSubmissionGuidance } from "../../planSubmissionGuidance";
 import { buildMissingToolCallContinuationPrompt } from "../../missingToolCallReprompt";
 import { isAssistantTurnEmpty } from "../../normalizedTurn";
 import {
@@ -57,6 +63,7 @@ export type EmptyResponseRecoveryResult = {
   emptyResponseCountThisTurn: number;
   usedMalformedToolUseRecoveryPrompt: boolean;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
+  planCandidateRepairCheckpoint?: PlanCandidateRepairCheckpoint | null;
 };
 
 export async function handleEmptyResponseRecovery(input: {
@@ -77,6 +84,7 @@ export async function handleEmptyResponseRecovery(input: {
   emptyResponseCountThisTurn: number;
   usedMalformedToolUseRecoveryPrompt: boolean;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
+  planCandidateRepairCheckpoint?: PlanCandidateRepairCheckpoint | null;
   pauseForReviewablePlanArtifact: PauseForReviewablePlanArtifact;
   tryClosePlanWithEvidence: TryClosePlanWithEvidence;
 }): Promise<EmptyResponseRecoveryResult> {
@@ -100,6 +108,7 @@ export async function handleEmptyResponseRecovery(input: {
   let usedMalformedToolUseRecoveryPrompt = input.usedMalformedToolUseRecoveryPrompt;
   let recoveringFromEmptyAssistantReplyAfterWrite =
     input.recoveringFromEmptyAssistantReplyAfterWrite;
+  let planCandidateRepairCheckpoint = input.planCandidateRepairCheckpoint ?? null;
   const emitDebug = (event: string, data: Record<string, unknown>) => {
     if (callbacks.onDebugEvent) callbacks.onDebugEvent(`agent.${event}`, data);
     else logAgentEvent(event, data);
@@ -111,6 +120,9 @@ export async function handleEmptyResponseRecovery(input: {
     emptyResponseCountThisTurn,
     usedMalformedToolUseRecoveryPrompt,
     recoveringFromEmptyAssistantReplyAfterWrite,
+    ...(Object.prototype.hasOwnProperty.call(input, "planCandidateRepairCheckpoint")
+      ? { planCandidateRepairCheckpoint }
+      : {}),
   });
 
   if (!isAssistantTurnEmpty(normalized)) {
@@ -243,6 +255,54 @@ export async function handleEmptyResponseRecovery(input: {
     return finish("stopped");
   }
 
+  if (
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
+    planCandidateRepairCheckpoint &&
+    !planCandidateRepairCheckpoint.exhausted
+  ) {
+    planCandidateRepairCheckpoint = advancePlanCandidateRepairCheckpoint({
+      checkpoint: planCandidateRepairCheckpoint,
+      outputChars: 0,
+      failures: ["typed_plan_repair_empty_response"],
+      preserveScope: true,
+    });
+    callbacks.appendMessage({
+      role: "assistant",
+      content: buildEmptyAssistantPlaceholder(normalized.hiddenThought),
+    });
+    if (planCandidateRepairCheckpoint.exhausted) {
+      const terminalReason = planCandidateRepairCheckpoint.terminalReason ||
+        "typed_plan_candidate_repair_attempts_exhausted";
+      emitDebug("plan_candidate_local_repair_empty_exhausted", {
+        iteration,
+        attempts: planCandidateRepairCheckpoint.attempts,
+        terminalReason,
+      });
+      callbacks.onNonActionableStop(
+        callbacks.getPreferredLanguage() === "zh"
+          ? "计划局部修复已暂停：连续响应没有提交当前 schema 所要求的有效 patch。已接受的节点和冻结证据回执仍保留，可从该检查点继续。"
+          : "Plan local repair paused because consecutive responses did not submit a valid patch for the active schema. Accepted nodes and the frozen evidence receipt remain retained for checkpointed continuation.",
+        "incomplete_plan",
+        {
+          phase: "paused",
+          recoveryReason: "plan_candidate_repair_budget_exhausted",
+          nextStep: terminalReason,
+        },
+      );
+      return finish("stopped");
+    }
+    callbacks.onStatusChange("running");
+    callbacks.appendMessage({
+      role: "user",
+      content: buildPlanCandidateRepairPrompt(planCandidateRepairCheckpoint, {
+        submissionTransport: input.forceXmlTools ? "text_envelope" : "active_transport",
+        contractCard: true,
+      }),
+    });
+    return finish("continue");
+  }
+
   if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
     if (consecutiveEmptyResponseCount >= 2) {
       const closureResult = await tryClosePlanWithEvidence("empty_response_checkpoint", {
@@ -281,9 +341,12 @@ export async function handleEmptyResponseRecovery(input: {
 
     callbacks.appendMessage({
       role: "user",
-      content: consecutiveEmptyResponseCount === 1
-        ? "The previous Plan reply was empty or protocol-only. Retry once with the same context and evidence bundle, and output a reviewable `<proposed_plan>`; MAIN runtime owns materialization. Use `<user_options>` only for a real blocking choice. Do not return hidden reasoning or pseudo-tool placeholders."
-        : "Two consecutive Plan replies produced no usable content, but the task must continue. Reuse the current context: if evidence is missing, call exactly one targeted read-only tool now; otherwise output the complete `<proposed_plan>`. Do not ask whether to continue, emit `<user_options>`, or return another blank/protocol placeholder.",
+      content: [
+        consecutiveEmptyResponseCount === 1
+          ? "The previous Plan reply was empty or protocol-only. Retry once with the same context and evidence bundle, and submit the complete typed graph; MAIN runtime owns validation and rendering. Use `<user_options>` only for a real blocking choice. Do not return hidden reasoning or pseudo-tool placeholders."
+          : "Two consecutive Plan replies produced no usable content, but the task must continue. Reuse the current context: if evidence is missing, call exactly one targeted read-only tool now; otherwise submit the complete typed graph. Do not ask whether to continue, emit `<user_options>`, or return another blank/protocol placeholder.",
+        buildPlanSubmissionGuidance(MODEL_CONTROL_LANGUAGE),
+      ].join("\n"),
     });
     return finish("continue");
   }
@@ -309,7 +372,6 @@ export async function handleEmptyResponseRecovery(input: {
       applyExecuteNoToolStrategyPivot({
         callbacks,
         decision: strategyDecision,
-        forceXmlTools: input.forceXmlTools,
         iteration,
         cause: "empty_execute_response",
       });

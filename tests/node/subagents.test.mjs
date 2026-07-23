@@ -34,6 +34,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
+const preferredScopes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"));
 const modelLanes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
 const subagentRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagentRuntime.ts"));
 const subagentJoinRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/subagentJoinRuntime.ts"));
@@ -82,6 +83,38 @@ function recordChildToolResult(callbacks, tool, target, content, options = {}) {
       ? { readFileObservation: options.readFileObservation }
       : {}),
   });
+}
+
+function makeSubagentClosure(overrides = {}) {
+  const { owner: ownerOverrides = {}, ...closureOverrides } = overrides;
+  const status = closureOverrides.status || "completed";
+  const state = closureOverrides.state || (status === "completed" ? "satisfied" : "blocked");
+  return {
+    schemaVersion: subagents.SUBAGENT_CLOSURE_SCHEMA_VERSION,
+    owner: {
+      agentKind: "subagent",
+      threadId: "thread-1",
+      parentTurnId: "turn-1",
+      subagentId: "subagent-1",
+      runId: "run-subagent-1",
+      parentRunId: "run-parent-1",
+      ...ownerOverrides,
+    },
+    scopeKey: closureOverrides.scopeKey || "turn-events",
+    status,
+    state,
+    remainingWork: status === "completed" ? null : "Inspect the unresolved child scope.",
+    observationCount: 0,
+    substantiveEvidenceCount: 0,
+    acceptedEvidenceToolCallIds: [],
+    requiredPaths: [],
+    coveredPaths: [],
+    failedPaths: [],
+    uncoveredPaths: [],
+    reasonCode: status === "completed" ? "runtime_completed" : "runtime_blocked",
+    reason: status === "completed" ? "The controlled runtime completed." : "The controlled runtime did not complete.",
+    ...closureOverrides,
+  };
 }
 
 test("subagent allowed paths preserve execution casing while deduplicating identities", () => {
@@ -268,10 +301,12 @@ test("adaptive delegation admits only useful context or diagnostic fan-out", () 
     preference: "preferred",
     phase: "mutation",
     hasWorkspace: true,
-    explicitScopeCount: 4,
+    explicitScopeCount: 2,
+    independentScopeKeys: ["src/main.js", "src/components/toolbar.js"],
+    runtimeHealth: readyRuntimeHealth,
   });
-  assert.equal(afterMutation.action, "defer");
-  assert.equal(afterMutation.reason, "phase_not_eligible");
+  assert.equal(afterMutation.action, "admit");
+  assert.equal(afterMutation.reason, "explicit_preference");
 
   const pendingJoin = subagents.resolveDelegationDecision({
     preference: "preferred",
@@ -339,39 +374,33 @@ test("checked collaboration becomes a bounded delegation obligation after parall
       "src/components/ToolbarPanel.tsx",
       "src-tauri/src/main.rs",
     ],
-    alreadySatisfied: false,
     spawnToolAvailable: true,
   });
 
   assert.equal(decision.action, "admit");
-  assert.deepEqual(requirement, {
-    required: true,
-    reason: "required",
-    candidateScopeKeys: [
-      "src-tauri/src/main.rs",
-      "src/components/editor.js",
-      "src/components/ToolbarPanel.tsx",
-    ],
-  });
+  assert.equal(requirement.required, true);
+  assert.equal(requirement.reason, "required");
+  assert.equal(requirement.contractOpen, true);
+  assert.deepEqual(requirement.candidateScopeKeys, [
+    "src-tauri/src/main.rs",
+    "src/components/editor.js",
+    "src/components/ToolbarPanel.tsx",
+  ]);
   const actionContract = subagents.buildPreferredDelegationActionContract({
     language: "zh",
     candidateScopeKeys: requirement.candidateScopeKeys,
   });
   assert.match(actionContract, /必须先调用 spawn_subagent/);
+  assert.match(actionContract, /最后生效的动作契约/);
+  assert.match(actionContract, /不要由主体调用 read_file/);
+  assert.match(actionContract, /role=reviewer/);
   assert.match(actionContract, /src\/components\/ToolbarPanel\.tsx/);
 
   assert.equal(subagents.resolvePreferredDelegationRequirement({
     decision,
     independentScopeKeys: ["src/components/editor.js"],
-    alreadySatisfied: false,
     spawnToolAvailable: true,
   }).reason, "insufficient_parallel_scope");
-  assert.equal(subagents.resolvePreferredDelegationRequirement({
-    decision,
-    independentScopeKeys: requirement.candidateScopeKeys,
-    alreadySatisfied: true,
-    spawnToolAvailable: true,
-  }).reason, "already_satisfied");
 
   const unsafeDecision = subagents.resolveDelegationDecision({
     preference: "preferred",
@@ -383,11 +412,614 @@ test("checked collaboration becomes a bounded delegation obligation after parall
   const unsafeRequirement = subagents.resolvePreferredDelegationRequirement({
     decision: unsafeDecision,
     independentScopeKeys: requirement.candidateScopeKeys,
-    alreadySatisfied: false,
     spawnToolAvailable: true,
   });
   assert.equal(unsafeRequirement.required, false);
   assert.equal(unsafeRequirement.reason, "runtime_capacity_degraded");
+});
+
+test("only a required preferred checkpoint normalizes spawned work to an independent reviewer", () => {
+  const calls = [{
+    id: "spawn-1",
+    name: "spawn_subagent",
+    arguments: JSON.stringify({
+      objective: "Inspect src/main.js",
+      role: "explorer",
+      allowed_paths: "src/main.js",
+    }),
+  }, {
+    id: "read-1",
+    name: "read_file",
+    arguments: JSON.stringify({ path: "src/main.js" }),
+  }];
+
+  assert.equal(
+    JSON.parse(subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, true)[0].arguments).role,
+    "reviewer",
+  );
+  assert.strictEqual(
+    subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, false),
+    calls,
+  );
+  assert.equal(
+    subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, true)[1].arguments,
+    calls[1].arguments,
+  );
+});
+
+test("preferred collaboration derives subsystem scopes and settles every scope independently", () => {
+  const requiredScopes = preferredScopes.derivePreferredDelegationScopeCandidates({
+    candidatePathKeys: [
+      "src/main.js",
+      "src/components/editor.js",
+      "src/components/toolbar.js",
+      "src-tauri/src/main.rs",
+    ],
+    maxCreatedPerTurn: 3,
+  });
+  assert.deepEqual(requiredScopes, [{
+    scopeKey: "src",
+    allowedPaths: [
+      "src/main.js",
+      "src/components/editor.js",
+      "src/components/toolbar.js",
+    ],
+  }, {
+    scopeKey: "src-tauri",
+    allowedPaths: ["src-tauri/src/main.rs"],
+  }]);
+
+  let contract = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes,
+    maxCreatedPerTurn: 3,
+  });
+  const requirement = {
+    required: true,
+    remainingScopes: requiredScopes,
+  };
+  const normalizedCalls = preferredScopes.normalizeRequiredPreferredDelegationScopeCalls([
+    { id: "spawn-ui", name: "spawn_subagent", arguments: "{}" },
+    { id: "spawn-rust", name: "spawn_subagent", arguments: "{}" },
+    { id: "spawn-extra", name: "spawn_subagent", arguments: JSON.stringify({
+      scope_key: "model-invented-extra",
+      allowed_paths: "src/components/preview.js",
+    }) },
+  ], requirement);
+  assert.deepEqual(normalizedCalls.map((call) => {
+    const args = JSON.parse(call.arguments);
+    return [args.scope_key, args.allowed_paths, args.role];
+  }), [
+    ["src", "src/main.js,src/components/editor.js,src/components/toolbar.js", "reviewer"],
+    ["src-tauri", "src-tauri/src/main.rs", "reviewer"],
+  ]);
+
+  contract = preferredScopes.recordPreferredDelegationScopeSpawn({
+    contract,
+    outcome: {
+      subagentId: "child-ui",
+      name: "UI",
+      status: "queued",
+      scopeKey: "src",
+      allowedPaths: requiredScopes[0].allowedPaths,
+    },
+  });
+  contract = preferredScopes.recordPreferredDelegationScopeSpawn({
+    contract,
+    outcome: {
+      subagentId: "child-rust",
+      name: "Rust",
+      status: "queued",
+      scopeKey: "src-tauri",
+      allowedPaths: requiredScopes[1].allowedPaths,
+    },
+  });
+  contract = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+    contract,
+    outcomes: [{
+      subagentId: "child-ui",
+      scopeKey: "src",
+      status: "completed",
+      closureState: "satisfied",
+      adoptedEvidenceCount: 2,
+      adoptedEvidenceTargets: ["src/main.js", "src/components/editor.js"],
+      consumed: true,
+    }, {
+      subagentId: "child-rust",
+      scopeKey: "src-tauri",
+      status: "degraded",
+      closureState: "partial",
+      adoptedEvidenceCount: 1,
+      adoptedEvidenceTargets: ["src-tauri/src/main.rs"],
+      consumed: false,
+    }],
+  });
+  const partial = preferredScopes.getPreferredDelegationScopeProgress(contract);
+  assert.equal(partial.satisfied, false);
+  assert.deepEqual(partial.consumedScopeKeys, ["src"]);
+  assert.deepEqual(partial.remainingScopes.map((scope) => scope.scopeKey), ["src-tauri"]);
+});
+
+test("execute delegation scopes accept only runtime-owned workspace paths", () => {
+  assert.deepEqual(
+    preferredScopes.collectPreferredDelegationWorkspacePathCandidates([
+      {
+        name: "grep_search",
+        target: "问题：打开文件失败后修复整个工作区",
+        status: "succeeded",
+        discoveryObservation: {
+          kind: "search",
+          targetRefs: ["src/main.js", "src/components/toolbar.js"],
+        },
+      },
+      {
+        name: "grep_search",
+        target: "另一段自然语言查询",
+        status: "succeeded",
+      },
+      {
+        name: "read_file",
+        target: "src/components/statusbar.js",
+        status: "succeeded",
+        readFileObservation: { path: "src/components/statusbar.js" },
+      },
+      {
+        name: "read_file",
+        target: "src/untrusted.js",
+        status: "succeeded",
+        delegatedObservation: {
+          planningEvidenceState: "unresolved",
+          closureState: "unverified",
+        },
+      },
+    ]),
+    [
+      "src/main.js",
+      "src/components/toolbar.js",
+      "src/components/statusbar.js",
+    ],
+  );
+});
+
+test("preferred collaboration opens a fresh bounded wave after lifecycle progress", () => {
+  const requiredScopes = [
+    { scopeKey: "editor", allowedPaths: ["src/main.js"] },
+    { scopeKey: "toolbar", allowedPaths: ["src/components/toolbar.js"] },
+  ];
+  let diagnostic = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes,
+    maxCreatedPerTurn: 2,
+    lifecyclePhase: "diagnostic",
+  });
+  for (const [index, scope] of requiredScopes.entries()) {
+    const subagentId = `diagnostic-${index}`;
+    diagnostic = preferredScopes.recordPreferredDelegationScopeSpawn({
+      contract: diagnostic,
+      outcome: {
+        subagentId,
+        name: subagentId,
+        status: "queued",
+        scopeKey: scope.scopeKey,
+        allowedPaths: scope.allowedPaths,
+      },
+    });
+    diagnostic = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+      contract: diagnostic,
+      outcomes: [{
+        subagentId,
+        scopeKey: scope.scopeKey,
+        status: "completed",
+        closureState: "satisfied",
+        adoptedEvidenceCount: 1,
+        adoptedEvidenceTargets: scope.allowedPaths,
+        consumed: true,
+      }],
+    });
+  }
+
+  assert.equal(preferredScopes.getPreferredDelegationScopeProgress(diagnostic).satisfied, true);
+  assert.equal(
+    preferredScopes.activatePreferredDelegationScopeContract(
+      diagnostic,
+      { requiredScopes, lifecyclePhase: "diagnostic" },
+      2,
+    ),
+    diagnostic,
+    "the same settled phase cannot manufacture a duplicate wave",
+  );
+
+  const validation = preferredScopes.activatePreferredDelegationScopeContract(
+    diagnostic,
+    { requiredScopes, lifecyclePhase: "validation" },
+    2,
+  );
+  assert.notEqual(validation, diagnostic);
+  assert.equal(validation.wave, 2);
+  assert.equal(validation.lifecyclePhase, "validation");
+  assert.deepEqual(validation.registrations, []);
+  assert.equal(
+    preferredScopes.getPreferredDelegationScopeProgress(validation).creationCapacityRemaining,
+    2,
+    "joined children release creation capacity for a later lifecycle wave",
+  );
+});
+
+test("preferred Plan scopes use closed authoritative owners without manufacturing sibling file scopes", () => {
+  const topologyOwners = preferredScopes.collectTrustedPreferredDelegationWorkspaceTopologyPaths([
+    {
+      name: "get_project_skeleton",
+      status: "succeeded",
+      discoveryObservation: {
+        kind: "project_structure",
+        targetRefs: [
+          "package.json",
+          "README.md",
+          "src/main.js",
+          "src/components/editor.js",
+          "src-tauri/src/main.rs",
+        ],
+      },
+    },
+    {
+      name: "list_directory",
+      status: "succeeded",
+      discoveryObservation: {
+        kind: "project_structure",
+        targetRefs: ["untrusted/summary.ts"],
+      },
+    },
+  ]);
+  assert.deepEqual(topologyOwners, [
+    "package.json",
+    "README.md",
+    "src/main.js",
+    "src/components/editor.js",
+    "src-tauri/src/main.rs",
+  ]);
+  assert.deepEqual(preferredScopes.derivePreferredDelegationScopeCandidates({
+    candidatePathKeys: topologyOwners,
+    maxCreatedPerTurn: 3,
+    strategy: "stable_top_level",
+  }).map((scope) => scope.scopeKey), [
+    "src",
+    "src-tauri",
+  ], "root singletons cannot consume child capacity beside directory-backed scopes");
+
+  const provisionalOwners = preferredScopes.collectAuthoritativePreferredDelegationEvidenceOwnerPaths([
+    { name: "read_file", target: "src/components/editor.js", status: "succeeded" },
+    { name: "read_file", target: "src/components/preview.js", status: "succeeded" },
+    { name: "read_file", target: "src/components/toolbar.js", status: "succeeded" },
+    { name: "find_symbol_references", target: "input", status: "succeeded" },
+    {
+      name: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      delegatedObservation: {
+        planningEvidenceState: "unresolved",
+        joinState: "consumed",
+        closureState: "partial",
+      },
+    },
+  ]);
+  assert.deepEqual(provisionalOwners, [
+    "src/components/editor.js",
+    "src/components/preview.js",
+    "src/components/toolbar.js",
+  ]);
+  assert.deepEqual(preferredScopes.derivePreferredDelegationScopeCandidates({
+    candidatePathKeys: provisionalOwners,
+    maxCreatedPerTurn: 3,
+    strategy: "stable_top_level",
+  }), [{
+    scopeKey: "src",
+    allowedPaths: ["src"],
+  }], "three sibling component reads remain one stable subsystem");
+
+  const closedOwners = preferredScopes.collectAuthoritativePreferredDelegationEvidenceOwnerPaths([
+    ...provisionalOwners.map((target) => ({ name: "read_file", target, status: "succeeded" })),
+    { name: "read_file", target: "src/main.js", status: "succeeded" },
+    { name: "read_file", target: "src-tauri/src/main.rs", status: "succeeded" },
+  ]);
+  assert.deepEqual(
+    preferredScopes.derivePreferredDelegationScopeCandidates({
+      candidatePathKeys: closedOwners,
+      maxCreatedPerTurn: 3,
+      strategy: "stable_top_level",
+    }).map((scope) => scope.scopeKey),
+    ["src", "src-tauri"],
+  );
+});
+
+test("preferred scope consumption requires matching child scope identity and in-scope evidence", () => {
+  const requiredScopes = [
+    { scopeKey: "src", allowedPaths: ["src/main.js"] },
+    { scopeKey: "src-tauri", allowedPaths: ["src-tauri/src/main.rs"] },
+  ];
+  const createSpawnedContract = () => preferredScopes.recordPreferredDelegationScopeSpawn({
+    contract: preferredScopes.createPreferredDelegationScopeContract({
+      requiredScopes,
+      maxCreatedPerTurn: 2,
+    }),
+    outcome: {
+      subagentId: "child-src",
+      name: "UI",
+      status: "queued",
+      scopeKey: "src",
+      allowedPaths: ["src/main.js"],
+    },
+  });
+  const baseOutcome = {
+    subagentId: "child-src",
+    status: "completed",
+    closureState: "satisfied",
+    adoptedEvidenceCount: 1,
+    consumed: true,
+  };
+
+  const wrongIdentity = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+    contract: createSpawnedContract(),
+    outcomes: [{
+      ...baseOutcome,
+      scopeKey: "src-tauri",
+      adoptedEvidenceTargets: ["src/main.js"],
+    }],
+  });
+  assert.equal(wrongIdentity.registrations[0].state, "incomplete");
+
+  const escapedEvidence = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+    contract: createSpawnedContract(),
+    outcomes: [{
+      ...baseOutcome,
+      scopeKey: "src",
+      adoptedEvidenceTargets: ["src-tauri/src/main.rs"],
+    }],
+  });
+  assert.equal(escapedEvidence.registrations[0].state, "incomplete");
+
+  const exactEvidence = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+    contract: createSpawnedContract(),
+    outcomes: [{
+      ...baseOutcome,
+      scopeKey: "src",
+      adoptedEvidenceTargets: ["src/main.js"],
+    }],
+  });
+  assert.equal(exactEvidence.registrations[0].state, "consumed");
+});
+
+test("an exhausted preferred scope contract releases evidence work back to the parent", () => {
+  const requiredScopes = [{ scopeKey: "src", allowedPaths: ["src/main.js"] }, {
+    scopeKey: "src-tauri",
+    allowedPaths: ["src-tauri/src/main.rs"],
+  }];
+  let contract = preferredScopes.createPreferredDelegationScopeContract({
+    requiredScopes,
+    maxCreatedPerTurn: 2,
+  });
+  for (const [index, scope] of requiredScopes.entries()) {
+    const subagentId = `incomplete-${index}`;
+    contract = preferredScopes.recordPreferredDelegationScopeSpawn({
+      contract,
+      outcome: {
+        subagentId,
+        name: subagentId,
+        status: "queued",
+        scopeKey: scope.scopeKey,
+        allowedPaths: scope.allowedPaths,
+      },
+    });
+    contract = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
+      contract,
+      outcomes: [{
+        subagentId,
+        scopeKey: scope.scopeKey,
+        status: "degraded",
+        closureState: "partial",
+        adoptedEvidenceCount: 1,
+        adoptedEvidenceTargets: [scope.allowedPaths[0]],
+        consumed: false,
+      }],
+    });
+  }
+
+  const progress = preferredScopes.getPreferredDelegationScopeProgress(contract);
+  assert.equal(progress.satisfied, false);
+  assert.equal(progress.exhausted, true);
+  assert.equal(progress.open, false);
+  assert.equal(progress.creationCapacityRemaining, 0);
+  assert.deepEqual(progress.remainingScopes.map((scope) => scope.scopeKey), [
+    "src",
+    "src-tauri",
+  ]);
+
+  const requirement = subagents.resolvePreferredDelegationRequirement({
+    decision: {
+      action: "admit",
+      reason: "adaptive_multi_scope",
+      phase: "diagnostic",
+      preference: "preferred",
+      independentScopeCount: 2,
+      explicitScopeCount: 0,
+      observedScopeCount: 2,
+      plannedWorkItemCount: 0,
+      pendingSubagentCount: 0,
+      runtimeHealthState: "healthy",
+    },
+    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
+    scopeCandidates: requiredScopes,
+    scopeContract: contract,
+    spawnToolAvailable: true,
+  });
+  assert.equal(requirement.required, false);
+  assert.equal(requirement.reason, "scope_creation_capacity_reached");
+  assert.equal(requirement.contractOpen, false);
+
+  const laterValidation = subagents.resolvePreferredDelegationRequirement({
+    decision: {
+      ...requirement,
+      action: "admit",
+      reason: "explicit_preference",
+      phase: "validation",
+      preference: "preferred",
+      independentScopeCount: 2,
+      explicitScopeCount: 0,
+      observedScopeCount: 2,
+      plannedWorkItemCount: 0,
+      pendingSubagentCount: 0,
+      runtimeHealthState: "ready",
+    },
+    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
+    scopeCandidates: requiredScopes,
+    scopeContract: contract,
+    spawnToolAvailable: true,
+  });
+  assert.equal(laterValidation.required, true);
+  assert.equal(laterValidation.lifecyclePhase, "validation");
+  assert.deepEqual(laterValidation.consumedScopeKeys, []);
+});
+
+test("typed scope_key assignments preserve three explicit disjoint scopes within turn capacity", () => {
+  const scopes = preferredScopes.derivePreferredDelegationScopeCandidates({
+    candidatePathKeys: [],
+    structuredInput: [
+      "1. scope_key=csv-parser, scope=parser, allowed_paths=src/hooks/useCsvParser.ts, expected_output=evidence",
+      "2. scope_key=chart-consumer, scope=chart, allowed_paths=src/hooks/useChartData.ts,src/store/dashboardStore.ts, expected_output=evidence",
+      "3. scope_key=type-contract, scope=types, allowed_paths=src/types/order.ts, expected_output=evidence",
+    ].join("\n"),
+    maxCreatedPerTurn: 3,
+  });
+  assert.deepEqual(scopes.map((scope) => scope.scopeKey), [
+    "csv-parser",
+    "chart-consumer",
+    "type-contract",
+  ]);
+});
+
+test("preferred delegation materializes admitted scopes early and bounds scheduler failures", async () => {
+  const scopes = [{ scopeKey: "src", allowedPaths: ["src/main.js"] }, {
+    scopeKey: "src-tauri",
+    allowedPaths: ["src-tauri/src/main.rs"],
+  }];
+  const required = {
+    required: true,
+    reason: "required",
+    candidateScopeKeys: scopes.map((scope) => scope.scopeKey),
+    requiredScopes: scopes,
+    remainingScopes: scopes,
+    contractOpen: true,
+    consumedScopeKeys: [],
+  };
+  const calls = [];
+  const admitted = await preferredScopes.materializePreferredDelegationScopesEarly({
+    requirement: required,
+    parentObjective: "Compare the frontend event owner with the backend command owner",
+    runSubagent: async (request) => {
+      calls.push(request);
+      return {
+        subagentId: `child-${request.scopeKey}`,
+        name: request.name,
+        status: "queued",
+        scopeKey: request.scopeKey,
+        allowedPaths: request.allowedPaths.split(","),
+      };
+    },
+  });
+  assert.equal(admitted.plan.action, "materialize");
+  assert.equal(admitted.plan.reason, "runtime_owned_disjoint_scopes");
+  assert.equal(admitted.plan.obligation, "preferred_delegation_scope_contract");
+  assert.deepEqual(calls.map((request) => [
+    request.scopeKey,
+    request.role,
+    request.allowedPaths,
+  ]), [
+    ["src", "reviewer", "src/main.js"],
+    ["src-tauri", "reviewer", "src-tauri/src/main.rs"],
+  ]);
+  assert.equal(admitted.outcomes.length, 2);
+  assert.deepEqual(admitted.failures, []);
+
+  let skippedCalls = 0;
+  const singleScope = await preferredScopes.materializePreferredDelegationScopesEarly({
+    requirement: {
+      ...required,
+      required: false,
+      reason: "insufficient_parallel_scope",
+      candidateScopeKeys: ["src"],
+      requiredScopes: [scopes[0]],
+      remainingScopes: [scopes[0]],
+      contractOpen: false,
+    },
+    runSubagent: async () => {
+      skippedCalls += 1;
+      throw new Error("must not run");
+    },
+  });
+  assert.equal(singleScope.plan.action, "skip");
+  assert.equal(singleScope.plan.blockedBy, "insufficient_parallel_scope");
+
+  const noCapacity = await preferredScopes.materializePreferredDelegationScopesEarly({
+    requirement: {
+      ...required,
+      required: false,
+      reason: "runtime_capacity_busy",
+      contractOpen: false,
+    },
+    runSubagent: async () => {
+      skippedCalls += 1;
+      throw new Error("must not run");
+    },
+  });
+  assert.equal(noCapacity.plan.action, "skip");
+  assert.equal(noCapacity.plan.blockedBy, "runtime_capacity_busy");
+  assert.equal(skippedCalls, 0);
+
+  const controlledFailure = await preferredScopes.materializePreferredDelegationScopesEarly({
+    requirement: required,
+    runSubagent: async (request) => {
+      if (request.scopeKey === "src") {
+        return {
+          subagentId: null,
+          name: request.name,
+          status: "deferred",
+          scopeKey: request.scopeKey,
+          reason: "runtime_capacity_busy",
+        };
+      }
+      throw new Error("scheduler unavailable");
+    },
+  });
+  assert.deepEqual(controlledFailure.attemptedScopeKeys, ["src", "src-tauri"]);
+  assert.deepEqual(controlledFailure.failures.map((failure) => [
+    failure.scopeKey,
+    failure.kind,
+  ]), [
+    ["src", "deferred"],
+    ["src-tauri", "runtime_error"],
+  ]);
+
+  const releasedAfterFailure = subagents.resolvePreferredDelegationRequirement({
+    decision: {
+      action: "admit",
+      reason: "explicit_preference",
+      phase: "diagnostic",
+      preference: "preferred",
+      independentScopeCount: 2,
+      explicitScopeCount: 0,
+      observedScopeCount: 2,
+      plannedWorkItemCount: 0,
+      pendingSubagentCount: 0,
+      runtimeHealthState: "ready",
+    },
+    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
+    scopeContract: preferredScopes.createPreferredDelegationScopeContract({
+      requiredScopes: scopes,
+      maxCreatedPerTurn: 2,
+    }),
+    blockedScopeKeys: controlledFailure.attemptedScopeKeys,
+    spawnToolAvailable: true,
+  });
+  assert.equal(releasedAfterFailure.required, false);
+  assert.equal(releasedAfterFailure.reason, "runtime_materialization_failed");
+  assert.equal(releasedAfterFailure.contractOpen, false);
 });
 
 test("runtime event projection preserves completion while recording thread closure", () => {
@@ -398,6 +1030,9 @@ test("runtime event projection preserves completion while recording thread closu
     name: "Euler",
     role: "explorer",
     objective: "Trace the event path",
+    scopeKey: "turn-events",
+    runId: "run-subagent-1",
+    parentRunId: "run-parent-1",
     status: "queued",
     profile: "local",
     provider: "OMLX",
@@ -413,7 +1048,14 @@ test("runtime event projection preserves completion while recording thread closu
       turnId: "turn-1",
       timestampMs: 20,
       subagentId: "subagent-1",
-      patch: { status: "completed", completedAt: 20, updatedAt: 20, summary: "Found the event boundary." },
+      patch: {
+        status: "completed",
+        completedAt: 20,
+        updatedAt: 20,
+        summary: "Found the event boundary.",
+        closureState: "satisfied",
+        closureAudit: makeSubagentClosure(),
+      },
       activity: { id: "activity-1", timestampMs: 20, status: "completed", title: "Summary returned" },
     }),
     turnEvents.withEventSchema({ type: "subagent.closed", threadId: "thread-1", turnId: "turn-1", timestampMs: 21, subagentId: "subagent-1", closedAt: 21, reason: "completed" }),
@@ -437,6 +1079,62 @@ test("runtime event projection preserves completion while recording thread closu
     }),
   ];
   assert.deepEqual(subagents.projectSubagentRuns(dismissed), []);
+});
+
+test("persisted completion without an authoritative closure envelope fails closed", () => {
+  const legacyBase = {
+    id: "subagent-legacy",
+    parentTurnId: "turn-legacy",
+    threadId: "thread-legacy",
+    name: "Legacy",
+    role: "explorer",
+    objective: "Inspect legacy persisted state",
+    status: "queued",
+    profile: "local",
+    provider: "Local",
+    model: "legacy-model",
+    createdAt: 10,
+    updatedAt: 10,
+  };
+  const events = [
+    turnEvents.withEventSchema({
+      type: "subagent.created",
+      threadId: legacyBase.threadId,
+      turnId: legacyBase.parentTurnId,
+      timestampMs: 10,
+      subagent: legacyBase,
+    }),
+    turnEvents.withEventSchema({
+      type: "subagent.updated",
+      threadId: legacyBase.threadId,
+      turnId: legacyBase.parentTurnId,
+      timestampMs: 20,
+      subagentId: legacyBase.id,
+      patch: {
+        status: "completed",
+        summary: "无剩余工作 / No remaining work / Hakuna kazi iliyobaki.",
+        updatedAt: 20,
+        completedAt: 20,
+      },
+    }),
+    turnEvents.withEventSchema({
+      type: "subagent.closed",
+      threadId: legacyBase.threadId,
+      turnId: legacyBase.parentTurnId,
+      timestampMs: 21,
+      subagentId: legacyBase.id,
+      closedAt: 21,
+      reason: "completed",
+    }),
+  ];
+
+  const [record] = subagents.projectSubagentRuns(events);
+  assert.equal(record.status, "blocked");
+  assert.equal(record.closureState, "blocked");
+  assert.equal(record.remainingWork, legacyBase.objective);
+  assert.match(record.error || "", /SUBAGENT_CLOSURE_CONTRACT_MISSING/);
+  assert.equal(subagents.isAuthoritativeSubagentClosure(undefined), false);
+  assert.equal(subagents.isAuthoritativeSubagentClosure({ state: "satisfied" }), false);
 });
 
 test("session restore reconciles active records that have no live controller", () => {
@@ -695,7 +1393,7 @@ test("controlled child runtime isolates messages and returns its summary through
       contextHints: "Start with src/lib/turnEvents.ts",
       scopeKey: "turn-events",
       scope: "Inspect only the turn event contract",
-      allowedPaths: "src/lib/turnEvents.ts,vite.config.js,src/main.js",
+      allowedPaths: "src/lib/turnEvents.ts,vite.config.js,src/main.js,src-tauri/src/main.rs",
       expectedOutput: "Evidence summary",
     },
     parentCallbacks: {
@@ -728,6 +1426,20 @@ test("controlled child runtime isolates messages and returns its summary through
         "export default defineConfig({ plugins: [] });",
         "---CONTENT END---",
       ].join("\n"));
+      const rustCommandSource = [
+        "use tauri::{AppHandle, Manager};",
+        "tauri::Builder::default().invoke_handler(tauri::generate_handler![save_file_content]);",
+        "#[tauri::command]",
+        "fn save_file_content(app: AppHandle, content: String, file_path: Option<String>) -> Result<(), String> {",
+        "  let path = file_path.ok_or_else(|| \"missing path\".to_string())?;",
+        "  std::fs::write(path, content).map_err(|error| error.to_string())",
+        "}",
+      ].join("\n");
+      const directRustFacts = planMaterialization.extractPlanEvidenceSourceFacts(rustCommandSource);
+      assert.ok(directRustFacts.includes(
+        "command_handler_argument_contract(save_file_content,content,filePath)",
+      ), JSON.stringify(directRustFacts));
+      recordChildToolResult(childCallbacks, "read_file", "src-tauri/src/main.rs", rustCommandSource);
       recordChildToolResult(childCallbacks, "read_file", "src/main.js", [
         "READ_FILE_RESULT",
         "path: src/main.js",
@@ -819,12 +1531,16 @@ test("controlled child runtime isolates messages and returns its summary through
   ]);
   const [record] = subagents.projectSubagentRuns(events);
   assert.equal(record.status, "completed");
-  assert.equal(record.activities.filter((activity) => activity.status === "completed").length, 10);
+  assert.equal(record.activities.filter((activity) => activity.status === "completed").length, 11);
   assert.match(result.evidence.find((item) => item.target === "vite.config.js")?.detail || "", /port:\s*1420/);
   const mainEvidence = result.evidence.find((item) => item.target === "src/main.js");
   assert.ok(mainEvidence?.facts?.some((fact) => /event_dom_listener_contract\(DOMContentLoaded\)/.test(fact)));
   assert.ok(mainEvidence?.facts?.some((fact) => /listener_calls\([^)]*\binitToolbar\b[^)]*\binitEditor\b/.test(fact)));
   assert.ok(mainEvidence?.facts?.every((fact) => !/localDefinition|nestedDefinitionCall/.test(fact)));
+  const rustEvidence = result.evidence.find((item) => item.target === "src-tauri/src/main.rs");
+  assert.ok(rustEvidence?.facts?.includes(
+    "command_handler_argument_contract(save_file_content,content,filePath)",
+  ), JSON.stringify(rustEvidence?.facts || []));
 
   const promoted = toolActivityTracking.extractDelegatedSubagentActivities({
     toolCallId: "call_wait_logged_md_viewer",
@@ -1030,7 +1746,7 @@ test("non-substantive observations cannot satisfy required fan-out coverage", as
   assert.deepEqual(result.closureAudit?.uncoveredPaths, ["src/components/editor.js"]);
 });
 
-test("child reports with declared remaining work cannot be marked completed", async () => {
+test("missing substantive evidence blocks closure independently of report wording", async () => {
   subagents.resetSubagentRuntimeForTests();
   const result = await subagentRuntime.executeControlledSubagent({
     request: {
@@ -1066,8 +1782,9 @@ test("child reports with declared remaining work cannot be marked completed", as
   });
 
   assert.equal(result.status, "blocked");
-  assert.match(result.blocker || "", /SUBAGENT_REMAINING_WORK_DECLARED/);
-  assert.match(result.remainingWork || "", /read_file/);
+  assert.match(result.blocker || "", /SUBAGENT_EVIDENCE_REQUIRED/);
+  assert.equal(result.closureAudit.reasonCode, "missing_substantive_evidence");
+  assert.equal(result.remainingWork, "Inspect parser normalization");
   assert.equal(result.evidence.length, 1);
 });
 
@@ -1166,8 +1883,8 @@ test("structured child reports and empty outlines cannot produce false completio
   assert.equal(result.closureAudit?.state, "blocked");
   assert.equal(result.closureAudit?.substantiveEvidenceCount, 0);
   assert.equal(result.evidence[0]?.observation?.substantive, false);
-  assert.match(result.remainingWork || "", /read_file/);
-  assert.match(result.blocker || "", /SUBAGENT_REMAINING_WORK_DECLARED/);
+  assert.equal(result.remainingWork, "Inspect parser normalization");
+  assert.match(result.blocker || "", /SUBAGENT_EVIDENCE_REQUIRED/);
 });
 
 test("negated remaining-work sections do not downgrade a completed child", () => {
@@ -1327,6 +2044,121 @@ test("subagent evidence retains tool-call, version, range, and fact provenance",
   ));
 });
 
+test("non-code file and document reads retain source observation provenance", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const markdownBody = [
+    "# Deployment notes",
+    "Use the reviewed staging checklist before release.",
+  ].join("\n");
+  const markdownRead = [
+    "READ_FILE_RESULT",
+    "path: docs/deployment.md",
+    "truncated: true",
+    "totalLines: 20",
+    `totalChars: ${markdownBody.length + 240}`,
+    `returnedChars: ${markdownBody.length}`,
+    "returnedLines: 5-6",
+    "nextStartLine: 7",
+    "---CONTENT START---",
+    markdownBody,
+    "---CONTENT END---",
+  ].join("\n");
+  const documentBody = "Approved retention policy for customer records.";
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect the deployment note and policy document",
+      scopeKey: "non-code-source-observations",
+      allowedPaths: "docs/deployment.md,docs/retention.docx",
+      expectedOutput: "Source-backed findings for both documents",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-non-code-source-observations",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-non-code-source-observations",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "docs/deployment.md",
+        markdownRead,
+        { toolCallId: "child-read-deployment-markdown" },
+      );
+      recordChildToolResult(
+        childCallbacks,
+        "read_document",
+        "docs/retention.docx",
+        documentBody,
+        { toolCallId: "child-read-retention-document" },
+      );
+      childCallbacks.onAssistantFinalText("Both documents were inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  const markdownEvidence = result.evidence.find((item) => item.target === "docs/deployment.md");
+  assert.equal(markdownEvidence?.observation?.kind, "source");
+  assert.equal(markdownEvidence?.observation?.substantive, true);
+  assert.equal(markdownEvidence?.provenance.sourceContentChars, [...markdownBody].length);
+  assert.match(markdownEvidence?.provenance.sourceContentHash || "", /^[a-z0-9]+$/i);
+  assert.deepEqual(markdownEvidence?.provenance.sourceRange, {
+    startLine: 5,
+    endLine: 6,
+    totalLines: 20,
+    truncated: true,
+  });
+
+  const documentEvidence = result.evidence.find((item) => item.target === "docs/retention.docx");
+  assert.equal(documentEvidence?.observation?.kind, "source");
+  assert.equal(documentEvidence?.observation?.substantive, true);
+  assert.equal(documentEvidence?.provenance.sourceContentChars, [...documentBody].length);
+  assert.match(documentEvidence?.provenance.sourceContentHash || "", /^[a-z0-9]+$/i);
+});
+
+test("a cached non-code read stub cannot satisfy child source evidence", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect the deployment note",
+      scopeKey: "cached-non-code-source",
+      allowedPaths: "docs/deployment.md",
+      expectedOutput: "Source-backed deployment evidence",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-cached-non-code-source",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-cached-non-code-source",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "docs/deployment.md",
+        "FILE_UNCHANGED_STUB: the exact source window remains in context",
+        { toolCallId: "child-read-cached-markdown" },
+      );
+      childCallbacks.onAssistantFinalText("The cached stub did not expose source bytes.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(result.status, "blocked");
+  assert.equal(result.closureAudit?.substantiveEvidenceCount, 0);
+  assert.equal(result.evidence[0]?.observation?.kind, "source");
+  assert.equal(result.evidence[0]?.observation?.substantive, false);
+  assert.equal(result.evidence[0]?.provenance.sourceContentChars, 0);
+  assert.equal(result.evidence[0]?.provenance.sourceContentHash, undefined);
+});
+
 test("subagent evidence keeps disjoint windows of the same file as separate observations", async () => {
   subagents.resetSubagentRuntimeForTests();
   const readResult = (startLine, endLine, content) => [
@@ -1460,11 +2292,418 @@ test("async spawn returns a handle before completion and wait preserves structur
   assert.match(joined.results[0].summary, /versioned and persisted/);
   assert.equal(joined.results[0].evidence[0].target, "src/lib/turnEvents.ts");
   assert.deepEqual(subagents.getPendingCoordinatedSubagentIds("thread-async", "turn-async"), []);
-  assert.equal(subagents.getCoordinatedSubagentRunCount("thread-async", "turn-async"), 1);
+  assert.equal(subagents.getCoordinatedSubagentRunCount("thread-async", "turn-async"), 0);
   assert.equal(subagents.findSubagentScopeConflict({
     threadId: "thread-async",
     targetPath: "src/lib/turnEvents.ts",
   }), null);
+});
+
+test("runtime wait treats an unmatched model ID as all registered children without another model iteration", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  let releaseChild;
+  const completion = new Promise((resolve) => { releaseChild = resolve; });
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-runtime-wait",
+    parentTurnId: "turn-runtime-wait",
+    subagentId: "subagent-runtime-wait",
+    name: "Euler",
+    scopeKey: "runtime-wait",
+    runId: "run-subagent-runtime-wait",
+    parentRunId: "run-parent-runtime-wait",
+    completion,
+  });
+
+  let settled = false;
+  const waiting = subagents.waitForCoordinatedSubagents({
+    threadId: "thread-runtime-wait",
+    parentTurnId: "turn-runtime-wait",
+    // Models sometimes spell an all-children request as a value even though
+    // the schema says to omit this field. The runtime ledger remains authority.
+    subagentIds: ["all"],
+  }).finally(() => { settled = true; });
+
+  let eventLoopAdvanced = false;
+  await new Promise((resolve) => setTimeout(() => {
+    eventLoopAdvanced = true;
+    resolve();
+  }, 0));
+  assert.equal(eventLoopAdvanced, true, "awaiting a child must yield to the UI event loop");
+  assert.equal(settled, false, "an unmatched ID must not return an empty join result");
+
+  releaseChild({
+    subagentId: "subagent-runtime-wait",
+    name: "Euler",
+    scopeKey: "runtime-wait",
+    status: "completed",
+    summary: "The registered child completed.",
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: "runtime-wait",
+      owner: {
+        threadId: "thread-runtime-wait",
+        parentTurnId: "turn-runtime-wait",
+        subagentId: "subagent-runtime-wait",
+        runId: "run-subagent-runtime-wait",
+        parentRunId: "run-parent-runtime-wait",
+      },
+    }),
+  });
+  const joined = await waiting;
+  assert.deepEqual(joined.results.map((entry) => entry.subagentId), ["subagent-runtime-wait"]);
+  assert.deepEqual(joined.pendingIds, []);
+});
+
+test("same-owner replacement ignores stale completion and cannot release the replacement lease", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const threadId = "thread-generation-race";
+  const sessionEpoch = "epoch-generation-race";
+  const parentTurnId = "turn-generation-race";
+  const subagentId = "subagent-generation-race";
+  let resolveOld;
+  let resolveReplacement;
+  const oldCompletion = new Promise((resolve) => { resolveOld = resolve; });
+  const replacementCompletion = new Promise((resolve) => { resolveReplacement = resolve; });
+  const makeResult = (generation, summary) => ({
+    subagentId,
+    name: "Noether",
+    scopeKey: "generation-race",
+    status: "completed",
+    summary,
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: "generation-race",
+      owner: {
+        threadId,
+        parentTurnId,
+        subagentId,
+        runId: `run-${generation}`,
+        parentRunId: "run-parent-generation-race",
+      },
+    }),
+  });
+
+  subagents.acquireSubagentScopeLease({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+    subagentId,
+    generation: "generation-old",
+    scopeKey: "generation-race",
+    workspace: "/workspace",
+    allowedPaths: ["src/old.ts"],
+    createdAt: Date.now(),
+  });
+  subagents.registerCoordinatedSubagentRun({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+    subagentId,
+    generation: "generation-old",
+    name: "Noether",
+    scopeKey: "generation-race",
+    runId: "run-generation-old",
+    parentRunId: "run-parent-generation-race",
+    completion: oldCompletion,
+  });
+  const staleWait = subagents.waitForCoordinatedSubagents({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+    subagentIds: [subagentId],
+  });
+
+  subagents.acquireSubagentScopeLease({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+    subagentId,
+    generation: "generation-replacement",
+    scopeKey: "generation-race",
+    workspace: "/workspace",
+    allowedPaths: ["src/replacement.ts"],
+    createdAt: Date.now(),
+  });
+  subagents.registerCoordinatedSubagentRun({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+    subagentId,
+    generation: "generation-replacement",
+    name: "Noether",
+    scopeKey: "generation-race",
+    runId: "run-generation-replacement",
+    parentRunId: "run-parent-generation-race",
+    completion: replacementCompletion,
+  });
+
+  resolveOld(makeResult("generation-old", "The stale child completed."));
+  const staleJoin = await staleWait;
+  assert.deepEqual(staleJoin.results, [], "a replaced generation must not publish stale evidence");
+  assert.deepEqual(staleJoin.pendingIds, [subagentId]);
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId,
+    sessionEpoch,
+    targetPath: "src/old.ts",
+  }), null, "replacement registration should release only the old generation lease");
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId,
+    sessionEpoch,
+    targetPath: "src/replacement.ts",
+  })?.generation, "generation-replacement");
+
+  resolveReplacement(makeResult("generation-replacement", "The replacement child completed."));
+  const replacementJoin = await subagents.waitForCoordinatedSubagents({
+    threadId,
+    sessionEpoch,
+    parentTurnId,
+  });
+  assert.deepEqual(
+    replacementJoin.results.map((entry) => entry.summary),
+    ["The replacement child completed."],
+  );
+  assert.deepEqual(replacementJoin.pendingIds, []);
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId,
+    sessionEpoch,
+    targetPath: "src/replacement.ts",
+  }), null);
+});
+
+test("coordination registry isolates identical child identities across session epochs", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const threadId = "thread-epoch-fence";
+  const parentTurnId = "turn-epoch-fence";
+  const subagentId = "subagent-epoch-fence";
+  const makeResult = (epoch) => ({
+    subagentId,
+    name: "Curie",
+    scopeKey: epoch,
+    status: "completed",
+    summary: `${epoch} completed.`,
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: epoch,
+      owner: {
+        threadId,
+        parentTurnId,
+        subagentId,
+        runId: `run-${epoch}`,
+        parentRunId: null,
+      },
+    }),
+  });
+  for (const epoch of ["epoch-a", "epoch-b"]) {
+    subagents.registerCoordinatedSubagentRun({
+      threadId,
+      sessionEpoch: epoch,
+      parentTurnId,
+      subagentId,
+      generation: `generation-${epoch}`,
+      name: "Curie",
+      scopeKey: epoch,
+      runId: `run-${epoch}`,
+      parentRunId: null,
+      completion: Promise.resolve(makeResult(epoch)),
+    });
+  }
+
+  const epochAJoin = await subagents.waitForCoordinatedSubagents({
+    threadId,
+    sessionEpoch: "epoch-a",
+    parentTurnId,
+  });
+  assert.deepEqual(epochAJoin.results.map((entry) => entry.summary), ["epoch-a completed."]);
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds(threadId, parentTurnId, "epoch-b"),
+    [subagentId],
+  );
+  assert.equal(subagents.getCoordinatedSubagentRunCount(threadId, parentTurnId, "epoch-a"), 0);
+  assert.equal(subagents.getCoordinatedSubagentRunCount(threadId, parentTurnId, "epoch-b"), 1);
+
+  const epochBJoin = await subagents.waitForCoordinatedSubagents({
+    threadId,
+    sessionEpoch: "epoch-b",
+    parentTurnId,
+  });
+  assert.deepEqual(epochBJoin.results.map((entry) => entry.summary), ["epoch-b completed."]);
+});
+
+test("an explicit all token dominates a simultaneously valid subset", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const threadId = "thread-mixed-all";
+  const parentTurnId = "turn-mixed-all";
+  const makeResult = (subagentId) => ({
+    subagentId,
+    name: subagentId,
+    scopeKey: subagentId,
+    status: "completed",
+    summary: `${subagentId} completed.`,
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: subagentId,
+      owner: {
+        threadId,
+        parentTurnId,
+        subagentId,
+        runId: `run-${subagentId}`,
+        parentRunId: null,
+      },
+    }),
+  });
+  for (const subagentId of ["subagent-one", "subagent-two"]) {
+    subagents.registerCoordinatedSubagentRun({
+      threadId,
+      parentTurnId,
+      subagentId,
+      name: subagentId,
+      scopeKey: subagentId,
+      completion: Promise.resolve(makeResult(subagentId)),
+    });
+  }
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId,
+    parentTurnId,
+    subagentIds: ["all", "subagent-one"],
+  });
+  assert.deepEqual(
+    joined.results.map((entry) => entry.subagentId).sort(),
+    ["subagent-one", "subagent-two"],
+  );
+  assert.deepEqual(joined.pendingIds, []);
+});
+
+test("runtime wait never projects a model-only stale ID as pending Turn work", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-no-live-child",
+    parentTurnId: "turn-no-live-child",
+    subagentIds: ["subagent-model-only-stale-id"],
+  });
+  assert.deepEqual(joined, { results: [], pendingIds: [] });
+});
+
+test("runtime wait reports unconsumed siblings and redirects a stale subset to the live Turn ledger", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const makeResult = (subagentId, scopeKey) => ({
+    subagentId,
+    name: subagentId,
+    scopeKey,
+    status: "completed",
+    summary: `${subagentId} completed.`,
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey,
+      owner: {
+        threadId: "thread-subset-wait",
+        parentTurnId: "turn-subset-wait",
+        subagentId,
+        runId: `run-${subagentId}`,
+        parentRunId: null,
+      },
+    }),
+  });
+  let releaseSecond;
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-subset-wait",
+    parentTurnId: "turn-subset-wait",
+    subagentId: "subagent-first",
+    name: "First",
+    scopeKey: "first-scope",
+    completion: Promise.resolve(makeResult("subagent-first", "first-scope")),
+  });
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-subset-wait",
+    parentTurnId: "turn-subset-wait",
+    subagentId: "subagent-second",
+    name: "Second",
+    scopeKey: "second-scope",
+    completion: new Promise((resolve) => { releaseSecond = resolve; }),
+  });
+
+  const firstJoin = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-subset-wait",
+    parentTurnId: "turn-subset-wait",
+    subagentIds: ["subagent-first"],
+  });
+  assert.deepEqual(firstJoin.results.map((entry) => entry.subagentId), ["subagent-first"]);
+  assert.deepEqual(firstJoin.pendingIds, ["subagent-second"]);
+
+  let staleJoinSettled = false;
+  const staleJoin = subagents.waitForCoordinatedSubagents({
+    threadId: "thread-subset-wait",
+    parentTurnId: "turn-subset-wait",
+    subagentIds: ["subagent-first"],
+  }).finally(() => { staleJoinSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(staleJoinSettled, false);
+
+  releaseSecond(makeResult("subagent-second", "second-scope"));
+  const secondJoin = await staleJoin;
+  assert.deepEqual(secondJoin.results.map((entry) => entry.subagentId), ["subagent-second"]);
+  assert.deepEqual(secondJoin.pendingIds, []);
+});
+
+test("runtime wait is abortable without consuming a child result", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  let releaseChild;
+  const completion = new Promise((resolve) => { releaseChild = resolve; });
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-abort-wait",
+    parentTurnId: "turn-abort-wait",
+    subagentId: "subagent-abort-wait",
+    name: "Noether",
+    scopeKey: "abort-wait",
+    completion,
+  });
+  const controller = new AbortController();
+  const waiting = subagents.waitForCoordinatedSubagents({
+    threadId: "thread-abort-wait",
+    parentTurnId: "turn-abort-wait",
+    signal: controller.signal,
+  }).then(
+    () => "resolved",
+    (error) => error?.name || "rejected",
+  );
+
+  controller.abort();
+  releaseChild({
+    subagentId: "subagent-abort-wait",
+    name: "Noether",
+    scopeKey: "abort-wait",
+    status: "completed",
+    summary: "Completed after the parent canceled its wait.",
+    summaryTrust: "unverified_hypothesis",
+    evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: "abort-wait",
+      owner: {
+        threadId: "thread-abort-wait",
+        parentTurnId: "turn-abort-wait",
+        subagentId: "subagent-abort-wait",
+        runId: "run-subagent-abort-wait",
+        parentRunId: null,
+      },
+    }),
+  });
+  assert.equal(await waiting, "AbortError");
+  await completion;
+  await Promise.resolve();
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds("thread-abort-wait", "turn-abort-wait"),
+    ["subagent-abort-wait"],
+    "an aborted parent wait must not consume a late child result",
+  );
+  const recoveredJoin = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-abort-wait",
+    parentTurnId: "turn-abort-wait",
+  });
+  assert.deepEqual(recoveredJoin.results.map((entry) => entry.subagentId), ["subagent-abort-wait"]);
 });
 
 test("child initialization cannot overwrite parent recovery or terminal tool-surface state", async () => {
@@ -1585,6 +2824,16 @@ test("completed child remains joinable until the parent consumes its result", as
     summary: "Ready before the parent reached its join boundary.",
     summaryTrust: "unverified_hypothesis",
     evidence: [],
+    closureAudit: makeSubagentClosure({
+      scopeKey: "ready-result",
+      owner: {
+        threadId: "thread-ready",
+        parentTurnId: "turn-ready",
+        subagentId: "subagent-ready",
+        runId: "run-subagent-ready",
+        parentRunId: null,
+      },
+    }),
   });
   subagents.registerCoordinatedSubagentRun({
     threadId: "thread-ready",
@@ -1607,6 +2856,64 @@ test("completed child remains joinable until the parent consumes its result", as
   });
   assert.equal(joined.results[0].status, "completed");
   assert.deepEqual(subagents.getPendingCoordinatedSubagentIds("thread-ready", "turn-ready"), []);
+});
+
+test("parent join fails closed for missing and tampered child closure envelopes", async () => {
+  for (const variant of ["missing", "tampered_owner"]) {
+    subagents.resetSubagentRuntimeForTests();
+    const subagentId = `subagent-join-${variant}`;
+    const threadId = `thread-join-${variant}`;
+    const parentTurnId = `turn-join-${variant}`;
+    const scopeKey = `scope-join-${variant}`;
+    const rawResult = {
+      subagentId,
+      name: "Noether",
+      scopeKey,
+      status: "completed",
+      summary: variant === "missing"
+        ? "No remaining work."
+        : "无剩余工作。",
+      summaryTrust: "unverified_hypothesis",
+      evidence: [],
+      ...(variant === "tampered_owner"
+        ? {
+            closureAudit: makeSubagentClosure({
+              scopeKey,
+              owner: {
+                threadId,
+                parentTurnId,
+                subagentId: "subagent-foreign-owner",
+                runId: `run-${subagentId}`,
+                parentRunId: null,
+              },
+            }),
+          }
+        : {}),
+    };
+    subagents.registerCoordinatedSubagentRun({
+      threadId,
+      parentTurnId,
+      subagentId,
+      name: "Noether",
+      scopeKey,
+      objective: "Inspect the exact joined scope",
+      runId: `run-${subagentId}`,
+      parentRunId: null,
+      completion: Promise.resolve(rawResult),
+    });
+
+    const joined = await subagents.waitForCoordinatedSubagents({
+      threadId,
+      parentTurnId,
+      subagentIds: [subagentId],
+    });
+    assert.equal(joined.results[0].status, "blocked", variant);
+    assert.equal(joined.results[0].closureAudit.state, "blocked", variant);
+    assert.equal(joined.results[0].closureAudit.reasonCode, "invalid_closure_envelope", variant);
+    assert.equal(joined.results[0].closureAudit.owner.subagentId, subagentId, variant);
+    assert.equal(joined.results[0].remainingWork, "Inspect the exact joined scope", variant);
+    assert.match(joined.results[0].error || "", /SUBAGENT_CLOSURE_CONTRACT_INVALID/, variant);
+  }
 });
 
 test("runtime parent join injects structured child evidence before finalization", async () => {
@@ -1650,7 +2957,11 @@ test("runtime parent join injects structured child evidence before finalization"
     reason: "parent_final_response",
   });
 
-  assert.equal(joined, true);
+  assert.equal(joined.joined, true);
+  assert.equal(joined.adoptedEvidenceCount, 1);
+  assert.equal(joined.sourceEvidenceCount, 1);
+  assert.deepEqual(joined.requestedIds, ["subagent-euler", "subagent-mendel"]);
+  assert.deepEqual(joined.resultIds, ["subagent-euler"]);
   assert.match(messages[0].content, /SUBAGENT_JOIN_RESULT/);
   assert.match(messages[0].content, /unverified child hypothesis/);
   assert.match(messages[0].content, /targeted parent read_file/);
@@ -1660,6 +2971,117 @@ test("runtime parent join injects structured child evidence before finalization"
   assert.equal(recent[0].delegatedObservation.requiresParentReread, true);
   assert.deepEqual(recentPlan, recent);
   assert.deepEqual(events.map((entry) => entry.event), ["parent_join_required", "parent_join_injected"]);
+});
+
+test("runtime parent join preserves a joined result without claiming empty evidence was consumed", async () => {
+  const messages = [];
+  const events = [];
+  const recent = [];
+  const recentPlan = [];
+  const joinResult = await subagentJoinRuntime.joinPendingSubagentsForParent({
+    callbacks: {
+      getPendingSubagentIds: () => ["subagent-empty"],
+      waitSubagents: async () => ({
+        pendingIds: [],
+        results: [{
+          subagentId: "subagent-empty",
+          name: "Noether",
+          scopeKey: "empty-result",
+          status: "completed",
+          summary: "No tool-backed observations were produced.",
+          summaryTrust: "unverified_hypothesis",
+          evidence: [],
+        }],
+      }),
+      getPreferredLanguage: () => "en",
+      appendMessage: (message) => messages.push(message),
+      onDebugEvent: (event, data) => events.push({ event, data }),
+    },
+    recentToolActivity: recent,
+    recentPlanToolActivity: recentPlan,
+    reason: "plan_finalization",
+  });
+
+  assert.deepEqual(joinResult, {
+    joined: true,
+    requestedIds: ["subagent-empty"],
+    resultIds: ["subagent-empty"],
+    adoptedEvidenceCount: 0,
+    sourceEvidenceCount: 0,
+    requiredParentRereads: 0,
+    scopeOutcomes: [{
+      subagentId: "subagent-empty",
+      scopeKey: "empty-result",
+      status: "completed",
+      closureState: "unverified",
+      adoptedEvidenceCount: 0,
+      adoptedEvidenceTargets: [],
+      consumed: false,
+    }],
+  });
+  assert.equal(messages.length, 1, "the parent still receives the joined child result");
+  assert.deepEqual(recent, []);
+  assert.deepEqual(recentPlan, []);
+  assert.equal(events[1].data.evidenceCount, 0);
+  assert.equal(events[1].data.provenanceBackedEvidenceCount, 0);
+});
+
+test("runtime parent join retains the bounded Plan evidence ledger beyond recent activity", async () => {
+  const recent = [];
+  const recentPlan = [];
+  const evidence = Array.from({ length: 20 }, (_unused, index) => ({
+    tool: "read_file",
+    target: `src/owner-${index}.ts`,
+    detail: `Observed owner ${index} contract.`,
+    provenance: {
+      source: "tool_observation",
+      owner: { agentKind: "subagent", subagentId: "subagent-ledger" },
+      sourceToolCallId: `child-read-${index}`,
+    },
+  }));
+  evidence.push({
+    tool: "read_file",
+    target: "src/owner-19.ts",
+    detail: "Observed the latest owner 19 contract detail.",
+    provenance: {
+      source: "tool_observation",
+      owner: { agentKind: "subagent", subagentId: "subagent-ledger" },
+      sourceToolCallId: "child-read-19-replay",
+    },
+  });
+
+  const joined = await subagentJoinRuntime.joinPendingSubagentsForParent({
+    callbacks: {
+      getPendingSubagentIds: () => ["subagent-ledger"],
+      waitSubagents: async () => ({
+        pendingIds: [],
+        results: [{
+          subagentId: "subagent-ledger",
+          name: "Ledger",
+          scopeKey: "many-owners",
+          status: "completed",
+          summary: "Observed many independent owners.",
+          summaryTrust: "unverified_hypothesis",
+          evidence,
+        }],
+      }),
+      getPreferredLanguage: () => "en",
+      appendMessage: () => {},
+    },
+    recentToolActivity: recent,
+    recentPlanToolActivity: recentPlan,
+    reason: "plan_finalization",
+  });
+
+  assert.equal(joined.sourceEvidenceCount, 21);
+  assert.equal(joined.adoptedEvidenceCount, 20);
+  assert.equal(recent.length, 12, "ordinary recent activity keeps its UI/context bound");
+  assert.equal(recentPlan.length, 20, "Plan evidence keeps the larger ledger bound");
+  assert.equal(recentPlan.some((entry) => entry.target === "src/owner-0.ts"), true);
+  assert.match(
+    recentPlan.find((entry) => entry.target === "src/owner-19.ts")?.detail || "",
+    /latest owner 19/,
+  );
 });
 
 test("only a structured parent scope deferral requests deterministic child join", () => {
@@ -1780,7 +3202,61 @@ test("iteration boundary with substantive evidence is a degraded partial result,
   assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
 });
 
-test("a bounded child handoff with evidence and explicit no remaining scoped work closes as completed", async () => {
+test("a stream failure after substantive child evidence preserves that evidence for parent join", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const traceEvents = [];
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect the toolbar implementation",
+      scopeKey: "toolbar-source",
+      scope: "One exact source file",
+      allowedPaths: "src/components/toolbar.js",
+      expectedOutput: "Source-backed findings",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-stream-failure",
+      getMessages: () => [],
+      onDebugEvent: (event, data) => traceEvents.push({ event, data }),
+    },
+    parentTurnId: "turn-stream-failure",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/components/toolbar.js",
+        "The toolbar click handler delegates file selection to the runtime-owned open path.",
+      );
+      throw new Error("STREAM_VISIBLE_TEXT_REPETITION: repeated summary suffix");
+    },
+  });
+
+  assert.equal(result.status, "degraded");
+  assert.equal(result.closureAudit.state, "partial");
+  assert.equal(result.closureAudit.reasonCode, "runtime_partial_failure");
+  assert.equal(result.evidence.length, 1);
+  assert.equal(result.evidence[0].target, "src/components/toolbar.js");
+  assert.ok(traceEvents.some((entry) =>
+    entry.event === "subagent_partial_evidence_preserved_after_runtime_failure"
+  ));
+
+  const adopted = toolActivityTracking.extractDelegatedSubagentActivities({
+    toolCallId: "wait-stream-failure",
+    name: "wait_subagents",
+    target: result.subagentId,
+    content: JSON.stringify({ pendingIds: [], results: [result] }),
+    isError: false,
+    lifecycleState: "completed",
+  }, { evidenceLedger: true });
+  assert.equal(adopted.length, 1);
+  assert.equal(adopted[0].target, "src/components/toolbar.js");
+  assert.equal(adopted[0].delegatedObservation.closureState, "partial");
+});
+
+test("a partial child handoff cannot be promoted by an explicit no-remaining-work report", async () => {
   subagents.resetSubagentRuntimeForTests();
   const traceEvents = [];
   const result = await subagentRuntime.executeControlledSubagent({
@@ -1819,11 +3295,75 @@ test("a bounded child handoff with evidence and explicit no remaining scoped wor
     },
   });
 
-  assert.equal(result.status, "completed");
-  assert.equal(result.closureAudit?.state, "satisfied");
-  assert.equal(result.remainingWork, undefined);
+  assert.equal(result.status, "degraded");
+  assert.equal(result.closureAudit?.state, "partial");
+  assert.equal(result.closureAudit?.status, "degraded");
+  assert.equal(result.closureAudit?.owner.subagentId, result.subagentId);
+  assert.match(result.remainingWork || "", /Inspect a bounded file/);
   assert.match(result.parentHandoff || "", /父任务决定/);
-  assert.ok(traceEvents.some((entry) => entry.event === "subagent_bounded_handoff_closed"));
+  assert.equal(traceEvents.some((entry) => entry.event === "subagent_bounded_handoff_closed"), false);
+});
+
+test("Chinese, English, and third-language summaries yield the same typed partial closure", async () => {
+  const summaries = [
+    "## 剩余范围内工作\n无。已完成调查。",
+    "## Remaining In-Scope Work\nNone. The investigation is complete.",
+    "Hakuna kazi iliyobaki; uchunguzi umekamilika.",
+  ];
+  const projections = [];
+  for (const [index, summary] of summaries.entries()) {
+    subagents.resetSubagentRuntimeForTests();
+    const result = await subagentRuntime.executeControlledSubagent({
+      request: {
+        objective: "Inspect the bounded runtime contract",
+        scopeKey: "language-neutral-closure",
+        allowedPaths: "src/lib/subagents.ts",
+        expectedOutput: "One source-backed contract observation",
+      },
+      parentCallbacks: {
+        getConfig: () => makeConfig("local"),
+        getPreferredLanguage: () => "en",
+        getSessionKey: () => `thread-language-neutral-${index}`,
+        getMessages: () => [],
+      },
+      parentTurnId: `turn-language-neutral-${index}`,
+      existingRunCount: 0,
+      emitEvent: () => {},
+      executeAgentLoop: async (childCallbacks) => {
+        recordChildToolResult(
+          childCallbacks,
+          "read_file",
+          "src/lib/subagents.ts",
+          "export const SUBAGENT_CLOSURE_SCHEMA_VERSION = 1;",
+        );
+        childCallbacks.onAssistantFinalText(summary);
+        return {
+          status: "completed",
+          resultKind: "blocked",
+          reason: "subagent_max_iterations_partial_handoff",
+        };
+      },
+    });
+    assert.equal(subagents.isAuthoritativeSubagentClosure(result.closureAudit, {
+      threadId: `thread-language-neutral-${index}`,
+      parentTurnId: `turn-language-neutral-${index}`,
+      subagentId: result.subagentId,
+      scopeKey: "language-neutral-closure",
+    }), true);
+    projections.push({
+      status: result.status,
+      state: result.closureAudit.state,
+      closureStatus: result.closureAudit.status,
+      remainingWork: result.closureAudit.remainingWork,
+      observationCount: result.closureAudit.observationCount,
+      substantiveEvidenceCount: result.closureAudit.substantiveEvidenceCount,
+      reasonCode: result.closureAudit.reasonCode,
+    });
+  }
+
+  assert.deepEqual(projections, [projections[0], projections[0], projections[0]]);
+  assert.equal(projections[0].status, "degraded");
+  assert.equal(projections[0].state, "partial");
 });
 
 test("a completed error conclusion never projects as subagent success", async () => {
@@ -2009,7 +3549,7 @@ test("subagent source contracts keep children read-only and UI activity clickabl
   assert.match(schemaSource, /name: "spawn_subagent"/);
   assert.match(schemaSource, /name: "wait_subagents"/);
   assert.match(workflowSource, /run\.parentTurnId !== currentParentTurnId/);
-  assert.match(workflowSource, /return prepareSubagentsForNewTurn\(\)\.then\(executeLoopStrategy\)/);
+  assert.match(workflowSource, /return prepareSubagentsForNewTurn\(\)\.then\(executeDurablyAdmittedLoop\)/);
   assert.match(workflowSource, /subagent_new_turn_preflight/);
   const debugLogSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/debugLog.ts"), "utf8");
   assert.match(debugLogSource, /source === "agent\.iteration_start"/);

@@ -54,6 +54,48 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitTurnDraft.ts"),
 );
+const checkpointRuntime = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/turnRuntimeCheckpoint.ts"),
+);
+const canonicalRuntime = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/turnRuntimeContract.ts"),
+);
+
+function admittedCheckpoint(turnId, signals) {
+  let canonical = canonicalRuntime.createCanonicalTurnRuntime({
+    turn: {
+      workspaceKey: "/tmp/project",
+      sessionKey: "/tmp/project:7",
+      sessionEpoch: "epoch-7",
+      clientSubmissionId: `submission-${turnId}`,
+      turnId,
+    },
+    strategy: "plan",
+    admittedAt: 10,
+  });
+  const started = canonicalRuntime.reduceCanonicalTurnRuntime(canonical, {
+    schemaVersion: canonicalRuntime.TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    type: "run.started",
+    sequence: canonical.nextSequence,
+    at: 11,
+    run: {
+      sessionKey: "/tmp/project:7",
+      sessionEpoch: "epoch-7",
+      turnId,
+      runId: "run-parent",
+      parentRunId: null,
+      attemptId: "run-parent",
+    },
+    phase: "planning",
+  });
+  assert.equal(started.disposition, "applied");
+  canonical = started.state;
+  return checkpointRuntime.createTurnRuntimeCheckpoint({
+    canonical,
+    admittedUserContext: signals,
+    updatedAt: 11,
+  });
+}
 
 function conversationTurn(overrides = {}) {
   return {
@@ -139,6 +181,13 @@ test("captured subagent preference wins over later mutable Session state", () =>
   assert.equal(capturedUnspecified.turnInputContextSignals.subagentPreference, "unspecified");
 });
 
+test("submit turn draft preserves typed diagnosis outcome authority", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    diagnosisRequirement: "required",
+  }));
+  assert.equal(draft.turnInputContextSignals.diagnosisRequirement, "required");
+});
+
 test("raw user prohibition overrides a captured preferred subagent preference", () => {
   const draft = prepareSubmitTurnDraft(baseInput({
     text: "检查启动和菜单模块，但本轮不要使用子智能体。",
@@ -161,6 +210,51 @@ test("submit turn draft reuses existing turn title and UI parent", () => {
   assert.equal(draft.uiDisplayTurnId, "turn-parent");
   assert.equal(draft.existingTurn?.id, "turn-existing");
   assert.equal(draft.titleDecision.turnTitle, "Existing Camera Fix");
+});
+
+test("same-Turn recovery draft inherits first admission metadata without reattaching image bytes", () => {
+  const checkpoint = admittedCheckpoint("turn-existing", {
+    imageParts: 1,
+    mentionedFilePaths: ["src/App.tsx"],
+    attachedFilePaths: ["notes/incident.md"],
+    subagentPreference: "preferred",
+    diagnosisRequirement: "required",
+  });
+  const sessionGet = () => ({
+    _nextTaskId: () => 100,
+    sessionsByWorkspace: {
+      "/tmp/project": [{
+        id: 7,
+        title: "New Conversation",
+        titleSource: "default",
+        messages: [],
+      }],
+    },
+    turnRuntimeCheckpoints: { "turn-existing": checkpoint },
+  });
+  const childDraft = prepareSubmitTurnDraft(baseInput({
+    sessionGet,
+    text: "请在新的恢复上下文中继续执行已批准计划。",
+    images: [],
+    mentionSnapshot: [],
+    attachedFilesSnapshot: [],
+    runSessionKey: "/tmp/project:7",
+    reuseCurrentTurn: true,
+    reusableTurnId: "turn-existing",
+  }));
+
+  assert.deepEqual(childDraft.currentImages, [], "child Run must not duplicate the data URL");
+  assert.deepEqual(childDraft.turnInputContextSignals, checkpoint.input.admittedUserContext);
+
+  const newTurnDraft = prepareSubmitTurnDraft(baseInput({
+    sessionGet,
+    runSessionKey: "/tmp/project:7",
+    reuseCurrentTurn: false,
+    reusableTurnId: null,
+  }));
+  assert.equal(newTurnDraft.turnId, "turn-created");
+  assert.equal(newTurnDraft.turnInputContextSignals.imageParts, 0);
+  assert.deepEqual(newTurnDraft.turnInputContextSignals.mentionedFilePaths, []);
 });
 
 test("a rejected reuse override cannot create a duplicate logical Turn id", () => {

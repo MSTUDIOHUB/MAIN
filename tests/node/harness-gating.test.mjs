@@ -80,6 +80,7 @@ function createMockCallbacks(options = {}) {
     getPreferredLanguage: () => options.language || "zh",
     getCurrentRunIntent: () => "execute",
     getIsPlanApproved: () => true,
+    getPlanStage: () => "plan",
     getWorkspaceTree: () => "tree",
     getSessionKey: () => "mock-session",
     getMessages: () => options.messages || [],
@@ -389,7 +390,7 @@ test("validated Plan replace is promoted to one exact full-content write", async
   });
 });
 
-test("validation repair on replace_in_file is promoted to the repaired full-content write", async () => {
+test("legacy replace_in_file Plan repair is quarantined instead of becoming typed authority", async () => {
   const original = [
     "# Proposed Plan",
     "",
@@ -437,7 +438,20 @@ test("validation repair on replace_in_file is promoted to the repaired full-cont
     tc,
     args,
     "/tmp/workspace",
-    createMockCallbacks({ getIsPlanApproved: () => false }),
+    createMockCallbacks({
+      getIsPlanApproved: () => false,
+      getCurrentTurnId: () => "turn-plan-validation-repair",
+      messages: [{
+        role: "user",
+        content: [
+          "[turn_intake]",
+          "[user_request]",
+          "修复 src/main.ts 的 creator/creatorName 返回字段契约，同时保留 creator 兼容字段。",
+          "[/user_request]",
+          "[/turn_intake]",
+        ].join("\n"),
+      }],
+    }),
     {
       recentToolActivity: [{
         name: "read_file",
@@ -448,15 +462,18 @@ test("validation repair on replace_in_file is promoted to the repaired full-cont
     },
   );
 
-  assert.equal(result, null, result?.content);
-  assert.equal(tc.name, "write_file");
-  assert.equal(args.search_text, undefined);
-  assert.equal(args.replace_text, undefined);
-  assert.match(String(args.content || ""), /修复 creatorName 映射/);
-  assert.match(String(args.content || ""), /运行 `npm test` 并检查退出码与输出/);
+  assert.equal(result?.qualityGateReason, "typed_plan_draft_missing");
+  assert.equal(result?.internalFeedback, true);
+  assert.equal(result?.lifecycleState, "completed");
+  assert.match(result?.content || "", /候选内容没有写入磁盘/);
+  assert.equal(tc.name, "replace_in_file");
+  assert.equal(args.content, undefined);
+  assert.equal(args.search_text, "修复 creator 映射");
+  assert.equal(args.replace_text, "修复 creatorName 映射");
   assert.deepEqual(JSON.parse(tc.arguments), {
     path: ".MAIN/plans/plan.md",
-    content: args.content,
+    search_text: "修复 creator 映射",
+    replace_text: "修复 creatorName 映射",
   });
 });
 

@@ -4,6 +4,11 @@ import {
   type PlanEvidenceRecord,
 } from "../planMaterialization";
 import type { PlanEvidenceBundle } from "../planEvidence";
+import { buildPlanSubmissionGuidance } from "../planSubmissionGuidance";
+import {
+  formatPlanEvidenceObligation,
+  type PlanEvidenceObligation,
+} from "../planEvidenceObligations";
 import {
   hasTurnProvidedContext,
   normalizeTurnInputContextSignals,
@@ -30,6 +35,7 @@ export interface PlanClosureEvidenceRecoveryContext {
   unresolvedContractKinds?: string[];
   confirmedChangeTargets?: string[];
   avoidTargets?: string[];
+  evidenceObligations?: PlanEvidenceObligation[];
 }
 
 export function buildPlanClosureEvidenceRecoveryPrompt(
@@ -57,9 +63,16 @@ export function buildPlanClosureEvidenceRecoveryPrompt(
   const avoidTargets = [...new Set(
     (context.avoidTargets || []).map((value) => String(value || "").trim()).filter(Boolean),
   )].slice(0, 8);
+  const evidenceObligations = [...new Set(
+    (context.evidenceObligations || []).map(formatPlanEvidenceObligation).filter(Boolean),
+  )].slice(0, 8);
   const hasPermissionContractGap = unresolvedContractKinds.some((kind) =>
     kind.startsWith("permission_contract:")
   );
+  const missingCommandHandlers = unresolvedContractKinds
+    .filter((kind) => kind.startsWith("command_handler_contract:"))
+    .map((kind) => kind.slice("command_handler_contract:".length))
+    .filter(Boolean);
   if (language === "en") {
     return [
       "PLAN_CLOSURE_NEEDS_EVIDENCE: MAIN could not get a model-authored reviewable plan from the current clean evidence.",
@@ -79,11 +92,20 @@ export function buildPlanClosureEvidenceRecoveryPrompt(
       avoidTargets.length > 0
         ? `The previous recovery read did not advance the evidence; choose a different owner than:\n${avoidTargets.map((target) => `- ${target}`).join("\n")}`
         : "",
+      evidenceObligations.length > 0
+        ? `Runtime-owned evidence obligations (execute exactly one next):\n${evidenceObligations.map((obligation) => `- ${obligation}`).join("\n")}`
+        : "",
       hasPermissionContractGap
         ? "Inspect the runtime permission/capability/manifest/configuration owner for the named plugin contract. A package or dependency declaration does not prove that runtime permission is granted. If its path is unknown, use one narrow search to locate that owner and then read it."
         : "",
-      "Select one unresolved facet or contract and do exactly one targeted read/search that binds it to a concrete source, configuration, permission, interface, or data contract. Do not reread evidence for covered facets.",
-      "After that single tool result, stop exploring and produce a concise visible `<proposed_plan>`. Map every numbered user-goal facet to confirmed evidence, a concrete change, and an executable validation. MAIN runtime owns `.MAIN/plans/plan.md` materialization.",
+      missingCommandHandlers.length > 0
+        ? `The trusted frontend source invokes ${missingCommandHandlers.map((command) => `\`${command}\``).join(", ")} through a runtime command transport, but the handler signature has not been observed. Locate and read the backend command definition; registration or call-site evidence alone does not establish its argument contract.`
+        : "",
+      evidenceObligations.length > 0
+        ? "Execute exactly one listed runtime obligation. MAIN will reassess the ledger after the result; do not replace it with a broad scan or an inferred path."
+        : "Select one unresolved facet or contract and do exactly one targeted read/search that binds it to a concrete source, configuration, permission, interface, or data contract. Do not reread evidence for covered facets.",
+      "Submit the complete typed graph only after MAIN reports no remaining evidence obligation. Map every numbered user-goal facet to confirmed evidence, a concrete change/decision, and an executable validation. MAIN runtime owns `.MAIN/plans/plan.md` rendering.",
+      buildPlanSubmissionGuidance("en"),
       "Do not call broad directory scans, do not edit source files, and do not create `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
   }
@@ -105,11 +127,20 @@ export function buildPlanClosureEvidenceRecoveryPrompt(
     avoidTargets.length > 0
       ? `上一次补证没有增加有效证据，请改查不同的契约拥有者，不要再读：\n${avoidTargets.map((target) => `- ${target}`).join("\n")}`
       : "",
+    evidenceObligations.length > 0
+      ? `runtime 生成的精确取证义务（下一步只执行一个）：\n${evidenceObligations.map((obligation) => `- ${obligation}`).join("\n")}`
+      : "",
     hasPermissionContractGap
       ? "请检查对应插件的运行时权限、capability、manifest 或配置拥有者；包清单或依赖声明不能证明运行时权限已经授予。若不知道路径，先做一次窄范围搜索定位拥有者，再读取该文件。"
       : "",
-    "从尚未解决的分面或契约中选择一个，下一步只做一次能够把它绑定到具体源码、配置、权限、接口或数据契约的精确定向取证。不要重读已覆盖分面的证据。",
-    "拿到这一次工具结果后，停止探索并输出精简可见 `<proposed_plan>`；每个用户编号分面都必须映射到已确认证据、具体改动和可执行验证。`.MAIN/plans/plan.md` 由 MAIN runtime 负责物化。",
+    missingCommandHandlers.length > 0
+      ? `已读前端源码通过运行时命令通道调用 ${missingCommandHandlers.map((command) => `\`${command}\``).join("、")}，但尚未观察到处理器签名。请定位并读取后端命令定义；仅有注册表或调用点不能证明参数契约。`
+      : "",
+    evidenceObligations.length > 0
+      ? "严格执行其中一个 runtime 义务；结果返回后由 MAIN 重新评估 ledger，不要改成泛扫或自行猜测路径。"
+      : "从尚未解决的分面或契约中选择一个，下一步只做一次能够把它绑定到具体源码、配置、权限、接口或数据契约的精确定向取证。不要重读已覆盖分面的证据。",
+    "只有 MAIN 报告没有剩余取证义务后，才提交完整 typed graph；每个用户编号分面都必须映射到已确认证据、具体改动/决策和可执行验证。`.MAIN/plans/plan.md` 由 MAIN runtime 负责渲染。",
+    buildPlanSubmissionGuidance("zh"),
     "不要再泛扫目录；批准前不要修改源码，也不要创建 `tasks.md`。",
   ].filter(Boolean).join("\n");
 }
@@ -135,9 +166,10 @@ export function buildPlanReadOnlyConvergencePrompt(
       context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
         ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
         : "",
-      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, output one visible `<proposed_plan>`; MAIN runtime will materialize the artifact.",
+      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, submit the complete typed graph; MAIN runtime will render the artifact.",
+      buildPlanSubmissionGuidance("en"),
       "The plan must express the goal, grounded current state or constraints, an implementation/design/analysis path, relevant affected boundaries, and executable validation. Adapt headings to the task; do not force bug-root-cause or source-file sections onto feature, design, research, or verification work.",
-      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Ask and stop without also emitting `<proposed_plan>`; do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
+      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Ask and stop without also submitting a typed graph; do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
       "Do not edit source files or `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
@@ -154,9 +186,10 @@ export function buildPlanReadOnlyConvergencePrompt(
     context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
       ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
       : "",
-    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请输出一个可见 `<proposed_plan>`，计划文件由 MAIN runtime 物化。",
+    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请提交完整 typed graph，计划文件由 MAIN runtime 渲染。",
+    buildPlanSubmissionGuidance("zh"),
     "计划必须表达目标、有根据的现状或约束、实施/设计/分析路径、相关影响边界和可执行验证。章节应随任务调整，不要给新功能、设计、调研或验证任务强套 Bug 根因或源码文件章节。",
-    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；提问后停止，不要同时输出 `<proposed_plan>`，也不要给出只是继续读取、检查、分析或验证的选项。",
+    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；提问后停止，不要同时提交 typed graph，也不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
     "批准前不要修改源码或生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
@@ -209,6 +242,7 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
   qualityGateReason?: string;
   missingSections?: string[];
   rejectCount?: number;
+  failurePreview?: string;
 }): string {
   const context = normalizeTurnInputContextSignals(input.userContext);
   const toolList = input.toolNames.slice(0, 6).join(", ");
@@ -217,18 +251,37 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
   const phase = input.phase || "drafting";
   if (phase === "needs_rewrite") {
     const needsExecutableTestContract = /(?:^|:)non_executable_test_plan(?:$|:)/i.test(reason);
+    const needsConcreteImplementationContract = /(?:^|:)empty_plan_implementation_detail(?:$|:)/i.test(reason);
+    const needsProtocolCleanup = /(?:^|:)protocol_noise(?:$|:)/i.test(reason);
+    const needsEpistemicClassification = /(?:^|:)unverified_diagnostic_claim_as_confirmed(?:$|:)/i.test(reason);
+    const failurePreview = String(input.failurePreview || "").replace(/\s+/g, " ").trim().slice(0, 240);
     if (input.language === "en") {
       return [
         needsExecutableTestContract
           ? "PLAN_NEEDS_REWRITE: The Test Plan exists, but its execution contract is not concrete enough. This is not a reason to read more files."
+          : needsConcreteImplementationContract
+          ? "PLAN_NEEDS_REWRITE: The Key Changes section contains an empty implementation owner or a mutation without a concrete post-change behavior. This is not a reason to read more files."
+          : needsProtocolCleanup
+          ? "PLAN_NEEDS_REWRITE: The visible candidate contains tool/function/parameter protocol markup. The evidence and plan decisions do not need to change."
+          : needsEpistemicClassification
+          ? "PLAN_NEEDS_REWRITE: A probabilistic or hypothetical causal statement was placed under Confirmed Evidence/Root Cause. This is an epistemic classification defect, not a request for more reads."
           : "PLAN_NEEDS_REWRITE: The last visible plan draft was structurally incomplete, but this is not a reason to read more files.",
         toolList ? `The attempted read-only tool call(s) were suppressed before execution: ${toolList}.` : "",
         reason ? `Quality gate reason: ${reason}.` : "",
+        needsEpistemicClassification && failurePreview
+          ? `Offending model-authored line: ${failurePreview}`
+          : "",
         needsExecutableTestContract
           ? "Rewrite only the Test Plan contract while preserving the objective, evidence, implementation scope, and target files. For each required check, provide either an exact runnable command, or one self-contained scenario with concrete input/setup or action plus a concrete observable expected result/assertion. Do not split the action and expectation across unrelated scenarios."
-          : "Rewrite the visible `<proposed_plan>` now. Add the missing user goal/sections from the canonical request and the frozen evidence bundle; MAIN runtime owns the file write.",
-        needsExecutableTestContract
-          ? "Output the complete revised `<proposed_plan>` so MAIN can materialize it; do not claim that a check has already passed."
+          : needsConcreteImplementationContract
+          ? "Rewrite only Key Changes while preserving the objective, confirmed evidence, target files, interfaces, and validation. Make every change one complete item containing its file/component owner, concrete post-change behavior, and upstream/downstream relationship. Remove standalone labels such as 'Change to:', 'Implement:', or 'Modify:'; do not leave their details in a same-level sibling item."
+          : needsProtocolCleanup
+          ? "Re-submit the complete typed graph through the submission transport declared by the latest [PLAN AUTHORING CONTRACT]. Remove every unrelated tool call, function/parameter transcript, and legacy Markdown draft. Preserve accepted typed fields and references where possible."
+          : needsEpistemicClassification
+          ? "Preserve literal source observations and the implementation/validation scope. For each uncertain causal claim, either (1) replace it with only the directly observed conditional behavior and its E-reference, or (2) move the complete claim under Unverified Assumptions and name how execution will verify it. Never turn a hypothesis into a confirmed cause merely by deleting may/might/likely."
+          : "Rewrite and submit the complete typed graph now through the transport declared by the latest [PLAN AUTHORING CONTRACT]. Add the missing goal/evidence/action/validation edges from the canonical request and frozen evidence bundle; MAIN runtime owns rendering.",
+        needsExecutableTestContract || needsConcreteImplementationContract || needsProtocolCleanup || needsEpistemicClassification
+          ? "Submit the complete revised typed graph through the currently declared ingress so MAIN can validate and render it; do not claim that a check has already passed."
           : "",
         "Do not call read-only tools in the next response unless MAIN explicitly reopens evidence recovery.",
         "Do not edit source files or `tasks.md` before approval.",
@@ -237,14 +290,29 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
     return [
       needsExecutableTestContract
         ? "PLAN_NEEDS_REWRITE: 测试方案已经存在，但其中的执行契约还不够具体；这不是继续读文件的理由。"
+        : needsConcreteImplementationContract
+        ? "PLAN_NEEDS_REWRITE: 关键改动中存在没有正文的实施容器，或者改动项没有写明具体的改后行为；这不是继续读文件的理由。"
+        : needsProtocolCleanup
+        ? "PLAN_NEEDS_REWRITE: 可见候选中混入了工具、函数或参数的协议标记；已有证据和计划决策无需改变。"
+        : needsEpistemicClassification
+        ? "PLAN_NEEDS_REWRITE: 概率性或假设性的因果陈述被写进了已确认证据/根因；这是认知分类错误，不是继续读文件的理由。"
         : "PLAN_NEEDS_REWRITE: 上一个可见计划草稿只是结构不完整，这不是继续读文件的理由。",
       toolList ? `刚才的只读工具已在执行前静默拦截：${toolList}。` : "",
       reason ? `质量门禁原因：${reason}。` : "",
+      needsEpistemicClassification && failurePreview
+        ? `触发门禁的模型原句：${failurePreview}`
+        : "",
       needsExecutableTestContract
         ? "只修正测试方案的执行契约，并保持用户目标、已有证据、实现范围和目标文件不变。每项必要验证必须提供：精确可运行命令；或者同一场景内的具体输入/准备或操作，以及可观察的具体预期结果/断言。不同场景之间不能借用操作和预期。"
-        : "现在直接重写可见 `<proposed_plan>`：把用户目标和缺失章节补齐，证据只使用当前冻结的证据包；计划文件由 MAIN runtime 写入。",
-      needsExecutableTestContract
-        ? "输出完整修订后的 `<proposed_plan>` 供 MAIN 物化；不要声称验证已经通过。"
+        : needsConcreteImplementationContract
+        ? "只修正关键改动，并保持用户目标、已确认证据、目标文件、接口和验证不变。每个改动必须是一条完整项，同时写明文件/组件所有者、具体改后行为以及上下游关系。删除单独的“修改为：/实现：/修改：”空标签，不要把它的细节写成同级列表项。"
+        : needsProtocolCleanup
+        ? "通过最新 [PLAN AUTHORING CONTRACT] 声明的提交传输重新提交完整 typed graph。删除无关工具调用、函数/参数转录和旧 Markdown 草稿；尽可能保留已合格的 typed 字段和引用。"
+        : needsEpistemicClassification
+        ? "保持源码中的直接观察、实现范围和验证范围不变。对每条不确定因果只能二选一：（1）改写为带 E 引用的、源码直接呈现的确定条件行为；（2）把完整因果移到“未验证假设”，并写明执行阶段如何验证。禁止只删除“可能/也许”后把假设伪装成已确认根因。"
+        : "现在通过最新 [PLAN AUTHORING CONTRACT] 声明的传输重写并提交完整 typed graph：补齐缺失的目标/证据/动作/验证引用，证据只使用当前冻结的证据包；计划文件由 MAIN runtime 渲染。",
+      needsExecutableTestContract || needsConcreteImplementationContract || needsProtocolCleanup || needsEpistemicClassification
+        ? "通过当前声明的入口提交完整修订 typed graph，供 MAIN 校验并渲染；不要声称验证已经通过。"
         : "",
       "下一条不要再调用只读工具；除非 MAIN 明确进入补证据阶段。",
       "批准前不要修改源码或生成 `tasks.md`。",
@@ -258,9 +326,10 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
       context.imageParts > 0
         ? "First write a concrete 'Screenshot observations' section: visible UI/text/state, what the user is asking, and which code/state path it points to."
         : "First restate the observed user-provided context and the actual user goal.",
-      "Then output a visible `<proposed_plan>` including the diagnosis, evidence, affected files, implementation steps, and validation. MAIN runtime owns materialization.",
+      "Then submit a complete typed graph with diagnosis, evidence refs, affected targets, changes/decisions, and validation primitives. MAIN runtime owns rendering.",
+      buildPlanSubmissionGuidance("en"),
       "If one missing fact truly blocks the plan, ask exactly one concrete question with `<user_options>`; do not offer generic continue-reading options.",
-      "Allowed next actions: output `<proposed_plan>`, or ask one blocking user choice. Do not call more discovery tools in the next response.",
+      "Allowed next actions: submit the typed graph through the declared transport, or ask one blocking user choice. Do not call more discovery tools in the next response.",
     ].filter(Boolean).join("\n");
   }
   return [
@@ -270,9 +339,10 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
     context.imageParts > 0
       ? "下一步必须先写出“截图观察到的现象”：图片中可见的 UI/文本/状态、用户真正要解决的问题，以及它指向的代码/状态链路。"
       : "下一步必须先复述用户提供的上下文和真实目标。",
-    "随后输出可见 `<proposed_plan>`，包含问题归因、已有证据、影响文件、实施步骤和验证方式；计划文件由 MAIN runtime 物化。",
+    "随后提交完整 typed graph，包含结构化问题归因、证据引用、影响目标、改动/决策和验证 primitive；计划文件由 MAIN runtime 渲染。",
+    buildPlanSubmissionGuidance("zh"),
     "如果确实只有一个缺失事实阻塞方案，只能提出一个具体问题并用 `<user_options>`；不要再给“继续查/继续分析”这类泛化选项。",
-    "下一条只允许：输出 `<proposed_plan>`，或询问一个真实阻塞选择。不要再次调用发现工具。",
+    "下一条只允许：通过已声明入口提交 typed graph，或询问一个真实阻塞选择。不要再次调用发现工具。",
   ].filter(Boolean).join("\n");
 }
 
@@ -389,7 +459,8 @@ export function buildPlanAutoScaffoldPrompt(input: {
   const evidence = summarizeRecentPlanEvidenceForPrompt(input.recentToolActivity, input.language);
   if (input.language === "en") {
     return [
-      "PLAN_AUTO_SCAFFOLD: Two low-quality plan drafts were rejected. Stop branching and output one visible `<proposed_plan>` using this scaffold. MAIN runtime owns artifact materialization.",
+      "PLAN_AUTO_SCAFFOLD: Two low-quality typed drafts were rejected. Stop branching and submit one complete typed graph using this scaffold as field guidance. MAIN runtime owns artifact rendering.",
+      buildPlanSubmissionGuidance("en"),
       reason,
       "",
       "Required scaffold:",
@@ -411,11 +482,12 @@ export function buildPlanAutoScaffoldPrompt(input: {
       "## Validation Standards",
       "- Exact runtime-executable test/build validation that proves the fix. Put optional user/manual review in the final conclusion as non-blocking follow-up, not in acceptance.",
       "",
-      "Output this scaffold as visible `<proposed_plan>` now. Do not call tools unless MAIN has explicitly reopened evidence recovery.",
+      "Convert this scaffold into the complete typed graph now. Do not call tools unless MAIN has explicitly reopened evidence recovery.",
     ].filter(Boolean).join("\n");
   }
   return [
-    "PLAN_AUTO_SCAFFOLD: 连续两个低质量 plan 草稿被拒绝。停止分叉，按下面脚手架输出一个可见 `<proposed_plan>`；计划文件由 MAIN runtime 物化。",
+    "PLAN_AUTO_SCAFFOLD: 连续两个低质量 typed 草稿被拒绝。停止分叉，把下面脚手架转换成完整 typed graph；计划文件由 MAIN runtime 渲染。",
+    buildPlanSubmissionGuidance("zh"),
     reason,
     "",
     "必须使用的脚手架：",
@@ -437,7 +509,7 @@ export function buildPlanAutoScaffoldPrompt(input: {
     "## 验证标准",
     "- 能证明修复成立且 runtime 可执行的测试/构建验证；可选用户/人工复核放入最终结论作为非阻塞后续，不进入验收标准。",
     "",
-    "现在把这个脚手架输出为可见 `<proposed_plan>`。除非 MAIN 已重新开放补证据，否则不要调用工具。",
+    "现在把这个脚手架转换成完整 typed graph。除非 MAIN 已重新开放补证据，否则不要调用工具。",
   ].filter(Boolean).join("\n");
 }
 
@@ -457,14 +529,16 @@ export function buildPlanEvidenceRecoveryClosurePrompt(input: {
     return [
       "PLAN_EVIDENCE_RECOVERY_COMPLETE: The targeted evidence pass is complete.",
       reason,
-      "Use the new evidence below and output the visible `<proposed_plan>` now; MAIN runtime owns artifact materialization. Do not start another exploration pass.",
+      "Use the new evidence below and submit the complete typed graph now; MAIN runtime owns artifact rendering. Do not start another exploration pass.",
+      buildPlanSubmissionGuidance("en"),
       evidence,
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_EVIDENCE_RECOVERY_COMPLETE: 定向补证已经完成。",
     reason,
-    "现在用下面的新证据输出可见 `<proposed_plan>`；计划文件由 MAIN runtime 物化，不要开启新一轮泛读。",
+    "现在用下面的新证据提交完整 typed graph；计划文件由 MAIN runtime 渲染，不要开启新一轮泛读。",
+    buildPlanSubmissionGuidance("zh"),
     evidence,
   ].filter(Boolean).join("\n");
 }
@@ -488,7 +562,7 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
       reason,
       input.requireResolvedEvidence
         ? "Do not keep calling read-only tools and do not draft a plan that assumes the unresolved evidence. State the exact unresolved evidence gap as the blocker and pause safely. Ask the user only when resolving it requires a genuine user-owned decision."
-        : "Do not keep calling read-only tools. Either output `<proposed_plan>` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
+        : "Do not keep calling read-only tools. Either submit the complete typed graph using only confirmed evidence below through the latest authoring contract, or state the single real blocker as a user-visible question.",
       evidence,
     ].filter(Boolean).join("\n");
   }
@@ -497,7 +571,7 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
     reason,
     input.requireResolvedEvidence
       ? "不要继续调用只读工具，也不要用未闭合的证据假定起草计划。请明确说明尚缺的证据并安全暂停；只有解决它确实需要用户决策时，才向用户提供选择。"
-      : "不要继续调用只读工具。要么只基于下面已确认的证据输出 `<proposed_plan>`，要么把唯一真实阻塞点作为可见问题告诉用户。",
+      : "不要继续调用只读工具。要么遵循最新 authoring contract、只基于下面已确认的证据提交完整 typed graph，要么把唯一真实阻塞点作为可见问题告诉用户。",
     evidence,
   ].filter(Boolean).join("\n");
 }
@@ -660,7 +734,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "",
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- Output one visible `<proposed_plan>`; MAIN runtime validates and materializes `.MAIN/plans/plan.md` after the response.",
+      `- ${buildPlanSubmissionGuidance("en")} MAIN runtime validates the typed graph and renders \`.MAIN/plans/plan.md\` after the response.`,
       "- Keep `plan.md` decision-complete, but adapt its headings to the task. Bug fixes may use root cause, features may use architecture/components/data flow, and research or verification plans may use decisions/constraints without inventing source edits.",
       "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
       "- Every implementation or design decision must point to concrete files, interfaces, components, data flow, commands, validation, or an explicit default. Mention public API/interface/type disposition only when it affects execution.",
@@ -671,7 +745,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "- If user intent is ambiguous, answer in ChatArea and ask proactively with `<user_options>` (options: ChatArea answer only, save as docs/ file, or create code refactoring plan).",
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
-      "- If the direction is clear and requires code changes, output a concise `<proposed_plan>` for runtime materialization and approval. Do not generate `tasks.md` or edit source files before approval.",
+      "- If the direction is clear and requires code changes, submit a concise complete typed graph through the contract-declared transport for runtime validation, rendering, and approval. Do not generate `tasks.md` or edit source files before approval.",
     ].filter(Boolean).join("\n");
   }
 
@@ -682,7 +756,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "",
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- 输出一个可见 `<proposed_plan>`；MAIN runtime 会在响应后校验并物化 `.MAIN/plans/plan.md`。",
+    `- ${buildPlanSubmissionGuidance("zh")} MAIN runtime 会在响应后校验 typed graph 并渲染 \`.MAIN/plans/plan.md\`。`,
     "- `plan.md` 必须做到决策完整，但章节应随任务类型调整：修复类可写根因，新增功能可写架构/组件/数据流，调研或验证类可写决策/约束，不要虚构源码改动。",
     "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
     "- 每个实现或设计决策必须指向具体文件、接口、组件、数据流、命令、验证方式或明确默认值；公共 API/接口/类型只有在影响执行时才需要说明。",
@@ -693,7 +767,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "- 若意图模糊未明确，在 ChatArea 解答同时使用 `<user_options>` 提问（包含：仅 ChatArea 查看 / 保存为 docs 文件 / 生成代码重构计划）。",
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
-    "- 如果方向已经明确，输出精简 `<proposed_plan>` 交由 runtime 物化并等待审批。批准前不要生成 `tasks.md`，不要修改源码。",
+    "- 如果方向已经明确，通过 contract 声明的入口提交精简完整 typed graph，交由 runtime 校验、渲染并等待审批。批准前不要生成 `tasks.md`，不要修改源码。",
   ].filter(Boolean).join("\n");
 }
 

@@ -270,7 +270,7 @@ test("Plan permission continuation fails closed across artifact drift and child 
     "the obsolete parent Run must be aborted before admission rejection is published",
   );
   const finalizerStart = source.indexOf(
-    "return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) =>",
+    "return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop).then(async (loopOutcome) =>",
   );
   const finalizerEnd = source.indexOf("const preTerminalRunId", finalizerStart);
   const finalizer = source.slice(finalizerStart, finalizerEnd);
@@ -314,7 +314,7 @@ test("a terminal conclusion child is created only after its owner was already pa
   );
   assert.match(
     terminalSource,
-    /if \(loopOutcome\.status !== "paused" && preConclusionLifecycleEvent\?\.type === "run\.paused"\) \{\s*if \(!beginTerminalConclusionRun\(preTerminalRunId, loopOutcome\.reason\)\) \{[\s\S]*return true;[\s\S]*\}\s*\}/,
+    /if \(loopOutcome\.status !== "paused" && preConclusionLifecycleEvent\?\.type === "run\.paused"\) \{\s*if \(!beginTerminalConclusionRun\(preTerminalRunId, loopOutcome\.reason\)\) \{[\s\S]*return unprojectedSettlement\("terminal_conclusion_run_not_admitted", loopOutcome\);[\s\S]*\}\s*\}/,
   );
 });
 
@@ -347,7 +347,9 @@ test("composer waits for durable turn admission before clearing the submitted dr
   assert.doesNotMatch(handler, /if \(isStreaming\)/);
   assert.doesNotMatch(handler, /queueUserMessage|handleGuideQueuedMessage/);
   assert.match(source, /const handleGuideCurrentRun = useCallback/);
-  assert.match(source, /latest\.setActiveGuidance\(guidanceText, latest\.currentTurnId\)/);
+  assert.match(source, /latest\.setActiveGuidance\(guidanceText, guidanceTarget\)/);
+  assert.match(source, /resolvedTurnIngressMode !== "submit"/);
+  assert.match(source, /composerGuidanceAvailable/);
   assert.match(source, /data-testid="composer-queue-button"/);
   assert.match(source, /data-testid="composer-guidance-button"/);
   assert.match(source, /data-testid="composer-queued-message"/);
@@ -356,19 +358,31 @@ test("composer waits for durable turn admission before clearing the submitted dr
 
 test("workspace Composer persists its exact intent snapshot as dispatch hints", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
+  const ingressSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/workspaceComposerIntentAdmission.ts"),
+    "utf8",
+  );
   const start = source.indexOf("const handleSendMessage = useCallback");
   const end = source.indexOf("const handleQuickReply", start);
   const handler = source.slice(start, end);
 
   assert.notEqual(start, -1);
   assert.ok(end > start);
-  assert.match(handler, /buildWorkspaceComposerIntentDispatchHints\(\{/);
-  assert.match(handler, /snapshot: submitOptions\.workspaceComposerIntentSnapshot/);
-  assert.match(handler, /acceptWorkspaceInstruction\(\{[\s\S]*source: "composer",[\s\S]*dispatchHints/);
+  assert.match(handler, /acceptWorkspaceComposerInstruction\(\{/);
+  assert.match(handler, /intentSnapshot: submitOptions\?\.workspaceComposerIntentSnapshot/);
+  assert.match(handler, /acceptWorkspaceInstruction: state\.acceptWorkspaceInstruction/);
   assert.doesNotMatch(
     handler,
-    /snapshot:\s*\{[\s\S]*lockedComposerIntent:\s*state\.lockedComposerIntent/,
+    /intentSnapshot:\s*\{[\s\S]*lockedComposerIntent:\s*state\.lockedComposerIntent/,
     "the durable intent must come from the exact submit event, not mutable Store state",
+  );
+  assert.match(
+    ingressSource,
+    /export function acceptWorkspaceComposerInstruction[\s\S]*buildWorkspaceComposerIntentDispatchHints\(\{[\s\S]*snapshot: input\.intentSnapshot/,
+  );
+  assert.match(
+    ingressSource,
+    /input\.acceptWorkspaceInstruction\(\{[\s\S]*source: "composer",[\s\S]*dispatchHints/,
   );
 });
 
@@ -422,12 +436,33 @@ test("preferred subagent collaboration is enforced only after runtime admission"
   );
   assert.match(preparationSource, /buildPreferredDelegationActionContract\(\{/);
   assert.match(preparationSource, /preferred_delegation_action_contract_injected/);
+  assert.ok(
+    preparationSource.indexOf("preferred_delegation_action_contract_injected") >
+      preparationSource.indexOf("plan_evidence_bundle_injected"),
+    "the required collaboration action contract must be injected after Plan evidence",
+  );
   assert.match(
     invocationSource,
     /input\.preferredDelegationRequired[\s\S]*availableToolNames\.has\("spawn_subagent"\)[\s\S]*return "required"/,
   );
-  assert.match(orchestratorSource, /onSubagentSpawnCreated:\s*\(\) =>/);
-  assert.match(orchestratorSource, /preferred_delegation_satisfied/);
+  assert.match(orchestratorSource, /onSubagentSpawnCreated:\s*async \(outcome\) =>/);
+  assert.match(orchestratorSource, /recordPreferredDelegationScopeSpawn\(\{/);
+  assert.match(orchestratorSource, /applyPreferredDelegationScopeJoinOutcomes\(\{/);
+  assert.equal(
+    (orchestratorSource.match(/applyPreferredDelegationScopeJoinOutcomes\(\{/g) || []).length,
+    1,
+    "all join paths must share one scope outcome apply boundary",
+  );
+  assert.match(
+    orchestratorSource,
+    /applyAndEmitPreferredDelegationScopeOutcomes\(outcomes, "explicit_wait"\)/,
+  );
+  assert.match(
+    orchestratorSource,
+    /applyAndEmitPreferredDelegationScopeOutcomes\([\s\S]*"parent_final_response"/,
+  );
+  assert.match(orchestratorSource, /preferred_delegation_spawned/);
+  assert.match(orchestratorSource, /preferred_delegation_consumed/);
 });
 
 test("desktop and destructive permission reviews are explicitly per-call and show final evidence", () => {
@@ -638,20 +673,34 @@ test("workflow engine projects then closes harness from structured agent loop ou
 test("agent loop closes non-actionable stops and completion-guard gaps as typed conclusions", () => {
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
+  const finalizationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"), "utf8");
+  const evaluationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/planExecutionEvaluation.ts"), "utf8");
   const resolverStart = guardsSource.indexOf("export function resolveNonActionableStopOutcome(");
   const resolverEnd = guardsSource.indexOf("export function resolveFinalTurnContractForCompletion", resolverStart);
   const resolverSource = guardsSource.slice(resolverStart, resolverEnd);
+  const approvedGuardStart = guardsSource.indexOf("export function runApprovedPlanCompletionGuard(");
+  const approvedGuardEnd = guardsSource.indexOf("export function runExecutionEvidenceCompletionGuard(", approvedGuardStart);
+  const approvedGuardSource = guardsSource.slice(approvedGuardStart, approvedGuardEnd);
 
   assert.match(runnerSource, /Promise<AgentLoopOutcome>/);
   assert.match(runnerSource, /onNonActionableStop: \(message, reason, progress\) =>/);
   assert.match(runnerSource, /resolveNonActionableStopOutcome\(reason, progress, \{[\s\S]*sawExecutionEvidence:/);
   assert.match(runnerSource, /completedAgentLoopOutcome\("agent_loop_no_terminal_outcome", "error"\)/);
+  assert.match(resolverSource, /isRecoverableRuntimePauseReason\(recoveryReason\)/);
+  assert.match(resolverSource, /"plan_generation_failed"[\s\S]*"plan_required_tool_protocol_violation"/);
+  assert.match(resolverSource, /"stream_no_visible_progress_timeout"[\s\S]*"stream_max_elapsed_timeout"/);
+  assert.match(resolverSource, /"max_iterations_boundary"[\s\S]*"execute_max_iterations_checkpoint"/);
+  assert.match(resolverSource, /status: "paused"[\s\S]*pauseKind: "recoverable"/);
   assert.match(resolverSource, /options\.sawExecutionEvidence[\s\S]*\? "partial" as const/);
   assert.match(resolverSource, /reason === "no_output"[\s\S]*\? "error" as const[\s\S]*: "blocked" as const/);
   assert.match(resolverSource, /return \{ status: "completed", resultKind, reason: recoveryReason \}/);
-  assert.doesNotMatch(resolverSource, /status: "paused"|pauseKind:/);
   assert.match(guardsSource, /approved_plan_completion_guard/);
-  assert.match(guardsSource, /buildPlanTaskEvidenceAudit/);
+  assert.match(approvedGuardSource, /evaluateApprovedPlanExecution/);
+  assert.match(finalizationSource, /evaluateApprovedPlanExecution/);
+  assert.doesNotMatch(approvedGuardSource, /buildPlanTaskEvidenceAudit|buildExecuteEvidenceClosureAudit/);
+  assert.doesNotMatch(finalizationSource, /buildPlanTaskEvidenceAudit|buildExecuteEvidenceClosureAudit/);
+  assert.match(evaluationSource, /buildPlanTaskEvidenceAudit/);
+  assert.match(evaluationSource, /buildExecuteEvidenceClosureAudit/);
 });
 
 test("agent loop runtime state preparation is separated from the main execute loop", () => {
@@ -854,7 +903,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(approvedPlanNoToolRoutingSource, /shouldHandleApprovedPlanExecutionNoTool/);
   assert.match(approvedPlanNoToolRoutingSource, /looksLikePlanCompletionClaim/);
   assert.match(approvedPlanNoToolRoutingSource, /shouldSuppressApprovedPlanNoToolText/);
-  assert.match(toolProgressRoutingSource, /isPreApprovalPlanDraftWrite/);
+  assert.match(toolProgressRoutingSource, /isAllowedUnapprovedPlanDraftMutationCallForRuntime/);
+  assert.match(toolProgressRoutingSource, /Typed[\s\S]*Plan runtime[\s\S]*return false/);
   assert.match(toolProgressRoutingSource, /looksLikeSubstantivePlanAssistantText/);
   assert.match(toolProgressRoutingSource, /shouldInjectRuntimeToolNarration/);
   assert.match(toolProgressRoutingSource, /resolveToolProgressPresentation/);
@@ -1143,7 +1193,6 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopRecoverySource, /target_progress_no_diff_chain/);
   assert.match(toolResultRecoveryPhaseSource, /handleExecuteConvergencePrompt\(\{/);
   assert.match(loopRecoverySource, /export function handleExecuteConvergencePrompt/);
-  assert.match(loopRecoverySource, /PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO/);
   assert.match(loopRecoverySource, /EXECUTE_CONVERGENCE_PROMPT_RATIO/);
   assert.match(loopRecoverySource, /buildExecuteConvergencePrompt/);
   assert.match(loopRecoverySource, /execute_convergence_prompt/);
@@ -1523,7 +1572,7 @@ test("approved plan max-iteration boundary pauses instead of surfacing agent err
   assert.notEqual(checkpointIndex, -1);
   assert.match(branch, /emitPlanExecutionProgress\("paused"/);
   assert.match(branch, /callbacks\.onNonActionableStop\(/);
-  assert.match(branch, /recoveryReason:\s*"plan_max_iterations_checkpoint"/);
+  assert.match(branch, /recoveryReason:\s*"max_iterations_boundary"/);
   assert.match(branch, /"incomplete_plan"/);
   assert.doesNotMatch(branch, /callbacks\.onError\(buildPlanMaxIterationsPauseNotice/);
 });
@@ -1542,7 +1591,11 @@ test("explicit reply options mark assistant text as awaiting input even when too
   assert.match(agentOrchestratorSource, /this\.latestRunPauseReason = committedPauseReason/);
   assert.match(workflowEngine, /const awaitingInput = meta\?\.awaitingInput === true && replyOptions\.length > 0/);
   assert.match(workflowEngine, /status:\s*"awaiting_input"/);
-  assert.match(workflowEngine, /persistTerminalProjection:[\s\S]*?isIntentionalActionPause/);
+  assert.match(
+    workflowEngine,
+    /persistTerminalProjection:[\s\S]*?projectTurnRuntimeCheckpointTransaction\(\{/,
+  );
+  assert.match(workflowEngine, /canonicalPauseKind:[\s\S]*?pendingAction[\s\S]*?"approval"[\s\S]*?"input"/);
   assert.match(workflowEngine, /publishTerminalStatus:[\s\S]*?isGenerating: false/);
 });
 
@@ -1699,7 +1752,7 @@ test("workflow engine owns finite differentiated auto-resumes between fresh evid
   );
   assert.match(
     terminalContinuation,
-    /else if \(pendingMaxIterationsAutoResume\)[\s\S]*?runAfterNextPaint\(\(\) => pending\.start\(\)\)/,
+    /else if \(pendingMaxIterationsAutoResume\)[\s\S]*?scheduleRuntimeTask\(\(\) => pending\.start\(\)\)/,
   );
 });
 
@@ -2273,15 +2326,16 @@ test("terminal runs persist, accept the owner CAS, and settle Harness before pub
   assert.match(workflowEngineSource, /terminal_idle_notification_deferred/);
   assert.match(
     workflowEngineSource,
-    /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: isIntentionalActionPause \? candidate\.status : terminalTurnStatus/,
+    /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: terminalTurnStatus/,
   );
   assert.match(workflowEngineSource, /terminal_run_projection_committed/);
   assert.match(workflowEngineSource, /harnessProjection === "ownership_lost"/);
   assert.match(workflowEngineSource, /if \(!terminalProjection\.committed\)/);
   assert.match(
     workflowEngineSource,
-    /isIntentionalActionPause[\s\S]*?pendingAction\?\.status === "pending"/,
+    /const canonicalTransaction = projectTurnRuntimeCheckpointTransaction\(\{[\s\S]*?checkpoint: existingTurnRuntimeCheckpoint[\s\S]*?owner: checkpointOwner/,
   );
+  assert.match(workflowEngineSource, /canonicalTransaction\.disposition === "rejected"/);
   assert.match(
     workflowEngineSource,
     /const isPlanGenerationFailure =[\s\S]*?reason === "incomplete_plan" && progress\?\.recoveryReason === "plan_generation_failed"/,
@@ -2336,6 +2390,14 @@ test("terminal runs persist, accept the owner CAS, and settle Harness before pub
   assert.match(emergencySource, /type: "turn\.completed"/);
   assert.match(emergencySource, /resultKind: "error"/);
   assert.match(emergencySource, /ensureClosedTurnConclusion\(outcome, draft\)/);
+  assert.match(emergencySource, /projectTurnRuntimeCheckpointTransaction\(\{/);
+  assert.match(emergencySource, /projectTurnRuntimeCompatibility\(existingTurnRuntimeCheckpoint\.canonical\)/);
+  assert.match(emergencySource, /pauseKind: "recoverable"/);
+  assert.match(emergencySource, /status: canonicalCompatibility\.conversationTurnStatus/);
+  assert.match(emergencySource, /agentStatus: canonicalCompatibility\.agentStatus/);
+  assert.match(emergencySource, /turnRuntimeCheckpoints: upsertTurnRuntimeCheckpoint/);
+  assert.doesNotMatch(emergencySource, /agentStatus:\s*"idle"/);
+  assert.doesNotMatch(emergencySource, /status:\s*"done"/);
   assert.match(emergencySource, /durability: "memory_only"/);
   assert.match(emergencySource, /durability: "durable_after_memory_publication"/);
   assert.doesNotMatch(
@@ -2351,7 +2413,7 @@ test("approved-plan same-turn handoff cannot publish a completed logical turn", 
     "utf8",
   );
   const terminalStart = workflowEngineSource.indexOf(
-    "return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) =>",
+    "return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop).then(async (loopOutcome) =>",
   );
   const pendingHandoffIndex = workflowEngineSource.indexOf(
     "const pendingSameTurnExecution =",

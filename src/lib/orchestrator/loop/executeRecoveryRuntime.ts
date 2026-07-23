@@ -254,6 +254,8 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
   const browserFailedLocator = input.previous?.browserFailedLocator || null;
   const browserLocatorCandidates = input.previous?.browserLocatorCandidates || [];
   const browserRequestedUrl = input.previous?.browserRequestedUrl || null;
+  const noProgressStrategyPivots =
+    input.previous?.noProgressStrategyPivots || [];
   return {
     expectedTarget: input.expectedTarget,
     sourceObservationKey: input.sourceObservationKey,
@@ -287,6 +289,9 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
     ...(browserFailedLocator ? { browserFailedLocator } : {}),
     ...(browserLocatorCandidates.length > 0 ? { browserLocatorCandidates } : {}),
     ...(browserRequestedUrl ? { browserRequestedUrl } : {}),
+    ...(noProgressStrategyPivots.length > 0
+      ? { noProgressStrategyPivots: [...noProgressStrategyPivots] }
+      : {}),
   };
 }
 
@@ -532,10 +537,10 @@ export function activateExecuteRecoveryRuntimeState(
   const phaseChanged = previousContract.phase !== nextContract.phase;
   const capabilityChanged =
     previousContract.nextRequiredCapability !== nextContract.nextRequiredCapability;
-  const targetChanged = Boolean(
-    expectedTarget &&
-    (!state.expectedTarget ||
-      !workspacePathsReferToSameFile(expectedTarget, state.expectedTarget)),
+  const targetChanged = Boolean(expectedTarget || state.expectedTarget) && (
+    !expectedTarget ||
+    !state.expectedTarget ||
+    !workspacePathsReferToSameFile(expectedTarget, state.expectedTarget)
   );
   const nextState: ExecuteRecoveryRuntimeState = {
     ...state,
@@ -974,12 +979,20 @@ export function transitionExecuteRecoveryRuntimeState(
     const currentVersionLease = sourceVersionChanged && activeReadLease
       ? { ...activeReadLease, observedVersion }
       : activeReadLease;
-    const leaseMatchesEvidence = Boolean(currentVersionLease) && readEvidenceSatisfiesRecoveryLease({
-      lease: currentVersionLease,
-      target: observation.freshReadTarget,
-      requestedRange: observation.sourceRequestedRange,
-      observedVersion: observation.sourceObservedVersion,
-    });
+    const targetingObservation = Boolean(
+      !currentVersionLease &&
+      contract.nextRequiredCapability === "targeting" &&
+      observation.sourceObservationKey?.trim(),
+    );
+    const leaseMatchesEvidence = targetingObservation || (
+      Boolean(currentVersionLease) &&
+      readEvidenceSatisfiesRecoveryLease({
+        lease: currentVersionLease,
+        target: observation.freshReadTarget,
+        requestedRange: observation.sourceRequestedRange,
+        observedVersion: observation.sourceObservedVersion,
+      })
+    );
     if (!leaseMatchesEvidence) {
       if (sourceVersionChanged && currentVersionLease) {
         const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
@@ -1016,7 +1029,9 @@ export function transitionExecuteRecoveryRuntimeState(
         reason: "recovery_context_observed",
         expectedTarget: contextTarget,
         sourceObservationKey,
-        readLease: activeReadLease && workspacePathsReferToSameFile(activeReadLease.target, contextTarget)
+        readLease: activeReadLease &&
+          contextTarget &&
+          workspacePathsReferToSameFile(activeReadLease.target, contextTarget)
           ? {
               ...activeReadLease,
               state: "consumed",
@@ -1049,11 +1064,35 @@ export function transitionExecuteRecoveryRuntimeState(
       expectedTarget &&
       !workspacePathsReferToSameFile(observation.freshReadTarget, expectedTarget),
     );
+    const activeReadLease = contract.readLease &&
+      (contract.readLease.state === "available" || contract.readLease.state === "active")
+        ? contract.readLease
+        : null;
+    if (!activeReadLease && state.mode !== "objective_audit") {
+      // Mutation and validation surfaces never authorize an adjacent read.
+      // A stale provider call or restored legacy request therefore cannot
+      // refresh source identity, reset the phase budget, or reopen the loop.
+      return {
+        state: transactionState,
+        transition: "none",
+        target: expectedTarget,
+        consumedExpectedRead: false,
+      };
+    }
+    // Objective audit is the only broad surface allowed to observe a fresh
+    // unleased source. Narrow recovery phases reopen reads through context /
+    // targeting contracts instead of treating an adjacent read as progress.
+    const shouldBindFreshReadTarget = Boolean(
+      expectedTarget ||
+      activeReadLease ||
+      state.mode === "objective_audit",
+    );
     const contextTarget = objectiveAuditTargetSwitch
       ? observation.freshReadTarget
-      : expectedTarget || observation.freshReadTarget;
+      : expectedTarget || (shouldBindFreshReadTarget ? observation.freshReadTarget : null);
     if (
       state.mode !== "objective_audit" &&
+      contextTarget &&
       !workspacePathsReferToSameFile(observation.freshReadTarget, contextTarget)
     ) {
       return {
@@ -1063,10 +1102,6 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    const activeReadLease = contract.readLease &&
-      (contract.readLease.state === "available" || contract.readLease.state === "active")
-        ? contract.readLease
-        : null;
     const leaseMatchesEvidence = Boolean(activeReadLease) && readEvidenceSatisfiesRecoveryLease({
       lease: activeReadLease,
       target: observation.freshReadTarget,
@@ -1082,6 +1117,7 @@ export function transitionExecuteRecoveryRuntimeState(
       };
     }
     const sourceObservationKey = observation.sourceObservationKey?.trim() || state.sourceObservationKey;
+    const boundSourceObservationKey = contextTarget ? sourceObservationKey : null;
     const observedVersion = observation.sourceObservedVersion?.trim() || null;
     const previousVersion = state.decisionCheckpoint?.evidenceVersion?.trim() || null;
     const observationChanged = Boolean(
@@ -1096,15 +1132,16 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    return {
-      state: resetExecuteRecoveryPhaseProgress({
+    const refreshedState: ExecuteRecoveryRuntimeState = {
         ...transactionState,
         expectedTarget: contextTarget,
         reason: activeReadLease
           ? transactionState.reason
           : "recovery_source_observation_refreshed",
-        sourceObservationKey,
-        readLease: activeReadLease && workspacePathsReferToSameFile(activeReadLease.target, contextTarget)
+        sourceObservationKey: boundSourceObservationKey,
+        readLease: activeReadLease &&
+          contextTarget &&
+          workspacePathsReferToSameFile(activeReadLease.target, contextTarget)
           ? {
               ...activeReadLease,
               state: "consumed",
@@ -1119,12 +1156,19 @@ export function transitionExecuteRecoveryRuntimeState(
           : null,
         decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
           expectedTarget: contextTarget,
-          sourceObservationKey,
+          sourceObservationKey: boundSourceObservationKey,
           nextRequiredCapability: contract.nextRequiredCapability,
           previous: state.decisionCheckpoint,
           evidenceVersion: observedVersion || previousVersion,
         }),
-      }),
+      };
+    // A leased source read or an objective-audit target switch satisfies a
+    // concrete runtime obligation.
+    const committedState = activeReadLease || contextTarget
+      ? resetExecuteRecoveryPhaseProgress(refreshedState)
+      : refreshedState;
+    return {
+      state: committedState,
       transition: "context_refreshed",
       target: contextTarget,
       consumedExpectedRead: Boolean(activeReadLease),
@@ -1135,6 +1179,20 @@ export function transitionExecuteRecoveryRuntimeState(
     contract.phase !== "context" &&
     (observation.mutationTarget || observation.mutationTargets?.length)
   ) {
+    if (
+      contract.nextRequiredCapability !== "mutation" &&
+      state.mode !== "objective_audit"
+    ) {
+      // A stale adjacent mutation cannot bypass the active validation or
+      // process capability. The controller must explicitly reopen mutation
+      // before a write result can advance this transaction.
+      return {
+        state: transactionState,
+        transition: "none",
+        target: expectedTarget,
+        consumedExpectedRead: false,
+      };
+    }
     const structuredMutationTargets = (observation.mutationTargets || [])
       .map((target) => target.trim())
       .filter(Boolean);
@@ -1174,7 +1232,19 @@ export function transitionExecuteRecoveryRuntimeState(
         ? expectedTarget
         : target
     );
-    const nextExpectedTarget = auditTargetSwitch
+    // A failed finite validation without a uniquely attributed diagnostic is
+    // a workspace-scoped repair. The first successful edit is evidence for
+    // that repair, not proof that this file is its sole owner. Validation runs
+    // after each bounded repair; another structured failure may open a new
+    // targeting transaction for a sibling owner.
+    const workspaceScopedFiniteRepair = Boolean(
+      state.decisionCheckpoint?.pendingFiniteValidation &&
+      !expectedTarget &&
+      !state.decisionCheckpoint.expectedTarget
+    );
+    const nextExpectedTarget = workspaceScopedFiniteRepair
+      ? null
+      : auditTargetSwitch
       ? observedMutationTargets.length === 1
         ? observedMutationTargets[0]
         : null
@@ -1190,7 +1260,9 @@ export function transitionExecuteRecoveryRuntimeState(
       state: resetExecuteRecoveryPhaseProgress({
         ...transactionState,
         mode: "validation_only",
-        reason: "recovery_mutation_observed",
+        reason: workspaceScopedFiniteRepair
+          ? "workspace_repair_mutation_observed"
+          : "recovery_mutation_observed",
         expectedTarget: nextExpectedTarget,
         // A successful mutation carries structured changed-path/diff evidence,
         // but it does not prove the whole user objective is implemented. Move

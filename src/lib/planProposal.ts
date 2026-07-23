@@ -1,3 +1,8 @@
+import {
+  extractTypedPlanDraftProtocolBlock,
+  hasTypedPlanDraftEnvelope,
+} from "./planDraftIngress";
+
 export type PlanJobStatus = "pending" | "in_progress" | "completed";
 
 export interface PlanJobItem {
@@ -154,21 +159,32 @@ export function hasPlanDraftPreview(text: string): boolean {
 // ── Tiered Plan Output Support ──────────────────────────────────────
 // Accept the supported document/protocol shapes without inferring anything
 // about the model that produced them.
-// Tier 1 = full structured protocol.
-// Tier 2 = <proposed_plan> wrapped Markdown.
+// Tier 1 = typed runtime protocol or the historical structured protocol.
+// Tier 2 = legacy wrapped Markdown (restore/import compatibility only).
 // Tier 3 = plain structured Markdown compatibility output.
+
+export interface TypedPlanProposal {
+  kind: "typed_plan_candidate";
+  /** Complete raw envelope; materialization, never Markdown parsing, consumes it. */
+  protocol: string;
+}
 
 export interface TextPlanProposal {
   kind: "tier2_proposed_plan" | "tier3_plaintext";
   markdown: string;
 }
 
-type TieredPlanResult = StructuredPlanProposal | TextPlanProposal;
+type TieredPlanResult = TypedPlanProposal | StructuredPlanProposal | TextPlanProposal;
 
 // Detect the plan output tier from model text
 export function detectPlanTier(text: string): 1 | 2 | 3 | 0 {
   if (!text.trim()) return 0;
   const rootText = stripReasoningBlocks(text);
+
+  // New runtime proposals carry typed authority rather than model-authored
+  // Markdown. Keep tier 1 as the historical numeric API while materialization
+  // distinguishes the typed envelope from the legacy <plan> jobs protocol.
+  if (hasTypedPlanDraftEnvelope(rootText)) return 1;
 
   // Tier 1: [PROPOSAL START] ... <plan>{...}</plan> ... [PROPOSAL END]
   if (PROPOSAL_START_RE.test(rootText) && PLAN_BLOCK_RE.test(rootText)) {
@@ -206,7 +222,14 @@ export function extractTieredPlanProposal(text: string): TieredPlanResult | null
 
   const rootText = stripReasoningBlocks(text);
 
-  // Tier 1: Full structured format
+  // Runtime Plan authority. Preserve the complete visible envelope so text
+  // transport and native-call adaptation enter the same typed materializer.
+  const typedProtocol = extractTypedPlanDraftProtocolBlock(rootText);
+  if (typedProtocol) {
+    return { kind: "typed_plan_candidate", protocol: typedProtocol };
+  }
+
+  // Historical Tier 1: full structured format.
   const tier1 = extractStructuredPlanProposal(text);
   if (tier1) return tier1;
 
@@ -260,27 +283,29 @@ export function hasTieredPlanProposal(text: string): boolean {
  */
 export function hasExplicitPlanProposal(text: string): boolean {
   const proposal = extractTieredPlanProposal(text);
-  return proposal !== null && (!("kind" in proposal) || proposal.kind === "tier2_proposed_plan");
+  return proposal !== null && (
+    !("kind" in proposal) ||
+    proposal.kind === "typed_plan_candidate" ||
+    proposal.kind === "tier2_proposed_plan"
+  );
 }
 
 /**
- * Some reasoning-capable providers occasionally route an explicitly tagged
- * final Plan through their reasoning field after a revision prompt. Recover
- * only the complete public protocol block; never promote surrounding chain of
- * thought or untagged reasoning into assistant-visible content.
+ * @deprecated Hidden provider reasoning is diagnostic history only and can
+ * never be a Plan materialization channel. Kept as a fail-closed compatibility
+ * export for persisted callers while they migrate to visible/native ingress.
  */
-export function extractExplicitPlanProtocolFromReasoning(text: string): string | null {
-  const reasoning = String(text || "");
-  const matched = reasoning.match(/<proposed_plan(?:\s[^>]*)?>[\s\S]*?<\/proposed_plan>/i);
-  if (!matched?.[0]) return null;
-  const candidate = matched[0].trim();
-  return hasExplicitPlanProposal(candidate) ? candidate : null;
+export function extractExplicitPlanProtocolFromReasoning(_text: string): null {
+  return null;
 }
 
 // Normalize any tier to a unified format that the runtime can consume
 export function normalizePlanProposal(proposal: TieredPlanResult): StructuredPlanProposal {
   if ("jobs" in proposal) {
     return proposal;
+  }
+  if (proposal.kind === "typed_plan_candidate") {
+    throw new Error("typed_plan_candidate_requires_runtime_materialization");
   }
   // Convert Tier 2/3 to StructuredPlanProposal with empty jobs
   return { markdown: proposal.markdown, jobs: [] };

@@ -65,10 +65,36 @@ const {
   handlePlanReadOnlyConvergence,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planConvergence.ts"));
 const {
+  assessPlanEvidenceTransactionProgress,
+  classifyPlanQualityRecovery,
   handlePlanQualityRecoveryAfterToolResults,
   handlePlanQualityRecoveryAfterVisibleMaterialization,
+  resolvePlanQualityRecoveryTransition,
   shouldPauseForReviewablePlanArtifactAfterToolResults,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
+
+test("an unrelated fresh file cannot advance an open exact symbol obligation", () => {
+  const unchanged = assessPlanEvidenceTransactionProgress({
+    previousObligationKeys: ["find_symbol_references::save_file_content"],
+    nextObligationKeys: ["find_symbol_references::save_file_content"],
+    hasSuccessfulEvidence: true,
+    semanticEvidenceAdvanced: true,
+    readCoverageAdvanced: true,
+  });
+  assert.deepEqual(unchanged, {
+    advanced: false,
+    firstOpenObligationKey: "find_symbol_references::save_file_content",
+    firstExactObligationClosed: false,
+  }, "reading index.html must not advance the save_file_content lookup transaction");
+
+  assert.equal(assessPlanEvidenceTransactionProgress({
+    previousObligationKeys: ["find_symbol_references::save_file_content"],
+    nextObligationKeys: ["read_target:src-tauri/src/main.rs:"],
+    hasSuccessfulEvidence: true,
+    semanticEvidenceAdvanced: true,
+    readCoverageAdvanced: false,
+  }).advanced, true, "closing the exact lookup may advance to its discovered owner read");
+});
 
 function createPlanConvergenceCallbacks(language = "en") {
   const appended = [];
@@ -111,6 +137,8 @@ test("plan evidence readiness requires model-visible visual context and targeted
       successfulSearches: 1,
       semanticFacts: 0,
       changeTargets: 0,
+      evidenceComponents: 0,
+      diagnosticEvidenceComponents: 0,
     },
   );
 
@@ -131,7 +159,7 @@ test("plan evidence readiness requires model-visible visual context and targeted
         { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
       ],
     }).status,
-    "needs_targeted_read",
+    "ready_for_plan",
   );
 
   assert.equal(
@@ -175,7 +203,7 @@ test("provided files are grounded by exact successful reads, not assistant claim
   );
 });
 
-test("MD Viewer structural reads do not close diagnostic Plan before a root-cause fact", () => {
+test("multiple structural source reads remain read-only before confirmed closure", () => {
   const userGoal = [
     "在 macOS 双击 Markdown 文件时只打开空白界面。",
     "软件内的打开功能无法开启文件选择窗口。",
@@ -247,7 +275,7 @@ test("plan read-only convergence stops broad discovery before targeted evidence 
     recentToolActivity: [
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
-  }), false);
+  }), true);
 
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -326,7 +354,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     recentToolActivity: [
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
-  }), false);
+  }), true);
 
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -481,6 +509,10 @@ test("plan convergence names an unresolved contract instead of allowing more bro
   });
 
   assert.equal(result.status, "continue");
+  assert.ok(
+    result.planEvidenceProgressFingerprint,
+    "opening model-draft recovery must freeze the pre-read evidence baseline",
+  );
   assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.match(harness.appended.at(-1)?.content || "", /permission_contract:dialog/);
   assert.match(harness.appended.at(-1)?.content || "", /do not reread them merely to resolve this gap/i);
@@ -588,7 +620,7 @@ test("plan quality recovery routes rejected plan drafts to targeted evidence", (
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.deepEqual(phases, [{
     phase: "needs_evidence",
-    reason: "bundle_not_ready",
+    reason: "no_targeted_evidence_read",
     status: "running",
   }]);
 });
@@ -690,6 +722,160 @@ test("grounded source evidence preserves an auto-scaffold recovery without reope
     reason: "auto scaffold after quality gate",
     status: "running",
   }]);
+});
+
+test("an empty evidence ledger reopens one model-draft read instead of paraphrasing an unverified diagnosis", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 2,
+    quality: {
+      ok: false,
+      reason: "unverified_diagnostic_claim_as_confirmed",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "找到文件打开后触发错误保存窗口的根因并制定修复计划。",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "insufficient_actionable_plan_signals",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: true,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryObjective: "none",
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.deepEqual(phases.at(-1), {
+    phase: "needs_evidence",
+    reason: "no_targeted_evidence_read",
+    status: "running",
+  });
+});
+
+test("quality recovery transition keeps active evidence transactional and clears only stale objectives", () => {
+  const common = {
+    intrinsicAction: "rewrite",
+    rejectionSource: "visible_candidate",
+    reasonType: "unverified_diagnostic_claim_as_confirmed",
+    evidenceState: "present",
+    evidenceRecoveryIssued: true,
+    evidenceRecoveryObjective: "model_draft",
+    hasRecoveryReadBatch: false,
+    evidenceBudgetAvailable: true,
+  };
+
+  assert.deepEqual(resolvePlanQualityRecoveryTransition({
+    ...common,
+    planRuntimePhase: "needs_evidence",
+  }), {
+    effectiveAction: "targeted_evidence",
+    evidenceObjective: "model_draft",
+    holdActiveEvidenceTransaction: true,
+    openEvidenceTransaction: false,
+    clearStaleEvidenceTransaction: false,
+    reason: "active_evidence_transaction",
+  });
+
+  assert.deepEqual(resolvePlanQualityRecoveryTransition({
+    ...common,
+    planRuntimePhase: "drafting",
+  }), {
+    effectiveAction: "rewrite",
+    evidenceObjective: "none",
+    holdActiveEvidenceTransaction: false,
+    openEvidenceTransaction: false,
+    clearStaleEvidenceTransaction: true,
+    reason: "intrinsic_quality_action",
+  });
+
+  assert.deepEqual(resolvePlanQualityRecoveryTransition({
+    ...common,
+    planRuntimePhase: "drafting",
+    evidenceState: "absent",
+    evidenceRecoveryIssued: false,
+    evidenceRecoveryObjective: "none",
+  }), {
+    effectiveAction: "targeted_evidence",
+    evidenceObjective: "model_draft",
+    holdActiveEvidenceTransaction: false,
+    openEvidenceTransaction: true,
+    clearStaleEvidenceTransaction: false,
+    reason: "initial_model_draft_evidence",
+  });
+
+  assert.equal(resolvePlanQualityRecoveryTransition({
+    ...common,
+    planRuntimePhase: "needs_evidence",
+    evidenceRecoveryIssued: false,
+  }).holdActiveEvidenceTransaction, true);
+
+  assert.equal(resolvePlanQualityRecoveryTransition({
+    ...common,
+    intrinsicAction: "targeted_evidence",
+    planRuntimePhase: "drafting",
+    evidenceRecoveryIssued: false,
+    evidenceRecoveryObjective: "none",
+  }).evidenceObjective, "model_draft");
+
+  assert.equal(resolvePlanQualityRecoveryTransition({
+    ...common,
+    intrinsicAction: "targeted_evidence",
+    rejectionSource: "persisted_artifact",
+    planRuntimePhase: "drafting",
+    evidenceRecoveryIssued: false,
+    evidenceRecoveryObjective: "none",
+  }).evidenceObjective, "deterministic_closure");
+});
+
+test("a visible draft cannot cancel an active model-draft evidence transaction", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 3,
+    quality: {
+      ok: false,
+      reason: "unverified_diagnostic_claim_as_confirmed",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "needs_evidence",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "找到文件打开后触发错误保存窗口的根因并制定修复计划。",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "insufficient_actionable_plan_signals",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: true,
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryObjective: "model_draft",
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.effectiveRecoveryAction, "targeted_evidence");
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
+  assert.equal(result.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.deepEqual(phases.at(-1), {
+    phase: "needs_evidence",
+    reason: "bundle_not_ready",
+    status: "running",
+  });
 });
 
 test("visible candidate rejection recovers without poisoning persisted artifact state", () => {
@@ -851,7 +1037,17 @@ test("visible candidate quality recovery is bounded without changing the typed a
       canAutoRepair: false,
     },
     planRuntimePhase: "needs_rewrite",
-    recentPlanToolActivity: [],
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "the file-open handler updates the active document path before the editor consumes the loaded content",
+    }, {
+      name: "read_file",
+      target: "src/editor.js",
+      status: "succeeded",
+      detail: "the editor consumes the active document path and dispatches the existing input event during programmatic load",
+    }],
     attemptedPlanWriteTargets: [],
     latestUserPromptText: "Create a reviewable plan",
     planLastQualityGateReason: "not_structured",
@@ -872,13 +1068,158 @@ test("visible candidate quality recovery is bounded without changing the typed a
     iteration: 10,
     planQualityRejectCount: secondRewrite.planQualityRejectCount,
     planAutoScaffoldPromptIssued: secondRewrite.planAutoScaffoldPromptIssued,
+    planVisibleQualityPromptBudget: secondRewrite.planVisibleQualityPromptBudget,
+  });
+  const bounded = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 11,
+    planQualityRejectCount: exhausted.planQualityRejectCount,
+    planAutoScaffoldPromptIssued: exhausted.planAutoScaffoldPromptIssued,
+    planVisibleQualityPromptBudget: exhausted.planVisibleQualityPromptBudget,
   });
 
   assert.match(secondRewrite.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
   assert.equal(secondRewrite.planAutoScaffoldPromptIssued, false);
   assert.equal(exhausted.planQualityRejectCount, 3);
+  assert.match(exhausted.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
+  assert.equal(bounded.planQualityRejectCount, 4);
+  assert.equal(bounded.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.equal(bounded.planArtifactQualityRejected, false);
+});
+
+test("a newly exposed visible quality issue receives one bounded revision after the initial budget", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "the file-open handler updates the active document path before the editor consumes the loaded content",
+    }, {
+      name: "read_file",
+      target: "src/editor.js",
+      status: "succeeded",
+      detail: "the editor consumes the active document path and dispatches the existing input event during programmatic load",
+    }],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "修复打开本地 Markdown 文件后的错误状态并制定计划。",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  };
+
+  const newlyExposedDiagnosticClassification = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 11,
+    planQualityRejectCount: 2,
+    planLastQualityGateReason: "missing_plan_required_sections:public_interfaces",
+    quality: {
+      ok: false,
+      reason: "unverified_diagnostic_claim_as_confirmed",
+      missingSections: [],
+      // A restored envelope may still carry the action used by an older
+      // runtime. The reason classifier must keep it out of evidence recovery.
+      recoveryAction: "targeted_evidence",
+      canAutoRepair: false,
+    },
+  });
+
+  assert.equal(newlyExposedDiagnosticClassification.planQualityRejectCount, 3);
+  assert.equal(newlyExposedDiagnosticClassification.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(newlyExposedDiagnosticClassification.planEvidenceRecoveryObjective, "none");
+  assert.match(
+    newlyExposedDiagnosticClassification.pendingPlanRuntimeRecoveryPrompt || "",
+    /PLAN_NEEDS_REWRITE/,
+  );
+  assert.equal(phases.at(-1)?.phase, "needs_rewrite");
+  assert.equal(phases.at(-1)?.reason, "unverified_diagnostic_claim_as_confirmed");
+
+  const repeatedSameIssue = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 12,
+    planQualityRejectCount: newlyExposedDiagnosticClassification.planQualityRejectCount,
+    planLastQualityGateReason: newlyExposedDiagnosticClassification.planLastQualityGateReason,
+    planVisibleQualityPromptBudget:
+      newlyExposedDiagnosticClassification.planVisibleQualityPromptBudget,
+    quality: {
+      ok: false,
+      reason: "unverified_diagnostic_claim_as_confirmed",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+  });
+
+  assert.equal(repeatedSameIssue.planQualityRejectCount, 4);
+  assert.match(repeatedSameIssue.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
+
+  const nextIndependentIssue = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 13,
+    planQualityRejectCount: repeatedSameIssue.planQualityRejectCount,
+    planLastQualityGateReason: repeatedSameIssue.planLastQualityGateReason,
+    planVisibleQualityPromptBudget: repeatedSameIssue.planVisibleQualityPromptBudget,
+    quality: {
+      ok: false,
+      reason: "missing_plan_required_sections:user_goal",
+      missingSections: ["user_goal"],
+      recoveryAction: "rewrite",
+      canAutoRepair: true,
+    },
+  });
+
+  assert.equal(nextIndependentIssue.planQualityRejectCount, 5);
+  assert.match(nextIndependentIssue.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
+});
+
+test("visible quality recovery signatures normalize section order and retain a hard global ceiling", () => {
+  const left = classifyPlanQualityRecovery({
+    reason: "missing_plan_required_sections:validation,user_goal",
+    missingSections: ["validation", "user_goal"],
+    recoveryAction: "rewrite",
+  });
+  const right = classifyPlanQualityRecovery({
+    reason: "missing_plan_required_sections:user_goal,validation",
+    missingSections: ["user_goal", "validation"],
+    recoveryAction: "rewrite",
+  });
+  assert.equal(left.signature, right.signature);
+
+  const harness = createPlanConvergenceCallbacks("en");
+  const exhausted = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 18,
+    quality: {
+      ok: false,
+      reason: "conflicting_plan_acceptance_assertions",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Create a reviewable plan.",
+    planQualityRejectCount: 6,
+    planLastQualityGateReason: "empty_plan_implementation_detail",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: () => {},
+  });
+
+  assert.equal(exhausted.planQualityRejectCount, 7);
   assert.equal(exhausted.pendingPlanRuntimeRecoveryPrompt, null);
-  assert.equal(exhausted.planArtifactQualityRejected, false);
 });
 
 test("quality-rejected plan writes are not eligible for post-tool review", () => {
@@ -989,6 +1330,13 @@ test("plan quality recovery keeps tools open when a successful read still lacks 
       target: "src/App.tsx",
       content: "export function App() {}",
       isError: false,
+      readFileObservation: {
+        key: "src/App.tsx::v1::1-120",
+        path: "src/App.tsx",
+        requestSignature: "1-120",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "needs_evidence",
     planEvidenceRecoveryObjective: "deterministic_closure",
@@ -1015,7 +1363,7 @@ test("plan quality recovery keeps tools open when a successful read still lacks 
   }]);
 });
 
-test("missing-visible-plan recovery accepts a fresh window as progress without closing an unproven diagnosis", () => {
+test("model-draft recovery does not close an unchanged structural evidence bundle", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
   const recentActivity = [
@@ -1074,53 +1422,7 @@ test("missing-visible-plan recovery accepts a fresh window as progress without c
   assert.equal(retry.planEvidenceNoProgressPasses, 1);
   assert.equal(retry.planClosureEvidenceRecoveryIssued, true);
   assert.equal(retry.planEvidenceRecoveryObjective, "model_draft");
-  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
-  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /missing range|different evidence owner/i);
-  assert.deepEqual(phases.at(-1), {
-    phase: "needs_evidence",
-      reason: "change_targets_lack_confirmed_rationale",
-    status: "running",
-  });
-
-  const completed = handlePlanQualityRecoveryAfterToolResults({
-    callbacks: harness.callbacks,
-    workflowMode: "plan",
-    iteration: 5,
-    results: [{
-      toolCallId: "read-main-next-window",
-      name: "read_file",
-      target: "src/main.js",
-      content: "READ_FILE_RESULT lines 101-200 with renderer initialization",
-      isError: false,
-      readFileObservation: {
-        key: "src/main.js::v1::101-200",
-        path: "src/main.js",
-        requestSignature: "101-200",
-        versionToken: "v1",
-        source: "fresh",
-      },
-    }],
-    planRuntimePhase: "needs_evidence",
-    planEvidenceRecoveryObjective: retry.planEvidenceRecoveryObjective,
-    recentPlanToolActivity: recentActivity,
-    attemptedPlanWriteTargets: [],
-    latestUserPromptText: "启动软件测试白屏，无任何 UI 显示，找到问题原因并制定修复方案。",
-    planQualityRejectCount: retry.planQualityRejectCount,
-    planLastQualityGateReason: retry.planLastQualityGateReason,
-    planLastMissingSections: retry.planLastMissingSections,
-    planAutoScaffoldPromptIssued: retry.planAutoScaffoldPromptIssued,
-    planClosureEvidenceRecoveryIssued: retry.planClosureEvidenceRecoveryIssued,
-    planEvidenceRecoveryPasses: retry.planEvidenceRecoveryPasses,
-    planEvidenceNoProgressPasses: retry.planEvidenceNoProgressPasses,
-    planEvidenceProgressFingerprint: retry.planEvidenceProgressFingerprint,
-    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
-  });
-
-  assert.equal(completed.planEvidenceRecoveryPasses, 0);
-  assert.equal(completed.planEvidenceNoProgressPasses, 0);
-  assert.equal(completed.planClosureEvidenceRecoveryIssued, true);
-  assert.equal(completed.planEvidenceRecoveryObjective, "model_draft");
-  assert.match(completed.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
+  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /previous recovery read did not advance/i);
   assert.deepEqual(phases.at(-1), {
     phase: "needs_evidence",
     reason: "change_targets_lack_confirmed_rationale",
@@ -1165,7 +1467,7 @@ test("model-draft recovery blocks repeated errors at the bounded no-progress lim
   assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
   assert.equal(result.planEvidenceNoProgressPasses, 5);
   assert.doesNotMatch(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.deepEqual(phases.at(-1), {
     phase: "needs_evidence",
     reason: "evidence read failed; choose another target",
@@ -1280,6 +1582,13 @@ test("fresh but insufficient model-draft evidence preserves the model-draft obje
       target: "src/unknown.ts",
       content: "READ_FILE_RESULT\nexport const value = 1;",
       isError: false,
+      readFileObservation: {
+        key: "src/unknown.ts::v1::1-120",
+        path: "src/unknown.ts",
+        requestSignature: "1-120",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "needs_evidence",
     planEvidenceRecoveryObjective: "model_draft",
@@ -1303,10 +1612,10 @@ test("fresh but insufficient model-draft evidence preserves the model-draft obje
   assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
   assert.equal(result.planEvidenceRecoveryPasses, 0);
   assert.equal(result.planEvidenceNoProgressPasses, 0);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.deepEqual(phases.at(-1), {
     phase: "needs_evidence",
-    reason: "bundle_not_ready",
+    reason: "targeted_reads_without_semantic_facts",
     status: "running",
   });
 });
@@ -1324,6 +1633,13 @@ test("a fourth distinct deterministic evidence window is progress, not budget ex
       target: "src/App.tsx",
       content: "READ_FILE_RESULT lines 301-400 with another structural owner",
       isError: false,
+      readFileObservation: {
+        key: "src/App.tsx::v1::301-400",
+        path: "src/App.tsx",
+        requestSignature: "301-400",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "needs_evidence",
     planEvidenceRecoveryObjective: "deterministic_closure",
@@ -1350,7 +1666,7 @@ test("a fourth distinct deterministic evidence window is progress, not budget ex
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.deepEqual(phases.at(-1), {
     phase: "needs_evidence",
-      reason: "bundle_not_ready",
+    reason: "semantic_facts_without_change_target",
     status: "running",
   });
 });
@@ -1374,6 +1690,13 @@ test("plan quality recovery closes once a successful read exposes a target defec
       target: "src/App.tsx",
       content: "export function App() {}",
       isError: false,
+      readFileObservation: {
+        key: "src/App.tsx::v1::1-120",
+        path: "src/App.tsx",
+        requestSignature: "1-120",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "needs_evidence",
     recentPlanToolActivity: recentActivity,
@@ -1417,6 +1740,13 @@ test("an outstanding evidence request is consumed after reconciliation advances 
       target: "src/App.tsx",
       content: "export function App() {}",
       isError: false,
+      readFileObservation: {
+        key: "src/App.tsx::v1::1-120",
+        path: "src/App.tsx",
+        requestSignature: "1-120",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "drafting",
     recentPlanToolActivity: recentActivity,
@@ -1559,12 +1889,14 @@ test("unproven read payloads cannot extend Plan recovery when the semantic evide
     planEvidenceProgressFingerprint: "",
   });
 
-  assert.equal(first.planEvidenceRecoveryPasses, 1);
-  assert.equal(first.planEvidenceNoProgressPasses, 0);
+  // A raw payload without a frozen baseline or a structured observation does
+  // not prove progress. Persist the current bundle as the baseline instead.
+  assert.equal(first.planEvidenceRecoveryPasses, 0);
+  assert.equal(first.planEvidenceNoProgressPasses, 1);
   assert.ok(first.planEvidenceProgressFingerprint);
 
   let blocked = first;
-  for (let attempt = 1; attempt <= 6; attempt += 1) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
     blocked = handlePlanQualityRecoveryAfterToolResults({
       ...common,
       iteration: 20 + attempt,
@@ -1583,7 +1915,7 @@ test("unproven read payloads cannot extend Plan recovery when the semantic evide
     });
   }
 
-  assert.equal(blocked.planEvidenceRecoveryPasses, 1);
+  assert.equal(blocked.planEvidenceRecoveryPasses, 0);
   assert.equal(blocked.planEvidenceNoProgressPasses, 6);
   assert.equal(blocked.planEvidenceRecoveryObjective, "none");
   assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_BLOCKED/);
@@ -1815,6 +2147,10 @@ test("post-convergence helper reopens bounded targeted evidence when a drafting 
   assert.equal(result.planEvidenceRecoveryPasses, 0);
   assert.equal(result.planReasoningOnlyRecoveryPasses, 0);
   assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
+  assert.ok(
+    result.planEvidenceProgressFingerprint,
+    "post-convergence recovery must freeze its semantic and coverage baseline",
+  );
   assert.equal(result.planAutoScaffoldPromptIssued, false);
   assert.equal(harness.appended.length, 2);
   assert.equal(harness.appended[0].role, "assistant");
@@ -1823,6 +2159,85 @@ test("post-convergence helper reopens bounded targeted evidence when a drafting 
   assert.deepEqual(harness.statuses, ["running"]);
   assert.deepEqual(harness.streamTokens, []);
   assert.deepEqual(phases, [{ phase: "needs_evidence", reason: "targeted_reads_without_semantic_facts" }]);
+});
+
+test("a post-convergence model-draft transaction rejects an unchanged raw read against its frozen baseline", () => {
+  const { harness, input } = createPostConvergenceInput({
+    input: {
+      visibleAssistantText: "I need one more file.",
+      assistantHistoryText: "I need one more file.",
+    },
+  });
+  const opened = handlePlanPostConvergenceToolRedirect(input);
+
+  const repeated = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 8,
+    results: [{
+      toolCallId: "read-same-bundle-without-observation",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "READ_FILE_RESULT with no structured fresh-read identity",
+      isError: false,
+    }],
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: opened.planEvidenceRecoveryObjective,
+    planEvidenceProgressFingerprint: opened.planEvidenceProgressFingerprint,
+    recentPlanToolActivity: input.recentPlanToolActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: input.latestUserPromptText,
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
+    setPlanRuntimePhase: () => {},
+  });
+
+  assert.equal(repeated.planEvidenceRecoveryPasses, 0);
+  assert.equal(repeated.planEvidenceNoProgressPasses, 1);
+  assert.equal(repeated.planEvidenceRecoveryObjective, "model_draft");
+  assert.match(repeated.pendingPlanRuntimeRecoveryPrompt || "", /previous recovery read did not advance/i);
+});
+
+test("non-target post-convergence recovery also freezes a baseline before reopening evidence", () => {
+  const { input } = createPostConvergenceInput({
+    input: {
+      effectiveToolCalls: [{ id: "call_list", name: "list_directory", arguments: "{}" }],
+      planRuntimePhase: "synthesis",
+      planEvidenceRecoveryPasses: 0,
+      planReasoningOnlyRecoveryPasses: 0,
+    },
+  });
+  const result = handlePlanPostConvergenceToolRedirect(input);
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
+  assert.equal(result.planEvidenceRecoveryPasses, 1);
+  assert.ok(result.planEvidenceProgressFingerprint);
+});
+
+test("a runtime-required preferred delegation bypasses the ordinary post-convergence read redirect", () => {
+  const { harness, phases, input } = createPostConvergenceInput({
+    input: {
+      availableToolNames: new Set(["spawn_subagent"]),
+      effectiveToolCalls: [
+        { id: "spawn_editor", name: "spawn_subagent", arguments: "{}" },
+        { id: "spawn_backend", name: "spawn_subagent", arguments: "{}" },
+      ],
+      preferredDelegationRequired: true,
+    },
+  });
+  const result = handlePlanPostConvergenceToolRedirect(input);
+
+  assert.equal(result.status, "none");
+  assert.deepEqual(harness.appended, []);
+  assert.deepEqual(harness.statuses, []);
+  assert.deepEqual(harness.streamTokens, []);
+  assert.deepEqual(phases, []);
 });
 
 test("post-convergence helper forces visible plan convergence after recovery is exhausted", () => {

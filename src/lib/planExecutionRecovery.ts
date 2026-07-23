@@ -32,6 +32,12 @@ import {
   scopeExecutionEvidenceLedger,
   type ExecuteEvidenceGap,
 } from "./verificationEvidence";
+import type { PlanStructuredEvidenceFact } from "./planStructuredEvidence";
+import type { PlanSourceObservation } from "./planSourceObservation";
+import type {
+  PlanEvidenceDiscoveryObservation,
+  PlanEvidenceObligation,
+} from "./planEvidenceObligations";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 3;
 export const CHAT_MAX_AUTO_RESUME_LIMIT = 2;
@@ -609,6 +615,19 @@ export interface PlanToolActivitySummary {
   detail?: string;
   /** Runtime-observed mutation truth; tool names and success prose are insufficient. */
   mutationObserved?: boolean;
+  /** Runtime-owned typed evidence. Legacy `facts` are display/import only. */
+  structuredFacts?: PlanStructuredEvidenceFact[];
+  /** Immutable exact source excerpts retained before display compaction. */
+  sourceObservations?: PlanSourceObservation[];
+  /** Runtime-parsed project/symbol topology; never reconstructed from model prose. */
+  discoveryObservation?: PlanEvidenceDiscoveryObservation;
+  /** Exact remaining read/search contract owned by the runtime. */
+  evidenceObligation?: PlanEvidenceObligation;
+  /** Exact needs_evidence transaction this result was admitted to close. */
+  obligationClosure?: {
+    role: "obligation_closure";
+    obligation: PlanEvidenceObligation;
+  };
   facts?: string[];
   /** Exact versioned read window retained across checkpoints and compaction. */
   readFileObservation?: FileReadObservationIdentity;
@@ -634,6 +653,10 @@ export interface PlanToolActivitySummary {
      * mutations still obey parentContextState/requiresParentReread below.
      */
     planningEvidenceState?: "reusable" | "unresolved";
+    /** Set only when a wait_subagents result crossed the parent join/consume boundary. */
+    joinState?: "consumed";
+    /** Only a complete, owner-matched typed closure may satisfy a parent read obligation. */
+    closureState?: "satisfied" | "partial" | "unverified";
     parentContextState: "reference_only" | "version_verified";
     requiresParentReread: boolean;
   };

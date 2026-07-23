@@ -1,4 +1,5 @@
 import type { MainModeKey } from "../lib/mainModes";
+import type { AttachedFile } from "../lib/attachments";
 import {
   isMainIntentShortcutAllowedInMainMode,
   parseMainDebugShortcut,
@@ -30,6 +31,28 @@ export interface WorkspaceComposerIntentAdmissionInput {
   readonly text: string;
   readonly language: "zh" | "en";
   readonly snapshot: WorkspaceComposerIntentSnapshot;
+}
+
+export interface WorkspaceComposerSubmissionPayloadSnapshot {
+  readonly contextMentions: readonly string[];
+  readonly attachedFiles: readonly AttachedFile[];
+}
+
+export interface WorkspaceComposerInstructionAdmissionInput<TAcceptance> {
+  readonly text: string;
+  readonly images?: readonly string[];
+  readonly language: "zh" | "en";
+  readonly intentSnapshot?: WorkspaceComposerIntentSnapshot;
+  readonly payloadSnapshot: WorkspaceComposerSubmissionPayloadSnapshot;
+  /** Production store admission port. It remains the sole receipt/FIFO owner. */
+  readonly acceptWorkspaceInstruction: (input: {
+    text: string;
+    images?: string[];
+    contextMentions: string[];
+    attachedFiles: AttachedFile[];
+    source: "composer";
+    dispatchHints?: WorkspaceJsonObject;
+  }) => Promise<TAcceptance>;
 }
 
 /**
@@ -96,4 +119,29 @@ export function buildWorkspaceComposerIntentDispatchHints(
     turnTitle,
     intentSummary,
   };
+}
+
+/**
+ * Shared production Composer ingress. UI and conformance callers provide the
+ * same immutable submit snapshots; durable admission still happens only in
+ * the store's acceptWorkspaceInstruction implementation.
+ */
+export function acceptWorkspaceComposerInstruction<TAcceptance>(
+  input: WorkspaceComposerInstructionAdmissionInput<TAcceptance>,
+): Promise<TAcceptance> {
+  const dispatchHints = input.intentSnapshot
+    ? buildWorkspaceComposerIntentDispatchHints({
+        text: input.text,
+        language: input.language,
+        snapshot: input.intentSnapshot,
+      })
+    : undefined;
+  return input.acceptWorkspaceInstruction({
+    text: input.text,
+    ...(input.images?.length ? { images: [...input.images] } : {}),
+    contextMentions: [...input.payloadSnapshot.contextMentions],
+    attachedFiles: input.payloadSnapshot.attachedFiles.map((file) => ({ ...file })),
+    source: "composer",
+    ...(dispatchHints ? { dispatchHints } : {}),
+  });
 }

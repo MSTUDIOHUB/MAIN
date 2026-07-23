@@ -57,12 +57,14 @@ const policyModule = loadTranspiledModuleSync(path.join(
   "src/lib/orchestrator/loop/preapprovalPlanRecoveryStreamPolicy.ts",
 ));
 const {
+  PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS,
   PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS,
   PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
   PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS,
   applyPreapprovalPlanQualityRecoveryStreamOptions,
   capPreapprovalPlanQualityRecoveryMaxEscalations,
   capPreapprovalPlanQualityRecoveryMaxTokens,
+  resolvePreapprovalPlanQualityRecoveryOutputTokens,
   resolvePreapprovalPlanQualityRecoveryStreamPolicy,
 } = policyModule;
 
@@ -85,14 +87,14 @@ test("preapproval plan rewrite gets one provider-neutral bounded stream lease", 
   assert.equal(policy.stage, "rewrite");
   assert.equal(
     policy.maxOutputTokens,
-    PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
+    PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS,
   );
   assert.equal(
     policy.maxStreamElapsedMs,
     PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS,
   );
   assert.equal(policy.maxStreamElapsedMs, 120_000);
-  assert.equal(policy.maxOutputTokens, 2_048);
+  assert.equal(policy.maxOutputTokens, 4_096);
   assert.equal(policy.toolChoice, undefined);
   assert.equal(
     policy.stopClass,
@@ -141,6 +143,21 @@ test("rewrite finalization never manufactures a native write-tool requirement", 
   assert.equal(options.toolChoice, undefined);
 });
 
+test("rewrite requires the exact native typed Plan submission surface", () => {
+  const policy = resolvePolicy({
+    llmToolNames: ["submit_plan_candidate"],
+    forceXmlTools: false,
+  });
+  const options = applyPreapprovalPlanQualityRecoveryStreamOptions(
+    policy,
+    { workflowMode: "plan", runtimeIntent: "plan" },
+    1,
+  );
+
+  assert.equal(policy.toolChoice, "required");
+  assert.equal(options.toolChoice, "required");
+});
+
 test("non-rewrite plan phases and approved execution are not capped", () => {
   const grounding = resolvePolicy({ planRuntimePhase: "grounding" });
   const approved = resolvePolicy({ isPlanApproved: true });
@@ -163,13 +180,41 @@ test("rewrite bounds preserve stricter upstream limits and prohibit escalation",
     2,
   );
 
-  assert.equal(capPreapprovalPlanQualityRecoveryMaxTokens(policy, undefined), 2_048);
+  assert.equal(capPreapprovalPlanQualityRecoveryMaxTokens(policy, undefined), 4_096);
   assert.equal(capPreapprovalPlanQualityRecoveryMaxTokens(policy, 1_024), 1_024);
-  assert.equal(capPreapprovalPlanQualityRecoveryMaxTokens(policy, 8_192), 2_048);
+  assert.equal(capPreapprovalPlanQualityRecoveryMaxTokens(policy, 8_192), 4_096);
   assert.equal(capPreapprovalPlanQualityRecoveryMaxEscalations(policy, 3), 0);
   assert.equal(stricterOptions.maxStreamElapsedMs, 45_000);
   assert.equal(stricterOptions.maxStreamElapsedLabel, "stricter_upstream_limit");
   assert.equal(stricterOptions.toolChoice, "required");
+});
+
+test("long multi-facet rewrites receive an adaptive lease with a hard ceiling", () => {
+  const graphSize = {
+    goals: 18,
+    evidence: 48,
+    changes: 24,
+    validations: 18,
+    interfaces: 12,
+  };
+  const policy = resolvePolicy({ graphSize });
+
+  assert.equal(
+    resolvePreapprovalPlanQualityRecoveryOutputTokens(graphSize),
+    PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
+  );
+  assert.equal(policy.maxOutputTokens, 8_192);
+  assert.equal(
+    capPreapprovalPlanQualityRecoveryMaxTokens(policy, 16_384),
+    PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
+  );
+  assert.equal(capPreapprovalPlanQualityRecoveryMaxEscalations(policy, 3), 0);
+
+  const compact = resolvePolicy({
+    graphSize: { goals: 1, evidence: 0, changes: 0, validations: 1, interfaces: 0 },
+  });
+  assert.ok(compact.maxOutputTokens >= PREAPPROVAL_PLAN_QUALITY_RECOVERY_BASE_OUTPUT_TOKENS);
+  assert.ok(compact.maxOutputTokens < policy.maxOutputTokens);
 });
 
 test("stream pipeline applies the preapproval policy to initial and retry calls", () => {

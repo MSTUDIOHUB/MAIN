@@ -100,6 +100,7 @@ export function handleAssistantOutputPhase(input: {
   runtimeIntent: ResolvedUserIntent;
   workspace: string;
   latestUserPromptText: string;
+  preferredDelegationRequired?: boolean;
   availableToolNames: Set<string>;
   effectiveToolCalls: ToolCallToExecute[];
   normalized: NormalizedStreamState;
@@ -533,8 +534,8 @@ export function handleAssistantOutputPhase(input: {
       role: "user",
       content:
         loopDecision.action === "force_finalize"
-          ? "The runtime resolved the repeated non-blocking options automatically. Complete planning now: call exactly one targeted read-only tool only if evidence is missing; otherwise output the complete reviewable `<proposed_plan>`. Do not emit more options or ask whether to continue; MAIN runtime owns the plan artifact."
-          : "MAIN treated the previous non-blocking plan options as permission to continue planning: do not ask whether to start exploration or provide paths again; immediately call one specific read/search tool for the missing evidence. If evidence is sufficient, output the complete reviewable `<proposed_plan>`; MAIN runtime owns the plan artifact.",
+          ? "The runtime resolved the repeated non-blocking options automatically. Complete planning now: call exactly one targeted read-only tool only if evidence is missing; otherwise submit the complete typed graph through the transport declared by the latest [PLAN AUTHORING CONTRACT]. Do not emit more options or ask whether to continue; MAIN runtime owns validation and rendering."
+          : "MAIN treated the previous non-blocking plan options as permission to continue planning: do not ask whether to start exploration or provide paths again; immediately call one specific read/search tool for the missing evidence. If evidence is sufficient, submit the complete typed graph through the transport declared by the latest [PLAN AUTHORING CONTRACT]; MAIN runtime owns validation and rendering.",
     });
     return finishControl("continue");
   }
@@ -772,6 +773,7 @@ export function handleAssistantOutputPhase(input: {
       assistantMsgId,
       ...planRuntimeState,
       latestUserPromptText: input.latestUserPromptText,
+      preferredDelegationRequired: input.preferredDelegationRequired,
       setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
     });
   planRuntimeState = applyPlanPostConvergenceRuntimeState(

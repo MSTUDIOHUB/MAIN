@@ -41,6 +41,7 @@ function loadTypeScript(sourcePath) {
 const {
   resolveWorkspaceInstructionActionDecision,
   resolveWorkspaceInstructionExecutionConsent,
+  shouldDeferWorkspaceInstructionDispatchForActiveOwner,
 } = loadTypeScript(
   path.join(process.cwd(), "src/store/workspaceInstructionApproval.ts"),
 );
@@ -182,4 +183,56 @@ test("an older choice in the same Turn cannot grant consent after a newer reques
     actionDecision: null,
     reason: "stale_request",
   });
+});
+
+test("running and ordinary pending-review owners defer FIFO while exact review actions resolve in place", () => {
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: false,
+    agentStatus: "pending_review",
+    hasPendingActionRequest: true,
+    hasExactPendingReviewActionDecision: false,
+    cancellationFenceFailed: false,
+  }), true);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: true,
+    agentStatus: "pending_review",
+    hasPendingActionRequest: true,
+    hasExactPendingReviewActionDecision: true,
+    cancellationFenceFailed: false,
+  }), false);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: true,
+    agentStatus: "running",
+    hasPendingActionRequest: false,
+    hasExactPendingReviewActionDecision: true,
+    cancellationFenceFailed: false,
+  }), true);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: true,
+    agentStatus: "idle",
+    hasPendingActionRequest: false,
+    hasExactPendingReviewActionDecision: false,
+    cancellationFenceFailed: false,
+  }), true);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: true,
+    agentStatus: "running",
+    hasPendingActionRequest: false,
+    hasExactPendingReviewActionDecision: false,
+    cancellationFenceFailed: true,
+  }), false);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: false,
+    agentStatus: "idle",
+    hasPendingActionRequest: true,
+    hasExactPendingReviewActionDecision: false,
+    cancellationFenceFailed: false,
+  }), true);
+  assert.equal(shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+    isGenerating: false,
+    agentStatus: "idle",
+    hasPendingActionRequest: false,
+    hasExactPendingReviewActionDecision: false,
+    cancellationFenceFailed: false,
+  }), false);
 });

@@ -119,6 +119,38 @@ test("phase threshold pivots twice before the bounded recovery fuse pauses", () 
   );
 });
 
+test("a targeting read cannot erase no-progress strategy history", () => {
+  const targeting = {
+    ...exhaustedState(["current_task_action_lock"]),
+    mode: "action_plus_targeting",
+    readLease: null,
+    decisionCheckpoint: {
+      ...exhaustedState(["current_task_action_lock"]).decisionCheckpoint,
+      nextRequiredCapability: "targeting",
+    },
+  };
+  const observed = runtime.transitionExecuteRecoveryRuntimeState(targeting, {
+    freshReadTarget: "src/main.ts",
+    sourceObservationKey: "src/main.ts::v2::1-120",
+    sourceObservedVersion: "v2",
+  });
+
+  assert.equal(observed.transition, "context_to_mutation");
+  assert.equal(observed.state.decisionCheckpoint.nextRequiredCapability, "mutation");
+  assert.deepEqual(observed.state.decisionCheckpoint.noProgressStrategyPivots, [
+    "current_task_action_lock",
+  ]);
+
+  const nextBoundary = runtime.resolveExecuteRecoveryNoProgressBoundary({
+    state: observed.state,
+    cause: "execute_recovery_phase_budget",
+    language: "en",
+    availableToolNames: ["apply_patch"],
+  });
+  assert.equal(nextBoundary.decision.action, "continue_with_pivot");
+  assert.equal(nextBoundary.decision.strategy, "alternate_capability_reframe");
+});
+
 test("pinned validation pivots cannot multiply the same run_command-only budget", () => {
   const state = {
     ...exhaustedState(),

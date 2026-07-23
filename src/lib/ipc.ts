@@ -1266,20 +1266,27 @@ export function exportTextFile(path: string, content: string): Promise<void> {
   return invoke<void>("export_text_file", { path, content });
 }
 
-export function listDirectory(path: string, workspace?: string): Promise<FileNode[]> {
-  return invoke<FileNode[]>("list_directory", { path, workspace });
+export async function listDirectory(path: string, workspace?: string): Promise<FileNode[]> {
+  const result = await invoke<unknown>("list_directory", { path, workspace });
+  return Array.isArray(result)
+    ? result.filter((entry): entry is FileNode => !!entry && typeof entry === "object")
+    : [];
 }
 
-export function globSearch(pattern: string, workspace?: string): Promise<string[]> {
-  return invoke<string[]>("glob_search", { pattern, workspace });
+export async function globSearch(pattern: string, workspace?: string): Promise<string[]> {
+  const result = await invoke<unknown>("glob_search", { pattern, workspace });
+  return Array.isArray(result)
+    ? result.filter((entry): entry is string => typeof entry === "string")
+    : [];
 }
 
 export function grepSearch(query: string, path: string, workspace?: string): Promise<string> {
   return invoke<string>("grep_search", { query, path, workspace });
 }
 
-export function getProjectSkeleton(depth?: number, workspace?: string): Promise<string> {
-  return invoke<string>("get_project_skeleton", { depth, workspace });
+export async function getProjectSkeleton(depth?: number, workspace?: string): Promise<string> {
+  const result = await invoke<unknown>("get_project_skeleton", { depth, workspace });
+  return typeof result === "string" ? result : "";
 }
 
 export function getFileOutline(path: string, workspace?: string): Promise<string> {

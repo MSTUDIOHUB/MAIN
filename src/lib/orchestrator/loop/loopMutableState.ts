@@ -106,11 +106,12 @@ export function applyIterationStreamPreparationMutableState(
   state: AgentLoopMutableState,
   result: Pick<
     IterationStreamPreparationResult,
-    "streamRuntimeState" | "executeRecoveryState"
+    "streamRuntimeState" | "executeRecoveryState" | "planRuntimeState"
   >,
 ): void {
   state.streamRuntimeState = result.streamRuntimeState;
   state.executeRecoveryState = result.executeRecoveryState;
+  state.planRuntimeState = result.planRuntimeState;
 }
 
 export function applyAssistantIterationMutableState(

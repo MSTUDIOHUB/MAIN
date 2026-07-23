@@ -1,5 +1,9 @@
 import type { TaskBlock } from "../lib/taskTypes";
-import { getIntentPolicy, type ResolvedRunIntent } from "../lib/runIntent";
+import {
+  getIntentPolicy,
+  looksLikeExplicitWorkspaceMutationRequest,
+  type ResolvedRunIntent,
+} from "../lib/runIntent";
 import { sanitizeUserContextItemsForPersist } from "../lib/userContextItems";
 import type {
   WorkspaceInstruction,
@@ -154,7 +158,14 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   blockIds?: number[];
 }): ConversationTurn {
   const hintedIntent = resolveWorkspaceInstructionIntentHint(input.instruction);
-  const projectedIntent = hintedIntent || "respond";
+  // This projection is presentation-only: it grants no capability and the
+  // dispatcher still owns authoritative intent resolution. An ordinary
+  // workspace repair must nevertheless look like an Execute Turn immediately
+  // after durable admission instead of briefly masquerading as chat.
+  const projectedIntent = hintedIntent ||
+    (looksLikeExplicitWorkspaceMutationRequest(input.instruction.payload.text)
+      ? "execute"
+      : "respond");
   const hintedTitle = input.instruction.payload.dispatchHints?.turnTitle;
   const hintedIntentSummary = normalizeIntentSummaryCandidate(
     input.instruction.payload.dispatchHints?.intentSummary,
