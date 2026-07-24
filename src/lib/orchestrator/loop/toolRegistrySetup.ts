@@ -27,6 +27,7 @@ import {
 } from "../../toolCapabilities";
 import { buildToolCatalog, type ToolCatalog } from "../../toolCatalog";
 import type { ToolDefinition } from "../../toolSchemas";
+import type { CollaborationAccessMode } from "../../collaborationWorkItems";
 import { UNITY_MCP_STRICT_RETRY_FORCED_TOOLS } from "./unityMcpRuntime";
 
 export interface AgentLoopToolRegistryState {
@@ -58,6 +59,7 @@ export async function prepareAgentLoopToolRegistry(input: {
   unityScriptEditRequested: boolean;
   gameStudioScriptEditRequested: boolean;
   subagentDepth?: number;
+  subagentAccessMode?: CollaborationAccessMode;
   webSearchEnabled: boolean;
   enabledKnowledgeBaseIds: string[];
 }): Promise<AgentLoopToolRegistryState> {
@@ -75,6 +77,7 @@ export async function prepareAgentLoopToolRegistry(input: {
     unityScriptEditRequested,
     gameStudioScriptEditRequested,
     subagentDepth = 0,
+    subagentAccessMode = "read",
     webSearchEnabled,
     enabledKnowledgeBaseIds,
   } = input;
@@ -282,6 +285,9 @@ export async function prepareAgentLoopToolRegistry(input: {
       "find_symbol_references",
       "git_status",
       "git_diff",
+      ...(subagentAccessMode === "write"
+        ? ["apply_patch", "replace_in_file", "write_file"]
+        : []),
     ]);
     routedToolDefinitions = routedToolDefinitions.filter((tool) => {
       return childToolNames.has(tool.function.name);

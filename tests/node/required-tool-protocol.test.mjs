@@ -406,7 +406,7 @@ test("mixed native Plan submission transactions fail closed before execution", (
   assert.equal(adapted.result.content, "");
 });
 
-test("a required preferred checkpoint adapts one exact read intent into a bounded reviewer child", () => {
+test("required-tool compatibility never rewrites a parent read into delegated work", () => {
   const raw = streamResult({
     toolCalls: [{
       index: 0,
@@ -416,31 +416,12 @@ test("a required preferred checkpoint adapts one exact read intent into a bounde
     }],
     finishReason: "tool_calls",
   });
-  const adapted = protocol.adaptRequiredPreferredDelegationReadIntent({
-    result: raw,
-    preferredDelegationRequired: true,
-    allowedToolNames: ["spawn_subagent"],
-  });
-
-  assert.equal(adapted.adapted, true);
-  assert.equal(adapted.sourceToolName, "read_file");
-  assert.equal(adapted.target, "src-tauri/src/main.rs");
-  assert.equal(adapted.result.toolCalls[0].name, "spawn_subagent");
-  const args = JSON.parse(adapted.result.toolCalls[0].arguments);
-  assert.equal(args.role, "reviewer");
-  assert.equal(args.allowed_paths, "src-tauri/src/main.rs");
-  assert.match(args.objective, /src-tauri\/src\/main\.rs/);
-
-  assert.strictEqual(protocol.adaptRequiredPreferredDelegationReadIntent({
-    result: raw,
-    preferredDelegationRequired: false,
-    allowedToolNames: ["spawn_subagent"],
-  }).result, raw);
-  assert.equal(protocol.adaptRequiredPreferredDelegationReadIntent({
-    result: streamResult({
-      toolCalls: [{ index: 0, id: "call-root", name: "grep_search", arguments: '{"path":"."}' }],
-    }),
-    preferredDelegationRequired: true,
-    allowedToolNames: ["spawn_subagent"],
-  }).adapted, false);
+  assert.equal(protocol.adaptRequiredPreferredDelegationReadIntent, undefined);
+  const unchanged = protocol.annotateRequiredToolCallProtocolResult(
+    raw,
+    undefined,
+    ["spawn_subagent"],
+  );
+  assert.strictEqual(unchanged, raw);
+  assert.equal(unchanged.toolCalls[0].name, "read_file");
 });

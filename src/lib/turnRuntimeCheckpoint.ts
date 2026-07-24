@@ -9,16 +9,20 @@ import {
   type VisualContextDeliveryStatus,
 } from "./visualContext";
 import {
-  isPreferredDelegationEvidenceTargetWithinScope,
-  normalizePreferredDelegationScopeContract,
-  reconcilePreferredDelegationScopeContractAfterRestart,
-  type PreferredDelegationScopeContract,
-} from "./preferredDelegationScopes";
+  decodeLegacyPreferredDelegationCheckpointV1,
+  type LegacyPreferredDelegationCheckpointV1,
+} from "./legacyPreferredDelegationCheckpoint";
 import {
   normalizeSubagentClosureReceiptLedger,
   resolveSubagentClosureReceiptReferences,
   type SubagentClosureReceiptLedger,
 } from "./subagentClosureReceipts";
+import {
+  createEmptyCollaborationLedger,
+  normalizeCollaborationWorkItemDraft,
+  normalizeCollaborationLedger,
+  type CollaborationLedgerV1,
+} from "./collaborationWorkItems";
 import {
   TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
   createCanonicalTurnRuntime,
@@ -42,6 +46,8 @@ import {
 } from "./turnRuntimeContract";
 
 export const TURN_RUNTIME_CHECKPOINT_SCHEMA_VERSION =
+  "turn-runtime-checkpoint.v2" as const;
+export const LEGACY_TURN_RUNTIME_CHECKPOINT_SCHEMA_VERSION =
   "turn-runtime-checkpoint.v1" as const;
 export const MAX_DURABLE_TURN_RUNTIME_CHECKPOINTS = 32;
 export const MAX_DURABLE_TURN_CLOSURE_RECEIPT_REFS = 48;
@@ -61,12 +67,8 @@ export interface TurnRuntimeCheckpointOwner {
 }
 
 export interface TurnRuntimePlanningCheckpoint {
-  preferredDelegationScopeContract: PreferredDelegationScopeContract | null;
-  /**
-   * References only. Canonical adopted evidence lives in the independent
-   * Session receipt ledger and is never self-certified by this checkpoint.
-   */
-  closureReceiptRefs: string[];
+  /** One-shot task history only; child model context is never persisted. */
+  collaborationLedger: CollaborationLedgerV1;
 }
 
 /**
@@ -711,16 +713,78 @@ function normalizeClosureReceiptRefs(value: unknown): string[] | null {
   return new Set(normalized).size === normalized.length ? normalized : null;
 }
 
+function migrateLegacyPreferredDelegationContract(input: {
+  parentTurnId: string;
+  contract: LegacyPreferredDelegationCheckpointV1 | null;
+  updatedAt: number;
+}): CollaborationLedgerV1 {
+  if (!input.contract) {
+    return createEmptyCollaborationLedger(input.parentTurnId, input.updatedAt);
+  }
+  const entries = input.contract.registrations.flatMap((registration, index) => {
+    const collaborationTaskId =
+      `legacy-collaboration-${registration.subagentId}-${index + 1}`;
+    const workItem = normalizeCollaborationWorkItemDraft({
+      collaborationTaskId,
+      draft: {
+        taskKey: registration.requiredScopeKey,
+        taskKind: "review",
+        objective:
+          `Restore adopted evidence from legacy delegated scope ${registration.requiredScopeKey}.`,
+        delegationReason:
+          "Migrated from the pre-v2 path-scope collaboration checkpoint.",
+        successCriteria:
+          "Preserve only runtime-issued evidence already adopted by the parent.",
+        expectedOutput: "Migrated runtime evidence receipt.",
+        requiredPaths: [],
+        allowedPaths: registration.allowedPaths,
+        accessMode: "read",
+      },
+    });
+    if (!workItem.ok) return [];
+    const terminalState = registration.state === "consumed"
+      ? "completed" as const
+      : registration.state === "incomplete"
+      ? "blocked" as const
+      : undefined;
+    return [{
+      workItem: workItem.workItem,
+      parentTurnId: input.parentTurnId,
+      subagentId: registration.subagentId,
+      runId: `legacy-run-${registration.subagentId}`,
+      state: terminalState ? "closed" as const : "queued" as const,
+      ...(terminalState ? { terminalState } : {}),
+      evidenceReceiptIds: [],
+      createdAt: input.updatedAt,
+      updatedAt: input.updatedAt,
+      ...(terminalState ? { closedAt: input.updatedAt } : {}),
+    }];
+  });
+  const migrated = normalizeCollaborationLedger({
+    schemaVersion: "collaboration-ledger.v1",
+    parentTurnId: input.parentTurnId,
+    entries,
+    updatedAt: input.updatedAt,
+  }, { parentTurnId: input.parentTurnId });
+  return migrated ||
+    createEmptyCollaborationLedger(input.parentTurnId, input.updatedAt);
+}
+
 function resolvePlanningReceiptEvidence(input: {
   checkpointOwner: TurnRuntimeCheckpointOwner;
   canonical: CanonicalTurnRuntimeState;
-  contract: PreferredDelegationScopeContract | null;
+  collaborationLedger: CollaborationLedgerV1;
   closureReceiptRefs: string[];
   receiptLedger: SubagentClosureReceiptLedger | null | undefined;
 }): {
   activities: PlanToolActivitySummary[];
   validReceiptRefs: string[];
-  evidenceOwners: Array<{ subagentId: string; scopeKey: string; target: string }>;
+  evidenceOwners: Array<{
+    collaborationTaskId: string;
+    subagentId: string;
+    taskKey: string;
+    target: string;
+  }>;
 } {
   const resolution = resolveSubagentClosureReceiptReferences({
     ledger: input.receiptLedger,
@@ -735,15 +799,22 @@ function resolvePlanningReceiptEvidence(input: {
         ...input.canonical.priorRuns.map((run) => run.identity.runId),
       ],
     },
-    contract: input.contract,
+    collaborationLedger: input.collaborationLedger,
   });
   return {
     activities: resolution.acceptedEvidence.map((evidence) => evidence.activity),
     validReceiptRefs: resolution.resolvedReceiptRefs,
     evidenceOwners: resolution.receipts.flatMap((receipt) =>
       receipt.acceptedEvidence.map((evidence) => ({
+        collaborationTaskId:
+          receipt.collaborationTaskId ||
+          input.collaborationLedger.entries.find((entry) =>
+            entry.subagentId === receipt.subagentId &&
+            entry.workItem.taskKey === receipt.scopeKey
+          )?.workItem.collaborationTaskId ||
+          "",
         subagentId: receipt.subagentId,
-        scopeKey: receipt.scopeKey,
+        taskKey: receipt.scopeKey,
         target: evidence.activity.target,
       }))
     ),
@@ -776,7 +847,11 @@ export function normalizeTurnRuntimeCheckpoint(
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isBoundedJsonValue(value, MAX_DURABLE_TURN_RUNTIME_CHECKPOINT_CHARS)) return null;
   const record = value as Record<string, unknown>;
-  if (record.schemaVersion !== TURN_RUNTIME_CHECKPOINT_SCHEMA_VERSION) return null;
+  const isLegacyV1 =
+    record.schemaVersion === LEGACY_TURN_RUNTIME_CHECKPOINT_SCHEMA_VERSION;
+  if (!isLegacyV1 && record.schemaVersion !== TURN_RUNTIME_CHECKPOINT_SCHEMA_VERSION) {
+    return null;
+  }
   const revision = safePositiveInteger(record.revision);
   const updatedAt = finiteTimestamp(record.updatedAt);
   const canonical = normalizeCanonicalTurnRuntimeState(record.canonical);
@@ -798,97 +873,119 @@ export function normalizeTurnRuntimeCheckpoint(
     ? record.planning as Record<string, unknown>
     : null;
   if (!planningRecord) return null;
-  const preferredContract = planningRecord.preferredDelegationScopeContract == null
+  const legacyPreferredContract = !isLegacyV1 ||
+      planningRecord.preferredDelegationScopeContract == null
     ? null
-    : normalizePreferredDelegationScopeContract(
+    : decodeLegacyPreferredDelegationCheckpointV1(
         planningRecord.preferredDelegationScopeContract,
       );
-  if (planningRecord.preferredDelegationScopeContract != null && !preferredContract) return null;
-  // v1 checkpoints briefly embedded adopted evidence before receipt ownership
-  // existed. Preserve their canonical Turn state, but never migrate that
-  // self-authored payload into durable collaboration authority.
-  const closureReceiptRefs = planningRecord.closureReceiptRefs === undefined &&
-      Array.isArray(planningRecord.adoptedEvidence)
-    ? []
-    : normalizeClosureReceiptRefs(planningRecord.closureReceiptRefs);
-  if (!closureReceiptRefs) return null;
+  if (
+    isLegacyV1 &&
+    planningRecord.preferredDelegationScopeContract != null &&
+    !legacyPreferredContract
+  ) return null;
+  // v1 checkpoints could reference independent receipts through a separate
+  // path-scope contract. Convert that ownership once; v2 never persists or
+  // executes the legacy scheduler contract.
+  const legacyClosureReceiptRefs = isLegacyV1
+    ? planningRecord.closureReceiptRefs === undefined
+      ? []
+      : normalizeClosureReceiptRefs(planningRecord.closureReceiptRefs)
+    : [];
+  if (isLegacyV1 && !legacyClosureReceiptRefs) return null;
+  let collaborationLedger = planningRecord.collaborationLedger === undefined && isLegacyV1
+    ? migrateLegacyPreferredDelegationContract({
+        parentTurnId: checkpointOwner.turnId,
+        contract: legacyPreferredContract,
+        updatedAt,
+      })
+    : normalizeCollaborationLedger(planningRecord.collaborationLedger, {
+        parentTurnId: checkpointOwner.turnId,
+        coldRestore: options?.coldRestore,
+        now: options?.now,
+      });
+  if (!collaborationLedger) return null;
 
   let restoredCanonical = canonical;
-  let restoredContract = preferredContract;
-  let restoredClosureReceiptRefs = closureReceiptRefs;
-  let changedForRestore = false;
-  if (options?.coldRestore) {
-    if (restoredCanonical.run?.status === "running") {
-      const at = Math.max(
-        restoredCanonical.lastEventAt,
-        finiteTimestamp(options.now) ?? Date.now(),
-      );
-      const transition = reduceCanonicalTurnRuntime(restoredCanonical, {
-        schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
-        type: "run.paused",
-        sequence: restoredCanonical.nextSequence,
-        at,
-        run: restoredCanonical.run.identity,
-        pauseKind: "recoverable",
-        reason: "application_restarted",
-      });
-      if (transition.disposition === "rejected") return null;
-      restoredCanonical = transition.state;
-      changedForRestore = true;
-    }
+  let changedForRestore = isLegacyV1;
+  if (options?.coldRestore && restoredCanonical.run?.status === "running") {
+    const at = Math.max(
+      restoredCanonical.lastEventAt,
+      finiteTimestamp(options.now) ?? Date.now(),
+    );
+    const transition = reduceCanonicalTurnRuntime(restoredCanonical, {
+      schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+      type: "run.paused",
+      sequence: restoredCanonical.nextSequence,
+      at,
+      run: restoredCanonical.run.identity,
+      pauseKind: "recoverable",
+      reason: "application_restarted",
+    });
+    if (transition.disposition === "rejected") return null;
+    restoredCanonical = transition.state;
+    changedForRestore = true;
   }
+
+  const ledgerReceiptRefs = [...new Set([
+    ...(legacyClosureReceiptRefs || []),
+    ...collaborationLedger.entries.flatMap((entry) => entry.evidenceReceiptIds),
+  ])];
+  if (
+    ledgerReceiptRefs.length > MAX_DURABLE_TURN_CLOSURE_RECEIPT_REFS ||
+    ledgerReceiptRefs.some((receiptId) => !requiredString(receiptId))
+  ) return null;
+
   if (options?.coldRestore || options?.closureReceiptLedger !== undefined) {
     const receiptResolution = resolvePlanningReceiptEvidence({
       checkpointOwner,
       canonical: restoredCanonical,
-      contract: restoredContract,
-      closureReceiptRefs,
+      collaborationLedger,
+      closureReceiptRefs: ledgerReceiptRefs,
       receiptLedger: options.closureReceiptLedger,
     });
-    const reconciledContract = options?.coldRestore
-      ? reconcilePreferredDelegationScopeContractAfterRestart({
-          contract: restoredContract,
-          adoptedEvidence: receiptResolution.evidenceOwners,
-        })
-      : restoredContract
-        ? {
-            ...restoredContract,
-            registrations: restoredContract.registrations.map((registration) => {
-              if (registration.state !== "consumed") return registration;
-              const exactEvidence = receiptResolution.evidenceOwners.some((evidence) =>
-                evidence.subagentId === registration.subagentId &&
-                evidence.scopeKey === registration.requiredScopeKey &&
-                isPreferredDelegationEvidenceTargetWithinScope(
-                  registration.allowedPaths,
-                  evidence.target,
-                )
-              );
-              return exactEvidence
-                ? registration
-                : { ...registration, state: "incomplete" as const };
-            }),
-          }
-        : null;
-    if (!sameJson(restoredContract, reconciledContract)) changedForRestore = true;
-    if (!sameJson(closureReceiptRefs, receiptResolution.validReceiptRefs)) {
-      changedForRestore = true;
-    }
-    restoredContract = reconciledContract;
-    const consumedRegistrationKeys = new Set(
-      (restoredContract?.registrations || [])
-        .filter((registration) => registration.state === "consumed")
-        .map((registration) => `${registration.subagentId}\u001f${registration.requiredScopeKey}`),
+    const validReceiptRefs = new Set(receiptResolution.validReceiptRefs);
+    const receiptsByTask = new Map<string, string[]>();
+    const normalizedReceiptLedger = normalizeSubagentClosureReceiptLedger(
+      options.closureReceiptLedger,
+      { expectedOwner: checkpointOwner },
     );
-    const resolvedLedger = normalizeSubagentClosureReceiptLedger(options.closureReceiptLedger, {
-      expectedOwner: checkpointOwner,
-    });
-    restoredClosureReceiptRefs = receiptResolution.validReceiptRefs.filter((receiptId) => {
-      const receipt = resolvedLedger?.receipts.find((candidate) => candidate.receiptId === receiptId);
-      return !!receipt && consumedRegistrationKeys.has(
-        `${receipt.subagentId}\u001f${receipt.scopeKey}`,
+    for (const receiptRef of validReceiptRefs) {
+      const receipt = normalizedReceiptLedger?.receipts.find((candidate) =>
+        candidate.receiptId === receiptRef
       );
+      const taskId = receipt?.collaborationTaskId ||
+        collaborationLedger.entries.find((entry) =>
+          entry.subagentId === receipt?.subagentId &&
+          entry.workItem.taskKey === receipt?.scopeKey
+        )?.workItem.collaborationTaskId;
+      if (!taskId) continue;
+      receiptsByTask.set(taskId, [
+        ...(receiptsByTask.get(taskId) || []),
+        receiptRef,
+      ]);
+    }
+    const reconciledLedger = normalizeCollaborationLedger({
+      ...collaborationLedger,
+      entries: collaborationLedger.entries.map((entry) => ({
+        ...entry,
+        evidenceReceiptIds:
+          receiptsByTask.get(entry.workItem.collaborationTaskId) || [],
+      })),
+      updatedAt: Math.max(
+        collaborationLedger.updatedAt,
+        finiteTimestamp(options?.now) ?? updatedAt,
+      ),
+    }, {
+      parentTurnId: checkpointOwner.turnId,
+      coldRestore: options?.coldRestore,
+      now: options?.now,
     });
+    if (!reconciledLedger) return null;
+    if (!sameJson(collaborationLedger, reconciledLedger)) changedForRestore = true;
+    collaborationLedger = reconciledLedger;
   }
+
   const restoredUpdatedAt = changedForRestore
     ? Math.max(updatedAt, restoredCanonical.lastEventAt, finiteTimestamp(options?.now) ?? Date.now())
     : updatedAt;
@@ -899,8 +996,7 @@ export function normalizeTurnRuntimeCheckpoint(
     canonical: restoredCanonical,
     input: inputCheckpoint,
     planning: {
-      preferredDelegationScopeContract: restoredContract,
-      closureReceiptRefs: restoredClosureReceiptRefs,
+      collaborationLedger,
     },
     updatedAt: restoredUpdatedAt,
   };
@@ -961,8 +1057,7 @@ export function normalizeTurnRuntimeCheckpointMap(
 export function createTurnRuntimeCheckpoint(input: {
   canonical: CanonicalTurnRuntimeState;
   admittedUserContext?: TurnInputContextSignals;
-  preferredDelegationScopeContract?: PreferredDelegationScopeContract | null;
-  closureReceiptRefs?: string[];
+  collaborationLedger?: CollaborationLedgerV1 | null;
   updatedAt?: number;
 }): TurnRuntimeCheckpointV1 {
   const admittedUserContext = normalizeTurnInputContextSignals(
@@ -978,9 +1073,11 @@ export function createTurnRuntimeCheckpoint(input: {
       visualContext: createInitialVisualContextState(admittedUserContext),
     },
     planning: {
-      preferredDelegationScopeContract:
-        input.preferredDelegationScopeContract || null,
-      closureReceiptRefs: input.closureReceiptRefs || [],
+      collaborationLedger: input.collaborationLedger ||
+        createEmptyCollaborationLedger(
+          input.canonical.turn.identity.turnId,
+          input.updatedAt ?? input.canonical.lastEventAt,
+        ),
     },
     updatedAt: input.updatedAt ?? input.canonical.lastEventAt,
   });
@@ -1068,22 +1165,19 @@ export function updateTurnRuntimeCheckpointCanonical(input: {
 
 export function updateTurnRuntimePlanningCheckpoint(input: {
   checkpoint: TurnRuntimeCheckpointV1;
-  preferredDelegationScopeContract: PreferredDelegationScopeContract | null;
-  closureReceiptRefs: string[];
+  collaborationLedger: CollaborationLedgerV1;
   updatedAt?: number;
 }): TurnRuntimeCheckpointV1 | null {
-  const contract = input.preferredDelegationScopeContract == null
-    ? null
-    : normalizePreferredDelegationScopeContract(input.preferredDelegationScopeContract);
-  if (input.preferredDelegationScopeContract && !contract) return null;
-  const closureReceiptRefs = normalizeClosureReceiptRefs(input.closureReceiptRefs);
-  if (!closureReceiptRefs) return null;
+  const collaborationLedger = normalizeCollaborationLedger(
+    input.collaborationLedger,
+    { parentTurnId: input.checkpoint.owner.turnId },
+  );
+  if (!collaborationLedger) return null;
   return normalizeTurnRuntimeCheckpoint({
     ...input.checkpoint,
     revision: input.checkpoint.revision + 1,
     planning: {
-      preferredDelegationScopeContract: contract,
-      closureReceiptRefs,
+      collaborationLedger,
     },
     updatedAt: Math.max(input.checkpoint.updatedAt, input.updatedAt ?? Date.now()),
   });
@@ -1097,8 +1191,9 @@ export function restoreDurableTurnPlanningActivities(
   const resolved = resolvePlanningReceiptEvidence({
     checkpointOwner: checkpoint.owner,
     canonical: checkpoint.canonical,
-    contract: checkpoint.planning.preferredDelegationScopeContract,
-    closureReceiptRefs: checkpoint.planning.closureReceiptRefs,
+    collaborationLedger: checkpoint.planning.collaborationLedger,
+    closureReceiptRefs: checkpoint.planning.collaborationLedger.entries
+      .flatMap((entry) => entry.evidenceReceiptIds),
     receiptLedger,
   });
   return resolved.activities.map((activity) => ({

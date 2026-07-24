@@ -4368,7 +4368,6 @@ export default function ChatArea({
       ? buildCapsuleGuidanceText(
           capsuleRunStatus,
           language,
-          capsuleStatusProjection.kind,
         )
       : "";
   const capsuleLiveGuidanceText = capsuleIsRunActive &&
@@ -4387,12 +4386,13 @@ export default function ChatArea({
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
           language,
-          // Any newer structured runtime event retires an older model
-          // preamble, including when the event has already completed and is no
-          // longer eligible as the Capsule's current activity.
+          // Only a newer renderable progress item or health signal retires an
+          // older model-visible line. Non-display telemetry must not replace
+          // the last useful Capsule content with a generic lifecycle sentence.
           notOlderThan: Math.max(
             0,
-            ...capsuleProgressLedger.map((item) => item.lastSeenAt),
+            capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
+            ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
           ),
         })
       : "";

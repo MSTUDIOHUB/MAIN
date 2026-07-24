@@ -166,14 +166,32 @@ export async function handleEmptyResponseRecovery(input: {
     return finish("continue");
   }
 
-  consecutiveEmptyResponseCount += 1;
-  emptyResponseCountThisTurn += 1;
   const isSubagent = (callbacks.getSubagentDepth?.() || 0) > 0;
   const isExecuteRuntime = isExecuteRuntimeRequiringEvidence({
     workflowMode,
     turnIntent,
     runtimeIntent,
   });
+  const requiredToolProtocolViolation =
+    normalized.protocolViolation === "required_tool_call_missing" ||
+    normalized.protocolViolation === "required_function_call_mismatch" ||
+    normalized.protocolViolation === "required_tool_call_not_available";
+  if (!isSubagent && isExecuteRuntime && requiredToolProtocolViolation) {
+    // Required-tool violations have one owner: handleExecuteNoToolRecovery.
+    // Counting the same zero-call response here first used the generic empty
+    // pivot and prevented transport compatibility fallback from ever running.
+    emitDebug("empty_execute_protocol_recovery_deferred", {
+      iteration,
+      protocolViolation: normalized.protocolViolation,
+      finishReason: normalized.finishReason,
+      workflowMode,
+      runtimeIntent,
+    });
+    return finish("none");
+  }
+
+  consecutiveEmptyResponseCount += 1;
+  emptyResponseCountThisTurn += 1;
 
   if (
     isSubagent &&

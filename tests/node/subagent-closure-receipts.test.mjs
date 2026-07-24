@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-
 import ts from "typescript";
 
 const workspaceRoot = process.cwd();
@@ -48,409 +47,300 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
+const collaboration = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/collaborationWorkItems.ts"),
+);
 const receipts = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/subagentClosureReceipts.ts"),
 );
-const preferredScopes = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"),
-);
 
-const owner = Object.freeze({
-  workspaceKey: "/workspace/project",
-  sessionKey: "/workspace/project:7",
-  sessionEpoch: "epoch-7",
-  parentTurnId: "turn-7",
-  parentRunId: "run-7",
-});
+const owner = {
+  workspaceKey: "workspace-1",
+  sessionKey: "session-1",
+  sessionEpoch: "epoch-1",
+  parentTurnId: "turn-1",
+  parentRunId: "run-parent-1",
+};
 
-function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+function workItem(id, taskKey, allowedPaths) {
+  const result = collaboration.normalizeCollaborationWorkItemDraft({
+    collaborationTaskId: id,
+    draft: {
+      taskKey,
+      taskKind: "explore",
+      objective: `Inspect ${taskKey} independently.`,
+      delegationReason: "The parent can continue non-overlapping work.",
+      successCriteria: "Return at least one exact source observation.",
+      expectedOutput: "A concise source-backed finding.",
+      requiredPaths: "",
+      allowedPaths,
+      accessMode: "read",
+    },
+  });
+  assert.equal(result.ok, true);
+  return result.workItem;
 }
 
-function exactContract(registrations = [
-  {
-    requiredScopeKey: "src",
-    childScopeKey: "src",
-    subagentId: "child-src",
-    allowedPaths: ["src"],
-    state: "consumed",
-  },
-  {
-    requiredScopeKey: "src-tauri",
-    childScopeKey: "src-tauri",
-    subagentId: "child-rust",
-    allowedPaths: ["src-tauri"],
-    state: "consumed",
-  },
-]) {
+function entry({
+  taskId,
+  taskKey,
+  subagentId,
+  runId,
+  allowedPaths,
+  terminalState = "completed",
+}) {
   return {
-    schemaVersion: preferredScopes.PREFERRED_DELEGATION_SCOPE_CONTRACT_VERSION,
-    requiredScopes: [
-      { scopeKey: "src", allowedPaths: ["src"] },
-      { scopeKey: "src-tauri", allowedPaths: ["src-tauri"] },
-    ],
-    registrations,
-    maxCreatedPerTurn: 2,
+    workItem: workItem(taskId, taskKey, allowedPaths),
+    parentTurnId: owner.parentTurnId,
+    subagentId,
+    runId,
+    state: "closed",
+    terminalState,
+    evidenceReceiptIds: [],
+    createdAt: 10,
+    updatedAt: 20,
+    closedAt: 20,
   };
 }
 
-function exactActivity({
+function ledger(entries) {
+  const normalized = collaboration.normalizeCollaborationLedger({
+    schemaVersion: "collaboration-ledger.v1",
+    parentTurnId: owner.parentTurnId,
+    entries,
+    updatedAt: 20,
+  }, { parentTurnId: owner.parentTurnId });
+  assert.ok(normalized);
+  return normalized;
+}
+
+function activity({
+  taskId,
   subagentId,
+  runId,
   target,
-  callId,
-  observationKey,
-  fact,
-  relation,
-  activityOwner = owner,
+  closureState = "satisfied",
+  callId = `call-${taskId}`,
 }) {
   return {
     name: "read_file",
     target,
     status: "succeeded",
-    detail: `Exact versioned read of ${target}`,
-    facts: [fact],
-    structuredFacts: [{
-      authority: "runtime_observation",
-      kind: "symbol_relation",
-      relation,
-      symbols: [fact],
-    }],
-    readFileObservation: {
-      path: target,
-      contentChars: 240,
-      lineCount: 12,
-      truncated: false,
-    },
+    facts: [`fact:${taskId}`],
     delegatedObservation: {
       owner: {
         agentKind: "subagent",
+        collaborationTaskId: taskId,
         subagentId,
-        parentTurnId: activityOwner.parentTurnId,
-        runId: activityOwner.parentRunId,
+        parentTurnId: owner.parentTurnId,
+        runId,
       },
       sourceToolCallId: callId,
-      sourceObservationKey: observationKey,
-      sourceVersion: "120:2",
-      sourceContentHash: `${subagentId}-content-hash`,
-      sourceContentChars: 240,
-      sourceRange: {
-        startLine: 1,
-        endLine: 12,
-        totalLines: 12,
-        truncated: false,
-      },
+      sourceObservationKey: `observation-${taskId}`,
+      sourceVersion: "v1",
+      sourceContentHash: `hash-${taskId}`,
+      sourceContentChars: 120,
       planningEvidenceState: "reusable",
       joinState: "consumed",
-      closureState: "satisfied",
+      closureState,
       parentContextState: "version_verified",
       requiresParentReread: false,
     },
   };
 }
 
-function issueExactLedger(overrides = {}) {
-  const contract = overrides.contract || exactContract();
-  const activities = overrides.activities || [
-    exactActivity({
-      subagentId: "child-src",
-      target: "src/main.js",
-      callId: "call-src-read",
-      observationKey: "obs-src-read",
-      fact: "scheduleAutoSave",
-      relation: "listener_calls",
-    }),
-    exactActivity({
-      subagentId: "child-rust",
-      target: "src-tauri/src/main.rs",
-      callId: "call-rust-read",
-      observationKey: "obs-rust-read",
-      fact: "save_file_content",
-      relation: "command_handler",
-    }),
-  ];
-  return receipts.issueSubagentClosureReceipts({
-    ledger: overrides.ledger,
-    owner: overrides.owner || owner,
-    contract,
-    activities,
-    issuedAt: overrides.issuedAt ?? 1_000,
-  });
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
-test("issues and normalizes an exact canonical closure ledger", () => {
-  const contract = exactContract();
-  const issued = issueExactLedger();
+test("issues task-owned receipts for completed and partial one-shot agents", () => {
+  const completed = entry({
+    taskId: "task-completed",
+    taskKey: "title-chain",
+    subagentId: "agent-completed",
+    runId: "run-completed",
+    allowedPaths: ["src/main.js"],
+  });
+  const partial = entry({
+    taskId: "task-partial",
+    taskKey: "save-chain",
+    subagentId: "agent-partial",
+    runId: "run-partial",
+    allowedPaths: ["src/components"],
+    terminalState: "partial",
+  });
+  const collaborationLedger = ledger([completed, partial]);
+  const issued = receipts.issueSubagentClosureReceipts({
+    owner,
+    collaborationLedger,
+    activities: [
+      activity({
+        taskId: "task-completed",
+        subagentId: "agent-completed",
+        runId: "run-completed",
+        target: "src/main.js",
+      }),
+      activity({
+        taskId: "task-partial",
+        subagentId: "agent-partial",
+        runId: "run-partial",
+        target: "src/components/toolbar.js",
+        closureState: "partial",
+      }),
+    ],
+    issuedAt: 30,
+  });
 
   assert.equal(issued.ledger.revision, 2);
-  assert.deepEqual(issued.missingConsumedScopeKeys, []);
+  assert.deepEqual(issued.missingTaskIds, []);
   assert.equal(issued.receiptRefs.length, 2);
-  assert.equal(new Set(issued.receiptRefs).size, 2);
-  const normalized = receipts.normalizeSubagentClosureReceiptLedger(issued.ledger, {
-    expectedOwner: owner,
-  });
-  assert.deepEqual(normalized, issued.ledger);
-  for (const receiptRef of issued.receiptRefs) {
-    const receipt = receipts.findSubagentClosureReceipt(normalized, receiptRef);
-    assert.ok(receipt);
-    assert.match(receipt.receiptId, /^subagent-closure:[a-f0-9]{64}$/);
-    assert.match(receipt.digest, /^[a-f0-9]{64}$/);
-    assert.equal(receipt.acceptedEvidence.length, 1);
-  }
+  assert.deepEqual(Object.keys(issued.receiptRefsByTask).sort(), [
+    "task-completed",
+    "task-partial",
+  ]);
+  const byTask = new Map(
+    issued.ledger.receipts.map((receipt) => [receipt.collaborationTaskId, receipt]),
+  );
+  assert.equal(byTask.get("task-completed").closureState, "satisfied");
+  assert.equal(byTask.get("task-partial").closureState, "partial");
+  assert.equal(byTask.get("task-completed").runId, "run-completed");
+  assert.deepEqual(
+    receipts.normalizeSubagentClosureReceiptLedger(issued.ledger, {
+      expectedOwner: owner,
+    }),
+    issued.ledger,
+  );
+
   const resolved = receipts.resolveSubagentClosureReceiptReferences({
-    ledger: normalized,
+    ledger: issued.ledger,
     receiptRefs: issued.receiptRefs,
     expectedOwner: owner,
-    contract,
+    collaborationLedger,
   });
-  assert.deepEqual(resolved.resolvedReceiptRefs, issued.receiptRefs);
   assert.deepEqual(resolved.rejectedReceiptRefs, []);
-  assert.deepEqual(resolved.consumedScopeKeys, ["src", "src-tauri"]);
+  assert.deepEqual(resolved.resolvedTaskIds.sort(), [
+    "task-completed",
+    "task-partial",
+  ]);
   assert.equal(resolved.acceptedEvidence.length, 2);
 });
 
-test("rejects a receipt when human-readable facts are tampered", () => {
-  const issued = issueExactLedger();
-  const tampered = clone(issued.ledger);
-  tampered.receipts[0].acceptedEvidence[0].activity.facts[0] = "forged root cause";
+test("receipt resolution is fenced by task, agent, run, parent owner, and lease", () => {
+  const taskEntry = entry({
+    taskId: "task-fenced",
+    taskKey: "fenced-task",
+    subagentId: "agent-fenced",
+    runId: "run-fenced",
+    allowedPaths: ["src/lib"],
+  });
+  const collaborationLedger = ledger([taskEntry]);
+  const issued = receipts.issueSubagentClosureReceipts({
+    owner,
+    collaborationLedger,
+    activities: [activity({
+      taskId: "task-fenced",
+      subagentId: "agent-fenced",
+      runId: "run-fenced",
+      target: "src/lib/subagents.ts",
+    })],
+    issuedAt: 30,
+  });
 
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(tampered), null);
-  assert.equal(
-    receipts.findSubagentClosureReceipt(tampered, tampered.receipts[0].receiptId),
-    null,
-  );
-});
+  const wrongParent = receipts.resolveSubagentClosureReceiptReferences({
+    ledger: issued.ledger,
+    receiptRefs: issued.receiptRefs,
+    expectedOwner: { ...owner, parentRunId: "run-parent-other" },
+    collaborationLedger,
+  });
+  assert.deepEqual(wrongParent.resolvedReceiptRefs, []);
+  assert.deepEqual(wrongParent.rejectedReceiptRefs, issued.receiptRefs);
 
-test("rejects a receipt when typed structured facts are tampered", () => {
-  const issued = issueExactLedger();
-  const tampered = clone(issued.ledger);
-  tampered.receipts[0].acceptedEvidence[0].activity.structuredFacts[0].relation =
-    "forged_relation";
-
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(tampered), null);
-  assert.equal(
-    receipts.findSubagentClosureReceipt(tampered, tampered.receipts[0].receiptId),
-    null,
-  );
-});
-
-test("forged receipt digests and ids cannot be resolved as consumed authority", () => {
-  const issued = issueExactLedger();
-  const forgedDigest = clone(issued.ledger);
-  forgedDigest.receipts[0].digest = "0".repeat(64);
-  const forgedId = clone(issued.ledger);
-  forgedId.receipts[0].receiptId = `subagent-closure:${"f".repeat(64)}`;
-
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(forgedDigest), null);
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(forgedId), null);
-  assert.equal(
-    receipts.findSubagentClosureReceipt(forgedDigest, issued.receiptRefs[0]),
-    null,
-  );
-  assert.equal(
-    receipts.findSubagentClosureReceipt(forgedId, forgedId.receipts[0].receiptId),
-    null,
-  );
-  assert.deepEqual(receipts.resolveSubagentClosureReceiptReferences({
-    ledger: forgedDigest,
+  const runDrift = clone(collaborationLedger);
+  runDrift.entries[0].runId = "run-reused";
+  const wrongRun = receipts.resolveSubagentClosureReceiptReferences({
+    ledger: issued.ledger,
     receiptRefs: issued.receiptRefs,
     expectedOwner: owner,
-    contract: exactContract(),
-  }), {
-    receipts: [],
-    acceptedEvidence: [],
-    resolvedReceiptRefs: [],
-    rejectedReceiptRefs: issued.receiptRefs,
-    consumedScopeKeys: [],
+    collaborationLedger: runDrift,
   });
-  assert.deepEqual(receipts.resolveSubagentClosureReceiptReferences({
-    ledger: forgedId,
-    receiptRefs: [forgedId.receipts[0].receiptId],
-    expectedOwner: owner,
-    contract: exactContract(),
-  }).resolvedReceiptRefs, []);
-});
+  assert.deepEqual(wrongRun.resolvedReceiptRefs, []);
 
-test("ledger normalization enforces exact owner and durable size fences", () => {
-  const issued = issueExactLedger();
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(issued.ledger, {
-    expectedOwner: { ...owner, workspaceKey: "/workspace/replacement" },
-  }), null);
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(issued.ledger, {
-    expectedOwner: { ...owner, sessionKey: "/workspace/project:replacement" },
-  }), null);
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(issued.ledger, {
-    expectedOwner: { ...owner, sessionEpoch: "epoch-replacement" },
-  }), null);
-
-  const tooManyReceipts = {
-    ...clone(issued.ledger),
-    receipts: Array.from(
-      { length: receipts.MAX_DURABLE_SUBAGENT_CLOSURE_RECEIPTS + 1 },
-      () => clone(issued.ledger.receipts[0]),
-    ),
-  };
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(tooManyReceipts), null);
-
-  const oversized = {
-    ...clone(issued.ledger),
-    ignoredPadding: "x".repeat(1_048_576),
-  };
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(oversized), null);
-
-  const cyclic = { ...issued.ledger };
-  cyclic.self = cyclic;
-  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(cyclic), null);
-
-  assert.throws(
-    () => receipts.createSubagentClosureReceiptLedger({
-      owner: {
-        workspaceKey: "x".repeat(8_193),
-        sessionKey: owner.sessionKey,
-        sessionEpoch: owner.sessionEpoch,
-      },
-    }),
-    /Invalid subagent closure receipt ledger owner/,
-  );
-});
-
-test("an unreferenced canonical receipt cannot manufacture consumed authority", () => {
-  const issued = issueExactLedger();
-  const resolved = receipts.resolveSubagentClosureReceiptReferences({
+  const pathDrift = clone(collaborationLedger);
+  pathDrift.entries[0].workItem.allowedPaths = ["src/other"];
+  const wrongPath = receipts.resolveSubagentClosureReceiptReferences({
     ledger: issued.ledger,
-    receiptRefs: [],
+    receiptRefs: issued.receiptRefs,
     expectedOwner: owner,
-    contract: exactContract(),
+    collaborationLedger: pathDrift,
   });
-  assert.deepEqual(resolved.resolvedReceiptRefs, []);
-  assert.deepEqual(resolved.acceptedEvidence, []);
-  assert.deepEqual(resolved.consumedScopeKeys, []);
+  assert.deepEqual(wrongPath.resolvedReceiptRefs, []);
 });
 
-test("resolution rejects self-consistent receipts for another parent Turn or Run", () => {
-  const current = issueExactLedger();
-  const otherOwner = {
-    ...owner,
-    parentTurnId: "turn-other",
-    parentRunId: "run-other",
-  };
-  const otherActivities = [
-    exactActivity({
-      subagentId: "child-src",
+test("tampering with task identity or evidence invalidates the sealed ledger", () => {
+  const taskEntry = entry({
+    taskId: "task-sealed",
+    taskKey: "sealed-task",
+    subagentId: "agent-sealed",
+    runId: "run-sealed",
+    allowedPaths: ["src/main.js"],
+  });
+  const issued = receipts.issueSubagentClosureReceipts({
+    owner,
+    collaborationLedger: ledger([taskEntry]),
+    activities: [activity({
+      taskId: "task-sealed",
+      subagentId: "agent-sealed",
+      runId: "run-sealed",
       target: "src/main.js",
-      callId: "call-other-src",
-      observationKey: "obs-other-src",
-      fact: "other src fact",
-      relation: "defines",
-      activityOwner: otherOwner,
-    }),
-    exactActivity({
-      subagentId: "child-rust",
-      target: "src-tauri/src/main.rs",
-      callId: "call-other-rust",
-      observationKey: "obs-other-rust",
-      fact: "other rust fact",
-      relation: "defines",
-      activityOwner: otherOwner,
-    }),
-  ];
-  const other = issueExactLedger({
-    ledger: current.ledger,
-    owner: otherOwner,
-    activities: otherActivities,
-    issuedAt: 1_001,
+    })],
+    issuedAt: 30,
   });
-  assert.ok(receipts.normalizeSubagentClosureReceiptLedger(other.ledger),
-    "the shared Session ledger may validly contain receipts for both Turns");
 
-  const resolved = receipts.resolveSubagentClosureReceiptReferences({
-    ledger: other.ledger,
-    receiptRefs: other.receiptRefs,
-    expectedOwner: owner,
-    contract: exactContract(),
-  });
-  assert.deepEqual(resolved.resolvedReceiptRefs, []);
-  assert.deepEqual(resolved.rejectedReceiptRefs, other.receiptRefs);
-  assert.deepEqual(resolved.consumedScopeKeys, []);
+  const identityTamper = clone(issued.ledger);
+  identityTamper.receipts[0].collaborationTaskId = "task-forged";
+  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(identityTamper), null);
 
-  const wrongRunOnly = receipts.resolveSubagentClosureReceiptReferences({
-    ledger: current.ledger,
-    receiptRefs: current.receiptRefs,
-    expectedOwner: { ...owner, parentRunId: "run-replacement" },
-    contract: exactContract(),
-  });
-  assert.deepEqual(wrongRunOnly.resolvedReceiptRefs, []);
-  assert.deepEqual(wrongRunOnly.rejectedReceiptRefs, current.receiptRefs);
+  const evidenceTamper = clone(issued.ledger);
+  evidenceTamper.receipts[0].acceptedEvidence[0].activity.facts[0] = "forged fact";
+  assert.equal(receipts.normalizeSubagentClosureReceiptLedger(evidenceTamper), null);
 });
 
-test("resolution rejects self-consistent receipts for another child or frozen scope", () => {
-  const alternateContract = {
-    schemaVersion: preferredScopes.PREFERRED_DELEGATION_SCOPE_CONTRACT_VERSION,
-    requiredScopes: [
-      { scopeKey: "frontend", allowedPaths: ["src"] },
-      { scopeKey: "backend", allowedPaths: ["src-tauri"] },
-    ],
-    registrations: [
-      {
-        requiredScopeKey: "frontend",
-        childScopeKey: "frontend",
-        subagentId: "child-alt-src",
-        allowedPaths: ["src"],
-        state: "consumed",
-      },
-      {
-        requiredScopeKey: "backend",
-        childScopeKey: "backend",
-        subagentId: "child-alt-rust",
-        allowedPaths: ["src-tauri"],
-        state: "consumed",
-      },
-    ],
-    maxCreatedPerTurn: 2,
-  };
-  const alternateActivities = [
-    exactActivity({
-      subagentId: "child-alt-src",
+test("unowned, stale-run, and out-of-lease observations never receive a receipt", () => {
+  const taskEntry = entry({
+    taskId: "task-bounded",
+    taskKey: "bounded-task",
+    subagentId: "agent-bounded",
+    runId: "run-bounded",
+    allowedPaths: ["src/main.js"],
+  });
+  const collaborationLedger = ledger([taskEntry]);
+  for (const observation of [
+    activity({
+      taskId: "task-other",
+      subagentId: "agent-bounded",
+      runId: "run-bounded",
       target: "src/main.js",
-      callId: "call-alt-src",
-      observationKey: "obs-alt-src",
-      fact: "alternate src fact",
-      relation: "defines",
     }),
-    exactActivity({
-      subagentId: "child-alt-rust",
-      target: "src-tauri/src/main.rs",
-      callId: "call-alt-rust",
-      observationKey: "obs-alt-rust",
-      fact: "alternate rust fact",
-      relation: "defines",
+    activity({
+      taskId: "task-bounded",
+      subagentId: "agent-bounded",
+      runId: "run-stale",
+      target: "src/main.js",
     }),
-  ];
-  const alternate = issueExactLedger({
-    contract: alternateContract,
-    activities: alternateActivities,
-  });
-  assert.ok(receipts.normalizeSubagentClosureReceiptLedger(alternate.ledger));
-
-  const resolved = receipts.resolveSubagentClosureReceiptReferences({
-    ledger: alternate.ledger,
-    receiptRefs: alternate.receiptRefs,
-    expectedOwner: owner,
-    contract: exactContract(),
-  });
-  assert.deepEqual(resolved.resolvedReceiptRefs, []);
-  assert.deepEqual(resolved.rejectedReceiptRefs, alternate.receiptRefs);
-  assert.deepEqual(resolved.acceptedEvidence, []);
-
-  const driftedAllowedPaths = exactContract().registrations.map((registration) =>
-    registration.requiredScopeKey === "src"
-      ? { ...registration, allowedPaths: ["src/components"] }
-      : registration
-  );
-  const pathDriftResolution = receipts.resolveSubagentClosureReceiptReferences({
-    ledger: issueExactLedger().ledger,
-    receiptRefs: issueExactLedger().receiptRefs,
-    expectedOwner: owner,
-    contract: exactContract(driftedAllowedPaths),
-  });
-  assert.equal(pathDriftResolution.consumedScopeKeys.includes("src"), false);
+    activity({
+      taskId: "task-bounded",
+      subagentId: "agent-bounded",
+      runId: "run-bounded",
+      target: "src/other.js",
+    }),
+  ]) {
+    const issued = receipts.issueSubagentClosureReceipts({
+      owner,
+      collaborationLedger,
+      activities: [observation],
+      issuedAt: 30,
+    });
+    assert.deepEqual(issued.receiptRefs, []);
+    assert.deepEqual(issued.missingTaskIds, ["task-bounded"]);
+  }
 });

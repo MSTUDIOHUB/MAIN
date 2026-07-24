@@ -2347,7 +2347,7 @@ if (runRealOmlx && explicitSubagentModel && explicitSubagentModel !== models[0])
 }
 const subagentModel = explicitSubagentModel || models[0];
 
-test(`real OMLX honors the captured collaboration toggle after runtime admission with ${subagentModel}`, async ({ page }) => {
+test(`real OMLX exposes optional semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }) => {
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
 
@@ -2377,26 +2377,35 @@ test(`real OMLX honors the captured collaboration toggle after runtime admission
       intakePreferred: parsedDebug.some((entry: { source?: string; subagentPreference?: string }) =>
         entry.source === "agent.task_orchestrator_phase" && entry.subagentPreference === "preferred"
       ),
-      requirementInjected: parsedDebug.some((entry: { source?: string }) =>
-        entry.source === "agent.preferred_delegation_action_contract_injected"
+      admissionPreferred: parsedDebug.some((entry: {
+        source?: string;
+        preference?: string;
+        action?: string;
+      }) =>
+        entry.source === "agent.delegation_admission_decision" &&
+        entry.preference === "preferred" &&
+        entry.action === "admit"
       ),
-      requiredToolChoice: parsedDebug.some((entry: { source?: string; preferredDelegationRequired?: boolean; toolChoice?: string }) =>
-        entry.source === "agent.llm_request_shape" &&
-        entry.preferredDelegationRequired === true &&
-        entry.toolChoice === "required"
+      spawnToolExposed: parsedDebug.some((entry: {
+        source?: string;
+        preference?: string;
+        spawnToolExposed?: boolean;
+      }) =>
+        entry.source === "agent.delegation_admission_decision" &&
+        entry.preference === "preferred" &&
+        entry.spawnToolExposed === true
       ),
-      spawned: parsedDebug.some((entry: { source?: string }) =>
+      legacyForcedContract: parsedDebug.some((entry: { source?: string }) =>
+        entry.source === "agent.preferred_delegation_action_contract_injected" ||
         entry.source === "agent.preferred_delegation_spawned"
       ),
-      hasSubagent: (snapshot?.subagentRuns?.length || 0) >= 1,
     };
   }), { timeout: 180_000 }).toEqual({
     dispatchError: null,
     intakePreferred: true,
-    requirementInjected: true,
-    requiredToolChoice: true,
-    spawned: true,
-    hasSubagent: true,
+    admissionPreferred: true,
+    spawnToolExposed: true,
+    legacyForcedContract: false,
   });
 
   await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration?.());

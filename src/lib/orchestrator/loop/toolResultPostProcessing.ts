@@ -147,7 +147,9 @@ export function handleToolResultPostProcessing(input: {
   );
   const delegatedActivities = [...delegatedEvidenceActivities, ...parentRereadObligations];
   const directlyTrackedResults = externalResults.filter((result) =>
-    result.name !== "spawn_subagent" && result.name !== "wait_subagents"
+    result.name !== "spawn_subagent" &&
+    result.name !== "wait_subagents" &&
+    result.name !== "cancel_subagent"
   );
 
   const resultCountsAsExecutionEvidence = (result: ToolExecutionResult): boolean => {

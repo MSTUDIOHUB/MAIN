@@ -205,7 +205,6 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"));
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
-const preferredScopes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"));
 
 const {
   buildReadOnlyCacheSignature,
@@ -990,15 +989,36 @@ test("named-tool mismatches are quarantined and reprompt the exact runtime contr
   assert.equal(result.status, "continue");
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.equal(harness.appended.length, 1);
+  assert.deepEqual(harness.protocolFallbacks, [
+    "required_native_tool_protocol_violation:required_function_call_mismatch",
+  ]);
+  assert.match(harness.appended[0].content, /XML-compatible/i);
   assert.match(harness.appended[0].content, /specific function/);
   assert.match(harness.appended[0].content, /mismatched call was not executed/);
   assert.match(harness.appended[0].content, /exactly the named tool/);
 });
 
-test("execute protocol no-action exhausts provider-neutral strategy pivots before pausing", () => {
+test("first native required-tool violation switches transport exactly once", () => {
+  const harness = createExecuteNoToolHarness("en");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    activeProfile: "local",
+    protocolViolation: "required_tool_call_missing",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 1);
+  assert.deepEqual(harness.protocolFallbacks, [
+    "required_native_tool_protocol_violation:required_tool_call_missing",
+  ]);
+  assert.match(harness.appended.at(-1)?.content || "", /XML-compatible/);
+  assert.doesNotMatch(harness.appended.at(-1)?.content || "", /current_task_action_lock/);
+});
+
+test("execute protocol no-action exhausts provider-neutral strategy pivots after compatibility fallback", () => {
   const firstHarness = createExecuteNoToolHarness("en");
   const first = handleExecuteNoToolRecovery(createExecuteNoToolInput(firstHarness, {
     activeProfile: "local",
+    forceXmlTools: true,
     consecutiveNoToolCount: 1,
     protocolViolation: "required_tool_call_missing",
   }));
@@ -1010,6 +1030,7 @@ test("execute protocol no-action exhausts provider-neutral strategy pivots befor
   const secondHarness = createExecuteNoToolHarness("en");
   const second = handleExecuteNoToolRecovery(createExecuteNoToolInput(secondHarness, {
     activeProfile: "cloud",
+    forceXmlTools: true,
     consecutiveNoToolCount: 2,
     protocolViolation: "required_tool_call_missing",
   }));
@@ -1023,6 +1044,7 @@ test("execute protocol no-action exhausts provider-neutral strategy pivots befor
 
   const exhaustedHarness = createExecuteNoToolHarness("en");
   const exhausted = handleExecuteNoToolRecovery(createExecuteNoToolInput(exhaustedHarness, {
+    forceXmlTools: true,
     consecutiveNoToolCount: 3,
     protocolViolation: "required_tool_call_missing",
   }));
@@ -1039,21 +1061,30 @@ test("out-of-surface tool calls are quarantined as protocol recovery", () => {
 
   assert.equal(result.status, "continue");
   assert.equal(harness.appended.length, 1);
+  assert.deepEqual(harness.protocolFallbacks, [
+    "required_native_tool_protocol_violation:required_tool_call_not_available",
+  ]);
+  assert.match(harness.appended[0].content, /XML-compatible/i);
   assert.match(harness.appended[0].content, /outside the active recovery surface/);
   assert.match(harness.appended[0].content, /was not executed/);
   assert.match(harness.appended[0].content, /actually exposed/);
 });
 
-test("active evidence recovery handles protocol violations without opening generic prose recovery", () => {
-  const quietHarness = createExecuteNoToolHarness("en");
-  const quiet = handleExecuteNoToolRecovery(createExecuteNoToolInput(quietHarness, {
+test("active XML evidence recovery records prose as a bounded protocol miss", () => {
+  const contractHarness = createExecuteNoToolHarness("en");
+  const contractMiss = handleExecuteNoToolRecovery(createExecuteNoToolInput(contractHarness, {
     activeProfile: "local",
     forceXmlTools: true,
     protocolViolationOnly: true,
-    visibleText: "I will inspect the source again.",
+    availableToolNames: new Set(["run_command"]),
+    sawExecuteOperationEvidence: true,
+    visibleText: "The changes look correct and should now be validated.",
   }));
-  assert.equal(quiet.status, "none");
-  assert.deepEqual(quietHarness.appended, []);
+  assert.equal(contractMiss.status, "continue");
+  assert.equal(contractMiss.consecutiveNoToolCount, 1);
+  assert.equal(contractHarness.appended.length, 1);
+  assert.match(contractHarness.appended[0].content, /<tool>run_command<\/tool>/);
+  assert.doesNotMatch(contractHarness.appended[0].content, /<tool>read_file<\/tool>/);
 
   const violationHarness = createExecuteNoToolHarness("en");
   const violation = handleExecuteNoToolRecovery(createExecuteNoToolInput(violationHarness, {
@@ -3242,8 +3273,14 @@ test("finite validation checkpoint accepts output merging but not compound shell
   );
 });
 
-test("delegation uses initial fan-out plus runtime-owned lifecycle review waves", () => {
-  const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
+test("collaboration availability is semantic, optional, and independent of path topology", () => {
+  const tools = [
+    "read_file",
+    "spawn_subagent",
+    "wait_subagents",
+    "cancel_subagent",
+    "apply_patch",
+  ].map((name) => ({
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
   }));
@@ -3277,257 +3314,53 @@ test("delegation uses initial fan-out plus runtime-owned lifecycle review waves"
       subagentPreference: "unspecified",
     },
     lastAssistantTextForCheckpoint: "",
-    latestUserPromptText: "可以开启多个 subagent 协同检查",
+    latestUserPromptText: "Inspect the workspace",
     ...overrides,
   });
 
-  const context = resolveIterationToolSurface(makeInput());
-  assert.equal(context.delegationDecision.action, "defer");
-  assert.equal(context.delegationDecision.reason, "insufficient_independent_scope");
-  assert.equal(context.delegationDecision.phase, "context");
-  assert.equal(context.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
-
-  const explicitlyScopedPrompt = resolveIterationToolSurface(makeInput({
-    latestUserPromptText: [
-      "必须先连续调用 spawn_subagent 三次并行分析。",
-      "allowed_paths=src/hooks/useCsvParser.ts,src/hooks/useChartData.ts,src/types/order.ts。",
-      "主体不要重读子智能体租约路径。",
-    ].join("\n"),
-  }));
-  assert.equal(explicitlyScopedPrompt.delegationDecision.preference, "preferred");
-  assert.equal(explicitlyScopedPrompt.delegationDecision.action, "admit");
-  assert.equal(explicitlyScopedPrompt.delegationDecision.independentScopeCount, 3);
-  assert.equal(explicitlyScopedPrompt.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
-
-  const sessionPreferred = resolveIterationToolSurface(makeInput({
-    latestUserPromptText: "检查启动和菜单模块",
+  const unspecified = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: "Inspect src/main.js and src/components/editor.js",
     turnInputContextSignals: {
       imageParts: 0,
-      mentionedFilePaths: ["src/main.js"],
+      mentionedFilePaths: ["src/main.js", "src/components/editor.js"],
       attachedFilePaths: [],
-      subagentPreference: "preferred",
+      subagentPreference: "unspecified",
     },
   }));
-  assert.equal(sessionPreferred.delegationDecision.preference, "preferred");
-  assert.equal(sessionPreferred.delegationDecision.action, "admit");
-  assert.equal(sessionPreferred.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
-
-  const evidenceTools = [
-    ...tools,
-    {
-      type: "function",
-      function: {
-        name: "find_symbol_references",
-        description: "find_symbol_references",
-        parameters: {
-          type: "object",
-          properties: { symbol: { type: "string" } },
-          required: ["symbol"],
-        },
-      },
-    },
-  ];
-  const openEvidenceTopology = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "needs_evidence",
-    rawIterationAllTools: evidenceTools,
-    latestUserPromptText: "Diagnose the editor and save-path symptoms before preparing a Plan",
-    recentPlanToolActivity: [
-      {
-        name: "read_file",
-        target: "src/components/editor.js",
-        status: "succeeded",
-        structuredFacts: [{
-          kind: "event_contract",
-          authority: "runtime_observation",
-          relation: "dom_dispatch",
-          event: "input",
-        }],
-      },
-      {
-        name: "read_file",
-        target: "src/components/toolbar.js",
-        status: "succeeded",
-      },
-    ],
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
-  assert.equal(openEvidenceTopology.delegationDecision.action, "admit");
+  assert.equal(unspecified.delegationDecision.action, "defer");
+  assert.equal(unspecified.delegationDecision.reason, "collaboration_not_enabled");
   assert.equal(
-    openEvidenceTopology.preferredDelegationRequirement.reason,
-    "evidence_topology_open",
-  );
-  assert.equal(openEvidenceTopology.preferredDelegationRequirement.required, false);
-  assert.equal(
-    openEvidenceTopology.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
+    unspecified.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
     false,
-  );
-  assert.equal(openEvidenceTopology.planEvidenceObligation?.kind, "find_symbol_references");
-  assert.equal(openEvidenceTopology.planEvidenceObligation?.symbol, "input");
-  assert.deepEqual(
-    openEvidenceTopology.iterationAllTools.map((tool) => tool.function.name),
-    ["find_symbol_references"],
+    "file and directory counts never manufacture child objectives",
   );
 
-  const earlyDisjointPlanTopology = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "grounding",
-    rawIterationAllTools: evidenceTools,
-    latestUserPromptText: "Trace the frontend event and backend command owners before drafting",
-    recentPlanToolActivity: [{
-      name: "get_project_skeleton",
-      target: "get_project_skeleton",
-      status: "succeeded",
-      discoveryObservation: {
-        kind: "project_structure",
-        targetRefs: [
-          "package.json",
-          "README.md",
-          "src/main.js",
-          "src/components/editor.js",
-          "src-tauri/src/main.rs",
-        ],
-      },
-    }],
+  const preferred = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: "Inspect the editor behavior",
     turnInputContextSignals: {
       imageParts: 0,
-      mentionedFilePaths: [],
+      mentionedFilePaths: ["src/main.js", "src/components/editor.js"],
       attachedFilePaths: [],
       subagentPreference: "preferred",
     },
   }));
-  assert.equal(earlyDisjointPlanTopology.delegationDecision.phase, "diagnostic");
-  assert.equal(earlyDisjointPlanTopology.delegationDecision.action, "admit");
-  assert.equal(earlyDisjointPlanTopology.preferredDelegationRequirement.required, true);
-  assert.deepEqual(
-    earlyDisjointPlanTopology.preferredDelegationRequirement.requiredScopes.map((scope) =>
-      scope.scopeKey
-    ),
-    ["src", "src-tauri"],
-  );
-  assert.deepEqual(
-    earlyDisjointPlanTopology.iterationAllTools.map((tool) => tool.function.name),
-    ["spawn_subagent"],
-    "typed project topology activates preferred delegation before parent source reads or Plan finalization",
-  );
-
-  const earlyScopeContract = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes: earlyDisjointPlanTopology.preferredDelegationRequirement.requiredScopes,
-    maxCreatedPerTurn: 3,
-  });
-  const releasedAfterEarlyCapacityFailure = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "grounding",
-    rawIterationAllTools: evidenceTools,
-    latestUserPromptText: "Trace the frontend event and backend command owners before drafting",
-    recentPlanToolActivity: [{
-      name: "get_project_skeleton",
-      target: "get_project_skeleton",
-      status: "succeeded",
-      discoveryObservation: {
-        kind: "project_structure",
-        targetRefs: ["src/main.js", "src-tauri/src/main.rs"],
-      },
-    }],
-    preferredDelegationScopeContract: earlyScopeContract,
-    preferredDelegationMaterializationBlockedScopeKeys: ["src", "src-tauri"],
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
+  assert.equal(preferred.delegationDecision.action, "admit");
+  assert.equal(preferred.delegationDecision.reason, "explicit_preference");
+  assert.equal("preferredDelegationRequirement" in preferred, false);
+  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "read_file"));
+  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "apply_patch"));
+  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"));
   assert.equal(
-    releasedAfterEarlyCapacityFailure.preferredDelegationRequirement.reason,
-    "runtime_materialization_failed",
-  );
-  assert.equal(
-    releasedAfterEarlyCapacityFailure.preferredDelegationRequirement.contractOpen,
+    preferred.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"),
     false,
-  );
-  assert.equal(
-    releasedAfterEarlyCapacityFailure.iterationAllTools.some((tool) =>
-      tool.function.name === "spawn_subagent"
-    ),
-    false,
-  );
-  assert.equal(
-    releasedAfterEarlyCapacityFailure.iterationAllTools.some((tool) =>
-      tool.function.name === "read_file"
-    ),
-    true,
-    "a rejected preferred materialization releases evidence work back to the parent",
-  );
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
-    "utf8",
-  );
-  assert.doesNotMatch(
-    orchestratorSource,
-    /turnIterationContext\.turn\.status\s*=\s*["']completed["']/,
-    "a control-plane-only delegation iteration cannot publish a false completion",
+    "the model keeps normal phase tools and is not forced to spawn or immediately wait",
   );
 
-  const closedMdViewerTopology = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "drafting",
-    usedPlanReadOnlyConvergencePrompt: true,
-    rawIterationAllTools: evidenceTools,
-    latestUserPromptText: "Prepare the grounded Plan for the editor and save-path symptoms",
-    recentPlanToolActivity: [
-      {
-        name: "read_file",
-        target: "src/components/editor.js",
-        status: "succeeded",
-        structuredFacts: [{
-          kind: "event_contract",
-          authority: "runtime_observation",
-          relation: "dom_dispatch",
-          event: "input",
-        }],
-      },
-      { name: "read_file", target: "src/components/toolbar.js", status: "succeeded" },
-      { name: "read_file", target: "src/components/preview.js", status: "succeeded" },
-      {
-        name: "read_file",
-        target: "src/main.js",
-        status: "succeeded",
-        structuredFacts: [{
-          kind: "event_contract",
-          authority: "runtime_observation",
-          relation: "dom_listener",
-          event: "input",
-        }, {
-          kind: "command_contract",
-          authority: "runtime_observation",
-          relation: "invoke",
-          command: "save_file_content",
-          arguments: ["filePath"],
-        }],
-      },
-      {
-        name: "read_file",
-        target: "src-tauri/src/main.rs",
-        status: "succeeded",
-        structuredFacts: [{
-          kind: "command_contract",
-          authority: "runtime_observation",
-          relation: "handler",
-          command: "save_file_content",
-          arguments: ["file_path"],
-        }],
-      },
-    ],
+  const pending = resolveIterationToolSurface(makeInput({
+    callbacks: {
+      ...makeInput().callbacks,
+      getPendingSubagentIds: () => ["subagent-running"],
+    },
     turnInputContextSignals: {
       imageParts: 0,
       mentionedFilePaths: [],
@@ -3535,176 +3368,11 @@ test("delegation uses initial fan-out plus runtime-owned lifecycle review waves"
       subagentPreference: "preferred",
     },
   }));
-  assert.equal(closedMdViewerTopology.preferredDelegationRequirement.required, true);
-  assert.deepEqual(
-    closedMdViewerTopology.preferredDelegationRequirement.requiredScopes.map((scope) => scope.scopeKey),
-    ["src", "src-tauri"],
-  );
-  assert.deepEqual(
-    closedMdViewerTopology.iterationAllTools.map((tool) => tool.function.name),
-    ["spawn_subagent"],
-  );
+  assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "read_file"));
+  assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"));
+  assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "cancel_subagent"));
 
-  const planDraftCheckpoint = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "drafting",
-    usedPlanReadOnlyConvergencePrompt: true,
-    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
-    recentPlanToolActivity: [
-      {
-        name: "read_file",
-        target: "src/main.js",
-        status: "succeeded",
-      },
-      {
-        name: "read_file",
-        target: "src-tauri/src/main.rs",
-        status: "succeeded",
-      },
-    ],
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
-  assert.equal(planDraftCheckpoint.delegationDecision.phase, "diagnostic");
-  assert.equal(planDraftCheckpoint.delegationDecision.action, "admit");
-  assert.equal(planDraftCheckpoint.preferredDelegationRequirement.required, true);
-  assert.deepEqual(
-    planDraftCheckpoint.iterationAllTools.map((tool) => tool.function.name),
-    ["spawn_subagent"],
-  );
-
-  let settledDelegation = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes,
-    maxCreatedPerTurn: 3,
-  });
-  for (const [index, scope] of settledDelegation.requiredScopes.entries()) {
-    const subagentId = `settled-${index}`;
-    settledDelegation = preferredScopes.recordPreferredDelegationScopeSpawn({
-      contract: settledDelegation,
-      outcome: {
-        subagentId,
-        name: subagentId,
-        status: "queued",
-        scopeKey: scope.scopeKey,
-        allowedPaths: scope.allowedPaths,
-      },
-    });
-    settledDelegation = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-      contract: settledDelegation,
-      outcomes: [{
-        subagentId,
-        scopeKey: scope.scopeKey,
-        status: "completed",
-        closureState: "satisfied",
-        adoptedEvidenceCount: 1,
-        adoptedEvidenceTargets: [scope.allowedPaths[0]],
-        consumed: true,
-      }],
-    });
-  }
-  const satisfiedPlanDraft = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "drafting",
-    usedPlanReadOnlyConvergencePrompt: true,
-    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
-    recentPlanToolActivity: planDraftCheckpoint.preferredDelegationRequirement.candidateScopeKeys
-      .map((target) => ({ name: "read_file", target, status: "succeeded" })),
-    preferredDelegationScopeContract: settledDelegation,
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
-  assert.equal(satisfiedPlanDraft.delegationDecision.phase, "finalization");
-  assert.equal(satisfiedPlanDraft.preferredDelegationRequirement.reason, "all_required_scopes_consumed");
-  assert.deepEqual(satisfiedPlanDraft.iterationAllTools, []);
-
-  let exhaustedDelegation = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes,
-    maxCreatedPerTurn: planDraftCheckpoint.preferredDelegationRequirement.requiredScopes.length,
-  });
-  for (const [index, scope] of exhaustedDelegation.requiredScopes.entries()) {
-    const subagentId = `exhausted-${index}`;
-    exhaustedDelegation = preferredScopes.recordPreferredDelegationScopeSpawn({
-      contract: exhaustedDelegation,
-      outcome: {
-        subagentId,
-        name: subagentId,
-        status: "queued",
-        scopeKey: scope.scopeKey,
-        allowedPaths: scope.allowedPaths,
-      },
-    });
-    exhaustedDelegation = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-      contract: exhaustedDelegation,
-      outcomes: [{
-        subagentId,
-        scopeKey: scope.scopeKey,
-        status: "degraded",
-        closureState: "partial",
-        adoptedEvidenceCount: 1,
-        adoptedEvidenceTargets: [scope.allowedPaths[0]],
-        consumed: false,
-      }],
-    });
-  }
-  const exhaustedPlanGrounding = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "grounding",
-    latestUserPromptText: "Inspect src/main.js and src-tauri/src/main.rs before planning",
-    recentPlanToolActivity: [
-      { name: "read_file", target: "src/main.js", status: "succeeded" },
-      { name: "read_file", target: "src-tauri/src/main.rs", status: "succeeded" },
-    ],
-    preferredDelegationScopeContract: exhaustedDelegation,
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
-  assert.equal(exhaustedPlanGrounding.preferredDelegationRequirement.contractOpen, false);
-  assert.equal(exhaustedPlanGrounding.preferredDelegationRequirement.reason, "scope_creation_capacity_reached");
-  assert.ok(exhaustedPlanGrounding.iterationAllTools.length > 0);
-  assert.equal(
-    exhaustedPlanGrounding.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
-    false,
-  );
-
-  const singleScopePlanDraft = resolveIterationToolSurface(makeInput({
-    workflowMode: "plan",
-    runtimeIntent: "plan",
-    planRuntimePhase: "drafting",
-    usedPlanReadOnlyConvergencePrompt: true,
-    latestUserPromptText: "Inspect the confirmed evidence and prepare the plan",
-    recentPlanToolActivity: [{
-      name: "read_file",
-      target: "src/main.js",
-      status: "succeeded",
-    }],
-    turnInputContextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: [],
-      attachedFilePaths: [],
-      subagentPreference: "preferred",
-    },
-  }));
-  assert.equal(singleScopePlanDraft.delegationDecision.phase, "finalization");
-  assert.equal(singleScopePlanDraft.preferredDelegationRequirement.required, false);
-  assert.deepEqual(singleScopePlanDraft.iterationAllTools, []);
-
-  const sessionForbidden = resolveIterationToolSurface(makeInput({
-    latestUserPromptText: "检查启动和菜单模块",
+  const forbidden = resolveIterationToolSurface(makeInput({
     turnInputContextSignals: {
       imageParts: 0,
       mentionedFilePaths: [],
@@ -3712,66 +3380,29 @@ test("delegation uses initial fan-out plus runtime-owned lifecycle review waves"
       subagentPreference: "forbidden",
     },
   }));
-  assert.equal(sessionForbidden.delegationDecision.reason, "user_forbidden");
-  assert.equal(sessionForbidden.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+  assert.equal(forbidden.delegationDecision.reason, "user_forbidden");
+  assert.equal(
+    forbidden.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
+    false,
+  );
 
   const mutation = resolveIterationToolSurface(makeInput({
-    recentToolActivity: [
-      {
-        name: "apply_patch",
-        target: "src/main.js",
-        status: "succeeded",
-        mutationObserved: true,
-      },
-      {
-        name: "read_file",
-        target: "src/main.js",
-        status: "succeeded",
-      },
-      {
-        name: "read_file",
-        target: "src/components/toolbar.js",
-        status: "succeeded",
-      },
-    ],
+    recentToolActivity: [{
+      name: "apply_patch",
+      target: "src/main.js",
+      status: "succeeded",
+      mutationObserved: true,
+    }],
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
   }));
-  assert.equal(mutation.delegationDecision.action, "admit");
   assert.equal(mutation.delegationDecision.phase, "mutation");
-  assert.equal(mutation.preferredDelegationRequirement.required, true);
-  assert.equal(mutation.preferredDelegationRequirement.lifecyclePhase, "mutation");
-  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
-  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"), false);
-
-  const validation = resolveIterationToolSurface(makeInput({
-    recentToolActivity: [
-      {
-        name: "run_command",
-        target: "npm test",
-        status: "succeeded",
-      },
-      {
-        name: "read_file",
-        target: "src/main.js",
-        status: "succeeded",
-      },
-      {
-        name: "read_file",
-        target: "src/components/toolbar.js",
-        status: "succeeded",
-      },
-    ],
-  }));
-  assert.equal(validation.delegationDecision.action, "admit");
-  assert.equal(validation.delegationDecision.phase, "validation");
-  assert.equal(validation.preferredDelegationRequirement.required, true);
-  assert.equal(validation.preferredDelegationRequirement.lifecyclePhase, "validation");
-  assert.equal(validation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
-
-  const simple = resolveIterationToolSurface(makeInput({
-    latestUserPromptText: "读取 src/main.js",
-  }));
-  assert.equal(simple.delegationDecision.reason, "insufficient_independent_scope");
-  assert.equal(simple.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+  assert.equal(mutation.delegationDecision.action, "admit");
+  assert.ok(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"));
 });
 
 test("parent mutation requires every delegated source window, not only the latest one", () => {
@@ -3860,9 +3491,8 @@ test("plan checklist length is telemetry, not an independent-scope admission sig
     latestUserPromptText: "Inspect the repository and prepare a plan",
   });
 
-  assert.equal(decision.delegationDecision.plannedWorkItemCount, 5);
-  assert.equal(decision.delegationDecision.independentScopeCount, 0);
   assert.equal(decision.delegationDecision.action, "defer");
+  assert.equal(decision.delegationDecision.reason, "collaboration_not_enabled");
   assert.equal(decision.availableToolNames.has("spawn_subagent"), false);
 });
 
@@ -4947,6 +4577,55 @@ test("patch mismatch recovery reuses versioned observations without cache bypass
 });
 
 test("mutation mismatch grants only a precise one-shot read and otherwise reuses retained source", () => {
+  const noEffectDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "normal",
+    results: [{
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+      isError: true,
+      lifecycleState: "blocked",
+      mutationPreflightReason: "empty_change",
+    }],
+  });
+  assert.equal(noEffectDecision?.mode, "mutation_first");
+  assert.equal(noEffectDecision?.reason, "mutation_preflight_no_effect");
+  assert.equal(noEffectDecision?.readLease, null);
+  assert.equal(
+    noEffectDecision?.protocolNoProgressFingerprint,
+    "mutation_no_effect::src/main.js",
+  );
+  const noEffectPrompt = buildExecuteRecoveryPrompt({
+    language: "zh",
+    reason: noEffectDecision.reason,
+    contract: resolveExecuteRecoveryActionContract(noEffectDecision.mode, {
+      expectedTarget: noEffectDecision.target,
+      sourceObservationKey: noEffectDecision.sourceObservationKey,
+      decisionCheckpoint: noEffectDecision.decisionCheckpoint,
+    }),
+    repeatedTargets: [noEffectDecision.target],
+  });
+  assert.match(noEffectPrompt, /没有产生任何状态变化/);
+  assert.match(noEffectPrompt, /不要重读/);
+
+  const identicalWriteDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "normal",
+    results: [{
+      name: "write_file",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+      isError: true,
+      lifecycleState: "blocked",
+      mutationPreflightReason: "identical_content",
+    }],
+  });
+  assert.equal(identicalWriteDecision?.reason, "mutation_preflight_no_effect");
+  assert.equal(identicalWriteDecision?.readLease, null);
+
   const replaceDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
     runtimeIntent: "execute",

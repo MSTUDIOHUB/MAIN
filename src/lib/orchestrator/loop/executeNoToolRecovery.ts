@@ -116,7 +116,7 @@ export function handleExecuteNoToolRecovery(input: {
     | "required_tool_call_missing"
     | "required_function_call_mismatch"
     | "required_tool_call_not_available";
-  /** Active evidence recovery only needs transport correction here. */
+  /** Active evidence recovery owns the capability and treats XML prose as a protocol miss. */
   protocolViolationOnly?: boolean;
   assistantMsgId: string;
   consecutiveNoToolCount: number;
@@ -175,6 +175,44 @@ export function handleExecuteNoToolRecovery(input: {
         protocolViolation: input.protocolViolation,
       },
     );
+    const compatibilityFallbackAlreadyActive =
+      forceXmlTools ||
+      callbacks.shouldForceXmlForProviderCompatibility?.() === true;
+    if (
+      !compatibilityFallbackAlreadyActive &&
+      callbacks.onProviderCompatibilityFallback
+    ) {
+      const fallbackReason =
+        `required_native_tool_protocol_violation:${input.protocolViolation}`;
+      callbacks.onProviderCompatibilityFallback(fallbackReason);
+      logAgentEvent("execute_required_tool_protocol_compatibility_fallback", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        runtimeIntent,
+        protocolViolation: input.protocolViolation,
+        availableTools: Array.from(availableToolNames),
+        action: "switch_to_xml_tools",
+        providerNeutral: true,
+      });
+      const violationInstruction =
+        input.protocolViolation === "required_function_call_mismatch"
+          ? "The runtime required one specific function; the mismatched call was not executed. Call exactly the named tool exposed by the active recovery contract."
+          : input.protocolViolation === "required_tool_call_not_available"
+          ? "The returned tool was outside the active recovery surface and was not executed. Call one capability that is actually exposed."
+          : "The previous response returned zero tool calls while one was required. Call exactly one exposed capability.";
+      callbacks.appendMessage({
+        role: "user",
+        content: [
+          "TOOL_PROTOCOL_COMPATIBILITY_FALLBACK: Native required-tool transport did not produce a valid executable call.",
+          "The runtime switched this provider lane to the XML-compatible formal tool envelope for the next bounded attempt.",
+          violationInstruction,
+          `Available capabilities: ${Array.from(availableToolNames).join(", ") || "(active recovery contract)"}.`,
+          "Do not restart analysis, emit progress prose, or claim completion before the tool result.",
+        ].join("\n"),
+      });
+      return finish("continue");
+    }
     const protocolCheckpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
     if (consecutiveNoToolCount >= protocolCheckpointLimit) {
       const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
@@ -235,9 +273,17 @@ export function handleExecuteNoToolRecovery(input: {
     });
     return finish("continue");
   }
-  if (input.protocolViolationOnly) return finish("none");
-
+  const activeRecoveryXmlTextWithoutAction = Boolean(
+    input.protocolViolationOnly &&
+    isExecuteRuntime &&
+    forceXmlTools &&
+    availableToolNames.size > 0 &&
+    effectiveToolCallCount === 0 &&
+    (!shouldPauseForUserChoice || finalReplyOptionsCount === 0) &&
+    visibleText.replace(/\s+/g, " ").trim(),
+  );
   const shouldRecoverExecuteXmlText =
+    activeRecoveryXmlTextWithoutAction ||
     shouldRecoverExecuteXmlTextWithoutAction({
       workflowMode,
       turnIntent,
@@ -261,6 +307,7 @@ export function handleExecuteNoToolRecovery(input: {
       runtimeIntent,
       visibleChars: visibleText.length,
       availableToolCount: availableToolNames.size,
+      activeRecoveryContract: activeRecoveryXmlTextWithoutAction,
     });
 
     const executeCheckpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
@@ -320,6 +367,8 @@ export function handleExecuteNoToolRecovery(input: {
     });
     return finish("continue");
   }
+
+  if (input.protocolViolationOnly) return finish("none");
 
   return finish("none");
 }

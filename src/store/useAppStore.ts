@@ -4137,6 +4137,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "goal.cleared",
     "subagent.created",
     "subagent.updated",
+    "subagent.completed",
     "subagent.closed",
     "subagent.dismissed",
     "subagent.handed_back",
@@ -7697,7 +7698,11 @@ function resolveCurrentSessionModeAffinityFromState(state: any): SessionModeAffi
 export function buildEmptySessionRuntimeSnapshot(
   state: any,
   affinity: SessionModeAffinity,
-  owner: { sessionKey: string; sessionEpoch: string; createdAt: number },
+  owner: {
+    sessionKey: string | null;
+    sessionEpoch: string | null;
+    createdAt: number;
+  },
 ): SessionRuntimeSnapshot {
   const selectedMainModeKey = normalizeSessionModeAffinity(affinity, "main_mode");
   const previousImageStudio = normalizeImageStudioRuntime(
@@ -7734,10 +7739,13 @@ export function buildEmptySessionRuntimeSnapshot(
     planExecutionEvidenceCount: 0,
     planAutoResumeCount: 0,
     planExecutionProgressSnapshot: null,
-    planLifecycle: createEmptyPlanLifecycleForSession(owner.sessionKey, {
-      sessionEpoch: owner.sessionEpoch,
-      now: owner.createdAt,
-    }),
+    planLifecycle: createEmptyPlanLifecycleForSession(
+      owner.sessionKey,
+      {
+        ...(owner.sessionEpoch ? { sessionEpoch: owner.sessionEpoch } : {}),
+        now: owner.createdAt,
+      },
+    ),
     planStage: "idle",
     isPlanApproved: false,
     planApprovalChoice: null,
@@ -7761,11 +7769,13 @@ export function buildEmptySessionRuntimeSnapshot(
     approvedShellPermissionRules: [],
     queuedUserMessage: null,
     activeGuidance: null,
-    workspaceTurnQueue: owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+    workspaceTurnQueue: !owner.sessionKey
+      || owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
       ? null
       : createWorkspaceTurnQueueState({
           sessionKey: owner.sessionKey,
-          sessionEpoch: owner.sessionEpoch,
+          sessionEpoch: owner.sessionEpoch
+            || createPlanLifecycleSessionEpoch(owner.createdAt),
           updatedAt: owner.createdAt,
         }),
     workspaceInstructionLedger: [],
@@ -9504,7 +9514,10 @@ export const useAppStore = create<AppState>()(
           threadId: run.threadId,
           turnId: run.parentTurnId,
           timestampMs,
+          collaborationTaskId: run.collaborationTaskId,
           subagentId,
+          runId: run.runId,
+          parentRunId: run.parentRunId,
           patch: {
             status: "canceled",
             updatedAt: timestampMs,
@@ -9522,7 +9535,10 @@ export const useAppStore = create<AppState>()(
           threadId: run.threadId,
           turnId: run.parentTurnId,
           timestampMs,
+          collaborationTaskId: run.collaborationTaskId,
           subagentId,
+          runId: run.runId,
+          parentRunId: run.parentRunId,
           closedAt: timestampMs,
           reason: "runtime_controller_missing",
         }),

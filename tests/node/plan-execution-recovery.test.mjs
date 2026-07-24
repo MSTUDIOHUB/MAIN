@@ -3050,6 +3050,42 @@ test("direct Execute converges at the same bounded checkpoint and validates exis
   assert.equal(appended.length, 1);
 });
 
+test("direct Execute convergence preserves an unfinished mutation transaction", () => {
+  const appended = [];
+  const activations = [];
+  const callbacks = {
+    appendMessage: (message) => appended.push(message),
+    getIsPlanApproved: () => false,
+    getCurrentTurnId: () => "turn-direct",
+    getPlanTasks: () => [],
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "earlier-write",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "replace_in_file",
+      transactionId: "turn-direct",
+      createdAt: 1,
+    }],
+  };
+
+  const result = handleExecuteConvergencePrompt({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 12,
+    effectiveMaxIterations: 50,
+    usedExecuteConvergencePrompt: false,
+    recentToolActivity: [],
+    executeRecoveryMode: "mutation_first",
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+
+  assert.equal(result.usedExecuteConvergencePrompt, true);
+  assert.deepEqual(activations, []);
+  assert.deepEqual(appended, []);
+});
+
 test("approved plan convergence moves to validation after composite task source evidence is satisfied", () => {
   const appended = [];
   const activations = [];

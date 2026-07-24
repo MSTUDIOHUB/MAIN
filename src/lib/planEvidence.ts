@@ -1351,7 +1351,7 @@ export function formatPlanEvidenceBundleForModel(
             "Evidence gate: OPEN. Do not draft or claim a root cause yet.",
             "Required contract counterpart(s):",
             ...unresolvedContracts,
-            "Obtain exactly one targeted observation for a missing owner through the capability permitted by the current action contract. If collaboration is required, spawn one scoped read-only subagent for that owner; otherwise read/search it directly. Then reassess the frozen evidence.",
+            "Obtain exactly one targeted observation for a missing owner through the capability permitted by the current action contract. If an independently successful semantic investigation has worthwhile parallel value and spawn_subagent is available, you may delegate it as a complete one-shot read task; otherwise read/search it directly. Then reassess the frozen evidence.",
           ]
         : []),
       "Use this exact bundle for the plan. Do not quote the bundle id/hash or this wrapper in visible output.",

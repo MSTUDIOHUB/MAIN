@@ -44,20 +44,7 @@ import {
   type VisualContextDeliveryStatus,
 } from "../../visualContext";
 import { resolveEffectiveSubagentDelegationPreference } from "../../turnIntake";
-import {
-  resolveSubagentCapacityPolicy,
-  type PreferredDelegationRequirement,
-} from "../../subagents";
-import {
-  activatePreferredDelegationScopeContract,
-  applyPreferredDelegationScopeJoinOutcomes,
-  getPreferredDelegationScopeProgress,
-  materializePreferredDelegationScopesEarly,
-  normalizeRequiredPreferredDelegationScopeCalls,
-  recordPreferredDelegationScopeSpawn,
-  type PreferredDelegationScopeContract,
-  type PreferredDelegationScopeJoinOutcome,
-} from "../../preferredDelegationScopes";
+import type { CollaborationTaskJoinOutcome } from "../../subagents";
 import { restoreDurableTurnPlanningActivities } from "../../turnRuntimeCheckpoint";
 import {
   getFileReadObservationForState,
@@ -314,6 +301,8 @@ export class AgentOrchestrator {
           unityScriptEditRequested,
           gameStudioScriptEditRequested,
           subagentDepth: callbacks.getSubagentDepth?.() ?? 0,
+          subagentAccessMode:
+            callbacks.getSubagentScope?.()?.accessMode || "read",
           webSearchEnabled: callbacks.getWebSearchEnabled?.() === true,
           enabledKnowledgeBaseIds: callbacks.getEnabledKnowledgeBaseIds?.() || [],
         });
@@ -340,10 +329,6 @@ export class AgentOrchestrator {
           workflowMode,
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
-        let preferredDelegationScopeContract: PreferredDelegationScopeContract | null =
-          checkpointOwnsCurrentTurn
-            ? restoredTurnRuntimeCheckpoint.planning.preferredDelegationScopeContract
-            : null;
         if (checkpointOwnsCurrentTurn) {
           const restoredPlanningActivities = restoreDurableTurnPlanningActivities(
             restoredTurnRuntimeCheckpoint,
@@ -353,8 +338,8 @@ export class AgentOrchestrator {
           loopState.recentToolActivity.push(...restoredPlanningActivities);
           callbacks.onDebugEvent?.("agent.turn_runtime_planning_checkpoint_restored", {
             checkpointRevision: restoredTurnRuntimeCheckpoint.revision,
-            preferredRegistrationCount:
-              preferredDelegationScopeContract?.registrations.length || 0,
+            collaborationEntryCount:
+              restoredTurnRuntimeCheckpoint.planning.collaborationLedger?.entries.length || 0,
             adoptedEvidenceCount: restoredPlanningActivities.length,
           });
         } else if (restoredTurnRuntimeCheckpoint) {
@@ -364,54 +349,41 @@ export class AgentOrchestrator {
             checkpointTurnId: restoredTurnRuntimeCheckpoint.owner.turnId,
           });
         }
-        let preferredDelegationRequirementActivations = 0;
-        let lastPreferredDelegationRequirement: PreferredDelegationRequirement | null = null;
-        const preferredDelegationMaterializationAttemptedScopeKeys = new Set<string>();
-        const preferredDelegationMaterializationBlockedScopeKeys = new Set<string>();
-        const publishPreferredDelegationCheckpoint = async () => {
+        const publishCollaborationCheckpoint = async () => {
           await callbacks.publishTurnRuntimePlanningCheckpoint?.({
-            preferredDelegationScopeContract,
             recentPlanToolActivity: loopState.recentPlanToolActivity,
             updatedAt: Date.now(),
           });
         };
-        const applyAndEmitPreferredDelegationScopeOutcomes = async (
-          outcomes: PreferredDelegationScopeJoinOutcome[],
+        const emitCollaborationTaskOutcomes = async (
+          outcomes: CollaborationTaskJoinOutcome[],
           joinBoundary:
-            | "preferred_early_materialization"
             | "plan_finalization"
             | "parent_final_response"
             | "explicit_wait",
         ) => {
-          preferredDelegationScopeContract = applyPreferredDelegationScopeJoinOutcomes({
-            contract: preferredDelegationScopeContract,
-            outcomes,
-          });
-          const appliedContract = preferredDelegationScopeContract;
-          await publishPreferredDelegationCheckpoint();
-          callbacks.onDebugEvent?.("agent.preferred_delegation_scope_outcomes", {
+          await publishCollaborationCheckpoint();
+          callbacks.onDebugEvent?.("agent.collaboration_task_outcomes", {
             iteration: loopState.iteration,
             joinBoundary,
-            outcomes: outcomes.map((outcome) => {
-              const registration = appliedContract?.registrations.find((candidate) =>
-                candidate.subagentId === outcome.subagentId &&
-                candidate.childScopeKey === outcome.scopeKey
-              );
-              return {
-                subagentId: outcome.subagentId,
-                scopeKey: outcome.scopeKey,
-                status: outcome.status,
-                closureState: outcome.closureState,
-                adoptedEvidenceCount: outcome.adoptedEvidenceCount,
-                adoptedEvidenceTargets: outcome.adoptedEvidenceTargets,
-                // Emit the reconciled contract truth. The raw child outcome may
-                // claim consumed before scope identity/ownership validation.
-                consumed: registration?.state === "consumed",
-              };
-            }),
+            outcomes: outcomes.map((outcome) => ({
+              subagentId: outcome.subagentId,
+              collaborationTaskId: outcome.collaborationTaskId,
+              taskKey: outcome.taskKey,
+              status: outcome.status,
+              closureState: outcome.closureState,
+              adoptedEvidenceCount: outcome.adoptedEvidenceCount,
+              adoptedEvidenceTargets: outcome.adoptedEvidenceTargets,
+              evidenceAdopted: outcome.evidenceAdopted,
+              terminalComplete: outcome.terminalComplete,
+            })),
             providerNeutral: true,
           });
-          return getPreferredDelegationScopeProgress(preferredDelegationScopeContract);
+          return {
+            adoptedTaskIds: outcomes
+              .filter((outcome) => outcome.evidenceAdopted)
+              .map((outcome) => outcome.collaborationTaskId),
+          };
         };
         const publishExecuteRecoveryState = () => {
           this.latestExecuteRecoveryState = {
@@ -702,19 +674,17 @@ export class AgentOrchestrator {
             reason: "plan_finalization",
           });
           if (joinResult.joined) {
-            const delegationProgress = await applyAndEmitPreferredDelegationScopeOutcomes(
-              joinResult.scopeOutcomes,
+            const delegationProgress = await emitCollaborationTaskOutcomes(
+              joinResult.taskOutcomes,
               "plan_finalization",
             );
-            if (delegationProgress.consumedScopeKeys.length > 0 && joinResult.adoptedEvidenceCount > 0) {
-              callbacks.onDebugEvent?.("agent.preferred_delegation_consumed", {
+            if (delegationProgress.adoptedTaskIds.length > 0 && joinResult.adoptedEvidenceCount > 0) {
+              callbacks.onDebugEvent?.("agent.semantic_collaboration_evidence_consumed", {
                 iteration,
-                requirementActivations: preferredDelegationRequirementActivations,
                 pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
                 joinBoundary: "plan_finalization",
                 adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
-                consumedScopeKeys: delegationProgress.consumedScopeKeys,
-                remainingScopes: delegationProgress.remainingScopes,
+                adoptedTaskIds: delegationProgress.adoptedTaskIds,
                 providerNeutral: true,
               });
             }
@@ -730,16 +700,13 @@ export class AgentOrchestrator {
             if (joinedEvidenceReadiness.status === "ready_for_plan") {
               setPlanRuntimePhase("drafting", "joined evidence passed Plan readiness gate");
             } else {
-              if (preferredDelegationScopeContract) {
-                callbacks.onDebugEvent?.("agent.preferred_delegation_joined_without_evidence", {
-                  iteration,
-                  requirementActivations: preferredDelegationRequirementActivations,
-                  resultIds: joinResult.resultIds,
-                  sourceEvidenceCount: joinResult.sourceEvidenceCount,
-                  joinBoundary: "plan_finalization",
-                  providerNeutral: true,
-                });
-              }
+              callbacks.onDebugEvent?.("agent.semantic_collaboration_joined_without_evidence", {
+                iteration,
+                resultIds: joinResult.resultIds,
+                sourceEvidenceCount: joinResult.sourceEvidenceCount,
+                joinBoundary: "plan_finalization",
+                providerNeutral: true,
+              });
               setPlanRuntimePhase(
                 "needs_evidence",
                 joinedEvidenceReadiness.reason,
@@ -772,13 +739,6 @@ export class AgentOrchestrator {
           iterationContext: turnIterationContext,
           turnInputContextSignals,
           latestUserPromptText,
-          preferredDelegationScopeContract,
-          preferredDelegationMaterializationBlockedScopeKeys: [
-            ...new Set([
-              ...preferredDelegationMaterializationAttemptedScopeKeys,
-              ...preferredDelegationMaterializationBlockedScopeKeys,
-            ]),
-          ],
           recentToolActivity: loopState.recentToolActivity,
           recentPlanToolActivity: loopState.recentPlanToolActivity,
           lastAssistantTextForCheckpoint:
@@ -795,38 +755,6 @@ export class AgentOrchestrator {
           loopState,
           iterationStreamPreparation,
         );
-        lastPreferredDelegationRequirement =
-          iterationStreamPreparation.toolSurfaceDecision.preferredDelegationRequirement;
-        if (lastPreferredDelegationRequirement.required) {
-          const previousContract = preferredDelegationScopeContract;
-          preferredDelegationScopeContract = activatePreferredDelegationScopeContract(
-            preferredDelegationScopeContract,
-            lastPreferredDelegationRequirement,
-            resolveSubagentCapacityPolicy(config).maxCreatedPerTurn,
-          );
-          if (preferredDelegationScopeContract !== previousContract) {
-            // Attempts are scoped to one collaboration wave. A settled
-            // diagnostic/review wave must not consume the capacity of a later
-            // phase in the same parent Turn.
-            preferredDelegationMaterializationAttemptedScopeKeys.clear();
-            preferredDelegationMaterializationBlockedScopeKeys.clear();
-            await publishPreferredDelegationCheckpoint();
-            callbacks.onDebugEvent?.("agent.preferred_delegation_lifecycle_wave_opened", {
-              iteration,
-              wave: preferredDelegationScopeContract?.wave || null,
-              lifecyclePhase:
-                preferredDelegationScopeContract?.lifecyclePhase || null,
-              scopeFingerprint:
-                preferredDelegationScopeContract?.scopeFingerprint || null,
-              scopeKeys:
-                preferredDelegationScopeContract?.requiredScopes.map((scope) =>
-                  scope.scopeKey
-                ) || [],
-              providerNeutral: true,
-            });
-          }
-          preferredDelegationRequirementActivations += 1;
-        }
         publishExecuteRecoveryState();
         if (iterationStreamPreparation.recoveryPause) {
           const pause = iterationStreamPreparation.recoveryPause;
@@ -872,128 +800,6 @@ export class AgentOrchestrator {
           return;
         }
 
-        if (lastPreferredDelegationRequirement.required) {
-          const collaborationRuntimeAvailable =
-            !!callbacks.runSubagent && !!callbacks.waitSubagents;
-          const materialization = await materializePreferredDelegationScopesEarly({
-            requirement: lastPreferredDelegationRequirement,
-            parentObjective: latestUserPromptText,
-            attemptedScopeKeys: preferredDelegationMaterializationAttemptedScopeKeys,
-            runSubagent: collaborationRuntimeAvailable
-              ? callbacks.runSubagent
-              : undefined,
-            signal: abortController.signal,
-          });
-          callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_decision", {
-            iteration,
-            action: materialization.plan.action,
-            reason: materialization.plan.reason,
-            obligation: materialization.plan.obligation,
-            blockedBy: materialization.plan.blockedBy,
-            scopeKeys: materialization.plan.requests.map((entry) => entry.scopeKey),
-            collaborationRuntimeAvailable,
-            providerNeutral: true,
-          });
-
-          if (
-            materialization.plan.action === "skip" &&
-            materialization.plan.reason === "runtime_spawn_unavailable"
-          ) {
-            for (const scope of lastPreferredDelegationRequirement.remainingScopes) {
-              preferredDelegationMaterializationAttemptedScopeKeys.add(scope.scopeKey);
-              preferredDelegationMaterializationBlockedScopeKeys.add(scope.scopeKey);
-            }
-            callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_outcome", {
-              iteration,
-              admittedScopeKeys: [],
-              failedScopes: lastPreferredDelegationRequirement.remainingScopes.map((scope) => ({
-                scopeKey: scope.scopeKey,
-                kind: "runtime_error",
-                reason: "collaboration_runtime_unavailable",
-              })),
-              parentFallback: "release_scope_obligation",
-              providerNeutral: true,
-            });
-            continue;
-          }
-
-          if (materialization.plan.action === "materialize") {
-            for (const scopeKey of materialization.attemptedScopeKeys) {
-              preferredDelegationMaterializationAttemptedScopeKeys.add(scopeKey);
-            }
-            for (const failure of materialization.failures) {
-              preferredDelegationMaterializationBlockedScopeKeys.add(failure.scopeKey);
-            }
-
-            const previousRegistrationCount =
-              preferredDelegationScopeContract?.registrations.length || 0;
-            for (const outcome of materialization.outcomes) {
-              if (outcome.subagentId === null) continue;
-              preferredDelegationScopeContract = recordPreferredDelegationScopeSpawn({
-                contract: preferredDelegationScopeContract,
-                outcome,
-              });
-              callbacks.onDebugEvent?.("agent.preferred_delegation_spawned", {
-                iteration,
-                requirementActivations: preferredDelegationRequirementActivations,
-                pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
-                subagentId: outcome.subagentId,
-                scopeKey: outcome.scopeKey,
-                allowedPaths: outcome.allowedPaths,
-                materialization: "runtime_early",
-              });
-            }
-            if (
-              (preferredDelegationScopeContract?.registrations.length || 0) !==
-              previousRegistrationCount
-            ) {
-              await publishPreferredDelegationCheckpoint();
-            }
-
-            const admittedScopeKeys = materialization.outcomes.flatMap((outcome) =>
-              outcome.subagentId === null ? [] : [outcome.scopeKey]
-            );
-            callbacks.onDebugEvent?.("agent.preferred_delegation_early_materialization_outcome", {
-              iteration,
-              admittedScopeKeys,
-              failures: materialization.failures,
-              parentFallback: materialization.failures.length > 0
-                ? "release_failed_scopes"
-                : "none",
-              providerNeutral: true,
-            });
-
-            if (admittedScopeKeys.length > 0) {
-              const joinResult = await joinPendingSubagentsForParent({
-                callbacks,
-                recentToolActivity: loopState.recentToolActivity,
-                recentPlanToolActivity: loopState.recentPlanToolActivity,
-                reason: "preferred_early_materialization",
-              });
-              if (joinResult.joined) {
-                const delegationProgress = await applyAndEmitPreferredDelegationScopeOutcomes(
-                  joinResult.scopeOutcomes,
-                  "preferred_early_materialization",
-                );
-                callbacks.onDebugEvent?.("agent.preferred_delegation_consumed", {
-                  iteration,
-                  requirementActivations: preferredDelegationRequirementActivations,
-                  pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
-                  joinBoundary: "preferred_early_materialization",
-                  adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
-                  consumedScopeKeys: delegationProgress.consumedScopeKeys,
-                  remainingScopes: delegationProgress.remainingScopes,
-                  providerNeutral: true,
-                });
-              }
-            }
-
-            // This was a control-plane-only iteration: no provider stream was
-            // opened. Recompute Plan/evidence state from the joined observations
-            // before allowing another parent read or any draft synthesis.
-            continue;
-          }
-        }
         const {
           runtimeIntent,
           finalTextOnlyStep,
@@ -1063,8 +869,6 @@ export class AgentOrchestrator {
           executeRecoveryStreamMaxElapsedMs: EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
           providerCompatibilityPlanAuthoringCard,
-          preferredDelegationRequired:
-            toolSurfaceDecision.preferredDelegationRequirement.required,
           planEvidenceObligationRequired:
             !!toolSurfaceDecision.planEvidenceObligation,
           planCandidateRepairActive:
@@ -1334,8 +1138,6 @@ export class AgentOrchestrator {
           toolCatalog,
           webSearchEnabled,
           latestUserPromptText,
-          preferredDelegationRequired:
-            toolSurfaceDecision.preferredDelegationRequirement.required,
           repairExecutionRequestInChat,
           commandDirectiveAction: commandDirective?.action,
           unityConsoleDiagnosticsRequested,
@@ -1355,8 +1157,8 @@ export class AgentOrchestrator {
           emitTurnCompletedEvent,
           emitTaskOrchestratorPhase,
           emitPlanExecutionProgress,
-          onSubagentScopeOutcomes: async (outcomes) => {
-            await applyAndEmitPreferredDelegationScopeOutcomes(
+          onCollaborationTaskOutcomes: async (outcomes) => {
+            await emitCollaborationTaskOutcomes(
               outcomes,
               "parent_final_response",
             );
@@ -1408,22 +1210,16 @@ export class AgentOrchestrator {
         if (assistantIterationPhase.status === "stopped") {
           if (
             effectiveSubagentPreference === "preferred" &&
-            !getPreferredDelegationScopeProgress(preferredDelegationScopeContract).satisfied
+            (callbacks.getPendingSubagentIds?.().length || 0) === 0
           ) {
-            callbacks.onDebugEvent?.("preferred_delegation_not_used", {
+            callbacks.onDebugEvent?.("collaboration_preference_not_used", {
               iteration,
-              reason: preferredDelegationRequirementActivations > 0
-                ? "required_delegation_protocol_not_satisfied"
-                : lastPreferredDelegationRequirement?.reason ||
-                  (availableToolNames.has("spawn_subagent")
-                    ? "model_declined_after_admission"
-                    : "phase_scope_or_capacity_not_admitted"),
+              reason: availableToolNames.has("spawn_subagent")
+                ? "model_declined_after_admission"
+                : toolSurfaceDecision.delegationDecision.reason,
               workflowMode,
               runtimeIntent,
               spawnToolExposed: availableToolNames.has("spawn_subagent"),
-              requirementActivations: preferredDelegationRequirementActivations,
-              candidateScopeKeys:
-                lastPreferredDelegationRequirement?.candidateScopeKeys || [],
               recentToolNames: [...new Set(loopState.recentToolActivity.map((activity) => activity.name))].slice(0, 12),
             });
           }
@@ -1447,23 +1243,7 @@ export class AgentOrchestrator {
           finalReplyOptionCount,
           hasStructuredProposal,
         } = assistantIterationPhase;
-        const executionToolCalls =
-          normalizeRequiredPreferredDelegationScopeCalls(
-            effectiveToolCalls,
-            toolSurfaceDecision.preferredDelegationRequirement,
-          );
-        const normalizedReviewerCalls = executionToolCalls.filter((call, index) =>
-          call.arguments !== effectiveToolCalls[index]?.arguments
-        );
-        if (normalizedReviewerCalls.length > 0) {
-          callbacks.onDebugEvent?.("agent.preferred_delegation_reviewer_normalized", {
-            iteration,
-            toolCallIds: normalizedReviewerCalls.map((call) => call.id),
-            normalizedCount: normalizedReviewerCalls.length,
-            reason: "required_pre_draft_independent_review",
-            providerNeutral: true,
-          });
-        }
+        const executionToolCalls = effectiveToolCalls;
 
         const toolIterationPhase = await handleToolIterationPhase({
           callbacks,
@@ -1521,28 +1301,18 @@ export class AgentOrchestrator {
           activateChatFinalSynthesis,
           pauseForReviewablePlanArtifact,
           onSubagentSpawnCreated: async (outcome) => {
-            const previousRegistrationCount =
-              preferredDelegationScopeContract?.registrations.length || 0;
-            preferredDelegationScopeContract = recordPreferredDelegationScopeSpawn({
-              contract: preferredDelegationScopeContract,
-              outcome,
-            });
-            if (
-              (preferredDelegationScopeContract?.registrations.length || 0) ===
-              previousRegistrationCount
-            ) return;
-            await publishPreferredDelegationCheckpoint();
-            callbacks.onDebugEvent?.("agent.preferred_delegation_spawned", {
+            await publishCollaborationCheckpoint();
+            callbacks.onDebugEvent?.("agent.semantic_collaboration_task_spawned", {
               iteration,
-              requirementActivations: preferredDelegationRequirementActivations,
               pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
               subagentId: outcome.subagentId,
+              collaborationTaskId: outcome.collaborationTaskId,
               scopeKey: outcome.scopeKey,
               allowedPaths: outcome.subagentId === null ? [] : outcome.allowedPaths,
             });
           },
-          onSubagentScopeOutcomes: async (outcomes) => {
-            await applyAndEmitPreferredDelegationScopeOutcomes(outcomes, "explicit_wait");
+          onCollaborationTaskOutcomes: async (outcomes) => {
+            await emitCollaborationTaskOutcomes(outcomes, "explicit_wait");
           },
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);

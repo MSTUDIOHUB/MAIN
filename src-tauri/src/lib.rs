@@ -7980,13 +7980,15 @@ struct ResolvedProxyNetworkTarget {
 fn proxy_network_grant(
     url: &str,
     headers: &HashMap<String, String>,
-    allow_explicit_local: bool,
+    user_configured_endpoint: bool,
 ) -> Result<NetworkGrant, String> {
     let allow_authorization = headers
         .keys()
         .any(|name| is_sensitive_cross_origin_header(name));
-    let grant = if allow_explicit_local && is_explicit_local_network_url(url) {
+    let grant = if user_configured_endpoint && is_explicit_local_network_url(url) {
         NetworkGrant::for_explicit_local_origin(url, allow_authorization)
+    } else if user_configured_endpoint {
+        NetworkGrant::for_user_configured_public_origin(url, allow_authorization)
     } else {
         NetworkGrant::from_urls([url], allow_authorization)
     };
@@ -8167,8 +8169,12 @@ fn authorize_proxy_redirect_hop(
         Err(NetworkGuardError::OriginNotGranted(_)) => {
             // A public redirect may establish a new exact-origin grant, but
             // it never inherits the local-endpoint exception or credentials.
-            let public_grant = NetworkGrant::from_urls([redirect_url], false)
-                .map_err(|error| format!("NETWORK_GUARD_DENIED: redirect rejected: {error}"))?;
+            let public_grant = if grant.allows_proxy_virtual_dns() {
+                NetworkGrant::for_user_configured_public_origin(redirect_url, false)
+            } else {
+                NetworkGrant::from_urls([redirect_url], false)
+            }
+            .map_err(|error| format!("NETWORK_GUARD_DENIED: redirect rejected: {error}"))?;
             let target = public_grant
                 .authorize_url(redirect_url)
                 .map_err(|error| format!("NETWORK_GUARD_DENIED: redirect rejected: {error}"))?;
@@ -8199,11 +8205,11 @@ async fn send_guarded_proxy_request(
     http1_only: bool,
     default_json_content_type: bool,
     identity_encoding: bool,
-    allow_explicit_local: bool,
+    user_configured_endpoint: bool,
     request_lease: Option<GuardedRequestLease<'_>>,
 ) -> Result<reqwest::Response, String> {
     validate_proxy_request_headers(headers)?;
-    let mut grant = proxy_network_grant(url, headers, allow_explicit_local)?;
+    let mut grant = proxy_network_grant(url, headers, user_configured_endpoint)?;
     let mut resolved = resolve_proxy_target(&grant, url, request_lease).await?;
     let mut current_method = method.to_uppercase();
     let mut current_body = body.map(str::to_string);
@@ -12745,6 +12751,25 @@ mod tests {
             assert!(is_sensitive_cross_origin_header(header), "{header}");
         }
         assert!(!is_sensitive_cross_origin_header("Content-Type"));
+
+        let provider_grant =
+            proxy_network_grant("https://provider.example.com/v1/models", &headers, true).unwrap();
+        let provider_initial = provider_grant
+            .authorize_url("https://provider.example.com/v1/models")
+            .unwrap();
+        let provider_redirect = authorize_proxy_redirect_hop(
+            &provider_grant,
+            &provider_initial,
+            "https://provider-cdn.example.com/v1/models",
+        )
+        .unwrap();
+        let provider_redirect_target = provider_redirect
+            .grant
+            .authorize_url("https://provider-cdn.example.com/v1/models")
+            .unwrap();
+        provider_redirect_target
+            .validate_resolved_addresses(&["198.18.0.42".parse().unwrap()])
+            .unwrap();
     }
 
     #[test]

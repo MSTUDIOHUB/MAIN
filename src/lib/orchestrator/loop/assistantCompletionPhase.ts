@@ -38,7 +38,7 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
-import type { PreferredDelegationScopeJoinOutcome } from "../../preferredDelegationScopes";
+import type { CollaborationTaskJoinOutcome } from "../../subagents";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -363,8 +363,8 @@ export async function handleAssistantCompletionPhase(input: {
   emitTurnCompletedEvent: () => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
-  onSubagentScopeOutcomes?: (
-    outcomes: PreferredDelegationScopeJoinOutcome[],
+  onCollaborationTaskOutcomes?: (
+    outcomes: CollaborationTaskJoinOutcome[],
   ) => void | Promise<void>;
   setPlanRuntimePhase: Parameters<typeof handlePlanNoToolRecovery>[0]["setPlanRuntimePhase"];
   waitForPlanApprovalIfNeeded: Parameters<typeof handlePlanNoToolRecovery>[0]["waitForPlanApprovalIfNeeded"];
@@ -404,7 +404,7 @@ export async function handleAssistantCompletionPhase(input: {
       reason: "parent_final_response",
     });
     if (joinResult.joined) {
-      await input.onSubagentScopeOutcomes?.(joinResult.scopeOutcomes);
+      await input.onCollaborationTaskOutcomes?.(joinResult.taskOutcomes);
       if (
         input.workflowMode === "plan" &&
         !input.callbacks.getIsPlanApproved() &&

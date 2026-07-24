@@ -637,6 +637,7 @@ export interface PlanToolActivitySummary {
   delegatedObservation?: {
     owner: {
       agentKind: "subagent";
+      collaborationTaskId?: string;
       subagentId: string;
       parentTurnId?: string;
       runId?: string;

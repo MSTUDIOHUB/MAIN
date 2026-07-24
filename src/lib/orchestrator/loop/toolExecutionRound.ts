@@ -119,7 +119,9 @@ export async function executeToolExecutionRound(input: {
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
   browserValidationCache: Map<string, ToolExecutionResult>;
-  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
+  onSubagentSpawnCreated?: (
+    outcome: SpawnSubagentResult,
+  ) => void | Promise<void>;
 }): Promise<ToolExecutionRoundResult> {
   const {
     readOnlyCalls,

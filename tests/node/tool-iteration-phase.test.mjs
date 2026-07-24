@@ -52,23 +52,23 @@ test("tool iteration phase returns one folded runtime-state result to the orches
   assert.match(phaseSource, /recoveryPromptState: toolResultRecoveryPhase\.recoveryPromptState/);
 });
 
-test("preferred delegation spawn state uses the runtime-owned child registration outcome", () => {
+test("semantic collaboration uses runtime-owned task registration and join outcomes", () => {
   assert.match(orchestratorTypesSource, /subagentSpawnOutcome\?: SpawnSubagentResult/);
   assert.match(runtimeOrchestratorSource, /subagentSpawnOutcome = result/);
-  assert.match(runtimeOrchestratorSource, /options\.onSubagentSpawnCreated\?\.\(result\)/);
+  assert.match(runtimeOrchestratorSource, /await options\.onSubagentSpawnCreated\?\.\(result\)/);
   assert.match(runtimeOrchestratorSource, /\{ subagentSpawnOutcome \}/);
   assert.match(phaseSource, /const runtimeOutcome = result\.subagentSpawnOutcome/);
   assert.match(phaseSource, /runtimeOutcome\.subagentId !== null/);
-  assert.match(phaseSource, /extractPreferredDelegationScopeJoinOutcomes/);
-  assert.match(phaseSource, /input\.onSubagentScopeOutcomes\?\.\(subagentScopeOutcomes\)/);
-  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_spawned"/);
-  assert.match(orchestratorSource, /onDebugEvent\?\.\("agent\.preferred_delegation_consumed"/);
+  assert.match(phaseSource, /extractCollaborationTaskJoinOutcomes/);
   assert.match(
-    orchestratorSource,
-    /applyPreferredDelegationScopeJoinOutcomes\(\{[\s\S]*joinResult\.scopeOutcomes/,
+    phaseSource,
+    /input\.onCollaborationTaskOutcomes\?\.\(collaborationTaskOutcomes\)/,
   );
-  assert.match(orchestratorSource, /delegationProgress\.consumedScopeKeys\.length > 0/);
-  assert.match(orchestratorSource, /preferred_delegation_joined_without_evidence/);
+  assert.match(orchestratorSource, /agent\.semantic_collaboration_task_spawned/);
+  assert.match(orchestratorSource, /agent\.semantic_collaboration_evidence_consumed/);
+  assert.match(orchestratorSource, /emitCollaborationTaskOutcomes/);
+  assert.match(orchestratorSource, /delegationProgress\.adoptedTaskIds\.length > 0/);
+  assert.match(orchestratorSource, /semantic_collaboration_joined_without_evidence/);
   assert.match(
     orchestratorSource,
     /joinResult\.adoptedEvidenceCount > 0[\s\S]*setPlanRuntimePhase\(\s*"needs_evidence"/,
@@ -78,8 +78,12 @@ test("preferred delegation spawn state uses the runtime-owned child registration
     /joinResult\.adoptedEvidenceCount === 0[\s\S]*input\.setPlanRuntimePhase\("needs_evidence"/,
   );
   assert.ok(
-    runtimeOrchestratorSource.indexOf("options.onSubagentSpawnCreated?.(result)") <
+    runtimeOrchestratorSource.indexOf("await options.onSubagentSpawnCreated?.(result)") <
       runtimeOrchestratorSource.indexOf("return JSON.stringify(result)"),
+  );
+  assert.doesNotMatch(
+    phaseSource,
+    /input\.onSubagentSpawnCreated\?\.\(outcome\)/,
   );
   assert.ok(
     phaseSource.indexOf("const runtimeOutcome = result.subagentSpawnOutcome") <

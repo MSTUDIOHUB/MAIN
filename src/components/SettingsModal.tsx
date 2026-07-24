@@ -43,7 +43,12 @@ import {
 import { buildCloudAuthFriendlyError } from "../lib/cloudAuthErrorHints";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
-import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
+import {
+  appendDebugLog,
+  clearDebugLog,
+  copyDebugLogToClipboard,
+  readDebugLogSnapshot,
+} from "../lib/debugLog";
 import { exportTextFile, spawnPty, writePty } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import {
@@ -2569,8 +2574,10 @@ export default function SettingsModal({
 
       const candidates = buildCloudModelListCandidates(endpoint, targetProtocol);
       const headers = buildCloudHeaders(targetProtocol, targetServer.apiKey || "", false, targetServer.customHeaders, targetAuthMode);
+      const candidateFailures: Array<{ candidateIndex: number; error: string }> = [];
+      let successfulCandidateResponses = 0;
 
-      for (const url of candidates) {
+      for (const [candidateIndex, url] of candidates.entries()) {
         try {
           const body = await invoke<string>("proxy_request", {
             url,
@@ -2580,6 +2587,7 @@ export default function SettingsModal({
             authMode: targetAuthMode,
             tokenRef: targetAuth.tokenRef,
           });
+          successfulCandidateResponses += 1;
           const models = extractCloudModelIds(JSON.parse(body));
           if (models.length === 0) continue;
 
@@ -2600,13 +2608,38 @@ export default function SettingsModal({
           confirmCloudModelSelection(selectedModel, targetServerForRuntime);
           setCloudFetchMsg({ text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
           return;
-        } catch {
-          // Try next candidate URL
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          candidateFailures.push({ candidateIndex, error: errorMessage });
+          appendDebugLog("warn", "settings.cloud_model_discovery_candidate_failed", {
+            serverId: targetServerId,
+            protocol: targetProtocol,
+            candidateIndex,
+            candidateCount: candidates.length,
+            error: errorMessage,
+          });
         }
       }
 
       setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
-      setCloudFetchMsg({ text: copy.cloudNoModels, type: "error" });
+      if (successfulCandidateResponses === 0 && candidateFailures.length > 0) {
+        const lastFailure = candidateFailures[candidateFailures.length - 1];
+        const friendlyError = buildCloudAuthFriendlyError({
+          protocol: targetProtocol,
+          authMode: targetAuthMode,
+          error: lastFailure.error,
+          language,
+        });
+        appendDebugLog("error", "settings.cloud_model_discovery_failed", {
+          serverId: targetServerId,
+          protocol: targetProtocol,
+          candidateCount: candidates.length,
+          failures: candidateFailures,
+        });
+        setCloudFetchMsg({ text: copy.cloudConnectionFailed(friendlyError), type: "error" });
+      } else {
+        setCloudFetchMsg({ text: copy.cloudNoModels, type: "error" });
+      }
     } catch (err) {
       setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
       const friendlyError = buildCloudAuthFriendlyError({

@@ -24,20 +24,15 @@ import {
   type PlanEvidenceObligation,
 } from "../../planEvidenceObligations";
 import {
-  isPlanRuntimeFinalizationPhase,
   shouldClosePlanToolSurfaceAfterReadOnlyConvergence,
 } from "../../planRuntime";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
-import { buildTaskTargetingProfile } from "../../taskTargeting";
 import {
   getSubagentAdmissionHealth,
-  normalizeIndependentDelegationScopeKeys,
   resolveDelegationDecision,
-  resolvePreferredDelegationRequirement,
   resolveSubagentCapacityPolicy,
   type DelegationDecision,
   type DelegationRuntimePhase,
-  type PreferredDelegationRequirement,
   type SubagentExecutionScope,
 } from "../../subagents";
 import {
@@ -54,15 +49,6 @@ import {
   scopeExecutionEvidenceLedger,
 } from "../../verificationEvidence";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
-import {
-  collectAuthoritativePreferredDelegationEvidenceOwnerPaths,
-  collectPreferredDelegationWorkspacePathCandidates,
-  collectTrustedPreferredDelegationWorkspaceTopologyPaths,
-  derivePreferredDelegationScopeCandidates,
-  getPreferredDelegationScopeProgress,
-  preferredDelegationScopeContractMatchesWave,
-  type PreferredDelegationScopeContract,
-} from "../../preferredDelegationScopes";
 
 export interface IterationToolSurfaceDecision {
   isExecuteRecoveryEligible: boolean;
@@ -70,7 +56,6 @@ export interface IterationToolSurfaceDecision {
   recoveryActionContract: RecoveryActionContract;
   directFileModifyPhase: DirectFileModifyPhase;
   delegationDecision: DelegationDecision;
-  preferredDelegationRequirement: PreferredDelegationRequirement;
   /** Exact runtime-owned read/search transaction for this Plan iteration. */
   planEvidenceObligation?: PlanEvidenceObligation;
   iterationAllTools: ToolDefinition[];
@@ -104,6 +89,7 @@ const DIRECT_FILE_MODIFY_WORKSPACE_TOOLS = new Set([
 const DIRECT_FILE_MODIFY_SOURCE_TOOLS = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "cancel_subagent",
   ...DIRECT_FILE_MODIFY_WORKSPACE_TOOLS,
 ]);
 
@@ -133,6 +119,28 @@ const SUBAGENT_REQUIRED_SCOPED_PATH_TOOLS = new Set([
   "grep_search",
   "find_symbol_references",
   "git_diff",
+]);
+
+const SUBAGENT_MUTATION_TOOL_NAMES = new Set([
+  "apply_patch",
+  "replace_in_file",
+  "write_file",
+]);
+
+const SUBAGENT_WRITE_PATH_TOOLS = new Set([
+  "replace_in_file",
+  "write_file",
+]);
+
+const SUBAGENT_FORBIDDEN_CONTROL_OR_PROCESS_TOOLS = new Set([
+  "spawn_subagent",
+  "wait_subagents",
+  "cancel_subagent",
+  "run_command",
+  "execute_command",
+  "start_dev_server",
+  "computer_use",
+  "browser_evaluate",
 ]);
 
 function withSubagentPathContract(
@@ -227,6 +235,15 @@ export function scopeSubagentToolDefinitions(input: {
   return input.tools.flatMap((tool) => {
     const name = tool.function.name;
     if (blocked.has(name)) return [];
+    if (SUBAGENT_FORBIDDEN_CONTROL_OR_PROCESS_TOOLS.has(name)) return [];
+    if ((scope.accessMode || "read") === "read" && SUBAGENT_MUTATION_TOOL_NAMES.has(name)) return [];
+    if (scope.accessMode === "write" && SUBAGENT_WRITE_PATH_TOOLS.has(name)) {
+      return [withSubagentPathContract(
+        tool,
+        scope.allowedPaths,
+        `Exact write lease target. Choose one of: ${scope.allowedPaths.join(", ")}`,
+      )];
+    }
     if (!ownsWorkspaceRoot && SUBAGENT_UNSCOPED_WORKSPACE_TOOLS.has(name)) return [];
     if (name === "list_directory") {
       if (scope.allowedDirectoryPaths.length === 0) return [];
@@ -342,8 +359,6 @@ export function resolveIterationToolSurface(input: {
   turnInputContextSignals: TurnInputContextSignals;
   lastAssistantTextForCheckpoint: string;
   latestUserPromptText?: string;
-  preferredDelegationScopeContract?: PreferredDelegationScopeContract | null;
-  preferredDelegationMaterializationBlockedScopeKeys?: string[];
 }): IterationToolSurfaceDecision {
   const {
     callbacks,
@@ -369,8 +384,6 @@ export function resolveIterationToolSurface(input: {
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
     latestUserPromptText = "",
-    preferredDelegationScopeContract = null,
-    preferredDelegationMaterializationBlockedScopeKeys = [],
   } = input;
 
   const devServerRuntimeObservation = resolveDevServerRuntimeState(
@@ -408,7 +421,7 @@ export function resolveIterationToolSurface(input: {
   const recoveryIterationAllTools = isExecuteRecoveryEligible
     ? rawIterationAllTools.filter((tool) =>
         (
-          tool.function.name !== "wait_subagents" ||
+          !["wait_subagents", "cancel_subagent"].includes(tool.function.name) ||
           pendingSubagentCount > 0
         ) &&
         isExecuteRecoveryToolName(
@@ -497,6 +510,7 @@ export function resolveIterationToolSurface(input: {
   const extraRecoveryToolNames = new Set<string>();
   if (recoveryScopesDelegation && pendingSubagentCount > 0) {
     extraRecoveryToolNames.add("wait_subagents");
+    extraRecoveryToolNames.add("cancel_subagent");
   }
   if (joinedChildNeedsParentReread && canExposeParentReread) extraRecoveryToolNames.add("read_file");
   const baseIterationAllTools = extraRecoveryToolNames.size > 0
@@ -574,48 +588,9 @@ export function resolveIterationToolSurface(input: {
         EXECUTION_VERIFICATION_TOOL_NAMES.has(activity.name)
       )
     );
-  const declaredTargetProfile = buildTaskTargetingProfile({
-    userPrompt: latestUserPromptText,
-    planTaskTexts: callbacks.getPlanTasks().map((task) => task.text),
-    userContext: turnInputContextSignals,
-  });
-  const explicitScopeKeys = [
-    ...declaredTargetProfile.explicitPaths,
-    ...(turnInputContextSignals.mentionedFilePaths || []),
-    ...(turnInputContextSignals.attachedFilePaths || []),
-  ];
-  const observedScopeKeys = collectPreferredDelegationWorkspacePathCandidates(
-    delegationActivities,
-  );
-  const authoritativePlanEvidenceOwnerScopeKeys =
-    workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? collectAuthoritativePreferredDelegationEvidenceOwnerPaths(recentPlanToolActivity)
-      : [];
-  const trustedPlanWorkspaceTopologyScopeKeys =
-    workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? collectTrustedPreferredDelegationWorkspaceTopologyPaths(recentPlanToolActivity)
-      : [];
-  const stablePlanWorkspaceOwnerScopeKeys = [
-    ...trustedPlanWorkspaceTopologyScopeKeys,
-    ...authoritativePlanEvidenceOwnerScopeKeys,
-  ];
-  const normalizedIndependentScopeKeys = normalizeIndependentDelegationScopeKeys([
-    ...(workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? []
-      : explicitScopeKeys),
-    ...(workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? stablePlanWorkspaceOwnerScopeKeys
-      : observedScopeKeys),
-  ]);
-  const explicitScopeCount = normalizeIndependentDelegationScopeKeys(explicitScopeKeys).length;
-  const observedScopeCount = normalizeIndependentDelegationScopeKeys(
-    workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? stablePlanWorkspaceOwnerScopeKeys
-      : observedScopeKeys,
-  ).length;
-  const plannedWorkItemCount = workflowMode === "plan"
-    ? callbacks.getPlanTasks().length
-    : 0;
+  // Runtime no longer derives collaboration work from files, directories, or
+  // checklist topology. The model receives the normal phase tools and authors
+  // complete semantic work items when collaboration has real value.
   const runtimeConfig = callbacks.getConfig?.();
   const subagentCapacityPolicy = runtimeConfig?.activeProfile &&
     runtimeConfig.local &&
@@ -635,20 +610,8 @@ export function resolveIterationToolSurface(input: {
       ? turnInputContextSignals.subagentPreference
       : callbacks.getGoalTurnContract?.()?.subagentPreference,
   });
-  const preferredDelegationScopeCandidates = derivePreferredDelegationScopeCandidates({
-    candidatePathKeys: normalizedIndependentScopeKeys,
-    structuredInput: latestUserPromptText,
-    // The scheduler remains the hard capacity authority. A minimal callback
-    // fixture may omit full config, so keep discovery capable of expressing
-    // the same bounded local contract instead of silently erasing scopes.
-    maxCreatedPerTurn: subagentCapacityPolicy?.maxCreatedPerTurn || 3,
-    strategy: workflowMode === "plan" && !callbacks.getIsPlanApproved()
-      ? "stable_top_level"
-      : "shallowest_parallel",
-  });
-  const preferredDelegationScopeProgress = getPreferredDelegationScopeProgress(
-    preferredDelegationScopeContract,
-  );
+  // Paths below remain observability signals only. The runtime no longer
+  // turns directory topology into child objectives or mandatory work.
   const openPlanEvidenceObligations =
     workflowMode === "plan" && !callbacks.getIsPlanApproved()
       ? derivePlanEvidenceObligations({
@@ -656,60 +619,11 @@ export function resolveIterationToolSurface(input: {
           activities: recentPlanToolActivity,
         })
       : [];
-  // Two authoritative, non-overlapping top-level owners are already a stable
-  // parallel boundary. Freeze and materialize that boundary as soon as it is
-  // known; do not make preferred collaboration wait for Plan finalization.
-  // A single subsystem remains provisional until the ordinary finalization
-  // gate closes, so sibling file reads never manufacture parallel work.
-  const preferredPlanStableParallelOwnersReady =
-    preferredDelegationScopeCandidates.length >= 2;
-  const preferredPlanEvidenceTopologyReady =
-    workflowMode !== "plan" ||
-    callbacks.getIsPlanApproved() ||
-    preferredPlanStableParallelOwnersReady ||
-    (
-      isPlanRuntimeFinalizationPhase(planRuntimePhase) &&
-      openPlanEvidenceObligations.length === 0
-    );
-  const preferredPlanContractActivationDeferred =
-    effectiveSubagentPreference === "preferred" &&
-    !preferredDelegationScopeContract &&
-    !preferredPlanEvidenceTopologyReady;
-  // A model can close all Plan evidence in one parallel read batch. That
-  // normally advances the runtime straight into drafting, whose tool surface
-  // is intentionally empty. When the captured Turn preference says
-  // collaboration is preferred and that batch has proved at least two useful,
-  // non-overlapping scopes, preserve one bounded pre-draft delegation
-  // checkpoint instead of silently skipping the user's preference. Reopen
-  // only spawn_subagent; all normal phase, capacity, recursion, and workspace
-  // admission boundaries below remain authoritative.
-  const preferredPlanDelegationCheckpointPending =
-    workflowMode === "plan" &&
-    !callbacks.getIsPlanApproved() &&
-    isPlanRuntimeFinalizationPhase(planRuntimePhase) &&
-    planRuntimePhase !== "review_ready" &&
-    planRuntimePhase !== "blocked" &&
-    effectiveSubagentPreference === "preferred" &&
-    preferredPlanEvidenceTopologyReady &&
-    !preferredDelegationScopeProgress.satisfied &&
-    (
-      preferredDelegationScopeProgress.open ||
-      preferredDelegationScopeCandidates.length >= 2
-    );
-  const checkpointSpawnTool = preferredPlanDelegationCheckpointPending
-    ? baseIterationAllTools.find((tool) => tool.function.name === "spawn_subagent")
-    : undefined;
-  const delegationEligiblePhaseScopedIterationAllTools =
-    checkpointSpawnTool &&
-    !phaseScopedIterationAllTools.some((tool) => tool.function.name === "spawn_subagent")
-      ? [...phaseScopedIterationAllTools, checkpointSpawnTool]
-      : phaseScopedIterationAllTools;
+  const delegationEligiblePhaseScopedIterationAllTools = phaseScopedIterationAllTools;
 
   let delegationPhase: DelegationRuntimePhase;
   if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
-    delegationPhase = preferredPlanDelegationCheckpointPending
-      ? "diagnostic"
-      : planRuntimePhase === "explore_structure"
+    delegationPhase = planRuntimePhase === "explore_structure"
       ? "context"
       : planRuntimePhase === "grounding" || planRuntimePhase === "needs_evidence"
       ? "diagnostic"
@@ -741,57 +655,14 @@ export function resolveIterationToolSurface(input: {
     preference: effectiveSubagentPreference,
     phase: delegationPhase,
     hasWorkspace: !!String(callbacks.getConfig?.().workspace || "").trim(),
-    explicitScopeCount,
-    observedScopeCount,
-    plannedWorkItemCount,
-    independentScopeKeys: normalizedIndependentScopeKeys,
     pendingSubagentCount,
     subagentDepth: callbacks.getSubagentDepth?.() || 0,
     runtimeHealth: delegationRuntimeHealth,
   });
-  const runtimeOwnedLifecycleReviewAvailable =
-    effectiveSubagentPreference === "preferred" &&
-    (delegationPhase === "mutation" || delegationPhase === "validation") &&
-    !!latestDecisiveRuntimeActivity &&
-    rawIterationAllTools.some((tool) =>
-      tool.function.name === "spawn_subagent"
-    );
-  const preferredDelegationRequirement = resolvePreferredDelegationRequirement({
-    decision: delegationDecision,
-    independentScopeKeys: normalizedIndependentScopeKeys,
-    scopeCandidates: preferredDelegationScopeCandidates,
-    scopeContract: preferredDelegationScopeContract,
-    activationAllowed: !preferredPlanContractActivationDeferred,
-    blockedScopeKeys: preferredDelegationMaterializationBlockedScopeKeys,
-    // Later lifecycle waves are materialized by the runtime control plane even
-    // when another phase-specific filter has hidden spawn_subagent from the
-    // provider request. A decisive mutation or verification event is the
-    // evidence-owned need signal; initial discovery cannot manufacture a
-    // second duplicate wave.
-    spawnToolAvailable:
-      runtimeOwnedLifecycleReviewAvailable ||
+  const delegationScopedIterationAllTools = delegationDecision.action === "admit" &&
       delegationEligiblePhaseScopedIterationAllTools.some((tool) =>
         tool.function.name === "spawn_subagent"
-      ),
-  });
-  const preferredDelegationContractMatchesCurrentWave =
-    preferredDelegationScopeContractMatchesWave({
-      contract: preferredDelegationScopeContract,
-      lifecyclePhase: preferredDelegationRequirement.lifecyclePhase,
-      scopes: preferredDelegationRequirement.requiredScopes,
-    });
-  const preferredDelegationCurrentWaveHasCapacity =
-    !preferredDelegationScopeContract ||
-    (
-      !preferredDelegationContractMatchesCurrentWave &&
-      preferredDelegationScopeProgress.activeScopeKeys.length === 0 &&
-      !preferredDelegationScopeProgress.open
-    ) ||
-    preferredDelegationScopeProgress.creationCapacityRemaining > 0;
-  const delegationScopedIterationAllTools = delegationDecision.action === "admit" &&
-      preferredDelegationRequirement.reason !== "runtime_materialization_failed" &&
-      !preferredPlanContractActivationDeferred &&
-      preferredDelegationCurrentWaveHasCapacity
+      )
     ? delegationEligiblePhaseScopedIterationAllTools
     : delegationEligiblePhaseScopedIterationAllTools.filter((tool) =>
         tool.function.name !== "spawn_subagent"
@@ -809,10 +680,6 @@ export function resolveIterationToolSurface(input: {
       reason: delegationDecision.reason,
       phase: delegationDecision.phase,
       preference: delegationDecision.preference,
-      independentScopeCount: delegationDecision.independentScopeCount,
-      explicitScopeCount: delegationDecision.explicitScopeCount,
-      observedScopeCount: delegationDecision.observedScopeCount,
-      plannedWorkItemCount: delegationDecision.plannedWorkItemCount,
       pendingSubagentCount: delegationDecision.pendingSubagentCount,
       runtimeHealthState: delegationRuntimeHealth?.state || "unknown",
       activeChildren: delegationRuntimeHealth?.activeChildren ?? null,
@@ -826,7 +693,6 @@ export function resolveIterationToolSurface(input: {
         delegationEligiblePhaseScopedIterationAllTools.some((tool) =>
           tool.function.name === "spawn_subagent"
         ),
-      preferredPlanDelegationCheckpointPending,
       providerNeutral: true,
     });
   }
@@ -863,9 +729,7 @@ export function resolveIterationToolSurface(input: {
       scopedTools: afterNames,
     });
   }
-  const preferredDelegationScopedIterationAllTools = preferredDelegationRequirement.required
-    ? subagentScopedIterationAllTools.filter((tool) => tool.function.name === "spawn_subagent")
-    : subagentScopedIterationAllTools;
+  const collaborationScopedIterationAllTools = subagentScopedIterationAllTools;
   // Keep a user-requested first delegation checkpoint and an in-flight join
   // authoritative. Once those boundaries are clear, needs_evidence is owned
   // by the first exact open ledger obligation, recomputed every iteration.
@@ -873,26 +737,28 @@ export function resolveIterationToolSurface(input: {
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&
     planRuntimePhase === "needs_evidence" &&
-    pendingSubagentCount === 0 &&
-    !preferredDelegationRequirement.contractOpen
+    pendingSubagentCount === 0
       ? openPlanEvidenceObligations[0]
       : undefined;
   const evidenceObligationScopedIterationAllTools = scopePlanEvidenceObligationToolDefinitions({
-    tools: preferredDelegationScopedIterationAllTools,
+    tools: collaborationScopedIterationAllTools,
     obligation: planEvidenceObligation,
   });
   const closedPlanAuthoringSurface = evidenceObligationScopedIterationAllTools.filter(
     (tool) => tool.function.name === SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
   );
-  const iterationAllTools = preferredDelegationRequirement.required
-    ? preferredDelegationScopedIterationAllTools
-    : preferredDelegationRequirement.contractOpen
-    ? preferredDelegationScopedIterationAllTools.filter((tool) =>
-        pendingSubagentCount > 0 && tool.function.name === "wait_subagents"
-      )
-    : shouldClosePlanToolSurface
+  const collaborationLifecycleScopedTools = collaborationScopedIterationAllTools.filter(
+    (tool) =>
+      !["wait_subagents", "cancel_subagent"].includes(tool.function.name) ||
+      pendingSubagentCount > 0,
+  );
+  const iterationAllTools = shouldClosePlanToolSurface
     ? closedPlanAuthoringSurface
-    : evidenceObligationScopedIterationAllTools;
+    : evidenceObligationScopedIterationAllTools.filter((tool) =>
+        collaborationLifecycleScopedTools.some((candidate) =>
+          candidate.function.name === tool.function.name
+        )
+      );
 
   if (planEvidenceObligation) {
     logAgentEvent("plan_evidence_obligation_tool_scope_applied", {
@@ -902,29 +768,6 @@ export function resolveIterationToolSurface(input: {
       expectedTool: getPlanEvidenceObligationToolName(planEvidenceObligation),
       scopedTools: iterationAllTools.map((tool) => tool.function.name),
       pendingSubagentCount,
-      providerNeutral: true,
-    });
-  }
-
-  if (delegationDecision.preference === "preferred") {
-    logAgentEvent("preferred_delegation_requirement", {
-      iteration,
-      required: preferredDelegationRequirement.required,
-      reason: preferredDelegationRequirement.reason,
-      candidateScopeKeys: preferredDelegationRequirement.candidateScopeKeys,
-      requiredScopes: preferredDelegationRequirement.requiredScopes,
-      remainingScopes: preferredDelegationRequirement.remainingScopes,
-      consumedScopeKeys: preferredDelegationRequirement.consumedScopeKeys,
-      contractOpen: preferredDelegationRequirement.contractOpen,
-      delegationAction: delegationDecision.action,
-      delegationReason: delegationDecision.reason,
-      preferredPlanDelegationCheckpointPending,
-      preferredPlanEvidenceTopologyReady,
-      preferredPlanStableParallelOwnersReady,
-      openPlanEvidenceObligationCount: openPlanEvidenceObligations.length,
-      authoritativeEvidenceOwnerScopeKeys: authoritativePlanEvidenceOwnerScopeKeys,
-      trustedWorkspaceTopologyScopeKeys: trustedPlanWorkspaceTopologyScopeKeys,
-      effectiveTools: iterationAllTools.map((tool) => tool.function.name),
       providerNeutral: true,
     });
   }
@@ -977,7 +820,6 @@ export function resolveIterationToolSurface(input: {
     recoveryActionContract,
     directFileModifyPhase,
     delegationDecision,
-    preferredDelegationRequirement,
     ...(planEvidenceObligation ? { planEvidenceObligation } : {}),
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),

@@ -110,7 +110,7 @@ test("needs-evidence scopes one exact runtime obligation primitive and argument"
   assert.deepEqual(scoped[0].function.parameters.required, ["symbol"]);
 });
 
-test("an explicit wait_subagents result closes the same typed scope ledger as a runtime join", () => {
+test("an explicit wait_subagents result closes the same semantic task ledger as a runtime join", () => {
   const result = {
     toolCallId: "wait-explicit",
     name: "wait_subagents",
@@ -121,6 +121,7 @@ test("an explicit wait_subagents result closes the same typed scope ledger as a 
       pendingIds: [],
       results: [{
         subagentId: "child-src",
+        collaborationTaskId: "task-editor-update",
         scopeKey: "src",
         status: "completed",
         closureAudit: {
@@ -130,6 +131,7 @@ test("an explicit wait_subagents result closes the same typed scope ledger as a 
             threadId: "thread-parent",
             parentTurnId: "turn-parent",
             subagentId: "child-src",
+            collaborationTaskId: "task-editor-update",
             runId: "run-child-src",
             parentRunId: "run-parent",
           },
@@ -160,7 +162,11 @@ test("an explicit wait_subagents result closes the same typed scope ledger as a 
           },
           provenance: {
             source: "tool_observation",
-            owner: { agentKind: "subagent", subagentId: "child-src" },
+            owner: {
+              agentKind: "subagent",
+              collaborationTaskId: "task-editor-update",
+              subagentId: "child-src",
+            },
             sourceToolCallId: "child-read-main",
           },
         }],
@@ -169,15 +175,17 @@ test("an explicit wait_subagents result closes the same typed scope ledger as a 
   };
 
   assert.deepEqual(
-    subagentJoinRuntime.extractPreferredDelegationScopeJoinOutcomes(result),
+    subagentJoinRuntime.extractCollaborationTaskJoinOutcomes(result),
     [{
+      collaborationTaskId: "task-editor-update",
       subagentId: "child-src",
-      scopeKey: "src",
+      taskKey: "src",
       status: "completed",
       closureState: "satisfied",
       adoptedEvidenceCount: 1,
       adoptedEvidenceTargets: ["src/main.js"],
-      consumed: true,
+      evidenceAdopted: true,
+      terminalComplete: true,
     }],
   );
 });
@@ -248,6 +256,45 @@ test("exact-file subagent scope exposes only executable search parameters", () =
   assert.equal(subagents.validateSubagentScopeTarget(scope, "src"), false);
 });
 
+test("only an approved write scope exposes structured mutation tools", () => {
+  const tools = [
+    tool("read_file", { path: { type: "string" } }, ["path"]),
+    tool("apply_patch", { patch: { type: "string" } }, ["patch"]),
+    tool("replace_in_file", {
+      path: { type: "string" },
+      old_text: { type: "string" },
+      new_text: { type: "string" },
+    }, ["path", "old_text", "new_text"]),
+    tool("write_file", {
+      path: { type: "string" },
+      content: { type: "string" },
+    }, ["path", "content"]),
+    tool("run_command", { command: { type: "string" } }, ["command"]),
+    tool("spawn_subagent", { objective: { type: "string" } }, ["objective"]),
+  ];
+  const readNames = toolCallPlanning.scopeSubagentToolDefinitions({
+    tools,
+    scope: exactFileScope({ accessMode: "read" }),
+  }).map((entry) => entry.function.name);
+  assert.deepEqual(readNames, ["read_file"]);
+
+  const writeScoped = toolCallPlanning.scopeSubagentToolDefinitions({
+    tools,
+    scope: exactFileScope({ accessMode: "write" }),
+  });
+  assert.deepEqual(
+    writeScoped.map((entry) => entry.function.name),
+    ["read_file", "apply_patch", "replace_in_file", "write_file"],
+  );
+  for (const name of ["replace_in_file", "write_file"]) {
+    assert.deepEqual(
+      writeScoped.find((entry) => entry.function.name === name)
+        .function.parameters.properties.path.enum,
+      exactFileScope().allowedPaths,
+    );
+  }
+});
+
 test("the first exact-file scope block quarantines that tool for later iterations", () => {
   const scope = exactFileScope();
   const grep = tool("grep_search", {
@@ -264,7 +311,7 @@ test("the first exact-file scope block quarantines that tool for later iteration
   );
 });
 
-test("a scheduling reservation immediately defers overlapping parent and child scopes", () => {
+test("a scheduling reservation blocks the parent and only conflicting child access modes", () => {
   subagents.resetSubagentRuntimeForTests();
   subagents.reserveSubagentScope({
     threadId: "thread-parent",
@@ -287,7 +334,18 @@ test("a scheduling reservation immediately defers overlapping parent and child s
     workspace: "/workspace",
     allowedPaths: ["src"],
   });
-  assert.equal(overlappingChild?.subagentId, "subagent-reserved");
+  assert.equal(
+    overlappingChild,
+    null,
+    "two read-only children may inspect overlapping paths for distinct semantic tasks",
+  );
+  const overlappingWriter = subagents.findSubagentLeaseOverlap({
+    threadId: "thread-parent",
+    workspace: "/workspace",
+    allowedPaths: ["src"],
+    accessMode: "write",
+  });
+  assert.equal(overlappingWriter?.subagentId, "subagent-reserved");
   subagents.resetSubagentRuntimeForTests();
 });
 

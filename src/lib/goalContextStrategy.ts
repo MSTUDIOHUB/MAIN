@@ -83,8 +83,8 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
       isZh ? "## 子智能体协作偏好" : "## Subagent Collaboration Preference",
       "",
       isZh
-        ? "用户偏好子智能体协作。存在一个有实质价值的有界只读范围时尽早创建一个；存在多个路径不重叠的范围时，在同一响应中按当前容量创建多个，主体同时推进非重叠工作并在结束前汇合。不要重复读取子智能体租约路径，也不要为凑数拆分琐碎任务；委派无益时可以不创建。"
-        : "The user prefers subagent collaboration. Spawn one early when one bounded read-only scope is independently valuable; when multiple disjoint scopes exist, spawn as many as current capacity permits in the same response while the parent advances non-overlapping work, then join before finalizing. Do not duplicate leased paths or manufacture filler tasks; use zero when delegation would not help.",
+        ? "本目标允许并优先考虑协作，但模型应先按目标与问题结构决定是否委派。只为具有独立成功标准和明确收益的窄语义任务创建全新一次性子智能体，不按目录凑数；每个实例终态后永久关闭，后续任务创建新实例并只继承已验证的精简证据。"
+        : "Collaboration is allowed and preferred, but the model first decides from the goal and problem structure whether delegation helps. Create fresh one-shot agents only for narrow semantic tasks with independent success criteria and clear value, never as directory-based filler. Permanently close every terminal instance; later work gets a new instance with verified compact evidence only.",
       "",
     ].join("\n"));
   } else if (subagentPreference === "forbidden") {

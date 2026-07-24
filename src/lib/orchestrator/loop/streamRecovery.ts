@@ -148,18 +148,41 @@ export function shouldAttemptExecuteStreamWatchdogRecovery(input: {
     !input.forceXmlTools;
 }
 
-export function buildExecuteStreamWatchdogRecoveryPrompt(language: "zh" | "en"): string {
+export function buildExecuteStreamWatchdogRecoveryPrompt(
+  language: "zh" | "en",
+  availableToolNames: Iterable<string> = [],
+): string {
+  const availableTools = [...new Set(
+    [...availableToolNames]
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  )];
+  const capabilityLine = language === "en"
+    ? availableTools.length > 0
+      ? `Available tools: ${availableTools.join(", ")}.`
+      : "Available tools: use exactly one tool from the active recovery contract."
+    : availableTools.length > 0
+    ? `本轮可用工具：${availableTools.join(", ")}。`
+    : "本轮可用工具：只能使用当前恢复契约中的一个工具。";
   return language === "en"
     ? [
         "EXECUTE_STREAM_RECOVERY: The previous execution stream timed out without producing a tool result.",
         "Call exactly one available tool now. Do not emit analysis, a plan, or a progress paragraph before the tool call.",
-        "If the previous edit had a patch mismatch, use one targeted read_file for the exact target; otherwise patch, run validation, or use browser validation now.",
+        capabilityLine,
+        "Choose only from that exact surface; do not name or request a capability that is not listed.",
       ].join("\n")
     : [
         "EXECUTE_STREAM_RECOVERY: 上一次执行流超时，且没有产生工具结果。",
         "现在必须直接调用一个可用工具；工具调用前不要输出分析、计划或进度段落。",
-        "如果上一笔编辑是 patch mismatch，只对精确目标调用一次 read_file；否则现在直接修改、运行验证或执行浏览器验证。",
+        capabilityLine,
+        "只能从这份精确工具面中选择，不得臆造或请求未列出的能力。",
       ].join("\n");
+}
+
+export function isExecuteStreamWatchdogRecoveryActionable(
+  result: Pick<StreamResult, "toolCalls" | "protocolViolation">,
+): boolean {
+  return !result.protocolViolation && (result.toolCalls?.length || 0) > 0;
 }
 
 export function shouldAttemptPreapprovalPlanStreamWatchdogRecovery(input: {
@@ -488,7 +511,6 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   executeRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
   providerCompatibilityPlanAuthoringCard?: string;
-  preferredDelegationRequired: boolean;
   planEvidenceObligationRequired?: boolean;
   planCandidateRepairActive?: boolean;
   fileReadStates: Map<string, FileReadState>;
@@ -528,7 +550,6 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     executeRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
     providerCompatibilityPlanAuthoringCard,
-    preferredDelegationRequired,
     planEvidenceObligationRequired,
     planCandidateRepairActive = false,
     fileReadStates,
@@ -606,7 +627,6 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       getPlanStreamWatchdogOptions,
       executeRecoveryStreamMaxElapsedMs,
       preapprovalPlanQualityRecoveryStreamPolicy,
-      preferredDelegationRequired,
       planEvidenceObligationRequired,
     });
     observeFileReadContextForMessagesSent({
@@ -647,6 +667,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       );
       const retryPrompt = buildExecuteStreamWatchdogRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
+        llmTools.map((tool) => tool.function.name),
       );
       logAgentEvent("execute_stream_watchdog_recovery_started", {
         iteration,
@@ -704,11 +725,22 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         })) {
           callbacks.onProviderNativeToolSuccess?.();
         }
-        logAgentEvent("execute_stream_watchdog_recovered", {
-          iteration,
-          toolCalls: streamResult.toolCalls?.length || 0,
-          finishReason: streamResult.finishReason || null,
-        });
+        const actionableRecovery =
+          isExecuteStreamWatchdogRecoveryActionable(streamResult);
+        logAgentEvent(
+          actionableRecovery
+            ? "execute_stream_watchdog_recovered"
+            : "execute_stream_watchdog_recovery_protocol_violation",
+          {
+            iteration,
+            toolCalls: streamResult.toolCalls?.length || 0,
+            finishReason: streamResult.finishReason || null,
+            protocolViolation: streamResult.protocolViolation || null,
+            nextRecovery: actionableRecovery
+              ? null
+              : "provider_compatibility",
+          },
+        );
         observeFileReadContextForMessagesSent({
           fileReadStates,
           beforeMessages: retrySourceMessages,

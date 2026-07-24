@@ -27,6 +27,8 @@ import type { ToolRiskLevel } from "../toolCapabilities";
 import type { ToolCatalogSource } from "../toolCatalog";
 import { type TurnInputContextSignals } from "../turnIntake";
 import type {
+  CancelSubagentRequest,
+  CancelSubagentResult,
   RuntimeTraceContext,
   SpawnSubagentRequest,
   SpawnSubagentResult,
@@ -34,7 +36,6 @@ import type {
   WaitSubagentsRequest,
   WaitSubagentsResult,
 } from "../subagents";
-import type { PreferredDelegationScopeContract } from "../preferredDelegationScopes";
 import type { TurnRuntimeCheckpointV1 } from "../turnRuntimeCheckpoint";
 import type { SubagentClosureReceiptLedger } from "../subagentClosureReceipts";
 import type { VisualContextDeliveryState } from "../visualContext";
@@ -222,7 +223,6 @@ export interface OrchestratorCallbacks {
   getSubagentClosureReceiptLedger?: () => SubagentClosureReceiptLedger | null;
   /** Persist collaboration progress before the loop advances past its boundary. */
   publishTurnRuntimePlanningCheckpoint?: (input: {
-    preferredDelegationScopeContract: PreferredDelegationScopeContract | null;
     recentPlanToolActivity: PlanToolActivitySummary[];
     updatedAt: number;
   }) => void | Promise<void>;
@@ -239,6 +239,9 @@ export interface OrchestratorCallbacks {
     request: WaitSubagentsRequest,
     options?: { signal?: AbortSignal },
   ) => Promise<WaitSubagentsResult>;
+  cancelSubagent?: (
+    request: CancelSubagentRequest,
+  ) => Promise<CancelSubagentResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("../goalState").GoalProgress, goal: import("../goalState").GoalDefinition) => void;

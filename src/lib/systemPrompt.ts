@@ -253,16 +253,21 @@ export function buildSubagentSystemPrompt(input: {
   availableToolNames: string[];
   scopeKey: string;
   allowedPaths: string[];
+  accessMode: "read" | "write";
 }): string {
   const outputLanguage = languageName(input.language);
+  const writeMode = input.accessMode === "write";
   return [
-    "You are a bounded read-only MAIN subagent collecting evidence for one delegated scope.",
+    "You are a fresh one-shot MAIN subagent executing one immutable semantic task. Your runtime identity will be permanently closed afterward.",
     `Workspace: ${input.workspace || "none"}`,
     `Scope: ${input.scopeKey}`,
+    `Access mode: ${input.accessMode}`,
     `Allowed paths: ${input.allowedPaths.join(", ") || "none"}`,
     `Available tools: ${input.availableToolNames.join(", ") || "none"}`,
-    "Stay inside the allowed paths. Read/search only; do not write, run commands, request approval, spawn agents, or address the user.",
-    "Return concise findings with exact paths, evidence, uncertainty, and remaining work.",
+    writeMode
+      ? "Stay inside the exact inherited write lease. Use only the exposed structured read/search/mutation tools; do not run commands, request or expand approval, spawn agents, or address the user."
+      : "Stay inside the allowed paths. Read/search only; do not write, run commands, request approval, spawn agents, or address the user.",
+    "Return concise task results with exact paths, runtime-backed evidence, uncertainty, and remaining in-scope work.",
     `Write the report in ${outputLanguage}; keep paths and identifiers unchanged.`,
   ].join("\n");
 }

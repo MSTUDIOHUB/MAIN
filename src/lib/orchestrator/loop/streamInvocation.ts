@@ -19,7 +19,6 @@ import {
 } from "../../runIntent";
 import type { OpenAiToolChoice, StreamResult } from "../../streaming";
 import {
-  adaptRequiredPreferredDelegationReadIntent,
   annotateRequiredToolCallProtocolResult,
   hasSuccessfulAllowedRawNativeToolCall,
 } from "../../requiredToolProtocol";
@@ -79,7 +78,6 @@ export function resolveRecoveryToolChoice(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   llmToolNames: string[];
   forceXmlTools: boolean;
-  preferredDelegationRequired?: boolean;
   planEvidenceObligationRequired?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
   recoveryActionContract?: RecoveryActionContract;
@@ -96,12 +94,6 @@ export function resolveRecoveryToolChoice(input: {
     return "required";
   }
   if (input.planEvidenceObligationRequired && availableToolNames.size === 1) {
-    return "required";
-  }
-  if (
-    input.preferredDelegationRequired &&
-    availableToolNames.has("spawn_subagent")
-  ) {
     return "required";
   }
   const recoveryActionContract = input.recoveryActionContract ||
@@ -134,7 +126,8 @@ export function resolveRecoveryToolChoice(input: {
     ? availableToolNames.size > 0
     : [...availableToolNames].some((name) =>
         recoveryActionContract.allowedToolNames.has(name) ||
-        name === "wait_subagents"
+        name === "wait_subagents" ||
+        name === "cancel_subagent"
       );
   if (!hasExecutableRecoveryTool) return undefined;
   return "required";
@@ -178,7 +171,6 @@ export async function invokeInitialStreamForIteration(input: {
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   executeRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
-  preferredDelegationRequired: boolean;
   planEvidenceObligationRequired?: boolean;
 }): Promise<InitialStreamInvocationResult> {
   const {
@@ -211,7 +203,6 @@ export async function invokeInitialStreamForIteration(input: {
     getPlanStreamWatchdogOptions,
     executeRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
-    preferredDelegationRequired,
     planEvidenceObligationRequired,
   } = input;
   const {
@@ -318,7 +309,6 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
-    preferredDelegationRequired,
     planEvidenceObligationRequired,
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
@@ -381,7 +371,6 @@ export async function invokeInitialStreamForIteration(input: {
     allTools: summarizeToolsForDiagnostics(iterationAllTools),
     llmTools: summarizeToolsForDiagnostics(llmTools),
     toolChoice: recoveryToolChoice ?? null,
-    preferredDelegationRequired,
     watchdog: {
       hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
       label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
@@ -424,25 +413,8 @@ export async function invokeInitialStreamForIteration(input: {
       runtimeIntent,
     },
   );
-  const preferredDelegationAdaptation =
-    adaptRequiredPreferredDelegationReadIntent({
-      result: rawStreamResult,
-      preferredDelegationRequired,
-      allowedToolNames: llmTools.map((tool) => tool.function.name),
-    });
-  if (preferredDelegationAdaptation.adapted) {
-    logAgentEvent("preferred_delegation_read_intent_adapted", {
-      iteration,
-      sourceToolName: preferredDelegationAdaptation.sourceToolName,
-      target: preferredDelegationAdaptation.target,
-      toolCallId: preferredDelegationAdaptation.toolCallId,
-      adaptedToolName: "spawn_subagent",
-      boundedReadOnlyIntent: true,
-      providerNeutral: true,
-    });
-  }
   const streamResult = annotateRequiredToolCallProtocolResult(
-    preferredDelegationAdaptation.result,
+    rawStreamResult,
     recoveryToolChoice,
     llmTools.map((tool) => tool.function.name),
   );

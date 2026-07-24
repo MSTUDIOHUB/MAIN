@@ -1764,6 +1764,8 @@ export function buildExecuteRecoveryPrompt(input: {
   const contract = input.contract;
   const partialMutationRequiresReread =
     input.reason === "mutation_partial_effect_requires_reread";
+  const mutationProducedNoEffect =
+    input.reason === "mutation_preflight_no_effect";
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
     : input.language === "zh" ? "最近已读目标" : "recently read targets";
@@ -1781,6 +1783,8 @@ export function buildExecuteRecoveryPrompt(input: {
       "Reuse the retained versioned observation. If exact source is genuinely missing and read_file is actually available, request one targeted window; otherwise perform the checkpoint's next capability.",
       partialMutationRequiresReread
         ? "The runtime observed that the failed tool already changed this workspace path. The pre-call source is stale: reread the current target now, and do not retry the same mutation or arguments until that fresh read returns."
+        : mutationProducedNoEffect
+        ? "The attempted mutation produced no state delta. Do not reread or replay identical arguments; submit one complete, non-identical mutation against the retained source observation, or report the exact external blocker."
         : "A failed patch may be malformed, a no-op, or a context mismatch. Follow the structured tool error instead of assuming that another read is required.",
       "Call one useful tool for this checkpoint. Do not start another broad scan, repeat an unchanged window, bypass file reads through shell commands, or claim completion without validation evidence.",
     ].filter(Boolean).join("\n");
@@ -1794,6 +1798,8 @@ export function buildExecuteRecoveryPrompt(input: {
     "复用已保留的版本化源码观察。只有确实缺少精确源码且本轮实际提供 read_file 时，才定向补读一个窗口；否则执行检查点指定的 next 能力。",
     partialMutationRequiresReread
       ? "运行时已观察到失败工具实际改变了该工作区路径。调用前的源码上下文已经过期：现在必须重读当前目标；在新读取返回前，不得用相同修改或参数重试。"
+      : mutationProducedNoEffect
+      ? "本次修改没有产生任何状态变化。不要重读，也不要原样重放相同参数；请基于已保留的源码观察提交一次完整且非同内容的修改，或说明精确的外部阻塞。"
       : "补丁失败可能是格式错误、无变化或上下文不匹配；应依据结构化工具错误处理，不能默认再读一次文件。",
     "本检查点只调用一个有用工具。不要重新泛读、重复未变化窗口、用 shell 绕过文件读取，也不要在缺少验证证据时声称完成。",
   ].filter(Boolean).join("\n");

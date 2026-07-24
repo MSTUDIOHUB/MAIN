@@ -133,9 +133,42 @@ export function normalizeToolCallForExecution(
   args: Record<string, unknown>,
   workspace?: string | null,
 ): Record<string, unknown> {
+  const executionArgs = { ...(args || {}) };
+  if (toolName === "replace_in_file") {
+    executionArgs.path ??=
+      executionArgs.target ??
+      executionArgs.file_path ??
+      executionArgs.file;
+    executionArgs.search_text ??=
+      executionArgs.old_content ??
+      executionArgs.old_text ??
+      executionArgs.oldString ??
+      executionArgs.search;
+    executionArgs.replace_text ??=
+      executionArgs.new_content ??
+      executionArgs.new_text ??
+      executionArgs.newString ??
+      executionArgs.replace;
+    for (const alias of [
+      "target",
+      "file_path",
+      "file",
+      "old_content",
+      "old_text",
+      "oldString",
+      "search",
+      "new_content",
+      "new_text",
+      "newString",
+      "replace",
+    ]) {
+      delete executionArgs[alias];
+    }
+  }
+
   const normalized: Record<string, unknown> = {};
 
-  for (const [key, value] of Object.entries(args || {})) {
+  for (const [key, value] of Object.entries(executionArgs)) {
     if (value === undefined || value === null) continue;
     normalized[key] = normalizeScalarArgument(key, value, workspace);
   }

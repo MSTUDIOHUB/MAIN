@@ -195,8 +195,10 @@ test("preferred subagent collaboration becomes an explicit runtime intake contra
   });
 
   assert.match(block, /subagentPreference: preferred/);
-  assert.match(block, /存在一个独立范围时应尽早创建一个/);
-  assert.match(block, /当前运行容量创建多个/);
+  assert.match(block, /0～N 个全新一次性子智能体/);
+  assert.match(block, /绝不能仅按目录拆分/);
+  assert.match(block, /终态后永久关闭且不得复用/);
+  assert.match(block, /只能接收已验证的精简证据/);
 });
 
 test("session preference supplies preferred only when user text is unspecified", () => {

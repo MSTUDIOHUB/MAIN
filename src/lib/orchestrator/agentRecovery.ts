@@ -1,5 +1,6 @@
 import type { ResolvedUserIntent } from "../runIntent";
 import type { StreamResult } from "../streaming";
+import { TOOL_DEFINITIONS } from "../toolSchemas";
 import { generateId } from "../utils";
 import { detectResponseLanguageMismatch } from "../workflowModels";
 import {
@@ -295,6 +296,54 @@ export function buildExecuteXmlTextActionRecoveryPrompt(input: {
   availableTools: string[];
 }): string {
   const toolList = input.availableTools.slice(0, 16).join(", ");
+  const exampleTool = input.availableTools[0] || "read_file";
+  const definition = TOOL_DEFINITIONS.find(
+    (tool) => tool.function.name === exampleTool,
+  );
+  const requiredParameters = Array.isArray(
+    definition?.function.parameters.required,
+  )
+    ? definition.function.parameters.required
+    : [];
+  const parameterPlaceholder = (name: string): string => {
+    const zh = input.language === "zh";
+    switch (name) {
+      case "command":
+        return zh
+          ? "使用活动契约固定的命令"
+          : "use the exact command pinned by the active contract";
+      case "description":
+        return zh ? "简述本次调用目的" : "brief purpose of this tool call";
+      case "path":
+        return zh ? "相对 workspace 的路径" : "workspace-relative path";
+      case "search_text":
+        return zh ? "与当前源文件完全一致的原文" : "exact current source block";
+      case "replace_text":
+        return zh ? "替换后的源码" : "replacement source block";
+      case "content":
+        return zh ? "完整文件内容" : "complete file content";
+      case "patch":
+        return "*** Begin Patch ... *** End Patch";
+      case "url":
+        return "http://localhost:PORT/";
+      case "app_name":
+        return zh ? "目标应用名称" : "target application name";
+      case "offset":
+        return "0";
+      default:
+        return zh ? `活动契约要求的 ${name}` : `${name} required by the active contract`;
+    }
+  };
+  const exampleParameters = requiredParameters.map(
+    (name) =>
+      `<parameter name="${name}">${parameterPlaceholder(name)}</parameter>`,
+  );
+  const example = [
+    "<tool_use>",
+    `<tool>${exampleTool}</tool>`,
+    ...exampleParameters,
+    "</tool_use>",
+  ];
   if (input.language === "en") {
     return [
       "The previous execute reply was plain text, but this local profile uses XML tool calls. Plain text is not executable progress in an execute turn.",
@@ -302,11 +351,8 @@ export function buildExecuteXmlTextActionRecoveryPrompt(input: {
       "Continue with exactly one of these outcomes:",
       "1. If the task can proceed, output exactly one valid XML `<tool_use>` block and no surrounding prose.",
       "2. If a real permission, evidence, or product-choice blocker prevents action, output concise Markdown plus `<user_options>` choices and stop.",
-      "Valid XML shape:",
-      "<tool_use>",
-      "<tool>read_file</tool>",
-      "<parameter name=\"path\">workspace-relative path</parameter>",
-      "</tool_use>",
+      `Valid XML shape for the currently exposed ${exampleTool} capability:`,
+      ...example,
       input.retryCount > 1 ? "This is a repeated protocol miss. Do not summarize or sign off without tool evidence." : "",
     ].filter(Boolean).join("\n");
   }
@@ -317,11 +363,8 @@ export function buildExecuteXmlTextActionRecoveryPrompt(input: {
     "下一条只能完成以下其一：",
     "1. 如果任务还能推进，只输出一个合法 XML `<tool_use>` 块，不要包裹解释或总结。",
     "2. 如果确实被权限、证据或产品选择阻塞，用简短 Markdown 说明阻塞点，并输出 `<user_options>` 选项后停止。",
-    "合法 XML 形状：",
-    "<tool_use>",
-    "<tool>read_file</tool>",
-    "<parameter name=\"path\">相对 workspace 的路径</parameter>",
-    "</tool_use>",
+    `当前开放的 ${exampleTool} 能力应使用以下 XML 形状：`,
+    ...example,
     input.retryCount > 1 ? "这已经是重复协议偏离。没有工具证据时不要总结或收尾。" : "",
   ].filter(Boolean).join("\n");
 }

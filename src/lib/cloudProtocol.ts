@@ -533,8 +533,14 @@ export function buildCloudModelListCandidates(endpoint: string, protocol: CloudA
     return [`${base}/v1beta/models`];
   }
 
-  const base = stripOpenAiChatPath(normalized);
+  const base = stripOpenAiResponsesPath(stripOpenAiChatPath(normalized));
   if (normalized.endsWith("/models")) return [normalized];
+  if (base !== normalized) {
+    if (base.endsWith("/v1")) {
+      return [`${base}/models`, `${base.replace(/\/v1$/i, "")}/models`];
+    }
+    return [`${base}/models`, `${base}/v1/models`];
+  }
   if (base.endsWith("/v1")) {
     return [`${base}/models`, `${base.replace(/\/v1$/i, "")}/models`];
   }

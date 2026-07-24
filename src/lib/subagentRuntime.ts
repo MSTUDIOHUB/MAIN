@@ -9,10 +9,14 @@ import { normalizeAgentLoopOutcome } from "./runOutcome";
 import {
   activateSubagentScopeLease,
   buildSubagentPolicyDeferral,
+  closeCollaborationTask,
+  evaluateCollaborationTaskAdmission,
   findSubagentLeaseOverlap,
+  getVerifiedCollaborationDependencyContext,
   getSubagentBurstAdmission,
   registerSubagentAbortController,
   registerCoordinatedSubagentRun,
+  registerCollaborationTask,
   recordSubagentRuntimeSample,
   reportSubagentCapacityFailure,
   normalizeSubagentSessionEpoch,
@@ -22,6 +26,7 @@ import {
   resolveSubagentPathCoverage,
   resolveSubagentCapacityPolicy,
   unregisterSubagentAbortController,
+  updateCollaborationTaskState,
   withSubagentCapacity,
   SUBAGENT_CLOSURE_SCHEMA_VERSION,
   type SpawnSubagentRequest,
@@ -35,7 +40,13 @@ import {
   type SubagentResultEnvelope,
   type SubagentRunSnapshot,
   type SubagentStatus,
+  type VerifiedCollaborationDependencyContext,
 } from "./subagents";
+import {
+  normalizeCollaborationWorkItemDraft,
+  type CollaborationTaskLifecycleState,
+  type CollaborationWorkItemV1,
+} from "./collaborationWorkItems";
 import { withEventSchema, type MainThreadEvent } from "./turnEvents";
 import { generateId } from "./utils";
 import { getFileMetadata } from "./ipc";
@@ -62,6 +73,9 @@ const SUBAGENT_EVIDENCE_TOOL_NAMES = new Set([
   "code_ast_query",
   "find_symbol_references",
   "git_diff",
+  "apply_patch",
+  "replace_in_file",
+  "write_file",
 ]);
 
 type ExecuteAgentLoop = (
@@ -459,10 +473,20 @@ export async function resolveSubagentExecutionScopePaths(input: {
 }
 
 export function resolveReadOnlySubagentRole(_requestedRole: unknown): string {
-  // Every child runtime is intentionally read/search-only. Keep the persisted
-  // role aligned with its actual capability instead of displaying model-authored
-  // labels such as "coder" that imply it can modify the workspace.
+  // Read tasks must not acquire a mutation role from model-authored labels.
   return "investigator";
+}
+
+function resolveSubagentRole(
+  requestedRole: unknown,
+  workItem?: Pick<CollaborationWorkItemV1, "taskKind" | "accessMode">,
+): string {
+  if (!workItem || workItem.accessMode === "read") {
+    return workItem?.taskKind === "review"
+      ? "reviewer"
+      : resolveReadOnlySubagentRole(requestedRole);
+  }
+  return workItem.taskKind === "implement" ? "implementer" : "validator";
 }
 
 function compactEvidenceFragment(value: unknown, maxChars: number): string {
@@ -612,39 +636,81 @@ function compactEvidence(
   return compacted;
 }
 
-function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"): string {
-  const hints = compactText(request.contextHints, 1_600);
-  const allowedPaths = compactText(request.allowedPaths, 2_000);
+function buildChildPrompt(
+  request: SpawnSubagentRequest,
+  workItem: CollaborationWorkItemV1,
+  language: "zh" | "en",
+  dependencyContext: VerifiedCollaborationDependencyContext[],
+): string {
+  const allowedPaths = workItem.allowedPaths.join(", ");
+  const requiredPaths = workItem.requiredPaths.join(", ");
   const scope = compactText(request.scope, 500);
-  const expectedOutput = compactText(request.expectedOutput, 500);
+  const criteria = workItem.successCriteria.map((criterion) => `- ${criterion}`).join("\n");
+  const writeMode = workItem.accessMode === "write";
+  const verifiedDependencies = dependencyContext.flatMap((dependency) => {
+    const header = language === "en"
+      ? `Dependency ${dependency.taskKey} (${dependency.collaborationTaskId}, ${dependency.terminalState}; receipts: ${dependency.evidenceReceiptIds.join(", ") || "none"})`
+      : `依赖任务 ${dependency.taskKey}（${dependency.collaborationTaskId}，${dependency.terminalState}；收据：${dependency.evidenceReceiptIds.join(", ") || "无"}）`;
+    const observations = dependency.observations.map((observation) => {
+      const evidence = observation.facts.length > 0
+        ? observation.facts.join("; ")
+        : observation.detail;
+      return `- ${observation.tool} · ${observation.target}: ${compactText(evidence, 700)}`;
+    });
+    return [header, ...observations];
+  }).join("\n");
   if (language === "en") {
     return [
-      "You are a bounded read-only subagent working for a parent task.",
-      `Role: ${resolveReadOnlySubagentRole(request.role)} (read-only)`,
-      `Objective: ${request.objective}`,
+      "You are a fresh, one-shot subagent working for a parent Turn. This runtime identity can execute only the immutable task below and will be permanently closed when it ends.",
+      `Task ID: ${workItem.collaborationTaskId}`,
+      `Task key/type: ${workItem.taskKey} / ${workItem.taskKind}`,
+      `Role: ${resolveSubagentRole(request.role, workItem)} (${workItem.accessMode})`,
+      `Objective: ${workItem.objective}`,
+      `Delegation reason: ${workItem.delegationReason}`,
+      `Success criteria:\n${criteria}`,
       scope ? `Owned scope: ${scope}` : "",
-      hints ? `Context hints: ${hints}` : "",
       allowedPaths ? `Allowed paths: ${allowedPaths}` : "",
-      expectedOutput ? `Expected output: ${expectedOutput}` : "",
-      "Use only the read/search tools exposed to you. Do not modify files, run shell commands, request approval, or spawn another agent.",
+      requiredPaths ? `Required paths: ${requiredPaths}` : "",
+      `Expected output: ${workItem.expectedOutput}`,
+      "Necessary user constraints must be represented by this immutable task contract. No parent transcript or previous subagent conversation, reasoning, or model-authored summary is inherited.",
+      verifiedDependencies
+        ? `Verified dependency evidence (runtime-authenticated tool observations only):\n${verifiedDependencies}`
+        : "Verified dependency evidence: none.",
+      writeMode
+        ? "Use only the structured mutation tools exposed by inherited parent approval and the exact write lease. Do not run shell commands, request approval, widen paths, or spawn another agent."
+        : "Use only the read/search tools exposed to you. Do not modify files, run shell commands, request approval, widen paths, or spawn another agent.",
       "Do not finish by proposing a tool call that is still available to you. A complete report needs at least one source-backed observation; if an outline or search is empty, read an exact allowed file before summarizing.",
-      "Completion is measured only against your assigned read-only scope, not the parent task. Stay inside the allowed paths and return concise Findings, Uncertainty, Remaining In-Scope Work, and Parent Handoff sections.",
-      "Remaining In-Scope Work lists only an allowed read/search action required by the objective or expected output that you did not complete. If all assigned investigation is complete, write 'none'. Put edits, implementation suggestions, user/parent decisions, and checks outside allowed paths under Parent Handoff; those do not make the child incomplete.",
+      "Completion is measured only against this assigned task, not the parent task. Stay inside the allowed paths and return concise Findings, Uncertainty, Remaining In-Scope Work, and Parent Handoff sections.",
+      writeMode
+        ? "Remaining In-Scope Work lists only an allowed, approved mutation or validation required by this task that you did not complete. If the assigned implementation is complete, write 'none'. Put user/parent decisions and checks outside allowed paths under Parent Handoff."
+        : "Remaining In-Scope Work lists only an allowed read/search action required by the objective or expected output that you did not complete. If all assigned investigation is complete, write 'none'. Put edits, implementation suggestions, user/parent decisions, and checks outside allowed paths under Parent Handoff; those do not make the child incomplete.",
       "Never offer approval choices or address the end user directly.",
     ].filter(Boolean).join("\n\n");
   }
   return [
-    "你是主任务派生出的有界只读子智能体。",
-    `角色：${resolveReadOnlySubagentRole(request.role)}（只读调查）`,
-    `目标：${request.objective}`,
+    "你是父回合创建的全新一次性子智能体。该运行身份只能执行下面这个不可变任务，结束后会永久关闭。",
+    `任务 ID：${workItem.collaborationTaskId}`,
+    `任务键/类型：${workItem.taskKey} / ${workItem.taskKind}`,
+    `角色：${resolveSubagentRole(request.role, workItem)}（${writeMode ? "受控写入" : "只读"}）`,
+    `目标：${workItem.objective}`,
+    `委派原因：${workItem.delegationReason}`,
+    `成功标准：\n${criteria}`,
     scope ? `负责范围：${scope}` : "",
-    hints ? `上下文提示：${hints}` : "",
     allowedPaths ? `允许路径：${allowedPaths}` : "",
-    expectedOutput ? `预期产出：${expectedOutput}` : "",
-    "只使用当前暴露的读取与搜索工具。不得修改文件、运行 Shell 命令、请求用户批准或继续创建子智能体。",
+    requiredPaths ? `必查路径：${requiredPaths}` : "",
+    `预期产出：${workItem.expectedOutput}`,
+    "必要的用户约束必须体现在这个不可变任务契约中。不会继承父线程原始对话，也不会继承旧子智能体的对话、推理或模型总结。",
+    verifiedDependencies
+      ? `已验证依赖证据（仅 runtime 认证的工具观察）：\n${verifiedDependencies}`
+      : "已验证依赖证据：无。",
+    writeMode
+      ? "只能使用父级审批继承且受精确写租约约束的结构化修改工具。不得运行 Shell、请求新批准、扩大路径或继续创建子智能体。"
+      : "只使用当前暴露的读取与搜索工具。不得修改文件、运行 Shell、请求用户批准、扩大路径或继续创建子智能体。",
     "不要以“稍后再调用当前可用工具”结束任务。完整报告至少需要一条源码支撑的观察；若 outline 或搜索为空，应先读取一个允许的精确文件再总结。",
-    "完成状态只按分配给你的只读范围判断，不按父任务是否全部完成判断。严格限制在允许路径内，并用“结论 / 不确定项 / 剩余范围内工作 / 父任务交接”四个部分返回简洁证据摘要。",
-    "“剩余范围内工作”只能列出目标或预期产出要求、允许路径内且你尚未完成的读取/搜索动作；如果分配的调查已经完成，明确写“无”。文件修改、实施建议、用户或父任务决策、允许路径外的核对都放入“父任务交接”，它们不代表子任务未完成。",
+    "完成状态只按分配给你的独立任务判断，不按父任务是否全部完成判断。严格限制在允许路径内，并用“结论 / 不确定项 / 剩余范围内工作 / 父任务交接”四个部分返回简洁证据摘要。",
+    writeMode
+      ? "“剩余范围内工作”只能列出该任务要求、已获批准且允许路径内尚未完成的修改或验证；如果分配的实施已经完成，明确写“无”。用户或父任务决策、允许路径外的核对放入“父任务交接”。"
+      : "“剩余范围内工作”只能列出目标或预期产出要求、允许路径内且你尚未完成的读取/搜索动作；如果分配的调查已经完成，明确写“无”。文件修改、实施建议、用户或父任务决策、允许路径外的核对都放入“父任务交接”，它们不代表子任务未完成。",
     "不要提供批准选项，也不要直接面向最终用户说话。",
   ].filter(Boolean).join("\n\n");
 }
@@ -721,6 +787,8 @@ function buildRuntimeSubagentClosure(input: {
 }
 
 interface PreparedSubagentRun {
+  workItem: CollaborationWorkItemV1;
+  collaborationTaskId: string;
   subagentId: string;
   generation: string;
   name: string;
@@ -728,6 +796,7 @@ interface PreparedSubagentRun {
   objective: string;
   scopeKey: string;
   allowedPaths: string[];
+  dependencyContext: VerifiedCollaborationDependencyContext[];
 }
 
 export function scheduleControlledSubagent(input: {
@@ -745,7 +814,7 @@ export function scheduleControlledSubagent(input: {
   // existingRunCount is the number of currently registered children, not a
   // lifetime Turn counter. Completed children are joined and released, after
   // which a later diagnostic/verification wave may use the capacity again.
-  if (input.existingRunCount >= policy.maxCreatedPerTurn) {
+  if (input.existingRunCount >= policy.maxConcurrentChildren) {
     const deferred = buildSubagentPolicyDeferral({
       name: input.request.name,
       scopeKey: input.request.scopeKey || input.request.scope,
@@ -755,37 +824,144 @@ export function scheduleControlledSubagent(input: {
       decision: "deferred",
       reason: deferred.reason,
       activeRunCount: input.existingRunCount,
-      maxCreatedPerTurn: policy.maxCreatedPerTurn,
+      maxConcurrentChildren: policy.maxConcurrentChildren,
       profile: policy.profile,
     });
     return deferred;
   }
 
+  const collaborationTaskId = `collaboration-task-${generateId()}`;
+  const parsedAllowedPaths = parseSubagentAllowedPaths(
+    input.request.allowedPaths,
+    parentConfig.workspace,
+  );
+  const parsedRequiredPaths = parseSubagentAllowedPaths(
+    input.request.requiredPaths,
+    parentConfig.workspace,
+  );
+  const workItemValidation = normalizeCollaborationWorkItemDraft({
+    collaborationTaskId,
+    draft: {
+      taskKey: input.request.taskKey,
+      taskKind: input.request.taskKind,
+      objective: input.request.objective,
+      delegationReason: input.request.delegationReason,
+      successCriteria: input.request.successCriteria,
+      expectedOutput: input.request.expectedOutput,
+      requiredPaths: parsedRequiredPaths,
+      allowedPaths: parsedAllowedPaths,
+      accessMode: input.request.accessMode,
+      dependsOn: input.request.dependsOn,
+      independentReviewOf: input.request.independentReviewOf,
+      goalSliceId: input.parentCallbacks.getCurrentRunIdentity?.().goalSliceId,
+    },
+  });
+  if (
+    !workItemValidation.ok ||
+    input.request.requiredPaths === undefined ||
+    String(input.request.objective || "").trim().length > 800
+  ) {
+    const deferred = buildSubagentPolicyDeferral({
+      collaborationTaskId,
+      name: input.request.name,
+      scopeKey: input.request.taskKey || input.request.scopeKey || input.request.scope,
+      reason: "invalid_task_contract",
+    });
+    input.parentCallbacks.onDebugEvent?.("delegation_admission_decision", {
+      decision: "deferred",
+      reason: deferred.reason,
+      collaborationTaskId,
+      missingFields: workItemValidation.ok
+        ? input.request.requiredPaths === undefined
+          ? ["required_paths"]
+          : ["objective_too_broad"]
+        : workItemValidation.missingFields,
+      failureKind: "policy",
+    });
+    return deferred;
+  }
+  const workItem = workItemValidation.workItem;
+  const parentIntent = input.parentCallbacks.getRuntimeRunIntent?.() ||
+    input.parentCallbacks.getCurrentRunIntent?.() ||
+    "analyze";
+  const writeAuthorized = workItem.accessMode === "read" ||
+    parentIntent === "goal" ||
+    (
+      parentIntent === "execute" &&
+      input.parentCallbacks.getExecutionConsentGranted?.() === true
+    ) ||
+    input.parentCallbacks.getIsPlanApproved();
+  if (!writeAuthorized) {
+    return buildSubagentPolicyDeferral({
+      collaborationTaskId,
+      name: input.request.name,
+      scopeKey: workItem.taskKey,
+      reason: "write_not_authorized",
+    });
+  }
+  const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
+  const parentThreadId = input.parentCallbacks.getSessionKey();
+  const semanticAdmission = evaluateCollaborationTaskAdmission({
+    threadId: parentThreadId,
+    sessionEpoch: parentSessionEpoch,
+    parentTurnId: input.parentTurnId,
+    workItem,
+  });
+  if (semanticAdmission.action === "defer") {
+    const existing = semanticAdmission.existing;
+    const existingStatus =
+      existing?.terminalState === "completed" ||
+        existing?.result?.closureAudit.state === "satisfied"
+      ? "completed"
+      : existing?.terminalState === "partial" ||
+          existing?.result?.closureAudit.state === "partial"
+      ? "partial"
+      : existing?.terminalState === "canceled" ||
+          existing?.state === "canceled"
+      ? "canceled"
+      : "blocked";
+    return buildSubagentPolicyDeferral({
+      collaborationTaskId,
+      name: input.request.name,
+      scopeKey: workItem.taskKey,
+      reason: semanticAdmission.reason,
+      ...(semanticAdmission.reason === "evidence_already_satisfied" && existing
+        ? {
+            existingEvidenceReceipt: {
+              collaborationTaskId: existing.workItem.collaborationTaskId,
+              subagentId: existing.subagentId,
+              runId: existing.runId,
+              status: existingStatus,
+              evidenceReceiptIds: [...existing.evidenceReceiptIds],
+              evidenceCount: existing.result?.evidence.length || 0,
+            },
+          }
+        : {}),
+    });
+  }
+
   const subagentId = `subagent-${generateId()}`;
   const generation = `subagent-generation-${generateId()}`;
-  const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
   const name = sanitizeName(input.request.name, input.existingRunCount);
   const requestedRole = compactText(input.request.role || "", 48);
-  const role = resolveReadOnlySubagentRole(requestedRole);
-  const rawObjective = String(input.request.objective || "").trim();
-  if (rawObjective.length > 800) {
-    throw new Error("SUBAGENT_SCOPE_TOO_BROAD: objective must be 800 characters or fewer.");
-  }
-  const objective = compactText(rawObjective, 800);
-  if (!objective) throw new Error("Subagent objective is required.");
-  const allowedPaths = parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace);
-  if (allowedPaths.length === 0) {
-    throw new Error("SUBAGENT_SCOPE_REQUIRED: workspace subagents require allowed_paths.");
-  }
+  const role = resolveSubagentRole(requestedRole, workItem);
+  const objective = workItem.objective;
+  const allowedPaths = workItem.allowedPaths;
   if (policy.profile === "local" && allowedPaths.length > 6) {
-    throw new Error("SUBAGENT_SCOPE_TOO_BROAD: local subagents may own at most 6 paths.");
+    return buildSubagentPolicyDeferral({
+      collaborationTaskId,
+      name,
+      scopeKey: workItem.taskKey,
+      reason: "invalid_task_contract",
+    });
   }
-  const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
+  const scopeKey = workItem.taskKey;
   const leaseOverlap = findSubagentLeaseOverlap({
     threadId: input.parentCallbacks.getSessionKey(),
     sessionEpoch: parentSessionEpoch,
     workspace: parentConfig.workspace,
     allowedPaths,
+    accessMode: workItem.accessMode,
   });
   if (leaseOverlap) {
     input.parentCallbacks.onDebugEvent?.("delegation_scope_decision", {
@@ -796,6 +972,7 @@ export function scheduleControlledSubagent(input: {
       allowedPaths,
     });
     return buildSubagentPolicyDeferral({
+      collaborationTaskId,
       name,
       scopeKey,
       reason: "overlapping_active_scope",
@@ -804,6 +981,8 @@ export function scheduleControlledSubagent(input: {
     });
   }
   const prepared: PreparedSubagentRun = {
+    workItem,
+    collaborationTaskId,
     subagentId,
     generation,
     name,
@@ -811,8 +990,35 @@ export function scheduleControlledSubagent(input: {
     objective,
     scopeKey,
     allowedPaths,
+    dependencyContext: getVerifiedCollaborationDependencyContext({
+      threadId: parentThreadId,
+      sessionEpoch: parentSessionEpoch,
+      parentTurnId: input.parentTurnId,
+      dependencies: workItem.dependsOn,
+    }),
   };
+  const childRunId = `run-${subagentId}`;
+  registerCollaborationTask({
+    threadId: parentThreadId,
+    sessionEpoch: parentSessionEpoch,
+    parentTurnId: input.parentTurnId,
+    workItem,
+    subagentId,
+    runId: childRunId,
+  });
+  updateCollaborationTaskState({
+    threadId: parentThreadId,
+    sessionEpoch: parentSessionEpoch,
+    parentTurnId: input.parentTurnId,
+    collaborationTaskId,
+    state: "queued",
+  });
   input.parentCallbacks.onDebugEvent?.("subagent_scheduled", {
+    collaborationTaskId,
+    taskKey: workItem.taskKey,
+    taskKind: workItem.taskKind,
+    semanticFingerprint: workItem.semanticFingerprint,
+    accessMode: workItem.accessMode,
     subagentId,
     name,
     role,
@@ -831,16 +1037,24 @@ export function scheduleControlledSubagent(input: {
     threadId: input.parentCallbacks.getSessionKey(),
     sessionEpoch: parentSessionEpoch,
     parentTurnId: input.parentTurnId,
+    collaborationTaskId,
     subagentId,
     generation,
     name,
     scopeKey,
     objective,
-    runId: `run-${subagentId}`,
+    runId: childRunId,
     parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
     completion,
   });
-  return { subagentId, name, status: "queued", scopeKey, allowedPaths };
+  return {
+    subagentId,
+    collaborationTaskId,
+    name,
+    status: "queued",
+    scopeKey,
+    allowedPaths,
+  };
 }
 
 export async function executeControlledSubagent(input: {
@@ -858,18 +1072,54 @@ export async function executeControlledSubagent(input: {
   const language = input.parentCallbacks.getPreferredLanguage();
   const policy = resolveSubagentCapacityPolicy(parentConfig);
   const prepared = input.prepared || (() => {
+    const collaborationTaskId = `collaboration-task-${generateId()}`;
     const objective = compactText(input.request.objective, 800);
+    const validation = normalizeCollaborationWorkItemDraft({
+      collaborationTaskId,
+      draft: {
+        taskKey: input.request.taskKey || input.request.scopeKey || "legacy-task",
+        taskKind: input.request.taskKind || "explore",
+        objective,
+        delegationReason: input.request.delegationReason || "Direct controlled child execution.",
+        successCriteria: input.request.successCriteria || input.request.expectedOutput || "Return source-backed evidence.",
+        expectedOutput: input.request.expectedOutput || "Concise evidence summary.",
+        requiredPaths: parseSubagentAllowedPaths(input.request.requiredPaths, parentConfig.workspace),
+        allowedPaths: parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace),
+        accessMode: input.request.accessMode || "read",
+        dependsOn: input.request.dependsOn,
+        independentReviewOf: input.request.independentReviewOf,
+        goalSliceId: input.request.goalSliceId,
+      },
+    });
+    if (!validation.ok) {
+      throw new Error(validation.reason);
+    }
+    const workItem = validation.workItem;
     return {
+      workItem,
+      collaborationTaskId,
       subagentId: `subagent-${generateId()}`,
       generation: `subagent-generation-${generateId()}`,
       name: sanitizeName(input.request.name, input.existingRunCount),
-      role: resolveReadOnlySubagentRole(input.request.role),
+      role: resolveSubagentRole(input.request.role, workItem),
       objective,
-      scopeKey: compactText(input.request.scopeKey || input.request.scope || objective, 96),
-      allowedPaths: parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace),
+      scopeKey: workItem.taskKey,
+      allowedPaths: workItem.allowedPaths,
+      dependencyContext: [],
     };
   })();
-  const { subagentId, generation, name, role, objective, scopeKey, allowedPaths } = prepared;
+  const {
+    workItem,
+    collaborationTaskId,
+    subagentId,
+    generation,
+    name,
+    role,
+    objective,
+    scopeKey,
+    allowedPaths,
+    dependencyContext,
+  } = prepared;
   const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
   const runtimeOwnership = {
     threadId: input.parentCallbacks.getSessionKey(),
@@ -888,12 +1138,15 @@ export async function executeControlledSubagent(input: {
       parentRunId,
       agentKind: "subagent",
       subagentId,
+      collaborationTaskId,
     });
   };
 
   const now = Date.now();
   const snapshot: SubagentRunSnapshot = {
     id: subagentId,
+    collaborationTaskId,
+    workItem,
     parentTurnId: input.parentTurnId,
     threadId: input.parentCallbacks.getSessionKey(),
     name,
@@ -922,9 +1175,16 @@ export async function executeControlledSubagent(input: {
     threadId: snapshot.threadId,
     turnId: input.parentTurnId,
     timestampMs: now,
+    collaborationTaskId,
+    subagentId,
+    runId: childRunId,
+    parentRunId,
     subagent: snapshot,
   }));
   emitChildDebug("subagent_queued", {
+    collaborationTaskId,
+    taskKey: workItem.taskKey,
+    taskKind: workItem.taskKind,
     scopeKey,
     profile: policy.profile,
     childCapacity: policy.maxActiveRequests,
@@ -941,6 +1201,7 @@ export async function executeControlledSubagent(input: {
     scopeKey,
     workspace: parentConfig.workspace,
     allowedPaths,
+    accessMode: workItem.accessMode,
     createdAt: now,
   });
   emitChildDebug("subagent_scope_reserved", {
@@ -960,19 +1221,26 @@ export async function executeControlledSubagent(input: {
 
   let childMessages: AgentMessage[] = [{
     role: "user",
-    content: buildChildPrompt(input.request, language),
+    content: buildChildPrompt(
+      input.request,
+      workItem,
+      language,
+      dependencyContext,
+    ),
   }];
   let childStatus: "idle" | "running" | "pending_review" | "error" = "idle";
   let streamText = "";
   let finalText = "";
   let turnSummary = "";
   let lastError = "";
+  let finalResultEnvelope: SubagentResultEnvelope | null = null;
   let completedToolCalls = 0;
   const evidence: SubagentResultEnvelope["evidence"] = [];
   // allowedPaths is an authorization ceiling, not an obligation to inspect
   // every permitted root. Required coverage is introduced only by a concrete
   // runtime fan-out (or a future explicit completion contract).
   const requiredObservationPaths = new Set<string>();
+  for (const path of workItem.requiredPaths) requiredObservationPaths.add(path);
   const coveredObservationPaths = new Set<string>();
   const failedObservationPaths = new Set<string>();
   let activitySequence = 0;
@@ -983,6 +1251,7 @@ export async function executeControlledSubagent(input: {
   const initiallyFileLikePaths = allowedPaths.filter(looksLikeExactFilePath);
   const subagentExecutionScope: SubagentExecutionScope = {
     subagentId,
+    collaborationTaskId,
     parentSessionKey: snapshot.threadId,
     scopeKey,
     workspace: parentConfig.workspace,
@@ -992,6 +1261,7 @@ export async function executeControlledSubagent(input: {
     scopeKind: initiallyFileLikePaths.length === allowedPaths.length
       ? "exact_files"
       : "directory_or_mixed",
+    accessMode: workItem.accessMode,
     blockedToolNames: [],
   };
   const resolvePathCoverage = (): SubagentPathCoverageAudit => resolveSubagentPathCoverage({
@@ -1001,12 +1271,40 @@ export async function executeControlledSubagent(input: {
   });
 
   const emitUpdate = (patch: SubagentRunPatch, activity?: SubagentActivity) => {
+    const collaborationState: CollaborationTaskLifecycleState | null =
+      patch.status === "queued"
+        ? "queued"
+        : patch.status === "starting" || patch.status === "running"
+        ? "running"
+        : patch.status === "summarizing"
+        ? "summarizing"
+        : patch.status === "completed"
+        ? "completed"
+        : patch.status === "degraded"
+        ? "partial"
+        : patch.status === "canceled"
+        ? "canceled"
+        : patch.status === "blocked" || patch.status === "failed"
+        ? "blocked"
+        : null;
+    if (collaborationState) {
+      updateCollaborationTaskState({
+        threadId: snapshot.threadId,
+        sessionEpoch: parentSessionEpoch,
+        parentTurnId: input.parentTurnId,
+        collaborationTaskId,
+        state: collaborationState,
+      });
+    }
     input.emitEvent(withEventSchema({
       type: "subagent.updated",
       threadId: snapshot.threadId,
       turnId: input.parentTurnId,
       timestampMs: Date.now(),
+      collaborationTaskId,
       subagentId,
+      runId: childRunId,
+      parentRunId,
       patch: { updatedAt: Date.now(), ...patch },
       ...(activity ? { activity } : {}),
     }));
@@ -1015,7 +1313,10 @@ export async function executeControlledSubagent(input: {
     const current = Date.now();
     if (current - lastProgressEmitAt < 500 && progress.phase === "thinking") return;
     lastProgressEmitAt = current;
-    emitUpdate({ status: "running", progress });
+    emitUpdate({
+      status: progress.phase === "summarizing" ? "summarizing" : "running",
+      progress,
+    });
   };
   const makeActivity = (
     status: SubagentActivity["status"],
@@ -1055,15 +1356,23 @@ export async function executeControlledSubagent(input: {
     getAssociatedPaths: () => input.parentCallbacks.getAssociatedPaths(),
     getSessionKey: () => `${snapshot.threadId}:${subagentId}`,
     getCurrentTurnId: () => subagentId,
-    getCurrentRunIntent: () => "analyze",
-    getRuntimeRunIntent: () => "analyze",
+    getCurrentRunIntent: () => workItem.accessMode === "write" ? "execute" : "analyze",
+    getRuntimeRunIntent: () => workItem.accessMode === "write" ? "execute" : "analyze",
     getGoalTurnContract: () => null,
-    getExecutionConsentGranted: () => false,
+    getExecutionConsentGranted: () => workItem.accessMode === "write",
     getForcedExecuteRecoveryMode: () => null,
     getForcedExecuteRecoveryState: () => null,
-    getCommandDirective: () => null,
-    getWorkflowMode: () => "chat",
-    getIsPlanApproved: () => false,
+    getCommandDirective: () => workItem.accessMode === "write"
+      ? {
+          kind: "file_modify",
+          source: "continuation",
+          requiresWorkspace: true,
+          requiresApproval: false,
+          reason: `Inherited one-shot write task ${collaborationTaskId}`,
+        }
+      : null,
+    getWorkflowMode: () => workItem.accessMode === "write" ? "edit" : "chat",
+    getIsPlanApproved: () => workItem.accessMode === "write",
     getPlanApprovalChoice: () => null,
     getReadOnlyAutoApproveForSession: () => true,
     getApprovedLocalFileReadPaths: () => input.parentCallbacks.getApprovedLocalFileReadPaths(),
@@ -1091,6 +1400,7 @@ export async function executeControlledSubagent(input: {
       parentRunId,
       agentKind: "subagent",
       subagentId,
+      collaborationTaskId,
     }),
     hasSessionHookInitialized: (sessionKey) => initializedHookSessions.has(sessionKey),
     markSessionHookInitialized: (sessionKey) => {
@@ -1125,6 +1435,7 @@ export async function executeControlledSubagent(input: {
     },
     runSubagent: undefined,
     waitSubagents: undefined,
+    cancelSubagent: undefined,
     onGoalProgressUpdate: undefined,
     onGoalRuntimeUpdate: undefined,
     onGoalIterationStart: undefined,
@@ -1278,7 +1589,8 @@ export async function executeControlledSubagent(input: {
           extractPlanEvidenceFacts(detail),
         );
         const isStructureRead = result.name === "get_file_outline";
-        const isDiffRead = result.name === "git_diff";
+        const isDiffRead = result.name === "git_diff" ||
+          ["apply_patch", "replace_in_file", "write_file"].includes(result.name);
         const observationKind = isSourceObservation
           ? "source"
           : isStructureRead
@@ -1368,6 +1680,7 @@ export async function executeControlledSubagent(input: {
             source: "tool_observation",
             owner: {
               agentKind: "subagent",
+              collaborationTaskId,
               subagentId,
               parentTurnId: input.parentTurnId,
               runId: childRunId,
@@ -1613,6 +1926,7 @@ export async function executeControlledSubagent(input: {
             agentKind: "subagent",
             threadId: snapshot.threadId,
             parentTurnId: input.parentTurnId,
+            collaborationTaskId,
             subagentId,
             runId: childRunId,
             parentRunId,
@@ -1668,7 +1982,10 @@ export async function executeControlledSubagent(input: {
             threadId: snapshot.threadId,
             turnId: input.parentTurnId,
             timestampMs: completedAt,
+            collaborationTaskId,
             subagentId,
+            runId: childRunId,
+            parentRunId,
             reason: lastError || outcome.reason,
             evidenceCount: substantiveEvidence.length,
             remainingWork,
@@ -1682,8 +1999,9 @@ export async function executeControlledSubagent(input: {
             remainingWork,
           });
         }
-        return {
+        finalResultEnvelope = {
           subagentId,
+          collaborationTaskId,
           name,
           scopeKey,
           status: finalStatus,
@@ -1696,6 +2014,7 @@ export async function executeControlledSubagent(input: {
           ...(closureAudit.remainingWork ? { remainingWork: closureAudit.remainingWork } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
         };
+        return finalResultEnvelope;
       },
     });
   } catch (error) {
@@ -1732,6 +2051,7 @@ export async function executeControlledSubagent(input: {
         agentKind: "subagent",
         threadId: snapshot.threadId,
         parentTurnId: input.parentTurnId,
+        collaborationTaskId,
         subagentId,
         runId: childRunId,
         parentRunId,
@@ -1789,8 +2109,9 @@ export async function executeControlledSubagent(input: {
       undefined,
       lastError,
     ));
-    return {
+    finalResultEnvelope = {
       subagentId,
+      collaborationTaskId,
       name,
       scopeKey,
       status: finalStatus,
@@ -1802,6 +2123,7 @@ export async function executeControlledSubagent(input: {
       ...(closureAudit.remainingWork ? { remainingWork: closureAudit.remainingWork } : {}),
       error: lastError,
     };
+    return finalResultEnvelope;
   } finally {
     const closedAt = Date.now();
     const finalEvidence = compactEvidence(evidence);
@@ -1839,14 +2161,48 @@ export async function executeControlledSubagent(input: {
       scopeLeaseActivated,
     });
     input.emitEvent(withEventSchema({
+      type: "subagent.completed",
+      threadId: snapshot.threadId,
+      turnId: input.parentTurnId,
+      timestampMs: closedAt,
+      collaborationTaskId,
+      subagentId,
+      runId: childRunId,
+      parentRunId,
+      completedAt: closedAt,
+      status: finalStatus,
+    }));
+    input.emitEvent(withEventSchema({
       type: "subagent.closed",
       threadId: snapshot.threadId,
       turnId: input.parentTurnId,
       timestampMs: closedAt,
+      collaborationTaskId,
       subagentId,
+      runId: childRunId,
+      parentRunId,
       closedAt,
       reason: finalStatus,
     }));
+    if (finalResultEnvelope) {
+      closeCollaborationTask({
+        threadId: snapshot.threadId,
+        sessionEpoch: parentSessionEpoch,
+        parentTurnId: input.parentTurnId,
+        collaborationTaskId,
+        result: finalResultEnvelope,
+        now: closedAt,
+      });
+    } else {
+      updateCollaborationTaskState({
+        threadId: snapshot.threadId,
+        sessionEpoch: parentSessionEpoch,
+        parentTurnId: input.parentTurnId,
+        collaborationTaskId,
+        state: "closed",
+        now: closedAt,
+      });
+    }
     input.parentSignal?.removeEventListener("abort", abortFromParent);
     unregisterSubagentAbortController(subagentId, runtimeOwnership);
     releaseSubagentScopeLease(subagentId, runtimeOwnership);

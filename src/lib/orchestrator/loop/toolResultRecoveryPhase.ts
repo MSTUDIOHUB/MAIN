@@ -110,6 +110,12 @@ import type { TurnIterationContext } from "./turnIterationContext";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
+const DIRECT_MUTATION_PREFLIGHT_RECOVERY_TOOLS = new Set([
+  "apply_patch",
+  "replace_in_file",
+  "write_file",
+]);
+
 type ApprovedPlanCompletionAudit = {
   completedCount: number;
   totalCount: number;
@@ -1514,7 +1520,7 @@ export async function handleToolResultRecoveryPhase(input: {
     emitTurnEvent: input.emitTurnEvent,
   });
 
-  // A real mutation mismatch owns the next transition before any soft
+  // A real mutation preflight failure owns the next transition before any soft
   // no-progress or repetition policy. The preflight result carries a stable
   // reason, target, current file version, and (when inferable) exact source
   // range, so the runtime can issue one precise reread lease without asking
@@ -1522,7 +1528,7 @@ export async function handleToolResultRecoveryPhase(input: {
   const mutationFailureTargets = input.results
     .filter((result) =>
       result.isError &&
-      (result.name === "apply_patch" || result.name === "replace_in_file") &&
+      DIRECT_MUTATION_PREFLIGHT_RECOVERY_TOOLS.has(result.name) &&
       !!String(result.target || "").trim()
     )
     .map((result) => result.target);
@@ -1544,6 +1550,10 @@ export async function handleToolResultRecoveryPhase(input: {
   if (directMutationPreflightRecovery) {
     const previousMode = executeRecoveryState.mode;
     const repeatedTargets = [directMutationPreflightRecovery.target];
+    const failedMutationResult = input.results.find((result) =>
+      result.target === directMutationPreflightRecovery.target &&
+      DIRECT_MUTATION_PREFLIGHT_RECOVERY_TOOLS.has(result.name)
+    );
     executeRecoveryState = activateExecuteRecoveryAndSync(
       directMutationPreflightRecovery.mode,
       directMutationPreflightRecovery.reason,
@@ -1553,6 +1563,8 @@ export async function handleToolResultRecoveryPhase(input: {
         sourceObservationKey: directMutationPreflightRecovery.sourceObservationKey,
         readLease: directMutationPreflightRecovery.readLease,
         decisionCheckpoint: directMutationPreflightRecovery.decisionCheckpoint,
+        protocolNoProgressFingerprint:
+          directMutationPreflightRecovery.protocolNoProgressFingerprint,
       },
     );
     const recoveryContract = resolveExecuteRecoveryActionContract(
@@ -1561,10 +1573,7 @@ export async function handleToolResultRecoveryPhase(input: {
     );
     logAgentEvent("mutation_preflight_recovery_activated", {
       iteration: input.iteration,
-      tool: input.results.find((result) =>
-        result.target === directMutationPreflightRecovery.target &&
-        (result.name === "apply_patch" || result.name === "replace_in_file")
-      )?.name || "",
+      tool: failedMutationResult?.name || "",
       target: directMutationPreflightRecovery.target,
       reason: directMutationPreflightRecovery.reason,
       previousMode,
@@ -1579,7 +1588,7 @@ export async function handleToolResultRecoveryPhase(input: {
     input.emitPlanExecutionProgress("running", {
       currentTool: recoveryContract.nextRequiredCapability === "targeted_read"
         ? "read_file"
-        : "apply_patch",
+        : failedMutationResult?.name || "apply_patch",
       latestEvidence: directMutationPreflightRecovery.reason,
       recoveryReason: directMutationPreflightRecovery.reason,
       nextStep: input.callbacks.getPreferredLanguage() === "zh"

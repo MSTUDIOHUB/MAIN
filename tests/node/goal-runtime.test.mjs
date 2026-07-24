@@ -633,10 +633,11 @@ test("Goal context promotes an explicit multi-subagent preference without making
   });
 
   assert.match(context, /子智能体协作偏好/);
-  assert.match(context, /路径不重叠/);
-  assert.match(context, /存在一个有实质价值的有界只读范围时尽早创建一个/);
-  assert.match(context, /当前容量创建多个/);
-  assert.match(context, /不要为凑数/);
+  assert.match(context, /模型应先按目标与问题结构决定是否委派/);
+  assert.match(context, /独立成功标准和明确收益/);
+  assert.match(context, /不按目录凑数/);
+  assert.match(context, /终态后永久关闭/);
+  assert.match(context, /已验证的精简证据/);
 });
 
 test("tool result parsing accepts zero failures and rejects explicit failures", () => {
@@ -1168,7 +1169,10 @@ test("preferred subagent work persists its structured preference through Goal co
   assert.equal(outcome.status, "completed");
   assert.equal(goal.subagentPreference, "preferred");
   assert.equal(observedContract.subagentPreference, "preferred");
-  assert.match(observedContract.context, /Spawn one early when one bounded read-only scope is independently valuable/);
+  assert.match(observedContract.context, /model first decides from the goal and problem structure whether delegation helps/);
+  assert.match(observedContract.context, /fresh one-shot agents only for narrow semantic tasks/);
+  assert.match(observedContract.context, /never as directory-based filler/);
+  assert.match(observedContract.context, /verified compact evidence only/);
 });
 
 test("Goal Engine completes only after a tool-backed mutation and verification slice", async () => {

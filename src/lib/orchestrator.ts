@@ -323,6 +323,7 @@ export const EXECUTION_REPEAT_READ_LIMIT = 8;
 export const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "cancel_subagent",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -1544,6 +1545,9 @@ export interface OrchestratorCallbacks {
     request: import("./subagents").WaitSubagentsRequest,
     options?: { signal?: AbortSignal },
   ) => Promise<import("./subagents").WaitSubagentsResult>;
+  cancelSubagent?: (
+    request: import("./subagents").CancelSubagentRequest,
+  ) => Promise<import("./subagents").CancelSubagentResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("./goalState").GoalProgress, goal: import("./goalState").GoalDefinition) => void;
@@ -1843,7 +1847,10 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
   if (mutationTargets.length > 0) return mutationTargets.join(", ");
   switch (name) {
     case "spawn_subagent":  return (args.name as string) || (args.objective as string) || "subagent";
-    case "wait_subagents": return (args.subagent_ids as string) || "all subagents";
+    case "wait_subagents": return (args.subagent_ids as string) ||
+      (args.collaboration_task_ids as string) || "all subagents";
+    case "cancel_subagent": return (args.subagent_id as string) ||
+      (args.collaboration_task_id as string) || "subagent";
     case "list_directory":  return (args.path as string) || ".";
     case "read_file":       return (args.path as string) || "";
     case "read_document":   return (args.path as string) || "";
@@ -3946,7 +3953,9 @@ interface ExecuteToolLifecycleOptions {
   attemptedPlanWriteTargets?: string[];
   toolCatalog?: ToolCatalog;
   /** Fires at the child registration boundary, before any same-batch wait_subagents call. */
-  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
+  onSubagentSpawnCreated?: (
+    outcome: SpawnSubagentResult,
+  ) => void | Promise<void>;
   /** Authorization that was computed before PreToolUse ran. */
   authorizationMode?: "automatic" | "session" | "user" | "plan_artifact";
   toolCapabilityRegistry?: ToolCapabilityRegistry;
@@ -4828,27 +4837,54 @@ async function executeToolCallWithLifecycle(
             throw new Error("Subagent runtime is unavailable for this workflow.");
           }
           const result = await callbacks.runSubagent({
+            taskKey: typeof resolvedArgs.task_key === "string"
+              ? resolvedArgs.task_key
+              : typeof resolvedArgs.taskKey === "string" ? resolvedArgs.taskKey : undefined,
+            taskKind: typeof resolvedArgs.task_kind === "string"
+              ? resolvedArgs.task_kind as import("./collaborationWorkItems").CollaborationTaskKind
+              : typeof resolvedArgs.taskKind === "string"
+              ? resolvedArgs.taskKind as import("./collaborationWorkItems").CollaborationTaskKind
+              : undefined,
             objective: String(resolvedArgs.objective || ""),
+            delegationReason: typeof resolvedArgs.delegation_reason === "string"
+              ? resolvedArgs.delegation_reason
+              : typeof resolvedArgs.delegationReason === "string" ? resolvedArgs.delegationReason : undefined,
+            successCriteria: typeof resolvedArgs.success_criteria === "string"
+              ? resolvedArgs.success_criteria
+              : typeof resolvedArgs.successCriteria === "string" ? resolvedArgs.successCriteria : undefined,
             name: typeof resolvedArgs.name === "string" ? resolvedArgs.name : undefined,
             role: typeof resolvedArgs.role === "string" ? resolvedArgs.role : undefined,
-            scopeKey: typeof resolvedArgs.scope_key === "string" ? resolvedArgs.scope_key : undefined,
             scope: typeof resolvedArgs.scope === "string" ? resolvedArgs.scope : undefined,
-            contextHints: typeof resolvedArgs.context_hints === "string"
-              ? resolvedArgs.context_hints
-              : typeof resolvedArgs.contextHints === "string" ? resolvedArgs.contextHints : undefined,
             allowedPaths: typeof resolvedArgs.allowed_paths === "string"
               ? resolvedArgs.allowed_paths
               : typeof resolvedArgs.allowedPaths === "string" ? resolvedArgs.allowedPaths : undefined,
+            requiredPaths: typeof resolvedArgs.required_paths === "string"
+              ? resolvedArgs.required_paths
+              : typeof resolvedArgs.requiredPaths === "string" ? resolvedArgs.requiredPaths : undefined,
+            accessMode: typeof resolvedArgs.access_mode === "string"
+              ? resolvedArgs.access_mode as import("./collaborationWorkItems").CollaborationAccessMode
+              : typeof resolvedArgs.accessMode === "string"
+              ? resolvedArgs.accessMode as import("./collaborationWorkItems").CollaborationAccessMode
+              : undefined,
             expectedOutput: typeof resolvedArgs.expected_output === "string"
               ? resolvedArgs.expected_output
               : typeof resolvedArgs.expectedOutput === "string" ? resolvedArgs.expectedOutput : undefined,
+            dependsOn: typeof resolvedArgs.depends_on === "string"
+              ? resolvedArgs.depends_on
+              : typeof resolvedArgs.dependsOn === "string" ? resolvedArgs.dependsOn : undefined,
+            independentReviewOf: typeof resolvedArgs.independent_review_of === "string"
+              ? resolvedArgs.independent_review_of
+              : typeof resolvedArgs.independentReviewOf === "string" ? resolvedArgs.independentReviewOf : undefined,
+            goalSliceId: typeof resolvedArgs.goal_slice_id === "string"
+              ? resolvedArgs.goal_slice_id
+              : typeof resolvedArgs.goalSliceId === "string" ? resolvedArgs.goalSliceId : undefined,
           }, { signal: options.abortSignal });
           subagentSpawnOutcome = result;
           if (
             result.subagentId !== null &&
             (result.status === "queued" || result.status === "running")
           ) {
-            options.onSubagentSpawnCreated?.(result);
+            await options.onSubagentSpawnCreated?.(result);
           }
           return JSON.stringify(result);
         })()
@@ -4861,7 +4897,14 @@ async function executeToolCallWithLifecycle(
               .split(/[\n,;]+/)
               .map((value) => value.trim())
               .filter(Boolean);
-            const joined = await callbacks.waitSubagents({ subagentIds }, { signal: options.abortSignal });
+            const collaborationTaskIds = String(resolvedArgs.collaboration_task_ids || "")
+              .split(/[\n,;]+/)
+              .map((value) => value.trim())
+              .filter(Boolean);
+            const joined = await callbacks.waitSubagents(
+              { subagentIds, collaborationTaskIds },
+              { signal: options.abortSignal },
+            );
             const unusableFailure = joined.results.find((entry) =>
               entry.status === "failed" &&
               entry.evidence.length === 0 &&
@@ -4872,6 +4915,23 @@ async function executeToolCallWithLifecycle(
             }
             return JSON.stringify(joined);
           })()
+        : tc.name === "cancel_subagent"
+          ? await (async () => {
+              if (!callbacks.cancelSubagent) {
+                throw new Error("Subagent cancellation runtime is unavailable for this workflow.");
+              }
+              const canceled = await callbacks.cancelSubagent({
+                subagentId: typeof resolvedArgs.subagent_id === "string"
+                  ? resolvedArgs.subagent_id
+                  : typeof resolvedArgs.subagentId === "string" ? resolvedArgs.subagentId : undefined,
+                collaborationTaskId: typeof resolvedArgs.collaboration_task_id === "string"
+                  ? resolvedArgs.collaboration_task_id
+                  : typeof resolvedArgs.collaborationTaskId === "string"
+                  ? resolvedArgs.collaborationTaskId
+                  : undefined,
+              });
+              return JSON.stringify(canceled);
+            })()
       : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
             allowExternalLocalRead: effectiveAllowExternalLocalRead,
             shellPermissionApproval: effectiveShellPermissionApproval,

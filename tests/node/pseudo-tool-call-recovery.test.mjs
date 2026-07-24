@@ -65,6 +65,9 @@ const {
   recoverPseudoToolCallFromContext,
   shouldRecoverExecuteXmlTextWithoutAction,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
+const { TOOL_DEFINITIONS } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/toolSchemas.ts"),
+);
 
 test("detects bracketed pseudo tool call placeholders", () => {
   assert.equal(looksLikePseudoToolCallPlaceholder("[Tool call: read_file]"), true);
@@ -159,6 +162,59 @@ test("XML execute text recovery prompt forces a canonical tool or user choice", 
   assert.match(prompt, /<tool_use>/);
   assert.match(prompt, /<user_options>/);
   assert.match(prompt, /不要包裹解释或总结/);
+});
+
+test("XML execute text recovery example follows the active validation surface", () => {
+  const prompt = buildExecuteXmlTextActionRecoveryPrompt({
+    language: "en",
+    retryCount: 1,
+    availableTools: ["run_command"],
+  });
+
+  assert.match(prompt, /<tool>run_command<\/tool>/);
+  assert.match(prompt, /<parameter name="command">/);
+  assert.match(prompt, /<parameter name="description">/);
+  assert.doesNotMatch(prompt, /<parameter name="cwd">/);
+  assert.doesNotMatch(prompt, /<tool>read_file<\/tool>/);
+});
+
+test("XML execute text recovery examples follow each built-in required schema", () => {
+  for (const tool of [
+    "replace_in_file",
+    "write_file",
+    "apply_patch",
+    "execute_command",
+    "browser_evaluate",
+    "computer_use",
+    "read_pty_since",
+    "git_status",
+  ]) {
+    const prompt = buildExecuteXmlTextActionRecoveryPrompt({
+      language: "en",
+      retryCount: 1,
+      availableTools: [tool],
+    });
+    const definition = TOOL_DEFINITIONS.find(
+      (candidate) => candidate.function.name === tool,
+    );
+    assert.ok(definition, `missing fixture schema for ${tool}`);
+    const required = definition.function.parameters.required || [];
+    for (const parameter of required) {
+      assert.match(
+        prompt,
+        new RegExp(`<parameter name="${parameter}">`),
+        `${tool} recovery example must include required ${parameter}`,
+      );
+    }
+    assert.deepEqual(
+      Array.from(
+        prompt.matchAll(/<parameter name="([^"]+)">/g),
+        (match) => match[1],
+      ),
+      required,
+      `${tool} recovery example must contain exactly its required schema keys`,
+    );
+  }
 });
 
 test("recovers pseudo read_file into tabular analysis for a unique @ CSV", () => {

@@ -303,7 +303,6 @@ export function handlePlanPostConvergenceToolRedirect(input: {
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
   latestUserPromptText: string;
-  preferredDelegationRequired?: boolean;
   setPlanRuntimePhase: (phase: PlanRuntimePhase, reason: string) => void;
 }): PlanPostConvergenceToolRedirectResult {
   const {
@@ -326,7 +325,6 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     planLastQualityGateReason,
     planLastMissingSections,
     latestUserPromptText,
-    preferredDelegationRequired = false,
     setPlanRuntimePhase,
   } = input;
 
@@ -359,8 +357,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     ),
   });
   const redirectEligibleToolCalls = effectiveToolCalls.filter((call) =>
-    !isAllowedUnapprovedPlanDraftMutationCall(call) &&
-    !(preferredDelegationRequired && call.name === "spawn_subagent")
+    !isAllowedUnapprovedPlanDraftMutationCall(call)
   );
   const shouldRedirectPostConvergenceToolCalls = shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({
     workflowMode,

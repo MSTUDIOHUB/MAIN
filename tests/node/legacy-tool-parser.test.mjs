@@ -59,6 +59,12 @@ const { sanitizeAIOutput } = loadTranspiledModuleSync(
 const { TOOL_DEFINITIONS } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/toolSchemas.ts"),
 );
+const { normalizeToolCallForExecution } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/toolCallNormalization.ts"),
+);
+const { resolveExecuteRecoveryBatchDecision } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"),
+);
 
 test("parses legacy execute_command wrapper into a real read-only tool call", () => {
   const parsed = parseTextForTools([
@@ -167,22 +173,67 @@ test("parses every registered built-in tool from XML without registry drift", ()
   }
 });
 
+test("native collaboration schemas expose the complete one-shot semantic contract", () => {
+  const spawn = TOOL_DEFINITIONS.find((tool) => tool.function.name === "spawn_subagent");
+  const wait = TOOL_DEFINITIONS.find((tool) => tool.function.name === "wait_subagents");
+  const cancel = TOOL_DEFINITIONS.find((tool) => tool.function.name === "cancel_subagent");
+
+  assert.ok(spawn);
+  assert.deepEqual(spawn.function.parameters.required, [
+    "task_key",
+    "task_kind",
+    "objective",
+    "delegation_reason",
+    "success_criteria",
+    "required_paths",
+    "allowed_paths",
+    "access_mode",
+    "expected_output",
+  ]);
+  assert.deepEqual(spawn.function.parameters.properties.task_kind.enum, [
+    "explore",
+    "review",
+    "implement",
+    "validate",
+  ]);
+  assert.deepEqual(spawn.function.parameters.properties.access_mode.enum, [
+    "read",
+    "write",
+  ]);
+  assert.ok(wait.function.parameters.properties.collaboration_task_ids);
+  assert.ok(cancel.function.parameters.properties.collaboration_task_id);
+  assert.equal(
+    TOOL_DEFINITIONS.some((tool) => tool.function.name === "followup_subagent"),
+    false,
+  );
+});
+
 test("parses parallel subagent spawn calls and a join from local-model XML", () => {
   const parsed = parseTextForTools([
     "<tool_use>",
     "<tool>spawn_subagent</tool>",
+    '<parameter name="task_key">frontend-title-chain</parameter>',
+    '<parameter name="task_kind">explore</parameter>',
     '<parameter name="objective">Inspect frontend initialization</parameter>',
-    '<parameter name="scope_key">frontend</parameter>',
+    '<parameter name="delegation_reason">The title state chain is independently diagnosable</parameter>',
+    '<parameter name="success_criteria">Identify the state owner and render projection</parameter>',
     '<parameter name="scope">Frontend only</parameter>',
+    '<parameter name="required_paths"></parameter>',
     '<parameter name="allowed_paths">src/main.js,src/components</parameter>',
+    '<parameter name="access_mode">read</parameter>',
     '<parameter name="expected_output">Evidence-backed findings</parameter>',
     "</tool_use>",
     "<tool_use>",
     "<tool>spawn_subagent</tool>",
+    '<parameter name="task_key">tauri-open-dialog-chain</parameter>',
+    '<parameter name="task_kind">explore</parameter>',
     '<parameter name="objective">Inspect Tauri configuration</parameter>',
-    '<parameter name="scope_key">tauri</parameter>',
+    '<parameter name="delegation_reason">The native open path is an independent causal chain</parameter>',
+    '<parameter name="success_criteria">Identify the open command and dialog trigger</parameter>',
     '<parameter name="scope">Tauri only</parameter>',
+    '<parameter name="required_paths">src-tauri/src/main.rs</parameter>',
     '<parameter name="allowed_paths">src-tauri/tauri.conf.json,src-tauri/src/main.rs</parameter>',
+    '<parameter name="access_mode">read</parameter>',
     '<parameter name="expected_output">Evidence-backed findings</parameter>',
     "</tool_use>",
     "<tool_use>",
@@ -195,8 +246,9 @@ test("parses parallel subagent spawn calls and a join from local-model XML", () 
     "spawn_subagent",
     "wait_subagents",
   ]);
-  assert.equal(parsed.toolCalls[0].arguments.scope_key, "frontend");
-  assert.equal(parsed.toolCalls[1].arguments.scope_key, "tauri");
+  assert.equal(parsed.toolCalls[0].arguments.task_key, "frontend-title-chain");
+  assert.equal(parsed.toolCalls[1].arguments.task_key, "tauri-open-dialog-chain");
+  assert.equal(parsed.toolCalls[0].arguments.access_mode, "read");
 });
 
 test("parses Gemma OMLX text tool tokens as executable calls", () => {
@@ -217,6 +269,109 @@ test("parses Gemma OMLX text tool tokens as executable calls", () => {
     query: "creatorName",
   });
   assert.equal(parsed.cleanText, "");
+});
+
+test("parses a complete one-shot semantic spawn from plain-text tool tokens", () => {
+  const parsed = parseTextForTools(
+    "<|tool_call>call:spawn_subagent{" +
+      "task_key: 'title-state-chain'," +
+      "task_kind: 'explore'," +
+      "objective: 'Trace the dirty title projection'," +
+      "delegation_reason: 'The UI state chain can be diagnosed independently'," +
+      "success_criteria: 'Identify the state owner and final render projection'," +
+      "required_paths: 'src/main.js'," +
+      "allowed_paths: 'src/main.js,src/components'," +
+      "access_mode: 'read'," +
+      "expected_output: 'Evidence-backed findings with exact paths'" +
+    "}",
+  );
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "spawn_subagent");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    task_key: "title-state-chain",
+    task_kind: "explore",
+    objective: "Trace the dirty title projection",
+    delegation_reason: "The UI state chain can be diagnosed independently",
+    success_criteria: "Identify the state owner and final render projection",
+    required_paths: "src/main.js",
+    allowed_paths: "src/main.js,src/components",
+    access_mode: "read",
+    expected_output: "Evidence-backed findings with exact paths",
+  });
+  assert.equal(parsed.cleanText, "");
+});
+
+test("parses a complete Gemma text mutation when replacement source contains braces and quotes", () => {
+  const newContent = [
+    "export function updateFileInfo(filePath, isDirty = false) {",
+    "  const fileInfo = document.getElementById('file-info');",
+    "  if (fileInfo) {",
+    "    fileInfo.textContent = filePath ? filePath.split('/').pop() : '未打开文件';",
+    "  }",
+    "}",
+  ].join("\n");
+  const oldContent = [
+    "export function updateFileInfo(filePath) {",
+    "  const fileInfo = document.getElementById('file-info');",
+    "  if (fileInfo) {",
+    "    fileInfo.textContent = filePath;",
+    "  }",
+    "}",
+  ].join("\n");
+  const parsed = parseTextForTools(
+    `<|tool_call>call:replace_in_file{new_content: '${newContent}',old_content: '${oldContent}',target: 'src/components/statusbar.js'}`,
+  );
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "replace_in_file");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    new_content: newContent,
+    old_content: oldContent,
+    target: "src/components/statusbar.js",
+  });
+  assert.equal(parsed.cleanText, "");
+});
+
+test("incident-shaped Gemma mutation remains executable through normalization and recovery selection", () => {
+  const parsed = parseTextForTools(
+    [
+      "<|tool_call>call:replace_in_file{",
+      "new_content: 'export function updateFileInfo(filePath) {",
+      "  const title = filePath ? filePath.split('/').pop() : '未打开文件';",
+      "  return { title, dirty: false };",
+      "}',",
+      "old_content: 'export function updateFileInfo(filePath) {",
+      "  return { title: filePath };",
+      "}',",
+      "target: 'src/components/statusbar.js'",
+      "}",
+    ].join("\n"),
+  );
+
+  assert.equal(parsed.toolCalls.length, 1);
+  const call = parsed.toolCalls[0];
+  const args = normalizeToolCallForExecution(
+    call.name,
+    call.arguments,
+    "/workspace",
+  );
+  assert.equal(args.path, "src/components/statusbar.js");
+  assert.match(String(args.search_text), /title: filePath/);
+  assert.match(String(args.replace_text), /dirty: false/);
+
+  const decision = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    expectedTarget: "src/components/statusbar.js",
+    calls: [{
+      id: call.id,
+      name: call.name,
+      target: String(args.path || ""),
+    }],
+  });
+  assert.equal(decision.phase, "need_mutation");
+  assert.equal(decision.selectedCallId, call.id);
+  assert.deepEqual(decision.deferredCallIds, []);
 });
 
 test("parses local-model knowledge search calls", () => {

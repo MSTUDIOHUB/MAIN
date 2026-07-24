@@ -1,4 +1,4 @@
-import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, logAgentEvent, type AgentLoopOutcome } from "../orchestrator";
+import { executeAgentLoop, isReviewablePlanStage, logAgentEvent, type AgentLoopOutcome } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { isGoalRuntimeDeleted } from "../goalPersistence";
 import { isCurrentGoalWorkflowOwner } from "../goalRunOwnership";
@@ -105,15 +105,18 @@ import { buildToolProgressNarration, summarizeToolObservation } from "../progres
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
 import { scheduleControlledSubagent } from "../subagentRuntime";
 import {
-  buildSubagentPolicyDeferral,
+  cancelCoordinatedSubagent,
   cancelSubagentRun,
-  countParentObservedDelegationPaths,
+  clearCollaborationRuntimeLedgerForParent,
+  closeOutstandingCollaborationTasksForParent,
   finalizeCoordinatedSubagentsForParent,
+  getCollaborationLedgerForParent,
   getCoordinatedSubagentRunCount,
   getPendingCoordinatedSubagentIds,
   isSubagentActiveStatus,
-  parseSubagentAllowedPaths,
   projectSubagentRuns,
+  resolveCollaborationSubagentIds,
+  restoreCollaborationRuntimeLedgerForParent,
   waitForCoordinatedSubagents,
 } from "../subagents";
 import {
@@ -800,6 +803,12 @@ export class WorkflowEngine {
             rejectionReason = "closure_ledger_owner_mismatch";
             return {};
           }
+          const collaborationLedger = getCollaborationLedgerForParent({
+            threadId: runSessionKey,
+            sessionEpoch: current.owner.sessionEpoch,
+            parentTurnId: current.owner.turnId,
+            now: input.updatedAt,
+          });
           const issued = issueSubagentClosureReceipts({
             ledger: existingLedger,
             owner: {
@@ -809,19 +818,19 @@ export class WorkflowEngine {
               parentTurnId: current.owner.turnId,
               parentRunId: current.canonical.run.identity.runId,
             },
-            contract: input.preferredDelegationScopeContract,
+            collaborationLedger,
             activities: input.recentPlanToolActivity,
             issuedAt: input.updatedAt,
           });
-          if (issued.missingConsumedScopeKeys.length > 0) {
-            rejectionReason = `consumed_scope_without_canonical_receipt:${issued.missingConsumedScopeKeys.join(",")}`;
-            return {};
-          }
           const next = updateTurnRuntimePlanningCheckpoint({
             checkpoint: current,
-            preferredDelegationScopeContract:
-              input.preferredDelegationScopeContract,
-            closureReceiptRefs: issued.receiptRefs,
+            collaborationLedger: getCollaborationLedgerForParent({
+              threadId: runSessionKey,
+              sessionEpoch: current.owner.sessionEpoch,
+              parentTurnId: current.owner.turnId,
+              evidenceReceiptIdsByTask: issued.receiptRefsByTask,
+              now: input.updatedAt,
+            }),
             updatedAt: input.updatedAt,
           });
           if (!next) {
@@ -876,9 +885,21 @@ export class WorkflowEngine {
         }
         logStoreEvent("turn_runtime_planning_checkpoint_persisted", {
           checkpointRevision: committedCheckpoint.revision,
-          preferredRegistrationCount:
-            committedCheckpoint.planning.preferredDelegationScopeContract?.registrations.length || 0,
-          closureReceiptRefCount: committedCheckpoint.planning.closureReceiptRefs.length,
+          collaborationEntryCount:
+            committedCheckpoint.planning.collaborationLedger.entries.length,
+          closureReceiptRefCount:
+            committedCheckpoint.planning.collaborationLedger.entries.reduce(
+              (count, entry) => count + entry.evidenceReceiptIds.length,
+              0,
+            ),
+          collaborationTasksMissingReceipts:
+            committedCheckpoint.planning.collaborationLedger.entries.filter((entry) =>
+              (
+                entry.terminalState === "completed" ||
+                entry.terminalState === "partial"
+              ) &&
+              entry.evidenceReceiptIds.length === 0
+            ).map((entry) => entry.workItem.collaborationTaskId),
           closureReceiptCount: committedLedger?.receipts.length || 0,
           adoptedEvidenceCount: committedLedger?.receipts.reduce(
             (count, receipt) => count + receipt.acceptedEvidence.length,
@@ -1119,7 +1140,10 @@ export class WorkflowEngine {
             threadId: run.threadId,
             turnId: run.parentTurnId,
             timestampMs,
+            collaborationTaskId: run.collaborationTaskId,
             subagentId: run.id,
+            runId: run.runId,
+            parentRunId: run.parentRunId,
             patch: {
               status: "canceled",
               updatedAt: timestampMs,
@@ -1137,7 +1161,10 @@ export class WorkflowEngine {
             threadId: run.threadId,
             turnId: run.parentTurnId,
             timestampMs,
+            collaborationTaskId: run.collaborationTaskId,
             subagentId: run.id,
+            runId: run.runId,
+            parentRunId: run.parentRunId,
             closedAt: timestampMs,
             reason: input.reason,
           }));
@@ -1179,6 +1206,16 @@ export class WorkflowEngine {
         result.controllerMissingIds.forEach((id) => controllerMissingIds.add(id));
         result.timedOutIds.forEach((id) => timedOutIds.add(id));
         releasedCount += result.releasedCount;
+        closeOutstandingCollaborationTasksForParent({
+          threadId: runSessionKey,
+          sessionEpoch: parentSessionEpoch,
+          parentTurnId,
+        });
+        clearCollaborationRuntimeLedgerForParent({
+          threadId: runSessionKey,
+          sessionEpoch: parentSessionEpoch,
+          parentTurnId,
+        });
       }
 
       const reconciledIds = closeProjectedSubagentRuns({
@@ -5624,27 +5661,6 @@ export class WorkflowEngine {
         parentTurnId,
         parentSessionEpoch,
       );
-      const allowedPaths = parseSubagentAllowedPaths(request.allowedPaths, runWorkspace);
-      const duplicateCount = countParentObservedDelegationPaths({
-        allowedPaths,
-        evidenceKeys: getSessionTaskTargetingEvidence(runSessionKey),
-      });
-      const independentReviewer = /reviewer|independent[_ -]?review/i.test(request.role || "");
-      if (!independentReviewer && allowedPaths.length > 0 && duplicateCount / allowedPaths.length > 0.5) {
-        const deferred = buildSubagentPolicyDeferral({
-          name: request.name,
-          scopeKey: request.scopeKey || request.scope || request.objective,
-          reason: "parent_scope_already_observed",
-        });
-        callbacks.onDebugEvent?.("delegation_scope_decision", {
-          decision: "deferred",
-          reason: deferred.reason,
-          allowedPaths,
-          duplicateCount,
-          failureKind: "policy",
-        });
-        return Promise.resolve(deferred);
-      }
       return Promise.resolve(scheduleControlledSubagent({
         request,
         parentCallbacks: callbacks,
@@ -5678,13 +5694,24 @@ export class WorkflowEngine {
         parentSessionEpoch,
       );
       const requestedSubagentIds = request.subagentIds || [];
-      const matchedRequestedIds = requestedSubagentIds.filter((id) =>
+      const requestedTaskIds = request.collaborationTaskIds || [];
+      const taskOwnedSubagentIds = resolveCollaborationSubagentIds({
+        threadId: runSessionKey,
+        sessionEpoch: parentSessionEpoch,
+        parentTurnId,
+        collaborationTaskIds: requestedTaskIds,
+      });
+      const effectiveRequestedSubagentIds = [
+        ...new Set([...requestedSubagentIds, ...taskOwnedSubagentIds]),
+      ];
+      const matchedRequestedIds = effectiveRequestedSubagentIds.filter((id) =>
         availableSubagentIds.includes(id)
       );
       callbacks.onDebugEvent?.("parent_wait", {
-        subagentIds: requestedSubagentIds,
+        subagentIds: effectiveRequestedSubagentIds,
+        collaborationTaskIds: requestedTaskIds,
         availableSubagentIds,
-        waitSelection: requestedSubagentIds.length === 0 || matchedRequestedIds.length === 0
+        waitSelection: effectiveRequestedSubagentIds.length === 0 || matchedRequestedIds.length === 0
           ? "all_registered"
           : "matched_subset",
         parentTurnId,
@@ -5693,7 +5720,7 @@ export class WorkflowEngine {
         threadId: runSessionKey,
         sessionEpoch: parentSessionEpoch,
         parentTurnId,
-        subagentIds: requestedSubagentIds,
+        subagentIds: effectiveRequestedSubagentIds,
         signal: waitOptions?.signal || abortCtrl.signal,
       });
       callbacks.onDebugEvent?.("parent_resume", {
@@ -5707,6 +5734,22 @@ export class WorkflowEngine {
         parentTurnId,
         releasedIds: result.results.map((entry) => entry.subagentId),
         releasedCount: result.results.length,
+      });
+      return result;
+    };
+    callbacks.cancelSubagent = async (request) => {
+      const parentTurnId = context.uiDisplayTurnId || turnId;
+      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const result = cancelCoordinatedSubagent({
+        threadId: runSessionKey,
+        sessionEpoch: parentSessionEpoch,
+        parentTurnId,
+        subagentId: request.subagentId,
+        collaborationTaskId: request.collaborationTaskId,
+      });
+      callbacks.onDebugEvent?.("subagent_cancel_requested", {
+        ...result,
+        parentTurnId,
       });
       return result;
     };
@@ -7775,9 +7818,12 @@ export class WorkflowEngine {
       if (!checkpoint) {
         throw new Error("TURN_RUNTIME_CHECKPOINT_ADMISSION_REJECTED");
       }
+      restoreCollaborationRuntimeLedgerForParent({
+        threadId: runSessionKey,
+        sessionEpoch: checkpoint.owner.sessionEpoch,
+        ledger: checkpoint.planning.collaborationLedger,
+      });
       await publishTurnRuntimePlanningCheckpoint({
-        preferredDelegationScopeContract:
-          checkpoint.planning.preferredDelegationScopeContract,
         recentPlanToolActivity: restoreDurableTurnPlanningActivities(
           checkpoint,
           getExactSubagentClosureReceiptLedger(),
@@ -7787,29 +7833,94 @@ export class WorkflowEngine {
       return executeLoopStrategy();
     };
 
-    return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop).then(async (loopOutcome) => {
-      const parentTurnId = context.uiDisplayTurnId || turnId;
-      const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
-        threadId: runSessionKey,
-        sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
-        parentTurnId,
-      });
-      if (subagentFinalization.requestedIds.length > 0 || subagentFinalization.releasedCount > 0) {
-        callbacks.onDebugEvent?.("parent_subagents_finalized", {
+    let collaborationFinalizationPromise: Promise<
+      Awaited<ReturnType<typeof finalizeCoordinatedSubagentsForParent>> | null
+    > | null = null;
+    const finalizeParentCollaboration = (input: {
+      outcomeStatus: string;
+      projectionError: string;
+      projectionTitle: string;
+      projectionReason: string;
+    }) => {
+      if (collaborationFinalizationPromise) return collaborationFinalizationPromise;
+      collaborationFinalizationPromise = (async () => {
+        const parentTurnId = context.uiDisplayTurnId || turnId;
+        const sessionEpoch =
+          resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+        let finalized: Awaited<
+          ReturnType<typeof finalizeCoordinatedSubagentsForParent>
+        > | null = null;
+        try {
+          finalized = await finalizeCoordinatedSubagentsForParent({
+            threadId: runSessionKey,
+            sessionEpoch,
+            parentTurnId,
+          });
+          if (finalized.requestedIds.length > 0 || finalized.releasedCount > 0) {
+            callbacks.onDebugEvent?.("parent_subagents_finalized", {
+              parentTurnId,
+              outcomeStatus: input.outcomeStatus,
+              ...finalized,
+            });
+          }
+          closeProjectedSubagentRuns({
+            ids: [
+              ...finalized.controllerMissingIds,
+              ...finalized.timedOutIds,
+            ],
+            error: input.projectionError,
+            title: input.projectionTitle,
+            reason: input.projectionReason,
+          });
+        } catch (error) {
+          callbacks.onDebugEvent?.("parent_subagent_finalization_failed", {
+            parentTurnId,
+            outcomeStatus: input.outcomeStatus,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+
+        closeOutstandingCollaborationTasksForParent({
+          threadId: runSessionKey,
+          sessionEpoch,
           parentTurnId,
-          outcomeStatus: loopOutcome.status,
-          ...subagentFinalization,
         });
-      }
-      const unresolvedIds = new Set([
-        ...subagentFinalization.controllerMissingIds,
-        ...subagentFinalization.timedOutIds,
-      ]);
-      closeProjectedSubagentRuns({
-        ids: unresolvedIds,
-        error: "SUBAGENT_PARENT_TERMINATED: the parent run ended before the child runtime settled.",
-        title: "Closed with parent run",
-        reason: "canceled",
+        try {
+          const checkpoint = getExactTurnRuntimeCheckpoint();
+          await publishTurnRuntimePlanningCheckpoint({
+            recentPlanToolActivity: checkpoint
+              ? restoreDurableTurnPlanningActivities(
+                  checkpoint,
+                  getExactSubagentClosureReceiptLedger(),
+                )
+              : [],
+            updatedAt: Date.now(),
+          });
+        } catch (error) {
+          callbacks.onDebugEvent?.("collaboration_checkpoint_finalization_failed", {
+            parentTurnId,
+            outcomeStatus: input.outcomeStatus,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          clearCollaborationRuntimeLedgerForParent({
+            threadId: runSessionKey,
+            sessionEpoch,
+            parentTurnId,
+          });
+        }
+        return finalized;
+      })();
+      return collaborationFinalizationPromise;
+    };
+
+    return prepareSubagentsForNewTurn().then(executeDurablyAdmittedLoop).then(async (loopOutcome) => {
+      await finalizeParentCollaboration({
+        outcomeStatus: loopOutcome.status,
+        projectionError:
+          "SUBAGENT_PARENT_TERMINATED: the parent run ended before the child runtime settled.",
+        projectionTitle: "Closed with parent run",
+        projectionReason: "canceled",
       });
       clearInterval(timerInterval);
       let latestState = sessionGet();
@@ -8128,6 +8239,13 @@ export class WorkflowEngine {
         alreadyCommittedTurn &&
         sessionGet().harnessRunMarker?.status !== "running"
       ) {
+        await finalizeParentCollaboration({
+          outcomeStatus: "already_committed",
+          projectionError:
+            "SUBAGENT_PARENT_TERMINATED: the parent run was already terminal.",
+          projectionTitle: "Closed with terminal parent run",
+          projectionReason: "canceled",
+        });
         logStoreEvent("post_terminal_exception_recorded", {
           sessionKey: runSessionKey,
           turnId,
@@ -8169,23 +8287,13 @@ export class WorkflowEngine {
             pauseOutcome,
           );
         }
-        const parentTurnId = context.uiDisplayTurnId || turnId;
-        const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
-          threadId: runSessionKey,
-          sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
-          parentTurnId,
-        }).catch(() => null);
-        if (subagentFinalization) {
-          closeProjectedSubagentRuns({
-            ids: [
-              ...subagentFinalization.controllerMissingIds,
-              ...subagentFinalization.timedOutIds,
-            ],
-            error: "SUBAGENT_PARENT_PAUSED: the parent Plan Run paused after child admission was rejected.",
-            title: "Closed with paused Plan run",
-            reason: "canceled",
-          });
-        }
+        await finalizeParentCollaboration({
+          outcomeStatus: "paused",
+          projectionError:
+            "SUBAGENT_PARENT_PAUSED: the parent Plan Run paused after child admission was rejected.",
+          projectionTitle: "Closed with paused Plan run",
+          projectionReason: "canceled",
+        });
         const pauseProjection = await commitTerminalProjectionBeforeStatusPublication(
           pauseOutcome,
           pauseHarnessProjection,
@@ -8217,6 +8325,13 @@ export class WorkflowEngine {
         { terminalResultKind: "error", allowErrorOverride: true },
       );
       if (errorHarnessProjection === "ownership_lost") {
+        await finalizeParentCollaboration({
+          outcomeStatus: "ownership_lost",
+          projectionError:
+            "SUBAGENT_PARENT_OWNERSHIP_LOST: the owning parent run no longer exists.",
+          projectionTitle: "Closed after parent ownership loss",
+          projectionReason: "canceled",
+        });
         clearInterval(timerInterval);
         logStoreEvent("stale_run_error_publication_skipped", {
           sessionKey: runSessionKey,
@@ -8226,29 +8341,13 @@ export class WorkflowEngine {
         });
         return unprojectedSettlement("error_harness_ownership_lost", errorOutcome);
       }
-      const parentTurnId = context.uiDisplayTurnId || turnId;
-      const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
-        threadId: runSessionKey,
-        sessionEpoch: resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch,
-        parentTurnId,
-      }).catch(() => null);
-      if (subagentFinalization) {
-        callbacks.onDebugEvent?.("parent_subagents_finalized", {
-          parentTurnId,
-          outcomeStatus: "completed",
-          outcomeKind: "error",
-          ...subagentFinalization,
-        });
-        closeProjectedSubagentRuns({
-          ids: [
-            ...subagentFinalization.controllerMissingIds,
-            ...subagentFinalization.timedOutIds,
-          ],
-          error: "SUBAGENT_PARENT_CRASHED: the parent run crashed before the child runtime settled.",
-          title: "Closed after parent failure",
-          reason: "canceled",
-        });
-      }
+      await finalizeParentCollaboration({
+        outcomeStatus: "error",
+        projectionError:
+          "SUBAGENT_PARENT_CRASHED: the parent run crashed before the child runtime settled.",
+        projectionTitle: "Closed after parent failure",
+        projectionReason: "canceled",
+      });
       clearInterval(timerInterval);
       logStoreEvent("agent_loop_crashed", {
         turnId,

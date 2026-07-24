@@ -323,6 +323,23 @@ test("cloud helpers build protocol-specific endpoints and headers", () => {
     ["https://api.anthropic.com/v1/models"],
   );
   assert.deepEqual(
+    buildCloudModelListCandidates(
+      "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "openai",
+    ),
+    [
+      "https://open.bigmodel.cn/api/paas/v4/models",
+      "https://open.bigmodel.cn/api/paas/v4/v1/models",
+    ],
+  );
+  assert.deepEqual(
+    buildCloudModelListCandidates("https://gateway.example/openai/responses", "openai"),
+    [
+      "https://gateway.example/openai/models",
+      "https://gateway.example/openai/v1/models",
+    ],
+  );
+  assert.deepEqual(
     buildCloudHeaders("anthropic", "test-key", true),
     {
       "Content-Type": "application/json",

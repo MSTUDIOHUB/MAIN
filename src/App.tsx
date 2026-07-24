@@ -28,14 +28,13 @@ import {
   syncTaskIdCounterFromBlocks,
   normalizeInterruptedConversationTurnsForRestore,
   normalizeSessionRuntimeSnapshot,
+  buildEmptySessionRuntimeSnapshot,
   buildSessionRuntimeSnapshotFromStoreState,
   buildRestoredSessionRuntimePatch,
 } from "./store/useAppStore";
 import {
   createPlanLifecycleSessionEpoch,
   createPlanLifecycleState,
-  ensurePlanLifecycleOwner,
-  reducePlanLifecycle,
 } from "./lib/planLifecycle";
 import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
 import {
@@ -2869,20 +2868,24 @@ export default function App() {
               : createPlanLifecycleSessionEpoch(resetAt)
           )
         : null;
-      const lifecycleOwner = activeSessionKey && activeSessionEpoch
-        ? ensurePlanLifecycleOwner({
-            lifecycle: state.planLifecycle,
-            sessionKey: activeSessionKey,
-            sessionEpoch: activeSessionEpoch,
-            at: resetAt,
-          })
-        : state.planLifecycle;
-      const lifecycleReset = reducePlanLifecycle(lifecycleOwner, {
-        type: "reset",
-        expectedVersion: lifecycleOwner.version,
-        at: resetAt,
-      });
+      const emptyRuntime = buildEmptySessionRuntimeSnapshot(
+        state,
+        resolveSessionModeAffinity(
+          activeSession as SessionModeAffinityLike | undefined,
+          state.selectedMainModeKey,
+        ),
+        {
+          sessionKey: activeSessionKey,
+          sessionEpoch: activeSessionEpoch,
+          createdAt: resetAt,
+        },
+      );
       return {
+        // A new/empty Session is a complete runtime-owner boundary. Reuse the
+        // same canonical empty snapshot as persistence instead of manually
+        // clearing only visible chat fields and leaking the previous Session's
+        // closure ledger, checkpoints, events, queue, or provider lane state.
+        ...emptyRuntime,
         ...(activeSessionKey && activeSessionEpoch && !existingOuterEpoch
           ? {
               sessionsByWorkspace: {
@@ -2895,27 +2898,10 @@ export default function App() {
               },
             }
           : {}),
-        taskFlow: [],
-        agentMessages: [],
-        contextMemoryState: null,
-        conversationTurns: [],
-        currentTurnId: null,
-        selectedDiffTaskId: null,
-        pendingSlashCommand: null,
-        planArtifacts: [],
-        planTasks: [],
-        planExecutionEvidenceLedger: [],
-        planExecutionEvidenceCount: 0,
-        planAutoResumeCount: 0,
-        planExecutionProgressSnapshot: null,
-        planLifecycle: lifecycleReset.disposition === "rejected"
-          ? lifecycleOwner
-          : lifecycleReset.state,
-        planStage: "idle",
-        isPlanApproved: false,
-        planApprovalChoice: null,
-        pendingPlanApprovalHandoff: null,
-        planApprovalExecutionStartedForTurnId: null,
+        // These two are user-selected app capabilities, not ownership
+        // artifacts from the previous Session.
+        activeStudioAgentKey: state.activeStudioAgentKey,
+        gameStudioInitialized: state.gameStudioInitialized,
         currentTurnExecutionConsent: { turnId: null, granted: false },
         agentStatus: "idle",
         isGenerating: false,
@@ -2923,11 +2909,6 @@ export default function App() {
         pendingReviewResolve: null,
         pendingReviewTaskId: null,
         pendingToolCall: null,
-        showPlanPanel: false,
-        showDiff: false,
-        showTerminal: false,
-        showFilePanel: false,
-        rightPanelTab: "plan",
       };
     });
   }, []);

@@ -6,11 +6,15 @@ import {
 } from "../../executeRecoveryTools";
 import type { FileReadObservationIdentity } from "../fileReadCache";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import {
+  normalizeWorkspacePathIdentity,
+  workspacePathsReferToSameFile,
+} from "../../workspacePaths";
 
 export type MutationPreflightRecoveryReason =
   | "mutation_preflight_invalid_patch"
   | "mutation_preflight_search_text_mismatch"
+  | "mutation_preflight_no_effect"
   | "mutation_partial_effect_requires_reread";
 
 interface MutationFailureResultLike {
@@ -53,6 +57,7 @@ export interface DirectMutationPreflightRecoveryDecision {
     state: "available";
   } | null;
   sourceObservationKey: string | null;
+  protocolNoProgressFingerprint: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint;
 }
 
@@ -64,6 +69,18 @@ function resolveStructuredMismatchReason(
   }
   if (result.mutationPreflightReason === "search_text_mismatch") {
     return "mutation_preflight_search_text_mismatch";
+  }
+  if (
+    result.mutationPreflightReason === "empty_change" ||
+    result.mutationPreflightReason === "identical_content"
+  ) {
+    return "mutation_preflight_no_effect";
+  }
+  if (result.mutationPreflightReason) {
+    // Structured preflight truth is authoritative. An unrelated stable reason
+    // such as read_failed or missing_content must not be reinterpreted from the
+    // generic MUTATION_PREFLIGHT_BLOCKED marker as a patch mismatch.
+    return null;
   }
   const mismatchIdentity = String(
     result.patchRecoveryMismatch?.mismatchFingerprint || "",
@@ -154,6 +171,7 @@ export function resolveDirectMutationPreflightRecovery(input: {
         state: "available",
       },
       sourceObservationKey: null,
+      protocolNoProgressFingerprint: null,
       decisionCheckpoint: {
         expectedTarget: target,
         sourceObservationKey: null,
@@ -180,7 +198,10 @@ export function resolveDirectMutationPreflightRecovery(input: {
       null;
     const sourceObservationKey = retainedObservation?.key || null;
     const requestedRange = mismatchEvidence?.requestedRange || null;
-    const readLease = requestedRange && mismatchEvidence?.mismatchFingerprint
+    const noEffect = reason === "mutation_preflight_no_effect";
+    const readLease = !noEffect &&
+      requestedRange &&
+      mismatchEvidence?.mismatchFingerprint
       ? {
           purpose: "patch_recovery" as const,
           target,
@@ -196,6 +217,9 @@ export function resolveDirectMutationPreflightRecovery(input: {
       target,
       readLease,
       sourceObservationKey,
+      protocolNoProgressFingerprint: noEffect
+        ? `mutation_no_effect::${normalizeWorkspacePathIdentity(target)}`
+        : null,
       decisionCheckpoint: {
         expectedTarget: target,
         sourceObservationKey,

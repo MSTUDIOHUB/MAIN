@@ -2220,7 +2220,7 @@ test("non-target post-convergence recovery also freezes a baseline before reopen
   assert.ok(result.planEvidenceProgressFingerprint);
 });
 
-test("a runtime-required preferred delegation bypasses the ordinary post-convergence read redirect", () => {
+test("semantic collaboration calls remain ordinary post-convergence tool calls", () => {
   const { harness, phases, input } = createPostConvergenceInput({
     input: {
       availableToolNames: new Set(["spawn_subagent"]),
@@ -2228,16 +2228,16 @@ test("a runtime-required preferred delegation bypasses the ordinary post-converg
         { id: "spawn_editor", name: "spawn_subagent", arguments: "{}" },
         { id: "spawn_backend", name: "spawn_subagent", arguments: "{}" },
       ],
-      preferredDelegationRequired: true,
     },
   });
   const result = handlePlanPostConvergenceToolRedirect(input);
 
-  assert.equal(result.status, "none");
-  assert.deepEqual(harness.appended, []);
-  assert.deepEqual(harness.statuses, []);
-  assert.deepEqual(harness.streamTokens, []);
-  assert.deepEqual(phases, []);
+  assert.equal(result.status, "continue");
+  assert.ok(harness.appended.length > 0);
+  assert.deepEqual(phases, [{
+    phase: "needs_evidence",
+    reason: "targeted_reads_without_semantic_facts",
+  }]);
 });
 
 test("post-convergence helper forces visible plan convergence after recovery is exhausted", () => {

@@ -509,6 +509,24 @@ test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or
       createdAt: 1,
       optionValues: ["continue"],
     },
+    turnRuntimeCheckpoints: {
+      "turn-foreign": {
+        schemaVersion: 1,
+        turnId: "turn-foreign",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+    },
+    subagentClosureReceiptLedger: {
+      schemaVersion: 1,
+      owner: {
+        workspaceKey: "/tmp/fresh-session",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+      receipts: {},
+      updatedAt: 1,
+    },
     contextMemoryState: { summary: "foreign memory" },
     contextMemoryStateByRuntimeKey: { foreign: { summary: "foreign lane memory" } },
     providerCompatibilityByRuntimeKey: { foreign: { forceXml: true } },
@@ -537,6 +555,8 @@ test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or
   assert.deepEqual(snapshot.runtimeEvents, []);
   assert.equal(snapshot.harnessRunMarker, null);
   assert.equal(snapshot.activeActionRequest, null);
+  assert.deepEqual(snapshot.turnRuntimeCheckpoints, {});
+  assert.equal(snapshot.subagentClosureReceiptLedger, null);
   assert.equal(snapshot.contextMemoryState, null);
   assert.deepEqual(snapshot.contextMemoryStateByRuntimeKey, {});
   assert.deepEqual(snapshot.providerCompatibilityByRuntimeKey, {});

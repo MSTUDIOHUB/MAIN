@@ -235,31 +235,76 @@ test("Capsule guidance explains the purpose of the latest structured action", ()
   }], "zh");
 
   assert.equal(
-    buildCapsuleGuidanceText(projection, "zh", "executing"),
+    buildCapsuleGuidanceText(projection, "zh"),
     "我正在修改 `ChatArea.tsx`，把已确认的方案落实到代码。",
   );
   assert.equal(
-    buildCapsuleGuidanceText(projection, "en", "executing"),
+    buildCapsuleGuidanceText(projection, "en"),
     "I'm updating `ChatArea.tsx` to put the confirmed approach into the code.",
   );
   assert.doesNotMatch(buildCapsuleGuidanceText(projection, "zh"), /replace_in_file|private detail|raw model prose/);
 });
 
-test("Capsule guidance uses a conversational lifecycle fallback before tool evidence exists", () => {
+test("Capsule guidance retains the last structured activity without a lifecycle prose fallback", () => {
   const emptyProjection = {
     currentActivity: null,
+    lastGuidanceActivity: null,
     milestones: [],
     healthSignals: [],
     activityText: "",
   };
   assert.equal(
-    buildCapsuleGuidanceText(emptyProjection, "zh", "analyzing"),
-    "我正在梳理你的需求，先确认问题从哪里发生。",
+    buildCapsuleGuidanceText(emptyProjection, "zh"),
+    "",
   );
   assert.equal(
-    buildCapsuleGuidanceText(emptyProjection, "en", "validating"),
-    "I'm validating the result in the real flow before I call it finished.",
+    buildCapsuleGuidanceText(emptyProjection, "en"),
+    "",
   );
+
+  const completedEdit = buildRunStatusProjection([{
+    key: "run:1:edit-complete",
+    runId: "run-1",
+    phase: "tool_result",
+    title: "raw model prose",
+    status: "done",
+    summary: "replace_in_file · private detail",
+    target: "src/components/ChatArea.tsx",
+    tool: "replace_in_file",
+    sourceToolCallIds: ["call-1"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+  assert.equal(completedEdit.currentActivity, null);
+  assert.equal(completedEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.equal(
+    buildCapsuleGuidanceText(completedEdit, "zh"),
+    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+  );
+
+  const blockedAfterEdit = buildRunStatusProjection([
+    completedEdit.lastGuidanceActivity,
+    {
+      key: "run:1:blocked",
+      runId: "run-1",
+      phase: "blocked",
+      title: "运行受阻",
+      status: "failed",
+      summary: "需要处理新的阻塞。",
+      target: "",
+      tool: "",
+      sourceToolCallIds: [],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 3,
+      lastSeenAt: 3,
+    },
+  ].filter(Boolean), "zh");
+  assert.equal(blockedAfterEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.ok(blockedAfterEdit.healthSignals.some((signal) => signal.kind === "failure"));
+  assert.equal(buildCapsuleGuidanceText(blockedAfterEdit, "zh"), "");
 });
 
 test("Capsule activity never falls back to an unproven progress title", () => {
@@ -1064,7 +1109,7 @@ test("visual progress preserves an explicit bounded observation separately from 
     null,
     "a delivered/observed screenshot is a milestone, not perpetual current activity",
   );
-  const guidance = buildCapsuleGuidanceText(projection, "zh", "executing");
-  assert.match(guidance, /实际修改/);
-  assert.doesNotMatch(guidance, /images:1/);
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.equal(guidance, "");
+  assert.equal(projection.lastGuidanceActivity, null);
 });

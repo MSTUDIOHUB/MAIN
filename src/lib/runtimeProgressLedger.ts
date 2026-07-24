@@ -43,12 +43,15 @@ export interface RunStatusHealthSignal {
 
 export interface RunStatusProjection {
   currentActivity: RuntimeProgressLedgerItem | null;
+  /** Last renderable progress owned by this Run, retained between updates. */
+  lastGuidanceActivity: RuntimeProgressLedgerItem | null;
   milestones: RuntimeProgressLedgerItem[];
   healthSignals: RunStatusHealthSignal[];
   activityText: string;
 }
 
 const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running"]);
+const RETAINABLE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running", "done"]);
 
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
@@ -123,6 +126,14 @@ function toolFamily(tool: string): string {
   if (/^(?:run_command|execute_command|send_pty_input|read_pty_|get_pty_status|clear_pty_buffer)/i.test(tool)) return "command";
   if (/browser/i.test(tool)) return "browser";
   return tool || "progress";
+}
+
+function isRetainableCapsuleGuidanceActivity(item: RuntimeProgressLedgerItem): boolean {
+  return RETAINABLE_CAPSULE_ACTIVITY_STATUSES.has(item.status) &&
+    item.phase !== "blocked" &&
+    // Visual delivery/recognition has its own evidence contract. The compact
+    // Capsule must not turn an internal images:N target into user guidance.
+    item.tool !== "visual_context";
 }
 
 function isCachedText(value: unknown): boolean {
@@ -667,6 +678,9 @@ export function buildRunStatusProjection(
     : [...ordered].reverse().find((item) =>
         item.status === "running" && item.phase !== "blocked"
       ) || null;
+  const lastGuidanceActivity = [...ordered].reverse().find(
+    isRetainableCapsuleGuidanceActivity,
+  ) || null;
   const milestones = ordered
     .filter((item) =>
       (item.status === "done" || item.status === "completed") &&
@@ -735,6 +749,7 @@ export function buildRunStatusProjection(
     : "";
   return {
     currentActivity,
+    lastGuidanceActivity,
     milestones,
     healthSignals,
     activityText,
@@ -809,17 +824,29 @@ function markdownTarget(value: unknown, language: RuntimeProgressLanguage): stri
 /**
  * Build the conversational live guidance shown in Capsule. Unlike the M
  * popover's terse evidence labels, this projection explains the purpose of the
- * current structured action. A lifecycle fallback keeps the primary surface
- * useful before the first tool event without reusing raw model prose.
+ * current structured action. When no action is currently running, the last
+ * renderable action for the same Run remains visible until newer renderable
+ * progress or a health signal supersedes it. Lifecycle phase labels are not
+ * manufactured into progress sentences.
  */
 export function buildCapsuleGuidanceText(
   projection: RunStatusProjection,
   language: RuntimeProgressLanguage = "zh",
-  fallbackPhase = "",
 ): string {
   const normalizedLanguage = normalizeLanguage(language);
-  const activity = projection.currentActivity;
-  if (activity && LIVE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
+  const latestHealthAt = Math.max(
+    0,
+    ...projection.healthSignals.map((signal) => signal.lastSeenAt),
+  );
+  const retainedActivity = projection.lastGuidanceActivity &&
+    (latestHealthAt === 0 || projection.lastGuidanceActivity.lastSeenAt > latestHealthAt)
+      ? projection.lastGuidanceActivity
+      : null;
+  const activity = projection.currentActivity &&
+    isRetainableCapsuleGuidanceActivity(projection.currentActivity)
+      ? projection.currentActivity
+      : retainedActivity;
+  if (activity && RETAINABLE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
     const family = toolFamily(activity.tool);
     const target = markdownTarget(activity.target, normalizedLanguage);
     const done = activity.status === "done" || activity.status === "completed";
@@ -864,19 +891,5 @@ export function buildCapsuleGuidanceText(
       : `我正在处理 ${target}，确认这一步带来的变化。`;
   }
 
-  const phase = String(fallbackPhase || "").toLowerCase();
-  if (normalizedLanguage === "en") {
-    if (/analy|understand|investigat/.test(phase)) return "I'm tracing the request now and locating where the issue begins.";
-    if (/plan/.test(phase)) return "I'm organizing the approach so the next changes follow a clear path.";
-    if (/execut|edit|implement/.test(phase)) return "I'm applying the confirmed approach to the actual implementation.";
-    if (/valid|verif|test/.test(phase)) return "I'm validating the result in the real flow before I call it finished.";
-    if (/recover|reconcil/.test(phase)) return "I'm checking the latest blocker and choosing a safe way to continue.";
-    return "";
-  }
-  if (/analy|understand|investigat/.test(phase)) return "我正在梳理你的需求，先确认问题从哪里发生。";
-  if (/plan/.test(phase)) return "我正在整理方案，让接下来的修改有清晰顺序。";
-  if (/execut|edit|implement/.test(phase)) return "我正在把已确认的方案落实到实际修改中。";
-  if (/valid|verif|test/.test(phase)) return "我正在验证修改结果，确认它在真实流程里生效。";
-  if (/recover|reconcil/.test(phase)) return "我正在检查刚才的阻塞点，并选择安全的继续方式。";
   return "";
 }

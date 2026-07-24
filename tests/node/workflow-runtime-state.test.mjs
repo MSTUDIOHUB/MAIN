@@ -411,7 +411,7 @@ test("workspace FIFO dispatch carries the captured subagent preference into Turn
   );
 });
 
-test("preferred subagent collaboration is enforced only after runtime admission", () => {
+test("collaboration stays optional and path-driven forced delegation is absent", () => {
   const planningSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"),
     "utf8",
@@ -429,40 +429,24 @@ test("preferred subagent collaboration is enforced only after runtime admission"
     "utf8",
   );
 
-  assert.match(planningSource, /resolvePreferredDelegationRequirement\(\{/);
-  assert.match(
-    planningSource,
-    /preferredDelegationRequirement\.required[\s\S]*filter\(\(tool\) => tool\.function\.name === "spawn_subagent"\)/,
-  );
-  assert.match(preparationSource, /buildPreferredDelegationActionContract\(\{/);
-  assert.match(preparationSource, /preferred_delegation_action_contract_injected/);
-  assert.ok(
-    preparationSource.indexOf("preferred_delegation_action_contract_injected") >
-      preparationSource.indexOf("plan_evidence_bundle_injected"),
-    "the required collaboration action contract must be injected after Plan evidence",
-  );
-  assert.match(
-    invocationSource,
-    /input\.preferredDelegationRequired[\s\S]*availableToolNames\.has\("spawn_subagent"\)[\s\S]*return "required"/,
-  );
+  assert.doesNotMatch(planningSource, /resolvePreferredDelegationRequirement/);
+  assert.doesNotMatch(planningSource, /preferredDelegationRequirement/);
+  assert.doesNotMatch(preparationSource, /buildPreferredDelegationActionContract/);
+  assert.doesNotMatch(preparationSource, /preferred_delegation_action_contract_injected/);
+  assert.doesNotMatch(invocationSource, /preferredDelegationRequired/);
+  assert.match(planningSource, /Runtime no longer derives collaboration work from files/);
+  assert.match(planningSource, /tool\.function\.name === "spawn_subagent"/);
+  assert.match(planningSource, /tool\.function\.name !== "spawn_subagent"/);
   assert.match(orchestratorSource, /onSubagentSpawnCreated:\s*async \(outcome\) =>/);
-  assert.match(orchestratorSource, /recordPreferredDelegationScopeSpawn\(\{/);
-  assert.match(orchestratorSource, /applyPreferredDelegationScopeJoinOutcomes\(\{/);
-  assert.equal(
-    (orchestratorSource.match(/applyPreferredDelegationScopeJoinOutcomes\(\{/g) || []).length,
-    1,
-    "all join paths must share one scope outcome apply boundary",
-  );
+  assert.match(orchestratorSource, /emitCollaborationTaskOutcomes/);
   assert.match(
     orchestratorSource,
-    /applyAndEmitPreferredDelegationScopeOutcomes\(outcomes, "explicit_wait"\)/,
+    /emitCollaborationTaskOutcomes\(outcomes, "explicit_wait"\)/,
   );
-  assert.match(
-    orchestratorSource,
-    /applyAndEmitPreferredDelegationScopeOutcomes\([\s\S]*"parent_final_response"/,
-  );
-  assert.match(orchestratorSource, /preferred_delegation_spawned/);
-  assert.match(orchestratorSource, /preferred_delegation_consumed/);
+  assert.match(orchestratorSource, /semantic_collaboration_task_spawned/);
+  assert.match(orchestratorSource, /semantic_collaboration_evidence_consumed/);
+  assert.doesNotMatch(orchestratorSource, /recordPreferredDelegationScopeSpawn/);
+  assert.doesNotMatch(orchestratorSource, /applyPreferredDelegationScopeJoinOutcomes/);
 });
 
 test("desktop and destructive permission reviews are explicitly per-call and show final evidence", () => {

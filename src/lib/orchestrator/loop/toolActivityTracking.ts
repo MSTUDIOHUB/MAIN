@@ -628,6 +628,13 @@ export function extractDelegatedSubagentActivities(
         delegatedObservation: {
           owner: {
             agentKind: "subagent",
+            ...(String(ownerRecord.collaborationTaskId || "").trim()
+              ? {
+                  collaborationTaskId: String(
+                    ownerRecord.collaborationTaskId,
+                  ).trim(),
+                }
+              : {}),
             subagentId: ownerSubagentId,
             ...(String(ownerRecord.parentTurnId || "").trim()
               ? { parentTurnId: String(ownerRecord.parentTurnId).trim() }
@@ -771,7 +778,17 @@ export function extractSubagentParentRereadObligations(
           targetRef: requiredPath,
         },
         delegatedObservation: {
-          owner: { agentKind: "subagent", subagentId },
+          owner: {
+            agentKind: "subagent",
+            ...(String(record.collaborationTaskId || "").trim()
+              ? {
+                  collaborationTaskId: String(
+                    record.collaborationTaskId,
+                  ).trim(),
+                }
+              : {}),
+            subagentId,
+          },
           planningEvidenceState: "unresolved",
           joinState: "consumed",
           closureState: closureAudit.state === "satisfied" ? "satisfied" : "partial",
@@ -795,7 +812,11 @@ export function toolResultCountsAsExecutionEvidence(
   // Coordination lifecycle is not task execution evidence. Only concrete
   // child tool observations promoted below, or a parent-side verification of
   // them, may contribute evidence to the execution ledger.
-  if (executionName === "spawn_subagent" || executionName === "wait_subagents") return false;
+  if (
+    executionName === "spawn_subagent" ||
+    executionName === "wait_subagents" ||
+    executionName === "cancel_subagent"
+  ) return false;
   const envelope = parseToolFeedbackEnvelope(result.content || "");
   const feedbackStatus = envelope?.envelope.status || "";
   if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {

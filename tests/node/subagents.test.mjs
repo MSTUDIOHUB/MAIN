@@ -34,7 +34,6 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
-const preferredScopes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"));
 const modelLanes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
 const subagentRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagentRuntime.ts"));
 const subagentJoinRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/subagentJoinRuntime.ts"));
@@ -163,17 +162,6 @@ test("broad read-only child searches narrow to every covered lease root without 
   });
 });
 
-test("parent path evidence prevents redundant delegation across current and legacy keys", () => {
-  assert.equal(subagents.countParentObservedDelegationPaths({
-    allowedPaths: ["src/main.js", "src/styles"],
-    evidenceKeys: new Set(["path:src/main.js", "file:src/styles/main.css"]),
-  }), 2);
-  assert.equal(subagents.countParentObservedDelegationPaths({
-    allowedPaths: ["src/main.js"],
-    evidenceKeys: new Set(["symbol:initToolbar", "path:src/editor.js"]),
-  }), 0);
-});
-
 test("read-only child roles never imply workspace mutation capability", () => {
   assert.equal(subagentRuntime.resolveReadOnlySubagentRole("coder"), "investigator");
   assert.equal(subagentRuntime.resolveReadOnlySubagentRole("reviewer"), "investigator");
@@ -184,7 +172,7 @@ test("capacity policy permits two local children and bounded cloud parallelism",
   assert.equal(local.profile, "local");
   assert.equal(local.maxActiveRequests, 2);
   assert.equal(local.maxBurstActiveRequests, 3);
-  assert.equal(local.maxCreatedPerTurn, 3);
+  assert.equal(local.maxConcurrentChildren, 3);
   assert.equal(local.model, "qwen3.6-35b-a3b");
 
   const cloud = subagents.resolveSubagentCapacityPolicy(makeConfig("cloud", {
@@ -194,832 +182,8 @@ test("capacity policy permits two local children and bounded cloud parallelism",
   assert.equal(cloud.profile, "cloud");
   assert.equal(cloud.maxActiveRequests, 3);
   assert.equal(cloud.maxBurstActiveRequests, 3);
-  assert.equal(cloud.maxCreatedPerTurn, 6);
+  assert.equal(cloud.maxConcurrentChildren, 6);
   assert.equal(cloud.model, "gpt-cloud");
-});
-
-test("adaptive delegation admits only useful context or diagnostic fan-out", () => {
-  const readyRuntimeHealth = {
-    laneKey: "local:test",
-    profile: "local",
-    state: "ready",
-    activeChildren: 0,
-    queuedChildren: 0,
-    capacityLimit: 2,
-    memorySafety: "safe",
-    recentSuccessfulRuns: 1,
-    latestStartupMs: 120,
-    latestCapacityWaitMs: 0,
-  };
-  const simple = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 1,
-  });
-  assert.equal(simple.action, "defer");
-  assert.equal(simple.reason, "insufficient_independent_scope");
-
-  const observedOnly = subagents.resolveDelegationDecision({
-    phase: "diagnostic",
-    hasWorkspace: true,
-    observedScopeCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-  });
-  assert.equal(observedOnly.action, "defer");
-  assert.equal(observedOnly.reason, "insufficient_independent_scope");
-  assert.equal(observedOnly.observedScopeCount, 2);
-  assert.equal(observedOnly.independentScopeCount, 2);
-
-  const structuredScopes = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-    runtimeHealth: readyRuntimeHealth,
-  });
-  assert.equal(structuredScopes.action, "admit");
-  assert.equal(structuredScopes.reason, "adaptive_multi_scope");
-
-  const unknownRuntimeHealth = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-  });
-  assert.equal(unknownRuntimeHealth.action, "defer");
-  assert.equal(unknownRuntimeHealth.reason, "runtime_health_unavailable");
-
-  const busyRuntimeHealth = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-    runtimeHealth: { ...readyRuntimeHealth, state: "busy", queuedChildren: 1 },
-  });
-  assert.equal(busyRuntimeHealth.action, "defer");
-  assert.equal(busyRuntimeHealth.reason, "runtime_capacity_busy");
-
-  const scopesAlreadyUnderDiagnosis = subagents.resolveDelegationDecision({
-    phase: "diagnostic",
-    hasWorkspace: true,
-    explicitScopeCount: 2,
-    observedScopeCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-  });
-  assert.equal(scopesAlreadyUnderDiagnosis.action, "defer");
-  assert.equal(scopesAlreadyUnderDiagnosis.reason, "insufficient_independent_scope");
-
-  const plannedIndependentWork = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    plannedWorkItemCount: 2,
-    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
-  });
-  assert.equal(plannedIndependentWork.action, "defer");
-  assert.equal(plannedIndependentWork.reason, "insufficient_independent_scope");
-
-  const preferred = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "context",
-    hasWorkspace: true,
-  });
-  assert.equal(preferred.action, "defer");
-  assert.equal(preferred.reason, "insufficient_independent_scope");
-
-  const preferredWithIndependentScope = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 1,
-    independentScopeKeys: ["src/main.js"],
-    runtimeHealth: readyRuntimeHealth,
-  });
-  assert.equal(preferredWithIndependentScope.action, "admit");
-  assert.equal(preferredWithIndependentScope.reason, "explicit_preference");
-
-  const afterMutation = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "mutation",
-    hasWorkspace: true,
-    explicitScopeCount: 2,
-    independentScopeKeys: ["src/main.js", "src/components/toolbar.js"],
-    runtimeHealth: readyRuntimeHealth,
-  });
-  assert.equal(afterMutation.action, "admit");
-  assert.equal(afterMutation.reason, "explicit_preference");
-
-  const pendingJoin = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "diagnostic",
-    hasWorkspace: true,
-    pendingSubagentCount: 1,
-  });
-  assert.equal(pendingJoin.action, "defer");
-  assert.equal(pendingJoin.reason, "pending_subagents_require_join");
-
-  const forbidden = subagents.resolveDelegationDecision({
-    preference: "forbidden",
-    phase: "context",
-    hasWorkspace: true,
-    explicitScopeCount: 3,
-  });
-  assert.equal(forbidden.action, "deny");
-  assert.equal(forbidden.reason, "user_forbidden");
-
-  const checklistOnly = subagents.resolveDelegationDecision({
-    phase: "context",
-    hasWorkspace: true,
-    plannedWorkItemCount: 6,
-  });
-  assert.equal(checklistOnly.action, "defer");
-  assert.equal(checklistOnly.independentScopeCount, 0);
-
-  const overlappingHints = subagents.resolveDelegationDecision({
-    phase: "diagnostic",
-    hasWorkspace: true,
-    independentScopeKeys: ["src/lib", "src/lib/subagents.ts", "./src/lib"],
-  });
-  assert.equal(overlappingHints.action, "defer");
-  assert.equal(overlappingHints.independentScopeCount, 1);
-});
-
-test("checked collaboration becomes a bounded delegation obligation after parallel scopes are proven", () => {
-  const readyRuntimeHealth = {
-    laneKey: "local:test",
-    profile: "local",
-    state: "ready",
-    activeChildren: 0,
-    queuedChildren: 0,
-    capacityLimit: 2,
-    memorySafety: "safe",
-    recentSuccessfulRuns: 1,
-    latestStartupMs: 120,
-    latestCapacityWaitMs: 0,
-  };
-  const decision = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "diagnostic",
-    hasWorkspace: true,
-    independentScopeKeys: [
-      "src/components/editor.js",
-      "src/components/ToolbarPanel.tsx",
-      "src-tauri/src/main.rs",
-    ],
-    runtimeHealth: readyRuntimeHealth,
-  });
-  const requirement = subagents.resolvePreferredDelegationRequirement({
-    decision,
-    independentScopeKeys: [
-      "src/components/editor.js",
-      "src/components/ToolbarPanel.tsx",
-      "src-tauri/src/main.rs",
-    ],
-    spawnToolAvailable: true,
-  });
-
-  assert.equal(decision.action, "admit");
-  assert.equal(requirement.required, true);
-  assert.equal(requirement.reason, "required");
-  assert.equal(requirement.contractOpen, true);
-  assert.deepEqual(requirement.candidateScopeKeys, [
-    "src-tauri/src/main.rs",
-    "src/components/editor.js",
-    "src/components/ToolbarPanel.tsx",
-  ]);
-  const actionContract = subagents.buildPreferredDelegationActionContract({
-    language: "zh",
-    candidateScopeKeys: requirement.candidateScopeKeys,
-  });
-  assert.match(actionContract, /必须先调用 spawn_subagent/);
-  assert.match(actionContract, /最后生效的动作契约/);
-  assert.match(actionContract, /不要由主体调用 read_file/);
-  assert.match(actionContract, /role=reviewer/);
-  assert.match(actionContract, /src\/components\/ToolbarPanel\.tsx/);
-
-  assert.equal(subagents.resolvePreferredDelegationRequirement({
-    decision,
-    independentScopeKeys: ["src/components/editor.js"],
-    spawnToolAvailable: true,
-  }).reason, "insufficient_parallel_scope");
-
-  const unsafeDecision = subagents.resolveDelegationDecision({
-    preference: "preferred",
-    phase: "diagnostic",
-    hasWorkspace: true,
-    independentScopeKeys: requirement.candidateScopeKeys,
-    runtimeHealth: { ...readyRuntimeHealth, state: "degraded", memorySafety: "unsafe" },
-  });
-  const unsafeRequirement = subagents.resolvePreferredDelegationRequirement({
-    decision: unsafeDecision,
-    independentScopeKeys: requirement.candidateScopeKeys,
-    spawnToolAvailable: true,
-  });
-  assert.equal(unsafeRequirement.required, false);
-  assert.equal(unsafeRequirement.reason, "runtime_capacity_degraded");
-});
-
-test("only a required preferred checkpoint normalizes spawned work to an independent reviewer", () => {
-  const calls = [{
-    id: "spawn-1",
-    name: "spawn_subagent",
-    arguments: JSON.stringify({
-      objective: "Inspect src/main.js",
-      role: "explorer",
-      allowed_paths: "src/main.js",
-    }),
-  }, {
-    id: "read-1",
-    name: "read_file",
-    arguments: JSON.stringify({ path: "src/main.js" }),
-  }];
-
-  assert.equal(
-    JSON.parse(subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, true)[0].arguments).role,
-    "reviewer",
-  );
-  assert.strictEqual(
-    subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, false),
-    calls,
-  );
-  assert.equal(
-    subagents.normalizeRequiredPreferredDelegationReviewerCalls(calls, true)[1].arguments,
-    calls[1].arguments,
-  );
-});
-
-test("preferred collaboration derives subsystem scopes and settles every scope independently", () => {
-  const requiredScopes = preferredScopes.derivePreferredDelegationScopeCandidates({
-    candidatePathKeys: [
-      "src/main.js",
-      "src/components/editor.js",
-      "src/components/toolbar.js",
-      "src-tauri/src/main.rs",
-    ],
-    maxCreatedPerTurn: 3,
-  });
-  assert.deepEqual(requiredScopes, [{
-    scopeKey: "src",
-    allowedPaths: [
-      "src/main.js",
-      "src/components/editor.js",
-      "src/components/toolbar.js",
-    ],
-  }, {
-    scopeKey: "src-tauri",
-    allowedPaths: ["src-tauri/src/main.rs"],
-  }]);
-
-  let contract = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes,
-    maxCreatedPerTurn: 3,
-  });
-  const requirement = {
-    required: true,
-    remainingScopes: requiredScopes,
-  };
-  const normalizedCalls = preferredScopes.normalizeRequiredPreferredDelegationScopeCalls([
-    { id: "spawn-ui", name: "spawn_subagent", arguments: "{}" },
-    { id: "spawn-rust", name: "spawn_subagent", arguments: "{}" },
-    { id: "spawn-extra", name: "spawn_subagent", arguments: JSON.stringify({
-      scope_key: "model-invented-extra",
-      allowed_paths: "src/components/preview.js",
-    }) },
-  ], requirement);
-  assert.deepEqual(normalizedCalls.map((call) => {
-    const args = JSON.parse(call.arguments);
-    return [args.scope_key, args.allowed_paths, args.role];
-  }), [
-    ["src", "src/main.js,src/components/editor.js,src/components/toolbar.js", "reviewer"],
-    ["src-tauri", "src-tauri/src/main.rs", "reviewer"],
-  ]);
-
-  contract = preferredScopes.recordPreferredDelegationScopeSpawn({
-    contract,
-    outcome: {
-      subagentId: "child-ui",
-      name: "UI",
-      status: "queued",
-      scopeKey: "src",
-      allowedPaths: requiredScopes[0].allowedPaths,
-    },
-  });
-  contract = preferredScopes.recordPreferredDelegationScopeSpawn({
-    contract,
-    outcome: {
-      subagentId: "child-rust",
-      name: "Rust",
-      status: "queued",
-      scopeKey: "src-tauri",
-      allowedPaths: requiredScopes[1].allowedPaths,
-    },
-  });
-  contract = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-    contract,
-    outcomes: [{
-      subagentId: "child-ui",
-      scopeKey: "src",
-      status: "completed",
-      closureState: "satisfied",
-      adoptedEvidenceCount: 2,
-      adoptedEvidenceTargets: ["src/main.js", "src/components/editor.js"],
-      consumed: true,
-    }, {
-      subagentId: "child-rust",
-      scopeKey: "src-tauri",
-      status: "degraded",
-      closureState: "partial",
-      adoptedEvidenceCount: 1,
-      adoptedEvidenceTargets: ["src-tauri/src/main.rs"],
-      consumed: false,
-    }],
-  });
-  const partial = preferredScopes.getPreferredDelegationScopeProgress(contract);
-  assert.equal(partial.satisfied, false);
-  assert.deepEqual(partial.consumedScopeKeys, ["src"]);
-  assert.deepEqual(partial.remainingScopes.map((scope) => scope.scopeKey), ["src-tauri"]);
-});
-
-test("execute delegation scopes accept only runtime-owned workspace paths", () => {
-  assert.deepEqual(
-    preferredScopes.collectPreferredDelegationWorkspacePathCandidates([
-      {
-        name: "grep_search",
-        target: "问题：打开文件失败后修复整个工作区",
-        status: "succeeded",
-        discoveryObservation: {
-          kind: "search",
-          targetRefs: ["src/main.js", "src/components/toolbar.js"],
-        },
-      },
-      {
-        name: "grep_search",
-        target: "另一段自然语言查询",
-        status: "succeeded",
-      },
-      {
-        name: "read_file",
-        target: "src/components/statusbar.js",
-        status: "succeeded",
-        readFileObservation: { path: "src/components/statusbar.js" },
-      },
-      {
-        name: "read_file",
-        target: "src/untrusted.js",
-        status: "succeeded",
-        delegatedObservation: {
-          planningEvidenceState: "unresolved",
-          closureState: "unverified",
-        },
-      },
-    ]),
-    [
-      "src/main.js",
-      "src/components/toolbar.js",
-      "src/components/statusbar.js",
-    ],
-  );
-});
-
-test("preferred collaboration opens a fresh bounded wave after lifecycle progress", () => {
-  const requiredScopes = [
-    { scopeKey: "editor", allowedPaths: ["src/main.js"] },
-    { scopeKey: "toolbar", allowedPaths: ["src/components/toolbar.js"] },
-  ];
-  let diagnostic = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes,
-    maxCreatedPerTurn: 2,
-    lifecyclePhase: "diagnostic",
-  });
-  for (const [index, scope] of requiredScopes.entries()) {
-    const subagentId = `diagnostic-${index}`;
-    diagnostic = preferredScopes.recordPreferredDelegationScopeSpawn({
-      contract: diagnostic,
-      outcome: {
-        subagentId,
-        name: subagentId,
-        status: "queued",
-        scopeKey: scope.scopeKey,
-        allowedPaths: scope.allowedPaths,
-      },
-    });
-    diagnostic = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-      contract: diagnostic,
-      outcomes: [{
-        subagentId,
-        scopeKey: scope.scopeKey,
-        status: "completed",
-        closureState: "satisfied",
-        adoptedEvidenceCount: 1,
-        adoptedEvidenceTargets: scope.allowedPaths,
-        consumed: true,
-      }],
-    });
-  }
-
-  assert.equal(preferredScopes.getPreferredDelegationScopeProgress(diagnostic).satisfied, true);
-  assert.equal(
-    preferredScopes.activatePreferredDelegationScopeContract(
-      diagnostic,
-      { requiredScopes, lifecyclePhase: "diagnostic" },
-      2,
-    ),
-    diagnostic,
-    "the same settled phase cannot manufacture a duplicate wave",
-  );
-
-  const validation = preferredScopes.activatePreferredDelegationScopeContract(
-    diagnostic,
-    { requiredScopes, lifecyclePhase: "validation" },
-    2,
-  );
-  assert.notEqual(validation, diagnostic);
-  assert.equal(validation.wave, 2);
-  assert.equal(validation.lifecyclePhase, "validation");
-  assert.deepEqual(validation.registrations, []);
-  assert.equal(
-    preferredScopes.getPreferredDelegationScopeProgress(validation).creationCapacityRemaining,
-    2,
-    "joined children release creation capacity for a later lifecycle wave",
-  );
-});
-
-test("preferred Plan scopes use closed authoritative owners without manufacturing sibling file scopes", () => {
-  const topologyOwners = preferredScopes.collectTrustedPreferredDelegationWorkspaceTopologyPaths([
-    {
-      name: "get_project_skeleton",
-      status: "succeeded",
-      discoveryObservation: {
-        kind: "project_structure",
-        targetRefs: [
-          "package.json",
-          "README.md",
-          "src/main.js",
-          "src/components/editor.js",
-          "src-tauri/src/main.rs",
-        ],
-      },
-    },
-    {
-      name: "list_directory",
-      status: "succeeded",
-      discoveryObservation: {
-        kind: "project_structure",
-        targetRefs: ["untrusted/summary.ts"],
-      },
-    },
-  ]);
-  assert.deepEqual(topologyOwners, [
-    "package.json",
-    "README.md",
-    "src/main.js",
-    "src/components/editor.js",
-    "src-tauri/src/main.rs",
-  ]);
-  assert.deepEqual(preferredScopes.derivePreferredDelegationScopeCandidates({
-    candidatePathKeys: topologyOwners,
-    maxCreatedPerTurn: 3,
-    strategy: "stable_top_level",
-  }).map((scope) => scope.scopeKey), [
-    "src",
-    "src-tauri",
-  ], "root singletons cannot consume child capacity beside directory-backed scopes");
-
-  const provisionalOwners = preferredScopes.collectAuthoritativePreferredDelegationEvidenceOwnerPaths([
-    { name: "read_file", target: "src/components/editor.js", status: "succeeded" },
-    { name: "read_file", target: "src/components/preview.js", status: "succeeded" },
-    { name: "read_file", target: "src/components/toolbar.js", status: "succeeded" },
-    { name: "find_symbol_references", target: "input", status: "succeeded" },
-    {
-      name: "read_file",
-      target: "src-tauri/src/main.rs",
-      status: "succeeded",
-      delegatedObservation: {
-        planningEvidenceState: "unresolved",
-        joinState: "consumed",
-        closureState: "partial",
-      },
-    },
-  ]);
-  assert.deepEqual(provisionalOwners, [
-    "src/components/editor.js",
-    "src/components/preview.js",
-    "src/components/toolbar.js",
-  ]);
-  assert.deepEqual(preferredScopes.derivePreferredDelegationScopeCandidates({
-    candidatePathKeys: provisionalOwners,
-    maxCreatedPerTurn: 3,
-    strategy: "stable_top_level",
-  }), [{
-    scopeKey: "src",
-    allowedPaths: ["src"],
-  }], "three sibling component reads remain one stable subsystem");
-
-  const closedOwners = preferredScopes.collectAuthoritativePreferredDelegationEvidenceOwnerPaths([
-    ...provisionalOwners.map((target) => ({ name: "read_file", target, status: "succeeded" })),
-    { name: "read_file", target: "src/main.js", status: "succeeded" },
-    { name: "read_file", target: "src-tauri/src/main.rs", status: "succeeded" },
-  ]);
-  assert.deepEqual(
-    preferredScopes.derivePreferredDelegationScopeCandidates({
-      candidatePathKeys: closedOwners,
-      maxCreatedPerTurn: 3,
-      strategy: "stable_top_level",
-    }).map((scope) => scope.scopeKey),
-    ["src", "src-tauri"],
-  );
-});
-
-test("preferred scope consumption requires matching child scope identity and in-scope evidence", () => {
-  const requiredScopes = [
-    { scopeKey: "src", allowedPaths: ["src/main.js"] },
-    { scopeKey: "src-tauri", allowedPaths: ["src-tauri/src/main.rs"] },
-  ];
-  const createSpawnedContract = () => preferredScopes.recordPreferredDelegationScopeSpawn({
-    contract: preferredScopes.createPreferredDelegationScopeContract({
-      requiredScopes,
-      maxCreatedPerTurn: 2,
-    }),
-    outcome: {
-      subagentId: "child-src",
-      name: "UI",
-      status: "queued",
-      scopeKey: "src",
-      allowedPaths: ["src/main.js"],
-    },
-  });
-  const baseOutcome = {
-    subagentId: "child-src",
-    status: "completed",
-    closureState: "satisfied",
-    adoptedEvidenceCount: 1,
-    consumed: true,
-  };
-
-  const wrongIdentity = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-    contract: createSpawnedContract(),
-    outcomes: [{
-      ...baseOutcome,
-      scopeKey: "src-tauri",
-      adoptedEvidenceTargets: ["src/main.js"],
-    }],
-  });
-  assert.equal(wrongIdentity.registrations[0].state, "incomplete");
-
-  const escapedEvidence = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-    contract: createSpawnedContract(),
-    outcomes: [{
-      ...baseOutcome,
-      scopeKey: "src",
-      adoptedEvidenceTargets: ["src-tauri/src/main.rs"],
-    }],
-  });
-  assert.equal(escapedEvidence.registrations[0].state, "incomplete");
-
-  const exactEvidence = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-    contract: createSpawnedContract(),
-    outcomes: [{
-      ...baseOutcome,
-      scopeKey: "src",
-      adoptedEvidenceTargets: ["src/main.js"],
-    }],
-  });
-  assert.equal(exactEvidence.registrations[0].state, "consumed");
-});
-
-test("an exhausted preferred scope contract releases evidence work back to the parent", () => {
-  const requiredScopes = [{ scopeKey: "src", allowedPaths: ["src/main.js"] }, {
-    scopeKey: "src-tauri",
-    allowedPaths: ["src-tauri/src/main.rs"],
-  }];
-  let contract = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes,
-    maxCreatedPerTurn: 2,
-  });
-  for (const [index, scope] of requiredScopes.entries()) {
-    const subagentId = `incomplete-${index}`;
-    contract = preferredScopes.recordPreferredDelegationScopeSpawn({
-      contract,
-      outcome: {
-        subagentId,
-        name: subagentId,
-        status: "queued",
-        scopeKey: scope.scopeKey,
-        allowedPaths: scope.allowedPaths,
-      },
-    });
-    contract = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-      contract,
-      outcomes: [{
-        subagentId,
-        scopeKey: scope.scopeKey,
-        status: "degraded",
-        closureState: "partial",
-        adoptedEvidenceCount: 1,
-        adoptedEvidenceTargets: [scope.allowedPaths[0]],
-        consumed: false,
-      }],
-    });
-  }
-
-  const progress = preferredScopes.getPreferredDelegationScopeProgress(contract);
-  assert.equal(progress.satisfied, false);
-  assert.equal(progress.exhausted, true);
-  assert.equal(progress.open, false);
-  assert.equal(progress.creationCapacityRemaining, 0);
-  assert.deepEqual(progress.remainingScopes.map((scope) => scope.scopeKey), [
-    "src",
-    "src-tauri",
-  ]);
-
-  const requirement = subagents.resolvePreferredDelegationRequirement({
-    decision: {
-      action: "admit",
-      reason: "adaptive_multi_scope",
-      phase: "diagnostic",
-      preference: "preferred",
-      independentScopeCount: 2,
-      explicitScopeCount: 0,
-      observedScopeCount: 2,
-      plannedWorkItemCount: 0,
-      pendingSubagentCount: 0,
-      runtimeHealthState: "healthy",
-    },
-    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
-    scopeCandidates: requiredScopes,
-    scopeContract: contract,
-    spawnToolAvailable: true,
-  });
-  assert.equal(requirement.required, false);
-  assert.equal(requirement.reason, "scope_creation_capacity_reached");
-  assert.equal(requirement.contractOpen, false);
-
-  const laterValidation = subagents.resolvePreferredDelegationRequirement({
-    decision: {
-      ...requirement,
-      action: "admit",
-      reason: "explicit_preference",
-      phase: "validation",
-      preference: "preferred",
-      independentScopeCount: 2,
-      explicitScopeCount: 0,
-      observedScopeCount: 2,
-      plannedWorkItemCount: 0,
-      pendingSubagentCount: 0,
-      runtimeHealthState: "ready",
-    },
-    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
-    scopeCandidates: requiredScopes,
-    scopeContract: contract,
-    spawnToolAvailable: true,
-  });
-  assert.equal(laterValidation.required, true);
-  assert.equal(laterValidation.lifecyclePhase, "validation");
-  assert.deepEqual(laterValidation.consumedScopeKeys, []);
-});
-
-test("typed scope_key assignments preserve three explicit disjoint scopes within turn capacity", () => {
-  const scopes = preferredScopes.derivePreferredDelegationScopeCandidates({
-    candidatePathKeys: [],
-    structuredInput: [
-      "1. scope_key=csv-parser, scope=parser, allowed_paths=src/hooks/useCsvParser.ts, expected_output=evidence",
-      "2. scope_key=chart-consumer, scope=chart, allowed_paths=src/hooks/useChartData.ts,src/store/dashboardStore.ts, expected_output=evidence",
-      "3. scope_key=type-contract, scope=types, allowed_paths=src/types/order.ts, expected_output=evidence",
-    ].join("\n"),
-    maxCreatedPerTurn: 3,
-  });
-  assert.deepEqual(scopes.map((scope) => scope.scopeKey), [
-    "csv-parser",
-    "chart-consumer",
-    "type-contract",
-  ]);
-});
-
-test("preferred delegation materializes admitted scopes early and bounds scheduler failures", async () => {
-  const scopes = [{ scopeKey: "src", allowedPaths: ["src/main.js"] }, {
-    scopeKey: "src-tauri",
-    allowedPaths: ["src-tauri/src/main.rs"],
-  }];
-  const required = {
-    required: true,
-    reason: "required",
-    candidateScopeKeys: scopes.map((scope) => scope.scopeKey),
-    requiredScopes: scopes,
-    remainingScopes: scopes,
-    contractOpen: true,
-    consumedScopeKeys: [],
-  };
-  const calls = [];
-  const admitted = await preferredScopes.materializePreferredDelegationScopesEarly({
-    requirement: required,
-    parentObjective: "Compare the frontend event owner with the backend command owner",
-    runSubagent: async (request) => {
-      calls.push(request);
-      return {
-        subagentId: `child-${request.scopeKey}`,
-        name: request.name,
-        status: "queued",
-        scopeKey: request.scopeKey,
-        allowedPaths: request.allowedPaths.split(","),
-      };
-    },
-  });
-  assert.equal(admitted.plan.action, "materialize");
-  assert.equal(admitted.plan.reason, "runtime_owned_disjoint_scopes");
-  assert.equal(admitted.plan.obligation, "preferred_delegation_scope_contract");
-  assert.deepEqual(calls.map((request) => [
-    request.scopeKey,
-    request.role,
-    request.allowedPaths,
-  ]), [
-    ["src", "reviewer", "src/main.js"],
-    ["src-tauri", "reviewer", "src-tauri/src/main.rs"],
-  ]);
-  assert.equal(admitted.outcomes.length, 2);
-  assert.deepEqual(admitted.failures, []);
-
-  let skippedCalls = 0;
-  const singleScope = await preferredScopes.materializePreferredDelegationScopesEarly({
-    requirement: {
-      ...required,
-      required: false,
-      reason: "insufficient_parallel_scope",
-      candidateScopeKeys: ["src"],
-      requiredScopes: [scopes[0]],
-      remainingScopes: [scopes[0]],
-      contractOpen: false,
-    },
-    runSubagent: async () => {
-      skippedCalls += 1;
-      throw new Error("must not run");
-    },
-  });
-  assert.equal(singleScope.plan.action, "skip");
-  assert.equal(singleScope.plan.blockedBy, "insufficient_parallel_scope");
-
-  const noCapacity = await preferredScopes.materializePreferredDelegationScopesEarly({
-    requirement: {
-      ...required,
-      required: false,
-      reason: "runtime_capacity_busy",
-      contractOpen: false,
-    },
-    runSubagent: async () => {
-      skippedCalls += 1;
-      throw new Error("must not run");
-    },
-  });
-  assert.equal(noCapacity.plan.action, "skip");
-  assert.equal(noCapacity.plan.blockedBy, "runtime_capacity_busy");
-  assert.equal(skippedCalls, 0);
-
-  const controlledFailure = await preferredScopes.materializePreferredDelegationScopesEarly({
-    requirement: required,
-    runSubagent: async (request) => {
-      if (request.scopeKey === "src") {
-        return {
-          subagentId: null,
-          name: request.name,
-          status: "deferred",
-          scopeKey: request.scopeKey,
-          reason: "runtime_capacity_busy",
-        };
-      }
-      throw new Error("scheduler unavailable");
-    },
-  });
-  assert.deepEqual(controlledFailure.attemptedScopeKeys, ["src", "src-tauri"]);
-  assert.deepEqual(controlledFailure.failures.map((failure) => [
-    failure.scopeKey,
-    failure.kind,
-  ]), [
-    ["src", "deferred"],
-    ["src-tauri", "runtime_error"],
-  ]);
-
-  const releasedAfterFailure = subagents.resolvePreferredDelegationRequirement({
-    decision: {
-      action: "admit",
-      reason: "explicit_preference",
-      phase: "diagnostic",
-      preference: "preferred",
-      independentScopeCount: 2,
-      explicitScopeCount: 0,
-      observedScopeCount: 2,
-      plannedWorkItemCount: 0,
-      pendingSubagentCount: 0,
-      runtimeHealthState: "ready",
-    },
-    independentScopeKeys: ["src/main.js", "src-tauri/src/main.rs"],
-    scopeContract: preferredScopes.createPreferredDelegationScopeContract({
-      requiredScopes: scopes,
-      maxCreatedPerTurn: 2,
-    }),
-    blockedScopeKeys: controlledFailure.attemptedScopeKeys,
-    spawnToolAvailable: true,
-  });
-  assert.equal(releasedAfterFailure.required, false);
-  assert.equal(releasedAfterFailure.reason, "runtime_materialization_failed");
-  assert.equal(releasedAfterFailure.contractOpen, false);
 });
 
 test("runtime event projection preserves completion while recording thread closure", () => {
@@ -1217,7 +381,7 @@ test("Auto delegation uses observed capacity health instead of assuming a fresh 
   assert.equal(degraded.state, "degraded");
 });
 
-test("queued children reserve child scope and immediately defer overlapping parent reads", async () => {
+test("queued children reserve parent access while allowing independent read-only peers", async () => {
   subagents.resetSubagentRuntimeForTests();
   const policy = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   let releaseOccupiers;
@@ -1271,10 +435,16 @@ test("queued children reserve child scope and immediately defer overlapping pare
     },
   });
 
+  assert.equal(subagents.findSubagentLeaseOverlap({
+    threadId: "thread-lease-order",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+  }), null);
   assert.ok(subagents.findSubagentLeaseOverlap({
     threadId: "thread-lease-order",
     workspace: "/workspace",
     allowedPaths: ["src/lib/subagents.ts"],
+    accessMode: "write",
   }));
   assert.ok(subagents.findSubagentScopeConflict({
     threadId: "thread-lease-order",
@@ -1412,7 +582,12 @@ test("controlled child runtime isolates messages and returns its summary through
       assert.equal(childCallbacks.getCurrentRunIntent(), "analyze");
       assert.equal(childCallbacks.getMessages().length, 1);
       assert.notEqual(childCallbacks.getMessages(), parentMessages);
-      assert.match(childCallbacks.getMessages()[0].content, /bounded read-only subagent/);
+      assert.match(childCallbacks.getMessages()[0].content, /fresh, one-shot subagent/);
+      assert.doesNotMatch(
+        childCallbacks.getMessages()[0].content,
+        /Start with src\/lib\/turnEvents\.ts/,
+        "unverified model-authored context hints are not copied into a fresh child",
+      );
       assert.notEqual(childCallbacks.getCurrentRunIdentity().runId, "run-parent");
       assert.equal(childCallbacks.getCurrentRunIdentity().parentRunId, "run-parent");
       childCallbacks.onDebugEvent("child_trace_probe", {});
@@ -1527,6 +702,7 @@ test("controlled child runtime isolates messages and returns its summary through
   assert.deepEqual(events.map((event) => event.type).filter((type, index, all) => index === 0 || type !== all[index - 1]), [
     "subagent.created",
     "subagent.updated",
+    "subagent.completed",
     "subagent.closed",
   ]);
   const [record] = subagents.projectSubagentRuns(events);
@@ -2024,6 +1200,7 @@ test("subagent evidence retains tool-call, version, range, and fact provenance",
   assert.equal(evidence.provenance.source, "tool_observation");
   assert.deepEqual(evidence.provenance.owner, {
     agentKind: "subagent",
+    collaborationTaskId: result.collaborationTaskId,
     subagentId: result.subagentId,
     parentTurnId: "turn-provenance",
     runId: `run-${result.subagentId}`,
@@ -2260,10 +1437,15 @@ test("async spawn returns a handle before completion and wait preserves structur
     request: {
       name: "Euler",
       role: "explorer",
+      taskKey: "turn-events",
+      taskKind: "explore",
       objective: "Inspect turn event persistence",
-      scopeKey: "turn-events",
+      delegationReason: "This independent persistence check can run while the parent inspects projection.",
+      successCriteria: "Return a source-backed observation of the event persistence contract.",
       scope: "Turn event persistence only",
+      requiredPaths: "",
       allowedPaths: "src/lib/turnEvents.ts",
+      accessMode: "read",
       expectedOutput: "Path-backed summary",
     },
     parentCallbacks,
@@ -2297,6 +1479,99 @@ test("async spawn returns a handle before completion and wait preserves structur
     threadId: "thread-async",
     targetPath: "src/lib/turnEvents.ts",
   }), null);
+});
+
+test("a fresh dependent child receives verified observations but no prior child context", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const events = [];
+  const parentCallbacks = {
+    getConfig: () => makeConfig("local"),
+    getPreferredLanguage: () => "en",
+    getSessionKey: () => "thread-dependency-handoff",
+    getMessages: () => [{
+      role: "user",
+      content: "PRIVATE_PARENT_TRANSCRIPT",
+    }],
+  };
+  const dependency = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      taskKey: "dependency-source",
+      taskKind: "explore",
+      objective: "Identify the source-side dependency contract.",
+      delegationReason: "The source contract can be verified independently.",
+      successCriteria: "Return one source-backed dependency observation.",
+      requiredPaths: "src/dependency.ts",
+      allowedPaths: "src/dependency.ts",
+      accessMode: "read",
+      expectedOutput: "Exact source evidence for the downstream task.",
+    },
+    parentCallbacks,
+    parentTurnId: "turn-dependency-handoff",
+    existingRunCount: 0,
+    emitEvent: (event) => events.push(event),
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/dependency.ts",
+        "export const dependencyMarker = true;",
+        { toolCallId: "dependency-source-read" },
+      );
+      childCallbacks.onAssistantFinalText(
+        "SECRET_CHILD_SUMMARY must never be inherited.",
+      );
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+  await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-dependency-handoff",
+    parentTurnId: "turn-dependency-handoff",
+    subagentIds: [dependency.subagentId],
+  });
+
+  let dependentPrompt = "";
+  const dependent = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      taskKey: "dependent-consumer",
+      taskKind: "validate",
+      objective: "Validate the consumer against the verified dependency contract.",
+      delegationReason: "The consumer validation is a distinct downstream task.",
+      successCriteria: "Return one source-backed consumer observation.",
+      requiredPaths: "src/consumer.ts",
+      allowedPaths: "src/consumer.ts",
+      accessMode: "read",
+      expectedOutput: "Consumer validation with exact source evidence.",
+      dependsOn: "dependency-source",
+    },
+    parentCallbacks,
+    parentTurnId: "turn-dependency-handoff",
+    existingRunCount: 0,
+    emitEvent: (event) => events.push(event),
+    executeAgentLoop: async (childCallbacks) => {
+      dependentPrompt = childCallbacks.getMessages()[0].content;
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/consumer.ts",
+        "import { dependencyMarker } from './dependency';",
+        { toolCallId: "dependent-consumer-read" },
+      );
+      childCallbacks.onAssistantFinalText("Consumer validation complete.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-dependency-handoff",
+    parentTurnId: "turn-dependency-handoff",
+    subagentIds: [dependent.subagentId],
+  });
+
+  assert.equal(joined.results[0].status, "completed");
+  assert.match(dependentPrompt, /Verified dependency evidence/);
+  assert.match(dependentPrompt, /dependency-source/);
+  assert.match(dependentPrompt, /read_file · src\/dependency\.ts/);
+  assert.doesNotMatch(dependentPrompt, /SECRET_CHILD_SUMMARY/);
+  assert.doesNotMatch(dependentPrompt, /PRIVATE_PARENT_TRANSCRIPT/);
 });
 
 test("runtime wait treats an unmatched model ID as all registered children without another model iteration", async () => {
@@ -2355,121 +1630,87 @@ test("runtime wait treats an unmatched model ID as all registered children witho
   assert.deepEqual(joined.pendingIds, []);
 });
 
-test("same-owner replacement ignores stale completion and cannot release the replacement lease", async () => {
+test("a one-shot subagent identity cannot be replaced or reactivated", async () => {
   subagents.resetSubagentRuntimeForTests();
-  const threadId = "thread-generation-race";
-  const sessionEpoch = "epoch-generation-race";
-  const parentTurnId = "turn-generation-race";
-  const subagentId = "subagent-generation-race";
-  let resolveOld;
-  let resolveReplacement;
-  const oldCompletion = new Promise((resolve) => { resolveOld = resolve; });
-  const replacementCompletion = new Promise((resolve) => { resolveReplacement = resolve; });
-  const makeResult = (generation, summary) => ({
+  const threadId = "thread-one-shot";
+  const sessionEpoch = "epoch-one-shot";
+  const parentTurnId = "turn-one-shot";
+  const subagentId = "subagent-one-shot";
+  let resolveRun;
+  const completion = new Promise((resolve) => { resolveRun = resolve; });
+  const result = {
     subagentId,
     name: "Noether",
-    scopeKey: "generation-race",
+    scopeKey: "one-shot",
     status: "completed",
-    summary,
+    summary: "The immutable task completed.",
     summaryTrust: "unverified_hypothesis",
     evidence: [],
     closureAudit: makeSubagentClosure({
-      scopeKey: "generation-race",
+      scopeKey: "one-shot",
       owner: {
         threadId,
         parentTurnId,
         subagentId,
-        runId: `run-${generation}`,
-        parentRunId: "run-parent-generation-race",
+        runId: "run-one-shot",
+        parentRunId: "run-parent-one-shot",
       },
     }),
-  });
+  };
 
   subagents.acquireSubagentScopeLease({
     threadId,
     sessionEpoch,
     parentTurnId,
     subagentId,
-    generation: "generation-old",
-    scopeKey: "generation-race",
+    generation: "generation-one-shot",
+    scopeKey: "one-shot",
     workspace: "/workspace",
-    allowedPaths: ["src/old.ts"],
+    allowedPaths: ["src/one-shot.ts"],
     createdAt: Date.now(),
   });
-  subagents.registerCoordinatedSubagentRun({
+  const registration = {
     threadId,
     sessionEpoch,
     parentTurnId,
     subagentId,
-    generation: "generation-old",
+    generation: "generation-one-shot",
     name: "Noether",
-    scopeKey: "generation-race",
-    runId: "run-generation-old",
-    parentRunId: "run-parent-generation-race",
-    completion: oldCompletion,
-  });
-  const staleWait = subagents.waitForCoordinatedSubagents({
-    threadId,
-    sessionEpoch,
-    parentTurnId,
-    subagentIds: [subagentId],
-  });
+    scopeKey: "one-shot",
+    runId: "run-one-shot",
+    parentRunId: "run-parent-one-shot",
+    completion,
+  };
+  subagents.registerCoordinatedSubagentRun(registration);
+  assert.throws(
+    () => subagents.registerCoordinatedSubagentRun(registration),
+    /SUBAGENT_ID_ALREADY_REGISTERED/,
+  );
 
-  subagents.acquireSubagentScopeLease({
-    threadId,
-    sessionEpoch,
-    parentTurnId,
-    subagentId,
-    generation: "generation-replacement",
-    scopeKey: "generation-race",
-    workspace: "/workspace",
-    allowedPaths: ["src/replacement.ts"],
-    createdAt: Date.now(),
-  });
-  subagents.registerCoordinatedSubagentRun({
-    threadId,
-    sessionEpoch,
-    parentTurnId,
-    subagentId,
-    generation: "generation-replacement",
-    name: "Noether",
-    scopeKey: "generation-race",
-    runId: "run-generation-replacement",
-    parentRunId: "run-parent-generation-race",
-    completion: replacementCompletion,
-  });
-
-  resolveOld(makeResult("generation-old", "The stale child completed."));
-  const staleJoin = await staleWait;
-  assert.deepEqual(staleJoin.results, [], "a replaced generation must not publish stale evidence");
-  assert.deepEqual(staleJoin.pendingIds, [subagentId]);
-  assert.equal(subagents.findSubagentScopeConflict({
-    threadId,
-    sessionEpoch,
-    targetPath: "src/old.ts",
-  }), null, "replacement registration should release only the old generation lease");
-  assert.equal(subagents.findSubagentScopeConflict({
-    threadId,
-    sessionEpoch,
-    targetPath: "src/replacement.ts",
-  })?.generation, "generation-replacement");
-
-  resolveReplacement(makeResult("generation-replacement", "The replacement child completed."));
-  const replacementJoin = await subagents.waitForCoordinatedSubagents({
+  resolveRun(result);
+  const joined = await subagents.waitForCoordinatedSubagents({
     threadId,
     sessionEpoch,
     parentTurnId,
   });
   assert.deepEqual(
-    replacementJoin.results.map((entry) => entry.summary),
-    ["The replacement child completed."],
+    joined.results.map((entry) => entry.summary),
+    ["The immutable task completed."],
   );
-  assert.deepEqual(replacementJoin.pendingIds, []);
+  assert.deepEqual(joined.pendingIds, []);
   assert.equal(subagents.findSubagentScopeConflict({
     threadId,
     sessionEpoch,
-    targetPath: "src/replacement.ts",
+    targetPath: "src/one-shot.ts",
   }), null);
+  assert.throws(
+    () => subagents.registerCoordinatedSubagentRun({
+      ...registration,
+      completion: Promise.resolve(result),
+    }),
+    /SUBAGENT_ID_ALREADY_REGISTERED/,
+    "a consumed closed identity must never be reactivated",
+  );
 });
 
 test("coordination registry isolates identical child identities across session epochs", async () => {
@@ -2522,7 +1763,11 @@ test("coordination registry isolates identical child identities across session e
     [subagentId],
   );
   assert.equal(subagents.getCoordinatedSubagentRunCount(threadId, parentTurnId, "epoch-a"), 0);
-  assert.equal(subagents.getCoordinatedSubagentRunCount(threadId, parentTurnId, "epoch-b"), 1);
+  assert.equal(
+    subagents.getCoordinatedSubagentRunCount(threadId, parentTurnId, "epoch-b"),
+    0,
+    "terminal children leave the active registry immediately even before their result is joined",
+  );
 
   const epochBJoin = await subagents.waitForCoordinatedSubagents({
     threadId,
@@ -2944,6 +2189,12 @@ test("runtime parent join injects structured child evidence before finalization"
                 subagentId: "subagent-euler",
               },
               sourceToolCallId: "child-read-events",
+              factReferences: Array.from({ length: 80 }, (_unused, index) => ({
+                fact: `event-contract-${index}`,
+                sourceToolCallId: "child-read-events",
+                sourceObservationKey: "read_file::src/lib/turnEvents.ts::v1",
+                sourceVersion: "v1",
+              })),
             },
           }],
         }],
@@ -2965,12 +2216,16 @@ test("runtime parent join injects structured child evidence before finalization"
   assert.match(messages[0].content, /SUBAGENT_JOIN_RESULT/);
   assert.match(messages[0].content, /unverified child hypothesis/);
   assert.match(messages[0].content, /targeted parent read_file/);
+  assert.match(messages[0].content, /src\/lib\/turnEvents\.ts/);
+  assert.doesNotMatch(messages[0].content, /factReferences/);
+  assert.equal(messages[0].content.length < 6_000, true);
   assert.deepEqual(recent.map((entry) => [entry.name, entry.target]), [["read_file", "src/lib/turnEvents.ts"]]);
   assert.equal(recent[0].readFileObservation, undefined);
   assert.equal(recent[0].delegatedObservation.owner.subagentId, "subagent-euler");
   assert.equal(recent[0].delegatedObservation.requiresParentReread, true);
   assert.deepEqual(recentPlan, recent);
   assert.deepEqual(events.map((entry) => entry.event), ["parent_join_required", "parent_join_injected"]);
+  assert.equal(events[1].data.internalPayloadChars > events[1].data.modelPayloadChars, true);
 });
 
 test("runtime parent join preserves a joined result without claiming empty evidence was consumed", async () => {
@@ -3009,15 +2264,7 @@ test("runtime parent join preserves a joined result without claiming empty evide
     adoptedEvidenceCount: 0,
     sourceEvidenceCount: 0,
     requiredParentRereads: 0,
-    scopeOutcomes: [{
-      subagentId: "subagent-empty",
-      scopeKey: "empty-result",
-      status: "completed",
-      closureState: "unverified",
-      adoptedEvidenceCount: 0,
-      adoptedEvidenceTargets: [],
-      consumed: false,
-    }],
+    taskOutcomes: [],
   });
   assert.equal(messages.length, 1, "the parent still receives the joined child result");
   assert.deepEqual(recent, []);
@@ -3398,7 +2645,7 @@ test("a completed error conclusion never projects as subagent success", async ()
   assert.match(result.summary, /provider request failed/i);
 });
 
-test("overlapping child scope is a policy deferral rather than a failed spawn", () => {
+test("overlapping write leases are a policy deferral rather than a failed spawn", () => {
   subagents.resetSubagentRuntimeForTests();
   subagents.acquireSubagentScopeLease({
     threadId: "thread-overlap",
@@ -3407,20 +2654,31 @@ test("overlapping child scope is a policy deferral rather than a failed spawn", 
     scopeKey: "existing-scope",
     workspace: "/workspace",
     allowedPaths: ["src/lib/subagents.ts"],
+    accessMode: "write",
     createdAt: Date.now(),
   });
   const debugEvents = [];
   const result = subagentRuntime.scheduleControlledSubagent({
     request: {
       name: "Mendel",
-      objective: "Inspect the same runtime coordinator",
-      scopeKey: "overlapping-scope",
+      taskKey: "modify-runtime-coordinator",
+      taskKind: "implement",
+      objective: "Modify the runtime coordinator under an exact write lease",
+      delegationReason: "A bounded implementation can proceed independently after diagnosis.",
+      successCriteria: "Produce a scoped diff for the coordinator.",
+      requiredPaths: "",
       allowedPaths: "src/lib",
+      accessMode: "write",
+      expectedOutput: "A structured diff and concise implementation summary.",
     },
     parentCallbacks: {
       getConfig: () => makeConfig("local"),
       getPreferredLanguage: () => "en",
       getSessionKey: () => "thread-overlap",
+      getCurrentRunIntent: () => "execute",
+      getRuntimeRunIntent: () => "execute",
+      getExecutionConsentGranted: () => true,
+      getIsPlanApproved: () => false,
       onDebugEvent: (event, data) => debugEvents.push({ event, data }),
     },
     parentTurnId: "turn-overlap",
@@ -3444,7 +2702,51 @@ test("overlapping child scope is a policy deferral rather than a failed spawn", 
   ));
 });
 
-test("scope leases reject child escape and parent overlap", () => {
+test("implement tasks cannot acquire a write lease without parent authority", () => {
+  subagents.resetSubagentRuntimeForTests();
+  let started = false;
+  const result = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      taskKey: "unauthorized-implementation",
+      taskKind: "implement",
+      objective: "Apply one bounded source correction.",
+      delegationReason: "The edit is independently bounded.",
+      successCriteria: "Produce a source diff.",
+      requiredPaths: "",
+      allowedPaths: "src/main.js",
+      accessMode: "write",
+      expectedOutput: "Structured diff evidence.",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-write-authority",
+      getCurrentRunIntent: () => "analyze",
+      getRuntimeRunIntent: () => "analyze",
+      getExecutionConsentGranted: () => false,
+      getIsPlanApproved: () => false,
+    },
+    parentTurnId: "turn-write-authority",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async () => {
+      started = true;
+      throw new Error("unauthorized child must not start");
+    },
+  });
+  assert.equal(result.status, "deferred");
+  assert.equal(result.reason, "write_not_authorized");
+  assert.equal(started, false);
+  assert.equal(
+    subagents.getCoordinatedSubagentRunCount(
+      "thread-write-authority",
+      "turn-write-authority",
+    ),
+    0,
+  );
+});
+
+test("scope leases reject child escape and serialize only conflicting access modes", () => {
   subagents.resetSubagentRuntimeForTests();
   subagents.acquireSubagentScopeLease({
     threadId: "thread-scope",
@@ -3501,11 +2803,17 @@ test("scope leases reject child escape and parent overlap", () => {
     threadId: "thread-scope",
     workspace: "/workspace",
     allowedPaths: ["src/lib"],
-  })?.subagentId, "subagent-scope");
+  }), null);
   assert.equal(subagents.findSubagentLeaseOverlap({
     threadId: "thread-scope",
     workspace: "/workspace",
     allowedPaths: ["other/../src/lib"],
+  }), null);
+  assert.equal(subagents.findSubagentLeaseOverlap({
+    threadId: "thread-scope",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib"],
+    accessMode: "write",
   })?.subagentId, "subagent-scope");
   assert.equal(subagents.findSubagentLeaseOverlap({
     threadId: "thread-scope",
@@ -3514,7 +2822,7 @@ test("scope leases reject child escape and parent overlap", () => {
   }), null);
 });
 
-test("subagent source contracts keep children read-only and UI activity clickable", () => {
+test("subagent source contracts gate read and approved write tasks while keeping UI activity clickable", () => {
   const registrySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolRegistrySetup.ts"), "utf8");
   const subagentRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/subagentRuntime.ts"), "utf8");
   const partitionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
@@ -3533,15 +2841,22 @@ test("subagent source contracts keep children read-only and UI activity clickabl
     "find_symbol_references",
     "git_status",
     "git_diff",
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
   ]) {
     assert.match(registrySource, new RegExp(`"${toolName}"`));
   }
+  assert.match(registrySource, /subagentAccessMode === "write"/);
   assert.match(registrySource, /mcpServers\.length > 0 && subagentDepth === 0/);
   assert.match(subagentRuntimeSource, /onToolSurfaceResolved: undefined/);
   assert.doesNotMatch(subagentRuntimeSource, /\.\.\.input\.parentCallbacks/);
   assert.match(subagentRuntimeSource, /getForcedExecuteRecoveryState: \(\) => null/);
   assert.match(subagentRuntimeSource, /onExecuteRecoveryStateChange: undefined/);
-  assert.match(partitionSource, /never reuse the[\s\S]*read-only result cache for subagents/);
+  assert.match(
+    partitionSource,
+    /tc\.name === "spawn_subagent"[\s\S]*tc\.name === "wait_subagents"[\s\S]*tc\.name === "cancel_subagent"[\s\S]*readOnlyCalls\.push[\s\S]*continue;/,
+  );
   assert.match(chatSource, /data-testid="subagent-activity-notice"/);
   assert.match(chatSource, /openSubagentsPanel/);
   assert.match(panelSource, /rightPanelTab === "subagents"/);

@@ -238,15 +238,22 @@ function getToolDepth(args: Record<string, unknown>): number | null {
 
 export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput = {}): TaskTargetingProfile {
   const userContext = normalizeTurnInputContextSignals(input.userContext);
-  const combinedText = [
+  // Structured file context is already an exact path channel. Do not feed it
+  // back through the prose path extractor: absolute paths containing spaces
+  // can otherwise manufacture truncated suffixes before the exact value is
+  // appended below.
+  const pathReferenceText = [
     input.userPrompt || "",
     ...(input.planArtifacts || []).map((artifact) => artifact.content || ""),
     ...(input.planTaskTexts || []),
+  ].join("\n");
+  const combinedText = [
+    pathReferenceText,
     ...(input.associatedPaths || []),
     ...userContext.mentionedFilePaths,
     ...userContext.attachedFilePaths,
   ].join("\n");
-  const explicitPaths = extractExplicitPaths(combinedText);
+  const explicitPaths = extractExplicitPaths(pathReferenceText);
   for (const path of input.associatedPaths || []) pushUnique(explicitPaths, path);
   for (const path of userContext.mentionedFilePaths) pushUnique(explicitPaths, path);
   for (const path of userContext.attachedFilePaths) pushUnique(explicitPaths, path);

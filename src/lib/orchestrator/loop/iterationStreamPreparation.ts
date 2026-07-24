@@ -37,8 +37,6 @@ import {
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
-import { buildPreferredDelegationActionContract } from "../../subagents";
-import type { PreferredDelegationScopeContract } from "../../preferredDelegationScopes";
 import {
   SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
   type ToolDefinition,
@@ -169,8 +167,6 @@ export async function prepareIterationStreamRequest(input: {
   iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
   turnInputContextSignals: TurnInputContextSignals;
   latestUserPromptText?: string;
-  preferredDelegationScopeContract?: PreferredDelegationScopeContract | null;
-  preferredDelegationMaterializationBlockedScopeKeys?: string[];
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   lastAssistantTextForCheckpoint: string;
@@ -196,8 +192,6 @@ export async function prepareIterationStreamRequest(input: {
     iterationContext,
     turnInputContextSignals,
     latestUserPromptText = "",
-    preferredDelegationScopeContract = null,
-    preferredDelegationMaterializationBlockedScopeKeys = [],
     recentToolActivity,
     recentPlanToolActivity,
     lastAssistantTextForCheckpoint,
@@ -598,8 +592,6 @@ export async function prepareIterationStreamRequest(input: {
     turnInputContextSignals,
     latestUserPromptText,
     lastAssistantTextForCheckpoint,
-    preferredDelegationScopeContract,
-    preferredDelegationMaterializationBlockedScopeKeys,
   });
   const activePlanCandidateRepair = planRuntimeState.planCandidateRepairCheckpoint?.exhausted === false
     ? planRuntimeState.planCandidateRepairCheckpoint
@@ -839,36 +831,6 @@ export async function prepareIterationStreamRequest(input: {
       transcriptToolMessages: managedAgentMessages.filter((message) => message.role === "tool").length,
     });
   }
-  // The action contract must be the final runtime-owned instruction. Evidence
-  // cards can legitimately name a missing source owner, but they must not
-  // override a stricter collaboration checkpoint by making a parent read look
-  // available. This ordering is part of the protocol and applies equally to
-  // native-tool and XML-compatible providers.
-  if (toolSurfaceDecision.preferredDelegationRequirement.required) {
-    const delegationContract = buildPreferredDelegationActionContract({
-      language: callbacks.getPreferredLanguage(),
-      candidateScopeKeys:
-        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
-      remainingScopes:
-        toolSurfaceDecision.preferredDelegationRequirement.remainingScopes,
-    });
-    managedAgentMessages = [
-      ...managedAgentMessages,
-      { role: "system", content: delegationContract },
-    ];
-    logAgentEvent("preferred_delegation_action_contract_injected", {
-      iteration,
-      candidateScopeKeys:
-        toolSurfaceDecision.preferredDelegationRequirement.candidateScopeKeys,
-      toolNames: toolSurfaceDecision.iterationAllTools.map((tool) =>
-        tool.function.name
-      ),
-      toolChoiceRequired: !contextManagementResult.forceXmlTools,
-      injectionOrder: "after_plan_evidence",
-      providerNeutral: true,
-    });
-  }
-
   const assistantMsgId = generateId();
   const maxOutputEscalations = getMaxOutputEscalations();
   const iterationRequestStartedAt = Date.now();

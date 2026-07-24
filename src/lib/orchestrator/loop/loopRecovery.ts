@@ -881,6 +881,25 @@ export function handleExecuteConvergencePrompt(input: {
     recentToolActivity: recentToolActivity.length,
     executeRecoveryMode,
   });
+  const activeRecoveryOwnsUnfinishedCapability =
+    executeRecoveryMode !== "normal" &&
+    executeRecoveryMode !== "validation_only" &&
+    executeRecoveryMode !== "finite_validation_only";
+  if (activeRecoveryOwnsUnfinishedCapability) {
+    const activeContract = resolveExecuteRecoveryActionContract(executeRecoveryMode);
+    logAgentEvent("execute_convergence_active_recovery_preserved", {
+      iteration,
+      maxIterations: effectiveMaxIterations,
+      executeRecoveryMode,
+      recoveryPhase: activeContract.phase,
+      nextRequiredCapability: activeContract.nextRequiredCapability,
+    });
+    // The active transaction already injects an exact ephemeral action card.
+    // A broad convergence prompt would contradict that narrower capability
+    // and, more importantly, must not replace an uncommitted mutation with
+    // validation merely because an earlier sibling target changed.
+    return { usedExecuteConvergencePrompt: true };
+  }
   if (isExecuteMutationRecoveryEligible({ callbacks, workflowMode, runtimeIntent })) {
     const recoveryMode = !callbacks.getIsPlanApproved() &&
         hasSuccessfulWorkspaceMutationEvidence({

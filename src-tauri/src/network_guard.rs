@@ -30,6 +30,8 @@ pub struct NetworkGrant {
     pub allow_authorization: bool,
     #[serde(default)]
     address_policy: NetworkAddressPolicy,
+    #[serde(default)]
+    allow_proxy_virtual_dns: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +62,26 @@ impl NetworkGrant {
             allowed_origins,
             allow_authorization,
             address_policy: NetworkAddressPolicy::PublicOnly,
+            allow_proxy_virtual_dns: false,
+        })
+    }
+
+    /// Grant a user-configured public provider origin while accepting DNS
+    /// answers from the RFC 2544 benchmark range used by system proxy/TUN
+    /// clients as virtual "fake IP" destinations. Only a configured hostname
+    /// receives that DNS exception; an IP-literal 198.18.0.0/15 target remains
+    /// forbidden, while ordinary public IP literals retain their old behavior.
+    pub fn for_user_configured_public_origin(
+        raw: &str,
+        allow_authorization: bool,
+    ) -> Result<Self, NetworkGuardError> {
+        let url = validate_network_url(raw)?;
+        let allow_proxy_virtual_dns = matches!(url.host(), Some(Host::Domain(_)));
+        Ok(Self {
+            allowed_origins: vec![NetworkOrigin::from_url(&url)?],
+            allow_authorization,
+            address_policy: NetworkAddressPolicy::PublicOnly,
+            allow_proxy_virtual_dns,
         })
     }
 
@@ -78,7 +100,12 @@ impl NetworkGrant {
             allowed_origins: vec![NetworkOrigin::from_url(&url)?],
             allow_authorization,
             address_policy: NetworkAddressPolicy::ExplicitLocal,
+            allow_proxy_virtual_dns: false,
         })
+    }
+
+    pub fn allows_proxy_virtual_dns(&self) -> bool {
+        self.allow_proxy_virtual_dns
     }
 
     pub fn authorize_url(&self, raw: &str) -> Result<AuthorizedNetworkTarget, NetworkGuardError> {
@@ -91,6 +118,7 @@ impl NetworkGrant {
             url,
             origin,
             address_policy: self.address_policy,
+            allow_proxy_virtual_dns: self.allow_proxy_virtual_dns,
         })
     }
 
@@ -114,6 +142,7 @@ pub struct AuthorizedNetworkTarget {
     pub url: Url,
     pub origin: NetworkOrigin,
     address_policy: NetworkAddressPolicy,
+    allow_proxy_virtual_dns: bool,
 }
 
 impl AuthorizedNetworkTarget {
@@ -124,7 +153,11 @@ impl AuthorizedNetworkTarget {
         &self,
         addresses: &[IpAddr],
     ) -> Result<(), NetworkGuardError> {
-        validate_resolved_addresses_for_policy(addresses, self.address_policy)
+        validate_resolved_addresses_for_policy(
+            addresses,
+            self.address_policy,
+            self.allow_proxy_virtual_dns,
+        )
     }
 }
 
@@ -237,18 +270,21 @@ fn validate_network_url_for_policy(
 }
 
 pub fn validate_resolved_addresses(addresses: &[IpAddr]) -> Result<(), NetworkGuardError> {
-    validate_resolved_addresses_for_policy(addresses, NetworkAddressPolicy::PublicOnly)
+    validate_resolved_addresses_for_policy(addresses, NetworkAddressPolicy::PublicOnly, false)
 }
 
 fn validate_resolved_addresses_for_policy(
     addresses: &[IpAddr],
     policy: NetworkAddressPolicy,
+    allow_proxy_virtual_dns: bool,
 ) -> Result<(), NetworkGuardError> {
     if addresses.is_empty() {
         return Err(NetworkGuardError::EmptyResolution);
     }
     for address in addresses {
-        if is_forbidden_ip_for_policy(*address, policy) {
+        if is_forbidden_ip_for_policy(*address, policy)
+            && !(allow_proxy_virtual_dns && is_proxy_virtual_dns_address(*address))
+        {
             return Err(NetworkGuardError::ForbiddenAddress(*address));
         }
     }
@@ -333,6 +369,20 @@ fn is_forbidden_ipv4(address: Ipv4Addr) -> bool {
         || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
         || address == Ipv4Addr::new(169, 254, 169, 254)
         || address == Ipv4Addr::new(100, 100, 100, 200)
+}
+
+fn is_proxy_virtual_dns_address(address: IpAddr) -> bool {
+    let address = match address {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(address) => {
+            let Some(address) = address.to_ipv4_mapped() else {
+                return false;
+            };
+            address
+        }
+    };
+    let octets = address.octets();
+    octets[0] == 198 && matches!(octets[1], 18 | 19)
 }
 
 fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
@@ -459,5 +509,42 @@ mod tests {
         assert!(
             NetworkGrant::for_explicit_local_origin("https://api.openai.com/v1", true,).is_err()
         );
+    }
+
+    #[test]
+    fn user_configured_provider_grant_accepts_proxy_virtual_dns_without_opening_private_targets() {
+        let grant = NetworkGrant::for_user_configured_public_origin(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+            true,
+        )
+        .unwrap();
+        let target = grant
+            .authorize_url("https://dashscope.aliyuncs.com/compatible-mode/v1/models")
+            .unwrap();
+        let proxy_virtual: IpAddr = "198.18.0.205".parse().unwrap();
+        target
+            .validate_resolved_addresses(&[proxy_virtual])
+            .unwrap();
+
+        let private: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(matches!(
+            target.validate_resolved_addresses(&[private]),
+            Err(NetworkGuardError::ForbiddenAddress(address)) if address == private
+        ));
+        assert!(NetworkGrant::for_user_configured_public_origin(
+            "http://198.18.0.205/v1/models",
+            true,
+        )
+        .is_err());
+        assert!(NetworkGrant::for_user_configured_public_origin(
+            "http://127.0.0.1:11434/v1/models",
+            true,
+        )
+        .is_err());
+        assert!(NetworkGrant::for_user_configured_public_origin(
+            "https://93.184.216.34/v1/models",
+            true,
+        )
+        .is_ok());
     }
 }

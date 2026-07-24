@@ -1014,8 +1014,8 @@ export async function partitionToolCallsForExecution(input: {
             : `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} is outside the current ${executeRecoveryBatchDecision.phase} phase; use the active tool surface for the next capability.`
         : isDelegationPolicyDeferral
         ? callbacks.getPreferredLanguage() === "zh"
-          ? "SUBAGENT_DELEGATION_DEFERRED: 当前阶段或自适应准入没有开放新的子智能体。请继续主体的当前步骤；若已有子智能体正在运行，请先 wait_subagents 汇合。"
-          : "SUBAGENT_DELEGATION_DEFERRED: The current phase or adaptive admission does not allow another subagent. Continue the parent's current step; join any running children with wait_subagents first."
+          ? "SUBAGENT_DELEGATION_DEFERRED: 当前阶段或容量准入没有开放新的子智能体。请继续主体不重叠的工作；仅在当前步骤依赖子任务结果或准备最终回答时调用 wait_subagents。"
+          : "SUBAGENT_DELEGATION_DEFERRED: The current phase or capacity admission does not allow another subagent. Continue non-overlapping parent work; call wait_subagents only when the current step depends on child results or before the final answer."
         : unsupportedMessage;
       if (executeRecoveryBatchDecision.active) {
         logAgentEvent("execute_recovery_scope_deferred", {
@@ -1932,9 +1932,14 @@ export async function partitionToolCallsForExecution(input: {
         if (isOrderSensitiveWorkspaceAction) sawOrderSensitiveWorkspaceAction = true;
         continue;
       }
-      // A repeated delegation is still a new isolated run; never reuse the
-      // read-only result cache for subagents.
-      if (tc.name === "spawn_subagent" || tc.name === "wait_subagents") {
+      // Every admitted delegation owns a fresh isolated run, while duplicate
+      // semantics may return a policy receipt. Never replay either outcome
+      // through the generic read-only result cache.
+      if (
+        tc.name === "spawn_subagent" ||
+        tc.name === "wait_subagents" ||
+        tc.name === "cancel_subagent"
+      ) {
         readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
         continue;
       }

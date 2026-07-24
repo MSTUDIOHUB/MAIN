@@ -59,3 +59,18 @@ test("shell normalization leaves dynamic and out-of-workspace cd for Rust to rej
     assert.equal(normalized.cwd, undefined);
   }
 });
+
+test("replace mutation compatibility aliases normalize into the canonical schema", () => {
+  assert.deepEqual(
+    normalizeToolCallForExecution("replace_in_file", {
+      target: `${workspace}/src/components/statusbar.js`,
+      old_content: "const title = filePath;",
+      new_content: "const title = filePath || '未命名文档';",
+    }, workspace),
+    {
+      path: "src/components/statusbar.js",
+      search_text: "const title = filePath;",
+      replace_text: "const title = filePath || '未命名文档';",
+    },
+  );
+});

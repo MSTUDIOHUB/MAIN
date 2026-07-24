@@ -100,7 +100,6 @@ export function handleAssistantOutputPhase(input: {
   runtimeIntent: ResolvedUserIntent;
   workspace: string;
   latestUserPromptText: string;
-  preferredDelegationRequired?: boolean;
   availableToolNames: Set<string>;
   effectiveToolCalls: ToolCallToExecute[];
   normalized: NormalizedStreamState;
@@ -773,7 +772,6 @@ export function handleAssistantOutputPhase(input: {
       assistantMsgId,
       ...planRuntimeState,
       latestUserPromptText: input.latestUserPromptText,
-      preferredDelegationRequired: input.preferredDelegationRequired,
       setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
     });
   planRuntimeState = applyPlanPostConvergenceRuntimeState(

@@ -136,8 +136,8 @@ export function buildTurnIntakeContextBlock(input: {
 
   if (subagentPreference === "preferred") {
     lines.push(input.language === "en"
-      ? "delegation: The user prefers subagent collaboration. Before broad exploration, identify useful bounded read-only scopes. Spawn one early when one independent scope is valuable; when multiple disjoint scopes exist, spawn as many as current runtime capacity permits in the same response while the parent continues non-overlapping work. Join children before finalizing. Do not create filler or duplicate scopes, and use zero when delegation would not help."
-      : "delegation: 用户偏好子智能体协作。大范围探索前先识别有实质价值的有界只读范围；存在一个独立范围时应尽早创建一个，存在多个路径不重叠的范围时应在同一响应中按当前运行容量创建多个，同时主体继续非重叠工作，并在结束前汇合。不要为了凑数制造琐碎或重复范围；委派无益时可以不创建。");
+      ? "delegation: Collaboration is allowed and preferred, but optional. First understand the user's intent and problem structure, then create 0–N fresh one-shot agents only for narrow semantic tasks with independent success criteria and worthwhile parallel value. Never split work by directory alone. Each child gets one immutable task, is permanently closed at terminal state, and is never reused; only verified compact evidence may be passed to a later fresh child. Continue non-overlapping parent work and join dependencies before finalizing."
+      : "delegation: 本轮允许并优先考虑协作，但不是强制配额。先理解用户意图和问题结构，只在并行收益明确时为具有独立成功标准的窄语义任务创建 0～N 个全新一次性子智能体；绝不能仅按目录拆分。每个子智能体只执行一个不可变任务，终态后永久关闭且不得复用；后续新实例只能接收已验证的精简证据。主体并行推进不重叠工作，并在依赖结果或最终回答前汇合。");
   } else if (subagentPreference === "forbidden") {
     lines.push(input.language === "en"
       ? "delegation: The user explicitly disabled subagents for this turn."

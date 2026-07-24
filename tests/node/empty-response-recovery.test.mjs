@@ -332,3 +332,23 @@ test("malformed plan tool-use block recovers before empty counters increment", a
   assert.equal(result.emptyResponseCountThisTurn, 0);
   assert.equal(events.some((event) => event.type === "append" && /Malformed|tool_use|XML/i.test(event.message.content)), true);
 });
+
+test("empty required-tool protocol violations defer to the execute protocol owner", async () => {
+  const { callbacks, events } = makeCallbacks({ language: "en" });
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    normalized: {
+      ...emptyNormalized(),
+      finishReason: "tool_calls",
+      protocolViolation: "required_tool_call_missing",
+    },
+  }));
+
+  assert.equal(result.status, "none");
+  assert.equal(result.consecutiveEmptyResponseCount, 0);
+  assert.equal(result.emptyResponseCountThisTurn, 0);
+  assert.deepEqual(events, []);
+});

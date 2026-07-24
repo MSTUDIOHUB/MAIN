@@ -22,6 +22,12 @@ test.describe("subagent activity and right panel", () => {
     await expect(panel).toBeVisible();
     await expect(panel).toContainText("本地主体 + 最多 2 个子流");
     await expect(panel).toContainText("qwen3.6-35b-a3b");
+    await expect(page.getByTestId("subagent-section-active")).toContainText("活跃 1");
+    await expect(page.getByTestId("subagent-section-done")).toContainText("已完成 2");
+    await expect(page.getByTestId("subagent-list-item-subagent-mendel"))
+      .toHaveAttribute("data-subagent-section", "active");
+    await expect(page.getByTestId("subagent-list-item-subagent-euler"))
+      .toHaveAttribute("data-subagent-section", "done");
     await expect(page.getByTestId("subagent-detail")).toContainText("Mendel");
     await expect(page.getByTestId("subagent-detail")).toContainText("src/components/ChatArea.tsx");
     await expect(page.getByTestId("stop-subagent-button")).toBeVisible();
@@ -47,6 +53,8 @@ test.describe("subagent activity and right panel", () => {
       const panel = page.getByTestId("subagents-panel");
       await expect(notice).toBeVisible();
       await expect(panel).toBeVisible();
+      await expect(page.getByTestId("subagent-section-active")).toBeVisible();
+      await expect(page.getByTestId("subagent-section-done")).toBeVisible();
       await expect(page.getByTestId("subagent-detail")).toContainText("Mendel");
 
       const panelBox = await panel.boundingBox();

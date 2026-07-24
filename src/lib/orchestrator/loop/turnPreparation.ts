@@ -407,6 +407,7 @@ export function createSystemPromptApplier(input: {
           availableToolNames: availableToolNameList,
           scopeKey: subagentScope.scopeKey,
           allowedPaths: subagentScope.allowedPaths,
+          accessMode: subagentScope.accessMode || "read",
         })
       : buildSystemPrompt(
       skills,

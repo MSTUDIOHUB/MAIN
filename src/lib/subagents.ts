@@ -13,12 +13,14 @@ import {
   relativizeToWorkspacePath,
 } from "./workspacePaths";
 import {
-  buildPreferredDelegationScopeFingerprint,
-  getPreferredDelegationScopeProgress,
-  preferredDelegationScopeContractMatchesWave,
-  type PreferredDelegationScopeCandidate,
-  type PreferredDelegationScopeContract,
-} from "./preferredDelegationScopes";
+  COLLABORATION_LEDGER_SCHEMA_VERSION,
+  type CollaborationAccessMode,
+  type CollaborationLedgerV1,
+  type CollaborationTaskKind,
+  type CollaborationTaskLifecycleState,
+  type CollaborationTaskTerminalState,
+  type CollaborationWorkItemV1,
+} from "./collaborationWorkItems";
 
 export type SubagentStatus =
   | "queued"
@@ -57,6 +59,7 @@ export interface SubagentClosureOwner {
   agentKind: "subagent";
   threadId: string;
   parentTurnId: string;
+  collaborationTaskId?: string;
   subagentId: string;
   runId: string;
   parentRunId: string | null;
@@ -89,6 +92,9 @@ export interface SubagentClosureEnvelope {
 
 export interface SubagentRunSnapshot {
   id: string;
+  /** One immutable semantic task owns this fresh child instance. */
+  collaborationTaskId?: string;
+  workItem?: CollaborationWorkItemV1;
   parentTurnId: string;
   threadId: string;
   name: string;
@@ -149,12 +155,20 @@ export interface SubagentRunRecord extends SubagentRunSnapshot {
 export interface SpawnSubagentRequest {
   name?: string;
   role?: string;
+  taskKey?: string;
+  taskKind?: CollaborationTaskKind;
   objective: string;
+  delegationReason?: string;
+  successCriteria?: string;
   scopeKey?: string;
   scope?: string;
-  contextHints?: string;
   allowedPaths?: string;
+  requiredPaths?: string;
   expectedOutput?: string;
+  accessMode?: CollaborationAccessMode;
+  dependsOn?: string;
+  independentReviewOf?: string;
+  goalSliceId?: string;
 }
 
 export type DelegationRuntimePhase =
@@ -169,17 +183,18 @@ export type DelegationDecisionAction = "admit" | "defer" | "deny";
 export type DelegationDecisionReason =
   | "explicit_preference"
   | "explicit_permission"
-  | "adaptive_multi_scope"
-  | "insufficient_independent_scope"
-  | "pending_subagents_require_join"
+  | "collaboration_not_enabled"
   | "phase_not_eligible"
   | "user_forbidden"
   | "workspace_unavailable"
   | "subagent_recursion_forbidden"
   | "turn_capacity_reached"
   | "overlapping_active_scope"
-  | "parent_scope_already_observed"
-  | "runtime_health_unavailable"
+  | "invalid_task_contract"
+  | "duplicate_semantic_task"
+  | "evidence_already_satisfied"
+  | "dependency_unresolved"
+  | "write_not_authorized"
   | "runtime_capacity_busy"
   | "runtime_capacity_degraded";
 
@@ -201,45 +216,14 @@ export interface DelegationDecision {
   reason: DelegationDecisionReason;
   phase: DelegationRuntimePhase;
   preference: SubagentDelegationPreference;
-  independentScopeCount: number;
-  explicitScopeCount: number;
-  observedScopeCount: number;
-  plannedWorkItemCount: number;
   pendingSubagentCount: number;
   runtimeHealthState: DelegationRuntimeHealth["state"] | "not_provided";
-}
-
-export type PreferredDelegationRequirementReason =
-  | "required"
-  | "not_preferred"
-  | "all_required_scopes_consumed"
-  | "awaiting_scope_join"
-  | "scope_creation_capacity_reached"
-  | "runtime_materialization_failed"
-  | "evidence_topology_open"
-  | "insufficient_parallel_scope"
-  | "spawn_unavailable"
-  | DelegationDecisionReason;
-
-export interface PreferredDelegationRequirement {
-  required: boolean;
-  reason: PreferredDelegationRequirementReason;
-  candidateScopeKeys: string[];
-  /** Frozen runtime-owned scopes that must each cross spawn -> join -> consume. */
-  requiredScopes: import("./preferredDelegationScopes").PreferredDelegationScopeCandidate[];
-  /** Exact scopes eligible for the next bounded spawn batch. */
-  remainingScopes: import("./preferredDelegationScopes").PreferredDelegationScopeCandidate[];
-  contractOpen: boolean;
-  consumedScopeKeys: string[];
-  /** Runtime phase that owns this bounded collaboration wave. */
-  lifecyclePhase: DelegationRuntimePhase;
-  /** Concrete path-scope identity used to prevent duplicate waves. */
-  scopeFingerprint: string;
 }
 
 export type SpawnSubagentResult =
   | {
       subagentId: string;
+      collaborationTaskId: string;
       name: string;
       status: "queued" | "running";
       scopeKey: string;
@@ -248,13 +232,35 @@ export type SpawnSubagentResult =
     }
   | {
       subagentId: null;
+      collaborationTaskId: string | null;
       name: string;
       status: "deferred";
       scopeKey: string;
       reason: DelegationDecisionReason;
       conflictingSubagentId?: string;
       conflictingScopeKey?: string;
+      existingEvidenceReceipt?: {
+        collaborationTaskId: string;
+        subagentId: string;
+        runId: string;
+        status: "completed" | "partial" | "blocked" | "canceled";
+        evidenceReceiptIds: string[];
+        evidenceCount: number;
+      };
     };
+
+export interface CollaborationTaskJoinOutcome {
+  collaborationTaskId: string;
+  subagentId: string;
+  taskKey: string;
+  status: string;
+  closureState: "satisfied" | "partial" | "unverified";
+  adoptedEvidenceCount: number;
+  adoptedEvidenceTargets: string[];
+  /** Evidence adoption is independent from whole-task completion. */
+  evidenceAdopted: boolean;
+  terminalComplete: boolean;
+}
 
 export interface SubagentEvidenceFactReference {
   fact: string;
@@ -266,6 +272,7 @@ export interface SubagentEvidenceFactReference {
 
 export interface SubagentObservationOwner {
   agentKind: "subagent";
+  collaborationTaskId?: string;
   subagentId: string;
   parentTurnId?: string;
   runId?: string;
@@ -365,6 +372,7 @@ export function resolveSubagentPathCoverage(input: {
 
 export interface SubagentResultEnvelope {
   subagentId: string;
+  collaborationTaskId?: string;
   name: string;
   scopeKey: string;
   status: SubagentStatus;
@@ -383,6 +391,7 @@ export interface SubagentResultEnvelope {
 
 export interface WaitSubagentsRequest {
   subagentIds?: string[];
+  collaborationTaskIds?: string[];
 }
 
 export interface WaitSubagentsResult {
@@ -390,8 +399,21 @@ export interface WaitSubagentsResult {
   pendingIds: string[];
 }
 
+export interface CancelSubagentRequest {
+  subagentId?: string;
+  collaborationTaskId?: string;
+}
+
+export interface CancelSubagentResult {
+  canceled: boolean;
+  status: "cancel_requested" | "already_closed" | "not_found";
+  subagentId: string | null;
+  collaborationTaskId: string | null;
+}
+
 export interface SubagentExecutionScope {
   subagentId: string;
+  collaborationTaskId: string;
   parentSessionKey: string;
   scopeKey: string;
   workspace: string;
@@ -401,6 +423,7 @@ export interface SubagentExecutionScope {
   /** Remaining exact paths; directory tools may target only these entries. */
   allowedDirectoryPaths: string[];
   scopeKind: "exact_files" | "directory_or_mixed";
+  accessMode: CollaborationAccessMode;
   /** A scope-invalid tool is removed after its first blocked call in this child run. */
   blockedToolNames: string[];
 }
@@ -412,6 +435,7 @@ export interface RuntimeTraceContext {
   parentRunId: string | null;
   agentKind: "parent" | "subagent";
   subagentId?: string;
+  collaborationTaskId?: string;
 }
 
 export interface SubagentCapacityPolicy {
@@ -421,7 +445,8 @@ export interface SubagentCapacityPolicy {
   model: string;
   maxActiveRequests: number;
   maxBurstActiveRequests: number;
-  maxCreatedPerTurn: number;
+  /** Safety fuse for simultaneously registered one-shot child workflows. */
+  maxConcurrentChildren: number;
   childMaxIterations: number;
 }
 
@@ -457,95 +482,21 @@ function normalizeSubagentScopePathIdentity(value: string): string {
   return joined || ".";
 }
 
-function normalizeSubagentScopeDisplayPath(value: unknown): string {
-  const normalized = String(value || "")
-    .replace(/\\/g, "/")
-    .replace(/^[`'\"]+|[`'\"]+$/g, "")
-    .replace(/^\.\//, "")
-    .replace(/\/+$/, "")
-    .trim();
-  if (!normalized) return "";
-  const drive = normalized.match(/^([a-z]:)\/(.*)$/i);
-  const absolute = normalized.startsWith("/");
-  const source = drive ? drive[2] : absolute ? normalized.slice(1) : normalized;
-  const segments: string[] = [];
-  for (const segment of source.split("/")) {
-    if (!segment || segment === ".") continue;
-    if (segment === "..") {
-      if (segments.length === 0) return "";
-      segments.pop();
-      continue;
-    }
-    segments.push(segment);
-  }
-  const joined = segments.join("/");
-  if (drive) return joined ? `${drive[1]}/${joined}` : `${drive[1]}/`;
-  if (absolute) return joined ? `/${joined}` : "/";
-  return joined || ".";
-}
-
-function collectIndependentDelegationScopes(values: unknown[]): Array<{
-  identity: string;
-  displayPath: string;
-}> {
-  const displayPathByIdentity = new Map<string, string>();
-  for (const value of values) {
-    const displayPath = normalizeSubagentScopeDisplayPath(value);
-    const identity = normalizeSubagentScopePathIdentity(displayPath);
-    if (!identity || identity === "." || displayPathByIdentity.has(identity)) continue;
-    displayPathByIdentity.set(identity, displayPath);
-  }
-  const normalized = [...displayPathByIdentity.entries()]
-    .map(([identity, displayPath]) => ({ identity, displayPath }))
-    .sort((left, right) => left.identity.length - right.identity.length
-      || left.identity.localeCompare(right.identity));
-  const independent: typeof normalized = [];
-  for (const candidate of normalized) {
-    if (independent.some((scope) =>
-      pathContains(scope.identity, candidate.identity)
-      || pathContains(candidate.identity, scope.identity))) {
-      continue;
-    }
-    independent.push(candidate);
-  }
-  return independent;
-}
-
 /**
- * Reduce path-like delegation hints to non-overlapping, canonical scopes.
- * Task count is deliberately excluded: several checklist items can still own
- * the same file and therefore do not prove that parallel work is independent.
- */
-export function normalizeIndependentDelegationScopeKeys(values: unknown[]): string[] {
-  return collectIndependentDelegationScopes(values).map((scope) => scope.identity);
-}
-
-/**
- * Provider-neutral delegation admission. Adaptive fan-out remains an initial
- * context optimization. An explicit preferred lifecycle may also open bounded
- * mutation/validation review waves after decisive runtime evidence; model and
- * provider identity never participate in the decision.
+ * Provider-neutral collaboration availability. Runtime decides only whether
+ * delegation is safe and authorized; the parent model owns whether useful
+ * semantic work exists and how to split it.
  */
 export function resolveDelegationDecision(input: {
   preference?: SubagentDelegationPreference;
   phase: DelegationRuntimePhase;
   hasWorkspace: boolean;
-  explicitScopeCount?: number;
-  observedScopeCount?: number;
-  plannedWorkItemCount?: number;
-  independentScopeKeys?: string[];
   pendingSubagentCount?: number;
   subagentDepth?: number;
   runtimeHealth?: DelegationRuntimeHealth | null;
 }): DelegationDecision {
   const preference = input.preference || "unspecified";
-  const explicitScopeCount = boundedCount(input.explicitScopeCount);
-  const observedScopeCount = boundedCount(input.observedScopeCount);
-  const plannedWorkItemCount = boundedCount(input.plannedWorkItemCount);
   const pendingSubagentCount = boundedCount(input.pendingSubagentCount);
-  const independentScopeCount = normalizeIndependentDelegationScopeKeys(
-    input.independentScopeKeys || [],
-  ).length;
   const decision = (
     action: DelegationDecisionAction,
     reason: DelegationDecisionReason,
@@ -554,10 +505,6 @@ export function resolveDelegationDecision(input: {
     reason,
     phase: input.phase,
     preference,
-    independentScopeCount,
-    explicitScopeCount,
-    observedScopeCount,
-    plannedWorkItemCount,
     pendingSubagentCount,
     runtimeHealthState: input.runtimeHealth?.state || "not_provided",
   });
@@ -567,27 +514,15 @@ export function resolveDelegationDecision(input: {
   }
   if (!input.hasWorkspace) return decision("deny", "workspace_unavailable");
   if (preference === "forbidden") return decision("deny", "user_forbidden");
-  const preferredLifecyclePhase =
-    preference === "preferred" &&
-    (input.phase === "mutation" || input.phase === "validation");
   if (
     input.phase !== "context" &&
     input.phase !== "diagnostic" &&
-    !preferredLifecyclePhase
+    input.phase !== "mutation" &&
+    input.phase !== "validation"
   ) {
     return decision("defer", "phase_not_eligible");
   }
-  if (pendingSubagentCount > 0) {
-    return decision("defer", "pending_subagents_require_join");
-  }
   if (preference === "preferred" || preference === "allowed") {
-    // Preference changes priority, never the existence of useful work. The
-    // parent must identify at least one concrete path scope before spawning;
-    // runtime health remains an admission boundary just as it is for adaptive
-    // fan-out.
-    if (independentScopeCount === 0) {
-      return decision("defer", "insufficient_independent_scope");
-    }
     if (input.runtimeHealth?.state === "degraded") {
       return decision("defer", "runtime_capacity_degraded");
     }
@@ -599,211 +534,24 @@ export function resolveDelegationDecision(input: {
       preference === "preferred" ? "explicit_preference" : "explicit_permission",
     );
   }
-  // Auto delegation is an initial-context optimization only. Files already
-  // read by the parent and checklist length are evidence/telemetry, not a
-  // reason to reopen fan-out during diagnosis.
-  if (
-    input.phase === "context" &&
-    explicitScopeCount >= 2 &&
-    independentScopeCount >= 2
-  ) {
-    if (!input.runtimeHealth || input.runtimeHealth.state === "unknown") {
-      return decision("defer", "runtime_health_unavailable");
-    }
-    if (input.runtimeHealth.state === "degraded") {
-      return decision("defer", "runtime_capacity_degraded");
-    }
-    if (input.runtimeHealth.state === "busy") {
-      return decision("defer", "runtime_capacity_busy");
-    }
-    return decision("admit", "adaptive_multi_scope");
-  }
-  return decision("defer", "insufficient_independent_scope");
-}
-
-/**
- * A checked collaboration preference is stronger than a prompt hint once the
- * runtime has proved that useful parallel work exists. Keep this obligation
- * behind the normal delegation admission decision so workspace, recursion,
- * phase, capacity, and memory-safety boundaries remain authoritative.
- *
- * Two independent scopes are required: one can remain with the parent while
- * the other is delegated without manufacturing duplicate work.
- */
-export function resolvePreferredDelegationRequirement(input: {
-  decision: DelegationDecision;
-  independentScopeKeys: string[];
-  scopeCandidates?: PreferredDelegationScopeCandidate[];
-  scopeContract?: PreferredDelegationScopeContract | null;
-  /** False while a Plan still has typed evidence owners left to discover. */
-  activationAllowed?: boolean;
-  /** Process-local scheduler failures already returned to the parent runtime. */
-  blockedScopeKeys?: Iterable<string>;
-  spawnToolAvailable: boolean;
-}): PreferredDelegationRequirement {
-  const fallbackScopes = collectIndependentDelegationScopes(
-    input.independentScopeKeys,
-  ).slice(0, 8).map((scope) => ({
-    scopeKey: scope.displayPath,
-    allowedPaths: [scope.displayPath],
-  }));
-  const initialScopes = (input.scopeCandidates?.length
-    ? input.scopeCandidates
-    : fallbackScopes).map((scope) => ({
-      scopeKey: scope.scopeKey,
-      allowedPaths: [...scope.allowedPaths],
-    }));
-  const storedProgress = getPreferredDelegationScopeProgress(input.scopeContract || null);
-  const scopeContractMatchesWave = preferredDelegationScopeContractMatchesWave({
-    contract: input.scopeContract || null,
-    lifecyclePhase: input.decision.phase,
-    scopes: initialScopes,
-  });
-  // An active wave must always be joined before phase rebasing. A settled wave
-  // belongs only to its phase+scope fingerprint and cannot permanently close
-  // collaboration for the rest of the parent Turn.
-  const effectiveScopeContract =
-    storedProgress.activeScopeKeys.length > 0 ||
-    storedProgress.open ||
-    scopeContractMatchesWave
-      ? input.scopeContract || null
-      : null;
-  const progress = getPreferredDelegationScopeProgress(effectiveScopeContract);
-  const requiredScopes = effectiveScopeContract?.requiredScopes || initialScopes;
-  const rawRemainingScopes = effectiveScopeContract
-    ? progress.remainingScopes.slice(0, progress.creationCapacityRemaining)
-    : initialScopes;
-  const blockedScopeKeys = new Set(
-    [...(
-      input.scopeContract && !effectiveScopeContract
-        ? []
-        : input.blockedScopeKeys || []
-    )].map((value) => String(value || "").trim()),
-  );
-  const remainingScopes = rawRemainingScopes.filter((scope) =>
-    !blockedScopeKeys.has(scope.scopeKey)
-  );
-  const candidateScopeKeys = requiredScopes.map((scope) => scope.scopeKey);
-  const result = (
-    required: boolean,
-    reason: PreferredDelegationRequirementReason,
-    contractOpen = false,
-  ): PreferredDelegationRequirement => ({
-    required,
-    reason,
-    candidateScopeKeys,
-    requiredScopes,
-    remainingScopes,
-    contractOpen,
-    consumedScopeKeys: progress.consumedScopeKeys,
-    lifecyclePhase: input.decision.phase,
-    scopeFingerprint: buildPreferredDelegationScopeFingerprint(requiredScopes),
-  });
-
-  if (input.decision.preference !== "preferred") {
-    return result(false, "not_preferred");
-  }
-  if (!effectiveScopeContract && input.activationAllowed === false) {
-    return result(false, "evidence_topology_open");
-  }
-  if (effectiveScopeContract && progress.satisfied) {
-    return result(false, "all_required_scopes_consumed");
-  }
-  if (effectiveScopeContract && progress.activeScopeKeys.length > 0) {
-    return result(false, "awaiting_scope_join", true);
-  }
-  if (effectiveScopeContract && progress.creationCapacityRemaining <= 0) {
-    return result(false, "scope_creation_capacity_reached", progress.open);
-  }
-  if (rawRemainingScopes.length > 0 && remainingScopes.length === 0) {
-    // Admission/scheduler failures are bounded for this process run. Release
-    // the evidence surface to the parent instead of repeatedly asking either
-    // the runtime or the model to recreate the same rejected child scopes.
-    return result(false, "runtime_materialization_failed", false);
-  }
-  if (input.decision.action !== "admit") {
-    return result(false, input.decision.reason, progress.open);
-  }
-  if (!effectiveScopeContract && requiredScopes.length < 2) {
-    return result(false, "insufficient_parallel_scope");
-  }
-  if (!input.spawnToolAvailable) {
-    return result(false, "spawn_unavailable", progress.open);
-  }
-  return result(true, "required", true);
-}
-
-export function buildPreferredDelegationActionContract(input: {
-  language: "zh" | "en";
-  candidateScopeKeys: string[];
-  remainingScopes?: PreferredDelegationScopeCandidate[];
-}): string {
-  const scopes = (input.remainingScopes?.length
-    ? input.remainingScopes
-    : collectIndependentDelegationScopes(input.candidateScopeKeys)
-      .slice(0, 8)
-      .map((scope) => ({ scopeKey: scope.displayPath, allowedPaths: [scope.displayPath] })))
-    .map((scope) => `- scope_key=${scope.scopeKey}; allowed_paths=${scope.allowedPaths.join(",")}`)
-    .join("\n");
-  if (input.language === "en") {
-    return [
-      "PREFERRED_DELEGATION_ACTION_REQUIRED: The user enabled subagent collaboration, and the runtime has admitted useful parallel read-only work.",
-      "This is the final action contract for the current request. The only available action is spawn_subagent. Call it now before any additional parent read, mutation, validation, or final response; do not emit a progress paragraph first.",
-      "If the evidence contract names a missing source owner, delegate that exact bounded observation to the child instead of calling read_file or search from the parent. Use a concrete path already present in the project structure or evidence; do not invent one.",
-      "Create one child for every remaining runtime-owned scope listed below. Use role=reviewer for each pre-draft independent audit. You may issue all listed spawn_subagent calls in this response; the runtime enforces the existing concurrency and memory-safety policy. allowed_paths is the authorization ceiling for that scope, not a claim that every file below a directory was inspected. A scope is consumed only after join returns a satisfied typed closure with at least one material provenance-backed observation; any exact evidence obligations left open return to the parent runtime.",
-      "Remaining required scopes:",
-      scopes || "- Select a concrete non-overlapping scope from the current evidence.",
-    ].join("\n");
-  }
-  return [
-    "PREFERRED_DELEGATION_ACTION_REQUIRED：用户已开启子智能体协作，且运行时已确认存在可并行的有价值只读范围。",
-    "这是当前请求最后生效的动作契约，唯一可用动作是 spawn_subagent。现在必须先调用 spawn_subagent，再进行主体追加读取、修改、验证或最终回答；工具调用前不要输出进度段落。",
-    "如果证据契约指出缺失的源码拥有者，就把该精确且有界的观察委派给子智能体，不要由主体调用 read_file 或搜索。路径必须已经出现在项目结构或证据中，不得虚构。",
-    "下面每个尚未完成的运行时 scope 都必须各创建一个子智能体，并设置 role=reviewer。可以在本次响应中并列调用全部列出的 spawn_subagent；运行时会继续执行既有并发和内存安全策略。allowed_paths 是该 scope 的授权上限，不表示目录下每个文件均已检查。只有 join 返回 typed closure=satisfied 且至少包含一条有实质内容的 provenance 观察，该 scope 才算 consumed；仍未关闭的精确证据义务会交回父运行时，partial 或无证据结果不算完成。",
-    "尚未完成的必需 scope：",
-    scopes || "- 请从当前证据中选择一个具体且不重叠的范围。",
-  ].join("\n");
-}
-
-/**
- * A required preferred-delegation checkpoint happens after the parent has
- * proved useful independent scopes. Normal discovery correctly rejects a
- * child that merely repeats parent-owned evidence, but this checkpoint asks
- * for an independent pre-draft audit. Normalize only spawn calls admitted by
- * that runtime checkpoint to the existing reviewer contract; all adaptive and
- * optional delegation keeps the ordinary duplicate-work policy.
- */
-export function normalizeRequiredPreferredDelegationReviewerCalls<
-  T extends { name: string; arguments: string },
->(calls: T[], required: boolean): T[] {
-  if (!required) return calls;
-  return calls.map((call) => {
-    if (call.name !== "spawn_subagent") return call;
-    try {
-      const parsed = JSON.parse(call.arguments) as Record<string, unknown>;
-      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return call;
-      if (/reviewer|independent[_ -]?review/i.test(String(parsed.role || ""))) {
-        return call;
-      }
-      return {
-        ...call,
-        arguments: JSON.stringify({ ...parsed, role: "reviewer" }),
-      };
-    } catch {
-      return call;
-    }
-  });
+  return decision("defer", "collaboration_not_enabled");
 }
 
 export function buildSubagentPolicyDeferral(input: {
+  collaborationTaskId?: string | null;
   name?: string;
   scopeKey?: string;
   reason: DelegationDecisionReason;
   conflictingSubagentId?: string;
   conflictingScopeKey?: string;
+  existingEvidenceReceipt?: Extract<
+    SpawnSubagentResult,
+    { status: "deferred" }
+  >["existingEvidenceReceipt"];
 }): Extract<SpawnSubagentResult, { status: "deferred" }> {
   return {
     subagentId: null,
+    collaborationTaskId: input.collaborationTaskId || null,
     name: String(input.name || "delegation").trim().slice(0, 32) || "delegation",
     status: "deferred",
     scopeKey: String(input.scopeKey || "delegation").trim().slice(0, 96) || "delegation",
@@ -813,6 +561,9 @@ export function buildSubagentPolicyDeferral(input: {
       : {}),
     ...(input.conflictingScopeKey
       ? { conflictingScopeKey: input.conflictingScopeKey }
+      : {}),
+    ...(input.existingEvidenceReceipt
+      ? { existingEvidenceReceipt: input.existingEvidenceReceipt }
       : {}),
   };
 }
@@ -952,7 +703,7 @@ export function resolveSubagentCapacityPolicy(config: AppConfig): SubagentCapaci
     // coordinated separately and reserves capacity for the parent thread.
     maxActiveRequests: profile === "local" ? 2 : 3,
     maxBurstActiveRequests: 3,
-    maxCreatedPerTurn: profile === "local" ? 3 : 6,
+    maxConcurrentChildren: profile === "local" ? 3 : 6,
     childMaxIterations: profile === "local" ? 6 : 8,
   };
 }
@@ -965,11 +716,60 @@ export function isSubagentActiveStatus(status: SubagentStatus): boolean {
   return ACTIVE_SUBAGENT_STATUSES.has(status);
 }
 
+function eventMatchesProjectedSubagent(
+  event: {
+    threadId: string;
+    turnId: string;
+    collaborationTaskId?: string;
+    runId?: string;
+    parentRunId?: string | null;
+  },
+  run: SubagentRunRecord,
+): boolean {
+  if (event.threadId !== run.threadId || event.turnId !== run.parentTurnId) {
+    return false;
+  }
+  if (
+    run.collaborationTaskId &&
+    event.collaborationTaskId !== run.collaborationTaskId
+  ) return false;
+  if (
+    run.runId &&
+    (
+      event.runId
+        ? event.runId !== run.runId
+        : !!run.collaborationTaskId
+    )
+  ) return false;
+  if (
+    run.parentRunId !== undefined &&
+    (
+      event.parentRunId !== undefined
+        ? event.parentRunId !== run.parentRunId
+        : !!run.collaborationTaskId
+    )
+  ) return false;
+  return true;
+}
+
 export function projectSubagentRuns(events: readonly MainThreadEvent[]): SubagentRunRecord[] {
   const records = new Map<string, SubagentRunRecord>();
 
   for (const event of events) {
     if (event.type === "subagent.created") {
+      if (records.has(event.subagent.id)) continue;
+      if (
+        (event.subagentId && event.subagentId !== event.subagent.id) ||
+        (
+          event.collaborationTaskId &&
+          event.subagent.collaborationTaskId !== event.collaborationTaskId
+        ) ||
+        (event.runId && event.subagent.runId !== event.runId) ||
+        (
+          event.parentRunId !== undefined &&
+          event.subagent.parentRunId !== event.parentRunId
+        )
+      ) continue;
       records.set(event.subagent.id, {
         ...event.subagent,
         activities: [],
@@ -979,7 +779,11 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
 
     if (event.type === "subagent.updated") {
       const current = records.get(event.subagentId);
-      if (!current) continue;
+      if (
+        !current ||
+        current.closedAt ||
+        !eventMatchesProjectedSubagent(event, current)
+      ) continue;
       const activities = event.activity
         ? [...current.activities, event.activity].slice(-80)
         : current.activities;
@@ -991,9 +795,25 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
       continue;
     }
 
+    if (event.type === "subagent.completed") {
+      const current = records.get(event.subagentId);
+      if (
+        !current ||
+        current.closedAt ||
+        !eventMatchesProjectedSubagent(event, current)
+      ) continue;
+      records.set(event.subagentId, projectFailClosedSubagentCompletion({
+        ...current,
+        status: event.status,
+        completedAt: event.completedAt,
+        updatedAt: Math.max(current.updatedAt, event.completedAt),
+      }));
+      continue;
+    }
+
     if (event.type === "subagent.closed") {
       const current = records.get(event.subagentId);
-      if (!current) continue;
+      if (!current || !eventMatchesProjectedSubagent(event, current)) continue;
       const requestedTerminalStatus = isSubagentTerminalStatus(event.reason as SubagentStatus)
         ? event.reason as SubagentStatus
         : event.reason === "orphaned_after_restart" || event.reason === "runtime_controller_missing"
@@ -1075,6 +895,7 @@ export interface CoordinatedSubagentRun {
   /** Session-instance fence. Runtime registrations always normalize this value. */
   sessionEpoch?: string;
   parentTurnId: string;
+  collaborationTaskId?: string;
   subagentId: string;
   /** Runtime-instance fence for same-owner replacement races. */
   generation?: string;
@@ -1101,10 +922,15 @@ export interface SubagentScopeLease {
   scopeKey: string;
   workspace: string;
   allowedPaths: string[];
+  accessMode?: CollaborationAccessMode;
   createdAt: number;
 }
 
 const coordinatedRuns = new Map<string, CoordinatedSubagentRun>();
+/** Terminal, context-free result receipts waiting for parent consumption. */
+const completedCoordinatedRuns = new Map<string, CoordinatedSubagentRun>();
+/** A closed agent identity is a permanent tombstone for its parent Turn. */
+const closedCoordinatedRunKeys = new Set<string>();
 const scopeLeases = new Map<string, SubagentScopeLease>();
 // Reservations serialize child ownership without blocking the parent. They
 // become active leases only when a child begins a real source-tool operation.
@@ -1112,6 +938,545 @@ const scopeReservations = new Map<string, SubagentScopeLease>();
 const COORDINATED_RESULT_TTL_MS = 10 * 60_000;
 const LEGACY_SUBAGENT_SESSION_EPOCH = "legacy-session-epoch";
 let coordinationGenerationSequence = 0;
+
+interface CollaborationTaskRuntimeRecord {
+  threadId: string;
+  sessionEpoch: string;
+  parentTurnId: string;
+  workItem: CollaborationWorkItemV1;
+  subagentId: string;
+  runId: string;
+  state: CollaborationTaskLifecycleState;
+  terminalState?: CollaborationTaskTerminalState;
+  createdAt: number;
+  updatedAt: number;
+  closedAt?: number;
+  evidenceReceiptIds: string[];
+  result?: SubagentResultEnvelope;
+}
+
+export interface VerifiedCollaborationDependencyContext {
+  collaborationTaskId: string;
+  taskKey: string;
+  terminalState: "completed" | "partial";
+  evidenceReceiptIds: string[];
+  observations: Array<{
+    tool: string;
+    target: string;
+    detail: string;
+    facts: string[];
+  }>;
+}
+
+const collaborationTaskRecords = new Map<string, CollaborationTaskRuntimeRecord>();
+
+function collaborationParentKey(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+}): string {
+  return [
+    input.threadId,
+    normalizeSubagentSessionEpoch(input.sessionEpoch),
+    input.parentTurnId,
+  ].join("::");
+}
+
+function collaborationTaskKey(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  collaborationTaskId: string;
+}): string {
+  return `${collaborationParentKey(input)}::${input.collaborationTaskId}`;
+}
+
+function getCollaborationTaskRecordsForParent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+}): CollaborationTaskRuntimeRecord[] {
+  const parentKey = `${collaborationParentKey(input)}::`;
+  return [...collaborationTaskRecords.entries()]
+    .filter(([key]) => key.startsWith(parentKey))
+    .map(([, record]) => record);
+}
+
+/**
+ * Build the only child-to-child handoff allowed by the one-shot model. The
+ * next instance receives task-owned receipt IDs and runtime-authenticated tool
+ * observations for explicit dependencies, never the former child's messages,
+ * reasoning, or model-authored summary.
+ */
+export function getVerifiedCollaborationDependencyContext(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  dependencies: string[];
+}): VerifiedCollaborationDependencyContext[] {
+  const requested = new Set(input.dependencies
+    .map((value) => String(value || "").trim().toLocaleLowerCase())
+    .filter(Boolean));
+  if (requested.size === 0) return [];
+  return getCollaborationTaskRecordsForParent(input)
+    .filter((record) =>
+      requested.has(record.workItem.collaborationTaskId.toLocaleLowerCase()) ||
+      requested.has(record.workItem.taskKey.toLocaleLowerCase())
+    )
+    .flatMap((record) => {
+      const result = record.result;
+      const authoritative = !!result &&
+        result.subagentId === record.subagentId &&
+        result.collaborationTaskId === record.workItem.collaborationTaskId &&
+        isAuthoritativeSubagentClosure(result.closureAudit, {
+          threadId: record.threadId,
+          parentTurnId: record.parentTurnId,
+          collaborationTaskId: record.workItem.collaborationTaskId,
+          subagentId: record.subagentId,
+          runId: record.runId,
+          scopeKey: result.scopeKey,
+        }) &&
+        result.status === result.closureAudit.status &&
+        (
+          result.closureAudit.state === "satisfied" ||
+          result.closureAudit.state === "partial"
+        );
+      const acceptedToolCallIds = new Set(
+        authoritative
+          ? result.closureAudit.acceptedEvidenceToolCallIds
+          : [],
+      );
+      const observations = authoritative
+        ? result.evidence
+          .filter((item) =>
+            item.provenance.source === "tool_observation" &&
+            item.provenance.owner.subagentId === record.subagentId &&
+            item.provenance.owner.collaborationTaskId ===
+              record.workItem.collaborationTaskId &&
+            item.provenance.owner.runId === record.runId &&
+            !!item.provenance.sourceToolCallId &&
+            acceptedToolCallIds.has(item.provenance.sourceToolCallId)
+          )
+          .slice(0, 8)
+          .map((item) => ({
+            tool: String(item.tool || "").slice(0, 80),
+            target: String(item.target || "").slice(0, 500),
+            detail: String(item.detail || "").slice(0, 1_000),
+            facts: (item.facts || []).slice(0, 8).map((fact) =>
+              String(fact || "").slice(0, 500)
+            ),
+          }))
+        : [];
+      if (observations.length === 0 && record.evidenceReceiptIds.length === 0) {
+        return [];
+      }
+      return [{
+        collaborationTaskId: record.workItem.collaborationTaskId,
+        taskKey: record.workItem.taskKey,
+        terminalState:
+          result?.closureAudit.state === "partial" ||
+            record.terminalState === "partial"
+            ? "partial" as const
+            : "completed" as const,
+        evidenceReceiptIds: [...record.evidenceReceiptIds],
+        observations,
+      }];
+    })
+    .slice(0, 4);
+}
+
+export type CollaborationTaskAdmission =
+  | { action: "admit" }
+  | {
+      action: "defer";
+      reason: Extract<
+        DelegationDecisionReason,
+        "duplicate_semantic_task" | "evidence_already_satisfied" | "dependency_unresolved"
+      >;
+      existing?: CollaborationTaskRuntimeRecord;
+    };
+
+/**
+ * Admit semantic work, not path topology. Paths remain a lease boundary only.
+ * An explicit independent review may intentionally overlap the reviewed task;
+ * every other matching semantic fingerprint is one immutable task.
+ */
+export function evaluateCollaborationTaskAdmission(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  workItem: CollaborationWorkItemV1;
+}): CollaborationTaskAdmission {
+  const existing = getCollaborationTaskRecordsForParent(input);
+  const unresolvedDependency = input.workItem.dependsOn.find((dependency) => {
+    const owner = existing.find((record) =>
+      record.workItem.collaborationTaskId === dependency ||
+      record.workItem.taskKey.toLocaleLowerCase() === dependency.toLocaleLowerCase()
+    );
+    return !owner || !(
+      owner.terminalState === "completed" ||
+      owner.terminalState === "partial" ||
+      owner.state === "completed" ||
+      owner.state === "partial"
+    );
+  });
+  if (unresolvedDependency) {
+    return { action: "defer", reason: "dependency_unresolved" };
+  }
+  const intentionalReview = input.workItem.taskKind === "review" &&
+    !!input.workItem.independentReviewOf;
+  if (
+    intentionalReview &&
+    !existing.some((record) =>
+      record.workItem.collaborationTaskId ===
+        input.workItem.independentReviewOf ||
+      record.workItem.taskKey.toLocaleLowerCase() ===
+        input.workItem.independentReviewOf?.toLocaleLowerCase()
+    )
+  ) {
+    return { action: "defer", reason: "dependency_unresolved" };
+  }
+  const duplicate = existing.find((record) =>
+    (
+      record.workItem.semanticFingerprint === input.workItem.semanticFingerprint ||
+      record.workItem.taskKey.toLocaleLowerCase() ===
+        input.workItem.taskKey.toLocaleLowerCase()
+    ) &&
+    !(
+      intentionalReview &&
+      (
+        record.workItem.collaborationTaskId === input.workItem.independentReviewOf ||
+        record.workItem.taskKey === input.workItem.independentReviewOf ||
+        record.workItem.independentReviewOf === input.workItem.independentReviewOf
+      )
+    )
+  );
+  if (!duplicate) return { action: "admit" };
+  const satisfiedByLiveResult =
+    duplicate.result?.closureAudit.state === "satisfied" &&
+    duplicate.result.evidence.length > 0;
+  const satisfiedByVerifiedReceipt =
+    duplicate.terminalState === "completed" &&
+    duplicate.evidenceReceiptIds.length > 0;
+  const satisfied = satisfiedByLiveResult || satisfiedByVerifiedReceipt;
+  return {
+    action: "defer",
+    reason: satisfied ? "evidence_already_satisfied" : "duplicate_semantic_task",
+    existing: duplicate,
+  };
+}
+
+export function registerCollaborationTask(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  workItem: CollaborationWorkItemV1;
+  subagentId: string;
+  runId: string;
+  now?: number;
+}): void {
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
+  if (
+    !input.workItem.collaborationTaskId ||
+    !String(input.subagentId || "").trim() ||
+    !String(input.runId || "").trim()
+  ) {
+    throw new Error("COLLABORATION_RUNTIME_IDENTITY_REQUIRED");
+  }
+  const key = collaborationTaskKey({
+    threadId: input.threadId,
+    sessionEpoch,
+    parentTurnId: input.parentTurnId,
+    collaborationTaskId: input.workItem.collaborationTaskId,
+  });
+  if (collaborationTaskRecords.has(key)) {
+    throw new Error("COLLABORATION_TASK_ID_ALREADY_REGISTERED");
+  }
+  const existingIdentity = getCollaborationTaskRecordsForParent({
+    threadId: input.threadId,
+    sessionEpoch,
+    parentTurnId: input.parentTurnId,
+  }).find((record) =>
+    record.subagentId === input.subagentId ||
+    record.runId === input.runId
+  );
+  if (existingIdentity) {
+    throw new Error("COLLABORATION_RUNTIME_IDENTITY_ALREADY_REGISTERED");
+  }
+  const now = input.now ?? Date.now();
+  collaborationTaskRecords.set(key, {
+    threadId: input.threadId,
+    sessionEpoch,
+    parentTurnId: input.parentTurnId,
+    workItem: input.workItem,
+    subagentId: input.subagentId,
+    runId: input.runId,
+    state: "created",
+    evidenceReceiptIds: [],
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
+export function updateCollaborationTaskState(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  collaborationTaskId: string;
+  state: CollaborationTaskLifecycleState;
+  result?: SubagentResultEnvelope;
+  now?: number;
+}): boolean {
+  const key = collaborationTaskKey(input);
+  const record = collaborationTaskRecords.get(key);
+  if (!record || record.state === "closed") return false;
+  const activeStates = new Set<CollaborationTaskLifecycleState>([
+    "created",
+    "queued",
+    "running",
+    "summarizing",
+  ]);
+  const terminalStates = new Set<CollaborationTaskLifecycleState>([
+    "completed",
+    "partial",
+    "blocked",
+    "canceled",
+    "interrupted",
+  ]);
+  const transitionAllowed = input.state === record.state ||
+    (
+      record.state === "created" &&
+      (
+        input.state === "queued" ||
+        input.state === "running" ||
+        input.state === "summarizing" ||
+        terminalStates.has(input.state) ||
+        input.state === "closed"
+      )
+    ) ||
+    (
+      record.state === "queued" &&
+      (
+        input.state === "running" ||
+        input.state === "summarizing" ||
+        terminalStates.has(input.state) ||
+        input.state === "closed"
+      )
+    ) ||
+    (
+      record.state === "running" &&
+      (
+        input.state === "summarizing" ||
+        terminalStates.has(input.state) ||
+        input.state === "closed"
+      )
+    ) ||
+    (
+      record.state === "summarizing" &&
+      (terminalStates.has(input.state) || input.state === "closed")
+    ) ||
+    (terminalStates.has(record.state) && input.state === "closed");
+  if (
+    !transitionAllowed ||
+    !(
+      activeStates.has(input.state) ||
+      terminalStates.has(input.state) ||
+      input.state === "closed"
+    )
+  ) return false;
+  const now = input.now ?? Date.now();
+  const terminalState = (
+    ["completed", "partial", "blocked", "canceled", "interrupted"] as const
+  ).includes(input.state as CollaborationTaskTerminalState)
+    ? input.state as CollaborationTaskTerminalState
+    : undefined;
+  record.state = input.state;
+  if (terminalState) record.terminalState = terminalState;
+  if (input.state === "closed" && !record.terminalState) {
+    record.terminalState = "interrupted";
+  }
+  record.updatedAt = Math.max(record.updatedAt, now);
+  if (input.result) record.result = input.result;
+  if (input.state === "closed") record.closedAt = now;
+  return true;
+}
+
+export function closeCollaborationTask(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  collaborationTaskId: string;
+  result: SubagentResultEnvelope;
+  now?: number;
+}): boolean {
+  const key = collaborationTaskKey(input);
+  const record = collaborationTaskRecords.get(key);
+  if (!record || record.state === "closed") return false;
+  const now = input.now ?? Date.now();
+  record.result = input.result;
+  record.terminalState = input.result.status === "completed"
+    ? "completed"
+    : input.result.status === "degraded"
+    ? "partial"
+    : input.result.status === "canceled"
+    ? "canceled"
+    : "blocked";
+  record.state = "closed";
+  record.updatedAt = Math.max(record.updatedAt, now);
+  record.closedAt = now;
+  return true;
+}
+
+export function getCollaborationLedgerForParent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  evidenceReceiptIdsByTask?: ReadonlyMap<string, readonly string[]> |
+    Record<string, readonly string[]>;
+  now?: number;
+}): CollaborationLedgerV1 {
+  const receiptIdsForTask = (collaborationTaskId: string): readonly string[] => {
+    if (!input.evidenceReceiptIdsByTask) return [];
+    const source = input.evidenceReceiptIdsByTask;
+    return typeof (source as ReadonlyMap<string, readonly string[]>).get === "function"
+      ? (source as ReadonlyMap<string, readonly string[]>).get(collaborationTaskId) || []
+      : (source as Record<string, readonly string[]>)[collaborationTaskId] || [];
+  };
+  const entries = getCollaborationTaskRecordsForParent(input)
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .map((record) => ({
+      workItem: record.workItem,
+      parentTurnId: record.parentTurnId,
+      subagentId: record.subagentId,
+      runId: record.runId,
+      state: record.state,
+      ...(record.terminalState ? { terminalState: record.terminalState } : {}),
+      evidenceReceiptIds: [...new Set(
+        [
+          ...record.evidenceReceiptIds,
+          ...receiptIdsForTask(record.workItem.collaborationTaskId),
+        ],
+      )],
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      ...(record.closedAt ? { closedAt: record.closedAt } : {}),
+    }));
+  return {
+    schemaVersion: COLLABORATION_LEDGER_SCHEMA_VERSION,
+    parentTurnId: input.parentTurnId,
+    entries,
+    updatedAt: Math.max(input.now ?? Date.now(), ...entries.map((entry) => entry.updatedAt)),
+  };
+}
+
+/**
+ * Rehydrate only immutable task identities and verified receipt references.
+ * Child prompts, messages, summaries, controllers, and leases are deliberately
+ * absent, so a restored entry can prevent duplicate work but can never revive
+ * the closed subagent.
+ */
+export function restoreCollaborationRuntimeLedgerForParent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  ledger: CollaborationLedgerV1;
+}): void {
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
+  for (const entry of input.ledger.entries) {
+    const key = collaborationTaskKey({
+      threadId: input.threadId,
+      sessionEpoch,
+      parentTurnId: input.ledger.parentTurnId,
+      collaborationTaskId: entry.workItem.collaborationTaskId,
+    });
+    const existing = collaborationTaskRecords.get(key);
+    if (existing) {
+      if (
+        existing.subagentId !== entry.subagentId ||
+        existing.runId !== entry.runId ||
+        existing.workItem.semanticFingerprint !==
+          entry.workItem.semanticFingerprint
+      ) {
+        throw new Error("COLLABORATION_LEDGER_IDENTITY_CONFLICT");
+      }
+      existing.evidenceReceiptIds = [...new Set([
+        ...existing.evidenceReceiptIds,
+        ...entry.evidenceReceiptIds,
+      ])];
+      continue;
+    }
+    const restoredTerminalState: CollaborationTaskTerminalState =
+      entry.terminalState ||
+      (
+          entry.state !== "closed" &&
+          ["completed", "partial", "blocked", "canceled", "interrupted"]
+            .includes(entry.state)
+        ? entry.state as CollaborationTaskTerminalState
+        : "interrupted"
+      );
+    const restoredAt = Math.max(entry.updatedAt, Date.now());
+    collaborationTaskRecords.set(key, {
+      threadId: input.threadId,
+      sessionEpoch,
+      parentTurnId: input.ledger.parentTurnId,
+      workItem: entry.workItem,
+      subagentId: entry.subagentId,
+      runId: entry.runId,
+      state: "closed",
+      terminalState: restoredTerminalState,
+      createdAt: entry.createdAt,
+      updatedAt: restoredAt,
+      closedAt: entry.closedAt || restoredAt,
+      evidenceReceiptIds: [...entry.evidenceReceiptIds],
+    });
+    closedCoordinatedRunKeys.add(
+      coordinationKey(
+        input.threadId,
+        sessionEpoch,
+        input.ledger.parentTurnId,
+        entry.subagentId,
+      ),
+    );
+  }
+}
+
+export function resolveCollaborationSubagentIds(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  collaborationTaskIds: string[];
+}): string[] {
+  const requested = new Set(input.collaborationTaskIds.map((value) => String(value || "").trim()));
+  return getCollaborationTaskRecordsForParent(input)
+    .filter((record) => requested.has(record.workItem.collaborationTaskId))
+    .map((record) => record.subagentId);
+}
+
+export function clearCollaborationRuntimeLedgerForParent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+}): void {
+  const parentKey = `${collaborationParentKey(input)}::`;
+  for (const key of collaborationTaskRecords.keys()) {
+    if (key.startsWith(parentKey)) collaborationTaskRecords.delete(key);
+  }
+}
+
+export function closeOutstandingCollaborationTasksForParent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  now?: number;
+}): void {
+  const now = input.now ?? Date.now();
+  for (const record of getCollaborationTaskRecordsForParent(input)) {
+    if (record.state === "closed") continue;
+    if (!record.terminalState) record.terminalState = "interrupted";
+    record.state = "closed";
+    record.updatedAt = Math.max(record.updatedAt, now);
+    record.closedAt = now;
+  }
+}
 
 export function normalizeSubagentSessionEpoch(value: unknown): string {
   return String(value || "").trim() || LEGACY_SUBAGENT_SESSION_EPOCH;
@@ -1167,10 +1532,12 @@ function hasRuntimeOwnership(
 }
 
 function releaseCoordinatedRun(key: string, expected: SubagentRuntimeOwnership): boolean {
-  const run = coordinatedRuns.get(key);
+  const run = coordinatedRuns.get(key) || completedCoordinatedRuns.get(key);
   if (!run || !hasRuntimeOwnership(run, expected)) return false;
   if (run.cleanupTimer) clearTimeout(run.cleanupTimer);
   coordinatedRuns.delete(key);
+  completedCoordinatedRuns.delete(key);
+  closedCoordinatedRunKeys.add(key);
   // Coordination records can be released by join, TTL cleanup, or parent
   // finalization. All are terminal ownership boundaries for this parent turn,
   // so a stale scope lease must never survive the record that owned it.
@@ -1203,31 +1570,6 @@ export function parseSubagentAllowedPaths(value: unknown, workspace = ""): strin
     seen.add(identity);
     return true;
   });
-}
-
-/**
- * Count delegated paths already covered by parent-owned source observations.
- * `path:` is the canonical runtime evidence key; `file:` remains accepted for
- * snapshots created before the targeting-ledger rename.
- */
-export function countParentObservedDelegationPaths(input: {
-  allowedPaths: string[];
-  evidenceKeys: Iterable<string>;
-}): number {
-  const observedPaths = [...input.evidenceKeys]
-    .map((entry) => {
-      if (entry.startsWith("path:")) return entry.slice("path:".length);
-      if (entry.startsWith("file:")) return entry.slice("file:".length);
-      return "";
-    })
-    .map(normalizeSubagentScopePathIdentity)
-    .filter(Boolean);
-  return input.allowedPaths
-    .map(normalizeSubagentScopePathIdentity)
-    .filter(Boolean)
-    .filter((allowed) => observedPaths.some((observed) =>
-      pathContains(allowed, observed) || pathContains(observed, allowed)
-    )).length;
 }
 
 function pathContains(scopePath: string, targetPath: string): boolean {
@@ -1343,6 +1685,7 @@ export function findSubagentLeaseOverlap(input: {
   sessionEpoch?: string;
   workspace: string;
   allowedPaths: string[];
+  accessMode?: CollaborationAccessMode;
 }): SubagentScopeLease | null {
   const candidates = input.allowedPaths
     .map((path) => normalizeSubagentScopePathIdentity(relativizeToWorkspacePath(path, input.workspace)))
@@ -1357,6 +1700,9 @@ export function findSubagentLeaseOverlap(input: {
       input.sessionEpoch &&
       normalizeSubagentSessionEpoch(lease.sessionEpoch) !== normalizeSubagentSessionEpoch(input.sessionEpoch)
     ) continue;
+    if ((input.accessMode || "read") === "read" && (lease.accessMode || "read") === "read") {
+      continue;
+    }
     if (candidates.some((candidate) => lease.allowedPaths.some((allowed) =>
       pathContains(allowed, candidate) || pathContains(candidate, allowed)
     ))) return lease;
@@ -1442,13 +1788,22 @@ function normalizeCoordinatedSubagentResult(
     ? value as Partial<SubagentResultEnvelope>
     : {};
   const expectedRunId = run.runId || `run-${run.subagentId}`;
+  const expectedCollaborationTaskId =
+    run.collaborationTaskId || `legacy-task-${run.subagentId}`;
   const expectedParentRunId = run.parentRunId ?? null;
   const authoritative =
     record.subagentId === run.subagentId &&
+    (
+      record.collaborationTaskId === expectedCollaborationTaskId ||
+      (!record.collaborationTaskId && !run.collaborationTaskId)
+    ) &&
     record.scopeKey === run.scopeKey &&
     isAuthoritativeSubagentClosure(record.closureAudit, {
       threadId: run.threadId,
       parentTurnId: run.parentTurnId,
+      ...(run.collaborationTaskId
+        ? { collaborationTaskId: expectedCollaborationTaskId }
+        : {}),
       subagentId: run.subagentId,
       runId: expectedRunId,
       parentRunId: expectedParentRunId,
@@ -1467,6 +1822,7 @@ function normalizeCoordinatedSubagentResult(
       agentKind: "subagent",
       threadId: run.threadId,
       parentTurnId: run.parentTurnId,
+      collaborationTaskId: expectedCollaborationTaskId,
       subagentId: run.subagentId,
       runId: expectedRunId,
       parentRunId: expectedParentRunId,
@@ -1487,6 +1843,7 @@ function normalizeCoordinatedSubagentResult(
   };
   return {
     subagentId: run.subagentId,
+    collaborationTaskId: expectedCollaborationTaskId,
     name: run.name,
     scopeKey: run.scopeKey,
     status: "blocked",
@@ -1513,15 +1870,12 @@ export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): v
   const generation = normalizeSubagentGeneration(explicitGeneration || existingScopeGeneration);
   const ownership = { sessionEpoch, generation };
   const key = coordinationKey(input.threadId, sessionEpoch, input.parentTurnId, input.subagentId);
-  const previous = coordinatedRuns.get(key);
-  if (previous) {
-    if (previous.cleanupTimer) clearTimeout(previous.cleanupTimer);
-    releaseSubagentScopeLease(previous.subagentId, {
-      threadId: previous.threadId,
-      sessionEpoch: normalizeSubagentSessionEpoch(previous.sessionEpoch),
-      parentTurnId: previous.parentTurnId,
-      generation: String(previous.generation || "").trim(),
-    });
+  if (
+    coordinatedRuns.has(key) ||
+    completedCoordinatedRuns.has(key) ||
+    closedCoordinatedRunKeys.has(key)
+  ) {
+    throw new Error("SUBAGENT_ID_ALREADY_REGISTERED");
   }
   const run: CoordinatedSubagentRun = {
     ...input,
@@ -1538,6 +1892,15 @@ export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): v
     if (current !== run || !hasRuntimeOwnership(current, ownership)) return;
     run.result = result;
     run.completedAt = Date.now();
+    coordinatedRuns.delete(key);
+    completedCoordinatedRuns.set(key, run);
+    closedCoordinatedRunKeys.add(key);
+    releaseSubagentScopeLease(run.subagentId, {
+      threadId: run.threadId,
+      sessionEpoch: ownership.sessionEpoch,
+      parentTurnId: run.parentTurnId,
+      generation: ownership.generation,
+    });
     run.cleanupTimer = setTimeout(() => {
       releaseCoordinatedRun(key, ownership);
     }, COORDINATED_RESULT_TTL_MS);
@@ -1550,13 +1913,77 @@ export function getPendingCoordinatedSubagentIds(
   sessionEpoch?: string,
 ): string[] {
   const normalizedSessionEpoch = normalizeSubagentSessionEpoch(sessionEpoch);
-  return [...coordinatedRuns.values()]
+  return [...coordinatedRuns.values(), ...completedCoordinatedRuns.values()]
     .filter((run) =>
       run.threadId === threadId &&
       normalizeSubagentSessionEpoch(run.sessionEpoch) === normalizedSessionEpoch &&
       run.parentTurnId === parentTurnId
     )
     .map((run) => run.subagentId);
+}
+
+export function cancelCoordinatedSubagent(input: {
+  threadId: string;
+  sessionEpoch?: string;
+  parentTurnId: string;
+  subagentId?: string;
+  collaborationTaskId?: string;
+}): CancelSubagentResult {
+  const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
+  const requestedSubagentId = String(input.subagentId || "").trim();
+  const requestedTaskId = String(input.collaborationTaskId || "").trim();
+  const activeRun = [...coordinatedRuns.values()].find((candidate) =>
+    candidate.threadId === input.threadId &&
+    normalizeSubagentSessionEpoch(candidate.sessionEpoch) === sessionEpoch &&
+    candidate.parentTurnId === input.parentTurnId &&
+    (
+      (requestedSubagentId && candidate.subagentId === requestedSubagentId) ||
+      (requestedTaskId && candidate.collaborationTaskId === requestedTaskId)
+    )
+  );
+  const completedRun = [...completedCoordinatedRuns.values()].find((candidate) =>
+    candidate.threadId === input.threadId &&
+    normalizeSubagentSessionEpoch(candidate.sessionEpoch) === sessionEpoch &&
+    candidate.parentTurnId === input.parentTurnId &&
+    (
+      (requestedSubagentId && candidate.subagentId === requestedSubagentId) ||
+      (requestedTaskId && candidate.collaborationTaskId === requestedTaskId)
+    )
+  );
+  const run = activeRun || completedRun;
+  if (!run) {
+    return {
+      canceled: false,
+      status: "not_found",
+      subagentId: requestedSubagentId || null,
+      collaborationTaskId: requestedTaskId || null,
+    };
+  }
+  if (completedRun || run.result || !hasLiveSubagentController(run.subagentId, {
+    threadId: run.threadId,
+    sessionEpoch,
+    parentTurnId: run.parentTurnId,
+    generation: String(run.generation || "").trim(),
+  })) {
+    return {
+      canceled: false,
+      status: "already_closed",
+      subagentId: run.subagentId,
+      collaborationTaskId: run.collaborationTaskId || null,
+    };
+  }
+  const canceled = cancelSubagentRun(run.subagentId, {
+    threadId: run.threadId,
+    sessionEpoch,
+    parentTurnId: run.parentTurnId,
+    generation: String(run.generation || "").trim(),
+  });
+  return {
+    canceled,
+    status: canceled ? "cancel_requested" : "already_closed",
+    subagentId: run.subagentId,
+    collaborationTaskId: run.collaborationTaskId || null,
+  };
 }
 
 export async function waitForCoordinatedSubagents(input: {
@@ -1567,7 +1994,7 @@ export async function waitForCoordinatedSubagents(input: {
   signal?: AbortSignal;
 }): Promise<WaitSubagentsResult> {
   const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
-  const parentRuns = [...coordinatedRuns.values()].filter((run) =>
+  const parentRuns = [...coordinatedRuns.values(), ...completedCoordinatedRuns.values()].filter((run) =>
     run.threadId === input.threadId &&
     normalizeSubagentSessionEpoch(run.sessionEpoch) === sessionEpoch &&
     run.parentTurnId === input.parentTurnId
@@ -1617,7 +2044,10 @@ export async function waitForCoordinatedSubagents(input: {
     const key = coordinationKey(run.threadId, ownership.sessionEpoch, run.parentTurnId, run.subagentId);
     // If the slot was replaced while this wait was blocked, the old result is
     // stale evidence. Do not consume it or release the replacement.
-    if (coordinatedRuns.get(key) !== run) continue;
+    if (
+      coordinatedRuns.get(key) !== run &&
+      completedCoordinatedRuns.get(key) !== run
+    ) continue;
     results.push(settledResults[index]);
     releaseCoordinatedRun(key, ownership);
   }
@@ -1656,7 +2086,7 @@ export async function finalizeCoordinatedSubagentsForParent(input: {
   graceMs?: number;
 }): Promise<ParentSubagentFinalizationResult> {
   const sessionEpoch = normalizeSubagentSessionEpoch(input.sessionEpoch);
-  const runs = [...coordinatedRuns.values()].filter((run) =>
+  const runs = [...coordinatedRuns.values(), ...completedCoordinatedRuns.values()].filter((run) =>
     run.threadId === input.threadId &&
     normalizeSubagentSessionEpoch(run.sessionEpoch) === sessionEpoch &&
     run.parentTurnId === input.parentTurnId
@@ -2033,7 +2463,10 @@ export function reconcileOrphanedSubagentEvents(
       threadId: run.threadId,
       turnId: run.parentTurnId,
       timestampMs: now,
+      collaborationTaskId: run.collaborationTaskId,
       subagentId: run.id,
+      runId: run.runId,
+      parentRunId: run.parentRunId,
       patch: {
         status: "canceled",
         updatedAt: now,
@@ -2058,7 +2491,10 @@ export function reconcileOrphanedSubagentEvents(
       threadId: run.threadId,
       turnId: run.parentTurnId,
       timestampMs: now,
+      collaborationTaskId: run.collaborationTaskId,
       subagentId: run.id,
+      runId: run.runId,
+      parentRunId: run.parentRunId,
       closedAt: now,
       reason: "orphaned_after_restart",
     }));
@@ -2075,6 +2511,9 @@ export function resetSubagentRuntimeForTests(): void {
   childAbortControllers.clear();
   runtimeSamplesByLane.clear();
   coordinatedRuns.clear();
+  completedCoordinatedRuns.clear();
+  closedCoordinatedRunKeys.clear();
+  collaborationTaskRecords.clear();
   scopeLeases.clear();
   scopeReservations.clear();
   coordinationGenerationSequence = 0;

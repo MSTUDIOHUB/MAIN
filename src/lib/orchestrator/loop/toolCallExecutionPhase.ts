@@ -381,7 +381,9 @@ export async function executeToolCallPhase(input: {
     resetTarget?: string,
     stateOverride?: ExecuteRecoveryRuntimeState,
   ) => ExecuteRecoveryRuntimeState;
-  onSubagentSpawnCreated?: (outcome: SpawnSubagentResult) => void;
+  onSubagentSpawnCreated?: (
+    outcome: SpawnSubagentResult,
+  ) => void | Promise<void>;
 }): Promise<ToolCallExecutionPhaseResult> {
   let noToolRuntimeState = resetConsecutiveNoToolRuntimeState(
     input.noToolRuntimeState,

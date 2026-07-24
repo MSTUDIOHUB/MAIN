@@ -100,6 +100,7 @@ const {
   replaceMessagesForRetry,
   resolvePreapprovalPlanStreamWatchdogReadFallback,
   resolvePreapprovalPlanStreamWatchdogRecoveryTools,
+  isExecuteStreamWatchdogRecoveryActionable,
   shouldAttemptExecuteStreamWatchdogRecovery,
   shouldAttemptPreapprovalPlanStreamWatchdogRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
@@ -363,27 +364,24 @@ test("an exact Plan evidence obligation requires its sole native primitive", () 
   }), undefined, "XML fallback remains action-contract driven");
 });
 
-test("admitted preferred delegation requires the provider-neutral spawn tool call", () => {
+test("preferred collaboration never forces a provider tool choice", () => {
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     llmToolNames: ["spawn_subagent"],
     forceXmlTools: false,
-    preferredDelegationRequired: true,
-  }), "required");
+  }), undefined);
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     llmToolNames: ["spawn_subagent"],
     forceXmlTools: true,
-    preferredDelegationRequired: true,
   }), undefined, "XML fallback remains prompt-driven instead of emitting an unsupported tool_choice");
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     llmToolNames: ["read_file"],
     forceXmlTools: false,
-    preferredDelegationRequired: true,
   }), undefined, "a missing spawn capability must never force an unrelated tool");
 });
 
@@ -620,7 +618,20 @@ test("every Execute watchdog timeout gets exactly one bounded native-tool recove
     llmToolCount: 0,
   }), false);
   assert.equal(EXECUTE_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS, 90_000);
-  assert.match(buildExecuteStreamWatchdogRecoveryPrompt("zh"), /直接调用一个可用工具/);
+  const prompt = buildExecuteStreamWatchdogRecoveryPrompt(
+    "zh",
+    ["apply_patch", "replace_in_file", "write_file"],
+  );
+  assert.match(prompt, /直接调用一个可用工具/);
+  assert.match(prompt, /apply_patch, replace_in_file, write_file/);
+  assert.doesNotMatch(prompt, /read_file/);
+  assert.equal(isExecuteStreamWatchdogRecoveryActionable({
+    toolCalls: [],
+    protocolViolation: "required_tool_call_missing",
+  }), false);
+  assert.equal(isExecuteStreamWatchdogRecoveryActionable({
+    toolCalls: [{ id: "call-1", name: "apply_patch", arguments: "{}" }],
+  }), true);
 });
 
 test("detects reasoning-dominated length results before max output escalation", () => {

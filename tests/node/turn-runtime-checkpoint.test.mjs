@@ -49,8 +49,8 @@ const canonicalRuntime = loadTranspiledModuleSync(
 const checkpointRuntime = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/turnRuntimeCheckpoint.ts"),
 );
-const preferredScopes = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/lib/preferredDelegationScopes.ts"),
+const collaboration = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/collaborationWorkItems.ts"),
 );
 const closureReceipts = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/subagentClosureReceipts.ts"),
@@ -100,7 +100,7 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-test("checkpoint schema and owner fences reject stale or tampered durable state", () => {
+test("checkpoint v2 migrates v1 collaboration state and rejects unknown schemas or owners", () => {
   const checkpoint = checkpointRuntime.createTurnRuntimeCheckpoint({
     canonical: runningCanonical(),
     updatedAt: 102,
@@ -117,8 +117,18 @@ test("checkpoint schema and owner fences reject stale or tampered durable state"
   }));
   assert.equal(checkpointRuntime.normalizeTurnRuntimeCheckpoint({
     ...checkpoint,
-    schemaVersion: "turn-runtime-checkpoint.v2",
+    schemaVersion: "turn-runtime-checkpoint.v3",
   }), null);
+  const legacy = clone(checkpoint);
+  legacy.schemaVersion = "turn-runtime-checkpoint.v1";
+  delete legacy.planning.collaborationLedger;
+  const migrated = checkpointRuntime.normalizeTurnRuntimeCheckpoint(legacy, {
+    expectedOwner: exactOwner,
+    coldRestore: true,
+    now: 200,
+  });
+  assert.equal(migrated?.schemaVersion, "turn-runtime-checkpoint.v2");
+  assert.deepEqual(migrated?.planning.collaborationLedger.entries, []);
   const circular = { ...checkpoint };
   circular.self = circular;
   assert.equal(
@@ -383,53 +393,67 @@ test("emergency checkpoint transaction closes a running Chat as canonical error"
   ]);
 });
 
-test("cold restart retains creation budget and only preserves consumed scopes with typed evidence", () => {
-  const requiredScopes = [
-    { scopeKey: "ui", allowedPaths: ["src/ui"] },
-    { scopeKey: "runtime", allowedPaths: ["src/runtime"] },
-  ];
-  let contract = preferredScopes.createPreferredDelegationScopeContract({
-    requiredScopes,
-    maxCreatedPerTurn: 2,
-  });
-  for (const [subagentId, scope] of [
-    ["child-ui", requiredScopes[0]],
-    ["child-runtime", requiredScopes[1]],
-  ]) {
-    contract = preferredScopes.recordPreferredDelegationScopeSpawn({
-      contract,
-      outcome: {
-        subagentId,
-        name: subagentId,
-        status: "queued",
-        scopeKey: scope.scopeKey,
-        allowedPaths: scope.allowedPaths,
+test("cold restart closes active one-shot tasks and preserves only task-owned receipts", () => {
+  const makeWorkItem = (taskId, taskKey, allowedPaths) => {
+    const normalized = collaboration.normalizeCollaborationWorkItemDraft({
+      collaborationTaskId: taskId,
+      draft: {
+        taskKey,
+        taskKind: "explore",
+        objective: `Inspect ${taskKey} independently.`,
+        delegationReason: "The parent can continue separate work.",
+        successCriteria: "Return exact source evidence.",
+        expectedOutput: "Source-backed finding.",
+        requiredPaths: "",
+        allowedPaths,
+        accessMode: "read",
       },
     });
-  }
-  contract = preferredScopes.applyPreferredDelegationScopeJoinOutcomes({
-    contract,
-    outcomes: [{
-      subagentId: "child-ui",
-      scopeKey: "ui",
-      status: "completed",
-      closureState: "satisfied",
-      adoptedEvidenceCount: 1,
-      adoptedEvidenceTargets: ["src/ui/App.tsx"],
-      consumed: true,
-    }],
-  });
-  assert.deepEqual(contract.registrations.map((entry) => entry.state), [
-    "consumed",
-    "spawned",
-  ]);
+    assert.equal(normalized.ok, true);
+    return normalized.workItem;
+  };
+  const completedTask = {
+    workItem: makeWorkItem("task-ui", "ui-chain", ["src/ui"]),
+    parentTurnId: turn.turnId,
+    subagentId: "child-ui",
+    runId: "run-child-ui",
+    state: "closed",
+    terminalState: "completed",
+    evidenceReceiptIds: [],
+    createdAt: 100,
+    updatedAt: 110,
+    closedAt: 110,
+  };
+  const activeTask = {
+    workItem: makeWorkItem("task-runtime", "runtime-chain", ["src/runtime"]),
+    parentTurnId: turn.turnId,
+    subagentId: "child-runtime",
+    runId: "run-child-runtime",
+    state: "running",
+    evidenceReceiptIds: [],
+    createdAt: 100,
+    updatedAt: 110,
+  };
+  const baseLedger = collaboration.normalizeCollaborationLedger({
+    schemaVersion: "collaboration-ledger.v1",
+    parentTurnId: turn.turnId,
+    entries: [completedTask, activeTask],
+    updatedAt: 110,
+  }, { parentTurnId: turn.turnId });
+  assert.ok(baseLedger);
 
   const adoptedActivity = {
     name: "read_file",
     target: "src/ui/App.tsx",
     status: "succeeded",
     delegatedObservation: {
-      owner: { agentKind: "subagent", subagentId: "child-ui" },
+      owner: {
+        agentKind: "subagent",
+        collaborationTaskId: "task-ui",
+        subagentId: "child-ui",
+        parentTurnId: turn.turnId,
+        runId: "run-child-ui",
+      },
       sourceToolCallId: "call-ui-read",
       sourceObservationKey: "obs-ui-read",
       planningEvidenceState: "reusable",
@@ -447,25 +471,27 @@ test("cold restart retains creation budget and only preserves consumed scopes wi
       parentTurnId: turn.turnId,
       parentRunId: run.runId,
     },
-    contract,
+    collaborationLedger: baseLedger,
     activities: [adoptedActivity],
     issuedAt: 120,
   });
-  assert.deepEqual(issued.missingConsumedScopeKeys, []);
+  assert.deepEqual(issued.missingTaskIds, []);
 
-  let checkpoint = checkpointRuntime.createTurnRuntimeCheckpoint({
+  const ledgerWithReceipt = collaboration.normalizeCollaborationLedger({
+    ...baseLedger,
+    entries: baseLedger.entries.map((entry) => ({
+      ...entry,
+      evidenceReceiptIds:
+        issued.receiptRefsByTask[entry.workItem.collaborationTaskId] || [],
+    })),
+    updatedAt: 120,
+  }, { parentTurnId: turn.turnId });
+  assert.ok(ledgerWithReceipt);
+  const checkpoint = checkpointRuntime.createTurnRuntimeCheckpoint({
     canonical: runningCanonical(),
-    preferredDelegationScopeContract: contract,
-    updatedAt: 110,
-  });
-  checkpoint = checkpointRuntime.updateTurnRuntimePlanningCheckpoint({
-    checkpoint,
-    preferredDelegationScopeContract: contract,
-    closureReceiptRefs: issued.receiptRefs,
+    collaborationLedger: ledgerWithReceipt,
     updatedAt: 120,
   });
-  assert.ok(checkpoint);
-  assert.equal(checkpoint.planning.closureReceiptRefs.length, 1);
 
   const restored = checkpointRuntime.normalizeTurnRuntimeCheckpoint(checkpoint, {
     closureReceiptLedger: issued.ledger,
@@ -473,50 +499,55 @@ test("cold restart retains creation budget and only preserves consumed scopes wi
     now: 200,
   });
   assert.ok(restored);
-  assert.deepEqual(
-    restored.planning.preferredDelegationScopeContract.registrations.map((entry) => entry.state),
-    ["consumed", "incomplete"],
+  const restoredCompleted = restored.planning.collaborationLedger.entries.find(
+    (entry) => entry.workItem.collaborationTaskId === "task-ui",
   );
-  const progress = preferredScopes.getPreferredDelegationScopeProgress(
-    restored.planning.preferredDelegationScopeContract,
+  const restoredInterrupted = restored.planning.collaborationLedger.entries.find(
+    (entry) => entry.workItem.collaborationTaskId === "task-runtime",
   );
-  assert.equal(progress.createdCount, 2);
-  assert.equal(progress.creationCapacityRemaining, 0);
-  assert.equal(progress.exhausted, true);
-
-  const withoutReceipt = clone(checkpoint);
-  withoutReceipt.planning.closureReceiptRefs = [];
-  const restoredWithoutEvidence = checkpointRuntime.normalizeTurnRuntimeCheckpoint(
-    withoutReceipt,
-    { closureReceiptLedger: issued.ledger, coldRestore: true, now: 200 },
-  );
-  assert.ok(restoredWithoutEvidence);
-  assert.deepEqual(
-    restoredWithoutEvidence.planning.preferredDelegationScopeContract.registrations
-      .map((entry) => entry.state),
-    ["incomplete", "incomplete"],
-  );
+  assert.equal(restoredCompleted.state, "closed");
+  assert.equal(restoredCompleted.terminalState, "completed");
+  assert.deepEqual(restoredCompleted.evidenceReceiptIds, issued.receiptRefs);
+  assert.equal(restoredInterrupted.state, "closed");
+  assert.equal(restoredInterrupted.terminalState, "interrupted");
+  assert.deepEqual(restoredInterrupted.evidenceReceiptIds, []);
   assert.equal(
-    preferredScopes.getPreferredDelegationScopeProgress(
-      restoredWithoutEvidence.planning.preferredDelegationScopeContract,
-    ).creationCapacityRemaining,
-    0,
+    checkpointRuntime.restoreDurableTurnPlanningActivities(
+      restored,
+      issued.ledger,
+    ).length,
+    1,
+  );
+
+  const restoredWithoutLedger = checkpointRuntime.normalizeTurnRuntimeCheckpoint(
+    checkpoint,
+    { closureReceiptLedger: null, coldRestore: true, now: 200 },
+  );
+  assert.ok(restoredWithoutLedger);
+  assert.deepEqual(
+    restoredWithoutLedger.planning.collaborationLedger.entries.flatMap(
+      (entry) => entry.evidenceReceiptIds,
+    ),
+    [],
   );
 
   const tamperedLedger = clone(issued.ledger);
-  tamperedLedger.receipts[0].acceptedEvidence[0].activity.target = "src/runtime/escape.ts";
-  const restoredWithTamperedReceipt = checkpointRuntime.normalizeTurnRuntimeCheckpoint(
-    checkpoint,
-    { closureReceiptLedger: tamperedLedger, coldRestore: true, now: 200 },
-  );
+  tamperedLedger.receipts[0].acceptedEvidence[0].activity.target =
+    "src/runtime/escape.ts";
+  const restoredWithTamperedReceipt =
+    checkpointRuntime.normalizeTurnRuntimeCheckpoint(checkpoint, {
+      closureReceiptLedger: tamperedLedger,
+      coldRestore: true,
+      now: 200,
+    });
   assert.ok(restoredWithTamperedReceipt);
   assert.deepEqual(
-    restoredWithTamperedReceipt.planning.preferredDelegationScopeContract.registrations
-      .map((entry) => entry.state),
-    ["incomplete", "incomplete"],
-    "tampered receipt evidence is discarded without erasing the canonical Turn checkpoint",
+    restoredWithTamperedReceipt.planning.collaborationLedger.entries.flatMap(
+      (entry) => entry.evidenceReceiptIds,
+    ),
+    [],
+    "tampered evidence is discarded without erasing canonical Turn or task history",
   );
-  assert.deepEqual(restoredWithTamperedReceipt.planning.closureReceiptRefs, []);
 });
 
 test("checkpoint upsert evicts the oldest Turn before crossing the durable map bound", () => {

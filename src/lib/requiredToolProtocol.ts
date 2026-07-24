@@ -79,24 +79,6 @@ export function consumeNativePlanCandidateSubmission(input: {
   };
 }
 
-const PREFERRED_DELEGATION_ADAPTABLE_READ_TOOLS = new Set([
-  "read_file",
-  "read_document",
-  "get_file_outline",
-  "code_ast_query",
-  "grep_search",
-  "find_symbol_references",
-  "git_diff",
-]);
-
-export interface PreferredDelegationReadIntentAdaptation {
-  result: StreamResult;
-  adapted: boolean;
-  sourceToolName?: string;
-  target?: string;
-  toolCallId?: string;
-}
-
 /**
  * Provider capability state advances only from the raw wire response. Prompt
  * exposure, visible-text adaptation, or a quarantined mixed transaction is
@@ -119,70 +101,6 @@ export function hasSuccessfulAllowedRawNativeToolCall(input: {
   }
   const rawCalls = input.rawResult.toolCalls || [];
   return rawCalls.length > 0 && rawCalls.every((call) => allowed.has(call.name));
-}
-
-/**
- * Some OpenAI-compatible providers return the concrete read the model wants
- * even when the only required capability is spawn_subagent. At a runtime-
- * admitted preferred-collaboration checkpoint, preserve that exact bounded
- * read intent by delegating it to an independent reviewer. This never adapts
- * mutations, commands, broad root searches, malformed arguments, or ordinary
- * optional delegation turns.
- */
-export function adaptRequiredPreferredDelegationReadIntent(input: {
-  result: StreamResult;
-  preferredDelegationRequired: boolean;
-  allowedToolNames: Iterable<string>;
-}): PreferredDelegationReadIntentAdaptation {
-  const unchanged = (): PreferredDelegationReadIntentAdaptation => ({
-    result: input.result,
-    adapted: false,
-  });
-  if (!input.preferredDelegationRequired) return unchanged();
-  const allowed = new Set([...input.allowedToolNames]);
-  if (!allowed.has("spawn_subagent")) return unchanged();
-  const calls = input.result.toolCalls || [];
-  if (calls.some((call) => call.name === "spawn_subagent")) return unchanged();
-
-  for (const call of calls) {
-    if (!PREFERRED_DELEGATION_ADAPTABLE_READ_TOOLS.has(call.name)) continue;
-    let args: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(call.arguments) as unknown;
-      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") continue;
-      args = parsed as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const target = String(args.path || args.file_path || args.filePath || "")
-      .trim()
-      .replace(/\\/g, "/");
-    if (!target || target === "." || target === "./") continue;
-    const safeCallId = String(call.id || "read")
-      .replace(/[^a-zA-Z0-9_-]+/g, "-")
-      .slice(-48) || "read";
-    const delegatedArguments = JSON.stringify({
-      objective: `Independently inspect ${target} and return exact source-backed facts needed by the parent Plan. Resolve the relevant contract or causal claim; do not modify files.`,
-      name: "Plan Reviewer",
-      role: "reviewer",
-      scope_key: `preferred-review-${safeCallId}`,
-      scope: `Independent pre-draft read-only review of ${target}`,
-      context_hints: `The parent requested ${call.name} for this exact path. Verify current source facts and distinguish confirmed evidence from hypotheses.`,
-      allowed_paths: target,
-      expected_output: "Provenance-backed source observations with relevant symbols, argument contracts, and any confirmed mismatch; explicitly report remaining uncertainty.",
-    });
-    return {
-      result: {
-        ...input.result,
-        toolCalls: [{ ...call, name: "spawn_subagent", arguments: delegatedArguments }],
-      },
-      adapted: true,
-      sourceToolName: call.name,
-      target,
-      toolCallId: call.id,
-    };
-  }
-  return unchanged();
 }
 
 /**

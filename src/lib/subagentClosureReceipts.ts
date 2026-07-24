@@ -1,9 +1,8 @@
 import type { PlanToolActivitySummary } from "./planExecutionRecovery";
 import {
-  isPreferredDelegationEvidenceTargetWithinScope,
-  normalizePreferredDelegationScopeContract,
-  type PreferredDelegationScopeContract,
-} from "./preferredDelegationScopes";
+  normalizeCollaborationLedger,
+  type CollaborationLedgerV1,
+} from "./collaborationWorkItems";
 import { sha256Hex } from "./sha256";
 import { normalizeWorkspacePathIdentity } from "./workspacePaths";
 
@@ -42,10 +41,14 @@ export interface CanonicalSubagentClosureReceipt {
   receiptId: string;
   digest: string;
   owner: SubagentClosureReceiptOwner;
+  /** Absent only on receipts migrated from the v1 path-scope scheduler. */
+  collaborationTaskId?: string;
   subagentId: string;
+  /** Absent only on receipts migrated from the v1 path-scope scheduler. */
+  runId?: string;
   scopeKey: string;
   allowedPaths: string[];
-  closureState: "satisfied";
+  closureState: "satisfied" | "partial";
   acceptedEvidence: CanonicalSubagentClosureEvidence[];
   issuedAt: number;
 }
@@ -149,8 +152,21 @@ function normalizeReceiptOwner(value: unknown): SubagentClosureReceiptOwner | nu
 function canonicalAllowedPaths(values: Iterable<unknown>): string[] {
   return [...new Set([...values]
     .map((value) => normalizeWorkspacePathIdentity(String(value || "")))
-    .filter((value) => value && value !== "."))]
+    .filter(Boolean))]
     .sort((left, right) => left.localeCompare(right));
+}
+
+function isEvidenceTargetWithinAllowedPaths(
+  allowedPaths: Iterable<unknown>,
+  target: unknown,
+): boolean {
+  const normalizedTarget = normalizeWorkspacePathIdentity(String(target || ""));
+  if (!normalizedTarget) return false;
+  return canonicalAllowedPaths(allowedPaths).some((allowedPath) =>
+    allowedPath === "." ||
+    normalizedTarget === allowedPath ||
+    normalizedTarget.startsWith(`${allowedPath}/`)
+  );
 }
 
 /**
@@ -176,6 +192,7 @@ export function normalizeCanonicalSubagentClosureActivity(
     ? delegated.owner as Record<string, unknown>
     : null;
   const subagentId = requiredString(owner?.subagentId);
+  const collaborationTaskId = requiredString(owner?.collaborationTaskId);
   const sourceToolCallId = requiredString(delegated?.sourceToolCallId);
   const sourceObservationKey = requiredString(delegated?.sourceObservationKey);
   if (
@@ -189,7 +206,10 @@ export function normalizeCanonicalSubagentClosureActivity(
     (!sourceToolCallId && !sourceObservationKey) ||
     delegated?.planningEvidenceState !== "reusable" ||
     delegated?.joinState !== "consumed" ||
-    delegated?.closureState !== "satisfied" ||
+    (
+      delegated?.closureState !== "satisfied" &&
+      delegated?.closureState !== "partial"
+    ) ||
     (delegated?.parentContextState !== "reference_only" &&
       delegated?.parentContextState !== "version_verified")
   ) return null;
@@ -247,6 +267,7 @@ export function normalizeCanonicalSubagentClosureActivity(
     delegatedObservation: {
       owner: {
         agentKind: "subagent",
+        ...(collaborationTaskId ? { collaborationTaskId } : {}),
         subagentId,
         ...(requiredString(owner.parentTurnId)
           ? { parentTurnId: requiredString(owner.parentTurnId)! }
@@ -265,7 +286,7 @@ export function normalizeCanonicalSubagentClosureActivity(
       ...(sourceRange ? { sourceRange } : {}),
       planningEvidenceState: "reusable",
       joinState: "consumed",
-      closureState: "satisfied",
+      closureState: delegated.closureState,
       parentContextState: delegated.parentContextState,
       requiresParentReread: delegated.requiresParentReread === true,
     },
@@ -277,12 +298,14 @@ function activityDigest(activity: PlanToolActivitySummary): string {
 }
 
 function evidenceIdentity(input: {
+  collaborationTaskId?: string;
   subagentId: string;
   activity: PlanToolActivitySummary;
   activityDigest: string;
 }): string {
   const delegated = input.activity.delegatedObservation!;
   return sha256Hex(canonicalJson({
+    collaborationTaskId: input.collaborationTaskId || null,
     subagentId: input.subagentId,
     sourceToolCallId: delegated.sourceToolCallId || null,
     sourceObservationKey: delegated.sourceObservationKey || null,
@@ -295,10 +318,16 @@ function evidenceIdentity(input: {
 function buildCanonicalEvidence(
   activity: PlanToolActivitySummary,
   subagentId: string,
+  collaborationTaskId?: string,
 ): CanonicalSubagentClosureEvidence {
   const digest = activityDigest(activity);
   return {
-    evidenceId: evidenceIdentity({ subagentId, activity, activityDigest: digest }),
+    evidenceId: evidenceIdentity({
+      collaborationTaskId,
+      subagentId,
+      activity,
+      activityDigest: digest,
+    }),
     activityDigest: digest,
     contentHash: activity.delegatedObservation?.sourceContentHash || digest,
     activity,
@@ -324,6 +353,7 @@ function normalizeEvidence(
   value: unknown,
   subagentId: string,
   allowedPaths: string[],
+  collaborationTaskId?: string,
 ): CanonicalSubagentClosureEvidence | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
@@ -331,9 +361,17 @@ function normalizeEvidence(
   if (
     !activity ||
     activity.delegatedObservation?.owner.subagentId !== subagentId ||
-    !isPreferredDelegationEvidenceTargetWithinScope(allowedPaths, activity.target)
+    (
+      collaborationTaskId &&
+      activity.delegatedObservation?.owner.collaborationTaskId !== collaborationTaskId
+    ) ||
+    !isEvidenceTargetWithinAllowedPaths(allowedPaths, activity.target)
   ) return null;
-  const canonical = buildCanonicalEvidence(activity, subagentId);
+  const canonical = buildCanonicalEvidence(
+    activity,
+    subagentId,
+    collaborationTaskId,
+  );
   return record.evidenceId === canonical.evidenceId &&
       record.activityDigest === canonical.activityDigest &&
       record.contentHash === canonical.contentHash
@@ -352,7 +390,9 @@ function normalizeReceipt(
   const receiptId = requiredString(record.receiptId);
   const digest = requiredString(record.digest);
   const owner = normalizeReceiptOwner(record.owner);
+  const collaborationTaskId = requiredString(record.collaborationTaskId);
   const subagentId = requiredString(record.subagentId);
+  const runId = requiredString(record.runId);
   const scopeKey = requiredString(record.scopeKey);
   const issuedAt = finiteTimestamp(record.issuedAt);
   const allowedPaths = Array.isArray(record.allowedPaths)
@@ -371,16 +411,20 @@ function normalizeReceipt(
       ledgerOwner,
     ) ||
     !subagentId ||
+    Boolean(collaborationTaskId) !== Boolean(runId) ||
     !scopeKey ||
     issuedAt === null ||
     allowedPaths.length === 0 ||
-    record.closureState !== "satisfied" ||
+    (
+      record.closureState !== "satisfied" &&
+      record.closureState !== "partial"
+    ) ||
     !Array.isArray(record.acceptedEvidence) ||
     record.acceptedEvidence.length === 0 ||
     record.acceptedEvidence.length > MAX_DURABLE_SUBAGENT_CLOSURE_EVIDENCE_PER_RECEIPT
   ) return null;
   const acceptedEvidence = record.acceptedEvidence.map((evidence) =>
-    normalizeEvidence(evidence, subagentId, allowedPaths)
+    normalizeEvidence(evidence, subagentId, allowedPaths, collaborationTaskId || undefined)
   );
   if (acceptedEvidence.some((evidence) => !evidence)) return null;
   const uniqueEvidence = acceptedEvidence as CanonicalSubagentClosureEvidence[];
@@ -390,10 +434,12 @@ function normalizeReceipt(
   const body = {
     schemaVersion: SUBAGENT_CLOSURE_RECEIPT_SCHEMA_VERSION,
     owner,
+    ...(collaborationTaskId ? { collaborationTaskId } : {}),
     subagentId,
+    ...(runId ? { runId } : {}),
     scopeKey,
     allowedPaths,
-    closureState: "satisfied" as const,
+    closureState: record.closureState as "satisfied" | "partial",
     acceptedEvidence: uniqueEvidence,
     issuedAt,
   };
@@ -438,7 +484,9 @@ export function normalizeSubagentClosureReceiptLedger(
     const key = [
       receipt.owner.parentTurnId,
       receipt.owner.parentRunId,
+      receipt.collaborationTaskId || "legacy-task",
       receipt.subagentId,
+      receipt.runId || "legacy-run",
       receipt.scopeKey,
     ].join("\u001f");
     if (ownerKeys.has(key)) return null;
@@ -481,13 +529,14 @@ function sameReceiptEvidence(
 export function issueSubagentClosureReceipts(input: {
   ledger: SubagentClosureReceiptLedger | null | undefined;
   owner: SubagentClosureReceiptOwner;
-  contract: PreferredDelegationScopeContract | null;
+  collaborationLedger: CollaborationLedgerV1;
   activities: PlanToolActivitySummary[];
   issuedAt?: number;
 }): {
   ledger: SubagentClosureReceiptLedger;
   receiptRefs: string[];
-  missingConsumedScopeKeys: string[];
+  receiptRefsByTask: Record<string, string[]>;
+  missingTaskIds: string[];
 } {
   const ledgerOwner = {
     workspaceKey: input.owner.workspaceKey,
@@ -498,9 +547,11 @@ export function issueSubagentClosureReceipts(input: {
     ? normalizeSubagentClosureReceiptLedger(input.ledger, { expectedOwner: ledgerOwner })
     : createSubagentClosureReceiptLedger({ owner: ledgerOwner, now: input.issuedAt });
   if (!current) throw new Error("SUBAGENT_CLOSURE_LEDGER_OWNER_MISMATCH");
-  const contract = normalizePreferredDelegationScopeContract(input.contract);
-  if (!contract) {
-    return { ledger: current, receiptRefs: [], missingConsumedScopeKeys: [] };
+  const collaborationLedger = normalizeCollaborationLedger(input.collaborationLedger, {
+    parentTurnId: input.owner.parentTurnId,
+  });
+  if (!collaborationLedger) {
+    throw new Error("COLLABORATION_LEDGER_OWNER_MISMATCH");
   }
   const issuedAt = finiteTimestamp(input.issuedAt) ?? Date.now();
   const normalizedActivities = input.activities
@@ -508,56 +559,77 @@ export function issueSubagentClosureReceipts(input: {
     .filter((activity): activity is PlanToolActivitySummary => !!activity);
   let receipts = [...current.receipts];
   const receiptRefs: string[] = [];
-  const missingConsumedScopeKeys: string[] = [];
+  const receiptRefsByTask: Record<string, string[]> = {};
+  const missingTaskIds: string[] = [];
   let changed = false;
-  for (const registration of contract.registrations) {
-    if (registration.state !== "consumed") continue;
-    const allowedPaths = canonicalAllowedPaths(registration.allowedPaths);
+
+  for (const entry of collaborationLedger.entries) {
+    const terminalState = entry.terminalState ||
+      (entry.state === "completed" || entry.state === "partial"
+        ? entry.state
+        : null);
+    if (terminalState !== "completed" && terminalState !== "partial") continue;
+    const collaborationTaskId = entry.workItem.collaborationTaskId;
+    const allowedPaths = canonicalAllowedPaths(entry.workItem.allowedPaths);
+    const closureState = terminalState === "completed"
+      ? "satisfied" as const
+      : "partial" as const;
     const activities = normalizedActivities.filter((activity) => {
       const delegated = activity.delegatedObservation;
-      return delegated?.owner.subagentId === registration.subagentId &&
-        (!delegated.owner.parentTurnId || delegated.owner.parentTurnId === input.owner.parentTurnId) &&
-        isPreferredDelegationEvidenceTargetWithinScope(allowedPaths, activity.target);
+      if (!delegated || delegated.owner.subagentId !== entry.subagentId) return false;
+      if (delegated.owner.collaborationTaskId !== collaborationTaskId) return false;
+      if (delegated.owner.runId !== entry.runId) return false;
+      return (
+        delegated.closureState === closureState ||
+        (closureState === "partial" && delegated.closureState === "satisfied")
+      ) && isEvidenceTargetWithinAllowedPaths(allowedPaths, activity.target);
     }).slice(-MAX_DURABLE_SUBAGENT_CLOSURE_EVIDENCE_PER_RECEIPT);
     const acceptedEvidence = activities.map((activity) =>
-      buildCanonicalEvidence(activity, registration.subagentId)
+      buildCanonicalEvidence(activity, entry.subagentId, collaborationTaskId)
     );
     if (acceptedEvidence.length === 0) {
-      missingConsumedScopeKeys.push(registration.requiredScopeKey);
+      missingTaskIds.push(collaborationTaskId);
       continue;
     }
     const existing = receipts.find((receipt) =>
       receipt.owner.parentTurnId === input.owner.parentTurnId &&
       receipt.owner.parentRunId === input.owner.parentRunId &&
-      receipt.subagentId === registration.subagentId &&
-      receipt.scopeKey === registration.requiredScopeKey &&
+      receipt.collaborationTaskId === collaborationTaskId &&
+      receipt.subagentId === entry.subagentId &&
+      receipt.runId === entry.runId &&
+      receipt.scopeKey === entry.workItem.taskKey &&
+      receipt.closureState === closureState &&
       sameJson(receipt.allowedPaths, allowedPaths) &&
       sameReceiptEvidence(receipt, acceptedEvidence)
     );
     if (existing) {
       receiptRefs.push(existing.receiptId);
+      receiptRefsByTask[collaborationTaskId] = [existing.receiptId];
       continue;
     }
     const nextReceipt = sealReceipt({
       schemaVersion: SUBAGENT_CLOSURE_RECEIPT_SCHEMA_VERSION,
       owner: { ...input.owner },
-      subagentId: registration.subagentId,
-      scopeKey: registration.requiredScopeKey,
+      collaborationTaskId,
+      subagentId: entry.subagentId,
+      runId: entry.runId,
+      scopeKey: entry.workItem.taskKey,
       allowedPaths,
-      closureState: "satisfied",
+      closureState,
       acceptedEvidence,
       issuedAt,
     });
     receipts = receipts.filter((receipt) => !(
       receipt.owner.parentTurnId === input.owner.parentTurnId &&
       receipt.owner.parentRunId === input.owner.parentRunId &&
-      receipt.subagentId === registration.subagentId &&
-      receipt.scopeKey === registration.requiredScopeKey
+      receipt.collaborationTaskId === collaborationTaskId
     ));
     receipts.push(nextReceipt);
     receiptRefs.push(nextReceipt.receiptId);
+    receiptRefsByTask[collaborationTaskId] = [nextReceipt.receiptId];
     changed = true;
   }
+
   receipts = receipts
     .sort((left, right) => left.issuedAt - right.issuedAt)
     .slice(-MAX_DURABLE_SUBAGENT_CLOSURE_RECEIPTS);
@@ -579,10 +651,17 @@ export function issueSubagentClosureReceipts(input: {
   });
   if (!normalized) throw new Error("SUBAGENT_CLOSURE_LEDGER_SIZE_LIMIT");
   const retainedIds = new Set(normalized.receipts.map((receipt) => receipt.receiptId));
+  const retainedRefsByTask = Object.fromEntries(
+    Object.entries(receiptRefsByTask).flatMap(([taskId, refs]) => {
+      const retained = refs.filter((receiptId) => retainedIds.has(receiptId));
+      return retained.length > 0 ? [[taskId, retained]] : [];
+    }),
+  );
   return {
     ledger: normalized,
     receiptRefs: receiptRefs.filter((receiptId) => retainedIds.has(receiptId)),
-    missingConsumedScopeKeys,
+    receiptRefsByTask: retainedRefsByTask,
+    missingTaskIds,
   };
 }
 
@@ -609,26 +688,29 @@ export function resolveSubagentClosureReceiptReferences(input: {
     parentRunId?: string;
     allowedParentRunIds?: string[];
   };
-  contract: PreferredDelegationScopeContract | null;
+  collaborationLedger: CollaborationLedgerV1;
 }): {
   receipts: CanonicalSubagentClosureReceipt[];
   acceptedEvidence: CanonicalSubagentClosureEvidence[];
   resolvedReceiptRefs: string[];
   rejectedReceiptRefs: string[];
-  consumedScopeKeys: string[];
+  resolvedTaskIds: string[];
 } {
   const ledger = normalizeSubagentClosureReceiptLedger(input.ledger, {
     expectedOwner: input.expectedOwner,
   });
-  const contract = normalizePreferredDelegationScopeContract(input.contract);
+  const collaborationLedger = normalizeCollaborationLedger(
+    input.collaborationLedger,
+    { parentTurnId: input.expectedOwner.parentTurnId },
+  );
   const rejectedReceiptRefs: string[] = [];
-  if (!ledger || !contract) {
+  if (!ledger || !collaborationLedger) {
     return {
       receipts: [],
       acceptedEvidence: [],
       resolvedReceiptRefs: [],
       rejectedReceiptRefs: [...input.receiptRefs],
-      consumedScopeKeys: [],
+      resolvedTaskIds: [],
     };
   }
   const allowedParentRunIds = new Set([
@@ -637,55 +719,78 @@ export function resolveSubagentClosureReceiptReferences(input: {
   ].filter(Boolean));
   const receiptsById = new Map(ledger.receipts.map((receipt) => [receipt.receiptId, receipt]));
   const receipts: CanonicalSubagentClosureReceipt[] = [];
-  const consumedScopeKeys: string[] = [];
-  const usedRegistrationKeys = new Set<string>();
+  const resolvedTaskIds: string[] = [];
+  const usedTaskIds = new Set<string>();
+
   for (const receiptRef of input.receiptRefs) {
     const receipt = receiptsById.get(receiptRef);
-    const registration = receipt
-      ? contract.registrations.find((candidate) =>
-          candidate.state === "consumed" &&
-          candidate.subagentId === receipt.subagentId &&
-          candidate.requiredScopeKey === receipt.scopeKey
+    const entry = receipt
+      ? collaborationLedger.entries.find((candidate) =>
+          receipt.collaborationTaskId
+            ? candidate.workItem.collaborationTaskId === receipt.collaborationTaskId
+            : candidate.subagentId === receipt.subagentId &&
+              candidate.workItem.taskKey === receipt.scopeKey
         )
       : null;
-    const registrationKey = registration
-      ? `${registration.subagentId}\u001f${registration.requiredScopeKey}`
-      : "";
+    const terminalState = entry?.terminalState ||
+      (entry?.state === "completed" || entry?.state === "partial"
+        ? entry.state
+        : null);
+    const expectedClosureState = terminalState === "completed"
+      ? "satisfied"
+      : terminalState === "partial"
+      ? "partial"
+      : null;
     const ownerMatch = !!receipt &&
       receipt.owner.workspaceKey === input.expectedOwner.workspaceKey &&
       receipt.owner.sessionKey === input.expectedOwner.sessionKey &&
       receipt.owner.sessionEpoch === input.expectedOwner.sessionEpoch &&
       receipt.owner.parentTurnId === input.expectedOwner.parentTurnId &&
       allowedParentRunIds.has(receipt.owner.parentRunId);
-    const scopeMatch = !!receipt && !!registration &&
-      sameJson(receipt.allowedPaths, canonicalAllowedPaths(registration.allowedPaths)) &&
+    const identityMatch = !!receipt && !!entry &&
+      receipt.subagentId === entry.subagentId &&
+      (!receipt.collaborationTaskId ||
+        receipt.collaborationTaskId === entry.workItem.collaborationTaskId) &&
+      (!receipt.runId || receipt.runId === entry.runId) &&
+      receipt.scopeKey === entry.workItem.taskKey;
+    const scopeMatch = !!receipt && !!entry &&
+      sameJson(receipt.allowedPaths, canonicalAllowedPaths(entry.workItem.allowedPaths)) &&
+      receipt.closureState === expectedClosureState &&
       receipt.acceptedEvidence.length > 0 &&
-      receipt.acceptedEvidence.every((evidence) =>
-        evidence.activity.delegatedObservation?.owner.subagentId === registration.subagentId &&
-        isPreferredDelegationEvidenceTargetWithinScope(
-          registration.allowedPaths,
-          evidence.activity.target,
-        )
-      );
+      receipt.acceptedEvidence.every((evidence) => {
+        const delegated = evidence.activity.delegatedObservation;
+        return delegated?.owner.subagentId === entry.subagentId &&
+          (
+            !delegated.owner.collaborationTaskId ||
+            delegated.owner.collaborationTaskId === entry.workItem.collaborationTaskId
+          ) &&
+          isEvidenceTargetWithinAllowedPaths(
+            entry.workItem.allowedPaths,
+            evidence.activity.target,
+          );
+      });
+    const taskId = entry?.workItem.collaborationTaskId || "";
     if (
       !receipt ||
-      !registration ||
+      !entry ||
       !ownerMatch ||
+      !identityMatch ||
       !scopeMatch ||
-      usedRegistrationKeys.has(registrationKey)
+      !taskId ||
+      usedTaskIds.has(taskId)
     ) {
       rejectedReceiptRefs.push(receiptRef);
       continue;
     }
-    usedRegistrationKeys.add(registrationKey);
+    usedTaskIds.add(taskId);
     receipts.push(receipt);
-    consumedScopeKeys.push(registration.requiredScopeKey);
+    resolvedTaskIds.push(taskId);
   }
   return {
     receipts,
     acceptedEvidence: receipts.flatMap((receipt) => receipt.acceptedEvidence),
     resolvedReceiptRefs: receipts.map((receipt) => receipt.receiptId),
     rejectedReceiptRefs,
-    consumedScopeKeys,
+    resolvedTaskIds,
   };
 }
