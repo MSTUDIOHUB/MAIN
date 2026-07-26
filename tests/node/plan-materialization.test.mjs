@@ -1237,8 +1237,15 @@ test("source-derived structured facts survive bundle construction", () => {
     }],
   });
 
-  assert.match(bundle.facts[0]?.summary || "", /event_dom_listener_contract\(DOMContentLoaded\)/);
-  assert.match(bundle.facts[0]?.summary || "", /listener_calls\(initToolbar,initEditor\)/);
+  assert.equal(bundle.facts[0]?.summary, "bounded source excerpt");
+  const structuredFacts = formatPlanStructuredEvidenceFacts(
+    bundle.facts[0]?.structuredFacts,
+  );
+  assert.ok(structuredFacts.includes("event_dom_listener_contract(DOMContentLoaded)"));
+  assert.ok(structuredFacts.includes("listener_calls(initToolbar,initEditor)"));
+  const modelEvidence = formatPlanEvidenceBundleForModel(bundle, "en");
+  assert.match(modelEvidence, /event_dom_listener_contract\(DOMContentLoaded\)/);
+  assert.match(modelEvidence, /listener_calls\(initToolbar,initEditor\)/);
 });
 
 test("source evidence exposes DOM side effects and Tauri command argument casing across owners", () => {

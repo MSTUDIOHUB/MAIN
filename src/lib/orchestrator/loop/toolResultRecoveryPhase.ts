@@ -3,11 +3,14 @@ import {
   buildFailedValidationRepairReadLease,
   buildFailedFiniteValidationRecoveryPrompt,
   classifyFailedFiniteValidationOutcome,
+  MAX_VALIDATION_MUTATION_REOPENS,
   resolveFailedFiniteValidationRecoveryPolicy,
   resolveExecuteRecoveryActionContract,
   requestedRangeFromReadObservationSignature,
+  scopeFiniteValidationDiagnosticToTarget,
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
+import type { ExecutionDecisionCheckpoint } from "../../executeRecoveryTools";
 import { buildApprovedPlanScopeConflictFingerprint } from "../../approvedPlanExecutionScope";
 import {
   buildBrowserValidationCacheSignature,
@@ -64,6 +67,7 @@ import {
   workspacePathsReferToSameFile,
 } from "../../workspacePaths";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
+import { hashString } from "../fileReadCache";
 import {
   handleExecuteConvergencePrompt,
   handleNoProgressRecovery,
@@ -72,7 +76,9 @@ import {
 } from "./loopRecovery";
 import { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import { resolvePtyObservationPolicyDeferral } from "./executeRecoveryRuntime";
+import {
+  resolvePtyObservationPolicyDeferral,
+} from "./executeRecoveryRuntime";
 import type {
   PlanLoopRuntimeState,
   PlanRuntimePhaseQualitySnapshot,
@@ -101,12 +107,14 @@ import {
   buildPlanGenerationFailedMessage,
   buildPlanGenerationFailedProgress,
 } from "./planNoToolRecovery";
-import { appendToolResultsToHistory } from "./toolResultHistory";
+import { commitToolResultBatch } from "./toolResultHistory";
+import { resolveDirectEditTransaction } from "../../directEditTransaction";
 import {
   joinPendingSubagentsForParent,
   shouldJoinPendingSubagentsAfterScopeDeferral,
 } from "./subagentJoinRuntime";
 import type { TurnIterationContext } from "./turnIterationContext";
+import type { CollaborationTaskJoinOutcome } from "../../subagents";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -326,6 +334,126 @@ function structuredCommandDiagnosticText(result: ToolExecutionResult): string {
   }
 }
 
+export function compactFiniteValidationDiagnostic(
+  diagnostic: string,
+  maxChars = 2_400,
+): string {
+  const normalized = String(diagnostic || "")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const limit = Number.isFinite(maxChars)
+    ? Math.max(1, Math.floor(maxChars))
+    : 2_400;
+  if (normalized.length <= limit) return normalized;
+
+  const omissionMarker = " …[diagnostic middle omitted]… ";
+  if (limit <= omissionMarker.length + 2) {
+    return normalized.slice(-limit);
+  }
+  const retainedChars = limit - omissionMarker.length;
+  // structuredCommandDiagnosticText orders stderr before stdout. Keep most of
+  // the head so an assertion/compiler diagnostic is not diluted by a long
+  // successful bundler listing, while retaining the tail for final summaries.
+  const headChars = Math.floor(retainedChars * 0.6);
+  const tailChars = retainedChars - headChars;
+  return [
+    normalized.slice(0, headChars),
+    omissionMarker,
+    normalized.slice(-tailChars),
+  ].join("");
+}
+
+export function resolveFiniteValidationRepairAttempt(input: {
+  currentDiagnostic: string;
+  previousDiagnostic?: string | null;
+  currentTarget?: string | null;
+  previousTarget?: string | null;
+  previousCount?: number;
+}): {
+  count: number;
+  diagnosticChanged: boolean;
+  diagnosticFingerprint: string;
+  budgetExhausted: boolean;
+} {
+  const normalize = (value: string | null | undefined) =>
+    compactFiniteValidationDiagnostic(String(value || ""))
+      .replace(
+        /(\b(?:[A-Za-z]:)?[^()\s:]+\.[A-Za-z0-9]+):\d+:\d+\b/g,
+        "$1:<line>:<column>",
+      )
+      .replace(
+        /(\b(?:[A-Za-z]:)?[^()\s:]+\.[A-Za-z0-9]+)\(\d+\s*[:,]\s*\d+\)/g,
+        "$1(<line>:<column>)",
+      )
+      .replace(
+        /\bline\s+\d+(?:\s*,?\s*(?:column|col)\s+\d+)?\b/gi,
+        "line <line>",
+      )
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase() || "(no-diagnostic)";
+  const currentTarget = String(input.currentTarget || "").trim();
+  const previousTarget = String(input.previousTarget || "").trim();
+  const sameTarget = currentTarget && previousTarget
+    ? workspacePathsReferToSameFile(currentTarget, previousTarget)
+    : !currentTarget && !previousTarget;
+  const currentDiagnostic = normalize(input.currentDiagnostic);
+  const previousDiagnostic = normalize(input.previousDiagnostic);
+  const previousCount = Math.max(
+    0,
+    Math.floor(Number(input.previousCount) || 0),
+  );
+  const sameDiagnostic =
+    previousCount > 0 &&
+    sameTarget &&
+    currentDiagnostic === previousDiagnostic;
+  return {
+    count: sameDiagnostic ? previousCount + 1 : 1,
+    diagnosticChanged: !sameDiagnostic,
+    diagnosticFingerprint: hashString(currentDiagnostic),
+    budgetExhausted:
+      sameDiagnostic &&
+      previousCount >= MAX_VALIDATION_MUTATION_REOPENS,
+  };
+}
+
+export function resolveLatestFiniteValidationMutationRange(input: {
+  activities?: PlanToolActivitySummary[] | null;
+  target?: string | null;
+  contextLines?: number;
+  maxLines?: number;
+}): { startLine: number; endLine: number; maxLines: number } | null {
+  const target = String(input.target || "").trim();
+  if (!target) return null;
+  const changed = [...(input.activities || [])].reverse().find((activity) =>
+    activity.mutationObserved === true &&
+    activity.mutationRange &&
+    workspacePathsReferToSameFile(activity.mutationRange.path, target)
+  )?.mutationRange;
+  if (!changed) return null;
+
+  const contextLines = Math.max(
+    0,
+    Math.min(60, Math.floor(Number(input.contextLines) || 32)),
+  );
+  const maxLines = Math.max(
+    24,
+    Math.min(160, Math.floor(Number(input.maxLines) || 120)),
+  );
+  const center = Math.floor((changed.startLine + changed.endLine) / 2);
+  let startLine = Math.max(1, changed.startLine - contextLines);
+  let endLine = changed.endLine + contextLines;
+  if (endLine - startLine + 1 > maxLines) {
+    startLine = Math.max(1, center - Math.floor((maxLines - 1) / 2));
+    endLine = startLine + maxLines - 1;
+  }
+  return { startLine, endLine, maxLines: endLine - startLine + 1 };
+}
+
 function normalizeDiagnosticWorkspacePath(input: {
   path: string;
   cwd: string;
@@ -333,6 +461,7 @@ function normalizeDiagnosticWorkspacePath(input: {
 }): string | null {
   let candidate = String(input.path || "")
     .trim()
+    .replace(/^(?:-->|:::)\s+/, "")
     .replace(/^[`'"(]+|[`'"),]+$/g, "")
     .replace(/\\/g, "/");
   if (!candidate) return null;
@@ -358,13 +487,14 @@ function normalizeDiagnosticWorkspacePath(input: {
   return normalizedParts.join("/") || null;
 }
 
-export function resolveFiniteValidationRepairTarget(input: {
+export function resolveFiniteValidationRepairTargets(input: {
   result: ToolExecutionResult;
   args: Record<string, unknown>;
   workspace: string;
-}): string | null {
+}): string[] {
   const diagnosticText = structuredCommandDiagnosticText(input.result)
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\\/g, "/");
   const pathPatterns = [
     /(?:^|\n)\s*(?:-->|:::)\s+(.+?):\d+:\d+/gm,
     /(?:^|\n)\s*([^\n()]+\.[A-Za-z0-9]+)\(\d+,\d+\)\s*:/gm,
@@ -372,6 +502,10 @@ export function resolveFiniteValidationRepairTarget(input: {
   ];
   const cwd = getShellToolCwd(input.args);
   const targets: string[] = [];
+  const strongSpans: Array<{ start: number; end: number }> = [];
+  const workspacePrefix = String(input.workspace || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
   const collectTarget = (rawPath: string) => {
     const target = normalizeDiagnosticWorkspacePath({
       path: rawPath,
@@ -380,6 +514,7 @@ export function resolveFiniteValidationRepairTarget(input: {
     });
     if (
       target &&
+      !/(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/i.test(target) &&
       !targets.some((entry) => workspacePathsReferToSameFile(entry, target))
     ) {
       targets.push(target);
@@ -388,21 +523,93 @@ export function resolveFiniteValidationRepairTarget(input: {
   for (const pattern of pathPatterns) {
     for (const match of diagnosticText.matchAll(pattern)) {
       collectTarget(match[1] || "");
+      strongSpans.push({
+        start: match.index || 0,
+        end: (match.index || 0) + match[0].length,
+      });
     }
   }
+  if (workspacePrefix && isAbsoluteWorkspacePath(workspacePrefix)) {
+    const escapedWorkspace = workspacePrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const absoluteWorkspacePath = new RegExp(
+      `${escapedWorkspace}/([^\\r\\n"'\\x60]+?\\.[A-Za-z0-9]+)(?=:\\d+(?::\\d+)?|[\\s;:,)"'\\x60]|$)`,
+      "gm",
+    );
+    for (const match of diagnosticText.matchAll(absoluteWorkspacePath)) {
+      collectTarget(match[0] || "");
+      strongSpans.push({
+        start: match.index || 0,
+        end: (match.index || 0) + match[0].length,
+      });
+    }
+  }
+  const weakDiagnosticText = [...strongSpans]
+    .sort((left, right) => left.start - right.start)
+    .reduce(
+      (masked, span) =>
+        `${masked.slice(0, span.start)}${masked
+          .slice(span.start, span.end)
+          .replace(/[^\r\n]/g, " ")}${masked.slice(span.end)}`,
+      diagnosticText,
+    );
   // Runtime assertions and project-specific acceptance commands often name a
   // source owner without line/column coordinates. Treat such paths as
   // attribution evidence too, but only after collecting every path so a
   // multi-owner diagnostic remains a workspace-level repair.
   const inlineWorkspacePath =
-    /(?:^|[\s;:("'`])((?:\.{0,2}\/)?(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]+\.[A-Za-z0-9]+)(?=$|[\s;:,)"'`])/gm;
-  for (const match of diagnosticText.matchAll(inlineWorkspacePath)) {
+    /(?:^|[\s;:("'`])((?:\.{0,2}\/)?(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]+\.[A-Za-z0-9]+)(?=$|[\s;:,.)"'`])/gm;
+  for (const match of weakDiagnosticText.matchAll(inlineWorkspacePath)) {
     collectTarget(match[1] || "");
   }
-  // A validation failure without exactly one attributed source path is an
-  // objective-level repair. Binding it to the most recently changed file
-  // invents causality and can prevent a legitimate multi-file fix.
+  return targets;
+}
+
+export function resolveFiniteValidationRepairTarget(input: {
+  result: ToolExecutionResult;
+  args: Record<string, unknown>;
+  workspace: string;
+}): string | null {
+  const targets = resolveFiniteValidationRepairTargets(input);
+  // A diagnostic that names multiple files establishes a bounded candidate
+  // set, not which member owns the defect. Only a sole owner is safe to bind
+  // directly; ambiguous attribution stays on the existing targeting surface.
   return targets.length === 1 ? targets[0] : null;
+}
+
+/**
+ * Serialize a structured multi-owner validation failure into one bounded
+ * repair transaction. Prefer a diagnostic owner that has not already produced
+ * mutation evidence; after validation reruns, its fresh diagnostic decides
+ * whether another owner still needs work. An unattributed failure may fall
+ * back only to an explicit unfinished objective target, never to the most
+ * recently touched file.
+ */
+export function resolveNextFiniteValidationRepairTarget(input: {
+  diagnosticTargets: string[];
+  checkpoint: ExecutionDecisionCheckpoint | null;
+}): string | null {
+  const transaction = resolveDirectEditTransaction(input.checkpoint);
+  const mutationEvidence = transaction?.mutations || [];
+  const lacksMutationEvidence = (target: string) => !mutationEvidence.some((entry) =>
+    workspacePathsReferToSameFile(entry.target, target)
+  );
+  const diagnosticTargets = input.diagnosticTargets
+    .map((target) => String(target || "").trim())
+    .filter((target, index, targets) =>
+      Boolean(target) &&
+      targets.findIndex((entry) => workspacePathsReferToSameFile(entry, target)) === index
+  );
+  // The freshly emitted diagnostic is stronger than historical mutation
+  // receipts. Repair its first remaining owner and rerun validation; when that
+  // owner is actually resolved it disappears from the next diagnostic. Rotating
+  // merely because a file was edited once can skip an unresolved first error
+  // and make a smaller model oscillate across unrelated files.
+  if (diagnosticTargets.length > 0) {
+    return diagnosticTargets[0];
+  }
+
+  const objectiveTargets = transaction?.expectedTargets || [];
+  return objectiveTargets.find(lacksMutationEvidence) || null;
 }
 
 function getApprovedPlanScopeConflict(results: ToolExecutionResult[]): {
@@ -809,7 +1016,7 @@ export function resolveApprovedPlanInitialMutationRead(input: {
   return decision.status === "covered" ? decision.result : null;
 }
 
-function resolveParentSourceRereadRequirement(input: {
+export function resolveParentSourceRereadRequirement(input: {
   results: ToolExecutionResult[];
   recentToolActivity: PlanToolActivitySummary[];
 }): {
@@ -822,6 +1029,9 @@ function resolveParentSourceRereadRequirement(input: {
     result.qualityGateReason === "subagent_parent_reread_required"
   );
   if (!deferred?.target) return null;
+  if (deferred.parentSourceRereadRequirement) {
+    return deferred.parentSourceRereadRequirement;
+  }
   const delegated = [...input.recentToolActivity].reverse().find((activity) =>
     activity.delegatedObservation?.requiresParentReread === true &&
     workspacePathsReferToSameFile(activity.target, deferred.target)
@@ -905,6 +1115,9 @@ export async function handleToolResultRecoveryPhase(input: {
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
+  onCollaborationTaskOutcomes?: (
+    outcomes: CollaborationTaskJoinOutcome[],
+  ) => void | Promise<void>;
   activateExecuteRecovery: ActivateExecuteRecovery;
   activateChatFinalSynthesis: ActivateChatFinalSynthesis;
   setPlanRuntimePhase: SetPlanRuntimePhase;
@@ -918,6 +1131,18 @@ export async function handleToolResultRecoveryPhase(input: {
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
   let completionAudit: ApprovedPlanCompletionAudit | undefined;
+
+  // Tool execution has one protocol commit point. Every recovery branch below
+  // consumes the committed batch and may only decide the next state.
+  commitToolResultBatch({
+    callbacks: input.callbacks,
+    toolFeedbackFormat: input.toolFeedbackFormat,
+    results: input.results,
+    toolArgsByCallId: input.toolArgsByCallId,
+    iterationContext: input.iterationContext,
+    emitTurnEvent: input.emitTurnEvent,
+  });
+
   const activateExecuteRecoveryAndSync: ActivateExecuteRecovery = (mode, reason, context) => {
     // The callback updates the outer loop immediately. Mirror the returned
     // state locally so this phase cannot fold an older `normal` state back over
@@ -942,6 +1167,24 @@ export async function handleToolResultRecoveryPhase(input: {
         : {}),
     }, { phase, reason }).state;
   };
+
+  if (
+    input.results.length > 0 &&
+    input.results.every((result) =>
+      result.internalFeedback === true &&
+      result.qualityGateReason === "parent_subagent_review_required"
+    )
+  ) {
+    input.callbacks.onStatusChange("running");
+    logAgentEvent("parent_subagent_review_iteration_deferred", {
+      iteration: input.iteration,
+      deferredToolNames: input.results.map((result) => result.name),
+      pendingSubagentIds: input.callbacks.getPendingSubagentIds?.() || [],
+      nextOwner: "parent",
+      providerNeutral: true,
+    });
+    return finish("continue");
+  }
 
   const ptyObservationDeferral = resolvePtyObservationPolicyDeferral(input.results);
   if (executeRecoveryState.mode === "normal" && ptyObservationDeferral) {
@@ -974,26 +1217,28 @@ export async function handleToolResultRecoveryPhase(input: {
   // the model to interpret the policy message and call wait_subagents caused
   // repeated parent reads against the same lease and wasted whole iterations.
   if (shouldJoinPendingSubagentsAfterScopeDeferral(input.results)) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     const joinResult = await joinPendingSubagentsForParent({
       callbacks: input.callbacks,
       recentToolActivity: input.recentToolActivity,
       recentPlanToolActivity: input.recentPlanToolActivity,
       reason: "scope_conflict",
     });
+    if (joinResult.joined) {
+      await input.onCollaborationTaskOutcomes?.(joinResult.taskOutcomes);
+    }
     logAgentEvent("parent_scope_conflict_join_completed", {
       iteration: input.iteration,
       joined: joinResult.joined,
       adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
       sourceEvidenceCount: joinResult.sourceEvidenceCount,
       requiredParentRereads: joinResult.requiredParentRereads,
+      adoptedMutationEvidenceCount:
+        joinResult.adoptedMutationEvidenceCount,
+      adoptedMutationTargets: joinResult.adoptedMutationTargets,
+      nextRecoveryCapability: resolveExecuteRecoveryActionContract(
+        executeRecoveryState.mode,
+        executeRecoveryState,
+      ).nextRequiredCapability,
       pendingSubagentIds: input.callbacks.getPendingSubagentIds?.() || [],
       deferredTargets: input.results
         .filter((result) => result.qualityGateReason === "subagent_scope_policy_deferred")
@@ -1036,14 +1281,6 @@ export async function handleToolResultRecoveryPhase(input: {
     input.callbacks.getIsPlanApproved() &&
     approvedPlanScopeBlockedTargets.length > 0
   ) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     const plannedTargets = approvedPlanScopeConflict.plannedTargets.length > 0
       ? approvedPlanScopeConflict.plannedTargets
       : Array.from(new Set(
@@ -1113,14 +1350,6 @@ export async function handleToolResultRecoveryPhase(input: {
     recentToolActivity: input.recentToolActivity,
   });
   if (parentSourceRereadRequirement) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "patch_recovery_read",
       "subagent_parent_source_reread_required",
@@ -1183,14 +1412,6 @@ export async function handleToolResultRecoveryPhase(input: {
   if (
     approvedPlanMutationContextDecision.status === "needs_targeting"
   ) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "action_plus_targeting",
       "approved_plan_symbol_targeting_required",
@@ -1230,14 +1451,6 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("continue");
   }
   if (approvedPlanMutationContextDecision.status === "needs_range_read") {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "patch_recovery_read",
       "approved_plan_declaration_range_required",
@@ -1293,14 +1506,6 @@ export async function handleToolResultRecoveryPhase(input: {
     ? approvedPlanMutationContextDecision.result
     : null;
   if (approvedPlanInitialMutationRead?.readFileObservation) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "mutation_first",
       "approved_plan_target_context_observed",
@@ -1375,14 +1580,6 @@ export async function handleToolResultRecoveryPhase(input: {
       evidenceClosureAudit.completionAllowed &&
       executeRecoveryState.mode === "normal"
     ) {
-      appendToolResultsToHistory({
-        callbacks: input.callbacks,
-        toolFeedbackFormat: input.toolFeedbackFormat,
-        results: input.results,
-        toolArgsByCallId: input.toolArgsByCallId,
-        iterationContext: input.iterationContext,
-        emitTurnEvent: input.emitTurnEvent,
-      });
       input.emitTaskOrchestratorPhase("DONE", {
         reason: "plan_evidence_complete_after_tool",
         iteration: input.iteration,
@@ -1449,14 +1646,6 @@ export async function handleToolResultRecoveryPhase(input: {
     isMutationRuntimeIntent(input.runtimeIntent) &&
     (input.workflowMode !== "plan" || input.callbacks.getIsPlanApproved());
   if (canEnterDevServerEvidenceRecovery && (shouldObservePty || shouldBrowserValidate)) {
-    appendToolResultsToHistory({
-      callbacks: input.callbacks,
-      toolFeedbackFormat: input.toolFeedbackFormat,
-      results: input.results,
-      toolArgsByCallId: input.toolArgsByCallId,
-      iterationContext: input.iterationContext,
-      emitTurnEvent: input.emitTurnEvent,
-    });
     const nextCapability = devServerRecoveryCapability as
       | "observe_pty"
       | "browser_validation";
@@ -1508,18 +1697,6 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("continue");
   }
 
-  // Fold tool results before recovery policy may append a user/system pivot.
-  // Native tool protocols require assistant(tool_calls) -> tool(result) before
-  // any recovery message, including branches that immediately continue/pause.
-  appendToolResultsToHistory({
-    callbacks: input.callbacks,
-    toolFeedbackFormat: input.toolFeedbackFormat,
-    results: input.results,
-    toolArgsByCallId: input.toolArgsByCallId,
-    iterationContext: input.iterationContext,
-    emitTurnEvent: input.emitTurnEvent,
-  });
-
   // A real mutation preflight failure owns the next transition before any soft
   // no-progress or repetition policy. The preflight result carries a stable
   // reason, target, current file version, and (when inferable) exact source
@@ -1544,12 +1721,17 @@ export async function handleToolResultRecoveryPhase(input: {
     workflowMode: input.workflowMode,
     runtimeIntent: input.runtimeIntent,
     executeRecoveryMode: executeRecoveryState.mode,
+    decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
     retainedSourceObservation: retainedMutationSourceObservation,
     results: input.results,
   });
   if (directMutationPreflightRecovery) {
     const previousMode = executeRecoveryState.mode;
     const repeatedTargets = [directMutationPreflightRecovery.target];
+    const targetReleased =
+      directMutationPreflightRecovery.mode === "action_plus_targeting";
+    const resumedObjectiveAudit =
+      directMutationPreflightRecovery.mode === "objective_audit";
     const failedMutationResult = input.results.find((result) =>
       result.target === directMutationPreflightRecovery.target &&
       DIRECT_MUTATION_PREFLIGHT_RECOVERY_TOOLS.has(result.name)
@@ -1558,7 +1740,10 @@ export async function handleToolResultRecoveryPhase(input: {
       directMutationPreflightRecovery.mode,
       directMutationPreflightRecovery.reason,
       {
-        expectedTarget: directMutationPreflightRecovery.target,
+        expectedTarget: targetReleased
+          ? null
+          : directMutationPreflightRecovery.target,
+        resetExpectedTarget: targetReleased,
         repeatedTargets,
         sourceObservationKey: directMutationPreflightRecovery.sourceObservationKey,
         readLease: directMutationPreflightRecovery.readLease,
@@ -1584,32 +1769,53 @@ export async function handleToolResultRecoveryPhase(input: {
         directMutationPreflightRecovery.readLease?.observedVersion ||
         directMutationPreflightRecovery.decisionCheckpoint.evidenceVersion ||
         null,
+      finiteValidationPending: Boolean(
+        executeRecoveryState.decisionCheckpoint?.pendingFiniteValidation,
+      ),
+      finiteValidationDiagnosticTargets:
+        executeRecoveryState.decisionCheckpoint?.finiteValidationDiagnosticTargets || [],
+      finiteValidationFailureDetail:
+        executeRecoveryState.decisionCheckpoint?.finiteValidationFailureDetail || null,
     });
     input.emitPlanExecutionProgress("running", {
-      currentTool: recoveryContract.nextRequiredCapability === "targeted_read"
+      currentTool: resumedObjectiveAudit
+        ? ""
+        : recoveryContract.nextRequiredCapability === "targeted_read"
         ? "read_file"
+        : recoveryContract.nextRequiredCapability === "targeting"
+        ? "grep_search"
         : failedMutationResult?.name || "apply_patch",
       latestEvidence: directMutationPreflightRecovery.reason,
       recoveryReason: directMutationPreflightRecovery.reason,
       nextStep: input.callbacks.getPreferredLanguage() === "zh"
-        ? recoveryContract.nextRequiredCapability === "targeted_read"
+        ? resumedObjectiveAudit
+          ? "本次审查候选修改没有产生变化；恢复目标闭合审查，检查其他未覆盖结果或直接总结"
+          : recoveryContract.nextRequiredCapability === "targeted_read"
           ? `精确重读 ${directMutationPreflightRecovery.target} 的当前版本后重算补丁`
+          : recoveryContract.nextRequiredCapability === "targeting"
+          ? `本次修改无效果，解除 ${directMutationPreflightRecovery.target} 绑定并重新定位真实修改所有者`
           : `复用 ${directMutationPreflightRecovery.target} 的当前源码观察并修正补丁`
-        : recoveryContract.nextRequiredCapability === "targeted_read"
+        : resumedObjectiveAudit
+          ? "the audit candidate produced no change; resume objective closure, inspect a different uncovered outcome, or summarize"
+          : recoveryContract.nextRequiredCapability === "targeted_read"
           ? `reread the exact current ${directMutationPreflightRecovery.target} range, then recompute the patch`
+          : recoveryContract.nextRequiredCapability === "targeting"
+          ? `release the no-effect ${directMutationPreflightRecovery.target} binding and locate the real mutation owner`
           : `reuse the current ${directMutationPreflightRecovery.target} observation and correct the patch`,
     });
     input.callbacks.onStatusChange("running");
-    input.callbacks.appendMessage({
-      role: "user",
-      content: buildExecuteRecoveryPrompt({
-        language: MODEL_CONTROL_LANGUAGE,
-        reason: directMutationPreflightRecovery.reason,
-        contract: recoveryContract,
-        repeatedTargets,
-        recentActivity: input.recentToolActivity,
-      }),
-    });
+    if (!resumedObjectiveAudit) {
+      input.callbacks.appendMessage({
+        role: "user",
+        content: buildExecuteRecoveryPrompt({
+          language: MODEL_CONTROL_LANGUAGE,
+          reason: directMutationPreflightRecovery.reason,
+          contract: recoveryContract,
+          repeatedTargets,
+          recentActivity: input.recentToolActivity,
+        }),
+      });
+    }
     return finish("continue");
   }
 
@@ -2143,28 +2349,107 @@ export async function handleToolResultRecoveryPhase(input: {
     pendingFiniteValidation
   ) {
     // A validation that actually ran has produced a source/test/config
-    // diagnostic. Command-only recovery cannot fix it, but repair must still
-    // cross an explicit context boundary before mutation. A unique source gets
-    // one exact read lease; an unattributed failure gets a bounded targeting
-    // surface until a runtime-owned source observation selects the target.
-    const repairTarget = resolveFiniteValidationRepairTarget({
+    // diagnostic. Command-only recovery cannot fix it. A unique source gets
+    // one exact read lease; ambiguous attribution returns to the existing
+    // targeting phase so the model must select and observe one concrete owner
+    // before mutation. Objective audit remains reserved for post-validation
+    // closure instead of also acting as a second repair loop.
+    const repairTargets = resolveFiniteValidationRepairTargets({
       result: failedFiniteValidation,
       args: failedFiniteValidationArgs,
       workspace: input.workspace,
     });
-    const validationDiagnostic = structuredCommandDiagnosticText(
-      failedFiniteValidation,
-    )
-      .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 2_400);
+    const previousDecisionCheckpoint = executeRecoveryState.decisionCheckpoint;
+    const repairTarget = resolveNextFiniteValidationRepairTarget({
+      diagnosticTargets: repairTargets,
+      checkpoint: previousDecisionCheckpoint,
+    });
+    const validationDiagnostic = compactFiniteValidationDiagnostic(
+      structuredCommandDiagnosticText(failedFiniteValidation),
+    );
+    const focusedValidationDiagnostic = repairTarget
+      ? scopeFiniteValidationDiagnosticToTarget({
+          diagnostic: validationDiagnostic,
+          target: repairTarget,
+        })
+      : validationDiagnostic;
+    const previousFocusedValidationDiagnostic = repairTarget &&
+        previousDecisionCheckpoint?.expectedTarget &&
+        workspacePathsReferToSameFile(
+          repairTarget,
+          previousDecisionCheckpoint.expectedTarget,
+        )
+      ? scopeFiniteValidationDiagnosticToTarget({
+          diagnostic:
+            previousDecisionCheckpoint.finiteValidationFailureDetail || "",
+          target: repairTarget,
+        })
+      : !repairTarget && !previousDecisionCheckpoint?.expectedTarget
+        ? previousDecisionCheckpoint?.finiteValidationFailureDetail || ""
+        : "";
+    const previousValidationMutationReopenCount = Math.max(
+      0,
+      Math.floor(
+        Number(previousDecisionCheckpoint?.validationMutationReopenCount) || 0,
+      ),
+    );
+    const repairAttempt = resolveFiniteValidationRepairAttempt({
+      currentDiagnostic: focusedValidationDiagnostic || validationDiagnostic,
+      previousDiagnostic: previousFocusedValidationDiagnostic,
+      currentTarget: repairTarget,
+      previousTarget: previousDecisionCheckpoint?.expectedTarget,
+      previousCount: previousValidationMutationReopenCount,
+    });
+    if (repairAttempt.budgetExhausted) {
+      const language = input.callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? `执行已暂停：同一有限验证已用尽 ${MAX_VALIDATION_MUTATION_REOPENS} 次修改重开预算且仍然失败。已有变更、诊断目标和验证命令均已保留。`
+        : `Execution paused: the same finite validation exhausted ${MAX_VALIDATION_MUTATION_REOPENS} mutation reopens and still fails. Existing changes, diagnostic targets, and the validation command were preserved.`;
+      input.callbacks.onNonActionableStop(message, "missing_tool_loop", {
+        phase: "paused",
+        recoveryReason: "finite_validation_repair_budget_exhausted",
+        repeatedTargets: repairTargets,
+        nextStep: language === "zh"
+          ? "从保留的验证检查点恢复并重新判断剩余诊断所有者；不要继续重复同一修改。"
+          : "Resume from the retained validation checkpoint and re-audit the remaining diagnostic owner; do not repeat the same mutation.",
+      });
+      input.callbacks.onStatusChange("idle");
+      logAgentEvent("finite_validation_repair_budget_exhausted", {
+        iteration: input.iteration,
+        command: failedFiniteValidationCommand,
+        diagnosticTargets: repairTargets,
+        validationMutationReopenCount:
+          previousValidationMutationReopenCount,
+        maxValidationMutationReopens: MAX_VALIDATION_MUTATION_REOPENS,
+        diagnosticChanged: repairAttempt.diagnosticChanged,
+        diagnosticFingerprint: repairAttempt.diagnosticFingerprint,
+      });
+      return finish("stopped");
+    }
+    const latestMutationRepairRange = repairTarget
+      ? resolveLatestFiniteValidationMutationRange({
+          activities: input.recentToolActivity,
+          target: repairTarget,
+        })
+      : null;
     const repairReadLease = repairTarget
       ? buildFailedValidationRepairReadLease({
           target: repairTarget,
           sourceObservationKey: executeRecoveryState.sourceObservationKey,
+          diagnosticText: focusedValidationDiagnostic || validationDiagnostic,
+          preferredRange: latestMutationRepairRange,
         })
       : null;
+    const repairFingerprint = [
+      "finite-validation-repair",
+      `command:${failedFiniteValidationCommand.toLowerCase()}`,
+      `target:${(repairTarget || "(targeting)").toLowerCase()}`,
+      `diagnostic:${repairAttempt.diagnosticFingerprint}`,
+    ].join("|");
+    const validationMutationReopenFingerprints = [...new Set([
+      ...(previousDecisionCheckpoint?.validationMutationReopenFingerprints || []),
+      repairFingerprint,
+    ])].slice(-32);
     executeRecoveryState = activateExecuteRecoveryAndSync(
       repairTarget ? "patch_recovery_read" : "action_plus_targeting",
       "failed_finite_validation_requires_repair",
@@ -2174,22 +2459,31 @@ export async function handleToolResultRecoveryPhase(input: {
         readLease: repairReadLease,
         sourceObservationKey: null,
         decisionCheckpoint: {
+          ...(previousDecisionCheckpoint || {}),
           expectedTarget: repairTarget,
           sourceObservationKey: null,
           nextRequiredCapability: repairTarget ? "targeted_read" : "targeting",
           pendingFiniteValidation,
+          finiteValidationFailureDetail: validationDiagnostic || null,
+          finiteValidationDiagnosticTargets: repairTargets,
+          validationMutationReopenCount: repairAttempt.count,
+          validationMutationReopenFingerprints,
         },
       },
     );
     const recoveryPrompt = [
       "FINITE_VALIDATION_REPAIR_REQUIRED: The finite validation command executed, but its validation failed.",
       `Failed command: ${failedFiniteValidationCommand}`,
-      validationDiagnostic
+      focusedValidationDiagnostic
+        ? `Observed validation diagnostic for the active repair owner: ${focusedValidationDiagnostic}`
+        : validationDiagnostic
         ? `Observed validation diagnostic: ${validationDiagnostic}`
         : "Observed validation diagnostic: no usable stdout/stderr was returned.",
-      repairTarget
+      repairTarget && repairTargets.length === 1
         ? `The diagnostic uniquely attributes the failure to ${repairTarget}. Read its current version once under the granted lease, then repair it.`
-        : "The diagnostic does not uniquely attribute the failure to one source file. Use the bounded targeting surface to locate an implicated owner, then read that concrete file; mutation opens only after that source observation. Do not promote the most recently changed file or a search query into the transaction target.",
+        : repairTarget
+        ? `The diagnostic names multiple bounded owners (${repairTargets.join(", ")}). This transaction serializes repair through ${repairTarget}: read its current version once under the granted lease, make only the supported repair, then let the same validation determine whether another owner remains.`
+        : `The diagnostic does not uniquely attribute the failure to one source file. Candidate owners: ${repairTargets.join(", ") || "(none parsed)"}. Use one bounded targeting action to select and observe a concrete implicated owner before repair. Keep the change minimal and do not promote the most recently changed file or a search query into the sole transaction target.`,
       "Rerun this same command after the repair.",
       "Do not substitute an unrelated successful command: this failed validation remains pending turn evidence until the same concrete command succeeds.",
     ].join("\n");
@@ -2203,17 +2497,27 @@ export async function handleToolResultRecoveryPhase(input: {
       nextRecoveryMode: executeRecoveryState.mode,
       nextRequiredCapability:
         executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+      diagnosticTargets: repairTargets,
+      selectedRepairTarget: repairTarget,
+      uniqueTargetSelection: repairTargets.length === 1,
+      repairReadRange: repairReadLease?.requestedRange || null,
+      latestMutationRepairRange,
+      focusedDiagnostic: (focusedValidationDiagnostic || validationDiagnostic).slice(0, 800),
+      validationRepairAttempt: repairAttempt.count,
+      diagnosticChanged: repairAttempt.diagnosticChanged,
+      diagnosticFingerprint: repairAttempt.diagnosticFingerprint,
     });
     input.emitPlanExecutionProgress("running", {
       currentTool: repairTarget ? "read_file" : "grep_search",
+      latestEvidence: (focusedValidationDiagnostic || validationDiagnostic).slice(0, 800),
       recoveryReason: "failed_finite_validation_requires_repair",
       nextStep: input.callbacks.getPreferredLanguage() === "zh"
         ? repairTarget
           ? `读取 ${repairTarget} 的当前版本一次，修复后重新运行同一验证命令`
-          : "先用有界搜索定位诊断归属文件，读取后修复，并重新运行同一验证命令"
+          : "在有界工作区审计中检查或修复诊断涉及的文件，并重新运行同一验证命令"
         : repairTarget
           ? `read the current ${repairTarget} once, repair it, then rerun the same validation command`
-          : "use bounded targeting to locate a diagnostic owner, read and repair it, then rerun the same validation command",
+          : "inspect or repair a diagnostic owner within the bounded workspace audit, then rerun the same validation command",
     });
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });

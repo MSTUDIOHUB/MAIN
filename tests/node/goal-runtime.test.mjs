@@ -1655,11 +1655,18 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
         "tool:replace_in_file|target:src/toolbar.ts|locus:11111111|requirement:req-toolbar",
         "tool:replace_in_file|target:src/toolbar.ts|locus:22222222|requirement:req-toolbar",
       ],
-      objectiveMutationEvidence: [{
-        target: "src/toolbar.ts",
-        requirementRef: "REQ-TOOLBAR",
-      }],
-      objectiveClosurePending: true,
+      directEditTransaction: {
+        obligationId: "requirement:req-toolbar",
+        revision: 1,
+        kind: "requirement",
+        phase: "validate",
+        expectedTargets: ["src/toolbar.ts"],
+        mutations: [{
+          target: "src/toolbar.ts",
+          requirementRef: "REQ-TOOLBAR",
+        }],
+        validation: null,
+      },
       browserFailureFingerprint: "browser-failure-v1",
       browserFailureCallSignature: "browser_evaluate::exact-v1",
       browserFailureDetail: "selector #open was not found",

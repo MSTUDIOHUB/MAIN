@@ -190,7 +190,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
   logAgentEvent(
     consecutiveReasoningDominatedCount >= 2
-      ? "reasoning_dominated_pause"
+      ? "reasoning_dominated_boundary"
       : "reasoning_dominated_recovery",
     {
       iteration,
@@ -235,6 +235,15 @@ export function handleReasoningDominatedNoToolRecovery(input: {
       callbacks.getIsPlanApproved() || workflowMode === "plan"
         ? "incomplete_plan"
         : "no_output",
+      isExecuteRuntime
+        ? {
+            phase: "paused",
+            recoveryReason: "reasoning_dominated_no_action",
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "保留当前证据，下一次有界续跑必须调用当前阶段工具而不是继续隐藏推理。"
+              : "Keep the current evidence; the next bounded continuation must call the active phase tool instead of continuing hidden reasoning.",
+          }
+        : undefined,
     );
     callbacks.onStatusChange("idle");
     return finish("stopped");

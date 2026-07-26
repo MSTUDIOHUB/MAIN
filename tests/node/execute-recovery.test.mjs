@@ -73,6 +73,7 @@ const {
   buildFailedFiniteValidationRecoveryPrompt,
   classifyFailedFiniteValidationOutcome,
   compactStructuredCommandResult,
+  summarizeSuccessfulValidationObservation,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
   buildExecutePatchMismatchFingerprint,
@@ -80,6 +81,7 @@ const {
   buildPatchRecoveryReadNoProgressFingerprint,
   failedFiniteValidationMatchesPendingPlanEvidence,
   hasPendingPlanCommandEvidence,
+  isAutoResumableExecutionBoundaryReason,
   isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
   isReadOnlyNoProgressDetail,
@@ -89,8 +91,11 @@ const {
   resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
   resolveExecuteReadOnlyRecoveryTrigger,
+  resolveFailedValidationDiagnosticRange,
   resolveFailedFiniteValidationRecoveryPolicy,
   resolveReadOnlyNoProgressTrigger,
+  resolveRuntimeOwnedRecoveryAction,
+  scopeFiniteValidationDiagnosticToTarget,
   shouldEnterFailedFiniteValidationRecovery,
   summarizeRepeatedExecuteTargets,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
@@ -139,6 +144,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/verificationEvidence.ts"));
 
 const {
+  hasStartedCollaborationForCurrentTurn,
   resolveIterationToolSurface,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"));
 
@@ -157,7 +163,6 @@ const {
 const {
   findDelegatedObservationRequiringParentReread,
   normalizeFiniteValidationCheckpointCommand,
-  objectiveAuditTargetsMissingReadObservation,
   partitionToolCallsForExecution,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
 const {
@@ -182,7 +187,11 @@ const {
 
 const {
   buildExecuteRecoverySourceContextMessage,
+  FOCUSED_PINNED_MUTATION_COMPACTION_LIMITS,
+  isRecoverySourceStableOutsideNativeToolHistory,
+  resolveRecoveryContextObservationKeys,
   resolveRecoverySourceContextFreshness,
+  shouldFocusPinnedMutationRecoveryContext,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/contextManagement.ts"));
 
 const {
@@ -199,9 +208,15 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRuntimeActions.ts"));
 
 const {
+  compactFiniteValidationDiagnostic,
   isFiniteValidationRecoveryExecution,
   resolveApprovedPlanMutationContextDecision,
   resolveFiniteValidationRepairTarget,
+  resolveFiniteValidationRepairTargets,
+  resolveFiniteValidationRepairAttempt,
+  resolveLatestFiniteValidationMutationRange,
+  resolveNextFiniteValidationRepairTarget,
+  resolveParentSourceRereadRequirement,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"));
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
@@ -983,22 +998,23 @@ test("named-tool mismatches are quarantined and reprompt the exact runtime contr
   const harness = createExecuteNoToolHarness("en");
   const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
     protocolViolation: "required_function_call_mismatch",
+    protocolExpectedTool: "apply_patch",
+    protocolActualTools: ["grep_search"],
     visibleText: "I will read the file again before editing.",
   }));
 
   assert.equal(result.status, "continue");
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.equal(harness.appended.length, 1);
-  assert.deepEqual(harness.protocolFallbacks, [
-    "required_native_tool_protocol_violation:required_function_call_mismatch",
-  ]);
-  assert.match(harness.appended[0].content, /XML-compatible/i);
+  assert.deepEqual(harness.protocolFallbacks, []);
+  assert.doesNotMatch(harness.appended[0].content, /XML-compatible/i);
   assert.match(harness.appended[0].content, /specific function/);
   assert.match(harness.appended[0].content, /mismatched call was not executed/);
-  assert.match(harness.appended[0].content, /exactly the named tool/);
+  assert.match(harness.appended[0].content, /required function is: apply_patch/);
+  assert.match(harness.appended[0].content, /Keep native function calling/);
 });
 
-test("first native required-tool violation switches transport exactly once", () => {
+test("first native required-tool miss keeps transport and adds one bounded repair", () => {
   const harness = createExecuteNoToolHarness("en");
   const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
     activeProfile: "local",
@@ -1007,10 +1023,9 @@ test("first native required-tool violation switches transport exactly once", () 
 
   assert.equal(result.status, "continue");
   assert.equal(result.consecutiveNoToolCount, 1);
-  assert.deepEqual(harness.protocolFallbacks, [
-    "required_native_tool_protocol_violation:required_tool_call_missing",
-  ]);
-  assert.match(harness.appended.at(-1)?.content || "", /XML-compatible/);
+  assert.deepEqual(harness.protocolFallbacks, []);
+  assert.match(harness.appended.at(-1)?.content || "", /Keep native function calling/);
+  assert.doesNotMatch(harness.appended.at(-1)?.content || "", /XML-compatible/);
   assert.doesNotMatch(harness.appended.at(-1)?.content || "", /current_task_action_lock/);
 });
 
@@ -1052,22 +1067,73 @@ test("execute protocol no-action exhausts provider-neutral strategy pivots after
   assert.equal(exhaustedHarness.stops.length, 1);
 });
 
-test("out-of-surface tool calls are quarantined as protocol recovery", () => {
+test("an exhausted required-tool protocol emits a typed workflow continuation boundary", () => {
+  const harness = createExecuteNoToolHarness("en");
+
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    forceXmlTools: true,
+    consecutiveNoToolCount: 3,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["grep_search"],
+  }));
+
+  assert.equal(result.status, "stopped");
+  assert.equal(harness.stops.length, 1);
+  assert.equal(
+    harness.stops[0].progress?.recoveryReason,
+    "required_tool_call_protocol_violation",
+  );
+  assert.deepEqual(harness.statuses.at(-1), "idle");
+});
+
+test("only model-neutral execution fuses are eligible for automatic continuation", () => {
+  for (const reason of [
+    "stream_no_visible_progress_timeout",
+    "execute_recovery_no_progress_limit",
+    "required_tool_call_protocol_violation",
+    "empty_model_response",
+    "target_progress_loop",
+    "execution_evidence_gap:mutation",
+  ]) {
+    assert.equal(
+      isAutoResumableExecutionBoundaryReason(reason),
+      true,
+      `${reason} should yield to the workflow continuation owner`,
+    );
+  }
+
+  for (const reason of [
+    "validation_mutation_reopen_budget_exhausted",
+    "finite_validation_repair_budget_exhausted",
+    "tool_permission",
+    "awaiting_user_choice",
+    "desktop_control_environment_blocked",
+  ]) {
+    assert.equal(
+      isAutoResumableExecutionBoundaryReason(reason),
+      false,
+      `${reason} requires a real pause instead of an automatic retry`,
+    );
+  }
+});
+
+test("out-of-surface tool calls repair the active native protocol without lane fallback", () => {
   const harness = createExecuteNoToolHarness("en");
   const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
     protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["grep_search"],
     visibleText: "I will read the file again before editing.",
   }));
 
   assert.equal(result.status, "continue");
   assert.equal(harness.appended.length, 1);
-  assert.deepEqual(harness.protocolFallbacks, [
-    "required_native_tool_protocol_violation:required_tool_call_not_available",
-  ]);
-  assert.match(harness.appended[0].content, /XML-compatible/i);
+  assert.deepEqual(harness.protocolFallbacks, []);
+  assert.doesNotMatch(harness.appended[0].content, /XML-compatible/i);
   assert.match(harness.appended[0].content, /outside the active recovery surface/);
   assert.match(harness.appended[0].content, /was not executed/);
-  assert.match(harness.appended[0].content, /actually exposed/);
+  assert.match(harness.appended[0].content, /Rejected historical\/out-of-surface tools: grep_search/);
+  assert.match(harness.appended[0].content, /exact currently callable surface/i);
+  assert.match(harness.appended[0].content, /Keep native function calling/);
 });
 
 test("active XML evidence recovery records prose as a bounded protocol miss", () => {
@@ -1483,6 +1549,188 @@ test("a short cached-read streak does not create a second special recovery path"
   assert.equal(result.status, "none");
   assert.deepEqual(activations, []);
   assert.equal(result.pendingExecuteRecoveryPrompt, null);
+});
+
+test("zero-result local search loop targets source before opening mutation tools", () => {
+  const activations = [];
+  let recoveryState = createExecuteRecoveryRuntimeState({ workflowMode: "edit" });
+  const recentToolActivity = Array.from({ length: 8 }, (_value, index) => ({
+    name: index === 0 ? "get_project_skeleton" : "grep_search",
+    status: "succeeded",
+    target: index === 0 ? "." : "unsaved",
+    detail: index === 0 ? "PROJECT_SKELETON" : "",
+  }));
+  const result = handleNoProgressRecovery({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPlanExecutionEvidenceLedger: () => [],
+      getPreferredLanguage: () => "zh",
+    },
+    activeProfile: "local",
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 8,
+    results: [{
+      toolCallId: "grep-8",
+      name: "grep_search",
+      target: "unsaved",
+      content: "",
+      isError: false,
+    }],
+    recentToolActivity,
+    recentPlanToolActivity: [],
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    executeRecoveryState: recoveryState,
+    repairExecutionRequestInChat: false,
+    latestUserPromptText: "增加未保存文件提示",
+    isUnapprovedPlanReadOnlyBatch: false,
+    planReadOnlyConvergenceBatches: 0,
+    planReadOnlyConvergenceTools: 0,
+    availableToolNames: new Set([
+      "glob_search",
+      "grep_search",
+      "get_file_outline",
+      "read_file",
+      "apply_patch",
+    ]),
+    tracking: {
+      lastNoProgressBatchSignature: "",
+      noProgressBatchRepeatCount: 2,
+      consecutiveReadFileOnlyCacheHits: 0,
+      lastReadFileOnlyObservationSignature: "",
+      noProgressStrategyPivots: [],
+    },
+    activateExecuteRecovery: (mode, reason, context = {}) => {
+      activations.push({ mode, reason, context });
+      recoveryState = activateExecuteRecoveryRuntimeState(recoveryState, {
+        mode,
+        reason,
+        expectedTarget:
+          typeof context.expectedTarget === "string"
+            ? context.expectedTarget
+            : null,
+        resetExpectedTarget: context.resetExpectedTarget === true,
+        readLease: context.readLease ?? null,
+        sourceObservationKey:
+          typeof context.sourceObservationKey === "string"
+            ? context.sourceObservationKey
+            : null,
+        decisionCheckpoint: context.decisionCheckpoint ?? null,
+      });
+      return recoveryState;
+    },
+    activateChatFinalSynthesis: () => {},
+    emitTaskOrchestratorPhase: () => {},
+  });
+
+  assert.equal(result.status, "none");
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0].mode, "action_plus_targeting");
+  assert.equal(recoveryState.mode, "action_plus_targeting");
+  assert.equal(
+    recoveryState.decisionCheckpoint?.nextRequiredCapability,
+    "targeting",
+  );
+  assert.equal(recoveryState.sourceObservationKey, null);
+  assert.match(result.pendingExecuteRecoveryPrompt || "", /No versioned source observation is bound yet/);
+  assert.match(result.pendingExecuteRecoveryPrompt || "", /Do not mutate or repeat the same zero-result query/);
+});
+
+test("a read-only loop with retained versioned source advances directly to mutation", () => {
+  const activations = [];
+  const sourceObservation = {
+    key: "src/main.js::v1::1-450",
+    path: "src/main.js",
+    requestSignature: "read_file::src/main.js::1-450",
+    versionToken: "v1",
+    source: "fresh",
+  };
+  const recentToolActivity = [
+    {
+      name: "read_file",
+      status: "succeeded",
+      target: "src/main.js",
+      detail: "READ_FILE_RESULT",
+      readFileObservation: sourceObservation,
+    },
+    ...Array.from({ length: 11 }, () => ({
+      name: "read_file",
+      status: "succeeded",
+      target: "src/main.js",
+      detail: "FILE_UNCHANGED_STUB",
+    })),
+  ];
+  const result = handleNoProgressRecovery({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPlanExecutionEvidenceLedger: () => [],
+      getPreferredLanguage: () => "zh",
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 12,
+    results: [{
+      toolCallId: "cached-main",
+      name: "read_file",
+      target: "src/main.js",
+      content: "FILE_UNCHANGED_STUB: src/main.js",
+      isError: false,
+    }],
+    recentToolActivity,
+    recentPlanToolActivity: [],
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    executeRecoveryState: createExecuteRecoveryRuntimeState({
+      workflowMode: "edit",
+    }),
+    repairExecutionRequestInChat: false,
+    latestUserPromptText: "修复文件打开后的错误保存",
+    isUnapprovedPlanReadOnlyBatch: false,
+    planReadOnlyConvergenceBatches: 0,
+    planReadOnlyConvergenceTools: 0,
+    availableToolNames: new Set(["read_file", "replace_in_file"]),
+    tracking: {
+      lastNoProgressBatchSignature: "",
+      noProgressBatchRepeatCount: 2,
+      consecutiveReadFileOnlyCacheHits: 2,
+      lastReadFileOnlyObservationSignature: "",
+      noProgressStrategyPivots: [],
+    },
+    activateExecuteRecovery: (mode, reason, context = {}) => {
+      activations.push({ mode, reason, context });
+      return activateExecuteRecoveryRuntimeState(
+        createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+        {
+          mode,
+          reason,
+          expectedTarget: context.expectedTarget || null,
+          sourceObservationKey: context.sourceObservationKey || null,
+          decisionCheckpoint: context.decisionCheckpoint || null,
+        },
+      );
+    },
+    activateChatFinalSynthesis: () => {},
+    emitTaskOrchestratorPhase: () => {},
+  });
+
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0].mode, "mutation_first");
+  assert.equal(activations[0].context.expectedTarget, "src/main.js");
+  assert.equal(
+    activations[0].context.sourceObservationKey,
+    sourceObservation.key,
+  );
+  assert.equal(activations[0].context.readFileObservation, sourceObservation);
+  assert.notEqual(activations[0].context.resetExpectedTarget, true);
+  assert.match(
+    result.pendingExecuteRecoveryPrompt || "",
+    /Reuse the retained versioned observation/,
+  );
 });
 
 test("different cached file windows do not trip the global read-only streak", () => {
@@ -1992,6 +2240,87 @@ test("read_file cache is range-and-version aware and never falls back to stale g
   assert.match(active.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
   assert.equal(active.preExecutionResults[0].readFileObservation?.source, "stub");
 
+  const leasedRecoveryState = {
+    mode: "patch_recovery_read",
+    reason: "mutation_preflight_search_text_mismatch",
+    expectedTarget: "src/App.tsx",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: {
+      purpose: "patch_recovery",
+      target: "src/App.tsx",
+      requestedRange: { startLine: 1, maxLines: 100 },
+      state: "available",
+    },
+    sourceObservationKey: null,
+    decisionCheckpoint: {
+      expectedTarget: "src/App.tsx",
+      sourceObservationKey: null,
+      nextRequiredCapability: "targeted_read",
+    },
+  };
+  const leased = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [{ role: "tool", content: modelContent }],
+    fileReadStates: new Map([[fileSignature, currentState]]),
+    executeRecoveryState: leasedRecoveryState,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(
+      leasedRecoveryState.mode,
+      leasedRecoveryState,
+    ),
+  }));
+  assert.equal(leased.readOnlyCalls.length, 0);
+  assert.equal(leased.preExecutionResults.length, 1);
+  assert.match(leased.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.match(leased.preExecutionResults[0].content, /export function App/);
+  assert.equal(
+    leased.preExecutionResults[0].readFileObservation?.source,
+    "replay",
+    "an exact recovery lease must receive source bytes rather than an unchanged stub",
+  );
+
+  const targetingRecoveryState = {
+    mode: "action_plus_targeting",
+    reason: "failed_finite_validation_requires_repair",
+    expectedTarget: null,
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "targeting",
+      pendingFiniteValidation: {
+        command: "npm run build",
+        cwd: ".",
+      },
+    },
+  };
+  const targeting = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [{ role: "tool", content: modelContent }],
+    fileReadStates: new Map([[fileSignature, currentState]]),
+    executeRecoveryState: targetingRecoveryState,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(
+      targetingRecoveryState.mode,
+      targetingRecoveryState,
+    ),
+  }));
+  assert.equal(targeting.readOnlyCalls.length, 0);
+  assert.equal(targeting.preExecutionResults.length, 1);
+  assert.match(targeting.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.match(targeting.preExecutionResults[0].content, /export function App/);
+  assert.equal(
+    targeting.preExecutionResults[0].readFileObservation?.source,
+    "replay",
+    "a model-selected targeting read must expose source bytes before the target is bound",
+  );
+
   const compactedStates = new Map([[fileSignature, currentState]]);
   const compacted = await partitionToolCallsForExecution(createReadFilePartitionInput({
     managedAgentMessages: [],
@@ -2026,6 +2355,93 @@ test("read_file cache is range-and-version aware and never falls back to stale g
   assert.equal(afterNewEvictionEpoch.preExecutionResults.length, 1);
   assert.match(afterNewEvictionEpoch.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
   assert.match(afterNewEvictionEpoch.preExecutionResults[0].content, /export function App/);
+});
+
+test("an unbounded recovery lease preserves its exact read instead of narrowing around cached fragments", async () => {
+  const version = { sizeBytes: 7_666, modifiedMs: 123 };
+  const makeWindow = (startLine, endLine) => {
+    const args = {
+      path: "src/App.tsx",
+      start_line: startLine,
+      end_line: endLine,
+      max_lines: endLine - startLine + 1,
+    };
+    const modelContent = [
+      "READ_FILE_RESULT",
+      "path: src/App.tsx",
+      "truncated: true",
+      "totalLines: 188",
+      "totalChars: 7666",
+      `returnedLines: ${startLine}-${endLine}`,
+      "returnedChars: 200",
+      "---CONTENT START---",
+      `// source lines ${startLine}-${endLine}`,
+      "---CONTENT END---",
+    ].join("\n");
+    const signature = buildFileReadSignature("src/App.tsx", args);
+    return [signature, {
+      signature,
+      path: "src/App.tsx",
+      argsKey: `${startLine}-${endLine}`,
+      contentHash: `${startLine}-${endLine}`,
+      contentLength: modelContent.length,
+      ...version,
+      modelContent,
+      updatedAt: startLine,
+    }];
+  };
+  const fileReadStates = new Map([
+    makeWindow(90, 105),
+    makeWindow(179, 188),
+  ]);
+  const recoveryState = {
+    mode: "patch_recovery_read",
+    reason: "failed_finite_validation_requires_repair",
+    expectedTarget: "src/App.tsx",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: {
+      purpose: "context_restore",
+      target: "src/App.tsx",
+      state: "available",
+    },
+    sourceObservationKey: null,
+    decisionCheckpoint: {
+      expectedTarget: "src/App.tsx",
+      sourceObservationKey: null,
+      nextRequiredCapability: "targeted_read",
+    },
+  };
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", ...version }
+    : {};
+
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "recovery-full-read",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx" }),
+    }],
+    managedAgentMessages: [...fileReadStates.values()].map((state) => ({
+      role: "tool",
+      content: state.modelContent,
+    })),
+    fileReadStates,
+    executeRecoveryState: recoveryState,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(
+      recoveryState.mode,
+      recoveryState,
+    ),
+  }));
+
+  assert.equal(result.preExecutionResults.length, 0);
+  assert.equal(result.readOnlyCalls.length, 1);
+  assert.deepEqual(JSON.parse(result.readOnlyCalls[0].arguments), {
+    path: "src/App.tsx",
+  });
 });
 
 test("approved execution keeps returning an unchanged stub after the old third-read boundary", async () => {
@@ -2346,6 +2762,107 @@ test("execute recovery context uses the real model budget instead of a fixed 16k
   assert.match(contextManagementSource, /recoverySourceContract\.phase === "mutation"/);
   assert.equal(recoveryPinIndex > contextManagementSource.indexOf("const toolCharsBefore"), true);
   assert.equal(evictionIndex > recoveryPinIndex, true);
+});
+
+test("a pinned mutation focuses context once after no-progress or a repeated validation defect", () => {
+  const contract = {
+    phase: "mutation",
+    nextRequiredCapability: "mutation",
+    expectedTarget: "src/components/toolbar.js",
+    sourceObservationKey: "toolbar-v1",
+    phaseNoProgressCount: 1,
+    decisionCheckpoint: null,
+  };
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract,
+  }), false);
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract: { ...contract, phaseNoProgressCount: 2 },
+  }), true);
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract: { ...contract, phaseNoProgressCount: 3 },
+  }), false, "the compacted transcript must be reused instead of rewritten every retry");
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract: {
+      ...contract,
+      phaseNoProgressCount: 0,
+      decisionCheckpoint: { validationMutationReopenCount: 2 },
+    },
+  }), true, "the second failed validation must remove stale investigation advice before another edit");
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract: {
+      ...contract,
+      phaseNoProgressCount: 0,
+      decisionCheckpoint: { validationMutationReopenCount: 3 },
+    },
+  }), false, "the early validation-repair compaction is also one-shot");
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: true,
+    contract: { ...contract, sourceObservationKey: null, phaseNoProgressCount: 2 },
+  }), false);
+  assert.equal(shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible: false,
+    contract: { ...contract, phaseNoProgressCount: 2 },
+  }), false);
+  assert.deepEqual(FOCUSED_PINNED_MUTATION_COMPACTION_LIMITS, {
+    maxMessages: 18,
+    maxToolResultMessages: 6,
+    maxToolChars: 10_000,
+    maxToolCallGroups: 3,
+    maxToolResultTokens: 600,
+    latestUserMessages: 2,
+  });
+});
+
+test("a recovery source remains pinned outside native tool history isolation", () => {
+  const source = "READ_FILE_RESULT\npath: src/main.js\n---CONTENT START---\nconst value = 1;\n---CONTENT END---";
+  assert.equal(isRecoverySourceStableOutsideNativeToolHistory(source, [{
+    role: "tool",
+    tool_call_id: "read-main",
+    content: source,
+  }]), false);
+  assert.equal(isRecoverySourceStableOutsideNativeToolHistory(source, [
+    {
+      role: "tool",
+      tool_call_id: "read-main",
+      content: source,
+    },
+    {
+      role: "system",
+      content: `[System: Recovery source window]\n${source}`,
+    },
+  ]), true);
+});
+
+test("an exact recovery source excludes a stale nearby activity window", () => {
+  assert.deepEqual(resolveRecoveryContextObservationKeys({
+    leaseObservationKeys: [],
+    sourceObservationKey: "read_file::src/main.js::235-331::version=v3",
+    recentActivityObservationKey: "read_file::src/main.js::430-526::version=v2",
+  }), [
+    "read_file::src/main.js::235-331::version=v3",
+  ]);
+  assert.deepEqual(resolveRecoveryContextObservationKeys({
+    leaseObservationKeys: [
+      "read_file::src/main.js::235-280::version=v3",
+      "read_file::src/main.js::281-331::version=v3",
+    ],
+    sourceObservationKey: "read_file::src/main.js::281-331::version=v3",
+    recentActivityObservationKey: "read_file::src/main.js::430-526::version=v2",
+  }), [
+    "read_file::src/main.js::235-280::version=v3",
+    "read_file::src/main.js::281-331::version=v3",
+  ]);
+  assert.deepEqual(resolveRecoveryContextObservationKeys({
+    recentActivityObservationKey: "read_file::src/main.js::430-526::version=v2",
+  }), [
+    "read_file::src/main.js::430-526::version=v2",
+  ]);
 });
 
 test("a successful mutation invalidates file windows and args-only observations", () => {
@@ -2959,7 +3476,7 @@ test("direct file modification retains structured repair tools until final valid
   });
 
   const sourceChange = resolveIterationToolSurface(makeInput());
-  assert.equal(sourceChange.directFileModifyPhase, "source_change");
+  assert.equal(sourceChange.directEditPhase, "inspect");
   assert.equal(sourceChange.availableToolNames.has("read_file"), true);
   assert.equal(sourceChange.availableToolNames.has("replace_in_file"), true);
   assert.equal(sourceChange.availableToolNames.has("write_file"), true);
@@ -2979,7 +3496,7 @@ test("direct file modification retains structured repair tools until final valid
     sourceTool: "apply_patch",
     createdAt: 1,
   }]));
-  assert.equal(validation.directFileModifyPhase, "validation");
+  assert.equal(validation.directEditPhase, "validate");
   assert.deepEqual(
     validation.iterationAllTools.map((tool) => tool.function.name),
     ["read_file", "replace_in_file", "write_file", "apply_patch", "run_command"],
@@ -3000,8 +3517,8 @@ test("direct file modification retains structured repair tools until final valid
     detail: "tool_unavailable_for_turn_phase",
   }]));
   assert.equal(
-    blockedMutation.directFileModifyPhase,
-    "source_change",
+    blockedMutation.directEditPhase,
+    "inspect",
     "policy/internal feedback without a successful write cannot advance the mutation phase",
   );
 
@@ -3011,14 +3528,14 @@ test("direct file modification retains structured repair tools until final valid
     status: "called",
     detail: "NO_EFFECT_MUTATION",
   }]));
-  assert.equal(noEffectMutation.directFileModifyPhase, "source_change");
+  assert.equal(noEffectMutation.directEditPhase, "inspect");
 
   const planArtifactActivity = resolveIterationToolSurface(makeInput([{
     name: "write_file",
     target: ".MAIN/plans/plan.md",
     status: "succeeded",
   }]));
-  assert.equal(planArtifactActivity.directFileModifyPhase, "source_change");
+  assert.equal(planArtifactActivity.directEditPhase, "inspect");
 
   const failedDurableMutation = resolveIterationToolSurface(makeInput([], [{
     id: "failed-source-change",
@@ -3031,8 +3548,8 @@ test("direct file modification retains structured repair tools until final valid
     createdAt: 2,
   }]));
   assert.equal(
-    failedDurableMutation.directFileModifyPhase,
-    "source_change",
+    failedDurableMutation.directEditPhase,
+    "inspect",
     "failed durable evidence cannot claim that a workspace mutation occurred",
   );
 });
@@ -3273,7 +3790,7 @@ test("finite validation checkpoint accepts output merging but not compound shell
   );
 });
 
-test("collaboration availability is semantic, optional, and independent of path topology", () => {
+test("enabled collaboration owns one real initial spawn and then restores normal tools", () => {
   const tools = [
     "read_file",
     "spawn_subagent",
@@ -3346,14 +3863,11 @@ test("collaboration availability is semantic, optional, and independent of path 
   }));
   assert.equal(preferred.delegationDecision.action, "admit");
   assert.equal(preferred.delegationDecision.reason, "explicit_preference");
-  assert.equal("preferredDelegationRequirement" in preferred, false);
-  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "read_file"));
-  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "apply_patch"));
-  assert.ok(preferred.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"));
-  assert.equal(
-    preferred.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"),
-    false,
-    "the model keeps normal phase tools and is not forced to spawn or immediately wait",
+  assert.equal(preferred.preferredDelegationRequired, true);
+  assert.deepEqual(
+    preferred.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+    "the collaboration toggle is a one-shot start boundary, not an optional hint",
   );
 
   const pending = resolveIterationToolSurface(makeInput({
@@ -3368,6 +3882,7 @@ test("collaboration availability is semantic, optional, and independent of path 
       subagentPreference: "preferred",
     },
   }));
+  assert.equal(pending.preferredDelegationRequired, false);
   assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "read_file"));
   assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"));
   assert.ok(pending.iterationAllTools.some((tool) => tool.function.name === "cancel_subagent"));
@@ -3402,7 +3917,114 @@ test("collaboration availability is semantic, optional, and independent of path 
   }));
   assert.equal(mutation.delegationDecision.phase, "mutation");
   assert.equal(mutation.delegationDecision.action, "admit");
-  assert.ok(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"));
+  assert.equal(mutation.preferredDelegationRequired, true);
+  assert.deepEqual(
+    mutation.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+  );
+
+  const recovery = resolveIterationToolSurface(makeInput({
+    executeRecoveryMode: "action_plus_targeting",
+    executeRecoveryReason: "no_progress_strategy_pivot",
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(recovery.preferredDelegationRequired, true);
+  assert.deepEqual(
+    recovery.iterationAllTools.map((tool) => tool.function.name),
+    ["spawn_subagent"],
+    "recovery cannot release parent tools before the preferred child starts",
+  );
+});
+
+test("a preferred collaboration checkpoint is not deferred by an active recovery transaction", async () => {
+  const registry = {
+    tools: {
+      ...partitionToolCapabilityRegistry.tools,
+      spawn_subagent: {
+        key: "spawn_subagent",
+        name: "spawn_subagent",
+        source: "built_in",
+        category: "agent",
+        risk: "read_only",
+        enabled: true,
+        autoExecutable: true,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const executeRecoveryState = {
+    mode: "action_plus_targeting",
+    reason: "execute_convergence_prompt",
+    expectedTarget: null,
+    attempts: 1,
+    iterationCount: 1,
+  };
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "preferred-child",
+      name: "spawn_subagent",
+      arguments: JSON.stringify({
+        task_kind: "explore",
+        objective: "Inspect the editor and file-save flow",
+        access_mode: "read",
+        allowed_paths: "src",
+      }),
+    }],
+    availableToolNames: new Set(["spawn_subagent"]),
+    toolCapabilityRegistry: registry,
+    executeRecoveryState,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(
+      executeRecoveryState.mode,
+      executeRecoveryState,
+    ),
+  }));
+
+  assert.deepEqual(result.readOnlyCalls.map((call) => call.id), ["preferred-child"]);
+  assert.equal(result.preExecutionResults.length, 0);
+});
+
+test("completed collaboration remains started after pending children join", () => {
+  const baseCallbacks = {
+    getCurrentTurnId: () => "turn-current",
+    getPendingSubagentIds: () => [],
+    getSessionKey: () => "session-current",
+    getSubagentClosureReceiptLedger: () => null,
+    getTurnRuntimeCheckpoint: () => null,
+  };
+  assert.equal(hasStartedCollaborationForCurrentTurn(baseCallbacks), false);
+  assert.equal(hasStartedCollaborationForCurrentTurn({
+    ...baseCallbacks,
+    getTurnRuntimeCheckpoint: () => ({
+      owner: {
+        turnId: "turn-current",
+        sessionKey: "session-current",
+      },
+      planning: {
+        collaborationLedger: {
+          entries: [{ state: "closed" }],
+        },
+      },
+    }),
+  }), true);
+  assert.equal(hasStartedCollaborationForCurrentTurn({
+    ...baseCallbacks,
+    getSubagentClosureReceiptLedger: () => ({
+      owner: { sessionKey: "session-current" },
+      receipts: [{ owner: { parentTurnId: "turn-current" } }],
+    }),
+  }), true);
+  assert.equal(hasStartedCollaborationForCurrentTurn({
+    ...baseCallbacks,
+    getSubagentClosureReceiptLedger: () => ({
+      owner: { sessionKey: "other-session" },
+      receipts: [{ owner: { parentTurnId: "turn-current" } }],
+    }),
+  }), false, "a stale Session receipt cannot satisfy the current Turn");
 });
 
 test("parent mutation requires every delegated source window, not only the latest one", () => {
@@ -3749,7 +4371,7 @@ test("child-owned source references require a parent-visible targeted read befor
         key: "parent-window",
         path: "src/App.tsx",
         requestSignature: "read_file::src/App.tsx::1-40",
-        versionToken: "120:2",
+        versionToken: "120:3",
         source: "fresh",
       },
       window: {
@@ -3763,6 +4385,136 @@ test("child-owned source references require a parent-visible targeted read befor
   });
   assert.equal(parentObserved.preExecutionResults.length, 0);
   assert.equal(parentObserved.writeCalls.length, 1);
+});
+
+test("parent reread recovery preserves the exact delegated window selected by the mutation gate", () => {
+  const selected = {
+    target: "src/main.js",
+    requestedRange: {
+      startLine: 1001,
+      endLine: 1123,
+      maxLines: 123,
+    },
+    observedVersion: null,
+    sourceObservationKey: "src/main.js:1001-1123:v1",
+  };
+  const requirement = resolveParentSourceRereadRequirement({
+    results: [{
+      toolCallId: "deferred-parent-write",
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "PARENT_SOURCE_REREAD_REQUIRED",
+      isError: false,
+      internalFeedback: true,
+      qualityGateReason: "subagent_parent_reread_required",
+      parentSourceRereadRequirement: selected,
+    }],
+    recentToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      delegatedObservation: {
+        owner: {
+          agentKind: "subagent",
+          subagentId: "subagent-other-window",
+        },
+        sourceObservationKey: "src/main.js:1-1000:v1",
+        sourceRange: {
+          startLine: 1,
+          endLine: 1000,
+          totalLines: 1123,
+          truncated: true,
+        },
+        parentContextState: "reference_only",
+        requiresParentReread: true,
+      },
+    }],
+  });
+
+  assert.deepEqual(requirement, selected);
+});
+
+test("a current parent recovery source supersedes stale disjoint child windows", () => {
+  const modelContent = [
+    "READ_FILE_RESULT",
+    "path: src/main.js",
+    "returnedLines: 470-510",
+    "---CONTENT START---",
+    "await invoke('save_file_content', { file_path: filePath, content });",
+    "---CONTENT END---",
+  ].join("\n");
+  const delegatedActivity = {
+    name: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    delegatedObservation: {
+      owner: {
+        agentKind: "subagent",
+        subagentId: "subagent-old-window",
+      },
+      sourceObservationKey: "child-window",
+      sourceRange: {
+        startLine: 1001,
+        endLine: 1123,
+        totalLines: 1123,
+        truncated: true,
+      },
+      parentContextState: "reference_only",
+      requiresParentReread: true,
+    },
+  };
+  const fileReadStates = new Map([["parent-repair-window", {
+    signature: "parent-repair-window",
+    path: "src/main.js",
+    argsKey: "start=470",
+    contentHash: "parent-hash",
+    contentLength: modelContent.length,
+    sizeBytes: 200,
+    modifiedMs: 2,
+    modelContent,
+    observation: {
+      key: "parent-repair-window",
+      path: "src/main.js",
+      requestSignature: "read_file::src/main.js::470-510",
+      versionToken: "200:2",
+      source: "fresh",
+    },
+    window: {
+      startLine: 470,
+      endLine: 510,
+      totalLines: 1123,
+      truncated: true,
+    },
+    updatedAt: Date.now(),
+  }]]);
+
+  assert.equal(findDelegatedObservationRequiringParentReread({
+    mutationTargets: ["src/main.js"],
+    recentToolActivity: [delegatedActivity],
+    fileReadStates,
+    managedAgentMessages: [{ role: "user", content: modelContent }],
+    executeRecoveryState: {
+      ...createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+      mode: "mutation_first",
+      reason: "failed_finite_validation_requires_repair",
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "parent-repair-window",
+    },
+  }), null);
+
+  assert.equal(findDelegatedObservationRequiringParentReread({
+    mutationTargets: ["src/main.js"],
+    recentToolActivity: [delegatedActivity],
+    fileReadStates,
+    managedAgentMessages: [{ role: "user", content: modelContent }],
+    executeRecoveryState: {
+      ...createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+      mode: "mutation_first",
+      reason: "failed_finite_validation_requires_repair",
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "different-window",
+    },
+  }), delegatedActivity);
 });
 
 test("iteration tool planning derives action-plus PTY and browser surfaces from the lifecycle ledger", () => {
@@ -4099,6 +4851,13 @@ test("finite validation checkpoints persist command, cwd, and timeout in the act
       cwd: "src-tauri/",
       timeoutMs: 120000,
     },
+    finiteValidationFailureDetail:
+      " \u0000src-tauri/src/main.rs:42:7\nexpected `file_path` ",
+    finiteValidationDiagnosticTargets: [
+      "src-tauri\\src\\main.rs",
+      "src-tauri/src/main.rs",
+      "",
+    ],
     validationMutationReopenCount: 2.9,
     validationMutationReopenFingerprints: [" Edit:A ", "edit:a", "EDIT:B"],
     objectiveMutationEvidence: [
@@ -4122,22 +4881,33 @@ test("finite validation checkpoints persist command, cwd, and timeout in the act
     cwd: "src-tauri",
     timeoutMs: 120000,
   });
+  assert.equal(
+    checkpoint?.finiteValidationFailureDetail,
+    "src-tauri/src/main.rs:42:7\nexpected `file_path`",
+  );
+  assert.deepEqual(
+    checkpoint?.finiteValidationDiagnosticTargets,
+    ["src-tauri/src/main.rs"],
+  );
   assert.equal(checkpoint?.validationMutationReopenCount, 2);
   assert.deepEqual(checkpoint?.validationMutationReopenFingerprints, ["edit:a", "edit:b"]);
-  assert.deepEqual(checkpoint?.objectiveMutationEvidence, [{
+  assert.deepEqual(checkpoint?.directEditTransaction?.mutations, [{
     target: "src-tauri/src/main.rs",
     requirementRef: "REQ-RUST",
   }]);
-  assert.equal(checkpoint?.objectiveObligationId, "requirement:REQ-RUST");
-  assert.equal(checkpoint?.objectiveRevision, 3);
-  assert.equal(checkpoint?.objectiveKind, "requirement");
-  assert.deepEqual(checkpoint?.objectiveExpectedTargets, ["src-tauri/src/main.rs"]);
-  assert.deepEqual(checkpoint?.objectiveValidationEvidence, {
+  assert.equal(checkpoint?.directEditTransaction?.obligationId, "requirement:REQ-RUST");
+  assert.equal(checkpoint?.directEditTransaction?.revision, 3);
+  assert.equal(checkpoint?.directEditTransaction?.kind, "requirement");
+  assert.deepEqual(
+    checkpoint?.directEditTransaction?.expectedTargets,
+    ["src-tauri/src/main.rs"],
+  );
+  assert.deepEqual(checkpoint?.directEditTransaction?.validation, {
     tool: "run_command",
     target: "cargo check",
     revision: 3,
   });
-  assert.equal(checkpoint?.objectiveClosurePending, true);
+  assert.equal(checkpoint?.directEditTransaction?.phase, "validate");
   const contract = resolveExecuteRecoveryActionContract("validation_only", {
     expectedTarget: checkpoint?.expectedTarget,
     decisionCheckpoint: checkpoint,
@@ -4193,7 +4963,7 @@ test("failed finite validation recovery preserves explicit command evidence", ()
   assert.match(runtimeOwnedPrompt, /one compatible finite command/);
 });
 
-test("finite validation repair binds only a uniquely attributed diagnostic path", () => {
+test("finite validation repair binds an explicitly attributed diagnostic path", () => {
   const attributed = resolveFiniteValidationRepairTarget({
     result: {
       name: "run_command",
@@ -4224,6 +4994,65 @@ test("finite validation repair binds only a uniquely attributed diagnostic path"
   });
   assert.equal(inlineAttributed, "src/main.js");
 
+  assert.deepEqual(resolveFiniteValidationRepairTargets({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stderr: [
+          "error: Unexpected `}`",
+          "  --> /Users/test/Vibe Coding Projects/MD Viewer/src/main.js:424:1",
+        ].join("\n"),
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/Users/test/Vibe Coding Projects/MD Viewer",
+  }), ["src/main.js"], "a workspace name with spaces cannot manufacture a fake suffix owner");
+
+  assert.deepEqual(resolveFiniteValidationRepairTargets({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stderr: "  --> /Users/test/Developer Workspace/Project/src/main.js:20:4",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/Users/test/Developer Workspace/Project",
+  }), ["src/main.js"], "spaces in a parent directory are normalized by the full workspace prefix");
+
+  assert.deepEqual(resolveFiniteValidationRepairTargets({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stderr: "Build failed in /Users/test/Vibe Coding Projects/MD Viewer/src/main.js",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/Users/test/Vibe Coding Projects/MD Viewer",
+  }), ["src/main.js"], "an inline absolute path is captured as one workspace-relative owner");
+
+  assert.deepEqual(resolveFiniteValidationRepairTargets({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stderr: "Repair Viewer/src/main.js and src/main.js.",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/Users/test/Vibe Coding Projects/MD Viewer",
+  }), ["Viewer/src/main.js", "src/main.js"], "a legal workspace subdirectory is never discarded as a path-suffix heuristic");
+
   const multiOwner = resolveFiniteValidationRepairTarget({
     result: {
       name: "run_command",
@@ -4240,8 +5069,177 @@ test("finite validation repair binds only a uniquely attributed diagnostic path"
   assert.equal(
     multiOwner,
     null,
-    "multiple diagnostic owners must retain a workspace-scoped repair",
+    "multiple explicit owners remain a bounded candidate set instead of locking mutation to the first path",
   );
+  assert.deepEqual(resolveFiniteValidationRepairTargets({
+    result: {
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({
+        exitCode: 1,
+        stdout: "Repair src/main.js and src/components/editor.js before rerunning.",
+      }),
+      isError: true,
+    },
+    args: { command: "npm run build", cwd: "." },
+    workspace: "/workspace",
+  }), ["src/main.js", "src/components/editor.js"]);
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: ["src/main.js", "src/components/editor.js"],
+    checkpoint: null,
+  }), "src/main.js", "a structured multi-owner failure is serialized instead of losing its target");
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: ["src/main.js", "src/components/editor.js"],
+    checkpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      objectiveExpectedTargets: ["src/main.js"],
+      objectiveMutationEvidence: [{ target: "src/main.js" }],
+    },
+  }), "src/main.js", "the first owner in a fresh validation remains authoritative despite older mutation receipts");
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: ["src/main.js", "src/components/editor.js"],
+    checkpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      objectiveExpectedTargets: ["src/main.js", "src/components/editor.js"],
+      objectiveMutationEvidence: [
+        { target: "src/main.js" },
+        { target: "src/components/editor.js" },
+      ],
+    },
+  }), "src/main.js", "a current failure is not skipped merely because every owner was edited before");
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: ["src/main.js", "src/components/editor.js"],
+    checkpoint: {
+      expectedTarget: "src/components/editor.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      objectiveExpectedTargets: ["src/main.js", "src/components/editor.js"],
+      objectiveMutationEvidence: [
+        { target: "src/main.js" },
+        { target: "src/components/editor.js" },
+      ],
+    },
+  }), "src/main.js", "validation order is stable instead of rotating from stale expected-target state");
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: [],
+    checkpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      objectiveExpectedTargets: ["src/components/editor.js", "src/main.js"],
+      objectiveMutationEvidence: [{ target: "src/components/editor.js" }],
+    },
+  }), "src/main.js", "an unattributed retry may continue an explicit unfinished objective target");
+  assert.equal(resolveNextFiniteValidationRepairTarget({
+    diagnosticTargets: [],
+    checkpoint: null,
+  }), null, "an unattributed failure without an objective remains targetless");
+
+  const compactedDiagnostic = compactFiniteValidationDiagnostic([
+    "vite build started",
+    "\u001b[31m" + "x".repeat(5_000) + "\u001b[0m",
+    "FINAL_ACCEPTANCE: src/main.js and src/components/editor.js remain broken",
+  ].join("\n"), 2_400);
+  assert.ok(compactedDiagnostic.length <= 2_400);
+  assert.match(compactedDiagnostic, /vite build started/);
+  assert.match(compactedDiagnostic, /diagnostic middle omitted/);
+  assert.match(compactedDiagnostic, /FINAL_ACCEPTANCE/);
+  assert.match(compactedDiagnostic, /src\/components\/editor\.js/);
+  assert.doesNotMatch(compactedDiagnostic, /\u001b\[/);
+
+  const repeatedDiagnosticAttempt = resolveFiniteValidationRepairAttempt({
+    currentDiagnostic:
+      "src/main.js:416:1 - pristine initial tab is still appended",
+    previousDiagnostic:
+      "src/main.js:416:1 - pristine initial tab is still appended",
+    currentTarget: "src/main.js",
+    previousTarget: "./src/main.js",
+    previousCount: MAX_VALIDATION_MUTATION_REOPENS,
+  });
+  assert.equal(
+    repeatedDiagnosticAttempt.count,
+    MAX_VALIDATION_MUTATION_REOPENS + 1,
+    "the same normalized diagnostic remains a consecutive retry",
+  );
+  assert.equal(repeatedDiagnosticAttempt.diagnosticChanged, false);
+  assert.match(repeatedDiagnosticAttempt.diagnosticFingerprint, /^[0-9a-f]+$/);
+  assert.equal(
+    repeatedDiagnosticAttempt.budgetExhausted,
+    true,
+    "the ninth reopen of one unchanged diagnostic is paused",
+  );
+
+  const changedDiagnosticAttempt = resolveFiniteValidationRepairAttempt({
+    currentDiagnostic:
+      "src/main.js:433:1 - existing-file save must invoke save_file_content",
+    previousDiagnostic:
+      "src/main.js:416:1 - pristine initial tab is still appended",
+    currentTarget: "src/main.js",
+    previousTarget: "src/main.js",
+    previousCount: MAX_VALIDATION_MUTATION_REOPENS,
+  });
+  assert.equal(changedDiagnosticAttempt.count, 1);
+  assert.equal(changedDiagnosticAttempt.diagnosticChanged, true);
+
+  const movedSyntaxDiagnosticAttempt = resolveFiniteValidationRepairAttempt({
+    currentDiagnostic:
+      "src/main.js:1184:1 - Unexpected end of input",
+    previousDiagnostic:
+      "src/main.js:1197:1 - Unexpected end of input",
+    currentTarget: "src/main.js",
+    previousTarget: "src/main.js",
+    previousCount: MAX_VALIDATION_MUTATION_REOPENS,
+  });
+  assert.equal(
+    movedSyntaxDiagnosticAttempt.diagnosticChanged,
+    false,
+    "volatile source coordinates do not turn the same syntax failure into a new repair epoch",
+  );
+  assert.equal(movedSyntaxDiagnosticAttempt.budgetExhausted, true);
+
+  assert.deepEqual(resolveLatestFiniteValidationMutationRange({
+    target: "src/main.js",
+    activities: [
+      {
+        name: "replace_in_file",
+        target: "src/components/editor.js",
+        status: "succeeded",
+        mutationObserved: true,
+        mutationRange: {
+          path: "src/components/editor.js",
+          startLine: 20,
+          endLine: 24,
+          maxLines: 5,
+        },
+      },
+      {
+        name: "write_file",
+        target: "src/main.js",
+        status: "succeeded",
+        mutationObserved: true,
+        mutationRange: {
+          path: "src/main.js",
+          startLine: 410,
+          endLine: 420,
+          maxLines: 11,
+        },
+      },
+    ],
+  }), {
+    startLine: 378,
+    endLine: 452,
+    maxLines: 75,
+  });
+  assert.equal(
+    changedDiagnosticAttempt.budgetExhausted,
+    false,
+    "a different remaining diagnostic starts a fresh consecutive budget",
+  );
+  assert.match(changedDiagnosticAttempt.diagnosticFingerprint, /^[0-9a-f]+$/);
 
   const objectiveLevel = resolveFiniteValidationRepairTarget({
     result: {
@@ -4309,6 +5307,15 @@ test("failed finite validation recovery distinguishes invocation errors from rea
   assert.equal(classifyFailedFiniteValidationOutcome({
     result: JSON.stringify({ exitCode: 127, stderr: "tool: command not found" }),
   }), "invocation_error");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: "npm notice run vite build\nsh: vite: command not found",
+  }), "invocation_error");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({
+      exitCode: 1,
+      stderr: "AssertionError: expected 'command not found' but received a validation error",
+    }),
+  }), "validation_failure");
   assert.equal(classifyFailedFiniteValidationOutcome({
     result: JSON.stringify({ exitCode: 1, stderr: "npm error Missing script: build" }),
   }), "invocation_error");
@@ -4384,6 +5391,139 @@ test("real validation failure grants one current-version repair read before muta
   assert.equal(contract.allowedToolNames.has("read_file"), true);
   assert.equal(contract.allowedToolNames.has("replace_in_file"), false);
   assert.equal(contract.allowedToolNames.has("run_command"), false);
+});
+
+test("validation diagnostics narrow repair reads around the exact compiler location", () => {
+  assert.deepEqual(resolveFailedValidationDiagnosticRange({
+    target: "src/main.js",
+    diagnosticText: [
+      "vite build failed",
+      "src/main.js (377:12): Failed to parse source for import analysis",
+    ].join("\n"),
+  }), {
+    startLine: 329,
+    endLine: 425,
+    maxLines: 97,
+  });
+  assert.deepEqual(resolveFailedValidationDiagnosticRange({
+    target: "src/main.js",
+    diagnosticText:
+      "file: /private/tmp/MD Viewer/src/main.js:377:12\nUnexpected token",
+  }), {
+    startLine: 329,
+    endLine: 425,
+    maxLines: 97,
+  });
+
+  const lease = buildFailedValidationRepairReadLease({
+    target: "src/main.js",
+    sourceObservationKey:
+      "read_file::src/main.js::[[\"end_line\",1000],[\"start_line\",1]]::version=old",
+    diagnosticText:
+      "src/main.js (377:12): Failed to parse source for import analysis",
+  });
+  assert.deepEqual(lease.requestedRange, {
+    startLine: 329,
+    endLine: 425,
+    maxLines: 97,
+  }, "the current failure location must replace an unrelated stale read window");
+
+  const unlocatedLease = buildFailedValidationRepairReadLease({
+    target: "src/main.js",
+    sourceObservationKey:
+      "read_file::src/main.js::[[\"end_line\",573],[\"max_lines\",97],[\"start_line\",477]]::version=old",
+    diagnosticText:
+      "[vite:build-import-analysis] src/main.js: Failed to parse source for import analysis because content contains invalid JS syntax",
+    preferredRange: { startLine: 378, endLine: 452, maxLines: 75 },
+  });
+  assert.deepEqual(unlocatedLease.requestedRange, {
+    startLine: 378,
+    endLine: 452,
+    maxLines: 75,
+  }, "an unlocated parser failure reopens the latest observed mutation hunk instead of a stale read window");
+
+  assert.equal(resolveFailedValidationDiagnosticRange({
+    target: "src/components/toolbar.js",
+    diagnosticText: "src/main.js (377:12): Unexpected token",
+  }), null);
+});
+
+test("validation repair does not transfer a stale line range across file owners", () => {
+  const lease = buildFailedValidationRepairReadLease({
+    target: "src/components/toolbar.js",
+    sourceObservationKey:
+      "read_file::/workspace/src/main.js::[[\"end_line\",450],[\"max_lines\",171],[\"start_line\",280]]::version=100:10::content=old",
+  });
+  assert.deepEqual(lease, {
+    purpose: "context_restore",
+    target: "src/components/toolbar.js",
+    state: "available",
+  });
+});
+
+test("runtime-owned recovery bypasses model choice only with one complete deterministic call", () => {
+  const validationContract = resolveExecuteRecoveryActionContract("validation_only", {
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: {
+        command: "npm run build",
+        cwd: ".",
+        timeoutMs: 120_000,
+      },
+    },
+  });
+  assert.deepEqual(resolveRuntimeOwnedRecoveryAction({
+    contract: validationContract,
+    activeToolNames: ["run_command"],
+  }), {
+    toolName: "run_command",
+    checkpointKind: "finite_validation",
+    arguments: {
+      command: "npm run build",
+      cwd: ".",
+      description: "Run the runtime-pinned finite validation: npm run build",
+      timeout_ms: 120_000,
+    },
+  });
+
+  const readContract = resolveExecuteRecoveryActionContract("patch_recovery_read", {
+    expectedTarget: "src/components/toolbar.js",
+    readLease: {
+      purpose: "context_restore",
+      target: "src/components/toolbar.js",
+      requestedRange: { startLine: 120, endLine: 150, maxLines: 31 },
+      state: "available",
+    },
+  });
+  assert.deepEqual(resolveRuntimeOwnedRecoveryAction({
+    contract: readContract,
+    activeToolNames: ["read_file"],
+  }), {
+    toolName: "read_file",
+    checkpointKind: "targeted_read",
+    arguments: {
+      path: "src/components/toolbar.js",
+      start_line: 120,
+      end_line: 150,
+      max_lines: 31,
+    },
+  });
+  assert.equal(resolveRuntimeOwnedRecoveryAction({
+    contract: readContract,
+    activeToolNames: ["read_file", "grep_search"],
+  }), null);
+  assert.equal(resolveRuntimeOwnedRecoveryAction({
+    contract: {
+      ...readContract,
+      readLease: {
+        ...readContract.readLease,
+        target: "src/main.js",
+      },
+    },
+    activeToolNames: ["read_file"],
+  }), null);
 });
 
 test("latest Execute incident keeps an unbounded parent reread satisfiable and the workspace surface stable", () => {
@@ -4590,25 +5730,147 @@ test("mutation mismatch grants only a precise one-shot read and otherwise reuses
       mutationPreflightReason: "empty_change",
     }],
   });
-  assert.equal(noEffectDecision?.mode, "mutation_first");
+  assert.equal(noEffectDecision?.mode, "action_plus_targeting");
   assert.equal(noEffectDecision?.reason, "mutation_preflight_no_effect");
   assert.equal(noEffectDecision?.readLease, null);
   assert.equal(
     noEffectDecision?.protocolNoProgressFingerprint,
     "mutation_no_effect::src/main.js",
   );
+  assert.equal(noEffectDecision?.decisionCheckpoint.expectedTarget, null);
+  assert.equal(
+    noEffectDecision?.decisionCheckpoint.nextRequiredCapability,
+    "targeting",
+  );
   const noEffectPrompt = buildExecuteRecoveryPrompt({
     language: "zh",
     reason: noEffectDecision.reason,
     contract: resolveExecuteRecoveryActionContract(noEffectDecision.mode, {
-      expectedTarget: noEffectDecision.target,
+      expectedTarget: noEffectDecision.decisionCheckpoint.expectedTarget,
       sourceObservationKey: noEffectDecision.sourceObservationKey,
       decisionCheckpoint: noEffectDecision.decisionCheckpoint,
     }),
     repeatedTargets: [noEffectDecision.target],
   });
   assert.match(noEffectPrompt, /没有产生任何状态变化/);
-  assert.match(noEffectPrompt, /不要重读/);
+  assert.match(noEffectPrompt, /目标绑定已解除/);
+
+  const validationOwnedNoEffectDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "mutation_first",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src/main.js::save-as-current",
+      nextRequiredCapability: "mutation",
+      pendingFiniteValidation: {
+        command: "npm run build",
+        cwd: ".",
+      },
+      finiteValidationFailureDetail:
+        "src/main.js:491:1 - save_file_content caller payloads must use filePath",
+      finiteValidationDiagnosticTargets: ["src/main.js"],
+    },
+    retainedSourceObservation: {
+      key: "src/main.js::save-as-current",
+      path: "src/main.js",
+      requestSignature: "read_file::src/main.js::470-520",
+      versionToken: "v3",
+      source: "fresh",
+    },
+    results: [{
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+      isError: true,
+      lifecycleState: "blocked",
+      mutationPreflightReason: "empty_change",
+    }],
+  });
+  assert.equal(validationOwnedNoEffectDecision?.mode, "mutation_first");
+  assert.equal(
+    validationOwnedNoEffectDecision?.decisionCheckpoint.expectedTarget,
+    "src/main.js",
+  );
+  assert.equal(
+    validationOwnedNoEffectDecision?.decisionCheckpoint.nextRequiredCapability,
+    "mutation",
+  );
+  assert.equal(
+    validationOwnedNoEffectDecision?.sourceObservationKey,
+    "src/main.js::save-as-current",
+  );
+  const validationOwnedPrompt = buildExecuteRecoveryPrompt({
+    language: "zh",
+    reason: validationOwnedNoEffectDecision.reason,
+    contract: resolveExecuteRecoveryActionContract(
+      validationOwnedNoEffectDecision.mode,
+      {
+        expectedTarget:
+          validationOwnedNoEffectDecision.decisionCheckpoint.expectedTarget,
+        sourceObservationKey:
+          validationOwnedNoEffectDecision.sourceObservationKey,
+        decisionCheckpoint:
+          validationOwnedNoEffectDecision.decisionCheckpoint,
+      },
+    ),
+    repeatedTargets: [validationOwnedNoEffectDecision.target],
+  });
+  assert.match(validationOwnedPrompt, /有限验证仍把具体缺口归因到这个源码所有者/);
+  assert.doesNotMatch(validationOwnedPrompt, /目标绑定已解除/);
+
+  const auditResumeDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "mutation_first",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src/main.js::v2",
+      nextRequiredCapability: "mutation",
+      directEditTransaction: {
+        obligationId: "root:direct-edit",
+        revision: 2,
+        kind: "root",
+        phase: "mutate",
+        expectedTargets: ["src/main.js", "src/components/editor.js"],
+        mutations: [
+          { target: "src/main.js" },
+          { target: "src/components/editor.js" },
+        ],
+        validation: {
+          tool: "run_command",
+          target: "npm run build",
+          revision: 2,
+        },
+      },
+    },
+    retainedSourceObservation: {
+      key: "src/main.js::v2",
+      path: "src/main.js",
+      requestSignature: "read_file::src/main.js",
+      versionToken: "v2",
+      source: "fresh",
+    },
+    results: [{
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+      isError: true,
+      lifecycleState: "blocked",
+      mutationPreflightReason: "empty_change",
+    }],
+  });
+  assert.equal(
+    auditResumeDecision?.mode,
+    "objective_audit",
+    "an ineffective edit after a validated audit read resumes closure instead of starting broad targeting",
+  );
+  assert.equal(auditResumeDecision?.decisionCheckpoint.nextRequiredCapability, "any");
+  assert.equal(
+    auditResumeDecision?.decisionCheckpoint.directEditTransaction?.phase,
+    "audit",
+  );
+  assert.equal(auditResumeDecision?.protocolNoProgressFingerprint, null);
 
   const identicalWriteDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
@@ -4630,6 +5892,27 @@ test("mutation mismatch grants only a precise one-shot read and otherwise reuses
     workflowMode: "edit",
     runtimeIntent: "execute",
     executeRecoveryMode: "normal",
+    decisionCheckpoint: {
+      expectedTarget: "src-tauri/src/main.rs",
+      sourceObservationKey: "main-rs-v1",
+      nextRequiredCapability: "mutation",
+      pendingFiniteValidation: {
+        command: "npm run build",
+        cwd: ".",
+      },
+      finiteValidationFailureDetail:
+        "src-tauri/src/main.rs must keep the open_file_dialog handler",
+      finiteValidationDiagnosticTargets: ["src-tauri/src/main.rs"],
+      directEditTransaction: {
+        obligationId: "root:direct-edit",
+        revision: 2,
+        kind: "root",
+        phase: "mutate",
+        expectedTargets: ["src-tauri/src/main.rs"],
+        mutations: [],
+        validation: null,
+      },
+    },
     results: [{
       name: "replace_in_file",
       target: "src-tauri/src/main.rs",
@@ -4643,6 +5926,22 @@ test("mutation mismatch grants only a precise one-shot read and otherwise reuses
   assert.equal(replaceDecision?.reason, "mutation_preflight_search_text_mismatch");
   assert.equal(replaceDecision?.readLease, null);
   assert.equal(replaceDecision?.decisionCheckpoint.nextRequiredCapability, "mutation");
+  assert.equal(
+    replaceDecision?.decisionCheckpoint.pendingFiniteValidation?.command,
+    "npm run build",
+  );
+  assert.equal(
+    replaceDecision?.decisionCheckpoint.finiteValidationFailureDetail,
+    "src-tauri/src/main.rs must keep the open_file_dialog handler",
+  );
+  assert.deepEqual(
+    replaceDecision?.decisionCheckpoint.finiteValidationDiagnosticTargets,
+    ["src-tauri/src/main.rs"],
+  );
+  assert.equal(
+    replaceDecision?.decisionCheckpoint.directEditTransaction?.revision,
+    2,
+  );
 
   const patchDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
@@ -4785,6 +6084,43 @@ test("mutation mismatch grants only a precise one-shot read and otherwise reuses
   }), null, "an active recovery lease must not be reinitialized by the same failure");
 });
 
+test("a successful exact mutation corrects a weak targeting read but not an explicit read lease", () => {
+  const weakTargetState = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "mutation_first",
+      reason: "read_only_evidence_budget",
+      expectedTarget: "package.json",
+      sourceObservationKey: "package.json::version=v1",
+    },
+  );
+  const corrected = transitionExecuteRecoveryRuntimeState(weakTargetState, {
+    mutationTarget: "src/main.js",
+    mutationTargets: ["src/main.js"],
+    mutationToolName: "replace_in_file",
+  });
+  assert.equal(corrected.transition, "mutation_to_validation");
+  assert.equal(corrected.state.expectedTarget, "src/main.js");
+  assert.equal(corrected.state.sourceObservationKey, null);
+  assert.equal(corrected.state.decisionCheckpoint?.expectedTarget, "src/main.js");
+
+  const leasedTargetState = {
+    ...weakTargetState,
+    readLease: {
+      purpose: "patch_recovery",
+      target: "package.json",
+      state: "consumed",
+    },
+  };
+  const blocked = transitionExecuteRecoveryRuntimeState(leasedTargetState, {
+    mutationTarget: "src/main.js",
+    mutationTargets: ["src/main.js"],
+    mutationToolName: "replace_in_file",
+  });
+  assert.equal(blocked.transition, "none");
+  assert.equal(blocked.state.expectedTarget, "package.json");
+});
+
 test("recovery batch selection serializes different model call shapes by phase", () => {
   const calls = [
     { id: "validate-first", name: "run_command", target: "npm test" },
@@ -4873,6 +6209,12 @@ test("recovery batch selection serializes different model call shapes by phase",
   });
   assert.equal(mutationContract.allowTargetedFileRead, false);
   assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
+  assert.equal(mutationContract.allowedToolNames.has("replace_in_file"), true);
+  assert.equal(mutationContract.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationContract.allowedToolNames.has("write_file"), true);
+  assert.deepEqual(mutationContract.toolCallRequirement, {
+    kind: "required_any",
+  });
   assert.equal(mutationContract.surfaceDescription, "capability:mutation");
 
   const mutationAfterReadNoProgress = resolveExecuteRecoveryActionContract("mutation_first", {
@@ -4886,6 +6228,8 @@ test("recovery batch selection serializes different model call shapes by phase",
   assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("read_file"), false);
   assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("grep_search"), false);
   assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("replace_in_file"), true);
+  assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("write_file"), true);
   assert.equal(mutationAfterReadNoProgress.allowedToolNames.has("run_command"), false);
   assert.equal(
     mutationAfterReadNoProgress.surfaceDescription,
@@ -4909,6 +6253,8 @@ test("recovery batch selection serializes different model call shapes by phase",
   assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("read_file"), false);
   assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("grep_search"), false);
   assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("replace_in_file"), true);
+  assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("write_file"), true);
   assert.equal(mutationAfterNoToolProgress.allowedToolNames.has("run_command"), false);
   assert.equal(
     mutationAfterNoToolProgress.surfaceDescription,
@@ -4953,6 +6299,45 @@ test("recovery batch selection serializes different model call shapes by phase",
     "an unrelated mutation must be deferred before it can write",
   );
   assert.deepEqual(wrongMutationOnly.deferredCallIds, ["wrong-edit"]);
+
+  const correctedWeakTarget = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{
+      id: "anchored-correction",
+      name: "replace_in_file",
+      target: "src/main.js",
+      canRebindTarget: true,
+    }],
+    expectedTarget: "package.json",
+    contract: resolveExecuteRecoveryActionContract("mutation_first", {
+      expectedTarget: "package.json",
+      sourceObservationKey: "package.json::version=v1",
+    }),
+  });
+  assert.equal(correctedWeakTarget.selectedCallId, "anchored-correction");
+  assert.deepEqual(correctedWeakTarget.deferredCallIds, []);
+
+  const leasedTargetCannotBeCorrected = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{
+      id: "wrong-leased-edit",
+      name: "replace_in_file",
+      target: "src/main.js",
+      canRebindTarget: true,
+    }],
+    expectedTarget: "package.json",
+    contract: resolveExecuteRecoveryActionContract("mutation_first", {
+      expectedTarget: "package.json",
+      sourceObservationKey: "package.json::version=v1",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "package.json",
+        state: "consumed",
+      },
+    }),
+  });
+  assert.equal(leasedTargetCannotBeCorrected.selectedCallId, null);
+  assert.deepEqual(leasedTargetCannotBeCorrected.deferredCallIds, ["wrong-leased-edit"]);
 
   const unresolvedPatch = resolveExecuteRecoveryBatchDecision({
     mode: "mutation_first",
@@ -5118,6 +6503,11 @@ test("recovery batch selection serializes different model call shapes by phase",
     toolCallExecutionPhaseSource,
     /refundExecuteRecoveryRuntimeIteration/,
     "policy deferrals and cache stubs must not refresh the recovery budget",
+  );
+  assert.match(
+    toolCallExecutionPhaseSource,
+    /reusesRetainedTargetingObservation[\s\S]*?nextRequiredCapability === "targeting"[\s\S]*?readFileObservation\?\.source === "stub"/,
+    "an explicit targeting read must be able to bind its still-resident version instead of looping on unchanged stubs",
   );
 });
 
@@ -5701,6 +7091,14 @@ test("max-steps final text prompt disables tools for chat final boundary", () =>
     maxIterations: 50,
     alreadyPrompted: false,
   }), false);
+  assert.equal(shouldUseMaxStepsFinalTextOnly({
+    workflowMode: "edit",
+    runtimeIntent: "analyze",
+    isPlanApproved: false,
+    iteration: 6,
+    maxIterations: 6,
+    alreadyPrompted: false,
+  }), true, "a read-only child reserves its final bounded request for synthesis");
 
   const prompt = buildMaxStepsFinalTextPrompt({
     language: "en",
@@ -5818,7 +7216,9 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(toolCallPlanningSource, /adaptiveFileReadAllowed: allowExecuteRecoveryFileRead/);
   assert.match(source, /prepareManagedMessagesForIteration\(\{/);
   assert.match(contextManagementSource, /execute_recovery_context_compacted/);
-  assert.match(contextManagementSource, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
+  assert.match(contextManagementSource, /shouldFocusPinnedMutationRecoveryContext/);
+  assert.match(contextManagementSource, /shouldCompactExecuteRecoveryContext/);
+  assert.match(contextManagementSource, /phaseNoProgressCount === 2/);
   assert.match(contextManagementSource, /execute_recovery_context_skipped/);
   assert.match(
     contextManagementSource,
@@ -5898,6 +7298,35 @@ test("execute recovery does not count fresh file windows toward the cached-read 
   assert.equal(decision.readOnlyActivityCount, 4);
   assert.equal(decision.cachedReadOnlyActivityCount, 1);
   assert.equal(decision.shouldRecover, false);
+});
+
+test("execute recovery does not treat distinct fresh reads as no progress by count alone", () => {
+  const recent = Array.from({ length: 12 }, (_value, index) => ({
+    name: "read_file",
+    status: "succeeded",
+    target: `src/owner-${index}.ts`,
+    detail: `READ_FILE_RESULT lines ${index * 40 + 1}-${(index + 1) * 40}`,
+  }));
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{
+      name: "read_file",
+      target: "src/owner-11.ts",
+      content: "READ_FILE_RESULT lines 441-480\nconst freshEvidence = true;",
+      isError: false,
+    }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 4,
+    minCachedReadOnlyActivities: 3,
+    minRepeatedReadOnlyTargetScore: 6,
+    maxReadOnlyToolChars: 48_000,
+  });
+
+  assert.equal(decision.readOnlyActivityCount, 12);
+  assert.equal(decision.cachedReadOnlyActivityCount, 0);
+  assert.equal(decision.shouldRecover, false);
+  assert.equal(decision.reason, "");
 });
 
 test("execute recovery detects cached reads across changing batch signatures", () => {
@@ -6465,78 +7894,7 @@ test("validation target switches bind a fresh observation or require a missing-w
   assert.equal(observed.readLease.purpose, "context_restore");
 });
 
-test("objective audit defers a new-target mutation until a current source observation is active", async () => {
-  const missing = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/toolbar.js"],
-    knownTargets: ["src/main.js"],
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    readMetadata: async () => null,
-  });
-  assert.deepEqual(missing, ["src/components/toolbar.js"]);
-
-  const newFileCreation = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/new-panel.js"],
-    knownTargets: ["src/main.js"],
-    creationTargets: ["src/components/new-panel.js"],
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async () => ({ status: "absent", metadata: null }),
-  });
-  assert.deepEqual(
-    newFileCreation,
-    [],
-    "an explicitly requested, verified-absent file cannot require an impossible source read",
-  );
-
-  const existingWriteTarget = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/new-panel.js"],
-    knownTargets: ["src/main.js"],
-    creationTargets: ["src/components/new-panel.js"],
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async (target) => ({
-      status: "exists",
-      metadata: { path: target, sizeBytes: 40, modifiedMs: 3 },
-    }),
-  });
-  assert.deepEqual(
-    existingWriteTarget,
-    ["src/components/new-panel.js"],
-    "write_file still requires a current source observation when its target already exists",
-  );
-
-  const unknownWriteTarget = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/new-panel.js"],
-    knownTargets: ["src/main.js"],
-    creationTargets: ["src/components/new-panel.js"],
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async () => ({ status: "unknown", metadata: null }),
-  });
-  assert.deepEqual(
-    unknownWriteTarget,
-    ["src/components/new-panel.js"],
-    "an IPC or permission error is not proof that write_file has a new target",
-  );
-
-  const createOnlyPatchTarget = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/new-panel.js"],
-    knownTargets: ["src/main.js"],
-    createOnlyTargets: ["src/components/new-panel.js"],
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async () => {
-      throw new Error("create-only targets do not use overwrite-capable metadata inference");
-    },
-  });
-  assert.deepEqual(createOnlyPatchTarget, []);
-
+test("workspace mutation parsing distinguishes move destinations from create-only targets", () => {
   const movePatch = [
     "*** Begin Patch",
     "*** Update File: src/main.js",
@@ -6555,53 +7913,6 @@ test("objective audit defers a new-target mutation until a current source observ
     [],
     "Move destinations require explicit absence proof and are not Add File create-only targets",
   );
-  assert.deepEqual(await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: moveTargets,
-    knownTargets: ["src/main.js"],
-    creationTargets: moveCreationTargets,
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async () => ({ status: "absent", metadata: null }),
-  }), []);
-  assert.deepEqual(await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: moveTargets,
-    knownTargets: ["src/main.js"],
-    creationTargets: moveCreationTargets,
-    fileReadStates: new Map(),
-    managedAgentMessages: [],
-    workspace: "/workspace",
-    probeMetadata: async (target) => ({
-      status: "exists",
-      metadata: { path: target, sizeBytes: 20, modifiedMs: 1 },
-    }),
-  }), ["src/moved-main.js"]);
-
-  const source = "function openMarkdownDialog() {}";
-  const fileReadStates = new Map([["toolbar-window", {
-    signature: "toolbar-window",
-    path: "src/components/toolbar.js",
-    argsKey: "{}",
-    contentHash: "toolbar-hash",
-    contentLength: source.length,
-    sizeBytes: 120,
-    modifiedMs: 7,
-    modelContent: source,
-    updatedAt: 10,
-  }]]);
-  const reusable = await objectiveAuditTargetsMissingReadObservation({
-    mutationTargets: ["src/components/toolbar.js"],
-    knownTargets: ["src/main.js"],
-    fileReadStates,
-    managedAgentMessages: [{ role: "tool", content: source }],
-    workspace: "/workspace",
-    readMetadata: async (target) => ({
-      path: target,
-      sizeBytes: 120,
-      modifiedMs: 7,
-    }),
-  });
-  assert.deepEqual(reusable, []);
 });
 
 test("file metadata availability treats only an explicit not-found code as absence", async () => {
@@ -6658,11 +7969,77 @@ test("recovery action cards retain the original turn objective and finite valida
   assert.match(card, /turnObjective=Open the selected Markdown file/);
   assert.match(card, /validationCommand=npm test/);
   assert.match(card, /validationCwd=\./);
-  assert.match(card, /objectiveClosure=pending/);
+  assert.match(card, /objectiveClosure=validate/);
   assert.match(card, /mutationEvidence=src\/main\.js@REQ-OPEN/);
 });
 
-test("objective audit action cards keep a bounded workspace surface and allow no-tool closure", () => {
+test("finite validation action cards bind only complete clauses for the active repair owner", () => {
+  const diagnostic = [
+    "src/main.js must remove the redundant filename update path",
+    "src/main.js and src/components/editor.js still route loading through synthetic input",
+    "src/components/toolbar.js is already correct",
+  ].join("; ");
+  assert.equal(
+    scopeFiniteValidationDiagnosticToTarget({
+      diagnostic,
+      target: "src/components/editor.js",
+    }),
+    "src/main.js and src/components/editor.js still route loading through synthetic input",
+  );
+  assert.equal(
+    scopeFiniteValidationDiagnosticToTarget({
+      diagnostic: [
+        "src/main.js:120:1 - replace the pristine initial tab",
+        "src/main.js:270:1 - save the active file through filePath",
+      ].join("\n"),
+      target: "src/main.js",
+    }),
+    "src/main.js:120:1 - replace the pristine initial tab",
+    "one repair transaction receives one complete same-file diagnostic",
+  );
+  assert.equal(
+    scopeFiniteValidationDiagnosticToTarget({
+      diagnostic:
+        "src/main.js:416:1 - openFiles still appends beside the pristine initial tab; replacement must require exactly one tab with no path, empty content, and isDirty false",
+      target: "src/main.js",
+    }),
+    "src/main.js:416:1 - openFiles still appends beside the pristine initial tab; replacement must require exactly one tab with no path, empty content, and isDirty false",
+    "a pathless continuation belongs to the preceding source-owned diagnostic",
+  );
+
+  const card = buildExecutionActionContractCard({
+    contract: {
+      modeLabel: "mutation_first",
+      phase: "mutation",
+      nextRequiredCapability: "mutation",
+      expectedTarget: "src/components/editor.js",
+      sourceObservationKey: "read_file::src/components/editor.js::[]",
+      readLease: null,
+      decisionCheckpoint: {
+        expectedTarget: "src/components/editor.js",
+        sourceObservationKey: "read_file::src/components/editor.js::[]",
+        nextRequiredCapability: "mutation",
+        validationMutationReopenCount: 2,
+        finiteValidationFailureDetail: diagnostic,
+        finiteValidationDiagnosticTargets: [
+          "src/main.js",
+          "src/components/editor.js",
+        ],
+      },
+      allowedToolNames: new Set(["replace_in_file"]),
+      allowsAllTools: false,
+    },
+    language: "zh",
+    availableToolNames: ["replace_in_file"],
+  });
+  assert.match(card, /activeValidationDiagnostic=src\/main\.js and src\/components\/editor\.js/);
+  assert.match(card, /validationRepairAttempt=2/);
+  assert.match(card, /同一诊断在上一次修改后仍然存在/);
+  assert.doesNotMatch(card, /toolbar\.js is already correct/);
+  assert.match(card, /不要新增与诊断无关的 helper、事件、API、自动保存或回退分支/);
+});
+
+test("objective audit freezes a validated revision and allows read-or-close only", () => {
   const contract = resolveExecuteRecoveryActionContract("objective_audit", {
     expectedTarget: "src/main.js",
     decisionCheckpoint: {
@@ -6678,14 +8055,18 @@ test("objective audit action cards keep a bounded workspace surface and allow no
         tool: "run_command",
         target: "npm test",
         revision: 2,
+        summary: [
+          "Fresh fixture verification passed: the pristine initial tab is replaced on open,",
+          "programmatic loading stays clean, and save_file_content uses the active filePath.",
+        ].join(" "),
       },
       objectiveClosurePending: true,
     },
   });
   assert.equal(contract.allowsAllTools, false);
   assert.equal(contract.allowedToolNames.has("read_file"), true);
-  assert.equal(contract.allowedToolNames.has("replace_in_file"), true);
-  assert.equal(contract.allowedToolNames.has("run_command"), true);
+  assert.equal(contract.allowedToolNames.has("replace_in_file"), false);
+  assert.equal(contract.allowedToolNames.has("run_command"), false);
   assert.equal(contract.allowedToolNames.has("execute_command"), false);
   assert.equal(contract.allowedToolNames.has("send_pty_input"), false);
   assert.equal(contract.allowedToolNames.has("get_pty_status"), false);
@@ -6695,12 +8076,15 @@ test("objective audit action cards keep a bounded workspace surface and allow no
   const card = buildExecutionActionContractCard({
     contract,
     language: "en",
-    availableToolNames: ["read_file", "replace_in_file", "run_command"],
+    availableToolNames: ["read_file", "git_diff"],
     turnObjective: "Finish every requested Open File behavior.",
   });
   assert.match(card, /phase=objective_audit/);
-  assert.match(card, /stable workspace surface restored/i);
-  assert.match(card, /do not repeat an already-successful finite validation through an interactive terminal/i);
+  assert.match(card, /current revision is frozen/i);
+  assert.match(card, /validationObservation=Fresh fixture verification passed/);
+  assert.match(card, /pristine initial tab is replaced on open/);
+  assert.match(card, /save_file_content uses the active filePath/);
+  assert.match(card, /call only read_file/i);
   assert.match(card, /make no tool call and output the final user-facing conclusion summary/i);
   assert.doesNotMatch(card, /Call one tool from availableTools/);
 
@@ -6742,4 +8126,76 @@ test("objective audit action cards keep a bounded workspace surface and allow no
       },
     },
   }), false, "validation from an older objective revision cannot close the audit");
+});
+
+test("successful validation observations retain a bounded semantic conclusion", () => {
+  const noisyPrefix = Array.from(
+    { length: 80 },
+    (_, index) => `build module ${index + 1}`,
+  ).join("\n");
+  const summary = summarizeSuccessfulValidationObservation(JSON.stringify({
+    exitCode: 0,
+    timedOut: false,
+    stdout: [
+      noisyPrefix,
+      "Fresh fixture verification passed: the pristine initial tab is replaced on open, programmatic loading stays clean, and save_file_content uses the active filePath.",
+    ].join("\n"),
+    stderr: "",
+  }), 420);
+  assert.ok(summary.length <= 420);
+  assert.match(summary, /Fresh fixture verification passed/);
+  assert.match(summary, /save_file_content uses the active filePath/);
+  assert.doesNotMatch(summary, /"stdout":/);
+});
+
+test("a fresh objective-audit source review opens one optional edit-or-close surface", () => {
+  const contract = resolveExecuteRecoveryActionContract("objective_audit", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "main-v3",
+      nextRequiredCapability: "mutation",
+      objectiveObligationId: "root:direct-edit",
+      objectiveRevision: 2,
+      objectiveKind: "root",
+      objectiveExpectedTargets: ["src/main.js"],
+      objectiveMutationEvidence: [{ target: "src/main.js" }],
+      objectiveValidationEvidence: {
+        tool: "run_command",
+        target: "npm test",
+        revision: 2,
+      },
+      objectiveClosurePending: true,
+    },
+  });
+
+  assert.equal(contract.phase, "mutation");
+  assert.equal(contract.surfaceDescription, "objective-audit:edit-or-close");
+  assert.equal(contract.allowsAllTools, false);
+  assert.deepEqual([...contract.allowedToolNames], ["replace_in_file"]);
+  assert.deepEqual(contract.toolCallRequirement, { kind: "optional" });
+
+  const card = buildExecutionActionContractCard({
+    contract,
+    language: "en",
+    availableToolNames: ["replace_in_file"],
+    turnObjective: "Finish every requested Open File behavior.",
+  });
+  assert.match(card, /next=correct_or_close/);
+  assert.match(card, /call replace_in_file once/i);
+  assert.match(card, /Otherwise make no tool call/i);
+  assert.match(card, /Do not manufacture a no-op edit/i);
+  assert.equal(objectiveAuditHasCurrentClosureEvidence({
+    mode: "objective_audit",
+    reason: "objective_audit_source_reviewed",
+    expectedTarget: "src/main.js",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "main-v3",
+    decisionCheckpoint: contract.decisionCheckpoint,
+  }), true, "declining the optional correction must preserve audited closure evidence");
 });

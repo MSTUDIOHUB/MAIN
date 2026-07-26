@@ -2,6 +2,7 @@ import {
   isLegacyPostMutationReadLease,
   migrateRecoveryReadLease,
   normalizeRecoveryReadRange,
+  normalizeExecutionDecisionCheckpointSnapshot,
   normalizeExecuteRecoveryMode,
   readEvidenceSatisfiesRecoveryLease,
   resolveExecuteRecoveryActionContract,
@@ -15,6 +16,13 @@ import {
 } from "../../executeRecoveryTools";
 import { isLocalDevServerHealthProbeCommand } from "../../devServerRuntime";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import {
+  directEditTransactionHasCurrentClosureEvidence,
+  recordDirectEditMutation,
+  recordDirectEditValidation,
+  resolveDirectEditTransaction,
+  setDirectEditTransactionPhase,
+} from "../../directEditTransaction";
 
 export const MAX_EXECUTE_RECOVERY_ITERATIONS = 6;
 
@@ -42,6 +50,7 @@ export type ExecuteRecoveryPhaseTransition =
   | "context_version_changed_to_targeting"
   | "validation_progress"
   | "context_to_mutation"
+  | "objective_audit_to_edit_or_close"
   | "mutation_to_validation"
   | "validation_to_objective_audit"
   | "validation_to_normal";
@@ -52,19 +61,164 @@ export interface ExecuteRecoveryObservation {
   mutationTarget?: string | null;
   /** Exact structured changed paths when one mutation updates multiple files. */
   mutationTargets?: string[];
+  mutationToolName?: string | null;
   validationTarget?: string | null;
   validationToolName?: string | null;
+  /** Bounded successful validation semantics retained for objective audit. */
+  validationSummary?: string | null;
   /** Stable observation identity; an unchanged cache stub may replay it. */
   sourceObservationKey?: string | null;
   sourceRequestedRange?: RecoveryReadLease["requestedRange"];
   sourceObservedVersion?: string | null;
   sourceRangeWasRuntimeNarrowed?: boolean;
-  /** Cache stubs may consume a one-shot lease, but never refresh recovery budgets. */
+  /** Cache stubs may confirm unleased targeting, but never consume a read lease. */
   sourceObservationWasCacheStub?: boolean;
 }
 
 export interface PtyObservationPolicyDeferral {
   requestedUrl: string | null;
+}
+
+export interface JoinedSubagentMutationValidationRecovery {
+  expectedTarget: string | null;
+  decisionCheckpoint: ExecutionDecisionCheckpoint;
+}
+
+export interface ExecuteRecoverySourceWindowContinuation {
+  target: string;
+  sourceObservationKey: string;
+  observedVersion: string;
+  requestedRange: NonNullable<RecoveryReadLease["requestedRange"]>;
+  readLease: RecoveryReadLease;
+}
+
+/**
+ * Reopen a bounded source window when a required action stalls with only a
+ * truncated observation. A quarantined read_file request may extend the
+ * window, but it must not skip the still-unseen lines immediately after the
+ * retained observation. Strategy-pivot budgets remain the outer bound, while
+ * the synthetic continuation remains one-shot.
+ */
+export function resolveExecuteRecoverySourceWindowContinuation(input: {
+  state: ExecuteRecoveryRuntimeState;
+  protocolActualToolCalls?: Array<{
+    name?: string | null;
+    arguments?: string | null;
+  }> | null;
+  observations: Array<{
+    key?: string | null;
+    path?: string | null;
+    versionToken?: string | null;
+    source?: "fresh" | "stub" | "replay" | null;
+    window?: {
+      startLine: number;
+      endLine: number;
+      totalLines: number;
+      truncated: boolean;
+    } | null;
+  }>;
+}): ExecuteRecoverySourceWindowContinuation | null {
+  const target = input.state.expectedTarget?.trim() || "";
+  const sourceObservationKey = input.state.sourceObservationKey?.trim() || "";
+  if (
+    input.state.mode === "normal" ||
+    !target ||
+    !sourceObservationKey
+  ) {
+    return null;
+  }
+  const observation = [...input.observations].reverse().find((candidate) =>
+    candidate.key === sourceObservationKey &&
+    candidate.source !== "stub" &&
+    workspacePathsReferToSameFile(candidate.path || "", target)
+  );
+  const window = observation?.window;
+  const observedVersion = observation?.versionToken?.trim() || "";
+  if (
+    !window ||
+    !observedVersion ||
+    window.startLine < 1 ||
+    window.endLine < window.startLine ||
+    window.totalLines <= window.endLine
+  ) {
+    return null;
+  }
+  const requestedReadRange = [...(input.protocolActualToolCalls || [])]
+    .reverse()
+    .flatMap((call) => {
+      if (call.name !== "read_file") return [];
+      try {
+        const parsed = JSON.parse(call.arguments || "{}");
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+        const args = parsed as Record<string, unknown>;
+        if (!workspacePathsReferToSameFile(String(args.path || ""), target)) return [];
+        const range = normalizeRecoveryReadRange(args);
+        return range?.startLine && (range.endLine || range.maxLines) ? [range] : [];
+      } catch {
+        return [];
+      }
+    })[0] || null;
+  if (
+    !requestedReadRange &&
+    input.state.readLease?.purpose === "missing_window"
+  ) {
+    return null;
+  }
+  const coveredWindows = input.observations
+    .filter((candidate) =>
+      candidate.source !== "stub" &&
+      candidate.versionToken === observedVersion &&
+      workspacePathsReferToSameFile(candidate.path || "", target) &&
+      candidate.window
+    )
+    .map((candidate) => candidate.window!)
+    .sort((left, right) => left.startLine - right.startLine);
+  const adjacentStartLine = window.endLine + 1;
+  let startLine = requestedReadRange?.startLine
+    ? Math.min(requestedReadRange.startLine, adjacentStartLine)
+    : adjacentStartLine;
+  let endLine = requestedReadRange
+    ? requestedReadRange.endLine ?? (
+        requestedReadRange.startLine! +
+        Math.max(1, requestedReadRange.maxLines || 1) -
+        1
+      )
+    : startLine + Math.max(1, window.endLine - window.startLine + 1) - 1;
+  startLine = Math.min(Math.max(1, startLine), window.totalLines);
+  endLine = Math.min(Math.max(startLine, endLine), window.totalLines);
+  for (const covered of coveredWindows) {
+    if (covered.endLine < startLine) continue;
+    if (covered.startLine > startLine) {
+      endLine = Math.min(endLine, covered.startLine - 1);
+      break;
+    }
+    startLine = covered.endLine + 1;
+    if (startLine > endLine || startLine > window.totalLines) return null;
+  }
+  const requestedRange = {
+    startLine,
+    endLine,
+    maxLines: endLine - startLine + 1,
+  };
+  const observationKeys = Array.from(new Set([
+    ...(input.state.readLease?.observationKeys || []),
+    sourceObservationKey,
+  ]));
+  return {
+    target,
+    sourceObservationKey,
+    observedVersion,
+    requestedRange,
+    readLease: {
+      purpose: "missing_window",
+      target,
+      requestedRange,
+      observationKey: sourceObservationKey,
+      observationKeys,
+      observedVersion,
+      state: "available",
+    },
+  };
 }
 
 /**
@@ -102,120 +256,85 @@ function resetExecuteRecoveryPhaseProgress<T extends ExecuteRecoveryRuntimeState
   };
 }
 
-function appendObjectiveMutationEvidence(
-  checkpoint: ExecutionDecisionCheckpoint | null,
-  targets: string[],
-): NonNullable<ExecutionDecisionCheckpoint["objectiveMutationEvidence"]> {
-  const requirementRef = checkpoint?.requirementRef?.trim() || null;
-  return targets.reduce<NonNullable<ExecutionDecisionCheckpoint["objectiveMutationEvidence"]>>(
-    (evidence, target) => {
-      const alreadyRecorded = evidence.some((entry) =>
-        workspacePathsReferToSameFile(entry.target, target) &&
-        String(entry.requirementRef || "").toLowerCase() ===
-          String(requirementRef || "").toLowerCase()
-      );
-      return alreadyRecorded
-        ? evidence
-        : [
-            ...evidence,
-            { target, ...(requirementRef ? { requirementRef } : {}) },
-          ].slice(-32);
-    },
-    checkpoint?.objectiveMutationEvidence || [],
-  );
-}
-
-function appendObjectiveExpectedTargets(
-  checkpoint: ExecutionDecisionCheckpoint | null,
-  targets: string[],
-): string[] {
-  return targets.reduce<string[]>((expectedTargets, target) => {
-    if (expectedTargets.some((entry) => workspacePathsReferToSameFile(entry, target))) {
-      return expectedTargets;
-    }
-    return [...expectedTargets, target].slice(-32);
-  }, checkpoint?.objectiveExpectedTargets || []);
-}
-
 function buildObjectiveMutationCheckpoint(input: {
   checkpoint: ExecutionDecisionCheckpoint | null;
   expectedTarget: string | null;
   evidenceTargets: string[];
 }): ExecutionDecisionCheckpoint {
   const checkpoint = input.checkpoint;
-  const requirementRef = checkpoint?.requirementRef?.trim() || null;
-  const planTaskId = checkpoint?.planTaskId?.trim() || null;
-  const objectiveKind: NonNullable<ExecutionDecisionCheckpoint["objectiveKind"]> =
-    requirementRef || planTaskId ? "requirement" : "root";
-  const previousRevision = Math.max(
-    1,
-    Math.floor(Number(checkpoint?.objectiveRevision) || 1),
-  );
-  // A mutation requested after a successful validation opens a genuinely new
-  // objective revision. Validation-stage follow-up edits before any successful
-  // validation stay in the same revision and retain the finite checkpoint.
-  const objectiveRevision = checkpoint?.objectiveValidationEvidence
-    ? previousRevision + 1
-    : previousRevision;
-  const identity = requirementRef
-    ? `requirement:${requirementRef.toLowerCase()}`
-    : planTaskId
-      ? `task:${planTaskId.toLowerCase()}`
-      : checkpoint?.objectiveObligationId?.trim() || "root:direct-edit";
-  const expectedTargets = appendObjectiveExpectedTargets(
-    checkpoint,
-    [
-      ...(input.expectedTarget ? [input.expectedTarget] : []),
-      ...input.evidenceTargets,
-    ],
-  );
   return {
     ...(checkpoint || {
       expectedTarget: input.expectedTarget,
       sourceObservationKey: null,
       nextRequiredCapability: "validation" as const,
     }),
-    objectiveObligationId: identity,
-    objectiveRevision,
-    objectiveKind,
-    objectiveExpectedTargets: expectedTargets,
-    objectiveMutationEvidence: appendObjectiveMutationEvidence(
-      checkpoint,
-      input.evidenceTargets,
-    ),
-    objectiveValidationEvidence: null,
-    objectiveClosurePending: true,
+    directEditTransaction: recordDirectEditMutation({
+      transaction: resolveDirectEditTransaction(checkpoint),
+      expectedTargets: input.expectedTarget ? [input.expectedTarget] : [],
+      mutationTargets: input.evidenceTargets,
+      requirementRef: checkpoint?.requirementRef,
+      planTaskId: checkpoint?.planTaskId,
+    }),
   };
 }
 
-function resolveObjectiveMutationCoverage(input: {
-  checkpoint: ExecutionDecisionCheckpoint | null;
-  expectedTarget: string | null;
-}): { covered: boolean; missingTargets: string[]; kind: "root" | "requirement" } {
-  const checkpoint = input.checkpoint;
-  const kind = checkpoint?.objectiveKind || (
-    checkpoint?.requirementRef || checkpoint?.planTaskId ? "requirement" : "root"
+/**
+ * Rebase a parent recovery transaction after a joined child produced real
+ * workspace mutation evidence.
+ *
+ * A child closure may still be blocked or unverified; that must not be
+ * mistaken for task completion. The changed paths are nevertheless trusted
+ * workspace facts after adoption, so the parent must validate them instead of
+ * continuing the pre-join targeting/no-tool contract.
+ */
+export function resolveJoinedSubagentMutationValidationRecovery(input: {
+  state: ExecuteRecoveryRuntimeState;
+  mutationTargets: readonly string[];
+}): JoinedSubagentMutationValidationRecovery | null {
+  const mutationTargets = input.mutationTargets.reduce<string[]>((targets, value) => {
+    const target = String(value || "").trim().replace(/\\/g, "/");
+    if (
+      !target ||
+      targets.some((entry) => workspacePathsReferToSameFile(entry, target))
+    ) {
+      return targets;
+    }
+    return [...targets, target];
+  }, []);
+  if (mutationTargets.length === 0) return null;
+
+  const previous = input.state.decisionCheckpoint;
+  const retainedExpectedTarget =
+    input.state.expectedTarget?.trim() ||
+    previous?.expectedTarget?.trim() ||
+    null;
+  const expectedTarget = retainedExpectedTarget || (
+    mutationTargets.length === 1 ? mutationTargets[0] : null
   );
-  const expectedTargets = checkpoint?.objectiveExpectedTargets?.length
-    ? checkpoint.objectiveExpectedTargets
-    : input.expectedTarget
-      ? [input.expectedTarget]
-      : [];
-  const requirementRef = checkpoint?.requirementRef?.trim().toLowerCase() || "";
-  const evidence = checkpoint?.objectiveMutationEvidence || [];
-  const missingTargets = expectedTargets.filter((target) => !evidence.some((entry) =>
-    workspacePathsReferToSameFile(entry.target, target) &&
-    (
-      kind === "root" ||
-      !requirementRef ||
-      String(entry.requirementRef || "").trim().toLowerCase() === requirementRef
-    )
-  ));
-  return {
-    covered: expectedTargets.length > 0 && missingTargets.length === 0,
-    missingTargets,
-    kind,
+  const decisionCheckpoint: ExecutionDecisionCheckpoint = {
+    ...(previous || {
+      expectedTarget,
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation" as const,
+    }),
+    expectedTarget,
+    // A child write invalidates any parent source snapshot for the adopted
+    // path. Validation owns the next step; a later diagnostic may reopen a
+    // fresh, explicitly leased read.
+    sourceObservationKey: null,
+    nextRequiredCapability: "validation",
+    directEditTransaction: recordDirectEditMutation({
+      transaction: resolveDirectEditTransaction(previous),
+      expectedTargets: [
+        ...(retainedExpectedTarget ? [retainedExpectedTarget] : []),
+        ...mutationTargets,
+      ],
+      mutationTargets,
+      requirementRef: previous?.requirementRef,
+      planTaskId: previous?.planTaskId,
+    }),
   };
+  return { expectedTarget, decisionCheckpoint };
 }
 
 function buildExecuteRecoveryDecisionCheckpoint(input: {
@@ -226,72 +345,37 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
   evidenceVersion?: string | null;
 }): ExecutionDecisionCheckpoint | null {
   if (!input.expectedTarget && !input.previous) return null;
-  const evidenceVersion = input.evidenceVersion === undefined
-    ? input.previous?.evidenceVersion || null
-    : input.evidenceVersion;
-  const planTaskId = input.previous?.planTaskId?.trim() || null;
-  const requirementRef = input.previous?.requirementRef?.trim() || null;
-  const pendingFiniteValidation = input.previous?.pendingFiniteValidation || null;
-  const validationMutationReopenCount = Math.max(
-    0,
-    Math.floor(Number(input.previous?.validationMutationReopenCount) || 0),
-  );
-  const validationMutationReopenFingerprints =
-    input.previous?.validationMutationReopenFingerprints || [];
-  const objectiveMutationEvidence = input.previous?.objectiveMutationEvidence || [];
-  const objectiveClosurePending = input.previous?.objectiveClosurePending === true;
-  const objectiveObligationId = input.previous?.objectiveObligationId?.trim() || null;
-  const objectiveRevision = Math.max(
-    1,
-    Math.floor(Number(input.previous?.objectiveRevision) || 1),
-  );
-  const objectiveKind = input.previous?.objectiveKind;
-  const objectiveExpectedTargets = input.previous?.objectiveExpectedTargets || [];
-  const objectiveValidationEvidence = input.previous?.objectiveValidationEvidence || null;
-  const browserFailureFingerprint = input.previous?.browserFailureFingerprint || null;
-  const browserFailureCallSignature = input.previous?.browserFailureCallSignature || null;
-  const browserFailureDetail = input.previous?.browserFailureDetail || null;
-  const browserFailedLocator = input.previous?.browserFailedLocator || null;
-  const browserLocatorCandidates = input.previous?.browserLocatorCandidates || [];
-  const browserRequestedUrl = input.previous?.browserRequestedUrl || null;
-  const noProgressStrategyPivots =
-    input.previous?.noProgressStrategyPivots || [];
+  const transactionPhase =
+    input.nextRequiredCapability === "targeting" ||
+    input.nextRequiredCapability === "targeted_read" ||
+    input.nextRequiredCapability === "browser_diagnostic"
+      ? "inspect"
+      : input.nextRequiredCapability === "mutation"
+        ? "mutate"
+        : input.nextRequiredCapability === "any"
+          ? null
+          : "validate";
+  const directEditTransaction = transactionPhase
+    ? setDirectEditTransactionPhase(
+        resolveDirectEditTransaction(input.previous),
+        transactionPhase,
+      )
+    : resolveDirectEditTransaction(input.previous);
   return {
+    // The checkpoint is the transaction state, not a per-phase projection.
+    // Carry it forward as a whole so adding a new owned field cannot silently
+    // erase it at the next context -> mutation -> validation transition.
+    ...(input.previous || {}),
     expectedTarget: input.expectedTarget,
     sourceObservationKey: input.sourceObservationKey,
     nextRequiredCapability: input.nextRequiredCapability,
-    ...(evidenceVersion
-      ? { evidenceVersion }
-      : {}),
-    ...(planTaskId ? { planTaskId } : {}),
-    ...(requirementRef ? { requirementRef } : {}),
-    ...(pendingFiniteValidation ? { pendingFiniteValidation } : {}),
-    ...(validationMutationReopenCount > 0
-      ? { validationMutationReopenCount }
-      : {}),
-    ...(validationMutationReopenFingerprints.length > 0
-      ? { validationMutationReopenFingerprints }
-      : {}),
-    ...(objectiveMutationEvidence.length > 0
-      ? { objectiveMutationEvidence }
-      : {}),
-    ...(objectiveObligationId ? { objectiveObligationId } : {}),
-    ...(input.previous?.objectiveRevision !== undefined ? { objectiveRevision } : {}),
-    ...(objectiveKind ? { objectiveKind } : {}),
-    ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
-    ...(input.previous?.objectiveValidationEvidence !== undefined
-      ? { objectiveValidationEvidence }
-      : {}),
-    ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
-    ...(browserFailureFingerprint ? { browserFailureFingerprint } : {}),
-    ...(browserFailureCallSignature ? { browserFailureCallSignature } : {}),
-    ...(browserFailureDetail ? { browserFailureDetail } : {}),
-    ...(browserFailedLocator ? { browserFailedLocator } : {}),
-    ...(browserLocatorCandidates.length > 0 ? { browserLocatorCandidates } : {}),
-    ...(browserRequestedUrl ? { browserRequestedUrl } : {}),
-    ...(noProgressStrategyPivots.length > 0
-      ? { noProgressStrategyPivots: [...noProgressStrategyPivots] }
-      : {}),
+    ...(input.evidenceVersion === undefined
+      ? {}
+      : {
+          evidenceVersion:
+            String(input.evidenceVersion || "").trim() || null,
+        }),
+    ...(directEditTransaction ? { directEditTransaction } : {}),
   };
 }
 
@@ -315,23 +399,9 @@ function inheritExecuteRecoveryCheckpointIdentity(
     checkpoint.validationMutationReopenFingerprints ??
     previous?.validationMutationReopenFingerprints ??
     [];
-  const objectiveMutationEvidence = checkpoint.objectiveMutationEvidence ??
-    previous?.objectiveMutationEvidence ??
-    [];
-  const objectiveClosurePending = checkpoint.objectiveClosurePending ??
-    previous?.objectiveClosurePending ??
-    false;
-  const objectiveObligationId = checkpoint.objectiveObligationId?.trim() ||
-    previous?.objectiveObligationId?.trim() || null;
-  const objectiveRevision = Math.max(
-    1,
-    Math.floor(Number(checkpoint.objectiveRevision ?? previous?.objectiveRevision) || 1),
-  );
-  const objectiveKind = checkpoint.objectiveKind || previous?.objectiveKind;
-  const objectiveExpectedTargets = checkpoint.objectiveExpectedTargets ??
-    previous?.objectiveExpectedTargets ?? [];
-  const objectiveValidationEvidence = checkpoint.objectiveValidationEvidence ??
-    previous?.objectiveValidationEvidence ?? null;
+  const directEditTransaction =
+    resolveDirectEditTransaction(checkpoint) ||
+    resolveDirectEditTransaction(previous);
   const browserFailureFingerprint = checkpoint.browserFailureFingerprint ||
     previous?.browserFailureFingerprint || null;
   const browserFailureCallSignature = checkpoint.browserFailureCallSignature === undefined
@@ -348,6 +418,10 @@ function inheritExecuteRecoveryCheckpointIdentity(
   const noProgressStrategyPivots = checkpoint.noProgressStrategyPivots ??
     previous?.noProgressStrategyPivots ?? [];
   return {
+    // Unknown-to-this-function checkpoint fields still belong to the active
+    // transaction. Merge the prior snapshot before applying the explicit
+    // activation so future fields cannot be lost to another manual whitelist.
+    ...(previous || {}),
     ...checkpoint,
     ...(planTaskId ? { planTaskId } : {}),
     ...(requirementRef ? { requirementRef } : {}),
@@ -358,20 +432,7 @@ function inheritExecuteRecoveryCheckpointIdentity(
     ...(validationMutationReopenFingerprints.length > 0
       ? { validationMutationReopenFingerprints }
       : {}),
-    ...(objectiveMutationEvidence.length > 0
-      ? { objectiveMutationEvidence }
-      : {}),
-    ...(objectiveObligationId ? { objectiveObligationId } : {}),
-    ...(checkpoint.objectiveRevision !== undefined || previous?.objectiveRevision !== undefined
-      ? { objectiveRevision }
-      : {}),
-    ...(objectiveKind ? { objectiveKind } : {}),
-    ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
-    ...(checkpoint.objectiveValidationEvidence !== undefined ||
-      previous?.objectiveValidationEvidence !== undefined
-      ? { objectiveValidationEvidence }
-      : {}),
-    ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
+    ...(directEditTransaction ? { directEditTransaction } : {}),
     ...(browserFailureFingerprint ? { browserFailureFingerprint } : {}),
     ...(checkpoint.browserFailureCallSignature !== undefined ||
       previous?.browserFailureCallSignature !== undefined
@@ -431,6 +492,10 @@ export function createExecuteRecoveryRuntimeState(input: {
   const phaseNoProgressCount = mode === "normal"
     ? 0
     : Math.max(0, input.forcedState?.phaseNoProgressCount || 0);
+  const restoredDecisionCheckpoint =
+    normalizeExecutionDecisionCheckpointSnapshot(
+      input.forcedState?.decisionCheckpoint,
+    );
   return {
     mode,
     reason: mode === "normal"
@@ -462,9 +527,9 @@ export function createExecuteRecoveryRuntimeState(input: {
             sourceObservationKey:
               input.forcedState?.sourceObservationKey?.trim() || null,
             nextRequiredCapability: "validation",
-            previous: input.forcedState?.decisionCheckpoint || null,
+            previous: restoredDecisionCheckpoint,
           })
-        : input.forcedState?.decisionCheckpoint || null,
+        : restoredDecisionCheckpoint,
   };
 }
 
@@ -511,7 +576,7 @@ export function activateExecuteRecoveryRuntimeState(
   const requestedDecisionCheckpoint = input.decisionCheckpoint === undefined
     ? undefined
     : inheritExecuteRecoveryCheckpointIdentity(
-        input.decisionCheckpoint,
+        normalizeExecutionDecisionCheckpointSnapshot(input.decisionCheckpoint),
         state.decisionCheckpoint,
       );
   const previousContract = resolveExecuteRecoveryActionContract(state.mode, {
@@ -640,6 +705,7 @@ function transitionValidatedObjective(
   state: ExecuteRecoveryRuntimeState,
   validationTarget: string,
   validationToolName: string,
+  validationSummary?: string | null,
 ): {
   state: ExecuteRecoveryRuntimeState;
   transition: ExecuteRecoveryPhaseTransition;
@@ -648,7 +714,8 @@ function transitionValidatedObjective(
 } {
   const checkpoint = state.decisionCheckpoint;
   const target = state.expectedTarget || validationTarget;
-  if (checkpoint?.objectiveClosurePending !== true) {
+  const directEditTransaction = resolveDirectEditTransaction(checkpoint);
+  if (!checkpoint || !directEditTransaction) {
     return {
       state: clearExecuteRecoveryRuntimeState(state),
       transition: "validation_to_normal",
@@ -657,28 +724,26 @@ function transitionValidatedObjective(
     };
   }
 
-  const coverage = resolveObjectiveMutationCoverage({
-    checkpoint,
-    expectedTarget: state.expectedTarget,
+  const validated = recordDirectEditValidation({
+    transaction: directEditTransaction,
+    tool: validationToolName || "validation",
+    target: validationTarget,
+    summary: validationSummary,
+    fallbackTarget: state.expectedTarget,
   });
-  const objectiveRevision = Math.max(
-    1,
-    Math.floor(Number(checkpoint.objectiveRevision) || 1),
-  );
   const verifiedCheckpoint: ExecutionDecisionCheckpoint = {
     ...checkpoint,
-    objectiveRevision,
-    objectiveKind: coverage.kind,
-    objectiveValidationEvidence: {
-      tool: validationToolName || "validation",
-      target: validationTarget,
-      revision: objectiveRevision,
-    },
-    objectiveClosurePending: true,
+    // The exact command has now succeeded. Keep the command as the reusable
+    // acceptance boundary for any audit correction, but retire the failure
+    // diagnosis so it cannot masquerade as an unresolved defect.
+    finiteValidationFailureDetail: null,
+    finiteValidationDiagnosticTargets: [],
+    directEditTransaction: validated.transaction,
   };
 
-  if (!coverage.covered) {
-    const missingTarget = coverage.missingTargets[0] || state.expectedTarget;
+  if (!validated.coverage.covered) {
+    const missingTarget =
+      validated.coverage.missingTargets[0] || state.expectedTarget;
     const readLease: RecoveryReadLease | null = missingTarget
       ? {
           purpose: "missing_window",
@@ -696,6 +761,10 @@ function transitionValidatedObjective(
         sourceObservationKey: null,
         decisionCheckpoint: {
           ...verifiedCheckpoint,
+          directEditTransaction: setDirectEditTransactionPhase(
+            verifiedCheckpoint.directEditTransaction,
+            readLease ? "inspect" : "mutate",
+          ),
           expectedTarget: missingTarget || null,
           sourceObservationKey: null,
           nextRequiredCapability: readLease ? "targeted_read" : "mutation",
@@ -707,7 +776,7 @@ function transitionValidatedObjective(
     };
   }
 
-  if (coverage.kind === "root") {
+  if (validated.coverage.kind === "root") {
     return {
       state: resetExecuteRecoveryPhaseProgress({
         ...state,
@@ -780,6 +849,7 @@ export function transitionExecuteRecoveryRuntimeState(
       transactionState,
       observation.validationTarget,
       observation.validationToolName,
+      observation.validationSummary,
     );
   }
 
@@ -1132,6 +1202,89 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
+    const auditTransaction = resolveDirectEditTransaction(
+      transactionState.decisionCheckpoint,
+    );
+    const repeatsCurrentValidatedAuditTarget = Boolean(
+      state.mode === "objective_audit" &&
+      contextTarget &&
+      expectedTarget &&
+      workspacePathsReferToSameFile(contextTarget, expectedTarget) &&
+      directEditTransactionHasCurrentClosureEvidence(
+        auditTransaction,
+        expectedTarget,
+      ) &&
+      [
+        ...(auditTransaction?.expectedTargets || []),
+        ...(auditTransaction?.mutations.map((entry) => entry.target) || []),
+      ].some((target) =>
+        workspacePathsReferToSameFile(contextTarget, target)
+      )
+    );
+    if (repeatsCurrentValidatedAuditTarget) {
+      // Reading the just-validated owner is the audit's evidence-gathering
+      // step. Keep closure optional, but expose one exact correction primitive
+      // on the next request. Previously this branch returned `none`, leaving
+      // the model permanently on a read-only surface even after it found a
+      // concrete remaining defect.
+      const correctionCheckpoint = buildExecuteRecoveryDecisionCheckpoint({
+        expectedTarget: contextTarget,
+        sourceObservationKey: boundSourceObservationKey,
+        nextRequiredCapability: "mutation",
+        previous: state.decisionCheckpoint,
+        evidenceVersion: observedVersion || previousVersion,
+      });
+      const correctionTransaction = setDirectEditTransactionPhase(
+        resolveDirectEditTransaction(correctionCheckpoint),
+        "audit",
+      );
+      const reviewedState = resetExecuteRecoveryPhaseProgress({
+        ...transactionState,
+        reason: "objective_audit_source_reviewed",
+        expectedTarget: contextTarget,
+        sourceObservationKey: boundSourceObservationKey,
+        readLease: null,
+        // `nextRequiredCapability` opens the optional correction surface, while
+        // the transaction itself stays audited. A no-tool response can therefore
+        // accept the already validated revision; an actual edit records a new
+        // revision and returns to validation.
+        decisionCheckpoint: correctionCheckpoint && correctionTransaction
+          ? {
+              ...correctionCheckpoint,
+              directEditTransaction: correctionTransaction,
+            }
+          : correctionCheckpoint,
+      });
+      return {
+        state: reviewedState,
+        transition: "objective_audit_to_edit_or_close",
+        target: contextTarget,
+        consumedExpectedRead: true,
+      };
+    }
+    if (state.mode === "objective_audit" && contextTarget) {
+      const reopenedState = resetExecuteRecoveryPhaseProgress({
+        ...transactionState,
+        mode: "mutation_first",
+        reason: "objective_audit_source_reopened",
+        expectedTarget: contextTarget,
+        sourceObservationKey: boundSourceObservationKey,
+        readLease: null,
+        decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+          expectedTarget: contextTarget,
+          sourceObservationKey: boundSourceObservationKey,
+          nextRequiredCapability: "mutation",
+          previous: state.decisionCheckpoint,
+          evidenceVersion: observedVersion || previousVersion,
+        }),
+      });
+      return {
+        state: reopenedState,
+        transition: "context_to_mutation",
+        target: contextTarget,
+        consumedExpectedRead: true,
+      };
+    }
     const refreshedState: ExecuteRecoveryRuntimeState = {
         ...transactionState,
         expectedTarget: contextTarget,
@@ -1179,13 +1332,10 @@ export function transitionExecuteRecoveryRuntimeState(
     contract.phase !== "context" &&
     (observation.mutationTarget || observation.mutationTargets?.length)
   ) {
-    if (
-      contract.nextRequiredCapability !== "mutation" &&
-      state.mode !== "objective_audit"
-    ) {
+    if (contract.nextRequiredCapability !== "mutation") {
       // A stale adjacent mutation cannot bypass the active validation or
-      // process capability. The controller must explicitly reopen mutation
-      // before a write result can advance this transaction.
+      // objective-audit boundary. A fresh source read must explicitly reopen
+      // mutation before a write result can advance this transaction.
       return {
         state: transactionState,
         transition: "none",
@@ -1203,6 +1353,17 @@ export function transitionExecuteRecoveryRuntimeState(
           ? [observation.mutationTarget.trim()].filter(Boolean)
           : [],
     )];
+    const anchoredTargetCorrection = Boolean(
+      expectedTarget &&
+      !state.readLease &&
+      observedMutationTargets.length === 1 &&
+      ["replace_in_file", "apply_patch"].includes(
+        String(observation.mutationToolName || ""),
+      ) &&
+      !observedMutationTargets.some((target) =>
+        workspacePathsReferToSameFile(target, expectedTarget)
+      ),
+    );
     const auditTargetSwitch = state.mode === "objective_audit" &&
       observedMutationTargets.length > 0 &&
       Boolean(
@@ -1211,14 +1372,19 @@ export function transitionExecuteRecoveryRuntimeState(
           workspacePathsReferToSameFile(target, expectedTarget)
         ),
       );
-    const mutationTarget = auditTargetSwitch
+    const mutationTarget = auditTargetSwitch || anchoredTargetCorrection
       ? observedMutationTargets[0] || null
       : expectedTarget || observedMutationTargets[0] || null;
     if (
       !mutationTarget ||
-      (state.mode !== "objective_audit" && expectedTarget && !observedMutationTargets.some((target) =>
-        workspacePathsReferToSameFile(target, expectedTarget)
-      ))
+      (
+        state.mode !== "objective_audit" &&
+        !anchoredTargetCorrection &&
+        expectedTarget &&
+        !observedMutationTargets.some((target) =>
+          workspacePathsReferToSameFile(target, expectedTarget)
+        )
+      )
     ) {
       return {
         state: transactionState,
@@ -1228,7 +1394,10 @@ export function transitionExecuteRecoveryRuntimeState(
       };
     }
     const evidenceTargets = observedMutationTargets.map((target) =>
-      !auditTargetSwitch && expectedTarget && workspacePathsReferToSameFile(target, expectedTarget)
+      !auditTargetSwitch &&
+      !anchoredTargetCorrection &&
+      expectedTarget &&
+      workspacePathsReferToSameFile(target, expectedTarget)
         ? expectedTarget
         : target
     );
@@ -1248,6 +1417,8 @@ export function transitionExecuteRecoveryRuntimeState(
       ? observedMutationTargets.length === 1
         ? observedMutationTargets[0]
         : null
+      : anchoredTargetCorrection
+      ? observedMutationTargets[0]
       : expectedTarget || (
           observedMutationTargets.length === 1 ? mutationTarget : null
         );
@@ -1269,9 +1440,14 @@ export function transitionExecuteRecoveryRuntimeState(
         // provisionally to validation; assistantCompletionPhase may reopen the
         // mutation surface for a distinct structured objective/target request.
         readLease: null,
+        sourceObservationKey: anchoredTargetCorrection
+          ? null
+          : transactionState.sourceObservationKey,
         decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
           expectedTarget: nextExpectedTarget,
-          sourceObservationKey: state.sourceObservationKey,
+          sourceObservationKey: anchoredTargetCorrection
+            ? null
+            : state.sourceObservationKey,
           nextRequiredCapability: "validation",
           previous: objectiveCheckpoint,
         }),
@@ -1334,6 +1510,7 @@ export function transitionExecuteRecoveryRuntimeState(
         transactionState,
         observation.validationTarget,
         validationToolName,
+        observation.validationSummary,
       );
     }
     const browserValidation = validationToolName === "browser_evaluate";
@@ -1359,6 +1536,7 @@ export function transitionExecuteRecoveryRuntimeState(
       transactionState,
       observation.validationTarget,
       validationToolName,
+      observation.validationSummary,
     );
   }
 
@@ -1399,11 +1577,21 @@ export function resolveExecuteRecoveryNoProgressBoundary(input: {
     input.state.readLease &&
     (input.state.readLease.state === "available" || input.state.readLease.state === "active")
   );
-  const nextCapability = closeRepeatedRead
+  // A bounded targeting phase that reaches its no-progress boundary has
+  // already spent its opportunity to identify more context. Leaving it on the
+  // same grep/read-only surface makes both strategy pivots wording-only and
+  // can strand an Execute turn forever even when the parent already consumed
+  // child/source evidence. Release that surface to the ordinary mutation
+  // primitives; mutation preflight still validates the concrete target chosen
+  // by the model.
+  const closeStalledTargeting =
+    previousCheckpoint?.nextRequiredCapability === "targeting";
+  const closeContextSurface = closeRepeatedRead || closeStalledTargeting;
+  const nextCapability = closeContextSurface
     ? "mutation" as const
     : previousCheckpoint?.nextRequiredCapability || "mutation";
-  const nextMode = closeRepeatedRead ? "mutation_first" as const : input.state.mode;
-  const contractBoundaryChanged = closeRepeatedRead ||
+  const nextMode = closeContextSurface ? "mutation_first" as const : input.state.mode;
+  const contractBoundaryChanged = closeContextSurface ||
     nextMode !== input.state.mode ||
     nextCapability !== previousCheckpoint?.nextRequiredCapability;
   const checkpoint: ExecutionDecisionCheckpoint = {
@@ -1438,7 +1626,8 @@ export function resolveExecuteRecoveryNoProgressBoundary(input: {
       protocolNoProgressFingerprint: contractBoundaryChanged
         ? null
         : input.state.protocolNoProgressFingerprint,
-      readLease: closeRepeatedRead ? null : input.state.readLease,
+      readLease:
+        closeContextSurface ? null : input.state.readLease,
       decisionCheckpoint: checkpoint,
     },
   };
@@ -1548,6 +1737,6 @@ export function buildExecuteRecoveryMaxIterationsPrompt(input: {
 }): string {
   const maxIterations = input.maxIterations ?? MAX_EXECUTE_RECOVERY_ITERATIONS;
   return input.language === "zh"
-    ? `执行已暂停：当前恢复阶段连续 ${maxIterations} 次没有获得新证据。已有证据账本已保留，恢复事务已关闭；继续时请重新核对目标文件版本与范围，再恢复精确修改或验证，不要重复同一语义请求。`
-    : `Execution paused: the current recovery phase produced no fresh evidence for ${maxIterations} consecutive attempts. The evidence ledger was preserved and the recovery transaction was closed; on resume, re-check the target version and range before continuing the exact mutation or validation without repeating the same semantic request.`;
+    ? `当前恢复阶段连续 ${maxIterations} 次没有获得新证据。已有证据账本和恢复事务已冻结；MAIN 将在全局续跑预算内重新核对目标版本与范围，再继续精确修改或验证，不会原样重复同一语义请求。`
+    : `The current recovery phase produced no fresh evidence for ${maxIterations} consecutive attempts. The evidence ledger and recovery transaction were frozen; within the global continuation budget, MAIN will re-check the target version and range before continuing the exact mutation or validation without replaying the same semantic request.`;
 }

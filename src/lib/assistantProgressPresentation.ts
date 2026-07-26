@@ -1,6 +1,7 @@
 import { shouldRetainStageSummary } from "./modelFeedbackDedupe";
 import { stripLeakedReasoning } from "./normalizedTurn";
 import { sanitizeAssistantDisplayContent } from "./sanitize";
+import type { CapsuleStatusKind } from "./turnPresentation";
 
 export type AssistantProgressLanguage = "zh" | "en";
 
@@ -69,7 +70,7 @@ function normalizeUnitForDedupe(value: string): string {
 }
 
 function isProcessOnlyUnit(text: string): boolean {
-  return /(?:让我|接下来|下一步|现在(?:我)?(?:会|将|要|先|继续|正在)|我(?:会|将|要|先|继续|准备|正在)).{0,100}(?:读取|查看|检查|搜索|分析|调查|执行|运行|写入|修改|修复|替换|验证|整理|继续)/.test(text) ||
+  return /(?:让我|接下来|下一步|现在(?:我)?(?:会|将|要|先|继续|正在|需要|有了(?:足够|充分)?(?:的)?(?:信息|上下文|证据))|我(?:会|将|要|先|继续|准备|正在|需要)).{0,100}(?:读取|查看|检查|搜索|分析|调查|执行|运行|写入|修改|修复|替换|验证|整理|继续)/.test(text) ||
     /\b(?:let me|next|i(?:'|’)ll|i will|i(?:'|’)m|i am|i need to|i want to).{0,140}\b(?:read|inspect|check|search|trace|analy[sz]e|investigate|run|execute|write|edit|modify|fix|patch|replace|validate|verify|summari[sz]e|continue)\b/i.test(text);
 }
 
@@ -95,7 +96,7 @@ function checkpointScore(text: string): number {
  */
 export function buildAssistantStageCheckpoint(
   value: unknown,
-  language: AssistantProgressLanguage = "zh",
+  _language: AssistantProgressLanguage = "zh",
 ): string {
   const publicText = sanitizePublicProgress(value);
   if (!publicText || !shouldRetainStageSummary(publicText)) return "";
@@ -126,16 +127,15 @@ export function buildAssistantStageCheckpoint(
   if (selected.length === 0) return "";
 
   selected.sort((left, right) => left.index - right.index);
-  const heading = language === "en" ? "Checkpoint:" : "阶段结论：";
   const lines: string[] = [];
-  let usedChars = heading.length;
+  let usedChars = 0;
   for (const unit of selected) {
     const line = `- ${unit.text}`;
     if (usedChars + line.length + 1 > MAX_CHECKPOINT_CHARS) continue;
     lines.push(line);
     usedChars += line.length + 1;
   }
-  return lines.length > 0 ? `${heading}\n${lines.join("\n")}` : "";
+  return lines.join("\n");
 }
 
 function guidanceClause(text: string): string {
@@ -144,6 +144,7 @@ function guidanceClause(text: string): string {
     /接下来(?:我)?/,
     /下一步(?:我)?/,
     /现在(?:我)?(?:会|将|要|先|继续|正在)/,
+    /现在(?:我)?有了(?:足够|充分)?(?:的)?(?:信息|上下文|证据)/,
     /我(?:现在)?(?:会|将|要|先|继续|准备|正在)/,
     /\blet me\b/i,
     /\bnext(?:,)?(?:\s+i)?\b/i,
@@ -179,4 +180,38 @@ export function buildCapsuleLiveGuidance(
       !RAW_TOOL_NAME_RE.test(text)
     );
   return candidates[candidates.length - 1] || "";
+}
+
+/**
+ * Keep an active Capsule conversational while no model-visible or structured
+ * action is available yet. These are public phase descriptions, not hidden
+ * chain-of-thought, and are replaced as soon as a concrete action arrives.
+ */
+export function buildCapsulePhaseGuidance(
+  kind: CapsuleStatusKind,
+  language: AssistantProgressLanguage = "zh",
+): string {
+  const copy: Partial<Record<CapsuleStatusKind, { zh: string; en: string }>> = {
+    analyzing: {
+      zh: "我正在梳理当前问题，先确认相关代码入口和可验证证据。",
+      en: "I’m framing the current issue and confirming the relevant code paths and verifiable evidence.",
+    },
+    planning: {
+      zh: "我正在把已确认的证据整理成可执行计划，并检查每一步的验证方式。",
+      en: "I’m turning the confirmed evidence into an executable plan and checking how each step will be verified.",
+    },
+    executing: {
+      zh: "我正在推进当前任务；下一项可验证的读取、修改或检查会在这里实时更新。",
+      en: "I’m advancing the current task; the next verifiable read, edit, or check will appear here.",
+    },
+    validating: {
+      zh: "我正在核对最新修改，确认真实行为和回归检查都符合预期。",
+      en: "I’m checking the latest changes against real behavior and regression evidence.",
+    },
+    recovering: {
+      zh: "我正在从最近的可靠证据继续推进，并重新确认当前修复目标。",
+      en: "I’m continuing from the latest reliable evidence and reconfirming the current repair target.",
+    },
+  };
+  return copy[kind]?.[language === "en" ? "en" : "zh"] || "";
 }

@@ -1851,11 +1851,19 @@ function normalizeProviderCompatibilityRuntimeLaneState(
   const fallbackExpiresAt = Number(candidate.fallbackExpiresAt);
   const nativeSuccessStreak = Math.max(0, Math.floor(Number(candidate.nativeSuccessStreak) || 0));
   const lastFallbackAt = Math.max(0, Math.floor(Number(candidate.lastFallbackAt) || 0));
+  const requiredToolChoiceFallbackExpiresAt = Number(
+    candidate.requiredToolChoiceFallbackExpiresAt,
+  );
   return {
     forceXmlTools: candidate.forceXmlTools === true,
     fallbackExpiresAt: Number.isFinite(fallbackExpiresAt) && fallbackExpiresAt > 0 ? fallbackExpiresAt : null,
     nativeSuccessStreak,
     lastFallbackAt,
+    requiredToolChoiceFallbackExpiresAt:
+      Number.isFinite(requiredToolChoiceFallbackExpiresAt) &&
+      requiredToolChoiceFallbackExpiresAt > 0
+        ? requiredToolChoiceFallbackExpiresAt
+        : null,
   };
 }
 

@@ -61,7 +61,13 @@ import {
   summarizePlanEvidenceDetail,
 } from "./planMaterialization";
 import { extractRuntimePlanEvidenceDiscovery } from "./planEvidenceObligations";
+import {
+  appendPlanEvidenceEntry,
+  createPlanExecutionEvidenceEntry,
+} from "./planEvidence";
+import type { PlanExecutionEvidenceEntry } from "./workflowModels";
 import { normalizeWorkspacePathIdentity } from "./workspacePaths";
+import { resolveApprovedPlanDelegatedWriteScope } from "./approvedPlanExecutionScope";
 
 const SUBAGENT_NAMES = ["Euler", "Mendel", "Herschel", "Noether", "Turing", "Curie"];
 const SUBAGENT_EVIDENCE_TOOL_NAMES = new Set([
@@ -95,6 +101,23 @@ function sanitizeName(value: unknown, fallbackIndex: number): string {
 function compactText(value: unknown, maxChars: number): string {
   const text = String(value || "").trim();
   return text.length > maxChars ? `${text.slice(0, maxChars).trimEnd()}...` : text;
+}
+
+/**
+ * A wall-clock boundary closes the child runtime, not the provenance-backed
+ * observations it already produced. Keep the child incomplete while exposing
+ * those observations to the parent as a typed partial handoff.
+ */
+export function resolveTimedOutSubagentEvidenceStatus(input: {
+  status: SubagentStatus;
+  wallClockTimedOut: boolean;
+  substantiveEvidenceCount: number;
+}): SubagentStatus {
+  return input.wallClockTimedOut &&
+    input.status === "blocked" &&
+    Math.max(0, Number(input.substantiveEvidenceCount) || 0) > 0
+    ? "degraded"
+    : input.status;
 }
 
 function normalizeDeclaredRemainingWorkValue(value: unknown): string {
@@ -682,7 +705,7 @@ function buildChildPrompt(
       "Do not finish by proposing a tool call that is still available to you. A complete report needs at least one source-backed observation; if an outline or search is empty, read an exact allowed file before summarizing.",
       "Completion is measured only against this assigned task, not the parent task. Stay inside the allowed paths and return concise Findings, Uncertainty, Remaining In-Scope Work, and Parent Handoff sections.",
       writeMode
-        ? "Remaining In-Scope Work lists only an allowed, approved mutation or validation required by this task that you did not complete. If the assigned implementation is complete, write 'none'. Put user/parent decisions and checks outside allowed paths under Parent Handoff."
+        ? "Remaining In-Scope Work lists only an allowed, approved mutation required by this task that you did not complete. If the assigned implementation is complete, write 'none'. Finite validation belongs to the parent; after a successful mutation, put `parent_validation_required` and the changed target under Parent Handoff."
         : "Remaining In-Scope Work lists only an allowed read/search action required by the objective or expected output that you did not complete. If all assigned investigation is complete, write 'none'. Put edits, implementation suggestions, user/parent decisions, and checks outside allowed paths under Parent Handoff; those do not make the child incomplete.",
       "Never offer approval choices or address the end user directly.",
     ].filter(Boolean).join("\n\n");
@@ -709,7 +732,7 @@ function buildChildPrompt(
     "不要以“稍后再调用当前可用工具”结束任务。完整报告至少需要一条源码支撑的观察；若 outline 或搜索为空，应先读取一个允许的精确文件再总结。",
     "完成状态只按分配给你的独立任务判断，不按父任务是否全部完成判断。严格限制在允许路径内，并用“结论 / 不确定项 / 剩余范围内工作 / 父任务交接”四个部分返回简洁证据摘要。",
     writeMode
-      ? "“剩余范围内工作”只能列出该任务要求、已获批准且允许路径内尚未完成的修改或验证；如果分配的实施已经完成，明确写“无”。用户或父任务决策、允许路径外的核对放入“父任务交接”。"
+      ? "“剩余范围内工作”只能列出该任务要求、已获批准且允许路径内尚未完成的修改；如果分配的实施已经完成，明确写“无”。有限验证由父任务负责；修改成功后，在“父任务交接”写明 `parent_validation_required` 和改动目标。"
       : "“剩余范围内工作”只能列出目标或预期产出要求、允许路径内且你尚未完成的读取/搜索动作；如果分配的调查已经完成，明确写“无”。文件修改、实施建议、用户或父任务决策、允许路径外的核对都放入“父任务交接”，它们不代表子任务未完成。",
     "不要提供批准选项，也不要直接面向最终用户说话。",
   ].filter(Boolean).join("\n\n");
@@ -803,6 +826,7 @@ export function scheduleControlledSubagent(input: {
   request: SpawnSubagentRequest;
   parentCallbacks: OrchestratorCallbacks;
   parentTurnId: string;
+  presentationTurnId?: string;
   parentSessionEpoch?: string;
   parentSignal?: AbortSignal;
   existingRunCount: number;
@@ -831,7 +855,11 @@ export function scheduleControlledSubagent(input: {
   }
 
   const collaborationTaskId = `collaboration-task-${generateId()}`;
-  const parsedAllowedPaths = parseSubagentAllowedPaths(
+  const requestedTaskKind = input.request.taskKind ||
+    (input.request.accessMode === "write" ? "implement" : "explore");
+  const requestedAccessMode = input.request.accessMode ||
+    (requestedTaskKind === "implement" ? "write" : "read");
+  const requestedAllowedPaths = parseSubagentAllowedPaths(
     input.request.allowedPaths,
     parentConfig.workspace,
   );
@@ -839,18 +867,57 @@ export function scheduleControlledSubagent(input: {
     input.request.requiredPaths,
     parentConfig.workspace,
   );
+  const missingExactWriteScope =
+    requestedAccessMode === "write" &&
+    requestedAllowedPaths.length === 0;
+  const effectiveTaskKind = missingExactWriteScope
+    ? "explore"
+    : requestedTaskKind;
+  const effectiveAccessMode = missingExactWriteScope
+    ? "read"
+    : requestedAccessMode;
+  const canonicalAllowedPaths = requestedAllowedPaths.length > 0
+    ? requestedAllowedPaths
+    : effectiveAccessMode === "read"
+      ? ["."]
+      : [];
+  if (missingExactWriteScope) {
+    // Never guess a write lease from prose. Preserve useful collaboration by
+    // admitting the child as a workspace-scoped reader; the parent retains
+    // all mutation authority and can act on the joined evidence.
+    input.parentCallbacks.onDebugEvent?.("delegation_scope_decision", {
+      decision: "downgraded",
+      reason: "missing_exact_write_scope",
+      collaborationTaskId,
+      requestedTaskKind,
+      requestedAccessMode,
+      effectiveTaskKind,
+      effectiveAccessMode,
+    });
+  }
+  const fallbackTaskKey =
+    input.request.taskKey ||
+    input.request.scopeKey ||
+    input.request.scope ||
+    input.request.name ||
+    `delegated-task-${collaborationTaskId.slice(-8)}`;
+  const fallbackExpectedOutput =
+    input.request.expectedOutput ||
+    "Source-backed evidence with exact targets and a concise parent handoff.";
   const workItemValidation = normalizeCollaborationWorkItemDraft({
     collaborationTaskId,
     draft: {
-      taskKey: input.request.taskKey,
-      taskKind: input.request.taskKind,
+      taskKey: fallbackTaskKey,
+      taskKind: effectiveTaskKind,
       objective: input.request.objective,
-      delegationReason: input.request.delegationReason,
-      successCriteria: input.request.successCriteria,
-      expectedOutput: input.request.expectedOutput,
+      delegationReason: input.request.delegationReason ||
+        "Gather an independent result while the parent continues non-overlapping work.",
+      successCriteria: input.request.successCriteria ||
+        "Return at least one substantive tool-backed observation that advances the objective.",
+      expectedOutput: fallbackExpectedOutput,
       requiredPaths: parsedRequiredPaths,
-      allowedPaths: parsedAllowedPaths,
-      accessMode: input.request.accessMode,
+      allowedPaths: canonicalAllowedPaths,
+      accessMode: effectiveAccessMode,
       dependsOn: input.request.dependsOn,
       independentReviewOf: input.request.independentReviewOf,
       goalSliceId: input.parentCallbacks.getCurrentRunIdentity?.().goalSliceId,
@@ -858,7 +925,6 @@ export function scheduleControlledSubagent(input: {
   });
   if (
     !workItemValidation.ok ||
-    input.request.requiredPaths === undefined ||
     String(input.request.objective || "").trim().length > 800
   ) {
     const deferred = buildSubagentPolicyDeferral({
@@ -872,9 +938,7 @@ export function scheduleControlledSubagent(input: {
       reason: deferred.reason,
       collaborationTaskId,
       missingFields: workItemValidation.ok
-        ? input.request.requiredPaths === undefined
-          ? ["required_paths"]
-          : ["objective_too_broad"]
+        ? ["objective_too_broad"]
         : workItemValidation.missingFields,
       failureKind: "policy",
     });
@@ -884,14 +948,42 @@ export function scheduleControlledSubagent(input: {
   const parentIntent = input.parentCallbacks.getRuntimeRunIntent?.() ||
     input.parentCallbacks.getCurrentRunIntent?.() ||
     "analyze";
+  const isPlanApproved = input.parentCallbacks.getIsPlanApproved?.() === true;
+  const forcedRecoveryState = input.parentCallbacks.getForcedExecuteRecoveryState?.() || null;
+  const forcedRecoveryMode = forcedRecoveryState?.mode ||
+    input.parentCallbacks.getForcedExecuteRecoveryMode?.() ||
+    "normal";
+  const approvedPlanWriteScope = resolveApprovedPlanDelegatedWriteScope({
+    isPlanApproved,
+    accessMode: workItem.accessMode,
+    allowedPaths: workItem.allowedPaths,
+    tasks: input.parentCallbacks.getPlanTasks?.() || [],
+  });
   const writeAuthorized = workItem.accessMode === "read" ||
-    parentIntent === "goal" ||
     (
-      parentIntent === "execute" &&
-      input.parentCallbacks.getExecutionConsentGranted?.() === true
-    ) ||
-    input.parentCallbacks.getIsPlanApproved();
+      forcedRecoveryMode === "normal" &&
+      approvedPlanWriteScope.allowed &&
+      (
+        parentIntent === "goal" ||
+        (
+          parentIntent === "execute" &&
+          input.parentCallbacks.getExecutionConsentGranted?.() === true
+        ) ||
+        isPlanApproved
+      )
+    );
   if (!writeAuthorized) {
+    input.parentCallbacks.onDebugEvent?.("delegation_scope_decision", {
+      decision: "deferred",
+      reason: "write_not_authorized",
+      collaborationTaskId,
+      taskKey: workItem.taskKey,
+      forcedRecoveryMode,
+      isPlanApproved,
+      requestedPaths: approvedPlanWriteScope.requestedTargets,
+      plannedPaths: approvedPlanWriteScope.plannedTargets,
+      unexpectedPaths: approvedPlanWriteScope.unexpectedTargets,
+    });
     return buildSubagentPolicyDeferral({
       collaborationTaskId,
       name: input.request.name,
@@ -1053,6 +1145,8 @@ export function scheduleControlledSubagent(input: {
     name,
     status: "queued",
     scopeKey,
+    accessMode: workItem.accessMode,
+    taskKind: workItem.taskKind,
     allowedPaths,
   };
 }
@@ -1061,6 +1155,7 @@ export async function executeControlledSubagent(input: {
   request: SpawnSubagentRequest;
   parentCallbacks: OrchestratorCallbacks;
   parentTurnId: string;
+  presentationTurnId?: string;
   parentSessionEpoch?: string;
   parentSignal?: AbortSignal;
   existingRunCount: number;
@@ -1120,6 +1215,9 @@ export async function executeControlledSubagent(input: {
     allowedPaths,
     dependencyContext,
   } = prepared;
+  const presentationTurnId =
+    String(input.presentationTurnId || input.parentTurnId).trim() ||
+    input.parentTurnId;
   const parentSessionEpoch = normalizeSubagentSessionEpoch(input.parentSessionEpoch);
   const runtimeOwnership = {
     threadId: input.parentCallbacks.getSessionKey(),
@@ -1147,7 +1245,7 @@ export async function executeControlledSubagent(input: {
     id: subagentId,
     collaborationTaskId,
     workItem,
-    parentTurnId: input.parentTurnId,
+    parentTurnId: presentationTurnId,
     threadId: input.parentCallbacks.getSessionKey(),
     name,
     role,
@@ -1173,7 +1271,7 @@ export async function executeControlledSubagent(input: {
   input.emitEvent(withEventSchema({
     type: "subagent.created",
     threadId: snapshot.threadId,
-    turnId: input.parentTurnId,
+    turnId: presentationTurnId,
     timestampMs: now,
     collaborationTaskId,
     subagentId,
@@ -1236,6 +1334,7 @@ export async function executeControlledSubagent(input: {
   let finalResultEnvelope: SubagentResultEnvelope | null = null;
   let completedToolCalls = 0;
   const evidence: SubagentResultEnvelope["evidence"] = [];
+  let childExecutionEvidenceLedger: PlanExecutionEvidenceEntry[] = [];
   // allowedPaths is an authorization ceiling, not an obligation to inspect
   // every permitted root. Required coverage is introduced only by a concrete
   // runtime fan-out (or a future explicit completion contract).
@@ -1246,6 +1345,7 @@ export async function executeControlledSubagent(input: {
   let activitySequence = 0;
   let lastProgressEmitAt = 0;
   let childForceXmlTools = false;
+  let childOmitRequiredToolChoice = false;
   let scopeLeaseActivated = false;
   const initializedHookSessions = new Set<string>();
   const initiallyFileLikePaths = allowedPaths.filter(looksLikeExactFilePath);
@@ -1299,7 +1399,7 @@ export async function executeControlledSubagent(input: {
     input.emitEvent(withEventSchema({
       type: "subagent.updated",
       threadId: snapshot.threadId,
-      turnId: input.parentTurnId,
+      turnId: presentationTurnId,
       timestampMs: Date.now(),
       collaborationTaskId,
       subagentId,
@@ -1372,15 +1472,16 @@ export async function executeControlledSubagent(input: {
         }
       : null,
     getWorkflowMode: () => workItem.accessMode === "write" ? "edit" : "chat",
-    getIsPlanApproved: () => workItem.accessMode === "write",
+    getIsPlanApproved: () => false,
     getPlanApprovalChoice: () => null,
     getReadOnlyAutoApproveForSession: () => true,
     getApprovedLocalFileReadPaths: () => input.parentCallbacks.getApprovedLocalFileReadPaths(),
-    getAutoApproveToolScopes: () => [],
+    getAutoApproveToolScopes: () =>
+      workItem.accessMode === "write" ? ["workspace_write"] : [],
     getPlanStage: () => "idle",
     getPlanArtifacts: () => [],
     getPlanTasks: () => [],
-    getPlanExecutionEvidenceLedger: () => [],
+    getPlanExecutionEvidenceLedger: () => childExecutionEvidenceLedger,
     getPlanAutoResumeCount: () => 0,
     getIsApprovedPlanExecutionTransitionPending: () => false,
     getStatus: () => childStatus,
@@ -1407,6 +1508,17 @@ export async function executeControlledSubagent(input: {
       initializedHookSessions.add(sessionKey);
     },
     shouldForceXmlForProviderCompatibility: () => childForceXmlTools,
+    shouldOmitRequiredToolChoiceForProviderCompatibility: () =>
+      childOmitRequiredToolChoice,
+    onProviderRequiredToolChoiceUnsupported: (reason) => {
+      childOmitRequiredToolChoice = true;
+      emitChildDebug("subagent_required_tool_choice_fallback", {
+        reason,
+        from: "required",
+        to: "auto",
+        nativeToolsPreserved: true,
+      });
+    },
     onProviderCompatibilityFallback: (reason) => {
       childForceXmlTools = true;
       emitChildDebug("subagent_protocol_fallback", {
@@ -1544,6 +1656,33 @@ export async function executeControlledSubagent(input: {
     }, makeActivity("completed", language === "zh" ? "工具调用完成" : "Tool call completed", tool, target, result));
     },
     onToolResultObserved: (result: ToolExecutionResult) => {
+      const changedPaths = result.workspaceMutationEvidence?.changedPaths || [];
+      if (
+        workItem.accessMode === "write" &&
+        !result.isError &&
+        result.internalFeedback !== true &&
+        changedPaths.length > 0
+      ) {
+        for (const changedPath of changedPaths) {
+          childExecutionEvidenceLedger = appendPlanEvidenceEntry(
+            childExecutionEvidenceLedger,
+            createPlanExecutionEvidenceEntry({
+              toolName: String(result.executionName || result.name),
+              target: changedPath,
+              result: String(
+                result.runtimeEvidenceContent ||
+                result.content ||
+                result.displayContent ||
+                "",
+              ),
+              executedArgs: result.executedArgs,
+              diff: result.workspaceMutationEvidence?.diff,
+              transactionId: subagentId,
+              runId: childRunId,
+            }),
+          );
+        }
+      }
       const scopedReadCoverage = result.scopedReadCoverage;
       for (const path of scopedReadCoverage?.requiredPaths || []) requiredObservationPaths.add(path);
       for (const path of scopedReadCoverage?.failedPaths || []) failedObservationPaths.add(path);
@@ -1831,11 +1970,41 @@ export async function executeControlledSubagent(input: {
         const compactedEvidence = compactEvidence(evidence);
         // The report is presentation-only. In particular, translated phrases
         // such as "none" / "无" must not change a runtime terminal state.
-        const parentHandoff = extractDeclaredSubagentParentHandoff(candidateSummary);
+        const declaredParentHandoff =
+          extractDeclaredSubagentParentHandoff(candidateSummary);
+        const changedTargets = [...new Set(
+          childExecutionEvidenceLedger
+            .filter((entry) => entry.kind === "file")
+            .map((entry) => String(entry.target || entry.value || "").trim())
+            .filter(Boolean),
+        )];
+        const parentValidationHandoff =
+          workItem.accessMode === "write" && changedTargets.length > 0
+            ? `parent_validation_required: ${changedTargets.join(", ")}`
+            : "";
+        const parentHandoff = declaredParentHandoff &&
+          /parent_validation_required/i.test(declaredParentHandoff)
+            ? declaredParentHandoff
+            : [declaredParentHandoff, parentValidationHandoff]
+                .filter(Boolean)
+                .join("\n");
         const requiresEvidence = String(input.request.expectedOutput || "").trim().length > 0;
         const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
         const hasSubstantiveEvidence = substantiveEvidence.length > 0;
         const pathCoverage = resolvePathCoverage();
+        const statusBeforeTimeoutEvidenceHandoff = finalStatus;
+        finalStatus = resolveTimedOutSubagentEvidenceStatus({
+          status: finalStatus,
+          wallClockTimedOut,
+          substantiveEvidenceCount: substantiveEvidence.length,
+        });
+        if (statusBeforeTimeoutEvidenceHandoff !== finalStatus) {
+          emitChildDebug("subagent_partial_evidence_preserved_after_wall_clock_timeout", {
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
+            reason: compactText(lastError, 240) || "wall_clock_timeout",
+          });
+        }
         let closureReasonCode = finalStatus === "completed"
           ? "runtime_completed"
           : finalStatus === "canceled"
@@ -1980,7 +2149,7 @@ export async function executeControlledSubagent(input: {
           input.emitEvent(withEventSchema({
             type: "subagent.handed_back",
             threadId: snapshot.threadId,
-            turnId: input.parentTurnId,
+            turnId: presentationTurnId,
             timestampMs: completedAt,
             collaborationTaskId,
             subagentId,
@@ -2008,6 +2177,9 @@ export async function executeControlledSubagent(input: {
           summary: finalSummary,
           summaryTrust: "unverified_hypothesis",
           evidence: compactedEvidence,
+          ...(childExecutionEvidenceLedger.length > 0
+            ? { mutationEvidence: childExecutionEvidenceLedger.slice(-24) }
+            : {}),
           closureAudit,
           ...(parentHandoff ? { parentHandoff } : {}),
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
@@ -2030,6 +2202,19 @@ export async function executeControlledSubagent(input: {
     const compactedEvidence = compactEvidence(evidence);
     const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
     const pathCoverage = resolvePathCoverage();
+    const statusBeforeTimeoutEvidenceHandoff = finalStatus;
+    finalStatus = resolveTimedOutSubagentEvidenceStatus({
+      status: finalStatus,
+      wallClockTimedOut,
+      substantiveEvidenceCount: substantiveEvidence.length,
+    });
+    if (statusBeforeTimeoutEvidenceHandoff !== finalStatus) {
+      emitChildDebug("subagent_partial_evidence_preserved_after_wall_clock_timeout", {
+        observationCount: compactedEvidence.length,
+        substantiveEvidenceCount: substantiveEvidence.length,
+        reason: compactText(lastError, 240) || "wall_clock_timeout",
+      });
+    }
     if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, error)) {
       finalStatus = substantiveEvidence.length > 0 ? "degraded" : "blocked";
     }
@@ -2118,6 +2303,9 @@ export async function executeControlledSubagent(input: {
       summary: finalSummary,
       summaryTrust: "unverified_hypothesis",
       evidence: compactedEvidence,
+      ...(childExecutionEvidenceLedger.length > 0
+        ? { mutationEvidence: childExecutionEvidenceLedger.slice(-24) }
+        : {}),
       closureAudit,
       blocker: lastError,
       ...(closureAudit.remainingWork ? { remainingWork: closureAudit.remainingWork } : {}),
@@ -2163,7 +2351,7 @@ export async function executeControlledSubagent(input: {
     input.emitEvent(withEventSchema({
       type: "subagent.completed",
       threadId: snapshot.threadId,
-      turnId: input.parentTurnId,
+      turnId: presentationTurnId,
       timestampMs: closedAt,
       collaborationTaskId,
       subagentId,
@@ -2175,7 +2363,7 @@ export async function executeControlledSubagent(input: {
     input.emitEvent(withEventSchema({
       type: "subagent.closed",
       threadId: snapshot.threadId,
-      turnId: input.parentTurnId,
+      turnId: presentationTurnId,
       timestampMs: closedAt,
       collaborationTaskId,
       subagentId,

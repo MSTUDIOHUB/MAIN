@@ -75,6 +75,42 @@ test("replace_in_file preflight blocks mismatched search_text before review", as
   assert.match(result.message || "", /文件版本变化|缺少精确范围/);
 });
 
+test("replace mismatch range prefers clustered rare identifiers over an early generic match", async () => {
+  const source = [
+    "const filePath = getInitialPath();",
+    ...Array.from({ length: 118 }, (_, index) =>
+      `const filler${index} = filePath || "";`
+    ),
+    "await invoke('save_file_content', {",
+    "  file_path: filePath,",
+    "  content: activeFile.content,",
+    "});",
+    ...Array.from({ length: 40 }, (_, index) => `const tail${index} = true;`),
+  ].join("\n");
+  const result = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/main.js",
+      search_text: [
+        'await invoke("save_file_content", {',
+        "  file_path: activeFile.path,",
+        "  content: activeFile.content",
+        "});",
+      ].join("\n"),
+      replace_text: "fixed",
+    },
+    language: "zh",
+    readFile: async () => source,
+  });
+
+  assert.equal(result.reason, "search_text_mismatch");
+  const range = result.patchRecoveryMismatch?.requestedRange;
+  assert.ok(range);
+  assert.ok((range.startLine || 0) > 80);
+  assert.ok((range.startLine || 0) <= 120);
+  assert.ok((range.endLine || 0) >= 123);
+});
+
 test("replace_in_file preflight blocks empty/no-op replacements", async () => {
   const result = await preflightWorkspaceMutation({
     toolName: "replace_in_file",

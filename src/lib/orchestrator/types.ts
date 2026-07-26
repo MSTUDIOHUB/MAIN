@@ -176,6 +176,10 @@ export interface OrchestratorCallbacks {
   getPlanArtifacts?: () => PlanArtifact[];
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
+  /** Rebind runtime-authored child mutations to this parent Turn for validation. */
+  adoptSubagentMutationEvidence?: (
+    entries: PlanExecutionEvidenceEntry[],
+  ) => void;
   getPlanAutoResumeCount?: () => number;
   getIsApprovedPlanExecutionTransitionPending?: () => boolean;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
@@ -193,6 +197,8 @@ export interface OrchestratorCallbacks {
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
   onProviderCompatibilityFallback?: (reason: string) => void;
+  shouldOmitRequiredToolChoiceForProviderCompatibility?: () => boolean;
+  onProviderRequiredToolChoiceUnsupported?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onToolSurfaceResolved?: (availableToolNames: string[]) => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
@@ -320,6 +326,17 @@ export interface OrchestratorCallbacks {
   onExecuteMaxIterationsCheckpoint?: (
     checkpoint: PlanMaxIterationsCheckpoint,
   ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
+  /**
+   * Route a recoverable Execute-local fuse (protocol drift, empty output,
+   * stream watchdog, or phase no-progress) through the same bounded
+   * continuation owner as the global iteration boundary.
+   */
+  onExecuteRecoveryBoundary?: (input: {
+    cause: string;
+    iteration: number;
+    message?: string;
+    repeatedTargets?: string[];
+  }) => boolean;
   onChatMaxIterationsCheckpoint?: (
     checkpoint: PlanMaxIterationsCheckpoint,
   ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
@@ -474,6 +491,17 @@ export interface ToolExecutionResult {
     diff?: ToolDiffPreview;
   };
   qualityGateReason?: string;
+  /** Exact child-owned source window that a deferred parent mutation must reread. */
+  parentSourceRereadRequirement?: {
+    target: string;
+    requestedRange: {
+      startLine?: number;
+      endLine?: number;
+      maxLines?: number;
+    } | null;
+    observedVersion: string | null;
+    sourceObservationKey: string | null;
+  };
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];
   /** Internal identity for one versioned read_file request window. */

@@ -198,6 +198,16 @@ test("raw user prohibition overrides a captured preferred subagent preference", 
   assert.equal(draft.turnInputContextSignals.subagentPreference, "forbidden");
 });
 
+test("permissive user wording does not downgrade the captured Composer collaboration switch", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    text: "找到这些问题的根本原因并修复，可以启动子智能体协作。",
+    preferSubagents: true,
+    subagentPreference: "preferred",
+  }));
+
+  assert.equal(draft.turnInputContextSignals.subagentPreference, "preferred");
+});
+
 test("submit turn draft reuses existing turn title and UI parent", () => {
   const draft = prepareSubmitTurnDraft(baseInput({
     reuseCurrentTurn: true,

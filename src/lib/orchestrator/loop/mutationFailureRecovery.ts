@@ -10,6 +10,11 @@ import {
   normalizeWorkspacePathIdentity,
   workspacePathsReferToSameFile,
 } from "../../workspacePaths";
+import {
+  directEditTransactionHasCurrentClosureEvidence,
+  resolveDirectEditTransaction,
+  setDirectEditTransactionPhase,
+} from "../../directEditTransaction";
 
 export type MutationPreflightRecoveryReason =
   | "mutation_preflight_invalid_patch"
@@ -36,16 +41,16 @@ interface MutationFailureResultLike {
 
 /**
  * Complete recovery action for one mutation preflight mismatch. Exact
- * structured mismatch evidence grants one target/range read lease. Without an
- * exact range the transaction stays mutation-only and must correct the call
- * from its retained observation instead of reopening broad diagnosis.
+ * structured mismatch evidence grants one target/range read lease. A malformed
+ * patch without a range stays mutation-only; a proven no-effect mutation
+ * releases its unconfirmed target and returns to bounded targeting.
  *
  * A concrete mutation failure may replace any surrounding Execute phase
  * (including validation or objective audit). Only an already-active recovery
  * read owns the next transition and must not be reinitialized.
  */
 export interface DirectMutationPreflightRecoveryDecision {
-  mode: "mutation_first" | "patch_recovery_read";
+  mode: Exclude<ExecuteRecoveryMode, "normal">;
   reason: MutationPreflightRecoveryReason;
   target: string;
   readLease: {
@@ -124,6 +129,7 @@ export function resolveDirectMutationPreflightRecovery(input: {
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   executeRecoveryMode: ExecuteRecoveryMode;
+  decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   retainedSourceObservation?: FileReadObservationIdentity | null;
   results: MutationFailureResultLike[];
 }): DirectMutationPreflightRecoveryDecision | null {
@@ -199,6 +205,28 @@ export function resolveDirectMutationPreflightRecovery(input: {
     const sourceObservationKey = retainedObservation?.key || null;
     const requestedRange = mismatchEvidence?.requestedRange || null;
     const noEffect = reason === "mutation_preflight_no_effect";
+    const pendingValidationOwnsTarget = Boolean(
+      noEffect &&
+      input.decisionCheckpoint?.pendingFiniteValidation &&
+      input.decisionCheckpoint.finiteValidationDiagnosticTargets?.some(
+        (candidate) => workspacePathsReferToSameFile(candidate, target),
+      ),
+    );
+    const directEditTransaction = resolveDirectEditTransaction(
+      input.decisionCheckpoint,
+    );
+    const resumedAuditTransaction =
+      noEffect &&
+      directEditTransaction?.phase === "mutate"
+        ? setDirectEditTransactionPhase(directEditTransaction, "audit")
+        : null;
+    const resumeValidatedAudit = Boolean(
+      resumedAuditTransaction &&
+      directEditTransactionHasCurrentClosureEvidence(
+        resumedAuditTransaction,
+        target,
+      ),
+    );
     const readLease = !noEffect &&
       requestedRange &&
       mismatchEvidence?.mismatchFingerprint
@@ -212,20 +240,57 @@ export function resolveDirectMutationPreflightRecovery(input: {
         }
       : null;
     return {
-      mode: readLease ? "patch_recovery_read" : "mutation_first",
+      mode: resumeValidatedAudit
+        ? "objective_audit"
+        : pendingValidationOwnsTarget
+        ? "mutation_first"
+        : noEffect
+        ? "action_plus_targeting"
+        : readLease
+        ? "patch_recovery_read"
+        : "mutation_first",
       reason,
       target,
       readLease,
-      sourceObservationKey,
-      protocolNoProgressFingerprint: noEffect
+      sourceObservationKey: resumeValidatedAudit
+        ? sourceObservationKey
+        : pendingValidationOwnsTarget
+        ? sourceObservationKey
+        : noEffect
+        ? null
+        : sourceObservationKey,
+      protocolNoProgressFingerprint: resumeValidatedAudit
+        ? null
+        : noEffect
         ? `mutation_no_effect::${normalizeWorkspacePathIdentity(target)}`
         : null,
-      decisionCheckpoint: {
-        expectedTarget: target,
-        sourceObservationKey,
-        nextRequiredCapability: readLease ? "targeted_read" : "mutation",
-        evidenceVersion: observedVersion,
-      },
+      decisionCheckpoint: resumeValidatedAudit
+        ? {
+            ...(input.decisionCheckpoint || {}),
+            expectedTarget: target,
+            sourceObservationKey,
+            nextRequiredCapability: "any",
+            ...(observedVersion ? { evidenceVersion: observedVersion } : {}),
+            directEditTransaction: resumedAuditTransaction!,
+          }
+        : {
+            // A patch mismatch is a failed attempt inside the current
+            // transaction, not a new transaction. Keep the validation
+            // command, diagnostic, ownership, and mutation receipts that
+            // explain what still needs repair.
+            ...(input.decisionCheckpoint || {}),
+            expectedTarget: noEffect && !pendingValidationOwnsTarget ? null : target,
+            sourceObservationKey:
+              noEffect && !pendingValidationOwnsTarget ? null : sourceObservationKey,
+            nextRequiredCapability: pendingValidationOwnsTarget
+              ? "mutation"
+              : noEffect
+              ? "targeting"
+              : readLease
+              ? "targeted_read"
+              : "mutation",
+            evidenceVersion: observedVersion,
+          },
     };
   }
   return null;

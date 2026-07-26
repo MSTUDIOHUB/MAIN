@@ -56,6 +56,42 @@ test("repeat guard uses a higher threshold for read-only tools", () => {
   assert.equal(result.threshold, 4);
 });
 
+test("repeat guard detects a short alternating read-only cycle", () => {
+  const history = [];
+  let result = null;
+
+  for (let i = 0; i < 4; i += 1) {
+    result = registerToolCallForRepeatGuard(history, "git_status", {}, true);
+    if (i < 3) assert.equal(result.repeated, false);
+    result = registerToolCallForRepeatGuard(history, "git_diff", {}, true);
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.threshold, 4);
+});
+
+test("repeat guard does not carry an alternating read-only cycle across a write", () => {
+  const history = [];
+
+  for (let i = 0; i < 3; i += 1) {
+    registerToolCallForRepeatGuard(history, "git_status", {}, true);
+    registerToolCallForRepeatGuard(history, "git_diff", {}, true);
+  }
+  registerToolCallForRepeatGuard(history, "replace_in_file", {
+    path: "src/main.js",
+    search_text: "before",
+    replace_text: "after",
+  }, false);
+
+  let result = null;
+  for (let i = 0; i < 3; i += 1) {
+    result = registerToolCallForRepeatGuard(history, "git_status", {}, true);
+    result = registerToolCallForRepeatGuard(history, "git_diff", {}, true);
+  }
+
+  assert.equal(result.repeated, false);
+});
+
 test("repeat guard keeps write tools on the stricter threshold", () => {
   const history = [];
   let result = null;

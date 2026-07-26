@@ -11,6 +11,7 @@ import {
   ensureProviderCompatibilityMode,
   isProviderImageContentCompatibilityErrorMessage,
   isProviderCompatibilityErrorMessage,
+  isRequiredToolChoiceCompatibilityErrorMessage,
 } from "../../providerCompatibility";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
@@ -40,6 +41,7 @@ import type { AgentLoopRuntimeState } from "./turnPreparation";
 import {
   EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS,
   invokeInitialStreamForIteration,
+  shouldOmitWireRequiredForLocalExecute,
   type PlanStreamWatchdogOptionsResolver,
 } from "./streamInvocation";
 import {
@@ -305,7 +307,7 @@ function pauseDirectExecuteStreamWatchdog(input: {
   recentToolActivity: PlanToolActivitySummary[];
   message: string;
   logContext?: Record<string, unknown>;
-}): boolean {
+}): { reason: string; message: string } | null {
   const executeEvidenceRuntime =
     input.workflowMode === "edit" ||
     isMutationRuntimeIntent(input.runtimeIntent) ||
@@ -315,7 +317,7 @@ function pauseDirectExecuteStreamWatchdog(input: {
     !executeEvidenceRuntime ||
     !isStreamWatchdogTimeoutMessage(input.message)
   ) {
-    return false;
+    return null;
   }
 
   const language = input.callbacks.getPreferredLanguage();
@@ -346,7 +348,7 @@ function pauseDirectExecuteStreamWatchdog(input: {
         `Suggested recovery: ${nextStep}.`,
       ].join("\n");
 
-  logAgentEvent("execute_stream_watchdog_paused", {
+  logAgentEvent("execute_stream_watchdog_boundary", {
     iteration: input.iteration,
     message: input.message.slice(0, 240),
     recoveryReason,
@@ -363,7 +365,7 @@ function pauseDirectExecuteStreamWatchdog(input: {
     },
   );
   input.callbacks.onStatusChange("idle");
-  return true;
+  return { reason: recoveryReason, message: pauseNotice };
 }
 
 function emitReactiveContextCompression(input: {
@@ -512,9 +514,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
   providerCompatibilityPlanAuthoringCard?: string;
   planEvidenceObligationRequired?: boolean;
+  priorSemanticToolMisses?: number;
   planCandidateRepairActive?: boolean;
   fileReadStates: Map<string, FileReadState>;
-  pauseApprovedPlanStreamWatchdog: (message: string, logContext?: Record<string, unknown>) => boolean;
+  pauseApprovedPlanStreamWatchdog: (
+    message: string,
+    logContext?: Record<string, unknown>,
+  ) => { reason: string; message: string } | null;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
     update?: Partial<PlanExecutionProgressUpdate>,
@@ -551,6 +557,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     preapprovalPlanQualityRecoveryStreamPolicy,
     providerCompatibilityPlanAuthoringCard,
     planEvidenceObligationRequired,
+    priorSemanticToolMisses = 0,
     planCandidateRepairActive = false,
     fileReadStates,
     pauseApprovedPlanStreamWatchdog,
@@ -584,7 +591,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   const pauseExecutionStreamWatchdog = (
     message: string,
     logContext?: Record<string, unknown>,
-  ): boolean =>
+  ): { reason: string; message: string } | null =>
     pauseApprovedPlanStreamWatchdog(message, logContext) ||
     pauseDirectExecuteStreamWatchdog({
       callbacks,
@@ -595,9 +602,8 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       message,
       logContext,
     });
-
-  try {
-    const initialStreamInvocation = await invokeInitialStreamForIteration({
+  const invokeInitialStream = (omitRequiredToolChoice = false) =>
+    invokeInitialStreamForIteration({
       callbacks,
       abortSignal,
       runtimeState,
@@ -628,7 +634,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       executeRecoveryStreamMaxElapsedMs,
       preapprovalPlanQualityRecoveryStreamPolicy,
       planEvidenceObligationRequired,
+      omitRequiredToolChoice,
+      priorSemanticToolMisses,
     });
+
+  try {
+    const initialStreamInvocation = await invokeInitialStream();
     observeFileReadContextForMessagesSent({
       fileReadStates,
       beforeMessages: managedAgentMessages,
@@ -650,6 +661,58 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     }
 
     let errMsg = (activeError as Error).message || "";
+    if (
+      llmTools.length > 0 &&
+      isRequiredToolChoiceCompatibilityErrorMessage(errMsg)
+    ) {
+      callbacks.onProviderRequiredToolChoiceUnsupported?.(errMsg);
+      logAgentEvent("required_tool_choice_compatibility_retry", {
+        iteration,
+        reason: errMsg.slice(0, 240),
+        nativeToolCount: llmTools.length,
+        nativeToolsPreserved: true,
+        fromToolChoice: "required",
+        toToolChoice: "auto",
+      });
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      callbacks.onStatusChange("running");
+      try {
+        const retryInvocation = await invokeInitialStream(true);
+        observeFileReadContextForMessagesSent({
+          fileReadStates,
+          beforeMessages: managedAgentMessages,
+          messagesSentToLLM: retryInvocation.messagesSentToLLM,
+          iteration,
+          reason: "required_tool_choice_compatibility_retry",
+        });
+        logAgentEvent("required_tool_choice_compatibility_recovered", {
+          iteration,
+          nativeToolCount: llmTools.length,
+          toolCalls: retryInvocation.streamResult.toolCalls?.length || 0,
+          finishReason: retryInvocation.streamResult.finishReason || null,
+          nativeToolsPreserved: true,
+        });
+        return {
+          status: "streamed",
+          streamResult: retryInvocation.streamResult,
+          snapshotContextLimit,
+          messagesSentToLLM: retryInvocation.messagesSentToLLM,
+        };
+      } catch (retryError) {
+        if (isAbortError(retryError)) {
+          callbacks.onStatusChange("idle");
+          return { status: "stopped", snapshotContextLimit };
+        }
+        activeError = retryError;
+        errMsg = (retryError as Error).message || "";
+        logAgentEvent("required_tool_choice_compatibility_retry_failed", {
+          iteration,
+          error: errMsg.slice(0, 240),
+          nativeToolCount: llmTools.length,
+          nativeToolsPreserved: true,
+        });
+      }
+    }
     if (shouldAttemptExecuteStreamWatchdogRecovery({
       message: errMsg,
       workflowMode,
@@ -669,13 +732,27 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         MODEL_CONTROL_LANGUAGE,
         llmTools.map((tool) => tool.function.name),
       );
+      const semanticRetryToolChoice = "required" as const;
+      const localRecoveryUsesSemanticToolChoice =
+        shouldOmitWireRequiredForLocalExecute({
+          activeProfile: config.activeProfile,
+          semanticActionRequired: true,
+          priorSemanticToolMisses: Math.max(1, priorSemanticToolMisses),
+        });
+      const retryToolChoice =
+        callbacks.shouldOmitRequiredToolChoiceForProviderCompatibility?.() === true ||
+        localRecoveryUsesSemanticToolChoice
+          ? undefined
+          : semanticRetryToolChoice;
       logAgentEvent("execute_stream_watchdog_recovery_started", {
         iteration,
         previousError: errMsg.slice(0, 240),
         retryMaxElapsedMs,
         retryMaxTokens,
         toolCount: llmTools.length,
-        toolChoice: "required",
+        toolChoice: retryToolChoice ?? null,
+        requiredToolChoiceCompatibilityOverride: retryToolChoice == null,
+        localRecoveryUsesSemanticToolChoice,
       });
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       emitPlanExecutionProgress("running", {
@@ -708,14 +785,14 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             ...getPlanStreamWatchdogOptions(llmTools.length),
             maxStreamElapsedMs: retryMaxElapsedMs,
             maxStreamElapsedLabel: "execute_action_retry",
-            toolChoice: "required",
+            toolChoice: retryToolChoice,
             workflowMode,
             runtimeIntent,
           }, llmTools.length),
         );
         const streamResult = annotateRequiredToolCallProtocolResult(
           rawStreamResult,
-          "required",
+          semanticRetryToolChoice,
           llmTools.map((tool) => tool.function.name),
         );
         if (hasSuccessfulAllowedRawNativeToolCall({
@@ -762,13 +839,31 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           retryMaxElapsedMs,
           toolCount: llmTools.length,
         });
-        if (pauseExecutionStreamWatchdog(errMsg, { stage: "bounded_action_retry" })) {
-          return { status: "stopped", snapshotContextLimit };
+        const watchdogBoundary = pauseExecutionStreamWatchdog(
+          errMsg,
+          { stage: "bounded_action_retry" },
+        );
+        if (watchdogBoundary) {
+          return {
+            status: "stopped",
+            snapshotContextLimit,
+            pauseReason: watchdogBoundary.reason,
+            pauseMessage: watchdogBoundary.message,
+          };
         }
       }
     }
-    if (pauseExecutionStreamWatchdog(errMsg, { stage: "initial_stream" })) {
-      return { status: "stopped", snapshotContextLimit };
+    const initialWatchdogBoundary = pauseExecutionStreamWatchdog(
+      errMsg,
+      { stage: "initial_stream" },
+    );
+    if (initialWatchdogBoundary) {
+      return {
+        status: "stopped",
+        snapshotContextLimit,
+        pauseReason: initialWatchdogBoundary.reason,
+        pauseMessage: initialWatchdogBoundary.message,
+      };
     }
     if (shouldAttemptPreapprovalPlanStreamWatchdogRecovery({
       message: errMsg,
@@ -825,6 +920,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         recoveryTools.length > 0,
         planCandidateRepairActive,
       );
+      const semanticRetryToolChoice =
+        recoveryTools.length > 0 ? "required" as const : undefined;
+      const retryToolChoice =
+        semanticRetryToolChoice &&
+        callbacks.shouldOmitRequiredToolChoiceForProviderCompatibility?.() !== true
+          ? semanticRetryToolChoice
+          : undefined;
       logAgentEvent("preapproval_plan_stream_watchdog_recovery_started", {
         iteration,
         previousError: errMsg.slice(0, 240),
@@ -833,7 +935,9 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         toolCount: recoveryTools.length,
         originalToolCount: llmTools.length,
         recoveryTools: recoveryTools.map((tool) => tool.function.name),
-        toolChoice: recoveryTools.length > 0 ? "required" : "none",
+        toolChoice: retryToolChoice ?? "none",
+        requiredToolChoiceCompatibilityOverride:
+          recoveryTools.length > 0 && retryToolChoice == null,
       });
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       callbacks.onStatusChange("running");
@@ -861,14 +965,14 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             ...baseRetryWatchdogOptions,
             maxStreamElapsedMs: retryMaxElapsedMs,
             maxStreamElapsedLabel: "preapproval_plan_stream_watchdog_retry",
-            ...(recoveryTools.length > 0 ? { toolChoice: "required" as const } : {}),
+            ...(retryToolChoice ? { toolChoice: retryToolChoice } : {}),
             workflowMode,
             runtimeIntent,
           }, recoveryTools.length),
         );
         const streamResult = annotateRequiredToolCallProtocolResult(
           rawStreamResult,
-          recoveryTools.length > 0 ? "required" : undefined,
+          semanticRetryToolChoice,
           recoveryTools.map((tool) => tool.function.name),
         );
         if (hasSuccessfulAllowedRawNativeToolCall({
@@ -1050,8 +1154,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           return { status: "stopped", snapshotContextLimit };
         }
         const retryErrMsg = (retryErr as Error).message || "";
-        if (pauseExecutionStreamWatchdog(retryErrMsg, { stage: "context_compaction_retry" })) {
-          return { status: "stopped", snapshotContextLimit };
+        const watchdogBoundary = pauseExecutionStreamWatchdog(
+          retryErrMsg,
+          { stage: "context_compaction_retry" },
+        );
+        if (watchdogBoundary) {
+          return {
+            status: "stopped",
+            snapshotContextLimit,
+            pauseReason: watchdogBoundary.reason,
+            pauseMessage: watchdogBoundary.message,
+          };
         }
         if (
           handlePlanDraftStreamTimeout({
@@ -1154,8 +1267,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             return { status: "stopped", snapshotContextLimit };
           }
           const finalErrMsg = (finalErr as Error).message || "";
-          if (pauseExecutionStreamWatchdog(finalErrMsg, { stage: "emergency_compaction_retry" })) {
-            return { status: "stopped", snapshotContextLimit };
+          const watchdogBoundary = pauseExecutionStreamWatchdog(
+            finalErrMsg,
+            { stage: "emergency_compaction_retry" },
+          );
+          if (watchdogBoundary) {
+            return {
+              status: "stopped",
+              snapshotContextLimit,
+              pauseReason: watchdogBoundary.reason,
+              pauseMessage: watchdogBoundary.message,
+            };
           }
           if (
             handlePlanDraftStreamTimeout({
@@ -1285,8 +1407,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           return { status: "stopped", snapshotContextLimit };
         }
         const cloudRetryErrMsg = (cloudRetryErr as Error).message || "";
-        if (pauseExecutionStreamWatchdog(cloudRetryErrMsg, { stage: "cloud_compaction_retry" })) {
-          return { status: "stopped", snapshotContextLimit };
+        const watchdogBoundary = pauseExecutionStreamWatchdog(
+          cloudRetryErrMsg,
+          { stage: "cloud_compaction_retry" },
+        );
+        if (watchdogBoundary) {
+          return {
+            status: "stopped",
+            snapshotContextLimit,
+            pauseReason: watchdogBoundary.reason,
+            pauseMessage: watchdogBoundary.message,
+          };
         }
         if (
           handlePlanDraftStreamTimeout({
@@ -1383,8 +1514,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         }
 
         const retryMsg = (retryErr as Error).message || "";
-        if (pauseExecutionStreamWatchdog(retryMsg, { stage: "provider_compatibility_retry" })) {
-          return { status: "stopped", snapshotContextLimit };
+        const watchdogBoundary = pauseExecutionStreamWatchdog(
+          retryMsg,
+          { stage: "provider_compatibility_retry" },
+        );
+        if (watchdogBoundary) {
+          return {
+            status: "stopped",
+            snapshotContextLimit,
+            pauseReason: watchdogBoundary.reason,
+            pauseMessage: watchdogBoundary.message,
+          };
         }
         if (
           handlePlanDraftStreamTimeout({
@@ -1458,8 +1598,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             return { status: "stopped", snapshotContextLimit };
           }
           const finalErrMsg = (finalErr as Error).message || "";
-          if (pauseExecutionStreamWatchdog(finalErrMsg, { stage: "provider_compatibility_final_retry" })) {
-            return { status: "stopped", snapshotContextLimit };
+          const watchdogBoundary = pauseExecutionStreamWatchdog(
+            finalErrMsg,
+            { stage: "provider_compatibility_final_retry" },
+          );
+          if (watchdogBoundary) {
+            return {
+              status: "stopped",
+              snapshotContextLimit,
+              pauseReason: watchdogBoundary.reason,
+              pauseMessage: watchdogBoundary.message,
+            };
           }
           if (
             handlePlanDraftStreamTimeout({
@@ -1516,8 +1665,17 @@ export async function invokeStreamWithRecoveryForIteration(input: {
               lastErr,
               language === "zh" ? "未知错误" : "Unknown error",
             );
-            if (pauseExecutionStreamWatchdog(lastErrorMessage, { stage: "provider_compatibility_transcript_retry" })) {
-              return { status: "stopped", snapshotContextLimit };
+            const watchdogBoundary = pauseExecutionStreamWatchdog(
+              lastErrorMessage,
+              { stage: "provider_compatibility_transcript_retry" },
+            );
+            if (watchdogBoundary) {
+              return {
+                status: "stopped",
+                snapshotContextLimit,
+                pauseReason: watchdogBoundary.reason,
+                pauseMessage: watchdogBoundary.message,
+              };
             }
             if (
               handlePlanDraftStreamTimeout({

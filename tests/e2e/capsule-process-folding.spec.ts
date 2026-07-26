@@ -30,7 +30,9 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   const secondUpdate = page.getByText("已确认重复展示来自同一工具前言被同时投影；Capsule 只保留精简判断。");
   await expect(firstUpdate).toHaveCount(1);
   await expect(secondUpdate).toHaveCount(1);
-  await expect(page.locator('[data-testid="chat-scroll-container"]')).not.toContainText(
+  const chat = page.locator('[data-testid="chat-scroll-container"]');
+  await expect(chat).not.toContainText("阶段结论：");
+  await expect(chat).not.toContainText(
     "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
   );
   await expect.poll(async () => firstUpdate.evaluate((first, secondText) => {
@@ -97,12 +99,13 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
-  const processDisclosure = page.getByTestId("turn-process-disclosure");
+  const processDisclosure = page.getByTestId("live-turn-process-toggle");
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
-  await expect(processDisclosure).toContainText("3 个工具");
+  await expect(processDisclosure).toContainText("3 步");
   await processDisclosure.click();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
-  await expect(timeline).toHaveCount(0);
+  await expect(timeline).toBeVisible();
+  await expect(page.getByTestId("live-turn-process-details")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(guidance).toContainText("让我继续查看 ChatArea.tsx");
   await expect(firstUpdate).toHaveCount(1);
@@ -110,7 +113,7 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
 
   await processDisclosure.click();
   await expect(timeline).toBeVisible();
-  await expect(page.getByTestId("live-turn-process-toggle")).toHaveAttribute("aria-expanded", "true");
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByTestId("tool-status-label")).toHaveCount(0);
   await expect(page.getByTestId("tool-collapsed-summary")).toHaveCount(0);
   await expect(page.getByTestId("chat-operation-summary")).toHaveCount(0);
@@ -120,6 +123,7 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
 
   await page.reload();
+  await expect(page.locator('[data-testid="chat-scroll-container"]')).not.toContainText("阶段结论：");
   await expect(page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。")).toHaveCount(1);
   await expect(page.getByText("已确认重复展示来自同一工具前言被同时投影；Capsule 只保留精简判断。")).toHaveCount(1);
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
@@ -140,6 +144,19 @@ test("Capsule turns structured runtime activity into conversational guidance", a
   await expect(capsule).not.toContainText("grep_search");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
+});
+
+test("active Capsule uses a conversational phase sentence before concrete activity arrives", async ({ page }) => {
+  await page.goto("/?e2eScenario=capsule-phase-fallback");
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(capsule).toHaveAttribute("data-guidance-source", "phase");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
+    "我正在推进当前任务；下一项可验证的读取、修改或检查会在这里实时更新。",
+  );
+  await expect(capsule).not.toContainText("正在执行");
 });
 
 test("turn process timeline stays inside its frame in a narrow viewport", async ({ page }) => {

@@ -37,6 +37,8 @@ export interface ProviderCompatibilityRuntimeLaneState {
   fallbackExpiresAt: number | null;
   nativeSuccessStreak: number;
   lastFallbackAt: number;
+  /** Until this instant, preserve native tools but omit the rejected `required` value. */
+  requiredToolChoiceFallbackExpiresAt?: number | null;
 }
 
 export interface QueuedUserMessage {

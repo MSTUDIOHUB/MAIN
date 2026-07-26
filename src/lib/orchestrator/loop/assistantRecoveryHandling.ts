@@ -179,6 +179,13 @@ export function handleAssistantNoToolRecovery(input: {
         input.forceXmlTools,
       ),
       "missing_tool_loop",
+      {
+        phase: "paused",
+        recoveryReason: "tool_protocol_doom_loop",
+        nextStep: input.callbacks.getPreferredLanguage() === "zh"
+          ? "保留现有证据，重新开放当前阶段实际可调用的工具面"
+          : "retain current evidence and reopen the actually callable tools for this phase",
+      },
     );
     input.callbacks.onStatusChange("idle");
     return {

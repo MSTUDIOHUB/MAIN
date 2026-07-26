@@ -405,8 +405,11 @@ test("typed Plan closes every runtime-owned contract and causal owner before rev
   });
   assert.equal(closed.ok, true, JSON.stringify(closed));
   assert.match(closed.candidate.projection.content, /Evidence Closure/);
-  assert.match(closed.candidate.projection.content, /schedulePersistence/);
   assert.match(closed.candidate.projection.content, /documentPath/);
+  assert.doesNotMatch(closed.candidate.projection.content, /listener_calls|source_observation\(/);
+  assert.ok(closed.candidate.evidenceReceipt.facts.some((fact) =>
+    fact.structuredFactBindings.some((binding) => /schedulePersistence/.test(binding.signature))
+  ));
 
   const allPreserved = structuredClone(draft);
   allPreserved.changes = [];
@@ -1099,10 +1102,18 @@ test("exact source observations remain immutable from runtime read through seale
     }],
   });
   const prompt = formatPlanEvidenceBundleForModel(sourceBundle, "en");
+  assert.equal(
+    sourceBundle.facts[0].summary,
+    "The programmatic value update dispatches input to the persistence listener.",
+  );
   assert.match(prompt, /source_observation id=E1\.O1/);
   assert.match(prompt, /dispatchEvent/);
   assert.match(prompt, /scheduleAutoSave/);
   assert.match(prompt, /source-sha256-/);
+  assert.ok(
+    prompt.indexOf("The programmatic value update dispatches input") <
+      prompt.indexOf("event_dom_dispatch_contract"),
+  );
 
   const result = createTypedRuntimePlanCandidate({
     draft: draftWithText("Prevent the programmatic input event from scheduling persistence.", sourceBundle),
@@ -1112,6 +1123,14 @@ test("exact source observations remain immutable from runtime read through seale
   });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.deepEqual(result.candidate.evidence[0].sourceObservations, sourceObservations);
+  assert.match(
+    result.candidate.projection.content,
+    /The programmatic value update dispatches input to the persistence listener\./,
+  );
+  assert.doesNotMatch(
+    result.candidate.projection.content,
+    /source_observation\(|version=|event_dom_dispatch_contract|listener_calls/,
+  );
 
   const sealed = sealPlanCandidate({
     candidate: result.candidate,

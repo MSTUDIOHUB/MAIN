@@ -116,10 +116,15 @@ export function handleExecuteNoToolRecovery(input: {
     | "required_tool_call_missing"
     | "required_function_call_mismatch"
     | "required_tool_call_not_available";
+  protocolActualTools?: string[];
+  protocolExpectedTool?: string;
   /** Active evidence recovery owns the capability and treats XML prose as a protocol miss. */
   protocolViolationOnly?: boolean;
   assistantMsgId: string;
   consecutiveNoToolCount: number;
+  onStrategyPivot?: (
+    decision: Extract<ExecuteNoProgressStrategyDecision, { action: "continue_with_pivot" }>,
+  ) => boolean;
 }): ExecuteNoToolRecoveryResult {
   const {
     callbacks,
@@ -175,44 +180,27 @@ export function handleExecuteNoToolRecovery(input: {
         protocolViolation: input.protocolViolation,
       },
     );
-    const compatibilityFallbackAlreadyActive =
-      forceXmlTools ||
-      callbacks.shouldForceXmlForProviderCompatibility?.() === true;
-    if (
-      !compatibilityFallbackAlreadyActive &&
-      callbacks.onProviderCompatibilityFallback
-    ) {
-      const fallbackReason =
-        `required_native_tool_protocol_violation:${input.protocolViolation}`;
-      callbacks.onProviderCompatibilityFallback(fallbackReason);
-      logAgentEvent("execute_required_tool_protocol_compatibility_fallback", {
-        iteration,
-        workflowMode,
-        turnIntent,
-        runtimeIntent,
-        protocolViolation: input.protocolViolation,
-        availableTools: Array.from(availableToolNames),
-        action: "switch_to_xml_tools",
-        providerNeutral: true,
-      });
-      const violationInstruction =
-        input.protocolViolation === "required_function_call_mismatch"
-          ? "The runtime required one specific function; the mismatched call was not executed. Call exactly the named tool exposed by the active recovery contract."
-          : input.protocolViolation === "required_tool_call_not_available"
-          ? "The returned tool was outside the active recovery surface and was not executed. Call one capability that is actually exposed."
-          : "The previous response returned zero tool calls while one was required. Call exactly one exposed capability.";
-      callbacks.appendMessage({
-        role: "user",
-        content: [
-          "TOOL_PROTOCOL_COMPATIBILITY_FALLBACK: Native required-tool transport did not produce a valid executable call.",
-          "The runtime switched this provider lane to the XML-compatible formal tool envelope for the next bounded attempt.",
-          violationInstruction,
-          `Available capabilities: ${Array.from(availableToolNames).join(", ") || "(active recovery contract)"}.`,
-          "Do not restart analysis, emit progress prose, or claim completion before the tool result.",
-        ].join("\n"),
-      });
-      return finish("continue");
-    }
+    const availableTools = Array.from(availableToolNames);
+    const actualTools = Array.from(new Set(
+      (input.protocolActualTools || [])
+        .map((name) => String(name || "").trim())
+        .filter(Boolean),
+    ));
+    const expectedTool = String(input.protocolExpectedTool || "").trim();
+    logAgentEvent("execute_required_tool_protocol_repair", {
+      iteration,
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
+      protocolViolation: input.protocolViolation,
+      actualTools,
+      expectedTool: expectedTool || null,
+      availableTools,
+      transport: forceXmlTools ? "xml" : "native",
+      action: "retry_active_transport",
+      providerLaneFallbackChanged: false,
+      providerNeutral: true,
+    });
     const protocolCheckpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
     if (consecutiveNoToolCount >= protocolCheckpointLimit) {
       const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
@@ -223,6 +211,7 @@ export function handleExecuteNoToolRecovery(input: {
         cause: input.protocolViolation,
       });
       if (strategyDecision.action === "continue_with_pivot") {
+        const runtimeContractChanged = input.onStrategyPivot?.(strategyDecision) === true;
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
@@ -231,6 +220,14 @@ export function handleExecuteNoToolRecovery(input: {
           cause: input.protocolViolation,
           runtimeAlreadyPrepared: true,
         });
+        if (runtimeContractChanged) {
+          logAgentEvent("execute_no_progress_source_window_reopened", {
+            iteration,
+            cause: input.protocolViolation,
+            strategy: strategyDecision.strategy,
+            providerNeutral: true,
+          });
+        }
         return finish("continue");
       }
       const stoppedAfterDurableChange = sawExecuteOperationEvidence;
@@ -239,6 +236,17 @@ export function handleExecuteNoToolRecovery(input: {
           ? "执行已暂停：工作区已经产生真实变更，但模型未能完成后续工具协议或验证。现有变更和检查点均已保留；这不是“未执行任何操作”。"
           : "Execution paused after real workspace changes because the model could not complete the follow-up tool protocol or validation. Existing changes and the checkpoint were preserved; this is not a no-action outcome."
         : buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution");
+      const nextStep = input.protocolViolation === "required_function_call_mismatch"
+        ? callbacks.getPreferredLanguage() === "zh"
+          ? "模型在具名工具阶段连续返回了其他工具；这些调用未执行。请从当前证据检查点恢复并调用契约指定的工具。"
+          : "The model repeatedly returned a different tool during a named-tool phase; those calls were not executed. Resume from the evidence checkpoint and call the contracted tool."
+        : input.protocolViolation === "required_tool_call_not_available"
+          ? callbacks.getPreferredLanguage() === "zh"
+            ? "模型连续返回当前契约未开放的工具；这些调用未执行。请从当前检查点选择工具面中实际可用的能力。"
+            : "The model repeatedly returned tools outside the active contract; those calls were not executed. Resume from the checkpoint and choose an exposed capability."
+          : callbacks.getPreferredLanguage() === "zh"
+            ? "模型在 required 工具阶段连续返回零工具调用；从当前证据检查点恢复，不能把 stop 当作完成。"
+            : "The model repeatedly returned no tool call while tool use was required; resume from the evidence checkpoint instead of treating stop as completion.";
       callbacks.onNonActionableStop(
         stopMessage,
         "missing_tool_loop",
@@ -247,17 +255,7 @@ export function handleExecuteNoToolRecovery(input: {
           recoveryReason: stoppedAfterDurableChange
             ? "required_tool_call_protocol_violation_after_change"
             : "required_tool_call_protocol_violation",
-          nextStep: input.protocolViolation === "required_function_call_mismatch"
-            ? callbacks.getPreferredLanguage() === "zh"
-              ? "模型在具名工具阶段连续返回了其他工具；这些调用未执行。请从当前证据检查点恢复并调用契约指定的工具。"
-              : "The model repeatedly returned a different tool during a named-tool phase; those calls were not executed. Resume from the evidence checkpoint and call the contracted tool."
-            : input.protocolViolation === "required_tool_call_not_available"
-              ? callbacks.getPreferredLanguage() === "zh"
-                ? "模型连续返回当前契约未开放的工具；这些调用未执行。请从当前检查点选择工具面中实际可用的能力。"
-                : "The model repeatedly returned tools outside the active contract; those calls were not executed. Resume from the checkpoint and choose an exposed capability."
-            : callbacks.getPreferredLanguage() === "zh"
-              ? "模型在 required 工具阶段连续返回零工具调用；从当前证据检查点恢复，不能把 stop 当作完成。"
-              : "The model repeatedly returned no tool call while tool use was required; resume from the evidence checkpoint instead of treating stop as completion.",
+          nextStep,
         },
       );
       callbacks.onStatusChange("idle");
@@ -265,11 +263,22 @@ export function handleExecuteNoToolRecovery(input: {
     }
     callbacks.appendMessage({
       role: "user",
-      content: input.protocolViolation === "required_function_call_mismatch"
-        ? "TOOL_PROTOCOL_RECOVERY: The runtime required one specific function, but the provider returned a different tool. The mismatched call was not executed. Do not restart analysis; call exactly the named tool currently exposed by the active recovery contract."
-        : input.protocolViolation === "required_tool_call_not_available"
-        ? "TOOL_PROTOCOL_RECOVERY: The provider returned a tool outside the active recovery surface. That call was not executed. Do not restart analysis; call one tool that is actually exposed by the current capability contract."
-        : "TOOL_PROTOCOL_RECOVERY: The previous response violated required tool use by returning no tool call. Do not restart analysis or claim completion; call exactly one currently available tool that closes the active evidence gap.",
+      content: [
+        input.protocolViolation === "required_function_call_mismatch"
+          ? "TOOL_PROTOCOL_RECOVERY: The runtime required one specific function, but the model returned a different tool. The mismatched call was not executed."
+          : input.protocolViolation === "required_tool_call_not_available"
+          ? "TOOL_PROTOCOL_RECOVERY: The model returned a tool outside the active recovery surface. That call was not executed."
+          : "TOOL_PROTOCOL_RECOVERY: The previous response returned no tool call while one action was required.",
+        actualTools.length > 0
+          ? `Rejected historical/out-of-surface tools: ${actualTools.join(", ")}.`
+          : "",
+        expectedTool ? `The required function is: ${expectedTool}.` : "",
+        `The exact currently callable surface is: ${availableTools.join(", ") || "(active recovery contract)"}.`,
+        forceXmlTools
+          ? "Keep the active XML transport and emit exactly one formal tool envelope from that surface."
+          : "Keep native function calling and call exactly one function from that surface; do not copy a tool name from earlier history.",
+        "Do not restart analysis, emit a progress paragraph, or claim completion before the tool result.",
+      ].filter(Boolean).join("\n"),
     });
     return finish("continue");
   }
@@ -320,6 +329,7 @@ export function handleExecuteNoToolRecovery(input: {
         cause: "execute_xml_text_without_action",
       });
       if (strategyDecision.action === "continue_with_pivot") {
+        const runtimeContractChanged = input.onStrategyPivot?.(strategyDecision) === true;
         applyExecuteNoToolStrategyPivot({
           callbacks,
           decision: strategyDecision,
@@ -328,30 +338,40 @@ export function handleExecuteNoToolRecovery(input: {
           cause: "execute_xml_text_without_action",
           runtimeAlreadyPrepared: true,
         });
+        if (runtimeContractChanged) {
+          logAgentEvent("execute_no_progress_source_window_reopened", {
+            iteration,
+            cause: "execute_xml_text_without_action",
+            strategy: strategyDecision.strategy,
+            providerNeutral: true,
+          });
+        }
         return finish("continue");
       }
+      const stoppedAfterDurableChange = sawExecuteOperationEvidence;
+      const stopMessage = stoppedAfterDurableChange
+        ? callbacks.getPreferredLanguage() === "zh"
+          ? "执行已暂停：工作区已有真实变更，但模型连续没有产生可执行的后续动作。现有变更已保留，可从当前检查点恢复。"
+          : "Execution paused after real workspace changes because the model repeatedly produced no executable follow-up action. Existing changes were preserved and the run can resume from this checkpoint."
+        : buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution");
+      const nextStep = callbacks.getPreferredLanguage() === "zh"
+        ? "从保留的检查点继续当前阶段的真实工具动作，不接受纯文本代替执行。"
+        : "Continue the current phase from the retained checkpoint with a real tool action; prose cannot substitute for execution.";
       logAgentEvent("loop_stop", {
         reason: "execute_xml_text_without_action",
         iteration,
         consecutiveNoToolCount,
       });
-      const stoppedAfterDurableChange = sawExecuteOperationEvidence;
       callbacks.onNonActionableStop(
-        stoppedAfterDurableChange
-          ? callbacks.getPreferredLanguage() === "zh"
-            ? "执行已暂停：工作区已有真实变更，但模型连续没有产生可执行的后续动作。现有变更已保留，可从当前检查点恢复。"
-            : "Execution paused after real workspace changes because the model repeatedly produced no executable follow-up action. Existing changes were preserved and the run can resume from this checkpoint."
-          : buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+        stopMessage,
         "no_action",
-        stoppedAfterDurableChange
-          ? {
-              phase: "paused",
-              recoveryReason: "execute_no_action_after_change",
-              nextStep: callbacks.getPreferredLanguage() === "zh"
-                ? "从保留的变更继续完成剩余目标和验证。"
-                : "Resume from the preserved changes to complete the remaining outcomes and validation.",
-            }
-          : undefined,
+        {
+          phase: "paused",
+          recoveryReason: stoppedAfterDurableChange
+            ? "execute_no_action_after_change"
+            : "execute_xml_text_without_action",
+          nextStep,
+        },
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");

@@ -1,4 +1,8 @@
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import {
+  isFinitePlanValidationCommand,
+  type PlanExecutionEvidenceEntry,
+} from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
 import {
   isAuthoritativeSubagentClosure,
@@ -6,11 +10,19 @@ import {
 } from "../../subagents";
 import { parseToolFeedbackEnvelope } from "../../toolFeedbackEnvelope";
 import type { WaitSubagentsResult } from "../../subagents";
+import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import {
   extractDelegatedSubagentActivities,
   extractSubagentParentRereadObligations,
   rememberDelegatedSubagentActivities,
 } from "./toolActivityTracking";
+
+const PARENT_STABLE_WORKSPACE_TOOL_NAMES = new Set([
+  "execute_command",
+  "start_dev_server",
+  "browser_evaluate",
+  "computer_use",
+]);
 
 export function shouldJoinPendingSubagentsAfterScopeDeferral(
   results: ToolExecutionResult[],
@@ -34,6 +46,8 @@ export interface ParentSubagentJoinResult {
   adoptedEvidenceCount: number;
   sourceEvidenceCount: number;
   requiredParentRereads: number;
+  adoptedMutationEvidenceCount: number;
+  adoptedMutationTargets: string[];
   taskOutcomes: CollaborationTaskJoinOutcome[];
 }
 
@@ -41,6 +55,111 @@ function compactSubagentJoinText(value: unknown, maxChars: number): string {
   const text = String(value || "").trim();
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 34)).trimEnd()}\n[model join view compacted]`;
+}
+
+function parseJoinedSubagentResultRecords(
+  result: ToolExecutionResult,
+): Record<string, unknown>[] {
+  if (result.name !== "wait_subagents" || result.isError) return [];
+  const evidenceContent = result.runtimeEvidenceContent || result.content || "";
+  const parsedFeedback = parseToolFeedbackEnvelope(evidenceContent);
+  const body = parsedFeedback?.body || evidenceContent;
+  try {
+    const payload = JSON.parse(body) as { results?: unknown[] };
+    return Array.isArray(payload?.results)
+      ? payload.results.filter((value): value is Record<string, unknown> =>
+          !!value && typeof value === "object" && !Array.isArray(value)
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Adopt only runtime-authored, successful child mutation records whose
+ * closure owner matches the joined result. Child prose never participates.
+ */
+export function extractJoinedSubagentMutationEvidence(
+  result: ToolExecutionResult,
+): PlanExecutionEvidenceEntry[] {
+  const adopted: PlanExecutionEvidenceEntry[] = [];
+  const seenIds = new Set<string>();
+  for (const record of parseJoinedSubagentResultRecords(result)) {
+    const subagentId = String(record.subagentId || "").trim();
+    const collaborationTaskId = String(record.collaborationTaskId || "").trim();
+    const scopeKey = String(record.scopeKey || "").trim();
+    const closureAudit = record.closureAudit && typeof record.closureAudit === "object"
+      ? record.closureAudit as Record<string, unknown>
+      : null;
+    if (
+      !subagentId ||
+      !scopeKey ||
+      !isAuthoritativeSubagentClosure(closureAudit, {
+        ...(collaborationTaskId ? { collaborationTaskId } : {}),
+        subagentId,
+        scopeKey,
+      })
+    ) continue;
+    const closureRunId = String(closureAudit.owner.runId || "").trim();
+    const mutationEvidence = Array.isArray(record.mutationEvidence)
+      ? record.mutationEvidence
+      : [];
+    for (const value of mutationEvidence) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const entry = value as PlanExecutionEvidenceEntry;
+      const id = String(entry.id || "").trim();
+      const target = String(entry.target || entry.value || "").trim();
+      if (
+        !id ||
+        seenIds.has(id) ||
+        entry.kind !== "file" ||
+        !target ||
+        !isWorkspaceMutationToolName(entry.sourceTool) ||
+        String(entry.transactionId || "").trim() !== subagentId ||
+        (closureRunId && String(entry.runId || "").trim() !== closureRunId) ||
+        ["failed", "pending", "unknown", "running", "stopped"].includes(
+          String(entry.observationStatus || ""),
+        )
+      ) continue;
+      seenIds.add(id);
+      adopted.push({
+        ...entry,
+        target,
+        value: target,
+      });
+    }
+  }
+  return adopted;
+}
+
+/**
+ * Commands and interactive checks must observe a settled child-write
+ * boundary. Read/edit work may continue concurrently until this exact point.
+ */
+export function shouldJoinPendingSubagentsBeforeParentValidation(input: {
+  subagentDepth: number;
+  pendingSubagentIds: string[];
+  toolCalls: Array<{ name: string; arguments?: string }>;
+  recoveryNextCapability?: string | null;
+}): boolean {
+  if (input.subagentDepth > 0 || input.pendingSubagentIds.length === 0) {
+    return false;
+  }
+  return input.toolCalls.some((call) => {
+    if (PARENT_STABLE_WORKSPACE_TOOL_NAMES.has(call.name)) return true;
+    if (call.name !== "run_command") return false;
+    if (
+      input.recoveryNextCapability === "validation" ||
+      input.recoveryNextCapability === "reconcile_server"
+    ) return true;
+    try {
+      const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+      return isFinitePlanValidationCommand(String(args.command || ""));
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
@@ -66,8 +185,6 @@ export function buildSubagentJoinModelPayload(waitResult: WaitSubagentsResult): 
         name: entry.name,
         scopeKey: entry.scopeKey,
         status: entry.status,
-        summary: compactSubagentJoinText(entry.summary, 2_400),
-        summaryTrust: entry.summaryTrust,
         evidence: entry.evidence.slice(0, evidenceLimit).map((evidence) => ({
           tool: evidence.tool,
           target: evidence.target,
@@ -158,9 +275,6 @@ export function buildSubagentJoinModelPayload(waitResult: WaitSubagentsResult): 
         ...(entry.remainingWork
           ? { remainingWork: compactSubagentJoinText(entry.remainingWork, 800) }
           : {}),
-        ...(entry.parentHandoff
-          ? { parentHandoff: compactSubagentJoinText(entry.parentHandoff, 1_200) }
-          : {}),
         ...(entry.error
           ? { error: compactSubagentJoinText(entry.error, 800) }
           : {}),
@@ -179,6 +293,8 @@ function emptyParentSubagentJoinResult(
     adoptedEvidenceCount: 0,
     sourceEvidenceCount: 0,
     requiredParentRereads: 0,
+    adoptedMutationEvidenceCount: 0,
+    adoptedMutationTargets: [],
     taskOutcomes: [],
   };
 }
@@ -192,26 +308,12 @@ function emptyParentSubagentJoinResult(
 export function extractCollaborationTaskJoinOutcomes(
   result: ToolExecutionResult,
 ): CollaborationTaskJoinOutcome[] {
-  if (result.name !== "wait_subagents" || result.isError) return [];
-  const evidenceContent = result.runtimeEvidenceContent || result.content || "";
-  const parsedFeedback = parseToolFeedbackEnvelope(evidenceContent);
-  const body = parsedFeedback?.body || evidenceContent;
-  let payload: unknown;
-  try {
-    payload = JSON.parse(body);
-  } catch {
-    return [];
-  }
-  const results = Array.isArray((payload as { results?: unknown[] })?.results)
-    ? (payload as { results: unknown[] }).results
-    : [];
+  const results = parseJoinedSubagentResultRecords(result);
   const delegatedEvidenceActivities = extractDelegatedSubagentActivities(
     result,
     { evidenceLedger: true },
   );
-  return results.flatMap((value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-    const entry = value as Record<string, unknown>;
+  return results.flatMap((entry) => {
     const subagentId = String(entry.subagentId || "").trim();
     const collaborationTaskId = String(entry.collaborationTaskId || "").trim();
     const taskKey = String(entry.scopeKey || "").trim();
@@ -268,6 +370,7 @@ export async function joinPendingSubagentsForParent(input: {
   reason:
     | "plan_finalization"
     | "parent_final_response"
+    | "parent_validation"
     | "scope_conflict";
 }): Promise<ParentSubagentJoinResult> {
   const pendingIds = input.callbacks.getPendingSubagentIds?.() || [];
@@ -286,8 +389,8 @@ export async function joinPendingSubagentsForParent(input: {
   input.callbacks.appendMessage({
     role: "user",
     content: input.callbacks.getPreferredLanguage() === "zh"
-      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner 和工具调用身份的实质性 evidence 才能进入计划证据账本。degraded/blocked 子任务本身不会提升为完成，但其中被运行时接受且路径已覆盖的独立观察仍可用于制定计划；failed/uncovered 精确路径继续作为父任务补读候选。执行阶段的修改仍需完整版本身份和父级验证。若用户禁止主线程重读，则必须把未覆盖路径保留为未解决阻塞，不能把 partial output 宣称为完成。\n${modelContent}`
-      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself. Only substantive evidence with tool_observation provenance, an owner, and tool-call identity may enter the Plan evidence ledger. A degraded or blocked child is never promoted as task completion, but independently accepted observations on covered paths remain usable for Plan authoring; exact failed or uncovered paths remain targeted parent read_file candidates. Execution mutations still require complete version identity and parent verification. If the user forbids parent rereads, keep uncovered paths as unresolved blockers and do not claim partial output as completion.\n${modelContent}`,
+      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。为避免未验证建议覆盖父任务判断，模型上下文只注入 provenance.source=tool_observation、带 owner 和工具调用身份的实质性 evidence；子模型的自由文本 summary/parentHandoff 仅保留在审计记录中。degraded/blocked 子任务本身不会提升为完成，但其中被运行时接受且路径已覆盖的独立观察仍可用于制定计划；failed/uncovered 精确路径继续作为父任务补读候选。执行阶段的修改仍需完整版本身份和父级验证。若用户禁止主线程重读，则必须把未覆盖路径保留为未解决阻塞，不能把 partial output 宣称为完成。\n${modelContent}`
+      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. To keep unverified recommendations from overriding the parent judgment, only substantive evidence with tool_observation provenance, an owner, and tool-call identity is injected into the model context; free-form child summary/parentHandoff text remains in the audit record only. A degraded or blocked child is never promoted as task completion, but independently accepted observations on covered paths remain usable for Plan authoring; exact failed or uncovered paths remain targeted parent read_file candidates. Execution mutations still require complete version identity and parent verification. If the user forbids parent rereads, keep uncovered paths as unresolved blockers and do not claim partial output as completion.\n${modelContent}`,
   });
   const syntheticResult: ToolExecutionResult = {
     toolCallId: `runtime-wait-subagents-${Date.now()}`,
@@ -317,6 +420,11 @@ export async function joinPendingSubagentsForParent(input: {
     activity.delegatedObservation?.requiresParentReread === true
   ).length;
   const taskOutcomes = extractCollaborationTaskJoinOutcomes(syntheticResult);
+  const mutationEvidence = extractJoinedSubagentMutationEvidence(syntheticResult);
+  input.callbacks.adoptSubagentMutationEvidence?.(mutationEvidence);
+  const adoptedMutationTargets = [...new Set(mutationEvidence
+    .map((entry) => String(entry.target || entry.value || "").trim())
+    .filter(Boolean))];
   rememberDelegatedSubagentActivities(input.recentToolActivity, delegatedActivities);
   rememberDelegatedSubagentActivities(
     input.recentPlanToolActivity,
@@ -335,6 +443,8 @@ export async function joinPendingSubagentsForParent(input: {
       : 0,
     distinctEvidenceTargets,
     requiredParentRereads,
+    adoptedMutationEvidenceCount: mutationEvidence.length,
+    adoptedMutationTargets,
     taskOutcomes,
     versionedReuseCandidates: delegatedActivities.filter((activity) =>
       activity.name === "read_file" &&
@@ -360,6 +470,8 @@ export async function joinPendingSubagentsForParent(input: {
     adoptedEvidenceCount: delegatedEvidenceActivities.length,
     sourceEvidenceCount,
     requiredParentRereads,
+    adoptedMutationEvidenceCount: mutationEvidence.length,
+    adoptedMutationTargets,
     taskOutcomes,
   };
 }

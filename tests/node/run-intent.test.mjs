@@ -163,6 +163,7 @@ test("compound diagnosis, mutation, and validation requests keep mutation author
     "The editor must not show filename tabs Find the root causes fix the underlying operation order and run real validation",
     "Inspect the startup logs, then repair the lifecycle ordering and validate the result.",
     "检查启动日志，然后修复底层执行顺序并运行真实验证。",
+    "修复 MD Viewer：打开本地文件后不要因为程序化 setValue 被标记为已修改或触发自动保存；请直接读取、修改并验证，直到问题解决。",
   ];
 
   for (const input of inputs) {

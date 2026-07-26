@@ -92,6 +92,7 @@ export function handleFinalTextOnlyToolCalls(input: {
     });
     callbacks.onNonActionableStop(pauseMessage, "no_action", {
       phase: "paused",
+      recoveryReason: "execute_chat_repair_no_progress",
       nextStep: language === "zh"
         ? "继续时应进入执行能力，复用已读证据直接修复或给出精确阻塞。"
         : "Resume with execution capabilities, reuse cached evidence, and patch or state the exact blocker.",

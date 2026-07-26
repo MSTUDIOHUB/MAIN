@@ -61,6 +61,43 @@ const {
   normalizePersistedMainThreadEvent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
+test("active Run keeps exact-turn legacy progress when the display block has no runId", () => {
+  const ledger = buildRuntimeProgressLedger({
+    turnId: "turn-current",
+    activeRunId: "run-current",
+    blocks: [
+      {
+        id: "tool-current",
+        type: "tool",
+        turnId: "turn-current",
+        toolName: "read_file",
+        target: "src/main.js",
+        toolStatus: "running",
+        createdAt: 20,
+      },
+      {
+        id: "tool-foreign",
+        type: "tool",
+        turnId: "turn-current",
+        runId: "run-foreign",
+        toolName: "read_file",
+        target: "src/foreign.js",
+        toolStatus: "running",
+        createdAt: 30,
+      },
+    ],
+    events: [],
+    language: "zh",
+  });
+
+  assert.equal(ledger.length, 1);
+  assert.equal(ledger[0].target, "src/main.js");
+  assert.equal(
+    buildCapsuleGuidanceText(buildRunStatusProjection(ledger), "zh"),
+    "我正在读取 `main.js`，确认与当前问题相关的实现。",
+  );
+});
+
 test("runtime progress ledger keeps an approved child run separate from its parent plan-review pause", () => {
   const parentRunId = "run-plan-review";
   const childRunId = "run-plan-execution";
@@ -245,6 +282,92 @@ test("Capsule guidance explains the purpose of the latest structured action", ()
   assert.doesNotMatch(buildCapsuleGuidanceText(projection, "zh"), /replace_in_file|private detail|raw model prose/);
 });
 
+test("Capsule collaboration guidance stays complete while ChatArea owns the full assignment", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:spawn-subagent",
+    runId: "run-1",
+    phase: "tool_result",
+    title: "raw objective that must not be copied into Capsule",
+    status: "done",
+    summary: "spawn_subagent · private protocol detail",
+    target: "Euler",
+    tool: "spawn_subagent",
+    sourceToolCallIds: ["call-spawn"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.equal(guidance, "子智能体 `Euler` 已开始独立调查，主体正在继续推进。");
+  assert.doesNotMatch(guidance, /\.\.\.|raw objective|spawn_subagent|private protocol/);
+});
+
+test("Capsule does not let a long-lived spawn heartbeat overwrite newer parent work", () => {
+  const projection = buildRunStatusProjection([
+    {
+      key: "run:1:spawn-subagent",
+      runId: "run-1",
+      phase: "tool_start",
+      title: "启动子智能体",
+      status: "running",
+      summary: "",
+      target: "Euler",
+      tool: "spawn_subagent",
+      sourceToolCallIds: ["call-spawn"],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 10,
+      lastSeenAt: 90,
+    },
+    {
+      key: "run:1:grep-main",
+      runId: "run-1",
+      phase: "tool_result",
+      title: "搜索主流程",
+      status: "done",
+      summary: "",
+      target: "src/main.js",
+      tool: "grep_search",
+      sourceToolCallIds: ["call-grep"],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 50,
+      lastSeenAt: 60,
+    },
+  ], "zh");
+
+  assert.equal(projection.currentActivity, null);
+  assert.equal(projection.lastGuidanceActivity?.tool, "grep_search");
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "zh"),
+    "我已搜索 `main.js`，正在收窄真正相关的路径。",
+  );
+});
+
+test("Capsule never presents a truncated protocol target as a complete thought", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:unknown",
+    runId: "run-1",
+    phase: "tool_start",
+    title: "raw model prose",
+    status: "running",
+    summary: "unknown_tool · private detail",
+    target: "x".repeat(400),
+    tool: "unknown_tool",
+    sourceToolCallIds: ["call-unknown"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.equal(guidance, "我正在处理 当前工作区，确认这一步带来的变化。");
+  assert.doesNotMatch(guidance, /\.\.\.|xxx/);
+});
+
 test("Capsule guidance retains the last structured activity without a lifecycle prose fallback", () => {
   const emptyProjection = {
     currentActivity: null,
@@ -281,6 +404,31 @@ test("Capsule guidance retains the last structured activity without a lifecycle 
   assert.equal(completedEdit.lastGuidanceActivity?.tool, "replace_in_file");
   assert.equal(
     buildCapsuleGuidanceText(completedEdit, "zh"),
+    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+  );
+  const completedStatusEdit = buildRunStatusProjection([{
+    ...completedEdit.lastGuidanceActivity,
+    key: "run:1:edit-completed-status",
+    status: "completed",
+  }], "zh");
+  assert.equal(completedStatusEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.equal(
+    buildCapsuleGuidanceText(completedStatusEdit, "zh"),
+    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+  );
+  const repeatedAfterCompletedEdit = {
+    ...completedStatusEdit,
+    healthSignals: [{
+      key: "repeat-edit",
+      kind: "repetition",
+      status: "done",
+      title: "重复操作 ChatArea.tsx",
+      summary: "同一目标共 2 次。",
+      lastSeenAt: 3,
+    }],
+  };
+  assert.equal(
+    buildCapsuleGuidanceText(repeatedAfterCompletedEdit, "zh"),
     "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
   );
 
@@ -999,6 +1147,100 @@ test("active child run filters parent harness telemetry", () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].runId, "run-child");
   assert.doesNotMatch(items[0].summary, /parent failed/);
+});
+
+test("active recovery child retains concrete parent guidance until it produces newer work", () => {
+  const parentEvents = [
+    withEventSchema({
+      type: "run.started",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 10,
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 20,
+      progress: {
+        phase: "investigating",
+        title: "已读取源码",
+        status: "done",
+        tool: "read_file",
+        target: "src/main.js",
+        sourceToolCallIds: ["read-parent"],
+      },
+    }),
+    withEventSchema({
+      type: "run.completed",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 30,
+      resultKind: "partial",
+      summary: "继续自动恢复。",
+    }),
+    withEventSchema({
+      type: "run.started",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-child",
+      parentRunId: "run-parent",
+      timestampMs: 40,
+    }),
+  ];
+  const inheritedItems = buildRuntimeProgressLedger({
+    events: parentEvents,
+    turnId: "turn-lineage",
+    activeRunId: "run-child",
+    language: "zh",
+  });
+  const inheritedProjection = buildRunStatusProjection(inheritedItems, "zh");
+
+  assert.equal(inheritedItems.length, 1);
+  assert.equal(inheritedItems[0].runId, "run-parent");
+  assert.equal(
+    buildCapsuleGuidanceText(inheritedProjection, "zh"),
+    "我已读完 `main.js`，正在整理它说明了什么。",
+  );
+  assert.doesNotMatch(inheritedProjection.activityText, /部分完成|继续自动恢复/);
+
+  const childItems = buildRuntimeProgressLedger({
+    events: [
+      ...parentEvents,
+      withEventSchema({
+        type: "progress.updated",
+        threadId: "thread-lineage",
+        turnId: "turn-lineage",
+        runId: "run-child",
+        parentRunId: "run-parent",
+        timestampMs: 50,
+        progress: {
+          phase: "editing",
+          title: "正在修改源码",
+          status: "running",
+          tool: "replace_in_file",
+          target: "src/components/editor.js",
+          sourceToolCallIds: ["edit-child"],
+        },
+      }),
+    ],
+    turnId: "turn-lineage",
+    activeRunId: "run-child",
+    language: "zh",
+  });
+  const childProjection = buildRunStatusProjection(childItems, "zh");
+
+  assert.equal(childProjection.currentActivity?.runId, "run-child");
+  assert.equal(
+    buildCapsuleGuidanceText(childProjection, "zh"),
+    "我正在修改 `editor.js`，把已确认的方案落实到代码。",
+  );
 });
 
 test("visual progress keeps delivery distinct from recognition and surfaces provider omission", () => {

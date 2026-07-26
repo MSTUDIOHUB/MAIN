@@ -670,6 +670,13 @@ export function handleAssistantOutputPhase(input: {
           ? "本轮已暂停：模型在只读许可已授予后仍没有产生有效工具动作。恢复时请直接使用一个未缓存的定向工具调用，或基于已缓存内容继续写入/验证。"
           : "This turn is paused: after read-only permission was granted, the model still did not produce useful tool action. Resume with one uncached targeted tool call, or continue from cached content with write/validation.",
         workflowMode === "plan" ? "incomplete_plan" : "no_action",
+        {
+          phase: "paused",
+          recoveryReason: "read_only_permission_no_action",
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "复用已授权的只读证据，重新进入定向工具或写入/验证能力"
+            : "reuse authorized read evidence and re-enter a targeted tool or write/validation capability",
+        },
       );
       callbacks.onStatusChange("idle");
       return finishControl("stopped");

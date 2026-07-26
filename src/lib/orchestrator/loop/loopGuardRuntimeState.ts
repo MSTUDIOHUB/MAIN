@@ -1,10 +1,12 @@
 import { classifyCommandResultOutcome } from "../../planEvidence";
 import type { ExecuteNoProgressStrategyPivot } from "../../executeRecoveryTools";
 import { hasCompletedToolExecution } from "../../toolResultEffect";
+import { WORKSPACE_MUTATION_TOOL_NAMES } from "../../workspaceMutationTools";
 
 export type RecentLoopGuardToolCall = {
   name: string;
   argsKey: string;
+  readOnly?: boolean;
 };
 
 export type RecentTargetProgressToolCall = {
@@ -126,9 +128,13 @@ export function resetLoopGuardRuntimeStateAfterMutation(
   state.consecutiveReadFileOnlyCacheHits = 0;
   state.lastReadFileOnlyObservationSignature = "";
   state.noProgressStrategyPivots.length = 0;
-  state.recentToolCalls.length = 0;
   state.recentTargetToolCalls.length = 0;
-  state.repeatGuardRecoveredSignatures.clear();
+  for (const signature of state.repeatGuardRecoveredSignatures) {
+    const toolName = signature.split("::", 1)[0] || "";
+    if (!WORKSPACE_MUTATION_TOOL_NAMES.has(toolName)) {
+      state.repeatGuardRecoveredSignatures.delete(signature);
+    }
+  }
   state.targetProgressGuardRecoveredSignatures.clear();
   state.failedToolCallCounts.clear();
   return state;

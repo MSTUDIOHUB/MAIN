@@ -1,6 +1,6 @@
 import type { MainModeKey } from "../../mainModes";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { EffectiveTurnContract } from "../../runIntent";
 import type { ToolCatalog } from "../../toolCatalog";
 import { logAgentEvent } from "../../orchestrator";
@@ -29,8 +29,17 @@ import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
-import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import type { ExecuteRecoveryMode, RecoveryReadLease } from "../../executeRecoveryTools";
+import {
+  resolveExecuteRecoverySourceWindowContinuation,
+  resolveJoinedSubagentMutationValidationRecovery,
+  type ExecuteRecoveryRuntimeState,
+} from "./executeRecoveryRuntime";
+import {
+  MAX_VALIDATION_MUTATION_REOPENS,
+  type ExecuteRecoveryMode,
+  type RecoveryReadLease,
+} from "../../executeRecoveryTools";
+export { MAX_VALIDATION_MUTATION_REOPENS } from "../../executeRecoveryTools";
 import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
 import { resolveCommandEvidenceRequirements } from "../../verificationEvidence";
 import {
@@ -39,13 +48,13 @@ import {
 } from "../../workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type { CollaborationTaskJoinOutcome } from "../../subagents";
+import {
+  directEditTransactionHasCurrentClosureEvidence,
+  expectDirectEditTargets,
+  resolveDirectEditTransaction,
+} from "../../directEditTransaction";
 
 type WorkflowMode = "chat" | "edit" | "plan";
-
-// Semantic fingerprints reject an identical validation-to-mutation retry.
-// This higher independent-action ceiling is only a final safety fuse for
-// objectives that legitimately require several distinct edits.
-export const MAX_VALIDATION_MUTATION_REOPENS = 8;
 
 export interface RecoveryReadObservationResolution {
   key: string;
@@ -58,29 +67,9 @@ export interface RecoveryReadObservationResolution {
 export function objectiveAuditHasCurrentClosureEvidence(
   recoveryState: ExecuteRecoveryRuntimeState,
 ): boolean {
-  const checkpoint = recoveryState.decisionCheckpoint;
-  if (
-    checkpoint?.objectiveClosurePending !== true ||
-    checkpoint.objectiveKind !== "root"
-  ) {
-    return false;
-  }
-  const revision = Math.max(
-    1,
-    Math.floor(Number(checkpoint.objectiveRevision) || 1),
-  );
-  if (checkpoint.objectiveValidationEvidence?.revision !== revision) return false;
-  const mutationEvidence = checkpoint.objectiveMutationEvidence || [];
-  if (mutationEvidence.length === 0) return false;
-  const expectedTargets = checkpoint.objectiveExpectedTargets?.length
-    ? checkpoint.objectiveExpectedTargets
-    : recoveryState.expectedTarget
-      ? [recoveryState.expectedTarget]
-      : [];
-  return expectedTargets.length > 0 && expectedTargets.every((target) =>
-    mutationEvidence.some((entry) =>
-      workspacePathsReferToSameFile(entry.target, target)
-    )
+  return directEditTransactionHasCurrentClosureEvidence(
+    resolveDirectEditTransaction(recoveryState.decisionCheckpoint),
+    recoveryState.expectedTarget,
   );
 }
 
@@ -405,6 +394,46 @@ export async function handleAssistantCompletionPhase(input: {
     });
     if (joinResult.joined) {
       await input.onCollaborationTaskOutcomes?.(joinResult.taskOutcomes);
+      const joinedMutationRecovery =
+        isMutationRuntimeIntent(input.runtimeIntent) &&
+        input.effectiveTurnContract?.mutationExpected === true
+          ? resolveJoinedSubagentMutationValidationRecovery({
+              state: input.getExecuteRecoveryState(),
+              mutationTargets: joinResult.adoptedMutationTargets,
+            })
+          : null;
+      if (joinedMutationRecovery) {
+        const previousRecoveryMode = input.getExecuteRecoveryState().mode;
+        input.activateExecuteRecovery(
+          "validation_only",
+          "joined_subagent_mutation_requires_parent_validation",
+          {
+            expectedTarget: joinedMutationRecovery.expectedTarget,
+            resetExpectedTarget: true,
+            readLease: null,
+            sourceObservationKey: null,
+            decisionCheckpoint: joinedMutationRecovery.decisionCheckpoint,
+            adoptedMutationEvidenceCount:
+              joinResult.adoptedMutationEvidenceCount,
+            adoptedMutationTargets: joinResult.adoptedMutationTargets,
+            source: "parent_final_response_join",
+          },
+        );
+        const nextRecoveryState = input.getExecuteRecoveryState();
+        logAgentEvent("parent_join_mutation_validation_activated", {
+          iteration: input.iteration,
+          previousRecoveryMode,
+          executeRecoveryMode: nextRecoveryState.mode,
+          nextRequiredCapability:
+            nextRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+          expectedTarget: nextRecoveryState.expectedTarget,
+          adoptedMutationEvidenceCount:
+            joinResult.adoptedMutationEvidenceCount,
+          adoptedMutationTargets: joinResult.adoptedMutationTargets,
+          directEditTransaction:
+            nextRecoveryState.decisionCheckpoint?.directEditTransaction || null,
+        });
+      }
       if (
         input.workflowMode === "plan" &&
         !input.callbacks.getIsPlanApproved() &&
@@ -453,11 +482,14 @@ export async function handleAssistantCompletionPhase(input: {
     input.approvedPlanAuditForNoTool.pendingExternalValidation
   );
   let currentExecuteRecoveryState = input.getExecuteRecoveryState();
+  const validationExpectedForThisRun =
+    (input.callbacks.getSubagentDepth?.() || 0) === 0 &&
+    input.effectiveTurnContract?.validationExpected === true;
   const preCompletionRecovery = resolvePreCompletionEvidenceRecoveryDecision({
     ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
     // Manual/user review remains an advisory conclusion. It never turns off
     // the independent post-mutation automatic validation contract.
-    validationExpected: input.effectiveTurnContract?.validationExpected === true,
+    validationExpected: validationExpectedForThisRun,
     mutationExpected: input.effectiveTurnContract?.mutationExpected === true,
     transactionId: input.iterationContext.eventTurnId,
     requiredCommandEvidence: resolveCommandEvidenceRequirements({
@@ -504,7 +536,7 @@ export async function handleAssistantCompletionPhase(input: {
       expectedTarget: nextState.expectedTarget,
       nextRequiredCapability: preCompletionRecovery.nextRequiredCapability,
       draftChars: input.visibleAssistantText.length,
-      validationExpected: input.effectiveTurnContract?.validationExpected === true,
+      validationExpected: validationExpectedForThisRun,
       mutationExpected: input.effectiveTurnContract?.mutationExpected === true,
       externalReviewIsAdvisory,
     });
@@ -513,7 +545,8 @@ export async function handleAssistantCompletionPhase(input: {
 
   if (currentExecuteRecoveryState.mode === "objective_audit") {
     const checkpoint = currentExecuteRecoveryState.decisionCheckpoint;
-    const revision = Math.max(1, Math.floor(Number(checkpoint?.objectiveRevision) || 1));
+    const directEditTransaction = resolveDirectEditTransaction(checkpoint);
+    const revision = directEditTransaction?.revision || 1;
     if (objectiveAuditHasCurrentClosureEvidence(currentExecuteRecoveryState)) {
       currentExecuteRecoveryState = input.clearExecuteRecovery(
         "objective_audit_model_stop",
@@ -522,10 +555,10 @@ export async function handleAssistantCompletionPhase(input: {
       );
       logAgentEvent("objective_closure_audit_completed", {
         iteration: input.iteration,
-        objectiveObligationId: checkpoint?.objectiveObligationId || null,
+        objectiveObligationId: directEditTransaction?.obligationId || null,
         objectiveRevision: revision,
-        mutationTargets: (checkpoint?.objectiveMutationEvidence || []).map((entry) => entry.target),
-        validationTool: checkpoint?.objectiveValidationEvidence?.tool || null,
+        mutationTargets: (directEditTransaction?.mutations || []).map((entry) => entry.target),
+        validationTool: directEditTransaction?.validation?.tool || null,
         completionSignal: "assistant_stop_without_tool_call",
       });
     } else {
@@ -585,7 +618,7 @@ export async function handleAssistantCompletionPhase(input: {
       Math.floor(Number(currentCheckpoint?.validationMutationReopenCount) || 0),
     ) + 1;
     // Recovery is a serial transaction. A multi-target patch reopens against
-    // its first target; the remaining targets stay in objectiveExpectedTargets
+    // its first target; the remaining targets stay in the transaction target set
     // and are handled by subsequent read -> mutation steps.
     const requestedTarget = validationMutationReopen.requestedTargets[0] || null;
     const targetChanged = Boolean(
@@ -609,14 +642,13 @@ export async function handleAssistantCompletionPhase(input: {
     });
     const targetReadRequired = targetBinding.mode === "patch_recovery_read";
     const nextSourceObservationKey = targetBinding.sourceObservationKey;
-    const priorObjectiveTargets = currentCheckpoint?.objectiveExpectedTargets || [];
-    const objectiveExpectedTargets = [
-      ...priorObjectiveTargets,
-      ...validationMutationReopen.requestedTargets,
-    ].reduce<string[]>((targets, target) =>
-      targets.some((entry) => workspacePathsReferToSameFile(entry, target))
-        ? targets
-        : [...targets, target], []);
+    const directEditTransaction = expectDirectEditTargets({
+      transaction: resolveDirectEditTransaction(currentCheckpoint),
+      targets: validationMutationReopen.requestedTargets,
+      requirementRef: currentCheckpoint?.requirementRef,
+      planTaskId: currentCheckpoint?.planTaskId,
+      phase: targetReadRequired ? "inspect" : "mutate",
+    });
     const validationMutationReopenFingerprints = [...new Set([
       ...(currentCheckpoint?.validationMutationReopenFingerprints || []),
       ...validationMutationReopen.semanticFingerprints,
@@ -641,8 +673,7 @@ export async function handleAssistantCompletionPhase(input: {
             : {}),
           validationMutationReopenCount,
           validationMutationReopenFingerprints,
-          ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
-          objectiveClosurePending: true,
+          directEditTransaction,
         },
         source: "validation_requested_followup_mutation",
       },
@@ -694,9 +725,65 @@ export async function handleAssistantCompletionPhase(input: {
     sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
     visibleText: input.visibleAssistantText || input.userVisibleText,
     protocolViolation: input.normalized.protocolViolation,
+    protocolActualTools: input.normalized.protocolActualTools,
+    protocolExpectedTool: input.normalized.protocolExpectedTool,
     protocolViolationOnly: currentExecuteRecoveryState.mode !== "normal",
     assistantMsgId: input.assistantMsgId,
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
+    onStrategyPivot: (decision) => {
+      const recoveryState = input.getExecuteRecoveryState();
+      const continuation = resolveExecuteRecoverySourceWindowContinuation({
+        state: recoveryState,
+        protocolActualToolCalls: input.normalized.protocolActualToolCalls,
+        observations: input.recentToolActivity.flatMap((activity) =>
+          activity.readFileObservation ? [activity.readFileObservation] : []
+        ),
+      });
+      const persistedCheckpoint = {
+        ...(recoveryState.decisionCheckpoint || {
+          expectedTarget: recoveryState.expectedTarget,
+          sourceObservationKey: recoveryState.sourceObservationKey,
+          nextRequiredCapability: "mutation" as const,
+        }),
+        noProgressStrategyPivots: decision.attemptedStrategies,
+      };
+      if (!continuation) {
+        if (recoveryState.mode !== "normal") {
+          input.activateExecuteRecovery(
+            recoveryState.mode,
+            `no_tool_strategy_pivot:${decision.strategy}`,
+            {
+              expectedTarget: recoveryState.expectedTarget,
+              sourceObservationKey: recoveryState.sourceObservationKey,
+              readLease: recoveryState.readLease,
+              decisionCheckpoint: persistedCheckpoint,
+              source: "required_action_strategy_pivot",
+            },
+          );
+        }
+        return false;
+      }
+      input.activateExecuteRecovery(
+        "patch_recovery_read",
+        "no_tool_truncated_source_window",
+        {
+          expectedTarget: continuation.target,
+          sourceObservationKey: continuation.sourceObservationKey,
+          observedVersion: continuation.observedVersion,
+          requestedRange: continuation.requestedRange,
+          readLease: continuation.readLease,
+          decisionCheckpoint: {
+            ...persistedCheckpoint,
+            expectedTarget: continuation.target,
+            sourceObservationKey: continuation.sourceObservationKey,
+            nextRequiredCapability: "targeted_read",
+            noProgressStrategyPivots: decision.attemptedStrategies,
+          },
+          source: "required_action_truncated_source_continuation",
+        },
+      );
+      return true;
+    },
   });
   noToolRuntimeState = applyConsecutiveNoToolRuntimeState(
     noToolRuntimeState,

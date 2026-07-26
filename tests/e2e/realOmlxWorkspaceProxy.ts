@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -116,6 +117,147 @@ export interface RealOmlxWorkspaceInventory {
   visitedDirectories: number;
   prunedDirectories: number;
   skippedEntries: number;
+}
+
+export interface RealOmlxWorkspaceCommandResult {
+  command: string;
+  cwd: string;
+  exitCode: number;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}
+
+/**
+ * Execute a finite validation command against the isolated replay workspace.
+ *
+ * The real-model bridge must not synthesize a successful command result from
+ * a source-pattern oracle: doing so can accept a final file that no longer
+ * parses. The caller remains responsible for classifying the command as
+ * finite before reaching this boundary.
+ */
+export async function runRealOmlxWorkspaceCommand(
+  workspace: string,
+  command: string,
+  options: {
+    timeoutMs?: number;
+    maxOutputChars?: number;
+  } = {},
+): Promise<RealOmlxWorkspaceCommandResult> {
+  const cwd = path.resolve(workspace);
+  const workspaceStat = await fs.stat(cwd);
+  if (!workspaceStat.isDirectory()) {
+    throw new Error(`REAL_OMLX_COMMAND_WORKSPACE_NOT_DIRECTORY: ${cwd}`);
+  }
+  const normalizedCommand = String(command || "").trim();
+  if (!normalizedCommand) {
+    throw new Error("REAL_OMLX_COMMAND_EMPTY");
+  }
+  const timeoutMs = Math.max(
+    1_000,
+    Math.min(300_000, Math.floor(Number(options.timeoutMs) || 120_000)),
+  );
+  const maxOutputChars = Math.max(
+    4_096,
+    Math.min(2 * 1024 * 1024, Math.floor(Number(options.maxOutputChars) || 256 * 1024)),
+  );
+  const startedAt = Date.now();
+
+  return await new Promise<RealOmlxWorkspaceCommandResult>((resolve) => {
+    const useProcessGroup = process.platform !== "win32";
+    const child = useProcessGroup
+      ? spawn("/bin/sh", ["-lc", normalizedCommand], {
+          cwd,
+          detached: true,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+      : spawn(normalizedCommand, {
+          cwd,
+          env: process.env,
+          shell: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+    let stdout = "";
+    let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+    let launchError = "";
+    let settled = false;
+
+    const appendOutput = (
+      current: string,
+      chunk: Buffer | string,
+    ): { value: string; truncated: boolean } => {
+      const next = `${current}${String(chunk)}`;
+      if (next.length <= maxOutputChars) {
+        return { value: next, truncated: false };
+      }
+      return {
+        value: next.slice(-maxOutputChars),
+        truncated: true,
+      };
+    };
+    child.stdout?.on("data", (chunk) => {
+      const next = appendOutput(stdout, chunk);
+      stdout = next.value;
+      stdoutTruncated = stdoutTruncated || next.truncated;
+    });
+    child.stderr?.on("data", (chunk) => {
+      const next = appendOutput(stderr, chunk);
+      stderr = next.value;
+      stderrTruncated = stderrTruncated || next.truncated;
+    });
+    child.on("error", (error) => {
+      launchError = error instanceof Error ? error.message : String(error);
+    });
+
+    const terminate = (signal: NodeJS.Signals) => {
+      if (!child.pid) return;
+      try {
+        if (useProcessGroup) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        // The process may have exited between the timeout and the signal.
+      }
+    };
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      terminate("SIGTERM");
+      const forceKill = setTimeout(() => terminate("SIGKILL"), 1_000);
+      forceKill.unref?.();
+    }, timeoutMs);
+    timeout.unref?.();
+
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (launchError) {
+        stderr = `${stderr}${stderr ? "\n" : ""}${launchError}`;
+      }
+      resolve({
+        command: normalizedCommand,
+        cwd,
+        exitCode: typeof code === "number" ? code : 1,
+        signal,
+        timedOut,
+        durationMs: Date.now() - startedAt,
+        stdout,
+        stderr,
+        stdoutTruncated,
+        stderrTruncated,
+      });
+    });
+  });
 }
 
 export interface RealOmlxSearchFileSelection {
@@ -260,7 +402,7 @@ export function recordRealOmlxAcceptanceDebugEvent(
       [payload.subagentPreference],
     );
   }
-  if (eventSource === "agent.preferred_delegation_spawned") {
+  if (eventSource === "agent.semantic_collaboration_task_spawned") {
     const scopeKey = String(payload.scopeKey || "").trim();
     const subagentId = String(payload.subagentId || "").trim();
     if (scopeKey) {
@@ -287,19 +429,18 @@ export function recordRealOmlxAcceptanceDebugEvent(
       Array.isArray(payload.subagentIds) ? payload.subagentIds : [],
     );
   }
-  if (eventSource === "agent.preferred_delegation_scope_outcomes") {
+  if (eventSource === "agent.semantic_collaboration_evidence_consumed") {
     const outcomes = Array.isArray(payload.outcomes) ? payload.outcomes : [];
     for (const value of outcomes) {
       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const outcome = value as Record<string, unknown>;
+      const scopeKey = String(outcome.taskKey || outcome.scopeKey || "").trim();
       next.joinedSubagentIds = appendUnique(next.joinedSubagentIds, [outcome.subagentId]);
-      next.joinedScopeKeys = appendUnique(next.joinedScopeKeys, [outcome.scopeKey]);
-      if (outcome.consumed === true) {
-        next.consumedScopeKeys = appendUnique(next.consumedScopeKeys, [outcome.scopeKey]);
+      next.joinedScopeKeys = appendUnique(next.joinedScopeKeys, [scopeKey]);
+      if (outcome.evidenceAdopted === true || outcome.consumed === true) {
+        next.consumedScopeKeys = appendUnique(next.consumedScopeKeys, [scopeKey]);
       }
     }
-  }
-  if (eventSource === "agent.preferred_delegation_consumed") {
     next.consumedScopeKeys = appendUnique(
       next.consumedScopeKeys,
       Array.isArray(payload.consumedScopeKeys) ? payload.consumedScopeKeys : [],

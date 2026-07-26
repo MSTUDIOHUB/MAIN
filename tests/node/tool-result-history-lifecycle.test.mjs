@@ -36,7 +36,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { appendToolResultsToHistory } = loadTranspiledModuleSync(
+const { commitToolResultBatch } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultHistory.ts"),
 );
 const { parseToolFeedbackEnvelope } = loadTranspiledModuleSync(
@@ -84,10 +84,10 @@ test("started internal policy feedback closes exactly one blocked lifecycle item
     qualityGateReason: "shell_read_forbidden",
   };
 
-  appendToolResultsToHistory({ ...fixture.input, results: [result] });
-  appendToolResultsToHistory({ ...fixture.input, results: [result] });
+  commitToolResultBatch({ ...fixture.input, results: [result] });
+  commitToolResultBatch({ ...fixture.input, results: [result] });
 
-  assert.equal(fixture.messages.length, 2, "model protocol history may be appended by both folds");
+  assert.equal(fixture.messages.length, 1, "the protocol result is committed exactly once");
   assert.equal(fixture.events.length, 1, "the item lifecycle is terminal exactly once");
   assert.equal(fixture.events[0].type, "item.completed");
   assert.deepEqual(fixture.events[0].item.details, {
@@ -103,7 +103,7 @@ test("started internal policy feedback closes exactly one blocked lifecycle item
 
 test("unstarted internal feedback does not synthesize an orphan completion", () => {
   const fixture = createFixture();
-  appendToolResultsToHistory({
+  commitToolResultBatch({
     ...fixture.input,
     results: [{
       toolCallId: "call-preexecution",
@@ -132,9 +132,10 @@ test("unstarted external preflight results synthesize one matched lifecycle pair
     lifecycleState: "blocked",
   };
 
-  appendToolResultsToHistory({ ...fixture.input, results: [result] });
-  appendToolResultsToHistory({ ...fixture.input, results: [result] });
+  commitToolResultBatch({ ...fixture.input, results: [result] });
+  commitToolResultBatch({ ...fixture.input, results: [result] });
 
+  assert.equal(fixture.messages.length, 1);
   assert.deepEqual(fixture.events.map((event) => event.type), [
     "item.started",
     "item.completed",
@@ -146,7 +147,7 @@ test("unstarted external preflight results synthesize one matched lifecycle pair
 
 test("normal started results retain the public tool_result completion shape", () => {
   const fixture = createFixture(["call-read"]);
-  appendToolResultsToHistory({
+  commitToolResultBatch({
     ...fixture.input,
     results: [{
       toolCallId: "call-read",
@@ -166,7 +167,7 @@ test("normal started results retain the public tool_result completion shape", ()
 
 test("failed tools that changed a file tell model history to reread stale source", () => {
   const fixture = createFixture(["call-partial-write"]);
-  appendToolResultsToHistory({
+  commitToolResultBatch({
     ...fixture.input,
     results: [{
       toolCallId: "call-partial-write",
@@ -199,7 +200,7 @@ test("failed tools that changed a file tell model history to reread stale source
 
 test("legacy tool history also preserves partial mutation recovery truth", () => {
   const fixture = createFixture(["call-partial-legacy"]);
-  appendToolResultsToHistory({
+  commitToolResultBatch({
     ...fixture.input,
     toolFeedbackFormat: "legacy",
     results: [{

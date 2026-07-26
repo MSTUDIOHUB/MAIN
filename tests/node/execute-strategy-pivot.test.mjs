@@ -94,7 +94,7 @@ test("phase threshold pivots twice before the bounded recovery fuse pauses", () 
   assert.equal(
     second.state.phaseNoProgressCount,
     runtime.MAX_EXECUTE_RECOVERY_ITERATIONS + 1,
-    "a wording-only pivot cannot refund the unchanged mutation surface",
+    "a wording-only alternate strategy cannot refund the phase budget",
   );
   assert.equal(
     second.state.protocolNoProgressCount,

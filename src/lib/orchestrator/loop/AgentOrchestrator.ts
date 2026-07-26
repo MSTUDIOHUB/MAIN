@@ -62,6 +62,8 @@ import type { PendingFiniteValidationCheckpoint } from "../../executeRecoveryToo
 import { resolveStoppedRunDisposition } from "./stoppedRunDisposition";
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import type { RuntimeGuidanceCompletionFenceDecision } from "../../runtimeGuidanceCompletion";
+import { hasSuccessfulWorkspaceMutationEvidence } from "../../verificationEvidence";
+import { hasStartedCollaborationForCurrentTurn } from "./toolCallPlanning";
 
 const EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS = 120_000;
 
@@ -360,10 +362,10 @@ export class AgentOrchestrator {
           joinBoundary:
             | "plan_finalization"
             | "parent_final_response"
-            | "explicit_wait",
+            | "tool_iteration",
         ) => {
           await publishCollaborationCheckpoint();
-          callbacks.onDebugEvent?.("agent.collaboration_task_outcomes", {
+          callbacks.onDebugEvent?.("agent.semantic_collaboration_evidence_consumed", {
             iteration: loopState.iteration,
             joinBoundary,
             outcomes: outcomes.map((outcome) => ({
@@ -377,13 +379,14 @@ export class AgentOrchestrator {
               evidenceAdopted: outcome.evidenceAdopted,
               terminalComplete: outcome.terminalComplete,
             })),
-            providerNeutral: true,
-          });
-          return {
+            consumedScopeKeys: outcomes
+              .filter((outcome) => outcome.evidenceAdopted)
+              .map((outcome) => outcome.taskKey),
             adoptedTaskIds: outcomes
               .filter((outcome) => outcome.evidenceAdopted)
               .map((outcome) => outcome.collaborationTaskId),
-          };
+            providerNeutral: true,
+          });
         };
         const publishExecuteRecoveryState = () => {
           this.latestExecuteRecoveryState = {
@@ -643,10 +646,19 @@ export class AgentOrchestrator {
           emitRunPausedEvent("aborted", "The run was aborted and can be resumed in the same turn.");
           return;
         }
+        if (hasSuccessfulWorkspaceMutationEvidence({
+          ledger: callbacks.getPlanExecutionEvidenceLedger(),
+          transactionId: eventTurnId,
+        })) {
+          markExecuteOperationEvidence();
+        }
 
-        if (shouldPinExecuteRecoveryFiniteValidationCheckpoint(
-          loopState.executeRecoveryState,
-        )) {
+        if (
+          (callbacks.getSubagentDepth?.() || 0) === 0 &&
+          shouldPinExecuteRecoveryFiniteValidationCheckpoint(
+            loopState.executeRecoveryState,
+          )
+        ) {
           const checkpoint = await resolveTrustedValidationCheckpoint();
           if (abortController.signal.aborted) {
             callbacks.onStatusChange("idle");
@@ -674,20 +686,10 @@ export class AgentOrchestrator {
             reason: "plan_finalization",
           });
           if (joinResult.joined) {
-            const delegationProgress = await emitCollaborationTaskOutcomes(
+            await emitCollaborationTaskOutcomes(
               joinResult.taskOutcomes,
               "plan_finalization",
             );
-            if (delegationProgress.adoptedTaskIds.length > 0 && joinResult.adoptedEvidenceCount > 0) {
-              callbacks.onDebugEvent?.("agent.semantic_collaboration_evidence_consumed", {
-                iteration,
-                pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
-                joinBoundary: "plan_finalization",
-                adoptedEvidenceCount: joinResult.adoptedEvidenceCount,
-                adoptedTaskIds: delegationProgress.adoptedTaskIds,
-                providerNeutral: true,
-              });
-            }
             const joinedEvidenceReadiness = assessPlanEvidenceReadiness({
               userGoal: latestUserPromptText,
               userContext: turnInputContextSignals,
@@ -868,6 +870,8 @@ export class AgentOrchestrator {
           getPlanStreamWatchdogOptions,
           executeRecoveryStreamMaxElapsedMs: EXECUTE_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
+          priorSemanticToolMisses:
+            loopState.noToolRuntimeState.consecutiveNoToolCount,
           providerCompatibilityPlanAuthoringCard,
           planEvidenceObligationRequired:
             !!toolSurfaceDecision.planEvidenceObligation,
@@ -1210,7 +1214,7 @@ export class AgentOrchestrator {
         if (assistantIterationPhase.status === "stopped") {
           if (
             effectiveSubagentPreference === "preferred" &&
-            (callbacks.getPendingSubagentIds?.().length || 0) === 0
+            !hasStartedCollaborationForCurrentTurn(callbacks)
           ) {
             callbacks.onDebugEvent?.("collaboration_preference_not_used", {
               iteration,
@@ -1312,7 +1316,7 @@ export class AgentOrchestrator {
             });
           },
           onCollaborationTaskOutcomes: async (outcomes) => {
-            await emitCollaborationTaskOutcomes(outcomes, "explicit_wait");
+            await emitCollaborationTaskOutcomes(outcomes, "tool_iteration");
           },
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);

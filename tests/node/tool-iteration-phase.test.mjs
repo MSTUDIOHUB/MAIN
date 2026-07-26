@@ -67,11 +67,12 @@ test("semantic collaboration uses runtime-owned task registration and join outco
   assert.match(orchestratorSource, /agent\.semantic_collaboration_task_spawned/);
   assert.match(orchestratorSource, /agent\.semantic_collaboration_evidence_consumed/);
   assert.match(orchestratorSource, /emitCollaborationTaskOutcomes/);
-  assert.match(orchestratorSource, /delegationProgress\.adoptedTaskIds\.length > 0/);
+  assert.match(orchestratorSource, /consumedScopeKeys:\s*outcomes/);
+  assert.match(orchestratorSource, /\.filter\(\(outcome\) => outcome\.evidenceAdopted\)/);
   assert.match(orchestratorSource, /semantic_collaboration_joined_without_evidence/);
   assert.match(
     orchestratorSource,
-    /joinResult\.adoptedEvidenceCount > 0[\s\S]*setPlanRuntimePhase\(\s*"needs_evidence"/,
+    /assessPlanEvidenceReadiness\(\{[\s\S]*joinedEvidenceReadiness\.status === "ready_for_plan"[\s\S]*setPlanRuntimePhase\(\s*"needs_evidence"/,
   );
   assert.match(
     assistantCompletionSource,

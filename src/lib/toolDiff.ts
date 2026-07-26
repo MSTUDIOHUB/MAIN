@@ -1,6 +1,7 @@
 import { getChatTempRoot, readChatTempFile, readFile } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
 import { previewApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import { buildLineDiff } from "./diff";
 
 export interface ToolDiffPreview {
   old: string;
@@ -8,6 +9,71 @@ export interface ToolDiffPreview {
   path?: string;
   existed?: boolean;
   fullFile?: boolean;
+}
+
+export interface ToolDiffChangedRange {
+  path: string;
+  startLine: number;
+  endLine: number;
+  maxLines: number;
+}
+
+/**
+ * Retain one concrete source locus from an observed full-file mutation diff.
+ * This is recovery metadata only: it does not infer intent or validate the
+ * edit. When a whole-file rewrite contains several hunks, the hunk with the
+ * most changed lines is the safest bounded place to reopen after validation.
+ */
+export function resolveToolDiffChangedRange(
+  preview?: ToolDiffPreview | null,
+): ToolDiffChangedRange | null {
+  const path = String(preview?.path || "").trim();
+  if (!preview?.fullFile || !path || preview.old === preview.new) return null;
+
+  const changedPositions: number[] = [];
+  let newLine = 1;
+  for (const line of buildLineDiff(preview.old, preview.new)) {
+    if (line.type === "unchanged") {
+      newLine += 1;
+      continue;
+    }
+    changedPositions.push(Math.max(1, newLine));
+    if (line.type === "added") newLine += 1;
+  }
+  if (changedPositions.length === 0) return null;
+
+  const hunks: Array<{
+    startLine: number;
+    endLine: number;
+    changedLines: number;
+  }> = [];
+  for (const position of changedPositions) {
+    const current = hunks[hunks.length - 1];
+    if (current && position - current.endLine <= 3) {
+      current.endLine = Math.max(current.endLine, position);
+      current.changedLines += 1;
+    } else {
+      hunks.push({
+        startLine: position,
+        endLine: position,
+        changedLines: 1,
+      });
+    }
+  }
+  const selected = hunks.reduce((best, candidate) => {
+    if (candidate.changedLines !== best.changedLines) {
+      return candidate.changedLines > best.changedLines ? candidate : best;
+    }
+    const candidateSpan = candidate.endLine - candidate.startLine;
+    const bestSpan = best.endLine - best.startLine;
+    return candidateSpan >= bestSpan ? candidate : best;
+  });
+  return {
+    path,
+    startLine: selected.startLine,
+    endLine: selected.endLine,
+    maxLines: selected.endLine - selected.startLine + 1,
+  };
 }
 
 export function supportsToolDiffPreview(toolName: string): boolean {

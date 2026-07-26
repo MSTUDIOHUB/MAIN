@@ -33,7 +33,7 @@ export function pauseApprovedPlanStreamWatchdog(input: {
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
   message: string;
   logContext?: Record<string, unknown>;
-}): boolean {
+}): { reason: string; message: string } | null {
   const {
     callbacks,
     iteration,
@@ -44,7 +44,7 @@ export function pauseApprovedPlanStreamWatchdog(input: {
     logContext,
   } = input;
   if (!callbacks.getIsPlanApproved() || !isStreamWatchdogTimeoutMessage(message)) {
-    return false;
+    return null;
   }
 
   const language = callbacks.getPreferredLanguage();
@@ -75,7 +75,7 @@ export function pauseApprovedPlanStreamWatchdog(input: {
         `Suggested recovery: ${nextStep}.`,
       ].join("\n");
 
-  logAgentEvent("approved_plan_stream_watchdog_paused", {
+  logAgentEvent("approved_plan_stream_watchdog_boundary", {
     iteration,
     message: message.slice(0, 240),
     progressSignature: truncateForLog(progressSignature, 220),
@@ -104,5 +104,5 @@ export function pauseApprovedPlanStreamWatchdog(input: {
     },
   );
   callbacks.onStatusChange("idle");
-  return true;
+  return { reason: recoveryReason, message: pauseNotice };
 }

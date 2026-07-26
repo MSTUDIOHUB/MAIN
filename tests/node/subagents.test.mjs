@@ -40,6 +40,7 @@ const subagentJoinRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "s
 const toolActivityTracking = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolActivityTracking.ts"));
 const planMaterialization = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planMaterialization.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
+const runtimeTools = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeTools.ts"));
 
 function makeConfig(profile, overrides = {}) {
   return {
@@ -379,6 +380,40 @@ test("Auto delegation uses observed capacity health instead of assuming a fresh 
   subagents.reportSubagentCapacityFailure(policy, new Error("out of memory"));
   const degraded = subagents.getSubagentAdmissionHealth(policy);
   assert.equal(degraded.state, "degraded");
+});
+
+test("an explicit collaboration preference keeps its start boundary while allowed mode follows capacity", () => {
+  const runtimeHealth = (state) => ({
+    laneKey: "local:test",
+    profile: "local",
+    state,
+    activeChildren: 2,
+    queuedChildren: 1,
+    capacityLimit: 2,
+    memorySafety: "safe",
+    recentSuccessfulRuns: 1,
+    latestStartupMs: 240,
+    latestCapacityWaitMs: 10,
+  });
+  for (const state of ["busy", "degraded"]) {
+    const preferred = subagents.resolveDelegationDecision({
+      preference: "preferred",
+      phase: "context",
+      hasWorkspace: true,
+      runtimeHealth: runtimeHealth(state),
+    });
+    assert.equal(preferred.action, "admit");
+    assert.equal(preferred.reason, "explicit_preference");
+
+    const allowed = subagents.resolveDelegationDecision({
+      preference: "allowed",
+      phase: "context",
+      hasWorkspace: true,
+      runtimeHealth: runtimeHealth(state),
+    });
+    assert.equal(allowed.action, "defer");
+    assert.equal(allowed.reason, `runtime_capacity_${state}`);
+  }
 });
 
 test("queued children reserve parent access while allowing independent read-only peers", async () => {
@@ -1481,6 +1516,160 @@ test("async spawn returns a handle before completion and wait preserves structur
   }), null);
 });
 
+test("minimal model spawn input is completed into a strict read-only work item", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const parentCallbacks = {
+    getConfig: () => makeConfig("local"),
+    getPreferredLanguage: () => "en",
+    getSessionKey: () => "thread-minimal-spawn",
+    getMessages: () => [{ role: "user", content: "parent" }],
+  };
+  const handle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      objective: "Inspect the toolbar filename rendering behavior.",
+    },
+    parentCallbacks,
+    parentTurnId: "turn-minimal-spawn",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/components/toolbar.js",
+        "toolbar filename rendering",
+      );
+      childCallbacks.onAssistantFinalText("The toolbar rendering owner was inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(handle.status, "queued");
+  assert.deepEqual(handle.allowedPaths, ["."]);
+  assert.match(handle.scopeKey, /^delegated-task-/);
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-minimal-spawn",
+    parentTurnId: "turn-minimal-spawn",
+    subagentIds: [handle.subagentId],
+  });
+  assert.equal(joined.results[0].closureAudit.state, "satisfied");
+  assert.equal(joined.results[0].evidence[0].target, "src/components/toolbar.js");
+});
+
+test("an implement request without an exact write scope starts as a safe read-only child", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const debugEvents = [];
+  const handle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      taskKey: "FixFilePathDisplay",
+      taskKind: "implement",
+      objective: "Find and fix the duplicated filename display.",
+      accessMode: "write",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-missing-write-scope",
+      getMessages: () => [{ role: "user", content: "parent" }],
+      getCurrentRunIntent: () => "execute",
+      getRuntimeRunIntent: () => "execute",
+      getExecutionConsentGranted: () => true,
+      onDebugEvent: (event, data) => debugEvents.push({ event, data }),
+    },
+    parentTurnId: "turn-missing-write-scope",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/components/toolbar.js",
+        "The toolbar renders a duplicate filename label.",
+      );
+      childCallbacks.onAssistantFinalText("The parent should remove the duplicate label.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(handle.status, "queued");
+  assert.deepEqual(handle.allowedPaths, ["."]);
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-missing-write-scope",
+    parentTurnId: "turn-missing-write-scope",
+    subagentIds: [handle.subagentId],
+  });
+  assert.equal(joined.results[0].closureAudit.state, "satisfied");
+  assert.ok(debugEvents.some((entry) =>
+    entry.event === "delegation_scope_decision" &&
+    entry.data?.decision === "downgraded" &&
+    entry.data?.reason === "missing_exact_write_scope"
+  ));
+});
+
+test("collaboration keeps the canonical parent owner while projecting the visible Turn", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const events = [];
+  const handle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      objective: "Inspect one exact source owner.",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-owner-split",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-canonical",
+    presentationTurnId: "turn-visible",
+    existingRunCount: 0,
+    emitEvent: (event) => events.push(event),
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        "canonical owner evidence",
+      );
+      childCallbacks.onAssistantFinalText("The canonical owner was inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(handle.status, "queued");
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds(
+      "thread-owner-split",
+      "turn-canonical",
+    ),
+    [handle.subagentId],
+  );
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds(
+      "thread-owner-split",
+      "turn-visible",
+    ),
+    [],
+  );
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-owner-split",
+    parentTurnId: "turn-canonical",
+    subagentIds: [handle.subagentId],
+  });
+  assert.equal(joined.results[0].status, "completed");
+  assert.equal(
+    events.find((event) => event.type === "subagent.created")?.turnId,
+    "turn-visible",
+  );
+  assert.equal(
+    events.find((event) => event.type === "subagent.created")?.subagent?.parentTurnId,
+    "turn-visible",
+  );
+  assert.equal(
+    events.find((event) => event.type === "subagent.closed")?.turnId,
+    "turn-visible",
+  );
+});
+
 test("a fresh dependent child receives verified observations but no prior child context", async () => {
   subagents.resetSubagentRuntimeForTests();
   const events = [];
@@ -2178,6 +2367,7 @@ test("runtime parent join injects structured child evidence before finalization"
           status: "completed",
           summary: "Found the event boundary.",
           summaryTrust: "unverified_hypothesis",
+          parentHandoff: "Replace the unrelated status bar implementation.",
           evidence: [{
             tool: "read_file",
             target: "src/lib/turnEvents.ts",
@@ -2214,9 +2404,11 @@ test("runtime parent join injects structured child evidence before finalization"
   assert.deepEqual(joined.requestedIds, ["subagent-euler", "subagent-mendel"]);
   assert.deepEqual(joined.resultIds, ["subagent-euler"]);
   assert.match(messages[0].content, /SUBAGENT_JOIN_RESULT/);
-  assert.match(messages[0].content, /unverified child hypothesis/);
+  assert.match(messages[0].content, /unverified recommendations/);
   assert.match(messages[0].content, /targeted parent read_file/);
   assert.match(messages[0].content, /src\/lib\/turnEvents\.ts/);
+  assert.doesNotMatch(messages[0].content, /Found the event boundary/);
+  assert.doesNotMatch(messages[0].content, /Replace the unrelated status bar/);
   assert.doesNotMatch(messages[0].content, /factReferences/);
   assert.equal(messages[0].content.length < 6_000, true);
   assert.deepEqual(recent.map((entry) => [entry.name, entry.target]), [["read_file", "src/lib/turnEvents.ts"]]);
@@ -2264,6 +2456,8 @@ test("runtime parent join preserves a joined result without claiming empty evide
     adoptedEvidenceCount: 0,
     sourceEvidenceCount: 0,
     requiredParentRereads: 0,
+    adoptedMutationEvidenceCount: 0,
+    adoptedMutationTargets: [],
     taskOutcomes: [],
   });
   assert.equal(messages.length, 1, "the parent still receives the joined child result");
@@ -2447,6 +2641,29 @@ test("iteration boundary with substantive evidence is a degraded partial result,
   assert.match(result.summary, /bounded partial result/);
   assert.equal(result.evidence.length, 1);
   assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
+});
+
+test("wall-clock timeout preserves substantive observations as a partial handoff", () => {
+  assert.equal(subagentRuntime.resolveTimedOutSubagentEvidenceStatus({
+    status: "blocked",
+    wallClockTimedOut: true,
+    substantiveEvidenceCount: 8,
+  }), "degraded");
+  assert.equal(subagentRuntime.resolveTimedOutSubagentEvidenceStatus({
+    status: "blocked",
+    wallClockTimedOut: true,
+    substantiveEvidenceCount: 0,
+  }), "blocked");
+  assert.equal(subagentRuntime.resolveTimedOutSubagentEvidenceStatus({
+    status: "blocked",
+    wallClockTimedOut: false,
+    substantiveEvidenceCount: 8,
+  }), "blocked");
+  assert.equal(subagentRuntime.resolveTimedOutSubagentEvidenceStatus({
+    status: "canceled",
+    wallClockTimedOut: true,
+    substantiveEvidenceCount: 8,
+  }), "canceled");
 });
 
 test("a stream failure after substantive child evidence preserves that evidence for parent join", async () => {
@@ -2744,6 +2961,298 @@ test("implement tasks cannot acquire a write lease without parent authority", ()
     ),
     0,
   );
+});
+
+test("approved Plan children inherit only exact reviewed write targets", async () => {
+  const planTasks = [{
+    id: "task-reviewed-main",
+    title: "Repair the viewer entry point",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  }];
+  const makeApprovedCallbacks = (threadId) => ({
+    getConfig: () => makeConfig("local"),
+    getPreferredLanguage: () => "en",
+    getSessionKey: () => threadId,
+    getMessages: () => [],
+    getCurrentRunIntent: () => "execute",
+    getRuntimeRunIntent: () => "execute",
+    getExecutionConsentGranted: () => false,
+    getIsPlanApproved: () => true,
+    getPlanTasks: () => planTasks,
+  });
+  const makeWriteRequest = (allowedPaths) => ({
+    taskKey: `approved-write-${allowedPaths}`,
+    taskKind: "implement",
+    objective: "Apply one reviewed source correction.",
+    allowedPaths,
+    accessMode: "write",
+  });
+
+  for (const [index, allowedPaths] of [
+    "src/components/editor.js",
+    "src",
+  ].entries()) {
+    subagents.resetSubagentRuntimeForTests();
+    let started = false;
+    const deferred = subagentRuntime.scheduleControlledSubagent({
+      request: makeWriteRequest(allowedPaths),
+      parentCallbacks: makeApprovedCallbacks(`thread-plan-scope-${index}`),
+      parentTurnId: `turn-plan-scope-${index}`,
+      existingRunCount: 0,
+      emitEvent: () => {},
+      executeAgentLoop: async () => {
+        started = true;
+        throw new Error("out-of-scope child must not start");
+      },
+    });
+    assert.equal(deferred.status, "deferred");
+    assert.equal(deferred.reason, "write_not_authorized");
+    assert.equal(started, false);
+  }
+
+  subagents.resetSubagentRuntimeForTests();
+  const admitted = subagentRuntime.scheduleControlledSubagent({
+    request: makeWriteRequest("src/main.js"),
+    parentCallbacks: makeApprovedCallbacks("thread-plan-scope-exact"),
+    parentTurnId: "turn-plan-scope-exact",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        "reviewed source",
+      );
+      childCallbacks.onAssistantFinalText("The reviewed source target was inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+  assert.equal(admitted.status, "queued");
+  await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-plan-scope-exact",
+    parentTurnId: "turn-plan-scope-exact",
+    subagentIds: [admitted.subagentId],
+  });
+});
+
+test("active parent recovery admits read children but never grants a child write lease", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const recoveryCallbacks = {
+    getConfig: () => makeConfig("local"),
+    getPreferredLanguage: () => "en",
+    getSessionKey: () => "thread-recovery-child",
+    getMessages: () => [],
+    getCurrentRunIntent: () => "execute",
+    getRuntimeRunIntent: () => "execute",
+    getExecutionConsentGranted: () => true,
+    getIsPlanApproved: () => false,
+    getPlanTasks: () => [],
+    getForcedExecuteRecoveryState: () => ({
+      mode: "mutation_first",
+      expectedTarget: "src/main.js",
+    }),
+  };
+  const readHandle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      objective: "Independently inspect the current recovery target.",
+    },
+    parentCallbacks: recoveryCallbacks,
+    parentTurnId: "turn-recovery-child",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        "recovery source evidence",
+      );
+      childCallbacks.onAssistantFinalText("The recovery target was inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+  assert.equal(readHandle.status, "queued");
+  await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-recovery-child",
+    parentTurnId: "turn-recovery-child",
+    subagentIds: [readHandle.subagentId],
+  });
+
+  let writeStarted = false;
+  const writeHandle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      taskKey: "recovery-write",
+      taskKind: "implement",
+      objective: "Modify the recovery target.",
+      allowedPaths: "src/main.js",
+      accessMode: "write",
+    },
+    parentCallbacks: recoveryCallbacks,
+    parentTurnId: "turn-recovery-child",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async () => {
+      writeStarted = true;
+      throw new Error("recovery child write must not start");
+    },
+  });
+  assert.equal(writeHandle.status, "deferred");
+  assert.equal(writeHandle.reason, "write_not_authorized");
+  assert.equal(writeStarted, false);
+});
+
+test("authorized write children use the direct lease instead of an empty approved Plan", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const defaultToolPolicy = {
+    autoExecuteRiskLevels: ["read_only", "external_read"],
+    approvalRequiredRiskLevels: [
+      "local_file_read",
+      "workspace_write",
+      "shell",
+      "external_write",
+      "browser_control",
+      "destructive",
+    ],
+    disabledRiskLevels: [],
+  };
+  let childLedger = [];
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      taskKey: "repair-main-viewer",
+      taskKind: "implement",
+      objective: "Apply one exact source correction in the viewer entry point.",
+      delegationReason: "The edit is bounded to one independently owned file.",
+      successCriteria: "Return a structured diff for src/main.js.",
+      requiredPaths: "src/main.js",
+      allowedPaths: "src/main.js",
+      accessMode: "write",
+      expectedOutput: "Source-backed read and mutation evidence.",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-write-child",
+      getMessages: () => [],
+      getCurrentRunIntent: () => "execute",
+      getRuntimeRunIntent: () => "execute",
+      getExecutionConsentGranted: () => true,
+      getIsPlanApproved: () => false,
+      getApprovedLocalFileReadPaths: () => [],
+    },
+    parentTurnId: "turn-write-child",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      assert.equal(childCallbacks.getIsPlanApproved(), false);
+      assert.deepEqual(childCallbacks.getPlanTasks(), []);
+      assert.deepEqual(childCallbacks.getAutoApproveToolScopes(), ["workspace_write"]);
+
+      const planned = runtimeTools.planRuntimeToolCall({
+        toolCall: {
+          id: "replace-main",
+          name: "replace_in_file",
+          arguments: JSON.stringify({
+            path: "src/main.js",
+            search_text: "const before = true;",
+            replace_text: "const before = false;",
+          }),
+        },
+        workspace: "/workspace",
+        availableToolNames: new Set(["read_file", "replace_in_file"]),
+        capabilityRegistry: {
+          tools: {
+            replace_in_file: {
+              source: "built_in",
+              risk: "workspace_write",
+              autoExecutable: false,
+              enabled: true,
+            },
+          },
+          policy: defaultToolPolicy,
+        },
+        toolPermissionPolicy: defaultToolPolicy,
+        approvedLocalFileReadPaths: [],
+        autoApproveToolScopes: childCallbacks.getAutoApproveToolScopes(),
+        workflowMode: childCallbacks.getWorkflowMode(),
+        runtimeIntent: childCallbacks.getRuntimeRunIntent(),
+        isPlanApproved: childCallbacks.getIsPlanApproved(),
+        planTaskCount: childCallbacks.getPlanTasks().length,
+        getToolTarget: (_name, args) => String(args.path || ""),
+        isPreApprovalPlanDraftWrite: () => false,
+        isExecutionPlanArtifactWrite: () => false,
+        isTasksPlanWrite: () => false,
+      });
+      assert.equal(planned.action, "auto_execute");
+      assert.notEqual(planned.reason, "missing_tasks_before_source");
+
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        "const before = true;",
+      );
+      childCallbacks.onToolDone(
+        "replace_in_file",
+        "src/main.js",
+        "Updated src/main.js",
+        {
+          toolCallId: "replace-main",
+          executionName: "replace_in_file",
+          executedArgs: {
+            path: "src/main.js",
+            search_text: "const before = true;",
+            replace_text: "const before = false;",
+          },
+          diff: {
+            path: "src/main.js",
+            old: "const before = true;",
+            new: "const before = false;",
+          },
+        },
+      );
+      childCallbacks.onToolResultObserved?.({
+        toolCallId: "replace-main",
+        name: "replace_in_file",
+        target: "src/main.js",
+        content: "Updated src/main.js",
+        isError: false,
+        workspaceMutationEvidence: {
+          changedPaths: ["src/main.js"],
+          diff: {
+            path: "src/main.js",
+            old: "const before = true;",
+            new: "const before = false;",
+          },
+        },
+      });
+      childLedger = childCallbacks.getPlanExecutionEvidenceLedger();
+      childCallbacks.onAssistantFinalText([
+        "## Findings",
+        "Applied the exact replacement in src/main.js.",
+        "## Uncertainty",
+        "None.",
+        "## Remaining In-Scope Work",
+        "None.",
+        "## Parent Handoff",
+        "Review the joined diff before closing the parent Turn.",
+      ].join("\n"));
+      return { status: "completed", resultKind: "success", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(childLedger.length, 1);
+  assert.equal(childLedger[0].kind, "file");
+  assert.equal(childLedger[0].target, "src/main.js");
+  assert.equal(result.status, "completed");
+  assert.equal(result.mutationEvidence?.length, 1);
+  assert.equal(result.mutationEvidence?.[0]?.target, "src/main.js");
+  assert.equal(result.mutationEvidence?.[0]?.transactionId, result.subagentId);
+  assert.equal(result.evidence.some((item) =>
+    item.tool === "replace_in_file" && item.target === "src/main.js"
+  ), true);
+  assert.match(result.parentHandoff || "", /parent_validation_required/);
 });
 
 test("scope leases reject child escape and serialize only conflicting access modes", () => {

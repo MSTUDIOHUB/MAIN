@@ -167,7 +167,7 @@ test("partial abort reconciles observed tool results before returning and closes
   assert.notEqual(abortedReturnIndex, -1);
   assert.ok(postProcessIndex < abortedReturnIndex);
   assert.match(phaseSource, /const wasAborted = toolExecutionRound\.status === "aborted"/);
-  assert.match(phaseSource, /if \(wasAborted\) \{[\s\S]*?appendToolResultsToHistory\(\{/);
+  assert.match(phaseSource, /if \(wasAborted\) \{[\s\S]*?commitToolResultBatch\(\{/);
   assert.match(phaseSource, /observedToolCallIds/);
   assert.match(phaseSource, /TOOL_CALL_ABORTED/);
   assert.match(phaseSource, /lifecycleState: "blocked"/);

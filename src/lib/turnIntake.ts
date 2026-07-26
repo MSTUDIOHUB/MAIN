@@ -60,9 +60,16 @@ export function resolveEffectiveSubagentDelegationPreference(input: {
   defaultPreference?: SubagentDelegationPreference;
 }): SubagentDelegationPreference {
   const explicitPreference = resolveSubagentDelegationPreference(input.rawUserInput);
-  return explicitPreference !== "unspecified"
-    ? explicitPreference
-    : normalizeSubagentDelegationPreference(input.defaultPreference);
+  const defaultPreference = normalizeSubagentDelegationPreference(
+    input.defaultPreference,
+  );
+  if (explicitPreference === "unspecified") return defaultPreference;
+  if (explicitPreference === "forbidden") return "forbidden";
+  if (explicitPreference === "preferred") return "preferred";
+  // The Composer collaboration switch is an explicit one-Turn start
+  // boundary. Permissive wording such as "可以启动子智能体" agrees with that
+  // boundary and must not silently weaken it from preferred to allowed.
+  return defaultPreference === "preferred" ? "preferred" : "allowed";
 }
 
 type MessageLike = {
@@ -136,8 +143,8 @@ export function buildTurnIntakeContextBlock(input: {
 
   if (subagentPreference === "preferred") {
     lines.push(input.language === "en"
-      ? "delegation: Collaboration is allowed and preferred, but optional. First understand the user's intent and problem structure, then create 0–N fresh one-shot agents only for narrow semantic tasks with independent success criteria and worthwhile parallel value. Never split work by directory alone. Each child gets one immutable task, is permanently closed at terminal state, and is never reused; only verified compact evidence may be passed to a later fresh child. Continue non-overlapping parent work and join dependencies before finalizing."
-      : "delegation: 本轮允许并优先考虑协作，但不是强制配额。先理解用户意图和问题结构，只在并行收益明确时为具有独立成功标准的窄语义任务创建 0～N 个全新一次性子智能体；绝不能仅按目录拆分。每个子智能体只执行一个不可变任务，终态后永久关闭且不得复用；后续新实例只能接收已验证的精简证据。主体并行推进不重叠工作，并在依赖结果或最终回答前汇合。");
+      ? "delegation: Collaboration is enabled for this turn. Before doing parent workspace work, create one fresh one-shot agent for a narrow semantic task with an independent success criterion and worthwhile parallel value. This is one start boundary, not a quota: create more children only when useful, never split work by directory alone, and never reuse a terminal child. Continue non-overlapping parent work, inspect child evidence or diffs, and keep final validation and completion with the parent."
+      : "delegation: 本轮已开启协作。主体开始工作区操作前，先为一个具有独立成功标准和并行价值的窄语义任务创建一个全新的一次性子智能体。这只是一次启动边界，不是数量配额：后续仅在确有价值时继续创建，绝不能仅按目录拆分，也不得复用已终止实例。主体并行推进不重叠工作，检查子智能体的证据或差异，并由主体负责最终验证与完成。");
   } else if (subagentPreference === "forbidden") {
     lines.push(input.language === "en"
       ? "delegation: The user explicitly disabled subagents for this turn."

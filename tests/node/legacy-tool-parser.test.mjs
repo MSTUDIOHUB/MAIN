@@ -173,23 +173,13 @@ test("parses every registered built-in tool from XML without registry drift", ()
   }
 });
 
-test("native collaboration schemas expose the complete one-shot semantic contract", () => {
+test("native collaboration schema keeps model ingress minimal and runtime metadata optional", () => {
   const spawn = TOOL_DEFINITIONS.find((tool) => tool.function.name === "spawn_subagent");
   const wait = TOOL_DEFINITIONS.find((tool) => tool.function.name === "wait_subagents");
   const cancel = TOOL_DEFINITIONS.find((tool) => tool.function.name === "cancel_subagent");
 
   assert.ok(spawn);
-  assert.deepEqual(spawn.function.parameters.required, [
-    "task_key",
-    "task_kind",
-    "objective",
-    "delegation_reason",
-    "success_criteria",
-    "required_paths",
-    "allowed_paths",
-    "access_mode",
-    "expected_output",
-  ]);
+  assert.deepEqual(spawn.function.parameters.required, ["objective"]);
   assert.deepEqual(spawn.function.parameters.properties.task_kind.enum, [
     "explore",
     "review",

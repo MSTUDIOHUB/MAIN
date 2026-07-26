@@ -41,7 +41,11 @@ test("assistant completion phase owns the no-tool assistant completion ordering"
   assert.match(phaseSource, /precompletion_evidence_recovery_activated/);
   assert.match(
     phaseSource,
-    /validationExpected: input\.effectiveTurnContract\?\.validationExpected === true/,
+    /resolveJoinedSubagentMutationValidationRecovery\(\{[\s\S]*?joined_subagent_mutation_requires_parent_validation[\s\S]*?parent_join_mutation_validation_activated/,
+  );
+  assert.match(
+    phaseSource,
+    /validationExpectedForThisRun[\s\S]*?getSubagentDepth\?\.\(\)[\s\S]*?validationExpected === true/,
   );
   assert.doesNotMatch(
     phaseSource,

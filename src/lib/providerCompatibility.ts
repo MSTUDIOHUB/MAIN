@@ -52,6 +52,26 @@ export interface ProviderCompatibilityModeOptions {
   replacementPlanAuthoringContract?: string;
 }
 
+/**
+ * Some OpenAI-compatible reasoning endpoints accept native tools but reject
+ * only the `tool_choice=required` request constraint. Treat that as a narrow
+ * request-shape capability miss so callers can preserve the native tool
+ * catalog and retry with the provider's default (`auto`) selection.
+ */
+export function isRequiredToolChoiceCompatibilityErrorMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  const namesToolChoice =
+    normalized.includes("tool_choice") ||
+    normalized.includes("tool choice");
+  const namesRequired =
+    /(?:^|[^a-z])required(?:[^a-z]|$)/.test(normalized);
+  const rejectsValue =
+    /(?:not supported|unsupported|does not support|doesn't support|not allowed|invalid|unknown|unrecognized|must be|only supports?|supported values?)/.test(
+      normalized,
+    );
+  return namesToolChoice && namesRequired && rejectsValue;
+}
+
 export function isProviderCompatibilityErrorMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
   return (
@@ -59,7 +79,6 @@ export function isProviderCompatibilityErrorMessage(message: string): boolean {
     normalized.includes("unsupported responses") ||
     normalized.includes("responses api is not supported") ||
     normalized.includes("responses api not supported") ||
-    normalized.includes("invalid_request_error") ||
     normalized.includes("invalid type for") ||
     normalized.includes("unsupported parameter") ||
     normalized.includes("unknown parameter") ||
@@ -69,6 +88,7 @@ export function isProviderCompatibilityErrorMessage(message: string): boolean {
     normalized.includes('invalid "messages"') ||
     normalized.includes("invalid messages") ||
     normalized.includes("messages[") ||
+    normalized.includes("reasoning_content") ||
     normalized.includes("tool_calls") ||
     normalized.includes("\"tools\"") ||
     normalized.includes("'tools'") ||
@@ -326,6 +346,136 @@ export function buildCompatibilityRetryMessages(
         : {}),
     };
   });
+}
+
+export interface NativeToolHistoryIsolationResult {
+  messages: CompatibilityMessage[];
+  changed: boolean;
+  isolatedToolNames: string[];
+}
+
+export const NATIVE_TOOL_HISTORY_RESULT_BUDGET_CHARS = 24_000;
+export const NATIVE_TOOL_HISTORY_RESULT_MAX_CHARS = 6_000;
+
+function boundHistoricalToolResult(
+  content: string,
+  maxChars: number,
+): string {
+  const text = String(content || "");
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 0) {
+    return `[Historical tool result omitted: ${text.length} chars]`;
+  }
+  const marker = `\n...[historical result compacted from ${text.length} chars]...\n`;
+  if (marker.length >= maxChars) {
+    return `[Historical tool result compacted: ${text.length} chars]`;
+  }
+  const retainedChars = maxChars - marker.length;
+  const headChars = Math.ceil(retainedChars / 2);
+  const tailChars = Math.floor(retainedChars / 2);
+  return `${text.slice(0, headChars)}${marker}${text.slice(-tailChars)}`;
+}
+
+/**
+ * A narrowed recovery request may expose a different tool catalog from the
+ * preceding turns. Smaller/local models can copy a native function name from
+ * historical assistant tool_calls even when that function is absent from the
+ * current request. If such stale calls exist, flatten the complete historical
+ * native call/result chain into ordinary transcript text while keeping the
+ * current request's native tool catalog intact.
+ *
+ * Flattening the complete chain (rather than deleting only stale calls)
+ * preserves Chat Completions call/result adjacency. Result bodies are retained
+ * newest-first under a fixed request budget because recovery checkpoints
+ * separately pin the current source/diagnostic evidence; replaying every old
+ * search and file window can otherwise make a small-model repair request grow
+ * without bound. Canonical runtime history is not mutated.
+ */
+export function isolateNativeToolHistoryForActiveSurface(
+  messages: CompatibilityMessage[],
+  activeToolNames: Iterable<string>,
+): NativeToolHistoryIsolationResult {
+  const activeTools = new Set(
+    [...activeToolNames]
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  );
+  const toolNamesByCallId = new Map<string, string>();
+  const isolatedToolNames = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const toolCall of message.tool_calls) {
+      const toolName = String(toolCall.function?.name || "").trim();
+      const toolCallId = String(toolCall.id || "").trim();
+      if (toolCallId && toolName) toolNamesByCallId.set(toolCallId, toolName);
+      if (toolName && !activeTools.has(toolName)) isolatedToolNames.add(toolName);
+    }
+  }
+  if (isolatedToolNames.size === 0) {
+    return { messages, changed: false, isolatedToolNames: [] };
+  }
+
+  const boundedToolResults = new Map<number, string>();
+  let remainingResultBudget = NATIVE_TOOL_HISTORY_RESULT_BUDGET_CHARS;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "tool") continue;
+    const text = typeof message.content === "string"
+      ? message.content
+      : extractCompatibilityTextContent(message.content);
+    const resultBudget = Math.min(
+      NATIVE_TOOL_HISTORY_RESULT_MAX_CHARS,
+      remainingResultBudget,
+    );
+    boundedToolResults.set(
+      index,
+      boundHistoricalToolResult(text, resultBudget),
+    );
+    remainingResultBudget = Math.max(
+      0,
+      remainingResultBudget - Math.min(text.length, resultBudget),
+    );
+  }
+
+  const isolatedMessages = messages.map((message, index): CompatibilityMessage => {
+    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+      const callNames = message.tool_calls
+        .map((toolCall) => String(toolCall.function?.name || "").trim())
+        .filter(Boolean);
+      const text = extractCompatibilityTextContent(message.content);
+      const { tool_calls: _toolCalls, ...withoutToolCalls } = message;
+      return {
+        ...withoutToolCalls,
+        role: "assistant",
+        content: [
+          text,
+          callNames.length > 0
+            ? `[Historical tool calls: ${callNames.join(", ")}]`
+            : "[Historical tool call]",
+        ].filter(Boolean).join("\n"),
+      };
+    }
+    if (message.role === "tool") {
+      const toolName = message.tool_call_id
+        ? toolNamesByCallId.get(message.tool_call_id)
+        : "";
+      const text = boundedToolResults.get(index) || "";
+      return {
+        role: "user",
+        content: [
+          `[Historical tool result${toolName ? `: ${toolName}` : ""}]`,
+          text,
+        ].filter(Boolean).join("\n"),
+      };
+    }
+    return message;
+  });
+
+  return {
+    messages: isolatedMessages,
+    changed: true,
+    isolatedToolNames: [...isolatedToolNames].sort(),
+  };
 }
 
 function stripCompatibilityMeta(line: string): boolean {

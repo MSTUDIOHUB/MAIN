@@ -61,6 +61,11 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/loopGuardRuntimeState.ts"),
 );
+const {
+  registerToolCallForRepeatGuard,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/repetitionGuard.ts"),
+);
 
 test("loop guard runtime state initializes the unified no-progress and repeat guards", () => {
   const state = createAgentLoopGuardRuntimeState();
@@ -211,9 +216,16 @@ test("a durable mutation starts a fresh loop-guard progress epoch", () => {
   state.noProgressBatchRepeatCount = 2;
   state.consecutiveReadFileOnlyCacheHits = 3;
   state.lastReadFileOnlyObservationSignature = "read:src/App.tsx";
-  state.recentToolCalls.push({ name: "run_command", argsKey: "npm test" });
+  state.recentToolCalls.push(
+    { name: "run_command", argsKey: "npm test" },
+    { name: "replace_in_file", argsKey: "same-edit", readOnly: false },
+  );
   state.recentTargetToolCalls.push({ name: "apply_patch", targetKey: "src/App.tsx", family: "edit" });
   state.repeatGuardRecoveredSignatures.add("repeat");
+  state.repeatGuardRecoveredSignatures.add("replace_in_file::same-edit");
+  state.repeatGuardRecoveredSignatures.add(
+    "replace_in_file::same-edit:strategy:current_task_action_lock",
+  );
   state.targetProgressGuardRecoveredSignatures.add("target");
   state.failedToolCallCounts.set("run_command:npm-test", 2);
 
@@ -226,11 +238,52 @@ test("a durable mutation starts a fresh loop-guard progress epoch", () => {
     lastReadFileOnlyObservationSignature: "",
     noProgressStrategyPivots: [],
   });
-  assert.equal(next.recentToolCalls.length, 0);
+  assert.deepEqual(next.recentToolCalls, [
+    { name: "run_command", argsKey: "npm test" },
+    { name: "replace_in_file", argsKey: "same-edit", readOnly: false },
+  ]);
   assert.equal(next.recentTargetToolCalls.length, 0);
-  assert.equal(next.repeatGuardRecoveredSignatures.size, 0);
+  assert.deepEqual([...next.repeatGuardRecoveredSignatures], [
+    "replace_in_file::same-edit",
+    "replace_in_file::same-edit:strategy:current_task_action_lock",
+  ]);
   assert.equal(next.targetProgressGuardRecoveredSignatures.size, 0);
   assert.equal(next.failedToolCallCounts.size, 0);
+});
+
+test("successful mutation epochs retain exact edit calls so repeated insertions converge", () => {
+  const state = createAgentLoopGuardRuntimeState();
+  const args = {
+    path: "src/main.js",
+    search_text: "// Recent files",
+    replace_text: "function duplicateHelper() {}\n// Recent files",
+  };
+
+  let result = registerToolCallForRepeatGuard(
+    state.recentToolCalls,
+    "replace_in_file",
+    args,
+    false,
+  );
+  assert.equal(result.repeated, false);
+  resetLoopGuardRuntimeStateAfterMutation(state);
+
+  result = registerToolCallForRepeatGuard(
+    state.recentToolCalls,
+    "replace_in_file",
+    args,
+    false,
+  );
+  assert.equal(result.repeated, false);
+  resetLoopGuardRuntimeStateAfterMutation(state);
+
+  result = registerToolCallForRepeatGuard(
+    state.recentToolCalls,
+    "replace_in_file",
+    args,
+    false,
+  );
+  assert.equal(result.repeated, true);
 });
 
 test("browser readiness preflight blocks do not poison real browser failure counts", () => {

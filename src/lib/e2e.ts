@@ -66,6 +66,7 @@ import {
   reduceCanonicalTurnRuntime,
 } from "./turnRuntimeContract";
 import { createTurnRuntimeCheckpoint } from "./turnRuntimeCheckpoint";
+import { buildAssistantStageCheckpoint } from "./assistantProgressPresentation";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -130,6 +131,7 @@ const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collaps
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
+const CAPSULE_PHASE_FALLBACK_SCENARIO = "capsule-phase-fallback";
 const GOAL_CAPSULE_SCENARIO = "goal-capsule";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
@@ -6719,7 +6721,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
   return cleanup;
 }
 
-function seedCapsuleProcessScenario(kind: "model" | "progress") {
+function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -6729,12 +6731,16 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
 
   const workspace = kind === "model"
     ? "/tmp/e2e-capsule-model-explanation"
-    : "/tmp/e2e-capsule-progress-only";
-  const sessionId = kind === "model" ? 999613 : 999614;
+    : kind === "progress"
+      ? "/tmp/e2e-capsule-progress-only"
+      : "/tmp/e2e-capsule-phase-fallback";
+  const sessionId = kind === "model" ? 999613 : kind === "progress" ? 999614 : 999616;
   const now = Date.now();
   const turnId = kind === "model"
     ? "e2e-capsule-model-explanation-turn"
-    : "e2e-capsule-progress-only-turn";
+    : kind === "progress"
+      ? "e2e-capsule-progress-only-turn"
+      : "e2e-capsule-phase-fallback-turn";
   const runId = `run-${turnId}`;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const firstUpdateId = useAppStore.getState()._nextTaskId();
@@ -6750,7 +6756,10 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: firstUpdateId,
       turnId,
       type: "agent" as const,
-      content: "阶段结论：\n- 已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
+      content: buildAssistantStageCheckpoint(
+        "已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
+        "zh",
+      ),
       visibility: "assistant_update" as const,
       streaming: false,
       publicProgress: {
@@ -6784,7 +6793,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
         createdAt: now,
       },
     }] : []),
-    {
+    ...(kind === "phase" ? [] : [{
       id: readToolId,
       turnId,
       type: "tool" as const,
@@ -6796,8 +6805,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       message: "OK",
       intentSummary: "确认 capsule 渲染链路",
       observationSummary: "找到 ChatArea 中 capsule 的显示优先级。",
-    },
-    {
+    }, {
       id: commandToolId,
       turnId,
       type: "tool" as const,
@@ -6809,12 +6817,15 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       message: "OK",
       intentSummary: "运行回归测试确认折叠状态",
       observationSummary: "验证命令已完成。",
-    },
+    }]),
     ...(kind === "model" ? [{
       id: secondUpdateId,
       turnId,
       type: "agent" as const,
-      content: "阶段结论：\n- 已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
+      content: buildAssistantStageCheckpoint(
+        "已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
+        "zh",
+      ),
       visibility: "assistant_update" as const,
       streaming: false,
       publicProgress: {
@@ -6829,7 +6840,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
         createdAt: now - 10,
       },
     }] : []),
-    {
+    ...(kind === "phase" ? [] : [{
       id: runningToolId,
       turnId,
       type: "tool" as const,
@@ -6840,7 +6851,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       toolStatus: "running" as const,
       message: "Searching...",
       intentSummary: "继续确认 capsule 不会被工具调用冲刷",
-    },
+    }]),
   ];
 
   useAppStore.setState((state) => ({
@@ -6857,7 +6868,11 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       [workspace]: [
         {
           id: sessionId,
-          title: kind === "model" ? "E2E Capsule Model Explanation" : "E2E Capsule Progress Only",
+        title: kind === "model"
+          ? "E2E Capsule Model Explanation"
+          : kind === "progress"
+            ? "E2E Capsule Progress Only"
+            : "E2E Capsule Phase Fallback",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -6903,7 +6918,11 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       {
         id: turnId,
         userPrompt: "继续排查 capsule 和工具折叠。",
-        title: kind === "model" ? "Capsule 模型说明缓存" : "Capsule 工具进度兜底",
+        title: kind === "model"
+          ? "Capsule 模型说明缓存"
+          : kind === "progress"
+            ? "Capsule 工具进度兜底"
+            : "Capsule 活跃阶段兜底",
         mode: "edit",
         intent: "execute",
         status: "executing",
@@ -6935,7 +6954,9 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
   bindBridgeSnapshot(
     kind === "model"
       ? CAPSULE_MODEL_EXPLANATION_SCENARIO
-      : CAPSULE_PROGRESS_ONLY_SCENARIO,
+      : kind === "progress"
+        ? CAPSULE_PROGRESS_ONLY_SCENARIO
+        : CAPSULE_PHASE_FALLBACK_SCENARIO,
   );
 
   const cleanup = () => {
@@ -8739,10 +8760,15 @@ function seedRealOmlxPlanFlowScenario() {
       })),
       planTasks: state.planTasks,
       planExecutionEvidence: state.planExecutionEvidenceLedger.map((entry) => ({
+        id: entry.id,
+        transactionId: entry.transactionId,
+        runId: entry.runId,
         kind: entry.kind,
         value: entry.value,
         target: entry.target,
         sourceTool: entry.sourceTool,
+        observationStatus: entry.observationStatus,
+        createdAt: entry.createdAt,
       })),
       goalStatus: state.goalStatus,
       activeGoal: state.activeGoal ? {
@@ -10952,6 +10978,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === CAPSULE_PROGRESS_ONLY_SCENARIO) {
     return seedCapsuleProcessScenario("progress");
+  }
+
+  if (scenario === CAPSULE_PHASE_FALLBACK_SCENARIO) {
+    return seedCapsuleProcessScenario("phase");
   }
 
   if (scenario === GOAL_CAPSULE_SCENARIO) {

@@ -2,12 +2,18 @@ import { workspacePathsReferToSameFile } from "./workspacePaths";
 import { isLocalDevServerHealthProbeCommand } from "./devServerRuntime";
 import { WORKSPACE_MUTATION_TOOL_NAMES } from "./workspaceMutationTools";
 import {
+  migrateLegacyDirectEditTransaction,
+  resolveDirectEditTransaction,
+  type DirectEditTransaction,
+} from "./directEditTransaction";
+import {
   isFinitePlanValidationCommand,
   planCommandEvidenceMatchesExecution,
 } from "./workflowModels";
 export {
   classifyFailedFiniteValidationOutcome,
   compactStructuredCommandResult,
+  summarizeSuccessfulValidationObservation,
   type FailedFiniteValidationOutcome,
 } from "./commandValidationOutcome";
 
@@ -19,6 +25,11 @@ export type ExecuteRecoveryMode =
   | "patch_recovery_read"
   | "validation_only"
   | "finite_validation_only";
+
+// Semantic fingerprints reject an identical validation-to-mutation retry.
+// This higher independent-action ceiling is only a final safety fuse for
+// objectives that legitimately require several distinct edits.
+export const MAX_VALIDATION_MUTATION_REOPENS = 8;
 
 export interface ExecuteRecoveryActivityLike {
   name?: string;
@@ -40,6 +51,11 @@ export interface ExecuteRecoveryBatchCallLike {
   id: string;
   name: string;
   target?: string;
+  /**
+   * Exact replacement and single-file update contracts may correct a weak
+   * targeting guess. Full-file writes and explicit read leases stay bound.
+   */
+  canRebindTarget?: boolean;
 }
 
 export interface ExecuteRecoveryBatchDecision {
@@ -100,7 +116,7 @@ export interface RecoveryReadLease {
   mismatchFingerprint?: string | null;
   /**
    * available: granted; active: the exact read is in flight; consumed: the
-   * one-shot lease is closed by a fresh observation or unchanged cache stub.
+   * one-shot lease is closed only by an exact source observation or source replay.
    * Only a new mismatch or source-version epoch may grant another lease.
    */
   state: "available" | "active" | "consumed";
@@ -137,34 +153,22 @@ export interface ExecutionDecisionCheckpoint {
   /** Exact finite validation that must succeed after the current repair. */
   pendingFiniteValidation?: PendingFiniteValidationCheckpoint | null;
   /**
-   * Validation-to-mutation transitions already spent for this unfinished
-   * objective. This is deliberately independent from generic recovery
-   * activations so patch/read retries cannot consume the bounded reopen.
+   * Latest bounded stdout/stderr diagnostic for the still-pending finite
+   * validation. It supersedes older repair prompts on every validation rerun.
+   */
+  finiteValidationFailureDetail?: string | null;
+  /** Workspace owners named by the latest finite-validation diagnostic. */
+  finiteValidationDiagnosticTargets?: string[];
+  /**
+   * Bounded validation-to-mutation transitions. Finite validation counts
+   * consecutive retries of the same diagnostic; assistant-proposed edits are
+   * additionally gated by their semantic fingerprints.
    */
   validationMutationReopenCount?: number;
   /** Semantic obligations already granted a validation -> mutation reopen. */
   validationMutationReopenFingerprints?: string[];
-  /** Exact mutations observed while the original turn objective is still open. */
-  objectiveMutationEvidence?: Array<{
-    target: string;
-    requirementRef?: string | null;
-  }>;
-  /** Stable structured identity for the unfinished objective transaction. */
-  objectiveObligationId?: string | null;
-  /** Monotonic objective revision retained across recovery/Goal continuations. */
-  objectiveRevision?: number;
-  /** Root Direct Edit objectives use an explicit audit; Plan/Goal use task evidence. */
-  objectiveKind?: "root" | "requirement";
-  /** Every exact workspace target that must have durable mutation evidence. */
-  objectiveExpectedTargets?: string[];
-  /** Exact successful validation associated with the current objective revision. */
-  objectiveValidationEvidence?: {
-    tool: string;
-    target: string;
-    revision: number;
-  } | null;
-  /** A write has evidence, but objective closure still awaits validation/audit. */
-  objectiveClosurePending?: boolean;
+  /** Canonical parent-owned read -> edit -> validate -> audit transaction. */
+  directEditTransaction?: DirectEditTransaction | null;
   /** Stable identity of a browser validation spec/runtime failure under diagnosis. */
   browserFailureFingerprint?: string | null;
   /** Exact cache-contract signature of a deterministic failed browser invocation. */
@@ -187,6 +191,48 @@ export const EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS: readonly ExecuteNoProgressStra
   "current_task_action_lock",
   "alternate_capability_reframe",
 ];
+
+/**
+ * Internal Execute boundaries that may yield to a fresh bounded Run without
+ * user input. This list is deliberately model/provider/language neutral and
+ * excludes permission, external-dependency, user-choice, and exhausted
+ * validation-repair boundaries.
+ */
+const AUTO_RESUMABLE_EXECUTION_BOUNDARY_REASONS = new Set([
+  "stream_no_visible_progress_timeout",
+  "stream_max_elapsed_timeout",
+  "execute_recovery_no_progress_limit",
+  "execute_no_progress_batch_loop",
+  "required_tool_call_protocol_violation",
+  "required_tool_call_protocol_violation_after_change",
+  "execute_no_action_after_change",
+  "execute_xml_text_without_action",
+  "execute_read_only_no_action_checkpoint",
+  "execute_missing_tool_reprompt_limit",
+  "execute_chat_repair_no_progress",
+  "empty_model_response",
+  "reasoning_dominated_no_action",
+  "target_progress_loop",
+  "repeated_failure_policy_no_progress",
+  "approved_plan_repeated_browser_validation",
+  "approved_plan_repeated_read_file",
+  "strict_repeat_strategy_exhausted",
+  "tool_protocol_doom_loop",
+  "read_only_permission_no_action",
+  "objective_closure_audit_evidence_missing",
+  "approved_plan_completion_guard_incomplete_after_change",
+  "approved_plan_completion_guard_no_evidence",
+  "approved_plan_remaining_tasks_no_action",
+  "execution_evidence_required",
+]);
+
+export function isAutoResumableExecutionBoundaryReason(
+  value: string | null | undefined,
+): boolean {
+  const reason = String(value || "").trim();
+  return AUTO_RESUMABLE_EXECUTION_BOUNDARY_REASONS.has(reason) ||
+    reason.startsWith("execution_evidence_gap:");
+}
 
 export type ExecuteNoProgressStrategyDecision =
   | {
@@ -348,6 +394,91 @@ export interface RecoveryActionContract {
   toolCallRequirement: RecoveryToolCallRequirement;
 }
 
+export interface RuntimeOwnedRecoveryAction {
+  toolName: "read_file" | "run_command";
+  arguments: Record<string, string | number>;
+  checkpointKind: "targeted_read" | "finite_validation";
+}
+
+/**
+ * Skip a redundant model decision only when the recovery contract exposes one
+ * named tool and already owns every required argument. Search, mutation,
+ * browser, and process actions remain model-owned.
+ */
+export function resolveRuntimeOwnedRecoveryAction(input: {
+  contract: RecoveryActionContract;
+  activeToolNames: Iterable<string>;
+}): RuntimeOwnedRecoveryAction | null {
+  const activeToolNames = new Set(
+    [...input.activeToolNames]
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  );
+  const requirement = input.contract.toolCallRequirement;
+  if (
+    requirement.kind !== "required_named" ||
+    activeToolNames.size !== 1 ||
+    !activeToolNames.has(requirement.toolName)
+  ) {
+    return null;
+  }
+
+  if (requirement.toolName === "run_command") {
+    const checkpoint =
+      input.contract.decisionCheckpoint?.pendingFiniteValidation;
+    const command = String(checkpoint?.command || "").trim();
+    const cwd = String(checkpoint?.cwd || ".").trim() || ".";
+    if (
+      input.contract.nextRequiredCapability !== "validation" ||
+      !command ||
+      !isFinitePlanValidationCommand(command)
+    ) {
+      return null;
+    }
+    const timeoutMs = Number(checkpoint?.timeoutMs);
+    return {
+      toolName: "run_command",
+      checkpointKind: "finite_validation",
+      arguments: {
+        command,
+        cwd,
+        description:
+          `Run the runtime-pinned finite validation: ${command}`.slice(0, 240),
+        ...(Number.isFinite(timeoutMs) && timeoutMs > 0
+          ? { timeout_ms: Math.floor(timeoutMs) }
+          : {}),
+      },
+    };
+  }
+
+  if (requirement.toolName === "read_file") {
+    const target = String(input.contract.expectedTarget || "").trim();
+    const lease = input.contract.readLease;
+    if (
+      input.contract.nextRequiredCapability !== "targeted_read" ||
+      !target ||
+      !lease ||
+      lease.state !== "available" ||
+      !workspacePathsReferToSameFile(target, lease.target)
+    ) {
+      return null;
+    }
+    const range = lease.requestedRange;
+    return {
+      toolName: "read_file",
+      checkpointKind: "targeted_read",
+      arguments: {
+        path: target,
+        ...(range?.startLine ? { start_line: range.startLine } : {}),
+        ...(range?.endLine ? { end_line: range.endLine } : {}),
+        ...(range?.maxLines ? { max_lines: range.maxLines } : {}),
+      },
+    };
+  }
+
+  return null;
+}
+
 /**
  * Provider-neutral tool-call requirement for the current recovery phase.
  * Transport adapters may translate this into their native tool-choice shape,
@@ -384,22 +515,23 @@ export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
 export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
 
 /**
- * Broad workspace surface retained only for objective auditing. An ordinary
- * recovery transaction uses the phase-specific sets below: once runtime has
- * advanced to mutation, another unleased search/read is not a valid adjacent
- * action and must not remain selectable.
+ * A closed revision is audited without write or validation tools. Stopping
+ * accepts the current mutation + validation receipts; reading a source file
+ * explicitly reopens one bounded mutation transaction.
  */
-export const EXECUTE_RECOVERY_STABLE_WORKSPACE_TOOLS = new Set([
+export const EXECUTE_RECOVERY_OBJECTIVE_AUDIT_TOOLS = new Set([
   "glob_search",
   "grep_search",
   "code_ast_query",
   "find_symbol_references",
   "get_file_outline",
   "read_file",
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
   "git_status",
   "git_diff",
-  "run_command",
+]);
+
+const EXECUTE_RECOVERY_OBJECTIVE_AUDIT_CORRECTION_TOOLS = new Set([
+  "replace_in_file",
 ]);
 
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
@@ -678,21 +810,37 @@ export function resolveExecuteRecoveryActionContract(
     };
   }
   if (mode === "objective_audit") {
+    const correctionWindowOpen =
+      context.decisionCheckpoint?.nextRequiredCapability === "mutation";
+    if (correctionWindowOpen) {
+      return {
+        ...shared,
+        modeLabel: mode,
+        phase: "mutation",
+        nextRequiredCapability: "mutation",
+        allowTargetedFileRead: false,
+        // The audit already observed a fresh exact source window. The model may
+        // either correct that window once or make no tool call to accept the
+        // frozen mutation + validation receipts.
+        allowsAllTools: false,
+        allowedToolNames: EXECUTE_RECOVERY_OBJECTIVE_AUDIT_CORRECTION_TOOLS,
+        surfaceDescription: "objective-audit:edit-or-close",
+        toolCallRequirement: { kind: "optional" },
+      };
+    }
     return {
       ...shared,
       modeLabel: mode,
       phase: "normal",
       nextRequiredCapability: "any",
       allowTargetedFileRead: true,
-      // Closure auditing may discover another ordinary workspace repair, but
-      // it must not reopen long-process, PTY, browser, or desktop lifecycles
-      // without a concrete checkpoint. Those capabilities each have their own
-      // evidence-owned transition. Keeping only the stable workspace surface
-      // prevents an already-successful finite validation from drifting into
-      // an unrelated interactive terminal loop.
+      // A successful validation is immutable during the closure decision.
+      // A fresh read is the single explicit transition that may reopen one
+      // bounded mutation; stale writes and repeated validation cannot bypass
+      // that boundary.
       allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_STABLE_WORKSPACE_TOOLS,
-      surfaceDescription: "objective-audit:workspace-core",
+      allowedToolNames: EXECUTE_RECOVERY_OBJECTIVE_AUDIT_TOOLS,
+      surfaceDescription: "objective-audit:read-or-close",
       toolCallRequirement: { kind: "optional" },
     };
   }
@@ -713,9 +861,7 @@ export function resolveExecuteRecoveryActionContract(
   if (activeReadLease) {
     phase = "context";
     nextRequiredCapability = "targeted_read";
-  } else if (
-    checkpointCapability === "targeting"
-  ) {
+  } else if (checkpointCapability === "targeting") {
     phase = "context";
     nextRequiredCapability = "targeting";
   } else if (checkpointCapability === "browser_diagnostic") {
@@ -735,7 +881,8 @@ export function resolveExecuteRecoveryActionContract(
     nextRequiredCapability = "validation";
   }
 
-  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability);
+  const allowedToolNames =
+    resolveRecoveryAllowedToolNames(nextRequiredCapability);
   return {
     ...shared,
     modeLabel: mode,
@@ -747,7 +894,8 @@ export function resolveExecuteRecoveryActionContract(
     allowsAllTools: false,
     allowedToolNames,
     surfaceDescription: `capability:${nextRequiredCapability}`,
-    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability),
+    toolCallRequirement:
+      resolveRecoveryToolCallRequirement(nextRequiredCapability),
   };
 }
 
@@ -850,6 +998,7 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
 ): ExecutionDecisionCheckpoint | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Partial<ExecutionDecisionCheckpoint>;
+  const rawCandidate = value as Record<string, unknown>;
   const capabilities = new Set<ExecuteRecoveryNextCapability>([
     "any",
     "targeting",
@@ -895,42 +1044,21 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
         .filter(Boolean))]
         .slice(-32)
     : [];
-  const objectiveMutationEvidence = Array.isArray(candidate.objectiveMutationEvidence)
-    ? candidate.objectiveMutationEvidence
-        .flatMap((entry) => {
-          if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
-          const target = String(entry.target || "").trim();
-          if (!target) return [];
-          const requirementRef = String(entry.requirementRef || "").trim() || null;
-          return [{ target, ...(requirementRef ? { requirementRef } : {}) }];
-        })
-        .filter((entry, index, entries) => entries.findIndex((candidateEntry) =>
-          candidateEntry.target.toLowerCase() === entry.target.toLowerCase() &&
-          String(candidateEntry.requirementRef || "").toLowerCase() ===
-            String(entry.requirementRef || "").toLowerCase()
-        ) === index)
-        .slice(-32)
-    : [];
-  const objectiveExpectedTargets = Array.isArray(candidate.objectiveExpectedTargets)
-    ? [...new Set(candidate.objectiveExpectedTargets
-        .map((entry) => String(entry || "").trim().replace(/\\/g, "/"))
+  const finiteValidationFailureDetail = String(
+    candidate.finiteValidationFailureDetail || "",
+  )
+    .replace(/\u0000/g, "")
+    .trim()
+    .slice(0, 2_400) || null;
+  const finiteValidationDiagnosticTargets = Array.isArray(
+    candidate.finiteValidationDiagnosticTargets,
+  )
+    ? [...new Set(candidate.finiteValidationDiagnosticTargets
+        .map((entry) => String(entry || "").replace(/\\/g, "/").trim())
         .filter(Boolean))]
-        .slice(-32)
+        .slice(0, 12)
     : [];
-  const objectiveValidationEvidenceCandidate = candidate.objectiveValidationEvidence;
-  const objectiveValidationEvidence = objectiveValidationEvidenceCandidate &&
-    typeof objectiveValidationEvidenceCandidate === "object" &&
-    !Array.isArray(objectiveValidationEvidenceCandidate)
-    ? (() => {
-        const tool = String(objectiveValidationEvidenceCandidate.tool || "").trim();
-        const target = String(objectiveValidationEvidenceCandidate.target || "").trim();
-        const revision = Math.max(
-          1,
-          Math.floor(Number(objectiveValidationEvidenceCandidate.revision) || 1),
-        );
-        return tool && target ? { tool, target, revision } : null;
-      })()
-    : null;
+  const directEditTransaction = migrateLegacyDirectEditTransaction(rawCandidate);
   const browserLocatorCandidates = Array.isArray(candidate.browserLocatorCandidates)
     ? [...new Set(candidate.browserLocatorCandidates
         .map((entry) => String(entry || "").replace(/\s+/g, " ").trim())
@@ -953,6 +1081,12 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     ...(candidate.pendingFiniteValidation === undefined
       ? {}
       : { pendingFiniteValidation }),
+    ...(candidate.finiteValidationFailureDetail === undefined
+      ? {}
+      : { finiteValidationFailureDetail }),
+    ...(candidate.finiteValidationDiagnosticTargets === undefined
+      ? {}
+      : { finiteValidationDiagnosticTargets }),
     ...(candidate.validationMutationReopenCount === undefined
       ? {}
       : {
@@ -964,35 +1098,7 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     ...(candidate.validationMutationReopenFingerprints === undefined
       ? {}
       : { validationMutationReopenFingerprints }),
-    ...(candidate.objectiveMutationEvidence === undefined
-      ? {}
-      : { objectiveMutationEvidence }),
-    ...(candidate.objectiveObligationId === undefined
-      ? {}
-      : {
-          objectiveObligationId:
-            String(candidate.objectiveObligationId || "").trim() || null,
-        }),
-    ...(candidate.objectiveRevision === undefined
-      ? {}
-      : {
-          objectiveRevision: Math.max(
-            1,
-            Math.floor(Number(candidate.objectiveRevision) || 1),
-          ),
-        }),
-    ...(candidate.objectiveKind === "root" || candidate.objectiveKind === "requirement"
-      ? { objectiveKind: candidate.objectiveKind }
-      : {}),
-    ...(candidate.objectiveExpectedTargets === undefined
-      ? {}
-      : { objectiveExpectedTargets }),
-    ...(candidate.objectiveValidationEvidence === undefined
-      ? {}
-      : { objectiveValidationEvidence }),
-    ...(candidate.objectiveClosurePending === undefined
-      ? {}
-      : { objectiveClosurePending: candidate.objectiveClosurePending === true }),
+    ...(directEditTransaction ? { directEditTransaction } : {}),
     ...(candidate.browserFailureFingerprint === undefined
       ? {}
       : {
@@ -1068,15 +1174,82 @@ export function requestedRangeFromReadObservationSignature(
   }
 }
 
+function targetFromReadObservationSignature(
+  requestSignature: string,
+): string | null {
+  const prefix = "read_file::";
+  if (!requestSignature.startsWith(prefix)) return null;
+  const argsSeparator = requestSignature.lastIndexOf("::");
+  if (argsSeparator <= prefix.length) return null;
+  return requestSignature.slice(prefix.length, argsSeparator).trim() || null;
+}
+
+/**
+ * Resolve a compiler/bundler diagnostic such as `src/main.js (377:12)` or
+ * `file: /workspace/src/main.js:377:12` to one bounded source window. Matching
+ * starts from the runtime-attributed target, so an unrelated diagnostic cannot
+ * silently transfer the repair lease to another file.
+ */
+export function resolveFailedValidationDiagnosticRange(input: {
+  target: string;
+  diagnosticText?: string | null;
+  contextLines?: number;
+}): RecoveryReadLease["requestedRange"] | null {
+  const target = String(input.target || "").trim().replace(/\\/g, "/");
+  const diagnosticText = String(input.diagnosticText || "").replace(/\\/g, "/");
+  if (!target || !diagnosticText) return null;
+
+  const basename = target.split("/").filter(Boolean).pop() || target;
+  const needles = [...new Set([target, basename])]
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+  for (const line of diagnosticText.split(/\r?\n/)) {
+    const normalizedLine = line.replace(/\\/g, "/");
+    const lowerLine = normalizedLine.toLowerCase();
+    for (const needle of needles) {
+      const lowerNeedle = needle.toLowerCase();
+      let searchFrom = 0;
+      while (searchFrom < lowerLine.length) {
+        const index = lowerLine.indexOf(lowerNeedle, searchFrom);
+        if (index < 0) break;
+        searchFrom = index + lowerNeedle.length;
+        const before = index > 0 ? normalizedLine[index - 1] : "";
+        if (before && !/[\s"'`(:/]/.test(before)) continue;
+        const suffix = normalizedLine.slice(index + needle.length);
+        const location = suffix.match(
+          /^\s*(?:\((\d+)\s*[,:]\s*\d+\)|:(\d+):\d+)/,
+        );
+        const lineNumber = Number(location?.[1] || location?.[2]);
+        if (!Number.isFinite(lineNumber) || lineNumber < 1) continue;
+        const contextLines = Math.max(
+          8,
+          Math.min(120, Math.floor(Number(input.contextLines) || 48)),
+        );
+        const startLine = Math.max(1, lineNumber - contextLines);
+        const endLine = lineNumber + contextLines;
+        return {
+          startLine,
+          endLine,
+          maxLines: endLine - startLine + 1,
+        };
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * A real validation failure occurs after the mutation epoch that invalidated
  * the source window used to author that mutation. Grant exactly one read of
  * the same target/range before asking for a repair, but do not bind the lease
- * to the stale pre-mutation version.
+ * to the stale pre-mutation version. A diagnostic can transfer ownership to a
+ * different file; in that case the previous file's range is unrelated.
  */
 export function buildFailedValidationRepairReadLease(input: {
   target: string;
   sourceObservationKey?: string | null;
+  diagnosticText?: string | null;
+  preferredRange?: RecoveryReadLease["requestedRange"] | null;
 }): RecoveryReadLease {
   const target = String(input.target || "").trim();
   const sourceObservationKey = String(input.sourceObservationKey || "").trim();
@@ -1084,9 +1257,20 @@ export function buildFailedValidationRepairReadLease(input: {
   const requestSignature = versionMarker > 0
     ? sourceObservationKey.slice(0, versionMarker)
     : sourceObservationKey;
-  const requestedRange = requestSignature
-    ? requestedRangeFromReadObservationSignature(requestSignature)
-    : null;
+  const observationTarget = targetFromReadObservationSignature(requestSignature);
+  const requestedRange =
+    resolveFailedValidationDiagnosticRange({
+      target,
+      diagnosticText: input.diagnosticText,
+    }) ||
+    normalizeRecoveryReadRange(input.preferredRange) ||
+    (
+      requestSignature &&
+      observationTarget &&
+      workspacePathsReferToSameFile(target, observationTarget)
+        ? requestedRangeFromReadObservationSignature(requestSignature)
+        : null
+    );
   return {
     purpose: "context_restore",
     target,
@@ -1290,8 +1474,17 @@ export function resolveExecuteRecoveryBatchDecision(input: {
   // allowing an unleased read during mutation made the phase boundary
   // advisory and let repeated-read loops run past the recovery budget.
   const mutationMayPreempt = contract.nextRequiredCapability === "mutation";
+  const correctiveMutations = !contract.readLease
+    ? calls.filter((call) =>
+        EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name) &&
+        call.canRebindTarget === true
+      )
+    : [];
+  const soleCorrectiveMutation =
+    correctiveMutations.length === 1 ? correctiveMutations[0] : undefined;
   const matchingMutation = mutationMayPreempt
     ? scopedCalls.find((call) => EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)) ||
+      soleCorrectiveMutation ||
       (soleUnresolvedPatch ? calls[0] : undefined)
     : undefined;
   const matchingRead = scopedEligible.find((call) => call.name === "read_file");
@@ -1373,6 +1566,61 @@ export function isExecuteRecoveryToolName(
 }
 
 /**
+ * Keep only complete diagnostic clauses that concern the active repair owner.
+ * Multi-owner validation reruns can otherwise leave several stale, conflicting
+ * repair prompts in a local model's context.
+ */
+export function scopeFiniteValidationDiagnosticToTarget(input: {
+  diagnostic: string;
+  target?: string | null;
+  maxChars?: number;
+}): string {
+  const diagnostic = String(input.diagnostic || "").trim();
+  if (!diagnostic) return "";
+  const normalizedTarget = String(input.target || "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  const targetBasename = normalizedTarget.split("/").filter(Boolean).pop() || "";
+  const fragments = diagnostic
+    .split(/(?:\s*;\s*|\n+)/)
+    .map((entry) => entry.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const clauses = fragments.reduce<string[]>((entries, fragment) => {
+    const namesSourceOwner =
+      /(?:^|[\s("'`])(?:\.{0,2}\/)?(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]+\.[A-Za-z0-9]+(?=$|[\s:;,.)"'`])/.test(
+        fragment,
+      );
+    if (!namesSourceOwner && entries.length > 0) {
+      entries[entries.length - 1] = `${entries[entries.length - 1]}; ${fragment}`;
+      return entries;
+    }
+    entries.push(fragment);
+    return entries;
+  }, []);
+  const matching = normalizedTarget
+    ? clauses.filter((entry) => {
+        const normalized = entry.replace(/\\/g, "/").toLowerCase();
+        return normalized.includes(normalizedTarget) ||
+          (!!targetBasename && normalized.includes(targetBasename));
+      })
+    : [];
+  // One validation-to-mutation transaction repairs one complete diagnostic
+  // clause. A fresh validation then removes that clause or returns it again.
+  // Feeding every same-file failure at once encouraged local models to make a
+  // nearby cosmetic edit or oscillate between several loci in a large file.
+  const selected = matching.length > 0 ? matching.slice(0, 1) : clauses.slice(-1);
+  const limit = Math.max(240, Math.floor(Number(input.maxChars) || 1_800));
+  const complete: string[] = [];
+  let usedChars = 0;
+  for (const clause of selected) {
+    if (usedChars + clause.length + 2 > limit) continue;
+    complete.push(clause);
+    usedChars += clause.length + 2;
+  }
+  return complete.join("; ");
+}
+
+/**
  * Ephemeral per-request contract card. It is appended after historical
  * recovery prompts, so a phase transition atomically replaces stale advice
  * without adding another durable transcript message.
@@ -1407,45 +1655,87 @@ export function buildExecutionActionContractCard(input: {
     .trim()
     .slice(0, 900);
   const pendingFiniteValidation = contract.decisionCheckpoint?.pendingFiniteValidation || null;
-  const objectiveClosure = contract.decisionCheckpoint?.objectiveClosurePending === true
-    ? "pending"
+  const finiteValidationFailureDetail = String(
+    contract.decisionCheckpoint?.finiteValidationFailureDetail || "",
+  ).trim();
+  const finiteValidationDiagnosticTargets = (
+    contract.decisionCheckpoint?.finiteValidationDiagnosticTargets || []
+  )
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  const validationRepairAttempt = Math.max(
+    0,
+    Math.floor(
+      Number(contract.decisionCheckpoint?.validationMutationReopenCount) || 0,
+    ),
+  );
+  const scopedFiniteValidationFailure = scopeFiniteValidationDiagnosticToTarget({
+    diagnostic: finiteValidationFailureDetail,
+    target: contract.expectedTarget,
+  });
+  const directEditTransaction =
+    resolveDirectEditTransaction(contract.decisionCheckpoint);
+  const objectiveClosure = directEditTransaction
+    ? directEditTransaction.phase
     : "not-tracked";
-  const mutationEvidence = (contract.decisionCheckpoint?.objectiveMutationEvidence || [])
+  const mutationEvidence = (directEditTransaction?.mutations || [])
     .slice(-8)
     .map((entry) => `${entry.target}${entry.requirementRef ? `@${entry.requirementRef}` : ""}`)
     .join(", ") || "(none)";
   if (contract.modeLabel === "objective_audit") {
-    const revision = Math.max(
-      1,
-      Math.floor(Number(contract.decisionCheckpoint?.objectiveRevision) || 1),
-    );
-    const validationEvidence = contract.decisionCheckpoint?.objectiveValidationEvidence;
+    const revision = directEditTransaction?.revision || 1;
+    const validationEvidence = directEditTransaction?.validation;
     const evidenceLine = validationEvidence
       ? `${validationEvidence.tool}:${validationEvidence.target}@revision-${validationEvidence.revision}`
       : "(none)";
+    const validationObservation = String(validationEvidence?.summary || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 1_200);
+    const correctionWindowOpen =
+      contract.nextRequiredCapability === "mutation";
     return input.language === "zh"
       ? [
           "[EXECUTION_ACTION_CONTRACT]",
-          `phase=objective_audit; next=close_or_continue; target=${target}`,
+          `phase=objective_audit; next=${correctionWindowOpen ? "correct_or_close" : "inspect_or_close"}; target=${target}`,
           `objectiveRevision=${revision}; mutationEvidence=${mutationEvidence}`,
           `validationEvidence=${evidenceLine}`,
+          ...(validationObservation
+            ? [`validationObservation=${validationObservation}`]
+            : []),
           ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
           `availableTools=${tools}`,
-          "这是动态 objective closure audit，稳定工作区工具面已恢复。逐项核对用户要求与当前 revision 的真实 mutation + validation 证据。",
-          "若仍有未完成工作，立即调用对应的具体工具；切换到新文件目标时先 read_file，再修改并重新验证。",
-          "长驻进程、PTY、浏览器或桌面能力只能由对应的具体生命周期检查点重新开启；不要用交互终端重复已经成功的有限验证。",
+          correctionWindowOpen
+            ? "这是 objective closure audit 的源码复核步骤。你刚读取了新的精确源码窗口；若它暴露出仍未覆盖的 outcome，可调用一次 replace_in_file 修正该窗口，否则不要调用工具并接受当前 revision。"
+            : "这是 objective closure audit。当前 revision 的修改和验证证据已冻结；本步骤只能检查源码或直接结束，不能重复验证。",
+          correctionWindowOpen
+            ? "不要为了结束审查而进行无意义改动；只有刚才的源码证据明确要求修正时才写入。"
+            : "若有一个具体 outcome 尚未覆盖，只调用 read_file 读取其精确源码目标；读取后运行时会开放一次“修正或结束”的有界步骤。否则不要调用工具，直接总结。",
+          validationObservation
+            ? "最终总结必须忠实复述 validationObservation 已验证的 outcome，并把推断与事实区分开；不要用新的、未经验证的根因解释替换它。"
+            : "",
           "只有全部 objective outcome 均已覆盖时才不调用工具，并直接输出面向用户的最终结论总结。不要为了结束审查而虚构工具调用。",
         ].join("\n")
       : [
           "[EXECUTION_ACTION_CONTRACT]",
-          `phase=objective_audit; next=close_or_continue; target=${target}`,
+          `phase=objective_audit; next=${correctionWindowOpen ? "correct_or_close" : "inspect_or_close"}; target=${target}`,
           `objectiveRevision=${revision}; mutationEvidence=${mutationEvidence}`,
           `validationEvidence=${evidenceLine}`,
+          ...(validationObservation
+            ? [`validationObservation=${validationObservation}`]
+            : []),
           ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
           `availableTools=${tools}`,
-          "This is a dynamic objective-closure audit with the stable workspace surface restored. Check every requested outcome against real mutation and validation evidence from the current revision.",
-          "If work remains, call the concrete tool now; when switching to a new file target, read_file first, then mutate and validate again.",
-          "Long-process, PTY, browser, and desktop capabilities reopen only from their concrete lifecycle checkpoints; do not repeat an already-successful finite validation through an interactive terminal.",
+          correctionWindowOpen
+            ? "This is the source-review step of the objective-closure audit. You just read a fresh exact source window; if it exposes an uncovered outcome, call replace_in_file once to correct that window. Otherwise make no tool call and accept the current revision."
+            : "This is the objective-closure audit. Mutation and validation evidence for the current revision is frozen; this step may inspect source or close, but it cannot repeat validation.",
+          correctionWindowOpen
+            ? "Do not manufacture a no-op edit to end the audit; write only when the source evidence you just read requires a correction."
+            : "If one concrete outcome is still uncovered, call only read_file for its exact source target; the runtime will then open one bounded correct-or-close step. Otherwise make no tool call and summarize.",
+          validationObservation
+            ? "The final summary must faithfully report the outcomes verified by validationObservation and distinguish inference from fact; do not replace them with a new unverified root-cause story."
+            : "",
           "Only when every objective outcome is covered, make no tool call and output the final user-facing conclusion summary. Do not invent a tool call merely to end the audit.",
         ].join("\n");
   }
@@ -1462,6 +1752,15 @@ export function buildExecutionActionContractCard(input: {
         ? [
             `validationCommand=${pendingFiniteValidation.command}`,
             `validationCwd=${pendingFiniteValidation.cwd}`,
+          ]
+        : []),
+      ...(scopedFiniteValidationFailure
+        ? [
+            `activeValidationDiagnostic=${scopedFiniteValidationFailure}`,
+            `diagnosticOwners=${finiteValidationDiagnosticTargets.join(", ") || target}`,
+            ...(validationRepairAttempt > 1
+              ? [`validationRepairAttempt=${validationRepairAttempt}`]
+              : []),
           ]
         : []),
       `availableTools=${tools}`,
@@ -1488,6 +1787,8 @@ export function buildExecutionActionContractCard(input: {
         ? "用 run_command 在 validationCwd 重新运行 validationCommand；该命令是当前唯一验收边界。若失败，运行时会依据结构化失败结果另行开启修复阶段。"
         : contract.nextRequiredCapability === "validation"
         ? "从已保留的清单与任务上下文选择一条真实、有限的 run_command。当前阶段不开放读取或修改；失败后由运行时结构化切回修复。"
+        : contract.nextRequiredCapability === "mutation" && scopedFiniteValidationFailure
+        ? `${validationRepairAttempt > 1 ? "同一诊断在上一次修改后仍然存在；不要继续重构函数，逐项对照诊断并只修改承载这些条件的现有表达式或分支。" : ""}本次修改必须直接消除 activeValidationDiagnostic 在当前 target 中指出的既有因果条件。replace_text 只覆盖 search_text 的精确范围，不要把相邻源码重复复制进去。优先删除或修正被点名的现有路径；不要新增与诊断无关的 helper、事件、API、自动保存或回退分支，也不要为了满足工具要求制造无意义改动。`
         : "只选择 availableTools 中能完成 next 的工具；相邻能力不会在当前阶段隐式开放。不要重启宽泛诊断。",
     ].join("\n");
   }
@@ -1501,6 +1802,15 @@ export function buildExecutionActionContractCard(input: {
       ? [
           `validationCommand=${pendingFiniteValidation.command}`,
           `validationCwd=${pendingFiniteValidation.cwd}`,
+        ]
+      : []),
+    ...(scopedFiniteValidationFailure
+      ? [
+          `activeValidationDiagnostic=${scopedFiniteValidationFailure}`,
+          `diagnosticOwners=${finiteValidationDiagnosticTargets.join(", ") || target}`,
+          ...(validationRepairAttempt > 1
+            ? [`validationRepairAttempt=${validationRepairAttempt}`]
+            : []),
         ]
       : []),
     `availableTools=${tools}`,
@@ -1527,6 +1837,8 @@ export function buildExecutionActionContractCard(input: {
       ? "Use run_command in validationCwd to rerun validationCommand; it is the only acceptance boundary for this phase. A structured failure lets runtime reopen repair separately."
       : contract.nextRequiredCapability === "validation"
       ? "Choose one real finite run_command from the retained manifest and task context. Reads and edits are closed in this phase; a structured failure lets runtime reopen repair."
+      : contract.nextRequiredCapability === "mutation" && scopedFiniteValidationFailure
+      ? `${validationRepairAttempt > 1 ? "The same diagnostic survived the previous mutation; do not keep restructuring the function. Compare every stated condition and change only the existing expression or branch that owns them. " : ""}This mutation must directly eliminate the existing causal condition named by activeValidationDiagnostic in the current target. Keep replacement text bounded to the exact searched region; do not copy adjacent source into it. Prefer removing or correcting the cited path; do not add unrelated helpers, events, APIs, autosave behavior, or fallback branches, and do not manufacture a no-op edit merely to satisfy the tool requirement.`
       : "Choose only an availableTools action that satisfies next. Adjacent capabilities are not implicitly open in this phase. Do not restart broad diagnosis.",
   ].join("\n");
 }
@@ -1635,7 +1947,8 @@ export function getMaxRepeatedReadOnlyTargetScore(
     const target = String(activity.target || "").trim();
     if (!target) continue;
     const targetKey = resolveEquivalentRecoveryTargetKey(counts, target);
-    if (!isReadOnlyNoProgressDetail(activity.detail)) continue;
+    const detail = String(activity.detail || "").trim();
+    if (detail && !isReadOnlyNoProgressDetail(detail)) continue;
     counts.set(targetKey, (counts.get(targetKey) || 0) + 1);
   }
   return Math.max(0, ...counts.values());
@@ -1702,9 +2015,10 @@ export function resolveReadOnlyNoProgressTrigger(input: {
   const visibleSuccessfulResults = input.results.filter(
     (result) => !result.internalFeedback && !result.isError,
   );
-  const currentBatchHasFreshReadOnlyEvidence = visibleSuccessfulResults.some((result) =>
-    !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
-  );
+  const currentBatchHasFreshReadOnlyEvidence = visibleSuccessfulResults.some((result) => {
+    const detail = String(result.displayContent || result.content || "").trim();
+    return Boolean(detail) && !isReadOnlyNoProgressDetail(detail);
+  });
   const readOnlyActivityLimit = input.minReadOnlyActivities ?? Infinity;
   if (readOnlyActivityCount >= readOnlyActivityLimit) {
     return { shouldRecover: true, reason: "read_only_evidence_budget", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
@@ -1766,6 +2080,9 @@ export function buildExecuteRecoveryPrompt(input: {
     input.reason === "mutation_partial_effect_requires_reread";
   const mutationProducedNoEffect =
     input.reason === "mutation_preflight_no_effect";
+  const noEffectRetainsValidationOwner = Boolean(
+    mutationProducedNoEffect && contract.expectedTarget,
+  );
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
     : input.language === "zh" ? "最近已读目标" : "recently read targets";
@@ -1773,6 +2090,9 @@ export function buildExecuteRecoveryPrompt(input: {
     .slice(-5)
     .map((activity) => [activity.status, activity.name, activity.target, activity.detail].filter(Boolean).join(" "))
     .join(input.language === "zh" ? "；" : "; ");
+  const needsSourceTargeting =
+    contract.nextRequiredCapability === "targeting" &&
+    !contract.sourceObservationKey;
 
   if (input.language === "en") {
     return [
@@ -1780,11 +2100,15 @@ export function buildExecuteRecoveryPrompt(input: {
       `Recovery reason: ${input.reason || "read_only_no_action"}.`,
       `Checkpoint: phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${contract.expectedTarget || repeatedTargets}.`,
       recent ? `Recent tool activity: ${recent}.` : "",
-      "Reuse the retained versioned observation. If exact source is genuinely missing and read_file is actually available, request one targeted window; otherwise perform the checkpoint's next capability.",
+      needsSourceTargeting
+        ? "No versioned source observation is bound yet. Do not mutate or repeat the same zero-result query; use one exposed targeting capability to identify a concrete source file and read its relevant window."
+        : "Reuse the retained versioned observation. If exact source is genuinely missing and read_file is actually available, request one targeted window; otherwise perform the checkpoint's next capability.",
       partialMutationRequiresReread
         ? "The runtime observed that the failed tool already changed this workspace path. The pre-call source is stale: reread the current target now, and do not retry the same mutation or arguments until that fresh read returns."
+        : noEffectRetainsValidationOwner
+        ? "The attempted mutation produced no state delta, but the pending finite validation still attributes its concrete gap to this source owner. Keep this target and make one differentiated mutation from the retained current source; do not replay identical arguments."
         : mutationProducedNoEffect
-        ? "The attempted mutation produced no state delta. Do not reread or replay identical arguments; submit one complete, non-identical mutation against the retained source observation, or report the exact external blocker."
+        ? "The attempted mutation produced no state delta, so its unconfirmed target binding was released. Do not replay identical arguments; use one bounded targeting action to identify the actual mutation owner."
         : "A failed patch may be malformed, a no-op, or a context mismatch. Follow the structured tool error instead of assuming that another read is required.",
       "Call one useful tool for this checkpoint. Do not start another broad scan, repeat an unchanged window, bypass file reads through shell commands, or claim completion without validation evidence.",
     ].filter(Boolean).join("\n");
@@ -1795,11 +2119,15 @@ export function buildExecuteRecoveryPrompt(input: {
     `恢复原因：${input.reason || "read_only_no_action"}。`,
     `检查点：phase=${contract.phase}；next=${contract.nextRequiredCapability}；target=${contract.expectedTarget || repeatedTargets}。`,
     recent ? `最近工具活动：${recent}。` : "",
-    "复用已保留的版本化源码观察。只有确实缺少精确源码且本轮实际提供 read_file 时，才定向补读一个窗口；否则执行检查点指定的 next 能力。",
+    needsSourceTargeting
+      ? "当前尚未绑定版本化源码观察。不要修改，也不要重复同一个零结果查询；请从已开放的定位能力中选择一个，确定具体源码文件并读取相关窗口。"
+      : "复用已保留的版本化源码观察。只有确实缺少精确源码且本轮实际提供 read_file 时，才定向补读一个窗口；否则执行检查点指定的 next 能力。",
     partialMutationRequiresReread
       ? "运行时已观察到失败工具实际改变了该工作区路径。调用前的源码上下文已经过期：现在必须重读当前目标；在新读取返回前，不得用相同修改或参数重试。"
+      : noEffectRetainsValidationOwner
+      ? "本次修改没有产生任何状态变化，但待完成的有限验证仍把具体缺口归因到这个源码所有者。保留当前目标和当前源码观察，执行一次不同的精确修改；不要重复相同参数。"
       : mutationProducedNoEffect
-      ? "本次修改没有产生任何状态变化。不要重读，也不要原样重放相同参数；请基于已保留的源码观察提交一次完整且非同内容的修改，或说明精确的外部阻塞。"
+      ? "本次修改没有产生任何状态变化，因此未经确认的目标绑定已解除。不要原样重放相同参数；请用一次有限定位动作确定真实修改所有者。"
       : "补丁失败可能是格式错误、无变化或上下文不匹配；应依据结构化工具错误处理，不能默认再读一次文件。",
     "本检查点只调用一个有用工具。不要重新泛读、重复未变化窗口、用 shell 绕过文件读取，也不要在缺少验证证据时声称完成。",
   ].filter(Boolean).join("\n");

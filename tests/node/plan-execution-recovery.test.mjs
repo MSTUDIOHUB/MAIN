@@ -2994,9 +2994,13 @@ test("approved plan convergence activates mutation recovery for an unfinished so
 
   assert.equal(result.usedExecuteConvergencePrompt, true);
   assert.equal(activations.length, 1);
-  assert.equal(activations[0][0], "mutation_first");
+  assert.equal(activations[0][0], "action_plus_targeting");
   assert.equal(activations[0][1], "execute_convergence_prompt");
   assert.equal(activations[0][2].resetExpectedTarget, true);
+  assert.equal(
+    activations[0][2].decisionCheckpoint.nextRequiredCapability,
+    "targeting",
+  );
   assert.equal(appended.length, 1);
 });
 
@@ -3238,7 +3242,7 @@ test("approved source task consumes one initial read lease then opens mutation o
   );
   assert.equal(mutationContract.allowTargetedFileRead, false);
   assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
-  assert.equal(mutationContract.allowedToolNames.has("apply_patch"), true);
+  assert.equal(mutationContract.allowedToolNames.has("replace_in_file"), true);
 });
 test("approved plan execution has no source-edit-first tool surface or shell veto", () => {
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));

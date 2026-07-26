@@ -195,13 +195,14 @@ test("preferred subagent collaboration becomes an explicit runtime intake contra
   });
 
   assert.match(block, /subagentPreference: preferred/);
-  assert.match(block, /0～N 个全新一次性子智能体/);
+  assert.match(block, /先为一个具有独立成功标准和并行价值的窄语义任务创建一个/);
+  assert.match(block, /一次启动边界，不是数量配额/);
   assert.match(block, /绝不能仅按目录拆分/);
-  assert.match(block, /终态后永久关闭且不得复用/);
-  assert.match(block, /只能接收已验证的精简证据/);
+  assert.match(block, /不得复用已终止实例/);
+  assert.match(block, /由主体负责最终验证与完成/);
 });
 
-test("session preference supplies preferred only when user text is unspecified", () => {
+test("session collaboration switch stays preferred unless user explicitly forbids delegation", () => {
   assert.equal(resolveEffectiveSubagentDelegationPreference({
     rawUserInput: "检查这两个模块",
     defaultPreference: "preferred",
@@ -213,7 +214,11 @@ test("session preference supplies preferred only when user text is unspecified",
   assert.equal(resolveEffectiveSubagentDelegationPreference({
     rawUserInput: "可以使用一个 subagent 帮忙检查",
     defaultPreference: "preferred",
-  }), "allowed");
+  }), "preferred");
+  assert.equal(resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: "找到这些问题的根本原因并修复，可以启动子智能体协作。",
+    defaultPreference: "preferred",
+  }), "preferred");
 });
 
 test("turn intake persists a session-supplied subagent preference for runtime recovery", () => {

@@ -87,6 +87,27 @@ test("real OMLX workspace inventory stops at a deterministic hard file limit", a
   assert.equal(inventory.truncated, true);
 });
 
+test("real OMLX command verification executes against final workspace bytes", async (t) => {
+  const workspace = await createTempWorkspace(t);
+  await writeFixtureFile(workspace, "broken.js", "function broken( {\\n");
+
+  const failed = await proxy.runRealOmlxWorkspaceCommand(
+    workspace,
+    `"${process.execPath}" --check broken.js`,
+  );
+  assert.notEqual(failed.exitCode, 0);
+  assert.match(failed.stderr, /SyntaxError|Unexpected token/);
+
+  await writeFixtureFile(workspace, "broken.js", "export const ready = true;\\n");
+  const passed = await proxy.runRealOmlxWorkspaceCommand(
+    workspace,
+    `"${process.execPath}" --check broken.js`,
+  );
+  assert.equal(passed.exitCode, 0, passed.stderr);
+  assert.equal(passed.cwd, path.resolve(workspace));
+  assert.equal(passed.timedOut, false);
+});
+
 test("real OMLX search selection admits only bounded text paths", () => {
   const selection = proxy.selectBoundedRealOmlxSearchFiles([
     "src/main.ts",
@@ -227,7 +248,7 @@ test("real OMLX acceptance ledger retains contract and collaboration facts indep
   );
   state = proxy.recordRealOmlxAcceptanceDebugEvent(
     state,
-    "agent.preferred_delegation_spawned",
+    "agent.semantic_collaboration_task_spawned",
     JSON.stringify({ scopeKey: "src", subagentId: "child-src" }),
   );
   for (let index = 0; index < 1_000; index += 1) {
@@ -239,7 +260,7 @@ test("real OMLX acceptance ledger retains contract and collaboration facts indep
   }
   state = proxy.recordRealOmlxAcceptanceDebugEvent(
     state,
-    "agent.preferred_delegation_scope_outcomes",
+    "agent.semantic_collaboration_evidence_consumed",
     JSON.stringify({
       outcomes: [{
         subagentId: "child-src",
@@ -266,7 +287,7 @@ test("real OMLX collaboration projection requires every expected scope to spawn,
   for (const [scopeKey, subagentId] of [["src", "child-src"], ["src-tauri", "child-rust"]]) {
     state = proxy.recordRealOmlxAcceptanceDebugEvent(
       state,
-      "agent.preferred_delegation_spawned",
+      "agent.semantic_collaboration_task_spawned",
       JSON.stringify({ scopeKey, subagentId }),
     );
   }
@@ -277,7 +298,7 @@ test("real OMLX collaboration projection requires every expected scope to spawn,
   );
   state = proxy.recordRealOmlxAcceptanceDebugEvent(
     state,
-    "agent.preferred_delegation_consumed",
+    "agent.semantic_collaboration_evidence_consumed",
     JSON.stringify({ consumedScopeKeys: ["src"] }),
   );
 
@@ -301,7 +322,7 @@ test("real OMLX collaboration projection requires every expected scope to spawn,
 
   state = proxy.recordRealOmlxAcceptanceDebugEvent(
     state,
-    "agent.preferred_delegation_consumed",
+    "agent.semantic_collaboration_evidence_consumed",
     JSON.stringify({ consumedScopeKeys: ["src", "src-tauri"] }),
   );
   assert.equal(proxy.projectRealOmlxCollaborationScopes({
@@ -324,12 +345,12 @@ test("real OMLX collaboration projection rejects arbitrary sibling reviewers for
   for (const [scopeKey, subagentId] of siblingScopes) {
     state = proxy.recordRealOmlxAcceptanceDebugEvent(
       state,
-      "agent.preferred_delegation_spawned",
+      "agent.semantic_collaboration_task_spawned",
       JSON.stringify({ scopeKey, subagentId }),
     );
     state = proxy.recordRealOmlxAcceptanceDebugEvent(
       state,
-      "agent.preferred_delegation_scope_outcomes",
+      "agent.semantic_collaboration_evidence_consumed",
       JSON.stringify({
         outcomes: [{
           scopeKey,

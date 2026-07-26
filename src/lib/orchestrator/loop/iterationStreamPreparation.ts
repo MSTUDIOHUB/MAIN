@@ -449,11 +449,13 @@ export async function prepareIterationStreamRequest(input: {
           phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
           protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
         };
-        executeRecoveryState = clearExecuteRecovery(
-          "max_recovery_iterations_reached",
-          undefined,
-          executeRecoveryState,
-        );
+        // Freeze the exact transaction for the workflow-owned continuation
+        // boundary. Clearing here discarded the target, validation diagnostic,
+        // and required capability before auto-resume could reconstruct them.
+        executeRecoveryState = {
+          ...exhaustedState,
+          reason: "execute_recovery_phase_boundary",
+        };
       }
     }
     logAgentEvent("execute_recovery_max_iterations_reached", {
@@ -461,11 +463,21 @@ export async function prepareIterationStreamRequest(input: {
       executeRecoveryMode: exhaustedState.mode,
       executeRecoveryAttempts: exhaustedState.attempts,
       recoveryIterationCount: exhaustedState.iterationCount,
+      phaseRequestCount: exhaustedState.phaseNoProgressCount,
+      phaseRequestLimit: executeRecoveryIterationAdvance.maxIterations,
+      phaseRequestOverage: Math.max(
+        0,
+        exhaustedState.phaseNoProgressCount -
+          executeRecoveryIterationAdvance.maxIterations,
+      ),
       protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
       protocolNoProgressFingerprint: exhaustedState.protocolNoProgressFingerprint,
       maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
       attemptedStrategies:
         exhaustedState.decisionCheckpoint?.noProgressStrategyPivots || [],
+      strategyPivotCount:
+        exhaustedState.decisionCheckpoint?.noProgressStrategyPivots?.length || 0,
+      willPause: recoveryPause !== null,
       disposition: boundaryDisposition,
     });
     executeRecoveryIterationAdvance = {
@@ -720,8 +732,11 @@ export async function prepareIterationStreamRequest(input: {
     ];
   }
   if (
-    toolSurfaceDecision.recoveryActionContract.phase !== "normal" ||
-    toolSurfaceDecision.recoveryActionContract.modeLabel === "objective_audit"
+    !toolSurfaceDecision.preferredDelegationRequired &&
+    (
+      toolSurfaceDecision.recoveryActionContract.phase !== "normal" ||
+      toolSurfaceDecision.recoveryActionContract.modeLabel === "objective_audit"
+    )
   ) {
     const contractCard = buildExecutionActionContractCard({
       contract: toolSurfaceDecision.recoveryActionContract,
@@ -745,13 +760,13 @@ export async function prepareIterationStreamRequest(input: {
         toolSurfaceDecision.recoveryActionContract.sourceObservationKey,
       toolCount: toolSurfaceDecision.iterationAllTools.length,
     });
-  } else if (toolSurfaceDecision.directFileModifyPhase) {
+  } else if (toolSurfaceDecision.directEditPhase) {
     managedAgentMessages = [
       ...managedAgentMessages,
       {
         role: "system",
         content: buildDirectFileModifyActionContractCard({
-          phase: toolSurfaceDecision.directFileModifyPhase,
+          phase: toolSurfaceDecision.directEditPhase,
           availableToolNames: toolSurfaceDecision.iterationAllTools.map(
             (tool) => tool.function.name,
           ),
@@ -760,10 +775,10 @@ export async function prepareIterationStreamRequest(input: {
     ];
     logAgentEvent("direct_file_modify_action_contract_injected", {
       iteration,
-      phase: toolSurfaceDecision.directFileModifyPhase,
+      phase: toolSurfaceDecision.directEditPhase,
       toolCount: toolSurfaceDecision.iterationAllTools.length,
       structuredMutationObserved:
-        toolSurfaceDecision.directFileModifyPhase === "validation",
+        toolSurfaceDecision.directEditPhase === "validate",
     });
   }
   if (toolSurfaceDecision.planEvidenceObligation) {

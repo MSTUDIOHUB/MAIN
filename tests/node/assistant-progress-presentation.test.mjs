@@ -37,6 +37,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildAssistantStageCheckpoint,
   buildCapsuleLiveGuidance,
+  buildCapsulePhaseGuidance,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/assistantProgressPresentation.ts"),
 );
@@ -60,7 +61,8 @@ test("ChatArea keeps concise complete findings while Capsule keeps only current 
   const checkpoint = buildAssistantStageCheckpoint(modelOutput, "zh");
   const guidance = buildCapsuleLiveGuidance(modelOutput, "zh");
 
-  assert.match(checkpoint, /^阶段结论：/);
+  assert.match(checkpoint, /^-/);
+  assert.doesNotMatch(checkpoint, /阶段结论：/);
   assert.match(checkpoint, /根本原因：`DOMContentLoaded`/);
   assert.match(checkpoint, /已确认保存失败来自/);
   assert.doesNotMatch(checkpoint, /```|const initialFile|activeFiles\.push|让我分析/);
@@ -79,7 +81,8 @@ test("English progress uses the same durable-versus-live boundary", () => {
   const checkpoint = buildAssistantStageCheckpoint(modelOutput, "en");
   const guidance = buildCapsuleLiveGuidance(modelOutput, "en");
 
-  assert.match(checkpoint, /^Checkpoint:/);
+  assert.match(checkpoint, /^-/);
+  assert.doesNotMatch(checkpoint, /Checkpoint:/);
   assert.match(checkpoint, /Root cause:/);
   assert.match(checkpoint, /Validation result:/);
   assert.equal(guidance, "Next I'll trace why the save path disappears.");
@@ -87,5 +90,30 @@ test("English progress uses the same durable-versus-live boundary", () => {
 
 test("tool-only narration is not promoted to either durable content or live thought", () => {
   assert.equal(buildAssistantStageCheckpoint("让我 apply_patch 来修复：", "zh"), "");
+  assert.equal(
+    buildAssistantStageCheckpoint(
+      "我需要先读取 `handleSaveAsFile` 函数的完整定义来定位问题。",
+      "zh",
+    ),
+    "",
+  );
   assert.equal(buildCapsuleLiveGuidance("让我 apply_patch 来修复：", "zh"), "");
+});
+
+test("an analysis-transition sentence stays transient instead of polluting ChatArea", () => {
+  const text = "现在我有了足够的信息来分析问题。";
+  assert.equal(buildAssistantStageCheckpoint(text, "zh"), "");
+  assert.equal(buildCapsuleLiveGuidance(text, "zh"), text);
+});
+
+test("active lifecycle fallback is conversational without exposing hidden reasoning", () => {
+  assert.equal(
+    buildCapsulePhaseGuidance("executing", "zh"),
+    "我正在推进当前任务；下一项可验证的读取、修改或检查会在这里实时更新。",
+  );
+  assert.equal(
+    buildCapsulePhaseGuidance("recovering", "en"),
+    "I’m continuing from the latest reliable evidence and reconfirming the current repair target.",
+  );
+  assert.equal(buildCapsulePhaseGuidance("completed", "zh"), "");
 });

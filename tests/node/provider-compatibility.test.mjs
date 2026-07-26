@@ -57,13 +57,16 @@ const providerCompatibility = loadTranspiledModuleSync(path.join(workspaceRoot, 
 const toolFeedbackEnvelope = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 
 const {
+  NATIVE_TOOL_HISTORY_RESULT_BUDGET_CHARS,
   buildProviderCompatibilitySystemMessage,
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
   ensureProviderCompatibilityMode,
+  isolateNativeToolHistoryForActiveSurface,
   isProviderCompatibilityErrorMessage,
   isProviderImageContentCompatibilityErrorMessage,
   isNativeToolCompatibilityErrorMessage,
+  isRequiredToolChoiceCompatibilityErrorMessage,
 } = providerCompatibility;
 
 const { TOOL_FEEDBACK_ENVELOPE_PREFIX, formatToolFeedbackEnvelope } = toolFeedbackEnvelope;
@@ -138,6 +141,119 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
     isProviderImageContentCompatibilityErrorMessage('HTTP 400: invalid tools payload'),
     false,
   );
+});
+
+test("required tool_choice incompatibility is classified without disabling native tools", () => {
+  const thinkingModeError =
+    "InternalError.Algo.InvalidParameter: The tool_choice parameter does not support being set to required or object in thinking mode";
+  assert.equal(
+    isRequiredToolChoiceCompatibilityErrorMessage(thinkingModeError),
+    true,
+  );
+  assert.equal(
+    isRequiredToolChoiceCompatibilityErrorMessage(
+      "HTTP 400: Invalid value 'required' for tool choice; supported values are none and auto",
+    ),
+    true,
+  );
+  assert.equal(
+    isRequiredToolChoiceCompatibilityErrorMessage(
+      "HTTP 400: unsupported parameter: tools",
+    ),
+    false,
+  );
+  assert.equal(
+    isProviderCompatibilityErrorMessage(thinkingModeError),
+    false,
+    "a narrow tool_choice miss must not enter the broad XML transport fallback",
+  );
+  assert.equal(
+    isProviderCompatibilityErrorMessage(
+      'HTTP 400: {"type":"invalid_request_error","message":"temperature is out of range"}',
+    ),
+    false,
+    "an error type alone is not evidence of a message/tool protocol incompatibility",
+  );
+});
+
+test("narrowed native surfaces flatten stale historical calls but retain native tools", () => {
+  const original = [
+    { role: "system", content: "Use the active tool catalog." },
+    { role: "user", content: "Fix the editor." },
+    {
+      role: "assistant",
+      content: "I will search first.",
+      tool_calls: [{
+        id: "call-search",
+        type: "function",
+        function: { name: "grep_search", arguments: '{"query":"unsaved"}' },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: "call-search",
+      content: "0 matches",
+    },
+  ];
+  const isolated = isolateNativeToolHistoryForActiveSurface(
+    original,
+    ["apply_patch", "replace_in_file", "write_file"],
+  );
+
+  assert.equal(isolated.changed, true);
+  assert.deepEqual(isolated.isolatedToolNames, ["grep_search"]);
+  assert.equal(isolated.messages.some((message) => message.role === "tool"), false);
+  assert.equal(
+    isolated.messages.some((message) => Array.isArray(message.tool_calls)),
+    false,
+  );
+  assert.match(isolated.messages[2].content, /Historical tool calls: grep_search/);
+  assert.match(isolated.messages[3].content, /Historical tool result: grep_search/);
+  assert.match(isolated.messages[3].content, /0 matches/);
+
+  const unchanged = isolateNativeToolHistoryForActiveSurface(
+    original,
+    ["grep_search", "apply_patch"],
+  );
+  assert.equal(unchanged.changed, false);
+  assert.strictEqual(unchanged.messages, original);
+});
+
+test("narrowed native history keeps newest evidence under a fixed request budget", () => {
+  const messages = [{ role: "user", content: "Repair the current validation failure." }];
+  for (let index = 0; index < 8; index += 1) {
+    messages.push({
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: `call-${index}`,
+        type: "function",
+        function: { name: "grep_search", arguments: `{"query":"q-${index}"}` },
+      }],
+    });
+    messages.push({
+      role: "tool",
+      tool_call_id: `call-${index}`,
+      content: `result-${index}-head\n${"x".repeat(9_000)}\nresult-${index}-tail`,
+    });
+  }
+  const isolated = isolateNativeToolHistoryForActiveSurface(
+    messages,
+    ["apply_patch"],
+  );
+  const historicalResultText = isolated.messages
+    .filter((message) => message.role === "user" &&
+      String(message.content || "").includes("[Historical tool result"))
+    .map((message) => String(message.content || ""))
+    .join("\n");
+
+  assert.equal(isolated.changed, true);
+  assert.ok(
+    historicalResultText.length < NATIVE_TOOL_HISTORY_RESULT_BUDGET_CHARS + 2_000,
+    `isolated result history should be bounded, received ${historicalResultText.length} chars`,
+  );
+  assert.match(historicalResultText, /historical result compacted|Historical tool result omitted/);
+  assert.match(historicalResultText, /result-7-tail/);
 });
 
 test("provider compatibility prompt derives its XML catalog from the active edit schemas", () => {

@@ -36,6 +36,7 @@ import {
   rememberToolActivity,
   toolResultCountsAsExecutionEvidence,
 } from "./toolActivityTracking";
+import { extractJoinedSubagentMutationEvidence } from "./subagentJoinRuntime";
 import { resolveUnityMcpForcedConsoleResult } from "./unityMcpRuntime";
 import { getToolExecutionArgs, hasCompletedToolExecution } from "../../toolResultEffect";
 
@@ -146,6 +147,29 @@ export function handleToolResultPostProcessing(input: {
     extractSubagentParentRereadObligations(result, { evidenceLedger: true })
   );
   const delegatedActivities = [...delegatedEvidenceActivities, ...parentRereadObligations];
+  const delegatedMutationEvidence = externalResults.flatMap(
+    extractJoinedSubagentMutationEvidence,
+  );
+  if (delegatedMutationEvidence.length > 0) {
+    callbacks.adoptSubagentMutationEvidence?.(delegatedMutationEvidence);
+    markExecuteOperationEvidence();
+    const latestMutation =
+      delegatedMutationEvidence[delegatedMutationEvidence.length - 1];
+    recentSuccessfulProjectWrite = {
+      name: latestMutation.sourceTool,
+      target: String(latestMutation.target || latestMutation.value || "").trim(),
+    };
+    recoveringFromEmptyAssistantReplyAfterWrite = false;
+    callbacks.onDebugEvent?.("subagent_mutation_evidence_promoted", {
+      iteration,
+      evidenceCount: delegatedMutationEvidence.length,
+      targets: [...new Set(delegatedMutationEvidence
+        .map((entry) => String(entry.target || entry.value || "").trim())
+        .filter(Boolean))].slice(0, 24),
+      nextOwner: "parent_validation",
+      providerNeutral: true,
+    });
+  }
   const directlyTrackedResults = externalResults.filter((result) =>
     result.name !== "spawn_subagent" &&
     result.name !== "wait_subagents" &&

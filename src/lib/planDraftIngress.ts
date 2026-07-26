@@ -626,6 +626,53 @@ function listSection(title: string, lines: string[]): string {
   return [`## ${title}`, ...(lines.length > 0 ? lines.map((line) => `- ${line}`) : ["- None."])].join("\n");
 }
 
+function renderPlanEvidenceLine(
+  candidate: PlanCandidateV3,
+  item: PlanCandidateV3["evidence"][number],
+  language: "zh" | "en",
+): string {
+  const receiptFact = candidate.evidenceReceipt.facts.find((fact) => fact.id === item.id);
+  let display = String(item.statement || "").replace(/\s+/g, " ").trim();
+  for (const observation of item.sourceObservations || []) {
+    const provenance =
+      `source_observation(${observation.path}:L${observation.startLine}-L${observation.endLine},${observation.excerptHash},version=${observation.versionToken})`;
+    display = display.split(provenance).join(" ").replace(/\s+/g, " ").trim();
+  }
+  // Structured contract signatures remain sealed in the receipt, while the
+  // user-facing artifact keeps the human evidence summary. They are appended
+  // by the runtime statement projector, so peel only exact trailing segments.
+  let peeled = display;
+  let removed = true;
+  while (removed) {
+    removed = false;
+    for (const binding of receiptFact?.structuredFactBindings || []) {
+      const signature = String(binding.signature || "").trim();
+      const suffix = signature ? ` ${signature}` : "";
+      if (suffix && peeled.endsWith(suffix)) {
+        peeled = peeled.slice(0, -suffix.length).trim();
+        removed = true;
+      }
+    }
+  }
+  if (peeled) display = peeled;
+
+  const target = String(item.target || "").replace(/`/g, "");
+  const sourceRanges = Array.from(new Set((item.sourceObservations || []).map((observation) =>
+    workspacePathsReferToSameFile(observation.path, item.target)
+      ? `L${observation.startLine}-${observation.endLine}`
+      : `${observation.path}:L${observation.startLine}-${observation.endLine}`
+  )));
+  const provenance = sourceRanges.length > 0
+    ? language === "zh"
+      ? `（源码：${sourceRanges.join("、")}）`
+      : ` (source: ${sourceRanges.join(", ")})`
+    : "";
+  const fallback = language === "zh"
+    ? `已确认 \`${target}\` 中与本次问题相关的实现。`
+    : `Confirmed the implementation in \`${target}\` that is relevant to this issue.`;
+  return `[${item.id}] \`${target}\`${language === "zh" ? "：" : ": "}${display || fallback}${provenance}`;
+}
+
 /** Render-only projection. No consumer may parse it back into new runtime truth. */
 export function renderTypedPlanCandidateMarkdown(
   candidate: PlanCandidateV3,
@@ -702,9 +749,10 @@ export function renderTypedPlanCandidateMarkdown(
           ),
         )]
       : []),
-    listSection(zh ? "已确认证据" : "Confirmed Evidence", candidate.evidence.map((item) =>
-      `[${item.id}] ${item.target} (${item.sourceTool}): ${item.statement}`
-    )),
+    listSection(
+      zh ? "已确认证据" : "Confirmed Evidence",
+      candidate.evidence.map((item) => renderPlanEvidenceLine(candidate, item, language)),
+    ),
     ...(coverageLines.length > 0
       ? [listSection(zh ? "证据闭环" : "Evidence Closure", coverageLines)]
       : []),

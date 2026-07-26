@@ -30,6 +30,8 @@ test("real OMLX validation selects only a fully loaded model", () => {
   assert.match(source, /selectedModelIds\.length !== 1/);
   assert.match(source, /unloadedRequestedModels/);
   assert.match(source, /OMLX_MODELS: selectedModelIds\.join/);
+  assert.match(source, /REAL_OMLX_TEST_GREP \|\| "plan\/approve\/execute"/);
+  assert.match(source, /"--grep", testGrep/);
   assert.match(source, /for \(let attempt = 1; attempt <= 3; attempt \+= 1\)/);
   assert.match(source, /readSingleModelStatusWithRetry\(selectedModelIds\[0\], "preflight"\)/);
   assert.match(source, /readSingleModelStatusWithRetry\(selectedModelIds\[0\], "postflight"\)/);

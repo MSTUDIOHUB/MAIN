@@ -111,6 +111,13 @@ try {
 }
 
 const preparedWorkspace = String(process.env.REAL_OMLX_WORKSPACE || "").trim();
+const testGrep = String(
+  process.env.REAL_OMLX_TEST_GREP || "plan/approve/execute",
+).trim();
+if (!testGrep) {
+  console.error("[real-omlx-plan] 验收未完成：REAL_OMLX_TEST_GREP 不能为空。");
+  process.exit(2);
+}
 if (preparedWorkspace) {
   try {
     const workspaceStat = await fs.stat(preparedWorkspace);
@@ -132,7 +139,7 @@ console.log(`[real-omlx-plan] 使用已加载模型：${selectedModelIds.join(",
 const cli = path.resolve("node_modules/@playwright/test/cli.js");
 const result = spawnSync(
   process.execPath,
-  [cli, "test", "tests/e2e/real-omlx-plan-flow.spec.ts", "--grep", "plan/approve/execute"],
+  [cli, "test", "tests/e2e/real-omlx-plan-flow.spec.ts", "--grep", testGrep],
   {
     stdio: "inherit",
     env: {

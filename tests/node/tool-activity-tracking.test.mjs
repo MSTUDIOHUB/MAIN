@@ -420,6 +420,43 @@ test("mutation activity carries runtime-observed truth instead of inferring from
   assert.equal(activities.at(-1).mutationObserved, true);
 });
 
+test("mutation activity retains the largest concrete changed hunk for validation recovery", () => {
+  const activities = [];
+  rememberToolActivity(activities, result({
+    toolCallId: "observed-full-file-diff",
+    workspaceEffect: "verified",
+    workspaceMutationEvidence: {
+      changedPaths: ["src/App.tsx"],
+      diff: {
+        path: "src/App.tsx",
+        old: [
+          "const stable = true;",
+          "function render() {",
+          "  return 'before';",
+          "}",
+          "export { render };",
+        ].join("\n"),
+        new: [
+          "const stable = true;",
+          "function render() {",
+          "  const label = 'after';",
+          "  return label;",
+          "}",
+          "export { render };",
+        ].join("\n"),
+        fullFile: true,
+      },
+    },
+  }));
+
+  assert.deepEqual(activities.at(-1).mutationRange, {
+    path: "src/App.tsx",
+    startLine: 3,
+    endLine: 4,
+    maxLines: 2,
+  });
+});
+
 test("execution success and possible workspace side effects remain orthogonal", () => {
   const failedAfterInvocation = result({
     name: "run_command",

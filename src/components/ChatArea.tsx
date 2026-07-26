@@ -111,6 +111,7 @@ import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
 import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
+import { buildCapsulePhaseGuidance } from "../lib/assistantProgressPresentation";
 import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
 import {
   resolveTurnStrategyFromIntent,
@@ -4396,7 +4397,26 @@ export default function ChatArea({
           ),
         })
       : "";
-  const capsuleGuidanceText = capsuleLiveGuidanceText || capsuleStructuredGuidanceText;
+  const capsulePhaseGuidanceText = capsuleIsRunActive && !capsuleActionKind
+    ? buildCapsulePhaseGuidance(capsuleStatusProjection.kind, language)
+    : "";
+  const capsuleGuidanceText =
+    capsuleLiveGuidanceText ||
+    capsuleStructuredGuidanceText ||
+    capsulePhaseGuidanceText;
+  const capsuleGuidanceSource = capsuleLiveGuidanceText
+    ? "model"
+    : capsuleStructuredGuidanceText
+      ? "runtime"
+      : capsulePhaseGuidanceText
+        ? "phase"
+        : "status";
+  const capsuleGuidanceUpdatedAt = Math.max(
+    0,
+    capsuleRunStatus.currentActivity?.lastSeenAt || 0,
+    capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
+    ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
+  );
 
   useEffect(() => {
     setIsCapsuleCollapsed(false);
@@ -5203,10 +5223,12 @@ export default function ChatArea({
               <div
                 data-testid="agent-explanation-capsule"
                 data-capsule-status={capsuleStatusProjection.kind}
+                data-guidance-source={capsuleGuidanceSource}
+                data-guidance-updated-at={capsuleGuidanceUpdatedAt || undefined}
                 data-action-kind={planReviewActionRequest?.kind || userChoiceActionRequest?.kind || permissionActionRequest?.kind || undefined}
-                data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
-                data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || undefined}
-                data-run-id={planReviewActionRequest?.runId || userChoiceActionRequest?.runId || permissionActionRequest?.runId || undefined}
+                data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || activeSessionKey || undefined}
+                data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || capsuleTurn?.id || undefined}
+                data-run-id={planReviewActionRequest?.runId || userChoiceActionRequest?.runId || permissionActionRequest?.runId || capsuleActiveRunId || undefined}
                 data-request-id={planReviewActionRequest?.requestId || userChoiceActionRequest?.requestId || permissionActionRequest?.requestId || undefined}
                 data-plan-revision={planReviewActionRequest ? String(planReviewActionRequest.planRevision) : undefined}
                 data-artifact-hash={planReviewActionRequest?.artifactHash || undefined}

@@ -411,7 +411,7 @@ test("workspace FIFO dispatch carries the captured subagent preference into Turn
   );
 });
 
-test("collaboration stays optional and path-driven forced delegation is absent", () => {
+test("collaboration toggle creates one provider-neutral spawn boundary without path heuristics", () => {
   const planningSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"),
     "utf8",
@@ -430,10 +430,12 @@ test("collaboration stays optional and path-driven forced delegation is absent",
   );
 
   assert.doesNotMatch(planningSource, /resolvePreferredDelegationRequirement/);
-  assert.doesNotMatch(planningSource, /preferredDelegationRequirement/);
+  assert.match(planningSource, /preferredDelegationRequired/);
+  assert.match(planningSource, /collaborationStarted/);
   assert.doesNotMatch(preparationSource, /buildPreferredDelegationActionContract/);
   assert.doesNotMatch(preparationSource, /preferred_delegation_action_contract_injected/);
   assert.doesNotMatch(invocationSource, /preferredDelegationRequired/);
+  assert.match(invocationSource, /availableToolNames\.has\("spawn_subagent"\)/);
   assert.match(planningSource, /Runtime no longer derives collaboration work from files/);
   assert.match(planningSource, /tool\.function\.name === "spawn_subagent"/);
   assert.match(planningSource, /tool\.function\.name !== "spawn_subagent"/);
@@ -441,7 +443,7 @@ test("collaboration stays optional and path-driven forced delegation is absent",
   assert.match(orchestratorSource, /emitCollaborationTaskOutcomes/);
   assert.match(
     orchestratorSource,
-    /emitCollaborationTaskOutcomes\(outcomes, "explicit_wait"\)/,
+    /emitCollaborationTaskOutcomes\(outcomes, "tool_iteration"\)/,
   );
   assert.match(orchestratorSource, /semantic_collaboration_task_spawned/);
   assert.match(orchestratorSource, /semantic_collaboration_evidence_consumed/);
@@ -659,6 +661,7 @@ test("agent loop closes non-actionable stops and completion-guard gaps as typed 
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
   const finalizationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"), "utf8");
   const evaluationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/planExecutionEvaluation.ts"), "utf8");
+  const executeRecoveryToolsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"), "utf8");
   const resolverStart = guardsSource.indexOf("export function resolveNonActionableStopOutcome(");
   const resolverEnd = guardsSource.indexOf("export function resolveFinalTurnContractForCompletion", resolverStart);
   const resolverSource = guardsSource.slice(resolverStart, resolverEnd);
@@ -672,7 +675,8 @@ test("agent loop closes non-actionable stops and completion-guard gaps as typed 
   assert.match(runnerSource, /completedAgentLoopOutcome\("agent_loop_no_terminal_outcome", "error"\)/);
   assert.match(resolverSource, /isRecoverableRuntimePauseReason\(recoveryReason\)/);
   assert.match(resolverSource, /"plan_generation_failed"[\s\S]*"plan_required_tool_protocol_violation"/);
-  assert.match(resolverSource, /"stream_no_visible_progress_timeout"[\s\S]*"stream_max_elapsed_timeout"/);
+  assert.match(resolverSource, /isAutoResumableExecutionBoundaryReason\(reason\)/);
+  assert.match(executeRecoveryToolsSource, /"stream_no_visible_progress_timeout"[\s\S]*"stream_max_elapsed_timeout"/);
   assert.match(resolverSource, /"max_iterations_boundary"[\s\S]*"execute_max_iterations_checkpoint"/);
   assert.match(resolverSource, /status: "paused"[\s\S]*pauseKind: "recoverable"/);
   assert.match(resolverSource, /options\.sawExecutionEvidence[\s\S]*\? "partial" as const/);
@@ -762,7 +766,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(assistantOutputPhaseSource, /resolveToolProgressRouting\(\{/);
   assert.match(assistantOutputPhaseSource, /resolveToolProgressPresentation\(\{/);
   assert.match(toolCallExecutionPhaseSource, /executeToolExecutionRound\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /appendToolResultsToHistory\(\{/);
+  assert.match(toolResultRecoveryPhaseSource, /commitToolResultBatch\(\{/);
   assert.match(toolCallExecutionPhaseSource, /handleToolResultPostProcessing\(\{/);
   assert.doesNotMatch(toolResultRecoveryPhaseSource, /handleReadFileRepeatLimitRecovery\(\{/);
   assert.doesNotMatch(toolResultRecoveryPhaseSource, /handleRepeatedEditValidationRecovery\(\{/);
@@ -935,7 +939,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /executeToolExecutionRound\(/);
   assert.doesNotMatch(source, /handleToolResultPostProcessing\(/);
   assert.doesNotMatch(source, /tool_calls_detected/);
-  assert.doesNotMatch(source, /appendToolResultsToHistory\(/);
+  assert.doesNotMatch(source, /commitToolResultBatch\(/);
   assert.doesNotMatch(source, /handleNoProgressRecovery\(/);
   assert.doesNotMatch(source, /handleReadFileRepeatLimitRecovery\(/);
   assert.doesNotMatch(source, /handleCrossIterationReadFileLoopRecovery\(/);
@@ -1133,7 +1137,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolExecutionRoundSource, /executeWriteToolWithReview/);
   assert.match(toolExecutionRoundSource, /logAgentEvent\("file_read_cache_stored"/);
   assert.match(toolExecutionRoundSource, /browserValidationCache\.set/);
-  assert.match(toolResultHistorySource, /export function appendToolResultsToHistory/);
+  assert.match(toolResultHistorySource, /export function commitToolResultBatch/);
   assert.match(toolResultHistorySource, /iterationContext: Pick</);
   assert.match(toolResultHistorySource, /\| "turnContext"[\s\S]*\| "startedToolCallIds"[\s\S]*\| "completedToolCallIds"/);
   assert.match(toolResultHistorySource, /const \{ eventThreadId, eventTurnId, turnContext \} = iterationContext;/);
@@ -1202,7 +1206,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(maxIterationBoundarySource, /logAgentEvent\(isPlanBoundary[\s\S]*?"max_iterations_checkpoint"[\s\S]*?"execute_max_iterations_checkpoint"/);
   assert.match(maxIterationBoundarySource, /handling\.autoResumeScheduled \? "max_iterations_auto_resume" : "max_iterations_boundary"/);
   assert.match(approvedPlanRecoveryActionsSource, /export function pauseApprovedPlanStreamWatchdog/);
-  assert.match(approvedPlanRecoveryActionsSource, /approved_plan_stream_watchdog_paused/);
+  assert.match(approvedPlanRecoveryActionsSource, /approved_plan_stream_watchdog_boundary/);
   assert.match(preCompletionEvidenceRecoverySource, /export function resolvePreCompletionEvidenceRecoveryDecision/);
   const preCompletionAuditIndex = assistantCompletionPhaseSource.indexOf("resolvePreCompletionEvidenceRecoveryDecision({");
   const activeContractIndex = assistantCompletionPhaseSource.indexOf('currentExecuteRecoveryState.mode !== "normal"');
@@ -1528,11 +1532,11 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   assert.match(guardsSource, /approved_plan_completion_guard_incomplete_after_change/);
   assert.match(
     approvedGuardSource,
-    /return \{\s*status: "completed",\s*resultKind: sawExecutionEvidence \? "partial" : "blocked",\s*reason: "approved_plan_completion_guard"/,
+    /return \{\s*status: "paused",\s*pauseKind: "recoverable",\s*reason: recoveryReason/,
   );
   assert.match(
     executionGuardSource,
-    /return \{\s*status: "completed",\s*resultKind: sawExecutionEvidence \? "partial" : "blocked"/,
+    /return \{\s*status: "paused",\s*pauseKind: "recoverable",\s*reason: recoveryReason/,
   );
   assert.doesNotMatch(workflowEngine, /const stoppedStatus =/);
   assert.match(workflowEngine, /const stopBlock = \{/);
@@ -1583,7 +1587,7 @@ test("explicit reply options mark assistant text as awaiting input even when too
   assert.match(workflowEngine, /publishTerminalStatus:[\s\S]*?isGenerating: false/);
 });
 
-test("agent loop blocks execute completion without execution evidence", () => {
+test("agent loop yields execute completion without execution evidence to recovery", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
@@ -1703,16 +1707,23 @@ test("workflow engine owns finite differentiated auto-resumes between fresh evid
   assert.match(executeHandler, /latestExecuteRecoveryState\?\.expectedTarget/);
   assert.match(executeHandler, /readLease: latestExecuteRecoveryState\?\.readLease \|\| null/);
   assert.match(executeHandler, /sourceObservationKey: latestExecuteRecoveryState\?\.sourceObservationKey \|\| null/);
-  assert.match(executeHandler, /phaseNoProgressCount: recoveryPhaseChanged/);
   assert.match(
+    executeHandler,
+    /normalizeExecutionDecisionCheckpointSnapshot\(\{[\s\S]*?\.\.\.\(latestExecuteRecoveryState\?\.decisionCheckpoint \|\| \{\}\)[\s\S]*?nextRequiredCapability: nextRecoveryContract\.nextRequiredCapability/,
+    "same-turn workflow resume must normalize the complete prior checkpoint instead of maintaining another field whitelist",
+  );
+  assert.match(executeHandler, /phaseNoProgressCount: 0/);
+  assert.match(executeHandler, /protocolNoProgressCount: 0/);
+  assert.match(executeHandler, /protocolNoProgressFingerprint: null/);
+  assert.match(
+    executeHandler,
+    /decisionCheckpoint: resumedDecisionCheckpoint/,
+    "the forced recovery state must use the canonical normalized checkpoint",
+  );
+  assert.doesNotMatch(
     executeHandler,
     /browserFailureCallSignature:\s*latestExecuteRecoveryState\.decisionCheckpoint\.browserFailureCallSignature/,
-    "same-turn workflow resume must retain the exact deterministic browser failure signature",
-  );
-  assert.match(
-    executeHandler,
-    /browserLocatorCandidates:\s*\[\s*\.\.\.latestExecuteRecoveryState\.decisionCheckpoint\.browserLocatorCandidates/,
-    "same-turn workflow resume must retain the browser diagnostic evidence paired with the signature",
+    "same-turn workflow resume must not manually whitelist checkpoint fields",
   );
   assert.match(
     toolCallExecutionPhaseSource,
@@ -1737,6 +1748,64 @@ test("workflow engine owns finite differentiated auto-resumes between fresh evid
   assert.match(
     terminalContinuation,
     /else if \(pendingMaxIterationsAutoResume\)[\s\S]*?scheduleRuntimeTask\(\(\) => pending\.start\(\)\)/,
+  );
+});
+
+test("recoverable execute-local fuses route through the global continuation owner", () => {
+  const workflowEngine = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const orchestrator = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+    "utf8",
+  );
+  const streamRecovery = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"),
+    "utf8",
+  );
+  const executeRecovery = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"),
+    "utf8",
+  );
+  const executeRecoveryTools = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"),
+    "utf8",
+  );
+
+  assert.match(
+    workflowEngine,
+    /onExecuteRecoveryBoundary: \(boundary\) => \{[\s\S]*?resolveMaxIterationStrategyPivot[\s\S]*?callbacks\.onExecuteMaxIterationsCheckpoint\?\.\(checkpoint\)/,
+  );
+  assert.match(
+    workflowEngine,
+    /isAutoResumableExecutionBoundaryReason\(boundaryCause\)[\s\S]*?isInternalAutoResumeBoundary[\s\S]*?recoverable_boundary_hidden_for_auto_resume/,
+    "a scheduled child Run must not render the yielding Run as a red ChatArea failure",
+  );
+  assert.match(
+    orchestrator,
+    /recoveryReason: "execute_recovery_no_progress_limit"/,
+    "the loop should emit a typed boundary and leave continuation ownership to the workflow",
+  );
+  assert.doesNotMatch(
+    orchestrator,
+    /routeExecuteRecoveryBoundary/,
+    "the loop must not schedule its own child Run",
+  );
+  assert.match(
+    streamRecovery,
+    /pauseReason: watchdogBoundary\.reason/,
+    "stream watchdogs should preserve their exact boundary reason",
+  );
+  assert.match(
+    executeRecoveryTools,
+    /AUTO_RESUMABLE_EXECUTION_BOUNDARY_REASONS[\s\S]*?isAutoResumableExecutionBoundaryReason/,
+    "all model-neutral local fuse reasons should be classified in one place",
+  );
+  assert.doesNotMatch(
+    executeRecovery,
+    /recoveryReason: "max_iterations_auto_resume"/,
+    "local recovery handlers must not impersonate the global continuation owner",
   );
 });
 
@@ -2177,7 +2246,7 @@ test("tool-result recovery returns the activated execute-recovery state", () => 
   assert.match(actionsSource, /return nextState;/);
 });
 
-test("six no-progress recovery attempts stop before another model stream", () => {
+test("six no-progress recovery attempts yield before another model stream without discarding the transaction", () => {
   const preparationSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
     "utf8",
@@ -2191,6 +2260,14 @@ test("six no-progress recovery attempts stop before another model stream", () =>
 
   assert.match(preparationSource, /recoveryPause:\s*\{/);
   assert.match(preparationSource, /execute_recovery_max_iterations_reached/);
+  assert.match(
+    preparationSource,
+    /executeRecoveryState = \{\s*\.\.\.exhaustedState,\s*reason: "execute_recovery_phase_boundary"/,
+  );
+  assert.doesNotMatch(
+    preparationSource,
+    /clearExecuteRecovery\(\s*"max_recovery_iterations_reached"/,
+  );
   assert.match(orchestratorSource, /execute_recovery_no_progress_limit/);
   assert.ok(pauseCheck >= 0 && streamCall > pauseCheck, "the terminal checkpoint must be emitted before another LLM stream starts");
 });

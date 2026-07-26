@@ -57,6 +57,7 @@ import {
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import { hasSuccessfulWorkspaceMutationEvidence } from "../../verificationEvidence";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 
 export { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
 
@@ -278,7 +279,6 @@ export function handleNoProgressRecovery(input: {
           readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
           sawExecuteOperationEvidence,
           noProgressBatchRepeatCount,
-          minReadOnlyActivities: currentExecuteRecoveryMode === "normal" ? 8 : Infinity,
           minCachedReadOnlyActivities: currentExecuteRecoveryMode === "normal" ? 3 : Infinity,
           maxNoProgressReadOnlyRepeats: 2,
           maxReadOnlyToolChars: 48000,
@@ -288,14 +288,68 @@ export function handleNoProgressRecovery(input: {
     const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     if (currentExecuteRecoveryAttempts < 2) {
-      // Read-only convergence already has context. Move to one mutation step;
-      // the context-read phase is reserved for an actual patch mismatch.
-      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = "mutation_first";
-      const activatedRecovery = activateTrackedExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
-        readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
-        batchToolChars: executeReadOnlyRecovery.batchToolChars,
-        repeatedTargets,
-      });
+      // Repeated searches are not a versioned source observation. Requiring a
+      // mutation with no bound target/source leaves smaller models only unsafe
+      // guesses (or an out-of-surface request for another read). Enter the
+      // bounded targeting capability first unless a prior runtime checkpoint
+      // already owns an exact source observation.
+      const retainedSourceObservation = [...recentToolActivity]
+        .reverse()
+        .map((activity) => activity.readFileObservation)
+        .find((observation) =>
+          Boolean(
+            observation &&
+            observation.source !== "stub" &&
+            observation.key &&
+            observation.path &&
+            (
+              repeatedTargets.length === 0 ||
+              repeatedTargets.some((target) =>
+                workspacePathsReferToSameFile(target, observation.path)
+              )
+            ),
+          )
+        ) || null;
+      const boundTarget =
+        currentExecuteRecoveryState.expectedTarget ||
+        retainedSourceObservation?.path ||
+        null;
+      const boundSourceObservationKey =
+        currentExecuteRecoveryState.sourceObservationKey ||
+        retainedSourceObservation?.key ||
+        null;
+      const hasBoundSourceObservation = Boolean(
+        boundTarget && boundSourceObservationKey,
+      );
+      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> =
+        hasBoundSourceObservation ? "mutation_first" : "action_plus_targeting";
+      const activatedRecovery = activateTrackedExecuteRecovery(
+        nextMode,
+        executeReadOnlyRecovery.reason,
+        {
+          readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
+          batchToolChars: executeReadOnlyRecovery.batchToolChars,
+          repeatedTargets,
+          ...(hasBoundSourceObservation
+            ? {
+                expectedTarget: boundTarget,
+                sourceObservationKey: boundSourceObservationKey,
+                ...(retainedSourceObservation
+                  ? { readFileObservation: retainedSourceObservation }
+                  : {}),
+              }
+            : {
+                resetExpectedTarget: true,
+                readLease: null,
+                sourceObservationKey: null,
+                decisionCheckpoint: {
+                  expectedTarget: null,
+                  sourceObservationKey: null,
+                  nextRequiredCapability: "targeting",
+                },
+              }),
+        },
+      );
       pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
         language: MODEL_CONTROL_LANGUAGE,
         reason: executeReadOnlyRecovery.reason,
@@ -421,6 +475,7 @@ export function handleNoProgressRecovery(input: {
         "no_action",
         {
           phase: "paused",
+          recoveryReason: "execute_chat_repair_no_progress",
           nextStep: language === "zh"
             ? "继续时应进入执行能力，基于已读证据直接修复/验证，或说明精确阻塞。"
             : "Resume with execution capabilities and patch/validate from cached evidence, or state the exact blocker.",
@@ -828,6 +883,15 @@ export function handleTargetProgressLoopRecovery(input: {
             "On resume, first inspect current workspace state, then choose a different strategy or output the final result.",
           ].join("\n"),
       "no_action",
+      {
+        phase: "paused",
+        progressSignature: progressCheck.signature,
+        repeatedTargets: displayTarget ? [displayTarget] : [],
+        recoveryReason: "target_progress_loop",
+        nextStep: callbacks.getPreferredLanguage() === "zh"
+          ? "从保留的目标检查点切换参数、工具或验证策略"
+          : "resume from the retained target checkpoint with different arguments, tools, or validation",
+      },
     );
     callbacks.onStatusChange("idle");
     return { status: "stopped" };
@@ -901,13 +965,14 @@ export function handleExecuteConvergencePrompt(input: {
     return { usedExecuteConvergencePrompt: true };
   }
   if (isExecuteMutationRecoveryEligible({ callbacks, workflowMode, runtimeIntent })) {
-    const recoveryMode = !callbacks.getIsPlanApproved() &&
-        hasSuccessfulWorkspaceMutationEvidence({
-          ledger: callbacks.getPlanExecutionEvidenceLedger(),
-          transactionId: callbacks.getCurrentTurnId?.(),
-        })
+    const hasCurrentMutation = !callbacks.getIsPlanApproved() &&
+      hasSuccessfulWorkspaceMutationEvidence({
+        ledger: callbacks.getPlanExecutionEvidenceLedger(),
+        transactionId: callbacks.getCurrentTurnId?.(),
+      });
+    const recoveryMode = hasCurrentMutation
       ? "validation_only"
-      : "mutation_first";
+      : "action_plus_targeting";
     activateExecuteRecovery(recoveryMode, "execute_convergence_prompt", {
       maxIterations: effectiveMaxIterations,
       recentToolActivity: recentToolActivity.length,
@@ -916,6 +981,17 @@ export function handleExecuteConvergencePrompt(input: {
       // lock belongs only to the preceding read/mutate transaction and must
       // not prevent the model from fixing another file in the same turn.
       resetExpectedTarget: true,
+      ...(!hasCurrentMutation
+        ? {
+            readLease: null,
+            sourceObservationKey: null,
+            decisionCheckpoint: {
+              expectedTarget: null,
+              sourceObservationKey: null,
+              nextRequiredCapability: "targeting",
+            },
+          }
+        : {}),
     });
   }
   callbacks.appendMessage({
@@ -938,7 +1014,7 @@ export function handleStrictRepeatGuardRecovery(input: {
   iteration: number;
   effectiveToolCalls: ToolCallToExecute[];
   results: ToolExecutionResult[];
-  recentToolCalls: Array<{ name: string; argsKey: string }>;
+  recentToolCalls: Array<{ name: string; argsKey: string; readOnly?: boolean }>;
   repeatGuardRecoveredSignatures: Set<string>;
   recentPlanToolActivity: PlanToolActivitySummary[];
   availableToolNames: Set<string>;

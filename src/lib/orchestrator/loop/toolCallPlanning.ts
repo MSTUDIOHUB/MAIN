@@ -49,20 +49,60 @@ import {
   scopeExecutionEvidenceLedger,
 } from "../../verificationEvidence";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
+import type { DirectEditTransactionPhase } from "../../directEditTransaction";
 
 export interface IterationToolSurfaceDecision {
   isExecuteRecoveryEligible: boolean;
   allowExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
-  directFileModifyPhase: DirectFileModifyPhase;
+  directEditPhase: DirectEditTransactionPhase | null;
   delegationDecision: DelegationDecision;
+  /** The collaboration toggle owns one successful root-level spawn boundary. */
+  preferredDelegationRequired: boolean;
   /** Exact runtime-owned read/search transaction for this Plan iteration. */
   planEvidenceObligation?: PlanEvidenceObligation;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
 }
 
-export type DirectFileModifyPhase = "source_change" | "validation" | null;
+type CollaborationStartCallbacks = Partial<Pick<
+  OrchestratorCallbacks,
+  | "getCurrentTurnId"
+  | "getPendingSubagentIds"
+  | "getSessionKey"
+  | "getSubagentClosureReceiptLedger"
+  | "getTurnRuntimeCheckpoint"
+>>;
+
+/**
+ * One exact-Turn collaboration fact shared by tool-surface gating and terminal
+ * diagnostics. Pending children, the durable planning ledger, and closure
+ * receipts are alternative projections of the same accepted start boundary.
+ */
+export function hasStartedCollaborationForCurrentTurn(
+  callbacks: CollaborationStartCallbacks,
+): boolean {
+  if ((callbacks.getPendingSubagentIds?.().length || 0) > 0) return true;
+  const currentTurnId = callbacks.getCurrentTurnId?.() || null;
+  if (!currentTurnId) return false;
+  const sessionKey = callbacks.getSessionKey?.() || null;
+  if (!sessionKey) return false;
+  const checkpoint = callbacks.getTurnRuntimeCheckpoint?.() || null;
+  if (
+    checkpoint?.owner.turnId === currentTurnId &&
+    checkpoint.owner.sessionKey === sessionKey &&
+    checkpoint.planning.collaborationLedger.entries.length > 0
+  ) {
+    return true;
+  }
+  const closureLedger = callbacks.getSubagentClosureReceiptLedger?.() || null;
+  return Boolean(
+    closureLedger?.owner.sessionKey === sessionKey &&
+    closureLedger.receipts.some((receipt) =>
+      receipt.owner.parentTurnId === currentTurnId
+    )
+  );
+}
 
 const DIRECT_FILE_MODIFY_WORKSPACE_TOOLS = new Set([
   "list_directory",
@@ -289,13 +329,13 @@ export function hasStructuredWorkspaceMutationEvidence(input: {
   });
 }
 
-function resolveDirectFileModifyPhase(input: {
+function resolveNormalDirectEditPhase(input: {
   callbacks: OrchestratorCallbacks;
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   executeRecoveryMode: ExecuteRecoveryMode;
   recentToolActivity: PlanToolActivitySummary[];
-}): DirectFileModifyPhase {
+}): DirectEditTransactionPhase | null {
   if (
     input.workflowMode !== "edit" ||
     !isMutationRuntimeIntent(input.runtimeIntent) ||
@@ -304,17 +344,21 @@ function resolveDirectFileModifyPhase(input: {
     input.callbacks.getCommandDirective?.()?.kind !== "file_modify"
   ) return null;
 
-  return hasStructuredWorkspaceMutationEvidence(input)
-    ? "validation"
-    : "source_change";
+  const mutationObserved = hasStructuredWorkspaceMutationEvidence(input);
+  if (mutationObserved && (input.callbacks.getSubagentDepth?.() || 0) > 0) {
+    // A controlled child owns only its exact read/write lease. The parent
+    // validates the joined diff instead of widening the child into shell.
+    return null;
+  }
+  return mutationObserved ? "validate" : "inspect";
 }
 
 export function buildDirectFileModifyActionContractCard(input: {
-  phase: Exclude<DirectFileModifyPhase, null>;
+  phase: DirectEditTransactionPhase;
   availableToolNames: Iterable<string>;
 }): string {
   const availableTools = [...new Set(input.availableToolNames)].sort().join(", ");
-  const phaseGuidance = input.phase === "source_change"
+  const phaseGuidance = input.phase === "inspect" || input.phase === "mutate"
     ? [
         "The user intent is a workspace file modification. Locate only the source context needed for the change, then modify source with apply_patch, replace_in_file, or write_file.",
         "run_command is available only for finite diagnostics in this phase. Do not use Python, shell redirection, sed, or temporary scripts to write workspace source, and do not start a dev server before structured file-mutation evidence exists.",
@@ -418,7 +462,28 @@ export function resolveIterationToolSurface(input: {
     ptyOutputSequence: devServerRuntimeObservation.outputSequence,
   });
   const allowExecuteRecoveryFileRead = recoveryActionContract.allowTargetedFileRead;
-  const recoveryIterationAllTools = isExecuteRecoveryEligible
+  const effectiveSubagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: latestUserPromptText,
+    defaultPreference: turnInputContextSignals.subagentPreference && turnInputContextSignals.subagentPreference !== "unspecified"
+      ? turnInputContextSignals.subagentPreference
+      : callbacks.getGoalTurnContract?.()?.subagentPreference,
+  });
+  const collaborationStarted =
+    hasStartedCollaborationForCurrentTurn(callbacks);
+  const preferredCollaborationStartPending =
+    effectiveSubagentPreference === "preferred" &&
+    (callbacks.getSubagentDepth?.() || 0) === 0 &&
+    !collaborationStarted &&
+    rawIterationAllTools.some((tool) =>
+      tool.function.name === "spawn_subagent"
+    );
+  // The UI preference owns the first successful child start. A recovery state
+  // reached after a rejected spawn must not silently restore parent tools.
+  const recoveryIterationAllTools = preferredCollaborationStartPending
+    ? rawIterationAllTools.filter((tool) =>
+        tool.function.name === "spawn_subagent"
+      )
+    : isExecuteRecoveryEligible
     ? rawIterationAllTools.filter((tool) =>
         (
           !["wait_subagents", "cancel_subagent"].includes(tool.function.name) ||
@@ -435,7 +500,11 @@ export function resolveIterationToolSurface(input: {
         )
       )
     : rawIterationAllTools;
-  if (isExecuteRecoveryEligible && recoveryIterationAllTools.length !== rawIterationAllTools.length) {
+  if (
+    isExecuteRecoveryEligible &&
+    !preferredCollaborationStartPending &&
+    recoveryIterationAllTools.length !== rawIterationAllTools.length
+  ) {
     logAgentEvent("execute_recovery_tool_scope_applied", {
       iteration,
       executeRecoveryMode,
@@ -475,13 +544,26 @@ export function resolveIterationToolSurface(input: {
       protocolNoProgressFingerprint: recoveryActionContract.protocolNoProgressFingerprint,
       recoveryIterationCount,
       maxRecoveryIterations,
+      phaseRequestCount: recoveryActionContract.phaseNoProgressCount,
+      phaseRequestLimit: maxRecoveryIterations,
+      phaseRequestOverage: Math.max(
+        0,
+        recoveryActionContract.phaseNoProgressCount - maxRecoveryIterations,
+      ),
+      strategyPivotCount:
+        recoveryActionContract.decisionCheckpoint?.noProgressStrategyPivots?.length || 0,
+      correctionWindowOpen:
+        recoveryActionContract.surfaceDescription ===
+          "objective-audit:edit-or-close",
       recentPlanToolActivity: recentPlanToolActivity.length,
       repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
     });
   }
 
   const executeContractOwnsSurface =
-    isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
+    isExecuteRecoveryEligible &&
+    recoveryActionContract.phase !== "normal" &&
+    !preferredCollaborationStartPending;
   // submit_plan_candidate is runtime control-plane ingress, not a generally
   // executable read-only tool. Keep it out of Chat/Edit and approved Plan
   // surfaces even though its permission risk is intentionally non-mutating.
@@ -532,16 +614,17 @@ export function resolveIterationToolSurface(input: {
     isPlanApproved: callbacks.getIsPlanApproved(),
     planRuntimePhase,
   });
-  const directFileModifyPhase = resolveDirectFileModifyPhase({
+  const directEditPhase = resolveNormalDirectEditPhase({
     callbacks,
     workflowMode,
     runtimeIntent,
     executeRecoveryMode,
     recentToolActivity,
   });
-  const directFileModifyAllowedTools = directFileModifyPhase === "source_change"
+  const directFileModifyAllowedTools =
+    directEditPhase === "inspect" || directEditPhase === "mutate"
     ? DIRECT_FILE_MODIFY_SOURCE_TOOLS
-    : directFileModifyPhase === "validation"
+    : directEditPhase === "validate" || directEditPhase === "audit"
     ? DIRECT_FILE_MODIFY_VALIDATION_TOOLS
     : null;
   const phaseScopedIterationAllTools = directFileModifyAllowedTools
@@ -550,12 +633,12 @@ export function resolveIterationToolSurface(input: {
       )
     : planPhaseScopedIterationAllTools;
   if (
-    directFileModifyPhase &&
+    directEditPhase &&
     phaseScopedIterationAllTools.length !== planPhaseScopedIterationAllTools.length
   ) {
     logAgentEvent("direct_file_modify_tool_scope_applied", {
       iteration,
-      phase: directFileModifyPhase,
+      phase: directEditPhase,
       commandDirectiveKind: callbacks.getCommandDirective?.()?.kind || null,
       rawToolCount: planPhaseScopedIterationAllTools.length,
       scopedToolCount: phaseScopedIterationAllTools.length,
@@ -566,7 +649,7 @@ export function resolveIterationToolSurface(input: {
       scopedTools: phaseScopedIterationAllTools
         .map((tool) => tool.function.name)
         .slice(0, 24),
-      structuredMutationObserved: directFileModifyPhase === "validation",
+      structuredMutationObserved: directEditPhase === "validate",
       providerNeutral: true,
     });
   }
@@ -604,12 +687,6 @@ export function resolveIterationToolSurface(input: {
     Array.isArray(runtimeConfig.cloudServers)
     ? getSubagentAdmissionHealth(subagentCapacityPolicy!)
     : null;
-  const effectiveSubagentPreference = resolveEffectiveSubagentDelegationPreference({
-    rawUserInput: latestUserPromptText,
-    defaultPreference: turnInputContextSignals.subagentPreference && turnInputContextSignals.subagentPreference !== "unspecified"
-      ? turnInputContextSignals.subagentPreference
-      : callbacks.getGoalTurnContract?.()?.subagentPreference,
-  });
   // Paths below remain observability signals only. The runtime no longer
   // turns directory topology into child objectives or mandatory work.
   const openPlanEvidenceObligations =
@@ -659,14 +736,22 @@ export function resolveIterationToolSurface(input: {
     subagentDepth: callbacks.getSubagentDepth?.() || 0,
     runtimeHealth: delegationRuntimeHealth,
   });
-  const delegationScopedIterationAllTools = delegationDecision.action === "admit" &&
-      delegationEligiblePhaseScopedIterationAllTools.some((tool) =>
+  const spawnToolAvailable = delegationEligiblePhaseScopedIterationAllTools.some(
+    (tool) => tool.function.name === "spawn_subagent",
+  );
+  const preferredDelegationRequired =
+    preferredCollaborationStartPending &&
+    delegationDecision.action === "admit" &&
+    spawnToolAvailable;
+  const delegationScopedIterationAllTools = preferredDelegationRequired
+    ? delegationEligiblePhaseScopedIterationAllTools.filter((tool) =>
         tool.function.name === "spawn_subagent"
       )
-    ? delegationEligiblePhaseScopedIterationAllTools
-    : delegationEligiblePhaseScopedIterationAllTools.filter((tool) =>
-        tool.function.name !== "spawn_subagent"
-      );
+    : delegationDecision.action === "admit" && spawnToolAvailable
+      ? delegationEligiblePhaseScopedIterationAllTools
+      : delegationEligiblePhaseScopedIterationAllTools.filter((tool) =>
+          tool.function.name !== "spawn_subagent"
+        );
   if (
     delegationEligiblePhaseScopedIterationAllTools.some((tool) =>
       tool.function.name === "spawn_subagent"
@@ -689,10 +774,9 @@ export function resolveIterationToolSurface(input: {
       recentSuccessfulRuns: delegationRuntimeHealth?.recentSuccessfulRuns ?? 0,
       latestStartupMs: delegationRuntimeHealth?.latestStartupMs ?? null,
       latestCapacityWaitMs: delegationRuntimeHealth?.latestCapacityWaitMs ?? null,
-      spawnToolExposed: delegationDecision.action === "admit" &&
-        delegationEligiblePhaseScopedIterationAllTools.some((tool) =>
-          tool.function.name === "spawn_subagent"
-        ),
+      collaborationStarted,
+      preferredDelegationRequired,
+      spawnToolExposed: delegationDecision.action === "admit" && spawnToolAvailable,
       providerNeutral: true,
     });
   }
@@ -737,6 +821,7 @@ export function resolveIterationToolSurface(input: {
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&
     planRuntimePhase === "needs_evidence" &&
+    !preferredDelegationRequired &&
     pendingSubagentCount === 0
       ? openPlanEvidenceObligations[0]
       : undefined;
@@ -789,7 +874,8 @@ export function resolveIterationToolSurface(input: {
       executeRecoveryMode,
       executeRecoveryReason,
       executeContractOwnsSurface,
-      directFileModifyPhase,
+      directEditPhase,
+      preferredDelegationRequired,
       // Report the effective surface, not an upstream eligibility hint. Those
       // can legitimately be true while a later phase filter removes read_file.
       allowFileRead: scopedToolNameSet.has("read_file"),
@@ -818,8 +904,9 @@ export function resolveIterationToolSurface(input: {
     isExecuteRecoveryEligible,
     allowExecuteRecoveryFileRead,
     recoveryActionContract,
-    directFileModifyPhase,
+    directEditPhase,
     delegationDecision,
+    preferredDelegationRequired,
     ...(planEvidenceObligation ? { planEvidenceObligation } : {}),
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),

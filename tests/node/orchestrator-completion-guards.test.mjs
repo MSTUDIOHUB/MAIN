@@ -246,11 +246,10 @@ test("non-actionable stops always close with an explicit result quality", () => 
     "blocked",
     "incomplete_plan",
   );
-  assertCompletedOutcome(
+  assertRecoverablePause(
     resolveNonActionableStopOutcome("incomplete_plan", {
       recoveryReason: "approved_plan_completion_guard_no_evidence",
     }),
-    "blocked",
     "approved_plan_completion_guard_no_evidence",
   );
   assertRecoverablePause(
@@ -286,13 +285,12 @@ test("non-actionable stops always close with an explicit result quality", () => 
     "blocked",
     "preapproval_plan_quality_recovery_stream_timeout",
   );
-  assertCompletedOutcome(
+  assertRecoverablePause(
     resolveNonActionableStopOutcome("missing_tool_loop", {
       recoveryReason: "required_tool_call_protocol_violation_after_change",
     }, {
       sawExecutionEvidence: true,
     }),
-    "partial",
     "required_tool_call_protocol_violation_after_change",
   );
   assertRecoverablePause(
@@ -320,7 +318,7 @@ test("non-actionable stops always close with an explicit result quality", () => 
   );
 });
 
-test("execution evidence completion guard closes execute turns without evidence as blocked", () => {
+test("execution evidence completion guard yields execute turns without evidence for workflow recovery", () => {
   const { callbacks, events } = createCallbacks();
   const result = runExecutionEvidenceCompletionGuard({
     outcome: { status: "completed", reason: "agent_loop_completed" },
@@ -336,7 +334,7 @@ test("execution evidence completion guard closes execute turns without evidence 
     sawExecutionEvidence: false,
   });
 
-  assertCompletedOutcome(result, "blocked", "execution_evidence_required");
+  assertRecoverablePause(result, "execution_evidence_required");
   assert.equal(events.stops.length, 1);
   assert.equal(events.stops[0].reason, "no_action");
   assert.equal(events.statuses.at(-1), "idle");
@@ -427,9 +425,8 @@ test("an active recovery phase blocks final completion even when prior evidence 
       decisionCheckpoint: null,
     },
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     result,
-    "partial",
     "execution_evidence_gap:recovery_phase_pending",
   );
   assert.match(events.stops[0].message, /恢复事务仍处于 validation 阶段/);
@@ -461,9 +458,8 @@ test("execution evidence completion guard rejects mutation without later validat
     sawExecutionEvidence: true,
   });
 
-  assertCompletedOutcome(
+  assertRecoverablePause(
     result,
-    "partial",
     "execution_evidence_gap:validation_after_mutation_required",
   );
   assert.match(events.stops[0].message, /最新修改之后没有可信/);
@@ -503,9 +499,8 @@ test("validation before a newer mutation cannot close the execution evidence gat
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     result,
-    "partial",
     "execution_evidence_gap:validation_after_mutation_required",
   );
 });
@@ -554,9 +549,8 @@ test("a later actual browser failure remains unresolved until the same browser t
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     blocked,
-    "partial",
     "execution_evidence_gap:unreconciled_failure",
   );
 
@@ -614,9 +608,8 @@ test("ledger append order, not equal millisecond timestamps, determines post-mut
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     blocked,
-    "partial",
     "execution_evidence_gap:validation_after_mutation_required",
   );
 
@@ -686,9 +679,8 @@ test("long-running execution requires PTY readiness and only interaction work re
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     pending,
-    "partial",
     "execution_evidence_gap:pty_observation_required",
   );
 
@@ -730,9 +722,8 @@ test("long-running execution requires PTY readiness and only interaction work re
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     interactionReady,
-    "partial",
     "execution_evidence_gap:browser_validation_required",
   );
 
@@ -807,9 +798,8 @@ test("validation-only long-running execution completes after current PTY readine
     sawExecutionEvidence: true,
   });
 
-  assertCompletedOutcome(
+  assertRecoverablePause(
     guard([launch]),
-    "partial",
     "execution_evidence_gap:pty_observation_required",
   );
   const ready = {
@@ -875,9 +865,8 @@ test("a healthy existing server reconciles a port conflict but still requires br
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assertCompletedOutcome(
+  assertRecoverablePause(
     reconciled,
-    "partial",
     "execution_evidence_gap:browser_validation_required",
   );
 
@@ -924,7 +913,7 @@ test("a healthy existing server reconciles a port conflict but still requires br
   assert.equal(closed, null);
 });
 
-test("approved plan provenance closes without evidence as blocked", () => {
+test("approved plan provenance yields without evidence for workflow recovery", () => {
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "edit",
     getIsPlanApproved: () => true,
@@ -935,7 +924,7 @@ test("approved plan provenance closes without evidence as blocked", () => {
     sawExecutionEvidence: false,
   });
 
-  assertCompletedOutcome(result, "blocked", "approved_plan_completion_guard");
+  assertRecoverablePause(result, "approved_plan_completion_guard_no_evidence");
   assert.equal(events.stops.length, 1);
   assert.equal(events.stops[0].reason, "incomplete_plan");
   assert.equal(events.stops[0].progress.recoveryReason, "approved_plan_completion_guard_no_evidence");
@@ -973,7 +962,10 @@ test("approved plan completion keeps user review advisory without disabling auto
     sawExecutionEvidence: true,
   });
 
-  assertCompletedOutcome(result, "partial", "approved_plan_completion_guard");
+  assertRecoverablePause(
+    result,
+    "approved_plan_completion_guard_incomplete_after_change",
+  );
   assert.equal(events.stops.length, 1);
   assert.equal(
     events.stops[0].progress.recoveryReason,
@@ -1050,7 +1042,10 @@ test("approved Plan completion truth rejects a completed stage when task evidenc
     sawExecutionEvidence: true,
   });
 
-  assertCompletedOutcome(result, "partial", "approved_plan_completion_guard");
+  assertRecoverablePause(
+    result,
+    "approved_plan_completion_guard_incomplete_after_change",
+  );
   assert.equal(events.stops.length, 1);
 });
 
@@ -1116,7 +1111,7 @@ test("approved plan completion is deferred until the current loop consumes the e
   assert.equal(events.statuses.length, 0);
 });
 
-test("approved plan recovery without an internal continuation lease closes as blocked", () => {
+test("approved plan recovery without an internal continuation lease stays recoverable", () => {
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "plan",
     getIsPlanApproved: () => true,
@@ -1128,7 +1123,7 @@ test("approved plan recovery without an internal continuation lease closes as bl
     sawExecutionEvidence: false,
   });
 
-  assertCompletedOutcome(result, "blocked", "approved_plan_completion_guard");
+  assertRecoverablePause(result, "approved_plan_completion_guard_no_evidence");
   assert.equal(events.stops.length, 1);
 });
 
@@ -1664,12 +1659,11 @@ test("completion guards discard staged completion instead of publishing a false 
     onError: () => {},
   }, new AbortController());
 
-  assert.deepEqual(outcome, {
-    status: "completed",
-    resultKind: "blocked",
-    reason: "execution_evidence_required",
-  });
-  assert.deepEqual(terminalCommits, ["discard"]);
+  assertRecoverablePause(outcome, "execution_evidence_required");
+  assert.deepEqual(terminalCommits, [
+    "discard",
+    "pause:execution_evidence_required",
+  ]);
 });
 
 test("agent loop runner preserves a bounded error reason for Goal Runtime diagnostics", async () => {

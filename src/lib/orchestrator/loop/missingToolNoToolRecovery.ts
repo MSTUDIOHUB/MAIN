@@ -217,6 +217,9 @@ export function handleMissingToolNoToolRecovery(input: {
         recentToolActivity,
         visibleText: visibleFallbackText,
       });
+      const nextStep = callbacks.getPreferredLanguage() === "zh"
+        ? "复用已读上下文，转向写入、验证或结构化说明真实阻塞。"
+        : "Reuse retained context and pivot to a write, validation, or a structured real blocker.";
       logAgentEvent("loop_stop", {
         reason: "execute_read_only_no_action_checkpoint",
         iteration,
@@ -230,15 +233,17 @@ export function handleMissingToolNoToolRecovery(input: {
         {
           repeatedTargets,
           recoveryReason: "execute_read_only_no_action_checkpoint",
-          nextStep: callbacks.getPreferredLanguage() === "zh"
-            ? "复用已读上下文，转向写入/验证/明确阻塞"
-            : "reuse read context and pivot to write/verify/a concrete blocker",
+          nextStep,
         },
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");
     }
 
+    const terminalMessage = buildNonActionableStopMessage(
+      callbacks.getPreferredLanguage(),
+      hiddenThoughtOnlyNoToolStop ? "no_output" : "missing_tool_loop",
+    );
     logAgentEvent("loop_stop", {
       reason: "missing_tool_reprompt_limit",
       iteration,
@@ -248,11 +253,17 @@ export function handleMissingToolNoToolRecovery(input: {
         : effectiveMissingToolKind,
     });
     callbacks.onNonActionableStop(
-      buildNonActionableStopMessage(
-        callbacks.getPreferredLanguage(),
-        hiddenThoughtOnlyNoToolStop ? "no_output" : "missing_tool_loop",
-      ),
+      terminalMessage,
       hiddenThoughtOnlyNoToolStop ? "no_output" : "missing_tool_loop",
+      isExecuteRuntime
+        ? {
+            phase: "paused",
+            recoveryReason: "execute_missing_tool_reprompt_limit",
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "从当前执行检查点继续并调用当前阶段开放的真实工具。"
+              : "Continue from the current execution checkpoint with a real tool exposed by the active phase.",
+          }
+        : undefined,
     );
     callbacks.onStatusChange("idle");
     return finish("stopped");

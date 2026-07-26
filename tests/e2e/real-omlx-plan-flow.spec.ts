@@ -23,6 +23,7 @@ import {
   readRealOmlxWorkspaceFileWindow,
   recordRealOmlxAcceptanceDebugEvent,
   REAL_OMLX_WORKSPACE_PROXY_LIMITS,
+  runRealOmlxWorkspaceCommand,
   selectBoundedRealOmlxSearchFiles,
   shouldPruneRealOmlxWorkspaceDirectory,
   type RealOmlxAcceptanceState,
@@ -30,6 +31,7 @@ import {
 } from "./realOmlxWorkspaceProxy";
 import {
   getMdViewerExecutionGaps,
+  getMdViewerFinalSummaryGaps,
   getMdViewerReadablePlanGaps,
   getMdViewerTypedPlanGaps,
 } from "./realOmlxMdViewerPlanOracle";
@@ -134,6 +136,7 @@ const realOmlxMutationOracleFiles = useSemanticMdViewerMutationOracle
   ? [
       "src/main.js",
       "src/components/editor.js",
+      "src/components/statusbar.js",
       "src/components/toolbar.js",
       "src-tauri/src/main.rs",
     ]
@@ -215,6 +218,18 @@ async function inspectFixtureMutation(
         toolbar: contents["src/components/toolbar.js"] || "",
       })
     : [];
+  if (useSemanticMdViewerMutationOracle && baseline) {
+    const allowedMutationFiles = new Set([
+      "src/main.js",
+      "src/components/editor.js",
+    ]);
+    for (const relativePath of changedFiles) {
+      if (allowedMutationFiles.has(relativePath)) continue;
+      executionGaps.push(
+        `${relativePath}:1:1 - this file is not a root-cause owner for the verified incident; restore its pre-run content and leave it unchanged`,
+      );
+    }
+  }
   const satisfied = useSemanticMdViewerMutationOracle
     ? executionGaps.length === 0
     : realOmlxMutationExpectation.test(contents[realOmlxMutationFile] || "");
@@ -224,8 +239,8 @@ async function inspectFixtureMutation(
     contents,
     detail: useSemanticMdViewerMutationOracle
       ? executionGaps.length === 0
-        ? "redundant filename UI is removed, programmatic open stays clean, and save_file_content uses filePath"
-        : executionGaps.join("; ")
+        ? "the pristine initial tab is replaced on open, programmatic loading stays clean, and save_file_content uses the active filePath"
+        : executionGaps.join("\n")
       : `${realOmlxMutationFile} matches ${realOmlxMutationExpectation.source}`,
   };
 }
@@ -360,7 +375,10 @@ function parseStructuredDebugEntries(entries: unknown[]): StructuredDebugEntry[]
   });
 }
 
-function inspectPreferredSubagentCollaboration(snapshot: any): {
+function inspectPreferredSubagentCollaboration(
+  snapshot: any,
+  expectedScopeKeys: string[] = realOmlxExpectedSubagentScopes,
+): {
   ready: boolean;
   detail: Record<string, unknown>;
 } {
@@ -371,22 +389,34 @@ function inspectPreferredSubagentCollaboration(snapshot: any): {
   const scopes = projectRealOmlxCollaborationScopes({
     acceptance,
     runs,
-    expectedScopeKeys: realOmlxExpectedSubagentScopes,
+    expectedScopeKeys,
   }).map((scope) => {
     const scopeRuns = runs.filter((run) => scope.subagentIds.includes(String(run.id || "")));
-    const authoritativeRun = scopeRuns.some((run) =>
-      String(run.status || "") === "completed" &&
-      String(run.closureState || "") === "satisfied" &&
+    // A bounded partial handoff with substantive evidence is still real
+    // collaboration: the parent owns final source/validation correctness.
+    // Reject empty or unjoined children, but do not make a child exhausting its
+    // own analysis budget invalidate an otherwise completed parent repair.
+    const acceptedRun = scopeRuns.some((run) =>
+      (
+        (
+          String(run.status || "") === "completed" &&
+          String(run.closureState || "") === "satisfied"
+        ) ||
+        (
+          String(run.status || "") === "degraded" &&
+          String(run.closureState || "") === "partial"
+        )
+      ) &&
       Number(run.substantiveEvidenceCount || 0) > 0 &&
       Number.isFinite(run.startedAt) &&
       Number.isFinite(run.completedAt) &&
       Number(run.completedAt) >= Number(run.startedAt)
     );
-    return { ...scope, authoritativeRun };
+    return { ...scope, acceptedRun };
   });
   const intakePreferred = acceptance.observedSubagentPreferences.includes("preferred");
   const allExpectedScopesSatisfied = scopes.length > 0 && scopes.every((scope) =>
-    scope.spawned && scope.joined && scope.consumed && scope.authoritativeRun
+    scope.spawned && scope.joined && scope.consumed && scope.acceptedRun
   );
   return {
     ready:
@@ -396,7 +426,7 @@ function inspectPreferredSubagentCollaboration(snapshot: any): {
     detail: {
       preferSubagents: snapshot?.preferSubagents === true,
       intakePreferred,
-      expectedScopeKeys: realOmlxExpectedSubagentScopes,
+      expectedScopeKeys,
       scopes,
       acceptance,
     },
@@ -471,7 +501,9 @@ function assertFirstPlanWorkspaceTurnAdmission(snapshot: any): string {
   return admittedTurnId;
 }
 
-test.describe.configure({ timeout: 1_200_000 });
+test.describe.configure({
+  timeout: Math.max(1_200_000, realOmlxExecutionTimeoutMs + 180_000),
+});
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
 
 test.beforeEach(async ({ page }) => {
@@ -691,8 +723,9 @@ test.beforeEach(async ({ page }) => {
     prunedDirectories: initialWorkspaceInventory.prunedDirectories,
     skippedEntries: initialWorkspaceInventory.skippedEntries,
   })}`);
+  const fixtureMutationBaseline = await readFixtureMutationContents(workspace);
   await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
-    await inspectFixtureMutation(workspace)
+    await inspectFixtureMutation(workspace, fixtureMutationBaseline)
   );
   let requireDirectEditRepair = false;
   await page.exposeFunction("__MAIN_E2E_REQUIRE_DIRECT_EDIT_REPAIR", async () => {
@@ -700,8 +733,14 @@ test.beforeEach(async ({ page }) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
-    const mutationState = await inspectFixtureMutation(workspace);
+    const mutationState = await inspectFixtureMutation(
+      workspace,
+      fixtureMutationBaseline,
+    );
     const isFiniteVerification = isFinitePlanValidationCommand(command);
+    const commandResult = isFiniteVerification
+      ? await runRealOmlxWorkspaceCommand(workspace, command)
+      : null;
     const directEditSource = requireDirectEditRepair && realOmlxFixture === "csv"
       ? await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8")
       : "";
@@ -709,24 +748,38 @@ test.beforeEach(async ({ page }) => {
       /\bsource\??\s*:\s*string\b/.test(directEditSource) &&
       /\bsource\s*:\s*["']csv["']/.test(directEditSource)
     );
-    const exitCode = mutationState.satisfied &&
+    const exitCode = commandResult?.exitCode === 0 &&
+      !commandResult.timedOut &&
+      mutationState.satisfied &&
       isFiniteVerification &&
       directEditRepairSatisfied
       ? 0
-      : 1;
+      : commandResult?.exitCode || 1;
+    const semanticSummary = exitCode === 0
+      ? `Fresh fixture verification passed: ${mutationState.detail}.`
+      : [
+          "FRESH_FIXTURE_ACCEPTANCE_FAILED: the finite command ran, but the current source still violates these user-visible acceptance conditions:",
+          mutationState.detail,
+        ].join("\n");
     return JSON.stringify({
       command,
       cwd: workspace,
       exitCode,
-      stdout: exitCode === 0
-        ? `Fresh fixture verification passed: ${mutationState.detail}.`
-        : `Fresh fixture verification failed: expected a finite command and ${mutationState.detail}.`,
-      stderr: requireDirectEditRepair && !directEditRepairSatisfied
-        ? [
+      timedOut: commandResult?.timedOut || false,
+      durationMs: commandResult?.durationMs || 0,
+      success: exitCode === 0,
+      stdout: [
+        commandResult?.stdout || "",
+        ...(exitCode === 0 ? [semanticSummary] : []),
+      ].filter(Boolean).join("\n"),
+      stderr: [
+        commandResult?.stderr || "",
+        ...(exitCode === 0 ? [] : [semanticSummary]),
+        ...(requireDirectEditRepair && !directEditRepairSatisfied ? [[
             "src/hooks/useCsvParser.ts:8:3 - error TS2741: Property 'source' is missing in normalized CsvOrder.",
             "Declare source?: string on CsvOrder and return source: 'csv' from normalizeCsvOrder.",
-          ].join("\n")
-        : "",
+          ].join("\n")] : []),
+      ].filter(Boolean).join("\n"),
     });
   });
 
@@ -849,9 +902,8 @@ test.beforeEach(async ({ page }) => {
       "agent.plan_evidence_bundle_ready",
       "agent.plan_evidence_bundle_injected",
       "agent.task_orchestrator_phase",
-      "agent.preferred_delegation_spawned",
-      "agent.preferred_delegation_scope_outcomes",
-      "agent.preferred_delegation_consumed",
+      "agent.semantic_collaboration_task_spawned",
+      "agent.semantic_collaboration_evidence_consumed",
       "parent_join_injected",
       "parent_resume",
     ]);
@@ -2107,12 +2159,18 @@ for (const model of models) {
   test(`real OMLX Execute completes the MD Viewer incident with ${model}`, async ({ page }) => {
     test.skip(!runExecuteIncidentReplay || realOmlxFixture !== "md-viewer");
     const workspace = (page as any).__realOmlxWorkspace as string;
-    const originalMainSource = await fs.readFile(path.join(workspace, "src/main.js"), "utf8");
+    const originalMutationContents = await readFixtureMutationContents(workspace);
+    const originalMainSource = originalMutationContents["src/main.js"] || "";
     const replayImages = await loadRealOmlxReplayImages();
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
-    const immediateSnapshot = await page.evaluate(async ({ text, images }) => {
+    const immediateSnapshot = await page.evaluate(async ({
+      text,
+      images,
+      preferSubagents,
+    }) => {
       const bridge = (window as any).__CODELY_E2E__;
+      if (preferSubagents) bridge?.setPreferSubagents?.(true);
       try {
         await bridge?.sendDirectEditMessage?.(text, images);
       } catch (error) {
@@ -2122,6 +2180,7 @@ for (const model of models) {
     }, {
       text: realOmlxRequest,
       images: replayImages,
+      preferSubagents: realOmlxPreferSubagents,
     });
 
     expect(immediateSnapshot?.dispatchError).toBeNull();
@@ -2142,10 +2201,54 @@ for (const model of models) {
     let observedRuntimeStart = false;
     let terminalSnapshot: any = null;
     let latestRuntimeSnapshot: any = immediateSnapshot;
+    const capsuleTimeline: Array<{
+      text: string;
+      source: string;
+      status: string;
+      runId: string;
+      turnId: string;
+      updatedAt: string;
+    }> = [];
     const admissionStartedAt = Date.now();
     try {
       await expect.poll(async () => {
-        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+        const observation = await page.evaluate(() => {
+          const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+          const shell = document.querySelector<HTMLElement>(
+            '[data-testid="agent-explanation-capsule"]',
+          );
+          const guidance = shell?.querySelector<HTMLElement>(
+            '[data-testid="capsule-guidance-label"]',
+          );
+          const status = shell?.querySelector<HTMLElement>(
+            '[data-testid="capsule-status-label"]',
+          );
+          return {
+            snapshot,
+            capsule: shell ? {
+              text: String(guidance?.textContent || status?.textContent || "")
+                .replace(/\s+/g, " ")
+                .trim(),
+              source: shell.dataset.guidanceSource || "",
+              status: shell.dataset.capsuleStatus || "",
+              runId: shell.dataset.runId || "",
+              turnId: shell.dataset.turnId || "",
+              updatedAt: shell.dataset.guidanceUpdatedAt || "",
+            } : null,
+          };
+        });
+        const snapshot = observation?.snapshot;
+        const capsule = observation?.capsule;
+        if (
+          capsule?.text &&
+          (
+            capsuleTimeline.length === 0 ||
+            capsuleTimeline[capsuleTimeline.length - 1]?.text !== capsule.text ||
+            capsuleTimeline[capsuleTimeline.length - 1]?.updatedAt !== capsule.updatedAt
+          )
+        ) {
+          capsuleTimeline.push(capsule);
+        }
         latestRuntimeSnapshot = snapshot;
         if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
         if (
@@ -2177,19 +2280,125 @@ for (const model of models) {
         isGenerating: latestRuntimeSnapshot?.isGenerating,
         iteration: latestRuntimeSnapshot?.harness?.iteration,
         toolBlocks: latestRuntimeSnapshot?.toolBlocks,
+        capsuleTimeline: capsuleTimeline.slice(-40),
         debugTail: latestRuntimeSnapshot?.debugTail,
       }).slice(-120_000)}`);
       throw error;
     }
 
+    const recoveryDebugTail = (terminalSnapshot?.debugTail || []).filter(
+      (entry: { source?: string }) =>
+        /(?:subagent_|delegation_|collaboration_|required_tool|execute_recovery|runtime_owned_recovery|file_read_cache|tool_surface_decision|tool_calls_detected|precompletion_evidence|no_progress|loop_stop_summary)/.test(
+          String(entry.source || ""),
+        ),
+    ).slice(-120);
+    const recoveryTraceFields = new Set([
+      "iteration",
+      "reason",
+      "executeRecoveryMode",
+      "recoveryPhase",
+      "nextRequiredCapability",
+      "selectedRepairTarget",
+      "diagnosticTargets",
+      "repairReadRange",
+      "focusedDiagnostic",
+      "target",
+      "observationKey",
+      "requestSignature",
+      "windowStartLine",
+      "windowEndLine",
+      "sourceAlreadyActive",
+      "sourceStableOutsideNativeToolHistory",
+      "toolName",
+      "activeTools",
+      "providerRequestSkipped",
+      "transition",
+      "result",
+      "status",
+    ]);
+    const focusedRecoveryTrace = parseStructuredDebugEntries(
+      terminalSnapshot?.debugTail || [],
+    ).filter((entry) =>
+      /(?:finite_validation_requires_repair|execute_recovery_source_context_pinned|execute_recovery_phase_transition|execute_recovery_activated|runtime_owned_recovery_action_materialized_pre_stream|agent_loop_stop_summary)/.test(
+        entry.source,
+      )
+    ).slice(-100).map((entry) => ({
+      source: entry.source,
+      ...Object.fromEntries(
+        Object.entries(entry).filter(([key]) => recoveryTraceFields.has(key)),
+      ),
+    }));
+    const finalFixtureState = await inspectFixtureMutation(
+      workspace,
+      originalMutationContents,
+    );
+    console.log(`[real-omlx-capsule-timeline:${model}] ${JSON.stringify(
+      capsuleTimeline.slice(-40),
+    ).slice(0, 30_000)}`);
+    console.log(`[real-omlx-collaboration:${model}] ${JSON.stringify(
+      (terminalSnapshot?.subagentRuns || []).map((run: {
+        id?: string;
+        scopeKey?: string;
+        status?: string;
+        closureState?: string;
+        evidenceCount?: number;
+        substantiveEvidenceCount?: number;
+      }) => ({
+        id: run.id,
+        scopeKey: run.scopeKey,
+        status: run.status,
+        closureState: run.closureState,
+        evidenceCount: run.evidenceCount,
+        substantiveEvidenceCount: run.substantiveEvidenceCount,
+      })),
+    )}`);
+    console.log(`[real-omlx-acceptance-gaps:${model}] ${JSON.stringify({
+      satisfied: finalFixtureState.satisfied,
+      changedFiles: finalFixtureState.changedFiles,
+      detail: finalFixtureState.detail,
+    })}`);
+    console.log(`[real-omlx-recovery-trace:${model}] ${JSON.stringify(
+      focusedRecoveryTrace,
+    ).slice(0, 40_000)}`);
     console.log(`[real-omlx-execute-incident:${model}] ${JSON.stringify({
       currentTurnStatus: terminalSnapshot?.currentTurnStatus,
       currentTurnIntent: terminalSnapshot?.currentTurnIntent,
       currentTurnTitle: terminalSnapshot?.currentTurnTitle,
       agentStatus: terminalSnapshot?.agentStatus,
       toolBlocks: terminalSnapshot?.toolBlocks,
-      debugTail: terminalSnapshot?.debugTail,
-    }).slice(-120_000)}`);
+      capsuleTimeline: capsuleTimeline.slice(-40),
+      debugTail: recoveryDebugTail,
+      subagentRuns: (terminalSnapshot?.subagentRuns || []).map((run: {
+        id?: string;
+        scopeKey?: string;
+        status?: string;
+        closureState?: string;
+        evidenceCount?: number;
+        substantiveEvidenceCount?: number;
+        parentHandoff?: string;
+      }) => ({
+        id: run.id,
+        scopeKey: run.scopeKey,
+        status: run.status,
+        closureState: run.closureState,
+        evidenceCount: run.evidenceCount,
+        substantiveEvidenceCount: run.substantiveEvidenceCount,
+        parentHandoff: run.parentHandoff,
+      })),
+      executionEvidence: (terminalSnapshot?.planExecutionEvidence || []).map((entry: {
+        kind?: string;
+        target?: string;
+        sourceTool?: string;
+        runId?: string;
+        createdAt?: number;
+      }) => ({
+        kind: entry.kind,
+        target: entry.target,
+        sourceTool: entry.sourceTool,
+        runId: entry.runId,
+        createdAt: entry.createdAt,
+      })),
+    }).slice(-40_000)}`);
 
     expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
     expect(terminalSnapshot?.currentTurnIntent).toBe("execute");
@@ -2200,7 +2409,14 @@ for (const model of models) {
       `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
     );
     await expect(finalAssistantMessage).toBeVisible();
-    expect(String(await finalAssistantMessage.textContent() || "").trim().length).toBeGreaterThan(0);
+    const finalAssistantText = String(
+      await finalAssistantMessage.textContent() || "",
+    ).trim();
+    expect(finalAssistantText.length).toBeGreaterThan(0);
+    expect(
+      getMdViewerFinalSummaryGaps(finalAssistantText),
+      `Final summary diverged from verified MD Viewer outcomes:\n${finalAssistantText}`,
+    ).toEqual([]);
 
     const toolBlocks = terminalSnapshot?.toolBlocks || [];
     expect(toolBlocks.some((block: { name?: string; status?: string }) =>
@@ -2210,6 +2426,24 @@ for (const model of models) {
     expect(toolBlocks.some((block: { name?: string; status?: string }) =>
       block.name === "run_command" && block.status === "completed"
     )).toBe(true);
+    const finalValidationBlock = [...toolBlocks].reverse().find(
+      (block: { name?: string; target?: string }) =>
+        block.name === "run_command" && String(block.target || "").trim(),
+    );
+    const finalValidationCommand = String(finalValidationBlock?.target || "").trim();
+    expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
+    const independentFinalValidation = await runRealOmlxWorkspaceCommand(
+      workspace,
+      finalValidationCommand,
+    );
+    expect(
+      independentFinalValidation.exitCode,
+      [
+        `Final replay validation failed: ${finalValidationCommand}`,
+        independentFinalValidation.stdout,
+        independentFinalValidation.stderr,
+      ].filter(Boolean).join("\n"),
+    ).toBe(0);
 
     const finalMainSource = await fs.readFile(path.join(workspace, "src/main.js"), "utf8");
     expect(finalMainSource).not.toBe(originalMainSource);
@@ -2223,6 +2457,40 @@ for (const model of models) {
     })).toEqual([]);
 
     const debugText = JSON.stringify(terminalSnapshot?.debugTail || []);
+    if (realOmlxPreferSubagents) {
+      // Direct Execute leaves decomposition to the model; require the scopes
+      // it actually created to be authoritative, joined, and consumed instead
+      // of inventing a fixture-specific scope name in the prompt.
+      const collaboration = inspectPreferredSubagentCollaboration(terminalSnapshot, []);
+      expect(collaboration.ready, JSON.stringify(collaboration.detail)).toBe(true);
+      const assignmentBlocks = (terminalSnapshot?.taskFlowPreview || []).filter(
+        (block: { type?: string; visibility?: string; content?: string }) =>
+          block.type === "agent" &&
+          block.visibility === "assistant_update" &&
+          /\*\*(?:分工|Assignment)\*\*/.test(String(block.content || "")) &&
+          /\*\*(?:授权范围|Authorized scope)\*\*/.test(String(block.content || "")),
+      );
+      expect(assignmentBlocks.length).toBeGreaterThan(0);
+      expect(debugText).toMatch(/collaboration_assignment_published/);
+    }
+    const concreteCapsuleTimeline = capsuleTimeline.filter((entry) =>
+      entry.source !== "status" &&
+      entry.text !== "正在执行" &&
+      entry.text !== "Executing"
+    );
+    expect(concreteCapsuleTimeline.length).toBeGreaterThan(0);
+    expect(new Set(concreteCapsuleTimeline.map((entry) => entry.text)).size)
+      .toBeGreaterThan(1);
+    expect(concreteCapsuleTimeline.every((entry) =>
+      entry.turnId === terminalTurnId &&
+      !/(?:\.\.\.|…)\s*$/.test(entry.text)
+    )).toBe(true);
+    expect(concreteCapsuleTimeline
+      .filter((entry) => entry.source !== "phase")
+      .every((entry) =>
+        entry.runId.trim().length > 0 &&
+        entry.updatedAt.trim().length > 0
+      )).toBe(true);
     expect(debugText).not.toMatch(
       /TURN_RUNTIME_PLANNING_CHECKPOINT_OWNER_MISMATCH|closure_ledger_owner_mismatch|repeated_failure_policy_no_progress|required_tool_protocol_violation/,
     );
@@ -2347,7 +2615,7 @@ if (runRealOmlx && explicitSubagentModel && explicitSubagentModel !== models[0])
 }
 const subagentModel = explicitSubagentModel || models[0];
 
-test(`real OMLX exposes optional semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }) => {
+test(`real OMLX starts semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }) => {
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
 
@@ -2395,6 +2663,30 @@ test(`real OMLX exposes optional semantic collaboration after runtime admission 
         entry.preference === "preferred" &&
         entry.spawnToolExposed === true
       ),
+      requiredStartBoundary: parsedDebug.some((entry: {
+        source?: string;
+        preference?: string;
+        preferredDelegationRequired?: boolean;
+      }) =>
+        entry.source === "agent.delegation_admission_decision" &&
+        entry.preference === "preferred" &&
+        entry.preferredDelegationRequired === true
+      ),
+      childStarted: (snapshot?.subagentRuns || []).length > 0 &&
+        parsedDebug.some((entry: { source?: string }) =>
+          entry.source === "agent.semantic_collaboration_task_spawned" ||
+          entry.source === "subagent_started"
+        ),
+      assignmentPublished: parsedDebug.some((entry: { source?: string }) =>
+        entry.source === "store.collaboration_assignment_published"
+      ),
+      assignmentVisible: (snapshot?.taskFlowPreview || []).some(
+        (block: { type?: string; visibility?: string; content?: string }) =>
+          block.type === "agent" &&
+          block.visibility === "assistant_update" &&
+          /\*\*(?:分工|Assignment)\*\*/.test(String(block.content || "")) &&
+          /\*\*(?:授权范围|Authorized scope)\*\*/.test(String(block.content || "")),
+      ),
       legacyForcedContract: parsedDebug.some((entry: { source?: string }) =>
         entry.source === "agent.preferred_delegation_action_contract_injected" ||
         entry.source === "agent.preferred_delegation_spawned"
@@ -2405,6 +2697,10 @@ test(`real OMLX exposes optional semantic collaboration after runtime admission 
     intakePreferred: true,
     admissionPreferred: true,
     spawnToolExposed: true,
+    requiredStartBoundary: true,
+    childStarted: true,
+    assignmentPublished: true,
+    assignmentVisible: true,
     legacyForcedContract: false,
   });
 

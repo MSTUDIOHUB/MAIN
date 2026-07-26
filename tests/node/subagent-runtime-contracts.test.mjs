@@ -170,6 +170,22 @@ test("an explicit wait_subagents result closes the same semantic task ledger as 
             sourceToolCallId: "child-read-main",
           },
         }],
+        mutationEvidence: [{
+          id: "child-mutation-main",
+          transactionId: "child-src",
+          runId: "run-child-src",
+          kind: "file",
+          value: "src/main.js",
+          target: "src/main.js",
+          sourceTool: "replace_in_file",
+          observation: {
+            summary: "Updated src/main.js",
+            facts: [],
+            hash: "child-mutation-main-hash",
+          },
+          outcome: { status: "succeeded" },
+          createdAt: 1,
+        }],
       }],
     }),
   };
@@ -187,6 +203,61 @@ test("an explicit wait_subagents result closes the same semantic task ledger as 
       evidenceAdopted: true,
       terminalComplete: true,
     }],
+  );
+  assert.deepEqual(
+    subagentJoinRuntime.extractJoinedSubagentMutationEvidence(result)
+      .map((entry) => [entry.sourceTool, entry.target, entry.transactionId]),
+    [["replace_in_file", "src/main.js", "child-src"]],
+  );
+  const wrongRunResult = {
+    ...result,
+    content: result.content.replace(
+      '"runId":"run-child-src","kind":"file"',
+      '"runId":"run-foreign","kind":"file"',
+    ),
+  };
+  assert.deepEqual(
+    subagentJoinRuntime.extractJoinedSubagentMutationEvidence(wrongRunResult),
+    [],
+  );
+});
+
+test("parent validation joins pending child writers at the stable workspace boundary", () => {
+  assert.equal(
+    subagentJoinRuntime.shouldJoinPendingSubagentsBeforeParentValidation({
+      subagentDepth: 0,
+      pendingSubagentIds: ["child-toolbar"],
+      toolCalls: [{
+        name: "run_command",
+        arguments: JSON.stringify({ command: "npm test" }),
+      }],
+      recoveryNextCapability: null,
+    }),
+    true,
+  );
+  assert.equal(
+    subagentJoinRuntime.shouldJoinPendingSubagentsBeforeParentValidation({
+      subagentDepth: 0,
+      pendingSubagentIds: ["child-toolbar"],
+      toolCalls: [{
+        name: "read_file",
+        arguments: JSON.stringify({ path: "src/main.js" }),
+      }],
+      recoveryNextCapability: null,
+    }),
+    false,
+  );
+  assert.equal(
+    subagentJoinRuntime.shouldJoinPendingSubagentsBeforeParentValidation({
+      subagentDepth: 1,
+      pendingSubagentIds: ["child-toolbar"],
+      toolCalls: [{
+        name: "run_command",
+        arguments: JSON.stringify({ command: "npm test" }),
+      }],
+      recoveryNextCapability: "validation",
+    }),
+    false,
   );
 });
 

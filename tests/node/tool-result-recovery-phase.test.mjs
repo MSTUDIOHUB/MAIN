@@ -20,7 +20,7 @@ const toolIterationPhaseSource = fsSync.readFileSync(
 test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /export async function handleToolResultRecoveryPhase/);
   assert.match(phaseSource, /handlePlanQualityRecoveryAfterToolResults\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
-  assert.match(phaseSource, /appendToolResultsToHistory\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
+  assert.match(phaseSource, /commitToolResultBatch\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
   assert.doesNotMatch(
     phaseSource,
     /handleReadFileRepeatLimitRecovery|handleCrossIterationReadFileLoopRecovery|handleRepeatedEditValidationRecovery/,
@@ -55,7 +55,7 @@ test("no-progress exits close tool lifecycle and provider history first", () => 
     "const noProgressRecovery = handleNoProgressRecovery({",
   );
   const appendIndex = phaseSource.lastIndexOf(
-    "appendToolResultsToHistory({",
+    "commitToolResultBatch({",
     noProgressIndex,
   );
   const stoppedIndex = phaseSource.indexOf(
@@ -108,13 +108,18 @@ test("parent overlap with an active child joins before generic no-progress accou
   assert.ok(joinIndex < noProgressIndex);
   assert.match(
     phaseSource.slice(deferralIndex, noProgressIndex),
-    /appendToolResultsToHistory\(\{[\s\S]*?await joinPendingSubagentsForParent\(\{[\s\S]*?return finish\("continue"\)/,
+    /await joinPendingSubagentsForParent\(\{[\s\S]*?onCollaborationTaskOutcomes\?\.\(joinResult\.taskOutcomes\)[\s\S]*?return finish\("continue"\)/,
+  );
+  assert.doesNotMatch(
+    phaseSource.slice(deferralIndex, noProgressIndex),
+    /joined_subagent_mutation|transitionExecuteRecoveryRuntimeState\(/,
+    "a child handoff cannot advance the parent transaction before parent review",
   );
 });
 
 test("Goal evidence is checked immediately after tool results enter history", () => {
   const noProgressIndex = phaseSource.indexOf("handleNoProgressRecovery({");
-  const appendIndex = phaseSource.lastIndexOf("appendToolResultsToHistory({", noProgressIndex);
+  const appendIndex = phaseSource.lastIndexOf("commitToolResultBatch({", noProgressIndex);
   const checkpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
 
   assert.notEqual(appendIndex, -1);
@@ -314,7 +319,7 @@ test("a long-process result atomically narrows the next turn to PTY observation 
 
 test("Plan and Direct Edit finite command failures split invocation recovery from source repair", () => {
   const noProgressIndex = phaseSource.indexOf("handleNoProgressRecovery({");
-  const appendIndex = phaseSource.lastIndexOf("appendToolResultsToHistory({", noProgressIndex);
+  const appendIndex = phaseSource.lastIndexOf("commitToolResultBatch({", noProgressIndex);
   const recoveryIndex = phaseSource.indexOf("approved_plan_finite_validation_recovery");
   const goalCheckpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
 
@@ -363,7 +368,13 @@ test("Plan and Direct Edit finite command failures split invocation recovery fro
   assert.match(phaseSource, /approved_plan_finite_validation_requires_repair/);
   assert.match(phaseSource, /direct_edit_finite_validation_recovery/);
   assert.match(phaseSource, /direct_edit_finite_validation_requires_repair/);
-  assert.match(phaseSource, /resolveFiniteValidationRepairTarget\(\{/);
+  assert.match(phaseSource, /resolveFiniteValidationRepairTargets\(\{/);
+  assert.match(
+    sourceRepairBranch,
+    /const repairTarget = resolveNextFiniteValidationRepairTarget\(\{/,
+  );
+  assert.match(sourceRepairBranch, /\.\.\.\(previousDecisionCheckpoint \|\| \{\}\)/);
+  assert.match(sourceRepairBranch, /selectedRepairTarget: repairTarget/);
   assert.match(sourceRepairBranch, /pendingFiniteValidation/);
   assert.doesNotMatch(
     phaseSource,
@@ -407,7 +418,7 @@ test("tool iteration phase delegates tool-result recovery internals to the phase
   assert.match(toolIterationPhaseSource, /results: toolCallPhase\.allResults/);
   assert.match(toolIterationPhaseSource, /executeRecoveryState: toolResultRecoveryPhase\.executeRecoveryState/);
   assert.doesNotMatch(orchestratorSource, /handleToolResultRecoveryPhase\(\{/);
-  assert.doesNotMatch(orchestratorSource, /appendToolResultsToHistory\(/);
+  assert.doesNotMatch(orchestratorSource, /commitToolResultBatch\(/);
   assert.doesNotMatch(orchestratorSource, /handleNoProgressRecovery\(/);
   assert.doesNotMatch(orchestratorSource, /handleReadFileRepeatLimitRecovery\(/);
   assert.doesNotMatch(orchestratorSource, /handleCrossIterationReadFileLoopRecovery\(/);

@@ -1,5 +1,6 @@
 import { buildChatFinalSynthesisPrompt, buildMaxStepsFinalTextPrompt } from "../../agentLoopSafety";
 import {
+  resolveRuntimeOwnedRecoveryAction,
   resolveExecuteRecoveryActionContract,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
@@ -22,12 +23,14 @@ import {
   annotateRequiredToolCallProtocolResult,
   hasSuccessfulAllowedRawNativeToolCall,
 } from "../../requiredToolProtocol";
+import { isolateNativeToolHistoryForActiveSurface } from "../../providerCompatibility";
 import {
   SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
   type ToolDefinition,
 } from "../../toolSchemas";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { AgentMessage, FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
+import { generateId } from "../../utils";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
 import {
   applyPreapprovalPlanQualityRecoveryStreamOptions,
@@ -48,6 +51,46 @@ export const EXECUTE_STREAM_MAX_ELAPSED_MS = 120_000;
 export const EXECUTE_ACTION_RETRY_MAX_ELAPSED_MS = 90_000;
 export const SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS = 4_096;
 export const SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS = 2_048;
+
+function agentMessageText(message: AgentMessage): string {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((part) =>
+      part && typeof part === "object" && "text" in part
+        ? String((part as { text?: unknown }).text || "")
+        : "",
+    )
+    .join("\n");
+}
+
+/**
+ * Validation repair prompts describe the same still-open obligation. Keep the
+ * latest one on the provider wire so stale diagnostics and prior target locks
+ * cannot compete with the current action contract. Canonical history remains
+ * untouched for audit and recovery persistence.
+ */
+export function collapseSupersededFiniteValidationRepairPrompts(
+  messages: AgentMessage[],
+): {
+  messages: AgentMessage[];
+  removedCount: number;
+} {
+  const repairIndexes = messages.flatMap((message, index) =>
+    message.role === "user" &&
+    /^\s*FINITE_VALIDATION_REPAIR_REQUIRED:/i.test(agentMessageText(message))
+      ? [index]
+      : [],
+  );
+  if (repairIndexes.length <= 1) {
+    return { messages, removedCount: 0 };
+  }
+  const removed = new Set(repairIndexes.slice(0, -1));
+  return {
+    messages: messages.filter((_message, index) => !removed.has(index)),
+    removedCount: repairIndexes.length - 1,
+  };
+}
 
 export function capSubagentStreamMaxTokens(
   subagentDepth: number,
@@ -73,6 +116,16 @@ export function capSubagentStreamMaxEscalations(
   return finalTextOnlyStep ? 0 : Math.min(maxOutputEscalations, 1);
 }
 
+export function shouldOmitWireRequiredForLocalExecute(input: {
+  activeProfile: string;
+  semanticActionRequired: boolean;
+  priorSemanticToolMisses?: number;
+}): boolean {
+  return input.activeProfile === "local" &&
+    input.semanticActionRequired &&
+    Math.max(0, Math.floor(Number(input.priorSemanticToolMisses) || 0)) === 0;
+}
+
 export function resolveRecoveryToolChoice(input: {
   isExecuteRecoveryEligible: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
@@ -84,6 +137,15 @@ export function resolveRecoveryToolChoice(input: {
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
   if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
+  // A preferred collaboration surface is narrowed to this single capability.
+  // Requiring any tool is therefore equivalent to requiring a real child
+  // creation without relying on provider-specific named-tool syntax.
+  if (
+    availableToolNames.size === 1 &&
+    availableToolNames.has("spawn_subagent")
+  ) {
+    return "required";
+  }
   // Drafting and rewrite expose only this runtime-control capability. Use the
   // portable required-any shape because the real schema surface already makes
   // the required function exact across OpenAI-compatible providers.
@@ -172,6 +234,8 @@ export async function invokeInitialStreamForIteration(input: {
   executeRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
   planEvidenceObligationRequired?: boolean;
+  omitRequiredToolChoice?: boolean;
+  priorSemanticToolMisses?: number;
 }): Promise<InitialStreamInvocationResult> {
   const {
     callbacks,
@@ -214,8 +278,89 @@ export async function invokeInitialStreamForIteration(input: {
     workflowMode,
   } = runtimeState;
 
+  const activeNativeToolNames = llmTools.map((tool) => tool.function.name);
+  const runtimeOwnedRecoveryAction = !finalTextOnlyStep &&
+      isExecuteRecoveryEligible
+    ? resolveRuntimeOwnedRecoveryAction({
+        contract: recoveryActionContract,
+        activeToolNames: activeNativeToolNames,
+      })
+    : null;
+  if (runtimeOwnedRecoveryAction) {
+    const toolCallId = `call_runtime_recovery_${iteration}_${generateId()}`;
+    callbacks.onStreamToken(
+      "__ESCALATION_RESET__:runtime_owned_recovery_action",
+      assistantMsgId,
+    );
+    logAgentEvent("runtime_owned_recovery_action_materialized_pre_stream", {
+      iteration,
+      toolName: runtimeOwnedRecoveryAction.toolName,
+      checkpointKind: runtimeOwnedRecoveryAction.checkpointKind,
+      argumentKeys: Object.keys(runtimeOwnedRecoveryAction.arguments).sort(),
+      recoveryMode: executeRecoveryMode,
+      recoveryPhase: recoveryActionContract.phase,
+      nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
+      activeTools: activeNativeToolNames,
+      providerRequestSkipped: true,
+      ordinaryToolAuthorizationPreserved: true,
+      providerNeutral: true,
+    });
+    return {
+      status: "streamed",
+      streamResult: {
+        content: "",
+        actionableContent: "",
+        semanticContent: "",
+        toolCalls: [{
+          index: 0,
+          id: toolCallId,
+          name: runtimeOwnedRecoveryAction.toolName,
+          arguments: JSON.stringify(runtimeOwnedRecoveryAction.arguments),
+        }],
+        finishReason: "tool_calls",
+      },
+      // No provider request occurred. Retain the canonical managed context so
+      // downstream tool execution and file-read residency remain unchanged.
+      messagesSentToLLM: managedAgentMessages,
+    };
+  }
+  const finiteValidationPromptProjection =
+    recoveryActionContract.phase !== "normal"
+      ? collapseSupersededFiniteValidationRepairPrompts(managedAgentMessages)
+      : { messages: managedAgentMessages, removedCount: 0 };
+  if (finiteValidationPromptProjection.removedCount > 0) {
+    logAgentEvent("finite_validation_repair_context_superseded", {
+      iteration,
+      removedPromptCount: finiteValidationPromptProjection.removedCount,
+      retainedPromptCount: 1,
+      recoveryPhase: recoveryActionContract.phase,
+      expectedTarget: recoveryActionContract.expectedTarget,
+      canonicalHistoryMutated: false,
+    });
+  }
+  const nativeToolHistoryIsolation =
+    !forceXmlTools && recoveryActionContract.phase !== "normal"
+      ? isolateNativeToolHistoryForActiveSurface(
+          finiteValidationPromptProjection.messages,
+          activeNativeToolNames,
+        )
+      : {
+          messages: finiteValidationPromptProjection.messages,
+          changed: false,
+          isolatedToolNames: [] as string[],
+        };
+  if (nativeToolHistoryIsolation.changed) {
+    logAgentEvent("native_tool_history_isolated", {
+      iteration,
+      recoveryPhase: recoveryActionContract.phase,
+      activeTools: activeNativeToolNames,
+      isolatedToolNames: nativeToolHistoryIsolation.isolatedToolNames,
+      canonicalHistoryMutated: false,
+      nativeToolsPreserved: true,
+    });
+  }
   const protocolMessagesForLLM = prepareMessagesForToolProtocol(
-    managedAgentMessages,
+    nativeToolHistoryIsolation.messages as AgentMessage[],
     config,
     settings,
     providerCompatibilityOverride,
@@ -304,7 +449,31 @@ export async function invokeInitialStreamForIteration(input: {
       baseResolvedStreamWatchdogOptions,
       llmTools.length,
     );
-  const recoveryToolChoice = resolveRecoveryToolChoice({
+  // Local OpenAI-compatible servers commonly accept the wire `required`
+  // value while their chat template becomes less likely to emit a tool call.
+  // Start provider-auto, but do not replay that weaker request after it has
+  // demonstrably returned no tool call. The next retry negotiates standard
+  // wire `required`; an endpoint that rejects it uses the existing capability
+  // fallback without changing the semantic contract.
+  const localRecoveryUsesSemanticToolChoice =
+    shouldOmitWireRequiredForLocalExecute({
+      activeProfile: config.activeProfile,
+      semanticActionRequired:
+        (
+          isExecuteRecoveryEligible &&
+          recoveryActionContract.phase !== "normal"
+        ) ||
+        (
+          llmTools.length === 1 &&
+          llmTools[0]?.function.name === "spawn_subagent"
+        ),
+      priorSemanticToolMisses: input.priorSemanticToolMisses,
+    });
+  const omitRequiredToolChoice =
+    input.omitRequiredToolChoice === true ||
+    callbacks.shouldOmitRequiredToolChoiceForProviderCompatibility?.() === true ||
+    localRecoveryUsesSemanticToolChoice;
+  const semanticRecoveryToolChoice = resolveRecoveryToolChoice({
     isExecuteRecoveryEligible,
     executeRecoveryMode,
     llmToolNames: llmTools.map((tool) => tool.function.name),
@@ -314,6 +483,11 @@ export async function invokeInitialStreamForIteration(input: {
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     recoveryActionContract,
   });
+  const recoveryToolChoice = omitRequiredToolChoice
+    ? undefined
+    : semanticRecoveryToolChoice;
+  const requiredToolChoiceCompatibilityOverride =
+    semanticRecoveryToolChoice != null && recoveryToolChoice == null;
   const policyCurrentMaxTokens =
     capPreapprovalPlanQualityRecoveryMaxTokens(
       preapprovalPlanQualityRecoveryStreamPolicy,
@@ -371,6 +545,9 @@ export async function invokeInitialStreamForIteration(input: {
     allTools: summarizeToolsForDiagnostics(iterationAllTools),
     llmTools: summarizeToolsForDiagnostics(llmTools),
     toolChoice: recoveryToolChoice ?? null,
+    semanticToolChoice: semanticRecoveryToolChoice ?? null,
+    requiredToolChoiceCompatibilityOverride,
+    localRecoveryUsesSemanticToolChoice,
     watchdog: {
       hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
       label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
@@ -415,7 +592,10 @@ export async function invokeInitialStreamForIteration(input: {
   );
   const streamResult = annotateRequiredToolCallProtocolResult(
     rawStreamResult,
-    recoveryToolChoice,
+    // A provider may reject the wire-level `required` value even though the
+    // runtime evidence transaction still requires one action. Keep semantic
+    // enforcement after omitting only the unsupported request parameter.
+    semanticRecoveryToolChoice,
     llmTools.map((tool) => tool.function.name),
   );
   if (streamResult.protocolTransportAdaptation) {
@@ -434,6 +614,8 @@ export async function invokeInitialStreamForIteration(input: {
       iteration,
       violation: streamResult.protocolViolation,
       toolChoice: recoveryToolChoice ?? null,
+      semanticToolChoice: semanticRecoveryToolChoice ?? null,
+      requiredToolChoiceCompatibilityOverride,
       expectedTool: streamResult.protocolExpectedTool || null,
       actualTools: streamResult.protocolActualTools || [],
       allowedTools: streamResult.protocolAllowedTools || llmTools.map((tool) => tool.function.name),

@@ -297,6 +297,10 @@ test("execute empty responses use both no-action pivots before pausing", async (
   }));
   assert.equal(stopped.status, "stopped");
   assert.equal(exhausted.events.some((event) => event.type === "stop"), true);
+  assert.equal(
+    exhausted.events.find((event) => event.type === "stop")?.details?.recoveryReason,
+    "empty_model_response",
+  );
 });
 
 test("repair-in-chat execute intent uses execution pivots instead of text synthesis", async () => {
@@ -334,21 +338,31 @@ test("malformed plan tool-use block recovers before empty counters increment", a
 });
 
 test("empty required-tool protocol violations defer to the execute protocol owner", async () => {
-  const { callbacks, events } = makeCallbacks({ language: "en" });
-  const result = await handleEmptyResponseRecovery(baseInput({
-    callbacks,
-    workflowMode: "edit",
-    turnIntent: "execute",
-    runtimeIntent: "execute",
-    normalized: {
-      ...emptyNormalized(),
-      finishReason: "tool_calls",
-      protocolViolation: "required_tool_call_missing",
-    },
-  }));
+  for (const subagentDepth of [0, 1]) {
+    const { callbacks: baseCallbacks, events } = makeCallbacks({ language: "en" });
+    const fallbacks = [];
+    const callbacks = {
+      ...baseCallbacks,
+      getSubagentDepth: () => subagentDepth,
+      shouldForceXmlForProviderCompatibility: () => false,
+      onProviderCompatibilityFallback: (reason) => fallbacks.push(reason),
+    };
+    const result = await handleEmptyResponseRecovery(baseInput({
+      callbacks,
+      workflowMode: "edit",
+      turnIntent: "execute",
+      runtimeIntent: "execute",
+      normalized: {
+        ...emptyNormalized(),
+        finishReason: "tool_calls",
+        protocolViolation: "required_tool_call_missing",
+      },
+    }));
 
-  assert.equal(result.status, "none");
-  assert.equal(result.consecutiveEmptyResponseCount, 0);
-  assert.equal(result.emptyResponseCountThisTurn, 0);
-  assert.deepEqual(events, []);
+    assert.equal(result.status, "none");
+    assert.equal(result.consecutiveEmptyResponseCount, 0);
+    assert.equal(result.emptyResponseCountThisTurn, 0);
+    assert.deepEqual(events, []);
+    assert.deepEqual(fallbacks, []);
+  }
 });

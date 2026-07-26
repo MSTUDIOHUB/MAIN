@@ -9,7 +9,14 @@ import type { AgentMessage, OrchestratorCallbacks, ToolExecutionResult } from ".
 import { getToolExecutionArgs } from "../../toolResultEffect";
 import type { TurnIterationContext } from "./turnIterationContext";
 
-export function appendToolResultsToHistory(input: {
+/**
+ * Commit one executor result batch to protocol history and lifecycle events.
+ *
+ * The Turn-owned completed set is the commit boundary: a result is claimed
+ * before any history, hook, context, or event side effect is emitted. Recovery
+ * policy may inspect a committed batch, but it must never commit it again.
+ */
+export function commitToolResultBatch(input: {
   callbacks: OrchestratorCallbacks;
   toolFeedbackFormat: ToolFeedbackFormat;
   results: ToolExecutionResult[];
@@ -39,6 +46,9 @@ export function appendToolResultsToHistory(input: {
   const completedToolCallIds = iterationContext.completedToolCallIds || new Set<string>();
 
   for (const result of results) {
+    if (completedToolCallIds.has(result.toolCallId)) continue;
+    completedToolCallIds.add(result.toolCallId);
+
     try {
       const resultChars = typeof result.content === "string" ? result.content.length : 0;
       turnContext.registerToolExecution({
@@ -69,7 +79,6 @@ export function appendToolResultsToHistory(input: {
       tool_call_id: result.toolCallId,
     });
     const started = startedToolCallIds.has(result.toolCallId);
-    if (completedToolCallIds.has(result.toolCallId)) continue;
     // Hidden protocol feedback remains 0-start/0-complete. A user-visible
     // external preflight result, however, still owns a real lifecycle item;
     // synthesize its start immediately before completion so the event stream
@@ -96,7 +105,6 @@ export function appendToolResultsToHistory(input: {
     }
 
     startedToolCallIds.delete(result.toolCallId);
-    completedToolCallIds.add(result.toolCallId);
 
     emitTurnEvent({
       type: "item.completed",

@@ -151,6 +151,23 @@ test("tool observation summarizes hiddenProcess evidence", () => {
   assert.match(summary, /hiddenProcess/);
 });
 
+test("run_command observation trusts a structured zero exit over warning prose", () => {
+  const summary = summarizeToolObservation({
+    toolName: "run_command",
+    target: "npm run build",
+    result: JSON.stringify({
+      exitCode: 0,
+      success: true,
+      stdout: "built successfully",
+      stderr: "warning: an error boundary was not tree-shaken",
+    }),
+    language: "zh",
+  });
+
+  assert.match(summary, /已成功退出/);
+  assert.doesNotMatch(summary, /失败信号/);
+});
+
 test("plan read-only narration names concrete evidence phase instead of image-count filler", () => {
   const progress = buildPlanReadOnlyProgressNarration({
     calls: [

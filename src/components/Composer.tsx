@@ -368,11 +368,11 @@ export default function Composer({
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
   const subagentPreferenceTitle = language === "en"
     ? preferSubagents
-      ? "Subagent collaboration is allowed and preferred. The model decides from task value whether to create 0–N fresh agents; each agent executes one immutable task and is permanently closed afterward."
-      : "Allow the model to create fresh one-task subagents when semantic parallelism is useful. Simple tasks may use none."
+      ? "Collaboration is enabled. This turn starts at least one fresh one-task subagent, then the parent continues non-overlapping work and owns final validation."
+      : "Enable collaboration for the next turn. MAIN will start one fresh one-task subagent before parent workspace work."
     : preferSubagents
-      ? "本会话允许并优先考虑协作；模型按任务价值决定是否创建 0～N 个全新子智能体，每个实例只执行一个不可变任务，结束后永久关闭。"
-      : "允许模型在语义并行确有价值时创建全新的一次性子智能体；简单任务可以不创建。";
+      ? "协作已开启：本轮会先启动至少一个全新的一次性子智能体，随后主体并行推进不重叠工作并负责最终验证。"
+      : "为下一轮开启协作；MAIN 会在主体开始工作区操作前启动一个全新的一次性子智能体。";
   const subagentPreferenceLockedTitle = language === "en"
     ? "Subagent collaboration is captured for the current run and can be changed after it stops."
     : "本轮已捕获子智能体协作设置，执行停止后才能更改。";

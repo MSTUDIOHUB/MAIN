@@ -68,12 +68,14 @@ import {
   buildExecuteMaxIterationsAutoResumeNotice,
   buildExecuteMaxIterationsPauseNotice,
   buildExecuteMaxIterationsResumePrompt,
+  buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsAutoResumeNotice,
   buildPlanMaxIterationsPauseNotice,
   buildPlanMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
   resolveExecuteMaxIterationsRecoveryDecision,
+  resolveMaxIterationStrategyPivot,
   resolveApprovedPlanSameTurnFallbackDecision,
   toPlanExecutionRuntimeProgressUpdate,
   type PlanMaxIterationsCheckpoint,
@@ -212,6 +214,8 @@ import {
 import { createTerminalStatusPublicationGate } from "../terminalStatusPublication";
 import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
 import {
+  isAutoResumableExecutionBoundaryReason,
+  normalizeExecutionDecisionCheckpointSnapshot,
   resolveExecuteRecoveryActionContract,
   type ForcedExecuteRecoveryRuntimeState,
 } from "../executeRecoveryTools";
@@ -224,6 +228,7 @@ import {
   normalizeModelFeedbackForDedupe,
 } from "../modelFeedbackDedupe";
 import { buildAssistantStageCheckpoint } from "../assistantProgressPresentation";
+import { buildSubagentAssignmentUpdate } from "../collaborationPresentation";
 
 type WorkflowStoreState = any;
 
@@ -557,6 +562,74 @@ export class WorkflowEngine {
         String(entry.observationStatus || ""),
       )
     );
+    const adoptSubagentMutationEvidence = (
+      entries: PlanExecutionEvidenceEntry[],
+    ) => {
+      const candidates = entries.filter((entry) =>
+        entry.kind === "file" &&
+        isWorkspaceMutationToolName(entry.sourceTool) &&
+        !!String(entry.id || "").trim() &&
+        !!String(entry.target || entry.value || "").trim() &&
+        !["failed", "pending", "unknown", "running", "stopped"].includes(
+          String(entry.observationStatus || ""),
+        )
+      );
+      if (candidates.length === 0) return;
+      let adoptedCount = 0;
+      const adoptedTargets: string[] = [];
+      sessionSet((state: any) => {
+        let nextLedger = state.planExecutionEvidenceLedger || [];
+        const knownIds = new Set(nextLedger.map((entry: PlanExecutionEvidenceEntry) =>
+          String(entry.id || "").trim()
+        ));
+        for (const candidate of candidates) {
+          if (knownIds.has(candidate.id)) continue;
+          const rebound = {
+            ...candidate,
+            transactionId: turnId,
+          };
+          const entry = {
+            ...rebound,
+            ...resolveCurrentPlanEvidenceIdentity(rebound),
+          };
+          nextLedger = appendPlanEvidenceEntry(nextLedger, entry);
+          knownIds.add(candidate.id);
+          adoptedCount += 1;
+          adoptedTargets.push(
+            String(candidate.target || candidate.value || "").trim(),
+          );
+        }
+        if (adoptedCount === 0) return {};
+        const nextTasks = reconcilePlanTaskCompletion(
+          state.planTasks || [],
+          state.planTasks || [],
+          nextLedger,
+          {
+            preserveMissing:
+              state.isPlanApproved ||
+              state.planStage === "executing" ||
+              state.planStage === "completed" ||
+              state.planTasks.length > 0,
+            highlightNext: state.isPlanApproved && nextLedger.length > 0,
+          },
+        );
+        return {
+          planExecutionEvidenceLedger: nextLedger,
+          planExecutionEvidenceCount: nextLedger.length,
+          planTasks: nextTasks,
+          planAutoResumeCount: 0,
+        };
+      });
+      if (adoptedCount > 0) {
+        logStoreEvent("subagent_mutation_evidence_adopted", {
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+          adoptedCount,
+          targets: [...new Set(adoptedTargets)].slice(0, 24),
+          providerNeutral: true,
+        });
+      }
+    };
     let pendingMaxIterationsAutoResume: {
       kind: "chat" | "plan" | "execute";
       start: () => void;
@@ -2128,6 +2201,7 @@ export class WorkflowEngine {
       getPlanArtifacts: () => sessionGet().planArtifacts,
       getPlanTasks: () => sessionGet().planTasks,
       getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
+      adoptSubagentMutationEvidence,
       getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
       getIsApprovedPlanExecutionTransitionPending: () => {
         const latest = sessionGet();
@@ -2441,6 +2515,45 @@ export class WorkflowEngine {
         }
         return true;
       },
+      shouldOmitRequiredToolChoiceForProviderCompatibility: () => {
+        const latest = sessionGet();
+        const laneKey = resolveRuntimeLaneKey(latest.config);
+        const normalizedMap = normalizeProviderCompatibilityByRuntimeKey(
+          latest.providerCompatibilityByRuntimeKey,
+        );
+        const laneState = normalizedMap[laneKey];
+        const expiresAt = laneState?.requiredToolChoiceFallbackExpiresAt;
+        if (expiresAt == null) return false;
+        if (
+          Date.now() >= expiresAt
+        ) {
+          sessionSet((s: any) => {
+            const nextMap = normalizeProviderCompatibilityByRuntimeKey(
+              s.providerCompatibilityByRuntimeKey,
+            );
+            const currentLane = nextMap[laneKey];
+            if (!currentLane) return {};
+            const {
+              requiredToolChoiceFallbackExpiresAt: _expiredRequiredToolChoice,
+              ...nextLane
+            } = currentLane;
+            if (!nextLane.forceXmlTools) {
+              delete nextMap[laneKey];
+            } else {
+              nextMap[laneKey] = nextLane;
+            }
+            return { providerCompatibilityByRuntimeKey: nextMap };
+          });
+          logStoreEvent("provider_required_tool_choice_probe_reenabled", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            laneKey,
+          });
+          return false;
+        }
+        return true;
+      },
       onProviderCompatibilityFallback: (reason: any) => {
         const laneKey = resolveRuntimeLaneKey(sessionGet().config);
         const now = Date.now();
@@ -2455,10 +2568,40 @@ export class WorkflowEngine {
         sessionSet((s: any) => {
           const nextMap = normalizeProviderCompatibilityByRuntimeKey(s.providerCompatibilityByRuntimeKey);
           nextMap[laneKey] = {
+            ...(nextMap[laneKey] || {}),
             forceXmlTools: true,
             fallbackExpiresAt: now + PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
             nativeSuccessStreak: 0,
             lastFallbackAt: now,
+          };
+          return { providerCompatibilityByRuntimeKey: nextMap };
+        });
+      },
+      onProviderRequiredToolChoiceUnsupported: (reason: any) => {
+        const laneKey = resolveRuntimeLaneKey(sessionGet().config);
+        const now = Date.now();
+        logStoreEvent("provider_required_tool_choice_fallback", {
+          turnId,
+          sessionKey: runSessionKey,
+          workspace: runWorkspace || null,
+          laneKey,
+          reason: String(reason || "").slice(0, 240),
+          cooldownMs: PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
+          nativeToolsPreserved: true,
+        });
+        sessionSet((s: any) => {
+          const nextMap = normalizeProviderCompatibilityByRuntimeKey(
+            s.providerCompatibilityByRuntimeKey,
+          );
+          nextMap[laneKey] = {
+            ...(nextMap[laneKey] || {
+              forceXmlTools: false,
+              fallbackExpiresAt: null,
+              nativeSuccessStreak: 0,
+              lastFallbackAt: 0,
+            }),
+            requiredToolChoiceFallbackExpiresAt:
+              now + PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
           };
           return { providerCompatibilityByRuntimeKey: nextMap };
         });
@@ -2469,10 +2612,15 @@ export class WorkflowEngine {
           const nextMap = normalizeProviderCompatibilityByRuntimeKey(s.providerCompatibilityByRuntimeKey);
           const currentLane = nextMap[laneKey];
           if (!currentLane) return {};
+          const requiredToolChoiceOverrideActive =
+            currentLane.requiredToolChoiceFallbackExpiresAt != null &&
+            Date.now() < currentLane.requiredToolChoiceFallbackExpiresAt;
+          if (
+            !currentLane.forceXmlTools &&
+            requiredToolChoiceOverrideActive
+          ) return {};
           const nextSuccessStreak = currentLane.nativeSuccessStreak + 1;
           if (nextSuccessStreak >= PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK) {
-            const rest = { ...nextMap };
-            delete rest[laneKey];
             logStoreEvent("provider_compatibility_recovered", {
               turnId,
               sessionKey: runSessionKey,
@@ -2480,6 +2628,17 @@ export class WorkflowEngine {
               laneKey,
               successStreak: nextSuccessStreak,
             });
+            if (requiredToolChoiceOverrideActive) {
+              nextMap[laneKey] = {
+                ...currentLane,
+                forceXmlTools: false,
+                fallbackExpiresAt: null,
+                nativeSuccessStreak: 0,
+              };
+              return { providerCompatibilityByRuntimeKey: nextMap };
+            }
+            const rest = { ...nextMap };
+            delete rest[laneKey];
             return { providerCompatibilityByRuntimeKey: rest };
           }
           nextMap[laneKey] = {
@@ -4404,6 +4563,94 @@ export class WorkflowEngine {
         });
       },
 
+      onExecuteRecoveryBoundary: (boundary) => {
+        const state = sessionGet();
+        const evidenceLedger = state.planExecutionEvidenceLedger || [];
+        const recoveryDecision = resolveExecuteMaxIterationsRecoveryDecision({
+          evidenceLedger,
+          recoveryState: latestExecuteRecoveryState,
+          transactionId: turnId,
+        });
+        const recoveryContract = resolveExecuteRecoveryActionContract(
+          recoveryDecision.mode,
+          {
+            expectedTarget: latestExecuteRecoveryState?.expectedTarget || null,
+            readLease: latestExecuteRecoveryState?.readLease || null,
+            sourceObservationKey:
+              latestExecuteRecoveryState?.sourceObservationKey || null,
+            decisionCheckpoint:
+              latestExecuteRecoveryState?.decisionCheckpoint || null,
+            phaseNoProgressCount:
+              latestExecuteRecoveryState?.phaseNoProgressCount || 0,
+            protocolNoProgressCount:
+              latestExecuteRecoveryState?.protocolNoProgressCount || 0,
+            protocolNoProgressFingerprint:
+              latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
+          },
+        );
+        const currentCount = Math.max(
+          0,
+          Number(state.planAutoResumeCount) || 0,
+        );
+        const strategyDecision = resolveMaxIterationStrategyPivot({
+          autoResumeCount: currentCount,
+          objectiveComplete: false,
+          nextRequiredCapability: recoveryContract.nextRequiredCapability,
+        });
+        const approvedPlanBoundary = state.isPlanApproved === true;
+        const progressMaxIterations = Math.max(
+          1,
+          Number(state.planExecutionProgressSnapshot?.maxIterations) ||
+            boundary.iteration ||
+            1,
+        );
+        const checkpoint = buildPlanMaxIterationsCheckpoint({
+          iterationCount: Math.max(1, boundary.iteration),
+          maxIterations: progressMaxIterations,
+          autoResumeCount: currentCount,
+          autoResumeEligible: strategyDecision.selected !== null,
+          strategyPivot: strategyDecision.selected,
+          attemptedStrategyPivots: strategyDecision.attempted,
+          remainingStrategyPivots: strategyDecision.remaining,
+          strategyPivotBudget: strategyDecision.hardLimit,
+          strategyCapability: recoveryContract.nextRequiredCapability,
+          tasks: approvedPlanBoundary ? state.planTasks || [] : [],
+          evidenceLedger,
+          // Durable mutation/validation facts come from the ledger. The local
+          // boundary supplies its repeated targets separately for diagnostics;
+          // do not reconstruct transient model activity from presentation UI.
+          recentToolActivity: [],
+          lastAssistantText: boundary.message || "",
+          unresolvedBlockers: [
+            `Recoverable Execute boundary: ${boundary.cause}.`,
+          ],
+        });
+        const handling = approvedPlanBoundary
+          ? callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint)
+          : callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
+        const autoResumeScheduled = Boolean(
+          handling &&
+          typeof handling === "object" &&
+          "status" in handling &&
+          handling.status === "auto_resume_scheduled",
+        );
+        const handled = handling === true || autoResumeScheduled;
+        logStoreEvent("execute_recovery_boundary_routed", {
+          cause: boundary.cause,
+          iteration: boundary.iteration,
+          repeatedTargets: boundary.repeatedTargets || [],
+          recoveryMode: recoveryDecision.mode,
+          recoveryReason: recoveryDecision.reason,
+          nextRequiredCapability: recoveryContract.nextRequiredCapability,
+          autoResumeCount: currentCount,
+          strategyPivot: strategyDecision.selected,
+          approvedPlanBoundary,
+          handled,
+          autoResumeScheduled,
+        });
+        return handled;
+      },
+
       onChatMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
         const currentCount = Math.max(
           0,
@@ -4773,17 +5020,6 @@ export class WorkflowEngine {
           latestExecuteRecoveryState?.expectedTarget?.trim() ||
           String(latestMutationEvidence?.target || latestMutationEvidence?.value || "").trim() ||
           null;
-        const previousRecoveryContract = latestExecuteRecoveryState
-          ? resolveExecuteRecoveryActionContract(latestExecuteRecoveryState.mode, {
-              expectedTarget: latestExecuteRecoveryState.expectedTarget,
-              readLease: latestExecuteRecoveryState.readLease,
-              sourceObservationKey: latestExecuteRecoveryState.sourceObservationKey,
-              decisionCheckpoint: latestExecuteRecoveryState.decisionCheckpoint,
-              phaseNoProgressCount: latestExecuteRecoveryState.phaseNoProgressCount,
-              protocolNoProgressCount: latestExecuteRecoveryState.protocolNoProgressCount,
-              protocolNoProgressFingerprint: latestExecuteRecoveryState.protocolNoProgressFingerprint,
-            })
-          : null;
         const nextRecoveryContract = resolveExecuteRecoveryActionContract(
           executeRecoveryDecision.mode,
           {
@@ -4796,22 +5032,27 @@ export class WorkflowEngine {
             protocolNoProgressFingerprint: latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
           },
         );
-        const recoveryPhaseChanged =
-          previousRecoveryContract?.phase !== nextRecoveryContract.phase;
+        const resumedDecisionCheckpoint = executeRecoveryDecision.mode === "normal"
+          ? null
+          : normalizeExecutionDecisionCheckpointSnapshot({
+              ...(latestExecuteRecoveryState?.decisionCheckpoint || {}),
+              expectedTarget,
+              sourceObservationKey:
+                latestExecuteRecoveryState?.sourceObservationKey || null,
+              nextRequiredCapability: nextRecoveryContract.nextRequiredCapability,
+            });
         const forcedExecuteRecoveryState: ForcedExecuteRecoveryRuntimeState = {
           mode: executeRecoveryDecision.mode,
           reason: executeRecoveryDecision.reason,
           expectedTarget,
           attempts: Math.max(0, latestExecuteRecoveryState?.attempts || 0),
-          phaseNoProgressCount: recoveryPhaseChanged
-            ? 0
-            : Math.max(0, latestExecuteRecoveryState?.phaseNoProgressCount || 0),
-          protocolNoProgressCount: recoveryPhaseChanged
-            ? 0
-            : Math.max(0, latestExecuteRecoveryState?.protocolNoProgressCount || 0),
-          protocolNoProgressFingerprint: recoveryPhaseChanged
-            ? null
-            : latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
+          // A bounded auto-resume is a new local attempt. The monotonic
+          // autoResumeCount and strategy-pivot ledger remain the global fuse;
+          // carrying exhausted phase counters across this boundary would make
+          // the resumed attempt stop before it can use its required tool.
+          phaseNoProgressCount: 0,
+          protocolNoProgressCount: 0,
+          protocolNoProgressFingerprint: null,
           readLease:
             nextRecoveryContract.phase === "context" ||
             nextRecoveryContract.phase === "mutation"
@@ -4820,141 +5061,7 @@ export class WorkflowEngine {
                 : null
               : null,
           sourceObservationKey: latestExecuteRecoveryState?.sourceObservationKey || null,
-          decisionCheckpoint: executeRecoveryDecision.mode === "normal"
-            ? null
-            : {
-                expectedTarget,
-                sourceObservationKey:
-                  latestExecuteRecoveryState?.sourceObservationKey || null,
-                nextRequiredCapability: nextRecoveryContract.nextRequiredCapability,
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.evidenceVersion
-                  ? {
-                      evidenceVersion:
-                        latestExecuteRecoveryState.decisionCheckpoint.evidenceVersion,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.planTaskId
-                  ? {
-                      planTaskId:
-                        latestExecuteRecoveryState.decisionCheckpoint.planTaskId,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.requirementRef
-                  ? {
-                      requirementRef:
-                        latestExecuteRecoveryState.decisionCheckpoint.requirementRef,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.noProgressStrategyPivots?.length
-                  ? {
-                      noProgressStrategyPivots: [
-                        ...latestExecuteRecoveryState.decisionCheckpoint.noProgressStrategyPivots,
-                      ],
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.pendingFiniteValidation
-                  ? {
-                      pendingFiniteValidation:
-                        latestExecuteRecoveryState.decisionCheckpoint.pendingFiniteValidation,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.validationMutationReopenCount
-                  ? {
-                      validationMutationReopenCount:
-                        latestExecuteRecoveryState.decisionCheckpoint.validationMutationReopenCount,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.validationMutationReopenFingerprints
-                  ? {
-                      validationMutationReopenFingerprints: [
-                        ...latestExecuteRecoveryState.decisionCheckpoint
-                          .validationMutationReopenFingerprints,
-                      ],
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveMutationEvidence
-                  ? {
-                      objectiveMutationEvidence:
-                        latestExecuteRecoveryState.decisionCheckpoint.objectiveMutationEvidence
-                          .map((entry) => ({ ...entry })),
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveClosurePending
-                  ? { objectiveClosurePending: true }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveObligationId
-                  ? {
-                      objectiveObligationId:
-                        latestExecuteRecoveryState.decisionCheckpoint.objectiveObligationId,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveRevision
-                  ? {
-                      objectiveRevision:
-                        latestExecuteRecoveryState.decisionCheckpoint.objectiveRevision,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveKind
-                  ? {
-                      objectiveKind:
-                        latestExecuteRecoveryState.decisionCheckpoint.objectiveKind,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveExpectedTargets
-                  ? {
-                      objectiveExpectedTargets: [
-                        ...latestExecuteRecoveryState.decisionCheckpoint.objectiveExpectedTargets,
-                      ],
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveValidationEvidence !== undefined
-                  ? {
-                      objectiveValidationEvidence:
-                        latestExecuteRecoveryState.decisionCheckpoint.objectiveValidationEvidence
-                          ? {
-                              ...latestExecuteRecoveryState.decisionCheckpoint.objectiveValidationEvidence,
-                            }
-                          : null,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureFingerprint
-                  ? {
-                      browserFailureFingerprint:
-                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureFingerprint,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureCallSignature
-                  ? {
-                      browserFailureCallSignature:
-                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureCallSignature,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureDetail
-                  ? {
-                      browserFailureDetail:
-                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureDetail,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailedLocator
-                  ? {
-                      browserFailedLocator:
-                        latestExecuteRecoveryState.decisionCheckpoint.browserFailedLocator,
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserLocatorCandidates?.length
-                  ? {
-                      browserLocatorCandidates: [
-                        ...latestExecuteRecoveryState.decisionCheckpoint.browserLocatorCandidates,
-                      ],
-                    }
-                  : {}),
-                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserRequestedUrl
-                  ? {
-                      browserRequestedUrl:
-                        latestExecuteRecoveryState.decisionCheckpoint.browserRequestedUrl,
-                    }
-                  : {}),
-              },
+          decisionCheckpoint: resumedDecisionCheckpoint,
         };
         const notice = shouldAutoResume
           ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, phaseLanguage)
@@ -5257,6 +5364,42 @@ export class WorkflowEngine {
       },
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
+        const boundaryCause = progress?.recoveryReason || reason;
+        const executeLikeBoundary =
+          getIntentPolicy(effectiveRunIntent).workflowMode === "edit" ||
+          sessionGet().isPlanApproved === true;
+        const recoveryBoundaryEligible =
+          executeLikeBoundary &&
+          pendingMaxIterationsAutoResume === null &&
+          !sessionGet().pendingPlanApprovalHandoff &&
+          isAutoResumableExecutionBoundaryReason(boundaryCause);
+        const recoveryBoundaryHandled =
+          recoveryBoundaryEligible &&
+          callbacks.onExecuteRecoveryBoundary?.({
+            cause: boundaryCause,
+            iteration:
+              progress?.iteration ||
+              sessionGet().planExecutionProgressSnapshot?.iteration ||
+              1,
+            message,
+            repeatedTargets: progress?.repeatedTargets || [],
+          }) === true;
+        const autoResumePlanHandoffPending = Boolean(
+          sessionGet().pendingPlanApprovalHandoff,
+        );
+        const autoResumeScheduled =
+          recoveryBoundaryHandled &&
+          (
+            pendingMaxIterationsAutoResume !== null ||
+            autoResumePlanHandoffPending
+          );
+        if (autoResumeScheduled) {
+          progress = {
+            ...(progress || {}),
+            phase: "paused",
+            recoveryReason: "max_iterations_auto_resume",
+          };
+        }
         lastNonActionableStopDiagnostic = {
           reason,
           message: String(message || "").trim(),
@@ -5273,7 +5416,49 @@ export class WorkflowEngine {
           repeatedTargets: progress?.repeatedTargets || [],
           messageChars: message.length,
           messagePreview: message.replace(/\s+/g, " ").slice(0, 260),
+          boundaryCause,
+          recoveryBoundaryHandled,
+          autoResumeScheduled,
         });
+        const isInternalAutoResumeBoundary =
+          progress?.recoveryReason === "max_iterations_auto_resume" &&
+          (
+            pendingMaxIterationsAutoResume !== null ||
+            autoResumePlanHandoffPending
+          );
+        if (recoveryBoundaryHandled) {
+          // The centralized boundary owner either scheduled a bounded child
+          // Run or already published the one truthful exhausted checkpoint.
+          // In both cases, close only streaming flags here; rendering the
+          // original local fuse again would create a duplicate red failure.
+          sessionSet((s: any) => ({
+            taskFlow: s.taskFlow.map((block: any) => {
+              if (
+                block.id === context.currentStreamingBlockId &&
+                block.type === "agent"
+              ) {
+                return { ...block, streaming: false };
+              }
+              if (
+                block.id === context.currentThoughtBlockId &&
+                block.type === "thought"
+              ) {
+                return { ...block, isStreaming: false };
+              }
+              return block;
+            }),
+          }));
+          logStoreEvent(isInternalAutoResumeBoundary
+            ? "recoverable_boundary_hidden_for_auto_resume"
+            : "recoverable_boundary_local_duplicate_suppressed", {
+            reason,
+            recoveryReason: progress?.recoveryReason,
+            autoResumeKind:
+              pendingMaxIterationsAutoResume?.kind ||
+              (autoResumePlanHandoffPending ? "plan" : null),
+          });
+          return;
+        }
         const isDurableRecoveryPause =
           (
             progress?.recoveryReason === "execute_recovery_no_progress_limit" &&
@@ -5653,18 +5838,31 @@ export class WorkflowEngine {
       },
     };
 
+    const resolveCollaborationParentOwnership = () => {
+      const canonicalOwner = resolveCanonicalCheckpointOwner(sessionGet());
+      return {
+        parentTurnId: canonicalOwner.turnId,
+        presentationTurnId: context.uiDisplayTurnId || canonicalOwner.turnId,
+        parentSessionEpoch: canonicalOwner.sessionEpoch,
+      };
+    };
+
     callbacks.runSubagent = (request, runOptions) => {
-      const parentTurnId = context.uiDisplayTurnId || turnId;
-      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const {
+        parentTurnId,
+        presentationTurnId,
+        parentSessionEpoch,
+      } = resolveCollaborationParentOwnership();
       const existingRunCount = getCoordinatedSubagentRunCount(
         runSessionKey,
         parentTurnId,
         parentSessionEpoch,
       );
-      return Promise.resolve(scheduleControlledSubagent({
+      const result = scheduleControlledSubagent({
         request,
         parentCallbacks: callbacks,
         parentTurnId,
+        presentationTurnId,
         parentSessionEpoch,
         parentSignal: runOptions?.signal || abortCtrl.signal,
         existingRunCount,
@@ -5674,19 +5872,56 @@ export class WorkflowEngine {
           }));
         },
         executeAgentLoop,
-      }));
+      });
+      if (result.subagentId) {
+        const content = buildSubagentAssignmentUpdate({
+          request,
+          result,
+          language: phaseLanguage,
+        });
+        const blockId = sessionGet()._nextTaskId();
+        appendTurnBlock({
+          id: blockId,
+          turnId: presentationTurnId,
+          type: "agent",
+          content,
+          streaming: false,
+          hiddenProcess: false,
+          visibility: "assistant_update",
+        });
+        logStoreEvent("collaboration_assignment_published", {
+          turnId,
+          displayTurnId: presentationTurnId,
+          runId: activeRuntimeRunIdentity.runId,
+          collaborationTaskId: result.collaborationTaskId,
+          subagentId: result.subagentId,
+          subagentName: result.name,
+          taskKind: result.taskKind,
+          accessMode: result.accessMode,
+          allowedPaths: result.allowedPaths,
+          objectiveChars: String(request.objective || "").length,
+          visibleChars: content.length,
+          blockId,
+        });
+      }
+      return Promise.resolve(result);
     };
     callbacks.getPendingSubagentIds = () => {
-      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const {
+        parentTurnId,
+        parentSessionEpoch,
+      } = resolveCollaborationParentOwnership();
       return getPendingCoordinatedSubagentIds(
         runSessionKey,
-        context.uiDisplayTurnId || turnId,
+        parentTurnId,
         parentSessionEpoch,
       );
     };
     callbacks.waitSubagents = async (request, waitOptions) => {
-      const parentTurnId = context.uiDisplayTurnId || turnId;
-      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const {
+        parentTurnId,
+        parentSessionEpoch,
+      } = resolveCollaborationParentOwnership();
       const waitStartedAt = Date.now();
       const availableSubagentIds = getPendingCoordinatedSubagentIds(
         runSessionKey,
@@ -5738,8 +5973,10 @@ export class WorkflowEngine {
       return result;
     };
     callbacks.cancelSubagent = async (request) => {
-      const parentTurnId = context.uiDisplayTurnId || turnId;
-      const parentSessionEpoch = resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+      const {
+        parentTurnId,
+        parentSessionEpoch,
+      } = resolveCollaborationParentOwnership();
       const result = cancelCoordinatedSubagent({
         threadId: runSessionKey,
         sessionEpoch: parentSessionEpoch,
@@ -7844,9 +8081,10 @@ export class WorkflowEngine {
     }) => {
       if (collaborationFinalizationPromise) return collaborationFinalizationPromise;
       collaborationFinalizationPromise = (async () => {
-        const parentTurnId = context.uiDisplayTurnId || turnId;
-        const sessionEpoch =
-          resolveCanonicalCheckpointOwner(sessionGet()).sessionEpoch;
+        const {
+          parentTurnId,
+          parentSessionEpoch: sessionEpoch,
+        } = resolveCollaborationParentOwnership();
         let finalized: Awaited<
           ReturnType<typeof finalizeCoordinatedSubagentsForParent>
         > | null = null;

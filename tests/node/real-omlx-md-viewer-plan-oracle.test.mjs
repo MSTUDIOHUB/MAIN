@@ -26,6 +26,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   getMdViewerExecutionGaps,
+  getMdViewerFinalSummaryGaps,
   getMdViewerReadablePlanGaps,
   getMdViewerTypedPlanGaps,
 } = loadTranspiledModuleSync(
@@ -42,8 +43,8 @@ function goodCandidate() {
       },
       {
         id: "E2",
-        target: "src/components/toolbar.js",
-        statement: "The toolbar owns the redundant #file-path filename surface.",
+        target: "src/main.js",
+        statement: "DOMContentLoaded pushes one pristine initialFile, while openFiles appends fileEntry beside it.",
       },
       {
         id: "E3",
@@ -60,7 +61,7 @@ function goodCandidate() {
       {
         id: "R1",
         certainty: "inferred",
-        text: "The toolbar renders a duplicate filename surface while tabs already own document naming.",
+        text: "openFiles appends beside the pristine initial tab, so the opened filename and unsaved document title coexist.",
         evidenceRefs: ["E2"],
         chainRefs: ["E2"],
         goalRefs: ["G1"],
@@ -85,9 +86,9 @@ function goodCandidate() {
     changes: [
       {
         id: "C1",
-        text: "Remove the redundant toolbar filename display so it no longer renders document naming.",
-        expectedOutcome: "The tab remains the sole filename surface.",
-        targetRef: "src/components/toolbar.js",
+        text: "Replace the untouched pristine initial tab when the first local file opens instead of appending beside it.",
+        expectedOutcome: "The opened filename replaces the initial unsaved document title while edited unsaved tabs remain safe.",
+        targetRef: "src/main.js",
         operation: "modify",
         evidenceRefs: ["E2"],
         diagnosisRefs: ["R1"],
@@ -120,9 +121,9 @@ function goodCandidate() {
     decisions: [
       {
         id: "D1",
-        text: "Keep tabs as the sole canonical filename title owner.",
+        text: "Keep edited unsaved tabs and normal tab title ownership unchanged.",
         disposition: "preserve",
-        evidenceRefs: ["E3"],
+        evidenceRefs: ["E2"],
         goalRefs: ["G1"],
       },
       {
@@ -177,10 +178,27 @@ function clone(value) {
 function executionSources() {
   return {
     caller: `
+      const initialFile = { path: '', content: '', isDirty: false };
+      activeFiles.push(initialFile);
       function setEditorValue(value) { editor.setValue(value); }
       async function handleOpenFile() {
         const selected = await openDialog({ multiple: true });
         if (selected) openFiles(selected);
+      }
+      async function openFiles(filePath) {
+        await invoke('read_file_content', { path: filePath });
+        const fileEntry = { path: filePath, content: '', isDirty: false };
+        if (
+          activeFiles.length === 1 &&
+          !activeFiles[0].path &&
+          activeFiles[0].content === '' &&
+          activeFiles[0].isDirty === false
+        ) {
+          activeFiles[0] = fileEntry;
+          updateTabTitle(0);
+        } else {
+          activeFiles.push(fileEntry);
+        }
       }
       async function handleSaveFile() {
         const file = activeFiles[activeTab];
@@ -219,9 +237,8 @@ test("MD Viewer execution oracle accepts the exact four-owner incident closure",
   assert.deepEqual(getMdViewerExecutionGaps(executionSources()), []);
 });
 
-test("MD Viewer execution oracle rejects the original filename, autosave, and Tauri payload defects", () => {
+test("MD Viewer execution oracle rejects the original blank-tab, autosave, and Tauri payload defects", () => {
   const sources = executionSources();
-  sources.toolbar = `<span id="file-path"></span>`;
   sources.editor = `
     editor.setValue = function(value) {
       this.value = value;
@@ -229,9 +246,16 @@ test("MD Viewer execution oracle rejects the original filename, autosave, and Ta
     };
   `;
   sources.caller = `
+    const initialFile = { path: '', content: '', isDirty: false };
+    activeFiles.push(initialFile);
     function setEditorValue(value) { editor.setValue(value); }
     async function handleOpenFile() {
       await openDialog({ multiple: true });
+    }
+    async function openFiles(filePath) {
+      const fileEntry = { path: filePath, content: '', isDirty: false };
+      activeFiles.push(fileEntry);
+      await invoke('read_file_content', { path: filePath });
     }
     async function handleSaveFile() {
       const file = activeFiles[activeTab];
@@ -245,12 +269,124 @@ test("MD Viewer execution oracle rejects the original filename, autosave, and Ta
       activeFiles[activeTab].path = filePath;
     }
   `;
-  assert.deepEqual(getMdViewerExecutionGaps(sources), [
-    "src/components/toolbar.js still renders the redundant #file-path filename label",
-    "src/main.js and src/components/editor.js still route programmatic file loading through synthetic input and can schedule autosave",
-    "src/main.js save_file_content caller payloads must use Tauri's external filePath key",
-    "src/main.js existing-file save must pass the active file.path as filePath",
-  ]);
+  const gaps = getMdViewerExecutionGaps(sources);
+  assert.equal(gaps.length, 4);
+  assert.ok(gaps.some((gap) => gap.includes(
+    "openFiles must replace only one pristine initial tab",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "programmatic setValue still dispatches input",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "save_file_content caller payloads must use Tauri's external filePath key",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "existing-file save must invoke save_file_content with the active file.path as filePath",
+  )));
+  assert.ok(gaps.every((gap) => /^src\/.+:\d+:1 - /.test(gap)));
+});
+
+test("MD Viewer execution oracle rejects post-fix API drift", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller
+    .replace(
+      "invoke('read_file_content', { path: filePath })",
+      "invoke('read_file_content', { filePath: filePath })",
+    );
+  sources.editor = sources.editor.replace(
+    "function(value)",
+    "function(value, silent)",
+  );
+
+  const gaps = getMdViewerExecutionGaps(sources);
+  assert.ok(gaps.some((gap) => gap.includes(
+    "setValue must keep its single-value API while removing only the synthetic input dispatch",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "read_file_content must preserve the Rust handler's external path key",
+  )));
+});
+
+test("MD Viewer execution oracle points a bad later save payload at the offending invoke", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    'await invoke("save_file_content", { filePath, content });',
+    'await invoke("save_file_content", { file_path: filePath, content });',
+  );
+
+  const expectedLine = sources.caller
+    .slice(0, sources.caller.indexOf('invoke("save_file_content", { file_path'))
+    .split(/\r?\n/).length;
+  const gap = getMdViewerExecutionGaps(sources).find((entry) =>
+    entry.includes("save_file_content caller payloads must use Tauri's external filePath key")
+  );
+  assert.ok(gap);
+  assert.match(gap, new RegExp(`^src/main\\.js:${expectedLine}:1 - `));
+});
+
+test("MD Viewer execution oracle does not mistake a payload value for the filePath key", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    'await invoke("save_file_content", { filePath, content });',
+    'await invoke("save_file_content", { file_path: filePath, content });',
+  );
+
+  const gaps = getMdViewerExecutionGaps(sources);
+  assert.ok(gaps.some((gap) => gap.includes(
+    "Save As must keep the selected dialog path, pass it as filePath, and persist that same path",
+  )));
+});
+
+test("MD Viewer execution oracle replaces only a truly pristine initial tab", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    "          activeFiles[0].content === '' &&\n          activeFiles[0].isDirty === false",
+    "          activeFiles[0].content === ''",
+  );
+
+  assert.ok(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "openFiles must replace only one pristine initial tab",
+    )),
+  );
+});
+
+test("MD Viewer execution oracle rejects an invented resetSaveState runtime call", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    "          activeFiles[0] = fileEntry;",
+    "          activeFiles[0] = fileEntry;\n          resetSaveState();",
+  );
+
+  assert.ok(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "no such runtime function is declared or imported",
+    )),
+  );
+  sources.caller += "\nfunction resetSaveState() {}";
+  assert.equal(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "no such runtime function is declared or imported",
+    )),
+    false,
+  );
+});
+
+test("MD Viewer execution oracle preserves a toolbar API that still has callers", () => {
+  const sources = executionSources();
+  sources.caller += "\ntoolbar.setCurrentFile('');";
+  assert.ok(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "setCurrentFile must remain exported while src/main.js still calls that module boundary",
+    )),
+  );
+  sources.toolbar += "\nexport function setCurrentFile(filePath) { void filePath; }";
+  assert.equal(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "setCurrentFile must remain exported while src/main.js still calls that module boundary",
+    )),
+    false,
+  );
 });
 
 test("MD Viewer execution oracle permits bypassing a legacy synthetic setValue shim", () => {
@@ -294,6 +430,39 @@ test("MD Viewer execution oracle accepts an existing-file path alias derived fro
   assert.deepEqual(getMdViewerExecutionGaps(sources), []);
 });
 
+test("MD Viewer execution oracle rejects a direct undefined save command call", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    "await invoke('save_file_content', { filePath: file.path, content });",
+    "await save_file_content({ filePath: file.path, content });",
+  );
+
+  assert.ok(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "existing-file save must invoke save_file_content",
+    )),
+  );
+});
+
+test("MD Viewer execution oracle requires the replaced tab to use the existing title API", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    "          updateTabTitle(0);",
+    [
+      "          const tab = document.querySelector('.tab-item');",
+      "          if (tab) tab.querySelector('.tab-title').textContent = fileEntry.title;",
+    ].join("\n"),
+  );
+
+  const gaps = getMdViewerExecutionGaps(sources);
+  assert.ok(gaps.some((gap) => gap.includes(
+    "then update that existing tab title",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "remove the invented selector",
+  )));
+});
+
 test("MD Viewer execution oracle rejects a Save As repair that uses content as the path", () => {
   const sources = executionSources();
   sources.caller = sources.caller
@@ -302,9 +471,9 @@ test("MD Viewer execution oracle rejects a Save As repair that uses content as t
     .replace("activeFiles[activeTab].path = filePath;", "activeFiles[activeTab].path = '';");
 
   assert.ok(
-    getMdViewerExecutionGaps(sources).includes(
-      "src/main.js Save As must keep the selected dialog path, pass it as filePath, and persist that same path",
-    ),
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "Save As must keep the selected dialog path, pass it as filePath, and persist that same path",
+    )),
   );
 });
 
@@ -316,9 +485,9 @@ test("MD Viewer execution oracle rejects replacing the plugin Open dialog with t
   );
 
   assert.ok(
-    getMdViewerExecutionGaps(sources).includes(
-      "src/main.js toolbar Open must keep the plugin-dialog boundary instead of invoking the event-emitting backend dialog command",
-    ),
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "toolbar Open must keep the plugin-dialog boundary instead of invoking the event-emitting backend dialog command",
+    )),
   );
 });
 
@@ -326,9 +495,26 @@ test("MD Viewer typed oracle accepts an evidence-bound caller fix and executable
   assert.deepEqual(getMdViewerTypedPlanGaps(goodCandidate()), []);
 });
 
+test("MD Viewer final-summary oracle requires all verified user-visible outcomes", () => {
+  const accurateSummary = [
+    "打开本地文件时会替换未修改的初始空白标签页，不再让文件名与未命名文档并存。",
+    "程序化 setValue 载入不再派发 input，因此不会把文件标为 dirty 或触发自动保存。",
+    "现有文件通过 save_file_content 使用活动文件的 filePath。",
+  ].join("\n");
+  assert.deepEqual(getMdViewerFinalSummaryGaps(accurateSummary), []);
+
+  const inaccurateSummary =
+    "已修复 handleSaveFile，因此文件名和未保存文档不会同时显示。测试通过。";
+  assert.deepEqual(getMdViewerFinalSummaryGaps(inaccurateSummary), [
+    "final summary omits the pristine initial-tab replacement",
+    "final summary omits the programmatic-load dirty/autosave boundary",
+    "final summary omits the active filePath save contract",
+  ]);
+});
+
 test("Markdown/Evidence keyword stuffing cannot replace typed graph ownership", () => {
   const candidate = goodCandidate();
-  candidate.evidence[0].statement += " filePath file_path toolbar tabs save_file_content scheduleAutoSave";
+  candidate.evidence[0].statement += " filePath file_path initialFile tabs save_file_content scheduleAutoSave";
   candidate.changes[2].targetRef = "src-tauri/src/main.rs";
   assert.ok(
     getMdViewerTypedPlanGaps(candidate).includes(
@@ -353,7 +539,7 @@ test("MD Viewer typed oracle rejects owner changes without corresponding evidenc
   candidate.changes[0].diagnosisRefs = [];
   assert.ok(
     getMdViewerTypedPlanGaps(candidate).includes(
-      "toolbar duplicate-name change is not bound to its diagnosis and evidence",
+      "pristine initial-tab replacement is not bound to its diagnosis and evidence",
     ),
   );
 });

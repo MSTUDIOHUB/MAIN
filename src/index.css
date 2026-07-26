@@ -761,6 +761,8 @@ html[data-theme="light"] #root {
 .agent-explanation-scroll-container {
   width: 100%;
   max-height: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;

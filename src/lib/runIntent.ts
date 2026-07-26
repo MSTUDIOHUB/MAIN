@@ -386,7 +386,7 @@ const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
 ];
 
 const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
-  /(?:不要|无需|不需要|请勿|禁止|别).{0,20}(?:修改|实现|修复|解决|处理|写入|创建|生成|改动|新增|添加|删除|替换|重构|执行)/i,
+  /(?:不要|无需|不需要|请勿|禁止|别).{0,10}(?:修改|实现|修复|解决|处理|写入|创建|生成|改动|新增|添加|删除|替换|重构|执行)/i,
   /(?:只|仅).{0,8}(?:分析|检查|解释|诊断|审查|评估|排查|总结|报告).{0,32}(?:不要|无需|不需要|请勿|禁止|别).{0,16}(?:修改|改动|写入|执行)?/i,
   /\b(?:do not|don't|dont|no need to|without)\s+(?:implementing?|fixing?|repairing?|resolving?|writing?|creating?|generating?|updating?|patching?|modifying?|refactoring?|deleting?|removing?|replacing?|adding?|changing?|running|executing)\b/i,
   /\b(?:only|just)\s+(?:analy[sz]e|inspect|explain|diagnose|review|assess|investigate|summari[sz]e|report)\b.{0,48}\b(?:do not|don't|without)\b/i,

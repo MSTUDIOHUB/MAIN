@@ -1,6 +1,7 @@
 import type { HooksConfig } from "../../hooks";
 import { extractStructuredChangedPaths } from "../fileReadCache";
 import { analyzePtyObservationResult } from "../../devServerRuntime";
+import { summarizeSuccessfulValidationObservation } from "../../commandValidationOutcome";
 import {
   buildPatchRecoveryReadNoProgressFingerprint,
   isReadOnlyNoProgressDetail,
@@ -29,7 +30,10 @@ import type { ToolCatalog } from "../../toolCatalog";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
-import type { SpawnSubagentResult } from "../../subagents";
+import type {
+  CollaborationTaskJoinOutcome,
+  SpawnSubagentResult,
+} from "../../subagents";
 import { hasCompletedToolExecution } from "../../toolResultEffect";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type {
@@ -66,12 +70,16 @@ import { resetTransientRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeState";
 import { partitionToolCallsForExecution } from "./toolCallPartitioning";
 import {
+  joinPendingSubagentsForParent,
+  shouldJoinPendingSubagentsBeforeParentValidation,
+} from "./subagentJoinRuntime";
+import {
   executeToolExecutionRound,
   shouldAdvanceWorkspaceObservationEpoch,
 } from "./toolExecutionRound";
 import { isVerificationEvidenceResult } from "./toolActivityTracking";
 import { handleToolResultPostProcessing } from "./toolResultPostProcessing";
-import { appendToolResultsToHistory } from "./toolResultHistory";
+import { commitToolResultBatch } from "./toolResultHistory";
 import type { TurnIterationContext } from "./turnIterationContext";
 import type { UnityMcpRuntimeState } from "./unityMcpRuntime";
 import {
@@ -384,6 +392,9 @@ export async function executeToolCallPhase(input: {
   onSubagentSpawnCreated?: (
     outcome: SpawnSubagentResult,
   ) => void | Promise<void>;
+  onCollaborationTaskOutcomes?: (
+    outcomes: CollaborationTaskJoinOutcome[],
+  ) => void | Promise<void>;
 }): Promise<ToolCallExecutionPhaseResult> {
   let noToolRuntimeState = resetConsecutiveNoToolRuntimeState(
     input.noToolRuntimeState,
@@ -521,6 +532,36 @@ export async function executeToolCallPhase(input: {
     aliasResolvedToolCalls,
     input.iterationContext.iterationTurnId,
   );
+  let parentReviewRequiredAfterJoin = false;
+  const pendingSubagentIds = input.callbacks.getPendingSubagentIds?.() || [];
+  if (shouldJoinPendingSubagentsBeforeParentValidation({
+    subagentDepth: input.callbacks.getSubagentDepth?.() || 0,
+    pendingSubagentIds,
+    toolCalls: effectiveToolCalls,
+    recoveryNextCapability: recoveryActionContract.nextRequiredCapability,
+  })) {
+    const joinResult = await joinPendingSubagentsForParent({
+      callbacks: input.callbacks,
+      recentToolActivity: input.recentToolActivity,
+      recentPlanToolActivity: input.recentPlanToolActivity,
+      reason: "parent_validation",
+    });
+    if (joinResult.joined) {
+      parentReviewRequiredAfterJoin = true;
+      await input.onCollaborationTaskOutcomes?.(joinResult.taskOutcomes);
+      logAgentEvent("parent_validation_join_completed", {
+        iteration: input.iteration,
+        requestedIds: pendingSubagentIds,
+        resultIds: joinResult.resultIds,
+        adoptedMutationEvidenceCount:
+          joinResult.adoptedMutationEvidenceCount,
+        adoptedMutationTargets: joinResult.adoptedMutationTargets,
+        pendingSubagentIds:
+          input.callbacks.getPendingSubagentIds?.() || [],
+        providerNeutral: true,
+      });
+    }
+  }
   logAgentEvent("tool_call_ids_canonicalized", {
     iteration: input.iteration,
     iterationTurnId: input.iterationContext.iterationTurnId,
@@ -555,6 +596,57 @@ export async function executeToolCallPhase(input: {
     input.providerReasoningForHistory,
     { tool_calls: toolCallsForMsg },
   ));
+
+  if (parentReviewRequiredAfterJoin) {
+    const toolArgsByCallId = new Map<string, Record<string, unknown>>();
+    const deferredResults = effectiveToolCalls.map((call): ToolExecutionResult => {
+      let args: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(call.arguments || "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          args = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // The protocol result closes malformed calls too; the next parent turn
+        // receives the joined handoff before choosing a new action.
+      }
+      toolArgsByCallId.set(call.id, args);
+      const target = String(
+        args.path || args.command || args.url || args.query || call.name,
+      ).trim();
+      return {
+        toolCallId: call.id,
+        name: call.name,
+        target,
+        content:
+          "PARENT_REVIEW_REQUIRED: Subagent work was joined before validation. Review the joined evidence/diff, then choose the next parent-owned edit or validation action.",
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "parent_subagent_review_required",
+      };
+    });
+    return {
+      status: "completed",
+      noToolRuntimeState,
+      planRuntimeState,
+      recoveryPromptState,
+      unityMcpRuntimeState,
+      evidenceRuntimeState,
+      executeRecoveryState,
+      loopGuardRuntimeState,
+      allResults: deferredResults,
+      toolArgsByCallId,
+      toolFailureSignatures: new Map(),
+      hasPlanDecisionOutput:
+        input.hasStructuredProposal || input.finalReplyOptionCount > 0,
+      unityMcpFallbackPrompt: null,
+      remainingTaskText: null,
+      successfulReadOnlyExplorationResultCount: 0,
+      isUnapprovedPlanReadOnlyBatch: false,
+    };
+  }
 
   const partitionedToolCalls = await partitionToolCallsForExecution({
     toolCalls: effectiveToolCalls,
@@ -660,6 +752,10 @@ export async function executeToolCallPhase(input: {
     activeRecoveryReadLease?.purpose === "patch_recovery"
       ? activeRecoveryReadLease
       : null;
+  const recoveryContractAtBatchStart = resolveExecuteRecoveryActionContract(
+    recoveryStateAtBatchStart.mode,
+    recoveryStateAtBatchStart,
+  );
   const freshReadResult = allResults.find((result) => {
     if (result.name !== "read_file" || !hasCompletedToolExecution(result)) return false;
     const detail = String(result.displayContent || result.content || "");
@@ -678,7 +774,21 @@ export async function executeToolCallPhase(input: {
     // cannot satisfy the old range/version identity; the transition then
     // invalidates the stale lease and returns to structural targeting.
     if (overlapExtension && !satisfiesActiveReadLease && !activeRecoveryReadLease) return false;
-    if (result.readFileObservation?.source === "stub" && satisfiesActiveReadLease) {
+    const reusesRetainedTargetingObservation = Boolean(
+      !activeRecoveryReadLease &&
+      recoveryContractAtBatchStart.phase === "context" &&
+      recoveryContractAtBatchStart.nextRequiredCapability === "targeting" &&
+      result.readFileObservation?.source === "stub" &&
+      result.readFileObservation.key &&
+      result.readFileObservation.versionToken
+    );
+    // Unleased targeting may confirm source identity from an unchanged stub.
+    // A runtime-owned read lease is stricter: the next model response must
+    // receive source bytes, so a stub can never consume that lease.
+    if (
+      result.readFileObservation?.source === "stub" &&
+      reusesRetainedTargetingObservation
+    ) {
       return true;
     }
     return result.readFileObservation?.source
@@ -691,13 +801,25 @@ export async function executeToolCallPhase(input: {
       toolArgsByCallId.get(result.toolCallId) || {},
     )
   );
-  const mutationTargets = mutationResult
-    ? [...new Set([
+  const mutationTargets = [...new Set([
+    ...(mutationResult
+      ? [
         ...(mutationResult.workspaceMutationEvidence?.changedPaths || []),
         ...extractStructuredChangedPaths(mutationResult.content, mutationResult.displayContent),
-      ])]
-    : [];
+        ]
+      : []),
+  ].filter(Boolean))];
+  const mutationTarget = mutationResult?.target;
+  const mutationToolName = mutationResult?.name;
   const validationResult = allResults.find(isVerificationEvidenceResult);
+  const validationSummary = validationResult
+    ? summarizeSuccessfulValidationObservation(
+        validationResult.runtimeEvidenceContent ||
+          validationResult.content ||
+          validationResult.displayContent ||
+          "",
+      )
+    : "";
   const recoveryIterationBudgetNeutral =
     executeRecoveryState.mode !== "normal" &&
     allResults.length > 0 &&
@@ -718,6 +840,7 @@ export async function executeToolCallPhase(input: {
     activePatchReadLease?.state === "available" &&
     allResults.some((result) =>
       result.name === "read_file" &&
+      result.readFileObservation?.source !== "stub" &&
       readEvidenceSatisfiesRecoveryLease({
         lease: activePatchReadLease,
         target: result.target,
@@ -749,15 +872,25 @@ export async function executeToolCallPhase(input: {
             freshReadResult.displayContent || freshReadResult.content || "",
           ))
         : false,
-      mutationTarget: mutationResult?.target,
+      mutationTarget,
       mutationTargets,
+      mutationToolName,
       validationTarget: validationResult?.target || validationResult?.name,
       validationToolName: validationResult?.name,
+      validationSummary,
     },
   );
-  if (recoveryTransition.transition === "validation_to_normal") {
+  const subagentMutationHandoff =
+    recoveryTransition.transition === "mutation_to_validation" &&
+    (input.callbacks.getSubagentDepth?.() || 0) > 0;
+  if (
+    recoveryTransition.transition === "validation_to_normal" ||
+    subagentMutationHandoff
+  ) {
     executeRecoveryState = clearExecuteRecoveryAndSync(
-      "recovery_validation_observed",
+      subagentMutationHandoff
+        ? "subagent_mutation_handoff_to_parent_validation"
+        : "recovery_validation_observed",
       recoveryTransition.target || undefined,
     );
   } else if (recoveryTransition.transition !== "none") {
@@ -918,7 +1051,7 @@ export async function executeToolCallPhase(input: {
           };
         }),
     ];
-    appendToolResultsToHistory({
+    commitToolResultBatch({
       callbacks: input.callbacks,
       toolFeedbackFormat: input.toolFeedbackFormat,
       results: protocolResults,

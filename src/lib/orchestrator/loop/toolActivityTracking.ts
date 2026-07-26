@@ -47,6 +47,7 @@ import {
   extractRuntimePlanSourceObservations,
   normalizePlanSourceObservations,
 } from "../../planSourceObservation";
+import { resolveToolDiffChangedRange } from "../../toolDiff";
 
 const SUBAGENT_EVIDENCE_TOOLS = new Set([
   "read_file",
@@ -394,6 +395,9 @@ function appendBoundedToolActivity(
         };
       }
       existing.mutationObserved = existing.mutationObserved === true || activity.mutationObserved === true;
+      if (activity.mutationRange) {
+        existing.mutationRange = { ...activity.mutationRange };
+      }
       const details = [existing.detail, activity.detail]
         .map((detail) => String(detail || "").trim())
         .filter((detail, index, all) => detail && all.indexOf(detail) === index);
@@ -909,6 +913,9 @@ export function rememberToolActivity(
   // downstream evidence gates continue to require successful execution.
   const mutationObserved = hasVerifiedWorkspaceMutationEffect(result, executedArgs) ||
     hasObservedWorkspaceMutationEffect(result);
+  const mutationRange = mutationObserved
+    ? resolveToolDiffChangedRange(result.workspaceMutationEvidence?.diff)
+    : null;
   const noEffectWorkspaceMutation =
     isWorkspaceMutationToolCall(executionName, executedArgs) && !mutationObserved;
   const commandOutcome = !hasCompletedToolExecution(result)
@@ -920,6 +927,7 @@ export function rememberToolActivity(
     name: result.name,
     target: result.target,
     mutationObserved,
+    ...(mutationRange ? { mutationRange } : {}),
     status: commandOutcome === "failed"
       ? "failed"
       : commandOutcome === "running"

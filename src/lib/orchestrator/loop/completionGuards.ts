@@ -18,7 +18,10 @@ import {
   resolveCommandEvidenceRequirements,
   type ExecuteEvidenceClosureAudit,
 } from "../../verificationEvidence";
-import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
+import {
+  isAutoResumableExecutionBoundaryReason,
+  resolveExecuteRecoveryActionContract,
+} from "../../executeRecoveryTools";
 import { resolveApprovedPlanTurnExpectations } from "./turnContractRuntime";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
@@ -279,18 +282,15 @@ export function resolveNonActionableStopOutcome(
  * the lifecycle meaning, not the prose that happened to accompany it.
  */
 export function isRecoverableRuntimePauseReason(reason: string): boolean {
+  if (isAutoResumableExecutionBoundaryReason(reason)) return true;
   return new Set([
     "plan_generation_failed",
     "plan_required_tool_protocol_violation",
-    "stream_no_visible_progress_timeout",
-    "stream_max_elapsed_timeout",
     "max_iterations_auto_resume",
     "max_iterations_boundary",
     "plan_max_iterations_checkpoint",
     "execute_max_iterations_checkpoint",
     "chat_max_iterations_strategy_exhausted",
-    "execute_recovery_no_progress_limit",
-    "execute_no_progress_batch_loop",
   ]).has(String(reason || "").trim());
 }
 
@@ -298,25 +298,29 @@ export function resolveFinalTurnContractForCompletion(input: {
   callbacks: OrchestratorCallbacks;
   latestTurnContract: EffectiveTurnContract | null;
 }): EffectiveTurnContract {
-  if (input.latestTurnContract) return input.latestTurnContract;
   const { callbacks } = input;
-  const finalRuntimeIntent: ResolvedUserIntent =
-    callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
-  const approvedPlanExpectations = resolveApprovedPlanTurnExpectations({
-    planApproved: callbacks.getIsPlanApproved(),
-    tasks: callbacks.getPlanTasks(),
-    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-  });
-  return buildEffectiveTurnContract({
-    conversationIntent: callbacks.getCurrentRunIntent(),
-    runtimeIntent: finalRuntimeIntent,
-    commandDirective: callbacks.getCommandDirective?.() ?? null,
-    planApproved: callbacks.getIsPlanApproved(),
-    executionConsentGranted:
-      callbacks.getExecutionConsentGranted?.() === true ||
-      callbacks.getIsPlanApproved(),
-    ...approvedPlanExpectations,
-  });
+  const contract = input.latestTurnContract || (() => {
+    const finalRuntimeIntent: ResolvedUserIntent =
+      callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
+    const approvedPlanExpectations = resolveApprovedPlanTurnExpectations({
+      planApproved: callbacks.getIsPlanApproved(),
+      tasks: callbacks.getPlanTasks(),
+      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+    });
+    return buildEffectiveTurnContract({
+      conversationIntent: callbacks.getCurrentRunIntent(),
+      runtimeIntent: finalRuntimeIntent,
+      commandDirective: callbacks.getCommandDirective?.() ?? null,
+      planApproved: callbacks.getIsPlanApproved(),
+      executionConsentGranted:
+        callbacks.getExecutionConsentGranted?.() === true ||
+        callbacks.getIsPlanApproved(),
+      ...approvedPlanExpectations,
+    });
+  })();
+  return (callbacks.getSubagentDepth?.() || 0) > 0 && contract.mutationExpected
+    ? { ...contract, validationExpected: false }
+    : contract;
 }
 
 export function runApprovedPlanCompletionGuard(input: {
@@ -392,6 +396,9 @@ export function runApprovedPlanCompletionGuard(input: {
     activeRecoveryNextCapability: recoveryGap?.nextRequiredCapability || null,
     completionGap: evaluation.gap,
   });
+  const recoveryReason = sawExecutionEvidence
+    ? "approved_plan_completion_guard_incomplete_after_change"
+    : "approved_plan_completion_guard_no_evidence";
   callbacks.onNonActionableStop(
     closureGap?.message || buildApprovedPlanNoToolPauseMessage(
         language,
@@ -403,9 +410,7 @@ export function runApprovedPlanCompletionGuard(input: {
     "incomplete_plan",
     {
       phase: "paused",
-      recoveryReason: sawExecutionEvidence
-        ? "approved_plan_completion_guard_incomplete_after_change"
-        : "approved_plan_completion_guard_no_evidence",
+      recoveryReason,
       nextStep: closureGap?.nextStep || (language === "zh"
         ? "批准计划尚缺真实执行证据；恢复后必须写入、运行命令、做浏览器验证，或明确外部验证边界。"
         : "The approved plan still lacks real execution evidence; resume by writing, running commands, browser-validating, or stating the external validation boundary."),
@@ -413,9 +418,9 @@ export function runApprovedPlanCompletionGuard(input: {
   );
   callbacks.onStatusChange("idle");
   return {
-    status: "completed",
-    resultKind: sawExecutionEvidence ? "partial" : "blocked",
-    reason: "approved_plan_completion_guard",
+    status: "paused",
+    pauseKind: "recoverable",
+    reason: recoveryReason,
   };
 }
 
@@ -497,6 +502,13 @@ export function runExecutionEvidenceCompletionGuard(input: {
     activeRecoveryMode: executeRecoveryState?.mode || "normal",
     activeRecoveryNextCapability: recoveryGap?.nextRequiredCapability || null,
   });
+  const recoveryReason = activeRecoveryPending
+    ? "execution_evidence_gap:recovery_phase_pending"
+    : missingAnyExecutionEvidence
+    ? "execution_evidence_required"
+    : missingRequiredEvidenceClosure
+    ? `execution_evidence_gap:${evidenceClosureAudit.gap}`
+    : "execution_evidence_required";
   callbacks.onNonActionableStop(
     closureGap?.message || (language === "zh"
       ? "执行已暂停：本轮需要真实执行证据，但没有检测到源码/文件写入、成功命令、浏览器验证或明确外部验证边界。如果前面只是重复只读检查，请复用已读上下文，恢复后直接调用可用写入/验证工具，或说明具体阻塞。"
@@ -504,13 +516,7 @@ export function runExecutionEvidenceCompletionGuard(input: {
     "no_action",
     {
       phase: "paused",
-      recoveryReason: activeRecoveryPending
-        ? "execution_evidence_gap:recovery_phase_pending"
-        : missingAnyExecutionEvidence
-        ? "execution_evidence_required"
-        : missingRequiredEvidenceClosure
-        ? `execution_evidence_gap:${evidenceClosureAudit.gap}`
-        : "execution_evidence_required",
+      recoveryReason,
       nextStep: closureGap?.nextStep || (language === "zh"
         ? "复用已读上下文，恢复后必须产生真实写入/验证证据，或明确阻塞。"
         : "Reuse read context and resume with real write/validation evidence, or a concrete blocker."),
@@ -518,15 +524,9 @@ export function runExecutionEvidenceCompletionGuard(input: {
   );
   callbacks.onStatusChange("idle");
   return {
-    status: "completed",
-    resultKind: sawExecutionEvidence ? "partial" : "blocked",
-    reason: activeRecoveryPending
-      ? "execution_evidence_gap:recovery_phase_pending"
-      : missingAnyExecutionEvidence
-      ? "execution_evidence_required"
-      : missingRequiredEvidenceClosure
-      ? `execution_evidence_gap:${evidenceClosureAudit.gap}`
-      : "execution_evidence_required",
+    status: "paused",
+    pauseKind: "recoverable",
+    reason: recoveryReason,
   };
 }
 

@@ -51,7 +51,7 @@ export interface AgentLoopControlRuntime {
   pauseApprovedPlanStreamWatchdog: (
     message: string,
     logContext?: Record<string, unknown>,
-  ) => boolean;
+  ) => { reason: string; message: string } | null;
   startLoop: (input: {
     runtimeIntent: ResolvedUserIntent;
     loopStartTools: ToolDefinition[];

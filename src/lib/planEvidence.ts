@@ -185,10 +185,12 @@ function canonicalStructuredFacts(input: PlanEvidenceFactInput): PlanStructuredE
 }
 
 function sourceDerivedFactSummary(input: PlanEvidenceFactInput): string {
-  return compact([
-    ...formatPlanStructuredEvidenceFacts(canonicalStructuredFacts(input)),
-    input.summary,
-  ].filter(Boolean).join(" "), 320);
+  const publicSummary = compact(input.summary, 320);
+  if (publicSummary) return publicSummary;
+  return compact(
+    formatPlanStructuredEvidenceFacts(canonicalStructuredFacts(input)).join(" "),
+    320,
+  );
 }
 
 function planEvidenceFactText(

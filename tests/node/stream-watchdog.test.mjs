@@ -81,10 +81,34 @@ const {
   SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS,
   capSubagentStreamMaxEscalations,
   capSubagentStreamMaxTokens,
+  collapseSupersededFiniteValidationRepairPrompts,
   resolveRecoveryToolChoice,
+  shouldOmitWireRequiredForLocalExecute,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
 );
+
+test("provider wire keeps only the latest finite validation repair prompt", () => {
+  const original = { role: "user", content: "修复当前问题" };
+  const first = {
+    role: "user",
+    content: "FINITE_VALIDATION_REPAIR_REQUIRED: first stale diagnostic",
+  };
+  const assistant = { role: "assistant", content: "正在处理" };
+  const latest = {
+    role: "user",
+    content: "FINITE_VALIDATION_REPAIR_REQUIRED: latest active diagnostic",
+  };
+  const projected = collapseSupersededFiniteValidationRepairPrompts([
+    original,
+    first,
+    assistant,
+    latest,
+  ]);
+
+  assert.equal(projected.removedCount, 1);
+  assert.deepEqual(projected.messages, [original, assistant, latest]);
+});
 const {
   resolveExecuteRecoveryActionContract,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
@@ -364,13 +388,13 @@ test("an exact Plan evidence obligation requires its sole native primitive", () 
   }), undefined, "XML fallback remains action-contract driven");
 });
 
-test("preferred collaboration never forces a provider tool choice", () => {
+test("preferred collaboration requires its sole spawn capability provider-neutrally", () => {
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     llmToolNames: ["spawn_subagent"],
     forceXmlTools: false,
-  }), undefined);
+  }), "required");
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
@@ -412,6 +436,21 @@ test("recovery tool choice follows the phase-owned capability surface", () => {
     streamInvocationSource,
     /nextRequiredCapability\s*===/,
     "the provider transport must not maintain a second capability-to-tool mapping",
+  );
+  assert.match(
+    streamInvocationSource,
+    /annotateRequiredToolCallProtocolResult\(\s*rawStreamResult,\s*[\s\S]*?semanticRecoveryToolChoice,/,
+    "omitting an unsupported wire constraint must retain the runtime's required-action contract",
+  );
+  assert.match(
+    streamInvocationSource,
+    /shouldOmitWireRequiredForLocalExecute\(\{[\s\S]*?recoveryActionContract\.phase !== "normal"[\s\S]*?priorSemanticToolMisses:[\s\S]*?\}\)/,
+    "local Execute recovery starts provider-auto but retains the miss count needed for capability escalation",
+  );
+  assert.match(
+    streamInvocationSource,
+    /runtime_owned_recovery_action_materialized_pre_stream/,
+    "a complete runtime-owned recovery call must not spend another provider request",
   );
   assert.deepEqual(
     resolveExecuteRecoveryActionContract("normal").toolCallRequirement,
@@ -465,6 +504,36 @@ test("recovery tool choice follows the phase-owned capability surface", () => {
     llmToolNames: ["read_file", "wait_subagents"],
     forceXmlTools: false,
   }), "required", "a pending child join must not be quarantined by named read_file choice");
+});
+
+test("local Execute recovery escalates from semantic auto to wire required after one miss", () => {
+  assert.equal(shouldOmitWireRequiredForLocalExecute({
+    activeProfile: "local",
+    semanticActionRequired: true,
+  }), true);
+  assert.equal(shouldOmitWireRequiredForLocalExecute({
+    activeProfile: "local",
+    semanticActionRequired: true,
+    priorSemanticToolMisses: 1,
+  }), false);
+  assert.equal(shouldOmitWireRequiredForLocalExecute({
+    activeProfile: "cloud",
+    semanticActionRequired: true,
+  }), false);
+  assert.equal(shouldOmitWireRequiredForLocalExecute({
+    activeProfile: "local",
+    semanticActionRequired: false,
+  }), false);
+
+  const streamRecoverySource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"),
+    "utf8",
+  );
+  assert.match(
+    streamRecoverySource,
+    /priorSemanticToolMisses:\s*Math\.max\(1,\s*priorSemanticToolMisses\)[\s\S]*?execute_stream_watchdog_recovery_started/,
+    "a bounded watchdog retry has already proven one semantic miss and must negotiate wire required",
+  );
 });
 
 test("max-iteration continuation exposes only its named finite validation capability", () => {

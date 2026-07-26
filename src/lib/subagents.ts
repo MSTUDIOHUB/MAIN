@@ -21,6 +21,7 @@ import {
   type CollaborationTaskTerminalState,
   type CollaborationWorkItemV1,
 } from "./collaborationWorkItems";
+import type { PlanExecutionEvidenceEntry } from "./workflowModels";
 
 export type SubagentStatus =
   | "queued"
@@ -227,6 +228,9 @@ export type SpawnSubagentResult =
       name: string;
       status: "queued" | "running";
       scopeKey: string;
+      /** Effective contract after runtime scope normalization/downgrade. */
+      accessMode: CollaborationAccessMode;
+      taskKind: CollaborationTaskKind;
       /** Runtime-normalized authorization roots used to settle scope ownership. */
       allowedPaths: string[];
     }
@@ -380,6 +384,8 @@ export interface SubagentResultEnvelope {
   /** Child-authored synthesis is a hypothesis; only provenance-backed evidence is trusted. */
   summaryTrust: "unverified_hypothesis";
   evidence: SubagentEvidenceItem[];
+  /** Runtime-authored successful child mutations awaiting parent validation. */
+  mutationEvidence?: PlanExecutionEvidenceEntry[];
   /** Sole runtime authority for whether this child scope is closed. */
   closureAudit: SubagentClosureEnvelope;
   blocker?: string;
@@ -522,17 +528,20 @@ export function resolveDelegationDecision(input: {
   ) {
     return decision("defer", "phase_not_eligible");
   }
-  if (preference === "preferred" || preference === "allowed") {
+  if (preference === "preferred") {
+    // An explicit collaboration toggle owns the initial child-start boundary.
+    // Capacity is coordinated by the scheduler; it must not silently restore
+    // parent read/edit tools before the requested child has been admitted.
+    return decision("admit", "explicit_preference");
+  }
+  if (preference === "allowed") {
     if (input.runtimeHealth?.state === "degraded") {
       return decision("defer", "runtime_capacity_degraded");
     }
     if (input.runtimeHealth?.state === "busy") {
       return decision("defer", "runtime_capacity_busy");
     }
-    return decision(
-      "admit",
-      preference === "preferred" ? "explicit_preference" : "explicit_permission",
-    );
+    return decision("admit", "explicit_permission");
   }
   return decision("defer", "collaboration_not_enabled");
 }

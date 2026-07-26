@@ -136,6 +136,10 @@ export function createAgentLoopRuntimeActions(input: {
     const sourceObservationKey = hasExplicitSourceObservationKey
       ? explicitSourceObservationKey
       : retainedObservation?.key || null;
+    const hasExplicitReadLease = Object.prototype.hasOwnProperty.call(
+      context,
+      "readLease",
+    );
     const explicitReadLease = context.readLease && typeof context.readLease === "object"
       ? context.readLease as RecoveryReadLease
       : null;
@@ -195,7 +199,9 @@ export function createAgentLoopRuntimeActions(input: {
     );
     const readLease: RecoveryReadLease | null = repeatedPatchMismatch
       ? currentRecoveryState.readLease
-      : patchReadLeaseCandidate || explicitReadLease || (
+      : hasExplicitReadLease
+        ? explicitReadLease
+        : patchReadLeaseCandidate || explicitReadLease || (
         retainedObservation && expectedTarget
         ? {
             purpose: "context_restore",
@@ -208,32 +214,21 @@ export function createAgentLoopRuntimeActions(input: {
             state: "consumed",
           }
         : null
-      );
+        );
     // A lease is one-shot for a target/version/range mismatch identity. If the
     // next patch still misses the same snapshot, stay in mutation instead of
     // minting another read phase; the monotonic protocol counter will bound
     // retries even when cache stubs or policy deferrals are budget-neutral.
     let nextState: ExecuteRecoveryRuntimeState;
     if (repeatedPatchMismatch && patchReadLeaseCandidate?.mismatchFingerprint) {
-      const mutationCheckpoint: ExecutionDecisionCheckpoint = explicitDecisionCheckpoint || {
+      const mutationCheckpoint: ExecutionDecisionCheckpoint = {
+        ...(currentRecoveryState.decisionCheckpoint || {}),
+        ...(explicitDecisionCheckpoint || {}),
         expectedTarget,
-        sourceObservationKey: currentRecoveryState.sourceObservationKey,
+        sourceObservationKey:
+          explicitDecisionCheckpoint?.sourceObservationKey ??
+          currentRecoveryState.sourceObservationKey,
         nextRequiredCapability: "mutation",
-        ...(currentRecoveryState.decisionCheckpoint?.evidenceVersion
-          ? { evidenceVersion: currentRecoveryState.decisionCheckpoint.evidenceVersion }
-          : {}),
-        ...(currentRecoveryState.decisionCheckpoint?.planTaskId
-          ? { planTaskId: currentRecoveryState.decisionCheckpoint.planTaskId }
-          : {}),
-        ...(currentRecoveryState.decisionCheckpoint?.requirementRef
-          ? { requirementRef: currentRecoveryState.decisionCheckpoint.requirementRef }
-          : {}),
-        ...(currentRecoveryState.decisionCheckpoint?.pendingFiniteValidation
-          ? {
-              pendingFiniteValidation:
-                currentRecoveryState.decisionCheckpoint.pendingFiniteValidation,
-            }
-          : {}),
       };
       nextState = registerExecuteRecoveryProtocolNoProgress(
         {
@@ -288,6 +283,13 @@ export function createAgentLoopRuntimeActions(input: {
       protocolNoProgressCount: nextState.protocolNoProgressCount,
       planTaskId: nextState.decisionCheckpoint?.planTaskId || null,
       requirementRef: nextState.decisionCheckpoint?.requirementRef || null,
+      finiteValidationPending: Boolean(
+        nextState.decisionCheckpoint?.pendingFiniteValidation,
+      ),
+      finiteValidationDiagnosticTargets:
+        nextState.decisionCheckpoint?.finiteValidationDiagnosticTargets || [],
+      finiteValidationFailureDetail:
+        nextState.decisionCheckpoint?.finiteValidationFailureDetail || null,
       recoveryToolSurface: resolveExecuteRecoveryActionContract(nextState.mode, {
         expectedTarget: nextState.expectedTarget,
         readLease: nextState.readLease,

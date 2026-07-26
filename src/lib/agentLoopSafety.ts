@@ -114,8 +114,13 @@ export function shouldUseMaxStepsFinalTextOnly(input: {
   if (input.alreadyPrompted) return false;
   if (input.iteration < input.maxIterations) return false;
   if (input.isPlanApproved) return false;
-  return input.workflowMode === "chat" && (
-    input.runtimeIntent === "respond" || input.runtimeIntent === "analyze"
+  // Read-only subagents inherit the parent's legacy workflow mode but run
+  // with the semantic `analyze` intent. Reserve their last bounded request
+  // for an evidence synthesis even when the parent is in Edit mode; otherwise
+  // all six requests can be spent on tools and the child is downgraded to a
+  // partial handoff without ever being asked to report its findings.
+  return input.runtimeIntent === "analyze" || (
+    input.workflowMode === "chat" && input.runtimeIntent === "respond"
   );
 }
 

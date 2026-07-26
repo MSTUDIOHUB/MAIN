@@ -236,6 +236,11 @@ export function handleApprovedPlanFinalization(input: {
           Array.from(availableToolNames),
         ),
         "incomplete_plan",
+        {
+          phase: "paused",
+          recoveryReason: "approved_plan_remaining_tasks_no_action",
+          nextStep: remainingText,
+        },
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");

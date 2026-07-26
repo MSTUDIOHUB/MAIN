@@ -13,6 +13,7 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTask,
 } from "./workflowModels";
+import { resolveDirectEditTransaction } from "./directEditTransaction";
 import type {
   FileReadObservationIdentity,
   FileReadWindowIdentity,
@@ -402,7 +403,9 @@ export function resolveExecuteMaxIterationsRecoveryDecision(input: {
 
   if (
     input.recoveryState?.mode === "objective_audit" &&
-    input.recoveryState.decisionCheckpoint?.objectiveClosurePending === true
+    resolveDirectEditTransaction(
+      input.recoveryState.decisionCheckpoint,
+    )?.phase === "audit"
   ) {
     // A complete evidence ledger is necessary but not sufficient for an
     // unstructured Direct Edit root. Preserve the explicit audit transaction
@@ -615,6 +618,13 @@ export interface PlanToolActivitySummary {
   detail?: string;
   /** Runtime-observed mutation truth; tool names and success prose are insufficient. */
   mutationObserved?: boolean;
+  /** Largest concrete changed hunk from the runtime-observed full-file diff. */
+  mutationRange?: {
+    path: string;
+    startLine: number;
+    endLine: number;
+    maxLines: number;
+  };
   /** Runtime-owned typed evidence. Legacy `facts` are display/import only. */
   structuredFacts?: PlanStructuredEvidenceFact[];
   /** Immutable exact source excerpts retained before display compaction. */

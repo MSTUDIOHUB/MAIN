@@ -1504,6 +1504,10 @@ export interface OrchestratorCallbacks {
   getPlanArtifacts?: () => PlanArtifact[];
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
+  /** Rebind runtime-authored child mutations to this parent Turn for validation. */
+  adoptSubagentMutationEvidence?: (
+    entries: PlanExecutionEvidenceEntry[],
+  ) => void;
   getPlanAutoResumeCount?: () => number;
   getIsApprovedPlanExecutionTransitionPending?: () => boolean;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
@@ -1513,6 +1517,8 @@ export interface OrchestratorCallbacks {
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
   onProviderCompatibilityFallback?: (reason: string) => void;
+  shouldOmitRequiredToolChoiceForProviderCompatibility?: () => boolean;
+  onProviderRequiredToolChoiceUnsupported?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onToolSurfaceResolved?: (availableToolNames: string[]) => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
@@ -1846,7 +1852,10 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
   const mutationTargets = resolveWorkspaceMutationTargets(name, args);
   if (mutationTargets.length > 0) return mutationTargets.join(", ");
   switch (name) {
-    case "spawn_subagent":  return (args.name as string) || (args.objective as string) || "subagent";
+    // The objective is durable ChatArea content, not a compact tool target.
+    // Falling back to the full assignment here made Capsule cut a sentence in
+    // half and left users without any complete account of the delegation.
+    case "spawn_subagent":  return (args.name as string) || "subagent";
     case "wait_subagents": return (args.subagent_ids as string) ||
       (args.collaboration_task_ids as string) || "all subagents";
     case "cancel_subagent": return (args.subagent_id as string) ||
@@ -5425,7 +5434,10 @@ async function executeToolCallWithLifecycle(
       );
     }
 
-    const completedTarget = mutationVerificationPath || target;
+    const completedTarget =
+      tc.name === "spawn_subagent" && subagentSpawnOutcome?.subagentId
+        ? subagentSpawnOutcome.name
+        : mutationVerificationPath || target;
     const trustedBuiltInMutation =
       catalogIdentity.source === "built_in" &&
       BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES.has(executionName) &&

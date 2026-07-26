@@ -176,10 +176,11 @@ export async function handleEmptyResponseRecovery(input: {
     normalized.protocolViolation === "required_tool_call_missing" ||
     normalized.protocolViolation === "required_function_call_mismatch" ||
     normalized.protocolViolation === "required_tool_call_not_available";
-  if (!isSubagent && isExecuteRuntime && requiredToolProtocolViolation) {
+  if (isExecuteRuntime && requiredToolProtocolViolation) {
     // Required-tool violations have one owner: handleExecuteNoToolRecovery.
-    // Counting the same zero-call response here first used the generic empty
-    // pivot and prevented transport compatibility fallback from ever running.
+    // Parent and child Execute runs share that semantic repair path; the
+    // read-only child XML fallback below is only a transport compatibility
+    // attempt for ordinary empty native completions.
     emitDebug("empty_execute_protocol_recovery_deferred", {
       iteration,
       protocolViolation: normalized.protocolViolation,
@@ -400,6 +401,14 @@ export async function handleEmptyResponseRecovery(input: {
 
   if (executeStrategiesExhausted || (!isExecuteRuntime && consecutiveEmptyResponseCount >= 3)) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+    const pauseNotice = buildEmptyModelResponsePauseNotice({
+      language: callbacks.getPreferredLanguage(),
+      emptyResponses: consecutiveEmptyResponseCount,
+      repeatedTargets,
+    });
+    const nextStep = callbacks.getPreferredLanguage() === "zh"
+      ? "复用当前证据和检查点，由下一次有界续跑重新调用当前阶段工具。"
+      : "Reuse the current evidence and checkpoint; let the next bounded continuation call the active phase tool.";
     emitDebug("loop_stop", {
       reason: "empty_model_response",
       iteration,
@@ -408,18 +417,12 @@ export async function handleEmptyResponseRecovery(input: {
       repeatedTargets,
     });
     callbacks.onNonActionableStop(
-      buildEmptyModelResponsePauseNotice({
-        language: callbacks.getPreferredLanguage(),
-        emptyResponses: consecutiveEmptyResponseCount,
-        repeatedTargets,
-      }),
+      pauseNotice,
       "no_output",
       {
         repeatedTargets,
         recoveryReason: "empty_model_response",
-        nextStep: callbacks.getPreferredLanguage() === "zh"
-          ? "复用已读上下文，要求直接总结、换目标或说明具体阻塞"
-          : "reuse cached context and ask for a direct summary, a different target, or the concrete blocker",
+        nextStep,
       },
     );
     callbacks.onStatusChange("idle");

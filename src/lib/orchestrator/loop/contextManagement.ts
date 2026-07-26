@@ -39,6 +39,27 @@ export interface IterationContextManagementResult {
   llmTools: ToolDefinition[];
 }
 
+/**
+ * An explicit recovery observation is the transaction's source identity.
+ * Recent activity is only a legacy fallback when the transaction has no
+ * identity of its own. Appending a nearby historical window after the active
+ * one makes the last system message contradict the exact diagnostic lease and
+ * can send a repair back to an already-resolved source range.
+ */
+export function resolveRecoveryContextObservationKeys(input: {
+  leaseObservationKeys?: string[];
+  sourceObservationKey?: string | null;
+  recentActivityObservationKey?: string | null;
+}): string[] {
+  const explicitKeys = Array.from(new Set([
+    ...(input.leaseObservationKeys || []),
+    ...(input.sourceObservationKey ? [input.sourceObservationKey] : []),
+  ].map((key) => String(key || "").trim()).filter(Boolean)));
+  if (explicitKeys.length > 0) return explicitKeys;
+  const fallback = String(input.recentActivityObservationKey || "").trim();
+  return fallback ? [fallback] : [];
+}
+
 export function buildExecuteRecoverySourceContextMessage(
   state: FileReadState,
   language: "zh" | "en",
@@ -147,6 +168,62 @@ export function buildContextPackTelemetry(input: {
   };
 }
 
+/**
+ * A pinned mutation gets one ordinary model attempt with the accumulated
+ * investigation. If that phase makes no progress, focus the next attempt once
+ * on the durable objective/checkpoint and the exact source window. Later
+ * retries reuse that compacted transcript instead of repeatedly rewriting it.
+ */
+export function shouldFocusPinnedMutationRecoveryContext(input: {
+  isExecuteRecoveryEligible: boolean;
+  contract: Pick<
+    RecoveryActionContract,
+    | "phase"
+    | "nextRequiredCapability"
+    | "expectedTarget"
+    | "sourceObservationKey"
+    | "phaseNoProgressCount"
+    | "decisionCheckpoint"
+  >;
+}): boolean {
+  const { contract } = input;
+  const validationRepairCount = Math.max(
+    0,
+    Math.floor(
+      Number(contract.decisionCheckpoint?.validationMutationReopenCount) || 0,
+    ),
+  );
+  return input.isExecuteRecoveryEligible &&
+    contract.phase === "mutation" &&
+    contract.nextRequiredCapability === "mutation" &&
+    Boolean(contract.expectedTarget && contract.sourceObservationKey) &&
+    (
+      contract.phaseNoProgressCount === 2 ||
+      validationRepairCount === 2
+    );
+}
+
+export const FOCUSED_PINNED_MUTATION_COMPACTION_LIMITS = Object.freeze({
+  maxMessages: 18,
+  maxToolResultMessages: 6,
+  maxToolChars: 10_000,
+  maxToolCallGroups: 3,
+  maxToolResultTokens: 600,
+  latestUserMessages: 2,
+});
+
+export function isRecoverySourceStableOutsideNativeToolHistory(
+  modelContent: string,
+  messages: AgentMessage[],
+): boolean {
+  if (!modelContent || !modelContent.trim()) return false;
+  return messages.some((message) =>
+    message.role !== "tool" &&
+    typeof message.content === "string" &&
+    message.content.includes(modelContent)
+  );
+}
+
 export function prepareManagedMessagesForIteration(input: {
   callbacks: OrchestratorCallbacks;
   config: AppConfig;
@@ -230,20 +307,32 @@ export function prepareManagedMessagesForIteration(input: {
         proactiveTriggerBudget: contextBudgetsForManagement.proactiveTriggerBudget,
       })
     : null;
+  const focusedPinnedMutationRetry = shouldFocusPinnedMutationRecoveryContext({
+    isExecuteRecoveryEligible,
+    contract: recoveryActionContract,
+  });
+  const shouldCompactExecuteRecoveryContext =
+    contextForceForManagement?.shouldForce === true ||
+    focusedPinnedMutationRetry;
+  const executeRecoveryCompactionLimits = focusedPinnedMutationRetry
+    ? FOCUSED_PINNED_MUTATION_COMPACTION_LIMITS
+    : {
+        maxMessages: config.activeProfile === "local" ? 60 : 36,
+        maxToolResultMessages: config.activeProfile === "local" ? 24 : 12,
+        maxToolChars: config.activeProfile === "local" ? 30_000 : 12_000,
+        maxToolCallGroups: config.activeProfile === "local" ? 12 : 6,
+        maxToolResultTokens: config.activeProfile === "local" ? 1200 : 360,
+        latestUserMessages: config.activeProfile === "local" ? 4 : 2,
+      };
   let executeRecoveryContextAlreadyCompacted = false;
-  if (isExecuteRecoveryEligible && contextForceForManagement?.shouldForce) {
+  if (isExecuteRecoveryEligible && shouldCompactExecuteRecoveryContext) {
     const recoveryMessagesBefore = batchMarkedSourceAgentMessages.length;
     const recoveryManagedResult = compactContextForExecuteRecovery(
       batchMarkedSourceAgentMessages,
       {
         previousMemoryState: callbacks.getContextMemoryState?.() || null,
         turnId: callbacks.getCurrentTurnId?.() || eventTurnId,
-        maxMessages: config.activeProfile === "local" ? 60 : 36,
-        maxToolResultMessages: config.activeProfile === "local" ? 24 : 12,
-        maxToolChars: config.activeProfile === "local" ? 30000 : 12000,
-        maxToolCallGroups: config.activeProfile === "local" ? 12 : 6,
-        maxToolResultTokens: config.activeProfile === "local" ? 1200 : 360,
-        latestUserMessages: config.activeProfile === "local" ? 4 : 2,
+        ...executeRecoveryCompactionLimits,
       },
     );
     callbacks.onContextMemoryBuilt?.(recoveryManagedResult.memoryState, recoveryManagedResult.memoryPacket);
@@ -295,9 +384,16 @@ export function prepareManagedMessagesForIteration(input: {
       iteration,
       executeRecoveryMode,
       executeRecoveryReason,
-      forceReason: contextForceForManagement.reason,
-      estimatedTokens: Math.round(contextForceForManagement.estimatedTokens),
-      tokenPressure: Number(contextForceForManagement.tokenPressure.toFixed(3)),
+      forceReason: contextForceForManagement?.shouldForce
+        ? contextForceForManagement.reason
+        : "pinned_mutation_retry",
+      focusedPinnedMutationRetry,
+      estimatedTokens: contextForceForManagement
+        ? Math.round(contextForceForManagement.estimatedTokens)
+        : null,
+      tokenPressure: contextForceForManagement
+        ? Number(contextForceForManagement.tokenPressure.toFixed(3))
+        : null,
       messagesBefore: recoveryMessagesBefore,
       messagesAfter: managedAgentMessages.length,
       droppedMessageCount: recoveryManagedResult.droppedMessageCount,
@@ -511,11 +607,11 @@ export function prepareManagedMessagesForIteration(input: {
     const lastActivity = recentToolActivity[recentToolActivity.length - 1];
     const failedTarget = lastActivity?.status === "failed" ? lastActivity.target : "";
     const activityObservation = lastActivity?.readFileObservation;
-    const observationKeys = Array.from(new Set([
-      ...executeRecoverySourceObservationKeys,
-      ...(executeRecoverySourceObservationKey ? [executeRecoverySourceObservationKey] : []),
-      ...(activityObservation?.key ? [activityObservation.key] : []),
-    ].map((key) => String(key || "").trim()).filter(Boolean)));
+    const observationKeys = resolveRecoveryContextObservationKeys({
+      leaseObservationKeys: executeRecoverySourceObservationKeys,
+      sourceObservationKey: executeRecoverySourceObservationKey,
+      recentActivityObservationKey: activityObservation?.key,
+    });
     const targetPath = executeRecoveryExpectedTarget || failedTarget;
     // Never substitute "the newest window for this path" for a missing
     // observation identity. That previously pinned an unrelated tail window
@@ -534,7 +630,12 @@ export function prepareManagedMessagesForIteration(input: {
           matchedState.modelContent,
           managedAgentMessages,
         );
-        if (!sourceAlreadyActive) {
+        const sourceStableOutsideNativeToolHistory =
+          isRecoverySourceStableOutsideNativeToolHistory(
+            matchedState.modelContent,
+            managedAgentMessages,
+          );
+        if (!sourceStableOutsideNativeToolHistory) {
           managedAgentMessages = [
             ...managedAgentMessages,
             {
@@ -556,6 +657,7 @@ export function prepareManagedMessagesForIteration(input: {
           windowEndLine: window?.endLine ?? null,
           totalLines: window?.totalLines ?? null,
           sourceAlreadyActive,
+          sourceStableOutsideNativeToolHistory,
           contentChars: matchedState.modelContent.length,
         });
       }
