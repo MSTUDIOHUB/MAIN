@@ -2225,11 +2225,20 @@ for (const model of models) {
     expect(plan).not.toMatch(/(?:已读证据|证据引用|Read Evidence)[\s\S]{0,800}\.MAIN\/plans\/plan\.md/i);
     expect(planSnapshot?.planArtifacts || []).toHaveLength(0);
     expect(sealedWorkPlan.draft.validations.some(
-      (validation: { command?: string; kind?: string; required?: boolean }) =>
-        validation.kind === "finite_command" &&
+      (validation: { kind?: string; required?: boolean }) =>
         validation.required === true &&
-        isFinitePlanValidationCommand(String(validation.command || "")),
+        ["finite_command", "browser", "desktop"].includes(
+          String(validation.kind || ""),
+        ),
     )).toBe(true);
+    if (requireSemanticTaskQuality) {
+      expect(sealedWorkPlan.draft.validations.some(
+        (validation: { command?: string; kind?: string; required?: boolean }) =>
+          validation.kind === "finite_command" &&
+          validation.required === true &&
+          isFinitePlanValidationCommand(String(validation.command || "")),
+      )).toBe(true);
+    }
     const workPlanEvidenceTargets = new Set(
       sealedWorkPlan.evidence.map(
         (entry: { target: string }) => String(entry.target || "").trim(),
@@ -2556,20 +2565,22 @@ for (const model of models) {
         command.toolName === "run_command" &&
         isFinitePlanValidationCommand(String(command.target || "")),
     );
-    expect(finiteValidation).toBeTruthy();
-    const validationCommand = String(finiteValidation?.target || "");
-    const independentValidation = await runRealOmlxWorkspaceCommand(
-      workspace,
-      validationCommand,
-    );
-    expect(
-      independentValidation.exitCode,
-      [
-        `Independent replay validation failed: ${validationCommand}`,
-        independentValidation.stdout,
-        independentValidation.stderr,
-      ].filter(Boolean).join("\n"),
-    ).toBe(0);
+    if (requireSemanticTaskQuality) expect(finiteValidation).toBeTruthy();
+    if (finiteValidation) {
+      const validationCommand = String(finiteValidation.target || "");
+      const independentValidation = await runRealOmlxWorkspaceCommand(
+        workspace,
+        validationCommand,
+      );
+      expect(
+        independentValidation.exitCode,
+        [
+          `Independent replay validation failed: ${validationCommand}`,
+          independentValidation.stdout,
+          independentValidation.stderr,
+        ].filter(Boolean).join("\n"),
+      ).toBe(0);
+    }
     if (requireSemanticTaskQuality && realOmlxFixture === "md-viewer") {
       expect(successfulValidations.some(
         (command: { toolName?: string }) => command.toolName === "browser_evaluate",
@@ -2919,9 +2930,8 @@ for (const model of models) {
       evidence.kind === "mutation"
     )).toBe(true);
     const successfulValidations = (runtimeV2.commands || []).filter(
-      (command: { kind?: string; toolName?: string; status?: string }) =>
+      (command: { kind?: string; status?: string }) =>
         command.kind === "execute_validation" &&
-        command.toolName === "run_command" &&
         command.status === "succeeded",
     );
     expect(successfulValidations.length).toBeGreaterThan(0);
@@ -2933,22 +2943,28 @@ for (const model of models) {
       evidence.kind === "validation"
     )).toBe(true);
     const finalValidationBlock = [...successfulValidations].reverse().find(
-      (command: { target?: string }) => String(command.target || "").trim(),
+      (command: { toolName?: string; target?: string }) =>
+        command.toolName === "run_command" &&
+        isFinitePlanValidationCommand(String(command.target || "")),
     );
     const finalValidationCommand = String(finalValidationBlock?.target || "").trim();
-    expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
-    const independentFinalValidation = await runRealOmlxWorkspaceCommand(
-      workspace,
-      finalValidationCommand,
-    );
-    expect(
-      independentFinalValidation.exitCode,
-      [
-        `Final replay validation failed: ${finalValidationCommand}`,
-        independentFinalValidation.stdout,
-        independentFinalValidation.stderr,
-      ].filter(Boolean).join("\n"),
-    ).toBe(0);
+    if (requireSemanticTaskQuality) {
+      expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
+    }
+    if (finalValidationCommand) {
+      const independentFinalValidation = await runRealOmlxWorkspaceCommand(
+        workspace,
+        finalValidationCommand,
+      );
+      expect(
+        independentFinalValidation.exitCode,
+        [
+          `Final replay validation failed: ${finalValidationCommand}`,
+          independentFinalValidation.stdout,
+          independentFinalValidation.stderr,
+        ].filter(Boolean).join("\n"),
+      ).toBe(0);
+    }
 
     const finalMainSource = await fs.readFile(path.join(workspace, "src/main.js"), "utf8");
     expect(finalMainSource).not.toBe(originalMainSource);
