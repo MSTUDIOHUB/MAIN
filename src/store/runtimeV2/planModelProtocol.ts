@@ -417,6 +417,7 @@ function parseJsonArrayFields(
   record: Record<string, unknown>,
   fields: readonly string[],
   required = false,
+  normalizationReasons?: string[],
 ): readonly unknown[] {
   const field = fields.find((candidate) => record[candidate] !== undefined);
   if (!field) {
@@ -425,12 +426,20 @@ function parseJsonArrayFields(
   }
   const value = record[field];
   if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") {
+    normalizationReasons?.push(`${field}:singleton_object_to_array`);
+    return [value];
+  }
   if (typeof value !== "string") {
     throw new Error(`${field} must be a JSON array string.`);
   }
   const parsed = safeJsonParse(value);
-  if (!Array.isArray(parsed)) throw new Error(`${field} must decode to an array.`);
-  return parsed;
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    normalizationReasons?.push(`${field}:singleton_object_json_to_array`);
+    return [parsed];
+  }
+  throw new Error(`${field} must decode to an array.`);
 }
 
 function parseArrayFields(
@@ -438,25 +447,46 @@ function parseArrayFields(
   directFields: readonly string[],
   legacyJsonFields: readonly string[],
   required = false,
+  normalizationReasons?: string[],
 ): readonly unknown[] {
   const directField = directFields.find((candidate) => record[candidate] !== undefined);
   if (directField) {
     const value = record[directField];
     if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") {
+      normalizationReasons?.push(`${directField}:singleton_object_to_array`);
+      return [value];
+    }
     if (typeof value === "string") {
       const parsed = safeJsonParse(value);
       if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === "object") {
+        normalizationReasons?.push(
+          `${directField}:singleton_object_json_to_array`,
+        );
+        return [parsed];
+      }
     }
     throw new Error(`${directField} must be an array or JSON array string.`);
   }
-  return parseJsonArrayFields(record, legacyJsonFields, required);
+  return parseJsonArrayFields(
+    record,
+    legacyJsonFields,
+    required,
+    normalizationReasons,
+  );
 }
 
 export function workPlanDraftFromSubmission(
   candidate: Record<string, unknown>,
   evidence: readonly WorkPlanRuntimeEvidence[],
   objective: string,
-): { readonly draft: WorkPlanDraftV1; readonly normalized: boolean } {
+): {
+  readonly draft: WorkPlanDraftV1;
+  readonly normalized: boolean;
+  readonly normalizationReasons: readonly string[];
+} {
+  const normalizationReasons: string[] = [];
   const raw = {
     schemaVersion: WORK_PLAN_V1_SCHEMA_VERSION,
     objective: String(objective || candidate.objective || ""),
@@ -470,31 +500,41 @@ export function workPlanDraftFromSubmission(
     findings: parseJsonArrayFields(
       candidate,
       ["findingsJson"],
+      false,
+      normalizationReasons,
     ) as WorkPlanDraftV1["findings"],
     steps: parseArrayFields(
       candidate,
       ["changes"],
       ["changesJson", "stepsJson"],
       true,
+      normalizationReasons,
     ) as readonly Record<string, any>[],
     validations: parseArrayFields(
       candidate,
       ["validations"],
       ["validationJson", "validationsJson"],
       true,
+      normalizationReasons,
     ) as readonly Record<string, any>[],
     risks: parseJsonArrayFields(
       candidate,
       ["risksJson"],
+      false,
+      normalizationReasons,
     ) as WorkPlanDraftV1["risks"],
     assumptions: parseJsonArrayFields(
       candidate,
       ["assumptionsJson"],
+      false,
+      normalizationReasons,
     ) as WorkPlanDraftV1["assumptions"],
     blockingQuestions: parseArrayFields(
       candidate,
       ["questions"],
       ["questionsJson", "blockingQuestionsJson"],
+      false,
+      normalizationReasons,
     ) as WorkPlanDraftV1["blockingQuestions"],
   };
   const knownEvidenceIds = new Set(evidence.map((entry) => entry.id));
@@ -654,6 +694,9 @@ export function workPlanDraftFromSubmission(
   };
   return {
     draft,
-    normalized: JSON.stringify(draft) !== JSON.stringify(raw),
+    normalized:
+      normalizationReasons.length > 0 ||
+      JSON.stringify(draft) !== JSON.stringify(raw),
+    normalizationReasons,
   };
 }

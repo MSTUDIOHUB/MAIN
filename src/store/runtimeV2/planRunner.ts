@@ -672,6 +672,7 @@ export async function runSubmitRuntimeV2Plan(
               evidenceCount: evidence.length,
               stepCount: draft.steps.length,
               validationCount: draft.validations.length,
+              reasons: compiled.normalizationReasons,
             });
           }
           const reviewedPlan = sealWorkPlanV1({

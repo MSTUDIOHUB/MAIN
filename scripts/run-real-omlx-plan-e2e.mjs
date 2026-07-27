@@ -135,6 +135,11 @@ if (preparedWorkspace) {
   }
 }
 console.log(`[real-omlx-plan] 使用已加载模型：${selectedModelIds.join(", ")}（加载状态未改变）`);
+console.log(
+  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1"
+    ? "[real-omlx-plan] 验收模式：Runtime v2 结构一致性 + 可选任务语义质量门禁"
+    : "[real-omlx-plan] 验收模式：Runtime v2 结构一致性（任务语义质量仅记录，不决定成败）",
+);
 
 const cli = path.resolve("node_modules/@playwright/test/cli.js");
 const result = spawnSync(
