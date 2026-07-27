@@ -98,14 +98,25 @@ export function parseAgentRuntimeLog(logText) {
 
 function createRun(event, runIndex) {
   const { payload } = event;
+  const runtimeVersion = event.event.startsWith("store.runtime_v2_")
+    ? "v2"
+    : "v1";
   return {
     runIndex,
+    runtimeVersion,
+    runId: asString(payload.runId),
+    turnId: asString(payload.turnId),
     startedAt: event.timestamp,
     endedAt: event.timestamp,
-    workflowMode: asString(payload.workflowMode),
-    runtimeIntent: asString(payload.runtimeIntent),
+    workflowMode: asString(payload.workflowMode) || asString(payload.strategy),
+    runtimeIntent: asString(payload.runtimeIntent) || asString(payload.strategy),
     iterationLimit: asNonNegativeInteger(payload.maxIterations),
     maxIteration: 0,
+    providerRequests: 0,
+    providerProtocolFailures: 0,
+    providerTransportFailures: 0,
+    providerRequestTimeouts: 0,
+    toolDeadlineExceeded: 0,
     totalToolCalls: 0,
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
@@ -117,9 +128,39 @@ function createRun(event, runIndex) {
     contextPacks: 0,
     forcedContextPacks: 0,
     actualDroppedMessages: 0,
+    subagentRequests: 0,
+    subagentsJoined: 0,
+    recoveryExhaustions: 0,
+    softSignals: 0,
+    validationPasses: 0,
+    validationFailures: 0,
+    invalidValidationAttempts: 0,
+    validationFallbacks: 0,
+    failureReadWindows: 0,
+    sourceMismatchRefreshes: 0,
+    runtimeOwnedSourceRefreshes: 0,
+    normalizedToolBatches: 0,
+    discardedToolCalls: 0,
+    mutationPreflightRejections: 0,
+    oversizedMutationRejections: 0,
+    outsideWorkspaceMutationRejections: 0,
+    correctiveTargetRejections: 0,
+    investigationMutationSurfaceViolations: 0,
+    sourceGapMutationSurfaceViolations: 0,
+    mutationRequestsWithoutLease: 0,
+    mutationEditorFallbacks: 0,
+    maxAvailableContextEntries: 0,
+    maxDroppedContextEntries: 0,
+    contextAnchorLosses: 0,
+    terminalResultKind: null,
+    terminalReason: null,
     toolCallsByName: {},
     stopReasons: {},
     forcedContextReasons: {},
+    executePolicies: {},
+    mutationLeaseAuthorities: {},
+    phaseTransitions: {},
+    projections: {},
     eventCount: 0,
   };
 }
@@ -149,7 +190,24 @@ function isNoActionStop(event) {
 
 function isRuntimeMetricEvent(event) {
   return event.event.startsWith("agent.") ||
-    event.event === "store.non_actionable_stop";
+    event.event === "store.non_actionable_stop" ||
+    event.event.startsWith("store.runtime_v2_");
+}
+
+function recordToolName(run, name, iteration) {
+  if (!name) {
+    run.unclassifiedToolCalls += 1;
+    return;
+  }
+  incrementCounter(run.toolCallsByName, name);
+  if (READ_FILE_TOOL_NAMES.has(name)) run.readFileCalls += 1;
+  if (MUTATION_TOOL_NAMES.has(name)) {
+    run.mutationToolCalls += 1;
+    if (run.firstMutationIteration === null && iteration > 0) {
+      run.firstMutationIteration = iteration;
+    }
+  }
+  if (VALIDATION_TOOL_NAMES.has(name)) run.validationToolCalls += 1;
 }
 
 function applyEventToRun(run, event) {
@@ -165,16 +223,187 @@ function applyEventToRun(run, event) {
     run.unclassifiedToolCalls += Math.max(0, reportedCount - names.length);
 
     for (const name of names) {
-      incrementCounter(run.toolCallsByName, name);
-      if (READ_FILE_TOOL_NAMES.has(name)) run.readFileCalls += 1;
-      if (MUTATION_TOOL_NAMES.has(name)) {
-        run.mutationToolCalls += 1;
-        const iteration = asNonNegativeInteger(payload.iteration);
-        if (run.firstMutationIteration === null && iteration > 0) {
-          run.firstMutationIteration = iteration;
+      recordToolName(run, name, asNonNegativeInteger(payload.iteration));
+    }
+  }
+
+  if (event.event === "store.runtime_v2_provider_request_opened") {
+    run.providerRequests += 1;
+    run.maxIteration = Math.max(run.maxIteration, run.providerRequests);
+  }
+  if (event.event === "store.runtime_v2_provider_protocol_failed") {
+    run.providerProtocolFailures += 1;
+    if (payload.protocolCode === "tool_arguments_rejected") {
+      run.invalidValidationAttempts += 1;
+    }
+  }
+  if (event.event === "store.runtime_v2_provider_transport_failed") {
+    run.providerTransportFailures += 1;
+    if (payload.timedOut === true) run.providerRequestTimeouts += 1;
+  }
+  if (event.event === "store.runtime_v2_tool_deadline_exceeded") {
+    run.toolDeadlineExceeded += 1;
+  }
+  if (event.event === "store.runtime_v2_context_prepared") {
+    run.maxAvailableContextEntries = Math.max(
+      run.maxAvailableContextEntries,
+      asNonNegativeInteger(payload.availableContextEntries),
+    );
+    run.maxDroppedContextEntries = Math.max(
+      run.maxDroppedContextEntries,
+      asNonNegativeInteger(payload.droppedEvidenceEntries),
+    );
+    const available = payload.contextSources &&
+      typeof payload.contextSources === "object"
+      ? payload.contextSources
+      : {};
+    const hasRetainedSources = payload.retainedContextSources &&
+      typeof payload.retainedContextSources === "object";
+    if (hasRetainedSources) {
+      const retained = payload.retainedContextSources;
+      for (const source of ["workspace", "subagent", "plan"]) {
+        if (
+          asNonNegativeInteger(available[source]) > 0 &&
+          asNonNegativeInteger(retained[source]) === 0
+        ) {
+          run.contextAnchorLosses += 1;
         }
       }
-      if (VALIDATION_TOOL_NAMES.has(name)) run.validationToolCalls += 1;
+    }
+    const mode = asString(payload.mode);
+    const executePolicy = asString(payload.executePolicy);
+    if (executePolicy) incrementCounter(run.executePolicies, executePolicy);
+    if (mode === "observe" && payload.mutationToolAvailable === true) {
+      run.investigationMutationSurfaceViolations += 1;
+    }
+    if (
+      executePolicy === "source_gap_allowed" &&
+      payload.mutationToolAvailable === true
+    ) {
+      run.sourceGapMutationSurfaceViolations += 1;
+    }
+    const leaseAuthority = asString(payload.mutationLeaseAuthority);
+    if (leaseAuthority) {
+      incrementCounter(run.mutationLeaseAuthorities, leaseAuthority);
+    }
+    if (
+      executePolicy === "mutation_required" &&
+      payload.mutationToolAvailable === true &&
+      !leaseAuthority &&
+      run.workflowMode !== "plan"
+    ) {
+      run.mutationRequestsWithoutLease += 1;
+    }
+    if (asString(payload.excludedMutationTool)) {
+      run.mutationEditorFallbacks += 1;
+    }
+  }
+
+  if (event.event === "store.runtime_v2_tool_execution_started") {
+    const name = asString(payload.toolName);
+    run.totalToolCalls += 1;
+    recordToolName(
+      run,
+      name,
+      run.providerRequests || run.totalToolCalls,
+    );
+  }
+  if (
+    event.event === "store.runtime_v2_tool_execution_completed" &&
+    payload.commandKind === "execute_validation"
+  ) {
+    if (payload.validationPassed === true) run.validationPasses += 1;
+    else if (payload.validationPassed === false) run.validationFailures += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_tool_execution_blocked" &&
+    payload.reason === "finite_validation_contract_required"
+  ) {
+    run.invalidValidationAttempts += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_tool_execution_blocked" &&
+    (
+      payload.reason === "corrective_mutation_target_mismatch" ||
+      payload.reason === "mutation_target_lease_mismatch" ||
+      payload.reason === "mutation_source_lease_missing"
+    )
+  ) {
+    run.correctiveTargetRejections += 1;
+  }
+  if (event.event === "store.runtime_v2_validation_fallback_selected") {
+    run.validationFallbacks += 1;
+  }
+  if (event.event === "store.runtime_v2_failure_read_window_selected") {
+    run.failureReadWindows += 1;
+    if (
+      payload.failureLabel === "apply_patch" ||
+      payload.failureLabel === "replace_in_file"
+    ) {
+      run.sourceMismatchRefreshes += 1;
+    }
+  }
+  if (event.event === "store.runtime_v2_source_refresh_fallback_selected") {
+    run.runtimeOwnedSourceRefreshes += 1;
+  }
+  if (event.event === "store.runtime_v2_provider_tool_batch_normalized") {
+    run.normalizedToolBatches += 1;
+    run.discardedToolCalls += Array.isArray(payload.discardedToolNames)
+      ? payload.discardedToolNames.length
+      : Math.max(0, asNonNegativeInteger(payload.originalToolCount) - 1);
+  }
+  if (event.event === "store.runtime_v2_mutation_preflight_rejected") {
+    run.mutationPreflightRejections += 1;
+    if (payload.reason === "oversized_change") {
+      run.oversizedMutationRejections += 1;
+    }
+    if (payload.reason === "outside_workspace") {
+      run.outsideWorkspaceMutationRejections += 1;
+    }
+  }
+
+  if (event.event === "store.runtime_v2_subagent_request_opened") {
+    run.subagentRequests += 1;
+  }
+  if (event.event === "store.runtime_v2_subagent_joined") {
+    run.subagentsJoined += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_ledger_committed" &&
+    payload.eventType === "recovery.exhausted"
+  ) {
+    run.recoveryExhaustions += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_ledger_committed" &&
+    payload.eventType === "soft_signal.observed"
+  ) {
+    run.softSignals += 1;
+  }
+  if (event.event === "store.runtime_v2_phase_transition") {
+    incrementCounter(
+      run.phaseTransitions,
+      `${asString(payload.from) || "unknown"}->${asString(payload.to) || "unknown"}`,
+    );
+  }
+  if (event.event === "store.runtime_v2_projection_published") {
+    incrementCounter(
+      run.projections,
+      `${asString(payload.audience) || "unknown"}:${asString(payload.storeDisposition) || "unknown"}`,
+    );
+  }
+  if (event.event === "store.runtime_v2_execute_terminal") {
+    run.terminalResultKind = asString(payload.resultKind);
+    run.terminalReason = asString(payload.reason);
+    incrementCounter(
+      run.stopReasons,
+      `runtime_v2:${run.terminalResultKind || "unknown"}`,
+    );
+    if (
+      asNonNegativeInteger(payload.mutations) === 0 &&
+      run.terminalResultKind !== "success"
+    ) {
+      run.noActionStops += 1;
     }
   }
 
@@ -225,11 +454,45 @@ function buildAggregate(runs) {
     contextPacks: 0,
     forcedContextPacks: 0,
     actualDroppedMessages: 0,
+    providerRequests: 0,
+    providerProtocolFailures: 0,
+    providerTransportFailures: 0,
+    providerRequestTimeouts: 0,
+    toolDeadlineExceeded: 0,
+    subagentRequests: 0,
+    subagentsJoined: 0,
+    recoveryExhaustions: 0,
+    softSignals: 0,
+    validationPasses: 0,
+    validationFailures: 0,
+    invalidValidationAttempts: 0,
+    validationFallbacks: 0,
+    failureReadWindows: 0,
+    sourceMismatchRefreshes: 0,
+    runtimeOwnedSourceRefreshes: 0,
+    normalizedToolBatches: 0,
+    discardedToolCalls: 0,
+    mutationPreflightRejections: 0,
+    oversizedMutationRejections: 0,
+    outsideWorkspaceMutationRejections: 0,
+    correctiveTargetRejections: 0,
+    investigationMutationSurfaceViolations: 0,
+    sourceGapMutationSurfaceViolations: 0,
+    mutationRequestsWithoutLease: 0,
+    mutationEditorFallbacks: 0,
+    maxAvailableContextEntries: 0,
+    maxDroppedContextEntries: 0,
+    contextAnchorLosses: 0,
     workflowModes: {},
     runtimeIntents: {},
+    runtimeVersions: {},
     toolCallsByName: {},
     stopReasons: {},
     forcedContextReasons: {},
+    executePolicies: {},
+    mutationLeaseAuthorities: {},
+    phaseTransitions: {},
+    projections: {},
   };
 
   for (const run of runs) {
@@ -246,9 +509,44 @@ function buildAggregate(runs) {
       "contextPacks",
       "forcedContextPacks",
       "actualDroppedMessages",
+      "providerRequests",
+      "providerProtocolFailures",
+      "providerTransportFailures",
+      "providerRequestTimeouts",
+      "toolDeadlineExceeded",
+      "subagentRequests",
+      "subagentsJoined",
+      "recoveryExhaustions",
+      "softSignals",
+      "validationPasses",
+      "validationFailures",
+      "invalidValidationAttempts",
+      "validationFallbacks",
+      "failureReadWindows",
+      "sourceMismatchRefreshes",
+      "runtimeOwnedSourceRefreshes",
+      "normalizedToolBatches",
+      "discardedToolCalls",
+      "mutationPreflightRejections",
+      "oversizedMutationRejections",
+      "outsideWorkspaceMutationRejections",
+      "correctiveTargetRejections",
+      "investigationMutationSurfaceViolations",
+      "sourceGapMutationSurfaceViolations",
+      "mutationRequestsWithoutLease",
+      "mutationEditorFallbacks",
+      "contextAnchorLosses",
     ]) {
       aggregate[field] += run[field];
     }
+    aggregate.maxAvailableContextEntries = Math.max(
+      aggregate.maxAvailableContextEntries,
+      run.maxAvailableContextEntries,
+    );
+    aggregate.maxDroppedContextEntries = Math.max(
+      aggregate.maxDroppedContextEntries,
+      run.maxDroppedContextEntries,
+    );
     if (run.firstMutationIteration !== null) {
       aggregate.runsWithMutation += 1;
       aggregate.firstMutationIteration = aggregate.firstMutationIteration === null
@@ -257,7 +555,16 @@ function buildAggregate(runs) {
     }
     incrementCounter(aggregate.workflowModes, run.workflowMode || "unknown");
     incrementCounter(aggregate.runtimeIntents, run.runtimeIntent || "unknown");
-    for (const field of ["toolCallsByName", "stopReasons", "forcedContextReasons"]) {
+    incrementCounter(aggregate.runtimeVersions, run.runtimeVersion || "unknown");
+    for (const field of [
+      "toolCallsByName",
+      "stopReasons",
+      "forcedContextReasons",
+      "executePolicies",
+      "mutationLeaseAuthorities",
+      "phaseTransitions",
+      "projections",
+    ]) {
       for (const [key, count] of Object.entries(run[field])) {
         incrementCounter(aggregate[field], key, count);
       }
@@ -270,6 +577,7 @@ function buildAggregate(runs) {
 export function analyzeAgentRuntimeEvents(events) {
   const runs = [];
   let currentRun = null;
+  const runtimeV2Runs = new Map();
 
   for (const event of events) {
     if (!event || typeof event !== "object") continue;
@@ -277,13 +585,37 @@ export function analyzeAgentRuntimeEvents(events) {
       currentRun = createRun(event, runs.length + 1);
       runs.push(currentRun);
     }
-    if (currentRun && isRuntimeMetricEvent(event)) {
-      applyEventToRun(currentRun, event);
+    const runtimeV2RunId = event.event.startsWith("store.runtime_v2_")
+      ? asString(event.payload?.runId)
+      : null;
+    if (
+      event.event === "store.runtime_v2_execute_admitted" &&
+      runtimeV2RunId &&
+      !runtimeV2Runs.has(runtimeV2RunId)
+    ) {
+      const run = createRun(event, runs.length + 1);
+      runtimeV2Runs.set(runtimeV2RunId, run);
+      runs.push(run);
+    }
+    if (
+      runtimeV2RunId &&
+      event.event.startsWith("store.runtime_v2_") &&
+      !runtimeV2Runs.has(runtimeV2RunId)
+    ) {
+      const run = createRun(event, runs.length + 1);
+      runtimeV2Runs.set(runtimeV2RunId, run);
+      runs.push(run);
+    }
+    const targetRun = runtimeV2RunId
+      ? runtimeV2Runs.get(runtimeV2RunId)
+      : currentRun;
+    if (targetRun && isRuntimeMetricEvent(event)) {
+      applyEventToRun(targetRun, event);
     }
   }
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runs,
     aggregate: buildAggregate(runs),
   };

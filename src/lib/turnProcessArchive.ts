@@ -136,6 +136,13 @@ function isProgressBlock(block: any): boolean {
   return block?.type === "progress";
 }
 
+function isDurableRuntimeV2TimelineStep(step: Pick<TurnArchiveStep, "items">): boolean {
+  return step.items.some((item) =>
+    isProgressBlock(item) &&
+    String(item.dedupeKey || "").startsWith("runtime-v2-timeline:")
+  );
+}
+
 function getLatestThoughtBlock(blocks: any[]): any | null {
   return [...blocks].reverse().find(isThoughtBlock) || null;
 }
@@ -194,7 +201,15 @@ function isContextPhase(kind: TurnArchiveStepKind): boolean {
 
 function getToolStepKind(block: any): TurnArchiveStepKind {
   const semanticToolName = getSemanticToolName(block);
-  if (hasTerminalMutationDiff(block) && EDIT_ACTIVITY_TOOL_NAMES.has(semanticToolName)) {
+  const status = mapToolStatus(block);
+  if (
+    EDIT_ACTIVITY_TOOL_NAMES.has(semanticToolName) &&
+    (
+      hasTerminalMutationDiff(block) ||
+      status === "failed" ||
+      status === "rejected"
+    )
+  ) {
     return "edit";
   }
   const phase = deriveToolPhase({
@@ -550,10 +565,12 @@ function isActivityCachedResult(block: any): boolean {
 function classifyToolActivityKind(
   toolName: string,
   status: TurnArchiveStepStatus,
-  hasMutationDiff = false,
 ): ActivityCellKind {
   if (status === "failed" || status === "rejected") {
-    if (hasMutationDiff && EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
+    // A rejected edit is still an edit attempt even when the preflight
+    // correctly prevented a diff. Calling it a generic blocked/paused step
+    // falsely implies that the whole Turn stopped.
+    if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
     return isExploringToolName(toolName) ? "exploring" : "blocked";
   }
   if (isExploringToolName(toolName)) return "exploring";
@@ -570,14 +587,16 @@ function classifyBlockActivityKind(block: any): ActivityCellKind {
   if (isReviewablePlanBlock(block)) return "plan";
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
-    return classifyToolActivityKind(getSemanticToolName(block), status, hasTerminalMutationDiff(block));
+    return classifyToolActivityKind(getSemanticToolName(block), status);
   }
   if (isProgressBlock(block)) {
     const toolName = getSemanticToolName(block);
-    if (toolName) return classifyToolActivityKind(toolName, mapProgressStatus(block));
     const phase = String(block.phase || "");
+    if (phase === "verifying") {
+      return toolName === "browser_evaluate" ? "browser" : "command";
+    }
+    if (toolName) return classifyToolActivityKind(toolName, mapProgressStatus(block));
     if (phase === "editing") return "edit";
-    if (phase === "verifying") return "command";
     if (phase === "blocked") return "blocked";
     return phase === "investigating" ? "exploring" : "message";
   }
@@ -827,7 +846,7 @@ function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, lan
   const failed = status === "failed" || status === "rejected";
   if (language === "en") {
     if (kind === "exploring") return failed ? "Exploration blocked" : running ? "Exploring" : "Explored";
-    if (kind === "edit") return failed ? "Edit blocked" : running ? "Editing" : "Edited";
+    if (kind === "edit") return failed ? "Edit not applied" : running ? "Editing" : "Edited";
     if (kind === "browser") return failed ? "Browser validation blocked" : running ? "Validating in browser" : "Validated in browser";
     if (kind === "command") return failed ? "Command blocked" : running ? "Running command" : "Ran";
     if (kind === "plan") return running ? "Preparing plan" : "Proposed plan";
@@ -837,7 +856,7 @@ function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, lan
     return running ? "Working" : "Recorded";
   }
   if (kind === "exploring") return failed ? "探索受阻" : running ? "正在探索" : "已探索";
-  if (kind === "edit") return failed ? "编辑受阻" : running ? "正在编辑" : "已编辑";
+  if (kind === "edit") return failed ? "修改未应用" : running ? "正在编辑" : "已编辑";
   if (kind === "browser") return failed ? "浏览器验证受阻" : running ? "正在浏览器验证" : "已执行浏览器验证";
   if (kind === "command") return failed ? "命令受阻" : running ? "正在运行命令" : "已运行";
   if (kind === "plan") return running ? "正在整理计划" : "已生成计划";
@@ -961,6 +980,11 @@ function buildActivityCellFromItems(
     targets,
   };
   const summary = makeActivitySummary({ ...provisional, items }, language);
+  const validationDidNotPass =
+    status === "failed" &&
+    items.some((item) =>
+      isProgressBlock(item) && String(item.phase || "") === "verifying"
+    );
   if (planRuntimePhase) {
     const label = planRuntimeArchiveGroupLabel(planRuntimePhase, language);
     const planKind = planRuntimeArchiveKind(planRuntimePhase);
@@ -1005,7 +1029,9 @@ function buildActivityCellFromItems(
     kind: firstKind,
     status,
     purposeKey: activityPurposeKey(firstKind, items.find(isToolBlock) || items[0] || {}, language),
-    label: activityVerb(firstKind, status, language),
+    label: validationDidNotPass
+      ? language === "zh" ? "验证未通过" : "Validation did not pass"
+      : activityVerb(firstKind, status, language),
     title: makeActivityTitle({ ...provisional, items }, language),
     summary: latestEvidence ? compactLine(`${summary}${summary ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${latestEvidence}`, 240) : summary,
     targets,
@@ -1389,6 +1415,9 @@ function isToolStrategyStep(step: TurnArchiveStep): boolean {
 
 function canMergeStrategyStep(current: TurnArchiveStep | null, next: TurnArchiveStep, pendingNote: string): boolean {
   if (!current) return false;
+  if (isDurableRuntimeV2TimelineStep(current) || isDurableRuntimeV2TimelineStep(next)) {
+    return false;
+  }
   if (!isToolStrategyStep(current) || !isToolStrategyStep(next)) return false;
   if (current.status !== next.status) return false;
   if (current.status === "failed" || current.status === "rejected") return false;
@@ -1644,6 +1673,11 @@ function attachActivityToStep(step: TurnArchiveStep, language: ToolPresentationL
 
 function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnArchiveStep): boolean {
   if (!current?.activity || !next.activity) return false;
+  // Runtime v2 emits one durable progress record per concrete command. Those
+  // rows are historical facts, not a replaceable "current phase" summary.
+  if (isDurableRuntimeV2TimelineStep(current) || isDurableRuntimeV2TimelineStep(next)) {
+    return false;
+  }
   if (current.kind === "thinking" || next.kind === "thinking") return false;
   if (current.kind === "message" || next.kind === "message") return false;
   if (
@@ -1707,7 +1741,10 @@ function makeStep(input: {
 
   if (isProgressBlock(block)) {
     const status = mapProgressStatus(block);
-    const kind = status === "failed" ? "blocked" : getProgressStepKind(String(block.phase || ""));
+    const progressKind = getProgressStepKind(String(block.phase || ""));
+    const kind = status === "failed" && progressKind !== "verify"
+      ? "blocked"
+      : progressKind;
     const targets = uniqueTargets([block], language);
     const sourceItem = block && typeof block === "object" ? { ...block, sourceIndex: index } : block;
     return {

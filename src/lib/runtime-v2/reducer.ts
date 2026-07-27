@@ -13,6 +13,7 @@ import {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import {
+  canOpenRuntimeV2RecoveryEpoch,
   canRecordRuntimeV2Recovery,
   emptyRuntimeV2RecoveryBudget,
   exhaustRuntimeV2Recovery,
@@ -527,7 +528,11 @@ export function tryTransition(
           scheduledCommands: completion.scheduledCommands,
           completedCommands: appendCommandReceipt(
             state.completedCommands,
-            commandReceipt(completion.command, event.passed ? "succeeded" : "failed", event.at),
+            // The validation command itself completed successfully even when
+            // the acceptance check did not pass. `event.passed` is the
+            // semantic result; command failure is reserved for a validator
+            // that could not be executed or authorized.
+            commandReceipt(completion.command, "succeeded", event.at),
           ),
           evidence: appendEvidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
@@ -593,6 +598,9 @@ export function tryTransition(
       if (event.evidence.length === 0) return rejection(state, "recovery_evidence_required");
       if (!hasNovelEvidence(state.evidence, event.evidence)) {
         return rejection(state, "recovery_evidence_not_novel");
+      }
+      if (!canOpenRuntimeV2RecoveryEpoch(state.recovery)) {
+        return rejection(state, "recovery_limit_exceeded");
       }
       return {
         disposition: "applied",

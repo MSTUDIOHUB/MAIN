@@ -31,6 +31,9 @@ export interface ApplyPatchPreview {
   ok: boolean;
   changes: ApplyPatchPreviewChange[];
   error?: string;
+  /** Stable recovery semantics for callers. Callers must not infer control
+   * flow from the human-readable error string. */
+  failureKind?: "target_unavailable" | "source_mismatch" | "invalid_patch";
 }
 
 export interface ApplyPatchIo {
@@ -292,7 +295,14 @@ export async function previewApplyPatch(
   probePath?: (path: string) => Promise<ApplyPatchPathAvailability>,
 ): Promise<ApplyPatchPreview> {
   const parsed = parseApplyPatch(patch);
-  if (!parsed.ok) return { ok: false, changes: [], error: parsed.error };
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      changes: [],
+      error: parsed.error,
+      failureKind: "invalid_patch",
+    };
+  }
 
   const changes: ApplyPatchPreviewChange[] = [];
   const staged = new Map<string, string | null>();
@@ -344,6 +354,7 @@ export async function previewApplyPatch(
           ok: false,
           changes: [],
           error: `Add File target availability could not be verified: ${operation.path}`,
+          failureKind: "target_unavailable",
         };
       }
       const next = operation.content || "";
@@ -356,7 +367,12 @@ export async function previewApplyPatch(
     if (operation.kind === "delete") {
       const current = await readCurrent(operation.path);
       if (!current.existed) {
-        return { ok: false, changes: [], error: `Delete File target does not exist: ${operation.path}` };
+        return {
+          ok: false,
+          changes: [],
+          error: `Delete File target does not exist: ${operation.path}`,
+          failureKind: "target_unavailable",
+        };
       }
       staged.set(operation.path, null);
       changes.push({ path: operation.path, kind: "delete", oldContent: current.content, newContent: "", existed: true });
@@ -365,13 +381,23 @@ export async function previewApplyPatch(
 
     const current = await readCurrent(operation.path);
     if (!current.existed) {
-      return { ok: false, changes: [], error: `Update File target does not exist: ${operation.path}` };
+      return {
+        ok: false,
+        changes: [],
+        error: `Update File target does not exist: ${operation.path}`,
+        failureKind: "target_unavailable",
+      };
     }
     let next = current.content;
     for (const hunk of operation.hunks) {
       const updated = replaceFirstExact(next, hunk.oldText, hunk.newText);
       if (updated == null) {
-        return { ok: false, changes: [], error: `Patch context was not found in ${operation.path}.` };
+        return {
+          ok: false,
+          changes: [],
+          error: `Patch context was not found in ${operation.path}.`,
+          failureKind: "source_mismatch",
+        };
       }
       next = updated;
     }
@@ -399,6 +425,7 @@ export async function previewApplyPatch(
           ok: false,
           changes: [],
           error: `Move destination availability could not be verified: ${operation.newPath}`,
+          failureKind: "target_unavailable",
         };
       }
       staged.set(operation.path, null);

@@ -27,6 +27,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   getMdViewerExecutionGaps,
   getMdViewerFinalSummaryGaps,
+  getNewUndeclaredCallGaps,
   getMdViewerReadablePlanGaps,
   getMdViewerTypedPlanGaps,
   getMdViewerWorkPlanGaps,
@@ -314,6 +315,30 @@ test("MD Viewer execution oracle accepts the exact four-owner incident closure",
   assert.deepEqual(getMdViewerExecutionGaps(executionSources()), []);
 });
 
+test("MD Viewer execution oracle accepts a guarded findIndex replacement", () => {
+  const sources = executionSources();
+  sources.caller = sources.caller.replace(
+    `        if (
+          activeFiles.length === 1 &&
+          !activeFiles[0].path &&
+          activeFiles[0].content === '' &&
+          activeFiles[0].isDirty === false
+        ) {
+          activeFiles[0] = fileEntry;
+          updateTabTitle(0);
+        } else {`,
+    `        const pristineIndex = activeFiles.findIndex(
+          file => !file.path && !file.isDirty && (!file.content || file.content.trim() === '')
+        );
+        if (pristineIndex !== -1) {
+          activeFiles[pristineIndex] = fileEntry;
+          updateTabTitle(pristineIndex, fileEntry.title);
+        } else {`,
+  );
+
+  assert.deepEqual(getMdViewerExecutionGaps(sources), []);
+});
+
 test("MD Viewer execution oracle rejects the original blank-tab, autosave, and Tauri payload defects", () => {
   const sources = executionSources();
   sources.editor = `
@@ -382,6 +407,75 @@ test("MD Viewer execution oracle rejects post-fix API drift", () => {
   assert.ok(gaps.some((gap) => gap.includes(
     "read_file_content must preserve the Rust handler's external path key",
   )));
+});
+
+test("MD Viewer execution oracle preserves the canonical tab host", () => {
+  const sources = executionSources();
+  sources.editor = `
+    export function renderEditor() {
+      editorPanel.innerHTML = '<textarea id="editor"></textarea>';
+    }
+    editor.setValue = function(value) {
+      this.value = value;
+    };
+  `;
+  assert.ok(getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+    "preserve the existing tabs-container host",
+  )));
+  sources.editor = sources.editor.replace(
+    "<textarea id=\"editor\"></textarea>",
+    "<div id=\"tabs-container\"></div><textarea id=\"editor\"></textarea>",
+  );
+  assert.equal(
+    getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+      "preserve the existing tabs-container host",
+    )),
+    false,
+  );
+});
+
+test("MD Viewer execution oracle rejects a disconnected save helper", () => {
+  const sources = executionSources();
+  sources.caller += `
+    async function saveFileContent(filePath, content) {
+      await invoke('save_file_content', { filePath, content });
+    }
+  `;
+  assert.ok(getMdViewerExecutionGaps(sources).some((gap) => gap.includes(
+    "remove the unused saveFileContent helper",
+  )));
+});
+
+test("MD Viewer execution oracle catches newly invented undeclared calls", () => {
+  const before = `
+    function updateTabTitle(index) { return index; }
+    updateTabTitle(0);
+  `;
+  const after = `
+    function updateTabTitle(index) { return index; }
+    updateTabTitle(0);
+    updateTabContent(0);
+  `;
+  assert.deepEqual(getNewUndeclaredCallGaps({
+    path: "src/main.js",
+    before,
+    after,
+  }), [
+    "src/main.js:4:1 - new call updateTabContent() has no local declaration or import; remove the invented dependency or bind it to an existing API",
+  ]);
+  assert.deepEqual(getNewUndeclaredCallGaps({
+    path: "src/main.js",
+    before,
+    after: `${after}\nfunction updateTabContent(index) { return index; }`,
+  }), []);
+  assert.deepEqual(getNewUndeclaredCallGaps({
+    path: "src/main.js",
+    before,
+    after: `${before}
+      // content is set programmatically (for example, while opening a file)
+      const note = "another apparentCall() is documentation";
+    `,
+  }), []);
 });
 
 test("MD Viewer execution oracle points a bad later save payload at the offending invoke", () => {

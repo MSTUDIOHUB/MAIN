@@ -621,27 +621,41 @@ function Heading({
   children,
   baseFontSize = 13,
   sourceId,
+  compact = false,
 }: {
   level: number;
   children: React.ReactNode;
   baseFontSize?: number;
   sourceId?: string;
+  compact?: boolean;
 }) {
-  const sizes: Record<number, number> = {
-    1: baseFontSize * 1.85,
-    2: baseFontSize * 1.45,
-    3: baseFontSize * 1.25,
-    4: baseFontSize * 1.12,
-    5: baseFontSize * 1.02,
-    6: baseFontSize * 0.94,
-  };
+  const sizes: Record<number, number> = compact
+    ? {
+        1: baseFontSize * 1.28,
+        2: baseFontSize * 1.18,
+        3: baseFontSize * 1.08,
+        4: baseFontSize * 1.04,
+        5: baseFontSize,
+        6: baseFontSize * 0.96,
+      }
+    : {
+        1: baseFontSize * 1.85,
+        2: baseFontSize * 1.45,
+        3: baseFontSize * 1.25,
+        4: baseFontSize * 1.12,
+        5: baseFontSize * 1.02,
+        6: baseFontSize * 0.94,
+      };
   const text = collectText(children);
   const id = sourceId && text ? `md-${sourceId}-${slugify(text)}` : undefined;
 
   return (
     <div
       id={id}
-      className="group mt-6 mb-3 first:mt-0 font-semibold text-[#f5f5f5]"
+      data-markdown-heading-level={level}
+      className={`group first:mt-0 text-[#f5f5f5] ${
+        compact ? "mt-4 mb-2 font-medium" : "mt-6 mb-3 font-semibold"
+      }`}
       style={{ fontSize: `${Math.round((sizes[level] || sizes[3]) * 10) / 10}px` }}
     >
       {children}
@@ -731,22 +745,25 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
   baseFontSize = 13,
   sourceId,
+  presentation = "document",
 }: {
   content: string;
   baseFontSize?: number;
   sourceId?: string;
+  presentation?: "document" | "assistant_update";
 }) {
   const normalized = useMemo(() => normalizeMarkdownForDisplay(content), [content]);
+  const compact = presentation === "assistant_update";
 
   const components = useMemo(() => ({
     code: (props: any) => <CodeBlock {...props} baseFontSize={baseFontSize} />,
     pre: PreBlock,
-    h1: ({ children }: any) => <Heading level={1} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
-    h2: ({ children }: any) => <Heading level={2} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
-    h3: ({ children }: any) => <Heading level={3} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
-    h4: ({ children }: any) => <Heading level={4} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
-    h5: ({ children }: any) => <Heading level={5} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
-    h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h1: ({ children }: any) => <Heading level={1} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
+    h2: ({ children }: any) => <Heading level={2} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
+    h3: ({ children }: any) => <Heading level={3} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
+    h4: ({ children }: any) => <Heading level={4} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
+    h5: ({ children }: any) => <Heading level={5} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
+    h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
     p: ({ children }: any) => <p className="mb-3 whitespace-pre-wrap last:mb-0 text-[#d4d4d8]">{children}</p>,
     a: ({ href, children }: any) => (
       <a href={href} target="_blank" rel="noopener noreferrer" className="theme-text underline underline-offset-4 transition-opacity hover:opacity-80" style={{ textDecorationColor: "var(--accent-subtle-border)" }}>
@@ -770,7 +787,11 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     td: ({ children }: any) => (
       <td className="border-b px-4 py-3 align-top" style={{ borderColor: "var(--surface-border-soft)", color: "var(--surface-text)" }}>{children}</td>
     ),
-    strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
+    strong: ({ children }: any) => (
+      <strong className={compact ? "font-medium text-[var(--surface-text-strong)]" : "font-semibold text-white"}>
+        {children}
+      </strong>
+    ),
     em: ({ children }: any) => <em className="theme-plan-text italic">{children}</em>,
     sup: ({ children }: any) => <sup className="rounded-full bg-[var(--accent-subtle)] px-1 text-[0.75em] theme-text">{children}</sup>,
     section: ({ children, className }: any) => (
@@ -786,12 +807,13 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
         </span>
       );
     },
-  }), [baseFontSize, normalized, sourceId]);
+  }), [baseFontSize, compact, normalized, sourceId]);
 
   if (!normalized) return null;
 
   return (
     <div
+      data-markdown-presentation={presentation}
       className="markdown-body break-words text-[#e4e4e7] [overflow-wrap:anywhere]"
       style={{
         fontSize: `${baseFontSize}px`,

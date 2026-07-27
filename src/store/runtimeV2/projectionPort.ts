@@ -13,6 +13,7 @@ import type {
   RuntimeV2ResultKind,
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
+import { reconcileRuntimeV2SubagentEvents } from "./subagentProjection";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -198,6 +199,11 @@ function reconcileRuntimeV2TimelineBlocks(
   const receipts = new Map(
     aggregate.completedCommands.map((receipt) => [receipt.idempotencyKey, receipt.status] as const),
   );
+  const validationOutcomes = new Map(
+    aggregate.events
+      .filter((event) => event.type === "validation.completed")
+      .map((event) => [event.idempotencyKey, event.passed] as const),
+  );
   return taskFlow.flatMap((block) => {
     if (
       block.type !== "progress" ||
@@ -213,11 +219,19 @@ function reconcileRuntimeV2TimelineBlocks(
     // projection. Remove only its provisional UI row instead of relabeling it
     // as either a successful or failed operation.
     if (receipt === "canceled") return [];
+    const validationPassed = block.toolCallId
+      ? validationOutcomes.get(block.toolCallId)
+      : undefined;
+    const failed = receipt === "failed" || validationPassed === false;
     return [{
       ...block,
-      status: receipt === "succeeded" ? "done" as const : "failed" as const,
-      evidence: receipt === "succeeded"
+      status: failed ? "failed" as const : "done" as const,
+      evidence: !failed
         ? ""
+        : validationPassed === false
+          ? language === "zh"
+            ? "有限验证未通过；运行时将根据已保留的失败证据继续修复。"
+            : "Validation did not pass; Runtime will continue from the retained failure evidence."
         : language === "zh"
           ? "该结构化动作已记录为失败，运行时将从已保留的证据继续恢复。"
           : "The structured action was recorded as failed; recovery will continue from retained evidence.",
@@ -349,6 +363,12 @@ export function createRuntimeV2ProjectionPort(
           state.runtimeEvents || [],
           aggregate,
           timestampMs,
+        );
+        runtimeEvents = reconcileRuntimeV2SubagentEvents(
+          runtimeEvents,
+          aggregate,
+          state,
+          input.language,
         );
         let taskFlow = state.taskFlow || [];
         let conversationTurns = state.conversationTurns || [];
@@ -552,6 +572,13 @@ export function createRuntimeV2ProjectionPort(
         return { runtimeEvents, taskFlow, conversationTurns };
       });
       const accepted = storeDisposition !== "owner_mismatch";
+      const projectedState = input.get();
+      const projectedRuntimeEvents = Array.isArray(projectedState?.runtimeEvents)
+        ? projectedState.runtimeEvents as MainThreadEvent[]
+        : [];
+      const projectedTaskFlow = Array.isArray(projectedState?.taskFlow)
+        ? projectedState.taskFlow as TaskBlock[]
+        : [];
       input.logStoreEvent(
         accepted
           ? "runtime_v2_projection_published"
@@ -562,6 +589,25 @@ export function createRuntimeV2ProjectionPort(
           turnId: run.turnId,
           runId: run.runId,
           storeDisposition,
+          projectionKind: projection.kind,
+          dedupeKey: projection.dedupeKey.slice(0, 240),
+          dedupeKeyChars: projection.dedupeKey.length,
+          markdownChars: projection.markdown.length,
+          projectionTitle: projection.markdown
+            .split("\n")[0]
+            ?.replace(/^#+\s*/, "")
+            .trim()
+            .slice(0, 240) || "",
+          timelineRecordCount: projectedTaskFlow.filter((block) =>
+            block.type === "progress" &&
+            block.turnId === run.turnId &&
+            block.runId === run.runId &&
+            String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+          ).length,
+          subagentRecordCount: projectedRuntimeEvents.filter((event) =>
+            event.type === "subagent.created" &&
+            event.turnId === run.turnId
+          ).length,
         },
       );
     },

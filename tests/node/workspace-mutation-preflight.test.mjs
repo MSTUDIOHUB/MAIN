@@ -71,6 +71,7 @@ test("replace_in_file preflight blocks mismatched search_text before review", as
 
   assert.equal(result.ok, false);
   assert.equal(result.reason, "search_text_mismatch");
+  assert.equal(result.recoveryKind, "source_mismatch");
   assert.match(result.message || "", /当前版本化源码观察/);
   assert.match(result.message || "", /文件版本变化|缺少精确范围/);
 });
@@ -162,6 +163,17 @@ test("write_file preflight blocks missing or identical content", async () => {
   assert.equal(identical.ok, false);
   assert.equal(identical.reason, "identical_content");
 
+  const overwrite = await preflightWorkspaceMutation({
+    toolName: "write_file",
+    args: { path: "src/hooks/useCsvParser.ts", content: "replacement" },
+    language: "en",
+    readFile: async () => "existing",
+  });
+
+  assert.equal(overwrite.ok, false);
+  assert.equal(overwrite.reason, "existing_file_requires_patch");
+  assert.match(overwrite.message || "", /replace_in_file|apply_patch/);
+
   const create = await preflightWorkspaceMutation({
     toolName: "write_file",
     args: { path: "new-file.ts", content: "new" },
@@ -170,6 +182,123 @@ test("write_file preflight blocks missing or identical content", async () => {
   });
 
   assert.equal(create.ok, true);
+});
+
+test("mutation preflight rejects external and traversing targets before reading", async () => {
+  let reads = 0;
+  const outside = await preflightWorkspaceMutation({
+    toolName: "write_file",
+    args: { path: "/tmp/generated-source.js", content: "unsafe" },
+    workspaceRoot: "/fixture",
+    language: "zh",
+    readFile: async () => {
+      reads += 1;
+      throw new Error("must not read");
+    },
+  });
+  assert.equal(outside.ok, false);
+  assert.equal(outside.reason, "outside_workspace");
+  assert.equal(outside.recoveryKind, "target_invalid");
+  assert.equal(reads, 0);
+
+  const traversalPatch = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: ../outside.js",
+        "@@",
+        "-old",
+        "+new",
+        "*** End Patch",
+      ].join("\n"),
+    },
+    workspaceRoot: "/fixture",
+    language: "en",
+    readFile: async () => {
+      reads += 1;
+      return "old";
+    },
+  });
+  assert.equal(traversalPatch.ok, false);
+  assert.equal(traversalPatch.reason, "outside_workspace");
+  assert.equal(traversalPatch.recoveryKind, "target_invalid");
+  assert.equal(reads, 0);
+});
+
+test("mutation preflight rejects whole-file rewrites but permits focused edits", async () => {
+  const source = Array.from(
+    { length: 1_000 },
+    (_, index) => `const line${index} = ${index};`,
+  ).join("\n");
+  const rewrite = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/main.js",
+      search_text: source,
+      replace_text: "const replacement = true;\n",
+    },
+    language: "zh",
+    readFile: async () => source,
+  });
+  assert.equal(rewrite.ok, false);
+  assert.equal(rewrite.reason, "oversized_change");
+  assert.equal(rewrite.recoveryKind, "mutation_rejected");
+
+  const focused = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/main.js",
+      search_text: "const line500 = 500;",
+      replace_text: "const line500 = 501;",
+    },
+    language: "zh",
+    readFile: async () => source,
+  });
+  assert.equal(focused.ok, true);
+
+  const patch = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: src/main.js",
+        "@@",
+        "-const line500 = 500;",
+        "+const line500 = 501;",
+        "*** End Patch",
+      ].join("\n"),
+    },
+    language: "zh",
+    readFile: async () => source,
+  });
+  assert.equal(patch.ok, true);
+
+  const oversizedCorrectivePatch = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: src/main.js",
+        "@@",
+        "-const line500 = 500;",
+        ...Array.from(
+          { length: 49 },
+          (_, index) => `+const repair${index} = ${index};`,
+        ),
+        "*** End Patch",
+      ].join("\n"),
+    },
+    language: "zh",
+    maxTouchedLines: 48,
+    readFile: async () => source,
+  });
+  assert.equal(oversizedCorrectivePatch.ok, false);
+  assert.equal(oversizedCorrectivePatch.reason, "oversized_change");
+  assert.equal(
+    oversizedCorrectivePatch.recoveryKind,
+    "mutation_rejected",
+  );
 });
 
 test("apply_patch preflight blocks invalid, no-op, and mismatched patches before review", async () => {
@@ -182,6 +311,7 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
 
   assert.equal(invalid.ok, false);
   assert.equal(invalid.reason, "invalid_patch");
+  assert.equal(invalid.recoveryKind, "source_mismatch");
   assert.equal(invalid.path, "src/App.tsx");
   assert.match(invalid.message || "", /active source observation/);
   assert.doesNotMatch(invalid.message || "", /Read the current file once/);
@@ -194,6 +324,46 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
   });
 
   assert.equal(valid.ok, true);
+});
+
+test("missing mutation targets request workspace reorientation instead of rereading the invented path", async () => {
+  const replace = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/invented.ts",
+      search_text: "old",
+      replace_text: "new",
+    },
+    workspaceRoot: "/fixture",
+    language: "en",
+    readFile: async () => {
+      throw new Error("not found");
+    },
+  });
+  assert.equal(replace.reason, "read_failed");
+  assert.equal(replace.recoveryKind, "target_invalid");
+
+  const patch = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: src/invented.ts",
+        "@@",
+        "-old",
+        "+new",
+        "*** End Patch",
+      ].join("\n"),
+    },
+    workspaceRoot: "/fixture",
+    language: "en",
+    readFile: async () => {
+      throw new Error("not found");
+    },
+  });
+  assert.equal(patch.reason, "invalid_patch");
+  assert.equal(patch.recoveryKind, "target_invalid");
+  assert.equal(patch.patchRecoveryMismatch, undefined);
 });
 
 test("patch mismatch preflight carries target, range, and current-version identity", async () => {

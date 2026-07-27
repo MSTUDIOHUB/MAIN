@@ -769,26 +769,14 @@ html[data-theme="light"] #root {
   flex-direction: column;
   position: relative;
   z-index: 10;
-  scrollbar-width: thin; /* Firefox */
-  scrollbar-color: var(--accent-light, #a855f7) transparent;
+  /* Keep wheel/touch scrolling for review controls without drawing a second
+   * rail inside the compact live surface. */
+  scrollbar-width: none;
 }
 
 .agent-explanation-scroll-container::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
-}
-
-.agent-explanation-scroll-container::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.agent-explanation-scroll-container::-webkit-scrollbar-thumb {
-  background: var(--accent-light, #a855f7);
-  border-radius: 9999px;
-}
-
-.agent-explanation-scroll-container::-webkit-scrollbar-thumb:hover {
-  background: var(--accent, #9333ea);
+  width: 0;
+  height: 0;
 }
 
 /* Conversational live guidance owns the Capsule's primary text surface.

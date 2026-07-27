@@ -12,21 +12,41 @@ function markdownCode(value: unknown): string {
   return text ? `\`${text}\`` : "当前工作区";
 }
 
-function readTarget(command: RuntimeV2Command): string {
+function workspaceRelativeTarget(value: unknown, workspaceKey = ""): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/\\/g, "/");
+  const workspace = workspaceKey.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (workspace && normalized.startsWith(`${workspace}/`)) {
+    return normalized.slice(workspace.length + 1);
+  }
+  if (/^\//.test(normalized)) {
+    const sourceSuffix = normalized.match(
+      /(?:^|\/)((?:src-tauri|src|tests?|scripts?|packages?|apps?|lib)\/.+)$/,
+    )?.[1];
+    return sourceSuffix || normalized.split("/").filter(Boolean).pop() || raw;
+  }
+  return raw;
+}
+
+function readTarget(command: RuntimeV2Command, workspaceKey = ""): string {
   const args = command.payload.arguments;
   const record = args && typeof args === "object" && !Array.isArray(args)
     ? args as Record<string, unknown>
     : {};
-  return markdownCode(record.path || record.file || record.query || command.payload.target);
+  return markdownCode(workspaceRelativeTarget(
+    record.path || record.file || record.query || command.payload.target,
+    workspaceKey,
+  ));
 }
 
 function actionMarkdown(
   command: RuntimeV2Command,
-  strategy?: TurnAggregateV1["strategy"],
+  context?: Pick<TurnAggregateV1, "strategy" | "turn">,
 ): string {
   switch (command.kind) {
     case "collect_observation":
-      return `正在收集与当前目标相关的代码证据：${String(command.payload.objective || "").trim()}`;
+      return "正在收集与当前目标相关的代码证据。";
     case "request_model": {
       const mode = String(command.payload.mode || "");
       const labels: Record<string, string> = {
@@ -34,14 +54,21 @@ function actionMarkdown(
         analyze: "正在结合工作区的实际只读证据形成完整答复。",
         observe: "正在根据已读证据判断根本原因。",
         plan: "正在把已确认的事实整理成可审核的修复计划。",
-        execute: "正在依据已批准的计划决定下一项安全修改或验证。",
+        execute: context?.strategy === "plan"
+          ? "正在依据已批准的计划选择下一项安全修改。"
+          : command.payload.executePolicy === "mutation_required"
+            ? "正在把已确认的证据转化为下一项代码修改。"
+            : command.payload.executePolicy ===
+                "source_reorientation_required"
+              ? "上一次修改目标不属于当前工作区，正在重新定位真实源码。"
+            : "正在确认实施修复所需的源码细节。",
         validate: "正在根据验收条件检查当前实现。",
       };
       return labels[mode] || "正在根据当前证据决定下一步。";
     }
     case "execute_tool": {
       const tool = String(command.payload.toolName || "").trim();
-      const target = readTarget(command);
+      const target = readTarget(command, context?.turn.workspaceKey);
       if (/read|open|outline/i.test(tool)) return `正在读取 ${target}，确认与当前问题相关的实现。`;
       if (/search|grep|glob|find/i.test(tool)) return `正在搜索 ${target}，收窄需要检查的代码范围。`;
       if (/patch|replace|write|edit/i.test(tool)) return `正在修改 ${target}，落实已经确认的修复方案。`;
@@ -57,7 +84,7 @@ function actionMarkdown(
     case "publish_projection":
       return "正在同步最新任务状态。";
     case "finalize_turn":
-      return strategy === "chat"
+      return context?.strategy === "chat"
         ? "正在整理本轮对话的完整回复。"
         : "正在整理已验证的结果与仍需说明的边界。";
   }
@@ -96,7 +123,20 @@ function visibleProviderCommentary(
   ) {
     return "";
   }
-  return commentary;
+  if (/```|<tool(?:_use)?>|<runtime-v2-tools>/i.test(commentary)) return "";
+  const compact = commentary.replace(/\s+/g, " ").trim();
+  if (compact.length <= 180) return compact;
+  const completeSentences = compact.match(/[^。！？!?]+[。！？!?]+/g) || [];
+  let selected = "";
+  for (const sentence of completeSentences) {
+    if (`${selected}${sentence}`.length > 180) break;
+    selected += sentence;
+    if (selected.length >= 80) break;
+  }
+  // Never cut a provider sentence in half or append synthetic ellipses. When
+  // no concise complete public sentence exists, the structured action below
+  // is more truthful than a clipped fragment.
+  return selected.trim();
 }
 
 function currentProviderCommentary(aggregate: TurnAggregateV1): string {
@@ -155,7 +195,9 @@ function projection(
   };
 }
 
-/** Full visible action text for Capsule. It intentionally does not truncate. */
+/** Capsule shows one complete public sentence plus the current structured
+ * action. Provider monologues and tool-envelope internals stay out of this
+ * live surface; durable results remain in ChatArea and the timeline. */
 export function buildRuntimeV2CapsuleProjection(
   aggregate: TurnAggregateV1,
   id: string,
@@ -163,7 +205,7 @@ export function buildRuntimeV2CapsuleProjection(
   const current = aggregate.scheduledCommands[0];
   const providerCommentary = currentProviderCommentary(aggregate);
   const action = current
-    ? actionMarkdown(current, aggregate.strategy)
+    ? actionMarkdown(current, aggregate)
     : providerCommentary
       ? providerCommentary
       : `正在${phaseTitle(aggregate.phase)}。`;
@@ -273,7 +315,7 @@ export function buildRuntimeV2TimelineProjection(
     aggregate,
     "timeline",
     id,
-    actionMarkdown(command, aggregate.strategy),
+    actionMarkdown(command, aggregate),
     "timeline",
     `command:${command.idempotencyKey}`,
   );
@@ -296,9 +338,24 @@ export function buildRuntimeV2FinalProjection(
       `final:${resultKind}:${reason}`,
     );
   }
+  const mutationTargets = [...new Set(aggregate.evidence
+    .filter((evidence) => evidence.kind === "mutation")
+    .map((evidence) => evidence.target)
+    .filter(Boolean))];
+  const validations = aggregate.events.filter(
+    (event) => event.type === "validation.completed",
+  );
+  const passedValidations = validations.filter((event) => event.passed).length;
+  const failedValidations = validations.length - passedValidations;
   const evidenceLine = aggregate.evidence.length > 0
     ? `- 已保留 ${aggregate.evidence.length} 条证据。`
     : "- 本轮没有可保留的证据。";
+  const mutationLine = mutationTargets.length > 0
+    ? `- 已修改：${mutationTargets.map(markdownCode).join("、")}。`
+    : "- 本轮没有已提交的文件修改。";
+  const validationLine = validations.length > 0
+    ? `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
+    : "- 本轮没有完成可确认的验证。";
   return projection(
     aggregate,
     "final",
@@ -306,6 +363,8 @@ export function buildRuntimeV2FinalProjection(
     [
       `### ${terminalTitle(resultKind)}`,
       finalMarkdown?.trim(),
+      mutationLine,
+      validationLine,
       evidenceLine,
       `- ${reason}`,
     ].filter(Boolean).join("\n\n"),

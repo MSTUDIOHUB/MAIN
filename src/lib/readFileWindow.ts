@@ -33,6 +33,7 @@ export interface ReadFileWindowCoveragePlan {
 export interface ReadFileWindowMetadata {
   marker: typeof READ_FILE_RESULT_MARKER;
   path: string;
+  contentVersion?: string;
   truncated: boolean;
   totalLines: number;
   totalChars: number;
@@ -45,6 +46,7 @@ export interface ReadFileWindowMetadata {
 export interface ReadFileWindowPayload {
   path?: string;
   content: string;
+  contentVersion?: string;
   startLine: number;
   endLine: number;
   totalLines: number;
@@ -290,6 +292,7 @@ export function extractReadFileWindowMetadata(content: string): ReadFileWindowMe
   return {
     marker: READ_FILE_RESULT_MARKER,
     path: values.get("path") || "",
+    contentVersion: values.get("contentVersion") || undefined,
     truncated: values.get("truncated") === "true",
     totalLines,
     totalChars,
@@ -360,6 +363,9 @@ export function formatReadFileWindowPayloadForModel(
   const header = [
     READ_FILE_RESULT_MARKER,
     `path: ${path}`,
+    payload.contentVersion
+      ? `contentVersion: ${payload.contentVersion}`
+      : "",
     `truncated: ${payload.truncated ? "true" : "false"}`,
     `totalLines: ${totalLines}`,
     `totalChars: ${totalChars}`,

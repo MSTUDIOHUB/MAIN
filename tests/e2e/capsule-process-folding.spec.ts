@@ -26,6 +26,19 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(capsule).not.toContainText("暂无工具调用");
   await expect(capsule).not.toContainText("tool:");
   await expect(capsule).not.toContainText("等待您的下一步指令");
+  const overflowOwners = await capsule.evaluate((element) => {
+    const inner = element.querySelector<HTMLElement>(".agent-explanation-scroll-container");
+    return {
+      shellOverflowY: getComputedStyle(element).overflowY,
+      innerOverflowY: inner ? getComputedStyle(inner).overflowY : "",
+      innerScrollbarWidth: inner ? getComputedStyle(inner).scrollbarWidth : "",
+    };
+  });
+  expect(overflowOwners).toEqual({
+    shellOverflowY: "hidden",
+    innerOverflowY: "auto",
+    innerScrollbarWidth: "none",
+  });
   const firstUpdate = page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。");
   const secondUpdate = page.getByText("已确认重复展示来自同一工具前言被同时投影；Capsule 只保留精简判断。");
   await expect(firstUpdate).toHaveCount(1);

@@ -51,6 +51,138 @@ function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number
     state.scheduledCommands.filter((scheduled) => runtimeV2ActionFingerprint(scheduled) === fingerprint).length;
 }
 
+function failedActionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
+  const epochOpenedAt = [...state.events].reverse().find(
+    (event) => event.type === "recovery.epoch_opened",
+  )?.at ?? Number.NEGATIVE_INFINITY;
+  return state.completedCommands.filter((receipt) =>
+    receipt.actionFingerprint === fingerprint &&
+    receipt.status === "failed" &&
+    receipt.completedAt >= epochOpenedAt
+  ).length;
+}
+
+function currentPhaseEvents(state: TurnAggregateV1) {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (
+      (event.type === "phase.changed" && event.phase === state.phase) ||
+      (event.type === "run.started" && event.phase === state.phase)
+    ) {
+      return state.events.slice(index + 1);
+    }
+  }
+  return state.events;
+}
+
+/**
+ * Acting permits a small, ledger-bounded source-gap pass. Once two source
+ * operations have succeeded (or the current phase repeats the same source),
+ * the next provider request must choose from mutation capabilities. A global
+ * iteration-pressure signal must not remove reads from a newly opened
+ * corrective phase after validation exposed fresh source gaps.
+ * This is a process-stage policy, not a model- or wording-specific heuristic.
+ */
+function actingExecutePolicy(
+  state: TurnAggregateV1,
+):
+  | "source_refresh_required"
+  | "source_reorientation_required"
+  | "source_gap_allowed"
+  | "mutation_required" {
+  const phaseEvents = currentPhaseEvents(state);
+  const isSuccessfulSourceOperation = (event: (typeof phaseEvents)[number]) =>
+    event.type === "tool.completed" &&
+    event.status === "succeeded" &&
+    event.evidence.length > 0 &&
+    event.evidence.every((evidence) => evidence.kind === "source");
+  const successfulSourceOperations = phaseEvents.filter(
+    isSuccessfulSourceOperation,
+  ).length;
+  const pressureObserved = phaseEvents.some((event) =>
+    event.type === "soft_signal.observed" &&
+    event.signal === "repeat"
+  );
+  let latestRecoveryFailureIndex = -1;
+  let latestRecoveryFailureKind:
+    | "mutation_rejected"
+    | "source_mismatch"
+    | "target_invalid"
+    | null = null;
+  for (let index = phaseEvents.length - 1; index >= 0; index -= 1) {
+    const event = phaseEvents[index]!;
+    if (
+      event.type === "tool.completed" &&
+      event.status !== "succeeded" &&
+      (
+        event.failureKind === "mutation_rejected" ||
+        event.failureKind === "source_mismatch" ||
+        event.failureKind === "target_invalid"
+      )
+    ) {
+      latestRecoveryFailureIndex = index;
+      latestRecoveryFailureKind = event.failureKind;
+      break;
+    }
+  }
+  if (latestRecoveryFailureIndex >= 0) {
+    const refreshedSourceOperations = phaseEvents
+      .slice(latestRecoveryFailureIndex + 1)
+      .filter(isSuccessfulSourceOperation)
+      .length;
+    if (
+      latestRecoveryFailureKind === "source_mismatch" ||
+      latestRecoveryFailureKind === "mutation_rejected"
+    ) {
+      return refreshedSourceOperations > 0
+        ? "mutation_required"
+        : "source_refresh_required";
+    }
+    // A nonexistent, external, or otherwise invalid target cannot be repaired
+    // by rereading that same path. Reopen two source-only decisions so a weak
+    // model can first orient to the workspace and then inspect a real file.
+    return refreshedSourceOperations >= 2
+      ? "mutation_required"
+      : "source_reorientation_required";
+  }
+  let phaseBoundaryIndex = -1;
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "phase.changed" && event.phase === "acting") {
+      phaseBoundaryIndex = index;
+      break;
+    }
+  }
+  let previousBoundaryIndex = -1;
+  for (let index = phaseBoundaryIndex - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "phase.changed" || event.type === "run.started") {
+      previousBoundaryIndex = index;
+      break;
+    }
+  }
+  const previousBoundary = previousBoundaryIndex >= 0
+    ? state.events[previousBoundaryIndex]
+    : null;
+  const correctivePhase = phaseBoundaryIndex >= 0 &&
+    previousBoundary?.type !== undefined &&
+    "phase" in previousBoundary &&
+    previousBoundary.phase === "validating" &&
+    state.events
+      .slice(previousBoundaryIndex + 1, phaseBoundaryIndex)
+      .some((event) =>
+        event.type === "validation.completed" && !event.passed
+      );
+  if (correctivePhase) {
+    return successfulSourceOperations === 0
+      ? "source_refresh_required"
+      : "mutation_required";
+  }
+  return successfulSourceOperations >= 2 || pressureObserved
+    ? "mutation_required"
+    : "source_gap_allowed";
+}
+
 function deterministicCommandKey(
   state: TurnAggregateV1,
   kind: RuntimeV2CommandKind,
@@ -109,10 +241,9 @@ function recoveryFinalization(
 }
 
 /**
- * A command can be attempted twice for an identical structural action. The
- * third attempt becomes a truthful partial conclusion instead of another
- * indefinitely-running model request. New evidence opens a new epoch and
- * therefore creates a new action fingerprint/attempt lineage.
+ * Recovery limits retries of failed structural actions. A successful read is
+ * evidence, not a failed recovery attempt; repeated successful reads are
+ * redirected by the acting tool policy instead of being mislabeled terminal.
  */
 function boundedCommand(
   state: TurnAggregateV1,
@@ -120,10 +251,8 @@ function boundedCommand(
   payload: Readonly<Record<string, unknown>> = {},
 ): RuntimeV2Command {
   const fingerprint = actionFingerprint(state, kind, payload);
-  if (actionAttemptCount(state, fingerprint) >= RUNTIME_V2_RECOVERY_LIMITS.action) {
-    const failedAttempts = state.completedCommands.filter((receipt) =>
-      receipt.actionFingerprint === fingerprint && receipt.status === "failed"
-    ).length;
+  const failedAttempts = failedActionAttemptCount(state, fingerprint);
+  if (failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action) {
     const transportFailureCount = state.recovery.receipts.find((receipt) =>
       receipt.scope === "transport" &&
       receipt.fingerprint === `transport:${fingerprint}` &&
@@ -252,6 +381,7 @@ export function decideNextCommands(
     case "acting":
       return [boundedCommand(state, "request_model", {
         mode: "execute",
+        executePolicy: actingExecutePolicy(state),
         toolExpectation: "required",
         objective: state.objective.text,
         workPlanRevision: state.workPlan?.revision || null,

@@ -175,6 +175,7 @@ export interface FileMetadata {
 export interface ReadFileWindowResult {
   path: string;
   content: string;
+  contentVersion: string;
   startLine: number;
   endLine: number;
   totalLines: number;

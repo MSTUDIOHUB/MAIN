@@ -27,6 +27,33 @@ export interface ProviderTransportAttempt {
   readonly textEnvelope: boolean;
 }
 
+export class RuntimeV2ProviderProtocolError extends Error {
+  readonly runtimeV2FailureKind = "provider_protocol";
+
+  constructor(
+    readonly code:
+      | "required_tool_missing"
+      | "tool_surface_rejected"
+      | "tool_arguments_rejected",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RuntimeV2ProviderProtocolError";
+  }
+}
+
+export function isRuntimeV2ProviderProtocolError(
+  error: unknown,
+): error is RuntimeV2ProviderProtocolError {
+  return error instanceof RuntimeV2ProviderProtocolError ||
+    (
+      !!error &&
+      typeof error === "object" &&
+      (error as { runtimeV2FailureKind?: unknown }).runtimeV2FailureKind ===
+        "provider_protocol"
+    );
+}
+
 export interface ProviderWireToolCall {
   readonly id?: unknown;
   readonly name?: unknown;
@@ -129,31 +156,257 @@ function normalizeUsage(value: unknown): Record<string, number> | undefined {
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+interface ExplicitTextToolEnvelopeParse {
+  readonly calls: RuntimeV2NormalizedToolCall[];
+  readonly diagnostic?: RuntimeV2ProviderDiagnostic;
+}
+
+function repairExplicitJsonSyntax(value: string): {
+  readonly json: string;
+  readonly controlCharacters: number;
+  readonly trailingCommas: number;
+} {
+  let escaped = "";
+  let inString = false;
+  let afterEscape = false;
+  let controlCharacters = 0;
+  for (const character of value) {
+    if (!inString) {
+      escaped += character;
+      if (character === "\"") inString = true;
+      continue;
+    }
+    if (afterEscape) {
+      escaped += character;
+      afterEscape = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped += character;
+      afterEscape = true;
+      continue;
+    }
+    if (character === "\"") {
+      escaped += character;
+      inString = false;
+      continue;
+    }
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f) {
+      controlCharacters += 1;
+      escaped += character === "\n"
+        ? "\\n"
+        : character === "\r"
+          ? "\\r"
+          : character === "\t"
+            ? "\\t"
+            : `\\u${code.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+    escaped += character;
+  }
+
+  let json = "";
+  inString = false;
+  afterEscape = false;
+  let trailingCommas = 0;
+  for (let index = 0; index < escaped.length; index += 1) {
+    const character = escaped[index];
+    if (inString) {
+      json += character;
+      if (afterEscape) afterEscape = false;
+      else if (character === "\\") afterEscape = true;
+      else if (character === "\"") inString = false;
+      continue;
+    }
+    if (character === "\"") {
+      inString = true;
+      json += character;
+      continue;
+    }
+    if (character === ",") {
+      let cursor = index + 1;
+      while (cursor < escaped.length && /\s/.test(escaped[cursor])) cursor += 1;
+      if (escaped[cursor] === "}" || escaped[cursor] === "]") {
+        trailingCommas += 1;
+        continue;
+      }
+    }
+    json += character;
+  }
+  return { json, controlCharacters, trailingCommas };
+}
+
+function explicitJsonFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const location = message.match(/position \d+|line \d+(?: column \d+)?/i)?.[0];
+  return location
+    ? `Explicit tool-envelope JSON is invalid near ${location}.`
+    : "Explicit tool-envelope JSON is invalid.";
+}
+
+function inspectExplicitTextToolEnvelope(
+  value: unknown,
+): ExplicitTextToolEnvelopeParse {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return { calls: [] };
+  const maxScanChars = 262_144;
+  const hasExplicitPrefix =
+    /<runtime-v2-tools>/.test(raw) ||
+    /^```(?:json)?\s*/i.test(raw) ||
+    raw.startsWith("{");
+  if (raw.length > maxScanChars) {
+    return hasExplicitPrefix ? {
+      calls: [],
+      diagnostic: {
+        code: "explicit_tool_envelope_too_large",
+        message: `Explicit tool envelope exceeds ${maxScanChars} characters.`,
+        retryable: true,
+      },
+    } : { calls: [] };
+  }
+  const matches = Array.from(
+    raw.matchAll(
+      /<runtime-v2-tools>\s*([\s\S]+?)\s*<\/runtime-v2-tools>/g,
+    ),
+  );
+  if (matches.length > 1) {
+    return {
+      calls: [],
+      diagnostic: {
+        code: "explicit_tool_envelope_ambiguous",
+        message: "More than one explicit tool envelope was returned.",
+        retryable: true,
+      },
+    };
+  }
+  const hasMarker = /<\/?runtime-v2-tools>/.test(raw);
+  const fenced = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const exactJson = raw.startsWith("{");
+  if (matches.length === 0 && !fenced && !exactJson) return { calls: [] };
+  if (hasMarker && matches.length === 0) {
+    return {
+      calls: [],
+      diagnostic: {
+        code: "explicit_tool_envelope_incomplete",
+        message: "The explicit tool envelope is missing a matching boundary.",
+        retryable: true,
+      },
+    };
+  }
+  const explicitJson = matches[0]?.[1] ?? fenced?.[1] ?? raw;
+  let parsed: unknown;
+  let repair: ReturnType<typeof repairExplicitJsonSyntax> | null = null;
+  try {
+    parsed = JSON.parse(explicitJson);
+  } catch (strictError) {
+    repair = repairExplicitJsonSyntax(explicitJson);
+    if (repair.json === explicitJson) {
+      return {
+        calls: [],
+        diagnostic: {
+          code: "explicit_tool_envelope_invalid_json",
+          message: explicitJsonFailureMessage(strictError),
+          retryable: true,
+        },
+      };
+    }
+    try {
+      parsed = JSON.parse(repair.json);
+    } catch (repairError) {
+      return {
+        calls: [],
+        diagnostic: {
+          code: "explicit_tool_envelope_invalid_json",
+          message: explicitJsonFailureMessage(repairError),
+          retryable: true,
+        },
+      };
+    }
+  }
+  const record = asRecord(parsed);
+  if (!record) {
+    return {
+      calls: [],
+      diagnostic: {
+        code: "explicit_tool_envelope_invalid_shape",
+        message: "Explicit tool-envelope JSON must be an object.",
+        retryable: true,
+      },
+    };
+  }
+  const rawCalls = record.toolCalls ?? record.tool_calls;
+  const calls = Array.isArray(rawCalls)
+    ? normalizeToolCalls(rawCalls)
+    : record.name || record.function
+      ? normalizeToolCalls([record])
+      : [];
+  const diagnostic = calls.length === 0
+    ? {
+        code: "explicit_tool_envelope_invalid_calls",
+        message: "Explicit tool envelope contains no valid tool call.",
+        retryable: true,
+      }
+    : repair
+      ? {
+          code: "explicit_tool_envelope_json_normalized",
+          message: `Normalized ${repair.controlCharacters} raw control characters and ${repair.trailingCommas} trailing commas inside an explicit tool envelope.`,
+          retryable: false,
+        }
+      : undefined;
+  return { calls, ...(diagnostic ? { diagnostic } : {}) };
+}
+
 /**
- * Text-envelope parsing deliberately accepts only an explicit JSON envelope.
- * It never searches prose for requests such as "let me read" and therefore
- * cannot turn a model's commentary into a lifecycle transition.
+ * Text-envelope parsing accepts one tagged envelope or a response whose whole
+ * body is an explicit JSON call (optionally fenced). Bounded commentary is
+ * tolerated only around the tagged form. Ordinary prose such as "let me read"
+ * still cannot become a lifecycle transition.
  */
 export function parseExplicitTextToolEnvelope(value: unknown): RuntimeV2NormalizedToolCall[] {
-  const text = normalizeString(value, 32_000);
-  if (!text) return [];
-  const match = text.match(/^\s*<runtime-v2-tools>\s*([\s\S]+?)\s*<\/runtime-v2-tools>\s*$/);
-  if (!match) return [];
-  try {
-    const parsed = JSON.parse(match[1]);
-    const record = asRecord(parsed);
-    return normalizeToolCalls(record?.toolCalls);
-  } catch {
-    return [];
-  }
+  return inspectExplicitTextToolEnvelope(value).calls;
+}
+
+export const RUNTIME_V2_PROVIDER_FALLBACK_RESERVE_MS = 30_000;
+
+/** Preserve part of the one-request deadline for a second supported protocol.
+ * A hanging primary lane must not consume the fallback before it can start. */
+export function allocateProviderAttemptTimeoutMs(
+  remainingMs: number,
+  hasFallback: boolean,
+): number {
+  const remaining = Math.max(1, Math.floor(remainingMs));
+  if (!hasFallback) return remaining;
+  const reserve = Math.min(
+    RUNTIME_V2_PROVIDER_FALLBACK_RESERVE_MS,
+    Math.max(1, Math.floor(remaining / 2)),
+  );
+  return Math.max(1, remaining - reserve);
 }
 
 export function normalizeProviderResponseV1(input: ProviderWireResponse): RuntimeV2NormalizedProviderResult {
-  const visibleText = normalizeString(input.visibleText ?? input.content, 32_000);
-  const explicitTextCalls = parseExplicitTextToolEnvelope(visibleText);
+  const presentationText = input.visibleText ?? input.content;
+  const visibleText = normalizeString(presentationText, 32_000);
   const nativeToolCalls = normalizeToolCalls(input.toolCalls ?? input.tool_calls);
-  const toolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : explicitTextCalls;
-  const diagnostics = normalizeDiagnostics(input.diagnostics);
+  const visibleEnvelope: ExplicitTextToolEnvelopeParse = nativeToolCalls.length > 0
+    ? { calls: [] }
+    : inspectExplicitTextToolEnvelope(input.visibleText);
+  const contentEnvelope: ExplicitTextToolEnvelopeParse = nativeToolCalls.length > 0 ||
+      visibleEnvelope.calls.length > 0
+    ? { calls: [] }
+    : inspectExplicitTextToolEnvelope(input.content);
+  const selectedEnvelope = visibleEnvelope.calls.length > 0
+    ? visibleEnvelope
+    : contentEnvelope.calls.length > 0 || contentEnvelope.diagnostic
+      ? contentEnvelope
+      : visibleEnvelope;
+  const toolCalls = nativeToolCalls.length > 0
+    ? nativeToolCalls
+    : selectedEnvelope.calls;
+  const diagnostics = [
+    ...normalizeDiagnostics(input.diagnostics),
+    ...(selectedEnvelope.diagnostic ? [selectedEnvelope.diagnostic] : []),
+  ];
   const result: RuntimeV2NormalizedProviderResult = {
     toolCalls,
     diagnostics,
@@ -172,8 +425,11 @@ export function createProviderActionEpoch(actionKey: string): ProviderActionEpoc
 
 function supportedVariants(profile: ProviderLaneProfileV1): RuntimeV2TransportVariant[] {
   const variants: RuntimeV2TransportVariant[] = [];
-  if (profile.nativeTools && profile.requiredToolChoice) variants.push("native_required");
-  if (profile.nativeTools) variants.push("native_auto");
+  if (profile.nativeTools && profile.requiredToolChoice) {
+    variants.push("native_required");
+  } else if (profile.nativeTools) {
+    variants.push("native_auto");
+  }
   if (profile.textToolEnvelope) variants.push("text_envelope");
   return variants;
 }

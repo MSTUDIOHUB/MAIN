@@ -1,4 +1,5 @@
 import { runtimeV2EvidenceVersion } from "../../lib/runtime-v2";
+import { extractReadFileWindowMetadata } from "../../lib/readFileWindow";
 
 /**
  * A read window is presentation evidence, not file-version authority. Exact
@@ -17,6 +18,12 @@ export async function resolveRuntimeV2SourceEvidenceVersion(input: {
     !input.readExactFile
   ) {
     return runtimeV2EvidenceVersion(input.output);
+  }
+  const observedVersion = typeof input.output === "string"
+    ? extractReadFileWindowMetadata(input.output)?.contentVersion
+    : "";
+  if (/^sha256-[a-f0-9]{64}$/.test(observedVersion || "")) {
+    return observedVersion!;
   }
   return runtimeV2EvidenceVersion(await input.readExactFile());
 }

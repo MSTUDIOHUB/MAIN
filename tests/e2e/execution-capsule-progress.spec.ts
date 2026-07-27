@@ -61,6 +61,32 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("Runtime v2 provider deadline settles in the browser event loop", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+  const result = await page.evaluate(async () => {
+    const { withRuntimeV2HardDeadline } = await import(
+      "/src/store/runtimeV2/hardDeadline.ts"
+    );
+    const startedAt = performance.now();
+    try {
+      await withRuntimeV2HardDeadline({
+        timeoutMs: 20,
+        timeoutError: "EXPECTED_BROWSER_DEADLINE",
+        task: () => new Promise(() => undefined),
+      });
+      return { message: "settled_without_error", elapsedMs: performance.now() - startedAt };
+    } catch (error) {
+      return {
+        message: error instanceof Error ? error.message : String(error),
+        elapsedMs: performance.now() - startedAt,
+      };
+    }
+  });
+  expect(result.message).toBe("EXPECTED_BROWSER_DEADLINE");
+  expect(result.elapsedMs).toBeGreaterThanOrEqual(15);
+  expect(result.elapsedMs).toBeLessThan(1_000);
+});
+
 test("Capsule beam uses one continuous masked Rotate gradient", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
@@ -512,6 +538,23 @@ test("typed Plan review Capsule preserves the exact request and artifact identit
   await expect(milestone).toBeVisible();
   await expect(milestone).toContainText("修复计划已准备好");
   await expect(milestone).toContainText("根本原因");
+  const milestoneTypography = await milestone.evaluate((element) => {
+    const markdown = element.querySelector<HTMLElement>("[data-markdown-presentation]");
+    const heading = element.querySelector<HTMLElement>("[data-markdown-heading-level]");
+    const strong = element.querySelector<HTMLElement>("strong");
+    return {
+      presentation: markdown?.dataset.markdownPresentation || "",
+      headingWeight: heading ? Number(getComputedStyle(heading).fontWeight) : 0,
+      headingSize: heading ? Number.parseFloat(getComputedStyle(heading).fontSize) : 0,
+      strongWeight: strong ? Number(getComputedStyle(strong).fontWeight) : 0,
+    };
+  });
+  expect(milestoneTypography.presentation).toBe("assistant_update");
+  expect(milestoneTypography.headingWeight).toBeLessThanOrEqual(500);
+  expect(milestoneTypography.headingSize).toBeLessThanOrEqual(20);
+  if (milestoneTypography.strongWeight > 0) {
+    expect(milestoneTypography.strongWeight).toBeLessThanOrEqual(500);
+  }
   await expect
     .poll(async () => page.evaluate(() => {
       const event = [...((window as any).__CODELY_E2E__?.events || [])]

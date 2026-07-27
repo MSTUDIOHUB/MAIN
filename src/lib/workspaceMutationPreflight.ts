@@ -1,4 +1,5 @@
 import {
+  parseApplyPatch,
   previewApplyPatch,
   summarizeApplyPatchTarget,
   type ApplyPatchPathAvailability,
@@ -17,6 +18,9 @@ export type WorkspaceMutationPreflightReason =
   | "search_text_mismatch"
   | "empty_change"
   | "identical_content"
+  | "existing_file_requires_patch"
+  | "oversized_change"
+  | "outside_workspace"
   | "invalid_patch";
 
 export interface WorkspaceMutationPreflightResult {
@@ -25,6 +29,10 @@ export interface WorkspaceMutationPreflightResult {
   message?: string;
   /** Best available workspace target for recovery and progress correlation. */
   path?: string;
+  /** Machine-readable recovery route. This prevents the Runtime from parsing
+   * localized diagnostics to decide whether to reread one versioned window or
+   * reopen bounded workspace orientation. */
+  recoveryKind?: "source_mismatch" | "target_invalid" | "mutation_rejected";
   patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
 }
 
@@ -32,11 +40,19 @@ export interface WorkspaceMutationPreflightInput {
   toolName: string;
   args: Record<string, unknown>;
   language?: "zh" | "en";
+  /** Lexical authority boundary used to reject external targets before any
+   * preview read or write is attempted. The executor still performs its
+   * canonical filesystem authorization afterward. */
+  workspaceRoot?: string;
   readFile: (path: string) => Promise<string>;
   readFileMetadata?: (
     path: string,
   ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
   probeFileAvailability?: (path: string) => Promise<ApplyPatchPathAvailability>;
+  /** Optional stage-owned safety ceiling. Corrective loops can require a
+   * smaller diff than an initial implementation without changing tool
+   * semantics or branching on model/provider identity. */
+  maxTouchedLines?: number;
 }
 
 function asText(value: unknown): string {
@@ -186,6 +202,12 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} would not change ${input.path}. Do not ask for approval; provide a real edit, run validation, or explain the blocker.`;
       case "identical_content":
         return `MUTATION_PREFLIGHT_BLOCKED: write_file content is identical to ${input.path}. Do not ask for approval; choose a real edit, validation, or a blocker report.`;
+      case "existing_file_requires_patch":
+        return `MUTATION_PREFLIGHT_BLOCKED: write_file cannot overwrite the existing file ${input.path}. Use replace_in_file or apply_patch so the existing implementation and a bounded diff remain authoritative.`;
+      case "oversized_change":
+        return `MUTATION_PREFLIGHT_BLOCKED: The proposed edit to ${input.path} is too large for one mutation (${input.detail || "oversized change"}). Preserve the existing architecture and split the repair into focused, evidence-backed edits.`;
+      case "outside_workspace":
+        return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} is outside the active workspace. Choose a workspace-relative target; external temporary files are not mutation authority for this task.`;
       case "invalid_patch":
         return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Correct the patch from the active source observation; reread only for a changed version or a genuinely missing range.`;
     }
@@ -202,9 +224,92 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} 不会改变 ${input.path}。不要请求用户审批；请给出真实改动、执行验证或说明阻塞。`;
     case "identical_content":
       return `MUTATION_PREFLIGHT_BLOCKED: write_file 内容与 ${input.path} 完全相同。不要请求用户审批；请改为真实改动、验证或阻塞说明。`;
+    case "existing_file_requires_patch":
+      return `MUTATION_PREFLIGHT_BLOCKED: write_file 不能覆盖已有文件 ${input.path}。请使用 replace_in_file 或 apply_patch，让现有实现保持权威并保留有限 diff。`;
+    case "oversized_change":
+      return `MUTATION_PREFLIGHT_BLOCKED: 对 ${input.path} 的单次修改过大（${input.detail || "改动范围过大"}）。请保留现有架构，并把修复拆成基于证据的精确修改。`;
+    case "outside_workspace":
+      return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 位于当前工作区之外。请选择工作区内的相对目标；外部临时文件不是本任务的修改权威。`;
     case "invalid_patch":
       return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。请依据当前源码观察修正 patch；只有版本变化或确实缺少范围时才重新读取。`;
   }
+}
+
+const MAX_SINGLE_MUTATION_LINES = 400;
+const LARGE_FILE_LINES = 200;
+const MAX_EXISTING_FILE_REPLACEMENT_RATIO = 0.5;
+
+function isLexicallyInsideWorkspace(
+  requestedPath: string,
+  workspaceRoot?: string,
+): boolean {
+  const requested = requestedPath.trim().replace(/\\/g, "/");
+  const root = String(workspaceRoot || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (!requested || !root) return true;
+  if (requested.split("/").includes("..")) return false;
+  const absolute = requested.startsWith("/") ||
+    /^[A-Za-z]:\//.test(requested);
+  if (!absolute) return true;
+  const normalized = requested.replace(/\/+/g, "/").replace(/\/+$/, "");
+  return normalized === root || normalized.startsWith(`${root}/`);
+}
+
+function applyPatchTargets(patch: string): string[] {
+  return [...patch.matchAll(
+    /^\*\*\*\s+(?:(?:Update|Add|Delete)\s+File:|Move to:)\s*(.+)$/gm,
+  )]
+    .map((match) => String(match[1] || "").trim())
+    .filter(Boolean);
+}
+
+function lineCount(value: string): number {
+  if (!value) return 0;
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length;
+}
+
+function oversizedChangeCountsDetail(input: {
+  current: string;
+  removedLines: number;
+  addedLines: number;
+  maxTouchedLines?: number;
+}): string | null {
+  const currentLines = Math.max(1, lineCount(input.current));
+  const touchedLines = Math.max(input.removedLines, input.addedLines);
+  const maxTouchedLines = Math.max(
+    1,
+    Math.min(
+      MAX_SINGLE_MUTATION_LINES,
+      Math.floor(Number(input.maxTouchedLines) || MAX_SINGLE_MUTATION_LINES),
+    ),
+  );
+  if (
+    touchedLines <= maxTouchedLines &&
+    (
+      currentLines < LARGE_FILE_LINES ||
+      Math.max(input.removedLines, input.addedLines) / currentLines <
+        MAX_EXISTING_FILE_REPLACEMENT_RATIO
+    )
+  ) {
+    return null;
+  }
+  return `${touchedLines} touched lines across a ${currentLines}-line existing file (limit ${maxTouchedLines})`;
+}
+
+function oversizedChangeDetail(input: {
+  current: string;
+  removed: string;
+  added: string;
+  maxTouchedLines?: number;
+}): string | null {
+  return oversizedChangeCountsDetail({
+    current: input.current,
+    removedLines: lineCount(input.removed),
+    addedLines: lineCount(input.added),
+    maxTouchedLines: input.maxTouchedLines,
+  });
 }
 
 function blocked(input: {
@@ -213,6 +318,7 @@ function blocked(input: {
   path: string;
   language: "zh" | "en";
   detail?: string;
+  recoveryKind?: WorkspaceMutationPreflightResult["recoveryKind"];
   patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
 }): WorkspaceMutationPreflightResult {
   return {
@@ -220,6 +326,7 @@ function blocked(input: {
     reason: input.reason,
     message: buildMessage(input),
     path: input.path,
+    ...(input.recoveryKind ? { recoveryKind: input.recoveryKind } : {}),
     ...(input.patchRecoveryMismatch
       ? { patchRecoveryMismatch: input.patchRecoveryMismatch }
       : {}),
@@ -242,6 +349,18 @@ export async function preflightWorkspaceMutation(
     if (typeof patch !== "string" || !patch.trim()) {
       return blocked({ reason: "missing_content", toolName, path: "patch", language });
     }
+    const externalTarget = applyPatchTargets(patch).find((target) =>
+      !isLexicallyInsideWorkspace(target, input.workspaceRoot)
+    );
+    if (externalTarget) {
+      return blocked({
+        reason: "outside_workspace",
+        toolName,
+        path: externalTarget,
+        language,
+        recoveryKind: "target_invalid",
+      });
+    }
     const patchTarget = summarizeApplyPatchTarget(patch) ||
       patch.match(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/m)?.[1]?.trim() ||
       "patch";
@@ -252,20 +371,67 @@ export async function preflightWorkspaceMutation(
     );
     if (!preview.ok) {
       const recoveryTarget = preview.changes[0]?.path || patchTarget;
-      const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
-        reason: "invalid_patch",
-        target: recoveryTarget,
-        requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget),
-        readFileMetadata: input.readFileMetadata,
-      });
+      const recoveryKind = preview.failureKind === "source_mismatch"
+        ? "source_mismatch"
+        : preview.failureKind === "target_unavailable"
+          ? "target_invalid"
+          : "mutation_rejected";
+      const patchRecoveryMismatch = recoveryKind === "source_mismatch"
+        ? await buildPatchRecoveryMismatchEvidence({
+            reason: "invalid_patch",
+            target: recoveryTarget,
+            requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget),
+            readFileMetadata: input.readFileMetadata,
+          })
+        : undefined;
       return blocked({
         reason: "invalid_patch",
         toolName,
         path: recoveryTarget,
         language,
         detail: preview.error,
+        recoveryKind,
         patchRecoveryMismatch,
       });
+    }
+    const parsedPatch = parseApplyPatch(patch);
+    for (const change of preview.changes) {
+      if (change.kind !== "update") continue;
+      const operations = parsedPatch.ok
+        ? parsedPatch.operations.filter((operation) =>
+            operation.kind === "update" && operation.path === change.path
+          )
+        : [];
+      const detail = oversizedChangeCountsDetail({
+        current: change.oldContent,
+        removedLines: operations.reduce(
+          (total, operation) =>
+            total + operation.hunks.reduce(
+              (sum, hunk) => sum + lineCount(hunk.oldText),
+              0,
+            ),
+          0,
+        ),
+        addedLines: operations.reduce(
+          (total, operation) =>
+            total + operation.hunks.reduce(
+              (sum, hunk) => sum + lineCount(hunk.newText),
+              0,
+          ),
+          0,
+        ),
+        maxTouchedLines: input.maxTouchedLines,
+      });
+      if (detail) {
+        return blocked({
+          reason: "oversized_change",
+          toolName,
+          path: change.path,
+          language,
+          detail,
+          recoveryKind: "mutation_rejected",
+        });
+      }
     }
     return { ok: true };
   }
@@ -276,19 +442,42 @@ export async function preflightWorkspaceMutation(
       return blocked({ reason: "missing_content", toolName, path: path || "(missing path)", language });
     }
     if (!path) return { ok: true };
+    if (!isLexicallyInsideWorkspace(path, input.workspaceRoot)) {
+      return blocked({
+        reason: "outside_workspace",
+        toolName,
+        path,
+        language,
+        recoveryKind: "target_invalid",
+      });
+    }
     try {
       const current = await input.readFile(path);
       if (current === content) {
         return blocked({ reason: "identical_content", toolName, path, language });
       }
+      return blocked({
+        reason: "existing_file_requires_patch",
+        toolName,
+        path,
+        language,
+      });
     } catch {
       return { ok: true };
     }
-    return { ok: true };
   }
 
   const searchText = asText(input.args.search_text);
   const replaceText = asText(input.args.replace_text);
+  if (!isLexicallyInsideWorkspace(path, input.workspaceRoot)) {
+    return blocked({
+      reason: "outside_workspace",
+      toolName,
+      path,
+      language,
+      recoveryKind: "target_invalid",
+    });
+  }
   if (!path || !searchText) return { ok: true };
 
   let current: string;
@@ -301,6 +490,7 @@ export async function preflightWorkspaceMutation(
       path,
       language,
       detail: error instanceof Error ? error.message : String(error || ""),
+      recoveryKind: "target_invalid",
     });
   }
 
@@ -319,12 +509,29 @@ export async function preflightWorkspaceMutation(
       toolName,
       path,
       language,
+      recoveryKind: "source_mismatch",
       patchRecoveryMismatch,
     });
   }
   const updated = current.replace(searchText, replaceText);
   if (updated === current) {
     return blocked({ reason: "empty_change", toolName, path, language });
+  }
+  const oversizedDetail = oversizedChangeDetail({
+    current,
+    removed: searchText,
+    added: replaceText,
+    maxTouchedLines: input.maxTouchedLines,
+  });
+  if (oversizedDetail) {
+    return blocked({
+      reason: "oversized_change",
+      toolName,
+      path,
+      language,
+      detail: oversizedDetail,
+      recoveryKind: "mutation_rejected",
+    });
   }
 
   return { ok: true };

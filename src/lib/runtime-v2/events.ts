@@ -77,6 +77,13 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      readonly failureKind?:
+        | "execution_failed"
+        | "not_authorized"
+        | "protocol_invalid"
+        | "mutation_rejected"
+        | "source_mismatch"
+        | "target_invalid";
     })
   | (RuntimeV2EventBase & {
       readonly type: "validation.completed";

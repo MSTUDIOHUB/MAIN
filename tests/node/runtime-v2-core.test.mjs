@@ -37,6 +37,9 @@ const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
 const sourceEvidenceVersion = loadTs(
   path.join(workspaceRoot, "src/store/runtimeV2/sourceEvidenceVersion.ts"),
 );
+const checkpointAdapter = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/checkpointPort.ts"),
+);
 
 const baseTurn = {
   workspaceKey: "/fixture",
@@ -84,6 +87,30 @@ function executeAggregate(initialPhase = "observing") {
 test("Plan and Execute hash exact read_file bytes instead of formatted read windows", async () => {
   const exact = "line 1\nline 2\n";
   const formattedWindow = "1: line 1\n[truncated]";
+  const exactVersion = runtime.runtimeV2EvidenceVersion(exact);
+  const versionedWindow = [
+    "READ_FILE_RESULT",
+    "path: src/main.js",
+    `contentVersion: ${exactVersion}`,
+    "truncated: true",
+    "totalLines: 2",
+    "totalChars: 14",
+    "returnedLines: 1-1",
+    "returnedChars: 6",
+    "---CONTENT START---",
+    "line 1",
+    "---CONTENT END---",
+  ].join("\n");
+  const embeddedVersion = await sourceEvidenceVersion
+    .resolveRuntimeV2SourceEvidenceVersion({
+      toolName: "read_file",
+      args: { path: "src/main.js", start_line: 1, max_lines: 1 },
+      output: versionedWindow,
+      readExactFile: async () => {
+        throw new Error("a window carrying exact contentVersion must not reread");
+      },
+    });
+  assert.equal(embeddedVersion, exactVersion);
   let exactReads = 0;
   const version = await sourceEvidenceVersion.resolveRuntimeV2SourceEvidenceVersion({
     toolName: "read_file",
@@ -94,7 +121,7 @@ test("Plan and Execute hash exact read_file bytes instead of formatted read wind
       return exact;
     },
   });
-  assert.equal(version, runtime.runtimeV2EvidenceVersion(exact));
+  assert.equal(version, exactVersion);
   assert.notEqual(version, runtime.runtimeV2EvidenceVersion(formattedWindow));
   assert.equal(exactReads, 1);
 
@@ -136,6 +163,49 @@ function recordProviderResponse(state, idempotencyKey, toolCalls = []) {
   }));
 }
 
+function recordSuccessfulSourceAction(state, ordinal) {
+  const providerKey = `acting-provider-${ordinal}`;
+  const providerCommand = commandFor(
+    state,
+    "request_model",
+    providerKey,
+    { mode: "execute", toolExpectation: "required" },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: providerCommand,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: providerKey,
+    result: {
+      toolCalls: [{
+        id: `read-${ordinal}`,
+        name: "read_file",
+        arguments: { path: "src/main.js" },
+      }],
+      diagnostics: [],
+    },
+  }));
+  const [read] = runtime.decideNextCommands(state);
+  assert.equal(read.kind, "execute_tool");
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: read,
+  }));
+  return runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: read.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: `source-${ordinal}`,
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    }],
+  }));
+}
+
 test("workspace read-only strategy is structurally distinct from Chat", () => {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,
@@ -153,6 +223,236 @@ test("workspace read-only strategy is structurally distinct from Chat", () => {
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.mode, "analyze");
   assert.notEqual(next.payload.mode, "chat");
+});
+
+test("Acting narrows the next provider request to mutation after its bounded source-gap pass", () => {
+  let state = executeAggregate("acting");
+  state = recordSuccessfulSourceAction(state, 1);
+  state = recordSuccessfulSourceAction(state, 2);
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.equal(next.payload.executePolicy, "mutation_required");
+  assert.equal(next.payload.toolExpectation, "required");
+  assert.equal(state.terminalOutcome, null);
+  assert.equal(state.recovery.exhausted, null);
+});
+
+test("a new corrective Acting phase keeps a bounded source gap despite global iteration pressure", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "soft_signal.observed", {
+    run: baseRun,
+    signal: "iteration_limit",
+  }));
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.equal(next.payload.executePolicy, "source_gap_allowed");
+});
+
+test("failed validation requires one fresh source window before corrective mutation", () => {
+  let state = executeAggregate("validating");
+  const validation = commandFor(
+    state,
+    "execute_validation",
+    "failed-validation-refresh",
+    {
+      toolCallId: "validation-refresh-call",
+      toolName: "run_command",
+      arguments: { command: "npm run build" },
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: validation,
+  }));
+  state = runtime.transition(state, event(state, "validation.completed", {
+    run: baseRun,
+    idempotencyKey: validation.idempotencyKey,
+    passed: false,
+    evidence: [],
+  }));
+  state = runtime.transition(state, event(state, "phase.changed", {
+    run: baseRun,
+    phase: "acting",
+    reason: "validation failed",
+  }));
+
+  let [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "source_refresh_required");
+
+  state = recordSuccessfulSourceAction(state, 1);
+  [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "mutation_required");
+});
+
+test("stale mutation context receives one exact refresh before retrying", () => {
+  let state = executeAggregate("acting");
+  const mutation = commandFor(
+    state,
+    "execute_tool",
+    "stale-mutation",
+    {
+      toolCallId: "stale-mutation-call",
+      toolName: "replace_in_file",
+      arguments: {
+        path: "src/main.js",
+        search_text: "stale source",
+        replace_text: "fixed source",
+      },
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "failed",
+    failureKind: "source_mismatch",
+    evidence: [],
+  }));
+
+  let [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "source_refresh_required");
+
+  state = recordSuccessfulSourceAction(state, 1);
+  [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "mutation_required");
+});
+
+test("a rejected mutation reacquires one exact source window before another edit", () => {
+  let state = executeAggregate("acting");
+  const mutation = commandFor(
+    state,
+    "execute_tool",
+    "oversized-mutation",
+    {
+      toolCallId: "oversized-mutation-call",
+      toolName: "replace_in_file",
+      arguments: {
+        path: "src/main.js",
+        search_text: "too much source",
+        replace_text: "too much replacement",
+      },
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "failed",
+    failureKind: "mutation_rejected",
+    evidence: [],
+  }));
+
+  let [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "source_refresh_required");
+
+  state = recordSuccessfulSourceAction(state, 1);
+  [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.executePolicy, "mutation_required");
+});
+
+test("an invalid mutation target reopens a bounded source-only orientation window", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "soft_signal.observed", {
+    run: baseRun,
+    signal: "repeat",
+  }));
+  const mutation = commandFor(
+    state,
+    "execute_tool",
+    "invalid-target-mutation",
+    {
+      toolCallId: "invalid-target-call",
+      toolName: "replace_in_file",
+      arguments: {
+        path: "src/invented.ts",
+        search_text: "old",
+        replace_text: "new",
+      },
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "failed",
+    failureKind: "target_invalid",
+    evidence: [],
+  }));
+
+  let [next] = runtime.decideNextCommands(state);
+  assert.equal(next.kind, "request_model");
+  assert.equal(
+    next.payload.executePolicy,
+    "source_reorientation_required",
+    "old repeat pressure must not force another blind mutation",
+  );
+
+  state = recordSuccessfulSourceAction(state, 1);
+  [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executePolicy, "source_reorientation_required");
+
+  state = recordSuccessfulSourceAction(state, 2);
+  [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executePolicy, "mutation_required");
+});
+
+test("recovery converges across novel failure spellings and corrective epochs", () => {
+  let budget = runtime.emptyRuntimeV2RecoveryBudget();
+  for (let index = 0; index < runtime.RUNTIME_V2_RECOVERY_EPOCH_LIMITS.action; index += 1) {
+    const fingerprint = `action:novel-${index}`;
+    assert.equal(
+      runtime.canRecordRuntimeV2Recovery(
+        budget,
+        "action",
+        fingerprint,
+      ),
+      true,
+    );
+    budget = runtime.recordRuntimeV2Recovery({
+      budget,
+      scope: "action",
+      fingerprint,
+      at: index + 1,
+    });
+  }
+  assert.equal(
+    runtime.canRecordRuntimeV2Recovery(
+      budget,
+      "action",
+      "action:another-new-spelling",
+    ),
+    false,
+  );
+
+  let epochBudget = runtime.emptyRuntimeV2RecoveryBudget();
+  for (
+    let index = 0;
+    index < runtime.RUNTIME_V2_MAX_CORRECTIVE_EPOCHS;
+    index += 1
+  ) {
+    assert.equal(runtime.canOpenRuntimeV2RecoveryEpoch(epochBudget), true);
+    epochBudget = runtime.openRuntimeV2RecoveryEpoch(epochBudget);
+  }
+  assert.equal(runtime.canOpenRuntimeV2RecoveryEpoch(epochBudget), false);
 });
 
 test("Capsule keeps provider-visible commentary beside its exact structured action", () => {
@@ -190,6 +490,41 @@ test("Capsule keeps provider-visible commentary beside its exact structured acti
   assert.match(capsule.markdown, /我已经收窄到编辑器的文件生命周期/);
   assert.match(capsule.markdown, /EditorInteractionCoordinator\.ts/);
   assert.doesNotMatch(capsule.markdown, /\.\.\./);
+});
+
+test("Capsule keeps a complete concise sentence and renders workspace paths relatively", () => {
+  let state = executeAggregate("observing");
+  const request = commandFor(state, "request_model", "model-long-commentary", {
+    mode: "observe",
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: request,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: request.idempotencyKey,
+    result: {
+      visibleText: `已定位到编辑器状态同步入口。${"仍在展开内部推演".repeat(80)}`,
+      toolCalls: [{
+        id: "read-absolute-editor",
+        name: "read_file",
+        arguments: { path: "/fixture/src/components/editor.js" },
+      }],
+      diagnostics: [],
+    },
+  }));
+  const [read] = runtime.decideNextCommands(state);
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: read,
+  }));
+
+  const capsule = runtime.buildRuntimeV2CapsuleProjection(state, "capsule-relative");
+  assert.match(capsule.markdown, /^已定位到编辑器状态同步入口。/);
+  assert.match(capsule.markdown, /`src\/components\/editor\.js`/);
+  assert.doesNotMatch(capsule.markdown, /\/fixture\//);
+  assert.doesNotMatch(capsule.markdown, /仍在展开内部推演/);
 });
 
 test("Capsule never exposes a text tool envelope as commentary", () => {
@@ -469,12 +804,90 @@ test("provider transport is capability-based, bounded and does not infer calls f
     variants.push(attempt.variant);
     epoch = runtime.recordProviderTransportAttempt(epoch, attempt);
   }
-  assert.deepEqual(variants, ["native_required", "native_auto", "text_envelope"]);
+  assert.deepEqual(variants, ["native_required", "text_envelope"]);
   assert.equal(runtime.providerActionEpochExhausted(profile, epoch), true);
   assert.deepEqual(runtime.parseExplicitTextToolEnvelope("让我读取 src/main.js"), []);
   assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
     '<runtime-v2-tools>{"toolCalls":[{"id":"a","name":"read_file","arguments":{"path":"src/main.js"}}]}</runtime-v2-tools>',
   ), [{ id: "a", name: "read_file", arguments: { path: "src/main.js" } }]);
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    '我先提交精确操作。\n<runtime-v2-tools>{"toolCalls":[{"id":"b","name":"read_file","arguments":{"path":"src/main.js","start_line":20}}]}</runtime-v2-tools>\n随后等待真实结果。',
+  ), [{
+    id: "b",
+    name: "read_file",
+    arguments: { path: "src/main.js", start_line: 20 },
+  }]);
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    '{"toolCalls":[{"id":"json","name":"apply_patch","arguments":{"patch":"*** Begin Patch"}}]}',
+  ), [{
+    id: "json",
+    name: "apply_patch",
+    arguments: { patch: "*** Begin Patch" },
+  }]);
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    '```json\n{"name":"read_file","arguments":{"path":"src/main.js"}}\n```',
+  ), [{
+    id: "tool-1",
+    name: "read_file",
+    arguments: { path: "src/main.js" },
+  }]);
+  const rawMultilineReplacement = [
+    '<runtime-v2-tools>{"toolCalls":[{"id":"repair","name":"replace_in_file","arguments":{',
+    '"path":"src/main.js","search_text":"const before = true;',
+    'const stale = true;","replace_text":"const before = true;',
+    'const stale = false;",}}]}</runtime-v2-tools>',
+  ].join("\n");
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    rawMultilineReplacement,
+  ), [{
+    id: "repair",
+    name: "replace_in_file",
+    arguments: {
+      path: "src/main.js",
+      search_text: "const before = true;\nconst stale = true;",
+      replace_text: "const before = true;\nconst stale = false;",
+    },
+  }]);
+  const normalizedEnvelope = runtime.normalizeProviderResponseV1({
+    visibleText: "",
+    content: rawMultilineReplacement,
+  });
+  assert.deepEqual(
+    normalizedEnvelope.diagnostics.map((diagnostic) => diagnostic.code),
+    ["explicit_tool_envelope_json_normalized"],
+  );
+  const invalidEnvelope = runtime.normalizeProviderResponseV1({
+    visibleText: "",
+    content:
+      '<runtime-v2-tools>{"toolCalls":[{"name":"read_file","arguments":}]}</runtime-v2-tools>',
+  });
+  assert.deepEqual(invalidEnvelope.toolCalls, []);
+  assert.deepEqual(
+    invalidEnvelope.diagnostics.map((diagnostic) => diagnostic.code),
+    ["explicit_tool_envelope_invalid_json"],
+  );
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    '说明如下：\n{"toolCalls":[{"name":"read_file","arguments":{"path":"src/main.js"}}]}',
+  ), []);
+  assert.deepEqual(runtime.parseExplicitTextToolEnvelope(
+    '<runtime-v2-tools>{"toolCalls":[]}</runtime-v2-tools>\n' +
+      '<runtime-v2-tools>{"toolCalls":[{"id":"c","name":"read_file","arguments":{"path":"src/main.js"}}]}</runtime-v2-tools>',
+  ), []);
+  const longReasoningPrefix = "分析".repeat(20_000);
+  assert.deepEqual(runtime.normalizeProviderResponseV1({
+    visibleText: "",
+    content:
+      `${longReasoningPrefix}<runtime-v2-tools>` +
+      '{"toolCalls":[{"id":"d","name":"apply_patch","arguments":{"patch":"*** Begin Patch"}}]}' +
+      "</runtime-v2-tools>",
+  }).toolCalls, [{
+    id: "d",
+    name: "apply_patch",
+    arguments: { patch: "*** Begin Patch" },
+  }]);
+  assert.equal(runtime.allocateProviderAttemptTimeoutMs(90_000, true), 60_000);
+  assert.equal(runtime.allocateProviderAttemptTimeoutMs(90_000, false), 90_000);
+  assert.equal(runtime.allocateProviderAttemptTimeoutMs(30_000, true), 15_000);
 });
 
 test("WorkPlanV1 seals one source for Markdown and requires review for lossy V5 imports", () => {
@@ -629,7 +1042,7 @@ test("RuntimeV2Controller persists scheduled effects, publishes complete Capsule
   assert.equal(published.filter((item) => item.audience === "final").length, 1);
 });
 
-test("identical structural actions without a real mutation close as error instead of claiming partial work", async () => {
+test("successful structural actions do not consume failed-action recovery", async () => {
   let now = 100;
   let id = 0;
   let revision = 0;
@@ -666,11 +1079,298 @@ test("identical structural actions without a real mutation close as error instea
   await controller.driveOnce();
   await controller.driveOnce();
   const aggregate = controller.snapshot().aggregate;
-  assert.equal(aggregate.phase, "completed");
-  assert.equal(aggregate.terminalOutcome.resultKind, "error");
-  assert.ok(aggregate.recovery.exhausted);
-  assert.equal(aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
-  assert.equal(published.filter((item) => item.audience === "final").length, 1);
+  assert.equal(aggregate.phase, "observing");
+  assert.equal(aggregate.terminalOutcome, null);
+  assert.equal(aggregate.recovery.exhausted, null);
+  assert.equal(aggregate.events.filter((event) => event.type === "turn.completed").length, 0);
+  assert.equal(published.filter((item) => item.audience === "final").length, 0);
+});
+
+test("an exact source refresh opens a bounded recovery epoch after a rejected edit", async () => {
+  let now = 450;
+  let id = 0;
+  let revision = 0;
+  let mutationCalls = 0;
+  const policies = [];
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision, event: appended },
+        };
+      },
+    },
+    provider: {
+      async request({ command }) {
+        policies.push(command.payload.executePolicy);
+        if (command.payload.executePolicy === "source_refresh_required") {
+          return {
+            toolCalls: [{
+              id: "refresh-source",
+              name: "read_file",
+              arguments: { path: "src/main.js" },
+            }],
+            diagnostics: [],
+          };
+        }
+        return {
+          toolCalls: [{
+            id: `mutation-${++mutationCalls}`,
+            name: "apply_patch",
+            arguments: { patch: "*** Begin Patch\n*** End Patch" },
+          }],
+          diagnostics: [],
+        };
+      },
+    },
+    tool: {
+      async execute({ command }) {
+        if (command.payload.toolName === "read_file") {
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+            evidence: [{
+              id: "refreshed-source",
+              kind: "source",
+              target: "src/main.js",
+              version: "source-v2",
+            }],
+          };
+        }
+        return mutationCalls === 1
+          ? {
+              type: "tool.completed",
+              run: command.run,
+              idempotencyKey: command.idempotencyKey,
+              status: "failed",
+              failureKind: "mutation_rejected",
+              evidence: [],
+            }
+          : {
+              type: "tool.completed",
+              run: command.run,
+              idempotencyKey: command.idempotencyKey,
+              status: "succeeded",
+              evidence: [{
+                id: "mutation-success",
+                kind: "mutation",
+                target: "src/main.js",
+                version: "source-v3",
+              }],
+            };
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler is not expected");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ run, kind }) => `${run.runId}:${kind}:${++id}`,
+    },
+  });
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+    initialPhase: "acting",
+  });
+  await controller.recordSoftSignal("repeat");
+  for (let step = 0; step < 6; step += 1) {
+    assert.equal(await controller.driveOnce(), true);
+  }
+
+  const aggregate = controller.snapshot().aggregate;
+  assert.deepEqual(policies, [
+    "mutation_required",
+    "source_refresh_required",
+    "mutation_required",
+  ]);
+  assert.equal(aggregate.recovery.epoch, 1);
+  assert.equal(aggregate.recovery.exhausted, null);
+  assert.ok(aggregate.events.some((item) =>
+    item.type === "recovery.epoch_opened" &&
+    item.reason === "corrective_source_refreshed_after_rejected_mutation"
+  ));
+  assert.ok(aggregate.evidence.some((item) =>
+    item.kind === "mutation" && item.id === "mutation-success"
+  ));
+});
+
+test("a weak-model read loop is pulled into mutation, validation, and a truthful terminal", async () => {
+  let now = 500;
+  let id = 0;
+  let revision = 0;
+  let sourceEvidenceId = 0;
+  const providerPolicies = [];
+  const executedTools = [];
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return { disposition: "committed", checkpoint: { revision, event: appended } };
+      },
+    },
+    provider: {
+      async request({ command }) {
+        const mode = command.payload.mode;
+        if (mode === "execute") {
+          providerPolicies.push(command.payload.executePolicy);
+          if (command.payload.executePolicy === "mutation_required") {
+            return {
+              toolCalls: [{
+                id: "apply-fix",
+                name: "apply_patch",
+                arguments: { patch: "*** Begin Patch\\n*** End Patch" },
+              }],
+              diagnostics: [],
+            };
+          }
+          return {
+            toolCalls: [1, 2, 3].map((ordinal) => ({
+              id: `read-${ordinal}`,
+              name: "read_file",
+              arguments: { path: "src/main.js" },
+            })),
+            diagnostics: [],
+          };
+        }
+        if (mode === "validate") {
+          return {
+            toolCalls: [{
+              id: "validate-fix",
+              name: "run_command",
+              arguments: { command: "npm test" },
+            }],
+            diagnostics: [],
+          };
+        }
+        if (mode === "conclude") {
+          return {
+            visibleText: "修复已经落账，并通过有限验证。",
+            toolCalls: [],
+            diagnostics: [],
+          };
+        }
+        throw new Error(`unexpected provider mode: ${mode}`);
+      },
+    },
+    tool: {
+      async execute({ command }) {
+        const toolName = command.payload.toolName;
+        executedTools.push(toolName);
+        if (toolName === "read_file") {
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+            evidence: [{
+              id: `source-${++sourceEvidenceId}`,
+              kind: "source",
+              target: "src/main.js",
+              version: "source-v1",
+            }],
+          };
+        }
+        if (toolName === "apply_patch") {
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+            evidence: [{
+              id: "mutation-1",
+              kind: "mutation",
+              target: "src/main.js",
+              version: "source-v2",
+            }],
+          };
+        }
+        return {
+          type: "validation.completed",
+          run: command.run,
+          idempotencyKey: command.idempotencyKey,
+          evidence: [{
+            id: "validation-1",
+            kind: "validation",
+            target: "npm test",
+            version: null,
+          }],
+          passed: true,
+        };
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler is not expected");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ run, kind }) => `${run.runId}:${kind}:${++id}`,
+    },
+  });
+
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+    initialPhase: "acting",
+  });
+  for (let step = 0; step < 6; step += 1) {
+    assert.equal(await controller.driveOnce(), true);
+  }
+  let aggregate = controller.snapshot().aggregate;
+  assert.equal(aggregate.terminalOutcome, null);
+  assert.deepEqual(providerPolicies, ["source_gap_allowed", "mutation_required"]);
+  assert.deepEqual(executedTools, [
+    "read_file",
+    "read_file",
+    "read_file",
+    "apply_patch",
+  ]);
+  assert.ok(aggregate.events.some((item) =>
+    item.type === "soft_signal.observed" && item.signal === "repeat"
+  ));
+  assert.equal(aggregate.recovery.exhausted, null);
+
+  const toValidation = runtime.decideRuntimeV2ExecutePhaseTransition(aggregate, {
+    isMutationToolName: (name) => name === "apply_patch",
+  });
+  assert.equal(toValidation?.to, "validating");
+  await controller.changePhase("validating", "mutation committed");
+  assert.equal(await controller.driveOnce(), true);
+  assert.equal(await controller.driveOnce(), true);
+  assert.equal(await controller.driveOnce(), true);
+
+  aggregate = controller.snapshot().aggregate;
+  const terminal = runtime.decideRuntimeV2TerminalOutcome(aggregate, {
+    canceled: false,
+    mutationCount: 1,
+    passedValidationCount: 1,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
+    hasProviderConclusion: true,
+  });
+  assert.equal(terminal?.resultKind, "success");
+  assert.equal(await controller.driveOnce(terminal), true);
+  aggregate = controller.snapshot().aggregate;
+  assert.equal(aggregate.terminalOutcome?.resultKind, "success");
+  assert.equal(aggregate.events.filter((item) => item.type === "turn.completed").length, 1);
 });
 
 test("bounded provider transport failures close as error rather than partial", async () => {
@@ -736,6 +1436,38 @@ test("bounded provider transport failures close as error rather than partial", a
   assert.equal(aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
 });
 
+test("provider protocol drift is recoverable action failure, not transport outage", async () => {
+  let state = executeAggregate("validating");
+  const command = commandFor(state, "request_model", "protocol-drift", {
+    mode: "validate",
+    toolExpectation: "required",
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command,
+  }));
+  const error = new runtime.RuntimeV2ProviderProtocolError(
+    "tool_surface_rejected",
+    "read_file is unavailable while validating",
+  );
+  assert.equal(runtime.isRuntimeV2ProviderProtocolError(error), true);
+  assert.equal(runtime.runtimeV2RecoveryScopeForCommandFailure(command, error), "action");
+  assert.equal(
+    runtime.runtimeV2RecoveryScopeForCommandFailure(
+      command,
+      new runtime.RuntimeV2ProviderProtocolError(
+        "tool_arguments_rejected",
+        "cat is not validation",
+      ),
+    ),
+    "action",
+  );
+  assert.equal(
+    runtime.runtimeV2RecoveryScopeForCommandFailure(command, new Error("HTTP 503")),
+    "transport",
+  );
+});
+
 test("v3 checkpoints replay events, reject a tampered aggregate, and CAS append once", () => {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,
@@ -746,7 +1478,12 @@ test("v3 checkpoints replay events, reject a tampered aggregate, and CAS append 
   }));
   state = runtime.transition(state, event(state, "run.started", { run: baseRun, phase: "preparing" }));
   const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: 2, aggregate: state, updatedAt: state.updatedAt });
-  assert.equal(runtime.normalizeRuntimeV2Checkpoint(checkpoint)?.aggregate.nextSequence, state.nextSequence);
+  assert.equal(runtime.normalizeRuntimeV2Checkpoint(checkpoint), checkpoint);
+  const persisted = JSON.parse(JSON.stringify(checkpoint));
+  const normalizedPersisted = runtime.normalizeRuntimeV2Checkpoint(persisted);
+  assert.ok(normalizedPersisted);
+  assert.notEqual(normalizedPersisted, persisted);
+  assert.equal(runtime.normalizeRuntimeV2Checkpoint(normalizedPersisted), normalizedPersisted);
   const tampered = { ...checkpoint, aggregate: { ...checkpoint.aggregate, phase: "completed" } };
   assert.equal(runtime.normalizeRuntimeV2Checkpoint(tampered), null);
   const nextEvent = event(state, "phase.changed", { run: baseRun, phase: "observing", reason: "begin review" });
@@ -765,6 +1502,122 @@ test("v3 checkpoints replay events, reject a tampered aggregate, and CAS append 
     event: nextEvent,
   });
   assert.equal(replayed.disposition, "idempotent");
+});
+
+test("checkpoint Store adapter rebases a transient projection revision conflict", async () => {
+  let revisionToken = { revision: 1 };
+  let state = {
+    runtimeV2Checkpoints: {},
+    unrelatedState: "before-conflict",
+  };
+  let publicationCount = 0;
+  const logs = [];
+  const port = checkpointAdapter.createRuntimeV2CheckpointPort({
+    get: () => state,
+    set: () => {},
+    scopeKey: "/fixture",
+    sessionId: null,
+    getSessionRevisionToken: () => revisionToken,
+    sanitizeTaskBlocksForPersist: (blocks) => blocks,
+    normalizeSessionRuntimeSnapshot: () => ({}),
+    persistSessionRecord: async () => null,
+    publishOwnerScopedRuntimeProjection(input) {
+      publicationCount += 1;
+      assert.equal(input.expectedRevisionToken, revisionToken);
+      if (publicationCount === 1) {
+        state = { ...state, unrelatedState: "changed-concurrently" };
+        revisionToken = { revision: 2 };
+        return { published: false, disposition: "revision_conflict" };
+      }
+      state = input.projectedState;
+      revisionToken = { revision: 3 };
+      return { published: true, disposition: "published" };
+    },
+    logStoreEvent(name, data) {
+      logs.push({ name, data });
+    },
+  });
+  const admitted = event(null, "turn.admitted", {
+    turn: baseTurn,
+    strategy: "execute",
+    objective: "Fix the fixture",
+    constraints: [],
+    acceptanceCriteria: [],
+  });
+
+  const result = await port.append({
+    owner: baseTurn,
+    expectedRevision: 0,
+    event: admitted,
+  });
+
+  assert.equal(result.disposition, "committed");
+  assert.equal(publicationCount, 2);
+  assert.equal(state.unrelatedState, "changed-concurrently");
+  assert.equal(state.runtimeV2Checkpoints[baseTurn.turnId].revision, 1);
+  assert.equal(
+    logs.filter((entry) =>
+      entry.name === "runtime_v2_checkpoint_projection_conflict"
+    ).length,
+    1,
+  );
+});
+
+test("checkpoint Store adapter preserves a concurrent UI tick during durable persistence", async () => {
+  let revisionToken = { revision: 1 };
+  let state = {
+    config: { sessionRecordingEnabled: true },
+    runtimeV2Checkpoints: {},
+    elapsedTime: 4,
+    sessionsByWorkspace: {
+      "/fixture": [{
+        id: 7,
+        messages: [],
+        storageRevision: 1,
+      }],
+    },
+  };
+  let publicationCount = 0;
+  const port = checkpointAdapter.createRuntimeV2CheckpointPort({
+    get: () => state,
+    set: () => {},
+    scopeKey: "/fixture",
+    sessionId: 7,
+    getSessionRevisionToken: () => revisionToken,
+    sanitizeTaskBlocksForPersist: (blocks) => blocks,
+    normalizeSessionRuntimeSnapshot: () => ({}),
+    async persistSessionRecord(_scopeKey, session) {
+      state = { ...state, elapsedTime: 5 };
+      revisionToken = { revision: 2 };
+      return { ...session, storageRevision: 2 };
+    },
+    publishOwnerScopedRuntimeProjection(input) {
+      publicationCount += 1;
+      assert.equal(input.expectedRevisionToken, revisionToken);
+      state = input.projectedState;
+      revisionToken = { revision: 3 };
+      return { published: true, disposition: "published" };
+    },
+    logStoreEvent() {},
+  });
+  const admitted = event(null, "turn.admitted", {
+    turn: baseTurn,
+    strategy: "execute",
+    objective: "Fix the fixture",
+    constraints: [],
+    acceptanceCriteria: [],
+  });
+
+  const result = await port.append({
+    owner: baseTurn,
+    expectedRevision: 0,
+    event: admitted,
+  });
+
+  assert.equal(result.disposition, "committed");
+  assert.equal(publicationCount, 1);
+  assert.equal(state.elapsedTime, 5);
+  assert.equal(state.runtimeV2Checkpoints[baseTurn.turnId].revision, 1);
 });
 
 test("read-only child scheduler requires disjoint scopes and records real request overlap", () => {
@@ -1386,6 +2239,8 @@ test("Execute completion facts are reconstructed from durable mutation and valid
   assert.deepEqual(runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier), {
     mutationCount: 1,
     passedValidationCount: 1,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
     failedOperationCount: 0,
   });
 });
@@ -1417,6 +2272,8 @@ test("runtime-owned plan artifact writes are not counted as project mutations", 
   assert.deepEqual(runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier), {
     mutationCount: 0,
     passedValidationCount: 0,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
     failedOperationCount: 0,
   });
 });
@@ -1435,6 +2292,8 @@ test("completion gate never treats an unexecuted provider analysis as a partial 
     canceled: false,
     mutationCount: 0,
     passedValidationCount: 0,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
     hasProviderConclusion: true,
   }), null);
 
@@ -1442,11 +2301,138 @@ test("completion gate never treats an unexecuted provider analysis as a partial 
     canceled: false,
     mutationCount: 1,
     passedValidationCount: 1,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
     hasProviderConclusion: true,
   }), {
     resultKind: "success",
     resultReason: "已完成修改，并通过结构化验证结果确认。",
   });
+});
+
+test("progressive validation failures continue while three identical failures close as partial", () => {
+  const classifier = { isMutationToolName: (name) => name === "apply_patch" };
+  let state = executeAggregate("acting");
+  const mutation = commandFor(state, "execute_tool", "bounded-mutation", {
+    toolCallId: "bounded-mutation-call",
+    toolName: "apply_patch",
+    arguments: { patch: "*** Begin Patch\n*** End Patch" },
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "succeeded",
+    evidence: [{ id: "bounded-M1", kind: "mutation", target: "src/main.js", version: null }],
+  }));
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    state = runtime.transition(state, event(state, "phase.changed", {
+      run: baseRun,
+      phase: "validating",
+      reason: `validate attempt ${attempt}`,
+    }));
+    const validation = commandFor(
+      state,
+      "execute_validation",
+      `bounded-validation-${attempt}`,
+      {
+        toolCallId: `bounded-validation-call-${attempt}`,
+        toolName: "run_command",
+        arguments: { command: "npm run build" },
+      },
+    );
+    state = runtime.transition(state, event(state, "command.scheduled", {
+      run: baseRun,
+      command: validation,
+    }));
+    state = runtime.transition(state, event(state, "validation.completed", {
+      run: baseRun,
+      idempotencyKey: validation.idempotencyKey,
+      passed: false,
+      failureKind: "assertion_failed",
+      evidence: [{
+        id: `bounded-V${attempt}`,
+        kind: "validation",
+        target: `diagnostic-${attempt}.log`,
+        version: `diagnostic-v${attempt}`,
+      }],
+    }));
+    const facts = runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier);
+    assert.equal(facts.failedValidationCount, attempt);
+    const decision = runtime.decideRuntimeV2TerminalOutcome(state, {
+      canceled: false,
+      ...facts,
+      hasProviderConclusion: false,
+    });
+    assert.equal(facts.stalledValidationCount, 1);
+    assert.equal(decision, null);
+    if (attempt < 3) state = runtime.transition(state, event(state, "phase.changed", {
+      run: baseRun,
+      phase: "acting",
+      reason: "correct failed validation",
+    }));
+  }
+
+  state = runtime.transition(state, event(state, "phase.changed", {
+    run: baseRun,
+    phase: "acting",
+    reason: "begin stalled validation fixture",
+  }));
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    state = runtime.transition(state, event(state, "phase.changed", {
+      run: baseRun,
+      phase: "validating",
+      reason: `stalled validate attempt ${attempt}`,
+    }));
+    const validation = commandFor(
+      state,
+      "execute_validation",
+      `stalled-validation-${attempt}`,
+      {
+        toolCallId: `stalled-validation-call-${attempt}`,
+        toolName: "run_command",
+        arguments: { command: "npm run build" },
+      },
+    );
+    state = runtime.transition(state, event(state, "command.scheduled", {
+      run: baseRun,
+      command: validation,
+    }));
+    state = runtime.transition(state, event(state, "validation.completed", {
+      run: baseRun,
+      idempotencyKey: validation.idempotencyKey,
+      passed: false,
+      failureKind: "assertion_failed",
+      evidence: [{
+        id: `stalled-V${attempt}`,
+        kind: "validation",
+        target: "npm run build",
+        version: "same-normalized-diagnostic",
+      }],
+    }));
+    const facts = runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier);
+    const decision = runtime.decideRuntimeV2TerminalOutcome(state, {
+      canceled: false,
+      ...facts,
+      hasProviderConclusion: false,
+    });
+    if (attempt < 3) {
+      assert.equal(decision, null);
+      state = runtime.transition(state, event(state, "phase.changed", {
+        run: baseRun,
+        phase: "acting",
+        reason: "retry stalled validation",
+      }));
+    } else {
+      assert.equal(facts.stalledValidationCount, 3);
+      assert.equal(decision?.resultKind, "partial");
+      assert.match(decision?.resultReason || "", /无进展循环/);
+    }
+  }
 });
 
 test("tool-call transport ids do not create unlimited recovery fingerprints", () => {
@@ -1691,10 +2677,12 @@ test("an aborted Turn settles the scheduled lifecycle as canceled without callin
   assert.equal(aggregate.events.filter((item) => item.type === "turn.completed").length, 1);
 });
 
-test("failed structured validation clears its pending call and consumes a bounded recovery receipt", async () => {
+test("failed acceptance checks remain normal loop evidence across multiple corrective mutations", async () => {
   let now = 400;
   let id = 0;
   let revision = 0;
+  let validationCalls = 0;
+  let mutationCalls = 0;
   const ports = {
     checkpoint: {
       async load() { return null; },
@@ -1704,16 +2692,43 @@ test("failed structured validation clears its pending call and consumes a bounde
       },
     },
     provider: {
-      async request() {
+      async request({ command }) {
+        if (command.payload.mode === "execute") {
+          return {
+            toolCalls: [{
+              id: `mutation-call-${++mutationCalls}`,
+              name: "apply_patch",
+              arguments: { patch: "*** Begin Patch\\n*** End Patch" },
+            }],
+            diagnostics: [],
+          };
+        }
         return {
-          toolCalls: [{ id: "validation-call-1", name: "run_command", arguments: { command: "npm run build" } }],
+          toolCalls: [{
+            id: `validation-call-${++validationCalls}`,
+            name: "run_command",
+            arguments: { command: "npm run build" },
+          }],
           diagnostics: [],
         };
       },
     },
     tool: {
       async execute({ command }) {
-        assert.equal(command.kind, "execute_validation");
+        if (command.kind === "execute_tool") {
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+            evidence: [{
+              id: `mutation-${mutationCalls}`,
+              kind: "mutation",
+              target: "src/main.js",
+              version: `version-${mutationCalls}`,
+            }],
+          };
+        }
         return {
           type: "validation.completed",
           run: command.run,
@@ -1739,12 +2754,109 @@ test("failed structured validation clears its pending call and consumes a bounde
     objective: "Repair the fixture",
     initialPhase: "validating",
   });
+  for (let cycle = 0; cycle < 5; cycle += 1) {
+    await controller.driveOnce();
+    await controller.driveOnce();
+    let aggregate = controller.snapshot().aggregate;
+    assert.equal(
+      aggregate.pendingToolCalls.length,
+      0,
+      `cycle=${cycle} phase=${aggregate.phase} scheduled=${aggregate.scheduledCommands.map((item) => item.kind).join(",")}`,
+    );
+    assert.equal(aggregate.completedCommands.at(-1).kind, "execute_validation");
+    assert.equal(
+      aggregate.completedCommands.at(-1).status,
+      "succeeded",
+      "the validator ran successfully even though acceptance did not pass",
+    );
+    assert.equal(aggregate.recovery.exhausted, null);
+    assert.equal(
+      aggregate.recovery.receipts.some((receipt) =>
+        receipt.scope === "diagnostic"
+      ),
+      false,
+    );
+
+    await controller.changePhase("acting", "repair failed validation");
+    await controller.driveOnce();
+    await controller.driveOnce();
+    aggregate = controller.snapshot().aggregate;
+    assert.equal(
+      aggregate.recovery.epoch,
+      0,
+      "ordinary acceptance repair is not a recovery epoch",
+    );
+    assert.equal(aggregate.recovery.exhausted, null);
+    await controller.changePhase("validating", "validate corrective mutation");
+  }
+  const aggregate = controller.snapshot().aggregate;
+  assert.equal(aggregate.recovery.actionRepeats, 0);
+  assert.equal(aggregate.recovery.diagnosticRepairs, 0);
+});
+
+test("a protocol-invalid validation is an action recovery, not a failed acceptance check", async () => {
+  let now = 900;
+  let id = 0;
+  let revision = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event }) {
+        revision += 1;
+        return { disposition: "committed", checkpoint: { revision, event } };
+      },
+    },
+    provider: {
+      async request() {
+        return {
+          toolCalls: [{
+            id: "inspection-call",
+            name: "run_command",
+            arguments: { command: "grep -n TODO src/main.js" },
+          }],
+          diagnostics: [],
+        };
+      },
+    },
+    tool: {
+      async execute({ command }) {
+        return {
+          type: "validation.completed",
+          run: command.run,
+          idempotencyKey: command.idempotencyKey,
+          passed: false,
+          failureKind: "protocol_invalid",
+          evidence: [],
+        };
+      },
+    },
+    scheduler: { async execute() { throw new Error("scheduler is not expected"); } },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ run, kind }) => `${run.runId}:${kind}:${++id}`,
+    },
+  });
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+    initialPhase: "validating",
+  });
   await controller.driveOnce();
   await controller.driveOnce();
   const aggregate = controller.snapshot().aggregate;
-  assert.equal(aggregate.pendingToolCalls.length, 0);
-  assert.equal(aggregate.completedCommands.at(-1).kind, "execute_validation");
-  assert.equal(aggregate.completedCommands.at(-1).status, "failed");
-  assert.equal(aggregate.recovery.actionRepeats, 0);
-  assert.equal(aggregate.recovery.diagnosticRepairs, 1);
+  assert.equal(aggregate.phase, "validating");
+  assert.equal(aggregate.recovery.diagnosticRepairs, 0);
+  assert.equal(
+    aggregate.recovery.receipts.some((receipt) => receipt.scope === "diagnostic"),
+    false,
+  );
+  assert.equal(
+    aggregate.recovery.receipts.some((receipt) => receipt.scope === "action"),
+    true,
+  );
+  assert.equal(aggregate.recovery.exhausted, null);
 });

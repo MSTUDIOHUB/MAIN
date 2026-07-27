@@ -4,6 +4,7 @@ import type {
   RuntimeV2RecoveryReceipt,
   RuntimeV2RecoveryScope,
 } from "./contracts";
+import { isRuntimeV2ProviderProtocolError } from "./providerLane";
 
 /**
  * These are product safety limits, not provider/model heuristics. A caller
@@ -15,6 +16,35 @@ export const RUNTIME_V2_RECOVERY_LIMITS: Readonly<Record<RuntimeV2RecoveryScope,
   context: 1,
   diagnostic: 2,
 });
+
+/**
+ * Per-fingerprint limits prevent replaying one identical action. These
+ * epoch-wide limits also stop a model from evading recovery merely by
+ * changing a path, patch body, tool-call id, or shell spelling each round.
+ */
+export const RUNTIME_V2_RECOVERY_EPOCH_LIMITS: Readonly<
+  Record<RuntimeV2RecoveryScope, number>
+> = Object.freeze({
+  transport: 3,
+  action: 4,
+  context: 1,
+  diagnostic: 2,
+});
+
+/** Initial execution is epoch 0; at most two evidence-backed corrective
+ * mutation epochs may follow before the existing receipts must converge. */
+export const RUNTIME_V2_MAX_CORRECTIVE_EPOCHS = 2;
+
+export function runtimeV2RecoveryScopeForCommandFailure(
+  command: RuntimeV2Command,
+  error: unknown,
+): RuntimeV2RecoveryScope {
+  if (command.kind === "request_model") {
+    return isRuntimeV2ProviderProtocolError(error) ? "action" : "transport";
+  }
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /context|token|window/i.test(message) ? "context" : "action";
+}
 
 const MAX_RECOVERY_RECEIPTS = 96;
 
@@ -70,6 +100,18 @@ export function recoveryReceiptCount(
   )?.count || 0;
 }
 
+export function recoveryReceiptTotal(
+  budget: RuntimeV2RecoveryBudget,
+  scope: RuntimeV2RecoveryScope,
+  epoch = budget.epoch,
+): number {
+  return budget.receipts
+    .filter((receipt) =>
+      receipt.scope === scope && receipt.epoch === epoch
+    )
+    .reduce((total, receipt) => total + receipt.count, 0);
+}
+
 export function canRecordRuntimeV2Recovery(
   budget: RuntimeV2RecoveryBudget,
   scope: RuntimeV2RecoveryScope,
@@ -77,7 +119,10 @@ export function canRecordRuntimeV2Recovery(
 ): boolean {
   return !budget.exhausted &&
     !!compact(fingerprint) &&
-    recoveryReceiptCount(budget, scope, fingerprint) < RUNTIME_V2_RECOVERY_LIMITS[scope];
+    recoveryReceiptCount(budget, scope, fingerprint) <
+      RUNTIME_V2_RECOVERY_LIMITS[scope] &&
+    recoveryReceiptTotal(budget, scope) <
+      RUNTIME_V2_RECOVERY_EPOCH_LIMITS[scope];
 }
 
 function incrementTotal(
@@ -127,11 +172,21 @@ export function recordRuntimeV2Recovery(input: {
 export function openRuntimeV2RecoveryEpoch(
   budget: RuntimeV2RecoveryBudget,
 ): RuntimeV2RecoveryBudget {
+  if (!canOpenRuntimeV2RecoveryEpoch(budget)) {
+    throw new Error("Runtime v2 corrective recovery epoch limit is exhausted.");
+  }
   return {
     ...budget,
     epoch: budget.epoch + 1,
     exhausted: null,
   };
+}
+
+export function canOpenRuntimeV2RecoveryEpoch(
+  budget: RuntimeV2RecoveryBudget,
+): boolean {
+  return !budget.exhausted &&
+    budget.epoch < RUNTIME_V2_MAX_CORRECTIVE_EPOCHS;
 }
 
 export function exhaustRuntimeV2Recovery(input: {

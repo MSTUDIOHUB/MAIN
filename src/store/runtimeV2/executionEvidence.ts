@@ -16,6 +16,18 @@ import type {
   RuntimeV2LiveExecutionState,
 } from "./executionTypes";
 
+type RuntimeV2ToolFailureKind = NonNullable<Extract<
+  RuntimeV2EventDraft,
+  { type: "tool.completed" }
+>["failureKind"]>;
+type RuntimeV2ValidationFailureKind = NonNullable<Extract<
+  RuntimeV2EventDraft,
+  { type: "validation.completed" }
+>["failureKind"]>;
+type RuntimeV2CompletionFailureKind =
+  | RuntimeV2ToolFailureKind
+  | RuntimeV2ValidationFailureKind;
+
 export function nextEvidenceId(live: RuntimeV2LiveExecutionState): string {
   live.evidenceCounter += 1;
   return `E${live.evidenceCounter}`;
@@ -52,6 +64,7 @@ function toolResultEvent(
   command: RuntimeV2Command,
   status: "succeeded" | "failed" | "blocked",
   evidence: RuntimeV2EvidenceReference[],
+  failureKind?: RuntimeV2ToolFailureKind,
 ): RuntimeV2EventDraft {
   return {
     type: "tool.completed",
@@ -59,6 +72,7 @@ function toolResultEvent(
     idempotencyKey: command.idempotencyKey,
     status,
     evidence,
+    ...(status !== "succeeded" && failureKind ? { failureKind } : {}),
   };
 }
 
@@ -71,10 +85,7 @@ function validationResultEvent(
     target: string;
     version: string | null;
   }>,
-  failureKind?: Extract<
-    RuntimeV2EventDraft,
-    { type: "validation.completed" }
-  >["failureKind"],
+  failureKind?: RuntimeV2ValidationFailureKind,
 ): RuntimeV2EventDraft {
   return {
     type: "validation.completed",
@@ -86,7 +97,7 @@ function validationResultEvent(
   };
 }
 
-function parseResultRecord(value: unknown): Record<string, unknown> | null {
+export function parseResultRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
   }
@@ -99,6 +110,45 @@ function parseResultRecord(value: unknown): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/** Decode structured command results before retaining them as model context.
+ * Keeping JSON-escaped stdout/stderr as one line prevents the recovery layer
+ * from seeing compiler and test `path:line` diagnostics. */
+export function modelContextContentForToolOutput(output: unknown): string {
+  const result = parseResultRecord(output);
+  if (!result) return typeof output === "string" ? output : String(output ?? "");
+  const exitCode = typeof result.exitCode === "number"
+    ? result.exitCode
+    : typeof result.exit_code === "number"
+      ? result.exit_code
+      : typeof result.exitCodeAfter === "number"
+        ? result.exitCodeAfter
+        : null;
+  // Failed builds often emit a very large stdout preamble before putting the
+  // actionable path:line diagnostics in stderr. Failure detail must lead the
+  // bounded context so truncation cannot hide the source recovery authority.
+  const failed = (exitCode !== null && exitCode !== 0) ||
+    result.success === false ||
+    result.ok === false ||
+    result.error !== undefined;
+  const textFields = failed
+    ? ["stderr", "error", "message", "stdout"] as const
+    : ["stdout", "stderr", "message", "error"] as const;
+  const content = textFields
+    .map((field) => typeof result[field] === "string"
+      ? String(result[field]).trim()
+      : "")
+    .filter(Boolean);
+  if (exitCode !== null) content.unshift(`exitCode: ${exitCode}`);
+  if (result.timedOut === true || result.timeout === true) {
+    content.unshift("timedOut: true");
+  }
+  return content.length > 0
+    ? content.join("\n")
+    : typeof output === "string"
+      ? output
+      : JSON.stringify(output);
 }
 
 function isValidationPassed(toolName: string, output: unknown): boolean {
@@ -121,6 +171,19 @@ function isValidationPassed(toolName: string, output: unknown): boolean {
   return false;
 }
 
+function validationEvidenceVersion(output: unknown): string {
+  const stableDiagnostic = modelContextContentForToolOutput(output)
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/:\d+(?::\d+)?\b/g, ":<line>")
+    .replace(/\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?)\b/gi, "<duration>")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 24)
+    .join("\n");
+  return runtimeV2EvidenceVersion(stableDiagnostic || output);
+}
+
 export function toolCompletionFor(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
@@ -129,10 +192,7 @@ export function toolCompletionFor(
   target: string,
   output: unknown,
   status: "succeeded" | "failed" | "blocked",
-  failureKind?: Extract<
-    RuntimeV2EventDraft,
-    { type: "validation.completed" }
-  >["failureKind"],
+  failureKind?: RuntimeV2CompletionFailureKind,
   sourceVersion?: string,
 ): RuntimeV2EventDraft {
   if (command.kind !== "execute_validation") {
@@ -157,24 +217,46 @@ export function toolCompletionFor(
               : null,
           }))
         : [],
+      failureKind === "assertion_failed"
+        ? "protocol_invalid"
+        : failureKind,
     );
   }
   const passed = status === "succeeded" &&
     isValidationPassed(toolName, output);
+  const validationFailureKind =
+    failureKind === "source_mismatch" ||
+      failureKind === "target_invalid" ||
+      failureKind === "mutation_rejected"
+      ? "protocol_invalid"
+      : failureKind;
   return validationResultEvent(
     command,
     passed,
-    passed
-      ? [{
-          id: nextEvidenceId(input.live),
-          kind: "validation",
-          target: target || toolName,
-          version: null,
-        }]
-      : [],
+    [{
+      id: nextEvidenceId(input.live),
+      kind: "validation",
+      target: target || toolName,
+      version: passed ? null : validationEvidenceVersion(output),
+    }],
     passed
       ? undefined
-      : failureKind ||
-        (status === "succeeded" ? "assertion_failed" : "execution_failed"),
+      : validationFailureKind ||
+        (status === "succeeded"
+          ? "assertion_failed"
+          : "execution_failed"),
   );
+}
+
+/** Preserve semantic failure in the provider context even when the underlying
+ * tool transport itself completed successfully. A finite validator with a
+ * non-zero exit code is failed evidence, not a successful tool observation. */
+export function modelContextStatusForCompletion(
+  completion: RuntimeV2EventDraft,
+): "succeeded" | "failed" | "blocked" {
+  if (completion.type === "validation.completed") {
+    return completion.passed ? "succeeded" : "failed";
+  }
+  if (completion.type === "tool.completed") return completion.status;
+  return "succeeded";
 }

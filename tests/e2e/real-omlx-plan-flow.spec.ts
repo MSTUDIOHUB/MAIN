@@ -37,6 +37,7 @@ import {
 import {
   getMdViewerExecutionGaps,
   getMdViewerFinalSummaryGaps,
+  getNewUndeclaredCallGaps,
   getMdViewerWorkPlanGaps,
 } from "./realOmlxMdViewerPlanOracle";
 import { expectRuntimeV2ReadOnlyCollaboration } from "./runtimeV2StructuralAssertions";
@@ -55,15 +56,21 @@ if (runRealOmlx && models.length !== 1) {
     `Real OMLX validation requires exactly one explicit OMLX_MODELS id; received ${models.length}.`,
   );
 }
+const realOmlxFixture = String(
+  process.env.REAL_OMLX_FIXTURE || "csv",
+).trim().toLowerCase();
 const realOmlxRequest =
   process.env.REAL_OMLX_REQUEST ||
-  "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
+  (
+    realOmlxFixture === "md-viewer"
+      ? "问题：1、在编辑界面显示了文件名和未保存的文档名字，这是不合理的。2、打开本地 md 文件后随后会弹出窗口，看起来是文件保存执行路径有关的问题。找到这些问题的根本原因并修复。"
+      : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。"
+  );
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
 const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
 const realOmlxImagePath = String(process.env.REAL_OMLX_IMAGE_PATH || "").trim();
 const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
 const runExecuteIncidentReplay = process.env.REAL_OMLX_EXECUTE_INCIDENT === "1";
-const realOmlxFixture = String(process.env.REAL_OMLX_FIXTURE || "csv").trim().toLowerCase();
 const realOmlxMutationFile = String(
   process.env.REAL_OMLX_MUTATION_FILE ||
   (realOmlxFixture === "md-viewer" ? "src/main.js" : "src/hooks/useCsvParser.ts"),
@@ -78,7 +85,11 @@ const realOmlxDevServerUrl = String(
   (realOmlxFixture === "md-viewer" ? "http://localhost:1420/" : "http://localhost:5173/"),
 );
 const realOmlxPlanExpectation = new RegExp(
-  process.env.REAL_OMLX_PLAN_EXPECT || "useCsvParser\\.ts|CSV|creator",
+  process.env.REAL_OMLX_PLAN_EXPECT || (
+    realOmlxFixture === "md-viewer"
+      ? "src/main\\.js|未保存|保存|打开"
+      : "useCsvParser\\.ts|CSV|creator"
+  ),
   "i",
 );
 const realOmlxPlanExpectAll = String(process.env.REAL_OMLX_PLAN_EXPECT_ALL || "")
@@ -125,7 +136,10 @@ const realOmlxPlanTimeoutMs = Math.max(
 );
 const realOmlxExecutionTimeoutMs = Math.max(
   30_000,
-  Number(process.env.REAL_OMLX_EXECUTION_TIMEOUT_MS || 500_000),
+  // Runtime v2 owns a 12-minute lifecycle deadline. The outer replay must
+  // outlive that boundary so it observes the canonical partial/success
+  // terminal instead of killing the page while the Run still says "running".
+  Number(process.env.REAL_OMLX_EXECUTION_TIMEOUT_MS || 780_000),
 );
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
@@ -138,6 +152,16 @@ const reviewablePlanStages = new Set(["plan", "design", "bugfix", "ready_to_exec
 const isMdViewerSavePathIncident =
   realOmlxFixture === "md-viewer" &&
   /(?:未保存|保存路径|打开本地|save\s*path|unsaved)/i.test(realOmlxRequest);
+if (
+  runRealOmlx &&
+  runExecuteIncidentReplay &&
+  realOmlxFixture === "md-viewer" &&
+  !isMdViewerSavePathIncident
+) {
+  throw new Error(
+    "The MD Viewer Execute incident lane requires an MD Viewer save/open request; fixture and objective are inconsistent.",
+  );
+}
 
 const useSemanticMdViewerMutationOracle =
   realOmlxFixture === "md-viewer" &&
@@ -254,6 +278,13 @@ async function inspectFixtureMutation(
       "src/main.js",
       "src/components/editor.js",
     ]);
+    for (const relativePath of allowedMutationFiles) {
+      executionGaps.push(...getNewUndeclaredCallGaps({
+        path: relativePath,
+        before: baseline[relativePath] || "",
+        after: contents[relativePath] || "",
+      }));
+    }
     for (const relativePath of changedFiles) {
       if (allowedMutationFiles.has(relativePath)) continue;
       executionGaps.push(
@@ -2730,6 +2761,8 @@ for (const model of models) {
     let observedRuntimeStart = false;
     let terminalSnapshot: any = null;
     let latestRuntimeSnapshot: any = immediateSnapshot;
+    let latestActiveRuntimeSnapshot: any =
+      immediateSnapshot?.runtimeV2 ? immediateSnapshot : null;
     const capsuleTimeline: Array<{
       text: string;
       source: string;
@@ -2758,9 +2791,13 @@ for (const model of models) {
             '[data-testid="capsule-status-label"]',
           );
           const progress = [...document.querySelectorAll<HTMLElement>(
-            '[data-testid="progress-block"]',
+            [
+              '[data-testid="progress-block"]',
+              '[data-testid="live-turn-step"]',
+              '[data-testid="turn-archive-step"]',
+            ].join(','),
           )].filter((node) => node.getClientRects().length > 0).map((node) => ({
-            phase: node.dataset.phase || "",
+            phase: node.dataset.phase || node.dataset.kind || "",
             status: node.dataset.status || "",
             text: String(node.textContent || "").replace(/\s+/g, " ").trim(),
           }));
@@ -2804,6 +2841,9 @@ for (const model of models) {
           }
         }
         latestRuntimeSnapshot = snapshot;
+        if (snapshot?.runtimeV2) {
+          latestActiveRuntimeSnapshot = snapshot;
+        }
         if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
         if (snapshot?.runtimeV2?.eventTypes?.includes("run.started")) {
           observedRuntimeStart = true;
@@ -2821,16 +2861,24 @@ for (const model of models) {
         return "running";
       }, { timeout: realOmlxExecutionTimeoutMs }).toBe("terminal");
     } catch (error) {
+      const activeSnapshot =
+        latestActiveRuntimeSnapshot || latestRuntimeSnapshot;
       console.log(`[real-omlx-execute-timeout:${model}] ${JSON.stringify({
         currentTurnStatus: latestRuntimeSnapshot?.currentTurnStatus,
         currentTurnIntent: latestRuntimeSnapshot?.currentTurnIntent,
         currentTurnTitle: latestRuntimeSnapshot?.currentTurnTitle,
         agentStatus: latestRuntimeSnapshot?.agentStatus,
         isGenerating: latestRuntimeSnapshot?.isGenerating,
-        runtimeV2: latestRuntimeSnapshot?.runtimeV2,
+        activeRuntimeV2: activeSnapshot?.runtimeV2,
         capsuleTimeline: capsuleTimeline.slice(-40),
         visibleTimeline: visibleTimeline.slice(-80),
-        debugTail: latestRuntimeSnapshot?.runtimeV2?.debug,
+        debugTail: (activeSnapshot?.debugTail || [])
+          .filter((entry: { source?: string }) =>
+            /runtime_v2|terminal|error|failed|recovery|timeout|watchdog/i.test(
+              String(entry?.source || ""),
+            )
+          )
+          .slice(-120),
       }).slice(-120_000)}`);
       throw error;
     }

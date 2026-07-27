@@ -36,6 +36,14 @@ export interface CreateRuntimeV2CheckpointInput {
   readonly updatedAt: number;
 }
 
+/**
+ * A deserialized checkpoint is replay-validated once at the persistence
+ * boundary. Checkpoints created by the reducer, and normalized copies that
+ * already passed replay validation, are immutable runtime values and can use
+ * the incremental CAS path without replaying the whole ledger on every event.
+ */
+const trustedRuntimeV2Checkpoints = new WeakSet<object>();
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -67,6 +75,35 @@ function isFinitePositiveInteger(value: unknown): value is number {
 
 function isFiniteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function checkpointOwner(
+  value: Record<string, unknown>,
+  expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+): RuntimeV2TurnIdentity | null {
+  if (!isPlainRecord(value.owner)) return null;
+  const owner = value.owner as unknown as RuntimeV2TurnIdentity;
+  if (![owner.workspaceKey, owner.sessionKey, owner.sessionEpoch, owner.clientSubmissionId, owner.turnId]
+    .every((part) => typeof part === "string" && part.trim() === part && part.length > 0)) return null;
+  if (expectedOwner && Object.entries(expectedOwner).some(([key, expected]) =>
+    expected !== undefined && owner[key as keyof RuntimeV2TurnIdentity] !== expected
+  )) return null;
+  return owner;
+}
+
+function hasValidCheckpointHeader(
+  value: Record<string, unknown>,
+  expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+): value is Record<string, unknown> & {
+  revision: number;
+  updatedAt: number;
+  owner: RuntimeV2TurnIdentity;
+} {
+  return value.schemaVersion === RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION &&
+    value.engineVersion === RUNTIME_V2_ENGINE_VERSION &&
+    isFinitePositiveInteger(value.revision) &&
+    isFiniteTimestamp(value.updatedAt) &&
+    !!checkpointOwner(value, expectedOwner);
 }
 
 /** The digest covers the full replayed state, including scheduled effects. */
@@ -101,7 +138,7 @@ export function createRuntimeV2Checkpoint(
   if (input.aggregate.events.length > MAX_RUNTIME_V2_CHECKPOINT_EVENTS) {
     throw new Error("Runtime v2 checkpoint event budget exceeded.");
   }
-  return {
+  const checkpoint: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
     engineVersion: RUNTIME_V2_ENGINE_VERSION,
     revision,
@@ -112,6 +149,8 @@ export function createRuntimeV2Checkpoint(
     aggregateDigest: digest,
     updatedAt,
   };
+  trustedRuntimeV2Checkpoints.add(checkpoint);
+  return checkpoint;
 }
 
 /**
@@ -123,21 +162,16 @@ export function normalizeRuntimeV2Checkpoint(
   expectedOwner?: Partial<RuntimeV2TurnIdentity>,
 ): RuntimeV2CheckpointV3 | null {
   if (!isPlainRecord(value)) return null;
+  if (!hasValidCheckpointHeader(value, expectedOwner)) return null;
+  if (trustedRuntimeV2Checkpoints.has(value)) {
+    return value as unknown as RuntimeV2CheckpointV3;
+  }
   try {
     if (JSON.stringify(value).length > MAX_RUNTIME_V2_CHECKPOINT_CHARS) return null;
   } catch {
     return null;
   }
-  if (value.schemaVersion !== RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION || value.engineVersion !== RUNTIME_V2_ENGINE_VERSION) {
-    return null;
-  }
-  if (!isFinitePositiveInteger(value.revision) || !isFiniteTimestamp(value.updatedAt) || !isPlainRecord(value.owner)) return null;
   const owner = value.owner as unknown as RuntimeV2TurnIdentity;
-  if (![owner.workspaceKey, owner.sessionKey, owner.sessionEpoch, owner.clientSubmissionId, owner.turnId]
-    .every((part) => typeof part === "string" && part.trim() === part && part.length > 0)) return null;
-  if (expectedOwner && Object.entries(expectedOwner).some(([key, expected]) =>
-    expected !== undefined && owner[key as keyof RuntimeV2TurnIdentity] !== expected
-  )) return null;
   if (!Array.isArray(value.events)) return null;
   const replayed = replayRuntimeV2Events(value.events as RuntimeV2Event[]);
   if (!replayed || !sameOwner(replayed.turn, owner)) return null;
@@ -145,7 +179,7 @@ export function normalizeRuntimeV2Checkpoint(
   if (value.aggregateDigest !== digest || !sameJson(value.aggregate, replayed)) return null;
   if (!sameJson(value.scheduledCommands, replayed.scheduledCommands)) return null;
   if (value.updatedAt < replayed.updatedAt) return null;
-  return {
+  const normalized: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
     engineVersion: RUNTIME_V2_ENGINE_VERSION,
     revision: value.revision,
@@ -156,6 +190,8 @@ export function normalizeRuntimeV2Checkpoint(
     aggregateDigest: digest,
     updatedAt: value.updatedAt,
   };
+  trustedRuntimeV2Checkpoints.add(normalized);
+  return normalized;
 }
 
 export function normalizeRuntimeV2CheckpointMap(

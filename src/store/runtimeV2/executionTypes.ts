@@ -65,6 +65,8 @@ export interface RuntimeV2ExecutionPortsInput {
   readonly live: RuntimeV2LiveExecutionState;
   readonly nextId: (scope: string) => string;
   readonly now: () => number;
+  /** Absolute Turn deadline shared by provider and effect adapters. */
+  readonly lifecycleDeadlineAt?: number;
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
