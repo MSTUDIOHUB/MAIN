@@ -4,6 +4,7 @@ import type {
   GoalContinuationAuthorization,
   GoalCreationAuthorization,
 } from "./submit/turnSubmission";
+import type { CanonicalRunIdentity } from "./turnRuntimeContract";
 
 export const GLOBAL_CHAT_KEY = "__MAIN_GLOBAL_CHAT__";
 
@@ -36,6 +37,8 @@ export interface ProviderCompatibilityRuntimeLaneState {
   fallbackExpiresAt: number | null;
   nativeSuccessStreak: number;
   lastFallbackAt: number;
+  /** Until this instant, preserve native tools but omit the rejected `required` value. */
+  requiredToolChoiceFallbackExpiresAt?: number | null;
 }
 
 export interface QueuedUserMessage {
@@ -61,9 +64,11 @@ export interface QueuedUserMessage {
 }
 
 export interface ActiveGuidance {
+  schemaVersion: 1;
   id: string;
   text: string;
-  turnId: string | null;
+  /** Guidance is a one-shot input owned by one exact Run attempt. */
+  target: CanonicalRunIdentity;
   createdAt: number;
   consumedAt?: number | null;
 }

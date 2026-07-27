@@ -231,7 +231,10 @@ test("plan, web, tabular, game studio, and goal modules are conditional", () => 
 
   const plan = buildPrompt({ intent: "plan", available: ["read_file"], toolDefinitions: [tools[0]] });
   assert.match(plan, /\[PLAN\]/);
-  assert.match(plan, /<proposed_plan>/);
+  assert.match(plan, /versioned PLAN AUTHORING CONTRACT/);
+  assert.match(plan, /quality gate checks the criteria disclosed before drafting/i);
+  assert.match(plan, /through the transport declared by the latest injected \[PLAN AUTHORING CONTRACT\]/);
+  assert.doesNotMatch(plan, /emit exactly one complete `<plan_candidate>`|call `submit_plan_candidate` exactly once/i);
 
   const webTool = {
     type: "function",
@@ -311,15 +314,4 @@ test("systemPrompt no longer contains a second hardcoded tool-description catalo
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/systemPrompt.ts"), "utf8");
   assert.doesNotMatch(source, /addToolDescription|TOOL_REQUIRED_ARGUMENTS/);
   assert.doesNotMatch(source, /replace_in_file:.*search, replace/);
-});
-
-test("Chinese approved-plan continuation remains tool-protocol neutral", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const start = source.indexOf("export function buildApprovedPlanContinuationPrompt");
-  const end = source.indexOf("export function shouldTreatCloudGatewayErrorAsCompatibility", start);
-  const promptBuilder = source.slice(start, end);
-
-  assert.ok(start >= 0 && end > start);
-  assert.match(promptBuilder, /当前暴露的正式工具调用/);
-  assert.doesNotMatch(promptBuilder, /使用\s*<tool_use>\s*格式/);
 });

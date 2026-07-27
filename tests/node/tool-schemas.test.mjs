@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 
@@ -9,20 +9,44 @@ import ts from "typescript";
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
 
-async function loadToolSchemasModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/toolSchemas.ts");
-  const source = await fs.readFile(sourcePath, "utf8");
+const transpiledModuleCache = new Map();
+
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
-    fileName: sourcePath,
+    fileName: normalizedPath,
   }).outputText;
 
   const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      for (const candidate of [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ]) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return require(specifier);
+  };
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, require);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
 
@@ -30,7 +54,7 @@ const {
   buildToolDefinitions,
   normalizeToolParametersSchema,
   normalizeToolDefinition,
-} = await loadToolSchemasModule();
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolSchemas.ts"));
 
 test("tool schema normalization patches description-only leaf fields", () => {
   const schema = normalizeToolParametersSchema({
@@ -86,6 +110,110 @@ test("shell tool schemas require execution descriptions and expose cwd metadata"
   assert.ok(executeCommand.function.parameters.properties.cwd);
   assert.ok(executeCommand.function.parameters.properties.wait_ms);
   assert.ok(executeCommand.function.parameters.properties.max_chars);
+});
+
+test("typed Plan submission schema carries the complete provider-neutral graph", () => {
+  const tools = buildToolDefinitions([]);
+  const submit = tools.find((tool) =>
+    tool.function.name === "submit_plan_candidate"
+  );
+
+  assert.ok(submit);
+  assert.deepEqual(submit.function.parameters.required, [
+    "schemaVersion",
+    "evidenceRefs",
+    "goalEvidenceBases",
+    "summary",
+    "diagnoses",
+    "changes",
+    "decisions",
+    "interfaces",
+    "validations",
+    "assumptions",
+    "blockingChoices",
+  ]);
+  const properties = submit.function.parameters.properties;
+  assert.equal(properties.diagnoses.type, "array");
+  assert.equal(properties.diagnoses.items.type, "object");
+  assert.deepEqual(properties.diagnoses.items.properties.certainty.enum, [
+    "observed",
+    "inferred",
+    "hypothesis",
+  ]);
+  assert.deepEqual(properties.goalEvidenceBases.items.required, [
+    "goalRef",
+    "componentRef",
+    "evidenceRefs",
+    "ownerRefs",
+    "relationRefs",
+    "diagnosisRefs",
+  ]);
+  assert.equal(properties.changes.items.properties.evidenceRefs.items.type, "string");
+  const plannedHarness = properties.changes.items.properties.plannedValidationHarness;
+  assert.deepEqual(plannedHarness.required, ["surface", "ownerRef", "binding"]);
+  assert.deepEqual(
+    plannedHarness.properties.binding.oneOf.map((branch) => branch.properties.kind.enum[0]),
+    ["direct_target", "manifest_script"],
+  );
+  assert.equal(properties.validations.items.properties.harnessChangeRef.type, "string");
+  const primitive = properties.validations.items.properties.primitive;
+  assert.equal(primitive.type, undefined);
+  assert.equal(primitive.oneOf.length, 6);
+  const branchByKind = new Map(primitive.oneOf.map((branch) => [
+    branch.properties.kind.enum[0],
+    branch,
+  ]));
+  assert.deepEqual([...branchByKind.keys()], [
+    "finite_command",
+    "service_observation",
+    "browser_interaction",
+    "desktop_interaction",
+    "assertion",
+    "advisory",
+  ]);
+  assert.deepEqual(branchByKind.get("finite_command").required, ["kind", "command"]);
+  assert.deepEqual(branchByKind.get("service_observation").required, [
+    "kind",
+    "launchCommand",
+    "ownerKey",
+    "readiness",
+  ]);
+  assert.deepEqual(branchByKind.get("assertion").required, [
+    "kind",
+    "acceptance",
+    "target",
+    "matcher",
+    "producer",
+  ]);
+  assert.deepEqual(branchByKind.get("advisory").required, ["kind", "note"]);
+  assert.deepEqual(branchByKind.get("assertion").properties.acceptance.enum, ["advisory"]);
+
+  const browser = branchByKind.get("browser_interaction").properties;
+  const desktop = branchByKind.get("desktop_interaction").properties;
+  assert.ok(browser.actions.items.required.includes("id"));
+  assert.ok(browser.actions.items.properties.kind.enum.includes("click"));
+  assert.ok(browser.actions.items.properties.kind.enum.includes("navigate"));
+  assert.ok(!browser.actions.items.properties.kind.enum.includes("open"));
+  assert.ok(desktop.actions.items.properties.kind.enum.includes("open"));
+  assert.ok(browser.assertions.items.properties.kind.enum.includes("visibility"));
+  assert.ok(browser.assertions.items.properties.kind.enum.includes("dialog"));
+  assert.equal(browser.assertions.minItems, 1);
+  assert.match(browser.assertions.items.properties.afterActionId.description, /caus/i);
+
+  const scalarTypes = (schema) => schema.anyOf.map((entry) => entry.type);
+  assert.deepEqual(
+    scalarTypes(branchByKind.get("service_observation").properties.readiness.properties.expected),
+    ["string", "number", "boolean"],
+  );
+  assert.deepEqual(
+    scalarTypes(browser.assertions.items.properties.expected),
+    ["string", "number", "boolean", "null"],
+  );
+  assert.deepEqual(
+    scalarTypes(branchByKind.get("assertion").properties.expected),
+    ["string", "number", "boolean", "null"],
+  );
+  assert.match(submit.function.description, /never writes files/i);
 });
 
 test("browser validation schema exposes local Playwright checks", () => {

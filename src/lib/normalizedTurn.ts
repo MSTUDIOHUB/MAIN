@@ -5,6 +5,7 @@ import { parseTextForTools } from "./textToolParser";
 import { extractReplyOptions, normalizeReplyOptionLabel, normalizeReplyOptionValue } from "./replyOptions";
 import { sanitizeVisibleAssistantText } from "./sanitize";
 import type { StreamResult } from "./streaming";
+import { isReservedVisualObservationProtocolToolName } from "./visualContext";
 import type { NormalizedStreamState, NormalizedToolCall, ReplyOption } from "./workflowModels";
 
 // region: 推理文本提取
@@ -359,7 +360,11 @@ function compactReasoningText(text: string, maxChars = Number.POSITIVE_INFINITY)
 
 function normalizeNativeToolCalls(result: StreamResult): NormalizedToolCall[] {
   return result.toolCalls
-    .filter((call) => call.name && call.arguments != null)
+    .filter((call) =>
+      call.name &&
+      call.arguments != null &&
+      !isReservedVisualObservationProtocolToolName(call.name)
+    )
     .map((call, index) => ({
       id: call.id?.trim() || `native_call_${index + 1}`,
       name: call.name,

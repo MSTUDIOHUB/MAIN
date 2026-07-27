@@ -2,6 +2,18 @@ import type { PendingSlashCommand } from "./gameStudio/catalog";
 import type { MainModeKey } from "./mainModes";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";
+
+/**
+ * `chat` is the container for a workspace-free conversation only. A
+ * workspace-bound read-only intent remains read-only through its capability
+ * policy, but its Session/Turn container is a task (`edit`) rather than Chat.
+ */
+export function resolveWorkspaceAwareWorkflowMode(
+  mode: LegacyWorkflowMode,
+  hasWorkspace: boolean,
+): LegacyWorkflowMode {
+  return hasWorkspace && mode === "chat" ? "edit" : mode;
+}
 export type ResolvedUserIntent =
   | "respond"
   | "discuss"
@@ -374,6 +386,43 @@ const STRONG_EXECUTE_PATTERNS = [
   /\b(?:run|execute|start).{0,24}(?:deploy(?:\.sh)?|deployment script|command)\b/i,
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
+
+const WORKSPACE_MUTATION_REQUEST_RE = /(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i;
+
+const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
+  /^(?:(?:please|kindly|now|directly)\s+|(?:can|could|would|will)\s+you\s+)*(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
+  /\b(?:find|locate|identify|investigate|diagnose|analy[sz]e|inspect|trace)\b.{0,80}\b(?:root causes?|causes?|issues?|problems?|bugs?|errors?|failures?|faults?)\b.{0,120}\b(?:implement|fix|repair|resolve|update|patch|modify|refactor|remove|replace|change)\b/i,
+  /(?:[.!?;,：，。！？；]\s*|\b(?:and|then|next)\s+)(?:please\s+)?(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
+  /^(?:(?:请|帮我|现在|直接|立即|马上|然后|随后|再)\s*)*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
+  /(?:[，。！？；：]\s*|(?:并且|然后|随后|再|并)\s*)(?:请|帮我|现在|直接)?\s*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
+];
+
+const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
+  /(?:不要|无需|不需要|请勿|禁止|别).{0,10}(?:修改|实现|修复|解决|处理|写入|创建|生成|改动|新增|添加|删除|替换|重构|执行)/i,
+  /(?:只|仅).{0,8}(?:分析|检查|解释|诊断|审查|评估|排查|总结|报告).{0,32}(?:不要|无需|不需要|请勿|禁止|别).{0,16}(?:修改|改动|写入|执行)?/i,
+  /\b(?:do not|don't|dont|no need to|without)\s+(?:implementing?|fixing?|repairing?|resolving?|writing?|creating?|generating?|updating?|patching?|modifying?|refactoring?|deleting?|removing?|replacing?|adding?|changing?|running|executing)\b/i,
+  /\b(?:only|just)\s+(?:analy[sz]e|inspect|explain|diagnose|review|assess|investigate|summari[sz]e|report)\b.{0,48}\b(?:do not|don't|without)\b/i,
+];
+
+function hasReadOnlyWorkspaceConstraint(input: string): boolean {
+  return matchesAny(input, READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS);
+}
+
+/**
+ * Resolve the requested workspace effect once, before provider/model routing.
+ * This signal is shared by Turn intent and command-directive inference so a
+ * semantic "find/explain" cue cannot silently erase an explicit edit request.
+ */
+export function looksLikeExplicitWorkspaceMutationRequest(input: string): boolean {
+  const normalizedInput = normalizeInput(input);
+  if (!normalizedInput || hasReadOnlyWorkspaceConstraint(normalizedInput)) return false;
+  if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) return false;
+  if (!WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput)) return false;
+  return (
+    matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS) ||
+    matchesAny(normalizedInput, DIRECT_WORKSPACE_MUTATION_PATTERNS)
+  );
+}
 
 const GAME_STUDIO_EXECUTE_PATTERNS = [
   /(?:立即|马上|现在|直接|开始|继续)(?:开始)?(?:重构|完善|实现|改造|开发|处理|执行|接入|集成)/i,
@@ -878,7 +927,6 @@ function inferShellAction(input: string): string {
   return "run";
 }
 
-const WORKSPACE_MUTATION_REQUEST_RE = /(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i;
 const EXPLICIT_SHELL_COMMAND_RE = /^(?:npm|pnpm|yarn|bun|node|python|python3|pytest|cargo|go|rustc|dotnet|bash|sh|make)\b/i;
 
 export function looksLikeExplicitShellCommandInput(value: unknown): boolean {
@@ -914,8 +962,12 @@ export function inferCommandDirective(
   const normalizedInput = normalizeInput(input);
   const lower = normalizedInput.toLowerCase();
   const workspaceMutationExpected =
-    (intent === "execute" || intent === "plan") &&
-    WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput);
+    looksLikeExplicitWorkspaceMutationRequest(normalizedInput) ||
+    (
+      (intent === "execute" || intent === "plan") &&
+      WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput) &&
+      !hasReadOnlyWorkspaceConstraint(normalizedInput)
+    );
   const explicitShellCommand = looksLikeExplicitShellCommandInput(lower);
   const remoteShellOperation = /(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)|(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i.test(normalizedInput);
   const naturalShellOperation = /\b(?:run|execute|start)\b.{0,24}\b(?:command|script|deploy|test|build|server)\b/i.test(lower) ||
@@ -1590,7 +1642,9 @@ export function resolveTurnRunIntent(
   }
 
   const hasStrongSummarizeSignal = matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS);
-  const hasStrongExecuteSignal = matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS);
+  const hasStrongExecuteSignal =
+    matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS) ||
+    looksLikeExplicitWorkspaceMutationRequest(normalizedInput);
   const hasStrongAnalyzeSignal = matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS);
 
   if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {

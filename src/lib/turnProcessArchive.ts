@@ -118,6 +118,16 @@ function isToolBlock(block: any): boolean {
   return block?.type === "tool";
 }
 
+function getSemanticToolName(block: any): string {
+  return String(block?.executionName || block?.toolName || "");
+}
+
+function hasTerminalMutationDiff(block: any): boolean {
+  if (!isToolBlock(block) || !block.diff) return false;
+  const status = String(block.toolStatus || block.status || "").toLowerCase();
+  return status === "executed" || status === "failed" || status === "error";
+}
+
 function isThoughtBlock(block: any): boolean {
   return block?.type === "thought" && String(block.content || "").trim().length > 0;
 }
@@ -165,7 +175,7 @@ function isLiveProcessCandidate(block: any): boolean {
   }
   if (block.type === "tool") {
     const status = String(block.toolStatus || block.status || "").toLowerCase();
-    return status === "executed" || status === "running";
+    return status === "executed" || status === "running" || status === "failed" || status === "error" || status === "rejected";
   }
   return block.type === "jobList" || block.type === "system";
 }
@@ -183,8 +193,12 @@ function isContextPhase(kind: TurnArchiveStepKind): boolean {
 }
 
 function getToolStepKind(block: any): TurnArchiveStepKind {
+  const semanticToolName = getSemanticToolName(block);
+  if (hasTerminalMutationDiff(block) && EDIT_ACTIVITY_TOOL_NAMES.has(semanticToolName)) {
+    return "edit";
+  }
   const phase = deriveToolPhase({
-    toolName: String(block?.toolName || ""),
+    toolName: semanticToolName,
     target: String(block?.target || ""),
     status: String(block?.status || ""),
     toolStatus: String(block?.toolStatus || ""),
@@ -217,7 +231,7 @@ function compactTarget(block: any, language: ToolPresentationLanguage): string {
   if (!isToolBlock(block)) return "";
   return compactToolPresentationTarget(
     String(block.target || ""),
-    String(block.toolName || ""),
+    getSemanticToolName(block),
     language,
   );
 }
@@ -388,7 +402,7 @@ function compactActivityTargetForTitle(target: string, toolName = ""): string {
 
 function toolActionForActivityTitle(block: any, language: ToolPresentationLanguage): string {
   if (!isToolBlock(block) && !isProgressBlock(block)) return "";
-  const toolName = String(block.toolName || "");
+  const toolName = getSemanticToolName(block);
   const target = compactActivityTargetForTitle(String(block.target || compactTarget(block, language) || ""), toolName);
   const rawTarget = target || (language === "zh" ? "目标" : "target");
   if (language === "en") {
@@ -533,8 +547,13 @@ function isActivityCachedResult(block: any): boolean {
   return /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|Repeated read-only tool call skipped/i.test(text);
 }
 
-function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatus): ActivityCellKind {
+function classifyToolActivityKind(
+  toolName: string,
+  status: TurnArchiveStepStatus,
+  hasMutationDiff = false,
+): ActivityCellKind {
   if (status === "failed" || status === "rejected") {
+    if (hasMutationDiff && EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
     return isExploringToolName(toolName) ? "exploring" : "blocked";
   }
   if (isExploringToolName(toolName)) return "exploring";
@@ -551,10 +570,10 @@ function classifyBlockActivityKind(block: any): ActivityCellKind {
   if (isReviewablePlanBlock(block)) return "plan";
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
-    return classifyToolActivityKind(String(block.toolName || ""), status);
+    return classifyToolActivityKind(getSemanticToolName(block), status, hasTerminalMutationDiff(block));
   }
   if (isProgressBlock(block)) {
-    const toolName = String(block.toolName || "");
+    const toolName = getSemanticToolName(block);
     if (toolName) return classifyToolActivityKind(toolName, mapProgressStatus(block));
     const phase = String(block.phase || "");
     if (phase === "editing") return "edit";
@@ -675,7 +694,7 @@ function planRuntimeRecoveryHint(phase: PlanRuntimeArchivePhase, reason: string,
 
 function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void {
   if (!isToolBlock(block)) return;
-  const toolName = String(block.toolName || "");
+  const toolName = getSemanticToolName(block);
   metrics.tools += 1;
   const status = mapToolStatus(block);
   if (status === "failed") metrics.failed += 1;
@@ -691,7 +710,7 @@ function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void
   else if (toolName === "browser_evaluate") metrics.browserValidations += 1;
   else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) metrics.terminalReads += 1;
   else if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input") metrics.commandsRun += 1;
-  else if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) {
+  else if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName) && hasTerminalMutationDiff(block)) {
     const diff = block.diff || {};
     const existed = typeof diff.existed === "boolean" ? diff.existed : String(diff.old || "").length > 0;
     if (toolName === "write_file" && !existed) metrics.filesCreated += 1;
@@ -754,10 +773,10 @@ function makeActivityMetricParts(metrics: ActivityMetrics, language: ToolPresent
 function makeExplorationRepeatParts(items: any[], language: ToolPresentationLanguage): string[] {
   const counts = new Map<string, { target: string; count: number; cached: number }>();
   for (const item of items) {
-    if (!isToolBlock(item) || !isExploringToolName(String(item.toolName || ""))) continue;
+    if (!isToolBlock(item) || !isExploringToolName(getSemanticToolName(item))) continue;
     const target = compactTarget(item, language);
     if (!target) continue;
-    const key = `${String(item.toolName || "")}:${target}`.toLowerCase();
+    const key = `${getSemanticToolName(item)}:${target}`.toLowerCase();
     const current = counts.get(key) || { target, count: 0, cached: 0 };
     current.count += 1;
     if (isActivityCachedResult(item)) current.cached += 1;
@@ -782,7 +801,7 @@ function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics
   let terminalReads = 0;
   for (const item of items) {
     if (!isToolBlock(item)) continue;
-    const toolName = String(item.toolName || "");
+    const toolName = getSemanticToolName(item);
     const target = compactTarget(item, language);
     if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt" || toolName === "get_file_outline" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
       if (target) readTargets.add(target);
@@ -1308,7 +1327,7 @@ function resolveToolIntent(block: any, kind: TurnArchiveStepKind, language: Tool
   if (persisted) return persisted;
   if (!isToolBlock(block)) return defaultIntentForStep(kind, language);
   return deriveToolIntentSummary({
-    toolName: String(block.toolName || ""),
+    toolName: getSemanticToolName(block),
     target: String(block.target || ""),
     language,
     status: String(block.status || ""),
@@ -1628,8 +1647,8 @@ function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnAr
   if (current.kind === "thinking" || next.kind === "thinking") return false;
   if (current.kind === "message" || next.kind === "message") return false;
   if (
-    current.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(item?.toolName || ""))) ||
-    next.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(item?.toolName || "")))
+    current.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(item))) ||
+    next.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(item)))
   ) {
     return false;
   }
@@ -1713,9 +1732,12 @@ function makeStep(input: {
 
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
-    const kind = status === "failed" || status === "rejected" ? "blocked" : getToolStepKind(block);
+    const semanticKind = getToolStepKind(block);
+    const kind = (status === "failed" || status === "rejected") && semanticKind !== "edit"
+      ? "blocked"
+      : semanticKind;
     const target = compactTarget(block, language);
-    const isGameStudioTool = GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(block.toolName || ""));
+    const isGameStudioTool = GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(block));
     return {
       id: `turn-archive-step-${kind}-${block.id ?? index}`,
       kind: isGameStudioTool && kind === "message" ? "command" : kind,
@@ -1842,7 +1864,7 @@ function makeCounts(steps: TurnArchiveStep[]): TurnProcessArchiveCounts {
     if (step.status === "failed") counts.failed += 1;
     if (step.status === "rejected") counts.rejected += 1;
     for (const item of step.items) {
-      const toolName = String(item?.toolName || "");
+      const toolName = getSemanticToolName(item);
       if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
         counts.table += 1;
       }

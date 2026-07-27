@@ -148,6 +148,75 @@ test("restore retains an unapproved actionable Plan artifact", () => {
   assert.deepEqual(restored.rejected, []);
 });
 
+test("restore fail-closes typed metadata when the sealed candidate was lost", () => {
+  const content = buildActionablePlan();
+  const restored = sanitizeRestoredPlanArtifacts({
+    artifacts: [artifact(content, {
+      candidateHash: "plan-candidate-sha256-lost",
+      authoringContractId: "plan-authoring-contract-lost",
+    })],
+    isPlanApproved: false,
+  });
+
+  assert.deepEqual(restored.artifacts, []);
+  assert.deepEqual(restored.rejected, [{
+    path: ".MAIN/plans/plan.md",
+    kind: "plan",
+    reason: "candidate_metadata_without_candidate",
+  }]);
+  assert.deepEqual(
+    restored.candidateIntegrityRejectedPaths,
+    [".MAIN/plans/plan.md"],
+  );
+});
+
+test("restore retains approved partial typed metadata only as a non-executable audit record", () => {
+  const content = buildActionablePlan();
+  const restored = sanitizeRestoredPlanArtifacts({
+    artifacts: [artifact(content, {
+      candidateHash: "plan-candidate-sha256-lost",
+      authoringContractId: "plan-authoring-contract-lost",
+    })],
+    isPlanApproved: true,
+  });
+
+  assert.equal(restored.artifacts.length, 1);
+  assert.equal(restored.artifacts[0].content, content.trim());
+  assert.deepEqual(restored.rejected, [{
+    path: ".MAIN/plans/plan.md",
+    kind: "plan",
+    reason: "candidate_metadata_without_candidate",
+  }]);
+  assert.deepEqual(
+    restored.candidateIntegrityRejectedPaths,
+    [".MAIN/plans/plan.md"],
+  );
+});
+
+test("restore treats a malformed typed candidate as data instead of throwing", () => {
+  const content = buildActionablePlan();
+  const malformed = artifact(content, {
+    candidate: { schemaVersion: 4, state: "sealed" },
+    candidateHash: "plan-candidate-sha256-malformed",
+    authoringContractId: "plan-authoring-contract-malformed",
+  });
+
+  assert.doesNotThrow(() => sanitizeRestoredPlanArtifacts({
+    artifacts: [malformed],
+    isPlanApproved: false,
+  }));
+  const restored = sanitizeRestoredPlanArtifacts({
+    artifacts: [malformed],
+    isPlanApproved: false,
+  });
+  assert.deepEqual(restored.artifacts, []);
+  assert.equal(restored.rejected[0]?.reason, "candidate_payload_malformed");
+  assert.deepEqual(
+    restored.candidateIntegrityRejectedPaths,
+    [".MAIN/plans/plan.md"],
+  );
+});
+
 test("restore rejects an unapproved Plan built on an unsupported hypothesis", () => {
   const content = buildUnsupportedHypothesisPlan();
   const structural = validatePlanArtifactContent(content, "plan");

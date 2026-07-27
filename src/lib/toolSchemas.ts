@@ -5,6 +5,23 @@
 
 import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
+import {
+  SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS,
+  SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS,
+  SUPPORTED_INTERACTION_ASSERTION_KINDS,
+} from "./validationContract";
+
+export interface ToolParameterSchema {
+  type?: string;
+  description?: string;
+  enum?: string[];
+  properties?: Record<string, ToolParameterSchema>;
+  items?: ToolParameterSchema;
+  required?: string[];
+  minItems?: number;
+  anyOf?: ToolParameterSchema[];
+  additionalProperties?: boolean | ToolParameterSchema;
+}
 
 export interface ToolDefinition {
   type: "function";
@@ -13,11 +30,366 @@ export interface ToolDefinition {
     description: string;
     parameters: {
       type: "object";
-      properties: Record<string, { type: string; description?: string; enum?: string[] }>;
+      properties: Record<string, ToolParameterSchema>;
       required: string[];
     };
   };
 }
+
+export const SUBMIT_PLAN_CANDIDATE_TOOL_NAME = "submit_plan_candidate";
+
+const PLAN_EXPECTED_SCALAR_SCHEMA = {
+  anyOf: [
+    { type: "string" },
+    { type: "number" },
+    { type: "boolean" },
+    { type: "null" },
+  ],
+  description: "Expected scalar value. Strings, numbers, booleans, and null use the same contract on native-tool and text-envelope transports.",
+};
+
+const PLAN_READINESS_EXPECTED_SCALAR_SCHEMA = {
+  anyOf: [
+    { type: "string" },
+    { type: "number" },
+    { type: "boolean" },
+  ],
+  description: "Expected service-readiness value. Strings, numbers, and booleans use the same contract on native-tool and text-envelope transports.",
+};
+
+const PLAN_INTERACTION_ASSERTION_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: {
+      type: "string",
+      enum: [...SUPPORTED_INTERACTION_ASSERTION_KINDS],
+    },
+    target: { type: "string" },
+    afterActionId: {
+      type: "string",
+      description: "ID of the action that must precede and cause this assertion. Required whenever actions are present.",
+    },
+    expected: { ...PLAN_EXPECTED_SCALAR_SCHEMA },
+  },
+  required: ["kind", "target"],
+};
+
+function planInteractionActionSchema(kinds: readonly string[]) {
+  return {
+    type: "object",
+    properties: {
+      id: {
+        type: "string",
+        description: "Stable action ID. Required so a post-action assertion can name the exact causal action.",
+      },
+      kind: {
+        type: "string",
+        enum: [...kinds],
+      },
+      target: { type: "string" },
+    },
+    required: ["id", "kind", "target"],
+  };
+}
+
+const PLAN_VALIDATION_PRIMITIVE_SCHEMA = {
+  description: "Tagged validation primitive. Select exactly one kind branch and provide every field required by that branch; shared typed ingress performs semantic validation after transport decoding.",
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["finite_command"] },
+        command: { type: "string" },
+        cwd: { type: "string" },
+        timeoutMs: { type: "number" },
+        description: { type: "string" },
+      },
+      required: ["kind", "command"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["service_observation"] },
+        launchCommand: { type: "string" },
+        cwd: { type: "string" },
+        ownerKey: { type: "string" },
+        readiness: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["process_status", "output_pattern", "port", "custom"] },
+            expected: { ...PLAN_READINESS_EXPECTED_SCALAR_SCHEMA },
+            target: { type: "string" },
+          },
+          required: ["kind", "expected"],
+        },
+        description: { type: "string" },
+      },
+      required: ["kind", "launchCommand", "ownerKey", "readiness"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["browser_interaction"] },
+        actions: {
+          type: "array",
+          items: planInteractionActionSchema(SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS),
+        },
+        assertions: {
+          type: "array",
+          minItems: 1,
+          items: PLAN_INTERACTION_ASSERTION_SCHEMA,
+        },
+        requireCausalAssertion: { type: "boolean" },
+        description: { type: "string" },
+      },
+      required: ["kind", "actions", "assertions"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["desktop_interaction"] },
+        actions: {
+          type: "array",
+          items: planInteractionActionSchema(SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS),
+        },
+        assertions: {
+          type: "array",
+          minItems: 1,
+          items: PLAN_INTERACTION_ASSERTION_SCHEMA,
+        },
+        requireCausalAssertion: { type: "boolean" },
+        description: { type: "string" },
+      },
+      required: ["kind", "actions", "assertions"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["assertion"] },
+        acceptance: {
+          type: "string",
+          enum: ["advisory"],
+          description: "Standalone assertions are non-blocking observations and never close Plan acceptance.",
+        },
+        target: { type: "string" },
+        matcher: {
+          type: "string",
+          enum: ["equals", "not_equals", "contains", "matches", "exists", "not_exists", "runtime_result"],
+        },
+        producer: {
+          type: "string",
+          enum: ["runtime_evidence_ledger", "workspace_file_state", "artifact_store"],
+        },
+        expected: { ...PLAN_EXPECTED_SCALAR_SCHEMA },
+        description: { type: "string" },
+      },
+      required: ["kind", "acceptance", "target", "matcher", "producer"],
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["advisory"] },
+        note: { type: "string" },
+        owner: { type: "string", enum: ["user", "external", "runtime"] },
+        description: { type: "string" },
+      },
+      required: ["kind", "note"],
+    },
+  ],
+};
+
+/**
+ * Runtime-control tool used only after Plan evidence has been frozen.  The
+ * schema mirrors TypedPlanDraftV1 and makes each primitive's required field
+ * shape explicit. Shared typed ingress still owns semantic, causal, and
+ * acceptance-capability validation so every provider follows the same
+ * validate/seal/render path.
+ */
+export const SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION = {
+  type: "function",
+  function: {
+    name: SUBMIT_PLAN_CANDIDATE_TOOL_NAME,
+    description: "Submit the complete typed Plan graph for runtime validation and review. This is a runtime control action: it never writes files or executes the Plan. Submit one complete replacement object; use textual <user_options> instead only when a genuinely user-owned choice blocks planning.",
+    parameters: {
+      type: "object",
+      properties: {
+        schemaVersion: {
+          type: "number",
+          description: "Typed Plan draft schema version. Must be 2.",
+        },
+        evidenceRefs: {
+          type: "array",
+          description: "Frozen evidence IDs used by this Plan, such as E1. Include every E listed by runtime Q coverage obligations.",
+          items: { type: "string" },
+        },
+        goalEvidenceBases: {
+          type: "array",
+          description: "Explicit semantic G-to-B mapping. Assign every required B and at least one selected B to every G. Optional B may be omitted; one G may use several B, but one B cannot be assigned to different goals.",
+          items: {
+            type: "object",
+            properties: {
+              goalRef: { type: "string" },
+              componentRef: { type: "string" },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              ownerRefs: { type: "array", items: { type: "string" } },
+              relationRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["goalRef", "componentRef", "evidenceRefs", "ownerRefs", "relationRefs", "diagnosisRefs"],
+          },
+        },
+        summary: {
+          type: "array",
+          description: "Short review summary lines. May be empty.",
+          items: { type: "string" },
+        },
+        diagnoses: {
+          type: "array",
+          description: "Root-cause or inference nodes with explicit evidence and goal edges.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique R-number ID, for example R1." },
+              text: { type: "string", description: "Diagnosis statement." },
+              certainty: {
+                type: "string",
+                enum: ["observed", "inferred", "hypothesis"],
+                description: "Evidence status of this diagnosis.",
+              },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              goalRefs: { type: "array", items: { type: "string" } },
+              chainRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["id", "text", "certainty", "evidenceRefs", "goalRefs", "chainRefs"],
+          },
+        },
+        changes: {
+          type: "array",
+          description: "Explicit change operations. A non-mutation Plan may leave this empty and use decisions.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique C-number ID, for example C1." },
+              text: { type: "string", description: "Concrete change description." },
+              targetRef: { type: "string", description: "Exact target path or boundary from frozen evidence." },
+              targetOwnerRef: { type: "string", description: "For create only: an existing evidence-backed owner in the same boundary." },
+              operation: {
+                type: "string",
+                enum: ["modify", "create", "delete", "preserve"],
+              },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: { type: "array", items: { type: "string" } },
+              goalRefs: { type: "array", items: { type: "string" } },
+              expectedOutcome: { type: "string", description: "Observable outcome of this change." },
+              relationships: { type: "array", items: { type: "string" } },
+              plannedValidationHarness: {
+                type: "object",
+                description: "Optional future executable harness created or modified by this C. V must bind it with harnessChangeRef and a structurally matching finite command.",
+                properties: {
+                  surface: { type: "string", enum: ["browser", "desktop"] },
+                  ownerRef: { type: "string", description: "Evidence-backed owner; for create match targetOwnerRef, for modify match targetRef." },
+                  binding: {
+                    oneOf: [{
+                      type: "object",
+                      properties: {
+                        kind: { type: "string", enum: ["direct_target"] },
+                        targetRef: { type: "string" },
+                      },
+                      required: ["kind", "targetRef"],
+                    }, {
+                      type: "object",
+                      properties: {
+                        kind: { type: "string", enum: ["manifest_script"] },
+                        manifestRef: { type: "string" },
+                        scriptName: { type: "string" },
+                      },
+                      required: ["kind", "manifestRef", "scriptName"],
+                    }],
+                  },
+                },
+                required: ["surface", "ownerRef", "binding"],
+              },
+            },
+            required: [
+              "id",
+              "text",
+              "targetRef",
+              "operation",
+              "evidenceRefs",
+              "diagnosisRefs",
+              "goalRefs",
+              "expectedOutcome",
+            ],
+          },
+        },
+        decisions: {
+          type: "array",
+          description: "Explicit design or preservation decisions.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique D-number ID, for example D1." },
+              text: { type: "string", description: "Decision statement." },
+              disposition: { type: "string", enum: ["change", "preserve"] },
+              evidenceRefs: { type: "array", items: { type: "string" } },
+              diagnosisRefs: {
+                type: "array",
+                items: { type: "string" },
+                description: "Covering R-number diagnoses for this disposition; required for relationship evidence.",
+              },
+              goalRefs: { type: "array", items: { type: "string" } },
+            },
+            required: ["id", "text", "disposition", "evidenceRefs", "diagnosisRefs", "goalRefs"],
+          },
+        },
+        interfaces: {
+          type: "array",
+          description: "Public API, interface, or type impacts. May be empty.",
+          items: { type: "string" },
+        },
+        validations: {
+          type: "array",
+          description: "Required validations or advisory observations with explicit V/G/C references and one runtime primitive each. Every goal still needs a required finite command or browser/desktop interaction. Interaction targets must come from runtime-observed interaction evidence and match the required execution surface.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique V-number ID, for example V1." },
+              goalRefs: { type: "array", items: { type: "string" } },
+              changeRefs: { type: "array", items: { type: "string" } },
+              primitive: PLAN_VALIDATION_PRIMITIVE_SCHEMA,
+              harnessChangeRef: { type: "string", description: "Optional exact C reference that creates/modifies the planned executable harness used by this finite command." },
+              expectedOutcome: { type: "string", description: "Decidable expected outcome." },
+            },
+            required: ["id", "goalRefs", "changeRefs", "primitive", "expectedOutcome"],
+          },
+        },
+        assumptions: {
+          type: "array",
+          description: "Explicit non-blocking assumptions. May be empty.",
+          items: { type: "string" },
+        },
+        blockingChoices: {
+          type: "array",
+          description: "Must be empty for submission. Use textual <user_options> instead when a real user choice blocks planning.",
+          items: { type: "string" },
+        },
+      },
+      required: [
+        "schemaVersion",
+        "evidenceRefs",
+        "goalEvidenceBases",
+        "summary",
+        "diagnoses",
+        "changes",
+        "decisions",
+        "interfaces",
+        "validations",
+        "assumptions",
+        "blockingChoices",
+      ],
+    },
+  },
+} as unknown as ToolDefinition;
 
 function cloneJsonValue<T>(value: T): T {
   if (Array.isArray(value)) {
@@ -90,24 +462,40 @@ export function normalizeToolDefinitions(tools: ToolDefinition[]): ToolDefinitio
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION,
   {
     type: "function",
     function: {
       name: "spawn_subagent",
-      description: "异步创建一个隔离的只读子智能体来处理有界、可独立完成的探索或分析任务。决定并行创建多个子智能体时，在同一回复中并列调用多次，不要创建一个后等待其结束。常规并行上限为 2，不是必须填满的配额；简单任务使用 0 或 1 个。只有仍有第三个实质性独立范围时才创建第 3 个，runtime 会在首 token、内存与故障状态安全后弹性放行。立即返回运行句柄；主体应继续处理不重叠工作，之后用 wait_subagents 汇合。",
+      description: "创建一个全新的一次性子智能体来执行一个不可变、语义独立且窄于父目标的任务。运行时若把它作为当前唯一工具，即表示本轮已开启协作，必须先创建一个；恢复正常工具面后，仅在并行收益明确时继续创建。任务结束后实例会永久关闭，后续工作必须重新分析并创建新任务，不得复用旧 agent。相同语义任务会被 runtime 去重；路径只用于权限和租约隔离，不用于生成目标。子智能体运行期间主体应继续处理不重叠工作，依赖结果或最终回答前再 wait_subagents。",
       parameters: {
         type: "object",
         properties: {
+          task_key: { type: "string", description: "当前父回合内稳定、简短且能表达职责的语义任务键" },
+          task_kind: {
+            type: "string",
+            enum: ["explore", "review", "implement", "validate"],
+            description: "独立任务类型；implement 是唯一允许请求写租约的类型",
+          },
           objective: { type: "string", description: "子智能体要独立完成的明确目标" },
+          delegation_reason: { type: "string", description: "可选：为什么该任务值得独立委派；省略时由运行时补充中性原因" },
+          success_criteria: { type: "string", description: "可选：可判定的成功标准；省略时要求返回与目标相关的实质性工具证据" },
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
-          scope_key: { type: "string", description: "稳定、简短且唯一的职责范围标识" },
-          scope: { type: "string", description: "该子智能体独占的职责边界，不得与主体当前探索重复" },
-          context_hints: { type: "string", description: "可选的紧凑上下文提示，不要复制整段主对话" },
-          allowed_paths: { type: "string", description: "允许读取和搜索的工作区路径，使用逗号分隔；本地任务最多 6 个" },
-          expected_output: { type: "string", description: "汇合时需要返回的证据结构或判断" },
+          scope: { type: "string", description: "可选的职责边界说明；不能替代 objective 和 success_criteria" },
+          required_paths: { type: "string", description: "可选：成功标准要求必须覆盖的精确路径" },
+          allowed_paths: { type: "string", description: "权限与租约上限，使用逗号分隔；只读任务可省略并限定为当前工作区，implement/write 必须提供精确路径，本地任务最多 6 个" },
+          access_mode: {
+            type: "string",
+            enum: ["read", "write"],
+            description: "可选，默认 read；write 仅适用于 implement，恢复阶段不可请求，并且必须继承父级 Execute/Goal 权限或精确落在已批准 Plan 的写范围内",
+          },
+          expected_output: { type: "string", description: "可选：汇合时需要返回的证据结构或判断；省略时返回带精确目标的来源证据" },
+          depends_on: { type: "string", description: "可选，依赖的 collaboration task ID 或 task_key，逗号分隔" },
+          independent_review_of: { type: "string", description: "可选；仅 reviewer 用于声明对指定 task ID/task_key 的有意独立复核" },
+          goal_slice_id: { type: "string", description: "可选；仅 Goal 模式用于关联父级 goal slice，普通回合不要填写" },
         },
-        required: ["objective", "scope_key", "scope", "allowed_paths", "expected_output"],
+        required: ["objective"],
       },
     },
   },
@@ -120,6 +508,22 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         type: "object",
         properties: {
           subagent_ids: { type: "string", description: "可选，逗号分隔的子智能体 ID；省略则等待全部" },
+          collaboration_task_ids: { type: "string", description: "可选，逗号分隔的一次性任务 ID；可与 subagent_ids 二选一" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cancel_subagent",
+      description: "取消当前父回合中一个仍在活动的一次性子智能体。取消后该实例立即进入终态并关闭，永远不能再次激活；后续需要相似工作时必须创建新的语义任务。",
+      parameters: {
+        type: "object",
+        properties: {
+          subagent_id: { type: "string", description: "要取消的活动子智能体 ID" },
+          collaboration_task_id: { type: "string", description: "也可使用该一次性任务 ID 定位；二者至少提供一个" },
         },
         required: [],
       },

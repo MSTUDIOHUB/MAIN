@@ -10,12 +10,50 @@ type PendingToolCallLike = {
   toolCallId?: string;
   name?: string;
   arguments?: unknown;
-  risk?: "local_file_read" | "browser_control" | "desktop_control";
+  risk?: ToolPermissionActionRequest["risk"];
   localFileReadPath?: string;
   shellPermissionDecision?: unknown;
 } | null | undefined;
 
 type ToolTaskBlock = Extract<TaskBlock, { type: "tool" }>;
+
+export interface PendingToolReviewOwnerIdentity {
+  taskId?: number | null;
+  turnIds: readonly (string | null | undefined)[];
+  toolCallId?: string | null;
+  toolName: string;
+  target: string;
+}
+
+/**
+ * One ownership rule for every pending-review projection. An explicit runtime
+ * call id never falls back to semantic matching; legacy records without that
+ * id must match both the final tool name and the exact disclosed target.
+ */
+export function isExactPendingToolReviewOwner(
+  task: TaskBlock | null | undefined,
+  owner: PendingToolReviewOwnerIdentity,
+): task is ToolTaskBlock {
+  if (!task || task.type !== "tool") return false;
+  if (owner.taskId != null && task.id !== owner.taskId) return false;
+  const allowedTurnIds = owner.turnIds
+    .map((turnId) => String(turnId || "").trim())
+    .filter(Boolean);
+  if (allowedTurnIds.length > 0 && !allowedTurnIds.includes(String(task.turnId || "").trim())) {
+    return false;
+  }
+
+  const expectedToolCallId = String(owner.toolCallId || "").trim();
+  if (expectedToolCallId) {
+    const taskToolCallId = String(
+      task.toolCallId || (task as ToolTaskBlock & { executionId?: string }).executionId || "",
+    ).trim();
+    return taskToolCallId === expectedToolCallId;
+  }
+
+  return String(task.toolName || "").trim() === String(owner.toolName || "").trim() &&
+    String(task.target || "").trim() === String(owner.target || "").trim();
+}
 
 function normalizeToolArguments(value: unknown): Record<string, unknown> {
   if (!value) return {};
@@ -27,6 +65,12 @@ function normalizeToolArguments(value: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+export interface PendingReviewArgumentDisclosure {
+  argumentName: string;
+  detail: string;
+  summaryTruncated: boolean;
 }
 
 export function summarizePendingPatchTarget(patch: string): string {
@@ -76,15 +120,71 @@ export function summarizeDesktopControlTarget(args: Record<string, unknown>): st
   return `${appName} · ${actionSummary}${screenshot}`;
 }
 
+export function redactPendingReviewSecrets(value: string): string {
+  return String(value || "")
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s;]+/gi, "$1[redacted]")
+    .replace(/(authorization\s*:\s*basic\s+)[A-Za-z0-9+/=]+/gi, "$1[redacted]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^\s/:@]+):([^\s/@]+)@/gi, "$1[redacted]@")
+    .replace(/((?:api[_-]?key|access[_-]?token|token|password|secret)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s;]+)/gi, "$1[redacted]")
+    .replace(/(--(?:api[_-]?key|access[_-]?token|token|password|secret)(?:=|\s+))(?:"[^"]*"|'[^']*'|[^\s;]+)/gi, "$1[redacted]");
+}
+
+export function summarizePendingReviewText(value: string, maxLength = 240): string {
+  const redacted = redactPendingReviewSecrets(value)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (redacted.length <= maxLength) return redacted;
+  return `${redacted.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
+}
+
+/**
+ * Keep the durable ActionRequest target compact while separately exposing the
+ * exact final command/SQL bytes that are about to execute. The detail is read
+ * only from the exact in-memory pending tool call and secrets are redacted,
+ * but no suffix is dropped: a dangerous trailing segment must remain visible.
+ */
+export function derivePendingReviewArgumentDisclosure(
+  toolName: string,
+  args: Record<string, unknown>,
+): PendingReviewArgumentDisclosure | null {
+  const preferredKeys = toolName === "run_command" || toolName === "execute_command"
+    ? ["command", "cmd", "input"]
+    : toolName === "send_pty_input"
+    ? ["input", "command"]
+    : ["sql", "statement", "query"];
+  const argumentName = preferredKeys.find((key) =>
+    typeof args[key] === "string" && String(args[key]).trim().length > 0
+  );
+  if (!argumentName) return null;
+  const raw = String(args[argumentName]);
+  const detail = redactPendingReviewSecrets(raw).trim();
+  if (!detail) return null;
+  return {
+    argumentName,
+    detail,
+    summaryTruncated: detail.replace(/\s+/g, " ").trim().length > 240,
+  };
+}
+
+export function getPendingToolReviewArgumentDisclosure(
+  toolCall: PendingToolCallLike,
+): PendingReviewArgumentDisclosure | null {
+  if (!toolCall) return null;
+  return derivePendingReviewArgumentDisclosure(
+    String(toolCall.name || "tool").trim() || "tool",
+    normalizeToolArguments(toolCall.arguments),
+  );
+}
+
 export function derivePendingReviewTarget(toolName: string, args: Record<string, unknown>, localFileReadPath?: string): string {
-  if (localFileReadPath && localFileReadPath.trim()) return localFileReadPath.trim();
+  if (localFileReadPath && localFileReadPath.trim()) return summarizePendingReviewText(localFileReadPath);
   if (toolName === "apply_patch") {
     return summarizePendingPatchTarget(String(args.patch || "")) || "workspace patch";
   }
   if (toolName === "computer_use") return summarizeDesktopControlTarget(args);
-  for (const key of ["path", "command", "url", "app_name", "appName", "query", "pattern", "target", "file", "cwd", "input"]) {
+  for (const key of ["path", "command", "url", "app_name", "appName", "sql", "query", "statement", "pattern", "target", "file", "cwd", "input"]) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "string" && value.trim()) return summarizePendingReviewText(value);
   }
   return toolName || "tool request";
 }
@@ -103,9 +203,13 @@ export function buildToolPermissionActionRequest(input: {
   const now = input.now ?? Date.now();
   const toolName = String(input.toolCall.name || "tool").trim() || "tool";
   const args = normalizeToolArguments(input.toolCall.arguments);
-  const risk: ToolPermissionActionRequest["risk"] = input.toolCall.shellPermissionDecision
-    ? "shell"
-    : input.toolCall.risk || (/^(?:apply_patch|replace_in_file|write_file|delete_file)$/i.test(toolName) ? "write" : "unknown");
+  const risk: ToolPermissionActionRequest["risk"] = input.toolCall.risk || (
+    input.toolCall.shellPermissionDecision
+      ? "shell"
+      : /^(?:apply_patch|replace_in_file|write_file|delete_file)$/i.test(toolName)
+      ? "write"
+      : "unknown"
+  );
   return {
     schemaVersion: ACTION_REQUEST_SCHEMA_VERSION,
     requestId: createActionRequestId("tool_permission", input.runId, now),
@@ -118,6 +222,7 @@ export function buildToolPermissionActionRequest(input: {
     status: "pending",
     createdAt: now,
     taskId: input.taskId,
+    ...(input.toolCall.toolCallId ? { toolCallId: input.toolCall.toolCallId } : {}),
     toolName,
     target: derivePendingReviewTarget(toolName, args, input.toolCall.localFileReadPath),
     risk,
@@ -137,6 +242,7 @@ export function buildPendingReviewFallbackTask(input: {
     id: input.taskId,
     turnId: input.turnId || undefined,
     type: "tool",
+    ...(input.toolCall.toolCallId ? { toolCallId: input.toolCall.toolCallId } : {}),
     toolName,
     target: derivePendingReviewTarget(toolName, args, input.toolCall.localFileReadPath),
     status: "pending_review",
@@ -162,8 +268,15 @@ export function resolveVisiblePendingToolReview(input: {
     return null;
   }
 
+  const requestOwner: PendingToolReviewOwnerIdentity = {
+    taskId: request.taskId,
+    turnIds: [request.turnId],
+    toolCallId: request.toolCallId,
+    toolName: request.toolName,
+    target: request.target,
+  };
   const isExactRequestTask = (task: ToolTaskBlock | null | undefined): task is ToolTaskBlock =>
-    !!task && task.type === "tool" && task.id === request.taskId && task.turnId === request.turnId;
+    isExactPendingToolReviewOwner(task, requestOwner);
   const activeTask = input.activeDiffTask as ToolTaskBlock | null | undefined;
   if (isExactRequestTask(activeTask)) {
     return {
@@ -174,7 +287,7 @@ export function resolveVisiblePendingToolReview(input: {
   }
 
   const pendingTask = input.taskFlow.find((task): task is ToolTaskBlock =>
-    task.type === "tool" && task.id === request.taskId && task.turnId === request.turnId
+    isExactRequestTask(task.type === "tool" ? task : null)
   );
   if (pendingTask) {
     return {
@@ -186,6 +299,7 @@ export function resolveVisiblePendingToolReview(input: {
 
   const pendingToolCall = input.pendingToolCall;
   if (!pendingToolCall) return null;
+  if (request.toolCallId && pendingToolCall.toolCallId !== request.toolCallId) return null;
   const pendingToolName = String(pendingToolCall.name || "tool").trim() || "tool";
   const pendingToolArgs = normalizeToolArguments(pendingToolCall.arguments);
   const pendingTarget = derivePendingReviewTarget(

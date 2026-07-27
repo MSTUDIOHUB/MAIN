@@ -37,10 +37,54 @@ function parseStructuredCommandResult(value: string): StructuredCommandResult | 
   }
 }
 
+/**
+ * Preserve the meaning of a successful finite validation across model-context
+ * compaction. The receipt favors the tail because test runners and acceptance
+ * harnesses conventionally print their semantic conclusion last, while still
+ * retaining a small prefix for command/tool context.
+ */
+export function summarizeSuccessfulValidationObservation(
+  value: string,
+  maxChars = 1_200,
+): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const structured = parseStructuredCommandResult(raw);
+  const observation = structured
+    ? [structured.stdout, structured.stderr].map((entry) => entry.trim()).filter(Boolean).join("\n")
+    : raw;
+  const normalized = observation
+    .replace(
+      // eslint-disable-next-line no-control-regex
+      /\u001b\[[0-?]*[ -/]*[@-~]/g,
+      "",
+    )
+    .replace(/\u0000/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const budget = Math.max(160, Math.floor(Number(maxChars) || 1_200));
+  if (normalized.length <= budget) return normalized;
+  const marker = `\n...[${normalized.length - budget} chars omitted]...\n`;
+  const remaining = Math.max(0, budget - marker.length);
+  const head = Math.floor(remaining * 0.35);
+  const tail = Math.max(0, remaining - head);
+  return `${normalized.slice(0, head)}${marker}${normalized.slice(-tail)}`;
+}
+
 // These are shell/toolchain protocol markers, not model-authored prose. Keep
 // the set deliberately narrow: ambiguous test/build/typecheck output defaults
 // to a real validation failure so MAIN never escapes through a weaker check.
 const INVOCATION_PROTOCOL_MARKER_RE = /\b(?:ENOENT|EACCES|EPERM|ERR_PNPM_NO_SCRIPT)\b|\bMissing script\s*:|\bCommand\s+["'][^"']+["']\s+not found\b|\bScript not found\b|\bCouldn't find a script named\b|\bUnknown command\b|\b(?:unknown|unrecognized|invalid) option\b/i;
+const SHELL_INVOCATION_MARKER_RE =
+  /(?:^|\n)\s*(?:(?:\/(?:usr\/)?bin\/)?(?:sh|bash|zsh|dash|fish|ksh|csh|tcsh|pwsh)|env):[^\n]*(?:command not found|(?::|\s)not found|no such file or directory)\s*(?=$|\n)/im;
+
+function hasInvocationProtocolMarker(value: string): boolean {
+  return INVOCATION_PROTOCOL_MARKER_RE.test(value) ||
+    SHELL_INVOCATION_MARKER_RE.test(value);
+}
 
 /**
  * Split command-launch/configuration failures from failures produced by a
@@ -64,7 +108,7 @@ export function classifyFailedFiniteValidationOutcome(input: {
     if (structured.exitCode === 126 || structured.exitCode === 127) {
       return "invocation_error";
     }
-    if (INVOCATION_PROTOCOL_MARKER_RE.test(`${structured.stdout}\n${structured.stderr}`)) {
+    if (hasInvocationProtocolMarker(`${structured.stdout}\n${structured.stderr}`)) {
       return "invocation_error";
     }
     return "validation_failure";
@@ -78,7 +122,7 @@ export function classifyFailedFiniteValidationOutcome(input: {
     return "invocation_error";
   }
 
-  return INVOCATION_PROTOCOL_MARKER_RE.test(String(input.result || ""))
+  return hasInvocationProtocolMarker(String(input.result || ""))
     ? "invocation_error"
     : "validation_failure";
 }

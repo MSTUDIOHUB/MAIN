@@ -45,24 +45,112 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { buildWorkspaceComposerIntentDispatchHints } = loadTranspiledModuleSync(
+const {
+  acceptWorkspaceComposerInstruction,
+  buildWorkspaceComposerIntentDispatchHints,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/workspaceComposerIntentAdmission.ts"),
 );
 
 function build(input = {}) {
+  const defaultSnapshot = {
+    mainModeKey: "main_mode",
+    lockedComposerIntent: null,
+    subagentPreference: "unspecified",
+  };
   return buildWorkspaceComposerIntentDispatchHints({
     text: "Inspect the runtime",
     language: "en",
-    snapshot: {
-      mainModeKey: "main_mode",
-      lockedComposerIntent: null,
-    },
     ...input,
+    snapshot: {
+      ...defaultSnapshot,
+      ...(input.snapshot || {}),
+    },
   });
 }
 
-test("ordinary Composer text does not mint an intent dispatch hint", () => {
-  assert.equal(build(), undefined);
+test("ordinary Composer text captures an explicit immutable subagent preference", () => {
+  assert.deepEqual(build(), { subagentPreference: "unspecified" });
+  assert.deepEqual(build({
+    snapshot: { subagentPreference: "preferred" },
+  }), { subagentPreference: "preferred" });
+});
+
+test("production Composer ingress passes immutable snapshots to the durable workspace admission port", async () => {
+  const originalImages = ["data:image/png;base64,fixture"];
+  const originalMentions = ["src/main.ts"];
+  const originalAttachments = [{
+    id: "attachment-1",
+    path: "README.md",
+    displayName: "README.md",
+    kind: "text",
+  }];
+  const calls = [];
+  const acceptance = await acceptWorkspaceComposerInstruction({
+    text: "Inspect the runtime before changing it",
+    images: originalImages,
+    language: "en",
+    intentSnapshot: {
+      mainModeKey: "main_mode",
+      lockedComposerIntent: "plan",
+      subagentPreference: "preferred",
+    },
+    payloadSnapshot: {
+      contextMentions: originalMentions,
+      attachedFiles: originalAttachments,
+    },
+    acceptWorkspaceInstruction: async (input) => {
+      calls.push(input);
+      return { accepted: true, receipt: { receiptId: "receipt-1" } };
+    },
+  });
+
+  assert.deepEqual(acceptance, {
+    accepted: true,
+    receipt: { receiptId: "receipt-1" },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    text: "Inspect the runtime before changing it",
+    images: ["data:image/png;base64,fixture"],
+    contextMentions: ["src/main.ts"],
+    attachedFiles: [{
+      id: "attachment-1",
+      path: "README.md",
+      displayName: "README.md",
+      kind: "text",
+    }],
+    source: "composer",
+    dispatchHints: {
+      subagentPreference: "preferred",
+      resolvedIntent: "plan",
+      runtimeIntentOverride: "plan",
+      skipIntentResolution: true,
+      turnTitle: "Inspect the runtime before changing it",
+      intentSummary: "Plan: Inspect the runtime before changing it",
+    },
+  });
+  assert.notEqual(calls[0].images, originalImages);
+  assert.notEqual(calls[0].contextMentions, originalMentions);
+  assert.notEqual(calls[0].attachedFiles, originalAttachments);
+  assert.notEqual(calls[0].attachedFiles[0], originalAttachments[0]);
+});
+
+test("real OMLX Plan replay enters through the production Composer admission boundary", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/e2e.ts"), "utf8");
+  const scenarioStart = source.indexOf("function seedRealOmlxPlanFlowScenario()");
+  const submitStart = source.indexOf("bridge.sendCloudMessage = async", scenarioStart);
+  const submitEnd = source.indexOf("bridge.sendDirectEditMessage", submitStart);
+  const submit = source.slice(submitStart, submitEnd);
+
+  assert.notEqual(scenarioStart, -1);
+  assert.notEqual(submitStart, -1);
+  assert.ok(submitEnd > submitStart);
+  assert.match(submit, /acceptWorkspaceComposerInstruction\(\{/);
+  assert.match(submit, /acceptWorkspaceInstruction: state\.acceptWorkspaceInstruction/);
+  assert.match(submit, /lockedComposerIntent: "plan"/);
+  assert.match(submit, /subagentPreference: state\.preferSubagents \? "preferred" : "unspecified"/);
+  assert.doesNotMatch(submit, /\.sendMessage\(/);
 });
 
 test("a locked Composer intent becomes an immutable dispatch decision", () => {
@@ -132,6 +220,7 @@ test("MDEBUG is durably classified as Plan with its canonical metadata", () => {
   });
 
   assert.deepEqual(hints, {
+    subagentPreference: "unspecified",
     resolvedIntent: "plan",
     runtimeIntentOverride: "plan",
     skipIntentResolution: true,

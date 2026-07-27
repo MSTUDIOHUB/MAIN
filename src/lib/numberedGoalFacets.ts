@@ -3,7 +3,10 @@ export interface NumberedUserGoalFacet {
   text: string;
 }
 
-const NUMBERED_GOAL_LINE_RE = /^\s*(\d{1,2})\s*[、.)．]\s*(.+?)\s*$/;
+// Treat punctuation as an input-adapter concern only. Providers and users
+// commonly emit either list punctuation (`1.` / `1、`) or label punctuation
+// (`1:` / `1：`); all forms must project to the same typed facet identity.
+const NUMBERED_GOAL_LINE_RE = /^\s*(\d{1,2})\s*[、.)．:：]\s*(.+?)\s*$/;
 
 function isDelegationAssignmentDescriptor(value: string): boolean {
   const fields = new Set(

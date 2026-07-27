@@ -137,54 +137,6 @@ const compactRunTool = {
   },
 };
 
-const orchestratorModuleCache = new Map();
-
-function loadOrchestratorTsModule(sourcePath) {
-  const normalizedPath = path.resolve(sourcePath);
-  if (orchestratorModuleCache.has(normalizedPath)) {
-    return orchestratorModuleCache.get(normalizedPath);
-  }
-
-  const fsSync = require("node:fs");
-  const source = fsSync.readFileSync(normalizedPath, "utf8");
-  const transpiled = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-    },
-    fileName: normalizedPath,
-  }).outputText;
-  const module = { exports: {} };
-  orchestratorModuleCache.set(normalizedPath, module.exports);
-  const localRequire = createRequire(normalizedPath);
-  const runtimeRequire = (specifier) => {
-    if (specifier === "@tauri-apps/api/core") return { invoke: async () => "" };
-    if (specifier === "@tauri-apps/api/event") return { listen: async () => () => {} };
-    if (specifier.startsWith(".")) {
-      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
-      for (const candidate of [basePath, `${basePath}.ts`, `${basePath}.tsx`, path.join(basePath, "index.ts")]) {
-        if (!fsSync.existsSync(candidate)) continue;
-        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
-          return loadOrchestratorTsModule(candidate);
-        }
-      }
-    }
-    return localRequire(specifier);
-  };
-  new Function("exports", "module", "require", transpiled)(module.exports, module, runtimeRequire);
-  orchestratorModuleCache.set(normalizedPath, module.exports);
-  return module.exports;
-}
-
-function loadOrchestratorModule() {
-  return loadOrchestratorTsModule(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
-}
-
-const {
-  resolveRuntimeProtocolProfile,
-  shouldUseXmlToolProtocol,
-} = loadOrchestratorModule();
-
 test("anthropic request body lifts system prompts and converts native tools/tool results", () => {
   const body = buildAnthropicRequestBody({
     messages: [
@@ -321,6 +273,23 @@ test("cloud helpers build protocol-specific endpoints and headers", () => {
   assert.deepEqual(
     buildCloudModelListCandidates("https://api.anthropic.com/v1/messages", "anthropic"),
     ["https://api.anthropic.com/v1/models"],
+  );
+  assert.deepEqual(
+    buildCloudModelListCandidates(
+      "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "openai",
+    ),
+    [
+      "https://open.bigmodel.cn/api/paas/v4/models",
+      "https://open.bigmodel.cn/api/paas/v4/v1/models",
+    ],
+  );
+  assert.deepEqual(
+    buildCloudModelListCandidates("https://gateway.example/openai/responses", "openai"),
+    [
+      "https://gateway.example/openai/models",
+      "https://gateway.example/openai/v1/models",
+    ],
   );
   assert.deepEqual(
     buildCloudHeaders("anthropic", "test-key", true),
@@ -602,87 +571,6 @@ test("cloud tool and explicit API protocol helpers normalize configured behavior
   assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).mode, "passive_hidden");
   assert.equal(resolveReasoningPolicy({ activeProfile: "cloud", reasoningRequest: "auto", reasoningEffort: "high" }).mode, "native_enabled");
   assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).replayInContext, false);
-});
-
-test("runtime protocol profile uses explicit protocol and config without model-name inference", () => {
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "Ollama",
-    model: "qwen3",
-    configuredToolProtocol: "auto",
-  }).toolProtocol, "xml");
-
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "OMLX",
-    model: "mlx-qwen",
-    configuredToolProtocol: "auto",
-  }).toolProtocol, "auto");
-
-  const localGemmaProfile = resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "OMLX",
-    model: "gemma-4-26b-a4b-it-8bit",
-    configuredToolProtocol: "auto",
-  });
-  assert.equal(localGemmaProfile.toolProtocol, "auto");
-  assert.equal(localGemmaProfile.reasoning, "passive_hidden");
-  assert.equal(localGemmaProfile.notes.some((note) => /hidden reasoning/.test(note)), true);
-  assert.deepEqual(localGemmaProfile, resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "OMLX",
-    model: "qwen3.6-35b-a3b",
-    configuredToolProtocol: "auto",
-  }));
-  assert.deepEqual(localGemmaProfile, resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "OMLX",
-    model: "arbitrary-local-model",
-    configuredToolProtocol: "auto",
-  }));
-
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "local",
-    provider: "OMLX",
-    model: "mlx-qwen",
-    configuredToolProtocol: "xml",
-  }).toolProtocol, "xml");
-
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "cloud",
-    provider: "OpenAI",
-    model: "gpt-5.4",
-    protocol: "openai",
-    configuredToolProtocol: "auto",
-  }).toolProtocol, "auto");
-
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "cloud",
-    provider: "Gemini",
-    model: "gemini-2.5-pro",
-    protocol: "gemini",
-    configuredToolProtocol: "auto",
-  }).toolProtocol, "xml");
-
-  assert.equal(resolveRuntimeProtocolProfile({
-    activeProfile: "cloud",
-    provider: "OpenAI-compatible",
-    model: "any-model",
-    protocol: "openai",
-    configuredToolProtocol: "xml",
-    compatibilityOverride: false,
-  }).toolProtocol, "xml");
-  assert.equal(shouldUseXmlToolProtocol(
-    { activeProfile: "cloud" },
-    {
-      provider: "OpenAI-compatible",
-      model: "any-model",
-      apiProtocol: "openai",
-      toolProtocol: "xml",
-    },
-    [],
-    false,
-  ), true);
 });
 
 test("gemini helpers build native generateContent requests and extract text", () => {
@@ -1023,6 +911,33 @@ test("cloud responses compact instructions preserve the current visual observati
   assert.match(compacted, /MAIN_VISUAL_OBSERVATION/);
   assert.match(compacted, /turn-image-current/);
   assert.match(compacted, /\[\/visual_observation_protocol\]/);
+});
+
+test("aggressive Responses compaction preserves accepted visual continuity after image bytes are removed", () => {
+  const olderObservation = [
+    "[visual_context_observation]",
+    '{"turnId":"turn-image-old","observationId":"visual-old","summary":"old pixels"}',
+    "[/visual_context_observation]",
+  ].join("\n");
+  const currentObservation = [
+    "[visual_context_observation]",
+    '{"turnId":"turn-image-current","observationId":"visual-current","summary":"The current screenshot visibly shows the editor."}',
+    "[/visual_context_observation]",
+  ].join("\n");
+  const compacted = compactCloudResponsesInstructions([
+    "当前工作区绝对路径为：/tmp/workspace",
+    olderObservation,
+    "low priority filler ".repeat(1200),
+    currentObservation,
+    "more low priority filler ".repeat(1200),
+  ].join("\n"), { aggressive: true });
+
+  assert.ok(compacted.length <= 3000);
+  assert.equal((compacted.match(/\[visual_context_observation\]/g) || []).length, 1);
+  assert.match(compacted, /turn-image-current/);
+  assert.match(compacted, /visual-current/);
+  assert.match(compacted, /current screenshot visibly shows the editor/);
+  assert.doesNotMatch(compacted, /turn-image-old|visual-old|old pixels/);
 });
 
 test("cloud responses compact messages keep recent context and summarize old history", () => {

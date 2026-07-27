@@ -59,6 +59,41 @@ async function loadIpcWithInvoke(invoke, coordinatorOptions = null) {
   });
 }
 
+test("workspace discovery IPC adapters fail closed on malformed nullable payloads", async () => {
+  const calls = [];
+  const ipc = await loadIpcWithInvoke(async (command) => {
+    calls.push(command);
+    return null;
+  });
+
+  assert.deepEqual(await ipc.listDirectory("src", "/workspace/ipc-contract"), []);
+  assert.deepEqual(await ipc.globSearch("src/**/*.ts", "/workspace/ipc-contract"), []);
+  assert.equal(await ipc.getProjectSkeleton(3, "/workspace/ipc-contract"), "");
+  assert.deepEqual(calls, ["list_directory", "glob_search", "get_project_skeleton"]);
+});
+
+test("workspace discovery IPC adapters retain only values from their declared contract", async () => {
+  const ipc = await loadIpcWithInvoke(async (command) => {
+    if (command === "list_directory") {
+      return [null, "src/main.ts", { name: "src", path: "src", is_dir: true }];
+    }
+    if (command === "glob_search") {
+      return ["src/main.ts", null, 7, "src/App.tsx"];
+    }
+    if (command === "get_project_skeleton") return { unexpected: true };
+    throw new Error(`Unexpected IPC command: ${command}`);
+  });
+
+  assert.deepEqual(await ipc.listDirectory(".", "/workspace/ipc-contract"), [
+    { name: "src", path: "src", is_dir: true },
+  ]);
+  assert.deepEqual(await ipc.globSearch("src/**/*", "/workspace/ipc-contract"), [
+    "src/main.ts",
+    "src/App.tsx",
+  ]);
+  assert.equal(await ipc.getProjectSkeleton(3, "/workspace/ipc-contract"), "");
+});
+
 test("partial Project Session saves merge transcript rows by id at the TypeScript queue head", async () => {
   const workspace = "/workspace/partial-transcript";
   const sessionId = 31;

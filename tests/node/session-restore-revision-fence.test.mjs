@@ -109,3 +109,17 @@ test("App restore captures after bootstrap and gates replay readiness on revisio
   assert.ok(replayReady > conflictLog);
   assert.match(body, /if \(!canPublishRestore\("finish"\)\) return;/);
 });
+
+test("App empty Session reset uses the canonical owner-isolated runtime snapshot", () => {
+  const source = fs.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
+  const start = source.indexOf("const resetToEmptyChatView = useCallback");
+  const end = source.indexOf("const hydrateWorkspacePlanForEmptySession", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const body = source.slice(start, end);
+
+  assert.match(body, /buildEmptySessionRuntimeSnapshot\(/);
+  assert.match(body, /\.\.\.emptyRuntime/);
+  assert.doesNotMatch(body, /subagentClosureReceiptLedger\s*:/);
+  assert.doesNotMatch(body, /turnRuntimeCheckpoints\s*:/);
+});

@@ -9,7 +9,11 @@ import {
   simplifyOperationProposalReplyOptions,
 } from "../lib/replyOptions";
 import type { TurnPresentationModel } from "../lib/turnPresentation";
-import type { ToolPermissionActionRequest, ToolPermissionResolutionIdentity } from "../lib/actionRequest";
+import {
+  requiresPerCallToolPermissionApproval,
+  type ToolPermissionActionRequest,
+  type ToolPermissionResolutionIdentity,
+} from "../lib/actionRequest";
 
 // region: ExecutionCapsule 属性定义
 interface ExecutionCapsuleProps {
@@ -20,6 +24,13 @@ interface ExecutionCapsuleProps {
   requestId?: string;
   permissionIdentity?: ToolPermissionResolutionIdentity;
   permissionRisk?: ToolPermissionActionRequest["risk"];
+  permissionToolName?: string;
+  permissionTarget?: string;
+  permissionArgumentDisclosure?: {
+    argumentName: string;
+    detail: string;
+    summaryTruncated: boolean;
+  } | null;
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
@@ -58,6 +69,27 @@ function isApprovalActionOption(option: ReplyOption): boolean {
     option.action === "continue_readonly_once" ||
     option.action === "allow_readonly_session"
   );
+}
+
+export function getToolPermissionRiskLabel(
+  risk: ToolPermissionActionRequest["risk"],
+  language: "zh" | "en",
+): string {
+  const labels: Record<NonNullable<ToolPermissionActionRequest["risk"]>, [string, string]> = {
+    read_only: ["只读", "Read only"],
+    workspace_write: ["工作区写入", "Workspace write"],
+    shell: ["Shell 命令", "Shell command"],
+    local_file_read: ["工作区外文件读取", "External file read"],
+    external_read: ["外部数据读取", "External data read"],
+    external_write: ["外部系统写入", "External system write"],
+    browser_control: ["浏览器控制", "Browser control"],
+    desktop_control: ["桌面控制", "Desktop control"],
+    destructive: ["破坏性操作", "Destructive operation"],
+    write: ["写入", "Write"],
+    unknown: ["未知风险", "Unknown risk"],
+  };
+  const label = labels[risk || "unknown"] || labels.unknown;
+  return language === "zh" ? label[0] : label[1];
 }
 
 function getDisplayReplyOptionLabel(option: ReplyOption, language: "zh" | "en"): string {
@@ -115,6 +147,9 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   requestId,
   permissionIdentity,
   permissionRisk,
+  permissionToolName,
+  permissionTarget,
+  permissionArgumentDisclosure,
   status,
   statusToneClass,
   language,
@@ -296,7 +331,10 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     ? reviewTaskCandidate
     : null;
   const hasPendingToolReview = !!activeReviewTask;
-  const desktopControlRequiresPerCallApproval = permissionRisk === "desktop_control";
+  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk);
+  const reviewTarget = String(permissionTarget || activeReviewTask?.target || "").trim();
+  const reviewToolName = String(permissionToolName || activeReviewTask?.toolName || "").trim();
+  const reviewRiskLabel = getToolPermissionRiskLabel(permissionRisk, language);
   const hasActiveDiffPreview = !!activeReviewTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
   const hasExpandableContent =
@@ -363,10 +401,10 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     showOptions: language === "zh" ? "展开选项" : "Show Options",
     collapseOptions: language === "zh" ? "收起选项" : "Collapse Options",
     diffRequest: language === "zh" ? "待确认变更" : "Pending Change",
-    chooseApproval: desktopControlRequiresPerCallApproval
+    chooseApproval: requiresPerCallApproval
       ? language === "zh"
-        ? "真实桌面控制每次只能单独审批"
-        : "Real desktop control requires approval for every call"
+        ? "此风险级别每次只能单独审批"
+        : "This risk level requires approval for every call"
       : language === "zh" ? "请选择审批方式" : "Choose an approval option",
     choiceHint: language === "zh"
       ? "模型已经识别出关键分叉并暂停。请先在聊天区点击一个选项，再继续当前回合。"
@@ -434,7 +472,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
       ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${progressItems.length} tasks completed`,
     executionStage: language === "zh" ? "执行步骤" : "Execution",
-  }), [activeProgressMode, completedCount, desktopControlRequiresPerCallApproval, hasOperationProposalApproval, language, progressItems.length]);
+  }), [activeProgressMode, completedCount, hasOperationProposalApproval, language, progressItems.length, requiresPerCallApproval]);
 
   const isBlackTheme = themeMode === "black";
   const activeRunOutline = isRunActive
@@ -960,6 +998,38 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       <div className="min-w-0">
                         <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
                         <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
+                        <div className="mt-2 grid gap-1 text-[11px]">
+                          <div data-testid="execution-capsule-tool-review-risk" className={permissionRisk === "destructive" ? "text-[#f87171]" : secondaryText}>
+                            {language === "zh" ? "风险" : "Risk"}：{reviewRiskLabel}
+                          </div>
+                          {reviewToolName && (
+                            <div data-testid="execution-capsule-tool-review-name" className={secondaryText}>
+                              {language === "zh" ? "工具" : "Tool"}：<span className={primaryText}>{reviewToolName}</span>
+                            </div>
+                          )}
+                          {reviewTarget && (
+                            <div data-testid="execution-capsule-tool-review-target" className={`break-words font-mono ${primaryText}`}>
+                              {language === "zh" ? "目标" : "Target"}：{reviewTarget}
+                            </div>
+                          )}
+                          {permissionArgumentDisclosure?.detail && (
+                            <div className="mt-2 rounded-lg border border-[var(--surface-border-soft)] bg-[var(--surface-bg)] p-2">
+                              <div className={`mb-1 text-[10px] font-medium ${secondaryText}`}>
+                                {language === "zh" ? "最终执行参数" : "Final execution argument"}
+                                {` · ${permissionArgumentDisclosure.argumentName}`}
+                                {permissionArgumentDisclosure.summaryTruncated
+                                  ? language === "zh" ? "（上方摘要已截断）" : " (summary truncated above)"
+                                  : ""}
+                              </div>
+                              <pre
+                                data-testid="execution-capsule-tool-review-argument"
+                                className={`max-h-[240px] overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 ${primaryText}`}
+                              >
+                                {permissionArgumentDisclosure.detail}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
                     <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -980,7 +1050,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       >
                         {copy.reject}
                       </button>
-                      {!desktopControlRequiresPerCallApproval && (
+                      {!requiresPerCallApproval && (
                         <button
                           data-testid="execution-capsule-tool-approve-session"
                           onClick={() => permissionIdentity && onApproveDiffSession?.(permissionIdentity)}

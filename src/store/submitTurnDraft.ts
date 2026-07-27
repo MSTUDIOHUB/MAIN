@@ -10,16 +10,22 @@ import type { TaskBlock } from "../lib/taskTypes";
 import {
   normalizeTurnInputContextSignals,
   resolveEffectiveSubagentDelegationPreference,
+  type SubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../lib/turnIntake";
 import { buildUserContextItems } from "../lib/userContextItems";
 import type { ResolvedRunIntent } from "../lib/runIntent";
 import type { ConversationTurn } from "../lib/workflowModels";
 import type { SessionTitleSeedState } from "../lib/intentTitlePolicy";
+import {
+  normalizeTurnRuntimeCheckpoint,
+  type TurnRuntimeCheckpointMap,
+} from "../lib/turnRuntimeCheckpoint";
 
 export interface SubmitTurnDraftSessionState {
   _nextTaskId: () => number;
   sessionsByWorkspace: Record<string, Array<SessionTitleSeedState & { id: number }>>;
+  turnRuntimeCheckpoints?: TurnRuntimeCheckpointMap;
 }
 
 export interface PrepareSubmitTurnDraftInput {
@@ -29,9 +35,13 @@ export interface PrepareSubmitTurnDraftInput {
   images?: string[];
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
+  runSessionKey?: string | null;
   runWorkspace?: string | null;
   preferredLanguage: "zh" | "en";
   preferSubagents?: boolean;
+  subagentPreference?: SubagentDelegationPreference;
+  /** Optional typed outcome authority supplied by an admission/preflight adapter. */
+  diagnosisRequirement?: TurnInputContextSignals["diagnosisRequirement"];
   effectiveRunIntent: ResolvedRunIntent;
   isMainDebugShortcut: boolean;
   optionTurnTitle?: string | null;
@@ -83,7 +93,7 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
         : availableNewTurnId || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const uiDisplayTurnId = input.uiParentTurnId || turnId;
   const currentImages = input.images || [];
-  const turnInputContextSignals = normalizeTurnInputContextSignals({
+  const submittedTurnInputContextSignals = normalizeTurnInputContextSignals({
     imageParts: currentImages.length,
     mentionedFilePaths: input.mentionSnapshot,
     attachedFilePaths: input.attachedFilesSnapshot.map((file) => {
@@ -92,9 +102,28 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
     }),
     subagentPreference: resolveEffectiveSubagentDelegationPreference({
       rawUserInput: input.text,
-      defaultPreference: input.preferSubagents ? "preferred" : "unspecified",
+      defaultPreference: input.subagentPreference ??
+        (input.preferSubagents ? "preferred" : "unspecified"),
     }),
+    diagnosisRequirement: input.diagnosisRequirement,
   });
+  const inheritedTurnRuntimeCheckpoint =
+    (input.reuseCurrentTurn || adoptionDecision.kind === "adopted")
+      ? normalizeTurnRuntimeCheckpoint(
+          sessionState.turnRuntimeCheckpoints?.[turnId],
+          {
+            expectedOwner: {
+              turnId,
+              ...(String(input.runSessionKey || "").trim()
+                ? { sessionKey: String(input.runSessionKey).trim() }
+                : {}),
+            },
+          },
+        )
+      : null;
+  const turnInputContextSignals = inheritedTurnRuntimeCheckpoint
+    ? inheritedTurnRuntimeCheckpoint.input.admittedUserContext
+    : submittedTurnInputContextSignals;
   const userContextItems = buildUserContextItems({
     contextMentions: input.mentionSnapshot,
     attachedFiles: input.attachedFilesSnapshot,

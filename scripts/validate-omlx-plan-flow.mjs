@@ -15,7 +15,11 @@ const execFile = promisify(execFileCallback);
 const workspaceRoot = process.cwd();
 const endpoint = (process.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1").replace(/\/+$/, "");
 const apiKey = process.env.OMLX_API_KEY || "mmnn";
-const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-A3B-6bit")
+// This legacy probe used to default to two large models. On shared-weight local
+// runtimes, merely addressing the second id can implicitly load it while the
+// first model is still resident. Require one explicit model and verify that it
+// is already the sole fully loaded model before any completion request.
+const models = String(process.env.OMLX_MODELS || "")
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
@@ -583,6 +587,8 @@ function isDiskWriteSatisfied(content) {
 
 async function runDiskWriteProbe(model) {
   const workspace = await seedDiskWorkspace(model);
+  const keepFixture = process.env.MAIN_KEEP_OMLX_DISK_FIXTURE === "1";
+  try {
   const messages = [
     {
       role: "system",
@@ -673,7 +679,7 @@ async function runDiskWriteProbe(model) {
     const current = await readWorkspaceFile(workspace.root, workspace.target);
     if (current !== workspace.original && isDiskWriteSatisfied(current)) {
       return {
-        workspace: workspace.root,
+        workspace: keepFixture ? workspace.root : "[temporary fixture removed after validation]",
         target: workspace.target,
         originalHash: workspace.originalHash,
         finalHash: sha256(current),
@@ -698,6 +704,13 @@ async function runDiskWriteProbe(model) {
     finalText,
     visibleTexts,
   });
+  } finally {
+    if (!keepFixture) {
+      await fs.rm(workspace.root, { recursive: true, force: true }).catch((error) => {
+        console.warn(`[omlx-probe] failed to remove temporary fixture ${workspace.root}: ${error.message}`);
+      });
+    }
+  }
 }
 
 async function runPlanProbe(model) {
@@ -762,6 +775,36 @@ async function runExecutionRecoveryProbe(model) {
 }
 
 async function main() {
+  if (models.length !== 1) {
+    fail("OMLX_MODELS must name exactly one already-loaded model; switch models outside this probe only after loaded_count reaches zero", {
+      requestedModels: models,
+    });
+  }
+
+  const modelStatus = await requestJson("/models/status");
+  const statusModels = Array.isArray(modelStatus?.models) ? modelStatus.models : [];
+  const loadedModelIds = statusModels
+    .filter((model) => model?.loaded === true && model?.is_loading !== true)
+    .map((model) => String(model?.id || "").trim())
+    .filter(Boolean);
+  const transitioningModelIds = statusModels
+    .filter((model) => model?.is_loading === true)
+    .map((model) => String(model?.id || "").trim())
+    .filter(Boolean);
+  if (
+    Number(modelStatus?.loaded_count) !== 1 ||
+    loadedModelIds.length !== 1 ||
+    transitioningModelIds.length > 0 ||
+    loadedModelIds[0] !== models[0]
+  ) {
+    fail("single-model safety gate failed; refusing an implicit load or overlapping model memory", {
+      requestedModel: models[0],
+      loadedModelIds,
+      transitioningModelIds,
+      loadedCount: modelStatus?.loaded_count,
+    });
+  }
+
   const modelList = await requestJson("/models");
   const available = new Set((modelList?.data || []).map((item) => item.id));
   for (const model of models) {

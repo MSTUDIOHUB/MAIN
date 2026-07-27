@@ -1,5 +1,10 @@
 import type { TaskBlock } from "../lib/taskTypes";
-import { getIntentPolicy, type ResolvedRunIntent } from "../lib/runIntent";
+import {
+  getIntentPolicy,
+  looksLikeExplicitWorkspaceMutationRequest,
+  resolveWorkspaceAwareWorkflowMode,
+  type ResolvedRunIntent,
+} from "../lib/runIntent";
 import { sanitizeUserContextItemsForPersist } from "../lib/userContextItems";
 import type {
   WorkspaceInstruction,
@@ -10,6 +15,7 @@ import {
   normalizeConversationDisplayTitle,
   type ConversationTurn,
 } from "../lib/workflowModels";
+import { selectRuntimeEngineVersionForNewTurn } from "../lib/runtimeEngineSelection";
 
 type WorkspaceUserBlock = Extract<TaskBlock, { type: "user" }>;
 
@@ -154,7 +160,14 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   blockIds?: number[];
 }): ConversationTurn {
   const hintedIntent = resolveWorkspaceInstructionIntentHint(input.instruction);
-  const projectedIntent = hintedIntent || "respond";
+  // This projection is presentation-only: it grants no capability and the
+  // dispatcher still owns authoritative intent resolution. An ordinary
+  // workspace repair must nevertheless look like an Execute Turn immediately
+  // after durable admission instead of briefly masquerading as chat.
+  const projectedIntent = hintedIntent ||
+    (looksLikeExplicitWorkspaceMutationRequest(input.instruction.payload.text)
+      ? "execute"
+      : "respond");
   const hintedTitle = input.instruction.payload.dispatchHints?.turnTitle;
   const hintedIntentSummary = normalizeIntentSummaryCandidate(
     input.instruction.payload.dispatchHints?.intentSummary,
@@ -166,6 +179,7 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   return {
     id: input.receipt.turnId,
     clientSubmissionId: input.instruction.clientSubmissionId,
+    runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(projectedIntent),
     workspaceInstructionReceiptId: input.receipt.receiptId,
     workspaceInstructionSource: input.instruction.source,
     userPrompt: input.instruction.payload.text,
@@ -181,7 +195,10 @@ export function buildWorkspaceInstructionConversationTurn(input: {
         ? "Accepted as a durable workspace Turn; routing is pending."
         : "已接纳为持久化工作区回合，等待路由执行。"
     ),
-    mode: getIntentPolicy(projectedIntent).workflowMode,
+    mode: resolveWorkspaceAwareWorkflowMode(
+      getIntentPolicy(projectedIntent).workflowMode,
+      true,
+    ),
     intent: projectedIntent,
     displayIntent: projectedIntent,
     status: "planning",

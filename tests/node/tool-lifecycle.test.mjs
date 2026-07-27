@@ -57,7 +57,7 @@ const { findToolLifecycleBlockIndex } = loadTranspiledModuleSync(path.join(works
 const { buildCompletedToolGroupRanges } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolUiGrouping.ts"));
 const { formatToolPresentation } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolPresentation.ts"));
 
-test("tool lifecycle matching prefers toolCallId and then falls back to name+target", () => {
+test("tool lifecycle matching keeps an explicit toolCallId as the unique owner", () => {
   const taskFlow = [
     { id: 1, type: "tool", turnId: "turn-1", toolName: "manage_camera", target: "Main Camera", toolStatus: "running", toolCallId: "call-1" },
     { id: 2, type: "tool", turnId: "turn-1", toolName: "manage_camera", target: "Main Camera", toolStatus: "running", toolCallId: "call-2" },
@@ -73,7 +73,7 @@ test("tool lifecycle matching prefers toolCallId and then falls back to name+tar
   });
   assert.equal(firstById, 0);
 
-  const fallbackLatest = findToolLifecycleBlockIndex({
+  const missingExplicitOwner = findToolLifecycleBlockIndex({
     taskFlow,
     turnId: "turn-1",
     toolName: "manage_camera",
@@ -81,7 +81,11 @@ test("tool lifecycle matching prefers toolCallId and then falls back to name+tar
     allowedStatuses: ["running"],
     meta: { toolCallId: "missing-call-id" },
   });
-  assert.equal(fallbackLatest, 1);
+  assert.equal(
+    missingExplicitOwner,
+    -1,
+    "an unstarted callback must not steal a previous call's card by name and target",
+  );
 
   const fallbackWithoutMeta = findToolLifecycleBlockIndex({
     taskFlow,
@@ -91,6 +95,21 @@ test("tool lifecycle matching prefers toolCallId and then falls back to name+tar
     allowedStatuses: ["running"],
   });
   assert.equal(fallbackWithoutMeta, 1);
+});
+
+test("a repeated provider id cannot claim a lifecycle card from an adjacent Turn", () => {
+  const taskFlow = [
+    { id: 1, type: "tool", turnId: "turn-old", toolName: "read_file", target: "src/a.ts", toolStatus: "running", toolCallId: "native_call_1" },
+  ];
+  const index = findToolLifecycleBlockIndex({
+    taskFlow,
+    turnId: "turn-new",
+    toolName: "read_file",
+    target: "src/a.ts",
+    allowedStatuses: ["running"],
+    meta: { toolCallId: "native_call_1" },
+  });
+  assert.equal(index, -1);
 });
 
 test("completed tool groups break on pending/failed/agent blocks and skip excluded read tools", () => {

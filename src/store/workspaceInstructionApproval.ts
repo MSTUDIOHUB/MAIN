@@ -48,6 +48,34 @@ export type WorkspaceInstructionActionDecision =
       identity: UserChoiceResolutionIdentity;
     };
 
+/**
+ * A durable FIFO head must not be adopted while another Run owns the Session.
+ * The only pending-review exception is an exact, revalidated ActionDecision,
+ * because that resolves the existing owner instead of starting a second Run.
+ * Ordinary durable Turns remain queued until the reviewed owner concludes;
+ * choosing Queue must never implicitly reject the current approval.
+ * A failed cancellation fence is intentionally allowed through so the
+ * dispatcher can close the admitted Turn with its fail-closed conclusion.
+ */
+export function shouldDeferWorkspaceInstructionDispatchForActiveOwner(input: {
+  isGenerating: boolean;
+  agentStatus: string;
+  hasPendingActionRequest: boolean;
+  hasExactPendingReviewActionDecision: boolean;
+  cancellationFenceFailed: boolean;
+}): boolean {
+  if (input.cancellationFenceFailed) return false;
+  const activeOwner = input.isGenerating ||
+    input.agentStatus === "running" ||
+    input.agentStatus === "pending_review" ||
+    input.hasPendingActionRequest;
+  if (!activeOwner) return false;
+  return !(
+    input.agentStatus === "pending_review" &&
+    input.hasExactPendingReviewActionDecision
+  );
+}
+
 function normalizeStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   const normalized = value.map((item) => typeof item === "string" ? item : "");

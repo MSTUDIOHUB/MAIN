@@ -659,6 +659,19 @@ try {
   const shouldScreenshot = normalizeBoolean(input.screenshot, false);
   const appPathRaw = String(input.appPath ?? input.app_path ?? "").trim();
 
+  if (!appName || appName.length > MAX_APP_NAME_CHARS || /[\u0000-\u001f\u007f]/.test(appName)) {
+    throw new Error("INVALID_APP_NAME");
+  }
+  if (appPathRaw.length > MAX_PATH_CHARS) throw new Error("APP_PATH_OUTSIDE_WORKSPACE_OR_MISSING: path too long");
+
+  const actionLines = parseLines(input.actions, MAX_ACTIONS, "ACTIONS");
+  const checkLines = parseLines(input.checks, MAX_CHECKS, "CHECKS");
+  const actions = actionLines.map((line) => parseActionLine(line, workspace));
+  const checks = checkLines.map(parseCheckLine);
+  const resolvedAppPath = shouldLaunch && appPathRaw
+    ? resolveExistingWorkspacePath(workspace, appPathRaw, "app")
+    : null;
+
   if (process.platform !== "darwin") {
     emit({
       ok: false,
@@ -670,19 +683,9 @@ try {
     });
     process.exit(0);
   }
-  if (!appName || appName.length > MAX_APP_NAME_CHARS || /[\u0000-\u001f\u007f]/.test(appName)) {
-    throw new Error("INVALID_APP_NAME");
-  }
-  if (appPathRaw.length > MAX_PATH_CHARS) throw new Error("APP_PATH_OUTSIDE_WORKSPACE_OR_MISSING: path too long");
-
-  const actionLines = parseLines(input.actions, MAX_ACTIONS, "ACTIONS");
-  const checkLines = parseLines(input.checks, MAX_CHECKS, "CHECKS");
-  const actions = actionLines.map((line) => parseActionLine(line, workspace));
-  const checks = checkLines.map(parseCheckLine);
 
   if (shouldLaunch) {
-    if (appPathRaw) {
-      const resolvedAppPath = resolveExistingWorkspacePath(workspace, appPathRaw, "app");
+    if (resolvedAppPath) {
       await runProcess("/usr/bin/open", [resolvedAppPath], remainingBudgetMs(deadline, "launch", 15_000));
     } else {
       await runProcess("/usr/bin/open", ["-a", appName], remainingBudgetMs(deadline, "launch", 15_000));

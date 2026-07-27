@@ -77,6 +77,7 @@ import type {
   PlanStage,
   ReplyOption,
 } from "../workflowModels";
+import { selectRuntimeEngineVersionForNewTurn } from "../runtimeEngineSelection";
 
 const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> = {
   respond: { zh: "回复", en: "Respond" },
@@ -1861,7 +1862,7 @@ export function buildLocalTurnTitle(
 ): string {
   const lowerInput = input.toLowerCase();
   const context = normalizeTurnInputContextSignals(contextSignals);
-  if (/(?:codex|plan mode|计划模式|\.main\/plans\/plan\.md|plan\.md|proposed_plan)/i.test(input)) {
+  if (/(?:codex|plan mode|计划模式|\.main\/plans\/plan\.md|plan\.md|plan_candidate|proposed_plan)/i.test(input)) {
     return language === "en" ? "Codex-style planning flow" : "重构 Codex 式计划流程";
   }
   if (/(?:sidebar|侧边栏|会话).*(?:标题|title)|(?:标题|title).*(?:sidebar|侧边栏|会话)/i.test(input)) {
@@ -2671,6 +2672,9 @@ export function buildSubmitVisibleTurnPatch(
               }
             : {}),
           status: params.initialTurnStatus,
+          runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(
+            params.effectiveRunIntent,
+          ),
           intent: preservePlanIdentity ? "plan" : params.effectiveRunIntent,
           displayIntent: params.effectiveDisplayIntent,
           intentSummary: isAdoptedTurn
@@ -2724,6 +2728,7 @@ export function buildSubmitVisibleTurnPatch(
   const newTurn: ConversationTurn = userBlock
     ? {
         id: params.turnId,
+        runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,
         intentSummary: params.effectiveIntentSummary,
@@ -2740,6 +2745,7 @@ export function buildSubmitVisibleTurnPatch(
       }
     : {
         id: params.turnId,
+        runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,
         intentSummary: params.effectiveIntentSummary,

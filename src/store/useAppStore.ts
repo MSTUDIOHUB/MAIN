@@ -3,7 +3,8 @@
 // All state that was previously scattered as useState in the monolith lives here.
 import { create, type StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
-import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
+import type { AgentMessage, ContentPart } from "../lib/agentMessages";
+import type { ToolReviewDecision } from "../lib/toolReviewDecision";
 import type {
   ExecuteRecoveryMode,
   ForcedExecuteRecoveryRuntimeState,
@@ -16,6 +17,7 @@ import {
   deleteChatTempPath,
   deletePlanFiles,
   deleteWorkspacePath,
+  getProjectSkeleton,
   ingestAttachmentFile,
   listDirectory,
   loadProjectSessionMeta,
@@ -76,7 +78,6 @@ import {
   canonicalizePlanArtifactPath,
   detectPlanArtifactKind,
   extractPlanTasks,
-  findDroppedPlanTasks,
   getPlanArtifactTitle,
   isGenericConversationTitle,
   isConversationTurnRuntimeClosed,
@@ -103,6 +104,37 @@ import {
   type MainThreadEventInput,
   type LegacyFailedMainThreadEvent,
 } from "../lib/turnEvents";
+import {
+  normalizeTurnRuntimeCheckpointMap,
+  type TurnRuntimeCheckpointMap,
+} from "../lib/turnRuntimeCheckpoint";
+import {
+  normalizeRuntimeV2CheckpointMap,
+  type RuntimeV2CheckpointMap,
+} from "../lib/runtime-v2/checkpoint";
+import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
+import { createRuntimeV2ProjectionPort } from "./runtimeV2/projectionPort";
+import {
+  approveAndDispatchRuntimeV2Plan,
+} from "./runtimeV2/planHandoff";
+import { resolveRuntimeV2PlanReviewFromAggregate } from "./runtimeV2/workPlanAdapter";
+import {
+  normalizeSubagentClosureReceiptLedger,
+  type SubagentClosureReceiptLedger,
+} from "../lib/subagentClosureReceipts";
+import {
+  isSameCanonicalRunIdentity,
+  normalizeCanonicalRunIdentity,
+  type CanonicalRunIdentity,
+} from "../lib/turnRuntimeContract";
+import {
+  createActiveGuidance,
+  normalizeActiveGuidance,
+} from "../lib/runtimeGuidance";
+import {
+  resolveTurnStrategyFromIntent,
+  selectTurnIngressAvailability,
+} from "../lib/turnIngress";
 import {
   buildAnthropicRequestBody,
   buildGeminiRequestForAuthMode,
@@ -135,8 +167,13 @@ import { hasReviewablePlanArtifact, normalizePlanApprovalChoice } from "../lib/p
 import {
   buildPlanApprovalIdentity,
   buildPlanExecutionInstructionHash,
+  buildTypedPlanApprovalIdentity,
   isPlanApprovalIdentityCurrent,
 } from "../lib/planApprovalIdentity";
+import {
+  preparePlanArtifactCommit,
+  reducePlanArtifactCommit,
+} from "../lib/planArtifactCommit";
 import {
   PLAN_LIFECYCLE_SCHEMA_VERSION,
   applyPlanArtifactIdentity,
@@ -173,6 +210,7 @@ import {
 } from "../lib/attachments";
 import {
   buildSemanticMetadataContextLines,
+  normalizeSubagentDelegationPreference,
   normalizeTurnInputContextSignals,
   type SubagentDelegationPreference,
   type TurnInputContextSignals,
@@ -196,6 +234,7 @@ import {
   isCurrentGoalAdministrativeControl,
   isCurrentGoalControlResolution,
   isExactToolPermissionResolutionIdentity,
+  requiresPerCallToolPermissionApproval,
   isToolPermissionPlanExecutionIdentityCurrent,
   isToolPermissionActionRequest,
   normalizeActionRequest,
@@ -203,10 +242,12 @@ import {
   type ActionRequest,
   type PendingPlanToolPermissionInvalidation,
   type ToolPermissionResolutionIdentity,
+  type ToolPermissionActionRequest,
   type UserChoiceResolutionIdentity,
   type PlanReviewResolutionIdentity,
   type GoalControlIdentity,
 } from "../lib/actionRequest";
+import { isExactPendingToolReviewOwner } from "../lib/pendingToolReview";
 import { issuePlanExplicitResumeAttempt } from "../lib/planExecutionContinuation";
 import { isHarnessMarkerOwnedByPlanExecution } from "../lib/planExecutionOwnership";
 import {
@@ -251,6 +292,7 @@ import {
   getIntentPolicy,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
+  resolveWorkspaceAwareWorkflowMode,
   type ExecutionConsentPolicy,
   type CommandDirective,
   type MainIntentShortcut,
@@ -390,7 +432,11 @@ import {
   settleWorkspaceClearSubmissionBarrier,
   takeSettledWorkspaceClearSubmission,
 } from "./workspaceClearSubmissionBarrier";
-import { projectCanceledTurn } from "../lib/canceledTurnProjection";
+import {
+  captureCanceledTurnControlPlaneFence,
+  projectCanceledTurn,
+  type CanceledTurnControlPlaneFence,
+} from "../lib/canceledTurnProjection";
 import { createSubmitHarnessRunId } from "./submitRunLease";
 import {
   buildApprovedPlanExecutionPrompt,
@@ -428,7 +474,7 @@ import {
   type SessionModeAffinity,
 } from "../lib/imageStudioSessions";
 import { runIntentPreflight } from "../lib/intentPreflight";
-import { runAfterNextPaint } from "../lib/uiScheduling";
+import { scheduleRuntimeTask } from "../lib/runtimeScheduling";
 import {
   cancelSubagentRun,
   isSubagentActiveStatus,
@@ -511,9 +557,11 @@ import {
   normalizeWorkspaceInstructionIntentHint,
   reconcileWorkspaceInstructionProjection,
 } from "./workspaceInstructionProjection";
+import { migrateLegacyQueuedMessageToWorkspaceTurn } from "./workspaceLegacyQueueMigration";
 import {
   resolveWorkspaceInstructionActionDecision,
   resolveWorkspaceInstructionExecutionConsent,
+  shouldDeferWorkspaceInstructionDispatchForActiveOwner,
 } from "./workspaceInstructionApproval";
 import { waitForSessionAdmissionReadiness } from "./sessionAdmissionReadiness";
 import {
@@ -948,6 +996,17 @@ export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
 const UNBOUND_PLAN_SESSION_KEY = "__MAIN_UNBOUND_PLAN_SESSION__";
 const UNBOUND_PLAN_SESSION_EPOCH = "__MAIN_UNBOUND_PLAN_EPOCH__";
 
+function resolveWorkspaceKeyFromBoundSessionKey(
+  sessionKey: string | null | undefined,
+): string | null {
+  const normalized = String(sessionKey || "").trim();
+  const separatorIndex = normalized.lastIndexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === normalized.length - 1) return null;
+  const sessionId = Number(normalized.slice(separatorIndex + 1));
+  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return null;
+  return normalized.slice(0, separatorIndex);
+}
+
 function createEmptyPlanLifecycleForSession(
   sessionKey: string | null | undefined,
   options?: { sessionEpoch?: string; now?: number },
@@ -975,6 +1034,12 @@ export interface SessionRuntimeSnapshot {
   runtimeEvents?: MainThreadEvent[];
   harnessRunMarker?: HarnessRunMarker | null;
   activeActionRequest?: ActionRequest | null;
+  /** Versioned, JSON-only canonical Turn + collaboration checkpoints. */
+  turnRuntimeCheckpoints?: TurnRuntimeCheckpointMap;
+  /** Event-sourced v3 checkpoints for Turns owned by Runtime v2. */
+  runtimeV2Checkpoints?: RuntimeV2CheckpointMap;
+  /** Session-owned canonical receipts backing durable subagent closure evidence. */
+  subagentClosureReceiptLedger?: SubagentClosureReceiptLedger | null;
   taskFlow: TaskBlock[];
   agentMessages: AgentMessage[];
   contextMemoryState?: ContextMemoryState | null;
@@ -1033,6 +1098,9 @@ export interface SessionRuntimeSnapshot {
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
+  turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
+  runtimeV2Checkpoints: RuntimeV2CheckpointMap;
+  subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   input: string;
   contextMentions: string[];
   attachedFiles: AttachedFile[];
@@ -1068,13 +1136,15 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   agentStatus: AgentStatus;
   abortController: AbortController | null;
   elapsedTime: number;
-  pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
+  pendingReviewResolve: ((decision: ToolReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   /** Current in-memory checkpoint owner. Not persisted because resolver closures cannot survive reload. */
   activeActionRequest: ActionRequest | null;
   pendingToolCall: {
+    toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
+    risk?: ToolPermissionActionRequest["risk"];
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   } | null;
@@ -1471,6 +1541,9 @@ export interface AppState {
   runtimeEvents: MainThreadEvent[];
   harnessRunMarker: HarnessRunMarker | null;
   activeActionRequest: ActionRequest | null;
+  turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
+  runtimeV2Checkpoints: RuntimeV2CheckpointMap;
+  subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setPlanStage: (stage: PlanStage) => void;
   upsertPlanArtifact: (artifact: PlanArtifact) => void;
@@ -1509,11 +1582,13 @@ export interface AppState {
   contextMemoryState: ContextMemoryState | null;
   contextMemoryStateByRuntimeKey: Record<string, ContextMemoryState | null>;
   providerCompatibilityByRuntimeKey: Record<string, ProviderCompatibilityRuntimeLaneState>;
-  pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
+  pendingReviewResolve: ((decision: ToolReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   pendingToolCall: {
+    toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
+    risk?: ToolPermissionActionRequest["risk"];
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   } | null;
@@ -1577,9 +1652,9 @@ export interface AppState {
     disposition?: Exclude<QueuedGoalContinuationRemovalMode, "replaced">;
     reason?: string;
   }) => boolean;
-  setActiveGuidance: (text: string, turnId?: string | null) => void;
+  setActiveGuidance: (text: string, target: CanonicalRunIdentity) => boolean;
   clearActiveGuidance: () => void;
-  consumeActiveGuidance: (turnId?: string | null) => ActiveGuidance | null;
+  consumeActiveGuidance: (target: CanonicalRunIdentity) => ActiveGuidance | null;
   acceptWorkspaceInstruction: (
     input: AcceptWorkspaceInstructionInput,
   ) => Promise<WorkspaceInstructionAcceptance>;
@@ -1792,11 +1867,19 @@ function normalizeProviderCompatibilityRuntimeLaneState(
   const fallbackExpiresAt = Number(candidate.fallbackExpiresAt);
   const nativeSuccessStreak = Math.max(0, Math.floor(Number(candidate.nativeSuccessStreak) || 0));
   const lastFallbackAt = Math.max(0, Math.floor(Number(candidate.lastFallbackAt) || 0));
+  const requiredToolChoiceFallbackExpiresAt = Number(
+    candidate.requiredToolChoiceFallbackExpiresAt,
+  );
   return {
     forceXmlTools: candidate.forceXmlTools === true,
     fallbackExpiresAt: Number.isFinite(fallbackExpiresAt) && fallbackExpiresAt > 0 ? fallbackExpiresAt : null,
     nativeSuccessStreak,
     lastFallbackAt,
+    requiredToolChoiceFallbackExpiresAt:
+      Number.isFinite(requiredToolChoiceFallbackExpiresAt) &&
+      requiredToolChoiceFallbackExpiresAt > 0
+        ? requiredToolChoiceFallbackExpiresAt
+        : null,
   };
 }
 
@@ -1975,12 +2058,19 @@ function normalizeLiveConversationTurns(
 export function normalizeInterruptedConversationTurnsForRestore(
   turns: ConversationTurn[] | undefined,
   _taskFlow: TaskBlock[],
+  hasWorkspaceContainer = false,
 ): ConversationTurn[] {
   return normalizeLiveConversationTurns(turns).map((normalizedTurn) => {
-    const turn = normalizedTurn;
-    if (turn.status !== "executing" && turn.status !== "planning") return normalizedTurn;
-    return {
+    const turn = {
       ...normalizedTurn,
+      mode: resolveWorkspaceAwareWorkflowMode(
+        normalizedTurn.mode || "chat",
+        hasWorkspaceContainer,
+      ),
+    };
+    if (turn.status !== "executing" && turn.status !== "planning") return turn;
+    return {
+      ...turn,
       status: "paused",
       summary: String(turn.summary || "").trim() || "Execution was interrupted by an application restart; progress is preserved and resumable.",
     };
@@ -3183,7 +3273,7 @@ function concludeWorkspaceInstructionEntry(input: {
     intentSummary: input.language === "en"
       ? "A durable workspace receipt was closed at an ownership recovery boundary."
       : "持久化工作区回执已在所有权恢复边界收口。",
-    mode: "chat" as const,
+    mode: "edit" as const,
     intent: "respond" as const,
     displayIntent: "respond" as const,
     status: "error" as const,
@@ -3990,7 +4080,7 @@ function quarantineRestoredLocalFastEntry(input: {
         userPrompt: input.entry.instruction.payload.text,
         title: useChinese ? "本地命令恢复隔离" : "Local command recovery quarantine",
         intentSummary: quarantineSummary,
-        mode: "chat",
+        mode: "edit",
         intent: "respond",
         displayIntent: "respond",
         status: "error",
@@ -4078,6 +4168,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "goal.cleared",
     "subagent.created",
     "subagent.updated",
+    "subagent.completed",
     "subagent.closed",
     "subagent.dismissed",
     "subagent.handed_back",
@@ -4197,6 +4288,9 @@ export function normalizeSessionRuntimeSnapshot(
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
   const expectedContainerSessionKey = String(options?.expectedSessionKey || "").trim();
+  const hasWorkspaceContainer = expectedContainerSessionKey
+    ? !expectedContainerSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+    : resolveSessionWorkspaceKey(options?.workspacePath || "") !== GLOBAL_CHAT_KEY;
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
     (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedMainModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
@@ -4227,8 +4321,10 @@ export function normalizeSessionRuntimeSnapshot(
   const queuedUserMessage = queuedUserMessageCandidate && (
     !expectedContainerSessionKey ||
     (
-      queuedUserMessageOwnerKeys.length > 0 &&
-      queuedUserMessageOwnerKeys.every((sessionKey) => sessionKey === expectedContainerSessionKey)
+      (
+        queuedUserMessageOwnerKeys.length === 0 ||
+        queuedUserMessageOwnerKeys.every((sessionKey) => sessionKey === expectedContainerSessionKey)
+      )
     )
   )
     ? queuedUserMessageCandidate
@@ -4327,6 +4423,9 @@ export function normalizeSessionRuntimeSnapshot(
   });
   const persistedPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
   const restoredPlanIdentity = buildPlanApprovalIdentity(restoredPlanArtifacts.artifacts);
+  const restoredPlanReviewIdentity = buildTypedPlanApprovalIdentity(
+    restoredPlanArtifacts.artifacts,
+  );
   const actionRequestCandidate = normalizeActionRequest(snapshot.activeActionRequest);
   const originalActionRequest = actionRequestCandidate && (
     !expectedContainerSessionKey ||
@@ -4369,6 +4468,13 @@ export function normalizeSessionRuntimeSnapshot(
   const rejectedReviewablePlanArtifact = restoredPlanArtifacts.rejected.some((artifact) =>
     artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix"
   );
+  // Current Plan quality rules may become stricter than the rules that sealed
+  // a legacy checkpoint. That must revoke execution authority, but it must not
+  // erase exact-owner progress/evidence needed to inspect or revise the Plan.
+  // Typed candidate integrity is different: projection/hash/contract drift is
+  // an ownership failure and remains fail-closed even for checkpoint history.
+  const rejectedTypedPlanCandidate =
+    restoredPlanArtifacts.candidateIntegrityRejectedPaths.length > 0;
   const restoredArtifactTaskSeed = restoredPlanArtifacts.artifacts
     .filter((artifact) => artifact.kind === "tasks")
     .flatMap((artifact) => extractPlanTasks(artifact.content));
@@ -4422,18 +4528,23 @@ export function normalizeSessionRuntimeSnapshot(
     restoredActionParentRunId === (restoredProgress.parentRunId || null) &&
     normalizedHarnessRunMarker?.turnId === restoredProgress.turnId
   );
-  const hasExactRestoredPlanApprovalCapability =
-    rawPlanOwnerMatchesContainer &&
-    isPlanApprovalLeaseBoundToState(candidateRestoredPlanLifecycle) &&
-    !rejectedReviewablePlanArtifact &&
-    restoredExecutionReadiness.ok &&
-    !restoredTaskIdentity.ambiguous &&
-    progressTurnOwnerValid &&
-    progressRunOwnerValid &&
+  const restoredPlanIdentityMatchesPersisted =
     !!persistedPlanIdentity &&
     !!restoredPlanIdentity &&
     persistedPlanIdentity.revision === restoredPlanIdentity.revision &&
     persistedPlanIdentity.artifactHash === restoredPlanIdentity.artifactHash;
+  const hasExactRestoredPlanCheckpoint =
+    rawPlanOwnerMatchesContainer &&
+    isPlanApprovalLeaseBoundToState(candidateRestoredPlanLifecycle) &&
+    !rejectedTypedPlanCandidate &&
+    !restoredTaskIdentity.ambiguous &&
+    progressTurnOwnerValid &&
+    progressRunOwnerValid &&
+    restoredPlanIdentityMatchesPersisted;
+  const hasExactRestoredPlanApprovalCapability =
+    hasExactRestoredPlanCheckpoint &&
+    !rejectedReviewablePlanArtifact &&
+    restoredExecutionReadiness.ok;
   // Restart restoration never grants active execution authority. An exact
   // approval capability can be retained only for a new explicit-resume lease.
   const restoredIsPlanApproved = false;
@@ -4451,8 +4562,8 @@ export function normalizeSessionRuntimeSnapshot(
         };
       })
     : rederivedPlanTasks;
-  const restoredPlanTasks = hasExactRestoredPlanApprovalCapability || hasTasksArtifact
-    ? hasExactRestoredPlanApprovalCapability
+  const restoredPlanTasks = hasExactRestoredPlanCheckpoint || hasTasksArtifact
+    ? hasExactRestoredPlanCheckpoint
       ? restoredApprovedPlanTasks
       : restoredArtifactTaskSeed
     : [];
@@ -4499,6 +4610,7 @@ export function normalizeSessionRuntimeSnapshot(
         request: deletionOwnedActionRequest ? null : originalActionRequest,
         runOwner: restoredHarnessRunMarker,
         planIdentity: restoredPlanIdentity,
+        planReviewIdentity: restoredPlanReviewIdentity,
         taskFlow: rawTaskFlow,
         goalRuntime: normalizedGoalRuntime,
         unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
@@ -4685,6 +4797,7 @@ export function normalizeSessionRuntimeSnapshot(
   let conversationTurns = normalizeInterruptedConversationTurnsForRestore(
     snapshot.conversationTurns,
     taskFlow,
+    hasWorkspaceContainer,
   ).map((turn) => {
     const ownsTerminalMarker = !!restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
     const hasRecoverableAwaitingState = turn.status === "awaiting_input" || turn.status === "awaiting_approval";
@@ -5116,7 +5229,7 @@ export function normalizeSessionRuntimeSnapshot(
     restoredLifecycleSessionKey !== UNBOUND_PLAN_SESSION_KEY &&
     !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`);
   const restoreAt = Date.now();
-  const restoredQueueCandidate = canRestoreWorkspaceQueue
+  let restoredQueueCandidate = canRestoreWorkspaceQueue
     ? reconcileWorkspaceTurnQueueOnRestore({
         snapshot: snapshot.workspaceTurnQueue,
         sessionKey: restoredLifecycleSessionKey,
@@ -5125,6 +5238,94 @@ export function normalizeSessionRuntimeSnapshot(
         at: restoreAt,
       })
     : null;
+  let migratedLegacyWorkspaceLedgerEntry: WorkspaceInstructionLedgerEntry | null = null;
+  if (canRestoreWorkspaceQueue && restoredQueueCandidate && restoredQueuedUserMessage) {
+    const legacyIdentity = String(restoredQueuedUserMessage.id || "legacy")
+      .replace(/[^A-Za-z0-9._:-]+/g, "-")
+      .slice(0, 96) || "legacy";
+    const occupiedBlockIds = new Set(taskFlow.map((block) => block.id));
+    let userBlockId = Math.max(0, ...[...occupiedBlockIds]) + 1;
+    while (occupiedBlockIds.has(userBlockId)) userBlockId += 1;
+    const migration = migrateLegacyQueuedMessageToWorkspaceTurn({
+      legacy: restoredQueuedUserMessage,
+      queue: restoredQueueCandidate,
+      sessionKey: restoredLifecycleSessionKey,
+      sessionEpoch: restoredLifecycleSessionEpoch,
+      clientSubmissionId: `legacy-${legacyIdentity}`,
+      receiptId: `workspace-receipt-legacy-${legacyIdentity}`,
+      turnId: `turn-legacy-${legacyIdentity}`,
+      userBlockId,
+      at: restoreAt,
+    });
+    if (migration.disposition === "migrated") {
+      const projection = reconcileWorkspaceInstructionProjection({
+        entry: migration.queue.entries.find((entry) =>
+          entry.receipt.receiptId === migration.receipt.receiptId
+        )!,
+        taskFlow,
+        conversationTurns,
+        userContextItems: buildWorkspaceInstructionUserContext({
+          contextMentions: restoredQueuedUserMessage.contextMentions || [],
+          attachedFiles: restoredQueuedUserMessage.attachedFiles || [],
+          images: restoredQueuedUserMessage.images || [],
+          workspace: options?.workspacePath || "",
+          language: /[^\x00-\x7F]/.test(restoredQueuedUserMessage.text) ? "zh" : "en",
+        }),
+        language: /[^\x00-\x7F]/.test(restoredQueuedUserMessage.text) ? "zh" : "en",
+      });
+      if (projection.disposition === "ready") {
+        restoredQueueCandidate = migration.queue;
+        taskFlow = projection.taskFlow;
+        conversationTurns = projection.conversationTurns;
+        migratedLegacyWorkspaceLedgerEntry = migration.ledgerEntry;
+        reservedWorkspaceInstructionBlockIds.push(userBlockId);
+        logStoreEvent("workspace_legacy_queue_migrated", {
+          sessionKey: restoredLifecycleSessionKey,
+          receiptId: migration.receipt.receiptId,
+          turnId: migration.receipt.turnId,
+        });
+      }
+    }
+    if (!migratedLegacyWorkspaceLedgerEntry) {
+      const useChinese = /[^\x00-\x7F]/.test(restoredQueuedUserMessage.text);
+      const errorTurnId = `turn-legacy-error-${legacyIdentity}`;
+      const userBlock: TaskBlock = {
+        id: userBlockId,
+        turnId: errorTurnId,
+        type: "user",
+        content: restoredQueuedUserMessage.text,
+      };
+      const errorBlockId = userBlockId + 1;
+      const summary = useChinese
+        ? "旧版排队指令无法安全迁移；已停止自动重放，请重新发送此指令。"
+        : "The legacy queued instruction could not be migrated safely. Automatic replay was stopped; submit it again.";
+      taskFlow = [
+        ...taskFlow,
+        userBlock,
+        { id: errorBlockId, turnId: errorTurnId, type: "agent", content: summary, streaming: false },
+      ];
+      conversationTurns = [...conversationTurns, {
+        id: errorTurnId,
+        clientSubmissionId: `legacy-error-${legacyIdentity}`,
+        userPrompt: restoredQueuedUserMessage.text,
+        title: useChinese ? "排队恢复失败" : "Queue restore failed",
+        intentSummary: summary,
+        mode: "edit",
+        intent: "respond",
+        displayIntent: "respond",
+        status: "error",
+        summary,
+        blockIds: [userBlockId, errorBlockId],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: restoreAt,
+      }];
+      logStoreEvent("workspace_legacy_queue_migration_failed_visible", {
+        sessionKey: restoredLifecycleSessionKey,
+        legacyQueueId: restoredQueuedUserMessage.id,
+      });
+    }
+  }
   const restoredLocalFastQueueEntries = options?.quarantineInterruptedLocalFast
     ? restoredQueueCandidate?.entries.filter(isRestoredLocalFastQueueEntry) || []
     : [];
@@ -5442,17 +5643,153 @@ export function normalizeSessionRuntimeSnapshot(
     suppliedLifecycleSessionEpoch &&
     restoredLifecycleSessionKey !== UNBOUND_PLAN_SESSION_KEY &&
     !restoredLifecycleSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
-      ? normalizeWorkspaceInstructionLedger(
+      ? (() => {
+          const ledger = [...normalizeWorkspaceInstructionLedger(
           snapshot.workspaceInstructionLedger,
           restoredLifecycleSessionKey,
           restoredLifecycleSessionEpoch,
-        )
+          )];
+          if (
+            migratedLegacyWorkspaceLedgerEntry &&
+            !ledger.some((entry) =>
+              entry.clientSubmissionId === migratedLegacyWorkspaceLedgerEntry!.clientSubmissionId
+            )
+          ) ledger.push(migratedLegacyWorkspaceLedgerEntry);
+          return ledger;
+        })()
       : [];
+  const restoredWorkspaceKey = options && "workspacePath" in options
+    ? resolveSessionWorkspaceKey(options.workspacePath)
+    : undefined;
+  const restoredSubagentClosureReceiptLedger = normalizeSubagentClosureReceiptLedger(
+    snapshot.subagentClosureReceiptLedger,
+    restoredWorkspaceKey || suppliedLifecycleSessionEpoch
+      ? {
+          expectedOwner: {
+            ...(restoredWorkspaceKey ? { workspaceKey: restoredWorkspaceKey } : {}),
+            ...(suppliedLifecycleSessionEpoch
+              ? {
+                  sessionKey: restoredLifecycleSessionKey,
+                  sessionEpoch: restoredLifecycleSessionEpoch,
+                }
+              : {}),
+          },
+        }
+      : undefined,
+  );
+  const normalizedTurnRuntimeCheckpoints = normalizeTurnRuntimeCheckpointMap(
+    snapshot.turnRuntimeCheckpoints,
+    {
+      expectedSessionKey: suppliedLifecycleSessionEpoch
+        ? restoredLifecycleSessionKey
+        : undefined,
+      expectedSessionEpoch: suppliedLifecycleSessionEpoch || undefined,
+      expectedWorkspaceKey: restoredWorkspaceKey,
+      closureReceiptLedger: restoredSubagentClosureReceiptLedger,
+      coldRestore: options?.quarantineInterruptedLocalFast === true,
+      now: restoreAt,
+    },
+  );
+  const restoredTurnRuntimeCheckpoints = Object.fromEntries(
+    Object.entries(normalizedTurnRuntimeCheckpoints).filter(([, checkpoint]) => {
+      if (checkpoint.canonical.planReviewStatus !== "pending") return true;
+      const request = reconciledRestoredActionRequest;
+      const artifact = checkpoint.canonical.planArtifact;
+      const run = checkpoint.canonical.run;
+      const review = restoredPlanLifecycle.reviewIdentity;
+      const canonicalArtifactPath = canonicalizePlanArtifactPath(artifact?.path || "");
+      const requestArtifactPaths = request?.kind === "plan_review"
+        ? request.artifactPaths.map(canonicalizePlanArtifactPath)
+        : [];
+      const reviewArtifactPaths = review?.artifactPaths.map(canonicalizePlanArtifactPath) || [];
+      return checkpoint.canonical.turn.strategy === "plan" &&
+        !!artifact &&
+        !!run &&
+        run.status === "paused" &&
+        run.pause?.subject === "plan" &&
+        request?.kind === "plan_review" &&
+        request.status === "pending" &&
+        request.sessionKey === checkpoint.owner.sessionKey &&
+        request.turnId === checkpoint.owner.turnId &&
+        request.runId === run.identity.runId &&
+        (request.parentRunId || null) === run.identity.parentRunId &&
+        request.planRevision === artifact.revision &&
+        request.artifactHash === artifact.digest &&
+        requestArtifactPaths.length === 1 &&
+        requestArtifactPaths[0] === canonicalArtifactPath &&
+        restoredPlanLifecycle.status === "awaiting_approval" &&
+        !!review &&
+        review.sessionKey === checkpoint.owner.sessionKey &&
+        review.sessionEpoch === checkpoint.owner.sessionEpoch &&
+        review.turnId === checkpoint.owner.turnId &&
+        review.runId === run.identity.runId &&
+        review.parentRunId === run.identity.parentRunId &&
+        review.requestId === request.requestId &&
+        review.planRevision === artifact.revision &&
+        review.artifactHash === artifact.digest &&
+        reviewArtifactPaths.length === 1 &&
+        reviewArtifactPaths[0] === canonicalArtifactPath;
+    }),
+  );
+  const restoredRuntimeV2Checkpoints = normalizeRuntimeV2CheckpointMap(
+    snapshot.runtimeV2Checkpoints,
+    {
+      ...(restoredWorkspaceKey ? { workspaceKey: restoredWorkspaceKey } : {}),
+      ...(suppliedLifecycleSessionEpoch
+        ? {
+            sessionKey: restoredLifecycleSessionKey,
+            sessionEpoch: suppliedLifecycleSessionEpoch,
+          }
+        : {}),
+    },
+  );
+  const checkpointBackedActionRequest =
+    reconciledRestoredActionRequest?.kind === "plan_review" &&
+    !restoredTurnRuntimeCheckpoints[reconciledRestoredActionRequest.turnId]
+      ? null
+      : reconciledRestoredActionRequest;
+  let checkpointBackedPlanLifecycle = restoredPlanLifecycle;
+  if (
+    reconciledRestoredActionRequest?.kind === "plan_review" &&
+    checkpointBackedActionRequest === null &&
+    checkpointBackedPlanLifecycle.status === "awaiting_approval" &&
+    checkpointBackedPlanLifecycle.planTurnId
+  ) {
+    const downgraded = reducePlanLifecycle(checkpointBackedPlanLifecycle, {
+      type: "start_drafting",
+      expectedVersion: checkpointBackedPlanLifecycle.version,
+      at: checkpointBackedPlanLifecycle.updatedAt,
+      planTurnId: checkpointBackedPlanLifecycle.planTurnId,
+      artifactIdentity: checkpointBackedPlanLifecycle.artifactIdentity,
+    });
+    if (downgraded.disposition !== "rejected") {
+      checkpointBackedPlanLifecycle = downgraded.state;
+    }
+  }
+  const checkpointRejectedPlanReviewTurnId = checkpointBackedActionRequest === null &&
+      reconciledRestoredActionRequest?.kind === "plan_review"
+    ? reconciledRestoredActionRequest.turnId
+    : null;
+  const checkpointBackedConversationTurns = checkpointRejectedPlanReviewTurnId
+    ? conversationTurns.map((turn) => turn.id === checkpointRejectedPlanReviewTurnId &&
+        turn.status === "awaiting_approval"
+      ? {
+          ...turn,
+          status: "paused" as const,
+          summary: turn.summary || (/[^\x00-\x7F]/.test(String(turn.userPrompt || ""))
+            ? "计划审批检查点与当前会话身份不一致；已撤销失效审批，可重新生成或调整计划。"
+            : "The Plan review checkpoint no longer matches this Session; stale approval was revoked."),
+        }
+      : turn)
+    : conversationTurns;
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents,
     harnessRunMarker: sanitizedHarnessRunMarker,
-    activeActionRequest: reconciledRestoredActionRequest,
+    activeActionRequest: checkpointBackedActionRequest,
+    turnRuntimeCheckpoints: restoredTurnRuntimeCheckpoints,
+    runtimeV2Checkpoints: restoredRuntimeV2Checkpoints,
+    subagentClosureReceiptLedger: restoredSubagentClosureReceiptLedger,
     taskFlow,
     agentMessages,
     contextMemoryState: normalizedContextMemoryState,
@@ -5460,7 +5797,7 @@ export function normalizeSessionRuntimeSnapshot(
     providerCompatibilityByRuntimeKey: normalizeProviderCompatibilityByRuntimeKey(
       snapshot.providerCompatibilityByRuntimeKey,
     ),
-    conversationTurns,
+    conversationTurns: checkpointBackedConversationTurns,
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
@@ -5471,16 +5808,16 @@ export function normalizeSessionRuntimeSnapshot(
     pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
     planArtifacts: restoredPlanArtifacts.artifacts,
     planTasks: restoredPlanTasks,
-    planExecutionEvidenceLedger: hasExactRestoredPlanApprovalCapability
+    planExecutionEvidenceLedger: hasExactRestoredPlanCheckpoint
       ? snapshot.planExecutionEvidenceLedger || []
       : [],
-    planExecutionEvidenceCount: hasExactRestoredPlanApprovalCapability
+    planExecutionEvidenceCount: hasExactRestoredPlanCheckpoint
       ? snapshot.planExecutionEvidenceCount ?? 0
       : 0,
-    planAutoResumeCount: hasExactRestoredPlanApprovalCapability
+    planAutoResumeCount: hasExactRestoredPlanCheckpoint
       ? Math.max(0, Number(snapshot.planAutoResumeCount) || 0)
       : 0,
-    planExecutionProgressSnapshot: hasExactRestoredPlanApprovalCapability
+    planExecutionProgressSnapshot: hasExactRestoredPlanCheckpoint
       ? (() => {
           const restored = normalizeStoredPlanExecutionProgressSnapshot(
             snapshot.planExecutionProgressSnapshot,
@@ -5489,7 +5826,7 @@ export function normalizeSessionRuntimeSnapshot(
           return restored ? { ...restored, phase: "paused" as const } : null;
         })()
       : null,
-    planLifecycle: restoredPlanLifecycle,
+    planLifecycle: checkpointBackedPlanLifecycle,
     planStage: restoredPlanStage,
     isPlanApproved: restoredIsPlanApproved,
     planApprovalChoice: hasExactRestoredPlanApprovalCapability
@@ -5515,7 +5852,7 @@ export function normalizeSessionRuntimeSnapshot(
     approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
       ? snapshot.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
-    queuedUserMessage: restoredQueuedUserMessage,
+    queuedUserMessage: canRestoreWorkspaceQueue ? null : restoredQueuedUserMessage,
     activeGuidance,
     workspaceTurnQueue: restoredWorkspaceTurnQueue,
     workspaceInstructionLedger: restoredWorkspaceInstructionLedger,
@@ -5550,12 +5887,51 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
     snapshot.harnessRunMarker?.sessionKey || null,
     { now: Date.now() },
   );
+  const checkpointOwnerFence = planLifecycle.sessionKey !== UNBOUND_PLAN_SESSION_KEY
+    ? {
+        expectedWorkspaceKey: resolveWorkspaceKeyFromBoundSessionKey(planLifecycle.sessionKey),
+        expectedSessionKey: planLifecycle.sessionKey,
+        expectedSessionEpoch: planLifecycle.sessionEpoch,
+      }
+    : undefined;
+  const subagentClosureReceiptLedger = normalizeSubagentClosureReceiptLedger(
+    snapshot.subagentClosureReceiptLedger,
+    checkpointOwnerFence
+      ? {
+          expectedOwner: {
+            workspaceKey: checkpointOwnerFence.expectedWorkspaceKey,
+            sessionKey: checkpointOwnerFence.expectedSessionKey,
+            sessionEpoch: checkpointOwnerFence.expectedSessionEpoch,
+          },
+        }
+      : undefined,
+  );
   return {
     ...snapshot,
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
     harnessRunMarker: normalizeHarnessRunMarker(snapshot.harnessRunMarker),
     activeActionRequest: normalizeActionRequest(snapshot.activeActionRequest),
+    turnRuntimeCheckpoints: normalizeTurnRuntimeCheckpointMap(
+      snapshot.turnRuntimeCheckpoints,
+      {
+        ...(checkpointOwnerFence || {}),
+        closureReceiptLedger: subagentClosureReceiptLedger,
+      },
+    ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      snapshot.runtimeV2Checkpoints,
+      checkpointOwnerFence
+        ? {
+            ...(checkpointOwnerFence.expectedWorkspaceKey
+              ? { workspaceKey: checkpointOwnerFence.expectedWorkspaceKey }
+              : {}),
+            sessionKey: checkpointOwnerFence.expectedSessionKey,
+            sessionEpoch: checkpointOwnerFence.expectedSessionEpoch,
+          }
+        : undefined,
+    ),
+    subagentClosureReceiptLedger,
     taskFlow: sanitizeTaskBlocksForPersist(snapshot.taskFlow || []),
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
     planArtifacts: sanitizedPlanArtifacts,
@@ -5624,18 +6000,48 @@ export function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | 
   };
 }
 
-function normalizeActiveGuidance(value: unknown): ActiveGuidance | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Partial<ActiveGuidance>;
-  const text = String(record.text || "").trim();
-  if (!text) return null;
-  return {
-    id: typeof record.id === "string" && record.id.trim() ? record.id : `guidance-${Date.now()}`,
-    text,
-    turnId: typeof record.turnId === "string" ? record.turnId : null,
-    createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : Date.now(),
-    consumedAt: Number.isFinite(Number(record.consumedAt)) ? Number(record.consumedAt) : null,
-  };
+function selectCurrentTurnIngress(state: AppState) {
+  const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+  const sessionId = Number(state.currentSessionId);
+  const sessionKey = Number.isSafeInteger(sessionId) && sessionId > 0
+    ? resolveSessionRuntimeKey(workspaceKey, sessionId)
+    : null;
+  const turnId = String(state.currentTurnId || "").trim();
+  const ownerSession = sessionKey
+    ? (state.sessionsByWorkspace[workspaceKey] || []).find((session) => session.id === sessionId)
+    : null;
+  const sessionEpoch = String(
+    ownerSession?.planLifecycleEpoch ||
+    (state.planLifecycle?.sessionKey === sessionKey ? state.planLifecycle.sessionEpoch : "") ||
+    "",
+  ).trim();
+  const expectedOwner = sessionKey && sessionEpoch && turnId
+    ? { workspaceKey, sessionKey, sessionEpoch, turnId }
+    : null;
+  const ownerTurn = turnId
+    ? state.conversationTurns.find((turn) => turn.id === turnId)
+    : null;
+  const runtimeOwnerObserved = !!(
+    state.isGenerating ||
+    state.agentStatus === "running" ||
+    state.agentStatus === "pending_review" ||
+    (
+      state.activeActionRequest?.status === "pending" &&
+      (!sessionKey || state.activeActionRequest.sessionKey === sessionKey) &&
+      (!turnId || state.activeActionRequest.turnId === turnId)
+    ) ||
+    (
+      state.harnessRunMarker?.status === "running" &&
+      (!sessionKey || state.harnessRunMarker.sessionKey === sessionKey) &&
+      (!turnId || state.harnessRunMarker.turnId === turnId)
+    )
+  );
+  return selectTurnIngressAvailability({
+    checkpoint: turnId ? state.turnRuntimeCheckpoints?.[turnId] : null,
+    expectedOwner,
+    strategy: resolveTurnStrategyFromIntent(ownerTurn?.intent, ownerTurn?.mode),
+    runtimeOwnerObserved,
+  });
 }
 
 const sessionRuntimeKeys = [
@@ -5643,6 +6049,9 @@ const sessionRuntimeKeys = [
   "runtimeEvents",
   "harnessRunMarker",
   "activeActionRequest",
+  "turnRuntimeCheckpoints",
+  "runtimeV2Checkpoints",
+  "subagentClosureReceiptLedger",
   "taskFlow",
   "agentMessages",
   "contextMemoryState",
@@ -5866,11 +6275,67 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     state.autoApproveTools === true,
     state.autoApproveToolScopes,
   );
+  const planLifecycle = state.planLifecycle || createEmptyPlanLifecycleForSession(
+    resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    ),
+  );
+  const hasBoundPlanLifecycle = planLifecycle.sessionKey !== UNBOUND_PLAN_SESSION_KEY;
+  const checkpointWorkspaceKey = state.currentWorkspace !== undefined
+    ? resolveSessionWorkspaceKey(state.currentWorkspace)
+    : hasBoundPlanLifecycle
+      ? resolveWorkspaceKeyFromBoundSessionKey(planLifecycle.sessionKey) || undefined
+      : undefined;
+  const subagentClosureReceiptLedger = normalizeSubagentClosureReceiptLedger(
+    state.subagentClosureReceiptLedger,
+    checkpointWorkspaceKey || hasBoundPlanLifecycle
+      ? {
+          expectedOwner: {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          },
+        }
+      : undefined,
+  );
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: normalizeRuntimeEvents(state.runtimeEvents),
     harnessRunMarker: normalizeHarnessRunMarker(state.harnessRunMarker),
     activeActionRequest: state.activeActionRequest || null,
+    turnRuntimeCheckpoints: normalizeTurnRuntimeCheckpointMap(
+      state.turnRuntimeCheckpoints,
+      {
+        ...(checkpointWorkspaceKey ? { expectedWorkspaceKey: checkpointWorkspaceKey } : {}),
+        ...(hasBoundPlanLifecycle
+          ? {
+              expectedSessionKey: planLifecycle.sessionKey,
+              expectedSessionEpoch: planLifecycle.sessionEpoch,
+            }
+          : {}),
+        closureReceiptLedger: subagentClosureReceiptLedger,
+      },
+    ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      state.runtimeV2Checkpoints,
+      checkpointWorkspaceKey || hasBoundPlanLifecycle
+        ? {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          }
+        : undefined,
+    ),
+    subagentClosureReceiptLedger,
     taskFlow: Array.isArray(state.taskFlow) ? archiveConsumedReplyOptionsFromTaskFlow(state.taskFlow) : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
     contextMemoryState: normalizedContextMemoryState,
@@ -5893,12 +6358,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planAutoResumeCount: Math.max(0, Number(state.planAutoResumeCount) || 0),
     planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(state.planExecutionProgressSnapshot),
-    planLifecycle: state.planLifecycle || createEmptyPlanLifecycleForSession(
-      resolveSessionRuntimeKey(
-        resolveSessionWorkspaceKey(state.currentWorkspace),
-        state.currentSessionId,
-      ),
-    ),
+    planLifecycle,
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
@@ -5939,7 +6399,9 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
       ? state.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
     readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
-    queuedUserMessage: normalizeQueuedUserMessage(state.queuedUserMessage),
+    queuedUserMessage: resolveVisibleGoalSubmissionSessionKey(state).startsWith(`${GLOBAL_CHAT_KEY}:`)
+      ? normalizeQueuedUserMessage(state.queuedUserMessage)
+      : null,
     activeGuidance: normalizeActiveGuidance(state.activeGuidance),
     workspaceTurnQueue: state.workspaceTurnQueue || null,
     workspaceInstructionLedger: Array.isArray(state.workspaceInstructionLedger)
@@ -6138,7 +6600,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
   parentRunId: string | null;
   reason: string;
   message: string;
-  expectedAbortController: AbortController | null;
+  controlPlaneFence: CanceledTurnControlPlaneFence;
   nextTaskId: () => number;
 }): Promise<SessionCancellationSettlement> {
   let sessionDeleted = false;
@@ -6217,7 +6679,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
     );
     if (
       !targetAlreadyTerminal &&
-      (scopedState.abortController ?? null) !== input.expectedAbortController
+      (scopedState.abortController ?? null) !== input.controlPlaneFence.abortController
     ) {
       ownerTransferred = true;
       return {};
@@ -6231,9 +6693,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       reason: input.reason,
       message: input.message,
       nextTaskId: input.nextTaskId,
-      controlPlaneFence: {
-        abortController: input.expectedAbortController,
-      },
+      controlPlaneFence: input.controlPlaneFence,
     });
     if (projection.disposition === "ownership_lost") {
       ownerTransferred = true;
@@ -6520,6 +6980,18 @@ export function buildRestoredSessionRuntimePatch(input: {
   if (!normalized) return {};
   const taskFlow = normalized.taskFlow || [];
   const conversationTurns = normalized.conversationTurns || [];
+  const restoredReviewTurnId = normalized.activeActionRequest?.kind === "plan_review"
+    ? normalized.activeActionRequest.turnId
+    : null;
+  const restoredReviewCheckpoint = restoredReviewTurnId
+    ? normalized.turnRuntimeCheckpoints?.[restoredReviewTurnId]
+    : null;
+  const restoredAgentStatus: AgentStatus =
+    restoredReviewCheckpoint?.canonical.planReviewStatus === "pending" &&
+    restoredReviewCheckpoint.canonical.run?.status === "paused" &&
+    restoredReviewCheckpoint.canonical.run.pause?.subject === "plan"
+      ? "pending_review"
+      : "idle";
   const runtime = createSessionRuntimeFromState({
     ...input.fallbackState,
     ...normalized,
@@ -6527,13 +6999,18 @@ export function buildRestoredSessionRuntimePatch(input: {
     conversationTurns,
     currentTurnId: normalized.currentTurnId ?? null,
     currentTurnState: createDefaultCurrentTurnState(),
-    agentStatus: "idle",
+    // Process-local execution authority is never restored. An exact typed Plan
+    // review is presentation state, however, and must remain visible/approvable.
+    agentStatus: restoredAgentStatus,
     isGenerating: false,
     abortController: null,
     pendingReviewResolve: null,
     pendingReviewTaskId: null,
     pendingToolCall: null,
     pendingPlanApprovalHandoff: null,
+    // Guidance is a process-local one-shot Run input. It never survives a
+    // cold restore, even when its serialized identity remains well formed.
+    activeGuidance: null,
     readOnlyAutoApproveForSession: false,
     lockedComposerIntent: sanitizeHydratedLockedComposerIntent(
       input.fallbackState.lockedComposerIntent,
@@ -6780,8 +7257,10 @@ async function getWorkspaceTree(workspace: string): Promise<string> {
   }
 
   try {
-    const skeleton = await invoke<string>("get_project_skeleton", { depth: 3, workspace });
-    workspaceTreeCache = skeleton;
+    // IPC is an untrusted boundary at runtime even when the TypeScript side
+    // declares a string. The adapter degrades malformed/null responses to an
+    // empty discovery snapshot instead of aborting Plan execution admission.
+    workspaceTreeCache = await getProjectSkeleton(3, workspace);
     workspaceTreeCacheKey = workspace;
     workspaceTreeCacheVersion = workspaceContentVersion;
     return workspaceTreeCache;
@@ -6950,6 +7429,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
       case "user":
         // Strip large image data URLs from persisted state (only keep metadata)
         const contextItems = sanitizeUserContextItemsForPersist(b.contextItems);
+        const runtimeGuidanceId = String(b.runtimeGuidance?.id || "").trim();
         return {
           id: b.id,
           turnId: b.turnId,
@@ -6957,12 +7437,13 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           type: "user" as const,
           content: String(b.content),
           ...(contextItems ? { contextItems } : {}),
+          ...(runtimeGuidanceId ? { runtimeGuidance: { id: runtimeGuidanceId } } : {}),
         };
       case "agent":
         // Remove streaming flag (transient UI state) — keep content (string)
         const publicProgress = b.publicProgress &&
           b.publicProgress.schemaVersion === 1 &&
-          b.publicProgress.kind === "assistant_commentary" &&
+          (b.publicProgress.kind === "assistant_commentary" || b.publicProgress.kind === "capsule_activity") &&
           b.publicProgress.source === "model_visible_content" &&
           String(b.publicProgress.sessionKey || "").trim() &&
           String(b.publicProgress.turnId || "").trim() &&
@@ -6970,7 +7451,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           String(b.publicProgress.runId || "").trim()
             ? {
                 schemaVersion: 1 as const,
-                kind: "assistant_commentary" as const,
+                kind: b.publicProgress.kind,
                 source: "model_visible_content" as const,
                 sessionKey: String(b.publicProgress.sessionKey).trim(),
                 turnId: String(b.publicProgress.turnId).trim(),
@@ -7082,6 +7563,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id, turnId: b.turnId, ...persistedTurnPhase(b), type: "tool" as const,
           toolName: String(b.toolName), target: String(b.target),
+          ...(b.executionName ? { executionName: String(b.executionName) } : {}),
           status: String(b.status),
           toolStatus: b.toolStatus,
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
@@ -7103,6 +7585,9 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
                   ...(typeof b.diff.fullFile === "boolean" ? { fullFile: b.diff.fullFile } : {}),
                 },
               }
+            : {}),
+          ...(b.workspaceEffect === "verified" || b.workspaceEffect === "partial"
+            ? { workspaceEffect: b.workspaceEffect }
             : {}),
           ...(b.revertStatus ? { revertStatus: b.revertStatus } : {}),
           ...(b.revertMessage ? { revertMessage: String(b.revertMessage) } : {}),
@@ -7167,11 +7652,67 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
 
 export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRuntimeSnapshot {
   const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+  const planLifecycle = state.planLifecycle || createEmptyPlanLifecycleForSession(
+    resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    ),
+  );
+  const hasBoundPlanLifecycle = planLifecycle.sessionKey !== UNBOUND_PLAN_SESSION_KEY;
+  const checkpointWorkspaceKey = "currentWorkspace" in (state || {})
+    ? resolveSessionWorkspaceKey(state.currentWorkspace)
+    : hasBoundPlanLifecycle
+      ? resolveWorkspaceKeyFromBoundSessionKey(planLifecycle.sessionKey) || undefined
+      : undefined;
+  const subagentClosureReceiptLedger = normalizeSubagentClosureReceiptLedger(
+    state.subagentClosureReceiptLedger,
+    checkpointWorkspaceKey || hasBoundPlanLifecycle
+      ? {
+          expectedOwner: {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          },
+        }
+      : undefined,
+  );
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: state.runtimeEvents || [],
     harnessRunMarker: state.harnessRunMarker || null,
     activeActionRequest: state.activeActionRequest || null,
+    turnRuntimeCheckpoints: normalizeTurnRuntimeCheckpointMap(
+      state.turnRuntimeCheckpoints,
+      {
+        ...(checkpointWorkspaceKey ? { expectedWorkspaceKey: checkpointWorkspaceKey } : {}),
+        ...(hasBoundPlanLifecycle
+          ? {
+              expectedSessionKey: planLifecycle.sessionKey,
+              expectedSessionEpoch: planLifecycle.sessionEpoch,
+            }
+          : {}),
+        closureReceiptLedger: subagentClosureReceiptLedger,
+      },
+    ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      state.runtimeV2Checkpoints,
+      checkpointWorkspaceKey || hasBoundPlanLifecycle
+        ? {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          }
+        : undefined,
+    ),
+    subagentClosureReceiptLedger,
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
     contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
@@ -7194,12 +7735,7 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planAutoResumeCount: Math.max(0, Number(state.planAutoResumeCount) || 0),
     planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(state.planExecutionProgressSnapshot),
-    planLifecycle: state.planLifecycle || createEmptyPlanLifecycleForSession(
-      resolveSessionRuntimeKey(
-        resolveSessionWorkspaceKey(state.currentWorkspace),
-        state.currentSessionId,
-      ),
-    ),
+    planLifecycle,
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: state.planApprovalChoice ?? null,
@@ -7251,7 +7787,11 @@ function resolveCurrentSessionModeAffinityFromState(state: any): SessionModeAffi
 export function buildEmptySessionRuntimeSnapshot(
   state: any,
   affinity: SessionModeAffinity,
-  owner: { sessionKey: string; sessionEpoch: string; createdAt: number },
+  owner: {
+    sessionKey: string | null;
+    sessionEpoch: string | null;
+    createdAt: number;
+  },
 ): SessionRuntimeSnapshot {
   const selectedMainModeKey = normalizeSessionModeAffinity(affinity, "main_mode");
   const previousImageStudio = normalizeImageStudioRuntime(
@@ -7262,6 +7802,9 @@ export function buildEmptySessionRuntimeSnapshot(
     runtimeEvents: [],
     harnessRunMarker: null,
     activeActionRequest: null,
+    turnRuntimeCheckpoints: {},
+    runtimeV2Checkpoints: {},
+    subagentClosureReceiptLedger: null,
     taskFlow: [],
     agentMessages: [],
     contextMemoryState: null,
@@ -7286,10 +7829,13 @@ export function buildEmptySessionRuntimeSnapshot(
     planExecutionEvidenceCount: 0,
     planAutoResumeCount: 0,
     planExecutionProgressSnapshot: null,
-    planLifecycle: createEmptyPlanLifecycleForSession(owner.sessionKey, {
-      sessionEpoch: owner.sessionEpoch,
-      now: owner.createdAt,
-    }),
+    planLifecycle: createEmptyPlanLifecycleForSession(
+      owner.sessionKey,
+      {
+        ...(owner.sessionEpoch ? { sessionEpoch: owner.sessionEpoch } : {}),
+        now: owner.createdAt,
+      },
+    ),
     planStage: "idle",
     isPlanApproved: false,
     planApprovalChoice: null,
@@ -7313,11 +7859,13 @@ export function buildEmptySessionRuntimeSnapshot(
     approvedShellPermissionRules: [],
     queuedUserMessage: null,
     activeGuidance: null,
-    workspaceTurnQueue: owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+    workspaceTurnQueue: !owner.sessionKey
+      || owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
       ? null
       : createWorkspaceTurnQueueState({
           sessionKey: owner.sessionKey,
-          sessionEpoch: owner.sessionEpoch,
+          sessionEpoch: owner.sessionEpoch
+            || createPlanLifecycleSessionEpoch(owner.createdAt),
           updatedAt: owner.createdAt,
         }),
     workspaceInstructionLedger: [],
@@ -7666,7 +8214,8 @@ function buildPlanArtifactRevertTransition(
     );
   }
 
-  const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
+  const nextArtifactIdentity = buildPlanApprovalIdentity(nextArtifacts);
+  const nextReviewIdentity = buildTypedPlanApprovalIdentity(nextArtifacts);
   const lifecycleSessionKey = resolveSessionRuntimeKey(
     resolveSessionWorkspaceKey(state.currentWorkspace),
     state.currentSessionId,
@@ -7674,7 +8223,7 @@ function buildPlanArtifactRevertTransition(
   let nextPlanLifecycle = transitionPlanLifecycleArtifactIdentity({
     lifecycle: state.planLifecycle,
     sessionKey: lifecycleSessionKey,
-    artifactIdentity: toPlanLifecycleArtifactIdentity(nextApprovalIdentity),
+    artifactIdentity: toPlanLifecycleArtifactIdentity(nextArtifactIdentity),
     now,
   });
   const heldPlanAuthority = state.isPlanApproved ||
@@ -7700,37 +8249,37 @@ function buildPlanArtifactRevertTransition(
     isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
   const shouldRefreshPlanReviewRequest =
     state.activeActionRequest?.kind === "plan_review" &&
-    !!nextApprovalIdentity &&
+    !!nextReviewIdentity &&
     (
-      state.activeActionRequest.planRevision !== nextApprovalIdentity.revision ||
-      state.activeActionRequest.artifactHash !== nextApprovalIdentity.artifactHash
+      state.activeActionRequest.planRevision !== nextReviewIdentity.revision ||
+      state.activeActionRequest.artifactHash !== nextReviewIdentity.artifactHash
     );
   const clearsPlanReviewRequest =
-    state.activeActionRequest?.kind === "plan_review" && !nextApprovalIdentity;
+    state.activeActionRequest?.kind === "plan_review" && !nextReviewIdentity;
   const nextPlanReviewRequest = shouldRefreshPlanReviewRequest &&
     state.activeActionRequest?.kind === "plan_review" &&
-    nextApprovalIdentity
+    nextReviewIdentity
       ? buildPlanReviewActionRequest({
           sessionKey: state.activeActionRequest.sessionKey,
           turnId: state.activeActionRequest.turnId,
           runId: state.activeActionRequest.runId,
           parentRunId: state.activeActionRequest.parentRunId,
           title: state.activeActionRequest.title,
-          planRevision: nextApprovalIdentity.revision,
-          artifactHash: nextApprovalIdentity.artifactHash,
-          artifactPaths: nextApprovalIdentity.artifactPaths,
+          planRevision: nextReviewIdentity.revision,
+          artifactHash: nextReviewIdentity.artifactHash,
+          artifactPaths: nextReviewIdentity.artifactPaths,
         })
       : state.activeActionRequest;
   if (
     shouldRefreshPlanReviewRequest &&
     nextPlanReviewRequest?.kind === "plan_review" &&
-    nextApprovalIdentity
+    nextReviewIdentity
   ) {
     const alignedLifecycle = alignPlanLifecycleWithReview({
       lifecycle: nextPlanLifecycle,
       sessionKey: lifecycleSessionKey,
       request: nextPlanReviewRequest,
-      artifactIdentity: nextApprovalIdentity,
+      artifactIdentity: nextReviewIdentity,
       now,
     });
     if (alignedLifecycle) nextPlanLifecycle = alignedLifecycle;
@@ -8474,7 +9023,12 @@ export const useAppStore = create<AppState>()(
         : null;
     const ownerRunId = ownedActionRequest?.runId || getHarnessActionRunId(ownedMarker);
     const ownerParentRunId = ownedActionRequest?.parentRunId || ownedMarker?.parentRunId || null;
-    const expectedAbortController = current.abortController;
+    const controlPlaneFence = captureCanceledTurnControlPlaneFence({
+      state: current,
+      sessionKey,
+      turnId,
+      runId: ownerRunId,
+    });
     const {
       sessionGet,
       sessionSet,
@@ -8503,7 +9057,7 @@ export const useAppStore = create<AppState>()(
         parentRunId: ownerParentRunId,
         reason,
         message,
-        expectedAbortController,
+        controlPlaneFence,
         nextTaskId: () => get()._nextTaskId(),
         sessionGet,
         getSessionRevisionToken,
@@ -8576,7 +9130,7 @@ export const useAppStore = create<AppState>()(
           parentRunId: ownerParentRunId,
           reason,
           message,
-          expectedAbortController,
+          controlPlaneFence,
           nextTaskId: () => get()._nextTaskId(),
         });
       },
@@ -9050,7 +9604,10 @@ export const useAppStore = create<AppState>()(
           threadId: run.threadId,
           turnId: run.parentTurnId,
           timestampMs,
+          collaborationTaskId: run.collaborationTaskId,
           subagentId,
+          runId: run.runId,
+          parentRunId: run.parentRunId,
           patch: {
             status: "canceled",
             updatedAt: timestampMs,
@@ -9068,7 +9625,10 @@ export const useAppStore = create<AppState>()(
           threadId: run.threadId,
           turnId: run.parentTurnId,
           timestampMs,
+          collaborationTaskId: run.collaborationTaskId,
           subagentId,
+          runId: run.runId,
+          parentRunId: run.parentRunId,
           closedAt: timestampMs,
           reason: "runtime_controller_missing",
         }),
@@ -9203,7 +9763,7 @@ export const useAppStore = create<AppState>()(
         });
       }
 
-      runAfterNextPaint(() => {
+      scheduleRuntimeTask(() => {
         resolver?.(
           choice === "approve_thread" || choice === "approve_once" || choice === "cancel"
             ? choice
@@ -9229,7 +9789,7 @@ export const useAppStore = create<AppState>()(
 
       if (choice === "stay_main") {
         set({ pendingRunDecision: null });
-        runAfterNextPaint(() => {
+        scheduleRuntimeTask(() => {
           get().sendMessage(pending.originalInput, originalImages, {
             suppressGameStudioSuggestion: true,
           });
@@ -9248,7 +9808,7 @@ export const useAppStore = create<AppState>()(
         lockedComposerIntent: null,
       });
 
-      runAfterNextPaint(() => {
+      scheduleRuntimeTask(() => {
         void (async () => {
           let configuredAgent = nextAgent;
           try {
@@ -9332,7 +9892,7 @@ export const useAppStore = create<AppState>()(
         ? intentChoice
         : null;
     set({ pendingRunDecision: null });
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       get().sendMessage(pending.originalInput, originalImages, {
         resolvedIntent: intentChoice,
         ...(approvedExecutionIntent
@@ -9832,7 +10392,10 @@ export const useAppStore = create<AppState>()(
                   ...turn,
                   title: turnTitle,
                   intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
-                  mode: "chat" as const,
+                  mode: resolveWorkspaceAwareWorkflowMode(
+                    "chat",
+                    sessionScopeKey !== GLOBAL_CHAT_KEY,
+                  ),
                   intent: "respond" as const,
                   displayIntent: "respond" as const,
                   status: "executing" as const,
@@ -9858,7 +10421,10 @@ export const useAppStore = create<AppState>()(
               userPrompt: prompt,
               title: turnTitle,
               intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
-              mode: "chat" as const,
+              mode: resolveWorkspaceAwareWorkflowMode(
+                "chat",
+                sessionScopeKey !== GLOBAL_CHAT_KEY,
+              ),
               intent: "respond" as const,
               displayIntent: "respond" as const,
               status: "executing" as const,
@@ -10610,13 +11176,16 @@ export const useAppStore = create<AppState>()(
         s.currentSessionId,
       );
       if (!sessionKey) return {};
+      const previous = s.runtimeBySessionKey[sessionKey];
       const replacement = createSessionRuntimeFromState(s);
+      const currentSessionGeneration = resolveActiveSessionPlanLifecycleEpoch(s, sessionKey);
       return {
         runtimeBySessionKey: {
           ...s.runtimeBySessionKey,
           [sessionKey]: preserveSubmitSessionRuntimeOwnership(
-            s.runtimeBySessionKey[sessionKey],
+            previous,
             replacement,
+            currentSessionGeneration,
           ),
         },
       };
@@ -10685,7 +11254,11 @@ export const useAppStore = create<AppState>()(
           [resolveSessionWorkspaceKey(s.currentWorkspace)]: s.currentSessionId,
         },
         currentWorkspace: "",
-        config: { ...s.config, workspace: "" },
+        config: {
+          ...s.config,
+          workspace: "",
+          workflowMode: "chat",
+        },
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
@@ -10735,7 +11308,14 @@ export const useAppStore = create<AppState>()(
           ? s.workspaces.map((entry) => entry.path === normalizedPath ? nextWorkspaceEntry : entry)
           : [...s.workspaces, nextWorkspaceEntry],
         activeSessionByWorkspace,
-        config: { ...s.config, workspace: normalizedPath },
+        config: {
+          ...s.config,
+          workspace: normalizedPath,
+          workflowMode: resolveWorkspaceAwareWorkflowMode(
+            s.config.workflowMode,
+            true,
+          ),
+        },
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
@@ -10782,7 +11362,14 @@ export const useAppStore = create<AppState>()(
               entry.path === stablePath || entry.path === normalizedPath ? nextEntry : entry
             );
           })(),
-          config: { ...s.config, workspace: stablePath },
+          config: {
+            ...s.config,
+            workspace: stablePath,
+            workflowMode: resolveWorkspaceAwareWorkflowMode(
+              s.config.workflowMode,
+              true,
+            ),
+          },
         }));
         invalidateWorkspaceTreeCache();
         return get().refreshInstructionAndHookState()
@@ -10801,13 +11388,28 @@ export const useAppStore = create<AppState>()(
 
   addSession: (workspacePath: string, session: Session) => {
     set((s) => {
+      const scopeKey = resolveSessionWorkspaceKey(workspacePath);
       const updated = { ...s.sessionsByWorkspace };
-      if (!updated[workspacePath]) updated[workspacePath] = [];
+      if (!updated[scopeKey]) updated[scopeKey] = [];
+      const isActiveWorkspaceContainer =
+        scopeKey !== GLOBAL_CHAT_KEY &&
+        resolveSessionWorkspaceKey(s.currentWorkspace) === scopeKey;
       return {
         sessionsByWorkspace: {
           ...updated,
-          [workspacePath]: [session, ...updated[workspacePath]],
+          [scopeKey]: [session, ...updated[scopeKey]],
         },
+        ...(isActiveWorkspaceContainer
+          ? {
+              config: {
+                ...s.config,
+                workflowMode: resolveWorkspaceAwareWorkflowMode(
+                  s.config.workflowMode,
+                  true,
+                ),
+              },
+            }
+          : {}),
       };
     });
   },
@@ -11307,7 +11909,7 @@ export const useAppStore = create<AppState>()(
           continue;
         }
         if (rejected.value) {
-          runAfterNextPaint(() => rejected.value?.({ action: "reject" }));
+          scheduleRuntimeTask(() => rejected.value?.({ action: "reject" }));
         }
         results.push({ path, taskIds, ok: true, message: copy.rejected });
         continue;
@@ -11869,6 +12471,9 @@ export const useAppStore = create<AppState>()(
         pendingReviewResolve: null,
         pendingReviewTaskId: null,
         activeActionRequest: null,
+        turnRuntimeCheckpoints: {},
+        runtimeV2Checkpoints: {},
+        subagentClosureReceiptLedger: null,
         pendingToolCall: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
@@ -12055,6 +12660,9 @@ export const useAppStore = create<AppState>()(
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       activeActionRequest: null,
+      turnRuntimeCheckpoints: {},
+      runtimeV2Checkpoints: {},
+      subagentClosureReceiptLedger: null,
       pendingToolCall: null,
       pendingSlashCommand: null,
       abortController: null,
@@ -12128,10 +12736,19 @@ export const useAppStore = create<AppState>()(
   normalizedStreamState: defaultNormalizedStreamState,
   runtimeEvents: [],
   harnessRunMarker: null,
-  setWorkflowMode: (mode) => set((s) => ({
-    config: { ...s.config, workflowMode: mode },
-    ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
-  })),
+  turnRuntimeCheckpoints: {},
+  runtimeV2Checkpoints: {},
+  subagentClosureReceiptLedger: null,
+  setWorkflowMode: (mode) => set((s) => {
+    const workflowMode = resolveWorkspaceAwareWorkflowMode(
+      mode,
+      Boolean(String(s.currentWorkspace || "").trim()),
+    );
+    return {
+      config: { ...s.config, workflowMode },
+      ...(workflowMode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
+    };
+  }),
   setPlanStage: (stage) => set({ planStage: stage }),
   upsertPlanArtifact: (artifact) => {
     const invalidatedPlanToolReviewRef: {
@@ -12139,65 +12756,81 @@ export const useAppStore = create<AppState>()(
     } = { current: null };
     const revokedPlanExecutionAbortRef: { current: (() => void) | null } = { current: null };
     set((s) => {
-      const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
-      const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
-      if (!canonicalPath || detectPlanArtifactKind(canonicalPath) !== artifact.kind) {
-        logStoreEvent("plan_artifact_rejected_by_identity_gate", {
-          path: artifact.path,
-          canonicalPath,
-          kind: artifact.kind,
-        });
+      const preparedCommit = preparePlanArtifactCommit(artifact);
+      if (!preparedCommit.accepted) {
+        if (preparedCommit.gate === "authority") {
+          logStoreEvent("plan_artifact_rejected_by_authority_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: preparedCommit.reason,
+          });
+        } else if (preparedCommit.gate === "typed_contract") {
+          logStoreEvent("plan_artifact_rejected_by_typed_contract_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            failures: preparedCommit.failures,
+            candidateHashMismatch: preparedCommit.candidateHashMismatch,
+            authoringContractMismatch: preparedCommit.authoringContractMismatch,
+          });
+        } else {
+          logStoreEvent("plan_artifact_rejected_before_commit", {
+            path: artifact.path,
+            kind: artifact.kind,
+            gate: preparedCommit.gate,
+          });
+        }
         return {};
       }
-      const normalizedArtifact = { ...artifact, path: canonicalPath };
-      const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
-      if (!validation.ok) {
-        logStoreEvent("plan_artifact_rejected_by_quality_gate", {
-          path: artifact.path,
-          kind: artifact.kind,
-          reason: validation.reason,
-          contentChars: sanitizedContent.length,
-        });
+      const commit = reducePlanArtifactCommit({
+        state: {
+          artifacts: s.planArtifacts,
+          tasks: s.planTasks,
+          evidenceLedger: s.planExecutionEvidenceLedger,
+          isApproved: s.isPlanApproved,
+          stage: s.planStage,
+        },
+        commit: preparedCommit.commit,
+      });
+      if (!commit.accepted) {
+        if (commit.gate === "authority") {
+          logStoreEvent("plan_artifact_rejected_by_authority_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: commit.reason,
+          });
+        } else if (commit.gate === "identity") {
+          logStoreEvent("plan_artifact_rejected_by_identity_gate", {
+            path: artifact.path,
+            canonicalPath: commit.canonicalPath,
+            kind: artifact.kind,
+          });
+        } else if (commit.gate === "typed_contract") {
+          logStoreEvent("plan_artifact_rejected_by_typed_contract_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            failures: commit.failures,
+            candidateHashMismatch: commit.candidateHashMismatch,
+            authoringContractMismatch: commit.authoringContractMismatch,
+          });
+        } else {
+          logStoreEvent("plan_artifact_rejected_by_quality_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: commit.reason,
+            contentChars: commit.contentChars,
+          });
+        }
         return {};
       }
 
-      const nextArtifacts = [...s.planArtifacts];
-      const currentMaxPlanRevision = s.planArtifacts.reduce(
-        (max, candidate) => Math.max(max, Number(candidate.revision) || 0),
-        0,
-      );
-      const existingIndex = nextArtifacts.findIndex(
-        (item) => canonicalizePlanArtifactPath(item.path) === canonicalPath,
-      );
-      if (existingIndex >= 0) {
-        const existingArtifact = nextArtifacts[existingIndex];
-        const contentChanged = existingArtifact.content !== sanitizedContent || existingArtifact.kind !== artifact.kind;
-        nextArtifacts[existingIndex] = {
-          ...normalizedArtifact,
-          content: sanitizedContent,
-          revision: contentChanged
-            ? Math.max(1, currentMaxPlanRevision + 1)
-            : Math.max(1, Number(existingArtifact.revision) || Number(artifact.revision) || 1),
-        };
-      } else {
-        nextArtifacts.push({
-          ...normalizedArtifact,
-          content: sanitizedContent,
-          revision: Math.max(1, currentMaxPlanRevision + 1),
-        });
-      }
-
-      const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? extractPlanTasks(sanitizedContent)
-        : s.planTasks;
-      const preserveTaskHistory =
-        s.isPlanApproved ||
-        s.planStage === "executing" ||
-        s.planStage === "completed" ||
-        s.planTasks.length > 0;
-      const droppedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? findDroppedPlanTasks(s.planTasks, parsedTasks)
-        : [];
+      const {
+        canonicalPath,
+        artifacts: nextArtifacts,
+        tasks: normalizedTasks,
+        droppedTasks,
+        artifactIdentity: nextArtifactIdentity,
+        reviewIdentity: nextReviewIdentity,
+      } = commit;
       if (droppedTasks.length > 0) {
         logStoreEvent("plan_tasks_preserved_missing_history", {
           path: artifact.path,
@@ -12205,17 +12838,6 @@ export const useAppStore = create<AppState>()(
           droppedCount: droppedTasks.length,
         });
       }
-      const normalizedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? reconcilePlanTaskCompletion(s.planTasks, parsedTasks, s.planExecutionEvidenceLedger, {
-            preserveMissing: preserveTaskHistory,
-            highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-          })
-        : normalizeApprovedPlanTaskStatuses(
-            s.planTasks,
-            s.planExecutionEvidenceLedger,
-            s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-          );
-      const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
       const lifecycleSessionKey = resolveSessionRuntimeKey(
         resolveSessionWorkspaceKey(s.currentWorkspace),
         s.currentSessionId,
@@ -12224,7 +12846,7 @@ export const useAppStore = create<AppState>()(
       let nextPlanLifecycle = transitionPlanLifecycleArtifactIdentity({
         lifecycle: s.planLifecycle,
         sessionKey: lifecycleSessionKey,
-        artifactIdentity: toPlanLifecycleArtifactIdentity(nextApprovalIdentity),
+        artifactIdentity: toPlanLifecycleArtifactIdentity(nextArtifactIdentity),
         now: lifecycleNow,
       });
       const approvalInvalidated = Boolean(
@@ -12252,35 +12874,37 @@ export const useAppStore = create<AppState>()(
         isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
       const shouldRefreshPlanReviewRequest =
         s.activeActionRequest?.kind === "plan_review" &&
-        !!nextApprovalIdentity &&
+        !!nextReviewIdentity &&
         (
-          s.activeActionRequest.planRevision !== nextApprovalIdentity.revision ||
-          s.activeActionRequest.artifactHash !== nextApprovalIdentity.artifactHash
+          s.activeActionRequest.planRevision !== nextReviewIdentity.revision ||
+          s.activeActionRequest.artifactHash !== nextReviewIdentity.artifactHash
         );
+      const clearsPlanReviewRequest =
+        s.activeActionRequest?.kind === "plan_review" && !nextReviewIdentity;
       const nextPlanReviewRequest = shouldRefreshPlanReviewRequest &&
         s.activeActionRequest?.kind === "plan_review" &&
-        nextApprovalIdentity
+        nextReviewIdentity
         ? buildPlanReviewActionRequest({
             sessionKey: s.activeActionRequest.sessionKey,
             turnId: s.activeActionRequest.turnId,
             runId: s.activeActionRequest.runId,
             parentRunId: s.activeActionRequest.parentRunId,
             title: s.activeActionRequest.title,
-            planRevision: nextApprovalIdentity.revision,
-            artifactHash: nextApprovalIdentity.artifactHash,
-            artifactPaths: nextApprovalIdentity.artifactPaths,
+            planRevision: nextReviewIdentity.revision,
+            artifactHash: nextReviewIdentity.artifactHash,
+            artifactPaths: nextReviewIdentity.artifactPaths,
           })
         : s.activeActionRequest;
       if (
         shouldRefreshPlanReviewRequest &&
         nextPlanReviewRequest?.kind === "plan_review" &&
-        nextApprovalIdentity
+        nextReviewIdentity
       ) {
         const alignedLifecycle = alignPlanLifecycleWithReview({
           lifecycle: nextPlanLifecycle,
           sessionKey: lifecycleSessionKey,
           request: nextPlanReviewRequest,
-          artifactIdentity: nextApprovalIdentity,
+          artifactIdentity: nextReviewIdentity,
           now: lifecycleNow,
         });
         if (alignedLifecycle) nextPlanLifecycle = alignedLifecycle;
@@ -12307,11 +12931,15 @@ export const useAppStore = create<AppState>()(
       const shouldAutoOpenPlanPanel = !effectivePlanApproved && s.planStage !== "executing";
 
       return {
-        planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
+        planArtifacts: nextArtifacts,
         planStage: nextStage,
         planTasks: approvalInvalidated ? [] : normalizedTasks,
         planLifecycle: nextPlanLifecycle,
-        ...(shouldRefreshPlanReviewRequest ? { activeActionRequest: nextPlanReviewRequest } : {}),
+        ...(shouldRefreshPlanReviewRequest
+          ? { activeActionRequest: nextPlanReviewRequest }
+          : clearsPlanReviewRequest
+            ? { activeActionRequest: null }
+            : {}),
         ...(planToolInvalidation?.patch || {}),
         clearedPlanTurnId: null,
         ...(approvalInvalidated
@@ -12523,6 +13151,151 @@ export const useAppStore = create<AppState>()(
     (() => {
       const state = get();
       const approvedTurnId = state.currentTurnId;
+      const runtimeV2Checkpoint = approvedTurnId
+        ? state.runtimeV2Checkpoints[approvedTurnId] || null
+        : null;
+      const runtimeV2Review = resolveRuntimeV2PlanReviewFromAggregate(
+        runtimeV2Checkpoint?.aggregate,
+      );
+      if (
+        runtimeV2Checkpoint?.aggregate.strategy === "plan" &&
+        runtimeV2Checkpoint.aggregate.planReviewCommit &&
+        !runtimeV2Review
+      ) {
+        logStoreEvent("runtime_v2_plan_approval_rejected", {
+          reason: "runtime_v2_plan_review_authority_invalid",
+          planTurnId: approvedTurnId,
+        });
+        return;
+      }
+      if (runtimeV2Checkpoint && runtimeV2Review && !runtimeV2Review.pending) {
+        logStoreEvent("runtime_v2_plan_approval_deduped", {
+          reason: "runtime_v2_plan_already_resolved",
+          planTurnId: runtimeV2Review.commit.review.turnId,
+          runId: runtimeV2Review.commit.review.runId,
+          requestId: runtimeV2Review.commit.review.requestId,
+        });
+        return;
+      }
+      if (runtimeV2Checkpoint && runtimeV2Review?.pending) {
+        const runtimeV2PlanTurnId = runtimeV2Review.commit.review.turnId;
+        const pendingRequest = state.activeActionRequest?.kind === "plan_review"
+          ? state.activeActionRequest
+          : null;
+        const reviewScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+        const reviewSessionKey = resolveSessionRuntimeKey(
+          reviewScopeKey,
+          state.currentSessionId,
+        );
+        if (
+          !reviewSessionKey ||
+          reviewSessionKey !== runtimeV2Review.commit.review.sessionKey
+        ) {
+          logStoreEvent("runtime_v2_plan_approval_rejected", {
+            reason: "runtime_v2_plan_session_owner_mismatch",
+            planTurnId: runtimeV2PlanTurnId,
+            requestId: pendingRequest?.requestId || null,
+          });
+          return;
+        }
+        const {
+          sessionGet,
+          sessionSet,
+          getSessionRevisionToken,
+          publishOwnerScopedRuntimeProjection,
+        } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
+          get,
+          set,
+          runSessionKey: reviewSessionKey,
+          createRuntimeFromState: createSessionRuntimeFromState,
+          pickRuntimePatch: pickSessionRuntimePatch,
+          normalizePatch: (patch) =>
+            normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
+          derivePlanStageFromArtifacts,
+          createDefaultCurrentTurnState,
+          logStoreEvent,
+        });
+        const port = createRuntimeV2CheckpointPort({
+          get: sessionGet,
+          set: sessionSet,
+          scopeKey: reviewScopeKey,
+          sessionId: state.currentSessionId,
+          getSessionRevisionToken,
+          sanitizeTaskBlocksForPersist,
+          normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+          persistSessionRecord: saveProjectSession,
+          publishOwnerScopedRuntimeProjection,
+          logStoreEvent,
+        });
+        const projectionPort = createRuntimeV2ProjectionPort({
+          get: sessionGet,
+          set: sessionSet,
+          nextTaskId: () => sessionGet()._nextTaskId(),
+          language: sessionGet().config.language === "en" ? "en" : "zh",
+          logStoreEvent,
+        });
+        void approveAndDispatchRuntimeV2Plan({
+          checkpoint: runtimeV2Checkpoint,
+          checkpointPort: port,
+          projectionPort,
+          review: runtimeV2Review,
+          request: pendingRequest,
+          expected: expectedIdentity,
+          language: sessionGet().config.language === "en" ? "en" : "zh",
+          onApproved: () => {
+            sessionSet((current) => ({
+              activeActionRequest: current.activeActionRequest?.requestId === pendingRequest?.requestId
+                ? null
+                : current.activeActionRequest,
+              isPlanApproved: true,
+              planStage: "ready_to_execute" as const,
+              agentStatus: "idle" as const,
+              isGenerating: false,
+              abortController: null,
+              conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
+                turn.id === runtimeV2PlanTurnId
+                  ? {
+                      ...turn,
+                      status: "executing" as const,
+                      summary: current.config.language === "en"
+                        ? "The Runtime v2 WorkPlan is approved and sealed as the execution input."
+                        : "Runtime v2 WorkPlan 已批准，并已封存为后续执行输入。",
+                    }
+                  : turn
+              ),
+            }));
+          },
+          dispatch: ({ prompt, turnId, runId }) =>
+            sessionGet().sendMessage(
+              prompt,
+              undefined,
+              {
+                hidden: true,
+                createVisibleTurnForHiddenMessage: false,
+                reuseCurrentTurn: true,
+                turnIdOverride: turnId,
+                preservePlanState: true,
+                resolvedIntent: "execute",
+                runtimeIntentOverride: "execute",
+                executionConsentGranted: true,
+                skipIntentResolution: true,
+                skipAutoPlanHydration: true,
+                runIdOverride: runId,
+                intentSummary: sessionGet().config.language === "en"
+                  ? "Execute the approved Runtime v2 WorkPlan."
+                  : "执行已批准的 Runtime v2 WorkPlan。",
+              },
+            ),
+          log: logStoreEvent,
+        }).catch((error) => {
+          logStoreEvent("runtime_v2_plan_approval_failed", {
+            planTurnId: runtimeV2PlanTurnId,
+            requestId: pendingRequest?.requestId || null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        return;
+      }
       if (state.isPlanApproved && isPlanApprovalLeaseBoundToState(state.planLifecycle)) {
         logStoreEvent("plan_approval_handoff_deduped", {
           reason: "already_approved",
@@ -12536,7 +13309,7 @@ export const useAppStore = create<AppState>()(
         return;
       }
 
-      const approvalIdentity = buildPlanApprovalIdentity(state.planArtifacts);
+      const approvalIdentity = buildTypedPlanApprovalIdentity(state.planArtifacts);
       if (!approvedTurnId || !hasReviewablePlanArtifact(state.planArtifacts) || !approvalIdentity) {
         const language = state.config.language === "en" ? "en" : "zh";
         const approvalSessionKey = resolveSessionRuntimeKey(
@@ -12927,7 +13700,7 @@ export const useAppStore = create<AppState>()(
       });
 
       if (!activePlanLoop && approvedTurnId && pendingHandoffPatch) {
-        runAfterNextPaint(() => {
+        scheduleRuntimeTask(() => {
           startApprovedPlanExecutionInCurrentTurn({
             get,
             setActiveState: (patch) => set(patch),
@@ -13156,7 +13929,7 @@ export const useAppStore = create<AppState>()(
       executionLeaseId: issued.handoff.executionLeaseId,
       executionAttempt: issued.handoff.executionAttempt,
     });
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       startApprovedPlanExecutionInCurrentTurn({
         get,
         setActiveState: (patch) => set(patch),
@@ -14252,7 +15025,7 @@ export const useAppStore = create<AppState>()(
         taskId: state.pendingReviewTaskId,
         toolName: state.pendingToolCall?.name || null,
       });
-      runAfterNextPaint(() => {
+      scheduleRuntimeTask(() => {
         const latest = get();
         if (latest.pendingReviewResolve && latest.pendingReviewTaskId === state.pendingReviewTaskId) {
           latest.allowToolAction(state.pendingReviewTaskId!);
@@ -14346,6 +15119,13 @@ export const useAppStore = create<AppState>()(
   queueUserMessage: (text, images, options) => {
     const state = get();
     const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+    if (!sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)) {
+      logStoreEvent("workspace_legacy_queue_write_rejected", {
+        sessionKey,
+        reason: "workspace_fifo_is_authoritative",
+      });
+      return null;
+    }
     const visibleGoalCreationAuthorization =
       visibleGoalSubmissionAuthorizationBroker.consume({
         envelope: options?.visibleGoalSubmissionEnvelope,
@@ -14454,36 +15234,95 @@ export const useAppStore = create<AppState>()(
     });
     return true;
   },
-  setActiveGuidance: (text, turnId) => {
-    const guidance = normalizeActiveGuidance({
-      id: `guidance-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  setActiveGuidance: (text, target) => {
+    const state = get();
+    const normalizedTarget = normalizeCanonicalRunIdentity(target);
+    const selection = selectCurrentTurnIngress(state);
+    if (
+      !normalizedTarget ||
+      selection.mode !== "guidance_or_queue" ||
+      !selection.guidanceTarget ||
+      !isSameCanonicalRunIdentity(selection.guidanceTarget, normalizedTarget) ||
+      !!normalizeActiveGuidance(state.activeGuidance)
+    ) {
+      logStoreEvent("active_guidance_rejected", {
+        reason: !normalizedTarget
+          ? "invalid_target"
+          : selection.mode !== "guidance_or_queue" || !selection.guidanceTarget
+            ? "run_not_guidable"
+            : !isSameCanonicalRunIdentity(selection.guidanceTarget, normalizedTarget)
+              ? "run_identity_mismatch"
+              : "guidance_already_pending",
+        turnId: normalizedTarget?.turnId || null,
+        runId: normalizedTarget?.runId || null,
+      });
+      return false;
+    }
+    const createdAt = Date.now();
+    const guidance = createActiveGuidance({
+      id: `guidance-${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
       text,
-      turnId: turnId ?? get().currentTurnId ?? null,
-      createdAt: Date.now(),
-      consumedAt: null,
+      target: normalizedTarget,
+      createdAt,
     });
-    if (!guidance) return;
+    if (!guidance) return false;
     set({ activeGuidance: guidance, input: "" });
     logStoreEvent("active_guidance_set", {
-      turnId: guidance.turnId,
+      turnId: guidance.target.turnId,
+      runId: guidance.target.runId,
+      attemptId: guidance.target.attemptId,
       chars: guidance.text.length,
     });
+    return true;
   },
   clearActiveGuidance: () => {
     set({ activeGuidance: null });
     logStoreEvent("active_guidance_cleared");
   },
-  consumeActiveGuidance: (turnId) => {
+  consumeActiveGuidance: (target) => {
     const state = get();
+    const requestedTarget = normalizeCanonicalRunIdentity(target);
     const guidance = normalizeActiveGuidance(state.activeGuidance);
-    if (!guidance) return null;
-    const requestedTurnId = turnId ?? state.currentTurnId ?? null;
-    if (guidance.consumedAt) return null;
-    if (guidance.turnId && requestedTurnId && guidance.turnId !== requestedTurnId) return null;
+    if (!requestedTarget || !guidance) {
+      if (state.activeGuidance && !guidance) {
+        set({ activeGuidance: null });
+        logStoreEvent("active_guidance_cleared", { reason: "invalid_contract" });
+      }
+      return null;
+    }
+    if (guidance.consumedAt !== null && guidance.consumedAt !== undefined) {
+      set({ activeGuidance: null });
+      return null;
+    }
+    // A late callback from an older attempt must not consume a newer Run's
+    // guidance. Preserve it for its exact owner in that case.
+    if (!isSameCanonicalRunIdentity(guidance.target, requestedTarget)) return null;
+    const selection = selectCurrentTurnIngress(state);
+    const exactRunningOwner =
+      selection.activeTurn?.turn.status === "open" &&
+      selection.activeTurn.run?.status === "running" &&
+      isSameCanonicalRunIdentity(
+        selection.activeTurn.run.identity,
+        requestedTarget,
+      );
+    // A completion fence moves the exact Run to `finalizing` before the
+    // already-admitted Guide is consumed. That sealed phase rejects new Guide
+    // admission, but it must not discard the item that won the race.
+    if (!exactRunningOwner) {
+      set({ activeGuidance: null });
+      logStoreEvent("active_guidance_cleared", {
+        reason: "owner_no_longer_guidable",
+        turnId: requestedTarget.turnId,
+        runId: requestedTarget.runId,
+      });
+      return null;
+    }
     const consumed = { ...guidance, consumedAt: Date.now() };
     set({ activeGuidance: null });
     logStoreEvent("active_guidance_consumed", {
-      turnId: requestedTurnId,
+      turnId: requestedTarget.turnId,
+      runId: requestedTarget.runId,
+      attemptId: requestedTarget.attemptId,
       chars: consumed.text.length,
     });
     return consumed;
@@ -14771,7 +15610,7 @@ export const useAppStore = create<AppState>()(
             state.config.language === "en" ? "Workspace instruction" : "工作区指令",
           ),
           intentSummary: summary,
-          mode: "chat" as const,
+          mode: "edit" as const,
           intent: "respond" as const,
           displayIntent: "respond" as const,
           status: "error" as const,
@@ -15471,7 +16310,7 @@ export const useAppStore = create<AppState>()(
             durability: "memory",
             resultKind: "error",
           });
-          runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+          scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
           return {
             accepted: true,
             receipt: admittedReceipt,
@@ -15543,7 +16382,7 @@ export const useAppStore = create<AppState>()(
         queuePosition,
         durability,
       });
-      runAfterNextPaint(() => {
+      scheduleRuntimeTask(() => {
         get().dispatchNextWorkspaceInstruction(sessionKey);
       });
       return {
@@ -15622,14 +16461,14 @@ export const useAppStore = create<AppState>()(
               }
             }
             if (settlement.terminalSettled || settlement.queueDisposition === "discard") {
-              runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
               return;
             }
             // Reconciliation exhausted without a terminal cancel conclusion.
             // The fence has been released, so retry the dispatcher in an exact
             // fail-closed mode that completes the admitted Turn with a visible
             // error instead of executing it or leaving FIFO silently wedged.
-            runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+            scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
           },
           (error) => {
             const ownsFence =
@@ -15650,7 +16489,7 @@ export const useAppStore = create<AppState>()(
               canceledTurnId: pendingCancellation.turnId,
               error: error instanceof Error ? error.message : String(error),
             });
-            runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+            scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
           },
         );
       }
@@ -15870,7 +16709,7 @@ export const useAppStore = create<AppState>()(
               claimId,
               setTimeout(retryStartingClaim, WORKSPACE_INSTRUCTION_START_GRACE_MS),
             );
-            runAfterNextPaint(retryStartingClaim);
+            scheduleRuntimeTask(retryStartingClaim);
             return false;
           }
           if (graceState === "scheduled") return false;
@@ -16017,13 +16856,6 @@ export const useAppStore = create<AppState>()(
     if (candidateCancellationFailure && !cancellationFailure) {
       workspaceInstructionCancellationFailureBySession.delete(sessionKey);
     }
-    if (
-      !cancellationFailure &&
-      state.agentStatus !== "pending_review" &&
-      (state.isGenerating || state.agentStatus === "running")
-    ) {
-      return false;
-    }
     const projection = reconcileWorkspaceInstructionProjection({
       entry: head,
       taskFlow: state.taskFlow,
@@ -16082,6 +16914,26 @@ export const useAppStore = create<AppState>()(
       ? projection.userBlock
       : null;
 
+    const hints = head.instruction.payload.dispatchHints || {};
+    const pendingReviewActionDecision = state.agentStatus === "pending_review"
+      ? resolveWorkspaceInstructionActionDecision({
+          sessionKey,
+          taskFlow: state.taskFlow,
+          hints,
+          activeActionRequest: state.activeActionRequest,
+        })
+      : { actionDecision: null, reason: "not_requested" as const };
+    if (shouldDeferWorkspaceInstructionDispatchForActiveOwner({
+      isGenerating: state.isGenerating,
+      agentStatus: state.agentStatus,
+      hasPendingActionRequest: state.activeActionRequest?.status === "pending",
+      hasExactPendingReviewActionDecision:
+        pendingReviewActionDecision.actionDecision !== null,
+      cancellationFenceFailed: !!cancellationFailure,
+    })) {
+      return false;
+    }
+
     const claimId = createWorkspaceRuntimeIdentity("workspace-claim");
     const claimed = reduceWorkspaceTurnQueue(queue, {
       type: "claim",
@@ -16103,7 +16955,6 @@ export const useAppStore = create<AppState>()(
       admittedUserBlockId: head.receipt.userBlockId,
       instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(head),
     };
-    const hints = head.instruction.payload.dispatchHints || {};
     const candidateGoalCreation = isGoalCreationAuthorization(hints.goalCreationAuthorization)
       ? hints.goalCreationAuthorization
       : null;
@@ -16132,20 +16983,15 @@ export const useAppStore = create<AppState>()(
     const hintedRuntimeIntent = normalizeWorkspaceInstructionIntentHint(
       hints.runtimeIntentOverride,
     ) || undefined;
+    const hintedSubagentPreference = typeof hints.subagentPreference === "string"
+      ? normalizeSubagentDelegationPreference(hints.subagentPreference)
+      : undefined;
     const executionConsentDecision = resolveWorkspaceInstructionExecutionConsent({
       sessionKey,
       taskFlow: state.taskFlow,
       hints,
       activeActionRequest: state.activeActionRequest,
     });
-    const pendingReviewActionDecision = state.agentStatus === "pending_review"
-      ? resolveWorkspaceInstructionActionDecision({
-          sessionKey,
-          taskFlow: state.taskFlow,
-          hints,
-          activeActionRequest: state.activeActionRequest,
-        })
-      : { actionDecision: null, reason: "not_requested" as const };
     const hintedReplyRequestId =
       hints.replyOptionRequestIdentity &&
       typeof hints.replyOptionRequestIdentity === "object" &&
@@ -16276,6 +17122,9 @@ export const useAppStore = create<AppState>()(
         skipAutoPlanHydration: true,
         ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
         ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
+        ...(hintedSubagentPreference !== undefined
+          ? { subagentPreferenceOverride: hintedSubagentPreference }
+          : {}),
         ...(hintedIntent || hints.skipIntentResolution === true
           ? { skipIntentResolution: true }
           : {}),
@@ -16384,7 +17233,7 @@ export const useAppStore = create<AppState>()(
       });
       if (completed) {
         get().saveCurrentRuntimeToSession();
-        runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+        scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
       }
       return completed;
     };
@@ -16424,7 +17273,7 @@ export const useAppStore = create<AppState>()(
       });
       if (acknowledged) {
         get().saveCurrentRuntimeToSession();
-        runAfterNextPaint(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+        scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
       }
       return acknowledged;
     };
@@ -16527,7 +17376,7 @@ export const useAppStore = create<AppState>()(
           // the local handler.
           localFastLease.release();
           if (ownerStillCurrent && isSessionRuntimeActive(get(), sessionKey)) {
-            runAfterNextPaint(() => {
+            scheduleRuntimeTask(() => {
               if (isSessionRuntimeActive(get(), sessionKey)) {
                 get().dispatchNextWorkspaceInstruction(sessionKey);
               }
@@ -16545,7 +17394,7 @@ export const useAppStore = create<AppState>()(
               }
               localFastLease.release();
               if (isSessionRuntimeActive(get(), sessionKey)) {
-                runAfterNextPaint(() => {
+                scheduleRuntimeTask(() => {
                   if (isSessionRuntimeActive(get(), sessionKey)) {
                     get().dispatchNextWorkspaceInstruction(sessionKey);
                   }
@@ -16641,6 +17490,17 @@ export const useAppStore = create<AppState>()(
     const state = get();
     const taskId = identity?.taskId ?? state.pendingReviewTaskId;
     if (taskId == null) return;
+    if (
+      isToolPermissionActionRequest(state.activeActionRequest) &&
+      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk)
+    ) {
+      logStoreEvent("tool_permission_session_approval_blocked", {
+        taskId,
+        toolName: state.activeActionRequest.toolName,
+        risk: state.activeActionRequest.risk || "unknown",
+      });
+      return;
+    }
     if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_session")) {
       invalidateStalePendingPlanToolPermission({
         state,
@@ -16690,7 +17550,15 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
-    const reviewTurnId = state.taskFlow.find((block) => block.id === taskId)?.turnId || state.currentTurnId;
+    const request = state.activeActionRequest as ToolPermissionActionRequest;
+    const reviewOwner = {
+      taskId: request.taskId,
+      turnIds: [request.turnId],
+      toolCallId: request.toolCallId,
+      toolName: request.toolName,
+      target: request.target,
+    };
+    const reviewTurnId = request.turnId;
     const localFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
     const shellDecision = state.pendingToolCall?.shellPermissionDecision || null;
     const shellApproval = shellDecision?.requiresApproval
@@ -16707,11 +17575,13 @@ export const useAppStore = create<AppState>()(
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       activeActionRequest: null,
+      turnRuntimeCheckpoints: {},
+      runtimeV2Checkpoints: {},
       pendingToolCall: null,
       agentStatus: "running",
       isGenerating: true,
       taskFlow: s.taskFlow.map((task) =>
-        task.id === taskId && task.type === "tool"
+        isExactPendingToolReviewOwner(task, reviewOwner)
           ? {
               ...task,
               status: "running",
@@ -16727,7 +17597,7 @@ export const useAppStore = create<AppState>()(
     if (reviewTurnId && reviewTurnId !== state.currentTurnId) {
       get().setConversationTurnStatus(reviewTurnId, "executing");
     }
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       resolve({
         action: "accept",
         ...(localFileReadPath ? { grantLocalFileReadPath: localFileReadPath } : {}),
@@ -16752,6 +17622,14 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
+    const request = state.activeActionRequest as ToolPermissionActionRequest;
+    const reviewOwner = {
+      taskId: request.taskId,
+      turnIds: [request.turnId],
+      toolCallId: request.toolCallId,
+      toolName: request.toolName,
+      target: request.target,
+    };
 
     // Clear pending state
     set({ pendingReviewResolve: null, pendingReviewTaskId: null, activeActionRequest: null, pendingToolCall: null });
@@ -16759,7 +17637,7 @@ export const useAppStore = create<AppState>()(
     // Update the Action Card
     set((s) => ({
       taskFlow: s.taskFlow.map((t) =>
-        t.id === taskId && t.type === "tool"
+        isExactPendingToolReviewOwner(t, reviewOwner)
           ? { ...t, toolStatus: "rejected" as const, status: "error", message: "Rejected by user." }
           : t
       ),
@@ -16767,7 +17645,7 @@ export const useAppStore = create<AppState>()(
     }));
 
     // Resolve the orchestrator's pending review promise → loop auto-resumes
-    runAfterNextPaint(() => {
+    scheduleRuntimeTask(() => {
       resolve({ action: "reject" });
     });
   },
@@ -16937,6 +17815,7 @@ export const useAppStore = create<AppState>()(
     workspaceInstructionClaim?: WorkspaceInstructionDispatchClaim;
     adoptExistingTurn?: boolean;
     admittedUserBlockId?: number;
+    subagentPreferenceOverride?: SubagentDelegationPreference;
   }) => {
     let state = get();
     if (options?.adoptExistingTurn) {
@@ -17126,6 +18005,7 @@ export const useAppStore = create<AppState>()(
     type CancellationSubmissionGate =
       | "none"
       | "legacy_deferred"
+      | "workspace_durable_admitted"
       | "workspace_claim_fenced";
     const readCancellationQueuedMessage = (
       candidate: AppState,
@@ -17136,7 +18016,7 @@ export const useAppStore = create<AppState>()(
     );
     const deferCurrentSubmissionForCancellation = (
       replayOptions: typeof options = options,
-      queuedWorkflowContext: CancellationQueueContext = {},
+      queuedRunContext: CancellationQueueContext = {},
     ): CancellationSubmissionGate => {
       const pendingCancellation = getPendingSessionCancellation(
         submissionOriginSessionKey,
@@ -17154,6 +18034,44 @@ export const useAppStore = create<AppState>()(
           claimId: replayOptions.workspaceInstructionClaim.claimId,
         });
         return "workspace_claim_fenced";
+      }
+      if (!submissionOriginSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)) {
+        const dispatchHints = JSON.parse(JSON.stringify({
+          ...(queuedRunContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride
+            ? { resolvedIntent: queuedRunContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride }
+            : {}),
+          ...(queuedRunContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot
+            ? { goalSourceContextSnapshot: queuedRunContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot }
+            : {}),
+          ...(queuedRunContext.goalCreationAuthorization
+            ? { goalCreationAuthorization: queuedRunContext.goalCreationAuthorization }
+            : {}),
+          ...(queuedRunContext.goalContinuationAuthorization
+            ? { goalContinuationAuthorization: queuedRunContext.goalContinuationAuthorization }
+            : {}),
+          ...(queuedRunContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance
+            ? { goalContinuationGuidance: queuedRunContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance }
+            : {}),
+        })) as WorkspaceJsonObject;
+        void get().acceptWorkspaceInstruction({
+          text,
+          images,
+          contextMentions: replayOptions?.contextMentionsSnapshot || state.contextMentions,
+          attachedFiles: (replayOptions?.attachedFilesSnapshot || state.attachedFiles)
+            .map((file) => normalizeAttachedFile(file)),
+          source: "replay",
+          dispatchHints,
+        }).then((acceptance) => {
+          logStoreEvent(
+            acceptance.accepted
+              ? "send_cancellation_barrier_workspace_admitted"
+              : "send_cancellation_barrier_workspace_rejected",
+            acceptance.accepted
+              ? { sessionKey: submissionOriginSessionKey, turnId: acceptance.receipt.turnId }
+              : { sessionKey: submissionOriginSessionKey, reason: acceptance.reason },
+          );
+        });
+        return "workspace_durable_admitted";
       }
       const replayOptionsWithoutSessionOrigin = replayOptions
         ? { ...replayOptions }
@@ -17175,7 +18093,7 @@ export const useAppStore = create<AppState>()(
         });
       if (!reusesExactQueuedMessage) {
         const goalContinuationAuthorization =
-          queuedWorkflowContext.goalContinuationAuthorization ||
+          queuedRunContext.goalContinuationAuthorization ||
           goalContinuationAuthorizationBroker.consume({
             envelope: replayOptions?.goalContinuationEnvelope,
             text,
@@ -17185,15 +18103,15 @@ export const useAppStore = create<AppState>()(
           attachedFiles: (replayOptions?.attachedFilesSnapshot || state.attachedFiles)
             .map((file) => normalizeAttachedFile(file)),
           runtimeIntentOverride:
-            queuedWorkflowContext.runtimeIntentOverride ||
+            queuedRunContext.runtimeIntentOverride ||
             replayOptions?.runtimeIntentOverride,
           goalSourceContextSnapshot:
-            queuedWorkflowContext.goalSourceContextSnapshot ||
+            queuedRunContext.goalSourceContextSnapshot ||
             replayOptions?.goalSourceContextSnapshot,
-          goalCreationAuthorization: queuedWorkflowContext.goalCreationAuthorization,
+          goalCreationAuthorization: queuedRunContext.goalCreationAuthorization,
           goalContinuationAuthorization: goalContinuationAuthorization || undefined,
           goalContinuationGuidance:
-            queuedWorkflowContext.goalContinuationGuidance ||
+            queuedRunContext.goalContinuationGuidance ||
             replayOptions?.goalContinuationGuidance,
           visibleGoalSubmissionEnvelope: replayOptions?.visibleGoalSubmissionEnvelope,
           replyOptionRequestIdentity: replayOptions?.replyOptionRequestIdentity,
@@ -17517,7 +18435,7 @@ export const useAppStore = create<AppState>()(
     const autoHydrationReason = submitPipelineDecision.planHydration.reason;
     const applyCurrentSendGate = (
       gateState: AppState,
-      queuedWorkflowContext?: {
+      queuedRunContext?: {
         runtimeIntentOverride?: ResolvedRunIntent;
         goalSourceContextSnapshot?: string;
         goalCreationAuthorization?: GoalCreationAuthorization;
@@ -17540,12 +18458,43 @@ export const useAppStore = create<AppState>()(
         executionConsentGranted: options?.executionConsentGranted,
         runtimeIntentOverride: options?.runtimeIntentOverride,
         turnIdOverride: options?.turnIdOverride,
+        workspaceInstructionClaim: options?.workspaceInstructionClaim,
       },
       mentionSnapshot,
       attachedFilesSnapshot,
-      queuedWorkflowContext,
+      queuedRunContext,
       queueUserMessage: (queuedText, queuedImages, queuedOptions) => {
-        get().queueUserMessage(queuedText, queuedImages, queuedOptions);
+        const latest = get();
+        const activeSessionKey = resolveVisibleGoalSubmissionSessionKey(latest);
+        if (!activeSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)) {
+          const dispatchHints = JSON.parse(JSON.stringify({
+            ...(queuedOptions?.runtimeIntentOverride
+              ? { resolvedIntent: queuedOptions.runtimeIntentOverride }
+              : {}),
+            ...(queuedOptions?.goalSourceContextSnapshot
+              ? { goalSourceContextSnapshot: queuedOptions.goalSourceContextSnapshot }
+              : {}),
+            ...(queuedOptions?.goalCreationAuthorization
+              ? { goalCreationAuthorization: queuedOptions.goalCreationAuthorization }
+              : {}),
+            ...(queuedOptions?.goalContinuationAuthorization
+              ? { goalContinuationAuthorization: queuedOptions.goalContinuationAuthorization }
+              : {}),
+            ...(queuedOptions?.goalContinuationGuidance
+              ? { goalContinuationGuidance: queuedOptions.goalContinuationGuidance }
+              : {}),
+          })) as WorkspaceJsonObject;
+          void latest.acceptWorkspaceInstruction({
+            text: queuedText,
+            images: queuedImages,
+            contextMentions: queuedOptions?.contextMentions || [],
+            attachedFiles: queuedOptions?.attachedFiles || [],
+            source: "replay",
+            dispatchHints,
+          });
+          return;
+        }
+        latest.queueUserMessage(queuedText, queuedImages, queuedOptions);
       },
       approvePendingReviewOnce: () => {
         get().approvePendingReviewOnce();
@@ -17560,17 +18509,17 @@ export const useAppStore = create<AppState>()(
       logStoreEvent,
     });
     const deferResetSubmissionForCancellation = (
-      queuedWorkflowContext?: CancellationQueueContext,
+      queuedRunContext?: CancellationQueueContext,
     ): CancellationSubmissionGate => {
       if (!getPendingSessionCancellation(submissionOriginSessionKey)) return "none";
       return deferCurrentSubmissionForCancellation(options, {
-        ...queuedWorkflowContext,
+        ...queuedRunContext,
         goalCreationAuthorization:
-          queuedWorkflowContext?.goalCreationAuthorization ||
+          queuedRunContext?.goalCreationAuthorization ||
           validatedVisibleGoalCreationAuthorization ||
           undefined,
         goalContinuationAuthorization:
-          queuedWorkflowContext?.goalContinuationAuthorization ||
+          queuedRunContext?.goalContinuationAuthorization ||
           goalContinuationAuthorization ||
           undefined,
       });
@@ -17582,7 +18531,7 @@ export const useAppStore = create<AppState>()(
       !!goalContinuationAuthorization;
     const shouldUseEarlyPlanSendGate =
       !!autoHydrationReason || shouldRouteContinuationToPlanResume;
-    const earlyGoalQueuedWorkflowContext =
+    const earlyGoalQueuedRunContext =
       shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority
       ? {
           runtimeIntentOverride: "goal" as const,
@@ -17611,11 +18560,11 @@ export const useAppStore = create<AppState>()(
     if (shouldUseEarlyPlanSendGate) {
       const planResumeSendGateEffect = applyCurrentSendGate(
         state,
-        earlyGoalQueuedWorkflowContext,
+        earlyGoalQueuedRunContext,
       );
       const earlyResetCancellationGate =
         planResumeSendGateEffect.decision.action.kind === "reset_stuck_state"
-          ? deferResetSubmissionForCancellation(earlyGoalQueuedWorkflowContext)
+          ? deferResetSubmissionForCancellation(earlyGoalQueuedRunContext)
           : "none";
       if (earlyResetCancellationGate !== "none") {
         if (earlyResetCancellationGate === "workspace_claim_fenced") return false;
@@ -17914,7 +18863,10 @@ export const useAppStore = create<AppState>()(
       goalContinuationAuthorization,
       requiresPlanExecutionAdmission,
     });
-    const effectiveWorkflowMode = runtimeDecision.effectiveWorkflowMode;
+    const effectiveWorkflowMode = resolveWorkspaceAwareWorkflowMode(
+      runtimeDecision.effectiveWorkflowMode,
+      !!String(state.currentWorkspace || "").trim(),
+    );
     const runtimeRunIntent = runtimeDecision.runtimeRunIntent;
     const effectiveDisplayIntent = runtimeDecision.effectiveDisplayIntent;
     const shouldGrantExecutionConsentForTurn = runtimeDecision.shouldGrantExecutionConsentForTurn;
@@ -17928,7 +18880,7 @@ export const useAppStore = create<AppState>()(
         })
       : undefined;
 
-    const sendGateQueuedWorkflowContext: CancellationQueueContext | undefined =
+    const sendGateQueuedRunContext: CancellationQueueContext | undefined =
       runtimeRunIntent === "goal"
       ? {
           runtimeIntentOverride: "goal",
@@ -17942,11 +18894,11 @@ export const useAppStore = create<AppState>()(
       : undefined;
     const sendGateEffect = applyCurrentSendGate(
       state,
-      sendGateQueuedWorkflowContext,
+      sendGateQueuedRunContext,
     );
     const resetCancellationGate =
       sendGateEffect.decision.action.kind === "reset_stuck_state"
-        ? deferResetSubmissionForCancellation(sendGateQueuedWorkflowContext)
+        ? deferResetSubmissionForCancellation(sendGateQueuedRunContext)
         : "none";
     if (resetCancellationGate !== "none") {
       if (resetCancellationGate === "workspace_claim_fenced") return false;
@@ -18035,9 +18987,11 @@ export const useAppStore = create<AppState>()(
       images,
       mentionSnapshot,
       attachedFilesSnapshot,
+      runSessionKey,
       runWorkspace,
       preferredLanguage,
       preferSubagents: state.preferSubagents,
+      subagentPreference: options?.subagentPreferenceOverride,
       effectiveRunIntent,
       isMainDebugShortcut: !!mainDebugShortcut,
       reuseCurrentTurn,

@@ -1,0 +1,87 @@
+import type { AgentMessage } from "../../lib/agentMessages";
+import type { ToolDefinition } from "../../lib/toolSchemas";
+import type {
+  ToolCapabilityRegistry,
+  ToolPermissionPolicy,
+} from "../../lib/toolCapabilities";
+import type { ToolCatalog } from "../../lib/toolCatalog";
+import {
+  type ProviderLaneProfileV1,
+  type RuntimeV2NormalizedProviderResult,
+  type RuntimeV2SubagentJob,
+} from "../../lib/runtime-v2";
+import type { RuntimeV2SubmissionContext } from "./submissionContext";
+
+export type StoreGet = () => any;
+
+export interface RuntimeV2ModelContextEntry {
+  readonly id: string;
+  readonly source: "workspace" | "tool" | "subagent" | "provider" | "plan";
+  readonly label: string;
+  readonly target: string;
+  readonly status: "succeeded" | "failed" | "blocked";
+  readonly content: string;
+}
+
+export interface RuntimeV2ExecutionAuthorization {
+  readonly toolDefinitions: readonly ToolDefinition[];
+  readonly toolCatalog: ToolCatalog;
+  readonly capabilityRegistry: ToolCapabilityRegistry;
+  readonly policy: ToolPermissionPolicy;
+}
+
+export interface RuntimeV2ChildResult {
+  readonly job: RuntimeV2SubagentJob;
+  readonly status: "completed" | "failed" | "canceled";
+  readonly summary: string;
+  readonly evidenceTarget: string | null;
+}
+
+export interface RuntimeV2SubagentCandidate {
+  readonly scopeKey: string;
+  readonly objective: string;
+  readonly allowedPaths: string[];
+}
+
+export interface RuntimeV2LiveExecutionState {
+  readonly messages: AgentMessage[];
+  readonly modelContext: RuntimeV2ModelContextEntry[];
+  readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
+  readonly childAbortControllers: Map<string, AbortController>;
+  readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
+  workspaceOverview: string;
+  subagentCandidates: RuntimeV2SubagentCandidate[];
+  evidenceCounter: number;
+  latestProviderResult: RuntimeV2NormalizedProviderResult | null;
+  latestVisibleText: string;
+  lastProviderTransport: "native" | "text_envelope" | null;
+  providerLaneProfile: ProviderLaneProfileV1 | null;
+  authorization: RuntimeV2ExecutionAuthorization | null;
+}
+
+export interface RuntimeV2ExecutionPortsInput {
+  readonly get: StoreGet;
+  readonly context: RuntimeV2SubmissionContext;
+  readonly live: RuntimeV2LiveExecutionState;
+  readonly nextId: (scope: string) => string;
+  readonly now: () => number;
+  readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
+}
+
+export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState {
+  return {
+    messages: [],
+    modelContext: [],
+    childRuns: new Map(),
+    childAbortControllers: new Map(),
+    childTelemetry: new Map(),
+    workspaceOverview: "",
+    subagentCandidates: [],
+    evidenceCounter: 0,
+    latestProviderResult: null,
+    latestVisibleText: "",
+    lastProviderTransport: null,
+    providerLaneProfile: null,
+    authorization: null,
+  };
+}

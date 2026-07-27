@@ -1,4 +1,5 @@
 import type { PendingOperationProposal } from "../lib/workflowModels";
+import { buildPlanSubmissionGuidance } from "../lib/planSubmissionGuidance";
 import { buildTurnIntakeContextBlock, type TurnInputContextSignals } from "../lib/turnIntake";
 
 export type SubmitPromptRunIntent = string;
@@ -71,20 +72,23 @@ function applyPlanModePrompt(input: BuildSubmitPromptContextInput, userContent: 
     : input.preferredLanguage === "en"
     ? "This turn is in PLAN mode."
     : "本轮处于 PLAN 模式。";
+  const submissionGuidance = buildPlanSubmissionGuidance(input.preferredLanguage);
   return input.preferredLanguage === "en"
     ? [
-        `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then create or update the reviewable plan at \`.MAIN/plans/plan.md\` with \`write_file\` or \`replace_in_file\`. This is the only allowed write before approval. For debug-log, screenshot, repeated-failure, or cross-module repairs, you may also keep a short staged ledger: \`requirements.md\` for user goals/acceptance and \`design.md\` for evidence-backed diagnosis. Do not write project source files or tasks.md before approval.`,
-        "Follow the opencode-style plan file workflow: if a plan file already exists, edit it incrementally; otherwise create it. Keep exploring read-only evidence until the plan is decision-complete.",
-        "The plan file must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
-        "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
+        `${planModeLead} Gather only the read-only evidence needed to make the plan decision-complete. Before approval, do not call \`write_file\`, \`replace_in_file\`, or any other write tool for \`.MAIN/plans/plan.md\`, requirements/design/tasks files, or project source files.`,
+        "Treat the frozen runtime evidence IDs and goal IDs as authority. The complete typed graph must connect diagnoses, explicit change operations/targets, decisions, interfaces, acceptance-capable validation primitives, assumptions, and blocking choices through G/E/R/C/D/V references. Prose and Markdown are display text only and must not carry graph authority.",
+        submissionGuidance,
+        "The runtime—not the model—validates that typed candidate, seals it, and renders the review artifact at `.MAIN/plans/plan.md`. Never create, update, patch, or incrementally edit that file yourself, even if an older plan already exists.",
+        "If a genuinely blocking user decision remains, return concise `<user_options>` only and do not also submit a typed graph. Otherwise submit the complete replacement graph through the contract-declared transport, without options or tutorial prose.",
         "",
         userContent,
       ].join("\n")
     : [
-        `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再用 \`write_file\` 或 \`replace_in_file\` 创建/更新可审批计划文件 \`.MAIN/plans/plan.md\`；这是批准前唯一允许的写入。遇到调试日志、截图、反复失败或跨模块修复时，可以同时保留简短 staged ledger：\`requirements.md\` 写用户目标/验收，\`design.md\` 写证据归因/取舍。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-        "严格按 opencode 风格的计划文件流程：如果 plan.md 已存在就增量编辑，否则创建完整计划；只读证据足够且计划 decision-complete 后再停在审批。",
-        "plan.md 必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
-        "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
+        `${planModeLead}只收集让计划达到 decision-complete 所需的只读证据。批准前不得为 \`.MAIN/plans/plan.md\`、requirements/design/tasks 文件或项目源码调用 \`write_file\`、\`replace_in_file\` 或任何其他写入工具。`,
+        "以 runtime 冻结的证据 ID 和目标 ID 为唯一依据。完整 typed graph 中的诊断、明确改动操作/目标、决策、接口、可验收验证原语、假设和阻塞选择必须通过 G/E/R/C/D/V 引用显式连接。自然语言和 Markdown 仅用于展示，不承载图关系权威。",
+        submissionGuidance,
+        "由 runtime 校验并封存 typed candidate，再单向渲染为 `.MAIN/plans/plan.md` 审批产物。模型绝不能自行创建、更新、打补丁或增量编辑该文件，即使已有旧计划也一样。",
+        "如仍有真正阻塞的用户决策，只返回精简的 `<user_options>`，不要同时提交 typed graph；否则通过契约声明的入口提交完整替换图，不要附带选项或教程式长文。",
         "",
         userContent,
       ].join("\n");
@@ -93,20 +97,25 @@ function applyPlanModePrompt(input: BuildSubmitPromptContextInput, userContent: 
 function applyPlanContinuationPrompt(input: BuildSubmitPromptContextInput, userContent: string): string {
   if (!input.shouldContinuePlanIntent) return userContent;
   const originalPlanPrompt = input.currentTurnUserPrompt?.trim();
+  const submissionGuidance = buildPlanSubmissionGuidance(input.preferredLanguage);
   return input.preferredLanguage === "en"
     ? [
         "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
         originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-        "Produce real planning progress now. If key choices remain, summarize them in 2-3 bullets then use <user_options>; if all decisions are made, write plan.md directly without options. Use requirements/design only as a short staged ledger for complex evidence tracking.",
-        "Keep plan.md concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
+        "Continue from the existing frozen evidence and gather only missing read-only evidence. Do not call write_file, replace_in_file, or any write tool for plan.md, requirements/design/tasks files, or project source files.",
+        "If a genuinely blocking choice remains, return concise <user_options> only. If all decisions are made, submit exactly one complete replacement typed graph with explicit G/E/R/C/D/V references and acceptance-capable validation primitives; do not return options in the same response.",
+        submissionGuidance,
+        "The runtime alone validates, seals, and renders `.MAIN/plans/plan.md`. Never create or incrementally edit the review artifact yourself; keep candidate display text concise and omit tutorials, full code listings, and repeated background.",
         input.text.trim() ? `Latest user message: ${input.text.trim()}` : "Latest user message: continue",
       ].join("\n")
     : [
         "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
         originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-        "现在必须产生实际规划进展。如有关键决策需确认，先用 2-3 条摘要归纳再给出 <user_options>；如所有决策已完成，则直接写入 plan.md 无需选项。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
+        "请沿用已冻结证据，只补充缺失的只读证据；不得为 plan.md、requirements/design/tasks 文件或项目源码调用 write_file、replace_in_file 或任何写入工具。",
+        "如仍有真正阻塞的选择，只返回精简的 <user_options>。如决策已完整，只提交一个完整替换式 typed graph，以 G/E/R/C/D/V 引用显式连接，并包含可验收的验证原语；同一回复不要再带选项。",
+        submissionGuidance,
         "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
-        "plan.md 要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
+        "只有 runtime 可以校验、封存并渲染 `.MAIN/plans/plan.md`；模型绝不能自行创建或增量编辑审批产物。candidate 的展示文本保持精简，不要写教程式长文、完整代码清单或重复背景。",
         input.text.trim() ? `用户最新消息：${input.text.trim()}` : "用户最新消息：继续",
       ].join("\n");
 }

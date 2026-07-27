@@ -1,4 +1,4 @@
-import type { AgentMessage } from "./orchestrator";
+import type { AgentMessage } from "./agentMessages";
 import { canonicalizeGoalInput } from "./goalState";
 import type { DurableTurnContext, PlanArtifact } from "./workflowModels";
 

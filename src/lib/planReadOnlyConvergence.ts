@@ -3,9 +3,19 @@ import {
   assessPlanClosureEvidence,
   buildPlanEvidenceBundle,
   isPlanEvidenceBundleReady,
+  isPlanEvidenceReadyForModelDraft,
 } from "./planEvidence";
 import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import type { PlanStructuredEvidenceFact } from "./planStructuredEvidence";
+import type { PlanSourceObservation } from "./planSourceObservation";
+import { derivePlanGoalFacets } from "./planAuthoringContract";
+import { assessPlanEvidenceComponentCapacity } from "./planEvidenceComponents";
+import {
+  derivePlanEvidenceObligations,
+  type PlanEvidenceDiscoveryObservation,
+  type PlanEvidenceObligation,
+} from "./planEvidenceObligations";
 
 export const PLAN_READONLY_CONVERGENCE_BATCH_LIMIT = 3;
 export const PLAN_READONLY_CONVERGENCE_TOOL_LIMIT = 12;
@@ -24,6 +34,8 @@ export interface PlanEvidenceReadinessResult {
   successfulSearches: number;
   semanticFacts: number;
   changeTargets: number;
+  evidenceComponents: number;
+  diagnosticEvidenceComponents: number;
 }
 
 export interface PlanToolActivityLike {
@@ -31,11 +43,26 @@ export interface PlanToolActivityLike {
   target?: string;
   status?: string;
   detail?: string;
+  facts?: string[];
+  structuredFacts?: PlanStructuredEvidenceFact[];
+  sourceObservations?: PlanSourceObservation[];
+  discoveryObservation?: PlanEvidenceDiscoveryObservation;
+  evidenceObligation?: PlanEvidenceObligation;
+  obligationClosure?: {
+    role: "obligation_closure";
+    obligation: PlanEvidenceObligation;
+  };
+  delegatedObservation?: {
+    planningEvidenceState?: "reusable" | "unresolved";
+    joinState?: "consumed";
+    closureState?: "satisfied" | "partial" | "unverified";
+  };
 }
 
 const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "cancel_subagent",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -67,6 +94,7 @@ const PLAN_READ_ONLY_TOOL_NAMES = new Set([
 const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "cancel_subagent",
   "glob_search",
   "grep_search",
   "read_file",
@@ -176,14 +204,35 @@ export function assessPlanEvidenceReadiness(input: {
       target: String(item.target || ""),
       status: "succeeded",
       summary: String(item.detail || ""),
+      facts: Array.isArray(item.facts) ? item.facts : [],
+      structuredFacts: Array.isArray(item.structuredFacts) ? item.structuredFacts : [],
+      sourceObservations: Array.isArray(item.sourceObservations) ? item.sourceObservations : [],
     })),
     files: successful.map((item) => String(item.target || "")),
   });
   const semanticFacts = semanticBundle.facts.length;
   const changeTargets = semanticBundle.changeTargets.length;
-  const counts = { successfulTargetedReads, successfulSearches, semanticFacts, changeTargets };
+  const componentCapacity = assessPlanEvidenceComponentCapacity({
+    facets: semanticBundle.goalFacets || derivePlanGoalFacets(String(input.userGoal || "plan evidence readiness")),
+    components: semanticBundle.evidenceComponents || [],
+    diagnosisRequired: userContext.diagnosisRequirement === "required",
+  });
+  const evidenceComponents = componentCapacity.available;
+  const diagnosticEvidenceComponents = componentCapacity.diagnosticAvailable;
+  const counts = {
+    successfulTargetedReads,
+    successfulSearches,
+    semanticFacts,
+    changeTargets,
+    evidenceComponents,
+    diagnosticEvidenceComponents,
+  };
   const hasGroundedVisualContext =
     input.hasGroundedVisualContext ?? input.hasObservedUserContext ?? false;
+  const evidenceObligations = derivePlanEvidenceObligations({
+    objective: input.userGoal,
+    activities: activity,
+  });
 
   if (input.hasBlockingUserChoice) {
     return {
@@ -217,6 +266,14 @@ export function assessPlanEvidenceReadiness(input: {
     };
   }
 
+  if (evidenceObligations.length > 0) {
+    return {
+      status: "needs_targeted_read",
+      reason: "structured_evidence_obligations_open",
+      ...counts,
+    };
+  }
+
   if (!isPlanEvidenceBundleReady(semanticBundle)) {
     return {
       status: "needs_targeted_read",
@@ -226,18 +283,12 @@ export function assessPlanEvidenceReadiness(input: {
   }
 
   const closureAssessment = assessPlanClosureEvidence(semanticBundle);
-  if (!closureAssessment.ready) {
+  if (!isPlanEvidenceReadyForModelDraft(semanticBundle, closureAssessment, {
+    diagnosisRequired: userContext.diagnosisRequirement === "required",
+  })) {
     return {
       status: "needs_targeted_read",
-      reason: closureAssessment.reason,
-      ...counts,
-    };
-  }
-
-  if (!readProvidedPath && successfulTargetedReads < 2 && successfulSearches < 1) {
-    return {
-      status: "needs_targeted_read",
-      reason: "insufficient_targeted_evidence",
+      reason: !componentCapacity.ready ? componentCapacity.reason : closureAssessment.reason,
       ...counts,
     };
   }
@@ -308,9 +359,30 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     hasGroundedVisualContext:
       input.hasGroundedVisualContext ?? input.hasObservedUserContext,
   });
+  const successfulActivity = (input.recentToolActivity || []).filter(isSuccessfulActivity);
+  const reusableDelegatedTargets = new Set(successfulActivity.flatMap((activity) => {
+    if (activity.delegatedObservation?.planningEvidenceState !== "reusable") return [];
+    const target = normalizeEvidencePath(String(activity.target || ""));
+    return target ? [target] : [];
+  }));
+  const hasParentOwnedTargetedRead = successfulActivity.some((activity) =>
+    !activity.delegatedObservation &&
+    isPlanTargetedEvidenceRead(String(activity.name || "")) &&
+    hasConcreteTarget(activity)
+  );
+  // Joined child evidence is already one bounded exploration batch. Once two
+  // independently scoped, provenance-backed observations and a parent-owned
+  // targeted read exist, a second batch is enough to make the runtime decide
+  // whether to draft or request one exact missing contract. This is based on
+  // evidence shape, never provider/model identity or response wording.
+  const reusableDelegatedConvergenceReady =
+    reusableDelegatedTargets.size >= 2 &&
+    hasParentOwnedTargetedRead &&
+    input.batchCount >= 2;
   if (
     readiness.status === "needs_targeted_read" &&
     (
+      reusableDelegatedConvergenceReady ||
       (readiness.successfulSearches > 0 && input.batchCount >= 1) ||
       (
         readiness.successfulTargetedReads >= 2 &&
@@ -324,6 +396,7 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     return false;
   }
   return (
+    reusableDelegatedConvergenceReady ||
     input.batchCount >= batchLimit ||
     input.toolCount >= toolLimit
   );

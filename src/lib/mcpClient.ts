@@ -764,12 +764,23 @@ export async function executeMcpTool(
     );
   }
 
-  const content = json.result?.content;
-  if (Array.isArray(content)) {
-    return content
-      .map((c: any) => (typeof c === "string" ? c : c.text ?? JSON.stringify(c)))
-      .join("\n");
-  }
+  return formatMcpToolCallResult(toolName, json.result);
+}
 
-  return JSON.stringify(json.result ?? {});
+/** Normalize the MCP CallToolResult boundary before orchestration sees it. */
+export function formatMcpToolCallResult(toolName: string, result: any): string {
+  const content = result?.content;
+  const formatted = Array.isArray(content)
+    ? content
+        .map((c: any) => (typeof c === "string" ? c : c.text ?? JSON.stringify(c)))
+        .join("\n")
+    : JSON.stringify(result ?? {});
+  if (result?.isError === true) {
+    const diagnostic = formatted.trim() || "MCP tool returned isError=true without diagnostic content.";
+    throw new Error(`MCP_TOOL_ERROR[${toolName}] ${diagnostic}`);
+  }
+  if (Array.isArray(content)) {
+    return formatted;
+  }
+  return formatted;
 }

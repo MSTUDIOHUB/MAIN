@@ -64,6 +64,7 @@ const {
   hasExplicitUnityConsoleDiagnosticCue,
   inferCommandDirective,
   looksLikeAmbiguousChatExecutionInput,
+  looksLikeExplicitWorkspaceMutationRequest,
   looksLikePreviousTurnContinuationInput,
   looksLikeExistingPlanExecutionRequest,
   mapResolvedRunIntentToWorkflowMode,
@@ -154,6 +155,42 @@ test("plain English implementation request enters execute workflow", () => {
   assert.equal(result.commandDirective.kind, "file_modify");
   assert.equal(result.commandDirective.requiresApproval, true);
   assert.equal(result.needsDecision, undefined);
+});
+
+test("compound diagnosis, mutation, and validation requests keep mutation authority", () => {
+  const inputs = [
+    "The editor must not show filename or Unsaved document tabs. Opening a local Markdown file still opens an erroneous save-path dialog. Find the root causes, fix the underlying operation order, and run real validation to confirm completion.",
+    "The editor must not show filename tabs Find the root causes fix the underlying operation order and run real validation",
+    "Inspect the startup logs, then repair the lifecycle ordering and validate the result.",
+    "检查启动日志，然后修复底层执行顺序并运行真实验证。",
+    "修复 MD Viewer：打开本地文件后不要因为程序化 setValue 被标记为已修改或触发自动保存；请直接读取、修改并验证，直到问题解决。",
+  ];
+
+  for (const input of inputs) {
+    assert.equal(looksLikeExplicitWorkspaceMutationRequest(input), true, input);
+    const result = resolveTurnRunIntent(
+      input,
+      createContext({ language: "en", hasWorkspace: true }),
+    );
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "file_modify", input);
+    assert.equal(result.commandDirective.action, "workspace_file_change", input);
+  }
+});
+
+test("read-only and plan-first constraints suppress mutation authority", () => {
+  const inputs = [
+    "Only analyze how to fix this issue; do not modify files.",
+    "Inspect the proposed fix without changing any files.",
+    "只分析如何修复这个问题，不要修改文件。",
+    "Give me a plan first; don't implement it yet.",
+  ];
+
+  for (const input of inputs) {
+    assert.equal(looksLikeExplicitWorkspaceMutationRequest(input), false, input);
+    const directive = inferCommandDirective(input, "respond");
+    assert.notEqual(directive.kind, "file_modify", input);
+  }
 });
 
 test("fix requests with analysis-domain nouns enter execute workflow", () => {

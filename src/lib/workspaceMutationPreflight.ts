@@ -105,20 +105,49 @@ function inferReplaceMismatchRecoveryRange(
     .replace(/\r/g, "\n")
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length >= 4)
-    .sort((left, right) => right.length - left.length);
+    .filter((line) => line.length >= 4);
+  const identifiers = [...new Set(
+    String(searchText || "").match(/[A-Za-z_$][\w$-]{3,}/g) || [],
+  )]
+    .filter((identifier) =>
+      !/^(?:function|return|const|class|import|export|async|await|content|value|path|file|true|false|null|undefined|error|string|object|array|event)$/i.test(
+        identifier,
+      )
+    )
+    .slice(0, 32);
+  const identifierLineCounts = new Map(identifiers.map((identifier) => [
+    identifier,
+    lines.reduce((count, line) => count + (line.includes(identifier) ? 1 : 0), 0),
+  ]));
   let anchorIndex = -1;
-  for (const candidate of searchLines) {
-    anchorIndex = lines.findIndex((line) => line.includes(candidate));
-    if (anchorIndex >= 0) break;
-  }
-  if (anchorIndex < 0) {
-    const identifiers = [...new Set(String(searchText || "").match(/[A-Za-z_$][\w$]{3,}/g) || [])]
-      .filter((identifier) => !/^(?:function|return|const|class|import|export|async|await)$/i.test(identifier))
-      .slice(0, 12);
+  let anchorScore = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    let score = 0;
     for (const identifier of identifiers) {
-      anchorIndex = lines.findIndex((line) => line.includes(identifier));
-      if (anchorIndex >= 0) break;
+      const lineCount = identifierLineCounts.get(identifier) || 0;
+      if (line.includes(identifier)) {
+        score += 18 / Math.max(1, lineCount) + Math.min(8, identifier.length / 3);
+      }
+      const nearbyStart = Math.max(0, index - 10);
+      const nearbyEnd = Math.min(lines.length, index + 11);
+      if (
+        lineCount > 0 &&
+        lines.slice(nearbyStart, nearbyEnd).some((candidate) =>
+          candidate.includes(identifier)
+        )
+      ) {
+        score += 4 / Math.max(1, lineCount);
+      }
+    }
+    for (const candidate of searchLines) {
+      if (candidate.length >= 12 && line.includes(candidate)) {
+        score += 30 + Math.min(30, candidate.length / 4);
+      }
+    }
+    if (score > anchorScore) {
+      anchorScore = score;
+      anchorIndex = index;
     }
   }
   if (anchorIndex < 0) return null;

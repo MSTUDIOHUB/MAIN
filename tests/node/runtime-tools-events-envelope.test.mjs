@@ -55,7 +55,6 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const runtimeTools = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeTools.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
-const turnPreparation = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/turnPreparation.ts"));
 const toolFeedbackEnvelope = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 
 const {
@@ -135,20 +134,23 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   assert.equal(autoRead.action, "auto_execute");
   assert.equal(initialLifecycleStateForPlanAction(autoRead.action), "queued");
 
-  const specAutoApproved = planRuntimeToolCall(createPlanInput({
+  const blockedRuntimeOwnedPlanArtifact = planRuntimeToolCall(createPlanInput({
     toolCall: { id: "d", name: "write_file", arguments: JSON.stringify({ path: ".MAIN/plans/plan.md", content: "# design" }) },
     workflowMode: "plan",
     runtimeIntent: "plan",
     isPlanApproved: false,
+    autoApproveToolScopes: ["workspace_write"],
   }));
-  assert.equal(specAutoApproved.action, "spec_file_auto_approved");
-  assert.equal(initialLifecycleStateForPlanAction(specAutoApproved.action), "queued");
+  assert.equal(blockedRuntimeOwnedPlanArtifact.action, "blocked_plan_gate");
+  assert.equal(blockedRuntimeOwnedPlanArtifact.reason, "pre_approval_plan_artifact_write");
+  assert.equal(initialLifecycleStateForPlanAction(blockedRuntimeOwnedPlanArtifact.action), "blocked");
 
   const blockedPlanGate = planRuntimeToolCall(createPlanInput({
     toolCall: { id: "e", name: "write_file", arguments: JSON.stringify({ path: "src/core.ts", content: "x" }) },
     workflowMode: "plan",
     runtimeIntent: "plan",
     isPlanApproved: false,
+    autoApproveToolScopes: ["workspace_write"],
   }));
   assert.equal(blockedPlanGate.action, "blocked_plan_gate");
   assert.equal(blockedPlanGate.reason, "pre_approval_source_write");
@@ -584,166 +586,6 @@ test("runtime terminal appends distinguish commit, replay, and semantic conflict
     assert.equal(turn.resultKind, resultKind);
     assert.equal(isTerminalTurnEvent(turn), true);
   }
-});
-
-test("Goal slice completion terminates only the child run, not the long-lived turn", () => {
-  const events = [];
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-goal",
-    getCurrentTurnId: () => "turn-goal",
-    getGoalTurnContract: () => ({ goalSliceId: "goal-1:slice:1" }),
-    getCurrentRunIdentity: () => ({
-      runId: "run-goal-slice-1",
-      parentRunId: "run-goal",
-      goalSliceId: "goal-1:slice:1",
-    }),
-    onTurnEvent: (event) => events.push(event),
-  });
-
-  emitter.emitTurnCompletedEvent();
-  assert.deepEqual(events.map((event) => event.type), ["run.completed"]);
-  assert.equal(events[0].goalSliceId, "goal-1:slice:1");
-});
-
-test("a parent pause does not suppress completion of a child run on the same logical turn", () => {
-  const events = [];
-  let currentRunIdentity = {
-    runId: "run-plan-review",
-    parentRunId: null,
-  };
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-plan-handoff",
-    getCurrentTurnId: () => "turn-plan-handoff",
-    getGoalTurnContract: () => null,
-    getCurrentRunIdentity: () => currentRunIdentity,
-    onTurnEvent: (event) => events.push(event),
-  });
-
-  assert.equal(emitter.emitRunPausedEvent(
-    "plan_review",
-    "The review run is paused before approved execution starts.",
-  ), true);
-  currentRunIdentity = {
-    runId: "run-plan-execution",
-    parentRunId: "run-plan-review",
-  };
-  emitter.emitTurnCompletedEvent();
-
-  assert.deepEqual(events.map((event) => event.type), [
-    "run.paused",
-    "run.completed",
-    "turn.completed",
-  ]);
-  assert.deepEqual(events.slice(0, 2).map((event) => ({
-    runId: event.runId,
-    parentRunId: event.parentRunId,
-  })), [
-    { runId: "run-plan-review", parentRunId: null },
-    { runId: "run-plan-execution", parentRunId: "run-plan-review" },
-  ]);
-  assert.equal(events[2].turnId, "turn-plan-handoff");
-});
-
-test("turn event emitter preserves the committed pause reason and rejects a duplicate terminal", () => {
-  const events = [];
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-choice",
-    getCurrentTurnId: () => "turn-choice",
-    getGoalTurnContract: () => null,
-    getCurrentRunIdentity: () => ({
-      runId: "run-choice",
-      parentRunId: null,
-    }),
-    onTurnEvent: (event) => events.push(event),
-  });
-
-  assert.equal(emitter.getRunPauseReason(), null);
-  assert.equal(emitter.emitRunPausedEvent(
-    "awaiting_user_choice",
-    "Waiting for a user choice.",
-  ), true);
-  assert.equal(emitter.getRunPauseReason(), "awaiting_user_choice");
-  assert.equal(emitter.emitRunPausedEvent(
-    "assistant_stopped",
-    "Duplicate fallback pause.",
-  ), false);
-  assert.equal(emitter.getRunPauseReason(), "awaiting_user_choice");
-  assert.equal(events.filter((event) => event.type === "run.paused").length, 1);
-});
-
-test("turn event emitter completes an aborted run with one canceled conclusion", () => {
-  const events = [];
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-canceled",
-    getCurrentTurnId: () => "turn-canceled",
-    getGoalTurnContract: () => null,
-    getCurrentRunIdentity: () => ({
-      runId: "run-canceled",
-      parentRunId: null,
-    }),
-    onTurnEvent: (event) => events.push(event),
-  });
-
-  emitter.emitTurnEvent({
-    type: "run.aborted",
-    threadId: "session-canceled",
-    turnId: "turn-canceled",
-    timestampMs: 1,
-    runId: "run-canceled",
-    parentRunId: null,
-    reason: "user_cancelled",
-  });
-  emitter.emitTurnCompletedEvent();
-
-  assert.deepEqual(events.map((event) => event.type), [
-    "run.aborted",
-    "run.completed",
-    "turn.completed",
-  ]);
-  assert.equal(events[1].resultKind, "canceled");
-  assert.equal(events[2].resultKind, "canceled");
-});
-
-test("turn completion emitter stages exactly one terminal commit", () => {
-  const events = [];
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-staged",
-    getCurrentTurnId: () => "turn-staged",
-    getGoalTurnContract: () => null,
-    onTurnEvent: (event) => events.push(event),
-  });
-  let committed = 0;
-
-  emitter.stageTurnCompletion(() => {
-    committed += 1;
-    emitter.emitTurnCompletedEvent();
-  });
-  emitter.stageTurnCompletion(() => {
-    committed += 10;
-  });
-
-  assert.equal(emitter.hasStagedTurnCompletion(), true);
-  assert.deepEqual(events, []);
-  assert.equal(emitter.commitStagedTurnCompletion(), true);
-  assert.equal(emitter.commitStagedTurnCompletion(), false);
-  assert.equal(committed, 1);
-  assert.equal(emitter.hasStagedTurnCompletion(), false);
-  assert.deepEqual(events.map((event) => event.type), ["run.completed", "turn.completed"]);
-});
-
-test("discarding a staged turn completion publishes no terminal event", () => {
-  const events = [];
-  const emitter = turnPreparation.createTurnEventEmitter({
-    getSessionKey: () => "session-discarded",
-    getCurrentTurnId: () => "turn-discarded",
-    getGoalTurnContract: () => null,
-    onTurnEvent: (event) => events.push(event),
-  });
-
-  emitter.stageTurnCompletion(() => emitter.emitTurnCompletedEvent());
-  assert.equal(emitter.discardStagedTurnCompletion(), true);
-  assert.equal(emitter.hasStagedTurnCompletion(), false);
-  assert.deepEqual(events, []);
 });
 
 test("tool feedback envelope v1 supports parse/format roundtrip", () => {

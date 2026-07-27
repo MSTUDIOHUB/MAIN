@@ -206,7 +206,7 @@ function MathBlock({ value, baseFontSize }: { value: string; baseFontSize: numbe
   );
 }
 
-function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: any) {
+function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...rest }: any) {
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isCodeExpanded, setIsCodeExpanded] = useState(false);
@@ -605,7 +605,15 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
 }
 
 function PreBlock({ children }: any) {
-  return <>{children}</>;
+  return (
+    <>
+      {React.Children.map(children, (child) =>
+        React.isValidElement(child)
+          ? React.cloneElement(child as React.ReactElement<any>, { inline: false })
+          : child
+      )}
+    </>
+  );
 }
 
 function Heading({

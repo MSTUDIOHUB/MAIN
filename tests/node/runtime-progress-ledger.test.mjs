@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildCapsuleActivityText,
+  buildCapsuleGuidanceText,
   buildRuntimeProgressLedger,
   buildRuntimeProgressProjection,
   buildRunStatusProjection,
@@ -59,6 +60,43 @@ const {
   withEventSchema,
   normalizePersistedMainThreadEvent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
+
+test("active Run keeps exact-turn legacy progress when the display block has no runId", () => {
+  const ledger = buildRuntimeProgressLedger({
+    turnId: "turn-current",
+    activeRunId: "run-current",
+    blocks: [
+      {
+        id: "tool-current",
+        type: "tool",
+        turnId: "turn-current",
+        toolName: "read_file",
+        target: "src/main.js",
+        toolStatus: "running",
+        createdAt: 20,
+      },
+      {
+        id: "tool-foreign",
+        type: "tool",
+        turnId: "turn-current",
+        runId: "run-foreign",
+        toolName: "read_file",
+        target: "src/foreign.js",
+        toolStatus: "running",
+        createdAt: 30,
+      },
+    ],
+    events: [],
+    language: "zh",
+  });
+
+  assert.equal(ledger.length, 1);
+  assert.equal(ledger[0].target, "src/main.js");
+  assert.equal(
+    buildCapsuleGuidanceText(buildRunStatusProjection(ledger), "zh"),
+    "我正在读取 `src/main.js`，确认与当前问题相关的实现。",
+  );
+});
 
 test("runtime progress ledger keeps an approved child run separate from its parent plan-review pause", () => {
   const parentRunId = "run-plan-review";
@@ -214,6 +252,207 @@ test("Capsule activity is regenerated from structured tool fields without model 
   assert.equal(activityText, "正在搜索 ChatArea.tsx · 2 次");
   assert.doesNotMatch(activityText, /grep_search|secret reasoning|模型声称/);
   assert.equal(buildCapsuleActivityText({ ...projection, currentActivity: null }, "zh"), "");
+});
+
+test("Capsule guidance explains the purpose of the latest structured action", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:edit",
+    runId: "run-1",
+    phase: "tool_start",
+    title: "raw model prose",
+    status: "running",
+    summary: "replace_in_file · private detail",
+    target: "src/components/ChatArea.tsx",
+    tool: "replace_in_file",
+    sourceToolCallIds: ["call-1"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "zh"),
+    "我正在修改 `src/components/ChatArea.tsx`，把已确认的方案落实到代码。",
+  );
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "en"),
+    "I'm updating `src/components/ChatArea.tsx` to put the confirmed approach into the code.",
+  );
+  assert.doesNotMatch(buildCapsuleGuidanceText(projection, "zh"), /replace_in_file|private detail|raw model prose/);
+});
+
+test("a completed collaboration step clears from Capsule while ChatArea owns the durable assignment", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:spawn-subagent",
+    runId: "run-1",
+    phase: "tool_result",
+    title: "raw objective that must not be copied into Capsule",
+    status: "done",
+    summary: "spawn_subagent · private protocol detail",
+    target: "Euler",
+    tool: "spawn_subagent",
+    sourceToolCallIds: ["call-spawn"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.equal(guidance, "");
+});
+
+test("Capsule clears a superseded spawn heartbeat instead of showing stale parent work", () => {
+  const projection = buildRunStatusProjection([
+    {
+      key: "run:1:spawn-subagent",
+      runId: "run-1",
+      phase: "tool_start",
+      title: "启动子智能体",
+      status: "running",
+      summary: "",
+      target: "Euler",
+      tool: "spawn_subagent",
+      sourceToolCallIds: ["call-spawn"],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 10,
+      lastSeenAt: 90,
+    },
+    {
+      key: "run:1:grep-main",
+      runId: "run-1",
+      phase: "tool_result",
+      title: "搜索主流程",
+      status: "done",
+      summary: "",
+      target: "src/main.js",
+      tool: "grep_search",
+      sourceToolCallIds: ["call-grep"],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 50,
+      lastSeenAt: 60,
+    },
+  ], "zh");
+
+  assert.equal(projection.currentActivity, null);
+  assert.equal(projection.lastGuidanceActivity?.tool, "grep_search");
+  assert.equal(
+    buildCapsuleGuidanceText(projection, "zh"),
+    "",
+  );
+});
+
+test("Capsule keeps a full structured target without pretending it is an ellipsis", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:unknown",
+    runId: "run-1",
+    phase: "tool_start",
+    title: "raw model prose",
+    status: "running",
+    summary: "unknown_tool · private detail",
+    target: "x".repeat(400),
+    tool: "unknown_tool",
+    sourceToolCallIds: ["call-unknown"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.match(guidance, /我正在处理/);
+  assert.match(guidance, /x{400}/);
+  assert.doesNotMatch(guidance, /\.\.\./);
+});
+
+test("Capsule clears completed structured activity and leaves phase fallback to its caller", () => {
+  const emptyProjection = {
+    currentActivity: null,
+    lastGuidanceActivity: null,
+    milestones: [],
+    healthSignals: [],
+    activityText: "",
+  };
+  assert.equal(
+    buildCapsuleGuidanceText(emptyProjection, "zh"),
+    "",
+  );
+  assert.equal(
+    buildCapsuleGuidanceText(emptyProjection, "en"),
+    "",
+  );
+
+  const completedEdit = buildRunStatusProjection([{
+    key: "run:1:edit-complete",
+    runId: "run-1",
+    phase: "tool_result",
+    title: "raw model prose",
+    status: "done",
+    summary: "replace_in_file · private detail",
+    target: "src/components/ChatArea.tsx",
+    tool: "replace_in_file",
+    sourceToolCallIds: ["call-1"],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+  assert.equal(completedEdit.currentActivity, null);
+  assert.equal(completedEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.equal(
+    buildCapsuleGuidanceText(completedEdit, "zh"),
+    "",
+  );
+  const completedStatusEdit = buildRunStatusProjection([{
+    ...completedEdit.lastGuidanceActivity,
+    key: "run:1:edit-completed-status",
+    status: "completed",
+  }], "zh");
+  assert.equal(completedStatusEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.equal(
+    buildCapsuleGuidanceText(completedStatusEdit, "zh"),
+    "",
+  );
+  const repeatedAfterCompletedEdit = {
+    ...completedStatusEdit,
+    healthSignals: [{
+      key: "repeat-edit",
+      kind: "repetition",
+      status: "done",
+      title: "重复操作 ChatArea.tsx",
+      summary: "同一目标共 2 次。",
+      lastSeenAt: 3,
+    }],
+  };
+  assert.equal(
+    buildCapsuleGuidanceText(repeatedAfterCompletedEdit, "zh"),
+    "",
+  );
+
+  const blockedAfterEdit = buildRunStatusProjection([
+    completedEdit.lastGuidanceActivity,
+    {
+      key: "run:1:blocked",
+      runId: "run-1",
+      phase: "blocked",
+      title: "运行受阻",
+      status: "failed",
+      summary: "需要处理新的阻塞。",
+      target: "",
+      tool: "",
+      sourceToolCallIds: [],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 3,
+      lastSeenAt: 3,
+    },
+  ].filter(Boolean), "zh");
+  assert.equal(blockedAfterEdit.lastGuidanceActivity?.tool, "replace_in_file");
+  assert.ok(blockedAfterEdit.healthSignals.some((signal) => signal.kind === "failure"));
+  assert.equal(buildCapsuleGuidanceText(blockedAfterEdit, "zh"), "");
 });
 
 test("Capsule activity never falls back to an unproven progress title", () => {
@@ -555,9 +794,11 @@ test("runtime progress events normalize structured tool identity before ledger a
   assert.equal(items[0].repeatCount, 4);
   assert.deepEqual(items[0].sourceToolCallIds, ["read-1", "read-2", "read-3", "read-4"]);
   const projection = buildRunStatusProjection(items, "zh");
-  assert.equal(projection.currentActivity.repeatCount, 4);
+  assert.equal(projection.currentActivity, null);
   assert.deepEqual(projection.milestones, []);
-  assert.deepEqual(projection.healthSignals, []);
+  assert.equal(projection.healthSignals.length, 1);
+  assert.equal(projection.healthSignals[0].kind, "repetition");
+  assert.match(projection.healthSignals[0].title, /重复读取/);
 });
 
 test("runtime progress ledger counts a tool call once across running, done, and transcript block", () => {
@@ -908,6 +1149,100 @@ test("active child run filters parent harness telemetry", () => {
   assert.doesNotMatch(items[0].summary, /parent failed/);
 });
 
+test("active recovery child does not reuse completed parent guidance before it produces newer work", () => {
+  const parentEvents = [
+    withEventSchema({
+      type: "run.started",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 10,
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 20,
+      progress: {
+        phase: "investigating",
+        title: "已读取源码",
+        status: "done",
+        tool: "read_file",
+        target: "src/main.js",
+        sourceToolCallIds: ["read-parent"],
+      },
+    }),
+    withEventSchema({
+      type: "run.completed",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 30,
+      resultKind: "partial",
+      summary: "继续自动恢复。",
+    }),
+    withEventSchema({
+      type: "run.started",
+      threadId: "thread-lineage",
+      turnId: "turn-lineage",
+      runId: "run-child",
+      parentRunId: "run-parent",
+      timestampMs: 40,
+    }),
+  ];
+  const inheritedItems = buildRuntimeProgressLedger({
+    events: parentEvents,
+    turnId: "turn-lineage",
+    activeRunId: "run-child",
+    language: "zh",
+  });
+  const inheritedProjection = buildRunStatusProjection(inheritedItems, "zh");
+
+  assert.equal(inheritedItems.length, 1);
+  assert.equal(inheritedItems[0].runId, "run-parent");
+  assert.equal(
+    buildCapsuleGuidanceText(inheritedProjection, "zh"),
+    "",
+  );
+  assert.doesNotMatch(inheritedProjection.activityText, /部分完成|继续自动恢复/);
+
+  const childItems = buildRuntimeProgressLedger({
+    events: [
+      ...parentEvents,
+      withEventSchema({
+        type: "progress.updated",
+        threadId: "thread-lineage",
+        turnId: "turn-lineage",
+        runId: "run-child",
+        parentRunId: "run-parent",
+        timestampMs: 50,
+        progress: {
+          phase: "editing",
+          title: "正在修改源码",
+          status: "running",
+          tool: "replace_in_file",
+          target: "src/components/editor.js",
+          sourceToolCallIds: ["edit-child"],
+        },
+      }),
+    ],
+    turnId: "turn-lineage",
+    activeRunId: "run-child",
+    language: "zh",
+  });
+  const childProjection = buildRunStatusProjection(childItems, "zh");
+
+  assert.equal(childProjection.currentActivity?.runId, "run-child");
+  assert.equal(
+    buildCapsuleGuidanceText(childProjection, "zh"),
+    "我正在修改 `src/components/editor.js`，把已确认的方案落实到代码。",
+  );
+});
+
 test("visual progress keeps delivery distinct from recognition and surfaces provider omission", () => {
   const queued = withEventSchema({
     type: "progress.updated",
@@ -1004,4 +1339,19 @@ test("visual progress preserves an explicit bounded observation separately from 
   assert.equal(observed.progress.visualContext.recognition, "observed");
   assert.equal(observed.progress.visualContext.observationSummary, "A compact toolbar is visible.");
   assert.equal(observed.progress.visualContext.observationId, "visual-observed-1");
+  const items = buildRuntimeProgressLedger({
+    events: [observed],
+    turnId: "turn-visual-observed",
+    activeRunId: "run-visual-observed",
+    language: "zh",
+  });
+  const projection = buildRunStatusProjection(items, "zh");
+  assert.equal(
+    projection.currentActivity,
+    null,
+    "a delivered/observed screenshot is a milestone, not perpetual current activity",
+  );
+  const guidance = buildCapsuleGuidanceText(projection, "zh");
+  assert.equal(guidance, "");
+  assert.equal(projection.lastGuidanceActivity, null);
 });

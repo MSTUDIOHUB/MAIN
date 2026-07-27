@@ -4,11 +4,15 @@ export type SubagentDelegationPreference =
   | "allowed"
   | "preferred";
 
+/** Structured Turn-admission authority; never infer this field from model prose. */
+export type DiagnosisOutcomeRequirement = "required" | "optional";
+
 export interface TurnInputContextSignals {
   imageParts: number;
   mentionedFilePaths: string[];
   attachedFilePaths: string[];
   subagentPreference: SubagentDelegationPreference;
+  diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
 export interface TurnInputContextLike {
@@ -16,6 +20,7 @@ export interface TurnInputContextLike {
   mentionedFilePaths?: string[];
   attachedFilePaths?: string[];
   subagentPreference?: SubagentDelegationPreference;
+  diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
 const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
@@ -55,9 +60,16 @@ export function resolveEffectiveSubagentDelegationPreference(input: {
   defaultPreference?: SubagentDelegationPreference;
 }): SubagentDelegationPreference {
   const explicitPreference = resolveSubagentDelegationPreference(input.rawUserInput);
-  return explicitPreference !== "unspecified"
-    ? explicitPreference
-    : normalizeSubagentDelegationPreference(input.defaultPreference);
+  const defaultPreference = normalizeSubagentDelegationPreference(
+    input.defaultPreference,
+  );
+  if (explicitPreference === "unspecified") return defaultPreference;
+  if (explicitPreference === "forbidden") return "forbidden";
+  if (explicitPreference === "preferred") return "preferred";
+  // The Composer collaboration switch is an explicit one-Turn start
+  // boundary. Permissive wording such as "可以启动子智能体" agrees with that
+  // boundary and must not silently weaken it from preferred to allowed.
+  return defaultPreference === "preferred" ? "preferred" : "allowed";
 }
 
 type MessageLike = {
@@ -79,11 +91,16 @@ function uniq(values: string[] = []): string[] {
 
 export function normalizeTurnInputContextSignals(input: TurnInputContextLike = {}): TurnInputContextSignals {
   const imageParts = Math.max(0, Math.floor(Number(input.imageParts || 0)));
+  const diagnosisRequirement = input.diagnosisRequirement === "required" ||
+      input.diagnosisRequirement === "optional"
+    ? input.diagnosisRequirement
+    : undefined;
   return {
     imageParts,
     mentionedFilePaths: uniq(input.mentionedFilePaths),
     attachedFilePaths: uniq(input.attachedFilePaths),
     subagentPreference: normalizeSubagentDelegationPreference(input.subagentPreference),
+    ...(diagnosisRequirement ? { diagnosisRequirement } : {}),
   };
 }
 
@@ -92,7 +109,8 @@ export function hasTurnProvidedContext(signals: TurnInputContextLike = {}): bool
   return (
     normalized.imageParts > 0 ||
     normalized.mentionedFilePaths.length > 0 ||
-    normalized.attachedFilePaths.length > 0
+    normalized.attachedFilePaths.length > 0 ||
+    normalized.diagnosisRequirement !== undefined
   );
 }
 
@@ -114,6 +132,9 @@ export function buildTurnIntakeContextBlock(input: {
   const lines: string[] = ["[turn_intake]"];
   lines.push(`workflowMode: ${input.workflowMode || "chat"}`);
   lines.push(`subagentPreference: ${subagentPreference}`);
+  if (signals.diagnosisRequirement) {
+    lines.push(`diagnosisRequirement: ${signals.diagnosisRequirement}`);
+  }
   lines.push(`imageParts: ${signals.imageParts}`);
   lines.push(`mentionedFiles: ${signals.mentionedFilePaths.length}`);
   for (const path of signals.mentionedFilePaths.slice(0, 12)) {
@@ -122,8 +143,8 @@ export function buildTurnIntakeContextBlock(input: {
 
   if (subagentPreference === "preferred") {
     lines.push(input.language === "en"
-      ? "delegation: The user prefers subagent collaboration. Before broad exploration, identify useful bounded read-only scopes. Spawn one early when one independent scope is valuable; when multiple disjoint scopes exist, spawn as many as current runtime capacity permits in the same response while the parent continues non-overlapping work. Join children before finalizing. Do not create filler or duplicate scopes, and use zero when delegation would not help."
-      : "delegation: 用户偏好子智能体协作。大范围探索前先识别有实质价值的有界只读范围；存在一个独立范围时应尽早创建一个，存在多个路径不重叠的范围时应在同一响应中按当前运行容量创建多个，同时主体继续非重叠工作，并在结束前汇合。不要为了凑数制造琐碎或重复范围；委派无益时可以不创建。");
+      ? "delegation: Collaboration is enabled for this turn. Before doing parent workspace work, create one fresh one-shot agent for a narrow semantic task with an independent success criterion and worthwhile parallel value. This is one start boundary, not a quota: create more children only when useful, never split work by directory alone, and never reuse a terminal child. Continue non-overlapping parent work, inspect child evidence or diffs, and keep final validation and completion with the parent."
+      : "delegation: 本轮已开启协作。主体开始工作区操作前，先为一个具有独立成功标准和并行价值的窄语义任务创建一个全新的一次性子智能体。这只是一次启动边界，不是数量配额：后续仅在确有价值时继续创建，绝不能仅按目录拆分，也不得复用已终止实例。主体并行推进不重叠工作，检查子智能体的证据或差异，并由主体负责最终验证与完成。");
   } else if (subagentPreference === "forbidden") {
     lines.push(input.language === "en"
       ? "delegation: The user explicitly disabled subagents for this turn."
@@ -227,11 +248,17 @@ export function extractTurnInputContextSignalsFromMessages(messages: MessageLike
   const intakeSubagentPreference = intakeBlock.match(
     /^subagentPreference:\s*(unspecified|forbidden|allowed|preferred)\s*$/mi,
   )?.[1];
+  const intakeDiagnosisRequirement = intakeBlock.match(
+    /^diagnosisRequirement:\s*(required|optional)\s*$/mi,
+  )?.[1];
   return normalizeTurnInputContextSignals({
     imageParts: Math.max(countImageParts(latestUser.content), Number.isFinite(imagePartsFromIntake) ? imagePartsFromIntake : 0),
     mentionedFilePaths,
     attachedFilePaths,
     subagentPreference: normalizeSubagentDelegationPreference(intakeSubagentPreference),
+    diagnosisRequirement: intakeDiagnosisRequirement === "required" || intakeDiagnosisRequirement === "optional"
+      ? intakeDiagnosisRequirement
+      : undefined,
   });
 }
 
@@ -248,6 +275,9 @@ export function buildSemanticMetadataContextLines(input: {
     `Attached files: ${signals.attachedFilePaths.length}`,
     ...signals.attachedFilePaths.slice(0, 6).map((path) => `- attachment ${path}`),
   ];
+  if (signals.diagnosisRequirement) {
+    lines.push(`Diagnosis outcome requirement: ${signals.diagnosisRequirement}`);
+  }
   lines.push(input.language === "en"
     ? "Title/summary must reflect the user's actual task plus this visual/file context."
     : "标题/摘要必须体现用户真实任务以及这次图片/文件上下文。");

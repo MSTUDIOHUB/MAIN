@@ -70,7 +70,10 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildEmptySessionRuntimeSnapshot,
   buildSessionRuntimeSnapshotFromStoreState,
+  GLOBAL_CHAT_KEY,
+  normalizeInterruptedConversationTurnsForRestore,
   normalizeSessionRuntimeSnapshot,
+  sanitizeTaskBlocksForPersist,
   useAppStore,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/useAppStore.ts"));
 const { createSubmitSessionRuntimeFacade } = loadTranspiledModuleSync(
@@ -101,9 +104,131 @@ const {
 const { buildPlanApprovalIdentity } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"),
 );
+const { hashPlanCandidate, hashPlanProjection } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planContract.ts"),
+);
 
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
+
+test("workspace Session containers normalize Chat turns to task turns", () => {
+  const turns = [{
+    id: "turn-chat",
+    userPrompt: "Inspect this workspace",
+    title: "Inspect",
+    mode: "chat",
+    status: "done",
+    summary: "done",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 1,
+  }, {
+    id: "turn-plan",
+    userPrompt: "Plan this repair",
+    title: "Plan",
+    mode: "plan",
+    status: "done",
+    summary: "done",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 2,
+  }];
+
+  assert.equal(
+    normalizeInterruptedConversationTurnsForRestore(turns, [], false)[0].mode,
+    "chat",
+  );
+  const workspaceTurns = normalizeInterruptedConversationTurnsForRestore(
+    turns,
+    [],
+    true,
+  );
+  assert.equal(workspaceTurns[0].mode, "edit");
+  assert.equal(workspaceTurns[1].mode, "plan");
+});
+
+test("new Session admission canonicalizes its bucket and refuses Chat mode in an active workspace", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/fixture/workspace-session-container";
+  const workspaceSession = {
+    id: 701,
+    title: "New Conversation",
+    date: new Date(0).toISOString(),
+    active: true,
+    messages: [],
+  };
+  const globalSession = {
+    id: 702,
+    title: "New Chat",
+    date: new Date(0).toISOString(),
+    active: true,
+    messages: [],
+  };
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: null,
+      sessionsByWorkspace: {},
+      config: {
+        ...originalState.config,
+        workspace,
+        workflowMode: "chat",
+      },
+    }, true);
+    useAppStore.getState().addSession(workspace, workspaceSession);
+    let state = useAppStore.getState();
+    assert.equal(state.config.workflowMode, "edit");
+    assert.deepEqual(state.sessionsByWorkspace[workspace]?.map((session) => session.id), [701]);
+    assert.equal(state.sessionsByWorkspace[GLOBAL_CHAT_KEY], undefined);
+
+    useAppStore.setState({
+      ...state,
+      currentWorkspace: "",
+      selectedWorkspace: "",
+      currentSessionId: null,
+      sessionsByWorkspace: {},
+      config: {
+        ...state.config,
+        workspace: "",
+        workflowMode: "chat",
+      },
+    }, true);
+    useAppStore.getState().addSession("", globalSession);
+    state = useAppStore.getState();
+    assert.deepEqual(
+      state.sessionsByWorkspace[GLOBAL_CHAT_KEY]?.map((session) => session.id),
+      [702],
+    );
+    assert.equal(state.sessionsByWorkspace[""], undefined);
+    assert.equal(state.config.workflowMode, "chat");
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
+
+test("runtime guidance user records preserve their stable identity across persistence", () => {
+  const persisted = sanitizeTaskBlocksForPersist([
+    {
+      id: 41,
+      turnId: "turn-guided",
+      type: "user",
+      content: "继续验证当前回合",
+      runtimeGuidance: { id: " guidance-41 " },
+    },
+  ]);
+
+  assert.deepEqual(persisted, [
+    {
+      id: 41,
+      turnId: "turn-guided",
+      type: "user",
+      content: "继续验证当前回合",
+      runtimeGuidance: { id: "guidance-41" },
+    },
+  ]);
+});
 
 function applyPlanTransition(state, command) {
   const result = reducePlanLifecycle(state, command);
@@ -483,6 +608,24 @@ test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or
       createdAt: 1,
       optionValues: ["continue"],
     },
+    turnRuntimeCheckpoints: {
+      "turn-foreign": {
+        schemaVersion: 1,
+        turnId: "turn-foreign",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+    },
+    subagentClosureReceiptLedger: {
+      schemaVersion: 1,
+      owner: {
+        workspaceKey: "/tmp/fresh-session",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+      receipts: {},
+      updatedAt: 1,
+    },
     contextMemoryState: { summary: "foreign memory" },
     contextMemoryStateByRuntimeKey: { foreign: { summary: "foreign lane memory" } },
     providerCompatibilityByRuntimeKey: { foreign: { forceXml: true } },
@@ -511,6 +654,8 @@ test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or
   assert.deepEqual(snapshot.runtimeEvents, []);
   assert.equal(snapshot.harnessRunMarker, null);
   assert.equal(snapshot.activeActionRequest, null);
+  assert.deepEqual(snapshot.turnRuntimeCheckpoints, {});
+  assert.equal(snapshot.subagentClosureReceiptLedger, null);
   assert.equal(snapshot.contextMemoryState, null);
   assert.deepEqual(snapshot.contextMemoryStateByRuntimeKey, {});
   assert.deepEqual(snapshot.providerCompatibilityByRuntimeKey, {});
@@ -985,22 +1130,35 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
       event.threadId === sessionKey && event.turnId === receipt.turnId
     );
     const turn = settled.conversationTurns.find((candidate) => candidate.id === receipt.turnId);
-
     assert.equal(streamInvocations.length >= 1, true, JSON.stringify({
       events: ownedEvents,
       turn,
       agentBlocks: settled.taskFlow.filter((block) => block.type === "agent"),
     }));
     assert.match(String(streamInvocations[0]?.url || ""), /127\.0\.0\.1:8000\/v1\/chat\/completions$/);
-    assert.equal(ownedEvents.filter((event) => event.type === "run.started").length >= 1, true);
+    assert.equal(
+      ownedEvents.filter((event) => event.type === "run.started").length >= 1,
+      true,
+      JSON.stringify({ eventTypes: ownedEvents.map((event) => event.type), ownedEvents }),
+    );
     assert.equal(ownedEvents.filter((event) => event.type === "run.completed").length, 1);
     assert.equal(ownedEvents.filter((event) => event.type === "turn.completed").length, 1);
-    assert.equal(ownedEvents.find((event) => event.type === "run.completed")?.resultKind, "error");
+    assert.equal(
+      ownedEvents.find((event) => event.type === "run.completed")?.resultKind,
+      "error",
+      JSON.stringify({
+        eventTypes: ownedEvents.map((event) => event.type),
+        ownedEvents,
+        runtimeOutcome: turn?.runtimeOutcome,
+        agentStatus: settled.agentStatus,
+      }),
+    );
     assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "error");
-    assert.equal(turn?.status, "done");
+    assert.equal(turn?.status, "error");
     assert.equal(turn?.runtimeOutcome?.resultKind, "error");
     assert.equal(settled.isGenerating, false);
-    assert.equal(settled.agentStatus, "idle");
+    assert.equal(settled.agentStatus, "error");
+    assert.match(turn?.summary || "", /turn failed|did not finish/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
         block.type === "agent" &&
@@ -2317,6 +2475,64 @@ function approvedTaskArtifact() {
   ].join("\n"));
 }
 
+function sealedPlanCandidateForRestore(content) {
+  return {
+    schemaVersion: 4,
+    state: "sealed",
+    contractId: "restore-contract:bundle-1",
+    authoringContractId: "restore-contract",
+    bundleHash: "bundle-1",
+    objective: "Restore exact-owner Plan checkpoint evidence safely.",
+    goals: [{ id: "G1", index: 1, text: "Preserve only exact-owner checkpoint evidence." }],
+    diagnosisRequired: false,
+    evidence: [],
+    summary: ["Keep checkpoint history separate from execution authority."],
+    diagnoses: [],
+    findings: [],
+    changes: [{
+      id: "C1",
+      text: "Modify src/main.js under the reviewed Plan.",
+      targetRef: "src/main.js",
+      evidenceRefs: [],
+      diagnosisRefs: [],
+      goalRefs: ["G1"],
+      operation: "modify",
+      expectedOutcome: "The reviewed mutation is applied.",
+      relationships: [],
+      executionEvidence: [],
+    }],
+    decisions: [],
+    interfaces: [],
+    tests: ["Run the restore regression."],
+    validations: [{
+      id: "V1",
+      goalRefs: ["G1"],
+      changeRefs: ["C1"],
+      primitive: {
+        kind: "finite_command",
+        acceptance: "required",
+        command: "node --test tests/node/session-runtime-restore.test.mjs",
+        capability: "test",
+        segments: [{
+          command: "node --test tests/node/session-runtime-restore.test.mjs",
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      },
+      expectedOutcome: "The restore regression exits successfully.",
+      blocking: true,
+    }],
+    assumptions: [],
+    blockingChoices: [],
+    projection: {
+      format: "markdown",
+      content,
+      contentHash: hashPlanProjection(content),
+    },
+  };
+}
+
 function planConversationTurn(overrides = {}) {
   return {
     id: "turn-plan",
@@ -2517,9 +2733,11 @@ test("restore preserves currentTaskId and migrates legacy task text only when th
   assert.equal(ambiguous.planExecutionProgressSnapshot, null);
 });
 
-test("restore pauses and revokes approval when the Plan checkpoint turn or run owner is stale", () => {
+test("restore preserves a legacy execution checkpoint identity while revoking its active lease", () => {
   const plan = planArtifact(buildApprovedPlanContent());
   const tasks = approvedTaskArtifact();
+  const legacyArtifactIdentity = buildPlanApprovalIdentity([plan, tasks]);
+  assert.equal(plan.candidate, undefined);
   const planTasks = extractPlanTasks(tasks.content);
   const baseProgress = {
     turnId: "turn-plan",
@@ -2552,7 +2770,12 @@ test("restore pauses and revokes approval when the Plan checkpoint turn or run o
   assert.equal(valid.isPlanApproved, false);
   assert.equal(valid.planLifecycle.status, "paused");
   assert.equal(valid.planLifecycle.executionLease, null);
+  assert.equal(
+    valid.planLifecycle.artifactIdentity?.artifactHash,
+    legacyArtifactIdentity.artifactHash,
+  );
   assert.equal(valid.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
+  assert.equal(valid.activeActionRequest, null);
   assert.equal(valid.harnessRunMarker.status, "paused");
   assert.equal(valid.runtimeEvents.at(-1).type, "run.paused");
 
@@ -2652,6 +2875,68 @@ test("restore retains checkpoint evidence only for the exact Session container e
   assert.equal(crossSession.planLifecycle.sessionEpoch, "other-plan-epoch");
   assert.equal(crossSession.planLifecycle.approvalLease, null);
   assert.deepEqual(crossSession.planExecutionEvidenceLedger, []);
+});
+
+test("restore fail-closes exact-owner checkpoint evidence when a typed Plan candidate drifts", () => {
+  const content = buildApprovedPlanContent();
+  const validCandidate = sealedPlanCandidateForRestore(content);
+  const driftedContent = `${content}\n\nUnreviewed projection drift.`;
+  const driftedCandidate = {
+    ...validCandidate,
+    projection: {
+      ...validCandidate.projection,
+      content: driftedContent,
+      contentHash: hashPlanProjection(driftedContent),
+    },
+  };
+  const plan = planArtifact(content, {
+    candidate: driftedCandidate,
+    candidateHash: hashPlanCandidate(driftedCandidate),
+    authoringContractId: driftedCandidate.authoringContractId,
+  });
+  const tasks = approvedTaskArtifact();
+  const planTasks = extractPlanTasks(tasks.content);
+  const evidence = [{
+    id: "evidence-drifted-candidate",
+    turnId: "turn-plan",
+    runId: "run-child",
+    kind: "file",
+    target: "src/main.js",
+    value: "must not survive candidate drift",
+    createdAt: 90,
+  }];
+
+  const restored = normalizeSessionRuntimeSnapshot({
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionEvidenceLedger: evidence,
+    planExecutionEvidenceCount: evidence.length,
+    planExecutionProgressSnapshot: {
+      turnId: "turn-plan",
+      runId: "run-child",
+      parentRunId: "run-outer",
+      phase: "running",
+      currentTaskId: planTasks[0].id,
+      currentTask: planTasks[0].text,
+      iteration: 2,
+      maxIterations: 50,
+      autoResumeCount: 0,
+      updatedAt: 100,
+    },
+    harnessRunMarker: planHarnessMarker(),
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  }, exactPlanRestoreOptions);
+
+  assert.equal(restored.isPlanApproved, false);
+  assert.equal(restored.planStage, "plan");
+  assert.equal(restored.planExecutionProgressSnapshot, null);
+  assert.deepEqual(restored.planExecutionEvidenceLedger, []);
+  assert.equal(restored.planExecutionEvidenceCount, 0);
 });
 
 test("restore rewrites the exact owner pause boundary when an internal Plan choice request is cleared", () => {
@@ -3371,6 +3656,17 @@ test("terminal marker restore keeps the last final and demotes only earlier same
         turnId,
         content: "Older final",
         visibility: "assistant_final",
+        publicProgress: {
+          schemaVersion: 1,
+          kind: "assistant_commentary",
+          source: "model_visible_content",
+          sessionKey,
+          turnId,
+          displayTurnId: turnId,
+          runId,
+          parentRunId: null,
+          createdAt: 200,
+        },
       },
       {
         id: 602,
@@ -3380,6 +3676,17 @@ test("terminal marker restore keeps the last final and demotes only earlier same
         streaming: true,
         hiddenProcess: true,
         visibility: "assistant_final",
+        publicProgress: {
+          schemaVersion: 1,
+          kind: "assistant_commentary",
+          source: "model_visible_content",
+          sessionKey,
+          turnId,
+          displayTurnId: turnId,
+          runId,
+          parentRunId: null,
+          createdAt: 300,
+        },
       },
       {
         id: 603,
@@ -3421,7 +3728,10 @@ test("terminal marker restore keeps the last final and demotes only earlier same
   assert.equal(ownedFinals[0].content, "Canonical final");
   assert.equal(ownedFinals[0].streaming, false);
   assert.equal(ownedFinals[0].hiddenProcess, false);
-  assert.equal(restored.taskFlow.find((block) => block.id === 601)?.visibility, "assistant_update");
+  const demotedFinal = restored.taskFlow.find((block) => block.id === 601);
+  assert.equal(demotedFinal?.visibility, "assistant_update");
+  assert.equal(demotedFinal?.publicProgress, undefined);
+  assert.equal(ownedFinals[0].publicProgress, undefined);
   assert.deepEqual(restored.conversationTurns[0].blockIds, [601, 602]);
   assert.equal(
     restored.taskFlow.filter((block) =>
@@ -7581,9 +7891,8 @@ test("dispatcher applies exact pending-review approve and reject decisions witho
   }
 });
 
-test("an unrelated pending-review Turn cancels the old review, releases its claim, and then takes FIFO ownership", async () => {
+test("an unrelated durable Turn stays queued during pending review and takes FIFO ownership only after review conclusion", () => {
   const originalState = useAppStore.getState();
-  const realSendMessage = originalState.sendMessage;
   const workspace = "/tmp/session-pending-review-unrelated";
   const sessionId = 1_200;
   const sessionKey = `${workspace}:${sessionId}`;
@@ -7592,11 +7901,6 @@ test("an unrelated pending-review Turn cancels the old review, releases its clai
   const sourceRunId = "run-review-unrelated";
   const queue = buildQueuedWorkspaceTurn(sessionKey, sessionEpoch, "pending-review-unrelated", 91_001);
   const receipt = queue.entries[0].receipt;
-  let settleCancellation;
-  const cancellationSettlement = new Promise((resolve) => {
-    settleCancellation = resolve;
-  });
-  let cancellation = null;
   const reviewDecisions = [];
   const dispatchClaims = [];
   let sendInvocations = 0;
@@ -7646,18 +7950,9 @@ test("an unrelated pending-review Turn cancels the old review, releases its clai
       pendingReviewResolve: (decision) => reviewDecisions.push(decision),
       pendingReviewTaskId: 5,
       abortController: { abort() {} },
-      closeTurnAsCanceled: () => {
-        cancellation = beginSessionCancellation(
-          sessionKey,
-          sourceTurnId,
-          () => cancellationSettlement,
-        );
-        return true;
-      },
-      sendMessage: (text, images, options) => {
+      sendMessage: (_text, _images, options) => {
         sendInvocations += 1;
         dispatchClaims.push(options.workspaceInstructionClaim);
-        if (sendInvocations === 1) return realSendMessage(text, images, options);
         useAppStore.setState({ currentTurnId: options.turnIdOverride });
         return true;
       },
@@ -7666,46 +7961,47 @@ test("an unrelated pending-review Turn cancels the old review, releases its clai
 
     assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), false);
     let current = useAppStore.getState();
-    assert.deepEqual(reviewDecisions, [{ action: "reject" }]);
+    assert.deepEqual(reviewDecisions, []);
     assert.equal(current.workspaceTurnQueue.entries[0].status, "queued");
     assert.equal(current.queuedUserMessage, null);
-    assert.equal(sendInvocations, 1);
+    assert.equal(sendInvocations, 0);
 
     useAppStore.setState({
       agentStatus: "idle",
       isGenerating: false,
       currentTurnId: null,
+      conversationTurns: current.conversationTurns.map((turn) =>
+        turn.id === sourceTurnId
+          ? {
+              ...turn,
+              status: "done",
+              summary: "The pending review concluded before FIFO advanced.",
+              runtimeOutcome: {
+                status: "completed",
+                reason: "review_concluded",
+                resultKind: "canceled",
+                runId: sourceRunId,
+                parentRunId: null,
+                updatedAt: 2,
+              },
+            }
+          : turn
+      ),
       activeActionRequest: null,
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       abortController: null,
     });
-    settleCancellation({
-      sessionKey,
-      turnId: sourceTurnId,
-      terminalSettled: true,
-      disposition: "committed",
-      queueDisposition: "replay",
-    });
-    await cancellation.cancellation.promise;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
 
     current = useAppStore.getState();
-    assert.equal(sendInvocations, 2);
+    assert.deepEqual(reviewDecisions, []);
+    assert.equal(sendInvocations, 1);
     assert.equal(dispatchClaims[0].turnId, receipt.turnId);
-    assert.equal(dispatchClaims[1].turnId, receipt.turnId);
-    assert.notEqual(dispatchClaims[0].claimId, dispatchClaims[1].claimId);
+    assert.equal(dispatchClaims[0].receiptId, receipt.receiptId);
     assert.equal(current.workspaceTurnQueue.entries.length, 0);
     assert.equal(current.queuedUserMessage, null);
   } finally {
-    settleCancellation?.({
-      sessionKey,
-      turnId: sourceTurnId,
-      terminalSettled: true,
-      disposition: "test_cleanup",
-      queueDisposition: "discard",
-    });
-    await cancellation?.cancellation.promise.catch(() => {});
     useAppStore.setState(originalState, true);
   }
 });

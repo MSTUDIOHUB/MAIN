@@ -80,6 +80,7 @@ const {
 
 const {
   resolveStreamingAssistantDisplay,
+  shouldProjectStreamingAssistantToCapsule,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/streamDisplayPolicy.ts"));
 
 const {
@@ -88,11 +89,75 @@ const {
 
 const {
   hasGeneratedPlanContent,
+  isPlanCandidateBlock,
   isPlanGenerationFailureBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
+  shouldSuppressSupersededPlanCandidate,
   shouldSuppressAgentToolEcho,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatBlockVisibility.ts"));
+
+test("canonical plan artifact suppresses the superseded raw proposal in ChatArea", () => {
+  const candidate = {
+    id: 7,
+    type: "agent",
+    content: [
+      "<proposed_plan>",
+      "# 完整修复计划",
+      "## Change",
+      "- 修改 src/main.js 的文件打开事件，并修复新建文档标题状态。",
+      "## Verification",
+      "- 运行构建与文件打开回归测试。",
+      "</proposed_plan>",
+    ].join("\n"),
+    turnPhase: { id: "scope" },
+  };
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: candidate,
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), true);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: candidate,
+    hasReviewableArtifact: false,
+    ownsReviewableArtifact: true,
+  }), false);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: { ...candidate, turnPhase: { id: "review_ready" } },
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), false);
+});
+
+test("explicit assistant milestones are not hidden as superseded plan drafts", () => {
+  const milestone = {
+    id: 8,
+    type: "agent",
+    visibility: "assistant_update",
+    content: [
+      "### 修复计划已准备好",
+      "",
+      "**根本原因**：在 `src/main.js` 的 `createTab` 函数中，当创建新标签页时，代码不仅更新标签标题，还调用 `toolbar.setCurrentFile()` 更新工具栏路径。对于未保存文件，`file.path` 为空，但 `file.title` 仍是临时文档名，因此旧的计划草稿识别器也会把这段正式说明识别成计划候选。",
+      "",
+      "- S1 · 修复 createTab 中工具栏文件路径更新逻辑",
+      "- S2 · 修复 openFiles 后错误触发保存窗口的问题",
+      "",
+      "已绑定 8 条可信证据和 1 项验证；批准前不会修改项目。",
+    ].join("\n"),
+  };
+
+  assert.equal(isPlanCandidateBlock(milestone), true);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: milestone,
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), false);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: { ...milestone, visibility: undefined },
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), true);
+});
 
 const {
   buildReadContextEntries,
@@ -423,7 +488,7 @@ test("Gemma4 proposal markers and user options are protocol, not chat text", () 
   assert.equal(normalized.toolCalls[0].name, "read_file");
 });
 
-test("streaming display policy buffers short protocol/noise tokens in plan execution", () => {
+test("streaming display policy holds every preapproval Plan candidate outside Capsule", () => {
   const odd = resolveStreamingAssistantDisplay({
     text: "कल",
     language: "zh",
@@ -448,9 +513,14 @@ test("streaming display policy buffers short protocol/noise tokens in plan execu
     workflowMode: "plan",
     runIntent: "plan",
   });
-  assert.equal(plan.action, "show");
-  assert.match(plan.text, /# 修复计划/);
-  assert.doesNotMatch(plan.text, /PROPOSAL/);
+  assert.equal(plan.action, "buffer");
+  assert.equal(plan.text, "");
+  assert.match(plan.bufferText, /# 修复计划/);
+  assert.equal(plan.reason, "plan_candidate_pending_quality_gate");
+  assert.equal(shouldProjectStreamingAssistantToCapsule({
+    workflowMode: "plan",
+    runIntent: "plan",
+  }), false);
 
   const continuation = resolveStreamingAssistantDisplay({
     text: " world",
@@ -500,7 +570,7 @@ test("visual observation metadata never appears in streaming or final assistant 
   );
 });
 
-test("streaming display policy preserves normal markdown tables", () => {
+test("streaming display policy buffers Plan markdown tables until materialization", () => {
   const decision = resolveStreamingAssistantDisplay({
     text: "| 文件 | 状态 |\n| --- | --- |\n| src/App.tsx | 已读 |",
     language: "zh",
@@ -508,8 +578,9 @@ test("streaming display policy preserves normal markdown tables", () => {
     runIntent: "plan",
   });
 
-  assert.equal(decision.action, "show");
-  assert.match(decision.text, /\| 文件 \| 状态 \|/);
+  assert.equal(decision.action, "buffer");
+  assert.equal(decision.text, "");
+  assert.match(decision.bufferText, /\| 文件 \| 状态 \|/);
 });
 
 test("chat feedback normalizes statuses and classifies common errors", () => {

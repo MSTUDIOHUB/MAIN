@@ -253,16 +253,21 @@ export function buildSubagentSystemPrompt(input: {
   availableToolNames: string[];
   scopeKey: string;
   allowedPaths: string[];
+  accessMode: "read" | "write";
 }): string {
   const outputLanguage = languageName(input.language);
+  const writeMode = input.accessMode === "write";
   return [
-    "You are a bounded read-only MAIN subagent collecting evidence for one delegated scope.",
+    "You are a fresh one-shot MAIN subagent executing one immutable semantic task. Your runtime identity will be permanently closed afterward.",
     `Workspace: ${input.workspace || "none"}`,
     `Scope: ${input.scopeKey}`,
+    `Access mode: ${input.accessMode}`,
     `Allowed paths: ${input.allowedPaths.join(", ") || "none"}`,
     `Available tools: ${input.availableToolNames.join(", ") || "none"}`,
-    "Stay inside the allowed paths. Read/search only; do not write, run commands, request approval, spawn agents, or address the user.",
-    "Return concise findings with exact paths, evidence, uncertainty, and remaining work.",
+    writeMode
+      ? "Stay inside the exact inherited write lease. Use only the exposed structured read/search/mutation tools; do not run commands, request or expand approval, spawn agents, or address the user."
+      : "Stay inside the allowed paths. Read/search only; do not write, run commands, request approval, spawn agents, or address the user.",
+    "Return concise task results with exact paths, runtime-backed evidence, uncertainty, and remaining in-scope work.",
     `Write the report in ${outputLanguage}; keep paths and identifiers unchanged.`,
   ].join("\n");
 }
@@ -309,10 +314,12 @@ function buildIntentModule(input: {
 
   if (intent === "plan") {
     return makeSection("PLAN", [
-      "Gather only the read-only evidence needed to remove material uncertainty.",
-      "Describe the desired result, grounded current state, affected boundary, implementation path, and executable validation.",
+      "The runtime injects a versioned PLAN AUTHORING CONTRACT before every model step. Treat its canonical objective, acceptance criteria, current stage, and explicit violations as the single planning protocol.",
+      "Follow the fixed sequence: understand the objective, gather only decision-changing read-only evidence, draft against the declared criteria, revise only declared violations, then stop for review.",
+      "Before the first action, identify the exact objective, known inputs, and smallest material unknown from that contract. Do not begin with an unconstrained draft or broad repository scan.",
+      "The quality gate checks the criteria disclosed before drafting. A rejection may request evidence or revision, but must not silently redefine the user's task or acceptance boundary.",
       "Do not turn your own read/check/fix ordering into user choices. Ask only when a user-owned product, scope, technology, or priority decision blocks the plan.",
-      "When ready, output one visible `<proposed_plan>` Markdown block and stop. MAIN runtime, not the model, validates and materializes `.MAIN/plans/plan.md`.",
+      "When ready, submit one complete typed Plan graph through the transport declared by the latest injected [PLAN AUTHORING CONTRACT], then stop. MAIN runtime, not the model, validates it and renders `.MAIN/plans/plan.md`.",
       "For a multi-step turn, optionally give a brief user-facing update only when a material finding changes the plan. Do not narrate file reads, searches, or tool names.",
       "Do not edit source files or write plan artifacts before approval.",
     ]);

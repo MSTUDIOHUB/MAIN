@@ -5,6 +5,7 @@ import {
   type ToolExecutionPhase,
   type ToolPresentationLanguage,
 } from "./toolPresentation";
+import { classifyCommandResultOutcome } from "./planEvidence";
 import type { ResolvedUserIntent } from "./runIntent";
 
 export type ProgressNarrationPhase =
@@ -659,12 +660,20 @@ export function summarizeToolObservation(input: {
   const hasHiddenProcess = /hiddenprocess/i.test(result);
   const exitZero = /(?:exitCode|exit_code|code)["':\s]+0\b/i.test(result) || /\bexit(?:ed)?\s+(?:with\s+)?0\b/i.test(lower);
   const failed = /\b(?:error|failed|failure|timed out|exitCode["':\s]+[1-9]|exit_code["':\s]+[1-9])\b/i.test(result);
+  const finiteCommandOutcome = input.toolName === "run_command"
+    ? classifyCommandResultOutcome(input.toolName, result)
+    : null;
 
   if (language === "en") {
     if (input.noOp) return "No file change was needed because the target already matched the requested content.";
     if (hasHiddenProcess) return `Confirmed ${role} contains hiddenProcess-related visibility logic.`;
     if (input.toolName === "replace_in_file" || input.toolName === "write_file" || input.toolName === "apply_patch") return `Recorded the file change for ${role}; the diff is available as evidence.`;
-    if (input.toolName === "run_command" || input.toolName === "execute_command") {
+    if (input.toolName === "run_command") {
+      if (finiteCommandOutcome === "succeeded") return `Verification command for ${role} exited successfully.`;
+      if (finiteCommandOutcome === "failed") return `Command output for ${role} contains a failure signal that needs follow-up.`;
+      return `Command output for ${role} was captured for the next decision.`;
+    }
+    if (input.toolName === "execute_command") {
       if (exitZero && !failed) return `Verification command for ${role} exited successfully.`;
       if (failed) return `Command output for ${role} contains a failure signal that needs follow-up.`;
       return `Command output for ${role} was captured for the next decision.`;
@@ -686,7 +695,12 @@ export function summarizeToolObservation(input: {
   if (input.noOp) return "目标内容已经匹配，本次没有产生文件改动。";
   if (hasHiddenProcess) return `已确认 ${role} 包含 hiddenProcess 相关可见性逻辑。`;
   if (input.toolName === "replace_in_file" || input.toolName === "write_file" || input.toolName === "apply_patch") return `已记录 ${role} 的文件改动，diff 可作为证据。`;
-  if (input.toolName === "run_command" || input.toolName === "execute_command") {
+  if (input.toolName === "run_command") {
+    if (finiteCommandOutcome === "succeeded") return `${role}已成功退出，可作为验证通过证据。`;
+    if (finiteCommandOutcome === "failed") return `${role}输出里包含失败信号，需要继续处理。`;
+    return `已记录${role}的命令输出，用于判断下一步。`;
+  }
+  if (input.toolName === "execute_command") {
     if (exitZero && !failed) return `${role}已成功退出，可作为验证通过证据。`;
     if (failed) return `${role}输出里包含失败信号，需要继续处理。`;
     return `已记录${role}的命令输出，用于判断下一步。`;

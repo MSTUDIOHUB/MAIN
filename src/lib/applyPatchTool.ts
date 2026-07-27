@@ -453,22 +453,49 @@ export async function applyWorkspacePatch(
       error: `Delete File is not supported for ${firstDelete?.path || "this patch"}.`,
     };
   }
-  if (preview.changes.some((change) => change.kind === "add") && !io.writeNewFile) {
+  if (
+    preview.changes.some((change) => change.kind === "add") &&
+    (!io.writeNewFile || !io.deletePath)
+  ) {
     const firstAdd = preview.changes.find((change) => change.kind === "add");
     return {
       ok: false,
       changes: [],
-      error: `Atomic Add File is not supported for ${firstAdd?.path || "this patch"}.`,
+      error: `Atomic Add File create/rollback is not supported for ${firstAdd?.path || "this patch"}.`,
     };
   }
-  for (const change of preview.changes) {
-    if (change.kind === "delete") {
-      await io.deletePath!(change.path);
-    } else if (change.kind === "add") {
-      await io.writeNewFile!(change.path, change.newContent);
-    } else {
-      await io.writeFile(change.path, change.newContent);
+  const applied: ApplyPatchPreviewChange[] = [];
+  try {
+    for (const change of preview.changes) {
+      if (change.kind === "delete") {
+        await io.deletePath!(change.path);
+      } else if (change.kind === "add") {
+        await io.writeNewFile!(change.path, change.newContent);
+      } else {
+        await io.writeFile(change.path, change.newContent);
+      }
+      applied.push(change);
     }
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    for (const change of [...applied].reverse()) {
+      try {
+        if (change.kind === "add") {
+          await io.deletePath!(change.path);
+        } else {
+          await io.writeFile(change.path, change.oldContent);
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(
+          `${change.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      const original = error instanceof Error ? error.message : String(error);
+      throw new Error(`apply_patch failed (${original}) and rollback was incomplete: ${rollbackErrors.join("; ")}`);
+    }
+    throw error;
   }
   return preview;
 }

@@ -980,9 +980,9 @@ function startDeferredRealBootstrap(controller, input) {
         gameStudioInitialized: false,
         gameStudioConfigForTurn: null,
       }),
-      createWorkflowContext: (context) => context,
+      createRuntimeContext: (context) => context,
       startStreamingUi: () => {},
-      runWorkflowEngine: async () => {
+      runRuntime: async () => {
         input.capabilityStarts.engine += 1;
         input.capabilityStarts.tools += 1;
         return true;
@@ -1656,6 +1656,15 @@ test("failed clear terminalizes active and background owners before sequential r
   const { useAppStore } = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/useAppStore.ts"),
   );
+  const { createWorkspaceTurnQueueState } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/workspaceTurnQueue.ts"),
+  );
+  const { migrateLegacyQueuedMessageToWorkspaceTurn } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/workspaceLegacyQueueMigration.ts"),
+  );
+  const { reconcileWorkspaceInstructionProjection } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/workspaceInstructionProjection.ts"),
+  );
   const workspace = "/workspace-clear-owner-recovery";
   const activeSessionId = 703;
   const backgroundSessionId = 704;
@@ -1755,37 +1764,72 @@ test("failed clear terminalizes active and background owners before sequential r
       status: "queued",
     }],
   ]);
-  const activeController = createRealRuntimeOwnerController(useAppStore, activeSessionKey);
-  activeController.sessionSet({
+  const buildDurableQueuedTurn = ({
+    legacy,
+    sessionEpoch,
+    taskFlow,
+    conversationTurns,
+    userBlockId,
+  }) => {
+    const migration = migrateLegacyQueuedMessageToWorkspaceTurn({
+      legacy,
+      queue: createWorkspaceTurnQueueState({
+        sessionKey: legacy.sessionKey,
+        sessionEpoch,
+      }),
+      sessionKey: legacy.sessionKey,
+      sessionEpoch,
+      clientSubmissionId: `durable-${legacy.id}`,
+      receiptId: `receipt-${legacy.id}`,
+      turnId: `turn-${legacy.id}`,
+      userBlockId,
+      at: legacy.createdAt,
+    });
+    assert.equal(migration.disposition, "migrated");
+    const projection = reconcileWorkspaceInstructionProjection({
+      entry: migration.queue.entries[0],
+      taskFlow,
+      conversationTurns,
+      language: "zh",
+    });
+    assert.equal(projection.disposition, "ready");
+    return {
+      workspaceTurnQueue: migration.queue,
+      workspaceInstructionLedger: [migration.ledgerEntry],
+      taskFlow: projection.taskFlow,
+      conversationTurns: projection.conversationTurns,
+    };
+  };
+  const activeQueuedTurn = buildDurableQueuedTurn({
+    legacy: queuedBySessionKey.get(activeSessionKey),
+    sessionEpoch: `test-session-epoch-${activeSessionId}`,
     taskFlow: duplicateFinals(activeTurnId, 1001),
-    queuedUserMessage: queuedBySessionKey.get(activeSessionKey),
+    conversationTurns: [executionTurn(activeTurnId)],
+    userBlockId: 1301,
   });
-  const backgroundController = createRealRuntimeOwnerController(useAppStore, backgroundSessionKey);
-  backgroundController.sessionSet({
-    conversationTurns: [executionTurn(backgroundTurnId)],
-    currentTurnId: backgroundTurnId,
+  const backgroundQueuedTurn = buildDurableQueuedTurn({
+    legacy: queuedBySessionKey.get(backgroundSessionKey),
+    sessionEpoch: `test-session-epoch-${backgroundSessionId}`,
     taskFlow: duplicateFinals(backgroundTurnId, 1101),
-    runtimeEvents: [],
-    agentStatus: "running",
-    isGenerating: true,
-    queuedUserMessage: queuedBySessionKey.get(backgroundSessionKey),
+    conversationTurns: [executionTurn(backgroundTurnId)],
+    userBlockId: 1302,
   });
-  const closedController = createRealRuntimeOwnerController(useAppStore, closedSessionKey);
-  closedController.sessionSet({
-    conversationTurns: [{
-      ...executionTurn(closedTurnId),
-      status: "done",
-      summary: "already closed",
-      runtimeOutcome: {
-        status: "aborted",
-        reason: "already_closed",
-        resultKind: "canceled",
-        runId: "run-already-closed",
-        parentRunId: null,
-        updatedAt: 8,
-      },
-    }],
-    currentTurnId: closedTurnId,
+  const closedTurn = {
+    ...executionTurn(closedTurnId),
+    status: "done",
+    summary: "already closed",
+    runtimeOutcome: {
+      status: "aborted",
+      reason: "already_closed",
+      resultKind: "canceled",
+      runId: "run-already-closed",
+      parentRunId: null,
+      updatedAt: 8,
+    },
+  };
+  const closedQueuedTurn = buildDurableQueuedTurn({
+    legacy: queuedBySessionKey.get(closedSessionKey),
+    sessionEpoch: `test-session-epoch-${closedSessionId}`,
     taskFlow: [{
       id: 1201,
       turnId: closedTurnId,
@@ -1794,6 +1838,27 @@ test("failed clear terminalizes active and background owners before sequential r
       streaming: false,
       visibility: "assistant_final",
     }],
+    conversationTurns: [closedTurn],
+    userBlockId: 1303,
+  });
+  const activeController = createRealRuntimeOwnerController(useAppStore, activeSessionKey);
+  activeController.sessionSet({
+    ...activeQueuedTurn,
+    queuedUserMessage: null,
+  });
+  const backgroundController = createRealRuntimeOwnerController(useAppStore, backgroundSessionKey);
+  backgroundController.sessionSet({
+    ...backgroundQueuedTurn,
+    currentTurnId: backgroundTurnId,
+    runtimeEvents: [],
+    agentStatus: "running",
+    isGenerating: true,
+    queuedUserMessage: null,
+  });
+  const closedController = createRealRuntimeOwnerController(useAppStore, closedSessionKey);
+  closedController.sessionSet({
+    ...closedQueuedTurn,
+    currentTurnId: closedTurnId,
     runtimeEvents: [
       {
         schemaVersion: 2,
@@ -1826,7 +1891,7 @@ test("failed clear terminalizes active and background owners before sequential r
     ],
     agentStatus: "idle",
     isGenerating: false,
-    queuedUserMessage: queuedBySessionKey.get(closedSessionKey),
+    queuedUserMessage: null,
   });
   const oldOwners = [activeController, backgroundController, closedController].map((controller) => ({
     controller,
@@ -1903,13 +1968,25 @@ test("failed clear terminalizes active and background owners before sequential r
     assert.equal(runtime.taskFlow.filter((block) =>
       block.type === "agent" && block.turnId === turnId && block.visibility === "assistant_final"
     ).length, 1);
-    assert.deepEqual(runtime.queuedUserMessage, queuedBySessionKey.get(sessionKey));
+    assert.equal(runtime.queuedUserMessage, null);
+    const queuedEntry = runtime.workspaceTurnQueue.entries[0];
+    assert.equal(
+      queuedEntry.instruction.payload.text,
+      queuedBySessionKey.get(sessionKey).text,
+    );
+    assert.equal(queuedEntry.status, "queued");
+    assert.ok(runtime.conversationTurns.some((candidate) =>
+      candidate.id === queuedEntry.receipt.turnId &&
+      candidate.workspaceInstructionReceiptId === queuedEntry.receipt.receiptId
+    ));
     const sessionId = Number(sessionKey.slice(sessionKey.lastIndexOf(":") + 1));
-    assert.deepEqual(
-      recovered.sessionsByWorkspace[workspace]
-        .find((session) => session.id === sessionId)
-        .runtimeSnapshot.queuedUserMessage,
-      queuedBySessionKey.get(sessionKey),
+    const persistedSnapshot = recovered.sessionsByWorkspace[workspace]
+      .find((session) => session.id === sessionId)
+      .runtimeSnapshot;
+    assert.equal(persistedSnapshot.queuedUserMessage, null);
+    assert.equal(
+      persistedSnapshot.workspaceTurnQueue.entries[0].instruction.payload.text,
+      queuedBySessionKey.get(sessionKey).text,
     );
   }
   assert.equal(
@@ -1926,16 +2003,11 @@ test("failed clear terminalizes active and background owners before sequential r
     freshController.hasSessionRuntimeOwnership(freshController.getSessionRuntimeOwnerToken()),
     true,
   );
-  assert.deepEqual(
-    freshController.sessionGet().queuedUserMessage,
-    queuedBySessionKey.get(activeSessionKey),
-  );
-  assert.equal(useAppStore.getState().clearQueuedUserMessage({
-    expectedId: queuedBySessionKey.get(activeSessionKey).id,
-    disposition: "consumed",
-    reason: "clear_failure_recovery_test_consumed",
-  }), true);
   assert.equal(freshController.sessionGet().queuedUserMessage, null);
+  assert.equal(
+    freshController.sessionGet().workspaceTurnQueue.entries[0].instruction.payload.text,
+    queuedBySessionKey.get(activeSessionKey).text,
+  );
   assert.equal(activeController.hasSessionRuntimeOwnership(oldOwners[0].token), false);
 });
 

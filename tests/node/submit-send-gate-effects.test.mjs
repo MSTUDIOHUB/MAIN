@@ -144,7 +144,7 @@ test("send gate effects queue visible submissions while preserving context snaps
     images: ["data:image/png;base64,a"],
     mentionSnapshot: ["src/App.tsx"],
     attachedFilesSnapshot: ["/tmp/report.csv"],
-    queuedWorkflowContext: {
+    queuedRunContext: {
       runtimeIntentOverride: "goal",
       goalSourceContextSnapshot: "[plan_artifact]\n- 修复批准生命周期",
       goalCreationAuthorization: {
@@ -191,7 +191,7 @@ test("send gate effects preserve authorized Goal guidance without rebuilding it 
   };
   const result = harness.apply({
     text: "显示给用户的选择文本",
-    queuedWorkflowContext: {
+    queuedRunContext: {
       runtimeIntentOverride: "goal",
       goalContinuationAuthorization: authorization,
       goalContinuationGuidance: "精确注入 Goal 的用户指导",
@@ -260,6 +260,37 @@ test("send gate effects approve pending review reply options without queueing", 
   assert.deepEqual(harness.calls.queued, []);
   assert.equal(harness.calls.logs[0].event, "send_pending_review_approve_bypass");
   assert.equal(harness.calls.logs[0].data.pendingReviewTaskId, 42);
+});
+
+test("a durable workspace claim never leaks into the legacy latest-wins queue", () => {
+  const harness = createHarness({
+    agentStatus: "pending_review",
+    abortController: {},
+  });
+  const result = harness.apply({
+    text: "durable queued instruction",
+    options: {
+      workspaceInstructionClaim: {
+        claimId: "claim-a",
+        turnId: "turn-a",
+        receiptId: "receipt-a",
+      },
+    },
+  });
+
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.returnValue, false);
+  assert.equal(result.decision.action.kind, "queue");
+  assert.deepEqual(harness.calls.queued, []);
+  assert.deepEqual(harness.calls.logs, [{
+    event: "workspace_turn_send_gate_queue_rejected",
+    data: {
+      reason: "agent_running_or_pending_review",
+      claimId: "claim-a",
+      turnId: "turn-a",
+      receiptId: "receipt-a",
+    },
+  }]);
 });
 
 test("send gate effects reset stuck running state and continue submission", () => {

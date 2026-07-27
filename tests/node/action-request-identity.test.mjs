@@ -330,12 +330,17 @@ test("runtime restore revives only exact resumable action checkpoints", () => {
   assert.equal(actionRequestRestore.restorePendingActionRequest({
     request: planReview,
     runOwner: owner,
-    planIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
+    planReviewIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
   })?.requestId, planReview.requestId);
   assert.equal(actionRequestRestore.restorePendingActionRequest({
     request: planReview,
     runOwner: owner,
-    planIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
+    planIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
+  }), null, "a generic legacy identity cannot restore a Plan review control");
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: planReview,
+    runOwner: owner,
+    planReviewIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
   }), null);
 
   const confirmation = actionRequests.buildGoalConfirmationActionRequest({
@@ -653,6 +658,7 @@ test("tool review builds a run-owned permission request with an auditable target
     title: "Fix the viewer",
     taskId: 9,
     toolCall: {
+      toolCallId: "call-run-1",
       name: "run_command",
       arguments: { command: "npm test" },
       shellPermissionDecision: { requiresApproval: true },
@@ -661,6 +667,7 @@ test("tool review builds a run-owned permission request with an auditable target
   });
   assert.equal(request.kind, "tool_permission");
   assert.equal(request.taskId, 9);
+  assert.equal(request.toolCallId, "call-run-1");
   assert.equal(request.target, "npm test");
   assert.equal(request.risk, "shell");
   assert.equal(request.title, "Fix the viewer");
@@ -669,6 +676,57 @@ test("tool review builds a run-owned permission request with an auditable target
     turnId: "turn-1",
     runId: "run-1",
   }), true);
+});
+
+test("database review preserves the final risk and shows a bounded redacted SQL target", () => {
+  const request = pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: "session-db",
+    turnId: "turn-db",
+    runId: "run-db",
+    title: "Database change",
+    taskId: 10,
+    toolCall: {
+      name: "postgres_query",
+      arguments: {
+        sql: `DELETE FROM users WHERE access_token=super-secret ${"x".repeat(300)}`,
+      },
+      risk: "destructive",
+    },
+    now: 43,
+  });
+  assert.equal(request.risk, "destructive");
+  assert.match(request.target, /^DELETE FROM users WHERE access_token=\[redacted\]/);
+  assert.ok(request.target.length <= 240);
+  assert.equal(actionRequests.requiresPerCallToolPermissionApproval(request.risk), true);
+  assert.equal(actionRequests.requiresPerCallToolPermissionApproval("desktop_control"), true);
+  assert.equal(actionRequests.requiresPerCallToolPermissionApproval("external_write"), false);
+
+  const dangerousShell = pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: "session-shell",
+    turnId: "turn-shell",
+    runId: "run-shell",
+    title: "Dangerous shell",
+    taskId: 11,
+    toolCall: {
+      name: "run_command",
+      arguments: { command: "destructive command" },
+      risk: "destructive",
+      shellPermissionDecision: { requiresApproval: true },
+    },
+    now: 44,
+  });
+  assert.equal(dangerousShell.risk, "destructive");
+
+  const trailingDanger = `SELECT 1; ${"-- harmless prefix ".repeat(20)}\nDELETE FROM users`;
+  const disclosure = pendingToolReview.derivePendingReviewArgumentDisclosure(
+    "execute_query",
+    { sql: `${trailingDanger}; --password hunter2 -- Authorization: Basic dXNlcjpwYXNz` },
+  );
+  assert.ok(disclosure);
+  assert.equal(disclosure.summaryTruncated, true);
+  assert.match(disclosure.detail, /DELETE FROM users/);
+  assert.doesNotMatch(disclosure.detail, /hunter2|dXNlcjpwYXNz/);
+  assert.match(disclosure.detail, /\[redacted\]/);
 });
 
 function planExecutionProvenance(overrides = {}) {
@@ -1066,6 +1124,89 @@ test("visible pending tool review resolves only the request exact task and turn"
   assert.equal(fallback.target, "npm test");
 });
 
+test("visible pending tool review cannot reuse a stale tool call from the same task and turn", () => {
+  const request = pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    title: "Fix the viewer",
+    taskId: 9,
+    toolCall: {
+      toolCallId: "call-current",
+      name: "run_command",
+      arguments: { command: "npm test" },
+    },
+    now: 42,
+  });
+  const staleTask = {
+    id: 9,
+    turnId: "turn-1",
+    toolCallId: "call-stale",
+    type: "tool",
+    toolName: "run_command",
+    target: "npm run destructive-stale-command",
+    status: "pending_review",
+    toolStatus: "pending",
+    message: "Waiting",
+  };
+
+  const resolved = pendingToolReview.resolveVisiblePendingToolReview({
+    taskFlow: [staleTask],
+    request,
+    pendingReviewTaskId: 9,
+    pendingToolCall: {
+      toolCallId: "call-current",
+      name: "run_command",
+      arguments: { command: "npm test" },
+    },
+    activeDiffTask: staleTask,
+  });
+
+  assert.equal(resolved.toolCallId, "call-current");
+  assert.equal(resolved.target, "npm test");
+  assert.notEqual(resolved.target, staleTask.target);
+});
+
+test("pending tool review ownership never downgrades an explicit call id and legacy matching is exact", () => {
+  const baseTask = {
+    id: 9,
+    turnId: "turn-1",
+    type: "tool",
+    toolName: "run_command",
+    target: "npm test",
+    status: "pending_review",
+    toolStatus: "pending",
+    message: "Waiting",
+  };
+  const owner = {
+    taskId: 9,
+    turnIds: ["turn-1"],
+    toolCallId: "call-current",
+    toolName: "run_command",
+    target: "npm test",
+  };
+
+  assert.equal(pendingToolReview.isExactPendingToolReviewOwner({
+    ...baseTask,
+    toolCallId: "call-stale",
+  }, owner), false, "same name and target cannot rescue an explicit id miss");
+  assert.equal(pendingToolReview.isExactPendingToolReviewOwner({
+    ...baseTask,
+    toolCallId: "call-current",
+  }, owner), true);
+
+  const legacyOwner = { ...owner, toolCallId: undefined };
+  assert.equal(pendingToolReview.isExactPendingToolReviewOwner(baseTask, legacyOwner), true);
+  assert.equal(pendingToolReview.isExactPendingToolReviewOwner({
+    ...baseTask,
+    target: "npm run stale",
+  }, legacyOwner), false);
+  assert.equal(pendingToolReview.isExactPendingToolReviewOwner({
+    ...baseTask,
+    toolName: "execute_command",
+  }, legacyOwner), false);
+});
+
 test("plan approval identity changes whenever a reviewable artifact changes", () => {
   const artifact = {
     kind: "plan",
@@ -1084,6 +1225,8 @@ test("plan approval identity changes whenever a reviewable artifact changes", ()
     artifact.path,
     String(artifact.revision),
     artifact.content,
+    "legacy-no-candidate",
+    "",
   ].join("\u001f");
   assert.equal(
     first.artifactHash,

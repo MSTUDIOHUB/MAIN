@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
   IconCheck,
   IconClose,
@@ -114,8 +114,13 @@ export default function SubagentsPanel({
     [runs, selectedId],
   );
   const activeCount = runs.filter((run) => isSubagentActiveStatus(run.status)).length;
-  const completedCount = runs.filter((run) => run.status === "completed").length;
   const endedCount = runs.length - activeCount;
+  const activeRuns = runs.filter((run) => isSubagentActiveStatus(run.status));
+  const doneRuns = runs.filter((run) => !isSubagentActiveStatus(run.status));
+  const projectedRuns = [
+    ...[...activeRuns].reverse().map((run) => ({ run, section: "active" as const })),
+    ...[...doneRuns].reverse().map((run) => ({ run, section: "done" as const })),
+  ];
 
   return (
     <div data-testid="subagents-panel" className={`flex h-full min-h-0 flex-col ${isLight ? "bg-[#ffffff] text-[#202124]" : "bg-[#050505] text-[#e4e4e7]"}`}>
@@ -127,12 +132,12 @@ export default function SubagentsPanel({
             <div className="mt-0.5 text-[14px] font-semibold">{activeCount} / {capacityPolicy.maxActiveRequests}</div>
           </div>
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "已完成" : "Completed"}</div>
-            <div className="mt-0.5 text-[14px] font-semibold">{completedCount}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "已归档" : "Done"}</div>
+            <div className="mt-0.5 text-[14px] font-semibold">{endedCount}</div>
           </div>
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "本轮上限" : "Turn cap"}</div>
-            <div className="mt-0.5 text-[14px] font-semibold">{capacityPolicy.maxCreatedPerTurn}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "本轮总数" : "Total"}</div>
+            <div className="mt-0.5 text-[14px] font-semibold">{runs.length}</div>
           </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -177,11 +182,26 @@ export default function SubagentsPanel({
           <div className={`px-3 py-6 text-center text-[12px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`}>
             {language === "zh" ? "当前任务尚未创建子智能体。" : "No subagents have been created for this task."}
           </div>
-        ) : [...runs].reverse().map((run) => {
+        ) : projectedRuns.map(({ run, section }, projectedIndex) => {
           const isSelected = selected?.id === run.id;
+          const startsSection = projectedIndex === 0 ||
+            projectedRuns[projectedIndex - 1]?.section !== section;
           return (
+            <Fragment key={`${section}:${run.id}`}>
+              {startsSection && (
+                <div
+                  data-testid={`subagent-section-${section}`}
+                  className={`px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${
+                    isLight ? "text-[#5f6368]" : "text-[#71717a]"
+                  }`}
+                >
+                  {section === "active"
+                    ? language === "zh" ? `活跃 ${activeCount}` : `Active ${activeCount}`
+                    : language === "zh" ? `已完成 ${endedCount}` : `Done ${endedCount}`}
+                </div>
+              )}
             <button
-              key={run.id}
+              data-subagent-section={section}
               type="button"
               data-testid={`subagent-list-item-${run.id}`}
               aria-pressed={isSelected}
@@ -207,6 +227,7 @@ export default function SubagentsPanel({
                 </span>
               </span>
             </button>
+            </Fragment>
           );
         })}
       </div>
@@ -225,6 +246,11 @@ export default function SubagentsPanel({
               <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
                 {selected.role} · {formatTime(selected.startedAt || selected.createdAt, language)} · {formatDuration(selected, language)}
               </div>
+              {selected.collaborationTaskId && (
+                <div className={`mt-1 break-all font-mono text-[9px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`}>
+                  {selected.workItem?.taskKind || "task"} · {selected.collaborationTaskId}
+                </div>
+              )}
               {(selected.observationCount !== undefined || selected.evidenceCount !== undefined) && (
                 <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
                   {language === "zh"

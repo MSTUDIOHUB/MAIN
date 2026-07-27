@@ -25,6 +25,11 @@ export interface SubmitSendGateEffectOptions {
   executionConsentGranted?: boolean;
   runtimeIntentOverride?: string | null;
   turnIdOverride?: string | null;
+  workspaceInstructionClaim?: {
+    claimId?: string;
+    turnId?: string;
+    receiptId?: string;
+  } | null;
 }
 
 export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEffectsState> {
@@ -37,7 +42,7 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   state: TState;
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
-  queuedWorkflowContext?: {
+  queuedRunContext?: {
     runtimeIntentOverride?: ResolvedRunIntent;
     goalSourceContextSnapshot?: string;
     goalCreationAuthorization?: GoalCreationAuthorization;
@@ -106,6 +111,24 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
   }
 
   if (decision.action.kind === "queue") {
+    if (input.options?.workspaceInstructionClaim) {
+      // The durable workspace FIFO already owns this exact Turn. Never copy a
+      // claimed head into the legacy latest-wins slot: the dispatcher will
+      // release the claim and retry the same FIFO head after the active owner
+      // settles.
+      input.logStoreEvent("workspace_turn_send_gate_queue_rejected", {
+        reason: decision.action.reason,
+        claimId: input.options.workspaceInstructionClaim.claimId || null,
+        turnId: input.options.workspaceInstructionClaim.turnId || null,
+        receiptId: input.options.workspaceInstructionClaim.receiptId || null,
+      });
+      return {
+        decision,
+        shouldContinue: false,
+        returnValue: false,
+        state: input.state,
+      };
+    }
     if (input.isHidden && input.options?.executionConsentGranted === true) {
       input.logStoreEvent("send_busy_hidden_execution_rejected", {
         reason: decision.action.reason,
@@ -122,7 +145,7 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
     input.queueUserMessage(input.text, input.images, {
       contextMentions: input.mentionSnapshot,
       attachedFiles: input.attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
-      ...input.queuedWorkflowContext,
+      ...input.queuedRunContext,
     });
     input.logStoreEvent("send_queued", {
       reason: decision.action.reason,

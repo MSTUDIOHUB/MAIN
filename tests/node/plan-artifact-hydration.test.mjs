@@ -177,7 +177,7 @@ test("hydrates existing .MAIN/plans artifacts and tasks from a reader", async ()
   assert.equal(hydrated.tasks[0].evidence[0].value, "src/lib/orchestrator.ts");
 });
 
-test("hydrates design-only plans without requiring requirements.md", async () => {
+test("hydrates design-only legacy plans without requiring requirements.md or tasks.md", async () => {
   const files = new Map([
     [
       ".MAIN/plans/plan.md",
@@ -202,7 +202,12 @@ test("hydrates design-only plans without requiring requirements.md", async () =>
   ]);
   assert.equal(hydrated.artifacts[0].kind, "plan");
   assert.equal(hydrated.hasTasksArtifact, false);
-  assert.equal(hydrated.tasks.length, 0);
+  assert.equal(hydrated.tasks.length, 3);
+  assert.deepEqual(
+    hydrated.artifacts[0].legacyTaskProjection?.map((task) => task.id),
+    hydrated.tasks.map((task) => task.id),
+  );
+  assert.equal(hydrated.tasks.some((task) => task.executionKind === "validation"), true);
 });
 
 test("available path filter avoids probing missing optional tasks.md", async () => {

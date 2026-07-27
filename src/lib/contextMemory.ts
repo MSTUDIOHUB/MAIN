@@ -204,14 +204,30 @@ function extractToolCallSummary(toolCall: unknown): ToolCallSummary | null {
   return { id, name: name || "tool_call", args: parseJsonObject(rawArgs) };
 }
 
-function buildToolCallLookup(messages: ContextMemoryMessage[]): Map<string, ToolCallSummary> {
-  const lookup = new Map<string, ToolCallSummary>();
-  for (const message of messages) {
-    if (!Array.isArray(message.tool_calls)) continue;
-    for (const toolCall of message.tool_calls) {
-      const summary = extractToolCallSummary(toolCall);
-      if (summary?.id) lookup.set(summary.id, summary);
+function buildToolCallLookup(messages: ContextMemoryMessage[]): Map<number, ToolCallSummary> {
+  const lookup = new Map<number, ToolCallSummary>();
+  const pendingById = new Map<string, ToolCallSummary[]>();
+  const latestById = new Map<string, ToolCallSummary>();
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
+    if (Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        const summary = extractToolCallSummary(toolCall);
+        if (!summary?.id) continue;
+        const pending = pendingById.get(summary.id) || [];
+        pending.push(summary);
+        pendingById.set(summary.id, pending);
+        latestById.set(summary.id, summary);
+      }
     }
+
+    if (message.role !== "tool" || !message.tool_call_id) continue;
+    const pending = pendingById.get(message.tool_call_id) || [];
+    const matched = pending.shift() || latestById.get(message.tool_call_id);
+    if (pending.length > 0) pendingById.set(message.tool_call_id, pending);
+    else pendingById.delete(message.tool_call_id);
+    if (matched) lookup.set(messageIndex, matched);
   }
   return lookup;
 }
@@ -281,11 +297,11 @@ function extractCheckboxProgress(text: string, source: ContextMemorySource, upda
 function extractToolEvidence(
   message: ContextMemoryMessage,
   messageIndex: number,
-  lookup: Map<string, ToolCallSummary>,
+  lookup: Map<number, ToolCallSummary>,
   updatedAt: number,
 ): { evidence?: ContextMemoryEntry; file?: ContextMemoryFileEntry; blocker?: ContextMemoryEntry; next?: ContextMemoryEntry } {
   if (message.role !== "tool") return {};
-  const tool = message.tool_call_id ? lookup.get(message.tool_call_id) : undefined;
+  const tool = lookup.get(messageIndex);
   const content = contextMemoryContentToText(message.content);
   const parsedFeedback = parseToolFeedbackEnvelope(content);
   const feedback = parsedFeedback?.envelope;
@@ -294,8 +310,14 @@ function extractToolEvidence(
   const args = tool?.args || {};
   const contentForMemory = body || content;
   const hash = stableContextHash(contentForMemory).slice(0, 8);
-  const path = readRecordString(args, ["path", "file", "target", "workspace", "cwd"]) || (feedback?.target && /^(?:\.{0,2}\/|[A-Za-z0-9_.-]+\/|[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$)/.test(feedback.target) ? feedback.target : "");
-  const command = readRecordString(args, ["command", "cmd", "query", "pattern"]) || (!path ? feedback?.target || "" : "");
+  const feedbackTarget = String(feedback?.target || "").trim();
+  const feedbackPath = feedbackTarget && /^(?:\.{0,2}\/|[A-Za-z0-9_.-]+\/|[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$)/.test(feedbackTarget)
+    ? feedbackTarget
+    : "";
+  const path = feedbackPath || readRecordString(args, ["path", "file", "target", "workspace", "cwd"]);
+  const command = !path
+    ? feedbackTarget || readRecordString(args, ["command", "cmd", "query", "pattern"])
+    : "";
   const target = path || command;
   const baseSource = sourceFor(message, messageIndex, {
     toolName,
@@ -333,7 +355,7 @@ function extractToolEvidence(
   const result: { evidence?: ContextMemoryEntry; file?: ContextMemoryFileEntry; blocker?: ContextMemoryEntry; next?: ContextMemoryEntry } = {
     evidence: entry(evidenceText, baseSource, updatedAt) || undefined,
   };
-  if (path && /read_file|get_file_outline|write_file|replace_in_file|delete_workspace_path/i.test(toolName)) {
+  if (path && status !== "failed" && /read_file|get_file_outline|write_file|replace_in_file|delete_workspace_path/i.test(toolName)) {
     const fileText = `${path} via ${toolName}; hash=${hash}; ${contentForMemory.length.toLocaleString()} chars`;
     const fileEntry = entry(fileText, baseSource, updatedAt);
     if (fileEntry) result.file = { ...fileEntry, path, hash };

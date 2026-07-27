@@ -89,6 +89,40 @@ test("published model final remains canonical while durable evidence determines 
   assert.deepEqual(result.execution.validations, ["run_command: npm test"]);
 });
 
+test("a later successful retry reconciles the same failed validation in durable context", () => {
+  const failedValidation = {
+    ...validationBlock,
+    id: 30,
+    status: "error",
+    toolStatus: "failed",
+    message: JSON.stringify({
+      command: "npm test",
+      exitCode: 1,
+      stdout: "1 test failed",
+      stderr: "",
+    }),
+  };
+  const successfulRetry = {
+    ...validationBlock,
+    id: 31,
+    message: JSON.stringify({
+      command: "npm test",
+      exitCode: 0,
+      stdout: "12 tests passed",
+      stderr: "",
+    }),
+  };
+  const result = resolveCompletedTurnFinalPresentation({
+    turnBlocks: [userBlock, writeBlock, failedValidation, successfulRetry],
+    publishedModelFinalText: "修复完成，测试已通过。",
+    language: "zh",
+  });
+
+  assert.equal(result.source, "model_final");
+  assert.deepEqual(result.execution.validations, ["run_command: npm test"]);
+  assert.deepEqual(result.execution.failures, []);
+});
+
 test("tool-only completion gets a deterministic Codex-style final from durable evidence", () => {
   const result = resolveCompletedTurnFinalPresentation({
     turnBlocks: [userBlock, writeBlock, validationBlock],
@@ -464,61 +498,6 @@ test("non-completed and legacy outcome labels never synthesize a success final",
   assert.equal(shouldCommitCompletedTurnFinalPresentation({ outcomeStatus: "completed" }), true);
 });
 
-test("canonical result kinds route success finals separately from blocked error and canceled conclusions", () => {
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const terminalStart = workflowSource.indexOf("const commitTerminalProjectionBeforeStatusPublication = async");
-  const terminalCommit = workflowSource.indexOf(
-    "durableState = await persistCurrentSessionRuntime(terminalDraftState)",
-    terminalStart,
-  );
-  const terminalRouting = workflowSource.slice(terminalStart, terminalCommit);
-  const closedConclusionStart = workflowSource.indexOf("const ensureClosedTurnConclusion");
-  const pausedConclusionStart = workflowSource.indexOf(
-    "const ensurePausedTurnFinalPresentation",
-    closedConclusionStart,
-  );
-  const closedConclusion = workflowSource.slice(closedConclusionStart, pausedConclusionStart);
-
-  assert.ok(terminalStart >= 0 && terminalCommit > terminalStart);
-  assert.match(
-    terminalRouting,
-    /outcome\.status === "completed" &&\s*\(outcome\.resultKind === "success" \|\| outcome\.resultKind === "partial"\)/,
-  );
-  assert.match(
-    terminalRouting,
-    /else if \(!isSameTurnExecutionContinuation\) \{\s*finalText = ensureClosedTurnConclusion\(outcome, draft\);/,
-  );
-  assert.match(
-    closedConclusion,
-    /resultKind !== "error" && resultKind !== "blocked" && resultKind !== "canceled"/,
-  );
-  assert.match(closedConclusion, /resultKind === "canceled"/);
-  assert.match(closedConclusion, /resultKind === "blocked"/);
-});
-
-test("partial terminal outcomes retain a truthful unfinished explanation", () => {
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const durableContextStart = workflowSource.indexOf("const commitTerminalTurnContext =");
-  const durableContextEnd = workflowSource.indexOf(
-    "const terminalTurn = latestState.conversationTurns.find",
-    durableContextStart,
-  );
-  const durableContextSource = workflowSource.slice(durableContextStart, durableContextEnd);
-
-  assert.ok(durableContextStart >= 0 && durableContextEnd > durableContextStart);
-  assert.match(durableContextSource, /loopOutcome\.resultKind === "partial"/);
-  assert.match(
-    durableContextSource,
-    /lastNonActionableStopDiagnostic\?\.nextStep \|\| loopOutcome\.reason/,
-  );
-});
-
 test("recoverable no-progress pauses commit a partial assistant final", () => {
   assert.equal(shouldCommitPausedTurnFinalPresentation({
     outcomeStatus: "paused",
@@ -538,103 +517,4 @@ test("recoverable no-progress pauses commit a partial assistant final", () => {
   ]) {
     assert.equal(shouldCommitPausedTurnFinalPresentation(input), false, JSON.stringify(input));
   }
-});
-
-test("execute batch-loop exhaustion commits a paused final without mutation evidence", () => {
-  assert.equal(shouldCommitPausedTurnFinalPresentation({
-    outcomeStatus: "paused",
-    recoveryReason: "execute_no_progress_batch_loop",
-    hasDurableMutationEvidence: false,
-  }), true);
-
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const pausedFinalStart = workflowSource.indexOf("const ensurePausedTurnFinalPresentation");
-  const pausedFinalEnd = workflowSource.indexOf("const projectHarnessForAgentLoopOutcome", pausedFinalStart);
-  const pausedFinalSource = workflowSource.slice(pausedFinalStart, pausedFinalEnd);
-  assert.match(pausedFinalSource, /outcome\.reason !== "execute_no_progress_batch_loop"/);
-  assert.match(
-    pausedFinalSource,
-    /outcome\.reason === "execute_recovery_no_progress_limit"[\s\S]*durableMutationEvidence\.length === 0/,
-  );
-  assert.match(pausedFinalSource, /visibility: "assistant_final" as const/);
-});
-
-test("pause then completion reuses one assistant_final for the same logical turn", () => {
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const completedStart = workflowSource.indexOf("const ensureCompletedTurnFinalPresentation");
-  const completedEnd = workflowSource.indexOf("const ensurePausedTurnFinalPresentation", completedStart);
-  const completedSource = workflowSource.slice(completedStart, completedEnd);
-  const pausedStart = completedEnd;
-  const pausedEnd = workflowSource.indexOf("const projectHarnessForAgentLoopOutcome", pausedStart);
-  const pausedSource = workflowSource.slice(pausedStart, pausedEnd);
-
-  assert.match(pausedSource, /const existingTerminalFinalBlock = \[\.\.\.turnBlocks\]\.reverse\(\)\.find/);
-  assert.match(pausedSource, /const finalBlockId = existingTerminalFinalBlock\?\.id \?\? current\._nextTaskId\(\)/);
-  assert.match(completedSource, /const reusableFinalBlock = matchingPublishedBlock \|\| existingTerminalFinalBlock \|\| null/);
-  assert.match(completedSource, /const finalBlockId = reusableFinalBlock\?\.id \?\? current\._nextTaskId\(\)/);
-  assert.match(
-    completedSource,
-    /block\.visibility === "assistant_final"[\s\S]*block\.id !== finalBlockId[\s\S]*visibility: "assistant_update"/,
-  );
-});
-
-test("workflow terminal contract routes canonical conclusions through supported ChatArea statuses", () => {
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-  const chatSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
-
-  assert.match(workflowSource, /if \(outcome\.status !== "completed"\) return null;/);
-  assert.match(workflowSource, /shouldCommitCompletedTurnFinalPresentation\(\{/);
-  assert.match(workflowSource, /shouldCommitPausedTurnFinalPresentation\(\{/);
-  assert.match(workflowSource, /ensurePausedTurnFinalPresentation\(outcome, draft\)/);
-  assert.match(workflowSource, /emitLocalPlanExecutionProgress\("paused",\s*\{/);
-  assert.match(workflowSource, /paused_turn_final_presentation_staged/);
-  assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
-  assert.match(workflowSource, /visibility: "assistant_final" as const/);
-  assert.match(workflowSource, /completedTurnHasChanges \? "completed_with_changes" : "done"/);
-  assert.match(workflowSource, /collectPlanTaskTerminalProjection\(\{/);
-  assert.match(workflowSource, /resolveTerminalTurnOwnership\(\{/);
-  assert.match(workflowSource, /candidate\.id === terminalOwnership\.ownerTurnId/);
-  assert.match(workflowSource, /advisories: planTerminalProjection\.advisories/);
-  assert.match(workflowSource, /availableToolNames: terminalAvailableToolNames/);
-  assert.doesNotMatch(workflowSource, /filter\(\(task: any\) => task\.evidenceStatus !== "satisfied"\)/);
-  assert.doesNotMatch(workflowSource, /outcome\.status === "completed"\s*\? "completed"/);
-  assert.match(storeSource, /\.\.\.\(b\.visibility \? \{ visibility: b\.visibility \} : \{\}\)/);
-  assert.match(storeSource, /block\.visibility !== "assistant_final"/);
-  assert.match(chatSource, /block\.visibility === "assistant_final"/);
-  assert.match(chatSource, /isPausedWithFinalConclusion/);
-  assert.match(chatSource, /data-testid=\{block\.visibility === "assistant_final" \? "assistant-final" : undefined\}/);
-});
-
-test("Feishu completion cards are emitted only after completed terminal commitment", () => {
-  const workflowSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
-    "utf8",
-  );
-  const callbackStart = workflowSource.indexOf("onAssistantFinalText:");
-  const callbackEnd = workflowSource.indexOf("onToolExecuting:", callbackStart);
-  const callbackSource = workflowSource.slice(callbackStart, callbackEnd);
-  const terminalStart = workflowSource.indexOf("return prepareSubagentsForNewTurn().then(executeLoopStrategy)");
-  const terminalCommit = workflowSource.indexOf("const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(", terminalStart);
-  const terminalCommitGuard = workflowSource.indexOf("if (!terminalProjection.committed)", terminalCommit);
-  const committedFinal = workflowSource.indexOf("const completedFinalTextForRemote = terminalProjection.finalText", terminalCommitGuard);
-  const completionCard = workflowSource.indexOf('feishuCardTitle: language === "en" ? "Task Complete" : "任务处理完成"', committedFinal);
-
-  assert.notEqual(callbackStart, -1);
-  assert.ok(callbackEnd > callbackStart);
-  assert.doesNotMatch(callbackSource, /Task Complete|任务处理完成/);
-  assert.match(callbackSource, /remoteFeishu && awaitingInput[\s\S]*?"Input Required"[\s\S]*?"需要用户选择"/);
-  assert.ok(terminalCommit > terminalStart);
-  assert.ok(terminalCommitGuard > terminalCommit);
-  assert.ok(committedFinal > terminalCommitGuard);
-  assert.ok(completionCard > committedFinal);
 });

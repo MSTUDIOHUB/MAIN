@@ -3,6 +3,7 @@ import {
   detectPlanArtifactKind,
   type PlanArtifactKind,
 } from "./workflowModels";
+import type { PlanCandidateV2 } from "./planContract";
 
 type SyncedPlanArtifactKind = Exclude<PlanArtifactKind, "summary">;
 
@@ -15,13 +16,19 @@ export interface ResolvedPlanArtifactUpdate {
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
 
 export interface PlanArtifactSyncCallbacks {
-  onPlanArtifactUpdated: (path: string, content: string, kind: SyncedPlanArtifactKind) => void;
+  onPlanArtifactUpdated: (
+    path: string,
+    content: string,
+    kind: SyncedPlanArtifactKind,
+    metadata?: { candidate?: PlanCandidateV2 },
+  ) => void;
   onPlanTasksUpdated: (content: string) => void;
 }
 
 export interface PlanArtifactSyncOptions {
   readFile: (path: string) => Promise<string>;
   warn?: (message: string, error?: unknown) => void;
+  candidate?: PlanCandidateV2;
 }
 
 function getPlanArtifactTarget(
@@ -82,8 +89,13 @@ export async function resolvePlanArtifactAfterToolSuccess(
 export function commitResolvedPlanArtifactUpdate(
   update: ResolvedPlanArtifactUpdate,
   callbacks: PlanArtifactSyncCallbacks,
+  metadata?: { candidate?: PlanCandidateV2 },
 ): void {
-  callbacks.onPlanArtifactUpdated(update.path, update.content, update.kind);
+  if (metadata?.candidate) {
+    callbacks.onPlanArtifactUpdated(update.path, update.content, update.kind, metadata);
+  } else {
+    callbacks.onPlanArtifactUpdated(update.path, update.content, update.kind);
+  }
   if (update.kind === "tasks" || update.kind === "bugfix") {
     callbacks.onPlanTasksUpdated(update.content);
   }
@@ -97,5 +109,9 @@ export async function syncPlanArtifactAfterToolSuccess(
 ): Promise<void> {
   const update = await resolvePlanArtifactAfterToolSuccess(toolName, toolArgs, options);
   if (!update) return;
-  commitResolvedPlanArtifactUpdate(update, callbacks);
+  commitResolvedPlanArtifactUpdate(
+    update,
+    callbacks,
+    options.candidate ? { candidate: options.candidate } : undefined,
+  );
 }

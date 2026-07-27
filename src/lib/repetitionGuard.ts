@@ -1,6 +1,7 @@
 export interface RecentToolCall {
   name: string;
   argsKey: string;
+  readOnly?: boolean;
 }
 
 export interface RecentTargetToolCall {
@@ -107,8 +108,14 @@ export function registerToolCallForRepeatGuard(
   const threshold = isShellInspection ? 3 : readOnly ? 4 : 3;
   const argsKey = buildRepeatLoopArgsKey(args);
 
-  history.push({ name, argsKey });
-  if (history.length > threshold + 2) history.shift();
+  history.push({ name, argsKey, readOnly });
+  const maxReadOnlyCycleLength = 3;
+  const historyLimit = readOnly
+    ? Math.max(threshold + 2, threshold * maxReadOnlyCycleLength)
+    : threshold + 2;
+  if (history.length > historyLimit) {
+    history.splice(0, history.length - historyLimit);
+  }
 
   if (history.length >= threshold) {
     const lastN = history.slice(-threshold);
@@ -116,6 +123,31 @@ export function registerToolCallForRepeatGuard(
       (call) => call.name === lastN[0].name && call.argsKey === lastN[0].argsKey,
     );
     if (repeated) {
+      return {
+        repeated: true,
+        threshold,
+        argsKey,
+        signature: buildRepeatLoopSignature(name, argsKey),
+      };
+    }
+  }
+
+  // Alternating read-only observations can form the same no-progress loop as
+  // one consecutive call (for example status/diff/status/diff). Require a
+  // complete 2- or 3-call cycle to repeat at the ordinary read-only threshold,
+  // and let any intervening write/validation action break the cycle.
+  if (readOnly) {
+    for (let cycleLength = 2; cycleLength <= maxReadOnlyCycleLength; cycleLength += 1) {
+      const windowLength = cycleLength * threshold;
+      if (history.length < windowLength) continue;
+      const window = history.slice(-windowLength);
+      if (!window.every((call) => call.readOnly === true)) continue;
+      const periodic = window.every((call, index) => {
+        if (index < cycleLength) return true;
+        const prior = window[index - cycleLength];
+        return call.name === prior.name && call.argsKey === prior.argsKey;
+      });
+      if (!periodic) continue;
       return {
         repeated: true,
         threshold,

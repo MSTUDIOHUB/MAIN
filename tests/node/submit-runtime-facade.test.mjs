@@ -53,6 +53,7 @@ const {
   buildOwnerScopedDurableSessionPatch,
   createSubmitPreRunSessionPatcher,
   createSubmitSessionRuntimeFacade,
+  preserveSubmitSessionRuntimeOwnership,
   startSubmitElapsedTimer,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitRuntimeFacade.ts"),
@@ -66,6 +67,13 @@ const {
   buildPlanApprovalIdentity,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"),
+);
+const {
+  createDraftPlanCandidate,
+  hashPlanCandidate,
+  sealPlanCandidate,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planContract.ts"),
 );
 const {
   persistHarnessRunMarker,
@@ -173,8 +181,11 @@ function buildAcceptedControllerPlan(label) {
     "## User goal",
     `- ${label}: keep the reviewed Plan bound to the exact materialized bytes.`,
     "",
+    "## Confirmed evidence",
+    "- [E1] `src/runtime.ts` is the owner-scoped mutation target represented by this fixture.",
+    "",
     "## Key changes",
-    "- Update the same plan artifact path while preserving a monotonic revision.",
+    "- [C1] Update `src/runtime.ts` through the same owner-scoped Plan while preserving a monotonic revision.",
     "- Refresh the pending review request so a control rendered for older bytes is stale.",
     "",
     "## Execution steps",
@@ -183,9 +194,79 @@ function buildAcceptedControllerPlan(label) {
     "3. Require the refreshed identity before execution can be approved.",
     "",
     "## Validation",
-    "- Assert the revision, artifact hash, artifact paths, and request id all describe the latest write.",
+    "- [V1] Run `node --test tests/node/submit-runtime-facade.test.mjs` and require exit code 0 so revision, artifact hash, paths, and request id all describe the latest write.",
     "",
   ].join("\n");
+}
+
+function buildTypedControllerCandidate(planContent = buildAcceptedControllerPlan("Typed revision")) {
+  const authoringContract = {
+    version: 7,
+    contractId: "controller-plan-contract",
+    objective: "Keep owner-scoped Plan commits bound to typed runtime work.",
+    facets: [{ id: "G1", index: 1, text: "Commit the typed Plan." }],
+    contextTargets: [],
+    reusableEvidenceTargets: [],
+    imageCount: 0,
+    diagnosisRequired: false,
+    criteria: [],
+  };
+  const bundle = {
+    bundleId: "controller-plan-bundle",
+    hash: "controller-plan-bundle-hash",
+    turnId: "turn-1",
+    objective: authoringContract.objective,
+    constraints: [],
+    facts: [{
+      id: "E1",
+      tool: "read_file",
+      target: "src/runtime.ts",
+      summary: "The runtime target is owned by the accepted Plan.",
+      hash: "controller-e1",
+    }],
+    changeTargets: ["src/runtime.ts"],
+    verificationTargets: [],
+  };
+  const draft = createDraftPlanCandidate({
+    content: planContent,
+    bundle,
+    authoringContract,
+    summary: ["Use the shared typed commit contract."],
+    findings: [],
+    diagnoses: [],
+    changes: [{
+      text: "[C1] Modify src/runtime.ts through the approved runtime task.",
+      targetRef: "src/runtime.ts",
+      evidenceRefs: ["E1"],
+    }],
+    interfaces: [],
+    tests: ["V1"],
+    assumptions: [],
+    blockingChoices: [],
+  });
+  return sealPlanCandidate({
+    candidate: draft,
+    content: planContent,
+    runtimeTasks: [{
+      id: "controller-validation",
+      text: "[V1] Run the controller regression test.",
+      status: "pending",
+      executionKind: "validation",
+      requirementRef: "G1",
+      validation: [{
+        kind: "finite_command",
+        acceptance: "required",
+        command: "node --test tests/node/submit-runtime-facade.test.mjs",
+        capability: "test",
+        segments: [{
+          command: "node --test tests/node/submit-runtime-facade.test.mjs",
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      }],
+    }],
+  });
 }
 
 function buildPlanToolControllerFixture() {
@@ -197,6 +278,7 @@ function buildPlanToolControllerFixture() {
     path: artifactPath,
     title: "Plan",
     content: buildAcceptedControllerPlan("Approved revision"),
+    legacyTaskProjection: [],
     revision: 1,
     updatedAt: 100,
   };
@@ -1052,6 +1134,60 @@ test("a recreated Session with the same runtime key cannot inherit an old facade
   assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].agentStatus, "idle");
 });
 
+test("ordinary snapshots preserve only the exact Session generation owner", () => {
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/run",
+      currentSessionId: 42,
+      runtimeBySessionKey: {},
+      sessionsByWorkspace: {
+        "/tmp/run": [{ id: 42, planLifecycleEpoch: "epoch-old" }],
+      },
+      currentTurnId: "turn-owner",
+      agentStatus: "running",
+      elapsedTime: 1,
+      taskFlow: [],
+    },
+  };
+  const facade = createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/run:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  facade.seedSessionRuntime();
+  const ownerToken = facade.getSessionRuntimeOwnerToken();
+  const previous = stateRef.current.runtimeBySessionKey["/tmp/run:42"];
+
+  stateRef.current = {
+    ...stateRef.current,
+    runtimeBySessionKey: {
+      ...stateRef.current.runtimeBySessionKey,
+      "/tmp/run:42": preserveSubmitSessionRuntimeOwnership(
+        previous,
+        createRuntimeFromState({ ...stateRef.current, elapsedTime: 2 }),
+        "epoch-old",
+      ),
+    },
+  };
+  assert.equal(facade.hasSessionRuntimeOwnership(ownerToken), true);
+  assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].elapsedTime, 2);
+
+  stateRef.current = {
+    ...stateRef.current,
+    runtimeBySessionKey: {
+      ...stateRef.current.runtimeBySessionKey,
+      "/tmp/run:42": preserveSubmitSessionRuntimeOwnership(
+        stateRef.current.runtimeBySessionKey["/tmp/run:42"],
+        createRuntimeFromState({ ...stateRef.current, elapsedTime: 3 }),
+        "epoch-new",
+      ),
+    },
+  };
+  assert.equal(facade.hasSessionRuntimeOwnership(ownerToken), false);
+});
+
 test("durable Session patch excludes mutable metadata returned by a save adapter", () => {
   const projectedState = {
     sessionsByWorkspace: {
@@ -1254,11 +1390,16 @@ test("submit session runtime controller advances Plan revision and refreshes pen
   });
 
   const artifactPath = ".MAIN/plans/plan.md";
+  const firstContent = buildAcceptedControllerPlan("First typed revision");
+  const firstCandidate = buildTypedControllerCandidate(firstContent);
   controller.sessionGet().upsertPlanArtifact({
     kind: "plan",
     path: artifactPath,
     title: "Plan",
-    content: buildAcceptedControllerPlan("First revision"),
+    content: firstContent,
+    candidate: firstCandidate,
+    candidateHash: hashPlanCandidate(firstCandidate),
+    authoringContractId: firstCandidate.authoringContractId,
     revision: 41,
     updatedAt: 100,
   });
@@ -1272,11 +1413,16 @@ test("submit session runtime controller advances Plan revision and refreshes pen
   assert.notEqual(firstReviewRequest.artifactHash, staleReviewRequest.artifactHash);
   assert.notEqual(firstReviewRequest.requestId, staleReviewRequest.requestId);
 
+  const secondContent = buildAcceptedControllerPlan("Second typed revision");
+  const secondCandidate = buildTypedControllerCandidate(secondContent);
   controller.sessionGet().upsertPlanArtifact({
     kind: "plan",
     path: artifactPath,
     title: "Plan",
-    content: buildAcceptedControllerPlan("Second revision"),
+    content: secondContent,
+    candidate: secondCandidate,
+    candidateHash: hashPlanCandidate(secondCandidate),
+    authoringContractId: secondCandidate.authoringContractId,
     revision: 41,
     updatedAt: 200,
   });
@@ -1307,6 +1453,128 @@ test("submit session runtime controller advances Plan revision and refreshes pen
     },
   );
   assert.equal(stateRef.current.isPlanApproved, false);
+});
+
+test("submit session runtime controller never refreshes a Plan review from a legacy import", () => {
+  const staleReviewRequest = {
+    schemaVersion: 1,
+    requestId: "action-plan-review-legacy-stale",
+    kind: "plan_review",
+    sessionKey: "/tmp/app:42",
+    turnId: "turn-1",
+    runId: "run-plan",
+    parentRunId: null,
+    title: "Review Plan",
+    status: "pending",
+    createdAt: 0,
+    planRevision: 99,
+    artifactHash: "plan-stale",
+    artifactPaths: [".MAIN/plans/plan.md"],
+  };
+  const stateRef = {
+    current: createControllerState({ activeActionRequest: staleReviewRequest }),
+  };
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/app:42",
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "plan",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: () => {},
+  });
+
+  controller.sessionGet().upsertPlanArtifact({
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: buildAcceptedControllerPlan("Legacy imported revision"),
+    legacyTaskProjection: [],
+    revision: 1,
+    updatedAt: 100,
+  });
+
+  assert.equal(stateRef.current.planArtifacts.length, 1);
+  assert.equal(stateRef.current.planLifecycle.artifactIdentity?.revision, 1);
+  assert.equal(stateRef.current.activeActionRequest, null);
+});
+
+test("owner-scoped Plan commit validates typed identity and derives typed runtime tasks", () => {
+  const events = [];
+  const stateRef = { current: createControllerState() };
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/app:42",
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "plan",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: (event, data) => events.push({ event, data }),
+    nowMs: () => 500,
+  });
+  const planContent = buildAcceptedControllerPlan("Typed owner-scoped revision");
+  const candidate = buildTypedControllerCandidate(planContent);
+
+  controller.sessionGet().upsertPlanArtifact({
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: planContent,
+    candidate,
+    candidateHash: hashPlanCandidate(candidate),
+    authoringContractId: candidate.authoringContractId,
+    updatedAt: 100,
+  });
+
+  assert.equal(stateRef.current.planArtifacts.length, 1);
+  assert.equal(stateRef.current.planArtifacts[0].revision, 1);
+  assert.equal(stateRef.current.planArtifacts[0].candidateHash, hashPlanCandidate(candidate));
+  assert.equal(
+    stateRef.current.planArtifacts[0].authoringContractId,
+    candidate.authoringContractId,
+  );
+  assert.equal(
+    stateRef.current.planTasks.some((task) => task.executionKind === "mutation"),
+    true,
+  );
+  assert.equal(
+    stateRef.current.planTasks.some((task) => task.executionKind === "validation"),
+    true,
+  );
+
+  const revisedCandidate = {
+    ...candidate,
+    assumptions: ["A reviewed typed-only change"],
+  };
+  controller.sessionGet().upsertPlanArtifact({
+    ...stateRef.current.planArtifacts[0],
+    candidate: revisedCandidate,
+    candidateHash: hashPlanCandidate(revisedCandidate),
+    authoringContractId: revisedCandidate.authoringContractId,
+    updatedAt: 200,
+  });
+  assert.equal(stateRef.current.planArtifacts[0].revision, 2);
+  assert.equal(
+    stateRef.current.planArtifacts[0].candidateHash,
+    hashPlanCandidate(revisedCandidate),
+  );
+
+  const acceptedArtifact = stateRef.current.planArtifacts[0];
+  controller.sessionGet().upsertPlanArtifact({
+    ...acceptedArtifact,
+    candidateHash: "plan-candidate-stale",
+    updatedAt: 300,
+  });
+  assert.equal(stateRef.current.planArtifacts[0], acceptedArtifact);
+  assert.equal(
+    events.some((entry) =>
+      entry.event === "plan_artifact_rejected_by_typed_contract_gate" &&
+      entry.data?.candidateHashMismatch === true
+    ),
+    true,
+  );
 });
 
 test("Plan artifact changes reject and clear the exact pending Plan tool permission", () => {

@@ -66,30 +66,6 @@ test("resolving a plan artifact does not publish it before the caller accepts qu
   ]]);
 });
 
-test("orchestrator commits resolved plan bytes only after the quality gate accepts them", () => {
-  const source = fs.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const resolveIndex = source.indexOf("const resolvedPlanArtifactUpdate = await resolvePlanArtifactAfterToolSuccess(");
-  const acceptanceIndex = source.indexOf("let planArtifactAccepted = true;", resolveIndex);
-  const rejectionIndex = source.indexOf("planArtifactAccepted = false;", acceptanceIndex);
-  const guardedCommitIndex = source.indexOf(
-    "if (resolvedPlanArtifactUpdate && planArtifactAccepted)",
-    rejectionIndex,
-  );
-  const commitIndex = source.indexOf("commitResolvedPlanArtifactUpdate(", guardedCommitIndex);
-
-  assert.ok(resolveIndex >= 0, "expected exact plan bytes to be resolved");
-  assert.ok(acceptanceIndex > resolveIndex, "expected a separate artifact acceptance state");
-  assert.ok(rejectionIndex > acceptanceIndex, "expected failed validation to reject publication");
-  assert.ok(guardedCommitIndex > rejectionIndex, "expected commit to run after validation");
-  assert.ok(commitIndex > guardedCommitIndex, "expected the guarded commit helper");
-  assert.match(source.slice(rejectionIndex, guardedCommitIndex), /storePublished:\s*false/);
-  assert.match(
-    source,
-    /export function isSuccessfulPlanArtifactWriteResult[\s\S]{0,220}!result\.internalFeedback/,
-    "a quality-rejected disk write must not become a successful Plan artifact result",
-  );
-});
-
 test("write_file sync uses the accepted content without a redundant disk read", async () => {
   let reads = 0;
   const updates = [];

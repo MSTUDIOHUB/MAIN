@@ -38,6 +38,9 @@ function loadTranspiledModuleSync(sourcePath) {
 const { commitCanceledTurn } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/commitCanceledTurn.ts"),
 );
+const { captureCanceledTurnControlPlaneFence } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/canceledTurnProjection.ts"),
+);
 const { createSubmitSessionRuntimeController } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitSessionRuntimeController.ts"),
 );
@@ -97,7 +100,6 @@ function createState(overrides = {}) {
 
 function createHarness(overrides = {}) {
   let state = createState(overrides.state);
-  const expectedAbortController = state.abortController ?? null;
   let revisionToken = {};
   let nextTaskId = 2;
   const order = [];
@@ -118,7 +120,12 @@ function createHarness(overrides = {}) {
       runId: "run-1",
       reason: "user_cancelled",
       message: "Canceled and closed.",
-      expectedAbortController,
+      controlPlaneFence: captureCanceledTurnControlPlaneFence({
+        state,
+        sessionKey: "session-1",
+        turnId: "turn-1",
+        runId: "run-1",
+      }),
       nextTaskId: () => nextTaskId++,
       sessionGet: () => state,
       getSessionRevisionToken: () => revisionToken,
@@ -336,11 +343,83 @@ test("an already-closed cleanup retries fail closed after a successor controller
   const result = await commitCanceledTurn(harness.input);
 
   assert.equal(result.committed, true);
-  assert.equal(result.disposition, "already_closed_durable");
+  assert.equal(result.disposition, "already_closed");
   assert.equal(result.attempts, 2);
   assert.equal(publishAttempts, 1);
-  assert.deepEqual(harness.order, ["persist", "publish", "persist"]);
+  assert.deepEqual(harness.order, ["persist", "publish"]);
   assert.equal(harness.state.abortController, successorController);
+  assert.equal(harness.state.isGenerating, true);
+  assert.equal(harness.state.agentStatus, "running");
+});
+
+test("an already-closed cleanup cannot clear a replacement attempt that keeps the controller", async () => {
+  const terminalState = createState({
+    conversationTurns: [{
+      ...createState().conversationTurns[0],
+      status: "done",
+    }],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Already complete.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      createState().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Already complete.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+  });
+  const harness = createHarness({ state: terminalState });
+  let publishAttempts = 0;
+  let successorMarker = null;
+  harness.input.publishProjection = () => {
+    publishAttempts += 1;
+    harness.order.push("publish");
+    successorMarker = {
+      ...harness.state.harnessRunMarker,
+      runId: "lease-attempt-2",
+      activeRunId: "run-1",
+      instanceId: "instance-attempt-2",
+    };
+    harness.setState({
+      ...harness.state,
+      harnessRunMarker: successorMarker,
+      isGenerating: true,
+      agentStatus: "running",
+    });
+    harness.replaceRevision();
+    return { published: false, disposition: "revision_conflict" };
+  };
+
+  const result = await commitCanceledTurn(harness.input);
+
+  assert.equal(result.committed, true);
+  assert.equal(result.disposition, "already_closed");
+  assert.equal(result.attempts, 2);
+  assert.equal(publishAttempts, 1);
+  assert.deepEqual(harness.order, ["persist", "publish"]);
+  assert.equal(harness.state.harnessRunMarker, successorMarker);
+  assert.equal(harness.state.abortController, terminalState.abortController);
   assert.equal(harness.state.isGenerating, true);
   assert.equal(harness.state.agentStatus, "running");
 });
@@ -660,7 +739,12 @@ test("deferred cancellation publishes the old terminal before a same-key control
       runId: "run-1",
       reason: "superseded_by_new_user_turn",
       message: "The old Turn was canceled and closed.",
-      expectedAbortController: cancellationController.sessionGet().abortController ?? null,
+      controlPlaneFence: captureCanceledTurnControlPlaneFence({
+        state: cancellationController.sessionGet(),
+        sessionKey,
+        turnId: "turn-1",
+        runId: "run-1",
+      }),
       nextTaskId: () => 2,
       sessionGet: cancellationController.sessionGet,
       getSessionRevisionToken: cancellationController.getSessionRevisionToken,

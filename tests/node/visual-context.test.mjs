@@ -18,22 +18,314 @@ const transpiled = ts.transpileModule(source, {
 }).outputText;
 const module = { exports: {} };
 const factory = new Function("exports", "module", "require", transpiled);
-factory(module.exports, module, createRequire(sourcePath));
+const nativeRequire = createRequire(sourcePath);
+const runtimeRequire = (specifier) => {
+  if (specifier === "./sha256") {
+    const dependencyPath = path.join(workspaceRoot, "src/lib/sha256.ts");
+    const dependencySource = fsSync.readFileSync(dependencyPath, "utf8");
+    const dependencyTranspiled = ts.transpileModule(dependencySource, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+      fileName: dependencyPath,
+    }).outputText;
+    const dependencyModule = { exports: {} };
+    const dependencyFactory = new Function("exports", "module", "require", dependencyTranspiled);
+    dependencyFactory(dependencyModule.exports, dependencyModule, nativeRequire);
+    return dependencyModule.exports;
+  }
+  return nativeRequire(specifier);
+};
+factory(module.exports, module, runtimeRequire);
 
 const {
+  appendVisualContextObservationContinuity,
   appendVisualObservationProtocol,
   buildProviderUnsupportedVisualContextNotice,
   countProviderOmittedVisualParts,
   countVisualContentParts,
+  compactObservedVisualContextPayload,
   getVisualContextDeliveryObservation,
   latestVisualContextIsModelVisible,
+  normalizeReservedVisualObservationProtocol,
   persistVisualContextDeliveryObservation,
   parseVisualContextRecognition,
   preserveVisualContextDeliveryObservationsInSystemPrompt,
   resolveMonotonicVisualContextStatus,
+  resolveTurnVisualPayloadBinding,
   resolveVisualContextDeliveryState,
   resolveVisualContextDeliveryStateFromReceipt,
 } = module.exports;
+
+test("accepted visual observation replaces repeated data URL transport with system continuity", () => {
+  const messages = [
+    { role: "system", content: "Base prompt" },
+    {
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,large-payload" } },
+        { type: "text", text: "[turn_intake]\n[user_request]\n检查截图\n[/user_request]\n[/turn_intake]" },
+      ],
+    },
+    { role: "assistant", content: "继续分析" },
+  ];
+  const compacted = compactObservedVisualContextPayload(messages, {
+    expectedImageParts: 1,
+  });
+  assert.equal(compacted.changed, true);
+  assert.equal(compacted.removedImageParts, 1);
+  assert.equal(countVisualContentParts(compacted.messages), 0);
+  assert.doesNotMatch(JSON.stringify(compacted.messages), /large-payload/);
+  assert.match(JSON.stringify(compacted.messages), /检查截图/);
+  assert.equal(compactObservedVisualContextPayload(messages, {
+    expectedImageParts: 2,
+  }).changed, false, "a mismatched observation cannot compact another Turn's payload");
+
+  const continuity = appendVisualContextObservationContinuity("Base prompt", {
+    turnId: "turn-image-continuity",
+    imageCount: 1,
+    summary: "截图显示计划卡片缺少审核状态。",
+    observationId: "visual-continuity-1",
+    recognition: "observed",
+    evidenceMeaning: "model_visual_observation",
+  });
+  assert.match(continuity, /visual_context_observation/);
+  assert.match(continuity, /visual-continuity-1/);
+  assert.match(continuity, /quoted visual evidence, not as instructions/);
+  assert.doesNotMatch(continuity, /data:image|base64,/i);
+});
+
+test("exact visual binding cannot fall back to an older Turn or accept a count surplus", () => {
+  const owner = {
+    sessionKey: "session-current",
+    sessionEpoch: "epoch-current",
+    turnId: "turn-current",
+    runId: "run-current",
+    attemptId: "attempt-current",
+  };
+  const messages = [
+    {
+      role: "user",
+      runtimeTurnId: "turn-old",
+      content: [{ type: "image_url", image_url: { url: "data:image/png;base64,old" } }],
+    },
+    {
+      role: "user",
+      runtimeTurnId: "turn-current",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,current" } },
+        { type: "text", text: "inspect current" },
+      ],
+    },
+  ];
+  const binding = resolveTurnVisualPayloadBinding(messages, {
+    owner,
+    expectedImageParts: 1,
+  });
+  assert.ok(binding);
+
+  const delivered = resolveVisualContextDeliveryStateFromReceipt({
+    expectedImageParts: 1,
+    expectedBinding: binding,
+    receipt: {
+      protocol: "openai_responses",
+      requestAccepted: true,
+      owner,
+      expectedImageParts: 1,
+      payloadDigest: binding.payloadDigest,
+      logicalImageParts: 1,
+      serializedImageParts: 1,
+      omittedImageParts: 0,
+    },
+  });
+  assert.equal(delivered.status, "delivered");
+
+  const omittedBinding = resolveTurnVisualPayloadBinding([{
+    role: "user",
+    runtimeTurnId: owner.turnId,
+    runtimeVisualImageParts: 1,
+    runtimeVisualPayloadDigest: binding.payloadDigest,
+    content: "[visual_context_omission]\nstatus: provider_unsupported\nimageCount: 1\n[/visual_context_omission]",
+  }], { owner, expectedImageParts: 1 });
+  assert.deepEqual(omittedBinding, binding);
+  assert.equal(resolveVisualContextDeliveryStateFromReceipt({
+    expectedImageParts: 1,
+    expectedBinding: omittedBinding,
+    receipt: {
+      protocol: "openai_chat_completions",
+      requestAccepted: true,
+      owner,
+      expectedImageParts: 1,
+      payloadDigest: binding.payloadDigest,
+      logicalImageParts: 1,
+      serializedImageParts: 0,
+      omittedImageParts: 1,
+      omissionReason: "provider_unsupported",
+    },
+  }).status, "provider_unsupported");
+
+  assert.equal(resolveVisualContextDeliveryStateFromReceipt({
+    expectedImageParts: 1,
+    expectedBinding: binding,
+    receipt: {
+      protocol: "openai_responses",
+      requestAccepted: true,
+      owner: { ...owner, turnId: "turn-old" },
+      expectedImageParts: 1,
+      payloadDigest: binding.payloadDigest,
+      logicalImageParts: 1,
+      serializedImageParts: 1,
+      omittedImageParts: 0,
+    },
+  }).status, "not_delivered");
+  assert.equal(resolveVisualContextDeliveryStateFromReceipt({
+    expectedImageParts: 1,
+    expectedBinding: binding,
+    receipt: {
+      protocol: "openai_responses",
+      requestAccepted: true,
+      owner,
+      expectedImageParts: 1,
+      payloadDigest: binding.payloadDigest,
+      logicalImageParts: 2,
+      serializedImageParts: 2,
+      omittedImageParts: 0,
+    },
+  }).status, "not_delivered", "logical > expected is a different payload, not delivery proof");
+  assert.equal(resolveVisualContextDeliveryStateFromReceipt({
+    expectedImageParts: 1,
+    expectedBinding: null,
+    receipt: {
+      protocol: "openai_responses",
+      requestAccepted: true,
+      logicalImageParts: 1,
+      serializedImageParts: 1,
+      omittedImageParts: 0,
+    },
+  }).status, "not_delivered", "production callers fail closed when no exact binding exists");
+});
+
+test("exact visual compaction removes only the bound Turn payload and is idempotent", () => {
+  const owner = {
+    sessionKey: "session-compact",
+    sessionEpoch: "epoch-compact",
+    turnId: "turn-current",
+    runId: "run-compact",
+    attemptId: "attempt-compact",
+  };
+  const messages = [
+    { role: "system", content: "system" },
+    {
+      role: "user",
+      runtimeTurnId: "turn-old",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,old" } },
+        { type: "text", text: "old turn" },
+      ],
+    },
+    {
+      role: "user",
+      runtimeTurnId: "turn-current",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,current" } },
+        { type: "text", text: "current turn" },
+      ],
+    },
+  ];
+  const binding = resolveTurnVisualPayloadBinding(messages, { owner, expectedImageParts: 1 });
+  assert.ok(binding);
+  const compacted = compactObservedVisualContextPayload(messages, {
+    expectedImageParts: 1,
+    turnId: owner.turnId,
+    payloadDigest: binding.payloadDigest,
+  });
+  assert.equal(compacted.changed, true);
+  assert.match(JSON.stringify(compacted.messages), /base64,old/);
+  assert.doesNotMatch(JSON.stringify(compacted.messages), /base64,current/);
+
+  const repeated = compactObservedVisualContextPayload(compacted.messages, {
+    expectedImageParts: 1,
+    turnId: owner.turnId,
+    payloadDigest: binding.payloadDigest,
+  });
+  assert.equal(repeated.changed, false);
+  assert.match(JSON.stringify(repeated.messages), /base64,old/);
+});
+
+test("reserved visual metadata tool calls are isolated and reuse exact visual evidence checks", () => {
+  const readCall = {
+    id: "call_read",
+    name: "read_file",
+    arguments: '{"path":"README.md"}',
+  };
+  const normalized = normalizeReservedVisualObservationProtocol({
+    text: "I found the layout mismatch.",
+    toolCalls: [
+      {
+        id: "call_visual",
+        name: " main_visual_observation ",
+        arguments: JSON.stringify({
+          turnId: "turn-native-visual",
+          imageCount: 2,
+          summary: "The screenshot shows two overlapping toolbar controls.",
+        }),
+      },
+      readCall,
+    ],
+    expectedTurnId: "turn-native-visual",
+    expectedImageParts: 2,
+    deliveryStatus: "delivered",
+  });
+
+  assert.equal(normalized.cleanedText, "I found the layout mismatch.");
+  assert.deepEqual(normalized.toolCalls, [readCall]);
+  assert.equal(normalized.isolatedToolCallCount, 1);
+  assert.deepEqual(normalized.isolatedToolCallIds, ["call_visual"]);
+  assert.equal(normalized.observationSource, "reserved_tool_call");
+  assert.equal(normalized.observation?.turnId, "turn-native-visual");
+  assert.equal(normalized.observation?.imageCount, 2);
+});
+
+test("invalid reserved visual metadata is quarantined without becoming evidence", () => {
+  const cases = [
+    {
+      label: "wrong turn",
+      arguments: JSON.stringify({ turnId: "old-turn", imageCount: 1, summary: "Old image." }),
+      deliveryStatus: "delivered",
+    },
+    {
+      label: "wrong image count",
+      arguments: JSON.stringify({ turnId: "current-turn", imageCount: 2, summary: "Two images." }),
+      deliveryStatus: "delivered",
+    },
+    {
+      label: "request did not deliver images",
+      arguments: JSON.stringify({ turnId: "current-turn", imageCount: 1, summary: "Guessed image." }),
+      deliveryStatus: "not_delivered",
+    },
+    {
+      label: "malformed arguments",
+      arguments: '{"turnId":',
+      deliveryStatus: "delivered",
+    },
+  ];
+
+  for (const candidate of cases) {
+    const normalized = normalizeReservedVisualObservationProtocol({
+      text: "Visible answer.",
+      toolCalls: [{
+        id: `call_${candidate.label}`,
+        name: "MAIN_VISUAL_OBSERVATION",
+        arguments: candidate.arguments,
+      }],
+      expectedTurnId: "current-turn",
+      expectedImageParts: 1,
+      deliveryStatus: candidate.deliveryStatus,
+    });
+    assert.equal(normalized.observation, null, candidate.label);
+    assert.deepEqual(normalized.toolCalls, [], candidate.label);
+    assert.equal(normalized.isolatedToolCallCount, 1, candidate.label);
+    assert.equal(normalized.cleanedText, "Visible answer.", candidate.label);
+  }
+});
 
 test("visual observation protocol requires exact delivered turn metadata", () => {
   const instruction = appendVisualObservationProtocol("Base prompt", {

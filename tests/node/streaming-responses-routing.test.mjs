@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 import ts from "typescript";
 
@@ -245,6 +246,47 @@ test("a Rust stream installs its abort listener before dispatching start", async
   assert.equal(listeners.size, 0);
 });
 
+test("a Rust stream receives the caller-owned phase timeout", async () => {
+  const listeners = new Map();
+  let startArgs = null;
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    startArgs = args;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: args.streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  await streamChatCompletion(
+    [{ role: "user", content: "bounded request" }],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: () => {} },
+    undefined,
+    undefined,
+    undefined,
+    { timeoutMs: 12_345 },
+  );
+
+  assert.equal(startArgs?.timeoutMs, 12_345);
+  assert.equal(listeners.size, 0);
+});
+
 test("OpenAI Responses reports image delivery from the accepted serialized request", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
@@ -279,6 +321,60 @@ test("OpenAI Responses reports image delivery from the accepted serialized reque
     serializedImageParts: 1,
     omittedImageParts: 0,
   });
+});
+
+test("owner-bound visual receipts never borrow an older Turn image", async () => {
+  const { streamChatCompletion } = await loadStreamingModule(async () =>
+    JSON.stringify({ output_text: "no current image" })
+  );
+  const owner = {
+    sessionKey: "session-current",
+    sessionEpoch: "epoch-current",
+    turnId: "turn-current",
+    runId: "run-current",
+    attemptId: "attempt-current",
+  };
+  const expectedCurrentDigest = createHash("sha256")
+    .update(JSON.stringify(["base64:CURRENT"]))
+    .digest("hex");
+  const result = await streamChatCompletion(
+    [
+      {
+        role: "user",
+        runtimeTurnId: "turn-old",
+        content: [{ type: "image_url", image_url: { url: "data:image/png;base64,OLD" } }],
+      },
+      {
+        role: "user",
+        runtimeTurnId: "turn-current",
+        content: "Current payload was compacted before this request",
+      },
+    ],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+    undefined,
+    undefined,
+    undefined,
+    {
+      visualTransportBinding: {
+        owner,
+        expectedImageParts: 1,
+        payloadDigest: expectedCurrentDigest,
+      },
+    },
+  );
+
+  assert.deepEqual(result.visualTransportReceipt?.owner, owner);
+  assert.equal(result.visualTransportReceipt?.logicalImageParts, 0);
+  assert.equal(result.visualTransportReceipt?.serializedImageParts, 0);
+  assert.notEqual(result.visualTransportReceipt?.payloadDigest, expectedCurrentDigest);
 });
 
 test("OpenAI Responses gateway timeouts preserve the current image in aggressive structured fallback", async () => {
@@ -935,6 +1031,91 @@ test("local Rust stream read errors fall back to a non-streaming request", async
     omittedImageParts: 0,
   });
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream", "proxy_request"]);
+});
+
+test("a local frontend response body terminated mid-stream retries once through Rust", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push({ command, args });
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: 'data: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}\n\n',
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: { stream_id: streamId, status: "ok", error: null },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: {
+      getReader() {
+        let readCount = 0;
+        return {
+          async read() {
+            readCount += 1;
+            if (readCount === 1) {
+              return {
+                done: false,
+                value: new TextEncoder().encode(
+                  'data: {"choices":[{"delta":{"content":"partial "}}]}\n\n',
+                ),
+              };
+            }
+            throw new TypeError("terminated");
+          },
+          async cancel() {},
+        };
+      },
+    },
+  });
+
+  const tokens = [];
+  const errors = [];
+  const lifecycle = [];
+  let doneCount = 0;
+  try {
+    const result = await streamChatCompletion(
+      [{ role: "user", content: "inspect the workspace" }],
+      {
+        baseUrl: "http://127.0.0.1:1234/v1",
+        apiKey: "not-needed",
+        model: "local-model",
+        provider: "Local Gateway",
+        useRustProxy: false,
+      },
+      {
+        onToken: (token) => tokens.push(token),
+        onDone: () => { doneCount += 1; },
+        onError: (error) => { errors.push(error.message); },
+        onLifecycle: (event) => { lifecycle.push(event); },
+      },
+    );
+    assert.equal(result.content, "recovered");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(tokens, ["partial ", "__ESCALATION_RESET__:", "recovered"]);
+  assert.deepEqual(errors, []);
+  assert.equal(doneCount, 1);
+  assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream"]);
+  assert.equal(lifecycle.some((event) => event.status === "frontend_body_retry_rust_proxy"), true);
 });
 
 test("Ollama frontend Load failed retries through the Rust stream proxy", async () => {

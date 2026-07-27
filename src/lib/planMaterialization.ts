@@ -14,28 +14,57 @@ import {
 } from "./workflowModels";
 import { findPlanValidationSectionHeadingLineIndex } from "./planExecutableValidation";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
+import { createPlanAuthoringContract } from "./planAuthoringContract";
+import { buildPlanSubmissionGuidance } from "./planSubmissionGuidance";
+import {
+  createTypedRuntimePlanCandidate,
+  extractTypedPlanDraftEnvelope,
+  type TypedPlanDraftV1,
+} from "./planDraftIngress";
+import {
+  advancePlanCandidateRepairCheckpoint,
+  applyPlanCandidateRepairPatch,
+  createPlanCandidateRepairCheckpoint,
+  extractPlanCandidateRepairEnvelope,
+  MAX_TYPED_PLAN_INITIAL_OUTPUT_CHARS,
+  MAX_TYPED_PLAN_REPAIR_OUTPUT_CHARS,
+  type PlanCandidateRepairCheckpoint,
+} from "./planCandidateRepair";
+import { createPlanEvidenceReceipt } from "./planEvidenceReceipt";
+import { sha256Hex } from "./sha256";
 import {
   assessPlanConfigurationContracts,
   assessPlanClosureEvidence,
   buildPlanCandidate,
   isPlanEvidenceBundleReady,
+  PLAN_DIAGNOSIS_SECTION_HEADING_RE,
   validatePlanCandidate,
   type PlanCandidate,
   type PlanConfigurationContractAssessment,
   type PlanEvidenceBundle,
 } from "./planEvidence";
-import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  resolveUniqueWorkspaceFileReference,
+  workspacePathsReferToSameFile,
+} from "./workspacePaths";
 import {
   extractNumberedUserGoalFacets,
   preserveNumberedUserGoalLines,
 } from "./numberedGoalFacets";
+import {
+  formatPlanStructuredEvidenceFacts,
+  type PlanStructuredEvidenceFact,
+} from "./planStructuredEvidence";
+import type { PlanSourceObservation } from "./planSourceObservation";
 
 export { extractNumberedUserGoalFacets } from "./numberedGoalFacets";
 
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
+  | "typed_runtime_plan"
   | "visible_plan"
   | "deterministically_compacted_visible_plan"
+  | "formatting_repaired_visible_plan"
   | "canonicalized_visible_plan"
   | "grounding_repaired_visible_plan"
   | "evidence_section_repaired_visible_plan"
@@ -56,7 +85,26 @@ export interface PlanMaterializationResult {
   quality?: PlanArtifactQualityResult;
   evidenceBundleHash?: string;
   candidate?: PlanCandidate;
+  candidateRepairCheckpoint?: PlanCandidateRepairCheckpoint;
+  candidateRepairExhausted?: boolean;
+  /**
+   * A normalized but not-yet-admissible projection that runtime may repair
+   * only with trusted workspace metadata, then submit through this complete
+   * materialization pipeline again. It is never reviewable by itself.
+   */
+  repairableProjection?: {
+    kind: MaterializablePlanKind;
+    path: string;
+    content: string;
+    source: PlanMaterializationSource;
+  };
 }
+
+export type PlanMaterializationIngressMode =
+  /** Deprecated compatibility default for callers outside production runtime. */
+  | "auto"
+  | "typed_runtime"
+  | "legacy_markdown_import";
 
 export interface PlanMaterializationToolActivityLike {
   name?: string;
@@ -64,6 +112,8 @@ export interface PlanMaterializationToolActivityLike {
   status?: string;
   detail?: string;
   facts?: string[];
+  structuredFacts?: PlanStructuredEvidenceFact[];
+  sourceObservations?: PlanSourceObservation[];
 }
 
 export interface PlanEvidenceRecord {
@@ -72,6 +122,8 @@ export interface PlanEvidenceRecord {
   status: string;
   summary?: string;
   facts?: string[];
+  structuredFacts?: PlanStructuredEvidenceFact[];
+  sourceObservations?: PlanSourceObservation[];
   hash?: string;
 }
 
@@ -103,6 +155,8 @@ export interface SanitizedPlanEvidenceInput {
 
 const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i;
 const PROPOSAL_MARKER_RE = /^\s*\[\s*(?:PROPOSAL(?:[_\s-]*(?:START|BEGIN|END|STOP))?|START[_\s-]*PROPOSAL|END[_\s-]*PROPOSAL)\s*\]?\s*$/gim;
+// Legacy restore/import grammar only. New model turns are forced through
+// typed_runtime before any Markdown canonicalizer is reachable.
 const PROPOSED_PLAN_BLOCK_RE = /<proposed_plan(?:\s[^>]*)?>([\s\S]*?)<\/proposed_plan>/i;
 const PROPOSED_PLAN_TAG_RE = /<\/?proposed_plan(?:\s[^>]*)?>/gi;
 const USER_OPTIONS_BLOCK_RE = /^\s*<user_options>\s*$[\s\S]*?^\s*<\/user_options>\s*$/gim;
@@ -488,6 +542,8 @@ function planEvidenceSourceSignalScore(line: string): number {
   if (PLAN_EVIDENCE_SOURCE_SIGNAL_RE.test(line)) score += 1;
   if (PLAN_EVIDENCE_SOURCE_CONTRACT_RE.test(line)) score += 12;
   if (/\b(?:invoke|emit|listen|addEventListener|invoke_handler)\s*\(/i.test(line)) score += 8;
+  if (/\bdispatchEvent\s*\(/i.test(line)) score += 10;
+  if (/^\s*#\[\s*tauri::command\b/i.test(line)) score += 14;
   if (/\b(?:open|read|write|save|load|handle)[A-Za-z0-9_]*\s*\(/i.test(line)) score += 3;
   if (/DOMContentLoaded|beforeunload|load\s*["']/i.test(line)) score -= 4;
   if (/(?:generate_handler!\s*\[|["']permissions["']\s*:\s*\[)/i.test(line)) score += 8;
@@ -495,7 +551,7 @@ function planEvidenceSourceSignalScore(line: string): number {
   if (/\b(?:throw|panic|error|failed|missing|invalid|unsupported)\b|失败|缺少|错误|无效/i.test(line)) score += 6;
   if (/\b(?:export\s+)?(?:async\s+)?(?:function|fn|class|interface|type)\b/i.test(line)) score += 4;
   if (/\b(?:import|use)\b/i.test(line)) score += 2;
-  if (/^\s*(?:\/\/|#)/.test(line)) score -= 2;
+  if (/^\s*\/\//.test(line) || /^\s*#(?!\!?\[)/.test(line)) score -= 2;
   return score;
 }
 
@@ -620,6 +676,101 @@ const NON_LISTENER_BODY_CALL_IDENTIFIERS = new Set([
   "with",
 ]);
 
+interface NestedListenerCallableRange {
+  start: number;
+  end: number;
+}
+
+function collectNestedListenerCallableRanges(
+  source: string,
+  mask: Uint8Array,
+  bodyOpenIndex: number,
+  bodyCloseIndex: number,
+): NestedListenerCallableRange[] {
+  const ranges: NestedListenerCallableRange[] = [];
+  const addBlockRange = (start: number, openIndex: number) => {
+    if (
+      start <= bodyOpenIndex ||
+      openIndex <= bodyOpenIndex ||
+      openIndex >= bodyCloseIndex ||
+      !mask[start] ||
+      !mask[openIndex]
+    ) return;
+    const closeIndex = findMatchingSourceDelimiter(source, mask, openIndex, "{", "}");
+    if (closeIndex > openIndex && closeIndex <= bodyCloseIndex) {
+      ranges.push({ start, end: closeIndex });
+    }
+  };
+  const blockPatterns = [
+    /\b(?:async\s+)?function\s*\*?(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\([^)]*\)\s*\{/g,
+    /\bclass(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?(?:\s+extends\s+[^\n{]+)?\s*\{/g,
+    /(?:^|[,{;])\s*(?:async\s+)?(?:get\s+|set\s+)?(?!if\b|for\b|while\b|switch\b|catch\b|with\b)[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)\s*\{/gm,
+  ];
+  for (const pattern of blockPatterns) {
+    for (const match of source.matchAll(pattern)) {
+      const start = match.index ?? -1;
+      const braceOffset = String(match[0] || "").lastIndexOf("{");
+      if (start < 0 || braceOffset < 0) continue;
+      addBlockRange(start, start + braceOffset);
+    }
+  }
+
+  for (let index = bodyOpenIndex + 1; index < bodyCloseIndex - 1; index += 1) {
+    if (!mask[index] || !mask[index + 1] || source[index] !== "=" || source[index + 1] !== ">") {
+      continue;
+    }
+    let expressionStart = index + 2;
+    while (expressionStart < bodyCloseIndex && /\s/.test(source[expressionStart] || "")) {
+      expressionStart += 1;
+    }
+    if (source[expressionStart] === "{" && mask[expressionStart]) {
+      addBlockRange(index, expressionStart);
+      continue;
+    }
+    let parentheses = 0;
+    let brackets = 0;
+    let braces = 0;
+    let expressionEnd = bodyCloseIndex - 1;
+    for (let cursor = expressionStart; cursor < bodyCloseIndex; cursor += 1) {
+      if (!mask[cursor]) continue;
+      const char = source[cursor] || "";
+      if (char === "(") parentheses += 1;
+      else if (char === ")") {
+        if (parentheses === 0 && brackets === 0 && braces === 0) {
+          expressionEnd = cursor - 1;
+          break;
+        }
+        parentheses = Math.max(0, parentheses - 1);
+      } else if (char === "[") brackets += 1;
+      else if (char === "]") brackets = Math.max(0, brackets - 1);
+      else if (char === "{") braces += 1;
+      else if (char === "}") {
+        if (parentheses === 0 && brackets === 0 && braces === 0) {
+          expressionEnd = cursor - 1;
+          break;
+        }
+        braces = Math.max(0, braces - 1);
+      } else if (
+        parentheses === 0 &&
+        brackets === 0 &&
+        braces === 0 &&
+        (char === ";" || char === "," || char === "\n")
+      ) {
+        expressionEnd = cursor;
+        break;
+      }
+    }
+    if (expressionEnd >= index) ranges.push({ start: index, end: expressionEnd });
+  }
+
+  return ranges
+    .filter((range) => range.start > bodyOpenIndex && range.end < bodyCloseIndex)
+    .sort((left, right) => left.start - right.start || right.end - left.end)
+    .filter((range, index, all) => !all.slice(0, index).some((outer) =>
+      outer.start <= range.start && outer.end >= range.end
+    ));
+}
+
 function extractTopLevelListenerBodyCalls(
   source: string,
   mask: Uint8Array,
@@ -627,18 +778,28 @@ function extractTopLevelListenerBodyCalls(
   bodyCloseIndex: number,
 ): string[] {
   const calls: string[] = [];
-  let braceDepth = 0;
+  const nestedCallableRanges = collectNestedListenerCallableRanges(
+    source,
+    mask,
+    bodyOpenIndex,
+    bodyCloseIndex,
+  );
   let parenthesisDepth = 0;
   let bracketDepth = 0;
   for (let index = bodyOpenIndex + 1; index < bodyCloseIndex; index += 1) {
+    const nestedCallable = nestedCallableRanges.find((range) =>
+      range.start <= index && range.end >= index
+    );
+    if (nestedCallable) {
+      index = nestedCallable.end;
+      continue;
+    }
     if (!mask[index]) continue;
     const char = source[index] || "";
     if (char === "{") {
-      braceDepth += 1;
       continue;
     }
     if (char === "}") {
-      braceDepth = Math.max(0, braceDepth - 1);
       continue;
     }
     if (char === "(") {
@@ -657,7 +818,7 @@ function extractTopLevelListenerBodyCalls(
       bracketDepth = Math.max(0, bracketDepth - 1);
       continue;
     }
-    if (braceDepth !== 0 || parenthesisDepth !== 0 || bracketDepth !== 0) continue;
+    if (parenthesisDepth !== 0 || bracketDepth !== 0) continue;
     if (!/[A-Za-z_$]/.test(char)) continue;
 
     let identifierEnd = index + 1;
@@ -750,6 +911,218 @@ function collectDomListenerSourceCandidate(
   };
 }
 
+function collectInvokeSourceCandidate(
+  lines: string[],
+  index: number,
+): { command: string; argumentKeys: string[]; endIndex: number } | null {
+  if (!/\binvoke\s*\(/i.test(lines[index] || "")) return null;
+  const boundedLines = lines.slice(index, Math.min(lines.length, index + 32));
+  const boundedSource = boundedLines.join("\n");
+  const invokeMatch = /\binvoke\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]/i.exec(boundedSource);
+  const command = invokeMatch?.[1] || "";
+  if (!command || invokeMatch?.index == null) return null;
+  const mask = buildSourceCodeMask(boundedSource);
+  const callOpenIndex = boundedSource.indexOf("(", invokeMatch.index);
+  if (callOpenIndex < 0 || !mask[callOpenIndex]) return null;
+  const callCloseIndex = findMatchingSourceDelimiter(
+    boundedSource,
+    mask,
+    callOpenIndex,
+    "(",
+    ")",
+  );
+  if (callCloseIndex < 0) return null;
+  const splitTopLevelRanges = (
+    startIndex: number,
+    endIndex: number,
+  ): Array<{ start: number; end: number }> => {
+    const ranges: Array<{ start: number; end: number }> = [];
+    let start = startIndex;
+    let parentheses = 0;
+    let brackets = 0;
+    let braces = 0;
+    for (let cursor = startIndex; cursor < endIndex; cursor += 1) {
+      if (!mask[cursor]) continue;
+      const char = boundedSource[cursor] || "";
+      if (char === "(") parentheses += 1;
+      else if (char === ")") parentheses = Math.max(0, parentheses - 1);
+      else if (char === "[") brackets += 1;
+      else if (char === "]") brackets = Math.max(0, brackets - 1);
+      else if (char === "{") braces += 1;
+      else if (char === "}") braces = Math.max(0, braces - 1);
+      else if (char === "," && parentheses === 0 && brackets === 0 && braces === 0) {
+        ranges.push({ start, end: cursor });
+        start = cursor + 1;
+      }
+    }
+    ranges.push({ start, end: endIndex });
+    return ranges;
+  };
+  const findNextCodeIndex = (startIndex: number, endIndex: number): number => {
+    for (let cursor = startIndex; cursor < endIndex; cursor += 1) {
+      if (mask[cursor] && !/\s/.test(boundedSource[cursor] || "")) return cursor;
+    }
+    return -1;
+  };
+  const callArguments = splitTopLevelRanges(callOpenIndex + 1, callCloseIndex);
+  const payloadArgument = callArguments[1];
+  const payloadOpenIndex = payloadArgument
+    ? findNextCodeIndex(payloadArgument.start, payloadArgument.end)
+    : -1;
+  const payloadCloseIndex = payloadOpenIndex >= 0 && boundedSource[payloadOpenIndex] === "{"
+    ? findMatchingSourceDelimiter(boundedSource, mask, payloadOpenIndex, "{", "}")
+    : -1;
+  const argumentKeys = payloadArgument && payloadCloseIndex >= 0 && payloadCloseIndex < payloadArgument.end
+    ? [...new Set(splitTopLevelRanges(payloadOpenIndex + 1, payloadCloseIndex).flatMap((range) => {
+        const keyStart = findNextCodeIndex(range.start, range.end);
+        if (keyStart < 0 || !/[A-Za-z_$]/.test(boundedSource[keyStart] || "")) return [];
+        let keyEnd = keyStart + 1;
+        while (
+          keyEnd < range.end &&
+          mask[keyEnd] &&
+          /[A-Za-z0-9_$]/.test(boundedSource[keyEnd] || "")
+        ) {
+          keyEnd += 1;
+        }
+        const nextCodeIndex = findNextCodeIndex(keyEnd, range.end);
+        if (
+          nextCodeIndex >= 0 &&
+          boundedSource[nextCodeIndex] !== ":" &&
+          boundedSource[nextCodeIndex] !== "("
+        ) return [];
+        return [boundedSource.slice(keyStart, keyEnd)];
+      }))].slice(0, 16)
+    : [];
+  return {
+    command,
+    argumentKeys,
+    endIndex: index + boundedSource.slice(0, callCloseIndex + 1).split("\n").length - 1,
+  };
+}
+
+function splitTopLevelSourceArguments(value: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let angle = 0;
+  let parentheses = 0;
+  let brackets = 0;
+  let braces = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] || "";
+    if (char === "<") angle += 1;
+    else if (char === ">") angle = Math.max(0, angle - 1);
+    else if (char === "(") parentheses += 1;
+    else if (char === ")") parentheses = Math.max(0, parentheses - 1);
+    else if (char === "[") brackets += 1;
+    else if (char === "]") brackets = Math.max(0, brackets - 1);
+    else if (char === "{") braces += 1;
+    else if (char === "}") braces = Math.max(0, braces - 1);
+    else if (
+      char === "," &&
+      angle === 0 &&
+      parentheses === 0 &&
+      brackets === 0 &&
+      braces === 0
+    ) {
+      parts.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+function splitIdentifierWords(value: string): string[] {
+  return String(value || "")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .map((part) => part.toLowerCase())
+    .filter(Boolean);
+}
+
+function titleCaseIdentifierWord(value: string): string {
+  return value ? `${value[0]?.toUpperCase() || ""}${value.slice(1)}` : "";
+}
+
+function renameTauriCommandArgument(value: string, strategy: string): string | null {
+  const words = splitIdentifierWords(value);
+  if (words.length === 0) return null;
+  const rawStrategy = String(strategy || "").trim();
+  switch (rawStrategy) {
+    case "UPPERCASE":
+      return words.join("").toUpperCase();
+    case "SCREAMING_SNAKE_CASE":
+      return words.join("_").toUpperCase();
+    case "SCREAMING-KEBAB-CASE":
+      return words.join("-").toUpperCase();
+    default:
+      break;
+  }
+  switch (rawStrategy.toLowerCase()) {
+    case "camelcase":
+    case "camel_case":
+      return `${words[0]}${words.slice(1).map(titleCaseIdentifierWord).join("")}`;
+    case "pascalcase":
+    case "pascal_case":
+      return words.map(titleCaseIdentifierWord).join("");
+    case "snake_case":
+      return words.join("_");
+    case "kebab-case":
+      return words.join("-");
+    case "lowercase":
+      return words.join("");
+    default:
+      // Unknown macro strategies must not be guessed. Omitting the argument
+      // contract is safer than manufacturing a cross-boundary mismatch.
+      return null;
+  }
+}
+
+function collectTauriCommandSourceCandidate(
+  lines: string[],
+  index: number,
+): { command: string; argumentKeys: string[]; endIndex: number } | null {
+  if (!/^\s*#\[\s*tauri::command\b/i.test(lines[index] || "")) return null;
+  const boundedLines = lines.slice(index, Math.min(lines.length, index + 40));
+  const boundedSource = boundedLines.join("\n");
+  const functionMatch = /\b(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m.exec(boundedSource);
+  const command = functionMatch?.[1] || "";
+  if (!command || functionMatch?.index == null) return null;
+  const mask = buildSourceCodeMask(boundedSource);
+  const argsOpenIndex = boundedSource.indexOf("(", functionMatch.index);
+  if (argsOpenIndex < 0 || !mask[argsOpenIndex]) return null;
+  const argsCloseIndex = findMatchingSourceDelimiter(
+    boundedSource,
+    mask,
+    argsOpenIndex,
+    "(",
+    ")",
+  );
+  if (argsCloseIndex < 0) return null;
+  const attribute = boundedSource.slice(0, functionMatch.index);
+  const renameAll = attribute.match(/rename_all\s*=\s*["']([^"']+)["']/i)?.[1] || "camelCase";
+  const argumentKeys = splitTopLevelSourceArguments(
+    boundedSource.slice(argsOpenIndex + 1, argsCloseIndex),
+  ).flatMap((argument) => {
+    const match = argument.match(/^(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([\s\S]+)$/);
+    const name = match?.[1] || "";
+    const type = match?.[2] || "";
+    if (
+      !name ||
+      /^(?:self|app|window)$/i.test(name) && /(?:AppHandle|WebviewWindow|Window)\b/.test(type) ||
+      /(?:^|::)(?:AppHandle|WebviewWindow|Window|State|Manager|Channel)\s*(?:<|$)/.test(type)
+    ) return [];
+    const externalName = renameTauriCommandArgument(name, renameAll);
+    return externalName ? [externalName] : [];
+  }).slice(0, 16);
+  return {
+    command,
+    argumentKeys,
+    endIndex: index + boundedSource.slice(0, argsCloseIndex + 1).split("\n").length - 1,
+  };
+}
+
 function compactPlanEvidenceSourceCandidate(
   lines: string[],
   index: number,
@@ -769,13 +1142,36 @@ function compactPlanEvidenceSourceCandidate(
       endIndex: index,
     };
   }
+  const tauriCommand = collectTauriCommandSourceCandidate(lines, index);
+  if (tauriCommand) {
+    return {
+      text: [
+        `L${index + 1}: command_handler_argument_contract(${tauriCommand.command}${tauriCommand.argumentKeys.length > 0 ? `,${tauriCommand.argumentKeys.join(",")}` : ""})`,
+      ].join(" "),
+      endIndex: tauriCommand.endIndex,
+    };
+  }
+  const invokeCall = collectInvokeSourceCandidate(lines, index);
+  if (invokeCall) {
+    return {
+      text: [
+        `L${index + 1}: command_invoke_contract(${invokeCall.command})`,
+        invokeCall.argumentKeys.length > 0
+          ? `command_invoke_argument_contract(${invokeCall.command},${invokeCall.argumentKeys.join(",")})`
+          : "",
+      ].filter(Boolean).join(" "),
+      endIndex: invokeCall.endIndex,
+    };
+  }
   const multilineContract = /(?:generate_handler!\s*\[|["']permissions["']\s*:\s*\[)/i.test(line);
   let endIndex = index;
   if (multilineContract) {
-    const closingPattern = /(?:\]\)|\]\s*[,;]?)\s*$/;
-    while (endIndex + 1 < lines.length && endIndex - index < 12) {
-      endIndex += 1;
-      if (closingPattern.test((lines[endIndex] || "").trim())) break;
+    const closingPattern = /(?:\]\)|\])\s*[,;]?\s*$/;
+    if (!closingPattern.test(line.trim())) {
+      while (endIndex + 1 < lines.length && endIndex - index < 12) {
+        endIndex += 1;
+        if (closingPattern.test((lines[endIndex] || "").trim())) break;
+      }
     }
   }
   const joined = lines.slice(index, endIndex + 1).join(" ");
@@ -813,6 +1209,13 @@ function compactPlanEvidenceSourceCandidate(
   if (tauriListenedEvent) {
     return {
       text: `L${index + 1}: event_tauri_listener_contract(${tauriListenedEvent})`,
+      endIndex,
+    };
+  }
+  const dispatchedDomEvent = joined.match(/\.dispatchEvent\s*\(\s*new\s+(?:Custom)?Event\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]/i)?.[1] || "";
+  if (dispatchedDomEvent) {
+    return {
+      text: `L${index + 1}: event_dom_dispatch_contract(${dispatchedDomEvent})`,
       endIndex,
     };
   }
@@ -918,17 +1321,109 @@ export function summarizePlanEvidenceDetail(input: {
 }
 
 const STRUCTURED_PLAN_EVIDENCE_FACT_RE =
-  /\b(?:(?:handler|permission|event_(?:emit|dom_listener|tauri_listener)|command_invoke)_contract|listener_calls)\([^\n)]{1,240}\)/gi;
+  /\b(?:(?:handler|permission|event_(?:emit|dom_listener|dom_dispatch|tauri_listener)|command_(?:transport|invoke|invoke_argument|handler_argument)|field|returned_field|field_read|field_fallback|field_selector|interaction_target|execution_surface)_contract|listener_calls)\([^\n)]{1,240}\)/gi;
 const STRUCTURED_PLAN_CONFIG_FACT_RE =
   /\b(?:devUrl\s*["']?\s*[:=]\s*["']?[^\s"']{1,160}|port\s*["']?\s*[:=]\s*\d{1,5}|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d{1,5})/gi;
 
+const NON_CONTRACT_PROPERTY_NAMES = new Set([
+  "catch",
+  "filter",
+  "find",
+  "forEach",
+  "join",
+  "length",
+  "map",
+  "push",
+  "reduce",
+  "slice",
+  "some",
+  "sort",
+  "then",
+  "trim",
+]);
+
+function extractStructuredDataFieldFacts(value: string): string[] {
+  const body = extractDelimitedReadFileBody(value) || String(value || "");
+  const facts: string[] = [];
+  const add = (fact: string) => {
+    if (fact && !facts.includes(fact)) facts.push(fact);
+  };
+
+  // DOM targets are accepted only from literal source syntax observed by the
+  // runtime. This is evidence for a future browser validation target; it is
+  // not inferred from model prose or from a guessed selector.
+  for (const match of body.matchAll(/\bgetElementById\s*\(\s*["']([^"'\r\n]{1,160})["']\s*\)/g)) {
+    if (match[1]) add(`interaction_target_contract(browser,#${match[1]})`);
+  }
+  for (const match of body.matchAll(/\bquerySelector(?:All)?\s*\(\s*["']([^"'()\r\n]{1,200})["']\s*\)/g)) {
+    if (match[1]) add(`interaction_target_contract(browser,${match[1]})`);
+  }
+  for (const match of body.matchAll(/\bid\s*=\s*["']([A-Za-z][A-Za-z0-9_:.-]{0,159})["']/g)) {
+    if (match[1]) add(`interaction_target_contract(browser,#${match[1]})`);
+  }
+  // Literal accessible names are owned by the source and can be addressed by
+  // MAIN's structured macOS Accessibility adapter. Dynamic expressions are
+  // intentionally excluded because their runtime label is not yet observed.
+  for (const match of body.matchAll(/\b(?:aria-label|title)\s*=\s*["']([^"'{}\r\n]{1,160})["']/g)) {
+    if (match[1]) add(`interaction_target_contract(desktop,${match[1].trim()})`);
+  }
+  for (const match of body.matchAll(/<button\b[^>]{0,600}>\s*([^<>{}\r\n]{1,160})\s*<\/button\s*>/gi)) {
+    if (match[1]) add(`interaction_target_contract(desktop,${match[1].trim()})`);
+  }
+
+  for (const declaration of body.matchAll(/\b(?:interface|type)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:=\s*)?\{([\s\S]{0,5000}?)\}/g)) {
+    const owner = declaration[1] || "Anonymous";
+    const fields = declaration[2] || "";
+    for (const property of fields.matchAll(/(?:^|[;,{\n])\s*(?:readonly\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(\?)?\s*:\s*[^;,}\n]+/g)) {
+      const field = property[1] || "";
+      if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+      add(`field_contract(${owner}.${field},${property[2] ? "optional" : "required"})`);
+    }
+  }
+
+  for (const returnedObject of body.matchAll(/\breturn\s*\{([\s\S]{0,4000}?)\}\s*;?/g)) {
+    const objectBody = returnedObject[1] || "";
+    for (const property of objectBody.matchAll(/(?:^|[,\n])\s*(?:\.\.\.[^,\n]+\s*,\s*)?(?:["']([^"']+)["']|([A-Za-z_$][A-Za-z0-9_$]*))\s*(?::|,|$)/g)) {
+      const field = property[1] || property[2] || "";
+      if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+      add(`returned_field_contract(${field})`);
+    }
+  }
+
+  for (const fallback of body.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\|\||\?\?)\s*\1\.([A-Za-z_$][A-Za-z0-9_$]*)/g)) {
+    const primary = fallback[2] || "";
+    const secondary = fallback[3] || "";
+    if (!primary || !secondary) continue;
+    add(`field_fallback_contract(${primary},${secondary})`);
+    add(`field_read_contract(${primary})`);
+    add(`field_read_contract(${secondary})`);
+  }
+  for (const access of body.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*\.([A-Za-z_$][A-Za-z0-9_$]*)\b/g)) {
+    const field = access[1] || "";
+    if (!field || NON_CONTRACT_PROPERTY_NAMES.has(field)) continue;
+    add(`field_read_contract(${field})`);
+  }
+  for (const selector of body.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:Field|Key|Property|Column)\s*=\s*["']([A-Za-z_$][A-Za-z0-9_$]*)["']/g)) {
+    if (selector[1]) add(`field_selector_contract(${selector[1]})`);
+  }
+  return facts.slice(0, 24);
+}
+
 function planEvidenceFactPriority(value: string): number {
+  if (/\bcommand_transport_contract\(/i.test(value)) return 128;
+  if (/\bcommand_(?:invoke_argument|handler_argument)_contract\(/i.test(value)) return 126;
   if (/event_dom_listener_contract\(DOMContentLoaded\)/i.test(value)) return 120;
   if (/\blistener_calls\(/i.test(value)) return 118;
   if (/\b(?:devUrl|port)\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):/i.test(value)) return 115;
   if (/\b(?:handler|permission)_contract\(/i.test(value)) return 105;
-  if (/\bevent_(?:emit|dom_listener|tauri_listener)_contract\(/i.test(value)) return 100;
+  if (/\bevent_(?:emit|dom_listener|dom_dispatch|tauri_listener)_contract\(/i.test(value)) return 100;
+  if (/\binteraction_target_contract\(/i.test(value)) return 98;
+  if (/\bexecution_surface_contract\(/i.test(value)) return 97;
   if (/\bcommand_invoke_contract\(/i.test(value)) return 90;
+  if (/\bfield_contract\([^,]+,required\)/i.test(value)) return 88;
+  if (/\bfield_(?:fallback|selector)_contract\(/i.test(value)) return 86;
+  if (/\bfield_contract\([^,]+,optional\)|\breturned_field_contract\(/i.test(value)) return 84;
+  if (/\bfield_read_contract\(/i.test(value)) return 70;
   return 50;
 }
 
@@ -942,7 +1437,53 @@ export function extractPlanEvidenceFacts(value: unknown): string[] {
   const candidates = [
     ...Array.from(text.matchAll(STRUCTURED_PLAN_EVIDENCE_FACT_RE), (match) => match[0] || ""),
     ...Array.from(text.matchAll(STRUCTURED_PLAN_CONFIG_FACT_RE), (match) => match[0] || ""),
+    ...extractStructuredDataFieldFacts(text),
   ];
+  return mergePlanEvidenceFacts(candidates);
+}
+
+/**
+ * Extract structured contracts directly from source bytes. Human-readable
+ * evidence summaries are intentionally tiny, so deriving facts only from the
+ * summary can drop a later invocation, event, or handler signature. Call this
+ * only for runtime-owned source-read results; arbitrary assistant prose must
+ * never be promoted into evidence through this path.
+ */
+export function extractPlanEvidenceSourceFacts(value: unknown): string[] {
+  const raw = String(value || "");
+  // Map-reduce summaries are model-authored projections, not runtime-owned
+  // source bytes. They may guide another read but cannot establish contracts.
+  if (/\[FILE MAP-REDUCE SUMMARY\]/i.test(raw)) return [];
+  const source = extractDelimitedReadFileBody(raw) || raw;
+  if (!source.trim()) return [];
+  const lines = source.split(/\r?\n/);
+  const candidates: string[] = [...extractStructuredDataFieldFacts(source)];
+  const hasTauriCommandTransport = /(?:from\s*["']@tauri-apps\/api\/(?:core|tauri)["']|require\s*\(\s*["']@tauri-apps\/api\/(?:core|tauri)["']\s*\)|import\s*\(\s*["']@tauri-apps\/api\/(?:core|tauri)["']\s*\))/i
+    .test(source);
+  if (hasTauriCommandTransport) {
+    // Keep transport ownership separate from a generic function named
+    // `invoke`. Contract closure may request a backend counterpart only when
+    // trusted source proves that this call crosses the Tauri boundary.
+    candidates.push("command_transport_contract(tauri)");
+    candidates.push("execution_surface_contract(desktop)");
+  }
+  for (let index = 0; index < lines.length; index += 1) {
+    if (planEvidenceSourceSignalScore(lines[index] || "") <= 0) continue;
+    const candidate = compactPlanEvidenceSourceCandidate(lines, index);
+    if (candidate.text) {
+      candidates.push(...Array.from(
+        candidate.text.matchAll(STRUCTURED_PLAN_EVIDENCE_FACT_RE),
+        (match) => match[0] || "",
+      ));
+    }
+    index = candidate.endIndex;
+  }
+  if (hasTauriCommandTransport) {
+    for (const fact of candidates) {
+      const command = fact.match(/command_invoke_contract\s*\(\s*([^,()]+)\s*\)/i)?.[1]?.trim() || "";
+      if (command) candidates.push(`command_transport_contract(tauri,${command})`);
+    }
+  }
   return mergePlanEvidenceFacts(candidates);
 }
 
@@ -1050,7 +1591,11 @@ export function formatPlanEvidenceRecord(record: PlanEvidenceRecord, language: "
     tool: record.tool,
     target: record.target,
     status: record.status,
-    detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
+    detail: [
+      record.summary,
+      ...formatPlanStructuredEvidenceFacts(record.structuredFacts),
+      ...(record.facts || []),
+    ].filter(Boolean).join(" "),
   });
   if (!normalized) return "";
   return summarizeEvidenceLine(normalized, language);
@@ -1379,7 +1924,10 @@ function facetSectionCovered(facetTerms: Set<string>, sectionBody: string): bool
   for (const term of facetTerms) {
     if (sectionTerms.has(term)) matches += term.length >= 4 ? 2 : 1;
   }
-  return matches >= 2;
+  // A facet with one genuinely distinct anchor is still meaningful. Requiring
+  // two matches in that case forced the validator to fall back to shared words
+  // such as "file" or "save", which let one generic chain close two goals.
+  return matches >= Math.min(2, Math.max(1, facetTerms.size));
 }
 
 function facetLineStronglyCovered(facetTerms: Set<string>, line: string): boolean {
@@ -1404,14 +1952,26 @@ function distinctSemanticFacetTerms(
   return new Set([...ownTerms].filter((term) => !sharedTerms.has(term)));
 }
 
-type PlanFacetReferencePrefix = "E" | "C" | "D" | "V";
+type PlanFacetReferencePrefix = "E" | "R" | "C" | "D" | "V";
 
 interface PlanFacetTraceabilityRow {
   index: number;
   body: string;
+  evidenceRefs: string[];
+  diagnosisRefs: string[];
   changeRefs: string[];
   decisionRefs: string[];
   validationRefs: string[];
+}
+
+const PLAN_FACET_TRACEABILITY_HEADING_RE = /^(?:(?:需求|目标|用户目标|问题)?分面(?:追踪|映射|覆盖)(?:矩阵|表)?|(?:需求|目标|问题)(?:追踪|映射)(?:矩阵|表)|(?:Requirement|Goal|Issue) Facet (?:Traceability|Mapping|Coverage)(?: Matrix| Table)?|(?:Facet|Requirement|Goal|Issue) Traceability(?: Matrix| Table)?|Traceability Matrix|G\s*\/\s*E(?:\s*\/\s*R)?\s*\/\s*(?:C|D)(?:\s*\/\s*D)?\s*\/\s*V Traceability)$/i;
+
+function isPlanFacetTraceabilityHeading(title: string): boolean {
+  return PLAN_FACET_TRACEABILITY_HEADING_RE.test(normalizePlanSectionRoleTitle(title));
+}
+
+function isWithinPlanFacetTraceabilitySection(section: ParsedPlanSection): boolean {
+  return [section.title, ...section.ancestors].some(isPlanFacetTraceabilityHeading);
 }
 
 function collectPlanReferenceIds(value: string, prefix: PlanFacetReferencePrefix): string[] {
@@ -1426,16 +1986,22 @@ function collectPlanReferenceIds(value: string, prefix: PlanFacetReferencePrefix
 function parsePlanFacetTraceabilityRows(sections: ParsedPlanSection[]): PlanFacetTraceabilityRow[] {
   const rows: PlanFacetTraceabilityRow[] = [];
   for (const section of sections) {
-    if (!/^(?:(?:需求|目标|用户目标|问题)?分面(?:追踪|映射|覆盖)|(?:Requirement|Goal|Issue) Facet (?:Traceability|Mapping|Coverage))$/i.test(
-      normalizePlanSectionRoleTitle(section.title),
-    )) continue;
+    if (!isPlanFacetTraceabilityHeading(section.title)) continue;
     for (const rawLine of section.body.split(/\r?\n/)) {
       const body = stripPlanListMarker(rawLine);
-      const match = body.match(/^(?:分面|需求|目标|问题|Facet|Requirement|Goal|Issue)\s*#?\s*(\d{1,2})\b/i);
+      // Accept the two compact, provider-neutral forms advertised by the
+      // authoring contract: a prose row ("Facet 1: ...") or an explicit
+      // reference chain ("G1 -> E1 -> C1 -> V1"). Markdown table rows and
+      // bracketed goal ids are common model renderings of the same ledger.
+      const match = body.match(
+        /^(?:\|\s*)?(?:\[\s*)?(?:G|(?:分面|需求|目标|问题|Facet|Requirement|Goal|Issue))\s*#?\s*(\d{1,2})(?:\s*\])?(?=\s*(?:\||[:：.)、．-]|->|→|$))/i,
+      );
       if (!match) continue;
       rows.push({
         index: Number(match[1]),
         body,
+        evidenceRefs: collectPlanReferenceIds(body, "E"),
+        diagnosisRefs: collectPlanReferenceIds(body, "R"),
         changeRefs: collectPlanReferenceIds(body, "C"),
         decisionRefs: collectPlanReferenceIds(body, "D"),
         validationRefs: collectPlanReferenceIds(body, "V"),
@@ -1448,29 +2014,85 @@ function parsePlanFacetTraceabilityRows(sections: ParsedPlanSection[]): PlanFace
 function planFacetTraceabilityRowCoversActionAndValidation(input: {
   row?: PlanFacetTraceabilityRow;
   facetTerms: Set<string>;
+  distinctFacetTerms: Set<string>;
+  evidenceBody: string;
+  diagnosisBody: string;
   changesBody: string;
   decisionsBody: string;
   validationBody: string;
 }): boolean {
   const row = input.row;
-  if (!row || !facetSectionCovered(input.facetTerms, row.body)) return false;
-  const referencesExist = (refs: string[], body: string) =>
-    refs.length > 0 && refs.every((ref) => new RegExp(`\\[${ref}\\]`, "i").test(body));
-  const groundedAction = referencesExist(row.changeRefs, input.changesBody) ||
-    referencesExist(row.decisionRefs, input.decisionsBody);
-  return groundedAction &&
-    referencesExist(row.validationRefs, input.validationBody);
+  // The row is only a reference ledger. Its prose often repeats the original
+  // user goal, so counting the row itself as semantic support lets unrelated
+  // E/C/V items self-certify merely by being named. Coverage must come from
+  // the referenced artifact entries, never from the mapping sentence.
+  if (!row) return false;
+  const referencePattern = (ref: string) =>
+    new RegExp(`\\[[^\\]\\n]{0,120}\\b${ref}\\b[^\\]\\n]{0,120}\\]`, "i");
+  const referencesResolve = (refs: string[], body: string) =>
+    refs.every((ref) => referencePattern(ref).test(body));
+  const referencedBody = (refs: string[], body: string) => body
+    .split(/\r?\n/)
+    .filter((line) => refs.some((ref) => referencePattern(ref).test(line)))
+    .join("\n");
+  const hasEvidenceRefs = row.evidenceRefs.length > 0;
+  const hasDiagnosisRefs = row.diagnosisRefs.length > 0;
+  const hasChangeRefs = row.changeRefs.length > 0;
+  const hasDecisionRefs = row.decisionRefs.length > 0;
+  const hasValidationRefs = row.validationRefs.length > 0;
+  const evidenceExists = hasEvidenceRefs && referencesResolve(row.evidenceRefs, input.evidenceBody);
+  const diagnosisExists = hasDiagnosisRefs && referencesResolve(row.diagnosisRefs, input.diagnosisBody);
+  const changeExists = hasChangeRefs && referencesResolve(row.changeRefs, input.changesBody);
+  const decisionExists = hasDecisionRefs && referencesResolve(row.decisionRefs, input.decisionsBody);
+  const validationExists = hasValidationRefs && referencesResolve(row.validationRefs, input.validationBody);
+  if (
+    !evidenceExists ||
+    (hasDiagnosisRefs && !diagnosisExists) ||
+    (!hasChangeRefs && !hasDecisionRefs) ||
+    (hasChangeRefs && !changeExists) ||
+    (hasDecisionRefs && !decisionExists) ||
+    !validationExists
+  ) return false;
+
+  const evidenceText = referencedBody(row.evidenceRefs, input.evidenceBody);
+  const diagnosisText = diagnosisExists
+    ? referencedBody(row.diagnosisRefs, input.diagnosisBody)
+    : "";
+  const actionText = [
+    changeExists ? referencedBody(row.changeRefs, input.changesBody) : "",
+    decisionExists ? referencedBody(row.decisionRefs, input.decisionsBody) : "",
+  ].filter(Boolean).join("\n");
+  const validationText = referencedBody(row.validationRefs, input.validationBody);
+  // Prefer terms unique to this frozen user-goal facet. A shared source owner
+  // proves provenance, but it does not prove which of several requested
+  // outcomes the referenced observation/change/validation actually closes.
+  const coverageTerms = input.distinctFacetTerms.size > 0
+    ? input.distinctFacetTerms
+    : input.facetTerms;
+  const evidenceSupportsFacet = facetSectionCovered(coverageTerms, evidenceText);
+  return evidenceSupportsFacet &&
+    (!hasDiagnosisRefs || facetSectionCovered(coverageTerms, diagnosisText)) &&
+    facetSectionCovered(coverageTerms, actionText) &&
+    facetSectionCovered(coverageTerms, validationText);
 }
 
 export function validateNumberedUserGoalFacetCoverage(input: {
   userGoal?: string;
   content: string;
+  diagnosisRequired?: boolean;
 }): PlanArtifactQualityResult {
   const facets = extractNumberedUserGoalFacets(input.userGoal || "");
   if (facets.length < 2) return classifyPlanArtifactQualityResult({ ok: true });
   const sections = parsePlanSections(input.content);
   const collectRoleText = (patterns: RegExp[]) => sections
-    .filter((section) => planSectionMatchesRole(section, patterns))
+    // A traceability row is an index, not evidence/change/validation content.
+    // Exclude it even when a malformed heading hierarchy nests the ledger
+    // under one of those role sections, otherwise bracketed refs in the row
+    // could manufacture their own target entries.
+    .filter((section) =>
+      !isWithinPlanFacetTraceabilitySection(section) &&
+      planSectionMatchesRole(section, patterns)
+    )
     .map((section) => `${section.ancestors.join("\n")}\n${section.title}\n${section.body}`)
     .join("\n");
   const changesBody = collectRoleText([
@@ -1479,21 +2101,58 @@ export function validateNumberedUserGoalFacetCoverage(input: {
   const decisionsBody = collectRoleText([
     /决策|结论|取舍|约束|保持不变|无需改动|不修改|decision|conclusion|trade-?off|constraint|no changes?|unchanged/i,
   ]);
+  const evidenceBody = collectRoleText([
+    /已确认证据|已确认事实|已确认发现|已读证据|证据依据|证据归因|根因与证据|confirmed evidence|confirmed facts|confirmed findings|read evidence|evidence mapping|root cause and evidence/i,
+  ]);
+  const diagnosisBody = collectRoleText([PLAN_DIAGNOSIS_SECTION_HEADING_RE]);
   const validationBody = collectRoleText([/测试|验证|验收|成功标准|完成标准|test|validation|acceptance|success criteria|definition of done/i]);
   const traceabilityRows = parsePlanFacetTraceabilityRows(sections);
+  const bindingKey = (row: PlanFacetTraceabilityRow) => [
+    [...row.evidenceRefs].sort().join(","),
+    [...row.diagnosisRefs].sort().join(","),
+    [...row.changeRefs].sort().join(","),
+    [...row.decisionRefs].sort().join(","),
+    [...row.validationRefs].sort().join(","),
+  ].join("|");
+  const bindingCounts = new Map<string, number>();
+  for (const row of traceabilityRows) {
+    const key = bindingKey(row);
+    bindingCounts.set(key, (bindingCounts.get(key) || 0) + 1);
+  }
+  const facetTexts = facets.map((facet) => facet.text);
   const uncovered = facets.filter((facet) => {
     const terms = semanticFacetTerms(facet.text);
-    const semanticCoverage =
-      (facetSectionCovered(terms, changesBody) || facetSectionCovered(terms, decisionsBody)) &&
-      facetSectionCovered(terms, validationBody);
+    const distinctTerms = distinctSemanticFacetTerms(facet.text, facetTexts);
+    const facetRows = traceabilityRows.filter((row) => row.index === facet.index);
+    const unambiguousRow = facetRows.length === 1 ? facetRows[0] : undefined;
+    // Multiple user goals may share evidence or a change, but an identical
+    // E+C/D+V tuple cannot independently prove two outcomes. A legitimate
+    // shared implementation still supplies an outcome-specific validation V.
+    const bindingIsUnique = !!unambiguousRow &&
+      (bindingCounts.get(bindingKey(unambiguousRow)) || 0) === 1;
     const referenceCoverage = planFacetTraceabilityRowCoversActionAndValidation({
-      row: traceabilityRows.find((row) => row.index === facet.index),
+      // A facet must have one unambiguous ledger row. Multiple rows for the
+      // same G id are not mergeable because doing so would let a partial row
+      // borrow the missing E/C/D/V role from another row.
+      row: bindingIsUnique ? unambiguousRow : undefined,
       facetTerms: terms,
+      distinctFacetTerms: distinctTerms,
+      evidenceBody,
+      diagnosisBody,
       changesBody,
       decisionsBody,
       validationBody,
     });
-    return !semanticCoverage && !referenceCoverage;
+    // For a multi-facet objective the explicit ledger is always mandatory,
+    // not an optional stricter mode. Free-form prose can look semantically
+    // complete while silently assigning one diagnosis/change to every user
+    // outcome. Requiring G -> grounded E -> C/D -> V makes the review boundary
+    // mechanically checkable and prevents a missing/broken row from borrowing
+    // coverage elsewhere in the document.
+    const requiredDiagnosisLinked = input.diagnosisRequired !== true || (
+      !!unambiguousRow && unambiguousRow.diagnosisRefs.length > 0
+    );
+    return !referenceCoverage || !requiredDiagnosisLinked;
   });
   return uncovered.length === 0
     ? classifyPlanArtifactQualityResult({ ok: true })
@@ -1586,6 +2245,16 @@ function planGroundingPathsMatch(left: string, right: string): boolean {
     normalizePlanGroundingPath(left),
     normalizePlanGroundingPath(right),
   );
+}
+
+function planGroundingTargetResolvesToEvidence(
+  target: string,
+  evidenceTargets: string[],
+): boolean {
+  return resolveUniqueWorkspaceFileReference(
+    normalizePlanGroundingPath(target),
+    evidenceTargets.map(normalizePlanGroundingPath),
+  ) !== null;
 }
 
 function isPlanMutationLine(value: string): boolean {
@@ -1820,7 +2489,11 @@ function collectObservedDevServerPorts(input: {
       )
       .map((record) => ({
         target: String(record.target || ""),
-        detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
+        detail: [
+          record.summary,
+          ...formatPlanStructuredEvidenceFacts(record.structuredFacts),
+          ...(record.facts || []),
+        ].filter(Boolean).join(" "),
       })),
     ...(input.recentToolActivity || [])
       .filter((activity) =>
@@ -1829,7 +2502,11 @@ function collectObservedDevServerPorts(input: {
       )
       .map((activity) => ({
         target: String(activity.target || ""),
-        detail: [activity.detail, ...(activity.facts || [])].filter(Boolean).join(" "),
+        detail: [
+          activity.detail,
+          ...formatPlanStructuredEvidenceFacts(activity.structuredFacts),
+          ...(activity.facts || []),
+        ].filter(Boolean).join(" "),
       })),
   ];
   const ports = new Set<number>();
@@ -1923,7 +2600,11 @@ function collectReadEvidenceForClaimGrounding(input: {
       )
       .map((record) => ({
         target: String(record.target || ""),
-        detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
+        detail: [
+          record.summary,
+          ...formatPlanStructuredEvidenceFacts(record.structuredFacts),
+          ...(record.facts || []),
+        ].filter(Boolean).join(" "),
       })),
     ...(input.recentToolActivity || [])
       .filter((activity) =>
@@ -1932,7 +2613,11 @@ function collectReadEvidenceForClaimGrounding(input: {
       )
       .map((activity) => ({
         target: String(activity.target || ""),
-        detail: [activity.detail, ...(activity.facts || [])].filter(Boolean).join(" "),
+        detail: [
+          activity.detail,
+          ...formatPlanStructuredEvidenceFacts(activity.structuredFacts),
+          ...(activity.facts || []),
+        ].filter(Boolean).join(" "),
       })),
   ];
 }
@@ -2051,8 +2736,17 @@ function collectDirectAbsenceClaimIdentifiers(line: string): string[] {
   // Source-presence assertions. Deliberately exclude relational verbs such as
   // 未使用、未实现、未注册 and phrases such as 没有在 ...; seeing an identifier
   // elsewhere in source is not evidence that those relationships exist.
-  addMatches(/(?:缺少|没有|不存在|未定义)\s*(?:必要的|对应的|任何)?\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
-  addMatches(/(?:missing|absent)\s+(?:an?\s+|the\s+)?[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  // A missing relationship is not a declaration-absence claim. For example,
+  // "the returned object is missing creatorName" is not contradicted by an
+  // interface declaration that mentions creatorName. Relationship claims are
+  // grounded by the later mutation/evidence checks, not this identifier-
+  // presence shortcut.
+  const isRelationalAbsenceClaim =
+    /(?:返回(?:对象|值)?|输出|结果|映射|赋值|绑定|注册|引用|消费|回退).{0,28}(?:缺少|没有|不存在|未定义)|(?:return(?:ed)?\s+(?:object|value)|output|result|mapping|assignment|binding|registration|reference|consumer|fallback).{0,28}(?:missing|absent|does\s+not\s+(?:contain|include|map|assign|bind|register|reference))/i.test(line);
+  if (!isRelationalAbsenceClaim) {
+    addMatches(/(?:缺少|没有|不存在|未定义)\s*(?:必要的|对应的|任何)?\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+    addMatches(/(?:missing|absent)\s+(?:an?\s+|the\s+)?[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  }
   addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s*(?:函数|方法|变量|监听器|保护)?\s*(?:不存在|未定义)/gi);
   addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s+is\s+(?:missing|absent|not\s+(?:present|defined))/gi);
 
@@ -2104,8 +2798,372 @@ export function findContradictedPlanDiagnosticClaim(input: {
   return null;
 }
 
+function textExplicitlyRemovesContractField(value: string, field: string): boolean {
+  const escapedField = escapePlanRegExp(field);
+  for (const rawLine of String(value || "").split(/\r?\n/)) {
+    const line = rawLine.replace(/[`*_]/g, " ").replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    const removesField = new RegExp(
+      `(?:移除|删除|去掉|废弃|重命名|替换|remove|delete|drop|deprecate|rename|replace)[^\\n。.!?]{0,140}(?:^|[^A-Za-z0-9_$])${escapedField}(?:$|[^A-Za-z0-9_$])`,
+      "i",
+    ).test(line);
+    if (!removesField) continue;
+    if (/(?:不(?:要|应|会|得|再)?|无需|避免)\s*(?:移除|删除|去掉|废弃|重命名|替换)|(?:do\s+not|don't|must\s+not|without|avoid)\s+(?:remove|delet|drop|deprecat|renam|replac)/i.test(line)) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function findUnsupportedBreakingFieldContractChange(input: {
+  content: string;
+  userGoal?: string;
+  evidenceBundle?: PlanEvidenceBundle;
+}): string | null {
+  if (!input.evidenceBundle) return null;
+  const mismatchKinds = assessPlanClosureEvidence(input.evidenceBundle).contractMismatchKinds;
+  for (const kind of mismatchKinds) {
+    if (!kind.startsWith("producer_missing_required_field:")) continue;
+    const field = kind.slice("producer_missing_required_field:".length);
+    if (!field || !textExplicitlyRemovesContractField(input.content, field)) continue;
+    if (textExplicitlyRemovesContractField(input.userGoal || "", field)) continue;
+    return field;
+  }
+  return null;
+}
+
+type ParsedConfirmedContractMismatch =
+  | {
+      type: "command_argument_case";
+      raw: string;
+      command: string;
+      actual: string;
+      expected: string;
+    }
+  | { type: "unregistered_command"; raw: string; command: string }
+  | { type: "event_listener_api"; raw: string; eventName: string }
+  | { type: "missing_permission"; raw: string; plugin: string }
+  | { type: "config_value_mismatch"; raw: string; key: string }
+  | { type: "producer_missing_required_field"; raw: string; field: string }
+  | { type: "unknown"; raw: string };
+
+/**
+ * Parse the finite mismatch vocabulary emitted by `assessPlanClosureEvidence`.
+ * Keep this as a discriminated union so adding a new detector cannot silently
+ * make its confirmed mismatch optional at the approval boundary.
+ */
+function parseConfirmedContractMismatch(rawKind: string): ParsedConfirmedContractMismatch {
+  const raw = String(rawKind || "").trim();
+  const commandArgument = raw.match(/^command_argument_case:(.+):([^:]+)->([^:]+)$/);
+  if (commandArgument) {
+    return {
+      type: "command_argument_case",
+      raw,
+      command: (commandArgument[1] || "").trim(),
+      actual: (commandArgument[2] || "").trim(),
+      expected: (commandArgument[3] || "").trim(),
+    };
+  }
+  const parseSingleValue = <T extends ParsedConfirmedContractMismatch["type"]>(
+    type: T,
+    prefix: string,
+    field: string,
+  ): ParsedConfirmedContractMismatch | null => {
+    if (!raw.startsWith(prefix)) return null;
+    const value = raw.slice(prefix.length).trim();
+    if (!value) return { type: "unknown", raw };
+    return { type, raw, [field]: value } as ParsedConfirmedContractMismatch;
+  };
+  return parseSingleValue("unregistered_command", "unregistered_command:", "command") ||
+    parseSingleValue("event_listener_api", "event_listener_api:", "eventName") ||
+    parseSingleValue("missing_permission", "missing_permission:", "plugin") ||
+    parseSingleValue("config_value_mismatch", "config_value_mismatch:", "key") ||
+    parseSingleValue(
+      "producer_missing_required_field",
+      "producer_missing_required_field:",
+      "field",
+    ) ||
+    { type: "unknown", raw };
+}
+
+function planEvidenceBundleFactText(
+  fact: PlanEvidenceBundle["facts"][number],
+): string {
+  return [fact.summary, ...formatPlanStructuredEvidenceFacts(fact.structuredFacts)]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function exactContractTokenPattern(value: string): string {
+  return `(?:^|[^A-Za-z0-9_$-])(${escapePlanRegExp(value)})(?=$|[^A-Za-z0-9_$-])`;
+}
+
+function textContainsExactContractToken(value: string, token: string): boolean {
+  if (!token) return false;
+  return new RegExp(exactContractTokenPattern(token)).test(String(value || ""));
+}
+
+function exactContractTokenRanges(
+  value: string,
+  token: string,
+): Array<{ start: number; end: number }> {
+  if (!token) return [];
+  const ranges: Array<{ start: number; end: number }> = [];
+  const pattern = new RegExp(exactContractTokenPattern(token), "g");
+  for (const match of String(value || "").matchAll(pattern)) {
+    const matchedToken = match[1] || "";
+    const prefixLength = (match[0] || "").length - matchedToken.length;
+    const start = (match.index || 0) + prefixLength;
+    ranges.push({ start, end: start + matchedToken.length });
+  }
+  return ranges;
+}
+
+function structuredContractArguments(
+  value: string,
+  contractName: "command_invoke_argument_contract" | "command_handler_argument_contract",
+  command: string,
+): string[] {
+  const pattern = new RegExp(
+    `${contractName}\\s*\\(\\s*${escapePlanRegExp(command)}\\s*,\\s*([^)]*)\\)`,
+    "gi",
+  );
+  return [...String(value || "").matchAll(pattern)]
+    .flatMap((match) => String(match[1] || "").split(","))
+    .map((argument) => argument.trim())
+    .filter(Boolean);
+}
+
+function confirmedContractMismatchOwnerTargets(input: {
+  mismatch: ParsedConfirmedContractMismatch;
+  bundle: PlanEvidenceBundle;
+}): string[] {
+  const { mismatch, bundle } = input;
+  if (mismatch.type === "config_value_mismatch") {
+    return assessPlanConfigurationContracts(bundle)
+      .filter((contract) => contract.status === "mismatch" && contract.key === mismatch.key)
+      .flatMap((contract) => contract.targets);
+  }
+  const owners = bundle.facts.filter((fact) => {
+    const evidenceText = planEvidenceBundleFactText(fact);
+    switch (mismatch.type) {
+      case "command_argument_case":
+        // The observed caller owns the actual argument name. Requiring the
+        // disposition to bind to this owner prevents an unrelated source file
+        // that happens to repeat all three identifiers from satisfying the gate.
+        return structuredContractArguments(
+          evidenceText,
+          "command_invoke_argument_contract",
+          mismatch.command,
+        ).some((argument) => argument === mismatch.actual);
+      case "unregistered_command":
+        return /(?:generate_handler!\s*\[|handler_contract\s*\()/i.test(evidenceText);
+      case "event_listener_api":
+        return new RegExp(
+          `event_dom_listener_contract\\s*\\(\\s*${escapePlanRegExp(mismatch.eventName)}\\s*\\)`,
+          "i",
+        ).test(evidenceText);
+      case "missing_permission":
+        return /(?:^|[\\/])capabilit(?:y|ies)[\\/]/i.test(fact.target) &&
+          /permission_contract\s*\(/i.test(evidenceText);
+      case "producer_missing_required_field": {
+        const field = escapePlanRegExp(mismatch.field);
+        return new RegExp(
+          `field_contract\\s*\\(\\s*[^,()]*\\.${field}\\s*,\\s*optional\\s*\\)`,
+          "i",
+        ).test(evidenceText) &&
+          /returned_field_contract\s*\(/i.test(evidenceText) &&
+          !new RegExp(`returned_field_contract\\s*\\(\\s*${field}\\s*\\)`, "i")
+            .test(evidenceText);
+      }
+      case "unknown":
+        return false;
+    }
+  }).map((fact) => fact.target);
+  return [...new Set(owners)];
+}
+
+function commandArgumentDispositionIsExplicit(
+  value: string,
+  mismatch: Extract<ParsedConfirmedContractMismatch, { type: "command_argument_case" }>,
+): boolean {
+  const text = String(value || "");
+  if (
+    !textContainsExactContractToken(text, mismatch.command) ||
+    !textContainsExactContractToken(text, mismatch.actual) ||
+    !textContainsExactContractToken(text, mismatch.expected)
+  ) return false;
+  const actualRanges = exactContractTokenRanges(text, mismatch.actual);
+  const expectedRanges = exactContractTokenRanges(text, mismatch.expected);
+  const forwardDisposition = /(?:->|→|改为|更名为|重命名为|替换为|调整为|对齐(?:为|到)|rename(?:d)?\s+to|replace(?:d)?\s+(?:it\s+)?with|align(?:ed)?\s+(?:it\s+)?to|use\s+instead)/i;
+  const reverseDisposition = /(?:而不是|替代|取代|instead\s+of|rather\s+than)/i;
+  return actualRanges.some((actual) => expectedRanges.some((expected) => {
+    if (actual.end <= expected.start && expected.start - actual.end <= 200) {
+      const bridge = text.slice(actual.end, expected.start);
+      return exactContractTokenRanges(bridge, mismatch.actual).length === 0 &&
+        exactContractTokenRanges(bridge, mismatch.expected).length === 0 &&
+        forwardDisposition.test(bridge);
+    }
+    if (expected.end <= actual.start && actual.start - expected.end <= 180) {
+      const bridge = text.slice(expected.end, actual.start);
+      return exactContractTokenRanges(bridge, mismatch.actual).length === 0 &&
+        exactContractTokenRanges(bridge, mismatch.expected).length === 0 &&
+        reverseDisposition.test(bridge);
+    }
+    return false;
+  }));
+}
+
+function confirmedContractMismatchDispositionIsExplicit(
+  value: string,
+  mismatch: ParsedConfirmedContractMismatch,
+): boolean {
+  const text = String(value || "");
+  switch (mismatch.type) {
+    case "command_argument_case":
+      return commandArgumentDispositionIsExplicit(text, mismatch);
+    case "unregistered_command":
+      return textContainsExactContractToken(text, mismatch.command) &&
+        /(?:实现|新增|添加|注册|接入|implement|add|register|wire).{0,100}(?:命令|处理器|handler|command|generate_handler)|(?:命令|处理器|handler|command|generate_handler).{0,100}(?:实现|新增|添加|注册|接入|implement|add|register|wire)/i.test(text);
+    case "event_listener_api":
+      return textContainsExactContractToken(text, mismatch.eventName) &&
+        /(?:DOM|addEventListener)/i.test(text) &&
+        /(?:Tauri|listen|event API|事件 API)/i.test(text) &&
+        /(?:改为|替换|迁移|接入|使用|replace|migrate|switch|use)/i.test(text);
+    case "missing_permission":
+      return textContainsExactContractToken(text, mismatch.plugin) &&
+        /(?:权限|capabilit|permission)/i.test(text) &&
+        /(?:新增|添加|加入|配置|补齐|授予|add|configure|grant)/i.test(text);
+    case "config_value_mismatch":
+      return textContainsExactContractToken(text, mismatch.key) &&
+        /(?:统一|对齐|改为|保持一致|align|unify|change|match)/i.test(text);
+    case "producer_missing_required_field":
+      return textContainsExactContractToken(text, mismatch.field) &&
+        /(?:填充|补齐|新增|添加|映射|返回|populate|add|map|return|include)/i.test(text);
+    case "unknown":
+      // Fail closed. A new detector must define both its owner and disposition
+      // semantics here before plans containing it can cross the review gate.
+      return false;
+  }
+}
+
+function collectGroundedContractDecisionLines(input: {
+  content: string;
+  bundle: PlanEvidenceBundle;
+  ownerTargets: string[];
+}): string[] {
+  const decisions = parsePlanSections(input.content).filter((section) =>
+    planSectionMatchesRole(section, [
+      /决策|结论|取舍|约束|保持不变|无需改动|不修改|decision|conclusion|trade-?off|constraint|no changes?|unchanged/i,
+    ])
+  );
+  return decisions.flatMap((section) => section.body.split(/\r?\n/).map((rawLine) => ({
+    rawLine,
+    context: [...section.ancestors, section.title].join(" "),
+  }))).filter(({ rawLine, context }) => {
+    const line = stripPlanListMarker(rawLine);
+    if (!line || !/(?:决定|选择|以.+为准|保持|不修改|无需改动|改为|决定|choose|decide|canonical|keep|preserve|unchanged|change)/i.test(line)) {
+      return false;
+    }
+    const explicitPaths = [...`${context}\n${line}`.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+      .map((match) => match[0] || "")
+      .filter(Boolean);
+    return explicitPaths.some((path) => {
+      const resolved = resolveUniqueWorkspaceFileReference(path, input.ownerTargets);
+      return !!resolved && input.bundle.facts.some((fact) =>
+        workspacePathsReferToSameFile(fact.target, resolved)
+      );
+    });
+  }).map(({ rawLine }) => stripPlanListMarker(rawLine));
+}
+
+function collectGroundedContractChangeLines(input: {
+  content: string;
+  bundle: PlanEvidenceBundle;
+  ownerTargets: string[];
+}): string[] {
+  const changes = parsePlanSections(input.content).filter((section) =>
+    planSectionMatchesRole(section, [
+      /关键改动|实现改动|具体改动|改动|变更|修复方案|实现方案|实施方案|执行方案|架构|设计|组件|数据流|落地方案|key changes|changes?|implementation|fix plan|approach|architecture|design|components?|data flow|plan of work/i,
+    ])
+  );
+  return changes.flatMap((section) => section.body.split(/\r?\n/).map((rawLine) => ({
+    rawLine,
+    context: [...section.ancestors, section.title].join(" "),
+  }))).filter(({ rawLine, context }) => {
+    const line = stripPlanListMarker(rawLine);
+    if (!line || !/(?:修改|更新|改为|新增|添加|加入|补齐|实现|注册|替换|迁移|接入|配置|填充|映射|modify|update|change|add|implement|register|replace|migrate|wire|configure|populate|map)/i.test(line)) {
+      return false;
+    }
+    const explicitPaths = [...`${context}\n${line}`.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+      .map((match) => match[0] || "")
+      .filter(Boolean);
+    return explicitPaths.some((path) => {
+      const resolved = resolveUniqueWorkspaceFileReference(path, input.ownerTargets);
+      return !!resolved && input.bundle.facts.some((fact) =>
+        workspacePathsReferToSameFile(fact.target, resolved)
+      );
+    });
+  }).map(({ rawLine }) => stripPlanListMarker(rawLine));
+}
+
+/**
+ * A frozen evidence bundle can prove a cross-boundary mismatch even when a
+ * model draft chooses unrelated but well-grounded edits. Every proved mismatch
+ * therefore needs one mismatch-owner-bound change (or explicit decision) that
+ * states the complete disposition. Evidence/summary repetition is not action.
+ */
+export function validateConfirmedContractMismatchDisposition(input: {
+  content: string;
+  evidenceBundle?: PlanEvidenceBundle;
+  candidate?: PlanCandidate;
+}): PlanArtifactQualityResult {
+  if (!input.evidenceBundle) return classifyPlanArtifactQualityResult({ ok: true });
+  const mismatchKinds = assessPlanClosureEvidence(input.evidenceBundle).contractMismatchKinds;
+  if (mismatchKinds.length === 0) return classifyPlanArtifactQualityResult({ ok: true });
+  const candidate = input.candidate || buildPlanCandidate({
+    content: input.content,
+    bundle: input.evidenceBundle,
+  });
+  const uncovered = mismatchKinds.filter((raw) => {
+    const mismatch = parseConfirmedContractMismatch(raw);
+    const ownerTargets = confirmedContractMismatchOwnerTargets({
+      mismatch,
+      bundle: input.evidenceBundle!,
+    });
+    if (ownerTargets.length === 0) return true;
+    const groundedChanges = candidate.changes
+      .filter((change) =>
+        change.evidenceRefs.length > 0 &&
+        ownerTargets.some((target) => workspacePathsReferToSameFile(target, change.targetRef))
+      )
+      .map((change) => change.text);
+    const groundedRoleChanges = collectGroundedContractChangeLines({
+      content: input.content,
+      bundle: input.evidenceBundle!,
+      ownerTargets,
+    });
+    const groundedDecisions = collectGroundedContractDecisionLines({
+      content: input.content,
+      bundle: input.evidenceBundle!,
+      ownerTargets,
+    });
+    return ![...groundedChanges, ...groundedRoleChanges, ...groundedDecisions].some((line) =>
+      confirmedContractMismatchDispositionIsExplicit(line, mismatch)
+    );
+  });
+  return uncovered.length === 0
+    ? classifyPlanArtifactQualityResult({ ok: true })
+    : classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: `uncovered_confirmed_contract_mismatches:${uncovered.join("|")}`,
+      });
+}
+
 export function validatePlanEvidenceGrounding(input: {
   content: string;
+  userGoal?: string;
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
@@ -2116,6 +3174,13 @@ export function validatePlanEvidenceGrounding(input: {
     return classifyPlanArtifactQualityResult({
       ok: false,
       reason: `plan_diagnostic_claim_contradicted:${contradictedClaim}`,
+    });
+  }
+  const unsupportedBreakingField = findUnsupportedBreakingFieldContractChange(input);
+  if (unsupportedBreakingField) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: `unsupported_breaking_contract_removal:${unsupportedBreakingField}`,
     });
   }
   const readTargets = [
@@ -2147,7 +3212,7 @@ export function validatePlanEvidenceGrounding(input: {
   }
 
   const ungroundedTargets = changeTargets.filter((target) =>
-    !readTargets.some((readTarget) => planGroundingPathsMatch(target, readTarget))
+    !planGroundingTargetResolvesToEvidence(target, readTargets)
   );
   if (ungroundedTargets.length > 0) {
     return classifyPlanArtifactQualityResult({
@@ -2163,6 +3228,7 @@ export function validatePlanEvidenceGrounding(input: {
 
 export function validateGroundedActionablePlanArtifact(input: {
   content: string;
+  userGoal?: string;
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
@@ -2178,6 +3244,7 @@ function repairMissingPlanEvidenceSection(input: {
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
+  evidenceBundle?: PlanEvidenceBundle;
   language: "zh" | "en";
 }): string | null {
   const changeTargets = collectPlanChangeTargets(input.content);
@@ -2185,7 +3252,9 @@ function repairMissingPlanEvidenceSection(input: {
 
   const matchesChangedTarget = (value: string): boolean => {
     const normalized = normalizePlanGroundingPath(value);
-    return changeTargets.some((target) => planGroundingPathsMatch(target, normalized));
+    return changeTargets.some((target) =>
+      planGroundingTargetResolvesToEvidence(target, [normalized])
+    );
   };
   const evidenceLines = uniquePlanItems([
     ...(input.evidence || [])
@@ -2206,6 +3275,15 @@ function repairMissingPlanEvidenceSection(input: {
       )
       .map((activity) => summarizeEvidenceLine(
         summarizeToolActivityForEvidence(activity),
+        input.language,
+      )),
+    ...(input.evidenceBundle?.facts || [])
+      .filter((fact) => matchesChangedTarget(fact.target))
+      .map((fact) => summarizeEvidenceLine(
+        `${fact.tool} ${fact.target}; excerpt=${[
+          fact.summary,
+          ...formatPlanStructuredEvidenceFacts(fact.structuredFacts),
+        ].filter(Boolean).join(" ")}`,
         input.language,
       )),
   ], 6, 1200, true).filter(isConcretePlanEvidence);
@@ -2667,8 +3745,21 @@ function buildFacetValidationPlanLines(input: {
 }): string[] {
   if (input.facets.length < 2) return [];
   return input.facets.map((facet) => input.language === "zh"
-    ? `按分面 ${facet.index} 的原始约束“${facet.text}”执行其涉及的输入、操作或检查，记录实际结果，并确认该分面单独通过；不得用其他分面的结果或仅用构建成功代替。`
-    : `Exercise the inputs, actions, or checks in facet ${facet.index} ("${facet.text}"), record the observed result, and confirm this facet passes independently; do not substitute another facet or a successful build.`);
+    ? `断言：执行分面 ${facet.index} 涉及的输入与操作后，观察结果满足原始约束“${facet.text}”；该断言必须有独立运行结果，不能由其他分面或仅构建成功代替。`
+    : `Assertion: after exercising the inputs and actions for facet ${facet.index}, the observed result satisfies the original constraint "${facet.text}"; this assertion requires its own runtime result and cannot be replaced by another facet or a successful build.`);
+}
+
+function buildGroundedAcceptanceAssertionLines(input: {
+  goal: string;
+  evidence: string[];
+  language: "zh" | "en";
+}): string[] {
+  const goal = compactPlanLine(input.goal, input.language === "zh" ? 180 : 220, true);
+  const evidence = compactPlanLine(input.evidence[0] || "", input.language === "zh" ? 180 : 220, true);
+  if (!goal || !evidence) return [];
+  return [input.language === "zh"
+    ? `断言：针对“${goal}”的回归结果必须证明已确认证据“${evidence}”对应的缺口已消除；断言失败时不得将计划标记完成。`
+    : `Assertion: the regression result for "${goal}" must prove that the gap described by confirmed evidence "${evidence}" is resolved; a failed assertion prevents completion.`];
 }
 
 function buildFacetTraceabilityPlanLines(input: {
@@ -2771,6 +3862,12 @@ function buildDeterministicContractFindings(
       findings.push(language === "zh"
         ? `已确认调用方使用命令 \`${command}\`，但后端 \`generate_handler!\` 注册表中没有对应处理器。`
         : `The caller invokes command \`${command}\`, but the backend \`generate_handler!\` registry has no matching handler.`);
+    } else if (kind.startsWith("command_argument_case:")) {
+      const [, command = "", mapping = ""] = kind.split(":");
+      const [actual = "", expected = ""] = mapping.split("->");
+      findings.push(language === "zh"
+        ? `已确认调用方向 \`${command}\` 传入 \`${actual}\`，而命令边界对外要求 \`${expected}\`，参数命名契约不一致。`
+        : `The caller passes \`${actual}\` to \`${command}\`, while the command boundary exposes \`${expected}\`; the argument-name contracts do not match.`);
     } else if (kind.startsWith("event_listener_api:")) {
       const eventName = kind.slice("event_listener_api:".length);
       findings.push(language === "zh"
@@ -2786,6 +3883,11 @@ function buildDeterministicContractFindings(
       findings.push(language === "zh"
         ? `已确认同一启动链路的多个配置对 \`${key}\` 给出了不同值。`
         : `Multiple configurations in the same startup path define conflicting values for \`${key}\`.`);
+    } else if (kind.startsWith("producer_missing_required_field:")) {
+      const field = kind.slice("producer_missing_required_field:".length);
+      findings.push(language === "zh"
+        ? `已确认上游归一化输出没有填充下游类型与消费方要求的 \`${field}\` 字段。`
+        : `The upstream normalization output does not populate the \`${field}\` field required by the downstream type and consumer contract.`);
     }
   }
   return findings;
@@ -2817,6 +3919,13 @@ function evidenceSupportsContractMismatch(evidence: string, kind: string): boole
     return new RegExp(`(?:command_invoke_contract\\s*\\(${escapePlanRegExp(command)}\\)|handler_contract\\s*\\()`, "i")
       .test(value);
   }
+  if (kind.startsWith("command_argument_case:")) {
+    const [, command = ""] = kind.split(":");
+    return new RegExp(
+      `command_(?:invoke|handler)_argument_contract\\s*\\(\\s*${escapePlanRegExp(command)}(?:,|\\))`,
+      "i",
+    ).test(value);
+  }
   if (kind.startsWith("event_listener_api:")) {
     const eventName = kind.slice("event_listener_api:".length);
     return new RegExp(
@@ -2836,6 +3945,14 @@ function evidenceSupportsContractMismatch(evidence: string, kind: string): boole
   if (kind.startsWith("config_value_mismatch:")) {
     return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i
       .test(value);
+  }
+  if (kind.startsWith("producer_missing_required_field:")) {
+    const field = kind.slice("producer_missing_required_field:".length);
+    const escapedField = escapePlanRegExp(field);
+    return new RegExp(
+      `(?:field_contract\\s*\\(\\s*[^,()]*\\.${escapedField}\\s*,\\s*(?:required|optional)\\s*\\)|field_(?:read|selector)_contract\\s*\\(\\s*${escapedField}\\s*\\)|returned_field_contract\\s*\\()`,
+      "i",
+    ).test(value);
   }
   return false;
 }
@@ -2864,6 +3981,10 @@ function buildDeterministicChangeLine(input: {
     input.language === "zh" ? "已读项目证据确认该文件在影响范围内" : "read project evidence confirms this file is in scope"
   );
   const localContractMismatchKinds = (input.contractMismatchKinds || []).filter((kind) => {
+    if (kind.startsWith("command_argument_case:")) {
+      return /\.(?:[cm]?js|jsx|tsx?)$/i.test(lowerFile) &&
+        /command_invoke_argument_contract\s*\(/i.test(evidence);
+    }
     if (kind.startsWith("unregistered_command:")) {
       return /\.rs$/i.test(lowerFile) && /handler_contract\s*\(/i.test(evidence);
     }
@@ -2877,12 +3998,30 @@ function buildDeterministicChangeLine(input: {
     if (kind.startsWith("config_value_mismatch:")) {
       return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i.test(evidence);
     }
+    if (kind.startsWith("producer_missing_required_field:")) {
+      const field = kind.slice("producer_missing_required_field:".length);
+      const escapedField = escapePlanRegExp(field);
+      return new RegExp(
+        `field_contract\\s*\\(\\s*[^,()]*\\.${escapedField}\\s*,\\s*optional\\s*\\)`,
+        "i",
+      ).test(evidence) &&
+        /\breturned_field_contract\s*\(/i.test(evidence) &&
+        !new RegExp(`returned_field_contract\\s*\\(\\s*${escapedField}\\s*\\)`, "i").test(evidence);
+    }
     return false;
   });
   const missingCommands = localContractMismatchKinds
     .filter((kind) => kind.startsWith("unregistered_command:"))
     .map((kind) => kind.slice("unregistered_command:".length))
     .filter(Boolean);
+  const mismatchedCommandArguments = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("command_argument_case:"))
+    .map((kind) => {
+      const [, command = "", mapping = ""] = kind.split(":");
+      const [actual = "", expected = ""] = mapping.split("->");
+      return { command, actual, expected };
+    })
+    .filter((item) => item.command && item.actual && item.expected);
   const mismatchedEvents = localContractMismatchKinds
     .filter((kind) => kind.startsWith("event_listener_api:"))
     .map((kind) => kind.slice("event_listener_api:".length))
@@ -2895,12 +4034,22 @@ function buildDeterministicChangeLine(input: {
     .filter((kind) => kind.startsWith("config_value_mismatch:"))
     .map((kind) => kind.slice("config_value_mismatch:".length))
     .filter(Boolean);
+  const missingRequiredFields = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("producer_missing_required_field:"))
+    .map((kind) => kind.slice("producer_missing_required_field:".length))
+    .filter(Boolean);
   const pluginPermissionList = missingPluginPermissions
     .map((plugin) => `\`${plugin}:default\``)
     .join(", ");
   const commandList = missingCommands.map((command) => `\`${command}\``).join(", ");
   const eventList = mismatchedEvents.map((eventName) => `\`${eventName}\``).join(", ");
   if (input.language === "en") {
+    if (/\.(?:[cm]?js|jsx|tsx?)$/i.test(lowerFile) && mismatchedCommandArguments.length > 0) {
+      const mappings = mismatchedCommandArguments
+        .map((item) => `\`${item.command}\`: \`${item.actual}\` -> \`${item.expected}\``)
+        .join(", ");
+      return `Update \`${file}\` at the invocation boundary to use the handler's exposed argument names (${mappings}), preserving the backend command signature, return/error semantics, and unrelated behavior. Grounding evidence: ${evidence}.`;
+    }
     if (/\.rs$/i.test(lowerFile) && missingCommands.length > 0) {
       return `Implement the missing Tauri command${missingCommands.length > 1 ? "s" : ""} ${commandList} in \`${file}\` and add ${missingCommands.length > 1 ? "them" : "it"} to the existing \`generate_handler!\` registration with an argument, return, and error contract that matches the caller. Grounding evidence: ${evidence}.`;
     }
@@ -2921,7 +4070,18 @@ function buildDeterministicChangeLine(input: {
     if (mismatchedConfigurationKeys.length > 0) {
       return `Align \`${mismatchedConfigurationKeys.join("`, `")}\` in \`${file}\` with the other read-backed configuration owner in the same startup path, changing only the side that differs from the canonical development command. Grounding evidence: ${evidence}.`;
     }
+    if (missingRequiredFields.length > 0) {
+      const fields = missingRequiredFields.map((field) => `\`${field}\``).join(", ");
+      return `Update the normalization output in \`${file}\` to populate the required downstream field${missingRequiredFields.length > 1 ? "s" : ""} ${fields} from the existing source value, preserving the established public/type contract and compatibility fields. Grounding evidence: ${evidence}.`;
+    }
     return `Repair the concrete implementation mismatch recorded for \`${file}\` (${evidence}) so it satisfies the reviewed objective: ${summarizeGoalForPlanChange(input.goal, "en")}. Preserve unrelated behavior and verify that exact path.`;
+  }
+
+  if (/\.(?:[cm]?js|jsx|tsx?)$/i.test(lowerFile) && mismatchedCommandArguments.length > 0) {
+    const mappings = mismatchedCommandArguments
+      .map((item) => `\`${item.command}\`：\`${item.actual}\` -> \`${item.expected}\``)
+      .join("、");
+    return `修改 \`${file}\` 的命令调用边界，使用处理器对外暴露的参数名（${mappings}），保持后端命令签名、返回值/错误语义及无关行为不变。依据证据：${evidence}。`;
   }
 
   if (/\.rs$/i.test(lowerFile) && missingCommands.length > 0) {
@@ -2943,6 +4103,10 @@ function buildDeterministicChangeLine(input: {
   }
   if (mismatchedConfigurationKeys.length > 0) {
     return `将 \`${file}\` 中的 \`${mismatchedConfigurationKeys.join("`、`")}\` 与同一启动链路的另一已读配置所有者对齐，只修改偏离规范开发命令的一侧。依据证据：${evidence}。`;
+  }
+  if (missingRequiredFields.length > 0) {
+    const fields = missingRequiredFields.map((field) => `\`${field}\``).join("、");
+    return `修改 \`${file}\` 的归一化输出：从现有来源值填充下游必需字段 ${fields}，保留已经建立的公共/类型契约与兼容字段。依据证据：${evidence}。`;
   }
   return `修复 \`${file}\` 中已读证据明确记录的实现不一致（${evidence}），使其满足已审核目标“${summarizeGoalForPlanChange(input.goal, "zh")}”；保持无关行为不变，并验证这条精确链路。`;
 }
@@ -3031,9 +4195,10 @@ function buildCodexStylePlanArtifact(input: {
       : [`Implement the confirmed data/reporting change for ${goalSummary} using the inspected evidence: ${evidence[0]}.`];
     const validation = [
       ...buildFacetValidationPlanLines({ facets, language: "en" }),
-      ...(commands.length > 0 || desktopRuntimeRequired
-        ? buildDeterministicValidationPlanLines({ commands, language: "en", desktopRuntimeRequired })
-        : ["Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result."]),
+      ...buildDeterministicValidationPlanLines({ commands, language: "en", desktopRuntimeRequired }),
+      ...(facets.length < 2 && !commands.some(isFinitePlanValidationCommand)
+        ? buildGroundedAcceptanceAssertionLines({ goal, evidence, language: "en" })
+        : []),
     ];
     const traceability = buildFacetTraceabilityPlanLines({
       facets,
@@ -3086,9 +4251,10 @@ function buildCodexStylePlanArtifact(input: {
     : [`基于已确认的证据实施与“${goalSummary}”相关的数据/报表改动：${evidence[0]}。`];
   const validation = [
     ...buildFacetValidationPlanLines({ facets, language: "zh" }),
-    ...(commands.length > 0 || desktopRuntimeRequired
-      ? buildDeterministicValidationPlanLines({ commands, language: "zh", desktopRuntimeRequired })
-      : ["运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。"]),
+    ...buildDeterministicValidationPlanLines({ commands, language: "zh", desktopRuntimeRequired }),
+    ...(facets.length < 2 && !commands.some(isFinitePlanValidationCommand)
+      ? buildGroundedAcceptanceAssertionLines({ goal, evidence, language: "zh" })
+      : []),
   ];
   const traceability = buildFacetTraceabilityPlanLines({
     facets,
@@ -3205,6 +4371,28 @@ export function canonicalizePlanArtifactContent(input: {
       : "",
   ], 10, 2000, true);
   const concreteEvidenceLines = evidenceLines.filter(isConcretePlanEvidence);
+
+  // Diagnosis is a first-class review role. Canonicalization is a lossy
+  // hierarchy repair, not an opportunity to collapse R claims back into E
+  // observations or assumptions. Preserve model-authored R/E references
+  // verbatim so the typed candidate adapter can bind the same causal chain to
+  // the frozen evidence bundle after materialization.
+  const diagnosisLines = collectLinesFromSections(
+    sections,
+    [PLAN_DIAGNOSIS_SECTION_HEADING_RE],
+    8,
+    2000,
+    true,
+    true,
+  );
+  const traceabilityLines = collectLinesFromSections(
+    sections,
+    [PLAN_FACET_TRACEABILITY_HEADING_RE],
+    16,
+    2000,
+    true,
+    true,
+  );
 
   const visibleFindingLines = uniquePlanItems([
     ...collectSectionTitles(sections, [
@@ -3324,9 +4512,15 @@ export function canonicalizePlanArtifactContent(input: {
       "# Plan",
       formatCodexPlanSection("Summary", summaryLines),
       formatCodexPlanSection("Confirmed Evidence", evidenceLines.slice(0, 10)),
+      ...(diagnosisLines.length > 0
+        ? [formatCodexPlanSection("Diagnosis / Inference", diagnosisLines)]
+        : []),
       formatCodexPlanSection("Key Changes", keyChangeLines),
       formatCodexPlanSection("Public APIs / Interfaces / Types", resolvedApiLines),
       formatCodexPlanSection("Test Plan", validationLines),
+      ...(traceabilityLines.length > 0
+        ? [formatCodexPlanSection("Requirement Facet Traceability", traceabilityLines)]
+        : []),
       formatCodexPlanSection("Assumptions / Defaults", assumptionLines),
     ].join("\n\n");
   }
@@ -3335,9 +4529,15 @@ export function canonicalizePlanArtifactContent(input: {
     "# 计划",
     formatCodexPlanSection("摘要", summaryLines),
     formatCodexPlanSection("已确认证据", evidenceLines.slice(0, 10)),
+    ...(diagnosisLines.length > 0
+      ? [formatCodexPlanSection("诊断 / 推断", diagnosisLines)]
+      : []),
     formatCodexPlanSection("关键改动", keyChangeLines),
     formatCodexPlanSection("公共 API / 接口 / 类型", resolvedApiLines),
     formatCodexPlanSection("测试方案", validationLines),
+    ...(traceabilityLines.length > 0
+      ? [formatCodexPlanSection("需求分面追踪", traceabilityLines)]
+      : []),
     formatCodexPlanSection("假设与默认值", assumptionLines),
   ].join("\n\n");
 }
@@ -3493,11 +4693,76 @@ function compactImplementationCodeBlocks(content: string): string {
     .trim();
 }
 
+const EMPTY_LIST_IMPLEMENTATION_CONTAINER_RE =
+  /^(?:改动(?:内容)?|变更(?:内容)?|实现细节|修改说明|修改为|改为|变更为|调整为|changes?|change to|replace with|implementation(?: details)?)\s*[:：]?\s*$/i;
+const CONCRETE_SIBLING_IMPLEMENTATION_OWNER_RE =
+  /(?:`[^`\n]+(?:\.[A-Za-z0-9]{1,10}|\(\))`|(?:[A-Za-z0-9_@.-]+\/)+[A-Za-z0-9_@.-]+\.[A-Za-z0-9]{1,10}|(?:文件|组件|接口|类型|file|component|interface|type)\s*[:：])/i;
+const CONCRETE_SIBLING_IMPLEMENTATION_ACTION_RE =
+  /(?:修改|更新|改为|新增|添加|修复|调整|移除|删除|替换|重构|接入|保留|统一|使用|让|不再|避免|modify|update|change|add|fix|adjust|remove|delete|replace|refactor|wire|preserve|normalize|use|ensure|prevent)/i;
+
+/**
+ * Some providers render a semantic list as:
+ *
+ *   - **Change to:**
+ *   - Modify `src/main.ts` so ...
+ *
+ * The first row is presentation-only noise; the second row already owns the
+ * complete mutation. Remove only that redundant container when its immediate
+ * same-level sibling independently names an implementation owner and action.
+ * We deliberately leave a truly empty label, a path-only row, or an
+ * identifier-only row untouched so the approval gate still rejects it.
+ */
+function repairRedundantSiblingImplementationContainers(content: string): {
+  content: string;
+  repaired: boolean;
+} {
+  const lines = String(content || "").split(/\r?\n/);
+  let repaired = false;
+  const kept = lines.filter((rawLine, index) => {
+    const ownerMatch = rawLine.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?)((?:\*\*|__)?)(.*?)(?:\2)\s*$/);
+    if (!ownerMatch) return true;
+    const ownerIndent = String(ownerMatch[1] || "").length;
+    const ownerText = String(ownerMatch[3] || "")
+      .replace(/\*\*|__/g, "")
+      .trim();
+    if (!EMPTY_LIST_IMPLEMENTATION_CONTAINER_RE.test(ownerText)) return true;
+
+    let nextMeaningful = "";
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const candidate = lines[cursor] || "";
+      if (!candidate.trim()) continue;
+      nextMeaningful = candidate;
+      break;
+    }
+    const siblingMatch = nextMeaningful.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?)(.+)$/);
+    if (!siblingMatch || String(siblingMatch[1] || "").length !== ownerIndent) return true;
+    const siblingText = String(siblingMatch[2] || "")
+      .replace(/\*\*|__/g, "")
+      .trim();
+    if (
+      EMPTY_LIST_IMPLEMENTATION_CONTAINER_RE.test(siblingText) ||
+      !CONCRETE_SIBLING_IMPLEMENTATION_OWNER_RE.test(siblingText) ||
+      !CONCRETE_SIBLING_IMPLEMENTATION_ACTION_RE.test(siblingText)
+    ) {
+      return true;
+    }
+    repaired = true;
+    return false;
+  });
+  return {
+    content: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    repaired,
+  };
+}
+
 function rejectPlanMaterialization(input: {
   reason: string;
   replyOptions?: string[];
   decisionFork?: PlanDecisionForkAnalysis;
   quality?: PlanArtifactQualityResult;
+  repairableProjection?: PlanMaterializationResult["repairableProjection"];
+  candidateRepairCheckpoint?: PlanCandidateRepairCheckpoint;
+  candidateRepairExhausted?: boolean;
 }): PlanMaterializationResult {
   const quality = input.quality || classifyPlanArtifactQualityResult({
     ok: false,
@@ -3509,6 +4774,11 @@ function rejectPlanMaterialization(input: {
     quality,
     ...(input.replyOptions ? { replyOptions: input.replyOptions } : {}),
     ...(input.decisionFork ? { decisionFork: input.decisionFork } : {}),
+    ...(input.repairableProjection ? { repairableProjection: input.repairableProjection } : {}),
+    ...(input.candidateRepairCheckpoint
+      ? { candidateRepairCheckpoint: input.candidateRepairCheckpoint }
+      : {}),
+    ...(input.candidateRepairExhausted ? { candidateRepairExhausted: true } : {}),
   };
 }
 
@@ -3526,6 +4796,12 @@ export function materializePlanArtifactFromVisibleText(input: {
   language?: "zh" | "en";
   evidenceBundle?: PlanEvidenceBundle;
   expectedEvidenceBundleHash?: string;
+  candidateRepairCheckpoint?: PlanCandidateRepairCheckpoint | null;
+  /**
+   * New production model proposals use typed_runtime. Auto/legacy are retained
+   * for deterministic runtime projections and cold historical imports only.
+   */
+  ingressMode?: PlanMaterializationIngressMode;
 }): PlanMaterializationResult {
   if (
     input.expectedEvidenceBundleHash &&
@@ -3538,13 +4814,226 @@ export function materializePlanArtifactFromVisibleText(input: {
   // We use extracted.content directly since extractReplyOptionsFromContent already
   // handles <user_options> removal without corrupting the content.
   const extracted = extractReplyOptionsFromContent(input.visibleText);
+  const ingressMode = input.ingressMode || "auto";
+  if (ingressMode !== "legacy_markdown_import") {
+    const outputChars = String(input.visibleText || "").length;
+    const priorRepair = input.candidateRepairCheckpoint || null;
+    if (!priorRepair && outputChars > MAX_TYPED_PLAN_INITIAL_OUTPUT_CHARS) {
+      return rejectPlanMaterialization({
+        reason: "typed_plan_candidate_initial_output_budget_exceeded",
+        replyOptions: extracted.replyOptions,
+        candidateRepairExhausted: true,
+      });
+    }
+    if (priorRepair && input.evidenceBundle?.hash !== priorRepair.evidenceBundleHash) {
+      return rejectPlanMaterialization({
+        reason: "typed_plan_repair_evidence_epoch_mismatch",
+        candidateRepairCheckpoint: {
+          ...priorRepair,
+          exhausted: true,
+          terminalReason: "typed_plan_repair_evidence_epoch_mismatch",
+        },
+        candidateRepairExhausted: true,
+      });
+    }
+
+    const repairEnvelope = extractPlanCandidateRepairEnvelope(extracted.content);
+    let repairDraft: TypedPlanDraftV1 | null = null;
+    let repairAttempt = false;
+    if (priorRepair) {
+      if (outputChars > MAX_TYPED_PLAN_REPAIR_OUTPUT_CHARS) {
+        const checkpoint = advancePlanCandidateRepairCheckpoint({
+          checkpoint: priorRepair,
+          outputChars,
+          failures: ["typed_plan_candidate_repair_output_budget_exceeded"],
+          terminalReason: "typed_plan_candidate_repair_output_budget_exceeded",
+        });
+        return rejectPlanMaterialization({
+          reason: checkpoint.terminalReason!,
+          candidateRepairCheckpoint: checkpoint,
+          candidateRepairExhausted: true,
+        });
+      }
+      if (repairEnvelope.status !== "parsed") {
+        const failures = repairEnvelope.status === "invalid"
+          ? repairEnvelope.failures
+          : ["typed_plan_repair_patch_required"];
+        const checkpoint = advancePlanCandidateRepairCheckpoint({
+          checkpoint: priorRepair,
+          outputChars,
+          failures,
+          preserveScope: true,
+        });
+        return rejectPlanMaterialization({
+          reason: `typed_plan_ingress_invalid:${failures.join(",")}`,
+          candidateRepairCheckpoint: checkpoint,
+          candidateRepairExhausted: checkpoint.exhausted,
+        });
+      }
+      const applied = applyPlanCandidateRepairPatch({
+        checkpoint: priorRepair,
+        patch: repairEnvelope.patch,
+      });
+      if (!applied.ok) {
+        const checkpoint = advancePlanCandidateRepairCheckpoint({
+          checkpoint: priorRepair,
+          outputChars,
+          failures: applied.failures,
+          preserveScope: true,
+        });
+        return rejectPlanMaterialization({
+          reason: `typed_plan_ingress_invalid:${applied.failures.join(",")}`,
+          candidateRepairCheckpoint: checkpoint,
+          candidateRepairExhausted: checkpoint.exhausted,
+        });
+      }
+      repairDraft = applied.draft;
+      repairAttempt = true;
+    } else if (repairEnvelope.status !== "absent") {
+      const failures = repairEnvelope.status === "invalid"
+        ? repairEnvelope.failures
+        : ["typed_plan_repair_checkpoint_missing"];
+      return rejectPlanMaterialization({
+        reason: `typed_plan_ingress_invalid:${failures.join(",")}`,
+        candidateRepairExhausted: true,
+      });
+    }
+
+    const envelope = repairDraft
+      ? { status: "parsed" as const, draft: repairDraft }
+      : extractTypedPlanDraftEnvelope(extracted.content);
+    if (envelope.status === "invalid") {
+      return rejectPlanMaterialization({
+        reason: `typed_plan_ingress_invalid:${envelope.failures.join(",")}`,
+        replyOptions: extracted.replyOptions,
+      });
+    }
+    if (envelope.status === "parsed") {
+      if (extracted.replyOptions.length > 0) {
+        return rejectPlanMaterialization({
+          reason: "typed_plan_candidate_with_user_options",
+          replyOptions: extracted.replyOptions,
+        });
+      }
+      if (!input.evidenceBundle) {
+        return rejectPlanMaterialization({ reason: "typed_plan_evidence_bundle_missing" });
+      }
+      const authoringContract = createPlanAuthoringContract({
+        objective: input.userGoal || input.evidenceBundle.objective,
+        contextSignals: normalizeTurnInputContextSignals(input.turnContext || {}),
+      });
+      const typed = createTypedRuntimePlanCandidate({
+        draft: envelope.draft,
+        bundle: input.evidenceBundle,
+        authoringContract,
+        language: input.language === "en" ? "en" : "zh",
+      });
+      if (!typed.ok) {
+        const evidenceReceiptHash = sha256Hex(JSON.stringify(createPlanEvidenceReceipt(input.evidenceBundle)));
+        const checkpoint = repairAttempt && priorRepair
+          ? advancePlanCandidateRepairCheckpoint({
+              checkpoint: priorRepair,
+              outputChars,
+              draft: envelope.draft,
+              failures: typed.failures,
+            })
+          : createPlanCandidateRepairCheckpoint({
+              draft: envelope.draft,
+              evidenceBundleHash: input.evidenceBundle.hash,
+              evidenceReceiptHash,
+              failures: typed.failures,
+              outputChars,
+            });
+        return rejectPlanMaterialization({
+          reason: `typed_plan_ingress_invalid:${typed.failures.join(",")}`,
+          candidateRepairCheckpoint: checkpoint,
+          candidateRepairExhausted: checkpoint.exhausted,
+        });
+      }
+      const candidateFailures = validatePlanCandidate(
+        typed.candidate,
+        input.evidenceBundle.hash,
+      );
+      if (candidateFailures.length > 0) {
+        const evidenceReceiptHash = sha256Hex(JSON.stringify(typed.candidate.evidenceReceipt));
+        const checkpoint = repairAttempt && priorRepair
+          ? advancePlanCandidateRepairCheckpoint({
+              checkpoint: priorRepair,
+              outputChars,
+              draft: envelope.draft,
+              failures: candidateFailures,
+            })
+          : createPlanCandidateRepairCheckpoint({
+              draft: envelope.draft,
+              evidenceBundleHash: input.evidenceBundle.hash,
+              evidenceReceiptHash,
+              failures: candidateFailures,
+              outputChars,
+            });
+        return rejectPlanMaterialization({
+          reason: `typed_plan_candidate_invalid:${candidateFailures.join(",")}`,
+          candidateRepairCheckpoint: checkpoint,
+          candidateRepairExhausted: checkpoint.exhausted,
+        });
+      }
+      const closure = assessPlanClosureEvidence(input.evidenceBundle);
+      // Typed action grounding is validated against explicit E/target/owner
+      // edges above.  It does not require the legacy deterministic fallback's
+      // inferred changeTargets: decision-only work may have no mutation scope,
+      // and an empty-workspace create is grounded by an observed root owner.
+      const typedBundleReady = !!input.evidenceBundle.objective && (
+        envelope.draft.changes.length === 0 || input.evidenceBundle.facts.length > 0
+      );
+      const closureReason = !typedBundleReady
+        ? "insufficient_grounded_evidence:typed_bundle_not_ready"
+        : envelope.draft.changes.length > 0 && closure.unresolvedContractKinds.length > 0
+          ? `unverified_plan_contract_counterpart:${closure.unresolvedContractKinds.join(",")}`
+          : "";
+      if (closureReason) {
+        return rejectPlanMaterialization({
+          reason: closureReason,
+          quality: classifyPlanArtifactQualityResult({ ok: false, reason: closureReason }),
+        });
+      }
+      // The projection is created only after the typed graph passes. No
+      // Markdown canonicalizer, language regex, or quality-repair path runs on
+      // new runtime authority.
+      return {
+        ok: true,
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        content: typed.candidate.projection.content,
+        source: "typed_runtime_plan",
+        evidenceBundleHash: input.evidenceBundle.hash,
+        candidate: typed.candidate,
+        replyOptions: [],
+      };
+    }
+    if (ingressMode === "typed_runtime") {
+      return rejectPlanMaterialization({
+        reason: "typed_plan_draft_missing",
+        replyOptions: extracted.replyOptions,
+      });
+    }
+  }
   // Apply stripPlanChoiceMarkup to handle any remaining protocol markers
   // but only if there are actual options to extract (to avoid corrupting clean content)
   const raw = extracted.replyOptions.length > 0
     ? stripPlanChoiceMarkup(extracted.content)
     : extracted.content.trim();
   if (!raw) return rejectPlanMaterialization({ reason: "empty", replyOptions: extracted.replyOptions });
-  if (PROTOCOL_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "protocol_noise" });
+  const protocolNoise = PROTOCOL_NOISE_RE.exec(raw);
+  if (protocolNoise) {
+    return rejectPlanMaterialization({
+      reason: "protocol_noise",
+      quality: classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: "protocol_noise",
+        failureStage: "protocol_markup",
+        failurePreview: String(protocolNoise[0] || "").slice(0, 120),
+      }),
+    });
+  }
   if (TOOL_LOG_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "tool_log_noise" });
 
   const language = detectMaterializationLanguage({
@@ -3605,6 +5094,14 @@ export function materializePlanArtifactFromVisibleText(input: {
   }
 
   let validation = validateActionablePlanArtifact(content);
+  if (!validation.ok && validation.reason === "empty_plan_implementation_detail") {
+    const formattingRepair = repairRedundantSiblingImplementationContainers(content);
+    if (formattingRepair.repaired) {
+      content = formattingRepair.content;
+      validation = validateActionablePlanArtifact(content);
+      source = "formatting_repaired_visible_plan";
+    }
+  }
   if (!validation.ok && validation.reason === "excessive_plan_code_dump") {
     const compacted = compactImplementationCodeBlocks(content);
     const compactedValidation = validateActionablePlanArtifact(compacted);
@@ -3652,17 +5149,18 @@ export function materializePlanArtifactFromVisibleText(input: {
     });
     if (repaired.repairedSections.length > 0) {
       const repairedValidation = validateActionablePlanArtifact(repaired.content);
-      if (repairedValidation.ok) {
-        content = repaired.content;
-        validation = repairedValidation;
-      }
-      // If repair didn't fix the issues, fall through to canonicalization
+      // A deterministic repair can expose the next independent violation.
+      // Preserve that monotonic progress even when the artifact is not yet
+      // valid, so canonicalization/rewrite evaluates the repaired candidate
+      // instead of rediscovering already-fixed gaps from the stale original.
+      content = repaired.content;
+      validation = repairedValidation;
     }
   }
   // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
-    !/insufficient_grounded_evidence|generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump|empty_plan_implementation_detail|conflicting_plan_acceptance_assertions/i.test(validation.reason || "")
+    !/insufficient_grounded_evidence|generic_fallback_plan|unverified_diagnostic_claim_as_confirmed|unsupported_hypothesis_as_plan|weak_path_echo_evidence|import_only_evidence|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump|empty_plan_implementation_detail|conflicting_plan_acceptance_assertions/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,
@@ -3690,11 +5188,24 @@ export function materializePlanArtifactFromVisibleText(input: {
       reason: validation.reason || "quality_gate",
       decisionFork,
       quality: validation,
+      ...(
+        validation.reason === "non_executable_test_plan"
+          ? {
+              repairableProjection: {
+                kind: "plan" as const,
+                path: ".MAIN/plans/plan.md",
+                content,
+                source,
+              },
+            }
+          : {}
+      ),
     });
   }
 
   let grounding = validatePlanEvidenceGrounding({
     content,
+    userGoal: input.userGoal,
     evidence: input.evidence,
     evidenceRecords: input.evidenceRecords,
     recentToolActivity: input.recentToolActivity,
@@ -3721,6 +5232,7 @@ export function materializePlanArtifactFromVisibleText(input: {
           : "grounding_repaired_visible_plan";
         grounding = validatePlanEvidenceGrounding({
           content,
+          userGoal: input.userGoal,
           evidence: input.evidence,
           evidenceRecords: input.evidenceRecords,
           recentToolActivity: input.recentToolActivity,
@@ -3736,11 +5248,13 @@ export function materializePlanArtifactFromVisibleText(input: {
         evidence: input.evidence,
         evidenceRecords: input.evidenceRecords,
         recentToolActivity: input.recentToolActivity,
+        evidenceBundle: input.evidenceBundle,
         language,
       });
       if (repaired) {
         const repairedQuality = validateGroundedActionablePlanArtifact({
           content: repaired,
+          userGoal: input.userGoal,
           evidence: input.evidence,
           evidenceRecords: input.evidenceRecords,
           recentToolActivity: input.recentToolActivity,
@@ -3776,9 +5290,16 @@ export function materializePlanArtifactFromVisibleText(input: {
     }
   }
 
+  const authoringContract = input.evidenceBundle
+    ? createPlanAuthoringContract({
+        objective: input.userGoal || input.evidenceBundle.objective,
+        contextSignals: normalizeTurnInputContextSignals(input.turnContext || {}),
+      })
+    : null;
   const facetCoverage = validateNumberedUserGoalFacetCoverage({
     userGoal: input.userGoal,
     content,
+    diagnosisRequired: authoringContract?.diagnosisRequired,
   });
   if (!facetCoverage.ok) {
     return rejectPlanMaterialization({
@@ -3789,8 +5310,24 @@ export function materializePlanArtifactFromVisibleText(input: {
   }
 
   const candidate = input.evidenceBundle
-    ? buildPlanCandidate({ content, bundle: input.evidenceBundle })
+    ? buildPlanCandidate({
+        content,
+        bundle: input.evidenceBundle,
+        authoringContract: authoringContract || undefined,
+      })
     : undefined;
+  const confirmedContractDisposition = validateConfirmedContractMismatchDisposition({
+    content,
+    evidenceBundle: input.evidenceBundle,
+    candidate,
+  });
+  if (!confirmedContractDisposition.ok) {
+    return rejectPlanMaterialization({
+      reason: confirmedContractDisposition.reason || "uncovered_confirmed_contract_mismatches",
+      decisionFork,
+      quality: confirmedContractDisposition,
+    });
+  }
   if (candidate) {
     const candidateFailures = validatePlanCandidate(candidate, input.evidenceBundle!.hash);
     if (candidateFailures.length > 0) {
@@ -3812,18 +5349,23 @@ export function materializePlanArtifactFromVisibleText(input: {
         quality: classifyPlanArtifactQualityResult({ ok: false, reason }),
       });
     }
-  } else if (input.evidenceBundle && !isPlanEvidenceBundleReady(input.evidenceBundle)) {
-    // A model-authored plan may infer a repair from trusted observations, but
-    // it still needs a non-empty frozen bundle and grounded change targets.
-    // The inference remains a review candidate; it is never promoted back
-    // into runtime facts or accepted as execution/validation evidence.
-    return rejectPlanMaterialization({
-      reason: "insufficient_grounded_evidence:bundle_not_ready",
-      quality: classifyPlanArtifactQualityResult({
-        ok: false,
-        reason: "insufficient_grounded_evidence:bundle_not_ready",
-      }),
-    });
+  } else if (input.evidenceBundle) {
+    // A model-authored plan may diagnose from trusted observations without a
+    // mechanically proved defect, but it may not publish across an unobserved
+    // contract boundary. Apply the same frozen-bundle admission rule here as
+    // the drafting gate so a quality rewrite cannot bypass a missing owner.
+    const closure = assessPlanClosureEvidence(input.evidenceBundle);
+    const reason = !isPlanEvidenceBundleReady(input.evidenceBundle)
+      ? "insufficient_grounded_evidence:bundle_not_ready"
+      : closure.unresolvedContractKinds.length > 0
+        ? `unverified_plan_contract_counterpart:${closure.unresolvedContractKinds.join(",")}`
+        : "";
+    if (reason) {
+      return rejectPlanMaterialization({
+        reason,
+        quality: classifyPlanArtifactQualityResult({ ok: false, reason }),
+      });
+    }
   }
   return {
     ok: true,
@@ -3839,7 +5381,10 @@ export function materializePlanArtifactFromVisibleText(input: {
 }
 
 export function isMaterializablePlanLikeText(text: string): boolean {
-  return materializePlanArtifactFromVisibleText({ visibleText: text }).ok;
+  return materializePlanArtifactFromVisibleText({
+    visibleText: text,
+    ingressMode: "legacy_markdown_import",
+  }).ok;
 }
 
 export function composeReviewablePlanFromEvidence(input: {
@@ -3876,7 +5421,7 @@ export function composeReviewablePlanFromEvidence(input: {
       "",
       "Hard requirements:",
       `- Use English for all visible prose and \`${targetPath}\` content.`,
-      `- Output visible Markdown, preferably wrapped in \`<proposed_plan>\`; MAIN will materialize it into \`${targetPath}\`.`,
+      `- ${buildPlanSubmissionGuidance("en")} MAIN validates it and renders \`${targetPath}\`.`,
       "- Do not call `write_file` or `replace_in_file` just to finish planning. Do not create `tasks.md`; do not modify source or deliverable files before approval.",
       "- Do not include tool logs, ContextMemoryState, XML, raw JSON envelopes, or recovery prompts in the artifact.",
       "- Separate confirmed facts from unverified hypotheses. Do not write probability guesses as execution steps unless an evidence line supports them.",
@@ -3899,7 +5444,7 @@ export function composeReviewablePlanFromEvidence(input: {
     "",
     "硬性要求：",
     `- 所有可见正文和 \`${targetPath}\` 内容必须使用简体中文。`,
-    `- 输出可见 Markdown，优先包在 \`<proposed_plan>\` 中；MAIN 会把它物化为 \`${targetPath}\`。`,
+    `- ${buildPlanSubmissionGuidance("zh")} MAIN 校验后渲染为 \`${targetPath}\`。`,
     "- 不要为了完成规划而调用 `write_file` 或 `replace_in_file`。批准前不要生成 `tasks.md`，不要修改源码或最终交付文件。",
     "- 文档中禁止出现工具日志、ContextMemoryState、XML、原始 JSON envelope、恢复提示。",
     "- 必须区分已确认事实和未验证假设。没有证据支撑的概率判断不能写成执行步骤。",
@@ -3914,6 +5459,11 @@ export function composeReviewablePlanFromEvidence(input: {
   ].filter(Boolean).join("\n");
 }
 
+/**
+ * Legacy Markdown projection helper retained for import/restore fixtures.
+ * Production deterministic fallback constructs runtime_synthesized authority
+ * directly in planDraftIngress and never parses this text back into truth.
+ */
 export function composePlanArtifactFromEvidence(input: {
   userGoal: string;
   evidence: string[];
@@ -3936,7 +5486,10 @@ export function composePlanArtifactFromEvidence(input: {
   return buildCodexStylePlanArtifact({
     userGoal: sanitized.userGoal || input.userGoal,
     evidence: input.evidenceBundle
-      ? input.evidenceBundle.facts.map((fact) => `${fact.tool} ${fact.target}: ${fact.summary}`)
+      ? input.evidenceBundle.facts.map((fact) => `${fact.tool} ${fact.target}: ${[
+          fact.summary,
+          ...formatPlanStructuredEvidenceFacts(fact.structuredFacts),
+        ].filter(Boolean).join(" ")}`)
       : sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)),
     files: input.evidenceBundle?.changeTargets.length
       ? input.evidenceBundle.changeTargets

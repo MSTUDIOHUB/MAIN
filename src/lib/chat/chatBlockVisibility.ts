@@ -1,6 +1,10 @@
 import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../modelFeedbackDedupe";
 import { parseMessageContent } from "../messageParser";
-import { extractPlanDraftPreview, extractTieredPlanProposal } from "../planProposal";
+import {
+  extractPlanDraftPreview,
+  extractTieredPlanProposal,
+  hasExplicitPlanProposal,
+} from "../planProposal";
 import { sanitizeAIOutput } from "../sanitize";
 import {
   extractPathishTokens,
@@ -153,7 +157,7 @@ function getPlanCandidatePreview(block: any): string {
   const parseCandidate = (source: unknown) => {
     const raw = getAgentInspectableContent(String(source || ""));
     const proposal = extractTieredPlanProposal(raw);
-    if (proposal?.markdown.trim()) return proposal.markdown.trim();
+    if (proposal && "markdown" in proposal && proposal.markdown.trim()) return proposal.markdown.trim();
     return extractPlanDraftPreview(raw)?.trim() || "";
   };
   const current = parseCandidate(block.content);
@@ -173,7 +177,29 @@ function getPlanCandidatePreview(block: any): string {
 }
 
 export function isPlanCandidateBlock(block: any): boolean {
-  return getPlanCandidatePreview(block).length > 0;
+  if (block?.type !== "agent") return false;
+  const raw = getAgentInspectableContent(String(block.content || ""));
+  return hasExplicitPlanProposal(raw) || getPlanCandidatePreview(block).length > 0;
+}
+
+export function shouldSuppressSupersededPlanCandidate(input: {
+  block: any;
+  hasReviewableArtifact: boolean;
+  ownsReviewableArtifact: boolean;
+}): boolean {
+  if (!input.hasReviewableArtifact || !input.ownsReviewableArtifact) return false;
+  // Explicit assistant channels are semantic runtime projections. A plan
+  // milestone can legitimately summarize findings and ordered implementation
+  // steps, which makes it look like a draft to the legacy Markdown classifier.
+  // Never let that compatibility path override a committed public projection.
+  if (
+    input.block?.visibility === "assistant_update" ||
+    input.block?.visibility === "assistant_final"
+  ) {
+    return false;
+  }
+  if (input.block?.archivedProposal) return false;
+  return isPlanCandidateBlock(input.block) && !isReviewablePlanBlock(input.block);
 }
 
 export function selectLatestPlanCandidatePreview(blocks: any[]): string {

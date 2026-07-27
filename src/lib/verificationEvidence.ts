@@ -104,9 +104,20 @@ export function scopeExecutionEvidenceLedger(
     : [...ledger];
 }
 
-function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry): boolean {
+export function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry): boolean {
   return !["failed", "pending", "unknown", "running", "stopped"].includes(
     String(entry.observationStatus || ""),
+  );
+}
+
+export function hasSuccessfulWorkspaceMutationEvidence(input: {
+  ledger: PlanExecutionEvidenceEntry[];
+  transactionId?: string | null;
+}): boolean {
+  return scopeExecutionEvidenceLedger(input.ledger, input.transactionId).some((entry) =>
+    entry.kind === "file" &&
+    isWorkspaceMutationToolName(entry.sourceTool) &&
+    isSuccessfulStructuredEvidence(entry)
   );
 }
 

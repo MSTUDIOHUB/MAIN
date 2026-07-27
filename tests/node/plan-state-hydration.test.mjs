@@ -213,11 +213,11 @@ test("early Plan hydration busy gate retains validated Goal authority and refres
 
   assert.match(
     source,
-    /const hasEarlyGoalAuthority = !!earlyGoalCreationAuthorization \|\|[\s\S]*?!!goalContinuationAuthorization[\s\S]*?const earlyGoalQueuedWorkflowContext =?[\s\S]*?shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority[\s\S]*?runtimeIntentOverride:\s*"goal"[\s\S]*?goalCreationAuthorization:\s*earlyGoalCreationAuthorization[\s\S]*?goalContinuationAuthorization/,
+    /const hasEarlyGoalAuthority = !!earlyGoalCreationAuthorization \|\|[\s\S]*?!!goalContinuationAuthorization[\s\S]*?const earlyGoalQueuedRunContext =?[\s\S]*?shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority[\s\S]*?runtimeIntentOverride:\s*"goal"[\s\S]*?goalCreationAuthorization:\s*earlyGoalCreationAuthorization[\s\S]*?goalContinuationAuthorization/,
   );
   assert.match(
     source,
-    /const shouldUseEarlyPlanSendGate =[\s\S]{0,150}?autoHydrationReason \|\| shouldRouteContinuationToPlanResume[\s\S]*?if \(shouldUseEarlyPlanSendGate\)[\s\S]{0,500}?applyCurrentSendGate\(\s*state,\s*earlyGoalQueuedWorkflowContext,?\s*\)/,
+    /const shouldUseEarlyPlanSendGate =[\s\S]{0,150}?autoHydrationReason \|\| shouldRouteContinuationToPlanResume[\s\S]*?if \(shouldUseEarlyPlanSendGate\)[\s\S]{0,500}?applyCurrentSendGate\(\s*state,\s*earlyGoalQueuedRunContext,?\s*\)/,
   );
   assert.match(
     source,

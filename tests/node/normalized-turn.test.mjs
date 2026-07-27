@@ -68,6 +68,28 @@ test("completion classification keeps protocol-only and true-empty distinct from
   assert.equal(classifyAssistantCompletion({ content: "done", toolCalls: [], finishReason: "stop" }), "content");
 });
 
+test("reserved visual metadata never normalizes into an executable workspace tool", () => {
+  const normalized = normalizeAssistantTurn({
+    content: "Continue with the inspected layout.",
+    toolCalls: [
+      {
+        id: "call_visual",
+        name: "MAIN_VISUAL_OBSERVATION",
+        arguments: '{"turnId":"turn-1","imageCount":1,"summary":"A toolbar is visible."}',
+      },
+      {
+        id: "call_read",
+        name: "read_file",
+        arguments: '{"path":"README.md"}',
+      },
+    ],
+    finishReason: "tool_calls",
+  });
+
+  assert.deepEqual(normalized.toolCalls.map((call) => call.name), ["read_file"]);
+  assert.equal(normalized.visibleText, "Continue with the inspected layout.");
+});
+
 test("assistant turn empty guard matches truly empty responses", () => {
   assert.equal(
     isAssistantTurnEmpty({

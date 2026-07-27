@@ -1,18 +1,22 @@
 import type { PlanArtifact, PlanStage, ReplyOption } from "./workflowModels";
+import {
+  buildTypedPlanApprovalIdentity,
+  resolveTypedPlanReviewAuthority,
+} from "./planApprovalIdentity";
 
-const REVIEWABLE_PLAN_ARTIFACTS = new Set(["plan", "design", "bugfix", "tasks"]);
 const PLAN_EXECUTION_CHOICE_RE = /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行|部署|发布|同步|上传)(?:.{0,24}(?:脚本|命令|deploy(?:\.sh)?|deployment|server|服务器|远程|生产|线上))?|\b(?:run|execute|deploy|publish|ship|sync)(?:.{0,24}(?:script|command|deploy(?:\.sh)?|deployment|server|remote|production))?\b/i;
 
 export type PlanApprovalQuickReplyAction =
   | "not_plan_approval"
   | "approve_existing_plan"
-  | "materialize_then_approve"
   | "block_missing_plan_artifact";
 
+export function isTypedReviewablePlanArtifact(artifact: PlanArtifact): boolean {
+  return resolveTypedPlanReviewAuthority([artifact]).ok;
+}
+
 export function hasReviewablePlanArtifact(planArtifacts?: PlanArtifact[]): boolean {
-  return (planArtifacts || []).some((artifact) =>
-    REVIEWABLE_PLAN_ARTIFACTS.has(artifact.kind) && String(artifact.content || "").trim().length > 0
-  );
+  return !!buildTypedPlanApprovalIdentity(planArtifacts || []);
 }
 
 export function hasReviewablePlanContext(input: {
@@ -84,7 +88,6 @@ export function resolvePlanApprovalQuickReplyAction(input: {
   isPlanApproved?: boolean;
   planArtifacts?: PlanArtifact[];
   planStage?: PlanStage;
-  sourceHasMaterializablePlan?: boolean | null;
 }): PlanApprovalQuickReplyAction {
   if (input.optionAction && input.optionAction !== "execute_once" && input.optionAction !== "approve_operation_once") {
     return "not_plan_approval";
@@ -98,6 +101,5 @@ export function resolvePlanApprovalQuickReplyAction(input: {
   if (!isApprovalChoice) return "not_plan_approval";
 
   if (hasReviewablePlanContext(input)) return "approve_existing_plan";
-  if (input.sourceHasMaterializablePlan === false) return "block_missing_plan_artifact";
-  return "materialize_then_approve";
+  return "block_missing_plan_artifact";
 }

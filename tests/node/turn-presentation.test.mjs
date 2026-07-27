@@ -77,8 +77,12 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     "utf8",
   );
   assert.match(chatAreaSource, /data-testid="capsule-status-label"/);
-  assert.match(chatAreaSource, /data-testid="capsule-activity-label"/);
-  assert.match(chatAreaSource, /buildCapsuleActivityText\(capsuleRunStatus, language\)/);
+  assert.match(chatAreaSource, /data-testid="capsule-guidance-label"/);
+  assert.match(chatAreaSource, /selectCapsuleLiveGuidance/);
+  assert.match(chatAreaSource, /buildCapsuleGuidanceText/);
+  assert.match(chatAreaSource, /content=\{capsuleGuidanceText\}/);
+  assert.doesNotMatch(chatAreaSource, /data-testid="capsule-activity-label"/);
+  assert.doesNotMatch(chatAreaSource, /buildCapsuleActivityText\(capsuleRunStatus, language\)/);
   assert.match(chatAreaSource, /aria-live="polite"/);
   assert.doesNotMatch(chatAreaSource, /currentTurnState\.capsuleExplanation/);
   assert.doesNotMatch(chatAreaSource, /deriveDynamicFirstPersonText/);
@@ -119,6 +123,18 @@ test("ordinary turns hide the heavy state anchor while legacy collapsed only fol
     language: "en",
   });
   assert.equal(migrated.processCollapsed, false);
+});
+
+test("workspace ordinary turns retain a visible Turn title and lifecycle anchor", () => {
+  const model = buildTurnPresentationModel({
+    turn: turn({ title: "Inspect the editor launch flow" }),
+    language: "en",
+    showStateAnchorOverride: true,
+  });
+
+  assert.equal(model.kind, "ordinary");
+  assert.equal(model.showStateAnchor, true);
+  assert.equal(model.title, "Inspect the editor launch flow");
 });
 
 test("Plan Goal and exceptional states retain a presentation anchor", () => {

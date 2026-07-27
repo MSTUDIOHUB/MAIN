@@ -4,12 +4,19 @@ import {
   sanitizeTaskBlocksForPersist,
   useAppStore,
 } from "../store/useAppStore";
-import {
-  ensureApprovedPlanRuntimeTasksForState,
-  evaluateApprovedPlanExecutionReadiness,
-} from "../store/submitApprovedPlanExecution";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
-import { getPlanArtifactTitle } from "./workflowModels";
+import {
+  getPlanArtifactTitle,
+  type PlanArtifact,
+  type PlanExecutionEvidenceEntry,
+} from "./workflowModels";
+import {
+  hashPlanCandidate,
+  hashPlanProjection,
+  PLAN_CANDIDATE_SCHEMA_VERSION,
+  type PlanCandidateV5,
+} from "./planContract";
+import { createPlanEvidenceReceipt } from "./planEvidenceReceipt";
 import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
 import { buildGoalRuntimeSnapshot } from "./goalRuntime";
 import { buildAcceptedGoalContinuationState } from "./goalResumeBoundary";
@@ -18,23 +25,44 @@ import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import {
   buildPlanApprovalIdentity,
   buildPlanExecutionInstructionHash,
+  buildTypedPlanApprovalIdentity,
+  resolveTypedPlanReviewAuthority,
 } from "./planApprovalIdentity";
 import {
+  createPlanLifecycleSessionEpoch,
   createPlanLifecycleState,
   isPlanApprovalLeaseBoundToState,
+  isPlanLifecycleExecutionAuthorizedForRun,
   PLAN_LIFECYCLE_SCHEMA_VERSION,
   reducePlanLifecycle,
 } from "./planLifecycle";
+import { capturePlanExecutionRunProvenance } from "./planExecutionProvenance";
+import { evaluateApprovedPlanExecution } from "./planExecutionEvaluation";
 import { issuePlanExplicitResumeAttempt } from "./planExecutionContinuation";
 import { readHarnessRunMarker, type HarnessRunMarker } from "./harnessCrashTelemetry";
 import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
-import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./turnEvents";
-import { projectSubagentRuns } from "./subagents";
+import {
+  appendRuntimeEventWithResult,
+  MAIN_THREAD_EVENT_SCHEMA_VERSION,
+  withEventSchema,
+} from "./turnEvents";
+import {
+  projectSubagentRuns,
+  SUBAGENT_CLOSURE_SCHEMA_VERSION,
+} from "./subagents";
 import type { NexusModeKey } from "./gameStudio/catalog";
 import {
   isCloudSettingsScenario,
   seedCloudSettingsScenario,
 } from "./e2e/scenarios/cloudSettings";
+import { acceptWorkspaceComposerInstruction } from "../store/workspaceComposerIntentAdmission";
+import {
+  TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+  createCanonicalTurnRuntime,
+  reduceCanonicalTurnRuntime,
+} from "./turnRuntimeContract";
+import { createTurnRuntimeCheckpoint } from "./turnRuntimeCheckpoint";
+import { buildAssistantStageCheckpoint } from "./assistantProgressPresentation";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -99,6 +127,7 @@ const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collaps
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
+const CAPSULE_PHASE_FALLBACK_SCENARIO = "capsule-phase-fallback";
 const GOAL_CAPSULE_SCENARIO = "goal-capsule";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
@@ -254,6 +283,7 @@ function bindCloudServerBridgeControls() {
     activeProfile?: "local" | "cloud";
     activeCloudServerId?: string;
     status?: "running" | "pending_review";
+    isGenerating?: boolean;
   } = {}) => {
     const status = options.status === "pending_review" ? "pending_review" : "running";
     useAppStore.setState((state) => ({
@@ -264,7 +294,7 @@ function bindCloudServerBridgeControls() {
         activeCloudServerId: options.activeCloudServerId ?? state.config.activeCloudServerId,
       },
       agentStatus: status,
-      isGenerating: status === "running",
+      isGenerating: options.isGenerating ?? status === "running",
     }));
   };
   bridge.clearModelRuntimeLock = () => {
@@ -273,6 +303,12 @@ function bindCloudServerBridgeControls() {
       agentStatus: "idle",
       isGenerating: false,
     }));
+  };
+  bridge.setPreferSubagents = (enabled = true) => {
+    useAppStore.getState().setPreferSubagents(enabled === true);
+  };
+  bridge.stopGeneration = () => {
+    useAppStore.getState().stopGeneration();
   };
 }
 
@@ -349,6 +385,11 @@ function bindBridgeSnapshot(scenario: string) {
       isGenerating: state.isGenerating,
       input: state.input,
       queuedUserMessage: state.queuedUserMessage,
+      workspaceTurnQueueEntries: (state.workspaceTurnQueue?.entries || []).map((entry) => ({
+        turnId: entry.receipt.turnId,
+        status: entry.status,
+        text: entry.instruction.payload.text,
+      })),
       activeGuidance: state.activeGuidance,
       autoApproveTools: state.autoApproveTools,
       preferSubagents: state.preferSubagents,
@@ -456,11 +497,269 @@ function bindBridgeSnapshot(scenario: string) {
   bindCloudServerBridgeControls();
 }
 
-function finishPlanExecution(finalMessage: string, summary: string) {
+function finishPlanExecution(finalMessage: string, summary: string): boolean {
   const bridge = getBridge();
   const state = useAppStore.getState();
-  const turnId = state.currentTurnId || state.conversationTurns[state.conversationTurns.length - 1]?.id || "e2e-plan-turn";
+  const lifecycle = state.planLifecycle;
+  const executionLease = lifecycle.executionLease;
+  const execution = lifecycle.execution;
+  if (
+    !executionLease ||
+    !execution ||
+    !isPlanLifecycleExecutionAuthorizedForRun(lifecycle, {
+      executionLeaseId: executionLease.executionLeaseId,
+      turnId: execution.turnId,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+      attempt: execution.attempt,
+    })
+  ) {
+    appendBridgeEvent("completion-rejected", {
+      reason: "plan_execution_owner_not_authorized",
+      lifecycleStatus: lifecycle.status,
+    });
+    return false;
+  }
+
+  const evidenceAt = Date.now();
+  const mutationEvidence: PlanExecutionEvidenceEntry[] = [];
+  const validationEvidence: PlanExecutionEvidenceEntry[] = [];
+  state.planTasks.forEach((task, taskIndex) => {
+    (task.evidence || []).forEach((evidence, evidenceIndex) => {
+      const common = {
+        id: `e2e-plan-completion:${task.id}:${evidenceIndex + 1}`,
+        transactionId: execution.turnId,
+        runId: execution.runId,
+        planTaskId: task.id,
+        requirementRef: task.requirementRef || task.id,
+        operationId: task.changeRef || task.validationRef || task.id,
+        obligationIds: task.validationRef ? [task.validationRef] : [],
+        value: evidence.value,
+        target: evidence.value,
+        outcome: { status: "succeeded" as const, exitCode: 0 },
+        createdAt: evidenceAt + taskIndex * 10 + evidenceIndex,
+      };
+      if (evidence.kind === "file" || evidence.kind === "deliverable") {
+        mutationEvidence.push({
+          ...common,
+          phase: "mutation",
+          kind: evidence.kind,
+          sourceTool: "write_file",
+        });
+        return;
+      }
+      if (evidence.kind === "cmd") {
+        validationEvidence.push({
+          ...common,
+          phase: "validation",
+          kind: "cmd",
+          sourceTool: "run_command",
+          automaticValidation: true,
+        });
+        return;
+      }
+      if (evidence.kind === "browser_dom" || evidence.kind === "browser_screenshot") {
+        validationEvidence.push({
+          ...common,
+          phase: "validation",
+          kind: evidence.kind,
+          sourceTool: "browser_evaluate",
+          automaticValidation: true,
+          browserInteraction: {
+            actions: [{
+              id: "approve-plan",
+              kind: "click",
+              target: "[data-testid=plan-approve-button]",
+              succeeded: true,
+              stateChanged: true,
+              effectStateChanged: true,
+              effectChangedFields: ["target.text"],
+            }],
+            assertions: [{
+              kind: "text",
+              target: evidence.value,
+              passed: true,
+              afterActionId: "approve-plan",
+              beforePassed: false,
+              changedAfterAction: true,
+              causallyLinked: true,
+            }],
+            pageErrors: [],
+            consoleErrors: [],
+          },
+        });
+        return;
+      }
+      validationEvidence.push({
+        ...common,
+        phase: "validation",
+        kind: evidence.kind,
+        sourceTool: evidence.kind === "tauri_required"
+          ? "computer_use"
+          : "runtime_assertion",
+        automaticValidation: evidence.kind !== "manual_user_validation",
+      });
+    });
+  });
+  const completionLedger = [
+    ...state.planExecutionEvidenceLedger,
+    ...mutationEvidence,
+    ...validationEvidence,
+  ];
+  const evaluation = evaluateApprovedPlanExecution({
+    tasks: state.planTasks,
+    evidenceLedger: completionLedger,
+    availableToolNames: new Set(["write_file", "run_command", "browser_evaluate", "computer_use"]),
+    turnId: execution.turnId,
+  });
+  if (!evaluation.completionAllowed) {
+    appendBridgeEvent("completion-rejected", {
+      reason: evaluation.gap.code,
+      lifecycleStatus: lifecycle.status,
+      remainingTaskIds: evaluation.gap.remainingTaskIds,
+      evidenceGap: evaluation.gap.evidenceGap,
+    });
+    return false;
+  }
+
+  const completedAt = evidenceAt + state.planTasks.length * 10 + 1;
+  const completion = reducePlanLifecycle(lifecycle, {
+    type: "complete",
+    expectedVersion: lifecycle.version,
+    at: completedAt,
+    expectedExecutionLeaseId: executionLease.executionLeaseId,
+    expectedExecution: execution,
+  });
+  if (completion.disposition === "rejected") {
+    appendBridgeEvent("completion-rejected", {
+      reason: completion.reason || "plan_lifecycle_completion_rejected",
+      lifecycleStatus: lifecycle.status,
+    });
+    return false;
+  }
+
+  const turnId = execution.turnId;
+  const threadId = lifecycle.sessionKey;
+  if (state.runtimeEvents.some((event) =>
+    (
+      event.type === "turn.completed" ||
+      (event.type === "run.completed" && event.runId === execution.runId)
+    ) &&
+    event.threadId === threadId &&
+    event.turnId === turnId
+  )) {
+    appendBridgeEvent("completion-rejected", {
+      reason: "plan_execution_owner_already_terminal",
+      lifecycleStatus: lifecycle.status,
+    });
+    return false;
+  }
+
+  let runtimeEvents = state.runtimeEvents;
+  if (!runtimeEvents.some((event) =>
+    event.type === "turn.started" &&
+    event.threadId === threadId &&
+    event.turnId === turnId
+  )) {
+    runtimeEvents = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+      type: "turn.started",
+      threadId,
+      turnId,
+      timestampMs: Math.max(0, execution.startedAt - 1),
+    })).events;
+  }
+  if (!runtimeEvents.some((event) =>
+    event.type === "run.started" &&
+    event.threadId === threadId &&
+    event.turnId === turnId &&
+    event.runId === execution.runId
+  )) {
+    const startedAppend = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+      type: "run.started",
+      threadId,
+      turnId,
+      timestampMs: execution.startedAt,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+    }));
+    if (startedAppend.disposition === "conflict") return false;
+    runtimeEvents = startedAppend.events;
+  }
+  const runCompletedAppend = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+    type: "run.completed",
+    threadId,
+    turnId,
+    timestampMs: completedAt,
+    runId: execution.runId,
+    parentRunId: execution.parentRunId,
+    resultKind: "success",
+    summary,
+  }));
+  if (runCompletedAppend.disposition === "conflict") return false;
+  const turnCompletedAppend = appendRuntimeEventWithResult(runCompletedAppend.events, withEventSchema({
+    type: "turn.completed",
+    threadId,
+    turnId,
+    timestampMs: completedAt,
+    resultKind: "success",
+  }));
+  if (turnCompletedAppend.disposition === "conflict") return false;
+
   const finishBlockId = state._nextTaskId();
+  const planExecutionProvenance = capturePlanExecutionRunProvenance(lifecycle);
+  const priorMarker = state.harnessRunMarker;
+  const markerMatchesExecution = !!priorMarker &&
+    priorMarker.sessionKey === threadId &&
+    priorMarker.turnId === turnId &&
+    (priorMarker.activeRunId || priorMarker.runId) === execution.runId &&
+    (priorMarker.activeParentRunId || priorMarker.parentRunId || null) === execution.parentRunId;
+  const terminalMarker: HarnessRunMarker = {
+    ...(markerMatchesExecution && priorMarker
+      ? priorMarker
+      : {
+          schemaVersion: 1 as const,
+          runId: execution.runId,
+          instanceId: `e2e-plan-execution-${execution.runId}`,
+          sessionKey: threadId,
+          workspace: state.currentWorkspace || null,
+          sessionId: state.currentSessionId,
+          turnId,
+          workflowMode: "plan",
+          runtimeIntent: "execute",
+          iteration: 1,
+          maxIterations: 12,
+          messagesLen: state.agentMessages.length,
+          toolCount: state.taskFlow.filter((block) => block.type === "tool").length,
+          latestTool: null,
+          latestToolTarget: null,
+          activeStreamId: null,
+          streamStatus: "closed",
+          streamChunkCount: 0,
+          streamByteCount: 0,
+          streamElapsedMs: 0,
+          streamLifecycleStatus: "completed",
+          lastStreamError: null,
+          startedAt: execution.startedAt,
+        }),
+    runId: execution.runId,
+    activeRunId: execution.runId,
+    activeParentRunId: execution.parentRunId,
+    parentRunId: execution.parentRunId,
+    ...(planExecutionProvenance
+      ? { activePlanExecutionProvenance: planExecutionProvenance }
+      : {}),
+    status: "completed",
+    terminalResultKind: "success",
+    planStage: "completed",
+    isPlanApproved: true,
+    activeStreamId: null,
+    streamStatus: "closed",
+    streamLifecycleStatus: "completed",
+    lastStreamError: null,
+    updatedAt: completedAt,
+    closedAt: completedAt,
+    closeReason: "completed",
+  };
 
   useAppStore.setState((current) => ({
     ...current,
@@ -472,6 +771,7 @@ function finishPlanExecution(finalMessage: string, summary: string) {
         type: "agent",
         content: finalMessage,
         streaming: false,
+        visibility: "assistant_final" as const,
       },
     ],
     conversationTurns: current.conversationTurns.map((turn) =>
@@ -480,6 +780,14 @@ function finishPlanExecution(finalMessage: string, summary: string) {
             ...turn,
             status: "done",
             summary,
+            runtimeOutcome: {
+              status: "completed" as const,
+              reason: "e2e_plan_execution_completed",
+              resultKind: "success" as const,
+              runId: execution.runId,
+              parentRunId: execution.parentRunId,
+              updatedAt: completedAt,
+            },
             blockIds: turn.blockIds.includes(finishBlockId)
               ? turn.blockIds
               : [...turn.blockIds, finishBlockId],
@@ -487,14 +795,19 @@ function finishPlanExecution(finalMessage: string, summary: string) {
         : turn
     ),
     planStage: "completed",
-    planTasks: current.planTasks.map((task) => ({
-      ...task,
-      status: "completed" as const,
-      evidenceStatus: "satisfied" as const,
-      blockedReason: undefined,
-    })),
+    planTasks: evaluation.taskAudit.tasks,
+    planExecutionEvidenceLedger: completionLedger,
+    planExecutionEvidenceCount: completionLedger.length,
+    planLifecycle: completion.state,
+    runtimeEvents: turnCompletedAppend.events,
+    harnessRunMarker: terminalMarker,
+    isPlanApproved: true,
+    pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId: turnId,
+    currentTurnExecutionConsent: { turnId, granted: false },
     agentStatus: "idle",
     isGenerating: false,
+    abortController: null,
     showPlanPanel: true,
     showDiff: false,
     showTerminal: false,
@@ -505,6 +818,7 @@ function finishPlanExecution(finalMessage: string, summary: string) {
   if (bridge) {
     bridge.completed = true;
   }
+  return true;
 }
 
 function seedPlanFlowScenario() {
@@ -518,37 +832,248 @@ function seedPlanFlowScenario() {
   const turnId = "e2e-plan-flow-turn";
   const sessionId = 999001;
   const workspace = "/tmp/e2e-plan-flow";
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "plan-session-e2e-plan-flow";
   const reviewRunId = "run-e2e-plan-flow-review";
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const originalSendMessage = useAppStore.getState().sendMessage;
 
-  const artifacts = [
-    {
-      kind: "design" as const,
-      path: ".MAIN/plans/plan.md",
-      title: "Design",
-      updatedAt: now - 1_000,
-      content: [
-        "# Design",
-        "",
-        "## 目标",
-        "- 支持生成计划、保存方案、批准执行与最终收尾。",
-        "",
-        "## 关键改动",
-        "- 修改 `src/lib/planControl.ts`，让正式 Plan 审批进入同一回合的执行 handoff。",
-        "- 修改 `src/components/RightPanel.tsx`，保持 Plan Workspace 的保存与审批入口可见。",
-        "",
-        "## 数据流",
-        "- Plan artifact -> exact review request -> approved child run -> evidence-backed completion。",
-        "",
-        "## 验证方式",
-        "- 运行 `node --test tests/node/workflow-models.test.mjs`，验证审批和执行状态转换。",
-        "- 使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
-      ].join("\n"),
-    },
-  ];
+  const artifacts = [createE2EPlanFlowTypedPlanArtifact([
+    "# Design",
+    "",
+    "## 目标",
+    "- 支持生成计划、保存方案、批准执行与最终收尾。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/lib/planControl.ts`，让正式 Plan 审批进入同一回合的执行 handoff。",
+    "- 修改 `src/components/RightPanel.tsx`，保持 Plan Workspace 的保存与审批入口可见。",
+    "",
+    "## 数据流",
+    "- Plan artifact -> exact review request -> approved child run -> evidence-backed completion。",
+    "",
+    "## 验证方式",
+    "- 运行 `node --test tests/node/workflow-models.test.mjs`，验证审批和执行状态转换。",
+    "- 使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
+  ].join("\n"), now - 1_000)];
   const approvalIdentity = buildPlanApprovalIdentity(artifacts);
+  if (!approvalIdentity) return undefined;
+  const reviewRequest = buildPlanReviewActionRequest({
+    sessionKey,
+    turnId,
+    runId: reviewRunId,
+    title: "计划审批回归流",
+    planRevision: approvalIdentity.revision,
+    artifactHash: approvalIdentity.artifactHash,
+    artifactPaths: approvalIdentity.artifactPaths,
+    now: now - 500,
+  });
+  const artifactIdentity = {
+    revision: approvalIdentity.revision,
+    artifactHash: approvalIdentity.artifactHash,
+    artifactPaths: approvalIdentity.artifactPaths,
+  };
+  const reviewIdentity = {
+    sessionKey,
+    sessionEpoch,
+    turnId,
+    runId: reviewRunId,
+    parentRunId: null,
+    requestId: reviewRequest.requestId,
+    planRevision: approvalIdentity.revision,
+    artifactHash: approvalIdentity.artifactHash,
+    artifactPaths: approvalIdentity.artifactPaths,
+  };
+  let planLifecycle = createPlanLifecycleState({
+    sessionKey,
+    sessionEpoch,
+    updatedAt: now - 2_000,
+  });
+  const drafting = reducePlanLifecycle(planLifecycle, {
+    type: "start_drafting",
+    expectedVersion: planLifecycle.version,
+    at: now - 1_500,
+    planTurnId: turnId,
+    artifactIdentity,
+  });
+  if (drafting.disposition === "rejected") return undefined;
+  planLifecycle = drafting.state;
+  const review = reducePlanLifecycle(planLifecycle, {
+    type: "request_review",
+    expectedVersion: planLifecycle.version,
+    at: now - 500,
+    artifactIdentity,
+    reviewIdentity,
+  });
+  if (review.disposition === "rejected") return undefined;
+  planLifecycle = review.state;
+
+  const simulateApprovedPlanChildRun: typeof originalSendMessage = (text, _images, options) => {
+    const current = useAppStore.getState();
+    const lifecycle = current.planLifecycle;
+    const approvalLease = lifecycle.approvalLease;
+    const executionLease = lifecycle.executionLease;
+    const handoff = current.pendingPlanApprovalHandoff;
+    const currentIdentity = buildPlanApprovalIdentity(current.planArtifacts);
+    const ownerSession = current.sessionsByWorkspace[workspace]?.find((session) => session.id === sessionId);
+    const marker = current.harnessRunMarker;
+    const computedInstructionHash = buildPlanExecutionInstructionHash(text);
+    const pathsMatch = (left: readonly string[] | undefined, right: readonly string[] | undefined) =>
+      !!left && !!right &&
+      left.length === right.length &&
+      left.every((path, index) => path === right[index]);
+    const exactAdmission =
+      lifecycle.status === "handoff_pending" &&
+      lifecycle.sessionKey === sessionKey &&
+      lifecycle.sessionEpoch === sessionEpoch &&
+      ownerSession?.planLifecycleEpoch === sessionEpoch &&
+      isPlanApprovalLeaseBoundToState(lifecycle) &&
+      !!approvalLease &&
+      !!executionLease &&
+      !!handoff &&
+      !!currentIdentity &&
+      lifecycle.planTurnId === turnId &&
+      lifecycle.artifactIdentity?.revision === currentIdentity.revision &&
+      lifecycle.artifactIdentity.artifactHash === currentIdentity.artifactHash &&
+      pathsMatch(lifecycle.artifactIdentity.artifactPaths, currentIdentity.artifactPaths) &&
+      approvalLease.planRevision === currentIdentity.revision &&
+      approvalLease.artifactHash === currentIdentity.artifactHash &&
+      pathsMatch(approvalLease.artifactPaths, currentIdentity.artifactPaths) &&
+      options?.hidden === true &&
+      options.createVisibleTurnForHiddenMessage === false &&
+      options.reuseCurrentTurn === true &&
+      options.preservePlanState === true &&
+      options.resolvedIntent === "execute" &&
+      options.skipIntentResolution === true &&
+      options.turnIdOverride === executionLease.executionTurnId &&
+      options.runIdOverride === executionLease.executionRunId &&
+      (options.parentRunIdOverride || null) === executionLease.parentRunId &&
+      options.planExecutionLeaseId === executionLease.executionLeaseId &&
+      options.planExecutionInstructionHash === executionLease.instructionHash &&
+      computedInstructionHash === executionLease.instructionHash &&
+      handoff.executionTurnId === executionLease.executionTurnId &&
+      handoff.executionRunId === executionLease.executionRunId &&
+      handoff.parentRunId === executionLease.parentRunId &&
+      handoff.executionAttempt === executionLease.attempt &&
+      handoff.executionLeaseId === executionLease.executionLeaseId &&
+      handoff.executionInstructionHash === executionLease.instructionHash &&
+      handoff.approvalLeaseId === approvalLease.leaseId &&
+      handoff.reviewRequestId === approvalLease.requestId &&
+      marker?.status === "paused" &&
+      marker.sessionKey === sessionKey &&
+      marker.turnId === turnId &&
+      (marker.activeRunId || marker.runId) === executionLease.parentRunId;
+
+    if (!exactAdmission || !approvalLease || !executionLease || !handoff || !marker) {
+      appendBridgeEvent("child-run-admission-rejected", {
+        reason: "execution_lease_identity_mismatch",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+
+    const admittedAt = Date.now();
+    const runStartedAppend = appendRuntimeEventWithResult(current.runtimeEvents, withEventSchema({
+      type: "run.started",
+      threadId: sessionKey,
+      turnId: executionLease.executionTurnId,
+      timestampMs: admittedAt,
+      runId: executionLease.executionRunId,
+      parentRunId: executionLease.parentRunId,
+    }));
+    if (runStartedAppend.disposition === "conflict") {
+      appendBridgeEvent("child-run-admission-rejected", {
+        reason: "run_started_identity_conflict",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+    const execution = {
+      turnId: executionLease.executionTurnId,
+      runId: executionLease.executionRunId,
+      parentRunId: executionLease.parentRunId,
+      attempt: executionLease.attempt,
+      startedAt: admittedAt,
+    };
+    const started = reducePlanLifecycle(lifecycle, {
+      type: "execution_started",
+      expectedVersion: lifecycle.version,
+      at: admittedAt,
+      executionLeaseId: executionLease.executionLeaseId,
+      instructionHash: computedInstructionHash,
+      execution,
+    });
+    if (started.disposition === "rejected" || !isPlanLifecycleExecutionAuthorizedForRun(started.state, {
+      executionLeaseId: executionLease.executionLeaseId,
+      turnId: execution.turnId,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+      attempt: execution.attempt,
+    })) {
+      appendBridgeEvent("child-run-admission-rejected", {
+        reason: started.reason || "execution_started_not_authorized",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+    const planExecutionProvenance = capturePlanExecutionRunProvenance(started.state);
+    if (!planExecutionProvenance) {
+      appendBridgeEvent("child-run-admission-rejected", {
+        reason: "plan_execution_provenance_missing",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+
+    useAppStore.setState((state) => ({
+      planLifecycle: started.state,
+      isPlanApproved: true,
+      planStage: "executing",
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: execution.turnId,
+      currentTurnExecutionConsent: { turnId: execution.turnId, granted: true },
+      runtimeEvents: runStartedAppend.events,
+      harnessRunMarker: {
+        ...marker,
+        runId: execution.runId,
+        activeRunId: execution.runId,
+        activeParentRunId: execution.parentRunId,
+        activePlanExecutionProvenance: planExecutionProvenance,
+        parentRunId: execution.parentRunId,
+        instanceId: `${marker.instanceId}:execution`,
+        status: "running",
+        terminalResultKind: null,
+        runtimeIntent: "execute",
+        planStage: "executing",
+        isPlanApproved: true,
+        startedAt: admittedAt,
+        updatedAt: admittedAt,
+        closedAt: null,
+        closeReason: null,
+      },
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === execution.turnId
+          ? {
+              ...turn,
+              status: "executing" as const,
+              summary: "已接纳批准后的同回合子 Run，正在执行计划。",
+              runtimeOutcome: undefined,
+            }
+          : turn
+      ),
+      agentStatus: "running",
+      isGenerating: true,
+      abortController: new AbortController(),
+    }));
+    appendBridgeEvent("child-run-admitted", {
+      turnId: execution.turnId,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+      executionLeaseId: executionLease.executionLeaseId,
+    });
+    return true;
+  };
 
   useAppStore.setState((state) => ({
     ...state,
@@ -562,6 +1087,7 @@ function seedPlanFlowScenario() {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E Plan Flow",
           date: new Date(now).toISOString(),
           active: true,
@@ -573,8 +1099,11 @@ function seedPlanFlowScenario() {
     harnessRunMarker: {
       schemaVersion: 1,
       runId: reviewRunId,
+      activeRunId: reviewRunId,
+      activeParentRunId: null,
+      parentRunId: null,
       instanceId: "e2e-plan-flow-instance",
-      sessionKey: `${workspace}:${sessionId}`,
+      sessionKey,
       workspace,
       sessionId,
       turnId,
@@ -601,18 +1130,7 @@ function seedPlanFlowScenario() {
       closedAt: now,
       closeReason: "plan_review_required",
     },
-    activeActionRequest: approvalIdentity
-      ? buildPlanReviewActionRequest({
-          sessionKey: `${workspace}:${sessionId}`,
-          turnId,
-          runId: reviewRunId,
-          title: "计划审批回归流",
-          planRevision: approvalIdentity.revision,
-          artifactHash: approvalIdentity.artifactHash,
-          artifactPaths: approvalIdentity.artifactPaths,
-          now,
-        })
-      : null,
+    activeActionRequest: reviewRequest,
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "请先生成方案，我确认后再执行。" },
       {
@@ -661,10 +1179,63 @@ function seedPlanFlowScenario() {
       },
     ],
     currentTurnId: turnId,
+    runtimeEvents: [
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "turn.started" as const,
+        threadId: sessionKey,
+        turnId,
+        timestampMs: now - 2_000,
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "run.started" as const,
+        threadId: sessionKey,
+        turnId,
+        timestampMs: now - 1_750,
+        runId: reviewRunId,
+        parentRunId: null,
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "plan.ready" as const,
+        threadId: sessionKey,
+        turnId,
+        timestampMs: now - 750,
+        path: ".MAIN/plans/plan.md",
+        summary: "正式 typed Plan 已物化并通过校验。",
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "approval.requested" as const,
+        threadId: sessionKey,
+        turnId,
+        timestampMs: now - 500,
+        runId: reviewRunId,
+        parentRunId: null,
+        requestId: reviewRequest.requestId,
+        actionKind: "plan_review" as const,
+        title: reviewRequest.title,
+        reason: "plan_review_required",
+        target: ".MAIN/plans/plan.md",
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "run.paused" as const,
+        threadId: sessionKey,
+        turnId,
+        timestampMs: now - 250,
+        runId: reviewRunId,
+        parentRunId: null,
+        reason: "plan_review",
+        message: "正式 typed Plan 已物化，等待用户审批。",
+      },
+    ],
     planArtifacts: artifacts,
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
+    planLifecycle,
     planStage: "design",
     isPlanApproved: false,
     showPlanPanel: true,
@@ -682,6 +1253,7 @@ function seedPlanFlowScenario() {
     input: "",
     attachedFiles: [],
     contextMentions: [],
+    sendMessage: simulateApprovedPlanChildRun,
   }));
 
   bindBridgeSnapshot(PLAN_FLOW_SCENARIO);
@@ -747,11 +1319,296 @@ function seedPlanFlowScenario() {
     if (rewriteTimer != null) window.clearTimeout(rewriteTimer);
     if (completionTimer != null) window.clearTimeout(completionTimer);
     unsubscribe();
+    if (useAppStore.getState().sendMessage === simulateApprovedPlanChildRun) {
+      useAppStore.setState({ sendMessage: originalSendMessage });
+    }
     bridge.initialized = false;
   };
 
   bridge.cleanup = cleanup;
   return cleanup;
+}
+
+function createEmptyE2EPlanEvidenceReceipt(input: {
+  bundleHash: string;
+  objective: string;
+  turnId: string;
+}) {
+  return createPlanEvidenceReceipt({
+    bundleId: input.bundleHash,
+    hash: input.bundleHash,
+    turnId: input.turnId,
+    objective: input.objective,
+    constraints: [],
+    facts: [],
+    observedTargets: [],
+    changeTargets: [],
+    verificationTargets: [],
+    coverageObligations: [],
+  });
+}
+
+function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number): PlanArtifact {
+  const authoringContractId = "authoring-contract:e2e-plan-flow";
+  const objective = "支持生成计划、保存方案、批准执行与最终收尾。";
+  const command = "node --test tests/node/workflow-models.test.mjs";
+  const candidate: PlanCandidateV5 = {
+    schemaVersion: PLAN_CANDIDATE_SCHEMA_VERSION,
+    state: "sealed",
+    contractId: `${authoringContractId}:evidence-bundle:e2e-plan-flow`,
+    authoringContractId,
+    bundleHash: "evidence-bundle:e2e-plan-flow",
+    objective,
+    goals: [{ id: "G1", index: 1, text: objective }],
+    diagnosisRequired: false,
+    evidence: [],
+    evidenceReceipt: createEmptyE2EPlanEvidenceReceipt({
+      bundleHash: "evidence-bundle:e2e-plan-flow",
+      objective,
+      turnId: "e2e-plan-flow-turn",
+    }),
+    summary: [
+      "让正式 Plan 审批进入同一逻辑回合的 child Run。",
+      "保持 Plan Workspace 的保存与审批入口可见。",
+    ],
+    diagnoses: [],
+    findings: [],
+    changes: [
+      {
+        id: "C1",
+        text: "修改 `src/lib/planControl.ts`，让正式 Plan 审批进入同一回合的执行 handoff。",
+        targetRef: "src/lib/planControl.ts",
+        evidenceRefs: [],
+        diagnosisRefs: [],
+        goalRefs: ["G1"],
+        operation: "modify",
+        expectedOutcome: "Plan 审批创建绑定当前 Turn 与 review Run 的执行 handoff。",
+        relationships: ["C2 保持 handoff 的保存与审批入口可操作。"],
+        executionEvidence: [{ kind: "file", value: "src/lib/planControl.ts" }],
+      },
+      {
+        id: "C2",
+        text: "修改 `src/components/RightPanel.tsx`，保持 Plan Workspace 的保存与审批入口可见。",
+        targetRef: "src/components/RightPanel.tsx",
+        evidenceRefs: [],
+        diagnosisRefs: [],
+        goalRefs: ["G1"],
+        operation: "modify",
+        expectedOutcome: "用户可以保存正式 Plan，并从同一审核面板批准执行。",
+        relationships: ["C1 提供批准后的同回合执行 handoff。"],
+        executionEvidence: [{ kind: "file", value: "src/components/RightPanel.tsx" }],
+      },
+    ],
+    decisions: [],
+    interfaces: ["Plan artifact -> exact review request -> approved child Run -> evidence-backed completion。"],
+    tests: [
+      `运行 \`${command}\`，验证审批和执行状态转换。`,
+      "使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
+    ],
+    validations: [
+      {
+        id: "V1",
+        goalRefs: ["G1"],
+        changeRefs: ["C1", "C2"],
+        primitive: {
+          id: "V1",
+          kind: "finite_command",
+          acceptance: "required",
+          description: "验证 Plan 审批和执行状态转换。",
+          command,
+          capability: "test",
+          segments: [{
+            command,
+            connector: "start",
+            role: "validator",
+            capability: "test",
+          }],
+        },
+        expectedOutcome: "Plan 审批与执行状态转换测试通过。",
+        blocking: true,
+      },
+    ],
+    assumptions: [],
+    blockingChoices: [],
+    projection: {
+      format: "markdown",
+      content,
+      contentHash: hashPlanProjection(content),
+    },
+  };
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt,
+    content,
+    candidate,
+    candidateHash: hashPlanCandidate(candidate),
+    authoringContractId,
+  };
+}
+
+function createE2ETypedPlanArtifact(content: string, updatedAt: number): PlanArtifact {
+  const authoringContractId = "authoring-contract:e2e-plan-quick-reply";
+  const command = "node --test tests/node/workflow-models.test.mjs";
+  const candidate: PlanCandidateV5 = {
+    schemaVersion: PLAN_CANDIDATE_SCHEMA_VERSION,
+    state: "sealed",
+    contractId: `${authoringContractId}:evidence-bundle:e2e`,
+    authoringContractId,
+    bundleHash: "evidence-bundle:e2e",
+    objective: "修复字体加载诊断流程并验证结果。",
+    goals: [{ id: "G1", index: 1, text: "修复字体加载诊断流程并验证结果。" }],
+    diagnosisRequired: false,
+    evidence: [],
+    evidenceReceipt: createEmptyE2EPlanEvidenceReceipt({
+      bundleHash: "evidence-bundle:e2e",
+      objective: "修复字体加载诊断流程并验证结果。",
+      turnId: "e2e-plan-quick-reply-turn",
+    }),
+    summary: ["先运行诊断，再执行范围内修复。"],
+    diagnoses: [],
+    findings: [],
+    changes: [{
+      id: "C1",
+      text: "根据诊断结果修复字体加载。",
+      targetRef: "src/main.ts",
+      evidenceRefs: [],
+      diagnosisRefs: [],
+      goalRefs: ["G1"],
+      operation: "modify",
+      expectedOutcome: "字体加载流程按诊断结果完成修复。",
+      relationships: [],
+      executionEvidence: [{ kind: "file", value: "src/main.ts" }],
+    }],
+    decisions: [],
+    interfaces: [],
+    tests: ["运行字体加载诊断并核对结果。"],
+    validations: [{
+      id: "V1",
+      goalRefs: ["G1"],
+      changeRefs: ["C1"],
+      primitive: {
+        id: "V1",
+        kind: "finite_command",
+        acceptance: "required",
+        description: "核对字体加载诊断结果。",
+        command,
+        capability: "test",
+        segments: [{
+          command,
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      },
+      expectedOutcome: "字体加载诊断通过。",
+      blocking: true,
+    }],
+    assumptions: [],
+    blockingChoices: [],
+    projection: {
+      format: "markdown",
+      content,
+      contentHash: hashPlanProjection(content),
+    },
+  };
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt,
+    content,
+    candidate,
+    candidateHash: hashPlanCandidate(candidate),
+    authoringContractId,
+  };
+}
+
+function createE2EExecutionCapsuleTypedPlanArtifact(
+  content: string,
+  updatedAt: number,
+  turnId: string,
+): PlanArtifact {
+  const authoringContractId = "authoring-contract:e2e-execution-capsule";
+  const command = "npx playwright test tests/e2e/execution-capsule-progress.spec.ts";
+  const candidate: PlanCandidateV5 = {
+    schemaVersion: PLAN_CANDIDATE_SCHEMA_VERSION,
+    state: "sealed",
+    contractId: `${authoringContractId}:evidence-bundle:e2e-execution-capsule`,
+    authoringContractId,
+    bundleHash: "evidence-bundle:e2e-execution-capsule",
+    objective: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
+    goals: [{
+      id: "G1",
+      index: 1,
+      text: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
+    }],
+    diagnosisRequired: false,
+    evidence: [],
+    evidenceReceipt: createEmptyE2EPlanEvidenceReceipt({
+      bundleHash: "evidence-bundle:e2e-execution-capsule",
+      objective: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
+      turnId,
+    }),
+    summary: ["让审批状态绑定 exact Plan review identity，面板显示状态独立投影。"],
+    diagnoses: [],
+    findings: [],
+    changes: [{
+      id: "C1",
+      text: "更新 ExecutionCapsule 审批状态投影，不改变右侧面板选择。",
+      targetRef: "src/components/ExecutionCapsule.tsx",
+      evidenceRefs: [],
+      diagnosisRefs: [],
+      goalRefs: ["G1"],
+      operation: "modify",
+      expectedOutcome: "Plan review Capsule 与 exact request 同步且面板状态稳定。",
+      relationships: [],
+      executionEvidence: [{ kind: "file", value: "src/components/ExecutionCapsule.tsx" }],
+    }],
+    decisions: [],
+    interfaces: ["typed Plan artifact -> exact review request -> same-Turn execution Run"],
+    tests: [`运行 \`${command}\` 验证审批与面板投影。`],
+    validations: [{
+      id: "V1",
+      goalRefs: ["G1"],
+      changeRefs: ["C1"],
+      primitive: {
+        id: "V1",
+        kind: "finite_command",
+        acceptance: "required",
+        description: "验证审批与面板投影。",
+        command,
+        capability: "test",
+        segments: [{
+          command,
+          connector: "start",
+          role: "validator",
+          capability: "test",
+        }],
+      },
+      expectedOutcome: "ExecutionCapsule 审批与右侧面板回归通过。",
+      blocking: true,
+    }],
+    assumptions: [],
+    blockingChoices: [],
+    projection: {
+      format: "markdown",
+      content,
+      contentHash: hashPlanProjection(content),
+    },
+  };
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    revision: 1,
+    updatedAt,
+    content,
+    candidate,
+    candidateHash: hashPlanCandidate(candidate),
+    authoringContractId,
+  };
 }
 
 function seedPlanQuickReplyApprovalScenario() {
@@ -853,15 +1710,10 @@ function seedPlanQuickReplyApprovalScenario() {
       },
     ],
     currentTurnId: turnId,
-    planArtifacts: [
-      {
-        kind: "design" as const,
-        path: ".MAIN/plans/plan.md",
-        title: "Design",
-        updatedAt: now - 1_000,
-        content: "# Design\n\n- 目标：修复字体加载诊断流程。\n- 方案：批准后先运行诊断，再根据结果修复字体加载。\n- 验证：根据 tasks.md 记录诊断命令和修复证据。\n",
-      },
-    ],
+    planArtifacts: [createE2ETypedPlanArtifact(
+      "# Design\n\n- 目标：修复字体加载诊断流程。\n- 方案：批准后先运行诊断，再根据结果修复字体加载。\n- 验证：根据 tasks.md 记录诊断命令和修复证据。\n",
+      now - 1_000,
+    )],
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
@@ -4113,6 +4965,8 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
           title: "正在执行已批准计划",
           status: "running",
           summary: "apply_patch · src/task-9.ts",
+          tool: "apply_patch",
+          canonicalTarget: "src/task-9.ts",
           dedupeKey: `plan-execution-progress:${childRunId}`,
         },
       },
@@ -4300,6 +5154,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     title: "长命令审批回归",
     taskId: reviewBlockId,
     toolCall: {
+      toolCallId: "call-e2e-pending-tool-review",
       name: "run_command",
       arguments: { command: longCommand },
       shellPermissionDecision: { requiresApproval: true },
@@ -4307,6 +5162,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     now,
   });
   const pendingToolCall = {
+    toolCallId: "call-e2e-pending-tool-review",
     name: "run_command",
     arguments: { command: longCommand },
     shellPermissionDecision: {
@@ -4353,6 +5209,8 @@ function seedExecutionCapsulePendingToolReviewScenario() {
         id: reviewBlockId,
         turnId,
         type: "tool" as const,
+        toolCallId: "call-e2e-pending-tool-review",
+        executionId: "call-e2e-pending-tool-review",
         toolName: "run_command",
         target: longCommand,
         status: "pending_review",
@@ -4527,6 +5385,31 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     };
   };
 
+  bridge.makePendingToolReviewDestructive = () => {
+    const destructiveTarget = "DELETE FROM users WHERE id = 42";
+    useAppStore.setState((state) => ({
+      activeActionRequest: state.activeActionRequest?.kind === "tool_permission"
+        ? {
+            ...state.activeActionRequest,
+            toolName: "postgres_query",
+            target: destructiveTarget,
+            risk: "destructive" as const,
+          }
+        : state.activeActionRequest,
+      pendingToolCall: {
+        toolCallId: "call-e2e-pending-tool-review",
+        name: "postgres_query",
+        arguments: { sql: destructiveTarget },
+        risk: "destructive" as const,
+      },
+      taskFlow: state.taskFlow.map((block) =>
+        block.id === reviewBlockId && block.type === "tool"
+          ? { ...block, toolName: "postgres_query", target: destructiveTarget }
+          : block
+      ),
+    }));
+  };
+
   bridge.resolvePendingToolReviewWithIdentity = (
     action: "approve_once" | "approve_session" | "reject",
     identity: {
@@ -4636,15 +5519,15 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
     showTerminal: false,
     showFilePanel: false,
     rightPanelTab: "plan",
-    agentStatus: "pending_review",
+    // Start from a deterministic idle control plane. The bridge below creates
+    // the actual orphan-card case (owned ActionRequest + pendingToolCall but no
+    // TaskBlock) without depending on Session hydration effect ordering.
+    agentStatus: "idle",
     isGenerating: false,
     abortController: null,
-    pendingReviewResolve: (decision: unknown) => appendBridgeEvent("orphan_review_resolved", { decision }),
-    pendingReviewTaskId,
-    pendingToolCall: {
-      name: "apply_patch",
-      arguments: { patch },
-    },
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
     selectedDiffTaskId: null,
     input: "",
     attachedFiles: [],
@@ -4750,9 +5633,13 @@ function seedExecutionCapsulePanelStabilityScenario() {
   const sessionId = 999604;
   const now = Date.now();
   const turnId = "e2e-execution-capsule-panel-stability-turn";
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "plan-session-e2e-execution-capsule-panel-stability";
+  const clientSubmissionId = "e2e-execution-capsule-panel-stability-submission";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const reviewBlockId = useAppStore.getState()._nextTaskId();
+  const originalSendMessage = useAppStore.getState().sendMessage;
   const planTasks = [
     {
       id: "panel-task-1",
@@ -4772,6 +5659,23 @@ function seedExecutionCapsulePanelStabilityScenario() {
     },
   ];
   const reviewCommand = "npm run build";
+  const planContent = [
+    "# ExecutionCapsule 面板稳定设计",
+    "",
+    "## 影响文件",
+    "- 修改 `src/components/ExecutionCapsule.tsx`，让审批状态跟随当前主题色并保持右侧面板稳定。",
+    "- 更新 `tests/e2e/execution-capsule-progress.spec.ts`，覆盖审批后的面板状态。",
+    "",
+    "## 执行顺序",
+    "1. 修改 ExecutionCapsule 的审批状态投影，不改变右侧面板选择。",
+    "2. 运行可执行的 Playwright 回归测试验证批准与执行衔接。",
+    "",
+    "## 关键数据流",
+    "Plan review request 绑定当前 revision/hash；批准后创建执行 run，面板展示状态保持独立。",
+    "",
+    "## 验证方式",
+    "- 运行 `npx playwright test tests/e2e/execution-capsule-progress.spec.ts`。",
+  ].join("\n");
 
   incrementSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
 
@@ -4780,7 +5684,17 @@ function seedExecutionCapsulePanelStabilityScenario() {
     id: agentBlockId,
     turnId,
     type: "agent" as const,
-    content: "已根据你的需求生成计划，等待确认后开始执行。",
+    content: [
+      "### 修复计划已准备好",
+      "",
+      "**根本原因**：审批状态与右侧面板选择共享了旧的展示条件。",
+      "",
+      "- S1 · 更新 ExecutionCapsule 审批状态投影",
+      "- S2 · 验证批准后右侧面板保持稳定",
+      "",
+      "已绑定可信证据和有限验证；批准前不会修改项目。",
+    ].join("\n"),
+    visibility: "assistant_update" as const,
   };
   const reviewBlock: any = {
     id: reviewBlockId,
@@ -4830,6 +5744,327 @@ function seedExecutionCapsulePanelStabilityScenario() {
     };
   };
 
+  const buildExactPlanReviewRuntime = (input: {
+    artifacts: PlanArtifact[];
+    runId: string;
+    requestId?: string;
+    at: number;
+  }) => {
+    const approvalIdentity = buildTypedPlanApprovalIdentity(input.artifacts);
+    if (!approvalIdentity) {
+      const authority = resolveTypedPlanReviewAuthority(input.artifacts);
+      throw new Error(
+        `ExecutionCapsule E2E fixture requires one typed primary Plan: ${
+          authority.ok ? "identity_projection_failed" : authority.reason
+        }`,
+      );
+    }
+    const baseRequest = buildPlanReviewActionRequest({
+      sessionKey,
+      turnId,
+      runId: input.runId,
+      parentRunId: null,
+      title: "ExecutionCapsule 面板稳定回归",
+      planRevision: approvalIdentity.revision,
+      artifactHash: approvalIdentity.artifactHash,
+      artifactPaths: approvalIdentity.artifactPaths,
+      now: input.at,
+    });
+    const request = input.requestId
+      ? { ...baseRequest, requestId: input.requestId }
+      : baseRequest;
+    const artifactIdentity = {
+      revision: approvalIdentity.revision,
+      artifactHash: approvalIdentity.artifactHash,
+      artifactPaths: approvalIdentity.artifactPaths,
+    };
+    let lifecycle = createPlanLifecycleState({
+      sessionKey,
+      sessionEpoch,
+      updatedAt: Math.max(0, input.at - 2),
+    });
+    const drafting = reducePlanLifecycle(lifecycle, {
+      type: "start_drafting",
+      expectedVersion: lifecycle.version,
+      at: Math.max(0, input.at - 1),
+      planTurnId: turnId,
+      artifactIdentity,
+    });
+    if (drafting.disposition === "rejected") {
+      throw new Error(`Failed to seed Plan drafting lifecycle: ${drafting.reason}`);
+    }
+    lifecycle = drafting.state;
+    const review = reducePlanLifecycle(lifecycle, {
+      type: "request_review",
+      expectedVersion: lifecycle.version,
+      at: input.at,
+      artifactIdentity,
+      reviewIdentity: {
+        sessionKey,
+        sessionEpoch,
+        turnId,
+        runId: input.runId,
+        parentRunId: null,
+        requestId: request.requestId,
+        planRevision: approvalIdentity.revision,
+        artifactHash: approvalIdentity.artifactHash,
+        artifactPaths: approvalIdentity.artifactPaths,
+      },
+    });
+    if (review.disposition === "rejected") {
+      throw new Error(`Failed to seed Plan review lifecycle: ${review.reason}`);
+    }
+    lifecycle = review.state;
+
+    const run = {
+      sessionKey,
+      sessionEpoch,
+      turnId,
+      runId: input.runId,
+      parentRunId: null,
+      attemptId: input.runId,
+    };
+    let canonical = createCanonicalTurnRuntime({
+      turn: {
+        workspaceKey: workspace,
+        sessionKey,
+        sessionEpoch,
+        clientSubmissionId,
+        turnId,
+      },
+      strategy: "plan",
+      admittedAt: Math.max(0, input.at - 2),
+    });
+    const started = reduceCanonicalTurnRuntime(canonical, {
+      schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+      type: "run.started",
+      sequence: canonical.nextSequence,
+      at: Math.max(canonical.lastEventAt, input.at - 1),
+      run,
+      phase: "planning",
+    });
+    if (started.disposition === "rejected") {
+      throw new Error(`Failed to seed Plan review Run: ${started.reason}`);
+    }
+    canonical = started.state;
+    const accepted = reduceCanonicalTurnRuntime(canonical, {
+      schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+      type: "plan.artifact_accepted",
+      sequence: canonical.nextSequence,
+      at: Math.max(canonical.lastEventAt, input.at),
+      run,
+      artifact: {
+        path: approvalIdentity.artifactPaths[0] || ".MAIN/plans/plan.md",
+        digest: approvalIdentity.artifactHash,
+        revision: approvalIdentity.revision,
+      },
+    });
+    if (accepted.disposition === "rejected") {
+      throw new Error(`Failed to seed Plan review checkpoint: ${accepted.reason}`);
+    }
+    const checkpoint = createTurnRuntimeCheckpoint({
+      canonical: accepted.state,
+      updatedAt: accepted.state.lastEventAt,
+    });
+    return {
+      request,
+      lifecycle,
+      checkpoint,
+      approvalIdentity,
+    };
+  };
+
+  /**
+   * This browser-only scenario has no Tauri/provider runtime behind it. Keep
+   * the production approval boundary intact and emulate only the child Run
+   * admission that follows a valid approval lease. Every identity used by the
+   * real dispatcher is rechecked before the fixture can project execution.
+   */
+  const admitApprovedPlanChildRun: typeof originalSendMessage = (text, images, options) => {
+    const isPlanExecutionDispatch =
+      options?.hidden === true &&
+      options.createVisibleTurnForHiddenMessage === false &&
+      options.reuseCurrentTurn === true &&
+      options.preservePlanState === true &&
+      options.resolvedIntent === "execute" &&
+      options.skipIntentResolution === true &&
+      typeof options.planExecutionLeaseId === "string" &&
+      typeof options.planExecutionInstructionHash === "string";
+    if (!isPlanExecutionDispatch) {
+      return originalSendMessage(text, images, options);
+    }
+
+    const current = useAppStore.getState();
+    const lifecycle = current.planLifecycle;
+    const approvalLease = lifecycle.approvalLease;
+    const executionLease = lifecycle.executionLease;
+    const handoff = current.pendingPlanApprovalHandoff;
+    const marker = current.harnessRunMarker;
+    const artifactIdentity = buildTypedPlanApprovalIdentity(current.planArtifacts);
+    const ownerSession = current.sessionsByWorkspace[workspace]
+      ?.find((session) => session.id === sessionId);
+    const instructionHash = buildPlanExecutionInstructionHash(text);
+    const pathsMatch = (
+      left: readonly string[] | undefined,
+      right: readonly string[] | undefined,
+    ) => !!left && !!right &&
+      left.length === right.length &&
+      left.every((path, index) => path === right[index]);
+    const exactAdmission =
+      lifecycle.status === "handoff_pending" &&
+      lifecycle.sessionKey === sessionKey &&
+      lifecycle.sessionEpoch === sessionEpoch &&
+      lifecycle.planTurnId === turnId &&
+      ownerSession?.planLifecycleEpoch === sessionEpoch &&
+      isPlanApprovalLeaseBoundToState(lifecycle) &&
+      !!approvalLease &&
+      !!executionLease &&
+      !!handoff &&
+      !!marker &&
+      !!artifactIdentity &&
+      lifecycle.artifactIdentity?.revision === artifactIdentity.revision &&
+      lifecycle.artifactIdentity.artifactHash === artifactIdentity.artifactHash &&
+      pathsMatch(lifecycle.artifactIdentity.artifactPaths, artifactIdentity.artifactPaths) &&
+      approvalLease.planRevision === artifactIdentity.revision &&
+      approvalLease.artifactHash === artifactIdentity.artifactHash &&
+      pathsMatch(approvalLease.artifactPaths, artifactIdentity.artifactPaths) &&
+      options.turnIdOverride === executionLease.executionTurnId &&
+      options.runIdOverride === executionLease.executionRunId &&
+      (options.parentRunIdOverride || null) === executionLease.parentRunId &&
+      options.planExecutionLeaseId === executionLease.executionLeaseId &&
+      options.planExecutionInstructionHash === executionLease.instructionHash &&
+      instructionHash === executionLease.instructionHash &&
+      handoff.executionTurnId === executionLease.executionTurnId &&
+      handoff.executionRunId === executionLease.executionRunId &&
+      handoff.parentRunId === executionLease.parentRunId &&
+      handoff.executionAttempt === executionLease.attempt &&
+      handoff.executionLeaseId === executionLease.executionLeaseId &&
+      handoff.executionInstructionHash === executionLease.instructionHash &&
+      handoff.approvalLeaseId === approvalLease.leaseId &&
+      handoff.reviewRequestId === approvalLease.requestId &&
+      marker.status === "paused" &&
+      marker.sessionKey === sessionKey &&
+      marker.turnId === turnId &&
+      (marker.activeRunId || marker.runId) === executionLease.parentRunId;
+    if (
+      !exactAdmission ||
+      !approvalLease ||
+      !executionLease ||
+      !handoff ||
+      !marker
+    ) {
+      appendBridgeEvent("panel-child-run-admission-rejected", {
+        reason: "execution_lease_identity_mismatch",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+
+    const admittedAt = Date.now();
+    const execution = {
+      turnId: executionLease.executionTurnId,
+      runId: executionLease.executionRunId,
+      parentRunId: executionLease.parentRunId,
+      attempt: executionLease.attempt,
+      startedAt: admittedAt,
+    };
+    const started = reducePlanLifecycle(lifecycle, {
+      type: "execution_started",
+      expectedVersion: lifecycle.version,
+      at: admittedAt,
+      executionLeaseId: executionLease.executionLeaseId,
+      instructionHash,
+      execution,
+    });
+    if (
+      started.disposition === "rejected" ||
+      !isPlanLifecycleExecutionAuthorizedForRun(started.state, {
+        executionLeaseId: executionLease.executionLeaseId,
+        turnId: execution.turnId,
+        runId: execution.runId,
+        parentRunId: execution.parentRunId,
+        attempt: execution.attempt,
+      })
+    ) {
+      appendBridgeEvent("panel-child-run-admission-rejected", {
+        reason: started.reason || "execution_started_not_authorized",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+    const provenance = capturePlanExecutionRunProvenance(started.state);
+    if (!provenance) {
+      appendBridgeEvent("panel-child-run-admission-rejected", {
+        reason: "plan_execution_provenance_missing",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+    const runStarted = appendRuntimeEventWithResult(current.runtimeEvents, withEventSchema({
+      type: "run.started",
+      threadId: sessionKey,
+      turnId: execution.turnId,
+      timestampMs: admittedAt,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+    }));
+    if (runStarted.disposition === "conflict") {
+      appendBridgeEvent("panel-child-run-admission-rejected", {
+        reason: "run_started_identity_conflict",
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+
+    useAppStore.setState((state) => ({
+      planLifecycle: started.state,
+      isPlanApproved: true,
+      planStage: "executing",
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: execution.turnId,
+      currentTurnExecutionConsent: { turnId: execution.turnId, granted: true },
+      runtimeEvents: runStarted.events,
+      harnessRunMarker: {
+        ...marker,
+        runId: execution.runId,
+        activeRunId: execution.runId,
+        activeParentRunId: execution.parentRunId,
+        activePlanExecutionProvenance: provenance,
+        parentRunId: execution.parentRunId,
+        instanceId: `${marker.instanceId}:execution`,
+        status: "running",
+        terminalResultKind: null,
+        runtimeIntent: "execute",
+        planStage: "executing",
+        isPlanApproved: true,
+        startedAt: admittedAt,
+        updatedAt: admittedAt,
+        closedAt: null,
+        closeReason: null,
+      },
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === execution.turnId
+          ? {
+              ...turn,
+              status: "executing" as const,
+              summary: "已接纳批准后的同回合子 Run，正在执行计划。",
+              runtimeOutcome: undefined,
+            }
+          : turn
+      ),
+      agentStatus: "running",
+      isGenerating: true,
+      abortController: new AbortController(),
+    }));
+    appendBridgeEvent("panel-child-run-admitted", {
+      turnId: execution.turnId,
+      runId: execution.runId,
+      parentRunId: execution.parentRunId,
+      executionLeaseId: executionLease.executionLeaseId,
+    });
+    return true;
+  };
+
   useAppStore.setState((state) => ({
     ...state,
     config: {
@@ -4843,9 +6078,11 @@ function seedExecutionCapsulePanelStabilityScenario() {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E ExecutionCapsule Panel Stability",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary",
           messages: [],
         },
       ],
@@ -4855,6 +6092,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
     conversationTurns: [
       {
         id: turnId,
+        clientSubmissionId,
         userPrompt: "/计划 修复 ExecutionCapsule 审批时右侧面板状态。",
         title: "ExecutionCapsule 面板稳定回归",
         mode: "plan",
@@ -4868,29 +6106,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
     ],
     currentTurnId: turnId,
     planArtifacts: [
-      {
-        kind: "design",
-        path: ".MAIN/plans/plan.md",
-        title: "Design",
-        content: [
-          "# ExecutionCapsule 面板稳定设计",
-          "",
-          "## 影响文件",
-          "- 修改 `src/components/ExecutionCapsule.tsx`，让审批状态跟随当前主题色并保持右侧面板稳定。",
-          "- 更新 `tests/e2e/execution-capsule-execution-progress.spec.ts`，覆盖审批后的面板状态。",
-          "",
-          "## 执行顺序",
-          "1. 修改 ExecutionCapsule 的审批状态投影，不改变右侧面板选择。",
-          "2. 运行可执行的 Playwright 回归测试验证批准与执行衔接。",
-          "",
-          "## 关键数据流",
-          "Plan review request 绑定当前 revision/hash；批准后创建执行 run，面板展示状态保持独立。",
-          "",
-          "## 验证方式",
-          "- 运行 `npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts`。",
-        ].join("\n"),
-        updatedAt: now,
-      },
+      createE2EExecutionCapsuleTypedPlanArtifact(planContent, now, turnId),
       {
         kind: "tasks",
         path: ".MAIN/plans/tasks.md",
@@ -4919,6 +6135,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
     input: "",
     attachedFiles: [],
     contextMentions: [],
+    sendMessage: admitApprovedPlanChildRun,
   }));
 
   bridge.setPanelMode = (mode: "plan" | "diff" | "terminal" | "closed") => {
@@ -5056,7 +6273,12 @@ function seedExecutionCapsulePanelStabilityScenario() {
 
   bridge.setExecutionCapsuleIdentity = (runId: string, requestId: string) => {
     const identityNow = Date.now();
-    const planIdentity = buildPlanApprovalIdentity(useAppStore.getState().planArtifacts);
+    const exactReview = buildExactPlanReviewRuntime({
+      artifacts: useAppStore.getState().planArtifacts,
+      runId,
+      requestId,
+      at: identityNow,
+    });
     useAppStore.setState({
       harnessRunMarker: {
         schemaVersion: 1,
@@ -5089,21 +6311,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
         closedAt: identityNow,
         closeReason: "plan_review",
       },
-      activeActionRequest: planIdentity
-        ? {
-            ...buildPlanReviewActionRequest({
-              sessionKey: `${workspace}:${sessionId}`,
-              turnId,
-              runId,
-              title: "ExecutionCapsule 面板稳定回归",
-              planRevision: planIdentity.revision,
-              artifactHash: planIdentity.artifactHash,
-              artifactPaths: planIdentity.artifactPaths,
-              now: identityNow,
-            }),
-            requestId,
-          }
-        : null,
+      planLifecycle: exactReview.lifecycle,
+      activeActionRequest: exactReview.request,
+      turnRuntimeCheckpoints: { [turnId]: exactReview.checkpoint },
     });
     appendBridgeEvent("execution_capsule_identity", { runId, requestId, turnId });
   };
@@ -5111,7 +6321,13 @@ function seedExecutionCapsulePanelStabilityScenario() {
   bridge.resetPlanApprovalPrompt = () => {
     useAppStore.setState((state) => {
       const withoutReview = removeReviewBlock(state);
-      const planIdentity = buildPlanApprovalIdentity(state.planArtifacts);
+      const resetAt = Date.now();
+      const reviewRunId = state.harnessRunMarker?.runId || "run-e2e-plan-review";
+      const exactReview = buildExactPlanReviewRuntime({
+        artifacts: state.planArtifacts,
+        runId: reviewRunId,
+        at: resetAt,
+      });
       return {
         ...withoutReview,
         isPlanApproved: false,
@@ -5129,26 +6345,17 @@ function seedExecutionCapsulePanelStabilityScenario() {
               status: "paused" as const,
               planStage: "ready_to_execute",
               isPlanApproved: false,
-              updatedAt: Date.now(),
-              closedAt: state.harnessRunMarker.closedAt || Date.now(),
+              updatedAt: resetAt,
+              closedAt: state.harnessRunMarker.closedAt || resetAt,
               closeReason: state.harnessRunMarker.closeReason || "plan_review",
             }
           : state.harnessRunMarker,
         pendingReviewResolve: null,
         pendingReviewTaskId: null,
         pendingToolCall: null,
-        activeActionRequest: planIdentity
-          ? buildPlanReviewActionRequest({
-              sessionKey: `${workspace}:${sessionId}`,
-              turnId,
-              runId: state.harnessRunMarker?.runId || "run-e2e-plan-review",
-              parentRunId: state.harnessRunMarker?.parentRunId || null,
-              title: "ExecutionCapsule 面板稳定回归",
-              planRevision: planIdentity.revision,
-              artifactHash: planIdentity.artifactHash,
-              artifactPaths: planIdentity.artifactPaths,
-            })
-          : null,
+        planLifecycle: exactReview.lifecycle,
+        activeActionRequest: exactReview.request,
+        turnRuntimeCheckpoints: { [turnId]: exactReview.checkpoint },
         selectedDiffTaskId: state.selectedDiffTaskId === reviewBlockId ? null : state.selectedDiffTaskId,
         conversationTurns: withoutReview.conversationTurns.map((turn) =>
           turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn
@@ -5189,7 +6396,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
     appendBridgeEvent("plan_approval_revoked_before_fallback");
   };
 
-  bridge.attemptBusyPlanResume = () => {
+  bridge.attemptBusyPlanResume = async () => {
     const owner = new AbortController();
     useAppStore.setState((state) => ({
       selectedMainModeKey: "main_mode",
@@ -5208,11 +6415,19 @@ function seedExecutionCapsulePanelStabilityScenario() {
       ),
     }));
     const accepted = useAppStore.getState().sendMessage("继续");
-    const latest = useAppStore.getState();
+    let latest = useAppStore.getState();
+    let queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries
+      .find((entry) => entry.status === "queued")?.instruction.payload.text;
+    for (let attempt = 0; attempt < 50 && !queuedWorkspaceInstruction; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 10));
+      latest = useAppStore.getState();
+      queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries
+        .find((entry) => entry.status === "queued")?.instruction.payload.text;
+    }
     return {
       accepted,
       ownerPreserved: latest.abortController === owner,
-      queuedText: latest.queuedUserMessage?.text || null,
+      queuedText: queuedWorkspaceInstruction || latest.queuedUserMessage?.text || null,
       startedForTurnId: latest.planApprovalExecutionStartedForTurnId,
     };
   };
@@ -5337,6 +6552,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
       pendingToolCall: null,
       agentStatus: "idle",
       isGenerating: false,
+      ...(latest.sendMessage === admitApprovedPlanChildRun
+        ? { sendMessage: originalSendMessage }
+        : {}),
     });
     bridge.initialized = false;
   };
@@ -5511,7 +6729,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
   return cleanup;
 }
 
-function seedCapsuleProcessScenario(kind: "model" | "progress") {
+function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -5521,14 +6739,20 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
 
   const workspace = kind === "model"
     ? "/tmp/e2e-capsule-model-explanation"
-    : "/tmp/e2e-capsule-progress-only";
-  const sessionId = kind === "model" ? 999613 : 999614;
+    : kind === "progress"
+      ? "/tmp/e2e-capsule-progress-only"
+      : "/tmp/e2e-capsule-phase-fallback";
+  const sessionId = kind === "model" ? 999613 : kind === "progress" ? 999614 : 999616;
   const now = Date.now();
   const turnId = kind === "model"
     ? "e2e-capsule-model-explanation-turn"
-    : "e2e-capsule-progress-only-turn";
+    : kind === "progress"
+      ? "e2e-capsule-progress-only-turn"
+      : "e2e-capsule-phase-fallback-turn";
+  const runId = `run-${turnId}`;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const firstUpdateId = useAppStore.getState()._nextTaskId();
+  const liveActivityId = useAppStore.getState()._nextTaskId();
   const readToolId = useAppStore.getState()._nextTaskId();
   const commandToolId = useAppStore.getState()._nextTaskId();
   const secondUpdateId = useAppStore.getState()._nextTaskId();
@@ -5540,14 +6764,48 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: firstUpdateId,
       turnId,
       type: "agent" as const,
-      content: "已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。",
+      content: buildAssistantStageCheckpoint(
+        "已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
+        "zh",
+      ),
       visibility: "assistant_update" as const,
       streaming: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "assistant_commentary" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now - 20,
+      },
+    }, {
+      id: liveActivityId,
+      turnId,
+      type: "agent" as const,
+      content: "让我继续查看 **ChatArea.tsx**，确认 Capsule 的实时投影入口。",
+      visibility: "user_progress" as const,
+      streaming: true,
+      hiddenProcess: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "capsule_activity" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now,
+      },
     }] : []),
-    {
+    ...(kind === "phase" ? [] : [{
       id: readToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "read_file",
       target: "src/components/ChatArea.tsx",
       status: "done",
@@ -5555,11 +6813,11 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       message: "OK",
       intentSummary: "确认 capsule 渲染链路",
       observationSummary: "找到 ChatArea 中 capsule 的显示优先级。",
-    },
-    {
+    }, {
       id: commandToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "run_command",
       target: "npm run test:workflow-assets",
       status: "done",
@@ -5567,26 +6825,41 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       message: "OK",
       intentSummary: "运行回归测试确认折叠状态",
       observationSummary: "验证命令已完成。",
-    },
+    }]),
     ...(kind === "model" ? [{
       id: secondUpdateId,
       turnId,
       type: "agent" as const,
-      content: "展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。",
+      content: buildAssistantStageCheckpoint(
+        "已确认重复展示来自同一工具前言被同时投影；**Capsule 只保留精简判断**。",
+        "zh",
+      ),
       visibility: "assistant_update" as const,
       streaming: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "assistant_commentary" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now - 10,
+      },
     }] : []),
-    {
+    ...(kind === "phase" ? [] : [{
       id: runningToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "grep_search",
       target: "src/components/ChatArea.tsx",
       status: "running",
       toolStatus: "running" as const,
       message: "Searching...",
       intentSummary: "继续确认 capsule 不会被工具调用冲刷",
-    },
+    }]),
   ];
 
   useAppStore.setState((state) => ({
@@ -5603,7 +6876,11 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       [workspace]: [
         {
           id: sessionId,
-          title: kind === "model" ? "E2E Capsule Model Explanation" : "E2E Capsule Progress Only",
+        title: kind === "model"
+          ? "E2E Capsule Model Explanation"
+          : kind === "progress"
+            ? "E2E Capsule Progress Only"
+            : "E2E Capsule Phase Fallback",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -5611,12 +6888,49 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId,
+      activeRunId: runId,
+      parentRunId: null,
+      instanceId: `instance-${turnId}`,
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "running",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      iteration: 2,
+      maxIterations: 25,
+      messagesLen: 4,
+      toolCount: 3,
+      latestTool: "grep_search",
+      latestToolTarget: "src/components/ChatArea.tsx",
+      activeStreamId: `stream-${turnId}`,
+      streamStatus: "chunk_progress",
+      streamChunkCount: 2,
+      streamByteCount: 128,
+      streamElapsedMs: 1_200,
+      streamLifecycleStatus: "streaming",
+      lastStreamError: null,
+      startedAt: now - 2_000,
+      updatedAt: now,
+      closedAt: null,
+      closeReason: null,
+    },
     taskFlow,
     conversationTurns: [
       {
         id: turnId,
         userPrompt: "继续排查 capsule 和工具折叠。",
-        title: kind === "model" ? "Capsule 模型说明缓存" : "Capsule 工具进度兜底",
+        title: kind === "model"
+          ? "Capsule 模型说明缓存"
+          : kind === "progress"
+            ? "Capsule 工具进度兜底"
+            : "Capsule 活跃阶段兜底",
         mode: "edit",
         intent: "execute",
         status: "executing",
@@ -5648,7 +6962,9 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
   bindBridgeSnapshot(
     kind === "model"
       ? CAPSULE_MODEL_EXPLANATION_SCENARIO
-      : CAPSULE_PROGRESS_ONLY_SCENARIO,
+      : kind === "progress"
+        ? CAPSULE_PROGRESS_ONLY_SCENARIO
+        : CAPSULE_PHASE_FALLBACK_SCENARIO,
   );
 
   const cleanup = () => {
@@ -6634,6 +7950,42 @@ function seedComposerRunningGuidanceScenario() {
   const now = Date.now();
   const turnId = "e2e-composer-running-guidance-turn";
   const planLifecycleEpoch = "plan-session-e2e-composer-running-guidance";
+  const workspace = "/tmp/e2e-composer-running-guidance";
+  const sessionId = 999011;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const canonicalRun = {
+    sessionKey,
+    sessionEpoch: planLifecycleEpoch,
+    turnId,
+    runId: "e2e-composer-running-guidance-run",
+    parentRunId: null,
+    attemptId: "e2e-composer-running-guidance-attempt",
+  };
+  const admittedCanonical = createCanonicalTurnRuntime({
+    turn: {
+      workspaceKey: workspace,
+      sessionKey,
+      sessionEpoch: planLifecycleEpoch,
+      clientSubmissionId: "e2e-composer-running-guidance-submission",
+      turnId,
+    },
+    strategy: "chat",
+    admittedAt: now,
+  });
+  const startedCanonical = reduceCanonicalTurnRuntime(admittedCanonical, {
+    schemaVersion: TURN_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    type: "run.started",
+    sequence: admittedCanonical.nextSequence,
+    at: now + 1,
+    run: canonicalRun,
+    phase: "preparing",
+  });
+  if (startedCanonical.disposition === "rejected") {
+    throw new Error(`Failed to seed canonical Composer Run: ${startedCanonical.reason}`);
+  }
+  const runningCheckpoint = createTurnRuntimeCheckpoint({
+    canonical: startedCanonical.state,
+  });
   const userBlockId = useAppStore.getState()._nextTaskId();
 
   useAppStore.setState((state) => ({
@@ -6643,12 +7995,12 @@ function seedComposerRunningGuidanceScenario() {
       language: "zh",
       workflowMode: "chat",
     },
-    currentWorkspace: "/tmp/e2e-composer-running-guidance",
-    selectedWorkspace: "/tmp/e2e-composer-running-guidance",
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
     sessionsByWorkspace: {
-      "/tmp/e2e-composer-running-guidance": [
+      [workspace]: [
         {
-          id: 999011,
+          id: sessionId,
           title: "E2E Composer Running Guidance",
           date: new Date(now).toISOString(),
           active: true,
@@ -6662,7 +8014,7 @@ function seedComposerRunningGuidanceScenario() {
         },
       ],
     },
-    currentSessionId: 999011,
+    currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
@@ -6682,6 +8034,7 @@ function seedComposerRunningGuidanceScenario() {
       },
     ],
     currentTurnId: turnId,
+    turnRuntimeCheckpoints: { [turnId]: runningCheckpoint },
     input: "",
     attachedFiles: [],
     contextMentions: [],
@@ -6701,6 +8054,33 @@ function seedComposerRunningGuidanceScenario() {
   }));
 
   bindBridgeSnapshot(COMPOSER_RUNNING_GUIDANCE_SCENARIO);
+  bridge.setModelRuntimeLock = (options: {
+    status?: "running" | "pending_review";
+    isGenerating?: boolean;
+  } = {}) => {
+    const status = options.status === "pending_review" ? "pending_review" : "running";
+    useAppStore.setState((state) => ({
+      ...state,
+      agentStatus: status,
+      isGenerating: options.isGenerating ?? status === "running",
+      turnRuntimeCheckpoints: status === "running"
+        ? { ...state.turnRuntimeCheckpoints, [turnId]: runningCheckpoint }
+        : state.turnRuntimeCheckpoints,
+    }));
+  };
+  bridge.clearModelRuntimeLock = () => {
+    useAppStore.setState((state) => {
+      const nextCheckpoints = { ...state.turnRuntimeCheckpoints };
+      delete nextCheckpoints[turnId];
+      return {
+        ...state,
+        agentStatus: "idle",
+        isGenerating: false,
+        activeGuidance: null,
+        turnRuntimeCheckpoints: nextCheckpoints,
+      };
+    });
+  };
 
   const cleanup = () => {
     const latest = useAppStore.getState();
@@ -7074,6 +8454,15 @@ function seedLocalPlanSlowFirstTokenScenario() {
   return cleanup;
 }
 
+function stableRealOmlxSessionId(value: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return 700_000 + ((hash >>> 0) % 200_000);
+}
+
 function seedRealOmlxPlanFlowScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -7082,20 +8471,23 @@ function seedRealOmlxPlanFlowScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
   bridge.dispatchError = null;
+  bridge.lastWorkspaceInstructionAcceptance = null;
 
   incrementSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO);
 
   const params = new URLSearchParams(window.location.search);
-  const model = params.get("model") || "gemma-4-26b-a4b-it-8bit";
+  const model = params.get("model") || "e2e-placeholder-model";
   const realOmlxConfig = (window as any).__REAL_OMLX_CONFIG__ || {};
   const workspace = String(
     (window as any).__REAL_OMLX_WORKSPACE__ ||
     `/tmp/e2e-real-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}`,
   );
-  const sessionId = model.includes("Qwen") ? 999522 : 999521;
+  const sessionId = stableRealOmlxSessionId(`${workspace}\0${model}`);
   const now = Date.now();
+  const sessionEpoch = createPlanLifecycleSessionEpoch(now);
+  const sessionKey = `${workspace}:${sessionId}`;
 
-  useAppStore.setState((state) => ({
+  const applyRealOmlxWorkspaceFixture = () => useAppStore.setState((state) => ({
     ...state,
     config: {
       ...state.config,
@@ -7118,10 +8510,16 @@ function seedRealOmlxPlanFlowScenario() {
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
+    workspaces: [{ path: workspace, name: "E2E Real OMLX", addedAt: now, lastActiveAt: now }],
+    activeSessionByWorkspace: {
+      ...state.activeSessionByWorkspace,
+      [workspace]: sessionId,
+    },
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: `E2E Real OMLX ${model}`,
           date: new Date(now).toISOString(),
           active: true,
@@ -7145,6 +8543,11 @@ function seedRealOmlxPlanFlowScenario() {
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
+    planLifecycle: createPlanLifecycleState({
+      sessionKey,
+      sessionEpoch,
+      updatedAt: now,
+    }),
     planStage: "idle",
     isPlanApproved: false,
     readOnlyAutoApproveForSession: true,
@@ -7152,6 +8555,15 @@ function seedRealOmlxPlanFlowScenario() {
     autoApproveToolScopes: ["workspace_write", "shell"],
     isGenerating: false,
     agentStatus: "idle",
+    runtimeEvents: [],
+    runtimeBySessionKey: {},
+    harnessRunMarker: null,
+    workspaceTurnQueue: null,
+    workspaceInstructionLedger: [],
+    activeActionRequest: null,
+    pendingToolCall: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
     elapsedTime: 0,
     showPlanPanel: true,
     showTerminal: false,
@@ -7159,18 +8571,41 @@ function seedRealOmlxPlanFlowScenario() {
     showDiff: false,
     selectedDiffTaskId: null,
   }));
+  applyRealOmlxWorkspaceFixture();
 
-  bridge.sendCloudMessage = (text?: string) =>
-    useAppStore.getState().sendMessage(
-      text || "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
-      undefined,
-      {
-        resolvedIntent: "plan",
-        skipIntentResolution: true,
+  bridge.sendCloudMessage = async (text?: string, images?: string[]) => {
+    // Zustand persistence may finish hydration after App's E2E mount effect.
+    // Reapply only the fixture owner immediately before the one real
+    // production admission; the receipt/FIFO/Turn path below remains the same
+    // one used by Composer and is not reconstructed in the bridge.
+    applyRealOmlxWorkspaceFixture();
+    const state = useAppStore.getState();
+    const acceptance = await acceptWorkspaceComposerInstruction({
+      text: text || "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
+      images,
+      language: state.config.language === "en" ? "en" : "zh",
+      intentSnapshot: {
+        mainModeKey: state.selectedMainModeKey,
+        // This scenario represents the same one-shot Plan capsule captured by
+        // Composer when the user explicitly selects Plan before submitting.
+        lockedComposerIntent: "plan",
+        subagentPreference: state.preferSubagents ? "preferred" : "unspecified",
       },
-    );
+      payloadSnapshot: {
+        contextMentions: state.contextMentions,
+        attachedFiles: state.attachedFiles,
+      },
+      acceptWorkspaceInstruction: state.acceptWorkspaceInstruction,
+    });
+    bridge.lastWorkspaceInstructionAcceptance = acceptance;
+    if (!acceptance.accepted) {
+      bridge.dispatchError = `workspace_admission:${acceptance.reason}`;
+      return false;
+    }
+    return true;
+  };
 
-  bridge.sendDirectEditMessage = (text?: string) => {
+  bridge.sendDirectEditMessage = async (text?: string, images?: string[]) => {
     useAppStore.setState((state) => ({
       ...state,
       config: { ...state.config, workflowMode: "edit" },
@@ -7179,14 +8614,31 @@ function seedRealOmlxPlanFlowScenario() {
       planStage: "idle",
       isPlanApproved: false,
     }));
-    return useAppStore.getState().sendMessage(
-      text || "直接修改 src/hooks/useCsvParser.ts，把 creator 映射为 creatorName，并用 npm test 验证。",
-      undefined,
-      {
-        resolvedIntent: "execute",
-        skipIntentResolution: true,
+    const state = useAppStore.getState();
+    const acceptance = await acceptWorkspaceComposerInstruction({
+      text: text || "直接修改 src/hooks/useCsvParser.ts，把 creator 映射为 creatorName，并用 npm test 验证。",
+      images,
+      language: state.config.language === "en" ? "en" : "zh",
+      intentSnapshot: {
+        mainModeKey: state.selectedMainModeKey,
+        // Execute is MAIN's default action path rather than a slash shortcut.
+        // Leaving this unlocked exercises the same text-to-action normalization
+        // that Composer uses for an ordinary Edit/Execute instruction.
+        lockedComposerIntent: null,
+        subagentPreference: state.preferSubagents ? "preferred" : "unspecified",
       },
-    );
+      payloadSnapshot: {
+        contextMentions: state.contextMentions,
+        attachedFiles: state.attachedFiles,
+      },
+      acceptWorkspaceInstruction: state.acceptWorkspaceInstruction,
+    });
+    bridge.lastWorkspaceInstructionAcceptance = acceptance;
+    if (!acceptance.accepted) {
+      bridge.dispatchError = `workspace_admission:${acceptance.reason}`;
+      return false;
+    }
+    return true;
   };
 
   bridge.sendGoalMessage = (text?: string) => {
@@ -7218,14 +8670,14 @@ function seedRealOmlxPlanFlowScenario() {
 
   bridge.approvePlan = () => {
     const before = useAppStore.getState();
-    const executionTasks = ensureApprovedPlanRuntimeTasksForState(
-      before,
-      before.config.language === "en" ? "en" : "zh",
-    );
-    const readiness = evaluateApprovedPlanExecutionReadiness({
-      planArtifacts: before.planArtifacts,
-      executionPlanTasks: executionTasks,
-    });
+    const checkpoint = before.currentTurnId
+      ? before.runtimeV2Checkpoints?.[before.currentTurnId] || null
+      : null;
+    const aggregate = checkpoint?.aggregate || null;
+    const review = aggregate?.planReviewCommit || null;
+    const request = before.activeActionRequest?.kind === "plan_review"
+      ? before.activeActionRequest
+      : null;
     before.approvePlan("批准执行");
     const after = useAppStore.getState();
     return {
@@ -7235,9 +8687,19 @@ function seedRealOmlxPlanFlowScenario() {
         agentStatus: before.agentStatus,
         isGenerating: before.isGenerating,
         actionRequestId: before.activeActionRequest?.requestId || null,
-        readiness,
-        executionTasks,
-        planContent: before.planArtifacts[0]?.content || "",
+        runtimeV2Authority: {
+          strategy: aggregate?.strategy || null,
+          phase: aggregate?.phase || null,
+          workPlanStatus: aggregate?.workPlan?.status || null,
+          workPlanId: aggregate?.sealedWorkPlan?.id || null,
+          revision: aggregate?.sealedWorkPlan?.revision || null,
+          digest: aggregate?.sealedWorkPlan?.digest || null,
+          projectionHash: aggregate?.sealedWorkPlan?.projectionHash || null,
+          reviewRequestId: review?.review?.requestId || null,
+          requestMatches: !!request &&
+            request.requestId === review?.review?.requestId &&
+            request.artifactHash === review?.authority?.projectionHash,
+        },
       },
       after: {
         turnId: after.currentTurnId,
@@ -7259,11 +8721,346 @@ function seedRealOmlxPlanFlowScenario() {
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const runtimeV2Checkpoint = currentTurn
+      ? state.runtimeV2Checkpoints?.[currentTurn.id] || null
+      : null;
+    const runtimeV2Aggregate = runtimeV2Checkpoint?.aggregate || null;
+    const runtimeV2Events = Array.isArray(runtimeV2Aggregate?.events)
+      ? runtimeV2Aggregate.events
+      : [];
+    const runtimeV2Receipts = Array.isArray(runtimeV2Aggregate?.completedCommands)
+      ? runtimeV2Aggregate.completedCommands
+      : [];
+    const runtimeV2ReceiptByKey = new Map(
+      runtimeV2Receipts.map((receipt: any) => [receipt.idempotencyKey, receipt] as const),
+    );
+    const runtimeV2CommandTarget = (command: any): string => {
+      const payload = command?.payload && typeof command.payload === "object"
+        ? command.payload
+        : {};
+      const args = payload.arguments && typeof payload.arguments === "object" && !Array.isArray(payload.arguments)
+        ? payload.arguments
+        : {};
+      const value = args.path || args.file || args.target || args.command || args.cmd ||
+        args.query || args.pattern || args.url || payload.target || payload.objective || "";
+      return typeof value === "string" ? value : JSON.stringify(value);
+    };
+    const runtimeV2Commands = runtimeV2Events
+      .filter((event: any) => event.type === "command.scheduled")
+      .map((event: any) => {
+        const receipt = runtimeV2ReceiptByKey.get(event.command?.idempotencyKey);
+        return {
+          sequence: event.sequence,
+          eventId: event.eventId,
+          at: event.at,
+          idempotencyKey: event.command?.idempotencyKey || "",
+          turnId: event.command?.run?.turnId || "",
+          runId: event.command?.run?.runId || "",
+          kind: event.command?.kind || "",
+          phase: event.command?.phase || "",
+          toolName: event.command?.payload?.toolName || "",
+          target: runtimeV2CommandTarget(event.command),
+          runtimeOwnedPlanArtifact:
+            event.command?.payload?.runtimeOwnedPlanArtifact === true,
+          status: receipt?.status || "scheduled",
+          actionFingerprint: receipt?.actionFingerprint || "",
+          completedAt: receipt?.completedAt || null,
+        };
+      });
+    const runtimeV2Projections = runtimeV2Events
+      .filter((event: any) => event.type === "projection.published")
+      .map((event: any) => ({
+        sequence: event.sequence,
+        eventId: event.eventId,
+        at: event.at,
+        audience: event.audience || "",
+        projectionId: event.projectionId || "",
+        kind: event.projection?.kind || "",
+        dedupeKey: event.projection?.dedupeKey || "",
+        markdown: event.projection?.markdown || "",
+      }));
+    const runtimeV2SubagentTelemetry = (runtimeV2Aggregate?.subagents || []).map((job: any) => {
+      const telemetryEvents = runtimeV2Events.filter((event: any) =>
+        event.type === "subagent.telemetry" && event.telemetry?.jobId === job.id
+      );
+      const telemetryAt = (phase: string) =>
+        telemetryEvents.find((event: any) => event.telemetry?.phase === phase)?.telemetry?.at || null;
+      return {
+        id: job.id,
+        scopeKey: job.scopeKey,
+        status: job.status,
+        allowedPaths: job.allowedPaths || [],
+        requestedAt: job.requestedAt || null,
+        requestOpenedAt: telemetryAt("request_opened"),
+        firstTokenAt: telemetryAt("first_token") || job.firstTokenAt || null,
+        closedAt: telemetryAt("closed") || job.closedAt || null,
+      };
+    });
+    const runtimeV2SubagentIntervals = runtimeV2SubagentTelemetry
+      .filter((entry: any) => Number.isFinite(entry.requestOpenedAt))
+      .map((entry: any) => ({
+        id: entry.id,
+        start: Number(entry.requestOpenedAt),
+        end: Number.isFinite(entry.closedAt) ? Number(entry.closedAt) : Number.POSITIVE_INFINITY,
+      }));
+    const runtimeV2SubagentPoints = runtimeV2SubagentIntervals.flatMap((interval: any) => [
+      { at: interval.start, delta: 1 },
+      ...(Number.isFinite(interval.end) ? [{ at: interval.end, delta: -1 }] : []),
+    ]).sort((left: any, right: any) => left.at - right.at || left.delta - right.delta);
+    let runtimeV2SubagentInFlight = 0;
+    let runtimeV2SubagentPeakInFlight = 0;
+    for (const point of runtimeV2SubagentPoints) {
+      runtimeV2SubagentInFlight += point.delta;
+      runtimeV2SubagentPeakInFlight = Math.max(
+        runtimeV2SubagentPeakInFlight,
+        runtimeV2SubagentInFlight,
+      );
+    }
+    const runtimeV2RunCompleted = runtimeV2Events.filter((event: any) =>
+      event.type === "run.completed"
+    );
+    const runtimeV2TurnCompleted = runtimeV2Events.filter((event: any) =>
+      event.type === "turn.completed"
+    );
+    const runtimeV2FinalProjections = runtimeV2Projections.filter((projection: any) =>
+      projection.audience === "final" && projection.kind === "final"
+    );
+    const runtimeV2RunTerminal = runtimeV2RunCompleted[0] || null;
+    const runtimeV2TurnTerminal = runtimeV2TurnCompleted[0] || null;
+    const runtimeV2FinalProjection = runtimeV2FinalProjections[0] || null;
+    const runtimeV2TaskBlocks = currentTurn
+      ? state.taskFlow.filter((block: any) => block.turnId === currentTurn.id)
+      : [];
+    const runtimeV2RunId = runtimeV2Aggregate?.run?.identity?.runId || null;
+    const runtimeV2Presentation = runtimeV2RunId ? {
+      chatMilestones: runtimeV2TaskBlocks
+        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_update")
+        .map((block: any) => ({
+          id: block.id,
+          markdown: String(block.content || ""),
+        })),
+      timeline: runtimeV2TaskBlocks
+        .filter((block: any) =>
+          block.type === "progress" &&
+          block.source === "runtime" &&
+          block.runId === runtimeV2RunId
+        )
+        .map((block: any) => ({
+          id: block.id,
+          phase: block.phase || "",
+          title: block.title || "",
+          action: block.action || "",
+          status: block.status || "",
+          toolName: block.toolName || block.tool || "",
+          target: block.target || block.canonicalTarget || "",
+          runId: block.runId || "",
+          toolCallId: block.toolCallId || "",
+          dedupeKey: block.dedupeKey || "",
+        })),
+      finals: runtimeV2TaskBlocks
+        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_final")
+        .map((block: any) => ({
+          id: block.id,
+          markdown: String(block.content || ""),
+        })),
+      threadEvents: (state.runtimeEvents || [])
+        .filter((event: any) =>
+          event.turnId === currentTurn?.id &&
+          (
+            !event.runId ||
+            event.runId === runtimeV2RunId
+          ) &&
+          (
+            event.type === "run.completed" ||
+            event.type === "turn.completed"
+          )
+        )
+        .map((event: any) => ({
+          type: event.type,
+          timestampMs: event.timestampMs,
+          turnId: event.turnId || "",
+          runId: event.runId || "",
+          resultKind: event.resultKind || "",
+        })),
+    } : null;
+    let localDebugEntries: any[] = [];
+    try {
+      const parsed = JSON.parse(
+        window.localStorage.getItem("main.debugLog.v1") || "[]",
+      );
+      if (Array.isArray(parsed)) localDebugEntries = parsed;
+    } catch {
+      localDebugEntries = [];
+    }
+    const realOmlxDebugTail = [...new Map([
+      ...localDebugEntries,
+      ...((window as any).__REAL_OMLX_DEBUG_LOGS__ || []),
+    ].map((entry: any) => [
+      [
+        String(entry?.timestamp || ""),
+        String(entry?.source || ""),
+        String(entry?.message || ""),
+      ].join("\u0000"),
+      entry,
+    ])).values()].slice(-1_200);
+    const runtimeV2Debug = realOmlxDebugTail.flatMap((entry: any) => {
+      const source = String(entry?.source || "");
+      if (!source.includes("runtime_v2")) return [];
+      let data: unknown = entry?.message;
+      if (typeof data === "string") {
+        const rawData = data;
+        try {
+          data = JSON.parse(rawData);
+        } catch {
+          data = rawData.slice(0, 2_400);
+        }
+      }
+      return [{
+        timestamp: entry?.timestamp || "",
+        level: entry?.level || "",
+        source,
+        data,
+      }];
+    }).slice(-300);
+    // E2E observes the durable Runtime v2 ledger, not provider prose or raw
+    // tool output. This keeps real-model acceptance aligned with production
+    // ownership: the checkpoint is the source of truth for commands, child
+    // jobs, validation, and terminal order.
+    const runtimeV2 = runtimeV2Aggregate ? {
+      schemaVersion: runtimeV2Aggregate.schemaVersion || null,
+      revision: runtimeV2Checkpoint?.revision ?? null,
+      strategy: runtimeV2Aggregate.strategy || null,
+      turnId: runtimeV2Aggregate.turn?.turnId || null,
+      runId: runtimeV2Aggregate.run?.identity?.runId || null,
+      turnIdentity: runtimeV2Aggregate.turn || null,
+      runIdentity: runtimeV2Aggregate.run?.identity || null,
+      phase: runtimeV2Aggregate.phase || null,
+      terminalOutcome: runtimeV2Aggregate.terminalOutcome || null,
+      evidence: (runtimeV2Aggregate.evidence || []).map((evidence: any) => ({
+        id: evidence.id,
+        kind: evidence.kind,
+        target: evidence.target,
+        version: evidence.version || null,
+      })),
+      evidenceCount: Array.isArray(runtimeV2Aggregate.evidence)
+        ? runtimeV2Aggregate.evidence.length
+        : 0,
+      events: runtimeV2Events.map((event: any) => ({
+        sequence: event.sequence,
+        eventId: event.eventId,
+        at: event.at,
+        type: event.type,
+        ...(event.type === "phase.changed"
+          ? { phase: event.phase, reason: event.reason }
+          : {}),
+        ...(event.type === "command.scheduled"
+          ? {
+              idempotencyKey: event.command?.idempotencyKey || "",
+              commandKind: event.command?.kind || "",
+            }
+          : {}),
+        ...(event.type === "command.completed"
+          ? { idempotencyKey: event.idempotencyKey, status: event.status }
+          : {}),
+        ...(event.type === "tool.completed"
+          ? {
+              idempotencyKey: event.idempotencyKey,
+              status: event.status,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "validation.completed"
+          ? {
+              idempotencyKey: event.idempotencyKey,
+              passed: event.passed,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "subagent.telemetry"
+          ? { telemetry: event.telemetry }
+          : {}),
+        ...(event.type === "subagent.completed"
+          ? {
+              jobId: event.jobId,
+              status: event.status,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "work_plan.sealed" ||
+          event.type === "work_plan.approved" ||
+          event.type === "work_plan.invalidated"
+          ? {
+              workPlan: event.workPlan || null,
+              planReviewCommit: event.type === "work_plan.sealed"
+                ? event.reviewCommit || null
+                : null,
+            }
+          : {}),
+        ...(event.type === "projection.published"
+          ? {
+              audience: event.audience,
+              projectionId: event.projectionId,
+              projectionKind: event.projection?.kind || "",
+              dedupeKey: event.projection?.dedupeKey || "",
+            }
+          : {}),
+        ...(event.type === "run.completed" || event.type === "turn.completed"
+          ? {
+              resultKind: event.outcome?.resultKind || "",
+              reason: event.outcome?.reason || "",
+              finalProjectionId: event.outcome?.finalProjectionId || "",
+            }
+          : {}),
+      })),
+      eventTypes: runtimeV2Events.map((event: any) => event.type),
+      commands: runtimeV2Commands,
+      receipts: runtimeV2Receipts.map((receipt: any) => ({
+        idempotencyKey: receipt.idempotencyKey,
+        kind: receipt.kind,
+        actionFingerprint: receipt.actionFingerprint,
+        status: receipt.status,
+        completedAt: receipt.completedAt,
+      })),
+      projections: runtimeV2Projections,
+      workPlan: runtimeV2Aggregate.workPlan || null,
+      sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
+      planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+      subagents: runtimeV2SubagentTelemetry,
+      subagentConcurrency: {
+        requestCount: runtimeV2SubagentIntervals.length,
+        peakInFlight: runtimeV2SubagentPeakInFlight,
+        hasRequestOverlap: runtimeV2SubagentPeakInFlight >= 2,
+      },
+      terminal: {
+        runCompletedCount: runtimeV2RunCompleted.length,
+        turnCompletedCount: runtimeV2TurnCompleted.length,
+        finalProjectionCount: runtimeV2FinalProjections.length,
+        runSequence: runtimeV2RunTerminal?.sequence || null,
+        finalProjectionSequence: runtimeV2FinalProjection?.sequence || null,
+        turnSequence: runtimeV2TurnTerminal?.sequence || null,
+        runResultKind: runtimeV2RunTerminal?.outcome?.resultKind || null,
+        turnResultKind: runtimeV2TurnTerminal?.outcome?.resultKind || null,
+        finalProjectionId: runtimeV2FinalProjection?.projectionId || null,
+        exactlyOnce:
+          runtimeV2RunCompleted.length === 1 &&
+          runtimeV2TurnCompleted.length === 1 &&
+          runtimeV2FinalProjections.length === 1 &&
+          runtimeV2RunTerminal?.outcome?.resultKind === runtimeV2TurnTerminal?.outcome?.resultKind &&
+          runtimeV2RunTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
+          runtimeV2TurnTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
+          runtimeV2RunTerminal.sequence < runtimeV2FinalProjection.sequence &&
+          runtimeV2FinalProjection.sequence < runtimeV2TurnTerminal.sequence,
+      },
+      presentation: runtimeV2Presentation,
+      debug: runtimeV2Debug,
+    } : null;
     const agentTexts = (state.taskFlow.filter((block) => block.type === "agent") as any[]).map((block) => block.content);
     const toolBlocks = (state.taskFlow.filter((block) => block.type === "tool") as any[]).map((block) => ({
       name: block.toolName,
       target: block.target,
-      status: block.status,
+      status: block.toolStatus === "executed"
+        ? "completed"
+        : block.toolStatus || block.status,
       error: block.error,
     }));
     const subagentRuns = projectSubagentRuns(state.runtimeEvents).map((run) => ({
@@ -7286,6 +9083,7 @@ function seedRealOmlxPlanFlowScenario() {
       substantiveEvidenceCount: run.substantiveEvidenceCount || 0,
       closureState: run.closureState || "",
       remainingWork: run.remainingWork || "",
+      parentHandoff: run.parentHandoff || "",
       activityCount: run.activities.length,
       activities: run.activities.map((activity) => ({
         status: activity.status,
@@ -7297,6 +9095,8 @@ function seedRealOmlxPlanFlowScenario() {
     }));
     return {
       model,
+      currentWorkspace: state.currentWorkspace,
+      currentSessionId: state.currentSessionId,
       agentStatus: state.agentStatus,
       isGenerating: state.isGenerating,
       planStage: state.planStage,
@@ -7305,13 +9105,21 @@ function seedRealOmlxPlanFlowScenario() {
         path: artifact.path,
         title: artifact.title,
         content: artifact.content,
+        candidate: artifact.candidate || null,
+        candidateHash: artifact.candidateHash || null,
+        authoringContractId: artifact.authoringContractId || null,
       })),
       planTasks: state.planTasks,
       planExecutionEvidence: state.planExecutionEvidenceLedger.map((entry) => ({
+        id: entry.id,
+        transactionId: entry.transactionId,
+        runId: entry.runId,
         kind: entry.kind,
         value: entry.value,
         target: entry.target,
         sourceTool: entry.sourceTool,
+        observationStatus: entry.observationStatus,
+        createdAt: entry.createdAt,
       })),
       goalStatus: state.goalStatus,
       activeGoal: state.activeGoal ? {
@@ -7328,8 +9136,39 @@ function seedRealOmlxPlanFlowScenario() {
         sourceTool: entry.sourceTool,
         target: entry.target,
       })),
+      preferSubagents: state.preferSubagents,
       currentTurnId: currentTurn?.id ?? null,
+      currentTurnClientSubmissionId: currentTurn?.clientSubmissionId ?? null,
+      currentTurnReceiptId: currentTurn?.workspaceInstructionReceiptId ?? null,
+      currentTurnInstructionSource: currentTurn?.workspaceInstructionSource ?? null,
+      currentTurnTitle: currentTurn?.title ?? null,
+      currentTurnIntent: currentTurn?.intent ?? null,
+      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
+      currentTurnPrompt: currentTurn?.userPrompt ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnBlockIds: currentTurn?.blockIds ?? [],
+      conversationTurns: state.conversationTurns.length,
+      conversationTurnPreview: state.conversationTurns.map((turn) => ({
+        id: turn.id,
+        clientSubmissionId: turn.clientSubmissionId || null,
+        workspaceInstructionReceiptId: turn.workspaceInstructionReceiptId || null,
+        workspaceInstructionSource: turn.workspaceInstructionSource || null,
+        title: turn.title,
+        intent: turn.intent,
+        displayIntent: turn.displayIntent || turn.intent,
+        userPrompt: turn.userPrompt,
+        status: turn.status,
+        runtimeEngineVersion: turn.runtimeEngineVersion || "legacy",
+        blockIds: [...turn.blockIds],
+      })),
+      workspaceInstructionLedger: state.workspaceInstructionLedger.map((entry) => ({
+        clientSubmissionId: entry.clientSubmissionId,
+        receiptId: entry.receipt.receiptId,
+        turnId: entry.receipt.turnId,
+        userBlockId: entry.receipt.userBlockId,
+        sessionKey: entry.receipt.sessionKey,
+        sessionEpoch: entry.receipt.sessionEpoch,
+      })),
       currentRunId: state.harnessRunMarker?.runId || null,
       parentRunId: state.harnessRunMarker?.parentRunId || null,
       pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
@@ -7337,8 +9176,20 @@ function seedRealOmlxPlanFlowScenario() {
       activeActionRequest: state.activeActionRequest ? {
         kind: state.activeActionRequest.kind,
         requestId: state.activeActionRequest.requestId,
+        sessionKey: state.activeActionRequest.sessionKey,
+        sessionEpoch: state.activeActionRequest.kind === "plan_review"
+          ? state.activeActionRequest.sessionEpoch || null
+          : null,
         turnId: state.activeActionRequest.turnId,
         runId: state.activeActionRequest.runId,
+        ...(state.activeActionRequest.kind === "plan_review"
+          ? {
+              parentRunId: state.activeActionRequest.parentRunId || null,
+              planRevision: state.activeActionRequest.planRevision,
+              artifactHash: state.activeActionRequest.artifactHash,
+              artifactPaths: state.activeActionRequest.artifactPaths || [],
+            }
+          : {}),
         ...(state.activeActionRequest.kind === "tool_permission"
           ? {
               toolName: state.activeActionRequest.toolName,
@@ -7350,19 +9201,30 @@ function seedRealOmlxPlanFlowScenario() {
       agentTexts,
       toolBlocks,
       subagentRuns,
+      runtimeV2,
       taskFlowTypes: state.taskFlow.map((block) => block.type),
       taskFlowPreview: state.taskFlow.map((block: any) => ({
+        id: block.id,
         turnId: block.turnId || "",
         type: block.type,
         visibility: block.visibility || "",
         title: block.title || "",
         content: String(block.content || block.error || "").slice(0, 800),
+        action: String(block.action || "").slice(0, 1_200),
+        phase: block.phase || "",
+        source: block.source || "",
+        runId: block.runId || "",
+        dedupeKey: block.dedupeKey || "",
         toolName: block.toolName || "",
         target: block.target || "",
-        status: block.status || "",
+        status: block.type === "tool" && block.toolStatus === "executed"
+          ? "completed"
+          : block.toolStatus || block.status || "",
       })),
-      debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-1_200),
+      debugTail: realOmlxDebugTail,
+      acceptanceState: (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ || null,
       dispatchError: bridge.dispatchError || null,
+      lastWorkspaceInstructionAcceptance: bridge.lastWorkspaceInstructionAcceptance || null,
       seedCount: readSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO),
     };
   };
@@ -7943,6 +9805,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planTasks: state.planTasks,
       currentTurnId: currentTurn?.id ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnRuntimeStatus: currentTurn?.runtimeOutcome?.status ?? null,
+      currentTurnResultKind: currentTurn?.runtimeOutcome?.resultKind ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       turnStartedEvents: state.runtimeEvents
@@ -8351,6 +10215,13 @@ function seedSessionAutoCreateScenario() {
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       conversationTurns: state.conversationTurns.length,
+      currentTurnId: state.currentTurnId,
+      currentTurnTitle: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        : null,
+      currentTurnReceiptId: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.workspaceInstructionReceiptId ?? null
+        : null,
       currentTurnStatus: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
         : null,
@@ -8893,6 +10764,9 @@ function seedSubagentsPanelScenario() {
           id: "subagent-euler",
           name: "Euler",
           objective: "检查 runtime event 的创建、更新与关闭投影。",
+          scopeKey: "runtime-event-projection",
+          runId: "run-subagent-euler",
+          parentRunId: null,
           status: "queued",
           createdAt: now - 18_000,
           updatedAt: now - 18_000,
@@ -8911,6 +10785,31 @@ function seedSubagentsPanelScenario() {
           completedAt: now - 12_000,
           updatedAt: now - 12_000,
           summary: "事件投影保持完成状态，并单独记录 closedAt。",
+          closureState: "satisfied",
+          closureAudit: {
+            schemaVersion: SUBAGENT_CLOSURE_SCHEMA_VERSION,
+            owner: {
+              agentKind: "subagent",
+              threadId: baseSubagent.threadId,
+              parentTurnId: turnId,
+              subagentId: "subagent-euler",
+              runId: "run-subagent-euler",
+              parentRunId: null,
+            },
+            scopeKey: "runtime-event-projection",
+            status: "completed",
+            state: "satisfied",
+            remainingWork: null,
+            observationCount: 0,
+            substantiveEvidenceCount: 0,
+            acceptedEvidenceToolCallIds: [],
+            requiredPaths: [],
+            coveredPaths: [],
+            failedPaths: [],
+            uncoveredPaths: [],
+            reasonCode: "runtime_completed",
+            reason: "The controlled child runtime completed successfully.",
+          },
           progress: { phase: "done", title: "执行完成", completedToolCalls: 2 },
         },
         activity: {
@@ -9449,6 +11348,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === CAPSULE_PROGRESS_ONLY_SCENARIO) {
     return seedCapsuleProcessScenario("progress");
+  }
+
+  if (scenario === CAPSULE_PHASE_FALLBACK_SCENARIO) {
+    return seedCapsuleProcessScenario("phase");
   }
 
   if (scenario === GOAL_CAPSULE_SCENARIO) {

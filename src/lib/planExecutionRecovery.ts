@@ -13,10 +13,11 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTask,
 } from "./workflowModels";
+import { resolveDirectEditTransaction } from "./directEditTransaction";
 import type {
   FileReadObservationIdentity,
   FileReadWindowIdentity,
-} from "./orchestrator/fileReadCache";
+} from "./fileReadObservation";
 import type { MainThreadProgressUpdate } from "./turnEvents";
 import {
   isReadOnlyNoProgressDetail,
@@ -32,6 +33,12 @@ import {
   scopeExecutionEvidenceLedger,
   type ExecuteEvidenceGap,
 } from "./verificationEvidence";
+import type { PlanStructuredEvidenceFact } from "./planStructuredEvidence";
+import type { PlanSourceObservation } from "./planSourceObservation";
+import type {
+  PlanEvidenceDiscoveryObservation,
+  PlanEvidenceObligation,
+} from "./planEvidenceObligations";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 3;
 export const CHAT_MAX_AUTO_RESUME_LIMIT = 2;
@@ -396,7 +403,9 @@ export function resolveExecuteMaxIterationsRecoveryDecision(input: {
 
   if (
     input.recoveryState?.mode === "objective_audit" &&
-    input.recoveryState.decisionCheckpoint?.objectiveClosurePending === true
+    resolveDirectEditTransaction(
+      input.recoveryState.decisionCheckpoint,
+    )?.phase === "audit"
   ) {
     // A complete evidence ledger is necessary but not sufficient for an
     // unstructured Direct Edit root. Preserve the explicit audit transaction
@@ -607,6 +616,28 @@ export interface PlanToolActivitySummary {
   target: string;
   status: PlanToolActivityStatus;
   detail?: string;
+  /** Runtime-observed mutation truth; tool names and success prose are insufficient. */
+  mutationObserved?: boolean;
+  /** Largest concrete changed hunk from the runtime-observed full-file diff. */
+  mutationRange?: {
+    path: string;
+    startLine: number;
+    endLine: number;
+    maxLines: number;
+  };
+  /** Runtime-owned typed evidence. Legacy `facts` are display/import only. */
+  structuredFacts?: PlanStructuredEvidenceFact[];
+  /** Immutable exact source excerpts retained before display compaction. */
+  sourceObservations?: PlanSourceObservation[];
+  /** Runtime-parsed project/symbol topology; never reconstructed from model prose. */
+  discoveryObservation?: PlanEvidenceDiscoveryObservation;
+  /** Exact remaining read/search contract owned by the runtime. */
+  evidenceObligation?: PlanEvidenceObligation;
+  /** Exact needs_evidence transaction this result was admitted to close. */
+  obligationClosure?: {
+    role: "obligation_closure";
+    obligation: PlanEvidenceObligation;
+  };
   facts?: string[];
   /** Exact versioned read window retained across checkpoints and compaction. */
   readFileObservation?: FileReadObservationIdentity;
@@ -616,6 +647,7 @@ export interface PlanToolActivitySummary {
   delegatedObservation?: {
     owner: {
       agentKind: "subagent";
+      collaborationTaskId?: string;
       subagentId: string;
       parentTurnId?: string;
       runId?: string;
@@ -626,6 +658,16 @@ export interface PlanToolActivitySummary {
     sourceContentHash?: string;
     sourceContentChars?: number;
     sourceRange?: FileReadWindowIdentity;
+    /**
+     * Planning may reuse a provenance-backed child observation without
+     * pretending that the child's whole delegated task completed. Execution
+     * mutations still obey parentContextState/requiresParentReread below.
+     */
+    planningEvidenceState?: "reusable" | "unresolved";
+    /** Set only when a wait_subagents result crossed the parent join/consume boundary. */
+    joinState?: "consumed";
+    /** Only a complete, owner-matched typed closure may satisfy a parent read obligation. */
+    closureState?: "satisfied" | "partial" | "unverified";
     parentContextState: "reference_only" | "version_verified";
     requiresParentReread: boolean;
   };
@@ -1167,6 +1209,21 @@ export function resolveRestoredPlanExecutionTaskIdentity(input: {
  * The checkpoint intentionally retains richer plan fields for the task UI;
  * consumers of runtimeEvents must not receive that incompatible object.
  */
+function parsePlanExecutionToolIdentity(value: unknown): {
+  tool: string;
+  canonicalTarget: string;
+} {
+  const parts = String(value || "")
+    .split(/\s*[·|]\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const tool = parts[0] && /^[a-z][a-z0-9_-]*$/i.test(parts[0]) ? parts[0] : "";
+  return {
+    tool,
+    canonicalTarget: tool ? parts.slice(1).join(" · ") : "",
+  };
+}
+
 export function toPlanExecutionRuntimeProgressUpdate(input: {
   snapshot: PlanExecutionProgressSnapshot;
   language: "zh" | "en";
@@ -1209,12 +1266,17 @@ export function toPlanExecutionRuntimeProgressUpdate(input: {
     .map((value) => compactLine(value, 180))
     .filter(Boolean)
     .join(" · ");
+  const toolIdentity = parsePlanExecutionToolIdentity(snapshot.currentTool);
 
   return {
     phase: `plan_execution:${snapshot.phase}`,
     title,
     status,
     summary,
+    ...(toolIdentity.tool ? { tool: toolIdentity.tool } : {}),
+    ...(toolIdentity.canonicalTarget
+      ? { canonicalTarget: toolIdentity.canonicalTarget }
+      : {}),
     ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
   };
 }

@@ -83,6 +83,12 @@ export interface BuildTurnPresentationModelInput extends TurnPresentationIdentit
   actionKind?: ActionRequestKind;
   hasActionRequest?: boolean;
   forceProcessExpanded?: boolean;
+  /**
+   * Workspace sessions are command/Turn oriented even when the resolved
+   * intent is conversational. Global chat leaves this unset so ordinary chat
+   * can retain its continuous transcript presentation.
+   */
+  showStateAnchorOverride?: boolean;
 }
 
 export type CapsuleStatusKind =
@@ -728,7 +734,7 @@ export function buildTurnPresentationModel(
     isPlan,
     isGoal,
     isAwaiting,
-    showStateAnchor: kind !== "ordinary",
+    showStateAnchor: input.showStateAnchorOverride ?? kind !== "ordinary",
     // `collapsed` remains a persisted compatibility fallback only. Both fields
     // represent process folding; user and final assistant content stay visible.
     processCollapsed:

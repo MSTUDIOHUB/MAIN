@@ -16,17 +16,22 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "plugin:event|listen") return 1;
       if (cmd === "plugin:event|unlisten") return null;
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
-      if (cmd === "save_project_session") return args?.session ?? null;
+      if (cmd === "save_project_session") {
+        const capture = ((window as any).__COMPOSER_PREFERENCE_E2E__ ??= { savedSessions: [] });
+        capture.savedSessions.push(JSON.parse(JSON.stringify(args?.session ?? null)));
+        return args?.session ?? null;
+      }
       if (cmd === "list_project_sessions") return [];
       return null;
     };
   });
 });
 
-test("ordinary running turn stays in the continuous flow while streaming", async ({ page }) => {
+test("ordinary running workspace turn keeps its Turn header while streaming", async ({ page }) => {
   await page.goto("/?e2eScenario=streaming-timer");
 
-  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(1);
+  await expect(page.getByTestId("turn-state-anchor")).toContainText("计时器回归流");
   await expect(page.getByText("请检查计时器是否正常增长。")).toBeVisible();
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 });
@@ -64,7 +69,7 @@ test("stopping a running Turn atomically projects one canceled conclusion and re
   });
 });
 
-test("composer durably admits additional workspace Turns in FIFO order while a run is active", async ({ page }) => {
+test("composer explicitly queues additional durable Turns while a run is active and Enter defaults to Queue", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-running-guidance");
 
   const textarea = page.getByTestId("composer-textarea");
@@ -87,17 +92,19 @@ test("composer durably admits additional workspace Turns in FIFO order while a r
   const firstInstruction = "追加检查导入后的空状态";
   const secondInstruction = "然后验证恢复后的焦点状态";
   await textarea.fill(firstInstruction);
-  await expect(page.getByTestId("composer-send-button")).toBeVisible();
-  await expect(page.getByTestId("composer-stop-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-guidance-button")).toBeVisible();
+  await expect(page.getByTestId("composer-queue-button")).toBeVisible();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
 
-  await page.getByTestId("composer-send-button").click();
+  await textarea.press("Enter");
   await expect(textarea).toHaveValue("");
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().input ?? "missing"))
     .toBe("");
 
   await textarea.fill(secondInstruction);
-  await page.getByTestId("composer-send-button").click();
+  await page.getByTestId("composer-queue-button").click();
   await expect(textarea).toHaveValue("");
 
   await expect.poll(async () => page.evaluate(() => {
@@ -141,9 +148,79 @@ test("composer durably admits additional workspace Turns in FIFO order while a r
     firstInstruction,
     secondInstruction,
   ]);
-  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect(page.getByTestId("composer-queued-message")).toContainText("已排队 · 2 个回合");
+  await expect(page.getByTestId("composer-queued-message")).toContainText(firstInstruction);
   await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
   await expect(page.getByTestId("composer-guidance-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+});
+
+test("composer keeps queue, guide, and stop controls for a live Turn owner between model chunks", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-running-guidance");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({
+    status: "running",
+    isGenerating: false,
+  }));
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      isGenerating: snapshot?.isGenerating,
+      agentStatus: snapshot?.agentStatus,
+      currentTurnStatus: snapshot?.currentTurnStatus,
+    };
+  })).toEqual({
+    isGenerating: false,
+    agentStatus: "running",
+    currentTurnStatus: "executing",
+  });
+
+  await page.getByTestId("composer-textarea").fill("继续核对当前回合的焦点恢复");
+  await expect(page.getByTestId("composer-guidance-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-queue-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
+});
+
+test("composer guides the current run without admitting a new Turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-running-guidance");
+
+  const guidance = "优先检查当前焦点恢复，不要开启新回合";
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill(guidance);
+
+  await expect(page.getByTestId("composer-guidance-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-queue-button")).toBeEnabled();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await page.getByTestId("composer-guidance-button").click();
+
+  await expect(textarea).toHaveValue("");
+  await expect(page.getByTestId("composer-active-guidance")).toContainText("正在引导当前执行");
+  await expect(page.getByTestId("composer-active-guidance")).toContainText(guidance);
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+    return {
+      activeGuidance: snapshot?.activeGuidance?.text ?? null,
+      conversationTurns: snapshot?.conversationTurns ?? null,
+      taskFlowUserCount: snapshot?.taskFlowUserCount ?? null,
+      admittedTurns: entries.filter((entry: { source?: string }) =>
+        entry.source === "store.workspace_instruction_admitted"
+      ).length,
+    };
+  })).toEqual({
+    activeGuidance: guidance,
+    conversationTurns: 1,
+    taskFlowUserCount: 1,
+    admittedTurns: 0,
+  });
+
+  await page.getByTestId("composer-guidance-undo-button").click();
+  await expect(page.getByTestId("composer-active-guidance")).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.getSnapshot?.().activeGuidance ?? null
+  )).toBeNull();
 });
 
 test("composer subagent preference toggle activates after the current run stops", async ({ page }, testInfo) => {
@@ -155,11 +232,33 @@ test("composer subagent preference toggle activates after the current run stops"
   await expect(subagentToggle).toBeEnabled();
   await subagentToggle.click();
   await expect(subagentToggle).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("composer-subagent-preference-status")).toContainText("协作已开启");
   await expect
     .poll(async () => page.evaluate(() => Boolean((window as any).__CODELY_E2E__?.getSnapshot?.().preferSubagents)))
     .toBe(true);
 
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({ status: "running" }));
+  const preferenceInstruction = "检查启动和菜单模块";
+  await page.getByTestId("composer-textarea").fill(preferenceInstruction);
+  await page.getByTestId("composer-queue-button").click();
+  await expect.poll(async () => page.evaluate((text) => {
+    const savedSessions = (window as any).__COMPOSER_PREFERENCE_E2E__?.savedSessions || [];
+    for (const session of savedSessions) {
+      const entries = session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [];
+      const admitted = entries.find((entry: any) => entry?.instruction?.payload?.text === text);
+      if (admitted) {
+        return admitted.instruction.payload.dispatchHints?.subagentPreference ?? null;
+      }
+    }
+    return null;
+  }, preferenceInstruction)).toBe("preferred");
+
   const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
+  const themeDraft = "检查运行中输入选择的主题显示";
+  await page.getByTestId("composer-textarea").fill(themeDraft);
+  const guidanceButton = page.getByTestId("composer-guidance-button");
+  const queueButton = page.getByTestId("composer-queue-button");
+  const runningActions = queueButton.locator("xpath=..");
   await expect(
     page.locator('[data-testid="composer-subagent-preference-toggle"] + [data-testid="composer-auto-review-toggle"]'),
   ).toHaveCount(1);
@@ -169,7 +268,13 @@ test("composer subagent preference toggle activates after the current run stops"
     await expect(subagentToggle).toBeVisible();
     await expect(subagentToggle).toHaveClass(/is-active/);
     await expect(autoReviewToggle).toBeVisible();
+    await expect(guidanceButton).toContainText("引导");
+    await expect(queueButton).toContainText("排队");
+    await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+    await expect(page.getByTestId("composer-queued-message")).toBeVisible();
     await subagentToggle.screenshot({ path: testInfo.outputPath(`subagent-toggle-${theme}.png`) });
+    await runningActions.screenshot({ path: testInfo.outputPath(`running-input-actions-${theme}.png`) });
+    await page.getByTestId("composer-queued-message").screenshot({ path: testInfo.outputPath(`running-input-queue-${theme}.png`) });
   }
 });
 
@@ -177,7 +282,9 @@ test("chat history remains scrollable during rapid streaming updates", async ({ 
   await page.goto("/?e2eScenario=streaming-responsiveness");
 
   const scroller = page.getByTestId("chat-scroll-container");
-  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(
+    page.locator("section[data-turn-id='e2e-responsive-active-turn']").getByTestId("turn-state-anchor"),
+  ).toContainText("流式滚动回归");
   await expect(page.getByText("请持续输出，同时保持历史滚动流畅。")).toBeAttached();
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 

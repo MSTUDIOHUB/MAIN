@@ -43,12 +43,14 @@ export interface RunStatusHealthSignal {
 
 export interface RunStatusProjection {
   currentActivity: RuntimeProgressLedgerItem | null;
+  /** Last renderable progress owned by this Run, retained between updates. */
+  lastGuidanceActivity: RuntimeProgressLedgerItem | null;
   milestones: RuntimeProgressLedgerItem[];
   healthSignals: RunStatusHealthSignal[];
   activityText: string;
 }
 
-const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running", "done"]);
+const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running"]);
 
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
@@ -113,6 +115,9 @@ function compactTarget(value: unknown): string {
 }
 
 function toolFamily(tool: string): string {
+  if (/^(?:spawn_subagent|wait_subagents|cancel_subagent)$/i.test(tool)) {
+    return "collaboration";
+  }
   if (/^(?:read_file|read_document|get_file_outline|code_ast_query|git_status|git_diff|analyze_tabular_document|query_tabular_document|knowledge_get_excerpt)$/i.test(tool)) {
     return "read";
   }
@@ -123,6 +128,14 @@ function toolFamily(tool: string): string {
   if (/^(?:run_command|execute_command|send_pty_input|read_pty_|get_pty_status|clear_pty_buffer)/i.test(tool)) return "command";
   if (/browser/i.test(tool)) return "browser";
   return tool || "progress";
+}
+
+function isRenderableRuntimeActivity(item: RuntimeProgressLedgerItem): boolean {
+  return (item.status === "running" || item.status === "done" || item.status === "completed") &&
+    item.phase !== "blocked" &&
+    // Visual delivery/recognition has its own evidence contract. The compact
+    // Capsule must not turn an internal images:N target into user guidance.
+    item.tool !== "visual_context";
 }
 
 function isCachedText(value: unknown): boolean {
@@ -179,10 +192,14 @@ function keyForProgress(input: {
 }): string {
   const runId = compactLine(input.runId || "", 96).toLowerCase();
   const runPrefix = runId ? `run:${runId}:` : "legacy:";
+  const explicit = compactLine(input.dedupeKey || "", 180);
+  // A Plan execution checkpoint is one evolving run-owned snapshot. Its
+  // structured tool identity may appear one event later during migration, so
+  // the typed checkpoint key must remain authoritative across that enrichment.
+  if (/^plan-execution-progress:/i.test(explicit)) return `${runPrefix}${explicit}`;
   const tool = String(input.tool || "").trim();
   const target = normalizeTarget(input.target || "");
   if (tool || target) return `${runPrefix}${toolFamily(tool)}:${tool}:${target}`.toLowerCase();
-  const explicit = compactLine(input.dedupeKey || "", 180);
   if (explicit) return `${runPrefix}${explicit}`;
   return `${runPrefix}progress:${String(input.phase || "").toLowerCase()}:${compactLine(input.title || "", 120).toLowerCase()}`;
 }
@@ -443,12 +460,41 @@ export function buildRuntimeProgressLedger(input: {
   const hasLivePlanExecution = !!input.planExecutionSnapshot &&
     (!turnId || input.planExecutionSnapshot.turnId === turnId) &&
     (!activeRunId || !snapshotRunId || snapshotRunId === activeRunId);
+  const runParentById = new Map<string, string>();
+  if (snapshotRunId && input.planExecutionSnapshot?.parentRunId) {
+    runParentById.set(snapshotRunId, String(input.planExecutionSnapshot.parentRunId).trim());
+  }
+  for (const block of input.blocks || []) {
+    if (turnId && String(block?.turnId || "") && String(block.turnId) !== turnId) continue;
+    const runId = String(block?.runId || "").trim();
+    const parentRunId = String(block?.parentRunId || "").trim();
+    if (runId && parentRunId && runId !== parentRunId) runParentById.set(runId, parentRunId);
+  }
+  for (const event of input.events || []) {
+    if (turnId && String((event as any).turnId || "") && String((event as any).turnId) !== turnId) continue;
+    const runId = String((event as any).runId || "").trim();
+    const parentRunId = String((event as any).parentRunId || "").trim();
+    if (runId && parentRunId && runId !== parentRunId) runParentById.set(runId, parentRunId);
+  }
+  const activeRunLineage = new Set<string>();
+  let lineageCursor = activeRunId;
+  while (lineageCursor && !activeRunLineage.has(lineageCursor) && activeRunLineage.size < 32) {
+    activeRunLineage.add(lineageCursor);
+    lineageCursor = runParentById.get(lineageCursor) || "";
+  }
+  const runBelongsToActiveLineage = (runId: string): boolean =>
+    !activeRunId || !runId || activeRunLineage.has(runId);
+  const runIsActiveAncestor = (runId: string): boolean =>
+    !!activeRunId && !!runId && runId !== activeRunId && activeRunLineage.has(runId);
   (input.blocks || []).forEach((block, index) => {
     if (turnId && String(block?.turnId || "") && String(block.turnId) !== turnId) return;
-    // Live progress has a canonical run-owned event. Older transcript blocks
-    // remain useful history but must not impersonate the currently executing
-    // child run, especially across plan-review handoffs.
-    if (activeRunId && String(block?.runId || "") !== activeRunId) return;
+    // Prefer canonical Run ownership when a block has it. Older adapters and
+    // some direct-Execute display blocks omit runId; an exact-turn unowned
+    // block remains a valid fallback, otherwise Capsule can regress to the
+    // generic status even while the current turn visibly records tool work.
+    const blockRunId = String(block?.runId || "").trim();
+    if (!runBelongsToActiveLineage(blockRunId)) return;
+    if (runIsActiveAncestor(blockRunId) && block?.type === "system") return;
     // The review-run pause belongs to audit history, never to an already
     // approved execution checkpoint rendered as current progress.
     if (
@@ -459,6 +505,13 @@ export function buildRuntimeProgressLedger(input: {
       return;
     }
     const item = itemFromBlock(block, index, language);
+    if (
+      item &&
+      runIsActiveAncestor(blockRunId) &&
+      (item.status === "paused" || item.status === "failed" || item.status === "completed")
+    ) {
+      return;
+    }
     if (item) addItem(byKey, item);
   });
   for (const event of input.events || []) {
@@ -469,7 +522,20 @@ export function buildRuntimeProgressLedger(input: {
       event.type === "run.completed" ||
       event.type === "run.aborted" ||
       event.type === "harness.telemetry";
-    if (activeRunId && isRunOwnedEvent && eventRunId !== activeRunId) continue;
+    if (isRunOwnedEvent && !runBelongsToActiveLineage(eventRunId)) continue;
+    if (
+      runIsActiveAncestor(eventRunId) &&
+      event.type !== "progress.updated"
+    ) {
+      continue;
+    }
+    if (
+      runIsActiveAncestor(eventRunId) &&
+      event.type === "progress.updated" &&
+      ["paused", "failed", "completed"].includes(normalizeStatus(event.progress.status))
+    ) {
+      continue;
+    }
     if (hasLivePlanExecution && event.type === "run.paused" && event.reason === "plan_review") continue;
     if (event.type === "progress.updated") {
       const item = itemFromProgressEvent(event.progress, event.timestampMs, language, eventRunId);
@@ -658,15 +724,26 @@ export function buildRunStatusProjection(
   const latestIsTerminal = latest?.status === "paused" ||
     latest?.status === "failed" ||
     latest?.status === "completed";
+  const isSupersededSpawnActivity = (item: RuntimeProgressLedgerItem): boolean =>
+    item.tool === "spawn_subagent" &&
+    ordered.some((candidate) =>
+      candidate.key !== item.key &&
+      candidate.firstSeenAt > item.firstSeenAt &&
+      toolFamily(candidate.tool) !== "collaboration" &&
+      isRenderableRuntimeActivity(candidate)
+    );
   const currentActivity = latestIsTerminal
     ? null
     : [...ordered].reverse().find((item) =>
-        item.status === "running" && item.phase !== "blocked"
-      ) || (latest &&
-    (latest.status === "done" || latest.status === "completed") &&
-    latest.cacheHits < latest.repeatCount
-      ? latest
-      : null);
+        item.status === "running" &&
+        item.phase !== "blocked" &&
+        !isSupersededSpawnActivity(item)
+      ) || null;
+  const lastGuidanceActivity = [...ordered].reverse().find(
+    (item) =>
+      isRenderableRuntimeActivity(item) &&
+      !isSupersededSpawnActivity(item),
+  ) || null;
   const milestones = ordered
     .filter((item) =>
       (item.status === "done" || item.status === "completed") &&
@@ -735,6 +812,7 @@ export function buildRunStatusProjection(
     : "";
   return {
     currentActivity,
+    lastGuidanceActivity,
     milestones,
     healthSignals,
     activityText,
@@ -798,4 +876,108 @@ export function buildCapsuleActivityText(
       : ` · ${activity.repeatCount}x`
     : "";
   return `${structuredTitle}${repeatText}`;
+}
+
+function markdownTarget(value: unknown, language: RuntimeProgressLanguage): string {
+  const normalized = normalizeTarget(value);
+  const target = normalized.replace(/`/g, "");
+  // Live Capsule text wraps and scrolls instead of concealing a long path.
+  if (target) return `\`${target}\``;
+  return language === "zh" ? "当前工作区" : "the current workspace";
+}
+
+/**
+ * Build the conversational live guidance shown in Capsule. Unlike the M
+ * popover's terse evidence labels, this projection explains the purpose of the
+ * current structured action. Completed actions deliberately clear here rather
+ * than masquerading as the next live action; the caller can show a phase-level
+ * public update until the next durable command arrives. Lifecycle phase labels
+ * are not manufactured into progress sentences at this layer.
+ */
+export function buildCapsuleGuidanceText(
+  projection: RunStatusProjection,
+  language: RuntimeProgressLanguage = "zh",
+): string {
+  const normalizedLanguage = normalizeLanguage(language);
+  const latestBlockingHealthAt = Math.max(
+    0,
+    ...projection.healthSignals
+      .filter((signal) => signal.kind !== "repetition")
+      .map((signal) => signal.lastSeenAt),
+  );
+  const activity = projection.currentActivity &&
+    isRenderableRuntimeActivity(projection.currentActivity) &&
+    latestBlockingHealthAt <= projection.currentActivity.lastSeenAt
+      ? projection.currentActivity
+      : null;
+  if (activity && LIVE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
+    const family = toolFamily(activity.tool);
+    const target = markdownTarget(activity.target, normalizedLanguage);
+    const done = activity.status === "done" || activity.status === "completed";
+    if (family === "collaboration") {
+      const isSpawn = activity.tool === "spawn_subagent";
+      const isWait = activity.tool === "wait_subagents";
+      if (normalizedLanguage === "en") {
+        if (isSpawn) return done
+          ? `Subagent ${target} has started the independent investigation; I’m continuing the parent work.`
+          : `I’m assigning an independent investigation to subagent ${target} while continuing the parent work.`;
+        if (isWait) return done
+          ? "I’ve received the subagent results and I’m checking them against the parent task."
+          : "I’m joining the subagent results so I can incorporate their evidence.";
+        return done
+          ? "The collaboration step is complete; I’m continuing with the parent task."
+          : "I’m coordinating the active collaboration step.";
+      }
+      if (isSpawn) return done
+        ? `子智能体 ${target} 已开始独立调查，主体正在继续推进。`
+        : `我正在把独立调查交给子智能体 ${target}，同时继续推进主体工作。`;
+      if (isWait) return done
+        ? "我已收到子智能体的结果，正在结合主体任务核对证据。"
+        : "我正在汇合子智能体的结果，准备把证据纳入当前判断。";
+      return done
+        ? "协作步骤已经完成，主体正在继续推进。"
+        : "我正在协调当前协作步骤。";
+    }
+    if (normalizedLanguage === "en") {
+      if (family === "read") return done
+        ? `I've read ${target}; now I'm organizing what it shows.`
+        : `I'm reading ${target} to confirm the implementation related to this issue.`;
+      if (family === "search") return done
+        ? `I've searched ${target}; now I'm narrowing down the relevant path.`
+        : `I'm searching ${target} to narrow down where to look next.`;
+      if (family === "edit") return done
+        ? `The change is in ${target}; next I'll verify the result.`
+        : `I'm updating ${target} to put the confirmed approach into the code.`;
+      if (family === "command") return done
+        ? `I've run ${target}; now I'm checking the result for regressions.`
+        : `I'm running ${target} to verify the latest change.`;
+      if (family === "browser") return done
+        ? `I've checked ${target} in the browser; now I'm reviewing the visible result.`
+        : `I'm checking ${target} in the browser to confirm the real UI behavior.`;
+      return done
+        ? `I've finished this pass on ${target}; now I'm deciding the next step.`
+        : `I'm working through ${target} and checking what it changes.`;
+    }
+
+    if (family === "read") return done
+      ? `我已读完 ${target}，正在整理它说明了什么。`
+      : `我正在读取 ${target}，确认与当前问题相关的实现。`;
+    if (family === "search") return done
+      ? `我已搜索 ${target}，正在收窄真正相关的路径。`
+      : `我正在搜索 ${target}，缩小接下来要检查的范围。`;
+    if (family === "edit") return done
+      ? `修改已写入 ${target}，接下来我会验证结果。`
+      : `我正在修改 ${target}，把已确认的方案落实到代码。`;
+    if (family === "command") return done
+      ? `我已运行 ${target}，正在检查结果和回归风险。`
+      : `我正在运行 ${target}，验证刚才的修改。`;
+    if (family === "browser") return done
+      ? `我已在浏览器里检查 ${target}，正在整理可见结果。`
+      : `我正在通过浏览器检查 ${target} 的实际表现。`;
+    return done
+      ? `我已完成对 ${target} 的这一轮处理，正在判断下一步。`
+      : `我正在处理 ${target}，确认这一步带来的变化。`;
+  }
+
+  return "";
 }

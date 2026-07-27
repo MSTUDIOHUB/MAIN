@@ -57,6 +57,11 @@ export interface ToolIntentFilterOptions {
   runtimeIntent?: ResolvedUserIntent;
 }
 
+/** Risks whose authorization must be bound to one exact tool call. */
+export function isPerCallOnlyToolRisk(risk: unknown): boolean {
+  return risk === "desktop_control" || risk === "destructive";
+}
+
 const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set(["write_file", "replace_in_file"]);
 const READ_ONLY_RUNTIME_INTENTS = new Set<ResolvedUserIntent>([
   "respond",
@@ -139,8 +144,12 @@ type SkillLike = {
 };
 
 const READ_ONLY_BUILT_INS = new Set([
+  // Runtime-control ingress: it never executes a workspace read/write and is
+  // consumed before ordinary tool partitioning.
+  "submit_plan_candidate",
   "spawn_subagent",
   "wait_subagents",
+  "cancel_subagent",
   "list_directory",
   "read_file",
   "read_document",
@@ -174,6 +183,33 @@ const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
 const DESKTOP_CONTROL_BUILT_INS = new Set(["computer_use"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
 const EXTERNAL_READ_BUILT_INS = new Set(["web_search", "web_fetch"]);
+
+export interface BuiltInValidationAdapterCapability {
+  surface: "browser" | "desktop";
+  toolName: string;
+  risk: "browser_control" | "desktop_control";
+}
+
+/**
+ * Runtime adapter registry used by typed Plan validation. Registration proves
+ * that MAIN has a structured executor for the primitive; task completion still
+ * requires an actual result from that executor and its ordinary permission gate.
+ */
+export function getBuiltInValidationAdapterCapability(
+  surface: "browser" | "desktop",
+): BuiltInValidationAdapterCapability | null {
+  const toolName = surface === "browser" ? "browser_evaluate" : "computer_use";
+  const registered = surface === "browser"
+    ? BROWSER_CONTROL_BUILT_INS.has(toolName)
+    : DESKTOP_CONTROL_BUILT_INS.has(toolName);
+  return registered
+    ? {
+        surface,
+        toolName,
+        risk: surface === "browser" ? "browser_control" : "desktop_control",
+      }
+    : null;
+}
 
 const LOCAL_FILE_READ_BUILT_INS = new Set([
   "read_file",
@@ -409,7 +445,10 @@ export function normalizeToolPermissionPolicy(policy?: Partial<ToolPermissionPol
       : fallback;
 
   return {
-    autoExecuteRiskLevels: normalizeRiskList(policy?.autoExecuteRiskLevels, defaults.autoExecuteRiskLevels),
+    autoExecuteRiskLevels: normalizeRiskList(
+      policy?.autoExecuteRiskLevels,
+      defaults.autoExecuteRiskLevels,
+    ).filter((risk) => !isPerCallOnlyToolRisk(risk)),
     approvalRequiredRiskLevels: normalizeRiskList(
       policy?.approvalRequiredRiskLevels,
       defaults.approvalRequiredRiskLevels,
@@ -464,16 +503,144 @@ function containsReadIntent(text: string): boolean {
   return containsAny(text, READ_VERBS);
 }
 
-function isSqlReadOnly(args: Record<string, unknown>): boolean | null {
-  const sqlValue = args.sql ?? args.query ?? args.statement ?? args.input;
-  if (typeof sqlValue !== "string") return null;
-  const normalized = sqlValue.trim().toLowerCase().replace(/^\s*--.*$/gm, "").trim();
-  if (!normalized) return null;
-  if (/^(select|with|explain|describe|show|pragma)\b/.test(normalized)) return true;
-  if (/\b(insert|update|delete|drop|alter|truncate|create|replace|vacuum|grant|revoke)\b/.test(normalized)) {
-    return false;
+function stripSqlLiteralsAndComments(sql: string): string {
+  let output = "";
+  let index = 0;
+  while (index < sql.length) {
+    const char = sql[index];
+    const next = sql[index + 1] || "";
+    if (char === "-" && next === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index += 1;
+      output += "\n";
+      index += sql[index] === "\n" ? 1 : 0;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < sql.length && !(sql[index] === "*" && sql[index + 1] === "/")) {
+        output += sql[index] === "\n" ? "\n" : " ";
+        index += 1;
+      }
+      index = Math.min(sql.length, index + 2);
+      continue;
+    }
+    if (
+      char === "#" &&
+      next !== ">" &&
+      (index === 0 || /\s/.test(sql[index - 1] || ""))
+    ) {
+      while (index < sql.length && sql[index] !== "\n") index += 1;
+      output += "\n";
+      index += sql[index] === "\n" ? 1 : 0;
+      continue;
+    }
+    if (char === "$" && /^\$[A-Za-z0-9_]*\$/.test(sql.slice(index))) {
+      const delimiter = sql.slice(index).match(/^\$[A-Za-z0-9_]*\$/)?.[0] || "";
+      const closeIndex = delimiter ? sql.indexOf(delimiter, index + delimiter.length) : -1;
+      if (closeIndex < 0) return `${output} unresolved_literal`;
+      const literal = sql.slice(index, closeIndex + delimiter.length);
+      output += literal.replace(/[^\n]/g, " ");
+      index = closeIndex + delimiter.length;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      const quote = char;
+      output += " ";
+      index += 1;
+      let closed = false;
+      while (index < sql.length) {
+        if (sql[index] === "\\") {
+          output += "  ";
+          index += 2;
+          continue;
+        }
+        if (sql[index] === quote) {
+          if (sql[index + 1] === quote) {
+            output += "  ";
+            index += 2;
+            continue;
+          }
+          output += " ";
+          index += 1;
+          closed = true;
+          break;
+        }
+        output += sql[index] === "\n" ? "\n" : " ";
+        index += 1;
+      }
+      if (!closed) return `${output} unresolved_literal`;
+      continue;
+    }
+    if (char === "[") {
+      const closeIndex = sql.indexOf("]", index + 1);
+      if (closeIndex < 0) return `${output} unresolved_identifier`;
+      output += " ".repeat(closeIndex - index + 1);
+      index = closeIndex + 1;
+      continue;
+    }
+    output += char.toLowerCase();
+    index += 1;
+  }
+  return output;
+}
+
+type SqlArgumentKey = "sql" | "statement" | "query" | "input";
+
+function getNonEmptySqlArgument(
+  args: Record<string, unknown>,
+): { key: SqlArgumentKey; value: string } | null {
+  for (const key of ["sql", "statement", "query", "input"] as const) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return { key, value };
   }
   return null;
+}
+
+function looksLikeSqlText(value: string): boolean {
+  if (/\/\*[!+]/.test(value)) return true;
+  const normalized = stripSqlLiteralsAndComments(value).trim();
+  if (!normalized || /\bunresolved_(?:literal|identifier)\b/.test(normalized)) return false;
+  return /^(?:\(+\s*)?(?:select|with|explain|describe|desc|show|values|insert|update|delete|drop|alter|truncate|create|replace|vacuum|grant|revoke|merge|upsert|call|execute|attach|detach|reindex|copy|do|pragma|begin|commit|rollback|set|lock)\b/i.test(normalized);
+}
+
+function hasSqlShapedArguments(args: Record<string, unknown>): boolean {
+  const sqlArgument = getNonEmptySqlArgument(args);
+  if (!sqlArgument) return false;
+  // `sql` and `statement` are explicit execution contracts. Generic `query`
+  // and `input` fields are also treated as SQL when their text has a SQL
+  // statement shape, without reclassifying ordinary search prompts.
+  return sqlArgument.key === "sql" ||
+    sqlArgument.key === "statement" ||
+    looksLikeSqlText(sqlArgument.value);
+}
+
+function isSqlReadOnly(args: Record<string, unknown>): boolean | null {
+  const sqlArgument = getNonEmptySqlArgument(args);
+  if (!sqlArgument) return null;
+  const sqlValue = sqlArgument.value;
+  // MySQL executes version comments (`/*!...*/`) and vendor hint comments can
+  // alter statement semantics. They must never disappear into the ordinary
+  // comment stripper while a generic database tool remains auto-approved.
+  if (/\/\*[!+]/.test(sqlValue)) return false;
+  const normalized = stripSqlLiteralsAndComments(sqlValue).trim();
+  // Once a tool call carries SQL-shaped input, ambiguity must not inherit the
+  // registry's declared risk. Database MCP servers commonly describe a generic
+  // query tool as read-only even though hooks can replace its statement.
+  if (!normalized) return false;
+  if (/\bunresolved_(?:literal|identifier)\b/.test(normalized)) return false;
+  if (/\b(insert|update|delete|drop|alter|truncate|create|replace|vacuum|grant|revoke|merge|upsert|call|execute|attach|detach|reindex)\b/.test(normalized)) {
+    return false;
+  }
+  if (/\bselect\b[\s\S]*\binto\b/.test(normalized)) return false;
+  const statements = normalized
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+  if (statements.length === 0) return false;
+  const readOnlyStatement = /^(?:\(+\s*)?(?:select|with|explain|describe|desc|show|values)\b/;
+  if (!statements.every((statement) => readOnlyStatement.test(statement))) return false;
+  return true;
 }
 
 export function normalizeLocalFileReadPath(value: string | null | undefined): string {
@@ -627,6 +794,7 @@ function buildServerLookup(servers: MCPServer[]): Record<string, MCPServer> {
 }
 
 export function isRiskAutoExecutable(risk: ToolRiskLevel, policy?: ToolPermissionPolicy): boolean {
+  if (isPerCallOnlyToolRisk(risk)) return false;
   const normalized = normalizeToolPermissionPolicy(policy);
   return normalized.autoExecuteRiskLevels.includes(risk) && !normalized.disabledRiskLevels.includes(risk);
 }
@@ -729,11 +897,15 @@ export function getToolRiskLevelForCall(
   ) {
     return "local_file_read";
   }
-  if (capability?.category === "database" || containsAny(normalizeText(name), DATABASE_TERMS)) {
+  if (
+    capability?.category === "database" ||
+    containsAny(normalizeText(name), DATABASE_TERMS) ||
+    hasSqlShapedArguments(args)
+  ) {
     const readOnlySql = isSqlReadOnly(args);
     if (readOnlySql === true) return "external_read";
     if (readOnlySql === false) {
-      const sqlValue = String(args.sql ?? args.query ?? args.statement ?? args.input ?? "").toLowerCase();
+      const sqlValue = (getNonEmptySqlArgument(args)?.value || "").toLowerCase();
       return /\b(drop|truncate|delete|alter)\b/.test(sqlValue) ? "destructive" : "external_write";
     }
   }
@@ -753,6 +925,7 @@ export function isToolAutoExecutableForCall(
 ): boolean {
   const effectivePolicy = normalizeToolPermissionPolicy(policy ?? registry?.policy);
   const risk = getToolRiskLevelForCall(name, args, registry, context);
+  if (isPerCallOnlyToolRisk(risk)) return false;
   return effectivePolicy.autoExecuteRiskLevels.includes(risk) && !effectivePolicy.disabledRiskLevels.includes(risk);
 }
 

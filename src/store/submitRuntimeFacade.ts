@@ -75,8 +75,31 @@ export interface SubmitSessionRuntimeFacade<
 const SUBMIT_SESSION_RUNTIME_OWNER = Symbol("submit-session-runtime-owner");
 
 type RuntimeWithSubmitOwner = {
-  [SUBMIT_SESSION_RUNTIME_OWNER]?: object;
+  [SUBMIT_SESSION_RUNTIME_OWNER]?: SubmitSessionRuntimeOwnerToken;
 };
+
+interface SubmitSessionRuntimeOwnerToken {
+  sessionKey: string;
+  sessionGeneration: string | null;
+}
+
+function resolveSubmitSessionGeneration<TState extends SubmitSessionRuntimeFacadeState<object>>(
+  state: TState,
+  sessionKey: string,
+): string | null {
+  for (const [scopeKey, records] of Object.entries(state.sessionsByWorkspace || {})) {
+    if (!Array.isArray(records)) continue;
+    for (const record of records as Array<Record<string, unknown>>) {
+      const sessionId = typeof record.id === "number" ? record.id : null;
+      if (resolveSessionRuntimeKey(scopeKey, sessionId) !== sessionKey) {
+        continue;
+      }
+      const generation = String(record.planLifecycleEpoch || "").trim();
+      return generation || null;
+    }
+  }
+  return null;
+}
 
 /**
  * Carry the opaque submit owner across an ordinary snapshot refresh of the
@@ -87,11 +110,17 @@ type RuntimeWithSubmitOwner = {
 export function preserveSubmitSessionRuntimeOwnership<TRuntime extends object>(
   previous: TRuntime | null | undefined,
   replacement: TRuntime,
+  currentSessionGeneration: string | null,
 ): TRuntime {
   const ownerToken = (previous as RuntimeWithSubmitOwner | null | undefined)?.[
     SUBMIT_SESSION_RUNTIME_OWNER
   ];
-  if (!ownerToken) return replacement;
+  if (
+    !ownerToken ||
+    ownerToken.sessionGeneration !== currentSessionGeneration
+  ) {
+    return replacement;
+  }
   return {
     ...replacement,
     [SUBMIT_SESSION_RUNTIME_OWNER]: ownerToken,
@@ -214,7 +243,10 @@ export function createSubmitSessionRuntimeFacade<
   params: SubmitSessionRuntimeFacadeInput<TState, TRuntime>,
 ): SubmitSessionRuntimeFacade<TState, TRuntime> {
   let seeded = false;
-  const runtimeOwnerToken = Object.freeze({ sessionKey: params.runSessionKey });
+  const runtimeOwnerToken = Object.freeze({
+    sessionKey: params.runSessionKey,
+    sessionGeneration: resolveSubmitSessionGeneration(params.get(), params.runSessionKey),
+  });
   const stampOwnedRuntime = (runtime: TRuntime): TRuntime => ({
     ...runtime,
     [SUBMIT_SESSION_RUNTIME_OWNER]: runtimeOwnerToken,

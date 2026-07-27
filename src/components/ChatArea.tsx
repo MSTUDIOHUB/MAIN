@@ -21,6 +21,7 @@ import {
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
+import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
@@ -47,7 +48,7 @@ import {
 } from "../lib/toolUiGrouping";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
-  buildCapsuleActivityText,
+  buildCapsuleGuidanceText,
   buildRuntimeProgressLedger,
   buildRunStatusProjection,
 } from "../lib/runtimeProgressLedger";
@@ -71,6 +72,7 @@ import {
   isTransparentToolNarrationBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
+  shouldSuppressSupersededPlanCandidate,
   shouldSuppressAgentAsExplanation,
   shouldSuppressAgentToolEcho,
 } from "../lib/chat/chatBlockVisibility";
@@ -89,7 +91,11 @@ import {
   isCommandLikeToolName,
   shouldGroupPlanExecutionTools,
 } from "../lib/chat/chatToolSummary";
-import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
+import {
+  getPendingToolReviewArgumentDisclosure,
+  isExactPendingToolReviewOwner,
+  resolveVisiblePendingToolReview,
+} from "../lib/pendingToolReview";
 import {
   getToolPermissionResolutionIdentity,
   shouldRenderPermissionCapsule,
@@ -101,11 +107,18 @@ import {
   isPlanReviewCapsulePresentationEligible,
   shouldRenderTurnBoundary,
 } from "../lib/turnPresentation";
-import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
-import { selectCapsulePublicCommentary } from "../lib/capsuleCommentary";
+import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
+import { buildCapsulePhaseGuidance } from "../lib/assistantProgressPresentation";
+import { buildRuntimeV2CompatibleCapsuleProjection } from "../lib/runtimeV2Presentation";
+import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
+import {
+  resolveTurnStrategyFromIntent,
+  selectTurnIngressAvailability,
+} from "../lib/turnIngress";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -2166,7 +2179,13 @@ function AgentContentBlock({
 
   return (
     <div
-      data-testid={block.visibility === "assistant_final" ? "assistant-final" : undefined}
+      data-testid={
+        block.visibility === "assistant_final"
+          ? "assistant-final"
+          : block.visibility === "assistant_update"
+            ? "assistant-update"
+            : undefined
+      }
       data-turn-id={block.turnId || undefined}
       className="mt-4 flex w-full min-w-0 items-start justify-start gap-3"
     >
@@ -2515,6 +2534,7 @@ export default function ChatArea({
     showFilePanel,
     rightPanelTab,
     runtimeEvents,
+    runtimeV2Checkpoints,
     harnessRunMarker,
     activeActionRequest,
     openRightPanelTab,
@@ -2559,6 +2579,7 @@ export default function ChatArea({
     showFilePanel: useAppStore((s) => s.showFilePanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    runtimeV2Checkpoints: useAppStore((s) => s.runtimeV2Checkpoints),
     harnessRunMarker: useAppStore((s) => s.harnessRunMarker),
     activeActionRequest: useAppStore((s) => s.activeActionRequest),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
@@ -2598,6 +2619,18 @@ export default function ChatArea({
     goalRuntime: useAppStore((s) => s.goalRuntime),
   };
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  const turnRuntimeCheckpoints = useAppStore((s) => s.turnRuntimeCheckpoints);
+  const activeSessionEpoch = useAppStore((s) => {
+    const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
+    const session = (s.sessionsByWorkspace[workspaceKey] || []).find(
+      (candidate) => candidate.id === s.currentSessionId,
+    );
+    const persistedEpoch = String(session?.planLifecycleEpoch || "").trim();
+    if (persistedEpoch) return persistedEpoch;
+    return s.planLifecycle?.sessionKey === activeSessionKey
+      ? String(s.planLifecycle.sessionEpoch || "").trim() || null
+      : null;
+  });
   const visualContextProgressByTurnId = useMemo(() => {
     const latestByTurnId = new Map<string, { timestampMs: number; progress: any }>();
     const terminalAtByTurnId = new Map<string, number>();
@@ -2820,6 +2853,52 @@ export default function ChatArea({
   const pinnedTurn = useMemo(() => {
     return resolvePinnedConversationTurn(visibleConversationTurns, currentTurnId);
   }, [visibleConversationTurns, currentTurnId]);
+  const composerHasLiveTurnOwner = Boolean(
+    currentWorkspace &&
+    pinnedTurn &&
+    !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
+    (
+      (
+        harnessRunMarker?.status === "running" &&
+        harnessRunMarker.sessionKey === activeSessionKey &&
+        harnessRunMarker.turnId === pinnedTurn.id
+      ) ||
+      (
+        agentStatus === "running" &&
+        (pinnedTurn.status === "planning" || pinnedTurn.status === "executing")
+      )
+    )
+  );
+  // Streaming is still a valid immediate signal. The durable Turn/Run owner
+  // covers the gaps between model chunks where isGenerating may briefly drop.
+  const composerRunActive = isStreaming || composerHasLiveTurnOwner;
+  const composerRuntimeOwnerObserved = composerRunActive ||
+    agentStatus === "pending_review" ||
+    (
+      activeActionRequest?.status === "pending" &&
+      activeActionRequest.sessionKey === activeSessionKey &&
+      activeActionRequest.turnId === pinnedTurn?.id
+    );
+  const composerTurnIngress = useMemo(() => selectTurnIngressAvailability({
+    checkpoint: pinnedTurn ? turnRuntimeCheckpoints?.[pinnedTurn.id] : null,
+    expectedOwner: pinnedTurn && activeSessionKey && activeSessionEpoch
+      ? {
+          workspaceKey: resolveSessionWorkspaceKey(currentWorkspace),
+          sessionKey: activeSessionKey,
+          sessionEpoch: activeSessionEpoch,
+          turnId: pinnedTurn.id,
+        }
+      : null,
+    strategy: resolveTurnStrategyFromIntent(pinnedTurn?.intent, pinnedTurn?.mode),
+    runtimeOwnerObserved: composerRuntimeOwnerObserved,
+  }), [
+    activeSessionEpoch,
+    activeSessionKey,
+    composerRuntimeOwnerObserved,
+    currentWorkspace,
+    pinnedTurn,
+    turnRuntimeCheckpoints,
+  ]);
   const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
     !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
@@ -2844,9 +2923,24 @@ export default function ChatArea({
   const planReviewOwnerTurn = activeActionRequest?.kind === "plan_review"
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
+  const runtimeV2PlanReview = useMemo(
+    () => planReviewOwnerTurn
+      ? resolveRuntimeV2PlanReviewFromAggregate(
+          runtimeV2Checkpoints[planReviewOwnerTurn.id]?.aggregate,
+        )
+      : null,
+    [planReviewOwnerTurn, runtimeV2Checkpoints],
+  );
   const currentPlanApprovalIdentity = useMemo(
-    () => buildPlanApprovalIdentity(planArtifacts),
-    [planArtifacts],
+    () => runtimeV2PlanReview
+      ? {
+          revision: runtimeV2PlanReview.commit.authority.revision,
+          artifactHash: runtimeV2PlanReview.commit.authority.projectionHash,
+          artifactPaths: [runtimeV2PlanReview.commit.artifact.path],
+          artifactCount: 1,
+        }
+      : buildTypedPlanApprovalIdentity(planArtifacts),
+    [planArtifacts, runtimeV2PlanReview],
   );
   const hasReviewablePlanArtifact = !!currentPlanApprovalIdentity;
   const planReviewActionRequest =
@@ -3123,6 +3217,21 @@ export default function ChatArea({
     permissionRequestHasExactRuntimeOwner,
     taskFlow,
   ]);
+  const pendingToolArgumentDisclosure = useMemo(() => {
+    if (
+      !permissionRequestHasExactRuntimeOwner ||
+      !permissionActionRequest?.toolCallId ||
+      pendingToolCall?.toolCallId !== permissionActionRequest.toolCallId ||
+      pendingToolCall?.name !== permissionActionRequest.toolName
+    ) {
+      return null;
+    }
+    return getPendingToolReviewArgumentDisclosure(pendingToolCall);
+  }, [
+    pendingToolCall,
+    permissionActionRequest,
+    permissionRequestHasExactRuntimeOwner,
+  ]);
   const capsuleControlHasChoiceContext =
     !!pendingToolReviewForExecutionCapsule;
   const shouldShowExecutionCapsuleNormally =
@@ -3248,6 +3357,16 @@ export default function ChatArea({
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-end">
           <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4">
+            {block.runtimeGuidance?.id && (
+              <div
+                data-testid="runtime-guidance-record"
+                data-guidance-id={block.runtimeGuidance.id}
+                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold text-emerald-400"
+              >
+                <IconZap className="h-3 w-3" />
+                {language === "en" ? "Guided this Turn" : "已引导本回合"}
+              </div>
+            )}
             {block.content && (
               <div
                 data-testid="user-message-content"
@@ -3367,8 +3486,14 @@ export default function ChatArea({
       const autoCollapse = index < taskFlow.length - 1 && taskFlow.findIndex((t, i) => i > index && t.type === "agent") !== -1;
       const blockPermissionIdentity = permissionRequestHasExactRuntimeOwner &&
         permissionResolutionIdentity &&
-        permissionResolutionIdentity.taskId === block.id &&
-        permissionResolutionIdentity.turnId === block.turnId
+        permissionActionRequest &&
+        isExactPendingToolReviewOwner(block, {
+          taskId: permissionResolutionIdentity.taskId,
+          turnIds: [permissionResolutionIdentity.turnId],
+          toolCallId: permissionActionRequest.toolCallId,
+          toolName: permissionActionRequest.toolName,
+          target: permissionActionRequest.target,
+        })
         ? permissionResolutionIdentity
         : null;
       return (
@@ -3381,13 +3506,20 @@ export default function ChatArea({
             message={block.message}
             diff={block.diff}
             shellPermissionDecision={block.shellPermissionDecision}
+            permissionRisk={blockPermissionIdentity ? permissionActionRequest?.risk : undefined}
             intentSummary={block.intentSummary}
             why={block.why}
             evidence={block.evidence}
             observationSummary={block.observationSummary}
-            onAllow={() => blockPermissionIdentity && allowToolAction?.(block.id, blockPermissionIdentity)}
-            onAllowForSession={() => blockPermissionIdentity && approvePendingReviewForSession?.(blockPermissionIdentity)}
-            onReject={() => blockPermissionIdentity && rejectToolAction?.(block.id, blockPermissionIdentity)}
+            onAllow={blockPermissionIdentity
+              ? () => allowToolAction?.(block.id, blockPermissionIdentity)
+              : undefined}
+            onAllowForSession={blockPermissionIdentity
+              ? () => approvePendingReviewForSession?.(blockPermissionIdentity)
+              : undefined}
+            onReject={blockPermissionIdentity
+              ? () => rejectToolAction?.(block.id, blockPermissionIdentity)
+              : undefined}
             autoApproveTools={autoApproveTools}
             onToggleAutoApprove={onToggleAutoApprove}
             autoCollapse={autoCollapse}
@@ -3496,6 +3628,10 @@ export default function ChatArea({
       turn,
       language,
       statusLabel: copy.turnStatusLabels[turn.status] || turn.status,
+      // A workspace submission is always a durable Turn. Keep its title,
+      // lifecycle, and timer visible even when intent resolution says respond.
+      // Only global chat uses the anchorless continuous transcript.
+      showStateAnchorOverride: !isGlobalChat,
     });
     // Compatibility: persisted `collapsed` now projects to process-only collapse.
     // The user request and final assistant response remain part of the continuous flow.
@@ -3712,6 +3848,11 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        if (shouldSuppressSupersededPlanCandidate({
+          block: item.block,
+          hasReviewableArtifact: hasReviewablePlanArtifact,
+          ownsReviewableArtifact: turn.id === planArtifactOwnerTurnId,
+        })) return null;
         // `user_progress` is runtime/process narration, including legacy
         // persisted model prose that used to be promoted from tool-call text.
         // Its structured tool evidence is rendered by the process timeline and
@@ -4245,16 +4386,17 @@ export default function ChatArea({
     agentStatus,
     isRunActive: capsuleIsRunActive,
   });
-  const capsuleActivityText = capsuleIsRunActive && [
-    "analyzing",
-    "planning",
-    "executing",
-    "validating",
-    "recovering",
-  ].includes(capsuleStatusProjection.kind)
-    ? buildCapsuleActivityText(capsuleRunStatus, language)
-    : "";
-  const capsuleCommentaryText = capsuleIsRunActive &&
+  const capsuleStructuredGuidanceText = capsuleIsRunActive &&
+    !capsuleActionKind &&
+    ["analyzing", "planning", "executing", "validating", "recovering"].includes(
+      capsuleStatusProjection.kind,
+    )
+      ? buildCapsuleGuidanceText(
+          capsuleRunStatus,
+          language,
+        )
+      : "";
+  const capsuleLiveGuidanceText = capsuleIsRunActive &&
     !capsuleActionKind &&
     activeSessionKey &&
     capsuleTurn?.id &&
@@ -4263,14 +4405,57 @@ export default function ChatArea({
     ["analyzing", "planning", "executing", "validating", "recovering"].includes(
       capsuleStatusProjection.kind,
     )
-      ? selectCapsulePublicCommentary({
+      ? selectCapsuleLiveGuidance({
           blocks: capsuleTurnBlocks,
           sessionKey: activeSessionKey,
           logicalTurnId: capsuleActiveLogicalTurnId,
           displayTurnId: capsuleTurn.id,
           runId: capsuleActiveRunId,
+          language,
+          // Only a newer renderable progress item or health signal retires an
+          // older model-visible line. Non-display telemetry must not replace
+          // the last useful Capsule content with a generic lifecycle sentence.
+          notOlderThan: Math.max(
+            0,
+            capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
+            ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
+          ),
         })
       : "";
+  const capsuleRuntimeV2Projection = capsuleIsRunActive &&
+    !capsuleActionKind &&
+    capsuleTurn?.id
+      ? buildRuntimeV2CompatibleCapsuleProjection({
+          events: runtimeEvents,
+          turnId: capsuleTurn.id,
+          runId: capsuleActiveRunId,
+          language,
+        })
+      : null;
+  const capsulePhaseGuidanceText = capsuleIsRunActive && !capsuleActionKind
+    ? buildCapsulePhaseGuidance(capsuleStatusProjection.kind, language)
+    : "";
+  const capsuleGuidanceText =
+    capsuleRuntimeV2Projection?.markdown ||
+    capsuleLiveGuidanceText ||
+    capsuleStructuredGuidanceText ||
+    capsulePhaseGuidanceText;
+  const capsuleGuidanceSource = capsuleRuntimeV2Projection
+    ? "runtime_v2"
+    : capsuleLiveGuidanceText
+    ? "model"
+    : capsuleStructuredGuidanceText
+      ? "runtime"
+      : capsulePhaseGuidanceText
+        ? "phase"
+        : "status";
+  const capsuleGuidanceUpdatedAt = Math.max(
+    0,
+    capsuleRuntimeV2Projection?.updatedAt || 0,
+    capsuleRunStatus.currentActivity?.lastSeenAt || 0,
+    capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
+    ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
+  );
 
   useEffect(() => {
     setIsCapsuleCollapsed(false);
@@ -4343,6 +4528,9 @@ export default function ChatArea({
       requestId={permissionActionRequest?.requestId || undefined}
       permissionIdentity={permissionResolutionIdentity || undefined}
       permissionRisk={permissionActionRequest?.risk}
+      permissionToolName={permissionActionRequest?.toolName}
+      permissionTarget={permissionActionRequest?.target}
+      permissionArgumentDisclosure={pendingToolArgumentDisclosure}
       status={capsuleStatusLabel}
       statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
       language={language}
@@ -5074,10 +5262,12 @@ export default function ChatArea({
               <div
                 data-testid="agent-explanation-capsule"
                 data-capsule-status={capsuleStatusProjection.kind}
+                data-guidance-source={capsuleGuidanceSource}
+                data-guidance-updated-at={capsuleGuidanceUpdatedAt || undefined}
                 data-action-kind={planReviewActionRequest?.kind || userChoiceActionRequest?.kind || permissionActionRequest?.kind || undefined}
-                data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
-                data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || undefined}
-                data-run-id={planReviewActionRequest?.runId || userChoiceActionRequest?.runId || permissionActionRequest?.runId || undefined}
+                data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || activeSessionKey || undefined}
+                data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || capsuleTurn?.id || undefined}
+                data-run-id={planReviewActionRequest?.runId || userChoiceActionRequest?.runId || permissionActionRequest?.runId || capsuleActiveRunId || undefined}
                 data-request-id={planReviewActionRequest?.requestId || userChoiceActionRequest?.requestId || permissionActionRequest?.requestId || undefined}
                 data-plan-revision={planReviewActionRequest ? String(planReviewActionRequest.planRevision) : undefined}
                 data-artifact-hash={planReviewActionRequest?.artifactHash || undefined}
@@ -5088,11 +5278,16 @@ export default function ChatArea({
                   maxHeight: !isCapsuleCollapsed && chatAreaHeight
                     ? `${chatAreaHeight * (hasTypedCapsuleControls ? 1 : 0.58)}px`
                     : undefined,
-                  overflowY: "hidden",
+                  overflowY: "auto",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
               >
+                <div
+                  aria-hidden="true"
+                  className="capsule-rotate-beam"
+                  data-testid="capsule-rotate-beam"
+                />
                 {isCapsuleCollapsed ? (
                   <div
                     className={`flex items-center justify-center w-full h-full ${activeGoal ? `capsule-goal-icon is-${goalStatus}` : "animate-pulse"}`}
@@ -5121,43 +5316,33 @@ export default function ChatArea({
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
-                          <span className="min-w-0 block flex-1 text-left">
-                            <span
-                              data-testid="capsule-status-label"
-                              className={`block truncate whitespace-nowrap font-semibold ${
-                                isLightThemeMode ? "text-[#18181b]" : "text-white"
-                              }`}
-                            >
-                              {headerLabel}
-                            </span>
-                            {capsuleCommentaryText && (
-                              <span
-                                data-testid="capsule-commentary-label"
+                          <div className="min-w-0 flex-1 text-left">
+                            {capsuleGuidanceText ? (
+                              <div
+                                data-testid="capsule-guidance-label"
                                 aria-live="polite"
                                 aria-atomic="true"
-                                title={capsuleCommentaryText}
-                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-medium ${
-                                  isLightThemeMode ? "text-[#3f3f46]" : "text-[#d4d4d8]"
-                                }`}
+                                className="capsule-guidance-markdown block min-w-0 font-medium"
                               >
-                                {language === "zh" ? "模型进展：" : "Model update: "}
-                                {capsuleCommentaryText}
-                              </span>
-                            )}
-                            {capsuleActivityText && (
+                                <MarkdownRenderer
+                                  content={capsuleGuidanceText}
+                                  baseFontSize={Math.max(12, resolvedChatFontSize - 1)}
+                                  sourceId={`capsule-guidance-${capsuleTurn?.id || "active"}`}
+                                />
+                              </div>
+                            ) : (
                               <span
-                                data-testid="capsule-activity-label"
+                                data-testid="capsule-status-label"
                                 aria-live="polite"
                                 aria-atomic="true"
-                                title={capsuleActivityText}
-                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-normal ${
-                                  isLightThemeMode ? "text-[#52525b]" : "text-[#a1a1aa]"
+                                className={`block whitespace-normal break-words font-semibold ${
+                                  isLightThemeMode ? "text-[#18181b]" : "text-white"
                                 }`}
                               >
-                                {capsuleActivityText}
+                                {headerLabel}
                               </span>
                             )}
-                          </span>
+                          </div>
                         </div>
 
                         {capsuleHasTasks && (
@@ -5269,6 +5454,9 @@ export default function ChatArea({
         setShowDiff={setShowDiff}
         onSendMessage={onSendMessage}
         isStreaming={isStreaming}
+        isRunActive={composerRunActive}
+        turnIngressMode={composerTurnIngress.mode}
+        guidanceTarget={composerTurnIngress.guidanceTarget}
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}

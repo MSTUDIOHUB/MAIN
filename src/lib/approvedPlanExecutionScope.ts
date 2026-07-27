@@ -21,6 +21,47 @@ function pathsMatch(left: string, right: string): boolean {
   return workspacePathsReferToSameFile(a, b);
 }
 
+export function collectApprovedPlanMutationTargets(tasks: PlanTask[]): string[] {
+  return Array.from(new Set((tasks || []).flatMap((task) =>
+    (task.evidence || [])
+      .filter((evidence) => evidence.kind === "file" || evidence.kind === "deliverable")
+      .map((evidence) => normalizePath(evidence.value))
+      .filter(Boolean),
+  )));
+}
+
+export function resolveApprovedPlanDelegatedWriteScope(input: {
+  isPlanApproved: boolean;
+  accessMode: "read" | "write";
+  allowedPaths: string[];
+  tasks: PlanTask[];
+}): ApprovedPlanMutationScopeDecision {
+  const applies = input.isPlanApproved && input.accessMode === "write";
+  if (!applies) {
+    return {
+      applies: false,
+      allowed: true,
+      requestedTargets: [],
+      plannedTargets: [],
+      unexpectedTargets: [],
+    };
+  }
+  const plannedTargets = collectApprovedPlanMutationTargets(input.tasks);
+  const requestedTargets = Array.from(new Set(
+    (input.allowedPaths || []).map(normalizePath).filter(Boolean),
+  ));
+  const unexpectedTargets = requestedTargets.filter((requested) =>
+    !plannedTargets.some((planned) => pathsMatch(requested, planned)),
+  );
+  return {
+    applies: true,
+    allowed: requestedTargets.length > 0 && unexpectedTargets.length === 0,
+    requestedTargets,
+    plannedTargets,
+    unexpectedTargets,
+  };
+}
+
 function collectRequestedTargets(input: {
   toolName: string;
   args: Record<string, unknown>;
@@ -142,12 +183,7 @@ export function resolveApprovedPlanMutationScope(input: {
     };
   }
 
-  const plannedTargets = Array.from(new Set(input.tasks.flatMap((task) =>
-    (task.evidence || [])
-      .filter((evidence) => evidence.kind === "file" || evidence.kind === "deliverable")
-      .map((evidence) => normalizePath(evidence.value))
-      .filter(Boolean),
-  )));
+  const plannedTargets = collectApprovedPlanMutationTargets(input.tasks);
   const requestedTargets = collectRequestedTargets(input);
   const unexpectedTargets = requestedTargets.filter((requested) =>
     !/^\.main\/plans\/tasks\.md$/i.test(requested) &&

@@ -6,7 +6,7 @@
 //   2. <tool_call> with JSON inside
 //   3. <function_call> with JSON inside
 //   4. <tool_code> wrappers containing a single function-style call
-//   5. Gemma/OMLX <|tool_call>call:name{...} text tokens
+//   5. Compatibility <|tool_call>call:name{...} text tokens
 //
 // Reasoning tags extracted as thoughts:
 //   <analysis>, <thought>, <thinking>, <reasoning>
@@ -358,25 +358,176 @@ function parseToolCodeBlock(inner: string): ParsedToolCall[] {
   return parsed ? [parsed] : [];
 }
 
-function parseGemmaToolCallBlocks(text: string): ParsedToolCall[] {
-  const calls: ParsedToolCall[] = [];
-  const blockRe = /<\|tool_call>\s*call:([a-z_][a-z0-9_]*)\s*\{([\s\S]*?)\}(?:\s*<\|\/tool_call>)?/gi;
-  let match: RegExpExecArray | null;
+interface CompatibilityTokenToolCallBlock {
+  start: number;
+  end: number;
+  toolName: string;
+  argumentBody: string;
+}
 
-  while ((match = blockRe.exec(text)) !== null) {
-    const toolName = String(match[1] || "").trim();
-    if (!BARE_TOOL_NAMES.has(toolName)) continue;
-    const namedArgumentBody = String(match[2] || "")
-      .replace(/(^|,)\s*([a-z_][a-z0-9_]*)\s*:\s*/gi, "$1 $2=")
-      .trim();
-    calls.push({
-      id: nextCallId(),
-      name: toolName,
-      arguments: parseNamedArguments(namedArgumentBody),
+const TOOL_ARGUMENT_COMPATIBILITY_NAMES = [
+  "target",
+  "file",
+  "file_path",
+  "old_content",
+  "new_content",
+  "old_text",
+  "new_text",
+  "oldString",
+  "newString",
+  "search",
+  "replace",
+] as const;
+
+function getKnownToolArgumentNames(toolName: string): Map<string, string> {
+  const names = new Map<string, string>();
+  const definition = TOOL_DEFINITIONS.find((tool) => tool.function.name === toolName);
+  const parameters = definition?.function.parameters as {
+    properties?: Record<string, unknown>;
+  } | undefined;
+  for (const name of Object.keys(parameters?.properties || {})) {
+    names.set(name.toLowerCase(), name);
+  }
+  for (const name of TOOL_ARGUMENT_COMPATIBILITY_NAMES) {
+    names.set(name.toLowerCase(), name);
+  }
+  return names;
+}
+
+function parseLooseCompatibilityArgumentValue(value: string): unknown {
+  const trimmed = value.trim().replace(/,\s*$/, "");
+  if (!trimmed) return "";
+  const quote = trimmed[0];
+  if (
+    (quote === "\"" || quote === "'" || quote === "`") &&
+    trimmed.length >= 2 &&
+    trimmed[trimmed.length - 1] === quote
+  ) {
+    if (quote === "\"") {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        // Local compatibility output may contain unescaped source quotes.
+      }
+    }
+    return trimmed.slice(1, -1);
+  }
+  return normalizeInlineArgValue(trimmed);
+}
+
+/**
+ * Parse object-like compatibility arguments by their registered schema keys.
+ *
+ * Some transports surface a native-looking call as compatibility text and wrap source
+ * code in a JavaScript-like single-quoted value. That source may itself
+ * contain quotes, commas, and balanced braces, so a generic `key='[^']*'`
+ * regex truncates valid mutations. Registered argument-key boundaries are
+ * stable enough to retain the complete value without interpreting its code.
+ */
+function parseCompatibilityTokenArgumentBody(
+  toolName: string,
+  argumentBody: string,
+): Record<string, unknown> {
+  const body = argumentBody.trim();
+  if (!body) return {};
+  try {
+    const parsed = JSON.parse(`{${body}}`);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Fall through to the schema-key boundary parser.
+  }
+
+  const knownNames = getKnownToolArgumentNames(toolName);
+  const boundaries: Array<{
+    key: string;
+    start: number;
+    valueStart: number;
+  }> = [];
+  const keyRe = /(?:^|,)\s*["']?([a-z_][a-z0-9_]*)["']?\s*:/gi;
+  let keyMatch: RegExpExecArray | null;
+  while ((keyMatch = keyRe.exec(body)) !== null) {
+    const canonicalKey = knownNames.get(String(keyMatch[1] || "").toLowerCase());
+    if (!canonicalKey) continue;
+    boundaries.push({
+      key: canonicalKey,
+      start: keyMatch.index,
+      valueStart: keyRe.lastIndex,
     });
   }
 
-  return calls;
+  if (boundaries.length > 0) {
+    const args: Record<string, unknown> = {};
+    for (let index = 0; index < boundaries.length; index += 1) {
+      const boundary = boundaries[index];
+      const valueEnd = boundaries[index + 1]?.start ?? body.length;
+      args[boundary.key] = parseLooseCompatibilityArgumentValue(
+        body.slice(boundary.valueStart, valueEnd),
+      );
+    }
+    return args;
+  }
+
+  const namedArgumentBody = body
+    .replace(/(^|,)\s*([a-z_][a-z0-9_]*)\s*:\s*/gi, "$1 $2=")
+    .trim();
+  return parseNamedArguments(namedArgumentBody);
+}
+
+/**
+ * Locate complete `<|tool_call>call:name{...}` blocks with balanced braces.
+ * The former non-greedy regex stopped at the first `}` inside replacement
+ * source and turned the only executable mutation into an empty-target call.
+ */
+function extractCompatibilityTokenToolCallBlocks(
+  text: string,
+): CompatibilityTokenToolCallBlock[] {
+  const blocks: CompatibilityTokenToolCallBlock[] = [];
+  const markerRe = /<\|tool_call>\s*call:([a-z_][a-z0-9_]*)\s*\{/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = markerRe.exec(text)) !== null) {
+    const toolName = String(match[1] || "").trim();
+    const openBrace = markerRe.lastIndex - 1;
+    let depth = 0;
+    let closeBrace = -1;
+    for (let index = openBrace; index < text.length; index += 1) {
+      if (text[index] === "{") depth += 1;
+      if (text[index] !== "}") continue;
+      depth -= 1;
+      if (depth === 0) {
+        closeBrace = index;
+        break;
+      }
+    }
+    if (closeBrace < 0) break;
+
+    let end = closeBrace + 1;
+    const closeToken = text.slice(end).match(/^\s*<\|\/tool_call>/i);
+    if (closeToken) end += closeToken[0].length;
+    if (BARE_TOOL_NAMES.has(toolName)) {
+      blocks.push({
+        start: match.index,
+        end,
+        toolName,
+        argumentBody: text.slice(openBrace + 1, closeBrace),
+      });
+    }
+    markerRe.lastIndex = end;
+  }
+  return blocks;
+}
+
+function removeTextRanges(text: string, ranges: Array<{ start: number; end: number }>): string {
+  if (ranges.length === 0) return text;
+  let cursor = 0;
+  let result = "";
+  for (const range of ranges) {
+    result += text.slice(cursor, range.start);
+    cursor = Math.max(cursor, range.end);
+  }
+  return result + text.slice(cursor);
 }
 
 function parseInlineToolInvocation(text: string): ParsedToolCall | null {
@@ -610,11 +761,25 @@ export function parseTextForTools(text: string): ParsedTextResult {
     toolCalls.push(...parseToolCodeBlock(block));
   }
 
-  // Format 5: Gemma/OMLX native-looking calls surfaced in text content.
-  toolCalls.push(...parseGemmaToolCallBlocks(text));
+  // Format 5: native-looking calls surfaced through compatibility text.
+  const compatibilityTokenToolCallBlocks =
+    extractCompatibilityTokenToolCallBlocks(text);
+  for (const block of compatibilityTokenToolCallBlocks) {
+    toolCalls.push({
+      id: nextCallId(),
+      name: block.toolName,
+      arguments: parseCompatibilityTokenArgumentBody(
+        block.toolName,
+        block.argumentBody,
+      ),
+    });
+  }
 
   // 3. Build clean text by removing all known XML blocks
-  const xmlStrippedText = text
+  const xmlStrippedText = removeTextRanges(
+    text,
+    compatibilityTokenToolCallBlocks,
+  )
     .replace(
       /<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/g,
       "",
@@ -625,7 +790,6 @@ export function parseTextForTools(text: string): ParsedTextResult {
       "",
     )
     .replace(/<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/g, "")
-    .replace(/<\|tool_call>\s*call:[a-z_][a-z0-9_]*\s*\{[\s\S]*?\}(?:\s*<\|\/tool_call>)?/gi, "")
     .replace(
       /<\/?(?:analysis|thought|thinking|reasoning|tool_use|tool_call|function_call|tool_code|tool|parameter|tool_response)(?:\s[^>]*)?>/g,
       "",
