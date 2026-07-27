@@ -39,7 +39,7 @@ export async function settlePlanTool(input: {
       ? { runtimeControlPlane: true }
       : {}),
   });
-  await input.ledger.append({
+  await input.ledger.settleCommand({
     type: "tool.completed",
     run: input.run,
     idempotencyKey: command.idempotencyKey,

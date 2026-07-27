@@ -70,6 +70,28 @@ export class PlanLedger {
     return event;
   }
 
+  async settleCommand(
+    draft: Extract<
+      RuntimeV2EventDraft,
+      {
+        type:
+          | "command.completed"
+          | "provider.responded"
+          | "tool.completed"
+          | "validation.completed";
+      }
+    >,
+  ): Promise<RuntimeV2Event> {
+    const event = await this.append(draft);
+    if (this.aggregate?.run && !this.aggregate.terminalOutcome) {
+      await this.publish(buildRuntimeV2CapsuleProjection(
+        this.aggregate,
+        this.nextId("runtime-v2-plan-capsule"),
+      ));
+    }
+    return event;
+  }
+
   async schedule(
     run: RuntimeV2RunIdentity,
     kind: RuntimeV2Command["kind"],
@@ -131,7 +153,7 @@ export class PlanLedger {
     status: "succeeded" | "failed" | "canceled",
   ): Promise<void> {
     for (const command of [...(this.aggregate?.scheduledCommands || [])]) {
-      await this.append({
+      await this.settleCommand({
         type: "command.completed",
         run,
         idempotencyKey: command.idempotencyKey,

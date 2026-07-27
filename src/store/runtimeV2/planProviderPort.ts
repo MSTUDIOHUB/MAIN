@@ -180,7 +180,7 @@ export async function requestPlanModel(input: {
       exactStructuredObject: !!structuredCandidate,
       protocolViolation: result.protocolViolation || null,
     });
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "provider.responded",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
@@ -209,7 +209,7 @@ export async function requestPlanModel(input: {
       requestAbort.signal,
       input.context.abortCtrl.signal,
     );
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "command.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,

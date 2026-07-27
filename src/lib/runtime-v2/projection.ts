@@ -75,8 +75,17 @@ function publicProviderCommentaryForCommand(
     event.result.toolCalls.some((call) => call.id === toolCallId)
   );
   if (!response || response.type !== "provider.responded") return "";
+  return visibleProviderCommentary(response.result);
+}
+
+function visibleProviderCommentary(
+  result: Extract<
+    RuntimeV2Event,
+    { type: "provider.responded" }
+  >["result"],
+): string {
   const commentary = String(
-    response.result.commentary || response.result.visibleText || "",
+    result.commentary || result.visibleText || "",
   ).trim();
   // A text-envelope transport is an implementation detail, not user-facing
   // commentary. It may schedule the command, but its JSON must never leak into
@@ -88,6 +97,20 @@ function publicProviderCommentaryForCommand(
     return "";
   }
   return commentary;
+}
+
+function currentProviderCommentary(aggregate: TurnAggregateV1): string {
+  const response = [...aggregate.events].reverse().find((event) =>
+    event.type === "provider.responded"
+  );
+  if (!response || response.type !== "provider.responded") return "";
+  const commentary = visibleProviderCommentary(response.result);
+  if (!commentary) return "";
+  if (response.result.toolCalls.length === 0) return commentary;
+  const pendingCallIds = new Set(aggregate.pendingToolCalls.map((call) => call.id));
+  return response.result.toolCalls.some((call) => pendingCallIds.has(call.id))
+    ? commentary
+    : "";
 }
 
 function phaseTitle(phase: TurnAggregateV1["phase"]): string {
@@ -138,13 +161,11 @@ export function buildRuntimeV2CapsuleProjection(
   id: string,
 ): RuntimeV2Projection {
   const current = aggregate.scheduledCommands[0];
-  const latestProviderCommentary = [...aggregate.events].reverse().find((event) =>
-    event.type === "provider.responded" && !!event.result.commentary
-  );
+  const providerCommentary = currentProviderCommentary(aggregate);
   const action = current
     ? actionMarkdown(current, aggregate.strategy)
-    : latestProviderCommentary?.type === "provider.responded"
-      ? latestProviderCommentary.result.commentary || "正在等待下一项结构化动作。"
+    : providerCommentary
+      ? providerCommentary
       : `正在${phaseTitle(aggregate.phase)}。`;
   const commandCommentary = publicProviderCommentaryForCommand(
     aggregate,
@@ -171,22 +192,11 @@ export function buildRuntimeV2MilestoneProjection(
 ): RuntimeV2Projection | null {
   if (
     event.type !== "phase.changed" &&
-    event.type !== "observation.recorded" &&
     event.type !== "work_plan.sealed" &&
     event.type !== "subagents.scheduled" &&
     event.type !== "subagent.completed"
   ) {
     return null;
-  }
-  if (event.type === "observation.recorded") {
-    return projection(
-      aggregate,
-      "chat_milestone",
-      id,
-      `### 已确认一条新的证据\n\n- 已记录 ${markdownCode(event.evidence.target)} 的观察结果。`,
-      "milestone",
-      `evidence:${event.evidence.id}`,
-    );
   }
   if (event.type === "work_plan.sealed") {
     return projection(
@@ -214,13 +224,32 @@ export function buildRuntimeV2MilestoneProjection(
     );
   }
   if (event.type === "subagent.completed") {
+    const terminalStatuses = new Set(["completed", "failed", "canceled"]);
+    if (
+      aggregate.subagents.some((job) => !terminalStatuses.has(job.status))
+    ) {
+      return null;
+    }
+    const completedCount = aggregate.subagents.filter(
+      (job) => job.status === "completed",
+    ).length;
+    const failedCount = aggregate.subagents.length - completedCount;
+    const evidenceCount = aggregate.evidence.filter(
+      (evidence) => evidence.kind === "subagent",
+    ).length;
     return projection(
       aggregate,
       "chat_milestone",
       id,
-      `### 子智能体已返回调查结果\n\n- 已完成 \`${event.jobId}\` 的只读范围调查，并记录 ${event.evidence.length} 条可用证据。`,
+      [
+        "### 并行只读调查已汇合",
+        "",
+        `- ${completedCount} 个范围完成调查${failedCount > 0 ? `，${failedCount} 个范围未能完整返回` : ""}。`,
+        `- 已将 ${evidenceCount} 条子智能体证据纳入主体判断；具体调用与范围保留在任务时间线中。`,
+        "- 主任务将基于合并后的证据继续判断或实施下一步。",
+      ].join("\n"),
       "milestone",
-      `subagent:${event.jobId}:${event.status}`,
+      `subagents-joined:${aggregate.subagents.map((job) => `${job.id}:${job.status}`).join(":")}`,
     );
   }
   return projection(

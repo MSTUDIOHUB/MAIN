@@ -110,7 +110,7 @@ async function collectInitialOverview(input: {
       input.runner.context.runSessionKey,
     );
     const overview = boundedPlanContent(result, 12_000);
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "command.completed",
       run: input.identity.run,
       idempotencyKey: collect.idempotencyKey,
@@ -135,7 +135,7 @@ async function collectInitialOverview(input: {
     });
     return { overview };
   } catch (error) {
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "command.completed",
       run: input.identity.run,
       idempotencyKey: collect.idempotencyKey,

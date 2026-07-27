@@ -226,6 +226,184 @@ test("Capsule never exposes a text tool envelope as commentary", () => {
   assert.doesNotMatch(capsule.markdown, /runtime-v2-tools|toolCalls/);
 });
 
+test("Capsule clears provider commentary after its structured action settles", () => {
+  let state = executeAggregate("observing");
+  const request = commandFor(state, "request_model", "model-stale-commentary", {
+    mode: "observe",
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: request,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: request.idempotencyKey,
+    result: {
+      visibleText: "这条说明只属于接下来的读取动作。",
+      toolCalls: [{
+        id: "read-once",
+        name: "read_file",
+        arguments: { path: "src/main.js" },
+      }],
+      diagnostics: [],
+    },
+  }));
+  const [read] = runtime.decideNextCommands(state);
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: read,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: read.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "read-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    }],
+  }));
+
+  const capsule = runtime.buildRuntimeV2CapsuleProjection(
+    state,
+    "capsule-settled",
+  );
+  assert.doesNotMatch(capsule.markdown, /只属于接下来的读取动作/);
+  assert.match(capsule.markdown, /正在收集证据/);
+});
+
+test("Chat milestones omit individual observations and join child results once", () => {
+  let state = executeAggregate("observing");
+  const observation = event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "source-1",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  });
+  state = runtime.transition(state, observation);
+  assert.equal(
+    runtime.buildRuntimeV2MilestoneProjection(
+      state,
+      observation,
+      "observation-milestone",
+    ),
+    null,
+  );
+
+  const childRun = (runId) => ({
+    ...baseRun,
+    runId,
+    parentRunId: baseRun.runId,
+    attemptId: runId,
+  });
+  const jobs = [
+    {
+      id: "child-frontend",
+      run: childRun("child-run-frontend"),
+      parentRunId: baseRun.runId,
+      scopeKey: "frontend",
+      objective: "Inspect frontend evidence",
+      allowedPaths: ["src"],
+      status: "queued",
+      requestedAt: state.updatedAt + 1,
+      firstTokenAt: null,
+      closedAt: null,
+      summary: null,
+    },
+    {
+      id: "child-backend",
+      run: childRun("child-run-backend"),
+      parentRunId: baseRun.runId,
+      scopeKey: "backend",
+      objective: "Inspect backend evidence",
+      allowedPaths: ["src-tauri"],
+      status: "queued",
+      requestedAt: state.updatedAt + 1,
+      firstTokenAt: null,
+      closedAt: null,
+      summary: null,
+    },
+  ];
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs,
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: jobs[0].id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: jobs[0].id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  const firstChild = event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: jobs[0].id,
+    status: "completed",
+    summary: "Frontend evidence collected.",
+    evidence: [{
+      id: "child-evidence-1",
+      kind: "subagent",
+      target: "src/main.js",
+      version: null,
+    }],
+  });
+  state = runtime.transition(state, firstChild);
+  assert.equal(
+    runtime.buildRuntimeV2MilestoneProjection(
+      state,
+      firstChild,
+      "first-child-milestone",
+    ),
+    null,
+  );
+
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: jobs[1].id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: jobs[1].id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  const secondChild = event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: jobs[1].id,
+    status: "failed",
+    summary: "Backend request ended without a report.",
+    evidence: [],
+  });
+  state = runtime.transition(state, secondChild);
+  const joined = runtime.buildRuntimeV2MilestoneProjection(
+    state,
+    secondChild,
+    "joined-child-milestone",
+  );
+  assert.match(joined.markdown, /并行只读调查已汇合/);
+  assert.match(joined.markdown, /1 个范围完成调查，1 个范围未能完整返回/);
+  assert.match(joined.markdown, /1 条子智能体证据/);
+});
+
 test("Runtime v2 reducer records one ordered ledger and forbids success before finalizing", () => {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,

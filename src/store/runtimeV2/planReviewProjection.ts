@@ -34,7 +34,7 @@ export async function writeReviewArtifact(input: {
       input.context.runWorkspace || "",
       input.context.runSessionKey,
     );
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "tool.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
@@ -47,7 +47,7 @@ export async function writeReviewArtifact(input: {
       }],
     });
   } catch (error) {
-    await input.ledger.append({
+    await input.ledger.settleCommand({
       type: "tool.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
