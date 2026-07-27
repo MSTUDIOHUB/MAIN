@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
+import { analyzeValidationCommand } from "../../lib/validationContract";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   WORK_PLAN_V1_SCHEMA_VERSION,
@@ -656,7 +657,20 @@ export function workPlanDraftFromSubmission(
           kind !== "advisory",
       };
     },
-  ) as Array<WorkPlanDraftV1["validations"][number]>;
+  ).flatMap((validation, index) => {
+    if (
+      validation.kind === "finite_command" &&
+      analyzeValidationCommand(validation.command || "", {
+        cwd: validation.cwd,
+      }).spec?.kind !== "finite_command"
+    ) {
+      normalizationReasons.push(
+        `validations[${index}]:unsafe_finite_command_removed`,
+      );
+      return [];
+    }
+    return [validation];
+  }) as Array<WorkPlanDraftV1["validations"][number]>;
   const executableStepIndexes = steps.flatMap((step, index) =>
     step.operation === "preserve" ? [] : [index]
   );

@@ -790,6 +790,65 @@ test("schema-bound Plan response ingress never searches surrounding prose for JS
   );
 });
 
+test("WorkPlan compilation removes unsafe finite commands only when another executable validation remains", () => {
+  const evidence = [{
+    id: "E1",
+    target: "src/main.js",
+    version: "sha256-reviewed",
+    statement: "Reviewed source.",
+  }];
+  const candidate = {
+    planMarkdown: "Make the reviewed change and verify the observable behavior.",
+    changes: [{
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "Update the reviewed behavior.",
+      expectedOutcome: "The behavior is corrected.",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run dev",
+      expectedOutcome: "The development server starts.",
+      required: true,
+    }, {
+      kind: "browser",
+      expectedOutcome: "The corrected behavior is visible in the application.",
+      required: true,
+    }],
+  };
+  const compiled = planProtocol.workPlanDraftFromSubmission(
+    candidate,
+    evidence,
+    "Repair the reviewed behavior.",
+  );
+  assert.deepEqual(
+    compiled.draft.validations.map((validation) => validation.kind),
+    ["browser"],
+  );
+  assert.ok(compiled.normalizationReasons.includes(
+    "validations[0]:unsafe_finite_command_removed",
+  ));
+  assert.doesNotThrow(() => runtime.sealWorkPlanV1({
+    draft: compiled.draft,
+    evidence,
+    createdAt: 1,
+  }));
+
+  const withoutFallback = planProtocol.workPlanDraftFromSubmission(
+    { ...candidate, validations: candidate.validations.slice(0, 1) },
+    evidence,
+    "Repair the reviewed behavior.",
+  );
+  assert.throws(
+    () => runtime.sealWorkPlanV1({
+      draft: withoutFallback.draft,
+      evidence,
+      createdAt: 1,
+    }),
+    /needs at least one required validation/,
+  );
+});
+
 test("a closed synthesis request gets one compact sequential recovery without overlap", async () => {
   let providerRound = 0;
   let activeRequests = 0;
