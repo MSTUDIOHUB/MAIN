@@ -16,8 +16,6 @@ export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS = 3 * 60_000;
 export const PLAN_DISCOVERY_DEADLINE_MS = 3 * 60_000;
 export const PLAN_DISCOVERY_ACTION_BUDGET = 8;
-export const PLAN_AUDIT_DISCOVERY_DEADLINE_MS = 2 * 60_000;
-export const PLAN_AUDIT_ACTION_BUDGET = 3;
 export const PLAN_CONTEXT_RESULT_CHARS = 10_000;
 export const PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS = 4_096;
@@ -119,18 +117,10 @@ export const PLAN_MODEL_TOOLS = [
   SUBMIT_WORK_PLAN_TOOL,
 ];
 
-export const PLAN_AUDIT_TOOLS = PLAN_MODEL_TOOLS.filter(
-  (definition) => definition.function.name !== SUBMIT_WORK_PLAN_TOOL_NAME,
-);
-
-export type PlanModelStage =
-  | "discovery"
-  | "synthesis"
-  | "audit_discovery"
-  | "audit_synthesis";
+export type PlanModelStage = "discovery" | "synthesis";
 
 export function isPlanSubmissionStage(stage: PlanModelStage): boolean {
-  return stage === "synthesis" || stage === "audit_synthesis";
+  return stage === "synthesis";
 }
 
 export function boundedPlanContent(
@@ -248,7 +238,6 @@ export function synthesisPlanTranscript(input: {
   readonly messages: readonly AgentMessage[];
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
   readonly evidenceContents: ReadonlyMap<string, string>;
-  readonly audit: boolean;
   readonly compactRecovery: boolean;
 }): AgentMessage[] {
   let lastSubmissionOutcomeIndex = -1;
@@ -256,7 +245,7 @@ export function synthesisPlanTranscript(input: {
     const message = input.messages[index]!;
     if (
       message.role === "tool" &&
-      /^WORK_PLAN_(?:REJECTED|DRAFT_ACCEPTED_FOR_AUDIT)\b/.test(
+      /^WORK_PLAN_REJECTED\b/.test(
         String(message.content || ""),
       )
     ) {
@@ -309,42 +298,11 @@ export function synthesisPlanTranscript(input: {
               "The preceding synthesis request was closed at the transport deadline. This is the single bounded recovery request: use only this compact evidence packet and submit one complete plan now.",
             ]
           : []),
-        input.audit
-          ? [
-              "This is the mandatory evidence audit. Write the final plan independently from the audited evidence; do not preserve the first draft's wording, target choices, or assumptions.",
-              "For every user-reported symptom, verify an exact trigger → function or contract → state transition → visible outcome chain from the retained source.",
-              "Challenge plausible but unproved explanations. Check initial placeholder state, programmatic UI updates versus user input, and serialized argument names across framework or language boundaries whenever the evidence contains them.",
-              "Account for each relevant source owner with a concrete modify or preserve decision. Remove unnecessary changes, source-sized code patches, unresolved source-reading questions, dev servers, and manual instructions from command fields.",
-            ].join(" ")
-          : [
-              "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
-              "Before submitting, reconcile the evidence into a concrete causal chain, cover every required source owner with a modify or preserve decision, and use observable bounded validation.",
-              "Do not submit speculation, a dev-server command as a finite check, or manual click instructions in the command field.",
-            ].join(" "),
-      ].join(" "),
-    },
-  ];
-}
-
-export function auditDiscoveryPlanTranscript(input: {
-  readonly messages: readonly AgentMessage[];
-  readonly evidence: readonly WorkPlanRuntimeEvidence[];
-  readonly evidenceContents: ReadonlyMap<string, string>;
-}): AgentMessage[] {
-  return [
-    ...input.messages.slice(0, 3),
-    {
-      role: "user",
-      content: compactPlanEvidencePacket(input),
-    },
-    {
-      role: "system",
-      content: [
-        "Perform an independent evidence audit; do not rely on or repair the first draft.",
-        "Use exactly one read-only action now to investigate the most consequential causal link that the current evidence does not make exact.",
-        "Compare every user-reported symptom with an exact trigger → function or contract → state transition → visible outcome chain.",
-        "Prioritize a missing source owner or a different source window; do not reread an unchanged observation.",
-        "You cannot submit during this bounded audit-discovery pass. The runtime will request one final corrected plan after the audit reads close.",
+        [
+          "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
+          "Before submitting, reconcile the retained evidence into a concrete causal chain and include only source owners that the evidence supports.",
+          "Use observable bounded validation. Do not put dev servers or manual instructions in finite command fields.",
+        ].join(" "),
       ].join(" "),
     },
   ];

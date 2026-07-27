@@ -39,8 +39,6 @@ import {
   writeReviewArtifact,
 } from "./planReviewProjection";
 import {
-  PLAN_AUDIT_ACTION_BUDGET,
-  PLAN_AUDIT_DISCOVERY_DEADLINE_MS,
   PLAN_DISCOVERY_ACTION_BUDGET,
   PLAN_DISCOVERY_DEADLINE_MS,
   PLAN_MODEL_COMPACTION_INTERVAL,
@@ -350,11 +348,8 @@ export async function runSubmitRuntimeV2Plan(
     } | null = null;
     let round = 0;
     let discoveryActionCount = 0;
-    let auditActionCount = 0;
-    let auditDeadlineAt = Number.POSITIVE_INFINITY;
     let stage: PlanModelStage = "discovery";
     let synthesisRecoveryCount = 0;
-    let auditSynthesisRecoveryCount = 0;
     const deadlineAt = startedAt + PLAN_MODEL_DEADLINE_MS;
     const discoveryDeadlineAt = startedAt + PLAN_DISCOVERY_DEADLINE_MS;
     planRounds:
@@ -402,25 +397,6 @@ export async function runSubmitRuntimeV2Plan(
           evidenceCount: evidence.length,
         });
       }
-      if (
-        stage === "audit_discovery" &&
-        (
-          auditActionCount >= PLAN_AUDIT_ACTION_BUDGET ||
-          Date.now() >= auditDeadlineAt
-        )
-      ) {
-        const boundary = auditActionCount >= PLAN_AUDIT_ACTION_BUDGET
-          ? "action_budget"
-          : "time_budget";
-        stage = "audit_synthesis";
-        input.logStoreEvent("runtime_v2_plan_audit_discovery_boundary", {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          boundary,
-          auditActionCount,
-          evidenceCount: evidence.length,
-        });
-      }
       if (round > 0 && round % PLAN_MODEL_COMPACTION_INTERVAL === 0) {
         await ledger.recordSoftSignal(identity.run, "iteration_limit");
         if (messages.length > 21) {
@@ -451,11 +427,8 @@ export async function runSubmitRuntimeV2Plan(
           stage,
           evidence,
           evidenceContents,
-          compactRecovery: stage === "synthesis"
-            ? synthesisRecoveryCount > 0
-            : stage === "audit_synthesis"
-            ? auditSynthesisRecoveryCount > 0
-            : false,
+          compactRecovery:
+            stage === "synthesis" && synthesisRecoveryCount > 0,
           logStoreEvent: input.logStoreEvent,
         });
       } catch (error) {
@@ -465,52 +438,40 @@ export async function runSubmitRuntimeV2Plan(
           isPlanSubmissionStage(stage) &&
           detail === "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT"
         ) {
-          const timedOutStage = stage === "audit_synthesis"
-            ? "audit_synthesis"
-            : "synthesis";
-          const recoveryCount = stage === "audit_synthesis"
-            ? auditSynthesisRecoveryCount
-            : synthesisRecoveryCount;
-          const canAttemptRecovery = recoveryCount < 1 &&
+          const canAttemptRecovery = synthesisRecoveryCount < 1 &&
             Date.now() + 5_000 < deadlineAt &&
             await ledger.recordRecovery({
               run: identity.run,
               scope: "transport",
-              fingerprint: `plan:${timedOutStage}:closed-request-timeout`,
-              reason: `计划 ${timedOutStage} 的限定串行恢复已耗尽。`,
+              fingerprint: "plan:synthesis:closed-request-timeout",
+              reason: "计划 synthesis 的限定串行恢复已耗尽。",
             });
           if (canAttemptRecovery) {
-            if (stage === "audit_synthesis") {
-              auditSynthesisRecoveryCount += 1;
-            } else {
-              synthesisRecoveryCount += 1;
-            }
-            input.logStoreEvent(`runtime_v2_plan_${timedOutStage}_timeout`, {
+            synthesisRecoveryCount += 1;
+            input.logStoreEvent("runtime_v2_plan_synthesis_timeout", {
               turnId: identity.turn.turnId,
               runId: identity.run.runId,
               round,
               evidenceCount: evidence.length,
-              stage: timedOutStage,
+              stage: "synthesis",
               recoveryAttempt: 1,
               action: "retry_after_closed_request_compact_context",
             });
             continue;
           }
-          input.logStoreEvent(`runtime_v2_plan_${timedOutStage}_timeout`, {
+          input.logStoreEvent("runtime_v2_plan_synthesis_timeout", {
             turnId: identity.turn.turnId,
             runId: identity.run.runId,
             round,
             evidenceCount: evidence.length,
-            stage: timedOutStage,
-            recoveryAttempt: recoveryCount,
+            stage: "synthesis",
+            recoveryAttempt: synthesisRecoveryCount,
             action: "terminal_after_bounded_retry",
           });
           terminalFailure = {
             resultKind: evidence.length > 0 ? "partial" : "error",
-            reason: stage === "audit_synthesis"
-              ? "计划证据审计及其一次串行恢复均达到限定时长；运行时已停止请求，现有证据和草案已保留。"
-              : "计划合成及其一次串行恢复均达到限定时长；运行时已停止请求，现有证据已保留。",
-            detailCode: `runtime_v2_plan_${timedOutStage}_timeout`,
+            reason: "计划合成及其一次串行恢复均达到限定时长；运行时已停止请求，现有证据已保留。",
+            detailCode: "runtime_v2_plan_synthesis_timeout",
           };
           break;
         }
@@ -553,9 +514,7 @@ export async function runSubmitRuntimeV2Plan(
         });
         messages.push({
           role: "system",
-          content: stage === "audit_discovery"
-            ? "No structured audit action was received. Use exactly one focused read-only tool."
-            : "No structured action was received. Use one focused read-only tool, or submit the complete WorkPlan now.",
+          content: "No structured action was received. Use one focused read-only tool, or submit the complete WorkPlan now.",
         });
         if (!canContinue) {
           terminalFailure = {
@@ -571,57 +530,9 @@ export async function runSubmitRuntimeV2Plan(
         discoveryActionCount += response.toolCalls.filter(
           (call) => call.name !== SUBMIT_WORK_PLAN_TOOL_NAME,
         ).length;
-      } else if (stage === "audit_discovery") {
-        auditActionCount += response.toolCalls.length;
       }
       const submitCalls = response.toolCalls.filter((call) => call.name === SUBMIT_WORK_PLAN_TOOL_NAME);
-      if (stage === "audit_discovery" && submitCalls.length > 0) {
-        for (const call of submitCalls) {
-          await settlePlanTool({
-            ledger,
-            run: identity.run,
-            call,
-            status: "blocked",
-          });
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: "WORK_PLAN_AUDIT_READ_REQUIRED: use one offered read-only tool before the final audit submission boundary.",
-          });
-        }
-        input.logStoreEvent("runtime_v2_plan_audit_early_submission_blocked", {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          round,
-          auditActionCount,
-          submitCallCount: submitCalls.length,
-        });
-        for (const call of response.toolCalls.filter(
-          (entry) => entry.name !== SUBMIT_WORK_PLAN_TOOL_NAME,
-        )) {
-          const canContinue = await executeReadOnlyPlanTool({
-            context: input.context,
-            ledger,
-            run: identity.run,
-            call,
-            messages,
-            evidence,
-            evidenceContents,
-            logStoreEvent: input.logStoreEvent,
-          });
-          if (!canContinue) {
-            terminalFailure = {
-              resultKind: evidence.length > 0 ? "partial" : "error",
-              reason: "计划审计中的同一只读动作连续失败；已保留证据并明确结束本轮。",
-              detailCode: "runtime_v2_plan_audit_read_recovery_exhausted",
-            };
-            break planRounds;
-          }
-        }
-        continue;
-      }
       if (
-        stage !== "audit_discovery" &&
         submitCalls.length === 1 &&
         response.toolCalls.length === 1
       ) {
@@ -680,39 +591,6 @@ export async function runSubmitRuntimeV2Plan(
             evidence,
             createdAt: Date.now(),
           });
-          if (stage === "discovery" || stage === "synthesis") {
-            await settlePlanTool({
-              ledger,
-              run: identity.run,
-              call,
-              status: "succeeded",
-            });
-            messages.push({
-              role: "tool",
-              tool_call_id: call.id,
-              content: [
-                "WORK_PLAN_DRAFT_ACCEPTED_FOR_AUDIT.",
-                "This draft is structurally valid but is not approval authority.",
-                "Audit every reported symptom against the retained evidence and submit one corrected final plan.",
-              ].join(" "),
-            });
-            stage = "audit_discovery";
-            auditActionCount = 0;
-            auditDeadlineAt = Math.min(
-              deadlineAt,
-              Date.now() + PLAN_AUDIT_DISCOVERY_DEADLINE_MS,
-            );
-            input.logStoreEvent("runtime_v2_plan_evidence_audit_started", {
-              turnId: identity.turn.turnId,
-              runId: identity.run.runId,
-              round,
-              evidenceCount: evidence.length,
-              stepCount: draft.steps.length,
-              validationCount: draft.validations.length,
-              auditActionBudget: PLAN_AUDIT_ACTION_BUDGET,
-            });
-            continue;
-          }
           sealedPlan = reviewedPlan;
           await settlePlanTool({
             ledger,

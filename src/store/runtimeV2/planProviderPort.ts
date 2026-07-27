@@ -9,7 +9,6 @@ import {
 } from "../../lib/runtime-v2";
 import { PlanLedger } from "./planLedger";
 import {
-  PLAN_AUDIT_TOOLS,
   PLAN_MODEL_REQUEST_TIMEOUT_MS,
   PLAN_MODEL_TOOLS,
   PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
@@ -17,7 +16,6 @@ import {
   PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS,
   SUBMIT_WORK_PLAN_TOOL,
   SUBMIT_WORK_PLAN_TOOL_NAME,
-  auditDiscoveryPlanTranscript,
   boundedPlanTranscript,
   isPlanProviderRequestTimeout,
   isPlanSubmissionStage,
@@ -48,8 +46,6 @@ export async function requestPlanModel(input: {
   const submissionStage = isPlanSubmissionStage(input.stage);
   const offeredTools = submissionStage
     ? [SUBMIT_WORK_PLAN_TOOL]
-    : input.stage === "audit_discovery"
-    ? PLAN_AUDIT_TOOLS
     : PLAN_MODEL_TOOLS;
   const toolChoice = submissionStage
     ? {
@@ -88,17 +84,8 @@ export async function requestPlanModel(input: {
   const requestMessages = input.stage === "synthesis"
     ? synthesisPlanTranscript({
         ...input,
-        audit: false,
         compactRecovery: !!input.compactRecovery,
       })
-    : input.stage === "audit_synthesis"
-    ? synthesisPlanTranscript({
-        ...input,
-        audit: true,
-        compactRecovery: !!input.compactRecovery,
-      })
-    : input.stage === "audit_discovery"
-    ? auditDiscoveryPlanTranscript(input)
     : boundedPlanTranscript(input.messages);
   try {
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {

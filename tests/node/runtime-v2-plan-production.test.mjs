@@ -434,7 +434,7 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
   assert.match(planRunner, /PLAN_MODEL_DEADLINE_MS/);
 });
 
-test("production Plan runner seals one plan, writes its exact projection and pauses for review", async () => {
+test("production Plan runner seals the first valid evidence-grounded plan and pauses for review", async () => {
   const draft = plan().draft;
   const reviewedDraft = {
     ...draft,
@@ -449,7 +449,7 @@ test("production Plan runner seals one plan, writes its exact projection and pau
   };
   let writtenPlan = null;
   let providerRound = 0;
-  let finalAuditRequest = null;
+  let acceptedSubmissionRequest = null;
   const result = await runProductionPlanScenario(
     async (messages, _settings, _callbacks, _signal, tools) => {
       providerRound += 1;
@@ -485,9 +485,7 @@ test("production Plan runner seals one plan, writes its exact projection and pau
           protocolViolation: null,
         };
       }
-      if (offeredNames.length === 1 && offeredNames[0] === "submit_runtime_v2_work_plan") {
-        finalAuditRequest = messages;
-      }
+      acceptedSubmissionRequest = messages;
       return {
         content: "",
         toolCalls: [{
@@ -519,7 +517,7 @@ test("production Plan runner seals one plan, writes its exact projection and pau
       throw new Error(`unexpected tool ${name}`);
     },
   );
-  assert.equal(providerRound, 7);
+  assert.equal(providerRound, 3);
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(
@@ -538,20 +536,11 @@ test("production Plan runner seals one plan, writes its exact projection and pau
     event.type === "projection.published" &&
     event.audience === "capsule_live"
   ));
-  const finalAuditText = finalAuditRequest
+  const acceptedSubmissionText = acceptedSubmissionRequest
     .map((message) => String(message.content || ""))
     .join("\n");
-  assert.match(finalAuditText, /mandatory evidence audit/);
-  assert.doesNotMatch(
-    finalAuditText,
-    /Correct the rejected WorkPlan structure/,
-    "an older rejected submission must not replace the current draft audit",
-  );
-  assert.doesNotMatch(
-    finalAuditText,
-    /统一文件打开路径并验证/,
-    "the final audit must reconstruct from evidence instead of anchoring on the first draft",
-  );
+  assert.match(acceptedSubmissionText, /WORK_PLAN_REJECTED/);
+  assert.doesNotMatch(acceptedSubmissionText, /mandatory evidence audit/);
 });
 
 test("Plan discovery has a bounded action window and then exposes only the minimal plan submission", async () => {
@@ -572,8 +561,6 @@ test("Plan discovery has a bounded action window and then exposes only the minim
   };
   let providerRound = 0;
   let synthesisRequest = null;
-  let finalAuditRequest = null;
-  let auditRequest = null;
   const result = await runProductionPlanScenario(
     async (messages, _settings, _callbacks, _signal, tools, _metadata, options) => {
       providerRound += 1;
@@ -598,26 +585,7 @@ test("Plan discovery has a bounded action window and then exposes only the minim
           protocolViolation: null,
         };
       }
-      const offeredNames = tools.map((definition) => definition.function.name);
-      if (offeredNames.length === 1 && offeredNames[0] === "read_file") {
-        auditRequest ||= { messages, tools, options };
-        return {
-          content: "",
-          toolCalls: [{
-            id: `audit-read-${providerRound}`,
-            name: "read_file",
-            arguments: JSON.stringify({
-              path: "src/main.js",
-              start_line: providerRound,
-              max_lines: 1,
-            }),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      }
       synthesisRequest ||= { messages, tools, options };
-      finalAuditRequest = { messages, tools, options };
       return {
         content: "",
         toolCalls: [{
@@ -661,17 +629,8 @@ test("Plan discovery has a bounded action window and then exposes only the minim
     },
   );
 
-  assert.equal(providerRound, 13);
+  assert.equal(providerRound, 9);
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
-  assert.deepEqual(
-    auditRequest.tools.map((definition) => definition.function.name),
-    ["read_file"],
-  );
-  assert.equal(auditRequest.options.toolChoice, "required");
-  assert.match(
-    auditRequest.messages.map((message) => String(message.content || "")).join("\n"),
-    /bounded audit-discovery pass/,
-  );
   assert.deepEqual(
     synthesisRequest.tools.map((definition) => definition.function.name),
     ["submit_runtime_v2_work_plan"],
@@ -692,14 +651,6 @@ test("Plan discovery has a bounded action window and then exposes only the minim
     synthesisRequest.messages.map((message) => String(message.content || "")).join("\n"),
     /read-only discovery window is closed/,
   );
-  assert.match(
-    finalAuditRequest.messages.map((message) => String(message.content || "")).join("\n"),
-    /mandatory evidence audit/,
-  );
-  assert.doesNotMatch(
-    finalAuditRequest.messages.map((message) => String(message.content || "")).join("\n"),
-    /根因位于文件打开状态的所有权/,
-  );
   assert.match(String(synthesisRequest.messages[0]?.content || ""), /MAIN RUNTIME V2 PLAN/);
   assert.equal(
     result.checkpoint.aggregate.evidence.filter((entry) =>
@@ -707,7 +658,7 @@ test("Plan discovery has a bounded action window and then exposes only the minim
     ).length,
     1,
   );
-  const synthesisText = finalAuditRequest.messages
+  const synthesisText = synthesisRequest.messages
     .map((message) => String(message.content || ""))
     .join("\n");
   assert.equal(
@@ -765,23 +716,6 @@ test("a closed synthesis request gets one compact sequential recovery without ov
             protocolViolation: null,
           };
         }
-        const offeredNames = tools.map((definition) => definition.function.name);
-        if (offeredNames.length === 1 && offeredNames[0] === "read_file") {
-          return {
-            content: "",
-            toolCalls: [{
-              id: `audit-read-after-recovery-${providerRound}`,
-              name: "read_file",
-              arguments: JSON.stringify({
-                path: "src/main.js",
-                start_line: providerRound,
-                max_lines: 1,
-              }),
-            }],
-            usage: {},
-            protocolViolation: null,
-          };
-        }
         synthesisRequests.push({ messages, maxTokens, options });
         if (providerRound === 9) {
           throw new Error(
@@ -814,15 +748,14 @@ test("a closed synthesis request gets one compact sequential recovery without ov
     },
   );
 
-  assert.equal(providerRound, 14);
+  assert.equal(providerRound, 10);
   assert.equal(maxActiveRequests, 1);
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(result.checkpoint.aggregate.scheduledCommands.length, 0);
-  assert.equal(synthesisRequests.length, 3);
+  assert.equal(synthesisRequests.length, 2);
   assert.equal(synthesisRequests[0].maxTokens, undefined);
   assert.equal(synthesisRequests[1].maxTokens, 4_096);
-  assert.equal(synthesisRequests[2].maxTokens, undefined);
   assert.ok(
     synthesisRequests[1].messages.reduce(
       (total, message) => total + String(message.content || "").length,

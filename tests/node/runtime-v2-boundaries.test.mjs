@@ -121,3 +121,34 @@ test("Runtime v2 Execute accepts only a durable conclude response as final provi
   assert.match(source, /=== "conclude"/);
   assert.doesNotMatch(source, /hasFinalProviderConclusion|latestVisibleText\s*\?\s*\{\s*finalMarkdown/);
 });
+
+test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
+  const adapterRoot = path.join(process.cwd(), "src/store/runtimeV2");
+  const runner = fs.readFileSync(path.join(adapterRoot, "planRunner.ts"), "utf8");
+  const protocol = fs.readFileSync(
+    path.join(adapterRoot, "planModelProtocol.ts"),
+    "utf8",
+  );
+  const provider = fs.readFileSync(
+    path.join(adapterRoot, "planProviderPort.ts"),
+    "utf8",
+  );
+  const source = `${runner}\n${protocol}\n${provider}`;
+
+  assert.ok(
+    runner.split("\n").length <= 850,
+    "planRunner must stay below the Runtime v2 Plan super-module boundary",
+  );
+  assert.doesNotMatch(
+    source,
+    /audit_discovery|audit_synthesis|mandatory evidence audit|PLAN_AUDIT_/i,
+  );
+  assert.doesNotMatch(
+    source,
+    /initial placeholder state|programmatic UI updates|serialized argument names/i,
+    "Plan orchestration must not encode one incident's likely diagnosis",
+  );
+  assert.match(protocol, /type PlanModelStage = "discovery" \| "synthesis"/);
+  assert.match(runner, /PLAN_DISCOVERY_ACTION_BUDGET/);
+  assert.match(runner, /runtime_v2_plan_synthesis_boundary/);
+});
