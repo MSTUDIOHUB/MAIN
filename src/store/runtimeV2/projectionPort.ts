@@ -80,6 +80,11 @@ function timelineProgressKey(aggregate: TurnAggregateV1, projection: RuntimeV2Pr
   return `runtime-v2-timeline:${aggregate.turn.turnId}:${projection.dedupeKey}`;
 }
 
+function isRuntimeOwnedPlanArtifactCommand(command: RuntimeV2Command | undefined): boolean {
+  return command?.kind === "execute_tool" &&
+    command.payload.runtimeOwnedPlanArtifact === true;
+}
+
 function timelineTitle(
   command: RuntimeV2Command,
   target: string,
@@ -323,8 +328,14 @@ export function createRuntimeV2ProjectionPort(
       const timestampMs = Date.now();
       const run = aggregate.run?.identity;
       if (!run) return;
+      let storeDisposition:
+        | "owner_mismatch"
+        | "projected"
+        | "deduped"
+        | "suppressed_internal" = "owner_mismatch";
       input.set((state: any) => {
         if (!ownsProjection(state, aggregate)) return {};
+        storeDisposition = "projected";
         let runtimeEvents = ensureRuntimeV2RunStartedEvent(
           state.runtimeEvents || [],
           aggregate,
@@ -379,11 +390,18 @@ export function createRuntimeV2ProjectionPort(
                 ? { ...turn, blockIds: [...turn.blockIds, block.id] }
                 : turn,
             );
+          } else {
+            storeDisposition = "deduped";
           }
         } else if (audience === "timeline") {
           const command = aggregate.scheduledCommands[0];
           const dedupeKey = timelineProgressKey(aggregate, projection);
-          if (
+          if (isRuntimeOwnedPlanArtifactCommand(command)) {
+            // The Plan artifact is runtime checkpoint storage, not a project
+            // implementation edit. Keep it in the ledger without presenting a
+            // misleading "modified .MAIN/plans/plan.md" user step.
+            storeDisposition = "suppressed_internal";
+          } else if (
             command &&
             !taskFlow.some((block: TaskBlock) =>
               block.type === "progress" &&
@@ -406,6 +424,8 @@ export function createRuntimeV2ProjectionPort(
                 ? { ...turn, blockIds: [...turn.blockIds, block.id] }
                 : turn,
             );
+          } else {
+            storeDisposition = "deduped";
           }
         } else if (audience === "final") {
           const visibleProjection = localizedRuntimeV2FinalProjection(
@@ -522,12 +542,19 @@ export function createRuntimeV2ProjectionPort(
 
         return { runtimeEvents, taskFlow, conversationTurns };
       });
-      input.logStoreEvent("runtime_v2_projection_published", {
-        audience: audience as RuntimeV2ProjectionAudience,
-        projectionId: projection.id,
-        turnId: run.turnId,
-        runId: run.runId,
-      });
+      const accepted = storeDisposition !== "owner_mismatch";
+      input.logStoreEvent(
+        accepted
+          ? "runtime_v2_projection_published"
+          : "runtime_v2_projection_skipped",
+        {
+          audience: audience as RuntimeV2ProjectionAudience,
+          projectionId: projection.id,
+          turnId: run.turnId,
+          runId: run.runId,
+          storeDisposition,
+        },
+      );
     },
   };
 }

@@ -2179,7 +2179,13 @@ function AgentContentBlock({
 
   return (
     <div
-      data-testid={block.visibility === "assistant_final" ? "assistant-final" : undefined}
+      data-testid={
+        block.visibility === "assistant_final"
+          ? "assistant-final"
+          : block.visibility === "assistant_update"
+            ? "assistant-update"
+            : undefined
+      }
       data-turn-id={block.turnId || undefined}
       className="mt-4 flex w-full min-w-0 items-start justify-start gap-3"
     >

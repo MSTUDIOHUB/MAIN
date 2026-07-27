@@ -503,6 +503,12 @@ test("typed Plan review Capsule preserves the exact request and artifact identit
   await expect(capsule).toHaveAttribute("data-artifact-hash", /.+/);
   await expect(page.getByTestId("plan-review-capsule-open")).toContainText("审阅计划");
   await expect(page.getByTestId("plan-review-capsule-approve")).toContainText("批准执行");
+  const milestone = page.locator(
+    '[data-testid="assistant-update"][data-turn-id="e2e-execution-capsule-panel-stability-turn"]',
+  );
+  await expect(milestone).toBeVisible();
+  await expect(milestone).toContainText("修复计划已准备好");
+  await expect(milestone).toContainText("根本原因");
   await expect
     .poll(async () => page.evaluate(() => {
       const event = [...((window as any).__CODELY_E2E__?.events || [])]

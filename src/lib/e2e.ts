@@ -5686,7 +5686,17 @@ function seedExecutionCapsulePanelStabilityScenario() {
     id: agentBlockId,
     turnId,
     type: "agent" as const,
-    content: "已根据你的需求生成计划，等待确认后开始执行。",
+    content: [
+      "### 修复计划已准备好",
+      "",
+      "**根本原因**：审批状态与右侧面板选择共享了旧的展示条件。",
+      "",
+      "- S1 · 更新 ExecutionCapsule 审批状态投影",
+      "- S2 · 验证批准后右侧面板保持稳定",
+      "",
+      "已绑定可信证据和有限验证；批准前不会修改项目。",
+    ].join("\n"),
+    visibility: "assistant_update" as const,
   };
   const reviewBlock: any = {
     id: reviewBlockId,

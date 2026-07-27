@@ -118,6 +118,7 @@ function projection(kind, markdown, dedupeKey, id = `${kind}-1`) {
 
 function createHarness(language = "zh") {
   let nextId = 1;
+  const logs = [];
   let state = {
     harnessRunMarker: {
       sessionKey: "session-a",
@@ -137,9 +138,11 @@ function createHarness(language = "zh") {
     },
     nextTaskId: () => ++nextId,
     language,
-    logStoreEvent() {},
+    logStoreEvent(event, data) {
+      logs.push({ event, data });
+    },
   });
-  return { port, getState: () => state };
+  return { port, getState: () => state, logs };
 }
 
 test("V2 timeline projects scheduled commands into visible process blocks and settles from receipts", async () => {
@@ -277,6 +280,67 @@ test("V2 Chat milestones remain durable assistant updates rather than timeline n
     ).length,
     0,
   );
+});
+
+test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", async () => {
+  const harness = createHarness();
+  const artifactWrite = command({
+    idempotencyKey: "run-a:planning:plan-artifact:attempt-1",
+    payload: {
+      toolName: "write_file",
+      target: ".MAIN/plans/plan.md",
+      runtimeOwnedPlanArtifact: true,
+    },
+  });
+  await harness.port.publish({
+    aggregate: aggregate({
+      phase: "planning",
+      run: { identity: runIdentity, status: "running", phase: "planning", terminalOutcome: null },
+      scheduledCommands: [artifactWrite],
+    }),
+    audience: "timeline",
+    projection: projection(
+      "timeline",
+      "正在写入 `.MAIN/plans/plan.md`。",
+      "turn-a:command:plan-artifact",
+    ),
+  });
+
+  assert.equal(
+    harness.getState().taskFlow.filter((block) =>
+      block.type === "progress" && block.toolCallId === artifactWrite.idempotencyKey
+    ).length,
+    0,
+  );
+  assert.equal(
+    harness.logs.at(-1)?.data?.storeDisposition,
+    "suppressed_internal",
+  );
+});
+
+test("V2 projection logs distinguish a stale Store owner from publication", async () => {
+  const harness = createHarness();
+  const staleAggregate = aggregate({
+    run: {
+      identity: { ...runIdentity, runId: "run-stale" },
+      status: "running",
+      phase: "acting",
+      terminalOutcome: null,
+    },
+  });
+  await harness.port.publish({
+    aggregate: staleAggregate,
+    audience: "chat_milestone",
+    projection: projection(
+      "milestone",
+      "### 不应进入当前会话",
+      "turn-a:stale",
+    ),
+  });
+
+  assert.equal(harness.getState().taskFlow.length, 1);
+  assert.equal(harness.logs.at(-1)?.event, "runtime_v2_projection_skipped");
+  assert.equal(harness.logs.at(-1)?.data?.storeDisposition, "owner_mismatch");
 });
 
 test("V2 canceled final projection preserves the canonical abort-complete-turn order", async () => {

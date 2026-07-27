@@ -188,6 +188,16 @@ export function shouldSuppressSupersededPlanCandidate(input: {
   ownsReviewableArtifact: boolean;
 }): boolean {
   if (!input.hasReviewableArtifact || !input.ownsReviewableArtifact) return false;
+  // Explicit assistant channels are semantic runtime projections. A plan
+  // milestone can legitimately summarize findings and ordered implementation
+  // steps, which makes it look like a draft to the legacy Markdown classifier.
+  // Never let that compatibility path override a committed public projection.
+  if (
+    input.block?.visibility === "assistant_update" ||
+    input.block?.visibility === "assistant_final"
+  ) {
+    return false;
+  }
   if (input.block?.archivedProposal) return false;
   return isPlanCandidateBlock(input.block) && !isReviewablePlanBlock(input.block);
 }

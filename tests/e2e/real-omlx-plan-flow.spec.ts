@@ -2272,8 +2272,14 @@ for (const model of models) {
     await expect(page.getByTestId("plan-review-panel")).toContainText(
       sealedWorkPlan.draft.objective,
     );
-    await expect(page.getByText("修复计划已准备好", { exact: true }).last())
-      .toBeVisible();
+    const planMilestoneHeading = String(reviewCommit.chat.markdown || "")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^#{1,6}\s+/, "").trim())
+      .find(Boolean) || sealedWorkPlan.draft.objective;
+    const visiblePlanMilestone = page.locator(
+      `[data-testid="assistant-update"][data-turn-id="${admittedPlanTurnId}"]`,
+    ).filter({ hasText: planMilestoneHeading }).last();
+    await expect(visiblePlanMilestone).toBeVisible();
     expect(reviewablePlanStages.has(String(planSnapshot?.planStage || ""))).toBe(true);
     const planChatText = (planRuntime.presentation?.chatMilestones || [])
       .map((milestone: { markdown?: string }) => String(milestone.markdown || ""))

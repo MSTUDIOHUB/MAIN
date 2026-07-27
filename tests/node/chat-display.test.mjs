@@ -89,6 +89,7 @@ const {
 
 const {
   hasGeneratedPlanContent,
+  isPlanCandidateBlock,
   isPlanGenerationFailureBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
@@ -126,6 +127,36 @@ test("canonical plan artifact suppresses the superseded raw proposal in ChatArea
     hasReviewableArtifact: true,
     ownsReviewableArtifact: true,
   }), false);
+});
+
+test("explicit assistant milestones are not hidden as superseded plan drafts", () => {
+  const milestone = {
+    id: 8,
+    type: "agent",
+    visibility: "assistant_update",
+    content: [
+      "### 修复计划已准备好",
+      "",
+      "**根本原因**：在 `src/main.js` 的 `createTab` 函数中，当创建新标签页时，代码不仅更新标签标题，还调用 `toolbar.setCurrentFile()` 更新工具栏路径。对于未保存文件，`file.path` 为空，但 `file.title` 仍是临时文档名，因此旧的计划草稿识别器也会把这段正式说明识别成计划候选。",
+      "",
+      "- S1 · 修复 createTab 中工具栏文件路径更新逻辑",
+      "- S2 · 修复 openFiles 后错误触发保存窗口的问题",
+      "",
+      "已绑定 8 条可信证据和 1 项验证；批准前不会修改项目。",
+    ].join("\n"),
+  };
+
+  assert.equal(isPlanCandidateBlock(milestone), true);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: milestone,
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), false);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: { ...milestone, visibility: undefined },
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), true);
 });
 
 const {
