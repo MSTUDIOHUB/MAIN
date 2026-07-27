@@ -16,6 +16,24 @@ function localModule(fromFile, specifier) {
   return null;
 }
 
+test("Runtime v2 production modules stay below the global super-module boundary", () => {
+  const productionRoots = [
+    coreRoot,
+    path.join(process.cwd(), "src/store/runtimeV2"),
+  ];
+  for (const root of productionRoots) {
+    for (const name of fs.readdirSync(root)) {
+      if (!name.endsWith(".ts")) continue;
+      const file = path.join(root, name);
+      const lineCount = fs.readFileSync(file, "utf8").split("\n").length;
+      assert.ok(
+        lineCount <= 800,
+        `${path.relative(process.cwd(), file)} has ${lineCount} lines and must be split before it becomes a Runtime v2 super-module`,
+      );
+    }
+  }
+});
+
 test("Runtime v2 core has no Store/UI/legacy imports and no local dependency cycle", () => {
   const files = fs.readdirSync(coreRoot)
     .filter((name) => name.endsWith(".ts"))

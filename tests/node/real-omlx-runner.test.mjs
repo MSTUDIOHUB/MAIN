@@ -11,6 +11,10 @@ const specSource = fs.readFileSync(
   path.join(process.cwd(), "tests/e2e/real-omlx-plan-flow.spec.ts"),
   "utf8",
 );
+const structuralAssertionsSource = fs.readFileSync(
+  path.join(process.cwd(), "tests/e2e/runtimeV2StructuralAssertions.ts"),
+  "utf8",
+);
 const e2eBridgeSource = fs.readFileSync(
   path.join(process.cwd(), "src/lib/e2e.ts"),
   "utf8",
@@ -68,5 +72,7 @@ test("real OMLX E2E identity and acceptance are model-neutral and debug-tail ind
   assert.match(e2eBridgeSource, /stableRealOmlxSessionId\(`\$\{workspace\}\\0\$\{model\}`\)/);
   assert.match(e2eBridgeSource, /__REAL_OMLX_ACCEPTANCE_STATE__/);
   assert.match(specSource, /recordRealOmlxAcceptanceDebugEvent/);
-  assert.match(specSource, /projectRealOmlxCollaborationScopes/);
+  assert.match(specSource, /expectRuntimeV2ReadOnlyCollaboration/);
+  assert.match(structuralAssertionsSource, /hasRequestOverlap: true/);
+  assert.match(structuralAssertionsSource, /peakInFlight/);
 });
