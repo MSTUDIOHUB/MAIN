@@ -418,11 +418,16 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     path.join(workspaceRoot, "src/store/runtimeV2/planRunner.ts"),
     "utf8",
   );
-  assert.doesNotMatch(planRunner, /\bPlanArtifact\b|planMaterialization|extractPlan|parsePlan/);
+  const planReviewProjection = fs.readFileSync(
+    path.join(workspaceRoot, "src/store/runtimeV2/planReviewProjection.ts"),
+    "utf8",
+  );
+  const planImplementation = `${planRunner}\n${planReviewProjection}`;
+  assert.doesNotMatch(planImplementation, /\bPlanArtifact\b|planMaterialization|extractPlan|parsePlan/);
   assert.match(planRunner, /createRuntimeV2PlanReviewCommit/);
-  assert.match(planRunner, /content: input\.plan\.markdown/);
+  assert.match(planReviewProjection, /content: input\.plan\.markdown/);
   assert.match(planRunner, /reviewCommit: commit/);
-  assert.match(planRunner, /markdown: input\.commit\.chat\.markdown/);
+  assert.match(planReviewProjection, /markdown: input\.commit\.chat\.markdown/);
   assert.doesNotMatch(planRunner, /plan:soft-round-limit|PLAN_MODEL_ROUND_LIMIT/);
   assert.match(planRunner, /runtime_v2_plan_soft_round_signal/);
   assert.match(planRunner, /terminal:\s*false/);
