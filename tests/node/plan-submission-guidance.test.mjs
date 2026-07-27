@@ -57,11 +57,12 @@ test("shared Plan recovery modules do not independently hard-code the envelope t
     );
   }
   assert.equal(fs.existsSync(path.join(workspaceRoot, "src/lib/orchestrator.ts")), false);
+  const legacyDirectory = path.join(workspaceRoot, "src/lib/orchestrator");
   assert.equal(
-    fs.readdirSync(path.join(workspaceRoot, "src/lib/orchestrator"), {
-      recursive: true,
-      withFileTypes: true,
-    }).some((entry) => entry.isFile()),
+    fs.existsSync(legacyDirectory) && fs.readdirSync(legacyDirectory, {
+        recursive: true,
+        withFileTypes: true,
+      }).some((entry) => entry.isFile()),
     false,
   );
 });

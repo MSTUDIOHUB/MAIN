@@ -23,11 +23,12 @@ test("shared agent contracts do not depend on the legacy orchestrator", () => {
 
 test("legacy orchestrator facades have been removed", () => {
   assert.equal(fs.existsSync(path.join(sourceRoot, "orchestrator.ts")), false);
+  const legacyDirectory = path.join(sourceRoot, "orchestrator");
   assert.equal(
-    fs.readdirSync(path.join(sourceRoot, "orchestrator"), {
-      recursive: true,
-      withFileTypes: true,
-    }).some((entry) => entry.isFile()),
+    fs.existsSync(legacyDirectory) && fs.readdirSync(legacyDirectory, {
+        recursive: true,
+        withFileTypes: true,
+      }).some((entry) => entry.isFile()),
     false,
   );
 });

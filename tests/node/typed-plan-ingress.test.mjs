@@ -1287,11 +1287,12 @@ test("production Plan prompts and materialization calls cannot regress to legacy
   assert.doesNotMatch(promptSource, /<proposed_plan>/i);
   assert.match(promptSource, /<plan_candidate>/i);
   assert.equal(fs.existsSync(path.join(workspaceRoot, "src/lib/orchestrator.ts")), false);
+  const legacyDirectory = path.join(workspaceRoot, "src/lib/orchestrator");
   assert.equal(
-    fs.readdirSync(path.join(workspaceRoot, "src/lib/orchestrator"), {
-      recursive: true,
-      withFileTypes: true,
-    }).some((entry) => entry.isFile()),
+    fs.existsSync(legacyDirectory) && fs.readdirSync(legacyDirectory, {
+        recursive: true,
+        withFileTypes: true,
+      }).some((entry) => entry.isFile()),
     false,
   );
 
