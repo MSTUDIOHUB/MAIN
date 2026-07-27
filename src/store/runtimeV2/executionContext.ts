@@ -1,10 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { deriveStreamSettings } from "../../lib/providerLaneSettings";
-import { getToolTarget } from "../../lib/toolTarget";
-import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import { streamChatCompletion } from "../../lib/streaming";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
-import { executeTool } from "../../lib/toolExecutor";
 import {
   buildToolCapabilityRegistry,
   getLocalFileReadPathForToolCall,
@@ -23,21 +19,17 @@ import {
 } from "../../lib/workspaceMutationTools";
 import {
   DEFAULT_PROVIDER_LANE_PROFILE_V1,
-  deriveRuntimeV2SubagentConcurrency,
   deriveRuntimeV2PlanSourceFreshness,
   normalizeRuntimeV2CheckpointMap,
   resolveRuntimeV2PlanMutationScope,
   resolveRuntimeV2PlanValidationScope,
   runtimeV2EvidenceVersion,
-  scheduleReadOnlySubagents,
   type ProviderLaneProfileV1,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
   type RuntimeV2EventDraft,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2SubagentJob,
-  type SchedulerPort,
-  type ToolPort,
 } from "../../lib/runtime-v2";
 import {
   isRuntimeV2WorkspaceReadToolName,
@@ -50,20 +42,7 @@ import type { RuntimeV2SubmissionContext } from "./submissionContext";
 
 export type StoreGet = () => any;
 
-const READ_ONLY_CHILD_TOOL_NAMES = new Set([
-  "list_directory",
-  "read_file",
-  "grep_search",
-  "get_file_outline",
-  "code_ast_query",
-  "find_symbol_references",
-]);
-
-const CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((definition) =>
-  READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name),
-);
-const RUNTIME_V2_CHILD_DEADLINE_MS = 90_000;
-const RUNTIME_V2_VALIDATION_TOOL_NAMES = new Set([
+export const RUNTIME_V2_VALIDATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
 ]);
@@ -146,11 +125,11 @@ interface RuntimeV2ToolAuthorizationResult {
   readonly shellPermissionApproval?: ShellPermissionApproval;
 }
 
-function stringValue(value: unknown, max = 24_000): string {
+export function stringValue(value: unknown, max = 24_000): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function boundedToolContent(value: unknown, max = 12_000): string {
+export function boundedToolContent(value: unknown, max = 12_000): string {
   const raw = typeof value === "string"
     ? value
     : JSON.stringify(value, null, 2);
@@ -232,7 +211,7 @@ export function createRuntimeV2ExecutionAuthorization(state: any): RuntimeV2Exec
   return { toolDefinitions, toolCatalog, capabilityRegistry, policy };
 }
 
-function authorizationFor(
+export function authorizationFor(
   input: RuntimeV2ExecutionPortsInput,
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
@@ -447,7 +426,7 @@ export function compactTextEnvelopeCatalog(tools: readonly ToolDefinition[]): st
   ].join("\n").slice(0, 12_000);
 }
 
-function validateToolAgainstPhaseAndPlan(input: {
+export function validateToolAgainstPhaseAndPlan(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly toolName: string;
@@ -568,7 +547,7 @@ function validateToolAgainstPhaseAndPlan(input: {
   return { allowed: true, reason: null, failureKind: null, reasonCode: null };
 }
 
-async function authorizeToolForCurrentTurn(
+export async function authorizeToolForCurrentTurn(
   input: RuntimeV2ExecutionPortsInput,
   name: string,
   args: Record<string, unknown>,
@@ -702,7 +681,7 @@ export function providerHistory(
   };
 }
 
-function childScopeAllows(job: RuntimeV2SubagentJob, args: Record<string, unknown>): boolean {
+export function childScopeAllows(job: RuntimeV2SubagentJob, args: Record<string, unknown>): boolean {
   const candidate = stringValue(args.path || args.file_path || args.cwd || "", 2_000)
     .replace(/^\.\//, "")
     .replace(/\\/g, "/");
@@ -710,7 +689,7 @@ function childScopeAllows(job: RuntimeV2SubagentJob, args: Record<string, unknow
   return job.allowedPaths.some((root) => candidate === root || candidate.startsWith(`${root.replace(/\/$/, "")}/`));
 }
 
-function deriveSubagentCandidates(overview: string, objective: string): Array<{ scopeKey: string; objective: string; allowedPaths: string[] }> {
+export function deriveSubagentCandidates(overview: string, objective: string): Array<{ scopeKey: string; objective: string; allowedPaths: string[] }> {
   const source = String(overview || "").replace(/\\/g, "/");
   const candidates: Array<{ scopeKey: string; objective: string; allowedPaths: string[] }> = [];
   const add = (scopeKey: string, allowedPath: string, description: string) => {
@@ -730,12 +709,12 @@ function deriveSubagentCandidates(overview: string, objective: string): Array<{ 
   return candidates.slice(0, 2);
 }
 
-function nextEvidenceId(live: RuntimeV2LiveExecutionState): string {
+export function nextEvidenceId(live: RuntimeV2LiveExecutionState): string {
   live.evidenceCounter += 1;
   return `E${live.evidenceCounter}`;
 }
 
-function recordToolModelContext(input: {
+export function recordToolModelContext(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly toolName: string;
@@ -753,7 +732,7 @@ function recordToolModelContext(input: {
   });
 }
 
-function toolDefinitionExists(input: RuntimeV2ExecutionPortsInput, name: string): boolean {
+export function toolDefinitionExists(input: RuntimeV2ExecutionPortsInput, name: string): boolean {
   const resolution = authorizationFor(input).toolCatalog.lookup(name);
   return resolution.status === "resolved" && resolution.entry.source === "built_in";
 }
@@ -815,7 +794,7 @@ function isValidationPassed(toolName: string, output: unknown): boolean {
   return false;
 }
 
-function toolCompletionFor(
+export function toolCompletionFor(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
   toolName: string,
@@ -851,605 +830,6 @@ function toolCompletionFor(
     : [], passed
       ? undefined
       : failureKind || (status === "succeeded" ? "assertion_failed" : "execution_failed"));
-}
-
-export function createRuntimeV2ToolPort(
-  input: RuntimeV2ExecutionPortsInput,
-): ToolPort {
-  return {
-    async execute({ command }) {
-      if (command.kind === "collect_observation") {
-        input.logStoreEvent("runtime_v2_tool_execution_started", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName: "get_project_skeleton",
-          target: input.context.runWorkspace || "workspace",
-        });
-        try {
-          const overview = boundedToolContent(await executeTool(
-            "get_project_skeleton",
-            {},
-            input.context.runWorkspace || "",
-            input.context.runSessionKey,
-            { toolCatalog: authorizationFor(input).toolCatalog },
-          ), 12_000);
-          input.live.workspaceOverview = overview;
-          input.live.subagentCandidates = deriveSubagentCandidates(
-            overview,
-            String(command.payload.objective || ""),
-          );
-          const evidenceId = nextEvidenceId(input.live);
-          recordModelContext(input.live, {
-            id: evidenceId,
-            source: "workspace",
-            label: "workspace_overview",
-            target: input.context.runWorkspace || "workspace",
-            status: "succeeded",
-            content: overview,
-          });
-          input.logStoreEvent("runtime_v2_tool_execution_completed", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            commandKind: command.kind,
-            toolName: "get_project_skeleton",
-            target: input.context.runWorkspace || "workspace",
-            status: "succeeded",
-            discoveredSubagentScopes: input.live.subagentCandidates.map((candidate) => candidate.scopeKey),
-          });
-          return {
-            type: "observation.recorded",
-            run: command.run,
-            evidence: {
-              id: evidenceId,
-              kind: "source",
-              target: input.context.runWorkspace || "workspace",
-              version: null,
-            },
-          };
-        } catch (error) {
-          input.logStoreEvent("runtime_v2_tool_execution_failed", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            commandKind: command.kind,
-            toolName: "get_project_skeleton",
-            target: input.context.runWorkspace || "workspace",
-            error: error instanceof Error ? error.message : String(error),
-          });
-          throw error;
-        }
-      }
-
-      if (command.kind !== "execute_tool" && command.kind !== "execute_validation") {
-        throw new Error(`Unsupported Runtime v2 tool command: ${command.kind}`);
-      }
-      const toolName = stringValue(command.payload.toolName, 256);
-      const args = command.payload.arguments && typeof command.payload.arguments === "object" && !Array.isArray(command.payload.arguments)
-        ? command.payload.arguments as Record<string, unknown>
-        : {};
-      const target = getToolTarget(toolName, args);
-      input.logStoreEvent("runtime_v2_tool_execution_started", {
-        turnId: command.run.turnId,
-        runId: command.run.runId,
-        commandKind: command.kind,
-        toolName,
-        target: target || null,
-      });
-      if (!toolDefinitionExists(input, toolName)) {
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "failed",
-          content: `UNKNOWN_TOOL: ${toolName}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_rejected", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: "unknown_tool",
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          null,
-          "failed",
-          "protocol_invalid",
-        );
-      }
-      if (command.kind === "execute_validation" && !RUNTIME_V2_VALIDATION_TOOL_NAMES.has(toolName)) {
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "failed",
-          content: `VALIDATION_TOOL_REJECTED: ${toolName}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_rejected", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: "validation_tool_required",
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          null,
-          "failed",
-          "protocol_invalid",
-        );
-      }
-      const phaseAndPlan = validateToolAgainstPhaseAndPlan({
-        ports: input,
-        command,
-        toolName,
-        args,
-        target,
-      });
-      if (!phaseAndPlan.allowed) {
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "blocked",
-          content: `TOOL_BLOCKED: ${phaseAndPlan.reason}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_blocked", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: phaseAndPlan.reasonCode,
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          null,
-          "blocked",
-          phaseAndPlan.failureKind || "not_authorized",
-        );
-      }
-      const authorization = await authorizeToolForCurrentTurn(input, toolName, args);
-      if (!authorization.allowed) {
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "blocked",
-          content: `TOOL_BLOCKED: ${authorization.reason || `${toolName} is not authorized for this Turn.`}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_blocked", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: authorization.reason || "authorization_required",
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          null,
-          "blocked",
-          "not_authorized",
-        );
-      }
-      try {
-        const rawOutput = await executeTool(
-          toolName,
-          args,
-          input.context.runWorkspace || "",
-          input.context.runSessionKey,
-          {
-            toolCatalog: authorizationFor(input).toolCatalog,
-            allowExternalLocalRead: authorization.allowExternalLocalRead,
-            ...(authorization.shellPermissionApproval
-              ? { shellPermissionApproval: authorization.shellPermissionApproval }
-              : {}),
-          },
-        );
-        const output = boundedToolContent(rawOutput);
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "succeeded",
-          content: output,
-        });
-        const completion = toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          rawOutput,
-          "succeeded",
-        );
-        input.logStoreEvent("runtime_v2_tool_execution_completed", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          status: completion.type === "validation.completed" && !completion.passed ? "failed" : "succeeded",
-          mutationCommitted: isWorkspaceMutationToolName(toolName),
-          validationPassed: completion.type === "validation.completed" ? completion.passed : null,
-        });
-        return completion;
-      } catch (error) {
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "failed",
-          content: `TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_failed", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          null,
-          "failed",
-          "execution_failed",
-        );
-      }
-    },
-  };
-}
-
-async function runReadOnlyChild(input: {
-  job: RuntimeV2SubagentJob;
-  ports: RuntimeV2ExecutionPortsInput;
-  signal: AbortSignal;
-}): Promise<RuntimeV2ChildResult> {
-  const telemetry = input.ports.live.childTelemetry.get(input.job.id);
-  const language = input.ports.context.phaseLanguage === "en" ? "English" : "简体中文";
-  const messages: AgentMessage[] = [
-    {
-      role: "system",
-      content: [
-        "You are a read-only child investigator in MAIN Runtime v2.",
-        `Scope key: ${input.job.scopeKey}`,
-        `Allowed paths: ${input.job.allowedPaths.join(", ")}`,
-        "Use only provided read/search tools. Never write files, run shell commands, ask for approval, or address the end user.",
-        `Return a concise evidence report in ${language}, with exact paths and uncertainty.`,
-      ].join("\n"),
-    },
-    { role: "user", content: input.job.objective },
-  ];
-  try {
-    let finalText = "";
-    const observedTargets: string[] = [];
-    for (let round = 0; round < 4; round += 1) {
-      const result = await streamChatCompletion(
-        messages,
-        deriveStreamSettings(input.ports.get().config),
-        {
-          onToken: () => {
-            if (telemetry && telemetry.firstTokenAt === null) telemetry.firstTokenAt = input.ports.now();
-          },
-          onDone: () => undefined,
-          onError: () => undefined,
-        },
-        input.signal,
-        CHILD_TOOL_DEFINITIONS,
-        undefined,
-        { toolChoice: "auto" },
-      );
-      finalText = sanitizeAssistantDisplayContent(result.content || "").trim();
-      messages.push({
-        role: "assistant",
-        content: result.content || "",
-        ...(result.toolCalls.length > 0
-          ? {
-              tool_calls: result.toolCalls.map((call) => ({
-                id: call.id,
-                type: "function" as const,
-                function: { name: call.name, arguments: call.arguments },
-              })),
-            }
-          : {}),
-      });
-      if (result.toolCalls.length === 0) break;
-      for (const call of result.toolCalls) {
-        let args: Record<string, unknown> = {};
-        try {
-          const parsed = JSON.parse(call.arguments);
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed;
-        } catch {
-          // The structured tool result below instructs the child to repair its
-          // own argument shape without widening its scope.
-        }
-        const allowed = READ_ONLY_CHILD_TOOL_NAMES.has(call.name) && childScopeAllows(input.job, args);
-        if (!allowed) {
-          messages.push({ role: "tool", tool_call_id: call.id, content: "CHILD_SCOPE_BLOCKED: use an allowed read-only path." });
-          continue;
-        }
-        try {
-          const target = getToolTarget(call.name, args);
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: boundedToolContent(await executeTool(
-              call.name,
-              args,
-              input.ports.context.runWorkspace || "",
-              input.ports.context.runSessionKey,
-              { toolCatalog: authorizationFor(input.ports).toolCatalog },
-            ), 8_000),
-          });
-          if (target) observedTargets.push(target);
-        } catch (error) {
-          messages.push({ role: "tool", tool_call_id: call.id, content: `CHILD_TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}` });
-        }
-      }
-      // A tool-containing final round is not a report. Give the child one
-      // bounded, tool-free chance to synthesize the evidence it just read.
-      if (round === 3) {
-        finalText = "子智能体达到只读调查轮次上限；已提交读取结果，未生成可确认摘要。";
-      }
-    }
-    if (telemetry) telemetry.closedAt = input.ports.now();
-    if (input.signal.aborted) {
-      return {
-        job: input.job,
-        status: "canceled",
-        summary: "子智能体已因父任务停止或超时而结束。",
-        evidenceTarget: observedTargets[0] || null,
-      };
-    }
-    return {
-      job: input.job,
-      status: "completed",
-      summary: finalText.slice(0, 4_000) || "子智能体未返回可展示摘要，但已结束只读调查。",
-      evidenceTarget: observedTargets[0] || null,
-    };
-  } catch (error) {
-    if (telemetry) telemetry.closedAt = input.ports.now();
-    return {
-      job: input.job,
-      status: input.signal.aborted ? "canceled" : "failed",
-      summary: input.signal.aborted
-        ? "子智能体已因父任务停止或超时而结束。"
-        : `只读调查失败：${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000),
-      evidenceTarget: null,
-    };
-  }
-}
-
-function startReadOnlyChild(
-  input: RuntimeV2ExecutionPortsInput,
-  job: RuntimeV2SubagentJob,
-  parentSignal: AbortSignal,
-): Promise<RuntimeV2ChildResult> {
-  const controller = new AbortController();
-  const abortFromParent = () => controller.abort(parentSignal.reason);
-  if (parentSignal.aborted) abortFromParent();
-  else parentSignal.addEventListener("abort", abortFromParent, { once: true });
-  input.live.childAbortControllers.set(job.id, controller);
-
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<RuntimeV2ChildResult>((resolve) => {
-    timeoutHandle = setTimeout(() => {
-      controller.abort(new Error("Runtime v2 child deadline exceeded."));
-      const telemetry = input.live.childTelemetry.get(job.id);
-      if (telemetry && telemetry.closedAt === null) telemetry.closedAt = input.now();
-      resolve({
-        job,
-        status: "failed",
-        summary: "子智能体超过 90 秒只读调查时限，已停止并保留此前可用结果。",
-        evidenceTarget: null,
-      });
-    }, RUNTIME_V2_CHILD_DEADLINE_MS);
-  });
-  const run = runReadOnlyChild({ job, ports: input, signal: controller.signal });
-  return Promise.race([run, timeout]).finally(() => {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    parentSignal.removeEventListener("abort", abortFromParent);
-    input.live.childAbortControllers.delete(job.id);
-  });
-}
-
-export function createRuntimeV2SchedulerPort(
-  input: RuntimeV2ExecutionPortsInput,
-): SchedulerPort {
-  return {
-    async prepareSchedule({ command }) {
-      if (command.kind !== "schedule_subagents") return null;
-      const decision = scheduleReadOnlySubagents({
-        parentRun: command.run,
-        candidates: input.live.subagentCandidates,
-        requestedAt: input.now(),
-        nextId: input.nextId,
-      });
-      if (decision.jobs.length !== 2) {
-        throw new Error("Runtime v2 requires two disjoint read-only child scopes before scheduling collaboration.");
-      }
-      return {
-        type: "subagents.scheduled",
-        run: command.run,
-        jobs: decision.jobs,
-      };
-    },
-    async execute({ command, signal, scheduledSubagents }) {
-      if (command.kind === "schedule_subagents") {
-        const jobs = (scheduledSubagents || []).filter((job) =>
-          job.status === "queued" || job.status === "running"
-        );
-        if (jobs.length !== 2) {
-          throw new Error("Runtime v2 scheduler can only start or resume the two child jobs already committed in its ledger.");
-        }
-        const events: RuntimeV2EventDraft[] = [];
-        input.logStoreEvent("runtime_v2_subagent_batch_starting", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          jobCount: jobs.length,
-          scopes: jobs.map((job) => job.scopeKey),
-          concurrent: jobs.length === 2,
-          resumed: jobs.some((job) => job.status === "running"),
-        });
-        for (const job of jobs) {
-          if (!input.live.childRuns.has(job.id)) {
-            input.live.childTelemetry.set(job.id, {
-              firstTokenAt: job.firstTokenAt,
-              closedAt: job.closedAt,
-            });
-            input.live.childRuns.set(job.id, startReadOnlyChild(input, job, signal));
-          }
-          if (job.status === "queued") {
-            input.logStoreEvent("runtime_v2_subagent_request_opened", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              jobId: job.id,
-              scopeKey: job.scopeKey,
-              allowedPaths: job.allowedPaths,
-            });
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: { jobId: job.id, phase: "request_opened", at: input.now() },
-            });
-          } else {
-            input.logStoreEvent("runtime_v2_subagent_request_resumed", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              jobId: job.id,
-              scopeKey: job.scopeKey,
-            });
-          }
-        }
-        return events;
-      }
-      if (command.kind === "join_subagents") {
-        const jobIds = Array.isArray(command.payload.jobIds)
-          ? command.payload.jobIds.map((value) => String(value || "")).filter(Boolean)
-          : [];
-        const results = await Promise.all(jobIds.map(async (jobId) => {
-          const promise = input.live.childRuns.get(jobId);
-          if (promise) return await promise;
-          const job = (scheduledSubagents || []).find((candidate) => candidate.id === jobId);
-          return job
-            ? {
-                job,
-                status: "failed" as const,
-                summary: "子智能体请求在进程重启后无法继续；已结束该只读子任务并保留父任务证据。",
-                evidenceTarget: null,
-              }
-            : null;
-        }));
-        const events: RuntimeV2EventDraft[] = [];
-        const observedJobs: RuntimeV2SubagentJob[] = [];
-        for (const result of results) {
-          if (!result) continue;
-          const committedJob = (scheduledSubagents || []).find((job) => job.id === result.job.id);
-          const telemetry = input.live.childTelemetry.get(result.job.id);
-          if (committedJob?.status === "queued") {
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: { jobId: result.job.id, phase: "request_opened", at: input.now() },
-            });
-          }
-          if (telemetry && telemetry.firstTokenAt !== null) {
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: { jobId: result.job.id, phase: "first_token", at: telemetry.firstTokenAt },
-            });
-          }
-          events.push({
-            type: "subagent.telemetry",
-            run: command.run,
-            telemetry: { jobId: result.job.id, phase: "closed", at: telemetry?.closedAt || input.now() },
-          });
-          events.push({
-            type: "subagent.completed",
-            run: command.run,
-            jobId: result.job.id,
-            status: result.status,
-            summary: result.summary,
-            evidence: result.status === "completed" && result.evidenceTarget
-              ? [{ id: nextEvidenceId(input.live), kind: "subagent", target: result.evidenceTarget, version: null }]
-              : [],
-          });
-          observedJobs.push({
-            ...result.job,
-            status: result.status,
-            firstTokenAt: telemetry?.firstTokenAt || null,
-            closedAt: telemetry?.closedAt || input.now(),
-            summary: result.summary,
-          });
-          // This enters only the parent model's evidence context. The UI
-          // projection remains a concise structured milestone, so a child's
-          // untrusted prose never becomes a duplicate ChatArea narration.
-          recordModelContext(input.live, {
-            id: `child:${result.job.id}`,
-            source: "subagent",
-            label: result.job.scopeKey,
-            target: result.evidenceTarget || result.job.allowedPaths.join(", "),
-            status: result.status === "completed" ? "succeeded" : "failed",
-            content: [
-              `Scope: ${result.job.scopeKey} (${result.job.allowedPaths.join(", ")})`,
-              `Status: ${result.status}`,
-              `Report: ${result.summary.slice(0, 4_000)}`,
-            ].join("\n"),
-          });
-          input.logStoreEvent("runtime_v2_subagent_joined", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            jobId: result.job.id,
-            status: result.status,
-            firstTokenAt: telemetry?.firstTokenAt || null,
-            closedAt: telemetry?.closedAt || null,
-            evidenceTarget: result.evidenceTarget,
-          });
-        }
-        const concurrency = deriveRuntimeV2SubagentConcurrency(observedJobs);
-        input.logStoreEvent("runtime_v2_subagent_batch_joined", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          jobCount: observedJobs.length,
-          peakInFlight: concurrency.peakInFlight,
-          hasRequestOverlap: concurrency.hasRequestOverlap,
-        });
-        return events;
-      }
-      throw new Error(`Unsupported Runtime v2 scheduler command: ${command.kind}`);
-    },
-  };
 }
 
 export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState {

@@ -55,10 +55,20 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
   const adapterFiles = [
     "executionContext.ts",
     "executionProviderPort.ts",
+    "executionSchedulerPort.ts",
+    "executionToolPort.ts",
   ];
-  const source = adapterFiles.map((name) =>
-    fs.readFileSync(path.join(adapterRoot, name), "utf8")
-  ).join("\n");
+  const adapterSources = adapterFiles.map((name) => ({
+    name,
+    source: fs.readFileSync(path.join(adapterRoot, name), "utf8"),
+  }));
+  const source = adapterSources.map((entry) => entry.source).join("\n");
+  for (const entry of adapterSources) {
+    assert.ok(
+      entry.source.split("\n").length <= 1_000,
+      `${entry.name} must stay below the Runtime v2 adapter super-module boundary`,
+    );
+  }
   assert.ok(
     entrySource.split("\n").length <= 24,
     "executionPorts must remain a small composition barrel instead of regaining runtime policy",
@@ -66,6 +76,8 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
   assert.doesNotMatch(entrySource, /\b(?:async\s+)?function\b|\bclass\b/);
   assert.match(entrySource, /from "\.\/executionProviderPort"/);
   assert.match(entrySource, /from "\.\/executionContext"/);
+  assert.match(entrySource, /from "\.\/executionSchedulerPort"/);
+  assert.match(entrySource, /from "\.\/executionToolPort"/);
   assert.equal(
     (source.match(/export function createRuntimeV2ProviderPort\b/g) || []).length,
     1,
