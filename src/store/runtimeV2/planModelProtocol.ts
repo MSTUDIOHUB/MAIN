@@ -350,20 +350,53 @@ export function auditDiscoveryPlanTranscript(input: {
   ];
 }
 
+export function safeJsonParse(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const stripped = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    try {
+      return JSON.parse(stripped);
+    } catch {
+      const firstBrace = stripped.indexOf("{");
+      const lastBrace = stripped.lastIndexOf("}");
+      const firstBracket = stripped.indexOf("[");
+      const lastBracket = stripped.lastIndexOf("]");
+
+      const isObject = firstBrace >= 0 && lastBrace > firstBrace && (firstBracket < 0 || firstBrace < firstBracket);
+      const isArray = firstBracket >= 0 && lastBracket > firstBracket && (firstBrace < 0 || firstBracket < firstBrace);
+
+      if (isObject) {
+        try {
+          return JSON.parse(stripped.slice(firstBrace, lastBrace + 1));
+        } catch {
+          return null;
+        }
+      }
+      if (isArray) {
+        try {
+          return JSON.parse(stripped.slice(firstBracket, lastBracket + 1));
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
+  }
+}
+
 export function decodeStructuredPlanArguments(
   value: unknown,
 ): Record<string, unknown> | null {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
   }
-  try {
-    const parsed = JSON.parse(String(value || ""));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
+  const parsed = safeJsonParse(String(value || ""));
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
 }
 
 export function isPlanProviderRequestTimeout(
@@ -395,7 +428,7 @@ function parseJsonArrayFields(
   if (typeof value !== "string") {
     throw new Error(`${field} must be a JSON array string.`);
   }
-  const parsed = JSON.parse(value);
+  const parsed = safeJsonParse(value);
   if (!Array.isArray(parsed)) throw new Error(`${field} must decode to an array.`);
   return parsed;
 }
@@ -411,7 +444,7 @@ function parseArrayFields(
     const value = record[directField];
     if (Array.isArray(value)) return value;
     if (typeof value === "string") {
-      const parsed = JSON.parse(value);
+      const parsed = safeJsonParse(value);
       if (Array.isArray(parsed)) return parsed;
     }
     throw new Error(`${directField} must be an array or JSON array string.`);
