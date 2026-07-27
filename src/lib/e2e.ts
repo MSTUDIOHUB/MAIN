@@ -4,10 +4,6 @@ import {
   sanitizeTaskBlocksForPersist,
   useAppStore,
 } from "../store/useAppStore";
-import {
-  ensureApprovedPlanRuntimeTasksForState,
-  evaluateApprovedPlanExecutionReadiness,
-} from "../store/submitApprovedPlanExecution";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   getPlanArtifactTitle,
@@ -8672,14 +8668,14 @@ function seedRealOmlxPlanFlowScenario() {
 
   bridge.approvePlan = () => {
     const before = useAppStore.getState();
-    const executionTasks = ensureApprovedPlanRuntimeTasksForState(
-      before,
-      before.config.language === "en" ? "en" : "zh",
-    );
-    const readiness = evaluateApprovedPlanExecutionReadiness({
-      planArtifacts: before.planArtifacts,
-      executionPlanTasks: executionTasks,
-    });
+    const checkpoint = before.currentTurnId
+      ? before.runtimeV2Checkpoints?.[before.currentTurnId] || null
+      : null;
+    const aggregate = checkpoint?.aggregate || null;
+    const review = aggregate?.planReviewCommit || null;
+    const request = before.activeActionRequest?.kind === "plan_review"
+      ? before.activeActionRequest
+      : null;
     before.approvePlan("批准执行");
     const after = useAppStore.getState();
     return {
@@ -8689,9 +8685,19 @@ function seedRealOmlxPlanFlowScenario() {
         agentStatus: before.agentStatus,
         isGenerating: before.isGenerating,
         actionRequestId: before.activeActionRequest?.requestId || null,
-        readiness,
-        executionTasks,
-        planContent: before.planArtifacts[0]?.content || "",
+        runtimeV2Authority: {
+          strategy: aggregate?.strategy || null,
+          phase: aggregate?.phase || null,
+          workPlanStatus: aggregate?.workPlan?.status || null,
+          workPlanId: aggregate?.sealedWorkPlan?.id || null,
+          revision: aggregate?.sealedWorkPlan?.revision || null,
+          digest: aggregate?.sealedWorkPlan?.digest || null,
+          projectionHash: aggregate?.sealedWorkPlan?.projectionHash || null,
+          reviewRequestId: review?.review?.requestId || null,
+          requestMatches: !!request &&
+            request.requestId === review?.review?.requestId &&
+            request.artifactHash === review?.authority?.projectionHash,
+        },
       },
       after: {
         turnId: after.currentTurnId,

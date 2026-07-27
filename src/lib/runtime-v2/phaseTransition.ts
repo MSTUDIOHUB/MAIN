@@ -61,7 +61,9 @@ function committedMutationKeys(
       )
       .filter((event) => {
         const name = toolName(event.command);
-        return !!name && isMutationToolName(name);
+        return event.command.payload.runtimeOwnedPlanArtifact !== true &&
+          !!name &&
+          isMutationToolName(name);
       })
       .map((event) => event.command.idempotencyKey),
   );

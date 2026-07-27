@@ -85,6 +85,15 @@ function isRuntimeOwnedPlanArtifactCommand(command: RuntimeV2Command | undefined
     command.payload.runtimeOwnedPlanArtifact === true;
 }
 
+function isInternalTimelineCommand(command: RuntimeV2Command | undefined): boolean {
+  return !command ||
+    command.kind === "request_model" ||
+    command.kind === "finalize_turn" ||
+    command.kind === "publish_projection" ||
+    command.payload.runtimeControlPlane === true ||
+    isRuntimeOwnedPlanArtifactCommand(command);
+}
+
 function timelineTitle(
   command: RuntimeV2Command,
   target: string,
@@ -396,10 +405,10 @@ export function createRuntimeV2ProjectionPort(
         } else if (audience === "timeline") {
           const command = aggregate.scheduledCommands[0];
           const dedupeKey = timelineProgressKey(aggregate, projection);
-          if (isRuntimeOwnedPlanArtifactCommand(command)) {
-            // The Plan artifact is runtime checkpoint storage, not a project
-            // implementation edit. Keep it in the ledger without presenting a
-            // misleading "modified .MAIN/plans/plan.md" user step.
+          if (isInternalTimelineCommand(command)) {
+            // Provider turns, control-plane submissions and runtime-owned
+            // artifacts remain auditable in the ledger. Timeline is reserved
+            // for concrete tools, validations and child work visible to users.
             storeDisposition = "suppressed_internal";
           } else if (
             command &&

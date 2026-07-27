@@ -35,6 +35,9 @@ export async function settlePlanTool(input: {
     toolCallId: input.call.id,
     toolName: input.call.name,
     arguments: input.call.arguments,
+    ...(input.call.name === "submit_runtime_v2_work_plan"
+      ? { runtimeControlPlane: true }
+      : {}),
   });
   await input.ledger.append({
     type: "tool.completed",

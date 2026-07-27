@@ -17,6 +17,22 @@ export interface RuntimeV2CompletionDecision {
   readonly resultReason: string;
 }
 
+export function exhaustedRuntimeV2ResultKind(
+  aggregate: TurnAggregateV1,
+): Extract<RuntimeV2ResultKind, "partial" | "error"> {
+  const mutationRequired = aggregate.strategy === "execute" ||
+    (
+      aggregate.strategy === "plan" &&
+      aggregate.workPlan?.status === "approved"
+    );
+  if (mutationRequired) {
+    return aggregate.evidence.some((evidence) => evidence.kind === "mutation")
+      ? "partial"
+      : "error";
+  }
+  return aggregate.evidence.length > 0 ? "partial" : "error";
+}
+
 /**
  * Determine only outcomes that the runtime can prove from structured facts.
  * In particular, an investigation summary without a tool call is not a
@@ -36,7 +52,7 @@ export function decideRuntimeV2TerminalOutcome(
   }
   if (aggregate.recovery.exhausted) {
     return {
-      resultKind: "partial",
+      resultKind: exhaustedRuntimeV2ResultKind(aggregate),
       resultReason: aggregate.recovery.exhausted.reason,
     };
   }

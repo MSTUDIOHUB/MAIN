@@ -318,6 +318,58 @@ test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", asy
   );
 });
 
+test("V2 keeps provider and plan control-plane commands out of the user timeline", async () => {
+  const harness = createHarness();
+  const internalCommands = [
+    command({
+      idempotencyKey: "run-a:planning:request-model:attempt-1",
+      kind: "request_model",
+      phase: "planning",
+      payload: { mode: "plan" },
+    }),
+    command({
+      idempotencyKey: "run-a:planning:submit-plan:attempt-1",
+      phase: "planning",
+      payload: {
+        toolName: "submit_runtime_v2_work_plan",
+        runtimeControlPlane: true,
+      },
+    }),
+  ];
+
+  for (const internalCommand of internalCommands) {
+    await harness.port.publish({
+      aggregate: aggregate({
+        phase: "planning",
+        run: {
+          identity: runIdentity,
+          status: "running",
+          phase: "planning",
+          terminalOutcome: null,
+        },
+        scheduledCommands: [internalCommand],
+      }),
+      audience: "timeline",
+      projection: projection(
+        "timeline",
+        "内部协议动作不应成为用户步骤。",
+        internalCommand.idempotencyKey,
+      ),
+    });
+  }
+
+  assert.equal(
+    harness.getState().taskFlow.filter((block) =>
+      block.type === "progress" &&
+      String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+    ).length,
+    0,
+  );
+  assert.ok(harness.logs.every((entry) =>
+    entry.data?.storeDisposition === "suppressed_internal"
+  ));
+});
+
 test("V2 projection logs distinguish a stale Store owner from publication", async () => {
   const harness = createHarness();
   const staleAggregate = aggregate({

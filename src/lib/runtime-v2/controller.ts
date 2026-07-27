@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { exhaustedRuntimeV2ResultKind } from "./completion";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command,
@@ -464,7 +465,7 @@ export class RuntimeV2Controller {
       reason: `无法继续执行当前结构化动作：${message.slice(0, 512)}`,
     }));
     await this.finishTerminal(
-      scope === "transport" ? "error" : "partial",
+      scope === "transport" ? "error" : exhaustedRuntimeV2ResultKind(state),
       scope === "transport"
         ? "provider_transport_exhausted"
         : "本轮已经达到可恢复重试上限；已保留已完成操作和证据，没有让任务停留在未结束状态。",

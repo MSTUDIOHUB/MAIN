@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { exhaustedRuntimeV2ResultKind } from "./completion";
 import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
@@ -95,7 +96,7 @@ function recoveryFinalization(
   state: TurnAggregateV1,
   fingerprint: string,
   reason: string,
-  resultKind: RuntimeV2ResultKind = "partial",
+  resultKind: RuntimeV2ResultKind = exhaustedRuntimeV2ResultKind(state),
   recoveryScope: RuntimeV2RecoveryScope = "action",
 ): RuntimeV2Command {
   return makeCommand(state, "finalize_turn", {

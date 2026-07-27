@@ -451,7 +451,7 @@ test("RuntimeV2Controller persists scheduled effects, publishes complete Capsule
   assert.equal(published.filter((item) => item.audience === "final").length, 1);
 });
 
-test("identical structural actions are bounded and close as partial instead of remaining active", async () => {
+test("identical structural actions without a real mutation close as error instead of claiming partial work", async () => {
   let now = 100;
   let id = 0;
   let revision = 0;
@@ -489,7 +489,7 @@ test("identical structural actions are bounded and close as partial instead of r
   await controller.driveOnce();
   const aggregate = controller.snapshot().aggregate;
   assert.equal(aggregate.phase, "completed");
-  assert.equal(aggregate.terminalOutcome.resultKind, "partial");
+  assert.equal(aggregate.terminalOutcome.resultKind, "error");
   assert.ok(aggregate.recovery.exhausted);
   assert.equal(aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
   assert.equal(published.filter((item) => item.audience === "final").length, 1);
@@ -1173,6 +1173,37 @@ test("Execute completion facts are reconstructed from durable mutation and valid
   assert.deepEqual(runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier), {
     mutationCount: 1,
     passedValidationCount: 1,
+    failedOperationCount: 0,
+  });
+});
+
+test("runtime-owned plan artifact writes are not counted as project mutations", () => {
+  const classifier = { isMutationToolName: (name) => name === "write_file" };
+  let state = executeAggregate("acting");
+  const artifact = commandFor(state, "execute_tool", "runtime-plan-artifact", {
+    toolName: "write_file",
+    target: ".MAIN/plans/plan.md",
+    runtimeOwnedPlanArtifact: true,
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: artifact,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: artifact.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "plan-artifact",
+      kind: "tool",
+      target: ".MAIN/plans/plan.md",
+      version: "projection-v1",
+    }],
+  }));
+
+  assert.deepEqual(runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier), {
+    mutationCount: 0,
+    passedValidationCount: 0,
     failedOperationCount: 0,
   });
 });

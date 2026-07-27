@@ -160,6 +160,27 @@ type FixtureMutationState = {
   detail: string;
 };
 
+function runtimeV2FailureDiagnostic(runtimeV2: any) {
+  const diagnosticDebug = (runtimeV2?.debug || []).filter((entry: any) =>
+    /(?:tool_execution_(?:failed|blocked|rejected)|recovery|phase_transition|plan_source_freshness|execute_terminal|provider_transport_failed)/i
+      .test(String(entry?.source || ""))
+  ).slice(-80);
+  return {
+    debug: diagnosticDebug,
+    strategy: runtimeV2?.strategy || null,
+    phase: runtimeV2?.phase || null,
+    terminalOutcome: runtimeV2?.terminalOutcome || null,
+    terminal: runtimeV2?.terminal || null,
+    workPlan: runtimeV2?.workPlan || null,
+    events: runtimeV2?.events || [],
+    evidence: runtimeV2?.evidence || [],
+    receipts: runtimeV2?.receipts || [],
+    commands: runtimeV2?.commands || [],
+    subagents: runtimeV2?.subagents || [],
+    subagentConcurrency: runtimeV2?.subagentConcurrency || null,
+  };
+}
+
 async function readFixtureMutationContents(workspace: string): Promise<Record<string, string>> {
   return Object.fromEntries(await Promise.all(realOmlxMutationOracleFiles.map(async (relativePath) => [
     relativePath,
@@ -2390,12 +2411,11 @@ for (const model of models) {
         const mutationState = await inspectFixtureMutation(workspace, originalMutationContents);
         if (mutationState.changedFiles.length > 0) return "mutated";
         if (snapshot?.runtimeV2?.terminal?.exactlyOnce === true) {
-          console.log(`[real-omlx-execute-safe-pause:${model}] ${JSON.stringify({
-            terminal: snapshot?.runtimeV2?.terminal,
-            commands: snapshot?.runtimeV2?.commands,
-            evidence: snapshot?.runtimeV2?.evidence,
-            debug: snapshot?.runtimeV2?.debug,
-          }).slice(-12_000)}`);
+          console.log(
+            `[real-omlx-execute-safe-pause:${model}] ${
+              JSON.stringify(runtimeV2FailureDiagnostic(snapshot?.runtimeV2))
+            }`,
+          );
           return "safe_pause";
         }
         return "running";
@@ -2476,12 +2496,11 @@ for (const model of models) {
       terminalExecutionSnapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
     ) as "success" | "partial" | "blocked" | "error" | "canceled";
     if (executionResultKind !== "success") {
-      console.log(`[real-omlx-execute-terminal:${model}] ${JSON.stringify({
-        terminal: terminalExecutionSnapshot?.runtimeV2?.terminal,
-        commands: terminalExecutionSnapshot?.runtimeV2?.commands,
-        evidence: terminalExecutionSnapshot?.runtimeV2?.evidence,
-        debug: terminalExecutionSnapshot?.runtimeV2?.debug,
-      }).slice(-40_000)}`);
+      console.log(
+        `[real-omlx-execute-terminal:${model}] ${
+          JSON.stringify(runtimeV2FailureDiagnostic(terminalExecutionSnapshot?.runtimeV2))
+        }`,
+      );
       expectCanonicalRuntimeV2Terminal(terminalExecutionSnapshot, {
         turnId: admittedPlanTurnId,
         resultKind: executionResultKind,
