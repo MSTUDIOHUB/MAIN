@@ -24,7 +24,6 @@ import { isAcceptanceCapableValidationSpec } from "../../src/lib/validationContr
 import {
   collectBoundedRealOmlxWorkspaceFiles,
   createRealOmlxAcceptanceState,
-  projectRealOmlxCollaborationScopes,
   readBoundedRealOmlxWorkspaceTextFile,
   readBoundedRealOmlxWorkspaceTextFiles,
   readRealOmlxWorkspaceFileWindow,
@@ -33,7 +32,6 @@ import {
   runRealOmlxWorkspaceCommand,
   selectBoundedRealOmlxSearchFiles,
   shouldPruneRealOmlxWorkspaceDirectory,
-  type RealOmlxAcceptanceState,
   type RealOmlxWorkspaceInventory,
 } from "./realOmlxWorkspaceProxy";
 import {
@@ -41,6 +39,7 @@ import {
   getMdViewerFinalSummaryGaps,
   getMdViewerWorkPlanGaps,
 } from "./realOmlxMdViewerPlanOracle";
+import { expectRuntimeV2ReadOnlyCollaboration } from "./runtimeV2StructuralAssertions";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -690,72 +689,6 @@ function expectRuntimeV2PlanReviewContract(
   );
   expect(visibleMilestones).toHaveLength(1);
   return runtime;
-}
-
-function inspectPreferredSubagentCollaboration(
-  snapshot: any,
-  expectedScopeKeys: string[] = realOmlxExpectedSubagentScopes,
-): {
-  ready: boolean;
-  detail: Record<string, unknown>;
-} {
-  const runs = (Array.isArray(snapshot?.subagentRuns) ? snapshot.subagentRuns : []) as Array<Record<string, unknown>>;
-  const acceptance = snapshot?.acceptanceState && typeof snapshot.acceptanceState === "object"
-    ? snapshot.acceptanceState as RealOmlxAcceptanceState
-    : createRealOmlxAcceptanceState();
-  const scopes = projectRealOmlxCollaborationScopes({
-    acceptance,
-    runs,
-    expectedScopeKeys,
-  }).map((scope) => {
-    const scopeRuns = runs.filter((run) => scope.subagentIds.includes(String(run.id || "")));
-    // A bounded partial handoff with substantive evidence is still real
-    // collaboration: the parent owns final source/validation correctness.
-    // Reject empty or unjoined children, but do not make a child exhausting its
-    // own analysis budget invalidate an otherwise completed parent repair.
-    const acceptedRun = scopeRuns.some((run) =>
-      (
-        (
-          String(run.status || "") === "completed" &&
-          String(run.closureState || "") === "satisfied"
-        ) ||
-        (
-          String(run.status || "") === "degraded" &&
-          String(run.closureState || "") === "partial"
-        )
-      ) &&
-      Number(run.substantiveEvidenceCount || 0) > 0 &&
-      Number.isFinite(run.startedAt) &&
-      Number.isFinite(run.completedAt) &&
-      Number(run.completedAt) >= Number(run.startedAt)
-    );
-    return { ...scope, acceptedRun };
-  });
-  const intakePreferred = acceptance.observedSubagentPreferences.includes("preferred");
-  const allExpectedScopesSatisfied = scopes.length > 0 && scopes.every((scope) =>
-    scope.spawned && scope.joined && scope.consumed && scope.acceptedRun
-  );
-  return {
-    ready:
-      snapshot?.preferSubagents === true &&
-      intakePreferred &&
-      allExpectedScopesSatisfied,
-    detail: {
-      preferSubagents: snapshot?.preferSubagents === true,
-      intakePreferred,
-      expectedScopeKeys,
-      scopes,
-      acceptance,
-    },
-  };
-}
-
-async function assertPreferredSubagentCollaboration(page: Page): Promise<void> {
-  await expect.poll(async () => {
-    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    const inspection = inspectPreferredSubagentCollaboration(snapshot);
-    return inspection.ready ? "joined" : JSON.stringify(inspection.detail);
-  }, { timeout: 120_000 }).toBe("joined");
 }
 
 function assertFirstPlanWorkspaceTurnAdmission(snapshot: any): string {
@@ -2103,7 +2036,7 @@ test.afterEach(async ({ page }, testInfo) => {
 });
 
 for (const model of models) {
-  test(`real OMLX MAIN plan/approve/execute reaches closure or bounded pause with ${model}`, async ({ page }) => {
+  test(`real OMLX MAIN plan/approve/execute reaches one structural terminal outcome with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     const originalMutationContents = await readFixtureMutationContents(workspace);
     const originalPlanOnlyWorkspaceFingerprint = realOmlxPlanOnly
@@ -2384,7 +2317,14 @@ for (const model of models) {
         runtime?.turnId === admittedPlanTurnId &&
         runtime?.workPlan?.status === "approved" &&
         runtime?.eventTypes?.includes("work_plan.approved") &&
-        ["acting", "completed"].includes(String(runtime?.phase || ""))
+        [
+          "preparing",
+          "observing",
+          "acting",
+          "validating",
+          "finalizing",
+          "completed",
+        ].includes(String(runtime?.phase || ""))
       )
         ? "execution_started"
         : `waiting:${runtime?.phase}:${runtime?.workPlan?.status}:${snapshot?.isGenerating}`;
@@ -2436,6 +2376,12 @@ for (const model of models) {
     }
 
     const mutationAfterEarlyOutcome = await inspectFixtureMutation(workspace, originalMutationContents);
+    if (realOmlxPreferSubagents) {
+      expectRuntimeV2ReadOnlyCollaboration(
+        earlyExecutionSnapshot?.runtimeV2,
+        realOmlxExpectedSubagentScopes,
+      );
+    }
     if (mutationAfterEarlyOutcome.changedFiles.length === 0) {
       expect(mutationAfterEarlyOutcome.contents).toEqual(originalMutationContents);
       const resultKind = String(
@@ -3010,59 +2956,7 @@ for (const model of models) {
     }
 
     const runtimeDebugText = JSON.stringify(runtimeV2.debug || []);
-    expect(runtimeV2.subagents).toHaveLength(2);
-    expect(runtimeV2.subagents.every((job: {
-      status?: string;
-      requestOpenedAt?: number;
-      firstTokenAt?: number | null;
-      closedAt?: number;
-    }) =>
-      job.status === "completed" &&
-      Number.isFinite(job.requestOpenedAt) &&
-      Number.isFinite(job.closedAt) &&
-      Number(job.requestOpenedAt) <= Number(job.closedAt) &&
-      (
-        job.firstTokenAt == null ||
-        (
-          Number.isFinite(job.firstTokenAt) &&
-          Number(job.requestOpenedAt) <= Number(job.firstTokenAt) &&
-          Number(job.firstTokenAt) <= Number(job.closedAt)
-        )
-      )
-    )).toBe(true);
-    expect(runtimeV2.subagentConcurrency).toMatchObject({
-      requestCount: 2,
-      hasRequestOverlap: true,
-    });
-    expect(runtimeV2.subagentConcurrency.peakInFlight).toBeGreaterThanOrEqual(2);
-    expect(Math.max(
-      ...runtimeV2.subagents.map((job: { requestOpenedAt: number }) =>
-        Number(job.requestOpenedAt)
-      ),
-    )).toBeLessThan(Math.min(
-      ...runtimeV2.subagents.map((job: { closedAt: number }) => Number(job.closedAt)),
-    ));
-    const joinedBatchDebug = (runtimeV2.debug || []).filter(
-      (entry: { source?: string }) =>
-        entry.source === "store.runtime_v2_subagent_batch_joined",
-    );
-    expect(joinedBatchDebug).toHaveLength(1);
-    expect(joinedBatchDebug[0]?.data).toMatchObject({
-      jobCount: 2,
-      peakInFlight: expect.any(Number),
-      hasRequestOverlap: true,
-    });
-
-    const parallelInvestigationMilestones = (
-      runtimeV2.presentation?.chatMilestones || []
-    ).filter((milestone: { markdown?: string }) =>
-      /### 已启动并行只读调查/.test(String(milestone.markdown || ""))
-    );
-    expect(parallelInvestigationMilestones).toHaveLength(1);
-    for (const job of runtimeV2.subagents as Array<{ scopeKey?: string }>) {
-      expect(parallelInvestigationMilestones[0]?.markdown)
-        .toContain(String(job.scopeKey || ""));
-    }
+    expectRuntimeV2ReadOnlyCollaboration(runtimeV2);
     await expect(page.getByText("已启动并行只读调查", { exact: false }).first()).toBeVisible();
     expect(runtimeV2.presentation?.timeline?.length || 0).toBeGreaterThan(0);
     expect((runtimeV2.presentation?.timeline || []).every(
