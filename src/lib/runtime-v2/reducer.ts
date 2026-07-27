@@ -564,8 +564,12 @@ export function tryTransition(
       return {
         disposition: "applied",
         state: append(state, event, {
-          phase: "acting",
-          run: { ...run, phase: "acting", status: "running" },
+          // Approval grants effect authority; it does not prove that the
+          // execution process has prepared current workspace context. Resume
+          // through the ordinary preparing/observing path so collaboration,
+          // source freshness and mutation gating remain available.
+          phase: "preparing",
+          run: { ...run, phase: "preparing", status: "running" },
           workPlan: { ...event.workPlan, status: "approved" },
         }),
       };

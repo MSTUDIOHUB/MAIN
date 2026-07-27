@@ -64,6 +64,7 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
     "executionText.ts",
     "executionToolPort.ts",
     "executionTypes.ts",
+    "providerToolSurface.ts",
   ];
   const adapterSources = adapterFiles.map((name) => ({
     name,

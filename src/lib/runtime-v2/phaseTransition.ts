@@ -31,6 +31,36 @@ export interface RuntimeV2ExecutePhaseTransitionInput {
 
 const TERMINAL_CHILD_STATUSES = new Set(["completed", "failed", "canceled"]);
 
+export function hasCompletedRuntimeV2InitialObservation(
+  state: TurnAggregateV1,
+): boolean {
+  let boundaryIndex = -1;
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (
+      event.type === "work_plan.approved" ||
+      event.type === "run.started"
+    ) {
+      boundaryIndex = index;
+      break;
+    }
+  }
+  const scheduled = new Set(
+    state.events
+      .slice(boundaryIndex + 1)
+      .filter((event): event is Extract<RuntimeV2Event, { type: "command.scheduled" }> =>
+        event.type === "command.scheduled" &&
+        event.command.kind === "collect_observation"
+      )
+      .map((event) => event.command.idempotencyKey),
+  );
+  return state.events.slice(boundaryIndex + 1).some((event) =>
+    event.type === "command.completed" &&
+    event.status === "succeeded" &&
+    scheduled.has(event.idempotencyKey)
+  );
+}
+
 function currentPhaseEvents(state: TurnAggregateV1): readonly RuntimeV2Event[] {
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
     const event = state.events[index]!;

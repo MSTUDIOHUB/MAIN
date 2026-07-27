@@ -811,6 +811,41 @@ test("Execute phase policy advances completed observation into acting without re
   });
 });
 
+test("initial observation completion is scoped to the current execution boundary", () => {
+  let state = executeAggregate("preparing");
+  const collect = commandFor(
+    state,
+    "collect_observation",
+    "collect-current-overview",
+    { objective: "Inspect the workspace" },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: collect,
+  }));
+  state = runtime.transition(state, event(state, "command.completed", {
+    run: baseRun,
+    idempotencyKey: collect.idempotencyKey,
+    status: "succeeded",
+  }));
+  assert.equal(runtime.hasCompletedRuntimeV2InitialObservation(state), true);
+
+  const approvalBoundary = {
+    ...event(state, "work_plan.approved", { run: baseRun }),
+    sequence: state.nextSequence,
+  };
+  const approvedState = {
+    ...state,
+    events: [...state.events, approvalBoundary],
+    nextSequence: state.nextSequence + 1,
+    updatedAt: approvalBoundary.at,
+  };
+  assert.equal(
+    runtime.hasCompletedRuntimeV2InitialObservation(approvedState),
+    false,
+  );
+});
+
 test("Execute phase policy waits for every scheduled read-only child but accepts terminal child failures", () => {
   let state = executeAggregate("observing");
   state = runtime.transition(state, event(state, "observation.recorded", {

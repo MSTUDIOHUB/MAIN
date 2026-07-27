@@ -1084,7 +1084,7 @@ test("approval appends to the same v2 checkpoint only for the exact owner, reque
   });
   assert.equal(result.ok, true);
   assert.equal(appendCount, 1);
-  assert.equal(result.checkpoint.aggregate.phase, "acting");
+  assert.equal(result.checkpoint.aggregate.phase, "preparing");
   assert.equal(result.checkpoint.aggregate.workPlan.status, "approved");
   const approved = adapter.resolveApprovedRuntimeV2WorkPlanFromAggregate(
     result.checkpoint.aggregate,
@@ -1201,7 +1201,7 @@ test("approval is exactly once under competing callbacks and only one callback m
     1,
   );
   assert.equal(committedCount, 1);
-  assert.equal(current.aggregate.phase, "acting");
+  assert.equal(current.aggregate.phase, "preparing");
 });
 
 test("approved execution authority rejects owner, reference and projection tampering", async () => {

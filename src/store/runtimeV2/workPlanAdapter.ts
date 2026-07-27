@@ -375,7 +375,9 @@ export function resolveApprovedRuntimeV2WorkPlanFromAggregate(
   const commit = aggregate?.planReviewCommit;
   const run = aggregate?.run?.identity;
   const workPlan = aggregate?.workPlan;
-  const executionPhase = aggregate?.phase === "acting" ||
+  const executionPhase = aggregate?.phase === "preparing" ||
+    aggregate?.phase === "observing" ||
+    aggregate?.phase === "acting" ||
     aggregate?.phase === "validating" ||
     aggregate?.phase === "finalizing";
   if (

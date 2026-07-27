@@ -9,6 +9,7 @@ import {
   decideRuntimeV2ExecutePhaseTransition,
   decideRuntimeV2TerminalOutcome,
   deriveRuntimeV2PlanSourceFreshness,
+  hasCompletedRuntimeV2InitialObservation,
   summarizeRuntimeV2ExecuteEvidence,
   type RuntimeV2ExecutePhaseTransition,
   type RuntimeV2ResultKind,
@@ -381,7 +382,10 @@ export async function runSubmitRuntimeV2Execute(
         );
         continue;
       }
-      if (before.phase === "preparing" && before.evidence.length > 0) {
+      if (
+        before.phase === "preparing" &&
+        hasCompletedRuntimeV2InitialObservation(before)
+      ) {
         input.logStoreEvent("runtime_v2_phase_transition", {
           turnId: identity.turn.turnId,
           runId: identity.run.runId,

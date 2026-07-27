@@ -22,6 +22,7 @@ import {
   type RuntimeV2ExecutionPortsInput,
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
+import { unexpectedRuntimeV2ProviderToolNames } from "./providerToolSurface";
 
 function providerModeInstruction(command: RuntimeV2Command): string {
   const mode = String(command.payload.mode || "").trim();
@@ -86,7 +87,9 @@ async function requestProviderOnce(input: {
       ]),
     ),
     approximateMessageChars: history.chars,
-    offeredToolCount: input.textEnvelope ? 0 : input.tools.length,
+    allowedToolCount: input.tools.length,
+    nativeToolCount: input.textEnvelope ? 0 : input.tools.length,
+    allowedToolNames: input.tools.map((tool) => tool.function.name),
   });
   const result = await streamChatCompletion(
     messages,
@@ -147,7 +150,9 @@ export function createRuntimeV2ProviderPort(
             transport: attempt.variant,
             textEnvelope: attempt.textEnvelope,
             toolExpectation: requiresTool ? "required" : "optional",
-            offeredToolCount: attempt.textEnvelope ? 0 : tools.length,
+            allowedToolCount: tools.length,
+            nativeToolCount: attempt.textEnvelope ? 0 : tools.length,
+            allowedToolNames: tools.map((tool) => tool.function.name),
           });
           const result = await requestProviderOnce({
             live: input.live,
@@ -160,6 +165,23 @@ export function createRuntimeV2ProviderPort(
           });
           if (requiresTool && result.toolCalls.length === 0) {
             throw new Error("Provider returned no structured tool call for a tool-required runtime command.");
+          }
+          const unexpectedToolNames = unexpectedRuntimeV2ProviderToolNames(
+            tools,
+            result.toolCalls,
+          );
+          if (unexpectedToolNames.length > 0) {
+            input.logStoreEvent("runtime_v2_provider_tool_surface_rejected", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              phase: command.phase,
+              transport: attempt.variant,
+              unexpectedToolNames,
+              allowedToolNames: tools.map((tool) => tool.function.name),
+            });
+            throw new Error(
+              `Provider requested tools outside the current Runtime v2 phase surface: ${unexpectedToolNames.join(", ")}`,
+            );
           }
           input.live.latestProviderResult = result;
           // A tool envelope (or a native response that bundles an action with
@@ -185,6 +207,7 @@ export function createRuntimeV2ProviderPort(
             runId: command.run.runId,
             transport: attempt.variant,
             toolCalls: result.toolCalls.length,
+            toolNames: result.toolCalls.map((call) => call.name),
             visibleChars: input.live.latestVisibleText.length,
             diagnosticCodes: result.diagnostics.map((diagnostic) => diagnostic.code).slice(0, 8),
           });
