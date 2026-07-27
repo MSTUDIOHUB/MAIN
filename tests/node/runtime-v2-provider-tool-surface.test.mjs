@@ -42,3 +42,32 @@ test("provider results cannot widen the current Runtime v2 phase tool surface", 
     ["read_file"],
   );
 });
+
+test("Execute keeps safe reads available beside mutations after source freshness", () => {
+  const available = [
+    definition("read_file"),
+    definition("grep_search"),
+    definition("apply_patch"),
+    definition("run_command"),
+  ];
+  const sourceToolNames = new Set(["read_file", "grep_search"]);
+  const isMutationToolName = (name) => name === "apply_patch";
+  assert.deepEqual(
+    surface.selectRuntimeV2ExecuteToolDefinitions({
+      available,
+      sourceToolNames,
+      isMutationToolName,
+      requiresFreshSourceReads: true,
+    }).map((item) => item.function.name),
+    ["read_file", "grep_search"],
+  );
+  assert.deepEqual(
+    surface.selectRuntimeV2ExecuteToolDefinitions({
+      available,
+      sourceToolNames,
+      isMutationToolName,
+      requiresFreshSourceReads: false,
+    }).map((item) => item.function.name),
+    ["read_file", "grep_search", "apply_patch"],
+  );
+});

@@ -34,6 +34,7 @@ import {
   aggregateForCurrentTurn,
   approvedPlanForCurrentTurn,
 } from "./executionAggregate";
+import { selectRuntimeV2ExecuteToolDefinitions } from "./providerToolSurface";
 import type {
   RuntimeV2ExecutionAuthorization,
   RuntimeV2ExecutionPortsInput,
@@ -110,47 +111,6 @@ export function authorizationFor(
   return input.live.authorization;
 }
 
-function currentPhaseSuccessfulToolNames(
-  input: RuntimeV2ExecutionPortsInput,
-): readonly string[] {
-  const aggregate = aggregateForCurrentTurn(input);
-  if (!aggregate) return [];
-  let phaseStart = -1;
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index]!;
-    if (
-      (event.type === "phase.changed" && event.phase === aggregate.phase) ||
-      (event.type === "run.started" && event.phase === aggregate.phase)
-    ) {
-      phaseStart = index;
-      break;
-    }
-  }
-  const scheduledNames = new Map<string, string>();
-  for (const event of aggregate.events.slice(phaseStart + 1)) {
-    if (
-      event.type === "command.scheduled" &&
-      (event.command.kind === "execute_tool" ||
-        event.command.kind === "execute_validation")
-    ) {
-      const name = event.command.payload.toolName;
-      if (typeof name === "string" && name.trim()) {
-        scheduledNames.set(event.command.idempotencyKey, name.trim());
-      }
-    }
-  }
-  return aggregate.events.slice(phaseStart + 1)
-    .filter((event) =>
-      event.type === "tool.completed" && event.status === "succeeded"
-    )
-    .map((event) =>
-      event.type === "tool.completed"
-        ? scheduledNames.get(event.idempotencyKey) || ""
-        : ""
-    )
-    .filter(Boolean);
-}
-
 export function providerToolDefinitionsForCommand(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
@@ -177,9 +137,6 @@ export function providerToolDefinitionsForCommand(
       allowed.has(definition.function.name)
     );
   }
-  const mutationOrRead = (definition: ToolDefinition) =>
-    isWorkspaceMutationToolName(definition.function.name) ||
-    RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name);
   if (mode === "execute") {
     const aggregate = aggregateForCurrentTurn(input);
     const approvedPlanNeedsFreshReads =
@@ -187,18 +144,18 @@ export function providerToolDefinitionsForCommand(
       aggregate.workPlan?.status === "approved" &&
       !aggregate.evidence.some((evidence) => evidence.kind === "mutation") &&
       deriveRuntimeV2PlanSourceFreshness(aggregate)?.allFresh === false;
-    if (approvedPlanNeedsFreshReads) {
-      return available.filter((definition) =>
-        RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name)
-      );
-    }
-    const focusedReadAlreadyUsed = currentPhaseSuccessfulToolNames(input)
-      .some((name) => RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name));
-    return available.filter((definition) =>
-      focusedReadAlreadyUsed
-        ? isWorkspaceMutationToolName(definition.function.name)
-        : mutationOrRead(definition)
-    );
+    // Keep one capability-based Execute surface for the rest of the phase.
+    // Dynamically withdrawing safe reads after the first successful call
+    // turns a recoverable extra observation into a provider transport error.
+    // Duplicate action fingerprints remain bounded by the Runtime core, while
+    // plan freshness, mutation scope and validation authority stay enforced
+    // independently below this presentation surface.
+    return selectRuntimeV2ExecuteToolDefinitions({
+      available,
+      sourceToolNames: RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
+      isMutationToolName: isWorkspaceMutationToolName,
+      requiresFreshSourceReads: approvedPlanNeedsFreshReads,
+    });
   }
   if (mode === "observe") {
     const childEvidencePending = command.payload.childEvidencePending === true;
@@ -211,7 +168,10 @@ export function providerToolDefinitionsForCommand(
       )
     );
   }
-  return available.filter(mutationOrRead);
+  return available.filter((definition) =>
+    isWorkspaceMutationToolName(definition.function.name) ||
+    RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name)
+  );
 }
 
 export function compactTextEnvelopeCatalog(
