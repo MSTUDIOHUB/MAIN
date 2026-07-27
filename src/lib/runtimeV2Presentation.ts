@@ -51,17 +51,14 @@ function actionLine(progress: MainThreadProgressUpdate, language: "zh" | "en"): 
   return action || title || (language === "zh" ? "正在推进当前任务。" : "Advancing the current task.");
 }
 
-function detailLine(progress: MainThreadProgressUpdate): string {
-  const summary = normalize(progress.summary);
-  if (!summary) return "";
-  return summary;
-}
-
 /**
  * Compatibility projector for existing MainThread progress events. It is
  * intentionally structural: no model text is parsed to decide lifecycle or
- * activity. The selected action is the currently-running event for the exact
- * Turn/Run and all returned text remains intact for Markdown rendering.
+ * activity. An explicit public action is already the complete Capsule
+ * projection and remains intact for Markdown rendering. Older events without
+ * one receive a single sentence derived from their structured tool and target;
+ * their summary remains owned by Run Status/Timeline instead of being
+ * duplicated in Capsule.
  */
 export function buildRuntimeV2CompatibleCapsuleProjection(input: {
   readonly events: readonly MainThreadEvent[];
@@ -81,10 +78,10 @@ export function buildRuntimeV2CompatibleCapsuleProjection(input: {
     .sort((left, right) => left.timestampMs - right.timestampMs)
     .pop();
   if (!active) return null;
-  const action = actionLine(active.progress, input.language);
-  const detail = detailLine(active.progress);
+  const action = normalize(active.progress.action) ||
+    actionLine(active.progress, input.language);
   return {
-    markdown: detail && detail !== action ? `${action}\n\n${detail}` : action,
+    markdown: action,
     source: "structured_runtime",
     updatedAt: active.timestampMs,
     dedupeKey: progressKey(active),

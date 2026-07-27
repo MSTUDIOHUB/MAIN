@@ -4965,6 +4965,8 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
           title: "正在执行已批准计划",
           status: "running",
           summary: "apply_patch · src/task-9.ts",
+          tool: "apply_patch",
+          canonicalTarget: "src/task-9.ts",
           dedupeKey: `plan-execution-progress:${childRunId}`,
         },
       },

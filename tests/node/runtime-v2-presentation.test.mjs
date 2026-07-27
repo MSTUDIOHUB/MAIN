@@ -57,7 +57,7 @@ function progress({ timestampMs, runId, tool, target, status, summary = "" }) {
   };
 }
 
-test("Capsule uses the newest active structured action and preserves the full target", () => {
+test("Capsule uses the newest active structured action and preserves the full target without Run Status summary", () => {
   const longPath = "src/features/very-long-directory-name/another-long-directory-name/components/editor/EditorInteractionCoordinator.ts";
   const result = presentation.buildRuntimeV2CompatibleCapsuleProjection({
     events: [
@@ -73,7 +73,28 @@ test("Capsule uses the newest active structured action and preserves the full ta
   assert.match(result.markdown, /正在修改/);
   assert.match(result.markdown, new RegExp(longPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(result.markdown, /\.\.\./);
-  assert.match(result.markdown, /正在写入最小修复/);
+  assert.doesNotMatch(result.markdown, /正在写入最小修复/);
+});
+
+test("an explicit public action remains complete Markdown and is not duplicated by its summary", () => {
+  const event = progress({
+    timestampMs: 12,
+    runId: "run-a",
+    tool: "apply_patch",
+    target: "src/main.js",
+    status: "running",
+    summary: "Run Status owns this duplicate.",
+  });
+  event.progress.action = "我已确认事件入口；现在修改 **src/main.js**。";
+  const result = presentation.buildRuntimeV2CompatibleCapsuleProjection({
+    events: [event],
+    turnId: "turn-a",
+    runId: "run-a",
+    language: "zh",
+  });
+  assert.ok(result);
+  assert.equal(result.markdown, "我已确认事件入口；现在修改 **src/main.js**。");
+  assert.doesNotMatch(result.markdown, /Run Status/);
 });
 
 test("completed structured activity clears instead of freezing Capsule on an old action", () => {
