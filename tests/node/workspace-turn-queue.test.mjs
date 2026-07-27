@@ -705,7 +705,8 @@ test("Turn projection rejects unknown intent strings without granting a runtime 
 
   assert.equal(turn.intent, "respond");
   assert.equal(turn.displayIntent, "respond");
-  assert.equal(turn.mode, "chat");
+  assert.equal(turn.mode, "edit");
+  assert.equal(turn.runtimeEngineVersion, "v2");
 });
 
 test("ordinary repair instructions project as Execute before authoritative dispatch", () => {

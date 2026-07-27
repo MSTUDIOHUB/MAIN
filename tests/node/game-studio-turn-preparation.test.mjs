@@ -95,7 +95,7 @@ function createRuntimeService(overrides = {}) {
   return service;
 }
 
-test("game studio turn preparation configures explicit setup-engine commands and builds an envelope", async () => {
+test("game studio turn preparation snapshots explicit setup without pre-lease effects", async () => {
   const service = createRuntimeService();
   const result = await prepareGameStudioTurn({
     currentMainModeKey: "game_studio",
@@ -116,25 +116,20 @@ test("game studio turn preparation configures explicit setup-engine commands and
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.activeStudioAgentKey, "unity-specialist");
-  assert.equal(result.gameStudioInitialized, true);
-  assert.equal(result.gameStudioConfigForTurn.engine, "unity");
-  assert.equal(result.gameStudioConfigForTurn.engineVersion, "2022");
-  assert.equal(result.shouldInvalidateWorkspaceTree, true);
-  assert.equal(result.shouldBumpWorkspaceContentVersion, true);
-  assert.deepEqual(result.runtimePatch, {
-    gameStudioInitialized: true,
-    activeStudioAgentKey: "unity-specialist",
-  });
-  assert.match(result.userContent, /^ENVELOPE:unity-specialist:unity:/);
+  assert.equal(result.activeStudioAgentKey, "studio_auto");
+  assert.equal(result.gameStudioInitialized, false);
+  assert.equal(result.gameStudioConfigForTurn, null);
+  assert.equal(result.shouldInvalidateWorkspaceTree, false);
+  assert.equal(result.shouldBumpWorkspaceContentVersion, false);
+  assert.equal(result.runtimePatch, null);
+  assert.match(result.userContent, /^ENVELOPE:studio_auto:none:/);
   assert.deepEqual(service.calls.map((call) => call[0]), [
-    "ensureInitialized",
-    "configureEngine",
+    "loadConfig",
     "buildTurnEnvelope",
   ]);
 });
 
-test("game studio turn preparation auto-configures explicit engine signals when workspace config is missing", async () => {
+test("game studio turn preparation never auto-configures from model-facing text", async () => {
   const service = createRuntimeService({
     async loadConfig() {
       this.calls.push(["loadConfig"]);
@@ -156,19 +151,16 @@ test("game studio turn preparation auto-configures explicit engine signals when 
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.activeStudioAgentKey, "unity-specialist");
-  assert.equal(result.gameStudioInitialized, true);
-  assert.equal(result.gameStudioConfigForTurn.engine, "unity");
-  assert.match(result.userContent, /^ENVELOPE:unity-specialist:unity:/);
+  assert.equal(result.activeStudioAgentKey, "studio_auto");
+  assert.equal(result.gameStudioInitialized, false);
+  assert.equal(result.gameStudioConfigForTurn, null);
+  assert.equal(result.userContent, "fix camera");
   assert.deepEqual(service.calls.map((call) => call[0]), [
     "loadConfig",
-    "ensureInitialized",
-    "configureEngine",
-    "buildTurnEnvelope",
   ]);
 });
 
-test("game studio turn preparation returns a failure when required initialization cannot start", async () => {
+test("game studio turn preparation leaves initialization to the admitted runtime", async () => {
   const warnings = [];
   const service = createRuntimeService({
     async ensureInitialized(agent) {
@@ -195,12 +187,12 @@ test("game studio turn preparation returns a failure when required initializatio
     logWarning: (event, data) => warnings.push({ event, data }),
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.errorMessage, "Game Studio 初始化失败：pack missing");
-  assert.equal(result.userContent, "implement camera");
+  assert.equal(result.ok, true);
+  assert.equal(result.errorMessage, undefined);
+  assert.match(result.userContent, /^ENVELOPE:studio_auto:none:/);
   assert.equal(warnings.length, 0);
   assert.deepEqual(service.calls.map((call) => call[0]), [
     "loadConfig",
-    "ensureInitialized",
+    "buildTurnEnvelope",
   ]);
 });

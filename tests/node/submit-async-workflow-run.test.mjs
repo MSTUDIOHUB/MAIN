@@ -584,7 +584,7 @@ test("submit async workflow run keeps stage order from context build to engine l
             harnessRunMarker: { id: "marker-1" },
           };
         },
-        createWorkflowContext: (input) => {
+        createRuntimeContext: (input) => {
           harness.calls.push([
             "context",
             input.workspaceTree,
@@ -601,7 +601,7 @@ test("submit async workflow run keeps stage order from context build to engine l
         startStreamingUi: (input) => {
           harness.calls.push(["streaming", input.context.turnId, input.effectiveIntentSummary]);
         },
-        runWorkflowEngine: (input) => {
+        runRuntime: (input) => {
           harness.calls.push(["engine", input.context.turnId]);
           return Promise.resolve(true);
         },
@@ -659,7 +659,7 @@ test("submit async workflow run stops before launch when Game Studio preparation
         startRunLease: () => {
           throw new Error("should not start lease");
         },
-        runWorkflowEngine: () => {
+        runRuntime: () => {
           throw new Error("should not start engine");
         },
       },
@@ -733,7 +733,7 @@ test("Goal continuation becomes active only after its exact Run lease is acquire
             parentRunId: "run-old",
           };
         },
-        createWorkflowContext: (input) => {
+        createRuntimeContext: (input) => {
           harness.calls.push(["resume_context"]);
           return {
             ...input,
@@ -743,7 +743,7 @@ test("Goal continuation becomes active only after its exact Run lease is acquire
           };
         },
         startStreamingUi: () => {},
-        runWorkflowEngine: () => Promise.resolve(true),
+        runRuntime: () => Promise.resolve(true),
       },
     },
   });
@@ -786,14 +786,14 @@ test("submit async workflow run awaits the workflow engine terminal transaction"
           abortController: new AbortController(),
           harnessRunMarker: { runId: "run-1" },
         }),
-        createWorkflowContext: (input) => ({
+        createRuntimeContext: (input) => ({
           ...input,
           streamBuffer: null,
           thinkingInterceptor: null,
           agentBlockIdsCreatedThisRun: new Set(),
         }),
         startStreamingUi: () => {},
-        runWorkflowEngine: () => new Promise((resolve) => {
+        runRuntime: () => new Promise((resolve) => {
           releaseEngine = resolve;
         }),
       },
@@ -808,6 +808,138 @@ test("submit async workflow run awaits the workflow engine terminal transaction"
   releaseEngine(true);
   await run;
   assert.equal(settled, true);
+});
+
+test("a projected review pause closes the provider lease and preserves the pending action", async () => {
+  const runId = "run-plan-review-ready";
+  const abortController = new AbortController();
+  const marker = {
+    schemaVersion: 1,
+    runId,
+    activeRunId: runId,
+    activeParentRunId: null,
+    parentRunId: null,
+    instanceId: "instance-plan-review",
+    sessionKey: "workspace::7",
+    workspace: "/tmp/workspace",
+    sessionId: 7,
+    turnId: "turn-1",
+    status: "running",
+    terminalResultKind: null,
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    planStage: "plan",
+    isPlanApproved: false,
+    iteration: 1,
+    maxIterations: 12,
+    messagesLen: 1,
+    toolCount: 0,
+    latestTool: null,
+    latestToolTarget: null,
+    activeStreamId: null,
+    streamStatus: null,
+    streamChunkCount: 0,
+    streamByteCount: 0,
+    streamElapsedMs: null,
+    streamLifecycleStatus: null,
+    lastStreamError: null,
+    startedAt: 1_100,
+    updatedAt: 1_100,
+    closedAt: null,
+    closeReason: null,
+  };
+  const harness = createHarness({
+    input: {
+      runIdOverride: runId,
+      effectiveRunIntent: "plan",
+      runtimeRunIntent: "plan",
+      effectiveWorkflowMode: "plan",
+    },
+  });
+  harness.input.phaseRunners = {
+    buildAttachmentContext: async () => ({
+      userContent: "plan",
+      attachmentRefs: [],
+      failedAttachmentCount: 0,
+    }),
+    buildPromptContext: () => ({ userContent: "plan" }),
+    runGameStudioPreparation: async () => ({
+      ok: true,
+      userContent: "plan",
+      activeStudioAgentKey: "coder",
+      gameStudioInitialized: false,
+      gameStudioConfigForTurn: null,
+    }),
+    startRunLease: (input) => {
+      input.setHarnessRunMarker(marker);
+      input.setAbortController(abortController);
+      return {
+        runId,
+        parentRunId: null,
+        turnAgentMessagesStart: 0,
+        agentUserMessage: { role: "user", content: "plan" },
+        abortController,
+        harnessRunMarker: marker,
+      };
+    },
+    createRuntimeContext: (input) => ({
+      ...input,
+      streamBuffer: null,
+      thinkingInterceptor: null,
+      agentBlockIdsCreatedThisRun: new Set(),
+    }),
+    startStreamingUi: () => {},
+    runRuntime: async () => {
+      harness.state.planStage = "ready_to_execute";
+      harness.state.activeActionRequest = {
+        sessionKey: "workspace::7",
+        turnId: "turn-1",
+        runId,
+        kind: "plan_review",
+        status: "pending",
+      };
+      harness.state.conversationTurns[0].status = "awaiting_approval";
+      return {
+        disposition: "projected",
+        reason: "runtime_v2_plan_review_required",
+        identity: {
+          sessionKey: "workspace::7",
+          turnId: "turn-1",
+          runId,
+          parentRunId: null,
+          outerRunId: runId,
+        },
+        outcome: {
+          status: "paused",
+          pauseKind: "action_required",
+          reason: "runtime_v2_plan_review_required",
+        },
+      };
+    },
+  };
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(harness.state.agentStatus, "pending_review");
+  assert.equal(harness.state.isGenerating, false);
+  assert.equal(harness.state.abortController, null);
+  assert.equal(harness.state.activeActionRequest.status, "pending");
+  assert.equal(harness.state.harnessRunMarker.status, "paused");
+  assert.equal(
+    harness.state.harnessRunMarker.closeReason,
+    "runtime_v2_plan_review_required",
+  );
+  assert.equal(harness.state.conversationTurns[0].status, "awaiting_approval");
+  assert.equal(harness.state.conversationTurns[0].runtimeOutcome.status, "paused");
+  assert.equal(
+    harness.state.runtimeEvents.filter((event) => event.type === "run.paused").length,
+    1,
+  );
+  assert.equal(harness.calls.some((entry) => entry[0] === "dispose_timer"), true);
+  assert.equal(harness.calls.some((entry) => entry[0] === "persist_bootstrap"), true);
+  assert.equal(harness.calls.some((entry) =>
+    entry[0] === "log" && entry[1] === "runtime_projected_pause_settled"
+  ), true);
 });
 
 test("a failed terminal projection quiesces only its exact workflow owner without completing the Turn", async () => {
@@ -882,14 +1014,14 @@ test("a failed terminal projection quiesces only its exact workflow owner withou
         harnessRunMarker: marker,
       };
     },
-    createWorkflowContext: (input) => ({
+    createRuntimeContext: (input) => ({
       ...input,
       streamBuffer: null,
       thinkingInterceptor: null,
       agentBlockIdsCreatedThisRun: new Set(),
     }),
     startStreamingUi: () => {},
-    runWorkflowEngine: async () => ({
+    runRuntime: async () => ({
       disposition: "projection_failed",
       reason: "terminal_projection_not_committed",
       identity: {
@@ -995,14 +1127,14 @@ test("terminal projection reconciliation never clears a newer exact workflow own
         harnessRunMarker: oldMarker,
       };
     },
-    createWorkflowContext: (input) => ({
+    createRuntimeContext: (input) => ({
       ...input,
       streamBuffer: null,
       thinkingInterceptor: null,
       agentBlockIdsCreatedThisRun: new Set(),
     }),
     startStreamingUi: () => {},
-    runWorkflowEngine: async () => {
+    runRuntime: async () => {
       harness.state.harnessRunMarker = newMarker;
       harness.state.abortController = newAbortController;
       harness.state.agentStatus = "running";
@@ -1094,13 +1226,13 @@ test("a Turn canceled during bootstrap cannot acquire a run lease or start tools
           input.createAbortController();
           throw new Error("terminal Turn must not acquire a run lease");
         },
-        createWorkflowContext: () => {
+        createRuntimeContext: () => {
           throw new Error("terminal Turn must not create workflow context");
         },
         startStreamingUi: () => {
           throw new Error("terminal Turn must not start streaming UI");
         },
-        runWorkflowEngine: () => {
+        runRuntime: () => {
           engineStarts += 1;
           throw new Error("terminal Turn must not start tools");
         },
@@ -1288,7 +1420,7 @@ test("bulk clear invalidates a deferred bootstrap before lease, marker, engine, 
           gameStudioInitialized: true,
           gameStudioConfigForTurn: null,
         }),
-        runWorkflowEngine: () => {
+        runRuntime: () => {
           engineStarts += 1;
           toolStarts += 1;
           return Promise.resolve(true);
@@ -1413,10 +1545,10 @@ test("a post-lease bootstrap exception durably closes only the acquired owner", 
             harnessRunMarker: marker,
           };
         },
-        createWorkflowContext: () => {
+        createRuntimeContext: () => {
           throw new Error("context construction failed");
         },
-        runWorkflowEngine: () => {
+        runRuntime: () => {
           throw new Error("engine must not start");
         },
       },

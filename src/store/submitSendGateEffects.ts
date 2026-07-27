@@ -42,7 +42,7 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   state: TState;
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
-  queuedWorkflowContext?: {
+  queuedRunContext?: {
     runtimeIntentOverride?: ResolvedRunIntent;
     goalSourceContextSnapshot?: string;
     goalCreationAuthorization?: GoalCreationAuthorization;
@@ -145,7 +145,7 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
     input.queueUserMessage(input.text, input.images, {
       contextMentions: input.mentionSnapshot,
       attachedFiles: input.attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
-      ...input.queuedWorkflowContext,
+      ...input.queuedRunContext,
     });
     input.logStoreEvent("send_queued", {
       reason: decision.action.reason,

@@ -1,7 +1,5 @@
-import { detectGameDevelopmentIntent } from "../lib/gameStudio/detection";
 import { mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import {
-  getDefaultStudioAgentForEngine,
   normalizeStudioAgentKey,
   type PendingSlashCommand,
   type ParsedSetupEngineArgs,
@@ -10,12 +8,6 @@ import {
 } from "../lib/gameStudio/catalog";
 
 export interface GameStudioTurnRuntimeService {
-  ensureInitialized(activeStudioAgent?: StudioAgentKey): Promise<StudioConfig>;
-  configureEngine(params: {
-    engine: Exclude<ParsedSetupEngineArgs["engine"], null>;
-    version?: string;
-    activeStudioAgent?: StudioAgentKey;
-  }): Promise<StudioConfig>;
   loadConfig(): Promise<StudioConfig | null>;
   buildTurnEnvelope(params: {
     originalText: string;
@@ -68,10 +60,6 @@ export type GameStudioTurnPreparationResult =
   | GameStudioTurnPreparationSuccess
   | GameStudioTurnPreparationFailure;
 
-function formatGameStudioInitError(error: unknown): string {
-  return `Game Studio 初始化失败：${error instanceof Error ? error.message : String(error)}`;
-}
-
 function warnGameStudioPreparation(
   params: GameStudioTurnPreparationInput,
   event: string,
@@ -90,61 +78,23 @@ export async function prepareGameStudioTurn(
   let activeStudioAgentKey = params.activeStudioAgentKey;
   let gameStudioInitialized = params.gameStudioInitialized;
   let gameStudioConfigForTurn: StudioConfig | null = null;
-  let shouldInvalidateWorkspaceTree = false;
-  let shouldBumpWorkspaceContentVersion = false;
-  let runtimePatch: GameStudioTurnPreparationSuccess["runtimePatch"] = null;
-
-  const markStudioInitialized = (config: StudioConfig) => {
-    activeStudioAgentKey = normalizeStudioAgentKey(config.activeStudioAgent);
-    gameStudioInitialized = true;
-    shouldInvalidateWorkspaceTree = true;
-    shouldBumpWorkspaceContentVersion = true;
-    runtimePatch = {
-      gameStudioInitialized: true,
-      activeStudioAgentKey,
-    };
-  };
 
   if (params.currentMainModeKey === "game_studio") {
-    if (params.parsedSetupEngineCommand?.mode === "configure" && params.parsedSetupEngineCommand.engine) {
-      try {
-        const engineAgent = getDefaultStudioAgentForEngine(params.parsedSetupEngineCommand.engine);
-        await runtimeService.ensureInitialized(engineAgent);
-        gameStudioConfigForTurn = await runtimeService.configureEngine({
-          engine: params.parsedSetupEngineCommand.engine,
-          version: params.parsedSetupEngineCommand.version,
-          activeStudioAgent: engineAgent,
-        });
-        markStudioInitialized(gameStudioConfigForTurn);
-      } catch (error) {
-        warnGameStudioPreparation(params, "game_studio_setup_engine_failed", error);
-      }
-    } else {
-      const engineSignal = detectGameDevelopmentIntent(params.text, {
-        workspaceTree: params.cachedWorkspaceTreeForGameDetection,
-      });
-      if (engineSignal.engineStatus === "explicit" && engineSignal.engine) {
-        const currentConfig = await runtimeService.loadConfig();
-        if (!currentConfig || currentConfig.engine === "unconfigured" || currentConfig.engine !== engineSignal.engine) {
-          try {
-            const engineAgent = getDefaultStudioAgentForEngine(engineSignal.engine);
-            await runtimeService.ensureInitialized(engineAgent);
-            gameStudioConfigForTurn = await runtimeService.configureEngine({
-              engine: engineSignal.engine,
-              activeStudioAgent: engineAgent,
-            });
-            markStudioInitialized(gameStudioConfigForTurn);
-          } catch (error) {
-            warnGameStudioPreparation(params, "game_studio_auto_engine_config_failed", error);
-          }
-        } else {
-          gameStudioConfigForTurn = currentConfig;
-        }
-      }
-    }
-
-    if (!gameStudioConfigForTurn) {
+    try {
       gameStudioConfigForTurn = await runtimeService.loadConfig();
+    } catch (error) {
+      warnGameStudioPreparation(
+        params,
+        "game_studio_config_snapshot_failed",
+        error,
+      );
+      gameStudioConfigForTurn = null;
+    }
+    if (gameStudioConfigForTurn) {
+      activeStudioAgentKey = normalizeStudioAgentKey(
+        gameStudioConfigForTurn.activeStudioAgent,
+      );
+      gameStudioInitialized = true;
     }
   }
 
@@ -155,27 +105,6 @@ export async function prepareGameStudioTurn(
       activeStudioAgentKey !== "studio_auto" ||
       gameStudioInitialized
     );
-
-  if (
-    params.currentMainModeKey === "game_studio" &&
-    !gameStudioInitialized &&
-    (params.parsedStudioCommand?.type === "workflow" || activeStudioAgentKey !== "studio_auto")
-  ) {
-    try {
-      const studioConfig = await runtimeService.ensureInitialized(activeStudioAgentKey);
-      gameStudioConfigForTurn = studioConfig;
-      markStudioInitialized(studioConfig);
-    } catch (error) {
-      return {
-        ok: false,
-        userContent,
-        activeStudioAgentKey,
-        gameStudioInitialized,
-        gameStudioConfigForTurn,
-        errorMessage: formatGameStudioInitError(error),
-      };
-    }
-  }
 
   if (shouldUseGameStudioEnvelope) {
     userContent = runtimeService.buildTurnEnvelope({
@@ -194,8 +123,8 @@ export async function prepareGameStudioTurn(
     activeStudioAgentKey,
     gameStudioInitialized,
     gameStudioConfigForTurn,
-    shouldInvalidateWorkspaceTree,
-    shouldBumpWorkspaceContentVersion,
-    runtimePatch,
+    shouldInvalidateWorkspaceTree: false,
+    shouldBumpWorkspaceContentVersion: false,
+    runtimePatch: null,
   };
 }

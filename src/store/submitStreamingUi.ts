@@ -16,7 +16,7 @@ import {
   compactThoughtContent,
   compactThoughtContentForPersist,
 } from "../lib/thoughtCompaction";
-import type { WorkflowContext } from "../lib/orchestrator/workflowEngine";
+import type { SubmissionRuntimeContext } from "../lib/submissionRuntimeContracts";
 
 type SubmitSessionGet = () => any;
 type SubmitSessionSet = (patch: any) => void;
@@ -27,7 +27,7 @@ export interface SubmitStreamingUiContextSignals {
 }
 
 export interface StartSubmitStreamingUiInput {
-  context: WorkflowContext;
+  context: SubmissionRuntimeContext;
   sessionGet: SubmitSessionGet;
   sessionSet: SubmitSessionSet;
   nextTaskId: () => number;
@@ -44,7 +44,7 @@ export interface SubmitStreamingUiLease {
 }
 
 function buildStreamingCapsuleActivityIdentity(
-  context: WorkflowContext,
+  context: SubmissionRuntimeContext,
   state: any,
 ) {
   const marker = state?.harnessRunMarker;

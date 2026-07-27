@@ -33,6 +33,7 @@ import {
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { isPlanCandidateBlock, isReviewablePlanBlock, selectLatestPlanCandidatePreview } from "../lib/chat/chatBlockVisibility";
 import { isPlanApprovalLeaseBoundToState } from "../lib/planLifecycle";
+import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -996,6 +997,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedDiffTaskId,
     gitDiffPreview,
     runtimeEvents,
+    runtimeV2Checkpoints,
     activeActionRequest,
     harnessRunMarker,
     selectedSubagentId,
@@ -1035,6 +1037,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
     gitDiffPreview: useAppStore((s) => s.gitDiffPreview),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    runtimeV2Checkpoints: useAppStore((s) => s.runtimeV2Checkpoints),
     activeActionRequest: useAppStore((s) => s.activeActionRequest),
     harnessRunMarker: useAppStore((s) => s.harnessRunMarker),
     selectedSubagentId: useAppStore((s) => s.selectedSubagentId),
@@ -1078,7 +1081,23 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       : taskFlow;
     return collectChangeEntries(scopedTaskFlow, getDiffStats);
   }, [latestPlanTurn, taskFlow]);
-  const planApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
+  const runtimeV2PlanReview = useMemo(
+    () => latestPlanTurn
+      ? resolveRuntimeV2PlanReviewFromAggregate(
+          runtimeV2Checkpoints[latestPlanTurn.id]?.aggregate,
+        )
+      : null,
+    [latestPlanTurn, runtimeV2Checkpoints],
+  );
+  const legacyPlanApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
+  const planApprovalIdentity = runtimeV2PlanReview
+    ? {
+        revision: runtimeV2PlanReview.commit.authority.revision,
+        artifactHash: runtimeV2PlanReview.commit.authority.projectionHash,
+        artifactPaths: [runtimeV2PlanReview.commit.artifact.path],
+        artifactCount: 1,
+      }
+    : legacyPlanApprovalIdentity;
   const hasReviewablePlanArtifact = !!planApprovalIdentity;
   const fallbackPlanPreview = useMemo(() => {
     if (hasReviewablePlanArtifact || !latestPlanEntry) return "";
@@ -1113,6 +1132,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasMatchingPlanActionOwner;
   const hasActivePlanContext =
     !!latestPlanTurn ||
+    !!runtimeV2PlanReview ||
     planArtifacts.length > 0 ||
     fallbackPlanPreview.length > 0 ||
     planStage !== "idle";
@@ -1275,7 +1295,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     }
     return true;
   };
-  const hasPlanPanelContent = planArtifacts.length > 0 || fallbackPlanPreview.length > 0;
+  const hasPlanPanelContent =
+    !!runtimeV2PlanReview ||
+    planArtifacts.length > 0 ||
+    fallbackPlanPreview.length > 0;
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
   const subagentCapacityPolicy = useMemo(() => resolveSubagentCapacityPolicy(config), [config]);
   const activeSubagentCount = subagentRuns.filter((run) =>
@@ -1464,6 +1487,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
           {rightPanelTab === "plan" && hasPlanPanelContent && (
             <PlanPanel
               presentation={planPresentation}
+              runtimeV2Review={runtimeV2PlanReview?.commit.panel || null}
               artifacts={planArtifacts}
               tasks={planTasks}
               evidenceLedger={planExecutionEvidenceLedger}

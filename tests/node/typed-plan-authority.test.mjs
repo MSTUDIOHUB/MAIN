@@ -295,29 +295,19 @@ test("legacy Plan imports retain the actionable Markdown protection", () => {
 });
 
 test("new, restored, and refreshed Plan reviews share one typed identity boundary", () => {
-  const workflowSource = fs.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+  const planRunnerSource = fs.readFileSync(
+    path.join(workspaceRoot, "src/store/runtimeV2/planRunner.ts"),
     "utf8",
   );
-  const statusSection = workflowSource.slice(
-    workflowSource.indexOf("onStatusChange:"),
-    workflowSource.indexOf("onPlanArtifactUpdated:"),
+  const workPlanAdapterSource = fs.readFileSync(
+    path.join(workspaceRoot, "src/store/runtimeV2/workPlanAdapter.ts"),
+    "utf8",
   );
-  assert.match(statusSection, /buildTypedPlanApprovalIdentity\(latest\.planArtifacts\)/);
-
-  const invalidationSection = workflowSource.slice(
-    workflowSource.indexOf("onPlanApprovalInvalidated:"),
-    workflowSource.indexOf("onPlanTasksUpdated:"),
-  );
-  assert.match(invalidationSection, /currentArtifactIdentity = buildPlanApprovalIdentity/);
-  assert.match(invalidationSection, /currentReviewIdentity = buildTypedPlanApprovalIdentity/);
-  assert.match(invalidationSection, /if \(currentReviewIdentity\)[\s\S]*buildPlanReviewActionRequest/);
-
-  const terminalReviewProjection = workflowSource.slice(
-    workflowSource.indexOf("const planReviewIdentity = pendingAction?.kind"),
-    workflowSource.indexOf("const canonicalPauseKind", workflowSource.indexOf("const planReviewIdentity = pendingAction?.kind")),
-  );
-  assert.match(terminalReviewProjection, /buildTypedPlanApprovalIdentity/);
+  assert.match(planRunnerSource, /createRuntimeV2PlanReviewCommit/);
+  assert.match(planRunnerSource, /reviewCommit/);
+  assert.match(workPlanAdapterSource, /validateRuntimeV2PlanReviewCommitIntegrity/);
+  assert.match(workPlanAdapterSource, /digest/);
+  assert.match(workPlanAdapterSource, /projectionHash/);
 
   const storeSource = fs.readFileSync(
     path.join(workspaceRoot, "src/store/useAppStore.ts"),

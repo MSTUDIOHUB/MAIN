@@ -29,6 +29,7 @@ const {
   getMdViewerFinalSummaryGaps,
   getMdViewerReadablePlanGaps,
   getMdViewerTypedPlanGaps,
+  getMdViewerWorkPlanGaps,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "tests/e2e/realOmlxMdViewerPlanOracle.ts"),
 );
@@ -173,6 +174,82 @@ function goodCandidate() {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function goodWorkPlan() {
+  return {
+    evidence: [
+      { id: "E-editor", target: "src/components/editor.js" },
+      { id: "E-main", target: "src/main.js" },
+      { id: "E-rust", target: "src-tauri/src/main.rs" },
+    ],
+    draft: {
+      summary: [
+        "DOMContentLoaded creates a pristine blank initialFile, then openFiles appends beside it so both titles coexist.",
+        "editor setValue dispatchEvent(input), then main marks isDirty and calls scheduleAutoSave.",
+        "main calls save_file_content with file_path while the Tauri handler exposes external filePath.",
+      ].join("\n"),
+      findings: [
+        {
+          statement:
+            "DOMContentLoaded creates a pristine blank initialFile, then openFiles appends beside it so both titles coexist.",
+          basis: ["E-main"],
+        },
+        {
+          statement:
+            "editor setValue dispatchEvent(input), then main marks isDirty and calls scheduleAutoSave.",
+          basis: ["E-editor", "E-main"],
+        },
+        {
+          statement:
+            "main calls save_file_content with file_path while the Tauri handler exposes external filePath.",
+          basis: ["E-main", "E-rust"],
+        },
+      ],
+      steps: [
+        {
+          operation: "modify",
+          targets: ["src/main.js"],
+          basis: ["E-main"],
+          change:
+            "In openFiles replace the pristine initial blank tab instead of appending beside it.",
+          expectedOutcome: "Only the opened filename remains visible.",
+        },
+        {
+          operation: "modify",
+          targets: ["src/components/editor.js"],
+          basis: ["E-editor"],
+          change:
+            "Remove dispatchEvent(input) from setValue so programmatic loads do not synthesize edits.",
+          expectedOutcome: "Opening a file leaves it clean and does not schedule autosave.",
+        },
+        {
+          operation: "modify",
+          targets: ["src/main.js"],
+          basis: ["E-main", "E-rust"],
+          change:
+            "Change each save_file_content caller payload from file_path to filePath.",
+          expectedOutcome: "The existing Tauri handler receives the active file path.",
+        },
+      ],
+      validations: [
+        {
+          stepIndexes: [0, 1, 2],
+          kind: "finite_command",
+          command: "npm run build",
+          expectedOutcome: "The project build succeeds.",
+          required: true,
+        },
+        {
+          stepIndexes: [0, 1, 2],
+          kind: "desktop",
+          expectedOutcome:
+            "Open a local md file without editing; programmatic setValue must not invoke save_file_content or show a save dialog.",
+          required: true,
+        },
+      ],
+    },
+  };
 }
 
 function executionSources() {
@@ -495,6 +572,25 @@ test("MD Viewer typed oracle accepts an evidence-bound caller fix and executable
   assert.deepEqual(getMdViewerTypedPlanGaps(goodCandidate()), []);
 });
 
+test("MD Viewer Runtime v2 WorkPlan oracle accepts the evidence-bound repair graph", () => {
+  assert.deepEqual(getMdViewerWorkPlanGaps(goodWorkPlan()), []);
+});
+
+test("MD Viewer Runtime v2 WorkPlan oracle rejects missing owner and validation edges", () => {
+  const plan = goodWorkPlan();
+  plan.evidence = plan.evidence.filter((entry) => entry.id !== "E-rust");
+  plan.draft.validations[0].stepIndexes = [];
+  plan.draft.validations[1].stepIndexes = [];
+  plan.draft.steps[2].targets = ["src-tauri/src/main.rs"];
+
+  const gaps = getMdViewerWorkPlanGaps(plan);
+  assert.ok(gaps.includes("handler owner evidence missing"));
+  assert.ok(gaps.includes("save command filePath repair step missing"));
+  assert.ok(gaps.includes("initial-tab step lacks a required validation edge"));
+  assert.ok(gaps.includes("editor autosave step lacks a required validation edge"));
+  assert.ok(gaps.some((gap) => gap.includes("non-owner mutation targets proposed")));
+});
+
 test("MD Viewer final-summary oracle requires all verified user-visible outcomes", () => {
   const accurateSummary = [
     "打开本地文件时会替换未修改的初始空白标签页，不再让文件名与未命名文档并存。",
@@ -572,15 +668,14 @@ test("browser validation may cover native behavior through an explicit executabl
   assert.deepEqual(getMdViewerTypedPlanGaps(candidate), []);
 });
 
-test("Markdown oracle checks readable typed-node sections without semantic keyword inference", () => {
+test("Markdown oracle permits a free narrative and requires only change and validation review sections", () => {
   const readable = [
-    "# Plan",
-    "## Diagnosis",
-    "- [R1] concise diagnosis",
+    "# Repair the editor lifecycle",
+    "The diagnosis can use whatever structure best explains this task.",
     "## Changes",
-    "- [C1] concise change",
+    "### S1 · concise change",
     "## Validation",
-    "- [V1] executable validation",
+    "### V1 · executable validation",
   ].join("\n");
   assert.deepEqual(getMdViewerReadablePlanGaps(readable), []);
 
@@ -590,7 +685,6 @@ test("Markdown oracle checks readable typed-node sections without semantic keywo
     "- toolbar editor main.rs setValue filePath file_path [R1] [C1] [V1]",
   ].join("\n");
   assert.deepEqual(getMdViewerReadablePlanGaps(evidenceOnly), [
-    "readable diagnosis section missing",
     "readable change section missing",
     "readable validation section missing",
   ]);

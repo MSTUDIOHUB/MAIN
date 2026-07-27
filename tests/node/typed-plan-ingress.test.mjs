@@ -76,12 +76,6 @@ const {
 const {
   classifyPlanArtifactQualityResult,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
-const {
-  rememberToolActivity,
-} = loadTranspiledModuleSync(path.join(
-  workspaceRoot,
-  "src/lib/orchestrator/loop/toolActivityTracking.ts",
-));
 
 const objective = "Update src/runtime.ts so the runtime uses the current owner.";
 const contract = createPlanAuthoringContract({
@@ -202,26 +196,6 @@ function draftWithText(text, sourceBundle = bundle) {
 
 function envelope(draft) {
   return `<plan_candidate>${JSON.stringify(draft)}</plan_candidate>`;
-}
-
-function runtimeReadResult({ toolCallId, target, content }) {
-  const lineCount = content.split("\n").length;
-  return {
-    toolCallId,
-    name: "read_file",
-    catalogIdentity: { source: "built_in", canonicalName: "read_file" },
-    target,
-    content,
-    isError: false,
-    readFileObservation: {
-      key: `${target}::${toolCallId}::production-reachability-v1`,
-      path: target,
-      requestSignature: toolCallId,
-      versionToken: `production-reachability-v1:${target}`,
-      source: "fresh",
-      window: { startLine: 1, endLine: lineCount, totalLines: lineCount, truncated: false },
-    },
-  };
 }
 
 test("typed Plan topology is explicit and independent of prose language", () => {
@@ -622,93 +596,6 @@ test("typed browser validation rejects guessed DOM targets and desktop-only subs
     language: "en",
   });
   assert.equal(harnessBacked.ok, true, JSON.stringify(harnessBacked));
-});
-
-test("production read adapters make Tauri desktop validation and native harnesses reachable", () => {
-  const activities = [];
-  rememberToolActivity(activities, runtimeReadResult({
-    toolCallId: "read-tauri-webview",
-    target: "src/App.tsx",
-    content: [
-      "import { invoke } from '@tauri-apps/api/core';",
-      "export function App() {",
-      "  return <main>",
-      "    <button aria-label=\"Open document\">Open</button>",
-      "    <output aria-label=\"Document loaded\">Ready</output>",
-      "  </main>;",
-      "}",
-    ].join("\n"),
-  }), { evidenceLedger: true });
-  rememberToolActivity(activities, runtimeReadResult({
-    toolCallId: "read-native-harness-manifest",
-    target: "package.json",
-    content: JSON.stringify({
-      scripts: {
-        "test:desktop": "wdio run ./wdio.conf.ts",
-      },
-    }, null, 2),
-  }), { evidenceLedger: true });
-
-  const productionBundle = buildPlanEvidenceBundle({
-    objective: "Update src/App.tsx and verify the Tauri desktop interaction.",
-    evidenceRecords: activities.map((item) => ({
-      tool: item.name,
-      target: item.target,
-      status: item.status,
-      summary: item.detail,
-      facts: item.facts,
-      structuredFacts: item.structuredFacts,
-      sourceObservations: item.sourceObservations,
-    })),
-  });
-  const productionContract = createPlanAuthoringContract({
-    objective: productionBundle.objective,
-    contextSignals: {
-      imageParts: 0,
-      mentionedFilePaths: ["src/App.tsx"],
-      attachedFilePaths: [],
-      subagentPreference: "unspecified",
-    },
-  });
-  const appEvidenceRef = productionBundle.facts.find((fact) => fact.target === "src/App.tsx")?.id;
-  const manifestEvidenceRef = productionBundle.facts.find((fact) => fact.target === "package.json")?.id;
-  assert.ok(appEvidenceRef);
-  assert.ok(manifestEvidenceRef);
-  const desktopDraft = draftWithText("Update the Tauri desktop interaction.", productionBundle);
-  desktopDraft.evidenceRefs = [appEvidenceRef, manifestEvidenceRef];
-  desktopDraft.changes[0].targetRef = "src/App.tsx";
-  desktopDraft.changes[0].evidenceRefs = [appEvidenceRef];
-  desktopDraft.validations[0].primitive = {
-    kind: "desktop_interaction",
-    actions: [{ id: "A1", kind: "click", target: "Open document" }],
-    assertions: [{
-      kind: "visibility",
-      target: "Document loaded",
-      afterActionId: "A1",
-    }],
-  };
-  desktopDraft.validations[0].expectedOutcome = "The desktop adapter observes the loaded document.";
-  const desktopCandidate = createTypedRuntimePlanCandidate({
-    draft: desktopDraft,
-    bundle: productionBundle,
-    authoringContract: productionContract,
-    language: "en",
-  });
-  assert.equal(desktopCandidate.ok, true, JSON.stringify(desktopCandidate));
-
-  const nativeHarnessDraft = structuredClone(desktopDraft);
-  nativeHarnessDraft.validations[0].primitive = {
-    kind: "finite_command",
-    command: "npm run test:desktop",
-  };
-  nativeHarnessDraft.validations[0].expectedOutcome = "The registered native UI harness exits with status 0.";
-  const nativeHarnessCandidate = createTypedRuntimePlanCandidate({
-    draft: nativeHarnessDraft,
-    bundle: productionBundle,
-    authoringContract: productionContract,
-    language: "en",
-  });
-  assert.equal(nativeHarnessCandidate.ok, true, JSON.stringify(nativeHarnessCandidate));
 });
 
 test("toolbar, editor, main, and Rust source owners stay independent until the typed Plan maps them to goals", () => {
@@ -1388,38 +1275,25 @@ test("deterministic fallback constructs runtime_synthesized authority without Ma
 });
 
 test("production Plan prompts and materialization calls cannot regress to legacy Markdown authority", () => {
-  const collectTsFiles = (directory) => fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const target = path.join(directory, entry.name);
-    return entry.isDirectory()
-      ? collectTsFiles(target)
-      : /\.tsx?$/.test(entry.name) ? [target] : [];
-  });
   const promptFiles = [
     path.join(workspaceRoot, "src/lib/systemPrompt.ts"),
     path.join(workspaceRoot, "src/lib/planRuntime.ts"),
     path.join(workspaceRoot, "src/lib/planAuthoringContract.ts"),
-    path.join(workspaceRoot, "src/lib/goalContextStrategy.ts"),
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
     path.join(workspaceRoot, "src/store/submitPromptContext.ts"),
-    ...collectTsFiles(path.join(workspaceRoot, "src/lib/orchestrator")),
+    path.join(workspaceRoot, "src/store/runtimeV2/planRunner.ts"),
+    path.join(workspaceRoot, "src/store/runtimeV2/workPlanAdapter.ts"),
   ];
   const promptSource = promptFiles.map((file) => fs.readFileSync(file, "utf8")).join("\n");
   assert.doesNotMatch(promptSource, /<proposed_plan>/i);
   assert.match(promptSource, /<plan_candidate>/i);
-
-  const orchestratorSource = fs.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const visibleMaterializerSource = orchestratorSource.slice(
-    orchestratorSource.indexOf("export async function autoMaterializePlanArtifactFromVisibleText"),
-    orchestratorSource.indexOf("export async function autoMaterializePlanArtifactFromEvidence"),
+  assert.equal(fs.existsSync(path.join(workspaceRoot, "src/lib/orchestrator.ts")), false);
+  assert.equal(
+    fs.readdirSync(path.join(workspaceRoot, "src/lib/orchestrator"), {
+      recursive: true,
+      withFileTypes: true,
+    }).some((entry) => entry.isFile()),
+    false,
   );
-  assert.match(visibleMaterializerSource, /const hasTypedCandidate = hasTypedPlanDraftEnvelope\(input\.visibleText\)/);
-  assert.match(visibleMaterializerSource, /if \(!hasTypedCandidate && !planReadiness\.ready\)/);
-  const materializerCalls = [...orchestratorSource.matchAll(/materializePlanArtifactFromVisibleText\(\{/g)];
-  assert.ok(materializerCalls.length > 0);
-  for (const call of materializerCalls) {
-    const callWindow = orchestratorSource.slice(call.index, call.index + 1_500);
-    assert.match(callWindow, /ingressMode:\s*"(?:typed_runtime|legacy_markdown_import)"/);
-  }
 
   const runtimeToolsSource = fs.readFileSync(path.join(workspaceRoot, "src/lib/runtimeTools.ts"), "utf8");
   assert.doesNotMatch(

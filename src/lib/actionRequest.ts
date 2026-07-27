@@ -71,6 +71,9 @@ const settledPlanToolPermissionInvalidations = new WeakSet<object>();
 
 export interface PlanReviewActionRequest extends ActionRequestBase {
   kind: "plan_review";
+  /** Runtime v2 owner epoch. Legacy requests omit it and can only resolve
+   * through the legacy authority path. */
+  sessionEpoch?: string;
   planRevision: number;
   artifactHash: string;
   artifactPaths: string[];
@@ -114,7 +117,7 @@ export type UserChoiceResolutionIdentity = Pick<
 
 export type PlanReviewResolutionIdentity = Pick<
   PlanReviewActionRequest,
-  "sessionKey" | "turnId" | "runId" | "requestId" | "planRevision" | "artifactHash"
+  "sessionKey" | "sessionEpoch" | "turnId" | "runId" | "parentRunId" | "requestId" | "planRevision" | "artifactHash"
 >;
 
 export type GoalConfirmationResolutionIdentity = Pick<
@@ -293,6 +296,7 @@ function buildBaseActionRequest(input: {
 
 export function buildPlanReviewActionRequest(input: {
   sessionKey: string;
+  sessionEpoch?: string;
   turnId: string;
   runId: string;
   parentRunId?: string | null;
@@ -305,6 +309,9 @@ export function buildPlanReviewActionRequest(input: {
   return {
     ...buildBaseActionRequest({ ...input, kind: "plan_review" }),
     kind: "plan_review",
+    ...(normalizeNonEmptyString(input.sessionEpoch)
+      ? { sessionEpoch: normalizeNonEmptyString(input.sessionEpoch) }
+      : {}),
     planRevision: Math.max(1, Number(input.planRevision) || 1),
     artifactHash: input.artifactHash,
     artifactPaths: [...input.artifactPaths],
@@ -614,6 +621,9 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
     return {
       ...base,
       kind,
+      ...(normalizeNonEmptyString(record.sessionEpoch)
+        ? { sessionEpoch: normalizeNonEmptyString(record.sessionEpoch) }
+        : {}),
       planRevision: Math.max(1, Number(record.planRevision) || 1),
       artifactHash,
       artifactPaths: Array.isArray(record.artifactPaths)

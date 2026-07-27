@@ -1,7 +1,10 @@
 import type { CommandDirective } from "./runIntent";
-import { resolveApprovedPlanValidationBoundary } from "./orchestrator/prompts/planPrompts";
 import {
   buildPlanTaskEvidenceAudit,
+  canDowngradeUnavailableBrowserValidationToAdvisory,
+  hasBrowserValidationCapability,
+  isPlanTaskAwaitingBrowserValidation,
+  isPlanTaskAwaitingExternalValidation,
   type PlanExecutionEvidenceEntry,
   type PlanTask,
   type PlanTaskEvidenceAudit,
@@ -55,6 +58,36 @@ export interface ApprovedPlanExecutionEvaluationInput {
   activeRecovery?: { mode: string } | null;
   turnId?: string | null;
   commandDirective?: CommandDirective | null;
+}
+
+/**
+ * Derive the remaining validation boundary from typed task evidence and the
+ * capabilities actually exposed to this Turn. This completion rule belongs to
+ * the evidence evaluator, not to a prompt or model-response parser.
+ */
+export function resolveApprovedPlanValidationBoundary(input: {
+  audit: PlanTaskEvidenceAudit | null;
+  availableToolNames: Set<string>;
+}): "none" | "browser_prompt" | "pause_browser_unavailable" | "pause_external_validation" {
+  const audit = input.audit;
+  if (!audit) return "none";
+  const browserAvailable = hasBrowserValidationCapability(input.availableToolNames);
+  if (audit.pendingExternalValidation && audit.automationComplete) {
+    return "pause_external_validation";
+  }
+  if (audit.allTrustedComplete) return "none";
+  const remaining = audit.remainingTasks;
+  if (remaining.length === 0) return "none";
+  const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
+  const allExternal = remaining.every(isPlanTaskAwaitingExternalValidation);
+  if (allBrowser && browserAvailable) return "browser_prompt";
+  if (allBrowser) {
+    return canDowngradeUnavailableBrowserValidationToAdvisory(audit)
+      ? "pause_external_validation"
+      : "pause_browser_unavailable";
+  }
+  if (allExternal) return "pause_external_validation";
+  return "none";
 }
 
 function buildCompletionGap(input: {

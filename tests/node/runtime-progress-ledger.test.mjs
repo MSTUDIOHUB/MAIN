@@ -94,7 +94,7 @@ test("active Run keeps exact-turn legacy progress when the display block has no 
   assert.equal(ledger[0].target, "src/main.js");
   assert.equal(
     buildCapsuleGuidanceText(buildRunStatusProjection(ledger), "zh"),
-    "我正在读取 `main.js`，确认与当前问题相关的实现。",
+    "我正在读取 `src/main.js`，确认与当前问题相关的实现。",
   );
 });
 
@@ -273,16 +273,16 @@ test("Capsule guidance explains the purpose of the latest structured action", ()
 
   assert.equal(
     buildCapsuleGuidanceText(projection, "zh"),
-    "我正在修改 `ChatArea.tsx`，把已确认的方案落实到代码。",
+    "我正在修改 `src/components/ChatArea.tsx`，把已确认的方案落实到代码。",
   );
   assert.equal(
     buildCapsuleGuidanceText(projection, "en"),
-    "I'm updating `ChatArea.tsx` to put the confirmed approach into the code.",
+    "I'm updating `src/components/ChatArea.tsx` to put the confirmed approach into the code.",
   );
   assert.doesNotMatch(buildCapsuleGuidanceText(projection, "zh"), /replace_in_file|private detail|raw model prose/);
 });
 
-test("Capsule collaboration guidance stays complete while ChatArea owns the full assignment", () => {
+test("a completed collaboration step clears from Capsule while ChatArea owns the durable assignment", () => {
   const projection = buildRunStatusProjection([{
     key: "run:1:spawn-subagent",
     runId: "run-1",
@@ -300,11 +300,10 @@ test("Capsule collaboration guidance stays complete while ChatArea owns the full
   }], "zh");
 
   const guidance = buildCapsuleGuidanceText(projection, "zh");
-  assert.equal(guidance, "子智能体 `Euler` 已开始独立调查，主体正在继续推进。");
-  assert.doesNotMatch(guidance, /\.\.\.|raw objective|spawn_subagent|private protocol/);
+  assert.equal(guidance, "");
 });
 
-test("Capsule does not let a long-lived spawn heartbeat overwrite newer parent work", () => {
+test("Capsule clears a superseded spawn heartbeat instead of showing stale parent work", () => {
   const projection = buildRunStatusProjection([
     {
       key: "run:1:spawn-subagent",
@@ -342,11 +341,11 @@ test("Capsule does not let a long-lived spawn heartbeat overwrite newer parent w
   assert.equal(projection.lastGuidanceActivity?.tool, "grep_search");
   assert.equal(
     buildCapsuleGuidanceText(projection, "zh"),
-    "我已搜索 `main.js`，正在收窄真正相关的路径。",
+    "",
   );
 });
 
-test("Capsule never presents a truncated protocol target as a complete thought", () => {
+test("Capsule keeps a full structured target without pretending it is an ellipsis", () => {
   const projection = buildRunStatusProjection([{
     key: "run:1:unknown",
     runId: "run-1",
@@ -364,11 +363,12 @@ test("Capsule never presents a truncated protocol target as a complete thought",
   }], "zh");
 
   const guidance = buildCapsuleGuidanceText(projection, "zh");
-  assert.equal(guidance, "我正在处理 当前工作区，确认这一步带来的变化。");
-  assert.doesNotMatch(guidance, /\.\.\.|xxx/);
+  assert.match(guidance, /我正在处理/);
+  assert.match(guidance, /x{400}/);
+  assert.doesNotMatch(guidance, /\.\.\./);
 });
 
-test("Capsule guidance retains the last structured activity without a lifecycle prose fallback", () => {
+test("Capsule clears completed structured activity and leaves phase fallback to its caller", () => {
   const emptyProjection = {
     currentActivity: null,
     lastGuidanceActivity: null,
@@ -404,7 +404,7 @@ test("Capsule guidance retains the last structured activity without a lifecycle 
   assert.equal(completedEdit.lastGuidanceActivity?.tool, "replace_in_file");
   assert.equal(
     buildCapsuleGuidanceText(completedEdit, "zh"),
-    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+    "",
   );
   const completedStatusEdit = buildRunStatusProjection([{
     ...completedEdit.lastGuidanceActivity,
@@ -414,7 +414,7 @@ test("Capsule guidance retains the last structured activity without a lifecycle 
   assert.equal(completedStatusEdit.lastGuidanceActivity?.tool, "replace_in_file");
   assert.equal(
     buildCapsuleGuidanceText(completedStatusEdit, "zh"),
-    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+    "",
   );
   const repeatedAfterCompletedEdit = {
     ...completedStatusEdit,
@@ -429,7 +429,7 @@ test("Capsule guidance retains the last structured activity without a lifecycle 
   };
   assert.equal(
     buildCapsuleGuidanceText(repeatedAfterCompletedEdit, "zh"),
-    "修改已写入 `ChatArea.tsx`，接下来我会验证结果。",
+    "",
   );
 
   const blockedAfterEdit = buildRunStatusProjection([
@@ -1149,7 +1149,7 @@ test("active child run filters parent harness telemetry", () => {
   assert.doesNotMatch(items[0].summary, /parent failed/);
 });
 
-test("active recovery child retains concrete parent guidance until it produces newer work", () => {
+test("active recovery child does not reuse completed parent guidance before it produces newer work", () => {
   const parentEvents = [
     withEventSchema({
       type: "run.started",
@@ -1206,7 +1206,7 @@ test("active recovery child retains concrete parent guidance until it produces n
   assert.equal(inheritedItems[0].runId, "run-parent");
   assert.equal(
     buildCapsuleGuidanceText(inheritedProjection, "zh"),
-    "我已读完 `main.js`，正在整理它说明了什么。",
+    "",
   );
   assert.doesNotMatch(inheritedProjection.activityText, /部分完成|继续自动恢复/);
 
@@ -1239,7 +1239,7 @@ test("active recovery child retains concrete parent guidance until it produces n
   assert.equal(childProjection.currentActivity?.runId, "run-child");
   assert.equal(
     buildCapsuleGuidanceText(childProjection, "zh"),
-    "我正在修改 `editor.js`，把已确认的方案落实到代码。",
+    "我正在修改 `src/components/editor.js`，把已确认的方案落实到代码。",
   );
 });
 

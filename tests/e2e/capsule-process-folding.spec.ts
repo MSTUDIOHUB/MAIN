@@ -138,7 +138,7 @@ test("Capsule turns structured runtime activity into conversational guidance", a
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
-    "我正在搜索 ChatArea.tsx，缩小接下来要检查的范围。",
+    "我正在搜索 src/components/ChatArea.tsx，缩小接下来要检查的范围。",
   );
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("grep_search");

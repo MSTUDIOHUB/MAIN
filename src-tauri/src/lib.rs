@@ -79,9 +79,7 @@ const HTTP_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const CURL_FALLBACK_STDERR_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_SUPERVISOR_GRACE_SECS: u64 = 5;
-const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
-const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
-const STREAM_IDLE_CHUNK_TIMEOUT_SECS: u64 = 180;
+const STREAM_PHASE_TIMEOUT_SECS: u64 = 180;
 const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 1_000;
 const READ_FILE_WINDOW_MAX_LINES: usize = 2_000;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 32_000;
@@ -9790,12 +9788,24 @@ async fn start_chat_stream(
     body: String,
     auth_mode: Option<String>,
     token_ref: Option<String>,
+    timeout_ms: Option<u64>,
 ) -> Result<(), String> {
     let stream_id = stream_id.trim().to_string();
     if stream_id.is_empty() {
         return Err("STREAM_ID_REQUIRED: stream_id 不能为空".to_string());
     }
     let stream_started_at = Instant::now();
+    let requested_timeout =
+        timeout_ms.map(|value| Duration::from_millis(value.clamp(1_000, 600_000)));
+    let stream_phase_timeout =
+        requested_timeout.unwrap_or(Duration::from_secs(STREAM_PHASE_TIMEOUT_SECS));
+    let stream_deadline = requested_timeout.map(|duration| stream_started_at + duration);
+    let remaining_stream_timeout = || {
+        stream_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(stream_phase_timeout)
+    };
+    let stream_phase_timeout_ms = stream_phase_timeout.as_millis();
     let original_url = url.clone();
     let stream_lease = ChatStreamLease::acquire(stream_id.clone())?;
     let cancel_flag = stream_lease.cancel_flag.clone();
@@ -9847,6 +9857,7 @@ async fn start_chat_stream(
             format!("stream_id={}", stream_id),
             format!("method=POST"),
             format!("url={}", url),
+            format!("phase_timeout_ms={}", stream_phase_timeout_ms),
         ];
         if let Ok(body_json) = serde_json::from_str::<Value>(&body) {
             if let Some(model) = body_json.get("model").and_then(|v| v.as_str()) {
@@ -9886,16 +9897,17 @@ async fn start_chat_stream(
         record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
     }
 
-    // No total client timeout is installed: once headers arrive, the existing
-    // first-chunk and idle watchdogs continue supervising long generations.
-    // The send phase itself remains exact-cancelable and response-bounded.
+    // Callers may own a bounded request deadline (for example a Plan synthesis
+    // stage). Without one, each transport phase retains the default watchdog.
+    // The response body remains exactly cancelable in both cases.
+    let response_timeout = remaining_stream_timeout();
     let response = match send_guarded_proxy_request(
         &url,
         "POST",
         &headers,
         Some(&body),
         None,
-        Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
+        response_timeout,
         is_model_request,
         true,
         is_model_request,
@@ -9928,9 +9940,9 @@ async fn start_chat_stream(
                 "warn",
                 "stream_first_chunk_timeout",
                 format!(
-                    "phase=response_headers url={} timeout_secs={} elapsed_ms={}",
+                    "phase=response_headers url={} timeout_ms={} elapsed_ms={}",
                     url,
-                    STREAM_FIRST_RESPONSE_TIMEOUT_SECS,
+                    response_timeout.as_millis(),
                     stream_started_at.elapsed().as_millis(),
                 ),
             );
@@ -9945,8 +9957,8 @@ async fn start_chat_stream(
                 &stream_id,
                 "error",
                 Some(format!(
-                    "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 秒内没有返回响应头，本轮已暂停。",
-                    STREAM_FIRST_RESPONSE_TIMEOUT_SECS,
+                    "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 毫秒内没有返回响应头，本轮已暂停。",
+                    response_timeout.as_millis(),
                 )),
             );
             return Ok(());
@@ -10010,8 +10022,9 @@ async fn start_chat_stream(
             futures_util::future::AbortHandle::new_pair();
         stream_lease.set_abort_handle(Some(chunk_abort_handle));
         let next_chunk = if chunk_count == 0 {
+            let chunk_timeout = remaining_stream_timeout();
             match tokio::time::timeout(
-                Duration::from_secs(STREAM_FIRST_CHUNK_TIMEOUT_SECS),
+                chunk_timeout,
                 futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
             )
             .await
@@ -10025,9 +10038,9 @@ async fn start_chat_stream(
                         "warn",
                         "stream_first_chunk_timeout",
                         format!(
-                            "phase=first_chunk url={} timeout_secs={} elapsed_ms={}",
+                            "phase=first_chunk url={} timeout_ms={} elapsed_ms={}",
                             url,
-                            STREAM_FIRST_CHUNK_TIMEOUT_SECS,
+                            chunk_timeout.as_millis(),
                             stream_started_at.elapsed().as_millis(),
                         ),
                     );
@@ -10042,8 +10055,8 @@ async fn start_chat_stream(
                         &stream_id,
                         "error",
                         Some(format!(
-                            "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 秒内没有返回首个流式 chunk，本轮已暂停。",
-                            STREAM_FIRST_CHUNK_TIMEOUT_SECS,
+                            "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 毫秒内没有返回首个流式 chunk，本轮已暂停。",
+                            chunk_timeout.as_millis(),
                         )),
                     );
                     return Ok(());
@@ -10070,8 +10083,9 @@ async fn start_chat_stream(
                 }
             }
         } else {
+            let chunk_timeout = remaining_stream_timeout();
             match tokio::time::timeout(
-                Duration::from_secs(STREAM_IDLE_CHUNK_TIMEOUT_SECS),
+                chunk_timeout,
                 futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
             )
             .await
@@ -10084,10 +10098,10 @@ async fn start_chat_stream(
                         "warn",
                         "stream_idle_timeout",
                         format!(
-                            "stream_id={} url={} timeout_secs={} chunks={} bytes={} elapsed_ms={}",
+                            "stream_id={} url={} timeout_ms={} chunks={} bytes={} elapsed_ms={}",
                             stream_id,
                             url,
-                            STREAM_IDLE_CHUNK_TIMEOUT_SECS,
+                            chunk_timeout.as_millis(),
                             chunk_count,
                             byte_count,
                             stream_started_at.elapsed().as_millis(),
@@ -10107,8 +10121,8 @@ async fn start_chat_stream(
                         &stream_id,
                         "error",
                         Some(format!(
-                            "STREAM_IDLE_TIMEOUT: 模型已返回首个流式 chunk，但 {} 秒内没有继续输出，本轮已暂停。",
-                            STREAM_IDLE_CHUNK_TIMEOUT_SECS,
+                            "STREAM_IDLE_TIMEOUT: 模型已返回首个流式 chunk，但 {} 毫秒内没有继续输出，本轮已暂停。",
+                            chunk_timeout.as_millis(),
                         )),
                     );
                     return Ok(());

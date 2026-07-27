@@ -179,7 +179,7 @@ test("submit game studio preparation returns failure for the shared bootstrap co
   assert.equal(state.isGenerating, true);
 });
 
-test("submit game studio preparation runs preparation and applies envelope result", async () => {
+test("submit game studio preparation builds an envelope without pre-lease effects", async () => {
   const state = createState();
   const harness = createHarness(state);
   const runtimeService = {
@@ -219,7 +219,7 @@ test("submit game studio preparation runs preparation and applies envelope resul
 
   assert.equal(result.ok, true);
   assert.match(result.userContent, /^ENVELOPE:unity-specialist:implement camera/);
-  assert.equal(result.gameStudioInitialized, true);
-  assert.equal(harness.invalidated, true);
-  assert.equal(state.bumpCount, 1);
+  assert.equal(result.gameStudioInitialized, false);
+  assert.equal(harness.invalidated, false);
+  assert.equal(state.bumpCount, 0);
 });

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -7,6 +7,13 @@ import { fileURLToPath } from "node:url";
 import {
   isFinitePlanValidationCommand,
 } from "../../src/lib/workflowModels";
+import { isWorkspaceMutationToolName } from "../../src/lib/workspaceMutationTools";
+import {
+  validateWorkPlanDraftV1,
+} from "../../src/lib/runtime-v2";
+import {
+  validateSealedWorkPlanV1Integrity,
+} from "../../src/store/runtimeV2/workPlanAdapter";
 import {
   hashPlanCandidate,
   PLAN_CANDIDATE_SCHEMA_VERSION,
@@ -32,8 +39,7 @@ import {
 import {
   getMdViewerExecutionGaps,
   getMdViewerFinalSummaryGaps,
-  getMdViewerReadablePlanGaps,
-  getMdViewerTypedPlanGaps,
+  getMdViewerWorkPlanGaps,
 } from "./realOmlxMdViewerPlanOracle";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
@@ -306,7 +312,7 @@ function summarizePlanDebugTail(entries: unknown[]): string[] {
       if (!entry || typeof entry !== "object") return String(entry || "");
       const record = entry as Record<string, unknown>;
       const source = String(record.source || record.target || "");
-      if (!/(?:^agent\.(?:plan_|loop_stop$|agent_loop_)|^store\.(?:non_actionable_stop|agent_loop_stop_summary|agent_loop_crashed|parent_subagents_finalized|terminal_|workflow_|harness_close_|stale_run_error_)|^app\.instance\.closed$|stream_(?:error|timeout|watchdog))/i.test(source)) {
+      if (!/(?:^agent\.(?:plan_|loop_stop$|agent_loop_)|^store\.(?:runtime_v2_|non_actionable_stop|agent_loop_stop_summary|agent_loop_crashed|parent_subagents_finalized|terminal_|workflow_|harness_close_|stale_run_error_)|^app\.instance\.closed$|stream_(?:error|timeout|watchdog))/i.test(source)) {
         return "";
       }
       return [record.level, source, record.message]
@@ -373,6 +379,250 @@ function parseStructuredDebugEntries(entries: unknown[]): StructuredDebugEntry[]
     }
     return [{ ...payload, source: String(record.source || "") }];
   });
+}
+
+function expectCanonicalRuntimeV2Terminal(
+  snapshot: any,
+  expected: {
+    turnId: string;
+    resultKind: "success" | "partial" | "blocked" | "error" | "canceled";
+    strategy?: "execute" | "plan";
+  },
+): any {
+  const runtime = snapshot?.runtimeV2;
+  expect(runtime, "The turn must expose its durable Runtime v2 checkpoint.").not.toBeNull();
+  expect(runtime?.schemaVersion).toBe("turn-aggregate.v1");
+  expect(runtime?.strategy).toBe(expected.strategy || "execute");
+  expect(runtime?.turnId).toBe(expected.turnId);
+  expect(runtime?.turnIdentity?.turnId).toBe(expected.turnId);
+  expect(runtime?.runIdentity?.turnId).toBe(expected.turnId);
+  expect(String(runtime?.runId || "")).not.toBe("");
+  expect(runtime?.phase).toBe("completed");
+  expect(runtime?.terminalOutcome?.resultKind).toBe(expected.resultKind);
+  expect(runtime?.terminal).toMatchObject({
+    runCompletedCount: 1,
+    turnCompletedCount: 1,
+    finalProjectionCount: 1,
+    runResultKind: expected.resultKind,
+    turnResultKind: expected.resultKind,
+    exactlyOnce: true,
+  });
+
+  const events = Array.isArray(runtime?.events) ? runtime.events : [];
+  const sequences = events.map((event: { sequence?: number }) => Number(event.sequence));
+  expect(sequences.length).toBeGreaterThan(0);
+  expect(sequences.every(Number.isFinite)).toBe(true);
+  for (let index = 1; index < sequences.length; index += 1) {
+    expect(sequences[index]).toBe(sequences[index - 1] + 1);
+  }
+  expect(new Set(events.map((event: { eventId?: string }) => event.eventId)).size)
+    .toBe(events.length);
+  expect(events[0]?.type).toBe("turn.admitted");
+  expect(events.filter((event: { type?: string }) => event.type === "run.started"))
+    .toHaveLength(1);
+  expect(events.filter((event: { type?: string }) => event.type === "run.completed"))
+    .toHaveLength(1);
+  expect(events.filter((event: { type?: string }) => event.type === "turn.completed"))
+    .toHaveLength(1);
+
+  const commands = Array.isArray(runtime?.commands) ? runtime.commands : [];
+  const receipts = Array.isArray(runtime?.receipts) ? runtime.receipts : [];
+  expect(commands.length).toBeGreaterThan(0);
+  expect(new Set(commands.map((command: { idempotencyKey?: string }) =>
+    command.idempotencyKey
+  )).size).toBe(commands.length);
+  expect(new Set(receipts.map((receipt: { idempotencyKey?: string }) =>
+    receipt.idempotencyKey
+  )).size).toBe(receipts.length);
+  expect(commands.map((command: { idempotencyKey?: string }) => command.idempotencyKey).sort())
+    .toEqual(receipts.map((receipt: { idempotencyKey?: string }) => receipt.idempotencyKey).sort());
+  expect(commands.every((command: { status?: string; completedAt?: number }) =>
+    ["succeeded", "failed", "canceled"].includes(String(command.status || "")) &&
+    Number.isFinite(command.completedAt)
+  )).toBe(true);
+  expect(commands.every((command: { turnId?: string; runId?: string }) =>
+    command.turnId === expected.turnId && command.runId === runtime.runId
+  )).toBe(true);
+
+  const projections = Array.isArray(runtime?.projections) ? runtime.projections : [];
+  const finalProjection = projections.filter(
+    (projection: { audience?: string; kind?: string }) =>
+      projection.audience === "final" && projection.kind === "final",
+  );
+  expect(finalProjection).toHaveLength(1);
+  expect(finalProjection[0]?.projectionId).toBe(runtime?.terminalOutcome?.finalProjectionId);
+  expect(runtime?.presentation?.finals || []).toHaveLength(1);
+  const threadTerminalEvents = runtime?.presentation?.threadEvents || [];
+  const projectedRunCompleted = threadTerminalEvents.filter(
+    (event: { type?: string }) => event.type === "run.completed",
+  );
+  const projectedTurnCompleted = threadTerminalEvents.filter(
+    (event: { type?: string }) => event.type === "turn.completed",
+  );
+  expect(projectedRunCompleted).toHaveLength(1);
+  expect(projectedTurnCompleted).toHaveLength(1);
+  expect(projectedRunCompleted[0]?.resultKind).toBe(expected.resultKind);
+  expect(projectedTurnCompleted[0]?.resultKind).toBe(expected.resultKind);
+  expect(Number(projectedRunCompleted[0]?.timestampMs))
+    .toBeLessThanOrEqual(Number(projectedTurnCompleted[0]?.timestampMs));
+  return runtime;
+}
+
+function expectRuntimeV2PlanReviewContract(
+  snapshot: any,
+  expected: { turnId: string },
+): any {
+  const runtime = snapshot?.runtimeV2;
+  expect(runtime, "Plan must expose its durable Runtime v2 checkpoint.").not.toBeNull();
+  expect(runtime?.schemaVersion).toBe("turn-aggregate.v1");
+  expect(runtime?.strategy).toBe("plan");
+  expect(runtime?.turnId).toBe(expected.turnId);
+  expect(runtime?.turnIdentity?.turnId).toBe(expected.turnId);
+  expect(runtime?.runIdentity?.turnId).toBe(expected.turnId);
+  expect(String(runtime?.runId || "")).not.toBe("");
+  expect(runtime?.phase).toBe("reviewing");
+  expect(runtime?.terminalOutcome).toBeNull();
+
+  const events = Array.isArray(runtime?.events) ? runtime.events : [];
+  const sequences = events.map((event: { sequence?: number }) => Number(event.sequence));
+  expect(sequences.length).toBeGreaterThan(0);
+  expect(sequences.every(Number.isFinite)).toBe(true);
+  for (let index = 1; index < sequences.length; index += 1) {
+    expect(sequences[index]).toBe(sequences[index - 1] + 1);
+  }
+  expect(new Set(events.map((event: { eventId?: string }) => event.eventId)).size)
+    .toBe(events.length);
+  expect(events[0]?.type).toBe("turn.admitted");
+  expect(events.filter((event: { type?: string }) => event.type === "run.started"))
+    .toHaveLength(1);
+  expect(events.filter((event: { type?: string }) => event.type === "work_plan.sealed"))
+    .toHaveLength(1);
+  expect(events.filter((event: { type?: string }) =>
+    event.type === "run.completed" || event.type === "turn.completed"
+  )).toHaveLength(0);
+
+  const sealed = runtime?.sealedWorkPlan;
+  const reference = runtime?.workPlan;
+  const commit = runtime?.planReviewCommit;
+  expect(sealed?.schemaVersion).toBe("work-plan.v1");
+  expect(sealed?.status).toBe("pending_review");
+  expect(reference?.status).toBe("pending_review");
+  expect(validateWorkPlanDraftV1(
+    sealed?.draft,
+    (sealed?.evidence || []).map((item: { id?: string }) => String(item.id || "")),
+    sealed?.evidence || [],
+  )).toEqual([]);
+  const integrity = validateSealedWorkPlanV1Integrity(sealed);
+  expect(integrity.ok).toBe(true);
+  const authority = {
+    id: sealed.id,
+    revision: sealed.revision,
+    digest: sealed.digest,
+    projectionHash: sealed.projectionHash,
+  };
+  expect(reference).toMatchObject(authority);
+  expect(commit?.schemaVersion).toBe("runtime-v2-plan-review-commit.v1");
+  expect(commit?.authority).toEqual(authority);
+  expect(commit?.review?.authority).toEqual(authority);
+  expect(commit?.review).toMatchObject({
+    sessionKey: runtime.turnIdentity.sessionKey,
+    sessionEpoch: runtime.turnIdentity.sessionEpoch,
+    turnId: expected.turnId,
+    runId: runtime.runId,
+    parentRunId: runtime.runIdentity.parentRunId ?? null,
+  });
+  expect(String(commit?.review?.requestId || "")).not.toBe("");
+  expect(commit?.artifact).toEqual({
+    path: ".MAIN/plans/plan.md",
+    content: sealed.markdown,
+    projectionHash: sealed.projectionHash,
+  });
+  expect(commit?.panel).toMatchObject({
+    audience: "plan_panel",
+    status: "pending_review",
+    authority,
+    title: sealed.draft.objective,
+    markdown: sealed.markdown,
+    validationCount: sealed.draft.validations.length,
+  });
+  expect(commit?.chat).toMatchObject({
+    audience: "chat_milestone",
+    authority,
+  });
+  expect(String(commit?.chat?.markdown || "")).not.toBe("");
+  expect(String(commit?.chat?.dedupeKey || "")).not.toBe("");
+
+  expect(snapshot?.activeActionRequest).toMatchObject({
+    kind: "plan_review",
+    requestId: commit.review.requestId,
+    sessionKey: commit.review.sessionKey,
+    sessionEpoch: commit.review.sessionEpoch,
+    turnId: expected.turnId,
+    runId: runtime.runId,
+    parentRunId: commit.review.parentRunId,
+    planRevision: sealed.revision,
+    artifactHash: sealed.projectionHash,
+    artifactPaths: [".MAIN/plans/plan.md"],
+  });
+
+  const commands = Array.isArray(runtime?.commands) ? runtime.commands : [];
+  const receipts = Array.isArray(runtime?.receipts) ? runtime.receipts : [];
+  expect(commands.length).toBeGreaterThan(0);
+  expect(new Set(commands.map((command: { idempotencyKey?: string }) =>
+    command.idempotencyKey
+  )).size).toBe(commands.length);
+  expect(new Set(receipts.map((receipt: { idempotencyKey?: string }) =>
+    receipt.idempotencyKey
+  )).size).toBe(receipts.length);
+  expect(commands.map((command: { idempotencyKey?: string }) => command.idempotencyKey).sort())
+    .toEqual(receipts.map((receipt: { idempotencyKey?: string }) => receipt.idempotencyKey).sort());
+  expect(commands.every((command: { status?: string; completedAt?: number }) =>
+    ["succeeded", "failed", "canceled"].includes(String(command.status || "")) &&
+    Number.isFinite(command.completedAt)
+  )).toBe(true);
+  expect(commands.every((command: { turnId?: string; runId?: string }) =>
+    command.turnId === expected.turnId && command.runId === runtime.runId
+  )).toBe(true);
+  const artifactWrites = commands.filter((command: {
+    kind?: string;
+    toolName?: string;
+    target?: string;
+    runtimeOwnedPlanArtifact?: boolean;
+  }) =>
+    command.kind === "execute_tool" &&
+    command.toolName === "write_file" &&
+    command.target === ".MAIN/plans/plan.md"
+  );
+  expect(artifactWrites).toHaveLength(1);
+  expect(artifactWrites[0]?.runtimeOwnedPlanArtifact).toBe(true);
+  expect(commands.filter((command: {
+    kind?: string;
+    toolName?: string;
+    runtimeOwnedPlanArtifact?: boolean;
+    target?: string;
+  }) =>
+    command.kind === "execute_tool" &&
+    isWorkspaceMutationToolName(String(command.toolName || "")) &&
+    !(
+      command.toolName === "write_file" &&
+      command.target === ".MAIN/plans/plan.md" &&
+      command.runtimeOwnedPlanArtifact === true
+    )
+  )).toHaveLength(0);
+
+  const committedProjections = (runtime?.projections || []).filter(
+    (projection: { audience?: string; dedupeKey?: string; markdown?: string }) =>
+      projection.audience === "chat_milestone" &&
+      projection.dedupeKey === commit.chat.dedupeKey &&
+      projection.markdown === commit.chat.markdown,
+  );
+  expect(committedProjections).toHaveLength(1);
+  const visibleMilestones = (runtime?.presentation?.chatMilestones || []).filter(
+    (projection: { markdown?: string }) =>
+      projection.markdown === commit.chat.markdown,
+  );
+  expect(visibleMilestones).toHaveLength(1);
+  return runtime;
 }
 
 function inspectPreferredSubagentCollaboration(
@@ -823,15 +1073,19 @@ test.beforeEach(async ({ page }) => {
     };
   });
 
-  const chatStreams = new Map<string, {
-    reader: ReadableStreamDefaultReader<Uint8Array>;
+  type RealOmlxChatStream = {
+    reader: ReadableStreamDefaultReader<Uint8Array> | null;
     decoder: TextDecoder;
     controller: AbortController;
     url: string;
     model: string;
     chars: number;
+    chunks: number;
     preview: string;
-  }>();
+    timeoutMs: number;
+    deadlineAt: number;
+  };
+  const chatStreams = new Map<string, RealOmlxChatStream>();
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
     const url = String(args.url || "");
@@ -842,41 +1096,105 @@ test.beforeEach(async ({ page }) => {
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
+    const requestedTimeoutMs = Number(args.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeoutMs)
+      ? Math.max(1_000, Math.min(600_000, Math.trunc(requestedTimeoutMs)))
+      : 180_000;
     const controller = new AbortController();
-    const response = await fetch(url, {
-      method: "POST",
-      headers: args.headers as Record<string, string>,
-      body: bodyText,
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
-    }
-    if (!response.body) throw new Error(`HTTP ${response.status}: response body is not streamable`);
-    chatStreams.set(streamId, {
-      reader: response.body.getReader(),
+    const stream: RealOmlxChatStream = {
+      reader: null,
       decoder: new TextDecoder(),
       controller,
       url,
       model,
       chars: 0,
+      chunks: 0,
       preview: "",
-    });
-    return { status: response.status };
+      timeoutMs,
+      deadlineAt: Date.now() + timeoutMs,
+    };
+    // Register the lease before waiting for response headers. OMLX can spend
+    // substantial time in prefill, and cancellation must still reach that
+    // in-flight fetch instead of becoming a no-op before a reader exists.
+    chatStreams.set(streamId, stream);
+    let responseHeaderTimer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const response = await Promise.race([
+        fetch(url, {
+          method: "POST",
+          headers: args.headers as Record<string, string>,
+          body: bodyText,
+          signal: controller.signal,
+        }),
+        new Promise<never>((_resolve, reject) => {
+          responseHeaderTimer = setTimeout(() => {
+            reject(new Error(
+              `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
+            ));
+          }, Math.max(1, stream.deadlineAt - Date.now()));
+        }),
+      ]);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+      }
+      if (!response.body) throw new Error(`HTTP ${response.status}: response body is not streamable`);
+      if (!chatStreams.has(streamId)) {
+        controller.abort();
+        throw new Error("chat_stream_canceled_before_headers");
+      }
+      stream.reader = response.body.getReader();
+      return { status: response.status };
+    } catch (error) {
+      chatStreams.delete(streamId);
+      controller.abort();
+      throw error;
+    } finally {
+      if (responseHeaderTimer !== null) clearTimeout(responseHeaderTimer);
+    }
   });
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_READ", async (streamId: string) => {
     const stream = chatStreams.get(String(streamId));
-    if (!stream) return { done: true, chunk: "" };
-    const { done, value } = await stream.reader.read();
-    const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
-    stream.chars += chunk.length;
-    if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
-    if (done) {
+    if (!stream?.reader) return { done: true, chunk: "" };
+    const phase = stream.chunks === 0 ? "first_chunk" : "idle_chunk";
+    const remainingMs = stream.deadlineAt - Date.now();
+    if (remainingMs <= 0) {
       chatStreams.delete(String(streamId));
-      console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+      stream.controller.abort();
+      void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
+      throw new Error(
+        `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
+      );
     }
-    return { done, chunk };
+    let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const { done, value } = await Promise.race([
+        stream.reader.read(),
+        new Promise<never>((_resolve, reject) => {
+          chunkTimer = setTimeout(() => {
+            reject(new Error(
+              `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
+            ));
+          }, Math.max(1, remainingMs));
+        }),
+      ]);
+      const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
+      stream.chars += chunk.length;
+      stream.chunks += 1;
+      if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
+      if (done) {
+        chatStreams.delete(String(streamId));
+        console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+      }
+      return { done, chunk };
+    } catch (error) {
+      chatStreams.delete(String(streamId));
+      stream.controller.abort();
+      void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
+      throw error;
+    } finally {
+      if (chunkTimer !== null) clearTimeout(chunkTimer);
+    }
   });
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_CANCEL", async (streamId: string) => {
     const stream = chatStreams.get(String(streamId));
@@ -1581,6 +1899,142 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+async function attachRealOmlxFailureDiagnostics(
+  page: Page,
+  testInfo: TestInfo,
+  workspace: string,
+): Promise<void> {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  let snapshot: any = null;
+  let presentation: any = null;
+  let fixture: any = null;
+  try {
+    ({ snapshot, presentation } = await page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.() || null;
+      const capsule = document.querySelector<HTMLElement>(
+        '[data-testid="agent-explanation-capsule"]',
+      );
+      const visibleProgress = [...document.querySelectorAll<HTMLElement>(
+        '[data-testid="progress-block"]',
+      )].map((node) => ({
+        visible: node.getClientRects().length > 0,
+        phase: node.dataset.phase || "",
+        status: node.dataset.status || "",
+        text: String(node.textContent || "").replace(/\s+/g, " ").trim(),
+      }));
+      return {
+        snapshot,
+        presentation: {
+          capsule: capsule ? {
+            visible: capsule.getClientRects().length > 0,
+            text: String(capsule.textContent || "").replace(/\s+/g, " ").trim(),
+            guidanceSource: capsule.dataset.guidanceSource || "",
+            status: capsule.dataset.capsuleStatus || "",
+            turnId: capsule.dataset.turnId || "",
+            runId: capsule.dataset.runId || "",
+            updatedAt: capsule.dataset.guidanceUpdatedAt || "",
+          } : null,
+          processTimelineVisible:
+            document.querySelector<HTMLElement>('[data-testid="live-turn-process-timeline"]')
+              ?.getClientRects().length > 0,
+          progress: visibleProgress,
+        },
+      };
+    }));
+  } catch (error) {
+    presentation = {
+      pageInspectionError: error instanceof Error ? error.message : String(error),
+    };
+  }
+  try {
+    await fs.access(workspace);
+    const inspected = await inspectFixtureMutation(workspace);
+    const fileHashes = Object.fromEntries(
+      Object.entries(inspected.contents).map(([relativePath, content]) => [
+        relativePath,
+        {
+          bytes: Buffer.byteLength(content, "utf8"),
+          sha256: createHash("sha256").update(content).digest("hex"),
+        },
+      ]),
+    );
+    fixture = {
+      workspace,
+      satisfied: inspected.satisfied,
+      detail: inspected.detail,
+      fileHashes,
+    };
+  } catch (error) {
+    fixture = {
+      workspace,
+      inspectionError: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const attachments = [
+    {
+      name: "runtime-v2-ledger",
+      value: {
+        testStatus: testInfo.status,
+        expectedStatus: testInfo.expectedStatus,
+        identity: {
+          currentTurnId: snapshot?.currentTurnId || null,
+          currentTurnStatus: snapshot?.currentTurnStatus || null,
+          currentTurnIntent: snapshot?.currentTurnIntent || null,
+          agentStatus: snapshot?.agentStatus || null,
+          isGenerating: snapshot?.isGenerating ?? null,
+        },
+        admission: snapshot?.lastWorkspaceInstructionAcceptance || null,
+        runtimeV2: snapshot?.runtimeV2 || null,
+      },
+    },
+    {
+      name: "runtime-v2-debug",
+      value: {
+        runtimeV2: snapshot?.runtimeV2?.debug || [],
+        terminalAndErrors: (snapshot?.debugTail || []).filter((entry: { source?: string }) =>
+          /runtime_v2|terminal|error|failed|crash|timeout|watchdog/i.test(
+            String(entry?.source || ""),
+          )
+        ).slice(-400),
+      },
+    },
+    {
+      name: "runtime-v2-presentation",
+      value: {
+        ledgerProjection: snapshot?.runtimeV2?.presentation || null,
+        browser: presentation,
+        taskFlow: (snapshot?.taskFlowPreview || []).filter((block: { turnId?: string }) =>
+          block.turnId === snapshot?.currentTurnId
+        ),
+      },
+    },
+    {
+      name: "fixture-state",
+      value: fixture,
+    },
+  ];
+  for (const attachment of attachments) {
+    await testInfo.attach(`${attachment.name}.json`, {
+      body: Buffer.from(JSON.stringify(attachment.value, null, 2), "utf8"),
+      contentType: "application/json",
+    });
+  }
+}
+
+// A caller-provided fixture is never owned by this test. Generated fixtures
+// are removed by default so repeated real-model runs do not leave a growing
+// collection of stale workspaces; opt in when a failed case needs inspection.
+test.afterEach(async ({ page }, testInfo) => {
+  const workspace = String((page as any).__realOmlxWorkspace || "").trim();
+  if (workspace) {
+    await attachRealOmlxFailureDiagnostics(page, testInfo, workspace);
+  }
+  if (String(process.env.REAL_OMLX_WORKSPACE || "").trim()) return;
+  if (process.env.MAIN_KEEP_REAL_OMLX_FIXTURE === "1") return;
+  if (!workspace) return;
+  await fs.rm(workspace, { recursive: true, force: true });
+});
+
 for (const model of models) {
   test(`real OMLX MAIN plan/approve/execute reaches closure or bounded pause with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
@@ -1615,9 +2069,12 @@ for (const model of models) {
       preferSubagents: realOmlxPreferSubagents,
     });
 
-    const admittedPlanTurnId = realOmlxPlanOnly
-      ? assertFirstPlanWorkspaceTurnAdmission(immediateAdmissionSnapshot)
-      : "";
+    const admittedPlanTurnId = assertFirstPlanWorkspaceTurnAdmission(
+      immediateAdmissionSnapshot,
+    );
+    expect((immediateAdmissionSnapshot?.conversationTurnPreview || []).find(
+      (turn: { id?: string }) => turn.id === admittedPlanTurnId,
+    )?.runtimeEngineVersion).toBe("v2");
 
     let lastPlanPollSignature = "";
     let lastPlanTerminalSignature = "";
@@ -1632,7 +2089,9 @@ for (const model of models) {
           isGenerating: snapshot?.isGenerating,
           currentTurnStatus: snapshot?.currentTurnStatus,
           planStage: snapshot?.planStage,
-          artifactCount: snapshot?.planArtifacts?.length ?? 0,
+          runtimePhase: snapshot?.runtimeV2?.phase || null,
+          workPlanStatus: snapshot?.runtimeV2?.workPlan?.status || null,
+          hasReviewCommit: Boolean(snapshot?.runtimeV2?.planReviewCommit),
         };
         const planPollSignature = JSON.stringify(planPollDiagnostic);
         if (planPollSignature !== lastPlanPollSignature) {
@@ -1646,9 +2105,11 @@ for (const model of models) {
           lastPlanDebugSignature = debugSignature;
         }
         if (snapshot?.dispatchError) throw new Error(`dispatch_error:${snapshot.dispatchError}`);
-        const artifactCount = snapshot?.planArtifacts?.length ?? 0;
         if (
-          artifactCount > 0 &&
+          snapshot?.runtimeV2?.phase === "reviewing" &&
+          snapshot?.runtimeV2?.workPlan?.status === "pending_review" &&
+          snapshot?.runtimeV2?.sealedWorkPlan?.status === "pending_review" &&
+          snapshot?.runtimeV2?.planReviewCommit &&
           snapshot?.isGenerating === false &&
           snapshot?.agentStatus === "pending_review" &&
           snapshot?.currentTurnStatus === "awaiting_approval" &&
@@ -1658,12 +2119,11 @@ for (const model of models) {
         }
         if (
           snapshot?.isGenerating === false &&
-          (
-            (snapshot?.taskFlowTypes || []).includes("user") ||
-            ["error", "idle"].includes(String(snapshot?.agentStatus || ""))
-          )
+          snapshot?.runtimeV2?.terminal?.exactlyOnce === true &&
+          !snapshot?.runtimeV2?.planReviewCommit
         ) {
-          const terminal = `terminal_without_artifact:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+          const terminal =
+            `terminal_without_v2_review:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
           if (terminal !== lastPlanTerminalSignature) {
             console.log(`[real-omlx-plan-terminal:${model}] ${terminal}`);
             console.log(`[real-omlx-plan-debug:${model}] ${JSON.stringify(summarizePlanDebugTail(snapshot?.debugTail || []))}`);
@@ -1680,6 +2140,7 @@ for (const model of models) {
     } catch (error) {
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
       console.log(`[real-omlx-plan-timeout-debug:${model}] ${JSON.stringify(summarizePlanDebugTail(snapshot?.debugTail || [])).slice(-12_000)}`);
+      console.log(`[real-omlx-plan-timeout-runtime-v2:${model}] ${JSON.stringify(snapshot?.runtimeV2?.debug || []).slice(-12_000)}`);
       console.log(`[real-omlx-plan-timeout-flow:${model}] ${JSON.stringify(snapshot?.taskFlowPreview || []).slice(-12_000)}`);
       throw error;
     }
@@ -1687,35 +2148,38 @@ for (const model of models) {
     if (planTerminalSnapshot) {
       const mutationAfterPlanPause = await readFixtureMutationContents(workspace);
       expect(mutationAfterPlanPause).toEqual(originalMutationContents);
+      expect(planTerminalSnapshot?.runtimeV2?.sealedWorkPlan || null).toBeNull();
+      expect(planTerminalSnapshot?.runtimeV2?.planReviewCommit || null).toBeNull();
       expect(planTerminalSnapshot?.planArtifacts || []).toHaveLength(0);
-      expect(planTerminalSnapshot?.planStage).not.toBe("completed");
-      expect(completedTurnStatuses.has(String(planTerminalSnapshot?.currentTurnStatus || ""))).toBe(false);
-      const planTerminalSummary = [...(planTerminalSnapshot?.debugTail || [])]
-        .reverse()
-        .map((entry: { source?: string; message?: string }) => {
-          if (entry.source !== "store.agent_loop_stop_summary") return null;
-          try {
-            return JSON.parse(String(entry.message || "{}"));
-          } catch {
-            return null;
-          }
-        })
-        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "plan");
-      expect(planTerminalSummary?.status).toBe("paused");
-      expect(planTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      const resultKind = String(
+        planTerminalSnapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
+      ) as "success" | "partial" | "blocked" | "error" | "canceled";
+      expect(resultKind).not.toBe("success");
+      expectCanonicalRuntimeV2Terminal(planTerminalSnapshot, {
+        turnId: admittedPlanTurnId,
+        resultKind,
+        strategy: "plan",
+      });
       console.log(`[real-omlx-plan-safe-pause:${model}] ${JSON.stringify({
-        reason: planTerminalSummary?.reason,
-        currentTurnStatus: planTerminalSnapshot?.currentTurnStatus,
-        planStage: planTerminalSnapshot?.planStage,
+        resultKind,
+        reason: planTerminalSnapshot?.runtimeV2?.terminalOutcome?.reason,
       })}`);
       return;
     }
 
-    const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
+    const planSnapshot = await page.evaluate(() =>
+      (window as any).__CODELY_E2E__?.getSnapshot?.()
+    );
+    const planRuntime = expectRuntimeV2PlanReviewContract(planSnapshot, {
+      turnId: admittedPlanTurnId,
+    });
+    const sealedWorkPlan = planRuntime.sealedWorkPlan;
+    const reviewCommit = planRuntime.planReviewCommit;
+    const plan = String(sealedWorkPlan.markdown || "");
     if (isMdViewerSavePathIncident) {
       expect(
-        getMdViewerReadablePlanGaps(plan),
-        "MD Viewer Markdown is a review projection and must expose readable R/C/V sections.",
+        getMdViewerWorkPlanGaps(sealedWorkPlan),
+        "MD Viewer acceptance is owned by the evidence-bound Runtime v2 WorkPlan.",
       ).toEqual([]);
     } else {
       expect(plan).toMatch(realOmlxPlanExpectation);
@@ -1727,61 +2191,40 @@ for (const model of models) {
     expect(plan).not.toMatch(/以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change/i);
     expect(plan).not.toMatch(/直接相关的最小改动|写入前先用证据确认|依据证据：已搜索文件|依据证据：已查看目录/i);
     expect(plan).not.toMatch(/(?:已读证据|证据引用|Read Evidence)[\s\S]{0,800}\.MAIN\/plans\/plan\.md/i);
-    const planSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    expect(planSnapshot?.planArtifacts || []).toHaveLength(1);
-    expect(planSnapshot?.planArtifacts?.[0]?.path).toBe(".MAIN/plans/plan.md");
-    const typedPlanArtifact = planSnapshot?.planArtifacts?.[0];
-    expect(typedPlanArtifact?.candidate).toBeTruthy();
-    expect(typedPlanArtifact?.candidate?.schemaVersion).toBe(PLAN_CANDIDATE_SCHEMA_VERSION);
-    expect(typedPlanArtifact?.candidate?.ingress).toBe("typed_runtime");
-    expect(typedPlanArtifact?.candidate?.validations?.some(
-      (validation: { primitive: Parameters<typeof isAcceptanceCapableValidationSpec>[0] }) =>
-        isAcceptanceCapableValidationSpec(validation.primitive),
+    expect(planSnapshot?.planArtifacts || []).toHaveLength(0);
+    expect(sealedWorkPlan.draft.validations.some(
+      (validation: { command?: string; kind?: string; required?: boolean }) =>
+        validation.kind === "finite_command" &&
+        validation.required === true &&
+        isFinitePlanValidationCommand(String(validation.command || "")),
     )).toBe(true);
-    expect(validateSealedPlanCandidate({
-      candidate: typedPlanArtifact.candidate,
-      expectedContent: typedPlanArtifact.content,
-    })).toEqual([]);
-    expect(typedPlanArtifact?.candidateHash).toBe(
-      hashPlanCandidate(typedPlanArtifact.candidate),
-    );
-    expect(typedPlanArtifact?.authoringContractId).toBe(
-      typedPlanArtifact?.candidate?.authoringContractId,
-    );
-    const candidateEvidenceTargets = new Set(
-      typedPlanArtifact.candidate.evidence.map(
+    const workPlanEvidenceTargets = new Set(
+      sealedWorkPlan.evidence.map(
         (entry: { target: string }) => String(entry.target || "").trim(),
       ),
     );
     for (const target of realOmlxPlanEvidenceTargets) {
       expect(
-        candidateEvidenceTargets.has(target),
-        `Typed Plan evidence must contain exact required target: ${target}`,
+        workPlanEvidenceTargets.has(target),
+        `Runtime v2 WorkPlan evidence must contain exact required target: ${target}`,
       ).toBe(true);
     }
-    const acceptanceState = planSnapshot?.acceptanceState as RealOmlxAcceptanceState | null;
-    expect(acceptanceState?.authoringContractIds || []).toContain(
-      typedPlanArtifact?.authoringContractId,
-    );
-    if (isMdViewerSavePathIncident) {
-      expect(
-        getMdViewerTypedPlanGaps(typedPlanArtifact.candidate),
-        "MD Viewer acceptance is owned by the typed evidence/diagnosis/change/validation graph, not Markdown keywords.",
-      ).toEqual([]);
-    }
-    expect(acceptanceState?.evidenceBundleHashes || []).toContain(
-      typedPlanArtifact?.candidate?.bundleHash,
-    );
     const persistedPlan = await fs.readFile(
-      path.join(workspace, String(planSnapshot?.planArtifacts?.[0]?.path || "")),
+      path.join(workspace, reviewCommit.artifact.path),
       "utf8",
     );
-    expect(persistedPlan.trim()).toBe(plan.trim());
+    expect(persistedPlan).toBe(plan);
+    expect(reviewCommit.artifact.content).toBe(plan);
+    await expect(page.getByTestId("plan-review-panel")).toBeVisible();
+    await expect(page.getByTestId("plan-review-panel")).toContainText(
+      sealedWorkPlan.draft.objective,
+    );
+    await expect(page.getByText("修复计划已准备好", { exact: true }).last())
+      .toBeVisible();
     expect(reviewablePlanStages.has(String(planSnapshot?.planStage || ""))).toBe(true);
-    if (realOmlxPreferSubagents) {
-      await assertPreferredSubagentCollaboration(page);
-    }
-    const planChatText = JSON.stringify(planSnapshot?.taskFlowPreview || []);
+    const planChatText = (planRuntime.presentation?.chatMilestones || [])
+      .map((milestone: { markdown?: string }) => String(milestone.markdown || ""))
+      .join("\n");
     console.log(`[real-omlx-plan-artifact:${model}]\n${plan}`);
     console.log(`[real-omlx-chat-plan:${model}] ${planChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(planChatText).toMatch(realOmlxPlanOnly
@@ -1816,8 +2259,12 @@ for (const model of models) {
       expect(finalPlanSnapshot?.currentTurnId).toBe(admittedPlanTurnId);
       expect(String(finalPlanSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
       expect(finalPlanSnapshot?.currentTurnIntent).toBe("plan");
-      expect(finalPlanSnapshot?.planArtifacts || []).toHaveLength(1);
-      expect(finalPlanSnapshot?.planArtifacts?.[0]?.path).toBe(".MAIN/plans/plan.md");
+      expect(finalPlanSnapshot?.planArtifacts || []).toHaveLength(0);
+      const finalPlanRuntime = expectRuntimeV2PlanReviewContract(finalPlanSnapshot, {
+        turnId: admittedPlanTurnId,
+      });
+      expect(finalPlanRuntime.sealedWorkPlan.digest).toBe(sealedWorkPlan.digest);
+      expect(finalPlanRuntime.planReviewCommit).toEqual(reviewCommit);
       expect(reviewablePlanStages.has(String(finalPlanSnapshot?.planStage || ""))).toBe(true);
       expect(JSON.stringify(finalPlanSnapshot?.debugTail || [])).not.toMatch(
         /plan_generation_failed|plan_evidence_materialization_exhausted/i,
@@ -1825,8 +2272,8 @@ for (const model of models) {
       expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(originalPlanOnlyWorkspaceFingerprint);
       if (isMdViewerSavePathIncident) {
         expect(
-          getMdViewerReadablePlanGaps(plan),
-          "MD Viewer review projection must retain readable typed-node sections while awaiting approval.",
+          getMdViewerWorkPlanGaps(finalPlanRuntime.sealedWorkPlan),
+          "MD Viewer review authority must retain the evidence-bound repair and validation graph.",
         ).toEqual([]);
         if (/\bopenFile\b/.test(plan)) {
           expect(plan).toMatch(/openFile[^\n]{0,180}(?:未被调用|无调用|无引用|非主因|死代码|not\s+(?:called|referenced|the\s+cause)|dead\s+code)/i);
@@ -1848,9 +2295,16 @@ for (const model of models) {
     await expect.poll(async () => {
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
       if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
-      return snapshot?.isPlanApproved === true && snapshot?.planApprovalExecutionStartedForTurnId
+      const runtime = snapshot?.runtimeV2;
+      return (
+        snapshot?.isPlanApproved === true &&
+        runtime?.turnId === admittedPlanTurnId &&
+        runtime?.workPlan?.status === "approved" &&
+        runtime?.eventTypes?.includes("work_plan.approved") &&
+        ["acting", "completed"].includes(String(runtime?.phase || ""))
+      )
         ? "execution_started"
-        : `waiting:${snapshot?.agentStatus}:${snapshot?.isGenerating}:${Boolean(snapshot?.pendingPlanApprovalHandoff)}`;
+        : `waiting:${runtime?.phase}:${runtime?.workPlan?.status}:${snapshot?.isGenerating}`;
     }, { timeout: 30_000 }).toBe("execution_started");
 
     let earlyExecutionSnapshot: any = null;
@@ -1873,18 +2327,12 @@ for (const model of models) {
         }
         const mutationState = await inspectFixtureMutation(workspace, originalMutationContents);
         if (mutationState.satisfied && mutationState.changedFiles.length > 0) return "mutated";
-        const terminalWithoutMutation = snapshot?.isGenerating === false && (
-          ["idle", "error"].includes(String(snapshot?.agentStatus || "")) ||
-          ["paused", "stopped_no_action", "error"].includes(String(snapshot?.currentTurnStatus || "")) ||
-          snapshot?.planStage === "paused"
-        );
-        if (terminalWithoutMutation) {
+        if (snapshot?.runtimeV2?.terminal?.exactlyOnce === true) {
           console.log(`[real-omlx-execute-safe-pause:${model}] ${JSON.stringify({
-            agentStatus: snapshot?.agentStatus,
-            currentTurnStatus: snapshot?.currentTurnStatus,
-            planStage: snapshot?.planStage,
-            toolBlocks: (snapshot?.toolBlocks || []).slice(-8),
-            debugTail: summarizePlanDebugTail(snapshot?.debugTail || []),
+            terminal: snapshot?.runtimeV2?.terminal,
+            commands: snapshot?.runtimeV2?.commands,
+            evidence: snapshot?.runtimeV2?.evidence,
+            debug: snapshot?.runtimeV2?.debug,
           }).slice(-12_000)}`);
           return "safe_pause";
         }
@@ -1900,8 +2348,7 @@ for (const model of models) {
         currentTurnStatus: snapshot?.currentTurnStatus,
         planStage: snapshot?.planStage,
         activeActionRequest: snapshot?.activeActionRequest,
-        toolBlocks: (snapshot?.toolBlocks || []).slice(-20),
-        debugTail: snapshot?.debugTail || [],
+        runtimeV2: snapshot?.runtimeV2,
       }).slice(-40_000)}`);
       throw error;
     }
@@ -1910,21 +2357,15 @@ for (const model of models) {
     if (!mutationAfterEarlyOutcome.satisfied || mutationAfterEarlyOutcome.changedFiles.length === 0) {
       expect(allowSafeExecutionPause, "Set REAL_OMLX_ALLOW_SAFE_PAUSE=1 when model incapability may be accepted as an honest bounded pause.").toBe(true);
       expect(mutationAfterEarlyOutcome.contents).toEqual(originalMutationContents);
-      expect(earlyExecutionSnapshot?.planStage).not.toBe("completed");
-      expect(completedTurnStatuses.has(String(earlyExecutionSnapshot?.currentTurnStatus || ""))).toBe(false);
-      const executeTerminalSummary = [...(earlyExecutionSnapshot?.debugTail || [])]
-        .reverse()
-        .map((entry: { source?: string; message?: string }) => {
-          if (entry.source !== "store.agent_loop_stop_summary") return null;
-          try {
-            return JSON.parse(String(entry.message || "{}"));
-          } catch {
-            return null;
-          }
-        })
-        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
-      expect(executeTerminalSummary?.status).toBe("paused");
-      expect(executeTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      const resultKind = String(
+        earlyExecutionSnapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
+      ) as "success" | "partial" | "blocked" | "error" | "canceled";
+      expect(resultKind).not.toBe("success");
+      expectCanonicalRuntimeV2Terminal(earlyExecutionSnapshot, {
+        turnId: admittedPlanTurnId,
+        resultKind,
+        strategy: "plan",
+      });
       return;
     }
 
@@ -1946,115 +2387,150 @@ for (const model of models) {
           }
           return "running";
         }
-        if (
-          snapshot?.isGenerating === false &&
-          snapshot?.planStage === "completed" &&
-          completedTurnStatuses.has(String(snapshot?.currentTurnStatus || ""))
-        ) return "completed";
-        if (snapshot?.isGenerating === false) {
+        if (snapshot?.runtimeV2?.terminal?.exactlyOnce === true) {
           terminalExecutionSnapshot = snapshot;
-          return "terminal";
+          return "completed";
         }
         return "running";
       }, { timeout: 300_000 })
-      .toMatch(/^(?:completed|terminal)$/);
+      .toBe("completed");
 
-    if (terminalExecutionSnapshot) {
+    const executionResultKind = String(
+      terminalExecutionSnapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
+    ) as "success" | "partial" | "blocked" | "error" | "canceled";
+    if (executionResultKind !== "success") {
       console.log(`[real-omlx-execute-terminal:${model}] ${JSON.stringify({
-        agentStatus: terminalExecutionSnapshot?.agentStatus,
-        currentTurnStatus: terminalExecutionSnapshot?.currentTurnStatus,
-        planStage: terminalExecutionSnapshot?.planStage,
-        activeActionRequest: terminalExecutionSnapshot?.activeActionRequest,
-        toolBlocks: (terminalExecutionSnapshot?.toolBlocks || []).slice(-20),
-        debugTail: terminalExecutionSnapshot?.debugTail || [],
+        terminal: terminalExecutionSnapshot?.runtimeV2?.terminal,
+        commands: terminalExecutionSnapshot?.runtimeV2?.commands,
+        evidence: terminalExecutionSnapshot?.runtimeV2?.evidence,
+        debug: terminalExecutionSnapshot?.runtimeV2?.debug,
       }).slice(-40_000)}`);
       expect(
         allowSafeExecutionPause,
         "Set REAL_OMLX_ALLOW_SAFE_PAUSE=1 when model incapability may be accepted as an honest bounded pause.",
       ).toBe(true);
-      expect(["paused", "stopped_no_action", "stopped_no_output"]).toContain(
-        String(terminalExecutionSnapshot?.currentTurnStatus || ""),
-      );
-      expect(terminalExecutionSnapshot?.planStage).not.toBe("completed");
-      const executeTerminalSummary = [...(terminalExecutionSnapshot?.debugTail || [])]
-        .reverse()
-        .map((entry: { source?: string; message?: string }) => {
-          if (entry.source !== "store.agent_loop_stop_summary") return null;
-          try {
-            return JSON.parse(String(entry.message || "{}"));
-          } catch {
-            return null;
-          }
-        })
-        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
-      expect(executeTerminalSummary?.status).toBe("paused");
-      expect(executeTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      expectCanonicalRuntimeV2Terminal(terminalExecutionSnapshot, {
+        turnId: admittedPlanTurnId,
+        resultKind: executionResultKind,
+        strategy: "plan",
+      });
       return;
     }
 
     const bodyText = await page.locator("body").innerText();
-    const executionSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    const executionChatText = JSON.stringify(executionSnapshot?.taskFlowPreview || []);
+    const executionSnapshot = terminalExecutionSnapshot;
+    const executionRuntime = expectCanonicalRuntimeV2Terminal(executionSnapshot, {
+      turnId: admittedPlanTurnId,
+      resultKind: "success",
+      strategy: "plan",
+    });
+    expect(executionRuntime.workPlan).toMatchObject({
+      ...reviewCommit.authority,
+      status: "approved",
+    });
+    expect(executionRuntime.sealedWorkPlan).toEqual(sealedWorkPlan);
+    expect(executionRuntime.planReviewCommit).toEqual(reviewCommit);
+    const executionChatText = [
+      ...(executionRuntime.presentation?.chatMilestones || []).map(
+        (entry: { markdown?: string }) => String(entry.markdown || ""),
+      ),
+      ...(executionRuntime.presentation?.finals || []).map(
+        (entry: { markdown?: string }) => String(entry.markdown || ""),
+      ),
+    ].join("\n");
     console.log(`[real-omlx-chat-execute:${model}] ${executionChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
-    expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|browser_evaluate|已完成|completed/i);
-    const executionEvidence = executionSnapshot?.planExecutionEvidence || [];
-    expect(executionEvidence).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "cmd" }),
-    ]));
-    expect(executionEvidence.some((entry: { kind?: string; target?: string }) =>
-      entry.kind === "file" && mutationAfterEarlyOutcome.changedFiles.includes(String(entry.target || ""))
+    expect(executionChatText).toMatch(/已完成|完成|修改|修复|验证|completed|validated/i);
+    const mutationCommands = (executionRuntime.commands || []).filter(
+      (command: { kind?: string; toolName?: string; status?: string }) =>
+        command.kind === "execute_tool" &&
+        ["apply_patch", "replace_in_file", "write_file", "write_file_atomic"].includes(
+          String(command.toolName || ""),
+        ) &&
+        command.status === "succeeded",
+    );
+    expect(mutationCommands.length).toBeGreaterThan(0);
+    expect(mutationCommands.every((command: { idempotencyKey?: string }) =>
+      (runtimeV2.receipts || []).some((receipt: {
+        idempotencyKey?: string;
+        kind?: string;
+        status?: string;
+      }) =>
+        receipt.idempotencyKey === command.idempotencyKey &&
+        receipt.kind === "execute_tool" &&
+        receipt.status === "succeeded"
+      )
     )).toBe(true);
+    expect(executionRuntime.evidence.some((entry: { kind?: string; target?: string }) =>
+      entry.kind === "mutation" &&
+      mutationAfterEarlyOutcome.changedFiles.some((file) =>
+        String(entry.target || "").includes(file)
+      )
+    )).toBe(true);
+    const successfulValidations = (executionRuntime.commands || []).filter(
+      (command: { kind?: string; status?: string }) =>
+        command.kind === "execute_validation" && command.status === "succeeded",
+    );
+    expect(successfulValidations.length).toBeGreaterThan(0);
+    expect(successfulValidations.every((command: { idempotencyKey?: string }) =>
+      (runtimeV2.receipts || []).some((receipt: {
+        idempotencyKey?: string;
+        kind?: string;
+        status?: string;
+      }) =>
+        receipt.idempotencyKey === command.idempotencyKey &&
+        receipt.kind === "execute_validation" &&
+        receipt.status === "succeeded"
+      )
+    )).toBe(true);
+    expect(executionRuntime.events.some(
+      (event: { type?: string; passed?: boolean }) =>
+        event.type === "validation.completed" && event.passed === true,
+    )).toBe(true);
+    expect(executionRuntime.evidence.some(
+      (entry: { kind?: string }) => entry.kind === "validation",
+    )).toBe(true);
+    const finiteValidation = [...successfulValidations].reverse().find(
+      (command: { toolName?: string; target?: string }) =>
+        command.toolName === "run_command" &&
+        isFinitePlanValidationCommand(String(command.target || "")),
+    );
+    expect(finiteValidation).toBeTruthy();
+    const validationCommand = String(finiteValidation?.target || "");
+    const independentValidation = await runRealOmlxWorkspaceCommand(
+      workspace,
+      validationCommand,
+    );
+    expect(
+      independentValidation.exitCode,
+      [
+        `Independent replay validation failed: ${validationCommand}`,
+        independentValidation.stdout,
+        independentValidation.stderr,
+      ].filter(Boolean).join("\n"),
+    ).toBe(0);
     if (realOmlxFixture === "md-viewer") {
-      expect(executionEvidence).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "browser_dom" }),
-      ]));
-      const executionToolNames = (executionSnapshot?.taskFlowPreview || [])
-        .map((block: { toolName?: string }) => block.toolName || "");
-      const launchIndex = executionToolNames.lastIndexOf("execute_command");
-      const ptyObservationIndex = Math.max(
-        executionToolNames.lastIndexOf("get_pty_status"),
-        executionToolNames.lastIndexOf("read_pty_since"),
-        executionToolNames.lastIndexOf("read_pty_tail"),
-      );
-      const browserIndex = executionToolNames.lastIndexOf("browser_evaluate");
-      expect(launchIndex).toBeGreaterThanOrEqual(0);
-      expect(ptyObservationIndex).toBeGreaterThan(launchIndex);
-      expect(browserIndex).toBeGreaterThan(ptyObservationIndex);
-      expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(
+      expect(successfulValidations.some(
+        (command: { toolName?: string }) => command.toolName === "browser_evaluate",
+      )).toBe(true);
+      expect(getMdViewerExecutionGaps({
+        caller: await fs.readFile(path.join(workspace, "src/main.js"), "utf8"),
+        editor: await fs.readFile(path.join(workspace, "src/components/editor.js"), "utf8"),
+        handler: await fs.readFile(path.join(workspace, "src-tauri/src/main.rs"), "utf8"),
+        toolbar: await fs.readFile(path.join(workspace, "src/components/toolbar.js"), "utf8"),
+      })).toEqual([]);
+      expect(JSON.stringify(executionRuntime.debug || [])).not.toMatch(
         /READ_FILE_NOT_AVAILABLE_IN_RECOVERY|DEV_SERVER_NOT_READY|server (?:is )?occupied/i,
       );
     }
     expect(executionChatText).not.toMatch(forbiddenChatNoise);
-    const terminalExecutionSummary = [...(executionSnapshot?.debugTail || [])]
-      .reverse()
-      .map((entry: { source?: string; message?: string }) => {
-        if (entry.source !== "store.agent_loop_stop_summary") return null;
-        try {
-          return JSON.parse(String(entry.message || "{}"));
-        } catch {
-          return null;
-        }
-      })
-      .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
-    expect(terminalExecutionSummary).toMatchObject({
-      status: "completed",
-      reason: "agent_loop_completed",
-      planStage: "completed",
-    });
     const terminalTurnId = String(executionSnapshot?.currentTurnId || "");
-    expect(terminalTurnId).not.toBe("");
-    const finalAssistantBlocks = (executionSnapshot?.taskFlowPreview || []).filter(
-      (block: { turnId?: string; type?: string; visibility?: string; content?: string }) =>
-        block.turnId === terminalTurnId &&
-        block.type === "agent" &&
-        block.visibility === "assistant_final" &&
-        String(block.content || "").trim().length > 0,
-    );
-    expect(finalAssistantBlocks).toHaveLength(1);
-    expect(String(finalAssistantBlocks[0]?.content || "")).toMatch(
+    expect(terminalTurnId).toBe(admittedPlanTurnId);
+    expect(executionRuntime.presentation?.finals || []).toHaveLength(1);
+    expect(String(executionRuntime.presentation.finals[0]?.markdown || "")).toMatch(
       /完成|修改|修复|验证|passed|updated|fixed|implemented|validated/i,
     );
-    expect(String(finalAssistantBlocks[0]?.content || "")).not.toContain("agent_loop_completed");
+    expect(String(executionRuntime.presentation.finals[0]?.markdown || ""))
+      .not.toContain("agent_loop_completed");
     await expect(page.locator(
       `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
     )).toBeVisible();
@@ -2180,7 +2656,10 @@ for (const model of models) {
     }, {
       text: realOmlxRequest,
       images: replayImages,
-      preferSubagents: realOmlxPreferSubagents,
+      // This incident is the production collaboration acceptance lane. It
+      // deliberately enables the Runtime v2 read-only scheduler rather than
+      // leaving overlap coverage to an optional environment flag.
+      preferSubagents: true,
     });
 
     expect(immediateSnapshot?.dispatchError).toBeNull();
@@ -2197,6 +2676,7 @@ for (const model of models) {
     expect(admittedTurn?.displayIntent).toBe("execute");
     expect(admittedTurn?.userPrompt).toBe(realOmlxRequest);
     expect(String(admittedTurn?.title || "").trim()).not.toBe("");
+    expect(admittedTurn?.runtimeEngineVersion).toBe("v2");
 
     let observedRuntimeStart = false;
     let terminalSnapshot: any = null;
@@ -2208,6 +2688,11 @@ for (const model of models) {
       runId: string;
       turnId: string;
       updatedAt: string;
+    }> = [];
+    const visibleTimeline: Array<{
+      phase: string;
+      status: string;
+      text: string;
     }> = [];
     const admissionStartedAt = Date.now();
     try {
@@ -2223,6 +2708,13 @@ for (const model of models) {
           const status = shell?.querySelector<HTMLElement>(
             '[data-testid="capsule-status-label"]',
           );
+          const progress = [...document.querySelectorAll<HTMLElement>(
+            '[data-testid="progress-block"]',
+          )].filter((node) => node.getClientRects().length > 0).map((node) => ({
+            phase: node.dataset.phase || "",
+            status: node.dataset.status || "",
+            text: String(node.textContent || "").replace(/\s+/g, " ").trim(),
+          }));
           return {
             snapshot,
             capsule: shell ? {
@@ -2235,6 +2727,7 @@ for (const model of models) {
               turnId: shell.dataset.turnId || "",
               updatedAt: shell.dataset.guidanceUpdatedAt || "",
             } : null,
+            progress,
           };
         });
         const snapshot = observation?.snapshot;
@@ -2249,19 +2742,26 @@ for (const model of models) {
         ) {
           capsuleTimeline.push(capsule);
         }
+        for (const progress of observation?.progress || []) {
+          if (
+            progress.text &&
+            !visibleTimeline.some((entry) =>
+              entry.phase === progress.phase &&
+              entry.status === progress.status &&
+              entry.text === progress.text
+            )
+          ) {
+            visibleTimeline.push(progress);
+          }
+        }
         latestRuntimeSnapshot = snapshot;
         if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
-        if (
-          snapshot?.isGenerating === true ||
-          snapshot?.agentStatus !== "idle" ||
-          (snapshot?.toolBlocks || []).length > 0
-        ) {
+        if (snapshot?.runtimeV2?.eventTypes?.includes("run.started")) {
           observedRuntimeStart = true;
         }
         if (
           observedRuntimeStart &&
-          snapshot?.isGenerating === false &&
-          ["idle", "error"].includes(String(snapshot?.agentStatus || ""))
+          snapshot?.runtimeV2?.terminal?.exactlyOnce === true
         ) {
           terminalSnapshot = snapshot;
           return "terminal";
@@ -2278,56 +2778,14 @@ for (const model of models) {
         currentTurnTitle: latestRuntimeSnapshot?.currentTurnTitle,
         agentStatus: latestRuntimeSnapshot?.agentStatus,
         isGenerating: latestRuntimeSnapshot?.isGenerating,
-        iteration: latestRuntimeSnapshot?.harness?.iteration,
-        toolBlocks: latestRuntimeSnapshot?.toolBlocks,
+        runtimeV2: latestRuntimeSnapshot?.runtimeV2,
         capsuleTimeline: capsuleTimeline.slice(-40),
-        debugTail: latestRuntimeSnapshot?.debugTail,
+        visibleTimeline: visibleTimeline.slice(-80),
+        debugTail: latestRuntimeSnapshot?.runtimeV2?.debug,
       }).slice(-120_000)}`);
       throw error;
     }
 
-    const recoveryDebugTail = (terminalSnapshot?.debugTail || []).filter(
-      (entry: { source?: string }) =>
-        /(?:subagent_|delegation_|collaboration_|required_tool|execute_recovery|runtime_owned_recovery|file_read_cache|tool_surface_decision|tool_calls_detected|precompletion_evidence|no_progress|loop_stop_summary)/.test(
-          String(entry.source || ""),
-        ),
-    ).slice(-120);
-    const recoveryTraceFields = new Set([
-      "iteration",
-      "reason",
-      "executeRecoveryMode",
-      "recoveryPhase",
-      "nextRequiredCapability",
-      "selectedRepairTarget",
-      "diagnosticTargets",
-      "repairReadRange",
-      "focusedDiagnostic",
-      "target",
-      "observationKey",
-      "requestSignature",
-      "windowStartLine",
-      "windowEndLine",
-      "sourceAlreadyActive",
-      "sourceStableOutsideNativeToolHistory",
-      "toolName",
-      "activeTools",
-      "providerRequestSkipped",
-      "transition",
-      "result",
-      "status",
-    ]);
-    const focusedRecoveryTrace = parseStructuredDebugEntries(
-      terminalSnapshot?.debugTail || [],
-    ).filter((entry) =>
-      /(?:finite_validation_requires_repair|execute_recovery_source_context_pinned|execute_recovery_phase_transition|execute_recovery_activated|runtime_owned_recovery_action_materialized_pre_stream|agent_loop_stop_summary)/.test(
-        entry.source,
-      )
-    ).slice(-100).map((entry) => ({
-      source: entry.source,
-      ...Object.fromEntries(
-        Object.entries(entry).filter(([key]) => recoveryTraceFields.has(key)),
-      ),
-    }));
     const finalFixtureState = await inspectFixtureMutation(
       workspace,
       originalMutationContents,
@@ -2335,69 +2793,19 @@ for (const model of models) {
     console.log(`[real-omlx-capsule-timeline:${model}] ${JSON.stringify(
       capsuleTimeline.slice(-40),
     ).slice(0, 30_000)}`);
-    console.log(`[real-omlx-collaboration:${model}] ${JSON.stringify(
-      (terminalSnapshot?.subagentRuns || []).map((run: {
-        id?: string;
-        scopeKey?: string;
-        status?: string;
-        closureState?: string;
-        evidenceCount?: number;
-        substantiveEvidenceCount?: number;
-      }) => ({
-        id: run.id,
-        scopeKey: run.scopeKey,
-        status: run.status,
-        closureState: run.closureState,
-        evidenceCount: run.evidenceCount,
-        substantiveEvidenceCount: run.substantiveEvidenceCount,
-      })),
-    )}`);
     console.log(`[real-omlx-acceptance-gaps:${model}] ${JSON.stringify({
       satisfied: finalFixtureState.satisfied,
       changedFiles: finalFixtureState.changedFiles,
       detail: finalFixtureState.detail,
     })}`);
-    console.log(`[real-omlx-recovery-trace:${model}] ${JSON.stringify(
-      focusedRecoveryTrace,
-    ).slice(0, 40_000)}`);
     console.log(`[real-omlx-execute-incident:${model}] ${JSON.stringify({
       currentTurnStatus: terminalSnapshot?.currentTurnStatus,
       currentTurnIntent: terminalSnapshot?.currentTurnIntent,
       currentTurnTitle: terminalSnapshot?.currentTurnTitle,
       agentStatus: terminalSnapshot?.agentStatus,
-      toolBlocks: terminalSnapshot?.toolBlocks,
+      runtimeV2: terminalSnapshot?.runtimeV2,
       capsuleTimeline: capsuleTimeline.slice(-40),
-      debugTail: recoveryDebugTail,
-      subagentRuns: (terminalSnapshot?.subagentRuns || []).map((run: {
-        id?: string;
-        scopeKey?: string;
-        status?: string;
-        closureState?: string;
-        evidenceCount?: number;
-        substantiveEvidenceCount?: number;
-        parentHandoff?: string;
-      }) => ({
-        id: run.id,
-        scopeKey: run.scopeKey,
-        status: run.status,
-        closureState: run.closureState,
-        evidenceCount: run.evidenceCount,
-        substantiveEvidenceCount: run.substantiveEvidenceCount,
-        parentHandoff: run.parentHandoff,
-      })),
-      executionEvidence: (terminalSnapshot?.planExecutionEvidence || []).map((entry: {
-        kind?: string;
-        target?: string;
-        sourceTool?: string;
-        runId?: string;
-        createdAt?: number;
-      }) => ({
-        kind: entry.kind,
-        target: entry.target,
-        sourceTool: entry.sourceTool,
-        runId: entry.runId,
-        createdAt: entry.createdAt,
-      })),
+      visibleTimeline: visibleTimeline.slice(-80),
     }).slice(-40_000)}`);
 
     expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
@@ -2405,6 +2813,11 @@ for (const model of models) {
     expect(String(terminalSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
     const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
     expect(terminalTurnId).not.toBe("");
+    expect(terminalTurnId).toBe(admittedTurnId);
+    const runtimeV2 = expectCanonicalRuntimeV2Terminal(terminalSnapshot, {
+      turnId: terminalTurnId,
+      resultKind: "success",
+    });
     const finalAssistantMessage = page.locator(
       `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
     );
@@ -2418,17 +2831,34 @@ for (const model of models) {
       `Final summary diverged from verified MD Viewer outcomes:\n${finalAssistantText}`,
     ).toEqual([]);
 
-    const toolBlocks = terminalSnapshot?.toolBlocks || [];
-    expect(toolBlocks.some((block: { name?: string; status?: string }) =>
-      ["apply_patch", "replace_in_file", "write_file", "write_file_atomic"].includes(String(block.name || "")) &&
-      block.status === "completed"
+    const mutationCommands = (runtimeV2.commands || []).filter(
+      (command: { kind?: string; toolName?: string; status?: string }) =>
+        command.kind === "execute_tool" &&
+        ["apply_patch", "replace_in_file", "write_file", "write_file_atomic"].includes(
+          String(command.toolName || ""),
+        ) &&
+        command.status === "succeeded",
+    );
+    expect(mutationCommands.length).toBeGreaterThan(0);
+    expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
+      evidence.kind === "mutation"
     )).toBe(true);
-    expect(toolBlocks.some((block: { name?: string; status?: string }) =>
-      block.name === "run_command" && block.status === "completed"
+    const successfulValidations = (runtimeV2.commands || []).filter(
+      (command: { kind?: string; toolName?: string; status?: string }) =>
+        command.kind === "execute_validation" &&
+        command.toolName === "run_command" &&
+        command.status === "succeeded",
+    );
+    expect(successfulValidations.length).toBeGreaterThan(0);
+    expect((runtimeV2.events || []).some(
+      (event: { type?: string; passed?: boolean }) =>
+        event.type === "validation.completed" && event.passed === true,
     )).toBe(true);
-    const finalValidationBlock = [...toolBlocks].reverse().find(
-      (block: { name?: string; target?: string }) =>
-        block.name === "run_command" && String(block.target || "").trim(),
+    expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
+      evidence.kind === "validation"
+    )).toBe(true);
+    const finalValidationBlock = [...successfulValidations].reverse().find(
+      (command: { target?: string }) => String(command.target || "").trim(),
     );
     const finalValidationCommand = String(finalValidationBlock?.target || "").trim();
     expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
@@ -2456,23 +2886,70 @@ for (const model of models) {
       toolbar: await fs.readFile(path.join(workspace, "src/components/toolbar.js"), "utf8"),
     })).toEqual([]);
 
-    const debugText = JSON.stringify(terminalSnapshot?.debugTail || []);
-    if (realOmlxPreferSubagents) {
-      // Direct Execute leaves decomposition to the model; require the scopes
-      // it actually created to be authoritative, joined, and consumed instead
-      // of inventing a fixture-specific scope name in the prompt.
-      const collaboration = inspectPreferredSubagentCollaboration(terminalSnapshot, []);
-      expect(collaboration.ready, JSON.stringify(collaboration.detail)).toBe(true);
-      const assignmentBlocks = (terminalSnapshot?.taskFlowPreview || []).filter(
-        (block: { type?: string; visibility?: string; content?: string }) =>
-          block.type === "agent" &&
-          block.visibility === "assistant_update" &&
-          /\*\*(?:分工|Assignment)\*\*/.test(String(block.content || "")) &&
-          /\*\*(?:授权范围|Authorized scope)\*\*/.test(String(block.content || "")),
-      );
-      expect(assignmentBlocks.length).toBeGreaterThan(0);
-      expect(debugText).toMatch(/collaboration_assignment_published/);
+    const runtimeDebugText = JSON.stringify(runtimeV2.debug || []);
+    expect(runtimeV2.subagents).toHaveLength(2);
+    expect(runtimeV2.subagents.every((job: {
+      status?: string;
+      requestOpenedAt?: number;
+      firstTokenAt?: number | null;
+      closedAt?: number;
+    }) =>
+      job.status === "completed" &&
+      Number.isFinite(job.requestOpenedAt) &&
+      Number.isFinite(job.closedAt) &&
+      Number(job.requestOpenedAt) <= Number(job.closedAt) &&
+      (
+        job.firstTokenAt == null ||
+        (
+          Number.isFinite(job.firstTokenAt) &&
+          Number(job.requestOpenedAt) <= Number(job.firstTokenAt) &&
+          Number(job.firstTokenAt) <= Number(job.closedAt)
+        )
+      )
+    )).toBe(true);
+    expect(runtimeV2.subagentConcurrency).toMatchObject({
+      requestCount: 2,
+      hasRequestOverlap: true,
+    });
+    expect(runtimeV2.subagentConcurrency.peakInFlight).toBeGreaterThanOrEqual(2);
+    expect(Math.max(
+      ...runtimeV2.subagents.map((job: { requestOpenedAt: number }) =>
+        Number(job.requestOpenedAt)
+      ),
+    )).toBeLessThan(Math.min(
+      ...runtimeV2.subagents.map((job: { closedAt: number }) => Number(job.closedAt)),
+    ));
+    const joinedBatchDebug = (runtimeV2.debug || []).filter(
+      (entry: { source?: string }) =>
+        entry.source === "store.runtime_v2_subagent_batch_joined",
+    );
+    expect(joinedBatchDebug).toHaveLength(1);
+    expect(joinedBatchDebug[0]?.data).toMatchObject({
+      jobCount: 2,
+      peakInFlight: expect.any(Number),
+      hasRequestOverlap: true,
+    });
+
+    const parallelInvestigationMilestones = (
+      runtimeV2.presentation?.chatMilestones || []
+    ).filter((milestone: { markdown?: string }) =>
+      /### 已启动并行只读调查/.test(String(milestone.markdown || ""))
+    );
+    expect(parallelInvestigationMilestones).toHaveLength(1);
+    for (const job of runtimeV2.subagents as Array<{ scopeKey?: string }>) {
+      expect(parallelInvestigationMilestones[0]?.markdown)
+        .toContain(String(job.scopeKey || ""));
     }
+    await expect(page.getByText("已启动并行只读调查", { exact: false }).first()).toBeVisible();
+    expect(runtimeV2.presentation?.timeline?.length || 0).toBeGreaterThan(0);
+    expect((runtimeV2.presentation?.timeline || []).every(
+      (entry: { title?: string; status?: string; toolCallId?: string }) =>
+        String(entry.title || "").trim().length > 0 &&
+        ["done", "failed"].includes(String(entry.status || "")) &&
+        String(entry.toolCallId || "").trim().length > 0,
+    )).toBe(true);
+    expect(visibleTimeline.length).toBeGreaterThan(0);
+    expect(visibleTimeline.some((entry) => entry.text.trim().length > 0)).toBe(true);
     const concreteCapsuleTimeline = capsuleTimeline.filter((entry) =>
       entry.source !== "status" &&
       entry.text !== "正在执行" &&
@@ -2481,6 +2958,18 @@ for (const model of models) {
     expect(concreteCapsuleTimeline.length).toBeGreaterThan(0);
     expect(new Set(concreteCapsuleTimeline.map((entry) => entry.text)).size)
       .toBeGreaterThan(1);
+    expect(concreteCapsuleTimeline.some((entry) => entry.source === "runtime_v2"))
+      .toBe(true);
+    const commandTokens = (runtimeV2.commands || []).flatMap((command: {
+      toolName?: string;
+      target?: string;
+    }) => [
+      String(command.toolName || "").trim(),
+      path.basename(String(command.target || "").trim()),
+    ]).filter((token: string) => token.length >= 4);
+    expect(concreteCapsuleTimeline.some((entry) =>
+      commandTokens.some((token: string) => entry.text.includes(token))
+    )).toBe(true);
     expect(concreteCapsuleTimeline.every((entry) =>
       entry.turnId === terminalTurnId &&
       !/(?:\.\.\.|…)\s*$/.test(entry.text)
@@ -2491,8 +2980,8 @@ for (const model of models) {
         entry.runId.trim().length > 0 &&
         entry.updatedAt.trim().length > 0
       )).toBe(true);
-    expect(debugText).not.toMatch(
-      /TURN_RUNTIME_PLANNING_CHECKPOINT_OWNER_MISMATCH|closure_ledger_owner_mismatch|repeated_failure_policy_no_progress|required_tool_protocol_violation/,
+    expect(runtimeDebugText).not.toMatch(
+      /RUNTIME_V2_STALE_RUN_CHECKPOINT|runtime_v2_checkpoint_projection_conflict|runtime_v2_checkpoint_persist_failed|runtime_v2_tool_execution_rejected/,
     );
   });
 

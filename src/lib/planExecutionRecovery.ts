@@ -17,7 +17,7 @@ import { resolveDirectEditTransaction } from "./directEditTransaction";
 import type {
   FileReadObservationIdentity,
   FileReadWindowIdentity,
-} from "./orchestrator/fileReadCache";
+} from "./fileReadObservation";
 import type { MainThreadProgressUpdate } from "./turnEvents";
 import {
   isReadOnlyNoProgressDetail,

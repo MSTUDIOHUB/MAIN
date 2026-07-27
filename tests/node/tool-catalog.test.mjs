@@ -221,31 +221,6 @@ test("same-name external editors cannot inherit built-in mutation trust", () => 
   }), true);
 });
 
-test("tool lifecycle gates built-in mutation fallback on catalog provenance", () => {
-  const source = fs.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const lifecycle = source.slice(
-    source.indexOf("async function executeToolCallWithLifecycle"),
-    source.indexOf("export async function autoMaterializePlanArtifactFromVisibleText"),
-  );
-
-  assert.match(
-    lifecycle,
-    /const catalogIdentity: ToolCatalogIdentity = catalogResolution\?\.status === "resolved"[\s\S]*source: catalogResolution\.entry\.source/,
-  );
-  assert.match(
-    lifecycle,
-    /const trustedBuiltInMutation =[\s\S]*catalogIdentity\.source === "built_in"[\s\S]*BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES\.has\(executionName\)/,
-  );
-  assert.match(
-    lifecycle,
-    /const completedDiffPreview = observedMutationDiffPreview \|\|[\s\S]*trustedBuiltInMutation \? diffPreview : undefined/,
-  );
-  assert.doesNotMatch(
-    lifecycle,
-    /: BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES\.has\(executionName\)[\s\S]{0,160}\? resolveWorkspaceMutationTargets/,
-  );
-});
-
 test("a skill conflicting with a built-in keeps a distinct execution source", () => {
   const catalog = buildToolCatalog({
     builtInDefinitions: [definition("read_file")],
@@ -376,37 +351,4 @@ test("unknown tool names fail closed instead of falling through to another sourc
     status: "unknown",
     requestedName: "does_not_exist",
   });
-});
-
-test("the production registry and executor both use the same catalog lookup", () => {
-  const registrySource = fs.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolRegistrySetup.ts"),
-    "utf8",
-  );
-  const executorSource = fs.readFileSync(
-    path.join(workspaceRoot, "src/lib/toolExecutor.ts"),
-    "utf8",
-  );
-  const executionPhaseSource = fs.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
-    "utf8",
-  );
-
-  assert.match(registrySource, /buildToolCatalog\(/);
-  assert.match(registrySource, /toolCatalog\.toolDefinitions/);
-  assert.match(executorSource, /options\.toolCatalog\.lookup\(name\)/);
-  assert.match(executorSource, /resolution\.entry\.executionName/);
-  assert.match(executorSource, /resolution\.entry\.source === "skill"/);
-  assert.match(executorSource, /invoke<string>\("execute_skill"/);
-  assert.match(executorSource, /skillId:\s*resolution\.entry\.skillId/);
-  assert.match(executorSource, /packagePath:\s*resolution\.entry\.packagePath\s*\?\?\s*null/);
-  assert.match(executorSource, /entryPoint:\s*resolution\.entry\.entryPoint\s*\?\?\s*null/);
-  assert.match(executorSource, /SKILL_IDENTITY_REQUIRED/);
-  assert.doesNotMatch(
-    executorSource,
-    /invoke<string>\("execute_skill",\s*\{\s*name,\s*args\s*\}\)/s,
-  );
-  assert.match(executorSource, /UNKNOWN_TOOL/);
-  assert.match(executionPhaseSource, /input\.toolCatalog\.lookup\(call\.name\)/);
-  assert.match(executionPhaseSource, /resolution\.entry\.exposedName/);
 });

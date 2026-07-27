@@ -2,6 +2,7 @@ import type { TaskBlock } from "../lib/taskTypes";
 import {
   getIntentPolicy,
   looksLikeExplicitWorkspaceMutationRequest,
+  resolveWorkspaceAwareWorkflowMode,
   type ResolvedRunIntent,
 } from "../lib/runIntent";
 import { sanitizeUserContextItemsForPersist } from "../lib/userContextItems";
@@ -14,6 +15,7 @@ import {
   normalizeConversationDisplayTitle,
   type ConversationTurn,
 } from "../lib/workflowModels";
+import { selectRuntimeEngineVersionForNewTurn } from "../lib/runtimeEngineSelection";
 
 type WorkspaceUserBlock = Extract<TaskBlock, { type: "user" }>;
 
@@ -177,6 +179,7 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   return {
     id: input.receipt.turnId,
     clientSubmissionId: input.instruction.clientSubmissionId,
+    runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(projectedIntent),
     workspaceInstructionReceiptId: input.receipt.receiptId,
     workspaceInstructionSource: input.instruction.source,
     userPrompt: input.instruction.payload.text,
@@ -192,7 +195,10 @@ export function buildWorkspaceInstructionConversationTurn(input: {
         ? "Accepted as a durable workspace Turn; routing is pending."
         : "已接纳为持久化工作区回合，等待路由执行。"
     ),
-    mode: getIntentPolicy(projectedIntent).workflowMode,
+    mode: resolveWorkspaceAwareWorkflowMode(
+      getIntentPolicy(projectedIntent).workflowMode,
+      true,
+    ),
     intent: projectedIntent,
     displayIntent: projectedIntent,
     status: "planning",

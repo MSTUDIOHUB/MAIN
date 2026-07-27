@@ -49,15 +49,15 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { createSubmitWorkflowContext } = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/store/submitWorkflowContext.ts"),
+const { createSubmitRuntimeContext } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/store/submitRuntimeContext.ts"),
 );
 const { startSubmitStreamingUi } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitStreamingUi.ts"),
 );
 
 function baseContext(overrides = {}) {
-  return createSubmitWorkflowContext({
+  return createSubmitRuntimeContext({
     turnId: "turn-1",
     uiDisplayTurnId: "turn-ui",
     runWorkspace: "/repo",

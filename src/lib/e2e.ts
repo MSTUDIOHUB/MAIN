@@ -8703,6 +8703,339 @@ function seedRealOmlxPlanFlowScenario() {
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const runtimeV2Checkpoint = currentTurn
+      ? state.runtimeV2Checkpoints?.[currentTurn.id] || null
+      : null;
+    const runtimeV2Aggregate = runtimeV2Checkpoint?.aggregate || null;
+    const runtimeV2Events = Array.isArray(runtimeV2Aggregate?.events)
+      ? runtimeV2Aggregate.events
+      : [];
+    const runtimeV2Receipts = Array.isArray(runtimeV2Aggregate?.completedCommands)
+      ? runtimeV2Aggregate.completedCommands
+      : [];
+    const runtimeV2ReceiptByKey = new Map(
+      runtimeV2Receipts.map((receipt: any) => [receipt.idempotencyKey, receipt] as const),
+    );
+    const runtimeV2CommandTarget = (command: any): string => {
+      const payload = command?.payload && typeof command.payload === "object"
+        ? command.payload
+        : {};
+      const args = payload.arguments && typeof payload.arguments === "object" && !Array.isArray(payload.arguments)
+        ? payload.arguments
+        : {};
+      const value = args.path || args.file || args.target || args.command || args.cmd ||
+        args.query || args.pattern || args.url || payload.target || payload.objective || "";
+      return typeof value === "string" ? value : JSON.stringify(value);
+    };
+    const runtimeV2Commands = runtimeV2Events
+      .filter((event: any) => event.type === "command.scheduled")
+      .map((event: any) => {
+        const receipt = runtimeV2ReceiptByKey.get(event.command?.idempotencyKey);
+        return {
+          sequence: event.sequence,
+          eventId: event.eventId,
+          at: event.at,
+          idempotencyKey: event.command?.idempotencyKey || "",
+          turnId: event.command?.run?.turnId || "",
+          runId: event.command?.run?.runId || "",
+          kind: event.command?.kind || "",
+          phase: event.command?.phase || "",
+          toolName: event.command?.payload?.toolName || "",
+          target: runtimeV2CommandTarget(event.command),
+          runtimeOwnedPlanArtifact:
+            event.command?.payload?.runtimeOwnedPlanArtifact === true,
+          status: receipt?.status || "scheduled",
+          actionFingerprint: receipt?.actionFingerprint || "",
+          completedAt: receipt?.completedAt || null,
+        };
+      });
+    const runtimeV2Projections = runtimeV2Events
+      .filter((event: any) => event.type === "projection.published")
+      .map((event: any) => ({
+        sequence: event.sequence,
+        eventId: event.eventId,
+        at: event.at,
+        audience: event.audience || "",
+        projectionId: event.projectionId || "",
+        kind: event.projection?.kind || "",
+        dedupeKey: event.projection?.dedupeKey || "",
+        markdown: event.projection?.markdown || "",
+      }));
+    const runtimeV2SubagentTelemetry = (runtimeV2Aggregate?.subagents || []).map((job: any) => {
+      const telemetryEvents = runtimeV2Events.filter((event: any) =>
+        event.type === "subagent.telemetry" && event.telemetry?.jobId === job.id
+      );
+      const telemetryAt = (phase: string) =>
+        telemetryEvents.find((event: any) => event.telemetry?.phase === phase)?.telemetry?.at || null;
+      return {
+        id: job.id,
+        scopeKey: job.scopeKey,
+        status: job.status,
+        allowedPaths: job.allowedPaths || [],
+        requestedAt: job.requestedAt || null,
+        requestOpenedAt: telemetryAt("request_opened"),
+        firstTokenAt: telemetryAt("first_token") || job.firstTokenAt || null,
+        closedAt: telemetryAt("closed") || job.closedAt || null,
+      };
+    });
+    const runtimeV2SubagentIntervals = runtimeV2SubagentTelemetry
+      .filter((entry: any) => Number.isFinite(entry.requestOpenedAt))
+      .map((entry: any) => ({
+        id: entry.id,
+        start: Number(entry.requestOpenedAt),
+        end: Number.isFinite(entry.closedAt) ? Number(entry.closedAt) : Number.POSITIVE_INFINITY,
+      }));
+    const runtimeV2SubagentPoints = runtimeV2SubagentIntervals.flatMap((interval: any) => [
+      { at: interval.start, delta: 1 },
+      ...(Number.isFinite(interval.end) ? [{ at: interval.end, delta: -1 }] : []),
+    ]).sort((left: any, right: any) => left.at - right.at || left.delta - right.delta);
+    let runtimeV2SubagentInFlight = 0;
+    let runtimeV2SubagentPeakInFlight = 0;
+    for (const point of runtimeV2SubagentPoints) {
+      runtimeV2SubagentInFlight += point.delta;
+      runtimeV2SubagentPeakInFlight = Math.max(
+        runtimeV2SubagentPeakInFlight,
+        runtimeV2SubagentInFlight,
+      );
+    }
+    const runtimeV2RunCompleted = runtimeV2Events.filter((event: any) =>
+      event.type === "run.completed"
+    );
+    const runtimeV2TurnCompleted = runtimeV2Events.filter((event: any) =>
+      event.type === "turn.completed"
+    );
+    const runtimeV2FinalProjections = runtimeV2Projections.filter((projection: any) =>
+      projection.audience === "final" && projection.kind === "final"
+    );
+    const runtimeV2RunTerminal = runtimeV2RunCompleted[0] || null;
+    const runtimeV2TurnTerminal = runtimeV2TurnCompleted[0] || null;
+    const runtimeV2FinalProjection = runtimeV2FinalProjections[0] || null;
+    const runtimeV2TaskBlocks = currentTurn
+      ? state.taskFlow.filter((block: any) => block.turnId === currentTurn.id)
+      : [];
+    const runtimeV2RunId = runtimeV2Aggregate?.run?.identity?.runId || null;
+    const runtimeV2Presentation = runtimeV2RunId ? {
+      chatMilestones: runtimeV2TaskBlocks
+        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_update")
+        .map((block: any) => ({
+          id: block.id,
+          markdown: String(block.content || ""),
+        })),
+      timeline: runtimeV2TaskBlocks
+        .filter((block: any) =>
+          block.type === "progress" &&
+          block.source === "runtime" &&
+          block.runId === runtimeV2RunId
+        )
+        .map((block: any) => ({
+          id: block.id,
+          phase: block.phase || "",
+          title: block.title || "",
+          action: block.action || "",
+          status: block.status || "",
+          toolName: block.toolName || block.tool || "",
+          target: block.target || block.canonicalTarget || "",
+          runId: block.runId || "",
+          toolCallId: block.toolCallId || "",
+          dedupeKey: block.dedupeKey || "",
+        })),
+      finals: runtimeV2TaskBlocks
+        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_final")
+        .map((block: any) => ({
+          id: block.id,
+          markdown: String(block.content || ""),
+        })),
+      threadEvents: (state.runtimeEvents || [])
+        .filter((event: any) =>
+          event.turnId === currentTurn?.id &&
+          (
+            !event.runId ||
+            event.runId === runtimeV2RunId
+          ) &&
+          (
+            event.type === "run.completed" ||
+            event.type === "turn.completed"
+          )
+        )
+        .map((event: any) => ({
+          type: event.type,
+          timestampMs: event.timestampMs,
+          turnId: event.turnId || "",
+          runId: event.runId || "",
+          resultKind: event.resultKind || "",
+        })),
+    } : null;
+    let localDebugEntries: any[] = [];
+    try {
+      const parsed = JSON.parse(
+        window.localStorage.getItem("main.debugLog.v1") || "[]",
+      );
+      if (Array.isArray(parsed)) localDebugEntries = parsed;
+    } catch {
+      localDebugEntries = [];
+    }
+    const realOmlxDebugTail = [...new Map([
+      ...localDebugEntries,
+      ...((window as any).__REAL_OMLX_DEBUG_LOGS__ || []),
+    ].map((entry: any) => [
+      [
+        String(entry?.timestamp || ""),
+        String(entry?.source || ""),
+        String(entry?.message || ""),
+      ].join("\u0000"),
+      entry,
+    ])).values()].slice(-1_200);
+    const runtimeV2Debug = realOmlxDebugTail.flatMap((entry: any) => {
+      const source = String(entry?.source || "");
+      if (!source.includes("runtime_v2")) return [];
+      let data: unknown = entry?.message;
+      if (typeof data === "string") {
+        const rawData = data;
+        try {
+          data = JSON.parse(rawData);
+        } catch {
+          data = rawData.slice(0, 2_400);
+        }
+      }
+      return [{
+        timestamp: entry?.timestamp || "",
+        level: entry?.level || "",
+        source,
+        data,
+      }];
+    }).slice(-300);
+    // E2E observes the durable Runtime v2 ledger, not provider prose or raw
+    // tool output. This keeps real-model acceptance aligned with production
+    // ownership: the checkpoint is the source of truth for commands, child
+    // jobs, validation, and terminal order.
+    const runtimeV2 = runtimeV2Aggregate ? {
+      schemaVersion: runtimeV2Aggregate.schemaVersion || null,
+      revision: runtimeV2Checkpoint?.revision ?? null,
+      strategy: runtimeV2Aggregate.strategy || null,
+      turnId: runtimeV2Aggregate.turn?.turnId || null,
+      runId: runtimeV2Aggregate.run?.identity?.runId || null,
+      turnIdentity: runtimeV2Aggregate.turn || null,
+      runIdentity: runtimeV2Aggregate.run?.identity || null,
+      phase: runtimeV2Aggregate.phase || null,
+      terminalOutcome: runtimeV2Aggregate.terminalOutcome || null,
+      evidence: (runtimeV2Aggregate.evidence || []).map((evidence: any) => ({
+        id: evidence.id,
+        kind: evidence.kind,
+        target: evidence.target,
+        version: evidence.version || null,
+      })),
+      evidenceCount: Array.isArray(runtimeV2Aggregate.evidence)
+        ? runtimeV2Aggregate.evidence.length
+        : 0,
+      events: runtimeV2Events.map((event: any) => ({
+        sequence: event.sequence,
+        eventId: event.eventId,
+        at: event.at,
+        type: event.type,
+        ...(event.type === "phase.changed"
+          ? { phase: event.phase, reason: event.reason }
+          : {}),
+        ...(event.type === "command.scheduled"
+          ? {
+              idempotencyKey: event.command?.idempotencyKey || "",
+              commandKind: event.command?.kind || "",
+            }
+          : {}),
+        ...(event.type === "command.completed"
+          ? { idempotencyKey: event.idempotencyKey, status: event.status }
+          : {}),
+        ...(event.type === "tool.completed"
+          ? {
+              idempotencyKey: event.idempotencyKey,
+              status: event.status,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "validation.completed"
+          ? {
+              idempotencyKey: event.idempotencyKey,
+              passed: event.passed,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "subagent.telemetry"
+          ? { telemetry: event.telemetry }
+          : {}),
+        ...(event.type === "subagent.completed"
+          ? {
+              jobId: event.jobId,
+              status: event.status,
+              evidence: event.evidence || [],
+            }
+          : {}),
+        ...(event.type === "work_plan.sealed" ||
+          event.type === "work_plan.approved" ||
+          event.type === "work_plan.invalidated"
+          ? {
+              workPlan: event.workPlan || null,
+              planReviewCommit: event.type === "work_plan.sealed"
+                ? event.reviewCommit || null
+                : null,
+            }
+          : {}),
+        ...(event.type === "projection.published"
+          ? {
+              audience: event.audience,
+              projectionId: event.projectionId,
+              projectionKind: event.projection?.kind || "",
+              dedupeKey: event.projection?.dedupeKey || "",
+            }
+          : {}),
+        ...(event.type === "run.completed" || event.type === "turn.completed"
+          ? {
+              resultKind: event.outcome?.resultKind || "",
+              reason: event.outcome?.reason || "",
+              finalProjectionId: event.outcome?.finalProjectionId || "",
+            }
+          : {}),
+      })),
+      eventTypes: runtimeV2Events.map((event: any) => event.type),
+      commands: runtimeV2Commands,
+      receipts: runtimeV2Receipts.map((receipt: any) => ({
+        idempotencyKey: receipt.idempotencyKey,
+        kind: receipt.kind,
+        actionFingerprint: receipt.actionFingerprint,
+        status: receipt.status,
+        completedAt: receipt.completedAt,
+      })),
+      projections: runtimeV2Projections,
+      workPlan: runtimeV2Aggregate.workPlan || null,
+      sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
+      planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+      subagents: runtimeV2SubagentTelemetry,
+      subagentConcurrency: {
+        requestCount: runtimeV2SubagentIntervals.length,
+        peakInFlight: runtimeV2SubagentPeakInFlight,
+        hasRequestOverlap: runtimeV2SubagentPeakInFlight >= 2,
+      },
+      terminal: {
+        runCompletedCount: runtimeV2RunCompleted.length,
+        turnCompletedCount: runtimeV2TurnCompleted.length,
+        finalProjectionCount: runtimeV2FinalProjections.length,
+        runSequence: runtimeV2RunTerminal?.sequence || null,
+        finalProjectionSequence: runtimeV2FinalProjection?.sequence || null,
+        turnSequence: runtimeV2TurnTerminal?.sequence || null,
+        runResultKind: runtimeV2RunTerminal?.outcome?.resultKind || null,
+        turnResultKind: runtimeV2TurnTerminal?.outcome?.resultKind || null,
+        finalProjectionId: runtimeV2FinalProjection?.projectionId || null,
+        exactlyOnce:
+          runtimeV2RunCompleted.length === 1 &&
+          runtimeV2TurnCompleted.length === 1 &&
+          runtimeV2FinalProjections.length === 1 &&
+          runtimeV2RunTerminal?.outcome?.resultKind === runtimeV2TurnTerminal?.outcome?.resultKind &&
+          runtimeV2RunTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
+          runtimeV2TurnTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
+          runtimeV2RunTerminal.sequence < runtimeV2FinalProjection.sequence &&
+          runtimeV2FinalProjection.sequence < runtimeV2TurnTerminal.sequence,
+      },
+      presentation: runtimeV2Presentation,
+      debug: runtimeV2Debug,
+    } : null;
     const agentTexts = (state.taskFlow.filter((block) => block.type === "agent") as any[]).map((block) => block.content);
     const toolBlocks = (state.taskFlow.filter((block) => block.type === "tool") as any[]).map((block) => ({
       name: block.toolName,
@@ -8807,6 +9140,7 @@ function seedRealOmlxPlanFlowScenario() {
         displayIntent: turn.displayIntent || turn.intent,
         userPrompt: turn.userPrompt,
         status: turn.status,
+        runtimeEngineVersion: turn.runtimeEngineVersion || "legacy",
         blockIds: [...turn.blockIds],
       })),
       workspaceInstructionLedger: state.workspaceInstructionLedger.map((entry) => ({
@@ -8824,8 +9158,20 @@ function seedRealOmlxPlanFlowScenario() {
       activeActionRequest: state.activeActionRequest ? {
         kind: state.activeActionRequest.kind,
         requestId: state.activeActionRequest.requestId,
+        sessionKey: state.activeActionRequest.sessionKey,
+        sessionEpoch: state.activeActionRequest.kind === "plan_review"
+          ? state.activeActionRequest.sessionEpoch || null
+          : null,
         turnId: state.activeActionRequest.turnId,
         runId: state.activeActionRequest.runId,
+        ...(state.activeActionRequest.kind === "plan_review"
+          ? {
+              parentRunId: state.activeActionRequest.parentRunId || null,
+              planRevision: state.activeActionRequest.planRevision,
+              artifactHash: state.activeActionRequest.artifactHash,
+              artifactPaths: state.activeActionRequest.artifactPaths || [],
+            }
+          : {}),
         ...(state.activeActionRequest.kind === "tool_permission"
           ? {
               toolName: state.activeActionRequest.toolName,
@@ -8837,6 +9183,7 @@ function seedRealOmlxPlanFlowScenario() {
       agentTexts,
       toolBlocks,
       subagentRuns,
+      runtimeV2,
       taskFlowTypes: state.taskFlow.map((block) => block.type),
       taskFlowPreview: state.taskFlow.map((block: any) => ({
         id: block.id,
@@ -8845,13 +9192,18 @@ function seedRealOmlxPlanFlowScenario() {
         visibility: block.visibility || "",
         title: block.title || "",
         content: String(block.content || block.error || "").slice(0, 800),
+        action: String(block.action || "").slice(0, 1_200),
+        phase: block.phase || "",
+        source: block.source || "",
+        runId: block.runId || "",
+        dedupeKey: block.dedupeKey || "",
         toolName: block.toolName || "",
         target: block.target || "",
         status: block.type === "tool" && block.toolStatus === "executed"
           ? "completed"
           : block.toolStatus || block.status || "",
       })),
-      debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-1_200),
+      debugTail: realOmlxDebugTail,
       acceptanceState: (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ || null,
       dispatchError: bridge.dispatchError || null,
       lastWorkspaceInstructionAcceptance: bridge.lastWorkspaceInstructionAcceptance || null,

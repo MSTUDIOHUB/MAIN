@@ -63,16 +63,6 @@ const {
   activeMemoryReclamation,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
-const {
-  computeContextForceReason,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
-
-const {
-  buildContextPackTelemetry,
-} = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/lib/orchestrator/loop/contextManagement.ts"),
-);
-
 test("computeContextBudgets reserves bounded output budget for context windows", () => {
   const budgets16k = computeContextBudgets(16384);
   const budgets128k = computeContextBudgets(131072);
@@ -97,39 +87,6 @@ test("manageContext leaves long tool output untouched while under the proactive 
   assert.match(result.memoryPacket, /ContextMemoryState v1/);
   assert.equal(result.messages.length, messages.length + 1);
   assert.equal(result.messages[2].content, messages[1].content);
-});
-
-test("context telemetry keeps forced reason and actual no-op compaction observable together", () => {
-  const messages = [
-    { role: "system", content: "system prompt" },
-    ...Array.from({ length: 8 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      content: `message-${index} ${"A".repeat(120)}`,
-    })),
-  ];
-  const contextForce = computeContextForceReason({
-    messages,
-    iteration: 2,
-    workflowMode: "edit",
-    isPlanApproved: false,
-    inputBudget: 100,
-    proactiveTriggerBudget: 100,
-  });
-  const managedResult = manageContext(messages, 4096, 1024, 4000, 4000, true);
-  const telemetry = buildContextPackTelemetry({
-    messagesBefore: messages.length,
-    messagesAfter: managedResult.messages.length,
-    managedResult,
-    contextForce,
-  });
-
-  assert.equal(contextForce.shouldForce, true);
-  assert.equal(telemetry.forceManaged, true);
-  assert.equal(telemetry.forceReason, "token_budget_threshold");
-  assert.equal(telemetry.droppedMessageCount, 0);
-  assert.equal(telemetry.microCompactionKind, "none");
-  assert.equal(telemetry.tokenBefore, Math.round(managedResult.tokenCountBefore));
-  assert.equal(telemetry.tokenAfter, Math.round(managedResult.tokenCountAfter));
 });
 
 test("manageContext can persist token savings once the proactive trigger is crossed", () => {

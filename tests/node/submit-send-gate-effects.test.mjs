@@ -144,7 +144,7 @@ test("send gate effects queue visible submissions while preserving context snaps
     images: ["data:image/png;base64,a"],
     mentionSnapshot: ["src/App.tsx"],
     attachedFilesSnapshot: ["/tmp/report.csv"],
-    queuedWorkflowContext: {
+    queuedRunContext: {
       runtimeIntentOverride: "goal",
       goalSourceContextSnapshot: "[plan_artifact]\n- 修复批准生命周期",
       goalCreationAuthorization: {
@@ -191,7 +191,7 @@ test("send gate effects preserve authorized Goal guidance without rebuilding it 
   };
   const result = harness.apply({
     text: "显示给用户的选择文本",
-    queuedWorkflowContext: {
+    queuedRunContext: {
       runtimeIntentOverride: "goal",
       goalContinuationAuthorization: authorization,
       goalContinuationGuidance: "精确注入 Goal 的用户指导",

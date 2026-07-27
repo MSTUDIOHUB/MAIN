@@ -2,6 +2,18 @@ import type { PendingSlashCommand } from "./gameStudio/catalog";
 import type { MainModeKey } from "./mainModes";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";
+
+/**
+ * `chat` is the container for a workspace-free conversation only. A
+ * workspace-bound read-only intent remains read-only through its capability
+ * policy, but its Session/Turn container is a task (`edit`) rather than Chat.
+ */
+export function resolveWorkspaceAwareWorkflowMode(
+  mode: LegacyWorkflowMode,
+  hasWorkspace: boolean,
+): LegacyWorkflowMode {
+  return hasWorkspace && mode === "chat" ? "edit" : mode;
+}
 export type ResolvedUserIntent =
   | "respond"
   | "discuss"

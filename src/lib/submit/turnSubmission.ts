@@ -77,6 +77,7 @@ import type {
   PlanStage,
   ReplyOption,
 } from "../workflowModels";
+import { selectRuntimeEngineVersionForNewTurn } from "../runtimeEngineSelection";
 
 const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> = {
   respond: { zh: "回复", en: "Respond" },
@@ -2671,6 +2672,9 @@ export function buildSubmitVisibleTurnPatch(
               }
             : {}),
           status: params.initialTurnStatus,
+          runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(
+            params.effectiveRunIntent,
+          ),
           intent: preservePlanIdentity ? "plan" : params.effectiveRunIntent,
           displayIntent: params.effectiveDisplayIntent,
           intentSummary: isAdoptedTurn
@@ -2724,6 +2728,7 @@ export function buildSubmitVisibleTurnPatch(
   const newTurn: ConversationTurn = userBlock
     ? {
         id: params.turnId,
+        runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,
         intentSummary: params.effectiveIntentSummary,
@@ -2740,6 +2745,7 @@ export function buildSubmitVisibleTurnPatch(
       }
     : {
         id: params.turnId,
+        runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,
         intentSummary: params.effectiveIntentSummary,

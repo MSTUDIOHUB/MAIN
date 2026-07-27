@@ -6,7 +6,7 @@ export type { SubagentDelegationPreference } from "./turnIntake";
 import type {
   FileReadObservationIdentity,
   FileReadWindowIdentity,
-} from "./orchestrator/fileReadCache";
+} from "./fileReadObservation";
 import { appendRuntimeEvent, withEventSchema, type MainThreadEvent } from "./turnEvents";
 import {
   normalizeWorkspacePathIdentity,

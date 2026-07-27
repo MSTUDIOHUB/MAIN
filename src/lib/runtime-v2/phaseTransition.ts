@@ -1,0 +1,217 @@
+import type { TurnAggregateV1 } from "./aggregate";
+import type { RuntimeV2Command } from "./contracts";
+import type { RuntimeV2Event } from "./events";
+import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+
+export type RuntimeV2ExecutePhaseTransition =
+  | {
+      readonly from: "observing";
+      readonly to: "acting";
+      readonly reason: "pending_mutation_call" | "observation_cycle_complete";
+    }
+  | {
+      readonly from: "acting";
+      readonly to: "validating";
+      readonly reason: "mutation_committed";
+    }
+  | {
+      readonly from: "validating";
+      readonly to: "acting";
+      readonly reason: "validation_failed";
+    };
+
+export interface RuntimeV2ExecutePhaseTransitionInput {
+  /**
+   * Tool capability classification belongs to the adapter. The Runtime core
+   * consumes only this provider-neutral predicate and never branches on a
+   * provider, model, natural-language response, or hard-coded tool list.
+   */
+  readonly isMutationToolName: (toolName: string) => boolean;
+}
+
+const TERMINAL_CHILD_STATUSES = new Set(["completed", "failed", "canceled"]);
+
+function currentPhaseEvents(state: TurnAggregateV1): readonly RuntimeV2Event[] {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (
+      (event.type === "phase.changed" && event.phase === state.phase) ||
+      (event.type === "run.started" && event.phase === state.phase)
+    ) {
+      return state.events.slice(index + 1);
+    }
+  }
+  return [];
+}
+
+function toolName(command: RuntimeV2Command): string {
+  return typeof command.payload.toolName === "string"
+    ? command.payload.toolName.trim()
+    : "";
+}
+
+function committedMutationKeys(
+  events: readonly RuntimeV2Event[],
+  isMutationToolName: RuntimeV2ExecutePhaseTransitionInput["isMutationToolName"],
+): ReadonlySet<string> {
+  const mutations = new Set(
+    events
+      .filter((event): event is Extract<RuntimeV2Event, { type: "command.scheduled" }> =>
+        event.type === "command.scheduled" && event.command.kind === "execute_tool"
+      )
+      .filter((event) => {
+        const name = toolName(event.command);
+        return !!name && isMutationToolName(name);
+      })
+      .map((event) => event.command.idempotencyKey),
+  );
+  const committed = new Set<string>();
+  for (const event of events) {
+    if (
+      event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      mutations.has(event.idempotencyKey)
+    ) {
+      committed.add(event.idempotencyKey);
+    }
+  }
+  return committed;
+}
+
+export interface RuntimeV2ExecuteEvidenceSummary {
+  readonly mutationCount: number;
+  readonly passedValidationCount: number;
+  readonly failedOperationCount: number;
+}
+
+/** Durable execution facts reconstructed from the ledger. Process-local
+ * counters cannot be used for completion because they disappear on restore. */
+export function summarizeRuntimeV2ExecuteEvidence(
+  state: TurnAggregateV1 | null,
+  input: RuntimeV2ExecutePhaseTransitionInput,
+): RuntimeV2ExecuteEvidenceSummary {
+  if (!state) {
+    return { mutationCount: 0, passedValidationCount: 0, failedOperationCount: 0 };
+  }
+  const latestMutationSequence = state.events.reduce((latest, event) =>
+    event.type === "tool.completed" &&
+    event.status === "succeeded" &&
+    event.evidence.some((evidence) => evidence.kind === "mutation")
+      ? Math.max(latest, event.sequence)
+      : latest
+  , -1);
+  return {
+    mutationCount: committedMutationKeys(state.events, input.isMutationToolName).size,
+    passedValidationCount: state.events.filter((event) =>
+      event.type === "validation.completed" &&
+      event.passed &&
+      event.sequence > latestMutationSequence
+    ).length,
+    failedOperationCount: state.events.filter((event) =>
+      (event.type === "tool.completed" && event.status !== "succeeded") ||
+      (event.type === "validation.completed" && !event.passed)
+    ).length,
+  };
+}
+
+function latestValidation(
+  events: readonly RuntimeV2Event[],
+): Extract<RuntimeV2Event, { type: "validation.completed" }> | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type === "validation.completed") return event;
+  }
+  return null;
+}
+
+/**
+ * Pure Execute phase policy.
+ *
+ * Phase changes are derived from the durable aggregate only. Provider prose,
+ * endpoint identity, model identity, and process-local counters cannot advance
+ * the lifecycle. A scheduled effect also fences phase changes until its
+ * completion is committed.
+ */
+export function decideRuntimeV2ExecutePhaseTransition(
+  state: TurnAggregateV1 | null,
+  input: RuntimeV2ExecutePhaseTransitionInput,
+): RuntimeV2ExecutePhaseTransition | null {
+  if (
+    !state ||
+    (
+      state.strategy !== "execute" &&
+      !(state.strategy === "plan" && state.workPlan?.status === "approved")
+    ) ||
+    !state.run ||
+    state.run.status !== "running" ||
+    state.terminalOutcome ||
+    state.scheduledCommands.length > 0
+  ) {
+    return null;
+  }
+
+  const pendingMutation = state.pendingToolCalls.some((call) =>
+    input.isMutationToolName(call.name)
+  );
+  const childrenSettled = state.subagents.every((job) =>
+    TERMINAL_CHILD_STATUSES.has(job.status)
+  );
+  if (state.phase === "observing" && pendingMutation && childrenSettled) {
+    return {
+      from: "observing",
+      to: "acting",
+      reason: "pending_mutation_call",
+    };
+  }
+
+  if (state.pendingToolCalls.length > 0) return null;
+  const phaseEvents = currentPhaseEvents(state);
+
+  if (state.phase === "observing") {
+    const parentResponded = phaseEvents.some((event) => event.type === "provider.responded");
+    if (state.evidence.length > 0 && parentResponded && childrenSettled) {
+      return {
+        from: "observing",
+        to: "acting",
+        reason: "observation_cycle_complete",
+      };
+    }
+    return null;
+  }
+
+  if (state.phase === "acting") {
+    const currentPhaseMutationCount =
+      committedMutationKeys(phaseEvents, input.isMutationToolName).size;
+    const approvedPlanCoverage = state.strategy === "plan"
+      ? deriveRuntimeV2PlanExecutionCoverage(state)
+      : null;
+    const mutationBoundarySatisfied = approvedPlanCoverage
+      ? approvedPlanCoverage.allMutationTargetsCovered
+      : true;
+    if (currentPhaseMutationCount > 0 && mutationBoundarySatisfied) {
+    return {
+      from: "acting",
+      to: "validating",
+      reason: "mutation_committed",
+    };
+    }
+  }
+
+  if (state.phase === "validating") {
+    const validation = latestValidation(phaseEvents);
+    if (
+      validation &&
+      !validation.passed &&
+      validation.failureKind !== "not_authorized" &&
+      validation.failureKind !== "protocol_invalid"
+    ) {
+      return {
+        from: "validating",
+        to: "acting",
+        reason: "validation_failed",
+      };
+    }
+  }
+
+  return null;
+}

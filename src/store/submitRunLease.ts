@@ -1,4 +1,4 @@
-import type { AgentMessage, ContentPart } from "../lib/orchestrator";
+import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
 import type { PlanStage } from "../lib/workflowModels";
 import type { ResolvedRunIntent } from "../lib/runIntent";

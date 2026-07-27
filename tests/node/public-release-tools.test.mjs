@@ -14,8 +14,11 @@ import {
 } from "../../scripts/release_tools.mjs";
 import { resolveReleaseMacVersion } from "../../scripts/release-mac.mjs";
 
+const temporaryRoots = new Set();
+
 async function createTempWorkspace() {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "main-release-tools-"));
+  temporaryRoots.add(rootDir);
   await fs.mkdir(path.join(rootDir, "src-tauri"), { recursive: true });
   await fs.writeFile(path.join(rootDir, "package.json"), JSON.stringify({ version: "1.1.1" }, null, 2));
   await fs.writeFile(
@@ -45,6 +48,12 @@ async function createTempWorkspace() {
   );
   return rootDir;
 }
+
+test.afterEach(async () => {
+  if (process.env.MAIN_KEEP_RELEASE_TOOL_FIXTURES === "1") return;
+  await Promise.all([...temporaryRoots].map((rootDir) => fs.rm(rootDir, { recursive: true, force: true })));
+  temporaryRoots.clear();
+});
 
 test("version helpers derive platform-compatible versions", () => {
   assert.equal(toMacBundleVersion("1.2.3-beta.4"), "1.2.3");

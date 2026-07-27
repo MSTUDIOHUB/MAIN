@@ -40,11 +40,3 @@ test("local provider routing sends Ollama /v1 endpoints through the Rust proxy",
   assert.equal(shouldUseRustProxyForLocalProvider("LM Studio", "http://127.0.0.1:1234/v1"), true);
   assert.equal(shouldUseRustProxyForLocalProvider("OMLX", "http://127.0.0.1:11535/v1"), true);
 });
-
-test("orchestrator and preflight share the local provider routing helper", async () => {
-  const orchestrator = await fs.readFile(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const preflight = await fs.readFile(path.join(workspaceRoot, "src/lib/intentPreflight.ts"), "utf8");
-
-  assert.match(orchestrator, /shouldUseRustProxyForLocalProvider\(config\.local\.provider,\s*config\.local\.endpoint\)/);
-  assert.match(preflight, /shouldUseRustProxyForLocalProvider\(config\.local\.provider,\s*config\.local\.endpoint\)/);
-});

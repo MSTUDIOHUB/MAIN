@@ -11,6 +11,18 @@ import {
   SUPPORTED_INTERACTION_ASSERTION_KINDS,
 } from "./validationContract";
 
+export interface ToolParameterSchema {
+  type?: string;
+  description?: string;
+  enum?: string[];
+  properties?: Record<string, ToolParameterSchema>;
+  items?: ToolParameterSchema;
+  required?: string[];
+  minItems?: number;
+  anyOf?: ToolParameterSchema[];
+  additionalProperties?: boolean | ToolParameterSchema;
+}
+
 export interface ToolDefinition {
   type: "function";
   function: {
@@ -18,7 +30,7 @@ export interface ToolDefinition {
     description: string;
     parameters: {
       type: "object";
-      properties: Record<string, { type: string; description?: string; enum?: string[] }>;
+      properties: Record<string, ToolParameterSchema>;
       required: string[];
     };
   };

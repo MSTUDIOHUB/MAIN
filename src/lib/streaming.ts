@@ -136,6 +136,7 @@ export interface StreamRequestOptions {
   toolChoice?: OpenAiToolChoice;
   responseFormat?: Record<string, unknown>;
   visualTransportBinding?: VisualTransportRequestBinding;
+  timeoutMs?: number;
 }
 
 /** A tool call accumulated from streaming deltas. */
@@ -2216,6 +2217,7 @@ async function streamViaRustProxy(
     body: JSON.stringify(body),
     authMode: settings.authMode,
     tokenRef: settings.tokenRef,
+    timeoutMs: options.timeoutMs,
   }).catch(err => {
     if (resolved) return;
     resolved = true;

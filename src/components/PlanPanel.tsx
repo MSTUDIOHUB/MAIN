@@ -8,9 +8,11 @@ import {
   type TurnPresentationModel,
 } from "../lib/turnPresentation";
 import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import type { RuntimeV2PlanPanelProjection } from "../lib/runtime-v2";
 
 interface PlanPanelProps {
   presentation?: TurnPresentationModel;
+  runtimeV2Review?: RuntimeV2PlanPanelProjection | null;
   artifacts: PlanArtifact[];
   tasks: PlanTask[];
   evidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -185,6 +187,7 @@ function getStageTone(stage: PlanStage): string {
 
 export default function PlanPanel({
   presentation,
+  runtimeV2Review = null,
   artifacts,
   tasks,
   evidenceLedger = [],
@@ -213,19 +216,33 @@ export default function PlanPanel({
   onRejectAndDelete,
 }: PlanPanelProps) {
   const copy = COPY[language];
-  const [activeArtifactPath, setActiveArtifactPath] = useState<string>(artifacts[artifacts.length - 1]?.path || "");
+  const runtimeV2Artifact = useMemo<PlanArtifact | null>(() => runtimeV2Review
+    ? {
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        title: runtimeV2Review.title,
+        content: runtimeV2Review.markdown,
+        revision: runtimeV2Review.authority.revision,
+        updatedAt: fallbackUpdatedAt || Date.now(),
+      }
+    : null, [fallbackUpdatedAt, runtimeV2Review]);
+  const [activeArtifactPath, setActiveArtifactPath] = useState<string>(
+    runtimeV2Artifact?.path || artifacts[artifacts.length - 1]?.path || "",
+  );
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [isApproving, setIsApproving] = useState(false);
   const [adjustmentText, setAdjustmentText] = useState("");
   const approvingRef = useRef(false);
   const previewMarkdown = fallbackPreview.trim();
   const hasReviewablePlanArtifact = useMemo(
-    () => !!buildTypedPlanApprovalIdentity(artifacts),
-    [artifacts],
+    () => !!runtimeV2Review || !!buildTypedPlanApprovalIdentity(artifacts),
+    [artifacts, runtimeV2Review],
   );
   const displayArtifacts = useMemo(
-    () => (hasReviewablePlanArtifact || !previewMarkdown ? artifacts : []),
-    [artifacts, hasReviewablePlanArtifact, previewMarkdown],
+    () => runtimeV2Artifact
+      ? [runtimeV2Artifact]
+      : (hasReviewablePlanArtifact || !previewMarkdown ? artifacts : []),
+    [artifacts, hasReviewablePlanArtifact, previewMarkdown, runtimeV2Artifact],
   );
 
   useEffect(() => {
@@ -259,8 +276,20 @@ export default function PlanPanel({
   const activeArtifact = displayArtifacts.find((artifact) => artifact.path === activeArtifactPath) || displayArtifacts[displayArtifacts.length - 1];
   const isCandidateOnly = !hasReviewablePlanArtifact && previewMarkdown.length > 0;
   const displayTasks = useMemo(
-    () => (tasks.length > 0 ? tasks : previewMarkdown ? extractPlanTasks(previewMarkdown) : []),
-    [tasks, previewMarkdown],
+    () => tasks.length > 0
+      ? tasks
+      : runtimeV2Review
+        ? runtimeV2Review.steps.map((step) => ({
+            id: step.id,
+            text: step.title,
+            status: "pending" as const,
+            executionKind: step.operation === "preserve" ? "observation" as const : "mutation" as const,
+            requirementRef: step.id,
+          }))
+        : previewMarkdown
+          ? extractPlanTasks(previewMarkdown)
+          : [],
+    [tasks, previewMarkdown, runtimeV2Review],
   );
   const taskAudit = useMemo(
     () => buildPlanTaskEvidenceAudit({ tasks: displayTasks, evidenceLedger }),
@@ -407,7 +436,7 @@ export default function PlanPanel({
       data-turn-lifecycle={presentation?.lifecycle}
       data-action-kind={presentation?.actionKind}
       data-plan-presentation={presentationBehavior.mode}
-      data-plan-document-kind={hasReviewablePlanArtifact ? "artifact" : isCandidateOnly ? "candidate" : "empty"}
+      data-plan-document-kind={runtimeV2Review ? "runtime_v2" : hasReviewablePlanArtifact ? "artifact" : isCandidateOnly ? "candidate" : "empty"}
       className="plan-review-panel flex h-full flex-col bg-[#050505]"
     >
       <div className="border-b border-[#27272a] px-4 py-3 bg-[#09090b]">

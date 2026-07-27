@@ -1,4 +1,3 @@
-import type { ToolExecutionResult } from "./orchestrator/types";
 import { isNoOpToolFeedback } from "./toolFeedbackEnvelope";
 import {
   BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES,
@@ -6,6 +5,31 @@ import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
 } from "./workspaceMutationTools";
+
+/**
+ * Minimal structural result consumed by evidence and cache invalidation.
+ * Execution engines may carry richer provider/UI fields, but this pure module
+ * must not depend on an engine-owned result type.
+ */
+export interface ToolResultEffectRecord {
+  name: string;
+  target: string;
+  content: string;
+  isError: boolean;
+  displayContent?: string;
+  internalFeedback?: boolean;
+  lifecycleState?: string;
+  executionName?: string;
+  catalogIdentity?: {
+    source?: string;
+  };
+  executedArgs?: Record<string, unknown>;
+  workspaceMutationEvidence?: {
+    changedPaths?: string[];
+  };
+  executionAttempted?: boolean;
+  workspaceEffect?: string;
+}
 
 const NON_EXECUTED_LIFECYCLE_STATES = new Set([
   "queued",
@@ -22,21 +46,22 @@ const NON_EXECUTED_LIFECYCLE_STATES = new Set([
  * task or workspace-mutation evidence.
  */
 export function hasCompletedToolExecution(
-  result: Pick<ToolExecutionResult, "isError"> &
-    Partial<Pick<ToolExecutionResult, "internalFeedback" | "lifecycleState">>,
+  result: Pick<ToolResultEffectRecord, "isError"> &
+    Partial<Pick<ToolResultEffectRecord, "internalFeedback" | "lifecycleState">>,
 ): boolean {
   if (result.isError || result.internalFeedback) return false;
   return !NON_EXECUTED_LIFECYCLE_STATES.has(String(result.lifecycleState || ""));
 }
 
 export function getToolExecutionName(
-  result: Pick<ToolExecutionResult, "name"> & Partial<Pick<ToolExecutionResult, "executionName">>,
+  result: Pick<ToolResultEffectRecord, "name"> &
+    Partial<Pick<ToolResultEffectRecord, "executionName">>,
 ): string {
   return String(result.executionName || result.name || "").trim();
 }
 
 export function getToolExecutionArgs(
-  result: Partial<Pick<ToolExecutionResult, "executedArgs">>,
+  result: Partial<Pick<ToolResultEffectRecord, "executedArgs">>,
   fallback: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return result.executedArgs && typeof result.executedArgs === "object"
@@ -51,7 +76,7 @@ export function getToolExecutionArgs(
  * successful execution evidence.
  */
 export function getObservedWorkspaceMutationPaths(
-  result: Partial<Pick<ToolExecutionResult, "workspaceMutationEvidence">>,
+  result: Partial<Pick<ToolResultEffectRecord, "workspaceMutationEvidence">>,
 ): string[] {
   return [...new Set(
     (result.workspaceMutationEvidence?.changedPaths || [])
@@ -61,7 +86,7 @@ export function getObservedWorkspaceMutationPaths(
 }
 
 export function hasObservedWorkspaceMutationEffect(
-  result: Partial<Pick<ToolExecutionResult, "workspaceMutationEvidence">>,
+  result: Partial<Pick<ToolResultEffectRecord, "workspaceMutationEvidence">>,
 ): boolean {
   return getObservedWorkspaceMutationPaths(result).length > 0;
 }
@@ -73,7 +98,7 @@ export function hasObservedWorkspaceMutationEffect(
  */
 export function canRecordPlanExecutionEvidenceForTool(input: {
   executionName: string;
-  catalogIdentity?: Partial<Pick<ToolExecutionResult, "catalogIdentity">>["catalogIdentity"];
+  catalogIdentity?: ToolResultEffectRecord["catalogIdentity"];
   hasObservedDiff: boolean;
 }): boolean {
   const executionName = String(input.executionName || "").trim();
@@ -89,8 +114,8 @@ export function canRecordPlanExecutionEvidenceForTool(input: {
  * is not durable mutation evidence.
  */
 export function hasVerifiedWorkspaceMutationEffect(
-  result: Pick<ToolExecutionResult, "name" | "target" | "content" | "isError"> &
-    Partial<Pick<ToolExecutionResult,
+  result: Pick<ToolResultEffectRecord, "name" | "target" | "content" | "isError"> &
+    Partial<Pick<ToolResultEffectRecord,
       "displayContent" | "internalFeedback" | "lifecycleState" | "executionName" |
       "catalogIdentity" | "executedArgs" | "workspaceMutationEvidence">>,
   fallbackArgs: Record<string, unknown> = {},
@@ -120,16 +145,16 @@ export function hasVerifiedWorkspaceMutationEffect(
  * returning an error, so observations must be conservatively invalidated.
  */
 export function mayHaveWorkspaceSideEffects(
-  result: Pick<ToolExecutionResult, "name" | "target" | "content" | "isError"> &
-    Partial<Pick<ToolExecutionResult,
+  result: Pick<ToolResultEffectRecord, "name" | "target" | "content" | "isError"> &
+    Partial<Pick<ToolResultEffectRecord,
       "displayContent" | "executionAttempted" | "executionName" | "executedArgs" |
       "workspaceMutationEvidence">>,
   fallbackArgs: Record<string, unknown> = {},
 ): boolean {
   if ((result.workspaceMutationEvidence?.changedPaths?.length ?? 0) > 0) return true;
-  if ((result as Partial<ToolExecutionResult>).workspaceEffect === "none") return false;
+  if ((result as Partial<ToolResultEffectRecord>).workspaceEffect === "none") return false;
   if (["verified", "possible", "partial"].includes(
-    String((result as Partial<ToolExecutionResult>).workspaceEffect || ""),
+    String((result as Partial<ToolResultEffectRecord>).workspaceEffect || ""),
   )) return true;
   if (result.executionAttempted !== true) return false;
   const executionName = getToolExecutionName(result);

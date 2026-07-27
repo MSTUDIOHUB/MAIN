@@ -587,6 +587,8 @@ function isDiskWriteSatisfied(content) {
 
 async function runDiskWriteProbe(model) {
   const workspace = await seedDiskWorkspace(model);
+  const keepFixture = process.env.MAIN_KEEP_OMLX_DISK_FIXTURE === "1";
+  try {
   const messages = [
     {
       role: "system",
@@ -677,7 +679,7 @@ async function runDiskWriteProbe(model) {
     const current = await readWorkspaceFile(workspace.root, workspace.target);
     if (current !== workspace.original && isDiskWriteSatisfied(current)) {
       return {
-        workspace: workspace.root,
+        workspace: keepFixture ? workspace.root : "[temporary fixture removed after validation]",
         target: workspace.target,
         originalHash: workspace.originalHash,
         finalHash: sha256(current),
@@ -702,6 +704,13 @@ async function runDiskWriteProbe(model) {
     finalText,
     visibleTexts,
   });
+  } finally {
+    if (!keepFixture) {
+      await fs.rm(workspace.root, { recursive: true, force: true }).catch((error) => {
+        console.warn(`[omlx-probe] failed to remove temporary fixture ${workspace.root}: ${error.message}`);
+      });
+    }
+  }
 }
 
 async function runPlanProbe(model) {

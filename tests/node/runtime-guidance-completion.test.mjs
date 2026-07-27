@@ -80,14 +80,3 @@ test("completion fence acquires finalization only for a live completion candidat
     lateGuidanceContinuationsUsed: 0,
   }), { kind: "not_applicable" });
 });
-
-test("production loop reserves an iteration only when late Guide wins completion", () => {
-  const orchestratorSource = fs.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
-    "utf8",
-  );
-  assert.match(orchestratorSource, /lateGuidanceIterationAllowance \+= 1/);
-  assert.match(orchestratorSource, /getEffectiveMaxIterations\(\) \+ lateGuidanceIterationAllowance/);
-  assert.match(orchestratorSource, /turnEvents\.discardStagedTurnCompletion\(\)/);
-  assert.match(orchestratorSource, /callbacks\.onLateGuidanceContinuation/);
-});

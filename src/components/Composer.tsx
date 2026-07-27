@@ -10,7 +10,7 @@ import { compressImage, getImageFilesFromClipboard, processImageFile } from "../
 import { estimateTokens } from "../lib/contextTrim";
 import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
-import type { AgentMessage, ContentPart } from "../lib/orchestrator";
+import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getGameStudioSlashCatalog } from "../lib/gameStudio/pack";
 import { humanizeSlug } from "../lib/gameStudio/catalog";

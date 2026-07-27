@@ -3,7 +3,8 @@
 // All state that was previously scattered as useState in the monolith lives here.
 import { create, type StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
-import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
+import type { AgentMessage, ContentPart } from "../lib/agentMessages";
+import type { ToolReviewDecision } from "../lib/toolReviewDecision";
 import type {
   ExecuteRecoveryMode,
   ForcedExecuteRecoveryRuntimeState,
@@ -107,6 +108,16 @@ import {
   normalizeTurnRuntimeCheckpointMap,
   type TurnRuntimeCheckpointMap,
 } from "../lib/turnRuntimeCheckpoint";
+import {
+  normalizeRuntimeV2CheckpointMap,
+  type RuntimeV2CheckpointMap,
+} from "../lib/runtime-v2/checkpoint";
+import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
+import { createRuntimeV2ProjectionPort } from "./runtimeV2/projectionPort";
+import {
+  approveAndDispatchRuntimeV2Plan,
+} from "./runtimeV2/planHandoff";
+import { resolveRuntimeV2PlanReviewFromAggregate } from "./runtimeV2/workPlanAdapter";
 import {
   normalizeSubagentClosureReceiptLedger,
   type SubagentClosureReceiptLedger,
@@ -281,6 +292,7 @@ import {
   getIntentPolicy,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
+  resolveWorkspaceAwareWorkflowMode,
   type ExecutionConsentPolicy,
   type CommandDirective,
   type MainIntentShortcut,
@@ -1024,6 +1036,8 @@ export interface SessionRuntimeSnapshot {
   activeActionRequest?: ActionRequest | null;
   /** Versioned, JSON-only canonical Turn + collaboration checkpoints. */
   turnRuntimeCheckpoints?: TurnRuntimeCheckpointMap;
+  /** Event-sourced v3 checkpoints for Turns owned by Runtime v2. */
+  runtimeV2Checkpoints?: RuntimeV2CheckpointMap;
   /** Session-owned canonical receipts backing durable subagent closure evidence. */
   subagentClosureReceiptLedger?: SubagentClosureReceiptLedger | null;
   taskFlow: TaskBlock[];
@@ -1085,6 +1099,7 @@ export interface SessionRuntimeSnapshot {
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
+  runtimeV2Checkpoints: RuntimeV2CheckpointMap;
   subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   input: string;
   contextMentions: string[];
@@ -1121,7 +1136,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   agentStatus: AgentStatus;
   abortController: AbortController | null;
   elapsedTime: number;
-  pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
+  pendingReviewResolve: ((decision: ToolReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   /** Current in-memory checkpoint owner. Not persisted because resolver closures cannot survive reload. */
   activeActionRequest: ActionRequest | null;
@@ -1527,6 +1542,7 @@ export interface AppState {
   harnessRunMarker: HarnessRunMarker | null;
   activeActionRequest: ActionRequest | null;
   turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
+  runtimeV2Checkpoints: RuntimeV2CheckpointMap;
   subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setPlanStage: (stage: PlanStage) => void;
@@ -1566,7 +1582,7 @@ export interface AppState {
   contextMemoryState: ContextMemoryState | null;
   contextMemoryStateByRuntimeKey: Record<string, ContextMemoryState | null>;
   providerCompatibilityByRuntimeKey: Record<string, ProviderCompatibilityRuntimeLaneState>;
-  pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
+  pendingReviewResolve: ((decision: ToolReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   pendingToolCall: {
     toolCallId?: string;
@@ -2042,12 +2058,19 @@ function normalizeLiveConversationTurns(
 export function normalizeInterruptedConversationTurnsForRestore(
   turns: ConversationTurn[] | undefined,
   _taskFlow: TaskBlock[],
+  hasWorkspaceContainer = false,
 ): ConversationTurn[] {
   return normalizeLiveConversationTurns(turns).map((normalizedTurn) => {
-    const turn = normalizedTurn;
-    if (turn.status !== "executing" && turn.status !== "planning") return normalizedTurn;
-    return {
+    const turn = {
       ...normalizedTurn,
+      mode: resolveWorkspaceAwareWorkflowMode(
+        normalizedTurn.mode || "chat",
+        hasWorkspaceContainer,
+      ),
+    };
+    if (turn.status !== "executing" && turn.status !== "planning") return turn;
+    return {
+      ...turn,
       status: "paused",
       summary: String(turn.summary || "").trim() || "Execution was interrupted by an application restart; progress is preserved and resumable.",
     };
@@ -3250,7 +3273,7 @@ function concludeWorkspaceInstructionEntry(input: {
     intentSummary: input.language === "en"
       ? "A durable workspace receipt was closed at an ownership recovery boundary."
       : "持久化工作区回执已在所有权恢复边界收口。",
-    mode: "chat" as const,
+    mode: "edit" as const,
     intent: "respond" as const,
     displayIntent: "respond" as const,
     status: "error" as const,
@@ -4057,7 +4080,7 @@ function quarantineRestoredLocalFastEntry(input: {
         userPrompt: input.entry.instruction.payload.text,
         title: useChinese ? "本地命令恢复隔离" : "Local command recovery quarantine",
         intentSummary: quarantineSummary,
-        mode: "chat",
+        mode: "edit",
         intent: "respond",
         displayIntent: "respond",
         status: "error",
@@ -4265,6 +4288,9 @@ export function normalizeSessionRuntimeSnapshot(
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
   const expectedContainerSessionKey = String(options?.expectedSessionKey || "").trim();
+  const hasWorkspaceContainer = expectedContainerSessionKey
+    ? !expectedContainerSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+    : resolveSessionWorkspaceKey(options?.workspacePath || "") !== GLOBAL_CHAT_KEY;
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
     (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedMainModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
@@ -4771,6 +4797,7 @@ export function normalizeSessionRuntimeSnapshot(
   let conversationTurns = normalizeInterruptedConversationTurnsForRestore(
     snapshot.conversationTurns,
     taskFlow,
+    hasWorkspaceContainer,
   ).map((turn) => {
     const ownsTerminalMarker = !!restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
     const hasRecoverableAwaitingState = turn.status === "awaiting_input" || turn.status === "awaiting_approval";
@@ -5283,7 +5310,7 @@ export function normalizeSessionRuntimeSnapshot(
         userPrompt: restoredQueuedUserMessage.text,
         title: useChinese ? "排队恢复失败" : "Queue restore failed",
         intentSummary: summary,
-        mode: "chat",
+        mode: "edit",
         intent: "respond",
         displayIntent: "respond",
         status: "error",
@@ -5704,6 +5731,18 @@ export function normalizeSessionRuntimeSnapshot(
         reviewArtifactPaths[0] === canonicalArtifactPath;
     }),
   );
+  const restoredRuntimeV2Checkpoints = normalizeRuntimeV2CheckpointMap(
+    snapshot.runtimeV2Checkpoints,
+    {
+      ...(restoredWorkspaceKey ? { workspaceKey: restoredWorkspaceKey } : {}),
+      ...(suppliedLifecycleSessionEpoch
+        ? {
+            sessionKey: restoredLifecycleSessionKey,
+            sessionEpoch: suppliedLifecycleSessionEpoch,
+          }
+        : {}),
+    },
+  );
   const checkpointBackedActionRequest =
     reconciledRestoredActionRequest?.kind === "plan_review" &&
     !restoredTurnRuntimeCheckpoints[reconciledRestoredActionRequest.turnId]
@@ -5749,6 +5788,7 @@ export function normalizeSessionRuntimeSnapshot(
     harnessRunMarker: sanitizedHarnessRunMarker,
     activeActionRequest: checkpointBackedActionRequest,
     turnRuntimeCheckpoints: restoredTurnRuntimeCheckpoints,
+    runtimeV2Checkpoints: restoredRuntimeV2Checkpoints,
     subagentClosureReceiptLedger: restoredSubagentClosureReceiptLedger,
     taskFlow,
     agentMessages,
@@ -5879,6 +5919,18 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
         closureReceiptLedger: subagentClosureReceiptLedger,
       },
     ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      snapshot.runtimeV2Checkpoints,
+      checkpointOwnerFence
+        ? {
+            ...(checkpointOwnerFence.expectedWorkspaceKey
+              ? { workspaceKey: checkpointOwnerFence.expectedWorkspaceKey }
+              : {}),
+            sessionKey: checkpointOwnerFence.expectedSessionKey,
+            sessionEpoch: checkpointOwnerFence.expectedSessionEpoch,
+          }
+        : undefined,
+    ),
     subagentClosureReceiptLedger,
     taskFlow: sanitizeTaskBlocksForPersist(snapshot.taskFlow || []),
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
@@ -5998,6 +6050,7 @@ const sessionRuntimeKeys = [
   "harnessRunMarker",
   "activeActionRequest",
   "turnRuntimeCheckpoints",
+  "runtimeV2Checkpoints",
   "subagentClosureReceiptLedger",
   "taskFlow",
   "agentMessages",
@@ -6267,6 +6320,20 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
           : {}),
         closureReceiptLedger: subagentClosureReceiptLedger,
       },
+    ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      state.runtimeV2Checkpoints,
+      checkpointWorkspaceKey || hasBoundPlanLifecycle
+        ? {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          }
+        : undefined,
     ),
     subagentClosureReceiptLedger,
     taskFlow: Array.isArray(state.taskFlow) ? archiveConsumedReplyOptionsFromTaskFlow(state.taskFlow) : [],
@@ -7631,6 +7698,20 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
         closureReceiptLedger: subagentClosureReceiptLedger,
       },
     ),
+    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+      state.runtimeV2Checkpoints,
+      checkpointWorkspaceKey || hasBoundPlanLifecycle
+        ? {
+            ...(checkpointWorkspaceKey ? { workspaceKey: checkpointWorkspaceKey } : {}),
+            ...(hasBoundPlanLifecycle
+              ? {
+                  sessionKey: planLifecycle.sessionKey,
+                  sessionEpoch: planLifecycle.sessionEpoch,
+                }
+              : {}),
+          }
+        : undefined,
+    ),
     subagentClosureReceiptLedger,
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
@@ -7722,6 +7803,7 @@ export function buildEmptySessionRuntimeSnapshot(
     harnessRunMarker: null,
     activeActionRequest: null,
     turnRuntimeCheckpoints: {},
+    runtimeV2Checkpoints: {},
     subagentClosureReceiptLedger: null,
     taskFlow: [],
     agentMessages: [],
@@ -10310,7 +10392,10 @@ export const useAppStore = create<AppState>()(
                   ...turn,
                   title: turnTitle,
                   intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
-                  mode: "chat" as const,
+                  mode: resolveWorkspaceAwareWorkflowMode(
+                    "chat",
+                    sessionScopeKey !== GLOBAL_CHAT_KEY,
+                  ),
                   intent: "respond" as const,
                   displayIntent: "respond" as const,
                   status: "executing" as const,
@@ -10336,7 +10421,10 @@ export const useAppStore = create<AppState>()(
               userPrompt: prompt,
               title: turnTitle,
               intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
-              mode: "chat" as const,
+              mode: resolveWorkspaceAwareWorkflowMode(
+                "chat",
+                sessionScopeKey !== GLOBAL_CHAT_KEY,
+              ),
               intent: "respond" as const,
               displayIntent: "respond" as const,
               status: "executing" as const,
@@ -11166,7 +11254,11 @@ export const useAppStore = create<AppState>()(
           [resolveSessionWorkspaceKey(s.currentWorkspace)]: s.currentSessionId,
         },
         currentWorkspace: "",
-        config: { ...s.config, workspace: "" },
+        config: {
+          ...s.config,
+          workspace: "",
+          workflowMode: "chat",
+        },
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
@@ -11216,7 +11308,14 @@ export const useAppStore = create<AppState>()(
           ? s.workspaces.map((entry) => entry.path === normalizedPath ? nextWorkspaceEntry : entry)
           : [...s.workspaces, nextWorkspaceEntry],
         activeSessionByWorkspace,
-        config: { ...s.config, workspace: normalizedPath },
+        config: {
+          ...s.config,
+          workspace: normalizedPath,
+          workflowMode: resolveWorkspaceAwareWorkflowMode(
+            s.config.workflowMode,
+            true,
+          ),
+        },
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
@@ -11263,7 +11362,14 @@ export const useAppStore = create<AppState>()(
               entry.path === stablePath || entry.path === normalizedPath ? nextEntry : entry
             );
           })(),
-          config: { ...s.config, workspace: stablePath },
+          config: {
+            ...s.config,
+            workspace: stablePath,
+            workflowMode: resolveWorkspaceAwareWorkflowMode(
+              s.config.workflowMode,
+              true,
+            ),
+          },
         }));
         invalidateWorkspaceTreeCache();
         return get().refreshInstructionAndHookState()
@@ -11282,13 +11388,28 @@ export const useAppStore = create<AppState>()(
 
   addSession: (workspacePath: string, session: Session) => {
     set((s) => {
+      const scopeKey = resolveSessionWorkspaceKey(workspacePath);
       const updated = { ...s.sessionsByWorkspace };
-      if (!updated[workspacePath]) updated[workspacePath] = [];
+      if (!updated[scopeKey]) updated[scopeKey] = [];
+      const isActiveWorkspaceContainer =
+        scopeKey !== GLOBAL_CHAT_KEY &&
+        resolveSessionWorkspaceKey(s.currentWorkspace) === scopeKey;
       return {
         sessionsByWorkspace: {
           ...updated,
-          [workspacePath]: [session, ...updated[workspacePath]],
+          [scopeKey]: [session, ...updated[scopeKey]],
         },
+        ...(isActiveWorkspaceContainer
+          ? {
+              config: {
+                ...s.config,
+                workflowMode: resolveWorkspaceAwareWorkflowMode(
+                  s.config.workflowMode,
+                  true,
+                ),
+              },
+            }
+          : {}),
       };
     });
   },
@@ -12351,6 +12472,7 @@ export const useAppStore = create<AppState>()(
         pendingReviewTaskId: null,
         activeActionRequest: null,
         turnRuntimeCheckpoints: {},
+        runtimeV2Checkpoints: {},
         subagentClosureReceiptLedger: null,
         pendingToolCall: null,
         executionConsentPolicy: "ask_per_turn",
@@ -12539,6 +12661,7 @@ export const useAppStore = create<AppState>()(
       pendingReviewTaskId: null,
       activeActionRequest: null,
       turnRuntimeCheckpoints: {},
+      runtimeV2Checkpoints: {},
       subagentClosureReceiptLedger: null,
       pendingToolCall: null,
       pendingSlashCommand: null,
@@ -12614,11 +12737,18 @@ export const useAppStore = create<AppState>()(
   runtimeEvents: [],
   harnessRunMarker: null,
   turnRuntimeCheckpoints: {},
+  runtimeV2Checkpoints: {},
   subagentClosureReceiptLedger: null,
-  setWorkflowMode: (mode) => set((s) => ({
-    config: { ...s.config, workflowMode: mode },
-    ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
-  })),
+  setWorkflowMode: (mode) => set((s) => {
+    const workflowMode = resolveWorkspaceAwareWorkflowMode(
+      mode,
+      Boolean(String(s.currentWorkspace || "").trim()),
+    );
+    return {
+      config: { ...s.config, workflowMode },
+      ...(workflowMode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
+    };
+  }),
   setPlanStage: (stage) => set({ planStage: stage }),
   upsertPlanArtifact: (artifact) => {
     const invalidatedPlanToolReviewRef: {
@@ -13021,6 +13151,151 @@ export const useAppStore = create<AppState>()(
     (() => {
       const state = get();
       const approvedTurnId = state.currentTurnId;
+      const runtimeV2Checkpoint = approvedTurnId
+        ? state.runtimeV2Checkpoints[approvedTurnId] || null
+        : null;
+      const runtimeV2Review = resolveRuntimeV2PlanReviewFromAggregate(
+        runtimeV2Checkpoint?.aggregate,
+      );
+      if (
+        runtimeV2Checkpoint?.aggregate.strategy === "plan" &&
+        runtimeV2Checkpoint.aggregate.planReviewCommit &&
+        !runtimeV2Review
+      ) {
+        logStoreEvent("runtime_v2_plan_approval_rejected", {
+          reason: "runtime_v2_plan_review_authority_invalid",
+          planTurnId: approvedTurnId,
+        });
+        return;
+      }
+      if (runtimeV2Checkpoint && runtimeV2Review && !runtimeV2Review.pending) {
+        logStoreEvent("runtime_v2_plan_approval_deduped", {
+          reason: "runtime_v2_plan_already_resolved",
+          planTurnId: runtimeV2Review.commit.review.turnId,
+          runId: runtimeV2Review.commit.review.runId,
+          requestId: runtimeV2Review.commit.review.requestId,
+        });
+        return;
+      }
+      if (runtimeV2Checkpoint && runtimeV2Review?.pending) {
+        const runtimeV2PlanTurnId = runtimeV2Review.commit.review.turnId;
+        const pendingRequest = state.activeActionRequest?.kind === "plan_review"
+          ? state.activeActionRequest
+          : null;
+        const reviewScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+        const reviewSessionKey = resolveSessionRuntimeKey(
+          reviewScopeKey,
+          state.currentSessionId,
+        );
+        if (
+          !reviewSessionKey ||
+          reviewSessionKey !== runtimeV2Review.commit.review.sessionKey
+        ) {
+          logStoreEvent("runtime_v2_plan_approval_rejected", {
+            reason: "runtime_v2_plan_session_owner_mismatch",
+            planTurnId: runtimeV2PlanTurnId,
+            requestId: pendingRequest?.requestId || null,
+          });
+          return;
+        }
+        const {
+          sessionGet,
+          sessionSet,
+          getSessionRevisionToken,
+          publishOwnerScopedRuntimeProjection,
+        } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
+          get,
+          set,
+          runSessionKey: reviewSessionKey,
+          createRuntimeFromState: createSessionRuntimeFromState,
+          pickRuntimePatch: pickSessionRuntimePatch,
+          normalizePatch: (patch) =>
+            normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
+          derivePlanStageFromArtifacts,
+          createDefaultCurrentTurnState,
+          logStoreEvent,
+        });
+        const port = createRuntimeV2CheckpointPort({
+          get: sessionGet,
+          set: sessionSet,
+          scopeKey: reviewScopeKey,
+          sessionId: state.currentSessionId,
+          getSessionRevisionToken,
+          sanitizeTaskBlocksForPersist,
+          normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+          persistSessionRecord: saveProjectSession,
+          publishOwnerScopedRuntimeProjection,
+          logStoreEvent,
+        });
+        const projectionPort = createRuntimeV2ProjectionPort({
+          get: sessionGet,
+          set: sessionSet,
+          nextTaskId: () => sessionGet()._nextTaskId(),
+          language: sessionGet().config.language === "en" ? "en" : "zh",
+          logStoreEvent,
+        });
+        void approveAndDispatchRuntimeV2Plan({
+          checkpoint: runtimeV2Checkpoint,
+          checkpointPort: port,
+          projectionPort,
+          review: runtimeV2Review,
+          request: pendingRequest,
+          expected: expectedIdentity,
+          language: sessionGet().config.language === "en" ? "en" : "zh",
+          onApproved: () => {
+            sessionSet((current) => ({
+              activeActionRequest: current.activeActionRequest?.requestId === pendingRequest?.requestId
+                ? null
+                : current.activeActionRequest,
+              isPlanApproved: true,
+              planStage: "ready_to_execute" as const,
+              agentStatus: "idle" as const,
+              isGenerating: false,
+              abortController: null,
+              conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
+                turn.id === runtimeV2PlanTurnId
+                  ? {
+                      ...turn,
+                      status: "executing" as const,
+                      summary: current.config.language === "en"
+                        ? "The Runtime v2 WorkPlan is approved and sealed as the execution input."
+                        : "Runtime v2 WorkPlan 已批准，并已封存为后续执行输入。",
+                    }
+                  : turn
+              ),
+            }));
+          },
+          dispatch: ({ prompt, turnId, runId }) =>
+            sessionGet().sendMessage(
+              prompt,
+              undefined,
+              {
+                hidden: true,
+                createVisibleTurnForHiddenMessage: false,
+                reuseCurrentTurn: true,
+                turnIdOverride: turnId,
+                preservePlanState: true,
+                resolvedIntent: "execute",
+                runtimeIntentOverride: "execute",
+                executionConsentGranted: true,
+                skipIntentResolution: true,
+                skipAutoPlanHydration: true,
+                runIdOverride: runId,
+                intentSummary: sessionGet().config.language === "en"
+                  ? "Execute the approved Runtime v2 WorkPlan."
+                  : "执行已批准的 Runtime v2 WorkPlan。",
+              },
+            ),
+          log: logStoreEvent,
+        }).catch((error) => {
+          logStoreEvent("runtime_v2_plan_approval_failed", {
+            planTurnId: runtimeV2PlanTurnId,
+            requestId: pendingRequest?.requestId || null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        return;
+      }
       if (state.isPlanApproved && isPlanApprovalLeaseBoundToState(state.planLifecycle)) {
         logStoreEvent("plan_approval_handoff_deduped", {
           reason: "already_approved",
@@ -15335,7 +15610,7 @@ export const useAppStore = create<AppState>()(
             state.config.language === "en" ? "Workspace instruction" : "工作区指令",
           ),
           intentSummary: summary,
-          mode: "chat" as const,
+          mode: "edit" as const,
           intent: "respond" as const,
           displayIntent: "respond" as const,
           status: "error" as const,
@@ -17301,6 +17576,7 @@ export const useAppStore = create<AppState>()(
       pendingReviewTaskId: null,
       activeActionRequest: null,
       turnRuntimeCheckpoints: {},
+      runtimeV2Checkpoints: {},
       pendingToolCall: null,
       agentStatus: "running",
       isGenerating: true,
@@ -17740,7 +18016,7 @@ export const useAppStore = create<AppState>()(
     );
     const deferCurrentSubmissionForCancellation = (
       replayOptions: typeof options = options,
-      queuedWorkflowContext: CancellationQueueContext = {},
+      queuedRunContext: CancellationQueueContext = {},
     ): CancellationSubmissionGate => {
       const pendingCancellation = getPendingSessionCancellation(
         submissionOriginSessionKey,
@@ -17761,20 +18037,20 @@ export const useAppStore = create<AppState>()(
       }
       if (!submissionOriginSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)) {
         const dispatchHints = JSON.parse(JSON.stringify({
-          ...(queuedWorkflowContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride
-            ? { resolvedIntent: queuedWorkflowContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride }
+          ...(queuedRunContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride
+            ? { resolvedIntent: queuedRunContext.runtimeIntentOverride || replayOptions?.runtimeIntentOverride }
             : {}),
-          ...(queuedWorkflowContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot
-            ? { goalSourceContextSnapshot: queuedWorkflowContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot }
+          ...(queuedRunContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot
+            ? { goalSourceContextSnapshot: queuedRunContext.goalSourceContextSnapshot || replayOptions?.goalSourceContextSnapshot }
             : {}),
-          ...(queuedWorkflowContext.goalCreationAuthorization
-            ? { goalCreationAuthorization: queuedWorkflowContext.goalCreationAuthorization }
+          ...(queuedRunContext.goalCreationAuthorization
+            ? { goalCreationAuthorization: queuedRunContext.goalCreationAuthorization }
             : {}),
-          ...(queuedWorkflowContext.goalContinuationAuthorization
-            ? { goalContinuationAuthorization: queuedWorkflowContext.goalContinuationAuthorization }
+          ...(queuedRunContext.goalContinuationAuthorization
+            ? { goalContinuationAuthorization: queuedRunContext.goalContinuationAuthorization }
             : {}),
-          ...(queuedWorkflowContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance
-            ? { goalContinuationGuidance: queuedWorkflowContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance }
+          ...(queuedRunContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance
+            ? { goalContinuationGuidance: queuedRunContext.goalContinuationGuidance || replayOptions?.goalContinuationGuidance }
             : {}),
         })) as WorkspaceJsonObject;
         void get().acceptWorkspaceInstruction({
@@ -17817,7 +18093,7 @@ export const useAppStore = create<AppState>()(
         });
       if (!reusesExactQueuedMessage) {
         const goalContinuationAuthorization =
-          queuedWorkflowContext.goalContinuationAuthorization ||
+          queuedRunContext.goalContinuationAuthorization ||
           goalContinuationAuthorizationBroker.consume({
             envelope: replayOptions?.goalContinuationEnvelope,
             text,
@@ -17827,15 +18103,15 @@ export const useAppStore = create<AppState>()(
           attachedFiles: (replayOptions?.attachedFilesSnapshot || state.attachedFiles)
             .map((file) => normalizeAttachedFile(file)),
           runtimeIntentOverride:
-            queuedWorkflowContext.runtimeIntentOverride ||
+            queuedRunContext.runtimeIntentOverride ||
             replayOptions?.runtimeIntentOverride,
           goalSourceContextSnapshot:
-            queuedWorkflowContext.goalSourceContextSnapshot ||
+            queuedRunContext.goalSourceContextSnapshot ||
             replayOptions?.goalSourceContextSnapshot,
-          goalCreationAuthorization: queuedWorkflowContext.goalCreationAuthorization,
+          goalCreationAuthorization: queuedRunContext.goalCreationAuthorization,
           goalContinuationAuthorization: goalContinuationAuthorization || undefined,
           goalContinuationGuidance:
-            queuedWorkflowContext.goalContinuationGuidance ||
+            queuedRunContext.goalContinuationGuidance ||
             replayOptions?.goalContinuationGuidance,
           visibleGoalSubmissionEnvelope: replayOptions?.visibleGoalSubmissionEnvelope,
           replyOptionRequestIdentity: replayOptions?.replyOptionRequestIdentity,
@@ -18159,7 +18435,7 @@ export const useAppStore = create<AppState>()(
     const autoHydrationReason = submitPipelineDecision.planHydration.reason;
     const applyCurrentSendGate = (
       gateState: AppState,
-      queuedWorkflowContext?: {
+      queuedRunContext?: {
         runtimeIntentOverride?: ResolvedRunIntent;
         goalSourceContextSnapshot?: string;
         goalCreationAuthorization?: GoalCreationAuthorization;
@@ -18186,7 +18462,7 @@ export const useAppStore = create<AppState>()(
       },
       mentionSnapshot,
       attachedFilesSnapshot,
-      queuedWorkflowContext,
+      queuedRunContext,
       queueUserMessage: (queuedText, queuedImages, queuedOptions) => {
         const latest = get();
         const activeSessionKey = resolveVisibleGoalSubmissionSessionKey(latest);
@@ -18233,17 +18509,17 @@ export const useAppStore = create<AppState>()(
       logStoreEvent,
     });
     const deferResetSubmissionForCancellation = (
-      queuedWorkflowContext?: CancellationQueueContext,
+      queuedRunContext?: CancellationQueueContext,
     ): CancellationSubmissionGate => {
       if (!getPendingSessionCancellation(submissionOriginSessionKey)) return "none";
       return deferCurrentSubmissionForCancellation(options, {
-        ...queuedWorkflowContext,
+        ...queuedRunContext,
         goalCreationAuthorization:
-          queuedWorkflowContext?.goalCreationAuthorization ||
+          queuedRunContext?.goalCreationAuthorization ||
           validatedVisibleGoalCreationAuthorization ||
           undefined,
         goalContinuationAuthorization:
-          queuedWorkflowContext?.goalContinuationAuthorization ||
+          queuedRunContext?.goalContinuationAuthorization ||
           goalContinuationAuthorization ||
           undefined,
       });
@@ -18255,7 +18531,7 @@ export const useAppStore = create<AppState>()(
       !!goalContinuationAuthorization;
     const shouldUseEarlyPlanSendGate =
       !!autoHydrationReason || shouldRouteContinuationToPlanResume;
-    const earlyGoalQueuedWorkflowContext =
+    const earlyGoalQueuedRunContext =
       shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority
       ? {
           runtimeIntentOverride: "goal" as const,
@@ -18284,11 +18560,11 @@ export const useAppStore = create<AppState>()(
     if (shouldUseEarlyPlanSendGate) {
       const planResumeSendGateEffect = applyCurrentSendGate(
         state,
-        earlyGoalQueuedWorkflowContext,
+        earlyGoalQueuedRunContext,
       );
       const earlyResetCancellationGate =
         planResumeSendGateEffect.decision.action.kind === "reset_stuck_state"
-          ? deferResetSubmissionForCancellation(earlyGoalQueuedWorkflowContext)
+          ? deferResetSubmissionForCancellation(earlyGoalQueuedRunContext)
           : "none";
       if (earlyResetCancellationGate !== "none") {
         if (earlyResetCancellationGate === "workspace_claim_fenced") return false;
@@ -18587,7 +18863,10 @@ export const useAppStore = create<AppState>()(
       goalContinuationAuthorization,
       requiresPlanExecutionAdmission,
     });
-    const effectiveWorkflowMode = runtimeDecision.effectiveWorkflowMode;
+    const effectiveWorkflowMode = resolveWorkspaceAwareWorkflowMode(
+      runtimeDecision.effectiveWorkflowMode,
+      !!String(state.currentWorkspace || "").trim(),
+    );
     const runtimeRunIntent = runtimeDecision.runtimeRunIntent;
     const effectiveDisplayIntent = runtimeDecision.effectiveDisplayIntent;
     const shouldGrantExecutionConsentForTurn = runtimeDecision.shouldGrantExecutionConsentForTurn;
@@ -18601,7 +18880,7 @@ export const useAppStore = create<AppState>()(
         })
       : undefined;
 
-    const sendGateQueuedWorkflowContext: CancellationQueueContext | undefined =
+    const sendGateQueuedRunContext: CancellationQueueContext | undefined =
       runtimeRunIntent === "goal"
       ? {
           runtimeIntentOverride: "goal",
@@ -18615,11 +18894,11 @@ export const useAppStore = create<AppState>()(
       : undefined;
     const sendGateEffect = applyCurrentSendGate(
       state,
-      sendGateQueuedWorkflowContext,
+      sendGateQueuedRunContext,
     );
     const resetCancellationGate =
       sendGateEffect.decision.action.kind === "reset_stuck_state"
-        ? deferResetSubmissionForCancellation(sendGateQueuedWorkflowContext)
+        ? deferResetSubmissionForCancellation(sendGateQueuedRunContext)
         : "none";
     if (resetCancellationGate !== "none") {
       if (resetCancellationGate === "workspace_claim_fenced") return false;

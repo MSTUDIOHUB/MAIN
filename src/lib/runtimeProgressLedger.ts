@@ -51,11 +51,6 @@ export interface RunStatusProjection {
 }
 
 const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running"]);
-const RETAINABLE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>([
-  "running",
-  "done",
-  "completed",
-]);
 
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
@@ -135,8 +130,8 @@ function toolFamily(tool: string): string {
   return tool || "progress";
 }
 
-function isRetainableCapsuleGuidanceActivity(item: RuntimeProgressLedgerItem): boolean {
-  return RETAINABLE_CAPSULE_ACTIVITY_STATUSES.has(item.status) &&
+function isRenderableRuntimeActivity(item: RuntimeProgressLedgerItem): boolean {
+  return (item.status === "running" || item.status === "done" || item.status === "completed") &&
     item.phase !== "blocked" &&
     // Visual delivery/recognition has its own evidence contract. The compact
     // Capsule must not turn an internal images:N target into user guidance.
@@ -735,7 +730,7 @@ export function buildRunStatusProjection(
       candidate.key !== item.key &&
       candidate.firstSeenAt > item.firstSeenAt &&
       toolFamily(candidate.tool) !== "collaboration" &&
-      isRetainableCapsuleGuidanceActivity(candidate)
+      isRenderableRuntimeActivity(candidate)
     );
   const currentActivity = latestIsTerminal
     ? null
@@ -746,7 +741,7 @@ export function buildRunStatusProjection(
       ) || null;
   const lastGuidanceActivity = [...ordered].reverse().find(
     (item) =>
-      isRetainableCapsuleGuidanceActivity(item) &&
+      isRenderableRuntimeActivity(item) &&
       !isSupersededSpawnActivity(item),
   ) || null;
   const milestones = ordered
@@ -885,12 +880,8 @@ export function buildCapsuleActivityText(
 
 function markdownTarget(value: unknown, language: RuntimeProgressLanguage): string {
   const normalized = normalizeTarget(value);
-  const parts = normalized.split("/").filter(Boolean);
-  const candidate = (parts[parts.length - 1] || normalized).replace(/`/g, "");
-  // Capsule must never present an ellipsis as if it were a complete thought.
-  // Very large protocol targets get a truthful generic noun; complete details
-  // remain available in ChatArea/tool history.
-  const target = candidate.length <= 180 ? candidate : "";
+  const target = normalized.replace(/`/g, "");
+  // Live Capsule text wraps and scrolls instead of concealing a long path.
   if (target) return `\`${target}\``;
   return language === "zh" ? "当前工作区" : "the current workspace";
 }
@@ -898,10 +889,10 @@ function markdownTarget(value: unknown, language: RuntimeProgressLanguage): stri
 /**
  * Build the conversational live guidance shown in Capsule. Unlike the M
  * popover's terse evidence labels, this projection explains the purpose of the
- * current structured action. When no action is currently running, the last
- * renderable action for the same Run remains visible until newer renderable
- * progress or a health signal supersedes it. Lifecycle phase labels are not
- * manufactured into progress sentences.
+ * current structured action. Completed actions deliberately clear here rather
+ * than masquerading as the next live action; the caller can show a phase-level
+ * public update until the next durable command arrives. Lifecycle phase labels
+ * are not manufactured into progress sentences at this layer.
  */
 export function buildCapsuleGuidanceText(
   projection: RunStatusProjection,
@@ -914,18 +905,12 @@ export function buildCapsuleGuidanceText(
       .filter((signal) => signal.kind !== "repetition")
       .map((signal) => signal.lastSeenAt),
   );
-  const retainedActivity = projection.lastGuidanceActivity &&
-    (
-      latestBlockingHealthAt === 0 ||
-      projection.lastGuidanceActivity.lastSeenAt > latestBlockingHealthAt
-    )
-      ? projection.lastGuidanceActivity
-      : null;
   const activity = projection.currentActivity &&
-    isRetainableCapsuleGuidanceActivity(projection.currentActivity)
+    isRenderableRuntimeActivity(projection.currentActivity) &&
+    latestBlockingHealthAt <= projection.currentActivity.lastSeenAt
       ? projection.currentActivity
-      : retainedActivity;
-  if (activity && RETAINABLE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
+      : null;
+  if (activity && LIVE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) {
     const family = toolFamily(activity.tool);
     const target = markdownTarget(activity.target, normalizedLanguage);
     const done = activity.status === "done" || activity.status === "completed";

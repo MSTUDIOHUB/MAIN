@@ -320,22 +320,6 @@ test("Plan native fallback atomically replaces the authoring card with its text 
   assert.match(text, /native_tools_disabled=true/);
 });
 
-test("Plan compatibility retry wiring carries the replacement card and removes submit from XML tools", () => {
-  const preparationSource = fsSync.readFileSync(path.join(
-    workspaceRoot,
-    "src/lib/orchestrator/loop/iterationStreamPreparation.ts",
-  ), "utf8");
-  const recoverySource = fsSync.readFileSync(path.join(
-    workspaceRoot,
-    "src/lib/orchestrator/loop/streamRecovery.ts",
-  ), "utf8");
-
-  assert.match(preparationSource, /providerCompatibilityPlanAuthoringCard\s*=\s*formatPlanAuthoringContractForModel/);
-  assert.match(preparationSource, /submissionTransport:\s*"text_envelope"/);
-  assert.match(recoverySource, /replacementPlanAuthoringContract:\s*providerCompatibilityPlanAuthoringCard/);
-  assert.match(recoverySource, /tool\.function\.name\s*!==\s*SUBMIT_PLAN_CANDIDATE_TOOL_NAME/);
-});
-
 test("XML tool compatibility preserves multimodal user content while flattening tool history", () => {
   const messages = buildCompatibilityRetryMessages([
     {

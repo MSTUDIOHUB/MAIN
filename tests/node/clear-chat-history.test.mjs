@@ -980,9 +980,9 @@ function startDeferredRealBootstrap(controller, input) {
         gameStudioInitialized: false,
         gameStudioConfigForTurn: null,
       }),
-      createWorkflowContext: (context) => context,
+      createRuntimeContext: (context) => context,
       startStreamingUi: () => {},
-      runWorkflowEngine: async () => {
+      runRuntime: async () => {
         input.capabilityStarts.engine += 1;
         input.capabilityStarts.tools += 1;
         return true;

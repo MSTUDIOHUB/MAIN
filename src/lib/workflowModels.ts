@@ -6,6 +6,7 @@ import {
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import type { AgentLoopOutcomeStatus, AgentLoopPauseKind, AgentLoopResultKind } from "./runOutcome";
 import type { PlanCandidateV2 } from "./planContract";
+import type { RuntimeEngineVersion } from "./runtime-v2/contracts";
 import {
   analyzeValidationCommand,
   commandContainsServiceProcess,
@@ -684,6 +685,9 @@ export interface ConversationTurn {
   id: string;
   /** Stable admission id for one workspace-visible user submission. */
   clientSubmissionId?: string;
+  /** Immutable kernel choice made at admission. Missing historical values mean
+   * `legacy`; active Turns never change this field in place. */
+  runtimeEngineVersion?: RuntimeEngineVersion;
   /** Durable receipt joining the admitted instruction, Turn, and FIFO entry. */
   workspaceInstructionReceiptId?: string;
   /** Surface that admitted this Turn; semantic intent is resolved later. */

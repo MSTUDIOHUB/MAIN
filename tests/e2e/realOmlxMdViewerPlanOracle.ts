@@ -711,6 +711,177 @@ export function getMdViewerTypedPlanGaps(candidate: MdViewerCandidate | null | u
   return Array.from(new Set(gaps));
 }
 
+type MdViewerWorkPlan = {
+  evidence?: Array<{ id?: unknown; target?: unknown }>;
+  draft?: {
+    findings?: Array<{ statement?: unknown; basis?: unknown[] }>;
+    steps?: Array<{
+      operation?: unknown;
+      targets?: unknown[];
+      basis?: unknown[];
+      change?: unknown;
+      expectedOutcome?: unknown;
+    }>;
+    validations?: Array<{
+      stepIndexes?: unknown[];
+      kind?: unknown;
+      command?: unknown;
+      expectedOutcome?: unknown;
+      required?: unknown;
+    }>;
+  };
+};
+
+function workPlanEvidenceIdsForTarget(
+  plan: MdViewerWorkPlan,
+  target: string,
+): Set<string> {
+  return new Set((plan.evidence || [])
+    .filter((entry) => pathsMatch(entry.target, target))
+    .map((entry) => String(entry.id || "").trim())
+    .filter(Boolean));
+}
+
+function workPlanBasis(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry || "").trim()).filter(Boolean)
+    : [];
+}
+
+type MdViewerWorkPlanStep =
+  NonNullable<NonNullable<MdViewerWorkPlan["draft"]>["steps"]>[number];
+
+function workPlanStepText(step: MdViewerWorkPlanStep): string {
+  return `${String(step?.change || "")} ${String(step?.expectedOutcome || "")}`;
+}
+
+/**
+ * Runtime v2 WorkPlan oracle for the same MD Viewer incident covered by the
+ * legacy typed candidate oracle above. Execution authority remains the v2
+ * evidence → step → validation graph. The free narrative is checked only for
+ * the diagnosis shown to the user; it never authorizes a mutation.
+ */
+export function getMdViewerWorkPlanGaps(
+  plan: MdViewerWorkPlan | null | undefined,
+): string[] {
+  if (!plan?.draft) return ["Runtime v2 WorkPlan missing"];
+  const gaps: string[] = [];
+  const narrative = String(plan.draft.summary || "");
+  const steps = plan.draft.steps || [];
+  const validations = plan.draft.validations || [];
+  const editorEvidence = workPlanEvidenceIdsForTarget(plan, OWNER_PATHS.editor);
+  const callerEvidence = workPlanEvidenceIdsForTarget(plan, OWNER_PATHS.caller);
+  const handlerEvidence = workPlanEvidenceIdsForTarget(plan, OWNER_PATHS.handler);
+  for (const [label, ids] of [
+    ["editor", editorEvidence],
+    ["caller", callerEvidence],
+    ["handler", handlerEvidence],
+  ] as const) {
+    if (ids.size === 0) gaps.push(`${label} owner evidence missing`);
+  }
+
+  const hasInitialDiagnosis =
+    /(?:initial|pristine|untouched|blank|empty|unsaved|初始|空白|未保存|未命名)/i.test(
+      narrative,
+    ) &&
+    /(?:openFiles|append|push|replace|coexist|并存|追加|替换)/i.test(
+      narrative,
+    );
+  if (!hasInitialDiagnosis) {
+    gaps.push("free plan narrative omits the initial-tab causal diagnosis");
+  }
+  const initialStepIndex = steps.findIndex((step) =>
+    String(step.operation || "") === "modify" &&
+    (step.targets || []).some((target) => pathsMatch(target, OWNER_PATHS.caller)) &&
+    intersects(workPlanBasis(step.basis), callerEvidence) &&
+    /(?:initial|pristine|untouched|blank|empty|unsaved|初始|空白|未保存|未命名)/i.test(
+      workPlanStepText(step),
+    ) &&
+    /(?:openFiles|replace|instead\s+of\s+append|替换|不再追加)/i.test(
+      workPlanStepText(step),
+    )
+  );
+  if (initialStepIndex < 0) {
+    gaps.push("pristine initial-tab replacement is not bound to caller evidence");
+  }
+
+  const hasAutosaveDiagnosis =
+    /setValue/i.test(narrative) &&
+    /(?:dispatchEvent|\binput\b)/i.test(narrative) &&
+    /isDirty/i.test(narrative) &&
+    /(?:scheduleAutoSave|auto[-_ ]?save|自动保存)/i.test(narrative);
+  if (!hasAutosaveDiagnosis) {
+    gaps.push("free plan narrative omits the editor-to-main autosave causal chain");
+  }
+  const editorStepIndex = steps.findIndex((step) =>
+    String(step.operation || "") === "modify" &&
+    (step.targets || []).some((target) => pathsMatch(target, OWNER_PATHS.editor)) &&
+    intersects(workPlanBasis(step.basis), editorEvidence) &&
+    /(?:setValue|dispatchEvent|\binput\b|程序性|合成事件)/i.test(workPlanStepText(step)) &&
+    /(?:remove|stop|without|不再|移除|取消)/i.test(workPlanStepText(step))
+  );
+  if (editorStepIndex < 0) gaps.push("editor synthetic-input repair step missing");
+
+  const hasContractDiagnosis =
+    /save_file_content/i.test(narrative) &&
+    /file_path/.test(narrative) &&
+    /filePath/.test(narrative);
+  if (!hasContractDiagnosis) {
+    gaps.push("free plan narrative omits the save command key mismatch");
+  }
+  const contractStepIndex = steps.findIndex((step) =>
+    String(step.operation || "") === "modify" &&
+    (step.targets || []).some((target) => pathsMatch(target, OWNER_PATHS.caller)) &&
+    intersects(workPlanBasis(step.basis), callerEvidence) &&
+    /save_file_content/i.test(workPlanStepText(step)) &&
+    /filePath/.test(workPlanStepText(step))
+  );
+  if (contractStepIndex < 0) gaps.push("save command filePath repair step missing");
+
+  const requiredValidations = validations.filter((validation) => validation.required === true);
+  const finiteValidation = requiredValidations.find((validation) =>
+    validation.kind === "finite_command" &&
+    /\b(?:npm|pnpm|yarn|bun|cargo)\b[\s\S]*(?:test|build|check)|\btsc\b/i.test(
+      String(validation.command || ""),
+    )
+  );
+  if (!finiteValidation) gaps.push("required finite build/test validation missing");
+  const interactionValidation = requiredValidations.find((validation) => {
+    const text = String(validation.expectedOutcome || "");
+    return (validation.kind === "browser" || validation.kind === "desktop") &&
+      /(?:open|load|打开|载入)/i.test(text) &&
+      /(?:without\s+(?:an?\s+)?edit|no\s+edit|programmatic|setValue|未编辑|不编辑|程序性)/i.test(text) &&
+      /(?:dialog|save_file_content|save\s+call|弹窗|对话框|保存调用)/i.test(text);
+  });
+  if (!interactionValidation) {
+    gaps.push("required open-without-edit interaction validation missing");
+  }
+  const requiredStepIndexes = new Set(requiredValidations.flatMap((validation) =>
+    (validation.stepIndexes || []).filter((index): index is number => Number.isInteger(index))
+  ));
+  for (const [label, index] of [
+    ["initial-tab", initialStepIndex],
+    ["editor autosave", editorStepIndex],
+    ["save contract", contractStepIndex],
+  ] as const) {
+    if (index >= 0 && !requiredStepIndexes.has(index)) {
+      gaps.push(`${label} step lacks a required validation edge`);
+    }
+  }
+
+  const unauthorizedMutations = steps.flatMap((step) => {
+    if (!["modify", "create", "delete"].includes(String(step.operation || ""))) return [];
+    return (step.targets || []).map(String).filter((target) =>
+      !pathsMatch(target, OWNER_PATHS.caller) &&
+      !pathsMatch(target, OWNER_PATHS.editor)
+    );
+  });
+  if (unauthorizedMutations.length > 0) {
+    gaps.push(`non-owner mutation targets proposed: ${[...new Set(unauthorizedMutations)].join(", ")}`);
+  }
+  return Array.from(new Set(gaps));
+}
+
 function sectionContainsNode(
   markdown: string,
   heading: RegExp,
@@ -727,19 +898,24 @@ function sectionContainsNode(
   return nodePattern.test(section.join("\n"));
 }
 
-/** Markdown is a review projection only; these checks intentionally cover
- * readability/structure and never infer source truth from Evidence prose. */
+/** Markdown is a review projection only. Its task-specific narrative is free;
+ * the runtime appends the two review sections needed for execution. */
 export function getMdViewerReadablePlanGaps(markdown: string): string[] {
   const plan = String(markdown || "").trim();
   const gaps: string[] = [];
-  if (!/^#\s+(?:Plan|计划)\b/im.test(plan)) gaps.push("readable Plan title missing");
-  if (!sectionContainsNode(plan, /^##\s+(?:诊断|Diagnosis|Root Cause)/i, /\[R\d+\b/i)) {
-    gaps.push("readable diagnosis section missing");
-  }
-  if (!sectionContainsNode(plan, /^##\s+(?:关键改动|改动|Changes?|Key Changes?)/i, /\[C\d+\b/i)) {
+  if (!/^#\s+\S/im.test(plan)) gaps.push("readable Plan title missing");
+  if (!sectionContainsNode(
+    plan,
+    /^##\s+(?:关键改动|改动|修改|Changes?|Key Changes?)/i,
+    /(?:\[C\d+\b|\bS\d+\b)/i,
+  )) {
     gaps.push("readable change section missing");
   }
-  if (!sectionContainsNode(plan, /^##\s+(?:测试方案|验证|Validations?|Tests?)/i, /\[V\d+\b/i)) {
+  if (!sectionContainsNode(
+    plan,
+    /^##\s+(?:测试方案|验证|Validations?|Tests?)/i,
+    /(?:\[V\d+\b|\bV\d+\b)/i,
+  )) {
     gaps.push("readable validation section missing");
   }
   return gaps;

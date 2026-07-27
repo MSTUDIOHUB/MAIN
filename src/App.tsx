@@ -70,7 +70,10 @@ import {
   type SessionModeAffinity,
   type SessionModeAffinityLike,
 } from "./lib/imageStudioSessions";
-import { resolveConversationTurnIntent } from "./lib/runIntent";
+import {
+  resolveConversationTurnIntent,
+  resolveWorkspaceAwareWorkflowMode,
+} from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { shouldContinueGoalFromUserChoice } from "./lib/goalChoiceContinuation";
 import {
@@ -954,7 +957,11 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
     ...transcriptMetadata,
     taskFlow: restoredPatch.taskFlow || restoredTaskFlow,
     conversationTurns: restoredPatch.conversationTurns ||
-      normalizeInterruptedConversationTurnsForRestore(entry.conversationTurns || [], restoredTaskFlow),
+      normalizeInterruptedConversationTurnsForRestore(
+        entry.conversationTurns || [],
+        restoredTaskFlow,
+        entry.scopeKey !== GLOBAL_CHAT_KEY,
+      ),
   };
 }
 
@@ -2611,6 +2618,7 @@ export default function App() {
       const restoredConversationTurns = normalizeInterruptedConversationTurnsForRestore(
         hasArrayItems(snapshot.conversationTurns) ? snapshot.conversationTurns : [],
         restoredTaskFlow,
+        scopeKey !== GLOBAL_CHAT_KEY,
       );
       syncTaskIdCounterFromBlocks(restoredTaskFlow);
       if (!canPublishRestore("runtime_snapshot")) return;
@@ -2666,7 +2674,7 @@ export default function App() {
           id: turnId,
           userPrompt: target.title || '',
           title: restoredTitle,
-          mode: 'chat' as const,
+          mode: scopeKey === GLOBAL_CHAT_KEY ? 'chat' as const : 'edit' as const,
           status: 'done' as const,
           summary: restoredTitle,
           blockIds: target.messages.map((m: any) => m.id),
@@ -2807,33 +2815,7 @@ export default function App() {
       } else {
         setCurrentWorkspace(stablePath);
         setCurrentSessionId(null);
-        useAppStore.setState({
-          taskFlow: [],
-          agentMessages: [],
-          contextMemoryState: null,
-          conversationTurns: [],
-          currentTurnId: null,
-          selectedDiffTaskId: null,
-          pendingSlashCommand: null,
-          planArtifacts: [],
-          planTasks: [],
-          planExecutionEvidenceLedger: [],
-          planExecutionEvidenceCount: 0,
-          planStage: "idle",
-          isPlanApproved: false,
-          planApprovalChoice: null,
-          agentStatus: "idle",
-          isGenerating: false,
-          abortController: null,
-          pendingReviewResolve: null,
-          pendingReviewTaskId: null,
-          pendingToolCall: null,
-          showPlanPanel: false,
-          showDiff: false,
-          showTerminal: false,
-          showFilePanel: false,
-          rightPanelTab: "plan",
-        });
+        resetToEmptyChatView();
         hydrateWorkspacePlanForEmptySession("workspace_open_empty");
         useAppStore.getState().markWorkspaceClearSubmissionReplayReady(stablePath, null);
       }
@@ -2880,12 +2862,19 @@ export default function App() {
           createdAt: resetAt,
         },
       );
+      const workflowMode = activeScopeKey === GLOBAL_CHAT_KEY
+        ? "chat"
+        : resolveWorkspaceAwareWorkflowMode(state.config.workflowMode, true);
       return {
         // A new/empty Session is a complete runtime-owner boundary. Reuse the
         // same canonical empty snapshot as persistence instead of manually
         // clearing only visible chat fields and leaking the previous Session's
         // closure ledger, checkpoints, events, queue, or provider lane state.
         ...emptyRuntime,
+        config: {
+          ...state.config,
+          workflowMode,
+        },
         ...(activeSessionKey && activeSessionEpoch && !existingOuterEpoch
           ? {
               sessionsByWorkspace: {
@@ -2939,9 +2928,9 @@ export default function App() {
     openSessionScope(GLOBAL_CHAT_KEY);
     const existing = await refreshSessionsForScope(GLOBAL_CHAT_KEY);
     if (existing.length === 0) {
-      resetToEmptyChatView();
       setCurrentWorkspace("");
       setCurrentSessionId(null);
+      resetToEmptyChatView();
       useAppStore.getState().markWorkspaceClearSubmissionReplayReady(GLOBAL_CHAT_KEY, null);
       return;
     }
@@ -3051,6 +3040,7 @@ export default function App() {
     sessionRecoveryAttemptRef.current = "";
     lastSessionRuntimeSignatureRef.current = "";
     resetToEmptyChatView();
+    useAppStore.getState().setWorkflowMode(isGlobalChat ? "chat" : "edit");
     if (!isGlobalChat) hydrateWorkspacePlanForEmptySession("new_session");
     useAppStore.getState().markWorkspaceClearSubmissionReplayReady(scopeKey, ns.id);
   };

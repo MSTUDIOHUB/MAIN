@@ -246,6 +246,47 @@ test("a Rust stream installs its abort listener before dispatching start", async
   assert.equal(listeners.size, 0);
 });
 
+test("a Rust stream receives the caller-owned phase timeout", async () => {
+  const listeners = new Map();
+  let startArgs = null;
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    startArgs = args;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: args.streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  await streamChatCompletion(
+    [{ role: "user", content: "bounded request" }],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: () => {} },
+    undefined,
+    undefined,
+    undefined,
+    { timeoutMs: 12_345 },
+  );
+
+  assert.equal(startArgs?.timeoutMs, 12_345);
+  assert.equal(listeners.size, 0);
+});
+
 test("OpenAI Responses reports image delivery from the accepted serialized request", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {

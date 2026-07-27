@@ -70,6 +70,8 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildEmptySessionRuntimeSnapshot,
   buildSessionRuntimeSnapshotFromStoreState,
+  GLOBAL_CHAT_KEY,
+  normalizeInterruptedConversationTurnsForRestore,
   normalizeSessionRuntimeSnapshot,
   sanitizeTaskBlocksForPersist,
   useAppStore,
@@ -108,6 +110,103 @@ const { hashPlanCandidate, hashPlanProjection } = loadTranspiledModuleSync(
 
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
+
+test("workspace Session containers normalize Chat turns to task turns", () => {
+  const turns = [{
+    id: "turn-chat",
+    userPrompt: "Inspect this workspace",
+    title: "Inspect",
+    mode: "chat",
+    status: "done",
+    summary: "done",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 1,
+  }, {
+    id: "turn-plan",
+    userPrompt: "Plan this repair",
+    title: "Plan",
+    mode: "plan",
+    status: "done",
+    summary: "done",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 2,
+  }];
+
+  assert.equal(
+    normalizeInterruptedConversationTurnsForRestore(turns, [], false)[0].mode,
+    "chat",
+  );
+  const workspaceTurns = normalizeInterruptedConversationTurnsForRestore(
+    turns,
+    [],
+    true,
+  );
+  assert.equal(workspaceTurns[0].mode, "edit");
+  assert.equal(workspaceTurns[1].mode, "plan");
+});
+
+test("new Session admission canonicalizes its bucket and refuses Chat mode in an active workspace", () => {
+  const originalState = useAppStore.getState();
+  const workspace = "/fixture/workspace-session-container";
+  const workspaceSession = {
+    id: 701,
+    title: "New Conversation",
+    date: new Date(0).toISOString(),
+    active: true,
+    messages: [],
+  };
+  const globalSession = {
+    id: 702,
+    title: "New Chat",
+    date: new Date(0).toISOString(),
+    active: true,
+    messages: [],
+  };
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: null,
+      sessionsByWorkspace: {},
+      config: {
+        ...originalState.config,
+        workspace,
+        workflowMode: "chat",
+      },
+    }, true);
+    useAppStore.getState().addSession(workspace, workspaceSession);
+    let state = useAppStore.getState();
+    assert.equal(state.config.workflowMode, "edit");
+    assert.deepEqual(state.sessionsByWorkspace[workspace]?.map((session) => session.id), [701]);
+    assert.equal(state.sessionsByWorkspace[GLOBAL_CHAT_KEY], undefined);
+
+    useAppStore.setState({
+      ...state,
+      currentWorkspace: "",
+      selectedWorkspace: "",
+      currentSessionId: null,
+      sessionsByWorkspace: {},
+      config: {
+        ...state.config,
+        workspace: "",
+        workflowMode: "chat",
+      },
+    }, true);
+    useAppStore.getState().addSession("", globalSession);
+    state = useAppStore.getState();
+    assert.deepEqual(
+      state.sessionsByWorkspace[GLOBAL_CHAT_KEY]?.map((session) => session.id),
+      [702],
+    );
+    assert.equal(state.sessionsByWorkspace[""], undefined);
+    assert.equal(state.config.workflowMode, "chat");
+  } finally {
+    useAppStore.setState(originalState, true);
+  }
+});
 
 test("runtime guidance user records preserve their stable identity across persistence", () => {
   const persisted = sanitizeTaskBlocksForPersist([
@@ -1037,10 +1136,23 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
       agentBlocks: settled.taskFlow.filter((block) => block.type === "agent"),
     }));
     assert.match(String(streamInvocations[0]?.url || ""), /127\.0\.0\.1:8000\/v1\/chat\/completions$/);
-    assert.equal(ownedEvents.filter((event) => event.type === "run.started").length >= 1, true);
+    assert.equal(
+      ownedEvents.filter((event) => event.type === "run.started").length >= 1,
+      true,
+      JSON.stringify({ eventTypes: ownedEvents.map((event) => event.type), ownedEvents }),
+    );
     assert.equal(ownedEvents.filter((event) => event.type === "run.completed").length, 1);
     assert.equal(ownedEvents.filter((event) => event.type === "turn.completed").length, 1);
-    assert.equal(ownedEvents.find((event) => event.type === "run.completed")?.resultKind, "error");
+    assert.equal(
+      ownedEvents.find((event) => event.type === "run.completed")?.resultKind,
+      "error",
+      JSON.stringify({
+        eventTypes: ownedEvents.map((event) => event.type),
+        ownedEvents,
+        runtimeOutcome: turn?.runtimeOutcome,
+        agentStatus: settled.agentStatus,
+      }),
+    );
     assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "error");
     assert.equal(turn?.status, "error");
     assert.equal(turn?.runtimeOutcome?.resultKind, "error");

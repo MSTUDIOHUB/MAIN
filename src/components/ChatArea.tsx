@@ -21,6 +21,7 @@ import {
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
+import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
@@ -112,6 +113,7 @@ import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
 import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
 import { buildCapsulePhaseGuidance } from "../lib/assistantProgressPresentation";
+import { buildRuntimeV2CompatibleCapsuleProjection } from "../lib/runtimeV2Presentation";
 import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
 import {
   resolveTurnStrategyFromIntent,
@@ -2526,6 +2528,7 @@ export default function ChatArea({
     showFilePanel,
     rightPanelTab,
     runtimeEvents,
+    runtimeV2Checkpoints,
     harnessRunMarker,
     activeActionRequest,
     openRightPanelTab,
@@ -2570,6 +2573,7 @@ export default function ChatArea({
     showFilePanel: useAppStore((s) => s.showFilePanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    runtimeV2Checkpoints: useAppStore((s) => s.runtimeV2Checkpoints),
     harnessRunMarker: useAppStore((s) => s.harnessRunMarker),
     activeActionRequest: useAppStore((s) => s.activeActionRequest),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
@@ -2913,9 +2917,24 @@ export default function ChatArea({
   const planReviewOwnerTurn = activeActionRequest?.kind === "plan_review"
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
+  const runtimeV2PlanReview = useMemo(
+    () => planReviewOwnerTurn
+      ? resolveRuntimeV2PlanReviewFromAggregate(
+          runtimeV2Checkpoints[planReviewOwnerTurn.id]?.aggregate,
+        )
+      : null,
+    [planReviewOwnerTurn, runtimeV2Checkpoints],
+  );
   const currentPlanApprovalIdentity = useMemo(
-    () => buildTypedPlanApprovalIdentity(planArtifacts),
-    [planArtifacts],
+    () => runtimeV2PlanReview
+      ? {
+          revision: runtimeV2PlanReview.commit.authority.revision,
+          artifactHash: runtimeV2PlanReview.commit.authority.projectionHash,
+          artifactPaths: [runtimeV2PlanReview.commit.artifact.path],
+          artifactCount: 1,
+        }
+      : buildTypedPlanApprovalIdentity(planArtifacts),
+    [planArtifacts, runtimeV2PlanReview],
   );
   const hasReviewablePlanArtifact = !!currentPlanApprovalIdentity;
   const planReviewActionRequest =
@@ -4397,14 +4416,27 @@ export default function ChatArea({
           ),
         })
       : "";
+  const capsuleRuntimeV2Projection = capsuleIsRunActive &&
+    !capsuleActionKind &&
+    capsuleTurn?.id
+      ? buildRuntimeV2CompatibleCapsuleProjection({
+          events: runtimeEvents,
+          turnId: capsuleTurn.id,
+          runId: capsuleActiveRunId,
+          language,
+        })
+      : null;
   const capsulePhaseGuidanceText = capsuleIsRunActive && !capsuleActionKind
     ? buildCapsulePhaseGuidance(capsuleStatusProjection.kind, language)
     : "";
   const capsuleGuidanceText =
+    capsuleRuntimeV2Projection?.markdown ||
     capsuleLiveGuidanceText ||
     capsuleStructuredGuidanceText ||
     capsulePhaseGuidanceText;
-  const capsuleGuidanceSource = capsuleLiveGuidanceText
+  const capsuleGuidanceSource = capsuleRuntimeV2Projection
+    ? "runtime_v2"
+    : capsuleLiveGuidanceText
     ? "model"
     : capsuleStructuredGuidanceText
       ? "runtime"
@@ -4413,6 +4445,7 @@ export default function ChatArea({
         : "status";
   const capsuleGuidanceUpdatedAt = Math.max(
     0,
+    capsuleRuntimeV2Projection?.updatedAt || 0,
     capsuleRunStatus.currentActivity?.lastSeenAt || 0,
     capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
     ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
@@ -5239,7 +5272,7 @@ export default function ChatArea({
                   maxHeight: !isCapsuleCollapsed && chatAreaHeight
                     ? `${chatAreaHeight * (hasTypedCapsuleControls ? 1 : 0.58)}px`
                     : undefined,
-                  overflowY: "hidden",
+                  overflowY: "auto",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}

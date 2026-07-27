@@ -315,14 +315,3 @@ test("systemPrompt no longer contains a second hardcoded tool-description catalo
   assert.doesNotMatch(source, /addToolDescription|TOOL_REQUIRED_ARGUMENTS/);
   assert.doesNotMatch(source, /replace_in_file:.*search, replace/);
 });
-
-test("Chinese approved-plan continuation remains tool-protocol neutral", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
-  const start = source.indexOf("export function buildApprovedPlanContinuationPrompt");
-  const end = source.indexOf("export function shouldTreatCloudGatewayErrorAsCompatibility", start);
-  const promptBuilder = source.slice(start, end);
-
-  assert.ok(start >= 0 && end > start);
-  assert.match(promptBuilder, /当前暴露的正式工具调用/);
-  assert.doesNotMatch(promptBuilder, /使用\s*<tool_use>\s*格式/);
-});

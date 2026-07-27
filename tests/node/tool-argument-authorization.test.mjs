@@ -285,31 +285,3 @@ test("shell calls cannot bypass active child leases through final command argume
     releaseSubagentScopeLease("child-shell-active");
   }
 });
-
-test("runtime applies final-argument scope authorization before final risk review", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
-  const lifecycle = orchestratorSource.slice(
-    orchestratorSource.indexOf("async function executeToolCallWithLifecycle"),
-    orchestratorSource.indexOf("export async function autoMaterializePlanArtifactFromVisibleText"),
-  );
-  const partitionSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
-    "utf8",
-  );
-
-  assert.match(lifecycle, /if \(hookArgumentsChanged\) \{[\s\S]*resolveToolArgumentAuthorization\(\{/);
-  assert.ok(
-    lifecycle.indexOf("resolveToolArgumentAuthorization({") <
-      lifecycle.indexOf("callbacks.requestReview({"),
-    "hard Plan/child scope must be checked before a final risk review can be requested",
-  );
-  assert.match(lifecycle, /resolveToolArgumentAuthorization\(\{[\s\S]*executionName,[\s\S]*args: resolvedArgs/);
-  assert.match(lifecycle, /getShellMutationTargetForLoopGuard\(executionName, resolvedArgs\)/);
-  assert.match(lifecycle, /pre_tool_hook_shell_source_mutation_blocked/);
-  assert.match(partitionSource, /resolveApprovedPlanCommandScope\(\{[\s\S]*toolName: executionName/);
-  assert.match(partitionSource, /resolveApprovedPlanMutationScope\(\{[\s\S]*toolName: executionName/);
-  assert.match(partitionSource, /resolveToolArgumentAuthorizationTargets\(\{[\s\S]*executionName,[\s\S]*args: toolArgs/);
-});

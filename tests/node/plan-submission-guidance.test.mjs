@@ -41,11 +41,9 @@ test("shared Plan recovery guidance delegates wire format to the latest authorin
 
 test("shared Plan recovery modules do not independently hard-code the envelope transport", () => {
   const recoveryModules = [
-    "src/lib/orchestrator/planOrchestration.ts",
-    "src/lib/orchestrator/loop/emptyResponseRecovery.ts",
-    "src/lib/orchestrator/loop/planNoToolRecovery.ts",
-    "src/lib/orchestrator/loop/streamRecovery.ts",
-    "src/lib/orchestrator/prompts/executePrompts.ts",
+    "src/lib/runtime-v2/controller.ts",
+    "src/lib/runtime-v2/decision.ts",
+    "src/lib/runtime-v2/recovery.ts",
     "src/lib/planRuntime.ts",
     "src/store/submitPromptContext.ts",
   ];
@@ -58,4 +56,12 @@ test("shared Plan recovery modules do not independently hard-code the envelope t
       `${relativePath} must follow the injected transport instead of selecting the envelope`,
     );
   }
+  assert.equal(fs.existsSync(path.join(workspaceRoot, "src/lib/orchestrator.ts")), false);
+  assert.equal(
+    fs.readdirSync(path.join(workspaceRoot, "src/lib/orchestrator"), {
+      recursive: true,
+      withFileTypes: true,
+    }).some((entry) => entry.isFile()),
+    false,
+  );
 });

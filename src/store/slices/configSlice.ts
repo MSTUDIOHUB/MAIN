@@ -18,6 +18,7 @@ import {
   normalizeContextMemoryState,
   type ContextMemoryState,
 } from "../../lib/contextMemory";
+import { resolveWorkspaceAwareWorkflowMode } from "../../lib/runIntent";
 
 export interface ConfigSlice {
   config: AppConfig;
@@ -165,6 +166,10 @@ export const createConfigSlice = (set: any, _get: any) => ({
       const nextConfig = typeof patch === "function" ? patch(s.config) : { ...s.config, ...patch };
       const normalizedConfig: AppConfig = {
         ...nextConfig,
+        workflowMode: resolveWorkspaceAwareWorkflowMode(
+          nextConfig.workflowMode,
+          Boolean(String(s.currentWorkspace || "").trim()),
+        ),
         eventStreamMode: normalizeEventStreamMode(nextConfig.eventStreamMode, s.config.eventStreamMode),
         toolFeedbackFormat: normalizeToolFeedbackFormat(nextConfig.toolFeedbackFormat, s.config.toolFeedbackFormat),
         reasoningDisplay: normalizeReasoningDisplay(nextConfig.reasoningDisplay, s.config.reasoningDisplay),
