@@ -4,7 +4,6 @@ import { sha256Hex } from "../../lib/sha256";
 import { executeTool } from "../../lib/toolExecutor";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
-  runtimeV2EvidenceVersion,
   type RuntimeV2EvidenceReference,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2RunIdentity,
@@ -18,6 +17,7 @@ import {
   compactRetainedPlanObservation,
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 
 export type RuntimeV2PlanLog = (
   event: string,
@@ -85,19 +85,17 @@ export async function executeReadOnlyPlanTool(input: {
     );
     const target = getToolTarget(input.call.name, args) || input.call.name;
     const content = boundedPlanContent(output);
-    // A read window is an observation, not a source version. Hash the exact
-    // file content under the same workspace authority so different windows of
-    // one unchanged file share one evidence identity without hiding the newly
-    // observed window from the model.
-    const versionPayload = input.call.name === "read_file"
-      ? await executeTool(
-          "read_file",
-          { ...args, __raw: true },
-          input.context.runWorkspace || "",
-          input.context.runSessionKey,
-        )
-      : output;
-    const version = runtimeV2EvidenceVersion(versionPayload);
+    const version = await resolveRuntimeV2SourceEvidenceVersion({
+      toolName: input.call.name,
+      args,
+      output,
+      readExactFile: () => executeTool(
+        "read_file",
+        { ...args, __raw: true },
+        input.context.runWorkspace || "",
+        input.context.runSessionKey,
+      ),
+    });
     const existingEvidence = input.evidence.find((entry) =>
       workspacePathsReferToSameFile(entry.target, target) &&
       entry.version === version
@@ -161,7 +159,11 @@ export async function executeReadOnlyPlanTool(input: {
       target,
       evidenceId: evidenceEntry.id,
       sourceVersion: version,
-      observationVersion: runtimeV2EvidenceVersion(output),
+      observationVersion: await resolveRuntimeV2SourceEvidenceVersion({
+        toolName: input.call.name,
+        args: { ...args, __raw: true },
+        output,
+      }),
       retainedChars: input.evidenceContents.get(evidenceEntry.id)?.length || 0,
     });
     return true;

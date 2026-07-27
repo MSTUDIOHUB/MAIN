@@ -2,6 +2,7 @@ import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import type { ToolPort } from "../../lib/runtime-v2";
+import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
   authorizationFor,
@@ -17,6 +18,7 @@ import {
   validateToolAgainstPhaseAndPlan,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
+import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 
 export function createRuntimeV2ToolPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -221,20 +223,35 @@ export function createRuntimeV2ToolPort(
         );
       }
       try {
+        const toolExecutionOptions = {
+          toolCatalog: authorizationFor(input).toolCatalog,
+          allowExternalLocalRead: authorization.allowExternalLocalRead,
+          ...(authorization.shellPermissionApproval
+            ? { shellPermissionApproval: authorization.shellPermissionApproval }
+            : {}),
+        };
         const rawOutput = await executeTool(
           toolName,
           args,
           input.context.runWorkspace || "",
           input.context.runSessionKey,
-          {
-            toolCatalog: authorizationFor(input).toolCatalog,
-            allowExternalLocalRead: authorization.allowExternalLocalRead,
-            ...(authorization.shellPermissionApproval
-              ? { shellPermissionApproval: authorization.shellPermissionApproval }
-              : {}),
-          },
+          toolExecutionOptions,
         );
         const output = boundedToolContent(rawOutput);
+        const sourceVersion = RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)
+          ? await resolveRuntimeV2SourceEvidenceVersion({
+              toolName,
+              args,
+              output: rawOutput,
+              readExactFile: () => executeTool(
+                "read_file",
+                { ...args, __raw: true },
+                input.context.runWorkspace || "",
+                input.context.runSessionKey,
+                toolExecutionOptions,
+              ),
+            })
+          : undefined;
         recordToolModelContext({
           ports: input,
           command,
@@ -251,6 +268,8 @@ export function createRuntimeV2ToolPort(
           target,
           rawOutput,
           "succeeded",
+          undefined,
+          sourceVersion,
         );
         input.logStoreEvent("runtime_v2_tool_execution_completed", {
           turnId: command.run.turnId,
@@ -261,6 +280,13 @@ export function createRuntimeV2ToolPort(
           status: completion.type === "validation.completed" && !completion.passed ? "failed" : "succeeded",
           mutationCommitted: isWorkspaceMutationToolName(toolName),
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
+          evidenceVersions: completion.type === "tool.completed"
+            ? completion.evidence.map((entry) => ({
+                kind: entry.kind,
+                target: entry.target,
+                version: entry.version,
+              }))
+            : [],
         });
         return completion;
       } catch (error) {

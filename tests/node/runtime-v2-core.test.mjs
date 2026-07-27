@@ -34,6 +34,9 @@ function loadTs(sourcePath) {
 }
 
 const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+const sourceEvidenceVersion = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/sourceEvidenceVersion.ts"),
+);
 
 const baseTurn = {
   workspaceKey: "/fixture",
@@ -77,6 +80,34 @@ function executeAggregate(initialPhase = "observing") {
     phase: initialPhase,
   }));
 }
+
+test("Plan and Execute hash exact read_file bytes instead of formatted read windows", async () => {
+  const exact = "line 1\nline 2\n";
+  const formattedWindow = "1: line 1\n[truncated]";
+  let exactReads = 0;
+  const version = await sourceEvidenceVersion.resolveRuntimeV2SourceEvidenceVersion({
+    toolName: "read_file",
+    args: { path: "src/main.js", start_line: 1, max_lines: 1 },
+    output: formattedWindow,
+    readExactFile: async () => {
+      exactReads += 1;
+      return exact;
+    },
+  });
+  assert.equal(version, runtime.runtimeV2EvidenceVersion(exact));
+  assert.notEqual(version, runtime.runtimeV2EvidenceVersion(formattedWindow));
+  assert.equal(exactReads, 1);
+
+  const rawVersion = await sourceEvidenceVersion.resolveRuntimeV2SourceEvidenceVersion({
+    toolName: "read_file",
+    args: { path: "src/main.js", __raw: true },
+    output: exact,
+    readExactFile: async () => {
+      throw new Error("an already exact read must not be repeated");
+    },
+  });
+  assert.equal(rawVersion, version);
+});
 
 function commandFor(state, kind, idempotencyKey, payload = {}) {
   return {

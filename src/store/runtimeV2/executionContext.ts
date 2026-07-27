@@ -803,6 +803,7 @@ export function toolCompletionFor(
   output: unknown,
   status: "succeeded" | "failed" | "blocked",
   failureKind?: Extract<RuntimeV2EventDraft, { type: "validation.completed" }>["failureKind"],
+  sourceVersion?: string,
 ): RuntimeV2EventDraft {
   if (command.kind !== "execute_validation") {
     const targets = isWorkspaceMutationToolName(toolName)
@@ -819,7 +820,7 @@ export function toolCompletionFor(
           kind: evidenceKind,
           target: resolvedTarget,
           version: evidenceKind === "source"
-            ? runtimeV2EvidenceVersion(output)
+            ? sourceVersion || runtimeV2EvidenceVersion(output)
             : null,
         }))
       : []);
