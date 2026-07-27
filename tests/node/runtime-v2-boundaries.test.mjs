@@ -47,9 +47,29 @@ test("Runtime v2 core has no Store/UI/legacy imports and no local dependency cyc
 });
 
 test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle branches", () => {
-  const source = fs.readFileSync(
-    path.join(process.cwd(), "src/store/runtimeV2/executionPorts.ts"),
+  const adapterRoot = path.join(process.cwd(), "src/store/runtimeV2");
+  const entrySource = fs.readFileSync(
+    path.join(adapterRoot, "executionPorts.ts"),
     "utf8",
+  );
+  const adapterFiles = [
+    "executionContext.ts",
+    "executionProviderPort.ts",
+  ];
+  const source = adapterFiles.map((name) =>
+    fs.readFileSync(path.join(adapterRoot, name), "utf8")
+  ).join("\n");
+  assert.ok(
+    entrySource.split("\n").length <= 24,
+    "executionPorts must remain a small composition barrel instead of regaining runtime policy",
+  );
+  assert.doesNotMatch(entrySource, /\b(?:async\s+)?function\b|\bclass\b/);
+  assert.match(entrySource, /from "\.\/executionProviderPort"/);
+  assert.match(entrySource, /from "\.\/executionContext"/);
+  assert.equal(
+    (source.match(/export function createRuntimeV2ProviderPort\b/g) || []).length,
+    1,
+    "the production execution adapter must have exactly one provider-port implementation",
   );
   assert.doesNotMatch(source, /\b(?:Qwen|OMLX|Ollama|LM\s*Studio|OpenAI|Anthropic)\b/i);
   assert.doesNotMatch(source, /looksLikeUnexecutedAction|missingToolCallReprompt|toolUnavailableClaim/i);
