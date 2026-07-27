@@ -1,32 +1,16 @@
-import {
-  abortedAgentLoopOutcome,
-  completedAgentLoopOutcome,
-  pausedAgentLoopOutcome,
-  type AgentLoopOutcome,
-} from "../../lib/runOutcome";
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
-import { executeTool } from "../../lib/toolExecutor";
 import {
   WORK_PLAN_V1_SCHEMA_VERSION,
-  runtimeV2EvidenceVersion,
-  runtimeV2ActionFingerprint,
   sealWorkPlanV1,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2ResultKind,
-  type RuntimeV2RunIdentity,
-  type RuntimeV2TurnIdentity,
   type SealedWorkPlanV1,
-  type WorkPlanRuntimeEvidence,
 } from "../../lib/runtime-v2";
-import type { ConversationTurn } from "../../lib/workflowModels";
-import { getRuntimeV2Checkpoint, createRuntimeV2CheckpointPort } from "./checkpointPort";
-import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import {
   createRuntimeV2PlanReviewCommit,
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
-import type { RuntimeV2SubmissionContext } from "./submissionContext";
-import { PlanLedger } from "./planLedger";
+import { bootstrapRuntimeV2Plan } from "./planBootstrap";
 import {
   executeReadOnlyPlanTool,
   settlePlanTool,
@@ -44,302 +28,36 @@ import {
   PLAN_MODEL_COMPACTION_INTERVAL,
   PLAN_MODEL_DEADLINE_MS,
   SUBMIT_WORK_PLAN_TOOL_NAME,
-  boundedPlanContent,
   isPlanSubmissionStage,
   decodeStructuredPlanArguments,
-  providerPlanMessages,
   workPlanDraftFromSubmission,
   type PlanModelStage,
   type PlanProviderTransport,
 } from "./planModelProtocol";
+import {
+  finishPlanTerminal,
+  planSettlement as settlement,
+  terminalPlanOutcome as terminalAgentOutcome,
+} from "./planSettlement";
+import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 
-type StoreGet = () => any;
-type StoreSet = (patchOrUpdater: any) => void;
-
-export interface RuntimeV2PlanRunnerInput {
-  readonly get: StoreGet;
-  readonly set: StoreSet;
-  readonly context: RuntimeV2SubmissionContext;
-  readonly getSessionRevisionToken: () => unknown;
-  readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
-  readonly publishOwnerScopedRuntimeProjection: (input: {
-    projectedState: any;
-    durableState?: any;
-    scopeKey: string;
-    sessionId: number | string | null | undefined;
-    expectedRevisionToken: unknown;
-  }) => { published: boolean; disposition: string };
-  readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
-  readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
-}
-
-function currentTurn(state: any, turnId: string): ConversationTurn | null {
-  return state?.conversationTurns?.find((turn: ConversationTurn) => turn.id === turnId) || null;
-}
-
-function sessionEpochFor(state: any, context: RuntimeV2SubmissionContext, turn: ConversationTurn): string {
-  const lifecycle = state?.planLifecycle;
-  if (lifecycle?.sessionKey === context.runSessionKey && String(lifecycle.sessionEpoch || "").trim()) {
-    return String(lifecycle.sessionEpoch).trim();
-  }
-  return `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
-}
-
-function identities(
-  state: any,
-  context: RuntimeV2SubmissionContext,
-  turn: ConversationTurn,
-): { readonly turn: RuntimeV2TurnIdentity; readonly run: RuntimeV2RunIdentity } {
-  const sessionEpoch = sessionEpochFor(state, context, turn);
-  return {
-    turn: {
-      workspaceKey: String(context.runWorkspace || "global").trim() || "global",
-      sessionKey: context.runSessionKey,
-      sessionEpoch,
-      clientSubmissionId: String(turn.clientSubmissionId || turn.id).trim(),
-      turnId: context.turnId,
-    },
-    run: {
-      sessionKey: context.runSessionKey,
-      sessionEpoch,
-      turnId: context.turnId,
-      runId: context.harnessRunId,
-      parentRunId: null,
-      attemptId: context.harnessRunId,
-    },
-  };
-}
-
-function settlement(
-  context: RuntimeV2SubmissionContext,
-  outcome: AgentLoopOutcome = pausedAgentLoopOutcome(
-    "runtime_v2_plan_review_required",
-    "action_required",
-  ),
-): RuntimeRunSettlement {
-  return {
-    disposition: "projected",
-    reason: outcome.reason,
-    identity: {
-      sessionKey: context.runSessionKey,
-      turnId: context.turnId,
-      runId: context.harnessRunId,
-      parentRunId: null,
-      outerRunId: context.harnessRunId,
-    },
-    outcome,
-  };
-}
-
-function terminalAgentOutcome(
-  resultKind: RuntimeV2ResultKind,
-  reason: string,
-): AgentLoopOutcome {
-  return resultKind === "canceled"
-    ? abortedAgentLoopOutcome(reason)
-    : completedAgentLoopOutcome(reason, resultKind);
-}
-
-async function finishPlanTerminal(input: {
-  readonly runner: RuntimeV2PlanRunnerInput;
-  readonly ledger: PlanLedger;
-  readonly run: RuntimeV2RunIdentity;
-  readonly resultKind: RuntimeV2ResultKind;
-  readonly reason: string;
-  readonly detailCode: string;
-}): Promise<RuntimeRunSettlement> {
-  await input.ledger.finishTerminal({
-    run: input.run,
-    resultKind: input.resultKind,
-    reason: input.reason,
-  });
-  input.runner.logStoreEvent("runtime_v2_plan_terminal", {
-    turnId: input.run.turnId,
-    runId: input.run.runId,
-    resultKind: input.resultKind,
-    reason: input.reason,
-    detailCode: input.detailCode,
-    evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
-  });
-  return settlement(
-    input.runner.context,
-    terminalAgentOutcome(input.resultKind, input.reason),
-  );
-}
+export type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 
 export async function runSubmitRuntimeV2Plan(
   input: RuntimeV2PlanRunnerInput,
 ): Promise<RuntimeRunSettlement> {
-  const initialState = input.get();
-  const turn = currentTurn(initialState, input.context.turnId);
-  if (!turn) throw new Error(`RUNTIME_V2_PLAN_TURN_MISSING:${input.context.turnId}`);
-  const identity = identities(initialState, input.context, turn);
-  const checkpointPort = createRuntimeV2CheckpointPort({
-    get: input.get,
-    set: input.set,
-    scopeKey: input.context.runScopeKey,
-    sessionId: input.context.runSessionId,
-    getSessionRevisionToken: input.getSessionRevisionToken,
-    sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
-    persistSessionRecord: input.persistSessionRecord,
-    publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
-    logStoreEvent: input.logStoreEvent,
-  });
-  const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
-  if (existing && existing.aggregate.run?.identity.runId !== identity.run.runId) {
-    throw new Error("RUNTIME_V2_PLAN_STALE_RUN_CHECKPOINT");
-  }
-  const projectionPort = createRuntimeV2ProjectionPort({
-    get: input.get,
-    set: input.set,
-    nextTaskId: () => input.get()._nextTaskId(),
-    language: input.context.phaseLanguage,
-    logStoreEvent: input.logStoreEvent,
-  });
-  const ledger = new PlanLedger(
-    identity.turn,
-    checkpointPort,
-    projectionPort,
-    existing ? { revision: existing.revision, aggregate: existing.aggregate } : null,
-  );
+  const bootstrap = await bootstrapRuntimeV2Plan(input);
+  if (bootstrap.settlement) return bootstrap.settlement;
+  const {
+    turn,
+    identity,
+    ledger,
+    evidence,
+    evidenceContents,
+    messages,
+  } = bootstrap;
 
   try {
-    if (existing?.aggregate.terminalOutcome) {
-      const terminal = existing.aggregate.terminalOutcome;
-      return settlement(
-        input.context,
-        terminalAgentOutcome(terminal.resultKind, terminal.reason),
-      );
-    }
-    if (existing?.aggregate.phase === "reviewing") {
-      const recoveredReview = resolveRuntimeV2PlanReviewFromAggregate(
-        existing.aggregate,
-      );
-      if (!recoveredReview?.pending) {
-        throw new Error("RUNTIME_V2_PLAN_REVIEW_AUTHORITY_INVALID");
-      }
-      applyReviewProjection(input, recoveredReview.commit);
-      return settlement(input.context);
-    }
-    if (!existing) {
-      await ledger.append({
-        type: "turn.admitted",
-        turn: identity.turn,
-        strategy: "plan",
-        objective: turn.userPrompt,
-        constraints: [],
-        acceptanceCriteria: [],
-      });
-      await ledger.append({
-        type: "run.started",
-        run: identity.run,
-        phase: "planning",
-      });
-    } else if (
-      existing.aggregate.strategy !== "plan" ||
-      existing.aggregate.phase !== "planning"
-    ) {
-      throw new Error(`RUNTIME_V2_PLAN_PHASE_INVALID:${existing.aggregate.phase}`);
-    } else if (existing.aggregate.scheduledCommands.length > 0) {
-      const interrupted = [...existing.aggregate.scheduledCommands];
-      await ledger.settleScheduled(identity.run, "failed");
-      for (const command of interrupted) {
-        const canContinue = await ledger.recordRecovery({
-          run: identity.run,
-          scope: command.kind === "request_model" ? "transport" : "action",
-          fingerprint: `cold-recovery:${runtimeV2ActionFingerprint(command)}`,
-          reason: "Plan Run 冷恢复时同一未结动作已超过安全重试预算。",
-        });
-        if (!canContinue) {
-          return finishPlanTerminal({
-            runner: input,
-            ledger,
-            run: identity.run,
-            resultKind: "partial",
-            reason: "计划生成在恢复未结动作时达到安全重试上限；已保留现有证据并明确结束本轮。",
-            detailCode: "runtime_v2_plan_cold_recovery_exhausted",
-          });
-        }
-      }
-      input.logStoreEvent("runtime_v2_plan_cold_recovery_settled", {
-        turnId: identity.turn.turnId,
-        runId: identity.run.runId,
-        interruptedKinds: interrupted.map((command) => command.kind),
-      });
-    }
-
-    const evidence: WorkPlanRuntimeEvidence[] = [];
-    const evidenceContents = new Map<string, string>();
-    let overview = "";
-    const collect = await ledger.schedule(identity.run, "collect_observation", {
-      objective: turn.userPrompt,
-    });
-    try {
-      const overviewResult = await executeTool(
-        "get_project_skeleton",
-        {},
-        input.context.runWorkspace || "",
-        input.context.runSessionKey,
-      );
-      overview = boundedPlanContent(overviewResult, 12_000);
-      await ledger.append({
-        type: "command.completed",
-        run: identity.run,
-        idempotencyKey: collect.idempotencyKey,
-        status: "succeeded",
-      });
-      evidence.push({
-        id: "E1",
-        target: input.context.runWorkspace || "workspace",
-        version: runtimeV2EvidenceVersion(overviewResult),
-        statement: "已读取工作区结构概览。",
-      });
-      evidenceContents.set("E1", overview);
-      await ledger.append({
-        type: "observation.recorded",
-        run: identity.run,
-        evidence: {
-          id: "E1",
-          kind: "source",
-          target: input.context.runWorkspace || "workspace",
-          version: evidence[0]!.version,
-        },
-      });
-    } catch (error) {
-      await ledger.append({
-        type: "command.completed",
-        run: identity.run,
-        idempotencyKey: collect.idempotencyKey,
-        status: "failed",
-      });
-      overview = "Runtime v2 could not collect the initial workspace overview. Use the available read-only tools to gather targeted evidence.";
-      const canContinue = await ledger.recordRecovery({
-        run: identity.run,
-        scope: "action",
-        fingerprint: runtimeV2ActionFingerprint(collect),
-        reason: "初始工作区概览持续读取失败。",
-      });
-      input.logStoreEvent("runtime_v2_plan_overview_failed", {
-        turnId: identity.turn.turnId,
-        runId: identity.run.runId,
-        error: error instanceof Error ? error.message : String(error),
-        action: "continue_with_targeted_read_tools",
-      });
-      if (!canContinue) {
-        return finishPlanTerminal({
-          runner: input,
-          ledger,
-          run: identity.run,
-          resultKind: "error",
-          reason: "无法读取工作区概览，且相同恢复动作已达到安全上限；本轮未生成待审核计划。",
-          detailCode: "runtime_v2_plan_overview_recovery_exhausted",
-        });
-      }
-    }
-
-    const messages = providerPlanMessages({ turn, context: input.context, overview });
     const startedAt = Date.now();
     let sealedPlan: SealedWorkPlanV1 | null = null;
     let terminalFailure: {

@@ -54,9 +54,16 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
   );
   const adapterFiles = [
     "executionContext.ts",
+    "executionAggregate.ts",
+    "executionAuthorization.ts",
+    "executionEvidence.ts",
+    "executionProviderContext.ts",
     "executionProviderPort.ts",
     "executionSchedulerPort.ts",
+    "executionSubagentScopes.ts",
+    "executionText.ts",
     "executionToolPort.ts",
+    "executionTypes.ts",
   ];
   const adapterSources = adapterFiles.map((name) => ({
     name,
@@ -65,13 +72,18 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
   const source = adapterSources.map((entry) => entry.source).join("\n");
   for (const entry of adapterSources) {
     assert.ok(
-      entry.source.split("\n").length <= 1_000,
+      entry.source.split("\n").length <= 550,
       `${entry.name} must stay below the Runtime v2 adapter super-module boundary`,
     );
   }
   assert.ok(
     entrySource.split("\n").length <= 24,
     "executionPorts must remain a small composition barrel instead of regaining runtime policy",
+  );
+  assert.ok(
+    adapterSources.find((entry) => entry.name === "executionContext.ts")
+      .source.split("\n").length <= 24,
+    "executionContext must remain a compatibility facade instead of regaining runtime policy",
   );
   assert.doesNotMatch(entrySource, /\b(?:async\s+)?function\b|\bclass\b/);
   assert.match(entrySource, /from "\.\/executionProviderPort"/);
@@ -124,7 +136,25 @@ test("Runtime v2 Execute accepts only a durable conclude response as final provi
 
 test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   const adapterRoot = path.join(process.cwd(), "src/store/runtimeV2");
-  const runner = fs.readFileSync(path.join(adapterRoot, "planRunner.ts"), "utf8");
+  const planFiles = [
+    "planRunner.ts",
+    "planBootstrap.ts",
+    "planModelProtocol.ts",
+    "planProviderPort.ts",
+    "planSettlement.ts",
+    "workPlanSubmission.ts",
+  ];
+  const planSources = planFiles.map((name) => ({
+    name,
+    source: fs.readFileSync(path.join(adapterRoot, name), "utf8"),
+  }));
+  for (const entry of planSources) {
+    assert.ok(
+      entry.source.split("\n").length <= 550,
+      `${entry.name} must stay below the Runtime v2 Plan super-module boundary`,
+    );
+  }
+  const runner = planSources.find((entry) => entry.name === "planRunner.ts").source;
   const protocol = fs.readFileSync(
     path.join(adapterRoot, "planModelProtocol.ts"),
     "utf8",
@@ -135,10 +165,6 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   );
   const source = `${runner}\n${protocol}\n${provider}`;
 
-  assert.ok(
-    runner.split("\n").length <= 850,
-    "planRunner must stay below the Runtime v2 Plan super-module boundary",
-  );
   assert.doesNotMatch(
     source,
     /audit_discovery|audit_synthesis|mandatory evidence audit|PLAN_AUDIT_/i,
