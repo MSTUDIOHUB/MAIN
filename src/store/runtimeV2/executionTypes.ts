@@ -37,12 +37,6 @@ export interface RuntimeV2ChildResult {
   readonly evidenceTarget: string | null;
 }
 
-export interface RuntimeV2SubagentCandidate {
-  readonly scopeKey: string;
-  readonly objective: string;
-  readonly allowedPaths: string[];
-}
-
 export interface RuntimeV2LiveExecutionState {
   readonly messages: AgentMessage[];
   readonly modelContext: RuntimeV2ModelContextEntry[];
@@ -50,7 +44,6 @@ export interface RuntimeV2LiveExecutionState {
   readonly childAbortControllers: Map<string, AbortController>;
   readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
   workspaceOverview: string;
-  subagentCandidates: RuntimeV2SubagentCandidate[];
   evidenceCounter: number;
   latestProviderResult: RuntimeV2NormalizedProviderResult | null;
   latestVisibleText: string;
@@ -78,7 +71,6 @@ export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState
     childAbortControllers: new Map(),
     childTelemetry: new Map(),
     workspaceOverview: "",
-    subagentCandidates: [],
     evidenceCounter: 0,
     latestProviderResult: null,
     latestVisibleText: "",

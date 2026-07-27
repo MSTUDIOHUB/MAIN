@@ -1,4 +1,4 @@
-import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
+import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   buildToolCapabilityRegistry,
   getLocalFileReadPathForToolCall,
@@ -42,6 +42,7 @@ import {
   runtimeV2MutationLease,
   validateRuntimeV2MutationLease,
 } from "./correctiveMutationPolicy";
+import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
 import { selectRuntimeV2ExecuteToolDefinitions } from "./providerToolSurface";
 import type {
   RuntimeV2ExecutionAuthorization,
@@ -81,49 +82,11 @@ export function finiteValidationCommandRejection(
   };
 }
 
-const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "repo_map_search",
-  "repo_map_context",
-  "code_ast_query",
-  "find_symbol_references",
-  "read_file",
-  "get_file_outline",
-  "replace_in_file",
-  "write_file",
-  "apply_patch",
-  "git_status",
-  "git_diff",
-  "run_command",
-  "browser_evaluate",
-  "get_project_skeleton",
-]);
-
 interface RuntimeV2ToolAuthorizationResult {
   readonly allowed: boolean;
   readonly reason: string | null;
   readonly allowExternalLocalRead: boolean;
   readonly shellPermissionApproval?: ShellPermissionApproval;
-}
-function runtimeToolDefinitions(state?: any): ToolDefinition[] {
-  const includeNetwork = state?.webSearchEnabled === true;
-  return TOOL_DEFINITIONS.filter((definition) => {
-    const name = definition.function.name;
-    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
-      (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
-  }).map((definition) => {
-    if (definition.function.name !== "write_file") return definition;
-    return {
-      ...definition,
-      function: {
-        ...definition.function,
-        description:
-          "Create a new file with complete content. Runtime v2 rejects overwriting an existing file; use replace_in_file or apply_patch for bounded edits to existing source.",
-      },
-    };
-  });
 }
 
 /** Freeze the built-in tool surface and policy for this Runtime v2 Turn.
@@ -132,7 +95,7 @@ function runtimeToolDefinitions(state?: any): ToolDefinition[] {
 export function createRuntimeV2ExecutionAuthorization(
   state: any,
 ): RuntimeV2ExecutionAuthorization {
-  const toolDefinitions = runtimeToolDefinitions(state);
+  const toolDefinitions = runtimeV2ToolDefinitions(state);
   const policy = normalizeToolPermissionPolicy(
     state?.config?.toolPermissionPolicy,
   );
@@ -163,9 +126,34 @@ export function providerToolDefinitionsForCommand(
   const available = [...authorizationFor(input).toolDefinitions];
   const mode = String(command.payload.mode || "").trim();
   if (mode === "conclude") return [];
+  const collaborationAction = String(
+    command.payload.collaborationAction || "",
+  ).trim();
+  const collaborationAllowed =
+    command.payload.collaborationAllowed !== false;
+  const activeSubagents = Array.isArray(command.payload.activeSubagents)
+    ? command.payload.activeSubagents
+    : [];
+  const remainingSubagentCapacity = Math.max(
+    0,
+    Number(command.payload.remainingSubagentCapacity) || 0,
+  );
+  const collaborationNames = new Set<string>();
+  if (collaborationAllowed && remainingSubagentCapacity > 0) {
+    collaborationNames.add("spawn_subagent");
+  }
+  if (collaborationAllowed && activeSubagents.length > 0) {
+    collaborationNames.add("wait_subagents");
+  }
+  if (collaborationAction === "spawn_required") {
+    return available.filter(
+      (definition) => definition.function.name === "spawn_subagent",
+    );
+  }
   if (mode === "analyze") {
     return available.filter((definition) =>
-      isRuntimeV2WorkspaceReadToolName(definition.function.name)
+      isRuntimeV2WorkspaceReadToolName(definition.function.name) ||
+      collaborationNames.has(definition.function.name)
     );
   }
   if (mode === "validate") {
@@ -251,7 +239,8 @@ export function providerToolDefinitionsForCommand(
       RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name) ||
       RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(
         definition.function.name,
-      )
+      ) ||
+      collaborationNames.has(definition.function.name)
     );
   }
   return available.filter((definition) =>

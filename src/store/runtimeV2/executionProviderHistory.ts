@@ -1,4 +1,5 @@
-import type { AgentMessage } from "../../lib/agentMessages";
+import type { AgentMessage, ContentPart } from "../../lib/agentMessages";
+import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
 import { boundedToolContent } from "./executionText";
 import { contextAnchorIndices } from "./executionProviderContext";
 import type {
@@ -10,6 +11,9 @@ import type {
 const MAX_CONTEXT_ENTRY_CHARS = 5_000;
 const MAX_CONTEXT_DIGEST_CHARS = 18_000;
 const MAX_CORRECTIVE_CONTEXT_DIGEST_CHARS = 14_000;
+const MAX_CONVERSATION_HISTORY_TURNS = 6;
+const MAX_CONVERSATION_HISTORY_CHARS = 28_000;
+const MAX_CONVERSATION_MESSAGE_CHARS = 12_000;
 const CONTEXT_SOURCES = [
   "workspace",
   "tool",
@@ -51,21 +55,128 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   ].join("\n");
 }
 
+function boundedConversationText(value: unknown): string {
+  const text = String(value || "").trim();
+  return text.length <= MAX_CONVERSATION_MESSAGE_CHARS
+    ? text
+    : `${text.slice(0, MAX_CONVERSATION_MESSAGE_CHARS - 43).trim()}\n[Older turn context truncated by Runtime v2.]`;
+}
+
+function boundedConversationContent(
+  content: AgentMessage["content"],
+): AgentMessage["content"] {
+  if (typeof content === "string") return boundedConversationText(content);
+  let images = 0;
+  return content.flatMap((part): ContentPart[] => {
+    if (part.type === "text") {
+      const text = boundedConversationText(part.text);
+      return text ? [{ type: "text", text }] : [];
+    }
+    if (part.type === "image_url" && images < 4) {
+      images += 1;
+      return [part];
+    }
+    return [];
+  });
+}
+
+function conversationContentChars(content: AgentMessage["content"]): number {
+  if (typeof content === "string") return content.length;
+  return content.reduce(
+    (total, part) => total + (part.type === "text" ? part.text.length : 128),
+    0,
+  );
+}
+
+function currentTurnUserMessage(
+  state: any,
+  turnId: string,
+  fallback: string,
+): AgentMessage {
+  const agentMessages = Array.isArray(state?.agentMessages)
+    ? state.agentMessages as AgentMessage[]
+    : [];
+  const exact = [...agentMessages].reverse().find(
+    (message) =>
+      message.role === "user" &&
+      String(message.runtimeTurnId || "").trim() === turnId,
+  );
+  // Restored transcripts intentionally discard process-local runtimeTurnId.
+  // The current submission is still the latest user message at admission.
+  const latestUser = [...agentMessages].reverse().find(
+    (message) => message.role === "user",
+  );
+  const selected = exact || latestUser;
+  if (!selected) {
+    return {
+      role: "user",
+      content: boundedConversationText(fallback) || "请处理当前任务。",
+    };
+  }
+  return {
+    role: "user",
+    content: boundedConversationContent(selected.content),
+    ...(exact?.runtimeTurnId ? { runtimeTurnId: exact.runtimeTurnId } : {}),
+  };
+}
+
 function baseProviderHistory(
   live: RuntimeV2LiveExecutionState,
   input: RuntimeV2ExecutionPortsInput,
 ): AgentMessage[] {
   if (live.messages.length > 0) return live.messages;
-  const turn = input.get().conversationTurns?.find(
+  const state = input.get();
+  const turns = Array.isArray(state?.conversationTurns)
+    ? state.conversationTurns
+    : [];
+  const turnIndex = turns.findIndex(
     (candidate: any) => candidate.id === input.context.turnId,
   );
+  const turn = turnIndex >= 0 ? turns[turnIndex] : null;
+  const history: AgentMessage[] = [];
+  let retainedChars = 0;
+  const priorTurns = (turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
+    .filter((candidate: any) => candidate?.uiVisibility !== "internal")
+    .slice(-MAX_CONVERSATION_HISTORY_TURNS);
+  for (let index = priorTurns.length - 1; index >= 0; index -= 1) {
+    const prior = priorTurns[index];
+    const user = boundedConversationText(prior?.userPrompt);
+    const assistant = boundedConversationText(
+      prior?.durableContext?.finalAssistantAnswer || prior?.summary,
+    );
+    const durableExecution = boundedConversationText(
+      serializeDurableTurnContextForModel(prior?.durableContext),
+    );
+    const pair: AgentMessage[] = [
+      ...(user ? [{ role: "user" as const, content: user }] : []),
+      ...(assistant
+        ? [{ role: "assistant" as const, content: assistant }]
+        : []),
+      ...(durableExecution
+        ? [{ role: "system" as const, content: durableExecution }]
+        : []),
+    ];
+    const pairChars = pair.reduce(
+      (total, message) => total + conversationContentChars(message.content),
+      0,
+    );
+    if (
+      history.length > 0 &&
+      retainedChars + pairChars > MAX_CONVERSATION_HISTORY_CHARS
+    ) {
+      break;
+    }
+    history.unshift(...pair);
+    retainedChars += pairChars;
+  }
   live.messages.push(
     { role: "system", content: systemInstruction(input) },
-    {
-      role: "user",
-      content: String(turn?.userPrompt || "").trim().slice(0, 12_000) ||
-        "请处理当前任务。",
-    },
+    ...history,
+    currentTurnUserMessage(
+      state,
+      input.context.turnId,
+      String(turn?.userPrompt || ""),
+    ),
   );
   return live.messages;
 }
@@ -228,15 +339,20 @@ export function providerHistory(
   readonly chars: number;
   readonly retainedSources: Record<string, number>;
   readonly focus: RuntimeV2ProviderHistoryFocus | null;
+  readonly historyMessages: number;
+  readonly priorTurns: number;
 } {
   const base = baseProviderHistory(live, input);
   const digest = buildModelContextDigest(live, focus);
+  const userMessages = base.filter((message) => message.role === "user").length;
   return {
     messages: digest.message ? [...base, digest.message] : [...base],
     retained: digest.retained,
     dropped: digest.dropped,
     retainedSources: digest.retainedSources,
     focus,
+    historyMessages: base.length,
+    priorTurns: Math.max(0, userMessages - 1),
     chars: base.reduce(
       (total, message) => total + String(message.content || "").length,
       0,

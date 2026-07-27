@@ -7,6 +7,7 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import { RUNTIME_V2_RECOVERY_LIMITS, runtimeV2ActionFingerprint } from "./recovery";
+import { MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS } from "./subagents";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -18,9 +19,24 @@ export interface RuntimeV2DecisionInput {
   /** User-visible, provider-authored conclusion after the adapter has already
    * checked the structured evidence gate. It is presentation data only. */
   readonly finalMarkdown?: string;
-  readonly allowReadOnlySubagents?: boolean;
-  /** The store scheduler has already proved that two frozen scopes exist. */
-  readonly hasReadOnlySubagentScopes?: boolean;
+  /**
+   * Admission-time collaboration policy. It controls only the model's tool
+   * surface; task identity, name, objective and scope must come from an actual
+   * spawn_subagent call.
+   */
+  readonly subagentPreference?:
+    | "unspecified"
+    | "forbidden"
+    | "allowed"
+    | "preferred";
+}
+
+function commaSeparatedValues(value: unknown): string[] {
+  return String(value || "")
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS);
 }
 
 function canonical(value: unknown): string {
@@ -310,6 +326,29 @@ export function decideNextCommands(
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
+    if (toolCall.name === "spawn_subagent") {
+      return [boundedCommand(state, "schedule_subagents", {
+        toolCallId: toolCall.id,
+        arguments: toolCall.arguments,
+      })];
+    }
+    if (toolCall.name === "wait_subagents") {
+      const requested = [
+        ...commaSeparatedValues(toolCall.arguments.subagent_ids),
+        ...commaSeparatedValues(toolCall.arguments.collaboration_task_ids),
+      ];
+      const activeIds = state.subagents
+        .filter((job) => job.status === "queued" || job.status === "running")
+        .map((job) => job.id);
+      return [boundedCommand(state, "join_subagents", {
+        toolCallId: toolCall.id,
+        arguments: toolCall.arguments,
+        requestedJobIds: requested,
+        jobIds: requested.length > 0
+          ? activeIds.filter((id) => requested.includes(id))
+          : activeIds,
+      })];
+    }
     const kind = state.phase === "validating" ? "execute_validation" : "execute_tool";
     return [boundedCommand(state, kind, {
       toolCallId: toolCall.id,
@@ -332,42 +371,55 @@ export function decideNextCommands(
           objective: state.objective.text,
         })];
       }
-      if (input.allowReadOnlySubagents && input.hasReadOnlySubagentScopes) {
-        const activeChildren = state.subagents.some((job) => job.status === "queued" || job.status === "running");
-        if (state.subagents.length === 0) {
-          return [boundedCommand(state, "schedule_subagents", {
-            mode: "read_only",
-            objective: state.objective.text,
-          })];
-        }
-        if (activeChildren) {
-          const lastScheduleIndex = state.events.map((event) => event.type).lastIndexOf("subagents.scheduled");
-          const parentObservedWhileChildrenRun = state.events.some((event, index) =>
-            index > lastScheduleIndex && event.type === "provider.responded"
-          );
-          // Let the parent make one independent observation while the child
-          // HTTP requests are in flight. It is a structural schedule fact,
-          // not a guess from child/model wording.
-          if (!parentObservedWhileChildrenRun) {
-            return [boundedCommand(state, "request_model", {
-              mode: state.strategy === "analyze" ? "analyze" : "observe",
-              toolExpectation: "optional",
-              objective: state.objective.text,
-              evidenceIds: state.evidence.map((item) => item.id),
-              childEvidencePending: true,
-            })];
-          }
+      const collaborationAllowed =
+        input.subagentPreference === "allowed" ||
+        input.subagentPreference === "preferred";
+      const activeSubagents = state.subagents
+        .filter((job) => job.status === "queued" || job.status === "running")
+        .map((job) => ({
+          id: job.id,
+          name: job.name || job.scopeKey,
+          objective: job.objective,
+        }));
+      const initialSpawnRequired =
+        input.subagentPreference === "preferred" &&
+        state.subagents.length === 0;
+      if (activeSubagents.length > 0) {
+        const lastScheduleIndex = state.events
+          .map((event) => event.type)
+          .lastIndexOf("subagents.scheduled");
+        const parentObservedWhileChildrenRun = state.events.some(
+          (event, index) =>
+            index > lastScheduleIndex &&
+            event.type === "provider.responded",
+        );
+        // Child identity and work come only from the provider's real
+        // spawn_subagent call. Once the parent has had one independent model
+        // turn, the runtime joins the actual active jobs even if a smaller
+        // model forgets the explicit wait tool, keeping collaboration finite.
+        if (parentObservedWhileChildrenRun) {
           return [boundedCommand(state, "join_subagents", {
             mode: "read_only",
-            jobIds: state.subagents.map((job) => job.id),
+            jobIds: activeSubagents.map((job) => job.id),
           })];
         }
       }
       return [boundedCommand(state, "request_model", {
         mode: state.strategy === "analyze" ? "analyze" : "observe",
-        toolExpectation: "optional",
+        toolExpectation: initialSpawnRequired ? "required" : "optional",
         objective: state.objective.text,
         evidenceIds: state.evidence.map((item) => item.id),
+        collaborationAllowed,
+        collaborationAction: initialSpawnRequired
+          ? "spawn_required"
+          : activeSubagents.length > 0
+            ? "children_active"
+            : "optional",
+        activeSubagents,
+        remainingSubagentCapacity: Math.max(
+          0,
+          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - state.subagents.length,
+        ),
       })];
     }
     case "planning":

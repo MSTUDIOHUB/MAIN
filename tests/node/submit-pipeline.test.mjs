@@ -1704,6 +1704,11 @@ test("semantic metadata decision builds a stable request and callback guard cont
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["Uploads/screen.png"],
     },
+    priorTurnContext: {
+      userPrompt: "修复编辑器保存失败",
+      title: "修复编辑器保存链路",
+      summary: "已定位事件消费端仍未处理保存结果。",
+    },
     titleIntentSignature: "analyze|分析这个截图里的布局问题|images:1|mentions:src/App.tsx|attachments:Uploads/screen.png",
     seededSessionTitleCandidate: "分析截图中的问题",
   });
@@ -1725,6 +1730,11 @@ test("semantic metadata decision builds a stable request and callback guard cont
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["Uploads/screen.png"],
       subagentPreference: "unspecified",
+    },
+    priorTurnContext: {
+      userPrompt: "修复编辑器保存失败",
+      title: "修复编辑器保存链路",
+      summary: "已定位事件消费端仍未处理保存结果。",
     },
   });
 });

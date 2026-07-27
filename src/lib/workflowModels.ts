@@ -762,7 +762,7 @@ const TITLE_META_PREFIX_RE =
 const TITLE_MODE_PREFIX_RE =
   /^(?:回复|respond|讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
 const TITLE_REASONING_LEAK_RE =
-  /(?:thinking process|here'?s a thinking|chain of thought|reasoning process|analy(?:s|z)e user input|step\s*1\b|let'?s think|思考过程|分析用户输入|先分析|先思考)/i;
+  /(?:thinking process|here'?s a thinking|chain of thought|reasoning process|analy(?:s|z)e user input|step\s*1\b|let'?s think|(?:although|even though)[^.!?。！？]{0,80}(?:the\s+)?first\s+(?:user\s+)?message|思考过程|分析用户输入|先分析|先思考|(?:虽然|尽管)[^。！？]{0,40}(?:第一条|首条)消息|^(?:用户说[：“"'‘]|the user (?:said|says|asks)\b))/i;
 const GENERIC_TURN_TITLE_RE = /^(?:新的任务|新任务|new task|turn decision|本轮决策|new conversation|新会话|new chat|新聊天)$/i;
 
 /**

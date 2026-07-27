@@ -104,9 +104,6 @@ const realOmlxPlanEvidenceTargets = String(
 ).split(";;").map((target) => target.trim()).filter(Boolean);
 const requireSemanticTaskQuality =
   process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1";
-const realOmlxExpectedSubagentScopes = String(
-  process.env.REAL_OMLX_EXPECT_SUBAGENT_SCOPES || "",
-).split(";;").map((scope) => scope.trim()).filter(Boolean);
 if (
   runRealOmlx &&
   realOmlxFixture === "md-viewer" &&
@@ -123,11 +120,6 @@ if (
 ) {
   throw new Error(
     "Task-quality validation requires explicit REAL_OMLX_PLAN_EVIDENCE_TARGETS for non-default fixtures.",
-  );
-}
-if (runRealOmlx && realOmlxPreferSubagents && realOmlxExpectedSubagentScopes.length === 0) {
-  throw new Error(
-    "REAL_OMLX_PREFER_SUBAGENTS=1 requires explicit REAL_OMLX_EXPECT_SUBAGENT_SCOPES.",
   );
 }
 const realOmlxPlanTimeoutMs = Math.max(
@@ -2410,7 +2402,6 @@ for (const model of models) {
     if (realOmlxPreferSubagents) {
       expectRuntimeV2ReadOnlyCollaboration(
         earlyExecutionSnapshot?.runtimeV2,
-        realOmlxExpectedSubagentScopes,
       );
     }
     if (mutationAfterEarlyOutcome.changedFiles.length === 0) {
@@ -3005,7 +2996,6 @@ for (const model of models) {
 
     const runtimeDebugText = JSON.stringify(runtimeV2.debug || []);
     expectRuntimeV2ReadOnlyCollaboration(runtimeV2);
-    await expect(page.getByText("已启动并行只读调查", { exact: false }).first()).toBeVisible();
     expect(runtimeV2.presentation?.timeline?.length || 0).toBeGreaterThan(0);
     expect((runtimeV2.presentation?.timeline || []).every(
       (entry: { title?: string; status?: string; toolCallId?: string }) =>
@@ -3045,6 +3035,21 @@ for (const model of models) {
         entry.runId.trim().length > 0 &&
         entry.updatedAt.trim().length > 0
       )).toBe(true);
+    const projectedMutations = (runtimeV2.presentation?.timeline || []).filter(
+      (entry: { toolName?: string; status?: string }) =>
+        /^(?:replace_in_file|write_file|apply_patch)$/.test(
+          String(entry.toolName || ""),
+        ) &&
+        entry.status === "done",
+    );
+    expect(projectedMutations.some((entry: {
+      diff?: { old?: string; new?: string; path?: string } | null;
+    }) =>
+      !!entry.diff &&
+      typeof entry.diff.old === "string" &&
+      typeof entry.diff.new === "string" &&
+      String(entry.diff.path || "").trim().length > 0
+    )).toBe(true);
     expect(runtimeDebugText).not.toMatch(
       /RUNTIME_V2_STALE_RUN_CHECKPOINT|runtime_v2_checkpoint_projection_conflict|runtime_v2_checkpoint_persist_failed|runtime_v2_tool_execution_rejected/,
     );

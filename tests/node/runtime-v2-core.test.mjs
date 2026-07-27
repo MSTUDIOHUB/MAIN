@@ -223,6 +223,7 @@ test("workspace read-only strategy is structurally distinct from Chat", () => {
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.mode, "analyze");
   assert.notEqual(next.payload.mode, "chat");
+  assert.equal(next.payload.collaborationAllowed, false);
 });
 
 test("Acting narrows the next provider request to mutation after its bounded source-gap pass", () => {
@@ -608,7 +609,7 @@ test("Capsule clears provider commentary after its structured action settles", (
   assert.match(capsule.markdown, /正在收集证据/);
 });
 
-test("Chat milestones omit individual observations and join child results once", () => {
+test("Chat milestones reject runtime-authored phase and child prose and keep actual provider commentary", () => {
   let state = executeAggregate("observing");
   const observation = event(state, "observation.recorded", {
     run: baseRun,
@@ -625,6 +626,19 @@ test("Chat milestones omit individual observations and join child results once",
       state,
       observation,
       "observation-milestone",
+    ),
+    null,
+  );
+  const phaseChange = event(state, "phase.changed", {
+    run: baseRun,
+    phase: "acting",
+    reason: "synthetic runtime phase copy",
+  });
+  assert.equal(
+    runtime.buildRuntimeV2MilestoneProjection(
+      state,
+      phaseChange,
+      "phase-milestone",
     ),
     null,
   );
@@ -663,10 +677,19 @@ test("Chat milestones omit individual observations and join child results once",
       summary: null,
     },
   ];
-  state = runtime.transition(state, event(state, "subagents.scheduled", {
+  const scheduled = event(state, "subagents.scheduled", {
     run: baseRun,
     jobs,
-  }));
+  });
+  state = runtime.transition(state, scheduled);
+  assert.equal(
+    runtime.buildRuntimeV2MilestoneProjection(
+      state,
+      scheduled,
+      "scheduled-milestone",
+    ),
+    null,
+  );
   state = runtime.transition(state, event(state, "subagent.telemetry", {
     run: baseRun,
     telemetry: {
@@ -734,9 +757,28 @@ test("Chat milestones omit individual observations and join child results once",
     secondChild,
     "joined-child-milestone",
   );
-  assert.match(joined.markdown, /并行只读调查已汇合/);
-  assert.match(joined.markdown, /1 个范围完成调查，1 个范围未能完整返回/);
-  assert.match(joined.markdown, /1 条子智能体证据/);
+  assert.equal(joined, null);
+
+  const providerCommentary = event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: "provider-commentary",
+    result: {
+      visibleText: "我先核对保存事件的真实消费路径。",
+      toolCalls: [{
+        id: "read-save-handler",
+        name: "read_file",
+        arguments: { path: "src/save-handler.ts" },
+      }],
+      diagnostics: [],
+    },
+  });
+  const realMilestone = runtime.buildRuntimeV2MilestoneProjection(
+    state,
+    providerCommentary,
+    "provider-commentary-milestone",
+  );
+  assert.equal(realMilestone.markdown, "我先核对保存事件的真实消费路径。");
+  assert.doesNotMatch(realMilestone.markdown, /当前阶段|已保留|并行只读调查/);
 });
 
 test("Runtime v2 reducer records one ordered ledger and forbids success before finalizing", () => {
@@ -1647,6 +1689,142 @@ test("read-only child scheduler requires disjoint scopes and records real reques
   assert.equal(telemetry.hasRequestOverlap, true);
 });
 
+test("read-only child scheduler preserves one model-selected identity without inventing a pair", () => {
+  const schedule = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    requestedAt: 10,
+    nextId: () => "child-kepler",
+    candidates: [{
+      sourceToolCallId: "spawn-kepler",
+      scopeKey: "save-event-consumer-audit",
+      name: "Kepler",
+      role: "event-flow reviewer",
+      objective: "Trace the save event consumer handoff.",
+      successCriteria: "Return the first unsupported transition with exact paths.",
+      expectedOutput: "A sourced handoff report.",
+      allowedPaths: ["src/editor"],
+    }],
+  });
+
+  assert.equal(schedule.jobs.length, 1);
+  assert.equal(schedule.jobs[0].sourceToolCallId, "spawn-kepler");
+  assert.equal(schedule.jobs[0].scopeKey, "save-event-consumer-audit");
+  assert.equal(schedule.jobs[0].name, "Kepler");
+  assert.equal(schedule.jobs[0].role, "event-flow reviewer");
+  assert.equal(schedule.jobs[0].objective, "Trace the save event consumer handoff.");
+  assert.deepEqual(schedule.rejectedScopeKeys, []);
+});
+
+test("a model wait_subagents call becomes the exact durable join command", () => {
+  let state = executeAggregate("observing");
+  const job = {
+    id: "child-kepler",
+    run: {
+      ...baseRun,
+      runId: "child-run-kepler",
+      parentRunId: baseRun.runId,
+      attemptId: "child-attempt-kepler",
+    },
+    parentRunId: baseRun.runId,
+    sourceToolCallId: "spawn-kepler",
+    scopeKey: "save-event-consumer-audit",
+    name: "Kepler",
+    role: "event-flow reviewer",
+    objective: "Trace the save event consumer handoff.",
+    allowedPaths: ["src/editor"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [job],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = recordProviderResponse(state, "wait-provider", [{
+    id: "wait-kepler",
+    name: "wait_subagents",
+    arguments: { subagent_ids: "child-kepler" },
+  }]);
+
+  const [join] = runtime.decideNextCommands(state);
+  assert.equal(join.kind, "join_subagents");
+  assert.equal(join.payload.toolCallId, "wait-kepler");
+  assert.deepEqual(join.payload.requestedJobIds, ["child-kepler"]);
+  assert.deepEqual(join.payload.jobIds, ["child-kepler"]);
+});
+
+test("active model-selected children join after one independent parent response", () => {
+  let state = executeAggregate("observing");
+  const job = {
+    id: "child-kepler",
+    run: {
+      ...baseRun,
+      runId: "child-run-kepler",
+      parentRunId: baseRun.runId,
+      attemptId: "child-attempt-kepler",
+    },
+    parentRunId: baseRun.runId,
+    sourceToolCallId: "spawn-kepler",
+    scopeKey: "save-event-consumer-audit",
+    name: "Kepler",
+    role: "event-flow reviewer",
+    objective: "Trace the save event consumer handoff.",
+    allowedPaths: ["src/editor"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [job],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+
+  const [parentModel] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(parentModel.kind, "request_model");
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: parentModel,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: parentModel.idempotencyKey,
+    result: {
+      visibleText: "我已完成与子任务不重叠的父级检查。",
+      toolCalls: [],
+      diagnostics: [],
+    },
+  }));
+
+  const [join] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(join.kind, "join_subagents");
+  assert.deepEqual(join.payload.jobIds, ["child-kepler"]);
+  assert.equal(join.payload.toolCallId, undefined);
+});
+
 test("Execute phase policy advances completed observation into acting without requiring a pending mutation", () => {
   let state = executeAggregate("observing");
   state = runtime.transition(state, event(state, "observation.recorded", {
@@ -2450,24 +2628,29 @@ test("tool-call transport ids do not create unlimited recovery fingerprints", ()
   );
 });
 
-test("controller commits child jobs before the scheduler can open either request", async () => {
+test("controller schedules only the child task selected by a real provider tool call", async () => {
   let now = 200;
   let id = 0;
   let revision = 0;
   const ledger = [];
-  const jobs = ["frontend", "backend"].map((scopeKey, index) => ({
-    id: `child-${index + 1}`,
-    run: { ...baseRun, runId: `child-run-${index + 1}`, parentRunId: baseRun.runId, attemptId: `child-attempt-${index + 1}` },
+  const jobs = [{
+    id: "child-save-events",
+    run: { ...baseRun, runId: "child-run-save-events", parentRunId: baseRun.runId, attemptId: "child-attempt-save-events" },
     parentRunId: baseRun.runId,
-    scopeKey,
-    objective: `inspect ${scopeKey}`,
-    allowedPaths: [index === 0 ? "src" : "src-tauri"],
+    sourceToolCallId: "spawn-save-events",
+    scopeKey: "save-event-consumer-audit",
+    name: "Kepler",
+    role: "event-flow reviewer",
+    objective: "Trace where save events are consumed and identify the first dropped handoff.",
+    successCriteria: "Return exact source paths and the first unsupported transition.",
+    allowedPaths: ["src/editor"],
     status: "queued",
     requestedAt: now,
     firstTokenAt: null,
     closedAt: null,
     summary: null,
-  }));
+  }];
+  let providerCalls = 0;
   const ports = {
     checkpoint: {
       async load() { return null; },
@@ -2477,10 +2660,32 @@ test("controller commits child jobs before the scheduler can open either request
         return { disposition: "committed", checkpoint: { revision, event } };
       },
     },
-    provider: { async request() { throw new Error("provider should not run before child scheduling"); } },
+    provider: {
+      async request() {
+        providerCalls += 1;
+        return {
+          visibleText: "我会先让 Kepler 独立核对保存事件的消费链。",
+          toolCalls: [{
+            id: "spawn-save-events",
+            name: "spawn_subagent",
+            arguments: {
+              task_key: "save-event-consumer-audit",
+              name: "Kepler",
+              role: "event-flow reviewer",
+              objective: "Trace where save events are consumed and identify the first dropped handoff.",
+              success_criteria: "Return exact source paths and the first unsupported transition.",
+              allowed_paths: "src/editor",
+            },
+          }],
+          diagnostics: [],
+        };
+      },
+    },
     tool: { async execute() { throw new Error("tool should not run before child scheduling"); } },
     scheduler: {
-      async prepareSchedule() {
+      async prepareSchedule({ command }) {
+        assert.equal(command.payload.toolCallId, "spawn-save-events");
+        assert.equal(command.payload.arguments.name, "Kepler");
         return { type: "subagents.scheduled", run: baseRun, jobs };
       },
       async execute({ command }) {
@@ -2503,10 +2708,21 @@ test("controller commits child jobs before the scheduler can open either request
   const controller = new runtime.RuntimeV2Controller(ports);
   await controller.admit({ turn: baseTurn, run: baseRun, strategy: "execute", objective: "Repair the fixture" });
   await controller.changePhase("observing", "initial observation is complete");
-  await controller.driveOnce({ allowReadOnlySubagents: true, hasReadOnlySubagentScopes: true });
+  await controller.driveOnce({ subagentPreference: "preferred" });
+  assert.equal(providerCalls, 1);
+  assert.equal(controller.snapshot().aggregate.subagents.length, 0);
+  assert.equal(controller.snapshot().aggregate.pendingToolCalls[0].name, "spawn_subagent");
+  await controller.driveOnce({ subagentPreference: "preferred" });
   const aggregate = controller.snapshot().aggregate;
-  assert.equal(aggregate.subagents.length, 2);
-  assert.deepEqual(aggregate.subagents.map((job) => job.status), ["running", "running"]);
+  assert.equal(aggregate.subagents.length, 1);
+  assert.equal(aggregate.subagents[0].name, "Kepler");
+  assert.equal(aggregate.subagents[0].objective, jobs[0].objective);
+  assert.deepEqual(aggregate.subagents.map((job) => job.status), ["running"]);
+  assert.equal(aggregate.pendingToolCalls.length, 0);
+  assert.ok(
+    ledger.findIndex((item) => item.type === "provider.responded") <
+      ledger.findIndex((item) => item.type === "subagents.scheduled"),
+  );
   assert.ok(ledger.findIndex((item) => item.type === "subagents.scheduled") < ledger.findIndex((item) => item.type === "subagent.telemetry"));
 });
 

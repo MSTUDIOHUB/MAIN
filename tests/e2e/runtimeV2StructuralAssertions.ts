@@ -2,6 +2,11 @@ import { expect } from "@playwright/test";
 
 type RuntimeV2SubagentSnapshot = {
   scopeKey?: string;
+  sourceToolCallId?: string;
+  name?: string;
+  role?: string;
+  objective?: string;
+  successCriteria?: string;
   status?: string;
   allowedPaths?: string[];
   requestOpenedAt?: number;
@@ -11,18 +16,20 @@ type RuntimeV2SubagentSnapshot = {
 
 export function expectRuntimeV2ReadOnlyCollaboration(
   runtime: any,
-  expectedScopeKeys: readonly string[] = [],
 ): void {
   const jobs = (Array.isArray(runtime?.subagents)
     ? runtime.subagents
     : []) as RuntimeV2SubagentSnapshot[];
-  expect(jobs).toHaveLength(2);
-  if (expectedScopeKeys.length > 0) {
-    expect(jobs.map((job) => String(job.scopeKey || "")).sort())
-      .toEqual([...expectedScopeKeys].sort());
-  }
+  expect(jobs.length).toBeGreaterThanOrEqual(1);
+  expect(jobs.length).toBeLessThanOrEqual(2);
   expect(jobs.every((job) =>
     ["completed", "failed", "canceled"].includes(String(job.status || "")) &&
+    String(job.sourceToolCallId || "").trim().length > 0 &&
+    String(job.scopeKey || "").trim().length > 0 &&
+    String(job.name || "").trim().length > 0 &&
+    String(job.role || "").trim().length > 0 &&
+    String(job.objective || "").trim().length > 0 &&
+    String(job.successCriteria || "").trim().length > 0 &&
     Array.isArray(job.allowedPaths) &&
     job.allowedPaths.length > 0 &&
     Number.isFinite(job.requestOpenedAt) &&
@@ -39,38 +46,31 @@ export function expectRuntimeV2ReadOnlyCollaboration(
   )).toBe(true);
 
   expect(runtime?.subagentConcurrency).toMatchObject({
-    requestCount: 2,
-    hasRequestOverlap: true,
+    requestCount: jobs.length,
   });
-  expect(runtime.subagentConcurrency.peakInFlight).toBeGreaterThanOrEqual(2);
-  expect(Math.max(
-    ...jobs.map((job) => Number(job.requestOpenedAt)),
-  )).toBeLessThan(Math.min(
-    ...jobs.map((job) => Number(job.closedAt)),
-  ));
+  expect(runtime.subagentConcurrency.peakInFlight).toBeGreaterThanOrEqual(1);
+  if (jobs.length > 1 && runtime.subagentConcurrency.hasRequestOverlap) {
+    expect(Math.max(
+      ...jobs.map((job) => Number(job.requestOpenedAt)),
+    )).toBeLessThan(Math.min(
+      ...jobs.map((job) => Number(job.closedAt)),
+    ));
+  }
 
   const joinedBatchDebug = (runtime?.debug || []).filter(
     (entry: { source?: string }) =>
       entry.source === "store.runtime_v2_subagent_batch_joined",
   );
-  expect(joinedBatchDebug).toHaveLength(1);
-  expect(joinedBatchDebug[0]?.data).toMatchObject({
-    jobCount: 2,
-    peakInFlight: expect.any(Number),
-    hasRequestOverlap: true,
-  });
+  expect(joinedBatchDebug.length).toBeGreaterThanOrEqual(1);
+  expect(joinedBatchDebug.every((entry: { data?: any }) =>
+    Number(entry.data?.jobCount || 0) >= 1 &&
+    Number(entry.data?.peakInFlight || 0) >= 1
+  )).toBe(true);
 
   const milestones = runtime?.presentation?.chatMilestones || [];
-  const allocationMilestones = milestones.filter((entry: { markdown?: string }) =>
-    /### 已启动并行只读调查/.test(String(entry.markdown || ""))
-  );
-  const joinedMilestones = milestones.filter((entry: { markdown?: string }) =>
-    /### 并行只读调查已汇合/.test(String(entry.markdown || ""))
-  );
-  expect(allocationMilestones).toHaveLength(1);
-  expect(joinedMilestones).toHaveLength(1);
-  for (const job of jobs) {
-    expect(allocationMilestones[0]?.markdown)
-      .toContain(String(job.scopeKey || ""));
-  }
+  expect(milestones.some((entry: { markdown?: string }) =>
+    /### (?:已启动并行只读调查|并行只读调查已汇合|当前阶段：)/.test(
+      String(entry.markdown || ""),
+    )
+  )).toBe(false);
 }

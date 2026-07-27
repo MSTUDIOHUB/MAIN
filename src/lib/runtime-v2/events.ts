@@ -14,6 +14,7 @@ import {
   type RuntimeV2SubagentStatus,
   type RuntimeV2SubagentTelemetry,
   type RuntimeV2TerminalOutcome,
+  type RuntimeV2ToolPresentation,
   type RuntimeV2TurnIdentity,
   type RuntimeV2WorkPlanReference,
 } from "./contracts";
@@ -77,6 +78,7 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      readonly presentation?: RuntimeV2ToolPresentation;
       readonly failureKind?:
         | "execution_failed"
         | "not_authorized"
@@ -91,6 +93,7 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly passed: boolean;
+      readonly presentation?: RuntimeV2ToolPresentation;
       /** A protocol or authority rejection asks for a corrected validation
        * call in the same phase. Only a real execution/assertion failure
        * justifies returning to source modification. */

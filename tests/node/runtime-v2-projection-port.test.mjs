@@ -164,13 +164,14 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 
   let state = harness.getState();
   let timelineBlocks = state.taskFlow.filter((block) =>
-    block.type === "progress" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+    block.type === "tool" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
   );
   assert.equal(timelineBlocks.length, 1);
   assert.equal(timelineBlocks[0].status, "running");
+  assert.equal(timelineBlocks[0].toolStatus, "running");
   assert.equal(timelineBlocks[0].target, "src/components/editor.js");
-  assert.equal(timelineBlocks[0].source, "runtime");
-  assert.match(timelineBlocks[0].title, /editor\.js/);
+  assert.equal(timelineBlocks[0].toolName, "replace_in_file");
+  assert.match(timelineBlocks[0].intentSummary, /editor\.js/);
   assert.ok(state.conversationTurns[0].blockIds.includes(timelineBlocks[0].id));
   assert.equal(
     state.runtimeEvents.filter((event) => event.type === "item.completed").length,
@@ -183,10 +184,30 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
     includeThoughts: false,
   });
   assert.equal(liveModel.stepCount, 1);
-  assert.match(liveModel.steps[0].intent, /editor\.js/);
+  assert.deepEqual(
+    liveModel.steps[0].targets,
+    ["src/components/editor.js"],
+  );
 
   await harness.port.publish({
     aggregate: aggregate({
+      events: [{
+        type: "tool.completed",
+        idempotencyKey: edit.idempotencyKey,
+        status: "succeeded",
+        presentation: {
+          toolName: "replace_in_file",
+          target: "src/components/editor.js",
+          message: "Updated src/components/editor.js",
+          diff: {
+            old: "const value = 1;\n",
+            new: "const value = 2;\n",
+            path: "src/components/editor.js",
+            existed: true,
+            fullFile: true,
+          },
+        },
+      }],
       completedCommands: [{
         idempotencyKey: edit.idempotencyKey,
         kind: edit.kind,
@@ -201,10 +222,65 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 
   state = harness.getState();
   timelineBlocks = state.taskFlow.filter((block) =>
-    block.type === "progress" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+    block.type === "tool" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
   );
   assert.equal(timelineBlocks.length, 1);
   assert.equal(timelineBlocks[0].status, "done");
+  assert.equal(timelineBlocks[0].toolStatus, "executed");
+  assert.equal(timelineBlocks[0].message, "Updated src/components/editor.js");
+  assert.deepEqual(timelineBlocks[0].diff, {
+    old: "const value = 1;\n",
+    new: "const value = 2;\n",
+    path: "src/components/editor.js",
+    existed: true,
+    fullFile: true,
+  });
+  assert.equal(timelineBlocks[0].workspaceEffect, "verified");
+});
+
+test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async () => {
+  const harness = createHarness();
+  const edit = command();
+  const liveText = "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+
+  await harness.port.publish({
+    aggregate: aggregate({ scheduledCommands: [edit] }),
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      liveText,
+      "turn-a:action:edit-1",
+    ),
+  });
+
+  let progressEvents = harness.getState().runtimeEvents.filter(
+    (event) => event.type === "progress.updated",
+  );
+  assert.equal(progressEvents.length, 1);
+  assert.equal(progressEvents[0].progress.title, "正在编辑 editor.js");
+  assert.equal(progressEvents[0].progress.summary, liveText);
+  assert.notEqual(
+    progressEvents[0].progress.title,
+    progressEvents[0].progress.summary,
+  );
+
+  await harness.port.publish({
+    aggregate: aggregate({ scheduledCommands: [] }),
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "正在实施修改。",
+      "turn-a:phase:acting",
+      "live-action-phase",
+    ),
+  });
+
+  progressEvents = harness.getState().runtimeEvents.filter(
+    (event) => event.type === "progress.updated",
+  );
+  const phaseProgress = progressEvents.at(-1).progress;
+  assert.equal(phaseProgress.title, "正在实施修改");
+  assert.equal(phaseProgress.summary, undefined);
 });
 
 test("V2 timeline records an unmet acceptance check without presenting the task as paused", async () => {
@@ -237,6 +313,12 @@ test("V2 timeline records an unmet acceptance check without presenting the task 
         type: "validation.completed",
         idempotencyKey: validation.idempotencyKey,
         passed: false,
+        presentation: {
+          toolName: "run_command",
+          target: "npm run build",
+          message: "src/main.ts:12:1 - type error",
+          observationSummary: "src/main.ts:12:1 - type error",
+        },
       }],
       completedCommands: [{
         idempotencyKey: validation.idempotencyKey,
@@ -256,18 +338,20 @@ test("V2 timeline records an unmet acceptance check without presenting the task 
 
   const state = harness.getState();
   const block = state.taskFlow.find((item) =>
-    item.type === "progress" &&
+    item.type === "tool" &&
     item.toolCallId === validation.idempotencyKey
   );
-  assert.equal(block.status, "failed");
-  assert.match(block.evidence, /验证未通过/);
+  assert.equal(block.status, "error");
+  assert.equal(block.toolStatus, "failed");
+  assert.match(block.message, /type error/);
   const timeline = buildLiveTurnProcessTimelineModel({
     blocks: state.taskFlow,
     language: "zh",
     includeThoughts: false,
   });
-  assert.equal(timeline.steps[0].kind, "verify");
-  assert.equal(timeline.steps[0].activity.label, "验证未通过");
+  assert.equal(timeline.steps[0].kind, "blocked");
+  assert.equal(timeline.steps[0].activity.metrics.commandsRun, 1);
+  assert.match(timeline.steps[0].activity.latestEvidence, /type error/);
 });
 
 test("V2 timeline retains each concrete command as an ordered record", async () => {
@@ -304,10 +388,12 @@ test("V2 timeline retains each concrete command as an ordered record", async () 
     language: "zh",
     includeThoughts: false,
   });
-  assert.equal(model.stepCount, 2);
-  assert.match(model.steps[0].intent, /editor\.js/);
-  assert.match(model.steps[1].intent, /toolbar\.js/);
-  assert.ok(model.steps[0].sourceIndex < model.steps[1].sourceIndex);
+  assert.equal(model.stepCount, 1);
+  assert.equal(model.steps[0].activity.metrics.filesRead, 2);
+  assert.deepEqual(
+    model.steps[0].items.map((item) => item.target),
+    ["src/components/editor.js", "src/components/toolbar.js"],
+  );
 });
 
 test("V2 timeline keeps validation targets complete, omits raw output, and removes canceled provisional rows", async () => {
@@ -338,7 +424,7 @@ test("V2 timeline keeps validation targets complete, omits raw output, and remov
   let state = harness.getState();
   const validationBlock = state.taskFlow.find((block) => block.toolCallId === validation.idempotencyKey);
   assert.ok(validationBlock);
-  assert.equal(validationBlock.phase, "verifying");
+  assert.equal(validationBlock.turnPhase.kind, "validation");
   assert.equal(validationBlock.target, "npm run build -- --mode validation");
   assert.doesNotMatch(JSON.stringify(validationBlock), /SECRET_TOOL_OUTPUT/);
 
@@ -363,15 +449,15 @@ test("V2 timeline keeps validation targets complete, omits raw output, and remov
   );
 });
 
-test("V2 Chat milestones remain durable assistant updates rather than timeline narration", async () => {
+test("V2 provider commentary remains a durable assistant update rather than timeline narration", async () => {
   const harness = createHarness();
   await harness.port.publish({
     aggregate: aggregate(),
     audience: "chat_milestone",
     projection: projection(
       "milestone",
-      "### 已启动并行只读调查\n\n- 前端和后端范围已经分别分配。",
-      "turn-a:subagents:frontend:backend",
+      "我先让 Kepler 独立核对保存事件的消费链。",
+      "turn-a:provider-commentary:spawn-save-events",
     ),
   });
 
@@ -674,5 +760,13 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
   assert.equal(
     state.runtimeEvents.find((event) => event.type === "turn.completed")?.resultKind,
     "canceled",
+  );
+  assert.equal(state.agentMessages.length, 1);
+  assert.equal(state.agentMessages[0].role, "assistant");
+  assert.equal(state.agentMessages[0].runtimeTurnId, "turn-a");
+  assert.match(state.agentMessages[0].content, /已取消/);
+  assert.equal(
+    state.conversationTurns[0].durableContext.finalAssistantAnswer,
+    "### 已取消\n\n本轮已按用户请求停止。",
   );
 });

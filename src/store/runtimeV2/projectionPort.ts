@@ -1,10 +1,15 @@
 import { getToolTarget } from "../../lib/toolTarget";
+import { buildDurableTurnContext } from "../../lib/durableTurnContext";
 import {
   appendRuntimeEvent,
   withEventSchema,
   type MainThreadEvent,
 } from "../../lib/turnEvents";
 import type { ProgressTaskBlock, TaskBlock } from "../../lib/taskTypes";
+import {
+  deriveTurnRuntimePhaseForTool,
+  withTurnRuntimePhaseStatus,
+} from "../../lib/turnPhase";
 import type {
   ProjectionPort,
   RuntimeV2Command,
@@ -46,8 +51,9 @@ function commandTool(command: RuntimeV2Command | undefined): string {
   if (command.kind === "execute_validation") {
     return String(command.payload.toolName || "run_command").trim();
   }
-  if (command.kind === "collect_observation") return "collect_observation";
-  if (command.kind === "schedule_subagents" || command.kind === "join_subagents") return command.kind;
+  if (command.kind === "collect_observation") return "get_project_skeleton";
+  if (command.kind === "schedule_subagents") return "spawn_subagent";
+  if (command.kind === "join_subagents") return "wait_subagents";
   return command.kind;
 }
 
@@ -69,6 +75,20 @@ function timelineTarget(command: RuntimeV2Command): string {
       ? command.payload.jobIds.map(String).map((value) => value.trim()).filter(Boolean)
       : [];
     return jobIds.join(", ");
+  }
+  if (command.kind === "schedule_subagents") {
+    const args =
+      command.payload.arguments &&
+        typeof command.payload.arguments === "object" &&
+        !Array.isArray(command.payload.arguments)
+        ? command.payload.arguments as Record<string, unknown>
+        : {};
+    return String(
+      args.name || args.task_key || args.objective || "",
+    ).trim();
+  }
+  if (command.kind === "collect_observation") {
+    return command.run.sessionKey;
   }
   return "";
 }
@@ -146,45 +166,102 @@ function timelineTitle(
   return "同步结构化任务状态";
 }
 
-function buildTimelineProgressBlock(input: {
+function compactRunStatusTarget(target: string, language: "zh" | "en"): string {
+  const normalized = String(target || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  return (parts[parts.length - 1] || normalized).slice(0, 72) ||
+    (language === "zh" ? "当前工作区" : "current workspace");
+}
+
+function runStatusTitle(
+  aggregate: TurnAggregateV1,
+  command: RuntimeV2Command | undefined,
+  target: string,
+  language: "zh" | "en",
+): string {
+  if (command?.kind === "execute_tool" || command?.kind === "execute_validation") {
+    const tool = commandTool(command);
+    const name = compactRunStatusTarget(target, language);
+    const read = /^(?:read_file|read_document|get_file_outline|code_ast_query|git_status|git_diff|analyze_tabular_document|query_tabular_document|knowledge_get_excerpt)$/i.test(tool);
+    const search = /^(?:list_directory|get_project_skeleton|glob_search|grep_search|find_symbol_references|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|index_workspace_documents|knowledge_search)$/i.test(tool);
+    const edit = /^(?:write_file|replace_in_file|apply_patch|delete_workspace_path)$/i.test(tool);
+    const commandLine = /^(?:run_command|execute_command|send_pty_input|read_pty_|get_pty_status|clear_pty_buffer)/i.test(tool);
+    const browser = /browser/i.test(tool);
+    if (language === "en") {
+      if (read) return `Reading ${name}`;
+      if (search) return `Searching ${name}`;
+      if (edit) return `Editing ${name}`;
+      if (commandLine) return `Running ${name}`;
+      if (browser) return `Validating ${name}`;
+    } else {
+      if (read) return `正在读取 ${name}`;
+      if (search) return `正在搜索 ${name}`;
+      if (edit) return `正在编辑 ${name}`;
+      if (commandLine) return `正在运行 ${name}`;
+      if (browser) return `正在验证 ${name}`;
+    }
+  }
+  if (command) {
+    return timelineTitle(command, target, language, aggregate.strategy).replace(/`/g, "");
+  }
+  const phaseTitles: Record<TurnAggregateV1["phase"], { zh: string; en: string }> = {
+    preparing: { zh: "正在准备执行", en: "Preparing" },
+    observing: { zh: "正在收集证据", en: "Collecting evidence" },
+    planning: { zh: "正在形成计划", en: "Preparing the plan" },
+    reviewing: { zh: "正在等待审核", en: "Waiting for review" },
+    acting: { zh: "正在实施修改", en: "Implementing the change" },
+    validating: { zh: "正在验证结果", en: "Validating the result" },
+    finalizing: { zh: "正在整理结论", en: "Preparing the conclusion" },
+    completed: { zh: "任务已结束", en: "Run completed" },
+  };
+  return phaseTitles[aggregate.phase][language];
+}
+
+function comparableRunStatusText(value: string): string {
+  return String(value || "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_`~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[。.!！?？]+$/g, "")
+    .toLocaleLowerCase();
+}
+
+function buildTimelineToolBlock(input: {
   aggregate: TurnAggregateV1;
   command: RuntimeV2Command;
   projection: RuntimeV2Projection;
   id: number;
-  timestampMs: number;
   language: "zh" | "en";
-}): ProgressTaskBlock {
+}): Extract<TaskBlock, { type: "tool" }> {
   const run = input.aggregate.run!.identity;
   const target = timelineTarget(input.command);
   const tool = commandTool(input.command);
   return {
     id: input.id,
     turnId: run.turnId,
-    type: "progress",
-    phase: input.command.kind === "execute_validation" ? "verifying" : phaseFor(input.aggregate),
-    title: timelineTitle(
+    type: "tool",
+    toolName: tool,
+    executionName: tool,
+    target,
+    status: "running",
+    toolStatus: "running",
+    toolCallId: input.command.idempotencyKey,
+    turnPhase: deriveTurnRuntimePhaseForTool({
+      toolName: tool,
+      target,
+      language: input.language,
+      status: "running",
+    }),
+    intentSummary: timelineTitle(
       input.command,
       target,
       input.language,
       input.aggregate.strategy,
     ),
-    why: "",
-    action: input.projection.markdown,
-    evidence: "",
-    next: "",
-    targets: target ? [target] : [],
-    tool,
-    toolName: tool,
-    target,
-    canonicalTarget: target,
-    status: "running",
-    source: "runtime",
     runId: run.runId,
     parentRunId: run.parentRunId,
-    toolCallId: input.command.idempotencyKey,
     dedupeKey: timelineProgressKey(input.aggregate, input.projection),
-    createdAt: input.timestampMs,
-    updatedAt: input.timestampMs,
   };
 }
 
@@ -204,9 +281,17 @@ function reconcileRuntimeV2TimelineBlocks(
       .filter((event) => event.type === "validation.completed")
       .map((event) => [event.idempotencyKey, event.passed] as const),
   );
+  const completions = new Map(
+    aggregate.events
+      .filter((event) =>
+        event.type === "tool.completed" ||
+        event.type === "validation.completed"
+      )
+      .map((event) => [event.idempotencyKey, event] as const),
+  );
   return taskFlow.flatMap((block) => {
     if (
-      block.type !== "progress" ||
+      (block.type !== "progress" && block.type !== "tool") ||
       block.turnId !== run.turnId ||
       block.runId !== run.runId ||
       !String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
@@ -214,7 +299,10 @@ function reconcileRuntimeV2TimelineBlocks(
       return [block];
     }
     const receipt = block.toolCallId ? receipts.get(block.toolCallId) : undefined;
-    if (!receipt || block.status !== "running") return [block];
+    const blockRunning = block.type === "progress"
+      ? block.status === "running"
+      : block.toolStatus === "running";
+    if (!receipt || !blockRunning) return [block];
     // A canceled command remains canonical in the runtime ledger and final
     // projection. Remove only its provisional UI row instead of relabeling it
     // as either a successful or failed operation.
@@ -223,6 +311,51 @@ function reconcileRuntimeV2TimelineBlocks(
       ? validationOutcomes.get(block.toolCallId)
       : undefined;
     const failed = receipt === "failed" || validationPassed === false;
+    if (block.type === "tool") {
+      const completion = block.toolCallId
+        ? completions.get(block.toolCallId)
+        : undefined;
+      const toolFailed =
+        completion?.type === "tool.completed" &&
+        completion.status !== "succeeded";
+      const terminalFailed = failed || toolFailed;
+      const presentation = completion?.presentation;
+      const fallbackMessage = terminalFailed
+        ? validationPassed === false
+          ? language === "zh"
+            ? "有限验证未通过；运行时已保留真实失败输出供后续修复。"
+            : "Validation did not pass; Runtime retained the real failure output for the next repair."
+          : language === "zh"
+            ? "该结构化工具动作未成功完成。"
+            : "The structured tool action did not complete successfully."
+        : "";
+      return [{
+        ...block,
+        toolName: presentation?.toolName || block.toolName,
+        executionName: presentation?.toolName || block.executionName,
+        target: presentation?.target || block.target,
+        status: terminalFailed ? "error" : "done",
+        toolStatus: terminalFailed ? "failed" : "executed",
+        turnPhase: withTurnRuntimePhaseStatus(
+          block.turnPhase,
+          terminalFailed ? "failed" : "done",
+          language,
+        ),
+        message: presentation?.message || fallbackMessage,
+        observationSummary:
+          presentation?.observationSummary ||
+          presentation?.message ||
+          fallbackMessage,
+        ...(presentation?.diff
+          ? {
+              diff: { ...presentation.diff },
+              workspaceEffect: terminalFailed
+                ? "partial" as const
+                : "verified" as const,
+            }
+          : {}),
+      }];
+    }
     return [{
       ...block,
       status: failed ? "failed" as const : "done" as const,
@@ -372,9 +505,9 @@ export function createRuntimeV2ProjectionPort(
         );
         let taskFlow = state.taskFlow || [];
         let conversationTurns = state.conversationTurns || [];
-        // Failure detail belongs to the runtime/debug ledger. The public
-        // timeline records only the structured outcome and never copies raw
-        // model or tool output.
+        // Reconcile only the bounded presentation facts committed by the
+        // effect adapter. Raw provider/tool transport payloads remain outside
+        // TaskFlow, while real targets, summaries and diffs stay inspectable.
         taskFlow = reconcileRuntimeV2TimelineBlocks(taskFlow, aggregate, timestampMs, input.language);
 
         if (audience === "capsule_live") {
@@ -382,6 +515,10 @@ export function createRuntimeV2ProjectionPort(
           const command = aggregate.scheduledCommands[0];
           const tool = commandTool(command);
           const target = commandTarget(command) || aggregate.evidence[aggregate.evidence.length - 1]?.target || "";
+          const title = runStatusTitle(aggregate, command, target, input.language);
+          const summary = comparableRunStatusText(title) === comparableRunStatusText(projection.markdown)
+            ? ""
+            : projection.markdown;
           runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
             type: "progress.updated",
             threadId: run.sessionKey,
@@ -391,10 +528,10 @@ export function createRuntimeV2ProjectionPort(
             timestampMs,
             progress: {
               phase: phaseFor(aggregate),
-              title: projection.markdown.split("\n")[0]?.replace(/^#+\s*/, "") || "运行中",
+              title,
               status: "running",
               action: projection.markdown,
-              summary: projection.markdown,
+              ...(summary ? { summary } : {}),
               tool,
               target,
               canonicalTarget: target,
@@ -433,18 +570,17 @@ export function createRuntimeV2ProjectionPort(
           } else if (
             command &&
             !taskFlow.some((block: TaskBlock) =>
-              block.type === "progress" &&
+              (block.type === "progress" || block.type === "tool") &&
               block.turnId === run.turnId &&
               block.runId === run.runId &&
               block.dedupeKey === dedupeKey
             )
           ) {
-            const block = buildTimelineProgressBlock({
+            const block = buildTimelineToolBlock({
               aggregate,
               command,
               projection,
               id: input.nextTaskId(),
-              timestampMs,
               language: input.language,
             });
             taskFlow = [...taskFlow, block];
@@ -476,22 +612,43 @@ export function createRuntimeV2ProjectionPort(
             taskFlow = [...taskFlow, block];
             conversationTurns = conversationTurns.map((turn: any) =>
               turn.id === run.turnId
-                ? {
-                    ...turn,
-                    status: terminalTurnStatus(aggregate.terminalOutcome?.resultKind || "partial"),
-                    summary: visibleProjection.markdown,
-                    collapsed: false,
-                    processCollapsed: false,
-                    blockIds: turn.blockIds.includes(block.id) ? turn.blockIds : [...turn.blockIds, block.id],
-                    runtimeOutcome: {
-                      status: "completed",
-                      reason: aggregate.terminalOutcome?.reason || "runtime_v2_terminal",
-                      resultKind: aggregate.terminalOutcome?.resultKind || "partial",
-                      runId: run.runId,
-                      parentRunId: run.parentRunId,
-                      updatedAt: timestampMs,
-                    },
-                  }
+                ? (() => {
+                    const nextTurn = {
+                      ...turn,
+                      status: terminalTurnStatus(
+                        aggregate.terminalOutcome?.resultKind || "partial",
+                      ),
+                      summary: visibleProjection.markdown,
+                      collapsed: false,
+                      processCollapsed: false,
+                      blockIds: turn.blockIds.includes(block.id)
+                        ? turn.blockIds
+                        : [...turn.blockIds, block.id],
+                      runtimeOutcome: {
+                        status: "completed" as const,
+                        reason:
+                          aggregate.terminalOutcome?.reason ||
+                          "runtime_v2_terminal",
+                        resultKind:
+                          aggregate.terminalOutcome?.resultKind || "partial",
+                        runId: run.runId,
+                        parentRunId: run.parentRunId,
+                        updatedAt: timestampMs,
+                      },
+                    };
+                    const durableContext = buildDurableTurnContext({
+                      turnId: run.turnId,
+                      turnBlocks: taskFlow.filter(
+                        (candidate: TaskBlock) =>
+                          candidate.turnId === run.turnId,
+                      ),
+                      fallbackAssistantText: visibleProjection.markdown,
+                      now: timestampMs,
+                    });
+                    return durableContext
+                      ? { ...nextTurn, durableContext }
+                      : nextTurn;
+                  })()
                 : turn,
             );
           }
@@ -545,11 +702,32 @@ export function createRuntimeV2ProjectionPort(
               resultKind,
             }));
           }
+          const existingAgentMessages = Array.isArray(state.agentMessages)
+            ? state.agentMessages
+            : [];
+          const agentMessages = existingAgentMessages.some((message: any) =>
+            message?.role === "assistant" &&
+            (
+              String(message.runtimeTurnId || "").trim() === run.turnId ||
+              String(message.content || "").trim() ===
+                visibleProjection.markdown.trim()
+            )
+          )
+            ? existingAgentMessages
+            : [
+                ...existingAgentMessages,
+                {
+                  role: "assistant" as const,
+                  content: visibleProjection.markdown,
+                  runtimeTurnId: run.turnId,
+                },
+              ];
           const marker = state.harnessRunMarker;
           return {
             runtimeEvents,
             taskFlow,
             conversationTurns,
+            agentMessages,
             harnessRunMarker: marker?.runId === run.runId
               ? {
                   ...marker,

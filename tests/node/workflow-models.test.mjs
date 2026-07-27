@@ -685,6 +685,12 @@ test("looksLikeReasoningLeakTitle detects leaked chain-of-thought style titles",
     looksLikeReasoningLeakTitle("Here's a thinking process: 1. Analyze User Input: inspect the request"),
     true,
   );
+  assert.equal(
+    looksLikeReasoningLeakTitle(
+      "用户说“继续修复”，结合前文语境（虽然这是第一条消息，但系统提示存在前文）",
+    ),
+    true,
+  );
 });
 
 test("resolveActiveConversationTurn prefers the latest turn while auto-following the bottom", () => {

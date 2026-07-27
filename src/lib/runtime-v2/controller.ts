@@ -363,13 +363,16 @@ export class RuntimeV2Controller {
       switch (command.kind) {
       case "request_model": {
         const result = await this.ports.provider.request({ run: command.run, command, signal });
-        await this.apply(asEvent({
+        const applied = await this.apply(asEvent({
           ...this.eventBase(),
           type: "provider.responded",
           run: command.run,
           idempotencyKey: command.idempotencyKey,
           result,
         }));
+        await this.publishMilestoneIfEligible(
+          applied.events[applied.events.length - 1],
+        );
         if (result.toolCalls.length === 0 && !String(result.visibleText || "").trim()) {
           await this.apply(asEvent({
             ...this.eventBase(),
@@ -429,9 +432,15 @@ export class RuntimeV2Controller {
           event = await this.ports.tool.execute({ run: command.run, command, signal });
         } else {
           if (command.kind === "schedule_subagents") {
+            const sourceToolCallId =
+              typeof command.payload.toolCallId === "string"
+                ? command.payload.toolCallId
+                : "";
             const committedChildren = this.requireAggregate().subagents.filter((job) =>
               job.parentRunId === command.run.runId &&
-              (job.status === "queued" || job.status === "running")
+              (job.status === "queued" || job.status === "running") &&
+              (!sourceToolCallId ||
+                job.sourceToolCallId === sourceToolCallId)
             );
             if (committedChildren.length === 0) {
               const prepared = await this.ports.scheduler.prepareSchedule?.({ run: command.run, command, signal });

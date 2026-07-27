@@ -226,83 +226,28 @@ export function buildRuntimeV2CapsuleProjection(
   );
 }
 
-/** Durable ChatArea checkpoint, emitted only at a structured phase/evidence boundary. */
+/**
+ * Durable ChatArea update sourced only from provider-authored public
+ * commentary attached to a real structured action. Phase changes, child
+ * scheduling and evidence counts remain structured UI state; Runtime must not
+ * impersonate the model with prewritten assistant messages.
+ */
 export function buildRuntimeV2MilestoneProjection(
   aggregate: TurnAggregateV1,
   event: RuntimeV2Event,
   id: string,
 ): RuntimeV2Projection | null {
-  if (
-    event.type !== "phase.changed" &&
-    event.type !== "work_plan.sealed" &&
-    event.type !== "subagents.scheduled" &&
-    event.type !== "subagent.completed"
-  ) {
-    return null;
-  }
-  if (event.type === "work_plan.sealed") {
-    return projection(
-      aggregate,
-      "chat_milestone",
-      id,
-      `### 修复计划已准备好\n\n- 已绑定 ${aggregate.evidence.length} 条证据。\n- 正在等待审核后再开始修改。`,
-      "milestone",
-      `plan:${event.workPlan.digest}`,
-    );
-  }
-  if (event.type === "subagents.scheduled") {
-    return projection(
-      aggregate,
-      "chat_milestone",
-      id,
-      [
-        "### 已启动并行只读调查",
-        "",
-        ...event.jobs.map((job) => `- 已将 \`${job.scopeKey}\` 分配给独立子智能体（范围：${job.allowedPaths.map(markdownCode).join("、")}）。`),
-        "- 我会继续处理不依赖这些结果的工作，随后统一汇合可信证据。",
-      ].join("\n"),
-      "milestone",
-      `subagents:${event.jobs.map((job) => job.id).join(":")}`,
-    );
-  }
-  if (event.type === "subagent.completed") {
-    const terminalStatuses = new Set(["completed", "failed", "canceled"]);
-    if (
-      aggregate.subagents.some((job) => !terminalStatuses.has(job.status))
-    ) {
-      return null;
-    }
-    const completedCount = aggregate.subagents.filter(
-      (job) => job.status === "completed",
-    ).length;
-    const failedCount = aggregate.subagents.length - completedCount;
-    const evidenceCount = aggregate.evidence.filter(
-      (evidence) => evidence.kind === "subagent",
-    ).length;
-    return projection(
-      aggregate,
-      "chat_milestone",
-      id,
-      [
-        "### 并行只读调查已汇合",
-        "",
-        `- ${completedCount} 个范围完成调查${failedCount > 0 ? `，${failedCount} 个范围未能完整返回` : ""}。`,
-        `- 已将 ${evidenceCount} 条子智能体证据纳入主体判断；具体调用与范围保留在任务时间线中。`,
-        "- 主任务将基于合并后的证据继续判断或实施下一步。",
-      ].join("\n"),
-      "milestone",
-      `subagents-joined:${aggregate.subagents.map((job) => `${job.id}:${job.status}`).join(":")}`,
-    );
-  }
+  if (event.type !== "provider.responded") return null;
+  if (event.result.toolCalls.length === 0) return null;
+  const commentary = visibleProviderCommentary(event.result);
+  if (!commentary) return null;
   return projection(
     aggregate,
     "chat_milestone",
     id,
-    aggregate.strategy === "chat"
-      ? `### 正在组织回复\n\n- 已确认本轮只进行对话，不会调用工具或修改工作区。\n- ${event.reason}`
-      : `### 当前阶段：${phaseTitle(event.phase)}\n\n- 已保留 ${aggregate.evidence.length} 条可信证据。\n- ${event.reason}`,
+    commentary,
     "milestone",
-    `phase:${event.phase}:${event.sequence}`,
+    `provider-commentary:${event.idempotencyKey}`,
   );
 }
 

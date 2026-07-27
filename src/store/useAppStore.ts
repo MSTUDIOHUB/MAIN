@@ -7567,6 +7567,13 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           status: String(b.status),
           toolStatus: b.toolStatus,
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
+          ...(b.runId ? { runId: String(b.runId) } : {}),
+          ...(b.parentRunId != null
+            ? { parentRunId: String(b.parentRunId) }
+            : {}),
+          ...(b.dedupeKey
+            ? { dedupeKey: String(b.dedupeKey).slice(0, 220) }
+            : {}),
           ...(b.message ? { message: String(b.message) } : {}),
           ...(b.intentSummary ? { intentSummary: String(b.intentSummary).slice(0, 160) } : {}),
           ...(b.why ? { why: String(b.why).slice(0, 240) } : {}),
@@ -19393,6 +19400,12 @@ export const useAppStore = create<AppState>()(
 
     // 每个新 turn 都异步请求一次轻量语义标题：
     // 先用本地标题占位，不阻塞发送；模型结果回来后再覆盖 turn/sidebar 标题。
+    const priorSemanticTurn = [...sessionGet().conversationTurns]
+      .reverse()
+      .find((candidate) =>
+        candidate.id !== turnId &&
+        candidate.uiVisibility !== "internal"
+      );
     const semanticMetadataDecision = resolveSubmitSemanticMetadataDecision({
       text,
       isHidden,
@@ -19406,6 +19419,13 @@ export const useAppStore = create<AppState>()(
       preferredLanguage,
       currentConfig: sessionGet().config,
       contextSignals: turnInputContextSignals,
+      priorTurnContext: priorSemanticTurn
+        ? {
+            userPrompt: priorSemanticTurn.userPrompt,
+            title: priorSemanticTurn.title,
+            summary: priorSemanticTurn.summary,
+          }
+        : null,
       titleIntentSignature,
       seededSessionTitleCandidate,
     });
@@ -19931,6 +19951,11 @@ async function requestSemanticTurnMetadata(params: {
   language: "zh" | "en";
   config: AppConfig;
   contextSignals?: TurnInputContextSignals;
+  priorTurnContext?: {
+    userPrompt: string;
+    title: string;
+    summary: string;
+  };
 }): Promise<SemanticTurnMetadata | null> {
   try {
     const isCloud = params.config.activeProfile === "cloud";
@@ -19963,6 +19988,8 @@ async function requestSemanticTurnMetadata(params: {
           "Return strict JSON only. No markdown, no prose, no code fences.",
           "This is a tiny background UI-label task, not the main conversation.",
           "Infer the user's actual task intent from the raw input.",
+          "When prior-turn context is supplied, treat the raw input as a continuation in the same conversation and resolve short references such as 'continue fixing' from that context.",
+          "Never describe the input as a first message, mention system prompts, or expose your title-generation analysis.",
           "If image/file context is listed, use it to infer the task subject. Do not ignore screenshots, attachments, or @ files.",
           "Ignore usernames, timestamps, transcript prefixes, copied meta text, and reasoning-style wording.",
           "Generate:",
@@ -19979,6 +20006,14 @@ async function requestSemanticTurnMetadata(params: {
           `Resolved intent: ${params.intent}`,
           `Preferred language: ${params.language}`,
           ...(contextLines.length > 0 ? ["Provided context:", ...contextLines] : []),
+          ...(params.priorTurnContext
+            ? [
+                "Prior turn in this same conversation:",
+                `- User request: ${params.priorTurnContext.userPrompt}`,
+                `- Turn title: ${params.priorTurnContext.title}`,
+                `- Outcome summary: ${params.priorTurnContext.summary}`,
+              ]
+            : []),
           `Raw user input: ${params.input.slice(0, 800)}`,
           "Return strict JSON now.",
         ].join("\n"),

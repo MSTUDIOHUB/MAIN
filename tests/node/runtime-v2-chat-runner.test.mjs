@@ -161,8 +161,7 @@ test("read-only Chat publishes one final and never reaches effect ports", async 
   assert.ok(liveChatProjection);
   assert.doesNotMatch(liveChatProjection.projection.markdown, /根本原因|代码证据/);
   const milestones = testHarness.projections.filter((entry) => entry.audience === "chat_milestone");
-  assert.equal(milestones.length, 1);
-  assert.doesNotMatch(milestones[0].projection.markdown, /这是完整的只读回答/);
+  assert.equal(milestones.length, 0);
 });
 
 test("a hallucinated tool call concludes error without invoking the tool", async () => {

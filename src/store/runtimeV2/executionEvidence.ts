@@ -3,7 +3,9 @@ import {
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
   type RuntimeV2EventDraft,
+  type RuntimeV2ToolPresentation,
 } from "../../lib/runtime-v2";
+import type { ToolDiffPreview } from "../../lib/toolDiff";
 import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
@@ -65,6 +67,7 @@ function toolResultEvent(
   status: "succeeded" | "failed" | "blocked",
   evidence: RuntimeV2EvidenceReference[],
   failureKind?: RuntimeV2ToolFailureKind,
+  presentation?: RuntimeV2ToolPresentation,
 ): RuntimeV2EventDraft {
   return {
     type: "tool.completed",
@@ -72,6 +75,7 @@ function toolResultEvent(
     idempotencyKey: command.idempotencyKey,
     status,
     evidence,
+    ...(presentation ? { presentation } : {}),
     ...(status !== "succeeded" && failureKind ? { failureKind } : {}),
   };
 }
@@ -86,6 +90,7 @@ function validationResultEvent(
     version: string | null;
   }>,
   failureKind?: RuntimeV2ValidationFailureKind,
+  presentation?: RuntimeV2ToolPresentation,
 ): RuntimeV2EventDraft {
   return {
     type: "validation.completed",
@@ -93,6 +98,7 @@ function validationResultEvent(
     idempotencyKey: command.idempotencyKey,
     passed,
     evidence,
+    ...(presentation ? { presentation } : {}),
     ...(!passed && failureKind ? { failureKind } : {}),
   };
 }
@@ -184,6 +190,109 @@ function validationEvidenceVersion(output: unknown): string {
   return runtimeV2EvidenceVersion(stableDiagnostic || output);
 }
 
+function boundedPresentationText(value: unknown, max: number): string {
+  const text = modelContextContentForToolOutput(value)
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .trim();
+  if (!text) return "";
+  return text.length <= max
+    ? text
+    : `${text.slice(0, max - 38).trim()}\n[Tool output truncated by Runtime v2.]`;
+}
+
+function compactDiffText(
+  value: string,
+  start: number,
+  end: number,
+): string {
+  const prefixOmitted = start > 0;
+  const suffixOmitted = end < value.length;
+  return [
+    prefixOmitted ? "[... earlier unchanged content omitted ...]\n" : "",
+    value.slice(start, end),
+    suffixOmitted ? "\n[... later unchanged content omitted ...]" : "",
+  ].join("");
+}
+
+function boundedPresentationDiff(
+  preview: ToolDiffPreview | undefined,
+): RuntimeV2ToolPresentation["diff"] | undefined {
+  if (!preview) return undefined;
+  const oldText = String(preview.old || "");
+  const newText = String(preview.new || "");
+  const maxCombinedChars = 120_000;
+  if (oldText.length + newText.length <= maxCombinedChars) {
+    return {
+      old: oldText,
+      new: newText,
+      ...(preview.path ? { path: preview.path } : {}),
+      ...(typeof preview.existed === "boolean"
+        ? { existed: preview.existed }
+        : {}),
+      ...(typeof preview.fullFile === "boolean"
+        ? { fullFile: preview.fullFile }
+        : {}),
+    };
+  }
+  let commonPrefix = 0;
+  const maxPrefix = Math.min(oldText.length, newText.length);
+  while (
+    commonPrefix < maxPrefix &&
+    oldText.charCodeAt(commonPrefix) === newText.charCodeAt(commonPrefix)
+  ) {
+    commonPrefix += 1;
+  }
+  let commonSuffix = 0;
+  while (
+    commonSuffix < oldText.length - commonPrefix &&
+    commonSuffix < newText.length - commonPrefix &&
+    oldText.charCodeAt(oldText.length - 1 - commonSuffix) ===
+      newText.charCodeAt(newText.length - 1 - commonSuffix)
+  ) {
+    commonSuffix += 1;
+  }
+  const contextChars = 24_000;
+  const oldStart = Math.max(0, commonPrefix - contextChars);
+  const newStart = Math.max(0, commonPrefix - contextChars);
+  const oldEnd = Math.min(
+    oldText.length,
+    oldText.length - commonSuffix + contextChars,
+  );
+  const newEnd = Math.min(
+    newText.length,
+    newText.length - commonSuffix + contextChars,
+  );
+  return {
+    old: compactDiffText(oldText, oldStart, oldEnd),
+    new: compactDiffText(newText, newStart, newEnd),
+    ...(preview.path ? { path: preview.path } : {}),
+    ...(typeof preview.existed === "boolean"
+      ? { existed: preview.existed }
+      : {}),
+    ...(typeof preview.fullFile === "boolean"
+      ? { fullFile: preview.fullFile }
+      : {}),
+  };
+}
+
+function toolPresentation(input: {
+  toolName: string;
+  target: string;
+  output: unknown;
+  diffPreview?: ToolDiffPreview;
+}): RuntimeV2ToolPresentation {
+  const message = boundedPresentationText(input.output, 4_000);
+  const observationSummary = boundedPresentationText(input.output, 1_200);
+  const diff = boundedPresentationDiff(input.diffPreview);
+  return {
+    toolName: input.toolName,
+    target: input.target || input.toolName,
+    ...(message ? { message } : {}),
+    ...(observationSummary ? { observationSummary } : {}),
+    ...(diff ? { diff } : {}),
+  };
+}
+
 export function toolCompletionFor(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
@@ -194,7 +303,14 @@ export function toolCompletionFor(
   status: "succeeded" | "failed" | "blocked",
   failureKind?: RuntimeV2CompletionFailureKind,
   sourceVersion?: string,
+  diffPreview?: ToolDiffPreview,
 ): RuntimeV2EventDraft {
+  const presentation = toolPresentation({
+    toolName,
+    target,
+    output,
+    diffPreview,
+  });
   if (command.kind !== "execute_validation") {
     const targets = isWorkspaceMutationToolName(toolName)
       ? resolveWorkspaceMutationTargets(toolName, args, target)
@@ -220,6 +336,7 @@ export function toolCompletionFor(
       failureKind === "assertion_failed"
         ? "protocol_invalid"
         : failureKind,
+      presentation,
     );
   }
   const passed = status === "succeeded" &&
@@ -245,6 +362,7 @@ export function toolCompletionFor(
         (status === "succeeded"
           ? "assertion_failed"
           : "execution_failed"),
+    presentation,
   );
 }
 

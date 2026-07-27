@@ -173,13 +173,6 @@ function phaseTransitionMessage(
   return messages[reason];
 }
 
-function shouldUseReadOnlySubagents(state: any, context: RuntimeV2SubmissionContext, live: ReturnType<typeof createRuntimeV2LiveExecutionState>): boolean {
-  const preference = context.turnInputContextSignals.subagentPreference;
-  return preference !== "forbidden" &&
-    (preference === "preferred" || state.preferSubagents === true) &&
-    live.subagentCandidates.length >= 2;
-}
-
 function settlement(
   context: RuntimeV2SubmissionContext,
   outcome: AgentLoopOutcome,
@@ -400,8 +393,8 @@ export async function runSubmitRuntimeV2Execute(
         continue;
       }
       const drove = await controller.driveOnce({
-        allowReadOnlySubagents: shouldUseReadOnlySubagents(input.get(), input.context, live),
-        hasReadOnlySubagentScopes: live.subagentCandidates.length >= 2,
+        subagentPreference:
+          input.context.turnInputContextSignals.subagentPreference,
       });
       if (!drove) {
         await controller.driveOnce({

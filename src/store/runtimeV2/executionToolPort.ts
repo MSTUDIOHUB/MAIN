@@ -1,5 +1,9 @@
 import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
+import {
+  buildToolDiffPreview,
+  type ToolDiffPreview,
+} from "../../lib/toolDiff";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
 import type { ToolPort } from "../../lib/runtime-v2";
@@ -9,7 +13,6 @@ import {
   authorizationFor,
   authorizeToolForCurrentTurn,
   boundedToolContent,
-  deriveSubagentCandidates,
   latestAcceptanceFailureSourceWindow,
   modelContextContentForToolOutput,
   modelContextStatusForCompletion,
@@ -58,10 +61,6 @@ export function createRuntimeV2ToolPort(
             12_000,
           );
           input.live.workspaceOverview = overview;
-          input.live.subagentCandidates = deriveSubagentCandidates(
-            overview,
-            String(command.payload.objective || ""),
-          );
           const evidenceId = nextEvidenceId(input.live);
           recordModelContext(input.live, {
             id: evidenceId,
@@ -78,7 +77,6 @@ export function createRuntimeV2ToolPort(
             toolName: "get_project_skeleton",
             target: input.context.runWorkspace || "workspace",
             status: "succeeded",
-            discoveredSubagentScopes: input.live.subagentCandidates.map((candidate) => candidate.scopeKey),
           });
           return {
             type: "observation.recorded",
@@ -239,6 +237,7 @@ export function createRuntimeV2ToolPort(
         );
       }
       try {
+        let diffPreview: ToolDiffPreview | undefined;
         const toolExecutionOptions = {
           toolCatalog: authorizationFor(input).toolCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
@@ -349,6 +348,21 @@ export function createRuntimeV2ToolPort(
                     : "protocol_invalid",
             );
           }
+          try {
+            diffPreview = await buildToolDiffPreview(toolName, args, {
+              workspace: input.context.runWorkspace || "",
+              sessionKey: input.context.runSessionKey,
+            });
+          } catch (error) {
+            input.logStoreEvent("runtime_v2_tool_diff_preview_failed", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              commandKind: command.kind,
+              toolName,
+              target: target || null,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
         const rawOutput = await executeRuntimeV2ToolWithDeadline({
           toolName,
@@ -404,6 +418,7 @@ export function createRuntimeV2ToolPort(
           "succeeded",
           undefined,
           sourceVersion,
+          diffPreview,
         );
         const semanticStatus = modelContextStatusForCompletion(completion);
         recordToolModelContext({

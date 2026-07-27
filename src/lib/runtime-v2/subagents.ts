@@ -8,7 +8,12 @@ export const MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS = 2;
 
 export interface RuntimeV2SubagentScopeCandidate {
   readonly scopeKey: string;
+  readonly sourceToolCallId?: string;
+  readonly name?: string;
+  readonly role?: string;
   readonly objective: string;
+  readonly successCriteria?: string;
+  readonly expectedOutput?: string;
   readonly allowedPaths: readonly string[];
 }
 
@@ -35,6 +40,7 @@ function pathsOverlap(left: string, right: string): boolean {
   const a = normalizedPath(left);
   const b = normalizedPath(right);
   if (!a || !b) return true;
+  if (a === "." || b === ".") return true;
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
@@ -49,19 +55,21 @@ export function areReadOnlySubagentScopesDisjoint(
 }
 
 /**
- * Schedule at most two genuinely independent, frozen read-only scopes. This
- * makes collaboration a runtime decision rather than a sequence of model
- * tool-call suggestions.
+ * Materialize at most two genuinely independent, frozen read-only scopes from
+ * provider-authored spawn_subagent calls. Runtime validates identity,
+ * capacity and path isolation; it never invents a task name or objective.
  */
 export function scheduleReadOnlySubagents(input: {
   readonly parentRun: RuntimeV2RunIdentity;
   readonly candidates: readonly RuntimeV2SubagentScopeCandidate[];
+  readonly existingJobs?: readonly RuntimeV2SubagentJob[];
   readonly requestedAt: number;
   readonly nextId: (scope: string) => string;
 }): RuntimeV2SubagentScheduleDecision {
   const jobs: RuntimeV2SubagentJob[] = [];
   const rejectedScopeKeys: string[] = [];
-  const seenScopeKeys = new Set<string>();
+  const existingJobs = input.existingJobs || [];
+  const seenScopeKeys = new Set(existingJobs.map((job) => job.scopeKey));
   for (const candidate of input.candidates) {
     const scopeKey = text(candidate.scopeKey, 256);
     const objective = text(candidate.objective, 2_000);
@@ -71,9 +79,12 @@ export function scheduleReadOnlySubagents(input: {
       continue;
     }
     seenScopeKeys.add(scopeKey);
-    if (jobs.length >= MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS || jobs.some((job) =>
-      !areReadOnlySubagentScopesDisjoint(job.allowedPaths, allowedPaths)
-    )) {
+    if (
+      existingJobs.length + jobs.length >= MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS ||
+      [...existingJobs, ...jobs].some((job) =>
+        !areReadOnlySubagentScopesDisjoint(job.allowedPaths, allowedPaths)
+      )
+    ) {
       rejectedScopeKeys.push(scopeKey);
       continue;
     }
@@ -90,8 +101,23 @@ export function scheduleReadOnlySubagents(input: {
         attemptId: `${input.parentRun.attemptId}:child:${id}`,
       },
       parentRunId: input.parentRun.runId,
+      ...(text(candidate.sourceToolCallId, 256)
+        ? { sourceToolCallId: text(candidate.sourceToolCallId, 256) }
+        : {}),
       scopeKey,
+      ...(text(candidate.name, 128)
+        ? { name: text(candidate.name, 128) }
+        : {}),
+      ...(text(candidate.role, 128)
+        ? { role: text(candidate.role, 128) }
+        : {}),
       objective,
+      ...(text(candidate.successCriteria, 1_000)
+        ? { successCriteria: text(candidate.successCriteria, 1_000) }
+        : {}),
+      ...(text(candidate.expectedOutput, 1_000)
+        ? { expectedOutput: text(candidate.expectedOutput, 1_000) }
+        : {}),
       allowedPaths,
       status: "queued",
       requestedAt: input.requestedAt,
@@ -99,18 +125,6 @@ export function scheduleReadOnlySubagents(input: {
       closedAt: null,
       summary: null,
     });
-  }
-  // Collaboration is worth starting only when there are two independent
-  // scopes to overlap. A single child only adds another lifecycle and join
-  // surface while giving the parent no concurrency benefit.
-  if (jobs.length < 2) {
-    return {
-      jobs: [],
-      rejectedScopeKeys: [...new Set([
-        ...rejectedScopeKeys,
-        ...jobs.map((job) => job.scopeKey),
-      ])],
-    };
   }
   return { jobs, rejectedScopeKeys };
 }

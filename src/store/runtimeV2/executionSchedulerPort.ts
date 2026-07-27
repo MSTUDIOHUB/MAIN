@@ -21,6 +21,7 @@ import {
   type RuntimeV2ChildResult,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
+import { aggregateForCurrentTurn } from "./executionAggregate";
 
 const READ_ONLY_CHILD_TOOL_NAMES = new Set([
   "list_directory",
@@ -35,6 +36,75 @@ const CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((definition) =>
 );
 const RUNTIME_V2_CHILD_DEADLINE_MS = 90_000;
 
+function boundedArgument(
+  value: unknown,
+  max: number,
+): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function commaSeparatedPaths(value: unknown): string[] {
+  return String(value || "")
+    .split(/[\n,]/)
+    .map((entry) =>
+      entry.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "")
+    )
+    .filter((entry) =>
+      !!entry &&
+      !entry.startsWith("/") &&
+      !/^[A-Za-z]:\//.test(entry) &&
+      !entry.split("/").includes("..")
+    )
+    .slice(0, 6);
+}
+
+function modelSelectedCandidate(
+  command: Parameters<
+    NonNullable<SchedulerPort["prepareSchedule"]>
+  >[0]["command"],
+) {
+  const args =
+    command.payload.arguments &&
+      typeof command.payload.arguments === "object" &&
+      !Array.isArray(command.payload.arguments)
+      ? command.payload.arguments as Record<string, unknown>
+      : {};
+  const taskKey = boundedArgument(args.task_key, 256);
+  const name = boundedArgument(args.name, 128);
+  const role = boundedArgument(args.role, 128);
+  const objective = boundedArgument(args.objective, 2_000);
+  const successCriteria = boundedArgument(args.success_criteria, 1_000);
+  const accessMode = boundedArgument(args.access_mode, 32) || "read";
+  const taskKind = boundedArgument(args.task_kind, 32) || "explore";
+  if (
+    !taskKey ||
+    !name ||
+    !role ||
+    !objective ||
+    !successCriteria
+  ) {
+    throw new Error(
+      "spawn_subagent requires model-selected task_key, name, role, objective, and success_criteria.",
+    );
+  }
+  if (accessMode !== "read" || taskKind === "implement") {
+    throw new Error(
+      "Runtime v2 collaboration currently accepts read-only explore, review, or validation investigations only.",
+    );
+  }
+  const allowedPaths = commaSeparatedPaths(args.allowed_paths);
+  return {
+    sourceToolCallId: boundedArgument(command.payload.toolCallId, 256),
+    scopeKey: taskKey,
+    name,
+    role,
+    objective,
+    successCriteria,
+    expectedOutput: boundedArgument(args.expected_output, 1_000),
+    allowedPaths: allowedPaths.length > 0 ? allowedPaths : ["."],
+  };
+}
+
 async function runReadOnlyChild(input: {
   job: RuntimeV2SubagentJob;
   ports: RuntimeV2ExecutionPortsInput;
@@ -47,11 +117,19 @@ async function runReadOnlyChild(input: {
       role: "system",
       content: [
         "You are a read-only child investigator in MAIN Runtime v2.",
+        `Name: ${input.job.name || input.job.scopeKey}`,
+        `Role: ${input.job.role || "read-only investigator"}`,
         `Scope key: ${input.job.scopeKey}`,
         `Allowed paths: ${input.job.allowedPaths.join(", ")}`,
+        input.job.successCriteria
+          ? `Success criteria: ${input.job.successCriteria}`
+          : "",
+        input.job.expectedOutput
+          ? `Expected output: ${input.job.expectedOutput}`
+          : "",
         "Use only provided read/search tools. Never write files, run shell commands, ask for approval, or address the end user.",
         `Return a concise evidence report in ${language}, with exact paths and uncertainty.`,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
     },
     { role: "user", content: input.job.objective },
   ];
@@ -194,14 +272,19 @@ export function createRuntimeV2SchedulerPort(
   return {
     async prepareSchedule({ command }) {
       if (command.kind !== "schedule_subagents") return null;
+      const existingJobs =
+        aggregateForCurrentTurn(input)?.subagents || [];
       const decision = scheduleReadOnlySubagents({
         parentRun: command.run,
-        candidates: input.live.subagentCandidates,
+        candidates: [modelSelectedCandidate(command)],
+        existingJobs,
         requestedAt: input.now(),
         nextId: input.nextId,
       });
-      if (decision.jobs.length !== 2) {
-        throw new Error("Runtime v2 requires two disjoint read-only child scopes before scheduling collaboration.");
+      if (decision.jobs.length !== 1) {
+        throw new Error(
+          `The model-selected child task could not be scheduled within the read-only capacity and path-isolation contract: ${decision.rejectedScopeKeys.join(", ") || "invalid scope"}.`,
+        );
       }
       return {
         type: "subagents.scheduled",
@@ -211,11 +294,18 @@ export function createRuntimeV2SchedulerPort(
     },
     async execute({ command, signal, scheduledSubagents }) {
       if (command.kind === "schedule_subagents") {
-        const jobs = (scheduledSubagents || []).filter((job) =>
-          job.status === "queued" || job.status === "running"
+        const sourceToolCallId = boundedArgument(
+          command.payload.toolCallId,
+          256,
         );
-        if (jobs.length !== 2) {
-          throw new Error("Runtime v2 scheduler can only start or resume the two child jobs already committed in its ledger.");
+        const jobs = (scheduledSubagents || []).filter((job) =>
+          (job.status === "queued" || job.status === "running") &&
+          (!sourceToolCallId || job.sourceToolCallId === sourceToolCallId)
+        );
+        if (jobs.length === 0) {
+          throw new Error(
+            "Runtime v2 scheduler could not resolve the child job committed for this spawn_subagent call.",
+          );
         }
         const events: RuntimeV2EventDraft[] = [];
         input.logStoreEvent("runtime_v2_subagent_batch_starting", {
@@ -223,7 +313,9 @@ export function createRuntimeV2SchedulerPort(
           runId: command.run.runId,
           jobCount: jobs.length,
           scopes: jobs.map((job) => job.scopeKey),
-          concurrent: jobs.length === 2,
+          concurrent: (scheduledSubagents || []).filter((job) =>
+            job.status === "queued" || job.status === "running"
+          ).length > 1,
           resumed: jobs.some((job) => job.status === "running"),
         });
         for (const job of jobs) {
@@ -262,6 +354,16 @@ export function createRuntimeV2SchedulerPort(
         const jobIds = Array.isArray(command.payload.jobIds)
           ? command.payload.jobIds.map((value) => String(value || "")).filter(Boolean)
           : [];
+        const requestedJobIds = Array.isArray(command.payload.requestedJobIds)
+          ? command.payload.requestedJobIds
+              .map((value) => String(value || "").trim())
+              .filter(Boolean)
+          : [];
+        if (requestedJobIds.length > 0 && jobIds.length === 0) {
+          throw new Error(
+            `wait_subagents did not match an active child id: ${requestedJobIds.join(", ")}`,
+          );
+        }
         const results = await Promise.all(jobIds.map(async (jobId) => {
           const promise = input.live.childRuns.get(jobId);
           if (promise) return await promise;
@@ -317,9 +419,9 @@ export function createRuntimeV2SchedulerPort(
             closedAt: telemetry?.closedAt || input.now(),
             summary: result.summary,
           });
-          // This enters only the parent model's evidence context. The UI
-          // projection remains a concise structured milestone, so a child's
-          // untrusted prose never becomes a duplicate ChatArea narration.
+          // This enters the parent model's evidence context and the structured
+          // Subagents panel. Child prose never becomes Runtime-authored
+          // ChatArea narration.
           recordModelContext(input.live, {
             id: `child:${result.job.id}`,
             source: "subagent",

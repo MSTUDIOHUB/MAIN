@@ -117,15 +117,19 @@ export function reconcileRuntimeV2SubagentEvents(
           id: job.id,
           parentTurnId: run.turnId,
           threadId: run.sessionKey,
-          name: job.scopeKey,
-          role: language === "zh" ? "只读调查" : "Read-only investigation",
+          name: job.name || job.scopeKey,
+          role: job.role || (
+            language === "zh" ? "只读调查" : "Read-only investigation"
+          ),
           objective: job.objective,
           scopeKey: job.scopeKey,
           scope: job.allowedPaths.join(", "),
           allowedPaths: [...job.allowedPaths],
-          expectedOutput: language === "zh"
-            ? "返回带来源的只读调查证据"
-            : "Return sourced read-only investigation evidence",
+          expectedOutput: job.expectedOutput || (
+            language === "zh"
+              ? "返回带来源的只读调查证据"
+              : "Return sourced read-only investigation evidence"
+          ),
           runId: job.run.runId,
           parentRunId: job.parentRunId,
           status: "queued",

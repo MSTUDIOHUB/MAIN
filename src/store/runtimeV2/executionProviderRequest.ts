@@ -78,19 +78,67 @@ function providerModeInstruction(
   toolSurface: {
     readonly hasReadFile: boolean;
     readonly hasMutation: boolean;
+    readonly hasSpawnSubagent: boolean;
+    readonly hasWaitSubagents: boolean;
     readonly mutationLease: RuntimeV2MutationLease | null;
   } = {
     hasReadFile: false,
     hasMutation: false,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
     mutationLease: null,
   },
 ): string {
   const mode = String(command.payload.mode || "").trim();
+  const collaborationAction = String(
+    command.payload.collaborationAction || "",
+  ).trim();
+  const activeSubagents = Array.isArray(command.payload.activeSubagents)
+    ? command.payload.activeSubagents
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") return "";
+          const record = entry as Record<string, unknown>;
+          const id = String(record.id || "").trim();
+          const name = String(record.name || "").trim();
+          const objective = String(record.objective || "").trim();
+          return id
+            ? `${name || id} (${id}): ${objective}`.slice(0, 600)
+            : "";
+        })
+        .filter(Boolean)
+    : [];
+  if (
+    (mode === "observe" || mode === "analyze") &&
+    collaborationAction === "spawn_required"
+  ) {
+    return [
+      "Current phase: model-selected collaboration.",
+      "Call spawn_subagent exactly once before any parent workspace read.",
+      "You must choose a fresh semantic task key, a real display name and role, a narrow evidence objective, success criteria, and the least read-only path scope needed.",
+      "Do not invent work from top-level directory names or generic architecture-layer labels; the delegated responsibility must follow the user's actual objective and current evidence.",
+    ].join(" ");
+  }
   switch (mode) {
     case "observe":
-      return "Current phase: bounded read-only investigation. Use exactly one focused read or search action to collect a concrete missing fact. Mutation and validation tools are unavailable; do not propose or simulate an edit.";
+      return [
+        "Current phase: bounded read-only investigation. Use exactly one focused read or search action to collect a concrete missing fact. Mutation and validation tools are unavailable; do not propose or simulate an edit.",
+        toolSurface.hasWaitSubagents
+          ? `Read-only child work is active (${activeSubagents.join("; ")}). Continue only genuinely independent parent work, or call wait_subagents before relying on or concluding from child results.`
+          : "",
+        toolSurface.hasSpawnSubagent
+          ? "spawn_subagent is available only when you identify another semantic, independent read-only investigation with concrete success criteria; choose its name, role, objective and scope yourself."
+          : "",
+      ].filter(Boolean).join(" ");
     case "analyze":
-      return "Current phase: bounded read-only workspace analysis. Use at most one focused read/search action when a concrete fact is missing. When the evidence is sufficient, return one complete Markdown answer with no tool call. Never request a mutation, shell command, browser action, or validation.";
+      return [
+        "Current phase: bounded read-only workspace analysis. Use at most one focused read/search action when a concrete fact is missing. When the evidence is sufficient, return one complete Markdown answer with no tool call. Never request a mutation, shell command, browser action, or validation.",
+        toolSurface.hasWaitSubagents
+          ? `Read-only child work is active (${activeSubagents.join("; ")}). Call wait_subagents before the final answer if its result is still relevant.`
+          : "",
+        toolSurface.hasSpawnSubagent
+          ? "You may call spawn_subagent only for a semantic independent investigation; its name, role, objective, success criteria and read scope must be your actual task design."
+          : "",
+      ].filter(Boolean).join(" ");
     case "execute":
       return command.payload.executePolicy === "source_refresh_required"
         ? "Current phase: corrective source refresh. Read the exact primary file window reported by the latest failed validator or stale mutation. Only read_file is available; do not survey other files or propose a mutation until this source snapshot is committed."
@@ -198,6 +246,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
             toolNames.has("replace_in_file") ||
             toolNames.has("apply_patch") ||
             toolNames.has("write_file"),
+          hasSpawnSubagent: toolNames.has("spawn_subagent"),
+          hasWaitSubagents: toolNames.has("wait_subagents"),
           mutationLease,
         },
       ),
@@ -232,6 +282,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     excludedMutationTool,
     retainedEvidenceEntries: history.retained,
     droppedEvidenceEntries: history.dropped,
+    conversationHistoryMessages: history.historyMessages,
+    priorConversationTurns: history.priorTurns,
     availableContextEntries: input.live.modelContext.length,
     contextSources: Object.fromEntries(
       ["workspace", "tool", "subagent", "provider", "plan"].map((source) => [

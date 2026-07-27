@@ -1247,6 +1247,11 @@ export interface SubmitSemanticMetadataDecision<TConfig extends object> {
     language: "zh" | "en";
     config: TConfig;
     contextSignals: TurnInputContextSignals;
+    priorTurnContext?: {
+      userPrompt: string;
+      title: string;
+      summary: string;
+    };
   };
 }
 
@@ -1970,6 +1975,11 @@ export function resolveSubmitSemanticMetadataDecision<TConfig extends object>(pa
   preferredLanguage: "zh" | "en";
   currentConfig: TConfig;
   contextSignals?: TurnInputContextLike;
+  priorTurnContext?: {
+    userPrompt?: string | null;
+    title?: string | null;
+    summary?: string | null;
+  } | null;
   titleIntentSignature: string;
   seededSessionTitleCandidate: string;
 }): SubmitSemanticMetadataDecision<TConfig> | null {
@@ -1996,6 +2006,19 @@ export function resolveSubmitSemanticMetadataDecision<TConfig extends object>(pa
       language: params.preferredLanguage,
       config: params.currentConfig,
       contextSignals: normalizeTurnInputContextSignals(params.contextSignals),
+      ...(params.priorTurnContext
+        ? {
+            priorTurnContext: {
+              userPrompt: String(
+                params.priorTurnContext.userPrompt || "",
+              ).trim().slice(0, 800),
+              title: String(params.priorTurnContext.title || "")
+                .trim().slice(0, 160),
+              summary: String(params.priorTurnContext.summary || "")
+                .trim().slice(0, 1_200),
+            },
+          }
+        : {}),
     },
   };
 }
