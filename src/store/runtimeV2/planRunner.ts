@@ -50,6 +50,7 @@ import {
   providerPlanMessages,
   workPlanDraftFromSubmission,
   type PlanModelStage,
+  type PlanProviderTransport,
 } from "./planModelProtocol";
 
 type StoreGet = () => any;
@@ -349,6 +350,7 @@ export async function runSubmitRuntimeV2Plan(
     let round = 0;
     let discoveryActionCount = 0;
     let stage: PlanModelStage = "discovery";
+    let synthesisTransport: PlanProviderTransport = "native_tool";
     let synthesisRecoveryCount = 0;
     const deadlineAt = startedAt + PLAN_MODEL_DEADLINE_MS;
     const discoveryDeadlineAt = startedAt + PLAN_DISCOVERY_DEADLINE_MS;
@@ -429,6 +431,9 @@ export async function runSubmitRuntimeV2Plan(
           evidenceContents,
           compactRecovery:
             stage === "synthesis" && synthesisRecoveryCount > 0,
+          transport: stage === "synthesis"
+            ? synthesisTransport
+            : "native_tool",
           logStoreEvent: input.logStoreEvent,
         });
       } catch (error) {
@@ -506,6 +511,38 @@ export async function runSubmitRuntimeV2Plan(
         await ledger.recordSoftSignal(identity.run, response.visibleText?.trim()
           ? "no_tool_call"
           : "empty_response");
+        if (
+          stage === "synthesis" &&
+          synthesisTransport === "native_tool"
+        ) {
+          await ledger.recordRecovery({
+            run: identity.run,
+            scope: "transport",
+            fingerprint: "plan:synthesis:native-tool-no-action",
+            reason: "原生计划提交协议没有产生结构化动作。",
+          });
+          synthesisTransport = "structured_response";
+          input.logStoreEvent("runtime_v2_plan_provider_transport_fallback", {
+            turnId: identity.turn.turnId,
+            runId: identity.run.runId,
+            round,
+            from: "native_tool",
+            to: "structured_response",
+            reason: "no_structured_action",
+          });
+          continue;
+        }
+        if (
+          stage === "synthesis" &&
+          synthesisTransport === "structured_response"
+        ) {
+          terminalFailure = {
+            resultKind: evidence.length > 0 ? "partial" : "error",
+            reason: "原生工具和结构化响应两种计划提交协议均未产生可验证动作；已保留证据并明确结束本轮。",
+            detailCode: "runtime_v2_plan_transport_variants_exhausted",
+          };
+          break;
+        }
         const canContinue = await ledger.recordRecovery({
           run: identity.run,
           scope: "transport",

@@ -118,10 +118,25 @@ export const PLAN_MODEL_TOOLS = [
 ];
 
 export type PlanModelStage = "discovery" | "synthesis";
+export type PlanProviderTransport = "native_tool" | "structured_response";
 
 export function isPlanSubmissionStage(stage: PlanModelStage): boolean {
   return stage === "synthesis";
 }
+
+/**
+ * Providers that ignore native tool_choice may still support a constrained
+ * response format. The result must pass the same WorkPlan compiler and
+ * validator as a native call; this schema does not grant lifecycle authority.
+ */
+export const WORK_PLAN_STRUCTURED_RESPONSE_FORMAT: Readonly<Record<string, unknown>> = {
+  type: "json_schema",
+  json_schema: {
+    name: "runtime_v2_work_plan_submission",
+    strict: false,
+    schema: SUBMIT_WORK_PLAN_TOOL.function.parameters,
+  },
+};
 
 export function boundedPlanContent(
   value: unknown,
@@ -239,6 +254,7 @@ export function synthesisPlanTranscript(input: {
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
   readonly evidenceContents: ReadonlyMap<string, string>;
   readonly compactRecovery: boolean;
+  readonly transport: PlanProviderTransport;
 }): AgentMessage[] {
   let lastSubmissionOutcomeIndex = -1;
   for (let index = input.messages.length - 1; index >= 0; index -= 1) {
@@ -299,13 +315,37 @@ export function synthesisPlanTranscript(input: {
             ]
           : []),
         [
-          "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
+          input.transport === "structured_response"
+            ? "The read-only discovery window is closed. Return exactly one JSON object matching the supplied runtime_v2_work_plan_submission schema. Do not add prose or a Markdown fence."
+            : "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
           "Before submitting, reconcile the retained evidence into a concrete causal chain and include only source owners that the evidence supports.",
           "Use observable bounded validation. Do not put dev servers or manual instructions in finite command fields.",
         ].join(" "),
       ].join(" "),
     },
   ];
+}
+
+/**
+ * Parse only a complete JSON response (or one complete JSON fence). Unlike
+ * safeJsonParse this never searches prose for braces, so commentary cannot be
+ * promoted into a lifecycle action.
+ */
+export function decodeExactStructuredPlanResponse(
+  value: unknown,
+): Record<string, unknown> | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const fenced = raw.match(/^```(?:json)?\s*([\s\S]+?)\s*```$/i);
+  const candidate = fenced ? fenced[1]!.trim() : raw;
+  try {
+    const parsed = JSON.parse(candidate);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export function safeJsonParse(text: string): unknown {

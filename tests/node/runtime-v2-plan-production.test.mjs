@@ -67,6 +67,7 @@ const approval = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planApprov
 const handoff = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planHandoff.ts"));
 const engineSelection = loadTs(path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"));
 const runIntent = loadTs(path.join(workspaceRoot, "src/lib/runIntent.ts"));
+const planProtocol = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planModelProtocol.ts"));
 
 const turn = {
   workspaceKey: "/fixture",
@@ -673,6 +674,122 @@ test("Plan discovery has a bounded action window and then exposes only the minim
   );
 });
 
+test("Plan synthesis falls back once from ignored native tools to a schema-bound response", async () => {
+  let providerRound = 0;
+  const synthesisRequests = [];
+  const submission = {
+    planMarkdown: "根因位于文件打开状态的所有权；修改保持现有工具边界。",
+    changes: [{
+      title: "统一标签生命周期",
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "打开文件时替换仍为空白且未修改的初始标签。",
+      expectedOutcome: "只显示当前文件标签。",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run build",
+      cwd: "/fixture",
+      expectedOutcome: "构建通过。",
+      required: true,
+    }],
+  };
+  const result = await runProductionPlanScenario(
+    async (messages, _settings, _callbacks, _signal, tools, maxTokens, options) => {
+      providerRound += 1;
+      if (providerRound <= 8) {
+        return {
+          content: "",
+          toolCalls: [{
+            id: `read-before-fallback-${providerRound}`,
+            name: "read_file",
+            arguments: JSON.stringify({ path: "src/main.js" }),
+          }],
+          usage: {},
+          protocolViolation: null,
+        };
+      }
+      synthesisRequests.push({ messages, tools, maxTokens, options });
+      if (providerRound === 9) {
+        return {
+          content: "I need to call submit_runtime_v2_work_plan, but I am still describing its parameters.",
+          toolCalls: [],
+          finishReason: "length",
+          usage: {},
+          protocolViolation: null,
+        };
+      }
+      return {
+        content: JSON.stringify(submission),
+        toolCalls: [],
+        finishReason: "stop",
+        usage: {},
+        protocolViolation: null,
+      };
+    },
+    async (name) => {
+      if (name === "get_project_skeleton") return "src/main.js";
+      if (name === "read_file") return "const openFile = true;";
+      if (name === "write_file") return "written";
+      throw new Error(`unexpected tool ${name}`);
+    },
+  );
+
+  assert.equal(providerRound, 10);
+  assert.equal(result.settlement.outcome.status, "paused");
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.equal(synthesisRequests[0].maxTokens, 4_096);
+  assert.deepEqual(
+    synthesisRequests[0].tools.map((tool) => tool.function.name),
+    ["submit_runtime_v2_work_plan"],
+  );
+  assert.deepEqual(synthesisRequests[0].options.toolChoice, {
+    type: "function",
+    function: { name: "submit_runtime_v2_work_plan" },
+  });
+  assert.equal(synthesisRequests[1].maxTokens, 4_096);
+  assert.deepEqual(synthesisRequests[1].tools, []);
+  assert.equal(synthesisRequests[1].options.toolChoice, undefined);
+  assert.equal(synthesisRequests[1].options.responseFormat.type, "json_schema");
+  assert.match(
+    synthesisRequests[1].messages
+      .map((message) => String(message.content || ""))
+      .join("\n"),
+    /Return exactly one JSON object/,
+  );
+  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 1);
+  assert.ok(result.checkpoint.aggregate.events.some((event) =>
+    event.type === "provider.responded" &&
+    event.result.diagnostics.some((diagnostic) =>
+      diagnostic.code === "structured_response_adapted"
+    )
+  ));
+});
+
+test("schema-bound Plan response ingress never searches surrounding prose for JSON", () => {
+  const submission = {
+    planMarkdown: "Plan",
+    changes: [{ targets: ["src/main.js"], change: "Change it." }],
+    validations: [{ kind: "assertion", expectedOutcome: "Works." }],
+  };
+  assert.deepEqual(
+    planProtocol.decodeExactStructuredPlanResponse(JSON.stringify(submission)),
+    submission,
+  );
+  assert.deepEqual(
+    planProtocol.decodeExactStructuredPlanResponse(
+      `\`\`\`json\n${JSON.stringify(submission)}\n\`\`\``,
+    ),
+    submission,
+  );
+  assert.equal(
+    planProtocol.decodeExactStructuredPlanResponse(
+      `Here is the plan:\n${JSON.stringify(submission)}`,
+    ),
+    null,
+  );
+});
+
 test("a closed synthesis request gets one compact sequential recovery without overlap", async () => {
   let providerRound = 0;
   let activeRequests = 0;
@@ -754,7 +871,7 @@ test("a closed synthesis request gets one compact sequential recovery without ov
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(result.checkpoint.aggregate.scheduledCommands.length, 0);
   assert.equal(synthesisRequests.length, 2);
-  assert.equal(synthesisRequests[0].maxTokens, undefined);
+  assert.equal(synthesisRequests[0].maxTokens, 4_096);
   assert.equal(synthesisRequests[1].maxTokens, 4_096);
   assert.ok(
     synthesisRequests[1].messages.reduce(

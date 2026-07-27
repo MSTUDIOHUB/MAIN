@@ -16,11 +16,14 @@ import {
   PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS,
   SUBMIT_WORK_PLAN_TOOL,
   SUBMIT_WORK_PLAN_TOOL_NAME,
+  WORK_PLAN_STRUCTURED_RESPONSE_FORMAT,
   boundedPlanTranscript,
+  decodeExactStructuredPlanResponse,
   isPlanProviderRequestTimeout,
   isPlanSubmissionStage,
   synthesisPlanTranscript,
   type PlanModelStage,
+  type PlanProviderTransport,
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 
@@ -41,13 +44,22 @@ export async function requestPlanModel(input: {
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
   readonly evidenceContents: ReadonlyMap<string, string>;
   readonly compactRecovery?: boolean;
+  readonly transport?: PlanProviderTransport;
   readonly logStoreEvent: RuntimeV2PlanLog;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const submissionStage = isPlanSubmissionStage(input.stage);
-  const offeredTools = submissionStage
+  const transport = submissionStage
+    ? input.transport || "native_tool"
+    : "native_tool";
+  const structuredResponse = transport === "structured_response";
+  const offeredTools = structuredResponse
+    ? []
+    : submissionStage
     ? [SUBMIT_WORK_PLAN_TOOL]
     : PLAN_MODEL_TOOLS;
-  const toolChoice = submissionStage
+  const toolChoice = structuredResponse
+    ? undefined
+    : submissionStage
     ? {
         type: "function" as const,
         function: { name: SUBMIT_WORK_PLAN_TOOL_NAME },
@@ -59,6 +71,7 @@ export async function requestPlanModel(input: {
     toolExpectation: "required",
     objective: input.ledger.snapshot()?.objective.text || "",
     evidenceIds: input.ledger.snapshot()?.evidence.map((entry) => entry.id) || [],
+    transport,
   });
   let streamedText = "";
   const requestAbort = new AbortController();
@@ -85,6 +98,7 @@ export async function requestPlanModel(input: {
     ? synthesisPlanTranscript({
         ...input,
         compactRecovery: !!input.compactRecovery,
+        transport,
       })
     : boundedPlanTranscript(input.messages);
   try {
@@ -94,6 +108,7 @@ export async function requestPlanModel(input: {
       evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
       stage: input.stage,
       compactRecovery: !!input.compactRecovery,
+      transport,
       offeredToolCount: offeredTools.length,
       offeredToolNames: offeredTools.map((tool) => tool.function.name),
       promptMessageCount: requestMessages.length,
@@ -113,16 +128,57 @@ export async function requestPlanModel(input: {
       },
       requestAbort.signal,
       offeredTools,
-      input.compactRecovery ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
-      { toolChoice, timeoutMs: requestTimeoutMs },
+      submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
+      {
+        ...(toolChoice ? { toolChoice } : {}),
+        ...(structuredResponse
+          ? { responseFormat: WORK_PLAN_STRUCTURED_RESPONSE_FORMAT }
+          : {}),
+        timeoutMs: requestTimeoutMs,
+      },
     );
+    const rawVisibleText = result.content || streamedText;
+    const structuredCandidate = structuredResponse
+      ? decodeExactStructuredPlanResponse(rawVisibleText)
+      : null;
+    const adaptedToolCalls = structuredResponse
+      ? structuredCandidate
+        ? [{
+            id: `${command.idempotencyKey}:structured-response`,
+            name: SUBMIT_WORK_PLAN_TOOL_NAME,
+            arguments: structuredCandidate,
+          }]
+        : []
+      : result.toolCalls;
     const normalized = normalizeProviderResponseV1({
-      visibleText: result.content || streamedText,
-      toolCalls: result.toolCalls,
+      visibleText: structuredCandidate ? "" : rawVisibleText,
+      toolCalls: adaptedToolCalls,
       usage: result.usage,
-      diagnostics: result.protocolViolation
-        ? [{ code: result.protocolViolation, message: "Plan tool protocol mismatch", retryable: true }]
-        : [],
+      diagnostics: [
+        ...(result.protocolViolation
+          ? [{ code: result.protocolViolation, message: "Plan tool protocol mismatch", retryable: true }]
+          : []),
+        ...(structuredCandidate
+          ? [{
+              code: "structured_response_adapted",
+              message: "A complete schema-bound response was normalized as the sole Plan submission.",
+              retryable: false,
+            }]
+          : []),
+      ],
+    });
+    input.logStoreEvent("runtime_v2_plan_provider_response_shape", {
+      turnId: input.run.turnId,
+      runId: input.run.runId,
+      stage: input.stage,
+      transport,
+      finishReason: result.finishReason || null,
+      contentChars: String(rawVisibleText || "").length,
+      reasoningChars: String(result.reasoningContent || "").length,
+      nativeToolCallCount: result.toolCalls.length,
+      normalizedToolCallCount: normalized.toolCalls.length,
+      exactStructuredObject: !!structuredCandidate,
+      protocolViolation: result.protocolViolation || null,
     });
     await input.ledger.append({
       type: "provider.responded",
@@ -132,13 +188,16 @@ export async function requestPlanModel(input: {
     });
     input.messages.push({
       role: "assistant",
-      content: result.content || streamedText,
-      ...(result.toolCalls.length > 0
+      content: structuredCandidate ? "" : rawVisibleText,
+      ...(normalized.toolCalls.length > 0
         ? {
-            tool_calls: result.toolCalls.map((call) => ({
+            tool_calls: normalized.toolCalls.map((call) => ({
               id: call.id,
               type: "function" as const,
-              function: { name: call.name, arguments: call.arguments },
+              function: {
+                name: call.name,
+                arguments: JSON.stringify(call.arguments),
+              },
             })),
           }
         : {}),
@@ -160,6 +219,7 @@ export async function requestPlanModel(input: {
       turnId: input.run.turnId,
       runId: input.run.runId,
       stage: input.stage,
+      transport,
       timeoutMs: requestTimeoutMs,
       timedOut: providerRequestTimedOut,
       errorName: error instanceof Error ? error.name : "",
