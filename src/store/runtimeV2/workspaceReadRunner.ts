@@ -159,17 +159,6 @@ function settlement(
   };
 }
 
-function shouldUseReadOnlySubagents(
-  state: any,
-  context: RuntimeV2SubmissionContext,
-  candidates: readonly unknown[],
-): boolean {
-  const preference = context.turnInputContextSignals.subagentPreference;
-  return preference !== "forbidden" &&
-    (preference === "preferred" || state.preferSubagents === true) &&
-    candidates.length >= 2;
-}
-
 /**
  * Workspace-bound non-mutating Turns are tasks, not Chat. They receive a
  * finite read-only tool/scheduler surface and a distinct runtime strategy.
@@ -331,12 +320,8 @@ export async function runSubmitRuntimeV2WorkspaceRead(
       }
 
       const drove = await controller.driveOnce({
-        allowReadOnlySubagents: shouldUseReadOnlySubagents(
-          input.get(),
-          input.context,
-          live.subagentCandidates,
-        ),
-        hasReadOnlySubagentScopes: live.subagentCandidates.length >= 2,
+        subagentPreference:
+          input.context.turnInputContextSignals.subagentPreference,
       });
       if (!drove) {
         await controller.driveOnce({

@@ -107,6 +107,151 @@ function payloadPassesVariableAsKey(
   ).test(payload);
 }
 
+const STANDARD_BARE_CALLS = new Set([
+  "alert",
+  "clearInterval",
+  "clearTimeout",
+  "confirm",
+  "fetch",
+  "parseFloat",
+  "parseInt",
+  "prompt",
+  "queueMicrotask",
+  "requestAnimationFrame",
+  "setInterval",
+  "setTimeout",
+  "structuredClone",
+]);
+
+/** Preserve source offsets while removing comments and literals from the
+ * lightweight call-site scan. Without this lexical boundary, prose such as
+ * `set programmatically (for example)` in a comment is misclassified as a
+ * JavaScript call and creates a false acceptance failure. */
+function maskJsCommentsAndLiterals(source: string): string {
+  const output = [...source];
+  const mask = (index: number) => {
+    if (output[index] !== "\n" && output[index] !== "\r") output[index] = " ";
+  };
+  for (let index = 0; index < output.length;) {
+    const current = output[index]!;
+    const next = output[index + 1] || "";
+    if (current === "/" && next === "/") {
+      mask(index);
+      mask(index + 1);
+      index += 2;
+      while (index < output.length && output[index] !== "\n") {
+        mask(index);
+        index += 1;
+      }
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      mask(index);
+      mask(index + 1);
+      index += 2;
+      while (
+        index < output.length &&
+        !(output[index] === "*" && output[index + 1] === "/")
+      ) {
+        mask(index);
+        index += 1;
+      }
+      if (index < output.length) {
+        mask(index);
+        mask(index + 1);
+        index += 2;
+      }
+      continue;
+    }
+    if (current === "'" || current === '"' || current === "`") {
+      const quote = current;
+      mask(index);
+      index += 1;
+      while (index < output.length) {
+        const value = output[index]!;
+        mask(index);
+        index += 1;
+        if (value === "\\") {
+          if (index < output.length) {
+            mask(index);
+            index += 1;
+          }
+          continue;
+        }
+        if (value === quote) break;
+      }
+      continue;
+    }
+    index += 1;
+  }
+  return output.join("");
+}
+
+function bareCallSites(source: string): Array<{ name: string; index: number }> {
+  const sites: Array<{ name: string; index: number }> = [];
+  const executableSource = maskJsCommentsAndLiterals(source);
+  const pattern = /(^|[^\w$.])([A-Za-z_$][\w$]*)\s*\(/gm;
+  for (const match of executableSource.matchAll(pattern)) {
+    const name = String(match[2] || "");
+    if (
+      !name ||
+      ["catch", "for", "function", "if", "switch", "while", "with"].includes(name)
+    ) {
+      continue;
+    }
+    sites.push({
+      name,
+      index: (match.index || 0) + String(match[1] || "").length,
+    });
+  }
+  return sites;
+}
+
+function hasCallableDeclaration(source: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return [
+    new RegExp(`\\b(?:async\\s+)?function\\s+${escaped}\\s*\\(`),
+    new RegExp(`\\b(?:const|let|var)\\s+${escaped}\\b`),
+    new RegExp(`\\b(?:const|let|var)\\s*\\{[^}]*\\b${escaped}\\b[^}]*\\}\\s*=`, "s"),
+    new RegExp(`\\bimport\\s+${escaped}\\b`),
+    new RegExp(`\\bimport\\s*\\{[^}]*\\b${escaped}\\b[^}]*\\}`, "s"),
+    new RegExp(`\\bfunction\\s*\\([^)]*\\b${escaped}\\b[^)]*\\)`),
+    new RegExp(`(?:\\(|,)\\s*${escaped}\\s*(?:,|\\))\\s*=>`),
+  ].some((pattern) => pattern.test(source));
+}
+
+/**
+ * Fixture validation catches a class of regressions that a bundler accepts:
+ * a repair introduces a new bare function call but neither declares nor
+ * imports it. Comparing with the pre-run source avoids relabeling intentional
+ * legacy globals as new failures.
+ */
+export function getNewUndeclaredCallGaps(input: {
+  path: string;
+  before: string;
+  after: string;
+}): string[] {
+  const previousCalls = new Set(bareCallSites(input.before).map((site) => site.name));
+  const reported = new Set<string>();
+  return bareCallSites(input.after).flatMap((site) => {
+    if (
+      previousCalls.has(site.name) ||
+      STANDARD_BARE_CALLS.has(site.name) ||
+      reported.has(site.name) ||
+      hasCallableDeclaration(input.after, site.name)
+    ) {
+      return [];
+    }
+    reported.add(site.name);
+    return [sourceGapAtIndex({
+      path: input.path,
+      source: input.after,
+      index: site.index,
+      message: `new call ${site.name}() has no local declaration or import; remove the invented dependency or bind it to an existing API`,
+    })];
+  });
+}
+
 /**
  * Source-level acceptance oracle for the real MD Viewer Execute replay.
  * It validates the exact four-owner incident described by the user instead of
@@ -143,6 +288,17 @@ export function getMdViewerExecutionGaps(
   const callerUsesPatchedSetValue = /\.setValue\s*\(/.test(callerSetEditorValue);
   const patchedSetValueDispatchesInput =
     /dispatchEvent\s*\(\s*new\s+Event\s*\(\s*["']input["']/.test(patchedSetValue);
+  if (
+    /\bfunction\s+renderEditor\b/.test(sources.editor) &&
+    !/id\s*=\s*["']tabs-container["']/.test(sources.editor)
+  ) {
+    gaps.push(sourceGap({
+      path: OWNER_PATHS.editor,
+      source: sources.editor,
+      pattern: /\bfunction\s+renderEditor\b/,
+      message: "renderEditor must preserve the existing tabs-container host; removing the canonical tab UI breaks title state instead of repairing it",
+    }));
+  }
   if (callerUsesPatchedSetValue && patchedSetValueDispatchesInput) {
     gaps.push(sourceGap({
       path: OWNER_PATHS.editor,
@@ -167,7 +323,7 @@ export function getMdViewerExecutionGaps(
   const bootstrapsPristineInitialTab =
     /\bactiveFiles\.push\s*\(\s*initialFile\s*\)/.test(sources.caller);
   const appendsOpenedFile = /\bactiveFiles\.push\s*\(\s*fileEntry\s*\)/.test(openFilesBody);
-  const guardsPristineInitialTab =
+  const directInitialTabGuard =
     /\bactiveFiles\.length\s*===?\s*1\b/.test(openFilesBody) &&
     (
       /!\s*activeFiles\s*\[\s*0\s*\]\.path\b/.test(openFilesBody) ||
@@ -178,11 +334,52 @@ export function getMdViewerExecutionGaps(
       /activeFiles\s*\[\s*0\s*\]\.isDirty\s*===?\s*false\b/.test(openFilesBody) ||
       /!\s*activeFiles\s*\[\s*0\s*\]\.isDirty\b/.test(openFilesBody)
     );
+  const pristineLookup = [...openFilesBody.matchAll(
+    /\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*activeFiles\.findIndex\s*\(\s*([A-Za-z_$][\w$]*)\s*=>\s*([^;]+)\);/g,
+  )].find((match) => {
+    const entry = String(match[2] || "").replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
+    const predicate = String(match[3] || "");
+    return !!entry &&
+      new RegExp(`!\\s*${entry}\\.path\\b`).test(predicate) &&
+      new RegExp(`!\\s*${entry}\\.isDirty\\b`).test(predicate) &&
+      (
+        new RegExp(`${entry}\\.content\\s*===?\\s*["']{2}`).test(predicate) ||
+        new RegExp(`!\\s*${entry}\\.content\\b`).test(predicate) ||
+        new RegExp(`${entry}\\.content\\.trim\\(\\)\\s*===?\\s*["']{2}`).test(
+          predicate,
+        )
+      );
+  });
+  const pristineIndexName = pristineLookup?.[1] || "";
+  const pristineEntryName = pristineLookup?.[2] || "";
+  const pristinePredicate = pristineLookup?.[3] || "";
+  const escapedEntry = pristineEntryName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const guardedPristineLookup = !!pristineIndexName &&
+    !!escapedEntry &&
+    !!pristinePredicate;
+  const guardsPristineInitialTab =
+    directInitialTabGuard || guardedPristineLookup;
+  const escapedIndex = pristineIndexName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const replacesPristineInitialTab =
     /\bactiveFiles\s*\[\s*0\s*\]\s*=\s*fileEntry\b/.test(openFilesBody) ||
-    /\bactiveFiles\.splice\s*\(\s*0\s*,\s*1\s*,\s*fileEntry\s*\)/.test(openFilesBody);
+    /\bactiveFiles\.splice\s*\(\s*0\s*,\s*1\s*,\s*fileEntry\s*\)/.test(openFilesBody) ||
+    (
+      !!escapedIndex &&
+      new RegExp(
+        `\\bactiveFiles\\s*\\[\\s*${escapedIndex}\\s*\\]\\s*=\\s*fileEntry\\b`,
+      ).test(openFilesBody)
+    );
   const updatesReplacedInitialTabTitle =
-    /\bupdateTabTitle\s*\(\s*(?:0|activeTab)\s*\)/.test(openFilesBody);
+    /\bupdateTabTitle\s*\(\s*(?:0|activeTab)\s*(?:,|\))/.test(openFilesBody) ||
+    (
+      !!escapedIndex &&
+      new RegExp(
+        `\\bupdateTabTitle\\s*\\(\\s*${escapedIndex}\\s*(?:,|\\))`,
+      ).test(openFilesBody)
+    );
   if (
     bootstrapsPristineInitialTab &&
     appendsOpenedFile &&
@@ -311,6 +508,23 @@ export function getMdViewerExecutionGaps(
       source: sources.caller,
       pattern: /\bresetSaveState\s*\(/,
       message: "openFiles calls resetSaveState, but no such runtime function is declared or imported",
+    }));
+  }
+  const saveHelperDeclarations = [
+    ...sources.caller.matchAll(/\b(?:async\s+)?function\s+saveFileContent\s*\(/g),
+  ];
+  const saveHelperReferences = [
+    ...sources.caller.matchAll(/\bsaveFileContent\s*\(/g),
+  ];
+  if (
+    saveHelperDeclarations.length > 0 &&
+    saveHelperReferences.length === saveHelperDeclarations.length
+  ) {
+    gaps.push(sourceGap({
+      path: OWNER_PATHS.caller,
+      source: sources.caller,
+      pattern: /\b(?:async\s+)?function\s+saveFileContent\s*\(/,
+      message: "remove the unused saveFileContent helper; repair the existing save owners instead of adding a disconnected write path",
     }));
   }
 

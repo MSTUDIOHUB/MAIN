@@ -113,7 +113,51 @@ function committedMutationKeys(
 export interface RuntimeV2ExecuteEvidenceSummary {
   readonly mutationCount: number;
   readonly passedValidationCount: number;
+  readonly failedValidationCount: number;
+  readonly stalledValidationCount: number;
   readonly failedOperationCount: number;
+}
+
+function validationFailureFingerprint(
+  event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
+): string {
+  return [
+    event.failureKind || "validation_failed",
+    ...event.evidence
+      .filter((evidence) => evidence.kind === "validation")
+      .map((evidence) =>
+        `${evidence.target}:${evidence.version || "unversioned"}`
+      )
+      .sort(),
+  ].join("|");
+}
+
+function failedValidationSummarySinceLastPass(
+  events: readonly RuntimeV2Event[],
+): { total: number; stalled: number } {
+  let count = 0;
+  let stalled = 0;
+  let latestFingerprint = "";
+  let countingStalled = true;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type !== "validation.completed") continue;
+    if (event.passed) break;
+    if (
+      event.failureKind !== "not_authorized" &&
+      event.failureKind !== "protocol_invalid"
+    ) {
+      count += 1;
+      const fingerprint = validationFailureFingerprint(event);
+      if (!latestFingerprint) latestFingerprint = fingerprint;
+      if (countingStalled && fingerprint === latestFingerprint) {
+        stalled += 1;
+      } else {
+        countingStalled = false;
+      }
+    }
+  }
+  return { total: count, stalled };
 }
 
 /** Durable execution facts reconstructed from the ledger. Process-local
@@ -123,7 +167,13 @@ export function summarizeRuntimeV2ExecuteEvidence(
   input: RuntimeV2ExecutePhaseTransitionInput,
 ): RuntimeV2ExecuteEvidenceSummary {
   if (!state) {
-    return { mutationCount: 0, passedValidationCount: 0, failedOperationCount: 0 };
+    return {
+      mutationCount: 0,
+      passedValidationCount: 0,
+      failedValidationCount: 0,
+      stalledValidationCount: 0,
+      failedOperationCount: 0,
+    };
   }
   const latestMutationSequence = state.events.reduce((latest, event) =>
     event.type === "tool.completed" &&
@@ -132,6 +182,9 @@ export function summarizeRuntimeV2ExecuteEvidence(
       ? Math.max(latest, event.sequence)
       : latest
   , -1);
+  const failedValidations = failedValidationSummarySinceLastPass(
+    state.events,
+  );
   return {
     mutationCount: committedMutationKeys(state.events, input.isMutationToolName).size,
     passedValidationCount: state.events.filter((event) =>
@@ -139,6 +192,8 @@ export function summarizeRuntimeV2ExecuteEvidence(
       event.passed &&
       event.sequence > latestMutationSequence
     ).length,
+    failedValidationCount: failedValidations.total,
+    stalledValidationCount: failedValidations.stalled,
     failedOperationCount: state.events.filter((event) =>
       (event.type === "tool.completed" && event.status !== "succeeded") ||
       (event.type === "validation.completed" && !event.passed)

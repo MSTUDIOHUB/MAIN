@@ -79,6 +79,28 @@ function compactLine(value: unknown, maxChars = 220): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 3).trim()}...`;
 }
 
+function comparableRunStatusText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_`~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[。.!！?？]+$/g, "")
+    .toLocaleLowerCase();
+}
+
+function withoutDuplicateRunStatusSummary(
+  item: RuntimeProgressLedgerItem,
+): RuntimeProgressLedgerItem {
+  if (
+    !item.summary ||
+    comparableRunStatusText(item.title) !== comparableRunStatusText(item.summary)
+  ) {
+    return item;
+  }
+  return { ...item, summary: "" };
+}
+
 function normalizeLanguage(language?: RuntimeProgressLanguage): RuntimeProgressLanguage {
   return language === "en" ? "en" : "zh";
 }
@@ -716,7 +738,10 @@ export function buildRunStatusProjection(
   maxMilestones = 3,
 ): RunStatusProjection {
   const normalizedLanguage = normalizeLanguage(language);
-  const ordered = [...items].sort((a, b) => {
+  // Runtime v2 briefly persisted its live sentence as both title and summary.
+  // Keep those events readable after upgrade without rendering the same text
+  // twice in the V1-compatible M popover.
+  const ordered = items.map(withoutDuplicateRunStatusSummary).sort((a, b) => {
     const lastDiff = a.lastSeenAt - b.lastSeenAt;
     return lastDiff !== 0 ? lastDiff : a.firstSeenAt - b.firstSeenAt;
   });

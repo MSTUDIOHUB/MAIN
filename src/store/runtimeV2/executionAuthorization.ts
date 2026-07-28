@@ -1,4 +1,4 @@
-import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
+import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   buildToolCapabilityRegistry,
   getLocalFileReadPathForToolCall,
@@ -11,6 +11,7 @@ import {
   shellPermissionPreflight,
   type ShellPermissionApproval,
 } from "../../lib/ipc";
+import { analyzeValidationCommand } from "../../lib/validationContract";
 import {
   canApplyShellAutoReview,
   resolveShellAutoApproval,
@@ -34,6 +35,14 @@ import {
   aggregateForCurrentTurn,
   approvedPlanForCurrentTurn,
 } from "./executionAggregate";
+import {
+  allowsRuntimeV2CorrectiveClarifyingRead,
+  constrainRuntimeV2MutationTools,
+  latestFailedMutationToolForLease,
+  runtimeV2MutationLease,
+  validateRuntimeV2MutationLease,
+} from "./correctiveMutationPolicy";
+import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
 import { selectRuntimeV2ExecuteToolDefinitions } from "./providerToolSurface";
 import type {
   RuntimeV2ExecutionAuthorization,
@@ -41,29 +50,37 @@ import type {
 } from "./executionTypes";
 
 export const RUNTIME_V2_VALIDATION_TOOL_NAMES = new Set([
-  "run_command",
-  "browser_evaluate",
+  "run_command", "browser_evaluate",
 ]);
 
-const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "repo_map_search",
-  "repo_map_context",
-  "code_ast_query",
-  "find_symbol_references",
-  "read_file",
-  "get_file_outline",
-  "replace_in_file",
-  "write_file",
-  "apply_patch",
-  "git_status",
-  "git_diff",
-  "run_command",
-  "browser_evaluate",
-  "get_project_skeleton",
-]);
+export interface RuntimeV2FiniteValidationRejection {
+  readonly reasonCode: "finite_validation_contract_required";
+  readonly rejectionReason: string;
+  readonly message: string;
+}
+
+/** One finite-validation contract shared by provider retries and execution.
+ * Rejecting an invalid proposal before scheduling it prevents model protocol
+ * drift from spending an execution/recovery epoch. Authorization repeats the
+ * same check at the effect boundary so no adapter can bypass it. */
+export function finiteValidationCommandRejection(
+  value: unknown,
+): RuntimeV2FiniteValidationRejection | null {
+  const command = String(value || "").trim();
+  const analysis = analyzeValidationCommand(command);
+  if (analysis.spec?.kind === "finite_command") return null;
+  const rejectionReason = analysis.rejectionReason ||
+    "no_validation_segment";
+  return {
+    reasonCode: "finite_validation_contract_required",
+    rejectionReason,
+    message: [
+      "验证阶段需要能以退出状态证明结果的有限 build、test、lint、typecheck 或 check 命令。",
+      "cat、grep、sed、head、tail、wc 等只读检查只能补充观察，不能作为验收。",
+      `当前命令未满足有限验证契约：${rejectionReason}。`,
+    ].join(" "),
+  };
+}
 
 interface RuntimeV2ToolAuthorizationResult {
   readonly allowed: boolean;
@@ -72,22 +89,13 @@ interface RuntimeV2ToolAuthorizationResult {
   readonly shellPermissionApproval?: ShellPermissionApproval;
 }
 
-function runtimeToolDefinitions(state?: any): ToolDefinition[] {
-  const includeNetwork = state?.webSearchEnabled === true;
-  return TOOL_DEFINITIONS.filter((definition) => {
-    const name = definition.function.name;
-    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
-      (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
-  });
-}
-
 /** Freeze the built-in tool surface and policy for this Runtime v2 Turn.
  * Extensions stay on the legacy adapter until their own capability contract
  * is migrated; an unknown tool can therefore never bypass the catalog. */
 export function createRuntimeV2ExecutionAuthorization(
   state: any,
 ): RuntimeV2ExecutionAuthorization {
-  const toolDefinitions = runtimeToolDefinitions(state);
+  const toolDefinitions = runtimeV2ToolDefinitions(state);
   const policy = normalizeToolPermissionPolicy(
     state?.config?.toolPermissionPolicy,
   );
@@ -118,9 +126,34 @@ export function providerToolDefinitionsForCommand(
   const available = [...authorizationFor(input).toolDefinitions];
   const mode = String(command.payload.mode || "").trim();
   if (mode === "conclude") return [];
+  const collaborationAction = String(
+    command.payload.collaborationAction || "",
+  ).trim();
+  const collaborationAllowed =
+    command.payload.collaborationAllowed !== false;
+  const activeSubagents = Array.isArray(command.payload.activeSubagents)
+    ? command.payload.activeSubagents
+    : [];
+  const remainingSubagentCapacity = Math.max(
+    0,
+    Number(command.payload.remainingSubagentCapacity) || 0,
+  );
+  const collaborationNames = new Set<string>();
+  if (collaborationAllowed && remainingSubagentCapacity > 0) {
+    collaborationNames.add("spawn_subagent");
+  }
+  if (collaborationAllowed && activeSubagents.length > 0) {
+    collaborationNames.add("wait_subagents");
+  }
+  if (collaborationAction === "spawn_required") {
+    return available.filter(
+      (definition) => definition.function.name === "spawn_subagent",
+    );
+  }
   if (mode === "analyze") {
     return available.filter((definition) =>
-      isRuntimeV2WorkspaceReadToolName(definition.function.name)
+      isRuntimeV2WorkspaceReadToolName(definition.function.name) ||
+      collaborationNames.has(definition.function.name)
     );
   }
   if (mode === "validate") {
@@ -139,6 +172,19 @@ export function providerToolDefinitionsForCommand(
   }
   if (mode === "execute") {
     const aggregate = aggregateForCurrentTurn(input);
+    const requiresMutation =
+      command.payload.executePolicy === "mutation_required";
+    const requiresFailureSourceRefresh =
+      command.payload.executePolicy === "source_refresh_required";
+    const requiresSourceReorientation =
+      command.payload.executePolicy === "source_reorientation_required";
+    const requiresInitialSourceGap =
+      command.payload.executePolicy === "source_gap_allowed";
+    if (requiresFailureSourceRefresh) {
+      return available.filter((definition) =>
+        definition.function.name === "read_file"
+      );
+    }
     const approvedPlanNeedsFreshReads =
       aggregate?.strategy === "plan" &&
       aggregate.workPlan?.status === "approved" &&
@@ -150,22 +196,51 @@ export function providerToolDefinitionsForCommand(
     // Duplicate action fingerprints remain bounded by the Runtime core, while
     // plan freshness, mutation scope and validation authority stay enforced
     // independently below this presentation surface.
-    return selectRuntimeV2ExecuteToolDefinitions({
+    const selected = selectRuntimeV2ExecuteToolDefinitions({
       available,
       sourceToolNames: RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
       isMutationToolName: isWorkspaceMutationToolName,
-      requiresFreshSourceReads: approvedPlanNeedsFreshReads,
+      createOnlyMutationToolNames: new Set(["write_file"]),
+      requiresFreshSourceReads:
+        approvedPlanNeedsFreshReads ||
+        requiresSourceReorientation ||
+        requiresInitialSourceGap,
+      requiresMutation,
     });
+    if (!requiresMutation) return selected;
+    const lease = runtimeV2MutationLease(input);
+    if (!lease) {
+      return aggregate?.strategy === "plan"
+        ? selected
+        : available.filter((definition) =>
+            definition.function.name === "read_file"
+          );
+    }
+    const allowClarifyingRead =
+      lease.authority === "acceptance_failure" &&
+      allowsRuntimeV2CorrectiveClarifyingRead(aggregate);
+    const correctiveSurface = allowClarifyingRead
+      ? [
+          ...selected,
+          ...available.filter((definition) =>
+            definition.function.name === "read_file"
+          ),
+        ]
+      : selected;
+    return constrainRuntimeV2MutationTools(
+      correctiveSurface,
+      lease,
+      allowClarifyingRead,
+      latestFailedMutationToolForLease(input, lease),
+    );
   }
   if (mode === "observe") {
-    const childEvidencePending = command.payload.childEvidencePending === true;
     return available.filter((definition) =>
-      (!childEvidencePending &&
-        isWorkspaceMutationToolName(definition.function.name)) ||
       RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name) ||
       RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(
         definition.function.name,
-      )
+      ) ||
+      collaborationNames.has(definition.function.name)
     );
   }
   return available.filter((definition) =>
@@ -224,6 +299,23 @@ export function validateToolAgainstPhaseAndPlan(input: {
 
   const aggregate = aggregateForCurrentTurn(input.ports);
   if (
+    input.command.kind === "execute_validation" &&
+    input.toolName === "run_command"
+  ) {
+    const command = String(
+      input.args.command || input.args.cmd || "",
+    ).trim();
+    const rejection = finiteValidationCommandRejection(command);
+    if (rejection) {
+      return {
+        allowed: false,
+        reason: rejection.message,
+        failureKind: "protocol_invalid",
+        reasonCode: rejection.reasonCode,
+      };
+    }
+  }
+  if (
     aggregate?.strategy === "analyze" &&
     (
       !isRuntimeV2WorkspaceReadToolName(input.toolName) ||
@@ -239,17 +331,35 @@ export function validateToolAgainstPhaseAndPlan(input: {
   }
   if (
     input.command.phase === "observing" &&
-    isWorkspaceMutationToolName(input.toolName) &&
-    aggregate?.subagents.some((job) =>
-      job.status === "queued" || job.status === "running"
-    )
+    isWorkspaceMutationToolName(input.toolName)
   ) {
     return {
       allowed: false,
-      reason: "并行只读调查尚未汇合；当前修改调用已拒绝，先消费已调度的子智能体证据。",
+      reason: "调查阶段只允许收集证据；修改必须在证据汇合并进入实施阶段后执行。",
       failureKind: "protocol_invalid",
-      reasonCode: "subagent_join_required_before_mutation",
+      reasonCode: "mutation_requires_acting_phase",
     };
+  }
+  if (
+    input.command.kind === "execute_tool" &&
+    isWorkspaceMutationToolName(input.toolName)
+  ) {
+    const mutationLease = validateRuntimeV2MutationLease({
+      ports: input.ports,
+      toolName: input.toolName,
+      args: input.args,
+      target: input.target,
+    });
+    if (mutationLease && !mutationLease.allowed) {
+      return {
+        allowed: false,
+        reason: mutationLease.lease
+          ? `本轮修改仅授权最近证据锁定的文件：${mutationLease.lease.target}。`
+          : "修改前必须先精确读取准备变更的源文件。",
+        failureKind: "protocol_invalid",
+        reasonCode: mutationLease.reasonCode,
+      };
+    }
   }
   if (aggregate?.strategy !== "plan") {
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };

@@ -8,6 +8,7 @@ export * from "./executionAggregate";
 export * from "./executionAuthorization";
 export * from "./executionEvidence";
 export * from "./executionProviderContext";
+export * from "./executionProviderHistory";
 export * from "./executionSubagentScopes";
 export * from "./executionText";
 export * from "./executionTypes";

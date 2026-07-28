@@ -230,6 +230,48 @@ test("runtime guidance user records preserve their stable identity across persis
   ]);
 });
 
+test("Runtime v2 tool timeline ownership and diff survive session persistence", () => {
+  const [persisted] = sanitizeTaskBlocksForPersist([
+    {
+      id: 42,
+      turnId: "turn-v2",
+      type: "tool",
+      toolName: "replace_in_file",
+      executionName: "replace_in_file",
+      target: "src/editor.ts",
+      status: "done",
+      toolStatus: "executed",
+      toolCallId: "command-v2",
+      runId: "run-v2",
+      parentRunId: null,
+      dedupeKey: "runtime-v2-timeline:turn-v2:command-v2",
+      diff: {
+        old: "const saved = false;\n",
+        new: "const saved = true;\n",
+        path: "src/editor.ts",
+        existed: true,
+        fullFile: true,
+      },
+      workspaceEffect: "verified",
+    },
+  ]);
+
+  assert.equal(persisted.runId, "run-v2");
+  assert.equal(persisted.parentRunId, undefined);
+  assert.equal(
+    persisted.dedupeKey,
+    "runtime-v2-timeline:turn-v2:command-v2",
+  );
+  assert.deepEqual(persisted.diff, {
+    old: "const saved = false;\n",
+    new: "const saved = true;\n",
+    path: "src/editor.ts",
+    existed: true,
+    fullFile: true,
+  });
+  assert.equal(persisted.workspaceEffect, "verified");
+});
+
 function applyPlanTransition(state, command) {
   const result = reducePlanLifecycle(state, command);
   assert.equal(result.disposition, "applied", result.reason);

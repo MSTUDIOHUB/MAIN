@@ -946,6 +946,44 @@ test("run status projection separates current activity, three milestones, and he
   assert.match(projection.healthSignals[0].summary, /2 次/);
 });
 
+test("run status projection hides duplicate V2 summaries and preserves distinct V1 detail", () => {
+  const projection = buildRunStatusProjection([
+    {
+      key: "run:run-a:edit:done",
+      runId: "run-a",
+      phase: "editing",
+      title: "已编辑 App.tsx",
+      status: "done",
+      summary: "修改已写入工作区。",
+      target: "src/App.tsx",
+      tool: "apply_patch",
+      sourceToolCallIds: ["edit-1"],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 10,
+      lastSeenAt: 10,
+    },
+    {
+      key: "run:run-a:phase:acting",
+      runId: "run-a",
+      phase: "editing",
+      title: "正在实施修改。",
+      status: "running",
+      summary: "正在实施修改",
+      target: "",
+      tool: "",
+      sourceToolCallIds: [],
+      repeatCount: 1,
+      cacheHits: 0,
+      firstSeenAt: 20,
+      lastSeenAt: 20,
+    },
+  ], "zh");
+
+  assert.equal(projection.currentActivity.summary, "");
+  assert.equal(projection.milestones[0].summary, "修改已写入工作区。");
+});
+
 test("run status projection keeps cache-only stubs out of current activity and milestones", () => {
   const event = withEventSchema({
     type: "progress.updated",

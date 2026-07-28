@@ -13,6 +13,7 @@ import {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import {
+  canOpenRuntimeV2RecoveryEpoch,
   canRecordRuntimeV2Recovery,
   emptyRuntimeV2RecoveryBudget,
   exhaustRuntimeV2Recovery,
@@ -21,6 +22,7 @@ import {
   runtimeV2ActionFingerprint,
 } from "./recovery";
 import {
+  MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS,
   applyRuntimeV2SubagentTelemetry,
   areReadOnlySubagentScopesDisjoint,
 } from "./subagents";
@@ -464,6 +466,10 @@ export function tryTransition(
     case "command.completed": {
       const completion = resolveCommandCompletion(state, event);
       if (isTransitionResult(completion)) return completion;
+      const toolCallId =
+        typeof completion.command.payload.toolCallId === "string"
+          ? completion.command.payload.toolCallId
+          : "";
       return {
         disposition: "applied",
         state: append(state, event, {
@@ -472,6 +478,9 @@ export function tryTransition(
             state.completedCommands,
             commandReceipt(completion.command, event.status, event.at),
           ),
+          pendingToolCalls: toolCallId
+            ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
+            : state.pendingToolCalls,
         }),
       };
     }
@@ -527,7 +536,11 @@ export function tryTransition(
           scheduledCommands: completion.scheduledCommands,
           completedCommands: appendCommandReceipt(
             state.completedCommands,
-            commandReceipt(completion.command, event.passed ? "succeeded" : "failed", event.at),
+            // The validation command itself completed successfully even when
+            // the acceptance check did not pass. `event.passed` is the
+            // semantic result; command failure is reserved for a validator
+            // that could not be executed or authorized.
+            commandReceipt(completion.command, "succeeded", event.at),
           ),
           evidence: appendEvidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
@@ -594,6 +607,9 @@ export function tryTransition(
       if (!hasNovelEvidence(state.evidence, event.evidence)) {
         return rejection(state, "recovery_evidence_not_novel");
       }
+      if (!canOpenRuntimeV2RecoveryEpoch(state.recovery)) {
+        return rejection(state, "recovery_limit_exceeded");
+      }
       return {
         disposition: "applied",
         state: append(state, event, {
@@ -636,12 +652,25 @@ export function tryTransition(
     case "soft_signal.observed":
       return { disposition: "applied", state: append(state, event) };
     case "subagents.scheduled": {
-      if (event.jobs.length !== 2 || event.jobs.some((job) => !isValidSubagentJob(job, event.run))) {
+      if (
+        event.jobs.length === 0 ||
+        state.subagents.length + event.jobs.length >
+          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS ||
+        event.jobs.some((job) => !isValidSubagentJob(job, event.run))
+      ) {
         return rejection(state, "subagent_invalid");
       }
       const known = new Set(state.subagents.map((job) => job.id));
       if (event.jobs.some((job) => known.has(job.id))) return rejection(state, "subagent_invalid");
       for (let left = 0; left < event.jobs.length; left += 1) {
+        if (state.subagents.some((job) =>
+          !areReadOnlySubagentScopesDisjoint(
+            event.jobs[left]!.allowedPaths,
+            job.allowedPaths,
+          )
+        )) {
+          return rejection(state, "subagent_scope_conflict");
+        }
         for (let right = left + 1; right < event.jobs.length; right += 1) {
           if (!areReadOnlySubagentScopesDisjoint(event.jobs[left]!.allowedPaths, event.jobs[right]!.allowedPaths)) {
             return rejection(state, "subagent_scope_conflict");

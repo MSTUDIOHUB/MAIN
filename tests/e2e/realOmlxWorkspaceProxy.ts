@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -880,9 +881,16 @@ export async function readRealOmlxWorkspaceFileWindow(
   const moreRequestedLines = returnedEndLine > 0 && returnedEndLine < Math.min(requestedEndLine, Math.max(1, totalLines));
   const moreScannedLines = returnedEndLine > 0 && returnedEndLine < totalLines;
   const truncated = scanTruncated || notWholeScannedFile || moreRequestedLines || moreScannedLines || lineTruncated;
+  const contentVersion = !scanTruncated
+    ? `sha256-${createHash("sha256").update(
+        (await fs.readFile(resolved.absolutePath, "utf8"))
+          .replace(/\r\n?/g, "\n"),
+      ).digest("hex")}`
+    : undefined;
   return {
     path: rawPath,
     content: selected.join("\n"),
+    contentVersion,
     startLine: returnedStartLine,
     endLine: returnedEndLine,
     totalLines,

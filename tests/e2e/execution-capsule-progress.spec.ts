@@ -61,6 +61,32 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("Runtime v2 provider deadline settles in the browser event loop", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+  const result = await page.evaluate(async () => {
+    const { withRuntimeV2HardDeadline } = await import(
+      "/src/store/runtimeV2/hardDeadline.ts"
+    );
+    const startedAt = performance.now();
+    try {
+      await withRuntimeV2HardDeadline({
+        timeoutMs: 20,
+        timeoutError: "EXPECTED_BROWSER_DEADLINE",
+        task: () => new Promise(() => undefined),
+      });
+      return { message: "settled_without_error", elapsedMs: performance.now() - startedAt };
+    } catch (error) {
+      return {
+        message: error instanceof Error ? error.message : String(error),
+        elapsedMs: performance.now() - startedAt,
+      };
+    }
+  });
+  expect(result.message).toBe("EXPECTED_BROWSER_DEADLINE");
+  expect(result.elapsedMs).toBeGreaterThanOrEqual(15);
+  expect(result.elapsedMs).toBeLessThan(1_000);
+});
+
 test("Capsule beam uses one continuous masked Rotate gradient", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
@@ -188,6 +214,59 @@ test("newer structured editing activity replaces settled ChatArea commentary in 
   );
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("**");
+});
+
+test("Run Status renders a duplicated V2 title and summary only once", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+  const duplicateText = "正在搜索 `src/components`，收窄需要检查的代码范围。";
+
+  await page.evaluate(async (text) => {
+    const [{ useAppStore }, { withEventSchema }] = await Promise.all([
+      import("/src/store/useAppStore.ts"),
+      import("/src/lib/turnEvents.ts"),
+    ]);
+    const state = useAppStore.getState();
+    const marker = state.harnessRunMarker;
+    if (!marker) throw new Error("Expected an active E2E run marker");
+    useAppStore.setState({
+      runtimeEvents: [
+        ...state.runtimeEvents,
+        withEventSchema({
+          type: "progress.updated",
+          threadId: marker.sessionKey,
+          turnId: marker.turnId,
+          runId: marker.runId,
+          parentRunId: marker.parentRunId,
+          timestampMs: Date.now() + 1_000,
+          progress: {
+            phase: "investigating",
+            title: text,
+            status: "running",
+            action: text,
+            summary: text,
+            tool: "grep_search",
+            target: "src/components",
+            canonicalTarget: "src/components",
+            audience: "user",
+            dedupeKey: `runtime-v2:${marker.turnId}:duplicate-popover-copy`,
+          },
+        }),
+      ],
+    });
+  }, duplicateText);
+
+  await page.getByTitle("查看运行状态").click();
+  const progressPopover = page.getByTestId("effective-progress-popover");
+  const currentActivity = page.getByTestId("run-status-current-activity");
+  await expect(progressPopover).toBeVisible();
+  await expect(currentActivity.getByText(duplicateText, { exact: true })).toHaveCount(1);
+
+  const screenshotPath = testInfo.outputPath("run-status-v2-deduplicated.png");
+  await progressPopover.screenshot({ path: screenshotPath });
+  await testInfo.attach("run-status-v2-deduplicated", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
 });
 
 test("pure plan execution keeps the runtime checkpoint in the main Capsule without duplicating its task tracker", async ({ page }) => {
@@ -512,6 +591,23 @@ test("typed Plan review Capsule preserves the exact request and artifact identit
   await expect(milestone).toBeVisible();
   await expect(milestone).toContainText("修复计划已准备好");
   await expect(milestone).toContainText("根本原因");
+  const milestoneTypography = await milestone.evaluate((element) => {
+    const markdown = element.querySelector<HTMLElement>("[data-markdown-presentation]");
+    const heading = element.querySelector<HTMLElement>("[data-markdown-heading-level]");
+    const strong = element.querySelector<HTMLElement>("strong");
+    return {
+      presentation: markdown?.dataset.markdownPresentation || "",
+      headingWeight: heading ? Number(getComputedStyle(heading).fontWeight) : 0,
+      headingSize: heading ? Number.parseFloat(getComputedStyle(heading).fontSize) : 0,
+      strongWeight: strong ? Number(getComputedStyle(strong).fontWeight) : 0,
+    };
+  });
+  expect(milestoneTypography.presentation).toBe("assistant_update");
+  expect(milestoneTypography.headingWeight).toBeLessThanOrEqual(500);
+  expect(milestoneTypography.headingSize).toBeLessThanOrEqual(20);
+  if (milestoneTypography.strongWeight > 0) {
+    expect(milestoneTypography.strongWeight).toBeLessThanOrEqual(500);
+  }
   await expect
     .poll(async () => page.evaluate(() => {
       const event = [...((window as any).__CODELY_E2E__?.events || [])]

@@ -21,7 +21,9 @@ import {
   buildRuntimeV2TimelineProjection,
 } from "./projection";
 import {
+  canOpenRuntimeV2RecoveryEpoch,
   canRecordRuntimeV2Recovery,
+  runtimeV2RecoveryScopeForCommandFailure,
   runtimeV2ActionFingerprint,
 } from "./recovery";
 import { transition } from "./reducer";
@@ -43,6 +45,65 @@ export interface RuntimeV2Admission {
 
 function asEvent<T extends RuntimeV2Event>(value: T): T {
   return value;
+}
+
+function structuralIdentity(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(structuralIdentity).join(",")}]`;
+  }
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) =>
+      `${JSON.stringify(key)}:${structuralIdentity(entry)}`
+    )
+    .join(",")}}`;
+}
+
+function sourceCommandIdentity(command: RuntimeV2Command): string {
+  return [
+    String(command.payload.toolName || ""),
+    structuralIdentity(command.payload.arguments || {}),
+  ].join(":");
+}
+
+function repeatsCommittedSourceEvidence(
+  state: TurnAggregateV1,
+  event: RuntimeV2Event,
+  command: RuntimeV2Command,
+): boolean {
+  if (
+    event.type !== "tool.completed" ||
+    event.status !== "succeeded" ||
+    event.evidence.length === 0 ||
+    !event.evidence.every((item) => item.kind === "source")
+  ) {
+    return false;
+  }
+  const identity = sourceCommandIdentity(command);
+  const priorCommandKeys = new Set(state.events
+    .filter((candidate): candidate is Extract<
+      RuntimeV2Event,
+      { type: "command.scheduled" }
+    > =>
+      candidate.type === "command.scheduled" &&
+      candidate.command.kind === "execute_tool" &&
+      candidate.command.idempotencyKey !== command.idempotencyKey &&
+      sourceCommandIdentity(candidate.command) === identity
+    )
+    .map((candidate) => candidate.command.idempotencyKey));
+  return state.events.some((candidate) =>
+    candidate.type === "tool.completed" &&
+    candidate.status === "succeeded" &&
+    priorCommandKeys.has(candidate.idempotencyKey) &&
+    event.evidence.every((incoming) =>
+      candidate.evidence.some((existing) =>
+        existing.kind === incoming.kind &&
+        existing.target === incoming.target &&
+        (existing.version || null) === (incoming.version || null)
+      )
+    )
+  );
 }
 
 /**
@@ -302,13 +363,16 @@ export class RuntimeV2Controller {
       switch (command.kind) {
       case "request_model": {
         const result = await this.ports.provider.request({ run: command.run, command, signal });
-        await this.apply(asEvent({
+        const applied = await this.apply(asEvent({
           ...this.eventBase(),
           type: "provider.responded",
           run: command.run,
           idempotencyKey: command.idempotencyKey,
           result,
         }));
+        await this.publishMilestoneIfEligible(
+          applied.events[applied.events.length - 1],
+        );
         if (result.toolCalls.length === 0 && !String(result.visibleText || "").trim()) {
           await this.apply(asEvent({
             ...this.eventBase(),
@@ -322,15 +386,39 @@ export class RuntimeV2Controller {
       }
       case "execute_tool": {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
-        const rebased = this.rebasePortEvent(event);
+        let rebased = this.rebasePortEvent(event);
+        const repeatedSourceEvidence = repeatsCommittedSourceEvidence(
+          this.requireAggregate(),
+          rebased,
+          command,
+        );
+        if (await this.openRecoveryEpochForCorrectiveEvidence(rebased)) {
+          rebased = this.rebasePortEvent(event);
+        }
         await this.apply(rebased);
+        if (
+          repeatedSourceEvidence &&
+          !this.requireAggregate().events.some((item) =>
+            item.type === "soft_signal.observed" && item.signal === "repeat"
+          )
+        ) {
+          await this.apply(asEvent({
+            ...this.eventBase(),
+            type: "soft_signal.observed",
+            run: command.run,
+            signal: "repeat",
+          }));
+        }
         await this.recordSemanticFailureIfNeeded(command, rebased);
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
         return;
       }
       case "execute_validation": {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
-        const rebased = this.rebasePortEvent(event);
+        let rebased = this.rebasePortEvent(event);
+        if (await this.openRecoveryEpochForCorrectiveEvidence(rebased)) {
+          rebased = this.rebasePortEvent(event);
+        }
         await this.apply(rebased);
         await this.recordSemanticFailureIfNeeded(command, rebased);
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
@@ -344,9 +432,15 @@ export class RuntimeV2Controller {
           event = await this.ports.tool.execute({ run: command.run, command, signal });
         } else {
           if (command.kind === "schedule_subagents") {
+            const sourceToolCallId =
+              typeof command.payload.toolCallId === "string"
+                ? command.payload.toolCallId
+                : "";
             const committedChildren = this.requireAggregate().subagents.filter((job) =>
               job.parentRunId === command.run.runId &&
-              (job.status === "queued" || job.status === "running")
+              (job.status === "queued" || job.status === "running") &&
+              (!sourceToolCallId ||
+                job.sourceToolCallId === sourceToolCallId)
             );
             if (committedChildren.length === 0) {
               const prepared = await this.ports.scheduler.prepareSchedule?.({ run: command.run, command, signal });
@@ -432,18 +526,12 @@ export class RuntimeV2Controller {
     }));
   }
 
-  private recoveryScopeFor(command: RuntimeV2Command, error: unknown): RuntimeV2RecoveryScope {
-    if (command.kind === "request_model") return "transport";
-    const message = error instanceof Error ? error.message : String(error || "");
-    return /context|token|window/i.test(message) ? "context" : "action";
-  }
-
   private async handleCommandFailure(command: RuntimeV2Command, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error || "Runtime v2 command failed.");
     await this.settleScheduledCommand(command, "failed");
     const state = this.requireAggregate();
     if (!state.run || state.terminalOutcome) return;
-    const scope = this.recoveryScopeFor(command, error);
+    const scope = runtimeV2RecoveryScopeForCommandFailure(command, error);
     const fingerprint = `${scope}:${runtimeV2ActionFingerprint(command)}`;
     if (canRecordRuntimeV2Recovery(state.recovery, scope, fingerprint)) {
       await this.apply(asEvent({
@@ -472,29 +560,29 @@ export class RuntimeV2Controller {
     );
   }
 
-  /** A backend can return a well-formed failure event without throwing. It
-   * still consumes the same structural recovery budget as a rejected promise,
-   * otherwise a model can keep receiving fresh retries without the ledger
-   * ever recording why progress stopped. */
+  /** A backend can return a well-formed structural failure without throwing.
+   * It consumes action recovery just like a rejected promise. A validator
+   * that ran and reported an unmet acceptance condition is different: that
+   * is ordinary loop evidence and must lead back to Acting, not consume a
+   * transport/action recovery budget. */
   private async recordSemanticFailureIfNeeded(
     command: RuntimeV2Command,
     event: RuntimeV2Event,
   ): Promise<void> {
-    const failed = (event.type === "tool.completed" && event.status !== "succeeded") ||
-      (event.type === "validation.completed" && !event.passed);
-    if (!failed) return;
+    const toolFailed =
+      event.type === "tool.completed" && event.status !== "succeeded";
+    const validationStructurallyFailed =
+      event.type === "validation.completed" &&
+      !event.passed &&
+      (
+        event.failureKind === "protocol_invalid" ||
+        event.failureKind === "not_authorized"
+      );
+    if (!toolFailed && !validationStructurallyFailed) return;
     const state = this.requireAggregate();
     if (!state.run || state.terminalOutcome) return;
-    const validationFailed = event.type === "validation.completed" && !event.passed;
-    const scope: RuntimeV2RecoveryScope = validationFailed ? "diagnostic" : "action";
-    // Different commands that test the same Turn acceptance boundary are not
-    // independent recovery lineages. Otherwise a weak model can evade the
-    // diagnostic budget simply by changing the shell spelling each round.
-    const diagnosticBoundary = state.objective.acceptanceCriteria.join("\u0000") ||
-      state.objective.text;
-    const fingerprint = validationFailed
-      ? `diagnostic:${diagnosticBoundary.trim().slice(0, 2_048)}`
-      : `${scope}:${runtimeV2ActionFingerprint(command)}`;
+    const scope: RuntimeV2RecoveryScope = "action";
+    const fingerprint = `${scope}:${runtimeV2ActionFingerprint(command)}`;
     if (canRecordRuntimeV2Recovery(state.recovery, scope, fingerprint)) {
       await this.apply(asEvent({
         ...this.eventBase(),
@@ -511,10 +599,79 @@ export class RuntimeV2Controller {
       run: state.run.identity,
       scope,
       fingerprint,
-      reason: validationFailed
-        ? "同一验收边界的有限验证已重复失败，诊断修复预算耗尽，准备以部分结果收口。"
-        : "当前工具动作已重复失败，已停止重复执行并准备以部分结果收口。",
+      reason: "当前工具动作已重复失败，已停止重复执行并准备以部分结果收口。",
     }));
+  }
+
+  private async openRecoveryEpochForCorrectiveEvidence(
+    event: RuntimeV2Event,
+  ): Promise<boolean> {
+    const state = this.requireAggregate();
+    if (
+      !state.run ||
+      state.recovery.exhausted ||
+      event.type !== "tool.completed" ||
+      event.status !== "succeeded"
+    ) {
+      return false;
+    }
+    const currentEpochHasFailure = state.recovery.receipts.some(
+      (receipt) => receipt.epoch === state.recovery.epoch,
+    );
+    const mutationEvidence = event.evidence.filter(
+      (evidence) => evidence.kind === "mutation",
+    );
+    const sourceEvidence = event.evidence.filter(
+      (evidence) => evidence.kind === "source",
+    );
+    const epochBoundary = state.events.map((candidate) => candidate.type)
+      .lastIndexOf("recovery.epoch_opened");
+    const epochEvents = state.events.slice(epochBoundary + 1);
+    let latestRecoverableFailureIndex = -1;
+    for (let index = epochEvents.length - 1; index >= 0; index -= 1) {
+      const candidate = epochEvents[index]!;
+      if (
+        candidate.type === "tool.completed" &&
+        candidate.status !== "succeeded" &&
+        (
+          candidate.failureKind === "mutation_rejected" ||
+          candidate.failureKind === "source_mismatch"
+        )
+      ) {
+        latestRecoverableFailureIndex = index;
+        break;
+      }
+    }
+    const latestRecoverableEditFailure =
+      latestRecoverableFailureIndex >= 0 &&
+      !epochEvents.slice(latestRecoverableFailureIndex + 1).some(
+        (candidate) =>
+          candidate.type === "tool.completed" &&
+          candidate.status === "succeeded" &&
+          candidate.evidence.some((evidence) => evidence.kind === "source"),
+      );
+    const recoveryEvidence = mutationEvidence.length > 0
+      ? mutationEvidence
+      : latestRecoverableEditFailure && sourceEvidence.length > 0
+        ? sourceEvidence
+        : [];
+    if (
+      !currentEpochHasFailure ||
+      recoveryEvidence.length === 0 ||
+      !canOpenRuntimeV2RecoveryEpoch(state.recovery)
+    ) {
+      return false;
+    }
+    await this.apply(asEvent({
+      ...this.eventBase(),
+      type: "recovery.epoch_opened",
+      run: state.run.identity,
+      reason: mutationEvidence.length > 0
+        ? "corrective_mutation_committed_after_recoverable_failure"
+        : "corrective_source_refreshed_after_rejected_mutation",
+      evidence: recoveryEvidence,
+    }));
+    return true;
   }
 
   private async publish(projection: ReturnType<typeof buildRuntimeV2CapsuleProjection>): Promise<void> {

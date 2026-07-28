@@ -1,6 +1,11 @@
 import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
+import {
+  buildToolDiffPreview,
+  type ToolDiffPreview,
+} from "../../lib/toolDiff";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
 import type { ToolPort } from "../../lib/runtime-v2";
 import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
@@ -8,7 +13,9 @@ import {
   authorizationFor,
   authorizeToolForCurrentTurn,
   boundedToolContent,
-  deriveSubagentCandidates,
+  latestAcceptanceFailureSourceWindow,
+  modelContextContentForToolOutput,
+  modelContextStatusForCompletion,
   nextEvidenceId,
   recordModelContext,
   recordToolModelContext,
@@ -19,6 +26,10 @@ import {
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
+import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
+
+const RUNTIME_V2_MAX_MUTATION_LINES = 96;
+const RUNTIME_V2_MAX_CORRECTIVE_MUTATION_LINES = 48;
 
 export function createRuntimeV2ToolPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -34,18 +45,22 @@ export function createRuntimeV2ToolPort(
           target: input.context.runWorkspace || "workspace",
         });
         try {
-          const overview = boundedToolContent(await executeTool(
-            "get_project_skeleton",
-            {},
-            input.context.runWorkspace || "",
-            input.context.runSessionKey,
-            { toolCatalog: authorizationFor(input).toolCatalog },
-          ), 12_000);
-          input.live.workspaceOverview = overview;
-          input.live.subagentCandidates = deriveSubagentCandidates(
-            overview,
-            String(command.payload.objective || ""),
+          const overview = boundedToolContent(
+            await executeRuntimeV2ToolWithDeadline({
+              toolName: "get_project_skeleton",
+              lifecycleDeadlineAt: input.lifecycleDeadlineAt,
+              now: input.now,
+              task: () => executeTool(
+                "get_project_skeleton",
+                {},
+                input.context.runWorkspace || "",
+                input.context.runSessionKey,
+                { toolCatalog: authorizationFor(input).toolCatalog },
+              ),
+            }),
+            12_000,
           );
+          input.live.workspaceOverview = overview;
           const evidenceId = nextEvidenceId(input.live);
           recordModelContext(input.live, {
             id: evidenceId,
@@ -62,7 +77,6 @@ export function createRuntimeV2ToolPort(
             toolName: "get_project_skeleton",
             target: input.context.runWorkspace || "workspace",
             status: "succeeded",
-            discoveredSubagentScopes: input.live.subagentCandidates.map((candidate) => candidate.scopeKey),
           });
           return {
             type: "observation.recorded",
@@ -223,6 +237,7 @@ export function createRuntimeV2ToolPort(
         );
       }
       try {
+        let diffPreview: ToolDiffPreview | undefined;
         const toolExecutionOptions = {
           toolCatalog: authorizationFor(input).toolCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
@@ -230,36 +245,169 @@ export function createRuntimeV2ToolPort(
             ? { shellPermissionApproval: authorization.shellPermissionApproval }
             : {}),
         };
-        const rawOutput = await executeTool(
+        if (isWorkspaceMutationToolName(toolName)) {
+          const correctiveSource = latestAcceptanceFailureSourceWindow(
+            input.live,
+            input.context.runWorkspace || "",
+          );
+          const preflight = await preflightWorkspaceMutation({
+            toolName,
+            args,
+            language: input.context.phaseLanguage,
+            workspaceRoot: input.context.runWorkspace || "",
+            maxTouchedLines: correctiveSource
+              ? RUNTIME_V2_MAX_CORRECTIVE_MUTATION_LINES
+              : RUNTIME_V2_MAX_MUTATION_LINES,
+            readFile: async (path) => String(
+              await executeRuntimeV2ToolWithDeadline({
+                toolName: "read_file",
+                lifecycleDeadlineAt: input.lifecycleDeadlineAt,
+                now: input.now,
+                task: () => executeTool(
+                  "read_file",
+                  { path, __raw: true },
+                  input.context.runWorkspace || "",
+                  input.context.runSessionKey,
+                  toolExecutionOptions,
+                ),
+              }),
+            ),
+          });
+          if (!preflight.ok) {
+            const mismatchRange =
+              preflight.patchRecoveryMismatch?.requestedRange;
+            const mismatchPath =
+              preflight.patchRecoveryMismatch?.target ||
+              preflight.path ||
+              target;
+            const sourceMismatch =
+              preflight.recoveryKind === "source_mismatch";
+            const targetInvalid =
+              preflight.recoveryKind === "target_invalid";
+            const mutationRejected =
+              preflight.recoveryKind === "mutation_rejected";
+            const refreshLine = mismatchRange?.startLine
+              ? Math.floor(
+                  (
+                    mismatchRange.startLine +
+                    (mismatchRange.endLine || mismatchRange.startLine)
+                  ) / 2,
+                )
+              : mutationRejected &&
+                  correctiveSource &&
+                  correctiveSource.path === mismatchPath
+                ? correctiveSource.failureLine
+                : null;
+            const sourceRefreshHint =
+              (sourceMismatch || mutationRejected) &&
+              mismatchPath &&
+              refreshLine
+              ? `${mismatchPath}:${refreshLine}:1 - refresh this exact source window before retrying a smaller valid mutation`
+              : "";
+            const content = [
+              preflight.message ||
+                `MUTATION_PREFLIGHT_BLOCKED: ${preflight.reason || "invalid mutation"}`,
+              sourceRefreshHint,
+            ].filter(Boolean).join("\n");
+            recordToolModelContext({
+              ports: input,
+              command,
+              toolName,
+              target: preflight.path || target,
+              status: "failed",
+              content,
+            });
+            input.logStoreEvent("runtime_v2_mutation_preflight_rejected", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              commandKind: command.kind,
+              toolName,
+              target: preflight.path || target || null,
+              reason: preflight.reason || "invalid_mutation",
+              recoveryKind: preflight.recoveryKind || null,
+              mismatchTarget:
+                preflight.patchRecoveryMismatch?.target || null,
+              mismatchStartLine: mismatchRange?.startLine || null,
+              mismatchEndLine: mismatchRange?.endLine || null,
+              message: preflight.message?.slice(0, 1_000) || null,
+            });
+            return toolCompletionFor(
+              input,
+              command,
+              toolName,
+              args,
+              preflight.path || target,
+              null,
+              "failed",
+              sourceMismatch
+                ? "source_mismatch"
+                : targetInvalid
+                  ? "target_invalid"
+                  : mutationRejected
+                    ? "mutation_rejected"
+                    : "protocol_invalid",
+            );
+          }
+          try {
+            diffPreview = await buildToolDiffPreview(toolName, args, {
+              workspace: input.context.runWorkspace || "",
+              sessionKey: input.context.runSessionKey,
+            });
+          } catch (error) {
+            input.logStoreEvent("runtime_v2_tool_diff_preview_failed", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              commandKind: command.kind,
+              toolName,
+              target: target || null,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        const rawOutput = await executeRuntimeV2ToolWithDeadline({
           toolName,
-          args,
-          input.context.runWorkspace || "",
-          input.context.runSessionKey,
-          toolExecutionOptions,
+          lifecycleDeadlineAt: input.lifecycleDeadlineAt,
+          now: input.now,
+          onTimeout: (timeoutMs) => {
+            input.logStoreEvent("runtime_v2_tool_deadline_exceeded", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              commandKind: command.kind,
+              toolName,
+              target: target || null,
+              timeoutMs,
+            });
+          },
+          task: () => executeTool(
+            toolName,
+            args,
+            input.context.runWorkspace || "",
+            input.context.runSessionKey,
+            toolExecutionOptions,
+          ),
+        });
+        const output = boundedToolContent(
+          modelContextContentForToolOutput(rawOutput),
         );
-        const output = boundedToolContent(rawOutput);
         const sourceVersion = RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)
           ? await resolveRuntimeV2SourceEvidenceVersion({
               toolName,
               args,
               output: rawOutput,
-              readExactFile: () => executeTool(
-                "read_file",
-                { ...args, __raw: true },
-                input.context.runWorkspace || "",
-                input.context.runSessionKey,
-                toolExecutionOptions,
-              ),
+              readExactFile: () => executeRuntimeV2ToolWithDeadline({
+                toolName: "read_file",
+                lifecycleDeadlineAt: input.lifecycleDeadlineAt,
+                now: input.now,
+                task: () => executeTool(
+                  "read_file",
+                  { ...args, __raw: true },
+                  input.context.runWorkspace || "",
+                  input.context.runSessionKey,
+                  toolExecutionOptions,
+                ),
+              }),
             })
           : undefined;
-        recordToolModelContext({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "succeeded",
-          content: output,
-        });
         const completion = toolCompletionFor(
           input,
           command,
@@ -270,14 +418,24 @@ export function createRuntimeV2ToolPort(
           "succeeded",
           undefined,
           sourceVersion,
+          diffPreview,
         );
+        const semanticStatus = modelContextStatusForCompletion(completion);
+        recordToolModelContext({
+          ports: input,
+          command,
+          toolName,
+          target,
+          status: semanticStatus,
+          content: output,
+        });
         input.logStoreEvent("runtime_v2_tool_execution_completed", {
           turnId: command.run.turnId,
           runId: command.run.runId,
           commandKind: command.kind,
           toolName,
           target: target || null,
-          status: completion.type === "validation.completed" && !completion.passed ? "failed" : "succeeded",
+          status: semanticStatus,
           mutationCommitted: isWorkspaceMutationToolName(toolName),
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
           evidenceVersions: completion.type === "tool.completed"

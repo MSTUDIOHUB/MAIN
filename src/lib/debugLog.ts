@@ -17,11 +17,19 @@ export interface DebugLogSnapshot {
 }
 
 const STORAGE_KEY = "main.debugLog.v1";
-const MAX_LOCAL_ENTRIES = 500;
+// The native log is the durable desktop record. This browser ring only backs
+// diagnostics when IPC is unavailable and must stay small enough that a busy
+// agent cannot make localStorage serialization block the UI thread.
+const MAX_LOCAL_ENTRIES = 160;
+const LOCAL_LOG_FLUSH_DELAY_MS = 40;
 
 let captureInstalled = false;
 let rustLogUnlisten: UnlistenFn | null = null;
 let performanceDiagnosticsInstalled = false;
+let localEntriesCache: DebugLogEntry[] | null = null;
+let localEntriesSerialized: string | null = null;
+let localEntriesDirty = false;
+let localLogFlushTimer: ReturnType<typeof setTimeout> | null = null;
 const DEBUG_LOG_BOOT_TIME = typeof performance !== "undefined" ? performance.now() : Date.now();
 
 interface DebugLogWindow extends Window {
@@ -342,24 +350,68 @@ function classifyConsoleLog(args: unknown[]): {
 function readLocalEntries(): DebugLogEntry[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
+    if (
+      localEntriesCache &&
+      (localEntriesDirty || raw === localEntriesSerialized)
+    ) {
+      return localEntriesCache;
+    }
+    if (!raw) {
+      localEntriesCache = [];
+      localEntriesSerialized = null;
+      localEntriesDirty = false;
+      return localEntriesCache;
+    }
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    localEntriesCache = Array.isArray(parsed)
+      ? parsed.slice(-MAX_LOCAL_ENTRIES)
+      : [];
+    localEntriesSerialized = raw;
+    localEntriesDirty = false;
+    return localEntriesCache;
   } catch {
-    return [];
+    return localEntriesCache || [];
   }
 }
 
-function writeLocalEntries(entries: DebugLogEntry[]) {
+function flushLocalEntries() {
+  if (localLogFlushTimer) {
+    clearTimeout(localLogFlushTimer);
+    localLogFlushTimer = null;
+  }
+  if (!localEntriesDirty || !localEntriesCache) return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries.slice(-MAX_LOCAL_ENTRIES)));
+    const serialized = JSON.stringify(localEntriesCache);
+    window.localStorage.setItem(STORAGE_KEY, serialized);
+    localEntriesSerialized = serialized;
+    localEntriesDirty = false;
   } catch {
     // localStorage can be unavailable in restricted WebView states.
   }
 }
 
+function scheduleLocalEntriesFlush() {
+  if (localLogFlushTimer) return;
+  localLogFlushTimer = setTimeout(() => {
+    localLogFlushTimer = null;
+    flushLocalEntries();
+  }, LOCAL_LOG_FLUSH_DELAY_MS);
+}
+
+function writeLocalEntries(entries: DebugLogEntry[]) {
+  localEntriesCache = entries.slice(-MAX_LOCAL_ENTRIES);
+  localEntriesDirty = true;
+  flushLocalEntries();
+}
+
 function appendLocalEntry(entry: DebugLogEntry) {
-  writeLocalEntries([...readLocalEntries(), entry]);
+  localEntriesCache = [...readLocalEntries(), entry].slice(-MAX_LOCAL_ENTRIES);
+  localEntriesDirty = true;
+  if (entry.level === "warn" || entry.level === "error") {
+    flushLocalEntries();
+  } else {
+    scheduleLocalEntriesFlush();
+  }
 }
 
 function formatEntry(entry: DebugLogEntry): string {
@@ -624,6 +676,7 @@ export function appendDebugLog(
 }
 
 export function getLocalDebugLogText() {
+  flushLocalEntries();
   return readLocalEntries().map(formatEntry).join("\n");
 }
 
@@ -667,6 +720,7 @@ export function installDebugLogCapture() {
   if (targetWindow.__MAIN_DEBUG_LOG_CAPTURE_INSTALLED__) return;
   captureInstalled = true;
   targetWindow.__MAIN_DEBUG_LOG_CAPTURE_INSTALLED__ = true;
+  window.addEventListener("pagehide", flushLocalEntries);
 
   const wrapConsole = (level: DebugLogLevel, original: (...args: unknown[]) => void) => {
     return (...args: unknown[]) => {

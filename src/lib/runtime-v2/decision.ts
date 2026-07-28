@@ -7,6 +7,7 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import { RUNTIME_V2_RECOVERY_LIMITS, runtimeV2ActionFingerprint } from "./recovery";
+import { MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS } from "./subagents";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -18,9 +19,24 @@ export interface RuntimeV2DecisionInput {
   /** User-visible, provider-authored conclusion after the adapter has already
    * checked the structured evidence gate. It is presentation data only. */
   readonly finalMarkdown?: string;
-  readonly allowReadOnlySubagents?: boolean;
-  /** The store scheduler has already proved that two frozen scopes exist. */
-  readonly hasReadOnlySubagentScopes?: boolean;
+  /**
+   * Admission-time collaboration policy. It controls only the model's tool
+   * surface; task identity, name, objective and scope must come from an actual
+   * spawn_subagent call.
+   */
+  readonly subagentPreference?:
+    | "unspecified"
+    | "forbidden"
+    | "allowed"
+    | "preferred";
+}
+
+function commaSeparatedValues(value: unknown): string[] {
+  return String(value || "")
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS);
 }
 
 function canonical(value: unknown): string {
@@ -49,6 +65,138 @@ function actionFingerprint(
 function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
   return state.completedCommands.filter((receipt) => receipt.actionFingerprint === fingerprint).length +
     state.scheduledCommands.filter((scheduled) => runtimeV2ActionFingerprint(scheduled) === fingerprint).length;
+}
+
+function failedActionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
+  const epochOpenedAt = [...state.events].reverse().find(
+    (event) => event.type === "recovery.epoch_opened",
+  )?.at ?? Number.NEGATIVE_INFINITY;
+  return state.completedCommands.filter((receipt) =>
+    receipt.actionFingerprint === fingerprint &&
+    receipt.status === "failed" &&
+    receipt.completedAt >= epochOpenedAt
+  ).length;
+}
+
+function currentPhaseEvents(state: TurnAggregateV1) {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (
+      (event.type === "phase.changed" && event.phase === state.phase) ||
+      (event.type === "run.started" && event.phase === state.phase)
+    ) {
+      return state.events.slice(index + 1);
+    }
+  }
+  return state.events;
+}
+
+/**
+ * Acting permits a small, ledger-bounded source-gap pass. Once two source
+ * operations have succeeded (or the current phase repeats the same source),
+ * the next provider request must choose from mutation capabilities. A global
+ * iteration-pressure signal must not remove reads from a newly opened
+ * corrective phase after validation exposed fresh source gaps.
+ * This is a process-stage policy, not a model- or wording-specific heuristic.
+ */
+function actingExecutePolicy(
+  state: TurnAggregateV1,
+):
+  | "source_refresh_required"
+  | "source_reorientation_required"
+  | "source_gap_allowed"
+  | "mutation_required" {
+  const phaseEvents = currentPhaseEvents(state);
+  const isSuccessfulSourceOperation = (event: (typeof phaseEvents)[number]) =>
+    event.type === "tool.completed" &&
+    event.status === "succeeded" &&
+    event.evidence.length > 0 &&
+    event.evidence.every((evidence) => evidence.kind === "source");
+  const successfulSourceOperations = phaseEvents.filter(
+    isSuccessfulSourceOperation,
+  ).length;
+  const pressureObserved = phaseEvents.some((event) =>
+    event.type === "soft_signal.observed" &&
+    event.signal === "repeat"
+  );
+  let latestRecoveryFailureIndex = -1;
+  let latestRecoveryFailureKind:
+    | "mutation_rejected"
+    | "source_mismatch"
+    | "target_invalid"
+    | null = null;
+  for (let index = phaseEvents.length - 1; index >= 0; index -= 1) {
+    const event = phaseEvents[index]!;
+    if (
+      event.type === "tool.completed" &&
+      event.status !== "succeeded" &&
+      (
+        event.failureKind === "mutation_rejected" ||
+        event.failureKind === "source_mismatch" ||
+        event.failureKind === "target_invalid"
+      )
+    ) {
+      latestRecoveryFailureIndex = index;
+      latestRecoveryFailureKind = event.failureKind;
+      break;
+    }
+  }
+  if (latestRecoveryFailureIndex >= 0) {
+    const refreshedSourceOperations = phaseEvents
+      .slice(latestRecoveryFailureIndex + 1)
+      .filter(isSuccessfulSourceOperation)
+      .length;
+    if (
+      latestRecoveryFailureKind === "source_mismatch" ||
+      latestRecoveryFailureKind === "mutation_rejected"
+    ) {
+      return refreshedSourceOperations > 0
+        ? "mutation_required"
+        : "source_refresh_required";
+    }
+    // A nonexistent, external, or otherwise invalid target cannot be repaired
+    // by rereading that same path. Reopen two source-only decisions so a weak
+    // model can first orient to the workspace and then inspect a real file.
+    return refreshedSourceOperations >= 2
+      ? "mutation_required"
+      : "source_reorientation_required";
+  }
+  let phaseBoundaryIndex = -1;
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "phase.changed" && event.phase === "acting") {
+      phaseBoundaryIndex = index;
+      break;
+    }
+  }
+  let previousBoundaryIndex = -1;
+  for (let index = phaseBoundaryIndex - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "phase.changed" || event.type === "run.started") {
+      previousBoundaryIndex = index;
+      break;
+    }
+  }
+  const previousBoundary = previousBoundaryIndex >= 0
+    ? state.events[previousBoundaryIndex]
+    : null;
+  const correctivePhase = phaseBoundaryIndex >= 0 &&
+    previousBoundary?.type !== undefined &&
+    "phase" in previousBoundary &&
+    previousBoundary.phase === "validating" &&
+    state.events
+      .slice(previousBoundaryIndex + 1, phaseBoundaryIndex)
+      .some((event) =>
+        event.type === "validation.completed" && !event.passed
+      );
+  if (correctivePhase) {
+    return successfulSourceOperations === 0
+      ? "source_refresh_required"
+      : "mutation_required";
+  }
+  return successfulSourceOperations >= 2 || pressureObserved
+    ? "mutation_required"
+    : "source_gap_allowed";
 }
 
 function deterministicCommandKey(
@@ -109,10 +257,9 @@ function recoveryFinalization(
 }
 
 /**
- * A command can be attempted twice for an identical structural action. The
- * third attempt becomes a truthful partial conclusion instead of another
- * indefinitely-running model request. New evidence opens a new epoch and
- * therefore creates a new action fingerprint/attempt lineage.
+ * Recovery limits retries of failed structural actions. A successful read is
+ * evidence, not a failed recovery attempt; repeated successful reads are
+ * redirected by the acting tool policy instead of being mislabeled terminal.
  */
 function boundedCommand(
   state: TurnAggregateV1,
@@ -120,10 +267,8 @@ function boundedCommand(
   payload: Readonly<Record<string, unknown>> = {},
 ): RuntimeV2Command {
   const fingerprint = actionFingerprint(state, kind, payload);
-  if (actionAttemptCount(state, fingerprint) >= RUNTIME_V2_RECOVERY_LIMITS.action) {
-    const failedAttempts = state.completedCommands.filter((receipt) =>
-      receipt.actionFingerprint === fingerprint && receipt.status === "failed"
-    ).length;
+  const failedAttempts = failedActionAttemptCount(state, fingerprint);
+  if (failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action) {
     const transportFailureCount = state.recovery.receipts.find((receipt) =>
       receipt.scope === "transport" &&
       receipt.fingerprint === `transport:${fingerprint}` &&
@@ -181,6 +326,29 @@ export function decideNextCommands(
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
+    if (toolCall.name === "spawn_subagent") {
+      return [boundedCommand(state, "schedule_subagents", {
+        toolCallId: toolCall.id,
+        arguments: toolCall.arguments,
+      })];
+    }
+    if (toolCall.name === "wait_subagents") {
+      const requested = [
+        ...commaSeparatedValues(toolCall.arguments.subagent_ids),
+        ...commaSeparatedValues(toolCall.arguments.collaboration_task_ids),
+      ];
+      const activeIds = state.subagents
+        .filter((job) => job.status === "queued" || job.status === "running")
+        .map((job) => job.id);
+      return [boundedCommand(state, "join_subagents", {
+        toolCallId: toolCall.id,
+        arguments: toolCall.arguments,
+        requestedJobIds: requested,
+        jobIds: requested.length > 0
+          ? activeIds.filter((id) => requested.includes(id))
+          : activeIds,
+      })];
+    }
     const kind = state.phase === "validating" ? "execute_validation" : "execute_tool";
     return [boundedCommand(state, kind, {
       toolCallId: toolCall.id,
@@ -203,42 +371,55 @@ export function decideNextCommands(
           objective: state.objective.text,
         })];
       }
-      if (input.allowReadOnlySubagents && input.hasReadOnlySubagentScopes) {
-        const activeChildren = state.subagents.some((job) => job.status === "queued" || job.status === "running");
-        if (state.subagents.length === 0) {
-          return [boundedCommand(state, "schedule_subagents", {
-            mode: "read_only",
-            objective: state.objective.text,
-          })];
-        }
-        if (activeChildren) {
-          const lastScheduleIndex = state.events.map((event) => event.type).lastIndexOf("subagents.scheduled");
-          const parentObservedWhileChildrenRun = state.events.some((event, index) =>
-            index > lastScheduleIndex && event.type === "provider.responded"
-          );
-          // Let the parent make one independent observation while the child
-          // HTTP requests are in flight. It is a structural schedule fact,
-          // not a guess from child/model wording.
-          if (!parentObservedWhileChildrenRun) {
-            return [boundedCommand(state, "request_model", {
-              mode: state.strategy === "analyze" ? "analyze" : "observe",
-              toolExpectation: "optional",
-              objective: state.objective.text,
-              evidenceIds: state.evidence.map((item) => item.id),
-              childEvidencePending: true,
-            })];
-          }
+      const collaborationAllowed =
+        input.subagentPreference === "allowed" ||
+        input.subagentPreference === "preferred";
+      const activeSubagents = state.subagents
+        .filter((job) => job.status === "queued" || job.status === "running")
+        .map((job) => ({
+          id: job.id,
+          name: job.name || job.scopeKey,
+          objective: job.objective,
+        }));
+      const initialSpawnRequired =
+        input.subagentPreference === "preferred" &&
+        state.subagents.length === 0;
+      if (activeSubagents.length > 0) {
+        const lastScheduleIndex = state.events
+          .map((event) => event.type)
+          .lastIndexOf("subagents.scheduled");
+        const parentObservedWhileChildrenRun = state.events.some(
+          (event, index) =>
+            index > lastScheduleIndex &&
+            event.type === "provider.responded",
+        );
+        // Child identity and work come only from the provider's real
+        // spawn_subagent call. Once the parent has had one independent model
+        // turn, the runtime joins the actual active jobs even if a smaller
+        // model forgets the explicit wait tool, keeping collaboration finite.
+        if (parentObservedWhileChildrenRun) {
           return [boundedCommand(state, "join_subagents", {
             mode: "read_only",
-            jobIds: state.subagents.map((job) => job.id),
+            jobIds: activeSubagents.map((job) => job.id),
           })];
         }
       }
       return [boundedCommand(state, "request_model", {
         mode: state.strategy === "analyze" ? "analyze" : "observe",
-        toolExpectation: "optional",
+        toolExpectation: initialSpawnRequired ? "required" : "optional",
         objective: state.objective.text,
         evidenceIds: state.evidence.map((item) => item.id),
+        collaborationAllowed,
+        collaborationAction: initialSpawnRequired
+          ? "spawn_required"
+          : activeSubagents.length > 0
+            ? "children_active"
+            : "optional",
+        activeSubagents,
+        remainingSubagentCapacity: Math.max(
+          0,
+          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - state.subagents.length,
+        ),
       })];
     }
     case "planning":
@@ -252,6 +433,7 @@ export function decideNextCommands(
     case "acting":
       return [boundedCommand(state, "request_model", {
         mode: "execute",
+        executePolicy: actingExecutePolicy(state),
         toolExpectation: "required",
         objective: state.objective.text,
         workPlanRevision: state.workPlan?.revision || null,

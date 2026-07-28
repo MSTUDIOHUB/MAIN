@@ -1,118 +1,39 @@
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import { streamChatCompletion } from "../../lib/streaming";
-import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
-  normalizeProviderResponseV1,
+  allocateProviderAttemptTimeoutMs,
   recordProviderTransportAttempt,
+  isRuntimeV2ProviderProtocolError,
   selectNextProviderTransportAttempt,
   type ProviderPort,
-  type RuntimeV2Command,
-  type RuntimeV2NormalizedProviderResult,
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
   baseProviderProfile,
-  compactTextEnvelopeCatalog,
-  containsProviderTextEnvelopePrompt,
-  providerHistory,
+  latestCorrectiveSourceRefreshWindow,
+  latestFailureReadWindow,
+  providerProfileForProvenToolTransport,
   providerToolDefinitionsForCommand,
-  recordApprovedPlanContext,
+  preferredFiniteValidationCommand,
   recordModelContext,
   type RuntimeV2ExecutionPortsInput,
-  type RuntimeV2LiveExecutionState,
 } from "./executionContext";
-import { unexpectedRuntimeV2ProviderToolNames } from "./providerToolSurface";
+import { finiteValidationCommandRejection } from "./executionAuthorization";
+import {
+  selectRuntimeOwnedSourceRefreshAction,
+  selectRuntimeOwnedValidationAction,
+} from "./executionDeterministicActions";
+import {
+  boundRuntimeV2ProviderToolCalls,
+  unexpectedRuntimeV2ProviderToolNames,
+} from "./providerToolSurface";
+import { withRuntimeV2HardDeadline } from "./hardDeadline";
+import {
+  requestRuntimeV2ProviderOnce,
+  runtimeV2ExecutionProviderOutputTokenLimit,
+  runtimeV2ProviderProtocolError,
+} from "./executionProviderRequest";
 
-function providerModeInstruction(command: RuntimeV2Command): string {
-  const mode = String(command.payload.mode || "").trim();
-  switch (mode) {
-    case "observe":
-      return "Current phase: bounded investigation. Use at most one focused read/search action when a concrete fact is missing. If the supplied evidence already identifies a safe fix, call the smallest workspace mutation now.";
-    case "analyze":
-      return "Current phase: bounded read-only workspace analysis. Use at most one focused read/search action when a concrete fact is missing. When the evidence is sufficient, return one complete Markdown answer with no tool call. Never request a mutation, shell command, browser action, or validation.";
-    case "execute":
-      return "Current phase: implementation. The bounded investigation window has ended. Use one focused read only when an exact source byte is missing; otherwise call one minimal workspace mutation. Never replace the tool call with a narration or another broad survey.";
-    case "validate":
-      return "Current phase: validate. Call a finite validation tool (prefer run_command or browser_evaluate) and wait for its actual result before concluding.";
-    case "conclude":
-      return "Current phase: final evidence report. Do not call another tool. State only the confirmed root cause, files actually changed, validation that actually passed, and any remaining limitation.";
-    default:
-      return "Current phase: choose the next action from concrete evidence. Use a structured tool whenever another fact, edit, or validation is required.";
-  }
-}
-
-async function requestProviderOnce(input: {
-  live: RuntimeV2LiveExecutionState;
-  ports: RuntimeV2ExecutionPortsInput;
-  command: RuntimeV2Command;
-  tools: ToolDefinition[];
-  textEnvelope: boolean;
-  toolChoice: "required" | "auto" | null;
-  signal: AbortSignal;
-}): Promise<RuntimeV2NormalizedProviderResult> {
-  const state = input.ports.get();
-  const settings = deriveStreamSettings(state.config);
-  let streamedText = "";
-  recordApprovedPlanContext(input.ports);
-  const history = providerHistory(input.live, input.ports);
-  const messages = [
-    ...history.messages,
-    { role: "system" as const, content: providerModeInstruction(input.command) },
-    ...(input.textEnvelope
-      ? [{
-          role: "system" as const,
-          content: containsProviderTextEnvelopePrompt(
-            input.ports.context.phaseLanguage,
-            input.command.payload.toolExpectation === "required",
-          ),
-        }, {
-          role: "system" as const,
-          content: compactTextEnvelopeCatalog(input.tools),
-        }]
-      : []),
-  ];
-  input.ports.logStoreEvent("runtime_v2_context_prepared", {
-    turnId: input.command.run.turnId,
-    runId: input.command.run.runId,
-    phase: input.command.phase,
-    mode: String(input.command.payload.mode || ""),
-    retainedEvidenceEntries: history.retained,
-    droppedEvidenceEntries: history.dropped,
-    availableContextEntries: input.live.modelContext.length,
-    contextSources: Object.fromEntries(
-      ["workspace", "tool", "subagent", "provider", "plan"].map((source) => [
-        source,
-        input.live.modelContext.filter((entry) => entry.source === source).length,
-      ]),
-    ),
-    approximateMessageChars: history.chars,
-    allowedToolCount: input.tools.length,
-    nativeToolCount: input.textEnvelope ? 0 : input.tools.length,
-    allowedToolNames: input.tools.map((tool) => tool.function.name),
-  });
-  const result = await streamChatCompletion(
-    messages,
-    settings,
-    {
-      onToken: (token) => { streamedText += token; },
-      onDone: () => undefined,
-      onError: () => undefined,
-    },
-    input.signal,
-    input.textEnvelope ? [] : input.tools,
-    undefined,
-    input.toolChoice ? { toolChoice: input.toolChoice } : {},
-  );
-  return normalizeProviderResponseV1({
-    visibleText: result.content || streamedText,
-    toolCalls: result.toolCalls,
-    usage: result.usage,
-    diagnostics: result.protocolViolation
-      ? [{ code: result.protocolViolation, message: "Provider tool protocol mismatch", retryable: true }]
-      : [],
-  });
-}
+export const RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
 
 export function createRuntimeV2ProviderPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -124,24 +45,126 @@ export function createRuntimeV2ProviderPort(
       if (!input.live.providerLaneProfile) {
         input.live.providerLaneProfile = baseProviderProfile(state);
       }
-      const profile = {
+      const profile = providerProfileForProvenToolTransport({
         ...input.live.providerLaneProfile,
         schemaVersion: "provider-lane.v1" as const,
         requiredToolChoice: requiresTool,
-      };
+      }, input.live.lastProviderTransport, requiresTool);
       // Freeze one capability surface for the Turn. A UI toggle or config
       // refresh after admission cannot make the provider request a tool that
       // the executor's authorization catalog did not expose.
       const tools = providerToolDefinitionsForCommand(input, command);
+      const preferredValidation =
+        preferredFiniteValidationCommand(input);
+      const allowedToolNames = tools.map((tool) => tool.function.name);
+      const deterministicValidation = !signal.aborted
+        ? selectRuntimeOwnedValidationAction({
+            command,
+            allowedToolNames,
+            preferredCommand: preferredValidation,
+          })
+        : null;
+      if (deterministicValidation) {
+        input.live.latestProviderResult = deterministicValidation;
+        input.live.latestVisibleText = "";
+        input.logStoreEvent("runtime_v2_validation_fallback_selected", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          phase: command.phase,
+          command:
+            deterministicValidation.toolCalls[0]?.arguments.command,
+          providerAttempts: 0,
+          selectionReason: "runtime_owned_preferred_validator",
+          lastFailureKind: null,
+          lastProtocolCode: null,
+        });
+        return deterministicValidation;
+      }
+      const deterministicSourceWindow =
+        !signal.aborted &&
+          command.payload.executePolicy === "source_refresh_required" &&
+          allowedToolNames.includes("read_file")
+        ? latestCorrectiveSourceRefreshWindow(
+            input.live,
+            input.context.runWorkspace || "",
+          )
+        : null;
+      const deterministicSourceRefresh = !signal.aborted
+        ? selectRuntimeOwnedSourceRefreshAction({
+            command,
+            allowedToolNames,
+            sourceWindow: deterministicSourceWindow,
+          })
+        : null;
+      if (deterministicSourceWindow && deterministicSourceRefresh) {
+        const failureContext = input.live.modelContext.find(
+          (entry) => entry.id === deterministicSourceWindow.evidenceId,
+        );
+        input.live.latestProviderResult = deterministicSourceRefresh;
+        input.live.latestVisibleText = "";
+        input.logStoreEvent(
+          "runtime_v2_failure_read_window_selected",
+          {
+            turnId: command.run.turnId,
+            runId: command.run.runId,
+            requestedPath: deterministicSourceWindow.path,
+            path: deterministicSourceWindow.path,
+            startLine: deterministicSourceWindow.startLine,
+            endLine: deterministicSourceWindow.endLine,
+            failureLine: deterministicSourceWindow.failureLine,
+            evidenceId: deterministicSourceWindow.evidenceId,
+            failureLabel: failureContext?.label || null,
+            selectionReason: "runtime_owned_source_refresh",
+          },
+        );
+        input.logStoreEvent(
+          "runtime_v2_source_refresh_fallback_selected",
+          {
+            turnId: command.run.turnId,
+            runId: command.run.runId,
+            phase: command.phase,
+            path: deterministicSourceWindow.path,
+            startLine: deterministicSourceWindow.startLine,
+            endLine: deterministicSourceWindow.endLine,
+            evidenceId: deterministicSourceWindow.evidenceId,
+          },
+        );
+        return deterministicSourceRefresh;
+      }
+      const requestDeadlineAt = Math.min(
+        Date.now() + RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS,
+        input.lifecycleDeadlineAt ?? Number.POSITIVE_INFINITY,
+      );
       let epoch: { actionKey: string; attempted: readonly RuntimeV2TransportVariant[] } = {
         actionKey: command.idempotencyKey,
         attempted: [],
       };
       let lastError: unknown = null;
       while (true) {
+        if (Date.now() >= requestDeadlineAt) {
+          lastError = new Error(
+            "RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT",
+          );
+          break;
+        }
         const attempt = selectNextProviderTransportAttempt(profile, epoch);
         if (!attempt) break;
         epoch = recordProviderTransportAttempt(epoch, attempt);
+        const requestAbort = new AbortController();
+        let requestTimedOut = false;
+        const forwardAbort = () => requestAbort.abort(signal.reason);
+        if (signal.aborted) {
+          forwardAbort();
+        } else {
+          signal.addEventListener("abort", forwardAbort, { once: true });
+        }
+        const remainingMs = Math.max(1, requestDeadlineAt - Date.now());
+        const hasFallback =
+          selectNextProviderTransportAttempt(profile, epoch) !== null;
+        const timeoutMs = allocateProviderAttemptTimeoutMs(
+          remainingMs,
+          hasFallback,
+        );
         try {
           input.logStoreEvent("runtime_v2_provider_request_opened", {
             turnId: command.run.turnId,
@@ -150,21 +173,75 @@ export function createRuntimeV2ProviderPort(
             transport: attempt.variant,
             textEnvelope: attempt.textEnvelope,
             toolExpectation: requiresTool ? "required" : "optional",
+            executePolicy: String(command.payload.executePolicy || ""),
             allowedToolCount: tools.length,
             nativeToolCount: attempt.textEnvelope ? 0 : tools.length,
             allowedToolNames: tools.map((tool) => tool.function.name),
+            hasFallback,
+            remainingRequestMs: remainingMs,
+            timeoutMs,
+            maxOutputTokens:
+              runtimeV2ExecutionProviderOutputTokenLimit(
+                command,
+                attempt.textEnvelope,
+              ),
           });
-          const result = await requestProviderOnce({
-            live: input.live,
-            ports: input,
-            command,
-            tools,
-            textEnvelope: attempt.textEnvelope,
-            toolChoice: attempt.toolChoice,
-            signal,
+          let result = await withRuntimeV2HardDeadline({
+            timeoutMs,
+            timeoutError: "RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT",
+            onTimeout: () => {
+              requestTimedOut = true;
+              requestAbort.abort(
+                "runtime_v2_execution_provider_request_timeout",
+              );
+            },
+            task: () => requestRuntimeV2ProviderOnce({
+              live: input.live,
+              ports: input,
+              command,
+              tools,
+              textEnvelope: attempt.textEnvelope,
+              toolChoice: attempt.toolChoice,
+              signal: requestAbort.signal,
+              timeoutMs,
+            }),
           });
           if (requiresTool && result.toolCalls.length === 0) {
-            throw new Error("Provider returned no structured tool call for a tool-required runtime command.");
+            const missingToolText = sanitizeAssistantDisplayContent(
+              result.visibleText || "",
+            ).replace(/\s+/g, " ").trim();
+            input.logStoreEvent("runtime_v2_required_tool_missing", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              phase: command.phase,
+              transport: attempt.variant,
+              textEnvelope: attempt.textEnvelope,
+              responseChars: missingToolText.length,
+              responsePreview: missingToolText.slice(0, 600),
+              responseTail: missingToolText.length > 600
+                ? missingToolText.slice(-600)
+                : "",
+              diagnosticCodes: result.diagnostics
+                .map((diagnostic) => diagnostic.code)
+                .slice(0, 8),
+              diagnosticMessages: result.diagnostics
+                .map((diagnostic) => diagnostic.message)
+                .slice(0, 4),
+              startsWithJson: /^\s*\{/.test(result.visibleText || ""),
+              hasJsonFence: /^\s*```(?:json)?/i.test(
+                result.visibleText || "",
+              ),
+              mentionsToolCalls: /tool_?calls?|runtime-v2-tools/i.test(
+                result.visibleText || "",
+              ),
+            });
+            throw runtimeV2ProviderProtocolError({
+              ports: input,
+              command,
+              code: "required_tool_missing",
+              requestedToolNames: [],
+              allowedToolNames: tools.map((tool) => tool.function.name),
+            });
           }
           const unexpectedToolNames = unexpectedRuntimeV2ProviderToolNames(
             tools,
@@ -179,9 +256,149 @@ export function createRuntimeV2ProviderPort(
               unexpectedToolNames,
               allowedToolNames: tools.map((tool) => tool.function.name),
             });
-            throw new Error(
-              `Provider requested tools outside the current Runtime v2 phase surface: ${unexpectedToolNames.join(", ")}`,
+            throw runtimeV2ProviderProtocolError({
+              ports: input,
+              command,
+              code: "tool_surface_rejected",
+              requestedToolNames: unexpectedToolNames,
+              allowedToolNames: tools.map((tool) => tool.function.name),
+            });
+          }
+          const boundedBatch = boundRuntimeV2ProviderToolCalls(
+            result.toolCalls,
+          );
+          if (boundedBatch.discarded.length > 0) {
+            input.logStoreEvent(
+              "runtime_v2_provider_tool_batch_normalized",
+              {
+                turnId: command.run.turnId,
+                runId: command.run.runId,
+                phase: command.phase,
+                transport: attempt.variant,
+                acceptedToolName: boundedBatch.accepted[0]?.name || null,
+                discardedToolNames: boundedBatch.discarded.map(
+                  (call) => call.name,
+                ),
+                originalToolCount: result.toolCalls.length,
+              },
             );
+            result = {
+              ...result,
+              toolCalls: boundedBatch.accepted,
+            };
+          }
+          if (
+            String(command.payload.mode || "") === "execute" &&
+            (
+              command.payload.executePolicy === "source_gap_allowed" ||
+              command.payload.executePolicy ===
+                "source_reorientation_required" ||
+              command.payload.executePolicy === "source_refresh_required" ||
+              command.payload.executePolicy === "mutation_required"
+            )
+          ) {
+            let enriched = false;
+            const toolCalls = result.toolCalls.map((call) => {
+              const forceRuntimeWindow =
+                command.payload.executePolicy === "source_refresh_required";
+              const hasExplicitWindow =
+                call.arguments.start_line !== undefined ||
+                call.arguments.end_line !== undefined;
+              if (
+                call.name !== "read_file" ||
+                (!forceRuntimeWindow && hasExplicitWindow)
+              ) {
+                return call;
+              }
+              const requestedPath = String(
+                call.arguments.path || call.arguments.file_path || "",
+              ).trim();
+              const primaryWindow = forceRuntimeWindow
+                ? latestCorrectiveSourceRefreshWindow(
+                    input.live,
+                    input.context.runWorkspace || "",
+                  )
+                : null;
+              const window = primaryWindow || latestFailureReadWindow(
+                input.live,
+                requestedPath,
+                input.context.runWorkspace || "",
+              );
+              if (!window) return call;
+              enriched = true;
+              const resolvedPath = "path" in window
+                ? window.path
+                : requestedPath;
+              const failureContext = input.live.modelContext.find(
+                (entry) => entry.id === window.evidenceId,
+              );
+              input.logStoreEvent(
+                "runtime_v2_failure_read_window_selected",
+                {
+                  turnId: command.run.turnId,
+                  runId: command.run.runId,
+                  requestedPath,
+                  path: resolvedPath,
+                  startLine: window.startLine,
+                  endLine: window.endLine,
+                  failureLine: window.failureLine,
+                  evidenceId: window.evidenceId,
+                  failureLabel: failureContext?.label || null,
+                },
+              );
+              return {
+                ...call,
+                arguments: {
+                  ...call.arguments,
+                  path: resolvedPath,
+                  start_line: window.startLine,
+                  end_line: window.endLine,
+                  max_lines: window.endLine - window.startLine + 1,
+                },
+              };
+            });
+            if (enriched) result = { ...result, toolCalls };
+          }
+          if (String(command.payload.mode || "") === "validate") {
+            const invalidValidationCall = result.toolCalls.find((call) => {
+              if (call.name !== "run_command") return false;
+              return !!finiteValidationCommandRejection(
+                call.arguments.command || call.arguments.cmd,
+              );
+            });
+            if (invalidValidationCall) {
+              const rejection = finiteValidationCommandRejection(
+                invalidValidationCall.arguments.command ||
+                  invalidValidationCall.arguments.cmd,
+              )!;
+              const preferredValidation =
+                preferredFiniteValidationCommand(input);
+              input.logStoreEvent(
+                "runtime_v2_provider_tool_arguments_rejected",
+                {
+                  turnId: command.run.turnId,
+                  runId: command.run.runId,
+                  phase: command.phase,
+                  transport: attempt.variant,
+                  toolName: invalidValidationCall.name,
+                  reason: rejection.reasonCode,
+                  rejectionReason: rejection.rejectionReason,
+                  preferredValidationCommand: preferredValidation || null,
+                },
+              );
+              throw runtimeV2ProviderProtocolError({
+                ports: input,
+                command,
+                code: "tool_arguments_rejected",
+                requestedToolNames: [invalidValidationCall.name],
+                allowedToolNames: tools.map((tool) => tool.function.name),
+                detail: [
+                  "The proposed run_command is not a finite acceptance validator.",
+                  rejection.message,
+                ].join(" "),
+                preferredValidationCommand: preferredValidation,
+              });
+            }
           }
           input.live.latestProviderResult = result;
           // A tool envelope (or a native response that bundles an action with
@@ -201,7 +418,14 @@ export function createRuntimeV2ProviderPort(
               content: input.live.latestVisibleText,
             });
           }
-          input.live.lastProviderTransport = attempt.textEnvelope ? "text_envelope" : "native";
+          if (result.toolCalls.length > 0) {
+            input.live.lastProviderTransport = attempt.textEnvelope &&
+                input.live.lastProviderTransport === "native"
+              ? "native"
+              : attempt.textEnvelope
+                ? "text_envelope"
+                : "native";
+          }
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,
@@ -213,14 +437,61 @@ export function createRuntimeV2ProviderPort(
           });
           return result;
         } catch (error) {
-          lastError = error;
-          input.logStoreEvent("runtime_v2_provider_transport_failed", {
+          const normalizedError = requestTimedOut
+            ? new Error("RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT")
+            : error;
+          lastError = normalizedError;
+          input.logStoreEvent(isRuntimeV2ProviderProtocolError(normalizedError)
+            ? "runtime_v2_provider_protocol_failed"
+            : "runtime_v2_provider_transport_failed", {
             turnId: command.run.turnId,
             runId: command.run.runId,
             transport: attempt.variant,
-            error: error instanceof Error ? error.message : String(error),
+            ...(isRuntimeV2ProviderProtocolError(normalizedError)
+              ? { protocolCode: normalizedError.code }
+              : {}),
+            timedOut: requestTimedOut,
+            timeoutMs,
+            error: normalizedError instanceof Error
+              ? normalizedError.message
+              : String(normalizedError),
           });
+        } finally {
+          signal.removeEventListener("abort", forwardAbort);
         }
+      }
+      const validationFallback = !signal.aborted
+        ? selectRuntimeOwnedValidationAction({
+            command,
+            allowedToolNames,
+            preferredCommand: preferredFiniteValidationCommand(input),
+          })
+        : null;
+      if (validationFallback) {
+        input.live.latestProviderResult = validationFallback;
+        input.live.latestVisibleText = "";
+        input.logStoreEvent("runtime_v2_validation_fallback_selected", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          phase: command.phase,
+          command: validationFallback.toolCalls[0]?.arguments.command,
+          providerAttempts: epoch.attempted.length,
+          lastFailureKind: isRuntimeV2ProviderProtocolError(lastError)
+            ? "protocol"
+            : "transport",
+          lastProtocolCode: isRuntimeV2ProviderProtocolError(lastError)
+            ? lastError.code
+            : null,
+        });
+        return validationFallback;
+      }
+      if (isRuntimeV2ProviderProtocolError(lastError)) {
+        input.logStoreEvent("runtime_v2_provider_protocol_exhausted", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          phase: command.phase,
+          protocolCode: lastError.code,
+        });
       }
       throw lastError instanceof Error ? lastError : new Error("Runtime v2 provider transport attempts exhausted.");
     },

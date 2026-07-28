@@ -26,6 +26,7 @@ import {
   type PlanProviderTransport,
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { withRuntimeV2HardDeadline } from "./hardDeadline";
 
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (
@@ -90,10 +91,6 @@ export async function requestPlanModel(input: {
       : PLAN_MODEL_REQUEST_TIMEOUT_MS,
     input.deadlineAt - Date.now(),
   ));
-  const requestTimeout = setTimeout(() => {
-    requestTimedOut = true;
-    requestAbort.abort("runtime_v2_plan_provider_request_timeout");
-  }, requestTimeoutMs);
   const requestMessages = input.stage === "synthesis"
     ? synthesisPlanTranscript({
         ...input,
@@ -118,25 +115,33 @@ export async function requestPlanModel(input: {
       ),
       timeoutMs: requestTimeoutMs,
     });
-    const result = await streamChatCompletion(
-      requestMessages,
-      deriveStreamSettings(input.get().config),
-      {
-        onToken: (token) => { streamedText += token; },
-        onDone: () => undefined,
-        onError: () => undefined,
+    const result = await withRuntimeV2HardDeadline({
+      timeoutMs: requestTimeoutMs,
+      timeoutError: "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT",
+      onTimeout: () => {
+        requestTimedOut = true;
+        requestAbort.abort("runtime_v2_plan_provider_request_timeout");
       },
-      requestAbort.signal,
-      offeredTools,
-      submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
-      {
-        ...(toolChoice ? { toolChoice } : {}),
-        ...(structuredResponse
-          ? { responseFormat: WORK_PLAN_STRUCTURED_RESPONSE_FORMAT }
-          : {}),
-        timeoutMs: requestTimeoutMs,
-      },
-    );
+      task: () => streamChatCompletion(
+        requestMessages,
+        deriveStreamSettings(input.get().config),
+        {
+          onToken: (token) => { streamedText += token; },
+          onDone: () => undefined,
+          onError: () => undefined,
+        },
+        requestAbort.signal,
+        offeredTools,
+        submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
+        {
+          ...(toolChoice ? { toolChoice } : {}),
+          ...(structuredResponse
+            ? { responseFormat: WORK_PLAN_STRUCTURED_RESPONSE_FORMAT }
+            : {}),
+          timeoutMs: requestTimeoutMs,
+        },
+      ),
+    });
     const rawVisibleText = result.content || streamedText;
     const structuredCandidate = structuredResponse
       ? decodeExactStructuredPlanResponse(rawVisibleText)
@@ -229,7 +234,6 @@ export async function requestPlanModel(input: {
       ? new Error("RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT")
       : error;
   } finally {
-    clearTimeout(requestTimeout);
     input.context.abortCtrl.signal.removeEventListener("abort", forwardAbort);
   }
 }

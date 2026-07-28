@@ -8788,6 +8788,11 @@ function seedRealOmlxPlanFlowScenario() {
       return {
         id: job.id,
         scopeKey: job.scopeKey,
+        sourceToolCallId: job.sourceToolCallId || "",
+        name: job.name || "",
+        role: job.role || "",
+        objective: job.objective || "",
+        successCriteria: job.successCriteria || "",
         status: job.status,
         allowedPaths: job.allowedPaths || [],
         requestedAt: job.requestedAt || null,
@@ -8841,21 +8846,50 @@ function seedRealOmlxPlanFlowScenario() {
         })),
       timeline: runtimeV2TaskBlocks
         .filter((block: any) =>
-          block.type === "progress" &&
-          block.source === "runtime" &&
-          block.runId === runtimeV2RunId
+          block.runId === runtimeV2RunId &&
+          (
+            (
+              block.type === "progress" &&
+              block.source === "runtime"
+            ) ||
+            (
+              block.type === "tool" &&
+              String(block.dedupeKey || "").startsWith(
+                "runtime-v2-timeline:",
+              )
+            )
+          )
         )
         .map((block: any) => ({
           id: block.id,
-          phase: block.phase || "",
-          title: block.title || "",
-          action: block.action || "",
-          status: block.status || "",
-          toolName: block.toolName || block.tool || "",
-          target: block.target || block.canonicalTarget || "",
+          phase: block.phase || block.turnPhase?.kind || "",
+          title:
+            block.title ||
+            block.intentSummary ||
+            block.toolName ||
+            "",
+          action: block.action || block.message || "",
+          status: block.type === "tool"
+            ? block.toolStatus === "executed"
+              ? "done"
+              : block.toolStatus === "failed" ||
+                  block.toolStatus === "rejected"
+                ? "failed"
+                : block.toolStatus || block.status || ""
+            : block.status || "",
+          toolName:
+            block.executionName ||
+            block.toolName ||
+            block.tool ||
+            "",
+          target:
+            block.target ||
+            block.canonicalTarget ||
+            "",
           runId: block.runId || "",
           toolCallId: block.toolCallId || "",
           dedupeKey: block.dedupeKey || "",
+          diff: block.diff || null,
         })),
       finals: runtimeV2TaskBlocks
         .filter((block: any) => block.type === "agent" && block.visibility === "assistant_final")

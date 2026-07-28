@@ -119,6 +119,10 @@ export type TaskBlock =
       toolCallId?: string;
       message?: string;
       diff?: ToolDiffSnapshot;
+      /** Runtime v2 projection owner and durable command identity. */
+      runId?: string;
+      parentRunId?: string | null;
+      dedupeKey?: string;
       /** A terminal diff is verified on success and partial after a failed tool. */
       workspaceEffect?: "verified" | "partial";
       shellPermissionDecision?: ShellPermissionDecision;

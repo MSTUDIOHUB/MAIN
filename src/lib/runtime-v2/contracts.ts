@@ -97,6 +97,26 @@ export interface RuntimeV2EvidenceReference {
   readonly version: string | null;
 }
 
+/**
+ * Bounded user-facing facts captured at the effect boundary. The runtime
+ * ledger remains the lifecycle authority; this payload only lets the UI
+ * render the real tool target, result and mutation diff instead of inventing
+ * generic progress prose after the fact.
+ */
+export interface RuntimeV2ToolPresentation {
+  readonly toolName: string;
+  readonly target: string;
+  readonly message?: string;
+  readonly observationSummary?: string;
+  readonly diff?: {
+    readonly old: string;
+    readonly new: string;
+    readonly path?: string;
+    readonly existed?: boolean;
+    readonly fullFile?: boolean;
+  };
+}
+
 export interface RuntimeV2WorkPlanReference {
   readonly id: string;
   readonly revision: number;
@@ -183,8 +203,15 @@ export interface RuntimeV2SubagentJob {
   readonly id: string;
   readonly run: RuntimeV2RunIdentity;
   readonly parentRunId: string;
+  /** Exact provider tool call that created this one-shot job. */
+  readonly sourceToolCallId?: string;
   readonly scopeKey: string;
+  /** Provider-selected presentation identity and role. */
+  readonly name?: string;
+  readonly role?: string;
   readonly objective: string;
+  readonly successCriteria?: string;
+  readonly expectedOutput?: string;
   readonly allowedPaths: readonly string[];
   readonly status: RuntimeV2SubagentStatus;
   readonly requestedAt: number;

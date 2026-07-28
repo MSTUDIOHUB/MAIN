@@ -132,7 +132,7 @@ test("turn archive model groups latest thought, context, edits, verification, an
   assert.match(archive.summaryText, /编辑 1/);
 });
 
-test("canonical failed-after-change remains an edit step while a no-diff failure remains blocked", () => {
+test("failed mutation attempts remain edit steps even when preflight prevents a diff", () => {
   const canonicalToolName = "mcp__unity__manage_script__f09a";
   const changed = {
     id: 21,
@@ -154,8 +154,8 @@ test("canonical failed-after-change remains an edit step while a no-diff failure
   const unchanged = {
     id: 22,
     type: "tool",
-    toolName: canonicalToolName,
-    executionName: "manage_script",
+    toolName: "replace_in_file",
+    executionName: "replace_in_file",
     target: "Assets/Scripts/Untouched.cs",
     status: "error",
     toolStatus: "failed",
@@ -175,7 +175,7 @@ test("canonical failed-after-change remains an edit step while a no-diff failure
   });
   const live = buildLiveTurnProcessTimelineModel({ blocks: [changed, unchanged], language: "zh" });
 
-  assert.deepEqual(archive.steps.map((step) => step.kind), ["edit", "blocked"]);
+  assert.deepEqual(archive.steps.map((step) => step.kind), ["edit", "edit"]);
   assert.deepEqual(archive.steps.map((step) => step.status), ["failed", "failed"]);
   assert.equal(archive.steps[0].activity.kind, "edit");
   assert.equal(archive.steps[0].activity.metrics.filesEdited, 1);
@@ -183,7 +183,8 @@ test("canonical failed-after-change remains an edit step while a no-diff failure
   assert.equal(archive.steps[0].items[0].executionName, "manage_script");
   assert.equal(archive.steps[0].items[0].workspaceEffect, "partial");
   assert.equal(archive.steps[1].activity.metrics.filesEdited, 0);
-  assert.deepEqual(live.steps.map((step) => step.kind), ["edit", "blocked"]);
+  assert.equal(archive.steps[1].activity.label, "修改未应用");
+  assert.deepEqual(live.steps.map((step) => step.kind), ["edit", "edit"]);
   assert.equal(live.steps[0].items[0].diff.path, "Assets/Scripts/Player.cs");
 });
 

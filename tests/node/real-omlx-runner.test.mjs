@@ -57,13 +57,13 @@ test("real OMLX spec fails closed unless parent and subagents share one explicit
   assert.match(specSource, /explicitSubagentModel !== models\[0\]/);
 });
 
-test("real OMLX validation requires caller-prepared workspaces and explicit acceptance scopes", () => {
+test("real OMLX validation requires caller-prepared workspaces and explicit evidence targets", () => {
   assert.match(source, /REAL_OMLX_WORKSPACE 必须是调用方预先复制好的非空工作区/);
   assert.match(source, /workspaceEntries\.length === 0/);
   assert.match(specSource, /E2E_REAL_OMLX_CUSTOM_WORKSPACE_EMPTY/);
   assert.match(specSource, /REAL_OMLX_PLAN_EVIDENCE_TARGETS/);
-  assert.match(specSource, /REAL_OMLX_EXPECT_SUBAGENT_SCOPES/);
   assert.match(specSource, /candidateEvidenceTargets\.has\(target\)/);
+  assert.doesNotMatch(specSource, /REAL_OMLX_EXPECT_SUBAGENT_SCOPES/);
   assert.doesNotMatch(specSource, /Fall back to the deterministic fixture structure below/);
 });
 
@@ -73,6 +73,12 @@ test("real OMLX E2E identity and acceptance are model-neutral and debug-tail ind
   assert.match(e2eBridgeSource, /__REAL_OMLX_ACCEPTANCE_STATE__/);
   assert.match(specSource, /recordRealOmlxAcceptanceDebugEvent/);
   assert.match(specSource, /expectRuntimeV2ReadOnlyCollaboration/);
-  assert.match(structuralAssertionsSource, /hasRequestOverlap: true/);
+  assert.match(structuralAssertionsSource, /jobs\.length\)\.toBeGreaterThanOrEqual\(1\)/);
+  assert.match(structuralAssertionsSource, /sourceToolCallId/);
+  assert.match(structuralAssertionsSource, /successCriteria/);
   assert.match(structuralAssertionsSource, /peakInFlight/);
+  assert.doesNotMatch(
+    structuralAssertionsSource,
+    /### \(\?:已启动并行只读调查\|并行只读调查已汇合\|当前阶段：\)\/\.test[\s\S]*\)\)\.toBe\(true\)/,
+  );
 });

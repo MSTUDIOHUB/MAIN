@@ -39,6 +39,9 @@ const {
 const {
   buildLiveTurnProcessTimelineModel,
 } = loadTs(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
+const {
+  projectSubagentRuns,
+} = loadTs(path.join(workspaceRoot, "src/lib/subagents.ts"));
 
 const runIdentity = {
   sessionKey: "session-a",
@@ -161,13 +164,14 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 
   let state = harness.getState();
   let timelineBlocks = state.taskFlow.filter((block) =>
-    block.type === "progress" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+    block.type === "tool" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
   );
   assert.equal(timelineBlocks.length, 1);
   assert.equal(timelineBlocks[0].status, "running");
+  assert.equal(timelineBlocks[0].toolStatus, "running");
   assert.equal(timelineBlocks[0].target, "src/components/editor.js");
-  assert.equal(timelineBlocks[0].source, "runtime");
-  assert.match(timelineBlocks[0].title, /editor\.js/);
+  assert.equal(timelineBlocks[0].toolName, "replace_in_file");
+  assert.match(timelineBlocks[0].intentSummary, /editor\.js/);
   assert.ok(state.conversationTurns[0].blockIds.includes(timelineBlocks[0].id));
   assert.equal(
     state.runtimeEvents.filter((event) => event.type === "item.completed").length,
@@ -180,10 +184,30 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
     includeThoughts: false,
   });
   assert.equal(liveModel.stepCount, 1);
-  assert.match(liveModel.steps[0].intent, /editor\.js/);
+  assert.deepEqual(
+    liveModel.steps[0].targets,
+    ["src/components/editor.js"],
+  );
 
   await harness.port.publish({
     aggregate: aggregate({
+      events: [{
+        type: "tool.completed",
+        idempotencyKey: edit.idempotencyKey,
+        status: "succeeded",
+        presentation: {
+          toolName: "replace_in_file",
+          target: "src/components/editor.js",
+          message: "Updated src/components/editor.js",
+          diff: {
+            old: "const value = 1;\n",
+            new: "const value = 2;\n",
+            path: "src/components/editor.js",
+            existed: true,
+            fullFile: true,
+          },
+        },
+      }],
       completedCommands: [{
         idempotencyKey: edit.idempotencyKey,
         kind: edit.kind,
@@ -198,10 +222,178 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 
   state = harness.getState();
   timelineBlocks = state.taskFlow.filter((block) =>
-    block.type === "progress" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+    block.type === "tool" && String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
   );
   assert.equal(timelineBlocks.length, 1);
   assert.equal(timelineBlocks[0].status, "done");
+  assert.equal(timelineBlocks[0].toolStatus, "executed");
+  assert.equal(timelineBlocks[0].message, "Updated src/components/editor.js");
+  assert.deepEqual(timelineBlocks[0].diff, {
+    old: "const value = 1;\n",
+    new: "const value = 2;\n",
+    path: "src/components/editor.js",
+    existed: true,
+    fullFile: true,
+  });
+  assert.equal(timelineBlocks[0].workspaceEffect, "verified");
+});
+
+test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async () => {
+  const harness = createHarness();
+  const edit = command();
+  const liveText = "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+
+  await harness.port.publish({
+    aggregate: aggregate({ scheduledCommands: [edit] }),
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      liveText,
+      "turn-a:action:edit-1",
+    ),
+  });
+
+  let progressEvents = harness.getState().runtimeEvents.filter(
+    (event) => event.type === "progress.updated",
+  );
+  assert.equal(progressEvents.length, 1);
+  assert.equal(progressEvents[0].progress.title, "正在编辑 editor.js");
+  assert.equal(progressEvents[0].progress.summary, liveText);
+  assert.notEqual(
+    progressEvents[0].progress.title,
+    progressEvents[0].progress.summary,
+  );
+
+  await harness.port.publish({
+    aggregate: aggregate({ scheduledCommands: [] }),
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "正在实施修改。",
+      "turn-a:phase:acting",
+      "live-action-phase",
+    ),
+  });
+
+  progressEvents = harness.getState().runtimeEvents.filter(
+    (event) => event.type === "progress.updated",
+  );
+  const phaseProgress = progressEvents.at(-1).progress;
+  assert.equal(phaseProgress.title, "正在实施修改");
+  assert.equal(phaseProgress.summary, undefined);
+});
+
+test("V2 timeline records an unmet acceptance check without presenting the task as paused", async () => {
+  const harness = createHarness();
+  const validation = command({
+    idempotencyKey: "run-a:validating:execute_validation:build",
+    kind: "execute_validation",
+    phase: "validating",
+    payload: {
+      toolName: "run_command",
+      arguments: { command: "npm run build" },
+    },
+  });
+  await harness.port.publish({
+    aggregate: aggregate({
+      phase: "validating",
+      scheduledCommands: [validation],
+    }),
+    audience: "timeline",
+    projection: projection(
+      "timeline",
+      "正在运行有限验证，检查本轮修改和验收条件。",
+      "turn-a:command:validation-1",
+    ),
+  });
+  await harness.port.publish({
+    aggregate: aggregate({
+      phase: "validating",
+      events: [{
+        type: "validation.completed",
+        idempotencyKey: validation.idempotencyKey,
+        passed: false,
+        presentation: {
+          toolName: "run_command",
+          target: "npm run build",
+          message: "src/main.ts:12:1 - type error",
+          observationSummary: "src/main.ts:12:1 - type error",
+        },
+      }],
+      completedCommands: [{
+        idempotencyKey: validation.idempotencyKey,
+        kind: validation.kind,
+        actionFingerprint: "validation",
+        status: "succeeded",
+        completedAt: 2,
+      }],
+    }),
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "正在根据验证结果准备下一项修复。",
+      "turn-a:phase:acting",
+    ),
+  });
+
+  const state = harness.getState();
+  const block = state.taskFlow.find((item) =>
+    item.type === "tool" &&
+    item.toolCallId === validation.idempotencyKey
+  );
+  assert.equal(block.status, "error");
+  assert.equal(block.toolStatus, "failed");
+  assert.match(block.message, /type error/);
+  const timeline = buildLiveTurnProcessTimelineModel({
+    blocks: state.taskFlow,
+    language: "zh",
+    includeThoughts: false,
+  });
+  assert.equal(timeline.steps[0].kind, "blocked");
+  assert.equal(timeline.steps[0].activity.metrics.commandsRun, 1);
+  assert.match(timeline.steps[0].activity.latestEvidence, /type error/);
+});
+
+test("V2 timeline retains each concrete command as an ordered record", async () => {
+  const harness = createHarness();
+  const first = command({
+    idempotencyKey: "run-a:acting:execute_tool:read-editor",
+    payload: {
+      toolName: "read_file",
+      arguments: { path: "src/components/editor.js" },
+    },
+  });
+  const second = command({
+    idempotencyKey: "run-a:acting:execute_tool:read-toolbar",
+    payload: {
+      toolName: "read_file",
+      arguments: { path: "src/components/toolbar.js" },
+    },
+  });
+  for (const [index, item] of [first, second].entries()) {
+    await harness.port.publish({
+      aggregate: aggregate({ scheduledCommands: [item] }),
+      audience: "timeline",
+      projection: projection(
+        "timeline",
+        `正在读取 \`${item.payload.arguments.path}\`。`,
+        `turn-a:command:read-${index + 1}`,
+        `timeline-${index + 1}`,
+      ),
+    });
+  }
+
+  const model = buildLiveTurnProcessTimelineModel({
+    blocks: harness.getState().taskFlow,
+    language: "zh",
+    includeThoughts: false,
+  });
+  assert.equal(model.stepCount, 1);
+  assert.equal(model.steps[0].activity.metrics.filesRead, 2);
+  assert.deepEqual(
+    model.steps[0].items.map((item) => item.target),
+    ["src/components/editor.js", "src/components/toolbar.js"],
+  );
 });
 
 test("V2 timeline keeps validation targets complete, omits raw output, and removes canceled provisional rows", async () => {
@@ -232,7 +424,7 @@ test("V2 timeline keeps validation targets complete, omits raw output, and remov
   let state = harness.getState();
   const validationBlock = state.taskFlow.find((block) => block.toolCallId === validation.idempotencyKey);
   assert.ok(validationBlock);
-  assert.equal(validationBlock.phase, "verifying");
+  assert.equal(validationBlock.turnPhase.kind, "validation");
   assert.equal(validationBlock.target, "npm run build -- --mode validation");
   assert.doesNotMatch(JSON.stringify(validationBlock), /SECRET_TOOL_OUTPUT/);
 
@@ -257,15 +449,15 @@ test("V2 timeline keeps validation targets complete, omits raw output, and remov
   );
 });
 
-test("V2 Chat milestones remain durable assistant updates rather than timeline narration", async () => {
+test("V2 provider commentary remains a durable assistant update rather than timeline narration", async () => {
   const harness = createHarness();
   await harness.port.publish({
     aggregate: aggregate(),
     audience: "chat_milestone",
     projection: projection(
       "milestone",
-      "### 已启动并行只读调查\n\n- 前端和后端范围已经分别分配。",
-      "turn-a:subagents:frontend:backend",
+      "我先让 Kepler 独立核对保存事件的消费链。",
+      "turn-a:provider-commentary:spawn-save-events",
     ),
   });
 
@@ -280,6 +472,127 @@ test("V2 Chat milestones remain durable assistant updates rather than timeline n
     ).length,
     0,
   );
+});
+
+test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle records", async () => {
+  const harness = createHarness();
+  const childRun = (suffix) => ({
+    ...runIdentity,
+    runId: `child-${suffix}`,
+    parentRunId: runIdentity.runId,
+    attemptId: `child-${suffix}`,
+  });
+  const jobs = ["frontend", "backend"].map((scope, index) => ({
+    id: `job-${scope}`,
+    run: childRun(scope),
+    parentRunId: runIdentity.runId,
+    scopeKey: scope,
+    objective: `Inspect ${scope}`,
+    allowedPaths: [index === 0 ? "src" : "src-tauri"],
+    status: "completed",
+    requestedAt: 10 + index,
+    firstTokenAt: 20 + index,
+    closedAt: 30 + index,
+    summary: `${scope} evidence`,
+  }));
+  const events = [
+    {
+      type: "subagents.scheduled",
+      eventId: "event-scheduled",
+      at: 10,
+      run: runIdentity,
+      jobs: jobs.map((job) => ({
+        ...job,
+        status: "queued",
+        firstTokenAt: null,
+        closedAt: null,
+        summary: null,
+      })),
+    },
+    ...jobs.flatMap((job, index) => [
+      {
+        type: "subagent.telemetry",
+        eventId: `event-open-${job.id}`,
+        at: 12 + index,
+        run: runIdentity,
+        telemetry: {
+          jobId: job.id,
+          phase: "request_opened",
+          at: 12 + index,
+        },
+      },
+      {
+        type: "subagent.telemetry",
+        eventId: `event-token-${job.id}`,
+        at: 20 + index,
+        run: runIdentity,
+        telemetry: {
+          jobId: job.id,
+          phase: "first_token",
+          at: 20 + index,
+        },
+      },
+      {
+        type: "subagent.completed",
+        eventId: `event-complete-${job.id}`,
+        at: 30 + index,
+        run: runIdentity,
+        jobId: job.id,
+        status: "completed",
+        summary: job.summary,
+        evidence: [{
+          id: `evidence-${job.id}`,
+          kind: "subagent",
+          target: job.allowedPaths[0],
+          version: null,
+        }],
+      },
+    ]),
+  ];
+  const childAggregate = aggregate({
+    events,
+    subagents: jobs,
+  });
+
+  await harness.port.publish({
+    aggregate: childAggregate,
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "正在汇合子智能体证据。",
+      "turn-a:children:joined",
+    ),
+  });
+  await harness.port.publish({
+    aggregate: childAggregate,
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "正在汇合子智能体证据。",
+      "turn-a:children:joined",
+      "live-action-repeat",
+    ),
+  });
+
+  const state = harness.getState();
+  const runs = projectSubagentRuns(state.runtimeEvents);
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
+  assert.ok(runs.every((run) => run.closedAt));
+  assert.ok(runs.every((run) => run.closureAudit?.state === "satisfied"));
+  assert.equal(
+    state.runtimeEvents.filter((event) => event.type === "subagent.created").length,
+    2,
+  );
+  assert.equal(
+    state.runtimeEvents.filter((event) => event.type === "subagent.completed").length,
+    2,
+  );
+  assert.equal(
+    state.runtimeEvents.filter((event) => event.type === "subagent.closed").length,
+    2,
+  );
+  assert.equal(harness.logs.at(-1)?.data?.subagentRecordCount, 2);
 });
 
 test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", async () => {
@@ -447,5 +760,13 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
   assert.equal(
     state.runtimeEvents.find((event) => event.type === "turn.completed")?.resultKind,
     "canceled",
+  );
+  assert.equal(state.agentMessages.length, 1);
+  assert.equal(state.agentMessages[0].role, "assistant");
+  assert.equal(state.agentMessages[0].runtimeTurnId, "turn-a");
+  assert.match(state.agentMessages[0].content, /已取消/);
+  assert.equal(
+    state.conversationTurns[0].durableContext.finalAssistantAnswer,
+    "### 已取消\n\n本轮已按用户请求停止。",
   );
 });

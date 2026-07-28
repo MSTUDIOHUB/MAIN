@@ -52,7 +52,9 @@ export interface RuntimeV2ExecuteRunnerInput {
 }
 
 const RUNTIME_V2_SOFT_STEP_SIGNAL = 24;
-const RUNTIME_V2_EXECUTION_DEADLINE_MS = 12 * 60_000;
+// Leave enough time for the longest in-flight provider/tool deadline and the
+// terminal checkpoint to settle before the outer submission lease expires.
+const RUNTIME_V2_EXECUTION_DEADLINE_MS = 10 * 60_000;
 
 function nowIdFactory() {
   let ordinal = 0;
@@ -148,6 +150,8 @@ function terminalDecision(input: {
     canceled: signal.aborted,
     mutationCount: evidence.mutationCount,
     passedValidationCount: evidence.passedValidationCount,
+    failedValidationCount: evidence.failedValidationCount,
+    stalledValidationCount: evidence.stalledValidationCount,
     hasProviderConclusion: !!finalMarkdown,
   });
   if (!decision) return null;
@@ -167,13 +171,6 @@ function phaseTransitionMessage(
     validation_failed: "有限验证未通过；返回修改阶段，根据失败证据进行一次针对性修复。",
   } as const;
   return messages[reason];
-}
-
-function shouldUseReadOnlySubagents(state: any, context: RuntimeV2SubmissionContext, live: ReturnType<typeof createRuntimeV2LiveExecutionState>): boolean {
-  const preference = context.turnInputContextSignals.subagentPreference;
-  return preference !== "forbidden" &&
-    (preference === "preferred" || state.preferSubagents === true) &&
-    live.subagentCandidates.length >= 2;
 }
 
 function settlement(
@@ -230,32 +227,25 @@ export async function runSubmitRuntimeV2Execute(
     });
     throw new Error("RUNTIME_V2_STALE_RUN_CHECKPOINT: checkpoint belongs to a different harness run.");
   }
+  const admittedAt = existing?.aggregate.events.find((event) =>
+    event.type === "run.started"
+  )?.at || Date.now();
+  const lifecycleDeadlineAt =
+    admittedAt + RUNTIME_V2_EXECUTION_DEADLINE_MS;
+  const executionPorts = {
+    get: input.get,
+    context: input.context,
+    live,
+    nextId,
+    now: Date.now,
+    lifecycleDeadlineAt,
+    logStoreEvent: input.logStoreEvent,
+  };
   const controller = new RuntimeV2Controller({
     checkpoint,
-    provider: createRuntimeV2ProviderPort({
-      get: input.get,
-      context: input.context,
-      live,
-      nextId,
-      now: Date.now,
-      logStoreEvent: input.logStoreEvent,
-    }),
-    tool: createRuntimeV2ToolPort({
-      get: input.get,
-      context: input.context,
-      live,
-      nextId,
-      now: Date.now,
-      logStoreEvent: input.logStoreEvent,
-    }),
-    scheduler: createRuntimeV2SchedulerPort({
-      get: input.get,
-      context: input.context,
-      live,
-      nextId,
-      now: Date.now,
-      logStoreEvent: input.logStoreEvent,
-    }),
+    provider: createRuntimeV2ProviderPort(executionPorts),
+    tool: createRuntimeV2ToolPort(executionPorts),
+    scheduler: createRuntimeV2SchedulerPort(executionPorts),
     projection: createRuntimeV2ProjectionPort({
       get: input.get,
       set: input.set,
@@ -302,9 +292,6 @@ export async function runSubmitRuntimeV2Execute(
       await controller.resumeScheduled();
     }
 
-    const admittedAt = controller.snapshot().aggregate?.events.find((event) =>
-      event.type === "run.started"
-    )?.at || Date.now();
     let step = 0;
     let softStepSignalRecorded = controller.snapshot().aggregate?.events.some((event) =>
       event.type === "soft_signal.observed" && event.signal === "iteration_limit"
@@ -362,6 +349,14 @@ export async function runSubmitRuntimeV2Execute(
         });
       }
       step += 1;
+      const terminal = terminalDecision({
+        aggregate: before,
+        signal: input.context.abortCtrl.signal,
+      });
+      if (terminal) {
+        await controller.driveOnce(terminal);
+        break;
+      }
       const phaseTransition = decideRuntimeV2ExecutePhaseTransition(before, {
         isMutationToolName: isWorkspaceMutationToolName,
       });
@@ -397,17 +392,9 @@ export async function runSubmitRuntimeV2Execute(
         await controller.changePhase("observing", "已完成初始工作区观察，开始基于证据定位问题。");
         continue;
       }
-      const terminal = terminalDecision({
-        aggregate: before,
-        signal: input.context.abortCtrl.signal,
-      });
-      if (terminal) {
-        await controller.driveOnce(terminal);
-        break;
-      }
       const drove = await controller.driveOnce({
-        allowReadOnlySubagents: shouldUseReadOnlySubagents(input.get(), input.context, live),
-        hasReadOnlySubagentScopes: live.subagentCandidates.length >= 2,
+        subagentPreference:
+          input.context.turnInputContextSignals.subagentPreference,
       });
       if (!drove) {
         await controller.driveOnce({
@@ -432,6 +419,8 @@ export async function runSubmitRuntimeV2Execute(
       evidenceCount: controller.snapshot().aggregate?.evidence.length || 0,
       mutations: executionEvidence.mutationCount,
       passedValidations: executionEvidence.passedValidationCount,
+      failedValidations: executionEvidence.failedValidationCount,
+      stalledValidations: executionEvidence.stalledValidationCount,
       failedOperations: executionEvidence.failedOperationCount,
       childRuns: controller.snapshot().aggregate?.subagents.length || 0,
     });

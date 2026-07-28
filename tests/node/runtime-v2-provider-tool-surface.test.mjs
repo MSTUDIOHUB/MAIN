@@ -43,6 +43,19 @@ test("provider results cannot widen the current Runtime v2 phase tool surface", 
   );
 });
 
+test("provider tool batches execute one action before Runtime v2 decides again", () => {
+  const bounded = surface.boundRuntimeV2ProviderToolCalls([
+    call("read_file"),
+    call("replace_in_file"),
+    call("run_command"),
+  ]);
+  assert.deepEqual(bounded.accepted.map((item) => item.name), ["read_file"]);
+  assert.deepEqual(
+    bounded.discarded.map((item) => item.name),
+    ["replace_in_file", "run_command"],
+  );
+});
+
 test("Execute keeps safe reads available beside mutations after source freshness", () => {
   const available = [
     definition("read_file"),
@@ -58,6 +71,7 @@ test("Execute keeps safe reads available beside mutations after source freshness
       sourceToolNames,
       isMutationToolName,
       requiresFreshSourceReads: true,
+      requiresMutation: false,
     }).map((item) => item.function.name),
     ["read_file", "grep_search"],
   );
@@ -67,7 +81,33 @@ test("Execute keeps safe reads available beside mutations after source freshness
       sourceToolNames,
       isMutationToolName,
       requiresFreshSourceReads: false,
+      requiresMutation: false,
     }).map((item) => item.function.name),
     ["read_file", "grep_search", "apply_patch"],
+  );
+});
+
+test("Execute narrows to mutation tools after its bounded source-gap pass", () => {
+  const available = [
+    definition("read_file"),
+    definition("grep_search"),
+    definition("apply_patch"),
+    definition("replace_in_file"),
+    definition("write_file"),
+    definition("run_command"),
+  ];
+  assert.deepEqual(
+    surface.selectRuntimeV2ExecuteToolDefinitions({
+      available,
+      sourceToolNames: new Set(["read_file", "grep_search"]),
+      isMutationToolName: (name) =>
+        name === "apply_patch" ||
+        name === "replace_in_file" ||
+        name === "write_file",
+      createOnlyMutationToolNames: new Set(["write_file"]),
+      requiresFreshSourceReads: false,
+      requiresMutation: true,
+    }).map((item) => item.function.name),
+    ["apply_patch", "replace_in_file"],
   );
 });

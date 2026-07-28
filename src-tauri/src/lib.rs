@@ -3701,6 +3701,7 @@ struct FileMetadata {
 struct ReadFileWindowResult {
     path: String,
     content: String,
+    content_version: String,
     start_line: usize,
     end_line: usize,
     total_lines: usize,
@@ -3845,6 +3846,7 @@ fn read_file_window(
     let mut selected: Vec<String> = Vec::new();
     let mut selected_chars = 0usize;
     let mut line_truncated = false;
+    let mut content_hasher = Sha256::new();
 
     loop {
         raw.clear();
@@ -3852,6 +3854,8 @@ fn read_file_window(
         if bytes == 0 {
             break;
         }
+        let canonical_raw = raw.replace("\r\n", "\n").replace('\r', "\n");
+        content_hasher.update(canonical_raw.as_bytes());
         total_lines += 1;
         let line = normalize_read_file_line(raw.clone());
         let line_chars = line.chars().count();
@@ -3911,6 +3915,7 @@ fn read_file_window(
     Ok(ReadFileWindowResult {
         path,
         content,
+        content_version: format!("sha256-{:x}", content_hasher.finalize()),
         start_line: returned_start,
         end_line: returned_end,
         total_lines,

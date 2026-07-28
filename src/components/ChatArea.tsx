@@ -2252,6 +2252,7 @@ function AgentContentBlock({
                   content={cleanText}
                   baseFontSize={chatFontSize}
                   sourceId={`agent-${block.id}-${segIdx}`}
+                  presentation={block.visibility === "assistant_update" ? "assistant_update" : "document"}
                 />
               );
             })
@@ -5278,7 +5279,10 @@ export default function ChatArea({
                   maxHeight: !isCapsuleCollapsed && chatAreaHeight
                     ? `${chatAreaHeight * (hasTypedCapsuleControls ? 1 : 0.58)}px`
                     : undefined,
-                  overflowY: "auto",
+                  // The inner scroll container is the sole overflow owner.
+                  // Keeping a second scrollbar on the Capsule shell produced
+                  // the thick right-side rail even for a one-line status.
+                  overflow: "hidden",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
