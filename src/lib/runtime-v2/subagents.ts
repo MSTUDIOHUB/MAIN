@@ -5,9 +5,14 @@ import type {
 } from "./contracts";
 
 export const MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS = 2;
+// A new child needs enough of the shared lifecycle to collect one independent
+// fact, submit its structured report, and still leave the parent a useful
+// takeover window. Near-deadline delegation only steals time from the writer.
+export const RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS = 2 * 60_000;
 
 export interface RuntimeV2SubagentScopeCandidate {
   readonly scopeKey: string;
+  readonly taskKind?: "explore" | "review" | "validate";
   readonly sourceToolCallId?: string;
   readonly name?: string;
   readonly role?: string;
@@ -36,6 +41,101 @@ function normalizedPath(value: string): string {
   return text(value).replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
 }
 
+function normalizedSemanticText(value: unknown, max: number): string {
+  return text(value, max).replace(/\s+/g, " ").toLowerCase();
+}
+
+export function runtimeV2SubagentModelHandle(
+  job: Pick<RuntimeV2SubagentJob, "id" | "scopeKey">,
+): string {
+  return text(job.scopeKey, 256) || text(job.id, 256);
+}
+
+export function runtimeV2SubagentSemanticIdentity(input: {
+  readonly taskKind?: "explore" | "review" | "validate";
+  readonly name?: string;
+  readonly role?: string;
+  readonly objective: string;
+  readonly successCriteria?: string;
+  readonly allowedPaths: readonly string[];
+}): string {
+  return JSON.stringify([
+    input.taskKind || "explore",
+    normalizedSemanticText(input.name, 128),
+    normalizedSemanticText(input.role, 128),
+    normalizedSemanticText(input.objective, 2_000),
+    normalizedSemanticText(input.successCriteria, 1_000),
+    [...new Set(input.allowedPaths.map(normalizedPath).filter(Boolean))]
+      .sort(),
+  ]);
+}
+
+export function resolveRuntimeV2SubagentReferences(input: {
+  readonly jobs: readonly RuntimeV2SubagentJob[];
+  readonly requested: readonly string[];
+}): {
+  readonly jobIds: readonly string[];
+  readonly unresolved: readonly string[];
+} {
+  const active = input.jobs.filter(
+    (job) => job.status === "queued" || job.status === "running",
+  );
+  const jobIds: string[] = [];
+  const unresolved: string[] = [];
+  for (const raw of input.requested) {
+    const reference = text(raw, 256);
+    if (!reference) continue;
+    const exact = active.filter((job) =>
+      job.id === reference ||
+      runtimeV2SubagentModelHandle(job) === reference
+    );
+    const segment = exact.length > 0
+      ? exact
+      : active.filter((job) => job.id.split(":").includes(reference));
+    if (segment.length !== 1) {
+      unresolved.push(reference);
+      continue;
+    }
+    if (!jobIds.includes(segment[0]!.id)) jobIds.push(segment[0]!.id);
+  }
+  return { jobIds, unresolved };
+}
+
+export function shouldRequestRuntimeV2SubagentReport(input: {
+  readonly evidenceCount: number;
+}): boolean {
+  // A child is a bounded independent probe, not a second open-ended agent
+  // loop. One child-owned evidence item is enough to make a citable finding;
+  // anything else belongs in `unresolved` so the parent can decide whether a
+  // different task is worth delegating. This also makes an explicit wait a
+  // convergence signal instead of a race against a hardcoded read loop.
+  return input.evidenceCount > 0;
+}
+
+export function runtimeV2SubagentFailureSummary(input: {
+  readonly canceled: boolean;
+  readonly deadlineExceeded: boolean;
+  readonly evidence: readonly { readonly target: string }[];
+}): string {
+  const targets = [...new Set(
+    input.evidence.map((evidence) => text(evidence.target, 256))
+      .filter(Boolean),
+  )].slice(0, 8);
+  const retained = input.evidence.length > 0
+    ? `已保留 ${input.evidence.length} 条只读证据供父任务接管${
+        targets.length > 0 ? `（${targets.join("、")}）` : ""
+      }。`
+    : "没有形成可交接的只读证据。";
+  if (input.canceled) {
+    return `子任务已因父任务取消而停止；没有提交可确认的结构化报告。${retained}`;
+  }
+  return `${
+    input.deadlineExceeded
+      ? "子任务在生命周期截止前"
+      : "子任务失败前"
+  }未提交引用真实证据的结构化报告。${retained}`;
+}
+
 function pathsOverlap(left: string, right: string): boolean {
   const a = normalizedPath(left);
   const b = normalizedPath(right);
@@ -55,9 +155,10 @@ export function areReadOnlySubagentScopesDisjoint(
 }
 
 /**
- * Materialize at most two genuinely independent, frozen read-only scopes from
- * provider-authored spawn_subagent calls. Runtime validates identity,
- * capacity and path isolation; it never invents a task name or objective.
+ * Materialize at most two active, frozen read-only jobs from provider-authored
+ * spawn_subagent calls. Completed jobs release capacity. Read-only jobs may
+ * intentionally overlap paths because the parent is the only writer; semantic
+ * task identity still prevents accidental duplicate delegation.
  */
 export function scheduleReadOnlySubagents(input: {
   readonly parentRun: RuntimeV2RunIdentity;
@@ -70,20 +171,36 @@ export function scheduleReadOnlySubagents(input: {
   const rejectedScopeKeys: string[] = [];
   const existingJobs = input.existingJobs || [];
   const seenScopeKeys = new Set(existingJobs.map((job) => job.scopeKey));
+  const seenSemanticIdentities = new Set(
+    existingJobs.map(runtimeV2SubagentSemanticIdentity),
+  );
+  const activeExistingJobs = existingJobs.filter(
+    (job) => job.status === "queued" || job.status === "running",
+  );
   for (const candidate of input.candidates) {
     const scopeKey = text(candidate.scopeKey, 256);
     const objective = text(candidate.objective, 2_000);
     const allowedPaths = [...new Set((candidate.allowedPaths || []).map(normalizedPath).filter(Boolean))].slice(0, 24);
-    if (!scopeKey || !objective || allowedPaths.length === 0 || seenScopeKeys.has(scopeKey)) {
+    const semanticIdentity = runtimeV2SubagentSemanticIdentity({
+      ...candidate,
+      objective,
+      allowedPaths,
+    });
+    if (
+      !scopeKey ||
+      !objective ||
+      allowedPaths.length === 0 ||
+      seenScopeKeys.has(scopeKey) ||
+      seenSemanticIdentities.has(semanticIdentity)
+    ) {
       if (scopeKey) rejectedScopeKeys.push(scopeKey);
       continue;
     }
     seenScopeKeys.add(scopeKey);
+    seenSemanticIdentities.add(semanticIdentity);
     if (
-      existingJobs.length + jobs.length >= MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS ||
-      [...existingJobs, ...jobs].some((job) =>
-        !areReadOnlySubagentScopesDisjoint(job.allowedPaths, allowedPaths)
-      )
+      activeExistingJobs.length + jobs.length >=
+        MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS
     ) {
       rejectedScopeKeys.push(scopeKey);
       continue;
@@ -105,6 +222,7 @@ export function scheduleReadOnlySubagents(input: {
         ? { sourceToolCallId: text(candidate.sourceToolCallId, 256) }
         : {}),
       scopeKey,
+      taskKind: candidate.taskKind || "explore",
       ...(text(candidate.name, 128)
         ? { name: text(candidate.name, 128) }
         : {}),
@@ -124,6 +242,7 @@ export function scheduleReadOnlySubagents(input: {
       firstTokenAt: null,
       closedAt: null,
       summary: null,
+      report: null,
     });
   }
   return { jobs, rejectedScopeKeys };

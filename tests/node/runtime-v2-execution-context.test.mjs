@@ -56,6 +56,10 @@ const authorization = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionAuthorization.ts",
 ));
+const runtime = loadTs(path.join(
+  workspaceRoot,
+  "src/lib/runtime-v2/index.ts",
+));
 const evidence = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionEvidence.ts",
@@ -84,10 +88,93 @@ const schedulerPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSchedulerPort.ts",
 ));
+const providerTools = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionProviderTools.ts",
+));
+const subagentContext = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionSubagentContext.ts",
+));
 
 function entry(id, source, target, content, status = "succeeded", label = source) {
   return { id, source, label, target, status, content };
 }
+
+test("late child handoff carries parent facts without converting them into child evidence", () => {
+  const capsule = subagentContext.buildRuntimeV2SubagentContextCapsule({
+    aggregate: {
+      phase: "validating",
+      objective: {
+        text: "修复打开文件后误触发保存弹窗",
+        acceptanceCriteria: ["打开文件保持 clean，保存使用活动路径"],
+        acceptanceCriterionIds: ["criterion-save"],
+      },
+      executionContract: {
+        status: "active",
+        id: "contract-save",
+        revision: 2,
+        criteria: [{
+          id: "criterion-save",
+          evidenceRequirement: "behavioral",
+        }],
+        changes: [{
+          operation: "modify",
+          target: "src/main.js",
+          basisEvidenceIds: ["E1"],
+        }],
+        validations: [{
+          id: "validation-save",
+          criterionIds: ["criterion-save"],
+          targetPaths: ["src/main.js"],
+          kind: "browser",
+          primitive: { kind: "browser_interaction" },
+        }],
+      },
+      evidence: [
+        {
+          id: "E1",
+          kind: "source",
+          target: "src/main.js",
+          version: "main-v1",
+        },
+        {
+          id: "E2",
+          kind: "mutation",
+          target: "src/main.js",
+          version: null,
+        },
+      ],
+    },
+    job: {
+      allowedPaths: ["src"],
+    },
+    modelContext: [
+      entry(
+        "parent-main",
+        "tool",
+        "src/main.js",
+        "invoke('save_file_content', { filePath: active.path })",
+        "succeeded",
+        "read_file",
+      ),
+      entry(
+        "unrelated",
+        "tool",
+        "docs/notes.md",
+        "unrelated secret survey",
+        "succeeded",
+        "read_file",
+      ),
+    ],
+  });
+  assert.match(capsule, /修复打开文件后误触发保存弹窗/);
+  assert.match(capsule, /contract-save/);
+  assert.match(capsule, /save_file_content/);
+  assert.match(capsule, /committedMutationTargets/);
+  assert.doesNotMatch(capsule, /unrelated secret survey/);
+  assert.doesNotMatch(capsule, /CHILD_EVIDENCE_ID/);
+});
 
 test("Runtime v2 Execute carries prior Turn conclusions and the admitted current prompt into provider history", () => {
   const live = {
@@ -222,6 +309,52 @@ test("Runtime v2 context retention cannot evict workspace, child, or latest fail
   assert.match(digest, /FRESH_ACCEPTANCE_FAILURE_TOKEN/);
   assert.equal(history.retainedSources.workspace, 1);
   assert.equal(history.retainedSources.subagent, 2);
+});
+
+test("a rejected repeated read keeps the successful source window in model context", () => {
+  const live = {
+    messages: [],
+    modelContext: [],
+    workspaceOverview: "",
+  };
+  context.recordModelContext(
+    live,
+    entry(
+      "source-window",
+      "tool",
+      "src/main.js",
+      "SOURCE_WINDOW_TOKEN",
+      "succeeded",
+      "read_file",
+    ),
+  );
+  context.recordModelContext(
+    live,
+    entry(
+      "repeat-feedback",
+      "tool",
+      "src/main.js",
+      "UNCHANGED_SOURCE_REPEAT_REJECTED",
+      "failed",
+      "read_file",
+    ),
+  );
+
+  assert.equal(live.modelContext.length, 2);
+  assert.equal(
+    live.modelContext.some((item) =>
+      item.status === "succeeded" &&
+      item.content === "SOURCE_WINDOW_TOKEN"
+    ),
+    true,
+  );
+  assert.equal(
+    live.modelContext.some((item) =>
+      item.status === "failed" &&
+      item.content === "UNCHANGED_SOURCE_REPEAT_REJECTED"
+    ),
+    true,
+  );
 });
 
 test("corrective mutation history isolates the validator and exact source snapshot", () => {
@@ -682,16 +815,26 @@ test("corrective mutation is leased to the validator-reported source file", () =
     ports,
     providerCommand,
   );
-  assert.deepEqual(
-    definitions.map((definition) => definition.function.name),
-    ["replace_in_file", "apply_patch"],
+  const definitionNames = definitions.map(
+    (definition) => definition.function.name,
+  );
+  assert.ok(definitionNames.includes("read_file"));
+  assert.ok(definitionNames.includes("replace_in_file"));
+  assert.ok(definitionNames.includes("apply_patch"));
+  assert.equal(definitionNames.includes("run_command"), false);
+  assert.equal(definitionNames.includes("write_file"), false);
+  const replaceDefinition = definitions.find(
+    (definition) => definition.function.name === "replace_in_file",
+  );
+  const patchDefinition = definitions.find(
+    (definition) => definition.function.name === "apply_patch",
   );
   assert.deepEqual(
-    definitions[0].function.parameters.properties.path.enum,
+    replaceDefinition.function.parameters.properties.path.enum,
     ["src/components/editor.js"],
   );
   assert.match(
-    definitions[1].function.description,
+    patchDefinition.function.description,
     /src\/components\/editor\.js/,
   );
   const reorientationDefinitions =
@@ -788,17 +931,265 @@ test("corrective phase allows one durable clarifying read before closing reads",
       },
       true,
     );
+  const constrainedNames = constrained.map(
+    (definition) => definition.function.name,
+  );
+  assert.ok(constrainedNames.includes("read_file"));
+  assert.ok(constrainedNames.includes("grep_search"));
+  assert.ok(constrainedNames.includes("replace_in_file"));
+  assert.ok(constrainedNames.includes("apply_patch"));
+  assert.equal(constrainedNames.includes("run_command"), false);
   assert.deepEqual(
-    constrained.map((definition) => definition.function.name),
-    ["read_file", "replace_in_file", "apply_patch"],
+    constrained.find((definition) =>
+      definition.function.name === "replace_in_file"
+    ).function.parameters.properties.path.enum,
+    ["src/main.js"],
+  );
+});
+
+test("Acting source exploration closes only after every contract target has versioned coverage", () => {
+  const aggregate = {
+    phase: "acting",
+    executionContract: {
+      changes: [
+        { operation: "modify", target: "src/main.js" },
+        { operation: "modify", target: "src/components/editor.js" },
+      ],
+    },
+    events: [
+      { type: "phase.changed", phase: "acting" },
+      {
+        type: "tool.completed",
+        status: "succeeded",
+        evidence: [{
+          id: "main-source",
+          kind: "source",
+          target: "src/main.js",
+          version: "main-v1",
+        }],
+      },
+    ],
+  };
+  assert.equal(
+    providerTools.hasRuntimeV2ContractSourceCoverage(aggregate),
+    false,
+  );
+  assert.equal(
+    providerTools.hasRuntimeV2ContractSourceCoverage({
+      ...aggregate,
+      events: [
+        ...aggregate.events,
+        {
+          type: "tool.completed",
+          status: "succeeded",
+          evidence: [{
+            id: "editor-source",
+            kind: "source",
+            target: "src/components/editor.js",
+            version: "editor-v1",
+          }],
+        },
+      ],
+    }),
+    true,
+  );
+});
+
+test("a repeated read forces a named mutation with a singleton envelope fallback", () => {
+  const definition = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: name,
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+  });
+  const command = {
+    kind: "request_model",
+    phase: "acting",
+    payload: {
+      mode: "execute",
+      executePolicy: "mutation_required",
+      toolExpectation: "required",
+      mutationProgressionRequired: true,
+      activeSubagents: [],
+    },
+  };
+  const available = [
+    definition("read_file"),
+    definition("replace_in_file"),
+    definition("apply_patch"),
+    definition("submit_execution_contract"),
+  ];
+  assert.equal(
+    providerTools.forcedRuntimeV2MutationToolName(
+      command,
+      available.map((item) => item.function.name),
+    ),
+    "replace_in_file",
   );
   assert.deepEqual(
-    constrained[0].function.parameters.properties.path.enum,
+    providerTools.runtimeV2ProviderAttemptTools(
+      available,
+      "replace_in_file",
+    ).map((item) => item.function.name),
+    ["replace_in_file"],
+  );
+  assert.deepEqual(
+    providerTools.runtimeV2ProviderAttemptTools(
+      available,
+      null,
+    ).map((item) => item.function.name),
+    available.map((item) => item.function.name),
+  );
+});
+
+test("a failed forced editor rotates to another mutation primitive and resets after success", () => {
+  const command = {
+    kind: "request_model",
+    phase: "acting",
+    payload: {
+      mode: "execute",
+      executePolicy: "mutation_required",
+      toolExpectation: "required",
+      mutationProgressionRequired: true,
+    },
+  };
+  const names = ["read_file", "replace_in_file", "apply_patch"];
+  const failedReplace = {
+    events: [{
+      type: "tool.completed",
+      status: "failed",
+      evidence: [],
+      presentation: {
+        toolName: "replace_in_file",
+        target: "src/main.js",
+      },
+    }],
+  };
+  assert.equal(
+    providerTools.forcedRuntimeV2MutationToolName(
+      command,
+      names,
+      failedReplace,
+    ),
+    "apply_patch",
+  );
+  assert.equal(
+    providerTools.forcedRuntimeV2MutationToolName(
+      command,
+      names,
+      {
+        events: [
+          ...failedReplace.events,
+          {
+            type: "tool.completed",
+            status: "failed",
+            evidence: [],
+            presentation: {
+              toolName: "apply_patch",
+              target: "src/main.js",
+            },
+          },
+        ],
+      },
+    ),
+    "replace_in_file",
+  );
+  assert.equal(
+    providerTools.forcedRuntimeV2MutationToolName(
+      command,
+      names,
+      {
+        events: [
+          ...failedReplace.events,
+          {
+            type: "tool.completed",
+            status: "succeeded",
+            evidence: [{
+              id: "mutation-main",
+              kind: "mutation",
+              target: "src/main.js",
+              version: null,
+            }],
+            presentation: {
+              toolName: "apply_patch",
+              target: "src/main.js",
+            },
+          },
+        ],
+      },
+    ),
+    "replace_in_file",
+  );
+});
+
+test("an uncovered contract target narrows source acquisition to one exact read", () => {
+  const definition = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: name,
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          query: { type: "string" },
+        },
+        required: [],
+      },
+    },
+  });
+  const required = providerTools.runtimeV2RequiredSourceToolDefinitions(
+    [
+      definition("read_file"),
+      definition("grep_search"),
+      definition("replace_in_file"),
+      definition("spawn_subagent"),
+    ],
+    "src/main.js",
+  );
+  assert.deepEqual(
+    required.map((item) => item.function.name),
+    ["read_file"],
+  );
+  assert.deepEqual(
+    required[0].function.parameters.properties.path.enum,
     ["src/main.js"],
   );
 });
 
 test("investigation is read-only and direct mutation is leased to the latest exact parent read", () => {
+  assert.equal(
+    correctivePolicy.runtimeV2ContractAllowsMutationTarget(
+      {
+        executionContract: {
+          changes: [
+            { operation: "modify", target: "src/main.js" },
+          ],
+        },
+      },
+      "/fixture/src/components/statusbar.js",
+    ),
+    false,
+  );
+  assert.equal(
+    correctivePolicy.runtimeV2ContractAllowsMutationTarget(
+      {
+        executionContract: {
+          changes: [
+            { operation: "modify", target: "src/main.js" },
+          ],
+        },
+      },
+      "/fixture/src/main.js",
+    ),
+    true,
+  );
   const live = {
     modelContext: [
       entry(
@@ -845,40 +1236,54 @@ test("investigation is read-only and direct mutation is leased to the latest exa
     ports,
     command("execute", "mutation_required"),
   );
-  assert.deepEqual(
-    mutationDefinitions.map((definition) => definition.function.name),
-    ["replace_in_file", "apply_patch"],
+  const mutationNames = mutationDefinitions.map(
+    (definition) => definition.function.name,
   );
+  assert.ok(mutationNames.includes("read_file"));
+  assert.ok(mutationNames.includes("grep_search"));
+  assert.ok(mutationNames.includes("replace_in_file"));
+  assert.ok(mutationNames.includes("apply_patch"));
   assert.deepEqual(
-    mutationDefinitions[0].function.parameters.properties.path.enum,
+    mutationDefinitions.find((definition) =>
+      definition.function.name === "replace_in_file"
+    ).function.parameters.properties.path.enum,
     ["src/main.js"],
   );
 });
 
-test("Runtime v2 collaboration tool surface requires the model to choose child identity and work", () => {
+test("preferred collaboration remains optional and keeps parent reads available", () => {
   const ports = {
     get: () => ({}),
     context: { turnId: "turn-a", runWorkspace: "/fixture" },
     live: { modelContext: [] },
   };
-  const spawnRequired =
+  const optionalCollaboration =
     authorization.providerToolDefinitionsForCommand(ports, {
       kind: "request_model",
       phase: "observing",
       payload: {
         mode: "observe",
         collaborationAllowed: true,
-        collaborationAction: "spawn_required",
         remainingSubagentCapacity: 2,
       },
     });
-  assert.deepEqual(
-    spawnRequired.map((definition) => definition.function.name),
-    ["spawn_subagent"],
+  const preferredNames = optionalCollaboration.map(
+    (definition) => definition.function.name,
   );
+  assert.ok(preferredNames.includes("spawn_subagent"));
+  assert.ok(preferredNames.includes("read_file"));
   assert.deepEqual(
-    spawnRequired[0].function.parameters.required,
-    ["task_key", "name", "role", "objective", "success_criteria"],
+    optionalCollaboration.find((definition) =>
+      definition.function.name === "spawn_subagent"
+    ).function.parameters.required,
+    [
+      "task_key",
+      "task_kind",
+      "name",
+      "role",
+      "objective",
+      "success_criteria",
+    ],
   );
 
   const active =
@@ -902,6 +1307,112 @@ test("Runtime v2 collaboration tool surface requires the model to choose child i
   assert.ok(activeNames.includes("spawn_subagent"));
   assert.ok(activeNames.includes("wait_subagents"));
   assert.equal(activeNames.includes("replace_in_file"), false);
+
+  for (const [phase, mode] of [
+    ["observing", "observe"],
+    ["acting", "execute"],
+    ["validating", "validate"],
+    ["validating", "conclude"],
+  ]) {
+    const names = authorization.providerToolDefinitionsForCommand(
+      ports,
+      {
+        kind: "request_model",
+        phase,
+        payload: {
+          mode,
+          collaborationAllowed: true,
+          collaborationAction: "optional",
+          remainingSubagentCapacity: 2,
+          activeSubagents: [],
+        },
+      },
+    ).map((definition) => definition.function.name);
+    assert.ok(
+      names.includes("spawn_subagent"),
+      `${mode} must allow on-demand child delegation`,
+    );
+    if (mode === "validate") {
+      assert.equal(names.includes("read_file"), false);
+      assert.equal(names.includes("replace_in_file"), false);
+    }
+  }
+
+  const takeoverNames = authorization.providerToolDefinitionsForCommand(
+    ports,
+    {
+      kind: "request_model",
+      phase: "validating",
+      payload: {
+        mode: "validate",
+        validationParentTakeoverReadRequired: true,
+        collaborationAllowed: true,
+        collaborationAction: "parent_takeover_required",
+        remainingSubagentCapacity: 0,
+        activeSubagents: [],
+      },
+    },
+  ).map((definition) => definition.function.name);
+  assert.ok(
+    takeoverNames.includes("read_file"),
+    "a failed validation child must leave the parent one focused safe-read handoff",
+  );
+  assert.equal(takeoverNames.includes("replace_in_file"), false);
+  assert.equal(
+    takeoverNames.includes("spawn_subagent"),
+    false,
+    "the parent must make direct phase progress before delegation reopens",
+  );
+});
+
+test("new delegation disappears when the shared lifecycle cannot leave parent takeover runway", () => {
+  const now = 1_000_000;
+  assert.equal(
+    providerTools.runtimeV2SubagentStartHasRunway({
+      now,
+      lifecycleDeadlineAt:
+        now + runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS,
+    }),
+    true,
+  );
+  assert.equal(
+    providerTools.runtimeV2SubagentStartHasRunway({
+      now,
+      lifecycleDeadlineAt:
+        now + runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS - 1,
+    }),
+    false,
+  );
+
+  const definitions =
+    authorization.providerToolDefinitionsForCommand({
+      get: () => ({}),
+      context: { turnId: "turn-a", runWorkspace: "/fixture" },
+      live: { modelContext: [] },
+      now: () => now,
+      lifecycleDeadlineAt:
+        now + runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS - 1,
+    }, {
+      kind: "request_model",
+      phase: "acting",
+      payload: {
+        mode: "execute",
+        collaborationAllowed: true,
+        remainingSubagentCapacity: 2,
+      },
+    });
+  assert.equal(
+    definitions.some((definition) =>
+      definition.function.name === "spawn_subagent"
+    ),
+    false,
+  );
+  assert.ok(
+    definitions.some((definition) =>
+      definition.function.name === "read_file"
+    ),
+    "near the lifecycle boundary the parent keeps direct safe tools",
+  );
 });
 
 test("Runtime v2 scheduler materializes the provider's child arguments verbatim", async () => {
@@ -914,9 +1425,11 @@ test("Runtime v2 scheduler materializes the provider's child arguments verbatim"
       phaseLanguage: "zh",
     },
     live: {
+      modelContext: [],
       childRuns: new Map(),
       childAbortControllers: new Map(),
       childTelemetry: new Map(),
+      childReportRequests: new Set(),
     },
     nextId: () => `child-${++childOrdinal}`,
     now: () => 10,
@@ -937,6 +1450,7 @@ test("Runtime v2 scheduler materializes the provider's child arguments verbatim"
         toolCallId: "spawn-kepler",
         arguments: {
           task_key: "save-event-consumer-audit",
+          task_kind: "review",
           name: "Kepler",
           role: "event-flow reviewer",
           objective: "Trace the save event consumer handoff.",
@@ -964,7 +1478,112 @@ test("Runtime v2 scheduler materializes the provider's child arguments verbatim"
   );
 });
 
-test("a failed mutation editor yields to its equivalent until a newer exact read arrives", () => {
+test("waiting for a child requests report closure and preserves a failed evidence handoff", async () => {
+  let resolveChild;
+  const childResult = new Promise((resolve) => {
+    resolveChild = resolve;
+  });
+  const job = {
+    id: "runtime-v2-child:ms47dtia:82",
+    run: {
+      sessionKey: "session-a",
+      sessionEpoch: "epoch-a",
+      turnId: "turn-a",
+      runId: "run-a:child:runtime-v2-child:ms47dtia:82",
+      parentRunId: "run-a",
+      attemptId: "attempt-a:child:runtime-v2-child:ms47dtia:82",
+    },
+    parentRunId: "run-a",
+    scopeKey: "analyze_file_open_flow",
+    taskKind: "explore",
+    objective: "Trace the file-open handoff.",
+    allowedPaths: ["."],
+    status: "running",
+    requestedAt: 10,
+    firstTokenAt: 11,
+    closedAt: null,
+    summary: null,
+  };
+  const live = {
+    modelContext: [],
+    childRuns: new Map([[job.id, childResult]]),
+    childAbortControllers: new Map(),
+    childTelemetry: new Map([[
+      job.id,
+      { firstTokenAt: 11, closedAt: null },
+    ]]),
+    childReportRequests: new Set(),
+  };
+  let now = 20;
+  const port = schedulerPort.createRuntimeV2SchedulerPort({
+    get: () => ({}),
+    context: {
+      turnId: "turn-a",
+      runWorkspace: "/fixture",
+      phaseLanguage: "zh",
+    },
+    live,
+    nextId: () => "unused",
+    now: () => ++now,
+    logStoreEvent() {},
+  });
+  const joining = port.execute({
+    command: {
+      idempotencyKey: "join-open-flow",
+      kind: "join_subagents",
+      phase: "observing",
+      run: {
+        sessionKey: "session-a",
+        sessionEpoch: "epoch-a",
+        turnId: "turn-a",
+        runId: "run-a",
+        parentRunId: null,
+        attemptId: "attempt-a",
+      },
+      payload: {
+        requestedJobIds: ["analyze_file_open_flow"],
+        jobIds: [job.id],
+      },
+    },
+    signal: new AbortController().signal,
+    scheduledSubagents: [job],
+  });
+
+  await Promise.resolve();
+  assert.equal(live.childReportRequests.has(job.id), true);
+  resolveChild({
+    job,
+    status: "failed",
+    summary:
+      "No structured report; retained one evidence item for parent takeover.",
+    report: null,
+    evidence: [{
+      id: `child:${job.id}:E1`,
+      kind: "subagent",
+      target: "src/main.js",
+      version: "v1",
+    }],
+    validationReceipts: [],
+  });
+  const events = await joining;
+  const completion = events.find((event) =>
+    event.type === "subagent.completed"
+  );
+  assert.equal(completion.status, "failed");
+  assert.equal(completion.evidence[0].target, "src/main.js");
+  assert.equal(live.childReportRequests.has(job.id), false);
+  assert.equal(live.childRuns.has(job.id), false);
+  assert.match(
+    live.modelContext.at(-1).content,
+    /Status: failed/,
+  );
+  assert.match(
+    live.modelContext.at(-1).content,
+    /child:runtime-v2-child:ms47dtia:82:E1/,
+  );
+});
+
+test("failed mutation calls do not remove an editor class from the parent tool surface", () => {
   const live = {
     modelContext: [
       entry(
@@ -982,6 +1601,14 @@ test("a failed mutation editor yields to its equivalent until a newer exact read
         "source mismatch",
         "failed",
         "apply_patch",
+      ),
+      entry(
+        "replace-failed",
+        "tool",
+        "src/main.js",
+        "old text not found",
+        "failed",
+        "replace_in_file",
       ),
     ],
   };
@@ -1002,7 +1629,10 @@ test("a failed mutation editor yields to its equivalent until a newer exact read
     authorization.providerToolDefinitionsForCommand(ports, providerCommand)
       .map((definition) => definition.function.name);
 
-  assert.deepEqual(names(), ["replace_in_file"]);
+  let availableNames = names();
+  assert.ok(availableNames.includes("read_file"));
+  assert.ok(availableNames.includes("replace_in_file"));
+  assert.ok(availableNames.includes("apply_patch"));
   live.modelContext.push(entry(
     "main-read-new",
     "tool",
@@ -1011,7 +1641,69 @@ test("a failed mutation editor yields to its equivalent until a newer exact read
     "succeeded",
     "read_file",
   ));
-  assert.deepEqual(names(), ["replace_in_file", "apply_patch"]);
+  availableNames = names();
+  assert.ok(availableNames.includes("read_file"));
+  assert.ok(availableNames.includes("replace_in_file"));
+  assert.ok(availableNames.includes("apply_patch"));
+});
+
+test("a target-less failed editor is correlated to its lease without gaining write authority", () => {
+  const live = {
+    modelContext: [
+      entry(
+        "main-read",
+        "tool",
+        "src/main.js",
+        "const ready = true;",
+        "succeeded",
+        "read_file",
+      ),
+    ],
+  };
+  const ports = {
+    get: () => ({}),
+    context: { turnId: "turn-a", runWorkspace: "/fixture" },
+    live,
+  };
+  const failureTarget =
+    correctivePolicy.runtimeV2MutationFailureContextTarget({
+      ports,
+      toolName: "replace_in_file",
+      requestedTarget: "",
+    });
+  assert.equal(failureTarget, "src/main.js");
+
+  live.modelContext.push(entry(
+    "empty-replace-failed",
+    "tool",
+    failureTarget,
+    "TOOL_BLOCKED: mutation arguments did not resolve a target",
+    "blocked",
+    "replace_in_file",
+  ));
+  const names = authorization.providerToolDefinitionsForCommand(ports, {
+    kind: "request_model",
+    phase: "acting",
+    payload: {
+      mode: "execute",
+      executePolicy: "mutation_required",
+    },
+  }).map((definition) => definition.function.name);
+  assert.ok(names.includes("replace_in_file"));
+  assert.ok(names.includes("apply_patch"));
+
+  const authorizationResult =
+    authorization.validateToolAgainstPhaseAndPlan({
+      ports,
+      command: {
+        kind: "execute_tool",
+        phase: "acting",
+      },
+      toolName: "replace_in_file",
+      args: {},
+      target: "",
+    });
+  assert.equal(authorizationResult.allowed, false);
 });
 
 test("provider deadline settles even when the transport ignores cancellation", async () => {
@@ -1075,7 +1767,7 @@ test("failed command diagnostics survive a large stdout preamble", () => {
   );
 });
 
-test("Runtime v2 validation guidance uses a bounded project-family command", () => {
+test("Runtime v2 validation guidance never invents acceptance from workspace manifests", () => {
   const input = {
     get: () => ({}),
     context: { turnId: "turn-a" },
@@ -1083,7 +1775,7 @@ test("Runtime v2 validation guidance uses a bounded project-family command", () 
   };
   assert.equal(
     context.preferredFiniteValidationCommand(input),
-    "pnpm run build",
+    "",
   );
   assert.equal(
     context.preferredFiniteValidationCommand({
@@ -1093,7 +1785,88 @@ test("Runtime v2 validation guidance uses a bounded project-family command", () 
           "package.json\npackage-lock.json\nsrc-tauri/Cargo.toml",
       },
     }),
-    "npm run build",
+    "",
+  );
+});
+
+test("browser validation passes only when its structured primitive has matching causal evidence", () => {
+  const primitive = {
+    id: "validation-open-clean",
+    kind: "browser_interaction",
+    acceptance: "required",
+    description: "Opening a file must not show a save dialog.",
+    actions: [{
+      id: "open-file",
+      kind: "click",
+      target: "#open-file",
+    }],
+    assertions: [{
+      kind: "dialog",
+      target: "save-dialog",
+      afterActionId: "open-file",
+      expected: "hidden",
+    }],
+    requireCausalAssertion: true,
+  };
+  const matching = JSON.stringify({
+    success: true,
+    actions: [{
+      id: "open-file",
+      kind: "click",
+      target: "#open-file",
+      success: true,
+    }],
+    assertions: [{
+      kind: "dialog",
+      target: "save-dialog",
+      afterActionId: "open-file",
+      actual: "hidden",
+      passed: true,
+      beforePassed: false,
+      changedAfterAction: true,
+      causallyLinked: true,
+    }],
+    pageErrors: [],
+    consoleErrors: [],
+  });
+  assert.equal(
+    evidence.isRuntimeV2ValidationPassed(
+      "browser_evaluate",
+      matching,
+      primitive,
+    ),
+    true,
+  );
+  assert.equal(
+    evidence.isRuntimeV2ValidationPassed(
+      "browser_evaluate",
+      JSON.stringify({
+        success: true,
+        actions: [{
+          id: "open-file",
+          kind: "click",
+          target: "#different-control",
+          success: true,
+        }],
+        assertions: [{
+          kind: "dialog",
+          target: "save-dialog",
+          afterActionId: "open-file",
+          actual: "hidden",
+          passed: true,
+          causallyLinked: true,
+        }],
+      }),
+      primitive,
+    ),
+    false,
+  );
+  assert.equal(
+    evidence.isRuntimeV2ValidationPassed(
+      "browser_evaluate",
+      JSON.stringify({ success: true }),
+    ),
+    false,
   );
 });
 
@@ -1138,7 +1911,7 @@ test("Runtime v2 rejects text inspection commands as validation", () => {
   assert.equal(accepted.allowed, true);
 });
 
-test("Runtime v2 owns known validation and corrective reread actions", () => {
+test("Runtime v2 owns only the evidence-refresh action, not acceptance selection", () => {
   const run = {
     sessionKey: "session-a",
     sessionEpoch: "epoch-a",
@@ -1147,37 +1920,6 @@ test("Runtime v2 owns known validation and corrective reread actions", () => {
     parentRunId: null,
     attemptId: "attempt-a",
   };
-  const validation = deterministicActions.selectRuntimeOwnedValidationAction({
-    command: {
-      idempotencyKey: "validation-a",
-      kind: "request_model",
-      run,
-      phase: "validating",
-      payload: { mode: "validate" },
-    },
-    allowedToolNames: ["run_command"],
-    preferredCommand: "npm run build",
-  });
-  assert.equal(validation.toolCalls[0].name, "run_command");
-  assert.equal(
-    validation.toolCalls[0].arguments.command,
-    "npm run build",
-  );
-  assert.equal(
-    deterministicActions.selectRuntimeOwnedValidationAction({
-      command: {
-        idempotencyKey: "validation-b",
-        kind: "request_model",
-        run,
-        phase: "validating",
-        payload: { mode: "validate" },
-      },
-      allowedToolNames: ["run_command"],
-      preferredCommand: "cat src/main.js",
-    }),
-    null,
-  );
-
   const refresh = deterministicActions.selectRuntimeOwnedSourceRefreshAction({
     command: {
       idempotencyKey: "refresh-a",
@@ -1202,4 +1944,38 @@ test("Runtime v2 owns known validation and corrective reread actions", () => {
     end_line: 445,
     max_lines: 105,
   });
+});
+
+test("Runtime v2 directly acquires a required contract source without another model choice", () => {
+  const run = {
+    sessionKey: "session-a",
+    sessionEpoch: "epoch-a",
+    turnId: "turn-a",
+    runId: "run-a",
+    parentRunId: null,
+    attemptId: "attempt-a",
+  };
+  const required = deterministicActions.selectRuntimeOwnedRequiredSourceAction({
+    command: {
+      idempotencyKey: "required-source-a",
+      kind: "request_model",
+      run,
+      phase: "observing",
+      payload: {
+        mode: "observe",
+        requiredExecutionContractSourceTarget: "src/main.js",
+      },
+    },
+    allowedToolNames: ["read_file"],
+    target: "src/main.js",
+  });
+  assert.deepEqual(required.toolCalls, [{
+    id: "runtime-required-source:required-source-a",
+    name: "read_file",
+    arguments: { path: "src/main.js" },
+  }]);
+  assert.equal(
+    required.diagnostics[0].code,
+    "runtime_owned_required_source",
+  );
 });

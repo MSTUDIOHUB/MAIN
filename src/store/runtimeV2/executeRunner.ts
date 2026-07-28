@@ -8,6 +8,8 @@ import {
   RuntimeV2Controller,
   decideRuntimeV2ExecutePhaseTransition,
   decideRuntimeV2TerminalOutcome,
+  deriveRuntimeV2ExecutionContractCoverage,
+  deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
   summarizeRuntimeV2ExecuteEvidence,
@@ -161,6 +163,54 @@ function terminalDecision(input: {
   };
 }
 
+function truthfulIncompleteDecision(input: {
+  aggregate: NonNullable<
+    ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]
+  >;
+}): { resultKind: "partial" | "error"; resultReason: string } {
+  const hasMutation = input.aggregate.evidence.some(
+    (evidence) => evidence.kind === "mutation",
+  );
+  const executionCoverage =
+    deriveRuntimeV2ExecutionContractCoverage(input.aggregate);
+  const planCoverage =
+    deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
+  const missingTargets = executionCoverage?.missingMutationTargets ||
+    planCoverage?.missingMutationTargets ||
+    [];
+  const missingCriteria = executionCoverage?.missingCriterionIds || [];
+  const missingValidations = executionCoverage?.missingValidationIds ||
+    planCoverage?.missingRequiredValidationIndexes.map(
+      (index) => `work-plan-validation-${index + 1}`,
+    ) ||
+    [];
+  const details = [
+    !executionCoverage &&
+        input.aggregate.strategy === "execute"
+      ? "未建立有效执行契约"
+      : "",
+    missingTargets.length > 0
+      ? `未修改目标：${missingTargets.join("、")}`
+      : "",
+    missingCriteria.length > 0
+      ? `未验收条件：${missingCriteria.join("、")}`
+      : "",
+    missingValidations.length > 0
+      ? `缺少验证：${missingValidations.join("、")}`
+      : "",
+  ].filter(Boolean);
+  return {
+    resultKind: hasMutation ? "partial" : "error",
+    resultReason: [
+      "本轮已到达运行生命周期时限。",
+      hasMutation
+        ? "已保留实际修改，但没有把未覆盖目标或条件表述为成功。"
+        : "本轮没有形成可验收的实际修改。",
+      ...details,
+    ].join(" "),
+  };
+}
+
 function phaseTransitionMessage(
   reason: RuntimeV2ExecutePhaseTransition["reason"],
 ): string {
@@ -274,14 +324,56 @@ export async function runSubmitRuntimeV2Execute(
         turn: identity.turn,
         run: identity.run,
         strategy: "execute",
-        objective: turn.userPrompt,
-        constraints: [],
-        acceptanceCriteria: [],
+        objective:
+          input.context.executeAdmission?.objective ||
+          turn.userPrompt,
+        constraints:
+          input.context.executeAdmission?.constraints || [],
+        acceptanceCriteria:
+          input.context.executeAdmission?.acceptanceCriteria.map(
+            (criterion) => criterion.text,
+          ) || [turn.userPrompt],
+        acceptanceCriterionIds:
+          input.context.executeAdmission?.acceptanceCriteria.map(
+            (criterion) => criterion.id,
+          ) || ["criterion-user-objective"],
+        acceptanceEvidenceRequirements:
+          input.context.executeAdmission?.acceptanceCriteria.map(
+            () => "behavioral" as const,
+          ) || ["behavioral"],
         initialPhase: "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
       return settlement(input.context, terminalOutcomeToLegacy(terminal.resultKind, terminal.reason));
+    } else if (
+      existing.migrationDisposition ===
+        "active_uncontracted_mutation"
+    ) {
+      input.logStoreEvent(
+        "runtime_v2_v3_uncontracted_mutation_quarantined",
+        {
+          turnId: identity.turn.turnId,
+          runId: identity.run.runId,
+          checkpointRevision: existing.revision,
+        },
+      );
+      await controller.discardScheduledForMigration();
+    } else if (
+      existing.migrationDisposition === "active_unmodified"
+    ) {
+      input.logStoreEvent(
+        "runtime_v2_v3_unmodified_reobserving",
+        {
+          turnId: identity.turn.turnId,
+          runId: identity.run.runId,
+          checkpointRevision: existing.revision,
+          previousPhase: existing.aggregate.phase,
+          discardedScheduledEffects:
+            existing.aggregate.scheduledCommands.length,
+        },
+      );
+      await controller.reobserveAfterLegacyMigration();
     } else {
       input.logStoreEvent("runtime_v2_execute_resuming_scheduled", {
         turnId: identity.turn.turnId,
@@ -300,6 +392,18 @@ export async function runSubmitRuntimeV2Execute(
       const before = controller.snapshot().aggregate;
       if (!before || before.terminalOutcome) break;
       if (
+        existing?.migrationDisposition ===
+          "active_uncontracted_mutation"
+      ) {
+        await controller.driveOnce({
+          resultKind: "partial",
+          resultReason:
+            "该在途 v3 Execute 已产生修改但没有执行契约；迁移不会补造授权或验收回执，现有修改已保留并以明确 partial 收口。",
+        });
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
+      }
+      if (
         before.strategy === "plan" &&
         before.workPlan?.status === "approved" &&
         !resolveApprovedRuntimeV2WorkPlanFromAggregate(before)
@@ -308,7 +412,8 @@ export async function runSubmitRuntimeV2Execute(
           resultKind: "error",
           resultReason: "已批准 WorkPlan 的身份、内容摘要或投影绑定无法通过校验；运行时未执行未获授权的后续效果。",
         });
-        break;
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
       }
       if (
         before.strategy === "plan" &&
@@ -327,15 +432,16 @@ export async function runSubmitRuntimeV2Execute(
             resultKind: "error",
             resultReason: `已批准计划的源文件版本发生变化或缺少可验证版本：${invalidTargets.join("、")}。本轮未执行过期修改，请重新审核更新后的计划。`,
           });
-          break;
+          if (controller.snapshot().aggregate?.terminalOutcome) break;
+          continue;
         }
       }
       if (Date.now() - admittedAt >= RUNTIME_V2_EXECUTION_DEADLINE_MS) {
-        await controller.driveOnce({
-          resultKind: "partial",
-          resultReason: "本轮已到达运行生命周期时限；已保留全部已提交修改与证据，并完成终态收口。",
-        });
-        break;
+        await controller.driveOnce(truthfulIncompleteDecision({
+          aggregate: before,
+        }));
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
       }
       if (step >= RUNTIME_V2_SOFT_STEP_SIGNAL && !softStepSignalRecorded) {
         await controller.recordSoftSignal("iteration_limit");
@@ -355,7 +461,8 @@ export async function runSubmitRuntimeV2Execute(
       });
       if (terminal) {
         await controller.driveOnce(terminal);
-        break;
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
       }
       const phaseTransition = decideRuntimeV2ExecutePhaseTransition(before, {
         isMutationToolName: isWorkspaceMutationToolName,
@@ -397,11 +504,17 @@ export async function runSubmitRuntimeV2Execute(
           input.context.turnInputContextSignals.subagentPreference,
       });
       if (!drove) {
-        await controller.driveOnce({
-          resultKind: "partial",
-          resultReason: "当前没有可继续执行的结构化动作；已保留证据并以部分结果收口。",
-        });
-        break;
+        if (before.phase === "reviewing") {
+          await controller.driveOnce({
+            resultKind: "blocked",
+            resultReason:
+              "当前 WorkPlan 正在等待用户审批；运行时没有代替用户批准或扩大授权。",
+          });
+          continue;
+        }
+        throw new Error(
+          `RUNTIME_V2_ACTIVE_DECISION_MISSING:${before.phase}`,
+        );
       }
     }
     const final = controller.snapshot().aggregate?.terminalOutcome;
@@ -411,6 +524,24 @@ export async function runSubmitRuntimeV2Execute(
       controller.snapshot().aggregate,
       { isMutationToolName: isWorkspaceMutationToolName },
     );
+    const finalAggregate = controller.snapshot().aggregate!;
+    const executionCoverage =
+      deriveRuntimeV2ExecutionContractCoverage(finalAggregate);
+    const planCoverage =
+      deriveRuntimeV2PlanExecutionCoverage(finalAggregate);
+    const staticOnlyBehavioralCriterionIds =
+      finalAggregate.executionContract?.criteria
+        .filter((criterion) =>
+          criterion.evidenceRequirement !== "static" &&
+          finalAggregate.executionContract!.validations.some(
+            (validation) =>
+              validation.criterionIds.includes(criterion.id) &&
+              validation.kind === "finite_command" &&
+              validation.capability !== "test" &&
+              validation.capability !== "inline_assertion",
+          )
+        )
+        .map((criterion) => criterion.id) || [];
     input.logStoreEvent("runtime_v2_execute_terminal", {
       turnId: identity.turn.turnId,
       runId: identity.run.runId,
@@ -423,8 +554,102 @@ export async function runSubmitRuntimeV2Execute(
       stalledValidations: executionEvidence.stalledValidationCount,
       failedOperations: executionEvidence.failedOperationCount,
       childRuns: controller.snapshot().aggregate?.subagents.length || 0,
+      executionAuthorityKind: executionCoverage
+        ? "execution_contract"
+        : planCoverage
+          ? "work_plan"
+          : null,
+      executionAuthorityId:
+        executionCoverage?.contractId ||
+        finalAggregate.sealedWorkPlan?.id ||
+        null,
+      contractCoverageComplete:
+        executionCoverage?.complete ??
+        (
+          planCoverage
+            ? planCoverage.allMutationTargetsCovered &&
+              planCoverage.allRequiredValidationsPassed
+            : false
+        ),
+      missingMutationTargets:
+        executionCoverage?.missingMutationTargets ||
+        planCoverage?.missingMutationTargets ||
+        [],
+      missingCriterionIds:
+        executionCoverage?.missingCriterionIds || [],
+      missingValidationIds:
+        executionCoverage?.missingValidationIds ||
+        planCoverage?.missingRequiredValidationIndexes.map(
+          (index) => `work-plan-validation-${index + 1}`,
+        ) ||
+        [],
+      staticOnlyBehavioralCriterionIds,
     });
     return settlement(input.context, terminalOutcomeToLegacy(outcome.resultKind, outcome.reason));
+  } catch (error) {
+    const aggregate = controller.snapshot().aggregate;
+    if (aggregate?.run && !aggregate.terminalOutcome) {
+      for (const childAbort of live.childAbortControllers.values()) {
+        childAbort.abort("runtime_v2_parent_infrastructure_failure");
+      }
+      const detail = (error instanceof Error
+        ? error.message
+        : String(error || "unknown error"))
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 1_000);
+      const hasMutation = aggregate.evidence.some(
+        (evidence) => evidence.kind === "mutation",
+      );
+      const resultKind = input.context.abortCtrl.signal.aborted
+        ? "canceled"
+        : hasMutation
+          ? "partial"
+          : "error";
+      const reason = input.context.abortCtrl.signal.aborted
+        ? "用户已停止本轮执行；已保留此前提交的证据和修改。"
+        : [
+            "Runtime v2 执行基础设施异常，父任务已在同一 checkpoint 中收口。",
+            hasMutation
+              ? "已保留实际修改，但未把未完成验收表述为成功。"
+              : "本轮未形成可验收的实际修改。",
+            detail ? `原因：${detail}` : "",
+          ].filter(Boolean).join(" ");
+      input.logStoreEvent("runtime_v2_execute_infrastructure_failure", {
+        turnId: identity.turn.turnId,
+        runId: identity.run.runId,
+        resultKind,
+        hasMutation,
+        error: detail,
+      });
+      try {
+        await controller.finishTerminal(resultKind, reason);
+      } catch (terminalError) {
+        input.logStoreEvent(
+          "runtime_v2_execute_infrastructure_terminal_failed",
+          {
+            turnId: identity.turn.turnId,
+            runId: identity.run.runId,
+            originalError: detail,
+            terminalError: terminalError instanceof Error
+              ? terminalError.message
+              : String(terminalError),
+          },
+        );
+        throw error;
+      }
+      const terminal = controller.snapshot().aggregate?.terminalOutcome;
+      if (terminal) {
+        return settlement(
+          input.context,
+          terminalOutcomeToLegacy(
+            terminal.resultKind,
+            terminal.reason,
+          ),
+        );
+      }
+    }
+    throw error;
   } finally {
     clearInterval(input.context.timerInterval as ReturnType<typeof setInterval>);
   }

@@ -34,8 +34,7 @@ export type RuntimeV2GoalBoundaryKind =
   | "cancel_requested"
   | "authority_lost"
   | "deadline_exceeded"
-  | "resource_budget_exhausted"
-  | "recovery_exhausted";
+  | "resource_budget_exhausted";
 
 export interface RuntimeV2GoalBoundarySignal {
   readonly kind: RuntimeV2GoalBoundaryKind;
@@ -94,6 +93,29 @@ export interface RuntimeV2GoalSliceRequest {
   readonly goalDeadlineAt: number;
 }
 
+/** Preserve the parent Goal's stable criterion identity at the Execute
+ * admission boundary. The slice prompt is presentation context; it must not
+ * replace criterion ids with anonymous synthesized text. */
+export function runtimeV2GoalSliceExecuteAdmission(
+  request: RuntimeV2GoalSliceRequest,
+): {
+  readonly objective: string;
+  readonly constraints: readonly string[];
+  readonly acceptanceCriteria: readonly {
+    readonly id: string;
+    readonly text: string;
+  }[];
+} {
+  return {
+    objective: request.objective.text,
+    constraints: request.objective.constraints,
+    acceptanceCriteria: request.criteria.map((criterion) => ({
+      id: criterion.id,
+      text: criterion.text,
+    })),
+  };
+}
+
 export interface RuntimeV2GoalSliceReceipt {
   readonly request: RuntimeV2GoalSliceRequest;
   readonly outcomeId: string;
@@ -121,6 +143,10 @@ export interface RuntimeV2GoalSagaState {
   readonly createdAt: number;
   readonly deadlineAt: number;
   readonly sliceDurationMs: number;
+  /**
+   * Legacy checkpoint field. Kept so v1 Goal checkpoints remain readable;
+   * repeated diagnostics are pressure signals and never terminal authority.
+   */
   readonly maxRecoveryAttempts: number;
   readonly resourceBudget: {
     readonly tokenLimit: number | null;
@@ -287,26 +313,14 @@ function terminalForSettledSlice(
       completedAt: receipt.completedAt,
     };
   }
-  if (receipt.reasonCode === "recovery_exhausted") {
-    return {
-      resultKind: state.evidence.length > 0 ? "partial" : "error",
-      reasonCode: "recovery_exhausted",
-      reason: receipt.reason,
-      completedAt: receipt.completedAt,
-    };
-  }
-  if (receipt.resultKind === "error" && !receipt.recoverable) {
+  if (
+    receipt.reasonCode !== "recovery_exhausted" &&
+    receipt.resultKind === "error" &&
+    !receipt.recoverable
+  ) {
     return {
       resultKind: "error",
       reasonCode: receipt.reasonCode,
-      reason: receipt.reason,
-      completedAt: receipt.completedAt,
-    };
-  }
-  if (state.recovery.exhausted) {
-    return {
-      resultKind: state.evidence.length > 0 ? "partial" : "error",
-      reasonCode: "recovery_exhausted",
       reason: receipt.reason,
       completedAt: receipt.completedAt,
     };
@@ -522,8 +536,6 @@ export function recordRuntimeV2GoalSliceOutcome(
     : state.recovery.fingerprint === fingerprint
       ? state.recovery.count + 1
       : 1;
-  const recoveryExhausted = outcome.reasonCode === "recovery_exhausted" ||
-    recoveryCount >= state.maxRecoveryAttempts;
   const receipt: RuntimeV2GoalSliceReceipt = {
     request,
     outcomeId: nonEmpty(outcome.outcomeId, "outcome_id"),
@@ -545,7 +557,7 @@ export function recordRuntimeV2GoalSliceOutcome(
     criterionEvidence,
     recovery: meaningfulProgress
       ? { fingerprint: null, count: 0, exhausted: false }
-      : { fingerprint, count: recoveryCount, exhausted: recoveryExhausted },
+      : { fingerprint, count: recoveryCount, exhausted: false },
     usage: {
       tokensUsed: state.usage.tokensUsed +
         Math.max(0, Math.floor(Number(outcome.usage?.tokensUsed) || 0)),

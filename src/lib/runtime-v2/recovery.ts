@@ -40,7 +40,9 @@ export function runtimeV2RecoveryScopeForCommandFailure(
   error: unknown,
 ): RuntimeV2RecoveryScope {
   if (command.kind === "request_model") {
-    return isRuntimeV2ProviderProtocolError(error) ? "action" : "transport";
+    return isRuntimeV2ProviderProtocolError(error)
+      ? "diagnostic"
+      : "transport";
   }
   const message = error instanceof Error ? error.message : String(error || "");
   return /context|token|window/i.test(message) ? "context" : "action";
@@ -69,7 +71,7 @@ function canonical(value: unknown): string {
 
 /** Stable within a Run and insensitive to the generated idempotency key. */
 export function runtimeV2ActionFingerprint(command: Pick<RuntimeV2Command, "kind" | "phase" | "payload">): string {
-  const explicit = compact(command.payload.actionFingerprint, 512);
+  const explicit = compact(command.payload.actionFingerprint, 4_096);
   if (explicit) return explicit;
   return `${command.phase}:${command.kind}:${canonical(command.payload)}`.slice(0, 4_096);
 }

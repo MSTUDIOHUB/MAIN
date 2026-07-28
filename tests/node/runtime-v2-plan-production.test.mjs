@@ -757,7 +757,11 @@ test("Plan synthesis falls back once from ignored native tools to a schema-bound
       .join("\n"),
     /Return exactly one JSON object/,
   );
-  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 1);
+  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 0);
+  assert.ok(result.checkpoint.aggregate.events.some((event) =>
+    event.type === "soft_signal.observed" &&
+    event.signal === "protocol_drift"
+  ));
   assert.ok(result.checkpoint.aggregate.events.some((event) =>
     event.type === "provider.responded" &&
     event.result.diagnostics.some((diagnostic) =>
@@ -899,12 +903,8 @@ test("a closed synthesis request gets one compact sequential recovery without ov
           );
         }
         return {
-          content: "",
-          toolCalls: [{
-            id: `submit-after-recovery-${providerRound}`,
-            name: "submit_runtime_v2_work_plan",
-            arguments: submission,
-          }],
+          content: submission,
+          toolCalls: [],
           usage: {},
           protocolViolation: null,
         };
@@ -948,10 +948,18 @@ test("a closed synthesis request gets one compact sequential recovery without ov
       .join("\n"),
     /single bounded recovery request/,
   );
-  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 1);
+  assert.ok(synthesisRequests[1].options.responseFormat);
+  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 0);
+  assert.equal(
+    result.checkpoint.aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "protocol_drift"
+    ).length,
+    1,
+  );
 });
 
-test("two synthesis timeouts close exactly once after the bounded sequential recovery", async () => {
+test("native and structured synthesis timeouts close only after both transports fail", async () => {
   let providerRound = 0;
   let activeRequests = 0;
   let maxActiveRequests = 0;
@@ -1002,7 +1010,7 @@ test("two synthesis timeouts close exactly once after the bounded sequential rec
   );
 });
 
-test("production Plan runner closes repeated no-action responses exactly once", async () => {
+test("Plan no-action stays soft until both synthesis transports are unavailable", async () => {
   const result = await runProductionPlanScenario(
     async () => ({
       content: "仍在分析",
@@ -1021,7 +1029,13 @@ test("production Plan runner closes repeated no-action responses exactly once", 
   assert.equal(aggregate.phase, "completed");
   assert.equal(aggregate.scheduledCommands.length, 0);
   assert.equal(aggregate.workPlan, null);
-  assert.ok(aggregate.recovery.exhausted);
+  assert.equal(aggregate.recovery.exhausted, null);
+  assert.ok(
+    aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "no_tool_call"
+    ).length >= 3,
+  );
   assert.equal(
     aggregate.events.filter((event) => event.type === "run.completed").length,
     1,

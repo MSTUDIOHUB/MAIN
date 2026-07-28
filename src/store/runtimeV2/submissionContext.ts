@@ -29,4 +29,15 @@ export interface RuntimeV2SubmissionContext {
   readonly timerInterval: unknown;
   readonly harnessRunId: string;
   readonly turnInputContextSignals: TurnInputContextSignals;
+  /** Optional parent-owned objective slice. Goal execution must preserve the
+   * original criterion ids instead of re-admitting a synthesized prompt as
+   * an anonymous Execute request. */
+  readonly executeAdmission?: {
+    readonly objective: string;
+    readonly constraints?: readonly string[];
+    readonly acceptanceCriteria: readonly {
+      readonly id: string;
+      readonly text: string;
+    }[];
+  };
 }

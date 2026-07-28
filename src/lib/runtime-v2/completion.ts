@@ -1,6 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2ResultKind } from "./contracts";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 
 /** Facts supplied by a store adapter after it has inspected actual tool and
  * validation receipts. Provider wording is intentionally reduced to a
@@ -18,13 +19,6 @@ export interface RuntimeV2CompletionDecision {
   readonly resultKind: RuntimeV2ResultKind;
   readonly resultReason: string;
 }
-
-/** Three identical normalized validator receipts mean corrective work has
- * stopped changing the observable failure. A separate epoch-wide ceiling
- * keeps genuinely changing diagnostics bounded without treating progress as
- * stagnation. The Run lifecycle deadline remains the outer wall-clock bound. */
-export const RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES = 3;
-export const RUNTIME_V2_MAX_TOTAL_FAILED_VALIDATION_CYCLES = 8;
 
 export function exhaustedRuntimeV2ResultKind(
   aggregate: TurnAggregateV1,
@@ -65,44 +59,33 @@ export function decideRuntimeV2TerminalOutcome(
       resultReason: aggregate.recovery.exhausted.reason,
     };
   }
-  if (
-    facts.mutationCount > 0 &&
-    facts.passedValidationCount === 0 &&
-    (
-      facts.stalledValidationCount >=
-        RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES ||
-      facts.failedValidationCount >=
-        RUNTIME_V2_MAX_TOTAL_FAILED_VALIDATION_CYCLES
-    )
-  ) {
-    return {
-      resultKind: "partial",
-      resultReason:
-        facts.stalledValidationCount >=
-            RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES
-          ? "已完成有限修改，但连续三次验收仍返回同一项标准化失败；运行时已保留修改、失败证据和具体文件，并结束本轮以避免无进展循环。"
-          : "已完成有限修改，但本轮已达到变化中失败证据的全局安全上限；运行时已保留修改、验证轨迹和具体文件，并结束本轮以避免无限循环。",
-    };
+  const executionContractCoverage =
+    deriveRuntimeV2ExecutionContractCoverage(aggregate);
+  if (aggregate.strategy === "execute") {
+    if (!executionContractCoverage?.complete) return null;
+    return facts.hasProviderConclusion
+      ? {
+          resultKind: "success",
+          resultReason:
+            "执行契约中的全部修改目标和验收条件均由最终修改后的匹配证据覆盖。",
+        }
+      : null;
   }
   const approvedPlanCoverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
-  if (
-    approvedPlanCoverage &&
-    (
+  if (approvedPlanCoverage) {
+    if (
       !approvedPlanCoverage.allMutationTargetsCovered ||
       !approvedPlanCoverage.allRequiredValidationsPassed
-    )
-  ) {
-    return null;
-  }
-  if (
-    facts.mutationCount > 0 &&
-    facts.passedValidationCount > 0 &&
-    facts.hasProviderConclusion
-  ) {
-    return {
-      resultKind: "success",
-      resultReason: "已完成修改，并通过结构化验证结果确认。",
-    };
+    ) {
+      return null;
+    }
+    return facts.hasProviderConclusion
+      ? {
+          resultKind: "success",
+          resultReason:
+            "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
+        }
+      : null;
   }
   return null;
 }

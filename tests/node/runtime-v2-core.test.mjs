@@ -60,12 +60,20 @@ const baseRun = {
 
 let eventCounter = 0;
 function event(state, type, fields = {}) {
+  const validationBoundary =
+    type === "validation.completed" && state && fields.authority
+      ? runtime.deriveRuntimeV2ValidationBoundary(
+          state,
+          fields.authority.targetPaths,
+        )
+      : {};
   return {
     schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
     sequence: state ? state.nextSequence : 0,
     eventId: `event-${++eventCounter}`,
     at: state ? state.updatedAt + 1 : 1,
     type,
+    ...validationBoundary,
     ...fields,
   };
 }
@@ -82,6 +90,54 @@ function executeAggregate(initialPhase = "observing") {
     run: baseRun,
     phase: initialPhase,
   }));
+}
+
+function withExecutionContract(state, input = {}) {
+  const source = input.source || state.evidence.find((item) =>
+    item.kind === "source" && item.version
+  );
+  assert.ok(source, "execution contract fixture requires versioned source");
+  const target = input.target || source.target;
+  const criterionId =
+    state.objective.acceptanceCriterionIds?.[0] || "criterion-1";
+  const contract = runtime.compileRuntimeV2ExecutionContract({
+    objective: state.objective,
+    evidence: state.evidence,
+    draft: {
+      criteria: [{
+        id: criterionId,
+        evidence_requirement:
+          input.evidenceRequirement || "behavioral",
+      }],
+      changes: [{
+        operation: input.operation || "modify",
+        target,
+        basis_evidence_ids: [source.id],
+      }],
+      validations: [{
+        id: input.validationId || "validation-1",
+        criterion_ids: [criterionId],
+        target_paths: [target],
+        kind: "finite_command",
+        command: input.command || "npm test",
+        cwd: ".",
+        expected_outcome: "The declared criterion passes.",
+      }],
+    },
+    committedAt: state.updatedAt + 1,
+    contractId: "execution-contract-fixture",
+  });
+  return { ...state, executionContract: contract };
+}
+
+function executionValidationAuthority(state, validationId = "validation-1") {
+  const validation = state.executionContract.validations.find(
+    (candidate) => candidate.id === validationId,
+  );
+  return runtime.runtimeV2ExecutionValidationAuthority({
+    contract: state.executionContract,
+    validation,
+  });
 }
 
 test("Plan and Execute hash exact read_file bytes instead of formatted read windows", async () => {
@@ -238,6 +294,275 @@ test("Acting narrows the next provider request to mutation after its bounded sou
   assert.equal(next.payload.toolExpectation, "required");
   assert.equal(state.terminalOutcome, null);
   assert.equal(state.recovery.exhausted, null);
+});
+
+test("Acting turns a rejected unchanged read into a required mutation progression", () => {
+  let state = executeAggregate("acting");
+  state = recordSuccessfulSourceAction(state, 1);
+  state = recordSuccessfulSourceAction(state, 2);
+  state = runtime.transition(state, event(state, "soft_signal.observed", {
+    run: baseRun,
+    signal: "repeat",
+  }));
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executePolicy, "mutation_required");
+  assert.equal(next.payload.mutationProgressionRequired, true);
+});
+
+test("fresh evidence for an uncovered contract target requires mutation without waiting for a read loop", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-main-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+  state = recordSuccessfulSourceAction(state, 1);
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executePolicy, "mutation_required");
+  assert.equal(next.payload.mutationProgressionRequired, true);
+});
+
+test("remaining contract targets require an exact source lease instead of another broad survey", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-main-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(
+    next.payload.requiredMutationSourceTarget,
+    "src/main.js",
+  );
+  assert.equal(next.payload.mutationProgressionRequired, false);
+});
+
+test("failed editor actions request evidence refresh without disabling the editor class", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-main-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+  state = recordSuccessfulSourceAction(state, 1);
+
+  for (const toolName of ["replace_in_file", "apply_patch"]) {
+    const failed = commandFor(
+      state,
+      "execute_tool",
+      `failed-${toolName}`,
+      {
+        toolCallId: `call-${toolName}`,
+        toolName,
+        arguments: { path: "src/main.js" },
+      },
+    );
+    state = runtime.transition(state, event(state, "command.scheduled", {
+      run: baseRun,
+      command: failed,
+    }));
+    state = runtime.transition(state, event(state, "tool.completed", {
+      run: baseRun,
+      idempotencyKey: failed.idempotencyKey,
+      status: "failed",
+      failureKind: "source_mismatch",
+      evidence: [],
+      presentation: {
+        toolName,
+        target: "src/main.js",
+      },
+    }));
+  }
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executePolicy, "source_refresh_required");
+  assert.equal(next.payload.mutationProgressionRequired, false);
+  assert.equal(next.payload.requiredMutationSourceTarget, null);
+
+  state = recordSuccessfulSourceAction(state, 2);
+  const [afterRefresh] = runtime.decideNextCommands(state);
+  assert.equal(
+    afterRefresh.payload.executePolicy,
+    "mutation_required",
+  );
+  assert.equal(
+    afterRefresh.payload.requiredMutationSourceTarget,
+    null,
+  );
+});
+
+test("a parent source read after child failure remains an observation during validation", () => {
+  let state = executeAggregate("validating");
+  const job = {
+    id: "child-validation-review",
+    run: {
+      ...baseRun,
+      runId: "child-run-validation-review",
+      parentRunId: baseRun.runId,
+      attemptId: "child-attempt-validation-review",
+    },
+    parentRunId: baseRun.runId,
+    scopeKey: "validation-review",
+    name: "Validation reviewer",
+    objective: "Review the saved-file behavior.",
+    allowedPaths: ["src"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [job],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: job.id,
+    status: "failed",
+    summary: "No structured report was committed.",
+    evidence: [],
+  }));
+
+  const [takeover] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(takeover.kind, "request_model");
+  assert.equal(takeover.payload.mode, "validate");
+  assert.equal(
+    takeover.payload.validationParentTakeoverReadRequired,
+    true,
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: takeover,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: takeover.idempotencyKey,
+    result: {
+      toolCalls: [{
+        id: "validate-read-main",
+        name: "read_file",
+        arguments: { path: "src/main.js" },
+      }],
+      diagnostics: [],
+    },
+  }));
+
+  const [read] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(read.kind, "execute_tool");
+  assert.equal(read.payload.toolName, "read_file");
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: read,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: read.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "validation-parent-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    }],
+  }));
+
+  const [validate] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(validate.kind, "request_model");
+  assert.equal(
+    validate.payload.validationParentTakeoverReadRequired,
+    false,
+  );
+});
+
+test("supporting reads do not automatically widen an active execution contract", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "editor-contract-source",
+      kind: "source",
+      target: "src/components/editor.js",
+      version: "editor-v1",
+    },
+  }));
+  const contract = withExecutionContract(state, {
+    target: "src/components/editor.js",
+  }).executionContract;
+  state = runtime.transition(state, event(
+    state,
+    "execution_contract.committed",
+    { run: baseRun, contract },
+  ));
+  const read = commandFor(state, "execute_tool", "read-outside-contract", {
+    toolCallId: "read-main-call",
+    toolName: "read_file",
+    arguments: { path: "src/main.js" },
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: read,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: read.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "main-contract-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    }],
+  }));
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(next.payload.executionContractRevisionRequired, undefined);
+  assert.deepEqual(next.payload.activeExecutionContractDraft.changes, [{
+    operation: "modify",
+    target: "src/components/editor.js",
+    basis_evidence_ids: ["editor-contract-source"],
+  }]);
+  assert.equal(next.payload.toolExpectation, "required");
 });
 
 test("a new corrective Acting phase keeps a bounded source gap despite global iteration pressure", () => {
@@ -717,6 +1042,15 @@ test("Chat milestones reject runtime-authored phase and child prose and keep act
       target: "src/main.js",
       version: null,
     }],
+    report: {
+      schemaVersion: runtime.RUNTIME_V2_SUBAGENT_REPORT_SCHEMA_VERSION,
+      summary: "Frontend evidence collected.",
+      findings: [{
+        statement: "The frontend handler owns the observed transition.",
+        evidenceIds: ["child-evidence-1"],
+      }],
+      unresolved: [],
+    },
   });
   state = runtime.transition(state, firstChild);
   assert.equal(
@@ -779,6 +1113,73 @@ test("Chat milestones reject runtime-authored phase and child prose and keep act
   );
   assert.equal(realMilestone.markdown, "我先核对保存事件的真实消费路径。");
   assert.doesNotMatch(realMilestone.markdown, /当前阶段|已保留|并行只读调查/);
+});
+
+test("a child that only reads but never submits an evidence-linked report cannot complete", () => {
+  let state = executeAggregate("observing");
+  const scheduled = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    candidates: [{
+      scopeKey: "read-until-budget",
+      taskKind: "explore",
+      objective: "Read the save path until evidence is clear.",
+      allowedPaths: ["src"],
+    }],
+    requestedAt: state.updatedAt + 1,
+    nextId: () => "child-read-until-budget",
+  });
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: scheduled.jobs,
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: scheduled.jobs[0].id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: scheduled.jobs[0].id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  const readEvidence = [{
+    id: "child-read-E1",
+    kind: "subagent",
+    target: "src/main.js",
+    version: "source-v1",
+  }];
+  const invalidCompletion = runtime.tryTransition(
+    state,
+    event(state, "subagent.completed", {
+      run: baseRun,
+      jobId: scheduled.jobs[0].id,
+      status: "completed",
+      summary: "Reached the read-only investigation round limit.",
+      evidence: readEvidence,
+    }),
+  );
+  assert.equal(invalidCompletion.disposition, "rejected");
+  assert.equal(invalidCompletion.reason, "subagent_invalid");
+
+  const failed = runtime.tryTransition(
+    state,
+    event(state, "subagent.completed", {
+      run: baseRun,
+      jobId: scheduled.jobs[0].id,
+      status: "failed",
+      summary: "No structured evidence-linked report was submitted.",
+      evidence: readEvidence,
+    }),
+  );
+  assert.equal(failed.disposition, "applied");
+  assert.equal(failed.state.subagents[0].status, "failed");
+  assert.equal(failed.state.subagents[0].report, null);
 });
 
 test("Runtime v2 reducer records one ordered ledger and forbids success before finalizing", () => {
@@ -1120,6 +1521,7 @@ test("successful structural actions do not consume failed-action recovery", asyn
   await controller.driveOnce();
   await controller.driveOnce();
   await controller.driveOnce();
+  await controller.driveOnce();
   const aggregate = controller.snapshot().aggregate;
   assert.equal(aggregate.phase, "observing");
   assert.equal(aggregate.terminalOutcome, null);
@@ -1248,6 +1650,77 @@ test("an exact source refresh opens a bounded recovery epoch after a rejected ed
   ));
 });
 
+test("an unchanged reread cannot reset exact side-effect retry protection", () => {
+  const initial = executeAggregate("acting");
+  const priorSource = event(initial, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: "prior-source",
+    status: "succeeded",
+    evidence: [{
+      id: "source-v1",
+      kind: "source",
+      target: "src/main.js",
+      version: "v1",
+    }],
+  });
+  const rejectedEdit = event(initial, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: "rejected-edit",
+    status: "failed",
+    failureKind: "mutation_rejected",
+    evidence: [],
+  });
+  const aggregate = {
+    ...initial,
+    events: [...initial.events, priorSource, rejectedEdit],
+    recovery: {
+      ...initial.recovery,
+      receipts: [{
+        scope: "action",
+        fingerprint: "action:apply-patch-v1",
+        count: 1,
+        epoch: 0,
+        lastAttemptAt: rejectedEdit.at,
+      }],
+    },
+  };
+  const sameVersion = event(aggregate, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: "same-source-refresh",
+    status: "succeeded",
+    evidence: [{
+      id: "source-v1-again",
+      kind: "source",
+      target: "src/main.js",
+      version: "v1",
+    }],
+  });
+  assert.equal(
+    runtime.deriveRuntimeV2CorrectiveRecoveryEpoch({
+      aggregate,
+      event: sameVersion,
+    }),
+    null,
+  );
+
+  const newVersion = {
+    ...sameVersion,
+    evidence: [{
+      id: "source-v2",
+      kind: "source",
+      target: "src/main.js",
+      version: "v2",
+    }],
+  };
+  assert.equal(
+    runtime.deriveRuntimeV2CorrectiveRecoveryEpoch({
+      aggregate,
+      event: newVersion,
+    })?.reason,
+    "corrective_source_refreshed_after_rejected_mutation",
+  );
+});
+
 test("a weak-model read loop is pulled into mutation, validation, and a truthful terminal", async () => {
   let now = 500;
   let id = 0;
@@ -1268,22 +1741,54 @@ test("a weak-model read loop is pulled into mutation, validation, and a truthful
         const mode = command.payload.mode;
         if (mode === "execute") {
           providerPolicies.push(command.payload.executePolicy);
-          if (command.payload.executePolicy === "mutation_required") {
+          if (sourceEvidenceId === 0) {
             return {
               toolCalls: [{
-                id: "apply-fix",
-                name: "apply_patch",
-                arguments: { patch: "*** Begin Patch\\n*** End Patch" },
+                id: "read-source",
+                name: "read_file",
+                arguments: { path: "src/main.js" },
+              }],
+              diagnostics: [],
+            };
+          }
+          if (!command.payload.executionContractRevision) {
+            return {
+              toolCalls: [{
+                id: "submit-contract",
+                name: "submit_execution_contract",
+                arguments: {
+                  criteria: [{
+                    id: "criterion-user-objective",
+                    evidence_requirement: "behavioral",
+                  }],
+                  changes: [{
+                    operation: "modify",
+                    target: "src/main.js",
+                    basis_evidence_ids: ["source-1"],
+                  }],
+                  validations: [{
+                    id: "fixture-test",
+                    criterion_ids: ["criterion-user-objective"],
+                    target_paths: ["src/main.js"],
+                    kind: "finite_command",
+                    command: "npm test",
+                    cwd: ".",
+                    expected_outcome: "fixture tests pass",
+                  }],
+                },
               }],
               diagnostics: [],
             };
           }
           return {
-            toolCalls: [1, 2, 3].map((ordinal) => ({
-              id: `read-${ordinal}`,
-              name: "read_file",
-              arguments: { path: "src/main.js" },
-            })),
+            toolCalls: [{
+              id: "apply-fix",
+              name: "apply_patch",
+              arguments: {
+                path: "src/main.js",
+                patch: "*** Begin Patch\\n*** End Patch",
+              },
+            }],
             diagnostics: [],
           };
         }
@@ -1350,6 +1855,11 @@ test("a weak-model read loop is pulled into mutation, validation, and a truthful
             version: null,
           }],
           passed: true,
+          authority: command.payload.validationAuthority,
+          ...runtime.deriveRuntimeV2ValidationBoundary(
+            controller.snapshot().aggregate,
+            command.payload.validationAuthority.targetPaths,
+          ),
         };
       },
     },
@@ -1371,6 +1881,8 @@ test("a weak-model read loop is pulled into mutation, validation, and a truthful
     run: baseRun,
     strategy: "execute",
     objective: "Repair the fixture",
+    acceptanceCriteria: ["Repair the fixture"],
+    acceptanceCriterionIds: ["criterion-user-objective"],
     initialPhase: "acting",
   });
   for (let step = 0; step < 6; step += 1) {
@@ -1378,15 +1890,17 @@ test("a weak-model read loop is pulled into mutation, validation, and a truthful
   }
   let aggregate = controller.snapshot().aggregate;
   assert.equal(aggregate.terminalOutcome, null);
-  assert.deepEqual(providerPolicies, ["source_gap_allowed", "mutation_required"]);
+  assert.deepEqual(providerPolicies, [
+    "source_gap_allowed",
+    "source_gap_allowed",
+    "mutation_required",
+  ]);
   assert.deepEqual(executedTools, [
-    "read_file",
-    "read_file",
     "read_file",
     "apply_patch",
   ]);
   assert.ok(aggregate.events.some((item) =>
-    item.type === "soft_signal.observed" && item.signal === "repeat"
+    item.type === "execution_contract.committed"
   ));
   assert.equal(aggregate.recovery.exhausted, null);
 
@@ -1413,6 +1927,285 @@ test("a weak-model read loop is pulled into mutation, validation, and a truthful
   aggregate = controller.snapshot().aggregate;
   assert.equal(aggregate.terminalOutcome?.resultKind, "success");
   assert.equal(aggregate.events.filter((item) => item.type === "turn.completed").length, 1);
+});
+
+test("an unchanged source loop is rejected without terminating the parent Turn", async () => {
+  let now = 1_700;
+  let id = 0;
+  let revision = 0;
+  let providerCalls = 0;
+  const executed = [];
+  const providerPolicies = [];
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision, event: appended },
+        };
+      },
+    },
+    provider: {
+      async request({ command }) {
+        providerCalls += 1;
+        providerPolicies.push({
+          expectation: command.payload.toolExpectation,
+          policy: command.payload.observationPolicy,
+          target: command.payload.repeatedSourceTarget,
+        });
+        return {
+          toolCalls: [{
+            id: `same-read-${providerCalls}`,
+            name: "read_file",
+            arguments: {
+              path: providerCalls % 2 === 0
+                ? "/fixture/src/main.js"
+                : "src/main.js",
+              start_line: providerCalls * 10,
+            },
+          }],
+          diagnostics: [],
+        };
+      },
+    },
+    tool: {
+      async execute({ command }) {
+        executed.push(command);
+        if (command.payload.repeatedActionRejected === true) {
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "failed",
+            failureKind: "protocol_invalid",
+            evidence: [],
+          };
+        }
+        return {
+          type: "tool.completed",
+          run: command.run,
+          idempotencyKey: command.idempotencyKey,
+          status: "succeeded",
+          evidence: [{
+            id: `same-source-${executed.length}`,
+            kind: "source",
+            target: "src/main.js",
+            version: "unchanged-v1",
+          }],
+        };
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler is not expected");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-same-read-${++id}`,
+      nextIdempotencyKey: ({ run, kind }) =>
+        `${run.runId}:${kind}:same-read:${++id}`,
+    },
+  });
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+    acceptanceCriteria: ["Repair the fixture"],
+    acceptanceCriterionIds: ["criterion-user-objective"],
+    initialPhase: "observing",
+  });
+  for (let step = 0; step < 6; step += 1) {
+    assert.equal(await controller.driveOnce(), true);
+  }
+  const aggregate = controller.snapshot().aggregate;
+  assert.equal(executed.length, 3);
+  assert.equal(
+    executed[2].payload.repeatedActionReason,
+    "unchanged_source_repeat",
+  );
+  assert.deepEqual(providerPolicies[2], {
+    expectation: "required",
+    policy: "different_action_or_contract_required",
+    target: "src/main.js",
+  });
+  const next = runtime.decideNextCommands(aggregate)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.toolExpectation, "required");
+  assert.equal(
+    next.payload.observationPolicy,
+    "execution_contract_required",
+  );
+  assert.deepEqual(next.payload.executionEvidenceCatalog, [
+    {
+      id: "same-source-1",
+      kind: "source",
+      target: "src/main.js",
+      version: "unchanged-v1",
+    },
+    {
+      id: "same-source-2",
+      kind: "source",
+      target: "src/main.js",
+      version: "unchanged-v1",
+    },
+  ]);
+  assert.equal(aggregate.terminalOutcome, null);
+  assert.equal(
+    aggregate.events.filter((item) =>
+      item.type === "soft_signal.observed" &&
+      item.signal === "repeat"
+    ).length,
+    1,
+  );
+});
+
+test("a rejected execution contract returns its exact compiler reason to the parent", async () => {
+  let state = executeAggregate("observing");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  }));
+  const request = runtime.decideNextCommands(state)[0];
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: request,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: request.idempotencyKey,
+    result: {
+      toolCalls: [{
+        id: "invalid-contract",
+        name: "submit_execution_contract",
+        arguments: {
+          criteria: [{
+            id: "criterion-1",
+            evidence_requirement: "behavioral",
+          }],
+          changes: [{
+            operation: "modify",
+            target: "src/main.js",
+            basis_evidence_ids: ["contract-source"],
+          }],
+          validations: [{
+            id: "inspect-only",
+            criterion_ids: ["criterion-1"],
+            target_paths: ["src/main.js"],
+            kind: "finite_command",
+            command: "grep -n save src/main.js",
+            expected_outcome: "Inspect the source.",
+          }],
+        },
+      }],
+      diagnostics: [],
+    },
+  }));
+
+  let revision = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision, event: appended },
+        };
+      },
+    },
+    provider: {
+      async request() {
+        throw new Error("provider should not run while committing");
+      },
+    },
+    tool: {
+      async execute() {
+        throw new Error("tool should not run while committing");
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler should not run while committing");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => state.updatedAt + revision + 1,
+      nextId: (scope) => `${scope}-contract-rejection-${revision + 1}`,
+      nextIdempotencyKey: ({ run, kind }) =>
+        `${run.runId}:${kind}:contract-rejection`,
+    },
+  }, { aggregate: state, revision: 0 });
+
+  assert.equal(await controller.driveOnce(), true);
+  const aggregate = controller.snapshot().aggregate;
+  const rejection = aggregate.events.find((item) =>
+    item.type === "execution_contract.rejected"
+  );
+  assert.match(
+    rejection?.reason || "",
+    /finite_validation_invalid:inspect-only/,
+  );
+  assert.equal(aggregate.executionContract, null);
+  assert.equal(aggregate.terminalOutcome, null);
+  assert.equal(
+    aggregate.events.filter((item) =>
+      item.type === "soft_signal.observed" &&
+      item.signal === "protocol_drift"
+    ).length,
+    1,
+  );
+  assert.match(
+    runtime.decideNextCommands(aggregate)[0].payload
+      .executionContractRejection,
+    /finite_validation_invalid:inspect-only/,
+  );
+});
+
+test("a missing contract basis schedules one runtime-owned exact source acquisition", () => {
+  let state = executeAggregate("observing");
+  state = runtime.transition(state, event(state, "execution_contract.rejected", {
+    run: baseRun,
+    reason:
+      "RUNTIME_V2_EXECUTION_CONTRACT_INVALID:versioned_basis_missing:src/main.js",
+  }));
+
+  let next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(
+    next.payload.observationPolicy,
+    "execution_contract_source_required",
+  );
+  assert.equal(
+    next.payload.requiredExecutionContractSourceTarget,
+    "src/main.js",
+  );
+  assert.equal(next.payload.toolExpectation, "required");
+
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "source-main-after-rejection",
+      kind: "source",
+      target: "/fixture/src/main.js",
+      version: "source-v1",
+    },
+  }));
+  next = runtime.decideNextCommands(state)[0];
+  assert.equal(
+    next.payload.requiredExecutionContractSourceTarget,
+    null,
+  );
 });
 
 test("bounded provider transport failures close as error rather than partial", async () => {
@@ -1470,6 +2263,8 @@ test("bounded provider transport failures close as error rather than partial", a
   await controller.driveOnce();
   await controller.driveOnce();
   await controller.driveOnce();
+  await controller.driveOnce();
+  await controller.driveOnce();
   const aggregate = controller.snapshot().aggregate;
   assert.equal(aggregate.phase, "completed");
   assert.equal(aggregate.terminalOutcome.resultKind, "error");
@@ -1493,7 +2288,7 @@ test("provider protocol drift is recoverable action failure, not transport outag
     "read_file is unavailable while validating",
   );
   assert.equal(runtime.isRuntimeV2ProviderProtocolError(error), true);
-  assert.equal(runtime.runtimeV2RecoveryScopeForCommandFailure(command, error), "action");
+  assert.equal(runtime.runtimeV2RecoveryScopeForCommandFailure(command, error), "diagnostic");
   assert.equal(
     runtime.runtimeV2RecoveryScopeForCommandFailure(
       command,
@@ -1502,7 +2297,7 @@ test("provider protocol drift is recoverable action failure, not transport outag
         "cat is not validation",
       ),
     ),
-    "action",
+    "diagnostic",
   );
   assert.equal(
     runtime.runtimeV2RecoveryScopeForCommandFailure(command, new Error("HTTP 503")),
@@ -1510,7 +2305,42 @@ test("provider protocol drift is recoverable action failure, not transport outag
   );
 });
 
-test("v3 checkpoints replay events, reject a tampered aggregate, and CAS append once", () => {
+test("a failed child join is an action signal and cannot fabricate provider transport exhaustion", () => {
+  const state = executeAggregate("observing");
+  const command = commandFor(
+    state,
+    "join_subagents",
+    "join-invalid-child-reference",
+    {
+      requestedJobIds: ["ms47dtia", "ms47f5ii"],
+      jobIds: [],
+    },
+  );
+  const error = new Error(
+    "wait_subagents did not match an active child task handle",
+  );
+
+  assert.equal(
+    runtime.runtimeV2RecoveryScopeForCommandFailure(command, error),
+    "action",
+  );
+  assert.deepEqual(
+    runtime.decideRuntimeV2CommandFailureRecovery({
+      aggregate: state,
+      command,
+      error,
+    }),
+    {
+      kind: "record",
+      scope: "action",
+      fingerprint:
+        `action:${runtime.runtimeV2ActionFingerprint(command)}`,
+      publish: true,
+    },
+  );
+});
+
+test("v4 checkpoints replay events, reject a tampered aggregate, and CAS append once", () => {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,
     strategy: "execute",
@@ -1544,6 +2374,176 @@ test("v3 checkpoints replay events, reject a tampered aggregate, and CAS append 
     event: nextEvent,
   });
   assert.equal(replayed.disposition, "idempotent");
+});
+
+test("checkpoint capacity outlives the former 512-event runtime failure boundary", () => {
+  let state = executeAggregate("observing");
+  while (state.events.length < 600) {
+    state = runtime.transition(state, event(
+      state,
+      "soft_signal.observed",
+      {
+        run: baseRun,
+        signal: "repeat",
+      },
+    ));
+  }
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: state.events.length,
+    aggregate: state,
+    updatedAt: state.updatedAt,
+  });
+  assert.equal(checkpoint.events.length, 600);
+  assert.ok(runtime.MAX_RUNTIME_V2_CHECKPOINT_EVENTS >= 2_048);
+});
+
+test("v3 checkpoint migration preserves terminal history and quarantines uncontracted work", async () => {
+  const asLegacyV3 = (state, revision = state.events.length) => {
+    const checkpoint = runtime.createRuntimeV2Checkpoint({
+      revision,
+      aggregate: state,
+      updatedAt: state.updatedAt,
+    });
+    return {
+      ...JSON.parse(JSON.stringify(checkpoint)),
+      schemaVersion: runtime.RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION,
+    };
+  };
+
+  let unmodified = runtime.transition(null, event(null, "turn.admitted", {
+    turn: baseTurn,
+    strategy: "execute",
+    objective: "Repair the original user-visible save behavior",
+    constraints: [],
+    acceptanceCriteria: [],
+  }));
+  unmodified = runtime.transition(unmodified, event(unmodified, "run.started", {
+    run: baseRun,
+    phase: "acting",
+  }));
+  const legacyMutation = commandFor(
+    unmodified,
+    "execute_tool",
+    "legacy-scheduled-mutation",
+    {
+      toolCallId: "legacy-scheduled-call",
+      toolName: "apply_patch",
+      arguments: { path: "src/main.js", patch: "@@" },
+    },
+  );
+  unmodified = runtime.transition(unmodified, event(unmodified, "command.scheduled", {
+    run: baseRun,
+    command: legacyMutation,
+  }));
+  const migratedUnmodified = runtime.normalizeRuntimeV2Checkpoint(
+    asLegacyV3(unmodified),
+  );
+  assert.equal(migratedUnmodified.schemaVersion, "turn-runtime-checkpoint.v4");
+  assert.equal(migratedUnmodified.migrationDisposition, "active_unmodified");
+  assert.deepEqual(
+    migratedUnmodified.aggregate.objective.acceptanceCriteria,
+    ["Repair the original user-visible save behavior"],
+  );
+  assert.deepEqual(
+    migratedUnmodified.aggregate.objective.acceptanceCriterionIds,
+    ["criterion-user-objective"],
+  );
+
+  let revision = migratedUnmodified.revision;
+  let now = migratedUnmodified.updatedAt;
+  let executedEffects = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return migratedUnmodified; },
+      async append() {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision },
+        };
+      },
+    },
+    provider: {
+      async request() {
+        throw new Error("migration must not call the provider");
+      },
+    },
+    tool: {
+      async execute() {
+        executedEffects += 1;
+        throw new Error("legacy scheduled mutation must not execute");
+      },
+    },
+    scheduler: {
+      async execute() {
+        executedEffects += 1;
+        throw new Error("legacy scheduled scheduler effect must not execute");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-migration-${now}`,
+      nextIdempotencyKey: ({ run, kind }) =>
+        `${run.runId}:${kind}:migration`,
+    },
+  }, {
+    aggregate: migratedUnmodified.aggregate,
+    revision: migratedUnmodified.revision,
+  });
+  await controller.reobserveAfterLegacyMigration();
+  assert.equal(executedEffects, 0);
+  assert.equal(controller.snapshot().aggregate.phase, "observing");
+  assert.equal(controller.snapshot().aggregate.scheduledCommands.length, 0);
+  assert.equal(
+    controller.snapshot().aggregate.completedCommands.at(-1).status,
+    "failed",
+  );
+
+  let mutated = executeAggregate("acting");
+  mutated = runtime.transition(mutated, event(mutated, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "legacy-uncontracted-mutation",
+      kind: "mutation",
+      target: "src/main.js",
+      version: "source-v2",
+    },
+  }));
+  const migratedMutation = runtime.normalizeRuntimeV2Checkpoint(
+    asLegacyV3(mutated),
+  );
+  assert.equal(
+    migratedMutation.migrationDisposition,
+    "active_uncontracted_mutation",
+  );
+  assert.equal(migratedMutation.aggregate.executionContract, null);
+
+  let terminal = executeAggregate("acting");
+  terminal = runtime.transition(terminal, event(terminal, "phase.changed", {
+    run: baseRun,
+    phase: "finalizing",
+    reason: "legacy truthful close",
+  }));
+  terminal = runtime.transition(terminal, event(terminal, "run.completed", {
+    run: baseRun,
+    outcome: {
+      resultKind: "partial",
+      reason: "Legacy terminal result remains read-only.",
+      completedAt: terminal.updatedAt + 1,
+      finalProjectionId: "legacy-final",
+    },
+  }));
+  const legacyTerminal = asLegacyV3(terminal);
+  const migratedTerminal = runtime.normalizeRuntimeV2Checkpoint(
+    legacyTerminal,
+  );
+  assert.equal(migratedTerminal.migrationDisposition, "terminal_read_only");
+  assert.equal(
+    migratedTerminal.aggregate.terminalOutcome.resultKind,
+    "partial",
+  );
+  assert.deepEqual(migratedTerminal.events, terminal.events);
 });
 
 test("checkpoint Store adapter rebases a transient projection revision conflict", async () => {
@@ -1662,7 +2662,7 @@ test("checkpoint Store adapter preserves a concurrent UI tick during durable per
   assert.equal(state.runtimeV2Checkpoints[baseTurn.turnId].revision, 1);
 });
 
-test("read-only child scheduler requires disjoint scopes and records real request overlap", () => {
+test("read-only child scheduler caps active jobs, permits path overlap, and releases capacity", () => {
   let child = 0;
   const schedule = runtime.scheduleReadOnlySubagents({
     parentRun: baseRun,
@@ -1670,8 +2670,8 @@ test("read-only child scheduler requires disjoint scopes and records real reques
     nextId: () => `child-${++child}`,
     candidates: [
       { scopeKey: "editor", objective: "Inspect editor event handlers", allowedPaths: ["src/components/editor"] },
-      { scopeKey: "tauri", objective: "Inspect Tauri command wiring", allowedPaths: ["src-tauri/src"] },
-      { scopeKey: "nested-editor", objective: "Overlaps editor", allowedPaths: ["src/components/editor/panels"] },
+      { scopeKey: "review-editor", objective: "Review editor event handlers", allowedPaths: ["src/components/editor"] },
+      { scopeKey: "nested-editor", objective: "Third active job", allowedPaths: ["src/components/editor/panels"] },
     ],
   });
   assert.equal(schedule.jobs.length, 2);
@@ -1687,6 +2687,23 @@ test("read-only child scheduler requires disjoint scopes and records real reques
   const telemetry = runtime.deriveRuntimeV2SubagentConcurrency(jobs);
   assert.equal(telemetry.peakInFlight, 2);
   assert.equal(telemetry.hasRequestOverlap, true);
+  const serial = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    requestedAt: 22,
+    nextId: () => `child-${++child}`,
+    existingJobs: jobs.map((job) => ({
+      ...job,
+      status: "completed",
+      summary: "structured report committed",
+    })),
+    candidates: [{
+      scopeKey: "post-review",
+      objective: "Validate the combined evidence",
+      allowedPaths: ["src/components/editor"],
+    }],
+  });
+  assert.equal(serial.jobs.length, 1);
+  assert.deepEqual(serial.rejectedScopeKeys, []);
 });
 
 test("read-only child scheduler preserves one model-selected identity without inventing a pair", () => {
@@ -1713,6 +2730,44 @@ test("read-only child scheduler preserves one model-selected identity without in
   assert.equal(schedule.jobs[0].role, "event-flow reviewer");
   assert.equal(schedule.jobs[0].objective, "Trace the save event consumer handoff.");
   assert.deepEqual(schedule.rejectedScopeKeys, []);
+});
+
+test("read-only child scheduler rejects a renamed duplicate semantic task", () => {
+  const existing = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    requestedAt: 10,
+    nextId: () => "runtime-v2-child:first",
+    candidates: [{
+      scopeKey: "analyze_file_open_flow",
+      taskKind: "explore",
+      name: "File flow analyst",
+      role: "event-flow reviewer",
+      objective: "Trace the file-open and save handoff in src/main.js.",
+      successCriteria: "Return the first unsupported transition with evidence.",
+      allowedPaths: ["."],
+    }],
+  }).jobs;
+  const duplicate = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    requestedAt: 20,
+    nextId: () => "runtime-v2-child:duplicate",
+    existingJobs: existing,
+    candidates: [{
+      scopeKey: "file-open-flow-analysis",
+      taskKind: "explore",
+      name: "File flow analyst",
+      role: "event-flow reviewer",
+      objective: " Trace   the file-open and save handoff in src/main.js. ",
+      successCriteria: "Return the first unsupported transition with evidence.",
+      allowedPaths: ["."],
+    }],
+  });
+
+  assert.deepEqual(duplicate.jobs, []);
+  assert.deepEqual(
+    duplicate.rejectedScopeKeys,
+    ["file-open-flow-analysis"],
+  );
 });
 
 test("a model wait_subagents call becomes the exact durable join command", () => {
@@ -1763,7 +2818,125 @@ test("a model wait_subagents call becomes the exact durable join command", () =>
   assert.deepEqual(join.payload.jobIds, ["child-kepler"]);
 });
 
-test("active model-selected children join after one independent parent response", () => {
+test("wait_subagents resolves model-facing task keys and legacy unique id segments", () => {
+  const buildState = (reference) => {
+    let state = executeAggregate("observing");
+    const job = {
+      id: "runtime-v2-child:ms47dtia:82",
+      run: {
+        ...baseRun,
+        runId: "child-run-open-flow",
+        parentRunId: baseRun.runId,
+        attemptId: "child-attempt-open-flow",
+      },
+      parentRunId: baseRun.runId,
+      sourceToolCallId: "spawn-open-flow",
+      scopeKey: "analyze_file_open_flow",
+      objective: "Trace the file-open handoff.",
+      allowedPaths: ["."],
+      status: "queued",
+      requestedAt: state.updatedAt + 1,
+      firstTokenAt: null,
+      closedAt: null,
+      summary: null,
+    };
+    state = runtime.transition(state, event(state, "subagents.scheduled", {
+      run: baseRun,
+      jobs: [job],
+    }));
+    state = runtime.transition(state, event(state, "subagent.telemetry", {
+      run: baseRun,
+      telemetry: {
+        jobId: job.id,
+        phase: "request_opened",
+        at: state.updatedAt + 1,
+      },
+    }));
+    state = recordProviderResponse(state, `wait-${reference}`, [{
+      id: `wait-call-${reference}`,
+      name: "wait_subagents",
+      arguments: { subagent_ids: reference },
+    }]);
+    return runtime.decideNextCommands(state)[0];
+  };
+
+  for (const reference of [
+    "analyze_file_open_flow",
+    "ms47dtia",
+  ]) {
+    const join = buildState(reference);
+    assert.equal(join.kind, "join_subagents");
+    assert.deepEqual(
+      join.payload.jobIds,
+      ["runtime-v2-child:ms47dtia:82"],
+    );
+    assert.deepEqual(join.payload.unresolvedJobIds, []);
+  }
+});
+
+test("wait_subagents resolves both short handles from the latest incident in one join", () => {
+  let state = executeAggregate("observing");
+  const jobs = [
+    {
+      id: "runtime-v2-child:ms47dtia:82",
+      scopeKey: "analyze_file_open_flow",
+      objective: "Trace the file-open handoff.",
+    },
+    {
+      id: "runtime-v2-child:ms47f5ii:143",
+      scopeKey: "file-open-flow-analysis",
+      objective: "Review the adjacent save-flow handoff.",
+    },
+  ].map((job, index) => ({
+    ...job,
+    run: {
+      ...baseRun,
+      runId: `child-run-incident-${index}`,
+      parentRunId: baseRun.runId,
+      attemptId: `child-attempt-incident-${index}`,
+    },
+    parentRunId: baseRun.runId,
+    sourceToolCallId: `spawn-incident-${index}`,
+    allowedPaths: ["."],
+    status: "queued",
+    requestedAt: state.updatedAt + index + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  }));
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs,
+  }));
+  for (const job of jobs) {
+    state = runtime.transition(state, event(state, "subagent.telemetry", {
+      run: baseRun,
+      telemetry: {
+        jobId: job.id,
+        phase: "request_opened",
+        at: state.updatedAt + 1,
+      },
+    }));
+  }
+  state = recordProviderResponse(state, "wait-latest-incident", [{
+    id: "wait-latest-incident-call",
+    name: "wait_subagents",
+    arguments: {
+      subagent_ids: "ms47dtia,ms47f5ii",
+    },
+  }]);
+
+  const [join] = runtime.decideNextCommands(state);
+  assert.equal(join.kind, "join_subagents");
+  assert.deepEqual(join.payload.requestedJobIds, [
+    "ms47dtia",
+    "ms47f5ii",
+  ]);
+  assert.deepEqual(join.payload.jobIds, jobs.map((job) => job.id));
+  assert.deepEqual(join.payload.unresolvedJobIds, []);
+});
+
+test("active children do not auto-join after one parent response but are joined before terminal", () => {
   let state = executeAggregate("observing");
   const job = {
     id: "child-kepler",
@@ -1817,12 +2990,169 @@ test("active model-selected children join after one independent parent response"
     },
   }));
 
+  const [continuedParent] = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  });
+  assert.equal(continuedParent.kind, "request_model");
   const [join] = runtime.decideNextCommands(state, {
     subagentPreference: "preferred",
+    resultKind: "partial",
+    resultReason: "test terminal boundary",
   });
   assert.equal(join.kind, "join_subagents");
   assert.deepEqual(join.payload.jobIds, ["child-kepler"]);
   assert.equal(join.payload.toolCallId, undefined);
+});
+
+test("a failed child makes direct parent takeover explicit without concluding the Turn", () => {
+  let state = executeAggregate("observing");
+  const job = {
+    id: "child-kepler",
+    run: {
+      ...baseRun,
+      runId: "child-run-kepler",
+      parentRunId: baseRun.runId,
+      attemptId: "child-attempt-kepler",
+    },
+    parentRunId: baseRun.runId,
+    scopeKey: "save-event-consumer-audit",
+    name: "Kepler",
+    objective: "Trace the save event consumer handoff.",
+    allowedPaths: ["src/editor"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [job],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: job.id,
+      phase: "closed",
+      at: state.updatedAt + 2,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: job.id,
+    status: "failed",
+    summary:
+      "No structured report; retained evidence for parent takeover.",
+    evidence: [{
+      id: "child:child-kepler:E1",
+      kind: "subagent",
+      target: "src/editor/save.ts",
+      version: "v1",
+    }],
+  }));
+
+  const parent = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.equal(parent.kind, "request_model");
+  assert.equal(
+    parent.payload.collaborationAction,
+    "parent_takeover_required",
+  );
+  assert.deepEqual(parent.payload.activeSubagents, []);
+  assert.equal(parent.payload.remainingSubagentCapacity, 0);
+  assert.equal(
+    parent.payload.failedSubagents[0].id,
+    "save-event-consumer-audit",
+  );
+  assert.equal(state.terminalOutcome, null);
+
+  const shiftedPhase = {
+    ...state,
+    phase: "acting",
+    events: [
+      ...state.events,
+      event(state, "phase.changed", {
+        run: baseRun,
+        phase: "acting",
+        reason: "validation_requires_correction",
+      }),
+    ],
+  };
+  const afterPhaseChange = runtime.decideNextCommands(shiftedPhase, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.equal(
+    afterPhaseChange.payload.collaborationAction,
+    "parent_takeover_required",
+    "changing phase must not erase the failed-child takeover obligation",
+  );
+  assert.equal(afterPhaseChange.payload.remainingSubagentCapacity, 0);
+
+  const afterParentProgress = {
+    ...shiftedPhase,
+    events: [
+      ...shiftedPhase.events,
+      event(shiftedPhase, "tool.completed", {
+        run: baseRun,
+        idempotencyKey: "parent-takeover-read",
+        status: "succeeded",
+        evidence: [{
+          id: "parent-E2",
+          kind: "source",
+          target: "src/editor/save.ts",
+          version: "v2",
+        }],
+      }),
+    ],
+  };
+  const reopened = runtime.decideNextCommands(afterParentProgress, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.equal(reopened.payload.collaborationAction, "optional");
+  assert.equal(reopened.payload.remainingSubagentCapacity, 2);
+});
+
+test("a failed spawn action closes delegation for the phase and leaves parent takeover active", () => {
+  let state = executeAggregate("observing");
+  const spawn = commandFor(
+    state,
+    "schedule_subagents",
+    "failed-spawn",
+    {
+      toolCallId: "failed-spawn-call",
+      arguments: {},
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: spawn,
+  }));
+  state = runtime.transition(state, event(state, "command.completed", {
+    run: baseRun,
+    idempotencyKey: spawn.idempotencyKey,
+    status: "failed",
+  }));
+
+  const parent = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.equal(parent.kind, "request_model");
+  assert.equal(
+    parent.payload.collaborationAction,
+    "parent_takeover_required",
+  );
+  assert.equal(parent.payload.remainingSubagentCapacity, 0);
+  assert.deepEqual(parent.payload.activeSubagents, []);
+  assert.equal(state.terminalOutcome, null);
 });
 
 test("Execute phase policy advances completed observation into acting without requiring a pending mutation", () => {
@@ -1831,6 +3161,7 @@ test("Execute phase policy advances completed observation into acting without re
     run: baseRun,
     evidence: { id: "phase-E1", kind: "source", target: "src/main.js", version: "v1" },
   }));
+  state = withExecutionContract(state);
   state = recordProviderResponse(state, "observe-complete");
 
   assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
@@ -1877,12 +3208,13 @@ test("initial observation completion is scoped to the current execution boundary
   );
 });
 
-test("Execute phase policy waits for every scheduled read-only child but accepts terminal child failures", () => {
+test("Execute phase policy lets the parent advance independently while children remain active", () => {
   let state = executeAggregate("observing");
   state = runtime.transition(state, event(state, "observation.recorded", {
     run: baseRun,
     evidence: { id: "phase-E2", kind: "source", target: "src", version: "v1" },
   }));
+  state = withExecutionContract(state);
   state = recordProviderResponse(state, "observe-with-children");
   const children = ["frontend", "backend"].map((scopeKey, index) => ({
     id: `phase-child-${index + 1}`,
@@ -1904,10 +3236,14 @@ test("Execute phase policy waits for every scheduled read-only child but accepts
   }));
   const classifier = { isMutationToolName: (name) => name === "apply_patch" };
 
-  assert.equal(runtime.decideRuntimeV2ExecutePhaseTransition({
+  assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition({
     ...state,
     subagents: children,
-  }, classifier), null);
+  }, classifier), {
+    from: "observing",
+    to: "acting",
+    reason: "observation_cycle_complete",
+  });
   assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition({
     ...state,
     subagents: children.map((job, index) => ({
@@ -1923,8 +3259,18 @@ test("Execute phase policy waits for every scheduled read-only child but accepts
   });
 });
 
-test("Execute phase policy never leaves observing for a mutation while child requests are active", () => {
+test("Execute phase policy may enter acting while a read-only child remains active", () => {
   let state = executeAggregate("observing");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "active-child-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "v1",
+    },
+  }));
+  state = withExecutionContract(state);
   state = recordProviderResponse(state, "observe-premature-mutation", [{
     id: "premature-mutation-call",
     name: "apply_patch",
@@ -1951,13 +3297,27 @@ test("Execute phase policy never leaves observing for a mutation while child req
       summary: null,
     }],
   };
-  assert.equal(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
+  assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
     isMutationToolName: (name) => name === "apply_patch",
-  }), null);
+  }), {
+    from: "observing",
+    to: "acting",
+    reason: "pending_mutation_call",
+  });
 });
 
 test("Execute phase policy moves a pending mutation into acting immediately", () => {
   let state = executeAggregate("observing");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "pending-mutation-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "v1",
+    },
+  }));
+  state = withExecutionContract(state);
   state = recordProviderResponse(state, "observe-mutation", [{
     id: "mutation-call",
     name: "apply_patch",
@@ -1975,6 +3335,16 @@ test("Execute phase policy moves a pending mutation into acting immediately", ()
 
 test("Execute phase policy advances a committed mutation into validation", () => {
   let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "mutation-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "v1",
+    },
+  }));
+  state = withExecutionContract(state);
   const mutation = commandFor(state, "execute_tool", "apply-mutation", {
     toolCallId: "mutation-call",
     toolName: "apply_patch",
@@ -1988,7 +3358,7 @@ test("Execute phase policy advances a committed mutation into validation", () =>
     run: baseRun,
     idempotencyKey: mutation.idempotencyKey,
     status: "succeeded",
-    evidence: [{ id: "phase-E3", kind: "tool", target: "src/main.js", version: "v2" }],
+    evidence: [{ id: "phase-E3", kind: "mutation", target: "src/main.js", version: "v2" }],
   }));
 
   assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
@@ -2000,7 +3370,7 @@ test("Execute phase policy advances a committed mutation into validation", () =>
   });
 });
 
-test("an approved Runtime v2 Plan uses the same mutation-to-validation phase policy", () => {
+test("an approved Plan without a sealed authority cannot advance on a mutation alone", () => {
   const classifier = { isMutationToolName: (name) => name === "apply_patch" };
   let state = {
     ...executeAggregate("acting"),
@@ -2028,11 +3398,10 @@ test("an approved Runtime v2 Plan uses the same mutation-to-validation phase pol
     status: "succeeded",
     evidence: [{ id: "approved-M1", kind: "mutation", target: "src/main.js", version: "v2" }],
   }));
-  assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition(state, classifier), {
-    from: "acting",
-    to: "validating",
-    reason: "mutation_committed",
-  });
+  assert.equal(
+    runtime.decideRuntimeV2ExecutePhaseTransition(state, classifier),
+    null,
+  );
 });
 
 function approvedTwoTargetPlanAggregate(initialPhase = "acting") {
@@ -2278,6 +3647,15 @@ test("approved Plan acceptance requires the reviewed validation after the latest
     idempotencyKey: reviewedValidation.idempotencyKey,
     passed: true,
     evidence: [{ id: "reviewed-V", kind: "validation", target: "npm run build", version: null }],
+    authority: {
+      kind: "work_plan",
+      id: state.sealedWorkPlan.id,
+      revision: state.sealedWorkPlan.revision,
+      digest: state.sealedWorkPlan.digest,
+      validationId: "work-plan-validation-1",
+      criterionIds: ["work-plan-validation-1"],
+      targetPaths: ["src/main.js", "src/components/editor.js"],
+    },
   }));
   assert.equal(
     runtime.deriveRuntimeV2PlanExecutionCoverage(state).allRequiredValidationsPassed,
@@ -2296,7 +3674,7 @@ test("approved Plan acceptance requires the reviewed validation after the latest
   );
 });
 
-test("a rejected validation call stays in validating instead of forcing an unrelated source edit", () => {
+test("a rejected validation call returns to acting recovery instead of looping in validation", () => {
   let state = executeAggregate("validating");
   const validation = commandFor(state, "execute_validation", "validation-scope-rejected", {
     toolCallId: "validation-scope-call",
@@ -2314,9 +3692,67 @@ test("a rejected validation call stays in validating instead of forcing an unrel
     failureKind: "not_authorized",
     evidence: [],
   }));
-  assert.equal(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
+  assert.deepEqual(runtime.decideRuntimeV2ExecutePhaseTransition(state, {
     isMutationToolName: (name) => name === "apply_patch",
-  }), null);
+  }), {
+    from: "validating",
+    to: "acting",
+    reason: "validation_failed",
+  });
+});
+
+test("validation retries retain the declared contract primitive and authorized browser target", () => {
+  let state = executeAggregate("validating");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "validation-contract-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "main-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+  const validation = commandFor(
+    state,
+    "execute_validation",
+    "validation-browser-retry",
+    {
+      toolCallId: "validation-browser-call",
+      toolName: "browser_evaluate",
+      arguments: {
+        url: "file:///fixture/index.html",
+        actions: "click: #open-file",
+        checks: "text: opened.md",
+      },
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: validation,
+  }));
+  state = runtime.transition(state, event(state, "validation.completed", {
+    run: baseRun,
+    idempotencyKey: validation.idempotencyKey,
+    passed: false,
+    failureKind: "assertion_failed",
+    evidence: [{
+      id: "validation-browser-failed",
+      kind: "validation",
+      target: "file:///fixture/index.html",
+      version: "failed-v1",
+    }],
+  }));
+
+  const [next] = runtime.decideNextCommands(state);
+  assert.equal(
+    next.payload.validationRetryTarget,
+    "file:///fixture/index.html",
+  );
+  assert.equal(
+    next.payload.activeExecutionContractDraft.validations[0].id,
+    "validation-1",
+  );
 });
 
 test("Execute phase policy returns failed validation to acting without replaying stale failures", () => {
@@ -2456,7 +3892,7 @@ test("runtime-owned plan artifact writes are not counted as project mutations", 
   });
 });
 
-test("completion gate never treats an unexecuted provider analysis as a partial result", () => {
+test("completion gate rejects generic mutation and validation counts without contract coverage", () => {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,
     strategy: "execute",
@@ -2475,20 +3911,767 @@ test("completion gate never treats an unexecuted provider analysis as a partial 
     hasProviderConclusion: true,
   }), null);
 
-  assert.deepEqual(runtime.decideRuntimeV2TerminalOutcome(state, {
+  assert.equal(runtime.decideRuntimeV2TerminalOutcome(state, {
     canceled: false,
     mutationCount: 1,
     passedValidationCount: 1,
     failedValidationCount: 0,
     stalledValidationCount: 0,
     hasProviderConclusion: true,
-  }), {
-    resultKind: "success",
-    resultReason: "已完成修改，并通过结构化验证结果确认。",
-  });
+  }), null);
 });
 
-test("progressive validation failures continue while three identical failures close as partial", () => {
+test("execution contract prevents a provider from downgrading behavioral acceptance to static build proof", () => {
+  const objective = {
+    text: "Opening a file must not trigger a save dialog.",
+    constraints: [],
+    acceptanceCriteria: [
+      "Opening a local file leaves the document clean and shows no save dialog.",
+    ],
+    acceptanceCriterionIds: ["criterion-open-clean"],
+  };
+  const evidence = [{
+    id: "source-main-v1",
+    kind: "source",
+    target: "src/main.js",
+    version: "sha-v1",
+  }];
+  assert.throws(
+    () => runtime.compileRuntimeV2ExecutionContract({
+      objective,
+      evidence,
+      draft: {
+        criteria: [{
+          id: "criterion-open-clean",
+          evidence_requirement: "static",
+        }],
+        changes: [{
+          operation: "modify",
+          target: "src/main.js",
+          basis_evidence_ids: ["source-main-v1"],
+        }],
+        validations: [{
+          id: "validation-build-only",
+          criterion_ids: ["criterion-open-clean"],
+          target_paths: ["src/main.js"],
+          kind: "finite_command",
+          command: "npm run build",
+          cwd: ".",
+          expected_outcome: "The build succeeds.",
+        }],
+      },
+      committedAt: 2,
+      contractId: "contract-build-only",
+    }),
+    /criterion_not_acceptance_covered:criterion-open-clean/,
+  );
+});
+
+test("a sole runtime criterion needs no provider-owned identity echo", () => {
+  const contract = runtime.compileRuntimeV2ExecutionContract({
+    objective: {
+      text: "Opening a file must not trigger a save dialog.",
+      constraints: [],
+      acceptanceCriteria: [
+        "Opening a local file leaves the document clean and shows no save dialog.",
+      ],
+      acceptanceCriterionIds: ["criterion-open-clean"],
+    },
+    evidence: [{
+      id: "source-main-v1",
+      kind: "source",
+      target: "src/main.js",
+      version: "sha-v1",
+    }],
+    draft: {
+      criteria: [],
+      changes: [{
+        operation: "modify",
+        target: "src/main.js",
+        basis_evidence_ids: ["source-main-v1"],
+      }],
+      validations: [{
+        id: "validation-behavior",
+        criterion_ids: [],
+        target_paths: ["src/main.js"],
+        kind: "finite_command",
+        command: "npm test",
+        cwd: ".",
+        expected_outcome: "The behavioral test passes.",
+      }],
+    },
+    committedAt: 2,
+    contractId: "contract-sole-criterion",
+  });
+  assert.deepEqual(
+    contract.criteria.map((criterion) => ({
+      id: criterion.id,
+      requirement: criterion.evidenceRequirement,
+    })),
+    [{
+      id: "criterion-open-clean",
+      requirement: "behavioral",
+    }],
+  );
+  assert.deepEqual(
+    contract.validations[0].criterionIds,
+    ["criterion-open-clean"],
+  );
+});
+
+test("multiple runtime criteria still reject provider aliases", () => {
+  assert.throws(
+    () => runtime.compileRuntimeV2ExecutionContract({
+      objective: {
+        text: "Repair both behaviors.",
+        constraints: [],
+        acceptanceCriteria: ["Behavior A passes.", "Behavior B passes."],
+        acceptanceCriterionIds: ["criterion-a", "criterion-b"],
+      },
+      evidence: [{
+        id: "source-main-v1",
+        kind: "source",
+        target: "src/main.js",
+        version: "sha-v1",
+      }],
+      draft: {
+        criteria: [{
+          id: "provider-a",
+          evidence_requirement: "behavioral",
+        }, {
+          id: "provider-b",
+          evidence_requirement: "behavioral",
+        }],
+        changes: [{
+          operation: "modify",
+          target: "src/main.js",
+          basis_evidence_ids: ["source-main-v1"],
+        }],
+        validations: [{
+          id: "validation-behavior",
+          criterion_ids: ["provider-a", "provider-b"],
+          target_paths: ["src/main.js"],
+          kind: "finite_command",
+          command: "npm test",
+          cwd: ".",
+          expected_outcome: "Both behavioral tests pass.",
+        }],
+      },
+      committedAt: 2,
+      contractId: "contract-multiple-criteria",
+    }),
+    /criterion_requirement_missing:criterion-a/,
+  );
+});
+
+test("execution contract binds mutation authority to the target's real source receipt", () => {
+  const objective = {
+    text: "Repair the file behavior.",
+    constraints: [],
+    acceptanceCriteria: ["The repaired behavior passes its test."],
+    acceptanceCriterionIds: ["criterion-behavior"],
+  };
+  const contract = runtime.compileRuntimeV2ExecutionContract({
+    objective,
+    evidence: [{
+      id: "source-other",
+      kind: "source",
+      target: "src/other.js",
+      version: "other-v1",
+    }, {
+      id: "source-main",
+      kind: "source",
+      target: "/fixture/src/main.js",
+      version: "main-v1",
+    }],
+    draft: {
+      criteria: [{
+        id: "criterion-behavior",
+        evidence_requirement: "behavioral",
+      }],
+      changes: [{
+        operation: "modify",
+        target: "src/main.js",
+        basis_evidence_ids: ["source-other", "provider-invented-id"],
+      }],
+      validations: [{
+        id: "validation-behavior",
+        criterion_ids: ["criterion-behavior"],
+        target_paths: ["src/main.js"],
+        kind: "finite_command",
+        command: "npm test",
+        cwd: ".",
+        expected_outcome: "The behavioral test passes.",
+      }],
+    },
+    committedAt: 2,
+    contractId: "contract-runtime-basis",
+  });
+  assert.deepEqual(
+    contract.changes[0].basisEvidenceIds,
+    ["source-main"],
+  );
+});
+
+test("execution contract persists an acceptance-capable interaction primitive", () => {
+  const objective = {
+    text: "Opening a file keeps the document clean.",
+    constraints: [],
+    acceptanceCriteria: ["No save dialog appears after opening a file."],
+    acceptanceCriterionIds: ["criterion-open-clean"],
+    acceptanceEvidenceRequirements: ["interaction"],
+  };
+  const contract = runtime.compileRuntimeV2ExecutionContract({
+    objective,
+    evidence: [{
+      id: "source-open-v1",
+      kind: "source",
+      target: "src/main.js",
+      version: "sha-v1",
+    }],
+    draft: {
+      criteria: [{
+        id: "criterion-open-clean",
+        evidence_requirement: "interaction",
+      }],
+      changes: [{
+        operation: "modify",
+        target: "src/main.js",
+        basis_evidence_ids: ["source-open-v1"],
+      }],
+      validations: [{
+        id: "validation-open-clean",
+        criterion_ids: ["criterion-open-clean"],
+        target_paths: ["src/main.js"],
+        kind: "browser",
+        actions: [{
+          id: "open-file",
+          kind: "click",
+          target: "#open-file",
+        }],
+        assertions: [{
+          kind: "dialog",
+          target: "save-dialog",
+          after_action_id: "open-file",
+          expected: "hidden",
+        }],
+        require_causal_assertion: true,
+        expected_outcome: "Opening a file does not display a save dialog.",
+      }],
+    },
+    committedAt: 2,
+    contractId: "contract-open-clean",
+  });
+  assert.equal(
+    contract.validations[0].primitive.kind,
+    "browser_interaction",
+  );
+  assert.equal(
+    contract.validations[0].primitive.requireCausalAssertion,
+    true,
+  );
+  assert.equal(runtime.validateRuntimeV2ExecutionContract({
+    contract,
+    objective,
+    evidence: [{
+      id: "source-open-v1",
+      kind: "source",
+      target: "src/main.js",
+      version: "sha-v1",
+    }],
+  }), true);
+});
+
+test("execution contract revisions are free before mutation and need fresh cited source evidence after it", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-source-v1",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  }));
+  const criterionId =
+    state.objective.acceptanceCriterionIds?.[0] || "criterion-1";
+  const compile = (
+    previous,
+    evidenceId,
+    committedAt,
+    expectedOutcome = "The fixture behavior passes.",
+  ) =>
+    runtime.compileRuntimeV2ExecutionContract({
+      objective: state.objective,
+      evidence: state.evidence,
+      previous,
+      draft: {
+        criteria: [{
+          id: criterionId,
+          evidence_requirement: "behavioral",
+        }],
+        changes: [{
+          operation: "modify",
+          target: "src/main.js",
+          basis_evidence_ids: [evidenceId],
+        }],
+        validations: [{
+          id: "validation-contract-revision",
+          criterion_ids: [criterionId],
+          target_paths: ["src/main.js"],
+          kind: "finite_command",
+          command: "npm test",
+          cwd: ".",
+          expected_outcome: expectedOutcome,
+        }],
+      },
+      committedAt,
+      contractId: "contract-revision",
+    });
+  const first = compile(null, "contract-source-v1", state.updatedAt + 1);
+  state = runtime.transition(state, event(
+    state,
+    "execution_contract.committed",
+    { run: baseRun, contract: first },
+  ));
+  assert.throws(
+    () => compile(
+      first,
+      "contract-source-v1",
+      state.updatedAt + 1,
+    ),
+    /contract_revision_no_change/,
+  );
+  const preMutationRevision = compile(
+    first,
+    "contract-source-v1",
+    state.updatedAt + 1,
+    "The revised fixture behavior passes.",
+  );
+  state = runtime.transition(state, event(
+    state,
+    "execution_contract.committed",
+    { run: baseRun, contract: preMutationRevision },
+  ));
+  assert.equal(state.executionContract.revision, 2);
+
+  const mutation = commandFor(state, "execute_tool", "contract-mutation", {
+    toolCallId: "contract-mutation-call",
+    toolName: "apply_patch",
+    arguments: { path: "src/main.js", patch: "@@" },
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "contract-mutation-v2",
+      kind: "mutation",
+      target: "src/main.js",
+      version: "source-v2",
+    }],
+  }));
+  const staleRevision = compile(
+    preMutationRevision,
+    "contract-source-v1",
+    state.updatedAt + 1,
+  );
+  assert.equal(runtime.tryTransition(state, event(
+    state,
+    "execution_contract.committed",
+    { run: baseRun, contract: staleRevision },
+  )).disposition, "rejected");
+
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "contract-source-v2",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v2",
+    },
+  }));
+  const freshRevision = compile(
+    preMutationRevision,
+    "contract-source-v2",
+    state.updatedAt + 1,
+  );
+  state = runtime.transition(state, event(
+    state,
+    "execution_contract.committed",
+    { run: baseRun, contract: freshRevision },
+  ));
+  assert.equal(state.executionContract.revision, 3);
+});
+
+test("completion gate accepts criterion-linked receipts after the final mutation", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "completion-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+  const mutation = commandFor(state, "execute_tool", "completion-mutation", {
+    toolCallId: "completion-mutation-call",
+    toolName: "apply_patch",
+    arguments: { path: "src/main.js", patch: "@@" },
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "completion-M1",
+      kind: "mutation",
+      target: "src/main.js",
+      version: "source-v2",
+    }],
+  }));
+  state = runtime.transition(state, event(state, "phase.changed", {
+    run: baseRun,
+    phase: "validating",
+    reason: "contract targets changed",
+  }));
+  const validation = commandFor(
+    state,
+    "execute_validation",
+    "completion-validation",
+    {
+      toolCallId: "completion-validation-call",
+      toolName: "run_command",
+      arguments: { command: "npm test", cwd: "." },
+      validationAuthority: executionValidationAuthority(state),
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: validation,
+  }));
+  state = runtime.transition(state, event(state, "validation.completed", {
+    run: baseRun,
+    idempotencyKey: validation.idempotencyKey,
+    passed: true,
+    authority: validation.payload.validationAuthority,
+    evidence: [{
+      id: "completion-V1",
+      kind: "validation",
+      target: "npm test",
+      version: null,
+    }],
+  }));
+  assert.equal(
+    runtime.deriveRuntimeV2ExecutionContractCoverage(state).complete,
+    true,
+  );
+  assert.equal(
+    runtime.decideRuntimeV2TerminalOutcome(state, {
+      canceled: false,
+      mutationCount: 1,
+      passedValidationCount: 1,
+      failedValidationCount: 0,
+      stalledValidationCount: 0,
+      hasProviderConclusion: true,
+    })?.resultKind,
+    "success",
+  );
+});
+
+test("child validation counts only for the exact final mutation boundary", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "child-validation-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  }));
+  state = withExecutionContract(state);
+  state = commitMutation(
+    state,
+    "child-validation-first-mutation",
+    "src/main.js",
+  );
+  const staleBoundary = runtime.deriveRuntimeV2ValidationBoundary(
+    state,
+    ["src/main.js"],
+  );
+  const staleStartedAt = state.updatedAt + 1;
+  const staleJob = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    candidates: [{
+      scopeKey: "stale-validator",
+      taskKind: "validate",
+      objective: "Run the contract validator.",
+      allowedPaths: ["."],
+    }],
+    requestedAt: staleStartedAt,
+    nextId: () => "child-stale-validator",
+  }).jobs[0];
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [staleJob],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: staleJob.id,
+      phase: "request_opened",
+      at: staleStartedAt,
+    },
+  }));
+  state = commitMutation(
+    state,
+    "child-validation-later-mutation",
+    "src/main.js",
+  );
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: staleJob.id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  const staleEvidence = {
+    id: "child-stale-validation-E1",
+    kind: "validation",
+    target: "npm test",
+    version: "exit-0",
+  };
+  state = runtime.transition(state, event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: staleJob.id,
+    status: "completed",
+    summary: "The declared validator passed before the later mutation.",
+    evidence: [staleEvidence],
+    report: {
+      schemaVersion: runtime.RUNTIME_V2_SUBAGENT_REPORT_SCHEMA_VERSION,
+      summary: "The declared validator passed before the later mutation.",
+      findings: [{
+        statement: "The validator exited successfully.",
+        evidenceIds: [staleEvidence.id],
+      }],
+      unresolved: [],
+    },
+    validationReceipts: [{
+      schemaVersion:
+        runtime.RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION,
+      evidenceId: staleEvidence.id,
+      passed: true,
+      authority: executionValidationAuthority(state),
+      ...staleBoundary,
+      startedAt: staleStartedAt,
+      completedAt: staleStartedAt + 1,
+    }],
+  }));
+  assert.equal(
+    runtime.deriveRuntimeV2ExecutionContractCoverage(state).complete,
+    false,
+  );
+
+  const currentBoundary = runtime.deriveRuntimeV2ValidationBoundary(
+    state,
+    ["src/main.js"],
+  );
+  const currentStartedAt = state.updatedAt + 1;
+  const currentJob = runtime.scheduleReadOnlySubagents({
+    parentRun: baseRun,
+    candidates: [{
+      scopeKey: "current-validator",
+      taskKind: "validate",
+      objective: "Run the validator against the final mutation.",
+      allowedPaths: ["."],
+    }],
+    requestedAt: currentStartedAt,
+    nextId: () => "child-current-validator",
+  }).jobs[0];
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    jobs: [currentJob],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: currentJob.id,
+      phase: "request_opened",
+      at: currentStartedAt,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: currentJob.id,
+      phase: "closed",
+      at: currentStartedAt + 1,
+    },
+  }));
+  const currentEvidence = {
+    id: "child-current-validation-E1",
+    kind: "validation",
+    target: "npm test",
+    version: "exit-0",
+  };
+  state = runtime.transition(state, event(state, "subagent.completed", {
+    run: baseRun,
+    jobId: currentJob.id,
+    status: "completed",
+    summary: "The declared validator passed against the final mutation.",
+    evidence: [currentEvidence],
+    report: {
+      schemaVersion: runtime.RUNTIME_V2_SUBAGENT_REPORT_SCHEMA_VERSION,
+      summary: "The declared validator passed against the final mutation.",
+      findings: [{
+        statement: "The final mutation passed the declared validator.",
+        evidenceIds: [currentEvidence.id],
+      }],
+      unresolved: [],
+    },
+    validationReceipts: [{
+      schemaVersion:
+        runtime.RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION,
+      evidenceId: currentEvidence.id,
+      passed: true,
+      authority: executionValidationAuthority(state),
+      ...currentBoundary,
+      startedAt: currentStartedAt,
+      completedAt: currentStartedAt + 1,
+    }],
+  }));
+  assert.equal(
+    runtime.deriveRuntimeV2ExecutionContractCoverage(state).complete,
+    true,
+  );
+});
+
+test("execution contract cannot complete while a declared mutation target is untouched", () => {
+  let state = executeAggregate("acting");
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "multi-target-source",
+      kind: "source",
+      target: "src/main.js",
+      version: "source-v1",
+    },
+  }));
+  const criterionId =
+    state.objective.acceptanceCriterionIds?.[0] || "criterion-1";
+  const contract = runtime.compileRuntimeV2ExecutionContract({
+    objective: state.objective,
+    evidence: state.evidence,
+    draft: {
+      criteria: [{
+        id: criterionId,
+        evidence_requirement: "behavioral",
+      }],
+      changes: [
+        {
+          operation: "modify",
+          target: "src/main.js",
+          basis_evidence_ids: ["multi-target-source"],
+        },
+        {
+          operation: "create",
+          target: "src/save-state.test.js",
+          basis_evidence_ids: [],
+        },
+      ],
+      validations: [{
+        id: "validation-multi-target",
+        criterion_ids: [criterionId],
+        target_paths: ["src/main.js", "src/save-state.test.js"],
+        kind: "finite_command",
+        command: "npm test",
+        cwd: ".",
+        expected_outcome: "The save-state behavior is covered by tests.",
+      }],
+    },
+    committedAt: state.updatedAt + 1,
+    contractId: "contract-multi-target",
+  });
+  state = { ...state, executionContract: contract };
+  const mutation = commandFor(state, "execute_tool", "one-target-mutation", {
+    toolCallId: "one-target-mutation-call",
+    toolName: "apply_patch",
+    arguments: { path: "src/main.js", patch: "@@" },
+  });
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: mutation,
+  }));
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: mutation.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "one-target-M1",
+      kind: "mutation",
+      target: "src/main.js",
+      version: "source-v2",
+    }],
+  }));
+  const validation = commandFor(
+    state,
+    "execute_validation",
+    "multi-target-validation",
+    {
+      toolCallId: "multi-target-validation-call",
+      toolName: "run_command",
+      arguments: { command: "npm test", cwd: "." },
+      validationAuthority: runtime.runtimeV2ExecutionValidationAuthority({
+        contract,
+        validation: contract.validations[0],
+      }),
+    },
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: validation,
+  }));
+  state = runtime.transition(state, event(state, "validation.completed", {
+    run: baseRun,
+    idempotencyKey: validation.idempotencyKey,
+    passed: true,
+    authority: validation.payload.validationAuthority,
+    evidence: [{
+      id: "multi-target-V1",
+      kind: "validation",
+      target: "npm test",
+      version: "exit-0",
+    }],
+  }));
+  const coverage = runtime.deriveRuntimeV2ExecutionContractCoverage(state);
+  assert.deepEqual(
+    coverage.missingMutationTargets,
+    ["src/save-state.test.js"],
+  );
+  assert.equal(coverage.complete, false);
+  assert.equal(runtime.decideRuntimeV2TerminalOutcome(state, {
+    canceled: false,
+    mutationCount: 1,
+    passedValidationCount: 1,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
+    hasProviderConclusion: true,
+  }), null);
+});
+
+test("progressive and repeated validation failures remain non-terminal signals", () => {
   const classifier = { isMutationToolName: (name) => name === "apply_patch" };
   let state = executeAggregate("acting");
   const mutation = commandFor(state, "execute_tool", "bounded-mutation", {
@@ -2607,8 +4790,7 @@ test("progressive validation failures continue while three identical failures cl
       }));
     } else {
       assert.equal(facts.stalledValidationCount, 3);
-      assert.equal(decision?.resultKind, "partial");
-      assert.match(decision?.resultReason || "", /无进展循环/);
+      assert.equal(decision, null);
     }
   }
 });
@@ -2626,6 +4808,85 @@ test("tool-call transport ids do not create unlimited recovery fingerprints", ()
     runtime.runtimeV2ActionFingerprint({ ...base, payload: { ...base.payload, toolCallId: "provider-call-a" } }),
     runtime.runtimeV2ActionFingerprint({ ...base, payload: { ...base.payload, toolCallId: "provider-call-b" } }),
   );
+});
+
+test("long request fingerprints retain one identity across receipts and advance attempts", () => {
+  let state = executeAggregate("observing");
+  state = {
+    ...state,
+    objective: {
+      ...state.objective,
+      acceptanceCriteria: ["behavioral acceptance ".repeat(180)],
+    },
+  };
+  const first = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.ok(first.payload.actionFingerprint.length > 512);
+  assert.equal(
+    runtime.runtimeV2ActionFingerprint(first),
+    first.payload.actionFingerprint,
+  );
+  state = runtime.transition(state, event(state, "command.scheduled", {
+    run: baseRun,
+    command: first,
+  }));
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: first.idempotencyKey,
+    result: {
+      visibleText: "Continue the parent investigation.",
+      toolCalls: [],
+      diagnostics: [],
+    },
+  }));
+
+  const second = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+  })[0];
+  assert.equal(second.payload.actionFingerprint, first.payload.actionFingerprint);
+  assert.equal(second.payload.attempt, 2);
+  assert.notEqual(second.idempotencyKey, first.idempotencyKey);
+});
+
+test("a child converges after its first independent evidence and failed handoff preserves targets", () => {
+  assert.equal(runtime.shouldRequestRuntimeV2SubagentReport({
+    evidenceCount: 0,
+    explicitlyRequested: true,
+    remainingMs: 10_000,
+  }), false);
+  assert.equal(runtime.shouldRequestRuntimeV2SubagentReport({
+    evidenceCount: 1,
+    explicitlyRequested: false,
+    remainingMs: 80_000,
+  }), true);
+  assert.equal(runtime.shouldRequestRuntimeV2SubagentReport({
+    evidenceCount: 1,
+    explicitlyRequested: false,
+    remainingMs: 20_000,
+  }), true);
+  assert.equal(runtime.shouldRequestRuntimeV2SubagentReport({
+    evidenceCount: 1,
+    explicitlyRequested: false,
+    remainingMs: 50_000,
+  }), true);
+  assert.equal(runtime.shouldRequestRuntimeV2SubagentReport({
+    evidenceCount: 1,
+    explicitlyRequested: false,
+    remainingMs: 80_000,
+    independentWorkComplete: true,
+  }), true);
+  const summary = runtime.runtimeV2SubagentFailureSummary({
+    canceled: false,
+    deadlineExceeded: true,
+    evidence: [
+      { target: "src/main.js" },
+      { target: "src/components/editor.js" },
+    ],
+  });
+  assert.match(summary, /2 条只读证据/);
+  assert.match(summary, /src\/main\.js/);
+  assert.match(summary, /父任务接管/);
 });
 
 test("controller schedules only the child task selected by a real provider tool call", async () => {
@@ -2837,6 +5098,7 @@ test("soft iteration pressure is durable but never terminal by itself", async ()
   });
   const before = controller.snapshot().aggregate;
   await controller.recordSoftSignal("iteration_limit");
+  await controller.recordSoftSignal("iteration_limit");
   const after = controller.snapshot().aggregate;
   assert.equal(after.phase, before.phase);
   assert.equal(after.terminalOutcome, null);
@@ -2845,6 +5107,129 @@ test("soft iteration pressure is durable but never terminal by itself", async ()
     after.events.filter((item) =>
       item.type === "soft_signal.observed" && item.signal === "iteration_limit"
     ).length,
+    1,
+  );
+});
+
+test("identical live projections are coalesced within one phase", async () => {
+  let now = 750;
+  let revision = 0;
+  let published = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision, event: appended },
+        };
+      },
+    },
+    provider: {
+      async request() {
+        throw new Error("provider is not expected");
+      },
+    },
+    tool: {
+      async execute() {
+        throw new Error("tool is not expected");
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler is not expected");
+      },
+    },
+    projection: {
+      async publish() {
+        published += 1;
+      },
+    },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-projection-${now}`,
+      nextIdempotencyKey: ({ run, kind }) =>
+        `${run.runId}:${kind}:projection`,
+    },
+  });
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+  });
+  await controller.publishLiveStatus("正在收集证据。", "first");
+  await controller.publishLiveStatus("正在收集证据。", "second");
+  const aggregate = controller.snapshot().aggregate;
+  assert.equal(published, 1);
+  assert.equal(
+    aggregate.events.filter((item) =>
+      item.type === "projection.published" &&
+      item.audience === "capsule_live"
+    ).length,
+    1,
+  );
+});
+
+test("an infrastructure conclusion settles an in-flight command in the same checkpoint", async () => {
+  let now = 820;
+  let revision = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return null; },
+      async append({ event: appended }) {
+        revision += 1;
+        return {
+          disposition: "committed",
+          checkpoint: { revision, event: appended },
+        };
+      },
+    },
+    provider: {
+      async request() {
+        throw new Error("provider is not expected");
+      },
+    },
+    tool: {
+      async execute() {
+        throw new Error("tool is not expected");
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler is not expected");
+      },
+    },
+    projection: { async publish() {} },
+    clockId: {
+      now: () => ++now,
+      nextId: (scope) => `${scope}-infrastructure-${now}`,
+      nextIdempotencyKey: ({ run, kind }) =>
+        `${run.runId}:${kind}:infrastructure`,
+    },
+  });
+  await controller.admit({
+    turn: baseTurn,
+    run: baseRun,
+    strategy: "execute",
+    objective: "Repair the fixture",
+    initialPhase: "observing",
+  });
+  const command = runtime.decideNextCommands(
+    controller.snapshot().aggregate,
+  )[0];
+  await controller.schedule(command);
+  await controller.finishTerminal(
+    "error",
+    "Runtime infrastructure failed.",
+  );
+  const aggregate = controller.snapshot().aggregate;
+  assert.equal(aggregate.scheduledCommands.length, 0);
+  assert.equal(aggregate.completedCommands.at(-1).status, "failed");
+  assert.equal(aggregate.terminalOutcome.resultKind, "error");
+  assert.equal(
+    aggregate.events.filter((item) => item.type === "turn.completed").length,
     1,
   );
 });

@@ -8,6 +8,7 @@ import {
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
+  aggregateForCurrentTurn,
   baseProviderProfile,
   latestCorrectiveSourceRefreshWindow,
   latestFailureReadWindow,
@@ -19,19 +20,26 @@ import {
 } from "./executionContext";
 import { finiteValidationCommandRejection } from "./executionAuthorization";
 import {
+  selectRuntimeOwnedRequiredSourceAction,
   selectRuntimeOwnedSourceRefreshAction,
-  selectRuntimeOwnedValidationAction,
 } from "./executionDeterministicActions";
 import {
   boundRuntimeV2ProviderToolCalls,
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
+import {
+  attemptedRuntimeV2ProviderToolCallIdentities,
+} from "./executionProviderAttemptHistory";
 import { withRuntimeV2HardDeadline } from "./hardDeadline";
 import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ProviderProtocolError,
 } from "./executionProviderRequest";
+import {
+  forcedRuntimeV2MutationToolName,
+  runtimeV2ProviderAttemptTools,
+} from "./executionProviderTools";
 
 export const RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
 
@@ -54,31 +62,50 @@ export function createRuntimeV2ProviderPort(
       // refresh after admission cannot make the provider request a tool that
       // the executor's authorization catalog did not expose.
       const tools = providerToolDefinitionsForCommand(input, command);
-      const preferredValidation =
-        preferredFiniteValidationCommand(input);
       const allowedToolNames = tools.map((tool) => tool.function.name);
-      const deterministicValidation = !signal.aborted
-        ? selectRuntimeOwnedValidationAction({
+      const forcedMutationToolName = forcedRuntimeV2MutationToolName(
+        command,
+        allowedToolNames,
+        aggregateForCurrentTurn(input),
+      );
+      const providerCommand = forcedMutationToolName
+        ? {
+            ...command,
+            payload: {
+              ...command.payload,
+              forcedMutationToolName,
+            },
+          }
+        : command;
+      const requiredSourceTarget = String(
+        command.payload.requiredExecutionContractSourceTarget ||
+          command.payload.requiredMutationSourceTarget ||
+          "",
+      ).trim();
+      const deterministicRequiredSource = !signal.aborted
+        ? selectRuntimeOwnedRequiredSourceAction({
             command,
             allowedToolNames,
-            preferredCommand: preferredValidation,
+            target: requiredSourceTarget,
           })
         : null;
-      if (deterministicValidation) {
-        input.live.latestProviderResult = deterministicValidation;
+      if (deterministicRequiredSource) {
+        input.live.latestProviderResult = deterministicRequiredSource;
         input.live.latestVisibleText = "";
-        input.logStoreEvent("runtime_v2_validation_fallback_selected", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          phase: command.phase,
-          command:
-            deterministicValidation.toolCalls[0]?.arguments.command,
-          providerAttempts: 0,
-          selectionReason: "runtime_owned_preferred_validator",
-          lastFailureKind: null,
-          lastProtocolCode: null,
-        });
-        return deterministicValidation;
+        input.logStoreEvent(
+          "runtime_v2_required_source_selected",
+          {
+            turnId: command.run.turnId,
+            runId: command.run.runId,
+            phase: command.phase,
+            path: requiredSourceTarget,
+            selectionReason:
+              command.payload.requiredExecutionContractSourceTarget
+                ? "execution_contract_basis_missing"
+                : "contracted_mutation_source_missing",
+          },
+        );
+        return deterministicRequiredSource;
       }
       const deterministicSourceWindow =
         !signal.aborted &&
@@ -165,6 +192,10 @@ export function createRuntimeV2ProviderPort(
           remainingMs,
           hasFallback,
         );
+        const attemptTools = runtimeV2ProviderAttemptTools(
+          tools,
+          forcedMutationToolName,
+        );
         try {
           input.logStoreEvent("runtime_v2_provider_request_opened", {
             turnId: command.run.turnId,
@@ -174,9 +205,10 @@ export function createRuntimeV2ProviderPort(
             textEnvelope: attempt.textEnvelope,
             toolExpectation: requiresTool ? "required" : "optional",
             executePolicy: String(command.payload.executePolicy || ""),
-            allowedToolCount: tools.length,
-            nativeToolCount: attempt.textEnvelope ? 0 : tools.length,
-            allowedToolNames: tools.map((tool) => tool.function.name),
+            forcedMutationToolName,
+            allowedToolCount: attemptTools.length,
+            nativeToolCount: attempt.textEnvelope ? 0 : attemptTools.length,
+            allowedToolNames: attemptTools.map((tool) => tool.function.name),
             hasFallback,
             remainingRequestMs: remainingMs,
             timeoutMs,
@@ -198,8 +230,8 @@ export function createRuntimeV2ProviderPort(
             task: () => requestRuntimeV2ProviderOnce({
               live: input.live,
               ports: input,
-              command,
-              tools,
+              command: providerCommand,
+              tools: attemptTools,
               textEnvelope: attempt.textEnvelope,
               toolChoice: attempt.toolChoice,
               signal: requestAbort.signal,
@@ -240,11 +272,13 @@ export function createRuntimeV2ProviderPort(
               command,
               code: "required_tool_missing",
               requestedToolNames: [],
-              allowedToolNames: tools.map((tool) => tool.function.name),
+              allowedToolNames: attemptTools.map(
+                (tool) => tool.function.name,
+              ),
             });
           }
           const unexpectedToolNames = unexpectedRuntimeV2ProviderToolNames(
-            tools,
+            attemptTools,
             result.toolCalls,
           );
           if (unexpectedToolNames.length > 0) {
@@ -254,18 +288,23 @@ export function createRuntimeV2ProviderPort(
               phase: command.phase,
               transport: attempt.variant,
               unexpectedToolNames,
-              allowedToolNames: tools.map((tool) => tool.function.name),
+              allowedToolNames: attemptTools.map(
+                (tool) => tool.function.name,
+              ),
             });
             throw runtimeV2ProviderProtocolError({
               ports: input,
               command,
               code: "tool_surface_rejected",
               requestedToolNames: unexpectedToolNames,
-              allowedToolNames: tools.map((tool) => tool.function.name),
+              allowedToolNames: attemptTools.map(
+                (tool) => tool.function.name,
+              ),
             });
           }
           const boundedBatch = boundRuntimeV2ProviderToolCalls(
             result.toolCalls,
+            attemptedRuntimeV2ProviderToolCallIdentities(input, command),
           );
           if (boundedBatch.discarded.length > 0) {
             input.logStoreEvent(
@@ -280,6 +319,7 @@ export function createRuntimeV2ProviderPort(
                   (call) => call.name,
                 ),
                 originalToolCount: result.toolCalls.length,
+                selection: boundedBatch.selection,
               },
             );
             result = {
@@ -459,31 +499,6 @@ export function createRuntimeV2ProviderPort(
         } finally {
           signal.removeEventListener("abort", forwardAbort);
         }
-      }
-      const validationFallback = !signal.aborted
-        ? selectRuntimeOwnedValidationAction({
-            command,
-            allowedToolNames,
-            preferredCommand: preferredFiniteValidationCommand(input),
-          })
-        : null;
-      if (validationFallback) {
-        input.live.latestProviderResult = validationFallback;
-        input.live.latestVisibleText = "";
-        input.logStoreEvent("runtime_v2_validation_fallback_selected", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          phase: command.phase,
-          command: validationFallback.toolCalls[0]?.arguments.command,
-          providerAttempts: epoch.attempted.length,
-          lastFailureKind: isRuntimeV2ProviderProtocolError(lastError)
-            ? "protocol"
-            : "transport",
-          lastProtocolCode: isRuntimeV2ProviderProtocolError(lastError)
-            ? lastError.code
-            : null,
-        });
-        return validationFallback;
       }
       if (isRuntimeV2ProviderProtocolError(lastError)) {
         input.logStoreEvent("runtime_v2_provider_protocol_exhausted", {

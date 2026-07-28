@@ -194,6 +194,8 @@ test("transport exhaustion concludes error instead of pausing", async () => {
   const testHarness = harness([
     new Error("transport unavailable"),
     new Error("transport unavailable"),
+    new Error("transport unavailable"),
+    new Error("transport unavailable"),
   ]);
   const result = await runRuntimeV2ChatLoop({
     ports: testHarness.ports,
@@ -206,7 +208,7 @@ test("transport exhaustion concludes error instead of pausing", async () => {
   });
   assert.equal(result.resultKind, "error");
   assert.equal(result.reason, "provider_transport_exhausted");
-  assert.equal(testHarness.read().providerCalls, 2);
+  assert.equal(testHarness.read().providerCalls, 4);
   assert.equal(
     result.aggregate.events.filter((event) => event.type === "run.paused").length,
     0,

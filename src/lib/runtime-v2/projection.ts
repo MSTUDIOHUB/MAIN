@@ -66,6 +66,8 @@ function actionMarkdown(
       };
       return labels[mode] || "正在根据当前证据决定下一步。";
     }
+    case "commit_execution_contract":
+      return "正在把用户目标、修改范围和逐条验收方式提交为可回放执行契约。";
     case "execute_tool": {
       const tool = String(command.payload.toolName || "").trim();
       const target = readTarget(command, context?.turn.workspaceKey);

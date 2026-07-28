@@ -195,7 +195,14 @@ export class PlanLedger {
 
   async recordSoftSignal(
     run: RuntimeV2RunIdentity,
-    signal: "no_tool_call" | "empty_response" | "repeat" | "context_pressure" | "iteration_limit",
+    signal:
+      | "no_tool_call"
+      | "empty_response"
+      | "repeat"
+      | "context_pressure"
+      | "iteration_limit"
+      | "protocol_drift"
+      | "repeated_action",
   ): Promise<void> {
     await this.append({ type: "soft_signal.observed", run, signal });
   }

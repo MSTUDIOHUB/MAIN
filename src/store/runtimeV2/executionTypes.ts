@@ -9,6 +9,9 @@ import {
   type ProviderLaneProfileV1,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2SubagentJob,
+  type RuntimeV2SubagentReportV1,
+  type RuntimeV2SubagentValidationReceiptV1,
+  type RuntimeV2EvidenceReference,
 } from "../../lib/runtime-v2";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 
@@ -34,7 +37,10 @@ export interface RuntimeV2ChildResult {
   readonly job: RuntimeV2SubagentJob;
   readonly status: "completed" | "failed" | "canceled";
   readonly summary: string;
-  readonly evidenceTarget: string | null;
+  readonly report: RuntimeV2SubagentReportV1 | null;
+  readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly validationReceipts:
+    readonly RuntimeV2SubagentValidationReceiptV1[];
 }
 
 export interface RuntimeV2LiveExecutionState {
@@ -43,6 +49,9 @@ export interface RuntimeV2LiveExecutionState {
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
   readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
+  /** A parent wait marks the child result as a dependency. The child switches
+   * to report-only mode after its next evidence-bearing action. */
+  readonly childReportRequests: Set<string>;
   workspaceOverview: string;
   evidenceCounter: number;
   latestProviderResult: RuntimeV2NormalizedProviderResult | null;
@@ -70,6 +79,7 @@ export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState
     childRuns: new Map(),
     childAbortControllers: new Map(),
     childTelemetry: new Map(),
+    childReportRequests: new Set(),
     workspaceOverview: "",
     evidenceCounter: 0,
     latestProviderResult: null,

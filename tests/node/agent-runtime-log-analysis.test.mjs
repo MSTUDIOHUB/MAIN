@@ -90,18 +90,21 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
     '[1785135800.077] [warn] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"source_gap_allowed","mutationToolAvailable":true}',
     '[1785135800.078] [warn] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"mutation_required","mutationToolAvailable":true}',
     '[1785135800.100] [info] [store.runtime_v2_tool_execution_started] {"turnId":"turn-v2","runId":"run-v2","toolName":"read_file","target":"src/main.js"}',
+    '[1785135800.150] [info] [store.runtime_v2_subagent_context_handoff] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a","inheritedContext":true,"parentContextChars":2400}',
     '[1785135800.200] [info] [store.runtime_v2_subagent_request_opened] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a"}',
-    '[1785135800.300] [info] [store.runtime_v2_subagent_joined] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a"}',
+    '[1785135800.300] [info] [store.runtime_v2_subagent_joined] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a","status":"completed","structuredReport":false}',
     '[1785135800.400] [info] [store.runtime_v2_phase_transition] {"turnId":"turn-v2","runId":"run-v2","from":"observing","to":"acting"}',
     '[1785135800.500] [info] [store.runtime_v2_projection_published] {"turnId":"turn-v2","runId":"run-v2","audience":"capsule_live","storeDisposition":"projected"}',
     '[1785135800.600] [info] [store.runtime_v2_tool_execution_started] {"turnId":"turn-v2","runId":"run-v2","toolName":"apply_patch","target":"src/main.js"}',
     '[1785135800.650] [info] [store.runtime_v2_mutation_preflight_rejected] {"turnId":"turn-v2","runId":"run-v2","toolName":"apply_patch","target":"src/main.js","reason":"oversized_change"}',
     '[1785135800.660] [info] [store.runtime_v2_mutation_preflight_rejected] {"turnId":"turn-v2","runId":"run-v2","toolName":"write_file","target":"/tmp/outside.js","reason":"outside_workspace"}',
     '[1785135800.700] [info] [store.runtime_v2_ledger_committed] {"turnId":"turn-v2","runId":"run-v2","eventType":"soft_signal.observed"}',
+    '[1785135800.710] [info] [store.runtime_v2_ledger_committed] {"turnId":"turn-v2","runId":"run-v2","eventType":"soft_signal.observed","signal":"protocol_drift"}',
+    '[1785135800.715] [warn] [store.runtime_v2_ledger_committed] {"turnId":"turn-v2","runId":"run-v2","eventType":"recovery.exhausted","recoveryScope":"diagnostic"}',
     '[1785135800.725] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","reason":"finite_validation_contract_required"}',
     '[1785135800.730] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_tool","toolName":"replace_in_file","reason":"mutation_target_lease_mismatch"}',
     '[1785135800.750] [info] [store.runtime_v2_tool_execution_completed] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","validationPassed":true}',
-    '[1785135800.800] [info] [store.runtime_v2_execute_terminal] {"turnId":"turn-v2","runId":"run-v2","resultKind":"success","reason":"validated","mutations":1}',
+    '[1785135800.800] [info] [store.runtime_v2_execute_terminal] {"turnId":"turn-v2","runId":"run-v2","resultKind":"success","reason":"validated","mutations":1,"contractCoverageComplete":false,"staticOnlyBehavioralCriterionIds":["criterion-visible-behavior"]}',
   ].join("\n"));
 
   const report = analyzeAgentRuntimeEvents(events);
@@ -115,8 +118,13 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.runs[0].readFileCalls, 1);
   assert.equal(report.runs[0].mutationToolCalls, 1);
   assert.equal(report.runs[0].subagentRequests, 1);
+  assert.equal(report.runs[0].subagentContextHandoffs, 1);
   assert.equal(report.runs[0].subagentsJoined, 1);
-  assert.equal(report.runs[0].softSignals, 1);
+  assert.equal(report.runs[0].completedSubagentsWithoutReport, 1);
+  assert.equal(report.runs[0].softSignals, 2);
+  assert.equal(report.runs[0].protocolDriftSignals, 1);
+  assert.equal(report.runs[0].recoveryExhaustions, 1);
+  assert.equal(report.runs[0].actionRecoveryExhaustions, 1);
   assert.equal(report.runs[0].validationPasses, 1);
   assert.equal(report.runs[0].invalidValidationAttempts, 2);
   assert.equal(report.runs[0].validationFallbacks, 1);
@@ -144,6 +152,12 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.runs[0].maxDroppedContextEntries, 4);
   assert.equal(report.runs[0].contextAnchorLosses, 0);
   assert.equal(report.runs[0].terminalResultKind, "success");
+  assert.deepEqual(report.runs[0].warnings, [
+    "completed_subagent_without_structured_report",
+    "success_without_execution_contract_coverage",
+    "protocol_drift_caused_action_terminal",
+    "static_validation_claims_behavior_coverage",
+  ]);
   assert.deepEqual(report.runs[0].phaseTransitions, { "observing->acting": 1 });
   assert.deepEqual(report.runs[0].projections, { "capsule_live:projected": 1 });
   assert.deepEqual(report.aggregate.runtimeVersions, { v2: 1 });
@@ -161,4 +175,117 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.aggregate.sourceGapMutationSurfaceViolations, 1);
   assert.equal(report.aggregate.mutationRequestsWithoutLease, 1);
   assert.equal(report.aggregate.mutationEditorFallbacks, 1);
+  assert.equal(report.aggregate.totalWarnings, 4);
+  assert.deepEqual(report.aggregate.warningCounts, {
+    completed_subagent_without_structured_report: 1,
+    success_without_execution_contract_coverage: 1,
+    protocol_drift_caused_action_terminal: 1,
+    static_validation_claims_behavior_coverage: 1,
+  });
+});
+
+test("the three-run MD Viewer incident replay rejects both false successes and the action terminal", () => {
+  const lines = [];
+  const appendRun = ({
+    ordinal,
+    resultKind,
+    contractCoverageComplete,
+    protocolDrift = false,
+  }) => {
+    const runId = `incident-run-${ordinal}`;
+    const turnId = `incident-turn-${ordinal}`;
+    const timestamp = 1_785_208_000 + ordinal * 100;
+    lines.push(
+      `[${timestamp}.000] [info] [store.runtime_v2_execute_admitted] {"turnId":"${turnId}","runId":"${runId}","strategy":"execute"}`,
+      `[${timestamp}.100] [info] [store.runtime_v2_subagent_request_opened] {"turnId":"${turnId}","runId":"${runId}","jobId":"child-${ordinal}"}`,
+      `[${timestamp}.200] [info] [store.runtime_v2_subagent_joined] {"turnId":"${turnId}","runId":"${runId}","jobId":"child-${ordinal}","status":"completed","structuredReport":false}`,
+    );
+    if (protocolDrift) {
+      lines.push(
+        `[${timestamp}.300] [warn] [store.runtime_v2_provider_protocol_failed] {"turnId":"${turnId}","runId":"${runId}","protocolCode":"tool_surface_rejected"}`,
+        `[${timestamp}.400] [warn] [store.runtime_v2_ledger_committed] {"turnId":"${turnId}","runId":"${runId}","eventType":"recovery.exhausted"}`,
+      );
+    } else {
+      lines.push(
+        `[${timestamp}.300] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"apply_patch","target":"src/main.js"}`,
+        `[${timestamp}.400] [info] [store.runtime_v2_tool_execution_completed] {"turnId":"${turnId}","runId":"${runId}","commandKind":"execute_validation","toolName":"run_command","validationPassed":true}`,
+      );
+    }
+    lines.push(
+      `[${timestamp}.500] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"${resultKind}","mutations":${protocolDrift ? 0 : 1},"contractCoverageComplete":${contractCoverageComplete}}`,
+    );
+  };
+  appendRun({
+    ordinal: 1,
+    resultKind: "success",
+    contractCoverageComplete: false,
+  });
+  appendRun({
+    ordinal: 2,
+    resultKind: "error",
+    contractCoverageComplete: false,
+    protocolDrift: true,
+  });
+  appendRun({
+    ordinal: 3,
+    resultKind: "success",
+    contractCoverageComplete: false,
+  });
+
+  const report = analyzeAgentRuntimeEvents(
+    parseAgentRuntimeLog(lines.join("\n")),
+  );
+  assert.deepEqual(
+    report.runs.map((run) => run.terminalResultKind),
+    ["success", "error", "success"],
+  );
+  assert.deepEqual(report.aggregate.warningCounts, {
+    completed_subagent_without_structured_report: 3,
+    subagent_started_without_parent_context_handoff: 3,
+    success_without_execution_contract_coverage: 2,
+    protocol_drift_caused_action_terminal: 1,
+  });
+  assert.ok(
+    report.runs[0].warnings.includes(
+      "success_without_execution_contract_coverage",
+    ),
+  );
+  assert.ok(
+    report.runs[1].warnings.includes(
+      "protocol_drift_caused_action_terminal",
+    ),
+  );
+  assert.ok(
+    report.runs[2].warnings.includes(
+      "success_without_execution_contract_coverage",
+    ),
+  );
+});
+
+test("latest child handoff incident detects discarded work and false transport exhaustion", () => {
+  const runId = "run-child-handoff";
+  const childRunId =
+    `${runId}:child:runtime-v2-child:ms47dtia:82`;
+  const turnId = "turn-child-handoff";
+  const report = analyzeAgentRuntimeEvents(parseAgentRuntimeLog([
+    `[1785215721.000] [info] [store.runtime_v2_execute_admitted] {"turnId":"${turnId}","runId":"${runId}","strategy":"execute"}`,
+    `[1785215722.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","phase":"observing"}`,
+    `[1785215723.000] [info] [store.runtime_v2_subagent_request_opened] {"turnId":"${turnId}","runId":"${runId}","jobId":"runtime-v2-child:ms47dtia:82"}`,
+    `[1785215724.000] [info] [store.runtime_v2_subagent_provider_result] {"turnId":"${turnId}","runId":"${childRunId}","jobId":"runtime-v2-child:ms47dtia:82","toolName":"read_file"}`,
+    `[1785215725.000] [info] [store.runtime_v2_subagent_provider_result] {"turnId":"${turnId}","runId":"${childRunId}","jobId":"runtime-v2-child:ms47dtia:82","toolName":"grep_search"}`,
+    `[1785215726.000] [info] [store.runtime_v2_subagent_joined] {"turnId":"${turnId}","runId":"${runId}","jobId":"runtime-v2-child:ms47dtia:82","status":"failed","structuredReport":false,"evidenceTargets":[]}`,
+    `[1785215727.000] [info] [store.runtime_v2_ledger_committed] {"turnId":"${turnId}","runId":"${runId}","eventType":"recovery.exhausted","recoveryScope":"transport"}`,
+    `[1785215728.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","reason":"provider_transport_exhausted","mutations":0,"contractCoverageComplete":false}`,
+  ].join("\n")));
+  const parent = report.runs.find((run) => run.runId === runId);
+
+  assert.equal(parent.subagentProviderActions, 2);
+  assert.equal(parent.failedSubagentsWithoutEvidence, 1);
+  assert.equal(parent.providerRequestsAfterFailedSubagentJoin, 0);
+  assert.deepEqual(parent.warnings, [
+    "subagent_started_without_parent_context_handoff",
+    "failed_subagent_discarded_tool_evidence",
+    "parent_did_not_resume_after_subagent_failure",
+    "non_provider_failure_marked_transport_exhaustion",
+  ]);
 });

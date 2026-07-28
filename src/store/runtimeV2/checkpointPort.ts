@@ -189,6 +189,12 @@ export function createRuntimeV2CheckpointPort(
           sequence: event.sequence,
           revision: appended.checkpoint.revision,
           sideEffectFence: event.type === "command.scheduled",
+          ...(event.type === "soft_signal.observed"
+            ? { signal: event.signal }
+            : {}),
+          ...(event.type === "recovery.exhausted"
+            ? { recoveryScope: event.scope }
+            : {}),
           rebasedConcurrentRuntime:
             storeRevisionBeforePersist !== expectedStoreRevision,
         });

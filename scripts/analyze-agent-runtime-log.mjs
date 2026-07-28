@@ -129,9 +129,18 @@ function createRun(event, runIndex) {
     forcedContextPacks: 0,
     actualDroppedMessages: 0,
     subagentRequests: 0,
+    subagentContextHandoffs: 0,
     subagentsJoined: 0,
+    completedSubagentsWithoutReport: 0,
+    subagentProviderActions: 0,
+    failedSubagentsWithoutEvidence: 0,
+    providerRequestsAfterFailedSubagentJoin: 0,
+    lastFailedSubagentJoinAt: null,
     recoveryExhaustions: 0,
+    actionRecoveryExhaustions: 0,
     softSignals: 0,
+    protocolDriftSignals: 0,
+    repeatedActionSignals: 0,
     validationPasses: 0,
     validationFailures: 0,
     invalidValidationAttempts: 0,
@@ -154,6 +163,9 @@ function createRun(event, runIndex) {
     contextAnchorLosses: 0,
     terminalResultKind: null,
     terminalReason: null,
+    terminalContractCoverageComplete: null,
+    staticOnlyBehavioralCriterionIds: [],
+    warnings: [],
     toolCallsByName: {},
     stopReasons: {},
     forcedContextReasons: {},
@@ -229,6 +241,12 @@ function applyEventToRun(run, event) {
 
   if (event.event === "store.runtime_v2_provider_request_opened") {
     run.providerRequests += 1;
+    if (
+      run.lastFailedSubagentJoinAt !== null &&
+      Number(event.timestamp) > run.lastFailedSubagentJoinAt
+    ) {
+      run.providerRequestsAfterFailedSubagentJoin += 1;
+    }
     run.maxIteration = Math.max(run.maxIteration, run.providerRequests);
   }
   if (event.event === "store.runtime_v2_provider_protocol_failed") {
@@ -365,20 +383,51 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_subagent_request_opened") {
     run.subagentRequests += 1;
   }
+  if (event.event === "store.runtime_v2_subagent_context_handoff") {
+    run.subagentContextHandoffs += 1;
+  }
   if (event.event === "store.runtime_v2_subagent_joined") {
     run.subagentsJoined += 1;
+    if (
+      payload.status === "completed" &&
+      payload.structuredReport !== true
+    ) {
+      run.completedSubagentsWithoutReport += 1;
+    }
+    if (
+      payload.status === "failed" &&
+      (
+        !Array.isArray(payload.evidenceTargets) ||
+        payload.evidenceTargets.length === 0
+      )
+    ) {
+      run.failedSubagentsWithoutEvidence += 1;
+      run.lastFailedSubagentJoinAt = Number(event.timestamp);
+    }
   }
   if (
     event.event === "store.runtime_v2_ledger_committed" &&
     payload.eventType === "recovery.exhausted"
   ) {
     run.recoveryExhaustions += 1;
+    if (
+      payload.recoveryScope === "action" ||
+      payload.recoveryScope === "diagnostic"
+    ) {
+      run.actionRecoveryExhaustions += 1;
+    }
   }
   if (
     event.event === "store.runtime_v2_ledger_committed" &&
     payload.eventType === "soft_signal.observed"
   ) {
     run.softSignals += 1;
+    if (payload.signal === "protocol_drift") {
+      run.protocolDriftSignals += 1;
+    }
+    if (payload.signal === "repeated_action") {
+      run.repeatedActionSignals += 1;
+    }
   }
   if (event.event === "store.runtime_v2_phase_transition") {
     incrementCounter(
@@ -395,6 +444,15 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_execute_terminal") {
     run.terminalResultKind = asString(payload.resultKind);
     run.terminalReason = asString(payload.reason);
+    run.terminalContractCoverageComplete =
+      typeof payload.contractCoverageComplete === "boolean"
+        ? payload.contractCoverageComplete
+        : null;
+    run.staticOnlyBehavioralCriterionIds =
+      Array.isArray(payload.staticOnlyBehavioralCriterionIds)
+        ? payload.staticOnlyBehavioralCriterionIds
+            .filter((id) => typeof id === "string" && id.trim())
+        : [];
     incrementCounter(
       run.stopReasons,
       `runtime_v2:${run.terminalResultKind || "unknown"}`,
@@ -437,6 +495,57 @@ function applyEventToRun(run, event) {
   if (isNoActionStop(event)) run.noActionStops += 1;
 }
 
+function finalizeRunWarnings(run) {
+  const warnings = [];
+  if (run.completedSubagentsWithoutReport > 0) {
+    warnings.push("completed_subagent_without_structured_report");
+  }
+  if (run.subagentRequests > run.subagentContextHandoffs) {
+    warnings.push("subagent_started_without_parent_context_handoff");
+  }
+  if (
+    run.subagentProviderActions > 0 &&
+    run.failedSubagentsWithoutEvidence > 0
+  ) {
+    warnings.push("failed_subagent_discarded_tool_evidence");
+  }
+  if (
+    run.terminalResultKind &&
+    run.failedSubagentsWithoutEvidence > 0 &&
+    run.providerRequestsAfterFailedSubagentJoin === 0
+  ) {
+    warnings.push("parent_did_not_resume_after_subagent_failure");
+  }
+  if (
+    run.runtimeVersion === "v2" &&
+    run.terminalResultKind === "success" &&
+    run.terminalContractCoverageComplete !== true
+  ) {
+    warnings.push("success_without_execution_contract_coverage");
+  }
+  if (
+    run.terminalResultKind &&
+    run.recoveryExhaustions > 0 &&
+    (
+      run.providerProtocolFailures > 0 ||
+      run.protocolDriftSignals > 0
+    )
+  ) {
+    warnings.push("protocol_drift_caused_action_terminal");
+  }
+  if (run.staticOnlyBehavioralCriterionIds.length > 0) {
+    warnings.push("static_validation_claims_behavior_coverage");
+  }
+  if (
+    run.terminalReason === "provider_transport_exhausted" &&
+    run.providerTransportFailures === 0 &&
+    run.providerProtocolFailures === 0
+  ) {
+    warnings.push("non_provider_failure_marked_transport_exhaustion");
+  }
+  run.warnings = warnings;
+}
+
 function buildAggregate(runs) {
   const aggregate = {
     runCount: runs.length,
@@ -460,9 +569,17 @@ function buildAggregate(runs) {
     providerRequestTimeouts: 0,
     toolDeadlineExceeded: 0,
     subagentRequests: 0,
+    subagentContextHandoffs: 0,
     subagentsJoined: 0,
+    completedSubagentsWithoutReport: 0,
+    subagentProviderActions: 0,
+    failedSubagentsWithoutEvidence: 0,
+    providerRequestsAfterFailedSubagentJoin: 0,
     recoveryExhaustions: 0,
+    actionRecoveryExhaustions: 0,
     softSignals: 0,
+    protocolDriftSignals: 0,
+    repeatedActionSignals: 0,
     validationPasses: 0,
     validationFailures: 0,
     invalidValidationAttempts: 0,
@@ -493,6 +610,8 @@ function buildAggregate(runs) {
     mutationLeaseAuthorities: {},
     phaseTransitions: {},
     projections: {},
+    warningCounts: {},
+    totalWarnings: 0,
   };
 
   for (const run of runs) {
@@ -515,9 +634,17 @@ function buildAggregate(runs) {
       "providerRequestTimeouts",
       "toolDeadlineExceeded",
       "subagentRequests",
+      "subagentContextHandoffs",
       "subagentsJoined",
+      "completedSubagentsWithoutReport",
+      "subagentProviderActions",
+      "failedSubagentsWithoutEvidence",
+      "providerRequestsAfterFailedSubagentJoin",
       "recoveryExhaustions",
+      "actionRecoveryExhaustions",
       "softSignals",
+      "protocolDriftSignals",
+      "repeatedActionSignals",
       "validationPasses",
       "validationFailures",
       "invalidValidationAttempts",
@@ -538,6 +665,10 @@ function buildAggregate(runs) {
       "contextAnchorLosses",
     ]) {
       aggregate[field] += run[field];
+    }
+    for (const warning of run.warnings) {
+      aggregate.totalWarnings += 1;
+      incrementCounter(aggregate.warningCounts, warning);
     }
     aggregate.maxAvailableContextEntries = Math.max(
       aggregate.maxAvailableContextEntries,
@@ -606,6 +737,18 @@ export function analyzeAgentRuntimeEvents(events) {
       runtimeV2Runs.set(runtimeV2RunId, run);
       runs.push(run);
     }
+    if (
+      runtimeV2RunId &&
+      event.event === "store.runtime_v2_subagent_provider_result" &&
+      runtimeV2RunId.includes(":child:")
+    ) {
+      const parentRunId = runtimeV2RunId.slice(
+        0,
+        runtimeV2RunId.indexOf(":child:"),
+      );
+      const parentRun = runtimeV2Runs.get(parentRunId);
+      if (parentRun) parentRun.subagentProviderActions += 1;
+    }
     const targetRun = runtimeV2RunId
       ? runtimeV2Runs.get(runtimeV2RunId)
       : currentRun;
@@ -613,6 +756,8 @@ export function analyzeAgentRuntimeEvents(events) {
       applyEventToRun(targetRun, event);
     }
   }
+
+  for (const run of runs) finalizeRunWarnings(run);
 
   return {
     schemaVersion: 2,

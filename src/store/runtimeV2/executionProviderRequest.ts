@@ -1,5 +1,8 @@
 import { deriveStreamSettings } from "../../lib/providerLaneSettings";
-import { streamChatCompletion } from "../../lib/streaming";
+import {
+  streamChatCompletion,
+  type OpenAiToolChoice,
+} from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
@@ -19,7 +22,6 @@ import {
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
 import {
-  latestFailedMutationToolForLease,
   runtimeV2MutationLease,
   type RuntimeV2MutationLease,
 } from "./correctiveMutationPolicy";
@@ -80,19 +82,18 @@ function providerModeInstruction(
     readonly hasMutation: boolean;
     readonly hasSpawnSubagent: boolean;
     readonly hasWaitSubagents: boolean;
+    readonly hasExecutionContract: boolean;
     readonly mutationLease: RuntimeV2MutationLease | null;
   } = {
     hasReadFile: false,
     hasMutation: false,
     hasSpawnSubagent: false,
     hasWaitSubagents: false,
+    hasExecutionContract: false,
     mutationLease: null,
   },
 ): string {
   const mode = String(command.payload.mode || "").trim();
-  const collaborationAction = String(
-    command.payload.collaborationAction || "",
-  ).trim();
   const activeSubagents = Array.isArray(command.payload.activeSubagents)
     ? command.payload.activeSubagents
         .map((entry) => {
@@ -107,41 +108,96 @@ function providerModeInstruction(
         })
         .filter(Boolean)
     : [];
-  if (
-    (mode === "observe" || mode === "analyze") &&
-    collaborationAction === "spawn_required"
-  ) {
-    return [
-      "Current phase: model-selected collaboration.",
-      "Call spawn_subagent exactly once before any parent workspace read.",
-      "You must choose a fresh semantic task key, a real display name and role, a narrow evidence objective, success criteria, and the least read-only path scope needed.",
-      "Do not invent work from top-level directory names or generic architecture-layer labels; the delegated responsibility must follow the user's actual objective and current evidence.",
-    ].join(" ");
-  }
+  const failedSubagents = Array.isArray(command.payload.failedSubagents)
+    ? command.payload.failedSubagents
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") return "";
+          const record = entry as Record<string, unknown>;
+          const id = String(record.id || "").trim();
+          const summary = String(record.summary || "").trim();
+          return id
+            ? `${id}: ${summary || "no structured report"}`.slice(0, 600)
+            : "";
+        })
+        .filter(Boolean)
+    : [];
+  const collaborationGuidance = [
+    command.payload.collaborationAction === "parent_takeover_required"
+      ? [
+          `Previous read-only child tasks failed (${failedSubagents.join("; ") || "no structured report"}).`,
+          "Child failure is not a blocker. The parent must continue the remaining objective directly with the tools and authority available in the current phase.",
+          "Do not recreate the same semantic child task.",
+        ].join(" ")
+      : "",
+    toolSurface.hasWaitSubagents
+      ? `Read-only child work is active (${activeSubagents.join("; ")}). Continue independent parent work and call wait_subagents only when its result becomes a dependency.`
+      : "",
+    toolSurface.hasSpawnSubagent
+      ? [
+          command.payload.collaborationPreferred === true
+            ? "Delegation is encouraged when a genuinely independent investigation, review, or validation would shorten the critical path; it is never mandatory."
+            : "Delegation is optional.",
+          "Use spawn_subagent only for a semantic independent explore, review, or validate task with concrete success criteria. The parent remains the only writer.",
+        ].join(" ")
+      : "",
+  ].filter(Boolean).join(" ");
   switch (mode) {
     case "observe":
       return [
-        "Current phase: bounded read-only investigation. Use exactly one focused read or search action to collect a concrete missing fact. Mutation and validation tools are unavailable; do not propose or simulate an edit.",
-        toolSurface.hasWaitSubagents
-          ? `Read-only child work is active (${activeSubagents.join("; ")}). Continue only genuinely independent parent work, or call wait_subagents before relying on or concluding from child results.`
-          : "",
-        toolSurface.hasSpawnSubagent
-          ? "spawn_subagent is available only when you identify another semantic, independent read-only investigation with concrete success criteria; choose its name, role, objective and scope yourself."
-          : "",
+        command.payload.requiredExecutionContractSourceTarget
+          ? [
+              "Current phase: exact execution-contract source acquisition.",
+              `The runtime will read exactly ${JSON.stringify(String(command.payload.requiredExecutionContractSourceTarget))} because the rejected modify/delete target has no matching versioned receipt.`,
+              "Do not resubmit the contract, delegate, survey another file, or propose a mutation until this receipt is committed.",
+            ].join(" ")
+          : command.payload.observationPolicy ===
+            "execution_contract_required"
+          ? [
+              "Current phase: execution contract required.",
+              "Investigation already produced versioned source evidence and then repeated or pivoted under pressure. Do not read, search, delegate, or narrate another diagnosis.",
+              "Call submit_execution_contract now. Use canonical E-prefixed source evidence ids below. When the runtime catalog has one criterion, omit criteria and criterion_ids; the runtime binds that sole identity and evidence class.",
+              "For behavioral UI acceptance, declare a browser or desktop validation with a supported action and an assertion linked by after_action_id, or a real automated test/executable assertion. Never use echo, grep, sed, cat, head, tail, or wc as validation.",
+              command.payload.executionContractRejection
+                ? `Correct this exact prior rejection: ${String(command.payload.executionContractRejection)}.`
+                : "",
+            ].join(" ")
+          : command.payload.observationPolicy ===
+            "different_action_or_contract_required"
+          ? [
+              "Current phase: investigation pivot required.",
+              `The unchanged source action for ${JSON.stringify(String(command.payload.repeatedSourceTarget || "the previous target"))} already returned committed evidence and must not be repeated.`,
+              "Call submit_execution_contract now if target evidence is sufficient; otherwise choose exactly one different source/search action that supplies a concrete missing fact.",
+            ].join(" ")
+          : "Current phase: bounded investigation. Use one focused read/search action to collect a concrete missing fact.",
+        toolSurface.hasExecutionContract
+          ? [
+              `Runtime-owned acceptance criteria: ${JSON.stringify(command.payload.acceptanceCriteria || [])}.`,
+              `Canonical versioned source evidence catalog: ${JSON.stringify(command.payload.executionEvidenceCatalog || [])}.`,
+              command.payload.executionContractRejection
+                ? `Previous execution contract rejection: ${String(command.payload.executionContractRejection)}. Correct it instead of resubmitting the same validation.`
+                : "",
+              command.payload.executionContractRevision
+                ? "The active execution contract may be revised only after genuinely new versioned source evidence."
+                : "Once target scope is evidenced, call submit_execution_contract before the first mutation. Multi-criterion objectives require exact runtime ids; a sole criterion is bound by the runtime.",
+            ].join(" ")
+          : "Mutation and validation tools are unavailable; do not propose or simulate an edit.",
+        collaborationGuidance,
       ].filter(Boolean).join(" ");
     case "analyze":
       return [
         "Current phase: bounded read-only workspace analysis. Use at most one focused read/search action when a concrete fact is missing. When the evidence is sufficient, return one complete Markdown answer with no tool call. Never request a mutation, shell command, browser action, or validation.",
-        toolSurface.hasWaitSubagents
-          ? `Read-only child work is active (${activeSubagents.join("; ")}). Call wait_subagents before the final answer if its result is still relevant.`
-          : "",
-        toolSurface.hasSpawnSubagent
-          ? "You may call spawn_subagent only for a semantic independent investigation; its name, role, objective, success criteria and read scope must be your actual task design."
-          : "",
+        collaborationGuidance,
       ].filter(Boolean).join(" ");
     case "execute":
-      return command.payload.executePolicy === "source_refresh_required"
-        ? "Current phase: corrective source refresh. Read the exact primary file window reported by the latest failed validator or stale mutation. Only read_file is available; do not survey other files or propose a mutation until this source snapshot is committed."
+      return [
+        command.payload.requiredMutationSourceTarget
+        ? [
+            "Current phase: exact contracted target acquisition.",
+            `Call read_file now for exactly ${JSON.stringify(String(command.payload.requiredMutationSourceTarget))}.`,
+            "The previous lease points at an already-covered or unrelated target. No mutation or broader survey is available until this source receipt establishes authority for the remaining contracted change.",
+          ].join(" ")
+        : command.payload.executePolicy === "source_refresh_required"
+        ? "Current phase: corrective source refresh. Read the exact primary file window reported by the latest failed validator or stale mutation before choosing the next bounded action."
         : command.payload.executePolicy === "source_reorientation_required"
         ? "Current phase: target recovery. The previous mutation named a target that is not valid in the active workspace. Use exactly one available source read, search, or directory action to locate authoritative code. Mutation and validation tools are temporarily unavailable; do not repeat the rejected path."
         : command.payload.executePolicy === "mutation_required"
@@ -151,28 +207,59 @@ function providerModeInstruction(
           ? [
               "Current phase: corrective implementation.",
               toolSurface.hasReadFile
-                ? "The validator-reported file is leased. If exact replacement bytes are still unclear, use the single read_file once; otherwise mutate now."
-                : "The validator-reported source is attached and read capabilities are closed. Call the one available minimal mutation tool now.",
+                ? "Safe reads remain available. Refresh only evidence needed for the next bounded mutation."
+                : "",
               "Repair only the concrete acceptance gaps in the leased file and preserve unrelated behavior.",
             ].join(" ")
           : toolSurface.mutationLease?.authority === "fresh_parent_read"
           ? [
               "Current phase: implementation.",
               `The mutation is leased to the exact file most recently read by the parent: ${toolSurface.mutationLease.target}.`,
-              "Call one available minimal mutation tool now and preserve unrelated code.",
+              command.payload.forcedMutationToolName
+                ? `The unchanged read loop was rejected. Call ${String(command.payload.forcedMutationToolName)} now; another read is not a different action.`
+                : "Call one available minimal mutation tool now and preserve unrelated code.",
             ].join(" ")
           : "Current phase: approved-plan implementation. Call exactly one minimal mutation within the sealed plan scope and preserve unrelated code."
-        : "Current phase: source acquisition before implementation. Mutation tools are closed for this request. Use one focused source action; finish with read_file on the exact file you intend to change. Never replace the tool call with narration.";
+        : "Current phase: source acquisition before implementation. Use one focused source action; finish with read_file on the exact file you intend to change.",
+        toolSurface.hasExecutionContract
+          ? [
+              "Every mutation must remain inside the active execution contract. If new versioned evidence changes the target or acceptance approach, revise the contract before the next mutation; prior validation receipts become stale.",
+              `Active execution contract draft: ${JSON.stringify(command.payload.activeExecutionContractDraft || {})}.`,
+              command.payload.executionContractRejection
+                ? `Correct this exact prior contract rejection before resubmitting: ${String(command.payload.executionContractRejection)}.`
+                : "",
+              `Canonical versioned source evidence catalog: ${JSON.stringify(command.payload.executionEvidenceCatalog || [])}.`,
+            ].filter(Boolean).join(" ")
+          : "",
+        collaborationGuidance,
+      ].filter(Boolean).join(" ");
     case "validate":
       return [
         "Current phase: validate. Call one acceptance-capable finite validation tool and wait for its actual result before concluding.",
+        toolSurface.hasReadFile
+          ? "Safe source reads remain available for a focused parent takeover after a child failure. A read is supporting evidence only: it never counts as validation, and after resolving the missing fact you must run the declared validator."
+          : "",
         "A run_command must be a bounded build, test, lint, typecheck, check, or assertion command. cat, grep, sed, head, tail, and wc only inspect text and are not validation.",
         preferredValidationCommand
           ? `Preferred workspace validation command: ${JSON.stringify(preferredValidationCommand)}. Use it unless retained evidence proves another bounded validator is more appropriate.`
           : "Prefer run_command or browser_evaluate according to the observable acceptance boundary.",
-      ].join(" ");
+        "Use only a validator declared by the active execution authority. A static build/lint/typecheck/check cannot prove a behavioral or interaction criterion.",
+        command.payload.activeExecutionContractDraft
+          ? [
+              `Active execution contract and declared validation primitives: ${JSON.stringify(command.payload.activeExecutionContractDraft)}.`,
+              "For browser_evaluate, translate the declared actions to its action DSL (for example click: selector or fill: selector => value) and the declared assertions to its checks DSL. Preserve the declared action/assertion causal intent; do not invent a different validator.",
+              command.payload.validationRetryTarget
+                ? `Reuse this previously authorized URL exactly: ${JSON.stringify(String(command.payload.validationRetryTarget))}.`
+                : "",
+            ].filter(Boolean).join(" ")
+          : "",
+        collaborationGuidance,
+      ].filter(Boolean).join(" ");
     case "conclude":
-      return "Current phase: final evidence report. Do not call another tool. State only the confirmed root cause, files actually changed, validation that actually passed, and any remaining limitation.";
+      return [
+        "Current phase: final evidence report. State only the confirmed root cause, files actually changed, matching validations that actually passed, and any remaining limitation.",
+        collaborationGuidance,
+      ].filter(Boolean).join(" ");
     default:
       return "Current phase: choose the next action from concrete evidence. Use a structured tool whenever another fact, edit, or validation is required.";
   }
@@ -184,7 +271,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   command: RuntimeV2Command;
   tools: ToolDefinition[];
   textEnvelope: boolean;
-  toolChoice: "required" | "auto" | null;
+  toolChoice: OpenAiToolChoice | null;
   signal: AbortSignal;
   timeoutMs: number;
 }): Promise<RuntimeV2NormalizedProviderResult> {
@@ -230,9 +317,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
       ? runtimeV2MutationLease(input.ports)
       : null;
   const toolNames = new Set(input.tools.map((tool) => tool.function.name));
-  const excludedMutationTool = mutationLease
-    ? latestFailedMutationToolForLease(input.ports, mutationLease)
-    : null;
   const messages = [
     ...history.messages,
     {
@@ -248,6 +332,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
             toolNames.has("write_file"),
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
+          hasExecutionContract:
+            toolNames.has("submit_execution_contract"),
           mutationLease,
         },
       ),
@@ -279,7 +365,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     mutationLeaseAuthority: mutationLease?.authority || null,
     mutationLeaseTarget: mutationLease?.target || null,
     mutationLeaseEvidenceId: mutationLease?.evidenceId || null,
-    excludedMutationTool,
+    forcedMutationToolName:
+      String(input.command.payload.forcedMutationToolName || "") || null,
     retainedEvidenceEntries: history.retained,
     droppedEvidenceEntries: history.dropped,
     conversationHistoryMessages: history.historyMessages,

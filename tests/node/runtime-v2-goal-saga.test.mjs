@@ -130,6 +130,17 @@ test("Goal saga uses ordinary finite Execute Turns and completes only from evide
     "Source fixed",
     "Tests pass",
   ]);
+  assert.deepEqual(
+    runtime.runtimeV2GoalSliceExecuteAdmission(firstDecision.request),
+    {
+      objective: "Repair and verify the fixture",
+      constraints: ["Stay inside the fixture"],
+      acceptanceCriteria: [
+        { id: "criterion-source", text: "Source fixed" },
+        { id: "criterion-tests", text: "Tests pass" },
+      ],
+    },
+  );
   assert.equal(firstDecision.request.deadlineAt, 10_000);
 
   state = runtime.recordRuntimeV2GoalSliceLaunch(state, firstDecision.request, 200);
@@ -185,11 +196,11 @@ test("Goal saga uses ordinary finite Execute Turns and completes only from evide
   assert.equal(state.totalSlices, 2);
 });
 
-test("same structural no-progress failure exhausts recovery without a paused state", () => {
+test("same structural no-progress failure remains a soft signal until a hard boundary", () => {
   let state = saga({
     criteria: [{ id: "criterion-tests", text: "Tests pass", required: true }],
   });
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
     const launch = runtime.decideRuntimeV2GoalSaga(state, 200 + attempt);
     assert.equal(launch.kind, "launch_slice");
     state = runtime.recordRuntimeV2GoalSliceLaunch(state, launch.request, 200 + attempt);
@@ -201,25 +212,19 @@ test("same structural no-progress failure exhausts recovery without a paused sta
       completedAt: 300 + attempt,
     }));
     const decision = runtime.decideRuntimeV2GoalSaga(state, 400 + attempt);
-    if (attempt === 1) {
-      assert.equal(decision.kind, "continue_goal");
-      state = runtime.continueRuntimeV2GoalSaga(
-        state,
-        decision.fromSliceId,
-        400 + attempt,
-      );
-    } else {
-      assert.equal(decision.kind, "complete_goal");
-      assert.equal(decision.outcome.resultKind, "error");
-      assert.equal(decision.outcome.reasonCode, "recovery_exhausted");
-      state = runtime.completeRuntimeV2GoalSaga(state, decision.outcome);
-    }
+    assert.equal(decision.kind, "continue_goal");
+    assert.equal(state.recovery.exhausted, false);
+    state = runtime.continueRuntimeV2GoalSaga(
+      state,
+      decision.fromSliceId,
+      400 + attempt,
+    );
   }
-  assert.equal(state.status, "completed");
+  assert.equal(state.status, "ready");
   assert.equal("pauseReason" in state, false);
   assert.deepEqual(
     new Set(state.recentSlices.map((receipt) => receipt.request.sliceId)).size,
-    2,
+    4,
   );
 });
 
@@ -262,7 +267,6 @@ test("hard boundaries are explicit terminal outcomes and never permanent pause",
   const cases = [
     ["cancel_requested", "canceled"],
     ["authority_lost", "blocked"],
-    ["recovery_exhausted", "error"],
   ];
   for (const [kind, expected] of cases) {
     const state = runtime.recordRuntimeV2GoalBoundary(saga(), {

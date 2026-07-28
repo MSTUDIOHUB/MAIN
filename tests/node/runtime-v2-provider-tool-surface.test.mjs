@@ -54,6 +54,33 @@ test("provider tool batches execute one action before Runtime v2 decides again",
     bounded.discarded.map((item) => item.name),
     ["replace_in_file", "run_command"],
   );
+  assert.equal(bounded.selection, "first");
+});
+
+test("provider tool batches skip a regenerated stale head for the first novel action", () => {
+  const repeated = {
+    id: "read-again",
+    name: "read_file",
+    arguments: { path: "src/main.js" },
+  };
+  const contract = {
+    id: "contract",
+    name: "submit_execution_contract",
+    arguments: { targets: [{ path: "src/main.js", operation: "modify" }] },
+  };
+  const bounded = surface.boundRuntimeV2ProviderToolCalls(
+    [repeated, contract],
+    new Set([surface.runtimeV2ProviderToolCallIdentity(repeated)]),
+  );
+  assert.deepEqual(
+    bounded.accepted.map((item) => item.name),
+    ["submit_execution_contract"],
+  );
+  assert.deepEqual(
+    bounded.discarded.map((item) => item.name),
+    ["read_file"],
+  );
+  assert.equal(bounded.selection, "first_novel_after_attempt");
 });
 
 test("Execute keeps safe reads available beside mutations after source freshness", () => {
@@ -87,7 +114,7 @@ test("Execute keeps safe reads available beside mutations after source freshness
   );
 });
 
-test("Execute narrows to mutation tools after its bounded source-gap pass", () => {
+test("Execute keeps safe reads beside leased mutations after its source-gap pass", () => {
   const available = [
     definition("read_file"),
     definition("grep_search"),
@@ -108,6 +135,6 @@ test("Execute narrows to mutation tools after its bounded source-gap pass", () =
       requiresFreshSourceReads: false,
       requiresMutation: true,
     }).map((item) => item.function.name),
-    ["apply_patch", "replace_in_file"],
+    ["read_file", "grep_search", "apply_patch", "replace_in_file"],
   );
 });

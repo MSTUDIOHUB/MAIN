@@ -1,9 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
-import { exhaustedRuntimeV2ResultKind } from "./completion";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command,
-  type RuntimeV2RecoveryScope,
   type RuntimeV2Projection,
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
@@ -20,19 +18,25 @@ import {
   buildRuntimeV2MilestoneProjection,
   buildRuntimeV2TimelineProjection,
 } from "./projection";
-import {
-  canOpenRuntimeV2RecoveryEpoch,
-  canRecordRuntimeV2Recovery,
-  runtimeV2RecoveryScopeForCommandFailure,
-  runtimeV2ActionFingerprint,
-} from "./recovery";
+import { runtimeV2ActionFingerprint } from "./recovery";
 import { transition } from "./reducer";
-
+import { compileRuntimeV2ExecutionContract } from "./executionContract";
+import {
+  decideRuntimeV2CommandFailureRecovery,
+  decideRuntimeV2SemanticFailureRecovery,
+  deriveRuntimeV2CorrectiveRecoveryEpoch,
+  repeatsCommittedRuntimeV2SourceEvidence,
+  repeatsRuntimeV2ProjectionInCurrentPhase,
+  shouldRecordRuntimeV2SoftSignal,
+} from "./controllerRecovery";
 export interface RuntimeV2ControllerSnapshot {
   readonly aggregate: TurnAggregateV1 | null;
   readonly revision: number;
 }
-
+type RuntimeV2SoftSignal = Extract<
+  RuntimeV2Event,
+  { readonly type: "soft_signal.observed" }
+>["signal"];
 export interface RuntimeV2Admission {
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -40,74 +44,14 @@ export interface RuntimeV2Admission {
   readonly objective: string;
   readonly constraints?: readonly string[];
   readonly acceptanceCriteria?: readonly string[];
+  readonly acceptanceCriterionIds?: readonly string[];
+  readonly acceptanceEvidenceRequirements?: readonly (
+    "static" | "behavioral" | "interaction"
+  )[];
   readonly initialPhase?: "preparing" | "observing" | "planning" | "acting" | "validating" | "finalizing";
 }
-
-function asEvent<T extends RuntimeV2Event>(value: T): T {
-  return value;
-}
-
-function structuralIdentity(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(structuralIdentity).join(",")}]`;
-  }
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entry]) =>
-      `${JSON.stringify(key)}:${structuralIdentity(entry)}`
-    )
-    .join(",")}}`;
-}
-
-function sourceCommandIdentity(command: RuntimeV2Command): string {
-  return [
-    String(command.payload.toolName || ""),
-    structuralIdentity(command.payload.arguments || {}),
-  ].join(":");
-}
-
-function repeatsCommittedSourceEvidence(
-  state: TurnAggregateV1,
-  event: RuntimeV2Event,
-  command: RuntimeV2Command,
-): boolean {
-  if (
-    event.type !== "tool.completed" ||
-    event.status !== "succeeded" ||
-    event.evidence.length === 0 ||
-    !event.evidence.every((item) => item.kind === "source")
-  ) {
-    return false;
-  }
-  const identity = sourceCommandIdentity(command);
-  const priorCommandKeys = new Set(state.events
-    .filter((candidate): candidate is Extract<
-      RuntimeV2Event,
-      { type: "command.scheduled" }
-    > =>
-      candidate.type === "command.scheduled" &&
-      candidate.command.kind === "execute_tool" &&
-      candidate.command.idempotencyKey !== command.idempotencyKey &&
-      sourceCommandIdentity(candidate.command) === identity
-    )
-    .map((candidate) => candidate.command.idempotencyKey));
-  return state.events.some((candidate) =>
-    candidate.type === "tool.completed" &&
-    candidate.status === "succeeded" &&
-    priorCommandKeys.has(candidate.idempotencyKey) &&
-    event.evidence.every((incoming) =>
-      candidate.evidence.some((existing) =>
-        existing.kind === incoming.kind &&
-        existing.target === incoming.target &&
-        (existing.version || null) === (incoming.version || null)
-      )
-    )
-  );
-}
-
-/**
- * Thin command runner around the pure reducer. It writes `command.scheduled`
+function asEvent<T extends RuntimeV2Event>(value: T): T { return value; }
+/** Thin command runner around the pure reducer. It writes `command.scheduled`
  * before every side effect and accepts results only through the same event
  * ledger. Concrete UI/store/provider adapters live outside this class.
  */
@@ -139,9 +83,8 @@ export class RuntimeV2Controller {
     };
   }
 
-  /** Ports supply semantic result fields only. The controller owns sequence,
-   * timestamp and event identity so a late external callback cannot publish a
-   * stale ledger position. */
+  /** Controller-owned identity prevents a late callback publishing a stale
+   * ledger position. */
   private rebasePortEvent(event: RuntimeV2EventDraft): RuntimeV2Event {
     return { ...event, ...this.eventBase() } as RuntimeV2Event;
   }
@@ -176,6 +119,15 @@ export class RuntimeV2Controller {
       objective: input.objective,
       constraints: input.constraints || [],
       acceptanceCriteria: input.acceptanceCriteria || [],
+      ...(input.acceptanceCriterionIds
+        ? { acceptanceCriterionIds: input.acceptanceCriterionIds }
+        : {}),
+      ...(input.acceptanceEvidenceRequirements
+        ? {
+            acceptanceEvidenceRequirements:
+              input.acceptanceEvidenceRequirements,
+          }
+        : {}),
     }));
     return this.apply(asEvent({
       ...this.eventBase(),
@@ -206,10 +158,20 @@ export class RuntimeV2Controller {
    * signals may trigger compaction or a strategy pivot, but never decide the
    * Turn outcome by themselves. */
   async recordSoftSignal(
-    signal: "no_tool_call" | "empty_response" | "repeat" | "context_pressure" | "iteration_limit",
+    signal: RuntimeV2SoftSignal,
+  ): Promise<TurnAggregateV1> {
+    return this.applySoftSignal(signal);
+  }
+
+  private async applySoftSignal(
+    signal: RuntimeV2SoftSignal,
   ): Promise<TurnAggregateV1> {
     const state = this.requireAggregate();
     if (!state.run) throw new Error("Runtime v2 Run is not active.");
+    if (!shouldRecordRuntimeV2SoftSignal({
+      aggregate: state,
+      signal,
+    })) return state;
     return this.apply(asEvent({
       ...this.eventBase(),
       type: "soft_signal.observed",
@@ -360,7 +322,61 @@ export class RuntimeV2Controller {
   private async execute(command: RuntimeV2Command): Promise<void> {
     try {
       const signal = this.abortSignal || new AbortController().signal;
+      if (
+        command.payload.repeatedActionRejected === true &&
+        command.kind !== "execute_tool" &&
+        command.kind !== "execute_validation"
+      ) {
+        throw new Error(
+          "RUNTIME_V2_REPEATED_ACTION_REJECTED: choose a different structured action.",
+        );
+      }
       switch (command.kind) {
+      case "commit_execution_contract": {
+        const current = this.requireAggregate();
+        const previous = current.executionContract;
+        const contract = compileRuntimeV2ExecutionContract({
+          objective: current.objective,
+          evidence: current.evidence,
+          draft: command.payload.arguments,
+          previous,
+          committedAt: this.ports.clockId.now(),
+          contractId:
+            previous?.id ||
+            `${current.turn.turnId}:execution-contract`,
+        });
+        await this.apply(asEvent({
+          ...this.eventBase(),
+          type: "command.completed",
+          run: command.run,
+          idempotencyKey: command.idempotencyKey,
+          status: "succeeded",
+        }));
+        const committed = await this.apply(asEvent({
+          ...this.eventBase(),
+          type: "execution_contract.committed",
+          run: command.run,
+          contract,
+        }));
+        if (previous) {
+          await this.apply(asEvent({
+            ...this.eventBase(),
+            type: "execution_contract.invalidated",
+            run: command.run,
+            contractId: previous.id,
+            revision: previous.revision,
+            reason: "replaced_by_new_evidence_revision",
+          }));
+        }
+        await this.publishMilestoneIfEligible(
+          committed.events[committed.events.length - 1],
+        );
+        await this.publish(buildRuntimeV2CapsuleProjection(
+          this.requireAggregate(),
+          this.ports.clockId.nextId("capsule"),
+        ));
+        return;
+      }
       case "request_model": {
         const result = await this.ports.provider.request({ run: command.run, command, signal });
         const applied = await this.apply(asEvent({
@@ -373,13 +389,19 @@ export class RuntimeV2Controller {
         await this.publishMilestoneIfEligible(
           applied.events[applied.events.length - 1],
         );
-        if (result.toolCalls.length === 0 && !String(result.visibleText || "").trim()) {
-          await this.apply(asEvent({
-            ...this.eventBase(),
-            type: "soft_signal.observed",
-            run: command.run,
-            signal: result.diagnostics.length > 0 ? "empty_response" : "no_tool_call",
-          }));
+        const responseMode = String(command.payload.mode || "").trim();
+        if (
+          result.toolCalls.length === 0 &&
+          responseMode !== "conclude" &&
+          responseMode !== "chat" &&
+          responseMode !== "analyze"
+        ) {
+          await this.applySoftSignal(
+            !String(result.visibleText || "").trim() ||
+                result.diagnostics.length > 0
+              ? "empty_response"
+              : "no_tool_call",
+          );
         }
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
         return;
@@ -387,27 +409,20 @@ export class RuntimeV2Controller {
       case "execute_tool": {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
         let rebased = this.rebasePortEvent(event);
-        const repeatedSourceEvidence = repeatsCommittedSourceEvidence(
-          this.requireAggregate(),
-          rebased,
-          command,
-        );
+        const repeatedSourceEvidence =
+          repeatsCommittedRuntimeV2SourceEvidence({
+            aggregate: this.requireAggregate(),
+            event: rebased,
+            command,
+          });
         if (await this.openRecoveryEpochForCorrectiveEvidence(rebased)) {
           rebased = this.rebasePortEvent(event);
         }
         await this.apply(rebased);
         if (
-          repeatedSourceEvidence &&
-          !this.requireAggregate().events.some((item) =>
-            item.type === "soft_signal.observed" && item.signal === "repeat"
-          )
+          repeatedSourceEvidence
         ) {
-          await this.apply(asEvent({
-            ...this.eventBase(),
-            type: "soft_signal.observed",
-            run: command.run,
-            signal: "repeat",
-          }));
+          await this.applySoftSignal("repeat");
         }
         await this.recordSemanticFailureIfNeeded(command, rebased);
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
@@ -511,6 +526,49 @@ export class RuntimeV2Controller {
     return true;
   }
 
+  /** v3 migration fence: discard an unresumable scheduled effect without
+   * executing it. The caller must then drive an explicit truthful terminal
+   * result; this method never manufactures new mutation authority. */
+  async discardScheduledForMigration(): Promise<void> {
+    const state = this.requireAggregate();
+    for (const command of [...state.scheduledCommands]) {
+      await this.settleScheduledCommand(command, "failed");
+    }
+  }
+
+  /** An unmodified v3 Execute may continue, but none of its pre-contract
+   * effects survive migration. Re-enter observing through legal phase edges
+   * so the provider must collect current evidence and commit v4 authority
+   * before any mutation can run. */
+  async reobserveAfterLegacyMigration(): Promise<void> {
+    await this.discardScheduledForMigration();
+    let state = this.requireAggregate();
+    if (state.phase === "observing") return;
+    if (
+      state.phase === "validating" ||
+      state.phase === "planning" ||
+      state.phase === "reviewing"
+    ) {
+      await this.changePhase(
+        "acting",
+        "v3 migration discarded pre-contract effects before rebuilding execution authority.",
+      );
+      state = this.requireAggregate();
+    }
+    if (state.phase === "preparing" || state.phase === "acting") {
+      await this.changePhase(
+        "observing",
+        "v3 migration requires fresh observation and an execution contract.",
+      );
+      return;
+    }
+    if (state.phase !== "observing") {
+      throw new Error(
+        `RUNTIME_V2_V3_MIGRATION_PHASE_UNRECOVERABLE:${state.phase}`,
+      );
+    }
+  }
+
   private async settleScheduledCommand(
     command: RuntimeV2Command,
     status: "succeeded" | "failed" | "canceled",
@@ -527,149 +585,96 @@ export class RuntimeV2Controller {
   }
 
   private async handleCommandFailure(command: RuntimeV2Command, error: unknown): Promise<void> {
-    const message = error instanceof Error ? error.message : String(error || "Runtime v2 command failed.");
     await this.settleScheduledCommand(command, "failed");
     const state = this.requireAggregate();
     if (!state.run || state.terminalOutcome) return;
-    const scope = runtimeV2RecoveryScopeForCommandFailure(command, error);
-    const fingerprint = `${scope}:${runtimeV2ActionFingerprint(command)}`;
-    if (canRecordRuntimeV2Recovery(state.recovery, scope, fingerprint)) {
+    const decision = decideRuntimeV2CommandFailureRecovery({
+      aggregate: state,
+      command,
+      error,
+    });
+    if (decision.kind === "signal") {
+      if (command.kind === "commit_execution_contract") {
+        await this.apply(asEvent({
+          ...this.eventBase(), type: "execution_contract.rejected",
+          run: state.run.identity, reason:
+            (error instanceof Error ? error.message : String(error))
+              .trim().slice(0, 1_000),
+        }));
+      }
+      await this.applySoftSignal(decision.signal);
+    } else if (decision.kind === "record") {
       await this.apply(asEvent({
         ...this.eventBase(),
         type: "recovery.recorded",
         run: state.run.identity,
-        scope,
-        fingerprint,
+        scope: decision.scope,
+        fingerprint: decision.fingerprint,
       }));
-      await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
+    } else {
+      await this.apply(asEvent({
+        ...this.eventBase(),
+        type: "recovery.exhausted",
+        run: state.run.identity,
+        scope: decision.scope,
+        fingerprint: decision.fingerprint,
+        reason: decision.reason,
+      }));
       return;
     }
-    await this.apply(asEvent({
-      ...this.eventBase(),
-      type: "recovery.exhausted",
-      run: state.run.identity,
-      scope,
-      fingerprint,
-      reason: `无法继续执行当前结构化动作：${message.slice(0, 512)}`,
-    }));
-    await this.finishTerminal(
-      scope === "transport" ? "error" : exhaustedRuntimeV2ResultKind(state),
-      scope === "transport"
-        ? "provider_transport_exhausted"
-        : "本轮已经达到可恢复重试上限；已保留已完成操作和证据，没有让任务停留在未结束状态。",
-    );
+    if (decision.publish) {
+      await this.publish(buildRuntimeV2CapsuleProjection(
+        this.requireAggregate(),
+        this.ports.clockId.nextId("capsule"),
+      ));
+    }
   }
 
   /** A backend can return a well-formed structural failure without throwing.
-   * It consumes action recovery just like a rejected promise. A validator
-   * that ran and reported an unmet acceptance condition is different: that
-   * is ordinary loop evidence and must lead back to Acting, not consume a
-   * transport/action recovery budget. */
+   * It records a retry guard just like a rejected promise. Once the same side
+   * effect reaches its guard, only that duplicate is rejected and the Turn
+   * remains active. An unmet acceptance condition is ordinary loop evidence. */
   private async recordSemanticFailureIfNeeded(
     command: RuntimeV2Command,
     event: RuntimeV2Event,
   ): Promise<void> {
-    const toolFailed =
-      event.type === "tool.completed" && event.status !== "succeeded";
-    const validationStructurallyFailed =
-      event.type === "validation.completed" &&
-      !event.passed &&
-      (
-        event.failureKind === "protocol_invalid" ||
-        event.failureKind === "not_authorized"
-      );
-    if (!toolFailed && !validationStructurallyFailed) return;
     const state = this.requireAggregate();
     if (!state.run || state.terminalOutcome) return;
-    const scope: RuntimeV2RecoveryScope = "action";
-    const fingerprint = `${scope}:${runtimeV2ActionFingerprint(command)}`;
-    if (canRecordRuntimeV2Recovery(state.recovery, scope, fingerprint)) {
+    const decision = decideRuntimeV2SemanticFailureRecovery({
+      aggregate: state,
+      command,
+      event,
+    });
+    if (!decision) return;
+    if (decision.kind === "record") {
       await this.apply(asEvent({
         ...this.eventBase(),
         type: "recovery.recorded",
         run: state.run.identity,
-        scope,
-        fingerprint,
+        scope: decision.scope,
+        fingerprint: decision.fingerprint,
       }));
       return;
     }
-    await this.apply(asEvent({
-      ...this.eventBase(),
-      type: "recovery.exhausted",
-      run: state.run.identity,
-      scope,
-      fingerprint,
-      reason: "当前工具动作已重复失败，已停止重复执行并准备以部分结果收口。",
-    }));
+    await this.applySoftSignal("repeated_action");
   }
 
   private async openRecoveryEpochForCorrectiveEvidence(
     event: RuntimeV2Event,
   ): Promise<boolean> {
     const state = this.requireAggregate();
-    if (
-      !state.run ||
-      state.recovery.exhausted ||
-      event.type !== "tool.completed" ||
-      event.status !== "succeeded"
-    ) {
-      return false;
-    }
-    const currentEpochHasFailure = state.recovery.receipts.some(
-      (receipt) => receipt.epoch === state.recovery.epoch,
-    );
-    const mutationEvidence = event.evidence.filter(
-      (evidence) => evidence.kind === "mutation",
-    );
-    const sourceEvidence = event.evidence.filter(
-      (evidence) => evidence.kind === "source",
-    );
-    const epochBoundary = state.events.map((candidate) => candidate.type)
-      .lastIndexOf("recovery.epoch_opened");
-    const epochEvents = state.events.slice(epochBoundary + 1);
-    let latestRecoverableFailureIndex = -1;
-    for (let index = epochEvents.length - 1; index >= 0; index -= 1) {
-      const candidate = epochEvents[index]!;
-      if (
-        candidate.type === "tool.completed" &&
-        candidate.status !== "succeeded" &&
-        (
-          candidate.failureKind === "mutation_rejected" ||
-          candidate.failureKind === "source_mismatch"
-        )
-      ) {
-        latestRecoverableFailureIndex = index;
-        break;
-      }
-    }
-    const latestRecoverableEditFailure =
-      latestRecoverableFailureIndex >= 0 &&
-      !epochEvents.slice(latestRecoverableFailureIndex + 1).some(
-        (candidate) =>
-          candidate.type === "tool.completed" &&
-          candidate.status === "succeeded" &&
-          candidate.evidence.some((evidence) => evidence.kind === "source"),
-      );
-    const recoveryEvidence = mutationEvidence.length > 0
-      ? mutationEvidence
-      : latestRecoverableEditFailure && sourceEvidence.length > 0
-        ? sourceEvidence
-        : [];
-    if (
-      !currentEpochHasFailure ||
-      recoveryEvidence.length === 0 ||
-      !canOpenRuntimeV2RecoveryEpoch(state.recovery)
-    ) {
-      return false;
-    }
+    if (!state.run) return false;
+    const recovery = deriveRuntimeV2CorrectiveRecoveryEpoch({
+      aggregate: state,
+      event,
+    });
+    if (!recovery) return false;
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "recovery.epoch_opened",
       run: state.run.identity,
-      reason: mutationEvidence.length > 0
-        ? "corrective_mutation_committed_after_recoverable_failure"
-        : "corrective_source_refreshed_after_rejected_mutation",
-      evidence: recoveryEvidence,
+      reason: recovery.reason,
+      evidence: recovery.evidence,
     }));
     return true;
   }
@@ -677,6 +682,10 @@ export class RuntimeV2Controller {
   private async publish(projection: ReturnType<typeof buildRuntimeV2CapsuleProjection>): Promise<void> {
     const state = this.requireAggregate();
     if (!state.run) return;
+    if (repeatsRuntimeV2ProjectionInCurrentPhase({
+      aggregate: state,
+      projection,
+    })) return;
     const event = asEvent({
       ...this.eventBase(),
       type: "projection.published",
@@ -723,7 +732,7 @@ export class RuntimeV2Controller {
     await this.finishTerminal(resultKind, reason, finalMarkdown);
   }
 
-  private async finishTerminal(
+  async finishTerminal(
     resultKind: RuntimeV2ResultKind,
     reason: string,
     finalMarkdown?: string,

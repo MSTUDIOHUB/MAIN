@@ -1,6 +1,6 @@
 export const RUNTIME_V2_ENGINE_VERSION = "v2" as const;
 export const RUNTIME_V2_EVENT_SCHEMA_VERSION = "runtime-v2-event.v1" as const;
-export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v3" as const;
+export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v4" as const;
 
 export type RuntimeEngineVersion = "legacy" | typeof RUNTIME_V2_ENGINE_VERSION;
 
@@ -32,6 +32,7 @@ export type RuntimeV2ProjectionAudience =
 export type RuntimeV2CommandKind =
   | "collect_observation"
   | "request_model"
+  | "commit_execution_contract"
   | "execute_tool"
   | "execute_validation"
   | "schedule_subagents"
@@ -88,6 +89,15 @@ export interface RuntimeV2Objective {
   readonly text: string;
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly string[];
+  /** Stable runtime-owned identities. Goal slices preserve their original
+   * criterion ids; direct Execute uses one id for the complete user request. */
+  readonly acceptanceCriterionIds?: readonly string[];
+  /** Runtime-owned lower bound. A provider may request stronger evidence in
+   * the execution contract, but it cannot downgrade a user-visible objective
+   * to a static build receipt. */
+  readonly acceptanceEvidenceRequirements?: readonly (
+    "static" | "behavioral" | "interaction"
+  )[];
 }
 
 export interface RuntimeV2EvidenceReference {
@@ -95,6 +105,16 @@ export interface RuntimeV2EvidenceReference {
   readonly kind: "source" | "tool" | "mutation" | "validation" | "subagent" | "user";
   readonly target: string;
   readonly version: string | null;
+}
+
+export interface RuntimeV2ExecutionValidationAuthority {
+  readonly kind: "execution_contract" | "work_plan";
+  readonly id: string;
+  readonly revision: number;
+  readonly digest: string;
+  readonly validationId: string;
+  readonly criterionIds: readonly string[];
+  readonly targetPaths: readonly string[];
 }
 
 /**
@@ -197,8 +217,8 @@ export type RuntimeV2SubagentStatus =
   | "failed"
   | "canceled";
 
-/** Read-only child contract for the first collaboration slice. A child never
- * receives mutation authority and its result is evidence, not parent state. */
+/** Read-only child contract available throughout the parent lifecycle. A child
+ * never receives mutation authority and its result is evidence, not state. */
 export interface RuntimeV2SubagentJob {
   readonly id: string;
   readonly run: RuntimeV2RunIdentity;
@@ -206,6 +226,7 @@ export interface RuntimeV2SubagentJob {
   /** Exact provider tool call that created this one-shot job. */
   readonly sourceToolCallId?: string;
   readonly scopeKey: string;
+  readonly taskKind?: "explore" | "review" | "validate";
   /** Provider-selected presentation identity and role. */
   readonly name?: string;
   readonly role?: string;
@@ -218,6 +239,7 @@ export interface RuntimeV2SubagentJob {
   readonly firstTokenAt: number | null;
   readonly closedAt: number | null;
   readonly summary: string | null;
+  readonly report?: import("./subagentReport").RuntimeV2SubagentReportV1 | null;
 }
 
 export interface RuntimeV2SubagentTelemetry {

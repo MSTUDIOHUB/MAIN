@@ -2,6 +2,7 @@ import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Command } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 
 export type RuntimeV2ExecutePhaseTransition =
   | {
@@ -28,8 +29,6 @@ export interface RuntimeV2ExecutePhaseTransitionInput {
    */
   readonly isMutationToolName: (toolName: string) => boolean;
 }
-
-const TERMINAL_CHILD_STATUSES = new Set(["completed", "failed", "canceled"]);
 
 export function hasCompletedRuntimeV2InitialObservation(
   state: TurnAggregateV1,
@@ -143,18 +142,13 @@ function failedValidationSummarySinceLastPass(
     const event = events[index]!;
     if (event.type !== "validation.completed") continue;
     if (event.passed) break;
-    if (
-      event.failureKind !== "not_authorized" &&
-      event.failureKind !== "protocol_invalid"
-    ) {
-      count += 1;
-      const fingerprint = validationFailureFingerprint(event);
-      if (!latestFingerprint) latestFingerprint = fingerprint;
-      if (countingStalled && fingerprint === latestFingerprint) {
-        stalled += 1;
-      } else {
-        countingStalled = false;
-      }
+    count += 1;
+    const fingerprint = validationFailureFingerprint(event);
+    if (!latestFingerprint) latestFingerprint = fingerprint;
+    if (countingStalled && fingerprint === latestFingerprint) {
+      stalled += 1;
+    } else {
+      countingStalled = false;
     }
   }
   return { total: count, stalled };
@@ -240,10 +234,15 @@ export function decideRuntimeV2ExecutePhaseTransition(
   const pendingMutation = state.pendingToolCalls.some((call) =>
     input.isMutationToolName(call.name)
   );
-  const childrenSettled = state.subagents.every((job) =>
-    TERMINAL_CHILD_STATUSES.has(job.status)
-  );
-  if (state.phase === "observing" && pendingMutation && childrenSettled) {
+  const hasExecutionAuthority =
+    state.strategy === "plan"
+      ? state.workPlan?.status === "approved"
+      : state.executionContract?.status === "active";
+  if (
+    state.phase === "observing" &&
+    pendingMutation &&
+    hasExecutionAuthority
+  ) {
     return {
       from: "observing",
       to: "acting",
@@ -256,7 +255,11 @@ export function decideRuntimeV2ExecutePhaseTransition(
 
   if (state.phase === "observing") {
     const parentResponded = phaseEvents.some((event) => event.type === "provider.responded");
-    if (state.evidence.length > 0 && parentResponded && childrenSettled) {
+    if (
+      state.evidence.length > 0 &&
+      parentResponded &&
+      hasExecutionAuthority
+    ) {
       return {
         from: "observing",
         to: "acting",
@@ -272,9 +275,14 @@ export function decideRuntimeV2ExecutePhaseTransition(
     const approvedPlanCoverage = state.strategy === "plan"
       ? deriveRuntimeV2PlanExecutionCoverage(state)
       : null;
+    const executionContractCoverage = state.strategy === "execute"
+      ? deriveRuntimeV2ExecutionContractCoverage(state)
+      : null;
     const mutationBoundarySatisfied = approvedPlanCoverage
       ? approvedPlanCoverage.allMutationTargetsCovered
-      : true;
+      : executionContractCoverage
+        ? executionContractCoverage.missingMutationTargets.length === 0
+        : false;
     if (currentPhaseMutationCount > 0 && mutationBoundarySatisfied) {
     return {
       from: "acting",
@@ -286,12 +294,7 @@ export function decideRuntimeV2ExecutePhaseTransition(
 
   if (state.phase === "validating") {
     const validation = latestValidation(phaseEvents);
-    if (
-      validation &&
-      !validation.passed &&
-      validation.failureKind !== "not_authorized" &&
-      validation.failureKind !== "protocol_invalid"
-    ) {
+    if (validation && !validation.passed) {
       return {
         from: "validating",
         to: "acting",

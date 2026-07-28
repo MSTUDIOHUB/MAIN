@@ -8783,6 +8783,11 @@ function seedRealOmlxPlanFlowScenario() {
       const telemetryEvents = runtimeV2Events.filter((event: any) =>
         event.type === "subagent.telemetry" && event.telemetry?.jobId === job.id
       );
+      const spawnCommand = runtimeV2Events.find((event: any) =>
+        event.type === "command.scheduled" &&
+        event.command?.kind === "schedule_subagents" &&
+        event.command?.payload?.toolCallId === job.sourceToolCallId
+      );
       const telemetryAt = (phase: string) =>
         telemetryEvents.find((event: any) => event.telemetry?.phase === phase)?.telemetry?.at || null;
       return {
@@ -8791,6 +8796,7 @@ function seedRealOmlxPlanFlowScenario() {
         sourceToolCallId: job.sourceToolCallId || "",
         name: job.name || "",
         role: job.role || "",
+        taskKind: job.taskKind || "explore",
         objective: job.objective || "",
         successCriteria: job.successCriteria || "",
         status: job.status,
@@ -8799,6 +8805,8 @@ function seedRealOmlxPlanFlowScenario() {
         requestOpenedAt: telemetryAt("request_opened"),
         firstTokenAt: telemetryAt("first_token") || job.firstTokenAt || null,
         closedAt: telemetryAt("closed") || job.closedAt || null,
+        startedInPhase: spawnCommand?.command?.phase || null,
+        reportSubmitted: !!job.report,
       };
     });
     const runtimeV2SubagentIntervals = runtimeV2SubagentTelemetry
@@ -9008,6 +9016,11 @@ function seedRealOmlxPlanFlowScenario() {
               idempotencyKey: event.idempotencyKey,
               passed: event.passed,
               evidence: event.evidence || [],
+              authority: event.authority || null,
+              mutationBoundarySequence:
+                event.mutationBoundarySequence ?? null,
+              validatedMutationVersions:
+                event.validatedMutationVersions || [],
             }
           : {}),
         ...(event.type === "subagent.telemetry"
@@ -9018,6 +9031,8 @@ function seedRealOmlxPlanFlowScenario() {
               jobId: event.jobId,
               status: event.status,
               evidence: event.evidence || [],
+              report: event.report || null,
+              validationReceipts: event.validationReceipts || [],
             }
           : {}),
         ...(event.type === "work_plan.sealed" ||
@@ -9059,6 +9074,7 @@ function seedRealOmlxPlanFlowScenario() {
       workPlan: runtimeV2Aggregate.workPlan || null,
       sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
       planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+      executionContract: runtimeV2Aggregate.executionContract || null,
       subagents: runtimeV2SubagentTelemetry,
       subagentConcurrency: {
         requestCount: runtimeV2SubagentIntervals.length,

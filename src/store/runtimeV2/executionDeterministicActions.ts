@@ -2,7 +2,6 @@ import type {
   RuntimeV2Command,
   RuntimeV2NormalizedProviderResult,
 } from "../../lib/runtime-v2";
-import { finiteValidationCommandRejection } from "./executionAuthorization";
 
 interface RuntimeV2SourceWindow {
   readonly path: string;
@@ -10,30 +9,28 @@ interface RuntimeV2SourceWindow {
   readonly endLine: number;
 }
 
-export function selectRuntimeOwnedValidationAction(input: {
+export function selectRuntimeOwnedRequiredSourceAction(input: {
   command: RuntimeV2Command;
   allowedToolNames: readonly string[];
-  preferredCommand: string;
+  target: string | null;
 }): RuntimeV2NormalizedProviderResult | null {
-  const preferredCommand = input.preferredCommand.trim();
-  if (
-    String(input.command.payload.mode || "") !== "validate" ||
-    !input.allowedToolNames.includes("run_command") ||
-    !preferredCommand ||
-    finiteValidationCommandRejection(preferredCommand)
-  ) {
+  const target = String(input.target || "").trim();
+  if (!target || !input.allowedToolNames.includes("read_file")) {
     return null;
   }
   return {
     visibleText: "",
     toolCalls: [{
-      id: `runtime-validation:${input.command.idempotencyKey}`.slice(0, 256),
-      name: "run_command",
-      arguments: { command: preferredCommand },
+      id: `runtime-required-source:${input.command.idempotencyKey}`.slice(
+        0,
+        256,
+      ),
+      name: "read_file",
+      arguments: { path: target },
     }],
     diagnostics: [{
-      code: "runtime_owned_validation",
-      message: "Runtime selected the approved finite workspace validator.",
+      code: "runtime_owned_required_source",
+      message: "Runtime selected the exact missing versioned source target.",
       retryable: false,
     }],
   };

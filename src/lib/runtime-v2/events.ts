@@ -2,6 +2,7 @@ import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
+  type RuntimeV2ExecutionValidationAuthority,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2Phase,
   type RuntimeV2Projection,
@@ -22,6 +23,14 @@ import type {
   RuntimeV2PlanReviewCommit,
   SealedWorkPlanV1,
 } from "./workPlan";
+import type {
+  RuntimeV2ExecutionContractV1,
+} from "./executionContract";
+import type { RuntimeV2SubagentReportV1 } from "./subagentReport";
+import type {
+  RuntimeV2SubagentValidationReceiptV1,
+  RuntimeV2ValidatedMutationVersion,
+} from "./validationReceipt";
 
 export interface RuntimeV2EventBase {
   readonly schemaVersion: typeof RUNTIME_V2_EVENT_SCHEMA_VERSION;
@@ -38,6 +47,10 @@ export type RuntimeV2Event =
       readonly objective: string;
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
+      readonly acceptanceCriterionIds?: readonly string[];
+      readonly acceptanceEvidenceRequirements?: readonly (
+        "static" | "behavioral" | "interaction"
+      )[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.started";
@@ -94,6 +107,14 @@ export type RuntimeV2Event =
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly passed: boolean;
       readonly presentation?: RuntimeV2ToolPresentation;
+      /** Exact authority and criterion linkage used when this validation was
+       * admitted. A receipt without it cannot prove Execute completion. */
+      readonly authority?: RuntimeV2ExecutionValidationAuthority;
+      /** Exact mutation boundary observed by the validator. Any later
+       * mutation makes this receipt stale. */
+      readonly mutationBoundarySequence?: number;
+      readonly validatedMutationVersions?:
+        readonly RuntimeV2ValidatedMutationVersion[];
       /** A protocol or authority rejection asks for a corrected validation
        * call in the same phase. Only a real execution/assertion failure
        * justifies returning to source modification. */
@@ -102,6 +123,23 @@ export type RuntimeV2Event =
         | "execution_failed"
         | "not_authorized"
         | "protocol_invalid";
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "execution_contract.committed";
+      readonly run: RuntimeV2RunIdentity;
+      readonly contract: RuntimeV2ExecutionContractV1;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "execution_contract.rejected";
+      readonly run: RuntimeV2RunIdentity;
+      readonly reason: string;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "execution_contract.invalidated";
+      readonly run: RuntimeV2RunIdentity;
+      readonly contractId: string;
+      readonly revision: number;
+      readonly reason: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "work_plan.sealed";
@@ -143,7 +181,14 @@ export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "soft_signal.observed";
       readonly run: RuntimeV2RunIdentity;
-      readonly signal: "no_tool_call" | "empty_response" | "repeat" | "context_pressure" | "iteration_limit";
+      readonly signal:
+        | "no_tool_call"
+        | "empty_response"
+        | "repeat"
+        | "context_pressure"
+        | "iteration_limit"
+        | "protocol_drift"
+        | "repeated_action";
     })
   | (RuntimeV2EventBase & {
       readonly type: "subagents.scheduled";
@@ -162,6 +207,9 @@ export type RuntimeV2Event =
       readonly status: Extract<RuntimeV2SubagentStatus, "completed" | "failed" | "canceled">;
       readonly summary: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
+      readonly report?: RuntimeV2SubagentReportV1;
+      readonly validationReceipts?:
+        readonly RuntimeV2SubagentValidationReceiptV1[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "projection.published";

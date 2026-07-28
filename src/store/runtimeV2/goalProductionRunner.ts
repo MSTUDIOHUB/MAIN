@@ -44,7 +44,6 @@ export interface RuntimeV2GoalProductionRunnerInput
 }
 
 const GOAL_SUPERVISOR_DEADLINE_MS = 24 * 60 * 60_000;
-const GOAL_LAUNCH_RECOVERY_LIMIT = 2;
 
 function currentTurn(
   state: any,
@@ -206,7 +205,7 @@ function projectGoalTerminal(
   });
 }
 
-async function recordLaunchRecoveryBoundary(input: {
+async function recordGoalLifecycleDeadline(input: {
   readonly checkpoint: RuntimeV2GoalSagaCheckpointPort;
   readonly owner: RuntimeV2GoalOwnerIdentity;
   readonly reason: string;
@@ -218,7 +217,7 @@ async function recordLaunchRecoveryBoundary(input: {
     owner: input.owner,
     expectedRevision: current.revision,
     state: recordRuntimeV2GoalBoundary(current.state, {
-      kind: "recovery_exhausted",
+      kind: "deadline_exceeded",
       reason: input.reason,
       at: input.now,
     }),
@@ -376,10 +375,9 @@ export async function runSubmitRuntimeV2Goal(
     }
 
     const supervisorStartedAt = now();
-    let launchFailures = 0;
     while (true) {
       if (now() - supervisorStartedAt >= GOAL_SUPERVISOR_DEADLINE_MS) {
-        await recordLaunchRecoveryBoundary({
+        await recordGoalLifecycleDeadline({
           checkpoint: sagaCheckpoint,
           owner: initial.owner,
           reason: "Goal supervisor lifecycle deadline reached.",
@@ -409,28 +407,26 @@ export async function runSubmitRuntimeV2Goal(
         break;
       }
       if (step.disposition === "launch_uncertain") {
-        launchFailures += 1;
         await controller.publishLiveStatus(
           input.context.phaseLanguage === "en"
             ? `The Goal slice launch is being reconciled from its durable identity.\n\n\`${step.request.sliceId}\``
             : `正在根据持久化身份核对 Goal 工作切片是否已经启动。\n\n\`${step.request.sliceId}\``,
-          `goal-launch-recovery:${step.request.sliceId}:${launchFailures}`,
+          `goal-launch-recovery:${step.request.sliceId}:${now()}`,
         );
-        if (launchFailures >= GOAL_LAUNCH_RECOVERY_LIMIT) {
-          await recordLaunchRecoveryBoundary({
-            checkpoint: sagaCheckpoint,
-            owner: initial.owner,
-            reason: `Goal slice launch could not be reconciled: ${step.error}`,
-            now: now(),
-          });
-        }
+        input.logStoreEvent("runtime_v2_goal_launch_soft_signal", {
+          turnId: identity.turn.turnId,
+          runId: identity.run.runId,
+          sliceId: step.request.sliceId,
+          signal: "protocol_drift",
+          error: step.error,
+          terminal: false,
+        });
         continue;
       }
       if (
         step.disposition === "launched" ||
         step.disposition === "resumed_launch"
       ) {
-        launchFailures = 0;
         await controller.publishMilestoneStatus(
           input.context.phaseLanguage === "en"
             ? `### Goal work slice started\n\n- Slice: \`${step.request.sliceId}\`\n- Remaining criteria: ${step.request.criteria.length}`

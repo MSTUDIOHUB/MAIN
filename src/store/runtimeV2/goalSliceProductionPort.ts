@@ -8,6 +8,7 @@ import {
   finishRuntimeV2CheckpointTerminal,
   isRuntimeV2TurnTerminallyClosed,
   normalizeRuntimeV2CheckpointMap,
+  runtimeV2GoalSliceExecuteAdmission,
   type RuntimeV2GoalSliceOutcome,
   type RuntimeV2GoalSliceRequest,
   type TurnAggregateV1,
@@ -279,9 +280,7 @@ function sliceOutcome(input: {
         ? "deadline_exceeded"
         : reachedSliceDeadline
           ? "slice_boundary"
-          : input.aggregate.recovery.exhausted
-            ? "recovery_exhausted"
-            : structurallyAccepted
+          : structurallyAccepted
               ? "objective_satisfied"
               : terminal.resultKind === "blocked"
                 ? "external_blocked"
@@ -546,6 +545,7 @@ export function createRuntimeV2GoalProductionSlicePort(
       turnInputContextSignals: normalizeTurnInputContextSignals(
         input.turnInputContextSignals,
       ),
+      executeAdmission: runtimeV2GoalSliceExecuteAdmission(request),
     };
     const execution = Promise.resolve()
       .then(() => execute({ ...input, context }))

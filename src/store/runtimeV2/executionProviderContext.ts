@@ -122,10 +122,20 @@ export function recordModelContext(
         : MAX_CONTEXT_ENTRY_CHARS,
     ),
   };
+  const preserveDistinctSourceWindows =
+    normalized.source === "tool" &&
+    normalized.label === "read_file";
   const duplicate = live.modelContext.findIndex((candidate) =>
     candidate.source === normalized.source &&
     candidate.label === normalized.label &&
-    candidate.target === normalized.target
+    candidate.target === normalized.target &&
+    (
+      !preserveDistinctSourceWindows ||
+      (
+        candidate.status === normalized.status &&
+        candidate.content === normalized.content
+      )
+    )
   );
   if (duplicate >= 0) live.modelContext.splice(duplicate, 1);
   live.modelContext.push(normalized);
@@ -138,11 +148,9 @@ export function recordModelContext(
   }
 }
 
-/** A phase-level hint, never an execution decision. Approved plans win; for
- * direct Execute turns the workspace skeleton supplies a provider-neutral
- * project-family default so weaker models do not waste validation rounds on
- * cat/grep-style observations. The command still passes the ordinary tool,
- * permission, and finite-validation contracts before it can run. */
+/** A phase-level hint sourced only from committed execution authority.
+ * Workspace manifests cannot silently promote a convenient build command
+ * into acceptance evidence. */
 export function preferredFiniteValidationCommand(
   input: RuntimeV2ExecutionPortsInput,
 ): string {
@@ -154,28 +162,13 @@ export function preferredFiniteValidationCommand(
   );
   const approvedCommand = String(approvedValidation?.command || "").trim();
   if (approvedCommand) return approvedCommand;
-
-  const overview = input.live.workspaceOverview.toLowerCase();
-  // Prefer the root package family before nested manifests. Desktop and
-  // monorepo workspaces commonly contain Cargo.toml, go.mod, or Gradle files
-  // below a package.json-owned root; choosing the nested checker would only
-  // validate one implementation layer rather than the product build.
-  if (/(?:^|[/\s])(?:bun\.lockb?|bun\.lock)\b/.test(overview)) {
-    return "bun run build";
-  }
-  if (/(?:^|[/\s])pnpm-lock\.yaml\b/.test(overview)) return "pnpm run build";
-  if (/(?:^|[/\s])yarn\.lock\b/.test(overview)) return "yarn build";
-  if (/(?:^|[/\s])package\.json\b/.test(overview)) return "npm run build";
-  if (/(?:^|[/\s])cargo\.toml\b/.test(overview)) return "cargo check";
-  if (/(?:^|[/\s])go\.mod\b/.test(overview)) return "go test ./...";
-  if (/(?:^|[/\s])(?:pyproject\.toml|pytest\.ini|tox\.ini)\b/.test(overview)) {
-    return "python -m pytest";
-  }
-  if (/(?:^|[/\s])(?:gradlew|build\.gradle(?:\.kts)?)\b/.test(overview)) {
-    return "./gradlew check";
-  }
-  if (/(?:^|[/\s])(?:mvnw|pom\.xml)\b/.test(overview)) return "./mvnw test";
-  return "";
+  const contractValidation =
+    aggregateForCurrentTurn(input)?.executionContract?.validations.find(
+      (validation) =>
+        validation.kind === "finite_command" &&
+        String(validation.command || "").trim(),
+    );
+  return String(contractValidation?.command || "").trim();
 }
 
 function latestIndex(

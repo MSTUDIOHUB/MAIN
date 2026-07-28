@@ -227,7 +227,7 @@ function historicalTerminal(
   if (runtime.status === "budget_exceeded") {
     return {
       resultKind: "partial",
-      reasonCode: "recovery_exhausted",
+      reasonCode: "resource_budget_exhausted",
       reason: runtime.pauseReason || runtime.progress.lastStopReason ||
         "Read-only migration of a historically incomplete Goal.",
       completedAt: at,

@@ -9,10 +9,16 @@ import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Event } from "./events";
 import { tryTransition } from "./reducer";
 
-export const MAX_RUNTIME_V2_CHECKPOINT_EVENTS = 512;
-export const MAX_RUNTIME_V2_CHECKPOINT_CHARS = 1_048_576;
+/** The durable envelope must outlive the 10-minute Execute lifecycle. The
+ * former 512-event ceiling could be reached in roughly half that time by
+ * ordinary provider/tool/projection receipts, turning persistence into an
+ * accidental lifecycle owner. */
+export const MAX_RUNTIME_V2_CHECKPOINT_EVENTS = 2_048;
+export const MAX_RUNTIME_V2_CHECKPOINT_CHARS = 8_388_608;
+export const RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION =
+  "turn-runtime-checkpoint.v3" as const;
 
-export interface RuntimeV2CheckpointV3 {
+export interface RuntimeV2CheckpointV4 {
   readonly schemaVersion: typeof RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION;
   readonly engineVersion: typeof RUNTIME_V2_ENGINE_VERSION;
   readonly revision: number;
@@ -23,7 +29,16 @@ export interface RuntimeV2CheckpointV3 {
   readonly scheduledCommands: readonly RuntimeV2Command[];
   readonly aggregateDigest: string;
   readonly updatedAt: number;
+  readonly migratedFrom?:
+    typeof RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION;
+  readonly migrationDisposition?:
+    | "terminal_read_only"
+    | "active_unmodified"
+    | "active_uncontracted_mutation";
 }
+
+/** Compatibility alias for store adapters that shipped with the v3 name. */
+export type RuntimeV2CheckpointV3 = RuntimeV2CheckpointV4;
 
 export type RuntimeV2CheckpointMap = Record<string, RuntimeV2CheckpointV3>;
 
@@ -99,7 +114,10 @@ function hasValidCheckpointHeader(
   updatedAt: number;
   owner: RuntimeV2TurnIdentity;
 } {
-  return value.schemaVersion === RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION &&
+  return (
+      value.schemaVersion === RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION ||
+      value.schemaVersion === RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
+    ) &&
     value.engineVersion === RUNTIME_V2_ENGINE_VERSION &&
     isFinitePositiveInteger(value.revision) &&
     isFiniteTimestamp(value.updatedAt) &&
@@ -153,6 +171,143 @@ export function createRuntimeV2Checkpoint(
   return checkpoint;
 }
 
+function migratedObjective(
+  aggregate: TurnAggregateV1,
+): TurnAggregateV1["objective"] {
+  const criteria = aggregate.objective.acceptanceCriteria.length > 0
+    ? aggregate.objective.acceptanceCriteria
+    : aggregate.strategy === "execute"
+      ? [aggregate.objective.text]
+      : [];
+  const ids = aggregate.objective.acceptanceCriterionIds?.length ===
+      criteria.length
+    ? aggregate.objective.acceptanceCriterionIds
+    : criteria.map((_, index) =>
+        aggregate.strategy === "execute" && criteria.length === 1
+          ? "criterion-user-objective"
+          : `criterion-${index + 1}`
+      );
+  return {
+    ...aggregate.objective,
+    acceptanceCriteria: criteria,
+    acceptanceCriterionIds: ids,
+  };
+}
+
+function normalizeLegacyActiveEvents(
+  events: readonly RuntimeV2Event[],
+): readonly RuntimeV2Event[] {
+  return events.map((event) => {
+    if (event.type === "turn.admitted") {
+      const acceptanceCriteria = event.acceptanceCriteria.length > 0
+        ? event.acceptanceCriteria
+        : event.strategy === "execute"
+          ? [event.objective]
+          : [];
+      return {
+        ...event,
+        acceptanceCriteria,
+        acceptanceCriterionIds:
+          event.acceptanceCriterionIds?.length ===
+              acceptanceCriteria.length
+            ? event.acceptanceCriterionIds
+            : acceptanceCriteria.map((_, index) =>
+                event.strategy === "execute" &&
+                    acceptanceCriteria.length === 1
+                  ? "criterion-user-objective"
+                  : `criterion-${index + 1}`
+              ),
+      };
+    }
+    if (
+      event.type === "subagent.completed" &&
+      event.status === "completed" &&
+      !event.report
+    ) {
+      return {
+        ...event,
+        status: "failed",
+        summary:
+          "Legacy child result lacked a structured evidence-linked report and was not migrated as completed.",
+      };
+    }
+    return event;
+  });
+}
+
+function normalizeLegacyRuntimeV2Checkpoint(
+  value: Record<string, unknown> & {
+    readonly revision: number;
+    readonly updatedAt: number;
+  },
+  owner: RuntimeV2TurnIdentity,
+): RuntimeV2CheckpointV4 | null {
+  if (
+    !isPlainRecord(value.aggregate) ||
+    !Array.isArray(value.events) ||
+    !Array.isArray(value.scheduledCommands)
+  ) {
+    return null;
+  }
+  const rawAggregate = value.aggregate as unknown as TurnAggregateV1;
+  if (
+    !sameOwner(rawAggregate.turn, owner) ||
+    !sameJson(rawAggregate.events, value.events) ||
+    !sameJson(rawAggregate.scheduledCommands, value.scheduledCommands) ||
+    value.aggregateDigest !== runtimeV2AggregateDigest(rawAggregate) ||
+    value.updatedAt < rawAggregate.updatedAt
+  ) {
+    return null;
+  }
+  const hasMutation = rawAggregate.evidence.some(
+    (evidence) => evidence.kind === "mutation",
+  );
+  if (rawAggregate.terminalOutcome) {
+    const aggregate: TurnAggregateV1 = {
+      ...rawAggregate,
+      objective: migratedObjective(rawAggregate),
+      executionContract: rawAggregate.executionContract || null,
+    };
+    const normalized: RuntimeV2CheckpointV4 = {
+      schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
+      engineVersion: RUNTIME_V2_ENGINE_VERSION,
+      revision: value.revision,
+      owner,
+      aggregate,
+      events: aggregate.events,
+      scheduledCommands: aggregate.scheduledCommands,
+      aggregateDigest: runtimeV2AggregateDigest(aggregate),
+      updatedAt: value.updatedAt,
+      migratedFrom: RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION,
+      migrationDisposition: "terminal_read_only",
+    };
+    trustedRuntimeV2Checkpoints.add(normalized);
+    return normalized;
+  }
+  const events = normalizeLegacyActiveEvents(
+    value.events as RuntimeV2Event[],
+  );
+  const replayed = replayRuntimeV2Events(events);
+  if (!replayed || !sameOwner(replayed.turn, owner)) return null;
+  const normalized: RuntimeV2CheckpointV4 = {
+    schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
+    engineVersion: RUNTIME_V2_ENGINE_VERSION,
+    revision: value.revision,
+    owner,
+    aggregate: replayed,
+    events: replayed.events,
+    scheduledCommands: replayed.scheduledCommands,
+    aggregateDigest: runtimeV2AggregateDigest(replayed),
+    updatedAt: Math.max(value.updatedAt, replayed.updatedAt),
+    migratedFrom: RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION,
+    migrationDisposition: hasMutation
+      ? "active_uncontracted_mutation"
+      : "active_unmodified",
+  };
+  trustedRuntimeV2Checkpoints.add(normalized);
+  return normalized;
+}
+
 /**
  * Validate a persisted checkpoint by replay. No legacy/unknown checkpoint is
  * coerced into v3; history remains readable through its original adapter.
@@ -172,6 +327,12 @@ export function normalizeRuntimeV2Checkpoint(
     return null;
   }
   const owner = value.owner as unknown as RuntimeV2TurnIdentity;
+  if (
+    value.schemaVersion ===
+      RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
+  ) {
+    return normalizeLegacyRuntimeV2Checkpoint(value, owner);
+  }
   if (!Array.isArray(value.events)) return null;
   const replayed = replayRuntimeV2Events(value.events as RuntimeV2Event[]);
   if (!replayed || !sameOwner(replayed.turn, owner)) return null;

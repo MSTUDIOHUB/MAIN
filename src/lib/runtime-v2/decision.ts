@@ -3,11 +3,42 @@ import { exhaustedRuntimeV2ResultKind } from "./completion";
 import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
+  RuntimeV2ExecutionValidationAuthority,
   RuntimeV2RecoveryScope,
   RuntimeV2ResultKind,
 } from "./contracts";
 import { RUNTIME_V2_RECOVERY_LIMITS, runtimeV2ActionFingerprint } from "./recovery";
-import { MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS } from "./subagents";
+import {
+  MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS,
+  resolveRuntimeV2SubagentReferences,
+  runtimeV2SubagentModelHandle,
+} from "./subagents";
+import {
+  resolveRuntimeV2ExecutionContractValidation,
+  runtimeV2ExecutionValidationAuthority,
+} from "./executionContract";
+import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
+import {
+  activeRuntimeV2ExecutionContractDraft as activeExecutionContractDraft,
+  currentRuntimeV2PhaseEvents as currentPhaseEvents,
+  latestRuntimeV2BrowserValidationTarget as latestBrowserValidationTarget,
+  latestRuntimeV2ExecutionContractRejection as latestExecutionContractRejection,
+  latestRuntimeV2RepeatedSourceTarget as latestRepeatedSourceTarget,
+  requiredRuntimeV2ExecutionContractSourceTarget as requiredExecutionContractSourceTarget,
+  requiredRuntimeV2MutationSourceTarget as requiredMutationSourceTarget,
+  runtimeV2ActingExecutePolicy as actingExecutePolicy,
+  runtimeV2ActingMutationProgressionRequired as actingMutationProgressionRequired,
+  runtimeV2ExecutionEvidenceCatalog as executionEvidenceCatalog,
+  runtimeV2ObservationContractRequired as observationContractRequired,
+  runtimeV2ValidationParentTakeoverReadRequired as validationParentTakeoverReadRequired,
+} from "./executionDecisionPolicy";
+import {
+  deriveRuntimeV2PlanExecutionCoverage,
+  resolveRuntimeV2PlanValidationScope,
+  runtimeV2PlanValidationAuthority,
+} from "./planExecution";
+import { isRuntimeV2WorkspaceReadToolName } from "./workspaceReadPolicy";
+import { workspacePathsReferToSameFile } from "../workspacePaths";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -39,14 +70,82 @@ function commaSeparatedValues(value: unknown): string[] {
     .slice(0, MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS);
 }
 
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.entries(value as Record<string, unknown>)
-    .filter(([key]) => key !== "actionFingerprint" && key !== "attempt")
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
-    .join(",")}}`;
+function collaborationPayload(
+  state: TurnAggregateV1,
+  input: RuntimeV2DecisionInput,
+): Readonly<Record<string, unknown>> {
+  const collaborationAllowed =
+    input.subagentPreference === "allowed" ||
+    input.subagentPreference === "preferred";
+  const activeSubagents = state.subagents
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map((job) => ({
+      id: runtimeV2SubagentModelHandle(job),
+      name: job.name || job.scopeKey,
+      objective: job.objective,
+    }));
+  const failedSubagents = state.subagents
+    .filter((job) => job.status === "failed")
+    .slice(-MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS)
+    .map((job) => ({
+      id: runtimeV2SubagentModelHandle(job),
+      name: job.name || job.scopeKey,
+      objective: job.objective,
+      summary: job.summary || "No structured report was committed.",
+    }));
+  const failedCommandKeys = new Set(state.events.flatMap((event) =>
+    event.type === "command.completed" && event.status === "failed"
+      ? [event.idempotencyKey]
+      : []
+  ));
+  let latestCollaborationFailureIndex = -1;
+  state.events.forEach((event, index) => {
+    if (
+      (
+        event.type === "subagent.completed" &&
+        event.status === "failed"
+      ) ||
+      (
+        event.type === "command.scheduled" &&
+        event.command.kind === "schedule_subagents" &&
+        failedCommandKeys.has(event.command.idempotencyKey)
+      )
+    ) {
+      latestCollaborationFailureIndex = index;
+    }
+  });
+  const parentProgressAfterFailure =
+    latestCollaborationFailureIndex >= 0 &&
+    state.events.slice(latestCollaborationFailureIndex + 1).some((event) =>
+      (
+        event.type === "tool.completed" &&
+        event.status === "succeeded" &&
+        event.evidence.length > 0
+      ) ||
+      event.type === "execution_contract.committed"
+    );
+  const parentTakeoverRequired =
+    latestCollaborationFailureIndex >= 0 &&
+    !parentProgressAfterFailure;
+  return {
+    collaborationAllowed,
+    collaborationPreferred:
+      input.subagentPreference === "preferred",
+    collaborationAction:
+      activeSubagents.length > 0
+        ? "children_active"
+        : parentTakeoverRequired
+          ? "parent_takeover_required"
+          : "optional",
+    activeSubagents,
+    failedSubagents,
+    remainingSubagentCapacity: Math.max(
+      0,
+      parentTakeoverRequired
+        ? 0
+        : MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - activeSubagents.length,
+    ),
+  };
 }
 
 function actionFingerprint(
@@ -54,12 +153,14 @@ function actionFingerprint(
   kind: RuntimeV2CommandKind,
   payload: Readonly<Record<string, unknown>>,
 ): string {
-  // Provider tool-call ids are transport-local and change every time a model
-  // retries the same request. They must not open an unbounded new recovery
-  // lineage for an otherwise identical action.
-  const structuralPayload = { ...payload };
-  delete structuralPayload.toolCallId;
-  return `${state.phase}:${kind}:${canonical(structuralPayload)}`.slice(0, 4_096);
+  if (state.phase === "completed") {
+    throw new Error("Cannot fingerprint a command for a completed Runtime v2 Run.");
+  }
+  return runtimeV2ActionFingerprint({
+    kind,
+    phase: state.phase,
+    payload,
+  });
 }
 
 function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
@@ -78,125 +179,48 @@ function failedActionAttemptCount(state: TurnAggregateV1, fingerprint: string): 
   ).length;
 }
 
-function currentPhaseEvents(state: TurnAggregateV1) {
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (
-      (event.type === "phase.changed" && event.phase === state.phase) ||
-      (event.type === "run.started" && event.phase === state.phase)
-    ) {
-      return state.events.slice(index + 1);
-    }
-  }
-  return state.events;
-}
-
-/**
- * Acting permits a small, ledger-bounded source-gap pass. Once two source
- * operations have succeeded (or the current phase repeats the same source),
- * the next provider request must choose from mutation capabilities. A global
- * iteration-pressure signal must not remove reads from a newly opened
- * corrective phase after validation exposed fresh source gaps.
- * This is a process-stage policy, not a model- or wording-specific heuristic.
- */
-function actingExecutePolicy(
+function successfulSourceActionAttemptCount(
   state: TurnAggregateV1,
-):
-  | "source_refresh_required"
-  | "source_reorientation_required"
-  | "source_gap_allowed"
-  | "mutation_required" {
-  const phaseEvents = currentPhaseEvents(state);
-  const isSuccessfulSourceOperation = (event: (typeof phaseEvents)[number]) =>
+  fingerprint: string,
+): number {
+  const commandKeys = new Set(state.completedCommands
+    .filter((receipt) =>
+      receipt.actionFingerprint === fingerprint &&
+      receipt.status === "succeeded"
+    )
+    .map((receipt) => receipt.idempotencyKey));
+  if (commandKeys.size === 0) return 0;
+  return state.events.filter((event) =>
     event.type === "tool.completed" &&
     event.status === "succeeded" &&
+    commandKeys.has(event.idempotencyKey) &&
     event.evidence.length > 0 &&
-    event.evidence.every((evidence) => evidence.kind === "source");
-  const successfulSourceOperations = phaseEvents.filter(
-    isSuccessfulSourceOperation,
+    event.evidence.every((evidence) => evidence.kind === "source")
   ).length;
-  const pressureObserved = phaseEvents.some((event) =>
-    event.type === "soft_signal.observed" &&
-    event.signal === "repeat"
-  );
-  let latestRecoveryFailureIndex = -1;
-  let latestRecoveryFailureKind:
-    | "mutation_rejected"
-    | "source_mismatch"
-    | "target_invalid"
-    | null = null;
-  for (let index = phaseEvents.length - 1; index >= 0; index -= 1) {
-    const event = phaseEvents[index]!;
-    if (
-      event.type === "tool.completed" &&
-      event.status !== "succeeded" &&
-      (
-        event.failureKind === "mutation_rejected" ||
-        event.failureKind === "source_mismatch" ||
-        event.failureKind === "target_invalid"
-      )
-    ) {
-      latestRecoveryFailureIndex = index;
-      latestRecoveryFailureKind = event.failureKind;
-      break;
-    }
-  }
-  if (latestRecoveryFailureIndex >= 0) {
-    const refreshedSourceOperations = phaseEvents
-      .slice(latestRecoveryFailureIndex + 1)
-      .filter(isSuccessfulSourceOperation)
-      .length;
-    if (
-      latestRecoveryFailureKind === "source_mismatch" ||
-      latestRecoveryFailureKind === "mutation_rejected"
-    ) {
-      return refreshedSourceOperations > 0
-        ? "mutation_required"
-        : "source_refresh_required";
-    }
-    // A nonexistent, external, or otherwise invalid target cannot be repaired
-    // by rereading that same path. Reopen two source-only decisions so a weak
-    // model can first orient to the workspace and then inspect a real file.
-    return refreshedSourceOperations >= 2
-      ? "mutation_required"
-      : "source_reorientation_required";
-  }
-  let phaseBoundaryIndex = -1;
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (event.type === "phase.changed" && event.phase === "acting") {
-      phaseBoundaryIndex = index;
-      break;
-    }
-  }
-  let previousBoundaryIndex = -1;
-  for (let index = phaseBoundaryIndex - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (event.type === "phase.changed" || event.type === "run.started") {
-      previousBoundaryIndex = index;
-      break;
-    }
-  }
-  const previousBoundary = previousBoundaryIndex >= 0
-    ? state.events[previousBoundaryIndex]
-    : null;
-  const correctivePhase = phaseBoundaryIndex >= 0 &&
-    previousBoundary?.type !== undefined &&
-    "phase" in previousBoundary &&
-    previousBoundary.phase === "validating" &&
-    state.events
-      .slice(previousBoundaryIndex + 1, phaseBoundaryIndex)
-      .some((event) =>
-        event.type === "validation.completed" && !event.passed
-      );
-  if (correctivePhase) {
-    return successfulSourceOperations === 0
-      ? "source_refresh_required"
-      : "mutation_required";
-  }
-  return successfulSourceOperations >= 2 || pressureObserved
-    ? "mutation_required"
-    : "source_gap_allowed";
+}
+
+function successfulSourceTargetAttemptCount(
+  state: TurnAggregateV1,
+  payload: Readonly<Record<string, unknown>>,
+): number {
+  const args = payload.arguments &&
+      typeof payload.arguments === "object" &&
+      !Array.isArray(payload.arguments)
+    ? payload.arguments as Record<string, unknown>
+    : {};
+  const target = String(
+    args.path || args.file_path || args.directory || args.target || "",
+  ).trim();
+  if (!target) return 0;
+  return currentPhaseEvents(state).filter((event) =>
+    event.type === "tool.completed" &&
+    event.status === "succeeded" &&
+    event.evidence.some((evidence) =>
+      evidence.kind === "source" &&
+      workspacePathsReferToSameFile(evidence.target, target) &&
+      !!evidence.version
+    )
+  ).length;
 }
 
 function deterministicCommandKey(
@@ -268,32 +292,38 @@ function boundedCommand(
 ): RuntimeV2Command {
   const fingerprint = actionFingerprint(state, kind, payload);
   const failedAttempts = failedActionAttemptCount(state, fingerprint);
-  if (failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action) {
-    const transportFailureCount = state.recovery.receipts.find((receipt) =>
-      receipt.scope === "transport" &&
-      receipt.fingerprint === `transport:${fingerprint}` &&
-      receipt.epoch === state.recovery.epoch
-    )?.count || 0;
-    if (
-      kind === "request_model" &&
-      failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action &&
-      transportFailureCount >= failedAttempts
-    ) {
-      return recoveryFinalization(
-        state,
-        fingerprint,
-        "provider_transport_exhausted",
-        "error",
-        "transport",
-      );
-    }
-    return recoveryFinalization(
-      state,
-      fingerprint,
-      "当前同一项结构化动作已达到恢复上限；已保留可靠证据并以部分结果收口，避免任务无限停留在执行中。",
-    );
+  const unchangedSourceRepeats =
+    kind === "execute_tool"
+      ? Math.max(
+          successfulSourceActionAttemptCount(state, fingerprint),
+          successfulSourceTargetAttemptCount(state, payload),
+        )
+      : 0;
+  const command = makeCommand(state, kind, payload);
+  if (
+    (
+      failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action ||
+      unchangedSourceRepeats >= 2
+    ) &&
+    kind !== "request_model" &&
+    kind !== "collect_observation"
+  ) {
+    // Refuse only this repeated structural action. The provider receives the
+    // rejection as ordinary context and may choose another action; it never
+    // becomes a Turn terminal merely because an action counter was reached.
+    return {
+      ...command,
+      payload: {
+        ...command.payload,
+        repeatedActionRejected: true,
+        repeatedActionReason:
+          unchangedSourceRepeats >= 2
+            ? "unchanged_source_repeat"
+            : "failed_action_retry_limit",
+      },
+    };
   }
-  return makeCommand(state, kind, payload);
+  return command;
 }
 
 /**
@@ -308,24 +338,54 @@ export function decideNextCommands(
 ): readonly RuntimeV2Command[] {
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
-  if (state.recovery.exhausted) {
-    return [recoveryFinalization(
-      state,
-      state.recovery.exhausted.fingerprint,
-      state.recovery.exhausted.reason,
-    )];
-  }
   if (input.resultKind && input.resultReason) {
+    const activeJobIds = state.subagents
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.id);
+    if (activeJobIds.length > 0) {
+      return [boundedCommand(state, "join_subagents", {
+        mode: "read_only",
+        jobIds: activeJobIds,
+        finalJoin: true,
+      })];
+    }
     return [makeCommand(state, "finalize_turn", {
       resultKind: input.resultKind,
       resultReason: input.resultReason,
       ...(typeof input.finalMarkdown === "string" && input.finalMarkdown.trim()
         ? { finalMarkdown: input.finalMarkdown.trim().slice(0, 24_000) }
-        : {}),
+      : {}),
     })];
+  }
+  if (state.recovery.exhausted) {
+    const activeJobIds = state.subagents
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.id);
+    if (activeJobIds.length > 0) {
+      return [boundedCommand(state, "join_subagents", {
+        mode: "read_only",
+        jobIds: activeJobIds,
+        finalJoin: true,
+      })];
+    }
+    return [recoveryFinalization(
+      state,
+      state.recovery.exhausted.fingerprint,
+      state.recovery.exhausted.reason,
+      state.recovery.exhausted.scope === "transport"
+        ? "error"
+        : exhaustedRuntimeV2ResultKind(state),
+      state.recovery.exhausted.scope,
+    )];
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
+    if (toolCall.name === "submit_execution_contract") {
+      return [boundedCommand(state, "commit_execution_contract", {
+        toolCallId: toolCall.id,
+        arguments: toolCall.arguments,
+      })];
+    }
     if (toolCall.name === "spawn_subagent") {
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
@@ -337,23 +397,73 @@ export function decideNextCommands(
         ...commaSeparatedValues(toolCall.arguments.subagent_ids),
         ...commaSeparatedValues(toolCall.arguments.collaboration_task_ids),
       ];
-      const activeIds = state.subagents
+      const activeJobs = state.subagents
         .filter((job) => job.status === "queued" || job.status === "running")
-        .map((job) => job.id);
+      const resolution = resolveRuntimeV2SubagentReferences({
+        jobs: activeJobs,
+        requested,
+      });
       return [boundedCommand(state, "join_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
         requestedJobIds: requested,
         jobIds: requested.length > 0
-          ? activeIds.filter((id) => requested.includes(id))
-          : activeIds,
+          ? resolution.jobIds
+          : activeJobs.map((job) => job.id),
+        unresolvedJobIds: resolution.unresolved,
       })];
     }
-    const kind = state.phase === "validating" ? "execute_validation" : "execute_tool";
+    // Validation remains an evidence-gathering phase. A failed child handoff
+    // may leave the parent needing one more safe source read before it can run
+    // the authority-linked validator. Classify that read as an ordinary tool
+    // observation so it cannot fabricate a validation receipt.
+    const kind =
+      state.phase === "validating" &&
+        !isRuntimeV2WorkspaceReadToolName(toolCall.name)
+        ? "execute_validation"
+        : "execute_tool";
+    let validationAuthority:
+      | RuntimeV2ExecutionValidationAuthority
+      | undefined;
+    if (kind === "execute_validation" && state.executionContract) {
+      const validation = resolveRuntimeV2ExecutionContractValidation({
+        contract: state.executionContract,
+        toolName: toolCall.name,
+        args: toolCall.arguments,
+      });
+      if (validation) {
+        validationAuthority = runtimeV2ExecutionValidationAuthority({
+          contract: state.executionContract,
+          validation,
+        });
+      }
+    } else if (
+      kind === "execute_validation" &&
+      state.workPlan?.status === "approved" &&
+      state.sealedWorkPlan
+    ) {
+      const scope = resolveRuntimeV2PlanValidationScope({
+        plan: state.sealedWorkPlan,
+        toolName: toolCall.name,
+        args: toolCall.arguments,
+      });
+      const validationIndex = scope.matchingValidationIndexes[0];
+      const validation = validationIndex === undefined
+        ? undefined
+        : state.sealedWorkPlan.draft.validations[validationIndex];
+      if (validation && validationIndex !== undefined) {
+        validationAuthority =
+          runtimeV2PlanValidationAuthority({
+            plan: state.sealedWorkPlan,
+            validationIndex,
+          }) || undefined;
+      }
+    }
     return [boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
       arguments: toolCall.arguments,
+      ...(validationAuthority ? { validationAuthority } : {}),
     })];
   }
 
@@ -371,55 +481,52 @@ export function decideNextCommands(
           objective: state.objective.text,
         })];
       }
-      const collaborationAllowed =
-        input.subagentPreference === "allowed" ||
-        input.subagentPreference === "preferred";
-      const activeSubagents = state.subagents
-        .filter((job) => job.status === "queued" || job.status === "running")
-        .map((job) => ({
-          id: job.id,
-          name: job.name || job.scopeKey,
-          objective: job.objective,
-        }));
-      const initialSpawnRequired =
-        input.subagentPreference === "preferred" &&
-        state.subagents.length === 0;
-      if (activeSubagents.length > 0) {
-        const lastScheduleIndex = state.events
-          .map((event) => event.type)
-          .lastIndexOf("subagents.scheduled");
-        const parentObservedWhileChildrenRun = state.events.some(
-          (event, index) =>
-            index > lastScheduleIndex &&
-            event.type === "provider.responded",
-        );
-        // Child identity and work come only from the provider's real
-        // spawn_subagent call. Once the parent has had one independent model
-        // turn, the runtime joins the actual active jobs even if a smaller
-        // model forgets the explicit wait tool, keeping collaboration finite.
-        if (parentObservedWhileChildrenRun) {
-          return [boundedCommand(state, "join_subagents", {
-            mode: "read_only",
-            jobIds: activeSubagents.map((job) => job.id),
-          })];
-        }
-      }
+      const repeatedSourceTarget =
+        state.strategy === "execute" && !state.executionContract
+          ? latestRepeatedSourceTarget(state)
+          : null;
+      const contractRequired =
+        state.strategy === "execute" &&
+        !state.executionContract &&
+        observationContractRequired(state);
+      const requiredContractSourceTarget =
+        state.strategy === "execute" &&
+        !state.executionContract
+          ? requiredExecutionContractSourceTarget(state)
+          : null;
       return [boundedCommand(state, "request_model", {
         mode: state.strategy === "analyze" ? "analyze" : "observe",
-        toolExpectation: initialSpawnRequired ? "required" : "optional",
-        objective: state.objective.text,
-        evidenceIds: state.evidence.map((item) => item.id),
-        collaborationAllowed,
-        collaborationAction: initialSpawnRequired
-          ? "spawn_required"
-          : activeSubagents.length > 0
-            ? "children_active"
+        toolExpectation:
+          repeatedSourceTarget || requiredContractSourceTarget
+            ? "required"
             : "optional",
-        activeSubagents,
-        remainingSubagentCapacity: Math.max(
-          0,
-          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - state.subagents.length,
+        observationPolicy:
+          requiredContractSourceTarget
+            ? "execution_contract_source_required"
+            : contractRequired
+            ? "execution_contract_required"
+            : repeatedSourceTarget
+            ? "different_action_or_contract_required"
+            : "evidence_gap_allowed",
+        repeatedSourceTarget,
+        requiredExecutionContractSourceTarget:
+          requiredContractSourceTarget,
+        objective: state.objective.text,
+        acceptanceCriteria: state.objective.acceptanceCriteria.map(
+          (criterion, index) => ({
+            id:
+              state.objective.acceptanceCriterionIds?.[index] ||
+              `criterion-${index + 1}`,
+            text: criterion,
+          }),
         ),
+        evidenceIds: state.evidence.map((item) => item.id),
+        executionEvidenceCatalog: executionEvidenceCatalog(state),
+        executionContractRejection:
+          latestExecutionContractRejection(state),
+        executionContractRevision:
+          state.executionContract?.revision || null,
+        ...collaborationPayload(state, input),
       })];
     }
     case "planning":
@@ -430,25 +537,60 @@ export function decideNextCommands(
       })];
     case "reviewing":
       return [];
-    case "acting":
+    case "acting": {
+      const executePolicy = actingExecutePolicy(state);
+      const mutationProgressionRequired =
+        executePolicy === "mutation_required" &&
+        actingMutationProgressionRequired(state);
       return [boundedCommand(state, "request_model", {
         mode: "execute",
-        executePolicy: actingExecutePolicy(state),
+        executePolicy,
         toolExpectation: "required",
         objective: state.objective.text,
         workPlanRevision: state.workPlan?.revision || null,
+        executionContractRevision:
+          state.executionContract?.revision || null,
+        activeExecutionContractDraft:
+          activeExecutionContractDraft(state),
+        executionContractRejection:
+          latestExecutionContractRejection(state),
+        mutationProgressionRequired:
+          mutationProgressionRequired,
+        requiredMutationSourceTarget:
+          requiredMutationSourceTarget(
+            state,
+            mutationProgressionRequired,
+          ),
         evidenceIds: state.evidence.map((item) => item.id),
+        executionEvidenceCatalog: executionEvidenceCatalog(state),
+        ...collaborationPayload(state, input),
       })];
+    }
     case "validating": {
-      const hasPassedValidation = state.events.some((event) =>
-        event.type === "validation.completed" && event.passed
-      );
+      const executionCoverage =
+        deriveRuntimeV2ExecutionContractCoverage(state);
+      const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
+      const validationCoverageComplete = executionCoverage
+        ? executionCoverage.missingValidationIds.length === 0 &&
+          executionCoverage.missingCriterionIds.length === 0
+        : planCoverage
+          ? planCoverage.allRequiredValidationsPassed
+          : false;
       return [boundedCommand(state, "request_model", {
-        mode: hasPassedValidation ? "conclude" : "validate",
-        toolExpectation: hasPassedValidation ? "optional" : "required",
+        mode: validationCoverageComplete ? "conclude" : "validate",
+        toolExpectation: validationCoverageComplete ? "optional" : "required",
         objective: state.objective.text,
         acceptanceCriteria: state.objective.acceptanceCriteria,
         evidenceIds: state.evidence.map((item) => item.id),
+        executionContractRevision:
+          state.executionContract?.revision || null,
+        activeExecutionContractDraft:
+          activeExecutionContractDraft(state),
+        validationRetryTarget:
+          latestBrowserValidationTarget(state),
+        validationParentTakeoverReadRequired:
+          validationParentTakeoverReadRequired(state),
+        ...collaborationPayload(state, input),
       })];
     }
     case "finalizing":

@@ -99,11 +99,16 @@ const realOmlxPlanExpectAll = String(process.env.REAL_OMLX_PLAN_EXPECT_ALL || ""
   .map((pattern) => new RegExp(pattern, "i"));
 const realOmlxPlanEvidenceTargets = String(
   process.env.REAL_OMLX_PLAN_EVIDENCE_TARGETS || (
-    realOmlxFixture === "csv" ? "src/hooks/useCsvParser.ts" : ""
+    realOmlxFixture === "csv"
+      ? "src/hooks/useCsvParser.ts"
+      : realOmlxFixture === "md-viewer"
+        ? "src/main.js"
+        : ""
   ),
 ).split(";;").map((target) => target.trim()).filter(Boolean);
 const requireSemanticTaskQuality =
-  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1";
+  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1" ||
+  (runExecuteIncidentReplay && realOmlxFixture === "md-viewer");
 if (
   runRealOmlx &&
   realOmlxFixture === "md-viewer" &&
@@ -491,6 +496,59 @@ function expectCanonicalRuntimeV2Terminal(
   expect(commands.every((command: { turnId?: string; runId?: string }) =>
     command.turnId === expected.turnId && command.runId === runtime.runId
   )).toBe(true);
+  if (
+    expected.resultKind === "success" &&
+    (expected.strategy || "execute") === "execute"
+  ) {
+    expect(runtime?.executionContract).toMatchObject({
+      schemaVersion: "runtime-v2-execution-contract.v1",
+      status: "active",
+    });
+    expect(runtime.executionContract.criteria.length).toBeGreaterThan(0);
+    expect(runtime.executionContract.changes.length).toBeGreaterThan(0);
+    expect(runtime.executionContract.validations.length).toBeGreaterThan(0);
+    const passedReceipts = events.flatMap((event: {
+      type?: string;
+      status?: string;
+      report?: unknown;
+      passed?: boolean;
+      authority?: unknown;
+      mutationBoundarySequence?: number;
+      validatedMutationVersions?: unknown[];
+      validationReceipts?: Array<{
+        passed?: boolean;
+        authority?: unknown;
+        mutationBoundarySequence?: number;
+        validatedMutationVersions?: unknown[];
+      }>;
+    }) => {
+      if (event.type === "validation.completed" && event.passed === true) {
+        return [event];
+      }
+      if (
+        event.type === "subagent.completed" &&
+        event.status === "completed" &&
+        !!event.report
+      ) {
+        return (event.validationReceipts || []).filter(
+          (receipt) => receipt.passed === true,
+        );
+      }
+      return [];
+    });
+    expect(passedReceipts.length).toBeGreaterThan(0);
+    expect(passedReceipts.every((receipt: {
+      authority?: unknown;
+      mutationBoundarySequence?: number;
+      validatedMutationVersions?: unknown[];
+    }) =>
+      !!receipt.authority &&
+      Number.isInteger(receipt.mutationBoundarySequence) &&
+      Number(receipt.mutationBoundarySequence) > 0 &&
+      Array.isArray(receipt.validatedMutationVersions) &&
+      receipt.validatedMutationVersions.length > 0
+    )).toBe(true);
+  }
 
   const projections = Array.isArray(runtime?.projections) ? runtime.projections : [];
   const finalProjection = projections.filter(
@@ -533,10 +591,28 @@ function expectSuccessfulPlanExecutionOrder(runtime: any): void {
       (event.evidence || []).some((entry) => entry.kind === "mutation"),
   );
   const validationIndex = events.findIndex(
-    (event: { type?: string; passed?: boolean }, index: number) =>
+    (event: {
+      type?: string;
+      status?: string;
+      report?: unknown;
+      passed?: boolean;
+      validationReceipts?: Array<{ passed?: boolean }>;
+    }, index: number) =>
       index > mutationIndex &&
-      event.type === "validation.completed" &&
-      event.passed === true,
+      (
+        (
+          event.type === "validation.completed" &&
+          event.passed === true
+        ) ||
+        (
+          event.type === "subagent.completed" &&
+          event.status === "completed" &&
+          !!event.report &&
+          (event.validationReceipts || []).some(
+            (receipt) => receipt.passed === true,
+          )
+        )
+      ),
   );
   const runCompletedIndex = events.findIndex(
     (event: { type?: string }, index: number) =>
@@ -1105,10 +1181,43 @@ test.beforeEach(async ({ page }) => {
     chars: number;
     chunks: number;
     preview: string;
+    responseText: string;
     timeoutMs: number;
     deadlineAt: number;
   };
   const chatStreams = new Map<string, RealOmlxChatStream>();
+  const summarizeRuntimeV2ToolCalls = (text: string) => {
+    const calls = new Map<number, { name: string; arguments: string }>();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload);
+        const deltas = parsed?.choices?.[0]?.delta?.tool_calls;
+        if (!Array.isArray(deltas)) continue;
+        for (const delta of deltas) {
+          const index = Number(delta?.index) || 0;
+          const current = calls.get(index) || {
+            name: "",
+            arguments: "",
+          };
+          current.name += String(delta?.function?.name || "");
+          current.arguments += String(delta?.function?.arguments || "");
+          calls.set(index, current);
+        }
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return [...calls.values()].map((call) => ({
+      name: call.name,
+      arguments:
+        call.name === "submit_execution_contract"
+          ? call.arguments.slice(0, 8_000)
+          : "",
+    }));
+  };
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
     const url = String(args.url || "");
@@ -1118,6 +1227,18 @@ test.beforeEach(async ({ page }) => {
       model = String(JSON.parse(bodyText).model || "");
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
+    }
+    const contractErrors = [
+      ...bodyText.matchAll(
+        /RUNTIME_V2_EXECUTION_CONTRACT_INVALID:[^"\\\n]{1,240}/g,
+      ),
+    ].map((match) => match[0]);
+    if (contractErrors.length > 0) {
+      console.log(
+        `[real-omlx-contract-retry] ${JSON.stringify(
+          [...new Set(contractErrors)].slice(-4),
+        )}`,
+      );
     }
     const requestedTimeoutMs = Number(args.timeoutMs);
     const timeoutMs = Number.isFinite(requestedTimeoutMs)
@@ -1133,6 +1254,7 @@ test.beforeEach(async ({ page }) => {
       chars: 0,
       chunks: 0,
       preview: "",
+      responseText: "",
       timeoutMs,
       deadlineAt: Date.now() + timeoutMs,
     };
@@ -1205,9 +1327,23 @@ test.beforeEach(async ({ page }) => {
       stream.chars += chunk.length;
       stream.chunks += 1;
       if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
+      if (stream.responseText.length < 200_000) {
+        stream.responseText = `${stream.responseText}${chunk}`.slice(
+          0,
+          200_000,
+        );
+      }
       if (done) {
         chatStreams.delete(String(streamId));
         console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+        const toolCalls = summarizeRuntimeV2ToolCalls(
+          stream.responseText,
+        );
+        if (toolCalls.length > 0) {
+          console.log(
+            `[real-omlx-tool-calls] ${JSON.stringify(toolCalls)}`,
+          );
+        }
       }
       return { done, chunk };
     } catch (error) {
@@ -1892,6 +2028,13 @@ test.beforeEach(async ({ page }) => {
         const ok = mutationState.satisfied === true &&
           actionRows.every((action) => action.ok) &&
           assertionRows.every((assertion) => assertion.passed);
+        const semanticFailureDetail =
+          mutationState.satisfied === true
+            ? ""
+            : String(
+                mutationState.detail ||
+                  "The fixture mutation does not satisfy the semantic acceptance oracle.",
+              );
         return {
           ok,
           url: String(args?.url || ""),
@@ -1901,7 +2044,14 @@ test.beforeEach(async ({ page }) => {
           actions: actionRows,
           assertions: assertionRows,
           consoleErrors: [],
-          pageErrors: [],
+          // The fixture oracle stands in for concrete DOM/native failures in
+          // this isolated replay. Feed its actionable path:line diagnostics
+          // back through the real validation receipt so Runtime v2 can reopen
+          // the exact corrective source window instead of learning about the
+          // semantic gap only after the Turn has already ended.
+          pageErrors: semanticFailureDetail
+            ? [semanticFailureDetail]
+            : [],
           failedRequests: [],
           textPreview: fixture === "md-viewer" ? "New Open Save" : "creatorName",
           durationMs: 1,
@@ -2939,27 +3089,62 @@ for (const model of models) {
     expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
       evidence.kind === "mutation"
     )).toBe(true);
-    const successfulValidations = (runtimeV2.commands || []).filter(
-      (command: { kind?: string; status?: string }) =>
-        command.kind === "execute_validation" &&
-        command.status === "succeeded",
+    const passedParentValidations = (runtimeV2.events || []).filter(
+      (event: { type?: string; passed?: boolean; authority?: unknown }) =>
+        event.type === "validation.completed" &&
+        event.passed === true &&
+        !!event.authority,
     );
-    expect(successfulValidations.length).toBeGreaterThan(0);
-    expect((runtimeV2.events || []).some(
-      (event: { type?: string; passed?: boolean }) =>
-        event.type === "validation.completed" && event.passed === true,
-    )).toBe(true);
+    const passedChildValidations = (runtimeV2.events || []).flatMap(
+      (event: {
+        type?: string;
+        status?: string;
+        report?: unknown;
+        validationReceipts?: Array<{
+          passed?: boolean;
+          authority?: unknown;
+        }>;
+      }) =>
+        event.type === "subagent.completed" &&
+          event.status === "completed" &&
+          !!event.report
+          ? (event.validationReceipts || []).filter((receipt) =>
+              receipt.passed === true && !!receipt.authority
+            )
+          : [],
+    );
+    expect(
+      passedParentValidations.length + passedChildValidations.length,
+    ).toBeGreaterThan(0);
     expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
       evidence.kind === "validation"
     )).toBe(true);
-    const finalValidationBlock = [...successfulValidations].reverse().find(
-      (command: { toolName?: string; target?: string }) =>
-        command.toolName === "run_command" &&
-        isFinitePlanValidationCommand(String(command.target || "")),
-    );
-    const finalValidationCommand = String(finalValidationBlock?.target || "").trim();
+    const finalValidationAuthority = (
+      passedChildValidations.at(-1)?.authority ||
+      passedParentValidations.at(-1)?.authority
+    ) as { validationId?: string } | undefined;
+    const finalValidationSpec = (
+      runtimeV2.executionContract?.validations || []
+    ).find((validation: { id?: string }) =>
+      validation.id === finalValidationAuthority?.validationId
+    ) as {
+      command?: string;
+      primitive?: Parameters<typeof isAcceptanceCapableValidationSpec>[0];
+    } | undefined;
+    const finalValidationPrimitive = finalValidationSpec?.primitive;
+    const finalValidationCommand = String(
+      finalValidationPrimitive?.kind === "finite_command"
+        ? finalValidationPrimitive.command
+        : finalValidationSpec?.command || "",
+    ).trim();
     if (requireSemanticTaskQuality) {
-      expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
+      expect(
+        !!finalValidationPrimitive &&
+          isAcceptanceCapableValidationSpec(finalValidationPrimitive),
+      ).toBe(true);
+      if (finalValidationPrimitive?.kind === "finite_command") {
+        expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
+      }
     }
     if (finalValidationCommand) {
       const independentFinalValidation = await runRealOmlxWorkspaceCommand(

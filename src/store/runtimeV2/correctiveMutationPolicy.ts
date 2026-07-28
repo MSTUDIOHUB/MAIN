@@ -1,12 +1,19 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
-import { resolveWorkspaceMutationTargets } from "../../lib/workspaceMutationTools";
+import {
+  isWorkspaceMutationToolName,
+  resolveWorkspaceMutationTargets,
+} from "../../lib/workspaceMutationTools";
+import {
+  isRuntimeV2WorkspaceReadToolName,
+} from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   latestAcceptanceFailureSourceWindow,
   normalizeRuntimeV2WorkspacePath,
 } from "./executionProviderContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 
 export interface RuntimeV2MutationLease {
   readonly target: string;
@@ -14,10 +21,23 @@ export interface RuntimeV2MutationLease {
   readonly evidenceId: string;
 }
 
+export function runtimeV2ContractAllowsMutationTarget(
+  aggregate: TurnAggregateV1 | null,
+  target: string,
+): boolean {
+  const targets = aggregate?.executionContract?.changes.map(
+    (change) => change.target,
+  ) || [];
+  return targets.length === 0 || targets.some((declared) =>
+    workspacePathsReferToSameFile(declared, target)
+  );
+}
+
 function latestSuccessfulParentRead(
   input: RuntimeV2ExecutionPortsInput,
 ): RuntimeV2MutationLease | null {
   const workspace = input.context.runWorkspace || "";
+  const aggregate = aggregateForCurrentTurn(input);
   for (let index = input.live.modelContext.length - 1; index >= 0; index -= 1) {
     const entry = input.live.modelContext[index]!;
     if (
@@ -34,6 +54,9 @@ function latestSuccessfulParentRead(
       target.startsWith("../") ||
       target.includes(", ")
     ) {
+      continue;
+    }
+    if (!runtimeV2ContractAllowsMutationTarget(aggregate, target)) {
       continue;
     }
     return {
@@ -69,63 +92,34 @@ export function runtimeV2MutationLease(
   return latestSuccessfulParentRead(input);
 }
 
-/**
- * A failed editor is not retried immediately against the same source bytes.
- * Once a newer exact read arrives, the editor becomes eligible again.
- */
-export function latestFailedMutationToolForLease(
-  input: RuntimeV2ExecutionPortsInput,
-  lease: RuntimeV2MutationLease,
-): "replace_in_file" | "apply_patch" | null {
-  const workspace = input.context.runWorkspace || "";
-  let latestReadIndex = -1;
-  for (let index = input.live.modelContext.length - 1; index >= 0; index -= 1) {
-    const entry = input.live.modelContext[index]!;
-    const target = normalizeRuntimeV2WorkspacePath(entry.target, workspace);
-    if (
-      target === lease.target &&
-      entry.source === "tool" &&
-      entry.label === "read_file" &&
-      entry.status === "succeeded"
-    ) {
-      latestReadIndex = index;
-      break;
-    }
-  }
-  for (
-    let index = input.live.modelContext.length - 1;
-    index > latestReadIndex;
-    index -= 1
-  ) {
-    const entry = input.live.modelContext[index]!;
-    if (
-      entry.source !== "tool" ||
-      entry.status !== "failed" ||
-      (entry.label !== "replace_in_file" && entry.label !== "apply_patch")
-    ) {
-      continue;
-    }
-    const target = normalizeRuntimeV2WorkspacePath(entry.target, workspace);
-    if (target === lease.target) return entry.label;
-  }
-  return null;
+/** Attribute a structurally invalid editor call to its active lease only for
+ * recovery bookkeeping. The original empty/malformed arguments still reach
+ * authorization unchanged and therefore cannot acquire write authority. */
+export function runtimeV2MutationFailureContextTarget(input: {
+  readonly ports: RuntimeV2ExecutionPortsInput;
+  readonly toolName: string;
+  readonly requestedTarget: string;
+}): string {
+  if (input.requestedTarget) return input.requestedTarget;
+  if (!isWorkspaceMutationToolName(input.toolName)) return "";
+  return runtimeV2MutationLease(input.ports)?.target || "";
 }
 
 export function constrainRuntimeV2MutationTools(
   definitions: readonly ToolDefinition[],
   lease: RuntimeV2MutationLease,
-  allowClarifyingRead = false,
-  excludedMutationTool: "replace_in_file" | "apply_patch" | null = null,
 ): ToolDefinition[] {
   const target = lease.target;
   return definitions
     .filter((definition) => {
       const name = definition.function.name;
-      return (
-        (name === "replace_in_file" || name === "apply_patch") &&
-        name !== excludedMutationTool
-      ) ||
-        (allowClarifyingRead && name === "read_file");
+      if (isWorkspaceMutationToolName(name)) {
+        return name === "replace_in_file" || name === "apply_patch";
+      }
+      return isRuntimeV2WorkspaceReadToolName(name) ||
+        name === "spawn_subagent" ||
+        name === "wait_subagents" ||
+        name === "submit_execution_contract";
     })
     .map((definition) => {
       const name = definition.function.name;
@@ -141,6 +135,9 @@ export function constrainRuntimeV2MutationTools(
           },
         };
       }
+      if (name !== "replace_in_file" && name !== "apply_patch") {
+        return definition;
+      }
       const path = definition.function.parameters.properties.path;
       return {
         ...definition,
@@ -148,9 +145,7 @@ export function constrainRuntimeV2MutationTools(
             ...definition.function,
             description: [
               definition.function.description,
-              name === "read_file"
-                ? `This is the final clarifying read for exactly ${target}; after it returns, submit a mutation instead of reading again.`
-              : `This mutation is leased to exactly ${target}; no other file is authorized in this request.`,
+              `This mutation is leased to exactly ${target}; no other file is authorized in this request.`,
             ].join(" "),
           parameters: {
             ...definition.function.parameters,

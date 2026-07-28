@@ -27,6 +27,9 @@ import {
 } from "./executionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
+import {
+  runtimeV2MutationFailureContextTarget,
+} from "./correctiveMutationPolicy";
 
 const RUNTIME_V2_MAX_MUTATION_LINES = 96;
 const RUNTIME_V2_MAX_CORRECTIVE_MUTATION_LINES = 48;
@@ -109,6 +112,17 @@ export function createRuntimeV2ToolPort(
         ? command.payload.arguments as Record<string, unknown>
         : {};
       const target = getToolTarget(toolName, args);
+      // Keep authorization bound to the provider's actual arguments. For
+      // recovery correlation only, attribute a target-less failed editor to
+      // the active mutation lease. Otherwise an empty native tool payload is
+      // recorded against the literal tool name and the same broken editor
+      // remains eligible forever on the leased source version.
+      const failureContextTarget =
+        runtimeV2MutationFailureContextTarget({
+          ports: input,
+          toolName,
+          requestedTarget: target,
+        });
       input.logStoreEvent("runtime_v2_tool_execution_started", {
         turnId: command.run.turnId,
         runId: command.run.runId,
@@ -116,12 +130,53 @@ export function createRuntimeV2ToolPort(
         toolName,
         target: target || null,
       });
+      if (command.payload.repeatedActionRejected === true) {
+        const unchangedSourceRepeat =
+          command.payload.repeatedActionReason ===
+            "unchanged_source_repeat";
+        recordToolModelContext({
+          ports: input,
+          command,
+          toolName,
+          target: failureContextTarget,
+          status: "failed",
+          content: unchangedSourceRepeat
+            ? [
+                "UNCHANGED_SOURCE_REPEAT_REJECTED: this target already returned the same committed source version twice in the current phase.",
+                "Changing line windows or inspection syntax does not create new source authority. Choose a genuinely different missing target, submit the execution contract, or perform the leased mutation. The Turn remains active.",
+              ].join(" ")
+            : [
+                "REPEATED_ACTION_REJECTED: this exact failed action reached its retry protection line.",
+                "Choose a different read, mutation, or validator from the currently available tool surface. The Turn remains active.",
+              ].join(" "),
+        });
+        input.logStoreEvent("runtime_v2_repeated_action_rejected", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          commandKind: command.kind,
+          toolName,
+          target: target || null,
+          reason: unchangedSourceRepeat
+            ? "unchanged_source_repeat"
+            : "failed_action_retry_limit",
+        });
+        return toolCompletionFor(
+          input,
+          command,
+          toolName,
+          args,
+          failureContextTarget,
+          null,
+          "failed",
+          "protocol_invalid",
+        );
+      }
       if (!toolDefinitionExists(input, toolName)) {
         recordToolModelContext({
           ports: input,
           command,
           toolName,
-          target,
+          target: failureContextTarget,
           status: "failed",
           content: `UNKNOWN_TOOL: ${toolName}`,
         });
@@ -138,7 +193,7 @@ export function createRuntimeV2ToolPort(
           command,
           toolName,
           args,
-          target,
+          failureContextTarget,
           null,
           "failed",
           "protocol_invalid",
@@ -149,7 +204,7 @@ export function createRuntimeV2ToolPort(
           ports: input,
           command,
           toolName,
-          target,
+          target: failureContextTarget,
           status: "failed",
           content: `VALIDATION_TOOL_REJECTED: ${toolName}`,
         });
@@ -166,7 +221,7 @@ export function createRuntimeV2ToolPort(
           command,
           toolName,
           args,
-          target,
+          failureContextTarget,
           null,
           "failed",
           "protocol_invalid",
@@ -184,7 +239,7 @@ export function createRuntimeV2ToolPort(
           ports: input,
           command,
           toolName,
-          target,
+          target: failureContextTarget,
           status: "blocked",
           content: `TOOL_BLOCKED: ${phaseAndPlan.reason}`,
         });
@@ -201,7 +256,7 @@ export function createRuntimeV2ToolPort(
           command,
           toolName,
           args,
-          target,
+          failureContextTarget,
           null,
           "blocked",
           phaseAndPlan.failureKind || "not_authorized",
@@ -213,7 +268,7 @@ export function createRuntimeV2ToolPort(
           ports: input,
           command,
           toolName,
-          target,
+          target: failureContextTarget,
           status: "blocked",
           content: `TOOL_BLOCKED: ${authorization.reason || `${toolName} is not authorized for this Turn.`}`,
         });
@@ -230,7 +285,7 @@ export function createRuntimeV2ToolPort(
           command,
           toolName,
           args,
-          target,
+          failureContextTarget,
           null,
           "blocked",
           "not_authorized",
@@ -313,7 +368,7 @@ export function createRuntimeV2ToolPort(
               ports: input,
               command,
               toolName,
-              target: preflight.path || target,
+              target: preflight.path || failureContextTarget,
               status: "failed",
               content,
             });
@@ -336,7 +391,7 @@ export function createRuntimeV2ToolPort(
               command,
               toolName,
               args,
-              preflight.path || target,
+              preflight.path || failureContextTarget,
               null,
               "failed",
               sourceMismatch
@@ -452,7 +507,7 @@ export function createRuntimeV2ToolPort(
           ports: input,
           command,
           toolName,
-          target,
+          target: failureContextTarget,
           status: "failed",
           content: `TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}`,
         });
@@ -469,7 +524,7 @@ export function createRuntimeV2ToolPort(
           command,
           toolName,
           args,
-          target,
+          failureContextTarget,
           null,
           "failed",
           "execution_failed",

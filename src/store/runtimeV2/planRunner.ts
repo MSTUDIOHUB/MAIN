@@ -72,17 +72,10 @@ export async function runSubmitRuntimeV2Plan(
     let synthesisRecoveryCount = 0;
     const deadlineAt = startedAt + PLAN_MODEL_DEADLINE_MS;
     const discoveryDeadlineAt = startedAt + PLAN_DISCOVERY_DEADLINE_MS;
-    planRounds:
     while (!sealedPlan && !terminalFailure) {
       if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
       if (Date.now() >= deadlineAt) {
         await ledger.recordSoftSignal(identity.run, "context_pressure");
-        await ledger.recordRecovery({
-          run: identity.run,
-          scope: "context",
-          fingerprint: "plan:lifecycle-deadline",
-          reason: "Plan Run 已达到限定生命周期。",
-        });
         terminalFailure = {
           resultKind: evidence.length > 0 ? "partial" : "error",
           reason: "计划生成已到达运行时限；已保留现有证据并明确结束本轮，没有留下悬空任务。",
@@ -161,16 +154,13 @@ export async function runSubmitRuntimeV2Plan(
           isPlanSubmissionStage(stage) &&
           detail === "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT"
         ) {
-          const canAttemptRecovery = synthesisRecoveryCount < 1 &&
-            Date.now() + 5_000 < deadlineAt &&
-            await ledger.recordRecovery({
-              run: identity.run,
-              scope: "transport",
-              fingerprint: "plan:synthesis:closed-request-timeout",
-              reason: "计划 synthesis 的限定串行恢复已耗尽。",
-            });
-          if (canAttemptRecovery) {
+          await ledger.recordSoftSignal(identity.run, "protocol_drift");
+          if (
+            synthesisTransport === "native_tool" &&
+            Date.now() + 5_000 < deadlineAt
+          ) {
             synthesisRecoveryCount += 1;
+            synthesisTransport = "structured_response";
             input.logStoreEvent("runtime_v2_plan_synthesis_timeout", {
               turnId: identity.turn.turnId,
               runId: identity.run.runId,
@@ -178,7 +168,9 @@ export async function runSubmitRuntimeV2Plan(
               evidenceCount: evidence.length,
               stage: "synthesis",
               recoveryAttempt: 1,
-              action: "retry_after_closed_request_compact_context",
+              from: "native_tool",
+              to: "structured_response",
+              action: "fallback_to_compatible_transport",
             });
             continue;
           }
@@ -189,12 +181,40 @@ export async function runSubmitRuntimeV2Plan(
             evidenceCount: evidence.length,
             stage: "synthesis",
             recoveryAttempt: synthesisRecoveryCount,
-            action: "terminal_after_bounded_retry",
+            transport: synthesisTransport,
+            action: "terminal_after_compatible_transports_unavailable",
           });
           terminalFailure = {
             resultKind: evidence.length > 0 ? "partial" : "error",
-            reason: "计划合成及其一次串行恢复均达到限定时长；运行时已停止请求，现有证据已保留。",
+            reason: "计划合成的原生工具与结构化响应通道均不可用；运行时已停止请求，现有证据已保留。",
             detailCode: "runtime_v2_plan_synthesis_timeout",
+          };
+          break;
+        }
+        if (isPlanSubmissionStage(stage)) {
+          await ledger.recordSoftSignal(identity.run, "protocol_drift");
+          if (synthesisTransport === "native_tool") {
+            synthesisRecoveryCount += 1;
+            synthesisTransport = "structured_response";
+            messages.push({
+              role: "system",
+              content: "The native submission transport failed. Submit the same evidence-bound plan through the schema-constrained response transport.",
+            });
+            input.logStoreEvent("runtime_v2_plan_provider_transport_fallback", {
+              turnId: identity.turn.turnId,
+              runId: identity.run.runId,
+              round,
+              from: "native_tool",
+              to: "structured_response",
+              reason: "transport_failure",
+              error: detail,
+            });
+            continue;
+          }
+          terminalFailure = {
+            resultKind: evidence.length > 0 ? "partial" : "error",
+            reason: "计划合成的原生工具与结构化响应通道均不可用；已保留现有证据并明确结束本轮。",
+            detailCode: "runtime_v2_plan_transport_variants_exhausted",
           };
           break;
         }
@@ -229,16 +249,33 @@ export async function runSubmitRuntimeV2Plan(
         await ledger.recordSoftSignal(identity.run, response.visibleText?.trim()
           ? "no_tool_call"
           : "empty_response");
+        if (stage === "discovery") {
+          stage = "synthesis";
+          messages.push({
+            role: "system",
+            content: [
+              "Discovery narration is not a terminal result.",
+              "Continue from retained evidence and submit the complete WorkPlan through the structured synthesis contract.",
+            ].join(" "),
+          });
+          input.logStoreEvent(
+            "runtime_v2_plan_synthesis_boundary",
+            {
+              turnId: identity.turn.turnId,
+              runId: identity.run.runId,
+              boundary: "provider_no_action",
+              discoveryActionCount,
+              evidenceCount: evidence.length,
+            },
+          );
+          continue;
+        }
         if (
           stage === "synthesis" &&
           synthesisTransport === "native_tool"
         ) {
-          await ledger.recordRecovery({
-            run: identity.run,
-            scope: "transport",
-            fingerprint: "plan:synthesis:native-tool-no-action",
-            reason: "原生计划提交协议没有产生结构化动作。",
-          });
+          await ledger.recordSoftSignal(identity.run, "protocol_drift");
+          synthesisRecoveryCount += 1;
           synthesisTransport = "structured_response";
           input.logStoreEvent("runtime_v2_plan_provider_transport_fallback", {
             turnId: identity.turn.turnId,
@@ -261,24 +298,10 @@ export async function runSubmitRuntimeV2Plan(
           };
           break;
         }
-        const canContinue = await ledger.recordRecovery({
-          run: identity.run,
-          scope: "transport",
-          fingerprint: "plan:provider-no-structured-action",
-          reason: "计划模型连续未返回结构化动作，已耗尽限定恢复预算。",
-        });
         messages.push({
           role: "system",
           content: "No structured action was received. Use one focused read-only tool, or submit the complete WorkPlan now.",
         });
-        if (!canContinue) {
-          terminalFailure = {
-            resultKind: evidence.length > 0 ? "partial" : "error",
-            reason: "模型连续未提供可执行的结构化计划动作；已保留证据并明确结束本轮。",
-            detailCode: "runtime_v2_plan_no_action_recovery_exhausted",
-          };
-          break;
-        }
         continue;
       }
       if (stage === "discovery") {
@@ -307,20 +330,10 @@ export async function runSubmitRuntimeV2Plan(
             detail: "submit arguments must be one JSON object",
             submissionChars: String(call.arguments || "").length,
           });
-          const canContinue = await ledger.recordRecovery({
-            run: identity.run,
-            scope: "diagnostic",
-            fingerprint: "plan:invalid-work-plan-submission",
-            reason: "模型连续提交无效 WorkPlan，已耗尽限定修正预算。",
-          });
-          if (!canContinue) {
-            terminalFailure = {
-              resultKind: evidence.length > 0 ? "partial" : "error",
-              reason: "模型连续提交无法验证的计划结构；已保留证据并明确结束本轮。",
-              detailCode: "runtime_v2_plan_invalid_submission_exhausted",
-            };
-            break;
-          }
+          await ledger.recordSoftSignal(
+            identity.run,
+            "protocol_drift",
+          );
           continue;
         }
         try {
@@ -376,25 +389,15 @@ export async function runSubmitRuntimeV2Plan(
             evidenceIds: evidence.map((entry) => entry.id),
             submissionChars: JSON.stringify(candidate).length,
           });
-          const canContinue = await ledger.recordRecovery({
-            run: identity.run,
-            scope: "diagnostic",
-            fingerprint: "plan:invalid-work-plan-submission",
-            reason: "模型连续提交无效 WorkPlan，已耗尽限定修正预算。",
-          });
-          if (!canContinue) {
-            terminalFailure = {
-              resultKind: evidence.length > 0 ? "partial" : "error",
-              reason: "模型连续提交无法验证的计划结构；已保留证据并明确结束本轮。",
-              detailCode: "runtime_v2_plan_invalid_submission_exhausted",
-            };
-            break;
-          }
+          await ledger.recordSoftSignal(
+            identity.run,
+            "protocol_drift",
+          );
           continue;
         }
       }
       for (const call of response.toolCalls) {
-        const canContinue = await executeReadOnlyPlanTool({
+        await executeReadOnlyPlanTool({
           context: input.context,
           ledger,
           run: identity.run,
@@ -404,14 +407,6 @@ export async function runSubmitRuntimeV2Plan(
           evidenceContents,
           logStoreEvent: input.logStoreEvent,
         });
-        if (!canContinue) {
-          terminalFailure = {
-            resultKind: evidence.length > 0 ? "partial" : "error",
-            reason: "计划调查中的同一工具动作连续失败；已保留证据并明确结束本轮。",
-            detailCode: "runtime_v2_plan_read_recovery_exhausted",
-          };
-          break planRounds;
-        }
       }
     }
     if (!sealedPlan) {
@@ -503,12 +498,7 @@ export async function runSubmitRuntimeV2Plan(
       });
     }
     const detail = error instanceof Error ? error.message : String(error);
-    await ledger.recordRecovery({
-      run: identity.run,
-      scope: "action",
-      fingerprint: `plan:unhandled:${detail.split(":")[0]?.slice(0, 160) || "unknown"}`,
-      reason: "Plan Run 遇到无法继续恢复的运行时错误。",
-    });
+    await ledger.recordSoftSignal(identity.run, "protocol_drift");
     input.logStoreEvent("runtime_v2_plan_unhandled_failure", {
       turnId: identity.turn.turnId,
       runId: identity.run.runId,

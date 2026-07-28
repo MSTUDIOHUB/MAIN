@@ -4,7 +4,15 @@ import {
   type RuntimeV2EvidenceReference,
   type RuntimeV2EventDraft,
   type RuntimeV2ToolPresentation,
+  type RuntimeV2ExecutionValidationAuthority,
+  deriveRuntimeV2ValidationBoundary,
 } from "../../lib/runtime-v2";
+import { parseBrowserInteractionEvidence } from "../../lib/planEvidence";
+import {
+  evaluateValidationSpec,
+  type ValidationEvidence,
+  type ValidationPrimitiveSpec,
+} from "../../lib/validationContract";
 import type { ToolDiffPreview } from "../../lib/toolDiff";
 import {
   isWorkspaceMutationToolName,
@@ -12,6 +20,7 @@ import {
 } from "../../lib/workspaceMutationTools";
 import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { authorizationFor } from "./executionAuthorization";
+import { aggregateForCurrentTurn } from "./executionAggregate";
 import { recordModelContext } from "./executionProviderContext";
 import type {
   RuntimeV2ExecutionPortsInput,
@@ -81,6 +90,7 @@ function toolResultEvent(
 }
 
 function validationResultEvent(
+  input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
   passed: boolean,
   evidence: Array<{
@@ -92,12 +102,22 @@ function validationResultEvent(
   failureKind?: RuntimeV2ValidationFailureKind,
   presentation?: RuntimeV2ToolPresentation,
 ): RuntimeV2EventDraft {
+  const authority = command.payload.validationAuthority
+    ? command.payload.validationAuthority as unknown as
+      RuntimeV2ExecutionValidationAuthority
+    : null;
+  const aggregate = authority ? aggregateForCurrentTurn(input) : null;
+  const validationBoundary = authority && aggregate
+    ? deriveRuntimeV2ValidationBoundary(aggregate, authority.targetPaths)
+    : null;
   return {
     type: "validation.completed",
     run: command.run,
     idempotencyKey: command.idempotencyKey,
     passed,
     evidence,
+    ...(authority ? { authority } : {}),
+    ...(validationBoundary || {}),
     ...(presentation ? { presentation } : {}),
     ...(!passed && failureKind ? { failureKind } : {}),
   };
@@ -157,11 +177,113 @@ export function modelContextContentForToolOutput(output: unknown): string {
       : JSON.stringify(output);
 }
 
-function isValidationPassed(toolName: string, output: unknown): boolean {
+export function isRuntimeV2ValidationPassed(
+  toolName: string,
+  output: unknown,
+  primitive?: ValidationPrimitiveSpec,
+): boolean {
   const result = parseResultRecord(output);
   if (!result) return false;
   if (result.timedOut === true || result.timeout === true || result.error) {
     return false;
+  }
+  if (primitive?.kind === "finite_command") {
+    const exitCode =
+      typeof result.exitCode === "number"
+        ? result.exitCode
+        : typeof result.exit_code === "number"
+          ? result.exit_code
+          : typeof result.exitCodeAfter === "number"
+            ? result.exitCodeAfter
+            : null;
+    const evidence: ValidationEvidence = {
+      kind: "finite_command_result",
+      command: primitive.command,
+      ...(primitive.cwd ? { cwd: primitive.cwd } : {}),
+      completed: exitCode !== null,
+      exitCode,
+      ...(result.timedOut === true || result.timeout === true
+        ? { timedOut: true }
+        : {}),
+    };
+    return evaluateValidationSpec(primitive, [evidence])
+      .acceptanceSatisfied;
+  }
+  if (
+    primitive?.kind === "browser_interaction" ||
+    primitive?.kind === "desktop_interaction"
+  ) {
+    const raw = typeof output === "string"
+      ? output
+      : JSON.stringify(output);
+    const interaction = parseBrowserInteractionEvidence(raw);
+    if (!interaction) return false;
+    const evidence: ValidationEvidence = {
+      kind: primitive.kind === "browser_interaction"
+        ? "browser_interaction_result"
+        : "desktop_interaction_result",
+      actions: interaction.actions.map((action) => ({
+        ...(action.id ? { id: action.id } : {}),
+        kind: action.kind,
+        target: action.target,
+        succeeded: action.succeeded,
+      })),
+      assertions: interaction.assertions.map((assertion) => ({
+        kind: assertion.kind,
+        target: assertion.target,
+        passed: assertion.passed,
+        ...(assertion.afterActionId
+          ? { afterActionId: assertion.afterActionId }
+          : {}),
+        ...(typeof assertion.beforePassed === "boolean"
+          ? { beforePassed: assertion.beforePassed }
+          : {}),
+        ...(typeof assertion.changedAfterAction === "boolean"
+          ? { changedAfterAction: assertion.changedAfterAction }
+          : {}),
+        ...(typeof assertion.causallyLinked === "boolean"
+          ? { causallyLinked: assertion.causallyLinked }
+          : {}),
+        ...(assertion.actual !== undefined
+          ? { actual: assertion.actual }
+          : {}),
+      })),
+      ...(interaction.pageErrors.length > 0
+        ? { pageErrors: interaction.pageErrors }
+        : {}),
+      ...(interaction.consoleErrors.length > 0
+        ? { consoleErrors: interaction.consoleErrors }
+        : {}),
+    };
+    return evaluateValidationSpec(primitive, [evidence])
+      .acceptanceSatisfied;
+  }
+  if (
+    toolName === "browser_evaluate" ||
+    toolName === "computer_use"
+  ) {
+    const raw = typeof output === "string"
+      ? output
+      : JSON.stringify(output);
+    const interaction = parseBrowserInteractionEvidence(raw);
+    if (
+      !interaction ||
+      interaction.assertions.length === 0 ||
+      interaction.assertions.some((assertion) => !assertion.passed) ||
+      interaction.actions.some((action) => !action.succeeded) ||
+      interaction.pageErrors.length > 0 ||
+      interaction.consoleErrors.length > 0
+    ) {
+      return false;
+    }
+    return interaction.actions.length === 0 ||
+      interaction.assertions.some((assertion) =>
+        assertion.causallyLinked === true ||
+        (
+          assertion.changedAfterAction === true &&
+          assertion.beforePassed === false
+        )
+      );
   }
   if (typeof result.exitCode === "number") return result.exitCode === 0;
   if (typeof result.exit_code === "number") return result.exit_code === 0;
@@ -177,7 +299,29 @@ function isValidationPassed(toolName: string, output: unknown): boolean {
   return false;
 }
 
-function validationEvidenceVersion(output: unknown): string {
+function validationPrimitiveForCommand(
+  input: RuntimeV2ExecutionPortsInput,
+  command: RuntimeV2Command,
+): ValidationPrimitiveSpec | undefined {
+  const authority = command.payload.validationAuthority as
+    RuntimeV2ExecutionValidationAuthority | undefined;
+  const contract = aggregateForCurrentTurn(input)?.executionContract;
+  if (
+    authority?.kind !== "execution_contract" ||
+    !contract ||
+    contract.status !== "active" ||
+    authority.id !== contract.id ||
+    authority.revision !== contract.revision ||
+    authority.digest !== contract.digest
+  ) {
+    return undefined;
+  }
+  return contract.validations.find((validation) =>
+    validation.id === authority.validationId
+  )?.primitive;
+}
+
+export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
   const stableDiagnostic = modelContextContentForToolOutput(output)
     .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/:\d+(?::\d+)?\b/g, ":<line>")
@@ -340,7 +484,11 @@ export function toolCompletionFor(
     );
   }
   const passed = status === "succeeded" &&
-    isValidationPassed(toolName, output);
+    isRuntimeV2ValidationPassed(
+      toolName,
+      output,
+      validationPrimitiveForCommand(input, command),
+    );
   const validationFailureKind =
     failureKind === "source_mismatch" ||
       failureKind === "target_invalid" ||
@@ -348,13 +496,14 @@ export function toolCompletionFor(
       ? "protocol_invalid"
       : failureKind;
   return validationResultEvent(
+    input,
     command,
     passed,
     [{
       id: nextEvidenceId(input.live),
       kind: "validation",
       target: target || toolName,
-      version: passed ? null : validationEvidenceVersion(output),
+      version: runtimeV2ValidationEvidenceVersion(output),
     }],
     passed
       ? undefined

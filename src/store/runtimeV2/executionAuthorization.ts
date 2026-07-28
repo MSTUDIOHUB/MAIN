@@ -22,35 +22,36 @@ import {
 } from "../../lib/workspaceMutationTools";
 import {
   deriveRuntimeV2PlanSourceFreshness,
+  resolveRuntimeV2ExecutionContractValidation,
   resolveRuntimeV2PlanMutationScope,
   resolveRuntimeV2PlanValidationScope,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   isRuntimeV2WorkspaceReadToolName,
-  RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
-  RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   aggregateForCurrentTurn,
   approvedPlanForCurrentTurn,
 } from "./executionAggregate";
 import {
-  allowsRuntimeV2CorrectiveClarifyingRead,
-  constrainRuntimeV2MutationTools,
-  latestFailedMutationToolForLease,
-  runtimeV2MutationLease,
   validateRuntimeV2MutationLease,
 } from "./correctiveMutationPolicy";
-import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
-import { selectRuntimeV2ExecuteToolDefinitions } from "./providerToolSurface";
+import {
+  runtimeV2ToolDefinitions,
+} from "./executionToolDefinitions";
+import {
+  buildRuntimeV2TextEnvelopeCatalog,
+  selectRuntimeV2ProviderToolDefinitions,
+} from "./executionProviderTools";
 import type {
   RuntimeV2ExecutionAuthorization,
   RuntimeV2ExecutionPortsInput,
 } from "./executionTypes";
 
 export const RUNTIME_V2_VALIDATION_TOOL_NAMES = new Set([
-  "run_command", "browser_evaluate",
+  "run_command", "browser_evaluate", "computer_use",
 ]);
 
 export interface RuntimeV2FiniteValidationRejection {
@@ -123,154 +124,17 @@ export function providerToolDefinitionsForCommand(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
 ): ToolDefinition[] {
-  const available = [...authorizationFor(input).toolDefinitions];
-  const mode = String(command.payload.mode || "").trim();
-  if (mode === "conclude") return [];
-  const collaborationAction = String(
-    command.payload.collaborationAction || "",
-  ).trim();
-  const collaborationAllowed =
-    command.payload.collaborationAllowed !== false;
-  const activeSubagents = Array.isArray(command.payload.activeSubagents)
-    ? command.payload.activeSubagents
-    : [];
-  const remainingSubagentCapacity = Math.max(
-    0,
-    Number(command.payload.remainingSubagentCapacity) || 0,
-  );
-  const collaborationNames = new Set<string>();
-  if (collaborationAllowed && remainingSubagentCapacity > 0) {
-    collaborationNames.add("spawn_subagent");
-  }
-  if (collaborationAllowed && activeSubagents.length > 0) {
-    collaborationNames.add("wait_subagents");
-  }
-  if (collaborationAction === "spawn_required") {
-    return available.filter(
-      (definition) => definition.function.name === "spawn_subagent",
-    );
-  }
-  if (mode === "analyze") {
-    return available.filter((definition) =>
-      isRuntimeV2WorkspaceReadToolName(definition.function.name) ||
-      collaborationNames.has(definition.function.name)
-    );
-  }
-  if (mode === "validate") {
-    const approved = approvedPlanForCurrentTurn(input);
-    const allowed = approved
-      ? new Set(approved.plan.draft.validations.flatMap((validation) => {
-          if (validation.kind === "finite_command") return ["run_command"];
-          if (validation.kind === "browser") return ["browser_evaluate"];
-          if (validation.kind === "desktop") return ["computer_use"];
-          return [];
-        }))
-      : RUNTIME_V2_VALIDATION_TOOL_NAMES;
-    return available.filter((definition) =>
-      allowed.has(definition.function.name)
-    );
-  }
-  if (mode === "execute") {
-    const aggregate = aggregateForCurrentTurn(input);
-    const requiresMutation =
-      command.payload.executePolicy === "mutation_required";
-    const requiresFailureSourceRefresh =
-      command.payload.executePolicy === "source_refresh_required";
-    const requiresSourceReorientation =
-      command.payload.executePolicy === "source_reorientation_required";
-    const requiresInitialSourceGap =
-      command.payload.executePolicy === "source_gap_allowed";
-    if (requiresFailureSourceRefresh) {
-      return available.filter((definition) =>
-        definition.function.name === "read_file"
-      );
-    }
-    const approvedPlanNeedsFreshReads =
-      aggregate?.strategy === "plan" &&
-      aggregate.workPlan?.status === "approved" &&
-      !aggregate.evidence.some((evidence) => evidence.kind === "mutation") &&
-      deriveRuntimeV2PlanSourceFreshness(aggregate)?.allFresh === false;
-    // Keep one capability-based Execute surface for the rest of the phase.
-    // Dynamically withdrawing safe reads after the first successful call
-    // turns a recoverable extra observation into a provider transport error.
-    // Duplicate action fingerprints remain bounded by the Runtime core, while
-    // plan freshness, mutation scope and validation authority stay enforced
-    // independently below this presentation surface.
-    const selected = selectRuntimeV2ExecuteToolDefinitions({
-      available,
-      sourceToolNames: RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
-      isMutationToolName: isWorkspaceMutationToolName,
-      createOnlyMutationToolNames: new Set(["write_file"]),
-      requiresFreshSourceReads:
-        approvedPlanNeedsFreshReads ||
-        requiresSourceReorientation ||
-        requiresInitialSourceGap,
-      requiresMutation,
-    });
-    if (!requiresMutation) return selected;
-    const lease = runtimeV2MutationLease(input);
-    if (!lease) {
-      return aggregate?.strategy === "plan"
-        ? selected
-        : available.filter((definition) =>
-            definition.function.name === "read_file"
-          );
-    }
-    const allowClarifyingRead =
-      lease.authority === "acceptance_failure" &&
-      allowsRuntimeV2CorrectiveClarifyingRead(aggregate);
-    const correctiveSurface = allowClarifyingRead
-      ? [
-          ...selected,
-          ...available.filter((definition) =>
-            definition.function.name === "read_file"
-          ),
-        ]
-      : selected;
-    return constrainRuntimeV2MutationTools(
-      correctiveSurface,
-      lease,
-      allowClarifyingRead,
-      latestFailedMutationToolForLease(input, lease),
-    );
-  }
-  if (mode === "observe") {
-    return available.filter((definition) =>
-      RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name) ||
-      RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(
-        definition.function.name,
-      ) ||
-      collaborationNames.has(definition.function.name)
-    );
-  }
-  return available.filter((definition) =>
-    isWorkspaceMutationToolName(definition.function.name) ||
-    RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(definition.function.name)
-  );
+  return selectRuntimeV2ProviderToolDefinitions({
+    ports: input,
+    command,
+    available: authorizationFor(input).toolDefinitions,
+  });
 }
 
 export function compactTextEnvelopeCatalog(
   tools: readonly ToolDefinition[],
 ): string {
-  const entries = tools.map((definition) => ({
-    name: definition.function.name,
-    required: definition.function.parameters.required,
-    properties: Object.fromEntries(
-      Object.entries(definition.function.parameters.properties).map(
-        ([name, schema]) => [
-          name,
-          {
-            type: schema.type,
-            ...(schema.enum ? { enum: schema.enum } : {}),
-          },
-        ],
-      ),
-    ),
-  }));
-  return [
-    "[runtime-v2 allowed tool catalog]",
-    JSON.stringify(entries),
-  ].join("\n").slice(0, 12_000);
+  return buildRuntimeV2TextEnvelopeCatalog(tools);
 }
 
 export function validateToolAgainstPhaseAndPlan(input: {
@@ -344,6 +208,42 @@ export function validateToolAgainstPhaseAndPlan(input: {
     input.command.kind === "execute_tool" &&
     isWorkspaceMutationToolName(input.toolName)
   ) {
+    if (aggregate?.strategy === "execute") {
+      const contract = aggregate.executionContract;
+      if (!contract || contract.status !== "active") {
+        return {
+          allowed: false,
+          reason:
+            "修改前必须先提交与用户目标、版本化读取证据和验收方式绑定的执行契约。",
+          failureKind: "not_authorized",
+          reasonCode: "execution_contract_required",
+        };
+      }
+      const requestedTargets = resolveWorkspaceMutationTargets(
+        input.toolName,
+        input.args,
+        input.target,
+      );
+      const unexpectedTargets = requestedTargets.filter((requested) =>
+        !contract.changes.some((change) =>
+          workspacePathsReferToSameFile(change.target, requested)
+        )
+      );
+      if (
+        requestedTargets.length === 0 ||
+        unexpectedTargets.length > 0
+      ) {
+        return {
+          allowed: false,
+          reason:
+            `修改目标不在当前执行契约范围内：${
+              unexpectedTargets.join(", ") || "未解析目标"
+            }`,
+          failureKind: "not_authorized",
+          reasonCode: "execution_contract_mutation_scope",
+        };
+      }
+    }
     const mutationLease = validateRuntimeV2MutationLease({
       ports: input.ports,
       toolName: input.toolName,
@@ -358,6 +258,28 @@ export function validateToolAgainstPhaseAndPlan(input: {
           : "修改前必须先精确读取准备变更的源文件。",
         failureKind: "protocol_invalid",
         reasonCode: mutationLease.reasonCode,
+      };
+    }
+  }
+  if (
+    aggregate?.strategy === "execute" &&
+    input.command.kind === "execute_validation"
+  ) {
+    const contract = aggregate.executionContract;
+    const validation = contract?.status === "active"
+      ? resolveRuntimeV2ExecutionContractValidation({
+          contract,
+          toolName: input.toolName,
+          args: input.args,
+        })
+      : null;
+    if (!contract || !validation) {
+      return {
+        allowed: false,
+        reason:
+          "该验证调用与当前执行契约中的 validation id、命令或交互类型不一致。",
+        failureKind: "not_authorized",
+        reasonCode: "execution_contract_validation_scope",
       };
     }
   }
