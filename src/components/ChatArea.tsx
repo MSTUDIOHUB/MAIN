@@ -23,6 +23,10 @@ import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 import {
+  deriveTurnElapsedSeconds,
+  resolveTurnRunTimeWindow,
+} from "../lib/turnElapsedTime";
+import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   hasLivePlanWorkspace,
@@ -2411,6 +2415,7 @@ const TurnTimer = memo(function TurnTimer({
   status,
   isStreaming,
   currentTurnId,
+  activeSessionKey,
   savedElapsedTime,
   isLightThemeMode,
 }: {
@@ -2418,15 +2423,47 @@ const TurnTimer = memo(function TurnTimer({
   status: string;
   isStreaming: boolean;
   currentTurnId: string | null;
+  activeSessionKey?: string | null;
   savedElapsedTime?: number;
   isLightThemeMode: boolean;
 }) {
-  const storeElapsedTime = useAppStore((s) => s.elapsedTime);
+  const storeElapsedTime = useAppStore((s) => {
+    const sessionElapsed = activeSessionKey
+      ? s.runtimeBySessionKey?.[activeSessionKey]?.elapsedTime
+      : undefined;
+    return Math.max(
+      0,
+      Number(sessionElapsed ?? s.elapsedTime ?? 0) || 0,
+    );
+  });
+  const turnRuntimeEvents = useAppStore((s) => {
+    return activeSessionKey
+      ? s.runtimeBySessionKey?.[activeSessionKey]?.runtimeEvents
+      : s.runtimeEvents;
+  });
+  const runTimeWindow = useMemo(
+    () => resolveTurnRunTimeWindow({
+      events: Array.isArray(turnRuntimeEvents) ? turnRuntimeEvents : [],
+      turnId,
+    }),
+    [turnRuntimeEvents, turnId],
+  );
   const isActive = turnId === currentTurnId && (isStreaming || status === "executing" || status === "planning");
-  const persistedElapsedTime = Math.max(0, Number(savedElapsedTime) || 0);
-  const timeToShow = Math.floor(isActive
-    ? Math.max(persistedElapsedTime, Number(storeElapsedTime) || 0)
-    : persistedElapsedTime);
+  const [currentTime, setCurrentTime] = useState(Date.now());
+  useEffect(() => {
+    if (!isActive || !runTimeWindow.startedAt) return;
+    const update = () => setCurrentTime(Date.now());
+    update();
+    const timerId = window.setInterval(update, 250);
+    return () => window.clearInterval(timerId);
+  }, [isActive, runTimeWindow.startedAt]);
+  const timeToShow = deriveTurnElapsedSeconds({
+    window: runTimeWindow,
+    nowMs: currentTime,
+    isActive,
+    savedElapsedSeconds: savedElapsedTime,
+    sessionElapsedSeconds: storeElapsedTime,
+  });
 
   const minutes = Math.floor(timeToShow / 60);
   const seconds = timeToShow % 60;
@@ -4084,6 +4121,7 @@ export default function ChatArea({
                 status={turnPresentation.status}
                 isStreaming={isStreaming}
                 currentTurnId={currentTurnId}
+                activeSessionKey={activeSessionKey}
                 savedElapsedTime={turn.elapsedTime}
                 isLightThemeMode={isLightThemeMode}
               />

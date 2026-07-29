@@ -2012,7 +2012,7 @@ export async function runSubmitAsyncWorkflowRun<
       input.parsedSetupEngineCommand,
     ),
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,
   } satisfies RunSubmitRuntimeInput);

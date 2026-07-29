@@ -1202,6 +1202,7 @@ export interface SubmitSessionBootstrapPatchInput<
   activeSessionByWorkspace: Record<string, number | null>;
   autoApproveTools: boolean;
   autoApproveToolScopes: TAutoApproveScope[];
+  preferSubagents: boolean;
   webSearchEnabled: boolean;
   webSearchProvider: TWebSearchProvider;
 }
@@ -1216,6 +1217,7 @@ export type SubmitSessionBootstrapPatch<
   activeSessionByWorkspace: Record<string, number | null>;
   autoApproveTools: boolean;
   autoApproveToolScopes: TAutoApproveScope[];
+  preferSubagents: boolean;
   webSearchEnabled: boolean;
   webSearchProvider: TWebSearchProvider;
   approvedLocalFileReadPaths: [];
@@ -1851,6 +1853,7 @@ export function buildSubmitSessionBootstrapPatch<
     },
     autoApproveTools: params.autoApproveTools,
     autoApproveToolScopes: params.autoApproveToolScopes,
+    preferSubagents: params.preferSubagents,
     webSearchEnabled: params.webSearchEnabled,
     webSearchProvider: params.webSearchProvider,
     approvedLocalFileReadPaths: [],

@@ -48,25 +48,6 @@ export function baseProviderProfile(state: any): ProviderLaneProfileV1 {
   };
 }
 
-/**
- * Once a required structured tool call has succeeded, keep that transport
- * first for the Turn. Native remains the primary lane, but one already
- * supported text-envelope attempt stays available inside the same bounded
- * request when a local server ignores required tool choice. A proven text
- * envelope is exclusive because it already establishes that native tools are
- * unnecessary. Optional prose responses never establish either preference.
- */
-export function providerProfileForProvenToolTransport(
-  profile: ProviderLaneProfileV1,
-  provenTransport: "native" | "text_envelope" | null,
-  requiresTool: boolean,
-): ProviderLaneProfileV1 {
-  if (!requiresTool || !provenTransport) return profile;
-  return provenTransport === "native"
-    ? profile
-    : { ...profile, nativeTools: false };
-}
-
 export function recordApprovedPlanContext(
   input: RuntimeV2ExecutionPortsInput,
 ): void {
@@ -148,9 +129,10 @@ export function recordModelContext(
   }
 }
 
-/** A phase-level hint sourced only from committed execution authority.
+/** A phase-level hint sourced only from an approved WorkPlan.
  * Workspace manifests cannot silently promote a convenient build command
- * into acceptance evidence. */
+ * into acceptance evidence. Direct Execute leaves validation selection to the
+ * model and checks the resulting finite receipt at completion. */
 export function preferredFiniteValidationCommand(
   input: RuntimeV2ExecutionPortsInput,
 ): string {
@@ -161,14 +143,7 @@ export function preferredFiniteValidationCommand(
       String(validation.command || "").trim(),
   );
   const approvedCommand = String(approvedValidation?.command || "").trim();
-  if (approvedCommand) return approvedCommand;
-  const contractValidation =
-    aggregateForCurrentTurn(input)?.executionContract?.validations.find(
-      (validation) =>
-        validation.kind === "finite_command" &&
-        String(validation.command || "").trim(),
-    );
-  return String(contractValidation?.command || "").trim();
+  return approvedCommand;
 }
 
 function latestIndex(

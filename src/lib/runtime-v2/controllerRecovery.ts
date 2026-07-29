@@ -7,7 +7,6 @@ import type {
 import type { RuntimeV2Event } from "./events";
 import { isRuntimeV2ProviderProtocolError } from "./providerLane";
 import {
-  canOpenRuntimeV2RecoveryEpoch,
   canRecordRuntimeV2Recovery,
   runtimeV2ActionFingerprint,
   runtimeV2RecoveryScopeForCommandFailure,
@@ -129,20 +128,6 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
   readonly command: RuntimeV2Command;
   readonly error: unknown;
 }): RuntimeV2FailureRecoveryDecision {
-  if (
-    input.command.kind === "commit_execution_contract" &&
-    String(
-      input.error instanceof Error
-        ? input.error.message
-        : input.error,
-    ).startsWith("RUNTIME_V2_EXECUTION_CONTRACT_INVALID:")
-  ) {
-    return {
-      kind: "signal",
-      signal: "protocol_drift",
-      publish: true,
-    };
-  }
   if (isRuntimeV2ProviderProtocolError(input.error)) {
     return {
       kind: "signal",
@@ -231,98 +216,6 @@ export function decideRuntimeV2SemanticFailureRecovery(input: {
     kind: "signal",
     signal: "repeated_action",
     publish: false,
-  };
-}
-
-export function deriveRuntimeV2CorrectiveRecoveryEpoch(input: {
-  readonly aggregate: TurnAggregateV1;
-  readonly event: RuntimeV2Event;
-}): {
-  readonly reason:
-    | "corrective_mutation_committed_after_recoverable_failure"
-    | "corrective_source_refreshed_after_rejected_mutation";
-  readonly evidence: Extract<
-    RuntimeV2Event,
-    { readonly type: "tool.completed" }
-  >["evidence"];
-} | null {
-  const { aggregate, event } = input;
-  if (
-    !aggregate.run ||
-    aggregate.recovery.exhausted ||
-    event.type !== "tool.completed" ||
-    event.status !== "succeeded"
-  ) {
-    return null;
-  }
-  const currentEpochHasFailure = aggregate.recovery.receipts.some(
-    (receipt) => receipt.epoch === aggregate.recovery.epoch,
-  );
-  const mutationEvidence = event.evidence.filter(
-    (evidence) => evidence.kind === "mutation",
-  );
-  const sourceEvidence = event.evidence.filter(
-    (evidence) => evidence.kind === "source",
-  );
-  const novelSourceEvidence = sourceEvidence.filter((incoming) =>
-    !aggregate.events.some((candidate) =>
-      candidate.type === "tool.completed" &&
-      candidate.status === "succeeded" &&
-      candidate.evidence.some((existing) =>
-        existing.kind === "source" &&
-        existing.version === incoming.version &&
-        workspacePathsReferToSameFile(
-          existing.target,
-          incoming.target,
-        )
-      )
-    )
-  );
-  const epochBoundary = aggregate.events.map((candidate) => candidate.type)
-    .lastIndexOf("recovery.epoch_opened");
-  const epochEvents = aggregate.events.slice(epochBoundary + 1);
-  let latestRecoverableFailureIndex = -1;
-  for (let index = epochEvents.length - 1; index >= 0; index -= 1) {
-    const candidate = epochEvents[index]!;
-    if (
-      candidate.type === "tool.completed" &&
-      candidate.status !== "succeeded" &&
-      (
-        candidate.failureKind === "mutation_rejected" ||
-        candidate.failureKind === "source_mismatch"
-      )
-    ) {
-      latestRecoverableFailureIndex = index;
-      break;
-    }
-  }
-  const latestRecoverableEditFailure =
-    latestRecoverableFailureIndex >= 0 &&
-    !epochEvents.slice(latestRecoverableFailureIndex + 1).some(
-      (candidate) =>
-        candidate.type === "tool.completed" &&
-        candidate.status === "succeeded" &&
-        candidate.evidence.some((evidence) =>
-          evidence.kind === "source"
-        ),
-    );
-  const evidence = mutationEvidence.length > 0
-    ? mutationEvidence
-    : latestRecoverableEditFailure && novelSourceEvidence.length > 0
-      ? novelSourceEvidence
-      : [];
-  if (
-    !currentEpochHasFailure ||
-    evidence.length === 0 ||
-    !canOpenRuntimeV2RecoveryEpoch(aggregate.recovery)
-  ) {
-    return null;
-  }
-  return {
-    reason: mutationEvidence.length > 0
-      ? "corrective_mutation_committed_after_recoverable_failure"
-      : "corrective_source_refreshed_after_rejected_mutation",
-    evidence,
   };
 }
 

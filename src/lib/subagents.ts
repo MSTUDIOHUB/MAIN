@@ -34,7 +34,12 @@ export type SubagentStatus =
   | "failed"
   | "canceled";
 
-export type SubagentActivityStatus = "running" | "completed" | "failed" | "canceled";
+export type SubagentActivityStatus =
+  | "running"
+  | "completed"
+  | "degraded"
+  | "failed"
+  | "canceled";
 
 export interface SubagentActivity {
   id: string;

@@ -204,7 +204,10 @@ export type RuntimeV2Event =
       readonly type: "subagent.completed";
       readonly run: RuntimeV2RunIdentity;
       readonly jobId: string;
-      readonly status: Extract<RuntimeV2SubagentStatus, "completed" | "failed" | "canceled">;
+      readonly status: Extract<
+        RuntimeV2SubagentStatus,
+        "completed" | "degraded" | "failed" | "canceled"
+      >;
       readonly summary: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly report?: RuntimeV2SubagentReportV1;

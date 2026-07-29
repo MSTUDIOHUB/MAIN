@@ -22,6 +22,7 @@ import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/wor
 import { authorizationFor } from "./executionAuthorization";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { recordModelContext } from "./executionProviderContext";
+import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
 import type {
   RuntimeV2ExecutionPortsInput,
   RuntimeV2LiveExecutionState,
@@ -52,14 +53,20 @@ export function recordToolModelContext(input: {
   readonly status: "succeeded" | "failed" | "blocked";
   readonly content: string;
 }): void {
+  const toolCallId = String(input.command.payload.toolCallId || "");
   recordModelContext(input.ports.live, {
-    id: `tool-result:${String(input.command.payload.toolCallId || input.ports.nextId("tool-context"))}`,
+    id: `tool-result:${toolCallId || input.ports.nextId("tool-context")}`,
     source: "tool",
     label: input.toolName || "unknown_tool",
     target: input.target || input.toolName || "workspace",
     status: input.status,
     content: input.content,
   });
+  appendRuntimeV2ToolResultHistory(
+    input.ports.live,
+    toolCallId,
+    input.content,
+  );
 }
 
 export function toolDefinitionExists(

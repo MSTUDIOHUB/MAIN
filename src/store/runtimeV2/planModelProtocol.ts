@@ -180,11 +180,7 @@ export function providerPlanMessages(input: {
 export function boundedPlanTranscript(
   messages: readonly AgentMessage[],
 ): AgentMessage[] {
-  if (messages.length <= 24) return [...messages];
-  return [
-    ...messages.slice(0, 3),
-    ...messages.slice(-(24 - Math.min(3, messages.length))),
-  ];
+  return [...messages];
 }
 
 export function compactRetainedPlanObservation(

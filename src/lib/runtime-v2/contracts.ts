@@ -1,6 +1,6 @@
 export const RUNTIME_V2_ENGINE_VERSION = "v2" as const;
 export const RUNTIME_V2_EVENT_SCHEMA_VERSION = "runtime-v2-event.v1" as const;
-export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v4" as const;
+export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v5" as const;
 
 export type RuntimeEngineVersion = "legacy" | typeof RUNTIME_V2_ENGINE_VERSION;
 
@@ -214,6 +214,7 @@ export type RuntimeV2SubagentStatus =
   | "queued"
   | "running"
   | "completed"
+  | "degraded"
   | "failed"
   | "canceled";
 

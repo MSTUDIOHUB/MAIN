@@ -12,10 +12,25 @@ import {
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
+import {
+  appendRuntimeV2ToolResultHistory,
+} from "./executionProviderHistory";
 import { startRuntimeV2ReadOnlyChild } from "./executionSubagentRunner";
 
 function boundedArgument(value: unknown, max: number): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function closeCollaborationToolCall(
+  input: RuntimeV2ExecutionPortsInput,
+  command: Parameters<SchedulerPort["execute"]>[0]["command"],
+  content: string,
+): void {
+  appendRuntimeV2ToolResultHistory(
+    input.live,
+    boundedArgument(command.payload.toolCallId, 256),
+    content.trim().slice(0, 8_000),
+  );
 }
 
 function commaSeparatedPaths(value: unknown): string[] {
@@ -159,19 +174,36 @@ export function createRuntimeV2SchedulerPort(
       if (command.kind !== "schedule_subagents") return null;
       const existingJobs =
         aggregateForCurrentTurn(input)?.subagents || [];
-      const decision = scheduleReadOnlySubagents({
-        parentRun: command.run,
-        candidates: [modelSelectedCandidate(command)],
-        existingJobs,
-        requestedAt: input.now(),
-        nextId: input.nextId,
-      });
+      let decision;
+      try {
+        decision = scheduleReadOnlySubagents({
+          parentRun: command.run,
+          candidates: [modelSelectedCandidate(command)],
+          existingJobs,
+          requestedAt: input.now(),
+          nextId: input.nextId,
+        });
+      } catch (error) {
+        closeCollaborationToolCall(
+          input,
+          command,
+          `SUBAGENT_SCHEDULE_REJECTED: ${
+            error instanceof Error ? error.message : String(error)
+          } Continue the parent task directly or submit a valid, genuinely independent read-only task.`,
+        );
+        throw error;
+      }
       if (decision.jobs.length !== 1) {
         const detail =
           `The requested child duplicates an existing semantic task, exceeds ` +
           `the two-active-child limit, or violates the read-only scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. Continue the parent task directly or delegate a genuinely different task.`;
+        closeCollaborationToolCall(
+          input,
+          command,
+          `SUBAGENT_SCHEDULE_REJECTED: ${detail}`,
+        );
         recordModelContext(input.live, {
           id:
             `scheduler:${command.idempotencyKey}:spawn_subagent_rejected`,
@@ -212,6 +244,11 @@ export function createRuntimeV2SchedulerPort(
           (!sourceToolCallId || job.sourceToolCallId === sourceToolCallId)
         );
         if (jobs.length === 0) {
+          closeCollaborationToolCall(
+            input,
+            command,
+            "SUBAGENT_SCHEDULE_REJECTED: no committed child matched this request. Continue the parent task directly.",
+          );
           throw new Error(
             "Runtime v2 scheduler could not resolve the child job committed for this spawn_subagent call.",
           );
@@ -266,6 +303,15 @@ export function createRuntimeV2SchedulerPort(
             });
           }
         }
+        closeCollaborationToolCall(
+          input,
+          command,
+          [
+            "SUBAGENT_STARTED",
+            `Handles: ${jobs.map(runtimeV2SubagentModelHandle).join(", ")}`,
+            "Continue independent parent work. Use wait_subagents only when a child result becomes a dependency.",
+          ].join("\n"),
+        );
         return events;
       }
       if (command.kind === "join_subagents") {
@@ -305,15 +351,17 @@ export function createRuntimeV2SchedulerPort(
             requestedJobIds,
             activeTaskHandles,
           });
+          closeCollaborationToolCall(
+            input,
+            command,
+            `SUBAGENT_WAIT_REJECTED: ${detail} Continue independent parent work.`,
+          );
           throw new Error(
             detail,
           );
         }
-        for (const jobId of jobIds) {
-          input.live.childReportRequests?.add(jobId);
-        }
         if (jobIds.length > 0) {
-          input.logStoreEvent("runtime_v2_subagent_report_requested", {
+          input.logStoreEvent("runtime_v2_subagent_wait_requested", {
             turnId: command.run.turnId,
             runId: command.run.runId,
             jobIds,
@@ -406,7 +454,11 @@ export function createRuntimeV2SchedulerPort(
               result.evidence[0]?.target ||
               result.job.allowedPaths.join(", "),
             status:
-              result.status === "completed" ? "succeeded" : "failed",
+              result.status === "completed"
+                ? "succeeded"
+                : result.status === "degraded"
+                  ? "blocked"
+                  : "failed",
             content: [
               `Scope: ${result.job.scopeKey} (${
                 result.job.allowedPaths.join(", ")
@@ -432,7 +484,6 @@ export function createRuntimeV2SchedulerPort(
             structuredReport: !!result.report,
             validationReceiptCount: result.validationReceipts.length,
           });
-          input.live.childReportRequests?.delete(result.job.id);
           input.live.childRuns.delete(result.job.id);
         }
         const aggregate = aggregateForCurrentTurn(input);
@@ -462,6 +513,27 @@ export function createRuntimeV2SchedulerPort(
           parentChildOverlap: parentChildOverlapMs > 0,
           parentChildOverlapMs,
         });
+        closeCollaborationToolCall(
+          input,
+          command,
+          [
+            "SUBAGENT_RESULTS",
+            ...results.flatMap((result) => result
+              ? [
+                  `Handle: ${runtimeV2SubagentModelHandle(result.job)}`,
+                  `Status: ${result.status}`,
+                  `Evidence ids: ${
+                    result.evidence.map((evidence) => evidence.id)
+                      .join(", ") || "none"
+                  }`,
+                  `Summary: ${result.summary.slice(0, 2_000)}`,
+                ]
+              : []),
+            observedJobs.some((job) => job.status !== "completed")
+              ? "One or more child tasks did not complete. Continue the objective directly using any retained evidence."
+              : "Apply child findings only when they are relevant to the parent objective.",
+          ].join("\n"),
+        );
         return events;
       }
       throw new Error(

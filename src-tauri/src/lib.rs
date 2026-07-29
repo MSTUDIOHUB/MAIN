@@ -2813,6 +2813,14 @@ fn code_ast_query(
 }
 
 #[tauri::command]
+fn check_source_syntax(
+    path: String,
+    content: String,
+) -> Result<code_ast::SourceSyntaxCheckResult, String> {
+    code_ast::check_source_syntax(Path::new(&path), content.as_bytes())
+}
+
+#[tauri::command]
 async fn find_symbol_references(
     state: State<'_, WorkspaceState>,
     symbol: String,
@@ -12604,6 +12612,7 @@ pub fn run() {
             shell_permission_preflight,
             build_repository_index,
             code_ast_query,
+            check_source_syntax,
             find_symbol_references,
             load_session_memory,
             record_session_failure,

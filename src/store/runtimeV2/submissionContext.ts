@@ -1,4 +1,5 @@
 import type { ResolvedRunIntent } from "../../lib/runIntent";
+import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { TurnInputContextSignals } from "../../lib/turnIntake";
 import type {
   GoalContinuationAuthorization,
@@ -29,6 +30,11 @@ export interface RuntimeV2SubmissionContext {
   readonly timerInterval: unknown;
   readonly harnessRunId: string;
   readonly turnInputContextSignals: TurnInputContextSignals;
+  /**
+   * One immutable budget resolved at Run admission. Every provider request,
+   * history compactor, and bounded read in this Run consumes this same value.
+   */
+  readonly runtimeContextBudget?: RuntimeContextBudget | null;
   /** Optional parent-owned objective slice. Goal execution must preserve the
    * original criterion ids instead of re-admitting a synthesized prompt as
    * an anonymous Execute request. */
@@ -39,5 +45,17 @@ export interface RuntimeV2SubmissionContext {
       readonly id: string;
       readonly text: string;
     }[];
+  };
+}
+
+export function withRuntimeV2ContextBudget<
+  T extends RuntimeV2SubmissionContext,
+>(
+  context: T,
+  runtimeContextBudget: RuntimeContextBudget | null,
+): T & { readonly runtimeContextBudget: RuntimeContextBudget | null } {
+  return {
+    ...context,
+    runtimeContextBudget,
   };
 }

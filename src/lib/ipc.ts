@@ -384,6 +384,16 @@ export interface AstQueryResult {
   note: string;
 }
 
+export interface SourceSyntaxCheckResult {
+  path: string;
+  language: string | null;
+  applicable: boolean;
+  hasErrors: boolean;
+  errorCount: number;
+  firstErrorLine?: number | null;
+  firstErrorColumn?: number | null;
+}
+
 export interface SymbolOccurrence {
   path: string;
   language: string;
@@ -1537,6 +1547,16 @@ export function codeAstQuery(input: {
     kinds: input.kinds,
     maxResults: input.maxResults,
     workspace,
+  });
+}
+
+export function checkSourceSyntax(
+  path: string,
+  content: string,
+): Promise<SourceSyntaxCheckResult> {
+  return invoke<SourceSyntaxCheckResult>("check_source_syntax", {
+    path,
+    content,
   });
 }
 

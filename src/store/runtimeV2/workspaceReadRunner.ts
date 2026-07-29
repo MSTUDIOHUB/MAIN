@@ -31,7 +31,7 @@ export interface RuntimeV2WorkspaceReadRunnerInput {
   readonly context: RuntimeV2SubmissionContext;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: any) => unknown;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;
@@ -196,7 +196,7 @@ export async function runSubmitRuntimeV2WorkspaceRead(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,

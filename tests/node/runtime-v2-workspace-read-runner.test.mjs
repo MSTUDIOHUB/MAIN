@@ -118,7 +118,6 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
         evidenceCounter: 0,
         latestProviderResult: null,
         latestVisibleText: "",
-        lastProviderTransport: null,
         providerLaneProfile: null,
         authorization: null,
       };
@@ -239,7 +238,7 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
     },
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",

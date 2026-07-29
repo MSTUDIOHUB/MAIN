@@ -23,6 +23,7 @@ import { PLAN_AUTHORING_CONTRACT_VERSION } from "../../src/lib/planAuthoringCont
 import { isAcceptanceCapableValidationSpec } from "../../src/lib/validationContract";
 import {
   collectBoundedRealOmlxWorkspaceFiles,
+  checkRealOmlxSourceSyntax,
   createRealOmlxAcceptanceState,
   readBoundedRealOmlxWorkspaceTextFile,
   readBoundedRealOmlxWorkspaceTextFiles,
@@ -500,21 +501,34 @@ function expectCanonicalRuntimeV2Terminal(
     expected.resultKind === "success" &&
     (expected.strategy || "execute") === "execute"
   ) {
-    expect(runtime?.executionContract).toMatchObject({
-      schemaVersion: "runtime-v2-execution-contract.v1",
-      status: "active",
-    });
-    expect(runtime.executionContract.criteria.length).toBeGreaterThan(0);
-    expect(runtime.executionContract.changes.length).toBeGreaterThan(0);
-    expect(runtime.executionContract.validations.length).toBeGreaterThan(0);
-    const passedReceipts = events.flatMap((event: {
+    const mutationEvents = events.filter((event: {
+      type?: string;
+      status?: string;
+      evidence?: Array<{ kind?: string }>;
+    }) =>
+      event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      (event.evidence || []).some((entry) => entry.kind === "mutation")
+    );
+    expect(mutationEvents.length).toBeGreaterThan(0);
+    const finalMutationSequence = Math.max(
+      ...mutationEvents.map((event: { sequence?: number }) =>
+        Number(event.sequence || 0)
+      ),
+    );
+    const passedParentValidations = events.filter((event: {
+      type?: string;
+      passed?: boolean;
+      sequence?: number;
+    }) =>
+      event.type === "validation.completed" &&
+      event.passed === true &&
+      Number(event.sequence || 0) > finalMutationSequence
+    );
+    const passedChildValidations = events.flatMap((event: {
       type?: string;
       status?: string;
       report?: unknown;
-      passed?: boolean;
-      authority?: unknown;
-      mutationBoundarySequence?: number;
-      validatedMutationVersions?: unknown[];
       validationReceipts?: Array<{
         passed?: boolean;
         authority?: unknown;
@@ -522,32 +536,60 @@ function expectCanonicalRuntimeV2Terminal(
         validatedMutationVersions?: unknown[];
       }>;
     }) => {
-      if (event.type === "validation.completed" && event.passed === true) {
-        return [event];
-      }
       if (
         event.type === "subagent.completed" &&
         event.status === "completed" &&
         !!event.report
       ) {
         return (event.validationReceipts || []).filter(
-          (receipt) => receipt.passed === true,
+          (receipt) =>
+            receipt.passed === true &&
+            Number(receipt.mutationBoundarySequence || 0) >=
+              finalMutationSequence,
         );
       }
       return [];
     });
-    expect(passedReceipts.length).toBeGreaterThan(0);
-    expect(passedReceipts.every((receipt: {
-      authority?: unknown;
-      mutationBoundarySequence?: number;
-      validatedMutationVersions?: unknown[];
+    expect(
+      passedParentValidations.length + passedChildValidations.length,
+    ).toBeGreaterThan(0);
+    const passedValidationKeys = new Set(
+      passedParentValidations.map((event: { idempotencyKey?: string }) =>
+        String(event.idempotencyKey || "")
+      ),
+    );
+    expect(commands.some((command: {
+      kind?: string;
+      status?: string;
+      idempotencyKey?: string;
     }) =>
-      !!receipt.authority &&
-      Number.isInteger(receipt.mutationBoundarySequence) &&
-      Number(receipt.mutationBoundarySequence) > 0 &&
-      Array.isArray(receipt.validatedMutationVersions) &&
-      receipt.validatedMutationVersions.length > 0
+      command.kind === "execute_validation" &&
+      command.status === "succeeded" &&
+      passedValidationKeys.has(String(command.idempotencyKey || ""))
     )).toBe(true);
+
+    if (runtime?.workPlan?.status === "approved") {
+      const authoritativeReceipts = [
+        ...passedParentValidations,
+        ...passedChildValidations,
+      ].filter((receipt: {
+        authority?: unknown;
+        mutationBoundarySequence?: number;
+        validatedMutationVersions?: unknown[];
+      }) =>
+        !!receipt.authority &&
+        Number.isInteger(receipt.mutationBoundarySequence) &&
+        Number(receipt.mutationBoundarySequence) > 0 &&
+        Array.isArray(receipt.validatedMutationVersions) &&
+        receipt.validatedMutationVersions.length > 0
+      );
+      expect(authoritativeReceipts.length).toBeGreaterThan(0);
+    } else {
+      // The minimal direct-Execute kernel preserves the admitted objective
+      // and proves it with a post-mutation behavioral validation. It does not
+      // revive the removed model-authored execution-contract protocol.
+      expect(runtime?.executionContract ?? null).toBeNull();
+    }
   }
 
   const projections = Array.isArray(runtime?.projections) ? runtime.projections : [];
@@ -1008,6 +1050,10 @@ test.beforeEach(async ({ page }) => {
     const stat = await fs.stat(absolute);
     return { path: rawPath, sizeBytes: stat.size, modifiedMs: stat.mtimeMs };
   });
+  await page.exposeFunction("__MAIN_E2E_CHECK_SOURCE_SYNTAX", (
+    rawPath: string,
+    content: string,
+  ) => checkRealOmlxSourceSyntax(rawPath, content));
   await page.exposeFunction("__MAIN_E2E_DISK_GLOB", async () => await getWorkspaceInventory());
   await page.exposeFunction("__MAIN_E2E_DISK_SEARCH_FILES", async () => {
     const inventory = await getWorkspaceInventory();
@@ -1082,6 +1128,9 @@ test.beforeEach(async ({ page }) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
+    console.log(`[real-omlx-validation-command] ${JSON.stringify({
+      command: command.slice(0, 1_000),
+    })}`);
     const mutationState = await inspectFixtureMutation(
       workspace,
       fixtureMutationBaseline,
@@ -1134,10 +1183,15 @@ test.beforeEach(async ({ page }) => {
 
   await page.exposeFunction("__MAIN_E2E_PROXY_REQUEST", async (args: Record<string, unknown>) => {
     const url = String(args.url || "");
+    const method = String(args.method || "POST").toUpperCase();
     const response = await fetch(url, {
-      method: String(args.method || "POST"),
+      method,
       headers: args.headers as Record<string, string>,
-      body: String(args.body || ""),
+      body: method === "GET" || method === "HEAD"
+        ? undefined
+        : typeof args.body === "string"
+          ? args.body
+          : undefined,
     });
     const text = await response.text();
     console.log(`[real-omlx-proxy] ${response.status} ${url} ${text.slice(0, 240).replace(/\s+/g, " ")}`);
@@ -1210,23 +1264,101 @@ test.beforeEach(async ({ page }) => {
         // The diagnostic is best-effort and must never affect the transport.
       }
     }
-    return [...calls.values()].map((call) => ({
-      name: call.name,
-      arguments:
-        call.name === "submit_execution_contract"
-          ? call.arguments.slice(0, 8_000)
-          : "",
-    }));
+    return [...calls.values()].map((call) => {
+      let argumentSummary: unknown = "";
+      try {
+        const parsed = JSON.parse(call.arguments || "{}");
+        argumentSummary =
+          call.name === "read_file"
+            ? Object.fromEntries(
+                [
+                  "path",
+                  "start_line",
+                  "end_line",
+                  "max_lines",
+                  "max_chars",
+                ].flatMap((key) =>
+                  Object.prototype.hasOwnProperty.call(parsed, key)
+                    ? [[key, parsed[key]]]
+                    : []
+                ),
+              )
+            : call.name === "grep_search"
+              ? {
+                  path: String(parsed.path || ".").slice(0, 240),
+                  query: String(parsed.query || parsed.pattern || "")
+                    .slice(0, 500),
+                }
+            : call.name === "run_command"
+              ? {
+                  command: String(parsed.command || parsed.cmd || "")
+                    .slice(0, 1_000),
+                  timeout_ms: parsed.timeout_ms,
+                }
+            : call.name === "submit_execution_contract"
+              ? parsed
+              : {
+                  keys: Object.keys(parsed).sort(),
+                };
+      } catch {
+        argumentSummary = {
+          invalidJsonPreview: call.arguments.slice(0, 240),
+        };
+      }
+      return {
+        name: call.name,
+        arguments: argumentSummary,
+      };
+    });
   };
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
     const url = String(args.url || "");
     const bodyText = String(args.body || "");
     let model = "";
+    let parsedBody: Record<string, unknown> | null = null;
     try {
-      model = String(JSON.parse(bodyText).model || "");
+      parsedBody = JSON.parse(bodyText) as Record<string, unknown>;
+      model = String(parsedBody.model || "");
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
+    }
+    if (
+      bodyText.includes("UNCHANGED_SOURCE_REPEAT_REJECTED") ||
+      bodyText.includes("UNCHANGED_OBSERVATION_REPEAT_REJECTED") ||
+      bodyText.includes("REPEATED_ACTION_REJECTED")
+    ) {
+      const messages = Array.isArray(parsedBody?.messages)
+        ? parsedBody.messages as Array<Record<string, unknown>>
+        : [];
+      console.log(`[real-omlx-repeat-context] ${JSON.stringify(
+        messages.slice(-8).map((message) => ({
+          role: String(message.role || ""),
+          toolCallId: String(message.tool_call_id || ""),
+          toolCalls: Array.isArray(message.tool_calls)
+            ? message.tool_calls.map((call) => {
+                const record = call && typeof call === "object"
+                  ? call as Record<string, unknown>
+                  : {};
+                const fn = record.function && typeof record.function === "object"
+                  ? record.function as Record<string, unknown>
+                  : {};
+                return {
+                  id: String(record.id || ""),
+                  name: String(fn.name || ""),
+                  argumentsPreview: String(fn.arguments || "")
+                    .slice(0, 1_200),
+                };
+              })
+            : [],
+          repeatCodes: String(message.content || "").match(
+            /UNCHANGED_SOURCE_REPEAT_REJECTED|UNCHANGED_OBSERVATION_REPEAT_REJECTED|REPEATED_ACTION_REJECTED/g,
+          ) || [],
+          toolResultPreview: String(message.role || "") === "tool"
+            ? String(message.content || "").slice(0, 1_200)
+            : "",
+        })),
+      )}`);
     }
     const contractErrors = [
       ...bodyText.matchAll(
@@ -1873,6 +2005,12 @@ test.beforeEach(async ({ page }) => {
         };
       }
       if (cmd === "read_file") return await readText(String(args?.path || ""));
+      if (cmd === "check_source_syntax") {
+        return await (window as any).__MAIN_E2E_CHECK_SOURCE_SYNTAX(
+          String(args?.path || ""),
+          String(args?.content || ""),
+        );
+      }
       if (cmd === "read_file_window") {
         const path = String(args?.path || "");
         const windowResult = await (window as any).__MAIN_E2E_DISK_READ_WINDOW(path, {
@@ -1891,6 +2029,9 @@ test.beforeEach(async ({ page }) => {
           returnedChars: Number(windowResult?.returnedChars || 0),
           truncated: Boolean(windowResult?.truncated),
           nextStartLine: windowResult?.nextStartLine ?? null,
+          ...(windowResult?.contentVersion
+            ? { contentVersion: String(windowResult.contentVersion) }
+            : {}),
         };
       }
       if (cmd === "read_document") {
@@ -3090,10 +3231,9 @@ for (const model of models) {
       evidence.kind === "mutation"
     )).toBe(true);
     const passedParentValidations = (runtimeV2.events || []).filter(
-      (event: { type?: string; passed?: boolean; authority?: unknown }) =>
+      (event: { type?: string; passed?: boolean }) =>
         event.type === "validation.completed" &&
-        event.passed === true &&
-        !!event.authority,
+        event.passed === true,
     );
     const passedChildValidations = (runtimeV2.events || []).flatMap(
       (event: {
@@ -3119,32 +3259,26 @@ for (const model of models) {
     expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
       evidence.kind === "validation"
     )).toBe(true);
-    const finalValidationAuthority = (
-      passedChildValidations.at(-1)?.authority ||
-      passedParentValidations.at(-1)?.authority
-    ) as { validationId?: string } | undefined;
-    const finalValidationSpec = (
-      runtimeV2.executionContract?.validations || []
-    ).find((validation: { id?: string }) =>
-      validation.id === finalValidationAuthority?.validationId
-    ) as {
-      command?: string;
-      primitive?: Parameters<typeof isAcceptanceCapableValidationSpec>[0];
-    } | undefined;
-    const finalValidationPrimitive = finalValidationSpec?.primitive;
+    const successfulValidationCommands = (runtimeV2.commands || [])
+      .filter((command: {
+        kind?: string;
+        status?: string;
+      }) =>
+        command.kind === "execute_validation" &&
+        command.status === "succeeded"
+      );
+    const finalFiniteValidation = [...successfulValidationCommands]
+      .reverse()
+      .find((command: { toolName?: string; target?: string }) =>
+        command.toolName === "run_command" &&
+        isFinitePlanValidationCommand(String(command.target || ""))
+      );
     const finalValidationCommand = String(
-      finalValidationPrimitive?.kind === "finite_command"
-        ? finalValidationPrimitive.command
-        : finalValidationSpec?.command || "",
+      finalFiniteValidation?.target || "",
     ).trim();
     if (requireSemanticTaskQuality) {
-      expect(
-        !!finalValidationPrimitive &&
-          isAcceptanceCapableValidationSpec(finalValidationPrimitive),
-      ).toBe(true);
-      if (finalValidationPrimitive?.kind === "finite_command") {
-        expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
-      }
+      expect(finalFiniteValidation).toBeTruthy();
+      expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
     }
     if (finalValidationCommand) {
       const independentFinalValidation = await runRealOmlxWorkspaceCommand(

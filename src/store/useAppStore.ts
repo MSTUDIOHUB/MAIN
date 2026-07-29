@@ -110,6 +110,7 @@ import {
 } from "../lib/turnRuntimeCheckpoint";
 import {
   normalizeRuntimeV2CheckpointMap,
+  serializeRuntimeV2CheckpointMap,
   type RuntimeV2CheckpointMap,
 } from "../lib/runtime-v2/checkpoint";
 import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
@@ -5879,6 +5880,7 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
+  const persistable = buildSessionRuntimeSnapshotFromStoreState(snapshot);
   const sanitizedPlanArtifacts = sanitizeRestoredPlanArtifacts({
     artifacts: snapshot.planArtifacts || [],
     isPlanApproved: snapshot.isPlanApproved === true,
@@ -5907,7 +5909,7 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
       : undefined,
   );
   return {
-    ...snapshot,
+    ...persistable,
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
     harnessRunMarker: normalizeHarnessRunMarker(snapshot.harnessRunMarker),
@@ -5919,7 +5921,7 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
         closureReceiptLedger: subagentClosureReceiptLedger,
       },
     ),
-    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+    runtimeV2Checkpoints: serializeRuntimeV2CheckpointMap(
       snapshot.runtimeV2Checkpoints,
       checkpointOwnerFence
         ? {
@@ -6321,7 +6323,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
         closureReceiptLedger: subagentClosureReceiptLedger,
       },
     ),
-    runtimeV2Checkpoints: normalizeRuntimeV2CheckpointMap(
+    runtimeV2Checkpoints: serializeRuntimeV2CheckpointMap(
       state.runtimeV2Checkpoints,
       checkpointWorkspaceKey || hasBoundPlanLifecycle
         ? {
@@ -6334,7 +6336,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
               : {}),
           }
         : undefined,
-    ),
+    ) as RuntimeV2CheckpointMap,
     subagentClosureReceiptLedger,
     taskFlow: Array.isArray(state.taskFlow) ? archiveConsumedReplyOptionsFromTaskFlow(state.taskFlow) : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
@@ -13229,7 +13231,7 @@ export const useAppStore = create<AppState>()(
           sessionId: state.currentSessionId,
           getSessionRevisionToken,
           sanitizeTaskBlocksForPersist,
-          normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+          buildSessionRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
           persistSessionRecord: saveProjectSession,
           publishOwnerScopedRuntimeProjection,
           logStoreEvent,
@@ -15462,12 +15464,21 @@ export const useAppStore = create<AppState>()(
       : (initial.sessionsByWorkspace[scopeKey] || []).find((candidate) => candidate.id === sessionId) || null;
     if (!sessionId || !sessionKey || !session) {
       const language = initial.config.language === "en" ? "en" : "zh";
-      const autoSession = buildNewSessionRecord({
+      const createdSession = buildNewSessionRecord({
         state: initial,
         scopeKey,
         affinity: initial.selectedMainModeKey === "image_studio" ? "image_studio" : "main_mode",
         language,
       });
+      const autoSession = {
+        ...createdSession,
+        runtimeSnapshot: {
+          ...createdSession.runtimeSnapshot!,
+          autoApproveTools: initial.autoApproveTools,
+          autoApproveToolScopes: [...initial.autoApproveToolScopes],
+          preferSubagents: initial.preferSubagents,
+        },
+      };
       const autoSessionRuntimePatch = getSessionRuntimeUiPatch(
         createSessionRuntimeFromState(autoSession.runtimeSnapshot || {}),
         { resetPanels: true },
@@ -19062,7 +19073,7 @@ export const useAppStore = create<AppState>()(
       runSessionKey,
       titleIntentSignature,
       sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+      buildSessionRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
       commitLocalSlashProjection: (context) => {
         if (!isHidden && ensuredSessionId != null) {
           sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
@@ -19599,7 +19610,7 @@ export const useAppStore = create<AppState>()(
       PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
       sanitizeTaskBlocksForPersist,
       sanitizeAgentMessagesForPersist,
-      normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
+      buildSessionRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
       normalizeProviderCompatibilityByRuntimeKey,
       compactCompletedTurnAgentMessages,
       normalizeQueuedUserMessage,

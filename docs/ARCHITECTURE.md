@@ -1,8 +1,11 @@
 # MAIN 架构与唯一所有权
 
 > 状态：现行规范
-> 最后按代码核验：2026-07-23
+> 最后按代码核验：2026-07-29
 > 若历史发布说明、旧截图或注释与本文冲突，以本文和当前测试为准。
+>
+> Runtime 修改必须同时遵守 [最小运行内核与能力边界](RUNTIME_KERNEL_INVARIANTS.md)。
+> 该文档记录当前生产入口、已接线能力和 v1/v2 对照门；仅存在但没有生产调用方的导出函数不构成产品能力。
 
 MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性验证边界。任何生命周期规则只能有一个所有者，不能在 TypeScript 与 Rust 中各实现一套策略。
 
@@ -10,12 +13,12 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 
 | 边界 | 唯一所有者 | 当前代码入口 | 不负责 |
 | --- | --- | --- | --- |
-| 用户意图、Plan Authoring Contract、typed Plan graph、模型循环与恢复策略 | TypeScript | `src/store/submitAsyncWorkflowRun.ts`、`src/store/submitWorkflowEngineRunner.ts`、`src/lib/orchestrator/workflowEngine.ts`、`src/lib/orchestrator.ts`、`src/lib/orchestrator/loop/AgentOrchestrator.ts`、`src/lib/planAuthoringContract.ts`、`src/lib/planContract.ts` | 最终文件系统、Shell、网络与进程安全；让模型文本直接决定生命周期或完成状态 |
+| 用户意图、Runtime v2 runner、模型循环与恢复策略 | TypeScript | `src/store/submitAsyncWorkflowRun.ts`、`src/store/submitRuntimeRunner.ts`、`src/store/runtimeV2/`、`src/lib/runtime-v2/` | 最终文件系统、Shell、网络与进程安全；让模型文本直接决定生命周期或完成状态 |
 | 审批请求、Context、Session 语义、Workspace Turn 接纳/FIFO、canonical Turn checkpoint、执行尝试所有权、续跑和 UI 可见状态 | TypeScript | `src/store/useAppStore.ts`、`src/store/workspaceTurnQueue.ts`、`src/store/submitRunLease.ts`、`src/lib/turnRuntimeContract.ts`、`src/lib/turnRuntimeCheckpoint.ts`、`src/lib/turnEvents.ts`、`src/lib/runTransitionReducer.ts` | 执行未经 Rust 复核的命令；把业务状态裁决委托给 SQLite |
 | 文件、Shell、PTY、应用管理的网络请求和 Session 快照存储机制 | Rust | `src-tauri/src/lib.rs`、`src-tauri/src/trusted_execution.rs`、`src-tauri/src/network_guard.rs`、`src-tauri/src/harness/permissions.rs`、`src-tauri/src/session_store.rs` | 重新判断用户意图、计划、队列状态、Run 所有权、transcript 合并或模型恢复策略 |
 | Trace、Replay、Golden、Eval 和回归夹具 | Rust Harness | `src-tauri/src/harness/`、`src-tauri/src/runtime/`、`src-tauri/src/eval/`、`benchmark/` | 推进生产会话的模型循环 |
 
-Rust `RuntimeLoop` 与 `runRuntimeHarness()` 当前是验证基础设施，不是生产 Agent 循环。除非先证明生产调用方已经迁移，否则不得把其中的策略描述成产品运行时行为。
+旧 `AgentOrchestrator`、Rust `RuntimeLoop` 与 `runRuntimeHarness()` 当前不是 Workspace Turn 的生产 Agent 循环。它们只可作为历史对照或验证基础设施；除非先证明新的生产调用方，否则不得把其中的策略描述成当前产品行为。
 
 `src-tauri/src/harness/permissions.rs` 当前是一个路径命名例外：生产 Shell 执行和 Harness 都复用其中的 `PermissionGuard`。它的生产权限校验职责属于 Rust 受信任执行边界，不能因为目录名含 `harness` 就把用户审批后的最终命令校验降为测试专用逻辑。
 
@@ -24,10 +27,10 @@ Rust `RuntimeLoop` 与 `runRuntimeHarness()` 当前是验证基础设施，不�
 工作区提交进入 TypeScript 后，生产执行链为：
 
 1. Workspace 接纳先创建稳定的 `clientSubmissionId`、receipt、`turnId`、用户块和回合标题，并把新 Turn 写入 Session/FIFO。
-2. `startSubmitAsyncWorkflowRun()` / `runSubmitAsyncWorkflowRun()` 接管已持久化的提交，`runSubmitWorkflowEngine()` 建立工作流执行环境。
-3. `workflowEngine.ts` 建立或恢复 exact-owner canonical Turn checkpoint，维护 Run、审批、计划续跑与最终投影。
-4. `AgentOrchestrator` 执行 provider-neutral 模型循环并选择工具；Plan 策略先冻结 authoring contract 与证据义务，再允许起草。
-5. Plan 候选通过共享 typed ingress 校验、seal、单向渲染 Markdown 并原子提交；批准后执行任务从 typed graph 派生，不从 Markdown 反向猜测。
+2. `startSubmitAsyncWorkflowRun()` / `runSubmitAsyncWorkflowRun()` 接管已持久化的提交，`submitRuntimeRunner.ts` 按 admission intent 选择 Runtime v2 runner。
+3. Runtime v2 runner 建立或恢复 exact-owner checkpoint，`RuntimeV2Controller` 与 ports 维护 Run、审批、计划续跑、工具执行和最终投影。
+4. provider adapter 执行 provider-neutral 请求和标准 tool-call 协议；Execute 使用可重复的 inspect-edit-verify 工具面，Plan 只产生待审核 artifact。
+5. Plan artifact 经共享 typed ingress/commit 后暂停待审；批准后的执行仍由 Runtime v2 Execute 消费批准 authority，不从 UI Markdown 猜测权限。
 6. 工具通过 TypeScript IPC 进入 Rust；已经迁移到统一边界的入口再做路径、Shell、网络、超时与进程回收校验。工具结果进入结构化证据账本。
 7. canonical Turn 状态、审批、Plan artifact、证据与兼容事件回到 Session 投影；ChatArea、进度胶囊和时间线只从这些结构化事实渲染。
 
@@ -35,40 +38,38 @@ Rust `RuntimeLoop` 与 `runRuntimeHarness()` 当前是验证基础设施，不�
 
 ## Provider-neutral Plan 边界
 
-Plan 模式采用单向权威链，避免“先自由写 Markdown，再由多套正则猜状态”：
+Runtime v2 Plan 使用一条较小的单向权威链：
 
 ```text
 Turn intake
-  -> Plan Authoring Contract（冻结目标、G 分面、上下文目标、诊断要求、验收条款）
-  -> typed evidence bundle / obligations
-  -> typed Plan draft
-  -> shared ingress + seal + contract validation
-  -> Markdown review projection + atomic artifact commit
-  -> plan.artifact_accepted
+  -> 有界只读取证
+  -> submit_runtime_v2_work_plan
+  -> WorkPlanDraftV1 校验与 seal
+  -> RuntimeV2PlanReviewCommit
+  -> Markdown / PlanPanel 投影
   -> pending_review
 ```
 
-- `src/lib/planAuthoringContract.ts` 在起草前声明 `understand -> gather -> draft -> revise -> review` 阶段和固定验收条款。质量门只能报告这些预先声明条款的违约，不能在候选生成后改写目标。
-- `src/lib/planContract.ts` 的 `PlanCandidateV5` 是审批和执行权威。它显式连接目标 `G`、runtime 派生的独立证据组件 `B`、证据 `E`、诊断 `R`、改动 `C`、保留/设计决策 `D` 与验证 `V`；Markdown 只是带 hash 的 `projection`。模型负责提交 `G -> B` 的语义映射，runtime 负责验证每个 `B` 的 owner/evidence/relation 集合、独立性和闭包要求，不能由 runtime 猜测某段证据属于哪个用户目标。
-- 支持 native tool 的 provider 使用 `submit_plan_candidate`；不支持 native tools 时，adapter 原子替换同一 frozen contract 的提交说明，并使用 `<plan_candidate>` 文本 envelope。两种传输都进入 `src/lib/planDraftIngress.ts` 的同一语义校验，不给隐藏 reasoning、普通正文、provider 名称或模型名称状态权威。
-- 首次候选不合格时，runtime 生成绑定原 draft hash、证据 receipt 和失败节点的局部 repair checkpoint；后续仍使用同名 `submit_plan_candidate`，但 tool schema 只允许有界替换被拒绝的 `R/C/D/V` 节点。已接受图和证据权威保持不变。修复次数、累计字符和操作数耗尽后进入可见 `action_required` pause，不能回落为 done/idle，也不能让隐藏 reasoning 充当修正版。
-- `src/lib/planArtifactCommit.ts` 是 Plan artifact 的统一 commit policy。新运行只能提交绑定 candidate hash、authoring contract、evidence bundle 与 Markdown projection 的 typed Plan；legacy Markdown 只允许显式 hydration/import，不能与 typed authority 混用。
-- 批准后的任务由 graph 中的 changes 与 validations 派生。`src/lib/validationContract.ts` 定义有限命令、长驻服务观察、浏览器交互、桌面交互、typed assertion 与 advisory；只有 `required` 且具备可判定 producer/result 的 primitive 能关闭验收，服务已启动或人工建议不能单独证明完成。没有既有 browser/desktop 验收能力时，候选必须把 `plannedValidationHarness` 作为真实 `create/modify` change，并由 validation 的 `harnessChangeRef` 和有限命令结构化绑定；runtime 不得凭测试措辞猜出一个不存在的 harness。
+- `src/lib/runtime-v2/workPlan.ts` 的 `SealedWorkPlanV1` 与 `RuntimeV2PlanReviewCommit` 是当前审批权威。Markdown 只从 sealed plan 单向生成，不反向解析为权限。
+- native tool、结构化 response 和文本 transport 最终必须进入同一个 WorkPlan 校验器。provider 名称、隐藏 reasoning 和普通正文没有审批状态权威。
+- Plan runner 只读取和提交待审计划；批准后由 Runtime v2 Execute 使用 exact plan identity、scope 和 validations。Plan 本身不写项目文件。
+- Plan 候选结构无效时可以带着明确 issue 修订；固定轮数或字符数只能保护单次资源，不能把未提交计划伪装成成功。
 
-Provider adapter 的职责到“能力检测、请求/响应形状、stream、图片、native tool 与文本 fallback”截止。它不能决定 Plan 是否合格、是否进入审核、任务是否完成或 Turn 的终态；这些决定由共享 typed contract、证据账本和 canonical Turn reducer 统一处理。
+Provider adapter 的职责到“能力检测、请求/响应形状、stream、图片、native tool 与文本 fallback”截止。它不能决定 Plan 是否合格、是否进入审核、任务是否完成或 Turn 的终态。
 
 ## 证据与协作边界
 
 MAIN 使用同一套结构化证据规则贯穿规划和执行，但保留不同阶段的持久化形状：
 
-- 规划阶段把只读工具观察规范化为 frozen `PlanEvidenceBundle`，并由 runtime 生成精确路径/符号 occurrence 义务。模型只能引用 bundle 中已有的 `E`；普通摘要、搜索词和未覆盖目录不成为事实。
-- 批准后执行使用 append-only `PlanExecutionEvidenceEntry[]`。每项可绑定 transaction、Run、Plan task、operation 与 validation obligation；typed validation adapter 只消费匹配 exact obligation 的结构化 producer result。
-- 完成由 review 后的 task graph、transaction-scoped ledger、可用验证边界和 recovery 状态共同投影。模型声称“已完成”、任务状态缓存、泛化工具成功或只启动服务都不能越过证据缺口。
+- 规划阶段把成功的只读结果规范化为带 path/version 的 `WorkPlanRuntimeEvidence`。模型只能引用 runtime 已签发的 evidence ID；普通摘要和未覆盖路径不成为事实。
+- Execute 把 source、mutation 与 validation 记录进当前 Turn aggregate。批准计划的 scope/validation 仍是 authority；直接 Execute 至少保留不可变用户目标和最终修改后的行为验收要求。
+- 完成由实际 mutation、最终 mutation boundary 后的匹配 validation 和 provider conclusion 共同投影。模型声称“已完成”、泛化工具成功或只启动服务都不能越过证据缺口。
 - Execute 的普通工作区恢复使用稳定的读／改／验核心工具面；阶段状态只表达优先动作，不再把安全的相邻工具调用判成协议错误。软 no-progress 计数不改变工具权限，只能决定继续提示或诚实暂停。路径/权限、源码新鲜度、批准 scope、进程生命周期和证据闭包仍是硬门。
-- 工具结果的具体因果 handler 先于通用 no-progress policy：真实修改和失败验证必须先推进或重开对应事务，重复／迭代预算只能处理没有更具体状态迁移的批次。工作区级验证不得把多文件 objective 重新绑定到最近一次改动文件；无唯一诊断归因时，普通读取只记为证据，不能取得单文件事务所有权。
-- 子智能体偏好只有在 runtime 已获得至少两个不重叠、可安全并行的只读 scope 后才形成 `PreferredDelegationScopeContract`。在 parent 第一次模型请求前，runtime 可从 trusted project skeleton 的稳定顶层目录直接派发这些 scope，避免把协作成败交给模型是否主动调用协调工具。每个 scope 仍必须经过 `spawn -> join -> consume`；只有带 child/tool/observation 身份、位于冻结 allowed paths 内且 closure 为 `satisfied` 的实质观察可进入 runtime-issued closure receipt。需要父级复读的 adopted observation 只用于发现，不能关闭 parent read obligation 或抑制精确复读。Turn checkpoint 只引用 receipt，canonical payload 位于独立 Session ledger；child summary、未 join 输出、partial/blocked closure 与 coordination tool 本身都不算完成证据。
+- 工具结果的具体因果 handler 先于通用 no-progress policy：真实修改和失败验证必须先推进下一次读取／修正／验证；重复或协议异常只产生软信号。
+- 子智能体偏好只控制 `spawn_subagent` 是否可见以及提示强度。模型可在观察、修改或验证阶段按需派生最多两个活动的只读 `explore/review/validate` 任务；不存在开场自动派生或必需 scope。
+- child 用普通最终文本结束只读工作；runtime 只有在结果引用至少一条真实或合法继承 evidence 时才编译合法报告并记为 `completed`。已有 evidence 但未形成合法报告时记为 `degraded` 并交回主体；无 evidence 才是 `failed`。父线程显式 wait 或终态 join 后接收结果；任何非 completed child 都不能阻断父线程，child 结果不能授权修改或凭自身关闭不匹配的验收。
 
-这不是把所有阶段压进一个未经区分的数组：Plan bundle、subagent closure receipt ledger 与执行 ledger 各保留自己的 schema，但共享精确身份、provenance、scope、obligation 和确定性评估规则。closure receipt 是 TypeScript runtime 的语义所有权边界，并非用于抵抗任意本地 Session snapshot 重写的密码学签名；Rust 仍只负责 opaque snapshot CAS。
+Plan evidence、child evidence 与 Execute evidence 可以有不同持久化形状，但共享 identity、path/version、provenance 和“不从摘要制造事实”的规则。Rust 仍只负责 opaque snapshot CAS。
 
 ## 核心实体
 
@@ -77,8 +78,7 @@ MAIN 使用同一套结构化证据规则贯穿规划和执行，但保留不同
 - **Turn**：一次已接纳的用户提交；拥有稳定 `turnId`，最终必须产生一个 `turn.completed`。
 - **Run**：为推进同一 Turn 发起的一次执行尝试；审批后续跑、计划执行或恢复可以形成带 `parentRunId` 的后续 Run。
 - **Item / Tool result**：Run 内的操作证据。工具可以失败，但工具失败不是应用级失败终态。
-- **Plan Authoring Contract**：起草前冻结的目标、分面、上下文目标、诊断要求与验收标准；provider transport 变化不得改变它。
-- **Typed Plan graph**：Plan 审批与执行权威；Markdown 只是用户可读投影。
+- **WorkPlan**：由原始目标、版本化只读证据和结构化 changes/validations 编译、密封的审批与执行权威；Markdown 只是用户可读投影。
 - **Evidence ledger**：runtime 拥有的结构化观察与结果；完成投影只接受与当前 transaction/task/obligation 对齐的证据。
 - **Canonical Turn checkpoint**：绑定 workspace、Session/epoch、client submission、Turn 和 Run attempt 的可回放状态；保存 Plan review、协作 scope 状态与 closure receipt refs，不内嵌自证式子智能体证据。
 

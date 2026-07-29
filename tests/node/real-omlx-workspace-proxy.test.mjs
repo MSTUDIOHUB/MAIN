@@ -190,6 +190,7 @@ test("real OMLX file windows honor line/character bounds without full-file decod
   assert.equal(window.nextStartLine, 13);
   assert.equal(window.truncated, true);
   assert.equal(window.scanTruncated, false);
+  assert.match(window.contentVersion, /^sha256-[a-f0-9]{64}$/);
 
   await writeFixtureFile(workspace, "src/long.ts", "x\n".repeat(100_000));
   const scannedWindow = await proxy.readRealOmlxWorkspaceFileWindow(workspace, "src/long.ts", {
@@ -212,6 +213,21 @@ test("real OMLX file windows reject large binary files from a bounded prefix sam
     proxy.readRealOmlxWorkspaceFileWindow(workspace, "assets/large.bin", { maxScanBytes: 1_024 }),
     /E2E_WORKSPACE_READ_BINARY/,
   );
+});
+
+test("real OMLX syntax checks preserve duplicate module-export safety", () => {
+  const checked = proxy.checkRealOmlxSourceSyntax(
+    "src/toolbar.js",
+    [
+      "export function updateTheme(theme) { return theme; }",
+      "export function updateTheme(theme) { return theme; }",
+    ].join("\n"),
+  );
+
+  assert.equal(checked.applicable, true);
+  assert.equal(checked.hasErrors, true);
+  assert.ok(checked.errorCount > 0);
+  assert.equal(checked.firstErrorLine, 2);
 });
 
 test("real OMLX debug entries retain structured identity while bounding message size", () => {

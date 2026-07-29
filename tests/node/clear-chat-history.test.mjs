@@ -114,6 +114,69 @@ function readSource(relativePath) {
   return fsSync.readFileSync(path.join(process.cwd(), relativePath), "utf8");
 }
 
+test("an auto-created workspace session keeps the submitted composer preferences", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const originalState = useAppStore.getState();
+  const workspace = "/workspace-composer-preferences";
+  const realDispatchNextWorkspaceInstruction =
+    originalState.dispatchNextWorkspaceInstruction;
+  try {
+    useAppStore.setState({
+      ...originalState,
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: null,
+      sessionsByWorkspace: {
+        ...originalState.sessionsByWorkspace,
+        [workspace]: [],
+      },
+      activeSessionByWorkspace: {
+        ...originalState.activeSessionByWorkspace,
+        [workspace]: null,
+      },
+      config: {
+        ...originalState.config,
+        workspace,
+        sessionRecordingEnabled: false,
+      },
+      autoApproveTools: true,
+      autoApproveToolScopes: ["read", "write"],
+      preferSubagents: true,
+      agentStatus: "idle",
+      isGenerating: false,
+      dispatchNextWorkspaceInstruction: () => true,
+    });
+
+    const acceptance = await useAppStore.getState().acceptWorkspaceInstruction({
+      text: "检查并修复保存流程",
+      source: "composer",
+      clientSubmissionId: "composer-preferences-auto-session",
+    });
+
+    assert.equal(acceptance.accepted, true);
+    const state = useAppStore.getState();
+    assert.equal(state.autoApproveTools, true);
+    assert.ok(state.autoApproveToolScopes.length > 0);
+    assert.equal(state.preferSubagents, true);
+    const session = state.sessionsByWorkspace[workspace].find(
+      (candidate) => candidate.id === state.currentSessionId,
+    );
+    assert.equal(session.runtimeSnapshot.autoApproveTools, true);
+    assert.deepEqual(
+      session.runtimeSnapshot.autoApproveToolScopes,
+      state.autoApproveToolScopes,
+    );
+    assert.equal(session.runtimeSnapshot.preferSubagents, true);
+  } finally {
+    useAppStore.setState({
+      ...originalState,
+      dispatchNextWorkspaceInstruction: realDispatchNextWorkspaceInstruction,
+    }, true);
+  }
+});
+
 test("clearChatHistory revokes workspace owners before durable clear and only then clears local state", () => {
   const source = readSource("src/store/useAppStore.ts");
   const start = source.indexOf("clearChatHistory: () => {");

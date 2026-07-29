@@ -57,12 +57,16 @@ function hasSubagentActivity(
 function runtimeV2SubagentClosure(input: {
   aggregate: TurnAggregateV1;
   job: TurnAggregateV1["subagents"][number];
-  status: Extract<SubagentStatus, "completed" | "failed" | "canceled">;
+  status: Extract<
+    SubagentStatus,
+    "completed" | "degraded" | "failed" | "canceled"
+  >;
   evidenceCount: number;
   reason: string;
 }): SubagentClosureEnvelope {
   const run = input.aggregate.run!.identity;
   const completed = input.status === "completed";
+  const degraded = input.status === "degraded";
   return {
     schemaVersion: 1,
     owner: {
@@ -75,7 +79,7 @@ function runtimeV2SubagentClosure(input: {
     },
     scopeKey: input.job.scopeKey,
     status: input.status,
-    state: completed ? "satisfied" : "blocked",
+    state: completed ? "satisfied" : degraded ? "partial" : "blocked",
     remainingWork: completed ? null : input.job.objective,
     observationCount: input.evidenceCount,
     substantiveEvidenceCount: input.evidenceCount,
@@ -86,6 +90,8 @@ function runtimeV2SubagentClosure(input: {
     uncoveredPaths: completed ? [] : [...input.job.allowedPaths],
     reasonCode: completed
       ? "runtime_v2_child_completed"
+      : degraded
+        ? "runtime_v2_child_degraded"
       : input.status === "canceled"
         ? "runtime_v2_child_canceled"
         : "runtime_v2_child_failed",
@@ -204,8 +210,10 @@ export function reconcileRuntimeV2SubagentEvents(
     if (runtimeEvent.type !== "subagent.completed") continue;
     const job = jobs.get(runtimeEvent.jobId);
     if (!job) continue;
-    const status: Extract<SubagentStatus, "completed" | "failed" | "canceled"> =
-      runtimeEvent.status;
+    const status: Extract<
+      SubagentStatus,
+      "completed" | "degraded" | "failed" | "canceled"
+    > = runtimeEvent.status;
     const evidenceCount = runtimeEvent.evidence.length;
     const closureAudit = runtimeV2SubagentClosure({
       aggregate,
@@ -240,7 +248,13 @@ export function reconcileRuntimeV2SubagentEvents(
             phase: "done",
             title: status === "completed"
               ? language === "zh" ? "调查已完成" : "Investigation completed"
-              : language === "zh" ? "调查未完成" : "Investigation did not complete",
+              : status === "degraded"
+                ? language === "zh"
+                  ? "已交由主体接管"
+                  : "Handed back to main"
+                : language === "zh"
+                  ? "调查未完成"
+                  : "Investigation did not complete",
           },
         },
         activity: {

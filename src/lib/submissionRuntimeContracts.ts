@@ -17,7 +17,7 @@ type SubmissionStoreState = any;
 export interface SubmissionRuntimeStorePorts {
   sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
   sanitizeAgentMessagesForPersist: (messages: any[]) => any[];
-  normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
   normalizeProviderCompatibilityByRuntimeKey: (value: unknown) => Record<string, ProviderCompatibilityRuntimeLaneState>;
   compactCompletedTurnAgentMessages: (params: {
     agentMessages: any[];

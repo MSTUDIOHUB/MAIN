@@ -1,25 +1,18 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Command } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { analyzeValidationCommand } from "../validationContract";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
-import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 
-export type RuntimeV2ExecutePhaseTransition =
-  | {
-      readonly from: "observing";
-      readonly to: "acting";
-      readonly reason: "pending_mutation_call" | "observation_cycle_complete";
-    }
-  | {
-      readonly from: "acting";
-      readonly to: "validating";
-      readonly reason: "mutation_committed";
-    }
-  | {
-      readonly from: "validating";
-      readonly to: "acting";
-      readonly reason: "validation_failed";
-    };
+export interface RuntimeV2ExecutePhaseTransition {
+  readonly from: "observing" | "acting" | "validating";
+  readonly to: "acting" | "validating";
+  readonly reason:
+    | "pending_mutation_call"
+    | "pending_validation_call"
+    | "mutation_committed"
+    | "validation_failed";
+}
 
 export interface RuntimeV2ExecutePhaseTransitionInput {
   /**
@@ -79,6 +72,12 @@ function toolName(command: RuntimeV2Command): string {
     : "";
 }
 
+const VALIDATION_TOOL_NAMES = new Set([
+  "run_command",
+  "browser_evaluate",
+  "computer_use",
+]);
+
 function committedMutationKeys(
   events: readonly RuntimeV2Event[],
   isMutationToolName: RuntimeV2ExecutePhaseTransitionInput["isMutationToolName"],
@@ -115,6 +114,70 @@ export interface RuntimeV2ExecuteEvidenceSummary {
   readonly failedValidationCount: number;
   readonly stalledValidationCount: number;
   readonly failedOperationCount: number;
+}
+
+function validationCoversObjective(
+  state: TurnAggregateV1,
+  event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
+): boolean {
+  if (!event.passed) return false;
+  const toolName = event.presentation?.toolName || "";
+  const interaction =
+    toolName === "browser_evaluate" || toolName === "computer_use";
+  const finite = toolName === "run_command"
+    ? analyzeValidationCommand(event.presentation?.target || "").spec
+    : null;
+  const behavioral =
+    interaction ||
+    (
+      finite?.kind === "finite_command" &&
+      (
+        finite.capability === "test" ||
+        finite.capability === "inline_assertion"
+      )
+    );
+  const requirements =
+    state.objective.acceptanceEvidenceRequirements?.length
+      ? state.objective.acceptanceEvidenceRequirements
+      : ["behavioral" as const];
+  return requirements.every((requirement) =>
+    requirement === "static"
+      ? interaction || finite?.kind === "finite_command"
+      : requirement === "interaction"
+        ? interaction
+        : behavioral
+  );
+}
+
+export function runtimeV2DirectExecuteReadyForConclusion(
+  state: TurnAggregateV1,
+): boolean {
+  const latestMutationSequence = state.events.reduce((latest, event) =>
+    event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+      ? Math.max(latest, event.sequence)
+      : latest
+  , -1);
+  if (latestMutationSequence < 0) return false;
+  const validations = state.events.filter((
+    event,
+  ): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
+    event.type === "validation.completed" &&
+    event.sequence > latestMutationSequence
+  );
+  let latestPassIndex = -1;
+  for (let index = validations.length - 1; index >= 0; index -= 1) {
+    if (validations[index]!.passed) {
+      latestPassIndex = index;
+      break;
+    }
+  }
+  if (latestPassIndex < 0) return false;
+  if (validations.slice(latestPassIndex + 1).some((event) => !event.passed)) {
+    return false;
+  }
+  return validations.some((event) => validationCoversObjective(state, event));
 }
 
 function validationFailureFingerprint(
@@ -230,65 +293,60 @@ export function decideRuntimeV2ExecutePhaseTransition(
   ) {
     return null;
   }
+  if (
+    state.phase !== "observing" &&
+    state.phase !== "acting" &&
+    state.phase !== "validating"
+  ) {
+    return null;
+  }
+  const approvedPlanCoverage = state.strategy === "plan"
+    ? deriveRuntimeV2PlanExecutionCoverage(state)
+    : null;
+  if (state.strategy === "plan" && !approvedPlanCoverage) return null;
 
   const pendingMutation = state.pendingToolCalls.some((call) =>
     input.isMutationToolName(call.name)
   );
-  const hasExecutionAuthority =
-    state.strategy === "plan"
-      ? state.workPlan?.status === "approved"
-      : state.executionContract?.status === "active";
   if (
-    state.phase === "observing" &&
     pendingMutation &&
-    hasExecutionAuthority
+    state.phase !== "acting"
   ) {
     return {
-      from: "observing",
+      from: state.phase,
       to: "acting",
       reason: "pending_mutation_call",
+    };
+  }
+  const pendingValidation = state.pendingToolCalls.some((call) =>
+    VALIDATION_TOOL_NAMES.has(call.name)
+  );
+  if (pendingValidation && state.phase !== "validating") {
+    return {
+      from: state.phase,
+      to: "validating",
+      reason: "pending_validation_call",
     };
   }
 
   if (state.pendingToolCalls.length > 0) return null;
   const phaseEvents = currentPhaseEvents(state);
 
-  if (state.phase === "observing") {
-    const parentResponded = phaseEvents.some((event) => event.type === "provider.responded");
-    if (
-      state.evidence.length > 0 &&
-      parentResponded &&
-      hasExecutionAuthority
-    ) {
-      return {
-        from: "observing",
-        to: "acting",
-        reason: "observation_cycle_complete",
-      };
-    }
-    return null;
-  }
-
   if (state.phase === "acting") {
     const currentPhaseMutationCount =
       committedMutationKeys(phaseEvents, input.isMutationToolName).size;
-    const approvedPlanCoverage = state.strategy === "plan"
-      ? deriveRuntimeV2PlanExecutionCoverage(state)
-      : null;
-    const executionContractCoverage = state.strategy === "execute"
-      ? deriveRuntimeV2ExecutionContractCoverage(state)
-      : null;
-    const mutationBoundarySatisfied = approvedPlanCoverage
-      ? approvedPlanCoverage.allMutationTargetsCovered
-      : executionContractCoverage
-        ? executionContractCoverage.missingMutationTargets.length === 0
-        : false;
-    if (currentPhaseMutationCount > 0 && mutationBoundarySatisfied) {
-    return {
-      from: "acting",
-      to: "validating",
-      reason: "mutation_committed",
-    };
+    if (
+      currentPhaseMutationCount > 0 &&
+      (
+        state.strategy !== "plan" ||
+        approvedPlanCoverage?.allMutationTargetsCovered
+      )
+    ) {
+      return {
+        from: "acting",
+        to: "validating",
+        reason: "mutation_committed",
+      };
     }
   }
 

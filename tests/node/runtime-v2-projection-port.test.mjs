@@ -595,6 +595,94 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
   assert.equal(harness.logs.at(-1)?.data?.subagentRecordCount, 2);
 });
 
+test("V2 projects an evidence-bearing incomplete child as degraded handoff", async () => {
+  const harness = createHarness();
+  const job = {
+    id: "job-degraded",
+    run: {
+      ...runIdentity,
+      runId: "child-degraded",
+      parentRunId: runIdentity.runId,
+      attemptId: "child-degraded",
+    },
+    parentRunId: runIdentity.runId,
+    scopeKey: "review-main",
+    objective: "Review src/main.js",
+    allowedPaths: ["src/main.js"],
+    status: "degraded",
+    requestedAt: 10,
+    firstTokenAt: 20,
+    closedAt: 30,
+    summary: "Evidence preserved; parent takeover required.",
+  };
+  const childAggregate = aggregate({
+    events: [{
+      type: "subagents.scheduled",
+      eventId: "event-degraded-scheduled",
+      at: 10,
+      run: runIdentity,
+      jobs: [{
+        ...job,
+        status: "queued",
+        firstTokenAt: null,
+        closedAt: null,
+        summary: null,
+      }],
+    }, {
+      type: "subagent.telemetry",
+      eventId: "event-degraded-open",
+      at: 12,
+      run: runIdentity,
+      telemetry: {
+        jobId: job.id,
+        phase: "request_opened",
+        at: 12,
+      },
+    }, {
+      type: "subagent.telemetry",
+      eventId: "event-degraded-close",
+      at: 30,
+      run: runIdentity,
+      telemetry: {
+        jobId: job.id,
+        phase: "closed",
+        at: 30,
+      },
+    }, {
+      type: "subagent.completed",
+      eventId: "event-degraded-complete",
+      at: 30,
+      run: runIdentity,
+      jobId: job.id,
+      status: "degraded",
+      summary: job.summary,
+      evidence: [{
+        id: "evidence-degraded",
+        kind: "subagent",
+        target: "src/main.js",
+        version: "sha-main",
+      }],
+    }],
+    subagents: [job],
+  });
+
+  await harness.port.publish({
+    aggregate: childAggregate,
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "主体正在接管未完成的评审。",
+      "turn-a:children:degraded",
+    ),
+  });
+
+  const [run] = projectSubagentRuns(harness.getState().runtimeEvents);
+  assert.equal(run.status, "degraded");
+  assert.equal(run.closureAudit?.state, "partial");
+  assert.equal(run.closureAudit?.reasonCode, "runtime_v2_child_degraded");
+  assert.equal(run.remainingWork, "Review src/main.js");
+});
+
 test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", async () => {
   const harness = createHarness();
   const artifactWrite = command({

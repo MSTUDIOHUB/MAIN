@@ -168,7 +168,7 @@ export async function bootstrapRuntimeV2Plan(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,

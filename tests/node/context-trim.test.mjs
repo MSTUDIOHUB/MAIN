@@ -69,8 +69,8 @@ test("computeContextBudgets reserves bounded output budget for context windows",
 
   assert.equal(budgets16k.outputBudget, 4096);
   assert.equal(budgets16k.inputBudget, 12288);
-  assert.equal(budgets128k.outputBudget, 8192);
-  assert.equal(budgets128k.inputBudget, 122880);
+  assert.equal(budgets128k.outputBudget, 26214);
+  assert.equal(budgets128k.inputBudget, 104858);
 });
 
 test("manageContext leaves long tool output untouched while under the proactive trigger", () => {

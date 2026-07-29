@@ -1,24 +1,21 @@
 import { getToolTarget } from "../../lib/toolTarget";
+import { extractReadFileWindowMetadata } from "../../lib/readFileWindow";
 import { executeTool } from "../../lib/toolExecutor";
-import {
-  buildToolDiffPreview,
-  type ToolDiffPreview,
-} from "../../lib/toolDiff";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
-import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
 import type { ToolPort } from "../../lib/runtime-v2";
 import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
   authorizationFor,
   authorizeToolForCurrentTurn,
+  boundedRuntimeV2ToolContent,
   boundedToolContent,
-  latestAcceptanceFailureSourceWindow,
   modelContextContentForToolOutput,
   modelContextStatusForCompletion,
   nextEvidenceId,
   recordModelContext,
   recordToolModelContext,
+  runtimeV2ContextBoundToolArguments,
   stringValue,
   toolCompletionFor,
   toolDefinitionExists,
@@ -27,12 +24,14 @@ import {
 } from "./executionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
+import { prepareRuntimeV2Mutation } from "./executionMutationPreflight";
+import {
+  runtimeV2ProviderToolCallConstraint,
+  runtimeV2ProviderToolCallIdentity,
+} from "./providerToolSurface";
 import {
   runtimeV2MutationFailureContextTarget,
 } from "./correctiveMutationPolicy";
-
-const RUNTIME_V2_MAX_MUTATION_LINES = 96;
-const RUNTIME_V2_MAX_CORRECTIVE_MUTATION_LINES = 48;
 
 export function createRuntimeV2ToolPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -130,10 +129,79 @@ export function createRuntimeV2ToolPort(
         toolName,
         target: target || null,
       });
-      if (command.payload.repeatedActionRejected === true) {
+      const toolCallId = String(command.payload.toolCallId || "");
+      const hasCoveredSourceReceipt =
+        !!toolCallId &&
+        input.live.coveredReadToolResults.has(toolCallId);
+      const cachedSourceReceipt = hasCoveredSourceReceipt
+        ? input.live.coveredReadToolResults.get(toolCallId) || null
+        : null;
+      if (hasCoveredSourceReceipt) {
+        input.live.coveredReadToolResults.delete(toolCallId);
+      }
+      if (
+        cachedSourceReceipt &&
+        command.payload.repeatedActionRejected !== true
+      ) {
+        recordToolModelContext({
+          ports: input,
+          command,
+          toolName,
+          target,
+          status: "succeeded",
+          content: cachedSourceReceipt,
+        });
+        input.logStoreEvent("runtime_v2_source_receipt_replayed", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          toolName,
+          target: target || null,
+          sourceVersion:
+            extractReadFileWindowMetadata(cachedSourceReceipt)
+              ?.contentVersion || null,
+        });
+        return toolCompletionFor(
+          input,
+          command,
+          toolName,
+          args,
+          target,
+          cachedSourceReceipt,
+          "succeeded",
+          undefined,
+          extractReadFileWindowMetadata(cachedSourceReceipt)
+            ?.contentVersion,
+        );
+      }
+      const coveredSourceRepeat =
+        hasCoveredSourceReceipt;
+      if (
+        coveredSourceRepeat ||
+        command.payload.repeatedActionRejected === true
+      ) {
+        const rejectedAction = {
+          name: toolName,
+          arguments: args,
+        };
+        const rejectedActionIdentity =
+          runtimeV2ProviderToolCallIdentity(rejectedAction);
+        input.live.rejectedProviderActions.set(
+          rejectedActionIdentity,
+          runtimeV2ProviderToolCallConstraint(rejectedAction),
+        );
+        while (input.live.rejectedProviderActions.size > 12) {
+          const oldest = input.live.rejectedProviderActions.keys()
+            .next().value;
+          if (!oldest) break;
+          input.live.rejectedProviderActions.delete(oldest);
+        }
         const unchangedSourceRepeat =
+          coveredSourceRepeat ||
           command.payload.repeatedActionReason ===
             "unchanged_source_repeat";
+        const unchangedObservationRepeat =
+          command.payload.repeatedActionReason ===
+            "unchanged_observation_repeat";
         recordToolModelContext({
           ports: input,
           command,
@@ -142,9 +210,16 @@ export function createRuntimeV2ToolPort(
           status: "failed",
           content: unchangedSourceRepeat
             ? [
-                "UNCHANGED_SOURCE_REPEAT_REJECTED: this target already returned the same committed source version twice in the current phase.",
-                "Changing line windows or inspection syntax does not create new source authority. Choose a genuinely different missing target, submit the execution contract, or perform the leased mutation. The Turn remains active.",
+                coveredSourceRepeat
+                  ? "UNCHANGED_SOURCE_COVERAGE_REUSED: this requested path and range is already fully covered by same-version read results since the latest mutation."
+                  : "UNCHANGED_SOURCE_REPEAT_REJECTED: this exact path and range already returned the same committed source version twice since the latest mutation.",
+                "The complete earlier result remains in the tool transcript. Reuse it and choose a mutation, validation, or a genuinely different uncovered target or range. The Turn remains active and safe reads reopen after every mutation.",
               ].join(" ")
+            : unchangedObservationRepeat
+              ? [
+                  "UNCHANGED_OBSERVATION_REPEAT_REJECTED: this exact read-only query already completed twice since the latest mutation.",
+                  "Its prior results remain in the tool transcript. Choose a mutation, validation, or a structurally different missing observation. The Turn remains active.",
+                ].join(" ")
             : [
                 "REPEATED_ACTION_REJECTED: this exact failed action reached its retry protection line.",
                 "Choose a different read, mutation, or validator from the currently available tool surface. The Turn remains active.",
@@ -157,8 +232,13 @@ export function createRuntimeV2ToolPort(
           toolName,
           target: target || null,
           reason: unchangedSourceRepeat
-            ? "unchanged_source_repeat"
+            ? coveredSourceRepeat
+              ? "covered_source_range_repeat"
+              : "unchanged_source_repeat"
+            : unchangedObservationRepeat
+              ? "unchanged_observation_repeat"
             : "failed_action_retry_limit",
+          actionIdentity: rejectedActionIdentity,
         });
         return toolCompletionFor(
           input,
@@ -292,7 +372,7 @@ export function createRuntimeV2ToolPort(
         );
       }
       try {
-        let diffPreview: ToolDiffPreview | undefined;
+        let diffPreview;
         const toolExecutionOptions = {
           toolCatalog: authorizationFor(input).toolCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
@@ -301,124 +381,23 @@ export function createRuntimeV2ToolPort(
             : {}),
         };
         if (isWorkspaceMutationToolName(toolName)) {
-          const correctiveSource = latestAcceptanceFailureSourceWindow(
-            input.live,
-            input.context.runWorkspace || "",
-          );
-          const preflight = await preflightWorkspaceMutation({
+          const preparation = await prepareRuntimeV2Mutation({
+            ports: input,
+            command,
             toolName,
             args,
-            language: input.context.phaseLanguage,
-            workspaceRoot: input.context.runWorkspace || "",
-            maxTouchedLines: correctiveSource
-              ? RUNTIME_V2_MAX_CORRECTIVE_MUTATION_LINES
-              : RUNTIME_V2_MAX_MUTATION_LINES,
-            readFile: async (path) => String(
-              await executeRuntimeV2ToolWithDeadline({
-                toolName: "read_file",
-                lifecycleDeadlineAt: input.lifecycleDeadlineAt,
-                now: input.now,
-                task: () => executeTool(
-                  "read_file",
-                  { path, __raw: true },
-                  input.context.runWorkspace || "",
-                  input.context.runSessionKey,
-                  toolExecutionOptions,
-                ),
-              }),
-            ),
+            target,
+            failureContextTarget,
+            toolExecutionOptions,
           });
-          if (!preflight.ok) {
-            const mismatchRange =
-              preflight.patchRecoveryMismatch?.requestedRange;
-            const mismatchPath =
-              preflight.patchRecoveryMismatch?.target ||
-              preflight.path ||
-              target;
-            const sourceMismatch =
-              preflight.recoveryKind === "source_mismatch";
-            const targetInvalid =
-              preflight.recoveryKind === "target_invalid";
-            const mutationRejected =
-              preflight.recoveryKind === "mutation_rejected";
-            const refreshLine = mismatchRange?.startLine
-              ? Math.floor(
-                  (
-                    mismatchRange.startLine +
-                    (mismatchRange.endLine || mismatchRange.startLine)
-                  ) / 2,
-                )
-              : mutationRejected &&
-                  correctiveSource &&
-                  correctiveSource.path === mismatchPath
-                ? correctiveSource.failureLine
-                : null;
-            const sourceRefreshHint =
-              (sourceMismatch || mutationRejected) &&
-              mismatchPath &&
-              refreshLine
-              ? `${mismatchPath}:${refreshLine}:1 - refresh this exact source window before retrying a smaller valid mutation`
-              : "";
-            const content = [
-              preflight.message ||
-                `MUTATION_PREFLIGHT_BLOCKED: ${preflight.reason || "invalid mutation"}`,
-              sourceRefreshHint,
-            ].filter(Boolean).join("\n");
-            recordToolModelContext({
-              ports: input,
-              command,
-              toolName,
-              target: preflight.path || failureContextTarget,
-              status: "failed",
-              content,
-            });
-            input.logStoreEvent("runtime_v2_mutation_preflight_rejected", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              commandKind: command.kind,
-              toolName,
-              target: preflight.path || target || null,
-              reason: preflight.reason || "invalid_mutation",
-              recoveryKind: preflight.recoveryKind || null,
-              mismatchTarget:
-                preflight.patchRecoveryMismatch?.target || null,
-              mismatchStartLine: mismatchRange?.startLine || null,
-              mismatchEndLine: mismatchRange?.endLine || null,
-              message: preflight.message?.slice(0, 1_000) || null,
-            });
-            return toolCompletionFor(
-              input,
-              command,
-              toolName,
-              args,
-              preflight.path || failureContextTarget,
-              null,
-              "failed",
-              sourceMismatch
-                ? "source_mismatch"
-                : targetInvalid
-                  ? "target_invalid"
-                  : mutationRejected
-                    ? "mutation_rejected"
-                    : "protocol_invalid",
-            );
-          }
-          try {
-            diffPreview = await buildToolDiffPreview(toolName, args, {
-              workspace: input.context.runWorkspace || "",
-              sessionKey: input.context.runSessionKey,
-            });
-          } catch (error) {
-            input.logStoreEvent("runtime_v2_tool_diff_preview_failed", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              commandKind: command.kind,
-              toolName,
-              target: target || null,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
+          if (!preparation.allowed) return preparation.completion;
+          diffPreview = preparation.diffPreview;
         }
+        const executionArgs = runtimeV2ContextBoundToolArguments(
+          toolName,
+          args,
+          input.context.runtimeContextBudget,
+        );
         const rawOutput = await executeRuntimeV2ToolWithDeadline({
           toolName,
           lifecycleDeadlineAt: input.lifecycleDeadlineAt,
@@ -435,14 +414,16 @@ export function createRuntimeV2ToolPort(
           },
           task: () => executeTool(
             toolName,
-            args,
+            executionArgs,
             input.context.runWorkspace || "",
             input.context.runSessionKey,
             toolExecutionOptions,
           ),
         });
-        const output = boundedToolContent(
+        const output = boundedRuntimeV2ToolContent(
+          toolName,
           modelContextContentForToolOutput(rawOutput),
+          input.context.runtimeContextBudget,
         );
         const sourceVersion = RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)
           ? await resolveRuntimeV2SourceEvidenceVersion({
@@ -476,6 +457,12 @@ export function createRuntimeV2ToolPort(
           diffPreview,
         );
         const semanticStatus = modelContextStatusForCompletion(completion);
+        if (
+          semanticStatus === "succeeded" &&
+          isWorkspaceMutationToolName(toolName)
+        ) {
+          input.live.rejectedProviderActions.clear();
+        }
         recordToolModelContext({
           ports: input,
           command,

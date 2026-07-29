@@ -4,6 +4,7 @@ import {
   getLocalFileReadPathForToolCall,
   getToolRiskLevelForCall,
   isLocalFileReadApproved,
+  isPerCallOnlyToolRisk,
   normalizeToolPermissionPolicy,
 } from "../../lib/toolCapabilities";
 import { buildToolCatalog } from "../../lib/toolCatalog";
@@ -22,12 +23,10 @@ import {
 } from "../../lib/workspaceMutationTools";
 import {
   deriveRuntimeV2PlanSourceFreshness,
-  resolveRuntimeV2ExecutionContractValidation,
   resolveRuntimeV2PlanMutationScope,
   resolveRuntimeV2PlanValidationScope,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
-import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   isRuntimeV2WorkspaceReadToolName,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
@@ -149,18 +148,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
   readonly failureKind: "not_authorized" | "protocol_invalid" | null;
   readonly reasonCode: string | null;
 } {
-  if (
-    input.command.kind === "execute_tool" &&
-    RUNTIME_V2_VALIDATION_TOOL_NAMES.has(input.toolName)
-  ) {
-    return {
-      allowed: false,
-      reason: "有限验证只能在验证阶段执行；当前应先提交计划内的最小修改。",
-      failureKind: "protocol_invalid",
-      reasonCode: "validation_phase_required",
-    };
-  }
-
   const aggregate = aggregateForCurrentTurn(input.ports);
   if (
     input.command.kind === "execute_validation" &&
@@ -194,56 +181,9 @@ export function validateToolAgainstPhaseAndPlan(input: {
     };
   }
   if (
-    input.command.phase === "observing" &&
-    isWorkspaceMutationToolName(input.toolName)
-  ) {
-    return {
-      allowed: false,
-      reason: "调查阶段只允许收集证据；修改必须在证据汇合并进入实施阶段后执行。",
-      failureKind: "protocol_invalid",
-      reasonCode: "mutation_requires_acting_phase",
-    };
-  }
-  if (
     input.command.kind === "execute_tool" &&
     isWorkspaceMutationToolName(input.toolName)
   ) {
-    if (aggregate?.strategy === "execute") {
-      const contract = aggregate.executionContract;
-      if (!contract || contract.status !== "active") {
-        return {
-          allowed: false,
-          reason:
-            "修改前必须先提交与用户目标、版本化读取证据和验收方式绑定的执行契约。",
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_required",
-        };
-      }
-      const requestedTargets = resolveWorkspaceMutationTargets(
-        input.toolName,
-        input.args,
-        input.target,
-      );
-      const unexpectedTargets = requestedTargets.filter((requested) =>
-        !contract.changes.some((change) =>
-          workspacePathsReferToSameFile(change.target, requested)
-        )
-      );
-      if (
-        requestedTargets.length === 0 ||
-        unexpectedTargets.length > 0
-      ) {
-        return {
-          allowed: false,
-          reason:
-            `修改目标不在当前执行契约范围内：${
-              unexpectedTargets.join(", ") || "未解析目标"
-            }`,
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_mutation_scope",
-        };
-      }
-    }
     const mutationLease = validateRuntimeV2MutationLease({
       ports: input.ports,
       toolName: input.toolName,
@@ -253,33 +193,15 @@ export function validateToolAgainstPhaseAndPlan(input: {
     if (mutationLease && !mutationLease.allowed) {
       return {
         allowed: false,
-        reason: mutationLease.lease
-          ? `本轮修改仅授权最近证据锁定的文件：${mutationLease.lease.target}。`
+        reason: mutationLease.leases.length > 0
+          ? [
+              "修改目标缺少当前版本的父级读取证据。",
+              `缺少证据：${mutationLease.unexpectedTargets.join(", ") || "未解析目标"}。`,
+              `已有证据：${mutationLease.leases.map((lease) => lease.target).join(", ")}。`,
+            ].join(" ")
           : "修改前必须先精确读取准备变更的源文件。",
         failureKind: "protocol_invalid",
         reasonCode: mutationLease.reasonCode,
-      };
-    }
-  }
-  if (
-    aggregate?.strategy === "execute" &&
-    input.command.kind === "execute_validation"
-  ) {
-    const contract = aggregate.executionContract;
-    const validation = contract?.status === "active"
-      ? resolveRuntimeV2ExecutionContractValidation({
-          contract,
-          toolName: input.toolName,
-          args: input.args,
-        })
-      : null;
-    if (!contract || !validation) {
-      return {
-        allowed: false,
-        reason:
-          "该验证调用与当前执行契约中的 validation id、命令或交互类型不一致。",
-        failureKind: "not_authorized",
-        reasonCode: "execution_contract_validation_scope",
       };
     }
   }
@@ -452,9 +374,16 @@ export async function authorizeToolForCurrentTurn(
         : {}),
     };
   }
+  if (isPerCallOnlyToolRisk(risk)) {
+    return {
+      allowed: false,
+      reason: `工具 ${name} 的 ${risk} 权限需要单次审批，不能复用本轮授权。`,
+      allowExternalLocalRead: false,
+    };
+  }
   return {
-    allowed: false,
-    reason: `Runtime v2 不会自动执行 ${risk} 工具。`,
+    allowed: true,
+    reason: null,
     allowExternalLocalRead: false,
   };
 }

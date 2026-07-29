@@ -34,7 +34,8 @@ export class RuntimeV2ProviderProtocolError extends Error {
     readonly code:
       | "required_tool_missing"
       | "tool_surface_rejected"
-      | "tool_arguments_rejected",
+      | "tool_arguments_rejected"
+      | "repeated_action_rejected",
     message: string,
   ) {
     super(message);

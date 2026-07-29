@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
+import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
+import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { streamChatCompletion } from "../../lib/streaming";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
@@ -8,23 +9,14 @@ import { getToolTarget } from "../../lib/toolTarget";
 import {
   allocateProviderAttemptTimeoutMs,
   compileRuntimeV2SubagentReport,
-  deriveRuntimeV2ValidationBoundary,
   normalizeProviderResponseV1,
   recordProviderTransportAttempt,
-  resolveRuntimeV2ExecutionContractValidation,
-  resolveRuntimeV2PlanValidationScope,
-  RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION,
-  runtimeV2SubagentFailureSummary,
-  runtimeV2ExecutionValidationAuthority,
   runtimeV2EvidenceVersion,
-  runtimeV2PlanValidationAuthority,
+  runtimeV2SubagentFailureSummary,
   selectNextProviderTransportAttempt,
-  shouldRequestRuntimeV2SubagentReport,
   type RuntimeV2EvidenceReference,
-  type RuntimeV2ExecutionValidationAuthority,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2SubagentJob,
-  type RuntimeV2SubagentValidationReceiptV1,
 } from "../../lib/runtime-v2";
 import { analyzeValidationCommand } from "../../lib/validationContract";
 import {
@@ -35,6 +27,7 @@ import {
   childScopeAllows,
   compactTextEnvelopeCatalog,
   containsProviderTextEnvelopePrompt,
+  runtimeV2ContextBoundToolArguments,
   type RuntimeV2ChildResult,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
@@ -43,9 +36,7 @@ import {
   isRuntimeV2ValidationPassed,
   runtimeV2ValidationEvidenceVersion,
 } from "./executionEvidence";
-import {
-  buildRuntimeV2SubagentContextCapsule,
-} from "./executionSubagentContext";
+import { buildRuntimeV2SubagentContextCapsule } from "./executionSubagentContext";
 
 const READ_ONLY_CHILD_TOOL_NAMES = new Set([
   "list_directory",
@@ -60,195 +51,84 @@ const VALIDATION_CHILD_TOOL_NAMES = new Set([
   "browser_evaluate",
   "computer_use",
 ]);
-const SUBMIT_SUBAGENT_REPORT_TOOL_NAME = "submit_subagent_report";
-const SUBMIT_SUBAGENT_REPORT_TOOL: ToolDefinition = {
-  type: "function",
-  function: {
-    name: SUBMIT_SUBAGENT_REPORT_TOOL_NAME,
-    description:
-      "Submit the final structured child report. Every finding must cite evidence ids returned by successful child tools. This is the only path to completed status.",
-    parameters: {
-      type: "object",
-      properties: {
-        summary: { type: "string" },
-        findings: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              statement: { type: "string" },
-              evidence_ids: {
-                type: "array",
-                minItems: 1,
-                items: { type: "string" },
-              },
-            },
-            required: ["statement", "evidence_ids"],
-          },
-        },
-        unresolved: {
-          type: "array",
-          items: { type: "string" },
-        },
-      },
-      required: ["summary", "findings", "unresolved"],
-    },
-  },
-};
-const READ_ONLY_CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter(
-  (definition) =>
-    READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name),
-);
-const VALIDATION_CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter(
-  (definition) =>
-    VALIDATION_CHILD_TOOL_NAMES.has(definition.function.name),
+const CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((definition) =>
+  READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
+  VALIDATION_CHILD_TOOL_NAMES.has(definition.function.name)
 );
 const RUNTIME_V2_CHILD_DEADLINE_MS = 90_000;
+const RUNTIME_V2_CHILD_SYNTHESIS_RESERVE_MS = 30_000;
+const RUNTIME_V2_CHILD_SYNTHESIS_MAX_OUTPUT_TOKENS = 1_024;
 
-class RuntimeV2ChildProtocolDriftError extends Error {}
+export function runtimeV2ChildStepPhase(input: {
+  readonly now: number;
+  readonly deadlineAt: number;
+  readonly evidenceCount: number;
+}): "investigate" | "synthesize" | "expired" {
+  if (input.now >= input.deadlineAt) return "expired";
+  return input.evidenceCount > 0 &&
+      input.deadlineAt - input.now <=
+        RUNTIME_V2_CHILD_SYNTHESIS_RESERVE_MS
+    ? "synthesize"
+    : "investigate";
+}
+
+class RuntimeV2ChildProtocolError extends Error {}
 class RuntimeV2ChildDeadlineError extends Error {}
 
-function childToolDefinitions(job: RuntimeV2SubagentJob): ToolDefinition[] {
-  return [
-    ...READ_ONLY_CHILD_TOOL_DEFINITIONS,
-    ...(job.taskKind === "validate"
-      ? VALIDATION_CHILD_TOOL_DEFINITIONS
-      : []),
-    SUBMIT_SUBAGENT_REPORT_TOOL,
-  ];
+function childTools(job: RuntimeV2SubagentJob): ToolDefinition[] {
+  return CHILD_TOOL_DEFINITIONS.filter((definition) =>
+    READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
+    job.taskKind === "validate"
+  );
 }
 
-function resolveChildValidationAuthority(input: {
-  readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly toolName: string;
-  readonly args: Readonly<Record<string, unknown>>;
-}): RuntimeV2ExecutionValidationAuthority | null {
-  const aggregate = aggregateForCurrentTurn(input.ports);
-  if (!aggregate) return null;
-  if (
-    aggregate.strategy === "execute" &&
-    aggregate.executionContract?.status === "active"
-  ) {
-    const validation = resolveRuntimeV2ExecutionContractValidation({
-      contract: aggregate.executionContract,
-      toolName: input.toolName,
-      args: input.args,
-    });
-    return validation
-      ? runtimeV2ExecutionValidationAuthority({
-          contract: aggregate.executionContract,
-          validation,
-        })
-      : null;
-  }
-  if (
-    aggregate.strategy === "plan" &&
-    aggregate.workPlan?.status === "approved" &&
-    aggregate.sealedWorkPlan
-  ) {
-    const scope = resolveRuntimeV2PlanValidationScope({
-      plan: aggregate.sealedWorkPlan,
-      toolName: input.toolName,
-      args: input.args,
-    });
-    const validationIndex = scope.matchingValidationIndexes[0];
-    return validationIndex === undefined
-      ? null
-      : runtimeV2PlanValidationAuthority({
-          plan: aggregate.sealedWorkPlan,
-          validationIndex,
-        });
-  }
-  return null;
-}
-
-function childExecutionValidationPrimitive(
-  ports: RuntimeV2ExecutionPortsInput,
-  authority: RuntimeV2ExecutionValidationAuthority,
-) {
-  const aggregate = aggregateForCurrentTurn(ports);
-  const contract = aggregate?.executionContract;
-  if (
-    authority.kind !== "execution_contract" ||
-    !contract ||
-    contract.status !== "active" ||
-    authority.id !== contract.id ||
-    authority.revision !== contract.revision ||
-    authority.digest !== contract.digest
-  ) {
-    return undefined;
-  }
-  return contract.validations.find((validation) =>
-    validation.id === authority.validationId
-  )?.primitive;
-}
-
-async function admitChildTool(input: {
+async function childToolAllowed(input: {
   readonly job: RuntimeV2SubagentJob;
   readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly toolName: string;
+  readonly name: string;
   readonly args: Record<string, unknown>;
-}): Promise<{
-  readonly allowed: boolean;
-  readonly validationAuthority: RuntimeV2ExecutionValidationAuthority | null;
-}> {
-  if (READ_ONLY_CHILD_TOOL_NAMES.has(input.toolName)) {
-    return {
-      allowed: childScopeAllows(input.job, input.args),
-      validationAuthority: null,
-    };
+}): Promise<boolean> {
+  if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
+    return childScopeAllows(input.job, input.args);
   }
   if (
     input.job.taskKind !== "validate" ||
-    !VALIDATION_CHILD_TOOL_NAMES.has(input.toolName)
+    !VALIDATION_CHILD_TOOL_NAMES.has(input.name)
   ) {
-    return { allowed: false, validationAuthority: null };
+    return false;
   }
-  if (input.toolName === "run_command") {
+  if (input.name === "run_command") {
     const analysis = analyzeValidationCommand(
       String(input.args.command ?? input.args.cmd ?? ""),
-      {
-        cwd: String(input.args.cwd ?? input.args.workdir ?? "."),
-      },
+      { cwd: String(input.args.cwd ?? input.args.workdir ?? ".") },
     );
     if (
       analysis.spec?.kind !== "finite_command" ||
-      !childScopeAllows(input.job, {
-        cwd: analysis.spec.cwd || ".",
-      })
+      !childScopeAllows(input.job, { cwd: analysis.spec.cwd || "." })
     ) {
-      return { allowed: false, validationAuthority: null };
+      return false;
     }
   }
-  const validationAuthority = resolveChildValidationAuthority(input);
-  if (!validationAuthority) {
-    return { allowed: false, validationAuthority: null };
-  }
-  const authorization = await authorizeToolForCurrentTurn(
+  return (await authorizeToolForCurrentTurn(
     input.ports,
-    input.toolName,
+    input.name,
     input.args,
-  );
-  return {
-    allowed: authorization.allowed,
-    validationAuthority: authorization.allowed
-      ? validationAuthority
-      : null,
-  };
+  )).allowed;
 }
 
-async function requestReadOnlyChildAction(input: {
+async function requestChildStep(input: {
   readonly job: RuntimeV2SubagentJob;
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly messages: readonly AgentMessage[];
   readonly tools: readonly ToolDefinition[];
+  readonly requiresTool: boolean;
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
+  readonly maxOutputTokens?: number;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const profile = {
     ...baseProviderProfile(input.ports.get()),
-    requiredToolChoice: true,
+    requiredToolChoice: input.requiresTool,
   };
   let epoch: {
     actionKey: string;
@@ -260,7 +140,6 @@ async function requestReadOnlyChildAction(input: {
     attempted: [],
   };
   let lastError: unknown = null;
-  let protocolOnly = true;
   while (Date.now() < input.deadlineAt) {
     const attempt = selectNextProviderTransportAttempt(profile, epoch);
     if (!attempt) break;
@@ -280,7 +159,7 @@ async function requestReadOnlyChildAction(input: {
               role: "system" as const,
               content: containsProviderTextEnvelopePrompt(
                 input.ports.context.phaseLanguage,
-                true,
+                input.requiresTool,
               ),
             }, {
               role: "system" as const,
@@ -288,10 +167,25 @@ async function requestReadOnlyChildAction(input: {
             }]
           : []),
       ];
+      const budget = input.ports.context.runtimeContextBudget;
+      const maxOutputTokens = Math.min(
+        input.maxOutputTokens ||
+          4_096,
+        budget?.outputBudget ?? 4_096,
+      );
+      const boundedRequestMessages = budget
+        ? boundRuntimeMessagesToContext(requestMessages, {
+            contextLimit: budget.contextLimit,
+            reservedOutputTokens: maxOutputTokens,
+          })
+        : requestMessages;
       let streamedText = "";
       const wire = await streamChatCompletion(
-        requestMessages,
-        deriveStreamSettings(input.ports.get().config),
+        boundedRequestMessages,
+        deriveBudgetedStreamSettings(
+          input.ports.get().config,
+          budget,
+        ),
         {
           onToken: (token) => {
             streamedText += token;
@@ -306,7 +200,7 @@ async function requestReadOnlyChildAction(input: {
         },
         input.signal,
         attempt.textEnvelope ? [] : [...input.tools],
-        4_096,
+        maxOutputTokens,
         {
           ...(attempt.toolChoice
             ? { toolChoice: attempt.toolChoice }
@@ -314,11 +208,9 @@ async function requestReadOnlyChildAction(input: {
           timeoutMs,
         },
       );
-      const protocolContent =
-        wire.actionableContent || wire.content || streamedText;
       const normalized = normalizeProviderResponseV1({
         visibleText: wire.semanticContent || streamedText,
-        content: protocolContent,
+        content: wire.actionableContent || wire.content || streamedText,
         toolCalls: wire.toolCalls,
         usage: wire.usage,
         diagnostics: wire.protocolViolation
@@ -329,28 +221,31 @@ async function requestReadOnlyChildAction(input: {
             }]
           : [],
       });
-      const allowedNames = new Set(
+      const allowed = new Set(
         input.tools.map((tool) => tool.function.name),
       );
       const unexpected = normalized.toolCalls.filter(
-        (call) => !allowedNames.has(call.name),
+        (call) => !allowed.has(call.name),
       );
+      const visibleText = sanitizeAssistantDisplayContent(
+        normalized.visibleText || "",
+      ).trim();
       if (
-        normalized.toolCalls.length === 0 ||
         unexpected.length > 0 ||
-        normalized.diagnostics.length > 0
+        normalized.diagnostics.length > 0 ||
+        (
+          normalized.toolCalls.length === 0 &&
+          (input.requiresTool || !visibleText)
+        )
       ) {
-        throw new RuntimeV2ChildProtocolDriftError(
-          normalized.toolCalls.length === 0
-            ? "child_required_tool_missing"
-            : unexpected.length > 0
-              ? `child_tool_surface_rejected:${
-                  unexpected.map((call) => call.name).join(",")
-                }`
-              : `child_protocol_diagnostic:${
-                  normalized.diagnostics
-                    .map((diagnostic) => diagnostic.code).join(",")
-                }`,
+        throw new RuntimeV2ChildProtocolError(
+          unexpected.length > 0
+            ? `child_tool_surface_rejected:${
+                unexpected.map((call) => call.name).join(",")
+              }`
+            : normalized.toolCalls.length === 0
+              ? "child_required_tool_missing"
+              : "child_protocol_diagnostic",
         );
       }
       input.ports.logStoreEvent("runtime_v2_subagent_provider_result", {
@@ -358,19 +253,18 @@ async function requestReadOnlyChildAction(input: {
         runId: input.job.run.runId,
         jobId: input.job.id,
         transport: attempt.variant,
-        toolName: normalized.toolCalls[0]!.name,
+        toolName: normalized.toolCalls[0]?.name || null,
+        concluded: normalized.toolCalls.length === 0,
       });
       return {
         ...normalized,
+        visibleText,
         toolCalls: normalized.toolCalls.slice(0, 1),
       };
     } catch (error) {
       lastError = error;
-      if (!(error instanceof RuntimeV2ChildProtocolDriftError)) {
-        protocolOnly = false;
-      }
       input.ports.logStoreEvent(
-        error instanceof RuntimeV2ChildProtocolDriftError
+        error instanceof RuntimeV2ChildProtocolError
           ? "runtime_v2_subagent_protocol_drift"
           : "runtime_v2_subagent_transport_failed",
         {
@@ -383,31 +277,71 @@ async function requestReadOnlyChildAction(input: {
       );
     }
   }
-  if (protocolOnly) {
-    throw new RuntimeV2ChildProtocolDriftError(
-      lastError instanceof Error
-        ? lastError.message
-        : "child_provider_protocol_unavailable",
-    );
-  }
   throw lastError instanceof Error
     ? lastError
     : new Error("Runtime v2 child provider transports exhausted.");
 }
 
+function pathsOverlap(left: string, right: string): boolean {
+  const normalize = (value: string) =>
+    value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+  const a = normalize(left);
+  const b = normalize(right);
+  return !a || !b || a === "." || b === "." ||
+    a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function inheritedReviewEvidence(
+  ports: RuntimeV2ExecutionPortsInput,
+  job: RuntimeV2SubagentJob,
+): RuntimeV2EvidenceReference[] {
+  if (job.taskKind !== "review") return [];
+  return (aggregateForCurrentTurn(ports)?.evidence || [])
+    .filter((evidence) =>
+      job.allowedPaths.some((path) => pathsOverlap(evidence.target, path))
+    )
+    .slice(-16);
+}
+
+function completedChildResult(input: {
+  readonly job: RuntimeV2SubagentJob;
+  readonly summary: string;
+  readonly evidence: readonly RuntimeV2EvidenceReference[];
+}): RuntimeV2ChildResult {
+  const report = compileRuntimeV2SubagentReport({
+    draft: {
+      summary: input.summary,
+      findings: [{
+        statement: input.summary,
+        evidence_ids: input.evidence.map((item) => item.id),
+      }],
+      unresolved: [],
+    },
+    evidence: input.evidence,
+  });
+  return {
+    job: input.job,
+    status: "completed",
+    summary: report.summary,
+    report,
+    evidence: input.evidence,
+    validationReceipts: [],
+  };
+}
+
 async function runRuntimeV2Child(input: {
-  job: RuntimeV2SubagentJob;
-  ports: RuntimeV2ExecutionPortsInput;
-  signal: AbortSignal;
+  readonly job: RuntimeV2SubagentJob;
+  readonly ports: RuntimeV2ExecutionPortsInput;
+  readonly signal: AbortSignal;
 }): Promise<RuntimeV2ChildResult> {
   const telemetry = input.ports.live.childTelemetry.get(input.job.id);
-  const language =
-    input.ports.context.phaseLanguage === "en" ? "English" : "简体中文";
-  const tools = childToolDefinitions(input.job);
-  const parentContextCapsule = buildRuntimeV2SubagentContextCapsule({
+  const tools = childTools(input.job);
+  const context = buildRuntimeV2SubagentContextCapsule({
     aggregate: aggregateForCurrentTurn(input.ports),
     job: input.job,
     modelContext: input.ports.live.modelContext,
+    contextBudget:
+      input.ports.context.runtimeContextBudget || undefined,
   });
   input.ports.logStoreEvent("runtime_v2_subagent_context_handoff", {
     turnId: input.job.run.turnId,
@@ -415,105 +349,77 @@ async function runRuntimeV2Child(input: {
     childRunId: input.job.run.runId,
     jobId: input.job.id,
     taskKind: input.job.taskKind || "explore",
-    parentContextChars: parentContextCapsule.length,
-    inheritedContext: parentContextCapsule.length > 0,
+    parentContextChars: context.length,
+    inheritedContext: context.length > 0,
   });
   const deadlineAt = Math.min(
     Date.now() + RUNTIME_V2_CHILD_DEADLINE_MS,
     input.ports.lifecycleDeadlineAt || Number.POSITIVE_INFINITY,
   );
-  const messages: AgentMessage[] = [
-    {
-      role: "system",
-      content: [
-        "You are a read-only child in MAIN Runtime v2.",
-        `Task kind: ${input.job.taskKind || "explore"}`,
-        `Name: ${input.job.name || input.job.scopeKey}`,
-        `Role: ${input.job.role || "read-only investigator"}`,
-        `Scope key: ${input.job.scopeKey}`,
-        `Allowed paths: ${input.job.allowedPaths.join(", ")}`,
-        input.job.successCriteria
-          ? `Success criteria: ${input.job.successCriteria}`
-          : "",
-        input.job.expectedOutput
-          ? `Expected output: ${input.job.expectedOutput}`
-          : "",
-        "The parent is the only writer. Never request or simulate a file mutation.",
-        input.job.taskKind === "validate"
-          ? "You may run only a finite validator already declared by the active parent execution authority."
-          : "Use only the provided read/search tools.",
-        parentContextCapsule
-          ? [
-              "PARENT_CONTEXT_CAPSULE follows. It is the current handoff, not child-owned evidence.",
-              "Do not restart a workspace survey or reread facts already present in this capsule. Use it to identify the smallest missing independent fact.",
-              "PARENT_CONTEXT_ONLY_NOT_CITABLE: report findings must still cite at least one new CHILD_EVIDENCE_ID produced by this child.",
-              parentContextCapsule,
-            ].join("\n")
-          : "",
-        "Every successful tool result returns an evidence id. Finish only by calling submit_subagent_report; every finding must cite real ids from this child. Include an unresolved array, even when empty.",
-        `Write report content in ${language}.`,
-      ].filter(Boolean).join("\n"),
-    },
-    { role: "user", content: input.job.objective },
-  ];
-  const evidence: RuntimeV2EvidenceReference[] = [];
-  const validationReceipts: RuntimeV2SubagentValidationReceiptV1[] = [];
-  const evidenceFingerprints = new Set<string>();
-  let evidenceOrdinal = 0;
-  let reportModeAnnounced = false;
+  const messages: AgentMessage[] = [{
+    role: "system",
+    content: [
+      "You are a read-only child of the current MAIN turn.",
+      `Task kind: ${input.job.taskKind || "explore"}`,
+      `Role: ${input.job.role || "read-only reviewer"}`,
+      `Allowed paths: ${input.job.allowedPaths.join(", ")}`,
+      input.job.successCriteria
+        ? `Success criteria: ${input.job.successCriteria}`
+        : "",
+      "The parent is the only writer. Never request or simulate file changes.",
+      "Use the parent context as current context; do not reread an unchanged fact merely to reconstruct the task.",
+      input.job.taskKind === "validate"
+        ? "You may use the provided finite validation tools. Your result is advisory until the parent validates the final mutation."
+        : "Use only the provided read/search tools.",
+      "When the bounded task is answered, return one concise final summary in ordinary text. There is no report tool.",
+      context ? `PARENT_CONTEXT_CAPSULE:\n${context}` : "",
+    ].filter(Boolean).join("\n"),
+  }, {
+    role: "user",
+    content: input.job.objective,
+  }];
+  const evidence = inheritedReviewEvidence(input.ports, input.job);
+  const fingerprints = new Set(
+    evidence.map((item) =>
+      `${item.kind}:${item.target}:${item.version || "unversioned"}`
+    ),
+  );
+  let ordinal = 0;
   try {
     while (!input.signal.aborted && Date.now() < deadlineAt) {
-      const reportOnly = shouldRequestRuntimeV2SubagentReport({
+      const phase = runtimeV2ChildStepPhase({
+        now: Date.now(),
+        deadlineAt,
         evidenceCount: evidence.length,
       });
-      if (reportOnly && !reportModeAnnounced) {
-        reportModeAnnounced = true;
-        messages.push({
-          role: "system",
-          content: [
-            "CHILD_REPORT_REQUIRED: this bounded child probe now has independent evidence.",
-            "Stop investigating. Call submit_subagent_report now using only CHILD_EVIDENCE_ID values already returned by successful tools; do not reread the parent handoff or widen scope.",
-            "List anything still unknown in unresolved; do not perform another read or search.",
-          ].join(" "),
-        });
-        input.ports.logStoreEvent(
-          "runtime_v2_subagent_report_mode_entered",
-          {
-            turnId: input.job.run.turnId,
-            runId: input.job.run.runId,
-            jobId: input.job.id,
-            evidenceCount: evidence.length,
-            parentRequested:
-              input.ports.live.childReportRequests?.has(input.job.id) ===
-                true,
-            reason: "first_independent_evidence",
-          },
-        );
-      }
+      if (phase !== "investigate") break;
       let result: RuntimeV2NormalizedProviderResult;
       try {
-        result = await requestReadOnlyChildAction({
+        result = await requestChildStep({
           ...input,
           messages,
-          tools: reportOnly
-            ? [SUBMIT_SUBAGENT_REPORT_TOOL]
-            : tools,
-          deadlineAt,
+          tools,
+          requiresTool: evidence.length === 0,
+          deadlineAt: evidence.length > 0
+            ? deadlineAt - RUNTIME_V2_CHILD_SYNTHESIS_RESERVE_MS
+            : deadlineAt,
         });
       } catch (error) {
-        if (!(error instanceof RuntimeV2ChildProtocolDriftError)) throw error;
-        // requestReadOnlyChildAction already exhausted every compatible
-        // transport for this structural action. Restarting the same epoch
-        // merely makes a failed child consume its whole lifecycle while the
-        // parent waits. Fail this child truthfully and let the parent continue.
+        if (evidence.length > 0 && !input.signal.aborted) break;
         throw error;
       }
-      const call = result.toolCalls[0]!;
+      const call = result.toolCalls[0];
+      if (!call) {
+        if (telemetry) telemetry.closedAt = input.ports.now();
+        return completedChildResult({
+          job: input.job,
+          summary: result.visibleText || "",
+          evidence,
+        });
+      }
       messages.push({
         role: "assistant",
-        content: sanitizeAssistantDisplayContent(
-          result.visibleText || "",
-        ),
+        content: result.visibleText || "",
         tool_calls: [{
           id: call.id,
           type: "function",
@@ -523,189 +429,160 @@ async function runRuntimeV2Child(input: {
           },
         }],
       });
-      if (call.name === SUBMIT_SUBAGENT_REPORT_TOOL_NAME) {
-        try {
-          const report = compileRuntimeV2SubagentReport({
-            draft: call.arguments,
-            evidence,
-          });
-          if (telemetry) telemetry.closedAt = input.ports.now();
-          return {
-            job: input.job,
-            status: "completed",
-            summary: report.summary,
-            report,
-            evidence,
-            validationReceipts,
-          };
-        } catch (error) {
-          throw new RuntimeV2ChildProtocolDriftError(
-            `SUBAGENT_REPORT_REJECTED: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
-      }
-      const admission = await admitChildTool({
+      if (!await childToolAllowed({
         job: input.job,
         ports: input.ports,
-        toolName: call.name,
+        name: call.name,
         args: { ...call.arguments },
-      });
-      if (!admission.allowed) {
-        throw new RuntimeV2ChildProtocolDriftError(
-          `CHILD_SCOPE_BLOCKED:${call.name}`,
-        );
+      })) {
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content:
+            "TOOL_BLOCKED: this action is outside the child's read-only scope. Choose an allowed bounded action or conclude from inherited evidence.",
+        });
+        continue;
       }
       try {
-        const target = getToolTarget(call.name, call.arguments) ||
-          call.name;
-        const aggregate = admission.validationAuthority
-          ? aggregateForCurrentTurn(input.ports)
-          : null;
-        const validationBoundary =
-          admission.validationAuthority && aggregate
-            ? deriveRuntimeV2ValidationBoundary(
-                aggregate,
-                admission.validationAuthority.targetPaths,
-              )
-            : null;
-        const startedAt = input.ports.now();
+        const target = getToolTarget(call.name, call.arguments) || call.name;
         const rawOutput = await executeTool(
           call.name,
-          { ...call.arguments },
+          runtimeV2ContextBoundToolArguments(
+            call.name,
+            { ...call.arguments },
+            input.ports.context.runtimeContextBudget,
+          ),
           input.ports.context.runWorkspace || "",
           input.ports.context.runSessionKey,
           { toolCatalog: authorizationFor(input.ports).toolCatalog },
         );
-        const completedAt = input.ports.now();
         const output = boundedToolContent(rawOutput, 8_000);
-        const validationCall = !!(
-          admission.validationAuthority && validationBoundary
-        );
-        const childEvidence: RuntimeV2EvidenceReference = {
-          id: `child:${input.job.id}:E${++evidenceOrdinal}`,
-          kind: validationCall ? "validation" : "subagent",
-          target,
-          version: validationCall
-            ? runtimeV2ValidationEvidenceVersion(rawOutput)
-            : runtimeV2EvidenceVersion(output),
-        };
-        const evidenceFingerprint = [
-          childEvidence.kind,
-          childEvidence.target,
-          childEvidence.version || "unversioned",
-        ].join(":");
-        if (evidenceFingerprints.has(evidenceFingerprint)) {
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: [
-              "CHILD_EVIDENCE_REPEAT: this target returned the same committed version already held by the child.",
-              "No new evidence id was created. Submit the structured report using the existing CHILD_EVIDENCE_ID and list unresolved work instead of repeating the tool.",
-            ].join(" "),
-          });
-          continue;
-        }
-        evidenceFingerprints.add(evidenceFingerprint);
-        evidence.push(childEvidence);
-        input.ports.logStoreEvent(
-          "runtime_v2_subagent_evidence_recorded",
-          {
-            turnId: input.job.run.turnId,
-            runId: input.job.run.runId,
-            jobId: input.job.id,
-            evidenceId: childEvidence.id,
-            evidenceKind: childEvidence.kind,
-            target: childEvidence.target,
-            evidenceCount: evidence.length,
-          },
-        );
-        if (admission.validationAuthority && validationBoundary) {
-          validationReceipts.push({
-            schemaVersion:
-              RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION,
-            evidenceId: childEvidence.id,
-            passed: isRuntimeV2ValidationPassed(
-              call.name,
-              rawOutput,
-              childExecutionValidationPrimitive(
-                input.ports,
-                admission.validationAuthority,
-              ),
-            ),
-            authority: admission.validationAuthority,
-            ...validationBoundary,
-            startedAt,
-            completedAt,
-          });
+        const isValidation = VALIDATION_CHILD_TOOL_NAMES.has(call.name);
+        const passed = isValidation
+          ? isRuntimeV2ValidationPassed(call.name, rawOutput)
+          : true;
+        const version = isValidation
+          ? runtimeV2ValidationEvidenceVersion(rawOutput)
+          : runtimeV2EvidenceVersion(output);
+        const fingerprint =
+          `subagent:${target}:${version || "unversioned"}`;
+        const isNewEvidence = !fingerprints.has(fingerprint);
+        const childEvidence: RuntimeV2EvidenceReference | null = isNewEvidence
+          ? {
+              id: `child:${input.job.id}:E${++ordinal}`,
+              kind: "subagent",
+              target,
+              version,
+            }
+          : null;
+        if (childEvidence) {
+          fingerprints.add(fingerprint);
+          evidence.push(childEvidence);
+          input.ports.logStoreEvent(
+            "runtime_v2_subagent_evidence_recorded",
+            {
+              turnId: input.job.run.turnId,
+              runId: input.job.run.runId,
+              jobId: input.job.id,
+              evidenceId: childEvidence.id,
+              target,
+              validationPassed: isValidation ? passed : null,
+            },
+          );
         }
         messages.push({
           role: "tool",
           tool_call_id: call.id,
           content: [
-            `CHILD_EVIDENCE_ID: ${childEvidence.id}`,
-            `TARGET: ${childEvidence.target}`,
-            `VERSION: ${childEvidence.version}`,
+            childEvidence
+              ? `CHILD_EVIDENCE_ID: ${childEvidence.id}`
+              : "CHILD_EVIDENCE_REPEAT",
+            `TARGET: ${target}`,
+            isValidation ? `VALIDATION_PASSED: ${passed}` : "",
             output,
-          ].join("\n"),
+          ].filter(Boolean).join("\n"),
         });
       } catch (error) {
-        throw new Error(
-          `CHILD_TOOL_ERROR:${call.name}:${
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: `TOOL_FAILED: ${
             error instanceof Error ? error.message : String(error)
           }`,
-        );
+        });
       }
     }
-    if (telemetry) telemetry.closedAt = input.ports.now();
+    if (
+      evidence.length > 0 &&
+      !input.signal.aborted &&
+      Date.now() < deadlineAt
+    ) {
+      messages.push({
+        role: "system",
+        content: [
+          "The investigation window is closed. Do not call another tool.",
+          "Return one concise final summary now. Cite the CHILD_EVIDENCE_ID values already present in the transcript, distinguish findings from unresolved questions, and do not claim a mutation.",
+        ].join(" "),
+      });
+      const result = await requestChildStep({
+        ...input,
+        messages,
+        tools: [],
+        requiresTool: false,
+        deadlineAt,
+        maxOutputTokens: RUNTIME_V2_CHILD_SYNTHESIS_MAX_OUTPUT_TOKENS,
+      });
+      if (telemetry) telemetry.closedAt = input.ports.now();
+      return completedChildResult({
+        job: input.job,
+        summary: result.visibleText || "",
+        evidence,
+      });
+    }
+  } catch {
     const canceled = input.signal.aborted &&
       !(input.signal.reason instanceof RuntimeV2ChildDeadlineError);
-    const deadlineExceeded =
-      input.signal.reason instanceof RuntimeV2ChildDeadlineError ||
-      Date.now() >= deadlineAt;
+    const status = canceled
+      ? "canceled"
+      : evidence.length > 0
+        ? "degraded"
+        : "failed";
+    if (telemetry) telemetry.closedAt = input.ports.now();
     return {
       job: input.job,
-      status: canceled ? "canceled" : "failed",
+      status,
       summary: runtimeV2SubagentFailureSummary({
         canceled,
-        deadlineExceeded,
+        deadlineExceeded:
+          input.signal.reason instanceof RuntimeV2ChildDeadlineError ||
+          Date.now() >= deadlineAt,
         evidence,
       }),
       report: null,
       evidence,
-      validationReceipts,
-    };
-  } catch (error) {
-    if (telemetry) telemetry.closedAt = input.ports.now();
-    const canceled = input.signal.aborted &&
-      !(input.signal.reason instanceof RuntimeV2ChildDeadlineError);
-    return {
-      job: input.job,
-      status: canceled ? "canceled" : "failed",
-      summary: canceled
-        ? runtimeV2SubagentFailureSummary({
-            canceled: true,
-            deadlineExceeded: false,
-            evidence,
-          })
-        : [
-            runtimeV2SubagentFailureSummary({
-              canceled: false,
-              deadlineExceeded:
-                input.signal.reason instanceof
-                  RuntimeV2ChildDeadlineError,
-              evidence,
-            }),
-            `失败原因：${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          ].join(" ").slice(0, 2_000),
-      report: null,
-      evidence,
-      validationReceipts,
+      validationReceipts: [],
     };
   }
+  const canceled = input.signal.aborted &&
+    !(input.signal.reason instanceof RuntimeV2ChildDeadlineError);
+  const status = canceled
+    ? "canceled"
+    : evidence.length > 0
+      ? "degraded"
+      : "failed";
+  if (telemetry) telemetry.closedAt = input.ports.now();
+  return {
+    job: input.job,
+    status,
+    summary: runtimeV2SubagentFailureSummary({
+      canceled,
+      deadlineExceeded: !canceled,
+      evidence,
+    }),
+    report: null,
+    evidence,
+    validationReceipts: [],
+  };
 }
 
 export async function startRuntimeV2ReadOnlyChild(
@@ -718,7 +595,6 @@ export async function startRuntimeV2ReadOnlyChild(
   if (parentSignal.aborted) abortFromParent();
   else parentSignal.addEventListener("abort", abortFromParent, { once: true });
   input.live.childAbortControllers.set(job.id, controller);
-
   const deadlineMs = Math.max(
     1,
     Math.min(
@@ -726,12 +602,10 @@ export async function startRuntimeV2ReadOnlyChild(
       (input.lifecycleDeadlineAt || Number.POSITIVE_INFINITY) - Date.now(),
     ),
   );
-  const timeoutHandle = setTimeout(() => {
-    controller.abort(
-      new RuntimeV2ChildDeadlineError(
-        "Runtime v2 child deadline exceeded.",
-      ),
-    );
+  const timeout = setTimeout(() => {
+    controller.abort(new RuntimeV2ChildDeadlineError(
+      "Runtime v2 child deadline exceeded.",
+    ));
   }, deadlineMs);
   try {
     return await runRuntimeV2Child({
@@ -740,9 +614,8 @@ export async function startRuntimeV2ReadOnlyChild(
       signal: controller.signal,
     });
   } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
+    clearTimeout(timeout);
     parentSignal.removeEventListener("abort", abortFromParent);
     input.live.childAbortControllers.delete(job.id);
-    input.live.childReportRequests?.delete(job.id);
   }
 }

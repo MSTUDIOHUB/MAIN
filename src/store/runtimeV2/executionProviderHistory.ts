@@ -1,5 +1,8 @@
 import type { AgentMessage, ContentPart } from "../../lib/agentMessages";
 import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
+import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
+import type { RuntimeV2NormalizedProviderResult } from "../../lib/runtime-v2";
+import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { boundedToolContent } from "./executionText";
 import { contextAnchorIndices } from "./executionProviderContext";
 import type {
@@ -11,9 +14,6 @@ import type {
 const MAX_CONTEXT_ENTRY_CHARS = 5_000;
 const MAX_CONTEXT_DIGEST_CHARS = 18_000;
 const MAX_CORRECTIVE_CONTEXT_DIGEST_CHARS = 14_000;
-const MAX_CONVERSATION_HISTORY_TURNS = 6;
-const MAX_CONVERSATION_HISTORY_CHARS = 28_000;
-const MAX_CONVERSATION_MESSAGE_CHARS = 12_000;
 const CONTEXT_SOURCES = [
   "workspace",
   "tool",
@@ -26,6 +26,128 @@ export interface RuntimeV2ProviderHistoryFocus {
   readonly kind: "corrective_mutation";
   readonly target: string;
   readonly evidenceId: string;
+}
+
+/**
+ * Preserve the standard assistant side of a tool exchange. Plan, child, and
+ * the former v1 loop already use this protocol pair; main execution must do
+ * the same so the next request continues from the real tool result.
+ */
+export function appendRuntimeV2AssistantToolCallHistory(
+  live: RuntimeV2LiveExecutionState,
+  result: RuntimeV2NormalizedProviderResult,
+): void {
+  if (result.toolCalls.length === 0) return;
+  live.messages.push({
+    role: "assistant",
+    content: result.visibleText || "",
+    tool_calls: result.toolCalls.map((call) => ({
+      id: call.id,
+      type: "function",
+      function: {
+        name: call.name,
+        arguments: JSON.stringify(call.arguments),
+      },
+    })),
+  });
+}
+
+export function appendRuntimeV2ToolResultHistory(
+  live: RuntimeV2LiveExecutionState,
+  toolCallId: string,
+  content: string,
+): void {
+  if (!toolCallId) return;
+  const hasParent = live.messages.some((message) =>
+    message.role === "assistant" &&
+    message.tool_calls?.some((call) => call.id === toolCallId)
+  );
+  if (!hasParent) return;
+  const existing = live.messages.find((message) =>
+    message.role === "tool" &&
+    message.tool_call_id === toolCallId
+  );
+  if (existing) {
+    existing.content = content;
+    return;
+  }
+  live.messages.push({
+    role: "tool",
+    tool_call_id: toolCallId,
+    content,
+  });
+}
+
+/**
+ * A provider protocol miss is still part of the conversation. Preserve the
+ * assistant response and the runtime-owned correction so a fallback transport
+ * or later command cannot resend an identical prompt with no knowledge of the
+ * failed attempt. Exact duplicate pairs are coalesced to keep a stubborn
+ * provider from growing context without adding information.
+ */
+export function appendRuntimeV2ProtocolDriftHistory(
+  live: RuntimeV2LiveExecutionState,
+  input: {
+    readonly visibleText: string;
+    readonly code: string;
+    readonly feedback: string;
+  },
+): void {
+  const visibleText = sanitizeAssistantDisplayContent(
+    input.visibleText || "",
+  ).trim();
+  const code = String(input.code || "protocol_drift").trim();
+  const feedback = String(input.feedback || "").trim();
+  const correction = [
+    `[runtime-v2 protocol feedback: ${code}]`,
+    feedback,
+  ].filter(Boolean).join("\n");
+  if (!correction) return;
+  const previousAssistantMessage =
+    live.messages[live.messages.length - 2];
+  const previousCorrectionMessage =
+    live.messages[live.messages.length - 1];
+  const previousAssistant =
+    previousAssistantMessage?.role === "assistant"
+      ? previousAssistantMessage
+      : null;
+  const previousCorrection =
+    previousCorrectionMessage?.role === "system"
+      ? previousCorrectionMessage
+      : null;
+  if (
+    previousAssistant &&
+    previousAssistant.content === visibleText &&
+    previousCorrection?.content === correction
+  ) {
+    return;
+  }
+  if (visibleText) {
+    live.messages.push({
+      role: "assistant",
+      content: visibleText,
+    });
+  }
+  live.messages.push({
+    role: "system",
+    content: correction,
+  });
+}
+
+/**
+ * Apply the shared complete-tool-pair compactor with limits derived from the
+ * actual model input budget. This preserves every pair while a large model
+ * has capacity and drops oldest complete groups under pressure; it does not
+ * impose a fixed number of rounds or messages.
+ */
+export function boundRuntimeV2ProviderConversation(
+  messages: readonly AgentMessage[],
+  options: {
+    readonly contextLimit: number;
+    readonly reservedOutputTokens: number;
+  },
+): AgentMessage[] {
+  return boundRuntimeMessagesToContext(messages, options);
 }
 
 function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
@@ -55,21 +177,18 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   ].join("\n");
 }
 
-function boundedConversationText(value: unknown): string {
-  const text = String(value || "").trim();
-  return text.length <= MAX_CONVERSATION_MESSAGE_CHARS
-    ? text
-    : `${text.slice(0, MAX_CONVERSATION_MESSAGE_CHARS - 43).trim()}\n[Older turn context truncated by Runtime v2.]`;
+function conversationText(value: unknown): string {
+  return String(value || "").trim();
 }
 
-function boundedConversationContent(
+function conversationContent(
   content: AgentMessage["content"],
 ): AgentMessage["content"] {
-  if (typeof content === "string") return boundedConversationText(content);
+  if (typeof content === "string") return conversationText(content);
   let images = 0;
   return content.flatMap((part): ContentPart[] => {
     if (part.type === "text") {
-      const text = boundedConversationText(part.text);
+      const text = conversationText(part.text);
       return text ? [{ type: "text", text }] : [];
     }
     if (part.type === "image_url" && images < 4) {
@@ -78,14 +197,6 @@ function boundedConversationContent(
     }
     return [];
   });
-}
-
-function conversationContentChars(content: AgentMessage["content"]): number {
-  if (typeof content === "string") return content.length;
-  return content.reduce(
-    (total, part) => total + (part.type === "text" ? part.text.length : 128),
-    0,
-  );
 }
 
 function currentTurnUserMessage(
@@ -110,12 +221,12 @@ function currentTurnUserMessage(
   if (!selected) {
     return {
       role: "user",
-      content: boundedConversationText(fallback) || "请处理当前任务。",
+      content: conversationText(fallback) || "请处理当前任务。",
     };
   }
   return {
     role: "user",
-    content: boundedConversationContent(selected.content),
+    content: conversationContent(selected.content),
     ...(exact?.runtimeTurnId ? { runtimeTurnId: exact.runtimeTurnId } : {}),
   };
 }
@@ -134,17 +245,14 @@ function baseProviderHistory(
   );
   const turn = turnIndex >= 0 ? turns[turnIndex] : null;
   const history: AgentMessage[] = [];
-  let retainedChars = 0;
   const priorTurns = (turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
-    .filter((candidate: any) => candidate?.uiVisibility !== "internal")
-    .slice(-MAX_CONVERSATION_HISTORY_TURNS);
-  for (let index = priorTurns.length - 1; index >= 0; index -= 1) {
-    const prior = priorTurns[index];
-    const user = boundedConversationText(prior?.userPrompt);
-    const assistant = boundedConversationText(
+    .filter((candidate: any) => candidate?.uiVisibility !== "internal");
+  for (const prior of priorTurns) {
+    const user = conversationText(prior?.userPrompt);
+    const assistant = conversationText(
       prior?.durableContext?.finalAssistantAnswer || prior?.summary,
     );
-    const durableExecution = boundedConversationText(
+    const durableExecution = conversationText(
       serializeDurableTurnContextForModel(prior?.durableContext),
     );
     const pair: AgentMessage[] = [
@@ -156,18 +264,7 @@ function baseProviderHistory(
         ? [{ role: "system" as const, content: durableExecution }]
         : []),
     ];
-    const pairChars = pair.reduce(
-      (total, message) => total + conversationContentChars(message.content),
-      0,
-    );
-    if (
-      history.length > 0 &&
-      retainedChars + pairChars > MAX_CONVERSATION_HISTORY_CHARS
-    ) {
-      break;
-    }
-    history.unshift(...pair);
-    retainedChars += pairChars;
+    history.push(...pair);
   }
   live.messages.push(
     { role: "system", content: systemInstruction(input) },
@@ -263,16 +360,23 @@ function buildModelContextDigest(
   readonly chars: number;
   readonly retainedSources: Record<string, number>;
 } {
-  if (live.modelContext.length === 0) {
+  // Ordinary tool outputs already travel in their standard assistant/tool
+  // pairs. Repeating them here was both lossy and the main source of context
+  // growth. Corrective packets may still pin one indexed tool result beside
+  // its failure authority.
+  const entries = focus
+    ? live.modelContext
+    : live.modelContext.filter((entry) => entry.source !== "tool");
+  if (entries.length === 0) {
     return {
       message: null,
       retained: 0,
-      dropped: 0,
+      dropped: live.modelContext.length,
       chars: 0,
       retainedSources: {},
     };
   }
-  const targetIndex = [...new Set(live.modelContext
+  const targetIndex = [...new Set(entries
     .map((entry) => entry.target)
     .filter(Boolean)
     .map((target) => target.slice(0, 120)))]
@@ -287,8 +391,7 @@ function buildModelContextDigest(
       ].join("\n")
     : [
         "[runtime-v2 structured evidence digest]",
-        "The approved WorkPlan is execution authority. Actual tool results and joined read-only child reports are evidence. Provider synthesis is labeled separately, remains untrusted, and cannot change lifecycle state.",
-        "Re-read a target if exact bytes are no longer retained.",
+        "Recent tool results are carried by the standard assistant/tool transcript. This digest adds only workspace, approved-plan, provider-diagnostic, and joined-child anchors.",
         targetIndex.length > 0 ? `Known targets: ${targetIndex.join(", ")}` : "",
       ].filter(Boolean).join("\n");
   const retainedIndices = new Set<number>();
@@ -297,21 +400,21 @@ function buildModelContextDigest(
     ? MAX_CORRECTIVE_CONTEXT_DIGEST_CHARS
     : MAX_CONTEXT_DIGEST_CHARS;
   const priority = focus
-    ? correctiveContextIndices(live.modelContext, focus)
+    ? correctiveContextIndices(entries, focus)
     : [
-        ...contextAnchorIndices(live.modelContext),
-        ...live.modelContext.map((_entry, index) => index).reverse(),
+        ...contextAnchorIndices(entries),
+        ...entries.map((_entry, index) => index).reverse(),
       ];
   for (const index of priority) {
     if (retainedIndices.has(index)) continue;
-    const entry = live.modelContext[index]!;
+    const entry = entries[index]!;
     const section = renderContextEntry(entry);
     if (chars + section.length > limit) continue;
     retainedIndices.add(index);
     chars += section.length;
     if (chars >= limit) break;
   }
-  const retained = live.modelContext.filter(
+  const retained = entries.filter(
     (_entry, index) => retainedIndices.has(index),
   );
   const body = retained.map(renderContextEntry).join("\n");

@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
+import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
+import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { streamChatCompletion } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
@@ -91,13 +92,31 @@ export async function requestPlanModel(input: {
       : PLAN_MODEL_REQUEST_TIMEOUT_MS,
     input.deadlineAt - Date.now(),
   ));
-  const requestMessages = input.stage === "synthesis"
+  const unboundedRequestMessages = input.stage === "synthesis"
     ? synthesisPlanTranscript({
         ...input,
         compactRecovery: !!input.compactRecovery,
         transport,
       })
     : boundedPlanTranscript(input.messages);
+  const budget = input.context.runtimeContextBudget;
+  const settings = deriveBudgetedStreamSettings(
+    input.get().config,
+    budget,
+  );
+  const maxOutputTokens = submissionStage
+    ? Math.min(
+        PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+        budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+      )
+    : budget?.outputBudget;
+  const requestMessages = budget
+    ? boundRuntimeMessagesToContext(unboundedRequestMessages, {
+        contextLimit: budget.contextLimit,
+        reservedOutputTokens:
+          maxOutputTokens || budget.outputBudget,
+      })
+    : unboundedRequestMessages;
   try {
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
       turnId: input.run.turnId,
@@ -113,6 +132,8 @@ export async function requestPlanModel(input: {
         (total, message) => total + String(message.content || "").length,
         0,
       ),
+      contextLimit: budget?.contextLimit ?? null,
+      maxOutputTokens: maxOutputTokens ?? null,
       timeoutMs: requestTimeoutMs,
     });
     const result = await withRuntimeV2HardDeadline({
@@ -124,7 +145,7 @@ export async function requestPlanModel(input: {
       },
       task: () => streamChatCompletion(
         requestMessages,
-        deriveStreamSettings(input.get().config),
+        settings,
         {
           onToken: (token) => { streamedText += token; },
           onDone: () => undefined,
@@ -132,7 +153,7 @@ export async function requestPlanModel(input: {
         },
         requestAbort.signal,
         offeredTools,
-        submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
+        maxOutputTokens,
         {
           ...(toolChoice ? { toolChoice } : {}),
           ...(structuredResponse

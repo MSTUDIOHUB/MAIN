@@ -15,6 +15,7 @@ import {
   boundedPlanContent,
   compactRetainedPlanObservation,
 } from "./planModelProtocol";
+import { runtimeV2ContextBoundToolArguments } from "./executionText";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 
@@ -79,7 +80,11 @@ export async function executeReadOnlyPlanTool(input: {
   try {
     const output = await executeTool(
       input.call.name,
-      args,
+      runtimeV2ContextBoundToolArguments(
+        input.call.name,
+        args,
+        input.context.runtimeContextBudget,
+      ),
       input.context.runWorkspace || "",
       input.context.runSessionKey,
     );

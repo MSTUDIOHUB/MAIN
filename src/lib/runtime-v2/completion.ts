@@ -1,7 +1,6 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2ResultKind } from "./contracts";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
-import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 
 /** Facts supplied by a store adapter after it has inspected actual tool and
  * validation receipts. Provider wording is intentionally reduced to a
@@ -10,6 +9,7 @@ export interface RuntimeV2CompletionFacts {
   readonly canceled: boolean;
   readonly mutationCount: number;
   readonly passedValidationCount: number;
+  readonly hasAcceptanceValidation: boolean;
   readonly failedValidationCount: number;
   readonly stalledValidationCount: number;
   readonly hasProviderConclusion: boolean;
@@ -59,17 +59,17 @@ export function decideRuntimeV2TerminalOutcome(
       resultReason: aggregate.recovery.exhausted.reason,
     };
   }
-  const executionContractCoverage =
-    deriveRuntimeV2ExecutionContractCoverage(aggregate);
   if (aggregate.strategy === "execute") {
-    if (!executionContractCoverage?.complete) return null;
-    return facts.hasProviderConclusion
-      ? {
-          resultKind: "success",
-          resultReason:
-            "执行契约中的全部修改目标和验收条件均由最终修改后的匹配证据覆盖。",
-        }
-      : null;
+    const hasVerifiedEffect =
+      facts.mutationCount > 0 &&
+      facts.hasAcceptanceValidation &&
+      facts.failedValidationCount === 0;
+    if (!hasVerifiedEffect || !facts.hasProviderConclusion) return null;
+    return {
+      resultKind: "success",
+      resultReason:
+        "最新工作区效果已由后续有限验证确认，并已生成基于实际证据的完成报告。",
+    };
   }
   const approvedPlanCoverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
   if (approvedPlanCoverage) {

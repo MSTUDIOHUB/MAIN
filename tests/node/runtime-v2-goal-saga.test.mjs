@@ -853,7 +853,7 @@ test("production Goal supervisor runs a finite Execute slice and closes one oute
     now: () => goal.createdAt + 1,
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",

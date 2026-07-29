@@ -8,7 +8,6 @@ export * from "./decision";
 export * from "./events";
 export * from "./evidenceVersion";
 export * from "./executionContract";
-export * from "./executionContractCoverage";
 export * from "./goalSaga";
 export * from "./phaseTransition";
 export * from "./planExecution";

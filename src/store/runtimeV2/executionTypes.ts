@@ -35,7 +35,7 @@ export interface RuntimeV2ExecutionAuthorization {
 
 export interface RuntimeV2ChildResult {
   readonly job: RuntimeV2SubagentJob;
-  readonly status: "completed" | "failed" | "canceled";
+  readonly status: "completed" | "degraded" | "failed" | "canceled";
   readonly summary: string;
   readonly report: RuntimeV2SubagentReportV1 | null;
   readonly evidence: readonly RuntimeV2EvidenceReference[];
@@ -49,14 +49,15 @@ export interface RuntimeV2LiveExecutionState {
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
   readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
-  /** A parent wait marks the child result as a dependency. The child switches
-   * to report-only mode after its next evidence-bearing action. */
-  readonly childReportRequests: Set<string>;
+  readonly coveredReadToolResults: Map<string, string | null>;
+  /** Exact semantic actions rejected at the current mutation boundary.
+   * The tool remains available; only the same tool+arguments tuple is
+   * ineligible until a successful workspace mutation opens a new boundary. */
+  readonly rejectedProviderActions: Map<string, string>;
   workspaceOverview: string;
   evidenceCounter: number;
   latestProviderResult: RuntimeV2NormalizedProviderResult | null;
   latestVisibleText: string;
-  lastProviderTransport: "native" | "text_envelope" | null;
   providerLaneProfile: ProviderLaneProfileV1 | null;
   authorization: RuntimeV2ExecutionAuthorization | null;
 }
@@ -79,12 +80,12 @@ export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState
     childRuns: new Map(),
     childAbortControllers: new Map(),
     childTelemetry: new Map(),
-    childReportRequests: new Set(),
+    coveredReadToolResults: new Map(),
+    rejectedProviderActions: new Map(),
     workspaceOverview: "",
     evidenceCounter: 0,
     latestProviderResult: null,
     latestVisibleText: "",
-    lastProviderTransport: null,
     providerLaneProfile: null,
     authorization: null,
   };

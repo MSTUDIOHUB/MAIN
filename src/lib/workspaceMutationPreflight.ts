@@ -21,7 +21,8 @@ export type WorkspaceMutationPreflightReason =
   | "existing_file_requires_patch"
   | "oversized_change"
   | "outside_workspace"
-  | "invalid_patch";
+  | "invalid_patch"
+  | "syntax_error";
 
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
@@ -49,6 +50,16 @@ export interface WorkspaceMutationPreflightInput {
     path: string,
   ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
   probeFileAvailability?: (path: string) => Promise<ApplyPatchPathAvailability>;
+  checkSyntax?: (
+    path: string,
+    content: string,
+  ) => Promise<{
+    applicable: boolean;
+    hasErrors: boolean;
+    errorCount: number;
+    firstErrorLine?: number | null;
+    firstErrorColumn?: number | null;
+  }>;
   /** Optional stage-owned safety ceiling. Corrective loops can require a
    * smaller diff than an initial implementation without changing tool
    * semantics or branching on model/provider identity. */
@@ -210,6 +221,8 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} is outside the active workspace. Choose a workspace-relative target; external temporary files are not mutation authority for this task.`;
       case "invalid_patch":
         return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Correct the patch from the active source observation; reread only for a changed version or a genuinely missing range.`;
+      case "syntax_error":
+        return `MUTATION_PREFLIGHT_BLOCKED: The proposed content for ${input.path} has a parser-confirmed syntax error (${input.detail || "invalid syntax"}). No file was changed; correct the edit from the active source observation.`;
     }
   }
 
@@ -232,6 +245,8 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 位于当前工作区之外。请选择工作区内的相对目标；外部临时文件不是本任务的修改权威。`;
     case "invalid_patch":
       return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。请依据当前源码观察修正 patch；只有版本变化或确实缺少范围时才重新读取。`;
+    case "syntax_error":
+      return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 的拟写入内容存在解析器确认的语法错误（${input.detail || "语法无效"}）。文件尚未修改；请依据当前源码观察修正编辑。`;
   }
 }
 
@@ -331,6 +346,28 @@ function blocked(input: {
       ? { patchRecoveryMismatch: input.patchRecoveryMismatch }
       : {}),
   };
+}
+
+async function blockedSyntaxResult(
+  input: WorkspaceMutationPreflightInput,
+  path: string,
+  content: string,
+  language: "zh" | "en",
+): Promise<WorkspaceMutationPreflightResult | null> {
+  if (!input.checkSyntax) return null;
+  const checked = await input.checkSyntax(path, content);
+  if (!checked.applicable || !checked.hasErrors) return null;
+  const location = checked.firstErrorLine
+    ? `${path}:${checked.firstErrorLine}:${checked.firstErrorColumn || 1}`
+    : path;
+  return blocked({
+    reason: "syntax_error",
+    toolName: input.toolName,
+    path,
+    language,
+    detail: `${location}; ${Math.max(1, checked.errorCount)} parser error(s)`,
+    recoveryKind: "mutation_rejected",
+  });
 }
 
 export async function preflightWorkspaceMutation(
@@ -433,6 +470,16 @@ export async function preflightWorkspaceMutation(
         });
       }
     }
+    for (const change of preview.changes) {
+      if (change.kind === "delete") continue;
+      const syntaxFailure = await blockedSyntaxResult(
+        input,
+        change.path,
+        change.newContent,
+        language,
+      );
+      if (syntaxFailure) return syntaxFailure;
+    }
     return { ok: true };
   }
 
@@ -463,7 +510,8 @@ export async function preflightWorkspaceMutation(
         language,
       });
     } catch {
-      return { ok: true };
+      return (await blockedSyntaxResult(input, path, content, language)) ||
+        { ok: true };
     }
   }
 
@@ -534,5 +582,6 @@ export async function preflightWorkspaceMutation(
     });
   }
 
-  return { ok: true };
+  return (await blockedSyntaxResult(input, path, updated, language)) ||
+    { ok: true };
 }

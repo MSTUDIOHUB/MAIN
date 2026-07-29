@@ -156,7 +156,7 @@ function createBridgeInput(state, harness, overrides = {}) {
     runSessionKey: "/repo:7",
     titleIntentSignature: "sig-help",
     sanitizeTaskBlocksForPersist: (blocks) => blocks.map((block) => ({ ...block, persisted: true })),
-    normalizeSessionRuntimeSnapshot: (snapshot) => ({ normalized: true, snapshot }),
+    buildSessionRuntimeSnapshot: (state) => ({ normalized: true, snapshot: state }),
     ...overrides,
   };
 }

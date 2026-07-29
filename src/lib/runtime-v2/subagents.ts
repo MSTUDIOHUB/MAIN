@@ -101,17 +101,6 @@ export function resolveRuntimeV2SubagentReferences(input: {
   return { jobIds, unresolved };
 }
 
-export function shouldRequestRuntimeV2SubagentReport(input: {
-  readonly evidenceCount: number;
-}): boolean {
-  // A child is a bounded independent probe, not a second open-ended agent
-  // loop. One child-owned evidence item is enough to make a citable finding;
-  // anything else belongs in `unresolved` so the parent can decide whether a
-  // different task is worth delegating. This also makes an explicit wait a
-  // convergence signal instead of a race against a hardcoded read loop.
-  return input.evidenceCount > 0;
-}
-
 export function runtimeV2SubagentFailureSummary(input: {
   readonly canceled: boolean;
   readonly deadlineExceeded: boolean;
@@ -128,6 +117,13 @@ export function runtimeV2SubagentFailureSummary(input: {
     : "没有形成可交接的只读证据。";
   if (input.canceled) {
     return `子任务已因父任务取消而停止；没有提交可确认的结构化报告。${retained}`;
+  }
+  if (input.evidence.length > 0) {
+    return `${
+      input.deadlineExceeded
+        ? "子任务在生命周期截止前"
+        : "子任务在收口前"
+    }未提交引用真实证据的结构化报告；已降级由父任务接管。${retained}`;
   }
   return `${
     input.deadlineExceeded

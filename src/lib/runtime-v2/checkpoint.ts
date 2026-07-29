@@ -17,6 +17,8 @@ export const MAX_RUNTIME_V2_CHECKPOINT_EVENTS = 2_048;
 export const MAX_RUNTIME_V2_CHECKPOINT_CHARS = 8_388_608;
 export const RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION =
   "turn-runtime-checkpoint.v3" as const;
+export const RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION =
+  "turn-runtime-checkpoint.v4" as const;
 
 export interface RuntimeV2CheckpointV4 {
   readonly schemaVersion: typeof RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION;
@@ -30,7 +32,8 @@ export interface RuntimeV2CheckpointV4 {
   readonly aggregateDigest: string;
   readonly updatedAt: number;
   readonly migratedFrom?:
-    typeof RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION;
+    | typeof RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
+    | typeof RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION;
   readonly migrationDisposition?:
     | "terminal_read_only"
     | "active_unmodified"
@@ -41,6 +44,27 @@ export interface RuntimeV2CheckpointV4 {
 export type RuntimeV2CheckpointV3 = RuntimeV2CheckpointV4;
 
 export type RuntimeV2CheckpointMap = Record<string, RuntimeV2CheckpointV3>;
+
+export interface RuntimeV2PersistedCheckpointV5 {
+  readonly schemaVersion: typeof RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION;
+  readonly engineVersion: typeof RUNTIME_V2_ENGINE_VERSION;
+  readonly revision: number;
+  readonly owner: RuntimeV2TurnIdentity;
+  /** The event ledger is the only persisted lifecycle truth. */
+  readonly events: readonly RuntimeV2Event[];
+  readonly aggregateDigest: string;
+  readonly updatedAt: number;
+  readonly migratedFrom?:
+    | typeof RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
+    | typeof RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION;
+  readonly migrationDisposition?:
+    | "terminal_read_only"
+    | "active_unmodified"
+    | "active_uncontracted_mutation";
+}
+
+export type RuntimeV2PersistedCheckpointMap =
+  Record<string, RuntimeV2PersistedCheckpointV5>;
 
 export interface CreateRuntimeV2CheckpointInput {
   readonly revision: number;
@@ -116,6 +140,7 @@ function hasValidCheckpointHeader(
 } {
   return (
       value.schemaVersion === RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION ||
+      value.schemaVersion === RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION ||
       value.schemaVersion === RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
     ) &&
     value.engineVersion === RUNTIME_V2_ENGINE_VERSION &&
@@ -226,9 +251,11 @@ function normalizeLegacyActiveEvents(
     ) {
       return {
         ...event,
-        status: "failed",
+        status: event.evidence.length > 0 ? "degraded" : "failed",
         summary:
-          "Legacy child result lacked a structured evidence-linked report and was not migrated as completed.",
+          event.evidence.length > 0
+            ? "Legacy child result retained evidence but lacked a structured report; parent takeover is required."
+            : "Legacy child result lacked both a structured evidence-linked report and retained evidence.",
       };
     }
     return event;
@@ -329,7 +356,9 @@ export function normalizeRuntimeV2Checkpoint(
   const owner = value.owner as unknown as RuntimeV2TurnIdentity;
   if (
     value.schemaVersion ===
-      RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
+      RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION ||
+    value.schemaVersion ===
+      RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION
   ) {
     return normalizeLegacyRuntimeV2Checkpoint(value, owner);
   }
@@ -337,8 +366,15 @@ export function normalizeRuntimeV2Checkpoint(
   const replayed = replayRuntimeV2Events(value.events as RuntimeV2Event[]);
   if (!replayed || !sameOwner(replayed.turn, owner)) return null;
   const digest = runtimeV2AggregateDigest(replayed);
-  if (value.aggregateDigest !== digest || !sameJson(value.aggregate, replayed)) return null;
-  if (!sameJson(value.scheduledCommands, replayed.scheduledCommands)) return null;
+  if (value.aggregateDigest !== digest) return null;
+  if (
+    value.aggregate !== undefined &&
+    !sameJson(value.aggregate, replayed)
+  ) return null;
+  if (
+    value.scheduledCommands !== undefined &&
+    !sameJson(value.scheduledCommands, replayed.scheduledCommands)
+  ) return null;
   if (value.updatedAt < replayed.updatedAt) return null;
   const normalized: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
@@ -366,6 +402,38 @@ export function normalizeRuntimeV2CheckpointMap(
       turnId,
     })] as const)
     .filter((entry): entry is [string, RuntimeV2CheckpointV3] => !!entry[1]));
+}
+
+/**
+ * Strip replayable caches at the Session persistence boundary. Live Store
+ * checkpoints retain `aggregate` for efficient decisions; disk contains one
+ * canonical ledger and reconstructs the cache through normalization.
+ */
+export function serializeRuntimeV2CheckpointMap(
+  value: unknown,
+  expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+): RuntimeV2PersistedCheckpointMap {
+  const normalized = normalizeRuntimeV2CheckpointMap(value, expectedOwner);
+  return Object.fromEntries(
+    Object.entries(normalized).map(([turnId, checkpoint]) => [
+      turnId,
+      {
+        schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
+        engineVersion: RUNTIME_V2_ENGINE_VERSION,
+        revision: checkpoint.revision,
+        owner: checkpoint.owner,
+        events: checkpoint.events,
+        aggregateDigest: checkpoint.aggregateDigest,
+        updatedAt: checkpoint.updatedAt,
+        ...(checkpoint.migratedFrom
+          ? { migratedFrom: checkpoint.migratedFrom }
+          : {}),
+        ...(checkpoint.migrationDisposition
+          ? { migrationDisposition: checkpoint.migrationDisposition }
+          : {}),
+      } satisfies RuntimeV2PersistedCheckpointV5,
+    ]),
+  );
 }
 
 export type AppendRuntimeV2CheckpointResult =

@@ -14,6 +14,7 @@ export interface ApplySubmitSessionBootstrapInput {
     activeSessionByWorkspace: Record<string, number | null>;
     autoApproveTools: boolean;
     autoApproveToolScopes: unknown[];
+    preferSubagents: boolean;
     webSearchEnabled: boolean;
     webSearchProvider: unknown;
     config: {
@@ -39,6 +40,11 @@ export function applySubmitSessionBootstrap(
   input: ApplySubmitSessionBootstrapInput,
 ): SubmitSessionBootstrapDecision {
   const { state } = input;
+  const composerPreferences = {
+    autoApproveTools: state.autoApproveTools,
+    autoApproveToolScopes: [...state.autoApproveToolScopes],
+    preferSubagents: state.preferSubagents,
+  };
   const decision = buildSubmitSessionBootstrapDecision({
     currentWorkspace: state.currentWorkspace,
     currentSessionId: state.currentSessionId,
@@ -55,8 +61,9 @@ export function applySubmitSessionBootstrap(
         decision,
         sessionsByWorkspace: s.sessionsByWorkspace,
         activeSessionByWorkspace: s.activeSessionByWorkspace,
-        autoApproveTools: s.autoApproveTools,
-        autoApproveToolScopes: s.autoApproveToolScopes,
+        autoApproveTools: composerPreferences.autoApproveTools,
+        autoApproveToolScopes: composerPreferences.autoApproveToolScopes,
+        preferSubagents: composerPreferences.preferSubagents,
         webSearchEnabled: s.webSearchEnabled,
         webSearchProvider: s.webSearchProvider,
       }) || {},

@@ -31,6 +31,7 @@ const {
   extractReadFileWindowMetadata,
   formatReadFileWindowForModel,
   planReadFileWindowCoverage,
+  replayReadFileWindowFromResult,
   resolveReadFileResultAfterLargeFileSummary,
 } = await loadReadFileWindowModule();
 
@@ -55,8 +56,8 @@ test("large read_file results return a 32K-bounded first window with truncation 
   assert.equal(metadata.nextStartLine, metadata.returnedEndLine + 1);
   assert.ok(metadata.returnedChars <= 32_000);
   assert.doesNotMatch(result, /nextRead:/);
-  assert.match(result, /Do not automatically continue paging/i);
-  assert.match(result, /only when the current decision needs specific missing lines/i);
+  assert.match(result, /continue from nextStartLine/i);
+  assert.match(result, /full-file semantics/i);
   assert.match(result, /do not use run_command merely to page file contents/i);
   assert.ok(result.length < 33_000);
 });
@@ -103,7 +104,23 @@ test("read_file explicit start_line and max_lines return the requested window", 
   assert.doesNotMatch(result, /line-008/);
 });
 
-test("duplicate truncated read guidance exposes missing-line metadata without auto-paging", () => {
+test("read_file max_chars metadata describes the source bytes actually returned", () => {
+  const content = numberedLines(500, "x".repeat(80));
+  const result = formatReadFileWindowForModel(
+    "src/components/toolbar.js",
+    content,
+    { max_chars: 10_000 },
+  );
+  const metadata = extractReadFileWindowMetadata(result);
+
+  assert.ok(metadata);
+  assert.equal(metadata.truncated, true);
+  assert.ok(metadata.returnedChars <= 10_000);
+  assert.equal(metadata.nextStartLine, metadata.returnedEndLine + 1);
+  assert.doesNotMatch(result, /line-500/);
+});
+
+test("truncated read guidance exposes a version-consistent continuation for full-file semantics", () => {
   const content = numberedLines(500, "x".repeat(80));
   const result = formatReadFileWindowForModel("src/components/Sidebar.tsx", content);
   const metadata = extractReadFileWindowMetadata(result);
@@ -112,10 +129,11 @@ test("duplicate truncated read guidance exposes missing-line metadata without au
   assert.ok(metadata?.nextStartLine);
   assert.match(guidance, new RegExp(`line ${metadata.nextStartLine}`));
   assert.match(guidance, /bounded window, not the whole file/);
-  assert.match(guidance, /If the current decision needs missing source/i);
+  assert.match(guidance, /full-file semantics/i);
+  assert.match(guidance, /continue sequentially/i);
   assert.match(guidance, /otherwise continue to mutation or validation/i);
   assert.match(guidance, /Do not use run_command/);
-  assert.match(result, /Do not automatically continue paging/i);
+  assert.match(result, /continue from nextStartLine/i);
   assert.doesNotMatch(guidance, /nextRead:/);
   assert.doesNotMatch(guidance, /full content already in context/i);
 });
@@ -165,4 +183,29 @@ test("read_file coverage planner detects fully covered requests", () => {
   assert.equal(plan.overlapped, true);
   assert.equal(plan.fullyCovered, true);
   assert.equal(plan.suggestedArgs, undefined);
+});
+
+test("a covered source range is replayed from its cached versioned window", () => {
+  const original = formatReadFileWindowForModel(
+    "src/main.js",
+    numberedLines(1_100),
+  ).replace(
+    "path: src/main.js",
+    "path: src/main.js\ncontentVersion: sha-main-v1",
+  );
+  const replay = replayReadFileWindowFromResult(original, {
+    path: "src/main.js",
+    start_line: 400,
+    end_line: 402,
+  });
+  const metadata = extractReadFileWindowMetadata(replay);
+
+  assert.ok(metadata);
+  assert.equal(metadata.contentVersion, "sha-main-v1");
+  assert.equal(metadata.returnedStartLine, 400);
+  assert.equal(metadata.returnedEndLine, 402);
+  assert.match(replay, /line-400/);
+  assert.match(replay, /line-402/);
+  assert.doesNotMatch(replay, /line-399/);
+  assert.doesNotMatch(replay, /line-403/);
 });

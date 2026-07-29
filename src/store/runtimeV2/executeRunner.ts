@@ -8,10 +8,10 @@ import {
   RuntimeV2Controller,
   decideRuntimeV2ExecutePhaseTransition,
   decideRuntimeV2TerminalOutcome,
-  deriveRuntimeV2ExecutionContractCoverage,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
+  runtimeV2DirectExecuteReadyForConclusion,
   summarizeRuntimeV2ExecuteEvidence,
   type RuntimeV2ExecutePhaseTransition,
   type RuntimeV2ResultKind,
@@ -41,7 +41,7 @@ export interface RuntimeV2ExecuteRunnerInput {
   readonly context: RuntimeV2SubmissionContext;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: any) => unknown;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;
@@ -152,6 +152,8 @@ function terminalDecision(input: {
     canceled: signal.aborted,
     mutationCount: evidence.mutationCount,
     passedValidationCount: evidence.passedValidationCount,
+    hasAcceptanceValidation:
+      runtimeV2DirectExecuteReadyForConclusion(aggregate),
     failedValidationCount: evidence.failedValidationCount,
     stalledValidationCount: evidence.stalledValidationCount,
     hasProviderConclusion: !!finalMarkdown,
@@ -171,32 +173,29 @@ function truthfulIncompleteDecision(input: {
   const hasMutation = input.aggregate.evidence.some(
     (evidence) => evidence.kind === "mutation",
   );
-  const executionCoverage =
-    deriveRuntimeV2ExecutionContractCoverage(input.aggregate);
+  const evidence = summarizeRuntimeV2ExecuteEvidence(input.aggregate, {
+    isMutationToolName: isWorkspaceMutationToolName,
+  });
   const planCoverage =
     deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
-  const missingTargets = executionCoverage?.missingMutationTargets ||
-    planCoverage?.missingMutationTargets ||
-    [];
-  const missingCriteria = executionCoverage?.missingCriterionIds || [];
-  const missingValidations = executionCoverage?.missingValidationIds ||
+  const missingTargets = planCoverage?.missingMutationTargets || [];
+  const missingValidations =
     planCoverage?.missingRequiredValidationIndexes.map(
       (index) => `work-plan-validation-${index + 1}`,
     ) ||
     [];
   const details = [
-    !executionCoverage &&
-        input.aggregate.strategy === "execute"
-      ? "未建立有效执行契约"
-      : "",
     missingTargets.length > 0
       ? `未修改目标：${missingTargets.join("、")}`
       : "",
-    missingCriteria.length > 0
-      ? `未验收条件：${missingCriteria.join("、")}`
-      : "",
     missingValidations.length > 0
       ? `缺少验证：${missingValidations.join("、")}`
+      : "",
+    hasMutation && evidence.passedValidationCount === 0
+      ? "最新修改之后没有通过有限验证"
+      : "",
+    evidence.failedValidationCount > 0
+      ? "最近一次验证仍未通过"
       : "",
   ].filter(Boolean);
   return {
@@ -216,7 +215,7 @@ function phaseTransitionMessage(
 ): string {
   const messages = {
     pending_mutation_call: "模型已经提交结构化修改动作，开始实施最小修复。",
-    observation_cycle_complete: "限定调查周期已经完成；已汇合现有证据，开始实施最小修复。",
+    pending_validation_call: "模型已经提交验证动作，开始检查当前工作区结果。",
     mutation_committed: "工作区修改已经真实落账；下一步执行有限验证。",
     validation_failed: "有限验证未通过；返回修改阶段，根据失败证据进行一次针对性修复。",
   } as const;
@@ -259,7 +258,7 @@ export async function runSubmitRuntimeV2Execute(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: (snapshot) => input.normalizeSessionRuntimeSnapshot(snapshot),
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,
@@ -525,23 +524,8 @@ export async function runSubmitRuntimeV2Execute(
       { isMutationToolName: isWorkspaceMutationToolName },
     );
     const finalAggregate = controller.snapshot().aggregate!;
-    const executionCoverage =
-      deriveRuntimeV2ExecutionContractCoverage(finalAggregate);
     const planCoverage =
       deriveRuntimeV2PlanExecutionCoverage(finalAggregate);
-    const staticOnlyBehavioralCriterionIds =
-      finalAggregate.executionContract?.criteria
-        .filter((criterion) =>
-          criterion.evidenceRequirement !== "static" &&
-          finalAggregate.executionContract!.validations.some(
-            (validation) =>
-              validation.criterionIds.includes(criterion.id) &&
-              validation.kind === "finite_command" &&
-              validation.capability !== "test" &&
-              validation.capability !== "inline_assertion",
-          )
-        )
-        .map((criterion) => criterion.id) || [];
     input.logStoreEvent("runtime_v2_execute_terminal", {
       turnId: identity.turn.turnId,
       runId: identity.run.runId,
@@ -550,40 +534,29 @@ export async function runSubmitRuntimeV2Execute(
       evidenceCount: controller.snapshot().aggregate?.evidence.length || 0,
       mutations: executionEvidence.mutationCount,
       passedValidations: executionEvidence.passedValidationCount,
+      acceptanceValidation:
+        runtimeV2DirectExecuteReadyForConclusion(finalAggregate),
       failedValidations: executionEvidence.failedValidationCount,
       stalledValidations: executionEvidence.stalledValidationCount,
       failedOperations: executionEvidence.failedOperationCount,
       childRuns: controller.snapshot().aggregate?.subagents.length || 0,
-      executionAuthorityKind: executionCoverage
-        ? "execution_contract"
-        : planCoverage
-          ? "work_plan"
-          : null,
+      executionAuthorityKind: planCoverage ? "work_plan" : "direct_execute",
       executionAuthorityId:
-        executionCoverage?.contractId ||
-        finalAggregate.sealedWorkPlan?.id ||
-        null,
-      contractCoverageComplete:
-        executionCoverage?.complete ??
-        (
-          planCoverage
-            ? planCoverage.allMutationTargetsCovered &&
-              planCoverage.allRequiredValidationsPassed
-            : false
-        ),
+        finalAggregate.sealedWorkPlan?.id || finalAggregate.turn.turnId,
+      verificationComplete: planCoverage
+        ? planCoverage.allMutationTargetsCovered &&
+          planCoverage.allRequiredValidationsPassed
+        : executionEvidence.mutationCount > 0 &&
+          runtimeV2DirectExecuteReadyForConclusion(finalAggregate) &&
+          executionEvidence.failedValidationCount === 0,
       missingMutationTargets:
-        executionCoverage?.missingMutationTargets ||
         planCoverage?.missingMutationTargets ||
         [],
-      missingCriterionIds:
-        executionCoverage?.missingCriterionIds || [],
       missingValidationIds:
-        executionCoverage?.missingValidationIds ||
         planCoverage?.missingRequiredValidationIndexes.map(
           (index) => `work-plan-validation-${index + 1}`,
         ) ||
         [],
-      staticOnlyBehavioralCriterionIds,
     });
     return settlement(input.context, terminalOutcomeToLegacy(outcome.resultKind, outcome.reason));
   } catch (error) {

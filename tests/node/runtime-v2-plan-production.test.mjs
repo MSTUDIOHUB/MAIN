@@ -261,7 +261,11 @@ async function runProductionPlanScenario(streamCompletion, toolExecution) {
     },
   };
   const mocks = new Map([
-    ["../../lib/providerLaneSettings", { deriveStreamSettings: () => ({}) }],
+    ["../../lib/providerLaneSettings", {
+      deriveBudgetedStreamSettings: (_config, budget) => ({
+        contextLimit: budget?.contextLimit,
+      }),
+    }],
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || args.query || ""),
     }],
@@ -306,10 +310,19 @@ async function runProductionPlanScenario(streamCompletion, toolExecution) {
       phaseLanguage: "zh",
       abortCtrl,
       timerInterval: undefined,
+      runtimeContextBudget: {
+        contextLimit: 32_768,
+        outputBudget: 4_096,
+        inputBudget: 28_672,
+        readWindowChars: 18_000,
+        source: "configured",
+        providerContextLimit: null,
+        availableMemoryBytes: null,
+      },
     },
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",
@@ -451,6 +464,7 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   let writtenPlan = null;
   let providerRound = 0;
   let acceptedSubmissionRequest = null;
+  const observedReadArgs = [];
   const result = await runProductionPlanScenario(
     async (messages, _settings, _callbacks, _signal, tools) => {
       providerRound += 1;
@@ -510,7 +524,10 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
     },
     async (name, args) => {
       if (name === "get_project_skeleton") return "src/main.js";
-      if (name === "read_file") return "const openFile = true;";
+      if (name === "read_file") {
+        observedReadArgs.push({ ...args });
+        return "const openFile = true;";
+      }
       if (name === "write_file") {
         writtenPlan = String(args.content || "");
         return "written";
@@ -519,6 +536,14 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
     },
   );
   assert.equal(providerRound, 3);
+  assert.ok(observedReadArgs.some((args) =>
+    args.__raw !== true &&
+    args.max_chars === 18_000
+  ));
+  assert.ok(observedReadArgs.some((args) =>
+    args.__raw === true &&
+    args.max_chars === undefined
+  ));
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(

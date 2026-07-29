@@ -2,6 +2,10 @@
 
 > 状态：现行规范
 > 事实源：`src/lib/turnRuntimeContract.ts`、`src/lib/turnRuntimeCheckpoint.ts`、`src/lib/turnEvents.ts`（兼容事件 schema v2）及其生产调用方。
+>
+> Workspace Turn 的当前执行策略入口是 `src/store/submitRuntimeRunner.ts` 与
+> `src/store/runtimeV2/`。本文件描述 canonical Session/Turn/Run 与 UI 投影；
+> Runtime 内部循环的修改边界见 [最小运行内核与能力边界](RUNTIME_KERNEL_INVARIANTS.md)。
 
 ## 一条提交就是一个 Turn
 
@@ -104,16 +108,19 @@ turn.completed(resultKind=error)
 
 ## Plan authoring 与审核态
 
-Plan Run 在任何模型起草前创建 frozen `PlanAuthoringContract`：objective、不可变 `G1/G2/...` 分面、上下文目标、可复用证据目标、图片数量、显式 diagnosis requirement 和固定验收条款都在此时确定。后续质量门只能指出同一 contract 的违约，并要求候选按原 contract 修订；修正版必须重新进入 typed ingress，不能只留在 hidden reasoning 或过程文本中。
+Plan Run 保留原始 objective，先用只读工具形成带版本的
+`WorkPlanRuntimeEvidence`，再让模型提交 `WorkPlanDraftV1`。后续校验只能指出
+同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
+WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
 Plan 的 canonical 顺序为：
 
 ```text
 turn.admitted(strategy=plan)
   run.started(phase=planning)
-  understand -> gather -> draft/revise
-  submit_plan_candidate 或 <plan_candidate>
-  typed ingress -> seal -> validate -> Markdown projection -> atomic artifact commit
+  bounded read-only gather
+  submit_runtime_v2_work_plan
+  WorkPlan compiler -> seal -> Markdown/PlanPanel projection -> review commit
   plan.artifact_accepted(path, digest, revision)
     run.status = paused
     run.phase = reviewing
@@ -129,9 +136,9 @@ conversationTurnStatus = awaiting_approval
 isTerminal = false
 ```
 
-`plan.artifact_accepted` 不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。它只有在 `.MAIN/plans/plan.md`、typed candidate/hash、authoring contract、ActionRequest、Plan lifecycle、Run 与 checkpoint identity 全部一致时才具有可批准权威。
+`plan.artifact_accepted` 不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。它只有在 `.MAIN/plans/plan.md`、sealed WorkPlan/digest、ActionRequest、Plan lifecycle、Run 与 checkpoint identity 全部一致时才具有可批准权威。
 
-- `changes_requested`：同一 Run 回到 `planning`，仍使用原 frozen contract；新 typed candidate 通过后替换 review artifact/revision。
+- `changes_requested`：同一 Run 回到 `planning`，保留原始用户目标和已有版本化证据；新的 WorkPlan 通过同一 compiler 后替换 review artifact/revision。
 - `approved`：review Run 转为 `recoverable` 暂停，随后启动 `parentRunId = reviewedRunId` 的执行 child Run；批准不等于执行成功。
 - 取消审核：依照 canonical 取消顺序收口，不把 `pending_review` 留成 done/idle。
 
@@ -139,19 +146,19 @@ Markdown 只负责审核显示。批准后任务和验证从 sealed typed graph 
 
 ## Execute 的稳定工具面
 
-普通工作区 Execute 使用一个稳定且有界的读／改／验核心工具面。恢复状态中的 `nextRequiredCapability` 只表示下一证据优先级，不再通过每回合切换互斥 schema 来撤销相邻的安全能力；模型可以按当前源码事实自然地在精确读取、结构化修改和有限验证之间移动。软 no-progress 计数只负责重提示或诚实暂停，不能再把稳定工具面降级成 mutation-only / validation-only。路径授权、修改前源码版本绑定、批准 Plan scope、命令权限和完成证据仍由 runtime 硬门控制。
+普通工作区 Execute 使用一个稳定且有界的读／改／验核心工具面。阶段只表示当前证据重点，不通过切换互斥 schema 撤掉安全读取或强制某一个修改工具；模型可以按当前源码事实自然地在精确读取、结构化修改和有限验证之间循环。路径授权、修改前源码版本绑定、批准 WorkPlan scope、命令权限和完成证据仍由 runtime 硬门控制。
 
-浏览器、桌面和长驻进程生命周期保留窄工具面，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。普通工作区阶段不能用这一例外重新引入 `read-only -> mutation-only -> validation-only` 振荡。子智能体证据需要父级复读时，runtime 必须签发显式 `context_restore` lease；即使 child 没有提供源码范围，父级第一次同目标新鲜读取也必须能消费该 lease 并进入修改阶段。
+浏览器、桌面和长驻进程生命周期保留各自的结构化启动、观察、交互和清理边界，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。它们不能被普通文件阶段用来重新引入 `read-only -> mutation-only -> validation-only` 振荡。child evidence 是只读参考；父线程修改目标前仍以自己的当前版本读取作为写入依据，不需要另造 `context_restore` lease。
 
-每批工具结果先由其具体 owner 消费：真实修改、编译／测试诊断、浏览器或桌面结果、Goal checkpoint 都优先形成下一状态；重复次数和“无进展”只在这些 handler 均未形成动作后运行。软启发式不得抢先暂停、改写或重新锁定一个仍有明确修复义务的多文件目标。没有唯一源码归因的工作区校验失败会释放最近文件的 transaction lock，回到 objective-level 修复；此时未租约读取只增加上下文证据，不取得排他 target ownership。只有带结构化 `path:line:column` 等唯一归因的诊断或显式 read lease 才建立新的单文件修复锁。
+每批工具结果先形成真实 source、mutation、validation、browser/desktop 或 Goal evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
 
 Root objective closure audit 只恢复可选的稳定工作区能力面（有界读／搜／编辑／有限命令），不重新开放长驻进程、PTY、浏览器或桌面能力。后四类能力必须由各自的结构化生命周期 checkpoint 重新开启，避免已经成功的有限验证在最终核对阶段漂移成无关的交互终端循环。
 
 ## Evidence ledger、typed validation 与完成门
 
-Plan 取证先形成带 hash 的 frozen `PlanEvidenceBundle`；runtime 根据用户目标、项目结构和符号 occurrence 产生具体 read/find 义务。只有成功关闭义务的 source observation 可成为 `E`，模型摘要或未验证假设不能替代它。runtime 再从关系义务与精确 observation 派生相互独立的 `B` 组件；每个用户目标必须映射至少一个 `B`，必需 `B` 必须恰好映射一次，诊断型 `B` 必须连接非 hypothesis 的 `R`。source observation 与引用它的 structured facts 是不可分割的 provenance group，裁剪时必须同步保留或同步删除，禁止生成悬空 receipt binding。
+Plan 取证形成带 path/version 的 `WorkPlanRuntimeEvidence`；只有成功的真实只读结果可成为 `E`，模型摘要或未验证假设不能替代它。引用 evidence 的 WorkPlan 与 source observation 是同一个 provenance 链，裁剪或迁移时禁止生成悬空 ID。
 
-批准后的所有真实操作进入 append-only `planExecutionEvidenceLedger`。每条 `PlanExecutionEvidenceEntry` 可携带 transaction、Run、Plan task、requirement、phase、operation、validation obligation、结构化 outcome 与 producer-specific observation。账本顺序本身是因果顺序；相同毫秒时间戳不能重排“修改后验证”。
+批准后的真实操作进入当前 Runtime v2 Turn aggregate。source、mutation 和 validation 保留有序因果关系；相同毫秒时间戳不能重排“修改后验证”。直接 Execute 不借用 Plan 权威，但仍必须保留原始用户目标，并且只有最终修改之后的匹配验证可以形成成功。
 
 typed validation primitive 的完成语义如下：
 
@@ -164,23 +171,24 @@ typed validation primitive 的完成语义如下：
 | `assertion` | 是 | exact target/matcher 和声明 producer 的 typed `assertion_result` |
 | `advisory` | 否 | 仅提示用户、外部或 runtime 后续复核 |
 
-每个 goal 必须同时有 action/decision 覆盖和至少一个 acceptance-capable validation。批准后 success 还要求：task set 非空、所有必需 task evidence 满足、transaction-scoped evidence closure 完成、没有 unreconciled failure/active recovery。模型正文、缓存 task status、无关成功命令、泛化文件读取或长驻服务已启动都不能宣告完成；存在缺口时必须继续恢复、暂停或以 `partial/blocked/error` 诚实收口。
+批准计划的 success 要求所有声明修改目标和 required validation 均有匹配 evidence；直接 Execute 的 success 要求至少有真实 mutation、最终 mutation boundary 后的行为验收以及 provider 的事实说明。模型正文、无关成功命令、泛化文件读取或长驻服务已启动都不能宣告完成；存在缺口时必须继续循环或以 `partial/blocked/error` 诚实收口。
 
 ## 子智能体协作状态
 
-用户启用子智能体偏好后，runtime 只有在 trusted project skeleton 或后续权威只读证据中识别至少两个不重叠 scope 且容量允许时，才冻结 `PreferredDelegationScopeContract`。显式结构化 scope 优先；否则按稳定顶层或最浅可并行项目边界派生，避免按偶然文件读创建大量 child。skeleton 路径可在 parent 第一次模型请求前触发有界并行派发，但不因此授予任何完成权威。
+用户允许或偏好子智能体时，runtime 在有剩余容量和生命周期余量时向模型暴露 `spawn_subagent`。`preferred` 只表示鼓励独立工作，不强制开场派生。模型为具体 `explore`、`review` 或 `validate` 任务提供名称、目标、成功条件和只读路径；最多两个 child 同时活动，完成后立即释放容量。
 
-每个必需 scope 的状态机是：
+每个已派生任务的状态机是：
 
 ```text
-required scope
-  -> spawn_subagent（registration=spawned）
-  -> wait/join
-  -> authoritative closure + provenance audit
-  -> consumed 或 incomplete
+spawn_subagent
+  -> queued / running
+  -> read/search/finite validation
+  -> ordinary final text
+  -> parent wait 或终态 join
+  -> completed / failed / canceled
 ```
 
-`consumed` 要求 child 已完成、closure=`satisfied`、存在实质 tool observation、证据 owner/tool-call/observation identity 完整，并且所有 adopted target 位于 frozen `allowedPaths` 内。runtime 随后签发 owner-fenced canonical closure receipt；Turn checkpoint 只保留 ref，完整活动及其 digest 位于独立 Session ledger。冷恢复找不到 exact receipt、digest/owner/Run/scope/path 任一漂移时，该 scope 必须变为 `incomplete` 且不得恢复证据。child summary、协调工具成功、未 join output、partial/unverified closure 都不算证据；`requiresParentReread=true` 的 observation 也不能关闭父级硬读义务或阻止 parent read。未覆盖或未验真的精确路径回到父 runtime 作为定向义务；只有父级按 path/range/version/hash 验真后才能成为可 seal 的 source observation。执行阶段的 mutation 仍需完整版本身份与父级验证。
+runtime 只在普通最终文本和至少一条真实或合法继承 evidence 同时存在时编译合法结构化报告并接受 `completed`。已有 evidence 但收口失败时写入 `degraded`，明确由主体接管；没有 evidence 才写入 `failed`，父任务取消则为 `canceled`。child summary、协调工具成功和未 join output 都不算验收；父智能体始终是唯一写入者，child 非 completed 后父线程继续原目标。
 
 ## 事件接受与幂等
 
@@ -225,15 +233,11 @@ Game Studio `local_fast` slash 也遵守同一可见结论契约：成功、错�
 - `src/lib/turnRuntimeContract.ts`
 - `src/lib/turnRuntimeCheckpoint.ts`
 - `src/lib/runTransitionReducer.ts`
-- `src/lib/planAuthoringContract.ts`
-- `src/lib/planContract.ts`
-- `src/lib/planDraftIngress.ts`
-- `src/lib/planArtifactCommit.ts`
-- `src/lib/validationContract.ts`
-- `src/lib/preferredDelegationScopes.ts`
+- `src/lib/runtime-v2/`
+- `src/store/runtimeV2/`
 - `src/lib/canceledTurnProjection.ts`
 - `src/store/sessionCancellationBarrier.ts`
-- `src/lib/orchestrator/workflowEngine.ts`
+- `src/store/submitRuntimeRunner.ts`
 - `src/store/submitAsyncWorkflowRun.ts`
 
 持久化与接纳细节见 [Session 持久化](SESSION_PERSISTENCE.md)。

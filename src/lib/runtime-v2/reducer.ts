@@ -696,6 +696,7 @@ export function tryTransition(
       ) {
         return rejection(state, "subagent_invalid");
       }
+      if (event.status === "degraded" && event.evidence.length === 0) return rejection(state, "subagent_invalid");
       if (!validateRuntimeV2SubagentValidationReceipts({
         receipts: event.validationReceipts,
         evidence: event.evidence,

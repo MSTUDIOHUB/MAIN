@@ -4,41 +4,22 @@ import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
   RuntimeV2ExecutionValidationAuthority,
-  RuntimeV2RecoveryScope,
   RuntimeV2ResultKind,
 } from "./contracts";
-import { RUNTIME_V2_RECOVERY_LIMITS, runtimeV2ActionFingerprint } from "./recovery";
+import { runtimeV2ActionFingerprint } from "./recovery";
 import {
   MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS,
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
 } from "./subagents";
 import {
-  resolveRuntimeV2ExecutionContractValidation,
-  runtimeV2ExecutionValidationAuthority,
-} from "./executionContract";
-import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
-import {
-  activeRuntimeV2ExecutionContractDraft as activeExecutionContractDraft,
-  currentRuntimeV2PhaseEvents as currentPhaseEvents,
-  latestRuntimeV2BrowserValidationTarget as latestBrowserValidationTarget,
-  latestRuntimeV2ExecutionContractRejection as latestExecutionContractRejection,
-  latestRuntimeV2RepeatedSourceTarget as latestRepeatedSourceTarget,
-  requiredRuntimeV2ExecutionContractSourceTarget as requiredExecutionContractSourceTarget,
-  requiredRuntimeV2MutationSourceTarget as requiredMutationSourceTarget,
-  runtimeV2ActingExecutePolicy as actingExecutePolicy,
-  runtimeV2ActingMutationProgressionRequired as actingMutationProgressionRequired,
-  runtimeV2ExecutionEvidenceCatalog as executionEvidenceCatalog,
-  runtimeV2ObservationContractRequired as observationContractRequired,
-  runtimeV2ValidationParentTakeoverReadRequired as validationParentTakeoverReadRequired,
-} from "./executionDecisionPolicy";
-import {
   deriveRuntimeV2PlanExecutionCoverage,
   resolveRuntimeV2PlanValidationScope,
   runtimeV2PlanValidationAuthority,
 } from "./planExecution";
-import { isRuntimeV2WorkspaceReadToolName } from "./workspaceReadPolicy";
-import { workspacePathsReferToSameFile } from "../workspacePaths";
+import { runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
+import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
+import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "./workspaceReadPolicy";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -61,6 +42,12 @@ export interface RuntimeV2DecisionInput {
     | "allowed"
     | "preferred";
 }
+
+const VALIDATION_TOOL_NAMES = new Set([
+  "run_command",
+  "browser_evaluate",
+  "computer_use",
+]);
 
 function commaSeparatedValues(value: unknown): string[] {
   return String(value || "")
@@ -85,12 +72,15 @@ function collaborationPayload(
       objective: job.objective,
     }));
   const failedSubagents = state.subagents
-    .filter((job) => job.status === "failed")
+    .filter((job) =>
+      job.status === "failed" || job.status === "degraded"
+    )
     .slice(-MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS)
     .map((job) => ({
       id: runtimeV2SubagentModelHandle(job),
       name: job.name || job.scopeKey,
       objective: job.objective,
+      status: job.status,
       summary: job.summary || "No structured report was committed.",
     }));
   const failedCommandKeys = new Set(state.events.flatMap((event) =>
@@ -103,7 +93,7 @@ function collaborationPayload(
     if (
       (
         event.type === "subagent.completed" &&
-        event.status === "failed"
+        (event.status === "failed" || event.status === "degraded")
       ) ||
       (
         event.type === "command.scheduled" &&
@@ -121,8 +111,7 @@ function collaborationPayload(
         event.type === "tool.completed" &&
         event.status === "succeeded" &&
         event.evidence.length > 0
-      ) ||
-      event.type === "execution_contract.committed"
+      )
     );
   const parentTakeoverRequired =
     latestCollaborationFailureIndex >= 0 &&
@@ -168,61 +157,6 @@ function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number
     state.scheduledCommands.filter((scheduled) => runtimeV2ActionFingerprint(scheduled) === fingerprint).length;
 }
 
-function failedActionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
-  const epochOpenedAt = [...state.events].reverse().find(
-    (event) => event.type === "recovery.epoch_opened",
-  )?.at ?? Number.NEGATIVE_INFINITY;
-  return state.completedCommands.filter((receipt) =>
-    receipt.actionFingerprint === fingerprint &&
-    receipt.status === "failed" &&
-    receipt.completedAt >= epochOpenedAt
-  ).length;
-}
-
-function successfulSourceActionAttemptCount(
-  state: TurnAggregateV1,
-  fingerprint: string,
-): number {
-  const commandKeys = new Set(state.completedCommands
-    .filter((receipt) =>
-      receipt.actionFingerprint === fingerprint &&
-      receipt.status === "succeeded"
-    )
-    .map((receipt) => receipt.idempotencyKey));
-  if (commandKeys.size === 0) return 0;
-  return state.events.filter((event) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
-    commandKeys.has(event.idempotencyKey) &&
-    event.evidence.length > 0 &&
-    event.evidence.every((evidence) => evidence.kind === "source")
-  ).length;
-}
-
-function successfulSourceTargetAttemptCount(
-  state: TurnAggregateV1,
-  payload: Readonly<Record<string, unknown>>,
-): number {
-  const args = payload.arguments &&
-      typeof payload.arguments === "object" &&
-      !Array.isArray(payload.arguments)
-    ? payload.arguments as Record<string, unknown>
-    : {};
-  const target = String(
-    args.path || args.file_path || args.directory || args.target || "",
-  ).trim();
-  if (!target) return 0;
-  return currentPhaseEvents(state).filter((event) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
-    event.evidence.some((evidence) =>
-      evidence.kind === "source" &&
-      workspacePathsReferToSameFile(evidence.target, target) &&
-      !!evidence.version
-    )
-  ).length;
-}
-
 function deterministicCommandKey(
   state: TurnAggregateV1,
   kind: RuntimeV2CommandKind,
@@ -264,66 +198,142 @@ function makeCommand(
   };
 }
 
-function recoveryFinalization(
-  state: TurnAggregateV1,
-  fingerprint: string,
-  reason: string,
-  resultKind: RuntimeV2ResultKind = exhaustedRuntimeV2ResultKind(state),
-  recoveryScope: RuntimeV2RecoveryScope = "action",
-): RuntimeV2Command {
-  return makeCommand(state, "finalize_turn", {
-    resultKind,
-    resultReason: reason,
-    recoveryExhausted: true,
-    recoveryScope,
-    recoveryFingerprint: fingerprint,
-  });
-}
-
-/**
- * Recovery limits retries of failed structural actions. A successful read is
- * evidence, not a failed recovery attempt; repeated successful reads are
- * redirected by the acting tool policy instead of being mislabeled terminal.
- */
 function boundedCommand(
   state: TurnAggregateV1,
   kind: Exclude<RuntimeV2CommandKind, "finalize_turn">,
   payload: Readonly<Record<string, unknown>> = {},
 ): RuntimeV2Command {
-  const fingerprint = actionFingerprint(state, kind, payload);
-  const failedAttempts = failedActionAttemptCount(state, fingerprint);
-  const unchangedSourceRepeats =
-    kind === "execute_tool"
-      ? Math.max(
-          successfulSourceActionAttemptCount(state, fingerprint),
-          successfulSourceTargetAttemptCount(state, payload),
-        )
-      : 0;
-  const command = makeCommand(state, kind, payload);
+  return makeCommand(state, kind, payload);
+}
+
+function repeatedObservationReason(
+  state: TurnAggregateV1,
+  command: RuntimeV2Command,
+):
+  | "unchanged_source_repeat"
+  | "unchanged_observation_repeat"
+  | "repeated_validation"
+  | null {
+  const requestedToolName = String(command.payload.toolName || "");
   if (
     (
-      failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action ||
-      unchangedSourceRepeats >= 2
-    ) &&
-    kind !== "request_model" &&
-    kind !== "collect_observation"
-  ) {
-    // Refuse only this repeated structural action. The provider receives the
-    // rejection as ordinary context and may choose another action; it never
-    // becomes a Turn terminal merely because an action counter was reached.
-    return {
-      ...command,
+      command.kind !== "execute_tool" &&
+      command.kind !== "execute_validation"
+    ) ||
+    (
+      command.kind === "execute_tool" &&
+      !RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(requestedToolName)
+    )
+  ) return null;
+  const toolActionFingerprint = (candidate: RuntimeV2Command) =>
+    runtimeV2ActionFingerprint({
+      kind: "execute_tool",
+      phase: "acting",
       payload: {
-        ...command.payload,
-        repeatedActionRejected: true,
-        repeatedActionReason:
-          unchangedSourceRepeats >= 2
-            ? "unchanged_source_repeat"
-            : "failed_action_retry_limit",
+        toolName: candidate.payload.toolName,
+        arguments: candidate.payload.arguments,
       },
-    };
+    });
+  const fingerprint = toolActionFingerprint(command);
+  const scheduled = new Map<string, RuntimeV2Command>();
+  const versions: string[] = [];
+  let identicalObservations = 0;
+  for (const event of state.events) {
+    if (event.type === "command.scheduled") {
+      scheduled.set(event.command.idempotencyKey, event.command);
+      continue;
+    }
+    if (
+      event.type !== "tool.completed" &&
+      event.type !== "validation.completed"
+    ) {
+      continue;
+    }
+    const completed = scheduled.get(event.idempotencyKey);
+    if (!completed) continue;
+    const toolName = String(completed.payload.toolName || "");
+    if (
+      event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      isWorkspaceMutationToolName(toolName)
+    ) {
+      // A committed mutation opens a new source boundary. Reads after it must
+      // remain available, and validations must re-run against the new source.
+      versions.length = 0;
+      identicalObservations = 0;
+      continue;
+    }
+    if (
+      completed.kind !== command.kind ||
+      toolName !== requestedToolName ||
+      toolActionFingerprint(completed) !== fingerprint ||
+      (
+        completed.kind === "execute_tool" &&
+        (
+          event.type !== "tool.completed" ||
+          event.status !== "succeeded"
+        )
+      ) ||
+      (
+        completed.kind === "execute_validation" &&
+        event.type !== "validation.completed"
+      )
+    ) {
+      continue;
+    }
+    identicalObservations += 1;
+    if (command.kind === "execute_validation") continue;
+    if (requestedToolName !== "read_file") continue;
+    const version = event.evidence.find(
+      (evidence) => evidence.kind === "source",
+    )?.version;
+    if (version) versions.push(version);
   }
-  return command;
+  if (command.kind === "execute_validation") {
+    return identicalObservations >= 2
+      ? "repeated_validation"
+      : null;
+  }
+  if (requestedToolName !== "read_file") {
+    return identicalObservations >= 2
+      ? "unchanged_observation_repeat"
+      : null;
+  }
+  return versions.length >= 2 &&
+      versions[versions.length - 1] === versions[versions.length - 2]
+    ? "unchanged_source_repeat"
+    : null;
+}
+
+function executeReadyForConclusion(state: TurnAggregateV1): boolean {
+  const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
+  if (planCoverage) {
+    return planCoverage.allMutationTargetsCovered &&
+      planCoverage.allRequiredValidationsPassed;
+  }
+  return runtimeV2DirectExecuteReadyForConclusion(state);
+}
+
+function executeModelRequest(
+  state: TurnAggregateV1,
+  input: RuntimeV2DecisionInput,
+): RuntimeV2Command {
+  const ready = executeReadyForConclusion(state);
+  return boundedCommand(state, "request_model", {
+    mode: ready
+      ? "conclude"
+      : state.phase === "validating"
+        ? "validate"
+        : "execute",
+    toolExpectation: ready ? "optional" : "required",
+    objective: state.objective.text,
+    acceptanceCriteria: state.objective.acceptanceCriteria,
+    evidenceIds: state.evidence.map((item) => item.id),
+    hasVersionedSourceEvidence: state.evidence.some(
+      (item) => item.kind === "source" && !!item.version,
+    ),
+    ...collaborationPayload(state, input),
+  });
 }
 
 /**
@@ -368,24 +378,15 @@ export function decideNextCommands(
         finalJoin: true,
       })];
     }
-    return [recoveryFinalization(
-      state,
-      state.recovery.exhausted.fingerprint,
-      state.recovery.exhausted.reason,
-      state.recovery.exhausted.scope === "transport"
+    return [makeCommand(state, "finalize_turn", {
+      resultKind: state.recovery.exhausted.scope === "transport"
         ? "error"
         : exhaustedRuntimeV2ResultKind(state),
-      state.recovery.exhausted.scope,
-    )];
+      resultReason: state.recovery.exhausted.reason,
+    })];
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
-    if (toolCall.name === "submit_execution_contract") {
-      return [boundedCommand(state, "commit_execution_contract", {
-        toolCallId: toolCall.id,
-        arguments: toolCall.arguments,
-      })];
-    }
     if (toolCall.name === "spawn_subagent") {
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
@@ -413,31 +414,13 @@ export function decideNextCommands(
         unresolvedJobIds: resolution.unresolved,
       })];
     }
-    // Validation remains an evidence-gathering phase. A failed child handoff
-    // may leave the parent needing one more safe source read before it can run
-    // the authority-linked validator. Classify that read as an ordinary tool
-    // observation so it cannot fabricate a validation receipt.
-    const kind =
-      state.phase === "validating" &&
-        !isRuntimeV2WorkspaceReadToolName(toolCall.name)
-        ? "execute_validation"
-        : "execute_tool";
+    const kind = VALIDATION_TOOL_NAMES.has(toolCall.name)
+      ? "execute_validation"
+      : "execute_tool";
     let validationAuthority:
       | RuntimeV2ExecutionValidationAuthority
       | undefined;
-    if (kind === "execute_validation" && state.executionContract) {
-      const validation = resolveRuntimeV2ExecutionContractValidation({
-        contract: state.executionContract,
-        toolName: toolCall.name,
-        args: toolCall.arguments,
-      });
-      if (validation) {
-        validationAuthority = runtimeV2ExecutionValidationAuthority({
-          contract: state.executionContract,
-          validation,
-        });
-      }
-    } else if (
+    if (
       kind === "execute_validation" &&
       state.workPlan?.status === "approved" &&
       state.sealedWorkPlan
@@ -459,12 +442,26 @@ export function decideNextCommands(
           }) || undefined;
       }
     }
-    return [boundedCommand(state, kind, {
+    const command = boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
       arguments: toolCall.arguments,
       ...(validationAuthority ? { validationAuthority } : {}),
-    })];
+    });
+    const repeatedActionReason = repeatedObservationReason(
+      state,
+      command,
+    );
+    return [repeatedActionReason
+      ? {
+          ...command,
+          payload: {
+            ...command.payload,
+            repeatedActionRejected: true,
+            repeatedActionReason,
+          },
+        }
+      : command];
   }
 
   switch (state.phase) {
@@ -481,53 +478,16 @@ export function decideNextCommands(
           objective: state.objective.text,
         })];
       }
-      const repeatedSourceTarget =
-        state.strategy === "execute" && !state.executionContract
-          ? latestRepeatedSourceTarget(state)
-          : null;
-      const contractRequired =
-        state.strategy === "execute" &&
-        !state.executionContract &&
-        observationContractRequired(state);
-      const requiredContractSourceTarget =
-        state.strategy === "execute" &&
-        !state.executionContract
-          ? requiredExecutionContractSourceTarget(state)
-          : null;
-      return [boundedCommand(state, "request_model", {
-        mode: state.strategy === "analyze" ? "analyze" : "observe",
-        toolExpectation:
-          repeatedSourceTarget || requiredContractSourceTarget
-            ? "required"
-            : "optional",
-        observationPolicy:
-          requiredContractSourceTarget
-            ? "execution_contract_source_required"
-            : contractRequired
-            ? "execution_contract_required"
-            : repeatedSourceTarget
-            ? "different_action_or_contract_required"
-            : "evidence_gap_allowed",
-        repeatedSourceTarget,
-        requiredExecutionContractSourceTarget:
-          requiredContractSourceTarget,
-        objective: state.objective.text,
-        acceptanceCriteria: state.objective.acceptanceCriteria.map(
-          (criterion, index) => ({
-            id:
-              state.objective.acceptanceCriterionIds?.[index] ||
-              `criterion-${index + 1}`,
-            text: criterion,
-          }),
-        ),
-        evidenceIds: state.evidence.map((item) => item.id),
-        executionEvidenceCatalog: executionEvidenceCatalog(state),
-        executionContractRejection:
-          latestExecutionContractRejection(state),
-        executionContractRevision:
-          state.executionContract?.revision || null,
-        ...collaborationPayload(state, input),
-      })];
+      if (state.strategy === "analyze") {
+        return [boundedCommand(state, "request_model", {
+          mode: "analyze",
+          toolExpectation: "optional",
+          objective: state.objective.text,
+          evidenceIds: state.evidence.map((item) => item.id),
+          ...collaborationPayload(state, input),
+        })];
+      }
+      return [executeModelRequest(state, input)];
     }
     case "planning":
       return [boundedCommand(state, "request_model", {
@@ -537,62 +497,9 @@ export function decideNextCommands(
       })];
     case "reviewing":
       return [];
-    case "acting": {
-      const executePolicy = actingExecutePolicy(state);
-      const mutationProgressionRequired =
-        executePolicy === "mutation_required" &&
-        actingMutationProgressionRequired(state);
-      return [boundedCommand(state, "request_model", {
-        mode: "execute",
-        executePolicy,
-        toolExpectation: "required",
-        objective: state.objective.text,
-        workPlanRevision: state.workPlan?.revision || null,
-        executionContractRevision:
-          state.executionContract?.revision || null,
-        activeExecutionContractDraft:
-          activeExecutionContractDraft(state),
-        executionContractRejection:
-          latestExecutionContractRejection(state),
-        mutationProgressionRequired:
-          mutationProgressionRequired,
-        requiredMutationSourceTarget:
-          requiredMutationSourceTarget(
-            state,
-            mutationProgressionRequired,
-          ),
-        evidenceIds: state.evidence.map((item) => item.id),
-        executionEvidenceCatalog: executionEvidenceCatalog(state),
-        ...collaborationPayload(state, input),
-      })];
-    }
-    case "validating": {
-      const executionCoverage =
-        deriveRuntimeV2ExecutionContractCoverage(state);
-      const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
-      const validationCoverageComplete = executionCoverage
-        ? executionCoverage.missingValidationIds.length === 0 &&
-          executionCoverage.missingCriterionIds.length === 0
-        : planCoverage
-          ? planCoverage.allRequiredValidationsPassed
-          : false;
-      return [boundedCommand(state, "request_model", {
-        mode: validationCoverageComplete ? "conclude" : "validate",
-        toolExpectation: validationCoverageComplete ? "optional" : "required",
-        objective: state.objective.text,
-        acceptanceCriteria: state.objective.acceptanceCriteria,
-        evidenceIds: state.evidence.map((item) => item.id),
-        executionContractRevision:
-          state.executionContract?.revision || null,
-        activeExecutionContractDraft:
-          activeExecutionContractDraft(state),
-        validationRetryTarget:
-          latestBrowserValidationTarget(state),
-        validationParentTakeoverReadRequired:
-          validationParentTakeoverReadRequired(state),
-        ...collaborationPayload(state, input),
-      })];
-    }
+    case "acting":
+    case "validating":
+      return [executeModelRequest(state, input)];
     case "finalizing":
       if (!input.resultKind || !input.resultReason) return [];
       return [makeCommand(state, "finalize_turn", {

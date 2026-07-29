@@ -18,7 +18,7 @@ export interface RuntimeV2CheckpointStoreAdapterInput {
   readonly sessionId: number | null | undefined;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
   readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
@@ -98,7 +98,7 @@ export function createRuntimeV2CheckpointPort(
             scopeKey: input.scopeKey,
             sessionId: input.sessionId,
             sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-            buildRuntimeSnapshot: (candidate) => input.normalizeSessionRuntimeSnapshot(candidate),
+            buildRuntimeSnapshot: (candidate) => input.buildSessionRuntimeSnapshot(candidate),
             persistSessionRecord: input.persistSessionRecord,
           });
         } catch (error) {

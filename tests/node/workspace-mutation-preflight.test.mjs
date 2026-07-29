@@ -326,6 +326,64 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
   assert.equal(valid.ok, true);
 });
 
+test("mutation preflight rejects parser-confirmed post-images before writing", async () => {
+  const checked = [];
+  const checkSyntax = async (path, content) => {
+    checked.push({ path, content });
+    const malformed = content.includes("}entFile(");
+    return {
+      applicable: path.endsWith(".js"),
+      hasErrors: malformed,
+      errorCount: malformed ? 1 : 0,
+      firstErrorLine: malformed ? 2 : null,
+      firstErrorColumn: malformed ? 1 : null,
+    };
+  };
+  const replacement = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/toolbar.js",
+      search_text: "function openFile(filePath) {",
+      replace_text: "}entFile(filePath) {",
+    },
+    language: "zh",
+    readFile: async () => [
+      "const ready = true;",
+      "function openFile(filePath) {",
+      "  return filePath;",
+      "}",
+    ].join("\n"),
+    checkSyntax,
+  });
+
+  assert.equal(replacement.ok, false);
+  assert.equal(replacement.reason, "syntax_error");
+  assert.equal(replacement.recoveryKind, "mutation_rejected");
+  assert.match(replacement.message || "", /文件尚未修改/);
+  assert.deepEqual(checked.map((entry) => entry.path), ["src/toolbar.js"]);
+
+  const patch = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: src/toolbar.js",
+        "@@",
+        "-function openFile(filePath) {",
+        "+}entFile(filePath) {",
+        "*** End Patch",
+      ].join("\n"),
+    },
+    language: "en",
+    readFile: async () => "function openFile(filePath) {\n  return filePath;\n}\n",
+    checkSyntax,
+  });
+
+  assert.equal(patch.ok, false);
+  assert.equal(patch.reason, "syntax_error");
+  assert.match(patch.message || "", /No file was changed/);
+});
+
 test("missing mutation targets request workspace reorientation instead of rereading the invented path", async () => {
   const replace = await preflightWorkspaceMutation({
     toolName: "replace_in_file",

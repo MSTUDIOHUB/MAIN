@@ -45,7 +45,7 @@ export interface RuntimeV2StudioRunnerInput {
   readonly studioReceipts: RuntimeV2StudioReceiptPort;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: any) => unknown;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;
@@ -288,7 +288,7 @@ export async function runSubmitRuntimeV2Studio(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,

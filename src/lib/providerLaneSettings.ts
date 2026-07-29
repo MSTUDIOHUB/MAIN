@@ -1,4 +1,5 @@
 import type { AppConfig } from "./appTypes";
+import type { RuntimeContextBudget } from "./runtimeContextBudget";
 import {
   normalizeCloudToolProtocol,
   normalizeLocalToolProtocol,
@@ -47,5 +48,17 @@ export function deriveStreamSettings(config: AppConfig): StreamSettings {
     contextLimit: undefined,
     provider: config.cloud.provider,
     useRustProxy: true, // Route through Rust to bypass WebView CORS
+  };
+}
+
+export function deriveBudgetedStreamSettings(
+  config: AppConfig,
+  budget: RuntimeContextBudget | null | undefined,
+): StreamSettings {
+  const settings = deriveStreamSettings(config);
+  if (config.activeProfile === "cloud" || !budget) return settings;
+  return {
+    ...settings,
+    contextLimit: budget.contextLimit,
   };
 }

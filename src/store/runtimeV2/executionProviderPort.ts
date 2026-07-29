@@ -8,40 +8,56 @@ import {
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
-  aggregateForCurrentTurn,
+  appendRuntimeV2ProtocolDriftHistory,
+  appendRuntimeV2AssistantToolCallHistory,
   baseProviderProfile,
-  latestCorrectiveSourceRefreshWindow,
-  latestFailureReadWindow,
-  providerProfileForProvenToolTransport,
   providerToolDefinitionsForCommand,
-  preferredFiniteValidationCommand,
   recordModelContext,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
-import { finiteValidationCommandRejection } from "./executionAuthorization";
-import {
-  selectRuntimeOwnedRequiredSourceAction,
-  selectRuntimeOwnedSourceRefreshAction,
-} from "./executionDeterministicActions";
 import {
   boundRuntimeV2ProviderToolCalls,
+  completedRuntimeV2ProviderToolCallIdentities,
+  runtimeV2ProviderCoveredReadReceipt,
+  runtimeV2ProviderReadIsFullyCovered,
+  runtimeV2ProviderToolCallConstraint,
+  scopeRuntimeV2ProviderToolCallIds,
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
-import {
-  attemptedRuntimeV2ProviderToolCallIdentities,
-} from "./executionProviderAttemptHistory";
 import { withRuntimeV2HardDeadline } from "./hardDeadline";
 import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ProviderProtocolError,
 } from "./executionProviderRequest";
-import {
-  forcedRuntimeV2MutationToolName,
-  runtimeV2ProviderAttemptTools,
-} from "./executionProviderTools";
 
 export const RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
+
+function rememberResult(
+  input: RuntimeV2ExecutionPortsInput,
+  command: Parameters<ProviderPort["request"]>[0]["command"],
+  result: Awaited<ReturnType<typeof requestRuntimeV2ProviderOnce>>,
+): void {
+  input.live.latestProviderResult = result;
+  input.live.latestVisibleText = result.toolCalls.length === 0
+    ? sanitizeAssistantDisplayContent(result.visibleText || "")
+      .trim()
+      .slice(0, 24_000)
+    : "";
+  if (input.live.latestVisibleText) {
+    recordModelContext(input.live, {
+      id: `provider:${command.idempotencyKey}`,
+      source: "provider",
+      label: `synthesis:${String(command.payload.mode || "unknown")}`,
+      target: "current-turn",
+      status: "succeeded",
+      content: input.live.latestVisibleText,
+    });
+  }
+  if (result.toolCalls.length > 0) {
+    appendRuntimeV2AssistantToolCallHistory(input.live, result);
+  }
+}
 
 export function createRuntimeV2ProviderPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -53,138 +69,60 @@ export function createRuntimeV2ProviderPort(
       if (!input.live.providerLaneProfile) {
         input.live.providerLaneProfile = baseProviderProfile(state);
       }
-      const profile = providerProfileForProvenToolTransport({
+      const profile = {
         ...input.live.providerLaneProfile,
         schemaVersion: "provider-lane.v1" as const,
         requiredToolChoice: requiresTool,
-      }, input.live.lastProviderTransport, requiresTool);
-      // Freeze one capability surface for the Turn. A UI toggle or config
-      // refresh after admission cannot make the provider request a tool that
-      // the executor's authorization catalog did not expose.
+      };
       const tools = providerToolDefinitionsForCommand(input, command);
       const allowedToolNames = tools.map((tool) => tool.function.name);
-      const forcedMutationToolName = forcedRuntimeV2MutationToolName(
-        command,
-        allowedToolNames,
-        aggregateForCurrentTurn(input),
-      );
-      const providerCommand = forcedMutationToolName
-        ? {
-            ...command,
-            payload: {
-              ...command.payload,
-              forcedMutationToolName,
-            },
-          }
-        : command;
-      const requiredSourceTarget = String(
-        command.payload.requiredExecutionContractSourceTarget ||
-          command.payload.requiredMutationSourceTarget ||
-          "",
-      ).trim();
-      const deterministicRequiredSource = !signal.aborted
-        ? selectRuntimeOwnedRequiredSourceAction({
-            command,
-            allowedToolNames,
-            target: requiredSourceTarget,
-          })
-        : null;
-      if (deterministicRequiredSource) {
-        input.live.latestProviderResult = deterministicRequiredSource;
-        input.live.latestVisibleText = "";
-        input.logStoreEvent(
-          "runtime_v2_required_source_selected",
-          {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            phase: command.phase,
-            path: requiredSourceTarget,
-            selectionReason:
-              command.payload.requiredExecutionContractSourceTarget
-                ? "execution_contract_basis_missing"
-                : "contracted_mutation_source_missing",
-          },
-        );
-        return deterministicRequiredSource;
-      }
-      const deterministicSourceWindow =
-        !signal.aborted &&
-          command.payload.executePolicy === "source_refresh_required" &&
-          allowedToolNames.includes("read_file")
-        ? latestCorrectiveSourceRefreshWindow(
-            input.live,
-            input.context.runWorkspace || "",
-          )
-        : null;
-      const deterministicSourceRefresh = !signal.aborted
-        ? selectRuntimeOwnedSourceRefreshAction({
-            command,
-            allowedToolNames,
-            sourceWindow: deterministicSourceWindow,
-          })
-        : null;
-      if (deterministicSourceWindow && deterministicSourceRefresh) {
-        const failureContext = input.live.modelContext.find(
-          (entry) => entry.id === deterministicSourceWindow.evidenceId,
-        );
-        input.live.latestProviderResult = deterministicSourceRefresh;
-        input.live.latestVisibleText = "";
-        input.logStoreEvent(
-          "runtime_v2_failure_read_window_selected",
-          {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            requestedPath: deterministicSourceWindow.path,
-            path: deterministicSourceWindow.path,
-            startLine: deterministicSourceWindow.startLine,
-            endLine: deterministicSourceWindow.endLine,
-            failureLine: deterministicSourceWindow.failureLine,
-            evidenceId: deterministicSourceWindow.evidenceId,
-            failureLabel: failureContext?.label || null,
-            selectionReason: "runtime_owned_source_refresh",
-          },
-        );
-        input.logStoreEvent(
-          "runtime_v2_source_refresh_fallback_selected",
-          {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            phase: command.phase,
-            path: deterministicSourceWindow.path,
-            startLine: deterministicSourceWindow.startLine,
-            endLine: deterministicSourceWindow.endLine,
-            evidenceId: deterministicSourceWindow.evidenceId,
-          },
-        );
-        return deterministicSourceRefresh;
+      if (requiresTool && tools.length === 0) {
+        throw new Error("RUNTIME_V2_REQUIRED_TOOL_SURFACE_EMPTY");
       }
       const requestDeadlineAt = Math.min(
         Date.now() + RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS,
         input.lifecycleDeadlineAt ?? Number.POSITIVE_INFINITY,
       );
-      let epoch: { actionKey: string; attempted: readonly RuntimeV2TransportVariant[] } = {
+
+      if (tools.length === 0) {
+        const timeoutMs = Math.max(1, requestDeadlineAt - Date.now());
+        let result = await requestRuntimeV2ProviderOnce({
+          live: input.live,
+          ports: input,
+          command,
+          tools: [],
+          textEnvelope: false,
+          toolChoice: null,
+          signal,
+          timeoutMs,
+        });
+        result = {
+          ...result,
+          toolCalls: scopeRuntimeV2ProviderToolCallIds(
+            result.toolCalls,
+            () => input.nextId("provider-tool-call"),
+          ),
+        };
+        rememberResult(input, command, result);
+        return result;
+      }
+
+      let epoch: {
+        actionKey: string;
+        attempted: readonly RuntimeV2TransportVariant[];
+      } = {
         actionKey: command.idempotencyKey,
         attempted: [],
       };
       let lastError: unknown = null;
-      while (true) {
-        if (Date.now() >= requestDeadlineAt) {
-          lastError = new Error(
-            "RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT",
-          );
-          break;
-        }
+      while (Date.now() < requestDeadlineAt) {
         const attempt = selectNextProviderTransportAttempt(profile, epoch);
         if (!attempt) break;
         epoch = recordProviderTransportAttempt(epoch, attempt);
         const requestAbort = new AbortController();
-        let requestTimedOut = false;
         const forwardAbort = () => requestAbort.abort(signal.reason);
-        if (signal.aborted) {
-          forwardAbort();
-        } else {
-          signal.addEventListener("abort", forwardAbort, { once: true });
-        }
+        if (signal.aborted) forwardAbort();
+        else signal.addEventListener("abort", forwardAbort, { once: true });
         const remainingMs = Math.max(1, requestDeadlineAt - Date.now());
         const hasFallback =
           selectNextProviderTransportAttempt(profile, epoch) !== null;
@@ -192,46 +130,35 @@ export function createRuntimeV2ProviderPort(
           remainingMs,
           hasFallback,
         );
-        const attemptTools = runtimeV2ProviderAttemptTools(
-          tools,
-          forcedMutationToolName,
-        );
+        let requestTimedOut = false;
         try {
           input.logStoreEvent("runtime_v2_provider_request_opened", {
             turnId: command.run.turnId,
             runId: command.run.runId,
             phase: command.phase,
             transport: attempt.variant,
-            textEnvelope: attempt.textEnvelope,
             toolExpectation: requiresTool ? "required" : "optional",
-            executePolicy: String(command.payload.executePolicy || ""),
-            forcedMutationToolName,
-            allowedToolCount: attemptTools.length,
-            nativeToolCount: attempt.textEnvelope ? 0 : attemptTools.length,
-            allowedToolNames: attemptTools.map((tool) => tool.function.name),
+            allowedToolNames,
             hasFallback,
-            remainingRequestMs: remainingMs,
             timeoutMs,
-            maxOutputTokens:
-              runtimeV2ExecutionProviderOutputTokenLimit(
-                command,
-                attempt.textEnvelope,
-              ),
+            maxOutputTokens: runtimeV2ExecutionProviderOutputTokenLimit(
+              command,
+              attempt.textEnvelope,
+              input.context.runtimeContextBudget,
+            ),
           });
           let result = await withRuntimeV2HardDeadline({
             timeoutMs,
             timeoutError: "RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT",
             onTimeout: () => {
               requestTimedOut = true;
-              requestAbort.abort(
-                "runtime_v2_execution_provider_request_timeout",
-              );
+              requestAbort.abort("runtime_v2_execution_provider_request_timeout");
             },
             task: () => requestRuntimeV2ProviderOnce({
               live: input.live,
               ports: input,
-              command: providerCommand,
-              tools: attemptTools,
+              command,
+              tools,
               textEnvelope: attempt.textEnvelope,
               toolChoice: attempt.toolChoice,
               signal: requestAbort.signal,
@@ -239,276 +166,155 @@ export function createRuntimeV2ProviderPort(
             }),
           });
           if (requiresTool && result.toolCalls.length === 0) {
-            const missingToolText = sanitizeAssistantDisplayContent(
-              result.visibleText || "",
-            ).replace(/\s+/g, " ").trim();
-            input.logStoreEvent("runtime_v2_required_tool_missing", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              phase: command.phase,
-              transport: attempt.variant,
-              textEnvelope: attempt.textEnvelope,
-              responseChars: missingToolText.length,
-              responsePreview: missingToolText.slice(0, 600),
-              responseTail: missingToolText.length > 600
-                ? missingToolText.slice(-600)
-                : "",
-              diagnosticCodes: result.diagnostics
-                .map((diagnostic) => diagnostic.code)
-                .slice(0, 8),
-              diagnosticMessages: result.diagnostics
-                .map((diagnostic) => diagnostic.message)
-                .slice(0, 4),
-              startsWithJson: /^\s*\{/.test(result.visibleText || ""),
-              hasJsonFence: /^\s*```(?:json)?/i.test(
-                result.visibleText || "",
-              ),
-              mentionsToolCalls: /tool_?calls?|runtime-v2-tools/i.test(
-                result.visibleText || "",
-              ),
-            });
-            throw runtimeV2ProviderProtocolError({
+            const protocolError = runtimeV2ProviderProtocolError({
               ports: input,
               command,
               code: "required_tool_missing",
               requestedToolNames: [],
-              allowedToolNames: attemptTools.map(
-                (tool) => tool.function.name,
-              ),
+              allowedToolNames,
             });
+            appendRuntimeV2ProtocolDriftHistory(input.live, {
+              visibleText: result.visibleText || "",
+              code: "required_tool_missing",
+              feedback: [
+                protocolError.message,
+                `Allowed tools: ${allowedToolNames.join(", ")}.`,
+                "The response did not advance the task. Submit exactly one different allowed structured action.",
+              ].join("\n"),
+            });
+            throw protocolError;
           }
-          const unexpectedToolNames = unexpectedRuntimeV2ProviderToolNames(
-            attemptTools,
+          const unexpected = unexpectedRuntimeV2ProviderToolNames(
+            tools,
             result.toolCalls,
           );
-          if (unexpectedToolNames.length > 0) {
-            input.logStoreEvent("runtime_v2_provider_tool_surface_rejected", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              phase: command.phase,
-              transport: attempt.variant,
-              unexpectedToolNames,
-              allowedToolNames: attemptTools.map(
-                (tool) => tool.function.name,
-              ),
-            });
-            throw runtimeV2ProviderProtocolError({
+          if (unexpected.length > 0) {
+            const protocolError = runtimeV2ProviderProtocolError({
               ports: input,
               command,
               code: "tool_surface_rejected",
-              requestedToolNames: unexpectedToolNames,
-              allowedToolNames: attemptTools.map(
-                (tool) => tool.function.name,
-              ),
+              requestedToolNames: unexpected,
+              allowedToolNames,
             });
+            appendRuntimeV2ProtocolDriftHistory(input.live, {
+              visibleText: result.visibleText || "",
+              code: "tool_surface_rejected",
+              feedback: [
+                protocolError.message,
+                `Allowed tools: ${allowedToolNames.join(", ")}.`,
+                "The response did not advance the task. Submit exactly one allowed structured action.",
+              ].join("\n"),
+            });
+            throw protocolError;
           }
-          const boundedBatch = boundRuntimeV2ProviderToolCalls(
-            result.toolCalls,
-            attemptedRuntimeV2ProviderToolCallIdentities(input, command),
-          );
-          if (boundedBatch.discarded.length > 0) {
-            input.logStoreEvent(
-              "runtime_v2_provider_tool_batch_normalized",
-              {
-                turnId: command.run.turnId,
-                runId: command.run.runId,
-                phase: command.phase,
-                transport: attempt.variant,
-                acceptedToolName: boundedBatch.accepted[0]?.name || null,
-                discardedToolNames: boundedBatch.discarded.map(
-                  (call) => call.name,
-                ),
-                originalToolCount: result.toolCalls.length,
-                selection: boundedBatch.selection,
-              },
-            );
-            result = {
-              ...result,
-              toolCalls: boundedBatch.accepted,
-            };
-          }
-          if (
-            String(command.payload.mode || "") === "execute" &&
-            (
-              command.payload.executePolicy === "source_gap_allowed" ||
-              command.payload.executePolicy ===
-                "source_reorientation_required" ||
-              command.payload.executePolicy === "source_refresh_required" ||
-              command.payload.executePolicy === "mutation_required"
+          const uncoveredCalls = result.toolCalls.filter((call) =>
+            !runtimeV2ProviderReadIsFullyCovered(
+              call,
+              input.live.messages,
             )
-          ) {
-            let enriched = false;
-            const toolCalls = result.toolCalls.map((call) => {
-              const forceRuntimeWindow =
-                command.payload.executePolicy === "source_refresh_required";
-              const hasExplicitWindow =
-                call.arguments.start_line !== undefined ||
-                call.arguments.end_line !== undefined;
-              if (
-                call.name !== "read_file" ||
-                (!forceRuntimeWindow && hasExplicitWindow)
-              ) {
-                return call;
-              }
-              const requestedPath = String(
-                call.arguments.path || call.arguments.file_path || "",
-              ).trim();
-              const primaryWindow = forceRuntimeWindow
-                ? latestCorrectiveSourceRefreshWindow(
-                    input.live,
-                    input.context.runWorkspace || "",
-                  )
-                : null;
-              const window = primaryWindow || latestFailureReadWindow(
-                input.live,
-                requestedPath,
-                input.context.runWorkspace || "",
-              );
-              if (!window) return call;
-              enriched = true;
-              const resolvedPath = "path" in window
-                ? window.path
-                : requestedPath;
-              const failureContext = input.live.modelContext.find(
-                (entry) => entry.id === window.evidenceId,
-              );
-              input.logStoreEvent(
-                "runtime_v2_failure_read_window_selected",
-                {
-                  turnId: command.run.turnId,
-                  runId: command.run.runId,
-                  requestedPath,
-                  path: resolvedPath,
-                  startLine: window.startLine,
-                  endLine: window.endLine,
-                  failureLine: window.failureLine,
-                  evidenceId: window.evidenceId,
-                  failureLabel: failureContext?.label || null,
-                },
-              );
-              return {
-                ...call,
-                arguments: {
-                  ...call.arguments,
-                  path: resolvedPath,
-                  start_line: window.startLine,
-                  end_line: window.endLine,
-                  max_lines: window.endLine - window.startLine + 1,
-                },
-              };
+          );
+          const batch = boundRuntimeV2ProviderToolCalls(
+            uncoveredCalls.length > 0 ? uncoveredCalls : result.toolCalls,
+            completedRuntimeV2ProviderToolCallIdentities(
+              input.live.messages,
+            ),
+            new Set(input.live.rejectedProviderActions.keys()),
+          );
+          if (batch.selection === "all_rejected") {
+            const protocolError = runtimeV2ProviderProtocolError({
+              ports: input,
+              command,
+              code: "repeated_action_rejected",
+              requestedToolNames: result.toolCalls.map((call) => call.name),
+              allowedToolNames,
+              detail: [
+                "The provider returned only exact actions already rejected at the current source boundary.",
+                ...result.toolCalls.map(
+                  runtimeV2ProviderToolCallConstraint,
+                ),
+                "Return a different allowed structured action.",
+              ].join("\n"),
             });
-            if (enriched) result = { ...result, toolCalls };
-          }
-          if (String(command.payload.mode || "") === "validate") {
-            const invalidValidationCall = result.toolCalls.find((call) => {
-              if (call.name !== "run_command") return false;
-              return !!finiteValidationCommandRejection(
-                call.arguments.command || call.arguments.cmd,
-              );
+            appendRuntimeV2ProtocolDriftHistory(input.live, {
+              visibleText: result.visibleText || "",
+              code: "repeated_action_rejected",
+              feedback: [
+                protocolError.message,
+                `Allowed tools: ${allowedToolNames.join(", ")}.`,
+                "The response did not advance the task. Submit exactly one different allowed structured action.",
+              ].join("\n"),
             });
-            if (invalidValidationCall) {
-              const rejection = finiteValidationCommandRejection(
-                invalidValidationCall.arguments.command ||
-                  invalidValidationCall.arguments.cmd,
-              )!;
-              const preferredValidation =
-                preferredFiniteValidationCommand(input);
-              input.logStoreEvent(
-                "runtime_v2_provider_tool_arguments_rejected",
-                {
-                  turnId: command.run.turnId,
-                  runId: command.run.runId,
-                  phase: command.phase,
-                  transport: attempt.variant,
-                  toolName: invalidValidationCall.name,
-                  reason: rejection.reasonCode,
-                  rejectionReason: rejection.rejectionReason,
-                  preferredValidationCommand: preferredValidation || null,
-                },
-              );
-              throw runtimeV2ProviderProtocolError({
-                ports: input,
-                command,
-                code: "tool_arguments_rejected",
-                requestedToolNames: [invalidValidationCall.name],
-                allowedToolNames: tools.map((tool) => tool.function.name),
-                detail: [
-                  "The proposed run_command is not a finite acceptance validator.",
-                  rejection.message,
-                ].join(" "),
-                preferredValidationCommand: preferredValidation,
-              });
-            }
+            throw protocolError;
           }
-          input.live.latestProviderResult = result;
-          // A tool envelope (or a native response that bundles an action with
-          // prose) is not a user-facing conclusion. Keeping it here would let
-          // a later recovery final repeat raw "let me edit" text after the
-          // structured action has already been handled by the Capsule.
-          input.live.latestVisibleText = result.toolCalls.length === 0
-            ? sanitizeAssistantDisplayContent(result.visibleText || "").trim().slice(0, 24_000)
-            : "";
-          if (input.live.latestVisibleText) {
-            recordModelContext(input.live, {
-              id: `provider:${command.idempotencyKey}`,
-              source: "provider",
-              label: `synthesis:${String(command.payload.mode || "unknown")}`,
-              target: "current-turn",
-              status: "succeeded",
-              content: input.live.latestVisibleText,
+          const acceptedCall = batch.accepted[0];
+          const discardedCalls = result.toolCalls.filter(
+            (call) => call !== acceptedCall,
+          );
+          if (discardedCalls.length > 0) {
+            input.logStoreEvent("runtime_v2_provider_tool_batch_normalized", {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              acceptedToolName: acceptedCall?.name || null,
+              discardedToolNames: discardedCalls.map((call) => call.name),
             });
           }
-          if (result.toolCalls.length > 0) {
-            input.live.lastProviderTransport = attempt.textEnvelope &&
-                input.live.lastProviderTransport === "native"
-              ? "native"
-              : attempt.textEnvelope
-                ? "text_envelope"
-                : "native";
+          const coveredReadRejected = !!acceptedCall &&
+            runtimeV2ProviderReadIsFullyCovered(
+              acceptedCall,
+              input.live.messages,
+            );
+          const coveredReadReceipt = acceptedCall
+            ? runtimeV2ProviderCoveredReadReceipt(
+                acceptedCall,
+                input.live.messages,
+              )
+            : null;
+          result = {
+            ...result,
+            toolCalls: scopeRuntimeV2ProviderToolCallIds(
+              batch.accepted,
+              () => input.nextId("provider-tool-call"),
+            ),
+          };
+          if (coveredReadRejected && result.toolCalls[0]) {
+            input.live.coveredReadToolResults.set(
+              result.toolCalls[0].id,
+              coveredReadReceipt,
+            );
           }
+          rememberResult(input, command, result);
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,
             transport: attempt.variant,
-            toolCalls: result.toolCalls.length,
             toolNames: result.toolCalls.map((call) => call.name),
             visibleChars: input.live.latestVisibleText.length,
-            diagnosticCodes: result.diagnostics.map((diagnostic) => diagnostic.code).slice(0, 8),
           });
           return result;
         } catch (error) {
-          const normalizedError = requestTimedOut
+          lastError = requestTimedOut
             ? new Error("RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT")
             : error;
-          lastError = normalizedError;
-          input.logStoreEvent(isRuntimeV2ProviderProtocolError(normalizedError)
-            ? "runtime_v2_provider_protocol_failed"
-            : "runtime_v2_provider_transport_failed", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            transport: attempt.variant,
-            ...(isRuntimeV2ProviderProtocolError(normalizedError)
-              ? { protocolCode: normalizedError.code }
-              : {}),
-            timedOut: requestTimedOut,
-            timeoutMs,
-            error: normalizedError instanceof Error
-              ? normalizedError.message
-              : String(normalizedError),
-          });
+          input.logStoreEvent(
+            isRuntimeV2ProviderProtocolError(lastError)
+              ? "runtime_v2_provider_protocol_failed"
+              : "runtime_v2_provider_transport_failed",
+            {
+              turnId: command.run.turnId,
+              runId: command.run.runId,
+              transport: attempt.variant,
+              error: lastError instanceof Error
+                ? lastError.message
+                : String(lastError),
+            },
+          );
         } finally {
           signal.removeEventListener("abort", forwardAbort);
         }
       }
-      if (isRuntimeV2ProviderProtocolError(lastError)) {
-        input.logStoreEvent("runtime_v2_provider_protocol_exhausted", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          phase: command.phase,
-          protocolCode: lastError.code,
-        });
-      }
-      throw lastError instanceof Error ? lastError : new Error("Runtime v2 provider transport attempts exhausted.");
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("RUNTIME_V2_PROVIDER_TRANSPORTS_UNAVAILABLE");
     },
   };
 }

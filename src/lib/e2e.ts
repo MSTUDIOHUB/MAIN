@@ -63,6 +63,7 @@ import {
 } from "./turnRuntimeContract";
 import { createTurnRuntimeCheckpoint } from "./turnRuntimeCheckpoint";
 import { buildAssistantStageCheckpoint } from "./assistantProgressPresentation";
+import { normalizeRuntimeV2Checkpoint } from "./runtime-v2";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -8718,11 +8719,26 @@ function seedRealOmlxPlanFlowScenario() {
 
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
-    const currentTurn = state.currentTurnId
+    const selectedTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const latestCheckpointedTurn = [...state.conversationTurns]
+      .reverse()
+      .find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]) || null;
+    const currentTurn =
+      (selectedTurn && state.runtimeV2Checkpoints?.[selectedTurn.id]
+        ? selectedTurn
+        : latestCheckpointedTurn) ||
+      selectedTurn ||
+      [...state.conversationTurns].reverse().find((turn) =>
+        turn.runtimeEngineVersion === "v2"
+      ) ||
+      null;
     const runtimeV2Checkpoint = currentTurn
-      ? state.runtimeV2Checkpoints?.[currentTurn.id] || null
+      ? normalizeRuntimeV2Checkpoint(
+          state.runtimeV2Checkpoints?.[currentTurn.id],
+          { turnId: currentTurn.id },
+        )
       : null;
     const runtimeV2Aggregate = runtimeV2Checkpoint?.aggregate || null;
     const runtimeV2Events = Array.isArray(runtimeV2Aggregate?.events)

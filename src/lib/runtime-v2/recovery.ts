@@ -5,6 +5,7 @@ import type {
   RuntimeV2RecoveryScope,
 } from "./contracts";
 import { isRuntimeV2ProviderProtocolError } from "./providerLane";
+import { sha256Hex } from "../sha256";
 
 /**
  * These are product safety limits, not provider/model heuristics. A caller
@@ -72,8 +73,12 @@ function canonical(value: unknown): string {
 /** Stable within a Run and insensitive to the generated idempotency key. */
 export function runtimeV2ActionFingerprint(command: Pick<RuntimeV2Command, "kind" | "phase" | "payload">): string {
   const explicit = compact(command.payload.actionFingerprint, 4_096);
-  if (explicit) return explicit;
-  return `${command.phase}:${command.kind}:${canonical(command.payload)}`.slice(0, 4_096);
+  if (/^runtime-v2-action-sha256-[0-9a-f]{64}$/.test(explicit)) {
+    return explicit;
+  }
+  const identity = explicit ||
+    `${command.phase}:${command.kind}:${canonical(command.payload)}`;
+  return `runtime-v2-action-sha256-${sha256Hex(identity)}`;
 }
 
 export function emptyRuntimeV2RecoveryBudget(): RuntimeV2RecoveryBudget {

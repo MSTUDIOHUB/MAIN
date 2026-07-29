@@ -20,11 +20,9 @@ import {
 } from "./projection";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import { transition } from "./reducer";
-import { compileRuntimeV2ExecutionContract } from "./executionContract";
 import {
   decideRuntimeV2CommandFailureRecovery,
   decideRuntimeV2SemanticFailureRecovery,
-  deriveRuntimeV2CorrectiveRecoveryEpoch,
   repeatsCommittedRuntimeV2SourceEvidence,
   repeatsRuntimeV2ProjectionInCurrentPhase,
   shouldRecordRuntimeV2SoftSignal,
@@ -332,51 +330,11 @@ export class RuntimeV2Controller {
         );
       }
       switch (command.kind) {
-      case "commit_execution_contract": {
-        const current = this.requireAggregate();
-        const previous = current.executionContract;
-        const contract = compileRuntimeV2ExecutionContract({
-          objective: current.objective,
-          evidence: current.evidence,
-          draft: command.payload.arguments,
-          previous,
-          committedAt: this.ports.clockId.now(),
-          contractId:
-            previous?.id ||
-            `${current.turn.turnId}:execution-contract`,
-        });
-        await this.apply(asEvent({
-          ...this.eventBase(),
-          type: "command.completed",
-          run: command.run,
-          idempotencyKey: command.idempotencyKey,
-          status: "succeeded",
-        }));
-        const committed = await this.apply(asEvent({
-          ...this.eventBase(),
-          type: "execution_contract.committed",
-          run: command.run,
-          contract,
-        }));
-        if (previous) {
-          await this.apply(asEvent({
-            ...this.eventBase(),
-            type: "execution_contract.invalidated",
-            run: command.run,
-            contractId: previous.id,
-            revision: previous.revision,
-            reason: "replaced_by_new_evidence_revision",
-          }));
-        }
-        await this.publishMilestoneIfEligible(
-          committed.events[committed.events.length - 1],
-        );
-        await this.publish(buildRuntimeV2CapsuleProjection(
-          this.requireAggregate(),
-          this.ports.clockId.nextId("capsule"),
-        ));
-        return;
-      }
+      case "commit_execution_contract":
+        // Read-only compatibility for an in-flight checkpoint created by the
+        // removed protocol. The scheduled command is settled by the ordinary
+        // failure path and the parent resumes the inspect-edit-verify loop.
+        throw new Error("RUNTIME_V2_LEGACY_COMMAND_UNRESUMABLE");
       case "request_model": {
         const result = await this.ports.provider.request({ run: command.run, command, signal });
         const applied = await this.apply(asEvent({
@@ -408,16 +366,13 @@ export class RuntimeV2Controller {
       }
       case "execute_tool": {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
-        let rebased = this.rebasePortEvent(event);
+        const rebased = this.rebasePortEvent(event);
         const repeatedSourceEvidence =
           repeatsCommittedRuntimeV2SourceEvidence({
             aggregate: this.requireAggregate(),
             event: rebased,
             command,
           });
-        if (await this.openRecoveryEpochForCorrectiveEvidence(rebased)) {
-          rebased = this.rebasePortEvent(event);
-        }
         await this.apply(rebased);
         if (
           repeatedSourceEvidence
@@ -430,10 +385,7 @@ export class RuntimeV2Controller {
       }
       case "execute_validation": {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
-        let rebased = this.rebasePortEvent(event);
-        if (await this.openRecoveryEpochForCorrectiveEvidence(rebased)) {
-          rebased = this.rebasePortEvent(event);
-        }
+        const rebased = this.rebasePortEvent(event);
         await this.apply(rebased);
         await this.recordSemanticFailureIfNeeded(command, rebased);
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
@@ -536,10 +488,9 @@ export class RuntimeV2Controller {
     }
   }
 
-  /** An unmodified v3 Execute may continue, but none of its pre-contract
-   * effects survive migration. Re-enter observing through legal phase edges
-   * so the provider must collect current evidence and commit v4 authority
-   * before any mutation can run. */
+  /** An unmodified legacy Execute may continue after its scheduled effect is
+   * discarded. Re-enter observation so the provider sees current source
+   * evidence before the next mutation. */
   async reobserveAfterLegacyMigration(): Promise<void> {
     await this.discardScheduledForMigration();
     let state = this.requireAggregate();
@@ -551,14 +502,14 @@ export class RuntimeV2Controller {
     ) {
       await this.changePhase(
         "acting",
-        "v3 migration discarded pre-contract effects before rebuilding execution authority.",
+        "Legacy migration discarded an unresumable scheduled effect.",
       );
       state = this.requireAggregate();
     }
     if (state.phase === "preparing" || state.phase === "acting") {
       await this.changePhase(
         "observing",
-        "v3 migration requires fresh observation and an execution contract.",
+        "Legacy migration requires fresh source observation.",
       );
       return;
     }
@@ -594,14 +545,6 @@ export class RuntimeV2Controller {
       error,
     });
     if (decision.kind === "signal") {
-      if (command.kind === "commit_execution_contract") {
-        await this.apply(asEvent({
-          ...this.eventBase(), type: "execution_contract.rejected",
-          run: state.run.identity, reason:
-            (error instanceof Error ? error.message : String(error))
-              .trim().slice(0, 1_000),
-        }));
-      }
       await this.applySoftSignal(decision.signal);
     } else if (decision.kind === "record") {
       await this.apply(asEvent({
@@ -657,26 +600,6 @@ export class RuntimeV2Controller {
       return;
     }
     await this.applySoftSignal("repeated_action");
-  }
-
-  private async openRecoveryEpochForCorrectiveEvidence(
-    event: RuntimeV2Event,
-  ): Promise<boolean> {
-    const state = this.requireAggregate();
-    if (!state.run) return false;
-    const recovery = deriveRuntimeV2CorrectiveRecoveryEpoch({
-      aggregate: state,
-      event,
-    });
-    if (!recovery) return false;
-    await this.apply(asEvent({
-      ...this.eventBase(),
-      type: "recovery.epoch_opened",
-      run: state.run.identity,
-      reason: recovery.reason,
-      evidence: recovery.evidence,
-    }));
-    return true;
   }
 
   private async publish(projection: ReturnType<typeof buildRuntimeV2CapsuleProjection>): Promise<void> {
