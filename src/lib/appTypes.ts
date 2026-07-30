@@ -44,7 +44,8 @@ export interface LocalConfig {
   contextLimit: number;
   apiKey: string;
   toolProtocol?: CloudToolProtocol;
-  /** Optional provider capacity override used by bounded auxiliary model jobs. */
+  /** Optional total provider-request capacity. MAIN reserves one request for
+   * the parent before exposing the remainder to bounded child work. */
   maxActiveRequests?: number;
 }
 

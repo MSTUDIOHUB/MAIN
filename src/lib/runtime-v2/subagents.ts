@@ -4,7 +4,6 @@ import type {
   RuntimeV2SubagentTelemetry,
 } from "./contracts";
 
-export const MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS = 2;
 // A new child needs enough of the shared lifecycle to collect one independent
 // fact, submit its structured report, and still leave the parent a useful
 // takeover window. Near-deadline delegation only steals time from the writer.
@@ -151,15 +150,17 @@ export function areReadOnlySubagentScopesDisjoint(
 }
 
 /**
- * Materialize at most two active, frozen read-only jobs from provider-authored
- * spawn_subagent calls. Completed jobs release capacity. Read-only jobs may
- * intentionally overlap paths because the parent is the only writer; semantic
- * task identity still prevents accidental duplicate delegation.
+ * Materialize frozen read-only jobs from provider-authored spawn_subagent
+ * calls within the capacity admitted by the provider lane. Completed jobs
+ * release capacity. Read-only jobs may intentionally overlap paths because
+ * the parent is the only writer; semantic task identity still prevents
+ * accidental duplicate delegation.
  */
 export function scheduleReadOnlySubagents(input: {
   readonly parentRun: RuntimeV2RunIdentity;
   readonly candidates: readonly RuntimeV2SubagentScopeCandidate[];
   readonly existingJobs?: readonly RuntimeV2SubagentJob[];
+  readonly maxActiveJobs: number;
   readonly requestedAt: number;
   readonly nextId: (scope: string) => string;
 }): RuntimeV2SubagentScheduleDecision {
@@ -172,6 +173,10 @@ export function scheduleReadOnlySubagents(input: {
   );
   const activeExistingJobs = existingJobs.filter(
     (job) => job.status === "queued" || job.status === "running",
+  );
+  const maxActiveJobs = Math.max(
+    0,
+    Math.floor(Number(input.maxActiveJobs) || 0),
   );
   for (const candidate of input.candidates) {
     const scopeKey = text(candidate.scopeKey, 256);
@@ -196,7 +201,7 @@ export function scheduleReadOnlySubagents(input: {
     seenSemanticIdentities.add(semanticIdentity);
     if (
       activeExistingJobs.length + jobs.length >=
-        MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS
+        maxActiveJobs
     ) {
       rejectedScopeKeys.push(scopeKey);
       continue;

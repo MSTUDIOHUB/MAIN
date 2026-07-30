@@ -8,7 +8,6 @@ import type {
 } from "./contracts";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import {
-  MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS,
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
 } from "./subagents";
@@ -17,9 +16,13 @@ import {
   resolveRuntimeV2PlanValidationScope,
   runtimeV2PlanValidationAuthority,
 } from "./planExecution";
-import { runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
-import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
-import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "./workspaceReadPolicy";
+import {
+  isRuntimeV2ValidationToolCall,
+  runtimeV2DirectExecuteReadyForConclusion,
+} from "./phaseTransition";
+import {
+  resolveRuntimeV2DirectExecuteValidationAuthority,
+} from "./validationReceipt";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -41,20 +44,15 @@ export interface RuntimeV2DecisionInput {
     | "forbidden"
     | "allowed"
     | "preferred";
+  /** Provider-lane capacity after reserving one request for the parent. */
+  readonly subagentCapacity?: number;
 }
-
-const VALIDATION_TOOL_NAMES = new Set([
-  "run_command",
-  "browser_evaluate",
-  "computer_use",
-]);
 
 function commaSeparatedValues(value: unknown): string[] {
   return String(value || "")
     .split(/[\n,]/)
     .map((entry) => entry.trim())
-    .filter(Boolean)
-    .slice(0, MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS);
+    .filter(Boolean);
 }
 
 function collaborationPayload(
@@ -64,6 +62,10 @@ function collaborationPayload(
   const collaborationAllowed =
     input.subagentPreference === "allowed" ||
     input.subagentPreference === "preferred";
+  const maxActiveSubagents = Math.max(
+    0,
+    Math.floor(Number(input.subagentCapacity) || 0),
+  );
   const activeSubagents = state.subagents
     .filter((job) => job.status === "queued" || job.status === "running")
     .map((job) => ({
@@ -75,7 +77,7 @@ function collaborationPayload(
     .filter((job) =>
       job.status === "failed" || job.status === "degraded"
     )
-    .slice(-MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS)
+    .slice(-Math.max(1, maxActiveSubagents))
     .map((job) => ({
       id: runtimeV2SubagentModelHandle(job),
       name: job.name || job.scopeKey,
@@ -83,39 +85,6 @@ function collaborationPayload(
       status: job.status,
       summary: job.summary || "No structured report was committed.",
     }));
-  const failedCommandKeys = new Set(state.events.flatMap((event) =>
-    event.type === "command.completed" && event.status === "failed"
-      ? [event.idempotencyKey]
-      : []
-  ));
-  let latestCollaborationFailureIndex = -1;
-  state.events.forEach((event, index) => {
-    if (
-      (
-        event.type === "subagent.completed" &&
-        (event.status === "failed" || event.status === "degraded")
-      ) ||
-      (
-        event.type === "command.scheduled" &&
-        event.command.kind === "schedule_subagents" &&
-        failedCommandKeys.has(event.command.idempotencyKey)
-      )
-    ) {
-      latestCollaborationFailureIndex = index;
-    }
-  });
-  const parentProgressAfterFailure =
-    latestCollaborationFailureIndex >= 0 &&
-    state.events.slice(latestCollaborationFailureIndex + 1).some((event) =>
-      (
-        event.type === "tool.completed" &&
-        event.status === "succeeded" &&
-        event.evidence.length > 0
-      )
-    );
-  const parentTakeoverRequired =
-    latestCollaborationFailureIndex >= 0 &&
-    !parentProgressAfterFailure;
   return {
     collaborationAllowed,
     collaborationPreferred:
@@ -123,16 +92,13 @@ function collaborationPayload(
     collaborationAction:
       activeSubagents.length > 0
         ? "children_active"
-        : parentTakeoverRequired
-          ? "parent_takeover_required"
-          : "optional",
+        : "optional",
     activeSubagents,
     failedSubagents,
+    maxActiveSubagents,
     remainingSubagentCapacity: Math.max(
       0,
-      parentTakeoverRequired
-        ? 0
-        : MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - activeSubagents.length,
+      maxActiveSubagents - activeSubagents.length,
     ),
   };
 }
@@ -169,7 +135,6 @@ function deterministicCommandKey(
     run.identity.runId,
     state.phase,
     kind,
-    `epoch-${state.recovery.epoch}`,
     `attempt-${attempt}`,
     fingerprint,
   ].join(":");
@@ -206,105 +171,6 @@ function boundedCommand(
   return makeCommand(state, kind, payload);
 }
 
-function repeatedObservationReason(
-  state: TurnAggregateV1,
-  command: RuntimeV2Command,
-):
-  | "unchanged_source_repeat"
-  | "unchanged_observation_repeat"
-  | "repeated_validation"
-  | null {
-  const requestedToolName = String(command.payload.toolName || "");
-  if (
-    (
-      command.kind !== "execute_tool" &&
-      command.kind !== "execute_validation"
-    ) ||
-    (
-      command.kind === "execute_tool" &&
-      !RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(requestedToolName)
-    )
-  ) return null;
-  const toolActionFingerprint = (candidate: RuntimeV2Command) =>
-    runtimeV2ActionFingerprint({
-      kind: "execute_tool",
-      phase: "acting",
-      payload: {
-        toolName: candidate.payload.toolName,
-        arguments: candidate.payload.arguments,
-      },
-    });
-  const fingerprint = toolActionFingerprint(command);
-  const scheduled = new Map<string, RuntimeV2Command>();
-  const versions: string[] = [];
-  let identicalObservations = 0;
-  for (const event of state.events) {
-    if (event.type === "command.scheduled") {
-      scheduled.set(event.command.idempotencyKey, event.command);
-      continue;
-    }
-    if (
-      event.type !== "tool.completed" &&
-      event.type !== "validation.completed"
-    ) {
-      continue;
-    }
-    const completed = scheduled.get(event.idempotencyKey);
-    if (!completed) continue;
-    const toolName = String(completed.payload.toolName || "");
-    if (
-      event.type === "tool.completed" &&
-      event.status === "succeeded" &&
-      isWorkspaceMutationToolName(toolName)
-    ) {
-      // A committed mutation opens a new source boundary. Reads after it must
-      // remain available, and validations must re-run against the new source.
-      versions.length = 0;
-      identicalObservations = 0;
-      continue;
-    }
-    if (
-      completed.kind !== command.kind ||
-      toolName !== requestedToolName ||
-      toolActionFingerprint(completed) !== fingerprint ||
-      (
-        completed.kind === "execute_tool" &&
-        (
-          event.type !== "tool.completed" ||
-          event.status !== "succeeded"
-        )
-      ) ||
-      (
-        completed.kind === "execute_validation" &&
-        event.type !== "validation.completed"
-      )
-    ) {
-      continue;
-    }
-    identicalObservations += 1;
-    if (command.kind === "execute_validation") continue;
-    if (requestedToolName !== "read_file") continue;
-    const version = event.evidence.find(
-      (evidence) => evidence.kind === "source",
-    )?.version;
-    if (version) versions.push(version);
-  }
-  if (command.kind === "execute_validation") {
-    return identicalObservations >= 2
-      ? "repeated_validation"
-      : null;
-  }
-  if (requestedToolName !== "read_file") {
-    return identicalObservations >= 2
-      ? "unchanged_observation_repeat"
-      : null;
-  }
-  return versions.length >= 2 &&
-      versions[versions.length - 1] === versions[versions.length - 2]
-    ? "unchanged_source_repeat"
-    : null;
-}
-
 function executeReadyForConclusion(state: TurnAggregateV1): boolean {
   const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
   if (planCoverage) {
@@ -314,24 +180,81 @@ function executeReadyForConclusion(state: TurnAggregateV1): boolean {
   return runtimeV2DirectExecuteReadyForConclusion(state);
 }
 
+/**
+ * Source evidence is necessary authority for an edit, but it is not itself a
+ * workspace effect. Keep this pressure active across additional reads until a
+ * mutation commits. The provider still retains every safe read tool; this
+ * durable fact only distinguishes "more evidence" from "objective advanced".
+ */
+export function deriveRuntimeV2EffectPressure(
+  state: TurnAggregateV1,
+): {
+  readonly schemaVersion: "runtime-v2-effect-pressure.v1";
+  readonly reason: "source_only_frontier";
+  readonly mutationBoundarySequence: number;
+  readonly sourceBoundarySequence: number;
+  readonly latestSourceEvidenceId: string;
+} | null {
+  let mutationBoundarySequence = 0;
+  let sourceBoundarySequence = 0;
+  let latestSourceEvidenceId = "";
+
+  for (const event of state.events) {
+    if (
+      event.type !== "tool.completed" ||
+      event.status !== "succeeded"
+    ) {
+      continue;
+    }
+    if (event.evidence.some((evidence) => evidence.kind === "mutation")) {
+      mutationBoundarySequence = event.sequence;
+      sourceBoundarySequence = 0;
+      latestSourceEvidenceId = "";
+      continue;
+    }
+    if (event.receiptOrigin === "replayed") continue;
+    const source = [...event.evidence].reverse().find((evidence) =>
+      evidence.kind === "source" && !!evidence.version
+    );
+    if (!source) continue;
+    sourceBoundarySequence = event.sequence;
+    latestSourceEvidenceId = source.id;
+  }
+
+  return sourceBoundarySequence > mutationBoundarySequence &&
+      !!latestSourceEvidenceId
+    ? {
+        schemaVersion: "runtime-v2-effect-pressure.v1",
+        reason: "source_only_frontier",
+        mutationBoundarySequence,
+        sourceBoundarySequence,
+        latestSourceEvidenceId,
+      }
+    : null;
+}
+
 function executeModelRequest(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput,
 ): RuntimeV2Command {
   const ready = executeReadyForConclusion(state);
+  const mode = ready
+    ? "conclude"
+    : state.phase === "validating"
+      ? "validate"
+      : "execute";
+  const effectPressure = mode === "execute"
+    ? deriveRuntimeV2EffectPressure(state)
+    : null;
   return boundedCommand(state, "request_model", {
-    mode: ready
-      ? "conclude"
-      : state.phase === "validating"
-        ? "validate"
-        : "execute",
-    toolExpectation: ready ? "optional" : "required",
+    mode,
     objective: state.objective.text,
     acceptanceCriteria: state.objective.acceptanceCriteria,
     evidenceIds: state.evidence.map((item) => item.id),
     hasVersionedSourceEvidence: state.evidence.some(
       (item) => item.kind === "source" && !!item.version,
     ),
+    ...(effectPressure ? { effectPressure } : {}),
     ...collaborationPayload(state, input),
   });
 }
@@ -391,6 +314,10 @@ export function decideNextCommands(
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
+        maxActiveSubagents: Math.max(
+          0,
+          Math.floor(Number(input.subagentCapacity) || 0),
+        ),
       })];
     }
     if (toolCall.name === "wait_subagents") {
@@ -414,7 +341,7 @@ export function decideNextCommands(
         unresolvedJobIds: resolution.unresolved,
       })];
     }
-    const kind = VALIDATION_TOOL_NAMES.has(toolCall.name)
+    const kind = isRuntimeV2ValidationToolCall(toolCall)
       ? "execute_validation"
       : "execute_tool";
     let validationAuthority:
@@ -442,26 +369,33 @@ export function decideNextCommands(
           }) || undefined;
       }
     }
+    if (
+      kind === "execute_validation" &&
+      !validationAuthority &&
+      state.strategy === "execute"
+    ) {
+      validationAuthority =
+        resolveRuntimeV2DirectExecuteValidationAuthority({
+          aggregate: state,
+          turnId: state.turn.turnId,
+          objective: state.objective,
+          validationId: toolCall.id,
+        }) || undefined;
+    }
+    const executionArguments = kind === "execute_validation"
+      ? Object.fromEntries(
+          Object.entries(toolCall.arguments).filter(([key]) =>
+            key !== "criterion_ids" && key !== "target_paths"
+          ),
+        )
+      : toolCall.arguments;
     const command = boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
-      arguments: toolCall.arguments,
+      arguments: executionArguments,
       ...(validationAuthority ? { validationAuthority } : {}),
     });
-    const repeatedActionReason = repeatedObservationReason(
-      state,
-      command,
-    );
-    return [repeatedActionReason
-      ? {
-          ...command,
-          payload: {
-            ...command.payload,
-            repeatedActionRejected: true,
-            repeatedActionReason,
-          },
-        }
-      : command];
+    return [command];
   }
 
   switch (state.phase) {

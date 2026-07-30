@@ -28,6 +28,7 @@ export interface RuntimeV2GoalCriterion {
   readonly id: string;
   readonly text: string;
   readonly required: boolean;
+  readonly evidenceRequirement?: "static" | "behavioral" | "interaction";
 }
 
 export type RuntimeV2GoalBoundaryKind =
@@ -104,6 +105,10 @@ export function runtimeV2GoalSliceExecuteAdmission(
   readonly acceptanceCriteria: readonly {
     readonly id: string;
     readonly text: string;
+    readonly evidenceRequirement?:
+      | "static"
+      | "behavioral"
+      | "interaction";
   }[];
 } {
   return {
@@ -112,6 +117,9 @@ export function runtimeV2GoalSliceExecuteAdmission(
     acceptanceCriteria: request.criteria.map((criterion) => ({
       id: criterion.id,
       text: criterion.text,
+      ...(criterion.evidenceRequirement
+        ? { evidenceRequirement: criterion.evidenceRequirement }
+        : {}),
     })),
   };
 }
@@ -356,6 +364,11 @@ export function createRuntimeV2GoalSaga(input: {
       id: nonEmpty(criterion.id, "criterion_id"),
       text: nonEmpty(criterion.text, "criterion_text").slice(0, 2_000),
       required: criterion.required === true,
+      ...(criterion.evidenceRequirement === "static" ||
+          criterion.evidenceRequirement === "behavioral" ||
+          criterion.evidenceRequirement === "interaction"
+        ? { evidenceRequirement: criterion.evidenceRequirement }
+        : {}),
     }));
   if (new Set(criteria.map((criterion) => criterion.id)).size !== criteria.length) {
     throw new Error("RUNTIME_V2_GOAL_DUPLICATE_CRITERION");

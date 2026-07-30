@@ -6,6 +6,7 @@ import {
   isLocalFileReadApproved,
   isPerCallOnlyToolRisk,
   normalizeToolPermissionPolicy,
+  type ToolRiskLevel,
 } from "../../lib/toolCapabilities";
 import { buildToolCatalog } from "../../lib/toolCatalog";
 import {
@@ -28,7 +29,7 @@ import {
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
-  isRuntimeV2WorkspaceReadToolName,
+  isRuntimeV2ReadOnlyToolName,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   aggregateForCurrentTurn,
@@ -59,9 +60,37 @@ export interface RuntimeV2FiniteValidationRejection {
   readonly message: string;
 }
 
+export function runtimeV2MutationLeaseRejectionReason(input: {
+  readonly toolName: string;
+  readonly unexpectedTargets: readonly string[];
+  readonly leaseTargets: readonly string[];
+}): string {
+  const visibleTargets = new Set(input.leaseTargets);
+  const missingTargets = input.unexpectedTargets.filter(
+    (target) => !visibleTargets.has(target),
+  );
+  if (missingTargets.length > 0) {
+    return [
+      "MUTATION_SOURCE_NOT_VISIBLE:",
+      `修改前必须先读取当前请求中尚不可见的目标：${missingTargets.join(", ")}。`,
+    ].join(" ");
+  }
+  if (input.toolName === "replace_in_file") {
+    return [
+      "REPLACE_SEARCH_TEXT_NOT_VISIBLE:",
+      "search_text 与当前请求中已经可见的版本化源码不完全匹配。",
+      "请直接复制已返回源码中的精确字节，或只读取尚未覆盖的范围；不要重复读取已完整覆盖的同版本文件。",
+    ].join(" ");
+  }
+  return [
+    "MUTATION_SOURCE_RANGE_NOT_VISIBLE:",
+    `拟修改内容未被当前请求中的版本化源码安全覆盖：${input.unexpectedTargets.join(", ") || "未解析目标"}。`,
+  ].join(" ");
+}
+
 /** One finite-validation contract shared by provider retries and execution.
  * Rejecting an invalid proposal before scheduling it prevents model protocol
- * drift from spending an execution/recovery epoch. Authorization repeats the
+ * drift from spending an execution attempt. Authorization repeats the
  * same check at the effect boundary so no adapter can bypass it. */
 export function finiteValidationCommandRejection(
   value: unknown,
@@ -82,11 +111,14 @@ export function finiteValidationCommandRejection(
   };
 }
 
-interface RuntimeV2ToolAuthorizationResult {
+export interface RuntimeV2ToolAuthorizationResult {
   readonly allowed: boolean;
   readonly reason: string | null;
   readonly allowExternalLocalRead: boolean;
   readonly shellPermissionApproval?: ShellPermissionApproval;
+  readonly approvalRequired?: boolean;
+  readonly risk?: ToolRiskLevel;
+  readonly localFileReadPath?: string;
 }
 
 /** Freeze the built-in tool surface and policy for this Runtime v2 Turn.
@@ -169,7 +201,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (
     aggregate?.strategy === "analyze" &&
     (
-      !isRuntimeV2WorkspaceReadToolName(input.toolName) ||
+      !isRuntimeV2ReadOnlyToolName(input.toolName) ||
       input.command.kind === "execute_validation"
     )
   ) {
@@ -186,6 +218,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   ) {
     const mutationLease = validateRuntimeV2MutationLease({
       ports: input.ports,
+      toolCallId: String(input.command.payload.toolCallId || ""),
       toolName: input.toolName,
       args: input.args,
       target: input.target,
@@ -193,13 +226,11 @@ export function validateToolAgainstPhaseAndPlan(input: {
     if (mutationLease && !mutationLease.allowed) {
       return {
         allowed: false,
-        reason: mutationLease.leases.length > 0
-          ? [
-              "修改目标缺少当前版本的父级读取证据。",
-              `缺少证据：${mutationLease.unexpectedTargets.join(", ") || "未解析目标"}。`,
-              `已有证据：${mutationLease.leases.map((lease) => lease.target).join(", ")}。`,
-            ].join(" ")
-          : "修改前必须先精确读取准备变更的源文件。",
+        reason: runtimeV2MutationLeaseRejectionReason({
+          toolName: input.toolName,
+          unexpectedTargets: mutationLease.unexpectedTargets,
+          leaseTargets: mutationLease.leases.map((lease) => lease.target),
+        }),
         failureKind: "protocol_invalid",
         reasonCode: mutationLease.reasonCode,
       };
@@ -291,15 +322,26 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
-  const risk = getToolRiskLevelForCall(
+  const localFileReadPath = getLocalFileReadPathForToolCall(
     name,
     args,
-    authorization.capabilityRegistry,
-    {
-      workspace: input.context.runWorkspace,
-      approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
-    },
+    input.context.runWorkspace,
   );
+  // Approval changes whether the call needs review; it must not erase the
+  // fact that execution still crosses the workspace boundary. Preserve the
+  // boundary risk so the executor receives allowExternalLocalRead exactly
+  // for the approved target.
+  const risk = localFileReadPath
+    ? "local_file_read"
+    : getToolRiskLevelForCall(
+        name,
+        args,
+        authorization.capabilityRegistry,
+        {
+          workspace: input.context.runWorkspace,
+          approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
+        },
+      );
   const capability = authorization.capabilityRegistry.tools[name];
   if (
     !capability?.enabled ||
@@ -325,19 +367,20 @@ export async function authorizeToolForCurrentTurn(
       : { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "local_file_read") {
-    const path = getLocalFileReadPathForToolCall(
-      name,
-      args,
-      input.context.runWorkspace,
-    );
-    const approved = !!path &&
-      isLocalFileReadApproved(path, state.approvedLocalFileReadPaths);
+    const approved = !!localFileReadPath &&
+      isLocalFileReadApproved(
+        localFileReadPath,
+        state.approvedLocalFileReadPaths,
+      );
     return approved
       ? { allowed: true, reason: null, allowExternalLocalRead: true }
       : {
           allowed: false,
           reason: "读取工作区外本地文件需要用户明确授权。",
           allowExternalLocalRead: false,
+          approvalRequired: true,
+          risk,
+          ...(localFileReadPath ? { localFileReadPath } : {}),
         };
   }
   const consent = state.currentTurnExecutionConsent;

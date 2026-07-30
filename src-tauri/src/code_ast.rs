@@ -11,6 +11,7 @@ const MAX_REFERENCE_FILE_BYTES: u64 = 768 * 1024;
 const MAX_REFERENCE_FILES: usize = 500;
 const DEFAULT_RESULT_LIMIT: usize = 80;
 const MAX_RESULT_LIMIT: usize = 200;
+const MAX_REPORTED_SYNTAX_ERRORS: usize = 32;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +70,14 @@ pub struct SymbolReferencesResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SourceSyntaxError {
+    pub line: usize,
+    pub column: usize,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceSyntaxCheckResult {
     pub path: String,
     pub language: Option<String>,
@@ -77,6 +86,8 @@ pub struct SourceSyntaxCheckResult {
     pub error_count: usize,
     pub first_error_line: Option<usize>,
     pub first_error_column: Option<usize>,
+    pub errors: Vec<SourceSyntaxError>,
+    pub errors_truncated: bool,
 }
 
 fn language_for_path(path: &Path) -> Option<(&'static str, Language)> {
@@ -377,6 +388,8 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
             error_count: 0,
             first_error_line: None,
             first_error_column: None,
+            errors: Vec::new(),
+            errors_truncated: false,
         });
     };
     let mut parser = Parser::new();
@@ -392,19 +405,36 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
     while let Some(node) = stack.pop() {
         if node.is_error() || node.is_missing() {
             let position = node.start_position();
-            errors.push((position.row, position.column));
+            errors.push((
+                position.row,
+                position.column,
+                if node.is_missing() {
+                    format!("missing_{}", node.kind())
+                } else {
+                    "parse_error".to_string()
+                },
+            ));
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
-    errors.extend(duplicate_module_export_positions(
-        root,
-        source,
-        language_name,
-    ));
+    errors.extend(
+        duplicate_module_export_positions(root, source, language_name)
+            .into_iter()
+            .map(|(row, column)| (row, column, "duplicate_export".to_string())),
+    );
     errors.sort_unstable();
-    errors.dedup();
+    errors.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
     let first = errors.first();
+    let reported_errors = errors
+        .iter()
+        .take(MAX_REPORTED_SYNTAX_ERRORS)
+        .map(|(row, column, kind)| SourceSyntaxError {
+            line: row + 1,
+            column: column + 1,
+            kind: kind.clone(),
+        })
+        .collect::<Vec<_>>();
     Ok(SourceSyntaxCheckResult {
         path: path.to_string_lossy().replace('\\', "/"),
         language: Some(language_name.to_string()),
@@ -413,6 +443,8 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
         error_count: errors.len(),
         first_error_line: first.map(|position| position.0 + 1),
         first_error_column: first.map(|position| position.1 + 1),
+        errors_truncated: errors.len() > reported_errors.len(),
+        errors: reported_errors,
     })
 }
 
@@ -731,6 +763,7 @@ mod tests {
         assert!(malformed.has_errors);
         assert!(malformed.error_count > 0);
         assert_eq!(malformed.first_error_line, Some(2));
+        assert!(malformed.errors.iter().any(|error| error.line == 2));
 
         let valid = check_source_syntax(
             Path::new("src/toolbar.tsx"),
@@ -756,6 +789,10 @@ mod tests {
         assert!(duplicate.has_errors);
         assert!(duplicate.error_count > 0);
         assert_eq!(duplicate.first_error_line, Some(2));
+        assert!(duplicate
+            .errors
+            .iter()
+            .any(|error| error.kind == "duplicate_export"));
     }
 
     #[test]

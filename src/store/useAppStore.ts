@@ -65,6 +65,9 @@ import {
   type HookExecutionRecord,
 } from "../lib/hooks";
 import {
+  createWorkspaceInstructionProjectionOwner,
+} from "./workspaceInstructionProjectionOwner";
+import {
   type ConversationTurn,
   type ConversationTurnStatus,
   type DurableTurnContext,
@@ -113,6 +116,11 @@ import {
   serializeRuntimeV2CheckpointMap,
   type RuntimeV2CheckpointMap,
 } from "../lib/runtime-v2/checkpoint";
+import {
+  normalizeRuntimeV2EmergencyTerminalEnvelopeMap,
+  sameRuntimeV2EmergencyTerminalRun,
+  type RuntimeV2EmergencyTerminalEnvelopeMap,
+} from "../lib/runtime-v2/emergencyTerminal";
 import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
 import { createRuntimeV2ProjectionPort } from "./runtimeV2/projectionPort";
 import {
@@ -1039,6 +1047,9 @@ export interface SessionRuntimeSnapshot {
   turnRuntimeCheckpoints?: TurnRuntimeCheckpointMap;
   /** Event-sourced v3 checkpoints for Turns owned by Runtime v2. */
   runtimeV2Checkpoints?: RuntimeV2CheckpointMap;
+  /** Minimal terminal facts used only when the canonical v5 ledger cannot persist. */
+  runtimeV2EmergencyTerminalEnvelopes?:
+    RuntimeV2EmergencyTerminalEnvelopeMap;
   /** Session-owned canonical receipts backing durable subagent closure evidence. */
   subagentClosureReceiptLedger?: SubagentClosureReceiptLedger | null;
   taskFlow: TaskBlock[];
@@ -1101,6 +1112,8 @@ export interface SessionRuntimeSnapshot {
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
   runtimeV2Checkpoints: RuntimeV2CheckpointMap;
+  runtimeV2EmergencyTerminalEnvelopes:
+    RuntimeV2EmergencyTerminalEnvelopeMap;
   subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   input: string;
   contextMentions: string[];
@@ -1471,7 +1484,13 @@ export interface AppState {
   instructionLastLoadedAt: number | null;
   hookLastLoadedAt: number | null;
   sessionHookCache: string[];
-  refreshInstructionAndHookState: (associatedPaths?: string[]) => Promise<void>;
+  refreshInstructionAndHookState: (
+    associatedPaths?: string[],
+    options?: {
+      workspace?: string;
+      projectToUi?: boolean;
+    },
+  ) => Promise<ResolvedInstructionSet | null>;
   setResolvedInstructionSet: (resolved: ResolvedInstructionSet | null) => void;
   setLoadedHookDefinitions: (hooks: HookDefinition[], loadedAt?: number | null) => void;
   appendHookExecutionRecords: (records: HookExecutionRecord[]) => void;
@@ -1544,6 +1563,8 @@ export interface AppState {
   activeActionRequest: ActionRequest | null;
   turnRuntimeCheckpoints: TurnRuntimeCheckpointMap;
   runtimeV2Checkpoints: RuntimeV2CheckpointMap;
+  runtimeV2EmergencyTerminalEnvelopes:
+    RuntimeV2EmergencyTerminalEnvelopeMap;
   subagentClosureReceiptLedger: SubagentClosureReceiptLedger | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setPlanStage: (stage: PlanStage) => void;
@@ -4170,6 +4191,8 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "subagent.created",
     "subagent.updated",
     "subagent.completed",
+    "subagent.handoff_delivered",
+    "subagent.handoff_applied",
     "subagent.closed",
     "subagent.dismissed",
     "subagent.handed_back",
@@ -4438,6 +4461,31 @@ export function normalizeSessionRuntimeSnapshot(
   const restoredLifecycleSessionKey = String(options?.expectedSessionKey || "").trim() ||
     UNBOUND_PLAN_SESSION_KEY;
   const suppliedLifecycleSessionEpoch = String(options?.expectedSessionEpoch || "").trim();
+  const restoredWorkspaceKey = options && "workspacePath" in options
+    ? resolveSessionWorkspaceKey(options.workspacePath)
+    : undefined;
+  const runtimeV2OwnerFence = {
+    ...(restoredWorkspaceKey
+      ? { workspaceKey: restoredWorkspaceKey }
+      : {}),
+    ...(suppliedLifecycleSessionEpoch
+      ? {
+          sessionKey: restoredLifecycleSessionKey,
+          sessionEpoch: suppliedLifecycleSessionEpoch,
+        }
+      : {}),
+  };
+  const restoredRuntimeV2Checkpoints = normalizeRuntimeV2CheckpointMap(
+    snapshot.runtimeV2Checkpoints,
+    runtimeV2OwnerFence,
+  );
+  const candidateEmergencyTerminalEnvelopes =
+    normalizeRuntimeV2EmergencyTerminalEnvelopeMap(
+      snapshot.runtimeV2EmergencyTerminalEnvelopes,
+      runtimeV2OwnerFence,
+    );
+  let restoredRuntimeV2EmergencyTerminalEnvelopes:
+    RuntimeV2EmergencyTerminalEnvelopeMap = {};
   const restoredLifecycleSessionEpoch = suppliedLifecycleSessionEpoch || (
     restoredLifecycleSessionKey === UNBOUND_PLAN_SESSION_KEY
       ? UNBOUND_PLAN_SESSION_EPOCH
@@ -4772,9 +4820,125 @@ export function normalizeSessionRuntimeSnapshot(
     : invalidatedActionUsesChinese
     ? "待选择项与当前运行身份不一致；已移除失效按钮并保留上下文。"
     : "The pending choice no longer matches the active run; stale controls were removed and context was preserved.";
-  const restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents).filter(
+  let restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents).filter(
     (event) => !expectedContainerSessionKey || event.threadId === expectedContainerSessionKey,
   );
+  for (
+    const [turnId, envelope] of Object.entries(
+      candidateEmergencyTerminalEnvelopes,
+    )
+  ) {
+    const checkpoint = restoredRuntimeV2Checkpoints[turnId];
+    if (
+      checkpoint &&
+      (
+        checkpoint.revision !== envelope.lastRevision ||
+        !!checkpoint.aggregate.terminalOutcome ||
+        !checkpoint.aggregate.run ||
+        !sameRuntimeV2EmergencyTerminalRun(
+          checkpoint.aggregate.run.identity,
+          envelope.run,
+        )
+      )
+    ) {
+      continue;
+    }
+    const runStarts = restoredRuntimeEvents.filter((event) =>
+      event.type === "run.started" &&
+      event.threadId === envelope.run.sessionKey &&
+      event.turnId === turnId &&
+      event.runId === envelope.run.runId
+    );
+    const runConclusions = restoredRuntimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.threadId === envelope.run.sessionKey &&
+      event.turnId === turnId &&
+      event.runId === envelope.run.runId
+    );
+    const turnConclusions = restoredRuntimeEvents.filter((event) =>
+      event.type === "turn.completed" &&
+      event.threadId === envelope.run.sessionKey &&
+      event.turnId === turnId
+    );
+    const ownerConflict =
+      runStarts.length > 1 ||
+      runStarts.some((event) =>
+        event.type === "run.started" &&
+        event.parentRunId !== envelope.run.parentRunId
+      ) ||
+      runConclusions.length > 1 ||
+      runConclusions.some((event) =>
+        event.type === "run.completed" &&
+        (
+          event.parentRunId !== envelope.run.parentRunId ||
+          event.resultKind !== envelope.resultKind
+        )
+      ) ||
+      turnConclusions.length > 1 ||
+      turnConclusions.some((event) =>
+        event.type === "turn.completed" &&
+        event.resultKind !== envelope.resultKind
+      );
+    if (ownerConflict) continue;
+
+    // A valid emergency terminal is projected through the same canonical
+    // restore transaction as ordinary terminal events. It is not replayed as
+    // a Runtime v2 aggregate and cannot revive the old running checkpoint.
+    restoredRuntimeEvents = restoredRuntimeEvents.filter((event) =>
+      !(
+        event.type === "run.paused" &&
+        event.threadId === envelope.run.sessionKey &&
+        event.turnId === turnId &&
+        event.runId === envelope.run.runId
+      )
+    );
+    restoredRuntimeEvents = insertRestoredRunStartBeforeTerminal({
+      runtimeEvents: restoredRuntimeEvents,
+      sessionKey: envelope.run.sessionKey,
+      turnId,
+      runId: envelope.run.runId,
+      parentRunId: envelope.run.parentRunId,
+      timestampMs: envelope.at,
+    });
+    if (envelope.resultKind === "canceled") {
+      restoredRuntimeEvents = insertRestoredRunAbortBeforeConclusion({
+        runtimeEvents: restoredRuntimeEvents,
+        sessionKey: envelope.run.sessionKey,
+        turnId,
+        runId: envelope.run.runId,
+        parentRunId: envelope.run.parentRunId,
+        timestampMs: envelope.at,
+        reason: envelope.reasonCode,
+        message: envelope.reason,
+      });
+    }
+    restoredRuntimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
+      runtimeEvents: restoredRuntimeEvents,
+      sessionKey: envelope.run.sessionKey,
+      turnId,
+      runId: envelope.run.runId,
+      parentRunId: envelope.run.parentRunId,
+      timestampMs: envelope.at,
+      resultKind: envelope.resultKind,
+      summary: envelope.reason,
+    });
+    if (turnConclusions.length === 0) {
+      restoredRuntimeEvents = appendRuntimeEvent(
+        restoredRuntimeEvents,
+        withEventSchema({
+          type: "turn.completed",
+          threadId: envelope.run.sessionKey,
+          turnId,
+          timestampMs: envelope.at,
+          resultKind: envelope.resultKind,
+        }),
+      );
+    }
+    restoredRuntimeV2EmergencyTerminalEnvelopes = {
+      ...restoredRuntimeV2EmergencyTerminalEnvelopes,
+      [turnId]: envelope,
+    };
+  }
   const restoredMarkerRunId = getHarnessActionRunId(restoredHarnessRunMarker);
   const restoredMarkerRunConclusion = restoredMarkerRunId
     ? [...restoredRuntimeEvents].reverse().find((event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
@@ -4849,7 +5013,43 @@ export function normalizeSessionRuntimeSnapshot(
         closeReason: invalidatedActionReason,
       }
     : restoredHarnessRunMarker;
-  let reconciledRestoredActionRequest = restoredActionRequest;
+  const markerEmergencyTerminal = sanitizedHarnessRunMarker
+    ? Object.values(
+        restoredRuntimeV2EmergencyTerminalEnvelopes,
+      ).find((envelope) =>
+        envelope.owner.sessionKey ===
+          sanitizedHarnessRunMarker?.sessionKey &&
+        envelope.owner.turnId === sanitizedHarnessRunMarker?.turnId &&
+        envelope.run.runId ===
+          getHarnessActionRunId(sanitizedHarnessRunMarker)
+      ) || null
+    : null;
+  if (sanitizedHarnessRunMarker && markerEmergencyTerminal) {
+    sanitizedHarnessRunMarker = {
+      ...sanitizedHarnessRunMarker,
+      status: markerEmergencyTerminal.resultKind === "error"
+        ? "error"
+        : "completed",
+      terminalResultKind: markerEmergencyTerminal.resultKind,
+      updatedAt: Math.max(
+        sanitizedHarnessRunMarker.updatedAt,
+        markerEmergencyTerminal.at,
+      ),
+      closedAt: markerEmergencyTerminal.at,
+      closeReason: markerEmergencyTerminal.reasonCode,
+      lastStreamError: null,
+    };
+  }
+  let reconciledRestoredActionRequest = restoredActionRequest &&
+      Object.values(
+        restoredRuntimeV2EmergencyTerminalEnvelopes,
+      ).some((envelope) =>
+        envelope.owner.sessionKey === restoredActionRequest.sessionKey &&
+        envelope.owner.turnId === restoredActionRequest.turnId &&
+        envelope.run.runId === restoredActionRequest.runId
+      )
+    ? null
+    : restoredActionRequest;
   const invalidatedOwnerRequest = invalidatedActionRequest;
   const replacementPauseReason = invalidatedActionReason;
   const replacementPauseMessage = invalidatedActionMessage;
@@ -5048,6 +5248,20 @@ export function normalizeSessionRuntimeSnapshot(
         ? restoredProjectedRunConclusion.resultKind
         : sanitizedHarnessRunMarker.terminalResultKind || "blocked",
     }));
+  }
+  for (
+    const [turnId, envelope] of Object.entries(
+      restoredRuntimeV2EmergencyTerminalEnvelopes,
+    )
+  ) {
+    runtimeEvents = runtimeEvents.filter((event) =>
+      !(
+        event.type === "run.paused" &&
+        event.threadId === envelope.run.sessionKey &&
+        event.turnId === turnId &&
+        event.runId === envelope.run.runId
+      )
+    );
   }
   // A durable Turn conclusion is authoritative even when its Harness marker
   // was already cleared before a crash. Project every currently loaded Turn;
@@ -5659,9 +5873,6 @@ export function normalizeSessionRuntimeSnapshot(
           return ledger;
         })()
       : [];
-  const restoredWorkspaceKey = options && "workspacePath" in options
-    ? resolveSessionWorkspaceKey(options.workspacePath)
-    : undefined;
   const restoredSubagentClosureReceiptLedger = normalizeSubagentClosureReceiptLedger(
     snapshot.subagentClosureReceiptLedger,
     restoredWorkspaceKey || suppliedLifecycleSessionEpoch
@@ -5732,18 +5943,6 @@ export function normalizeSessionRuntimeSnapshot(
         reviewArtifactPaths[0] === canonicalArtifactPath;
     }),
   );
-  const restoredRuntimeV2Checkpoints = normalizeRuntimeV2CheckpointMap(
-    snapshot.runtimeV2Checkpoints,
-    {
-      ...(restoredWorkspaceKey ? { workspaceKey: restoredWorkspaceKey } : {}),
-      ...(suppliedLifecycleSessionEpoch
-        ? {
-            sessionKey: restoredLifecycleSessionKey,
-            sessionEpoch: suppliedLifecycleSessionEpoch,
-          }
-        : {}),
-    },
-  );
   const checkpointBackedActionRequest =
     reconciledRestoredActionRequest?.kind === "plan_review" &&
     !restoredTurnRuntimeCheckpoints[reconciledRestoredActionRequest.turnId]
@@ -5790,6 +5989,8 @@ export function normalizeSessionRuntimeSnapshot(
     activeActionRequest: checkpointBackedActionRequest,
     turnRuntimeCheckpoints: restoredTurnRuntimeCheckpoints,
     runtimeV2Checkpoints: restoredRuntimeV2Checkpoints,
+    runtimeV2EmergencyTerminalEnvelopes:
+      restoredRuntimeV2EmergencyTerminalEnvelopes,
     subagentClosureReceiptLedger: restoredSubagentClosureReceiptLedger,
     taskFlow,
     agentMessages,
@@ -5933,6 +6134,22 @@ export function sanitizeSessionRuntimeSnapshotForPersist(
           }
         : undefined,
     ),
+    runtimeV2EmergencyTerminalEnvelopes:
+      normalizeRuntimeV2EmergencyTerminalEnvelopeMap(
+        snapshot.runtimeV2EmergencyTerminalEnvelopes,
+        checkpointOwnerFence
+          ? {
+              ...(checkpointOwnerFence.expectedWorkspaceKey
+                ? {
+                    workspaceKey:
+                      checkpointOwnerFence.expectedWorkspaceKey,
+                  }
+                : {}),
+              sessionKey: checkpointOwnerFence.expectedSessionKey,
+              sessionEpoch: checkpointOwnerFence.expectedSessionEpoch,
+            }
+          : undefined,
+      ),
     subagentClosureReceiptLedger,
     taskFlow: sanitizeTaskBlocksForPersist(snapshot.taskFlow || []),
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
@@ -6053,6 +6270,7 @@ const sessionRuntimeKeys = [
   "activeActionRequest",
   "turnRuntimeCheckpoints",
   "runtimeV2Checkpoints",
+  "runtimeV2EmergencyTerminalEnvelopes",
   "subagentClosureReceiptLedger",
   "taskFlow",
   "agentMessages",
@@ -6337,6 +6555,23 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
           }
         : undefined,
     ) as RuntimeV2CheckpointMap,
+    runtimeV2EmergencyTerminalEnvelopes:
+      normalizeRuntimeV2EmergencyTerminalEnvelopeMap(
+        state.runtimeV2EmergencyTerminalEnvelopes,
+        checkpointWorkspaceKey || hasBoundPlanLifecycle
+          ? {
+              ...(checkpointWorkspaceKey
+                ? { workspaceKey: checkpointWorkspaceKey }
+                : {}),
+              ...(hasBoundPlanLifecycle
+                ? {
+                    sessionKey: planLifecycle.sessionKey,
+                    sessionEpoch: planLifecycle.sessionEpoch,
+                  }
+                : {}),
+            }
+          : undefined,
+      ),
     subagentClosureReceiptLedger,
     taskFlow: Array.isArray(state.taskFlow) ? archiveConsumedReplyOptionsFromTaskFlow(state.taskFlow) : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
@@ -7721,6 +7956,23 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
           }
         : undefined,
     ),
+    runtimeV2EmergencyTerminalEnvelopes:
+      normalizeRuntimeV2EmergencyTerminalEnvelopeMap(
+        state.runtimeV2EmergencyTerminalEnvelopes,
+        checkpointWorkspaceKey || hasBoundPlanLifecycle
+          ? {
+              ...(checkpointWorkspaceKey
+                ? { workspaceKey: checkpointWorkspaceKey }
+                : {}),
+              ...(hasBoundPlanLifecycle
+                ? {
+                    sessionKey: planLifecycle.sessionKey,
+                    sessionEpoch: planLifecycle.sessionEpoch,
+                  }
+                : {}),
+            }
+          : undefined,
+      ),
     subagentClosureReceiptLedger,
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
@@ -7813,6 +8065,7 @@ export function buildEmptySessionRuntimeSnapshot(
     activeActionRequest: null,
     turnRuntimeCheckpoints: {},
     runtimeV2Checkpoints: {},
+    runtimeV2EmergencyTerminalEnvelopes: {},
     subagentClosureReceiptLedger: null,
     taskFlow: [],
     agentMessages: [],
@@ -8796,6 +9049,8 @@ const goalContinuationAuthorizationBroker =
 // later A/B/C snapshot from overtaking an earlier one while still allowing
 // unrelated Sessions to persist independently.
 const workspaceInstructionAdmissionPipelines = new Map<string, Promise<void>>();
+const workspaceInstructionProjectionOwner =
+  createWorkspaceInstructionProjectionOwner();
 const workspaceInstructionAdmissionsByIdentity = new Map<
   string,
   Promise<WorkspaceInstructionAcceptance>
@@ -11079,31 +11334,61 @@ export const useAppStore = create<AppState>()(
   instructionLastLoadedAt: null,
   hookLastLoadedAt: null,
   sessionHookCache: [],
-  refreshInstructionAndHookState: async (associatedPaths = []) => {
+  refreshInstructionAndHookState: async (
+    associatedPaths = [],
+    options = {},
+  ) => {
     const state = get();
-    if (!state.currentWorkspace.trim()) {
-      set({
-        resolvedInstructionSet: null,
-        instructionSources: [],
-        loadedHookDefinitions: defaultHookDefinitions,
-        instructionLastLoadedAt: null,
-        hookLastLoadedAt: null,
-      });
-      return;
+    const requestedWorkspace = String(
+      options.workspace ?? state.currentWorkspace,
+    ).trim();
+    const shouldProjectToUi = options.projectToUi !== false &&
+      requestedWorkspace === state.currentWorkspace.trim();
+    const projectionLease = shouldProjectToUi
+      ? workspaceInstructionProjectionOwner.claim(requestedWorkspace)
+      : null;
+    if (!requestedWorkspace) {
+      if (
+        workspaceInstructionProjectionOwner.canCommit(
+          projectionLease,
+          get().currentWorkspace,
+        )
+      ) {
+        set({
+          resolvedInstructionSet: null,
+          instructionSources: [],
+          loadedHookDefinitions: defaultHookDefinitions,
+          instructionLastLoadedAt: null,
+          hookLastLoadedAt: null,
+        });
+      }
+      return null;
     }
 
     const [resolved, hooksConfig] = await Promise.all([
-      loadResolvedInstructions(state.currentWorkspace, state.skills, associatedPaths),
-      loadHooksConfig(state.currentWorkspace),
+      loadResolvedInstructions(
+        requestedWorkspace,
+        state.skills,
+        associatedPaths,
+      ),
+      loadHooksConfig(requestedWorkspace),
     ]);
 
-    set({
-      resolvedInstructionSet: resolved,
-      instructionSources: resolved.sources,
-      instructionLastLoadedAt: resolved.loadedAt,
-      loadedHookDefinitions: Object.values(hooksConfig.hooks).flat(),
-      hookLastLoadedAt: hooksConfig.loadedAt,
-    });
+    if (
+      workspaceInstructionProjectionOwner.canCommit(
+        projectionLease,
+        get().currentWorkspace,
+      )
+    ) {
+      set({
+        resolvedInstructionSet: resolved,
+        instructionSources: resolved.sources,
+        instructionLastLoadedAt: resolved.loadedAt,
+        loadedHookDefinitions: Object.values(hooksConfig.hooks).flat(),
+        hookLastLoadedAt: hooksConfig.loadedAt,
+      });
+    }
+    return resolved;
   },
   setResolvedInstructionSet: (resolved) =>
     set({
@@ -11252,6 +11537,7 @@ export const useAppStore = create<AppState>()(
     });
   },
   setCurrentWorkspace: (path: string) => {
+    workspaceInstructionProjectionOwner.invalidate();
     invalidateWorkspaceTreeCache();
     const normalizedPath = path.trim();
     if (!normalizedPath) {
@@ -12482,6 +12768,7 @@ export const useAppStore = create<AppState>()(
         activeActionRequest: null,
         turnRuntimeCheckpoints: {},
         runtimeV2Checkpoints: {},
+        runtimeV2EmergencyTerminalEnvelopes: {},
         subagentClosureReceiptLedger: null,
         pendingToolCall: null,
         executionConsentPolicy: "ask_per_turn",
@@ -12671,6 +12958,7 @@ export const useAppStore = create<AppState>()(
       activeActionRequest: null,
       turnRuntimeCheckpoints: {},
       runtimeV2Checkpoints: {},
+      runtimeV2EmergencyTerminalEnvelopes: {},
       subagentClosureReceiptLedger: null,
       pendingToolCall: null,
       pendingSlashCommand: null,
@@ -12747,6 +13035,7 @@ export const useAppStore = create<AppState>()(
   harnessRunMarker: null,
   turnRuntimeCheckpoints: {},
   runtimeV2Checkpoints: {},
+  runtimeV2EmergencyTerminalEnvelopes: {},
   subagentClosureReceiptLedger: null,
   setWorkflowMode: (mode) => set((s) => {
     const workflowMode = resolveWorkspaceAwareWorkflowMode(
@@ -17594,7 +17883,6 @@ export const useAppStore = create<AppState>()(
       pendingReviewTaskId: null,
       activeActionRequest: null,
       turnRuntimeCheckpoints: {},
-      runtimeV2Checkpoints: {},
       pendingToolCall: null,
       agentStatus: "running",
       isGenerating: true,
@@ -19592,6 +19880,14 @@ export const useAppStore = create<AppState>()(
       acquireHarnessRunMarker,
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
+      refreshWorkspaceContext: (workspace) =>
+        get().refreshInstructionAndHookState([
+          ...turnInputContextSignals.mentionedFilePaths,
+          ...turnInputContextSignals.attachedFilePaths,
+        ], {
+          workspace,
+          projectToUi: false,
+        }),
       nowMs,
       sendStartedAt,
       getLastTurnToolSummary,

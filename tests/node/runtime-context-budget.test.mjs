@@ -83,14 +83,58 @@ test("provider model metadata and loaded status define a real local capability",
         id: "Qwen3.6-35B-A3B-6bit",
         loaded: true,
         is_loading: false,
+        max_tokens: 4_096,
+        preserve_thinking_default: true,
       }],
     },
   });
 
   assert.deepEqual(capability, {
     providerContextLimit: 262_144,
+    providerOutputLimit: null,
     loaded: true,
+    preserveAssistantReasoning: true,
   });
+});
+
+test("only semantically explicit provider fields define a hard output limit", () => {
+  const capability = budget.parseOpenAiLocalModelCapability({
+    model: "bounded-output-model",
+    modelsPayload: {
+      data: [{
+        id: "bounded-output-model",
+        max_context_length: 65_536,
+        max_output_tokens: 8_192,
+      }],
+    },
+    statusPayload: {
+      models: [{
+        id: "bounded-output-model",
+        loaded: true,
+        max_tokens: 2_048,
+      }],
+    },
+  });
+
+  assert.equal(capability.providerOutputLimit, 8_192);
+});
+
+test("provider output metadata caps generation without shrinking the admitted input context", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    providerOutputLimit: 4_096,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+
+  assert.ok(resolved.contextLimit > 32_768);
+  assert.equal(resolved.outputBudget, 4_096);
+  assert.equal(
+    resolved.inputBudget,
+    resolved.contextLimit - 4_096,
+  );
+  assert.equal(resolved.providerOutputLimit, 4_096);
 });
 
 test("healthy memory can expand a loaded model above the configured fallback without exceeding provider capacity", () => {
@@ -189,6 +233,151 @@ test("runtime budget resolver uses authenticated provider facts and current memo
   assert.ok(requested.every((entry) => entry.authorizationPresent));
 });
 
+test("Ollama uses the loaded model's effective native context without guessing concurrency", async () => {
+  const requested = [];
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "ollama",
+      endpoint: "http://127.0.0.1:11434/v1",
+      model: "qwen3:30b",
+      apiKey: "",
+      contextLimit: 16_384,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 12,
+      total_bytes: 64 * GIB,
+      available_bytes: 12 * GIB,
+    }),
+    requestJson: async (url) => {
+      requested.push(url);
+      return {
+        models: [{
+          name: "qwen3:30b",
+          model: "qwen3:30b",
+          context_length: 65_536,
+        }],
+      };
+    },
+  });
+
+  assert.deepEqual(requested, [
+    "http://127.0.0.1:11434/api/ps",
+  ]);
+  assert.equal(resolved.providerContextLimit, 65_536);
+  assert.equal(resolved.contextLimit, 65_536);
+  assert.equal(resolved.source, "provider_and_memory");
+  assert.equal(resolved.providerOutputLimit, null);
+});
+
+test("an unloaded Ollama model keeps the configured context fallback", async () => {
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "Ollama",
+      endpoint: "http://127.0.0.1:11434/v1",
+      model: "qwen3:30b",
+      contextLimit: 24_576,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * GIB,
+      available_bytes: 24 * GIB,
+    }),
+    requestJson: async () => ({ models: [] }),
+  });
+
+  assert.equal(resolved.contextLimit, 24_576);
+  assert.equal(resolved.providerContextLimit, null);
+  assert.equal(resolved.source, "configured");
+});
+
+test("LM Studio uses the selected loaded instance's configured context", async () => {
+  const requested = [];
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "LM Studio",
+      endpoint: "http://127.0.0.1:1234/v1",
+      model: "qwen/qwen3-coder",
+      apiKey: "lm-token",
+      contextLimit: 16_384,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 12,
+      total_bytes: 64 * GIB,
+      available_bytes: 12 * GIB,
+    }),
+    requestJson: async (url, headers) => {
+      requested.push({
+        url,
+        authorizationPresent: Boolean(headers.authorization),
+      });
+      return {
+        models: [{
+          key: "qwen/qwen3-coder",
+          max_context_length: 131_072,
+          loaded_instances: [{
+            id: "qwen/qwen3-coder",
+            config: {
+              context_length: 65_536,
+            },
+          }],
+        }],
+      };
+    },
+  });
+
+  assert.deepEqual(requested, [{
+    url: "http://127.0.0.1:1234/api/v1/models",
+    authorizationPresent: true,
+  }]);
+  assert.equal(resolved.providerContextLimit, 65_536);
+  assert.equal(resolved.contextLimit, 65_536);
+  assert.equal(resolved.source, "provider_and_memory");
+  assert.equal(resolved.providerOutputLimit, null);
+});
+
+test("an unknown OpenAI-compatible provider keeps the configured fallback when loaded status is unavailable", async () => {
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "Custom Local",
+      endpoint: "http://127.0.0.1:9000/v1",
+      model: "custom-model",
+      contextLimit: 20_480,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * GIB,
+      available_bytes: 24 * GIB,
+    }),
+    requestJson: async (url) => {
+      if (url.endsWith("/models/status")) {
+        throw new Error("unsupported endpoint");
+      }
+      return {
+        data: [{
+          id: "custom-model",
+          max_context_length: 131_072,
+        }],
+      };
+    },
+  });
+
+  assert.equal(resolved.providerContextLimit, 131_072);
+  assert.equal(resolved.contextLimit, 20_480);
+  assert.equal(resolved.source, "configured");
+});
+
 test("cloud Runs keep provider-managed context and do not probe local capacity", async () => {
   let probes = 0;
   const resolved = await budget.resolveRuntimeContextBudget({
@@ -243,6 +432,7 @@ test("one resolved Run budget drives provider settings and read_file windows", (
     configuredContextLimit: 32_768,
     providerContextLimit: 262_144,
     modelLoaded: true,
+    preserveAssistantReasoning: true,
     availableMemoryBytes: 12 * GIB,
     reservedOutputTokens: 8_192,
   });
@@ -271,10 +461,50 @@ test("one resolved Run budget drives provider settings and read_file windows", (
     { path: "src/main.js", max_chars: 12_000 },
     resolved,
   );
+  const parallelBatch = executionText.runtimeV2ContextBoundToolArguments(
+    "read_file",
+    { path: "src/main.js" },
+    resolved,
+    { parallelReadCount: 3 },
+  );
 
   assert.equal(settings.contextLimit, resolved.contextLimit);
+  assert.equal(
+    settings.reasoningRequest,
+    "auto",
+    "Runtime v2 must preserve the local provider/model reasoning default",
+  );
+  assert.equal(settings.preserveAssistantReasoning, true);
+  assert.deepEqual(
+    providerSettings.deriveProviderAdapterCapabilities(settings),
+    {
+      nativeToolRoundTrip: true,
+      reasoningToggle: true,
+    },
+  );
+  assert.deepEqual(
+    providerSettings.deriveProviderAdapterCapabilities({
+      provider: "LM Studio",
+    }),
+    {
+      nativeToolRoundTrip: true,
+      reasoningToggle: false,
+    },
+  );
   assert.equal(args.max_chars, resolved.readWindowChars);
   assert.equal(explicitSmaller.max_chars, 12_000);
+  assert.equal(
+    parallelBatch.max_chars,
+    Math.floor(resolved.readWindowChars / 3),
+  );
+  assert.equal(
+    executionText.runtimeV2ParallelReadCount([
+      { name: "read_file" },
+      { name: "grep_search" },
+      { name: "read_file" },
+    ]),
+    2,
+  );
   assert.ok(args.max_chars > 32_000);
 });
 
@@ -304,7 +534,7 @@ test("Runtime v2 preserves a complete admitted read window instead of truncating
   assert.doesNotMatch(retained, /Runtime v2 truncated/);
 });
 
-test("native Runtime v2 responses use the Run output budget while text envelopes stay compact", () => {
+test("native and compatibility tool protocols share the Run output budget", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768,
     providerContextLimit: 262_144,
@@ -331,7 +561,7 @@ test("native Runtime v2 responses use the Run output budget while text envelopes
       true,
       resolved,
     ),
-    4_096,
+    resolved.outputBudget,
   );
 });
 

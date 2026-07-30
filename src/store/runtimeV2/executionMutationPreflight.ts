@@ -14,16 +14,13 @@ import type {
 import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
 import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
 import {
-  latestAcceptanceFailureSourceWindow,
-} from "./executionProviderContext";
-import {
-  recordToolModelContext,
+  recordToolResultHistory,
   toolCompletionFor,
 } from "./executionEvidence";
+import {
+  runtimeV2ProviderToolCallIdentity,
+} from "./providerToolSurface";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
-
-const MAX_MUTATION_LINES = 96;
-const MAX_CORRECTIVE_MUTATION_LINES = 48;
 
 type RuntimeV2MutationPreparation =
   | {
@@ -50,18 +47,11 @@ export async function prepareRuntimeV2Mutation(input: {
   readonly toolExecutionOptions: ToolExecutionOptions;
 }): Promise<RuntimeV2MutationPreparation> {
   const workspace = input.ports.context.runWorkspace || "";
-  const correctiveSource = latestAcceptanceFailureSourceWindow(
-    input.ports.live,
-    workspace,
-  );
   const preflight = await preflightWorkspaceMutation({
     toolName: input.toolName,
     args: input.args,
     language: input.ports.context.phaseLanguage,
     workspaceRoot: workspace,
-    maxTouchedLines: correctiveSource
-      ? MAX_CORRECTIVE_MUTATION_LINES
-      : MAX_MUTATION_LINES,
     readFile: async (path) => String(
       await executeRuntimeV2ToolWithDeadline({
         toolName: "read_file",
@@ -79,6 +69,11 @@ export async function prepareRuntimeV2Mutation(input: {
     checkSyntax: checkSourceSyntax,
   });
   if (!preflight.ok) {
+    const rejectedActionIdentity =
+      runtimeV2ProviderToolCallIdentity({
+        name: input.toolName,
+        arguments: input.args,
+      });
     const mismatchRange = preflight.patchRecoveryMismatch?.requestedRange;
     const mismatchPath =
       preflight.patchRecoveryMismatch?.target ||
@@ -94,11 +89,7 @@ export async function prepareRuntimeV2Mutation(input: {
             (mismatchRange.endLine || mismatchRange.startLine)
           ) / 2,
         )
-      : mutationRejected &&
-          correctiveSource &&
-          correctiveSource.path === mismatchPath
-        ? correctiveSource.failureLine
-        : null;
+      : null;
     const sourceRefreshHint =
       (sourceMismatch || mutationRejected) &&
         mismatchPath &&
@@ -110,7 +101,7 @@ export async function prepareRuntimeV2Mutation(input: {
         `MUTATION_PREFLIGHT_BLOCKED: ${preflight.reason || "invalid mutation"}`,
       sourceRefreshHint,
     ].filter(Boolean).join("\n");
-    recordToolModelContext({
+    recordToolResultHistory({
       ports: input.ports,
       command: input.command,
       toolName: input.toolName,
@@ -130,6 +121,7 @@ export async function prepareRuntimeV2Mutation(input: {
       mismatchStartLine: mismatchRange?.startLine || null,
       mismatchEndLine: mismatchRange?.endLine || null,
       message: preflight.message?.slice(0, 1_000) || null,
+      actionIdentity: rejectedActionIdentity,
     });
     return {
       allowed: false,

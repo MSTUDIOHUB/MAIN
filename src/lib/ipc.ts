@@ -141,11 +141,13 @@ function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): 
   }
 
   const runtimeSnapshot = {
-    ...(incomingRuntime || currentRuntime || {}),
+    ...(currentRuntime || {}),
+    ...(incomingRuntime || {}),
     taskFlow: messages,
     conversationTurns: turns,
   };
   return {
+    ...current,
     ...incoming,
     messages,
     messageCount: messages.length,
@@ -183,6 +185,9 @@ export interface ReadFileWindowResult {
   returnedChars: number;
   truncated: boolean;
   nextStartLine?: number | null;
+  returnedStartChar?: number | null;
+  returnedEndChar?: number | null;
+  nextStartChar?: number | null;
 }
 
 export interface OpenFileExternalResult {
@@ -392,6 +397,12 @@ export interface SourceSyntaxCheckResult {
   errorCount: number;
   firstErrorLine?: number | null;
   firstErrorColumn?: number | null;
+  errors?: Array<{
+    line: number;
+    column: number;
+    kind: string;
+  }>;
+  errorsTruncated?: boolean;
 }
 
 export interface SymbolOccurrence {
@@ -984,6 +995,7 @@ export function readFileWindow(
   endLine?: number,
   maxLines?: number,
   maxChars?: number,
+  startChar?: number,
 ): Promise<ReadFileWindowResult> {
   return invoke<ReadFileWindowResult>("read_file_window", {
     path,
@@ -992,6 +1004,7 @@ export function readFileWindow(
     endLine,
     maxLines,
     maxChars,
+    startChar,
   });
 }
 

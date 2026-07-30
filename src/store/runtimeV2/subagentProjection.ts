@@ -54,6 +54,19 @@ function hasSubagentActivity(
   );
 }
 
+function hasSubagentReceiptEvent(
+  events: readonly MainThreadEvent[],
+  type:
+    | "subagent.handoff_delivered"
+    | "subagent.handoff_applied",
+  receiptId: string,
+): boolean {
+  return events.some((event) =>
+    event.type === type &&
+    event.receiptId === receiptId
+  );
+}
+
 function runtimeV2SubagentClosure(input: {
   aggregate: TurnAggregateV1;
   job: TurnAggregateV1["subagents"][number];
@@ -204,6 +217,50 @@ export function reconcileRuntimeV2SubagentEvents(
         },
         activity,
       }));
+      continue;
+    }
+
+    if (
+      runtimeEvent.type === "subagent.handoff_delivered" ||
+      runtimeEvent.type === "subagent.handoff_applied"
+    ) {
+      const job = jobs.get(runtimeEvent.jobId);
+      if (
+        !job ||
+        hasSubagentReceiptEvent(
+          next,
+          runtimeEvent.type,
+          runtimeEvent.eventId,
+        )
+      ) {
+        continue;
+      }
+      next = appendRuntimeEvent(next, withEventSchema(
+        runtimeEvent.type === "subagent.handoff_delivered"
+          ? {
+              type: "subagent.handoff_delivered",
+              threadId: run.sessionKey,
+              turnId: run.turnId,
+              subagentId: job.id,
+              runId: job.run.runId,
+              parentRunId: job.parentRunId,
+              timestampMs: runtimeEvent.at,
+              receiptId: runtimeEvent.eventId,
+              evidenceIds: [...runtimeEvent.evidenceIds],
+            }
+          : {
+              type: "subagent.handoff_applied",
+              threadId: run.sessionKey,
+              turnId: run.turnId,
+              subagentId: job.id,
+              runId: job.run.runId,
+              parentRunId: job.parentRunId,
+              timestampMs: runtimeEvent.at,
+              receiptId: runtimeEvent.eventId,
+              sourceEventId: runtimeEvent.sourceEventId,
+              evidenceIds: [...runtimeEvent.evidenceIds],
+            },
+      ));
       continue;
     }
 

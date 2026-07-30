@@ -4,6 +4,9 @@ import type {
   RuntimeV2ProviderDiagnostic,
   RuntimeV2TransportVariant,
 } from "./contracts";
+import {
+  parseExplicitCompatibilityTokenToolCalls,
+} from "../textToolParser";
 
 export interface ProviderLaneProfileV1 {
   readonly schemaVersion: "provider-lane.v1";
@@ -32,7 +35,9 @@ export class RuntimeV2ProviderProtocolError extends Error {
 
   constructor(
     readonly code:
+      | "native_tools_unsupported"
       | "required_tool_missing"
+      | "output_truncated"
       | "tool_surface_rejected"
       | "tool_arguments_rejected"
       | "repeated_action_rejected",
@@ -40,6 +45,20 @@ export class RuntimeV2ProviderProtocolError extends Error {
   ) {
     super(message);
     this.name = "RuntimeV2ProviderProtocolError";
+  }
+}
+
+/**
+ * The production provider adapter raises this only when structured capability
+ * state proves that it has no compatible request candidate. It is not inferred
+ * from a request rejection, protocol drift, or retry count.
+ */
+export class RuntimeV2ProviderTransportsUnavailableError extends Error {
+  readonly runtimeV2FailureKind = "provider_transports_unavailable";
+
+  constructor(message = "RUNTIME_V2_PROVIDER_TRANSPORTS_UNAVAILABLE") {
+    super(message);
+    this.name = "RuntimeV2ProviderTransportsUnavailableError";
   }
 }
 
@@ -53,6 +72,59 @@ export function isRuntimeV2ProviderProtocolError(
       (error as { runtimeV2FailureKind?: unknown }).runtimeV2FailureKind ===
         "provider_protocol"
     );
+}
+
+export function isRuntimeV2ProviderTransportsUnavailableError(
+  error: unknown,
+): error is RuntimeV2ProviderTransportsUnavailableError {
+  return error instanceof RuntimeV2ProviderTransportsUnavailableError ||
+    (
+      !!error &&
+      typeof error === "object" &&
+      (error as { runtimeV2FailureKind?: unknown }).runtimeV2FailureKind ===
+        "provider_transports_unavailable"
+    );
+}
+
+/**
+ * Preserve a failure from a transport that was actually attempted. A timeout,
+ * reset, HTTP failure, or provider overload is a transient request fact; it
+ * does not prove that every compatible wire format is unavailable. Only an
+ * adapter with no compatible attempt at all may emit the hard capability
+ * boundary.
+ */
+export function runtimeV2ProviderAttemptFailure(
+  error: unknown,
+): Error {
+  if (error instanceof Error) return error;
+  if (error !== null && error !== undefined) {
+    return new Error(String(error));
+  }
+  const unknownFailure = new Error(
+    "RUNTIME_V2_PROVIDER_ATTEMPT_FAILED_UNKNOWN",
+  );
+  unknownFailure.name = "RuntimeV2ProviderAttemptError";
+  return unknownFailure;
+}
+
+/**
+ * A transport fallback is capability negotiation, not semantic recovery.
+ * When the provider returned a structured but invalid/rejected action, the
+ * active transport has already proved that it can express tool calls. Changing
+ * the wire format would only replay the same decision with less context.
+ */
+export function runtimeV2ProviderProtocolErrorAllowsTransportFallback(
+  error: unknown,
+  observation: {
+    readonly activeTransportProven?: boolean;
+  } = {},
+): boolean {
+  return isRuntimeV2ProviderProtocolError(error) &&
+    (
+      error.code === "native_tools_unsupported" ||
+      error.code === "required_tool_missing"
+    ) &&
+    observation.activeTransportProven !== true;
 }
 
 export interface ProviderWireToolCall {
@@ -254,6 +326,7 @@ function inspectExplicitTextToolEnvelope(
   const maxScanChars = 262_144;
   const hasExplicitPrefix =
     /<runtime-v2-tools>/.test(raw) ||
+    /<\|tool_call>/i.test(raw) ||
     /^```(?:json)?\s*/i.test(raw) ||
     raw.startsWith("{");
   if (raw.length > maxScanChars) {
@@ -265,6 +338,30 @@ function inspectExplicitTextToolEnvelope(
         retryable: true,
       },
     } : { calls: [] };
+  }
+  const compatibilityCalls =
+    parseExplicitCompatibilityTokenToolCalls(raw);
+  if (compatibilityCalls.length > 0) {
+    return {
+      calls: compatibilityCalls.map((call) => ({
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+      })),
+    };
+  }
+  if (/<\|tool_call>/i.test(raw)) {
+    return {
+      calls: [],
+      diagnostic: {
+        code: /<\|\/tool_call>/i.test(raw) || /}\s*$/.test(raw)
+          ? "explicit_tool_envelope_invalid_calls"
+          : "explicit_tool_envelope_incomplete",
+        message:
+          "The explicit compatibility tool marker contains no complete valid tool call.",
+        retryable: true,
+      },
+    };
   }
   const matches = Array.from(
     raw.matchAll(
@@ -368,23 +465,6 @@ export function parseExplicitTextToolEnvelope(value: unknown): RuntimeV2Normaliz
   return inspectExplicitTextToolEnvelope(value).calls;
 }
 
-export const RUNTIME_V2_PROVIDER_FALLBACK_RESERVE_MS = 30_000;
-
-/** Preserve part of the one-request deadline for a second supported protocol.
- * A hanging primary lane must not consume the fallback before it can start. */
-export function allocateProviderAttemptTimeoutMs(
-  remainingMs: number,
-  hasFallback: boolean,
-): number {
-  const remaining = Math.max(1, Math.floor(remainingMs));
-  if (!hasFallback) return remaining;
-  const reserve = Math.min(
-    RUNTIME_V2_PROVIDER_FALLBACK_RESERVE_MS,
-    Math.max(1, Math.floor(remaining / 2)),
-  );
-  return Math.max(1, remaining - reserve);
-}
-
 export function normalizeProviderResponseV1(input: ProviderWireResponse): RuntimeV2NormalizedProviderResult {
   const presentationText = input.visibleText ?? input.content;
   const visibleText = normalizeString(presentationText, 32_000);
@@ -450,7 +530,11 @@ export function selectNextProviderTransportAttempt(
     return { variant: next, toolChoice: "required", textEnvelope: false };
   }
   if (next === "native_auto") {
-    return { variant: next, toolChoice: "auto", textEnvelope: false };
+    // OpenAI-compatible APIs define omitted tool_choice as automatic
+    // selection. Omitting the optional field is more interoperable than
+    // forcing an explicit value on local servers while preserving the same
+    // observable agent-loop semantics.
+    return { variant: next, toolChoice: null, textEnvelope: false };
   }
   return { variant: next, toolChoice: null, textEnvelope: true };
 }

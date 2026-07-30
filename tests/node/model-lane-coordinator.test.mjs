@@ -34,16 +34,55 @@ function loadTs(sourcePath) {
 }
 
 const lanes = loadTs(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
+const appConfig = loadTs(path.join(workspaceRoot, "src/lib/appConfig.ts"));
 
-function localConfig() {
+function localConfig(maxActiveRequests) {
   return {
     activeProfile: "local",
-    local: { provider: "OMLX", endpoint: "http://127.0.0.1:8000/v1", model: "qwen" },
+    local: {
+      provider: "local-provider",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "fixture-model",
+      ...(maxActiveRequests ? { maxActiveRequests } : {}),
+    },
     cloud: {},
     cloudServers: [],
     activeCloudServerId: "",
   };
 }
+
+test("lane identity canonicalizes endpoint routing without retaining credentials", () => {
+  const withSecrets = localConfig();
+  withSecrets.local.endpoint =
+    "HTTP://user:super-secret@127.0.0.1:8000/v1/?api_key=also-secret#fragment";
+  const canonical = localConfig();
+  canonical.local.endpoint = "http://127.0.0.1:8000/v1";
+
+  const secretKey = appConfig.resolveRuntimeLaneKey(withSecrets);
+  assert.equal(secretKey, appConfig.resolveRuntimeLaneKey(canonical));
+  assert.doesNotMatch(secretKey, /super-secret|also-secret|user/i);
+});
+
+test("unknown lanes expose one empirical child probe while configured capacity reserves the parent", () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const unknown = lanes.getModelLaneCapacityObservation(localConfig());
+  assert.equal(unknown.configured, false);
+  assert.equal(unknown.maxActiveRequests, 2);
+  assert.equal(unknown.maxActiveSubagents, 1);
+
+  const configured =
+    lanes.getModelLaneCapacityObservation(localConfig(4));
+  assert.equal(configured.configured, true);
+  assert.equal(configured.maxActiveRequests, 4);
+  assert.equal(configured.maxActiveSubagents, 3);
+
+  const oversized =
+    lanes.getModelLaneCapacityObservation(localConfig(99));
+  assert.equal(oversized.configured, true);
+  assert.equal(oversized.requestLimitCeiling, 4);
+  assert.equal(oversized.maxActiveRequests, 4);
+  assert.equal(oversized.maxActiveSubagents, 3);
+});
 
 test("local parent and two child model requests overlap after cold-start admission", async () => {
   lanes.resetModelLaneCoordinatorForTests();
@@ -89,11 +128,16 @@ test("local parent and two child model requests overlap after cold-start admissi
   const firstChild = await firstChildPromise;
   firstChild.markFirstToken();
   const secondChild = await secondChildPromise;
+  secondChild.markFirstToken();
   assert.equal(admittedChildren, 2);
+  const observed =
+    lanes.getModelLaneCapacityObservation(localConfig());
+  assert.equal(observed.maxConfirmedActiveRequests, 3);
+  assert.equal(observed.maxActiveSubagents, 3);
   assert.ok(events.some((entry) =>
     entry.event === "model_lane_admission" &&
     entry.data.activeRequests === 3 &&
-    entry.data.limit === 4
+    entry.data.limit === 3
   ));
   assert.ok(events.some((entry) =>
     entry.event === "model_lane_admission" &&
@@ -227,7 +271,7 @@ test("critical admission pressure rejects the child while preserving the parent"
   parent.release();
 });
 
-for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "524 gateway timeout"]) {
+for (const failureMessage of ["OOM", "429 rate limited", "concurrency limit reached"]) {
   test(`capacity failure '${failureMessage}' hands the newest child back before the parent`, async () => {
     lanes.resetModelLaneCoordinatorForTests();
     lanes.setModelLaneMemoryReaderForTests(async () => ({
@@ -268,3 +312,58 @@ for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "52
     parent.release();
   });
 }
+
+test("transport and semantic timeouts do not falsely degrade provider capacity", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    contextLimit: 32768,
+    agentKind: "parent",
+  });
+  for (const message of [
+    "connection reset",
+    "524 gateway timeout",
+    "STREAM_NO_VISIBLE_PROGRESS_TIMEOUT",
+  ]) {
+    assert.equal(parent.reportFailure(new Error(message)), false);
+  }
+  parent.release();
+});
+
+test("a transient memory probe failure recovers without restarting the lane", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  let attempts = 0;
+  lanes.setModelLaneMemoryReaderForTests(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("temporary probe failure");
+    return {
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * 1024 ** 3,
+      available_bytes: 24 * 1024 ** 3,
+    };
+  });
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "parent",
+  });
+  parent.markFirstToken();
+  assert.equal(
+    await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000),
+    false,
+  );
+  assert.equal(
+    lanes.getModelLaneBurstAdmission(parent.laneKey).reason,
+    "memory_probe_unavailable",
+  );
+  assert.equal(
+    await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000),
+    true,
+  );
+  assert.notEqual(
+    lanes.getModelLaneBurstAdmission(parent.laneKey).reason,
+    "memory_probe_unavailable",
+  );
+  parent.release();
+});

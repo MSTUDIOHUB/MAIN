@@ -36,12 +36,16 @@ export interface RuntimeContextBudget {
     | "memory"
     | "provider_and_memory";
   readonly providerContextLimit: number | null;
+  readonly providerOutputLimit: number | null;
+  readonly preserveAssistantReasoning: boolean | null;
   readonly availableMemoryBytes: number | null;
 }
 
 export interface OpenAiLocalModelCapability {
   readonly providerContextLimit: number | null;
+  readonly providerOutputLimit: number | null;
   readonly loaded: boolean | null;
+  readonly preserveAssistantReasoning: boolean | null;
 }
 
 interface RuntimeContextConfigLike {
@@ -96,6 +100,29 @@ function contextLimitFromModelRecord(
   return null;
 }
 
+function outputLimitFromModelRecord(
+  value: unknown,
+): number | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const field of [
+    "max_output_tokens",
+    "max_completion_tokens",
+    "maxOutputTokens",
+  ]) {
+    const number = Number(record[field]);
+    if (Number.isFinite(number) && number > 0) {
+      return Math.min(
+        MAX_DISCOVERED_CONTEXT_TOKENS,
+        Math.floor(number),
+      );
+    }
+  }
+  return null;
+}
+
 export function parseOpenAiLocalModelCapability(input: {
   readonly model: string;
   readonly modelsPayload: unknown;
@@ -128,10 +155,20 @@ export function parseOpenAiLocalModelCapability(input: {
   const loaded = statusRecord
     ? statusRecord.loaded === true && statusRecord.is_loading !== true
     : null;
+  const preserveAssistantReasoning =
+    typeof statusRecord?.preserve_thinking_default === "boolean"
+      ? statusRecord.preserve_thinking_default
+      : typeof statusRecord?.preserve_reasoning === "boolean"
+        ? statusRecord.preserve_reasoning
+        : null;
 
   return {
     providerContextLimit: contextLimitFromModelRecord(modelRecord),
+    providerOutputLimit:
+      outputLimitFromModelRecord(statusRecord) ||
+      outputLimitFromModelRecord(modelRecord),
     loaded,
+    preserveAssistantReasoning,
   };
 }
 
@@ -177,7 +214,9 @@ function readWindowCharsForInputBudget(inputBudget: number): number {
 export function computeRuntimeContextBudget(input: {
   readonly configuredContextLimit: number;
   readonly providerContextLimit: number | null;
+  readonly providerOutputLimit?: number | null;
   readonly modelLoaded: boolean | null;
+  readonly preserveAssistantReasoning?: boolean | null;
   readonly availableMemoryBytes: number | null;
   readonly reservedOutputTokens?: number;
 }): RuntimeContextBudget {
@@ -203,10 +242,16 @@ export function computeRuntimeContextBudget(input: {
         capabilityLimit,
         memoryContextCapacity(availableMemoryBytes),
       );
-  const budgets = computeContextBudgets(
-    contextLimit,
-    input.reservedOutputTokens,
-  );
+  const providerOutputLimit = outputLimitFromModelRecord({
+    max_output_tokens: input.providerOutputLimit,
+  });
+  const requestedOutputBudget =
+    input.reservedOutputTokens === undefined
+      ? providerOutputLimit ?? undefined
+      : providerOutputLimit === null
+        ? input.reservedOutputTokens
+        : Math.min(input.reservedOutputTokens, providerOutputLimit);
+  const budgets = computeContextBudgets(contextLimit, requestedOutputBudget);
   const source = canUseProviderCapacity
     ? "provider_and_memory"
     : contextLimit < configured
@@ -220,6 +265,11 @@ export function computeRuntimeContextBudget(input: {
     readWindowChars: readWindowCharsForInputBudget(budgets.inputBudget),
     source,
     providerContextLimit,
+    providerOutputLimit,
+    preserveAssistantReasoning:
+      typeof input.preserveAssistantReasoning === "boolean"
+        ? input.preserveAssistantReasoning
+        : null,
     availableMemoryBytes,
   };
 }
@@ -314,6 +364,31 @@ function normalizedOpenAiBase(endpoint: string): string {
   return /\/v1$/i.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
+function normalizedNativeProviderBase(endpoint: string): string {
+  return endpoint.trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(?:api\/chat|api\/v1|v1)$/i, "");
+}
+
+function emptyLocalModelCapability(
+  loaded: boolean | null = null,
+): OpenAiLocalModelCapability {
+  return {
+    providerContextLimit: null,
+    providerOutputLimit: null,
+    loaded,
+    preserveAssistantReasoning: null,
+  };
+}
+
+function authorizationHeaders(
+  apiKey: string,
+): Record<string, string> {
+  return apiKey
+    ? { authorization: `Bearer ${apiKey}` }
+    : {};
+}
+
 async function defaultRequestJson(
   url: string,
   headers: Record<string, string>,
@@ -337,17 +412,15 @@ async function readOpenAiLocalCapability(input: {
 }): Promise<OpenAiLocalModelCapability> {
   const base = normalizedOpenAiBase(input.endpoint);
   if (!base || !input.model) {
-    return { providerContextLimit: null, loaded: null };
+    return emptyLocalModelCapability();
   }
-  const headers: Record<string, string> = input.apiKey
-    ? { authorization: `Bearer ${input.apiKey}` }
-    : {};
+  const headers = authorizationHeaders(input.apiKey);
   const [models, status] = await Promise.allSettled([
     input.requestJson(`${base}/models`, headers),
     input.requestJson(`${base}/models/status`, headers),
   ]);
   if (models.status !== "fulfilled") {
-    return { providerContextLimit: null, loaded: null };
+    return emptyLocalModelCapability();
   }
   return parseOpenAiLocalModelCapability({
     model: input.model,
@@ -356,6 +429,132 @@ async function readOpenAiLocalCapability(input: {
       ? { statusPayload: status.value }
       : {}),
   });
+}
+
+async function readOllamaLocalCapability(input: {
+  readonly endpoint: string;
+  readonly model: string;
+  readonly apiKey: string;
+  readonly requestJson: NonNullable<
+    RuntimeContextBudgetDependencies["requestJson"]
+  >;
+}): Promise<OpenAiLocalModelCapability> {
+  const base = normalizedNativeProviderBase(input.endpoint);
+  if (!base || !input.model) return emptyLocalModelCapability();
+  try {
+    const payload = await input.requestJson(
+      `${base}/api/ps`,
+      authorizationHeaders(input.apiKey),
+    );
+    const records =
+      payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as { models?: unknown }).models)
+        ? (payload as { models: unknown[] }).models
+        : [];
+    const expectedModel = modelId(input.model);
+    const loadedRecord = records.find((candidate) => {
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+      ) return false;
+      const record = candidate as Record<string, unknown>;
+      return modelId(record.model) === expectedModel ||
+        modelId(record.name) === expectedModel;
+    });
+    if (!loadedRecord) return emptyLocalModelCapability(false);
+    return {
+      providerContextLimit:
+        contextLimitFromModelRecord(loadedRecord),
+      providerOutputLimit: null,
+      loaded: true,
+      preserveAssistantReasoning: null,
+    };
+  } catch {
+    return emptyLocalModelCapability();
+  }
+}
+
+async function readLmStudioLocalCapability(input: {
+  readonly endpoint: string;
+  readonly model: string;
+  readonly apiKey: string;
+  readonly requestJson: NonNullable<
+    RuntimeContextBudgetDependencies["requestJson"]
+  >;
+}): Promise<OpenAiLocalModelCapability> {
+  const base = normalizedNativeProviderBase(input.endpoint);
+  if (!base || !input.model) return emptyLocalModelCapability();
+  try {
+    const payload = await input.requestJson(
+      `${base}/api/v1/models`,
+      authorizationHeaders(input.apiKey),
+    );
+    const records =
+      payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as { models?: unknown }).models)
+        ? (payload as { models: unknown[] }).models
+        : [];
+    const expectedModel = modelId(input.model);
+    let selectedRecord: Record<string, unknown> | null = null;
+    let selectedInstance: Record<string, unknown> | null = null;
+    for (const candidate of records) {
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+      ) continue;
+      const record = candidate as Record<string, unknown>;
+      const instances = Array.isArray(record.loaded_instances)
+        ? record.loaded_instances.filter(
+            (instance): instance is Record<string, unknown> =>
+              !!instance &&
+              typeof instance === "object" &&
+              !Array.isArray(instance),
+          )
+        : [];
+      const exactInstance = instances.find((instance) =>
+        modelId(instance.id) === expectedModel
+      ) || null;
+      if (
+        modelId(record.key) !== expectedModel &&
+        !exactInstance
+      ) continue;
+      selectedRecord = record;
+      selectedInstance = exactInstance || instances[0] || null;
+      break;
+    }
+    if (!selectedRecord) return emptyLocalModelCapability(false);
+    const instanceConfig =
+      selectedInstance?.config &&
+        typeof selectedInstance.config === "object" &&
+        !Array.isArray(selectedInstance.config)
+        ? selectedInstance.config
+        : null;
+    return {
+      providerContextLimit:
+        contextLimitFromModelRecord(instanceConfig),
+      providerOutputLimit: null,
+      loaded: selectedInstance !== null,
+      preserveAssistantReasoning: null,
+    };
+  } catch {
+    return emptyLocalModelCapability();
+  }
+}
+
+function localProviderCapabilityReader(
+  provider: unknown,
+): typeof readOpenAiLocalCapability {
+  const normalized = String(provider || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  if (normalized === "ollama") return readOllamaLocalCapability;
+  if (normalized === "lmstudio") return readLmStudioLocalCapability;
+  return readOpenAiLocalCapability;
 }
 
 /**
@@ -385,9 +584,10 @@ export async function resolveRuntimeContextBudget(
   }
   const getMemory = dependencies.getSystemMemory || getSystemMemory;
   const requestJson = dependencies.requestJson || defaultRequestJson;
+  const readCapability = localProviderCapabilityReader(local.provider);
   const [memory, capability] = await Promise.allSettled([
     getMemory(),
-    readOpenAiLocalCapability({
+    readCapability({
       endpoint,
       model,
       apiKey: String(local.apiKey || ""),
@@ -401,12 +601,20 @@ export async function resolveRuntimeContextBudget(
     : null;
   const modelCapability = capability.status === "fulfilled"
     ? capability.value
-    : { providerContextLimit: null, loaded: null };
+    : {
+        providerContextLimit: null,
+        providerOutputLimit: null,
+        loaded: null,
+        preserveAssistantReasoning: null,
+      };
 
   return computeRuntimeContextBudget({
     configuredContextLimit,
     providerContextLimit: modelCapability.providerContextLimit,
+    providerOutputLimit: modelCapability.providerOutputLimit,
     modelLoaded: modelCapability.loaded,
+    preserveAssistantReasoning:
+      modelCapability.preserveAssistantReasoning,
     availableMemoryBytes,
   });
 }

@@ -298,7 +298,7 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
   return state?.conversationTurns?.find((turn: ConversationTurn) => turn.id === turnId) || null;
 }
 
-function identities(
+export function buildRuntimeV2ChatIdentities(
   state: any,
   context: RuntimeV2SubmissionContext,
   turn: ConversationTurn,
@@ -310,7 +310,7 @@ function identities(
     : `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
   return {
     turn: {
-      workspaceKey: String(context.runWorkspace || "global").trim() || "global",
+      workspaceKey: String(context.runScopeKey).trim(),
       sessionKey: context.runSessionKey,
       sessionEpoch,
       clientSubmissionId: String(turn.clientSubmissionId || turn.id).trim(),
@@ -363,7 +363,7 @@ export async function runSubmitRuntimeV2Chat(
   const initialState = input.get();
   const turn = currentTurn(initialState, input.context.turnId);
   if (!turn) throw new Error(`RUNTIME_V2_CHAT_TURN_MISSING:${input.context.turnId}`);
-  const identity = identities(initialState, input.context, turn);
+  const identity = buildRuntimeV2ChatIdentities(initialState, input.context, turn);
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
   if (existing && existing.aggregate.run?.identity.runId !== identity.run.runId) {
     input.logStoreEvent("runtime_v2_chat_stale_checkpoint_quarantined", {

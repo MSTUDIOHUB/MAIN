@@ -104,7 +104,7 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
     '[1785135800.725] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","reason":"finite_validation_contract_required"}',
     '[1785135800.730] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_tool","toolName":"replace_in_file","reason":"mutation_target_lease_mismatch"}',
     '[1785135800.750] [info] [store.runtime_v2_tool_execution_completed] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","validationPassed":true}',
-    '[1785135800.800] [info] [store.runtime_v2_execute_terminal] {"turnId":"turn-v2","runId":"run-v2","resultKind":"success","reason":"validated","mutations":1,"contractCoverageComplete":false,"staticOnlyBehavioralCriterionIds":["criterion-visible-behavior"]}',
+    '[1785135800.800] [info] [store.runtime_v2_execute_terminal] {"turnId":"turn-v2","runId":"run-v2","resultKind":"success","reason":"validated","mutations":1,"verificationComplete":true,"staticOnlyBehavioralCriterionIds":["criterion-visible-behavior"]}',
   ].join("\n"));
 
   const report = analyzeAgentRuntimeEvents(events);
@@ -154,9 +154,9 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.runs[0].terminalResultKind, "success");
   assert.deepEqual(report.runs[0].warnings, [
     "completed_subagent_without_structured_report",
-    "success_without_execution_contract_coverage",
     "protocol_drift_caused_action_terminal",
     "static_validation_claims_behavior_coverage",
+    "safe_read_batch_discarded",
   ]);
   assert.deepEqual(report.runs[0].phaseTransitions, { "observing->acting": 1 });
   assert.deepEqual(report.runs[0].projections, { "capsule_live:projected": 1 });
@@ -178,88 +178,10 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.aggregate.totalWarnings, 4);
   assert.deepEqual(report.aggregate.warningCounts, {
     completed_subagent_without_structured_report: 1,
-    success_without_execution_contract_coverage: 1,
     protocol_drift_caused_action_terminal: 1,
     static_validation_claims_behavior_coverage: 1,
+    safe_read_batch_discarded: 1,
   });
-});
-
-test("the three-run MD Viewer incident replay rejects both false successes and the action terminal", () => {
-  const lines = [];
-  const appendRun = ({
-    ordinal,
-    resultKind,
-    contractCoverageComplete,
-    protocolDrift = false,
-  }) => {
-    const runId = `incident-run-${ordinal}`;
-    const turnId = `incident-turn-${ordinal}`;
-    const timestamp = 1_785_208_000 + ordinal * 100;
-    lines.push(
-      `[${timestamp}.000] [info] [store.runtime_v2_execute_admitted] {"turnId":"${turnId}","runId":"${runId}","strategy":"execute"}`,
-      `[${timestamp}.100] [info] [store.runtime_v2_subagent_request_opened] {"turnId":"${turnId}","runId":"${runId}","jobId":"child-${ordinal}"}`,
-      `[${timestamp}.200] [info] [store.runtime_v2_subagent_joined] {"turnId":"${turnId}","runId":"${runId}","jobId":"child-${ordinal}","status":"completed","structuredReport":false}`,
-    );
-    if (protocolDrift) {
-      lines.push(
-        `[${timestamp}.300] [warn] [store.runtime_v2_provider_protocol_failed] {"turnId":"${turnId}","runId":"${runId}","protocolCode":"tool_surface_rejected"}`,
-        `[${timestamp}.400] [warn] [store.runtime_v2_ledger_committed] {"turnId":"${turnId}","runId":"${runId}","eventType":"recovery.exhausted"}`,
-      );
-    } else {
-      lines.push(
-        `[${timestamp}.300] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"apply_patch","target":"src/main.js"}`,
-        `[${timestamp}.400] [info] [store.runtime_v2_tool_execution_completed] {"turnId":"${turnId}","runId":"${runId}","commandKind":"execute_validation","toolName":"run_command","validationPassed":true}`,
-      );
-    }
-    lines.push(
-      `[${timestamp}.500] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"${resultKind}","mutations":${protocolDrift ? 0 : 1},"contractCoverageComplete":${contractCoverageComplete}}`,
-    );
-  };
-  appendRun({
-    ordinal: 1,
-    resultKind: "success",
-    contractCoverageComplete: false,
-  });
-  appendRun({
-    ordinal: 2,
-    resultKind: "error",
-    contractCoverageComplete: false,
-    protocolDrift: true,
-  });
-  appendRun({
-    ordinal: 3,
-    resultKind: "success",
-    contractCoverageComplete: false,
-  });
-
-  const report = analyzeAgentRuntimeEvents(
-    parseAgentRuntimeLog(lines.join("\n")),
-  );
-  assert.deepEqual(
-    report.runs.map((run) => run.terminalResultKind),
-    ["success", "error", "success"],
-  );
-  assert.deepEqual(report.aggregate.warningCounts, {
-    completed_subagent_without_structured_report: 3,
-    subagent_started_without_parent_context_handoff: 3,
-    success_without_execution_contract_coverage: 2,
-    protocol_drift_caused_action_terminal: 1,
-  });
-  assert.ok(
-    report.runs[0].warnings.includes(
-      "success_without_execution_contract_coverage",
-    ),
-  );
-  assert.ok(
-    report.runs[1].warnings.includes(
-      "protocol_drift_caused_action_terminal",
-    ),
-  );
-  assert.ok(
-    report.runs[2].warnings.includes(
-      "success_without_execution_contract_coverage",
-    ),
-  );
 });
 
 test("latest child handoff incident detects discarded work and false transport exhaustion", () => {
@@ -275,7 +197,7 @@ test("latest child handoff incident detects discarded work and false transport e
     `[1785215725.000] [info] [store.runtime_v2_subagent_provider_result] {"turnId":"${turnId}","runId":"${childRunId}","jobId":"runtime-v2-child:ms47dtia:82","toolName":"grep_search"}`,
     `[1785215726.000] [info] [store.runtime_v2_subagent_joined] {"turnId":"${turnId}","runId":"${runId}","jobId":"runtime-v2-child:ms47dtia:82","status":"failed","structuredReport":false,"evidenceTargets":[]}`,
     `[1785215727.000] [info] [store.runtime_v2_ledger_committed] {"turnId":"${turnId}","runId":"${runId}","eventType":"recovery.exhausted","recoveryScope":"transport"}`,
-    `[1785215728.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","reason":"provider_transport_exhausted","mutations":0,"contractCoverageComplete":false}`,
+    `[1785215728.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","reason":"provider_transport_exhausted","mutations":0,"verificationComplete":false}`,
   ].join("\n")));
   const parent = report.runs.find((run) => run.runId === runId);
 
@@ -287,5 +209,40 @@ test("latest child handoff incident detects discarded work and false transport e
     "failed_subagent_discarded_tool_evidence",
     "parent_did_not_resume_after_subagent_failure",
     "non_provider_failure_marked_transport_exhaustion",
+  ]);
+});
+
+test("latest no-mutation replay identifies discarded safe reads and provider livelock", () => {
+  const turnId = "turn-latest-no-mutation";
+  const runId = "run-latest-no-mutation";
+  const lines = [
+    `[1785314679.000] [info] [store.runtime_v2_execute_admitted] {"turnId":"${turnId}","runId":"${runId}","strategy":"execute"}`,
+    `[1785314680.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","transport":"native_required"}`,
+    `[1785314681.000] [info] [store.runtime_v2_provider_tool_batch_normalized] {"turnId":"${turnId}","runId":"${runId}","acceptedToolName":"read_file","discardedToolNames":["read_file","get_file_outline"]}`,
+    `[1785314682.000] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","approximateMessageChars":105000}`,
+  ];
+  for (let index = 0; index < 4; index += 1) {
+    lines.push(
+      `[17853146${83 + index}.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","transport":"native_required"}`,
+      `[17853146${83 + index}.500] [warn] [store.runtime_v2_provider_protocol_failed] {"turnId":"${turnId}","runId":"${runId}","protocolCode":"repeated_action_rejected","transportFallbackAllowed":true}`,
+      `[17853146${83 + index}.700] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","approximateMessageChars":105000}`,
+    );
+  }
+  lines.push(
+    `[1785314690.000] [warn] [store.runtime_v2_provider_transport_failed] {"turnId":"${turnId}","runId":"${runId}","error":"RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT"}`,
+    `[1785314691.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","mutations":0,"verificationComplete":false}`,
+  );
+
+  const report = analyzeAgentRuntimeEvents(
+    parseAgentRuntimeLog(lines.join("\n")),
+  );
+  const run = report.runs[0];
+
+  assert.equal(run.providerRequestTimeouts, 1);
+  assert.equal(run.maxStrategyPivotRevision, 0);
+  assert.deepEqual(run.warnings, [
+    "safe_read_batch_discarded",
+    "semantic_protocol_used_transport_fallback",
+    "provider_livelock_without_strategy_pivot",
   ]);
 });

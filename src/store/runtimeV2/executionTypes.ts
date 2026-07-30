@@ -7,24 +7,16 @@ import type {
 import type { ToolCatalog } from "../../lib/toolCatalog";
 import {
   type ProviderLaneProfileV1,
+  type RuntimeV2TransportVariant,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2SubagentJob,
   type RuntimeV2SubagentReportV1,
-  type RuntimeV2SubagentValidationReceiptV1,
   type RuntimeV2EvidenceReference,
 } from "../../lib/runtime-v2";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 
 export type StoreGet = () => any;
-
-export interface RuntimeV2ModelContextEntry {
-  readonly id: string;
-  readonly source: "workspace" | "tool" | "subagent" | "provider" | "plan";
-  readonly label: string;
-  readonly target: string;
-  readonly status: "succeeded" | "failed" | "blocked";
-  readonly content: string;
-}
+export type StoreSet = (patchOrUpdater: any) => void;
 
 export interface RuntimeV2ExecutionAuthorization {
   readonly toolDefinitions: readonly ToolDefinition[];
@@ -38,32 +30,73 @@ export interface RuntimeV2ChildResult {
   readonly status: "completed" | "degraded" | "failed" | "canceled";
   readonly summary: string;
   readonly report: RuntimeV2SubagentReportV1 | null;
+  /** Versioned parent evidence delivered to a review child. This remains
+   * provenance-only and is never counted as evidence produced by the child. */
+  readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
   readonly evidence: readonly RuntimeV2EvidenceReference[];
-  readonly validationReceipts:
-    readonly RuntimeV2SubagentValidationReceiptV1[];
+}
+
+export interface RuntimeV2MaterializedSourceWindow {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly content: string;
+}
+
+export interface RuntimeV2MaterializedSourceCoverage {
+  readonly target: string;
+  readonly version: string;
+  readonly totalLines: number;
+  readonly windows: readonly RuntimeV2MaterializedSourceWindow[];
+  readonly complete: boolean;
 }
 
 export interface RuntimeV2LiveExecutionState {
   readonly messages: AgentMessage[];
-  readonly modelContext: RuntimeV2ModelContextEntry[];
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
   readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
   readonly coveredReadToolResults: Map<string, string | null>;
-  /** Exact semantic actions rejected at the current mutation boundary.
-   * The tool remains available; only the same tool+arguments tuple is
-   * ineligible until a successful workspace mutation opens a new boundary. */
-  readonly rejectedProviderActions: Map<string, string>;
-  workspaceOverview: string;
+  readonly parallelReadCountByToolCallId: Map<string, number>;
+  /** Exact source that survived final request bounding for the most recent
+   * provider attempt. It is process-local and is never checkpoint authority. */
+  latestProviderRequestSourceCoverage:
+    readonly RuntimeV2MaterializedSourceCoverage[];
+  /** Request-scoped source authority copied only onto mutation calls returned
+   * by that exact provider request. */
+  readonly mutationSourceCoverageByToolCallId: Map<
+    string,
+    readonly RuntimeV2MaterializedSourceCoverage[]
+  >;
   evidenceCounter: number;
   latestProviderResult: RuntimeV2NormalizedProviderResult | null;
   latestVisibleText: string;
+  /** Provider-private reasoning continuity for one native tool turn. This is
+   * process-local, never projected, logged, or checkpointed. */
+  latestProviderAssistantReasoning: {
+    readonly content: string;
+    readonly field: "reasoning_content" | "reasoning";
+  } | null;
+  /** Process-local truth used only if persisting the mutation completion
+   * itself fails. The normal completion event remains the durable authority. */
+  hasExecutedMutationEffect: boolean;
   providerLaneProfile: ProviderLaneProfileV1 | null;
+  /** Run-local observations of transports that actually returned at least
+   * one structured call. A later no-call response is semantic drift, not a
+   * reason to renegotiate an already proven wire format. */
+  readonly provenStructuredToolTransports: Set<RuntimeV2TransportVariant>;
   authorization: RuntimeV2ExecutionAuthorization | null;
+  /** A user-denied exact permission request is a lifecycle boundary, not a
+   * provider/tool error. The owning runner consumes this fact into one
+   * canonical blocked terminal without exposing transport diagnostics. */
+  permissionRejection: {
+    readonly reason: string;
+    readonly finalMarkdown: string;
+  } | null;
 }
 
 export interface RuntimeV2ExecutionPortsInput {
   readonly get: StoreGet;
+  readonly set?: StoreSet;
   readonly context: RuntimeV2SubmissionContext;
   readonly live: RuntimeV2LiveExecutionState;
   readonly nextId: (scope: string) => string;
@@ -76,17 +109,21 @@ export interface RuntimeV2ExecutionPortsInput {
 export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState {
   return {
     messages: [],
-    modelContext: [],
     childRuns: new Map(),
     childAbortControllers: new Map(),
     childTelemetry: new Map(),
     coveredReadToolResults: new Map(),
-    rejectedProviderActions: new Map(),
-    workspaceOverview: "",
+    parallelReadCountByToolCallId: new Map(),
+    latestProviderRequestSourceCoverage: [],
+    mutationSourceCoverageByToolCallId: new Map(),
     evidenceCounter: 0,
     latestProviderResult: null,
     latestVisibleText: "",
+    latestProviderAssistantReasoning: null,
+    hasExecutedMutationEffect: false,
     providerLaneProfile: null,
+    provenStructuredToolTransports: new Set(),
     authorization: null,
+    permissionRejection: null,
   };
 }

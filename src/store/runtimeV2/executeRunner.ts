@@ -6,12 +6,15 @@ import {
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import {
   RuntimeV2Controller,
+  createRuntimeV2EmergencyTerminalEnvelope,
   decideRuntimeV2ExecutePhaseTransition,
   decideRuntimeV2TerminalOutcome,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
+  isRuntimeV2TurnTerminallyClosed,
   runtimeV2DirectExecuteReadyForConclusion,
+  runtimeV2CheckpointWriteFailureReason,
   summarizeRuntimeV2ExecuteEvidence,
   type RuntimeV2ExecutePhaseTransition,
   type RuntimeV2ResultKind,
@@ -20,8 +23,13 @@ import {
 } from "../../lib/runtime-v2";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
+import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
-import { getRuntimeV2Checkpoint, createRuntimeV2CheckpointPort } from "./checkpointPort";
+import {
+  createRuntimeV2CheckpointPort,
+  getRuntimeV2Checkpoint,
+  getRuntimeV2EmergencyTerminalEnvelope,
+} from "./checkpointPort";
 import {
   createRuntimeV2LiveExecutionState,
   createRuntimeV2ProviderPort,
@@ -53,7 +61,6 @@ export interface RuntimeV2ExecuteRunnerInput {
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
-const RUNTIME_V2_SOFT_STEP_SIGNAL = 24;
 // Leave enough time for the longest in-flight provider/tool deadline and the
 // terminal checkpoint to settle before the outer submission lease expires.
 const RUNTIME_V2_EXECUTION_DEADLINE_MS = 10 * 60_000;
@@ -184,6 +191,12 @@ function truthfulIncompleteDecision(input: {
       (index) => `work-plan-validation-${index + 1}`,
     ) ||
     [];
+  const readOnlyEvidenceCount = input.aggregate.evidence.filter(
+    (item) =>
+      item.kind === "source" ||
+      item.kind === "tool" ||
+      item.kind === "subagent",
+  ).length;
   const details = [
     missingTargets.length > 0
       ? `未修改目标：${missingTargets.join("、")}`
@@ -196,6 +209,15 @@ function truthfulIncompleteDecision(input: {
       : "",
     evidence.failedValidationCount > 0
       ? "最近一次验证仍未通过"
+      : "",
+    !hasMutation && readOnlyEvidenceCount > 0
+      ? `已完成 ${readOnlyEvidenceCount} 条只读证据收集`
+      : "",
+    evidence.failedProviderRequestCount > 0
+      ? `模型有 ${evidence.failedProviderRequestCount} 次决策请求未形成可执行结果`
+      : "",
+    evidence.failedOperationCount > 0
+      ? `${evidence.failedOperationCount} 个动作被拒绝或执行失败`
       : "",
   ].filter(Boolean);
   return {
@@ -264,6 +286,31 @@ export async function runSubmitRuntimeV2Execute(
     logStoreEvent: input.logStoreEvent,
   });
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
+  const emergencyTerminal =
+    getRuntimeV2EmergencyTerminalEnvelope(
+      initialState,
+      identity.turn,
+    );
+  if (emergencyTerminal) {
+    input.logStoreEvent(
+      "runtime_v2_execute_emergency_terminal_restored",
+      {
+        turnId: identity.turn.turnId,
+        runId: emergencyTerminal.run.runId,
+        resultKind: emergencyTerminal.resultKind,
+        reasonCode: emergencyTerminal.reasonCode,
+        lastRevision: emergencyTerminal.lastRevision,
+        hasMutation: emergencyTerminal.hasMutation,
+      },
+    );
+    return settlement(
+      input.context,
+      terminalOutcomeToLegacy(
+        emergencyTerminal.resultKind,
+        emergencyTerminal.reason,
+      ),
+    );
+  }
   if (existing && existing.aggregate.run?.identity.runId !== identity.run.runId) {
     // The current harness generation cannot safely adopt an old effect run
     // whose UI owner is no longer current. Let the outer bootstrap finalizer
@@ -283,6 +330,7 @@ export async function runSubmitRuntimeV2Execute(
     admittedAt + RUNTIME_V2_EXECUTION_DEADLINE_MS;
   const executionPorts = {
     get: input.get,
+    set: input.set,
     context: input.context,
     live,
     nextId,
@@ -337,9 +385,13 @@ export async function runSubmitRuntimeV2Execute(
             (criterion) => criterion.id,
           ) || ["criterion-user-objective"],
         acceptanceEvidenceRequirements:
-          input.context.executeAdmission?.acceptanceCriteria.map(
-            () => "behavioral" as const,
-          ) || ["behavioral"],
+          input.context.executeAdmission?.acceptanceCriteria.every(
+              (criterion) => !!criterion.evidenceRequirement,
+            )
+            ? input.context.executeAdmission.acceptanceCriteria.map(
+                (criterion) => criterion.evidenceRequirement!,
+              )
+            : undefined,
         initialPhase: "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
@@ -383,13 +435,17 @@ export async function runSubmitRuntimeV2Execute(
       await controller.resumeScheduled();
     }
 
-    let step = 0;
-    let softStepSignalRecorded = controller.snapshot().aggregate?.events.some((event) =>
-      event.type === "soft_signal.observed" && event.signal === "iteration_limit"
-    ) || false;
     while (true) {
       const before = controller.snapshot().aggregate;
       if (!before || before.terminalOutcome) break;
+      if (live.permissionRejection) {
+        await controller.driveOnce({
+          resultKind: "blocked",
+          resultReason: live.permissionRejection.reason,
+          finalMarkdown: live.permissionRejection.finalMarkdown,
+        });
+        continue;
+      }
       if (
         existing?.migrationDisposition ===
           "active_uncontracted_mutation"
@@ -442,18 +498,6 @@ export async function runSubmitRuntimeV2Execute(
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
-      if (step >= RUNTIME_V2_SOFT_STEP_SIGNAL && !softStepSignalRecorded) {
-        await controller.recordSoftSignal("iteration_limit");
-        softStepSignalRecorded = true;
-        input.logStoreEvent("runtime_v2_soft_step_signal", {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          step,
-          terminal: false,
-          action: "continue_from_bounded_structured_context",
-        });
-      }
-      step += 1;
       const terminal = terminalDecision({
         aggregate: before,
         signal: input.context.abortCtrl.signal,
@@ -501,6 +545,10 @@ export async function runSubmitRuntimeV2Execute(
       const drove = await controller.driveOnce({
         subagentPreference:
           input.context.turnInputContextSignals.subagentPreference,
+        subagentCapacity:
+          resolveSubagentCapacityPolicy(
+            input.get().config,
+          ).maxActiveRequests,
       });
       if (!drove) {
         if (before.phase === "reviewing") {
@@ -539,6 +587,8 @@ export async function runSubmitRuntimeV2Execute(
       failedValidations: executionEvidence.failedValidationCount,
       stalledValidations: executionEvidence.stalledValidationCount,
       failedOperations: executionEvidence.failedOperationCount,
+      failedProviderRequests:
+        executionEvidence.failedProviderRequestCount,
       childRuns: controller.snapshot().aggregate?.subagents.length || 0,
       executionAuthorityKind: planCoverage ? "work_plan" : "direct_execute",
       executionAuthorityId:
@@ -561,7 +611,10 @@ export async function runSubmitRuntimeV2Execute(
     return settlement(input.context, terminalOutcomeToLegacy(outcome.resultKind, outcome.reason));
   } catch (error) {
     const aggregate = controller.snapshot().aggregate;
-    if (aggregate?.run && !aggregate.terminalOutcome) {
+    if (
+      aggregate?.run &&
+      !isRuntimeV2TurnTerminallyClosed(aggregate)
+    ) {
       for (const childAbort of live.childAbortControllers.values()) {
         childAbort.abort("runtime_v2_parent_infrastructure_failure");
       }
@@ -573,7 +626,7 @@ export async function runSubmitRuntimeV2Execute(
         .slice(0, 1_000);
       const hasMutation = aggregate.evidence.some(
         (evidence) => evidence.kind === "mutation",
-      );
+      ) || live.hasExecutedMutationEffect;
       const resultKind = input.context.abortCtrl.signal.aborted
         ? "canceled"
         : hasMutation
@@ -595,21 +648,76 @@ export async function runSubmitRuntimeV2Execute(
         hasMutation,
         error: detail,
       });
-      try {
-        await controller.finishTerminal(resultKind, reason);
-      } catch (terminalError) {
+      let terminalWriteError: unknown = null;
+      if (!aggregate.terminalOutcome) {
+        try {
+          await controller.finishTerminal(resultKind, reason);
+        } catch (terminalError) {
+          terminalWriteError = terminalError;
+        }
+      } else {
+        terminalWriteError = error;
+      }
+      if (terminalWriteError) {
         input.logStoreEvent(
           "runtime_v2_execute_infrastructure_terminal_failed",
           {
             turnId: identity.turn.turnId,
             runId: identity.run.runId,
             originalError: detail,
-            terminalError: terminalError instanceof Error
-              ? terminalError.message
-              : String(terminalError),
+            terminalError: terminalWriteError instanceof Error
+              ? terminalWriteError.message
+              : String(terminalWriteError),
           },
         );
-        throw error;
+        const reasonCode =
+          runtimeV2CheckpointWriteFailureReason(terminalWriteError) ||
+          runtimeV2CheckpointWriteFailureReason(error);
+        if (!reasonCode) throw error;
+        const emergencyResultKind = input.context.abortCtrl.signal.aborted
+          ? "canceled" as const
+          : hasMutation
+            ? "partial" as const
+            : "error" as const;
+        const emergencySnapshot = controller.snapshot();
+        const envelope = createRuntimeV2EmergencyTerminalEnvelope({
+          owner: identity.turn,
+          run: identity.run,
+          resultKind: emergencyResultKind,
+          reasonCode,
+          language: input.context.phaseLanguage,
+          at: Date.now(),
+          lastRevision: emergencySnapshot.revision,
+          hasMutation,
+        });
+        const emergency = await checkpoint.commitEmergencyTerminal({
+          owner: identity.turn,
+          run: identity.run,
+          expectedRevision: emergencySnapshot.revision,
+          envelope,
+        });
+        if (
+          emergency.disposition === "conflict" ||
+          !emergency.envelope
+        ) {
+          input.logStoreEvent(
+            "runtime_v2_execute_emergency_terminal_conflict",
+            {
+              turnId: identity.turn.turnId,
+              runId: identity.run.runId,
+              lastRevision: emergencySnapshot.revision,
+              reasonCode,
+            },
+          );
+          throw error;
+        }
+        return settlement(
+          input.context,
+          terminalOutcomeToLegacy(
+            emergency.envelope.resultKind,
+            emergency.envelope.reason,
+          ),
+        );
       }
       const terminal = controller.snapshot().aggregate?.terminalOutcome;
       if (terminal) {

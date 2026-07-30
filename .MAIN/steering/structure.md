@@ -4,46 +4,33 @@ inclusion: always
 
 # Project Structure
 
-## 目录组织
-- `src/`
-  - `components/`：前端 UI 组件。重点包括 `Composer.tsx`、`ChatArea.tsx`、`RightPanel.tsx`、`PlanPanel.tsx`、`ActionCard.tsx`。
-  - `lib/`：Agent 核心逻辑。重点包括 `orchestrator.ts`、`systemPrompt.ts`、`toolExecutor.ts`、`streaming.ts`、`instructions.ts`、`hooks.ts`。
-  - `store/`：全局状态管理，核心文件是 `useAppStore.ts`。
-  - `utils/`：文件扫描、图片等辅助工具。
-- `src-tauri/`
-  - `src/lib.rs`：Tauri Rust 后端命令入口，负责文件系统、PTY、流式代理等能力。
-  - `tauri.conf.json`：桌面应用配置。
-- `.MAIN/`
-  - `steering/`：项目级规则与上下文；
-  - `plans/`：Plan 模式临时规格文件目录；
-  - `templates/`：意图分析与 Plan 文档模板；
-  - `rules/`：对特定路径生效的 scoped rules。
-  - `hooks.json`：生命周期 Hook 配置。
-- `scripts/`
-  - `plan_completion_check.mjs`：Plan 完成检查 Hook 脚本。
-- `docs/`：架构、组件、执行循环、IPC 等设计文档。
+## 当前生产调用链
 
-## 命名规范
-- React 组件文件使用 `PascalCase.tsx`
-- 工具/库文件使用 `camelCase.ts` 或语义清晰的模块名
-- Zustand store 中的 action 使用动词短语命名，如 `approvePlan`、`rejectToolAction`
-- Plan 产物文件固定为：`requirements.md`、`design.md`、`tasks.md`、`bugfix.md`
+```text
+src/store/submitAsyncWorkflowRun.ts
+  -> src/store/submitRuntimeRunner.ts
+  -> src/store/runtimeV2/*Runner
+  -> src/lib/runtime-v2/RuntimeV2Controller + ports
+  -> src/lib/toolExecutor.ts / src/lib/streaming.ts
+  -> src-tauri/src/lib.rs
+```
 
-## 模块边界
-- `components/` 负责展示与交互，不承担核心 Agent 决策；
-- `store/useAppStore.ts` 负责 UI 状态与 orchestrator 回调桥接；
-- `lib/orchestrator.ts` 是 Agent 多轮执行主循环，是 Plan / Fast / Chat 行为分流的核心；
-- `src-tauri/src/lib.rs` 负责与本地文件系统、终端和网络代理交互；
-- `.MAIN/templates/` 负责提供稳定的文档骨架，不应承担运行时状态；
-- `.MAIN/hooks.json` 与 `scripts/plan_completion_check.mjs` 负责执行期护栏，不应替代 store 中的真实任务状态；
-- Plan 面板相关逻辑应优先放在 `workflowModels.ts`、`PlanPanel.tsx`、`RightPanel.tsx` 与 `useAppStore.ts` 的配合层，不要把 UI 细节塞进 orchestrator。
+- `src/store/useAppStore.ts` 负责接纳、Session/FIFO 状态与 UI 桥接，不拥有模型循环策略。
+- `src/store/runtimeV2/` 是生产 runner 和 provider/tool/checkpoint/projection ports。
+- `src/lib/runtime-v2/` 保存 provider-neutral contract、controller、reducer 与证据语义。
+- `src/components/` 只从结构化投影展示状态，不从模型措辞猜测完成或失败。
+- Rust 负责文件、Shell、网络、进程与快照 CAS 的最终受信任边界，不重新判断用户意图。
+- 旧 `src/lib/orchestrator.ts` 和 Rust `RuntimeLoop` 不是 Workspace Turn 的生产 Agent 循环，只能作为历史对照或测试基础设施。
 
-## 关键入口文件
-- `src/store/useAppStore.ts`：全局状态、消息发送入口、review gate、面板状态同步
-- `src/lib/orchestrator.ts`：Agent 执行循环、Plan gate、工具执行分发
-- `src/lib/systemPrompt.ts`：系统提示词拼装与三模式规则
-- `src/lib/instructions.ts`：工作区指令、规则、模板解析入口
-- `src/lib/hooks.ts`：Hook 配置加载与执行结果归一化
-- `src/components/RightPanel.tsx`：计划/差异/终端/文件四类面板入口
-- `src/components/PlanPanel.tsx`：Plan 文档与任务进度展示
-- `src-tauri/src/lib.rs`：Rust 端 IPC 与文件/终端实现
+## 工作区文件
+
+- `.MAIN/steering/`、`.MAIN/rules/` 和根目录 instruction 文件是用户可读、可版本控制的项目规则。
+- `.MAIN/plans/plan.md` 是 sealed WorkPlan 的可读投影；审批权威是 typed identity，不是 Markdown 文本。
+- `.MAIN/plans/tasks.md` 仅在长任务、跨会话恢复或用户要求审计时持久化，不是每轮必需的第二事实源。
+- `docs/ARCHITECTURE.md` 与 `docs/RUNTIME_KERNEL_INVARIANTS.md` 记录现行所有权和能力边界；旧发布说明不能覆盖当前生产调用点。
+
+## 修改边界
+
+- React 组件使用 `PascalCase.tsx`；库和 store 模块使用语义明确的 `camelCase.ts`。
+- UI、runtime policy、provider adapter、trusted execution 与 persistence 各自保持单一所有者。
+- 修复运行时前先从生产入口追踪调用点；不要依据旧文件名、未调用的 helper 或历史文档补逻辑。

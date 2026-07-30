@@ -7,14 +7,16 @@ import {
   type SchedulerPort,
   type TurnAggregateV1,
 } from "../../lib/runtime-v2";
-import {
-  recordModelContext,
-  type RuntimeV2ExecutionPortsInput,
-} from "./executionContext";
+import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   appendRuntimeV2ToolResultHistory,
+  upsertRuntimeV2ContextAnchor,
 } from "./executionProviderHistory";
+import {
+  runtimeV2ModelSelectedSubagentCandidate,
+  runtimeV2SubagentCapacityFromCommand,
+} from "./executionSubagentCandidate";
 import { startRuntimeV2ReadOnlyChild } from "./executionSubagentRunner";
 
 function boundedArgument(value: unknown, max: number): string {
@@ -31,77 +33,6 @@ function closeCollaborationToolCall(
     boundedArgument(command.payload.toolCallId, 256),
     content.trim().slice(0, 8_000),
   );
-}
-
-function commaSeparatedPaths(value: unknown): string[] {
-  return String(value || "")
-    .split(/[\n,]/)
-    .map((entry) =>
-      entry.trim().replace(/\\/g, "/").replace(/^\.\//, "")
-        .replace(/\/+$/, "")
-    )
-    .filter((entry) =>
-      !!entry &&
-      !entry.startsWith("/") &&
-      !/^[A-Za-z]:\//.test(entry) &&
-      !entry.split("/").includes("..")
-    )
-    .slice(0, 6);
-}
-
-function modelSelectedCandidate(
-  command: Parameters<
-    NonNullable<SchedulerPort["prepareSchedule"]>
-  >[0]["command"],
-) {
-  const args =
-    command.payload.arguments &&
-      typeof command.payload.arguments === "object" &&
-      !Array.isArray(command.payload.arguments)
-      ? command.payload.arguments as Record<string, unknown>
-      : {};
-  const taskKey = boundedArgument(args.task_key, 256);
-  const name = boundedArgument(args.name, 128);
-  const role = boundedArgument(args.role, 128);
-  const objective = boundedArgument(args.objective, 2_000);
-  const successCriteria = boundedArgument(args.success_criteria, 1_000);
-  const accessMode = boundedArgument(args.access_mode, 32) || "read";
-  const taskKind = boundedArgument(args.task_kind, 32) || "explore";
-  if (
-    !taskKey ||
-    !name ||
-    !role ||
-    !objective ||
-    !successCriteria
-  ) {
-    throw new Error(
-      "spawn_subagent requires model-selected task_key, name, role, objective, and success_criteria.",
-    );
-  }
-  if (
-    accessMode !== "read" ||
-    (
-      taskKind !== "explore" &&
-      taskKind !== "review" &&
-      taskKind !== "validate"
-    )
-  ) {
-    throw new Error(
-      "Runtime v2 collaboration currently accepts read-only explore, review, or validation investigations only.",
-    );
-  }
-  const allowedPaths = commaSeparatedPaths(args.allowed_paths);
-  return {
-    sourceToolCallId: boundedArgument(command.payload.toolCallId, 256),
-    scopeKey: taskKey,
-    taskKind: taskKind as "explore" | "review" | "validate",
-    name,
-    role,
-    objective,
-    successCriteria,
-    expectedOutput: boundedArgument(args.expected_output, 1_000),
-    allowedPaths: allowedPaths.length > 0 ? allowedPaths : ["."],
-  };
 }
 
 function parentCommandIntervals(
@@ -178,8 +109,10 @@ export function createRuntimeV2SchedulerPort(
       try {
         decision = scheduleReadOnlySubagents({
           parentRun: command.run,
-          candidates: [modelSelectedCandidate(command)],
+          candidates: [runtimeV2ModelSelectedSubagentCandidate(command)],
           existingJobs,
+          maxActiveJobs:
+            runtimeV2SubagentCapacityFromCommand(command),
           requestedAt: input.now(),
           nextId: input.nextId,
         });
@@ -196,7 +129,7 @@ export function createRuntimeV2SchedulerPort(
       if (decision.jobs.length !== 1) {
         const detail =
           `The requested child duplicates an existing semantic task, exceeds ` +
-          `the two-active-child limit, or violates the read-only scope contract: ${
+          `the current provider-lane capacity, or violates the read-only scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. Continue the parent task directly or delegate a genuinely different task.`;
         closeCollaborationToolCall(
@@ -204,15 +137,6 @@ export function createRuntimeV2SchedulerPort(
           command,
           `SUBAGENT_SCHEDULE_REJECTED: ${detail}`,
         );
-        recordModelContext(input.live, {
-          id:
-            `scheduler:${command.idempotencyKey}:spawn_subagent_rejected`,
-          source: "subagent",
-          label: "spawn_subagent_rejected",
-          target: decision.rejectedScopeKeys.join(", ") || "child",
-          status: "failed",
-          content: detail,
-        });
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId,
           runId: command.run.runId,
@@ -230,6 +154,8 @@ export function createRuntimeV2SchedulerPort(
       return {
         type: "subagents.scheduled",
         run: command.run,
+        maxActiveSubagents:
+          runtimeV2SubagentCapacityFromCommand(command),
         jobs: decision.jobs,
       };
     },
@@ -335,16 +261,6 @@ export function createRuntimeV2SchedulerPort(
             `wait_subagents did not match an active child task handle: ${
               requestedJobIds.join(", ")
             }. Active handles: ${activeTaskHandles.join(", ") || "none"}.`;
-          recordModelContext(input.live, {
-            id:
-              `scheduler:${command.idempotencyKey}:wait_subagents_rejected`,
-            source: "subagent",
-            label: "wait_subagents_rejected",
-            target: requestedJobIds.join(", "),
-            status: "failed",
-            content:
-              `${detail} Continue independent parent work and retry only with an exact active handle when the result is required.`,
-          });
           input.logStoreEvent("runtime_v2_subagent_reference_rejected", {
             turnId: command.run.turnId,
             runId: command.run.runId,
@@ -381,8 +297,8 @@ export function createRuntimeV2SchedulerPort(
                 summary:
                   "子智能体请求在进程重启后无法继续；已结束该只读子任务并保留父任务证据。",
                 report: null,
+                inheritedEvidence: [],
                 evidence: [],
-                validationReceipts: [],
               }
             : null;
         }));
@@ -432,11 +348,11 @@ export function createRuntimeV2SchedulerPort(
             jobId: result.job.id,
             status: result.status,
             summary: result.summary,
+            ...(result.inheritedEvidence.length > 0
+              ? { inheritedEvidence: result.inheritedEvidence }
+              : {}),
             evidence: result.evidence,
             ...(result.report ? { report: result.report } : {}),
-            ...(result.validationReceipts.length > 0
-              ? { validationReceipts: result.validationReceipts }
-              : {}),
           });
           observedJobs.push({
             ...result.job,
@@ -446,31 +362,47 @@ export function createRuntimeV2SchedulerPort(
             summary: result.summary,
             report: result.report,
           });
-          recordModelContext(input.live, {
-            id: `child:${result.job.id}`,
-            source: "subagent",
-            label: result.job.scopeKey,
-            target:
-              result.evidence[0]?.target ||
-              result.job.allowedPaths.join(", "),
-            status:
-              result.status === "completed"
-                ? "succeeded"
-                : result.status === "degraded"
-                  ? "blocked"
-                  : "failed",
-            content: [
-              `Scope: ${result.job.scopeKey} (${
-                result.job.allowedPaths.join(", ")
-              })`,
-              `Status: ${result.status}`,
-              `Evidence ids: ${
-                result.evidence.map((evidence) => evidence.id)
-                  .join(", ") || "none"
-              }`,
-              `Report: ${result.summary.slice(0, 4_000)}`,
-            ].join("\n"),
+          const contextEntryId = `child:${result.job.id}`;
+          const evidenceIds = [...new Set(
+            result.evidence.map((evidence) => evidence.id),
+          )];
+          const contextContent = [
+            `Scope: ${result.job.scopeKey} (${
+              result.job.allowedPaths.join(", ")
+            })`,
+            `Status: ${result.status}`,
+            `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
+            `Report: ${result.summary.slice(0, 4_000)}`,
+            evidenceIds.length > 0
+              ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
+              : "No child evidence id is available for parent adoption; continue the objective directly.",
+          ].join("\n");
+          upsertRuntimeV2ContextAnchor(input.live, {
+            key: contextEntryId,
+            content: contextContent,
           });
+          const deliveredContext = input.live.messages.find((message) =>
+            message.role === "system" &&
+            typeof message.content === "string" &&
+            message.content.startsWith(
+              `[runtime-v2 context: ${contextEntryId}]`,
+            ) &&
+            message.content.includes(
+              `Report: ${result.summary.slice(0, 4_000)}`,
+            ) &&
+            message.content.includes(
+              `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
+            )
+          );
+          if (deliveredContext) {
+            events.push({
+              type: "subagent.handoff_delivered",
+              run: command.run,
+              jobId: result.job.id,
+              contextEntryId,
+              evidenceIds,
+            });
+          }
           input.logStoreEvent("runtime_v2_subagent_joined", {
             turnId: command.run.turnId,
             runId: command.run.runId,
@@ -482,7 +414,6 @@ export function createRuntimeV2SchedulerPort(
               (evidence) => evidence.target,
             ),
             structuredReport: !!result.report,
-            validationReceiptCount: result.validationReceipts.length,
           });
           input.live.childRuns.delete(result.job.id);
         }
@@ -532,6 +463,7 @@ export function createRuntimeV2SchedulerPort(
             observedJobs.some((job) => job.status !== "completed")
               ? "One or more child tasks did not complete. Continue the objective directly using any retained evidence."
               : "Apply child findings only when they are relevant to the parent objective.",
+            "When relying on a child fact, explicitly cite its exact evidence id. An uncited child result remains delivered but not adopted.",
           ].join("\n"),
         );
         return events;

@@ -3,6 +3,7 @@ import { globSearch, readFile } from "./ipc";
 export type InstructionSourceKind =
   | "legacy"
   | "workspace_agent"
+  | "steering"
   | "scoped_rule"
   | "template"
   | "skill";
@@ -44,6 +45,30 @@ export interface ResolvedInstructionSet {
   debugSummary: string;
 }
 
+/**
+ * Render the exact instruction layers admitted at a Turn boundary.
+ *
+ * This is deliberately not session memory: it contains only live,
+ * user-maintained instruction sources and keeps their provenance. Runtime v2
+ * snapshots this string once so the parent and any later child use the same
+ * rules even if the UI switches workspaces while the Turn is running.
+ */
+export function renderResolvedInstructionContext(
+  resolved: ResolvedInstructionSet | null | undefined,
+): string {
+  if (!resolved?.layers.length) return "";
+  return resolved.layers
+    .map((layer) => {
+      const source = layer.source.path || layer.source.name || layer.id;
+      return [
+        `## ${layer.title}`,
+        `Source: ${source}`,
+        layer.content.trim(),
+      ].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+}
+
 export interface InstructionSkillLike {
   id: string;
   name: string;
@@ -55,6 +80,7 @@ export interface InstructionSkillLike {
 type ParsedFrontmatter = {
   body: string;
   paths: string[];
+  inclusion: string;
 };
 
 const LEGACY_FILES = [
@@ -124,12 +150,12 @@ function extractInlineArray(raw: string): string[] {
 
 function parseFrontmatter(raw: string): ParsedFrontmatter {
   if (!raw.startsWith("---\n") && !raw.startsWith("---\r\n")) {
-    return { body: raw.trim(), paths: [] };
+    return { body: raw.trim(), paths: [], inclusion: "" };
   }
 
   const parts = raw.split(/^---\s*$/m);
   if (parts.length < 3) {
-    return { body: raw.trim(), paths: [] };
+    return { body: raw.trim(), paths: [], inclusion: "" };
   }
 
   const frontmatter = parts[1] ?? "";
@@ -137,10 +163,36 @@ function parseFrontmatter(raw: string): ParsedFrontmatter {
   const lines = frontmatter.split(/\r?\n/);
   const paths: string[] = [];
   let collectingPaths = false;
+  let inclusion = "";
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+
+    if (/^inclusion\s*:/.test(trimmed)) {
+      inclusion = trimmed
+        .replace(/^inclusion\s*:\s*/, "")
+        .replace(/\s+#.*$/, "")
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+      collectingPaths = false;
+      continue;
+    }
+
+    if (/^fileMatchPattern\s*:/.test(trimmed)) {
+      const value = trimmed
+        .replace(/^fileMatchPattern\s*:\s*/, "")
+        .replace(/\s+#.*$/, "")
+        .trim();
+      const inline = extractInlineArray(value);
+      if (inline.length > 0) {
+        paths.push(...inline);
+      } else if (value && value !== "|") {
+        paths.push(value.replace(/^['"]|['"]$/g, ""));
+      }
+      collectingPaths = false;
+      continue;
+    }
 
     if (/^paths\s*:/.test(trimmed)) {
       collectingPaths = true;
@@ -167,12 +219,16 @@ function parseFrontmatter(raw: string): ParsedFrontmatter {
   return {
     body,
     paths: paths.map(normalizePath).filter(Boolean),
+    inclusion,
   };
 }
 
-async function tryRead(path: string): Promise<string | null> {
+async function tryRead(
+  path: string,
+  workspace: string,
+): Promise<string | null> {
   try {
-    return await readFile(path);
+    return await readFile(path, workspace);
   } catch {
     return null;
   }
@@ -189,10 +245,11 @@ function matchPatterns(patterns: string[], associatedPaths: string[]): string[] 
 }
 
 export async function loadResolvedInstructions(
-  _workspace: string,
+  workspace: string,
   skills: InstructionSkillLike[],
   associatedPaths: string[] = [],
 ): Promise<ResolvedInstructionSet> {
+  const immutableWorkspace = workspace.trim();
   const normalizedAssociated = associatedPaths.map(normalizePath).filter(Boolean);
   const layers: InstructionLayer[] = [];
   const templates: InstructionLayer[] = [];
@@ -243,32 +300,71 @@ export async function loadResolvedInstructions(
   };
 
   for (const legacyPath of LEGACY_FILES) {
-    const content = await tryRead(legacyPath);
+    const content = await tryRead(legacyPath, immutableWorkspace);
     if (!content) continue;
     pushLayer(legacyPath.split("/").pop() || legacyPath, "legacy", content, {
       path: legacyPath,
     });
   }
 
-  const cursorRuleFiles = await globSearch(".cursor/rules/*.md").catch(() => []);
+  const cursorRuleFiles = await globSearch(
+    ".cursor/rules/*.md",
+    immutableWorkspace,
+  ).catch(() => []);
   for (const rulePath of cursorRuleFiles) {
-    const content = await tryRead(rulePath);
+    const content = await tryRead(rulePath, immutableWorkspace);
     if (!content) continue;
     pushLayer(rulePath.split("/").pop() || rulePath, "legacy", content, {
       path: rulePath,
     });
   }
 
-  const agentContent = await tryRead("AGENT.md");
+  const agentContent = await tryRead("AGENT.md", immutableWorkspace);
   if (agentContent) {
     pushLayer("AGENT.md", "workspace_agent", agentContent, { path: "AGENT.md" });
   }
 
-  const scopedRuleFiles = await globSearch(".MAIN/rules/*.md").catch(() => []);
+  const steeringFiles = await globSearch(
+    ".MAIN/steering/*.md",
+    immutableWorkspace,
+  ).catch(
+    () => [],
+  );
+  for (const steeringPath of steeringFiles.sort()) {
+    if (/\/README\.md$/i.test(normalizePath(steeringPath))) continue;
+    const content = await tryRead(steeringPath, immutableWorkspace);
+    if (!content) continue;
+    const parsed = parseFrontmatter(content);
+    const matched = parsed.paths.length > 0
+      ? matchPatterns(parsed.paths, normalizedAssociated)
+      : [];
+    const shouldLoad =
+      parsed.inclusion === "always" ||
+      (
+        parsed.inclusion === "fileMatch" &&
+        parsed.paths.length > 0 &&
+        matched.length > 0
+      );
+    if (!shouldLoad) continue;
+    pushLayer(
+      steeringPath.split("/").pop() || steeringPath,
+      "steering",
+      parsed.body,
+      {
+        path: steeringPath,
+        matchedPaths: matched,
+      },
+    );
+  }
+
+  const scopedRuleFiles = await globSearch(
+    ".MAIN/rules/*.md",
+    immutableWorkspace,
+  ).catch(() => []);
   const scopedRules: ScopedRule[] = [];
 
   for (const rulePath of scopedRuleFiles) {
-    const content = await tryRead(rulePath);
+    const content = await tryRead(rulePath, immutableWorkspace);
     if (!content) continue;
 
     const parsed = parseFrontmatter(content);
@@ -302,12 +398,15 @@ export async function loadResolvedInstructions(
       });
     });
 
-  const templateFiles = await globSearch(".MAIN/templates/**/*.md").catch(() => []);
+  const templateFiles = await globSearch(
+    ".MAIN/templates/**/*.md",
+    immutableWorkspace,
+  ).catch(() => []);
   for (const templatePath of templateFiles) {
     if (normalizePath(templatePath).startsWith(".MAIN/templates/game-studio/")) {
       continue;
     }
-    const content = await tryRead(templatePath);
+    const content = await tryRead(templatePath, immutableWorkspace);
     if (!content) continue;
     const parsed = parseFrontmatter(content);
     const relativeTitle = templatePath.replace(/^\.MAIN\/templates\//, "");

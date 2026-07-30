@@ -120,6 +120,10 @@ export interface StreamSettings {
   disableResponseStorage?: boolean;
   reasoningEffort?: OpenAiReasoningEffort;
   reasoningRequest?: ReasoningRequestMode;
+  /** Provider capability discovered at Run admission. When true, replay the
+   * provider's hidden assistant reasoning only to that provider across native
+   * tool turns. It is never display or durable conversation content. */
+  preserveAssistantReasoning?: boolean;
   toolProtocol?: CloudToolProtocol;
   contextLimit?: number; // total context window for the model (used to calculate max_tokens)
   provider?: string;    // "Ollama" | "LM Studio" | "OMLX" | "OpenAI" — controls SSE format
@@ -137,6 +141,10 @@ export interface StreamRequestOptions {
   responseFormat?: Record<string, unknown>;
   visualTransportBinding?: VisualTransportRequestBinding;
   timeoutMs?: number;
+  /** The caller already projected and budgeted the exact decision context.
+   * Provider adapters must preserve those messages byte-for-byte and must not
+   * replace them with an internally compacted fallback. */
+  contextOwnership?: "caller" | "adapter";
 }
 
 /** A tool call accumulated from streaming deltas. */
@@ -408,7 +416,8 @@ export function shouldStopNoVisibleStreamStall(input: {
   return (
     input.elapsedMs >= STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS &&
     input.visibleChars === 0 &&
-    input.toolCallCount === 0
+    input.toolCallCount === 0 &&
+    (input.reasoningChars || 0) === 0
   );
 }
 
@@ -543,14 +552,25 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
   const message = choice?.message && typeof choice.message === "object"
     ? choice.message as Record<string, unknown>
     : undefined;
-  const source = delta ?? message ?? root;
+  const nativeMessage = root.message && typeof root.message === "object"
+    ? root.message as Record<string, unknown>
+    : undefined;
+  const source = delta ?? message ?? nativeMessage ?? root;
   const deltaContent = extractTextLike(delta?.content ?? delta?.text);
-  const messageContent = extractTextLike(message?.content ?? message?.text);
+  const messageContent = extractTextLike(
+    message?.content ??
+      message?.text ??
+      nativeMessage?.content ??
+      nativeMessage?.text,
+  );
   const rootContent = extractTextLike(root.content ?? root.text ?? root.response);
   const content = deltaContent || messageContent || rootContent;
   const reasoningFields: OpenAiCompatibleReasoningField[] = ["reasoning_content", "reasoning", "thinking", "thought"];
   const deltaReasoning = extractFirstTextField(delta, reasoningFields);
-  const messageReasoning = extractFirstTextField(message, reasoningFields);
+  const messageReasoning = extractFirstTextField(
+    message ?? nativeMessage,
+    reasoningFields,
+  );
   const rootReasoning = extractFirstTextField(root, reasoningFields);
   const reasoning = deltaReasoning.text || messageReasoning.text || rootReasoning.text;
   const rawReasoningField = deltaReasoning.text
@@ -564,15 +584,50 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
     : root.done === true
       ? "stop"
       : null;
+  const toolCalls = Array.isArray(source.tool_calls)
+    ? source.tool_calls.map((entry, index) => {
+        if (!entry || typeof entry !== "object") return entry;
+        const call = entry as Record<string, unknown>;
+        const fn = call.function && typeof call.function === "object"
+          ? call.function as Record<string, unknown>
+          : null;
+        if (!fn) return entry;
+        const args = fn.arguments;
+        return {
+          ...call,
+          index: Number.isFinite(Number(call.index))
+            ? Number(call.index)
+            : index,
+          function: {
+            ...fn,
+            arguments: typeof args === "string"
+              ? args
+              : JSON.stringify(args ?? {}),
+          },
+        };
+      })
+    : [];
 
   return {
     content,
-    contentMode: deltaContent ? "delta" : content ? "cumulative" : "none",
+    contentMode:
+      deltaContent || (nativeMessage && messageContent)
+        ? "delta"
+        : content
+          ? "cumulative"
+          : "none",
     reasoning,
-    reasoningMode: deltaReasoning.text ? "delta" : reasoning ? "cumulative" : "none",
+    reasoningMode:
+      deltaReasoning.text || (nativeMessage && messageReasoning.text)
+        ? "delta"
+        : reasoning
+          ? "cumulative"
+          : "none",
     reasoningField: normalizeReasoningFieldForHistory(rawReasoningField),
-    finishReason: normalizedFinishReason,
-    toolCalls: Array.isArray(source.tool_calls) ? source.tool_calls : [],
+    finishReason: toolCalls.length > 0
+      ? "tool_calls"
+      : normalizedFinishReason,
+    toolCalls,
   };
 }
 
@@ -883,12 +938,23 @@ function isOmlxProvider(settings: StreamSettings): boolean {
 
 export function buildOpenAiCompatibleReasoningRequestExtras(
   settings: StreamSettings,
+  maxOutputTokens: number,
 ): Record<string, unknown> {
-  if (settings.reasoningRequest !== "off" || !isOmlxProvider(settings)) return {};
+  if (!isOmlxProvider(settings)) return {};
   // oMLX exposes this as a documented ChatCompletionRequest capability. Do
   // not send it to arbitrary OpenAI-compatible endpoints: many reject
   // unknown top-level request keys.
-  return { chat_template_kwargs: { enable_thinking: false } };
+  if (settings.reasoningRequest === "off") {
+    return { chat_template_kwargs: { enable_thinking: false } };
+  }
+  // "auto" means the selected model/provider owns its advertised default.
+  // Sending a positive budget here would force thinking on models whose OMLX
+  // metadata declares thinking_default=false.
+  if (settings.reasoningRequest !== "explicit") return {};
+  const budget = Math.floor(Number(maxOutputTokens) / 2);
+  return Number.isFinite(budget) && budget > 0
+    ? { thinking_budget: budget }
+    : {};
 }
 
 function isOpenAiResponsesApi(settings: StreamSettings): boolean {
@@ -1236,6 +1302,7 @@ async function requestOpenAiNonStreaming(
       );
       acceptedRequestBody = requestBody;
     } else if (apiFormat === "responses") {
+      const callerOwnsContext = options.contextOwnership === "caller";
       const shouldIncludeTools = !minimalCompatibilityMode && shouldSendNativeTools(settings);
       const usesXmlToolProtocol =
         normalizeCloudToolProtocol(settings.toolProtocol) === "xml" ||
@@ -1246,7 +1313,7 @@ async function requestOpenAiNonStreaming(
         tools,
         disableResponseStorage: settings.disableResponseStorage,
         reasoningEffort: settings.reasoningEffort,
-        compact: true,
+        compact: !callerOwnsContext,
         includeTools: shouldIncludeTools,
         toolProtocol: usesXmlToolProtocol
           ? "xml"
@@ -1336,6 +1403,11 @@ async function requestOpenAiNonStreaming(
           }
           const isRetryableGatewayError = isRetryableCloudErrorMessage(errMsg);
           if (isRetryableGatewayError) {
+            if (callerOwnsContext) {
+              throw new Error(
+                `${PROVIDER_COMPATIBILITY_TAG} caller_owned_context_rejected ${errMsg}`,
+              );
+            }
             if (gatewayCompactTranscriptCandidate && candidate === gatewayCompactTranscriptCandidate) {
               throw lastCompatibilityError;
             }
@@ -1395,7 +1467,10 @@ async function requestOpenAiNonStreaming(
       const chatBody: Record<string, unknown> = {
         model: settings.model,
         messages: messages.map((message) => {
-          const mapped = mapMessageForApi(message, false);
+          const mapped = mapMessageForApi(message, false, {
+            includeAssistantReasoning:
+              settings.preserveAssistantReasoning === true,
+          });
           return mapped.role === "tool"
             ? { role: "user", content: mapped.content }
             : mapped;
@@ -1405,7 +1480,12 @@ async function requestOpenAiNonStreaming(
         ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
         ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
         ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
-        ...(!minimalCompatibilityMode ? buildOpenAiCompatibleReasoningRequestExtras(settings) : {}),
+        ...(!minimalCompatibilityMode
+          ? buildOpenAiCompatibleReasoningRequestExtras(
+              settings,
+              maxTokens,
+            )
+          : {}),
       };
       applyOpenAiToolChoice(chatBody, settings, tools, options.toolChoice, minimalCompatibilityMode);
       payload = await postJsonRequest(
@@ -1558,7 +1638,10 @@ async function streamViaRustProxy(
   const body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
-        messages: messages.map((m) => mapMessageForApi(m, true)),
+        messages: messages.map((m) => mapMessageForApi(m, true, {
+          includeAssistantReasoning:
+            settings.preserveAssistantReasoning === true,
+        })),
         stream: true,
         options: buildOllamaOptions(settings, maxTokens),
       }
@@ -1574,15 +1657,21 @@ async function streamViaRustProxy(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false)),
+          messages: messages.map((m) => mapMessageForApi(m, false, {
+            includeAssistantReasoning:
+              settings.preserveAssistantReasoning === true,
+          })),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
-          ...buildOpenAiCompatibleReasoningRequestExtras(settings),
+          ...buildOpenAiCompatibleReasoningRequestExtras(
+            settings,
+            maxTokens,
+          ),
         };
 
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
+  if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
   applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
@@ -1873,40 +1962,20 @@ async function streamViaRustProxy(
 
     sseBuffer += rawChunk;
 
-    if (isOllama) {
-      const lines = sseBuffer.split("\n");
-      sseBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("{")) continue;
-        try {
-          const json = JSON.parse(trimmed);
-          providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
-          if (json.done) { finishReason = "stop"; continue; }
-          const contentDelta = json.message?.content ?? "";
-          if (contentDelta) {
-            fullContent += contentDelta;
-            refreshSemanticProgress();
-            if (stopVisibleTextRepetition()) return;
-            emitContentForDisplay(contentDelta);
-          }
-        } catch { /* skip */ }
-      }
-    } else {
-      const lines = sseBuffer.split("\n");
-      sseBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === "data: [DONE]") continue;
-        try {
-          const jsonText = trimmed.startsWith("data: ")
-            ? trimmed.slice(6)
-            : trimmed.startsWith("data:")
-              ? trimmed.slice(5).trimStart()
-              : trimmed;
-          const json = JSON.parse(jsonText);
-          providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
-          const extracted = extractOpenAiCompatibleDelta(json);
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === "data: [DONE]") continue;
+      try {
+        const jsonText = trimmed.startsWith("data: ")
+          ? trimmed.slice(6)
+          : trimmed.startsWith("data:")
+            ? trimmed.slice(5).trimStart()
+            : trimmed;
+        const json = JSON.parse(jsonText);
+        providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
+        const extracted = extractOpenAiCompatibleDelta(json);
 
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
@@ -1984,8 +2053,7 @@ async function streamViaRustProxy(
           }
           if (stopReasoningOnlyRunaway()) return;
           if (stopNoVisibleProgressStall()) return;
-        } catch { /* skip */ }
-      }
+      } catch { /* skip */ }
     }
   };
 
@@ -2262,6 +2330,16 @@ export async function streamChatCompletion(
 
   const { onToken, onDone, onError } = callbacks;
   const streamStartedAt = Date.now();
+  let frontendChunkCount = 0;
+  let frontendByteCount = 0;
+  let frontendLastProgressLifecycleAt = 0;
+  callbacks.onLifecycle?.({
+    phase: "stream_started",
+    elapsedMs: 0,
+    chunkCount: 0,
+    byteCount: 0,
+    status: "started",
+  });
   const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
   const isGemini = isGeminiProvider(settings);
 
@@ -2270,7 +2348,10 @@ export async function streamChatCompletion(
   const body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
-        messages: messages.map((m) => mapMessageForApi(m, true)),
+        messages: messages.map((m) => mapMessageForApi(m, true, {
+          includeAssistantReasoning:
+            settings.preserveAssistantReasoning === true,
+        })),
         stream: true,
         options: buildOllamaOptions(settings, maxTokens),
         ...(options.responseFormat ? { format: options.responseFormat } : {}),
@@ -2287,17 +2368,24 @@ export async function streamChatCompletion(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false)),
+          messages: messages.map((m) => mapMessageForApi(m, false, {
+            includeAssistantReasoning:
+              settings.preserveAssistantReasoning === true,
+          })),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
           ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
-          ...buildOpenAiCompatibleReasoningRequestExtras(settings),
+          ...buildOpenAiCompatibleReasoningRequestExtras(
+            settings,
+            maxTokens,
+          ),
         };
 
-  // Include tools if provided (native function calling) — only for non-Ollama
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
+  // Native tool catalogs share one OpenAI-compatible function schema,
+  // including Ollama's /api/chat transport.
+  if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
   applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
@@ -2524,6 +2612,29 @@ export async function streamChatCompletion(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      const now = Date.now();
+      frontendChunkCount += 1;
+      frontendByteCount += value.byteLength;
+      if (frontendChunkCount === 1) {
+        callbacks.onLifecycle?.({
+          phase: "first_chunk",
+          elapsedMs: now - streamStartedAt,
+          chunkCount: frontendChunkCount,
+          byteCount: frontendByteCount,
+          status: "streaming",
+        });
+      } else if (
+        now - frontendLastProgressLifecycleAt >= 5_000
+      ) {
+        frontendLastProgressLifecycleAt = now;
+        callbacks.onLifecycle?.({
+          phase: "chunk_progress",
+          elapsedMs: now - streamStartedAt,
+          chunkCount: frontendChunkCount,
+          byteCount: frontendByteCount,
+          status: "streaming",
+        });
+      }
       const chunkText = decoder.decode(value, { stream: true });
 
       if (anthropicProcessor) {
@@ -2533,54 +2644,24 @@ export async function streamChatCompletion(
 
       buffer += chunkText;
 
-      if (isOllama) {
-        // ── Ollama native SSE format ────────────────────────────
-        // Each line is a JSON object: {"message":{"content":"..."},"done":false}
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+      // OpenAI-compatible SSE and Ollama's raw newline-delimited JSON share
+      // one normalized delta path. Provider framing is removed before decode.
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("{")) continue;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === "data: [DONE]") continue;
 
-          try {
-            const json = JSON.parse(trimmed);
-            providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
-            if (json.done) {
-              finishReason = "stop";
-              continue;
-            }
-
-            const contentDelta = json.message?.content ?? "";
-            if (contentDelta) {
-              fullContent += contentDelta;
-              refreshSemanticProgress();
-              throwIfVisibleTextRepetition();
-              emitContentForDisplay(contentDelta);
-            }
-          } catch (error) {
-            if (error && (error as any)._visibleTextRepetitionAbort) throw error;
-            // malformed JSON — skip
-          }
-        }
-      } else {
-        // ── OpenAI-compatible SSE format ─────────────────────────
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
-
-          try {
-            const jsonText = trimmed.startsWith("data: ")
-              ? trimmed.slice(6)
-              : trimmed.startsWith("data:")
-                ? trimmed.slice(5).trimStart()
-                : trimmed;
-            const json = JSON.parse(jsonText);
-            providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
-            const extracted = extractOpenAiCompatibleDelta(json);
+        try {
+          const jsonText = trimmed.startsWith("data: ")
+            ? trimmed.slice(6)
+            : trimmed.startsWith("data:")
+              ? trimmed.slice(5).trimStart()
+              : trimmed;
+          const json = JSON.parse(jsonText);
+          providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
+          const extracted = extractOpenAiCompatibleDelta(json);
 
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output
@@ -2687,11 +2768,10 @@ export async function streamChatCompletion(
                 `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without semantic-visible output or tool calls.`,
               ), { _semanticProgressAbort: true });
             }
-          } catch (e) {
-            // Re-throw garbled-reasoning abort — must not be swallowed
-            if (e && ((e as any)._garbledAbort || (e as any)._semanticProgressAbort || (e as any)._visibleTextRepetitionAbort)) throw e;
-            // malformed SSE chunk — skip
-          }
+        } catch (e) {
+          // Re-throw garbled-reasoning abort — must not be swallowed
+          if (e && ((e as any)._garbledAbort || (e as any)._semanticProgressAbort || (e as any)._visibleTextRepetitionAbort)) throw e;
+          // malformed SSE chunk — skip
         }
       }
     }
@@ -2732,42 +2812,67 @@ export async function streamChatCompletion(
   if (anthropicProcessor) {
     anthropicProcessor.flush();
   } else if (buffer.trim()) {
-    if (isOllama) {
+    for (const line of buffer.trim().split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === "data: [DONE]") continue;
+      const jsonText = trimmed.startsWith("data: ")
+        ? trimmed.slice(6)
+        : trimmed.startsWith("data:")
+          ? trimmed.slice(5).trimStart()
+          : trimmed;
       try {
-        const json = JSON.parse(buffer.trim());
-        if (json.message?.content) {
-          fullContent += json.message.content;
+        const extracted = extractOpenAiCompatibleDelta(
+          JSON.parse(jsonText),
+        );
+        const resolvedReasoning =
+          resolveOpenAiCompatibleReasoningDelta(
+            extracted,
+            emittedOpenAiCompatibleReasoning,
+          );
+        emittedOpenAiCompatibleReasoning =
+          resolvedReasoning.emittedText;
+        if (resolvedReasoning.delta) {
+          providerReasoningContent += resolvedReasoning.delta;
+          providerReasoningField =
+            providerReasoningField ?? extracted.reasoningField;
           refreshSemanticProgress();
-          emitContentForDisplay(json.message.content);
         }
-      } catch { /* ignore */ }
-    } else {
-      const remaining = buffer.trim();
-      for (const line of remaining.split("\n")) {
-        const t = line.trim();
-        if (!t || t === "data: [DONE]") continue;
-        const d = t.startsWith("data: ") ? t.slice(6) : t.startsWith("data:") ? t.slice(5).trimStart() : null;
-        if (!d) continue;
-        try {
-          const json = JSON.parse(d);
-          const extracted = extractOpenAiCompatibleDelta(json);
-          const resolvedReasoning = resolveOpenAiCompatibleReasoningDelta(extracted, emittedOpenAiCompatibleReasoning);
-          emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
-          if (resolvedReasoning.delta) {
-            providerReasoningContent += resolvedReasoning.delta;
-            providerReasoningField = providerReasoningField ?? extracted.reasoningField;
-            refreshSemanticProgress();
+        const resolvedText = resolveOpenAiCompatibleTextDelta(
+          extracted,
+          emittedOpenAiCompatibleText,
+        );
+        emittedOpenAiCompatibleText = resolvedText.emittedText;
+        if (resolvedText.delta) {
+          fullContent += resolvedText.delta;
+          refreshSemanticProgress();
+          emitContentForDisplay(resolvedText.delta);
+        }
+        if (extracted.finishReason) {
+          finishReason = extracted.finishReason;
+        }
+        for (const tc of extracted.toolCalls as Array<{
+          index?: number;
+          id?: string;
+          function?: { name?: string; arguments?: string };
+        }>) {
+          const index = tc.index ?? 0;
+          const existing = toolCallsMap.get(index);
+          if (existing) {
+            if (!existing.id && tc.id) existing.id = tc.id;
+            if (!existing.name && tc.function?.name) {
+              existing.name = tc.function.name;
+            }
+            existing.arguments += tc.function?.arguments || "";
+          } else {
+            toolCallsMap.set(index, {
+              index,
+              id: tc.id || "",
+              name: tc.function?.name || "",
+              arguments: tc.function?.arguments || "",
+            });
           }
-          const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
-          emittedOpenAiCompatibleText = resolvedText.emittedText;
-          const contentDelta = resolvedText.delta;
-          if (contentDelta) {
-            fullContent += contentDelta;
-            refreshSemanticProgress();
-            emitContentForDisplay(contentDelta);
-          }
-        } catch { /* ignore */ }
-      }
+        }
+      } catch { /* ignore malformed final frame */ }
     }
   }
 

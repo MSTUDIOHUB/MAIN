@@ -547,8 +547,35 @@ test("a terminal Plan Turn rolls back only its exact pending child handoff", () 
 });
 
 test("submit async workflow run keeps stage order from context build to engine launch", async () => {
+  const runInstructionSnapshot = {
+    layers: [{
+      id: "legacy:AGENTS.md:0",
+      title: "AGENTS.md",
+      content: "Run focused tests.",
+      order: 0,
+      source: {
+        id: "legacy:AGENTS.md:0",
+        name: "AGENTS.md",
+        kind: "legacy",
+        path: "AGENTS.md",
+        enabled: true,
+        order: 0,
+      },
+    }],
+    templates: [],
+    sources: [],
+    matchedRules: [],
+    associatedPaths: [],
+    loadedAt: 1,
+    debugSummary: "",
+  };
   const harness = createHarness({
     input: {
+      refreshWorkspaceContext: async (workspace) => {
+        harness.calls.push(["instruction_refresh"]);
+        assert.equal(workspace, "/tmp/workspace");
+        return runInstructionSnapshot;
+      },
       phaseRunners: {
         buildAttachmentContext: async (input) => {
           harness.calls.push(["attachment", input.text, input.mentions, input.files]);
@@ -590,6 +617,7 @@ test("submit async workflow run keeps stage order from context build to engine l
             input.workspaceTree,
             input.gameStudioConfigForTurn?.engine,
             input.turnAgentMessagesStart,
+            input.workspaceInstructionContext,
           ]);
           return {
             ...input,
@@ -618,6 +646,8 @@ test("submit async workflow run keeps stage order from context build to engine l
       "prompt",
       "studio",
       "clear_context",
+      "instruction_refresh",
+      "log",
       "workspace_tree",
       "log",
       "lease",
@@ -634,8 +664,80 @@ test("submit async workflow run keeps stage order from context build to engine l
     "existing proposal",
     "assistant:turn-1",
   ]);
-  assert.equal(harness.calls[5][1], "workspace_tree_ready");
-  assert.equal(harness.calls[7][1], "[D] src");
+  assert.equal(
+    harness.calls[5][1],
+    "workspace_instructions_refreshed",
+  );
+  assert.equal(harness.calls[7][1], "workspace_tree_ready");
+  assert.equal(harness.calls[9][1], "[D] src");
+  assert.match(harness.calls[9][4], /Run focused tests/);
+});
+
+test("an admitted A Run keeps its A instruction snapshot when the UI switches to B", async () => {
+  const instructionSet = (workspace, content) => ({
+    layers: [{
+      id: `legacy:${workspace}:0`,
+      title: "AGENTS.md",
+      content,
+      order: 0,
+      source: {
+        id: `legacy:${workspace}:0`,
+        name: "AGENTS.md",
+        kind: "legacy",
+        path: "AGENTS.md",
+        enabled: true,
+        order: 0,
+      },
+    }],
+    templates: [],
+    sources: [],
+    matchedRules: [],
+    associatedPaths: [],
+    loadedAt: 1,
+    debugSummary: "",
+  });
+  const workspaceA = "/tmp/workspace-a";
+  const workspaceB = "/tmp/workspace-b";
+  const aInstructions = instructionSet(workspaceA, "Only rule A");
+  const bInstructions = instructionSet(workspaceB, "Only rule B");
+  let capturedContext = "";
+  const harness = createHarness({
+    state: {
+      currentWorkspace: workspaceA,
+      resolvedInstructionSet: aInstructions,
+    },
+    input: {
+      runWorkspace: workspaceA,
+      runScopeKey: workspaceA,
+      refreshWorkspaceContext: async (workspace) => {
+        assert.equal(workspace, workspaceA);
+        // The active UI moves to B while A's asynchronous load is in flight.
+        harness.state.currentWorkspace = workspaceB;
+        harness.state.resolvedInstructionSet = bInstructions;
+        await Promise.resolve();
+        return aInstructions;
+      },
+      phaseRunners: {
+        createRuntimeContext: (input) => {
+          capturedContext = input.workspaceInstructionContext;
+          return {
+            ...input,
+            streamBuffer: null,
+            thinkingInterceptor: null,
+            agentBlockIdsCreatedThisRun: new Set(),
+          };
+        },
+        runRuntime: () => Promise.resolve(true),
+      },
+    },
+  });
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.match(capturedContext, /Only rule A/);
+  assert.doesNotMatch(capturedContext, /Only rule B/);
+  assert.equal(harness.state.currentWorkspace, workspaceB);
+  assert.equal(harness.state.resolvedInstructionSet, bInstructions);
 });
 
 test("submit async workflow run stops before launch when Game Studio preparation fails", async () => {

@@ -32,7 +32,6 @@ export type RuntimeV2ProjectionAudience =
 export type RuntimeV2CommandKind =
   | "collect_observation"
   | "request_model"
-  | "commit_execution_contract"
   | "execute_tool"
   | "execute_validation"
   | "schedule_subagents"
@@ -44,6 +43,11 @@ export type RuntimeV2TransportVariant =
   | "native_required"
   | "native_auto"
   | "text_envelope";
+
+export type RuntimeV2SubagentHandoffApplicationSource =
+  | "provider_result"
+  | "command"
+  | "final";
 
 /** Recovery is deliberately scoped to a durable, structural fact. Model prose
  * and loop counts are not valid recovery keys. */
@@ -57,7 +61,6 @@ export interface RuntimeV2RecoveryReceipt {
   readonly scope: RuntimeV2RecoveryScope;
   readonly fingerprint: string;
   readonly count: number;
-  readonly epoch: number;
   readonly lastAttemptAt: number;
 }
 
@@ -108,7 +111,7 @@ export interface RuntimeV2EvidenceReference {
 }
 
 export interface RuntimeV2ExecutionValidationAuthority {
-  readonly kind: "execution_contract" | "work_plan";
+  readonly kind: "direct_execute" | "work_plan";
   readonly id: string;
   readonly revision: number;
   readonly digest: string;
@@ -150,7 +153,6 @@ export interface RuntimeV2RecoveryBudget {
   readonly actionRepeats: number;
   readonly contextRefreshes: number;
   readonly diagnosticRepairs: number;
-  readonly epoch: number;
   /** A bounded, replayable receipt ledger rather than process-local counters. */
   readonly receipts: readonly RuntimeV2RecoveryReceipt[];
   readonly exhausted: RuntimeV2RecoveryExhaustion | null;

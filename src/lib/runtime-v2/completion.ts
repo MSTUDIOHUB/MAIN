@@ -38,10 +38,10 @@ export function exhaustedRuntimeV2ResultKind(
 
 /**
  * Determine only outcomes that the runtime can prove from structured facts.
- * In particular, an investigation summary without a tool call is not a
- * partial conclusion: local models often emit it immediately before their
- * first useful action, and the bounded command policy should get its chance
- * to recover the protocol first.
+ * A provider response without a tool call is the ordinary agent-loop finish
+ * signal. The Runtime never upgrades its prose into success: structured
+ * mutation and validation facts still decide whether that finish is success,
+ * partial, or error.
  */
 export function decideRuntimeV2TerminalOutcome(
   aggregate: TurnAggregateV1,
@@ -64,12 +64,25 @@ export function decideRuntimeV2TerminalOutcome(
       facts.mutationCount > 0 &&
       facts.hasAcceptanceValidation &&
       facts.failedValidationCount === 0;
-    if (!hasVerifiedEffect || !facts.hasProviderConclusion) return null;
-    return {
-      resultKind: "success",
-      resultReason:
-        "最新工作区效果已由后续有限验证确认，并已生成基于实际证据的完成报告。",
-    };
+    if (!facts.hasProviderConclusion) return null;
+    if (hasVerifiedEffect) {
+      return {
+        resultKind: "success",
+        resultReason:
+          "最新工作区效果已由后续有限验证确认，并已生成基于实际证据的完成报告。",
+      };
+    }
+    return facts.mutationCount > 0
+      ? {
+          resultKind: "partial",
+          resultReason:
+            "模型已结束本轮，但最新修改尚未获得与用户目标匹配的完整验收证据。",
+        }
+      : {
+          resultKind: "error",
+          resultReason:
+            "模型已结束本轮，但没有形成可验收的实际修改。",
+        };
   }
   const approvedPlanCoverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
   if (approvedPlanCoverage) {

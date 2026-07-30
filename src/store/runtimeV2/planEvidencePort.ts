@@ -12,10 +12,12 @@ import { PlanLedger } from "./planLedger";
 import {
   PLAN_CONTEXT_RESULT_CHARS,
   PLAN_READ_ONLY_TOOL_NAMES,
-  boundedPlanContent,
   compactRetainedPlanObservation,
 } from "./planModelProtocol";
-import { runtimeV2ContextBoundToolArguments } from "./executionText";
+import {
+  boundedRuntimeV2ToolContent,
+  runtimeV2ContextBoundToolArguments,
+} from "./executionText";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 
@@ -56,6 +58,7 @@ export async function executeReadOnlyPlanTool(input: {
   readonly messages: AgentMessage[];
   readonly evidence: WorkPlanRuntimeEvidence[];
   readonly evidenceContents: Map<string, string>;
+  readonly parallelReadCount: number;
   readonly logStoreEvent: RuntimeV2PlanLog;
 }): Promise<void> {
   const args = input.call.arguments;
@@ -84,12 +87,17 @@ export async function executeReadOnlyPlanTool(input: {
         input.call.name,
         args,
         input.context.runtimeContextBudget,
+        { parallelReadCount: input.parallelReadCount },
       ),
       input.context.runWorkspace || "",
       input.context.runSessionKey,
     );
     const target = getToolTarget(input.call.name, args) || input.call.name;
-    const content = boundedPlanContent(output);
+    const content = boundedRuntimeV2ToolContent(
+      input.call.name,
+      output,
+      input.context.runtimeContextBudget,
+    );
     const version = await resolveRuntimeV2SourceEvidenceVersion({
       toolName: input.call.name,
       args,

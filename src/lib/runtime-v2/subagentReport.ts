@@ -29,12 +29,14 @@ function strings(value: unknown, max: number, itemMax: number): string[] {
   )].slice(0, max);
 }
 
-/** Compile a child-authored report only when every cited id belongs to an
- * actual successful child observation. Prose and path mentions cannot invent
- * evidence or upgrade a failed child to completed. */
+/** Compile a child-authored report only when every cited id belongs either to
+ * an actual successful child observation or to versioned parent evidence that
+ * was explicitly handed to a review child. Keeping the two collections
+ * separate prevents inherited context from being counted as child output. */
 export function compileRuntimeV2SubagentReport(input: {
   readonly draft: unknown;
   readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly inheritedEvidence?: readonly RuntimeV2EvidenceReference[];
 }): RuntimeV2SubagentReportV1 {
   const draft =
     input.draft && typeof input.draft === "object" &&
@@ -49,7 +51,8 @@ export function compileRuntimeV2SubagentReport(input: {
     throw new Error("RUNTIME_V2_SUBAGENT_REPORT_INVALID:findings_missing");
   }
   const realEvidenceIds = new Set(
-    input.evidence.map((evidence) => evidence.id),
+    [...input.evidence, ...(input.inheritedEvidence || [])]
+      .map((evidence) => evidence.id),
   );
   const findings = draft.findings.slice(0, 32).map((value, index) => {
     const finding =
@@ -87,9 +90,37 @@ export function compileRuntimeV2SubagentReport(input: {
   };
 }
 
+/** Convert ordinary child final text into the structured report boundary.
+ * Runtime may only attach ids that the child actually named in that text; it
+ * must never manufacture adoption by citing every item that happened to be
+ * available in the context capsule. */
+export function compileRuntimeV2SubagentTextReport(input: {
+  readonly summary: string;
+  readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly inheritedEvidence?: readonly RuntimeV2EvidenceReference[];
+}): RuntimeV2SubagentReportV1 {
+  const citedEvidence = [
+    ...input.evidence,
+    ...(input.inheritedEvidence || []),
+  ].filter((evidence) => input.summary.includes(evidence.id));
+  return compileRuntimeV2SubagentReport({
+    draft: {
+      summary: input.summary,
+      findings: [{
+        statement: input.summary,
+        evidence_ids: citedEvidence.map((evidence) => evidence.id),
+      }],
+      unresolved: [],
+    },
+    evidence: input.evidence,
+    inheritedEvidence: input.inheritedEvidence,
+  });
+}
+
 export function validateRuntimeV2SubagentReport(input: {
   readonly report: RuntimeV2SubagentReportV1 | null | undefined;
   readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly inheritedEvidence?: readonly RuntimeV2EvidenceReference[];
 }): boolean {
   if (
     !input.report ||
@@ -109,6 +140,7 @@ export function validateRuntimeV2SubagentReport(input: {
         unresolved: input.report.unresolved,
       },
       evidence: input.evidence,
+      inheritedEvidence: input.inheritedEvidence,
     });
     return JSON.stringify(rebuilt) === JSON.stringify(input.report);
   } catch {

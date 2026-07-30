@@ -38,10 +38,6 @@ function loadPlanContractModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planContract.ts"));
 }
 
-function loadPlanExecutionNoToolModule() {
-  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionNoTool.ts"));
-}
-
 function loadPlanLifecycleModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
 }
@@ -273,11 +269,6 @@ function createTypedReviewablePlanArtifact(overrides = {}) {
     ...overrides,
   };
 }
-
-const {
-  buildPlanExecutionNoToolRecoveryPrompt,
-  shouldHandleApprovedPlanExecutionNoTool,
-} = loadPlanExecutionNoToolModule();
 
 const {
   buildClosedActivePlanRuntimePatch,
@@ -5047,73 +5038,6 @@ test("validatePlanArtifactContent requires inferable task evidence", () => {
   );
   assert.equal(validatePlanArtifactContent(bugfixWithoutEvidence, "bugfix").ok, false);
   assert.equal(validatePlanArtifactContent(bugfixWithEvidence, "bugfix").ok, true);
-});
-
-test("approved plan execution no-tool recovery bypasses generic missing-tool stop", () => {
-  const audit = buildPlanTaskEvidenceAudit({
-    tasks: extractPlanTasks("- [ ] 修复执行阶段状态边界 — 证据: file:src/store/useAppStore.ts"),
-    evidenceLedger: [],
-    highlightNext: true,
-  });
-
-  assert.equal(
-    shouldHandleApprovedPlanExecutionNoTool({
-      isPlanApproved: true,
-      planStage: "executing",
-      toolCallCount: 0,
-      audit,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldHandleApprovedPlanExecutionNoTool({
-      isPlanApproved: true,
-      planStage: "design",
-      toolCallCount: 0,
-      audit,
-    }),
-    false,
-  );
-
-  const advisoryAudit = buildPlanTaskEvidenceAudit({
-    tasks: extractPlanTasks("- [ ] 用户手动确认最终交互 — 证据: manual_user_validation:user confirmation"),
-    evidenceLedger: [],
-  });
-  assert.equal(advisoryAudit.acceptedCompletion, true);
-  assert.equal(
-    shouldHandleApprovedPlanExecutionNoTool({
-      isPlanApproved: true,
-      planStage: "executing",
-      toolCallCount: 0,
-      audit: advisoryAudit,
-    }),
-    false,
-  );
-
-  const prompt = buildPlanExecutionNoToolRecoveryPrompt({
-    language: "zh",
-    forceXmlTools: true,
-    missingTasksArtifact: false,
-    remainingText: audit.blockedReasons.join("\n"),
-    commandHint: "命令提示",
-  });
-  assert.match(prompt, /TOOL_ONLY_RECOVERY/);
-  assert.match(prompt, /已批准计划正在执行/);
-  assert.match(prompt, /真实 `<tool_use>`/);
-  assert.match(prompt, /read_file/);
-  assert.match(prompt, /apply_patch/);
-  assert.match(prompt, /browser_evaluate/);
-  assert.match(prompt, /完成任务前必须先产生真实工具证据/);
-  assert.match(prompt, /src\/store\/useAppStore\.ts/);
-  assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
-
-  const nativePrompt = buildPlanExecutionNoToolRecoveryPrompt({
-    language: "en",
-    missingTasksArtifact: false,
-    remainingText: "file evidence for src/store/useAppStore.ts",
-  });
-  assert.match(nativePrompt, /formal tool call from the active schemas/);
-  assert.doesNotMatch(nativePrompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("collectChangeEntries ignores ephemeral plan files but keeps source and bugfix diffs", () => {

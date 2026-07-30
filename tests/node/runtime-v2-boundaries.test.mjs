@@ -53,7 +53,13 @@ test("Runtime v2 core has no Store/UI/legacy imports and no local dependency cyc
   const visited = new Set();
   const visit = (file, trail = []) => {
     if (visiting.has(file)) {
-      assert.fail(`Runtime v2 local import cycle: ${[...trail, file].map(path.basename).join(" -> ")}`);
+      assert.fail(
+        `Runtime v2 local import cycle: ${
+          [...trail, file]
+            .map((entry) => path.basename(entry))
+            .join(" -> ")
+        }`,
+      );
     }
     if (visited.has(file)) return;
     visiting.add(file);
@@ -194,6 +200,10 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
     "Plan orchestration must not encode one incident's likely diagnosis",
   );
   assert.match(protocol, /type PlanModelStage = "discovery" \| "synthesis"/);
-  assert.match(runner, /PLAN_DISCOVERY_ACTION_BUDGET/);
-  assert.match(runner, /runtime_v2_plan_synthesis_boundary/);
+  assert.doesNotMatch(
+    source,
+    /PLAN_DISCOVERY_ACTION_BUDGET|PLAN_DISCOVERY_DEADLINE_MS|action_budget|time_budget/,
+    "planning may compact softly but only the shared lifecycle deadline may end discovery",
+  );
+  assert.match(runner, /PLAN_MODEL_DEADLINE_MS/);
 });

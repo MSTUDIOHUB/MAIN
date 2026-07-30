@@ -1,4 +1,4 @@
-import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { withRuntimeV2HardDeadline } from "./hardDeadline";
 
 export const RUNTIME_V2_SOURCE_TOOL_TIMEOUT_MS = 45_000;
@@ -11,7 +11,7 @@ const RUNTIME_V2_BOUNDED_VALIDATION_TOOLS = new Set([
 ]);
 
 export function runtimeV2ToolDeadlineMs(toolName: string): number | null {
-  if (RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)) {
+  if (RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)) {
     return RUNTIME_V2_SOURCE_TOOL_TIMEOUT_MS;
   }
   return RUNTIME_V2_BOUNDED_VALIDATION_TOOLS.has(toolName)

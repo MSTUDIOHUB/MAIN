@@ -11,6 +11,7 @@ import {
   type RuntimeV2TurnIdentity,
 } from "../../lib/runtime-v2";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
+import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { getRuntimeV2Checkpoint, createRuntimeV2CheckpointPort } from "./checkpointPort";
 import {
@@ -80,7 +81,7 @@ function identities(
   const sessionEpoch = sessionEpochFor(state, context, turn);
   return {
     turn: {
-      workspaceKey: String(context.runWorkspace || "").trim(),
+      workspaceKey: String(context.runScopeKey).trim(),
       sessionKey: context.runSessionKey,
       sessionEpoch,
       clientSubmissionId: String(turn.clientSubmissionId || turn.id).trim(),
@@ -168,8 +169,10 @@ export async function runSubmitRuntimeV2WorkspaceRead(
 ): Promise<RuntimeRunSettlement> {
   const now = input.now || Date.now;
   const workspace = String(input.context.runWorkspace || "").trim();
-  if (!workspace) {
-    throw new Error("RUNTIME_V2_WORKSPACE_READ_REQUIRES_WORKSPACE");
+  const hasAttachedFiles =
+    input.context.turnInputContextSignals.attachedFilePaths.length > 0;
+  if (!workspace && !hasAttachedFiles) {
+    throw new Error("RUNTIME_V2_BOUNDED_READ_REQUIRES_SOURCE_SCOPE");
   }
   const initialState = input.get();
   const turn = currentTurn(initialState, input.context.turnId);
@@ -215,6 +218,7 @@ export async function runSubmitRuntimeV2WorkspaceRead(
     }),
     tool: createRuntimeV2ToolPort({
       get: input.get,
+      set: input.set,
       context: input.context,
       live,
       nextId,
@@ -256,12 +260,13 @@ export async function runSubmitRuntimeV2WorkspaceRead(
         run: identity.run,
         strategy: "analyze",
         objective: turn.userPrompt,
-        initialPhase: "preparing",
+        initialPhase: workspace ? "preparing" : "observing",
       });
       input.logStoreEvent("runtime_v2_workspace_read_admitted", {
         turnId: identity.turn.turnId,
         runId: identity.run.runId,
-        workspace,
+        workspace: workspace || null,
+        sourceScope: workspace ? "workspace" : "attachments",
         strategy: "analyze",
       });
     } else if (existing.aggregate.terminalOutcome) {
@@ -288,10 +293,18 @@ export async function runSubmitRuntimeV2WorkspaceRead(
     while (true) {
       const before = controller.snapshot().aggregate;
       if (!before || before.terminalOutcome) break;
+      if (live.permissionRejection) {
+        await controller.driveOnce({
+          resultKind: "blocked",
+          resultReason: live.permissionRejection.reason,
+          finalMarkdown: live.permissionRejection.finalMarkdown,
+        });
+        continue;
+      }
       if (now() - admittedAt >= deadlineMs) {
         await controller.driveOnce({
           resultKind: "partial",
-          resultReason: "工作区只读任务已到达生命周期时限；已保留读取到的证据并完成终态收口。",
+          resultReason: "只读任务已到达生命周期时限；已保留读取到的证据并完成终态收口。",
         });
         break;
       }
@@ -322,6 +335,10 @@ export async function runSubmitRuntimeV2WorkspaceRead(
       const drove = await controller.driveOnce({
         subagentPreference:
           input.context.turnInputContextSignals.subagentPreference,
+        subagentCapacity:
+          resolveSubagentCapacityPolicy(
+            input.get().config,
+          ).maxActiveRequests,
       });
       if (!drove) {
         await controller.driveOnce({

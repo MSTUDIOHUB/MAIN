@@ -18,7 +18,6 @@ import type {
   RuntimeV2PlanReviewCommit,
   SealedWorkPlanV1,
 } from "./workPlan";
-import type { RuntimeV2ExecutionContractV1 } from "./executionContract";
 
 export interface RuntimeV2RunState {
   readonly identity: RuntimeV2RunIdentity;
@@ -41,9 +40,6 @@ export interface TurnAggregateV1 {
    * are projections of this value, never inputs used to reconstruct it. */
   readonly sealedWorkPlan: SealedWorkPlanV1 | null;
   readonly planReviewCommit: RuntimeV2PlanReviewCommit | null;
-  /** Runtime-owned Execute authority. Provider drafts are compiled against
-   * the immutable admitted objective and versioned source evidence. */
-  readonly executionContract: RuntimeV2ExecutionContractV1 | null;
   readonly scheduledCommands: readonly RuntimeV2Command[];
   /** Completed receipts make a cold recovery distinguish an unstarted effect
    * from a command that already consumed its bounded retry budget. */

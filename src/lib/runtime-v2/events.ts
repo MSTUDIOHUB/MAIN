@@ -11,6 +11,7 @@ import {
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
   type RuntimeV2Strategy,
+  type RuntimeV2SubagentHandoffApplicationSource,
   type RuntimeV2SubagentJob,
   type RuntimeV2SubagentStatus,
   type RuntimeV2SubagentTelemetry,
@@ -23,12 +24,8 @@ import type {
   RuntimeV2PlanReviewCommit,
   SealedWorkPlanV1,
 } from "./workPlan";
-import type {
-  RuntimeV2ExecutionContractV1,
-} from "./executionContract";
 import type { RuntimeV2SubagentReportV1 } from "./subagentReport";
 import type {
-  RuntimeV2SubagentValidationReceiptV1,
   RuntimeV2ValidatedMutationVersion,
 } from "./validationReceipt";
 
@@ -91,6 +88,10 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      /** A replay closes the provider tool pair with an already committed
+       * same-version receipt. It is not a new observation or progress
+       * boundary and therefore carries no new evidence. */
+      readonly receiptOrigin?: "executed" | "replayed";
       readonly presentation?: RuntimeV2ToolPresentation;
       readonly failureKind?:
         | "execution_failed"
@@ -125,23 +126,6 @@ export type RuntimeV2Event =
         | "protocol_invalid";
     })
   | (RuntimeV2EventBase & {
-      readonly type: "execution_contract.committed";
-      readonly run: RuntimeV2RunIdentity;
-      readonly contract: RuntimeV2ExecutionContractV1;
-    })
-  | (RuntimeV2EventBase & {
-      readonly type: "execution_contract.rejected";
-      readonly run: RuntimeV2RunIdentity;
-      readonly reason: string;
-    })
-  | (RuntimeV2EventBase & {
-      readonly type: "execution_contract.invalidated";
-      readonly run: RuntimeV2RunIdentity;
-      readonly contractId: string;
-      readonly revision: number;
-      readonly reason: string;
-    })
-  | (RuntimeV2EventBase & {
       readonly type: "work_plan.sealed";
       readonly run: RuntimeV2RunIdentity;
       readonly workPlan: RuntimeV2WorkPlanReference;
@@ -158,12 +142,6 @@ export type RuntimeV2Event =
       readonly run: RuntimeV2RunIdentity;
       readonly workPlan: RuntimeV2WorkPlanReference;
       readonly reason: string;
-    })
-  | (RuntimeV2EventBase & {
-      readonly type: "recovery.epoch_opened";
-      readonly run: RuntimeV2RunIdentity;
-      readonly reason: string;
-      readonly evidence: readonly RuntimeV2EvidenceReference[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "recovery.recorded";
@@ -193,6 +171,7 @@ export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "subagents.scheduled";
       readonly run: RuntimeV2RunIdentity;
+      readonly maxActiveSubagents: number;
       readonly jobs: readonly RuntimeV2SubagentJob[];
     })
   | (RuntimeV2EventBase & {
@@ -209,10 +188,30 @@ export type RuntimeV2Event =
         "completed" | "degraded" | "failed" | "canceled"
       >;
       readonly summary: string;
+      /** Parent evidence available to a review child. It is not appended to
+       * the aggregate again and cannot be counted as child-produced evidence. */
+      readonly inheritedEvidence?:
+        readonly RuntimeV2EvidenceReference[];
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly report?: RuntimeV2SubagentReportV1;
-      readonly validationReceipts?:
-        readonly RuntimeV2SubagentValidationReceiptV1[];
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "subagent.handoff_delivered";
+      /** Parent Run that received the child result. */
+      readonly run: RuntimeV2RunIdentity;
+      readonly jobId: string;
+      readonly contextEntryId: string;
+      readonly evidenceIds: readonly string[];
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "subagent.handoff_applied";
+      /** Parent Run that explicitly used child evidence. */
+      readonly run: RuntimeV2RunIdentity;
+      readonly jobId: string;
+      readonly evidenceIds: readonly string[];
+      readonly sourceEventId: string;
+      readonly source:
+        RuntimeV2SubagentHandoffApplicationSource;
     })
   | (RuntimeV2EventBase & {
       readonly type: "projection.published";

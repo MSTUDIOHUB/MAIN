@@ -71,6 +71,29 @@ test("finite command analysis proves every fail-fast shell segment", () => {
   ]) {
     assert.equal(analyzeValidationCommand(command).spec, null, command);
   }
+
+  const redirected = analyzeValidationCommand("npm test 2>&1");
+  assert.equal(redirected.rejectionReason, null);
+  assert.equal(redirected.spec?.kind, "finite_command");
+  assert.equal(
+    analyzeValidationCommand("npm test 2>&1 | head -50").rejectionReason,
+    "pipeline_exit_status_ambiguous",
+  );
+  assert.equal(
+    analyzeValidationCommand("npm test &>test.log").spec?.kind,
+    "finite_command",
+  );
+
+  const directBuild = analyzeValidationCommand(
+    "cd /tmp/workspace && npx vite build 2>&1",
+  );
+  assert.equal(directBuild.rejectionReason, null);
+  assert.equal(directBuild.spec?.kind, "finite_command");
+  assert.equal(directBuild.spec?.capability, "build");
+  assert.deepEqual(directBuild.segments.map((segment) => segment.role), [
+    "prelude",
+    "validator",
+  ]);
 });
 
 test("inline commands require decidable failure semantics and reject resident runtimes", () => {

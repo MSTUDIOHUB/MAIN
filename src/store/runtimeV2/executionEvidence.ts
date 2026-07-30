@@ -18,10 +18,9 @@ import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
-import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { authorizationFor } from "./executionAuthorization";
 import { aggregateForCurrentTurn } from "./executionAggregate";
-import { recordModelContext } from "./executionProviderContext";
 import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
 import type {
   RuntimeV2ExecutionPortsInput,
@@ -45,7 +44,7 @@ export function nextEvidenceId(live: RuntimeV2LiveExecutionState): string {
   return `E${live.evidenceCounter}`;
 }
 
-export function recordToolModelContext(input: {
+export function recordToolResultHistory(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly toolName: string;
@@ -54,14 +53,6 @@ export function recordToolModelContext(input: {
   readonly content: string;
 }): void {
   const toolCallId = String(input.command.payload.toolCallId || "");
-  recordModelContext(input.ports.live, {
-    id: `tool-result:${toolCallId || input.ports.nextId("tool-context")}`,
-    source: "tool",
-    label: input.toolName || "unknown_tool",
-    target: input.target || input.toolName || "workspace",
-    status: input.status,
-    content: input.content,
-  });
   appendRuntimeV2ToolResultHistory(
     input.ports.live,
     toolCallId,
@@ -148,9 +139,16 @@ export function parseResultRecord(value: unknown): Record<string, unknown> | nul
 /** Decode structured command results before retaining them as model context.
  * Keeping JSON-escaped stdout/stderr as one line prevents the recovery layer
  * from seeing compiler and test `path:line` diagnostics. */
-export function modelContextContentForToolOutput(output: unknown): string {
+export function toolResultContentForModel(output: unknown): string {
   const result = parseResultRecord(output);
-  if (!result) return typeof output === "string" ? output : String(output ?? "");
+  if (!result) {
+    const text = typeof output === "string"
+      ? output
+      : String(output ?? "");
+    return text.length > 0
+      ? text
+      : "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.";
+  }
   const exitCode = typeof result.exitCode === "number"
     ? result.exitCode
     : typeof result.exit_code === "number"
@@ -180,8 +178,10 @@ export function modelContextContentForToolOutput(output: unknown): string {
   return content.length > 0
     ? content.join("\n")
     : typeof output === "string"
-      ? output
-      : JSON.stringify(output);
+      ? output ||
+        "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches."
+      : JSON.stringify(output) ||
+        "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.";
 }
 
 export function isRuntimeV2ValidationPassed(
@@ -306,30 +306,8 @@ export function isRuntimeV2ValidationPassed(
   return false;
 }
 
-function validationPrimitiveForCommand(
-  input: RuntimeV2ExecutionPortsInput,
-  command: RuntimeV2Command,
-): ValidationPrimitiveSpec | undefined {
-  const authority = command.payload.validationAuthority as
-    RuntimeV2ExecutionValidationAuthority | undefined;
-  const contract = aggregateForCurrentTurn(input)?.executionContract;
-  if (
-    authority?.kind !== "execution_contract" ||
-    !contract ||
-    contract.status !== "active" ||
-    authority.id !== contract.id ||
-    authority.revision !== contract.revision ||
-    authority.digest !== contract.digest
-  ) {
-    return undefined;
-  }
-  return contract.validations.find((validation) =>
-    validation.id === authority.validationId
-  )?.primitive;
-}
-
 export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
-  const stableDiagnostic = modelContextContentForToolOutput(output)
+  const stableDiagnostic = toolResultContentForModel(output)
     .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/:\d+(?::\d+)?\b/g, ":<line>")
     .replace(/\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?)\b/gi, "<duration>")
@@ -342,7 +320,7 @@ export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
 }
 
 function boundedPresentationText(value: unknown, max: number): string {
-  const text = modelContextContentForToolOutput(value)
+  const text = toolResultContentForModel(value)
     .replace(/\u001b\[[0-9;]*m/g, "")
     .trim();
   if (!text) return "";
@@ -468,7 +446,7 @@ export function toolCompletionFor(
       : [target || toolName];
     const evidenceKind = isWorkspaceMutationToolName(toolName)
       ? "mutation" as const
-      : RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)
+      : RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)
         ? "source" as const
         : "tool" as const;
     return toolResultEvent(
@@ -494,7 +472,7 @@ export function toolCompletionFor(
     isRuntimeV2ValidationPassed(
       toolName,
       output,
-      validationPrimitiveForCommand(input, command),
+      undefined,
     );
   const validationFailureKind =
     failureKind === "source_mismatch" ||
@@ -525,7 +503,7 @@ export function toolCompletionFor(
 /** Preserve semantic failure in the provider context even when the underlying
  * tool transport itself completed successfully. A finite validator with a
  * non-zero exit code is failed evidence, not a successful tool observation. */
-export function modelContextStatusForCompletion(
+export function toolResultStatusForCompletion(
   completion: RuntimeV2EventDraft,
 ): "succeeded" | "failed" | "blocked" {
   if (completion.type === "validation.completed") {

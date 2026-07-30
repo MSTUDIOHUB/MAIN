@@ -2,16 +2,15 @@ import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   buildRuntimeV2CapsuleProjection,
   buildRuntimeV2TimelineProjection,
-  canRecordRuntimeV2Recovery,
   createRuntimeV2Checkpoint,
   finishRuntimeV2CheckpointTerminal,
+  shouldRecordRuntimeV2SoftSignal,
   type CheckpointPort,
   type ProjectionPort,
   type RuntimeV2Command,
   type RuntimeV2Event,
   type RuntimeV2EventDraft,
   type RuntimeV2Projection,
-  type RuntimeV2RecoveryScope,
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
   type RuntimeV2TurnIdentity,
@@ -162,37 +161,6 @@ export class PlanLedger {
     }
   }
 
-  async recordRecovery(input: {
-    readonly run: RuntimeV2RunIdentity;
-    readonly scope: RuntimeV2RecoveryScope;
-    readonly fingerprint: string;
-    readonly reason: string;
-  }): Promise<boolean> {
-    const aggregate = this.aggregate;
-    if (!aggregate || aggregate.recovery.exhausted) return false;
-    if (canRecordRuntimeV2Recovery(
-      aggregate.recovery,
-      input.scope,
-      input.fingerprint,
-    )) {
-      await this.append({
-        type: "recovery.recorded",
-        run: input.run,
-        scope: input.scope,
-        fingerprint: input.fingerprint,
-      });
-      return true;
-    }
-    await this.append({
-      type: "recovery.exhausted",
-      run: input.run,
-      scope: input.scope,
-      fingerprint: input.fingerprint,
-      reason: input.reason,
-    });
-    return false;
-  }
-
   async recordSoftSignal(
     run: RuntimeV2RunIdentity,
     signal:
@@ -204,6 +172,13 @@ export class PlanLedger {
       | "protocol_drift"
       | "repeated_action",
   ): Promise<void> {
+    const aggregate = this.aggregate;
+    if (
+      !aggregate ||
+      !shouldRecordRuntimeV2SoftSignal({ aggregate, signal })
+    ) {
+      return;
+    }
     await this.append({ type: "soft_signal.observed", run, signal });
   }
 

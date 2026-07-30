@@ -35,6 +35,10 @@ import type {
   GoalContinuationAuthorization,
   GoalCreationAuthorization,
 } from "../lib/submit/turnSubmission";
+import {
+  renderResolvedInstructionContext,
+  type ResolvedInstructionSet,
+} from "../lib/instructions";
 import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
@@ -125,6 +129,7 @@ export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparation
     sessionRecordingEnabled?: boolean;
     reasoningDisplay?: string;
   };
+  resolvedInstructionSet?: ResolvedInstructionSet | null;
   startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
 }
 
@@ -225,6 +230,14 @@ export interface StartSubmitAsyncWorkflowRunInput<
     owner: HarnessRunOwner,
   ) => HarnessRunMarker | null;
   getWorkspaceTree: (workspace: string) => Promise<string>;
+  /**
+   * Loads the exact live project rules for this Run's immutable workspace.
+   * The returned snapshot belongs to the Run and is independent of the live UI
+   * workspace projection.
+   */
+  refreshWorkspaceContext?: (
+    workspace: string,
+  ) => Promise<ResolvedInstructionSet | null>;
   nowMs: () => number;
   sendStartedAt: number;
   getLastTurnToolSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
@@ -1774,6 +1787,34 @@ export async function runSubmitAsyncWorkflowRun<
   // Workspace discovery is fallible and does not require an execution lease.
   // Resolve it before marking the harness/run as active so a read failure can
   // be finalized as a pre-run conclusion instead of stranding a running lease.
+  let resolvedInstructionSnapshot: ResolvedInstructionSet | null = null;
+  if (input.refreshWorkspaceContext) {
+    const instructionRefreshStartedAt = input.nowMs();
+    try {
+      resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
+        input.runWorkspace,
+      );
+      input.logStoreEvent("workspace_instructions_refreshed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
+        elapsedMs: Math.round(
+          input.nowMs() - instructionRefreshStartedAt,
+        ),
+      });
+    } catch (error) {
+      // Instruction discovery is advisory bootstrap I/O. Do not borrow the
+      // live UI projection because it may already belong to another workspace.
+      // Ordinary source tools can continue the Turn without an instruction
+      // snapshot.
+      input.logStoreEvent("workspace_instructions_refresh_failed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   const workspaceTreeStartedAt = input.nowMs();
   const workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
   input.logStoreEvent("workspace_tree_ready", {
@@ -1976,6 +2017,9 @@ export async function runSubmitAsyncWorkflowRun<
     mentionSnapshot: input.mentionSnapshot,
     remoteFeishu: input.remoteFeishu,
     workspaceTree,
+    workspaceInstructionContext: renderResolvedInstructionContext(
+      resolvedInstructionSnapshot,
+    ),
     gameStudioConfigForTurn: gameStudioPreparation.gameStudioConfigForTurn,
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,

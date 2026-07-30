@@ -105,7 +105,12 @@ test("ordinary composer command creates a new turn instead of consuming stale re
 
   const command = "首先执行P0的重构，如果有任何不确定的方向请向我提问。";
   await page.getByTestId("composer-textarea").fill(command);
-  await page.getByTestId("composer-send-button").click();
+  // The paused choice owner makes Composer Queue-only. The durable queue still
+  // admits this as a distinct Turn immediately; it must not resolve the old
+  // choice request or masquerade as a concurrent direct submit.
+  await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-queue-button")).toBeVisible();
+  await page.getByTestId("composer-queue-button").click();
 
   // Workspace instructions are admitted as Turns before intent routing. They
   // must never fall back to the legacy pre-Turn execution-confirmation chat.
@@ -137,10 +142,22 @@ test("ordinary composer command creates a new turn instead of consuming stale re
     )
     .toEqual([]);
 
-  const originalTurnCheckpoint = page.locator(
-    '[data-testid="turn-choice-checkpoint"][data-turn-id="e2e-awaiting-choice-turn"]',
-  );
-  await expect(originalTurnCheckpoint).toBeVisible();
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().workspaceTurnQueueEntries ?? []),
+    )
+    .toEqual([
+      expect.objectContaining({ status: "queued", text: command }),
+    ]);
+
+  // Until the queued Turn is dispatched, the original pending request remains
+  // the global Capsule owner. It must stay actionable and must not be copied
+  // into a second inline checkpoint.
+  const originalTurnCapsule = page.getByTestId("agent-explanation-capsule");
+  await expect(originalTurnCapsule).toHaveAttribute("data-turn-id", "e2e-awaiting-choice-turn");
+  await expect(originalTurnCapsule).toHaveAttribute("data-request-id", "request-e2e-awaiting-choice");
+  await expect(originalTurnCapsule.getByTestId("execution-capsule-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("turn-choice-checkpoint")).toHaveCount(0);
 });
 
 test("mixed choice options keep execution choices together and split read-only permissions", async ({ page }) => {

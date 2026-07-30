@@ -4,40 +4,6 @@ inclusion: always
 
 # Project Conventions
 
-## 通用编码规范
-
-### 命名
-- 类名：`PascalCase`
-- 方法名：`PascalCase`（C#）/ `camelCase`（TypeScript/Python）
-- 私有字段：`_camelCase`（C#）/ `camelCase`（TypeScript）
-- 常量：`UPPER_SNAKE_CASE` 或 `PascalCase`（取决于语言惯例）
-- 接口：`IPascalCase`（C#）/ `PascalCase`（TypeScript，不加 I 前缀）
-
-### 文件组织
-- 一个文件一个主类型（C#），或一个文件一个组件/模块（TypeScript）。
-- 文件名与主类型名一致。
-- 相关类型放在同一目录下，不跨模块引用内部实现。
-
-### 注释与文档
-- 公共 API 必须有 XML doc（C#）或 JSDoc（TypeScript）注释。
-- 注释解释「为什么」，不解释「是什么」。
-- TODO 标记格式：`// TODO(owner): 描述`
-
-### 错误处理
-- 不要吞掉异常。如果必须忽略，写明原因。
-- 校验输入在最外层，业务逻辑假设输入已校验。
-- 使用 Result/Either 模式替代异常控制流（如适用）。
-
-### 测试
-- 公共方法必须有对应测试。
-- 测试命名：`Method_Scenario_ExpectedResult`。
-- Mock 最小化：只 Mock 外部依赖，不 Mock 被测类的内部方法。
-
-### 依赖方向
-- 高层模块不依赖低层模块的实现，依赖抽象（接口）。
-- 依赖方向：Presentation → Domain → Infrastructure → Foundation。
-- 禁止循环依赖。
-
 ## Agent 工作流约定
 
 ### 三种模式的职责边界
@@ -46,9 +12,9 @@ inclusion: always
 - `plan`：用于复杂任务，先产出规格文件，再进入审批与执行。
 
 ### Plan 模式约定
-- `tasks.md` 是执行进度的单一事实来源；任务完成后应优先同步 checkbox。
-- 不要把“任意一次写文件成功”误判为“完成了一个计划任务”。
-- 在执行阶段结束前，应确保 `tasks.md` 中所有已完成任务被标记为 `[x]`，否则默认任务尚未闭环。
+- sealed WorkPlan identity 与 runtime task/evidence ledger 是审批和进度事实源；Markdown 只作单向可读投影。
+- 不要把“任意一次写文件成功”或“任意 build 通过”误判为完成。
+- `.MAIN/plans/tasks.md` 是可选审计文件；仅在长任务、跨会话恢复或用户明确要求时创建。
 - 如果用户只想保留方案，不执行代码修改，应优先提供导出/保存计划文档的路径，而不是强行进入执行。
 
 ### 意图理解约定
@@ -63,3 +29,6 @@ inclusion: always
 - 修改时只触达与当前需求直接相关的代码；不顺手重构、格式化或清理无关历史问题。
 - 若本次改动直接造成 import、变量、辅助函数或注释失效，应一并清理；否则保持原状。
 - 修复或实现完成后，必须给出与目标直接对应的验证证据：测试、运行结果、Diff、文档更新或明确的未验证说明。
+- 每次 mutation 都使旧验证失效；应先通过语言/静态安全门，再做用户可见行为验收。
+- 安全读取在观察、修改和验证阶段都应可用；不要用固定轮数或撤工具强迫模型推进。
+- 子智能体只能调查、评审或非写入验证；父线程是唯一写入者，协作失败不得替代父线程继续解决问题。

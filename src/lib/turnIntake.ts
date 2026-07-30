@@ -66,9 +66,10 @@ export function resolveEffectiveSubagentDelegationPreference(input: {
   if (explicitPreference === "unspecified") return defaultPreference;
   if (explicitPreference === "forbidden") return "forbidden";
   if (explicitPreference === "preferred") return "preferred";
-  // The Composer collaboration switch is an explicit one-Turn start
-  // boundary. Permissive wording such as "可以启动子智能体" agrees with that
-  // boundary and must not silently weaken it from preferred to allowed.
+  // The Composer collaboration switch is a durable preference for this Turn,
+  // not an instruction to spawn at a particular lifecycle boundary.
+  // Permissive wording such as "可以启动子智能体" agrees with that preference
+  // and must not silently weaken it from preferred to allowed.
   return defaultPreference === "preferred" ? "preferred" : "allowed";
 }
 
@@ -143,8 +144,8 @@ export function buildTurnIntakeContextBlock(input: {
 
   if (subagentPreference === "preferred") {
     lines.push(input.language === "en"
-      ? "delegation: Collaboration is enabled for this turn. Before doing parent workspace work, create one fresh one-shot agent for a narrow semantic task with an independent success criterion and worthwhile parallel value. This is one start boundary, not a quota: create more children only when useful, never split work by directory alone, and never reuse a terminal child. Continue non-overlapping parent work, inspect child evidence or diffs, and keep final validation and completion with the parent."
-      : "delegation: 本轮已开启协作。主体开始工作区操作前，先为一个具有独立成功标准和并行价值的窄语义任务创建一个全新的一次性子智能体。这只是一次启动边界，不是数量配额：后续仅在确有价值时继续创建，绝不能仅按目录拆分，也不得复用已终止实例。主体并行推进不重叠工作，检查子智能体的证据或差异，并由主体负责最终验证与完成。");
+      ? "delegation: Collaboration is preferred for this turn when a genuinely independent investigation, review, or validation can shorten the critical path. It is never a mandatory opening step or a quota: delegate at any useful lifecycle phase, never split work by directory alone, and never reuse a terminal child. Continue non-overlapping parent work, inspect child evidence, and keep all writes, final validation, and completion with the parent."
+      : "delegation: 本轮偏好协作，但只有独立的调查、评审或验证确实能缩短关键路径时才委派。它不是强制开场步骤，也不是数量配额：可在生命周期中任何合适阶段按需创建，绝不能仅按目录拆分，也不得复用已终止实例。主体继续推进不重叠工作，检查子智能体证据，并由主体唯一写入、负责最终验证与完成。");
   } else if (subagentPreference === "forbidden") {
     lines.push(input.language === "en"
       ? "delegation: The user explicitly disabled subagents for this turn."

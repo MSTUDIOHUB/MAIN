@@ -403,10 +403,7 @@ export function normalizeCloudToolProtocol(value: unknown): CloudToolProtocol {
   return value === "native" || value === "xml" ? value : "auto";
 }
 
-export function getDefaultLocalToolProtocol(provider: unknown): CloudToolProtocol {
-  const normalized = String(provider || "").trim().toLowerCase();
-  if (normalized === "lm studio") return "xml";
-  if (normalized === "ollama") return "xml";
+export function getDefaultLocalToolProtocol(_provider: unknown): CloudToolProtocol {
   return "auto";
 }
 

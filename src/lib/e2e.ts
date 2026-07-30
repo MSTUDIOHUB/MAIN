@@ -17,10 +17,17 @@ import {
   type PlanCandidateV5,
 } from "./planContract";
 import { createPlanEvidenceReceipt } from "./planEvidenceReceipt";
-import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
+import {
+  createGoalDefinition,
+  createGoalProgress,
+  type GoalStatus,
+} from "./goalState";
 import { buildGoalRuntimeSnapshot } from "./goalRuntime";
 import { buildAcceptedGoalContinuationState } from "./goalResumeBoundary";
-import { buildPlanReviewActionRequest, buildUserChoiceActionRequest } from "./actionRequest";
+import {
+  buildPlanReviewActionRequest,
+  buildUserChoiceActionRequest,
+} from "./actionRequest";
 import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import {
   buildPlanApprovalIdentity,
@@ -39,7 +46,10 @@ import {
 import { capturePlanExecutionRunProvenance } from "./planExecutionProvenance";
 import { evaluateApprovedPlanExecution } from "./planExecutionEvaluation";
 import { issuePlanExplicitResumeAttempt } from "./planExecutionContinuation";
-import { readHarnessRunMarker, type HarnessRunMarker } from "./harnessCrashTelemetry";
+import {
+  readHarnessRunMarker,
+  type HarnessRunMarker,
+} from "./harnessCrashTelemetry";
 import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
 import {
   appendRuntimeEventWithResult,
@@ -67,8 +77,10 @@ import { normalizeRuntimeV2Checkpoint } from "./runtime-v2";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
-const PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO = "plan-quick-reply-materialize-gemma";
-const PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO = "plan-quick-reply-materialize-qwen";
+const PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO =
+  "plan-quick-reply-materialize-gemma";
+const PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO =
+  "plan-quick-reply-materialize-qwen";
 const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const ASSISTANT_FINAL_PERSISTENCE_SCENARIO = "assistant-final-persistence";
@@ -77,13 +89,15 @@ const STAGE_CONCLUSION_PRESERVED_SCENARIO = "stage-conclusion-preserved";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO = "awaiting-choice-mixed-options";
-const AWAITING_CHOICE_DIAGNOSTIC_REJECTED_SCENARIO = "awaiting-choice-diagnostic-rejected";
+const AWAITING_CHOICE_DIAGNOSTIC_REJECTED_SCENARIO =
+  "awaiting-choice-diagnostic-rejected";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
 const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
 const READ_CONTEXT_THIN_NARRATION_SCENARIO = "read-context-thin-narration";
-const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO = "read-context-persistent-progress";
+const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO =
+  "read-context-persistent-progress";
 const OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO = "opencode-transcript-display";
 const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
@@ -92,39 +106,28 @@ const GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO = "game-studio-plan-shortcuts";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const COMPOSER_RUNNING_GUIDANCE_SCENARIO = "composer-running-guidance";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
-const LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO = "local-plan-slow-first-token";
 const REAL_OMLX_PLAN_FLOW_SCENARIO = "real-omlx-plan-flow";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
-const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
-const PLAN_OPERATION_APPROVAL_REUSE_SCENARIO = "plan-operation-approval-reuse";
-const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
-const OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO = "operation-approval-natural-flow";
-const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
-const GAME_STUDIO_EXECUTE_REPLY_SCENARIO = "game-studio-execute-reply-runtime";
-const UNITY_MCP_OPTIONS_PRIORITY_SCENARIO = "unity-mcp-options-priority";
-const UNITY_TOOL_CODE_COMPAT_SCENARIO = "unity-tool-code-compat";
-const UNITY_NO_ERROR_ROUTING_SCENARIO = "unity-no-error-routing";
-const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
-const MALFORMED_TOOL_USE_PLAN_SCENARIO = "malformed-tool-use-plan";
-const PLAN_CLOSURE_GUARD_EMPTY_SCENARIO = "plan-closure-guard-empty";
-const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
-const APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO = "approved-plan-execution-no-tool";
-const APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO = "approved-plan-execution-replay";
-const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const ORDINARY_CONTINUE_NEW_TURN_SCENARIO = "ordinary-continue-new-turn";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const PROGRESS_NARRATION_TOOL_FLOW_SCENARIO = "progress-narration-tool-flow";
 const GLOBAL_CHAT_TOOL_SCOPE_SCENARIO = "global-chat-tool-scope";
 const GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO = "global-chat-attachment-read";
-const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "execution-capsule-execution-progress";
-const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "execution-capsule-plan-task-progress";
-const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "execution-capsule-strict-evidence-progress";
-const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "execution-capsule-pending-tool-review";
-const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO = "execution-capsule-orphan-pending-review";
+const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO =
+  "execution-capsule-execution-progress";
+const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO =
+  "execution-capsule-plan-task-progress";
+const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO =
+  "execution-capsule-strict-evidence-progress";
+const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO =
+  "execution-capsule-pending-tool-review";
+const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO =
+  "execution-capsule-orphan-pending-review";
 const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "execution-capsule-panel-stability";
-const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
+const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO =
+  "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
@@ -155,7 +158,10 @@ function getBridge(): any {
   return target.__CODELY_E2E__;
 }
 
-function appendBridgeEvent(type: string, payload: Record<string, unknown> = {}) {
+function appendBridgeEvent(
+  type: string,
+  payload: Record<string, unknown> = {},
+) {
   const bridge = getBridge();
   if (!bridge) return;
   bridge.events = [...(bridge.events || []), { type, ...payload }];
@@ -173,7 +179,8 @@ function buildE2ERunningToolPermissionOwner(input: {
   now?: number;
 }): HarnessRunMarker {
   const now = input.now ?? Date.now();
-  const previous = input.previous?.runId === input.runId &&
+  const previous =
+    input.previous?.runId === input.runId &&
     input.previous.sessionKey === `${input.workspace}:${input.sessionId}` &&
     input.previous.turnId === input.turnId
     ? input.previous
@@ -182,7 +189,8 @@ function buildE2ERunningToolPermissionOwner(input: {
     schemaVersion: 1,
     runId: input.runId,
     parentRunId: previous?.parentRunId ?? null,
-    instanceId: previous?.instanceId || `e2e-tool-permission-${input.sessionId}`,
+    instanceId:
+      previous?.instanceId || `e2e-tool-permission-${input.sessionId}`,
     sessionKey: `${input.workspace}:${input.sessionId}`,
     workspace: input.workspace,
     sessionId: input.sessionId,
@@ -268,7 +276,10 @@ function bindCloudServerBridgeControls() {
   bridge.setCloudServers = (servers: any[], activeCloudServerId?: string) => {
     const normalizedServers = Array.isArray(servers) ? servers : [];
     const activeId = activeCloudServerId || normalizedServers[0]?.id;
-    const activeServer = normalizedServers.find((server) => server.id === activeId) || normalizedServers[0] || null;
+    const activeServer =
+      normalizedServers.find((server) => server.id === activeId) ||
+      normalizedServers[0] ||
+      null;
     useAppStore.setState((state) => ({
       ...state,
       config: {
@@ -280,19 +291,23 @@ function bindCloudServerBridgeControls() {
       },
     }));
   };
-  bridge.setModelRuntimeLock = (options: {
+  bridge.setModelRuntimeLock = (
+    options: {
     activeProfile?: "local" | "cloud";
     activeCloudServerId?: string;
     status?: "running" | "pending_review";
     isGenerating?: boolean;
-  } = {}) => {
-    const status = options.status === "pending_review" ? "pending_review" : "running";
+    } = {},
+  ) => {
+    const status =
+      options.status === "pending_review" ? "pending_review" : "running";
     useAppStore.setState((state) => ({
       ...state,
       config: {
         ...state.config,
         activeProfile: options.activeProfile || state.config.activeProfile,
-        activeCloudServerId: options.activeCloudServerId ?? state.config.activeCloudServerId,
+        activeCloudServerId:
+          options.activeCloudServerId ?? state.config.activeCloudServerId,
       },
       agentStatus: status,
       isGenerating: options.isGenerating ?? status === "running",
@@ -319,7 +334,9 @@ function getSeedCountKey(scenario: string): string {
 
 function readSeedCount(scenario: string): number {
   if (typeof window === "undefined") return 0;
-  return Number(window.localStorage.getItem(getSeedCountKey(scenario)) || "0") || 0;
+  return (
+    Number(window.localStorage.getItem(getSeedCountKey(scenario)) || "0") || 0
+  );
 }
 
 function incrementSeedCount(scenario: string): number {
@@ -334,18 +351,33 @@ function bindBridgeSnapshot(scenario: string) {
   if (!bridge) return;
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
-    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
-    const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
-    const userBlocks = state.taskFlow.filter((block) => block.type === "user") as any[];
-    const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
-    const agentMessageSummaries = (state.agentMessages || []).map((message: any) => {
+    const agentBlocks = state.taskFlow.filter(
+      (block) => block.type === "agent",
+    ) as any[];
+    const toolBlocks = state.taskFlow.filter(
+      (block) => block.type === "tool",
+    ) as any[];
+    const userBlocks = state.taskFlow.filter(
+      (block) => block.type === "user",
+    ) as any[];
+    const archivedOptionBlocks = agentBlocks.filter(
+      (block) => block.archivedAfterChoice,
+    );
+    const agentMessageSummaries = (state.agentMessages || []).map(
+      (message: any) => {
       const content = message?.content;
       if (Array.isArray(content)) {
         return {
           role: message?.role || "",
-          hasImage: content.some((part: any) => part?.type === "image_url" || part?.type === "input_image"),
+            hasImage: content.some(
+              (part: any) =>
+                part?.type === "image_url" || part?.type === "input_image",
+            ),
           text: content
-            .filter((part: any) => part?.type === "text" || part?.type === "input_text")
+              .filter(
+                (part: any) =>
+                  part?.type === "text" || part?.type === "input_text",
+              )
             .map((part: any) => String(part.text || ""))
             .join("\n"),
         };
@@ -355,11 +387,14 @@ function bindBridgeSnapshot(scenario: string) {
         hasImage: false,
         text: String(content || ""),
       };
-    });
+      },
+    );
     const scopeKey = state.currentWorkspace || GLOBAL_CHAT_KEY;
     const sessions = state.sessionsByWorkspace[scopeKey] || [];
     const currentTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      ? state.conversationTurns.find(
+          (turn) => turn.id === state.currentTurnId,
+        ) || null
       : null;
     const persistedHarnessRunMarker = readHarnessRunMarker();
     const visibleConversationTurns = state.conversationTurns
@@ -386,11 +421,13 @@ function bindBridgeSnapshot(scenario: string) {
       isGenerating: state.isGenerating,
       input: state.input,
       queuedUserMessage: state.queuedUserMessage,
-      workspaceTurnQueueEntries: (state.workspaceTurnQueue?.entries || []).map((entry) => ({
+      workspaceTurnQueueEntries: (state.workspaceTurnQueue?.entries || []).map(
+        (entry) => ({
         turnId: entry.receipt.turnId,
         status: entry.status,
         text: entry.instruction.payload.text,
-      })),
+        }),
+      ),
       activeGuidance: state.activeGuidance,
       autoApproveTools: state.autoApproveTools,
       preferSubagents: state.preferSubagents,
@@ -411,13 +448,19 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnRuntimeStatus: currentTurn?.runtimeOutcome?.status ?? null,
       currentTurnResultKind: currentTurn?.runtimeOutcome?.resultKind ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
-      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
+      currentTurnDisplayIntent:
+        currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       currentTurnParentPlanTurnId: currentTurn?.parentPlanTurnId ?? null,
       conversationTurns: state.conversationTurns.length,
-      executionChildTurns: state.conversationTurns.filter((turn) => turn.parentPlanTurnId === "e2e-execution-capsule-panel-stability-turn").length,
+      executionChildTurns: state.conversationTurns.filter(
+        (turn) =>
+          turn.parentPlanTurnId ===
+          "e2e-execution-capsule-panel-stability-turn",
+      ).length,
       currentTurnExecutionConsent: state.currentTurnExecutionConsent,
       pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
-      planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
+      planApprovalExecutionStartedForTurnId:
+        state.planApprovalExecutionStartedForTurnId,
       planLifecycleStatus: state.planLifecycle.status,
       harnessRunMarker: state.harnessRunMarker
         ? {
@@ -435,7 +478,8 @@ function bindBridgeSnapshot(scenario: string) {
             sessionKey: persistedHarnessRunMarker.sessionKey,
             turnId: persistedHarnessRunMarker.turnId,
             status: persistedHarnessRunMarker.status,
-            terminalResultKind: persistedHarnessRunMarker.terminalResultKind || null,
+            terminalResultKind:
+              persistedHarnessRunMarker.terminalResultKind || null,
             planStage: persistedHarnessRunMarker.planStage,
             isPlanApproved: persistedHarnessRunMarker.isPlanApproved,
           }
@@ -443,38 +487,46 @@ function bindBridgeSnapshot(scenario: string) {
       runCompletedEvents: state.runtimeEvents.flatMap((event) =>
         event.type === "run.completed" && event.turnId === currentTurn?.id
           ? [{ runId: event.runId, resultKind: event.resultKind }]
-          : []
+          : [],
       ),
       turnCompletedEvents: state.runtimeEvents.flatMap((event) =>
         event.type === "turn.completed" && event.turnId === currentTurn?.id
           ? [{ turnId: event.turnId, resultKind: event.resultKind }]
-          : []
+          : [],
       ),
-      visibleFinalCount: agentBlocks.filter((block) =>
+      visibleFinalCount: agentBlocks.filter(
+        (block) =>
         block.turnId === currentTurn?.id &&
         block.visibility === "assistant_final" &&
-        block.streaming !== true
+          block.streaming !== true,
       ).length,
       visibleConversationTurns,
-      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user")
+        .length,
       agentTexts: agentBlocks.map((block) => block.content),
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
-      userContextItems: userBlocks.flatMap((block) => Array.isArray(block.contextItems) ? block.contextItems : []),
+      userContextItems: userBlocks.flatMap((block) =>
+        Array.isArray(block.contextItems) ? block.contextItems : [],
+      ),
       userBlockImagesCount: userBlocks.reduce(
-        (count, block) => count + (Array.isArray(block.images) ? block.images.length : 0),
+        (count, block) =>
+          count + (Array.isArray(block.images) ? block.images.length : 0),
         0,
       ),
       agentMessageSummaries,
-      selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
+      selectedOptions: archivedOptionBlocks
+        .map((block) => block.selectedOption)
+        .filter(Boolean),
       themeMode: state.config.themeMode,
       goalStatus: state.goalStatus,
       activeGoalId: state.activeGoal?.id ?? null,
-      activeGoalObjective: state.activeGoal?.rawText || state.activeGoal?.objective || null,
+      activeGoalObjective:
+        state.activeGoal?.rawText || state.activeGoal?.objective || null,
       activeGoalRevision: state.activeGoal?.revision ?? null,
       activeActionRequestKind: state.activeActionRequest?.kind ?? null,
-      pendingReplyOptionBlocks: agentBlocks.filter((block) =>
-        Array.isArray(block.options) && block.options.length > 0
+      pendingReplyOptionBlocks: agentBlocks.filter(
+        (block) => Array.isArray(block.options) && block.options.length > 0,
       ).length,
       queuedGoalContinuationSource:
         state.queuedUserMessage?.goalContinuationAuthorization?.source ?? null,
@@ -559,7 +611,10 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
         });
         return;
       }
-      if (evidence.kind === "browser_dom" || evidence.kind === "browser_screenshot") {
+      if (
+        evidence.kind === "browser_dom" ||
+        evidence.kind === "browser_screenshot"
+      ) {
         validationEvidence.push({
           ...common,
           phase: "validation",
@@ -567,7 +622,8 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
           sourceTool: "browser_evaluate",
           automaticValidation: true,
           browserInteraction: {
-            actions: [{
+            actions: [
+              {
               id: "approve-plan",
               kind: "click",
               target: "[data-testid=plan-approve-button]",
@@ -575,8 +631,10 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
               stateChanged: true,
               effectStateChanged: true,
               effectChangedFields: ["target.text"],
-            }],
-            assertions: [{
+              },
+            ],
+            assertions: [
+              {
               kind: "text",
               target: evidence.value,
               passed: true,
@@ -584,7 +642,8 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
               beforePassed: false,
               changedAfterAction: true,
               causallyLinked: true,
-            }],
+              },
+            ],
             pageErrors: [],
             consoleErrors: [],
           },
@@ -595,7 +654,8 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
         ...common,
         phase: "validation",
         kind: evidence.kind,
-        sourceTool: evidence.kind === "tauri_required"
+        sourceTool:
+          evidence.kind === "tauri_required"
           ? "computer_use"
           : "runtime_assertion",
         automaticValidation: evidence.kind !== "manual_user_validation",
@@ -610,7 +670,12 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
   const evaluation = evaluateApprovedPlanExecution({
     tasks: state.planTasks,
     evidenceLedger: completionLedger,
-    availableToolNames: new Set(["write_file", "run_command", "browser_evaluate", "computer_use"]),
+    availableToolNames: new Set([
+      "write_file",
+      "run_command",
+      "browser_evaluate",
+      "computer_use",
+    ]),
     turnId: execution.turnId,
   });
   if (!evaluation.completionAllowed) {
@@ -641,14 +706,16 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
 
   const turnId = execution.turnId;
   const threadId = lifecycle.sessionKey;
-  if (state.runtimeEvents.some((event) =>
-    (
-      event.type === "turn.completed" ||
-      (event.type === "run.completed" && event.runId === execution.runId)
-    ) &&
+  if (
+    state.runtimeEvents.some(
+      (event) =>
+        (event.type === "turn.completed" ||
+          (event.type === "run.completed" &&
+            event.runId === execution.runId)) &&
     event.threadId === threadId &&
-    event.turnId === turnId
-  )) {
+        event.turnId === turnId,
+    )
+  ) {
     appendBridgeEvent("completion-rejected", {
       reason: "plan_execution_owner_already_terminal",
       lifecycleStatus: lifecycle.status,
@@ -657,36 +724,50 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
   }
 
   let runtimeEvents = state.runtimeEvents;
-  if (!runtimeEvents.some((event) =>
+  if (
+    !runtimeEvents.some(
+      (event) =>
     event.type === "turn.started" &&
     event.threadId === threadId &&
-    event.turnId === turnId
-  )) {
-    runtimeEvents = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+        event.turnId === turnId,
+    )
+  ) {
+    runtimeEvents = appendRuntimeEventWithResult(
+      runtimeEvents,
+      withEventSchema({
       type: "turn.started",
       threadId,
       turnId,
       timestampMs: Math.max(0, execution.startedAt - 1),
-    })).events;
+      }),
+    ).events;
   }
-  if (!runtimeEvents.some((event) =>
+  if (
+    !runtimeEvents.some(
+      (event) =>
     event.type === "run.started" &&
     event.threadId === threadId &&
     event.turnId === turnId &&
-    event.runId === execution.runId
-  )) {
-    const startedAppend = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+        event.runId === execution.runId,
+    )
+  ) {
+    const startedAppend = appendRuntimeEventWithResult(
+      runtimeEvents,
+      withEventSchema({
       type: "run.started",
       threadId,
       turnId,
       timestampMs: execution.startedAt,
       runId: execution.runId,
       parentRunId: execution.parentRunId,
-    }));
+      }),
+    );
     if (startedAppend.disposition === "conflict") return false;
     runtimeEvents = startedAppend.events;
   }
-  const runCompletedAppend = appendRuntimeEventWithResult(runtimeEvents, withEventSchema({
+  const runCompletedAppend = appendRuntimeEventWithResult(
+    runtimeEvents,
+    withEventSchema({
     type: "run.completed",
     threadId,
     turnId,
@@ -695,25 +776,31 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
     parentRunId: execution.parentRunId,
     resultKind: "success",
     summary,
-  }));
+    }),
+  );
   if (runCompletedAppend.disposition === "conflict") return false;
-  const turnCompletedAppend = appendRuntimeEventWithResult(runCompletedAppend.events, withEventSchema({
+  const turnCompletedAppend = appendRuntimeEventWithResult(
+    runCompletedAppend.events,
+    withEventSchema({
     type: "turn.completed",
     threadId,
     turnId,
     timestampMs: completedAt,
     resultKind: "success",
-  }));
+    }),
+  );
   if (turnCompletedAppend.disposition === "conflict") return false;
 
   const finishBlockId = state._nextTaskId();
   const planExecutionProvenance = capturePlanExecutionRunProvenance(lifecycle);
   const priorMarker = state.harnessRunMarker;
-  const markerMatchesExecution = !!priorMarker &&
+  const markerMatchesExecution =
+    !!priorMarker &&
     priorMarker.sessionKey === threadId &&
     priorMarker.turnId === turnId &&
     (priorMarker.activeRunId || priorMarker.runId) === execution.runId &&
-    (priorMarker.activeParentRunId || priorMarker.parentRunId || null) === execution.parentRunId;
+    (priorMarker.activeParentRunId || priorMarker.parentRunId || null) ===
+      execution.parentRunId;
   const terminalMarker: HarnessRunMarker = {
     ...(markerMatchesExecution && priorMarker
       ? priorMarker
@@ -730,7 +817,8 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
           iteration: 1,
           maxIterations: 12,
           messagesLen: state.agentMessages.length,
-          toolCount: state.taskFlow.filter((block) => block.type === "tool").length,
+          toolCount: state.taskFlow.filter((block) => block.type === "tool")
+            .length,
           latestTool: null,
           latestToolTarget: null,
           activeStreamId: null,
@@ -793,7 +881,7 @@ function finishPlanExecution(finalMessage: string, summary: string): boolean {
               ? turn.blockIds
               : [...turn.blockIds, finishBlockId],
           }
-        : turn
+        : turn,
     ),
     planStage: "completed",
     planTasks: evaluation.taskAudit.tasks,
@@ -841,7 +929,9 @@ function seedPlanFlowScenario() {
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const originalSendMessage = useAppStore.getState().sendMessage;
 
-  const artifacts = [createE2EPlanFlowTypedPlanArtifact([
+  const artifacts = [
+    createE2EPlanFlowTypedPlanArtifact(
+      [
     "# Design",
     "",
     "## 目标",
@@ -857,7 +947,10 @@ function seedPlanFlowScenario() {
     "## 验证方式",
     "- 运行 `node --test tests/node/workflow-models.test.mjs`，验证审批和执行状态转换。",
     "- 使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
-  ].join("\n"), now - 1_000)];
+      ].join("\n"),
+      now - 1_000,
+    ),
+  ];
   const approvalIdentity = buildPlanApprovalIdentity(artifacts);
   if (!approvalIdentity) return undefined;
   const reviewRequest = buildPlanReviewActionRequest({
@@ -910,18 +1003,28 @@ function seedPlanFlowScenario() {
   if (review.disposition === "rejected") return undefined;
   planLifecycle = review.state;
 
-  const simulateApprovedPlanChildRun: typeof originalSendMessage = (text, _images, options) => {
+  const simulateApprovedPlanChildRun: typeof originalSendMessage = (
+    text,
+    _images,
+    options,
+  ) => {
     const current = useAppStore.getState();
     const lifecycle = current.planLifecycle;
     const approvalLease = lifecycle.approvalLease;
     const executionLease = lifecycle.executionLease;
     const handoff = current.pendingPlanApprovalHandoff;
     const currentIdentity = buildPlanApprovalIdentity(current.planArtifacts);
-    const ownerSession = current.sessionsByWorkspace[workspace]?.find((session) => session.id === sessionId);
+    const ownerSession = current.sessionsByWorkspace[workspace]?.find(
+      (session) => session.id === sessionId,
+    );
     const marker = current.harnessRunMarker;
     const computedInstructionHash = buildPlanExecutionInstructionHash(text);
-    const pathsMatch = (left: readonly string[] | undefined, right: readonly string[] | undefined) =>
-      !!left && !!right &&
+    const pathsMatch = (
+      left: readonly string[] | undefined,
+      right: readonly string[] | undefined,
+    ) =>
+      !!left &&
+      !!right &&
       left.length === right.length &&
       left.every((path, index) => path === right[index]);
     const exactAdmission =
@@ -936,8 +1039,12 @@ function seedPlanFlowScenario() {
       !!currentIdentity &&
       lifecycle.planTurnId === turnId &&
       lifecycle.artifactIdentity?.revision === currentIdentity.revision &&
-      lifecycle.artifactIdentity.artifactHash === currentIdentity.artifactHash &&
-      pathsMatch(lifecycle.artifactIdentity.artifactPaths, currentIdentity.artifactPaths) &&
+      lifecycle.artifactIdentity.artifactHash ===
+        currentIdentity.artifactHash &&
+      pathsMatch(
+        lifecycle.artifactIdentity.artifactPaths,
+        currentIdentity.artifactPaths,
+      ) &&
       approvalLease.planRevision === currentIdentity.revision &&
       approvalLease.artifactHash === currentIdentity.artifactHash &&
       pathsMatch(approvalLease.artifactPaths, currentIdentity.artifactPaths) &&
@@ -966,7 +1073,13 @@ function seedPlanFlowScenario() {
       marker.turnId === turnId &&
       (marker.activeRunId || marker.runId) === executionLease.parentRunId;
 
-    if (!exactAdmission || !approvalLease || !executionLease || !handoff || !marker) {
+    if (
+      !exactAdmission ||
+      !approvalLease ||
+      !executionLease ||
+      !handoff ||
+      !marker
+    ) {
       appendBridgeEvent("child-run-admission-rejected", {
         reason: "execution_lease_identity_mismatch",
         lifecycleStatus: lifecycle.status,
@@ -975,14 +1088,17 @@ function seedPlanFlowScenario() {
     }
 
     const admittedAt = Date.now();
-    const runStartedAppend = appendRuntimeEventWithResult(current.runtimeEvents, withEventSchema({
+    const runStartedAppend = appendRuntimeEventWithResult(
+      current.runtimeEvents,
+      withEventSchema({
       type: "run.started",
       threadId: sessionKey,
       turnId: executionLease.executionTurnId,
       timestampMs: admittedAt,
       runId: executionLease.executionRunId,
       parentRunId: executionLease.parentRunId,
-    }));
+      }),
+    );
     if (runStartedAppend.disposition === "conflict") {
       appendBridgeEvent("child-run-admission-rejected", {
         reason: "run_started_identity_conflict",
@@ -1005,20 +1121,25 @@ function seedPlanFlowScenario() {
       instructionHash: computedInstructionHash,
       execution,
     });
-    if (started.disposition === "rejected" || !isPlanLifecycleExecutionAuthorizedForRun(started.state, {
+    if (
+      started.disposition === "rejected" ||
+      !isPlanLifecycleExecutionAuthorizedForRun(started.state, {
       executionLeaseId: executionLease.executionLeaseId,
       turnId: execution.turnId,
       runId: execution.runId,
       parentRunId: execution.parentRunId,
       attempt: execution.attempt,
-    })) {
+      })
+    ) {
       appendBridgeEvent("child-run-admission-rejected", {
         reason: started.reason || "execution_started_not_authorized",
         lifecycleStatus: lifecycle.status,
       });
       return false;
     }
-    const planExecutionProvenance = capturePlanExecutionRunProvenance(started.state);
+    const planExecutionProvenance = capturePlanExecutionRunProvenance(
+      started.state,
+    );
     if (!planExecutionProvenance) {
       appendBridgeEvent("child-run-admission-rejected", {
         reason: "plan_execution_provenance_missing",
@@ -1061,7 +1182,7 @@ function seedPlanFlowScenario() {
               summary: "已接纳批准后的同回合子 Run，正在执行计划。",
               runtimeOutcome: undefined,
             }
-          : turn
+          : turn,
       ),
       agentStatus: "running",
       isGenerating: true,
@@ -1133,7 +1254,12 @@ function seedPlanFlowScenario() {
     },
     activeActionRequest: reviewRequest,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请先生成方案，我确认后再执行。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请先生成方案，我确认后再执行。",
+      },
       {
         id: agentBlockId,
         turnId,
@@ -1309,7 +1435,10 @@ function seedPlanFlowScenario() {
         });
 
         completionTimer = window.setTimeout(() => {
-          finishPlanExecution("执行完成，已收尾。", "方案已保存，批准执行后已顺利完成收尾。");
+          finishPlanExecution(
+            "执行完成，已收尾。",
+            "方案已保存，批准执行后已顺利完成收尾。",
+          );
           appendBridgeEvent("completed");
         }, 150);
       }, 50);
@@ -1349,7 +1478,10 @@ function createEmptyE2EPlanEvidenceReceipt(input: {
   });
 }
 
-function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number): PlanArtifact {
+function createE2EPlanFlowTypedPlanArtifact(
+  content: string,
+  updatedAt: number,
+): PlanArtifact {
   const authoringContractId = "authoring-contract:e2e-plan-flow";
   const objective = "支持生成计划、保存方案、批准执行与最终收尾。";
   const command = "node --test tests/node/workflow-models.test.mjs";
@@ -1383,7 +1515,8 @@ function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number):
         diagnosisRefs: [],
         goalRefs: ["G1"],
         operation: "modify",
-        expectedOutcome: "Plan 审批创建绑定当前 Turn 与 review Run 的执行 handoff。",
+        expectedOutcome:
+          "Plan 审批创建绑定当前 Turn 与 review Run 的执行 handoff。",
         relationships: ["C2 保持 handoff 的保存与审批入口可操作。"],
         executionEvidence: [{ kind: "file", value: "src/lib/planControl.ts" }],
       },
@@ -1397,11 +1530,15 @@ function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number):
         operation: "modify",
         expectedOutcome: "用户可以保存正式 Plan，并从同一审核面板批准执行。",
         relationships: ["C1 提供批准后的同回合执行 handoff。"],
-        executionEvidence: [{ kind: "file", value: "src/components/RightPanel.tsx" }],
+        executionEvidence: [
+          { kind: "file", value: "src/components/RightPanel.tsx" },
+        ],
       },
     ],
     decisions: [],
-    interfaces: ["Plan artifact -> exact review request -> approved child Run -> evidence-backed completion。"],
+    interfaces: [
+      "Plan artifact -> exact review request -> approved child Run -> evidence-backed completion。",
+    ],
     tests: [
       `运行 \`${command}\`，验证审批和执行状态转换。`,
       "使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
@@ -1418,12 +1555,14 @@ function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number):
           description: "验证 Plan 审批和执行状态转换。",
           command,
           capability: "test",
-          segments: [{
+          segments: [
+            {
             command,
             connector: "start",
             role: "validator",
             capability: "test",
-          }],
+            },
+          ],
         },
         expectedOutcome: "Plan 审批与执行状态转换测试通过。",
         blocking: true,
@@ -1449,7 +1588,10 @@ function createE2EPlanFlowTypedPlanArtifact(content: string, updatedAt: number):
   };
 }
 
-function createE2ETypedPlanArtifact(content: string, updatedAt: number): PlanArtifact {
+function createE2ETypedPlanArtifact(
+  content: string,
+  updatedAt: number,
+): PlanArtifact {
   const authoringContractId = "authoring-contract:e2e-plan-quick-reply";
   const command = "node --test tests/node/workflow-models.test.mjs";
   const candidate: PlanCandidateV5 = {
@@ -1470,7 +1612,8 @@ function createE2ETypedPlanArtifact(content: string, updatedAt: number): PlanArt
     summary: ["先运行诊断，再执行范围内修复。"],
     diagnoses: [],
     findings: [],
-    changes: [{
+    changes: [
+      {
       id: "C1",
       text: "根据诊断结果修复字体加载。",
       targetRef: "src/main.ts",
@@ -1481,11 +1624,13 @@ function createE2ETypedPlanArtifact(content: string, updatedAt: number): PlanArt
       expectedOutcome: "字体加载流程按诊断结果完成修复。",
       relationships: [],
       executionEvidence: [{ kind: "file", value: "src/main.ts" }],
-    }],
+      },
+    ],
     decisions: [],
     interfaces: [],
     tests: ["运行字体加载诊断并核对结果。"],
-    validations: [{
+    validations: [
+      {
       id: "V1",
       goalRefs: ["G1"],
       changeRefs: ["C1"],
@@ -1496,16 +1641,19 @@ function createE2ETypedPlanArtifact(content: string, updatedAt: number): PlanArt
         description: "核对字体加载诊断结果。",
         command,
         capability: "test",
-        segments: [{
+          segments: [
+            {
           command,
           connector: "start",
           role: "validator",
           capability: "test",
-        }],
+            },
+          ],
       },
       expectedOutcome: "字体加载诊断通过。",
       blocking: true,
-    }],
+      },
+    ],
     assumptions: [],
     blockingChoices: [],
     projection: {
@@ -1532,7 +1680,8 @@ function createE2EExecutionCapsuleTypedPlanArtifact(
   turnId: string,
 ): PlanArtifact {
   const authoringContractId = "authoring-contract:e2e-execution-capsule";
-  const command = "npx playwright test tests/e2e/execution-capsule-progress.spec.ts";
+  const command =
+    "npx playwright test tests/e2e/execution-capsule-progress.spec.ts";
   const candidate: PlanCandidateV5 = {
     schemaVersion: PLAN_CANDIDATE_SCHEMA_VERSION,
     state: "sealed",
@@ -1540,11 +1689,13 @@ function createE2EExecutionCapsuleTypedPlanArtifact(
     authoringContractId,
     bundleHash: "evidence-bundle:e2e-execution-capsule",
     objective: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
-    goals: [{
+    goals: [
+      {
       id: "G1",
       index: 1,
       text: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
-    }],
+      },
+    ],
     diagnosisRequired: false,
     evidence: [],
     evidenceReceipt: createEmptyE2EPlanEvidenceReceipt({
@@ -1552,10 +1703,13 @@ function createE2EExecutionCapsuleTypedPlanArtifact(
       objective: "修复 ExecutionCapsule 审批投影并保持右侧面板状态稳定。",
       turnId,
     }),
-    summary: ["让审批状态绑定 exact Plan review identity，面板显示状态独立投影。"],
+    summary: [
+      "让审批状态绑定 exact Plan review identity，面板显示状态独立投影。",
+    ],
     diagnoses: [],
     findings: [],
-    changes: [{
+    changes: [
+      {
       id: "C1",
       text: "更新 ExecutionCapsule 审批状态投影，不改变右侧面板选择。",
       targetRef: "src/components/ExecutionCapsule.tsx",
@@ -1563,14 +1717,21 @@ function createE2EExecutionCapsuleTypedPlanArtifact(
       diagnosisRefs: [],
       goalRefs: ["G1"],
       operation: "modify",
-      expectedOutcome: "Plan review Capsule 与 exact request 同步且面板状态稳定。",
+        expectedOutcome:
+          "Plan review Capsule 与 exact request 同步且面板状态稳定。",
       relationships: [],
-      executionEvidence: [{ kind: "file", value: "src/components/ExecutionCapsule.tsx" }],
-    }],
+        executionEvidence: [
+          { kind: "file", value: "src/components/ExecutionCapsule.tsx" },
+        ],
+      },
+    ],
     decisions: [],
-    interfaces: ["typed Plan artifact -> exact review request -> same-Turn execution Run"],
+    interfaces: [
+      "typed Plan artifact -> exact review request -> same-Turn execution Run",
+    ],
     tests: [`运行 \`${command}\` 验证审批与面板投影。`],
-    validations: [{
+    validations: [
+      {
       id: "V1",
       goalRefs: ["G1"],
       changeRefs: ["C1"],
@@ -1581,16 +1742,19 @@ function createE2EExecutionCapsuleTypedPlanArtifact(
         description: "验证审批与面板投影。",
         command,
         capability: "test",
-        segments: [{
+          segments: [
+            {
           command,
           connector: "start",
           role: "validator",
           capability: "test",
-        }],
+            },
+          ],
       },
       expectedOutcome: "ExecutionCapsule 审批与右侧面板回归通过。",
       blocking: true,
-    }],
+      },
+    ],
     assumptions: [],
     blockingChoices: [],
     projection: {
@@ -1653,13 +1817,15 @@ function seedPlanQuickReplyApprovalScenario() {
     },
     currentWorkspace: workspace,
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: sessionId,
         title: "E2E Plan Quick Reply Approval",
         date: new Date(now).toISOString(),
         active: true,
         messages: [],
-      }],
+        },
+      ],
     },
     currentSessionId: sessionId,
     harnessRunMarker: buildE2EPausedActionOwner({
@@ -1676,7 +1842,12 @@ function seedPlanQuickReplyApprovalScenario() {
     }),
     activeActionRequest: choiceRequest,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请先规划字体修复流程，我确认后再执行。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请先规划字体修复流程，我确认后再执行。",
+      },
       {
         id: agentBlockId,
         turnId,
@@ -1711,10 +1882,12 @@ function seedPlanQuickReplyApprovalScenario() {
       },
     ],
     currentTurnId: turnId,
-    planArtifacts: [createE2ETypedPlanArtifact(
+    planArtifacts: [
+      createE2ETypedPlanArtifact(
       "# Design\n\n- 目标：修复字体加载诊断流程。\n- 方案：批准后先运行诊断，再根据结果修复字体加载。\n- 验证：根据 tasks.md 记录诊断命令和修复证据。\n",
       now - 1_000,
-    )],
+      ),
+    ],
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
@@ -1776,7 +1949,8 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
     }),
     requestId: `request-e2e-plan-quick-reply-materialize-${modelStyle}`,
   };
-  const agentContent = modelStyle === "gemma"
+  const agentContent =
+    modelStyle === "gemma"
     ? [
         "## 修复方案",
         "",
@@ -1837,13 +2011,15 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
     },
     currentWorkspace: workspace,
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: sessionId,
         title: `E2E ${modelStyle} Plan Materialization`,
         date: new Date(now).toISOString(),
         active: true,
         messages: [],
-      }],
+        },
+      ],
     },
     currentSessionId: sessionId,
     harnessRunMarker: buildE2EPausedActionOwner({
@@ -1860,7 +2036,12 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
     }),
     activeActionRequest: choiceRequest,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: `请用 ${modelStyle} 风格先规划，批准后再执行。` },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: `请用 ${modelStyle} 风格先规划，批准后再执行。`,
+      },
       {
         id: agentBlockId,
         turnId,
@@ -1869,7 +2050,8 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         options: [
           {
             label: "批准执行本轮操作",
-            value: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+            value:
+              "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
             action: "approve_operation_once" as const,
             source: "proposal_follow_up" as const,
           },
@@ -1924,9 +2106,11 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
     contextMentions: [],
   }));
 
-  bindBridgeSnapshot(modelStyle === "gemma"
+  bindBridgeSnapshot(
+    modelStyle === "gemma"
     ? PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO
-    : PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO);
+      : PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO,
+  );
 
   return () => {
     bridge.initialized = false;
@@ -2044,9 +2228,8 @@ function seedPlanReloadResumeScenario() {
     };
     const executionRunId = "run-e2e-plan-reload-execution-1";
     const executionLeaseId = "execution-lease-e2e-plan-reload-1";
-    const executionInstructionHash = buildPlanExecutionInstructionHash(
-      "继续执行已批准计划的剩余任务。",
-    );
+    const executionInstructionHash =
+      buildPlanExecutionInstructionHash("继续执行已批准计划的剩余任务。");
     const executionLease = {
       schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
       executionLeaseId,
@@ -2155,7 +2338,12 @@ function seedPlanReloadResumeScenario() {
       },
       currentSessionId: sessionId,
       taskFlow: [
-        { id: userBlockId, turnId, type: "user", content: "这个方案已经批准了，请继续把剩余任务做完。" },
+        {
+          id: userBlockId,
+          turnId,
+          type: "user",
+          content: "这个方案已经批准了，请继续把剩余任务做完。",
+        },
         {
           id: agentBlockId,
           turnId,
@@ -2189,18 +2377,29 @@ function seedPlanReloadResumeScenario() {
       currentTurnId: turnId,
       planArtifacts,
       planTasks: [
-        { id: "reload-task-1", text: "恢复计划工作区状态", status: "completed", evidenceStatus: "satisfied" },
-        { id: "reload-task-2", text: "恢复对话与执行任务进度", status: "in_progress" },
+        {
+          id: "reload-task-1",
+          text: "恢复计划工作区状态",
+          status: "completed",
+          evidenceStatus: "satisfied",
+        },
+        {
+          id: "reload-task-2",
+          text: "恢复对话与执行任务进度",
+          status: "in_progress",
+        },
         { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending" },
       ],
-      planExecutionEvidenceLedger: [{
+      planExecutionEvidenceLedger: [
+        {
         id: "e2e-reload-evidence-1",
         kind: "file",
         value: "reload-plan.md",
         target: "reload-plan.md",
         sourceTool: "write_file",
         createdAt: now,
-      }],
+        },
+      ],
       planExecutionEvidenceCount: 1,
       planLifecycle,
       planStage: "executing",
@@ -2226,7 +2425,9 @@ function seedPlanReloadResumeScenario() {
       seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO),
     });
   } else {
-    appendBridgeEvent("restored", { seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO) });
+    appendBridgeEvent("restored", {
+      seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO),
+    });
   }
 
   bindBridgeSnapshot(PLAN_RELOAD_RESUME_SCENARIO);
@@ -2261,7 +2462,10 @@ function seedAwaitingChoiceScenario() {
       turnId,
       runId,
       title: "等待用户选择回归流",
-      optionValues: ["先修暂停等待选择，再补 UI 状态", "先补 UI 状态，再回头修暂停逻辑"],
+      optionValues: [
+        "先修暂停等待选择，再补 UI 状态",
+        "先补 UI 状态，再回头修暂停逻辑",
+      ],
       allowCustomReply: true,
       now,
     }),
@@ -2326,16 +2530,28 @@ function seedAwaitingChoiceScenario() {
     },
     activeActionRequest: request,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请继续做计划和工程实现。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请继续做计划和工程实现。",
+      },
       {
         id: agentBlockId,
         turnId,
         type: "agent",
-        content: "我发现这里有一个关键分叉，需要你先确认优先级，然后我再继续当前回合。",
+        content:
+          "我发现这里有一个关键分叉，需要你先确认优先级，然后我再继续当前回合。",
         streaming: false,
         options: [
-          { label: "先修暂停等待选择，再补 UI 状态", value: "先修暂停等待选择，再补 UI 状态" },
-          { label: "先补 UI 状态，再回头修暂停逻辑", value: "先补 UI 状态，再回头修暂停逻辑" },
+          {
+            label: "先修暂停等待选择，再补 UI 状态",
+            value: "先修暂停等待选择，再补 UI 状态",
+          },
+          {
+            label: "先补 UI 状态，再回头修暂停逻辑",
+            value: "先补 UI 状态，再回头修暂停逻辑",
+          },
         ],
         choiceRequest: request,
       },
@@ -2360,14 +2576,16 @@ function seedAwaitingChoiceScenario() {
         path: ".MAIN/plans/requirements.md",
         title: "Requirements",
         updatedAt: now - 2_000,
-        content: "# Requirements\n\n- 当模型有真实疑问时，必须暂停并等待用户选择。\n",
+        content:
+          "# Requirements\n\n- 当模型有真实疑问时，必须暂停并等待用户选择。\n",
       },
       {
         kind: "design",
         path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 1_000,
-        content: "# Design\n\n- 选择完成后应继续同一回合，而不是新开一轮或直接丢失上下文。\n",
+        content:
+          "# Design\n\n- 选择完成后应继续同一回合，而不是新开一轮或直接丢失上下文。\n",
       },
     ],
     planTasks: [],
@@ -2473,7 +2691,12 @@ function seedAwaitingChoiceMixedOptionsScenario() {
     }),
     activeActionRequest: choiceRequest,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请告诉我下一步该怎么处理。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请告诉我下一步该怎么处理。",
+      },
       {
         id: agentBlockId,
         turnId,
@@ -2481,13 +2704,42 @@ function seedAwaitingChoiceMixedOptionsScenario() {
         content: "这里有真实分叉和只读授权动作，请先选择。",
         streaming: false,
         options: [
-          { label: "先确认代码主逻辑，再决定是否改动", value: "先确认代码主逻辑，再决定是否改动" },
-          { label: "我来确认类型，然后执行修复", value: "我来确认类型，然后执行修复", action: "approve_operation_once", source: "explicit_user_options" },
-          { label: "继续调整方案", value: "继续调整上面的方案，暂不执行真实操作", action: "adjust_plan", source: "explicit_user_options" },
-          { label: "取消操作", value: "取消上面的执行操作，本轮到此为止", action: "cancel_operation", source: "explicit_user_options" },
-          { label: "先确认渲染层，再回头看业务逻辑", value: "先确认渲染层，再回头看业务逻辑" },
-          { label: "继续当前只读读取", value: "请继续当前只读读取。", action: "continue_readonly_once" },
-          { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
+          {
+            label: "先确认代码主逻辑，再决定是否改动",
+            value: "先确认代码主逻辑，再决定是否改动",
+          },
+          {
+            label: "我来确认类型，然后执行修复",
+            value: "我来确认类型，然后执行修复",
+            action: "approve_operation_once",
+            source: "explicit_user_options",
+          },
+          {
+            label: "继续调整方案",
+            value: "继续调整上面的方案，暂不执行真实操作",
+            action: "adjust_plan",
+            source: "explicit_user_options",
+          },
+          {
+            label: "取消操作",
+            value: "取消上面的执行操作，本轮到此为止",
+            action: "cancel_operation",
+            source: "explicit_user_options",
+          },
+          {
+            label: "先确认渲染层，再回头看业务逻辑",
+            value: "先确认渲染层，再回头看业务逻辑",
+          },
+          {
+            label: "继续当前只读读取",
+            value: "请继续当前只读读取。",
+            action: "continue_readonly_once",
+          },
+          {
+            label: "当前会话只读步骤全部批准",
+            value: "本会话只读读取、搜索和分析步骤全部允许。",
+            action: "allow_readonly_session",
+          },
         ],
         choiceRequest,
       },
@@ -2574,12 +2826,18 @@ function seedAwaitingChoiceDiagnosticRejectedScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "检查为什么样式没有生效。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "检查为什么样式没有生效。",
+      },
       {
         id: agentBlockId,
         turnId,
         type: "agent",
-        content: "请选择：\n\n1. 那问题可能出在 Vite 的构建过程中\n2. `App.css` 被自动引入了",
+        content:
+          "请选择：\n\n1. 那问题可能出在 Vite 的构建过程中\n2. `App.css` 被自动引入了",
         streaming: false,
         options: [],
       },
@@ -2656,7 +2914,12 @@ function seedFeishuRemoteAnalysisScenario() {
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "检查html版本和pygame版本的界面差别" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "检查html版本和pygame版本的界面差别",
+      },
       {
         id: agentBlockId,
         turnId,
@@ -2730,15 +2993,42 @@ function seedReadContextCollapseScenario() {
   const userBlockId = useAppStore.getState()._nextTaskId();
   const readTargets = [
     { toolName: "get_project_skeleton", target: "" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Config/BattleSceneConfigSO.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Runtime/BattleUnit.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/SkillDataSO.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/StatusEffectDataSO.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/UnitDataSO.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEventCenter.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEventData.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEvents.cs" },
-    { toolName: "read_file", target: "Assets/Scripts/Battle/Runtime/BattleActionQueue.cs" },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Config/BattleSceneConfigSO.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Runtime/BattleUnit.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Data/SkillDataSO.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Data/StatusEffectDataSO.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Data/UnitDataSO.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Events/BattleEventCenter.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Events/BattleEventData.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Events/BattleEvents.cs",
+    },
+    {
+      toolName: "read_file",
+      target: "Assets/Scripts/Battle/Runtime/BattleActionQueue.cs",
+    },
   ];
   const readBlocks = readTargets.map((item) => ({
     id: useAppStore.getState()._nextTaskId(),
@@ -2779,7 +3069,12 @@ function seedReadContextCollapseScenario() {
   const singleReadBlockId = useAppStore.getState()._nextTaskId();
   const agentAfterSingleReadBlockId = useAppStore.getState()._nextTaskId();
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "请读取战斗系统上下文并继续分析。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "请读取战斗系统上下文并继续分析。",
+    },
     ...readBlocks,
     failedReadBlock,
     writeBlock,
@@ -2853,7 +3148,9 @@ function seedReadContextCollapseScenario() {
   }));
 
   bindBridgeSnapshot(READ_CONTEXT_COLLAPSE_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_COLLAPSE_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(READ_CONTEXT_COLLAPSE_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -2876,7 +3173,12 @@ function seedReadContextInterleavedScenario() {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "读取并搜索后执行几条命令，继续总结。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "读取并搜索后执行几条命令，继续总结。",
+    },
     {
       id: useAppStore.getState()._nextTaskId(),
       turnId,
@@ -2980,7 +3282,9 @@ function seedReadContextInterleavedScenario() {
   }));
 
   bindBridgeSnapshot(READ_CONTEXT_INTERLEAVED_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_INTERLEAVED_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(READ_CONTEXT_INTERLEAVED_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3003,7 +3307,12 @@ function seedReadContextAgentSegmentScenario() {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "分两段读取上下文并在中间输出一次结论。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "分两段读取上下文并在中间输出一次结论。",
+    },
     {
       id: useAppStore.getState()._nextTaskId(),
       turnId,
@@ -3109,7 +3418,9 @@ function seedReadContextAgentSegmentScenario() {
   }));
 
   bindBridgeSnapshot(READ_CONTEXT_AGENT_SEGMENT_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_AGENT_SEGMENT_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(READ_CONTEXT_AGENT_SEGMENT_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3133,7 +3444,12 @@ function seedReadContextThinNarrationScenario() {
   const nextId = () => useAppStore.getState()._nextTaskId();
   const userBlockId = nextId();
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "根据截图说明问题，然后继续读取三个关键文件。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "根据截图说明问题，然后继续读取三个关键文件。",
+    },
     {
       id: nextId(),
       turnId,
@@ -3237,7 +3553,9 @@ function seedReadContextThinNarrationScenario() {
   }));
 
   bindBridgeSnapshot(READ_CONTEXT_THIN_NARRATION_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_THIN_NARRATION_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(READ_CONTEXT_THIN_NARRATION_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3321,7 +3639,8 @@ function seedReadContextPersistentProgressScenario() {
       id: planAgentBlockId,
       turnId: planTurnId,
       type: "agent" as const,
-      content: "我已经生成了可审批计划文件 .MAIN/plans/plan.md，现在停在审批阶段。请审阅右侧计划面板，确认后再进入执行。",
+      content:
+        "我已经生成了可审批计划文件 .MAIN/plans/plan.md，现在停在审批阶段。请审阅右侧计划面板，确认后再进入执行。",
       streaming: false,
     },
     {
@@ -3369,7 +3688,14 @@ function seedReadContextPersistentProgressScenario() {
         intent: "plan" as const,
         status: "awaiting_approval" as const,
         summary: "已生成计划并等待审批。",
-        blockIds: [planUserBlockId, readOneBlockId, duplicateReadBlockId, readTwoBlockId, planWriteBlockId, planAgentBlockId],
+        blockIds: [
+          planUserBlockId,
+          readOneBlockId,
+          duplicateReadBlockId,
+          readTwoBlockId,
+          planWriteBlockId,
+          planAgentBlockId,
+        ],
         collapsed: false,
         createdAt: now,
       },
@@ -3395,7 +3721,8 @@ function seedReadContextPersistentProgressScenario() {
         path: ".MAIN/plans/plan.md",
         title: "Plan",
         updatedAt: now,
-        content: "# 计划\n\n## 用户目标\n- 先读取关键文件并生成可审批计划，批准前不要改源码。\n\n## 已读证据\n- src/store/dashboardStore.ts\n- src/hooks/useCsvParser.ts\n\n## 执行步骤\n1. 基于已读证据收窄修改点。\n2. 批准后实施最小源码变更。\n\n## 验证标准\n- 运行聚焦测试并确认 Dashboard 指标更新。",
+        content:
+          "# 计划\n\n## 用户目标\n- 先读取关键文件并生成可审批计划，批准前不要改源码。\n\n## 已读证据\n- src/store/dashboardStore.ts\n- src/hooks/useCsvParser.ts\n\n## 执行步骤\n1. 基于已读证据收窄修改点。\n2. 批准后实施最小源码变更。\n\n## 验证标准\n- 运行聚焦测试并确认 Dashboard 指标更新。",
       },
     ],
     planTasks: [],
@@ -3409,7 +3736,9 @@ function seedReadContextPersistentProgressScenario() {
   }));
 
   bindBridgeSnapshot(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3480,7 +3809,8 @@ function seedOpencodeTranscriptDisplayScenario() {
         id: nextId(),
         turnId,
         type: "agent" as const,
-        content: "我会先整体理解项目结构，然后读取 ChatArea、工具分组和 Plan runtime 的关键链路。",
+        content:
+          "我会先整体理解项目结构，然后读取 ChatArea、工具分组和 Plan runtime 的关键链路。",
         streaming: false,
       },
       {
@@ -3545,7 +3875,8 @@ function seedOpencodeTranscriptDisplayScenario() {
         id: nextId(),
         turnId,
         type: "agent" as const,
-        content: "从已读取的文件中，我发现显示层需要先生成 operation cluster，再交给 ChatArea 渲染；Plan 模式也需要先进入 Explore 项目结构阶段。",
+        content:
+          "从已读取的文件中，我发现显示层需要先生成 operation cluster，再交给 ChatArea 渲染；Plan 模式也需要先进入 Explore 项目结构阶段。",
         streaming: false,
       },
     ];
@@ -3581,7 +3912,9 @@ function seedOpencodeTranscriptDisplayScenario() {
   };
 
   bindBridgeSnapshot(OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3698,7 +4031,13 @@ function seedProcessDisplayScenario() {
         mode: "chat",
         status: "done",
         summary: "已准备过程显示测试数据。",
-        blockIds: [userBlockId, thoughtBlockId, latestThoughtBlockId, toolBlockId, agentBlockId],
+        blockIds: [
+          userBlockId,
+          thoughtBlockId,
+          latestThoughtBlockId,
+          toolBlockId,
+          agentBlockId,
+        ],
         collapsed: false,
         createdAt: now,
       },
@@ -3715,7 +4054,9 @@ function seedProcessDisplayScenario() {
   }));
 
   bindBridgeSnapshot(PROCESS_DISPLAY_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(PROCESS_DISPLAY_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(PROCESS_DISPLAY_SCENARIO),
+  });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3725,12 +4066,20 @@ function seedProcessDisplayScenario() {
   return cleanup;
 }
 
-function hasDiffReloadSummaryState(workspace: string, sessionId: number): boolean {
+function hasDiffReloadSummaryState(
+  workspace: string,
+  sessionId: number,
+): boolean {
   const state = useAppStore.getState();
   return (
     state.currentWorkspace === workspace &&
     state.currentSessionId === sessionId &&
-    state.taskFlow.some((block) => block.type === "tool" && block.toolStatus === "executed" && !!block.diff) &&
+    state.taskFlow.some(
+      (block) =>
+        block.type === "tool" &&
+        block.toolStatus === "executed" &&
+        !!block.diff,
+    ) &&
     state.conversationTurns.length > 0
   );
 }
@@ -3796,11 +4145,9 @@ function seedDiffReloadSummaryScenario() {
           message: "Updated src/main.ts",
           diff: {
             path: "src/main.ts",
-            old: [
-              "export function main() {",
-              "  return 'old main';",
-              "}",
-            ].join("\n"),
+            old: ["export function main() {", "  return 'old main';", "}"].join(
+              "\n",
+            ),
             new: [
               "export function main() {",
               "  const title = 'new main';",
@@ -3846,10 +4193,7 @@ function seedDiffReloadSummaryScenario() {
           diff: {
             path: "src/generated.ts",
             old: "",
-            new: [
-              "export const generated = true;",
-              "",
-            ].join("\n"),
+            new: ["export const generated = true;", ""].join("\n"),
             existed: false,
             fullFile: true,
           },
@@ -3868,7 +4212,8 @@ function seedDiffReloadSummaryScenario() {
           id: agentBlockId,
           turnId,
           type: "agent",
-          content: "已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。",
+          content:
+            "已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。",
           streaming: false,
         },
       ],
@@ -3880,7 +4225,14 @@ function seedDiffReloadSummaryScenario() {
           mode: "edit",
           status: "done",
           summary: "三个文件已修改，可点击查看 Diff。",
-          blockIds: [userBlockId, toolBlockIdA, toolBlockIdB, toolBlockIdC, commandBlockId, agentBlockId],
+          blockIds: [
+            userBlockId,
+            toolBlockIdA,
+            toolBlockIdB,
+            toolBlockIdC,
+            commandBlockId,
+            agentBlockId,
+          ],
           collapsed: false,
           createdAt: now,
         },
@@ -3909,9 +4261,13 @@ function seedDiffReloadSummaryScenario() {
       contextMentions: [],
     }));
 
-    appendBridgeEvent("seeded", { seedCount: readSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO) });
+    appendBridgeEvent("seeded", {
+      seedCount: readSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO),
+    });
   } else {
-    appendBridgeEvent("restored", { seedCount: readSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO) });
+    appendBridgeEvent("restored", {
+      seedCount: readSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO),
+    });
   }
 
   bindBridgeSnapshot(DIFF_RELOAD_SUMMARY_SCENARIO);
@@ -3948,7 +4304,12 @@ function seedAssistantFinalPersistenceScenario() {
 
   if (!restored) {
     const taskFlow = sanitizeTaskBlocksForPersist([
-      { id: 9101, turnId: "assistant-final-completed", type: "user", content: "完成并总结修改" },
+      {
+        id: 9101,
+        turnId: "assistant-final-completed",
+        type: "user",
+        content: "完成并总结修改",
+      },
       {
         id: 9102,
         turnId: "assistant-final-completed",
@@ -3957,7 +4318,12 @@ function seedAssistantFinalPersistenceScenario() {
         visibility: "assistant_final",
         streaming: false,
       },
-      { id: 9201, turnId: "assistant-final-paused", type: "user", content: "暂停的任务" },
+      {
+        id: 9201,
+        turnId: "assistant-final-paused",
+        type: "user",
+        content: "暂停的任务",
+      },
       {
         id: 9202,
         turnId: "assistant-final-paused",
@@ -3966,7 +4332,12 @@ function seedAssistantFinalPersistenceScenario() {
         visibility: "assistant_update",
         streaming: false,
       },
-      { id: 9301, turnId: "assistant-final-error", type: "user", content: "失败的任务" },
+      {
+        id: 9301,
+        turnId: "assistant-final-error",
+        type: "user",
+        content: "失败的任务",
+      },
       {
         id: 9302,
         turnId: "assistant-final-error",
@@ -3975,7 +4346,12 @@ function seedAssistantFinalPersistenceScenario() {
         visibility: "assistant_update",
         streaming: false,
       },
-      { id: 9401, turnId: "assistant-final-pending", type: "user", content: "等待批准的任务" },
+      {
+        id: 9401,
+        turnId: "assistant-final-pending",
+        type: "user",
+        content: "等待批准的任务",
+      },
       {
         id: 9402,
         turnId: "assistant-final-pending",
@@ -4048,13 +4424,15 @@ function seedAssistantFinalPersistenceScenario() {
     config: { ...state.config, language: "zh", workflowMode: "edit" },
     currentWorkspace: workspace,
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: sessionId,
         title: "E2E Assistant Final Persistence",
         date: new Date(now).toISOString(),
         active: true,
         messages: [],
-      }],
+        },
+      ],
     },
     currentSessionId: sessionId,
     taskFlow: restored.taskFlow,
@@ -4211,7 +4589,9 @@ function seedLiveEditDiffStepsScenario() {
   }));
 
   bindBridgeSnapshot(LIVE_EDIT_DIFF_STEPS_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(LIVE_EDIT_DIFF_STEPS_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(LIVE_EDIT_DIFF_STEPS_SCENARIO),
+  });
 
   const cleanup = () => {
     const latest = useAppStore.getState();
@@ -4255,7 +4635,12 @@ function seedStageConclusionPreservedScenario() {
   ].join("\n");
 
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user", content: "修复 Unity console 里的编译错误。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user",
+      content: "修复 Unity console 里的编译错误。",
+    },
     {
       id: readBlockId,
       turnId,
@@ -4402,12 +4787,18 @@ function seedPlanReplaceRefreshScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "继续执行剩余任务，并同步刷新计划面板。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "继续执行剩余任务，并同步刷新计划面板。",
+      },
       {
         id: agentBlockId,
         turnId,
         type: "agent",
-        content: "任务执行中，`tasks.md` 每次更新后都应该立即刷新右侧计划面板。",
+        content:
+          "任务执行中，`tasks.md` 每次更新后都应该立即刷新右侧计划面板。",
         streaming: false,
       },
     ],
@@ -4431,14 +4822,16 @@ function seedPlanReplaceRefreshScenario() {
         path: ".MAIN/plans/requirements.md",
         title: "Requirements",
         updatedAt: now - 3_000,
-        content: "# Requirements\n\n- 执行中每完成一个任务，都需要立即同步计划面板。\n",
+        content:
+          "# Requirements\n\n- 执行中每完成一个任务，都需要立即同步计划面板。\n",
       },
       {
         kind: "design",
         path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 2_000,
-        content: "# Design\n\n- 任务进度以 tasks.md 为准，replace_in_file 也必须触发刷新。\n",
+        content:
+          "# Design\n\n- 任务进度以 tasks.md 为准，replace_in_file 也必须触发刷新。\n",
       },
       {
         kind: "tasks",
@@ -4456,17 +4849,27 @@ function seedPlanReplaceRefreshScenario() {
         evidenceStatus: "satisfied",
         evidence: [{ kind: "file", value: "plan-output.md" }],
       },
-      { id: "replace-task-2", text: "保存方案供用户留档", status: "in_progress" },
-      { id: "replace-task-3", text: "批准执行并完成最终收尾", status: "pending" },
+      {
+        id: "replace-task-2",
+        text: "保存方案供用户留档",
+        status: "in_progress",
+      },
+      {
+        id: "replace-task-3",
+        text: "批准执行并完成最终收尾",
+        status: "pending",
+      },
     ],
-    planExecutionEvidenceLedger: [{
+    planExecutionEvidenceLedger: [
+      {
       id: "e2e-replace-evidence-1",
       kind: "file",
       value: "plan-output.md",
       target: "plan-output.md",
       sourceTool: "write_file",
       createdAt: now,
-    }],
+      },
+    ],
     planExecutionEvidenceCount: 1,
     planStage: "executing",
     isPlanApproved: true,
@@ -4487,7 +4890,9 @@ function seedPlanReplaceRefreshScenario() {
     contextMentions: [],
   }));
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(PLAN_REPLACE_REFRESH_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(PLAN_REPLACE_REFRESH_SCENARIO),
+  });
   bindBridgeSnapshot(PLAN_REPLACE_REFRESH_SCENARIO);
 
   const replacePlanTasks = async () => {
@@ -4523,7 +4928,8 @@ function seedPlanReplaceRefreshScenario() {
       {
         path: ".MAIN/plans/tasks.md",
         search_text: "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
-        replace_text: "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
+        replace_text:
+          "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
       },
       {
         onPlanArtifactUpdated: (path, content, kind) => {
@@ -4531,7 +4937,10 @@ function seedPlanReplaceRefreshScenario() {
           state.upsertPlanArtifact({
             kind,
             path,
-            title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
+            title: getPlanArtifactTitle(
+              kind,
+              state.config.language === "en" ? "en" : "zh",
+            ),
             content,
             updatedAt: Date.now(),
           });
@@ -4547,7 +4956,9 @@ function seedPlanReplaceRefreshScenario() {
     const current = useAppStore.getState();
     appendBridgeEvent("tasks-replaced", {
       statuses: current.planTasks.map((task) => task.status),
-      artifactContent: current.planArtifacts.find((artifact) => artifact.kind === "tasks")?.content ?? "",
+      artifactContent:
+        current.planArtifacts.find((artifact) => artifact.kind === "tasks")
+          ?.content ?? "",
     });
   };
 
@@ -4646,7 +5057,12 @@ function seedExecutionCapsuleExecutionProgressScenario() {
       closeReason: null,
     },
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/执行 修改 ExecutionCapsule 执行步骤进度。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "/执行 修改 ExecutionCapsule 执行步骤进度。",
+      },
       {
         id: commentaryBlockId,
         turnId,
@@ -4707,7 +5123,13 @@ function seedExecutionCapsuleExecutionProgressScenario() {
         intent: "execute",
         status: "executing",
         summary: "执行模式下 ExecutionCapsule 应展示工具步骤进度。",
-        blockIds: [userBlockId, commentaryBlockId, readBlockId, editBlockId, commandBlockId],
+        blockIds: [
+          userBlockId,
+          commentaryBlockId,
+          readBlockId,
+          editBlockId,
+          commandBlockId,
+        ],
         collapsed: false,
         createdAt: now,
       },
@@ -4766,13 +5188,19 @@ function seedExecutionCapsuleExecutionProgressScenario() {
     contextMentions: [],
   }));
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO);
 
   const cleanup = () => {
     const latest = useAppStore.getState();
     latest.abortController?.abort();
-    useAppStore.setState({ abortController: null, agentStatus: "idle", isGenerating: false });
+    useAppStore.setState({
+      abortController: null,
+      agentStatus: "idle",
+      isGenerating: false,
+    });
     bridge.initialized = false;
   };
 
@@ -4801,11 +5229,16 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     return {
       id: `plan-task-${taskNumber}`,
       text: `T${taskNumber}: 更新 ${filePath} — 证据: file:${filePath}`,
-      status: taskNumber === 9 ? "in_progress" as const : "completed" as const,
-      claimedStatus: taskNumber === 9 ? "pending" as const : "completed" as const,
+      status:
+        taskNumber === 9 ? ("in_progress" as const) : ("completed" as const),
+      claimedStatus:
+        taskNumber === 9 ? ("pending" as const) : ("completed" as const),
       evidence: [{ kind: "file" as const, value: filePath }],
-      evidenceStatus: taskNumber === 9 ? "missing" as const : "satisfied" as const,
-      ...(taskNumber === 9 ? { blockedReason: "缺少真实执行证据，暂不能标记完成" } : {}),
+      evidenceStatus:
+        taskNumber === 9 ? ("missing" as const) : ("satisfied" as const),
+      ...(taskNumber === 9
+        ? { blockedReason: "缺少真实执行证据，暂不能标记完成" }
+        : {}),
     };
   });
   const evidenceLedger = planTasks.slice(0, 8).map((_, index) => ({
@@ -4840,7 +5273,12 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/计划 执行 9 个任务并追踪进度。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "/计划 执行 9 个任务并追踪进度。",
+      },
     ],
     conversationTurns: [
       {
@@ -4862,7 +5300,12 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
         kind: "tasks",
         path: ".MAIN/plans/tasks.md",
         title: "Tasks",
-        content: planTasks.map((task) => `- [${task.status === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        content: planTasks
+          .map(
+            (task) =>
+              `- [${task.status === "completed" ? "x" : " "}] ${task.text}`,
+          )
+          .join("\n"),
         updatedAt: now,
       },
     ],
@@ -4981,11 +5424,17 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     contextMentions: [],
   }));
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO);
 
   const cleanup = () => {
-    useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
+    useAppStore.setState({
+      abortController: null,
+      isGenerating: false,
+      agentStatus: "idle",
+    });
   };
 
   return cleanup;
@@ -5009,24 +5458,31 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
     const filePath = `src/task-${taskNumber}.ts`;
     return {
       id: `strict-plan-task-${taskNumber}`,
-      text: taskNumber === 2
+      text:
+        taskNumber === 2
         ? `1.1 修复 useTrendData 回退逻辑 — 证据: file:${filePath}`
         : `T${taskNumber}: 更新 ${filePath} — 证据: file:${filePath}`,
-      status: taskNumber <= 7 ? "completed" as const : "pending" as const,
-      claimedStatus: taskNumber <= 7 ? "completed" as const : "pending" as const,
+      status: taskNumber <= 7 ? ("completed" as const) : ("pending" as const),
+      claimedStatus:
+        taskNumber <= 7 ? ("completed" as const) : ("pending" as const),
       evidence: [{ kind: "file" as const, value: filePath }],
-      evidenceStatus: taskNumber === 1 ? "satisfied" as const : "missing" as const,
-      ...(taskNumber === 1 ? {} : { blockedReason: "缺少真实执行证据，暂不能标记完成" }),
+      evidenceStatus:
+        taskNumber === 1 ? ("satisfied" as const) : ("missing" as const),
+      ...(taskNumber === 1
+        ? {}
+        : { blockedReason: "缺少真实执行证据，暂不能标记完成" }),
     };
   });
-  const evidenceLedger = [{
+  const evidenceLedger = [
+    {
     id: "strict-evidence-1",
     kind: "file" as const,
     value: "src/task-1.ts",
     target: "src/task-1.ts",
     sourceTool: "replace_in_file",
     createdAt: now,
-  }];
+    },
+  ];
 
   incrementSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO);
 
@@ -5051,7 +5507,12 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/计划 执行 8 个任务并严格追踪证据。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "/计划 执行 8 个任务并严格追踪证据。",
+      },
     ],
     conversationTurns: [
       {
@@ -5073,7 +5534,12 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
         kind: "tasks",
         path: ".MAIN/plans/tasks.md",
         title: "Tasks",
-        content: planTasks.map((task) => `- [${task.claimedStatus === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        content: planTasks
+          .map(
+            (task) =>
+              `- [${task.claimedStatus === "completed" ? "x" : " "}] ${task.text}`,
+          )
+          .join("\n"),
         updatedAt: now,
       },
     ],
@@ -5099,11 +5565,17 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
     contextMentions: [],
   }));
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO);
 
   const cleanup = () => {
-    useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
+    useAppStore.setState({
+      abortController: null,
+      isGenerating: false,
+      agentStatus: "idle",
+    });
   };
 
   return cleanup;
@@ -5124,16 +5596,22 @@ function seedExecutionCapsulePendingToolReviewScenario() {
   const runId = "run-e2e-pending-tool-review";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const reviewBlockId = useAppStore.getState()._nextTaskId();
-  const longCommand = "printf '\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01\\x08\\x02\\x00\\x00\\x00\\x90wS\\xde\\x00\\x00\\x00\\x0cIDATx\\x9cc\\xf8\\x0f\\x00\\x01\\x01\\x01\\x00\\x18\\xdd\\x8d\\xb4\\x00\\x00\\x00\\x00IEND\\xaeB`\\x82' > src-tauri/icons/icon.png && echo Created valid icon.png";
+  const longCommand =
+    "printf '\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01\\x08\\x02\\x00\\x00\\x00\\x90wS\\xde\\x00\\x00\\x00\\x0cIDATx\\x9cc\\xf8\\x0f\\x00\\x01\\x01\\x01\\x00\\x18\\xdd\\x8d\\xb4\\x00\\x00\\x00\\x00IEND\\xaeB`\\x82' > src-tauri/icons/icon.png && echo Created valid icon.png";
   const planTasks = Array.from({ length: 12 }, (_, index) => {
     const taskNumber = index + 1;
     return {
       id: `review-plan-task-${taskNumber}`,
       text: `T${taskNumber}: 执行验证步骤 — 证据: cmd:npm run check-${taskNumber}`,
-      status: taskNumber <= 8 ? "completed" as const : "in_progress" as const,
-      claimedStatus: taskNumber <= 8 ? "completed" as const : "pending" as const,
-      evidence: [{ kind: "cmd" as const, value: `npm run check-${taskNumber}` }],
-      evidenceStatus: taskNumber <= 8 ? "satisfied" as const : "missing" as const,
+      status:
+        taskNumber <= 8 ? ("completed" as const) : ("in_progress" as const),
+      claimedStatus:
+        taskNumber <= 8 ? ("completed" as const) : ("pending" as const),
+      evidence: [
+        { kind: "cmd" as const, value: `npm run check-${taskNumber}` },
+      ],
+      evidenceStatus:
+        taskNumber <= 8 ? ("satisfied" as const) : ("missing" as const),
     };
   });
   const completedEvidenceTaskOrder = [3, 1, 2, 4, 5, 6, 7, 8];
@@ -5205,7 +5683,12 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/计划 执行含长命令审批的任务。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "/计划 执行含长命令审批的任务。",
+      },
       {
         id: reviewBlockId,
         turnId,
@@ -5262,7 +5745,12 @@ function seedExecutionCapsulePendingToolReviewScenario() {
         kind: "tasks",
         path: ".MAIN/plans/tasks.md",
         title: "Tasks",
-        content: planTasks.map((task) => `- [${task.status === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        content: planTasks
+          .map(
+            (task) =>
+              `- [${task.status === "completed" ? "x" : " "}] ${task.text}`,
+          )
+          .join("\n"),
         updatedAt: now,
       },
     ],
@@ -5322,11 +5810,14 @@ function seedExecutionCapsulePendingToolReviewScenario() {
       }),
       pendingReviewTaskId: reviewBlockId,
       pendingToolCall,
-      pendingReviewResolve: (decision: unknown) => appendBridgeEvent("pending_tool_review_resolved", { decision }),
+      pendingReviewResolve: (decision: unknown) =>
+        appendBridgeEvent("pending_tool_review_resolved", { decision }),
       agentStatus: "pending_review",
       currentTurnId: turnId,
       conversationTurns: state.conversationTurns.map((turn) =>
-        turn.id === turnId ? { ...turn, status: "awaiting_approval" as const } : turn
+        turn.id === turnId
+          ? { ...turn, status: "awaiting_approval" as const }
+          : turn,
       ),
     }));
     appendBridgeEvent("pending_tool_review_prompt_restored", {
@@ -5389,7 +5880,8 @@ function seedExecutionCapsulePendingToolReviewScenario() {
   bridge.makePendingToolReviewDestructive = () => {
     const destructiveTarget = "DELETE FROM users WHERE id = 42";
     useAppStore.setState((state) => ({
-      activeActionRequest: state.activeActionRequest?.kind === "tool_permission"
+      activeActionRequest:
+        state.activeActionRequest?.kind === "tool_permission"
         ? {
             ...state.activeActionRequest,
             toolName: "postgres_query",
@@ -5406,7 +5898,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
       taskFlow: state.taskFlow.map((block) =>
         block.id === reviewBlockId && block.type === "tool"
           ? { ...block, toolName: "postgres_query", target: destructiveTarget }
-          : block
+          : block,
       ),
     }));
   };
@@ -5423,11 +5915,14 @@ function seedExecutionCapsulePendingToolReviewScenario() {
   ) => {
     const state = useAppStore.getState();
     if (action === "approve_once") state.approvePendingReviewOnce(identity);
-    else if (action === "approve_session") state.approvePendingReviewForSession(identity);
+    else if (action === "approve_session")
+      state.approvePendingReviewForSession(identity);
     else state.rejectToolAction(identity.taskId, identity);
   };
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO);
 
   const cleanup = () => {
@@ -5491,7 +5986,12 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "修复 unity console 窗口里的报错。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "修复 unity console 窗口里的报错。",
+      },
     ],
     conversationTurns: [
       {
@@ -5537,12 +6037,22 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
 
   bridge.showOrphanPendingReviewPrompt = () => {
     useAppStore.setState((state) => {
-      const hasUserBlock = state.taskFlow.some((block) => block.id === userBlockId);
-      const nextTurns = state.conversationTurns.some((turn) => turn.id === turnId)
+      const hasUserBlock = state.taskFlow.some(
+        (block) => block.id === userBlockId,
+      );
+      const nextTurns = state.conversationTurns.some(
+        (turn) => turn.id === turnId,
+      )
         ? state.conversationTurns.map((turn) =>
             turn.id === turnId
-              ? { ...turn, status: "awaiting_approval" as const, blockIds: turn.blockIds.includes(userBlockId) ? turn.blockIds : [...turn.blockIds, userBlockId] }
-              : turn
+              ? {
+                  ...turn,
+                  status: "awaiting_approval" as const,
+                  blockIds: turn.blockIds.includes(userBlockId)
+                    ? turn.blockIds
+                    : [...turn.blockIds, userBlockId],
+                }
+              : turn,
           )
         : [
             ...state.conversationTurns,
@@ -5563,17 +6073,26 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
       return {
         ...state,
         taskFlow: hasUserBlock
-          ? state.taskFlow.filter((block) => !(block.type === "tool" && block.id === pendingReviewTaskId))
+          ? state.taskFlow.filter(
+              (block) =>
+                !(block.type === "tool" && block.id === pendingReviewTaskId),
+            )
           : [
               ...state.taskFlow,
-              { id: userBlockId, turnId, type: "user" as const, content: "修复 unity console 窗口里的报错。" },
+              {
+                id: userBlockId,
+                turnId,
+                type: "user" as const,
+                content: "修复 unity console 窗口里的报错。",
+              },
             ],
         conversationTurns: nextTurns,
         currentTurnId: turnId,
         agentStatus: "pending_review",
         isGenerating: false,
         abortController: null,
-        pendingReviewResolve: (decision: unknown) => appendBridgeEvent("orphan_review_resolved", { decision }),
+        pendingReviewResolve: (decision: unknown) =>
+          appendBridgeEvent("orphan_review_resolved", { decision }),
         pendingReviewTaskId,
         harnessRunMarker: buildE2ERunningToolPermissionOwner({
           workspace,
@@ -5605,7 +6124,9 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
     appendBridgeEvent("orphan_pending_prompt_shown");
   };
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO);
 
   const cleanup = () => {
@@ -5647,7 +6168,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
       text: "T1: 更新 ExecutionCapsule 审批状态 — 证据: file:src/components/ExecutionCapsule.tsx",
       status: "pending" as const,
       claimedStatus: "pending" as const,
-      evidence: [{ kind: "file" as const, value: "src/components/ExecutionCapsule.tsx" }],
+      evidence: [
+        { kind: "file" as const, value: "src/components/ExecutionCapsule.tsx" },
+      ],
       evidenceStatus: "missing" as const,
     },
     {
@@ -5655,7 +6178,13 @@ function seedExecutionCapsulePanelStabilityScenario() {
       text: "T2: 验证右侧面板状态稳定 — 证据: cmd:npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts",
       status: "pending" as const,
       claimedStatus: "pending" as const,
-      evidence: [{ kind: "cmd" as const, value: "npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts" }],
+      evidence: [
+        {
+          kind: "cmd" as const,
+          value:
+            "npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts",
+        },
+      ],
       evidenceStatus: "missing" as const,
     },
   ];
@@ -5680,7 +6209,12 @@ function seedExecutionCapsulePanelStabilityScenario() {
 
   incrementSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
 
-  const baseUserBlock = { id: userBlockId, turnId, type: "user" as const, content: "/计划 修复 ExecutionCapsule 审批时右侧面板状态。" };
+  const baseUserBlock = {
+    id: userBlockId,
+    turnId,
+    type: "user" as const,
+    content: "/计划 修复 ExecutionCapsule 审批时右侧面板状态。",
+  };
   const baseAgentBlock = {
     id: agentBlockId,
     turnId,
@@ -5722,25 +6256,34 @@ function seedExecutionCapsulePanelStabilityScenario() {
     },
   };
 
-  const removeReviewBlock = (state: ReturnType<typeof useAppStore.getState>) => ({
+  const removeReviewBlock = (
+    state: ReturnType<typeof useAppStore.getState>,
+  ) => ({
     taskFlow: state.taskFlow.filter((block) => block.id !== reviewBlockId),
     conversationTurns: state.conversationTurns.map((turn) =>
       turn.id === turnId
-        ? { ...turn, blockIds: turn.blockIds.filter((id) => id !== reviewBlockId) }
-        : turn
+        ? {
+            ...turn,
+            blockIds: turn.blockIds.filter((id) => id !== reviewBlockId),
+          }
+        : turn,
     ),
   });
 
   const addReviewBlock = (state: ReturnType<typeof useAppStore.getState>) => {
-    const hasReviewBlock = state.taskFlow.some((block) => block.id === reviewBlockId);
+    const hasReviewBlock = state.taskFlow.some(
+      (block) => block.id === reviewBlockId,
+    );
     return {
       taskFlow: hasReviewBlock
-        ? state.taskFlow.map((block) => block.id === reviewBlockId ? reviewBlock : block)
+        ? state.taskFlow.map((block) =>
+            block.id === reviewBlockId ? reviewBlock : block,
+          )
         : [...state.taskFlow, reviewBlock],
       conversationTurns: state.conversationTurns.map((turn) =>
         turn.id === turnId && !turn.blockIds.includes(reviewBlockId)
           ? { ...turn, blockIds: [...turn.blockIds, reviewBlockId] }
-          : turn
+          : turn,
       ),
     };
   };
@@ -5792,7 +6335,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
       artifactIdentity,
     });
     if (drafting.disposition === "rejected") {
-      throw new Error(`Failed to seed Plan drafting lifecycle: ${drafting.reason}`);
+      throw new Error(
+        `Failed to seed Plan drafting lifecycle: ${drafting.reason}`,
+      );
     }
     lifecycle = drafting.state;
     const review = reducePlanLifecycle(lifecycle, {
@@ -5861,7 +6406,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
       },
     });
     if (accepted.disposition === "rejected") {
-      throw new Error(`Failed to seed Plan review checkpoint: ${accepted.reason}`);
+      throw new Error(
+        `Failed to seed Plan review checkpoint: ${accepted.reason}`,
+      );
     }
     const checkpoint = createTurnRuntimeCheckpoint({
       canonical: accepted.state,
@@ -5881,7 +6428,11 @@ function seedExecutionCapsulePanelStabilityScenario() {
    * admission that follows a valid approval lease. Every identity used by the
    * real dispatcher is rechecked before the fixture can project execution.
    */
-  const admitApprovedPlanChildRun: typeof originalSendMessage = (text, images, options) => {
+  const admitApprovedPlanChildRun: typeof originalSendMessage = (
+    text,
+    images,
+    options,
+  ) => {
     const isPlanExecutionDispatch =
       options?.hidden === true &&
       options.createVisibleTurnForHiddenMessage === false &&
@@ -5901,14 +6452,19 @@ function seedExecutionCapsulePanelStabilityScenario() {
     const executionLease = lifecycle.executionLease;
     const handoff = current.pendingPlanApprovalHandoff;
     const marker = current.harnessRunMarker;
-    const artifactIdentity = buildTypedPlanApprovalIdentity(current.planArtifacts);
-    const ownerSession = current.sessionsByWorkspace[workspace]
-      ?.find((session) => session.id === sessionId);
+    const artifactIdentity = buildTypedPlanApprovalIdentity(
+      current.planArtifacts,
+    );
+    const ownerSession = current.sessionsByWorkspace[workspace]?.find(
+      (session) => session.id === sessionId,
+    );
     const instructionHash = buildPlanExecutionInstructionHash(text);
     const pathsMatch = (
       left: readonly string[] | undefined,
       right: readonly string[] | undefined,
-    ) => !!left && !!right &&
+    ) =>
+      !!left &&
+      !!right &&
       left.length === right.length &&
       left.every((path, index) => path === right[index]);
     const exactAdmission =
@@ -5924,8 +6480,12 @@ function seedExecutionCapsulePanelStabilityScenario() {
       !!marker &&
       !!artifactIdentity &&
       lifecycle.artifactIdentity?.revision === artifactIdentity.revision &&
-      lifecycle.artifactIdentity.artifactHash === artifactIdentity.artifactHash &&
-      pathsMatch(lifecycle.artifactIdentity.artifactPaths, artifactIdentity.artifactPaths) &&
+      lifecycle.artifactIdentity.artifactHash ===
+        artifactIdentity.artifactHash &&
+      pathsMatch(
+        lifecycle.artifactIdentity.artifactPaths,
+        artifactIdentity.artifactPaths,
+      ) &&
       approvalLease.planRevision === artifactIdentity.revision &&
       approvalLease.artifactHash === artifactIdentity.artifactHash &&
       pathsMatch(approvalLease.artifactPaths, artifactIdentity.artifactPaths) &&
@@ -6001,14 +6561,17 @@ function seedExecutionCapsulePanelStabilityScenario() {
       });
       return false;
     }
-    const runStarted = appendRuntimeEventWithResult(current.runtimeEvents, withEventSchema({
+    const runStarted = appendRuntimeEventWithResult(
+      current.runtimeEvents,
+      withEventSchema({
       type: "run.started",
       threadId: sessionKey,
       turnId: execution.turnId,
       timestampMs: admittedAt,
       runId: execution.runId,
       parentRunId: execution.parentRunId,
-    }));
+      }),
+    );
     if (runStarted.disposition === "conflict") {
       appendBridgeEvent("panel-child-run-admission-rejected", {
         reason: "run_started_identity_conflict",
@@ -6051,7 +6614,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
               summary: "已接纳批准后的同回合子 Run，正在执行计划。",
               runtimeOutcome: undefined,
             }
-          : turn
+          : turn,
       ),
       agentStatus: "running",
       isGenerating: true,
@@ -6145,7 +6708,8 @@ function seedExecutionCapsulePanelStabilityScenario() {
       showDiff: mode === "diff",
       showTerminal: mode === "terminal",
       showFilePanel: false,
-      rightPanelTab: mode === "diff" ? "diff" : mode === "terminal" ? "terminal" : "plan",
+      rightPanelTab:
+        mode === "diff" ? "diff" : mode === "terminal" ? "terminal" : "plan",
       selectedDiffTaskId: mode === "diff" ? reviewBlockId : null,
     });
     appendBridgeEvent("panel_mode", { mode });
@@ -6172,7 +6736,8 @@ function seedExecutionCapsulePanelStabilityScenario() {
       phase: "summarizing" as const,
       title: "Needs rewrite",
       why: "草稿结构不完整，直接重写可见方案。",
-      action: "第 4 次计划生成已持续 65 秒，收到 420 个流式分块；隐藏推理正文不会展示。",
+      action:
+        "第 4 次计划生成已持续 65 秒，收到 420 个流式分块；隐藏推理正文不会展示。",
       evidence: "",
       next: "计划通过质量门后才会进入审核；当前不会请求执行批准。",
       targets: [],
@@ -6207,7 +6772,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
               summary: "",
               blockIds: [userBlockId, staleReadBlockId, phaseBlockId],
             }
-          : turn
+          : turn,
       ),
       currentTurnState: {
         ...state.currentTurnState,
@@ -6316,14 +6881,19 @@ function seedExecutionCapsulePanelStabilityScenario() {
       activeActionRequest: exactReview.request,
       turnRuntimeCheckpoints: { [turnId]: exactReview.checkpoint },
     });
-    appendBridgeEvent("execution_capsule_identity", { runId, requestId, turnId });
+    appendBridgeEvent("execution_capsule_identity", {
+      runId,
+      requestId,
+      turnId,
+    });
   };
 
   bridge.resetPlanApprovalPrompt = () => {
     useAppStore.setState((state) => {
       const withoutReview = removeReviewBlock(state);
       const resetAt = Date.now();
-      const reviewRunId = state.harnessRunMarker?.runId || "run-e2e-plan-review";
+      const reviewRunId =
+        state.harnessRunMarker?.runId || "run-e2e-plan-review";
       const exactReview = buildExactPlanReviewRuntime({
         artifacts: state.planArtifacts,
         runId: reviewRunId,
@@ -6357,9 +6927,12 @@ function seedExecutionCapsulePanelStabilityScenario() {
         planLifecycle: exactReview.lifecycle,
         activeActionRequest: exactReview.request,
         turnRuntimeCheckpoints: { [turnId]: exactReview.checkpoint },
-        selectedDiffTaskId: state.selectedDiffTaskId === reviewBlockId ? null : state.selectedDiffTaskId,
+        selectedDiffTaskId:
+          state.selectedDiffTaskId === reviewBlockId
+            ? null
+            : state.selectedDiffTaskId,
         conversationTurns: withoutReview.conversationTurns.map((turn) =>
-          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn
+          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn,
         ),
       };
     });
@@ -6377,9 +6950,14 @@ function seedExecutionCapsulePanelStabilityScenario() {
 
   bridge.failNextPlanExecutionSubmission = () => {
     const originalSendMessage = useAppStore.getState().sendMessage;
-    const interceptSendMessage: typeof originalSendMessage = (text, images, options) => {
+    const interceptSendMessage: typeof originalSendMessage = (
+      text,
+      images,
+      options,
+    ) => {
       if (
-        (options?.runtimeIntentOverride === "execute" || options?.resolvedIntent === "execute") &&
+        (options?.runtimeIntentOverride === "execute" ||
+          options?.resolvedIntent === "execute") &&
         options?.reuseCurrentTurn === true
       ) {
         useAppStore.setState({ sendMessage: originalSendMessage });
@@ -6412,23 +6990,30 @@ function seedExecutionCapsulePanelStabilityScenario() {
       pendingPlanApprovalHandoff: null,
       planApprovalExecutionStartedForTurnId: turnId,
       conversationTurns: state.conversationTurns.map((turn) =>
-        turn.id === turnId ? { ...turn, status: "executing" } : turn
+        turn.id === turnId ? { ...turn, status: "executing" } : turn,
       ),
     }));
     const accepted = useAppStore.getState().sendMessage("继续");
     let latest = useAppStore.getState();
-    let queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries
-      .find((entry) => entry.status === "queued")?.instruction.payload.text;
-    for (let attempt = 0; attempt < 50 && !queuedWorkspaceInstruction; attempt += 1) {
+    let queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries.find(
+      (entry) => entry.status === "queued",
+    )?.instruction.payload.text;
+    for (
+      let attempt = 0;
+      attempt < 50 && !queuedWorkspaceInstruction;
+      attempt += 1
+    ) {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 10));
       latest = useAppStore.getState();
-      queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries
-        .find((entry) => entry.status === "queued")?.instruction.payload.text;
+      queuedWorkspaceInstruction = latest.workspaceTurnQueue?.entries.find(
+        (entry) => entry.status === "queued",
+      )?.instruction.payload.text;
     }
     return {
       accepted,
       ownerPreserved: latest.abortController === owner,
-      queuedText: queuedWorkspaceInstruction || latest.queuedUserMessage?.text || null,
+      queuedText:
+        queuedWorkspaceInstruction || latest.queuedUserMessage?.text || null,
       startedForTurnId: latest.planApprovalExecutionStartedForTurnId,
     };
   };
@@ -6436,7 +7021,8 @@ function seedExecutionCapsulePanelStabilityScenario() {
   bridge.showToolApprovalPrompt = () => {
     useAppStore.setState((state) => {
       const withReview = addReviewBlock(state);
-      const runId = state.harnessRunMarker?.runId || "run-e2e-panel-tool-review";
+      const runId =
+        state.harnessRunMarker?.runId || "run-e2e-panel-tool-review";
       return {
         ...withReview,
         isPlanApproved: true,
@@ -6445,7 +7031,8 @@ function seedExecutionCapsulePanelStabilityScenario() {
         isGenerating: false,
         abortController: null,
         currentTurnExecutionConsent: { turnId, granted: true },
-        pendingReviewResolve: (decision: unknown) => appendBridgeEvent("tool_review_resolved", { decision }),
+        pendingReviewResolve: (decision: unknown) =>
+          appendBridgeEvent("tool_review_resolved", { decision }),
         pendingReviewTaskId: reviewBlockId,
         harnessRunMarker: buildE2ERunningToolPermissionOwner({
           workspace,
@@ -6476,7 +7063,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
           shellPermissionDecision: reviewBlock.shellPermissionDecision,
         },
         conversationTurns: withReview.conversationTurns.map((turn) =>
-          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn
+          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn,
         ),
       };
     });
@@ -6486,9 +7073,11 @@ function seedExecutionCapsulePanelStabilityScenario() {
   bridge.showChildRunToolApprovalPrompt = () => {
     bridge.showToolApprovalPrompt?.();
     useAppStore.setState((state) => {
-      const outerRunId = state.harnessRunMarker?.runId || "run-e2e-panel-tool-review";
+      const outerRunId =
+        state.harnessRunMarker?.runId || "run-e2e-panel-tool-review";
       const childRunId = `${outerRunId}-child`;
-      const request = state.activeActionRequest?.kind === "tool_permission"
+      const request =
+        state.activeActionRequest?.kind === "tool_permission"
         ? state.activeActionRequest
         : null;
       return {
@@ -6532,14 +7121,18 @@ function seedExecutionCapsulePanelStabilityScenario() {
         activeActionRequest: null,
         pendingToolCall: null,
         conversationTurns: withoutReview.conversationTurns.map((turn) =>
-          turn.id === turnId ? { ...turn, status: stateName === "idle" ? "done" : "executing" } : turn
+          turn.id === turnId
+            ? { ...turn, status: stateName === "idle" ? "done" : "executing" }
+            : turn,
         ),
       };
     });
     appendBridgeEvent("run_state", { state: stateName });
   };
 
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO) });
+  appendBridgeEvent("seeded", {
+    seedCount: readSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO),
+  });
   bindBridgeSnapshot(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
 
   const cleanup = () => {
@@ -6564,7 +7157,9 @@ function seedExecutionCapsulePanelStabilityScenario() {
   return cleanup;
 }
 
-function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input") {
+function seedGameStudioToolGroupScenario(
+  status: "executing" | "awaiting_input",
+) {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -6572,12 +7167,14 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
   bridge.savedDocuments = [];
   bridge.completed = status !== "executing";
 
-  const workspace = status === "executing"
+  const workspace =
+    status === "executing"
     ? "/tmp/e2e-game-studio-tool-group"
     : "/tmp/e2e-game-studio-awaiting-choice";
   const sessionId = status === "executing" ? 999611 : 999612;
   const now = Date.now();
-  const turnId = status === "executing"
+  const turnId =
+    status === "executing"
     ? "e2e-game-studio-tool-group-turn"
     : "e2e-game-studio-awaiting-choice-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
@@ -6589,7 +7186,12 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
   const agentBlockId = useAppStore.getState()._nextTaskId();
 
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "继续排查 Main Camera 行为。" },
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "继续排查 Main Camera 行为。",
+    },
     {
       id: completedAId,
       turnId,
@@ -6642,7 +7244,8 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "running",
       toolStatus: "running",
       message: "Executing...",
-      intentSummary: "继续调整 Main Camera 视角\n**视角偏移** 需要用工具结果确认后再继续。",
+      intentSummary:
+        "继续调整 Main Camera 视角\n**视角偏移** 需要用工具结果确认后再继续。",
     });
   } else {
     taskFlow.push({
@@ -6651,8 +7254,16 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       type: "agent",
       content: "请选择下一步。",
       options: [
-        { label: "继续分析 Main Camera", value: "继续分析 Main Camera", action: "continue_readonly_once" },
-        { label: "本会话只读全部允许", value: "本会话只读全部允许", action: "allow_readonly_session" },
+        {
+          label: "继续分析 Main Camera",
+          value: "继续分析 Main Camera",
+          action: "continue_readonly_once",
+        },
+        {
+          label: "本会话只读全部允许",
+          value: "本会话只读全部允许",
+          action: "allow_readonly_session",
+        },
       ],
       choiceRequest: {
         sessionKey: `${workspace}:${sessionId}`,
@@ -6682,7 +7293,8 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       [workspace]: [
         {
           id: sessionId,
-          title: status === "executing"
+          title:
+            status === "executing"
             ? "E2E Game Studio Tool Group Collapse"
             : "E2E Game Studio Awaiting Choice",
           date: new Date(now).toISOString(),
@@ -6701,7 +7313,10 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
         mode: "edit",
         intent: "studio_workflow",
         status,
-        summary: status === "executing" ? "Game Studio 连续工具调用中。" : "Game Studio 已暂停等待选择。",
+        summary:
+          status === "executing"
+            ? "Game Studio 连续工具调用中。"
+            : "Game Studio 已暂停等待选择。",
         blockIds: taskFlow.map((block) => block.id),
         collapsed: false,
         createdAt: now,
@@ -6738,14 +7353,17 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = kind === "model"
+  const workspace =
+    kind === "model"
     ? "/tmp/e2e-capsule-model-explanation"
     : kind === "progress"
       ? "/tmp/e2e-capsule-progress-only"
       : "/tmp/e2e-capsule-phase-fallback";
-  const sessionId = kind === "model" ? 999613 : kind === "progress" ? 999614 : 999616;
+  const sessionId =
+    kind === "model" ? 999613 : kind === "progress" ? 999614 : 999616;
   const now = Date.now();
-  const turnId = kind === "model"
+  const turnId =
+    kind === "model"
     ? "e2e-capsule-model-explanation-turn"
     : kind === "progress"
       ? "e2e-capsule-progress-only-turn"
@@ -6758,10 +7376,18 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   const commandToolId = useAppStore.getState()._nextTaskId();
   const secondUpdateId = useAppStore.getState()._nextTaskId();
   const runningToolId = useAppStore.getState()._nextTaskId();
-  const capsuleText = "我会保留这条模型说明，并在工具执行时继续围绕 capsule 链路排查。";
+  const capsuleText =
+    "我会保留这条模型说明，并在工具执行时继续围绕 capsule 链路排查。";
   const taskFlow: any[] = [
-    { id: userBlockId, turnId, type: "user" as const, content: "继续排查 capsule 和工具折叠。" },
-    ...(kind === "model" ? [{
+    {
+      id: userBlockId,
+      turnId,
+      type: "user" as const,
+      content: "继续排查 capsule 和工具折叠。",
+    },
+    ...(kind === "model"
+      ? [
+          {
       id: firstUpdateId,
       turnId,
       type: "agent" as const,
@@ -6782,11 +7408,13 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
         parentRunId: null,
         createdAt: now - 20,
       },
-    }, {
+          },
+          {
       id: liveActivityId,
       turnId,
       type: "agent" as const,
-      content: "让我继续查看 **ChatArea.tsx**，确认 Capsule 的实时投影入口。",
+            content:
+              "让我继续查看 **ChatArea.tsx**，确认 Capsule 的实时投影入口。",
       visibility: "user_progress" as const,
       streaming: true,
       hiddenProcess: false,
@@ -6801,8 +7429,13 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
         parentRunId: null,
         createdAt: now,
       },
-    }] : []),
-    ...(kind === "phase" ? [] : [{
+          },
+        ]
+      : []),
+    ...(kind === "phase"
+      ? []
+      : [
+          {
       id: readToolId,
       turnId,
       type: "tool" as const,
@@ -6814,7 +7447,8 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       message: "OK",
       intentSummary: "确认 capsule 渲染链路",
       observationSummary: "找到 ChatArea 中 capsule 的显示优先级。",
-    }, {
+          },
+          {
       id: commandToolId,
       turnId,
       type: "tool" as const,
@@ -6826,8 +7460,11 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       message: "OK",
       intentSummary: "运行回归测试确认折叠状态",
       observationSummary: "验证命令已完成。",
-    }]),
-    ...(kind === "model" ? [{
+          },
+        ]),
+    ...(kind === "model"
+      ? [
+          {
       id: secondUpdateId,
       turnId,
       type: "agent" as const,
@@ -6848,8 +7485,13 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
         parentRunId: null,
         createdAt: now - 10,
       },
-    }] : []),
-    ...(kind === "phase" ? [] : [{
+          },
+        ]
+      : []),
+    ...(kind === "phase"
+      ? []
+      : [
+          {
       id: runningToolId,
       turnId,
       type: "tool" as const,
@@ -6860,7 +7502,8 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       toolStatus: "running" as const,
       message: "Searching...",
       intentSummary: "继续确认 capsule 不会被工具调用冲刷",
-    }]),
+          },
+        ]),
   ];
 
   useAppStore.setState((state) => ({
@@ -6877,7 +7520,8 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       [workspace]: [
         {
           id: sessionId,
-        title: kind === "model"
+          title:
+            kind === "model"
           ? "E2E Capsule Model Explanation"
           : kind === "progress"
             ? "E2E Capsule Progress Only"
@@ -6927,7 +7571,8 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       {
         id: turnId,
         userPrompt: "继续排查 capsule 和工具折叠。",
-        title: kind === "model"
+        title:
+          kind === "model"
           ? "Capsule 模型说明缓存"
           : kind === "progress"
             ? "Capsule 工具进度兜底"
@@ -6947,8 +7592,14 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       interceptorThought: "",
       lastReportedThought: "",
       lastReportedAssistantText: "",
-      capsuleExplanation: kind === "model"
-        ? { turnId, text: capsuleText, updatedAt: now, source: "model" as const }
+      capsuleExplanation:
+        kind === "model"
+          ? {
+              turnId,
+              text: capsuleText,
+              updatedAt: now,
+              source: "model" as const,
+            }
         : null,
       turnId,
     },
@@ -6992,7 +7643,8 @@ function seedGoalCapsuleScenario() {
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const goal = {
     ...createGoalDefinition({
-    objective: "重构 Goal Runtime；完成标准：Loop 与 Capsule 通过测试；约束：兼容 dark、black、light 三大主题",
+      objective:
+        "重构 Goal Runtime；完成标准：Loop 与 Capsule 通过测试；约束：兼容 dark、black、light 三大主题",
     iterationBudget: 40,
     maxDurationMs: 2 * 60 * 60 * 1000,
     sessionKey: `${workspace}:${sessionId}`,
@@ -7000,7 +7652,10 @@ function seedGoalCapsuleScenario() {
     }),
     id: "e2e_goal_capsule",
   };
-  const progress = createGoalProgress(goal.id, `${workspace}/.MAIN/goals/${goal.id}/progress.md`);
+  const progress = createGoalProgress(
+    goal.id,
+    `${workspace}/.MAIN/goals/${goal.id}/progress.md`,
+  );
   progress.currentIteration = 3;
   progress.totalIterationsUsed = 3;
   progress.totalTokensUsed = 4820;
@@ -7046,12 +7701,14 @@ function seedGoalCapsuleScenario() {
       createdAt: now - 10_000,
     },
   ];
-  progress.milestones = [{
+  progress.milestones = [
+    {
     id: "e2e-goal-milestone",
     text: "验证 Capsule Goal 菜单与三主题",
     status: "in_progress",
     criterionIds: goal.criteria?.map((criterion) => criterion.id) || [],
-  }];
+    },
+  ];
   progress.currentMilestoneId = "e2e-goal-milestone";
   progress.usage = {
     modelIterations: 3,
@@ -7061,7 +7718,11 @@ function seedGoalCapsuleScenario() {
     activeStartedAt: now - 20_000,
     estimatedTokens: true,
   };
-  const runtime = buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+  const runtime = buildGoalRuntimeSnapshot({
+    goal,
+    progress,
+    phase: "execute",
+  });
 
   useAppStore.setState((state) => ({
     ...state,
@@ -7070,10 +7731,18 @@ function seedGoalCapsuleScenario() {
     selectedNexusModeKey: "nexus_general",
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
-    workspaces: [{ path: workspace, name: "E2E Goal Capsule", addedAt: now, lastActiveAt: now }],
+    workspaces: [
+      {
+        path: workspace,
+        name: "E2E Goal Capsule",
+        addedAt: now,
+        lastActiveAt: now,
+      },
+    ],
     activeSessionByWorkspace: { [workspace]: sessionId },
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: sessionId,
         title: "E2E Goal Capsule",
         date: new Date(now).toISOString(),
@@ -7081,15 +7750,28 @@ function seedGoalCapsuleScenario() {
         storageStatus: "ok" as const,
         recordingDisabled: false,
         messages: [],
-      }],
+        },
+      ],
       [GLOBAL_CHAT_KEY]: [],
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "持续完成 Goal Runtime 重构。" },
-      { id: agentBlockId, turnId, type: "agent", content: "已进入持续目标执行。", streaming: false },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "持续完成 Goal Runtime 重构。",
+      },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "已进入持续目标执行。",
+        streaming: false,
+      },
     ],
-    conversationTurns: [{
+    conversationTurns: [
+      {
       id: turnId,
       userPrompt: "持续完成 Goal Runtime 重构。",
       title: "Goal Runtime 重构",
@@ -7102,7 +7784,8 @@ function seedGoalCapsuleScenario() {
       collapsed: false,
       createdAt: now,
       elapsedTime: 83,
-    }],
+      },
+    ],
     currentTurnId: turnId,
     currentTurnState: {
       interceptorHandled: false,
@@ -7136,19 +7819,33 @@ function seedGoalCapsuleScenario() {
       updatedAt: Date.now(),
       criteria: state.activeGoal.criteria?.map((criterion) => ({
         ...criterion,
-        status: status === "completed" ? "satisfied" as const : criterion.status,
-        evidenceIds: status === "completed" ? state.goalProgress?.evidence?.map((entry) => entry.id) || [] : criterion.evidenceIds,
+        status:
+          status === "completed" ? ("satisfied" as const) : criterion.status,
+        evidenceIds:
+          status === "completed"
+            ? state.goalProgress?.evidence?.map((entry) => entry.id) || []
+            : criterion.evidenceIds,
       })),
     };
     const nextRuntime = {
-      ...(state.goalRuntime || buildGoalRuntimeSnapshot({ goal: nextGoal, progress: state.goalProgress, phase: "observe" })),
+      ...(state.goalRuntime ||
+        buildGoalRuntimeSnapshot({
+          goal: nextGoal,
+          progress: state.goalProgress,
+          phase: "observe",
+        })),
       goal: nextGoal,
       status,
-      phase: status === "completed" ? "observe" as const : "re_plan" as const,
+      phase:
+        status === "completed" ? ("observe" as const) : ("re_plan" as const),
       pauseReason: status === "paused" ? "E2E pause" : undefined,
       updatedAt: Date.now(),
     };
-    useAppStore.setState({ activeGoal: nextGoal, goalStatus: status, goalRuntime: nextRuntime });
+    useAppStore.setState({
+      activeGoal: nextGoal,
+      goalStatus: status,
+      goalRuntime: nextRuntime,
+    });
   };
   bridge.setGoalUserChoicePending = () => {
     const state = useAppStore.getState();
@@ -7173,7 +7870,8 @@ function seedGoalCapsuleScenario() {
       updatedAt: Date.now(),
     };
     const awaitingRuntime = {
-      ...(state.goalRuntime || buildGoalRuntimeSnapshot({
+      ...(state.goalRuntime ||
+        buildGoalRuntimeSnapshot({
         goal: awaitingGoal,
         progress: state.goalProgress,
         phase: "re_plan",
@@ -7229,12 +7927,12 @@ function seedGoalCapsuleScenario() {
               options: optionValues.map((value) => ({ label: value, value })),
               choiceRequest: request,
             }
-          : block
+          : block,
       ),
       conversationTurns: latest.conversationTurns.map((turn) =>
         turn.id === turnId
           ? { ...turn, status: "awaiting_input" as const }
-          : turn
+          : turn,
       ),
       agentStatus: "idle",
       isGenerating: false,
@@ -7317,9 +8015,12 @@ function seedGoalCapsuleScenario() {
             ...session,
             active: session.id === nextSessionId,
           })),
-          ...((latest.sessionsByWorkspace[workspace] || []).some((session) => session.id === nextSessionId)
+          ...((latest.sessionsByWorkspace[workspace] || []).some(
+            (session) => session.id === nextSessionId,
+          )
             ? []
-            : [{
+            : [
+                {
                 id: nextSessionId,
                 title: "E2E Goal Capsule Other Session",
                 date: new Date().toISOString(),
@@ -7327,7 +8028,8 @@ function seedGoalCapsuleScenario() {
                 storageStatus: "temporary" as const,
                 recordingDisabled: true,
                 messages: [],
-              }]),
+                },
+              ]),
         ],
       },
       taskFlow: [],
@@ -7351,10 +8053,18 @@ function seedGoalCapsuleScenario() {
   bridge.getGoalOwnerSnapshot = () => {
     const state = useAppStore.getState();
     const ownerRuntime = state.runtimeBySessionKey[`${workspace}:${sessionId}`];
-    const ownerSession = (state.sessionsByWorkspace[workspace] || []).find((session) => session.id === sessionId);
+    const ownerSession = (state.sessionsByWorkspace[workspace] || []).find(
+      (session) => session.id === sessionId,
+    );
     return {
-      runtimeGoalId: ownerRuntime?.activeGoal?.id || ownerRuntime?.goalRuntime?.goal?.id || null,
-      sessionGoalId: ownerSession?.runtimeSnapshot?.activeGoal?.id || ownerSession?.runtimeSnapshot?.goalRuntime?.goal?.id || null,
+      runtimeGoalId:
+        ownerRuntime?.activeGoal?.id ||
+        ownerRuntime?.goalRuntime?.goal?.id ||
+        null,
+      sessionGoalId:
+        ownerSession?.runtimeSnapshot?.activeGoal?.id ||
+        ownerSession?.runtimeSnapshot?.goalRuntime?.goal?.id ||
+        null,
       currentSessionId: state.currentSessionId,
       currentGoalId: state.activeGoal?.id || null,
     };
@@ -7513,7 +8223,8 @@ function seedGameStudioOnboardingScenario() {
       input: state.input,
       themeMode: state.config.themeMode,
       conversationTurns: state.conversationTurns.length,
-      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user")
+        .length,
       gameStudioInitialized: state.gameStudioInitialized,
       selectedMainModeKey: state.selectedMainModeKey,
       selectedNexusModeKey: state.selectedNexusModeKey,
@@ -7601,22 +8312,32 @@ function seedComposerMainShortcutsScenario() {
       selectedMainModeKey: state.selectedMainModeKey,
       lockedComposerIntent: state.lockedComposerIntent,
       currentTurnIntent: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.intent ?? null)
         : null,
       currentTurnDisplayIntent: state.currentTurnId
         ? (() => {
-            const turn = state.conversationTurns.find((candidate) => candidate.id === state.currentTurnId);
+            const turn = state.conversationTurns.find(
+              (candidate) => candidate.id === state.currentTurnId,
+            );
             return turn?.displayIntent ?? turn?.intent ?? null;
           })()
         : null,
       currentTurnTitle: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.title ?? null)
         : null,
       currentTurnPrompt: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.userPrompt ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.userPrompt ?? null)
         : null,
       currentTurnStatus: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.status ?? null)
         : null,
       currentWorkspace: state.currentWorkspace,
       activeGoalId: state.activeGoal?.id ?? null,
@@ -7661,7 +8382,9 @@ function seedComposerMainShortcutsScenario() {
       agentStatus: "idle",
       abortController: null,
     });
-    const started = useAppStore.getState().sendMessage(queued.text, queued.images, {
+    const started = useAppStore
+      .getState()
+      .sendMessage(queued.text, queued.images, {
       contextMentionsSnapshot: queued.contextMentions || [],
       attachedFilesSnapshot: queued.attachedFiles || [],
       runtimeIntentOverride: queued.runtimeIntentOverride,
@@ -7744,22 +8467,32 @@ function seedGameStudioPlanShortcutsScenario() {
       currentTurnId: state.currentTurnId,
       turnIds: state.conversationTurns.map((turn) => turn.id),
       currentTurnIntent: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.intent ?? null)
         : null,
       currentTurnDisplayIntent: state.currentTurnId
         ? (() => {
-            const turn = state.conversationTurns.find((candidate) => candidate.id === state.currentTurnId);
+            const turn = state.conversationTurns.find(
+              (candidate) => candidate.id === state.currentTurnId,
+            );
             return turn?.displayIntent ?? turn?.intent ?? null;
           })()
         : null,
       currentTurnTitle: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.title ?? null)
         : null,
       currentTurnPrompt: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.userPrompt ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.userPrompt ?? null)
         : null,
       currentTurnStatus: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.status ?? null)
         : null,
       conversationTurns: state.conversationTurns.length,
       planStage: state.planStage,
@@ -7775,7 +8508,12 @@ function seedGameStudioPlanShortcutsScenario() {
     useAppStore.setState((state) => ({
       ...state,
       taskFlow: [
-        { id: userBlockId, turnId, type: "user", content: "先规划 Game Studio 大整改" },
+        {
+          id: userBlockId,
+          turnId,
+          type: "user",
+          content: "先规划 Game Studio 大整改",
+        },
         {
           id: agentBlockId,
           turnId,
@@ -7854,7 +8592,12 @@ function seedStreamingTimerScenario() {
     },
     currentSessionId: 999006,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请检查计时器是否正常增长。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请检查计时器是否正常增长。",
+      },
     ],
     conversationTurns: [
       {
@@ -7900,31 +8643,37 @@ function seedStreamingTimerScenario() {
 
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
-    const turn = state.conversationTurns.find((candidate) => candidate.id === turnId) || null;
+    const turn =
+      state.conversationTurns.find((candidate) => candidate.id === turnId) ||
+      null;
     return {
       isGenerating: state.isGenerating,
       agentStatus: state.agentStatus,
       elapsedTime: state.elapsedTime,
       turnStatus: turn?.status || null,
-      turnResultKind: turn?.runtimeOutcome?.status === "completed"
+      turnResultKind:
+        turn?.runtimeOutcome?.status === "completed"
         ? turn.runtimeOutcome.resultKind
         : null,
-      canceledRunConclusions: state.runtimeEvents.filter((event) =>
+      canceledRunConclusions: state.runtimeEvents.filter(
+        (event) =>
         event.type === "run.completed" &&
         event.threadId === "/tmp/e2e-streaming-timer:999006" &&
         event.turnId === turnId &&
-        event.resultKind === "canceled"
+          event.resultKind === "canceled",
       ).length,
-      turnConclusions: state.runtimeEvents.filter((event) =>
+      turnConclusions: state.runtimeEvents.filter(
+        (event) =>
         event.type === "turn.completed" &&
         event.threadId === "/tmp/e2e-streaming-timer:999006" &&
-        event.turnId === turnId
+          event.turnId === turnId,
       ).length,
-      visibleFinals: state.taskFlow.filter((block) =>
+      visibleFinals: state.taskFlow.filter(
+        (block) =>
         block.type === "agent" &&
         block.turnId === turnId &&
         block.visibility === "assistant_final" &&
-        block.streaming !== true
+          block.streaming !== true,
       ).length,
       seedCount: readSeedCount(STREAMING_TIMER_SCENARIO),
     };
@@ -7982,7 +8731,9 @@ function seedComposerRunningGuidanceScenario() {
     phase: "preparing",
   });
   if (startedCanonical.disposition === "rejected") {
-    throw new Error(`Failed to seed canonical Composer Run: ${startedCanonical.reason}`);
+    throw new Error(
+      `Failed to seed canonical Composer Run: ${startedCanonical.reason}`,
+    );
   }
   const runningCheckpoint = createTurnRuntimeCheckpoint({
     canonical: startedCanonical.state,
@@ -8019,7 +8770,12 @@ function seedComposerRunningGuidanceScenario() {
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "请检查运行中输入体验。" },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请检查运行中输入体验。",
+      },
     ],
     conversationTurns: [
       {
@@ -8055,16 +8811,20 @@ function seedComposerRunningGuidanceScenario() {
   }));
 
   bindBridgeSnapshot(COMPOSER_RUNNING_GUIDANCE_SCENARIO);
-  bridge.setModelRuntimeLock = (options: {
+  bridge.setModelRuntimeLock = (
+    options: {
     status?: "running" | "pending_review";
     isGenerating?: boolean;
-  } = {}) => {
-    const status = options.status === "pending_review" ? "pending_review" : "running";
+    } = {},
+  ) => {
+    const status =
+      options.status === "pending_review" ? "pending_review" : "running";
     useAppStore.setState((state) => ({
       ...state,
       agentStatus: status,
       isGenerating: options.isGenerating ?? status === "running",
-      turnRuntimeCheckpoints: status === "running"
+      turnRuntimeCheckpoints:
+        status === "running"
         ? { ...state.turnRuntimeCheckpoints, [turnId]: runningCheckpoint }
         : state.turnRuntimeCheckpoints,
     }));
@@ -8144,8 +8904,19 @@ function seedStreamingResponsivenessScenario() {
   const activeUserBlockId = 40_000;
   const activeAgentBlockId = 40_001;
   taskFlow.push(
-    { id: activeUserBlockId, turnId: activeTurnId, type: "user", content: "请持续输出，同时保持历史滚动流畅。" },
-    { id: activeAgentBlockId, turnId: activeTurnId, type: "agent", content: "开始生成...\n", streaming: true },
+    {
+      id: activeUserBlockId,
+      turnId: activeTurnId,
+      type: "user",
+      content: "请持续输出，同时保持历史滚动流畅。",
+    },
+    {
+      id: activeAgentBlockId,
+      turnId: activeTurnId,
+      type: "agent",
+      content: "开始生成...\n",
+      streaming: true,
+    },
   );
   conversationTurns.push({
     id: activeTurnId,
@@ -8168,13 +8939,15 @@ function seedStreamingResponsivenessScenario() {
     },
     currentWorkspace: workspace,
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: 999008,
         title: "E2E Streaming Responsiveness",
         date: new Date(now).toISOString(),
         active: true,
         messages: [],
-      }],
+        },
+      ],
     },
     currentSessionId: 999008,
     taskFlow,
@@ -8200,8 +8973,11 @@ function seedStreamingResponsivenessScenario() {
       ...current,
       taskFlow: current.taskFlow.map((block) =>
         block.id === activeAgentBlockId && block.type === "agent"
-          ? { ...block, content: `${block.content}片段 ${tickCount}：保持 UI 可滚动。\n` }
-          : block
+          ? {
+              ...block,
+              content: `${block.content}片段 ${tickCount}：保持 UI 可滚动。\n`,
+            }
+          : block,
       ),
     }));
   }, 45);
@@ -8262,8 +9038,19 @@ function seedStreamErrorRecoveryScenario() {
     },
     currentSessionId: 999007,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "这个流式报错后不应该还显示思考中。" },
-      { id: thoughtBlockId, turnId, type: "thought", content: "先检查流状态，再整理恢复逻辑。", isStreaming: true },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "这个流式报错后不应该还显示思考中。",
+      },
+      {
+        id: thoughtBlockId,
+        turnId,
+        type: "thought",
+        content: "先检查流状态，再整理恢复逻辑。",
+        isStreaming: true,
+      },
     ],
     conversationTurns: [
       {
@@ -8307,7 +9094,8 @@ function seedStreamErrorRecoveryScenario() {
           target: "",
           status: "error",
           toolStatus: "failed",
-          message: "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：流读取错误: error decoding response body",
+          message:
+            "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：流读取错误: error decoding response body",
         },
       ],
       conversationTurns: current.conversationTurns.map((turn) =>
@@ -8316,9 +9104,11 @@ function seedStreamErrorRecoveryScenario() {
               ...turn,
               status: "error",
               summary: "模型服务传输中断，已保留本轮已完成的操作记录。",
-              blockIds: turn.blockIds.includes(errorBlockId) ? turn.blockIds : [...turn.blockIds, errorBlockId],
+              blockIds: turn.blockIds.includes(errorBlockId)
+                ? turn.blockIds
+                : [...turn.blockIds, errorBlockId],
             }
-          : turn
+          : turn,
       ),
       isGenerating: false,
       agentStatus: "error",
@@ -8337,117 +9127,6 @@ function seedStreamErrorRecoveryScenario() {
 
   const cleanup = () => {
     window.clearTimeout(timerId);
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedLocalPlanSlowFirstTokenScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO);
-
-  const now = Date.now();
-  const workspace = "/tmp/e2e-local-plan-slow-first-token";
-  const sessionId = 999511;
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      workflowMode: "plan",
-      activeProfile: "local",
-      local: {
-        ...state.config.local,
-        provider: "Ollama",
-        endpoint: "http://127.0.0.1:11434",
-        model: "e2e-slow-local-plan",
-        apiKey: "ollama",
-        contextLimit: 16384,
-        toolProtocol: "xml",
-      },
-      workspace,
-      instructionsEnabled: false,
-      hooksEnabled: false,
-      sessionRecordingEnabled: false,
-    },
-    currentWorkspace: workspace,
-    selectedWorkspace: workspace,
-    workspaces: [{ path: workspace, name: "E2E Local Plan Slow First Token", addedAt: now, lastActiveAt: now }],
-    activeSessionByWorkspace: { [workspace]: sessionId },
-    sessionsByWorkspace: {
-      [workspace]: [
-        {
-          id: sessionId,
-          title: "E2E Local Plan Slow First Token",
-          date: new Date(now).toISOString(),
-          active: true,
-          storageStatus: "temporary",
-          recordingDisabled: true,
-          messages: [],
-        },
-      ],
-    },
-    currentSessionId: sessionId,
-    selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
-    taskFlow: [],
-    agentMessages: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    planArtifacts: [],
-    planTasks: [],
-    planStage: "idle",
-    isPlanApproved: false,
-    readOnlyAutoApproveForSession: false,
-    isGenerating: false,
-    agentStatus: "idle",
-    elapsedTime: 0,
-    showPlanPanel: false,
-    showTerminal: false,
-    showFilePanel: false,
-    showDiff: false,
-    selectedDiffTaskId: null,
-  }));
-
-  bridge.sendCloudMessage = (text?: string) =>
-    useAppStore.getState().sendMessage(
-      text || "请为慢首 token 的本地模型生成一个可审批执行计划。",
-      undefined,
-      {
-        resolvedIntent: "plan",
-        skipIntentResolution: true,
-      },
-    );
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    const currentTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-      : null;
-    return {
-      agentStatus: state.agentStatus,
-      isGenerating: state.isGenerating,
-      planStage: state.planStage,
-      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
-      currentTurnStatus: currentTurn?.status ?? null,
-      systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
-      seedCount: readSeedCount(LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO),
-    };
-  };
-
-  const cleanup = () => {
     bridge.initialized = false;
   };
 
@@ -8488,7 +9167,8 @@ function seedRealOmlxPlanFlowScenario() {
   const sessionEpoch = createPlanLifecycleSessionEpoch(now);
   const sessionKey = `${workspace}:${sessionId}`;
 
-  const applyRealOmlxWorkspaceFixture = () => useAppStore.setState((state) => ({
+  const applyRealOmlxWorkspaceFixture = () =>
+    useAppStore.setState((state) => ({
     ...state,
     config: {
       ...state.config,
@@ -8498,7 +9178,9 @@ function seedRealOmlxPlanFlowScenario() {
       local: {
         ...state.config.local,
         provider: "OMLX",
-        endpoint: String(realOmlxConfig.endpoint || "http://127.0.0.1:8000/v1"),
+          endpoint: String(
+            realOmlxConfig.endpoint || "http://127.0.0.1:8000/v1",
+          ),
         model,
         apiKey: String(realOmlxConfig.apiKey || "mmnn"),
         contextLimit: 32768,
@@ -8511,7 +9193,14 @@ function seedRealOmlxPlanFlowScenario() {
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
-    workspaces: [{ path: workspace, name: "E2E Real OMLX", addedAt: now, lastActiveAt: now }],
+      workspaces: [
+        {
+          path: workspace,
+          name: "E2E Real OMLX",
+          addedAt: now,
+          lastActiveAt: now,
+        },
+      ],
     activeSessionByWorkspace: {
       ...state.activeSessionByWorkspace,
       [workspace]: sessionId,
@@ -8582,7 +9271,9 @@ function seedRealOmlxPlanFlowScenario() {
     applyRealOmlxWorkspaceFixture();
     const state = useAppStore.getState();
     const acceptance = await acceptWorkspaceComposerInstruction({
-      text: text || "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
+      text:
+        text ||
+        "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
       images,
       language: state.config.language === "en" ? "en" : "zh",
       intentSnapshot: {
@@ -8617,7 +9308,9 @@ function seedRealOmlxPlanFlowScenario() {
     }));
     const state = useAppStore.getState();
     const acceptance = await acceptWorkspaceComposerInstruction({
-      text: text || "直接修改 src/hooks/useCsvParser.ts，把 creator 映射为 creatorName，并用 npm test 验证。",
+      text:
+        text ||
+        "直接修改 src/hooks/useCsvParser.ts，把 creator 映射为 creatorName，并用 npm test 验证。",
       images,
       language: state.config.language === "en" ? "en" : "zh",
       intentSnapshot: {
@@ -8643,7 +9336,9 @@ function seedRealOmlxPlanFlowScenario() {
   };
 
   bridge.sendGoalMessage = (text?: string) => {
-    const objective = text || "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";
+    const objective =
+      text ||
+      "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";
     const ownerTurnId = `e2e-omlx-goal-${sessionId}`;
     const state = useAppStore.getState();
     state.startGoal(objective, {
@@ -8676,7 +9371,8 @@ function seedRealOmlxPlanFlowScenario() {
       : null;
     const aggregate = checkpoint?.aggregate || null;
     const review = aggregate?.planReviewCommit || null;
-    const request = before.activeActionRequest?.kind === "plan_review"
+    const request =
+      before.activeActionRequest?.kind === "plan_review"
       ? before.activeActionRequest
       : null;
     before.approvePlan("批准执行");
@@ -8697,7 +9393,8 @@ function seedRealOmlxPlanFlowScenario() {
           digest: aggregate?.sealedWorkPlan?.digest || null,
           projectionHash: aggregate?.sealedWorkPlan?.projectionHash || null,
           reviewRequestId: review?.review?.requestId || null,
-          requestMatches: !!request &&
+          requestMatches:
+            !!request &&
             request.requestId === review?.review?.requestId &&
             request.artifactHash === review?.authority?.projectionHash,
         },
@@ -8720,9 +9417,12 @@ function seedRealOmlxPlanFlowScenario() {
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
     const selectedTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      ? state.conversationTurns.find(
+          (turn) => turn.id === state.currentTurnId,
+        ) || null
       : null;
-    const latestCheckpointedTurn = [...state.conversationTurns]
+    const latestCheckpointedTurn =
+      [...state.conversationTurns]
       .reverse()
       .find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]) || null;
     const currentTurn =
@@ -8730,9 +9430,9 @@ function seedRealOmlxPlanFlowScenario() {
         ? selectedTurn
         : latestCheckpointedTurn) ||
       selectedTurn ||
-      [...state.conversationTurns].reverse().find((turn) =>
-        turn.runtimeEngineVersion === "v2"
-      ) ||
+      [...state.conversationTurns]
+        .reverse()
+        .find((turn) => turn.runtimeEngineVersion === "v2") ||
       null;
     const runtimeV2Checkpoint = currentTurn
       ? normalizeRuntimeV2Checkpoint(
@@ -8744,27 +9444,47 @@ function seedRealOmlxPlanFlowScenario() {
     const runtimeV2Events = Array.isArray(runtimeV2Aggregate?.events)
       ? runtimeV2Aggregate.events
       : [];
-    const runtimeV2Receipts = Array.isArray(runtimeV2Aggregate?.completedCommands)
+    const runtimeV2Receipts = Array.isArray(
+      runtimeV2Aggregate?.completedCommands,
+    )
       ? runtimeV2Aggregate.completedCommands
       : [];
     const runtimeV2ReceiptByKey = new Map(
-      runtimeV2Receipts.map((receipt: any) => [receipt.idempotencyKey, receipt] as const),
+      runtimeV2Receipts.map(
+        (receipt: any) => [receipt.idempotencyKey, receipt] as const,
+      ),
     );
     const runtimeV2CommandTarget = (command: any): string => {
-      const payload = command?.payload && typeof command.payload === "object"
+      const payload =
+        command?.payload && typeof command.payload === "object"
         ? command.payload
         : {};
-      const args = payload.arguments && typeof payload.arguments === "object" && !Array.isArray(payload.arguments)
+      const args =
+        payload.arguments &&
+        typeof payload.arguments === "object" &&
+        !Array.isArray(payload.arguments)
         ? payload.arguments
         : {};
-      const value = args.path || args.file || args.target || args.command || args.cmd ||
-        args.query || args.pattern || args.url || payload.target || payload.objective || "";
+      const value =
+        args.path ||
+        args.file ||
+        args.target ||
+        args.command ||
+        args.cmd ||
+        args.query ||
+        args.pattern ||
+        args.url ||
+        payload.target ||
+        payload.objective ||
+        "";
       return typeof value === "string" ? value : JSON.stringify(value);
     };
     const runtimeV2Commands = runtimeV2Events
       .filter((event: any) => event.type === "command.scheduled")
       .map((event: any) => {
-        const receipt = runtimeV2ReceiptByKey.get(event.command?.idempotencyKey);
+        const receipt = runtimeV2ReceiptByKey.get(
+          event.command?.idempotencyKey,
+        );
         return {
           sequence: event.sequence,
           eventId: event.eventId,
@@ -8795,17 +9515,23 @@ function seedRealOmlxPlanFlowScenario() {
         dedupeKey: event.projection?.dedupeKey || "",
         markdown: event.projection?.markdown || "",
       }));
-    const runtimeV2SubagentTelemetry = (runtimeV2Aggregate?.subagents || []).map((job: any) => {
-      const telemetryEvents = runtimeV2Events.filter((event: any) =>
-        event.type === "subagent.telemetry" && event.telemetry?.jobId === job.id
+    const runtimeV2SubagentTelemetry = (
+      runtimeV2Aggregate?.subagents || []
+    ).map((job: any) => {
+      const telemetryEvents = runtimeV2Events.filter(
+        (event: any) =>
+          event.type === "subagent.telemetry" &&
+          event.telemetry?.jobId === job.id,
       );
-      const spawnCommand = runtimeV2Events.find((event: any) =>
+      const spawnCommand = runtimeV2Events.find(
+        (event: any) =>
         event.type === "command.scheduled" &&
         event.command?.kind === "schedule_subagents" &&
-        event.command?.payload?.toolCallId === job.sourceToolCallId
+          event.command?.payload?.toolCallId === job.sourceToolCallId,
       );
       const telemetryAt = (phase: string) =>
-        telemetryEvents.find((event: any) => event.telemetry?.phase === phase)?.telemetry?.at || null;
+        telemetryEvents.find((event: any) => event.telemetry?.phase === phase)
+          ?.telemetry?.at || null;
       return {
         id: job.id,
         scopeKey: job.scopeKey,
@@ -8830,12 +9556,21 @@ function seedRealOmlxPlanFlowScenario() {
       .map((entry: any) => ({
         id: entry.id,
         start: Number(entry.requestOpenedAt),
-        end: Number.isFinite(entry.closedAt) ? Number(entry.closedAt) : Number.POSITIVE_INFINITY,
+        end: Number.isFinite(entry.closedAt)
+          ? Number(entry.closedAt)
+          : Number.POSITIVE_INFINITY,
       }));
-    const runtimeV2SubagentPoints = runtimeV2SubagentIntervals.flatMap((interval: any) => [
+    const runtimeV2SubagentPoints = runtimeV2SubagentIntervals
+      .flatMap((interval: any) => [
       { at: interval.start, delta: 1 },
-      ...(Number.isFinite(interval.end) ? [{ at: interval.end, delta: -1 }] : []),
-    ]).sort((left: any, right: any) => left.at - right.at || left.delta - right.delta);
+        ...(Number.isFinite(interval.end)
+          ? [{ at: interval.end, delta: -1 }]
+          : []),
+      ])
+      .sort(
+        (left: any, right: any) =>
+          left.at - right.at || left.delta - right.delta,
+      );
     let runtimeV2SubagentInFlight = 0;
     let runtimeV2SubagentPeakInFlight = 0;
     for (const point of runtimeV2SubagentPoints) {
@@ -8845,14 +9580,15 @@ function seedRealOmlxPlanFlowScenario() {
         runtimeV2SubagentInFlight,
       );
     }
-    const runtimeV2RunCompleted = runtimeV2Events.filter((event: any) =>
-      event.type === "run.completed"
+    const runtimeV2RunCompleted = runtimeV2Events.filter(
+      (event: any) => event.type === "run.completed",
     );
-    const runtimeV2TurnCompleted = runtimeV2Events.filter((event: any) =>
-      event.type === "turn.completed"
+    const runtimeV2TurnCompleted = runtimeV2Events.filter(
+      (event: any) => event.type === "turn.completed",
     );
-    const runtimeV2FinalProjections = runtimeV2Projections.filter((projection: any) =>
-      projection.audience === "final" && projection.kind === "final"
+    const runtimeV2FinalProjections = runtimeV2Projections.filter(
+      (projection: any) =>
+        projection.audience === "final" && projection.kind === "final",
     );
     const runtimeV2RunTerminal = runtimeV2RunCompleted[0] || null;
     const runtimeV2TurnTerminal = runtimeV2TurnCompleted[0] || null;
@@ -8861,39 +9597,35 @@ function seedRealOmlxPlanFlowScenario() {
       ? state.taskFlow.filter((block: any) => block.turnId === currentTurn.id)
       : [];
     const runtimeV2RunId = runtimeV2Aggregate?.run?.identity?.runId || null;
-    const runtimeV2Presentation = runtimeV2RunId ? {
+    const runtimeV2Presentation = runtimeV2RunId
+      ? {
       chatMilestones: runtimeV2TaskBlocks
-        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_update")
+            .filter(
+              (block: any) =>
+                block.type === "agent" &&
+                block.visibility === "assistant_update",
+            )
         .map((block: any) => ({
           id: block.id,
           markdown: String(block.content || ""),
         })),
       timeline: runtimeV2TaskBlocks
-        .filter((block: any) =>
+            .filter(
+              (block: any) =>
           block.runId === runtimeV2RunId &&
-          (
-            (
-              block.type === "progress" &&
-              block.source === "runtime"
-            ) ||
-            (
-              block.type === "tool" &&
+                ((block.type === "progress" && block.source === "runtime") ||
+                  (block.type === "tool" &&
               String(block.dedupeKey || "").startsWith(
                 "runtime-v2-timeline:",
-              )
-            )
-          )
+                    ))),
         )
         .map((block: any) => ({
           id: block.id,
           phase: block.phase || block.turnPhase?.kind || "",
-          title:
-            block.title ||
-            block.intentSummary ||
-            block.toolName ||
-            "",
+              title: block.title || block.intentSummary || block.toolName || "",
           action: block.action || block.message || "",
-          status: block.type === "tool"
+              status:
+                block.type === "tool"
             ? block.toolStatus === "executed"
               ? "done"
               : block.toolStatus === "failed" ||
@@ -8902,36 +9634,30 @@ function seedRealOmlxPlanFlowScenario() {
                 : block.toolStatus || block.status || ""
             : block.status || "",
           toolName:
-            block.executionName ||
-            block.toolName ||
-            block.tool ||
-            "",
-          target:
-            block.target ||
-            block.canonicalTarget ||
-            "",
+                block.executionName || block.toolName || block.tool || "",
+              target: block.target || block.canonicalTarget || "",
           runId: block.runId || "",
           toolCallId: block.toolCallId || "",
           dedupeKey: block.dedupeKey || "",
           diff: block.diff || null,
         })),
       finals: runtimeV2TaskBlocks
-        .filter((block: any) => block.type === "agent" && block.visibility === "assistant_final")
+            .filter(
+              (block: any) =>
+                block.type === "agent" &&
+                block.visibility === "assistant_final",
+            )
         .map((block: any) => ({
           id: block.id,
           markdown: String(block.content || ""),
         })),
       threadEvents: (state.runtimeEvents || [])
-        .filter((event: any) =>
+            .filter(
+              (event: any) =>
           event.turnId === currentTurn?.id &&
-          (
-            !event.runId ||
-            event.runId === runtimeV2RunId
-          ) &&
-          (
-            event.type === "run.completed" ||
-            event.type === "turn.completed"
-          )
+                (!event.runId || event.runId === runtimeV2RunId) &&
+                (event.type === "run.completed" ||
+                  event.type === "turn.completed"),
         )
         .map((event: any) => ({
           type: event.type,
@@ -8940,7 +9666,8 @@ function seedRealOmlxPlanFlowScenario() {
           runId: event.runId || "",
           resultKind: event.resultKind || "",
         })),
-    } : null;
+        }
+      : null;
     let localDebugEntries: any[] = [];
     try {
       const parsed = JSON.parse(
@@ -8950,7 +9677,9 @@ function seedRealOmlxPlanFlowScenario() {
     } catch {
       localDebugEntries = [];
     }
-    const realOmlxDebugTail = [...new Map([
+    const realOmlxDebugTail = [
+      ...new Map(
+        [
       ...localDebugEntries,
       ...((window as any).__REAL_OMLX_DEBUG_LOGS__ || []),
     ].map((entry: any) => [
@@ -8960,8 +9689,11 @@ function seedRealOmlxPlanFlowScenario() {
         String(entry?.message || ""),
       ].join("\u0000"),
       entry,
-    ])).values()].slice(-1_200);
-    const runtimeV2Debug = realOmlxDebugTail.flatMap((entry: any) => {
+        ]),
+      ).values(),
+    ].slice(-1_200);
+    const runtimeV2Debug = realOmlxDebugTail
+      .flatMap((entry: any) => {
       const source = String(entry?.source || "");
       if (!source.includes("runtime_v2")) return [];
       let data: unknown = entry?.message;
@@ -8973,18 +9705,22 @@ function seedRealOmlxPlanFlowScenario() {
           data = rawData.slice(0, 2_400);
         }
       }
-      return [{
+        return [
+          {
         timestamp: entry?.timestamp || "",
         level: entry?.level || "",
         source,
         data,
-      }];
-    }).slice(-300);
+          },
+        ];
+      })
+      .slice(-300);
     // E2E observes the durable Runtime v2 ledger, not provider prose or raw
     // tool output. This keeps real-model acceptance aligned with production
     // ownership: the checkpoint is the source of truth for commands, child
     // jobs, validation, and terminal order.
-    const runtimeV2 = runtimeV2Aggregate ? {
+    const runtimeV2 = runtimeV2Aggregate
+      ? {
       schemaVersion: runtimeV2Aggregate.schemaVersion || null,
       revision: runtimeV2Checkpoint?.revision ?? null,
       strategy: runtimeV2Aggregate.strategy || null,
@@ -8994,12 +9730,14 @@ function seedRealOmlxPlanFlowScenario() {
       runIdentity: runtimeV2Aggregate.run?.identity || null,
       phase: runtimeV2Aggregate.phase || null,
       terminalOutcome: runtimeV2Aggregate.terminalOutcome || null,
-      evidence: (runtimeV2Aggregate.evidence || []).map((evidence: any) => ({
+          evidence: (runtimeV2Aggregate.evidence || []).map(
+            (evidence: any) => ({
         id: evidence.id,
         kind: evidence.kind,
         target: evidence.target,
         version: evidence.version || null,
-      })),
+            }),
+          ),
       evidenceCount: Array.isArray(runtimeV2Aggregate.evidence)
         ? runtimeV2Aggregate.evidence.length
         : 0,
@@ -9048,7 +9786,6 @@ function seedRealOmlxPlanFlowScenario() {
               status: event.status,
               evidence: event.evidence || [],
               report: event.report || null,
-              validationReceipts: event.validationReceipts || [],
             }
           : {}),
         ...(event.type === "work_plan.sealed" ||
@@ -9056,7 +9793,8 @@ function seedRealOmlxPlanFlowScenario() {
           event.type === "work_plan.invalidated"
           ? {
               workPlan: event.workPlan || null,
-              planReviewCommit: event.type === "work_plan.sealed"
+                  planReviewCommit:
+                    event.type === "work_plan.sealed"
                 ? event.reviewCommit || null
                 : null,
             }
@@ -9069,7 +9807,8 @@ function seedRealOmlxPlanFlowScenario() {
               dedupeKey: event.projection?.dedupeKey || "",
             }
           : {}),
-        ...(event.type === "run.completed" || event.type === "turn.completed"
+            ...(event.type === "run.completed" ||
+            event.type === "turn.completed"
           ? {
               resultKind: event.outcome?.resultKind || "",
               reason: event.outcome?.reason || "",
@@ -9087,11 +9826,10 @@ function seedRealOmlxPlanFlowScenario() {
         completedAt: receipt.completedAt,
       })),
       projections: runtimeV2Projections,
-      workPlan: runtimeV2Aggregate.workPlan || null,
-      sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
-      planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
-      executionContract: runtimeV2Aggregate.executionContract || null,
-      subagents: runtimeV2SubagentTelemetry,
+          workPlan: runtimeV2Aggregate.workPlan || null,
+          sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
+          planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+          subagents: runtimeV2SubagentTelemetry,
       subagentConcurrency: {
         requestCount: runtimeV2SubagentIntervals.length,
         peakInFlight: runtimeV2SubagentPeakInFlight,
@@ -9111,25 +9849,37 @@ function seedRealOmlxPlanFlowScenario() {
           runtimeV2RunCompleted.length === 1 &&
           runtimeV2TurnCompleted.length === 1 &&
           runtimeV2FinalProjections.length === 1 &&
-          runtimeV2RunTerminal?.outcome?.resultKind === runtimeV2TurnTerminal?.outcome?.resultKind &&
-          runtimeV2RunTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
-          runtimeV2TurnTerminal?.outcome?.finalProjectionId === runtimeV2FinalProjection?.projectionId &&
-          runtimeV2RunTerminal.sequence < runtimeV2FinalProjection.sequence &&
-          runtimeV2FinalProjection.sequence < runtimeV2TurnTerminal.sequence,
+              runtimeV2RunTerminal?.outcome?.resultKind ===
+                runtimeV2TurnTerminal?.outcome?.resultKind &&
+              runtimeV2RunTerminal?.outcome?.finalProjectionId ===
+                runtimeV2FinalProjection?.projectionId &&
+              runtimeV2TurnTerminal?.outcome?.finalProjectionId ===
+                runtimeV2FinalProjection?.projectionId &&
+              runtimeV2RunTerminal.sequence <
+                runtimeV2FinalProjection.sequence &&
+              runtimeV2FinalProjection.sequence <
+                runtimeV2TurnTerminal.sequence,
       },
       presentation: runtimeV2Presentation,
       debug: runtimeV2Debug,
-    } : null;
-    const agentTexts = (state.taskFlow.filter((block) => block.type === "agent") as any[]).map((block) => block.content);
-    const toolBlocks = (state.taskFlow.filter((block) => block.type === "tool") as any[]).map((block) => ({
+        }
+      : null;
+    const agentTexts = (
+      state.taskFlow.filter((block) => block.type === "agent") as any[]
+    ).map((block) => block.content);
+    const toolBlocks = (
+      state.taskFlow.filter((block) => block.type === "tool") as any[]
+    ).map((block) => ({
       name: block.toolName,
       target: block.target,
-      status: block.toolStatus === "executed"
+      status:
+        block.toolStatus === "executed"
         ? "completed"
         : block.toolStatus || block.status,
       error: block.error,
     }));
-    const subagentRuns = projectSubagentRuns(state.runtimeEvents).map((run) => ({
+    const subagentRuns = projectSubagentRuns(state.runtimeEvents).map(
+      (run) => ({
       id: run.id,
       parentTurnId: run.parentTurnId,
       name: run.name,
@@ -9158,7 +9908,8 @@ function seedRealOmlxPlanFlowScenario() {
         target: activity.target || "",
         detail: String(activity.detail || "").slice(0, 1_200),
       })),
-    }));
+      }),
+    );
     return {
       model,
       currentWorkspace: state.currentWorkspace,
@@ -9188,13 +9939,18 @@ function seedRealOmlxPlanFlowScenario() {
         createdAt: entry.createdAt,
       })),
       goalStatus: state.goalStatus,
-      activeGoal: state.activeGoal ? {
+      activeGoal: state.activeGoal
+        ? {
         id: state.activeGoal.id,
         objective: state.activeGoal.rawText || state.activeGoal.objective,
         revision: state.activeGoal.revision || 1,
-      } : null,
+          }
+        : null,
       goalIterations: state.goalProgress?.totalIterationsUsed || 0,
-      goalPauseReason: state.goalRuntime?.pauseReason || state.goalProgress?.pauseReason || null,
+      goalPauseReason:
+        state.goalRuntime?.pauseReason ||
+        state.goalProgress?.pauseReason ||
+        null,
       goalLastError: state.goalRuntime?.lastError || null,
       goalEvidence: (state.goalProgress?.evidence || []).map((entry) => ({
         kind: entry.kind,
@@ -9206,10 +9962,12 @@ function seedRealOmlxPlanFlowScenario() {
       currentTurnId: currentTurn?.id ?? null,
       currentTurnClientSubmissionId: currentTurn?.clientSubmissionId ?? null,
       currentTurnReceiptId: currentTurn?.workspaceInstructionReceiptId ?? null,
-      currentTurnInstructionSource: currentTurn?.workspaceInstructionSource ?? null,
+      currentTurnInstructionSource:
+        currentTurn?.workspaceInstructionSource ?? null,
       currentTurnTitle: currentTurn?.title ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
-      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
+      currentTurnDisplayIntent:
+        currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       currentTurnPrompt: currentTurn?.userPrompt ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnBlockIds: currentTurn?.blockIds ?? [],
@@ -9217,7 +9975,8 @@ function seedRealOmlxPlanFlowScenario() {
       conversationTurnPreview: state.conversationTurns.map((turn) => ({
         id: turn.id,
         clientSubmissionId: turn.clientSubmissionId || null,
-        workspaceInstructionReceiptId: turn.workspaceInstructionReceiptId || null,
+        workspaceInstructionReceiptId:
+          turn.workspaceInstructionReceiptId || null,
         workspaceInstructionSource: turn.workspaceInstructionSource || null,
         title: turn.title,
         intent: turn.intent,
@@ -9227,23 +9986,28 @@ function seedRealOmlxPlanFlowScenario() {
         runtimeEngineVersion: turn.runtimeEngineVersion || "legacy",
         blockIds: [...turn.blockIds],
       })),
-      workspaceInstructionLedger: state.workspaceInstructionLedger.map((entry) => ({
+      workspaceInstructionLedger: state.workspaceInstructionLedger.map(
+        (entry) => ({
         clientSubmissionId: entry.clientSubmissionId,
         receiptId: entry.receipt.receiptId,
         turnId: entry.receipt.turnId,
         userBlockId: entry.receipt.userBlockId,
         sessionKey: entry.receipt.sessionKey,
         sessionEpoch: entry.receipt.sessionEpoch,
-      })),
+        }),
+      ),
       currentRunId: state.harnessRunMarker?.runId || null,
       parentRunId: state.harnessRunMarker?.parentRunId || null,
       pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
-      planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
-      activeActionRequest: state.activeActionRequest ? {
+      planApprovalExecutionStartedForTurnId:
+        state.planApprovalExecutionStartedForTurnId,
+      activeActionRequest: state.activeActionRequest
+        ? {
         kind: state.activeActionRequest.kind,
         requestId: state.activeActionRequest.requestId,
         sessionKey: state.activeActionRequest.sessionKey,
-        sessionEpoch: state.activeActionRequest.kind === "plan_review"
+            sessionEpoch:
+              state.activeActionRequest.kind === "plan_review"
           ? state.activeActionRequest.sessionEpoch || null
           : null,
         turnId: state.activeActionRequest.turnId,
@@ -9263,7 +10027,8 @@ function seedRealOmlxPlanFlowScenario() {
               risk: state.activeActionRequest.risk || "unknown",
             }
           : {}),
-      } : null,
+          }
+        : null,
       agentTexts,
       toolBlocks,
       subagentRuns,
@@ -9283,147 +10048,17 @@ function seedRealOmlxPlanFlowScenario() {
         dedupeKey: block.dedupeKey || "",
         toolName: block.toolName || "",
         target: block.target || "",
-        status: block.type === "tool" && block.toolStatus === "executed"
+        status:
+          block.type === "tool" && block.toolStatus === "executed"
           ? "completed"
           : block.toolStatus || block.status || "",
       })),
       debugTail: realOmlxDebugTail,
       acceptanceState: (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ || null,
       dispatchError: bridge.dispatchError || null,
-      lastWorkspaceInstructionAcceptance: bridge.lastWorkspaceInstructionAcceptance || null,
+      lastWorkspaceInstructionAcceptance:
+        bridge.lastWorkspaceInstructionAcceptance || null,
       seedCount: readSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO),
-    };
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedLocalPlanClosureGuardEmptyScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(PLAN_CLOSURE_GUARD_EMPTY_SCENARIO);
-
-  const now = Date.now();
-  const workspace = "/tmp/e2e-plan-closure-guard-empty";
-  const sessionId = 999512;
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      workflowMode: "plan",
-      activeProfile: "local",
-      local: {
-        ...state.config.local,
-        provider: "Ollama",
-        endpoint: "http://127.0.0.1:11434",
-        model: "e2e-local-empty-plan",
-        apiKey: "ollama",
-        contextLimit: 16384,
-        toolProtocol: "xml",
-      },
-      workspace,
-      instructionsEnabled: false,
-      hooksEnabled: false,
-      sessionRecordingEnabled: false,
-    },
-    currentWorkspace: workspace,
-    selectedWorkspace: workspace,
-    workspaces: [{ path: workspace, name: "E2E Plan Closure Guard Empty", addedAt: now, lastActiveAt: now }],
-    activeSessionByWorkspace: { [workspace]: sessionId },
-    sessionsByWorkspace: {
-      [workspace]: [
-        {
-          id: sessionId,
-          title: "E2E Plan Closure Guard Empty",
-          date: new Date(now).toISOString(),
-          active: true,
-          storageStatus: "temporary",
-          recordingDisabled: true,
-          messages: [],
-        },
-      ],
-    },
-    currentSessionId: sessionId,
-    selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
-    taskFlow: [],
-    agentMessages: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    planArtifacts: [],
-    planTasks: [],
-    planStage: "idle",
-    isPlanApproved: false,
-    readOnlyAutoApproveForSession: false,
-    isGenerating: false,
-    agentStatus: "idle",
-    elapsedTime: 0,
-    showPlanPanel: false,
-    showTerminal: false,
-    showFilePanel: false,
-    showDiff: false,
-    selectedDiffTaskId: null,
-  }));
-
-  bridge.sendCloudMessage = (text?: string) =>
-    useAppStore.getState().sendMessage(
-      text || "请基于 orders.csv 生成一个数据分析自动化执行计划。",
-      undefined,
-      {
-        resolvedIntent: "plan",
-        skipIntentResolution: true,
-      },
-    );
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    const currentTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-      : null;
-    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
-    const thoughtBlocks = state.taskFlow.filter((block) => block.type === "thought") as any[];
-    const progressBlocks = state.taskFlow.filter((block) => block.type === "progress") as any[];
-    const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
-    const progressTexts = progressBlocks.map((block) =>
-      [
-        block.title,
-        block.why,
-        block.action,
-        block.evidence,
-        block.next,
-        ...(Array.isArray(block.targets) ? block.targets : []),
-      ]
-        .filter(Boolean)
-        .join(" "),
-    );
-    return {
-      agentStatus: state.agentStatus,
-      isGenerating: state.isGenerating,
-      planStage: state.planStage,
-      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
-      currentTurnStatus: currentTurn?.status ?? null,
-      agentTexts: agentBlocks.map((block) => block.content),
-      thoughtTexts: [
-        ...thoughtBlocks.map((block) => block.content),
-        ...progressTexts,
-        ...toolBlocks.map((block) => [block.toolName, block.target, block.message].filter(Boolean).join(" ")),
-      ],
-      seedCount: readSeedCount(PLAN_CLOSURE_GUARD_EMPTY_SCENARIO),
     };
   };
 
@@ -9451,30 +10086,32 @@ function seedCloudToolProtocolScenario(scenario: string) {
     scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO;
   const workspace = isGlobalChatScenario ? "" : `/tmp/e2e-${scenario}`;
   const scopeKey = isGlobalChatScenario ? GLOBAL_CHAT_KEY : workspace;
-  const ordinaryContinueSeed = scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
-    ? (() => {
-        const turnId = "e2e-ordinary-continue-previous-turn";
-        const userBlockId = useAppStore.getState()._nextTaskId();
-        const toolBlockId = useAppStore.getState()._nextTaskId();
-        const agentBlockId = useAppStore.getState()._nextTaskId();
-        return {
-          turnId,
-          taskFlow: [
-            {
-              id: userBlockId,
-              turnId,
-              type: "user" as const,
-              content: "请修复 README 检查链路并验证。",
-            },
-            {
-              id: toolBlockId,
-              turnId,
-              type: "tool" as const,
-              toolName: "read_file",
-              target: "README.md",
-              status: "done",
-              toolStatus: "executed" as const,
-              message: "已读取 README.md，下一步尚未完成。",
+  const ordinaryContinueSeed =
+    scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
+      ? (() => {
+          const turnId = "e2e-ordinary-continue-previous-turn";
+          const runId = "run-e2e-ordinary-continue-previous";
+          const userBlockId = useAppStore.getState()._nextTaskId();
+          const toolBlockId = useAppStore.getState()._nextTaskId();
+          const agentBlockId = useAppStore.getState()._nextTaskId();
+          return {
+            turnId,
+            taskFlow: [
+              {
+                id: userBlockId,
+                turnId,
+                type: "user" as const,
+                content: "请修复 README 检查链路并验证。",
+      },
+              {
+                id: toolBlockId,
+                turnId,
+                type: "tool" as const,
+                toolName: "read_file",
+                target: "README.md",
+                status: "done",
+                toolStatus: "executed" as const,
+                message: "已读取 README.md，下一步尚未完成。",
             },
             {
               id: agentBlockId,
@@ -9482,11 +10119,18 @@ function seedCloudToolProtocolScenario(scenario: string) {
               type: "agent" as const,
               content: "我已经定位到 README 检查链路，但还没完成后续处理。",
               streaming: false,
+                visibility: "assistant_final" as const,
             },
           ],
           agentMessages: [
-            { role: "user" as const, content: "请修复 README 检查链路并验证。" },
-            { role: "assistant" as const, content: "我已经定位到 README 检查链路，但还没完成后续处理。" },
+              {
+                role: "user" as const,
+                content: "请修复 README 检查链路并验证。",
+              },
+              {
+                role: "assistant" as const,
+                content: "我已经定位到 README 检查链路，但还没完成后续处理。",
+              },
           ],
           conversationTurns: [
             {
@@ -9496,36 +10140,66 @@ function seedCloudToolProtocolScenario(scenario: string) {
               mode: "chat" as const,
               intent: "execute" as const,
               displayIntent: "execute" as const,
-              status: "stopped_no_action" as const,
-              summary: "上一轮已停止，等待用户继续。",
+                status: "done" as const,
+                summary: "上一轮以阻塞结果结束；后续指令必须创建新的 Turn。",
               blockIds: [userBlockId, toolBlockId, agentBlockId],
               collapsed: false,
               createdAt: now - 1_000,
+                runtimeOutcome: {
+                  status: "completed" as const,
+                  reason: "e2e_previous_turn_acceptance_incomplete",
+                  resultKind: "blocked" as const,
+                  runId,
+                  parentRunId: null,
+                  updatedAt: now - 900,
+                },
+              },
+            ],
+            runtimeEvents: [
+              {
+                schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+                type: "turn.started" as const,
+                threadId: workspace,
+                turnId,
+                timestampMs: now - 1_300,
+              },
+              {
+                schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+                type: "run.started" as const,
+                threadId: workspace,
+                turnId,
+                timestampMs: now - 1_200,
+                runId,
+                parentRunId: null,
+              },
+              {
+                schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+                type: "run.completed" as const,
+                threadId: workspace,
+                turnId,
+                timestampMs: now - 900,
+                runId,
+                parentRunId: null,
+                resultKind: "blocked" as const,
+                summary: "读取完成，但用户目标尚未修改或验证。",
+              },
+              {
+                schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+                type: "turn.completed" as const,
+                threadId: workspace,
+                turnId,
+                timestampMs: now - 900,
+                resultKind: "blocked" as const,
             },
           ],
         };
       })()
     : null;
-  const sessionId = scenario === CLOUD_TOOL_FALLBACK_SCENARIO
+  const sessionId =
+    scenario === CLOUD_TOOL_FALLBACK_SCENARIO
     ? 999501
-    : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
-    ? 999504
-    : scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO
-    ? 999507
-    : scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO
-    ? 999508
-    : scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
-    ? 999509
-    : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
-    ? 999505
     : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
     ? 999506
-    : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
-    ? 999510
-    : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
-    ? 999513
-    : scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
-    ? 999518
     : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
     ? 999514
     : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
@@ -9558,13 +10232,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     config: {
       ...state.config,
       language: "zh",
-      workflowMode:
-        scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ||
-        scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO ||
-        scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO ||
-        scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
-          ? "plan"
-          : "chat",
+      workflowMode: "chat",
       activeProfile: "cloud",
       workspace,
       cloud: server,
@@ -9578,7 +10246,14 @@ function seedCloudToolProtocolScenario(scenario: string) {
     selectedWorkspace: workspace,
     workspaces: isGlobalChatScenario
       ? []
-      : [{ path: workspace, name: `E2E ${scenario}`, addedAt: now, lastActiveAt: now }],
+      : [
+          {
+            path: workspace,
+            name: `E2E ${scenario}`,
+            addedAt: now,
+            lastActiveAt: now,
+          },
+        ],
     activeSessionByWorkspace: {
       [scopeKey]: sessionId,
     },
@@ -9586,26 +10261,11 @@ function seedCloudToolProtocolScenario(scenario: string) {
       [scopeKey]: [
         {
           id: sessionId,
-          title: scenario === CLOUD_TOOL_FALLBACK_SCENARIO
+          title:
+            scenario === CLOUD_TOOL_FALLBACK_SCENARIO
             ? "E2E Cloud Tool Fallback"
-            : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
-            ? "E2E Game Studio Execute Reply"
-            : scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO
-            ? "E2E Unity MCP Options Priority"
-            : scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO
-            ? "E2E Unity Tool Code Compatibility"
-            : scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
-            ? "E2E Unity No Error Routing"
-            : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
-            ? "E2E Pseudo Tool Call Recovery"
             : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
             ? "E2E Local File Read Approval"
-            : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
-            ? "E2E Malformed Tool Use Plan"
-            : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
-            ? "E2E Approved Plan No Tool"
-            : scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
-            ? "E2E Approved Plan Execution Replay"
             : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
             ? "E2E Progress Narration Tool Flow"
             : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
@@ -9614,9 +10274,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Global Chat Tool Scope"
             : scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO
             ? "E2E Global Chat Attachment Read"
-            : scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
-            ? "E2E Plan Operation Approval Reuse"
-            : "E2E Reply Options Tool Pause",
+                        : "E2E Cloud Runtime Boundary",
           date: new Date(now).toISOString(),
           active: true,
           storageStatus: "temporary",
@@ -9626,22 +10284,13 @@ function seedCloudToolProtocolScenario(scenario: string) {
       ],
     },
     currentSessionId: sessionId,
-    selectedMainModeKey:
-      scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ||
-        scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO ||
-        scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
-        ? "game_studio"
-        : "main_mode",
-    selectedNexusModeKey:
-      scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ||
-        scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO ||
-        scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
-        ? "nexus_game_studio"
-        : "nexus_general",
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
     taskFlow: ordinaryContinueSeed?.taskFlow ?? [],
     agentMessages: ordinaryContinueSeed?.agentMessages ?? [],
     conversationTurns: ordinaryContinueSeed?.conversationTurns ?? [],
     currentTurnId: ordinaryContinueSeed?.turnId ?? null,
+    runtimeEvents: ordinaryContinueSeed?.runtimeEvents ?? [],
     input: "",
     attachedFiles: [],
     contextMentions: [],
@@ -9654,18 +10303,6 @@ function seedCloudToolProtocolScenario(scenario: string) {
     showTerminal: false,
     showFilePanel: false,
     selectedDiffTaskId: null,
-    ...(scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO || scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
-      ? {
-          planArtifacts: [],
-          planTasks: [],
-          planExecutionEvidenceLedger: [],
-          planExecutionEvidenceCount: 0,
-          planStage: "idle",
-          isPlanApproved: false,
-          autoApproveTools: true,
-          autoApproveToolScopes: ["shell", "workspace_write"],
-        }
-      : {}),
   }));
 
   bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
@@ -9674,64 +10311,21 @@ function seedCloudToolProtocolScenario(scenario: string) {
     }));
   };
 
-  bridge.sendCloudRespondMessage = (text?: string) => useAppStore.getState().sendMessage(
-    text || "请只解释当前上下文，不要执行操作。",
-    undefined,
-    {
-      resolvedIntent: "respond",
-      runtimeIntentOverride: "respond",
-      skipIntentResolution: true,
-    },
-  );
-
-  bridge.queueCloudRespondMessage = (text?: string) => {
-    useAppStore.getState().queueUserMessage(
-      text || "请优先处理这条排队消息。",
-      undefined,
-      { runtimeIntentOverride: "respond" },
-    );
-    return true;
-  };
-
-  bridge.rejectNextAutoResume = () => {
-    const originalSendMessage = useAppStore.getState().sendMessage;
-    const guardedSendMessage: typeof originalSendMessage = (text, images, options) => {
-      if (options?.hidden && options?.parentRunIdOverride) {
-        useAppStore.setState({ sendMessage: originalSendMessage });
-        return false;
-      }
-      return originalSendMessage(text, images, options);
-    };
-    useAppStore.setState({ sendMessage: guardedSendMessage });
-    return true;
-  };
-
   bridge.sendCloudMessage = (text?: string) => {
     if (scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "请读取附件并确认是否包含 GLOBAL_ATTACHMENT_READ_OK。",
         undefined,
         {
-          resolvedIntent: "respond",
-          skipIntentResolution: true,
-          attachedFilesSnapshot: ["/tmp/e2e-outside-main-debug.log"],
+            resolvedIntent: "respond",
+            skipIntentResolution: true,
+            attachedFilesSnapshot: ["/tmp/e2e-outside-main-debug.log"],
         },
       );
     }
 
     if (scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO) {
       return useAppStore.getState().sendMessage(text || "继续");
-    }
-
-    if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "请基于 orders.csv 生成一个数据分析自动化执行计划。",
-        undefined,
-        {
-          resolvedIntent: "plan",
-          skipIntentResolution: true,
-        },
-      );
     }
 
     if (scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO) {
@@ -9741,91 +10335,6 @@ function seedCloudToolProtocolScenario(scenario: string) {
         {
           resolvedIntent: "analyze",
           skipIntentResolution: true,
-        },
-      );
-    }
-
-    if (
-      scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO ||
-      scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO ||
-      scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
-    ) {
-      return useAppStore.getState().sendMessage(
-        text || "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。",
-      );
-    }
-
-    if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "请直接执行一个需要多轮检查的长任务。",
-        undefined,
-        {
-          resolvedIntent: "execute",
-          executionConsentGranted: true,
-          skipIntentResolution: true,
-        },
-      );
-    }
-
-    if (scenario === OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO) {
-      return useAppStore.getState().sendMessage(text || "请修复这个问题。");
-    }
-
-    if (scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "请修复 CSV 导入后图表不显示。",
-        undefined,
-        {
-          resolvedIntent: "plan",
-          skipIntentResolution: true,
-        },
-      );
-    }
-
-    if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "请在 Unity 场景下先给我可点击选项。",
-        undefined,
-        {
-          resolvedIntent: "respond",
-          skipIntentResolution: true,
-          commandDirective: {
-            kind: "unity",
-            action: "code",
-            source: "debug",
-          },
-        },
-      );
-    }
-
-    if (scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "请在 Unity 项目里先读取 src 目录定位脚本入口。",
-        undefined,
-        {
-          resolvedIntent: "respond",
-          skipIntentResolution: true,
-          commandDirective: {
-            kind: "unity",
-            action: "code",
-            source: "debug",
-          },
-        },
-      );
-    }
-
-    if (scenario === UNITY_NO_ERROR_ROUTING_SCENARIO) {
-      return useAppStore.getState().sendMessage(
-        text || "Unity 没有报错，但蛇没有自动移动，请先排查行为问题。",
-        undefined,
-        {
-          resolvedIntent: "respond",
-          skipIntentResolution: true,
-          commandDirective: {
-            kind: "unity",
-            action: "code",
-            source: "debug",
-          },
         },
       );
     }
@@ -9843,7 +10352,9 @@ function seedCloudToolProtocolScenario(scenario: string) {
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
     const currentTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      ? state.conversationTurns.find(
+          (turn) => turn.id === state.currentTurnId,
+        ) || null
       : null;
     const visibleConversationTurns = state.conversationTurns
       .filter((turn) => turn.uiVisibility !== "internal")
@@ -9851,325 +10362,64 @@ function seedCloudToolProtocolScenario(scenario: string) {
         id: turn.id,
         title: turn.title,
         status: turn.status,
+        runtimeStatus: turn.runtimeOutcome?.status ?? null,
+        resultKind: turn.runtimeOutcome?.resultKind ?? null,
         intent: turn.intent,
         displayIntent: turn.displayIntent || turn.intent,
         blockCount: turn.blockIds.length,
       }));
-    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
-    const optionBlocks = agentBlocks.filter((block) => Array.isArray(block.options) && block.options.length > 0);
-    const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
-    const progressBlocks = state.taskFlow.filter((block) => block.type === "progress") as any[];
-    const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
+    const agentBlocks = state.taskFlow.filter(
+      (block) => block.type === "agent",
+    ) as any[];
+    const toolBlocks = state.taskFlow.filter(
+      (block) => block.type === "tool",
+    ) as any[];
 
     return {
       agentStatus: state.agentStatus,
-      isGenerating: state.isGenerating,
-      planStage: state.planStage,
-      isPlanApproved: state.isPlanApproved,
-      planAutoResumeCount: state.planAutoResumeCount,
-      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
-      planTasks: state.planTasks,
       currentTurnId: currentTurn?.id ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
-      currentTurnRuntimeStatus: currentTurn?.runtimeOutcome?.status ?? null,
       currentTurnResultKind: currentTurn?.runtimeOutcome?.resultKind ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
-      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
-      turnStartedEvents: state.runtimeEvents
-        .filter((event) => event.type === "turn.started")
-        .map((event) => ({ turnId: event.turnId })),
-      runStartedEvents: state.runtimeEvents
-        .filter((event) => event.type === "run.started")
-        .map((event) => ({
-          turnId: event.turnId,
-          runId: event.runId,
-          parentRunId: event.parentRunId || null,
-        })),
-      runPausedEvents: state.runtimeEvents
-        .filter((event) => event.type === "run.paused")
-        .map((event) => ({
-          turnId: event.turnId,
-          runId: event.runId,
-          reason: event.reason,
-          message: event.message,
-        })),
-      pendingRunDecision: state.pendingRunDecision
+      activeActionRequest: state.activeActionRequest
         ? {
-            kind: state.pendingRunDecision.kind,
-            suggestedIntent: state.pendingRunDecision.suggestedIntent,
-            optionIds: (state.pendingRunDecision.options || []).map((option) => option.id),
-            optionLabels: (state.pendingRunDecision.options || []).map((option) => option.label),
+            kind: state.activeActionRequest.kind,
+            status: state.activeActionRequest.status,
+            turnId: state.activeActionRequest.turnId,
+            runId: state.activeActionRequest.runId,
+            requestId: state.activeActionRequest.requestId,
+            ...(state.activeActionRequest.kind === "tool_permission"
+              ? {
+                  taskId: state.activeActionRequest.taskId,
+                  toolCallId: state.activeActionRequest.toolCallId || null,
+                  toolName: state.activeActionRequest.toolName,
+                  target: state.activeActionRequest.target,
+                }
+              : {}),
           }
         : null,
+      pendingReviewTaskId: state.pendingReviewTaskId,
       conversationTurns: state.conversationTurns.length,
       visibleConversationTurns,
-      taskFlowBlocks: state.taskFlow.length,
-      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
-      currentTurnBlockIds: currentTurn?.blockIds || [],
+      visibleFinalCount: agentBlocks.filter(
+        (block) =>
+          block.turnId === currentTurn?.id &&
+          block.visibility === "assistant_final" &&
+          block.streaming !== true,
+      ).length,
       taskBlockSummaries: state.taskFlow.map((block: any) => ({
         id: block.id,
         turnId: block.turnId,
         type: block.type,
-        content: typeof block.content === "string" ? block.content.slice(0, 120) : "",
+        content:
+          typeof block.content === "string" ? block.content.slice(0, 120) : "",
       })),
       agentTexts: agentBlocks.map((block) => block.content),
-      agentBlockDebug: agentBlocks.map((block) => ({
-        id: block.id,
-        turnId: block.turnId,
-        hasOptions: Array.isArray(block.options) && block.options.length > 0,
-        optionLabels: Array.isArray(block.options) ? block.options.map((option: any) => option.label) : [],
-        archivedAfterChoice: block.archivedAfterChoice === true,
-        selectedOption: block.selectedOption || null,
-      })),
-      optionBlockCount: optionBlocks.length,
-      optionLabels: optionBlocks.flatMap((block) => (block.options || []).map((option: any) => option.label)),
-      progressBlockCount: progressBlocks.length,
-      archivedOptionCount: archivedOptionBlocks.length,
-      selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
       toolStatuses: toolBlocks.map((block) => block.toolStatus),
-      systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
-      seedCount: readSeedCount(scenario),
     };
   };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedPlanApprovalExecuteToolsScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO);
-
-  const now = Date.now();
-  const workspace = "/tmp/e2e-plan-approval-execute-tools";
-  const sessionId = 999503;
-  const turnId = "e2e-plan-approval-execute-tools-turn";
-  const reviewRunId = "run-e2e-plan-approval-execute-tools-review";
-  const userBlockId = useAppStore.getState()._nextTaskId();
-  const agentBlockId = useAppStore.getState()._nextTaskId();
-  const planArtifacts = [
-    {
-      kind: "plan" as const,
-      path: ".MAIN/plans/plan.md",
-      title: "Plan",
-      revision: 1,
-      updatedAt: now - 1_000,
-      content: [
-        "# 审批后执行工具回归计划",
-        "",
-        "## 摘要",
-        "- 用户目标：验证 Plan 审批后以新的执行 run 修改源码并运行验证。",
-        "",
-        "## 已确认证据",
-        "- `src/main.js` 是当前 E2E 工作区的可写源码入口。",
-        "- 执行 run 需要同时获得 workspace write 与 shell 工具能力。",
-        "",
-        "## 关键改动",
-        "- 修改 `src/main.js`，加入批准执行路径的回归标记。",
-        "",
-        "## 公共 API / 接口 / 类型",
-        "- 不修改公共 API；仅增加内部回归标记。",
-        "",
-        "## 测试方案",
-        "- 运行 `npm run test:workflow-assets` 验证批准后的执行链路。",
-        "",
-        "## 假设与默认值",
-        "- 保持现有启动流程不变。",
-      ].join("\n"),
-    },
-    {
-      kind: "tasks" as const,
-      path: ".MAIN/plans/tasks.md",
-      title: "Tasks",
-      revision: 1,
-      updatedAt: now,
-      content: [
-        "# Tasks",
-        "",
-        "- [ ] 修改 `src/main.js` 加入批准执行回归标记 — 证据: file:src/main.js",
-        "- [ ] 运行 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
-      ].join("\n"),
-    },
-  ];
-  const approvalIdentity = buildPlanApprovalIdentity(planArtifacts);
-  const server = {
-    id: "e2e-plan-approval-execute-tools-server",
-    name: "E2E Cloud",
-    protocol: "openai" as const,
-    apiFormat: "responses" as const,
-    provider: "OpenAI",
-    endpoint: "https://e2e-cloud.example/v1",
-    model: "e2e-cloud-model",
-    apiKey: "e2e-key",
-    customHeaders: "",
-    temperature: 0.2,
-    topP: 0.95,
-    disableResponseStorage: true,
-    reasoningEffort: "none" as const,
-    toolProtocol: "auto" as const,
-    auth: { mode: "api_key" as const, status: "disconnected" as const },
-  };
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      workflowMode: "plan",
-      activeProfile: "cloud",
-      workspace,
-      cloud: server,
-      cloudServers: [server],
-      activeCloudServerId: server.id,
-      instructionsEnabled: false,
-      hooksEnabled: false,
-      sessionRecordingEnabled: false,
-    },
-    currentWorkspace: workspace,
-    selectedWorkspace: workspace,
-    sessionsByWorkspace: {
-      [workspace]: [
-        {
-          id: sessionId,
-          title: "E2E Plan Approval Execute Tools",
-          date: new Date(now).toISOString(),
-          active: true,
-          storageStatus: "temporary",
-          recordingDisabled: true,
-          messages: [],
-        },
-      ],
-    },
-    currentSessionId: sessionId,
-    harnessRunMarker: {
-      schemaVersion: 1,
-      runId: reviewRunId,
-      instanceId: "e2e-plan-approval-execute-tools-instance",
-      sessionKey: `${workspace}:${sessionId}`,
-      workspace,
-      sessionId,
-      turnId,
-      status: "paused",
-      workflowMode: "plan",
-      runtimeIntent: "plan",
-      planStage: "ready_to_execute",
-      isPlanApproved: false,
-      iteration: 1,
-      maxIterations: 12,
-      messagesLen: 2,
-      toolCount: 0,
-      latestTool: null,
-      latestToolTarget: null,
-      activeStreamId: null,
-      streamStatus: "closed",
-      streamChunkCount: 0,
-      streamByteCount: 0,
-      streamElapsedMs: 0,
-      streamLifecycleStatus: "completed",
-      lastStreamError: null,
-      startedAt: now - 1_000,
-      updatedAt: now,
-      closedAt: now,
-      closeReason: "plan_review_required",
-    },
-    activeActionRequest: approvalIdentity
-      ? buildPlanReviewActionRequest({
-          sessionKey: `${workspace}:${sessionId}`,
-          turnId,
-          runId: reviewRunId,
-          title: "审批后执行工具回归",
-          planRevision: approvalIdentity.revision,
-          artifactHash: approvalIdentity.artifactHash,
-          artifactPaths: approvalIdentity.artifactPaths,
-          now,
-        })
-      : null,
-    selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
-    taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/计划 修复审批后执行工具不可用的问题。" },
-      {
-        id: agentBlockId,
-        turnId,
-        type: "agent",
-        content: "计划已经收敛，可以批准执行。",
-        streaming: false,
-      },
-    ],
-    agentMessages: [],
-    conversationTurns: [
-      {
-        id: turnId,
-        userPrompt: "/计划 修复审批后执行工具不可用的问题。",
-        title: "审批后执行工具回归",
-        mode: "plan",
-        intent: "plan",
-        status: "awaiting_approval",
-        summary: "等待用户批准执行。",
-        blockIds: [userBlockId, agentBlockId],
-        collapsed: false,
-        createdAt: now,
-      },
-    ],
-    currentTurnId: turnId,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    planArtifacts,
-    planTasks: [
-      {
-        id: "plan-approval-task-mutation",
-        text: "修改 `src/main.js` 加入批准执行回归标记",
-        status: "pending",
-        evidence: [{ kind: "file", value: "src/main.js" }],
-      },
-      {
-        id: "plan-approval-task-validation",
-        text: "运行 `npm run test:workflow-assets` 验证批准后的执行链路",
-        status: "pending",
-        commands: ["npm run test:workflow-assets"],
-        evidence: [{ kind: "cmd", value: "npm run test:workflow-assets" }],
-      },
-    ],
-    planExecutionEvidenceLedger: [],
-    planExecutionEvidenceCount: 0,
-    runtimeEvents: [],
-    planStage: "ready_to_execute",
-    isPlanApproved: false,
-    planApprovalChoice: null,
-    currentTurnExecutionConsent: { turnId: null, granted: false },
-    // This scenario exercises scoped execution progression, not permission UI.
-    // Opt in explicitly so mutation can advance to the validation-focused run.
-    autoApproveTools: true,
-    autoApproveToolScopes: ["workspace_write", "shell"],
-    readOnlyAutoApproveForSession: false,
-    showPlanPanel: true,
-    showDiff: false,
-    showTerminal: false,
-    showFilePanel: false,
-    rightPanelTab: "plan",
-    selectedDiffTaskId: null,
-    agentStatus: "pending_review",
-    isGenerating: false,
-    abortController: null,
-    pendingReviewResolve: null,
-    pendingReviewTaskId: null,
-    pendingToolCall: null,
-  }));
-
-  bindBridgeSnapshot(PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO);
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -10240,7 +10490,8 @@ function seedSessionAutoCreateScenario() {
   };
 
   bridge.prepareStaleCurrentSession = () => {
-    resetRuntime([
+    resetRuntime(
+      [
       {
         id: staleSessionId,
         title: "旧项目会话",
@@ -10249,7 +10500,9 @@ function seedSessionAutoCreateScenario() {
         storageStatus: "ok",
         messages: [],
       },
-    ], null);
+      ],
+      null,
+    );
   };
 
   bridge.sendFirstMessage = () => {
@@ -10262,34 +10515,48 @@ function seedSessionAutoCreateScenario() {
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
     const sessions = state.sessionsByWorkspace[workspace] || [];
-    const currentSession = sessions.find((session) => session.id === state.currentSessionId) || null;
-    const staleSession = sessions.find((session) => session.id === staleSessionId) || null;
+    const currentSession =
+      sessions.find((session) => session.id === state.currentSessionId) || null;
+    const staleSession =
+      sessions.find((session) => session.id === staleSessionId) || null;
 
     return {
       workspace,
       staleSessionId,
       sessionCount: sessions.length,
       currentSessionId: state.currentSessionId,
-      activeSessionIds: sessions.filter((session) => session.active).map((session) => session.id),
+      activeSessionIds: sessions
+        .filter((session) => session.active)
+        .map((session) => session.id),
       currentSessionActive: currentSession?.active === true,
       currentSessionStorageStatus: currentSession?.storageStatus ?? null,
-      currentSessionRecordingDisabled: currentSession?.recordingDisabled === true,
-      currentSessionRuntimeTurns: currentSession?.runtimeSnapshot?.conversationTurns?.length ?? 0,
-      currentSessionRuntimeBlocks: currentSession?.runtimeSnapshot?.taskFlow?.length ?? 0,
+      currentSessionRecordingDisabled:
+        currentSession?.recordingDisabled === true,
+      currentSessionRuntimeTurns:
+        currentSession?.runtimeSnapshot?.conversationTurns?.length ?? 0,
+      currentSessionRuntimeBlocks:
+        currentSession?.runtimeSnapshot?.taskFlow?.length ?? 0,
       currentSessionMessages: currentSession?.messages?.length ?? 0,
       staleSessionMessages: staleSession?.messages?.length ?? 0,
       taskFlowBlocks: state.taskFlow.length,
-      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user")
+        .length,
       conversationTurns: state.conversationTurns.length,
       currentTurnId: state.currentTurnId,
       currentTurnTitle: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.title ?? null)
         : null,
       currentTurnReceiptId: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.workspaceInstructionReceiptId ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.workspaceInstructionReceiptId ?? null)
         : null,
       currentTurnStatus: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        ? (state.conversationTurns.find(
+            (turn) => turn.id === state.currentTurnId,
+          )?.status ?? null)
         : null,
       activeStudioAgentKey: state.activeStudioAgentKey,
       seedCount: readSeedCount(SESSION_AUTO_CREATE_SCENARIO),
@@ -10305,7 +10572,11 @@ function seedSessionAutoCreateScenario() {
 }
 
 export function getE2ESavePlanDocumentHandler():
-  | ((document: { title: string; suggestedFileName: string; content: string }) => Promise<boolean>)
+  | ((document: {
+      title: string;
+      suggestedFileName: string;
+      content: string;
+    }) => Promise<boolean>)
   | null {
   if (getScenarioName() !== PLAN_FLOW_SCENARIO) return null;
 
@@ -10320,17 +10591,22 @@ export function getE2ESavePlanDocumentHandler():
   };
 }
 
-export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string) => boolean) | null {
+export function getE2EQuickReplyHandler():
+  ((text: string, sourceTurnId?: string) => boolean) | null {
   const scenario = getScenarioName();
 
   if (scenario === PLAN_FLOW_SCENARIO) {
     return (text, sourceTurnId) => {
       const state = useAppStore.getState();
-      const turnId = sourceTurnId || state.currentTurnId || "e2e-plan-flow-turn";
+      const turnId =
+        sourceTurnId || state.currentTurnId || "e2e-plan-flow-turn";
       const replyText = String(text || "").trim();
       if (!replyText) return true;
 
-      appendBridgeEvent("plan-adjustment-submitted", { text: replyText, sourceTurnId: turnId });
+      appendBridgeEvent("plan-adjustment-submitted", {
+        text: replyText,
+        sourceTurnId: turnId,
+      });
       const userBlockId = state._nextTaskId();
       const agentBlockId = state._nextTaskId();
 
@@ -10355,10 +10631,12 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
                 summary: "已收到计划调整建议，等待再次确认。",
                 blockIds: [
                   ...turn.blockIds,
-                  ...[userBlockId, agentBlockId].filter((id) => !turn.blockIds.includes(id)),
+                  ...[userBlockId, agentBlockId].filter(
+                    (id) => !turn.blockIds.includes(id),
+                  ),
                 ],
               }
-            : turn
+            : turn,
         ),
         currentTurnId: turnId,
         isPlanApproved: false,
@@ -10375,7 +10653,8 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
   return (text, sourceTurnId) => {
     const bridge = getBridge();
     const state = useAppStore.getState();
-    const turnId = sourceTurnId || state.currentTurnId || "e2e-awaiting-choice-turn";
+    const turnId =
+      sourceTurnId || state.currentTurnId || "e2e-awaiting-choice-turn";
     const replyText = String(text || "").trim();
     if (!replyText) return true;
 
@@ -10410,7 +10689,7 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
                 ? turn.blockIds
                 : [...turn.blockIds, userBlockId],
             }
-          : turn
+          : turn,
       ),
       currentTurnId: turnId,
       agentStatus: "running",
@@ -10442,7 +10721,7 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
                   ? turn.blockIds
                   : [...turn.blockIds, assistantBlockId],
               }
-            : turn
+            : turn,
         ),
         planStage: "ready_to_execute",
         agentStatus: "idle",
@@ -10459,13 +10738,16 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
   };
 }
 
-export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null {
+export function getE2EResumeExecutionHandler():
+  (() => Promise<boolean>) | null {
   if (getScenarioName() !== PLAN_RELOAD_RESUME_SCENARIO) return null;
 
   return async () => {
     const state = useAppStore.getState();
     const approvalLease = state.planLifecycle.approvalLease;
-    const priorOwner = state.planLifecycle.execution || (approvalLease
+    const priorOwner =
+      state.planLifecycle.execution ||
+      (approvalLease
       ? {
           turnId: approvalLease.approvalTurnId,
           runId: approvalLease.approvalRunId,
@@ -10518,7 +10800,7 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
       conversationTurns: state.conversationTurns.map((turn) =>
         turn.id === executionOwner.turnId
           ? { ...turn, status: "executing", runtimeOutcome: undefined }
-          : turn
+          : turn,
       ),
     }));
 
@@ -10535,7 +10817,10 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
         expectedExecution: lifecycle.execution,
       });
       if (completed.disposition === "rejected") return;
-      finishPlanExecution("恢复执行完成，剩余任务已全部收尾。", "页面重载后的 Plan 已成功恢复，并顺利完成剩余任务。");
+      finishPlanExecution(
+        "恢复执行完成，剩余任务已全部收尾。",
+        "页面重载后的 Plan 已成功恢复，并顺利完成剩余任务。",
+      );
       useAppStore.setState((current) => ({
         planLifecycle: completed.state,
         conversationTurns: current.conversationTurns.map((turn) =>
@@ -10551,7 +10836,7 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
                   updatedAt: completedAt,
                 },
               }
-            : turn
+            : turn,
         ),
       }));
       appendBridgeEvent("completed");
@@ -10755,10 +11040,14 @@ function seedSubagentsPanelScenario() {
   const sessionId = 999702;
   const turnId = "e2e-subagents-panel-turn";
   const now = Date.now();
-  const requestedTheme = typeof window !== "undefined"
+  const requestedTheme =
+    typeof window !== "undefined"
     ? new URLSearchParams(window.location.search).get("theme")
     : null;
-  const themeMode = requestedTheme === "light" || requestedTheme === "black" ? requestedTheme : "dark";
+  const themeMode =
+    requestedTheme === "light" || requestedTheme === "black"
+      ? requestedTheme
+      : "dark";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const baseSubagent = {
@@ -10788,7 +11077,8 @@ function seedSubagentsPanelScenario() {
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
     sessionsByWorkspace: {
-      [workspace]: [{
+      [workspace]: [
+        {
         id: sessionId,
         title: "E2E Subagents Panel",
         date: new Date(now).toISOString(),
@@ -10796,16 +11086,29 @@ function seedSubagentsPanelScenario() {
         storageStatus: "temporary",
         recordingDisabled: true,
         messages: [],
-      }],
+        },
+      ],
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "并行检查事件协议与右侧面板。" },
-      { id: agentBlockId, turnId, type: "agent", content: "已委派两个只读子智能体并收集执行状态。", streaming: false },
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "并行检查事件协议与右侧面板。",
+      },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "已委派两个只读子智能体并收集执行状态。",
+        streaming: false,
+      },
     ],
-    conversationTurns: [{
+    conversationTurns: [
+      {
       id: turnId,
       userPrompt: "并行检查事件协议与右侧面板。",
       title: "子智能体执行检查",
@@ -10816,7 +11119,8 @@ function seedSubagentsPanelScenario() {
       blockIds: [userBlockId, agentBlockId],
       collapsed: false,
       createdAt: now - 20_000,
-    }],
+      },
+    ],
     currentTurnId: turnId,
     runtimeEvents: [
       {
@@ -10866,8 +11170,8 @@ function seedSubagentsPanelScenario() {
             status: "completed",
             state: "satisfied",
             remainingWork: null,
-            observationCount: 0,
-            substantiveEvidenceCount: 0,
+            observationCount: 1,
+            substantiveEvidenceCount: 1,
             acceptedEvidenceToolCallIds: [],
             requiredPaths: [],
             coveredPaths: [],
@@ -10886,6 +11190,31 @@ function seedSubagentsPanelScenario() {
           tool: "read_file",
           target: "src/lib/turnEvents.ts",
         },
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "subagent.handoff_delivered",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 11_900,
+        subagentId: "subagent-euler",
+        runId: "run-subagent-euler",
+        parentRunId: null,
+        receiptId: "runtime-v2:euler:delivered",
+        evidenceIds: ["evidence-euler-event-projection"],
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "subagent.handoff_applied",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 11_800,
+        subagentId: "subagent-euler",
+        runId: "run-subagent-euler",
+        parentRunId: null,
+        receiptId: "runtime-v2:euler:applied",
+        sourceEventId: "runtime-v2:euler:parent-provider",
+        evidenceIds: ["evidence-euler-event-projection"],
       },
       {
         schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
@@ -10980,7 +11309,11 @@ function seedSubagentsPanelScenario() {
           updatedAt: now - 1_200,
           summary: "已定位共享模型通道与内存采样入口，主体可从该证据继续。",
           error: "可用内存低于预留线，已取消最新子流。",
-          progress: { phase: "done", title: "已降级由主体接管", completedToolCalls: 1 },
+          progress: {
+            phase: "done",
+            title: "已降级由主体接管",
+            completedToolCalls: 1,
+          },
         },
         activity: {
           id: "herschel-activity-1",
@@ -11030,7 +11363,9 @@ function seedSubagentsPanelScenario() {
   }));
 
   bindBridgeSnapshot(SUBAGENTS_PANEL_SCENARIO);
-  const cleanup = () => { bridge.initialized = false; };
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
   bridge.cleanup = cleanup;
   return cleanup;
 }
@@ -11060,7 +11395,12 @@ function seedSidebarRemoveLastWorkspaceScenario() {
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
     workspaces: [
-      { path: workspace, name: "E2E Sidebar Remove Last", addedAt: now, lastActiveAt: now },
+      {
+        path: workspace,
+        name: "E2E Sidebar Remove Last",
+        addedAt: now,
+        lastActiveAt: now,
+      },
     ],
     activeSessionByWorkspace: {
       [workspace]: sessionId,
@@ -11079,7 +11419,12 @@ function seedSidebarRemoveLastWorkspaceScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId: "e2e-sidebar-turn", type: "user", content: "请帮我分析当前项目架构。" },
+      {
+        id: userBlockId,
+        turnId: "e2e-sidebar-turn",
+        type: "user",
+        content: "请帮我分析当前项目架构。",
+      },
       {
         id: agentBlockId,
         turnId: "e2e-sidebar-turn",
@@ -11273,10 +11618,6 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedStreamingResponsivenessScenario();
   }
 
-  if (scenario === LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO) {
-    return seedLocalPlanSlowFirstTokenScenario();
-  }
-
   if (scenario === REAL_OMLX_PLAN_FLOW_SCENARIO) {
     return seedRealOmlxPlanFlowScenario();
   }
@@ -11289,65 +11630,6 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCloudToolProtocolScenario(CLOUD_TOOL_FALLBACK_SCENARIO);
   }
 
-  if (scenario === REPLY_OPTIONS_TOOL_PAUSE_SCENARIO) {
-    return seedCloudToolProtocolScenario(REPLY_OPTIONS_TOOL_PAUSE_SCENARIO);
-  }
-
-  if (scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO) {
-    return seedCloudToolProtocolScenario(PLAN_OPERATION_APPROVAL_REUSE_SCENARIO);
-  }
-
-  if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {
-    return seedCloudToolProtocolScenario(EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO);
-  }
-
-  if (scenario === OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO) {
-    return seedCloudToolProtocolScenario(OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO);
-  }
-
-  if (scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO) {
-    return seedCloudToolProtocolScenario(GAME_STUDIO_EXECUTE_REPLY_SCENARIO);
-  }
-
-  if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
-    return seedCloudToolProtocolScenario(UNITY_MCP_OPTIONS_PRIORITY_SCENARIO);
-  }
-
-  if (scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO) {
-    return seedCloudToolProtocolScenario(UNITY_TOOL_CODE_COMPAT_SCENARIO);
-  }
-
-  if (scenario === UNITY_NO_ERROR_ROUTING_SCENARIO) {
-    return seedCloudToolProtocolScenario(UNITY_NO_ERROR_ROUTING_SCENARIO);
-  }
-
-  if (scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO) {
-    return seedCloudToolProtocolScenario(PSEUDO_TOOL_CALL_RECOVERY_SCENARIO);
-  }
-
-  if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
-    return seedCloudToolProtocolScenario(MALFORMED_TOOL_USE_PLAN_SCENARIO);
-  }
-  if (scenario === PLAN_CLOSURE_GUARD_EMPTY_SCENARIO) {
-    return seedLocalPlanClosureGuardEmptyScenario();
-  }
-
-  if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
-    return seedCloudToolProtocolScenario(EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO);
-  }
-
-  if (scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO) {
-    return seedCloudToolProtocolScenario(APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO);
-  }
-
-  if (scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO) {
-    return seedCloudToolProtocolScenario(APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO);
-  }
-
-  if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
-    return seedCloudToolProtocolScenario(EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO);
-  }
-
   if (scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO) {
     return seedCloudToolProtocolScenario(ORDINARY_CONTINUE_NEW_TURN_SCENARIO);
   }
@@ -11357,7 +11639,9 @@ export function initializeE2EScenarios(): (() => void) | undefined {
   }
 
   if (scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO) {
-    return seedCloudToolProtocolScenario(PROGRESS_NARRATION_TOOL_FLOW_SCENARIO);
+      return seedCloudToolProtocolScenario(
+        PROGRESS_NARRATION_TOOL_FLOW_SCENARIO,
+      );
   }
 
   if (scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO) {
@@ -11365,11 +11649,9 @@ export function initializeE2EScenarios(): (() => void) | undefined {
   }
 
   if (scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO) {
-    return seedCloudToolProtocolScenario(GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO);
-  }
-
-  if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {
-    return seedPlanApprovalExecuteToolsScenario();
+      return seedCloudToolProtocolScenario(
+        GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO,
+      );
   }
 
   if (scenario === SESSION_AUTO_CREATE_SCENARIO) {
@@ -11432,7 +11714,6 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedSubagentsPanelScenario();
   }
 
-  
   if (scenario === SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO) {
     return seedSidebarRemoveLastWorkspaceScenario();
   }
@@ -11443,7 +11724,8 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     // A synchronous seed failure must not leave a bridge that claims to be
     // initialized while its scenario controls were never installed.
     bridge.initialized = false;
-    bridge.initializationError = error instanceof Error ? error.message : String(error);
+    bridge.initializationError =
+      error instanceof Error ? error.message : String(error);
     throw error;
   }
 }

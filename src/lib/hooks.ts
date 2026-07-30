@@ -140,7 +140,7 @@ export async function loadHooksConfig(workspace: string): Promise<HooksConfig> {
   }
 
   try {
-    const raw = await readFile(".MAIN/hooks.json");
+    const raw = await readFile(".MAIN/hooks.json", workspace);
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const hooksNode =
       parsed && typeof parsed.hooks === "object" && parsed.hooks !== null

@@ -5,7 +5,10 @@ import type {
   RuntimeV2RecoveryScope,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
-import { isRuntimeV2ProviderProtocolError } from "./providerLane";
+import {
+  isRuntimeV2ProviderProtocolError,
+  isRuntimeV2ProviderTransportsUnavailableError,
+} from "./providerLane";
 import {
   canRecordRuntimeV2Recovery,
   runtimeV2ActionFingerprint,
@@ -33,54 +36,46 @@ function currentPhaseBoundary(aggregate: TurnAggregateV1): number {
   return 0;
 }
 
-/** Soft signals are durable state, not an iteration transcript. Retain one
- * occurrence per phase, except repeated-source pressure which is retained
- * once per concrete source target. */
+function currentMutationBoundary(
+  aggregate: TurnAggregateV1,
+  phaseBoundary: number,
+): number {
+  for (
+    let index = aggregate.events.length - 1;
+    index >= phaseBoundary;
+    index -= 1
+  ) {
+    const event = aggregate.events[index]!;
+    if (
+      event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+    ) {
+      return index + 1;
+    }
+  }
+  return phaseBoundary;
+}
+
+/** Soft signals are durable pressure facts, not an iteration transcript.
+ * Presence signals are retained once per phase. Repeated safe reads are
+ * represented by their ordinary tool receipt and bounded provider feedback,
+ * so one repeat signal per phase and mutation boundary is sufficient. */
 export function shouldRecordRuntimeV2SoftSignal(input: {
   readonly aggregate: TurnAggregateV1;
   readonly signal: RuntimeV2SoftSignal;
 }): boolean {
+  const phaseBoundary = currentPhaseBoundary(input.aggregate);
+  const signalBoundary = input.signal === "repeat"
+    ? currentMutationBoundary(input.aggregate, phaseBoundary)
+    : phaseBoundary;
   const phaseEvents = input.aggregate.events.slice(
-    currentPhaseBoundary(input.aggregate),
+    signalBoundary,
   );
-  if (input.signal !== "repeat") {
-    return !phaseEvents.some((event) =>
-      event.type === "soft_signal.observed" &&
-      event.signal === input.signal
-    );
-  }
-  const latestSource = [...phaseEvents].reverse().find((event) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
-    event.evidence.some((evidence) => evidence.kind === "source")
+  return !phaseEvents.some((event) =>
+    event.type === "soft_signal.observed" &&
+    event.signal === input.signal
   );
-  const target = latestSource?.type === "tool.completed"
-    ? latestSource.evidence.find((evidence) =>
-        evidence.kind === "source"
-      )?.target || ""
-    : "";
-  if (!target) return true;
-  return !phaseEvents.some((event, index) => {
-    if (
-      event.type !== "soft_signal.observed" ||
-      event.signal !== "repeat"
-    ) {
-      return false;
-    }
-    for (let sourceIndex = index - 1; sourceIndex >= 0; sourceIndex -= 1) {
-      const sourceEvent = phaseEvents[sourceIndex]!;
-      if (
-        sourceEvent.type === "tool.completed" &&
-        sourceEvent.status === "succeeded"
-      ) {
-        return sourceEvent.evidence.some((evidence) =>
-          evidence.kind === "source" &&
-          evidence.target === target
-        );
-      }
-    }
-    return false;
-  });
 }
 
 /** Presentation updates are replayable but semantically identical updates in
@@ -117,10 +112,22 @@ export type RuntimeV2FailureRecoveryDecision =
       readonly publish: boolean;
     }
   | {
-      readonly kind: "exhaust";
+      /**
+       * The failed command receipt already is the durable progress signal.
+       * Saturating the bounded diagnostic ledger must not become a lifecycle
+       * terminal; the Run deadline owns that boundary.
+       */
+      readonly kind: "continue";
+      readonly publish: boolean;
+    }
+  | {
+      /** The provider adapter, rather than a retry count, proved that no
+       * compatible request path remains for this Run. */
+      readonly kind: "hard_stop";
       readonly scope: "transport";
       readonly fingerprint: string;
-      readonly reason: "provider_transport_exhausted";
+      readonly reason: "provider_transports_unavailable";
+      readonly publish: true;
     };
 
 export function decideRuntimeV2CommandFailureRecovery(input: {
@@ -132,6 +139,16 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
     return {
       kind: "signal",
       signal: "protocol_drift",
+      publish: true,
+    };
+  }
+  if (isRuntimeV2ProviderTransportsUnavailableError(input.error)) {
+    return {
+      kind: "hard_stop",
+      scope: "transport",
+      fingerprint:
+        `transport:${runtimeV2ActionFingerprint(input.command)}`,
+      reason: "provider_transports_unavailable",
       publish: true,
     };
   }
@@ -170,10 +187,8 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
     };
   }
   return {
-    kind: "exhaust",
-    scope,
-    fingerprint,
-    reason: "provider_transport_exhausted",
+    kind: "continue",
+    publish: true,
   };
 }
 
@@ -182,7 +197,7 @@ export function decideRuntimeV2SemanticFailureRecovery(input: {
   readonly command: RuntimeV2Command;
   readonly event: RuntimeV2Event;
 }): Exclude<RuntimeV2FailureRecoveryDecision, {
-  readonly kind: "exhaust";
+  readonly kind: "continue" | "hard_stop";
 }> | null {
   const toolFailed =
     input.event.type === "tool.completed" &&

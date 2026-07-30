@@ -338,5 +338,11 @@ test("read_file schema exposes line-window parameters and does not promise full-
   assert.ok(readFile.function.parameters.properties.start_line);
   assert.ok(readFile.function.parameters.properties.end_line);
   assert.ok(readFile.function.parameters.properties.max_lines);
+  assert.ok(readFile.function.parameters.properties.start_char);
+  assert.ok(readFile.function.parameters.properties.max_chars);
+  assert.match(
+    readFile.function.parameters.properties.start_char.description,
+    /0-based/,
+  );
   assert.deepEqual(readFile.function.parameters.required, ["path"]);
 });

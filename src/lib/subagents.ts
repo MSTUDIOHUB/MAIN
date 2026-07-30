@@ -1,6 +1,8 @@
 import type { AppConfig } from "./appTypes";
-import { resolveRuntimeLaneKey } from "./appConfig";
-import { getModelLaneBurstAdmission } from "./modelLaneCoordinator";
+import {
+  getModelLaneBurstAdmission,
+  getModelLaneCapacityObservation,
+} from "./modelLaneCoordinator";
 import type { SubagentDelegationPreference } from "./turnIntake";
 export type { SubagentDelegationPreference } from "./turnIntake";
 import type {
@@ -156,6 +158,19 @@ export type SubagentRunPatch = Partial<Pick<
 
 export interface SubagentRunRecord extends SubagentRunSnapshot {
   activities: SubagentActivity[];
+  /** Child-owned evidence proven by a structured closure or hand-back event. */
+  childEvidenceCount: number;
+  /** A structured child result crossed the child runtime boundary. */
+  returnedCount: number;
+  /** Reserved for an explicit parent-delivery receipt; absence stays zero. */
+  deliveredCount: number;
+  /** Reserved for an explicit parent-adoption receipt; absence stays zero. */
+  adoptedCount: number;
+  /** Runtime-owned terminal cause. Mutable model/status prose is not used. */
+  terminalReason?: {
+    code: string;
+    detail: string;
+  };
 }
 
 export interface SpawnSubagentRequest {
@@ -454,11 +469,15 @@ export interface SubagentCapacityPolicy {
   profile: "local" | "cloud";
   provider: string;
   model: string;
+  /** Current provider-request capacity, including the reserved parent. */
+  maxTotalRequests: number;
+  /** Highest simultaneous first-token overlap confirmed for this lane. */
+  confirmedTotalRequests: number;
+  capacitySource: "configured" | "observed" | "probing";
   maxActiveRequests: number;
   maxBurstActiveRequests: number;
   /** Safety fuse for simultaneously registered one-shot child workflows. */
   maxConcurrentChildren: number;
-  childMaxIterations: number;
 }
 
 function boundedCount(value: unknown): number {
@@ -534,9 +553,8 @@ export function resolveDelegationDecision(input: {
     return decision("defer", "phase_not_eligible");
   }
   if (preference === "preferred") {
-    // An explicit collaboration toggle owns the initial child-start boundary.
-    // Capacity is coordinated by the scheduler; it must not silently restore
-    // parent read/edit tools before the requested child has been admitted.
+    // "Preferred" exposes collaboration throughout the eligible lifecycle.
+    // It never creates an initial spawn barrier or withholds parent tools.
     return decision("admit", "explicit_preference");
   }
   if (preference === "allowed") {
@@ -687,6 +705,45 @@ function projectFailClosedSubagentCompletion(
     closureState: "blocked",
     remainingWork: record.objective,
     error: record.error || error,
+    terminalReason: record.terminalReason || {
+      code: "subagent_closure_contract_missing",
+      detail: error,
+    },
+  };
+}
+
+function projectStructuredSubagentClosureFacts(
+  record: SubagentRunRecord,
+): SubagentRunRecord {
+  const closure = record.closureAudit;
+  if (!isAuthoritativeSubagentClosure(closure, {
+    threadId: record.threadId,
+    parentTurnId: record.parentTurnId,
+    subagentId: record.id,
+    ...(record.runId ? { runId: record.runId } : {}),
+    ...(record.parentRunId !== undefined
+      ? { parentRunId: record.parentRunId }
+      : {}),
+    ...(record.scopeKey ? { scopeKey: record.scopeKey } : {}),
+  })) {
+    return record;
+  }
+  const detail = String(closure.reason || "").trim();
+  return {
+    ...record,
+    childEvidenceCount: Math.max(
+      record.childEvidenceCount,
+      Math.max(0, Math.floor(closure.substantiveEvidenceCount)),
+    ),
+    returnedCount: Math.max(record.returnedCount, 1),
+    ...(record.status !== "completed" && detail
+      ? {
+          terminalReason: record.terminalReason || {
+            code: String(closure.reasonCode || "subagent_closed"),
+            detail,
+          },
+        }
+      : {}),
   };
 }
 
@@ -705,20 +762,44 @@ function resolveConfiguredModel(config: AppConfig): { provider: string; model: s
   };
 }
 
-export function resolveSubagentCapacityPolicy(config: AppConfig): SubagentCapacityPolicy {
+export function resolveSubagentCapacityPolicy(
+  config: AppConfig | null | undefined,
+): SubagentCapacityPolicy {
+  if (!config) {
+    return {
+      laneKey: "profile=unknown",
+      profile: "local",
+      provider: "Unknown",
+      model: "Unknown",
+      maxTotalRequests: 1,
+      confirmedTotalRequests: 0,
+      capacitySource: "probing",
+      maxActiveRequests: 1,
+      maxBurstActiveRequests: 1,
+      maxConcurrentChildren: 1,
+    };
+  }
   const profile = config.activeProfile === "cloud" ? "cloud" : "local";
   const configured = resolveConfiguredModel(config);
+  const observed = getModelLaneCapacityObservation(config);
   return {
-    laneKey: resolveRuntimeLaneKey(config),
+    laneKey: observed.laneKey,
     profile,
     provider: configured.provider,
     model: configured.model,
-    // This is the number of child workflows. Model-request concurrency is
-    // coordinated separately and reserves capacity for the parent thread.
-    maxActiveRequests: profile === "local" ? 2 : 3,
-    maxBurstActiveRequests: 3,
-    maxConcurrentChildren: profile === "local" ? 3 : 6,
-    childMaxIterations: profile === "local" ? 6 : 8,
+    maxTotalRequests: observed.maxActiveRequests,
+    confirmedTotalRequests: observed.maxConfirmedActiveRequests,
+    capacitySource: observed.configured
+      ? "configured"
+      : observed.maxConfirmedActiveRequests > 1
+        ? "observed"
+        : "probing",
+    // This is the number of child workflows after the model lane has reserved
+    // one request for the parent. Unknown providers expose only the next
+    // empirical probe; a configured capacity is trusted as an upper bound.
+    maxActiveRequests: observed.maxActiveSubagents,
+    maxBurstActiveRequests: observed.maxActiveSubagents,
+    maxConcurrentChildren: observed.maxActiveSubagents,
   };
 }
 
@@ -784,10 +865,21 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
           event.subagent.parentRunId !== event.parentRunId
         )
       ) continue;
-      records.set(event.subagent.id, {
+      const created = {
         ...event.subagent,
         activities: [],
-      });
+        childEvidenceCount: 0,
+        returnedCount: 0,
+        deliveredCount: 0,
+        adoptedCount: 0,
+        terminalReason: undefined,
+      } satisfies SubagentRunRecord;
+      records.set(
+        event.subagent.id,
+        projectStructuredSubagentClosureFacts(
+          projectFailClosedSubagentCompletion(created),
+        ),
+      );
       continue;
     }
 
@@ -801,11 +893,22 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
       const activities = event.activity
         ? [...current.activities, event.activity].slice(-80)
         : current.activities;
-      records.set(event.subagentId, projectFailClosedSubagentCompletion({
+      const updated: SubagentRunRecord = {
         ...current,
         ...event.patch,
         activities,
-      }));
+        childEvidenceCount: current.childEvidenceCount,
+        returnedCount: current.returnedCount,
+        deliveredCount: current.deliveredCount,
+        adoptedCount: current.adoptedCount,
+        terminalReason: current.terminalReason,
+      };
+      records.set(
+        event.subagentId,
+        projectStructuredSubagentClosureFacts(
+          projectFailClosedSubagentCompletion(updated),
+        ),
+      );
       continue;
     }
 
@@ -816,12 +919,82 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
         current.closedAt ||
         !eventMatchesProjectedSubagent(event, current)
       ) continue;
-      records.set(event.subagentId, projectFailClosedSubagentCompletion({
+      records.set(event.subagentId, projectStructuredSubagentClosureFacts(
+        projectFailClosedSubagentCompletion({
         ...current,
         status: event.status,
         completedAt: event.completedAt,
         updatedAt: Math.max(current.updatedAt, event.completedAt),
-      }));
+        returnedCount: Math.max(current.returnedCount, 1),
+      })));
+      continue;
+    }
+
+    if (event.type === "subagent.handoff_delivered") {
+      const current = records.get(event.subagentId);
+      if (
+        !current ||
+        current.returnedCount <= 0 ||
+        !String(event.receiptId || "").trim() ||
+        !Array.isArray(event.evidenceIds) ||
+        !eventMatchesProjectedSubagent(event, current)
+      ) {
+        continue;
+      }
+      records.set(event.subagentId, {
+        ...current,
+        deliveredCount: current.deliveredCount + 1,
+        updatedAt: Math.max(current.updatedAt, event.timestampMs),
+      });
+      continue;
+    }
+
+    if (event.type === "subagent.handoff_applied") {
+      const current = records.get(event.subagentId);
+      if (
+        !current ||
+        current.deliveredCount <= 0 ||
+        !String(event.receiptId || "").trim() ||
+        !String(event.sourceEventId || "").trim() ||
+        !Array.isArray(event.evidenceIds) ||
+        event.evidenceIds.length === 0 ||
+        event.evidenceIds.some((id) => !String(id || "").trim()) ||
+        !eventMatchesProjectedSubagent(event, current)
+      ) {
+        continue;
+      }
+      records.set(event.subagentId, {
+        ...current,
+        adoptedCount: current.adoptedCount + 1,
+        updatedAt: Math.max(current.updatedAt, event.timestampMs),
+      });
+      continue;
+    }
+
+    if (event.type === "subagent.handed_back") {
+      const current = records.get(event.subagentId);
+      if (!current || !eventMatchesProjectedSubagent(event, current)) continue;
+      const detail = String(event.reason || "").trim();
+      records.set(event.subagentId, {
+        ...current,
+        childEvidenceCount: Math.max(
+          current.childEvidenceCount,
+          Math.max(0, Math.floor(Number(event.evidenceCount) || 0)),
+        ),
+        returnedCount: Math.max(current.returnedCount, 1),
+        updatedAt: Math.max(current.updatedAt, event.timestampMs),
+        ...(event.remainingWork
+          ? { remainingWork: event.remainingWork }
+          : {}),
+        ...(detail
+          ? {
+              terminalReason: {
+                code: "subagent_handed_back",
+                detail,
+              },
+            }
+          : {}),
+      });
       continue;
     }
 
@@ -836,7 +1009,8 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
       const terminalStatus = requestedTerminalStatus === "completed" && current.status !== "completed"
         ? "blocked"
         : requestedTerminalStatus;
-      records.set(event.subagentId, projectFailClosedSubagentCompletion({
+      records.set(event.subagentId, projectStructuredSubagentClosureFacts(
+        projectFailClosedSubagentCompletion({
         ...current,
         status: terminalStatus,
         closedAt: event.closedAt,
@@ -844,7 +1018,7 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
           ? { completedAt: event.closedAt }
           : {}),
         updatedAt: Math.max(current.updatedAt, event.closedAt),
-      }));
+      })));
       continue;
     }
 

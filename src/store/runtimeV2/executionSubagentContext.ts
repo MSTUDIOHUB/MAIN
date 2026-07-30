@@ -1,13 +1,30 @@
+import type { AgentMessage } from "../../lib/agentMessages";
 import type {
   RuntimeV2SubagentJob,
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
-import type { RuntimeV2ModelContextEntry } from "./executionTypes";
+import {
+  RUNTIME_V2_CONTEXT_ANCHOR_PREFIX,
+} from "./executionProviderAnchors";
+import {
+  buildRuntimeV2DecisionView,
+  materializedRuntimeV2SourceCoverage,
+} from "./executionProviderDecisionView";
+import type {
+  RuntimeV2ProviderEffectFacts,
+} from "./executionProviderEffectFacts";
 
 const DEFAULT_PARENT_CONTEXT_CAPSULE_CHARS = 20_000;
-const MAX_PARENT_CONTEXT_CAPSULE_CHARS = 160_000;
-const MAX_PARENT_CONTEXT_ENTRY_CHARS = 64_000;
+
+interface RuntimeV2ParentContextEntry {
+  readonly id: string;
+  readonly source: "workspace" | "plan" | "tool";
+  readonly label: string;
+  readonly target: string;
+  readonly status: "succeeded";
+  readonly content: string;
+}
 
 function normalizedPath(value: string): string {
   return value.trim()
@@ -25,105 +42,102 @@ function pathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-function entryMatchesScope(
-  entry: RuntimeV2ModelContextEntry,
-  allowedPaths: readonly string[],
-): boolean {
-  if (
-    entry.source === "workspace" ||
-    entry.source === "plan" ||
-    entry.source === "provider"
-  ) {
-    return true;
-  }
-  return allowedPaths.some((allowedPath) =>
-    pathsOverlap(entry.target, allowedPath)
-  );
+function messageText(message: AgentMessage): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
 }
 
-function bounded(value: string, max: number): string {
-  const text = String(value || "").trim();
-  return text.length <= max
-    ? text
-    : `${text.slice(0, max)}\n...<parent-context-truncated>`;
+function canonicalContextAnchors(
+  messages: readonly AgentMessage[],
+): RuntimeV2ParentContextEntry[] {
+  return messages.flatMap((message) => {
+    if (message.role !== "system") return [];
+    const content = messageText(message);
+    if (!content.startsWith(RUNTIME_V2_CONTEXT_ANCHOR_PREFIX)) return [];
+    const firstLine = content.split(/\r?\n/, 1)[0] || "";
+    const key = firstLine
+      .slice(RUNTIME_V2_CONTEXT_ANCHOR_PREFIX.length)
+      .replace(/\]$/, "")
+      .trim();
+    if (key !== "workspace-overview" && key !== "approved-work-plan") {
+      return [];
+    }
+    return [{
+      id: `context:${key}`,
+      source: key === "workspace-overview" ? "workspace" : "plan",
+      label: key,
+      target: key === "workspace-overview"
+        ? "workspace"
+        : ".MAIN/workplan.json",
+      status: "succeeded" as const,
+      content,
+    }];
+  });
+}
+
+function canonicalSourceContext(input: {
+  readonly messages: readonly AgentMessage[];
+  readonly effectFacts?: RuntimeV2ProviderEffectFacts;
+  readonly workspace: string;
+  readonly allowedPaths: readonly string[];
+}): RuntimeV2ParentContextEntry[] {
+  const currentDecision = buildRuntimeV2DecisionView(
+    input.messages,
+    input.effectFacts,
+  );
+  return materializedRuntimeV2SourceCoverage(
+    currentDecision,
+    input.workspace,
+    input.effectFacts,
+  ).flatMap((coverage) => {
+    if (
+      !input.allowedPaths.some((allowedPath) =>
+        pathsOverlap(coverage.target, allowedPath)
+      )
+    ) {
+      return [];
+    }
+    return coverage.windows.map((window) => ({
+      id:
+        `source:${coverage.target}:${coverage.version}:${window.startLine}-${window.endLine}`,
+      source: "tool" as const,
+      label: "read_file",
+      target: coverage.target,
+      status: "succeeded" as const,
+      content: [
+        "READ_FILE_RESULT",
+        `path: ${coverage.target}`,
+        `contentVersion: ${coverage.version}`,
+        `totalLines: ${coverage.totalLines}`,
+        `returnedLines: ${window.startLine}-${window.endLine}`,
+        `complete: ${coverage.complete}`,
+        "---CONTENT START---",
+        window.content,
+        "---CONTENT END---",
+      ].join("\n"),
+    }));
+  });
 }
 
 function parentContextCapacity(
   budget?: Pick<RuntimeContextBudget, "inputBudget">,
-): {
-  readonly capsuleChars: number;
-  readonly entryChars: number;
-} {
+): number {
   const inputBudget = Math.max(
     0,
     Math.floor(Number(budget?.inputBudget) || 0),
   );
-  const capsuleChars = inputBudget > 0
+  return inputBudget > 0
     ? Math.max(
         DEFAULT_PARENT_CONTEXT_CAPSULE_CHARS,
-        Math.min(
-          MAX_PARENT_CONTEXT_CAPSULE_CHARS,
-          Math.floor(inputBudget * 2.5 * 0.35),
-        ),
+        Math.floor(inputBudget * 2.5 * 0.35),
       )
     : DEFAULT_PARENT_CONTEXT_CAPSULE_CHARS;
-  return {
-    capsuleChars,
-    entryChars: Math.max(
-      8_000,
-      Math.min(
-        MAX_PARENT_CONTEXT_ENTRY_CHARS,
-        Math.floor(capsuleChars * 0.6),
-      ),
-    ),
-  };
-}
-
-function selectRelevantParentContext(input: {
-  readonly entries: readonly RuntimeV2ModelContextEntry[];
-  readonly allowedPaths: readonly string[];
-  readonly capacityChars: number;
-  readonly entryChars: number;
-}): Array<RuntimeV2ModelContextEntry & { content: string }> {
-  const relevant = input.entries.filter((entry) =>
-    entryMatchesScope(entry, input.allowedPaths)
-  );
-  const selected: Array<
-    RuntimeV2ModelContextEntry & { content: string }
-  > = [];
-  let retainedChars = 0;
-  for (let index = relevant.length - 1; index >= 0; index -= 1) {
-    const entry = relevant[index]!;
-    const content = bounded(entry.content, input.entryChars);
-    const estimatedChars =
-      content.length +
-      entry.id.length +
-      entry.label.length +
-      entry.target.length +
-      160;
-    if (
-      selected.length > 0 &&
-      retainedChars + estimatedChars > input.capacityChars
-    ) {
-      continue;
-    }
-    selected.unshift({ ...entry, content });
-    retainedChars += estimatedChars;
-  }
-  return selected;
 }
 
 function activeAuthority(aggregate: TurnAggregateV1): unknown {
-  if (aggregate.executionContract?.status === "active") {
-    return {
-      kind: "execution_contract",
-      id: aggregate.executionContract.id,
-      revision: aggregate.executionContract.revision,
-      criteria: aggregate.executionContract.criteria,
-      changes: aggregate.executionContract.changes,
-      validations: aggregate.executionContract.validations,
-    };
-  }
   if (
     aggregate.workPlan?.status === "approved" &&
     aggregate.sealedWorkPlan
@@ -140,33 +154,37 @@ function activeAuthority(aggregate: TurnAggregateV1): unknown {
   return null;
 }
 
-/** Build a bounded handoff from durable parent facts. Inherited entries are
- * context only: they let a late child start at the current lifecycle boundary,
- * but never become child-owned evidence or satisfy the structured report gate.
+/**
+ * Build a child handoff from the one canonical parent transcript and durable
+ * receipts. Exact source windows are inherited only when they still belong to
+ * the current decision boundary and overlap the child's declared read scope.
+ * Entries are admitted whole; an oversized source is omitted for an explicit
+ * child read instead of being silently truncated into misleading code.
  */
 export function buildRuntimeV2SubagentContextCapsule(input: {
   readonly aggregate: TurnAggregateV1 | null;
   readonly job: RuntimeV2SubagentJob;
-  readonly modelContext: readonly RuntimeV2ModelContextEntry[];
+  readonly messages: readonly AgentMessage[];
+  readonly effectFacts?: RuntimeV2ProviderEffectFacts;
+  readonly workspace?: string;
   readonly contextBudget?: Pick<RuntimeContextBudget, "inputBudget">;
 }): string {
   const aggregate = input.aggregate;
   if (!aggregate) return "";
-  const capacity = parentContextCapacity(input.contextBudget);
-  const relevantContext = selectRelevantParentContext({
-    entries: input.modelContext,
-    allowedPaths: input.job.allowedPaths,
-    capacityChars: Math.max(4_000, capacity.capsuleChars - 8_000),
-    entryChars: capacity.entryChars,
-  })
-    .map((entry) => ({
-      id: entry.id,
-      source: entry.source,
-      label: entry.label,
-      target: entry.target,
-      status: entry.status,
-      content: entry.content,
-    }));
+  const allowedEvidence = aggregate.evidence.filter((evidence) =>
+    input.job.allowedPaths.some((path) =>
+      pathsOverlap(evidence.target, path)
+    )
+  );
+  const candidates = [
+    ...canonicalContextAnchors(input.messages),
+    ...canonicalSourceContext({
+      messages: input.messages,
+      effectFacts: input.effectFacts,
+      workspace: input.workspace || "",
+      allowedPaths: input.job.allowedPaths,
+    }),
+  ];
   const capsule = {
     userObjective: aggregate.objective.text,
     acceptanceCriteria: aggregate.objective.acceptanceCriteria.map(
@@ -179,7 +197,7 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
     ),
     lifecyclePhase: aggregate.phase,
     authority: activeAuthority(aggregate),
-    parentEvidenceCatalog: aggregate.evidence.slice(-32).map((evidence) => ({
+    parentEvidenceCatalog: allowedEvidence.slice(-32).map((evidence) => ({
       id: evidence.id,
       kind: evidence.kind,
       target: evidence.target,
@@ -187,15 +205,25 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
     })),
     committedMutationTargets: [
       ...new Set(
-        aggregate.evidence
+        allowedEvidence
           .filter((evidence) => evidence.kind === "mutation")
           .map((evidence) => evidence.target),
       ),
     ],
-    relevantParentContext: relevantContext,
+    relevantParentContext: [] as RuntimeV2ParentContextEntry[],
+    omittedParentContext: [] as string[],
   };
-  return bounded(
-    JSON.stringify(capsule, null, 2),
-    capacity.capsuleChars,
-  );
+  const capacity = parentContextCapacity(input.contextBudget);
+  for (const entry of candidates) {
+    const next = {
+      ...capsule,
+      relevantParentContext: [...capsule.relevantParentContext, entry],
+    };
+    if (JSON.stringify(next).length <= capacity) {
+      capsule.relevantParentContext.push(entry);
+    } else {
+      capsule.omittedParentContext.push(entry.id);
+    }
+  }
+  return JSON.stringify(capsule, null, 2);
 }

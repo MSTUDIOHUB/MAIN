@@ -20,13 +20,11 @@ inclusion: always
 
 ## 核心功能
 - **Chat 模式**：用于问答、分析、澄清需求、头脑风暴，不默认进入执行。
-- **Fast 模式**：用于直接执行实现，强调快速落地。
-- **Plan 模式**：用于复杂任务的 review-first 流程，先产出 `requirements.md` / `design.md` / `tasks.md` / `bugfix.md`，再审批执行。
-- **模板驱动规划**：通过 `.MAIN/templates/intent/` 与 `.MAIN/templates/plan/` 统一意图分析与规格文档骨架，减少模型自由发挥导致的偏差。
+- **Fast / Execute 模式**：用于直接执行明确任务，遵循可重复的读取、修改、最终修改后验证循环。
+- **Plan 模式**：用于复杂任务的 review-first 流程；模型提交 typed plan candidate，runtime 校验、密封并渲染 `.MAIN/plans/plan.md`，用户批准后才获得执行 authority。
 - **Agent 工具链**：文件读写、目录扫描、项目骨架、终端命令、MCP 工具、技能工具。
-- **Hook 护栏**：通过 `.MAIN/hooks.json` 在关键时机补充执行约束与完成检查，降低“任务未闭环却提前收尾”的概率。
 - **右侧工作区面板**：展示计划文档、任务进度、Diff、终端与文件预览。
-- **Workspace Instructions / Steering**：通过 `AGENT.md`、`.MAIN/steering`、`.MAIN/rules` 约束 Agent 行为。
+- **Workspace Instructions / Steering**：通过 `AGENTS.md`、`CLAUDE.md`、`AGENT.md`、`.MAIN/steering` 与 `.MAIN/rules` 提供带来源的项目大前提。
 
 ## 业务目标
 - 提高 Agent 在真实项目中的稳定执行率，尤其是复杂任务下的 Plan → Execute 闭环完成率；
@@ -36,7 +34,7 @@ inclusion: always
 
 ## 约束与风险
 - 本地模型对工具调用格式、长上下文和多轮稳定性较敏感；
-- Plan 模式如果缺少明确的完成定义，容易出现“生成计划后执行半途停止”；
+- Plan 或 Execute 如果缺少目标关联的最终验证证据，必须诚实返回 partial，不能由模型正文补造完成；
 - 用户意图可能分为“仅要方案”“先方案后执行”“直接执行”，若未区分清楚会导致体验偏差；
-- 计划文档默认位于 `.MAIN/plans/`，若没有导出/保存能力，用户可能丢失有价值的方案内容。
-- 如果模板与 Hook 只存在于磁盘却没有被流程真正使用，它们会退化成“看起来很完整”的静态文件，因此必须接入系统提示词与生命周期执行链路。
+- 项目规则、会话压缩摘要、任务证据和验收回执是不同事实层，不能互相替代；
+- 只有能从生产入口追到调用点的能力才可在 UI 或文档中宣称可用。

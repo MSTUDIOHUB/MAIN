@@ -2,24 +2,26 @@ import type { RuntimeV2RunState, TurnAggregateV1 } from "./aggregate";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command, type RuntimeV2CommandReceipt,
-  type RuntimeV2EvidenceReference, type RuntimeV2Phase,
+  type RuntimeV2Phase,
   type RuntimeV2RunIdentity, type RuntimeV2TerminalOutcome,
   type RuntimeV2TurnIdentity, type RuntimeV2WorkPlanReference,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import {
-  canOpenRuntimeV2RecoveryEpoch, canRecordRuntimeV2Recovery,
+  canRecordRuntimeV2Recovery,
   emptyRuntimeV2RecoveryBudget, exhaustRuntimeV2Recovery,
-  openRuntimeV2RecoveryEpoch, recordRuntimeV2Recovery,
+  recordRuntimeV2Recovery,
   runtimeV2ActionFingerprint,
 } from "./recovery";
-import { MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS, applyRuntimeV2SubagentTelemetry } from "./subagents";
-import { validateRuntimeV2SubagentReport } from "./subagentReport";
-import { validateRuntimeV2SubagentValidationReceipts } from "./validationReceipt";
+import { applyRuntimeV2SubagentTelemetry } from "./subagents";
 import {
-  hasNovelRuntimeV2Evidence,
+  isValidRuntimeV2SubagentHandoffApplication,
+  isValidRuntimeV2SubagentHandoffDelivery,
+} from "./subagentHandoff";
+import {
+  appendNovelRuntimeV2Evidence,
   hasMatchingRuntimeV2SealedPlanAuthority,
-  isValidRuntimeV2ExecutionContractCommit,
+  isValidRuntimeV2SubagentCompletion,
   isValidRuntimeV2SubagentJob,
 } from "./reducerGuards";
 export type RuntimeV2TransitionRejection =
@@ -39,20 +41,18 @@ export type RuntimeV2TransitionRejection =
   | "plan_strategy_required"
   | "plan_review_required"
   | "plan_identity_mismatch"
-  | "execution_contract_invalid"
   | "command_identity_mismatch"
   | "command_already_scheduled"
   | "command_already_completed"
   | "command_not_scheduled"
   | "command_kind_mismatch"
-  | "recovery_evidence_required"
-  | "recovery_evidence_not_novel"
   | "recovery_limit_exceeded"
   | "recovery_already_exhausted"
   | "subagent_invalid"
   | "subagent_scope_conflict"
   | "subagent_not_found"
   | "subagent_telemetry_invalid"
+  | "subagent_handoff_invalid"
   | "run_already_aborted"
   | "canceled_requires_abort"
   | "abort_requires_canceled"
@@ -74,7 +74,7 @@ export type RuntimeV2TransitionResult =
 
 const PHASE_TRANSITIONS: Readonly<Record<Exclude<RuntimeV2Phase, "completed">, readonly RuntimeV2Phase[]>> = {
   preparing: ["observing", "planning", "acting", "finalizing"],
-  observing: ["planning", "acting", "finalizing"],
+  observing: ["planning", "acting", "validating", "finalizing"],
   planning: ["reviewing", "acting", "finalizing"],
   reviewing: ["planning", "acting", "finalizing"],
   acting: ["observing", "validating", "finalizing"],
@@ -196,7 +196,6 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
     workPlan: null,
     sealedWorkPlan: null,
     planReviewCommit: null,
-    executionContract: null,
     scheduledCommands: [],
     completedCommands: [],
     pendingToolCalls: [],
@@ -207,21 +206,6 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
     nextSequence: event.sequence + 1,
     updatedAt: event.at,
   };
-}
-
-function appendEvidence(
-  existing: readonly RuntimeV2EvidenceReference[],
-  additions: readonly RuntimeV2EvidenceReference[],
-): readonly RuntimeV2EvidenceReference[] {
-  const next = [...existing];
-  const known = new Set(existing.map((item) => `${item.id}\u0000${item.target}\u0000${item.version || ""}`));
-  for (const evidence of additions) {
-    const key = `${evidence.id}\u0000${evidence.target}\u0000${evidence.version || ""}`;
-    if (known.has(key)) continue;
-    known.add(key);
-    next.push(evidence);
-  }
-  return next;
 }
 
 function activeRun(
@@ -390,7 +374,7 @@ export function tryTransition(
       return {
         disposition: "applied",
         state: append(state, event, {
-          evidence: appendEvidence(state.evidence, [event.evidence]),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, [event.evidence]),
         }),
       };
     case "command.scheduled": {
@@ -464,7 +448,7 @@ export function tryTransition(
               event.at,
             ),
           ),
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
             ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
             : state.pendingToolCalls,
@@ -489,61 +473,10 @@ export function tryTransition(
             // that could not be executed or authorized.
             commandReceipt(completion.command, "succeeded", event.at),
           ),
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
             ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
             : state.pendingToolCalls,
-        }),
-      };
-    }
-    case "execution_contract.committed": {
-      if (
-        !isValidRuntimeV2ExecutionContractCommit({
-          state,
-          event,
-        })
-      ) {
-        return rejection(state, "execution_contract_invalid");
-      }
-      return {
-        disposition: "applied",
-        state: append(state, event, {
-          executionContract: event.contract,
-        }),
-      };
-    }
-    case "execution_contract.rejected":
-      if (!event.reason.trim()) {
-        return rejection(state, "execution_contract_invalid");
-      }
-      return {
-        disposition: "applied",
-        state: append(state, event),
-      };
-    case "execution_contract.invalidated": {
-      if (
-        !state.executionContract ||
-        state.executionContract.id !== event.contractId ||
-        state.executionContract.revision < event.revision
-      ) {
-        return rejection(state, "execution_contract_invalid");
-      }
-      if (state.executionContract.revision > event.revision) {
-        // A replacement commit makes the prior revision stale immediately.
-        // Preserve the explicit audit event without invalidating the newer
-        // authority that is already active.
-        return {
-          disposition: "applied",
-          state: append(state, event),
-        };
-      }
-      return {
-        disposition: "applied",
-        state: append(state, event, {
-          executionContract: {
-            ...state.executionContract,
-            status: "invalidated",
-          },
         }),
       };
     }
@@ -600,22 +533,6 @@ export function tryTransition(
         }),
       };
     }
-    case "recovery.epoch_opened": {
-      if (event.evidence.length === 0) return rejection(state, "recovery_evidence_required");
-      if (!hasNovelRuntimeV2Evidence(state.evidence, event.evidence)) {
-        return rejection(state, "recovery_evidence_not_novel");
-      }
-      if (!canOpenRuntimeV2RecoveryEpoch(state.recovery)) {
-        return rejection(state, "recovery_limit_exceeded");
-      }
-      return {
-        disposition: "applied",
-        state: append(state, event, {
-          evidence: appendEvidence(state.evidence, event.evidence),
-          recovery: openRuntimeV2RecoveryEpoch(state.recovery),
-        }),
-      };
-    }
     case "recovery.recorded": {
       if (!canRecordRuntimeV2Recovery(state.recovery, event.scope, event.fingerprint)) {
         return rejection(state, "recovery_limit_exceeded");
@@ -651,12 +568,13 @@ export function tryTransition(
       return { disposition: "applied", state: append(state, event) };
     case "subagents.scheduled": {
       const activeCount = state.subagents.filter((job) =>
-        job.status === "queued" || job.status === "running"
-      ).length;
+        job.status === "queued" || job.status === "running").length;
+      const maxActiveSubagents = Math.floor(Number(event.maxActiveSubagents) || 0);
       if (
         event.jobs.length === 0 ||
+        maxActiveSubagents <= 0 ||
         activeCount + event.jobs.length >
-          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS ||
+          maxActiveSubagents ||
         event.jobs.some((job) =>
           !isValidRuntimeV2SubagentJob(job, event.run)
         )
@@ -688,21 +606,12 @@ export function tryTransition(
         return rejection(state, "subagent_telemetry_invalid");
       }
       if (
-        event.status === "completed" &&
-        !validateRuntimeV2SubagentReport({
-          report: event.report,
-          evidence: event.evidence,
+        !isValidRuntimeV2SubagentCompletion({
+          state,
+          event,
+          taskKind: current.taskKind,
         })
       ) {
-        return rejection(state, "subagent_invalid");
-      }
-      if (event.status === "degraded" && event.evidence.length === 0) return rejection(state, "subagent_invalid");
-      if (!validateRuntimeV2SubagentValidationReceipts({
-        receipts: event.validationReceipts,
-        evidence: event.evidence,
-        taskKind: current.taskKind,
-        eventAt: event.at,
-      })) {
         return rejection(state, "subagent_invalid");
       }
       const subagents = [...state.subagents];
@@ -716,9 +625,21 @@ export function tryTransition(
         disposition: "applied",
         state: append(state, event, {
           subagents,
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
         }),
       };
+    }
+    case "subagent.handoff_delivered": {
+      if (!isValidRuntimeV2SubagentHandoffDelivery({ state, event })) {
+        return rejection(state, "subagent_handoff_invalid");
+      }
+      return { disposition: "applied", state: append(state, event) };
+    }
+    case "subagent.handoff_applied": {
+      if (!isValidRuntimeV2SubagentHandoffApplication({ state, event })) {
+        return rejection(state, "subagent_handoff_invalid");
+      }
+      return { disposition: "applied", state: append(state, event) };
     }
     case "projection.published": {
       if (event.projection.id !== event.projectionId || event.projection.audience !== event.audience) {

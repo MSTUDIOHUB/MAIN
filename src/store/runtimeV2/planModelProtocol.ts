@@ -11,8 +11,6 @@ export const PLAN_MODEL_COMPACTION_INTERVAL = 10;
 export const PLAN_MODEL_DEADLINE_MS = 8 * 60_000;
 export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS = 3 * 60_000;
-export const PLAN_DISCOVERY_DEADLINE_MS = 3 * 60_000;
-export const PLAN_DISCOVERY_ACTION_BUDGET = 8;
 export const PLAN_CONTEXT_RESULT_CHARS = 10_000;
 export const PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS = 4_096;
@@ -115,7 +113,10 @@ export const PLAN_MODEL_TOOLS = [
 ];
 
 export type PlanModelStage = "discovery" | "synthesis";
-export type PlanProviderTransport = "native_tool" | "structured_response";
+export type PlanProviderTransport =
+  | "native_tool"
+  | "text_envelope"
+  | "structured_response";
 
 export function isPlanSubmissionStage(stage: PlanModelStage): boolean {
   return stage === "synthesis";
@@ -304,7 +305,7 @@ export function synthesisPlanTranscript(input: {
       content: [
         ...(input.compactRecovery
           ? [
-              "The preceding synthesis request was closed at the transport deadline. This is the single bounded recovery request: use only this compact evidence packet and submit one complete plan now.",
+              "The preceding synthesis request did not produce a complete submission. Use only this compact evidence packet and submit one complete plan now.",
             ]
           : []),
         [

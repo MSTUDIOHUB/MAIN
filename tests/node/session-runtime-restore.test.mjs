@@ -107,6 +107,9 @@ const { buildPlanApprovalIdentity } = loadTranspiledModuleSync(
 const { hashPlanCandidate, hashPlanProjection } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planContract.ts"),
 );
+const runtimeV2 = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"),
+);
 
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
@@ -1050,7 +1053,7 @@ test("FIFO acknowledgement saves the live Session without revoking its seeded su
   }
 });
 
-test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX transport", async () => {
+test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a transient OMLX failure at the lifecycle boundary", async () => {
   const originalState = useAppStore.getState();
   const realSendMessage = originalState.sendMessage;
   const workspace = "/tmp/fifo-omlx-bootstrap-owner";
@@ -1067,6 +1070,8 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
   const receipt = queue.entries[0].receipt;
   const defaultTauriInvoke = tauriInvoke;
   const originalWindow = globalThis.window;
+  const defaultDateNow = Date.now;
+  let fixtureNow = defaultDateNow();
   const localStorageValues = new Map();
   let signalTreeStarted;
   const treeStarted = new Promise((resolve) => {
@@ -1086,6 +1091,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
         removeItem: (key) => localStorageValues.delete(String(key)),
       },
     };
+    Date.now = () => fixtureNow;
     tauriInvoke = async (command, args) => {
       if (command === "get_project_skeleton") {
         signalTreeStarted();
@@ -1094,6 +1100,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
       }
       if (command === "start_chat_stream") {
         streamInvocations.push(args);
+        fixtureNow += 8 * 60_000 + 1;
         throw new Error("deterministic OMLX transport fixture failure");
       }
       if (command === "save_project_session") return args?.session ?? null;
@@ -1187,7 +1194,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
     assert.equal(ownedEvents.filter((event) => event.type === "turn.completed").length, 1);
     assert.equal(
       ownedEvents.find((event) => event.type === "run.completed")?.resultKind,
-      "error",
+      "partial",
       JSON.stringify({
         eventTypes: ownedEvents.map((event) => event.type),
         ownedEvents,
@@ -1195,12 +1202,12 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
         agentStatus: settled.agentStatus,
       }),
     );
-    assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "error");
-    assert.equal(turn?.status, "error");
-    assert.equal(turn?.runtimeOutcome?.resultKind, "error");
+    assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "partial");
+    assert.equal(turn?.status, "done");
+    assert.equal(turn?.runtimeOutcome?.resultKind, "partial");
     assert.equal(settled.isGenerating, false);
-    assert.equal(settled.agentStatus, "error");
-    assert.match(turn?.summary || "", /turn failed|did not finish/i);
+    assert.equal(settled.agentStatus, "idle");
+    assert.match(turn?.summary || "", /生命周期时限|lifecycle/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
         block.type === "agent" &&
@@ -1211,6 +1218,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and reaches the OMLX tr
     );
   } finally {
     releaseTree?.();
+    Date.now = defaultDateNow;
     tauriInvoke = defaultTauriInvoke;
     if (originalWindow === undefined) delete globalThis.window;
     else globalThis.window = originalWindow;
@@ -8046,4 +8054,311 @@ test("an unrelated durable Turn stays queued during pending review and takes FIF
   } finally {
     useAppStore.setState(originalState, true);
   }
+});
+
+test("an emergency terminal envelope restores through the canonical Turn final and cannot revive its paused run", () => {
+  const workspace = "/tmp/runtime-v2-emergency-restore";
+  const sessionKey = `${workspace}:99`;
+  const sessionEpoch = "epoch-emergency-restore";
+  const turnId = "turn-emergency-restore";
+  const runId = "run-emergency-restore";
+  const owner = {
+    workspaceKey: workspace,
+    sessionKey,
+    sessionEpoch,
+    clientSubmissionId: "submission-emergency-restore",
+    turnId,
+  };
+  const run = {
+    sessionKey,
+    sessionEpoch,
+    turnId,
+    runId,
+    parentRunId: null,
+    attemptId: runId,
+  };
+  const envelope = runtimeV2.createRuntimeV2EmergencyTerminalEnvelope({
+    owner,
+    run,
+    resultKind: "partial",
+    reasonCode: "checkpoint_persist_failed",
+    language: "zh",
+    at: 1_800_000_000_000,
+    lastRevision: 0,
+    hasMutation: true,
+  });
+  const contaminatedEnvelope = {
+    ...envelope,
+    providerText: "must-not-restore",
+    events: [{ raw: "must-not-restore" }],
+  };
+  contaminatedEnvelope.store = contaminatedEnvelope;
+
+  const restored = normalizeSessionRuntimeSnapshot({
+    runtimeV2EmergencyTerminalEnvelopes: {
+      [turnId]: contaminatedEnvelope,
+    },
+    harnessRunMarker: {
+      schemaVersion: 1,
+      instanceId: "instance-emergency-restore",
+      sessionKey,
+      workspace,
+      sessionId: 99,
+      turnId,
+      runId,
+      activeRunId: runId,
+      activeParentRunId: null,
+      parentRunId: null,
+      status: "running",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      startedAt: 1_799_999_999_000,
+      updatedAt: 1_799_999_999_500,
+      closedAt: null,
+      closeReason: null,
+    },
+    taskFlow: [{
+      id: 1,
+      turnId,
+      type: "agent",
+      content: "",
+      streaming: true,
+      visibility: "assistant_final",
+    }],
+    conversationTurns: [{
+      id: turnId,
+      clientSubmissionId: owner.clientSubmissionId,
+      userPrompt: "修复并验证当前文件",
+      title: "修复当前文件",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "executing",
+      summary: "",
+      blockIds: [1],
+      collapsed: false,
+      createdAt: 1_799_999_999_000,
+    }],
+    runtimeEvents: [
+      {
+        schemaVersion: 2,
+        type: "run.started",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 1_799_999_999_000,
+        runId,
+        parentRunId: null,
+      },
+      {
+        schemaVersion: 2,
+        type: "run.paused",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 1_799_999_999_500,
+        runId,
+        parentRunId: null,
+        reason: "application_restarted",
+        message: "This obsolete pause must not revive the run.",
+      },
+    ],
+  }, {
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+  });
+
+  assert.ok(restored);
+  assert.equal(restored.harnessRunMarker.status, "completed");
+  assert.equal(
+    restored.harnessRunMarker.closeReason,
+    "checkpoint_persist_failed",
+  );
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(
+    restored.conversationTurns[0].runtimeOutcome.resultKind,
+    "partial",
+  );
+  assert.equal(
+    restored.runtimeEvents.some((event) =>
+      event.type === "run.paused" &&
+      event.threadId === sessionKey &&
+      event.turnId === turnId &&
+      event.runId === runId
+    ),
+    false,
+  );
+  assert.equal(
+    restored.runtimeEvents.filter((event) =>
+      event.type === "run.completed" &&
+      event.turnId === turnId &&
+      event.runId === runId
+    ).length,
+    1,
+  );
+  assert.equal(
+    restored.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" && event.turnId === turnId
+    ).length,
+    1,
+  );
+  const final = restored.taskFlow.find((block) =>
+    block.type === "agent" &&
+    block.turnId === turnId &&
+    block.visibility === "assistant_final"
+  );
+  assert.ok(final);
+  assert.match(final.content, /运行时检查点未能持久化/);
+  assert.equal(final.streaming, false);
+  assert.deepEqual(
+    Object.keys(
+      restored.runtimeV2EmergencyTerminalEnvelopes[turnId],
+    ).sort(),
+    [
+      "at",
+      "hasMutation",
+      "lastRevision",
+      "owner",
+      "reason",
+      "reasonCode",
+      "resultKind",
+      "run",
+      "schemaVersion",
+    ],
+  );
+});
+
+test("restore rejects an emergency terminal envelope whose checkpoint revision drifted", () => {
+  const workspace = "/tmp/runtime-v2-emergency-revision";
+  const sessionKey = `${workspace}:100`;
+  const sessionEpoch = "epoch-emergency-revision";
+  const turnId = "turn-emergency-revision";
+  const runId = "run-emergency-revision";
+  const owner = {
+    workspaceKey: workspace,
+    sessionKey,
+    sessionEpoch,
+    clientSubmissionId: "submission-emergency-revision",
+    turnId,
+  };
+  const run = {
+    sessionKey,
+    sessionEpoch,
+    turnId,
+    runId,
+    parentRunId: null,
+    attemptId: runId,
+  };
+  let ordinal = 0;
+  const event = (aggregate, type, fields) => ({
+    schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence: aggregate ? aggregate.nextSequence : 0,
+    eventId: `restore-revision-${++ordinal}`,
+    at: aggregate ? aggregate.updatedAt + 1 : 1,
+    type,
+    ...fields,
+  });
+  let aggregate = runtimeV2.transition(
+    null,
+    event(null, "turn.admitted", {
+      turn: owner,
+      strategy: "execute",
+      objective: "Repair",
+      constraints: [],
+      acceptanceCriteria: ["Repair works"],
+      acceptanceCriterionIds: ["criterion-user-objective"],
+      acceptanceEvidenceRequirements: ["behavioral"],
+    }),
+  );
+  aggregate = runtimeV2.transition(
+    aggregate,
+    event(aggregate, "run.started", {
+      run,
+      phase: "observing",
+    }),
+  );
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({
+    revision: aggregate.events.length,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const staleEnvelope =
+    runtimeV2.createRuntimeV2EmergencyTerminalEnvelope({
+      owner,
+      run,
+      resultKind: "error",
+      reasonCode: "checkpoint_size_budget_exceeded",
+      language: "en",
+      at: 1_800_000_000_000,
+      lastRevision: checkpoint.revision - 1,
+      hasMutation: false,
+    });
+
+  const restored = normalizeSessionRuntimeSnapshot({
+    runtimeV2Checkpoints: { [turnId]: checkpoint },
+    runtimeV2EmergencyTerminalEnvelopes: {
+      [turnId]: staleEnvelope,
+    },
+    harnessRunMarker: {
+      schemaVersion: 1,
+      instanceId: "instance-emergency-revision",
+      sessionKey,
+      workspace,
+      sessionId: 100,
+      turnId,
+      runId,
+      activeRunId: runId,
+      activeParentRunId: null,
+      parentRunId: null,
+      status: "running",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      startedAt: 1_799_999_999_000,
+      updatedAt: 1_799_999_999_500,
+      closedAt: null,
+      closeReason: null,
+    },
+    conversationTurns: [{
+      id: turnId,
+      clientSubmissionId: owner.clientSubmissionId,
+      userPrompt: "Repair",
+      title: "Repair",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "executing",
+      summary: "",
+      blockIds: [],
+      collapsed: false,
+      createdAt: 1_799_999_999_000,
+    }],
+    runtimeEvents: [{
+      schemaVersion: 2,
+      type: "run.started",
+      threadId: sessionKey,
+      turnId,
+      timestampMs: 1_799_999_999_000,
+      runId,
+      parentRunId: null,
+    }],
+  }, {
+    workspacePath: workspace,
+    expectedSessionKey: sessionKey,
+    expectedSessionEpoch: sessionEpoch,
+  });
+
+  assert.ok(restored);
+  assert.deepEqual(restored.runtimeV2EmergencyTerminalEnvelopes, {});
+  assert.equal(restored.harnessRunMarker.status, "paused");
+  assert.equal(restored.conversationTurns[0].status, "paused");
+  assert.equal(
+    restored.runtimeEvents.some((candidate) =>
+      candidate.type === "turn.completed" &&
+      candidate.turnId === turnId
+    ),
+    false,
+  );
 });

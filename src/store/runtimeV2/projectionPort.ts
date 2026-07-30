@@ -19,6 +19,7 @@ import type {
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import { reconcileRuntimeV2SubagentEvents } from "./subagentProjection";
+import { localizedRuntimeV2FinalProjection } from "./projectionTerminal";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -403,28 +404,6 @@ function ensureRuntimeV2RunStartedEvent(
   }));
 }
 
-function localizedRuntimeV2FinalProjection(
-  aggregate: TurnAggregateV1,
-  projection: RuntimeV2Projection,
-  language: "zh" | "en",
-): RuntimeV2Projection {
-  if (aggregate.terminalOutcome?.reason !== "provider_transport_exhausted") {
-    return projection;
-  }
-  const markdown = language === "en"
-    ? [
-        "### Execution failed",
-        "",
-        "The task did not finish because every bounded model-provider transport attempt failed. No model response was accepted, and all committed evidence was preserved.",
-      ].join("\n")
-    : [
-        "### 执行失败",
-        "",
-        "模型服务的有限传输重试均失败，本轮没有接受任何模型回复；已经保留全部已提交证据。",
-      ].join("\n");
-  return { ...projection, markdown };
-}
-
 function ownsProjection(state: any, aggregate: TurnAggregateV1): boolean {
   const run = aggregate.run?.identity;
   const marker = state?.harnessRunMarker;
@@ -462,12 +441,13 @@ function hasProjectionBlock(
   taskFlow: readonly TaskBlock[],
   turnId: string,
   projection: RuntimeV2Projection,
+  visibility: "assistant_update" | "assistant_final",
 ): boolean {
   return taskFlow.some((block) =>
     block.turnId === turnId &&
     block.type === "agent" &&
     block.content === projection.markdown &&
-    (block.visibility === "assistant_update" || block.visibility === "assistant_final"),
+    block.visibility === visibility,
   );
 }
 
@@ -540,7 +520,12 @@ export function createRuntimeV2ProjectionPort(
             },
           }));
         } else if (audience === "chat_milestone") {
-          if (!hasProjectionBlock(taskFlow, run.turnId, projection)) {
+          if (!hasProjectionBlock(
+            taskFlow,
+            run.turnId,
+            projection,
+            "assistant_update",
+          )) {
             const block: TaskBlock = {
               id: input.nextTaskId(),
               turnId: run.turnId,
@@ -599,7 +584,12 @@ export function createRuntimeV2ProjectionPort(
             input.language,
           );
           runtimeEvents = closeRuntimeV2CapsuleEvents(runtimeEvents, aggregate, timestampMs);
-          if (!hasProjectionBlock(taskFlow, run.turnId, visibleProjection)) {
+          if (!hasProjectionBlock(
+            taskFlow,
+            run.turnId,
+            visibleProjection,
+            "assistant_final",
+          )) {
             const block: TaskBlock = {
               id: input.nextTaskId(),
               turnId: run.turnId,

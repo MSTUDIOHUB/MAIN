@@ -9,6 +9,21 @@ export const READ_FILE_TOOL_NAMES = new Set([
   "read_file",
 ]);
 
+const SAFE_WORKSPACE_READ_TOOL_NAMES = new Set([
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "repo_map_search",
+  "repo_map_context",
+  "code_ast_query",
+  "find_symbol_references",
+  "read_file",
+  "get_file_outline",
+  "git_status",
+  "git_diff",
+  "get_project_skeleton",
+]);
+
 export const MUTATION_TOOL_NAMES = new Set([
   "apply_patch",
   "replace_in_file",
@@ -160,10 +175,12 @@ function createRun(event, runIndex) {
     mutationEditorFallbacks: 0,
     maxAvailableContextEntries: 0,
     maxDroppedContextEntries: 0,
+    maxStrategyPivotRevision: 0,
     contextAnchorLosses: 0,
+    discardedSafeReadBatches: 0,
+    semanticProtocolFallbacks: 0,
     terminalResultKind: null,
     terminalReason: null,
-    terminalContractCoverageComplete: null,
     staticOnlyBehavioralCriterionIds: [],
     warnings: [],
     toolCallsByName: {},
@@ -182,7 +199,11 @@ function extractToolNames(payload) {
     ? payload.names
     : Array.isArray(payload.toolNames)
       ? payload.toolNames
-      : [];
+      : payload.toolNames &&
+          typeof payload.toolNames === "object" &&
+          Array.isArray(payload.toolNames.names)
+        ? payload.toolNames.names
+        : [];
   return names
     .filter((name) => typeof name === "string" && name.trim())
     .map((name) => name.trim());
@@ -254,10 +275,21 @@ function applyEventToRun(run, event) {
     if (payload.protocolCode === "tool_arguments_rejected") {
       run.invalidValidationAttempts += 1;
     }
+    if (
+      payload.transportFallbackAllowed === true &&
+      payload.protocolCode !== "required_tool_missing"
+    ) {
+      run.semanticProtocolFallbacks += 1;
+    }
   }
   if (event.event === "store.runtime_v2_provider_transport_failed") {
     run.providerTransportFailures += 1;
-    if (payload.timedOut === true) run.providerRequestTimeouts += 1;
+    if (
+      payload.timedOut === true ||
+      /timeout/i.test(String(payload.error || ""))
+    ) {
+      run.providerRequestTimeouts += 1;
+    }
   }
   if (event.event === "store.runtime_v2_tool_deadline_exceeded") {
     run.toolDeadlineExceeded += 1;
@@ -270,6 +302,10 @@ function applyEventToRun(run, event) {
     run.maxDroppedContextEntries = Math.max(
       run.maxDroppedContextEntries,
       asNonNegativeInteger(payload.droppedEvidenceEntries),
+    );
+    run.maxStrategyPivotRevision = Math.max(
+      run.maxStrategyPivotRevision,
+      asNonNegativeInteger(payload.strategyPivotRevision),
     );
     const available = payload.contextSources &&
       typeof payload.contextSources === "object"
@@ -369,6 +405,16 @@ function applyEventToRun(run, event) {
     run.discardedToolCalls += Array.isArray(payload.discardedToolNames)
       ? payload.discardedToolNames.length
       : Math.max(0, asNonNegativeInteger(payload.originalToolCount) - 1);
+    if (
+      !Array.isArray(payload.acceptedToolNames) &&
+      Array.isArray(payload.discardedToolNames) &&
+      payload.discardedToolNames.length > 0 &&
+      payload.discardedToolNames.every((name) =>
+        SAFE_WORKSPACE_READ_TOOL_NAMES.has(name)
+      )
+    ) {
+      run.discardedSafeReadBatches += 1;
+    }
   }
   if (event.event === "store.runtime_v2_mutation_preflight_rejected") {
     run.mutationPreflightRejections += 1;
@@ -444,10 +490,6 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_execute_terminal") {
     run.terminalResultKind = asString(payload.resultKind);
     run.terminalReason = asString(payload.reason);
-    run.terminalContractCoverageComplete =
-      typeof payload.contractCoverageComplete === "boolean"
-        ? payload.contractCoverageComplete
-        : null;
     run.staticOnlyBehavioralCriterionIds =
       Array.isArray(payload.staticOnlyBehavioralCriterionIds)
         ? payload.staticOnlyBehavioralCriterionIds
@@ -517,13 +559,6 @@ function finalizeRunWarnings(run) {
     warnings.push("parent_did_not_resume_after_subagent_failure");
   }
   if (
-    run.runtimeVersion === "v2" &&
-    run.terminalResultKind === "success" &&
-    run.terminalContractCoverageComplete !== true
-  ) {
-    warnings.push("success_without_execution_contract_coverage");
-  }
-  if (
     run.terminalResultKind &&
     run.recoveryExhaustions > 0 &&
     (
@@ -542,6 +577,19 @@ function finalizeRunWarnings(run) {
     run.providerProtocolFailures === 0
   ) {
     warnings.push("non_provider_failure_marked_transport_exhaustion");
+  }
+  if (run.discardedSafeReadBatches > 0) {
+    warnings.push("safe_read_batch_discarded");
+  }
+  if (run.semanticProtocolFallbacks > 0) {
+    warnings.push("semantic_protocol_used_transport_fallback");
+  }
+  if (
+    run.providerProtocolFailures >= 3 &&
+    run.providerRequests >= 3 &&
+    run.maxStrategyPivotRevision === 0
+  ) {
+    warnings.push("provider_livelock_without_strategy_pivot");
   }
   run.warnings = warnings;
 }
@@ -599,7 +647,10 @@ function buildAggregate(runs) {
     mutationEditorFallbacks: 0,
     maxAvailableContextEntries: 0,
     maxDroppedContextEntries: 0,
+    maxStrategyPivotRevision: 0,
     contextAnchorLosses: 0,
+    discardedSafeReadBatches: 0,
+    semanticProtocolFallbacks: 0,
     workflowModes: {},
     runtimeIntents: {},
     runtimeVersions: {},
@@ -663,6 +714,8 @@ function buildAggregate(runs) {
       "mutationRequestsWithoutLease",
       "mutationEditorFallbacks",
       "contextAnchorLosses",
+      "discardedSafeReadBatches",
+      "semanticProtocolFallbacks",
     ]) {
       aggregate[field] += run[field];
     }
@@ -677,6 +730,10 @@ function buildAggregate(runs) {
     aggregate.maxDroppedContextEntries = Math.max(
       aggregate.maxDroppedContextEntries,
       run.maxDroppedContextEntries,
+    );
+    aggregate.maxStrategyPivotRevision = Math.max(
+      aggregate.maxStrategyPivotRevision,
+      run.maxStrategyPivotRevision,
     );
     if (run.firstMutationIteration !== null) {
       aggregate.runsWithMutation += 1;

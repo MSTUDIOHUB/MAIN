@@ -18,7 +18,6 @@ import {
   buildRuntimeV2MilestoneProjection,
   buildRuntimeV2TimelineProjection,
 } from "./projection";
-import { runtimeV2ActionFingerprint } from "./recovery";
 import { transition } from "./reducer";
 import {
   decideRuntimeV2CommandFailureRecovery,
@@ -27,6 +26,10 @@ import {
   repeatsRuntimeV2ProjectionInCurrentPhase,
   shouldRecordRuntimeV2SoftSignal,
 } from "./controllerRecovery";
+import {
+  referencedRuntimeV2SubagentEvidenceIds,
+  runtimeV2SubagentHandoffApplicationSource,
+} from "./subagentHandoff";
 export interface RuntimeV2ControllerSnapshot {
   readonly aggregate: TurnAggregateV1 | null;
   readonly revision: number;
@@ -266,15 +269,65 @@ export class RuntimeV2Controller {
   async schedule(command: RuntimeV2Command): Promise<TurnAggregateV1> {
     const state = this.requireAggregate();
     if (!state.run) throw new Error("Runtime v2 Run is not active.");
-    const next = await this.apply(asEvent({
+    const scheduledEvent = asEvent({
       ...this.eventBase(),
       type: "command.scheduled",
       run: state.run.identity,
       command,
-    }));
+    });
+    await this.apply(scheduledEvent);
+    await this.recordAppliedSubagentHandoffs(scheduledEvent);
+    const next = this.requireAggregate();
     await this.publish(buildRuntimeV2CapsuleProjection(next, this.ports.clockId.nextId("capsule")));
     await this.publish(buildRuntimeV2TimelineProjection(next, command, this.ports.clockId.nextId("timeline")));
     return this.requireAggregate();
+  }
+
+  private async recordAppliedSubagentHandoffs(
+    sourceEvent: RuntimeV2Event,
+  ): Promise<void> {
+    const source = runtimeV2SubagentHandoffApplicationSource(sourceEvent);
+    if (!source) return;
+    const state = this.requireAggregate();
+    if (!state.run) return;
+    const alreadyApplied = new Map<string, Set<string>>();
+    for (const event of state.events) {
+      if (event.type !== "subagent.handoff_applied") continue;
+      const evidenceIds = alreadyApplied.get(event.jobId) || new Set<string>();
+      for (const evidenceId of event.evidenceIds) {
+        evidenceIds.add(evidenceId);
+      }
+      alreadyApplied.set(event.jobId, evidenceIds);
+    }
+    const deliveries = state.events.filter(
+      (event): event is Extract<
+        RuntimeV2Event,
+        { readonly type: "subagent.handoff_delivered" }
+      > =>
+        event.type === "subagent.handoff_delivered" &&
+        event.sequence < sourceEvent.sequence,
+    );
+    for (const delivery of deliveries) {
+      const used = alreadyApplied.get(delivery.jobId) || new Set<string>();
+      const evidenceIds = referencedRuntimeV2SubagentEvidenceIds({
+        sourceEvent,
+        evidenceIds: delivery.evidenceIds,
+      }).filter((evidenceId) => !used.has(evidenceId));
+      if (evidenceIds.length === 0) continue;
+      await this.apply(asEvent({
+        ...this.eventBase(),
+        type: "subagent.handoff_applied",
+        run: state.run.identity,
+        jobId: delivery.jobId,
+        evidenceIds,
+        sourceEventId: sourceEvent.eventId,
+        source,
+      }));
+      alreadyApplied.set(
+        delivery.jobId,
+        new Set([...used, ...evidenceIds]),
+      );
+    }
   }
 
   async driveOnce(input: RuntimeV2DecisionInput = {}): Promise<boolean> {
@@ -287,24 +340,6 @@ export class RuntimeV2Controller {
     const state = this.requireAggregate();
     const next = decideNextCommands(state, input)[0];
     if (!next) return false;
-    if (next.kind === "finalize_turn" && next.payload.recoveryExhausted === true) {
-      const latest = this.requireAggregate();
-      if (!latest.recovery.exhausted && latest.run) {
-        const recoveryScope = next.payload.recoveryScope;
-        await this.apply(asEvent({
-          ...this.eventBase(),
-          type: "recovery.exhausted",
-          run: latest.run.identity,
-          scope: recoveryScope === "transport" ||
-              recoveryScope === "context" ||
-              recoveryScope === "diagnostic"
-            ? recoveryScope
-            : "action",
-          fingerprint: String(next.payload.recoveryFingerprint || runtimeV2ActionFingerprint(next)),
-          reason: String(next.payload.resultReason || "recovery_budget_exhausted"),
-        }));
-      }
-    }
     try {
       await this.schedule(next);
       await this.execute(next);
@@ -320,33 +355,21 @@ export class RuntimeV2Controller {
   private async execute(command: RuntimeV2Command): Promise<void> {
     try {
       const signal = this.abortSignal || new AbortController().signal;
-      if (
-        command.payload.repeatedActionRejected === true &&
-        command.kind !== "execute_tool" &&
-        command.kind !== "execute_validation"
-      ) {
-        throw new Error(
-          "RUNTIME_V2_REPEATED_ACTION_REJECTED: choose a different structured action.",
-        );
-      }
       switch (command.kind) {
-      case "commit_execution_contract":
-        // Read-only compatibility for an in-flight checkpoint created by the
-        // removed protocol. The scheduled command is settled by the ordinary
-        // failure path and the parent resumes the inspect-edit-verify loop.
-        throw new Error("RUNTIME_V2_LEGACY_COMMAND_UNRESUMABLE");
       case "request_model": {
         const result = await this.ports.provider.request({ run: command.run, command, signal });
-        const applied = await this.apply(asEvent({
+        const providerEvent = asEvent({
           ...this.eventBase(),
           type: "provider.responded",
           run: command.run,
           idempotencyKey: command.idempotencyKey,
           result,
-        }));
+        });
+        const applied = await this.apply(providerEvent);
         await this.publishMilestoneIfEligible(
           applied.events[applied.events.length - 1],
         );
+        await this.recordAppliedSubagentHandoffs(providerEvent);
         const responseMode = String(command.payload.mode || "").trim();
         if (
           result.toolCalls.length === 0 &&
@@ -368,6 +391,10 @@ export class RuntimeV2Controller {
         const event = await this.ports.tool.execute({ run: command.run, command, signal });
         const rebased = this.rebasePortEvent(event);
         const repeatedSourceEvidence =
+          (
+            rebased.type === "tool.completed" &&
+            rebased.receiptOrigin === "replayed"
+          ) ||
           repeatsCommittedRuntimeV2SourceEvidence({
             aggregate: this.requireAggregate(),
             event: rebased,
@@ -554,7 +581,7 @@ export class RuntimeV2Controller {
         scope: decision.scope,
         fingerprint: decision.fingerprint,
       }));
-    } else {
+    } else if (decision.kind === "hard_stop") {
       await this.apply(asEvent({
         ...this.eventBase(),
         type: "recovery.exhausted",
@@ -563,7 +590,6 @@ export class RuntimeV2Controller {
         fingerprint: decision.fingerprint,
         reason: decision.reason,
       }));
-      return;
     }
     if (decision.publish) {
       await this.publish(buildRuntimeV2CapsuleProjection(

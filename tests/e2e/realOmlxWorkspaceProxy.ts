@@ -30,6 +30,12 @@ export interface RealOmlxSourceSyntaxCheckResult {
   readonly errorCount: number;
   readonly firstErrorLine: number | null;
   readonly firstErrorColumn: number | null;
+  readonly errors: ReadonlyArray<{
+    readonly line: number;
+    readonly column: number;
+    readonly kind: string;
+  }>;
+  readonly errorsTruncated: boolean;
 }
 
 function collectBindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
@@ -128,6 +134,8 @@ export function checkRealOmlxSourceSyntax(
       errorCount: 0,
       firstErrorLine: null,
       firstErrorColumn: null,
+      errors: [],
+      errorsTruncated: false,
     };
   }
 
@@ -138,7 +146,7 @@ export function checkRealOmlxSourceSyntax(
     true,
     scriptKind,
   );
-  const positions = (
+  const diagnostics = (
     (source as ts.SourceFile & {
       parseDiagnostics?: readonly ts.DiagnosticWithLocation[];
     }).parseDiagnostics || []
@@ -147,20 +155,33 @@ export function checkRealOmlxSourceSyntax(
       diagnostic.category === ts.DiagnosticCategory.Error &&
       diagnostic.start !== undefined
     )
-    .map((diagnostic) => Number(diagnostic.start));
+    .map((diagnostic) => ({
+      position: Number(diagnostic.start),
+      kind: `typescript_${diagnostic.code}`,
+    }));
   const seenExports = new Set<string>();
   for (const statement of source.statements) {
     for (const exported of exportedNames(statement, source)) {
       if (seenExports.has(exported.name)) {
-        positions.push(exported.position);
+        diagnostics.push({
+          position: exported.position,
+          kind: "duplicate_export",
+        });
       } else {
         seenExports.add(exported.name);
       }
     }
   }
-  positions.sort((left, right) => left - right);
-  const uniquePositions = [...new Set(positions)];
-  const first = uniquePositions[0];
+  diagnostics.sort((left, right) =>
+    left.position - right.position ||
+    left.kind.localeCompare(right.kind)
+  );
+  const uniqueDiagnostics = diagnostics.filter(
+    (diagnostic, index, all) =>
+      index === 0 ||
+      diagnostic.position !== all[index - 1]?.position,
+  );
+  const first = uniqueDiagnostics[0]?.position;
   const location = first === undefined
     ? null
     : source.getLineAndCharacterOfPosition(first);
@@ -168,10 +189,21 @@ export function checkRealOmlxSourceSyntax(
     path: rawPath,
     language: extension.slice(1),
     applicable: true,
-    hasErrors: uniquePositions.length > 0,
-    errorCount: uniquePositions.length,
+    hasErrors: uniqueDiagnostics.length > 0,
+    errorCount: uniqueDiagnostics.length,
     firstErrorLine: location ? location.line + 1 : null,
     firstErrorColumn: location ? location.character + 1 : null,
+    errors: uniqueDiagnostics.slice(0, 32).map((diagnostic) => {
+      const position = source.getLineAndCharacterOfPosition(
+        diagnostic.position,
+      );
+      return {
+        line: position.line + 1,
+        column: position.character + 1,
+        kind: diagnostic.kind,
+      };
+    }),
+    errorsTruncated: uniqueDiagnostics.length > 32,
   };
 }
 
@@ -1051,7 +1083,16 @@ export async function readRealOmlxWorkspaceFileWindow(
     totalChars,
     returnedChars: selectedChars,
     truncated,
-    nextStartLine: truncated && returnedEndLine > 0 ? returnedEndLine + 1 : null,
+    nextStartLine:
+      (
+          scanTruncated ||
+          moreRequestedLines ||
+          moreScannedLines ||
+          lineTruncated
+        ) &&
+        returnedEndLine > 0
+        ? returnedEndLine + 1
+        : null,
     scanTruncated,
     scannedBytes: bytesToScan,
     sizeBytes: metadata.size,

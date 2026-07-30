@@ -31,6 +31,7 @@ export interface CreateSubmitRuntimeContextInput {
   mentionSnapshot: string[];
   remoteFeishu: FeishuRemoteContext | undefined;
   workspaceTree: string | null;
+  workspaceInstructionContext?: string;
   gameStudioConfigForTurn: StudioConfig | null;
   abortCtrl: AbortController;
   timerInterval: unknown;
@@ -67,6 +68,9 @@ export function createSubmitRuntimeContext(
     mentionSnapshot: input.mentionSnapshot,
     remoteFeishu: input.remoteFeishu,
     workspaceTree: input.workspaceTree,
+    workspaceInstructionContext: String(
+      input.workspaceInstructionContext || "",
+    ),
     gameStudioConfigForTurn: input.gameStudioConfigForTurn,
     abortCtrl: input.abortCtrl,
     timerInterval: input.timerInterval,

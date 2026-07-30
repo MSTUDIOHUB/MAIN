@@ -5,19 +5,52 @@ import type {
   RuntimeV2SubagentJob,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
-import { validateRuntimeV2ExecutionContract } from "./executionContract";
-import { workspacePathsReferToSameFile } from "../workspacePaths";
+import { validateRuntimeV2SubagentReport } from "./subagentReport";
 
-export function hasNovelRuntimeV2Evidence(
+export function appendNovelRuntimeV2Evidence(
   existing: readonly RuntimeV2EvidenceReference[],
-  incoming: readonly RuntimeV2EvidenceReference[],
-): boolean {
+  additions: readonly RuntimeV2EvidenceReference[],
+): readonly RuntimeV2EvidenceReference[] {
+  const next = [...existing];
   const known = new Set(existing.map((item) =>
     `${item.id}\u0000${item.target}\u0000${item.version || ""}`
   ));
-  return incoming.some((item) =>
-    !known.has(`${item.id}\u0000${item.target}\u0000${item.version || ""}`)
-  );
+  for (const evidence of additions) {
+    const key =
+      `${evidence.id}\u0000${evidence.target}\u0000${evidence.version || ""}`;
+    if (known.has(key)) continue;
+    known.add(key);
+    next.push(evidence);
+  }
+  return next;
+}
+
+export function isValidRuntimeV2SubagentCompletion(input: {
+  readonly state: TurnAggregateV1;
+  readonly event: Extract<
+    RuntimeV2Event,
+    { readonly type: "subagent.completed" }
+  >;
+  readonly taskKind: RuntimeV2SubagentJob["taskKind"];
+}): boolean {
+  const inheritedEvidence = input.event.inheritedEvidence || [];
+  const known = new Map(input.state.evidence.map((item) => [item.id, item]));
+  const inheritedIsKnown = inheritedEvidence.every((item) => {
+    const candidate = known.get(item.id);
+    return candidate?.kind === item.kind &&
+      candidate.target === item.target &&
+      candidate.version === item.version;
+  });
+  return inheritedIsKnown &&
+    (
+      input.event.status !== "completed" ||
+      validateRuntimeV2SubagentReport({
+        report: input.event.report,
+        evidence: input.event.evidence,
+        inheritedEvidence,
+      })
+    ) &&
+    (input.event.status !== "degraded" || input.event.evidence.length > 0);
 }
 
 export function isValidRuntimeV2SubagentJob(
@@ -37,85 +70,6 @@ export function isValidRuntimeV2SubagentJob(
     job.firstTokenAt === null &&
     job.closedAt === null &&
     job.summary === null;
-}
-
-export function isValidRuntimeV2ExecutionContractCommit(input: {
-  readonly state: TurnAggregateV1;
-  readonly event: Extract<
-    RuntimeV2Event,
-    { readonly type: "execution_contract.committed" }
-  >;
-}): boolean {
-  const { state, event } = input;
-  if (
-    state.strategy !== "execute" ||
-    (state.phase !== "observing" && state.phase !== "acting") ||
-    !validateRuntimeV2ExecutionContract({
-      contract: event.contract,
-      objective: state.objective,
-      evidence: state.evidence,
-      previous: state.executionContract,
-    })
-  ) {
-    return false;
-  }
-  const hasCommittedMutation = state.evidence.some(
-    (evidence) => evidence.kind === "mutation",
-  );
-  if (hasCommittedMutation && !state.executionContract) {
-    return false;
-  }
-  if (!state.executionContract) return true;
-  // Before the first mutation the model may freely refine scope. Once a
-  // mutation exists, every revision must be grounded in source evidence
-  // collected after the previous contract commit; a new target needs its own
-  // newly cited basis rather than borrowing an unrelated refresh.
-  if (!hasCommittedMutation) return true;
-  const previousCommitIndex = state.events.findIndex(
-    (candidate) =>
-      candidate.type === "execution_contract.committed" &&
-      candidate.contract.id === state.executionContract!.id &&
-      candidate.contract.revision ===
-        state.executionContract!.revision,
-  );
-  const postCommitSources = new Map(
-    state.events.slice(previousCommitIndex + 1).flatMap((candidate) => {
-      if (
-        candidate.type === "observation.recorded" &&
-        candidate.evidence.kind === "source" &&
-        !!candidate.evidence.version
-      ) {
-        return [[
-          candidate.evidence.id,
-          candidate.evidence.target,
-        ] as const];
-      }
-      if (candidate.type === "tool.completed") {
-        return candidate.evidence.filter((evidence) =>
-          evidence.kind === "source" && !!evidence.version
-        ).map((evidence) => [evidence.id, evidence.target] as const);
-      }
-      return [];
-    }),
-  );
-  const newTargets = event.contract.changes.filter((change) =>
-    !state.executionContract!.changes.some((previous) =>
-      previous.operation === change.operation &&
-      previous.target === change.target
-    )
-  );
-  const changesNeedingFreshBasis =
-    newTargets.length > 0 ? newTargets : event.contract.changes;
-  return changesNeedingFreshBasis.every((change) =>
-    change.basisEvidenceIds.some((id) => {
-      const evidenceTarget = postCommitSources.get(id);
-      return !!evidenceTarget &&
-        (
-          change.operation === "create" ||
-          workspacePathsReferToSameFile(evidenceTarget, change.target)
-        );
-    })
-  );
 }
 
 export function hasMatchingRuntimeV2SealedPlanAuthority(input: {

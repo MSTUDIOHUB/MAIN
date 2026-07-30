@@ -141,11 +141,6 @@ const realOmlxExecutionTimeoutMs = Math.max(
 );
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
-const completedTurnStatuses = new Set([
-  "done",
-  "completed",
-  "completed_with_changes",
-]);
 const reviewablePlanStages = new Set(["plan", "design", "bugfix", "ready_to_execute"]);
 const isMdViewerSavePathIncident =
   realOmlxFixture === "md-viewer" &&
@@ -614,6 +609,22 @@ function expectCanonicalRuntimeV2Terminal(
   expect(Number(projectedRunCompleted[0]?.timestampMs))
     .toBeLessThanOrEqual(Number(projectedTurnCompleted[0]?.timestampMs));
   return runtime;
+}
+
+function expectRuntimeV2TurnPresentationStatus(snapshot: any): void {
+  const resultKind = String(
+    snapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
+  );
+  expect([
+    "success",
+    "partial",
+    "blocked",
+    "error",
+    "canceled",
+  ]).toContain(resultKind);
+  expect(snapshot?.currentTurnStatus).toBe(
+    resultKind === "error" ? "error" : "done",
+  );
 }
 
 function expectSuccessfulPlanExecutionOrder(runtime: any): void {
@@ -1307,9 +1318,30 @@ test.beforeEach(async ({ page }) => {
       }
       return {
         name: call.name,
+        argumentHash: createHash("sha256")
+          .update(`${call.name}:${call.arguments}`)
+          .digest("hex"),
         arguments: argumentSummary,
       };
     });
+  };
+  const summarizeRuntimeV2ReasoningTail = (text: string) => {
+    let reasoning = "";
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const delta = JSON.parse(payload)?.choices?.[0]?.delta;
+        reasoning += String(
+          delta?.reasoning_content || delta?.reasoning || "",
+        );
+        if (reasoning.length > 8_000) reasoning = reasoning.slice(-8_000);
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return reasoning.replace(/\s+/g, " ").trim().slice(-2_000);
   };
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
@@ -1323,10 +1355,55 @@ test.beforeEach(async ({ page }) => {
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
+    const requestMessages = Array.isArray(parsedBody?.messages)
+      ? parsedBody.messages as Array<Record<string, unknown>>
+      : [];
+    console.log(`[real-omlx-request] ${JSON.stringify({
+      model,
+      messages: requestMessages.length,
+      approximateMessageChars: requestMessages.reduce(
+        (total, message) =>
+          total + JSON.stringify(message).length,
+        0,
+      ),
+      tools: Array.isArray(parsedBody?.tools)
+        ? parsedBody.tools.length
+        : 0,
+      toolNames: Array.isArray(parsedBody?.tools)
+        ? parsedBody.tools.map((tool) => {
+            const record = tool && typeof tool === "object"
+              ? tool as Record<string, unknown>
+              : {};
+            const fn = record.function &&
+                typeof record.function === "object"
+              ? record.function as Record<string, unknown>
+              : {};
+            return String(fn.name || "");
+          })
+        : [],
+      toolChoice: parsedBody?.tool_choice ?? null,
+      maxTokens: parsedBody?.max_tokens ?? null,
+      thinkingBudget: parsedBody?.thinking_budget ?? null,
+      temperature: parsedBody?.temperature ?? null,
+      topP: parsedBody?.top_p ?? null,
+      chatTemplateKwargs: parsedBody?.chat_template_kwargs ?? null,
+    })}`);
+    const traceContextMode =
+      String(process.env.REAL_OMLX_TRACE_CONTEXT || "");
+    const traceThisContext =
+      traceContextMode === "1" ||
+      (
+        traceContextMode === "tail" &&
+        bodyText.includes("src/main.js") &&
+        bodyText.includes("start_line")
+      );
     if (
+      traceThisContext ||
+      bodyText.includes("UNCHANGED_SOURCE_COVERAGE_REUSED") ||
       bodyText.includes("UNCHANGED_SOURCE_REPEAT_REJECTED") ||
       bodyText.includes("UNCHANGED_OBSERVATION_REPEAT_REJECTED") ||
-      bodyText.includes("REPEATED_ACTION_REJECTED")
+      bodyText.includes("REPEATED_ACTION_REJECTED") ||
+      bodyText.includes("ACTION_NOT_EXECUTED")
     ) {
       const messages = Array.isArray(parsedBody?.messages)
         ? parsedBody.messages as Array<Record<string, unknown>>
@@ -1352,10 +1429,15 @@ test.beforeEach(async ({ page }) => {
               })
             : [],
           repeatCodes: String(message.content || "").match(
-            /UNCHANGED_SOURCE_REPEAT_REJECTED|UNCHANGED_OBSERVATION_REPEAT_REJECTED|REPEATED_ACTION_REJECTED/g,
+            /UNCHANGED_SOURCE_COVERAGE_REUSED|UNCHANGED_SOURCE_REPEAT_REJECTED|UNCHANGED_OBSERVATION_REPEAT_REJECTED|REPEATED_ACTION_REJECTED|ACTION_NOT_EXECUTED/g,
           ) || [],
-          toolResultPreview: String(message.role || "") === "tool"
-            ? String(message.content || "").slice(0, 1_200)
+          systemInstructionTail: String(message.role || "") === "system"
+            ? String(message.content || "").slice(-2_000)
+            : "",
+          toolResultHeader: String(message.role || "") === "tool"
+            ? String(message.content || "")
+              .split("---CONTENT START---", 1)[0]
+              .slice(0, 1_200)
             : "",
         })),
       )}`);
@@ -1475,6 +1557,14 @@ test.beforeEach(async ({ page }) => {
           console.log(
             `[real-omlx-tool-calls] ${JSON.stringify(toolCalls)}`,
           );
+        }
+        if (process.env.REAL_OMLX_LOG_REASONING_TAIL === "1") {
+          const reasoningTail = summarizeRuntimeV2ReasoningTail(
+            stream.responseText,
+          );
+          if (reasoningTail) {
+            console.log(`[real-omlx-reasoning-tail] ${reasoningTail}`);
+          }
         }
       }
       return { done, chunk };
@@ -2929,7 +3019,7 @@ for (const model of models) {
       toolBlocks: terminalSnapshot?.toolBlocks,
       debugTail: terminalSnapshot?.debugTail,
     }).slice(-40_000)}`);
-    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    expectRuntimeV2TurnPresentationStatus(terminalSnapshot);
     const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
     expect(terminalTurnId).not.toBe("");
     const finalAssistantMessage = page.locator(
@@ -3187,7 +3277,7 @@ for (const model of models) {
       visibleTimeline: visibleTimeline.slice(-80),
     }).slice(-40_000)}`);
 
-    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    expectRuntimeV2TurnPresentationStatus(terminalSnapshot);
     expect(terminalSnapshot?.currentTurnIntent).toBe("execute");
     expect(String(terminalSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
     const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");

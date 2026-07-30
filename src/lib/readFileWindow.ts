@@ -14,6 +14,7 @@ interface NormalizedReadFileWindow {
   requestedMaxLines: number;
   requestedMaxChars: number;
   explicitWindow: boolean;
+  startChar?: number;
 }
 
 export interface ReadFileWindowRange {
@@ -43,6 +44,14 @@ export interface ReadFileWindowMetadata {
   returnedEndLine: number;
   returnedChars: number;
   nextStartLine?: number;
+  returnedStartChar?: number;
+  returnedEndChar?: number;
+  nextStartChar?: number;
+}
+
+export interface ExactReadFileWindow {
+  metadata: ReadFileWindowMetadata;
+  content: string;
 }
 
 export interface ReadFileWindowPayload {
@@ -56,6 +65,9 @@ export interface ReadFileWindowPayload {
   returnedChars?: number;
   truncated: boolean;
   nextStartLine?: number | null;
+  returnedStartChar?: number | null;
+  returnedEndChar?: number | null;
+  nextStartChar?: number | null;
 }
 
 export interface OptionalLargeFileSummary {
@@ -91,12 +103,41 @@ function parsePositiveInteger(value: unknown): number | undefined {
   return undefined;
 }
 
-function splitTextLines(content: string): string[] {
+function parseNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const rounded = Math.floor(value);
+    return rounded >= 0 ? rounded : undefined;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      const rounded = Math.floor(parsed);
+      return rounded >= 0 ? rounded : undefined;
+    }
+  }
+  return undefined;
+}
+
+function exactSourceLineRecords(content: string): string[] {
   if (!content) return [];
-  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized.split("\n");
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
+  return (content.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) || [])
+    .filter((record) => record.length > 0);
+}
+
+function sourceLineStartCharOffset(content: string, startLine: number): number {
+  if (startLine <= 1) return 0;
+  const chars = Array.from(content);
+  let line = 1;
+  for (let index = 0; index < chars.length; index += 1) {
+    if (chars[index] === "\r" && chars[index + 1] === "\n") {
+      index += 1;
+    } else if (chars[index] !== "\r" && chars[index] !== "\n") {
+      continue;
+    }
+    line += 1;
+    if (line === startLine) return index + 1;
+  }
+  return chars.length;
 }
 
 function normalizeWindowArgs(
@@ -107,7 +148,12 @@ function normalizeWindowArgs(
   const explicitEndLine = parsePositiveInteger(args.end_line);
   const explicitMaxLines = parsePositiveInteger(args.max_lines);
   const explicitMaxChars = parsePositiveInteger(args.max_chars);
-  const explicitWindow = !!explicitStartLine || !!explicitEndLine || !!explicitMaxLines;
+  const explicitStartChar = parseNonNegativeInteger(args.start_char);
+  const explicitWindow =
+    !!explicitStartLine ||
+    !!explicitEndLine ||
+    !!explicitMaxLines ||
+    explicitStartChar !== undefined;
   const requestedMaxLines = Math.min(
     explicitMaxLines ?? DEFAULT_WINDOW_MAX_LINES,
     MAX_REQUESTED_WINDOW_LINES,
@@ -118,8 +164,16 @@ function normalizeWindowArgs(
   );
   const startLine = Math.min(Math.max(explicitStartLine ?? 1, 1), Math.max(totalLines, 1));
   const maxLineEnd = startLine + requestedMaxLines - 1;
+  // Some providers advance `start_line` from the previous nextStartLine but
+  // accidentally retain that previous window's end_line. Treat the now
+  // reversed end as stale instead of collapsing the continuation to one
+  // line; otherwise the file can never reach complete same-version coverage.
+  const usableEndLine =
+    explicitEndLine !== undefined && explicitEndLine >= startLine
+      ? explicitEndLine
+      : undefined;
   const requestedEndLine = Math.min(
-    explicitEndLine ? Math.min(explicitEndLine, maxLineEnd) : maxLineEnd,
+    usableEndLine ? Math.min(usableEndLine, maxLineEnd) : maxLineEnd,
     Math.max(totalLines, 1),
   );
 
@@ -129,6 +183,9 @@ function normalizeWindowArgs(
     requestedMaxLines,
     requestedMaxChars,
     explicitWindow,
+    ...(explicitStartChar !== undefined
+      ? { startChar: explicitStartChar }
+      : {}),
   };
 }
 
@@ -241,7 +298,7 @@ export function planReadFileWindowCoverage(
   };
 }
 
-function selectWindowLines(
+function selectExactWindowLines(
   lines: string[],
   startLine: number,
   requestedEndLine: number,
@@ -250,32 +307,28 @@ function selectWindowLines(
   if (lines.length === 0) {
     return { content: "", endLine: 0, lineTruncated: false };
   }
-
   const selected: string[] = [];
   let charCount = 0;
   let lineTruncated = false;
   const startIndex = startLine - 1;
   const requestedEndIndex = Math.min(requestedEndLine - 1, lines.length - 1);
-
   for (let index = startIndex; index <= requestedEndIndex; index += 1) {
     const line = lines[index] ?? "";
-    const separatorLength = selected.length > 0 ? 1 : 0;
-    const nextLength = charCount + separatorLength + line.length;
-    if (selected.length > 0 && nextLength > maxChars) break;
-    if (selected.length === 0 && nextLength > maxChars) {
-      selected.push(line.slice(0, maxChars));
-      charCount = maxChars;
+    const lineChars = Array.from(line);
+    if (selected.length > 0 && charCount + lineChars.length > maxChars) {
+      break;
+    }
+    if (selected.length === 0 && lineChars.length > maxChars) {
+      selected.push(lineChars.slice(0, maxChars).join(""));
       lineTruncated = true;
       break;
     }
     selected.push(line);
-    charCount = nextLength;
+    charCount += lineChars.length;
   }
-
-  const endLine = selected.length > 0 ? startLine + selected.length - 1 : startLine;
   return {
-    content: selected.join("\n"),
-    endLine,
+    content: selected.join(""),
+    endLine: selected.length > 0 ? startLine + selected.length - 1 : startLine,
     lineTruncated,
   };
 }
@@ -296,6 +349,9 @@ export function extractReadFileWindowMetadata(content: string): ReadFileWindowMe
   const totalChars = Number(values.get("totalChars"));
   const returnedChars = Number(values.get("returnedChars"));
   const nextStartLine = Number(values.get("nextStartLine"));
+  const returnedCharsRange = values.get("returnedCharRange") || "";
+  const returnedCharsMatch = /^(\d+)-(\d+)$/.exec(returnedCharsRange);
+  const nextStartChar = Number(values.get("nextStartChar"));
   if (!Number.isFinite(totalLines) || !Number.isFinite(totalChars) || !returnedMatch) return null;
 
   return {
@@ -309,6 +365,91 @@ export function extractReadFileWindowMetadata(content: string): ReadFileWindowMe
     returnedEndLine: Number(returnedMatch[2]),
     returnedChars: Number.isFinite(returnedChars) ? returnedChars : 0,
     ...(Number.isFinite(nextStartLine) && nextStartLine > 0 ? { nextStartLine } : {}),
+    ...(returnedCharsMatch
+      ? {
+          returnedStartChar: Number(returnedCharsMatch[1]),
+          returnedEndChar: Number(returnedCharsMatch[2]),
+        }
+      : {}),
+    ...(Number.isFinite(nextStartChar) && nextStartChar >= 0
+      ? { nextStartChar }
+      : {}),
+  };
+}
+
+/**
+ * Return source text only when the complete, standard READ_FILE_RESULT
+ * envelope is still present. Context compaction may preserve range metadata
+ * beside an excerpt; that is useful for orientation but must never become
+ * mutation authority.
+ */
+export function extractExactReadFileWindow(
+  content: string,
+): ExactReadFileWindow | null {
+  const metadata = extractReadFileWindowMetadata(content);
+  if (!metadata) return null;
+  const startMarker = "\n---CONTENT START---\n";
+  const endMarker = "\n---CONTENT END---";
+  const contentStart = content.indexOf(startMarker);
+  const contentEnd = content.lastIndexOf(endMarker);
+  if (
+    contentStart < 0 ||
+    contentEnd < contentStart + startMarker.length
+  ) {
+    return null;
+  }
+  const exactContent = content.slice(
+    contentStart + startMarker.length,
+    contentEnd,
+  );
+  if (
+    metadata.nextStartLine !== undefined &&
+    metadata.nextStartLine > metadata.totalLines
+  ) {
+    return null;
+  }
+  if (
+    metadata.totalLines === 0 &&
+    (
+      metadata.returnedStartLine !== 0 ||
+      metadata.returnedEndLine !== 0 ||
+      metadata.returnedChars !== 0 ||
+      metadata.truncated
+    )
+  ) {
+    return null;
+  }
+  if (
+    metadata.totalLines > 0 &&
+    metadata.returnedStartLine === 0 &&
+    metadata.returnedEndLine === 0 &&
+    metadata.returnedStartChar === undefined
+  ) {
+    return null;
+  }
+  if (
+    metadata.returnedStartLine === 1 &&
+    metadata.returnedEndLine === metadata.totalLines &&
+    metadata.returnedChars < metadata.totalChars
+  ) {
+    return null;
+  }
+  if (
+    metadata.returnedStartChar !== undefined &&
+    (
+      metadata.returnedStartChar !== 0 ||
+      metadata.returnedEndChar !== metadata.totalChars ||
+      metadata.returnedEndChar - metadata.returnedStartChar !==
+        metadata.returnedChars ||
+      Array.from(exactContent).length !== metadata.returnedChars ||
+      metadata.truncated
+    )
+  ) {
+    return null;
+  }
+  return {
+    metadata,
+    content: exactContent,
   };
 }
 
@@ -350,7 +491,7 @@ export function replayReadFileWindowFromResult(
   ) {
     return null;
   }
-  const cachedLines = splitTextLines(
+  const cachedLines = exactSourceLineRecords(
     previousResult.slice(contentStart + startMarker.length, contentEnd),
   );
   const expectedCachedLines =
@@ -360,12 +501,13 @@ export function replayReadFileWindowFromResult(
     normalized.startLine - metadata.returnedStartLine + 1;
   const relativeEnd =
     normalized.requestedEndLine - metadata.returnedStartLine + 1;
-  const selected = selectWindowLines(
+  const selected = selectExactWindowLines(
     cachedLines,
     relativeStart,
     relativeEnd,
     normalized.requestedMaxChars,
   );
+  if (selected.lineTruncated) return null;
   const returnedEndLine =
     normalized.startLine + selected.endLine - relativeStart;
   const moreRequestedLines =
@@ -387,10 +529,10 @@ export function replayReadFileWindowFromResult(
       endLine: returnedEndLine,
       totalLines: metadata.totalLines,
       totalChars: metadata.totalChars,
-      returnedChars: selected.content.length,
+      returnedChars: Array.from(selected.content).length,
       truncated,
       nextStartLine:
-        moreRequestedLines || moreFileLines || selected.lineTruncated
+        moreRequestedLines || moreFileLines
           ? returnedEndLine + 1
           : null,
     },
@@ -403,22 +545,71 @@ export function formatReadFileWindowForModel(
   content: string,
   args: Record<string, unknown> = {},
 ): string {
-  const lines = splitTextLines(content);
+  const lines = exactSourceLineRecords(content);
+  const totalContentChars = Array.from(content).length;
   const totalLines = lines.length;
   const normalized = normalizeWindowArgs(args, totalLines);
+  if (normalized.startChar !== undefined) {
+    const sourceChars = Array.from(content);
+    const startChar = Math.min(normalized.startChar, sourceChars.length);
+    const endChar = Math.min(
+      sourceChars.length,
+      startChar + normalized.requestedMaxChars,
+    );
+    const windowContent = sourceChars.slice(startChar, endChar).join("");
+    const truncated = startChar !== 0 || endChar !== sourceChars.length;
+    return formatReadFileWindowPayloadForModel(path, {
+      path,
+      content: windowContent,
+      startLine: 0,
+      endLine: 0,
+      totalLines,
+      totalChars: sourceChars.length,
+      returnedChars: endChar - startChar,
+      truncated,
+      returnedStartChar: startChar,
+      returnedEndChar: endChar,
+      nextStartChar: endChar < sourceChars.length ? endChar : null,
+    });
+  }
   const shouldReturnRaw =
     !normalized.explicitWindow &&
-    content.length <= normalized.requestedMaxChars &&
+    totalContentChars <= normalized.requestedMaxChars &&
     totalLines <= DEFAULT_WINDOW_MAX_LINES;
 
   if (shouldReturnRaw) return content;
 
-  const { content: windowContent, endLine, lineTruncated } = selectWindowLines(
+  const { content: windowContent, endLine, lineTruncated } =
+    selectExactWindowLines(
     lines,
     normalized.startLine,
     normalized.requestedEndLine,
     normalized.requestedMaxChars,
-  );
+    );
+  if (lineTruncated) {
+    const sourceChars = Array.from(content);
+    const startChar = sourceLineStartCharOffset(
+      content,
+      normalized.startLine,
+    );
+    const endChar = Math.min(
+      sourceChars.length,
+      startChar + normalized.requestedMaxChars,
+    );
+    return formatReadFileWindowPayloadForModel(path, {
+      path,
+      content: sourceChars.slice(startChar, endChar).join(""),
+      startLine: 0,
+      endLine: 0,
+      totalLines,
+      totalChars: totalContentChars,
+      returnedChars: endChar - startChar,
+      truncated: true,
+      returnedStartChar: startChar,
+      returnedEndChar: endChar,
+      nextStartChar: endChar < sourceChars.length ? endChar : null,
+    });
+  }
   const returnedEndLine = totalLines === 0 ? 0 : endLine;
   const returnedStartLine = totalLines === 0 ? 0 : normalized.startLine;
   const moreRequestedLines = returnedEndLine < normalized.requestedEndLine;
@@ -433,9 +624,9 @@ export function formatReadFileWindowForModel(
     `path: ${path}`,
     `truncated: ${truncated ? "true" : "false"}`,
     `totalLines: ${totalLines}`,
-    `totalChars: ${content.length}`,
+    `totalChars: ${totalContentChars}`,
     `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
-    `returnedChars: ${windowContent.length}`,
+    `returnedChars: ${Array.from(windowContent).length}`,
     nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
     "note: This is a bounded window only when truncated=true. When full-file semantics are required, continue from nextStartLine with read_file until the same-version coverage is complete; for a local decision, request only the specific missing range. Do not use run_command merely to page file contents.",
     "---CONTENT START---",
@@ -454,8 +645,33 @@ export function formatReadFileWindowPayloadForModel(
   const returnedEndLine = Math.max(0, Number(payload.endLine) || 0);
   const totalLines = Math.max(0, Number(payload.totalLines) || 0);
   const totalChars = Math.max(0, Number(payload.totalChars) || 0);
-  const returnedChars = Math.max(0, Number(payload.returnedChars ?? content.length) || 0);
-  const nextStartLine = parsePositiveInteger(payload.nextStartLine);
+  const returnedChars = Math.max(
+    0,
+    Number(payload.returnedChars ?? Array.from(content).length) || 0,
+  );
+  const requestedNextStartLine =
+    parsePositiveInteger(payload.nextStartLine);
+  const nextStartLine =
+    requestedNextStartLine !== undefined &&
+      totalLines > 0 &&
+      requestedNextStartLine > returnedEndLine &&
+      requestedNextStartLine <= totalLines
+      ? requestedNextStartLine
+      : undefined;
+  const returnedStartChar = parseNonNegativeInteger(payload.returnedStartChar);
+  const returnedEndChar = parseNonNegativeInteger(payload.returnedEndChar);
+  const nextStartChar = parseNonNegativeInteger(payload.nextStartChar);
+  const reachesLineEof =
+    payload.truncated &&
+    totalLines > 0 &&
+    returnedStartLine > 1 &&
+    returnedEndLine >= totalLines &&
+    nextStartLine === undefined;
+  const continuationNote = nextStartChar !== undefined
+    ? `note: This is a bounded character window. Continue with start_char: ${nextStartChar} on the same content version; character cursors are 0-based and end-exclusive, so adjacent results concatenate without overlap or loss. Do not use run_command merely to page file contents.`
+    : reachesLineEof
+      ? "note: This bounded line window reaches EOF. Do not request a line past totalLines; combine it with prior same-version windows, or request only an earlier missing range. Do not use run_command merely to page file contents."
+    : "note: This is a bounded window only when truncated=true. When full-file semantics are required, continue from nextStartLine with read_file until the same-version coverage is complete; for a local decision, request only the specific missing range. Do not use run_command merely to page file contents.";
   const header = [
     READ_FILE_RESULT_MARKER,
     `path: ${path}`,
@@ -467,12 +683,89 @@ export function formatReadFileWindowPayloadForModel(
     `totalChars: ${totalChars}`,
     `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
     `returnedChars: ${returnedChars}`,
+    returnedStartChar !== undefined && returnedEndChar !== undefined
+      ? `returnedCharRange: ${returnedStartChar}-${returnedEndChar}`
+      : "",
     nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
-    "note: This is a bounded window only when truncated=true. When full-file semantics are required, continue from nextStartLine with read_file until the same-version coverage is complete; for a local decision, request only the specific missing range. Do not use run_command merely to page file contents.",
+    nextStartChar !== undefined ? `nextStartChar: ${nextStartChar}` : "",
+    continuationNote,
     "---CONTENT START---",
   ].filter(Boolean);
 
   return `${header.join("\n")}\n${content}\n---CONTENT END---`;
+}
+
+function exactSourceLineCount(content: string): number {
+  if (!content) return 0;
+  const separators = content.match(/\r\n|\r|\n/g)?.length || 0;
+  return separators + (/(?:\r\n|\r|\n)$/.test(content) ? 0 : 1);
+}
+
+/**
+ * Production normally receives a versioned window from the Rust reader. A
+ * compatible older backend may return a complete small file as raw text
+ * instead. Normalize only that raw source into the same envelope; never parse
+ * it as a command result, and never trim file boundary characters.
+ */
+export function ensureVersionedReadFileResultForModel(
+  path: string,
+  output: unknown,
+  contentVersion: string,
+): string {
+  const content = typeof output === "string"
+    ? output
+    : output === null || output === undefined
+      ? ""
+      : JSON.stringify(output, null, 2);
+  const metadata = extractReadFileWindowMetadata(content);
+  if (metadata?.contentVersion) return content;
+  if (metadata) {
+    const startMarker = "\n---CONTENT START---\n";
+    const endMarker = "\n---CONTENT END---";
+    const contentStart = content.indexOf(startMarker);
+    const contentEnd = content.lastIndexOf(endMarker);
+    if (
+      contentStart < 0 ||
+      contentEnd < contentStart + startMarker.length
+    ) {
+      return content;
+    }
+    const source = content.slice(
+      contentStart + startMarker.length,
+      contentEnd,
+    );
+    return formatReadFileWindowPayloadForModel(
+      metadata.path || path,
+      {
+        path: metadata.path || path,
+        content: source,
+        contentVersion,
+        startLine: metadata.returnedStartLine,
+        endLine: metadata.returnedEndLine,
+        totalLines: metadata.totalLines,
+        totalChars: metadata.totalChars,
+        returnedChars: metadata.returnedChars,
+        truncated: metadata.truncated,
+        nextStartLine: metadata.nextStartLine,
+        returnedStartChar: metadata.returnedStartChar,
+        returnedEndChar: metadata.returnedEndChar,
+        nextStartChar: metadata.nextStartChar,
+      },
+    );
+  }
+  const totalLines = exactSourceLineCount(content);
+  const totalChars = Array.from(content).length;
+  return formatReadFileWindowPayloadForModel(path, {
+    path,
+    content,
+    contentVersion,
+    startLine: totalLines === 0 ? 0 : 1,
+    endLine: totalLines,
+    totalLines,
+    totalChars,
+    returnedChars: totalChars,
+    truncated: false,
+  });
 }
 
 export function buildReadFileWindowContinuationGuidance(content: string): string | null {
@@ -481,7 +774,9 @@ export function buildReadFileWindowContinuationGuidance(content: string): string
 
   return [
     "The earlier read_file result was a bounded window, not the whole file.",
-    metadata.nextStartLine
+    metadata.nextStartChar !== undefined
+      ? `Continue the exact same content version with read_file start_char: ${metadata.nextStartChar}; this character cursor is 0-based and end-exclusive, so adjacent results can be concatenated without overlap or loss.`
+      : metadata.nextStartLine
       ? `If full-file semantics are required, continue sequentially from line ${metadata.nextStartLine} on the same content version; if only a local decision remains, request the specific missing range, otherwise continue to mutation or validation.`
       : "For full-file semantics, continue with another same-version start_line/end_line window; otherwise request only a range needed by the current decision.",
     "Do not use run_command merely to page file contents.",

@@ -94,6 +94,64 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
+test("caller-owned Responses context reaches the wire without adapter truncation", async () => {
+  let acceptedBody = null;
+  const source = `${"SOURCE_BYTE_".repeat(2_600)}SOURCE_TAIL_SENTINEL`;
+  const { streamChatCompletion } = await loadStreamingModule(
+    async (command, args) => {
+      assert.equal(command, "proxy_request");
+      acceptedBody = JSON.parse(args.body);
+      return JSON.stringify({ output_text: "ok" });
+    },
+  );
+
+  await streamChatCompletion(
+    [{
+      role: "system",
+      content: "runtime owns this bounded decision view",
+    }, {
+      role: "user",
+      content: "repair the visible source",
+    }, {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "read-source",
+        type: "function",
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/source.js" }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "read-source",
+      content: source,
+    }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: () => {} },
+    undefined,
+    undefined,
+    4096,
+    { contextOwnership: "caller" },
+  );
+
+  assert.ok(acceptedBody);
+  const wireInput = JSON.stringify(acceptedBody.input);
+  assert.match(wireInput, /SOURCE_TAIL_SENTINEL/);
+  assert.ok(
+    wireInput.length >= source.length,
+    "the provider adapter must not silently compact caller-owned source",
+  );
+});
+
 test("aborting a non-streaming Rust proxy request cancels only its request id", async () => {
   const calls = [];
   let rejectProxy;
@@ -1200,6 +1258,99 @@ test("Ollama frontend Load failed retries through the Rust stream proxy", async 
   assert.equal(lifecycle.some((event) => event.status === "frontend_transport_retry_rust_proxy"), true);
 });
 
+test("Ollama native transport sends tools and normalizes thinking plus object tool arguments", async () => {
+  const listeners = new Map();
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(
+    async (command, args) => {
+      assert.equal(command, "start_chat_stream");
+      const body = JSON.parse(args.body);
+      assert.equal(body.tools[0].function.name, "read_file");
+      const streamId = args.streamId;
+      queueMicrotask(() => {
+        listeners.get("chat-stream-chunk")?.({
+          payload: {
+            stream_id: streamId,
+            chunk: `${JSON.stringify({
+              message: {
+                thinking: "inspect the requested source",
+                content: "",
+                tool_calls: [{
+                  function: {
+                    name: "read_file",
+                    arguments: { path: "src/main.js" },
+                  },
+                }],
+              },
+              done: false,
+            })}\n`,
+          },
+        });
+        listeners.get("chat-stream-chunk")?.({
+          payload: {
+            stream_id: streamId,
+            chunk: `${JSON.stringify({
+              message: {},
+              done: true,
+              done_reason: "tool_calls",
+            })}\n`,
+          },
+        });
+        listeners.get("chat-stream-done")?.({
+          payload: {
+            stream_id: streamId,
+            status: "success",
+          },
+        });
+      });
+    },
+    listenMock,
+  );
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "inspect src/main.js" }],
+    {
+      baseUrl: "http://127.0.0.1:11434",
+      apiKey: "not-needed",
+      model: "tool-model",
+      provider: "Ollama",
+      toolProtocol: "native",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+    undefined,
+    [{
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a workspace file",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+          },
+          required: ["path"],
+        },
+      },
+    }],
+  );
+
+  assert.equal(result.reasoningContent, "inspect the requested source");
+  assert.equal(result.finishReason, "tool_calls");
+  assert.equal(result.toolCalls[0].name, "read_file");
+  assert.equal(
+    result.toolCalls[0].arguments,
+    JSON.stringify({ path: "src/main.js" }),
+  );
+});
+
 test("local Rust streams convert cumulative text payloads into visible deltas", async () => {
   const listeners = new Map();
   const invokeCalls = [];
@@ -1499,13 +1650,19 @@ test("local Rust streams keep slow genuine visible output and native tool progre
   assert.equal(result.toolCalls[0]?.name, "read_file");
 });
 
-test("reasoning does not exempt a semantically hidden stream from the no-visible timeout", async () => {
+test("active reasoning is transport progress and is not a no-visible timeout", async () => {
   const { shouldStopNoVisibleStreamStall } = await loadStreamingModule(async () => undefined);
   assert.equal(shouldStopNoVisibleStreamStall({
     elapsedMs: 120_000,
     visibleChars: 0,
     toolCallCount: 0,
     reasoningChars: 24_000,
+  }), false);
+  assert.equal(shouldStopNoVisibleStreamStall({
+    elapsedMs: 120_000,
+    visibleChars: 0,
+    toolCallCount: 0,
+    reasoningChars: 0,
   }), true);
   assert.equal(shouldStopNoVisibleStreamStall({
     elapsedMs: 240_000,
@@ -1521,9 +1678,9 @@ test("reasoning does not exempt a semantically hidden stream from the no-visible
   }), false);
 });
 
-test("OMLX reasoning-off requests disable thinking without leaking provider extras to unknown endpoints", async () => {
+test("adapter-derived reasoning controls do not leak to unknown endpoints", async () => {
   const requests = [];
-  const run = async (provider, reasoningRequest) => {
+  const run = async (provider, reasoningRequest, maxOutputTokens) => {
     const listeners = new Map();
     const listenMock = async (eventName, handler) => {
       listeners.set(eventName, handler);
@@ -1557,16 +1714,24 @@ test("OMLX reasoning-off requests disable thinking without leaking provider extr
         useRustProxy: true,
       },
       { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+      undefined,
+      undefined,
+      maxOutputTokens,
     );
   };
 
-  await run("OMLX", "off");
-  await run("Custom Local", "off");
-  await run("OMLX", "auto");
+  await run("OMLX", "off", 4_096);
+  await run("Custom Local", "off", 4_096);
+  await run("OMLX", "auto", 4_096);
+  await run("Custom Local", "auto", 4_096);
+  await run("OMLX", "explicit", 4_096);
 
   assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false });
   assert.equal(requests[1].body.chat_template_kwargs, undefined);
   assert.equal(requests[2].body.chat_template_kwargs, undefined);
+  assert.equal(requests[2].body.thinking_budget, undefined);
+  assert.equal(requests[3].body.thinking_budget, undefined);
+  assert.equal(requests[4].body.thinking_budget, 2048);
 });
 
 test("local Rust streams stop reasoning-only runaway output", async () => {
@@ -1619,7 +1784,7 @@ test("local Rust streams stop reasoning-only runaway output", async () => {
   assert.deepEqual(tokens, []);
 });
 
-test("OpenAI-compatible chat does not replay assistant reasoning_content by default", async () => {
+test("OpenAI-compatible chat replays assistant reasoning only with a discovered provider capability", async () => {
   const listeners = new Map();
   const listenMock = async (eventName, handler) => {
     listeners.set(eventName, handler);
@@ -1684,6 +1849,45 @@ test("OpenAI-compatible chat does not replay assistant reasoning_content by defa
   assert.equal(requests[0].messages[1].reasoning_content, undefined);
   assert.equal(requests[0].messages[1].tool_calls[0].function.name, "read_file");
   assert.equal(requests[0].messages[2].reasoning_content, undefined);
+
+  await streamChatCompletion(
+    [
+      { role: "user", content: "先读文件" },
+      {
+        role: "assistant",
+        content: "我先读取。",
+        reasoning_content: "Need to inspect the file before answering.",
+        tool_calls: [{
+          id: "call_2",
+          type: "function",
+          function: { name: "read_file", arguments: "{\"path\":\"src/App.tsx\"}" },
+        }],
+      },
+      { role: "tool", content: "ok", tool_call_id: "call_2" },
+    ],
+    {
+      baseUrl: "http://127.0.0.1:8000/v1",
+      apiKey: "test-key",
+      model: "local-thinking-model",
+      apiProtocol: "openai",
+      apiFormat: "chat_completions",
+      provider: "OMLX",
+      useRustProxy: true,
+      preserveAssistantReasoning: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests[1].messages[1].reasoning_content,
+    "Need to inspect the file before answering.",
+  );
+  assert.equal(requests[1].messages[2].reasoning_content, undefined);
 });
 
 test("OpenAI Responses retries 524 failures with aggressive compact input without reasoning", async () => {

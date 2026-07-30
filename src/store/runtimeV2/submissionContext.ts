@@ -24,6 +24,8 @@ export interface RuntimeV2SubmissionContext {
   readonly phaseLanguage: "zh" | "en";
   readonly effectiveRunIntent: ResolvedRunIntent;
   readonly runtimeRunIntent: ResolvedRunIntent;
+  /** Exact live project rules captured at the Turn safe boundary. */
+  readonly workspaceInstructionContext?: string;
   readonly goalCreationAuthorization?: GoalCreationAuthorization | null;
   readonly goalContinuationAuthorization?: GoalContinuationAuthorization | null;
   readonly abortCtrl: AbortController;
@@ -44,6 +46,10 @@ export interface RuntimeV2SubmissionContext {
     readonly acceptanceCriteria: readonly {
       readonly id: string;
       readonly text: string;
+      readonly evidenceRequirement?:
+        | "static"
+        | "behavioral"
+        | "interaction";
     }[];
   };
 }

@@ -60,6 +60,7 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   readonly effectiveIntent: ResolvedRunIntent | null | undefined;
   readonly runtimeIntent: ResolvedRunIntent | null | undefined;
   readonly runWorkspace: string | null | undefined;
+  readonly hasAttachedFiles?: boolean;
 }): RuntimeV2VisibleRunnerKind | null {
   // runtimeIntent is the immutable admission authority. effectiveIntent is
   // retained only as diagnostic input; a later UI projection must never
@@ -68,6 +69,13 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   if (input.runtimeIntent === "studio_workflow") return "studio";
   if (input.runtimeIntent === "plan") return "plan";
   if (input.runtimeIntent === "goal") return "goal";
+  if (
+    isRuntimeV2ChatIntent(input.runtimeIntent) &&
+    String(input.runWorkspace || "").trim().length === 0 &&
+    input.hasAttachedFiles === true
+  ) {
+    return "workspace_read";
+  }
   if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace)) {
     return "chat";
   }

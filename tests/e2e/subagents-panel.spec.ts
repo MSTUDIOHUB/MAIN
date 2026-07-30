@@ -20,10 +20,10 @@ test.describe("subagent activity and right panel", () => {
     await page.getByTestId("subagent-activity-subagent-mendel").click();
     const panel = page.getByTestId("subagents-panel");
     await expect(panel).toBeVisible();
-    await expect(panel).toContainText("本地主体 + 最多 2 个子流");
+    await expect(panel).toContainText("模型请求并发探测中（主体 1 + 探测子流 1）");
     await expect(panel).toContainText("qwen3.6-35b-a3b");
     await expect(page.getByTestId("subagent-section-active")).toContainText("活跃 1");
-    await expect(page.getByTestId("subagent-section-done")).toContainText("已完成 2");
+    await expect(page.getByTestId("subagent-section-done")).toContainText("已结束 2");
     await expect(page.getByTestId("subagent-list-item-subagent-mendel"))
       .toHaveAttribute("data-subagent-section", "active");
     await expect(page.getByTestId("subagent-list-item-subagent-euler"))
@@ -35,13 +35,18 @@ test.describe("subagent activity and right panel", () => {
     await page.getByTestId("subagent-list-item-subagent-euler").click();
     await expect(page.getByTestId("subagent-detail")).toContainText("Euler");
     await expect(page.getByTestId("subagent-detail")).toContainText("事件投影保持完成状态");
+    await expect(page.getByTestId("subagent-detail"))
+      .toContainText("新证据 1 · 返回 1 · 交付 1 · 采用 1");
     await expect(page.getByTestId("stop-subagent-button")).toHaveCount(0);
 
     await page.getByTestId("subagent-list-item-subagent-herschel").click();
     await expect(page.getByTestId("subagent-detail")).toContainText("已降级由主体接管");
     await expect(page.getByTestId("subagent-detail")).toContainText("已定位共享模型通道与内存采样入口");
     await expect(page.getByTestId("subagent-detail")).toContainText("接管原因");
-    await expect(page.getByTestId("subagent-detail")).toContainText("可用内存低于预留线");
+    await expect(page.getByTestId("subagent-detail")).toContainText("memory pressure");
+    await expect(page.getByTestId("subagent-detail")).not.toContainText("可用内存低于预留线");
+    await expect(page.getByTestId("subagent-detail"))
+      .toContainText("新证据 1 · 返回 1 · 交付 0 · 采用 0");
   });
 
   for (const theme of ["light", "dark", "black"] as const) {

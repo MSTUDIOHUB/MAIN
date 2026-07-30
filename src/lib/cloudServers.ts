@@ -40,6 +40,8 @@ export interface CloudProfileConfig {
   disableResponseStorage: boolean;
   reasoningEffort: OpenAiReasoningEffort;
   toolProtocol: CloudToolProtocol;
+  /** Optional total provider-request capacity for this endpoint/model lane. */
+  maxActiveRequests?: number;
   auth: CloudAuthSummary;
 }
 
@@ -61,6 +63,13 @@ function cleanString(value: unknown): string {
 
 function cleanNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function cleanOptionalPositiveInteger(value: unknown): number | undefined {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0
+    ? numeric
+    : undefined;
 }
 
 export function getDefaultCloudEndpoint(protocol: CloudApiProtocol): string {
@@ -162,6 +171,12 @@ export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null)
     disableResponseStorage: input?.disableResponseStorage ?? fallback.disableResponseStorage,
     reasoningEffort: normalizeOpenAiReasoningEffort(input?.reasoningEffort),
     toolProtocol: normalizeCloudToolProtocol(input?.toolProtocol),
+    ...(cleanOptionalPositiveInteger(input?.maxActiveRequests)
+      ? {
+          maxActiveRequests:
+            cleanOptionalPositiveInteger(input?.maxActiveRequests),
+        }
+      : {}),
     auth,
   };
 }

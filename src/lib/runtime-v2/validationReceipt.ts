@@ -1,11 +1,10 @@
 import { workspacePathsReferToSameFile } from "../workspacePaths";
+import { sha256Hex } from "../sha256";
 import type {
   RuntimeV2EvidenceReference,
   RuntimeV2ExecutionValidationAuthority,
+  RuntimeV2Objective,
 } from "./contracts";
-
-export const RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION =
-  "runtime-v2-subagent-validation-receipt.v1" as const;
 
 /**
  * A mutation evidence id and ledger sequence together identify one durable
@@ -24,17 +23,6 @@ export interface RuntimeV2ValidationBoundary {
   /** Latest mutation for every target claimed by this validator. */
   readonly validatedMutationVersions:
     readonly RuntimeV2ValidatedMutationVersion[];
-}
-
-export interface RuntimeV2SubagentValidationReceiptV1
-  extends RuntimeV2ValidationBoundary {
-  readonly schemaVersion:
-    typeof RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION;
-  readonly evidenceId: string;
-  readonly passed: boolean;
-  readonly authority: RuntimeV2ExecutionValidationAuthority;
-  readonly startedAt: number;
-  readonly completedAt: number;
 }
 
 interface RuntimeV2ValidationBoundaryEvent {
@@ -83,6 +71,82 @@ function uniqueTargets(targets: readonly string[]): readonly string[] {
     }
   }
   return unique;
+}
+
+export function runtimeV2DirectExecuteCriterionIds(
+  objective: RuntimeV2Objective,
+): readonly string[] {
+  const supplied = objective.acceptanceCriterionIds || [];
+  return objective.acceptanceCriteria.map((_, index) =>
+    String(supplied[index] || "").trim() || `criterion-${index + 1}`
+  );
+}
+
+export function runtimeV2DirectExecuteMutationTargets(
+  aggregate: RuntimeV2ValidationBoundaryAggregate,
+): readonly string[] {
+  return uniqueTargets(
+    mutationEvents(aggregate).flatMap((event) =>
+      eventEvidence(event)
+        .filter((evidence) => evidence.kind === "mutation")
+        .map((evidence) => evidence.target)
+    ),
+  );
+}
+
+export function runtimeV2DirectExecuteAuthorityDigest(input: {
+  readonly turnId: string;
+  readonly objective: RuntimeV2Objective;
+}): string {
+  return sha256Hex(JSON.stringify({
+    turnId: input.turnId,
+    objective: input.objective.text,
+    criteria: input.objective.acceptanceCriteria.map((text, index) => ({
+      id: runtimeV2DirectExecuteCriterionIds(input.objective)[index],
+      text,
+      evidenceRequirement:
+        input.objective.acceptanceEvidenceRequirements?.[index] || null,
+    })),
+  }));
+}
+
+/**
+ * Bind a direct Execute validator to the complete runtime-owned acceptance
+ * scope at the current mutation boundary. The provider chooses the validator,
+ * but it cannot omit a criterion or mutation target from the resulting
+ * receipt.
+ */
+export function resolveRuntimeV2DirectExecuteValidationAuthority(input: {
+  readonly aggregate: RuntimeV2ValidationBoundaryAggregate;
+  readonly turnId: string;
+  readonly objective: RuntimeV2Objective;
+  readonly validationId: string;
+}): RuntimeV2ExecutionValidationAuthority | null {
+  const admittedCriteria = runtimeV2DirectExecuteCriterionIds(
+    input.objective,
+  );
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(
+    input.aggregate,
+  );
+  if (
+    !input.validationId.trim() ||
+    admittedCriteria.length === 0 ||
+    mutationTargets.length === 0
+  ) {
+    return null;
+  }
+  return {
+    kind: "direct_execute",
+    id: input.turnId,
+    revision: 1,
+    digest: runtimeV2DirectExecuteAuthorityDigest({
+      turnId: input.turnId,
+      objective: input.objective,
+    }),
+    validationId: input.validationId,
+    criterionIds: admittedCriteria,
+    targetPaths: mutationTargets,
+  };
 }
 
 export function deriveRuntimeV2ValidationBoundary(
@@ -151,58 +215,4 @@ export function runtimeV2ValidationBoundaryMatchesCurrent(input: {
       candidate.version === current.version
     )
   );
-}
-
-export function validateRuntimeV2SubagentValidationReceipts(input: {
-  readonly receipts:
-    | readonly RuntimeV2SubagentValidationReceiptV1[]
-    | undefined;
-  readonly evidence: readonly RuntimeV2EvidenceReference[];
-  readonly taskKind: string | undefined;
-  readonly eventAt: number;
-}): boolean {
-  const receipts = input.receipts || [];
-  if (receipts.length === 0) return true;
-  if (input.taskKind !== "validate") return false;
-  const evidenceById = new Map(
-    input.evidence.map((evidence) => [evidence.id, evidence]),
-  );
-  if (new Set(receipts.map((receipt) => receipt.evidenceId)).size !==
-    receipts.length) {
-    return false;
-  }
-  return receipts.every((receipt) => {
-    const validationEvidence = evidenceById.get(receipt.evidenceId);
-    const authority = receipt.authority;
-    return receipt.schemaVersion ===
-        RUNTIME_V2_SUBAGENT_VALIDATION_RECEIPT_SCHEMA_VERSION &&
-      validationEvidence?.kind === "validation" &&
-      !!authority &&
-      (authority.kind === "execution_contract" ||
-        authority.kind === "work_plan") &&
-      !!authority.id &&
-      Number.isInteger(authority.revision) &&
-      authority.revision > 0 &&
-      !!authority.digest &&
-      !!authority.validationId &&
-      authority.criterionIds.length > 0 &&
-      authority.targetPaths.length > 0 &&
-      Number.isInteger(receipt.mutationBoundarySequence) &&
-      receipt.mutationBoundarySequence >= 0 &&
-      receipt.validatedMutationVersions.length <=
-        uniqueTargets(authority.targetPaths).length &&
-      receipt.validatedMutationVersions.every((version) =>
-        !!version.target &&
-        !!version.mutationEvidenceId &&
-        authority.targetPaths.some((target) =>
-          workspacePathsReferToSameFile(target, version.target)
-        ) &&
-        Number.isInteger(version.mutationSequence) &&
-        version.mutationSequence > 0
-      ) &&
-      Number.isFinite(receipt.startedAt) &&
-      Number.isFinite(receipt.completedAt) &&
-      receipt.startedAt <= receipt.completedAt &&
-      receipt.completedAt <= input.eventAt;
-  });
 }

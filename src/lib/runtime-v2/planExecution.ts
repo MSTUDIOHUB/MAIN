@@ -311,32 +311,6 @@ export function deriveRuntimeV2PlanExecutionCoverage(
         validatedMutationVersions: event.validatedMutationVersions,
       }),
   );
-  const childValidationReceipts = aggregate.events.flatMap((event) => {
-    if (
-      event.type !== "subagent.completed" ||
-      event.status !== "completed" ||
-      !event.report
-    ) {
-      return [];
-    }
-    const citedEvidenceIds = new Set(
-      event.report.findings.flatMap((finding) => finding.evidenceIds),
-    );
-    return (event.validationReceipts || []).filter((receipt) =>
-      receipt.passed &&
-      citedEvidenceIds.has(receipt.evidenceId) &&
-      event.evidence.some((evidence) =>
-        evidence.id === receipt.evidenceId &&
-        evidence.kind === "validation"
-      ) &&
-      runtimeV2ValidationBoundaryMatchesCurrent({
-        aggregate,
-        targetPaths: receipt.authority.targetPaths,
-        mutationBoundarySequence: receipt.mutationBoundarySequence,
-        validatedMutationVersions: receipt.validatedMutationVersions,
-      })
-    );
-  });
   const passedRequiredValidationIndexes = requiredValidationIndexes.filter((index) => {
     const required = plan.draft.validations[index];
     const expectedAuthority = runtimeV2PlanValidationAuthority({
@@ -362,17 +336,12 @@ export function deriveRuntimeV2PlanExecutionCoverage(
           workspacePathsReferToSameFile(target, candidate)
         )
       );
-    return !!required && (
-      passedValidations.some((event) => {
-        if (!authorityMatches(event.authority)) return false;
-        const invocation = argumentsForEvent(aggregate, event);
-        return !!invocation &&
-          validationMatches(required, invocation.toolName, invocation.args);
-      }) ||
-      childValidationReceipts.some((receipt) =>
-        authorityMatches(receipt.authority)
-      )
-    );
+    return !!required && passedValidations.some((event) => {
+      if (!authorityMatches(event.authority)) return false;
+      const invocation = argumentsForEvent(aggregate, event);
+      return !!invocation &&
+        validationMatches(required, invocation.toolName, invocation.args);
+    });
   });
   const missingRequiredValidationIndexes = requiredValidationIndexes.filter(
     (index) => !passedRequiredValidationIndexes.includes(index),

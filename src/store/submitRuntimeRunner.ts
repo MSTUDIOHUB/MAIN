@@ -53,6 +53,8 @@ export async function runSubmitRuntime(
     effectiveIntent: input.context.effectiveRunIntent,
     runtimeIntent: input.context.runtimeRunIntent,
     runWorkspace: input.context.runWorkspace,
+    hasAttachedFiles:
+      input.context.turnInputContextSignals.attachedFilePaths.length > 0,
   });
   if (admittedVersion !== "v2") {
     input.logStoreEvent("runtime_v2_turn_marker_missing", {
@@ -83,6 +85,10 @@ export async function runSubmitRuntime(
     source: runtimeContextBudget?.source ?? "provider_managed",
     providerContextLimit:
       runtimeContextBudget?.providerContextLimit ?? null,
+    providerOutputLimit:
+      runtimeContextBudget?.providerOutputLimit ?? null,
+    preserveAssistantReasoning:
+      runtimeContextBudget?.preserveAssistantReasoning ?? null,
     availableMemoryBytes:
       runtimeContextBudget?.availableMemoryBytes ?? null,
   });

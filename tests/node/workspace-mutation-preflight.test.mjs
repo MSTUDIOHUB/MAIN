@@ -76,6 +76,28 @@ test("replace_in_file preflight blocks mismatched search_text before review", as
   assert.match(result.message || "", /文件版本变化|缺少精确范围/);
 });
 
+test("replace_in_file preflight rejects an ambiguous exact block", async () => {
+  const result = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/main.js",
+      search_text: "const duplicate = true;",
+      replace_text: "const duplicate = false;",
+    },
+    language: "en",
+    readFile: async () => [
+      "const duplicate = true;",
+      "const middle = true;",
+      "const duplicate = true;",
+    ].join("\n"),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "search_text_ambiguous");
+  assert.equal(result.recoveryKind, "mutation_rejected");
+  assert.match(result.message || "", /unique|more than once/i);
+});
+
 test("replace mismatch range prefers clustered rare identifiers over an early generic match", async () => {
   const source = [
     "const filePath = getInitialPath();",
@@ -360,7 +382,10 @@ test("mutation preflight rejects parser-confirmed post-images before writing", a
   assert.equal(replacement.reason, "syntax_error");
   assert.equal(replacement.recoveryKind, "mutation_rejected");
   assert.match(replacement.message || "", /文件尚未修改/);
-  assert.deepEqual(checked.map((entry) => entry.path), ["src/toolbar.js"]);
+  assert.deepEqual(checked.map((entry) => entry.path), [
+    "src/toolbar.js",
+    "src/toolbar.js",
+  ]);
 
   const patch = await preflightWorkspaceMutation({
     toolName: "apply_patch",
@@ -382,6 +407,65 @@ test("mutation preflight rejects parser-confirmed post-images before writing", a
   assert.equal(patch.ok, false);
   assert.equal(patch.reason, "syntax_error");
   assert.match(patch.message || "", /No file was changed/);
+});
+
+test("mutation preflight requires a parser-clean postimage for an already-broken file", async () => {
+  const checkSyntax = async (_path, content) => {
+    const errorCount = [...String(content).matchAll(/BROKEN/g)].length;
+    return {
+      applicable: true,
+      hasErrors: errorCount > 0,
+      errorCount,
+      firstErrorLine: errorCount > 0 ? 1 : null,
+      firstErrorColumn: errorCount > 0 ? 1 : null,
+      errors: Array.from({ length: errorCount }, (_, index) => ({
+        line: index + 4,
+        column: 2,
+        kind: `parse_${index + 1}`,
+      })),
+      errorsTruncated: false,
+    };
+  };
+  const current = "BROKEN first\nBROKEN second\n";
+  const improved = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/toolbar.js",
+      search_text: "BROKEN first",
+      replace_text: "fixed first",
+    },
+    language: "en",
+    readFile: async () => current,
+    checkSyntax,
+  });
+  assert.equal(improved.ok, false);
+  assert.equal(improved.reason, "syntax_error");
+  assert.match(
+    improved.message || "",
+    /pre-existing 2 -> proposed 1/,
+  );
+
+  const equallyBroken = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/toolbar.js",
+      search_text: "BROKEN first",
+      replace_text: "BROKEN replacement",
+    },
+    language: "en",
+    readFile: async () => current,
+    checkSyntax,
+  });
+  assert.equal(equallyBroken.ok, false);
+  assert.equal(equallyBroken.reason, "syntax_error");
+  assert.match(
+    equallyBroken.message || "",
+    /pre-existing 2 -> proposed 2/,
+  );
+  assert.match(
+    equallyBroken.message || "",
+    /src\/toolbar\.js:4:2 parse_1, src\/toolbar\.js:5:2 parse_2/,
+  );
 });
 
 test("missing mutation targets request workspace reorientation instead of rereading the invented path", async () => {

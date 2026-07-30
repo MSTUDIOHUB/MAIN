@@ -16,6 +16,7 @@ export type WorkspaceMutationPreflightReason =
   | "missing_content"
   | "read_failed"
   | "search_text_mismatch"
+  | "search_text_ambiguous"
   | "empty_change"
   | "identical_content"
   | "existing_file_requires_patch"
@@ -59,6 +60,12 @@ export interface WorkspaceMutationPreflightInput {
     errorCount: number;
     firstErrorLine?: number | null;
     firstErrorColumn?: number | null;
+    errors?: Array<{
+      line: number;
+      column: number;
+      kind: string;
+    }>;
+    errorsTruncated?: boolean;
   }>;
   /** Optional stage-owned safety ceiling. Corrective loops can require a
    * smaller diff than an initial implementation without changing tool
@@ -209,6 +216,8 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: Could not read ${input.path} before patching (${input.detail || "read failed"}). Do not ask for approval; read the correct target or report the blocker.`;
       case "search_text_mismatch":
         return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Reuse the active versioned source observation and correct the edit; reread only when the file version changed or the exact required range is missing.`;
+      case "search_text_ambiguous":
+        return `MUTATION_PREFLIGHT_BLOCKED: search_text occurs more than once in ${input.path}. Expand it to one unique exact block from the visible source before retrying.`;
       case "empty_change":
         return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} would not change ${input.path}. Do not ask for approval; provide a real edit, run validation, or explain the blocker.`;
       case "identical_content":
@@ -233,6 +242,8 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: patch 前无法读取 ${input.path}（${input.detail || "读取失败"}）。不要请求用户审批；请读取正确目标或明确阻塞。`;
     case "search_text_mismatch":
       return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中不存在。请复用当前版本化源码观察并修正编辑；只有文件版本变化或确实缺少精确范围时才重新读取。`;
+    case "search_text_ambiguous":
+      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中出现多次。请依据已显示源码将其扩展为唯一的精确文本块后重试。`;
     case "empty_change":
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} 不会改变 ${input.path}。不要请求用户审批；请给出真实改动、执行验证或说明阻塞。`;
     case "identical_content":
@@ -353,19 +364,42 @@ async function blockedSyntaxResult(
   path: string,
   content: string,
   language: "zh" | "en",
+  previousContent?: string,
 ): Promise<WorkspaceMutationPreflightResult | null> {
   if (!input.checkSyntax) return null;
   const checked = await input.checkSyntax(path, content);
   if (!checked.applicable || !checked.hasErrors) return null;
-  const location = checked.firstErrorLine
-    ? `${path}:${checked.firstErrorLine}:${checked.firstErrorColumn || 1}`
-    : path;
+  const previous = previousContent === undefined
+    ? null
+    : await input.checkSyntax(path, previousContent);
+  const reportedErrors = (checked.errors || [])
+    .filter((error) =>
+      Number(error?.line) > 0 && Number(error?.column) > 0
+    )
+    .slice(0, 8);
+  const location = reportedErrors.length > 0
+    ? reportedErrors.map((error) =>
+        `${path}:${Math.floor(error.line)}:${Math.floor(error.column)}${
+          String(error.kind || "").trim()
+            ? ` ${String(error.kind).trim().slice(0, 80)}`
+            : ""
+        }`
+      ).join(", ")
+    : checked.firstErrorLine
+      ? `${path}:${checked.firstErrorLine}:${checked.firstErrorColumn || 1}`
+      : path;
+  const progress = previous?.applicable && previous.hasErrors
+    ? `; pre-existing ${previous.errorCount} -> proposed ${checked.errorCount}`
+    : "";
   return blocked({
     reason: "syntax_error",
     toolName: input.toolName,
     path,
     language,
-    detail: `${location}; ${Math.max(1, checked.errorCount)} parser error(s)`,
+    detail:
+      `${location}${
+        checked.errorsTruncated ? ", additional parser errors omitted" : ""
+      }; ${Math.max(1, checked.errorCount)} parser error(s)${progress}`,
     recoveryKind: "mutation_rejected",
   });
 }
@@ -477,6 +511,7 @@ export async function preflightWorkspaceMutation(
         change.path,
         change.newContent,
         language,
+        change.kind === "update" ? change.oldContent : undefined,
       );
       if (syntaxFailure) return syntaxFailure;
     }
@@ -561,6 +596,16 @@ export async function preflightWorkspaceMutation(
       patchRecoveryMismatch,
     });
   }
+  const firstMatch = current.indexOf(searchText);
+  if (current.indexOf(searchText, firstMatch + 1) >= 0) {
+    return blocked({
+      reason: "search_text_ambiguous",
+      toolName,
+      path,
+      language,
+      recoveryKind: "mutation_rejected",
+    });
+  }
   const updated = current.replace(searchText, replaceText);
   if (updated === current) {
     return blocked({ reason: "empty_change", toolName, path, language });
@@ -582,6 +627,12 @@ export async function preflightWorkspaceMutation(
     });
   }
 
-  return (await blockedSyntaxResult(input, path, updated, language)) ||
+  return (await blockedSyntaxResult(
+    input,
+    path,
+    updated,
+    language,
+    current,
+  )) ||
     { ok: true };
 }

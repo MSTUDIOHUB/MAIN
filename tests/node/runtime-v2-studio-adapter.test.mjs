@@ -118,7 +118,7 @@ function aggregateFor(currentCommand, completed = []) {
     completedCommands: [],
     pendingToolCalls: [],
     subagents: [],
-    recovery: { receipts: [], exhausted: null, epoch: 0 },
+    recovery: { receipts: [], exhausted: null },
     terminalOutcome: null,
     finalProjectionId: null,
     nextSequence: 0,

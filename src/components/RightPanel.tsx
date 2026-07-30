@@ -1300,7 +1300,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     planArtifacts.length > 0 ||
     fallbackPlanPreview.length > 0;
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
-  const subagentCapacityPolicy = useMemo(() => resolveSubagentCapacityPolicy(config), [config]);
+  // Lane capacity is learned from live first-token overlap and can change
+  // without a config write. Resolve it on each panel render so child lifecycle
+  // updates also refresh the displayed capacity truth.
+  const subagentCapacityPolicy = resolveSubagentCapacityPolicy(config);
   const activeSubagentCount = subagentRuns.filter((run) =>
     run.status === "queued" || run.status === "starting" || run.status === "running" || run.status === "summarizing"
   ).length;
