@@ -508,7 +508,7 @@ test("repeated successful searches remain executable and rely on soft strategy p
   assert.equal(state.terminalOutcome, null);
 });
 
-test("repeated validators remain executable until evidence or the lifecycle boundary resolves the Turn", () => {
+test("repeated validators remain executable until evidence or an explicit hard boundary resolves the Turn", () => {
   let state = executeAggregate();
   for (const id of ["build-1", "build-2"]) {
     state = providerResult(state, {
@@ -982,6 +982,47 @@ test("approved WorkPlan keeps sealed multi-target and validation authority", () 
   }).allowed, false);
 });
 
+test("a tool-free Execute report truthfully closes an incomplete approved WorkPlan", () => {
+  let state = approvedTwoTargetPlanAggregate();
+  state = commitMutation(state, "main-only-mutation", "src/main.js");
+  state = providerResult(state, {
+    visibleText:
+      "Updated src/main.js, but the remaining target and required validation are incomplete.",
+  });
+
+  assert.equal(
+    runtime.latestRuntimeV2ProviderConclusionText(state),
+    "Updated src/main.js, but the remaining target and required validation are incomplete.",
+  );
+  assert.deepEqual(runtime.decideRuntimeV2TerminalOutcome(state, {
+    canceled: false,
+    mutationCount: 1,
+    passedValidationCount: 0,
+    hasAcceptanceValidation: false,
+    failedValidationCount: 0,
+    stalledValidationCount: 0,
+    hasProviderConclusion: true,
+  }), {
+    resultKind: "partial",
+    resultReason:
+      "模型已结束本轮；已保留实际修改，但已批准 WorkPlan 尚未完整闭环。未覆盖修改目标：src/editor.js。 未通过必需验证：work-plan-validation-1。",
+  });
+});
+
+test("a duplicate-action adapter diagnostic is not a provider conclusion", () => {
+  let state = approvedTwoTargetPlanAggregate();
+  state = providerResult(state, {
+    visibleText: "This text belongs to a rejected duplicate.",
+    diagnostics: [{
+      code: "repeated_action_rejected",
+      message: "already_completed:run_command:opaque",
+      retryable: true,
+    }],
+  });
+
+  assert.equal(runtime.latestRuntimeV2ProviderConclusionText(state), "");
+});
+
 test("preferred collaboration remains available after a failed child", () => {
   let state = executeAggregate();
   let next = runtime.decideNextCommands(state, {
@@ -1331,6 +1372,77 @@ test("the controller records adoption only from a later durable parent provider 
   assert.equal(applied[0].source, "provider_result");
 });
 
+test("the controller propagates a scheduling conflict before the command is durable", async () => {
+  const aggregate = executeAggregate();
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 9,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  let clock = aggregate.updatedAt;
+  let id = 0;
+  let providerRequests = 0;
+  let appendsAfterConflict = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() {
+        return checkpoint;
+      },
+      async append(input) {
+        if (input.event.type === "command.scheduled") {
+          return { disposition: "conflict", checkpoint: null };
+        }
+        appendsAfterConflict += 1;
+        return runtime.appendRuntimeV2Checkpoint({
+          checkpoint,
+          owner: input.owner,
+          expectedRevision: input.expectedRevision,
+          event: input.event,
+        });
+      },
+    },
+    provider: {
+      async request() {
+        providerRequests += 1;
+        throw new Error("provider must not run before durable scheduling");
+      },
+    },
+    tool: {
+      async execute() {
+        throw new Error("tool must not run before durable scheduling");
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("scheduler must not run before durable scheduling");
+      },
+    },
+    projection: {
+      async publish() {},
+    },
+    clockId: {
+      now: () => ++clock,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ kind }) => `${kind}-${++id}`,
+    },
+  }, {
+    aggregate,
+    revision: checkpoint.revision,
+  });
+
+  await assert.rejects(
+    () => controller.driveOnce(),
+    /checkpoint ownership or revision conflict/,
+  );
+  assert.equal(providerRequests, 0);
+  assert.equal(
+    appendsAfterConflict,
+    0,
+    "an unscheduled command cannot manufacture recovery or projection events",
+  );
+  assert.equal(controller.snapshot().aggregate.events.length, aggregate.events.length);
+});
+
 test("transient command failures never create a recovery-count terminal", () => {
   const state = executeAggregate();
   const command = commandFor(state, "execute_tool", "read-failed", {
@@ -1368,7 +1480,7 @@ test("transient command failures never create a recovery-count terminal", () => 
   assert.equal(
     runtime.decideNextCommands({ ...state, recovery })[0].kind,
     "request_model",
-    "the lifecycle deadline, not a retry counter, owns terminal timing",
+    "a retry counter cannot own terminal timing",
   );
 });
 
@@ -1390,6 +1502,136 @@ test("an adapter-confirmed provider transport boundary is a hard stop without a 
     reason: "provider_transports_unavailable",
     publish: true,
   });
+});
+
+test("the shared lifecycle deadline is a boundary, not a transport recovery", async () => {
+  const aggregate = executeAggregate();
+  let checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: aggregate.events.length,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  let clock = aggregate.updatedAt;
+  let id = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() {
+        return checkpoint;
+      },
+      async append(input) {
+        const appended = runtime.appendRuntimeV2Checkpoint({
+          checkpoint,
+          owner: input.owner,
+          expectedRevision: input.expectedRevision,
+          event: input.event,
+        });
+        if (appended.checkpoint) checkpoint = appended.checkpoint;
+        return appended;
+      },
+    },
+    provider: {
+      async request() {
+        throw new runtime.RuntimeV2LifecycleDeadlineError();
+      },
+    },
+    tool: {
+      async execute() {
+        throw new Error("tool execution is outside this deadline test");
+      },
+    },
+    scheduler: {
+      async execute() {
+        throw new Error("child scheduling is outside this deadline test");
+      },
+    },
+    projection: {
+      async publish() {},
+    },
+    clockId: {
+      now: () => ++clock,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ kind }) => `${kind}-${++id}`,
+    },
+  }, {
+    aggregate,
+    revision: checkpoint.revision,
+  });
+
+  assert.equal(await controller.driveOnce(), true);
+  const after = controller.snapshot().aggregate;
+  const completion = after.events.findLast((candidate) =>
+    candidate.type === "command.completed"
+  );
+  assert.equal(completion.status, "canceled");
+  assert.equal(
+    after.events.some((candidate) =>
+      candidate.type === "recovery.recorded" ||
+      candidate.type === "recovery.exhausted"
+    ),
+    false,
+  );
+  assert.equal(
+    runtime.summarizeRuntimeV2ExecuteEvidence(after, {
+      isMutationToolName: (name) => name === "apply_patch",
+    }).failedProviderRequestCount,
+    0,
+  );
+});
+
+test("presentation counts repeated source receipts as one evidence fact without rewriting the ledger", () => {
+  let state = executeAggregate();
+  for (const [id, target, version] of [
+    ["source-main-first", "src/main.js", "sha-main"],
+    ["source-main-repeat", "src/main.js", "sha-main"],
+    ["source-toolbar", "src/toolbar.js", "sha-toolbar"],
+  ]) {
+    state = runtime.transition(state, event(state, "observation.recorded", {
+      run: baseRun,
+      evidence: {
+        id,
+        kind: "source",
+        target,
+        version,
+      },
+    }));
+  }
+
+  assert.equal(state.evidence.length, 3);
+  assert.equal(runtime.countDistinctRuntimeV2EvidenceFacts(state.evidence), 2);
+  const finalProjection = runtime.buildRuntimeV2FinalProjection(
+    state,
+    "final-evidence-count",
+    "error",
+    "lifecycle deadline",
+  );
+  assert.match(finalProjection.markdown, /已保留 2 条证据/);
+  assert.doesNotMatch(finalProjection.markdown, /已保留 3 条证据/);
+  assert.equal(runtime.countDistinctRuntimeV2EvidenceFacts([
+    {
+      id: "grep-first",
+      kind: "tool",
+      target: "src",
+      version: null,
+    },
+    {
+      id: "grep-second",
+      kind: "tool",
+      target: "src",
+      version: null,
+    },
+    {
+      id: "source-unversioned-first",
+      kind: "source",
+      target: "workspace",
+      version: null,
+    },
+    {
+      id: "source-unversioned-second",
+      kind: "source",
+      target: "workspace",
+      version: null,
+    },
+  ]), 4);
 });
 
 test("nullish provider rejections stay on the recoverable request path", () => {
@@ -1461,6 +1703,36 @@ test("failed provider requests stay durable on the shared request path", () => {
   }));
   const afterProgress = runtime.decideNextCommands(state)[0];
   assert.equal(afterProgress.kind, "request_model");
+});
+
+test("provider request identity and diagnostics survive the 256 receipt window", () => {
+  let state = executeAggregate();
+  let latest = null;
+  for (let attempt = 1; attempt <= 257; attempt += 1) {
+    const command = runtime.decideNextCommands(state)[0];
+    assert.equal(command.kind, "request_model");
+    assert.equal(command.payload.attempt, attempt);
+    if (latest) assert.notEqual(command.idempotencyKey, latest.idempotencyKey);
+    latest = command;
+    state = schedule(state, command);
+    state = runtime.transition(state, event(state, "command.completed", {
+      run: baseRun,
+      idempotencyKey: command.idempotencyKey,
+      status: "failed",
+    }));
+  }
+
+  assert.equal(state.completedCommands.length, 256);
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.attempt, 258);
+  assert.notEqual(next.idempotencyKey, latest.idempotencyKey);
+  assert.equal(
+    runtime.summarizeRuntimeV2ExecuteEvidence(state, {
+      isMutationToolName: (name) => name === "apply_patch",
+    }).failedProviderRequestCount,
+    257,
+  );
 });
 
 test("new source reads preserve effect pressure until a mutation commits", () => {
@@ -1766,11 +2038,77 @@ test("a provider admission rejection stays non-executable and drives soft recove
       retryable: true,
     }],
   });
+  const firstRecoveryAt = state.updatedAt;
 
-  const next = runtime.decideNextCommands(state)[0];
+  let next = runtime.decideNextCommands(state)[0];
   assert.equal(next.kind, "request_model");
+  assert.deepEqual(next.payload.recoveryPressure, {
+    schemaVersion: "runtime-v2-provider-recovery.v1",
+    reason: "repeated_action_rejected",
+    occurrence: 1,
+    stage: "reconsider",
+  });
   assert.equal(state.pendingToolCalls.length, 0);
   assert.equal(state.terminalOutcome, null);
+
+  state = providerResult(state, {
+    toolCalls: [],
+    diagnostics: [{
+      code: "repeated_action_rejected",
+      message: "already_rejected:read_file:opaque-action-id",
+      retryable: true,
+    }],
+  });
+  next = runtime.decideNextCommands(state)[0];
+  assert.deepEqual(next.payload.recoveryPressure, {
+    schemaVersion: "runtime-v2-provider-recovery.v1",
+    reason: "repeated_action_rejected",
+    occurrence: 2,
+    stage: "reframe",
+  });
+  assert.equal(
+    runtime.deriveRuntimeV2ProviderRecoveryWindow(state)?.startedAt,
+    firstRecoveryAt,
+    "the recovery-stall lease must resume from canonical ledger time after an app restart",
+  );
+  assert.equal(
+    runtime.summarizeRuntimeV2ExecuteEvidence(state, {
+      isMutationToolName: (name) => name === "apply_patch",
+    }).failedProviderRequestCount,
+    2,
+    "adapter-level non-actionable decisions must be counted even when the HTTP streams succeeded",
+  );
+
+  let lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({
+    current: null,
+    pressure: next.payload.recoveryPressure,
+    now: 1_000,
+  });
+  assert.equal(lease?.startedAt, 1_000);
+  assert.equal(
+    runtime.runtimeV2ProviderRecoveryStallExpired(
+      lease,
+      1_000 + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS - 1,
+    ),
+    false,
+  );
+  assert.equal(
+    runtime.runtimeV2ProviderRecoveryStallExpired(
+      lease,
+      1_000 + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS,
+    ),
+    true,
+  );
+  lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({
+    current: lease,
+    pressure: null,
+    now: 1_000 + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS,
+  });
+  assert.equal(
+    lease,
+    null,
+    "a new actionable decision/evidence boundary clears the stall lease instead of imposing a total task duration",
+  );
 });
 
 test("action fingerprints stay fixed-size regardless of tool payload size", () => {

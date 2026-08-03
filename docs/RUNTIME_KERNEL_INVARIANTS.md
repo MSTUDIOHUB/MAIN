@@ -47,7 +47,7 @@ Execute 只需要一个可重复的核心循环：
 3. 每次修改形成新的验证边界；修改前的验证不能证明修改后的行为。
 4. provider 正文只负责说明，不能创造 mutation、validation、permission 或 terminal 事实。
 5. 重复读取、无工具响应、协议漂移和弱输出是推进信号，不是任务终态。
-6. 最终 mutation boundary 后的真实证据完整覆盖所有必要验收条件时可以 `success`；验收尚未完成时，只有用户取消、权限或外部状态阻塞、兼容 transport 全部不可用、生命周期截止和无法满足的真实验收边界可以提前收口，已有改动但覆盖不全时必须是 `partial`。
+6. 最终 mutation boundary 后的真实证据完整覆盖所有必要验收条件时可以 `success`；普通 Execute 没有整轮 wall-clock 截止。验收尚未完成时，只有用户取消、权限或外部状态阻塞、兼容 transport 全部不可用、调用方显式预算、持续的 provider 恢复停滞和无法满足的真实验收边界可以提前收口，已有改动但覆盖不全时必须是 `partial`。
 
 “兼容 transport 全部不可用”必须由**没有任何兼容请求可以发出**或所有候选 transport
 都已得到不兼容证据来证明。某个已经发出的 provider 请求发生 HTTP、连接、reset 或
@@ -59,6 +59,8 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 直接 Execute 的读取授权是一个 mutation boundary 内的**多目标集合**：父线程依次读取 A、B、C 后，可以修改这三个已取得版本证据的目标；读取 B 不会撤销 A。任一成功 mutation 会清空该集合，后续修改必须重新读取最新版本。不得退化成“只有最后一次读取的文件可改”，也不得把旧读取永久当作授权。
 
 读取是编辑授权和理解证据，不是用户目标已经产生效果。当前 mutation boundary 已物化精确版本源码、但尚无成功 mutation 时，ledger 必须保持 `source_only_frontier`：后续读取可以补充 workset，却不能不断把“仍未产生效果”的状态重置成已推进。此时 request 可以在**同一完整工具集合**中把现有 mutation 能力排在前面，并要求只有能明确指出一个缺失路径、范围或事实时才继续读取。不得撤掉读取、强制单一编辑工具、按读取轮数结束，或按 Qwen/Gemma 等模型名分支。成功 mutation 自然清除该压力并进入新的验证边界。
+
+普通 Execute 的时间语义是“进展驱动”，不是“从接纳开始倒计时”：模型推理、持续流式输出、真实工具动作、证据收集、修改和验证无论总耗时多久，都不能因为 Turn 年龄被取消。10 分钟只用于 `provider recovery stall lease`：它从第一次没有形成可执行结果的 provider 决策开始，在模型持续重复已拒绝动作、返回空动作或请求持续失败且没有新进展时累计；任一可执行决策或新的工具/证据边界立即清零。该 lease 只在两次动作之间检查，不中断正在进行的慢模型请求或工具。读取和有限验证仍可有单操作 watchdog；单操作超时是可恢复失败，不是整轮终态。
 
 ### 2.1 跨模型统一协议，而不是统一思考过程
 
@@ -211,6 +213,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 子智能体应接收目标、相关父证据、当前版本/修改边界和缺失验收项组成的锚点上下文。继承证据必须带 provenance，不能因协议不允许引用而被迫重读。
 - 当前最小内核不向 child 暴露额外“报告工具”：child 每次请求同时保留其安全工具和普通最终文本能力，不使用 required-tool、不预留固定“强制总结阶段”，也不在取得首条证据后撤掉工具。精确重复动作只得到标准工具拒绝结果并继续同一 child 生命周期。child 用普通最终文本收口，runtime 只在报告引用子任务真实新证据或明确交付给 `review` 的版本化父证据时记为 `completed`。继承父证据必须单独保存 provenance；它可以支持 review finding，但绝不计入子任务新证据、交付、采用或验收数量。
 - child 取得**新证据**但未形成合法报告时记为 `degraded`，UI 显示“已降级由主体接管”；只有继承上下文但没有合法报告，或根本没有新证据时记为 `failed`。父任务取消时为 `canceled`。这些状态都不能制造验收事实。
+- child 同样没有总耗时截止。只有连续步骤重复、越权、失败或没有产生新证据时才启动 10 分钟恢复停滞租约；任一新证据立即清零，慢速的在途 provider/tool 请求不会被该租约中断。停滞后 child 以 `degraded/failed` 交回父线程，避免父任务最终 join 永久悬挂。
 - 子智能体 `degraded/failed` 后父线程继续当前目标。协作状态不得成为父线程停止原因；只有 `completed` 且报告引用真实 evidence 时才是成功的协作结果。
 - 子智能体面板显示当前真实 lane 状态：能力未知时为“探测中”，确认首 token 重叠后同时显示“已实测数量”和“当前开放数量”，显式配置则标为“已配置”。不得写死“最多两个子流”，也不得把主体槽位混入子流计数。
 
@@ -231,12 +234,13 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 同一个 Runtime authority resolver 生成 Execute 工具面并执行授权；本 Turn consent 可允许 `browser_evaluate`，桌面控制仍保留逐次授权。
 - browser validation 只有在存在因果关联的 passed assertion，且没有 page/console error 时才算通过；静态 build 不能单独覆盖行为 criterion。
 - Goal/WorkPlan 明确声明的 `behavioral`、`interaction`、`static` 证据类型必须严格保持。普通 Execute 没有该类型事实时，Runtime 不从自然语言猜分类，也不把所有目标硬编码为 behavioral；模型选择的真实有限 validator 可以覆盖未分类条件，最终报告必须如实说明实际验证内容。
-- Plan discovery 始终同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。只有共享生命周期截止可以结束；provider 无动作和协议漂移只作为软反馈或兼容 transport 协商。
+- Plan discovery 始终同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。只有 Plan 自己共享的模型阶段截止可以结束该有界合成阶段；provider 无动作和协议漂移只作为软反馈或兼容 transport 协商。该阶段预算不得被误用为普通 Execute 的 Turn 总时限。
 - 普通副作用按规范化后的 tool+arguments 在同一 mutation boundary 精确拒绝，工具本身和其他参数仍然可用。`read_file` 是 coverage-aware 例外：首次缓存重放后，同一路径、同版本的其他范围只有在该请求范围仍物化于**当前实际发给模型的 decision view** 时才属于“无新信息”；canonical transcript 曾经覆盖过不等于模型现在仍看得到。若有界 workset 已淘汰该源码，允许再次从缓存重放而不访问磁盘。首次 replay 可以返回精确缓存源码；源码仍可见时再次重分片只能返回有界结构化指引，不能附加源码奖励无效读取。durable replay receipt、标准工具对、路径/版本和 mutation receipt 负责恢复关闭事实，但执行拒绝前必须再与当前 decision view 求交，不能只相信 process-local Map 或历史 ledger；成功 mutation 会重新开放新的边界。
 - 精确重复的安全读取不重新访问工作区：若同一 mutation boundary 已有成功回执，runtime 直接重放原 assistant/tool 结果；provider 同时提出新读取时只执行新部分。失败回执不缓存，成功 mutation 会使全部旧读取回执失效。
-- provider 没有产生合法工具调用或动作被精确拒绝时，下一次请求会保留完整可见的 assistant 响应和结构化 runtime 反馈；只有完全相同的响应/反馈对会合并。重试不能遗忘刚刚失败的尝试，也不能靠固定轮数收口。
+- provider 没有产生合法工具调用时，下一次请求保留完整可见的 assistant 响应和结构化 runtime 反馈。动作被精确拒绝时，必须用标准 `assistant.tool_calls -> tool(ACTION_NOT_EXECUTED)` 对关闭模型刚提交的原生工具状态，再附加恢复事实；同一 action identity 只保留一对，修改正文必须脱敏。只写一条 system 提示而省略工具结果会让部分本地模型从未观察到决策状态变化，并确定性重放同一动作。重试不能遗忘刚刚失败的尝试，也不能靠固定轮数收口。
+- 连续 provider 拒绝使用 ledger 派生的渐进恢复阶段：先重新核对失败事实，再重构完成路径，最后选择真正不同的动作或诚实报告缺口。恢复期间不得撤掉工具或按模型名分支；支持 reasoning toggle 且用户没有关闭 reasoning 时，第二阶段开始可把本次请求提升为显式 reasoning，动作或证据恢复后回到原配置。相同反馈也必须投影可见的恢复次数。只有持续 10 分钟没有任何可执行进展才触发恢复停滞边界，普通 Execute 总耗时不参与该计时。
 - 已拒绝的标准 assistant/tool 动作对继续存在于 canonical ledger，但从下一次 provider 的决策副本中整体移除，并由有界的结构化拒绝事实替代；真实源码读取回执仍按路径、版本和范围保留。不得删除持久化真值，也不得让失败动作反复占用模型决策上下文。
-- provider 工具参数在生成 action identity 之前按工具 JSON schema 做递归标量规范化；例如数值字段的 `"260"` 与 `260` 必须是同一个动作。不得针对模型名、字段名或事故参数编写修正规则。
+- provider 工具参数在生成 action identity 之前按工具 JSON schema 做递归标量规范化；例如数值字段的 `"260"` 与 `260` 必须是同一个动作。工具契约可以用只在 runtime 内可见、发送 provider 前会剥离的 identity-default 注解声明“显式默认值等价于省略”，不得针对模型名或事故参数编写临时修正规则。
 - 原生工具仍由 provider 配置/能力决定。某一次请求使用文本信封 fallback 只挽救该请求，不能写成 Turn 级“已证明能力”并永久撤掉后续原生工具。
 - 本地工具协议的默认值已经统一为 `auto`；LM Studio、Ollama、OMLX 不再因产品名默认进入 XML。真实 wire format 和兼容 fallback 由 adapter 能力与本次请求结果决定。
 - 用户保存的 native/XML 是偏好，不是能力证明。Gemini adapter 当前尚未完成工具声明、`functionCall` 解析、调用历史回放和 `functionResponse` 结果回放，因此 Execute、child 和 Plan 即使偏好 native 也直接使用现有文本信封；四向测试全部通过前不得打开 native capability。

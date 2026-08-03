@@ -152,6 +152,8 @@ Markdown 只负责审核显示。批准后任务和验证从 sealed typed graph 
 
 每批工具结果先形成真实 source、mutation、validation、browser/desktop 或 Goal evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
 
+普通 Execute 没有从 Turn 接纳时刻开始计算的总耗时上限。持续流式输出、有效模型决策、工具动作、证据、修改或验证都允许任务继续，无论本地硬件使单步或整轮耗时多久。10 分钟只表示“连续没有形成可执行进展”的恢复停滞窗口；它不取消正在运行的慢请求，并会在下一条有效动作或证据处清零。模型流的无响应头、无首 chunk 或 chunk 间长期静默仍由单请求 watchdog 处理，该请求失败后回到共享恢复循环，不能直接把 Turn 判为超时。
+
 Root objective closure audit 只恢复可选的稳定工作区能力面（有界读／搜／编辑／有限命令），不重新开放长驻进程、PTY、浏览器或桌面能力。后四类能力必须由各自的结构化生命周期 checkpoint 重新开启，避免已经成功的有限验证在最终核对阶段漂移成无关的交互终端循环。
 
 ## Evidence ledger、typed validation 与完成门
@@ -175,7 +177,7 @@ typed validation primitive 的完成语义如下：
 
 ## 子智能体协作状态
 
-用户允许或偏好子智能体时，runtime 在有剩余容量和生命周期余量时向模型暴露 `spawn_subagent`。`preferred` 只表示鼓励独立工作，不强制开场派生。模型为具体 `explore`、`review` 或 `validate` 任务提供名称、目标、成功条件和只读路径；最多两个 child 同时活动，完成后立即释放容量。
+用户允许或偏好子智能体时，runtime 在父 Run 仍活动且有剩余 provider 容量时向模型暴露 `spawn_subagent`。`preferred` 只表示鼓励独立工作，不强制开场派生。模型为具体 `explore`、`review` 或 `validate` 任务提供名称、目标、成功条件和只读路径；同时活动数量由实际 provider lane 容量决定，完成后立即释放容量。普通 Execute 不因总耗时关闭父 Run 或 child；只有用户取消、显式调用方预算或真实停滞/资源边界可以收口。
 
 每个已派生任务的状态机是：
 

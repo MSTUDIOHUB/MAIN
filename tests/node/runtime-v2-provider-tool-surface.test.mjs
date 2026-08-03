@@ -188,6 +188,39 @@ test("an already completed safe read is not scheduled again before mutation", ()
   assert.equal(bounded.selection, "all_attempted");
 });
 
+test("an already completed effect is not scheduled again before a new mutation boundary", () => {
+  const validation = {
+    id: "validate-again",
+    name: "run_command",
+    arguments: { command: "npm test", cwd: "." },
+  };
+  const identity = surface.runtimeV2ProviderToolCallIdentity(validation);
+  const repeatedOnly = surface.boundRuntimeV2ProviderToolCalls(
+    [validation],
+    new Set([identity]),
+  );
+
+  assert.deepEqual(repeatedOnly.accepted, []);
+  assert.deepEqual(repeatedOnly.discarded, [validation]);
+  assert.equal(repeatedOnly.selection, "all_attempted");
+
+  const differentValidation = {
+    id: "validate-different",
+    name: "run_command",
+    arguments: { command: "npm run lint", cwd: "." },
+  };
+  const withNovelSibling = surface.boundRuntimeV2ProviderToolCalls(
+    [validation, differentValidation],
+    new Set([identity]),
+  );
+  assert.deepEqual(withNovelSibling.accepted, [differentValidation]);
+  assert.deepEqual(withNovelSibling.discarded, [validation]);
+  assert.equal(
+    withNovelSibling.selection,
+    "first_novel_after_attempt",
+  );
+});
+
 test("a novel safe read keeps completed companions in the provider-selected batch", () => {
   const toolbar = {
     id: "read-toolbar-again",

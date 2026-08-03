@@ -107,6 +107,7 @@ export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparation
   planLifecycle: PlanLifecycleState;
   planApprovalChoice?: string | null;
   showPlanPanel?: boolean;
+  rightPanelTab?: string;
   pendingPlanApprovalHandoff?: PlanApprovalHandoff | null;
   planApprovalExecutionStartedForTurnId?: string | null;
   currentTurnExecutionConsent?: { turnId: string | null; granted: boolean };
@@ -1083,6 +1084,8 @@ export async function settleProjectedRuntimePause<
       actionRequest.sessionKey === request.runSessionKey &&
       actionRequest.turnId === request.turnId &&
       actionRequest.runId === settlement.identity.runId;
+    const ownsPendingPlanReview =
+      ownsPendingAction && actionRequest.kind === "plan_review";
     const pausedTurnStatus = ownsPendingAction
       ? actionRequest.kind === "user_choice"
         ? "awaiting_input"
@@ -1142,6 +1145,12 @@ export async function settleProjectedRuntimePause<
       isGenerating: false,
       abortController: null,
       elapsedTime: request.elapsedTimer.getElapsedSeconds(),
+      ...(ownsPendingPlanReview
+        ? {
+            showPlanPanel: true,
+            rightPanelTab: "plan",
+          }
+        : {}),
     } as unknown as Partial<TState>;
   });
 

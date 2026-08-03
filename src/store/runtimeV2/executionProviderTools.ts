@@ -233,6 +233,49 @@ function normalizedSchemaScalar(
   return value;
 }
 
+function schemaValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => schemaValuesEqual(item, right[index]));
+  }
+  if (
+    !left ||
+    !right ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  ) {
+    return false;
+  }
+  const leftEntries = Object.entries(left as Record<string, unknown>);
+  const rightRecord = right as Record<string, unknown>;
+  const rightKeys = Object.keys(rightRecord);
+  return leftEntries.length === rightKeys.length &&
+    leftEntries.every(([key, value]) =>
+      Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+      schemaValuesEqual(value, rightRecord[key])
+    );
+}
+
+function normalizeIdentityDefault(
+  schema: ToolParameterSchema | undefined,
+  value: unknown,
+): unknown {
+  if (
+    !schema ||
+    !Object.prototype.hasOwnProperty.call(schema, "runtimeIdentityDefault")
+  ) {
+    return value;
+  }
+  const identityDefault = normalizedSchemaScalar(
+    schema,
+    schema.runtimeIdentityDefault,
+  );
+  return schemaValuesEqual(value, identityDefault) ? undefined : value;
+}
+
 /** Normalize transport-level scalar drift through the advertised schema
  * before action identity, scheduling, authorization, and execution see it. */
 export function normalizeRuntimeV2ProviderToolCalls(
@@ -243,25 +286,33 @@ export function normalizeRuntimeV2ProviderToolCalls(
   const schemas = new Map(
     tools.map((tool) => [
       tool.function.name,
-      tool.function.parameters.properties,
+      {
+        properties: tool.function.parameters.properties,
+        required: new Set(tool.function.parameters.required),
+      },
     ]),
   );
   return calls.map((call) => {
-    const properties = schemas.get(call.name);
-    if (!properties) return call;
+    const schema = schemas.get(call.name);
+    if (!schema) return call;
     const canonicalArguments = normalizeToolCallForExecution(
       call.name,
       call.arguments,
       workspace,
     );
+    const normalizedArguments = Object.fromEntries(
+      Object.entries(canonicalArguments).flatMap(([key, value]) => {
+        const propertySchema = schema.properties[key];
+        const normalizedValue = normalizedSchemaScalar(propertySchema, value);
+        const identityValue = schema.required.has(key)
+          ? normalizedValue
+          : normalizeIdentityDefault(propertySchema, normalizedValue);
+        return identityValue === undefined ? [] : [[key, identityValue]];
+      }),
+    );
     return {
       ...call,
-      arguments: Object.fromEntries(
-        Object.entries(canonicalArguments).map(([key, value]) => [
-          key,
-          normalizedSchemaScalar(properties[key], value),
-        ]),
-      ),
+      arguments: normalizedArguments,
     };
   });
 }

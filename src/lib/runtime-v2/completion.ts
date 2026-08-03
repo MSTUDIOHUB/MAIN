@@ -20,6 +20,44 @@ export interface RuntimeV2CompletionDecision {
   readonly resultReason: string;
 }
 
+/**
+ * A tool-free response is the provider's voluntary loop-completion signal in
+ * every Execute decision mode. Protocol diagnostics are deliberately excluded:
+ * the adapter may rewrite a rejected duplicate into an empty response, but
+ * that feedback receipt is not a provider-authored conclusion.
+ */
+export function latestRuntimeV2ProviderConclusionText(
+  aggregate: TurnAggregateV1,
+): string {
+  const scheduledModes = new Map<string, string>();
+  for (const event of aggregate.events) {
+    if (
+      event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+    ) {
+      scheduledModes.set(
+        event.command.idempotencyKey,
+        String(event.command.payload.mode || "").trim(),
+      );
+    }
+  }
+  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
+    const event = aggregate.events[index]!;
+    if (event.type !== "provider.responded") continue;
+    const mode = scheduledModes.get(event.idempotencyKey) || "";
+    if (
+      !["execute", "validate", "conclude"].includes(mode) ||
+      event.result.toolCalls.length > 0 ||
+      event.result.diagnostics.length > 0
+    ) {
+      continue;
+    }
+    const text = String(event.result.visibleText || "").trim();
+    if (text) return text.slice(0, 24_000);
+  }
+  return "";
+}
+
 export function exhaustedRuntimeV2ResultKind(
   aggregate: TurnAggregateV1,
 ): Extract<RuntimeV2ResultKind, "partial" | "error"> {
@@ -90,7 +128,32 @@ export function decideRuntimeV2TerminalOutcome(
       !approvedPlanCoverage.allMutationTargetsCovered ||
       !approvedPlanCoverage.allRequiredValidationsPassed
     ) {
-      return null;
+      if (!facts.hasProviderConclusion) return null;
+      const missingTargets =
+        approvedPlanCoverage.missingMutationTargets;
+      const missingValidationIds =
+        approvedPlanCoverage.missingRequiredValidationIndexes.map(
+          (index) => `work-plan-validation-${index + 1}`,
+        );
+      const detail = [
+        missingTargets.length > 0
+          ? `未覆盖修改目标：${missingTargets.join("、")}。`
+          : "",
+        missingValidationIds.length > 0
+          ? `未通过必需验证：${missingValidationIds.join("、")}。`
+          : "",
+      ].filter(Boolean).join(" ");
+      return facts.mutationCount > 0
+        ? {
+            resultKind: "partial",
+            resultReason:
+              `模型已结束本轮；已保留实际修改，但已批准 WorkPlan 尚未完整闭环。${detail}`,
+          }
+        : {
+            resultKind: "error",
+            resultReason:
+              `模型已结束本轮，但已批准 WorkPlan 没有形成可验收的实际修改。${detail}`,
+          };
     }
     return facts.hasProviderConclusion
       ? {

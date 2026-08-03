@@ -88,6 +88,7 @@ export function runtimeV2RepeatedActionFeedback(
   } else {
     lines.push(
       "No tool effect ran. Reuse a committed result when applicable; otherwise choose materially different arguments or another allowed action.",
+      "If no materially different authorized action can advance the objective, return a concise evidence report without a tool call; the Runtime will preserve the incomplete result without claiming success.",
     );
   }
   return lines.join("\n");

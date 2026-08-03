@@ -148,15 +148,43 @@ test("Runtime v2 store adapters do not import either legacy execution owner", ()
   }
 });
 
-test("Runtime v2 Execute accepts only a durable conclude response as final provider text", () => {
-  const source = fs.readFileSync(
+test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free response as final provider text", () => {
+  const coreSource = fs.readFileSync(
+    path.join(process.cwd(), "src/lib/runtime-v2/completion.ts"),
+    "utf8",
+  );
+  const adapterSource = fs.readFileSync(
     path.join(process.cwd(), "src/store/runtimeV2/executeRunner.ts"),
     "utf8",
   );
-  assert.match(source, /latestDurableProviderConclusion/);
-  assert.match(source, /payload\.mode/);
-  assert.match(source, /=== "conclude"/);
-  assert.doesNotMatch(source, /hasFinalProviderConclusion|latestVisibleText\s*\?\s*\{\s*finalMarkdown/);
+  assert.match(coreSource, /latestRuntimeV2ProviderConclusionText/);
+  assert.match(coreSource, /\["execute", "validate", "conclude"\]/);
+  assert.match(coreSource, /event\.result\.toolCalls\.length > 0/);
+  assert.match(coreSource, /event\.result\.diagnostics\.length > 0/);
+  assert.match(adapterSource, /latestRuntimeV2ProviderConclusionText/);
+  assert.doesNotMatch(
+    adapterSource,
+    /hasFinalProviderConclusion|latestVisibleText\s*\?\s*\{\s*finalMarkdown/,
+  );
+});
+
+test("ordinary Runtime v2 Execute has no whole-Turn wall-clock deadline", () => {
+  const runnerSource = fs.readFileSync(
+    path.join(process.cwd(), "src/store/runtimeV2/executeRunner.ts"),
+    "utf8",
+  );
+  const providerSource = fs.readFileSync(
+    path.join(process.cwd(), "src/store/runtimeV2/executionProviderPort.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    runnerSource,
+    /RUNTIME_V2_EXECUTION_DEADLINE_MS|admittedAt\s*\+|Date\.now\(\)\s*-\s*admittedAt/,
+    "ordinary Execute must remain open while real work is still progressing",
+  );
+  assert.match(runnerSource, /runtimeV2ProviderRecoveryStallExpired/);
+  assert.match(providerSource, /return Number\.isFinite\(lifecycleDeadlineAt\)/);
+  assert.doesNotMatch(providerSource, /PROVIDER_REQUEST_TIMEOUT_MS\s*=/);
 });
 
 test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
@@ -203,7 +231,7 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   assert.doesNotMatch(
     source,
     /PLAN_DISCOVERY_ACTION_BUDGET|PLAN_DISCOVERY_DEADLINE_MS|action_budget|time_budget/,
-    "planning may compact softly but only the shared lifecycle deadline may end discovery",
+    "planning may compact softly but only its shared model-stage deadline may end discovery",
   );
   assert.match(runner, /PLAN_MODEL_DEADLINE_MS/);
 });

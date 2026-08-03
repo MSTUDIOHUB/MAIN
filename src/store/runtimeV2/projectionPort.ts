@@ -10,6 +10,7 @@ import {
   deriveTurnRuntimePhaseForTool,
   withTurnRuntimePhaseStatus,
 } from "../../lib/turnPhase";
+import { runtimeV2StructuredActionMarkdown } from "../../lib/runtime-v2";
 import type {
   ProjectionPort,
   RuntimeV2Command,
@@ -496,9 +497,12 @@ export function createRuntimeV2ProjectionPort(
           const tool = commandTool(command);
           const target = commandTarget(command) || aggregate.evidence[aggregate.evidence.length - 1]?.target || "";
           const title = runStatusTitle(aggregate, command, target, input.language);
-          const summary = comparableRunStatusText(title) === comparableRunStatusText(projection.markdown)
-            ? ""
+          const structuredAction = command
+            ? runtimeV2StructuredActionMarkdown(command, aggregate)
             : projection.markdown;
+          const summary = comparableRunStatusText(title) === comparableRunStatusText(structuredAction)
+            ? ""
+            : structuredAction;
           runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
             type: "progress.updated",
             threadId: run.sessionKey,

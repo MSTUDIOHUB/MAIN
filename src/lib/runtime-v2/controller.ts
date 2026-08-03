@@ -342,13 +342,22 @@ export class RuntimeV2Controller {
     if (!next) return false;
     try {
       await this.schedule(next);
-      await this.execute(next);
     } catch (error) {
-      // A projection adapter must never strand a scheduled command. The
-      // controller settles the durable command through the same bounded
-      // recovery policy as an executor failure.
+      // Recovery owns only commands that crossed the durable scheduling
+      // boundary. A rejected transition/CAS is an infrastructure failure;
+      // treating it as a provider failure can retry an uncommitted identity
+      // forever without advancing the ledger.
+      if (!this.aggregate?.scheduledCommands.some(
+        (command) => command.idempotencyKey === next.idempotencyKey,
+      )) {
+        throw error;
+      }
+      // A later scheduling projection/handoff failure must not strand the
+      // already durable command.
       await this.handleCommandFailure(next, error);
+      return true;
     }
+    await this.execute(next);
     return true;
   }
 
@@ -563,14 +572,21 @@ export class RuntimeV2Controller {
   }
 
   private async handleCommandFailure(command: RuntimeV2Command, error: unknown): Promise<void> {
-    await this.settleScheduledCommand(command, "failed");
-    const state = this.requireAggregate();
-    if (!state.run || state.terminalOutcome) return;
     const decision = decideRuntimeV2CommandFailureRecovery({
-      aggregate: state,
+      aggregate: this.requireAggregate(),
       command,
       error,
     });
+    await this.settleScheduledCommand(
+      command,
+      decision.kind === "lifecycle_boundary" ? "canceled" : "failed",
+    );
+    const state = this.requireAggregate();
+    if (
+      !state.run ||
+      state.terminalOutcome ||
+      decision.kind === "lifecycle_boundary"
+    ) return;
     if (decision.kind === "signal") {
       await this.applySoftSignal(decision.signal);
     } else if (decision.kind === "record") {

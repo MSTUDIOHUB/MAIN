@@ -62,7 +62,8 @@ function canonical(value: unknown): string {
       key !== "actionFingerprint" &&
       key !== "attempt" &&
       key !== "toolCallId" &&
-      key !== "effectPressure"
+      key !== "effectPressure" &&
+      key !== "recoveryPressure"
     )
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)

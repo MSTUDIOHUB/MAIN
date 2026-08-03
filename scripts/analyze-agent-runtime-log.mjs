@@ -132,10 +132,16 @@ function createRun(event, runIndex) {
     providerTransportFailures: 0,
     providerRequestTimeouts: 0,
     toolDeadlineExceeded: 0,
+    lifecycleDeadlineClosures: 0,
+    providerRecoveryStallClosures: 0,
+    providerActionRejections: 0,
+    maxProviderRecoveryOccurrence: 0,
+    sourceOnlyFrontierContexts: 0,
     totalToolCalls: 0,
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
     mutationToolCalls: 0,
+    committedMutations: 0,
     validationToolCalls: 0,
     firstMutationIteration: null,
     noActionStops: 0,
@@ -294,7 +300,23 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_tool_deadline_exceeded") {
     run.toolDeadlineExceeded += 1;
   }
+  if (event.event === "store.runtime_v2_lifecycle_deadline_reached") {
+    run.lifecycleDeadlineClosures += 1;
+  }
+  if (event.event === "store.runtime_v2_provider_recovery_stall_reached") {
+    run.providerRecoveryStallClosures += 1;
+    run.maxProviderRecoveryOccurrence = Math.max(
+      run.maxProviderRecoveryOccurrence,
+      asNonNegativeInteger(payload.occurrence),
+    );
+  }
+  if (event.event === "store.runtime_v2_provider_action_rejected") {
+    run.providerActionRejections += 1;
+  }
   if (event.event === "store.runtime_v2_context_prepared") {
+    if (payload.sourceOnlyFrontier === true) {
+      run.sourceOnlyFrontierContexts += 1;
+    }
     run.maxAvailableContextEntries = Math.max(
       run.maxAvailableContextEntries,
       asNonNegativeInteger(payload.availableContextEntries),
@@ -306,6 +328,10 @@ function applyEventToRun(run, event) {
     run.maxStrategyPivotRevision = Math.max(
       run.maxStrategyPivotRevision,
       asNonNegativeInteger(payload.strategyPivotRevision),
+    );
+    run.maxProviderRecoveryOccurrence = Math.max(
+      run.maxProviderRecoveryOccurrence,
+      asNonNegativeInteger(payload.recoveryOccurrence),
     );
     const available = payload.contextSources &&
       typeof payload.contextSources === "object"
@@ -490,6 +516,7 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_execute_terminal") {
     run.terminalResultKind = asString(payload.resultKind);
     run.terminalReason = asString(payload.reason);
+    run.committedMutations = asNonNegativeInteger(payload.mutations);
     run.staticOnlyBehavioralCriterionIds =
       Array.isArray(payload.staticOnlyBehavioralCriterionIds)
         ? payload.staticOnlyBehavioralCriterionIds
@@ -585,11 +612,29 @@ function finalizeRunWarnings(run) {
     warnings.push("semantic_protocol_used_transport_fallback");
   }
   if (
-    run.providerProtocolFailures >= 3 &&
+    run.providerProtocolFailures + run.providerActionRejections >= 3 &&
     run.providerRequests >= 3 &&
-    run.maxStrategyPivotRevision === 0
+    run.maxStrategyPivotRevision === 0 &&
+    run.maxProviderRecoveryOccurrence === 0
   ) {
     warnings.push("provider_livelock_without_strategy_pivot");
+  }
+  if (
+    run.providerActionRejections >= 3 &&
+    run.committedMutations === 0
+  ) {
+    warnings.push("provider_repeated_actions_without_effect");
+  }
+  if (
+    run.terminalResultKind &&
+    run.terminalResultKind !== "success" &&
+    run.terminalResultKind !== "canceled" &&
+    run.totalToolCalls > 0 &&
+    run.committedMutations === 0 &&
+    run.sourceOnlyFrontierContexts >= 2 &&
+    run.providerRequests >= 2
+  ) {
+    warnings.push("source_only_frontier_ended_without_effect");
   }
   run.warnings = warnings;
 }
@@ -603,6 +648,7 @@ function buildAggregate(runs) {
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
     mutationToolCalls: 0,
+    committedMutations: 0,
     validationToolCalls: 0,
     firstMutationIteration: null,
     runsWithMutation: 0,
@@ -616,6 +662,11 @@ function buildAggregate(runs) {
     providerTransportFailures: 0,
     providerRequestTimeouts: 0,
     toolDeadlineExceeded: 0,
+    lifecycleDeadlineClosures: 0,
+    providerRecoveryStallClosures: 0,
+    providerActionRejections: 0,
+    maxProviderRecoveryOccurrence: 0,
+    sourceOnlyFrontierContexts: 0,
     subagentRequests: 0,
     subagentContextHandoffs: 0,
     subagentsJoined: 0,
@@ -673,6 +724,7 @@ function buildAggregate(runs) {
       "unclassifiedToolCalls",
       "readFileCalls",
       "mutationToolCalls",
+      "committedMutations",
       "validationToolCalls",
       "noActionStops",
       "providerCompatibilityRetries",
@@ -684,6 +736,10 @@ function buildAggregate(runs) {
       "providerTransportFailures",
       "providerRequestTimeouts",
       "toolDeadlineExceeded",
+      "lifecycleDeadlineClosures",
+      "providerRecoveryStallClosures",
+      "providerActionRejections",
+      "sourceOnlyFrontierContexts",
       "subagentRequests",
       "subagentContextHandoffs",
       "subagentsJoined",
@@ -734,6 +790,10 @@ function buildAggregate(runs) {
     aggregate.maxStrategyPivotRevision = Math.max(
       aggregate.maxStrategyPivotRevision,
       run.maxStrategyPivotRevision,
+    );
+    aggregate.maxProviderRecoveryOccurrence = Math.max(
+      aggregate.maxProviderRecoveryOccurrence,
+      run.maxProviderRecoveryOccurrence,
     );
     if (run.firstMutationIteration !== null) {
       aggregate.runsWithMutation += 1;

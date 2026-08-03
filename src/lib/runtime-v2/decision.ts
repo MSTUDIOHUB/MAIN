@@ -6,6 +6,7 @@ import type {
   RuntimeV2ExecutionValidationAuthority,
   RuntimeV2ResultKind,
 } from "./contracts";
+import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import {
   resolveRuntimeV2SubagentReferences,
@@ -119,8 +120,13 @@ function actionFingerprint(
 }
 
 function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
-  return state.completedCommands.filter((receipt) => receipt.actionFingerprint === fingerprint).length +
-    state.scheduledCommands.filter((scheduled) => runtimeV2ActionFingerprint(scheduled) === fingerprint).length;
+  // `completedCommands` is a bounded replay cache. Command identity must be
+  // derived from the canonical ledger or its attempt number can roll back
+  // when an old receipt leaves that cache.
+  return state.events.filter((event) =>
+    event.type === "command.scheduled" &&
+    runtimeV2ActionFingerprint(event.command) === fingerprint
+  ).length;
 }
 
 function deterministicCommandKey(
@@ -178,6 +184,116 @@ function executeReadyForConclusion(state: TurnAggregateV1): boolean {
       planCoverage.allRequiredValidationsPassed;
   }
   return runtimeV2DirectExecuteReadyForConclusion(state);
+}
+
+export interface RuntimeV2ProviderRecoveryPressure {
+  readonly schemaVersion: "runtime-v2-provider-recovery.v1";
+  readonly reason:
+    | "repeated_action_rejected"
+    | "empty_response"
+    | "provider_request_failed";
+  readonly occurrence: number;
+  readonly stage: "reconsider" | "reframe" | "alternative";
+}
+
+export interface RuntimeV2ProviderRecoveryWindow {
+  readonly pressure: RuntimeV2ProviderRecoveryPressure;
+  /** Time of the first uninterrupted non-actionable provider decision. */
+  readonly startedAt: number;
+}
+
+function providerRequestCommandKeys(
+  events: readonly RuntimeV2Event[],
+): ReadonlySet<string> {
+  return new Set(events.flatMap((event) =>
+    event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+      ? [event.command.idempotencyKey]
+      : []
+  ));
+}
+
+/**
+ * Derive one bounded recovery fact from the canonical ledger. The count is not
+ * a completion or authorization rule: it selects a materially different next
+ * decision prompt while the task remains open.
+ */
+export function deriveRuntimeV2ProviderRecoveryWindow(
+  state: TurnAggregateV1,
+): RuntimeV2ProviderRecoveryWindow | null {
+  if (state.pendingToolCalls.length > 0) return null;
+  const providerRequestKeys = providerRequestCommandKeys(state.events);
+  let occurrence = 0;
+  let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
+  let startedAt = 0;
+
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "provider.responded") {
+      const repeated = event.result.diagnostics.some((diagnostic) =>
+        diagnostic.code === "repeated_action_rejected"
+      );
+      const nonActionable =
+        event.result.toolCalls.length === 0 &&
+        (
+          event.result.diagnostics.length > 0 ||
+          !String(event.result.visibleText || "").trim()
+        );
+      if (!nonActionable) break;
+      occurrence += 1;
+      startedAt = event.at;
+      if (!latestReason) {
+        latestReason = repeated
+          ? "repeated_action_rejected"
+          : "empty_response";
+      }
+      continue;
+    }
+    if (
+      event.type === "command.completed" &&
+      event.status === "failed" &&
+      providerRequestKeys.has(event.idempotencyKey)
+    ) {
+      occurrence += 1;
+      startedAt = event.at;
+      latestReason ||= "provider_request_failed";
+      continue;
+    }
+    if (
+      event.type === "observation.recorded" ||
+      event.type === "tool.completed" ||
+      event.type === "validation.completed" ||
+      event.type === "work_plan.sealed" ||
+      event.type === "work_plan.approved" ||
+      event.type === "work_plan.invalidated" ||
+      event.type === "subagent.completed" ||
+      event.type === "subagent.handoff_applied" ||
+      event.type === "run.started"
+    ) {
+      break;
+    }
+  }
+
+  if (!latestReason || occurrence === 0) return null;
+  return {
+    startedAt,
+    pressure: {
+      schemaVersion: "runtime-v2-provider-recovery.v1",
+      reason: latestReason,
+      occurrence,
+      stage: occurrence === 1
+        ? "reconsider"
+        : occurrence === 2
+          ? "reframe"
+          : "alternative",
+    },
+  };
+}
+
+export function deriveRuntimeV2ProviderRecoveryPressure(
+  state: TurnAggregateV1,
+): RuntimeV2ProviderRecoveryPressure | null {
+  return deriveRuntimeV2ProviderRecoveryWindow(state)?.pressure || null;
 }
 
 /**
@@ -246,6 +362,9 @@ function executeModelRequest(
   const effectPressure = mode === "execute"
     ? deriveRuntimeV2EffectPressure(state)
     : null;
+  const recoveryPressure = mode === "execute" || mode === "validate"
+    ? deriveRuntimeV2ProviderRecoveryPressure(state)
+    : null;
   return boundedCommand(state, "request_model", {
     mode,
     objective: state.objective.text,
@@ -255,6 +374,7 @@ function executeModelRequest(
       (item) => item.kind === "source" && !!item.version,
     ),
     ...(effectPressure ? { effectPressure } : {}),
+    ...(recoveryPressure ? { recoveryPressure } : {}),
     ...collaborationPayload(state, input),
   });
 }

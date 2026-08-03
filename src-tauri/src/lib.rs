@@ -79,7 +79,10 @@ const HTTP_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const CURL_FALLBACK_STDERR_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_SUPERVISOR_GRACE_SECS: u64 = 5;
-const STREAM_PHASE_TIMEOUT_SECS: u64 = 180;
+// This watchdog applies independently to response headers, the first chunk,
+// and each subsequent idle gap. It is not a total model-generation or Turn
+// duration limit; every received chunk opens a fresh phase window.
+const STREAM_PHASE_TIMEOUT_SECS: u64 = 600;
 const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 1_000;
 const READ_FILE_WINDOW_MAX_LINES: usize = 2_000;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 32_000;
@@ -9813,7 +9816,19 @@ async fn read_stream_error_body(
     }
 }
 
+fn should_emit_chat_stream_done(status: &str) -> bool {
+    // The frontend settles Abort immediately and unregisters both stream
+    // listeners before asking Rust to cancel. Broadcasting a second
+    // `cancelled` event after that cleanup races Tauri's callback registry and
+    // can target an already-removed callback id. Success and real Rust-owned
+    // errors still use the terminal event channel.
+    status != "cancelled"
+}
+
 fn emit_chat_stream_done(app: &AppHandle, stream_id: &str, status: &str, error: Option<String>) {
+    if !should_emit_chat_stream_done(status) {
+        return;
+    }
     let _ = app.emit(
         "chat-stream-done",
         StreamDonePayload {
@@ -12764,11 +12779,12 @@ mod tests {
         read_pty_generation_tail, read_session_transcript_with_fallback,
         resolve_command_working_directory, resolve_existing_path, resolve_open_file_external_path,
         resolve_write_path, revalidate_write_path, run_cancellable_bounded_process,
-        run_workspace_shell_command, should_hide_list_directory_entry,
-        should_skip_recursive_search_dir, validate_image_studio_endpoint_for_engine,
-        validate_image_studio_remote_image_url, validate_proxy_request_headers, validate_pty_input,
-        ChatStreamLease, FileNode, ProxyPhaseError, ProxyRequestLease,
-        EARLY_CANCELLED_PROXY_REQUEST_LIMIT, EARLY_CANCELLED_STREAM_LIMIT, PTY_TAIL_DEFAULT_CHARS,
+        run_workspace_shell_command, should_emit_chat_stream_done,
+        should_hide_list_directory_entry, should_skip_recursive_search_dir,
+        validate_image_studio_endpoint_for_engine, validate_image_studio_remote_image_url,
+        validate_proxy_request_headers, validate_pty_input, ChatStreamLease, FileNode,
+        ProxyPhaseError, ProxyRequestLease, EARLY_CANCELLED_PROXY_REQUEST_LIMIT,
+        EARLY_CANCELLED_STREAM_LIMIT, PTY_TAIL_DEFAULT_CHARS,
     };
     use serde_json::json;
     use std::fs;
@@ -12777,6 +12793,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     static CANCELLATION_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cancelled_chat_stream_does_not_emit_after_frontend_cleanup() {
+        assert!(!should_emit_chat_stream_done("cancelled"));
+        assert!(should_emit_chat_stream_done("ok"));
+        assert!(should_emit_chat_stream_done("error"));
+    }
 
     #[test]
     fn read_file_window_preserves_exact_source_boundaries() {

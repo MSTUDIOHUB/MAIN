@@ -195,7 +195,14 @@ export function boundRuntimeV2ProviderToolCalls(
       runtimeV2ProviderToolCallIdentity(calls[index]!),
     )
   );
-  const selectedIndex = firstNovelIndex ?? eligibleIndices[0]!;
+  if (firstNovelIndex === undefined) {
+    return {
+      accepted: [],
+      discarded: [...calls],
+      selection: "all_attempted",
+    };
+  }
+  const selectedIndex = firstNovelIndex;
   const skippedRejected = calls
     .slice(0, selectedIndex)
     .some((call) =>

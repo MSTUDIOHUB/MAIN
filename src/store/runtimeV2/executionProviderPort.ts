@@ -1,14 +1,11 @@
-import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
-import {
-  isWorkspaceMutationToolName,
-} from "../../lib/workspaceMutationTools";
 import {
   providerActionEpochExhausted,
   recordProviderTransportAttempt,
   isRuntimeV2ProviderProtocolError,
   RuntimeV2ProviderProtocolError,
   RuntimeV2ProviderTransportsUnavailableError,
+  isRuntimeV2LifecycleDeadlineError,
   runtimeV2ProviderAttemptFailure,
   runtimeV2ProviderProtocolErrorAllowsTransportFallback,
   selectNextProviderTransportAttempt,
@@ -16,13 +13,13 @@ import {
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
+  appendRuntimeV2RejectedToolCallHistory,
   appendRuntimeV2ProviderFeedbackHistory,
-  appendRuntimeV2AssistantToolCallHistory,
-  appendRuntimeV2AssistantTextHistory,
   aggregateForCurrentTurn,
   baseProviderProfile,
   deriveRuntimeV2ProviderEffectFacts,
   providerToolDefinitionsForCommand,
+  rememberRuntimeV2ProviderResult,
   runtimeV2ParallelReadCount,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
@@ -38,7 +35,11 @@ import {
   scopeRuntimeV2ProviderToolCallIds,
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
-import { withRuntimeV2HardDeadline } from "./hardDeadline";
+import {
+  assertRuntimeV2ProviderRequestDeadline,
+  executeRuntimeV2ProviderWithDeadline,
+  isRuntimeV2ExecutionProviderTimeout,
+} from "./executionProviderDeadline";
 import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
@@ -53,47 +54,17 @@ import {
 
 export { runtimeV2RepeatedActionFeedback } from "./executionProviderFeedback";
 
-export const RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
-
 export function runtimeV2ExecutionProviderDeadlineAt(
-  now: number,
+  _now: number,
   lifecycleDeadlineAt?: number,
-): number {
-  // Production Execute always owns one absolute lifecycle deadline. A local
-  // model's prefill time grows with the exact context it was asked to consume;
-  // restarting an otherwise healthy request at a shorter fixed interval only
-  // repeats that work and can make completion impossible.
+): number | undefined {
+  // Ordinary Execute has no whole-request wall-clock budget. Streaming owns a
+  // phase watchdog, so a slow but active local model can keep producing output
+  // without its request being canceled merely because total generation time is
+  // long. An explicit caller-owned lifecycle budget remains enforceable.
   return Number.isFinite(lifecycleDeadlineAt)
     ? Number(lifecycleDeadlineAt)
-    : now + RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT_MS;
-}
-
-function rememberResult(
-  input: RuntimeV2ExecutionPortsInput,
-  result: Awaited<ReturnType<typeof requestRuntimeV2ProviderOnce>>,
-): void {
-  input.live.latestProviderResult = result;
-  input.live.latestVisibleText = result.toolCalls.length === 0
-    ? sanitizeAssistantDisplayContent(result.visibleText || "")
-      .trim()
-      .slice(0, 24_000)
-    : "";
-  if (input.live.latestVisibleText) {
-    appendRuntimeV2AssistantTextHistory(
-      input.live,
-      input.live.latestVisibleText,
-    );
-  }
-  if (result.toolCalls.length > 0) {
-    for (const call of result.toolCalls) {
-      if (!isWorkspaceMutationToolName(call.name)) continue;
-      input.live.mutationSourceCoverageByToolCallId.set(
-        call.id,
-        input.live.latestProviderRequestSourceCoverage,
-      );
-    }
-    appendRuntimeV2AssistantToolCallHistory(input.live, result);
-  }
+    : undefined;
 }
 
 export function createRuntimeV2ProviderPort(
@@ -118,22 +89,35 @@ export function createRuntimeV2ProviderPort(
         Date.now(),
         input.lifecycleDeadlineAt,
       );
+      assertRuntimeV2ProviderRequestDeadline({
+        ports: input,
+        command,
+        requestDeadlineAt,
+        transport: null,
+      });
 
       if (tools.length === 0) {
-        const timeoutMs = Math.max(1, requestDeadlineAt - Date.now());
         let result;
         try {
-          result = await requestRuntimeV2ProviderOnce({
-            live: input.live,
+          result = await executeRuntimeV2ProviderWithDeadline({
             ports: input,
             command,
-            tools: [],
-            textEnvelope: false,
-            toolChoice: null,
+            requestDeadlineAt,
+            transport: null,
             signal,
-            timeoutMs,
+            task: (request) => requestRuntimeV2ProviderOnce({
+              live: input.live,
+              ports: input,
+              command,
+              tools: [],
+              textEnvelope: false,
+              toolChoice: null,
+              signal: request.signal,
+              timeoutMs: request.timeoutMs,
+            }),
           });
         } catch (error) {
+          if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
           if (isRuntimeV2ProviderProtocolError(error)) throw error;
           throw runtimeV2ProviderAttemptFailure(error);
         }
@@ -144,7 +128,7 @@ export function createRuntimeV2ProviderPort(
             () => input.nextId("provider-tool-call"),
           ),
         };
-        rememberResult(input, result);
+        rememberRuntimeV2ProviderResult(input, result);
         return result;
       }
 
@@ -162,55 +146,52 @@ export function createRuntimeV2ProviderPort(
         throw new RuntimeV2ProviderTransportsUnavailableError();
       }
       let lastError: unknown = null;
-      while (Date.now() < requestDeadlineAt) {
+      while (
+        !Number.isFinite(requestDeadlineAt) ||
+        Date.now() < Number(requestDeadlineAt)
+      ) {
         const attempt = selectNextProviderTransportAttempt(profile, epoch);
         if (!attempt) break;
         epoch = recordProviderTransportAttempt(epoch, attempt);
-        const requestAbort = new AbortController();
-        const forwardAbort = () => requestAbort.abort(signal.reason);
-        if (signal.aborted) forwardAbort();
-        else signal.addEventListener("abort", forwardAbort, { once: true });
-        const remainingMs = Math.max(1, requestDeadlineAt - Date.now());
         const hasFallback =
           selectNextProviderTransportAttempt(profile, epoch) !== null;
         // A fallback is a capability negotiation path after an explicit
         // protocol error, not a retry for a slow or timed-out request.
-        // Therefore the current supported transport owns the full remaining
-        // request deadline.
-        const timeoutMs = remainingMs;
-        let requestTimedOut = false;
+        // Therefore the current supported transport is never interrupted by a
+        // shorter adapter retry timer.
         try {
-          input.logStoreEvent("runtime_v2_provider_request_opened", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            phase: command.phase,
+          let result = await executeRuntimeV2ProviderWithDeadline({
+            ports: input,
+            command,
+            requestDeadlineAt,
             transport: attempt.variant,
-            allowedToolNames,
-            hasFallback,
-            timeoutMs,
-            maxOutputTokens: runtimeV2ExecutionProviderOutputTokenLimit(
-              command,
-              attempt.textEnvelope,
-              input.context.runtimeContextBudget,
-            ),
-          });
-          let result = await withRuntimeV2HardDeadline({
-            timeoutMs,
-            timeoutError: "RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT",
-            onTimeout: () => {
-              requestTimedOut = true;
-              requestAbort.abort("runtime_v2_execution_provider_request_timeout");
+            signal,
+            task: (request) => {
+              input.logStoreEvent("runtime_v2_provider_request_opened", {
+                turnId: command.run.turnId,
+                runId: command.run.runId,
+                phase: command.phase,
+                transport: attempt.variant,
+                allowedToolNames,
+                hasFallback,
+                timeoutMs: request.timeoutMs ?? null,
+                maxOutputTokens: runtimeV2ExecutionProviderOutputTokenLimit(
+                  command,
+                  attempt.textEnvelope,
+                  input.context.runtimeContextBudget,
+                ),
+              });
+              return requestRuntimeV2ProviderOnce({
+                live: input.live,
+                ports: input,
+                command,
+                tools,
+                textEnvelope: attempt.textEnvelope,
+                toolChoice: attempt.toolChoice,
+                signal: request.signal,
+                timeoutMs: request.timeoutMs,
+              });
             },
-            task: () => requestRuntimeV2ProviderOnce({
-              live: input.live,
-              ports: input,
-              command,
-              tools,
-              textEnvelope: attempt.textEnvelope,
-              toolChoice: attempt.toolChoice,
-              signal: requestAbort.signal,
-              timeoutMs,
-            }),
           });
           result = {
             ...result,
@@ -391,6 +372,16 @@ export function createRuntimeV2ProviderPort(
                   (coverage) => coverage.target,
                 ),
             });
+            const [rejectedHistoryCall] =
+              scopeRuntimeV2ProviderToolCallIds(
+                [rejectedCall],
+                () => input.nextId("provider-rejected-tool-call"),
+              );
+            appendRuntimeV2RejectedToolCallHistory(input.live, {
+              call: rejectedHistoryCall!,
+              actionIdentity,
+              feedback,
+            });
             appendRuntimeV2ProviderFeedbackHistory(input.live, {
               code: "repeated_action_rejected",
               feedback,
@@ -410,7 +401,7 @@ export function createRuntimeV2ProviderPort(
                 },
               ],
             };
-            rememberResult(input, result);
+            rememberRuntimeV2ProviderResult(input, result);
             input.logStoreEvent("runtime_v2_provider_action_rejected", {
               turnId: command.run.turnId,
               runId: command.run.runId,
@@ -470,7 +461,7 @@ export function createRuntimeV2ProviderPort(
             if (!covered?.receipt) return;
             input.live.coveredReadToolResults.set(call.id, covered.receipt);
           });
-          rememberResult(input, result);
+          rememberRuntimeV2ProviderResult(input, result);
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,
@@ -480,6 +471,12 @@ export function createRuntimeV2ProviderPort(
           });
           return result;
         } catch (error) {
+          if (isRuntimeV2LifecycleDeadlineError(error)) {
+            lastError = error;
+            break;
+          }
+          const requestTimedOut =
+            isRuntimeV2ExecutionProviderTimeout(error);
           const errorMessage = error instanceof Error
             ? error.message
             : String(error);
@@ -530,10 +527,9 @@ export function createRuntimeV2ProviderPort(
           if (!protocolFallbackAllowed) {
             break;
           }
-        } finally {
-          signal.removeEventListener("abort", forwardAbort);
         }
       }
+      if (isRuntimeV2LifecycleDeadlineError(lastError)) throw lastError;
       if (isRuntimeV2ProviderProtocolError(lastError)) throw lastError;
       throw runtimeV2ProviderAttemptFailure(lastError);
     },

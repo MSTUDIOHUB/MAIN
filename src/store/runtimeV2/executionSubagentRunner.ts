@@ -9,18 +9,21 @@ import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
 import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
+  advanceRuntimeV2ChildRecoveryStallLease,
   compileRuntimeV2SubagentTextReport,
   isRuntimeV2ProviderProtocolError,
   normalizeProviderResponseV1,
   recordProviderTransportAttempt,
   RuntimeV2ProviderProtocolError,
   runtimeV2ProviderProtocolErrorAllowsTransportFallback,
+  runtimeV2ChildRecoveryStallExpired,
   runtimeV2EvidenceVersion,
   runtimeV2SubagentFailureSummary,
   selectNextProviderTransportAttempt,
   type RuntimeV2EvidenceReference,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2NormalizedToolCall,
+  type RuntimeV2ChildRecoveryStallLease,
   type RuntimeV2SubagentJob,
 } from "../../lib/runtime-v2";
 import { analyzeValidationCommand } from "../../lib/validationContract";
@@ -155,6 +158,7 @@ async function requestChildStep(input: {
   readonly tools: readonly ToolDefinition[];
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
+  readonly recoveryOccurrence: number;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const profile = {
     ...baseProviderProfile(input.ports.get()),
@@ -181,6 +185,13 @@ async function requestChildStep(input: {
     try {
       const requestMessages: AgentMessage[] = [
         ...input.messages,
+        ...(input.recoveryOccurrence > 0
+          ? [{
+              role: "system" as const,
+              content:
+                `CHILD_RECOVERY_PIVOT ${input.recoveryOccurrence}: the previous child step produced no new evidence. Use a genuinely different allowed read/validation action for one named missing fact, or conclude from retained evidence. Do not repeat the closed action.`,
+            }]
+          : []),
         ...(attempt.textEnvelope
           ? [{
             role: "system" as const,
@@ -498,6 +509,8 @@ async function runRuntimeV2Child(input: {
     ),
   );
   let ordinal = 0;
+  let recoveryLease: RuntimeV2ChildRecoveryStallLease | null = null;
+  let recoveryStalled = false;
   try {
     while (!input.signal.aborted && Date.now() < deadlineAt) {
       let result: RuntimeV2NormalizedProviderResult;
@@ -507,6 +520,7 @@ async function runRuntimeV2Child(input: {
           messages,
           tools,
           deadlineAt,
+          recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
       } catch (error) {
         if (
@@ -545,6 +559,7 @@ async function runRuntimeV2Child(input: {
         })),
       });
       const parallelReadCount = runtimeV2ParallelReadCount(calls);
+      let progressed = false;
       for (const call of calls) {
         if (!acceptedCallIds.has(call.id)) {
           messages.push({
@@ -613,6 +628,7 @@ async function runRuntimeV2Child(input: {
                 }
               : null;
           if (childEvidence) {
+            progressed = true;
             fingerprints.add(fingerprint);
             evidence.push(childEvidence);
             input.ports.logStoreEvent(
@@ -651,6 +667,30 @@ async function runRuntimeV2Child(input: {
           });
         }
       }
+      recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
+        current: recoveryLease,
+        progressed,
+        now: input.ports.now(),
+      });
+      if (
+        runtimeV2ChildRecoveryStallExpired(
+          recoveryLease,
+          input.ports.now(),
+        )
+      ) {
+        recoveryStalled = true;
+        input.ports.logStoreEvent(
+          "runtime_v2_subagent_recovery_stall_reached",
+          {
+            turnId: input.job.run.turnId,
+            runId: input.job.run.runId,
+            jobId: input.job.id,
+            occurrence: recoveryLease?.occurrence || 0,
+            recoveryStartedAt: recoveryLease?.startedAt || null,
+          },
+        );
+        break;
+      }
     }
   } catch {
     const canceled = input.signal.aborted &&
@@ -666,6 +706,7 @@ async function runRuntimeV2Child(input: {
       status,
       summary: runtimeV2SubagentFailureSummary({
         canceled,
+        recoveryStalled,
         deadlineExceeded:
           input.signal.reason instanceof RuntimeV2ChildDeadlineError ||
           Date.now() >= deadlineAt,
@@ -689,7 +730,8 @@ async function runRuntimeV2Child(input: {
     status,
     summary: runtimeV2SubagentFailureSummary({
       canceled,
-      deadlineExceeded: !canceled,
+      recoveryStalled,
+      deadlineExceeded: !canceled && !recoveryStalled,
       evidence,
     }),
     report: null,

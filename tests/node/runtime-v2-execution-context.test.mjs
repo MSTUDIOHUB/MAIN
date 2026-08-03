@@ -82,6 +82,10 @@ const providerPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderPort.ts",
 ));
+const providerDeadline = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionProviderDeadline.ts",
+));
 const executionTypes = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionTypes.ts",
@@ -93,6 +97,10 @@ const providerEffectFacts = loadTs(path.join(
 const executionToolPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolPort.ts",
+));
+const executionToolDeadline = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionToolDeadline.ts",
 ));
 const executionText = loadTs(path.join(
   workspaceRoot,
@@ -126,6 +134,100 @@ const runtime = loadTs(path.join(
   workspaceRoot,
   "src/lib/runtime-v2/index.ts",
 ));
+
+test("a shared lifecycle boundary stays distinct from a tool timeout", async () => {
+  await assert.rejects(
+    executionToolDeadline.executeRuntimeV2ToolWithDeadline({
+      toolName: "read_file",
+      lifecycleDeadlineAt: 100,
+      now: () => 100,
+      task: async () => "unreachable",
+    }),
+    (error) => {
+      assert.equal(runtime.isRuntimeV2LifecycleDeadlineError(error), true);
+      return true;
+    },
+  );
+});
+
+test("a provider request reports the shared lifecycle boundary without a transport failure", async () => {
+  const events = [];
+  const lifecycleDeadlineAt = Date.now() + 5;
+  const command = {
+    idempotencyKey: "provider-lifecycle",
+    kind: "request_provider",
+    phase: "observing",
+    run: {
+      sessionKey: "session",
+      sessionEpoch: "epoch",
+      turnId: "turn",
+      runId: "run",
+      parentRunId: null,
+      attemptId: "attempt",
+    },
+    payload: {},
+  };
+  await assert.rejects(
+    providerDeadline.executeRuntimeV2ProviderWithDeadline({
+      ports: {
+        lifecycleDeadlineAt,
+        logStoreEvent: (event, payload) => events.push({ event, payload }),
+      },
+      command,
+      requestDeadlineAt: lifecycleDeadlineAt,
+      transport: "native_auto",
+      signal: new AbortController().signal,
+      task: () => new Promise(() => undefined),
+    }),
+    (error) => {
+      assert.equal(runtime.isRuntimeV2LifecycleDeadlineError(error), true);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    events.map((entry) => entry.event),
+    ["runtime_v2_lifecycle_deadline_reached"],
+  );
+});
+
+test("ordinary Execute provider requests have no default whole-request wall-clock deadline", async () => {
+  assert.equal(
+    providerPort.runtimeV2ExecutionProviderDeadlineAt(1_000),
+    undefined,
+    "normal Execute must use the transport phase watchdog instead of a total Run/request deadline",
+  );
+
+  let observedTimeout = "not-called";
+  const result = await providerDeadline.executeRuntimeV2ProviderWithDeadline({
+    ports: {
+      logStoreEvent: () => undefined,
+    },
+    command: {
+      idempotencyKey: "provider-unbounded-execute",
+      kind: "request_model",
+      phase: "acting",
+      run: {
+        sessionKey: "session",
+        sessionEpoch: "epoch",
+        turnId: "turn",
+        runId: "run",
+        parentRunId: null,
+        attemptId: "attempt",
+      },
+      payload: { mode: "execute" },
+    },
+    requestDeadlineAt: undefined,
+    transport: "native_auto",
+    signal: new AbortController().signal,
+    task: async ({ timeoutMs }) => {
+      observedTimeout = timeoutMs;
+      return "completed";
+    },
+  });
+
+  assert.equal(result, "completed");
+  assert.equal(observedTimeout, undefined);
+});
 
 test("successful empty tool output is explicit model evidence", () => {
   assert.equal(
@@ -1104,6 +1206,91 @@ test("a rejected action leaves one non-executable causal feedback anchor", () =>
   );
 });
 
+test("a repeated provider action is closed as one native tool exchange", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.latestProviderAssistantReasoning = {
+    field: "reasoning_content",
+    content: "private rejected reasoning",
+  };
+  const call = {
+    id: "rejected-read-1",
+    name: "read_file",
+    arguments: { path: "src/hooks/useCsvParser.ts" },
+  };
+  const feedback = [
+    "ACTION_NOT_EXECUTED: the latest read_file action already completed.",
+    "Reuse the committed result or choose a materially different action.",
+  ].join("\n");
+
+  providerHistory.appendRuntimeV2RejectedToolCallHistory(live, {
+    call,
+    actionIdentity: "read-file-identity",
+    feedback,
+  });
+  providerHistory.appendRuntimeV2ProviderFeedbackHistory(live, {
+    code: "repeated_action_rejected",
+    feedback,
+  });
+
+  assert.deepEqual(
+    live.messages.map((message) => message.role),
+    ["assistant", "tool", "system"],
+  );
+  assert.equal(
+    live.messages[0]?.tool_calls?.[0]?.function.name,
+    "read_file",
+  );
+  assert.deepEqual(
+    JSON.parse(live.messages[0]?.tool_calls?.[0]?.function.arguments || "{}"),
+    { path: "src/hooks/useCsvParser.ts" },
+  );
+  assert.equal(live.messages[1]?.tool_call_id, "rejected-read-1");
+  assert.match(String(live.messages[1]?.content || ""), /ACTION_NOT_EXECUTED/);
+  assert.equal(live.latestProviderAssistantReasoning, null);
+
+  providerHistory.appendRuntimeV2RejectedToolCallHistory(live, {
+    call: { ...call, id: "rejected-read-2" },
+    actionIdentity: "read-file-identity",
+    feedback,
+  });
+  providerHistory.appendRuntimeV2ProviderFeedbackHistory(live, {
+    code: "repeated_action_rejected",
+    feedback,
+  });
+  assert.equal(
+    live.messages.length,
+    3,
+    "the same rejected action must not grow the decision transcript",
+  );
+  assert.equal(
+    live.messages[1]?.tool_call_id,
+    "rejected-read-2",
+    "the bounded rejection pair must move to the latest decision frontier",
+  );
+
+  const mutationLive = executionTypes.createRuntimeV2LiveExecutionState();
+  providerHistory.appendRuntimeV2RejectedToolCallHistory(mutationLive, {
+    call: {
+      id: "rejected-mutation-1",
+      name: "replace_in_file",
+      arguments: {
+        path: "src/secret.ts",
+        search_text: "SENSITIVE_OLD_SOURCE",
+        replace_text: "SENSITIVE_NEW_SOURCE",
+      },
+    },
+    actionIdentity: "mutation-identity",
+    feedback:
+      "ACTION_NOT_EXECUTED: targets: [\"src/secret.ts\"]; effect: none.",
+  });
+  const mutationExchange = JSON.stringify(mutationLive.messages);
+  assert.match(mutationExchange, /mutation-identity/);
+  assert.doesNotMatch(
+    mutationExchange,
+    /SENSITIVE_OLD_SOURCE|SENSITIVE_NEW_SOURCE|search_text|replace_text/,
+  );
+});
+
 test("rejected mutation feedback names only the target and an executable source-refresh next step", () => {
   const feedback = providerPort.runtimeV2RepeatedActionFeedback({
     call: {
@@ -1235,6 +1422,34 @@ test("provider tool arguments normalize schema-equivalent scalar types before id
         end_line: 350,
       },
     }),
+  );
+});
+
+test("provider action identity omits schema-declared optional defaults", () => {
+  const read = definition("read_file");
+  read.function.parameters.properties = {
+    path: { type: "string" },
+    start_line: { type: "number", runtimeIdentityDefault: 1 },
+  };
+  const [explicitDefault, omittedDefault] =
+    providerTools.normalizeRuntimeV2ProviderToolCalls([{
+      id: "read-explicit-default",
+      name: "read_file",
+      arguments: {
+        path: "src/main.js",
+        start_line: "1",
+      },
+    }, {
+      id: "read-omitted-default",
+      name: "read_file",
+      arguments: { path: "src/main.js" },
+    }], [read]);
+
+  assert.deepEqual(explicitDefault.arguments, { path: "src/main.js" });
+  assert.deepEqual(omittedDefault.arguments, { path: "src/main.js" });
+  assert.equal(
+    providerToolSurface.runtimeV2ProviderToolCallIdentity(explicitDefault),
+    providerToolSurface.runtimeV2ProviderToolCallIdentity(omittedDefault),
   );
 });
 
@@ -2058,6 +2273,43 @@ test("child lifecycle uses only the parent lifecycle deadline", () => {
   assert.doesNotMatch(
     source,
     /requiresTool|child_required_tool_missing|investigation window is closed/i,
+  );
+});
+
+test("child recovery timing counts only consecutive no-progress steps", () => {
+  let lease = runtime.advanceRuntimeV2ChildRecoveryStallLease({
+    current: null,
+    progressed: false,
+    now: 1_000,
+  });
+  assert.deepEqual(lease, {
+    startedAt: 1_000,
+    occurrence: 1,
+  });
+  lease = runtime.advanceRuntimeV2ChildRecoveryStallLease({
+    current: lease,
+    progressed: false,
+    now: 2_000,
+  });
+  assert.deepEqual(lease, {
+    startedAt: 1_000,
+    occurrence: 2,
+  });
+  assert.equal(
+    runtime.runtimeV2ChildRecoveryStallExpired(
+      lease,
+      1_000 + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS,
+    ),
+    true,
+  );
+  assert.equal(
+    runtime.advanceRuntimeV2ChildRecoveryStallLease({
+      current: lease,
+      progressed: true,
+      now: 1_000 + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS,
+    }),
+    null,
+    "new child evidence clears the stall clock regardless of total child duration",
   );
 });
 
@@ -3933,6 +4185,61 @@ test("provider history uses canonical context anchors without a second digest", 
     1,
   );
   assert.doesNotMatch(rendered, /runtime-v2 structured evidence digest/);
+});
+
+test("provider history initializes the current user before a preloaded context anchor", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const ports = {
+    get: () => ({
+      config: {},
+      conversationTurns: [{
+        id: "turn",
+        userPrompt: "repair the current workspace",
+      }],
+      agentMessages: [{
+        role: "user",
+        runtimeTurnId: "turn",
+        content: "repair the current workspace",
+      }],
+    }),
+    context: {
+      turnId: "turn",
+      runWorkspace: "/tmp/runtime-v2-preloaded-anchor",
+      phaseLanguage: "en",
+    },
+    live,
+  };
+  providerHistory.upsertRuntimeV2ContextAnchor(live, {
+    key: "workspace-overview",
+    content: "PRELOADED_WORKSPACE_ANCHOR",
+  });
+
+  const request = providerHistory.providerHistory(live, ports);
+
+  assert.deepEqual(
+    request.messages.map((message) => message.role),
+    ["system", "user", "system"],
+  );
+  assert.match(
+    String(request.messages[0]?.content || ""),
+    /\[MAIN RUNTIME V2\]/,
+  );
+  assert.equal(
+    request.messages[1]?.content,
+    "repair the current workspace",
+  );
+  assert.match(
+    String(request.messages[2]?.content || ""),
+    /PRELOADED_WORKSPACE_ANCHOR/,
+  );
+  const decisionView = providerHistory.buildRuntimeV2DecisionView(
+    request.messages,
+  );
+  assert.equal(
+    decisionView.find((message) => message.role === "user")?.content,
+    "repair the current workspace",
+    "the current user must survive the final provider decision projection",
+  );
 });
 
 test("runtime state has one transcript and no parallel model-context recovery store", () => {

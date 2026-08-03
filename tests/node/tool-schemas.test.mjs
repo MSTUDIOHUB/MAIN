@@ -62,6 +62,7 @@ test("tool schema normalization patches description-only leaf fields", () => {
     properties: {
       query: {
         description: "Search string without explicit type",
+        runtimeIdentityDefault: "",
       },
       nested: {
         type: "object",
@@ -76,6 +77,7 @@ test("tool schema normalization patches description-only leaf fields", () => {
   });
 
   assert.equal(schema.properties.query.type, "string");
+  assert.equal("runtimeIdentityDefault" in schema.properties.query, false);
   assert.equal(schema.properties.nested.properties.mode.type, "string");
 });
 

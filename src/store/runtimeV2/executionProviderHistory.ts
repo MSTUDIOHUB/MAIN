@@ -4,7 +4,11 @@ import type {
 } from "../../lib/agentMessages";
 import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import type { RuntimeV2NormalizedProviderResult } from "../../lib/runtime-v2";
+import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import type {
+  RuntimeV2NormalizedProviderResult,
+  RuntimeV2NormalizedToolCall,
+} from "../../lib/runtime-v2";
 import type {
   RuntimeV2ExecutionPortsInput,
   RuntimeV2LiveExecutionState,
@@ -64,6 +68,33 @@ export function appendRuntimeV2AssistantToolCallHistory(
   live.latestProviderAssistantReasoning = null;
 }
 
+export function rememberRuntimeV2ProviderResult(
+  ports: RuntimeV2ExecutionPortsInput,
+  result: RuntimeV2NormalizedProviderResult,
+): void {
+  ports.live.latestProviderResult = result;
+  ports.live.latestVisibleText = result.toolCalls.length === 0
+    ? sanitizeAssistantDisplayContent(result.visibleText || "")
+      .trim()
+      .slice(0, 24_000)
+    : "";
+  if (ports.live.latestVisibleText) {
+    appendRuntimeV2AssistantTextHistory(
+      ports.live,
+      ports.live.latestVisibleText,
+    );
+  }
+  if (result.toolCalls.length === 0) return;
+  for (const call of result.toolCalls) {
+    if (!isWorkspaceMutationToolName(call.name)) continue;
+    ports.live.mutationSourceCoverageByToolCallId.set(
+      call.id,
+      ports.live.latestProviderRequestSourceCoverage,
+    );
+  }
+  appendRuntimeV2AssistantToolCallHistory(ports.live, result);
+}
+
 export function appendRuntimeV2ToolResultHistory(
   live: RuntimeV2LiveExecutionState,
   toolCallId: string,
@@ -88,6 +119,81 @@ export function appendRuntimeV2ToolResultHistory(
     tool_call_id: toolCallId,
     content,
   });
+}
+
+/**
+ * Close a provider-selected action that the Runtime deliberately did not
+ * execute using the same assistant/tool protocol pair as a real tool result.
+ * Some local models deterministically replay an action when rejection is only
+ * described by a later system message because their native tool state never
+ * changed. Keep one pair per normalized action identity so that recovery is
+ * causal without allowing a deterministic loop to grow its own transcript.
+ *
+ * Mutation bodies are omitted from the historical template. The bounded
+ * feedback still names safe targets and the lack of effect, while preventing
+ * a rejected patch from becoming an executable copy source.
+ */
+export function appendRuntimeV2RejectedToolCallHistory(
+  live: RuntimeV2LiveExecutionState,
+  input: {
+    readonly call: RuntimeV2NormalizedToolCall;
+    readonly actionIdentity: string;
+    readonly feedback: string;
+  },
+): void {
+  const actionIdentity = String(input.actionIdentity || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 256);
+  const feedback = String(input.feedback || "").trim().slice(0, 4_000);
+  if (!actionIdentity || !input.call.id || !feedback) return;
+  const marker = `[runtime-v2 rejected action: ${actionIdentity}]`;
+  const supersededToolCallIds = new Set<string>();
+  for (let index = live.messages.length - 1; index >= 0; index -= 1) {
+    const message = live.messages[index];
+    if (
+      message?.role === "tool" &&
+      String(message.content || "").startsWith(marker)
+    ) {
+      supersededToolCallIds.add(String(message.tool_call_id || ""));
+      live.messages.splice(index, 1);
+    }
+  }
+  if (supersededToolCallIds.size > 0) {
+    for (let index = live.messages.length - 1; index >= 0; index -= 1) {
+      const message = live.messages[index];
+      if (
+        message?.role === "assistant" &&
+        message.tool_calls?.length === 1 &&
+        supersededToolCallIds.has(message.tool_calls[0]!.id)
+      ) {
+        live.messages.splice(index, 1);
+      }
+    }
+  }
+  const historyArguments = isWorkspaceMutationToolName(input.call.name)
+    ? {
+        runtime_v2_rejected_action: actionIdentity,
+        effect: "none",
+      }
+    : input.call.arguments;
+  live.messages.push({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: input.call.id,
+      type: "function",
+      function: {
+        name: input.call.name,
+        arguments: JSON.stringify(historyArguments),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: input.call.id,
+    content: `${marker}\n${feedback}`,
+  });
+  live.latestProviderAssistantReasoning = null;
 }
 
 /**
@@ -127,6 +233,16 @@ export function appendRuntimeV2ProviderFeedbackHistory(
     previousCorrectionMessage?.role === "system"
       ? previousCorrectionMessage
       : null;
+  if (!visibleText) {
+    for (let index = live.messages.length - 1; index >= 0; index -= 1) {
+      const message = live.messages[index];
+      if (message?.role === "system" && message.content === correction) {
+        live.messages.splice(index, 1);
+      }
+    }
+    live.messages.push({ role: "system", content: correction });
+    return;
+  }
   if (
     previousCorrection?.content === correction &&
     (
@@ -250,7 +366,17 @@ function baseProviderHistory(
   live: RuntimeV2LiveExecutionState,
   input: RuntimeV2ExecutionPortsInput,
 ): AgentMessage[] {
-  if (live.messages.length > 0) return live.messages;
+  if (live.messages.some((message) =>
+    message.role === "system" &&
+    typeof message.content === "string" &&
+    message.content.startsWith("[MAIN RUNTIME V2]")
+  )) {
+    return live.messages;
+  }
+  // Observation and plan anchors may be materialized before the first model
+  // request. They are additions to the canonical transcript, not proof that
+  // its admission prefix (including the current user message) already exists.
+  const preloadedContext = live.messages.splice(0);
   const state = input.get();
   const turns = Array.isArray(state?.conversationTurns)
     ? state.conversationTurns
@@ -289,6 +415,7 @@ function baseProviderHistory(
       input.context.turnId,
       String(turn?.userPrompt || ""),
     ),
+    ...preloadedContext,
   );
   return live.messages;
 }

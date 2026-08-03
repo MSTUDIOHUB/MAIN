@@ -534,7 +534,7 @@ test("Runtime v2 preserves a complete admitted read window instead of truncating
   assert.doesNotMatch(retained, /Runtime v2 truncated/);
 });
 
-test("native and compatibility tool protocols share the Run output budget", () => {
+test("native and compatibility tool protocols share a bounded decision output budget", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768,
     providerContextLimit: 262_144,
@@ -553,7 +553,10 @@ test("native and compatibility tool protocols share the Run output budget", () =
       false,
       resolved,
     ),
-    resolved.outputBudget,
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
+    ),
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
@@ -561,7 +564,77 @@ test("native and compatibility tool protocols share the Run output budget", () =
       true,
       resolved,
     ),
-    resolved.outputBudget,
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
+    ),
+  );
+});
+
+test("source-only effect pressure uses capability-gated action decoding", () => {
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+    }),
+    "off",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: false,
+    }),
+    "auto",
+    "providers without a documented toggle retain their configured behavior",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: false,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+    }),
+    "auto",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "reconsider",
+    }),
+    "auto",
+    "recovery restores configured reasoning instead of decoding the same rejected action again",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "reframe",
+    }),
+    "explicit",
+    "a sustained rejected-action loop upgrades reasoning only through a documented provider capability",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "off",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "alternative",
+    }),
+    "off",
+    "an explicit user/provider off setting remains authoritative",
   );
 });
 

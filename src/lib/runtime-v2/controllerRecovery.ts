@@ -9,6 +9,7 @@ import {
   isRuntimeV2ProviderProtocolError,
   isRuntimeV2ProviderTransportsUnavailableError,
 } from "./providerLane";
+import { isRuntimeV2LifecycleDeadlineError } from "./lifecycle";
 import {
   canRecordRuntimeV2Recovery,
   runtimeV2ActionFingerprint,
@@ -98,6 +99,11 @@ export function repeatsRuntimeV2ProjectionInCurrentPhase(input: {
 
 export type RuntimeV2FailureRecoveryDecision =
   | {
+      /** An explicit caller-owned absolute budget owns the terminal decision. */
+      readonly kind: "lifecycle_boundary";
+      readonly publish: false;
+    }
+  | {
       readonly kind: "signal";
       readonly signal:
         | "protocol_drift"
@@ -115,7 +121,8 @@ export type RuntimeV2FailureRecoveryDecision =
       /**
        * The failed command receipt already is the durable progress signal.
        * Saturating the bounded diagnostic ledger must not become a lifecycle
-       * terminal; the Run deadline owns that boundary.
+       * terminal; a real recovery-stall or caller-owned boundary owns that
+       * decision outside this retry ledger.
        */
       readonly kind: "continue";
       readonly publish: boolean;
@@ -135,6 +142,12 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
   readonly command: RuntimeV2Command;
   readonly error: unknown;
 }): RuntimeV2FailureRecoveryDecision {
+  if (isRuntimeV2LifecycleDeadlineError(input.error)) {
+    return {
+      kind: "lifecycle_boundary",
+      publish: false,
+    };
+  }
   if (isRuntimeV2ProviderProtocolError(input.error)) {
     return {
       kind: "signal",
@@ -197,7 +210,7 @@ export function decideRuntimeV2SemanticFailureRecovery(input: {
   readonly command: RuntimeV2Command;
   readonly event: RuntimeV2Event;
 }): Exclude<RuntimeV2FailureRecoveryDecision, {
-  readonly kind: "continue" | "hard_stop";
+  readonly kind: "continue" | "hard_stop" | "lifecycle_boundary";
 }> | null {
   const toolFailed =
     input.event.type === "tool.completed" &&

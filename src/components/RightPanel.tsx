@@ -34,6 +34,7 @@ import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { isPlanCandidateBlock, isReviewablePlanBlock, selectLatestPlanCandidatePreview } from "../lib/chat/chatBlockVisibility";
 import { isPlanApprovalLeaseBoundToState } from "../lib/planLifecycle";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
+import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -1054,6 +1055,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   }, [selectedDiffTaskId, taskFlow]);
   const viewedDiffTask = activeDiffTask ?? selectedDiffTask;
   const language = config.language === "en" ? "en" : "zh";
+  const activeSessionKey = resolveSessionRuntimeKey(
+    resolveSessionWorkspaceKey(currentWorkspace),
+    currentSessionId,
+  );
   const latestPlanEntry = useMemo(() => {
     const entries = conversationTurns.map((turn) => ({
       turn,
@@ -1062,9 +1067,24 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
     return [...entries].reverse().find((entry) => turnHasPlanPreview(entry.blocks)) || null;
   }, [conversationTurns, taskFlow]);
+  const actionOwnedPlanTurn = useMemo(
+    () => (
+      (activeActionRequest?.kind === "plan_review" ||
+        activeActionRequest?.kind === "user_choice") &&
+      activeActionRequest.sessionKey === activeSessionKey
+        ? conversationTurns.find(
+            (turn) => turn.id === activeActionRequest.turnId,
+          ) || null
+        : null
+    ),
+    [activeActionRequest, activeSessionKey, conversationTurns],
+  );
   const latestPlanTurn = useMemo(
-    () => latestPlanEntry?.turn || [...conversationTurns].reverse().find((turn) => isPlanConversationTurn(turn)) || null,
-    [conversationTurns, latestPlanEntry],
+    () => actionOwnedPlanTurn ||
+      latestPlanEntry?.turn ||
+      [...conversationTurns].reverse().find((turn) => isPlanConversationTurn(turn)) ||
+      null,
+    [actionOwnedPlanTurn, conversationTurns, latestPlanEntry],
   );
   const hasVisiblePlanChoice = useMemo(
     () => !!latestPlanTurn && taskFlow.some((block) =>
@@ -1082,11 +1102,14 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return collectChangeEntries(scopedTaskFlow, getDiffStats);
   }, [latestPlanTurn, taskFlow]);
   const runtimeV2PlanReview = useMemo(
-    () => latestPlanTurn
-      ? resolveRuntimeV2PlanReviewFromAggregate(
-          runtimeV2Checkpoints[latestPlanTurn.id]?.aggregate,
-        )
-      : null,
+    () => {
+      if (!latestPlanTurn) return null;
+      const checkpoint = normalizeRuntimeV2Checkpoint(
+        runtimeV2Checkpoints[latestPlanTurn.id],
+        { turnId: latestPlanTurn.id },
+      );
+      return resolveRuntimeV2PlanReviewFromAggregate(checkpoint?.aggregate);
+    },
     [latestPlanTurn, runtimeV2Checkpoints],
   );
   const legacyPlanApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
@@ -1103,10 +1126,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     if (hasReviewablePlanArtifact || !latestPlanEntry) return "";
     return selectLatestPlanCandidatePreview(latestPlanEntry.blocks);
   }, [hasReviewablePlanArtifact, latestPlanEntry]);
-  const activeSessionKey = resolveSessionRuntimeKey(
-    resolveSessionWorkspaceKey(currentWorkspace),
-    currentSessionId,
-  );
   const hasMatchingPlanActionOwner = isPlanActionRequestPresentationEligible({
     actionKind: activeActionRequest?.kind,
     requestStatus: activeActionRequest?.status,

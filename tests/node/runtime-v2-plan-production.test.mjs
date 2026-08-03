@@ -1374,8 +1374,16 @@ test("only structured provider transport unavailability closes Plan recovery", a
 
 test("one sealed WorkPlan and ReviewCommit survive checkpoint cold recovery", () => {
   const { checkpoint, sealed, commit } = reviewCheckpoint();
+  const persisted = runtime.serializeRuntimeV2CheckpointMap({
+    [turn.turnId]: checkpoint,
+  })[turn.turnId];
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(persisted, "aggregate"),
+    false,
+    "the durable checkpoint must contain only the canonical event ledger",
+  );
   const restored = runtime.normalizeRuntimeV2Checkpoint(
-    JSON.parse(JSON.stringify(checkpoint)),
+    JSON.parse(JSON.stringify(persisted)),
     turn,
   );
   assert.ok(restored);

@@ -6,18 +6,24 @@ import {
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import {
   RuntimeV2Controller,
+  advanceRuntimeV2ProviderRecoveryStallLease,
   createRuntimeV2EmergencyTerminalEnvelope,
+  countDistinctRuntimeV2EvidenceFacts,
   decideRuntimeV2ExecutePhaseTransition,
   decideRuntimeV2TerminalOutcome,
+  deriveRuntimeV2ProviderRecoveryWindow,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
+  latestRuntimeV2ProviderConclusionText,
   runtimeV2DirectExecuteReadyForConclusion,
+  runtimeV2ProviderRecoveryStallExpired,
   runtimeV2CheckpointWriteFailureReason,
   summarizeRuntimeV2ExecuteEvidence,
   type RuntimeV2ExecutePhaseTransition,
   type RuntimeV2ResultKind,
+  type RuntimeV2ProviderRecoveryStallLease,
   type RuntimeV2RunIdentity,
   type RuntimeV2TurnIdentity,
 } from "../../lib/runtime-v2";
@@ -60,10 +66,6 @@ export interface RuntimeV2ExecuteRunnerInput {
   readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
-
-// Leave enough time for the longest in-flight provider/tool deadline and the
-// terminal checkpoint to settle before the outer submission lease expires.
-const RUNTIME_V2_EXECUTION_DEADLINE_MS = 10 * 60_000;
 
 function nowIdFactory() {
   let ordinal = 0;
@@ -115,36 +117,6 @@ function terminalOutcomeToLegacy(
     : completedAgentLoopOutcome(reason, resultKind);
 }
 
-function latestDurableProviderConclusion(
-  aggregate: NonNullable<ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]>,
-): string {
-  const scheduledModes = new Map<string, string>();
-  for (const event of aggregate.events) {
-    if (
-      event.type === "command.scheduled" &&
-      event.command.kind === "request_model"
-    ) {
-      scheduledModes.set(
-        event.command.idempotencyKey,
-        String(event.command.payload.mode || "").trim(),
-      );
-    }
-  }
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index]!;
-    if (
-      event.type === "provider.responded" &&
-      scheduledModes.get(event.idempotencyKey) === "conclude" &&
-      event.result.toolCalls.length === 0
-    ) {
-      return sanitizeAssistantDisplayContent(event.result.visibleText || "")
-        .trim()
-        .slice(0, 24_000);
-    }
-  }
-  return "";
-}
-
 function terminalDecision(input: {
   aggregate: ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"];
   signal: AbortSignal;
@@ -154,7 +126,9 @@ function terminalDecision(input: {
   const evidence = summarizeRuntimeV2ExecuteEvidence(aggregate, {
     isMutationToolName: isWorkspaceMutationToolName,
   });
-  const finalMarkdown = latestDurableProviderConclusion(aggregate);
+  const finalMarkdown = sanitizeAssistantDisplayContent(
+    latestRuntimeV2ProviderConclusionText(aggregate),
+  ).trim().slice(0, 24_000);
   const decision = decideRuntimeV2TerminalOutcome(aggregate, {
     canceled: signal.aborted,
     mutationCount: evidence.mutationCount,
@@ -172,10 +146,11 @@ function terminalDecision(input: {
   };
 }
 
-function truthfulIncompleteDecision(input: {
+function truthfulRecoveryStallDecision(input: {
   aggregate: NonNullable<
     ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]
   >;
+  recoveryOccurrence: number;
 }): { resultKind: "partial" | "error"; resultReason: string } {
   const hasMutation = input.aggregate.evidence.some(
     (evidence) => evidence.kind === "mutation",
@@ -196,7 +171,9 @@ function truthfulIncompleteDecision(input: {
       item.kind === "source" ||
       item.kind === "tool" ||
       item.kind === "subagent",
-  ).length;
+  );
+  const distinctReadOnlyEvidenceCount =
+    countDistinctRuntimeV2EvidenceFacts(readOnlyEvidenceCount);
   const details = [
     missingTargets.length > 0
       ? `未修改目标：${missingTargets.join("、")}`
@@ -210,8 +187,8 @@ function truthfulIncompleteDecision(input: {
     evidence.failedValidationCount > 0
       ? "最近一次验证仍未通过"
       : "",
-    !hasMutation && readOnlyEvidenceCount > 0
-      ? `已完成 ${readOnlyEvidenceCount} 条只读证据收集`
+    !hasMutation && distinctReadOnlyEvidenceCount > 0
+      ? `已完成 ${distinctReadOnlyEvidenceCount} 条只读证据收集`
       : "",
     evidence.failedProviderRequestCount > 0
       ? `模型有 ${evidence.failedProviderRequestCount} 次决策请求未形成可执行结果`
@@ -223,7 +200,7 @@ function truthfulIncompleteDecision(input: {
   return {
     resultKind: hasMutation ? "partial" : "error",
     resultReason: [
-      "本轮已到达运行生命周期时限。",
+      `模型恢复已连续停滞，最近 ${input.recoveryOccurrence} 次决策没有形成新的可执行进展。`,
       hasMutation
         ? "已保留实际修改，但没有把未覆盖目标或条件表述为成功。"
         : "本轮没有形成可验收的实际修改。",
@@ -323,11 +300,6 @@ export async function runSubmitRuntimeV2Execute(
     });
     throw new Error("RUNTIME_V2_STALE_RUN_CHECKPOINT: checkpoint belongs to a different harness run.");
   }
-  const admittedAt = existing?.aggregate.events.find((event) =>
-    event.type === "run.started"
-  )?.at || Date.now();
-  const lifecycleDeadlineAt =
-    admittedAt + RUNTIME_V2_EXECUTION_DEADLINE_MS;
   const executionPorts = {
     get: input.get,
     set: input.set,
@@ -335,7 +307,6 @@ export async function runSubmitRuntimeV2Execute(
     live,
     nextId,
     now: Date.now,
-    lifecycleDeadlineAt,
     logStoreEvent: input.logStoreEvent,
   };
   const controller = new RuntimeV2Controller({
@@ -358,6 +329,7 @@ export async function runSubmitRuntimeV2Execute(
   }, existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined, {
     abortSignal: input.context.abortCtrl.signal,
   });
+  let providerRecoveryLease: RuntimeV2ProviderRecoveryStallLease | null = null;
 
   try {
     if (!existing) {
@@ -438,6 +410,16 @@ export async function runSubmitRuntimeV2Execute(
     while (true) {
       const before = controller.snapshot().aggregate;
       if (!before || before.terminalOutcome) break;
+      const providerRecoveryWindow =
+        deriveRuntimeV2ProviderRecoveryWindow(before);
+      const providerRecoveryPressure =
+        providerRecoveryWindow?.pressure || null;
+      providerRecoveryLease = advanceRuntimeV2ProviderRecoveryStallLease({
+        current: providerRecoveryLease,
+        pressure: providerRecoveryPressure,
+        startedAt: providerRecoveryWindow?.startedAt,
+        now: Date.now(),
+      });
       if (live.permissionRejection) {
         await controller.driveOnce({
           resultKind: "blocked",
@@ -491,19 +473,34 @@ export async function runSubmitRuntimeV2Execute(
           continue;
         }
       }
-      if (Date.now() - admittedAt >= RUNTIME_V2_EXECUTION_DEADLINE_MS) {
-        await controller.driveOnce(truthfulIncompleteDecision({
-          aggregate: before,
-        }));
-        if (controller.snapshot().aggregate?.terminalOutcome) break;
-        continue;
-      }
       const terminal = terminalDecision({
         aggregate: before,
         signal: input.context.abortCtrl.signal,
       });
       if (terminal) {
         await controller.driveOnce(terminal);
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
+      }
+      if (
+        providerRecoveryPressure &&
+        runtimeV2ProviderRecoveryStallExpired(
+          providerRecoveryLease,
+          Date.now(),
+        )
+      ) {
+        input.logStoreEvent("runtime_v2_provider_recovery_stall_reached", {
+          turnId: identity.turn.turnId,
+          runId: identity.run.runId,
+          phase: before.phase,
+          reason: providerRecoveryPressure.reason,
+          occurrence: providerRecoveryPressure.occurrence,
+          recoveryStartedAt: providerRecoveryLease?.startedAt || null,
+        });
+        await controller.driveOnce(truthfulRecoveryStallDecision({
+          aggregate: before,
+          recoveryOccurrence: providerRecoveryPressure.occurrence,
+        }));
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
@@ -579,7 +576,9 @@ export async function runSubmitRuntimeV2Execute(
       runId: identity.run.runId,
       resultKind: outcome.resultKind,
       reason: outcome.reason,
-      evidenceCount: controller.snapshot().aggregate?.evidence.length || 0,
+      evidenceCount: countDistinctRuntimeV2EvidenceFacts(
+        controller.snapshot().aggregate?.evidence || [],
+      ),
       mutations: executionEvidence.mutationCount,
       passedValidations: executionEvidence.passedValidationCount,
       acceptanceValidation:

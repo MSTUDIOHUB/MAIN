@@ -16,10 +16,9 @@ import {
 } from "./emergencyTerminal";
 import { tryTransition } from "./reducer";
 
-/** The durable envelope must outlive the 10-minute Execute lifecycle. The
- * former 512-event ceiling could be reached in roughly half that time by
- * ordinary provider/tool/projection receipts, turning persistence into an
- * accidental lifecycle owner. */
+/** The durable envelope must support long-running Execute Turns. The former
+ * 512-event ceiling could be reached by ordinary provider/tool/projection
+ * receipts, turning persistence pressure into an accidental lifecycle owner. */
 export const MAX_RUNTIME_V2_CHECKPOINT_EVENTS = 2_048;
 export const MAX_RUNTIME_V2_CHECKPOINT_CHARS = 8_388_608;
 export const RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION =

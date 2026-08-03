@@ -354,6 +354,36 @@ export function summarizeRuntimeV2ExecuteEvidence(
   const failedValidations = failedValidationSummarySinceLastPass(
     state.events,
   );
+  const providerRequestKeys = new Set(
+    state.events.flatMap((event) =>
+      event.type === "command.scheduled" &&
+        event.command.kind === "request_model"
+        ? [event.command.idempotencyKey]
+        : []
+    ),
+  );
+  const failedProviderDecisionKeys = new Set(
+    state.events.flatMap((event) => {
+      if (
+        event.type === "command.completed" &&
+        event.status === "failed" &&
+        providerRequestKeys.has(event.idempotencyKey)
+      ) {
+        return [event.idempotencyKey];
+      }
+      if (
+        event.type === "provider.responded" &&
+        event.result.toolCalls.length === 0 &&
+        (
+          event.result.diagnostics.length > 0 ||
+          !String(event.result.visibleText || "").trim()
+        )
+      ) {
+        return [event.idempotencyKey];
+      }
+      return [];
+    }),
+  );
   return {
     mutationCount:
       committedMutationSequences(state.events, input.isMutationToolName).length,
@@ -368,11 +398,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
       (event.type === "tool.completed" && event.status !== "succeeded") ||
       (event.type === "validation.completed" && !event.passed)
     ).length,
-    failedProviderRequestCount: state.completedCommands.filter(
-      (receipt) =>
-        receipt.kind === "request_model" &&
-        receipt.status === "failed",
-    ).length,
+    failedProviderRequestCount: failedProviderDecisionKeys.size,
   };
 }
 

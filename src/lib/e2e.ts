@@ -7375,6 +7375,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   const readToolId = useAppStore.getState()._nextTaskId();
   const commandToolId = useAppStore.getState()._nextTaskId();
   const secondUpdateId = useAppStore.getState()._nextTaskId();
+  const settledScopeToolId = useAppStore.getState()._nextTaskId();
   const runningToolId = useAppStore.getState()._nextTaskId();
   const capsuleText =
     "我会保留这条模型说明，并在工具执行时继续围绕 capsule 链路排查。";
@@ -7492,6 +7493,27 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       ? []
       : [
           {
+      id: settledScopeToolId,
+      turnId,
+      type: "tool" as const,
+      runId,
+      toolName: "read_file",
+      target: "src/main.js",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+      intentSummary: "读取入口文件确认当前范围",
+      observationSummary: "入口文件已读取。",
+      turnPhase: {
+        id: "scope",
+        kind: "scope" as const,
+        title: "范围归纳",
+        summary: "锁定当前实现涉及的入口和搜索目标。",
+        domain: "workspace",
+        status: "done" as const,
+      },
+          },
+          {
       id: runningToolId,
       turnId,
       type: "tool" as const,
@@ -7502,6 +7524,14 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       toolStatus: "running" as const,
       message: "Searching...",
       intentSummary: "继续确认 capsule 不会被工具调用冲刷",
+      turnPhase: {
+        id: "scope",
+        kind: "scope" as const,
+        title: "范围归纳",
+        summary: "锁定当前实现涉及的入口和搜索目标。",
+        domain: "workspace",
+        status: "running" as const,
+      },
           },
         ]),
   ];
@@ -7551,7 +7581,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       iteration: 2,
       maxIterations: 25,
       messagesLen: 4,
-      toolCount: 3,
+      toolCount: 4,
       latestTool: "grep_search",
       latestToolTarget: "src/components/ChatArea.tsx",
       activeStreamId: `stream-${turnId}`,
@@ -9148,6 +9178,7 @@ function seedRealOmlxPlanFlowScenario() {
   if (!bridge) return undefined;
 
   bridge.events = [{ type: "boot" }];
+  bridge.planPanelTransitions = [];
   bridge.savedDocuments = [];
   bridge.completed = false;
   bridge.dispatchError = null;
@@ -9262,6 +9293,37 @@ function seedRealOmlxPlanFlowScenario() {
     selectedDiffTaskId: null,
   }));
   applyRealOmlxWorkspaceFixture();
+  const unsubscribePlanPanelTrace = useAppStore.subscribe((state, previous) => {
+    if (
+      state.showPlanPanel === previous.showPlanPanel &&
+      state.rightPanelTab === previous.rightPanelTab &&
+      state.activeActionRequest === previous.activeActionRequest &&
+      state.agentStatus === previous.agentStatus
+    ) {
+      return;
+    }
+    bridge.planPanelTransitions = [
+      ...(bridge.planPanelTransitions || []),
+      {
+        at: Date.now(),
+        showPlanPanel: state.showPlanPanel,
+        rightPanelTab: state.rightPanelTab,
+        showDiff: state.showDiff,
+        showTerminal: state.showTerminal,
+        agentStatus: state.agentStatus,
+        actionKind: state.activeActionRequest?.kind || null,
+        actionStatus: state.activeActionRequest?.status || null,
+        planStage: state.planStage,
+        markerStatus: state.harnessRunMarker?.status || null,
+        markerSessionKey: state.harnessRunMarker?.sessionKey || null,
+        markerTurnId: state.harnessRunMarker?.turnId || null,
+        markerRunId:
+          state.harnessRunMarker?.activeRunId ||
+          state.harnessRunMarker?.runId ||
+          null,
+      },
+    ].slice(-40);
+  });
 
   bridge.sendCloudMessage = async (text?: string, images?: string[]) => {
     // Zustand persistence may finish hydration after App's E2E mount effect.
@@ -9366,8 +9428,14 @@ function seedRealOmlxPlanFlowScenario() {
 
   bridge.approvePlan = () => {
     const before = useAppStore.getState();
-    const checkpoint = before.currentTurnId
+    const rawCheckpoint = before.currentTurnId
       ? before.runtimeV2Checkpoints?.[before.currentTurnId] || null
+      : null;
+    const checkpoint = before.currentTurnId
+      ? normalizeRuntimeV2Checkpoint(
+          rawCheckpoint,
+          { turnId: before.currentTurnId },
+        )
       : null;
     const aggregate = checkpoint?.aggregate || null;
     const review = aggregate?.planReviewCommit || null;
@@ -9385,6 +9453,8 @@ function seedRealOmlxPlanFlowScenario() {
         isGenerating: before.isGenerating,
         actionRequestId: before.activeActionRequest?.requestId || null,
         runtimeV2Authority: {
+          rawCheckpointHasAggregate: !!rawCheckpoint?.aggregate,
+          normalizedCheckpointHasAggregate: !!aggregate,
           strategy: aggregate?.strategy || null,
           phase: aggregate?.phase || null,
           workPlanStatus: aggregate?.workPlan?.status || null,
@@ -9434,9 +9504,12 @@ function seedRealOmlxPlanFlowScenario() {
         .reverse()
         .find((turn) => turn.runtimeEngineVersion === "v2") ||
       null;
+    const rawRuntimeV2Checkpoint = currentTurn
+      ? state.runtimeV2Checkpoints?.[currentTurn.id] || null
+      : null;
     const runtimeV2Checkpoint = currentTurn
       ? normalizeRuntimeV2Checkpoint(
-          state.runtimeV2Checkpoints?.[currentTurn.id],
+          rawRuntimeV2Checkpoint,
           { turnId: currentTurn.id },
         )
       : null;
@@ -9918,6 +9991,43 @@ function seedRealOmlxPlanFlowScenario() {
       isGenerating: state.isGenerating,
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
+      showPlanPanel: state.showPlanPanel,
+      rightPanelTab: state.rightPanelTab,
+      showDiff: state.showDiff,
+      showTerminal: state.showTerminal,
+      rightPanelWidth: state.rightPanelWidth,
+      sidebarWidth: state.sidebarWidth,
+      viewportWidth: window.innerWidth,
+      planPanelMounted: Boolean(
+        document.querySelector('[data-testid="plan-review-panel"]'),
+      ),
+      planPanelDocumentKind:
+        document
+          .querySelector('[data-testid="plan-review-panel"]')
+          ?.getAttribute("data-plan-document-kind") || null,
+      planPanelPresentation:
+        document
+          .querySelector('[data-testid="plan-review-panel"]')
+          ?.getAttribute("data-plan-presentation") || null,
+      planPanelActionKind:
+        document
+          .querySelector('[data-testid="plan-review-panel"]')
+          ?.getAttribute("data-action-kind") || null,
+      planPanelTransitions: bridge.planPanelTransitions || [],
+      harnessRunMarker: state.harnessRunMarker
+        ? {
+            status: state.harnessRunMarker.status,
+            sessionKey: state.harnessRunMarker.sessionKey,
+            turnId: state.harnessRunMarker.turnId,
+            outerRunId: state.harnessRunMarker.runId,
+            activeRunId: state.harnessRunMarker.activeRunId || null,
+          }
+        : null,
+      runtimeV2CheckpointCache: {
+        present: Boolean(rawRuntimeV2Checkpoint),
+        hasAggregate: Boolean(rawRuntimeV2Checkpoint?.aggregate),
+        normalized: Boolean(runtimeV2Checkpoint),
+      },
       planArtifacts: state.planArtifacts.map((artifact) => ({
         path: artifact.path,
         title: artifact.title,
@@ -10063,6 +10173,7 @@ function seedRealOmlxPlanFlowScenario() {
   };
 
   const cleanup = () => {
+    unsubscribePlanPanelTrace();
     bridge.initialized = false;
   };
 

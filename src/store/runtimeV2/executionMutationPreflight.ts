@@ -12,7 +12,10 @@ import type {
   RuntimeV2EventDraft,
 } from "../../lib/runtime-v2";
 import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
-import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
+import {
+  executeRuntimeV2ToolWithDeadline,
+  type RuntimeV2ToolDeadlineBoundary,
+} from "./executionToolDeadline";
 import {
   recordToolResultHistory,
   toolCompletionFor,
@@ -57,6 +60,27 @@ export async function prepareRuntimeV2Mutation(input: {
         toolName: "read_file",
         lifecycleDeadlineAt: input.ports.lifecycleDeadlineAt,
         now: input.ports.now,
+        onTimeout: (
+          timeoutMs: number,
+          boundary: RuntimeV2ToolDeadlineBoundary,
+        ) => {
+          input.ports.logStoreEvent(
+            boundary === "lifecycle"
+              ? "runtime_v2_lifecycle_deadline_reached"
+              : "runtime_v2_tool_deadline_exceeded",
+            {
+              turnId: input.command.run.turnId,
+              runId: input.command.run.runId,
+              commandKind: input.command.kind,
+              toolName: "read_file",
+              target: path,
+              timeoutMs,
+              lifecycleDeadlineAt: boundary === "lifecycle"
+                ? input.ports.lifecycleDeadlineAt
+                : null,
+            },
+          );
+        },
         task: () => executeTool(
           "read_file",
           { path, __raw: true },

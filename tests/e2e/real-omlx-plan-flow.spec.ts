@@ -65,7 +65,7 @@ const realOmlxRequest =
   (
     realOmlxFixture === "md-viewer"
       ? "问题：1、在编辑界面显示了文件名和未保存的文档名字，这是不合理的。2、打开本地 md 文件后随后会弹出窗口，看起来是文件保存执行路径有关的问题。找到这些问题的根本原因并修复。"
-      : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。"
+      : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改，并运行 npm test 验证直到通过。"
   );
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
 const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
@@ -134,9 +134,9 @@ const realOmlxPlanTimeoutMs = Math.max(
 );
 const realOmlxExecutionTimeoutMs = Math.max(
   30_000,
-  // Runtime v2 owns a 12-minute lifecycle deadline. The outer replay must
-  // outlive that boundary so it observes the canonical partial/success
-  // terminal instead of killing the page while the Run still says "running".
+  // This is a test-harness wait budget, not a product Run deadline. Ordinary
+  // Execute stays open while work progresses; the replay still needs a finite
+  // outer bound so CI can report a missing terminal instead of hanging.
   Number(process.env.REAL_OMLX_EXECUTION_TIMEOUT_MS || 780_000),
 );
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
@@ -918,8 +918,21 @@ test.beforeEach(async ({ page }) => {
     "package.json": JSON.stringify({
       name: "csv-direct-edit-recovery-fixture",
       private: true,
-      scripts: { test: "tsc --noEmit" },
+      scripts: { test: "node tests/creator-mapping.test.mjs" },
     }, null, 2) + "\n",
+    "tests/creator-mapping.test.mjs": [
+      "import assert from 'node:assert/strict';",
+      "import fs from 'node:fs';",
+      "",
+      "const source = fs.readFileSync('src/hooks/useCsvParser.ts', 'utf8');",
+      "const normalized = source.replace(/\\s+/g, '').replaceAll('\"', \"'\");",
+      "assert.equal(",
+      "  normalized.includes(\"creatorName:row.creator||row['创建者']||''\"),",
+      "  true,",
+      "  'normalizeCsvOrder must map the CSV creator column to creatorName',",
+      ");",
+      "",
+    ].join("\n"),
     "src/hooks/useCsvParser.ts": [
       "export interface CsvOrder {",
       "  creator?: string;",
@@ -2495,6 +2508,23 @@ for (const model of models) {
           runtimePhase: snapshot?.runtimeV2?.phase || null,
           workPlanStatus: snapshot?.runtimeV2?.workPlan?.status || null,
           hasReviewCommit: Boolean(snapshot?.runtimeV2?.planReviewCommit),
+          showPlanPanel: snapshot?.showPlanPanel,
+          rightPanelTab: snapshot?.rightPanelTab,
+          showDiff: snapshot?.showDiff,
+          showTerminal: snapshot?.showTerminal,
+          planPanelMounted: snapshot?.planPanelMounted,
+          planPanelDocumentKind: snapshot?.planPanelDocumentKind,
+          planPanelPresentation: snapshot?.planPanelPresentation,
+          planPanelActionKind: snapshot?.planPanelActionKind,
+          viewportWidth: snapshot?.viewportWidth,
+          rightPanelWidth: snapshot?.rightPanelWidth,
+          sidebarWidth: snapshot?.sidebarWidth,
+          markerStatus: snapshot?.harnessRunMarker?.status || null,
+          markerRunId:
+            snapshot?.harnessRunMarker?.activeRunId ||
+            snapshot?.harnessRunMarker?.outerRunId ||
+            null,
+          checkpointCache: snapshot?.runtimeV2CheckpointCache || null,
         };
         const planPollSignature = JSON.stringify(planPollDiagnostic);
         if (planPollSignature !== lastPlanPollSignature) {
@@ -2626,6 +2656,23 @@ for (const model of models) {
     );
     expect(persistedPlan).toBe(plan);
     expect(reviewCommit.artifact.content).toBe(plan);
+    console.log(`[real-omlx-plan-panel:${model}] ${JSON.stringify({
+      showPlanPanel: planSnapshot?.showPlanPanel,
+      rightPanelTab: planSnapshot?.rightPanelTab,
+      showDiff: planSnapshot?.showDiff,
+      showTerminal: planSnapshot?.showTerminal,
+      planPanelMounted: planSnapshot?.planPanelMounted,
+      planPanelDocumentKind: planSnapshot?.planPanelDocumentKind,
+      planPanelPresentation: planSnapshot?.planPanelPresentation,
+      planPanelActionKind: planSnapshot?.planPanelActionKind,
+      viewportWidth: planSnapshot?.viewportWidth,
+      rightPanelWidth: planSnapshot?.rightPanelWidth,
+      sidebarWidth: planSnapshot?.sidebarWidth,
+      harnessRunMarker: planSnapshot?.harnessRunMarker || null,
+      runtimeV2CheckpointCache:
+        planSnapshot?.runtimeV2CheckpointCache || null,
+      transitions: (planSnapshot?.planPanelTransitions || []).slice(-12),
+    })}`);
     await expect(page.getByTestId("plan-review-panel")).toBeVisible();
     await expect(page.getByTestId("plan-review-panel")).toContainText(
       sealedWorkPlan.draft.objective,
@@ -3045,43 +3092,32 @@ for (const model of models) {
     expect(source).toMatch(/\bsource\s*:\s*["']csv["']/);
 
     const snapshot = terminalSnapshot;
-    const runtimeEvents = (snapshot?.debugTail || []).map((entry: { source?: string; message?: string }) => {
-      try {
-        return { source: entry.source, ...JSON.parse(String(entry.message || "{}")) };
-      } catch {
-        return { source: entry.source, message: entry.message };
-      }
-    });
+    const runtimeEvents = snapshot?.runtimeV2?.events || [];
     const failedValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>) =>
-      entry.source === "store.tool_result" &&
-      entry.toolName === "run_command" &&
-      entry.isError === true
+      entry.type === "validation.completed" && entry.passed === false
     );
     const repairMutationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
       index > failedValidationIndex &&
-      entry.source === "store.tool_result" &&
-      ["apply_patch", "replace_in_file", "write_file"].includes(String(entry.toolName || "")) &&
-      entry.isError === false
+      entry.type === "tool.completed" &&
+      entry.status === "succeeded" &&
+      Array.isArray(entry.evidence) &&
+      entry.evidence.some((evidence: { kind?: string }) => evidence.kind === "mutation")
     );
     const successfulValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
       index > repairMutationIndex &&
-      entry.source === "store.tool_result" &&
-      entry.toolName === "run_command" &&
-      entry.isError === false
+      entry.type === "validation.completed" && entry.passed === true
     );
     expect(failedValidationIndex).toBeGreaterThanOrEqual(0);
     expect(repairMutationIndex).toBeGreaterThan(failedValidationIndex);
     expect(successfulValidationIndex).toBeGreaterThan(repairMutationIndex);
-    expect(runtimeEvents.some((entry: Record<string, unknown>) =>
+    expect((snapshot?.debugTail || []).some((entry: Record<string, unknown>) =>
       entry.source === "agent.tool_calls_detected" &&
       Array.isArray(entry.names) &&
       entry.names.includes("execute_command")
     )).toBe(false);
 
-    const debugText = JSON.stringify(snapshot?.debugTail || []);
-    expect(debugText).toMatch(/direct_edit_finite_validation_requires_repair/);
-    expect(debugText).toMatch(/recovery_mutation_observed/);
-    expect(debugText).not.toMatch(/repeated_failure_policy_no_progress/);
+    expect(snapshot?.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+    expect(snapshot?.runtimeV2?.recovery?.exhausted || null).toBeNull();
   });
 
   test(`real OMLX Execute completes the MD Viewer incident with ${model}`, async ({ page }) => {

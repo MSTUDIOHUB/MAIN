@@ -22,6 +22,7 @@ import {
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
+import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
 import {
   deriveTurnElapsedSeconds,
   resolveTurnRunTimeWindow,
@@ -1891,14 +1892,33 @@ function TurnArchiveStepCard({
   const isLive = variant === "live";
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
-  const defaultExpanded = (!isLive && (step.expandedByDefault || hasChangeSummary)) || (isLive && hasChangeSummary);
+  const hasSettledDetailItems = step.items.some((item: any) =>
+    item?.status === "done" ||
+    item?.status === "error" ||
+    item?.status === "failed" ||
+    item?.toolStatus === "executed" ||
+    item?.toolStatus === "failed"
+  );
+  const defaultExpanded =
+    (!isLive && (step.expandedByDefault || hasChangeSummary)) ||
+    (isLive && (
+      hasChangeSummary ||
+      (step.status === "running" && hasSettledDetailItems)
+    ));
   const [expanded, setExpanded] = useState(defaultExpanded);
   useEffect(() => {
-    if (isLive && hasChangeSummary) setExpanded(true);
-  }, [isLive, hasChangeSummary]);
+    if (
+      isLive &&
+      (
+        hasChangeSummary ||
+        (step.status === "running" && hasSettledDetailItems)
+      )
+    ) {
+      setExpanded(true);
+    }
+  }, [isLive, hasChangeSummary, hasSettledDetailItems, step.status]);
   const detailItems = buildBlockRenderItems(step.items, false, false, language);
-  const isLiveRunningWithoutChanges = isLive && step.status === "running" && !hasChangeSummary;
-  const canExpandDetails = !isLiveRunningWithoutChanges && (hasChangeSummary || detailItems.length > 0);
+  const canExpandDetails = hasChangeSummary || detailItems.length > 0;
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -2962,11 +2982,14 @@ export default function ChatArea({
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
   const runtimeV2PlanReview = useMemo(
-    () => planReviewOwnerTurn
-      ? resolveRuntimeV2PlanReviewFromAggregate(
-          runtimeV2Checkpoints[planReviewOwnerTurn.id]?.aggregate,
-        )
-      : null,
+    () => {
+      if (!planReviewOwnerTurn) return null;
+      const checkpoint = normalizeRuntimeV2Checkpoint(
+        runtimeV2Checkpoints[planReviewOwnerTurn.id],
+        { turnId: planReviewOwnerTurn.id },
+      );
+      return resolveRuntimeV2PlanReviewFromAggregate(checkpoint?.aggregate);
+    },
     [planReviewOwnerTurn, runtimeV2Checkpoints],
   );
   const currentPlanApprovalIdentity = useMemo(

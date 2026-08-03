@@ -224,11 +224,13 @@ test("latest no-mutation replay identifies discarded safe reads and provider liv
   for (let index = 0; index < 4; index += 1) {
     lines.push(
       `[17853146${83 + index}.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","transport":"native_required"}`,
-      `[17853146${83 + index}.500] [warn] [store.runtime_v2_provider_protocol_failed] {"turnId":"${turnId}","runId":"${runId}","protocolCode":"repeated_action_rejected","transportFallbackAllowed":true}`,
+      `[17853146${83 + index}.500] [info] [store.runtime_v2_provider_action_rejected] {"turnId":"${turnId}","runId":"${runId}","toolName":"replace_in_file","reason":"already_rejected"}`,
       `[17853146${83 + index}.700] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","approximateMessageChars":105000}`,
     );
   }
   lines.push(
+    `[1785314688.000] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"replace_in_file","target":"src/main.js"}`,
+    `[1785314689.000] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"apply_patch","target":"src/main.js"}`,
     `[1785314690.000] [warn] [store.runtime_v2_provider_transport_failed] {"turnId":"${turnId}","runId":"${runId}","error":"RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT"}`,
     `[1785314691.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","mutations":0,"verificationComplete":false}`,
   );
@@ -239,10 +241,44 @@ test("latest no-mutation replay identifies discarded safe reads and provider liv
   const run = report.runs[0];
 
   assert.equal(run.providerRequestTimeouts, 1);
+  assert.equal(run.providerActionRejections, 4);
+  assert.equal(run.mutationToolCalls, 2);
+  assert.equal(run.committedMutations, 0);
   assert.equal(run.maxStrategyPivotRevision, 0);
   assert.deepEqual(run.warnings, [
     "safe_read_batch_discarded",
-    "semantic_protocol_used_transport_fallback",
     "provider_livelock_without_strategy_pivot",
+    "provider_repeated_actions_without_effect",
+  ]);
+});
+
+test("provider recovery stall is diagnosed without treating ordinary Execute time as a deadline", () => {
+  const turnId = "turn-provider-recovery-stall";
+  const runId = "run-provider-recovery-stall";
+  const report = analyzeAgentRuntimeEvents(parseAgentRuntimeLog([
+    `[1785411088.000] [info] [store.runtime_v2_execute_admitted] {"turnId":"${turnId}","runId":"${runId}","strategy":"execute"}`,
+    `[1785411101.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","phase":"observing"}`,
+    `[1785411101.100] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","mode":"execute","sourceOnlyFrontier":true,"mutationToolAvailable":true}`,
+    `[1785411102.000] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"read_file","target":"src/main.js"}`,
+    `[1785411165.000] [info] [store.runtime_v2_provider_request_opened] {"turnId":"${turnId}","runId":"${runId}","phase":"observing"}`,
+    `[1785411165.100] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","mode":"execute","sourceOnlyFrontier":true,"mutationToolAvailable":true}`,
+    `[1785411166.000] [info] [store.runtime_v2_tool_execution_started] {"turnId":"${turnId}","runId":"${runId}","toolName":"grep_search","target":"writeFile"}`,
+    `[1785411167.000] [info] [store.runtime_v2_provider_action_rejected] {"turnId":"${turnId}","runId":"${runId}","toolName":"replace_in_file","reason":"already_rejected"}`,
+    `[1785411168.000] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","mode":"execute","recoveryStage":"reconsider","recoveryOccurrence":1}`,
+    `[1785411169.000] [info] [store.runtime_v2_provider_action_rejected] {"turnId":"${turnId}","runId":"${runId}","toolName":"replace_in_file","reason":"already_rejected"}`,
+    `[1785411170.000] [info] [store.runtime_v2_context_prepared] {"turnId":"${turnId}","runId":"${runId}","mode":"execute","recoveryStage":"reframe","recoveryOccurrence":2}`,
+    `[1785411688.000] [info] [store.runtime_v2_provider_recovery_stall_reached] {"turnId":"${turnId}","runId":"${runId}","phase":"observing","reason":"repeated_action_rejected","occurrence":2}`,
+    `[1785411690.000] [info] [store.runtime_v2_execute_terminal] {"turnId":"${turnId}","runId":"${runId}","resultKind":"error","reason":"模型恢复已连续停滞。","mutations":0,"verificationComplete":false}`,
+  ].join("\n")));
+  const run = report.runs[0];
+
+  assert.equal(run.providerProtocolFailures, 0);
+  assert.equal(run.providerTransportFailures, 0);
+  assert.equal(run.sourceOnlyFrontierContexts, 2);
+  assert.equal(run.lifecycleDeadlineClosures, 0);
+  assert.equal(run.providerRecoveryStallClosures, 1);
+  assert.equal(run.maxProviderRecoveryOccurrence, 2);
+  assert.deepEqual(run.warnings, [
+    "source_only_frontier_ended_without_effect",
   ]);
 });

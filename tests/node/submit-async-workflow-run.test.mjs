@@ -1028,6 +1028,12 @@ test("a projected review pause closes the provider lease and preserves the pendi
   assert.equal(harness.state.activeActionRequest.status, "pending");
   assert.equal(harness.state.harnessRunMarker.status, "paused");
   assert.equal(
+    harness.state.showPlanPanel,
+    true,
+    "settling a pending Plan review must leave its approval workspace visible",
+  );
+  assert.equal(harness.state.rightPanelTab, "plan");
+  assert.equal(
     harness.state.harnessRunMarker.closeReason,
     "runtime_v2_plan_review_required",
   );

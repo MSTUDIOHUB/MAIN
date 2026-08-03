@@ -5,7 +5,11 @@ import {
 } from "../../lib/readFileWindow";
 import { executeTool } from "../../lib/toolExecutor";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
-import type { ToolPort } from "../../lib/runtime-v2";
+import {
+  isRuntimeV2LifecycleDeadlineError,
+  type RuntimeV2Command,
+  type ToolPort,
+} from "../../lib/runtime-v2";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
@@ -26,13 +30,43 @@ import {
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
-import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
+import {
+  executeRuntimeV2ToolWithDeadline,
+  type RuntimeV2ToolDeadlineBoundary,
+} from "./executionToolDeadline";
 import { prepareRuntimeV2Mutation } from "./executionMutationPreflight";
 import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerToolSurface";
 import { runtimeV2MutationFailureContextTarget } from "./correctiveMutationPolicy";
 import { resolveRuntimeV2ToolAuthorization } from "./executionExternalLocalRead";
+
+function logRuntimeV2ToolDeadline(input: {
+  readonly ports: RuntimeV2ExecutionPortsInput;
+  readonly command: RuntimeV2Command;
+  readonly toolName: string;
+  readonly target: string | null;
+  readonly timeoutMs: number;
+  readonly boundary: RuntimeV2ToolDeadlineBoundary;
+}): void {
+  input.ports.logStoreEvent(
+    input.boundary === "lifecycle"
+      ? "runtime_v2_lifecycle_deadline_reached"
+      : "runtime_v2_tool_deadline_exceeded",
+    {
+      turnId: input.command.run.turnId,
+      runId: input.command.run.runId,
+      commandKind: input.command.kind,
+      toolName: input.toolName,
+      target: input.target,
+      timeoutMs: input.timeoutMs,
+      lifecycleDeadlineAt: input.boundary === "lifecycle"
+        ? input.ports.lifecycleDeadlineAt
+        : null,
+    },
+  );
+}
+
 export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): ToolPort {
   return {
     async execute({ command, signal }) {
@@ -50,6 +84,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               toolName: "get_project_skeleton",
               lifecycleDeadlineAt: input.lifecycleDeadlineAt,
               now: input.now,
+              onTimeout: (timeoutMs, boundary) =>
+                logRuntimeV2ToolDeadline({
+                  ports: input,
+                  command,
+                  toolName: "get_project_skeleton",
+                  target: input.context.runWorkspace || "workspace",
+                  timeoutMs,
+                  boundary,
+                }),
               task: () => executeTool(
                 "get_project_skeleton",
                 {},
@@ -84,6 +127,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
             },
           };
         } catch (error) {
+          if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
           input.logStoreEvent("runtime_v2_tool_execution_failed", {
             turnId: command.run.turnId,
             runId: command.run.runId,
@@ -316,16 +360,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           toolName,
           lifecycleDeadlineAt: input.lifecycleDeadlineAt,
           now: input.now,
-          onTimeout: (timeoutMs) => {
-            input.logStoreEvent("runtime_v2_tool_deadline_exceeded", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              commandKind: command.kind,
+          onTimeout: (timeoutMs, boundary) =>
+            logRuntimeV2ToolDeadline({
+              ports: input,
+              command,
               toolName,
               target: target || null,
               timeoutMs,
-            });
-          },
+              boundary,
+            }),
           task: () => executeTool(
             toolName,
             executionArgs,
@@ -343,6 +386,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 toolName: "read_file",
                 lifecycleDeadlineAt: input.lifecycleDeadlineAt,
                 now: input.now,
+                onTimeout: (timeoutMs, boundary) =>
+                  logRuntimeV2ToolDeadline({
+                    ports: input,
+                    command,
+                    toolName: "read_file",
+                    target: target || null,
+                    timeoutMs,
+                    boundary,
+                  }),
                 task: () => executeTool(
                   "read_file",
                   { ...args, __raw: true },
@@ -415,6 +467,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         });
         return completion;
       } catch (error) {
+        if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
         const failureContent =
           `TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}`;
         recordToolResultHistory({

@@ -112,6 +112,7 @@ import {
   type TurnRuntimeCheckpointMap,
 } from "../lib/turnRuntimeCheckpoint";
 import {
+  normalizeRuntimeV2Checkpoint,
   normalizeRuntimeV2CheckpointMap,
   serializeRuntimeV2CheckpointMap,
   type RuntimeV2CheckpointMap,
@@ -13450,7 +13451,10 @@ export const useAppStore = create<AppState>()(
       const state = get();
       const approvedTurnId = state.currentTurnId;
       const runtimeV2Checkpoint = approvedTurnId
-        ? state.runtimeV2Checkpoints[approvedTurnId] || null
+        ? normalizeRuntimeV2Checkpoint(
+            state.runtimeV2Checkpoints[approvedTurnId],
+            { turnId: approvedTurnId },
+          )
         : null;
       const runtimeV2Review = resolveRuntimeV2PlanReviewFromAggregate(
         runtimeV2Checkpoint?.aggregate,

@@ -14,6 +14,12 @@ import {
 export interface ToolParameterSchema {
   type?: string;
   description?: string;
+  /**
+   * Internal execution-identity annotation. Optional arguments equal to this
+   * value are canonicalized as omitted before replay detection. Schema
+   * normalization removes the annotation before any provider request.
+   */
+  runtimeIdentityDefault?: unknown;
   enum?: string[];
   properties?: Record<string, ToolParameterSchema>;
   items?: ToolParameterSchema;
@@ -412,6 +418,7 @@ function normalizeToolSchemaNode(node: unknown): void {
   if (!node || typeof node !== "object") return;
 
   const schemaNode = node as Record<string, unknown>;
+  delete schemaNode.runtimeIdentityDefault;
   const hasOwn = (key: string) => Object.prototype.hasOwnProperty.call(schemaNode, key);
   const hasDescription = typeof schemaNode.description === "string" && schemaNode.description.trim().length > 0;
   const hasType = typeof schemaNode.type === "string" && schemaNode.type.trim().length > 0;
@@ -731,7 +738,11 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" },
-          start_line: { type: "number", description: "可选，1-based 起始行号。适合读取报错行附近或继续读取 nextStartLine。" },
+          start_line: {
+            type: "number",
+            description: "可选，1-based 起始行号。适合读取报错行附近或继续读取 nextStartLine。",
+            runtimeIdentityDefault: 1,
+          },
           end_line: { type: "number", description: "可选，1-based 结束行号。可与 start_line 搭配读取精确范围。" },
           max_lines: { type: "number", description: "可选，最多返回多少行。大文件默认只返回安全窗口；继续读取时通常传 nextStartLine 和 max_lines。" },
           start_char: { type: "number", description: "可选，0-based Unicode code-point 字符游标。仅用于 returnedCharRange/nextStartChar 续读；不要与行窗口参数混用。" },

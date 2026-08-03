@@ -241,7 +241,11 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async () => {
   const harness = createHarness();
   const edit = command();
-  const liveText = "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+  const providerCommentary =
+    "Now I have a clear picture of all three issues. Let me check the remaining files.";
+  const structuredText =
+    "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+  const liveText = `${providerCommentary}\n\n${structuredText}`;
 
   await harness.port.publish({
     aggregate: aggregate({ scheduledCommands: [edit] }),
@@ -258,7 +262,16 @@ test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async ()
   );
   assert.equal(progressEvents.length, 1);
   assert.equal(progressEvents[0].progress.title, "正在编辑 editor.js");
-  assert.equal(progressEvents[0].progress.summary, liveText);
+  assert.equal(progressEvents[0].progress.summary, structuredText);
+  assert.doesNotMatch(
+    progressEvents[0].progress.summary,
+    /Now I have a clear picture/,
+  );
+  assert.equal(
+    progressEvents[0].progress.action,
+    liveText,
+    "Capsule may retain public provider commentary, but Run Status must use the structured action explanation",
+  );
   assert.notEqual(
     progressEvents[0].progress.title,
     progressEvents[0].progress.summary,

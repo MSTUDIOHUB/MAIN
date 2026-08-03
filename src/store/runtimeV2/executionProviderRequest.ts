@@ -7,6 +7,7 @@ import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import {
   streamChatCompletion,
   type OpenAiToolChoice,
+  type StreamSettings,
 } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
@@ -89,9 +90,45 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
 ): number {
   return Math.max(
     1,
-    budget?.outputBudget ??
+    Math.min(
+      budget?.outputBudget ??
+        RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
       RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
+    ),
   );
+}
+
+/**
+ * Once exact source is visible but no workspace effect exists, a documented
+ * reasoning toggle can switch the next request into action decoding. This is
+ * capability- and state-based; model/provider names never enter the policy.
+ */
+export function runtimeV2ExecutionReasoningRequest(input: {
+  readonly configured: StreamSettings["reasoningRequest"];
+  readonly sourceOnlyFrontier: boolean;
+  readonly hasMutationTool: boolean;
+  readonly providerSupportsReasoningToggle: boolean;
+  readonly recoveringFromRejectedAction?: boolean;
+  readonly recoveryStage?: string;
+}): StreamSettings["reasoningRequest"] {
+  if (
+    input.recoveringFromRejectedAction &&
+    input.providerSupportsReasoningToggle &&
+    input.configured !== "off" &&
+    (
+      input.recoveryStage === "reframe" ||
+      input.recoveryStage === "alternative"
+    )
+  ) {
+    return "explicit";
+  }
+  return !input.recoveringFromRejectedAction &&
+      input.sourceOnlyFrontier &&
+      input.hasMutationTool &&
+      input.providerSupportsReasoningToggle &&
+      input.configured !== "off"
+    ? "off"
+    : input.configured;
 }
 
 export function runtimeV2ProviderProtocolError(input: {
@@ -249,6 +286,28 @@ export function providerModeInstruction(
         ].join(" ")
       : "",
   ].filter(Boolean).join(" ");
+  const recoveryPressure =
+    command.payload.recoveryPressure &&
+      typeof command.payload.recoveryPressure === "object" &&
+      !Array.isArray(command.payload.recoveryPressure)
+      ? command.payload.recoveryPressure as Record<string, unknown>
+      : null;
+  const recoveryOccurrence = Math.max(
+    0,
+    Math.floor(Number(recoveryPressure?.occurrence) || 0),
+  );
+  const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const recoveryGuidance = recoveryPressure
+    ? [
+        `RECOVERY_PIVOT ${recoveryOccurrence}: the previous provider decision produced no executable progress (${String(recoveryPressure.reason || "non_actionable_response")}).`,
+        recoveryStage === "reconsider"
+          ? "Re-read the latest structured failure feedback and submit an action whose normalized tool arguments are materially different from the closed action."
+          : recoveryStage === "reframe"
+            ? "Change strategy now: revise the complete repair, choose another allowed editor, or request one specifically named missing fact. Do not resubmit the same patch or read."
+            : "The current approach is stalled. Choose a genuinely different authorized action that can advance the objective, or return a concise evidence-backed incomplete report. The closed action will not execute.",
+        "All currently authorized inspect, edit, and validation tools remain available.",
+      ].join(" ")
+    : "";
   const editableSourceGuidance =
     toolSurface.hasMutation &&
       toolSurface.hasMaterializedSourceEvidence
@@ -270,6 +329,7 @@ export function providerModeInstruction(
   }
   if (mode === "validate") {
     return [
+      recoveryGuidance,
       "Validate the latest committed mutation now with a finite test, assertion, build, lint, typecheck, browser, or desktop interaction appropriate to the user's observable acceptance criteria.",
       "Do not repeat the mutation before validation. Safe reads remain available when a genuinely missing post-edit fact is required; a read or diff alone is not validation.",
       "Static checks prove only static properties. User-visible behavior requires a test, browser interaction, or desktop interaction that observes that behavior.",
@@ -280,6 +340,7 @@ export function providerModeInstruction(
     ].filter(Boolean).join(" ");
   }
   return [
+    recoveryGuidance,
     "Continue one inspect-edit-verify loop for the user's complete objective.",
     toolSurface.sourceOnlyFrontier
       ? "The current mutation boundary already has exact versioned source but no committed workspace effect. If the visible source supports a safe coherent repair, submit the mutation now. Continue reading only when you can name one missing path, range, or fact required to edit safely; broad exploration does not advance the objective."
@@ -312,14 +373,13 @@ export async function requestRuntimeV2ProviderOnce(input: {
   textEnvelope: boolean;
   toolChoice: OpenAiToolChoice | null;
   signal: AbortSignal;
-  timeoutMs: number;
+  timeoutMs?: number;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const state = input.ports.get();
   const budget = input.ports.context.runtimeContextBudget;
   const settings = deriveBudgetedStreamSettings(state.config, budget);
-  const requestSettings = settings;
   const adapterCapabilities = deriveProviderAdapterCapabilities(
-    requestSettings,
+    settings,
   );
   input.live.latestProviderAssistantReasoning = null;
   const maxOutputTokens = runtimeV2ExecutionProviderOutputTokenLimit(
@@ -373,6 +433,34 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const sourceOnlyFrontier =
     effectPressure?.reason === "source_only_frontier" &&
     input.live.latestProviderRequestSourceCoverage.length > 0;
+  const recoveryPressure =
+    input.command.payload.recoveryPressure &&
+      typeof input.command.payload.recoveryPressure === "object" &&
+      !Array.isArray(input.command.payload.recoveryPressure)
+      ? input.command.payload.recoveryPressure as Record<string, unknown>
+      : null;
+  const recoveringFromRejectedAction =
+    recoveryPressure?.reason === "repeated_action_rejected";
+  const hasMutationTool =
+    toolNames.has("replace_in_file") ||
+    toolNames.has("apply_patch") ||
+    toolNames.has("write_file");
+  const reasoningRequest = runtimeV2ExecutionReasoningRequest({
+    configured: settings.reasoningRequest,
+    sourceOnlyFrontier,
+    hasMutationTool,
+    providerSupportsReasoningToggle:
+      adapterCapabilities.reasoningToggle,
+    recoveringFromRejectedAction,
+    recoveryStage: String(recoveryPressure?.stage || ""),
+  });
+  const requestSettings = reasoningRequest === settings.reasoningRequest
+    ? settings
+    : {
+        ...settings,
+        reasoningRequest,
+        preserveAssistantReasoning: false,
+      };
   const messages = [
     ...boundedConversation,
     {
@@ -382,10 +470,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         preferredValidation,
         {
           hasReadFile: toolNames.has("read_file"),
-          hasMutation:
-            toolNames.has("replace_in_file") ||
-            toolNames.has("apply_patch") ||
-            toolNames.has("write_file"),
+          hasMutation: hasMutationTool,
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
           hasMaterializedSourceEvidence:
@@ -415,10 +500,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
     sourceReadAvailable: toolNames.has("read_file"),
-    mutationToolAvailable:
-      toolNames.has("replace_in_file") ||
-      toolNames.has("apply_patch") ||
-      toolNames.has("write_file"),
+    mutationToolAvailable: hasMutationTool,
     conversationHistoryMessages: boundedConversation.length,
     unboundedConversationHistoryMessages: history.historyMessages,
     priorConversationTurns: history.priorTurns,
@@ -433,6 +515,14 @@ export async function requestRuntimeV2ProviderOnce(input: {
     sourceOnlyFrontier,
     maxOutputTokens,
     reasoningRequest: requestSettings.reasoningRequest || null,
+    effectPressureActionDecoding:
+      reasoningRequest === "off" &&
+      settings.reasoningRequest !== "off",
+    recoveryStage: recoveryPressure?.stage || null,
+    recoveryOccurrence: Number(recoveryPressure?.occurrence) || 0,
+    recoveryReasoningEscalated:
+      reasoningRequest === "explicit" &&
+      settings.reasoningRequest !== "explicit",
     decisionViewApplied: true,
     canonicalConversationMessages: history.messages.length,
     removedDecisionMessages: Math.max(
