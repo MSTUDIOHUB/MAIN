@@ -135,9 +135,15 @@ if (preparedWorkspace) {
   }
 }
 console.log(`[real-omlx-plan] 使用已加载模型：${selectedModelIds.join(", ")}（加载状态未改变）`);
+const requireTaskQuality =
+  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1" ||
+  (
+    process.env.REAL_OMLX_EXECUTE_INCIDENT === "1" &&
+    process.env.REAL_OMLX_FIXTURE === "md-viewer"
+  );
 console.log(
-  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1"
-    ? "[real-omlx-plan] 验收模式：Runtime v2 结构一致性 + 可选任务语义质量门禁"
+  requireTaskQuality
+    ? "[real-omlx-plan] 验收模式：Runtime v2 结构一致性 + 强制任务语义质量门禁"
     : "[real-omlx-plan] 验收模式：Runtime v2 结构一致性（任务语义质量仅记录，不决定成败）",
 );
 
@@ -154,6 +160,9 @@ const result = spawnSync(
       OMLX_ENDPOINT: endpoint,
       OMLX_API_KEY: apiKey,
       OMLX_MODELS: selectedModelIds.join(","),
+      ...(requireTaskQuality
+        ? { REAL_OMLX_REQUIRE_TASK_QUALITY: "1" }
+        : {}),
     },
   },
 );

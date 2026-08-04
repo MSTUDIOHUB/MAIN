@@ -54,15 +54,32 @@ function hasSubagentActivity(
   );
 }
 
+function hasSubagentReceiptEvent(
+  events: readonly MainThreadEvent[],
+  type:
+    | "subagent.handoff_delivered"
+    | "subagent.handoff_applied",
+  receiptId: string,
+): boolean {
+  return events.some((event) =>
+    event.type === type &&
+    event.receiptId === receiptId
+  );
+}
+
 function runtimeV2SubagentClosure(input: {
   aggregate: TurnAggregateV1;
   job: TurnAggregateV1["subagents"][number];
-  status: Extract<SubagentStatus, "completed" | "failed" | "canceled">;
+  status: Extract<
+    SubagentStatus,
+    "completed" | "degraded" | "failed" | "canceled"
+  >;
   evidenceCount: number;
   reason: string;
 }): SubagentClosureEnvelope {
   const run = input.aggregate.run!.identity;
   const completed = input.status === "completed";
+  const degraded = input.status === "degraded";
   return {
     schemaVersion: 1,
     owner: {
@@ -75,7 +92,7 @@ function runtimeV2SubagentClosure(input: {
     },
     scopeKey: input.job.scopeKey,
     status: input.status,
-    state: completed ? "satisfied" : "blocked",
+    state: completed ? "satisfied" : degraded ? "partial" : "blocked",
     remainingWork: completed ? null : input.job.objective,
     observationCount: input.evidenceCount,
     substantiveEvidenceCount: input.evidenceCount,
@@ -86,6 +103,8 @@ function runtimeV2SubagentClosure(input: {
     uncoveredPaths: completed ? [] : [...input.job.allowedPaths],
     reasonCode: completed
       ? "runtime_v2_child_completed"
+      : degraded
+        ? "runtime_v2_child_degraded"
       : input.status === "canceled"
         ? "runtime_v2_child_canceled"
         : "runtime_v2_child_failed",
@@ -113,22 +132,30 @@ export function reconcileRuntimeV2SubagentEvents(
     if (runtimeEvent.type === "subagents.scheduled") {
       for (const job of runtimeEvent.jobs) {
         if (hasSubagentEvent(next, "subagent.created", job.id)) continue;
+        const implementation = job.taskKind === "implement" &&
+          job.accessMode === "write";
         const snapshot: SubagentRunSnapshot = {
           id: job.id,
           parentTurnId: run.turnId,
           threadId: run.sessionKey,
           name: job.name || job.scopeKey,
           role: job.role || (
-            language === "zh" ? "只读调查" : "Read-only investigation"
+            implementation
+              ? language === "zh" ? "实现负责人" : "Implementation owner"
+              : language === "zh" ? "只读调查" : "Read-only investigation"
           ),
           objective: job.objective,
           scopeKey: job.scopeKey,
           scope: job.allowedPaths.join(", "),
           allowedPaths: [...job.allowedPaths],
           expectedOutput: job.expectedOutput || (
-            language === "zh"
-              ? "返回带来源的只读调查证据"
-              : "Return sourced read-only investigation evidence"
+            implementation
+              ? language === "zh"
+                ? "返回一个可在汇合时校验提交的暂存修改事务"
+                : "Return one staged mutation transaction for validated join-time commit"
+              : language === "zh"
+                ? "返回带来源的只读调查证据"
+                : "Return sourced read-only investigation evidence"
           ),
           runId: job.run.runId,
           parentRunId: job.parentRunId,
@@ -161,11 +188,19 @@ export function reconcileRuntimeV2SubagentEvents(
       const activityId = `runtime-v2:${runtimeEvent.eventId}`;
       if (hasSubagentActivity(next, activityId)) continue;
       const phase = runtimeEvent.telemetry.phase;
+      const implementation = job.taskKind === "implement" &&
+        job.accessMode === "write";
       const title = phase === "request_opened"
-        ? language === "zh" ? "已启动只读调查" : "Read-only investigation started"
+        ? implementation
+          ? language === "zh" ? "已启动范围互斥的实现任务" : "Scoped implementation started"
+          : language === "zh" ? "已启动只读调查" : "Read-only investigation started"
         : phase === "first_token"
-          ? language === "zh" ? "正在分析范围内证据" : "Analyzing scoped evidence"
-          : language === "zh" ? "正在整理调查结果" : "Summarizing investigation";
+          ? implementation
+            ? language === "zh" ? "正在形成暂存修改" : "Preparing staged mutation"
+            : language === "zh" ? "正在分析范围内证据" : "Analyzing scoped evidence"
+          : implementation
+            ? language === "zh" ? "正在整理实现回报" : "Summarizing implementation"
+            : language === "zh" ? "正在整理调查结果" : "Summarizing investigation";
       const activity: SubagentActivity = {
         id: activityId,
         timestampMs: runtimeEvent.telemetry.at,
@@ -201,11 +236,57 @@ export function reconcileRuntimeV2SubagentEvents(
       continue;
     }
 
+    if (
+      runtimeEvent.type === "subagent.handoff_delivered" ||
+      runtimeEvent.type === "subagent.handoff_applied"
+    ) {
+      const job = jobs.get(runtimeEvent.jobId);
+      if (
+        !job ||
+        hasSubagentReceiptEvent(
+          next,
+          runtimeEvent.type,
+          runtimeEvent.eventId,
+        )
+      ) {
+        continue;
+      }
+      next = appendRuntimeEvent(next, withEventSchema(
+        runtimeEvent.type === "subagent.handoff_delivered"
+          ? {
+              type: "subagent.handoff_delivered",
+              threadId: run.sessionKey,
+              turnId: run.turnId,
+              subagentId: job.id,
+              runId: job.run.runId,
+              parentRunId: job.parentRunId,
+              timestampMs: runtimeEvent.at,
+              receiptId: runtimeEvent.eventId,
+              evidenceIds: [...runtimeEvent.evidenceIds],
+            }
+          : {
+              type: "subagent.handoff_applied",
+              threadId: run.sessionKey,
+              turnId: run.turnId,
+              subagentId: job.id,
+              runId: job.run.runId,
+              parentRunId: job.parentRunId,
+              timestampMs: runtimeEvent.at,
+              receiptId: runtimeEvent.eventId,
+              sourceEventId: runtimeEvent.sourceEventId,
+              evidenceIds: [...runtimeEvent.evidenceIds],
+            },
+      ));
+      continue;
+    }
+
     if (runtimeEvent.type !== "subagent.completed") continue;
     const job = jobs.get(runtimeEvent.jobId);
     if (!job) continue;
-    const status: Extract<SubagentStatus, "completed" | "failed" | "canceled"> =
-      runtimeEvent.status;
+    const status: Extract<
+      SubagentStatus,
+      "completed" | "degraded" | "failed" | "canceled"
+    > = runtimeEvent.status;
     const evidenceCount = runtimeEvent.evidence.length;
     const closureAudit = runtimeV2SubagentClosure({
       aggregate,
@@ -240,7 +321,13 @@ export function reconcileRuntimeV2SubagentEvents(
             phase: "done",
             title: status === "completed"
               ? language === "zh" ? "调查已完成" : "Investigation completed"
-              : language === "zh" ? "调查未完成" : "Investigation did not complete",
+              : status === "degraded"
+                ? language === "zh"
+                  ? "已交由主体接管"
+                  : "Handed back to main"
+                : language === "zh"
+                  ? "调查未完成"
+                  : "Investigation did not complete",
           },
         },
         activity: {

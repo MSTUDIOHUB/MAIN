@@ -7,7 +7,10 @@ import {
   normalizeLocalToolProtocol,
   resolveEffectiveCloudApiFormat,
 } from "./cloudProtocol";
-import { createDefaultCloudConfig } from "./cloudServers";
+import {
+  createDefaultCloudConfig,
+  getDefaultCloudEndpoint,
+} from "./cloudServers";
 import {
   createDefaultMcpRoutingConfig,
   createDefaultToolPermissionPolicy,
@@ -63,6 +66,23 @@ export function normalizeRuntimeLaneToken(value: unknown): string {
   return compacted || "-";
 }
 
+function normalizeRuntimeLaneEndpoint(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "-";
+  try {
+    const endpoint = new URL(raw);
+    const pathname = endpoint.pathname.replace(/\/+$/, "");
+    return normalizeRuntimeLaneToken(
+      `${endpoint.protocol}//${endpoint.host}${pathname}`,
+    );
+  } catch {
+    // An invalid endpoint cannot carry traffic. Keep its lane isolated from
+    // valid endpoints without retaining arbitrary userinfo/query text in
+    // observable coordinator keys or debug events.
+    return "invalid_endpoint";
+  }
+}
+
 export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefined): string {
   const activeProfile = config?.activeProfile === "cloud" ? "cloud" : "local";
   if (activeProfile === "local") {
@@ -74,10 +94,16 @@ export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefi
       typeof config?.local?.model === "string" && config.local.model.trim()
         ? config.local.model
         : DEFAULT_LOCAL_CONFIG.model;
+    const localEndpoint =
+      typeof config?.local?.endpoint === "string" &&
+        config.local.endpoint.trim()
+        ? config.local.endpoint
+        : DEFAULT_LOCAL_CONFIG.endpoint;
     const localToolProtocol = normalizeLocalToolProtocol(config?.local?.toolProtocol, localProvider);
     return [
       "profile=local",
       `provider=${normalizeRuntimeLaneToken(localProvider)}`,
+      `endpoint=${normalizeRuntimeLaneEndpoint(localEndpoint)}`,
       `model=${normalizeRuntimeLaneToken(localModel)}`,
       `tool=${normalizeRuntimeLaneToken(localToolProtocol)}`,
       "protocol=local",
@@ -85,34 +111,44 @@ export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefi
     ].join("|");
   }
 
+  const activeCloud = config?.cloudServers?.find(
+    (server) => server.id === config.activeCloudServerId,
+  ) || config?.cloud;
   const cloudProtocolInput =
-    typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
+    typeof activeCloud?.protocol === "string"
+      ? activeCloud.protocol
+      : "openai";
   const cloudExperimentalLoginEnabled =
     CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE && config?.cloudExperimentalLoginEnabled === true;
   const cloudAuthMode = cloudExperimentalLoginEnabled
-    ? config?.cloud?.auth?.mode ?? "api_key"
+    ? activeCloud?.auth?.mode ?? "api_key"
     : "api_key";
   const cloudApiFormat = resolveEffectiveCloudApiFormat({
     protocol: cloudProtocolInput,
     apiFormat:
-      typeof config?.cloud?.apiFormat === "string"
-        ? config.cloud.apiFormat
+      typeof activeCloud?.apiFormat === "string"
+        ? activeCloud.apiFormat
         : "chat_completions",
     authMode: cloudAuthMode,
   });
   const cloudProvider =
-    typeof config?.cloud?.provider === "string" && config.cloud.provider.trim()
-      ? config.cloud.provider
+    typeof activeCloud?.provider === "string" && activeCloud.provider.trim()
+      ? activeCloud.provider
       : "OpenAI";
   const cloudModel =
-    typeof config?.cloud?.model === "string" && config.cloud.model.trim()
-      ? config.cloud.model
+    typeof activeCloud?.model === "string" && activeCloud.model.trim()
+      ? activeCloud.model
       : "";
-  const cloudToolProtocol = normalizeCloudToolProtocol(config?.cloud?.toolProtocol);
+  const cloudEndpoint =
+    typeof activeCloud?.endpoint === "string" && activeCloud.endpoint.trim()
+      ? activeCloud.endpoint
+      : getDefaultCloudEndpoint(normalizeCloudProtocol(cloudProtocolInput));
+  const cloudToolProtocol = normalizeCloudToolProtocol(activeCloud?.toolProtocol);
   const cloudProtocol = normalizeCloudProtocol(cloudProtocolInput);
   return [
     "profile=cloud",
     `provider=${normalizeRuntimeLaneToken(cloudProvider)}`,
+    `endpoint=${normalizeRuntimeLaneEndpoint(cloudEndpoint)}`,
     `model=${normalizeRuntimeLaneToken(cloudModel)}`,
     `tool=${normalizeRuntimeLaneToken(cloudToolProtocol)}`,
     `protocol=${normalizeRuntimeLaneToken(cloudProtocol)}`,

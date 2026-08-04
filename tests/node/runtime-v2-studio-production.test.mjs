@@ -199,7 +199,7 @@ test("production Studio runner executes one frozen plan and closes exactly once"
     studioReceipts,
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",

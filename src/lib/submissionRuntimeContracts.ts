@@ -17,7 +17,7 @@ type SubmissionStoreState = any;
 export interface SubmissionRuntimeStorePorts {
   sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
   sanitizeAgentMessagesForPersist: (messages: any[]) => any[];
-  normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
   normalizeProviderCompatibilityByRuntimeKey: (value: unknown) => Record<string, ProviderCompatibilityRuntimeLaneState>;
   compactCompletedTurnAgentMessages: (params: {
     agentMessages: any[];
@@ -71,6 +71,9 @@ export interface SubmissionRuntimeContext {
   mentionSnapshot: string[];
   remoteFeishu: FeishuRemoteContext | undefined;
   workspaceTree: string | null;
+  /** Exact live workspace instructions captured before Run admission.
+   * Conversation summaries and legacy session memory never populate it. */
+  workspaceInstructionContext?: string;
   gameStudioConfigForTurn: GameStudioConfig | null;
   abortCtrl: AbortController;
   timerInterval: any;

@@ -6,6 +6,7 @@ test.beforeEach(async ({ page }) => {
       window.localStorage.clear();
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
+    window.confirm = () => true;
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
     const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
     internals.metadata ??= {
@@ -15,6 +16,7 @@ test.beforeEach(async ({ page }) => {
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "plugin:event|listen") return 1;
       if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "plugin:dialog|message") return "OK";
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "save_project_session") {
         const capture = ((window as any).__COMPOSER_PREFERENCE_E2E__ ??= { savedSessions: [] });
@@ -233,6 +235,9 @@ test("composer subagent preference toggle activates after the current run stops"
   await subagentToggle.click();
   await expect(subagentToggle).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("composer-subagent-preference-status")).toContainText("协作已开启");
+  const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
+  await autoReviewToggle.click();
+  await expect(autoReviewToggle).toHaveAttribute("aria-pressed", "true");
   await expect
     .poll(async () => page.evaluate(() => Boolean((window as any).__CODELY_E2E__?.getSnapshot?.().preferSubagents)))
     .toBe(true);
@@ -252,8 +257,29 @@ test("composer subagent preference toggle activates after the current run stops"
     }
     return null;
   }, preferenceInstruction)).toBe("preferred");
+  await expect(subagentToggle).toHaveAttribute("aria-pressed", "true");
+  await expect(autoReviewToggle).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    const savedSessions =
+      (window as any).__COMPOSER_PREFERENCE_E2E__?.savedSessions || [];
+    return {
+      autoApproveTools: snapshot?.autoApproveTools,
+      preferSubagents: snapshot?.preferSubagents,
+      persistedAutoApprove: savedSessions.some(
+        (session: any) => session?.runtimeSnapshot?.autoApproveTools === true,
+      ),
+      persistedSubagents: savedSessions.some(
+        (session: any) => session?.runtimeSnapshot?.preferSubagents === true,
+      ),
+    };
+  })).toEqual({
+    autoApproveTools: true,
+    preferSubagents: true,
+    persistedAutoApprove: true,
+    persistedSubagents: true,
+  });
 
-  const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
   const themeDraft = "检查运行中输入选择的主题显示";
   await page.getByTestId("composer-textarea").fill(themeDraft);
   const guidanceButton = page.getByTestId("composer-guidance-button");

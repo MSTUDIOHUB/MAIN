@@ -193,6 +193,13 @@ function parseWindowLineArg(args: Record<string, unknown>, key: string): number 
   return rounded > 0 ? rounded : undefined;
 }
 
+function parseWindowCharArg(args: Record<string, unknown>, key: string): number | undefined {
+  const value = parseOptionalNumber(args[key]);
+  if (value === undefined) return undefined;
+  const rounded = Math.floor(value);
+  return rounded >= 0 ? rounded : undefined;
+}
+
 function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boolean {
   return !workspace.trim() && !!sessionKey;
 }
@@ -396,6 +403,7 @@ export async function executeTool(
       const endLine = parseWindowLineArg(args, "end_line");
       const maxLines = parseWindowLineArg(args, "max_lines");
       const maxChars = parseWindowLineArg(args, "max_chars");
+      const startChar = parseWindowCharArg(args, "start_char");
       let content: string;
       if (shouldReturnRawReadFile(args)) {
         if (readWorkspace !== workspace) {
@@ -417,6 +425,7 @@ export async function executeTool(
             endLine,
             maxLines,
             maxChars,
+            startChar,
           );
           return formatReadFileWindowPayloadForModel(rawPath, payload, args);
         } catch (error) {
@@ -899,6 +908,12 @@ export async function executeTool(
         : await readFile(replacePath, workspace);
       if (!original.includes(searchText)) {
         throw new Error("search_text mismatch. The file content has likely changed. Please use the read_file tool or grep_search to view the current file content before attempting to edit again.");
+      }
+      const firstMatch = original.indexOf(searchText);
+      if (original.indexOf(searchText, firstMatch + 1) >= 0) {
+        throw new Error(
+          "search_text is ambiguous because it occurs more than once. Expand it to one unique exact block before attempting the edit again.",
+        );
       }
       const updated = original.replace(searchText, replaceText);
       if (updated === original) {

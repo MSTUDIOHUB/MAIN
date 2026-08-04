@@ -1,0 +1,797 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import ts from "typescript";
+
+const workspaceRoot = process.cwd();
+const cache = new Map();
+
+function loadTs(sourcePath) {
+  const normalized = path.resolve(sourcePath);
+  if (cache.has(normalized)) return cache.get(normalized);
+  const source = fs.readFileSync(normalized, "utf8");
+  const localRequire = createRequire(normalized);
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: normalized,
+  }).outputText;
+  const module = { exports: {} };
+  cache.set(normalized, module.exports);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const base = path.resolve(path.dirname(normalized), specifier);
+      for (const candidate of [
+        base,
+        `${base}.ts`,
+        path.join(base, "index.ts"),
+      ]) {
+        if (fs.existsSync(candidate) && candidate.endsWith(".ts")) {
+          return loadTs(candidate);
+        }
+      }
+    }
+    return localRequire(specifier);
+  };
+  new Function("exports", "module", "require", output)(
+    module.exports,
+    module,
+    runtimeRequire,
+  );
+  cache.set(normalized, module.exports);
+  return module.exports;
+}
+
+const budget = loadTs(path.join(
+  workspaceRoot,
+  "src/lib/runtimeContextBudget.ts",
+));
+const providerSettings = loadTs(path.join(
+  workspaceRoot,
+  "src/lib/providerLaneSettings.ts",
+));
+const executionText = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionText.ts",
+));
+const submissionContext = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/submissionContext.ts",
+));
+const providerRequest = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionProviderRequest.ts",
+));
+
+const GIB = 1024 ** 3;
+
+test("provider model metadata and loaded status define a real local capability", () => {
+  const capability = budget.parseOpenAiLocalModelCapability({
+    model: "Qwen3.6-35B-A3B-6bit",
+    modelsPayload: {
+      data: [{
+        id: "Qwen3.6-35B-A3B-6bit",
+        max_model_len: 262_144,
+      }],
+    },
+    statusPayload: {
+      models: [{
+        id: "Qwen3.6-35B-A3B-6bit",
+        loaded: true,
+        is_loading: false,
+        max_tokens: 4_096,
+        preserve_thinking_default: true,
+      }],
+    },
+  });
+
+  assert.deepEqual(capability, {
+    providerContextLimit: 262_144,
+    providerOutputLimit: null,
+    loaded: true,
+    preserveAssistantReasoning: true,
+  });
+});
+
+test("only semantically explicit provider fields define a hard output limit", () => {
+  const capability = budget.parseOpenAiLocalModelCapability({
+    model: "bounded-output-model",
+    modelsPayload: {
+      data: [{
+        id: "bounded-output-model",
+        max_context_length: 65_536,
+        max_output_tokens: 8_192,
+      }],
+    },
+    statusPayload: {
+      models: [{
+        id: "bounded-output-model",
+        loaded: true,
+        max_tokens: 2_048,
+      }],
+    },
+  });
+
+  assert.equal(capability.providerOutputLimit, 8_192);
+});
+
+test("provider output metadata caps generation without shrinking the admitted input context", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    providerOutputLimit: 4_096,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+
+  assert.ok(resolved.contextLimit > 32_768);
+  assert.equal(resolved.outputBudget, 4_096);
+  assert.equal(
+    resolved.inputBudget,
+    resolved.contextLimit - 4_096,
+  );
+  assert.equal(resolved.providerOutputLimit, 4_096);
+});
+
+test("healthy memory can expand a loaded model above the configured fallback without exceeding provider capacity", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+
+  assert.ok(resolved.contextLimit > 32_768);
+  assert.ok(resolved.contextLimit <= 262_144);
+  assert.ok(resolved.inputBudget > 32_768);
+  assert.ok(resolved.outputBudget > 8_192);
+  assert.ok(resolved.readWindowChars > 32_000);
+  assert.equal(resolved.source, "provider_and_memory");
+});
+
+test("unknown model capacity never guesses a larger context than configured", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: null,
+    modelLoaded: null,
+    availableMemoryBytes: 24 * GIB,
+    reservedOutputTokens: 8_192,
+  });
+
+  assert.equal(resolved.contextLimit, 32_768);
+  assert.equal(resolved.source, "configured");
+});
+
+test("memory pressure can lower the effective budget but never below the runtime minimum", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 131_072,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    availableMemoryBytes: 900 * 1024 ** 2,
+    reservedOutputTokens: 4_096,
+  });
+
+  assert.equal(resolved.contextLimit, 4_096);
+  assert.equal(resolved.inputBudget, 0);
+  assert.equal(resolved.readWindowChars, 4_000);
+});
+
+test("runtime budget resolver uses authenticated provider facts and current memory once", async () => {
+  const requested = [];
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "OMLX",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "Qwen3.6-35B-A3B-6bit",
+      apiKey: "secret-not-logged",
+      contextLimit: 32_768,
+      toolProtocol: "auto",
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 12,
+      total_bytes: 64 * GIB,
+      available_bytes: 12 * GIB,
+    }),
+    requestJson: async (url, headers) => {
+      requested.push({
+        url,
+        authorizationPresent: Boolean(headers.authorization),
+      });
+      if (url.endsWith("/models/status")) {
+        return {
+          models: [{
+            id: "Qwen3.6-35B-A3B-6bit",
+            loaded: true,
+            is_loading: false,
+          }],
+        };
+      }
+      return {
+        data: [{
+          id: "Qwen3.6-35B-A3B-6bit",
+          max_model_len: 262_144,
+        }],
+      };
+    },
+  });
+
+  assert.ok(resolved.contextLimit > 32_768);
+  assert.deepEqual(
+    requested.map((entry) => entry.url),
+    [
+      "http://127.0.0.1:8000/v1/models",
+      "http://127.0.0.1:8000/v1/models/status",
+    ],
+  );
+  assert.ok(requested.every((entry) => entry.authorizationPresent));
+});
+
+test("Ollama uses the loaded model's effective native context without guessing concurrency", async () => {
+  const requested = [];
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "ollama",
+      endpoint: "http://127.0.0.1:11434/v1",
+      model: "qwen3:30b",
+      apiKey: "",
+      contextLimit: 16_384,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 12,
+      total_bytes: 64 * GIB,
+      available_bytes: 12 * GIB,
+    }),
+    requestJson: async (url) => {
+      requested.push(url);
+      return {
+        models: [{
+          name: "qwen3:30b",
+          model: "qwen3:30b",
+          context_length: 65_536,
+        }],
+      };
+    },
+  });
+
+  assert.deepEqual(requested, [
+    "http://127.0.0.1:11434/api/ps",
+  ]);
+  assert.equal(resolved.providerContextLimit, 65_536);
+  assert.equal(resolved.contextLimit, 65_536);
+  assert.equal(resolved.source, "provider_and_memory");
+  assert.equal(resolved.providerOutputLimit, null);
+});
+
+test("an unloaded Ollama model keeps the configured context fallback", async () => {
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "Ollama",
+      endpoint: "http://127.0.0.1:11434/v1",
+      model: "qwen3:30b",
+      contextLimit: 24_576,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * GIB,
+      available_bytes: 24 * GIB,
+    }),
+    requestJson: async () => ({ models: [] }),
+  });
+
+  assert.equal(resolved.contextLimit, 24_576);
+  assert.equal(resolved.providerContextLimit, null);
+  assert.equal(resolved.source, "configured");
+});
+
+test("LM Studio uses the selected loaded instance's configured context", async () => {
+  const requested = [];
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "LM Studio",
+      endpoint: "http://127.0.0.1:1234/v1",
+      model: "qwen/qwen3-coder",
+      apiKey: "lm-token",
+      contextLimit: 16_384,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 12,
+      total_bytes: 64 * GIB,
+      available_bytes: 12 * GIB,
+    }),
+    requestJson: async (url, headers) => {
+      requested.push({
+        url,
+        authorizationPresent: Boolean(headers.authorization),
+      });
+      return {
+        models: [{
+          key: "qwen/qwen3-coder",
+          max_context_length: 131_072,
+          loaded_instances: [{
+            id: "qwen/qwen3-coder",
+            config: {
+              context_length: 65_536,
+            },
+          }],
+        }],
+      };
+    },
+  });
+
+  assert.deepEqual(requested, [{
+    url: "http://127.0.0.1:1234/api/v1/models",
+    authorizationPresent: true,
+  }]);
+  assert.equal(resolved.providerContextLimit, 65_536);
+  assert.equal(resolved.contextLimit, 65_536);
+  assert.equal(resolved.source, "provider_and_memory");
+  assert.equal(resolved.providerOutputLimit, null);
+});
+
+test("an unknown OpenAI-compatible provider keeps the configured fallback when loaded status is unavailable", async () => {
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      provider: "Custom Local",
+      endpoint: "http://127.0.0.1:9000/v1",
+      model: "custom-model",
+      contextLimit: 20_480,
+    },
+  }, {
+    getSystemMemory: async () => ({
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * GIB,
+      available_bytes: 24 * GIB,
+    }),
+    requestJson: async (url) => {
+      if (url.endsWith("/models/status")) {
+        throw new Error("unsupported endpoint");
+      }
+      return {
+        data: [{
+          id: "custom-model",
+          max_context_length: 131_072,
+        }],
+      };
+    },
+  });
+
+  assert.equal(resolved.providerContextLimit, 131_072);
+  assert.equal(resolved.contextLimit, 20_480);
+  assert.equal(resolved.source, "configured");
+});
+
+test("cloud Runs keep provider-managed context and do not probe local capacity", async () => {
+  let probes = 0;
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "cloud",
+    local: {
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "local-model",
+      contextLimit: 32_768,
+    },
+  }, {
+    getSystemMemory: async () => {
+      probes += 1;
+      throw new Error("must not be called");
+    },
+    requestJson: async () => {
+      probes += 1;
+      throw new Error("must not be called");
+    },
+  });
+
+  assert.equal(resolved, null);
+  assert.equal(probes, 0);
+});
+
+test("missing local endpoint or model uses configured fallback without probes", async () => {
+  let probes = 0;
+  const resolved = await budget.resolveRuntimeContextBudget({
+    activeProfile: "local",
+    local: {
+      endpoint: "",
+      model: "",
+      contextLimit: 24_576,
+    },
+  }, {
+    getSystemMemory: async () => {
+      probes += 1;
+      throw new Error("must not be called");
+    },
+    requestJson: async () => {
+      probes += 1;
+      throw new Error("must not be called");
+    },
+  });
+
+  assert.equal(resolved.contextLimit, 24_576);
+  assert.equal(resolved.source, "configured");
+  assert.equal(probes, 0);
+});
+
+test("one resolved Run budget drives provider settings and read_file windows", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    preserveAssistantReasoning: true,
+    availableMemoryBytes: 12 * GIB,
+    reservedOutputTokens: 8_192,
+  });
+  const config = {
+    activeProfile: "local",
+    local: {
+      provider: "OMLX",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "Qwen3.6-35B-A3B-6bit",
+      apiKey: "",
+      contextLimit: 32_768,
+      toolProtocol: "auto",
+    },
+  };
+  const settings = providerSettings.deriveBudgetedStreamSettings(
+    config,
+    resolved,
+  );
+  const args = executionText.runtimeV2ContextBoundToolArguments(
+    "read_file",
+    { path: "src/main.js" },
+    resolved,
+  );
+  const explicitSmaller = executionText.runtimeV2ContextBoundToolArguments(
+    "read_file",
+    { path: "src/main.js", max_chars: 12_000 },
+    resolved,
+  );
+  const parallelBatch = executionText.runtimeV2ContextBoundToolArguments(
+    "read_file",
+    { path: "src/main.js" },
+    resolved,
+    { parallelReadCount: 3 },
+  );
+
+  assert.equal(settings.contextLimit, resolved.contextLimit);
+  assert.equal(
+    settings.reasoningRequest,
+    "auto",
+    "Runtime v2 must preserve the local provider/model reasoning default",
+  );
+  assert.equal(settings.preserveAssistantReasoning, true);
+  assert.deepEqual(
+    providerSettings.deriveProviderAdapterCapabilities(settings),
+    {
+      nativeToolRoundTrip: true,
+      reasoningToggle: true,
+    },
+  );
+  assert.deepEqual(
+    providerSettings.deriveProviderAdapterCapabilities({
+      provider: "LM Studio",
+    }),
+    {
+      nativeToolRoundTrip: true,
+      reasoningToggle: false,
+    },
+  );
+  assert.equal(args.max_chars, resolved.readWindowChars);
+  assert.equal(explicitSmaller.max_chars, 12_000);
+  assert.equal(
+    parallelBatch.max_chars,
+    Math.floor(resolved.readWindowChars / 3),
+  );
+  assert.equal(
+    executionText.runtimeV2ParallelReadCount([
+      { name: "read_file" },
+      { name: "grep_search" },
+      { name: "read_file" },
+    ]),
+    2,
+  );
+  assert.ok(args.max_chars > 32_000);
+});
+
+test("Runtime v2 preserves a complete admitted read window instead of truncating it again", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+  const content = [
+    "READ_FILE_RESULT",
+    "path: src/main.js",
+    "truncated: false",
+    "---CONTENT START---",
+    "x".repeat(48_000),
+    "---CONTENT END---",
+  ].join("\n");
+
+  const retained = executionText.boundedRuntimeV2ToolContent(
+    "read_file",
+    content,
+    resolved,
+  );
+
+  assert.equal(retained, content);
+  assert.doesNotMatch(retained, /Runtime v2 truncated/);
+});
+
+test("native and compatibility tool protocols share a bounded decision output budget", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+  const command = {
+    payload: {
+      toolExpectation: "required",
+    },
+  };
+
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      command,
+      false,
+      resolved,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
+    ),
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      { payload: { mode: "execute" } },
+      false,
+      resolved,
+      "closed_recovery",
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS,
+    ),
+    "a closed action window uses the recovery ceiling on its first request",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      { payload: { mode: "execute" } },
+      false,
+      resolved,
+      null,
+      true,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_MAX_OUTPUT_TOKENS,
+    ),
+    "a named contract-only decision has enough room for schema-complete arguments while prose remains separately capped",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      command,
+      true,
+      resolved,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
+    ),
+  );
+
+  for (const [mode, expected] of [
+    ["execute", providerRequest.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS],
+    ["validate", providerRequest.RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS],
+    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS],
+  ]) {
+    assert.equal(
+      providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+        { payload: { mode } },
+        false,
+        resolved,
+      ),
+      Math.min(resolved.outputBudget, expected),
+    );
+  }
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      {
+        payload: {
+          mode: "execute",
+          recoveryPressure: { reason: "empty_response", occurrence: 1 },
+        },
+      },
+      false,
+      resolved,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS,
+    ),
+  );
+});
+
+test("source-only effect pressure uses capability-gated action decoding", () => {
+  assert.ok(
+    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT >
+      providerRequest.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+    "a complete multi-file contract has a bounded but schema-sized envelope while ordinary forced actions stay terse",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "explicit",
+      sourceOnlyFrontier: true,
+      hasMutationTool: false,
+      providerSupportsReasoningToggle: true,
+      contractOnlyAction: true,
+    }),
+    "off",
+    "contract formation decodes committed evidence instead of opening a second hidden analysis phase",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "explicit",
+      sourceOnlyFrontier: true,
+      hasMutationTool: false,
+      providerSupportsReasoningToggle: false,
+      contractOnlyAction: true,
+    }),
+    "explicit",
+    "reasoning policy never invents an unsupported provider toggle",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: false,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      structuredActionRequired: true,
+    }),
+    "off",
+    "a closed state-machine action boundary decodes a tool immediately instead of opening another hidden essay",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+    }),
+    "off",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: false,
+    }),
+    "auto",
+    "providers without a documented toggle retain their configured behavior",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: false,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+    }),
+    "auto",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "reconsider",
+    }),
+    "off",
+    "a rejected structured action switches directly to bounded action decoding",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "reframe",
+    }),
+    "off",
+    "a sustained rejected-action loop cannot reopen long-form reasoning",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "off",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      recoveringFromRejectedAction: true,
+      recoveryStage: "alternative",
+    }),
+    "off",
+    "an explicit user/provider off setting remains authoritative",
+  );
+});
+
+test("Run admission attaches one immutable budget object to the submission context", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768,
+    providerContextLimit: 262_144,
+    modelLoaded: true,
+    availableMemoryBytes: 12 * GIB,
+  });
+  const original = {
+    turnId: "turn-1",
+    runtimeContextBudget: null,
+  };
+  const attached = submissionContext.withRuntimeV2ContextBudget(
+    original,
+    resolved,
+  );
+
+  assert.notEqual(attached, original);
+  assert.equal(attached.runtimeContextBudget, resolved);
+  assert.equal(original.runtimeContextBudget, null);
+});
+
+test("pressure compaction never drops a trailing phase authority instruction", () => {
+  const messages = [
+    { role: "system", content: "root authority" },
+    { role: "user", content: "fix the complete objective" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "read-1",
+        type: "function",
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/main.js" }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: "read-1",
+      content: "x".repeat(80_000),
+    },
+    {
+      role: "system",
+      content: "submit the evidence-backed result now",
+    },
+  ];
+  const bounded = budget.boundRuntimeMessagesToContext(messages, {
+    contextLimit: 8_192,
+    reservedOutputTokens: 4_096,
+  });
+
+  assert.equal(
+    bounded.at(-1).content,
+    "submit the evidence-backed result now",
+  );
+  assert.ok(bounded.some((message) =>
+    message.role === "user" &&
+    message.content === "fix the complete objective"
+  ));
+});

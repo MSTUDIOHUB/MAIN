@@ -8,6 +8,7 @@ import {
   resolveRuntimeV2VisibleRunnerKind,
   resolveRuntimeEngineVersion,
 } from "../lib/runtimeEngineSelection";
+import { resolveRuntimeContextBudget } from "../lib/runtimeContextBudget";
 import { runSubmitRuntimeV2Chat } from "./runtimeV2/chatRunner";
 import { runSubmitRuntimeV2Execute } from "./runtimeV2/executeRunner";
 import { runSubmitRuntimeV2Goal } from "./runtimeV2/goalProductionRunner";
@@ -19,6 +20,7 @@ import type {
   RuntimeV2GameStudioServicePort,
 } from "./runtimeV2/studioAdapter";
 import type { RuntimeV2StudioAction } from "../lib/runtime-v2";
+import { withRuntimeV2ContextBudget } from "./runtimeV2/submissionContext";
 
 type SubmitRuntimeStoreGet = () => any;
 type SubmitRuntimeStoreSet = any;
@@ -26,7 +28,7 @@ type SubmitRuntimeStoreSet = any;
 type SubmitRuntimePortInputs = Pick<
   SubmissionRuntimeStorePorts,
   | "sanitizeTaskBlocksForPersist"
-  | "normalizeSessionRuntimeSnapshot"
+  | "buildSessionRuntimeSnapshot"
   | "getSessionRevisionToken"
   | "publishOwnerScopedRuntimeProjection"
   | "logStoreEvent"
@@ -42,7 +44,7 @@ export interface RunSubmitRuntimeInput extends SubmitRuntimePortInputs {
   studioActions?: readonly RuntimeV2StudioAction[];
 }
 
-export function runSubmitRuntime(
+export async function runSubmitRuntime(
   input: RunSubmitRuntimeInput,
 ): Promise<RuntimeRunSettlement> {
   const turn = input.get().conversationTurns?.find((candidate: any) => candidate.id === input.context.turnId);
@@ -51,6 +53,8 @@ export function runSubmitRuntime(
     effectiveIntent: input.context.effectiveRunIntent,
     runtimeIntent: input.context.runtimeRunIntent,
     runWorkspace: input.context.runWorkspace,
+    hasAttachedFiles:
+      input.context.turnInputContextSignals.attachedFilePaths.length > 0,
   });
   if (admittedVersion !== "v2") {
     input.logStoreEvent("runtime_v2_turn_marker_missing", {
@@ -61,14 +65,41 @@ export function runSubmitRuntime(
     });
     throw new Error("RUNTIME_V2_TURN_ADMISSION_REQUIRED");
   }
+  const runtimeContextBudget = await resolveRuntimeContextBudget(
+    input.get().config || {},
+  );
+  const runtimeContext = withRuntimeV2ContextBudget(
+    input.context,
+    runtimeContextBudget,
+  );
+  input.logStoreEvent("runtime_v2_context_budget_resolved", {
+    turnId: input.context.turnId,
+    runId: input.context.harnessRunId,
+    profile: input.get().config?.activeProfile === "cloud"
+      ? "cloud"
+      : "local",
+    contextLimit: runtimeContextBudget?.contextLimit ?? null,
+    inputBudget: runtimeContextBudget?.inputBudget ?? null,
+    outputBudget: runtimeContextBudget?.outputBudget ?? null,
+    readWindowChars: runtimeContextBudget?.readWindowChars ?? null,
+    source: runtimeContextBudget?.source ?? "provider_managed",
+    providerContextLimit:
+      runtimeContextBudget?.providerContextLimit ?? null,
+    providerOutputLimit:
+      runtimeContextBudget?.providerOutputLimit ?? null,
+    preserveAssistantReasoning:
+      runtimeContextBudget?.preserveAssistantReasoning ?? null,
+    availableMemoryBytes:
+      runtimeContextBudget?.availableMemoryBytes ?? null,
+  });
   if (runtimeV2RunnerKind === "execute") {
     return runSubmitRuntimeV2Execute({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -78,10 +109,10 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2Plan({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -91,10 +122,10 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2Goal({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -109,13 +140,13 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2Studio({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       actions: input.studioActions,
       runtimeService: input.runtimeService,
       studioReceipts: createRuntimeV2StudioReceiptFilePort({ workspace }),
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -127,10 +158,10 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2Execute({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -140,10 +171,10 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2Chat({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,
@@ -153,10 +184,10 @@ export function runSubmitRuntime(
     return runSubmitRuntimeV2WorkspaceRead({
       get: input.get,
       set: input.set,
-      context: input.context,
+      context: runtimeContext,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord || saveProjectSession,
       logStoreEvent: input.logStoreEvent,

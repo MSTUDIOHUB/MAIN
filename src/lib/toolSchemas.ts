@@ -14,12 +14,19 @@ import {
 export interface ToolParameterSchema {
   type?: string;
   description?: string;
+  /**
+   * Internal execution-identity annotation. Optional arguments equal to this
+   * value are canonicalized as omitted before replay detection. Schema
+   * normalization removes the annotation before any provider request.
+   */
+  runtimeIdentityDefault?: unknown;
   enum?: string[];
   properties?: Record<string, ToolParameterSchema>;
   items?: ToolParameterSchema;
   required?: string[];
   minItems?: number;
   anyOf?: ToolParameterSchema[];
+  not?: ToolParameterSchema;
   additionalProperties?: boolean | ToolParameterSchema;
 }
 
@@ -411,6 +418,7 @@ function normalizeToolSchemaNode(node: unknown): void {
   if (!node || typeof node !== "object") return;
 
   const schemaNode = node as Record<string, unknown>;
+  delete schemaNode.runtimeIdentityDefault;
   const hasOwn = (key: string) => Object.prototype.hasOwnProperty.call(schemaNode, key);
   const hasDescription = typeof schemaNode.description === "string" && schemaNode.description.trim().length > 0;
   const hasType = typeof schemaNode.type === "string" && schemaNode.type.trim().length > 0;
@@ -461,21 +469,42 @@ export function normalizeToolDefinitions(tools: ToolDefinition[]): ToolDefinitio
   return tools.map((tool) => normalizeToolDefinition(tool));
 }
 
+export const READ_ONLY_SUBAGENT_TASK_KINDS = [
+  "explore",
+  "review",
+  "validate",
+] as const;
+
+export const READ_ONLY_SUBAGENT_ACCESS_MODES = ["read"] as const;
+
+export const RUNTIME_V2_SUBAGENT_TASK_KINDS = [
+  ...READ_ONLY_SUBAGENT_TASK_KINDS,
+  "implement",
+] as const;
+
+export const RUNTIME_V2_SUBAGENT_ACCESS_MODES = ["read", "write"] as const;
+
+export const RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS = [
+  "create",
+  "modify",
+  "delete",
+] as const;
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION,
   {
     type: "function",
     function: {
       name: "spawn_subagent",
-      description: "创建一个全新的一次性子智能体来执行一个不可变、语义独立且窄于父目标的任务。运行时若把它作为当前唯一工具，即表示本轮已开启协作，必须先创建一个；恢复正常工具面后，仅在并行收益明确时继续创建。任务结束后实例会永久关闭，后续工作必须重新分析并创建新任务，不得复用旧 agent。相同语义任务会被 runtime 去重；路径只用于权限和租约隔离，不用于生成目标。子智能体运行期间主体应继续处理不重叠工作，依赖结果或最终回答前再 wait_subagents。",
+      description: "按需创建一个全新的一次性子智能体。调查、评审和验证任务为只读；父线程形成明确方案后，可把互不重叠的文件所有权交给 implement 子任务并行形成一个受控修改事务。仅在存在真实并行收益时委派，父线程继续处理不重叠工作。",
       parameters: {
         type: "object",
         properties: {
           task_key: { type: "string", description: "当前父回合内稳定、简短且能表达职责的语义任务键" },
           task_kind: {
             type: "string",
-            enum: ["explore", "review", "implement", "validate"],
-            description: "独立任务类型；implement 是唯一允许请求写租约的类型",
+            enum: [...RUNTIME_V2_SUBAGENT_TASK_KINDS],
+            description: "子任务类型；explore/review/validate 为只读，implement 为明确方案下的受控实现",
           },
           objective: { type: "string", description: "子智能体要独立完成的明确目标" },
           delegation_reason: { type: "string", description: "可选：为什么该任务值得独立委派；省略时由运行时补充中性原因" },
@@ -483,19 +512,28 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
           scope: { type: "string", description: "可选的职责边界说明；不能替代 objective 和 success_criteria" },
-          required_paths: { type: "string", description: "可选：成功标准要求必须覆盖的精确路径" },
-          allowed_paths: { type: "string", description: "权限与租约上限，使用逗号分隔；只读任务可省略并限定为当前工作区，implement/write 必须提供精确路径，本地任务最多 6 个" },
+          required_paths: { type: "string", description: "成功标准要求必须覆盖的精确路径；只读任务未提供 allowed_paths 时也作为其最小读取范围。implement 必须列出每个实际写入文件。" },
+          allowed_paths: { type: "string", description: "权限上限，使用逗号分隔；省略时使用 required_paths，本地任务最多 6 个。write 子任务必须使用互不重叠的精确文件目标，不能用目录授权后再自行选择文件。" },
           access_mode: {
             type: "string",
-            enum: ["read", "write"],
-            description: "可选，默认 read；write 仅适用于 implement，恢复阶段不可请求，并且必须继承父级 Execute/Goal 权限或精确落在已批准 Plan 的写范围内",
+            enum: [...RUNTIME_V2_SUBAGENT_ACCESS_MODES],
+            description: "explore/review/validate 使用 read；仅 implement 可使用 write",
+          },
+          implementation_operation: {
+            type: "string",
+            enum: [...RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS],
+            description: "implement 必填：该子任务负责 create、modify 或 delete 中的一类修改",
+          },
+          implementation_plan: {
+            type: "string",
+            description: "implement 必填：父线程基于证据形成的具体修改方案，必须说明责任边界和预期行为，不能只写‘修复问题’",
           },
           expected_output: { type: "string", description: "可选：汇合时需要返回的证据结构或判断；省略时返回带精确目标的来源证据" },
           depends_on: { type: "string", description: "可选，依赖的 collaboration task ID 或 task_key，逗号分隔" },
           independent_review_of: { type: "string", description: "可选；仅 reviewer 用于声明对指定 task ID/task_key 的有意独立复核" },
           goal_slice_id: { type: "string", description: "可选；仅 Goal 模式用于关联父级 goal slice，普通回合不要填写" },
         },
-        required: ["objective"],
+        required: ["objective", "required_paths"],
       },
     },
   },
@@ -717,14 +755,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "读取源码、Markdown、JSON、日志、纯文本等文件的内容窗口。工作区外的本机绝对路径会先请求用户授权，授权后通过临时附件副本读取。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
+      description: "读取源码、Markdown、JSON、日志、纯文本等文件的内容窗口。工作区外的本机绝对路径会先请求用户授权，授权后通过临时附件副本读取。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。若单行超过窗口，会返回 0-based、end-exclusive 的 returnedCharRange/nextStartChar；用 start_char 和 max_chars 继续同一版本，相邻结果可直接拼接。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" },
-          start_line: { type: "number", description: "可选，1-based 起始行号。适合读取报错行附近或继续读取 nextStartLine。" },
+          start_line: {
+            type: "number",
+            description: "可选，1-based 起始行号。适合读取报错行附近或继续读取 nextStartLine。",
+            runtimeIdentityDefault: 1,
+          },
           end_line: { type: "number", description: "可选，1-based 结束行号。可与 start_line 搭配读取精确范围。" },
           max_lines: { type: "number", description: "可选，最多返回多少行。大文件默认只返回安全窗口；继续读取时通常传 nextStartLine 和 max_lines。" },
+          start_char: { type: "number", description: "可选，0-based Unicode code-point 字符游标。仅用于 returnedCharRange/nextStartChar 续读；不要与行窗口参数混用。" },
+          max_chars: { type: "number", description: "可选，字符窗口上限。与 start_char 配合可无损续读超长单行。" },
         },
         required: ["path"],
       },
@@ -842,12 +886,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "replace_in_file",
-      description: "Replace one exact text block in an existing file and return a structured diff. Use the schema keys path, search_text, and replace_text exactly; search_text must match the current file verbatim.",
+      description: "Replace one unique exact text block in an existing file and return a structured diff. Use the schema keys path, search_text, and replace_text exactly. Copy the smallest block that is still unique directly from current source; never reconstruct a large unchanged region from memory. search_text must match verbatim and occur only once.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" },
-          search_text: { type: "string", description: "旧代码（必须与原文完全一致）" },
+          search_text: { type: "string", description: "直接从当前源码复制的最小唯一旧代码块（必须逐字匹配，不要包含无关的未修改函数）" },
           replace_text: { type: "string", description: "新代码" },
         },
         required: ["path", "search_text", "replace_text"],
@@ -880,6 +924,23 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           patch: { type: "string", description: "Complete patch text. Example: *** Begin Patch\n*** Update File: src/example.ts\n@@\n-old\n+new\n*** End Patch. A standard ---/+++ unified diff is also accepted." },
         },
         required: ["patch"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_workspace_path",
+      description: "Delete one exact workspace-relative file or empty path after explicit destructive-operation review. Never use the workspace root, an absolute path, `..`, a glob, or a broad directory. Prefer a narrower modification when deletion is not required by the approved solution.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Exact workspace-relative deletion target. The runtime revalidates scope and requests one-shot destructive approval before execution.",
+          },
+        },
+        required: ["path"],
       },
     },
   },

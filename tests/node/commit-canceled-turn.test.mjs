@@ -45,6 +45,7 @@ const { createSubmitSessionRuntimeController } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitSessionRuntimeController.ts"),
 );
 const {
+  awaitCanceledTurnTerminalProjection,
   beginSessionCancellation,
   deferUntilSessionCancellationSettled,
   getPendingSessionCancellation,
@@ -53,6 +54,52 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/sessionCancellationBarrier.ts"),
 );
+
+test("a stale runtime observes the cancellation owner instead of writing a second terminal", async () => {
+  const sessionKey = "/tmp/project:runtime-cancel-owner";
+  const turnId = "turn-runtime-cancel";
+  let releaseCancellation;
+  const gate = new Promise((resolve) => {
+    releaseCancellation = resolve;
+  });
+  let projection = { runtimeEvents: [], taskFlow: [] };
+  const { cancellation } = beginSessionCancellation(
+    sessionKey,
+    turnId,
+    async () => {
+      await gate;
+      projection = {
+        runtimeEvents: [
+          { type: "run.aborted", threadId: sessionKey, turnId, runId: "run-1" },
+          { type: "run.completed", threadId: sessionKey, turnId, runId: "run-1", resultKind: "canceled" },
+          { type: "turn.completed", threadId: sessionKey, turnId, resultKind: "canceled" },
+        ],
+        taskFlow: [{ type: "agent", turnId, visibility: "assistant_final" }],
+      };
+      return {
+        sessionKey,
+        turnId,
+        terminalSettled: true,
+        disposition: "committed_durable",
+      };
+    },
+  );
+
+  const observed = awaitCanceledTurnTerminalProjection({
+    sessionKey,
+    turnId,
+    getProjection: () => projection,
+  });
+  releaseCancellation();
+  assert.equal(await observed, true);
+  await cancellation.promise;
+  assert.equal(getPendingSessionCancellation(sessionKey), null);
+  assert.equal(await awaitCanceledTurnTerminalProjection({
+    sessionKey,
+    turnId,
+    getProjection: () => projection,
+  }), true, "the canonical projection remains sufficient after the fence is released");
+});
 
 function createState(overrides = {}) {
   return {

@@ -1,24 +1,26 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Command } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { analyzeValidationCommand } from "../validationContract";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { workspacePathsReferToSameFile } from "../workspacePaths";
+import {
+  runtimeV2DirectExecuteAuthorityDigest,
+  runtimeV2DirectExecuteCriterionIds,
+  runtimeV2DirectExecuteMutationTargets,
+  runtimeV2ValidationBoundaryMatchesCurrent,
+} from "./validationReceipt";
 
-export type RuntimeV2ExecutePhaseTransition =
-  | {
-      readonly from: "observing";
-      readonly to: "acting";
-      readonly reason: "pending_mutation_call" | "observation_cycle_complete";
-    }
-  | {
-      readonly from: "acting";
-      readonly to: "validating";
-      readonly reason: "mutation_committed";
-    }
-  | {
-      readonly from: "validating";
-      readonly to: "acting";
-      readonly reason: "validation_failed";
-    };
+export interface RuntimeV2ExecutePhaseTransition {
+  readonly from: "observing" | "acting" | "validating";
+  readonly to: "acting" | "validating";
+  readonly reason:
+    | "pending_mutation_call"
+    | "pending_validation_call"
+    | "mutation_committed"
+    | "unvalidated_mutation_pending"
+    | "validation_failed";
+}
 
 export interface RuntimeV2ExecutePhaseTransitionInput {
   /**
@@ -28,8 +30,6 @@ export interface RuntimeV2ExecutePhaseTransitionInput {
    */
   readonly isMutationToolName: (toolName: string) => boolean;
 }
-
-const TERMINAL_CHILD_STATUSES = new Set(["completed", "failed", "canceled"]);
 
 export function hasCompletedRuntimeV2InitialObservation(
   state: TurnAggregateV1,
@@ -80,10 +80,27 @@ function toolName(command: RuntimeV2Command): string {
     : "";
 }
 
-function committedMutationKeys(
+export function isRuntimeV2ValidationToolCall(
+  call: Pick<
+    TurnAggregateV1["pendingToolCalls"][number],
+    "name" | "arguments"
+  >,
+): boolean {
+  if (call.name === "run_command") {
+    const command = String(
+      call.arguments.command || call.arguments.cmd || "",
+    ).trim();
+    return analyzeValidationCommand(command).spec?.kind ===
+      "finite_command";
+  }
+  return call.name === "browser_evaluate" ||
+    call.name === "computer_use";
+}
+
+function committedMutationSequences(
   events: readonly RuntimeV2Event[],
   isMutationToolName: RuntimeV2ExecutePhaseTransitionInput["isMutationToolName"],
-): ReadonlySet<string> {
+): readonly number[] {
   const mutations = new Set(
     events
       .filter((event): event is Extract<RuntimeV2Event, { type: "command.scheduled" }> =>
@@ -97,17 +114,25 @@ function committedMutationKeys(
       })
       .map((event) => event.command.idempotencyKey),
   );
-  const committed = new Set<string>();
-  for (const event of events) {
-    if (
+  const parentMutations = events
+    .filter((event): event is Extract<RuntimeV2Event, { type: "tool.completed" }> =>
       event.type === "tool.completed" &&
       event.status === "succeeded" &&
       mutations.has(event.idempotencyKey)
-    ) {
-      committed.add(event.idempotencyKey);
-    }
-  }
-  return committed;
+    )
+    .map((event) => event.sequence);
+  const childMutations = events
+    .filter((event): event is Extract<RuntimeV2Event, { type: "subagent.completed" }> =>
+      event.type === "subagent.completed" &&
+      event.status === "completed" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+    )
+    .map((event) => event.sequence);
+  return [...parentMutations, ...childMutations];
+}
+
+function latestSequence(values: readonly number[]): number {
+  return values.length > 0 ? Math.max(...values) : -1;
 }
 
 export interface RuntimeV2ExecuteEvidenceSummary {
@@ -116,6 +141,177 @@ export interface RuntimeV2ExecuteEvidenceSummary {
   readonly failedValidationCount: number;
   readonly stalledValidationCount: number;
   readonly failedOperationCount: number;
+  readonly failedProviderRequestCount: number;
+}
+
+/** Three identical acceptance failures across mutation boundaries prove that
+ * edits are not changing the observed defect. This is a semantic no-progress
+ * boundary, not a wall-clock or total-step limit: any materially different
+ * validation result resets the consecutive count. */
+export const RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT = 3;
+
+function validationSupportsRequirement(
+  event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
+  requirement: "static" | "behavioral" | "interaction" | undefined,
+): boolean {
+  if (!event.passed) return false;
+  const toolName = event.presentation?.toolName || "";
+  const interaction =
+    toolName === "browser_evaluate" || toolName === "computer_use";
+  const finite = toolName === "run_command"
+    ? analyzeValidationCommand(event.presentation?.target || "").spec
+    : null;
+  const behavioral =
+    interaction ||
+    (
+      finite?.kind === "finite_command" &&
+      (
+        finite.capability === "test" ||
+        finite.capability === "inline_assertion"
+      )
+    );
+  if (requirement === "static") {
+    return interaction || finite?.kind === "finite_command";
+  }
+  if (requirement === "interaction") return interaction;
+  if (requirement === "behavioral") return behavioral;
+  // Direct Execute admission preserves the user's objective but does not
+  // invent a semantic class from prose. Any real finite validator may cover
+  // an unclassified criterion; typed Goal and WorkPlan criteria retain their
+  // explicit stronger requirement.
+  return interaction || finite?.kind === "finite_command";
+}
+
+function validationAuthorityWasAdmitted(
+  state: TurnAggregateV1,
+  event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
+): boolean {
+  const authority = event.authority;
+  if (!authority) return false;
+  const scheduled = state.events.find((candidate) =>
+    candidate.type === "command.scheduled" &&
+    candidate.command.kind === "execute_validation" &&
+    candidate.command.idempotencyKey === event.idempotencyKey
+  );
+  const admitted = scheduled?.type === "command.scheduled"
+    ? scheduled.command.payload.validationAuthority
+    : null;
+  if (
+    !admitted ||
+    typeof admitted !== "object" ||
+    Array.isArray(admitted)
+  ) {
+    return false;
+  }
+  const value = admitted as Record<string, unknown>;
+  const admittedCriterionIds = Array.isArray(value.criterionIds)
+    ? value.criterionIds as unknown[]
+    : [];
+  const admittedTargetPaths = Array.isArray(value.targetPaths)
+    ? value.targetPaths as unknown[]
+    : [];
+  return value.kind === authority.kind &&
+    value.id === authority.id &&
+    value.revision === authority.revision &&
+    value.digest === authority.digest &&
+    value.validationId === authority.validationId &&
+    admittedCriterionIds.length === authority.criterionIds.length &&
+    authority.criterionIds.every((id) =>
+      admittedCriterionIds.includes(id)
+    ) &&
+    admittedTargetPaths.length === authority.targetPaths.length &&
+    authority.targetPaths.every((target) =>
+      admittedTargetPaths.some((candidate) =>
+        workspacePathsReferToSameFile(String(candidate), target)
+      )
+    );
+}
+
+export function runtimeV2DirectExecuteReadyForConclusion(
+  state: TurnAggregateV1,
+): boolean {
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
+  const latestMutationSequence = state.events.reduce(
+    (latest, event) =>
+      (
+        (
+          event.type === "tool.completed" &&
+          event.status === "succeeded"
+        ) ||
+        (
+          event.type === "subagent.completed" &&
+          event.status === "completed"
+        )
+      ) &&
+        event.evidence.some((evidence) => evidence.kind === "mutation")
+        ? Math.max(latest, event.sequence)
+        : latest,
+    -1,
+  );
+  if (latestMutationSequence < 0) return false;
+  const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
+  if (criterionIds.length === 0 || mutationTargets.length === 0) return false;
+  const expectedDigest = runtimeV2DirectExecuteAuthorityDigest({
+    turnId: state.turn.turnId,
+    objective: state.objective,
+  });
+  const validations = state.events.filter((
+    event,
+  ): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
+    event.type === "validation.completed" &&
+    event.sequence > latestMutationSequence
+  );
+  const validPasses = validations.filter((event) => {
+    const authority = event.authority;
+    return event.passed &&
+      authority?.kind === "direct_execute" &&
+      authority.id === state.turn.turnId &&
+      authority.revision === 1 &&
+      authority.digest === expectedDigest &&
+      authority.validationId.length > 0 &&
+      authority.criterionIds.length > 0 &&
+      authority.criterionIds.every((id) => criterionIds.includes(id)) &&
+      authority.targetPaths.length > 0 &&
+      authority.targetPaths.every((target) =>
+        mutationTargets.some((mutationTarget) =>
+          workspacePathsReferToSameFile(mutationTarget, target)
+        )
+      ) &&
+      validationAuthorityWasAdmitted(state, event) &&
+      event.evidence.some((evidence) => evidence.kind === "validation") &&
+      runtimeV2ValidationBoundaryMatchesCurrent({
+        aggregate: state,
+        targetPaths: authority.targetPaths,
+        mutationBoundarySequence: event.mutationBoundarySequence,
+        validatedMutationVersions: event.validatedMutationVersions,
+      });
+  });
+  if (validPasses.length === 0) return false;
+  const latestPassSequence = Math.max(
+    ...validPasses.map((event) => event.sequence),
+  );
+  if (
+    validations.some((event) =>
+      event.sequence > latestPassSequence && !event.passed
+    )
+  ) {
+    return false;
+  }
+  const requirements = state.objective.acceptanceEvidenceRequirements || [];
+  const allCriteriaCovered = criterionIds.every((criterionId, index) =>
+    validPasses.some((event) =>
+      event.authority!.criterionIds.includes(criterionId) &&
+      validationSupportsRequirement(event, requirements[index])
+    )
+  );
+  const allMutationTargetsCovered = mutationTargets.every((mutationTarget) =>
+    validPasses.some((event) =>
+      event.authority!.targetPaths.some((target) =>
+        workspacePathsReferToSameFile(mutationTarget, target)
+      )
+    )
+  );
+  return allCriteriaCovered && allMutationTargetsCovered;
 }
 
 function validationFailureFingerprint(
@@ -143,18 +339,13 @@ function failedValidationSummarySinceLastPass(
     const event = events[index]!;
     if (event.type !== "validation.completed") continue;
     if (event.passed) break;
-    if (
-      event.failureKind !== "not_authorized" &&
-      event.failureKind !== "protocol_invalid"
-    ) {
-      count += 1;
-      const fingerprint = validationFailureFingerprint(event);
-      if (!latestFingerprint) latestFingerprint = fingerprint;
-      if (countingStalled && fingerprint === latestFingerprint) {
-        stalled += 1;
-      } else {
-        countingStalled = false;
-      }
+    count += 1;
+    const fingerprint = validationFailureFingerprint(event);
+    if (!latestFingerprint) latestFingerprint = fingerprint;
+    if (countingStalled && fingerprint === latestFingerprint) {
+      stalled += 1;
+    } else {
+      countingStalled = false;
     }
   }
   return { total: count, stalled };
@@ -173,6 +364,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
       failedValidationCount: 0,
       stalledValidationCount: 0,
       failedOperationCount: 0,
+      failedProviderRequestCount: 0,
     };
   }
   const latestMutationSequence = state.events.reduce((latest, event) =>
@@ -185,8 +377,39 @@ export function summarizeRuntimeV2ExecuteEvidence(
   const failedValidations = failedValidationSummarySinceLastPass(
     state.events,
   );
+  const providerRequestKeys = new Set(
+    state.events.flatMap((event) =>
+      event.type === "command.scheduled" &&
+        event.command.kind === "request_model"
+        ? [event.command.idempotencyKey]
+        : []
+    ),
+  );
+  const failedProviderDecisionKeys = new Set(
+    state.events.flatMap((event) => {
+      if (
+        event.type === "command.completed" &&
+        event.status === "failed" &&
+        providerRequestKeys.has(event.idempotencyKey)
+      ) {
+        return [event.idempotencyKey];
+      }
+      if (
+        event.type === "provider.responded" &&
+        event.result.toolCalls.length === 0 &&
+        (
+          event.result.diagnostics.length > 0 ||
+          !String(event.result.visibleText || "").trim()
+        )
+      ) {
+        return [event.idempotencyKey];
+      }
+      return [];
+    }),
+  );
   return {
-    mutationCount: committedMutationKeys(state.events, input.isMutationToolName).size,
+    mutationCount:
+      committedMutationSequences(state.events, input.isMutationToolName).length,
     passedValidationCount: state.events.filter((event) =>
       event.type === "validation.completed" &&
       event.passed &&
@@ -198,6 +421,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
       (event.type === "tool.completed" && event.status !== "succeeded") ||
       (event.type === "validation.completed" && !event.passed)
     ).length,
+    failedProviderRequestCount: failedProviderDecisionKeys.size,
   };
 }
 
@@ -236,62 +460,83 @@ export function decideRuntimeV2ExecutePhaseTransition(
   ) {
     return null;
   }
+  if (
+    state.phase !== "observing" &&
+    state.phase !== "acting" &&
+    state.phase !== "validating"
+  ) {
+    return null;
+  }
+  const approvedPlanCoverage = state.strategy === "plan"
+    ? deriveRuntimeV2PlanExecutionCoverage(state)
+    : null;
+  if (state.strategy === "plan" && !approvedPlanCoverage) return null;
 
   const pendingMutation = state.pendingToolCalls.some((call) =>
     input.isMutationToolName(call.name)
   );
-  const childrenSettled = state.subagents.every((job) =>
-    TERMINAL_CHILD_STATUSES.has(job.status)
-  );
-  if (state.phase === "observing" && pendingMutation && childrenSettled) {
+  if (
+    pendingMutation &&
+    state.phase !== "acting"
+  ) {
     return {
-      from: "observing",
+      from: state.phase,
       to: "acting",
       reason: "pending_mutation_call",
+    };
+  }
+  const pendingValidation = state.pendingToolCalls.some((call) =>
+    isRuntimeV2ValidationToolCall(call)
+  );
+  if (pendingValidation && state.phase !== "validating") {
+    return {
+      from: state.phase,
+      to: "validating",
+      reason: "pending_validation_call",
     };
   }
 
   if (state.pendingToolCalls.length > 0) return null;
   const phaseEvents = currentPhaseEvents(state);
 
-  if (state.phase === "observing") {
-    const parentResponded = phaseEvents.some((event) => event.type === "provider.responded");
-    if (state.evidence.length > 0 && parentResponded && childrenSettled) {
-      return {
-        from: "observing",
-        to: "acting",
-        reason: "observation_cycle_complete",
-      };
-    }
-    return null;
-  }
-
   if (state.phase === "acting") {
-    const currentPhaseMutationCount =
-      committedMutationKeys(phaseEvents, input.isMutationToolName).size;
-    const approvedPlanCoverage = state.strategy === "plan"
-      ? deriveRuntimeV2PlanExecutionCoverage(state)
-      : null;
-    const mutationBoundarySatisfied = approvedPlanCoverage
-      ? approvedPlanCoverage.allMutationTargetsCovered
-      : true;
-    if (currentPhaseMutationCount > 0 && mutationBoundarySatisfied) {
-    return {
-      from: "acting",
-      to: "validating",
-      reason: "mutation_committed",
-    };
+    const latestPhaseMutationSequence = latestSequence(
+      committedMutationSequences(
+        phaseEvents,
+        input.isMutationToolName,
+      ),
+    );
+    const latestMutationSequence = latestSequence(
+      committedMutationSequences(
+        state.events,
+        input.isMutationToolName,
+      ),
+    );
+    const latestValidationSequence = latestSequence(
+      state.events
+        .filter((event) => event.type === "validation.completed")
+        .map((event) => event.sequence),
+    );
+    if (
+      latestMutationSequence > latestValidationSequence &&
+      (
+        state.strategy !== "plan" ||
+        approvedPlanCoverage?.allMutationTargetsCovered
+      )
+    ) {
+      return {
+        from: "acting",
+        to: "validating",
+        reason: latestPhaseMutationSequence >= 0
+          ? "mutation_committed"
+          : "unvalidated_mutation_pending",
+      };
     }
   }
 
   if (state.phase === "validating") {
     const validation = latestValidation(phaseEvents);
-    if (
-      validation &&
-      !validation.passed &&
-      validation.failureKind !== "not_authorized" &&
-      validation.failureKind !== "protocol_invalid"
-    ) {
+    if (validation && !validation.passed) {
       return {
         from: "validating",
         to: "acting",

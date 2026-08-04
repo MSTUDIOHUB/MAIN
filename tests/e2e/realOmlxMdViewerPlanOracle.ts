@@ -261,6 +261,27 @@ export function getMdViewerExecutionGaps(
   sources: MdViewerExecutionSources,
 ): string[] {
   const gaps: string[] = [];
+  if (/\}entFile\s*\(/.test(sources.toolbar)) {
+    gaps.push(sourceGap({
+      path: OWNER_PATHS.toolbar,
+      source: sources.toolbar,
+      pattern: /\}entFile\s*\(/,
+      message: "remove the corrupted }entFile fragment that prevents the toolbar module from parsing and causes the white screen",
+    }));
+  }
+  const updateThemeExports = [
+    ...sources.toolbar.matchAll(
+      /\bexport\s+function\s+updateTheme\s*\(/g,
+    ),
+  ];
+  if (updateThemeExports.length > 1) {
+    gaps.push(sourceGapAtIndex({
+      path: OWNER_PATHS.toolbar,
+      source: sources.toolbar,
+      index: updateThemeExports[1]?.index || 0,
+      message: "keep exactly one exported updateTheme declaration after removing the corrupted duplicate fragment",
+    }));
+  }
   if (
     /\btoolbar\.setCurrentFile\s*\(/.test(sources.caller) &&
     !/\bexport\s+function\s+setCurrentFile\s*\(/.test(sources.toolbar)

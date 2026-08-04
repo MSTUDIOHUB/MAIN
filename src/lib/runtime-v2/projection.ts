@@ -6,6 +6,7 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
 
 function markdownCode(value: unknown): string {
   const text = String(value || "").trim().replace(/`/g, "");
@@ -40,7 +41,7 @@ function readTarget(command: RuntimeV2Command, workspaceKey = ""): string {
   ));
 }
 
-function actionMarkdown(
+export function runtimeV2StructuredActionMarkdown(
   command: RuntimeV2Command,
   context?: Pick<TurnAggregateV1, "strategy" | "turn">,
 ): string {
@@ -49,6 +50,19 @@ function actionMarkdown(
       return "正在收集与当前目标相关的代码证据。";
     case "request_model": {
       const mode = String(command.payload.mode || "");
+      const recoveryPressure =
+        command.payload.recoveryPressure &&
+          typeof command.payload.recoveryPressure === "object" &&
+          !Array.isArray(command.payload.recoveryPressure)
+          ? command.payload.recoveryPressure as Record<string, unknown>
+          : null;
+      if (recoveryPressure) {
+        const occurrence = Math.max(
+          1,
+          Math.floor(Number(recoveryPressure.occurrence) || 1),
+        );
+        return `上一个模型动作没有形成可执行进展，正在切换恢复策略（第 ${occurrence} 次）。`;
+      }
       const labels: Record<string, string> = {
         chat: "正在理解当前问题，并结合本轮对话上下文组织完整回复。",
         analyze: "正在结合工作区的实际只读证据形成完整答复。",
@@ -78,7 +92,7 @@ function actionMarkdown(
     case "execute_validation":
       return "正在运行有限验证，检查本轮修改和验收条件。";
     case "schedule_subagents":
-      return "正在为互不重叠的只读范围启动子智能体，主体会继续处理不依赖这些结果的工作。";
+      return "正在启动范围明确的子智能体协作，主体会继续处理不依赖这些证据或暂存修改的工作。";
     case "join_subagents":
       return "正在汇合子智能体的调查结果，并把可信证据纳入当前判断。";
     case "publish_projection":
@@ -205,7 +219,7 @@ export function buildRuntimeV2CapsuleProjection(
   const current = aggregate.scheduledCommands[0];
   const providerCommentary = currentProviderCommentary(aggregate);
   const action = current
-    ? actionMarkdown(current, aggregate)
+    ? runtimeV2StructuredActionMarkdown(current, aggregate)
     : providerCommentary
       ? providerCommentary
       : `正在${phaseTitle(aggregate.phase)}。`;
@@ -260,7 +274,7 @@ export function buildRuntimeV2TimelineProjection(
     aggregate,
     "timeline",
     id,
-    actionMarkdown(command, aggregate),
+    runtimeV2StructuredActionMarkdown(command, aggregate),
     "timeline",
     `command:${command.idempotencyKey}`,
   );
@@ -292,8 +306,11 @@ export function buildRuntimeV2FinalProjection(
   );
   const passedValidations = validations.filter((event) => event.passed).length;
   const failedValidations = validations.length - passedValidations;
-  const evidenceLine = aggregate.evidence.length > 0
-    ? `- 已保留 ${aggregate.evidence.length} 条证据。`
+  const evidenceCount = countDistinctRuntimeV2EvidenceFacts(
+    aggregate.evidence,
+  );
+  const evidenceLine = evidenceCount > 0
+    ? `- 已保留 ${evidenceCount} 条证据。`
     : "- 本轮没有可保留的证据。";
   const mutationLine = mutationTargets.length > 0
     ? `- 已修改：${mutationTargets.map(markdownCode).join("、")}。`

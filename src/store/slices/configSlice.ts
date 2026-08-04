@@ -1,7 +1,7 @@
 import type { AppConfig, LocalConfig } from "../../lib/appTypes";
 import {
-  CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE,
   createDefaultAppConfig,
+  resolveRuntimeLaneKey as resolveAppRuntimeLaneKey,
 } from "../../lib/appConfig";
 import {
   normalizeEventStreamMode,
@@ -9,9 +9,6 @@ import {
 } from "../../lib/turnEvents";
 import {
   normalizeLocalToolProtocol,
-  normalizeCloudToolProtocol,
-  resolveEffectiveCloudApiFormat,
-  normalizeCloudProtocol,
   type ReasoningDisplayMode,
 } from "../../lib/cloudProtocol";
 import {
@@ -65,73 +62,20 @@ export function normalizeLocalConfig(
       hasStoredToolProtocol ? input?.toolProtocol : undefined,
       provider,
     ),
+    ...(
+      Number.isSafeInteger(Number(input?.maxActiveRequests)) &&
+        Number(input?.maxActiveRequests) > 0
+        ? { maxActiveRequests: Number(input?.maxActiveRequests) }
+        : Number.isSafeInteger(Number(fallback.maxActiveRequests)) &&
+            Number(fallback.maxActiveRequests) > 0
+          ? { maxActiveRequests: Number(fallback.maxActiveRequests) }
+          : {}
+    ),
   };
 }
 
-export function normalizeRuntimeLaneToken(value: unknown): string {
-  const compacted = String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[|\s]+/g, "_");
-  return compacted || "-";
-}
-
 export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefined): string {
-  const activeProfile = config?.activeProfile === "cloud" ? "cloud" : "local";
-  if (activeProfile === "local") {
-    const localProvider =
-      typeof config?.local?.provider === "string" && config.local.provider.trim()
-        ? config.local.provider
-        : defaultConfig.local.provider;
-    const localModel =
-      typeof config?.local?.model === "string" && config.local.model.trim()
-        ? config.local.model
-        : defaultConfig.local.model;
-    const localToolProtocol = normalizeLocalToolProtocol(config?.local?.toolProtocol, localProvider);
-    return [
-      "profile=local",
-      `provider=${normalizeRuntimeLaneToken(localProvider)}`,
-      `model=${normalizeRuntimeLaneToken(localModel)}`,
-      `tool=${normalizeRuntimeLaneToken(localToolProtocol)}`,
-      "protocol=local",
-      "api_format=chat_completions",
-    ].join("|");
-  }
-
-  const cloudProtocolInput =
-    typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
-  const cloudExperimentalLoginEnabled =
-    CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE && config?.cloudExperimentalLoginEnabled === true;
-  const cloudAuthMode = cloudExperimentalLoginEnabled
-    ? config?.cloud?.auth?.mode ?? "api_key"
-    : "api_key";
-  const cloudApiFormat = resolveEffectiveCloudApiFormat({
-    protocol: cloudProtocolInput,
-    apiFormat:
-      typeof config?.cloud?.apiFormat === "string"
-        ? config.cloud.apiFormat
-        : "chat_completions",
-    authMode: cloudAuthMode,
-  });
-  const cloudProvider =
-    typeof config?.cloud?.provider === "string" && config.cloud.provider.trim()
-      ? config.cloud.provider
-      : defaultConfig.cloud.provider;
-  const cloudModel =
-    typeof config?.cloud?.model === "string" && config.cloud.model.trim()
-      ? config.cloud.model
-      : defaultConfig.cloud.model;
-  const cloudToolProtocol = normalizeCloudToolProtocol(config?.cloud?.toolProtocol);
-  const cloudProtocol = normalizeCloudProtocol(cloudProtocolInput);
-  return [
-    "profile=cloud",
-    `provider=${normalizeRuntimeLaneToken(cloudProvider)}`,
-    `model=${normalizeRuntimeLaneToken(cloudModel)}`,
-    `tool=${normalizeRuntimeLaneToken(cloudToolProtocol)}`,
-    `protocol=${normalizeRuntimeLaneToken(cloudProtocol)}`,
-    `api_format=${normalizeRuntimeLaneToken(cloudApiFormat)}`,
-    `auth=${normalizeRuntimeLaneToken(cloudAuthMode)}`,
-  ].join("|");
+  return resolveAppRuntimeLaneKey(config);
 }
 
 export function normalizeContextMemoryStateByRuntimeKey(value: unknown): Record<string, ContextMemoryState | null> {

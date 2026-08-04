@@ -519,6 +519,25 @@ function extractCompatibilityTokenToolCallBlocks(
   return blocks;
 }
 
+/**
+ * Parse only the explicit chat-template compatibility marker. Unlike
+ * parseTextForTools this never treats bare names, prose, or generic XML as an
+ * executable action, so strict runtimes can share the provider adapter
+ * without inheriting the legacy parser's recovery heuristics.
+ */
+export function parseExplicitCompatibilityTokenToolCalls(
+  text: string,
+): ParsedToolCall[] {
+  return extractCompatibilityTokenToolCallBlocks(text).map((block) => ({
+    id: nextCallId(),
+    name: block.toolName,
+    arguments: parseCompatibilityTokenArgumentBody(
+      block.toolName,
+      block.argumentBody,
+    ),
+  }));
+}
+
 function removeTextRanges(text: string, ranges: Array<{ start: number; end: number }>): string {
   if (ranges.length === 0) return text;
   let cursor = 0;

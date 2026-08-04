@@ -190,6 +190,7 @@ test("real OMLX file windows honor line/character bounds without full-file decod
   assert.equal(window.nextStartLine, 13);
   assert.equal(window.truncated, true);
   assert.equal(window.scanTruncated, false);
+  assert.match(window.contentVersion, /^sha256-[a-f0-9]{64}$/);
 
   await writeFixtureFile(workspace, "src/long.ts", "x\n".repeat(100_000));
   const scannedWindow = await proxy.readRealOmlxWorkspaceFileWindow(workspace, "src/long.ts", {
@@ -202,6 +203,33 @@ test("real OMLX file windows honor line/character bounds without full-file decod
   assert.ok(scannedWindow.content.length <= 64);
 });
 
+test("real OMLX tail windows never advertise a line past EOF", async (t) => {
+  const workspace = await createTempWorkspace(t);
+  const numberedLines = Array.from(
+    { length: 100 },
+    (_, index) => `line-${index + 1}`,
+  ).join("\n");
+  await writeFixtureFile(workspace, "src/tail.ts", numberedLines);
+
+  const window = await proxy.readRealOmlxWorkspaceFileWindow(
+    workspace,
+    "src/tail.ts",
+    {
+      startLine: 90,
+      endLine: 100,
+      maxLines: 100,
+      maxChars: 10_000,
+      maxScanBytes: 64 * 1024,
+    },
+  );
+
+  assert.equal(window.startLine, 90);
+  assert.equal(window.endLine, 100);
+  assert.equal(window.totalLines, 100);
+  assert.equal(window.truncated, true);
+  assert.equal(window.nextStartLine, null);
+});
+
 test("real OMLX file windows reject large binary files from a bounded prefix sample", async (t) => {
   const workspace = await createTempWorkspace(t);
   const binary = Buffer.alloc(8_192, 65);
@@ -212,6 +240,29 @@ test("real OMLX file windows reject large binary files from a bounded prefix sam
     proxy.readRealOmlxWorkspaceFileWindow(workspace, "assets/large.bin", { maxScanBytes: 1_024 }),
     /E2E_WORKSPACE_READ_BINARY/,
   );
+});
+
+test("real OMLX syntax checks preserve duplicate module-export safety", () => {
+  const checked = proxy.checkRealOmlxSourceSyntax(
+    "src/toolbar.js",
+    [
+      "export function updateTheme(theme) { return theme; }",
+      "export function updateTheme(theme) { return theme; }",
+    ].join("\n"),
+  );
+
+  assert.equal(checked.applicable, true);
+  assert.equal(checked.hasErrors, true);
+  assert.ok(checked.errorCount > 0);
+  assert.equal(checked.firstErrorLine, 2);
+  assert.deepEqual(checked.errors, [{
+    line: 2,
+    column: 17,
+    kind: "duplicate_export",
+    symbol: "updateTheme",
+  }]);
+  assert.equal(checked.errorsTruncated, false);
+  assert.deepEqual(checked.moduleExports, ["updateTheme"]);
 });
 
 test("real OMLX debug entries retain structured identity while bounding message size", () => {

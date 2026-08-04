@@ -70,6 +70,8 @@ function baseInput(overrides = {}) {
     mentionSnapshot: ["src/App.tsx"],
     remoteFeishu: { chatId: "chat-1" },
     workspaceTree: "[F] src/App.tsx",
+    workspaceInstructionContext:
+      "## AGENTS.md\nSource: AGENTS.md\nRun focused tests.",
     gameStudioConfigForTurn: { engine: "unity", activeStudioAgent: "unity-specialist" },
     abortCtrl: { signal: { aborted: false } },
     timerInterval: "timer-1",
@@ -107,6 +109,10 @@ test("submit runtime context carries immutable turn parameters and initializes m
   assert.equal(context.abortCtrl, input.abortCtrl);
   assert.equal(context.timerInterval, "timer-1");
   assert.equal(context.harnessRunId, "run-124");
+  assert.equal(
+    context.workspaceInstructionContext,
+    input.workspaceInstructionContext,
+  );
   assert.deepEqual(context.turnInputContextSignals, input.turnInputContextSignals);
   assert.equal(context.getElapsedSeconds(), 9);
   assert.equal(context.streamBuffer, null);

@@ -1,6 +1,8 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Event } from "./events";
 import type { SealedWorkPlanV1, WorkPlanDraftV1 } from "./workPlan";
+import type { RuntimeV2ExecutionValidationAuthority } from "./contracts";
+import { runtimeV2ValidationBoundaryMatchesCurrent } from "./validationReceipt";
 import {
   normalizeWorkspacePathIdentity,
   workspacePathsReferToSameFile,
@@ -149,6 +151,27 @@ export function resolveRuntimeV2PlanValidationScope(input: {
   };
 }
 
+export function runtimeV2PlanValidationAuthority(input: {
+  readonly plan: SealedWorkPlanV1;
+  readonly validationIndex: number;
+}): RuntimeV2ExecutionValidationAuthority | null {
+  const validation = input.plan.draft.validations[input.validationIndex];
+  if (!validation) return null;
+  const validationId =
+    `work-plan-validation-${input.validationIndex + 1}`;
+  return {
+    kind: "work_plan",
+    id: input.plan.id,
+    revision: input.plan.revision,
+    digest: input.plan.digest,
+    validationId,
+    criterionIds: [validationId],
+    targetPaths: uniquePaths(validation.stepIndexes.flatMap((stepIndex) =>
+      input.plan.draft.steps[stepIndex]?.targets || []
+    )),
+  };
+}
+
 function eventIndex(
   aggregate: TurnAggregateV1,
   event: RuntimeV2Event,
@@ -162,8 +185,10 @@ function latestMutationIndex(aggregate: TurnAggregateV1): number {
   let latest = -1;
   for (const event of aggregate.events) {
     if (
-      event.type === "tool.completed" &&
-      event.status === "succeeded" &&
+      (
+        (event.type === "tool.completed" && event.status === "succeeded") ||
+        (event.type === "subagent.completed" && event.status === "completed")
+      ) &&
       event.evidence.some((evidence) => evidence.kind === "mutation")
     ) {
       latest = Math.max(latest, eventIndex(aggregate, event));
@@ -279,11 +304,42 @@ export function deriveRuntimeV2PlanExecutionCoverage(
     (event): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
       event.type === "validation.completed" &&
       event.passed &&
-      eventIndex(aggregate, event) > mutationBoundary,
+      eventIndex(aggregate, event) > mutationBoundary &&
+      !!event.authority &&
+      runtimeV2ValidationBoundaryMatchesCurrent({
+        aggregate,
+        targetPaths: event.authority.targetPaths,
+        mutationBoundarySequence: event.mutationBoundarySequence,
+        validatedMutationVersions: event.validatedMutationVersions,
+      }),
   );
   const passedRequiredValidationIndexes = requiredValidationIndexes.filter((index) => {
     const required = plan.draft.validations[index];
+    const expectedAuthority = runtimeV2PlanValidationAuthority({
+      plan,
+      validationIndex: index,
+    });
+    const authorityMatches = (
+      authority: RuntimeV2ExecutionValidationAuthority | undefined,
+    ) => !!expectedAuthority &&
+      authority?.kind === "work_plan" &&
+      authority.id === expectedAuthority.id &&
+      authority.revision === expectedAuthority.revision &&
+      authority.digest === expectedAuthority.digest &&
+      authority.validationId === expectedAuthority.validationId &&
+      authority.criterionIds.length ===
+        expectedAuthority.criterionIds.length &&
+      authority.criterionIds.every((id) =>
+        expectedAuthority.criterionIds.includes(id)
+      ) &&
+      authority.targetPaths.length === expectedAuthority.targetPaths.length &&
+      authority.targetPaths.every((target) =>
+        expectedAuthority.targetPaths.some((candidate) =>
+          workspacePathsReferToSameFile(target, candidate)
+        )
+      );
     return !!required && passedValidations.some((event) => {
+      if (!authorityMatches(event.authority)) return false;
       const invocation = argumentsForEvent(aggregate, event);
       return !!invocation &&
         validationMatches(required, invocation.toolName, invocation.args);

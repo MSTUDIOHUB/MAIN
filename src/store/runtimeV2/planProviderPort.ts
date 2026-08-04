@@ -1,5 +1,9 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
+import {
+  deriveBudgetedStreamSettings,
+  deriveProviderAdapterCapabilities,
+} from "../../lib/providerLaneSettings";
+import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { streamChatCompletion } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
@@ -27,6 +31,8 @@ import {
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { withRuntimeV2HardDeadline } from "./hardDeadline";
+import { containsProviderTextEnvelopePrompt } from "./executionProviderContext";
+import { buildRuntimeV2TextEnvelopeCatalog } from "./executionProviderTools";
 
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (
@@ -49,16 +55,27 @@ export async function requestPlanModel(input: {
   readonly logStoreEvent: RuntimeV2PlanLog;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const submissionStage = isPlanSubmissionStage(input.stage);
-  const transport = submissionStage
+  const budget = input.context.runtimeContextBudget;
+  const settings = deriveBudgetedStreamSettings(
+    input.get().config,
+    budget,
+  );
+  const requestedTransport = submissionStage
     ? input.transport || "native_tool"
     : "native_tool";
+  const adapterCapabilities = deriveProviderAdapterCapabilities(settings);
+  const transport =
+    requestedTransport === "native_tool" &&
+      !adapterCapabilities.nativeToolRoundTrip
+      ? "text_envelope"
+      : requestedTransport;
   const structuredResponse = transport === "structured_response";
-  const offeredTools = structuredResponse
-    ? []
-    : submissionStage
+  const textEnvelope = transport === "text_envelope";
+  const planTools = submissionStage
     ? [SUBMIT_WORK_PLAN_TOOL]
     : PLAN_MODEL_TOOLS;
-  const toolChoice = structuredResponse
+  const offeredTools = structuredResponse || textEnvelope ? [] : planTools;
+  const toolChoice = structuredResponse || textEnvelope
     ? undefined
     : submissionStage
     ? {
@@ -91,13 +108,42 @@ export async function requestPlanModel(input: {
       : PLAN_MODEL_REQUEST_TIMEOUT_MS,
     input.deadlineAt - Date.now(),
   ));
-  const requestMessages = input.stage === "synthesis"
+  const planRequestMessages = input.stage === "synthesis"
     ? synthesisPlanTranscript({
         ...input,
         compactRecovery: !!input.compactRecovery,
         transport,
       })
     : boundedPlanTranscript(input.messages);
+  const unboundedRequestMessages = textEnvelope
+    ? [
+        ...planRequestMessages,
+        {
+          role: "system" as const,
+          content: containsProviderTextEnvelopePrompt(
+            input.context.phaseLanguage,
+            true,
+          ),
+        },
+        {
+          role: "system" as const,
+          content: buildRuntimeV2TextEnvelopeCatalog(planTools),
+        },
+      ]
+    : planRequestMessages;
+  const maxOutputTokens = submissionStage
+    ? Math.min(
+        PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+        budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+      )
+    : budget?.outputBudget;
+  const requestMessages = budget
+    ? boundRuntimeMessagesToContext(unboundedRequestMessages, {
+        contextLimit: budget.contextLimit,
+        reservedOutputTokens:
+          maxOutputTokens || budget.outputBudget,
+      })
+    : unboundedRequestMessages;
   try {
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
       turnId: input.run.turnId,
@@ -105,7 +151,10 @@ export async function requestPlanModel(input: {
       evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
       stage: input.stage,
       compactRecovery: !!input.compactRecovery,
+      requestedTransport,
       transport,
+      adapterNativeToolRoundTrip:
+        adapterCapabilities.nativeToolRoundTrip,
       offeredToolCount: offeredTools.length,
       offeredToolNames: offeredTools.map((tool) => tool.function.name),
       promptMessageCount: requestMessages.length,
@@ -113,6 +162,8 @@ export async function requestPlanModel(input: {
         (total, message) => total + String(message.content || "").length,
         0,
       ),
+      contextLimit: budget?.contextLimit ?? null,
+      maxOutputTokens: maxOutputTokens ?? null,
       timeoutMs: requestTimeoutMs,
     });
     const result = await withRuntimeV2HardDeadline({
@@ -124,7 +175,7 @@ export async function requestPlanModel(input: {
       },
       task: () => streamChatCompletion(
         requestMessages,
-        deriveStreamSettings(input.get().config),
+        settings,
         {
           onToken: (token) => { streamedText += token; },
           onDone: () => undefined,
@@ -132,7 +183,7 @@ export async function requestPlanModel(input: {
         },
         requestAbort.signal,
         offeredTools,
-        submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined,
+        maxOutputTokens,
         {
           ...(toolChoice ? { toolChoice } : {}),
           ...(structuredResponse

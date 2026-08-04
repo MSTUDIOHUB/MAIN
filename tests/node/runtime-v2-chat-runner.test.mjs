@@ -36,6 +36,9 @@ function loadTs(sourcePath) {
 const { runRuntimeV2ChatLoop } = loadTs(
   path.join(workspaceRoot, "src/lib/runtime-v2/chat.ts"),
 );
+const { buildRuntimeV2ChatIdentities } = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/chatRunner.ts"),
+);
 const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
 
 const turn = {
@@ -53,6 +56,59 @@ const run = {
   parentRunId: null,
   attemptId: "run-chat",
 };
+
+test("global Chat uses the canonical session scope as checkpoint workspace owner", () => {
+  const globalScope = "__MAIN_GLOBAL_CHAT__";
+  const globalSessionKey = `${globalScope}:42`;
+  const identity = buildRuntimeV2ChatIdentities(
+    { planLifecycle: null },
+    {
+      runWorkspace: "",
+      runScopeKey: globalScope,
+      runSessionKey: globalSessionKey,
+      turnId: "turn-global-chat",
+      harnessRunId: "run-global-chat",
+    },
+    {
+      id: "turn-global-chat",
+      clientSubmissionId: "submission-global-chat",
+    },
+  );
+
+  assert.equal(identity.turn.workspaceKey, globalScope);
+  assert.equal(identity.turn.sessionKey, globalSessionKey);
+  assert.equal(identity.run.sessionKey, globalSessionKey);
+  assert.equal(identity.run.sessionEpoch, identity.turn.sessionEpoch);
+
+  const admitted = runtime.transition(null, {
+    schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence: 0,
+    eventId: "event-global-chat-admitted",
+    at: 100,
+    type: "turn.admitted",
+    turn: identity.turn,
+    strategy: "chat",
+    objective: "普通全局聊天",
+    constraints: [],
+    acceptanceCriteria: [],
+  });
+  const persisted = runtime.serializeRuntimeV2CheckpointMap(
+    {
+      [identity.turn.turnId]: runtime.createRuntimeV2Checkpoint({
+        revision: 1,
+        aggregate: admitted,
+        updatedAt: admitted.updatedAt,
+      }),
+    },
+    {
+      workspaceKey: globalScope,
+      sessionKey: globalSessionKey,
+      sessionEpoch: identity.turn.sessionEpoch,
+    },
+  );
+
+  assert.ok(persisted[identity.turn.turnId]);
+});
 
 function harness(providerResults, options = {}) {
   let revision = 0;
@@ -190,10 +246,20 @@ test("a hallucinated tool call concludes error without invoking the tool", async
   );
 });
 
-test("transport exhaustion concludes error instead of pausing", async () => {
+test("transient transport failures continue until the lifecycle deadline", async () => {
   const testHarness = harness([
-    new Error("transport unavailable"),
-    new Error("transport unavailable"),
+    ({ advance }) => {
+      advance(400);
+      throw new Error("transport unavailable");
+    },
+    ({ advance }) => {
+      advance(400);
+      throw new Error("transport unavailable");
+    },
+    ({ advance }) => {
+      advance(400);
+      throw new Error("transport unavailable");
+    },
   ]);
   const result = await runRuntimeV2ChatLoop({
     ports: testHarness.ports,
@@ -204,15 +270,15 @@ test("transport exhaustion concludes error instead of pausing", async () => {
     now: testHarness.now,
     deadlineMs: 1_000,
   });
-  assert.equal(result.resultKind, "error");
-  assert.equal(result.reason, "provider_transport_exhausted");
-  assert.equal(testHarness.read().providerCalls, 2);
+  assert.equal(result.resultKind, "partial");
+  assert.match(result.reason, /运行时限/);
+  assert.equal(testHarness.read().providerCalls, 3);
   assert.equal(
     result.aggregate.events.filter((event) => event.type === "run.paused").length,
     0,
   );
   assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
-  assert.equal(result.aggregate.recovery.exhausted?.scope, "transport");
+  assert.equal(result.aggregate.recovery.exhausted, null);
 });
 
 test("deadline and cancellation are distinct canonical conclusions", async (t) => {

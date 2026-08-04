@@ -2,7 +2,6 @@ import type { AgentMessage } from "../../lib/agentMessages";
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import { executeTool } from "../../lib/toolExecutor";
 import {
-  runtimeV2ActionFingerprint,
   runtimeV2EvidenceVersion,
   type RuntimeV2RunIdentity,
   type RuntimeV2TurnIdentity,
@@ -23,11 +22,7 @@ import {
 } from "./planReviewProjection";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
-import {
-  finishPlanTerminal,
-  planSettlement,
-  terminalPlanOutcome,
-} from "./planSettlement";
+import { planSettlement, terminalPlanOutcome } from "./planSettlement";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
@@ -141,31 +136,16 @@ async function collectInitialOverview(input: {
       idempotencyKey: collect.idempotencyKey,
       status: "failed",
     });
-    const canContinue = await input.ledger.recordRecovery({
-      run: input.identity.run,
-      scope: "action",
-      fingerprint: runtimeV2ActionFingerprint(collect),
-      reason: "初始工作区概览持续读取失败。",
-    });
+    await input.ledger.recordSoftSignal(
+      input.identity.run,
+      "repeated_action",
+    );
     input.runner.logStoreEvent("runtime_v2_plan_overview_failed", {
       turnId: input.identity.turn.turnId,
       runId: input.identity.run.runId,
       error: error instanceof Error ? error.message : String(error),
       action: "continue_with_targeted_read_tools",
     });
-    if (!canContinue) {
-      return {
-        overview: "",
-        settlement: await finishPlanTerminal({
-          runner: input.runner,
-          ledger: input.ledger,
-          run: input.identity.run,
-          resultKind: "error",
-          reason: "无法读取工作区概览，且相同恢复动作已达到安全上限；本轮未生成待审核计划。",
-          detailCode: "runtime_v2_plan_overview_recovery_exhausted",
-        }),
-      };
-    }
     return {
       overview: "Runtime v2 could not collect the initial workspace overview. Use the available read-only tools to gather targeted evidence.",
     };
@@ -188,7 +168,7 @@ export async function bootstrapRuntimeV2Plan(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,
@@ -251,24 +231,12 @@ export async function bootstrapRuntimeV2Plan(
     const interrupted = [...existing.aggregate.scheduledCommands];
     await ledger.settleScheduled(identity.run, "failed");
     for (const command of interrupted) {
-      const canContinue = await ledger.recordRecovery({
-        run: identity.run,
-        scope: command.kind === "request_model" ? "transport" : "action",
-        fingerprint: `cold-recovery:${runtimeV2ActionFingerprint(command)}`,
-        reason: "Plan Run 冷恢复时同一未结动作已超过安全重试预算。",
-      });
-      if (!canContinue) {
-        return {
-          settlement: await finishPlanTerminal({
-            runner: input,
-            ledger,
-            run: identity.run,
-            resultKind: "partial",
-            reason: "计划生成在恢复未结动作时达到安全重试上限；已保留现有证据并明确结束本轮。",
-            detailCode: "runtime_v2_plan_cold_recovery_exhausted",
-          }),
-        };
-      }
+      await ledger.recordSoftSignal(
+        identity.run,
+        command.kind === "request_model"
+          ? "protocol_drift"
+          : "repeated_action",
+      );
     }
     input.logStoreEvent("runtime_v2_plan_cold_recovery_settled", {
       turnId: identity.turn.turnId,

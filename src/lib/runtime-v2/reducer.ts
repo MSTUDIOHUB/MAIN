@@ -1,32 +1,29 @@
 import type { RuntimeV2RunState, TurnAggregateV1 } from "./aggregate";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
-  type RuntimeV2Command,
-  type RuntimeV2CommandReceipt,
-  type RuntimeV2EvidenceReference,
+  type RuntimeV2Command, type RuntimeV2CommandReceipt,
   type RuntimeV2Phase,
-  type RuntimeV2RunIdentity,
-  type RuntimeV2SubagentJob,
-  type RuntimeV2TerminalOutcome,
-  type RuntimeV2TurnIdentity,
-  type RuntimeV2WorkPlanReference,
+  type RuntimeV2RunIdentity, type RuntimeV2TerminalOutcome,
+  type RuntimeV2TurnIdentity, type RuntimeV2WorkPlanReference,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import {
-  canOpenRuntimeV2RecoveryEpoch,
   canRecordRuntimeV2Recovery,
-  emptyRuntimeV2RecoveryBudget,
-  exhaustRuntimeV2Recovery,
-  openRuntimeV2RecoveryEpoch,
+  emptyRuntimeV2RecoveryBudget, exhaustRuntimeV2Recovery,
   recordRuntimeV2Recovery,
   runtimeV2ActionFingerprint,
 } from "./recovery";
+import { applyRuntimeV2SubagentTelemetry } from "./subagents";
 import {
-  MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS,
-  applyRuntimeV2SubagentTelemetry,
-  areReadOnlySubagentScopesDisjoint,
-} from "./subagents";
-
+  isValidRuntimeV2SubagentHandoffApplication,
+  isValidRuntimeV2SubagentHandoffDelivery,
+} from "./subagentHandoff";
+import {
+  appendNovelRuntimeV2Evidence,
+  hasMatchingRuntimeV2SealedPlanAuthority,
+  isValidRuntimeV2SubagentCompletion,
+  isValidRuntimeV2SubagentJob,
+} from "./reducerGuards";
 export type RuntimeV2TransitionRejection =
   | "initial_event_required"
   | "invalid_event_schema"
@@ -49,14 +46,13 @@ export type RuntimeV2TransitionRejection =
   | "command_already_completed"
   | "command_not_scheduled"
   | "command_kind_mismatch"
-  | "recovery_evidence_required"
-  | "recovery_evidence_not_novel"
   | "recovery_limit_exceeded"
   | "recovery_already_exhausted"
   | "subagent_invalid"
   | "subagent_scope_conflict"
   | "subagent_not_found"
   | "subagent_telemetry_invalid"
+  | "subagent_handoff_invalid"
   | "run_already_aborted"
   | "canceled_requires_abort"
   | "abort_requires_canceled"
@@ -78,7 +74,7 @@ export type RuntimeV2TransitionResult =
 
 const PHASE_TRANSITIONS: Readonly<Record<Exclude<RuntimeV2Phase, "completed">, readonly RuntimeV2Phase[]>> = {
   preparing: ["observing", "planning", "acting", "finalizing"],
-  observing: ["planning", "acting", "finalizing"],
+  observing: ["planning", "acting", "validating", "finalizing"],
   planning: ["reviewing", "acting", "finalizing"],
   reviewing: ["planning", "acting", "finalizing"],
   acting: ["observing", "validating", "finalizing"],
@@ -86,13 +82,8 @@ const PHASE_TRANSITIONS: Readonly<Record<Exclude<RuntimeV2Phase, "completed">, r
   finalizing: [],
 };
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 && value === value.trim();
-}
-
-function isFiniteTimestamp(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
+function isNonEmptyString(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 && value === value.trim(); }
+function isFiniteTimestamp(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 
 function isSameTurn(left: RuntimeV2TurnIdentity, right: RuntimeV2TurnIdentity): boolean {
   return left.workspaceKey === right.workspaceKey &&
@@ -123,37 +114,6 @@ function isSameWorkPlan(left: RuntimeV2WorkPlanReference, right: RuntimeV2WorkPl
     left.revision === right.revision &&
     left.digest === right.digest &&
     left.projectionHash === right.projectionHash;
-}
-
-function hasMatchingSealedPlanAuthority(
-  event: Extract<RuntimeV2Event, { type: "work_plan.sealed" }>,
-  state: TurnAggregateV1,
-): boolean {
-  const plan = event.sealedPlan;
-  const commit = event.reviewCommit;
-  return plan.status === "pending_review" &&
-    isSameWorkPlan(event.workPlan, {
-      id: plan.id,
-      revision: plan.revision,
-      digest: plan.digest,
-      projectionHash: plan.projectionHash,
-      status: "pending_review",
-    }) &&
-    commit.schemaVersion === "runtime-v2-plan-review-commit.v1" &&
-    commit.authority.id === plan.id &&
-    commit.authority.revision === plan.revision &&
-    commit.authority.digest === plan.digest &&
-    commit.authority.projectionHash === plan.projectionHash &&
-    commit.artifact.path === ".MAIN/plans/plan.md" &&
-    commit.artifact.content === plan.markdown &&
-    commit.artifact.projectionHash === plan.projectionHash &&
-    commit.panel.markdown === plan.markdown &&
-    commit.review.requestId.trim().length > 0 &&
-    commit.review.sessionKey === state.turn.sessionKey &&
-    commit.review.sessionEpoch === state.turn.sessionEpoch &&
-    commit.review.turnId === state.turn.turnId &&
-    commit.review.runId === event.run.runId &&
-    commit.review.parentRunId === event.run.parentRunId;
 }
 
 function isValidTurnIdentity(value: RuntimeV2TurnIdentity): boolean {
@@ -218,6 +178,16 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
       text: event.objective,
       constraints: [...event.constraints],
       acceptanceCriteria: [...event.acceptanceCriteria],
+      ...(event.acceptanceCriterionIds
+        ? { acceptanceCriterionIds: [...event.acceptanceCriterionIds] }
+        : {}),
+      ...(event.acceptanceEvidenceRequirements
+        ? {
+            acceptanceEvidenceRequirements: [
+              ...event.acceptanceEvidenceRequirements,
+            ],
+          }
+        : {}),
     },
     run: null,
     phase: "preparing",
@@ -236,21 +206,6 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
     nextSequence: event.sequence + 1,
     updatedAt: event.at,
   };
-}
-
-function appendEvidence(
-  existing: readonly RuntimeV2EvidenceReference[],
-  additions: readonly RuntimeV2EvidenceReference[],
-): readonly RuntimeV2EvidenceReference[] {
-  const next = [...existing];
-  const known = new Set(existing.map((item) => `${item.id}\u0000${item.target}\u0000${item.version || ""}`));
-  for (const evidence of additions) {
-    const key = `${evidence.id}\u0000${evidence.target}\u0000${evidence.version || ""}`;
-    if (known.has(key)) continue;
-    known.add(key);
-    next.push(evidence);
-  }
-  return next;
 }
 
 function activeRun(
@@ -301,30 +256,6 @@ function appendCommandReceipt(
   // effect from a cold-recovery replay, without turning a long session into an
   // unbounded event cache.
   return [...current, receipt].slice(-256);
-}
-
-function hasNovelEvidence(
-  existing: readonly RuntimeV2EvidenceReference[],
-  incoming: readonly RuntimeV2EvidenceReference[],
-): boolean {
-  const known = new Set(existing.map((item) => `${item.id}\u0000${item.target}\u0000${item.version || ""}`));
-  return incoming.some((item) => !known.has(`${item.id}\u0000${item.target}\u0000${item.version || ""}`));
-}
-
-function isValidSubagentJob(job: RuntimeV2SubagentJob, parent: RuntimeV2RunIdentity): boolean {
-  return !!job.id &&
-    job.parentRunId === parent.runId &&
-    job.run.parentRunId === parent.runId &&
-    job.run.sessionKey === parent.sessionKey &&
-    job.run.sessionEpoch === parent.sessionEpoch &&
-    job.run.turnId === parent.turnId &&
-    !!job.scopeKey &&
-    !!job.objective &&
-    job.allowedPaths.length > 0 &&
-    job.status === "queued" &&
-    job.firstTokenAt === null &&
-    job.closedAt === null &&
-    job.summary === null;
 }
 
 function resolveCommandCompletion(
@@ -443,7 +374,7 @@ export function tryTransition(
       return {
         disposition: "applied",
         state: append(state, event, {
-          evidence: appendEvidence(state.evidence, [event.evidence]),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, [event.evidence]),
         }),
       };
     case "command.scheduled": {
@@ -517,7 +448,7 @@ export function tryTransition(
               event.at,
             ),
           ),
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
             ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
             : state.pendingToolCalls,
@@ -542,7 +473,7 @@ export function tryTransition(
             // that could not be executed or authorized.
             commandReceipt(completion.command, "succeeded", event.at),
           ),
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
           pendingToolCalls: toolCallId
             ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
             : state.pendingToolCalls,
@@ -552,7 +483,7 @@ export function tryTransition(
     case "work_plan.sealed": {
       if (state.strategy !== "plan") return rejection(state, "plan_strategy_required");
       if (state.phase !== "planning") return rejection(state, "phase_invalid");
-      if (!hasMatchingSealedPlanAuthority(event, state)) {
+      if (!hasMatchingRuntimeV2SealedPlanAuthority({ event, state })) {
         return rejection(state, "plan_identity_mismatch");
       }
       const run = state.run;
@@ -602,22 +533,6 @@ export function tryTransition(
         }),
       };
     }
-    case "recovery.epoch_opened": {
-      if (event.evidence.length === 0) return rejection(state, "recovery_evidence_required");
-      if (!hasNovelEvidence(state.evidence, event.evidence)) {
-        return rejection(state, "recovery_evidence_not_novel");
-      }
-      if (!canOpenRuntimeV2RecoveryEpoch(state.recovery)) {
-        return rejection(state, "recovery_limit_exceeded");
-      }
-      return {
-        disposition: "applied",
-        state: append(state, event, {
-          evidence: appendEvidence(state.evidence, event.evidence),
-          recovery: openRuntimeV2RecoveryEpoch(state.recovery),
-        }),
-      };
-    }
     case "recovery.recorded": {
       if (!canRecordRuntimeV2Recovery(state.recovery, event.scope, event.fingerprint)) {
         return rejection(state, "recovery_limit_exceeded");
@@ -652,31 +567,27 @@ export function tryTransition(
     case "soft_signal.observed":
       return { disposition: "applied", state: append(state, event) };
     case "subagents.scheduled": {
+      const runSubagents = state.subagents.filter((job) =>
+        job.parentRunId === event.run.runId
+      );
+      const activeCount = runSubagents.filter((job) =>
+        job.status === "queued" || job.status === "running").length;
+      const maxActiveSubagents = Math.floor(Number(event.maxActiveSubagents) || 0);
       if (
         event.jobs.length === 0 ||
-        state.subagents.length + event.jobs.length >
-          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS ||
-        event.jobs.some((job) => !isValidSubagentJob(job, event.run))
+        maxActiveSubagents <= 0 ||
+        runSubagents.length + event.jobs.length >
+          maxActiveSubagents ||
+        activeCount + event.jobs.length >
+          maxActiveSubagents ||
+        event.jobs.some((job) =>
+          !isValidRuntimeV2SubagentJob(job, event.run)
+        )
       ) {
         return rejection(state, "subagent_invalid");
       }
       const known = new Set(state.subagents.map((job) => job.id));
       if (event.jobs.some((job) => known.has(job.id))) return rejection(state, "subagent_invalid");
-      for (let left = 0; left < event.jobs.length; left += 1) {
-        if (state.subagents.some((job) =>
-          !areReadOnlySubagentScopesDisjoint(
-            event.jobs[left]!.allowedPaths,
-            job.allowedPaths,
-          )
-        )) {
-          return rejection(state, "subagent_scope_conflict");
-        }
-        for (let right = left + 1; right < event.jobs.length; right += 1) {
-          if (!areReadOnlySubagentScopesDisjoint(event.jobs[left]!.allowedPaths, event.jobs[right]!.allowedPaths)) {
-            return rejection(state, "subagent_scope_conflict");
-          }
-        }
-      }
       return {
         disposition: "applied",
         state: append(state, event, { subagents: [...state.subagents, ...event.jobs] }),
@@ -699,19 +610,41 @@ export function tryTransition(
       if (current.status !== "running" || current.closedAt === null) {
         return rejection(state, "subagent_telemetry_invalid");
       }
+      if (
+        !isValidRuntimeV2SubagentCompletion({
+          state,
+          event,
+          job: current,
+        })
+      ) {
+        return rejection(state, "subagent_invalid");
+      }
       const subagents = [...state.subagents];
       subagents[index] = {
         ...current,
         status: event.status,
         summary: event.summary.trim() || null,
+        report: event.report || null,
       };
       return {
         disposition: "applied",
         state: append(state, event, {
           subagents,
-          evidence: appendEvidence(state.evidence, event.evidence),
+          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
         }),
       };
+    }
+    case "subagent.handoff_delivered": {
+      if (!isValidRuntimeV2SubagentHandoffDelivery({ state, event })) {
+        return rejection(state, "subagent_handoff_invalid");
+      }
+      return { disposition: "applied", state: append(state, event) };
+    }
+    case "subagent.handoff_applied": {
+      if (!isValidRuntimeV2SubagentHandoffApplication({ state, event })) {
+        return rejection(state, "subagent_handoff_invalid");
+      }
+      return { disposition: "applied", state: append(state, event) };
     }
     case "projection.published": {
       if (event.projection.id !== event.projectionId || event.projection.audience !== event.audience) {

@@ -564,3 +564,142 @@ test("late events cannot reactivate or contaminate a closed one-shot identity", 
   assert.equal(projected[0].runId, "run-event-first");
   assert.equal(projected[0].status, "canceled");
 });
+
+test("subagent panel facts come from structured lifecycle events, not mutable patch counters", () => {
+  const identity = {
+    threadId: "thread-projection-facts",
+    turnId: "turn-projection-facts",
+    collaborationTaskId: "task-projection-facts",
+    subagentId: "agent-projection-facts",
+    runId: "run-projection-facts",
+    parentRunId: "run-parent",
+  };
+  const closureAudit = {
+    schemaVersion: subagents.SUBAGENT_CLOSURE_SCHEMA_VERSION,
+    owner: {
+      agentKind: "subagent",
+      threadId: identity.threadId,
+      parentTurnId: identity.turnId,
+      collaborationTaskId: identity.collaborationTaskId,
+      subagentId: identity.subagentId,
+      runId: identity.runId,
+      parentRunId: identity.parentRunId,
+    },
+    scopeKey: "projection-facts",
+    status: "degraded",
+    state: "partial",
+    remainingWork: "Parent must finish the final validation.",
+    observationCount: 3,
+    substantiveEvidenceCount: 2,
+    acceptedEvidenceToolCallIds: ["child-call-1", "child-call-2"],
+    requiredPaths: ["src/main.ts"],
+    coveredPaths: ["src/main.ts"],
+    failedPaths: [],
+    uncoveredPaths: [],
+    reasonCode: "child_deadline_after_evidence",
+    reason: "The child lifecycle deadline was reached after evidence was collected.",
+  };
+  const events = [{
+    type: "subagent.created",
+    ...identity,
+    timestampMs: 10,
+    subagent: {
+      id: identity.subagentId,
+      collaborationTaskId: identity.collaborationTaskId,
+      parentTurnId: identity.turnId,
+      threadId: identity.threadId,
+      name: "Projection facts",
+      role: "reviewer",
+      objective: "Review the final mutation.",
+      scopeKey: "projection-facts",
+      runId: identity.runId,
+      parentRunId: identity.parentRunId,
+      status: "queued",
+      profile: "local",
+      provider: "provider",
+      model: "model",
+      createdAt: 10,
+      updatedAt: 10,
+    },
+  }, {
+    type: "subagent.updated",
+    ...identity,
+    timestampMs: 20,
+    patch: {
+      status: "degraded",
+      updatedAt: 20,
+      completedAt: 20,
+      evidenceCount: 99,
+      observationCount: 99,
+      error: "调查未完成",
+      closureState: "partial",
+      closureAudit,
+    },
+  }, {
+    type: "subagent.completed",
+    ...identity,
+    timestampMs: 21,
+    completedAt: 21,
+    status: "degraded",
+  }, {
+    type: "subagent.handed_back",
+    ...identity,
+    timestampMs: 22,
+    reason: "memory_pressure_after_evidence",
+    evidenceCount: 2,
+    remainingWork: "Parent must finish the final validation.",
+  }];
+
+  const [projected] = subagents.projectSubagentRuns(events);
+  assert.equal(projected.childEvidenceCount, 2);
+  assert.equal(projected.returnedCount, 1);
+  assert.equal(projected.deliveredCount, 0);
+  assert.equal(projected.adoptedCount, 0);
+  assert.deepEqual(projected.terminalReason, {
+    code: "subagent_handed_back",
+    detail: "memory_pressure_after_evidence",
+  });
+  assert.notEqual(projected.terminalReason.detail, projected.error);
+});
+
+test("inherited or unproven patch evidence is not projected as child output", () => {
+  const events = [{
+    type: "subagent.created",
+    threadId: "thread-inherited",
+    turnId: "turn-inherited",
+    timestampMs: 10,
+    subagentId: "agent-inherited",
+    subagent: {
+      id: "agent-inherited",
+      parentTurnId: "turn-inherited",
+      threadId: "thread-inherited",
+      name: "Inherited context reviewer",
+      role: "reviewer",
+      objective: "Review using parent context.",
+      status: "queued",
+      profile: "local",
+      provider: "provider",
+      model: "model",
+      createdAt: 10,
+      updatedAt: 10,
+    },
+  }, {
+    type: "subagent.updated",
+    threadId: "thread-inherited",
+    turnId: "turn-inherited",
+    timestampMs: 20,
+    subagentId: "agent-inherited",
+    patch: {
+      status: "running",
+      updatedAt: 20,
+      evidenceCount: 7,
+      observationCount: 7,
+    },
+  }];
+
+  const [projected] = subagents.projectSubagentRuns(events);
+  assert.equal(projected.childEvidenceCount, 0);
+  assert.equal(projected.returnedCount, 0);
+  assert.equal(projected.deliveredCount, 0);
+  assert.equal(projected.adoptedCount, 0);
+});

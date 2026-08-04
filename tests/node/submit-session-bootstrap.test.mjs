@@ -61,6 +61,7 @@ function createState(overrides = {}) {
     activeSessionByWorkspace: {},
     autoApproveTools: false,
     autoApproveToolScopes: [],
+    preferSubagents: false,
     webSearchEnabled: false,
     webSearchProvider: "off",
     config: {
@@ -113,6 +114,27 @@ test("submit session bootstrap creates an auto session and touches the run sessi
       },
     },
   ]);
+});
+
+test("submit session bootstrap preserves the submitted composer preferences", () => {
+  const state = createState({
+    autoApproveTools: true,
+    autoApproveToolScopes: ["read", "write"],
+    preferSubagents: true,
+  });
+  const harness = createHarness(state);
+
+  applySubmitSessionBootstrap({
+    state,
+    set: harness.set,
+    updateSession: harness.updateSession,
+    autoSessionNowMs: 1000,
+    commandIssuedAtMs: 2000,
+  });
+
+  assert.equal(state.autoApproveTools, true);
+  assert.deepEqual(state.autoApproveToolScopes, ["read", "write"]);
+  assert.equal(state.preferSubagents, true);
 });
 
 test("submit session bootstrap reuses a valid current session without creating one", () => {

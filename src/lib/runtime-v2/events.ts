@@ -2,6 +2,7 @@ import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
+  type RuntimeV2ExecutionValidationAuthority,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2Phase,
   type RuntimeV2Projection,
@@ -10,6 +11,7 @@ import {
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
   type RuntimeV2Strategy,
+  type RuntimeV2SubagentHandoffApplicationSource,
   type RuntimeV2SubagentJob,
   type RuntimeV2SubagentStatus,
   type RuntimeV2SubagentTelemetry,
@@ -22,6 +24,10 @@ import type {
   RuntimeV2PlanReviewCommit,
   SealedWorkPlanV1,
 } from "./workPlan";
+import type { RuntimeV2SubagentReportV1 } from "./subagentReport";
+import type {
+  RuntimeV2ValidatedMutationVersion,
+} from "./validationReceipt";
 
 export interface RuntimeV2EventBase {
   readonly schemaVersion: typeof RUNTIME_V2_EVENT_SCHEMA_VERSION;
@@ -38,6 +44,10 @@ export type RuntimeV2Event =
       readonly objective: string;
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
+      readonly acceptanceCriterionIds?: readonly string[];
+      readonly acceptanceEvidenceRequirements?: readonly (
+        "static" | "behavioral" | "interaction"
+      )[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.started";
@@ -78,6 +88,10 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      /** A replay closes the provider tool pair with an already committed
+       * same-version receipt. It is not a new observation or progress
+       * boundary and therefore carries no new evidence. */
+      readonly receiptOrigin?: "executed" | "replayed";
       readonly presentation?: RuntimeV2ToolPresentation;
       readonly failureKind?:
         | "execution_failed"
@@ -86,6 +100,10 @@ export type RuntimeV2Event =
         | "mutation_rejected"
         | "source_mismatch"
         | "target_invalid";
+      /** Stable machine-readable cause supplied by the effect boundary.
+       * Provider-facing prose is presentation only and must never be parsed
+       * to reconstruct recovery authority after checkpoint restore. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "validation.completed";
@@ -94,6 +112,14 @@ export type RuntimeV2Event =
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly passed: boolean;
       readonly presentation?: RuntimeV2ToolPresentation;
+      /** Exact authority and criterion linkage used when this validation was
+       * admitted. A receipt without it cannot prove Execute completion. */
+      readonly authority?: RuntimeV2ExecutionValidationAuthority;
+      /** Exact mutation boundary observed by the validator. Any later
+       * mutation makes this receipt stale. */
+      readonly mutationBoundarySequence?: number;
+      readonly validatedMutationVersions?:
+        readonly RuntimeV2ValidatedMutationVersion[];
       /** A protocol or authority rejection asks for a corrected validation
        * call in the same phase. Only a real execution/assertion failure
        * justifies returning to source modification. */
@@ -122,12 +148,6 @@ export type RuntimeV2Event =
       readonly reason: string;
     })
   | (RuntimeV2EventBase & {
-      readonly type: "recovery.epoch_opened";
-      readonly run: RuntimeV2RunIdentity;
-      readonly reason: string;
-      readonly evidence: readonly RuntimeV2EvidenceReference[];
-    })
-  | (RuntimeV2EventBase & {
       readonly type: "recovery.recorded";
       readonly run: RuntimeV2RunIdentity;
       readonly scope: RuntimeV2RecoveryScope;
@@ -143,11 +163,19 @@ export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "soft_signal.observed";
       readonly run: RuntimeV2RunIdentity;
-      readonly signal: "no_tool_call" | "empty_response" | "repeat" | "context_pressure" | "iteration_limit";
+      readonly signal:
+        | "no_tool_call"
+        | "empty_response"
+        | "repeat"
+        | "context_pressure"
+        | "iteration_limit"
+        | "protocol_drift"
+        | "repeated_action";
     })
   | (RuntimeV2EventBase & {
       readonly type: "subagents.scheduled";
       readonly run: RuntimeV2RunIdentity;
+      readonly maxActiveSubagents: number;
       readonly jobs: readonly RuntimeV2SubagentJob[];
     })
   | (RuntimeV2EventBase & {
@@ -159,9 +187,35 @@ export type RuntimeV2Event =
       readonly type: "subagent.completed";
       readonly run: RuntimeV2RunIdentity;
       readonly jobId: string;
-      readonly status: Extract<RuntimeV2SubagentStatus, "completed" | "failed" | "canceled">;
+      readonly status: Extract<
+        RuntimeV2SubagentStatus,
+        "completed" | "degraded" | "failed" | "canceled"
+      >;
       readonly summary: string;
+      /** Parent evidence available to a review child. It is not appended to
+       * the aggregate again and cannot be counted as child-produced evidence. */
+      readonly inheritedEvidence?:
+        readonly RuntimeV2EvidenceReference[];
       readonly evidence: readonly RuntimeV2EvidenceReference[];
+      readonly report?: RuntimeV2SubagentReportV1;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "subagent.handoff_delivered";
+      /** Parent Run that received the child result. */
+      readonly run: RuntimeV2RunIdentity;
+      readonly jobId: string;
+      readonly contextEntryId: string;
+      readonly evidenceIds: readonly string[];
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "subagent.handoff_applied";
+      /** Parent Run that explicitly used child evidence. */
+      readonly run: RuntimeV2RunIdentity;
+      readonly jobId: string;
+      readonly evidenceIds: readonly string[];
+      readonly sourceEventId: string;
+      readonly source:
+        RuntimeV2SubagentHandoffApplicationSource;
     })
   | (RuntimeV2EventBase & {
       readonly type: "projection.published";

@@ -315,6 +315,22 @@ test("MD Viewer execution oracle accepts the exact four-owner incident closure",
   assert.deepEqual(getMdViewerExecutionGaps(executionSources()), []);
 });
 
+test("MD Viewer execution oracle rejects the toolbar fragment that causes a white screen", () => {
+  const sources = executionSources();
+  sources.toolbar = [
+    "export function updateTheme(theme) { return theme; }entFile(filePath) {}",
+    sources.toolbar,
+    "export function updateTheme(theme) { return theme; }",
+  ].join("\n");
+  const gaps = getMdViewerExecutionGaps(sources);
+  assert.ok(gaps.some((gap) => gap.includes(
+    "remove the corrupted }entFile fragment",
+  )));
+  assert.ok(gaps.some((gap) => gap.includes(
+    "keep exactly one exported updateTheme declaration",
+  )));
+});
+
 test("MD Viewer execution oracle accepts a guarded findIndex replacement", () => {
   const sources = executionSources();
   sources.caller = sources.caller.replace(

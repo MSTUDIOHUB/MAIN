@@ -146,7 +146,7 @@ test("generated core prompt is compact and states the actual completion contract
   assert.match(prompt, /\[COMPLETION\]/);
   assert.match(prompt, /A successful write proves only that exact mutation/);
   assert.match(prompt, /each requested outcome has corresponding artifact\/diff evidence/);
-  assert.match(prompt, /reopen the mutation phase for distinct remaining outcomes within a finite runtime limit/);
+  assert.match(prompt, /reopen the mutation phase for distinct remaining outcomes while each cycle yields new evidence or a materially changed validation result/);
   assert.doesNotMatch(prompt, /reopen mutation once/);
   assert.doesNotMatch(prompt, /Available (?:mutation|validation) tools:/);
 });

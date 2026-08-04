@@ -62,6 +62,7 @@ test("tool schema normalization patches description-only leaf fields", () => {
     properties: {
       query: {
         description: "Search string without explicit type",
+        runtimeIdentityDefault: "",
       },
       nested: {
         type: "object",
@@ -76,6 +77,7 @@ test("tool schema normalization patches description-only leaf fields", () => {
   });
 
   assert.equal(schema.properties.query.type, "string");
+  assert.equal("runtimeIdentityDefault" in schema.properties.query, false);
   assert.equal(schema.properties.nested.properties.mode.type, "string");
 });
 
@@ -110,6 +112,19 @@ test("shell tool schemas require execution descriptions and expose cwd metadata"
   assert.ok(executeCommand.function.parameters.properties.cwd);
   assert.ok(executeCommand.function.parameters.properties.wait_ms);
   assert.ok(executeCommand.function.parameters.properties.max_chars);
+});
+
+test("replace_in_file asks providers for a minimal exact source block", () => {
+  const replace = buildToolDefinitions([]).find((tool) =>
+    tool.function.name === "replace_in_file"
+  );
+
+  assert.ok(replace);
+  assert.match(replace.function.description, /smallest block/i);
+  assert.match(
+    replace.function.parameters.properties.search_text.description,
+    /最小唯一旧代码块/,
+  );
 });
 
 test("typed Plan submission schema carries the complete provider-neutral graph", () => {
@@ -263,6 +278,17 @@ test("repo_map and apply_patch schemas are exposed for built-in code intelligenc
   assert.match(applyPatch.function.description, /Codex/);
 });
 
+test("destructive workspace deletion has an exact reviewed built-in schema", () => {
+  const tools = buildToolDefinitions([]);
+  const deletion = tools.find((tool) =>
+    tool.function.name === "delete_workspace_path"
+  );
+  assert.ok(deletion);
+  assert.deepEqual(deletion.function.parameters.required, ["path"]);
+  assert.match(deletion.function.description, /exact workspace-relative/i);
+  assert.match(deletion.function.description, /destructive-operation review/i);
+});
+
 test("Tree-sitter AST and native Git inspection schemas are exposed as bounded read-only tools", () => {
   const tools = buildToolDefinitions([]);
   const byName = new Map(tools.map((tool) => [tool.function.name, tool]));
@@ -338,5 +364,11 @@ test("read_file schema exposes line-window parameters and does not promise full-
   assert.ok(readFile.function.parameters.properties.start_line);
   assert.ok(readFile.function.parameters.properties.end_line);
   assert.ok(readFile.function.parameters.properties.max_lines);
+  assert.ok(readFile.function.parameters.properties.start_char);
+  assert.ok(readFile.function.parameters.properties.max_chars);
+  assert.match(
+    readFile.function.parameters.properties.start_char.description,
+    /0-based/,
+  );
   assert.deepEqual(readFile.function.parameters.required, ["path"]);
 });

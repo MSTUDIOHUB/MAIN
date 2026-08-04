@@ -3,11 +3,27 @@ import { exhaustedRuntimeV2ResultKind } from "./completion";
 import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
-  RuntimeV2RecoveryScope,
+  RuntimeV2ExecutionValidationAuthority,
   RuntimeV2ResultKind,
 } from "./contracts";
-import { RUNTIME_V2_RECOVERY_LIMITS, runtimeV2ActionFingerprint } from "./recovery";
-import { MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS } from "./subagents";
+import type { RuntimeV2Event } from "./events";
+import { runtimeV2ActionFingerprint } from "./recovery";
+import {
+  resolveRuntimeV2SubagentReferences,
+  runtimeV2SubagentModelHandle,
+} from "./subagents";
+import {
+  deriveRuntimeV2PlanExecutionCoverage,
+  resolveRuntimeV2PlanValidationScope,
+  runtimeV2PlanValidationAuthority,
+} from "./planExecution";
+import {
+  isRuntimeV2ValidationToolCall,
+  runtimeV2DirectExecuteReadyForConclusion,
+} from "./phaseTransition";
+import {
+  resolveRuntimeV2DirectExecuteValidationAuthority,
+} from "./validationReceipt";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -29,24 +45,106 @@ export interface RuntimeV2DecisionInput {
     | "forbidden"
     | "allowed"
     | "preferred";
+  /** Provider-lane capacity after reserving one request for the parent. */
+  readonly subagentCapacity?: number;
+  /** Whether the admitted parent/child provider requests can really overlap. */
+  readonly subagentRequestMode?: "parallel" | "serialized";
 }
 
 function commaSeparatedValues(value: unknown): string[] {
   return String(value || "")
     .split(/[\n,]/)
     .map((entry) => entry.trim())
-    .filter(Boolean)
-    .slice(0, MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS);
+    .filter(Boolean);
 }
 
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.entries(value as Record<string, unknown>)
-    .filter(([key]) => key !== "actionFingerprint" && key !== "attempt")
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
-    .join(",")}}`;
+function currentRunSubagents(state: TurnAggregateV1) {
+  const parentRunId = state.run?.identity.runId;
+  return parentRunId
+    ? state.subagents.filter((job) => job.parentRunId === parentRunId)
+    : [];
+}
+
+function admittedMaxChildRuns(
+  state: TurnAggregateV1,
+  currentCapacity: number,
+): number {
+  const currentRunId = state.run?.identity.runId;
+  for (const event of state.events) {
+    if (
+      event.type !== "command.scheduled" ||
+      event.command.kind !== "request_model" ||
+      event.command.run.runId !== currentRunId
+    ) {
+      continue;
+    }
+    const admitted = Number(event.command.payload.maxChildRuns);
+    if (Number.isSafeInteger(admitted) && admitted >= 0) {
+      return admitted;
+    }
+  }
+  return currentCapacity;
+}
+
+function collaborationPayload(
+  state: TurnAggregateV1,
+  input: RuntimeV2DecisionInput,
+): Readonly<Record<string, unknown>> {
+  const collaborationAllowed =
+    input.subagentPreference === "allowed" ||
+    input.subagentPreference === "preferred";
+  const currentCapacity = Math.max(
+    0,
+    Math.floor(Number(input.subagentCapacity) || 0),
+  );
+  // Adaptive lane probing may discover more concurrency during a Run. Freeze
+  // the total child budget in the first durable provider request so that new
+  // capacity cannot turn one parent objective into an unbounded spawn loop.
+  const maxChildRuns = admittedMaxChildRuns(state, currentCapacity);
+  const maxActiveSubagents = Math.min(currentCapacity, maxChildRuns);
+  const runSubagents = currentRunSubagents(state);
+  const activeSubagents = runSubagents
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map((job) => ({
+      id: runtimeV2SubagentModelHandle(job),
+      name: job.name || job.scopeKey,
+      objective: job.objective,
+    }));
+  const failedSubagents = runSubagents
+    .filter((job) =>
+      job.status === "failed" || job.status === "degraded"
+    )
+    .slice(-Math.max(1, maxActiveSubagents))
+    .map((job) => ({
+      id: runtimeV2SubagentModelHandle(job),
+      name: job.name || job.scopeKey,
+      objective: job.objective,
+      status: job.status,
+      summary: job.summary || "No structured report was committed.",
+    }));
+  return {
+    collaborationAllowed,
+    collaborationPreferred:
+      input.subagentPreference === "preferred",
+    collaborationRequestMode:
+      input.subagentRequestMode ||
+      (currentCapacity > 0 ? "parallel" : "serialized"),
+    collaborationAction:
+      activeSubagents.length > 0
+        ? "children_active"
+        : "optional",
+    activeSubagents,
+    failedSubagents,
+    maxActiveSubagents,
+    maxChildRuns,
+    remainingSubagentCapacity: Math.max(
+      0,
+      Math.min(
+        maxActiveSubagents - activeSubagents.length,
+        maxChildRuns - runSubagents.length,
+      ),
+    ),
+  };
 }
 
 function actionFingerprint(
@@ -54,149 +152,24 @@ function actionFingerprint(
   kind: RuntimeV2CommandKind,
   payload: Readonly<Record<string, unknown>>,
 ): string {
-  // Provider tool-call ids are transport-local and change every time a model
-  // retries the same request. They must not open an unbounded new recovery
-  // lineage for an otherwise identical action.
-  const structuralPayload = { ...payload };
-  delete structuralPayload.toolCallId;
-  return `${state.phase}:${kind}:${canonical(structuralPayload)}`.slice(0, 4_096);
+  if (state.phase === "completed") {
+    throw new Error("Cannot fingerprint a command for a completed Runtime v2 Run.");
+  }
+  return runtimeV2ActionFingerprint({
+    kind,
+    phase: state.phase,
+    payload,
+  });
 }
 
 function actionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
-  return state.completedCommands.filter((receipt) => receipt.actionFingerprint === fingerprint).length +
-    state.scheduledCommands.filter((scheduled) => runtimeV2ActionFingerprint(scheduled) === fingerprint).length;
-}
-
-function failedActionAttemptCount(state: TurnAggregateV1, fingerprint: string): number {
-  const epochOpenedAt = [...state.events].reverse().find(
-    (event) => event.type === "recovery.epoch_opened",
-  )?.at ?? Number.NEGATIVE_INFINITY;
-  return state.completedCommands.filter((receipt) =>
-    receipt.actionFingerprint === fingerprint &&
-    receipt.status === "failed" &&
-    receipt.completedAt >= epochOpenedAt
+  // `completedCommands` is a bounded replay cache. Command identity must be
+  // derived from the canonical ledger or its attempt number can roll back
+  // when an old receipt leaves that cache.
+  return state.events.filter((event) =>
+    event.type === "command.scheduled" &&
+    runtimeV2ActionFingerprint(event.command) === fingerprint
   ).length;
-}
-
-function currentPhaseEvents(state: TurnAggregateV1) {
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (
-      (event.type === "phase.changed" && event.phase === state.phase) ||
-      (event.type === "run.started" && event.phase === state.phase)
-    ) {
-      return state.events.slice(index + 1);
-    }
-  }
-  return state.events;
-}
-
-/**
- * Acting permits a small, ledger-bounded source-gap pass. Once two source
- * operations have succeeded (or the current phase repeats the same source),
- * the next provider request must choose from mutation capabilities. A global
- * iteration-pressure signal must not remove reads from a newly opened
- * corrective phase after validation exposed fresh source gaps.
- * This is a process-stage policy, not a model- or wording-specific heuristic.
- */
-function actingExecutePolicy(
-  state: TurnAggregateV1,
-):
-  | "source_refresh_required"
-  | "source_reorientation_required"
-  | "source_gap_allowed"
-  | "mutation_required" {
-  const phaseEvents = currentPhaseEvents(state);
-  const isSuccessfulSourceOperation = (event: (typeof phaseEvents)[number]) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
-    event.evidence.length > 0 &&
-    event.evidence.every((evidence) => evidence.kind === "source");
-  const successfulSourceOperations = phaseEvents.filter(
-    isSuccessfulSourceOperation,
-  ).length;
-  const pressureObserved = phaseEvents.some((event) =>
-    event.type === "soft_signal.observed" &&
-    event.signal === "repeat"
-  );
-  let latestRecoveryFailureIndex = -1;
-  let latestRecoveryFailureKind:
-    | "mutation_rejected"
-    | "source_mismatch"
-    | "target_invalid"
-    | null = null;
-  for (let index = phaseEvents.length - 1; index >= 0; index -= 1) {
-    const event = phaseEvents[index]!;
-    if (
-      event.type === "tool.completed" &&
-      event.status !== "succeeded" &&
-      (
-        event.failureKind === "mutation_rejected" ||
-        event.failureKind === "source_mismatch" ||
-        event.failureKind === "target_invalid"
-      )
-    ) {
-      latestRecoveryFailureIndex = index;
-      latestRecoveryFailureKind = event.failureKind;
-      break;
-    }
-  }
-  if (latestRecoveryFailureIndex >= 0) {
-    const refreshedSourceOperations = phaseEvents
-      .slice(latestRecoveryFailureIndex + 1)
-      .filter(isSuccessfulSourceOperation)
-      .length;
-    if (
-      latestRecoveryFailureKind === "source_mismatch" ||
-      latestRecoveryFailureKind === "mutation_rejected"
-    ) {
-      return refreshedSourceOperations > 0
-        ? "mutation_required"
-        : "source_refresh_required";
-    }
-    // A nonexistent, external, or otherwise invalid target cannot be repaired
-    // by rereading that same path. Reopen two source-only decisions so a weak
-    // model can first orient to the workspace and then inspect a real file.
-    return refreshedSourceOperations >= 2
-      ? "mutation_required"
-      : "source_reorientation_required";
-  }
-  let phaseBoundaryIndex = -1;
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (event.type === "phase.changed" && event.phase === "acting") {
-      phaseBoundaryIndex = index;
-      break;
-    }
-  }
-  let previousBoundaryIndex = -1;
-  for (let index = phaseBoundaryIndex - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (event.type === "phase.changed" || event.type === "run.started") {
-      previousBoundaryIndex = index;
-      break;
-    }
-  }
-  const previousBoundary = previousBoundaryIndex >= 0
-    ? state.events[previousBoundaryIndex]
-    : null;
-  const correctivePhase = phaseBoundaryIndex >= 0 &&
-    previousBoundary?.type !== undefined &&
-    "phase" in previousBoundary &&
-    previousBoundary.phase === "validating" &&
-    state.events
-      .slice(previousBoundaryIndex + 1, phaseBoundaryIndex)
-      .some((event) =>
-        event.type === "validation.completed" && !event.passed
-      );
-  if (correctivePhase) {
-    return successfulSourceOperations === 0
-      ? "source_refresh_required"
-      : "mutation_required";
-  }
-  return successfulSourceOperations >= 2 || pressureObserved
-    ? "mutation_required"
-    : "source_gap_allowed";
 }
 
 function deterministicCommandKey(
@@ -211,7 +184,6 @@ function deterministicCommandKey(
     run.identity.runId,
     state.phase,
     kind,
-    `epoch-${state.recovery.epoch}`,
     `attempt-${attempt}`,
     fingerprint,
   ].join(":");
@@ -240,60 +212,303 @@ function makeCommand(
   };
 }
 
-function recoveryFinalization(
-  state: TurnAggregateV1,
-  fingerprint: string,
-  reason: string,
-  resultKind: RuntimeV2ResultKind = exhaustedRuntimeV2ResultKind(state),
-  recoveryScope: RuntimeV2RecoveryScope = "action",
-): RuntimeV2Command {
-  return makeCommand(state, "finalize_turn", {
-    resultKind,
-    resultReason: reason,
-    recoveryExhausted: true,
-    recoveryScope,
-    recoveryFingerprint: fingerprint,
-  });
-}
-
-/**
- * Recovery limits retries of failed structural actions. A successful read is
- * evidence, not a failed recovery attempt; repeated successful reads are
- * redirected by the acting tool policy instead of being mislabeled terminal.
- */
 function boundedCommand(
   state: TurnAggregateV1,
   kind: Exclude<RuntimeV2CommandKind, "finalize_turn">,
   payload: Readonly<Record<string, unknown>> = {},
 ): RuntimeV2Command {
-  const fingerprint = actionFingerprint(state, kind, payload);
-  const failedAttempts = failedActionAttemptCount(state, fingerprint);
-  if (failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action) {
-    const transportFailureCount = state.recovery.receipts.find((receipt) =>
-      receipt.scope === "transport" &&
-      receipt.fingerprint === `transport:${fingerprint}` &&
-      receipt.epoch === state.recovery.epoch
-    )?.count || 0;
-    if (
-      kind === "request_model" &&
-      failedAttempts >= RUNTIME_V2_RECOVERY_LIMITS.action &&
-      transportFailureCount >= failedAttempts
-    ) {
-      return recoveryFinalization(
-        state,
-        fingerprint,
-        "provider_transport_exhausted",
-        "error",
-        "transport",
-      );
-    }
-    return recoveryFinalization(
-      state,
-      fingerprint,
-      "当前同一项结构化动作已达到恢复上限；已保留可靠证据并以部分结果收口，避免任务无限停留在执行中。",
-    );
-  }
   return makeCommand(state, kind, payload);
+}
+
+function executeReadyForConclusion(state: TurnAggregateV1): boolean {
+  const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
+  if (planCoverage) {
+    return planCoverage.allMutationTargetsCovered &&
+      planCoverage.allRequiredValidationsPassed;
+  }
+  return runtimeV2DirectExecuteReadyForConclusion(state);
+}
+
+export interface RuntimeV2ProviderRecoveryPressure {
+  readonly schemaVersion: "runtime-v2-provider-recovery.v1";
+  readonly reason:
+    | "repeated_action_rejected"
+    | "empty_response"
+    | "provider_request_failed";
+  readonly occurrence: number;
+  readonly stage: "reconsider" | "reframe" | "alternative";
+}
+
+export interface RuntimeV2ProviderRecoveryWindow {
+  readonly pressure: RuntimeV2ProviderRecoveryPressure;
+  /** Time of the first uninterrupted non-actionable provider decision. */
+  readonly startedAt: number;
+}
+
+function providerRequestCommandKeys(
+  events: readonly RuntimeV2Event[],
+): ReadonlySet<string> {
+  return new Set(events.flatMap((event) =>
+    event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+      ? [event.command.idempotencyKey]
+      : []
+  ));
+}
+
+function providerRequestModesByCommandKey(
+  events: readonly RuntimeV2Event[],
+): ReadonlyMap<string, string> {
+  return new Map(events.flatMap((event) =>
+    event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+      ? [[
+          event.command.idempotencyKey,
+          String(event.command.payload.mode || "").trim(),
+        ] as const]
+      : []
+  ));
+}
+
+function providerToolCallProgress(
+  events: readonly RuntimeV2Event[],
+): {
+  readonly progressed: ReadonlySet<string>;
+  readonly settledWithoutProgress: ReadonlySet<string>;
+} {
+  const toolCallIdByCommandKey = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "command.scheduled") continue;
+    const toolCallId = String(event.command.payload.toolCallId || "").trim();
+    if (toolCallId) {
+      toolCallIdByCommandKey.set(event.command.idempotencyKey, toolCallId);
+    }
+  }
+  const progressed = new Set<string>();
+  const settledWithoutProgress = new Set<string>();
+  for (const event of events) {
+    if (event.type === "tool.completed") {
+      const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
+      if (!toolCallId) continue;
+      if (event.status === "succeeded") progressed.add(toolCallId);
+      else settledWithoutProgress.add(toolCallId);
+      continue;
+    }
+    if (event.type !== "validation.completed") continue;
+    const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
+    if (!toolCallId) continue;
+    if (
+      event.passed ||
+      event.failureKind === "assertion_failed" ||
+      event.failureKind === "execution_failed" ||
+      !event.failureKind
+    ) {
+      progressed.add(toolCallId);
+    } else {
+      settledWithoutProgress.add(toolCallId);
+    }
+  }
+  return { progressed, settledWithoutProgress };
+}
+
+/**
+ * Derive one bounded recovery fact from the canonical ledger. The count is not
+ * a completion or authorization rule: it selects a materially different next
+ * decision prompt while the task remains open.
+ */
+export function deriveRuntimeV2ProviderRecoveryWindow(
+  state: TurnAggregateV1,
+): RuntimeV2ProviderRecoveryWindow | null {
+  if (state.pendingToolCalls.length > 0) return null;
+  const providerRequestKeys = providerRequestCommandKeys(state.events);
+  const providerRequestModes = providerRequestModesByCommandKey(state.events);
+  const toolCallProgress = providerToolCallProgress(state.events);
+  let occurrence = 0;
+  let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
+  let startedAt = 0;
+
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "provider.responded") {
+      const requestMode = providerRequestModes.get(event.idempotencyKey) || "";
+      const executableProgressRequired =
+        requestMode === "execute" || requestMode === "validate";
+      const repeated = event.result.diagnostics.some((diagnostic) =>
+        diagnostic.code === "repeated_action_rejected"
+      );
+      const failedToolDecision = event.result.toolCalls.length > 0 &&
+        event.result.toolCalls.every((call) =>
+          toolCallProgress.settledWithoutProgress.has(call.id) &&
+          !toolCallProgress.progressed.has(call.id)
+        );
+      const nonActionable =
+        (event.result.toolCalls.length === 0 || failedToolDecision) &&
+        (
+          executableProgressRequired ||
+          event.result.diagnostics.length > 0 ||
+          !String(event.result.visibleText || "").trim()
+        );
+      if (!nonActionable) break;
+      occurrence += 1;
+      startedAt = event.at;
+      if (!latestReason) {
+        latestReason = repeated
+          ? "repeated_action_rejected"
+          : "empty_response";
+      }
+      continue;
+    }
+    if (
+      event.type === "command.completed" &&
+      event.status === "failed" &&
+      providerRequestKeys.has(event.idempotencyKey)
+    ) {
+      occurrence += 1;
+      startedAt = event.at;
+      latestReason ||= "provider_request_failed";
+      continue;
+    }
+    if (event.type === "tool.completed") {
+      if (event.status === "succeeded") break;
+      continue;
+    }
+    if (event.type === "validation.completed") {
+      if (
+        event.passed ||
+        event.failureKind === "assertion_failed" ||
+        event.failureKind === "execution_failed" ||
+        !event.failureKind
+      ) {
+        break;
+      }
+      continue;
+    }
+    if (
+      event.type === "observation.recorded" ||
+      event.type === "work_plan.sealed" ||
+      event.type === "work_plan.approved" ||
+      event.type === "work_plan.invalidated" ||
+      event.type === "subagent.completed" ||
+      event.type === "subagent.handoff_applied" ||
+      event.type === "run.started"
+    ) {
+      break;
+    }
+  }
+
+  if (!latestReason || occurrence === 0) return null;
+  return {
+    startedAt,
+    pressure: {
+      schemaVersion: "runtime-v2-provider-recovery.v1",
+      reason: latestReason,
+      occurrence,
+      stage: occurrence === 1
+        ? "reconsider"
+        : occurrence === 2
+          ? "reframe"
+          : "alternative",
+    },
+  };
+}
+
+export function deriveRuntimeV2ProviderRecoveryPressure(
+  state: TurnAggregateV1,
+): RuntimeV2ProviderRecoveryPressure | null {
+  return deriveRuntimeV2ProviderRecoveryWindow(state)?.pressure || null;
+}
+
+/**
+ * Source evidence is necessary authority for an edit, but it is not itself a
+ * workspace effect. Keep this pressure active across additional reads until a
+ * mutation commits. The provider still retains every safe read tool; this
+ * durable fact only distinguishes "more evidence" from "objective advanced".
+ */
+export function deriveRuntimeV2EffectPressure(
+  state: TurnAggregateV1,
+): {
+  readonly schemaVersion: "runtime-v2-effect-pressure.v1";
+  readonly reason: "source_only_frontier";
+  readonly mutationBoundarySequence: number;
+  readonly sourceBoundarySequence: number;
+  readonly latestSourceEvidenceId: string;
+} | null {
+  let mutationBoundarySequence = 0;
+  let sourceBoundarySequence = 0;
+  let latestSourceEvidenceId = "";
+
+  for (const event of state.events) {
+    if (
+      event.type === "subagent.completed" &&
+      event.status === "completed" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+    ) {
+      mutationBoundarySequence = event.sequence;
+      sourceBoundarySequence = 0;
+      latestSourceEvidenceId = "";
+      continue;
+    }
+    if (
+      event.type !== "tool.completed" ||
+      event.status !== "succeeded"
+    ) {
+      continue;
+    }
+    if (event.evidence.some((evidence) => evidence.kind === "mutation")) {
+      mutationBoundarySequence = event.sequence;
+      sourceBoundarySequence = 0;
+      latestSourceEvidenceId = "";
+      continue;
+    }
+    if (event.receiptOrigin === "replayed") continue;
+    const source = [...event.evidence].reverse().find((evidence) =>
+      evidence.kind === "source" && !!evidence.version
+    );
+    if (!source) continue;
+    sourceBoundarySequence = event.sequence;
+    latestSourceEvidenceId = source.id;
+  }
+
+  return sourceBoundarySequence > mutationBoundarySequence &&
+      !!latestSourceEvidenceId
+    ? {
+        schemaVersion: "runtime-v2-effect-pressure.v1",
+        reason: "source_only_frontier",
+        mutationBoundarySequence,
+        sourceBoundarySequence,
+        latestSourceEvidenceId,
+      }
+    : null;
+}
+
+function executeModelRequest(
+  state: TurnAggregateV1,
+  input: RuntimeV2DecisionInput,
+): RuntimeV2Command {
+  const ready = executeReadyForConclusion(state);
+  const mode = ready
+    ? "conclude"
+    : state.phase === "validating"
+      ? "validate"
+      : "execute";
+  const effectPressure = mode === "execute"
+    ? deriveRuntimeV2EffectPressure(state)
+    : null;
+  const recoveryPressure = mode === "execute" || mode === "validate"
+    ? deriveRuntimeV2ProviderRecoveryPressure(state)
+    : null;
+  return boundedCommand(state, "request_model", {
+    mode,
+    objective: state.objective.text,
+    acceptanceCriteria: state.objective.acceptanceCriteria,
+    evidenceIds: state.evidence.map((item) => item.id),
+    hasVersionedSourceEvidence: state.evidence.some(
+      (item) => item.kind === "source" && !!item.version,
+    ),
+    ...(effectPressure ? { effectPressure } : {}),
+    ...(recoveryPressure ? { recoveryPressure } : {}),
+    ...collaborationPayload(state, input),
+  });
 }
 
 /**
@@ -308,28 +523,54 @@ export function decideNextCommands(
 ): readonly RuntimeV2Command[] {
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
-  if (state.recovery.exhausted) {
-    return [recoveryFinalization(
-      state,
-      state.recovery.exhausted.fingerprint,
-      state.recovery.exhausted.reason,
-    )];
-  }
   if (input.resultKind && input.resultReason) {
+    const activeJobIds = currentRunSubagents(state)
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.id);
+    if (activeJobIds.length > 0) {
+      return [boundedCommand(state, "join_subagents", {
+        mode: "read_only",
+        jobIds: activeJobIds,
+        finalJoin: true,
+      })];
+    }
     return [makeCommand(state, "finalize_turn", {
       resultKind: input.resultKind,
       resultReason: input.resultReason,
       ...(typeof input.finalMarkdown === "string" && input.finalMarkdown.trim()
         ? { finalMarkdown: input.finalMarkdown.trim().slice(0, 24_000) }
-        : {}),
+      : {}),
+    })];
+  }
+  if (state.recovery.exhausted) {
+    const activeJobIds = currentRunSubagents(state)
+      .filter((job) => job.status === "queued" || job.status === "running")
+      .map((job) => job.id);
+    if (activeJobIds.length > 0) {
+      return [boundedCommand(state, "join_subagents", {
+        mode: "read_only",
+        jobIds: activeJobIds,
+        finalJoin: true,
+      })];
+    }
+    return [makeCommand(state, "finalize_turn", {
+      resultKind: state.recovery.exhausted.scope === "transport"
+        ? "error"
+        : exhaustedRuntimeV2ResultKind(state),
+      resultReason: state.recovery.exhausted.reason,
     })];
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
     if (toolCall.name === "spawn_subagent") {
+      const collaboration = collaborationPayload(state, input);
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
+        maxActiveSubagents: collaboration.maxActiveSubagents,
+        maxChildRuns: collaboration.maxChildRuns,
+        collaborationRequestMode:
+          collaboration.collaborationRequestMode,
       })];
     }
     if (toolCall.name === "wait_subagents") {
@@ -337,24 +578,82 @@ export function decideNextCommands(
         ...commaSeparatedValues(toolCall.arguments.subagent_ids),
         ...commaSeparatedValues(toolCall.arguments.collaboration_task_ids),
       ];
-      const activeIds = state.subagents
+      const activeJobs = currentRunSubagents(state)
         .filter((job) => job.status === "queued" || job.status === "running")
-        .map((job) => job.id);
+      const resolution = resolveRuntimeV2SubagentReferences({
+        jobs: activeJobs,
+        requested,
+      });
       return [boundedCommand(state, "join_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
         requestedJobIds: requested,
         jobIds: requested.length > 0
-          ? activeIds.filter((id) => requested.includes(id))
-          : activeIds,
+          ? resolution.jobIds
+          : activeJobs.map((job) => job.id),
+        unresolvedJobIds: resolution.unresolved,
       })];
     }
-    const kind = state.phase === "validating" ? "execute_validation" : "execute_tool";
-    return [boundedCommand(state, kind, {
+    const kind = isRuntimeV2ValidationToolCall(toolCall)
+      ? "execute_validation"
+      : "execute_tool";
+    let validationAuthority:
+      | RuntimeV2ExecutionValidationAuthority
+      | undefined;
+    if (
+      kind === "execute_validation" &&
+      state.workPlan?.status === "approved" &&
+      state.sealedWorkPlan
+    ) {
+      const scope = resolveRuntimeV2PlanValidationScope({
+        plan: state.sealedWorkPlan,
+        toolName: toolCall.name,
+        args: toolCall.arguments,
+      });
+      const validationIndex = scope.matchingValidationIndexes[0];
+      const validation = validationIndex === undefined
+        ? undefined
+        : state.sealedWorkPlan.draft.validations[validationIndex];
+      if (validation && validationIndex !== undefined) {
+        validationAuthority =
+          runtimeV2PlanValidationAuthority({
+            plan: state.sealedWorkPlan,
+            validationIndex,
+          }) || undefined;
+      }
+    }
+    if (
+      kind === "execute_validation" &&
+      !validationAuthority &&
+      state.strategy === "execute"
+    ) {
+      validationAuthority =
+        resolveRuntimeV2DirectExecuteValidationAuthority({
+          aggregate: state,
+          turnId: state.turn.turnId,
+          objective: state.objective,
+          validationId: toolCall.id,
+        }) || undefined;
+    }
+    const executionArguments = kind === "execute_validation"
+      ? Object.fromEntries(
+          Object.entries(toolCall.arguments).filter(([key]) =>
+            key !== "criterion_ids" && key !== "target_paths"
+          ),
+        )
+      : toolCall.arguments;
+    const collaboration = collaborationPayload(state, input);
+    const command = boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
-      arguments: toolCall.arguments,
-    })];
+      arguments: executionArguments,
+      collaborationPreferred: collaboration.collaborationPreferred,
+      collaborationAction: collaboration.collaborationAction,
+      maxActiveSubagents: collaboration.maxActiveSubagents,
+      maxChildRuns: collaboration.maxChildRuns,
+      ...(validationAuthority ? { validationAuthority } : {}),
+    });
+    return [command];
   }
 
   switch (state.phase) {
@@ -371,56 +670,16 @@ export function decideNextCommands(
           objective: state.objective.text,
         })];
       }
-      const collaborationAllowed =
-        input.subagentPreference === "allowed" ||
-        input.subagentPreference === "preferred";
-      const activeSubagents = state.subagents
-        .filter((job) => job.status === "queued" || job.status === "running")
-        .map((job) => ({
-          id: job.id,
-          name: job.name || job.scopeKey,
-          objective: job.objective,
-        }));
-      const initialSpawnRequired =
-        input.subagentPreference === "preferred" &&
-        state.subagents.length === 0;
-      if (activeSubagents.length > 0) {
-        const lastScheduleIndex = state.events
-          .map((event) => event.type)
-          .lastIndexOf("subagents.scheduled");
-        const parentObservedWhileChildrenRun = state.events.some(
-          (event, index) =>
-            index > lastScheduleIndex &&
-            event.type === "provider.responded",
-        );
-        // Child identity and work come only from the provider's real
-        // spawn_subagent call. Once the parent has had one independent model
-        // turn, the runtime joins the actual active jobs even if a smaller
-        // model forgets the explicit wait tool, keeping collaboration finite.
-        if (parentObservedWhileChildrenRun) {
-          return [boundedCommand(state, "join_subagents", {
-            mode: "read_only",
-            jobIds: activeSubagents.map((job) => job.id),
-          })];
-        }
+      if (state.strategy === "analyze") {
+        return [boundedCommand(state, "request_model", {
+          mode: "analyze",
+          toolExpectation: "optional",
+          objective: state.objective.text,
+          evidenceIds: state.evidence.map((item) => item.id),
+          ...collaborationPayload(state, input),
+        })];
       }
-      return [boundedCommand(state, "request_model", {
-        mode: state.strategy === "analyze" ? "analyze" : "observe",
-        toolExpectation: initialSpawnRequired ? "required" : "optional",
-        objective: state.objective.text,
-        evidenceIds: state.evidence.map((item) => item.id),
-        collaborationAllowed,
-        collaborationAction: initialSpawnRequired
-          ? "spawn_required"
-          : activeSubagents.length > 0
-            ? "children_active"
-            : "optional",
-        activeSubagents,
-        remainingSubagentCapacity: Math.max(
-          0,
-          MAX_RUNTIME_V2_READ_ONLY_SUBAGENTS - state.subagents.length,
-        ),
-      })];
+      return [executeModelRequest(state, input)];
     }
     case "planning":
       return [boundedCommand(state, "request_model", {
@@ -431,26 +690,8 @@ export function decideNextCommands(
     case "reviewing":
       return [];
     case "acting":
-      return [boundedCommand(state, "request_model", {
-        mode: "execute",
-        executePolicy: actingExecutePolicy(state),
-        toolExpectation: "required",
-        objective: state.objective.text,
-        workPlanRevision: state.workPlan?.revision || null,
-        evidenceIds: state.evidence.map((item) => item.id),
-      })];
-    case "validating": {
-      const hasPassedValidation = state.events.some((event) =>
-        event.type === "validation.completed" && event.passed
-      );
-      return [boundedCommand(state, "request_model", {
-        mode: hasPassedValidation ? "conclude" : "validate",
-        toolExpectation: hasPassedValidation ? "optional" : "required",
-        objective: state.objective.text,
-        acceptanceCriteria: state.objective.acceptanceCriteria,
-        evidenceIds: state.evidence.map((item) => item.id),
-      })];
-    }
+    case "validating":
+      return [executeModelRequest(state, input)];
     case "finalizing":
       if (!input.resultKind || !input.resultReason) return [];
       return [makeCommand(state, "finalize_turn", {

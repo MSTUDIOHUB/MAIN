@@ -85,6 +85,64 @@ const run = {
   attemptId: "review-run-a",
 };
 
+test("Plan preserves an admitted read_file window without a second truncation", async () => {
+  const sourceWindow = `${"x".repeat(12_500)}\nTAIL_MARKER`;
+  const planEvidence = loadTsWithMocks(
+    path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"),
+    new Map([
+      ["../../lib/toolExecutor", {
+        executeTool: async () => sourceWindow,
+      }],
+      ["../../lib/toolTarget", {
+        getToolTarget: () => "src/large.ts",
+      }],
+      ["../../lib/workspacePaths", {
+        workspacePathsReferToSameFile: (left, right) => left === right,
+      }],
+      ["./sourceEvidenceVersion", {
+        resolveRuntimeV2SourceEvidenceVersion: async () => "sha256-large",
+      }],
+    ]),
+  );
+  const messages = [];
+  const evidence = [];
+  const evidenceContents = new Map();
+  const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: {
+      runWorkspace: "/fixture",
+      runSessionKey: "session",
+      runtimeContextBudget: {
+        contextLimit: 65_536,
+        outputBudget: 8_192,
+        inputBudget: 57_344,
+        readWindowChars: 32_000,
+      },
+    },
+    ledger: {
+      schedule: async () => ({ idempotencyKey: "plan-read-large" }),
+      settleCommand: async (event) => settlements.push(event),
+      recordSoftSignal: async () => undefined,
+    },
+    run,
+    call: {
+      id: "read-large",
+      name: "read_file",
+      arguments: { path: "src/large.ts" },
+    },
+    messages,
+    evidence,
+    evidenceContents,
+    parallelReadCount: 1,
+    logStoreEvent: () => undefined,
+  });
+
+  assert.equal(settlements[0]?.status, "succeeded");
+  assert.equal(evidenceContents.get("E1"), sourceWindow);
+  assert.match(messages[0]?.content || "", /TAIL_MARKER$/);
+  assert.equal(messages[0]?.content.includes(sourceWindow), true);
+});
+
 function plan() {
   return runtime.sealWorkPlanV1({
     draft: {
@@ -193,7 +251,11 @@ function actionRequest(commit, overrides = {}) {
   };
 }
 
-async function runProductionPlanScenario(streamCompletion, toolExecution) {
+async function runProductionPlanScenario(
+  streamCompletion,
+  toolExecution,
+  options = {},
+) {
   let taskId = 0;
   let state = {
     conversationTurns: [{
@@ -261,7 +323,14 @@ async function runProductionPlanScenario(streamCompletion, toolExecution) {
     },
   };
   const mocks = new Map([
-    ["../../lib/providerLaneSettings", { deriveStreamSettings: () => ({}) }],
+    ["../../lib/providerLaneSettings", {
+      deriveBudgetedStreamSettings: (_config, budget) => ({
+        contextLimit: budget?.contextLimit,
+      }),
+      deriveProviderAdapterCapabilities: () => ({
+        nativeToolRoundTrip: options.nativeToolRoundTrip ?? true,
+      }),
+    }],
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || args.query || ""),
     }],
@@ -306,10 +375,19 @@ async function runProductionPlanScenario(streamCompletion, toolExecution) {
       phaseLanguage: "zh",
       abortCtrl,
       timerInterval: undefined,
+      runtimeContextBudget: {
+        contextLimit: 32_768,
+        outputBudget: 4_096,
+        inputBudget: 28_672,
+        readWindowChars: 18_000,
+        source: "configured",
+        providerContextLimit: null,
+        availableMemoryBytes: null,
+      },
     },
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",
@@ -343,6 +421,12 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     runtimeIntent: "respond",
     runWorkspace: undefined,
   }), "chat");
+  assert.equal(engineSelection.resolveRuntimeV2VisibleRunnerKind({
+    effectiveIntent: "respond",
+    runtimeIntent: "respond",
+    runWorkspace: undefined,
+    hasAttachedFiles: true,
+  }), "workspace_read");
   assert.equal(engineSelection.resolveRuntimeV2VisibleRunnerKind({
     effectiveIntent: "respond",
     runtimeIntent: "respond",
@@ -451,6 +535,7 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   let writtenPlan = null;
   let providerRound = 0;
   let acceptedSubmissionRequest = null;
+  const observedReadArgs = [];
   const result = await runProductionPlanScenario(
     async (messages, _settings, _callbacks, _signal, tools) => {
       providerRound += 1;
@@ -510,7 +595,10 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
     },
     async (name, args) => {
       if (name === "get_project_skeleton") return "src/main.js";
-      if (name === "read_file") return "const openFile = true;";
+      if (name === "read_file") {
+        observedReadArgs.push({ ...args });
+        return "const openFile = true;";
+      }
       if (name === "write_file") {
         writtenPlan = String(args.content || "");
         return "written";
@@ -519,6 +607,14 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
     },
   );
   assert.equal(providerRound, 3);
+  assert.ok(observedReadArgs.some((args) =>
+    args.__raw !== true &&
+    args.max_chars === 18_000
+  ));
+  assert.ok(observedReadArgs.some((args) =>
+    args.__raw === true &&
+    args.max_chars === undefined
+  ));
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(
@@ -544,7 +640,7 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   assert.doesNotMatch(acceptedSubmissionText, /mandatory evidence audit/);
 });
 
-test("Plan discovery has a bounded action window and then exposes only the minimal plan submission", async () => {
+test("Plan discovery keeps read and submit tools available until the model submits", async () => {
   const reviewedDraft = {
     ...plan().draft,
     findings: plan().draft.findings.map((finding) => ({
@@ -634,21 +730,22 @@ test("Plan discovery has a bounded action window and then exposes only the minim
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.deepEqual(
     synthesisRequest.tools.map((definition) => definition.function.name),
-    ["submit_runtime_v2_work_plan"],
+    ["read_file", "submit_runtime_v2_work_plan"],
   );
+  const submitTool = synthesisRequest.tools.find((definition) =>
+    definition.function.name === "submit_runtime_v2_work_plan"
+  );
+  assert.ok(submitTool);
   assert.deepEqual(
-    synthesisRequest.tools[0].function.parameters.required,
+    submitTool.function.parameters.required,
     ["planMarkdown", "changes", "validations"],
   );
   assert.equal(
-    synthesisRequest.tools[0].function.parameters.properties.findingsJson,
+    submitTool.function.parameters.properties.findingsJson,
     undefined,
   );
-  assert.deepEqual(synthesisRequest.options.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
-  assert.match(
+  assert.equal(synthesisRequest.options.toolChoice, "required");
+  assert.doesNotMatch(
     synthesisRequest.messages.map((message) => String(message.content || "")).join("\n"),
     /read-only discovery window is closed/,
   );
@@ -662,10 +759,10 @@ test("Plan discovery has a bounded action window and then exposes only the minim
   const synthesisText = synthesisRequest.messages
     .map((message) => String(message.content || ""))
     .join("\n");
-  assert.equal(
-    (synthesisText.match(/E2 · (?:\.\/|\/fixture\/)?src\/main\.js · sha256-/g) || []).length,
-    1,
-    "path aliases for one unchanged file must not duplicate the synthesis evidence index",
+  assert.doesNotMatch(
+    synthesisText,
+    /E2 · (?:\.\/|\/fixture\/)?src\/main\.js · sha256-/,
+    "continued discovery must keep the canonical tool transcript instead of adding a synthesis evidence copy",
   );
   assert.match(
     synthesisText,
@@ -735,35 +832,138 @@ test("Plan synthesis falls back once from ignored native tools to a schema-bound
     },
   );
 
-  assert.equal(providerRound, 10);
+  assert.equal(providerRound, 11);
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
-  assert.equal(synthesisRequests[0].maxTokens, 4_096);
   assert.deepEqual(
     synthesisRequests[0].tools.map((tool) => tool.function.name),
+    ["read_file", "submit_runtime_v2_work_plan"],
+  );
+  assert.equal(synthesisRequests[0].options.toolChoice, "required");
+  assert.equal(synthesisRequests[1].maxTokens, 4_096);
+  assert.deepEqual(
+    synthesisRequests[1].tools.map((tool) => tool.function.name),
     ["submit_runtime_v2_work_plan"],
   );
-  assert.deepEqual(synthesisRequests[0].options.toolChoice, {
+  assert.deepEqual(synthesisRequests[1].options.toolChoice, {
     type: "function",
     function: { name: "submit_runtime_v2_work_plan" },
   });
-  assert.equal(synthesisRequests[1].maxTokens, 4_096);
-  assert.deepEqual(synthesisRequests[1].tools, []);
-  assert.equal(synthesisRequests[1].options.toolChoice, undefined);
-  assert.equal(synthesisRequests[1].options.responseFormat.type, "json_schema");
+  assert.equal(synthesisRequests[2].maxTokens, 4_096);
+  assert.deepEqual(synthesisRequests[2].tools, []);
+  assert.equal(synthesisRequests[2].options.toolChoice, undefined);
+  assert.equal(synthesisRequests[2].options.responseFormat.type, "json_schema");
   assert.match(
-    synthesisRequests[1].messages
+    synthesisRequests[2].messages
       .map((message) => String(message.content || ""))
       .join("\n"),
     /Return exactly one JSON object/,
   );
-  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 1);
+  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 0);
+  assert.ok(result.checkpoint.aggregate.events.some((event) =>
+    event.type === "soft_signal.observed" &&
+    event.signal === "protocol_drift"
+  ));
   assert.ok(result.checkpoint.aggregate.events.some((event) =>
     event.type === "provider.responded" &&
     event.result.diagnostics.some((diagnostic) =>
       diagnostic.code === "structured_response_adapted"
     )
   ));
+});
+
+test("Plan uses the text envelope first when the adapter lacks native tool round-trip", async () => {
+  const requests = [];
+  const readArguments = [];
+  const submission = {
+    planMarkdown: "Use the evidence-backed owner and preserve the existing boundary.",
+    changes: [{
+      title: "Repair the owner",
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "Update the reviewed lifecycle owner.",
+      expectedOutcome: "The visible lifecycle remains coherent.",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run build",
+      cwd: "/fixture",
+      expectedOutcome: "Build succeeds.",
+      required: true,
+    }],
+  };
+  const envelope = (toolCalls) =>
+    `<runtime-v2-tools>${JSON.stringify({ toolCalls })}</runtime-v2-tools>`;
+  let round = 0;
+  const result = await runProductionPlanScenario(
+    async (messages, _settings, _callbacks, _signal, tools, _maxTokens, requestOptions) => {
+      round += 1;
+      requests.push({ messages, tools, requestOptions });
+      return round === 1
+        ? {
+            content: envelope([{
+              id: "read-main",
+              name: "read_file",
+              arguments: { path: "src/main.js" },
+            }, {
+              id: "read-editor",
+              name: "read_file",
+              arguments: { path: "src/editor.js" },
+            }, {
+              id: "read-toolbar",
+              name: "read_file",
+              arguments: { path: "src/toolbar.js" },
+            }]),
+            toolCalls: [],
+            finishReason: "stop",
+            usage: {},
+            protocolViolation: null,
+          }
+        : {
+            content: envelope([{
+              id: "submit-plan",
+              name: "submit_runtime_v2_work_plan",
+              arguments: submission,
+            }]),
+            toolCalls: [],
+            finishReason: "stop",
+            usage: {},
+            protocolViolation: null,
+          };
+    },
+    async (name, args) => {
+      if (name === "get_project_skeleton") return "src/main.js";
+      if (name === "read_file") {
+        if (args.__raw !== true) readArguments.push(args);
+        return "const owner = true;";
+      }
+      if (name === "write_file") return "written";
+      throw new Error(`unexpected tool ${name}`);
+    },
+    { nativeToolRoundTrip: false },
+  );
+
+  assert.equal(result.settlement.outcome.status, "paused");
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.deepEqual(request.tools, []);
+    assert.equal(request.requestOptions.toolChoice, undefined);
+    const prompt = request.messages
+      .map((message) => String(message.content || ""))
+      .join("\n");
+    assert.match(prompt, /<runtime-v2-tools>/);
+  }
+  assert.match(
+    requests[0].messages
+      .map((message) => String(message.content || ""))
+      .join("\n"),
+    /read_file/,
+  );
+  assert.deepEqual(
+    readArguments.map((args) => args.max_chars),
+    [6_000, 6_000, 6_000],
+    "one provider-selected read batch shares the Run window instead of multiplying it",
+  );
 });
 
 test("schema-bound Plan response ingress never searches surrounding prose for JSON", () => {
@@ -849,7 +1049,7 @@ test("WorkPlan compilation removes unsafe finite commands only when another exec
   );
 });
 
-test("a closed synthesis request gets one compact sequential recovery without overlap", async () => {
+test("a closed synthesis request gets compact sequential recovery without overlap", async () => {
   let providerRound = 0;
   let activeRequests = 0;
   let maxActiveRequests = 0;
@@ -899,12 +1099,8 @@ test("a closed synthesis request gets one compact sequential recovery without ov
           );
         }
         return {
-          content: "",
-          toolCalls: [{
-            id: `submit-after-recovery-${providerRound}`,
-            name: "submit_runtime_v2_work_plan",
-            arguments: submission,
-          }],
+          content: submission,
+          toolCalls: [],
           usage: {},
           protocolViolation: null,
         };
@@ -946,15 +1142,40 @@ test("a closed synthesis request gets one compact sequential recovery without ov
     synthesisRequests[1].messages
       .map((message) => String(message.content || ""))
       .join("\n"),
-    /single bounded recovery request/,
+    /preceding synthesis request did not produce a complete submission/,
   );
-  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 1);
+  assert.ok(synthesisRequests[1].options.responseFormat);
+  assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 0);
+  assert.equal(
+    result.checkpoint.aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "protocol_drift"
+    ).length,
+    1,
+  );
 });
 
-test("two synthesis timeouts close exactly once after the bounded sequential recovery", async () => {
+test("repeated synthesis timeouts stay soft and a later submission can succeed", async () => {
   let providerRound = 0;
   let activeRequests = 0;
   let maxActiveRequests = 0;
+  const submission = JSON.stringify({
+    planMarkdown: "根据已读取源码修复文件标签生命周期并验证构建。",
+    changes: [{
+      title: "统一标签生命周期",
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "打开文件时替换仍为空白且未修改的初始标签。",
+      expectedOutcome: "只显示当前文件标签。",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run build",
+      cwd: "/fixture",
+      expectedOutcome: "构建通过。",
+      required: true,
+    }],
+  });
   const result = await runProductionPlanScenario(
     async () => {
       activeRequests += 1;
@@ -973,9 +1194,17 @@ test("two synthesis timeouts close exactly once after the bounded sequential rec
             protocolViolation: null,
           };
         }
-        throw new Error(
-          "STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced keepalive chunks without a semantic action",
-        );
+        if (providerRound <= 11) {
+          throw new Error(
+            "STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced keepalive chunks without a semantic action",
+          );
+        }
+        return {
+          content: submission,
+          toolCalls: [],
+          usage: {},
+          protocolViolation: null,
+        };
       } finally {
         activeRequests -= 1;
       }
@@ -983,65 +1212,178 @@ test("two synthesis timeouts close exactly once after the bounded sequential rec
     async (name) => {
       if (name === "get_project_skeleton") return "src/main.js";
       if (name === "read_file") return "const openFile = true;";
+      if (name === "write_file") return "written";
       throw new Error(`unexpected tool ${name}`);
     },
   );
 
-  assert.equal(providerRound, 10);
+  assert.equal(providerRound, 12);
   assert.equal(maxActiveRequests, 1);
-  assert.equal(result.settlement.outcome.status, "completed");
-  assert.equal(result.settlement.outcome.resultKind, "partial");
-  assert.equal(result.checkpoint.aggregate.phase, "completed");
+  assert.equal(result.settlement.outcome.status, "paused");
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
   assert.equal(result.checkpoint.aggregate.scheduledCommands.length, 0);
-  assert.equal(result.checkpoint.aggregate.terminalOutcome?.resultKind, "partial");
+  assert.equal(result.checkpoint.aggregate.terminalOutcome, null);
+  assert.equal(result.checkpoint.aggregate.recovery.exhausted, null);
   assert.equal(
     result.checkpoint.aggregate.events.filter((event) =>
       event.type === "run.completed"
+    ).length,
+    0,
+  );
+  assert.equal(
+    result.checkpoint.aggregate.events.filter((event) =>
+      event.type === "recovery.exhausted"
+    ).length,
+    0,
+  );
+  assert.equal(
+    result.checkpoint.aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "protocol_drift"
     ).length,
     1,
   );
 });
 
-test("production Plan runner closes repeated no-action responses exactly once", async () => {
+test("Plan no-action remains bounded and can recover after both synthesis transports", async () => {
+  let providerRound = 0;
+  const submission = JSON.stringify({
+    planMarkdown: "根据已读取源码修复文件标签生命周期并验证构建。",
+    changes: [{
+      title: "统一标签生命周期",
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "打开文件时替换仍为空白且未修改的初始标签。",
+      expectedOutcome: "只显示当前文件标签。",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run build",
+      cwd: "/fixture",
+      expectedOutcome: "构建通过。",
+      required: true,
+    }],
+  });
   const result = await runProductionPlanScenario(
-    async () => ({
-      content: "仍在分析",
-      toolCalls: [],
-      usage: {},
-      protocolViolation: null,
-    }),
+    async () => {
+      providerRound += 1;
+      if (providerRound === 1) {
+        return {
+          content: "",
+          toolCalls: [{
+            id: "read-before-no-action",
+            name: "read_file",
+            arguments: JSON.stringify({ path: "src/main.js" }),
+          }],
+          usage: {},
+          protocolViolation: null,
+        };
+      }
+      if (providerRound <= 5) {
+        return {
+          content: "仍在分析",
+          toolCalls: [],
+          usage: {},
+          protocolViolation: null,
+        };
+      }
+      return {
+        content: submission,
+        toolCalls: [],
+        usage: {},
+        protocolViolation: null,
+      };
+    },
     async (name) => {
       if (name === "get_project_skeleton") return "src/main.js";
+      if (name === "read_file") return "const openFile = true;";
+      if (name === "write_file") return "written";
       throw new Error(`unexpected tool ${name}`);
     },
   );
   const aggregate = result.checkpoint.aggregate;
-  assert.equal(result.settlement.outcome.status, "completed");
-  assert.equal(result.settlement.outcome.resultKind, "partial");
-  assert.equal(aggregate.phase, "completed");
+  assert.equal(providerRound, 6);
+  assert.equal(result.settlement.outcome.status, "paused");
+  assert.equal(aggregate.phase, "reviewing");
   assert.equal(aggregate.scheduledCommands.length, 0);
-  assert.equal(aggregate.workPlan, null);
-  assert.ok(aggregate.recovery.exhausted);
+  assert.ok(aggregate.workPlan);
+  assert.equal(aggregate.recovery.exhausted, null);
   assert.equal(
-    aggregate.events.filter((event) => event.type === "run.completed").length,
+    aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "no_tool_call"
+    ).length,
     1,
   );
   assert.equal(
+    aggregate.events.filter((event) => event.type === "run.completed").length,
+    0,
+  );
+  assert.equal(
     aggregate.events.filter((event) => event.type === "turn.completed").length,
-    1,
+    0,
   );
   assert.equal(
     aggregate.events.filter((event) =>
       event.type === "projection.published" && event.audience === "final"
     ).length,
-    1,
+    0,
+  );
+});
+
+test("only structured provider transport unavailability closes Plan recovery", async () => {
+  let providerRound = 0;
+  const result = await runProductionPlanScenario(
+    async () => {
+      providerRound += 1;
+      if (providerRound === 1) {
+        return {
+          content: "",
+          toolCalls: [{
+            id: "read-before-provider-unavailable",
+            name: "read_file",
+            arguments: JSON.stringify({ path: "src/main.js" }),
+          }],
+          usage: {},
+          protocolViolation: null,
+        };
+      }
+      throw new runtime.RuntimeV2ProviderTransportsUnavailableError();
+    },
+    async (name) => {
+      if (name === "get_project_skeleton") return "src/main.js";
+      if (name === "read_file") return "const openFile = true;";
+      throw new Error(`unexpected tool ${name}`);
+    },
+  );
+  const aggregate = result.checkpoint.aggregate;
+  assert.equal(providerRound, 2);
+  assert.equal(result.settlement.outcome.status, "completed");
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(aggregate.phase, "completed");
+  assert.equal(aggregate.terminalOutcome?.resultKind, "partial");
+  assert.equal(aggregate.recovery.exhausted, null);
+  assert.equal(
+    aggregate.events.filter((event) =>
+      event.type === "soft_signal.observed" &&
+      event.signal === "protocol_drift"
+    ).length,
+    0,
   );
 });
 
 test("one sealed WorkPlan and ReviewCommit survive checkpoint cold recovery", () => {
   const { checkpoint, sealed, commit } = reviewCheckpoint();
+  const persisted = runtime.serializeRuntimeV2CheckpointMap({
+    [turn.turnId]: checkpoint,
+  })[turn.turnId];
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(persisted, "aggregate"),
+    false,
+    "the durable checkpoint must contain only the canonical event ledger",
+  );
   const restored = runtime.normalizeRuntimeV2Checkpoint(
-    JSON.parse(JSON.stringify(checkpoint)),
+    JSON.parse(JSON.stringify(persisted)),
     turn,
   );
   assert.ok(restored);

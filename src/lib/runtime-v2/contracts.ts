@@ -1,6 +1,6 @@
 export const RUNTIME_V2_ENGINE_VERSION = "v2" as const;
 export const RUNTIME_V2_EVENT_SCHEMA_VERSION = "runtime-v2-event.v1" as const;
-export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v3" as const;
+export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v5" as const;
 
 export type RuntimeEngineVersion = "legacy" | typeof RUNTIME_V2_ENGINE_VERSION;
 
@@ -44,6 +44,11 @@ export type RuntimeV2TransportVariant =
   | "native_auto"
   | "text_envelope";
 
+export type RuntimeV2SubagentHandoffApplicationSource =
+  | "provider_result"
+  | "command"
+  | "final";
+
 /** Recovery is deliberately scoped to a durable, structural fact. Model prose
  * and loop counts are not valid recovery keys. */
 export type RuntimeV2RecoveryScope =
@@ -56,7 +61,6 @@ export interface RuntimeV2RecoveryReceipt {
   readonly scope: RuntimeV2RecoveryScope;
   readonly fingerprint: string;
   readonly count: number;
-  readonly epoch: number;
   readonly lastAttemptAt: number;
 }
 
@@ -88,6 +92,15 @@ export interface RuntimeV2Objective {
   readonly text: string;
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly string[];
+  /** Stable runtime-owned identities. Goal slices preserve their original
+   * criterion ids; direct Execute uses one id for the complete user request. */
+  readonly acceptanceCriterionIds?: readonly string[];
+  /** Runtime-owned lower bound. A provider may request stronger evidence in
+   * the execution contract, but it cannot downgrade a user-visible objective
+   * to a static build receipt. */
+  readonly acceptanceEvidenceRequirements?: readonly (
+    "static" | "behavioral" | "interaction"
+  )[];
 }
 
 export interface RuntimeV2EvidenceReference {
@@ -95,6 +108,16 @@ export interface RuntimeV2EvidenceReference {
   readonly kind: "source" | "tool" | "mutation" | "validation" | "subagent" | "user";
   readonly target: string;
   readonly version: string | null;
+}
+
+export interface RuntimeV2ExecutionValidationAuthority {
+  readonly kind: "direct_execute" | "work_plan";
+  readonly id: string;
+  readonly revision: number;
+  readonly digest: string;
+  readonly validationId: string;
+  readonly criterionIds: readonly string[];
+  readonly targetPaths: readonly string[];
 }
 
 /**
@@ -130,7 +153,6 @@ export interface RuntimeV2RecoveryBudget {
   readonly actionRepeats: number;
   readonly contextRefreshes: number;
   readonly diagnosticRepairs: number;
-  readonly epoch: number;
   /** A bounded, replayable receipt ledger rather than process-local counters. */
   readonly receipts: readonly RuntimeV2RecoveryReceipt[];
   readonly exhausted: RuntimeV2RecoveryExhaustion | null;
@@ -194,11 +216,14 @@ export type RuntimeV2SubagentStatus =
   | "queued"
   | "running"
   | "completed"
+  | "degraded"
   | "failed"
   | "canceled";
 
-/** Read-only child contract for the first collaboration slice. A child never
- * receives mutation authority and its result is evidence, not parent state. */
+/** Bounded child contract available throughout the parent lifecycle.
+ * Investigation jobs are read-only. An implement job may stage one mutation
+ * transaction only after the parent provides an explicit plan and exclusive
+ * path ownership; Runtime commits that transaction at the join boundary. */
 export interface RuntimeV2SubagentJob {
   readonly id: string;
   readonly run: RuntimeV2RunIdentity;
@@ -206,6 +231,10 @@ export interface RuntimeV2SubagentJob {
   /** Exact provider tool call that created this one-shot job. */
   readonly sourceToolCallId?: string;
   readonly scopeKey: string;
+  readonly taskKind?: "explore" | "review" | "validate" | "implement";
+  readonly accessMode?: "read" | "write";
+  readonly implementationOperation?: "create" | "modify" | "delete";
+  readonly implementationPlan?: string;
   /** Provider-selected presentation identity and role. */
   readonly name?: string;
   readonly role?: string;
@@ -218,6 +247,7 @@ export interface RuntimeV2SubagentJob {
   readonly firstTokenAt: number | null;
   readonly closedAt: number | null;
   readonly summary: string | null;
+  readonly report?: import("./subagentReport").RuntimeV2SubagentReportV1 | null;
 }
 
 export interface RuntimeV2SubagentTelemetry {

@@ -368,11 +368,11 @@ export default function Composer({
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
   const subagentPreferenceTitle = language === "en"
     ? preferSubagents
-      ? "Collaboration is enabled. This turn starts at least one fresh one-task subagent, then the parent continues non-overlapping work and owns final validation."
-      : "Enable collaboration for the next turn. MAIN will start one fresh one-task subagent before parent workspace work."
+      ? "Collaboration is enabled. MAIN may delegate independent investigation, review, validation, or explicitly planned non-overlapping implementation at any useful stage; delegation is never mandatory."
+      : "Allow adaptive collaboration for the next turn, including scoped investigation and planned non-overlapping implementation when useful."
     : preferSubagents
-      ? "协作已开启：本轮会先启动至少一个全新的一次性子智能体，随后主体并行推进不重叠工作并负责最终验证。"
-      : "为下一轮开启协作；MAIN 会在主体开始工作区操作前启动一个全新的一次性子智能体。";
+      ? "协作已开启：MAIN 可在任一适合阶段按需委派独立调查、评审、验证或方案明确且范围互斥的实现任务；绝不强制启动。"
+      : "允许下一轮自适应协作，包括范围明确的调查及方案明确、互不重叠的实现任务。";
   const subagentPreferenceLockedTitle = language === "en"
     ? "Subagent collaboration is captured for the current run and can be changed after it stops."
     : "本轮已捕获子智能体协作设置，执行停止后才能更改。";

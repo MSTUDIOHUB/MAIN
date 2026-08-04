@@ -1,182 +1,72 @@
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
-import { streamChatCompletion } from "../../lib/streaming";
+import {
+  deriveBudgetedStreamSettings,
+  deriveProviderAdapterCapabilities,
+} from "../../lib/providerLaneSettings";
+import { acquireModelLane } from "../../lib/modelLaneCoordinator";
+import {
+  streamChatCompletion,
+  type OpenAiToolChoice,
+} from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
-  RuntimeV2ProviderProtocolError,
   type RuntimeV2Command,
   type RuntimeV2NormalizedProviderResult,
 } from "../../lib/runtime-v2";
 import {
+  aggregateForCurrentTurn,
   compactTextEnvelopeCatalog,
+  buildRuntimeV2DecisionView,
+  boundRuntimeV2ProviderConversation,
   containsProviderTextEnvelopePrompt,
-  latestAcceptanceFailureSourceWindow,
+  deriveRuntimeV2ProviderEffectFacts,
+  materializedRuntimeV2SourceCoverage,
   preferredFiniteValidationCommand,
   providerHistory,
   recordApprovedPlanContext,
-  recordModelContext,
   type RuntimeV2ExecutionPortsInput,
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
 import {
-  latestFailedMutationToolForLease,
-  runtimeV2MutationLease,
-  type RuntimeV2MutationLease,
-} from "./correctiveMutationPolicy";
+  prioritizeRuntimeV2ProviderToolDefinitions,
+} from "./executionProviderTools";
+import {
+  deriveRuntimeV2ExecutionContract,
+  deriveRuntimeV2ExecutionContractRepair,
+  runtimeV2ExecutionContractReadWindow,
+  runtimeV2ExecutionContractRequired,
+} from "./executionContract";
+import { deriveRuntimeV2ExecutionContractAdvance } from "./executionContractAdvance";
+import {
+  runtimeV2EvidenceOnlyDecisionConversation,
+} from "./executionContractFormation";
+import {
+  deriveRuntimeV2ValidationCorrectionWindow,
+} from "./executionValidationCorrection";
+import {
+  providerModeInstruction,
+} from "./executionProviderInstruction";
+import {
+  RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT,
+  RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT,
+  RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT,
+  RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT,
+  RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+  providerMessageChars,
+  runtimeV2CurrentToolSurfaceInstruction,
+  runtimeV2ExecutionEffectiveToolChoice,
+  runtimeV2ExecutionProviderOutputTokenLimit,
+  runtimeV2ExecutionReasoningRequest,
+  runtimeV2ProviderOutputWasTruncated,
+  shouldRetryRuntimeV2WithoutReasoning,
+} from "./executionProviderRequestPolicy";
 
-export const RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS = 8_192;
-export const RUNTIME_V2_EXECUTION_TOOL_ENVELOPE_MAX_OUTPUT_TOKENS = 4_096;
+export * from "./executionProviderRequestPolicy";
 
-export function runtimeV2ExecutionProviderOutputTokenLimit(
-  command: RuntimeV2Command,
-  textEnvelope: boolean,
-): number {
-  return textEnvelope &&
-      command.payload.toolExpectation === "required"
-    ? RUNTIME_V2_EXECUTION_TOOL_ENVELOPE_MAX_OUTPUT_TOKENS
-    : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS;
-}
-
-export function runtimeV2ProviderProtocolError(input: {
-  ports: RuntimeV2ExecutionPortsInput;
-  command: RuntimeV2Command;
-  code:
-    | "required_tool_missing"
-    | "tool_surface_rejected"
-    | "tool_arguments_rejected";
-  requestedToolNames: readonly string[];
-  allowedToolNames: readonly string[];
-  detail?: string;
-  preferredValidationCommand?: string;
-}): RuntimeV2ProviderProtocolError {
-  const message = input.detail || (
-    input.code === "required_tool_missing"
-      ? "The previous response did not submit the structured tool call required by the current phase."
-      : `The previous response requested unavailable tools: ${input.requestedToolNames.join(", ") || "unknown"}.`
-  );
-  recordModelContext(input.ports.live, {
-    id: `provider-protocol:${input.command.idempotencyKey}:${input.code}`,
-    source: "provider",
-    label: input.code,
-    target: `${input.command.phase}:${String(input.command.payload.mode || "unknown")}`,
-    status: "failed",
-    content: [
-      message,
-      `Allowed tools for this phase: ${input.allowedToolNames.join(", ") || "none"}.`,
-      input.preferredValidationCommand
-        ? `Preferred finite validation: ${input.preferredValidationCommand}.`
-        : "",
-      "Retry with exactly one allowed structured tool. Do not repeat an unavailable tool or replace the call with narration.",
-    ].filter(Boolean).join("\n"),
-  });
-  return new RuntimeV2ProviderProtocolError(input.code, message);
-}
-
-function providerModeInstruction(
-  command: RuntimeV2Command,
-  preferredValidationCommand = "",
-  toolSurface: {
-    readonly hasReadFile: boolean;
-    readonly hasMutation: boolean;
-    readonly hasSpawnSubagent: boolean;
-    readonly hasWaitSubagents: boolean;
-    readonly mutationLease: RuntimeV2MutationLease | null;
-  } = {
-    hasReadFile: false,
-    hasMutation: false,
-    hasSpawnSubagent: false,
-    hasWaitSubagents: false,
-    mutationLease: null,
-  },
-): string {
-  const mode = String(command.payload.mode || "").trim();
-  const collaborationAction = String(
-    command.payload.collaborationAction || "",
-  ).trim();
-  const activeSubagents = Array.isArray(command.payload.activeSubagents)
-    ? command.payload.activeSubagents
-        .map((entry) => {
-          if (!entry || typeof entry !== "object") return "";
-          const record = entry as Record<string, unknown>;
-          const id = String(record.id || "").trim();
-          const name = String(record.name || "").trim();
-          const objective = String(record.objective || "").trim();
-          return id
-            ? `${name || id} (${id}): ${objective}`.slice(0, 600)
-            : "";
-        })
-        .filter(Boolean)
-    : [];
-  if (
-    (mode === "observe" || mode === "analyze") &&
-    collaborationAction === "spawn_required"
-  ) {
-    return [
-      "Current phase: model-selected collaboration.",
-      "Call spawn_subagent exactly once before any parent workspace read.",
-      "You must choose a fresh semantic task key, a real display name and role, a narrow evidence objective, success criteria, and the least read-only path scope needed.",
-      "Do not invent work from top-level directory names or generic architecture-layer labels; the delegated responsibility must follow the user's actual objective and current evidence.",
-    ].join(" ");
-  }
-  switch (mode) {
-    case "observe":
-      return [
-        "Current phase: bounded read-only investigation. Use exactly one focused read or search action to collect a concrete missing fact. Mutation and validation tools are unavailable; do not propose or simulate an edit.",
-        toolSurface.hasWaitSubagents
-          ? `Read-only child work is active (${activeSubagents.join("; ")}). Continue only genuinely independent parent work, or call wait_subagents before relying on or concluding from child results.`
-          : "",
-        toolSurface.hasSpawnSubagent
-          ? "spawn_subagent is available only when you identify another semantic, independent read-only investigation with concrete success criteria; choose its name, role, objective and scope yourself."
-          : "",
-      ].filter(Boolean).join(" ");
-    case "analyze":
-      return [
-        "Current phase: bounded read-only workspace analysis. Use at most one focused read/search action when a concrete fact is missing. When the evidence is sufficient, return one complete Markdown answer with no tool call. Never request a mutation, shell command, browser action, or validation.",
-        toolSurface.hasWaitSubagents
-          ? `Read-only child work is active (${activeSubagents.join("; ")}). Call wait_subagents before the final answer if its result is still relevant.`
-          : "",
-        toolSurface.hasSpawnSubagent
-          ? "You may call spawn_subagent only for a semantic independent investigation; its name, role, objective, success criteria and read scope must be your actual task design."
-          : "",
-      ].filter(Boolean).join(" ");
-    case "execute":
-      return command.payload.executePolicy === "source_refresh_required"
-        ? "Current phase: corrective source refresh. Read the exact primary file window reported by the latest failed validator or stale mutation. Only read_file is available; do not survey other files or propose a mutation until this source snapshot is committed."
-        : command.payload.executePolicy === "source_reorientation_required"
-        ? "Current phase: target recovery. The previous mutation named a target that is not valid in the active workspace. Use exactly one available source read, search, or directory action to locate authoritative code. Mutation and validation tools are temporarily unavailable; do not repeat the rejected path."
-        : command.payload.executePolicy === "mutation_required"
-        ? !toolSurface.hasMutation && toolSurface.hasReadFile
-          ? "Current phase: exact source acquisition. No mutation is authorized until the parent reads the precise file it intends to change. Call read_file once for that file; do not narrate a fix or survey unrelated files."
-          : toolSurface.mutationLease?.authority === "acceptance_failure"
-          ? [
-              "Current phase: corrective implementation.",
-              toolSurface.hasReadFile
-                ? "The validator-reported file is leased. If exact replacement bytes are still unclear, use the single read_file once; otherwise mutate now."
-                : "The validator-reported source is attached and read capabilities are closed. Call the one available minimal mutation tool now.",
-              "Repair only the concrete acceptance gaps in the leased file and preserve unrelated behavior.",
-            ].join(" ")
-          : toolSurface.mutationLease?.authority === "fresh_parent_read"
-          ? [
-              "Current phase: implementation.",
-              `The mutation is leased to the exact file most recently read by the parent: ${toolSurface.mutationLease.target}.`,
-              "Call one available minimal mutation tool now and preserve unrelated code.",
-            ].join(" ")
-          : "Current phase: approved-plan implementation. Call exactly one minimal mutation within the sealed plan scope and preserve unrelated code."
-        : "Current phase: source acquisition before implementation. Mutation tools are closed for this request. Use one focused source action; finish with read_file on the exact file you intend to change. Never replace the tool call with narration.";
-    case "validate":
-      return [
-        "Current phase: validate. Call one acceptance-capable finite validation tool and wait for its actual result before concluding.",
-        "A run_command must be a bounded build, test, lint, typecheck, check, or assertion command. cat, grep, sed, head, tail, and wc only inspect text and are not validation.",
-        preferredValidationCommand
-          ? `Preferred workspace validation command: ${JSON.stringify(preferredValidationCommand)}. Use it unless retained evidence proves another bounded validator is more appropriate.`
-          : "Prefer run_command or browser_evaluate according to the observable acceptance boundary.",
-      ].join(" ");
-    case "conclude":
-      return "Current phase: final evidence report. Do not call another tool. State only the confirmed root cause, files actually changed, validation that actually passed, and any remaining limitation.";
-    default:
-      return "Current phase: choose the next action from concrete evidence. Use a structured tool whenever another fact, edit, or validation is required.";
-  }
-}
+export {
+  providerModeInstruction,
+  runtimeV2EditableSourceAnchor,
+} from "./executionProviderInstruction";
 
 export async function requestRuntimeV2ProviderOnce(input: {
   live: RuntimeV2LiveExecutionState;
@@ -184,141 +74,452 @@ export async function requestRuntimeV2ProviderOnce(input: {
   command: RuntimeV2Command;
   tools: ToolDefinition[];
   textEnvelope: boolean;
-  toolChoice: "required" | "auto" | null;
+  toolChoice: OpenAiToolChoice | null;
   signal: AbortSignal;
-  timeoutMs: number;
+  timeoutMs?: number;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   const state = input.ports.get();
-  const settings = deriveStreamSettings(state.config);
-  const envelopeOnly =
-    input.textEnvelope &&
-    input.command.payload.toolExpectation === "required";
-  const requestSettings = envelopeOnly
-    ? { ...settings, reasoningRequest: "off" as const }
-    : settings;
+  const budget = input.ports.context.runtimeContextBudget;
+  const settings = deriveBudgetedStreamSettings(state.config, budget);
+  const adapterCapabilities = deriveProviderAdapterCapabilities(
+    settings,
+  );
+  input.live.latestProviderAssistantReasoning = null;
+  const requestMode = String(input.command.payload.mode || "").trim();
+  const reasoningOnlyCharLimit =
+    requestMode === "execute" || requestMode === "validate"
+      ? RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT
+      : undefined;
+  let streamedText = "";
+  recordApprovedPlanContext(input.ports);
+  const history = providerHistory(input.live, input.ports);
+  const sealedPreferredValidation = String(input.command.payload.mode || "") === "validate"
+    ? preferredFiniteValidationCommand(input.ports)
+    : "";
+  const aggregate = aggregateForCurrentTurn(input.ports);
+  const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(aggregate);
+  const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
+  const executionContractRequired =
+    runtimeV2ExecutionContractRequired(aggregate);
+  const executionContractReadWindow =
+    runtimeV2ExecutionContractReadWindow(aggregate);
+  const executionContractAdvance =
+    deriveRuntimeV2ExecutionContractAdvance(aggregate);
+  const executionContractRepair =
+    deriveRuntimeV2ExecutionContractRepair(aggregate);
+  const validationCorrection =
+    deriveRuntimeV2ValidationCorrectionWindow(aggregate);
+  const preferredValidation = validationCorrection.validationCommandUnavailable
+    ? ""
+    : sealedPreferredValidation;
+  const contractFormationDecision =
+    (executionContractRequired && executionContractReadWindow.closed) ||
+    !!executionContractRepair;
+  const contractOnlyAction =
+    contractFormationDecision &&
+    input.tools.length === 1 &&
+    input.tools[0]?.function.name === "record_execution_contract";
   const maxOutputTokens = runtimeV2ExecutionProviderOutputTokenLimit(
     input.command,
     input.textEnvelope,
+    budget,
+    input.live.latestProviderActionWindow,
+    contractOnlyAction,
   );
-  let streamedText = "";
-  recordApprovedPlanContext(input.ports);
-  const correctiveSource =
-    String(input.command.payload.mode || "") === "execute" &&
-      input.command.payload.executePolicy === "mutation_required"
-      ? latestAcceptanceFailureSourceWindow(
-          input.live,
-          input.ports.context.runWorkspace || "",
-        )
-      : null;
-  const history = providerHistory(
-    input.live,
-    input.ports,
-    correctiveSource
-      ? {
-          kind: "corrective_mutation",
-          target: correctiveSource.path,
-          evidenceId: correctiveSource.evidenceId,
-        }
-      : null,
+  const canonicalDecisionConversation = budget
+    ? boundRuntimeV2ProviderConversation(
+        history.messages,
+        {
+          contextLimit: budget.contextLimit,
+          reservedOutputTokens: maxOutputTokens,
+        },
+        providerEffectFacts,
+      )
+    : buildRuntimeV2DecisionView(
+        history.messages,
+        providerEffectFacts,
+      );
+  input.live.latestProviderRequestSourceCoverage =
+    materializedRuntimeV2SourceCoverage(
+      canonicalDecisionConversation,
+      input.ports.context.runWorkspace || "",
+      providerEffectFacts,
+    );
+  const providerTools = prioritizeRuntimeV2ProviderToolDefinitions({
+    command: input.command,
+    tools: input.tools,
+    hasMaterializedSourceEvidence:
+      input.live.latestProviderRequestSourceCoverage.length > 0,
+  });
+  const toolNames = new Set(
+    providerTools.map((tool) => tool.function.name),
   );
-  const preferredValidation = String(input.command.payload.mode || "") === "validate"
-    ? preferredFiniteValidationCommand(input.ports)
-    : "";
-  const mutationLease =
-    String(input.command.payload.mode || "") === "execute" &&
-      input.command.payload.executePolicy === "mutation_required"
-      ? runtimeV2MutationLease(input.ports)
+  const effectPressure =
+    input.command.payload.effectPressure &&
+      typeof input.command.payload.effectPressure === "object" &&
+      !Array.isArray(input.command.payload.effectPressure)
+      ? input.command.payload.effectPressure as Record<string, unknown>
       : null;
-  const toolNames = new Set(input.tools.map((tool) => tool.function.name));
-  const excludedMutationTool = mutationLease
-    ? latestFailedMutationToolForLease(input.ports, mutationLease)
-    : null;
-  const messages = [
-    ...history.messages,
-    {
-      role: "system" as const,
-      content: providerModeInstruction(
+  const sourceOnlyFrontier =
+    effectPressure?.reason === "source_only_frontier" &&
+    input.live.latestProviderRequestSourceCoverage.length > 0;
+  const recoveryPressure =
+    input.command.payload.recoveryPressure &&
+      typeof input.command.payload.recoveryPressure === "object" &&
+      !Array.isArray(input.command.payload.recoveryPressure)
+      ? input.command.payload.recoveryPressure as Record<string, unknown>
+      : null;
+  const recoveringFromRejectedAction =
+    recoveryPressure?.reason === "repeated_action_rejected";
+  const actionWindow = input.live.latestProviderActionWindow;
+  const hasMutationTool =
+    toolNames.has("replace_in_file") ||
+    toolNames.has("apply_patch") ||
+    toolNames.has("write_file");
+  const structuredActionRequired =
+    contractOnlyAction ||
+    !!actionWindow ||
+    executionContractAdvance.required ||
+    validationCorrection.active ||
+    validationCorrection.validationCommandUnavailable ||
+    recoveringFromRejectedAction;
+  const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const forceStructuredAction = structuredActionRequired;
+  const boundedConversation = structuredActionRequired
+    ? runtimeV2EvidenceOnlyDecisionConversation(
+        canonicalDecisionConversation,
+      )
+    : canonicalDecisionConversation;
+  const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
+    requested: input.toolChoice,
+    tools: providerTools,
+    textEnvelope: input.textEnvelope,
+    forceStructuredAction,
+  });
+  const actionOnlyCharLimit =
+    requestMode === "execute" || requestMode === "validate"
+      ? structuredActionRequired
+        ? contractOnlyAction
+          ? RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT
+          : RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT
+        : RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT
+      : undefined;
+  const derivedReasoningRequest = runtimeV2ExecutionReasoningRequest({
+    configured: settings.reasoningRequest,
+    sourceOnlyFrontier,
+    hasMutationTool,
+    providerSupportsReasoningToggle:
+      adapterCapabilities.reasoningToggle,
+    contractOnlyAction,
+    structuredActionRequired,
+    recoveringFromRejectedAction,
+    recoveryStage,
+    actionWindow,
+  });
+  const reasoningRequest = derivedReasoningRequest;
+  const requestSettings = reasoningRequest === settings.reasoningRequest
+    ? settings
+    : {
+        ...settings,
+        reasoningRequest,
+        preserveAssistantReasoning: false,
+      };
+  const decisionInstruction = {
+    role: "system" as const,
+    content: [
+      providerModeInstruction(
         input.command,
         preferredValidation,
         {
           hasReadFile: toolNames.has("read_file"),
-          hasMutation:
-            toolNames.has("replace_in_file") ||
-            toolNames.has("apply_patch") ||
-            toolNames.has("write_file"),
+          hasMutation: hasMutationTool,
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
-          mutationLease,
+          hasMaterializedSourceEvidence:
+            input.live.latestProviderRequestSourceCoverage.length > 0,
+          sourceOnlyFrontier,
+          materializedSourceCoverage:
+            input.live.latestProviderRequestSourceCoverage,
+          actionWindow,
+          executionContract: validationCorrection.active
+            ? null
+            : executionContract,
+          executionContractRequired,
+          executionContractReadWindowClosed:
+            executionContractReadWindow.closed,
+          executionContractRepairAttempts:
+            executionContractRepair?.attempts || 0,
+          executionContractAdvanceRequired:
+            executionContractAdvance.required,
+          executionContractCommittedTargets:
+            executionContractAdvance.committedTargets,
+          executionContractPendingTargets:
+            executionContractAdvance.pendingTargets,
+          executionContractSourceReviewAvailable:
+            executionContractAdvance.sourceReviewAvailable,
+          executionContractSourceReviewTargets:
+            executionContractAdvance.sourceReviewTargets,
+          validationCorrectionActive: validationCorrection.active,
+          validationCommandUnavailable:
+            validationCorrection.validationCommandUnavailable,
+          failedValidationCommand:
+            validationCorrection.failedValidationCommand,
+          replacementValidationExhausted:
+            validationCorrection.validationCommandUnavailable &&
+            validationCorrection.repeatedFailedValidations >= 1,
         },
       ),
-    },
-    ...(input.textEnvelope
-      ? [{
-          role: "system" as const,
-          content: containsProviderTextEnvelopePrompt(
-            input.ports.context.phaseLanguage,
-            input.command.payload.toolExpectation === "required",
-          ),
-        }, {
-          role: "system" as const,
-          content: compactTextEnvelopeCatalog(input.tools),
-        }]
-      : []),
+      runtimeV2CurrentToolSurfaceInstruction(
+        providerTools,
+        structuredActionRequired,
+      ),
+    ].join(" "),
+  };
+  const textEnvelopeInstructions = input.textEnvelope
+    ? [{
+        role: "system" as const,
+        content: containsProviderTextEnvelopePrompt(
+          input.ports.context.phaseLanguage,
+          false,
+        ),
+      }, {
+        role: "system" as const,
+        content: compactTextEnvelopeCatalog(providerTools),
+      }]
+    : [];
+  const firstNonSystemIndex = boundedConversation.findIndex((message) =>
+    message.role !== "system"
+  );
+  const instructionIndex = firstNonSystemIndex < 0
+    ? boundedConversation.length
+    : firstNonSystemIndex;
+  const messages = [
+    ...boundedConversation.slice(0, instructionIndex),
+    decisionInstruction,
+    ...textEnvelopeInstructions,
+    ...boundedConversation.slice(instructionIndex),
   ];
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
-    executePolicy: String(input.command.payload.executePolicy || ""),
     sourceReadAvailable: toolNames.has("read_file"),
-    mutationToolAvailable:
-      toolNames.has("replace_in_file") ||
-      toolNames.has("apply_patch") ||
-      toolNames.has("write_file"),
-    mutationLeaseAuthority: mutationLease?.authority || null,
-    mutationLeaseTarget: mutationLease?.target || null,
-    mutationLeaseEvidenceId: mutationLease?.evidenceId || null,
-    excludedMutationTool,
-    retainedEvidenceEntries: history.retained,
-    droppedEvidenceEntries: history.dropped,
-    conversationHistoryMessages: history.historyMessages,
+    mutationToolAvailable: hasMutationTool,
+    conversationHistoryMessages: boundedConversation.length,
+    unboundedConversationHistoryMessages: history.historyMessages,
     priorConversationTurns: history.priorTurns,
-    availableContextEntries: input.live.modelContext.length,
-    contextSources: Object.fromEntries(
-      ["workspace", "tool", "subagent", "provider", "plan"].map((source) => [
-        source,
-        input.live.modelContext.filter((entry) => entry.source === source).length,
-      ]),
+    approximateMessageChars: messages.reduce(
+      (total, message) => total + providerMessageChars(message),
+      0,
     ),
-    retainedContextSources: history.retainedSources,
-    contextFocus: history.focus?.kind || null,
-    focusedTarget: history.focus?.target || null,
-    focusedEvidenceId: history.focus?.evidenceId || null,
-    approximateMessageChars: history.chars,
     preferredValidationCommand: preferredValidation || null,
-    allowedToolCount: input.tools.length,
-    nativeToolCount: input.textEnvelope ? 0 : input.tools.length,
-    allowedToolNames: input.tools.map((tool) => tool.function.name),
+    allowedToolCount: providerTools.length,
+    nativeToolCount: input.textEnvelope ? 0 : providerTools.length,
+    allowedToolNames: providerTools.map((tool) => tool.function.name),
+    toolChoice: effectiveToolChoice || null,
+    collaborationAllowed:
+      input.command.payload.collaborationAllowed === true,
+    collaborationRequestMode:
+      String(input.command.payload.collaborationRequestMode || "serialized"),
+    remainingSubagentCapacity: Math.max(
+      0,
+      Math.floor(
+        Number(input.command.payload.remainingSubagentCapacity) || 0,
+      ),
+    ),
+    sourceOnlyFrontier,
+    providerActionWindow: actionWindow,
+    executionContractRevision: executionContract?.revision || null,
+    executionContractRequired,
+    executionContractSupplementalReadBatches:
+      executionContractReadWindow.supplementalReadBatches,
+    executionContractReadWindowClosed:
+      executionContractReadWindow.closed,
+    executionContractRepairAttempts:
+      executionContractRepair?.attempts || 0,
+    executionContractAdvanceRequired: executionContractAdvance.required,
+    executionContractCommittedTargets:
+      executionContractAdvance.committedTargets,
+    executionContractPendingTargets:
+      executionContractAdvance.pendingTargets,
+    executionContractSourceReviewAvailable:
+      executionContractAdvance.sourceReviewAvailable,
+    executionContractSourceReviewTargets:
+      executionContractAdvance.sourceReviewTargets,
+    executionContractSourceReviewReceiptCount:
+      executionContractAdvance.sourceReviewReceiptCount,
+    validationCorrectionActive: validationCorrection.active,
+    validationCorrectionRepeatedFailures:
+      validationCorrection.repeatedFailedValidations,
+    validationCommandUnavailable:
+      validationCorrection.validationCommandUnavailable,
+    failedValidationCommand:
+      validationCorrection.failedValidationCommand,
+    contractOnlyAction,
+    structuredActionRequired,
+    forceStructuredAction,
+    actionOnlyCharLimit: actionOnlyCharLimit || null,
     maxOutputTokens,
     reasoningRequest: requestSettings.reasoningRequest || null,
+    effectPressureActionDecoding:
+      reasoningRequest === "off" &&
+      settings.reasoningRequest !== "off",
+    recoveryStage: recoveryPressure?.stage || null,
+    recoveryOccurrence: Number(recoveryPressure?.occurrence) || 0,
+    recoveryReasoningEscalated:
+      reasoningRequest === "explicit" &&
+      settings.reasoningRequest !== "explicit",
+    decisionViewApplied: true,
+    canonicalConversationMessages: history.messages.length,
+    removedDecisionMessages: Math.max(
+      0,
+      history.messages.length - boundedConversation.length,
+    ),
   });
-  const result = await streamChatCompletion(
-    messages,
-    requestSettings,
-    {
-      onToken: (token) => { streamedText += token; },
-      onDone: () => undefined,
-      onError: () => undefined,
-    },
-    input.signal,
-    input.textEnvelope ? [] : input.tools,
-    maxOutputTokens,
-    {
-      ...(input.toolChoice ? { toolChoice: input.toolChoice } : {}),
-      timeoutMs: input.timeoutMs,
-    },
+  const requestTokenBudget = Math.max(
+    2_048,
+    Math.ceil(
+      messages.reduce(
+        (total, message) => total + providerMessageChars(message),
+        0,
+      ) / 4,
+    ) + maxOutputTokens,
   );
+  const lane = await acquireModelLane({
+    config: state.config,
+    contextLimit: budget?.contextLimit,
+    requestTokenBudget,
+    agentKind: "parent",
+    signal: input.signal,
+    onDebugEvent: (event, data) =>
+      input.ports.logStoreEvent(event, {
+        turnId: input.command.run.turnId,
+        runId: input.command.run.runId,
+        ...data,
+      }),
+  });
+  let result: Awaited<ReturnType<typeof streamChatCompletion>>;
+  let reasoningFallbackApplied = false;
+  try {
+    result = await streamChatCompletion(
+      messages,
+      requestSettings,
+      {
+        onToken: (token) => {
+          lane.markFirstToken();
+          streamedText += token;
+        },
+        onDone: () => undefined,
+        onError: () => undefined,
+        onLifecycle: (event) => {
+          if (event.phase === "first_chunk") lane.markFirstToken();
+        },
+      },
+      input.signal,
+      input.textEnvelope ? [] : providerTools,
+      maxOutputTokens,
+      {
+        ...(effectiveToolChoice ? { toolChoice: effectiveToolChoice } : {}),
+        timeoutMs: input.timeoutMs,
+        contextOwnership: "caller",
+        reasoningOnlyCharLimit,
+        actionOnlyCharLimit,
+      },
+    );
+    if (
+      shouldRetryRuntimeV2WithoutReasoning({
+        finishReason: result.finishReason,
+        reasoningChars: result.reasoningContent?.length || 0,
+        actionChars:
+          result.actionableContent?.length ||
+          result.semanticContent?.length ||
+          result.content.length,
+        toolCallCount: result.toolCalls.length,
+        availableToolCount: providerTools.length,
+        reasoningRequest: requestSettings.reasoningRequest,
+        providerSupportsReasoningToggle:
+          adapterCapabilities.reasoningToggle,
+        structuredActionRequired,
+      })
+    ) {
+      reasoningFallbackApplied = true;
+      input.ports.logStoreEvent(
+        "runtime_v2_provider_reasoning_truncated",
+        {
+          turnId: input.command.run.turnId,
+          runId: input.command.run.runId,
+          phase: input.command.phase,
+          mode: String(input.command.payload.mode || ""),
+          finishReason: result.finishReason,
+          reasoningChars: result.reasoningContent?.length || 0,
+            actionChars:
+              result.actionableContent?.length ||
+              result.semanticContent?.length ||
+              result.content.length,
+            truncationKind: (result.reasoningContent?.length || 0) > 0
+              ? "reasoning_without_action"
+              : "visible_prose_without_action",
+            recovery: "provider_reasoning_toggle_off",
+        },
+      );
+      streamedText = "";
+      const recoveryMessages = [
+        ...messages,
+        {
+          role: "system" as const,
+          content: [
+            "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
+            "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
+          ].join(" "),
+        },
+      ];
+      result = await streamChatCompletion(
+        recoveryMessages,
+        {
+          ...requestSettings,
+          reasoningRequest: "off",
+          preserveAssistantReasoning: false,
+        },
+        {
+          onToken: (token) => {
+            lane.markFirstToken();
+            streamedText += token;
+          },
+          onDone: () => undefined,
+          onError: () => undefined,
+          onLifecycle: (event) => {
+            if (event.phase === "first_chunk") lane.markFirstToken();
+          },
+        },
+        input.signal,
+        input.textEnvelope ? [] : providerTools,
+        maxOutputTokens,
+        {
+          ...(effectiveToolChoice ? { toolChoice: effectiveToolChoice } : {}),
+          timeoutMs: input.timeoutMs,
+          contextOwnership: "caller",
+          // Some OpenAI-compatible local adapters acknowledge the reasoning
+          // toggle but still emit hidden reasoning. The first 4k guard catches
+          // that capability drift quickly; a sole schema-bound contract gets
+          // one larger bounded retry so MAIN does not cancel the model just
+          // before it emits the required JSON tool arguments.
+          reasoningOnlyCharLimit: contractOnlyAction
+            ? RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT
+            : reasoningOnlyCharLimit,
+          actionOnlyCharLimit:
+            actionOnlyCharLimit === undefined
+              ? undefined
+              : Math.min(actionOnlyCharLimit, 1_000),
+        },
+      );
+    }
+  } catch (error) {
+    lane.reportFailure(error);
+    throw error;
+  } finally {
+    lane.release();
+  }
   const protocolContent =
     result.actionableContent || result.content || streamedText;
   const visibleText =
@@ -328,7 +529,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     runId: input.command.run.runId,
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
-    executePolicy: String(input.command.payload.executePolicy || ""),
     textEnvelope: input.textEnvelope,
     finishReason: result.finishReason || null,
     rawContentChars: result.content.length,
@@ -342,18 +542,51 @@ export async function requestRuntimeV2ProviderOnce(input: {
     envelopeCloseMarkers:
       protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
     protocolViolation: result.protocolViolation || null,
+    reasoningFallbackApplied,
+  });
+  const providerReasoning = String(result.reasoningContent || "").trim();
+  if (
+    requestSettings.preserveAssistantReasoning === true &&
+    providerReasoning
+  ) {
+    input.live.latestProviderAssistantReasoning = {
+      content: providerReasoning,
+      field: result.reasoningField === "reasoning"
+        ? "reasoning"
+        : "reasoning_content",
+    };
+  }
+  const outputTruncated = runtimeV2ProviderOutputWasTruncated({
+    finishReason: result.finishReason,
+    toolCallCount: result.toolCalls.length,
+    availableToolCount: providerTools.length,
   });
   return normalizeProviderResponseV1({
     visibleText,
     content: protocolContent,
     toolCalls: result.toolCalls,
+    ...(!input.textEnvelope &&
+        contractOnlyAction &&
+        providerTools.length === 1
+      ? { requiredSingleTool: providerTools[0] }
+      : {}),
     usage: result.usage,
-    diagnostics: result.protocolViolation
-      ? [{
+    diagnostics: [
+      ...(result.protocolViolation
+        ? [{
           code: result.protocolViolation,
           message: "Provider tool protocol mismatch",
           retryable: true,
         }]
-      : [],
+        : []),
+      ...(outputTruncated
+        ? [{
+          code: "output_truncated",
+          message:
+            "Provider output reached its token limit before a structured action or complete conclusion.",
+          retryable: true,
+        }]
+        : []),
+    ],
   });
 }

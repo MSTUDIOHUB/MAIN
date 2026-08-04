@@ -451,6 +451,40 @@ test("cold restore exposes an exact Plan review without restoring execution auth
   assert.equal(patch.activeActionRequest?.kind, "plan_review");
 });
 
+test("session persistence drops recursive Store fields and stays size-stable", () => {
+  const state = {
+    ...buildExactPendingReviewSnapshot(),
+    currentWorkspace: workspace,
+    currentSessionId: sessionId,
+  };
+  state.sessionsByWorkspace = {
+    [workspace]: [{
+      id: sessionId,
+      runtimeSnapshot: state,
+    }],
+  };
+  state.runtimeBySessionKey = {
+    [sessionKey]: state,
+  };
+  state.unknownStoreProjection = {
+    previous: state,
+  };
+
+  const sanitized = store.sanitizeSessionRuntimeSnapshotForPersist(state);
+  assert.equal("sessionsByWorkspace" in sanitized, false);
+  assert.equal("runtimeBySessionKey" in sanitized, false);
+  assert.equal("unknownStoreProjection" in sanitized, false);
+  const firstEncoding = JSON.stringify(sanitized);
+  const second = store.sanitizeSessionRuntimeSnapshotForPersist(sanitized);
+  const secondEncoding = JSON.stringify(second);
+  const thirdEncoding = JSON.stringify(
+    store.sanitizeSessionRuntimeSnapshotForPersist(second),
+  );
+  assert.ok(secondEncoding.length <= firstEncoding.length);
+  assert.equal(thirdEncoding.length, secondEncoding.length);
+  assert.deepEqual(JSON.parse(thirdEncoding), JSON.parse(secondEncoding));
+});
+
 test("store round-trips only the exact Session-owned subagent closure receipt ledger", () => {
   const snapshot = buildExactPendingReviewSnapshot();
   const ledger = closureReceiptRuntime.createSubagentClosureReceiptLedger({

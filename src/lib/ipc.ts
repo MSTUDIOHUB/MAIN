@@ -141,11 +141,13 @@ function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): 
   }
 
   const runtimeSnapshot = {
-    ...(incomingRuntime || currentRuntime || {}),
+    ...(currentRuntime || {}),
+    ...(incomingRuntime || {}),
     taskFlow: messages,
     conversationTurns: turns,
   };
   return {
+    ...current,
     ...incoming,
     messages,
     messageCount: messages.length,
@@ -183,6 +185,9 @@ export interface ReadFileWindowResult {
   returnedChars: number;
   truncated: boolean;
   nextStartLine?: number | null;
+  returnedStartChar?: number | null;
+  returnedEndChar?: number | null;
+  nextStartChar?: number | null;
 }
 
 export interface OpenFileExternalResult {
@@ -382,6 +387,24 @@ export interface AstQueryResult {
   symbols: AstSymbol[];
   truncated: boolean;
   note: string;
+}
+
+export interface SourceSyntaxCheckResult {
+  path: string;
+  language: string | null;
+  applicable: boolean;
+  hasErrors: boolean;
+  errorCount: number;
+  firstErrorLine?: number | null;
+  firstErrorColumn?: number | null;
+  errors?: Array<{
+    line: number;
+    column: number;
+    kind: string;
+    symbol?: string;
+  }>;
+  errorsTruncated?: boolean;
+  moduleExports?: string[];
 }
 
 export interface SymbolOccurrence {
@@ -974,6 +997,7 @@ export function readFileWindow(
   endLine?: number,
   maxLines?: number,
   maxChars?: number,
+  startChar?: number,
 ): Promise<ReadFileWindowResult> {
   return invoke<ReadFileWindowResult>("read_file_window", {
     path,
@@ -982,6 +1006,7 @@ export function readFileWindow(
     endLine,
     maxLines,
     maxChars,
+    startChar,
   });
 }
 
@@ -1537,6 +1562,16 @@ export function codeAstQuery(input: {
     kinds: input.kinds,
     maxResults: input.maxResults,
     workspace,
+  });
+}
+
+export function checkSourceSyntax(
+  path: string,
+  content: string,
+): Promise<SourceSyntaxCheckResult> {
+  return invoke<SourceSyntaxCheckResult>("check_source_syntax", {
+    path,
+    content,
   });
 }
 

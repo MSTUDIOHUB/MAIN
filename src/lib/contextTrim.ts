@@ -230,7 +230,7 @@ export function computeContextBudgets(
   outputBudgetOverride?: number,
 ): ContextBudgets {
   const outputBudget = outputBudgetOverride
-    ?? Math.min(8192, Math.max(4096, Math.floor(contextLimit * 0.2)));
+    ?? Math.min(32_768, Math.max(4_096, Math.floor(contextLimit * 0.2)));
   const inputBudget = Math.max(0, contextLimit - outputBudget);
   return {
     contextLimit,
@@ -827,7 +827,7 @@ function compactOneLine(text: string, maxChars = 180): string {
 }
 
 function collectReadFileSignalLines(body: string, maxChars: number): string {
-  const signalRe = /\b(?:export|function|const|let|class|interface|type|return|if|for|while|useEffect|useMemo|rawOrders|filteredOrders|setOrders|load|csv|order|course|revenue|status|theme|dark|chart|echarts|paidAmount|completedTime|localStorage|ConfigProvider)\b/i;
+  const signalRe = /\b(?:import|export|default|function|async|await|const|let|var|class|interface|type|enum|struct|def|fn|func|package|public|private|protected|static|new|return|throw|try|catch|if|else|switch|case|for|while|get|set)\b/i;
   const lines = body.split(/\r?\n/);
   const picked: string[] = [];
   let chars = 0;

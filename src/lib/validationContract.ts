@@ -242,6 +242,7 @@ function splitShellSegments(value: string): SplitShellResult {
   for (let index = 0; index < value.length; index += 1) {
     const char = value[index] || "";
     const next = value[index + 1] || "";
+    const previous = value[index - 1] || "";
     if (escaped) {
       current += char;
       escaped = false;
@@ -268,6 +269,13 @@ function splitShellSegments(value: string): SplitShellResult {
       return { segments, rejectionReason: "unsafe_shell_syntax" };
     }
     if (char === "&") {
+      // File-descriptor redirection (`2>&1`, `>&2`, `&>file`) is not a
+      // background-process operator. Preserve it in the command so a later
+      // pipeline, if present, is rejected for its real exit-status ambiguity.
+      if (previous === ">" || previous === "<" || next === ">") {
+        current += char;
+        continue;
+      }
       if (next !== "&") {
         return { segments, rejectionReason: "background_process" };
       }
@@ -366,7 +374,7 @@ function classifyFiniteSegment(
   if (/\b(?:node\s+--test|npx\s+playwright\s+test|npx\s+cypress\s+run|npx\s+vitest(?:\s+run|[^\n;&|]*\s--run(?:\s|$))|npx\s+jest\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|cargo\s+test\b|go\s+test\b|swift\s+test\b|dotnet\s+test\b|(?:\.\/)?mvnw?\s+(?:test|verify)\b|(?:\.\/)?gradlew?\s+(?:test|check)\b|xcodebuild\b[^\n;&|]*\btest\b|bundle\s+exec\s+rspec\b|rspec\b|phpunit\b|composer\s+(?:run-script\s+)?test\b|make\s+(?:test|check)\b|ctest\b)/i.test(command)) {
     return { capability: "test", inlineMissingAssertion: false };
   }
-  if (/\b(?:cargo\s+build\b|go\s+build\b|swift\s+build\b|dotnet\s+build\b|(?:\.\/)?mvnw?\s+(?:package|compile)\b|(?:\.\/)?gradlew?\s+build\b|xcodebuild\b[^\n;&|]*\bbuild\b|cmake\s+--build\b|make\s+build\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?tauri\s+build\b|(?:cargo\s+)?tauri\s+build\b)/i.test(command)) {
+  if (/\b(?:cargo\s+build\b|go\s+build\b|swift\s+build\b|dotnet\s+build\b|(?:\.\/)?mvnw?\s+(?:package|compile)\b|(?:\.\/)?gradlew?\s+build\b|xcodebuild\b[^\n;&|]*\bbuild\b|cmake\s+--build\b|make\s+build\b|(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|yarn\s+dlx)\s+)?vite\s+build\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?tauri\s+build\b|(?:cargo\s+)?tauri\s+build\b)/i.test(command)) {
     return { capability: "build", inlineMissingAssertion: false };
   }
   if (/\b(?:cargo\s+clippy\b|eslint\b|biome\s+(?:lint|check)\b|ruff\s+check\b|make\s+lint\b)/i.test(command)) {

@@ -4,15 +4,24 @@ import {
   type RuntimeV2EvidenceReference,
   type RuntimeV2EventDraft,
   type RuntimeV2ToolPresentation,
+  type RuntimeV2ExecutionValidationAuthority,
+  deriveRuntimeV2ValidationBoundary,
 } from "../../lib/runtime-v2";
+import { parseBrowserInteractionEvidence } from "../../lib/planEvidence";
+import {
+  evaluateValidationSpec,
+  type ValidationEvidence,
+  type ValidationPrimitiveSpec,
+} from "../../lib/validationContract";
 import type { ToolDiffPreview } from "../../lib/toolDiff";
 import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
-import { RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { authorizationFor } from "./executionAuthorization";
-import { recordModelContext } from "./executionProviderContext";
+import { aggregateForCurrentTurn } from "./executionAggregate";
+import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
 import type {
   RuntimeV2ExecutionPortsInput,
   RuntimeV2LiveExecutionState,
@@ -35,7 +44,7 @@ export function nextEvidenceId(live: RuntimeV2LiveExecutionState): string {
   return `E${live.evidenceCounter}`;
 }
 
-export function recordToolModelContext(input: {
+export function recordToolResultHistory(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly toolName: string;
@@ -43,14 +52,12 @@ export function recordToolModelContext(input: {
   readonly status: "succeeded" | "failed" | "blocked";
   readonly content: string;
 }): void {
-  recordModelContext(input.ports.live, {
-    id: `tool-result:${String(input.command.payload.toolCallId || input.ports.nextId("tool-context"))}`,
-    source: "tool",
-    label: input.toolName || "unknown_tool",
-    target: input.target || input.toolName || "workspace",
-    status: input.status,
-    content: input.content,
-  });
+  const toolCallId = String(input.command.payload.toolCallId || "");
+  appendRuntimeV2ToolResultHistory(
+    input.ports.live,
+    toolCallId,
+    input.content,
+  );
 }
 
 export function toolDefinitionExists(
@@ -68,6 +75,7 @@ function toolResultEvent(
   evidence: RuntimeV2EvidenceReference[],
   failureKind?: RuntimeV2ToolFailureKind,
   presentation?: RuntimeV2ToolPresentation,
+  failureReasonCode?: string,
 ): RuntimeV2EventDraft {
   return {
     type: "tool.completed",
@@ -77,10 +85,12 @@ function toolResultEvent(
     evidence,
     ...(presentation ? { presentation } : {}),
     ...(status !== "succeeded" && failureKind ? { failureKind } : {}),
+    ...(status !== "succeeded" && failureReasonCode ? { failureReasonCode } : {}),
   };
 }
 
 function validationResultEvent(
+  input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
   passed: boolean,
   evidence: Array<{
@@ -92,12 +102,22 @@ function validationResultEvent(
   failureKind?: RuntimeV2ValidationFailureKind,
   presentation?: RuntimeV2ToolPresentation,
 ): RuntimeV2EventDraft {
+  const authority = command.payload.validationAuthority
+    ? command.payload.validationAuthority as unknown as
+      RuntimeV2ExecutionValidationAuthority
+    : null;
+  const aggregate = authority ? aggregateForCurrentTurn(input) : null;
+  const validationBoundary = authority && aggregate
+    ? deriveRuntimeV2ValidationBoundary(aggregate, authority.targetPaths)
+    : null;
   return {
     type: "validation.completed",
     run: command.run,
     idempotencyKey: command.idempotencyKey,
     passed,
     evidence,
+    ...(authority ? { authority } : {}),
+    ...(validationBoundary || {}),
     ...(presentation ? { presentation } : {}),
     ...(!passed && failureKind ? { failureKind } : {}),
   };
@@ -121,9 +141,16 @@ export function parseResultRecord(value: unknown): Record<string, unknown> | nul
 /** Decode structured command results before retaining them as model context.
  * Keeping JSON-escaped stdout/stderr as one line prevents the recovery layer
  * from seeing compiler and test `path:line` diagnostics. */
-export function modelContextContentForToolOutput(output: unknown): string {
+export function toolResultContentForModel(output: unknown): string {
   const result = parseResultRecord(output);
-  if (!result) return typeof output === "string" ? output : String(output ?? "");
+  if (!result) {
+    const text = typeof output === "string"
+      ? output
+      : String(output ?? "");
+    return text.length > 0
+      ? text
+      : "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.";
+  }
   const exitCode = typeof result.exitCode === "number"
     ? result.exitCode
     : typeof result.exit_code === "number"
@@ -153,15 +180,119 @@ export function modelContextContentForToolOutput(output: unknown): string {
   return content.length > 0
     ? content.join("\n")
     : typeof output === "string"
-      ? output
-      : JSON.stringify(output);
+      ? output ||
+        "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches."
+      : JSON.stringify(output) ||
+        "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.";
 }
 
-function isValidationPassed(toolName: string, output: unknown): boolean {
+export function isRuntimeV2ValidationPassed(
+  toolName: string,
+  output: unknown,
+  primitive?: ValidationPrimitiveSpec,
+): boolean {
   const result = parseResultRecord(output);
   if (!result) return false;
   if (result.timedOut === true || result.timeout === true || result.error) {
     return false;
+  }
+  if (primitive?.kind === "finite_command") {
+    const exitCode =
+      typeof result.exitCode === "number"
+        ? result.exitCode
+        : typeof result.exit_code === "number"
+          ? result.exit_code
+          : typeof result.exitCodeAfter === "number"
+            ? result.exitCodeAfter
+            : null;
+    const evidence: ValidationEvidence = {
+      kind: "finite_command_result",
+      command: primitive.command,
+      ...(primitive.cwd ? { cwd: primitive.cwd } : {}),
+      completed: exitCode !== null,
+      exitCode,
+      ...(result.timedOut === true || result.timeout === true
+        ? { timedOut: true }
+        : {}),
+    };
+    return evaluateValidationSpec(primitive, [evidence])
+      .acceptanceSatisfied;
+  }
+  if (
+    primitive?.kind === "browser_interaction" ||
+    primitive?.kind === "desktop_interaction"
+  ) {
+    const raw = typeof output === "string"
+      ? output
+      : JSON.stringify(output);
+    const interaction = parseBrowserInteractionEvidence(raw);
+    if (!interaction) return false;
+    const evidence: ValidationEvidence = {
+      kind: primitive.kind === "browser_interaction"
+        ? "browser_interaction_result"
+        : "desktop_interaction_result",
+      actions: interaction.actions.map((action) => ({
+        ...(action.id ? { id: action.id } : {}),
+        kind: action.kind,
+        target: action.target,
+        succeeded: action.succeeded,
+      })),
+      assertions: interaction.assertions.map((assertion) => ({
+        kind: assertion.kind,
+        target: assertion.target,
+        passed: assertion.passed,
+        ...(assertion.afterActionId
+          ? { afterActionId: assertion.afterActionId }
+          : {}),
+        ...(typeof assertion.beforePassed === "boolean"
+          ? { beforePassed: assertion.beforePassed }
+          : {}),
+        ...(typeof assertion.changedAfterAction === "boolean"
+          ? { changedAfterAction: assertion.changedAfterAction }
+          : {}),
+        ...(typeof assertion.causallyLinked === "boolean"
+          ? { causallyLinked: assertion.causallyLinked }
+          : {}),
+        ...(assertion.actual !== undefined
+          ? { actual: assertion.actual }
+          : {}),
+      })),
+      ...(interaction.pageErrors.length > 0
+        ? { pageErrors: interaction.pageErrors }
+        : {}),
+      ...(interaction.consoleErrors.length > 0
+        ? { consoleErrors: interaction.consoleErrors }
+        : {}),
+    };
+    return evaluateValidationSpec(primitive, [evidence])
+      .acceptanceSatisfied;
+  }
+  if (
+    toolName === "browser_evaluate" ||
+    toolName === "computer_use"
+  ) {
+    const raw = typeof output === "string"
+      ? output
+      : JSON.stringify(output);
+    const interaction = parseBrowserInteractionEvidence(raw);
+    if (
+      !interaction ||
+      interaction.assertions.length === 0 ||
+      interaction.assertions.some((assertion) => !assertion.passed) ||
+      interaction.actions.some((action) => !action.succeeded) ||
+      interaction.pageErrors.length > 0 ||
+      interaction.consoleErrors.length > 0
+    ) {
+      return false;
+    }
+    return interaction.actions.length === 0 ||
+      interaction.assertions.some((assertion) =>
+        assertion.causallyLinked === true ||
+        (
+          assertion.changedAfterAction === true &&
+          assertion.beforePassed === false
+        )
+      );
   }
   if (typeof result.exitCode === "number") return result.exitCode === 0;
   if (typeof result.exit_code === "number") return result.exit_code === 0;
@@ -177,8 +308,35 @@ function isValidationPassed(toolName: string, output: unknown): boolean {
   return false;
 }
 
-function validationEvidenceVersion(output: unknown): string {
-  const stableDiagnostic = modelContextContentForToolOutput(output)
+export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
+  const result = parseResultRecord(output);
+  const exitCode = result && (
+      typeof result.exitCode === "number" ||
+      typeof result.exit_code === "number" ||
+      typeof result.exitCodeAfter === "number"
+    )
+    ? Number(result.exitCode ?? result.exit_code ?? result.exitCodeAfter)
+    : null;
+  const failed = Boolean(
+    result && (
+      result.error ||
+      result.timedOut === true ||
+      result.timeout === true ||
+      result.success === false ||
+      result.passed === false ||
+      (exitCode !== null && exitCode !== 0)
+    ),
+  );
+  const failureDiagnostic = failed && result
+    ? ["error", "message", "stderr"]
+        .map((field) => typeof result[field] === "string"
+          ? String(result[field]).trim()
+          : "")
+        .filter(Boolean)
+        .join("\n")
+    : "";
+  const stableDiagnostic = (failureDiagnostic ||
+    toolResultContentForModel(output))
     .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/:\d+(?::\d+)?\b/g, ":<line>")
     .replace(/\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?)\b/gi, "<duration>")
@@ -187,11 +345,14 @@ function validationEvidenceVersion(output: unknown): string {
     .filter(Boolean)
     .slice(0, 24)
     .join("\n");
-  return runtimeV2EvidenceVersion(stableDiagnostic || output);
+  return runtimeV2EvidenceVersion([
+    exitCode === null ? "" : `exitCode:${exitCode}`,
+    stableDiagnostic,
+  ].filter(Boolean).join("\n") || output);
 }
 
 function boundedPresentationText(value: unknown, max: number): string {
-  const text = modelContextContentForToolOutput(value)
+  const text = toolResultContentForModel(value)
     .replace(/\u001b\[[0-9;]*m/g, "")
     .trim();
   if (!text) return "";
@@ -304,6 +465,7 @@ export function toolCompletionFor(
   failureKind?: RuntimeV2CompletionFailureKind,
   sourceVersion?: string,
   diffPreview?: ToolDiffPreview,
+  failureReasonCode?: string,
 ): RuntimeV2EventDraft {
   const presentation = toolPresentation({
     toolName,
@@ -317,7 +479,7 @@ export function toolCompletionFor(
       : [target || toolName];
     const evidenceKind = isWorkspaceMutationToolName(toolName)
       ? "mutation" as const
-      : RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(toolName)
+      : RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)
         ? "source" as const
         : "tool" as const;
     return toolResultEvent(
@@ -330,17 +492,20 @@ export function toolCompletionFor(
             target: resolvedTarget,
             version: evidenceKind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
-              : null,
+              : evidenceKind === "tool"
+                ? runtimeV2ValidationEvidenceVersion(output)
+                : null,
           }))
         : [],
       failureKind === "assertion_failed"
         ? "protocol_invalid"
         : failureKind,
       presentation,
+      failureReasonCode,
     );
   }
   const passed = status === "succeeded" &&
-    isValidationPassed(toolName, output);
+    isRuntimeV2ValidationPassed(toolName, output, undefined);
   const validationFailureKind =
     failureKind === "source_mismatch" ||
       failureKind === "target_invalid" ||
@@ -348,13 +513,14 @@ export function toolCompletionFor(
       ? "protocol_invalid"
       : failureKind;
   return validationResultEvent(
+    input,
     command,
     passed,
     [{
       id: nextEvidenceId(input.live),
       kind: "validation",
       target: target || toolName,
-      version: passed ? null : validationEvidenceVersion(output),
+      version: runtimeV2ValidationEvidenceVersion(output),
     }],
     passed
       ? undefined
@@ -369,7 +535,7 @@ export function toolCompletionFor(
 /** Preserve semantic failure in the provider context even when the underlying
  * tool transport itself completed successfully. A finite validator with a
  * non-zero exit code is failed evidence, not a successful tool observation. */
-export function modelContextStatusForCompletion(
+export function toolResultStatusForCompletion(
   completion: RuntimeV2EventDraft,
 ): "succeeded" | "failed" | "blocked" {
   if (completion.type === "validation.completed") {

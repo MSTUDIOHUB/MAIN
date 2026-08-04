@@ -186,7 +186,7 @@ test("child mutation restrictions do not disable delegation", () => {
   );
 });
 
-test("preferred subagent collaboration becomes an explicit runtime intake contract", () => {
+test("enabled subagent collaboration remains model-directed at every stage", () => {
   const block = buildTurnIntakeContextBlock({
     rawUserInput: "修复启动白屏，可以开启多个subagent协同工作",
     signals: {},
@@ -195,11 +195,18 @@ test("preferred subagent collaboration becomes an explicit runtime intake contra
   });
 
   assert.match(block, /subagentPreference: preferred/);
-  assert.match(block, /先为一个具有独立成功标准和并行价值的窄语义任务创建一个/);
-  assert.match(block, /一次启动边界，不是数量配额/);
-  assert.match(block, /绝不能仅按目录拆分/);
-  assert.match(block, /不得复用已终止实例/);
-  assert.match(block, /由主体负责最终验证与完成/);
+  assert.match(block, /读取、修改或验证任一阶段/);
+  assert.match(block, /根据实际工作量自行判断/);
+  assert.match(block, /绝不强制/);
+  assert.match(block, /不是写入或完成的前置条件/);
+  assert.match(block, /父线程已形成证据化方案/);
+  assert.match(block, /只接收父线程整理的上下文胶囊/);
+  assert.match(block, /不会继承父线程隐藏推理或完整对话/);
+  assert.match(block, /每个精确且互不重叠的文件目标/);
+  assert.match(block, /不能只授权目录/);
+  assert.match(block, /汇合时重新校验并提交/);
+  assert.match(block, /父线程继续推进不依赖子结果的工作/);
+  assert.match(block, /不得只按目录拆分或复用已终止实例/);
 });
 
 test("session collaboration switch stays preferred unless user explicitly forbids delegation", () => {

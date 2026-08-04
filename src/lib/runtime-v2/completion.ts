@@ -9,6 +9,7 @@ export interface RuntimeV2CompletionFacts {
   readonly canceled: boolean;
   readonly mutationCount: number;
   readonly passedValidationCount: number;
+  readonly hasAcceptanceValidation: boolean;
   readonly failedValidationCount: number;
   readonly stalledValidationCount: number;
   readonly hasProviderConclusion: boolean;
@@ -19,12 +20,43 @@ export interface RuntimeV2CompletionDecision {
   readonly resultReason: string;
 }
 
-/** Three identical normalized validator receipts mean corrective work has
- * stopped changing the observable failure. A separate epoch-wide ceiling
- * keeps genuinely changing diagnostics bounded without treating progress as
- * stagnation. The Run lifecycle deadline remains the outer wall-clock bound. */
-export const RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES = 3;
-export const RUNTIME_V2_MAX_TOTAL_FAILED_VALIDATION_CYCLES = 8;
+/**
+ * A tool-free response is the provider's voluntary loop-completion signal in
+ * every Execute decision mode. Protocol diagnostics are deliberately excluded:
+ * the adapter may rewrite a rejected duplicate into an empty response, but
+ * that feedback receipt is not a provider-authored conclusion.
+ */
+export function latestRuntimeV2ProviderConclusionText(
+  aggregate: TurnAggregateV1,
+): string {
+  const scheduledModes = new Map<string, string>();
+  for (const event of aggregate.events) {
+    if (
+      event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+    ) {
+      scheduledModes.set(
+        event.command.idempotencyKey,
+        String(event.command.payload.mode || "").trim(),
+      );
+    }
+  }
+  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
+    const event = aggregate.events[index]!;
+    if (event.type !== "provider.responded") continue;
+    const mode = scheduledModes.get(event.idempotencyKey) || "";
+    if (
+      !["execute", "validate", "conclude"].includes(mode) ||
+      event.result.toolCalls.length > 0 ||
+      event.result.diagnostics.length > 0
+    ) {
+      continue;
+    }
+    const text = String(event.result.visibleText || "").trim();
+    if (text) return text.slice(0, 24_000);
+  }
+  return "";
+}
 
 export function exhaustedRuntimeV2ResultKind(
   aggregate: TurnAggregateV1,
@@ -44,10 +76,10 @@ export function exhaustedRuntimeV2ResultKind(
 
 /**
  * Determine only outcomes that the runtime can prove from structured facts.
- * In particular, an investigation summary without a tool call is not a
- * partial conclusion: local models often emit it immediately before their
- * first useful action, and the bounded command policy should get its chance
- * to recover the protocol first.
+ * A provider response without a tool call is the ordinary agent-loop finish
+ * signal. The Runtime never upgrades its prose into success: structured
+ * mutation and validation facts still decide whether that finish is success,
+ * partial, or error.
  */
 export function decideRuntimeV2TerminalOutcome(
   aggregate: TurnAggregateV1,
@@ -65,44 +97,71 @@ export function decideRuntimeV2TerminalOutcome(
       resultReason: aggregate.recovery.exhausted.reason,
     };
   }
-  if (
-    facts.mutationCount > 0 &&
-    facts.passedValidationCount === 0 &&
-    (
-      facts.stalledValidationCount >=
-        RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES ||
-      facts.failedValidationCount >=
-        RUNTIME_V2_MAX_TOTAL_FAILED_VALIDATION_CYCLES
-    )
-  ) {
-    return {
-      resultKind: "partial",
-      resultReason:
-        facts.stalledValidationCount >=
-            RUNTIME_V2_MAX_STALLED_VALIDATION_CYCLES
-          ? "已完成有限修改，但连续三次验收仍返回同一项标准化失败；运行时已保留修改、失败证据和具体文件，并结束本轮以避免无进展循环。"
-          : "已完成有限修改，但本轮已达到变化中失败证据的全局安全上限；运行时已保留修改、验证轨迹和具体文件，并结束本轮以避免无限循环。",
-    };
+  if (aggregate.strategy === "execute") {
+    const hasVerifiedEffect =
+      facts.mutationCount > 0 &&
+      facts.hasAcceptanceValidation &&
+      facts.failedValidationCount === 0;
+    if (!facts.hasProviderConclusion) return null;
+    if (hasVerifiedEffect) {
+      return {
+        resultKind: "success",
+        resultReason:
+          "最新工作区效果已由后续有限验证确认，并已生成基于实际证据的完成报告。",
+      };
+    }
+    return facts.mutationCount > 0
+      ? {
+          resultKind: "partial",
+          resultReason:
+            "模型已结束本轮，但最新修改尚未获得与用户目标匹配的完整验收证据。",
+        }
+      : {
+          resultKind: "error",
+          resultReason:
+            "模型已结束本轮，但没有形成可验收的实际修改。",
+        };
   }
   const approvedPlanCoverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
-  if (
-    approvedPlanCoverage &&
-    (
+  if (approvedPlanCoverage) {
+    if (
       !approvedPlanCoverage.allMutationTargetsCovered ||
       !approvedPlanCoverage.allRequiredValidationsPassed
-    )
-  ) {
-    return null;
-  }
-  if (
-    facts.mutationCount > 0 &&
-    facts.passedValidationCount > 0 &&
-    facts.hasProviderConclusion
-  ) {
-    return {
-      resultKind: "success",
-      resultReason: "已完成修改，并通过结构化验证结果确认。",
-    };
+    ) {
+      if (!facts.hasProviderConclusion) return null;
+      const missingTargets =
+        approvedPlanCoverage.missingMutationTargets;
+      const missingValidationIds =
+        approvedPlanCoverage.missingRequiredValidationIndexes.map(
+          (index) => `work-plan-validation-${index + 1}`,
+        );
+      const detail = [
+        missingTargets.length > 0
+          ? `未覆盖修改目标：${missingTargets.join("、")}。`
+          : "",
+        missingValidationIds.length > 0
+          ? `未通过必需验证：${missingValidationIds.join("、")}。`
+          : "",
+      ].filter(Boolean).join(" ");
+      return facts.mutationCount > 0
+        ? {
+            resultKind: "partial",
+            resultReason:
+              `模型已结束本轮；已保留实际修改，但已批准 WorkPlan 尚未完整闭环。${detail}`,
+          }
+        : {
+            resultKind: "error",
+            resultReason:
+              `模型已结束本轮，但已批准 WorkPlan 没有形成可验收的实际修改。${detail}`,
+          };
+    }
+    return facts.hasProviderConclusion
+      ? {
+          resultKind: "success",
+          resultReason:
+            "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
+        }
+      : null;
   }
   return null;
 }

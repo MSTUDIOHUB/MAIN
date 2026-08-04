@@ -9,7 +9,7 @@ export interface RuntimeV2PlanRunnerInput {
   readonly context: RuntimeV2SubmissionContext;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: any) => unknown;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;

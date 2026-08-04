@@ -75,6 +75,14 @@ test("workspace read policy excludes every effect-capable tool", () => {
   ]) {
     assert.equal(readPolicy.isRuntimeV2WorkspaceReadToolName(toolName), false);
   }
+  for (const toolName of [
+    "read_file",
+    "read_document",
+    "analyze_tabular_document",
+    "query_tabular_document",
+  ]) {
+    assert.equal(readPolicy.isRuntimeV2ReadOnlyToolName(toolName), true);
+  }
 });
 
 test("production workspace read runner uses analyze, reads evidence, and concludes once", async () => {
@@ -109,16 +117,13 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
     createRuntimeV2LiveExecutionState() {
       return {
         messages: [],
-        modelContext: [],
         childRuns: new Map(),
         childAbortControllers: new Map(),
         childTelemetry: new Map(),
-        workspaceOverview: "",
         subagentCandidates: [],
         evidenceCounter: 0,
         latestProviderResult: null,
         latestVisibleText: "",
-        lastProviderTransport: null,
         providerLaneProfile: null,
         authorization: null,
       };
@@ -235,11 +240,14 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
       abortCtrl: new AbortController(),
       timerInterval,
       harnessRunId: "run-read",
-      turnInputContextSignals: { subagentPreference: "forbidden" },
+      turnInputContextSignals: {
+        attachedFilePaths: [],
+        subagentPreference: "forbidden",
+      },
     },
     getSessionRevisionToken: () => 1,
     sanitizeTaskBlocksForPersist: (blocks) => blocks,
-    normalizeSessionRuntimeSnapshot: (snapshot) => snapshot,
+    buildSessionRuntimeSnapshot: (state) => state,
     publishOwnerScopedRuntimeProjection: () => ({
       published: true,
       disposition: "published",

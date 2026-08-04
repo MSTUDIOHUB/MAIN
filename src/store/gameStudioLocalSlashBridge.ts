@@ -50,7 +50,7 @@ export interface GameStudioLocalSlashBridgeInput {
   runSessionKey: string;
   titleIntentSignature: string | null;
   sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
-  normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
   /**
    * Production durability barrier for a completed local-fast conclusion. The
    * callback persists the exact owner projection (including FIFO retirement)
@@ -276,7 +276,7 @@ export function createGameStudioLocalSlashBridge(
       messages: input.sanitizeTaskBlocksForPersist(latest.taskFlow),
       storageStatus: latest.config.sessionRecordingEnabled ? "ok" : "temporary",
       recordingDisabled: !latest.config.sessionRecordingEnabled,
-      runtimeSnapshot: input.normalizeSessionRuntimeSnapshot(
+      runtimeSnapshot: input.buildSessionRuntimeSnapshot(
         buildLocalSlashRuntimeSnapshot(latest),
       ),
     });

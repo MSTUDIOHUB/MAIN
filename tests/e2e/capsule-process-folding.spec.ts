@@ -64,7 +64,7 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(progressPopover).toContainText("当前活动");
   await expect(progressPopover).toContainText("最近里程碑");
   await expect(page.getByTestId("run-status-current-activity")).toContainText("ChatArea.tsx");
-  await expect(page.getByTestId("run-status-milestone")).toHaveCount(2);
+  await expect(page.getByTestId("run-status-milestone")).toHaveCount(3);
   await expect(progressPopover).toContainText("ChatArea.tsx");
   await expect(progressPopover).toContainText("npm run test:workflow-assets");
 
@@ -127,13 +127,24 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await processDisclosure.click();
   await expect(timeline).toBeVisible();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
-  await expect(page.getByTestId("tool-status-label")).toHaveCount(0);
+  await expect(timeline.getByTestId("tool-status-label")).toHaveCount(1);
   await expect(page.getByTestId("tool-collapsed-summary")).toHaveCount(0);
   await expect(page.getByTestId("chat-operation-summary")).toHaveCount(0);
   await expect(page.getByTestId("completed-tool-group-summary")).toHaveCount(0);
 
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
   await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
+  const activeScopeStep = page.getByTestId("live-turn-step").filter({
+    hasText: "范围归纳",
+  });
+  await expect(activeScopeStep.getByTestId("turn-archive-step-toggle")).toBeVisible();
+  await expect(activeScopeStep.getByTestId("turn-archive-step-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+  await expect(activeScopeStep.getByTestId("turn-archive-step-details")).toContainText(
+    "src/main.js",
+  );
 
   await page.reload();
   await expect(page.locator('[data-testid="chat-scroll-container"]')).not.toContainText("阶段结论：");

@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import ts from "typescript";
 
 export const REAL_OMLX_WORKSPACE_PROXY_LIMITS = Object.freeze({
   maxWorkspaceFiles: 4_000,
@@ -20,6 +21,198 @@ export const REAL_OMLX_WORKSPACE_PROXY_LIMITS = Object.freeze({
   maxDebugEntries: 500,
   maxDebugMessageChars: 8_000,
 });
+
+export interface RealOmlxSourceSyntaxCheckResult {
+  readonly path: string;
+  readonly language: string | null;
+  readonly applicable: boolean;
+  readonly hasErrors: boolean;
+  readonly errorCount: number;
+  readonly firstErrorLine: number | null;
+  readonly firstErrorColumn: number | null;
+  readonly errors: ReadonlyArray<{
+    readonly line: number;
+    readonly column: number;
+    readonly kind: string;
+    readonly symbol?: string;
+  }>;
+  readonly errorsTruncated: boolean;
+  readonly moduleExports: readonly string[];
+}
+
+function collectBindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
+  if (ts.isIdentifier(name)) return [name];
+  return name.elements.flatMap((element) =>
+    ts.isOmittedExpression(element)
+      ? []
+      : collectBindingIdentifiers(element.name)
+  );
+}
+
+function exportedNames(
+  statement: ts.Statement,
+  source: ts.SourceFile,
+): Array<{ name: string; position: number }> {
+  if (ts.isExportAssignment(statement)) {
+    return [{ name: "default", position: statement.getStart(source) }];
+  }
+  if (ts.isExportDeclaration(statement)) {
+    if (!statement.exportClause) return [];
+    if (ts.isNamespaceExport(statement.exportClause)) {
+      return [{
+        name: statement.exportClause.name.text,
+        position: statement.exportClause.name.getStart(source),
+      }];
+    }
+    return statement.exportClause.elements.map((element) => ({
+      name: element.name.text,
+      position: element.name.getStart(source),
+    }));
+  }
+
+  const modifiers = ts.canHaveModifiers(statement)
+    ? ts.getModifiers(statement) || []
+    : [];
+  if (!modifiers.some((modifier) =>
+    modifier.kind === ts.SyntaxKind.ExportKeyword
+  )) {
+    return [];
+  }
+  const defaultModifier = modifiers.find((modifier) =>
+    modifier.kind === ts.SyntaxKind.DefaultKeyword
+  );
+  if (defaultModifier) {
+    return [{
+      name: "default",
+      position: defaultModifier.getStart(source),
+    }];
+  }
+  if (ts.isVariableStatement(statement)) {
+    return statement.declarationList.declarations.flatMap((declaration) =>
+      collectBindingIdentifiers(declaration.name).map((identifier) => ({
+        name: identifier.text,
+        position: identifier.getStart(source),
+      }))
+    );
+  }
+  if (
+    ts.isFunctionDeclaration(statement) ||
+    ts.isClassDeclaration(statement) ||
+    ts.isInterfaceDeclaration(statement) ||
+    ts.isTypeAliasDeclaration(statement) ||
+    ts.isEnumDeclaration(statement) ||
+    ts.isModuleDeclaration(statement)
+  ) {
+    return statement.name
+      ? [{
+          name: statement.name.text,
+          position: statement.name.getStart(source),
+        }]
+      : [];
+  }
+  return [];
+}
+
+export function checkRealOmlxSourceSyntax(
+  rawPath: string,
+  content: string,
+): RealOmlxSourceSyntaxCheckResult {
+  const extension = path.extname(String(rawPath || "")).toLowerCase();
+  const scriptKinds: Record<string, ts.ScriptKind> = {
+    ".js": ts.ScriptKind.JS,
+    ".jsx": ts.ScriptKind.JSX,
+    ".mjs": ts.ScriptKind.JS,
+    ".cjs": ts.ScriptKind.JS,
+    ".ts": ts.ScriptKind.TS,
+    ".tsx": ts.ScriptKind.TSX,
+  };
+  const scriptKind = scriptKinds[extension];
+  if (scriptKind === undefined) {
+    return {
+      path: rawPath,
+      language: null,
+      applicable: false,
+      hasErrors: false,
+      errorCount: 0,
+      firstErrorLine: null,
+      firstErrorColumn: null,
+      errors: [],
+      errorsTruncated: false,
+      moduleExports: [],
+    };
+  }
+
+  const source = ts.createSourceFile(
+    rawPath,
+    String(content || ""),
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
+  const diagnostics = (
+    (source as ts.SourceFile & {
+      parseDiagnostics?: readonly ts.DiagnosticWithLocation[];
+    }).parseDiagnostics || []
+  )
+    .filter((diagnostic) =>
+      diagnostic.category === ts.DiagnosticCategory.Error &&
+      diagnostic.start !== undefined
+    )
+    .map((diagnostic) => ({
+      position: Number(diagnostic.start),
+      kind: `typescript_${diagnostic.code}`,
+      symbol: undefined as string | undefined,
+    }));
+  const seenExports = new Set<string>();
+  for (const statement of source.statements) {
+    for (const exported of exportedNames(statement, source)) {
+      if (seenExports.has(exported.name)) {
+        diagnostics.push({
+          position: exported.position,
+          kind: "duplicate_export",
+          symbol: exported.name,
+        });
+      } else {
+        seenExports.add(exported.name);
+      }
+    }
+  }
+  diagnostics.sort((left, right) =>
+    left.position - right.position ||
+    left.kind.localeCompare(right.kind)
+  );
+  const uniqueDiagnostics = diagnostics.filter(
+    (diagnostic, index, all) =>
+      index === 0 ||
+      diagnostic.position !== all[index - 1]?.position,
+  );
+  const first = uniqueDiagnostics[0]?.position;
+  const location = first === undefined
+    ? null
+    : source.getLineAndCharacterOfPosition(first);
+  return {
+    path: rawPath,
+    language: extension.slice(1),
+    applicable: true,
+    hasErrors: uniqueDiagnostics.length > 0,
+    errorCount: uniqueDiagnostics.length,
+    firstErrorLine: location ? location.line + 1 : null,
+    firstErrorColumn: location ? location.character + 1 : null,
+    errors: uniqueDiagnostics.slice(0, 32).map((diagnostic) => {
+      const position = source.getLineAndCharacterOfPosition(
+        diagnostic.position,
+      );
+      return {
+        line: position.line + 1,
+        column: position.character + 1,
+        kind: diagnostic.kind,
+        ...(diagnostic.symbol ? { symbol: diagnostic.symbol } : {}),
+      };
+    }),
+    errorsTruncated: uniqueDiagnostics.length > 32,
+    moduleExports: [...seenExports],
+  };
+}
 
 const IGNORED_DIRECTORY_NAMES = new Set([
   ".git",
@@ -897,7 +1090,16 @@ export async function readRealOmlxWorkspaceFileWindow(
     totalChars,
     returnedChars: selectedChars,
     truncated,
-    nextStartLine: truncated && returnedEndLine > 0 ? returnedEndLine + 1 : null,
+    nextStartLine:
+      (
+          scanTruncated ||
+          moreRequestedLines ||
+          moreScannedLines ||
+          lineTruncated
+        ) &&
+        returnedEndLine > 0
+        ? returnedEndLine + 1
+        : null,
     scanTruncated,
     scannedBytes: bytesToScan,
     sizeBytes: metadata.size,

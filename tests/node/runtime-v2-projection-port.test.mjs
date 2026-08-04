@@ -96,7 +96,7 @@ function aggregate(overrides = {}) {
     completedCommands: [],
     pendingToolCalls: [],
     subagents: [],
-    recovery: { epoch: 0, receipts: [], exhausted: null },
+    recovery: { receipts: [], exhausted: null },
     terminalOutcome: null,
     finalProjectionId: null,
     nextSequence: 0,
@@ -241,7 +241,11 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
 test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async () => {
   const harness = createHarness();
   const edit = command();
-  const liveText = "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+  const providerCommentary =
+    "Now I have a clear picture of all three issues. Let me check the remaining files.";
+  const structuredText =
+    "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+  const liveText = `${providerCommentary}\n\n${structuredText}`;
 
   await harness.port.publish({
     aggregate: aggregate({ scheduledCommands: [edit] }),
@@ -258,7 +262,16 @@ test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async ()
   );
   assert.equal(progressEvents.length, 1);
   assert.equal(progressEvents[0].progress.title, "正在编辑 editor.js");
-  assert.equal(progressEvents[0].progress.summary, liveText);
+  assert.equal(progressEvents[0].progress.summary, structuredText);
+  assert.doesNotMatch(
+    progressEvents[0].progress.summary,
+    /Now I have a clear picture/,
+  );
+  assert.equal(
+    progressEvents[0].progress.action,
+    liveText,
+    "Capsule may retain public provider commentary, but Run Status must use the structured action explanation",
+  );
   assert.notEqual(
     progressEvents[0].progress.title,
     progressEvents[0].progress.summary,
@@ -474,6 +487,68 @@ test("V2 provider commentary remains a durable assistant update rather than time
   );
 });
 
+test("an identical milestone never suppresses the terminal Turn projection", async () => {
+  const harness = createHarness();
+  const markdown = "### 已完成\n\n修改和验证均已完成。";
+  await harness.port.publish({
+    aggregate: aggregate(),
+    audience: "chat_milestone",
+    projection: projection(
+      "milestone",
+      markdown,
+      "turn-a:provider-commentary:final-preview",
+    ),
+  });
+
+  const terminalOutcome = {
+    resultKind: "success",
+    reason: "acceptance_covered",
+    completedAt: 2,
+    finalProjectionId: "final-success",
+  };
+  await harness.port.publish({
+    aggregate: aggregate({
+      phase: "completed",
+      run: {
+        identity: runIdentity,
+        status: "completed",
+        phase: "completed",
+        terminalOutcome,
+      },
+      terminalOutcome,
+      finalProjectionId: "final-success",
+    }),
+    audience: "final",
+    projection: {
+      id: "final-success",
+      audience: "final",
+      markdown,
+      kind: "final",
+      dedupeKey: "turn-a:final",
+    },
+  });
+
+  const state = harness.getState();
+  assert.equal(
+    state.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.visibility === "assistant_update" &&
+      block.content === markdown
+    ).length,
+    1,
+  );
+  assert.equal(
+    state.taskFlow.filter((block) =>
+      block.type === "agent" &&
+      block.visibility === "assistant_final" &&
+      block.content === markdown
+    ).length,
+    1,
+  );
+  assert.equal(state.conversationTurns[0].status, "done");
+  assert.equal(state.conversationTurns[0].runtimeOutcome?.resultKind, "success");
+});
+
 test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle records", async () => {
   const harness = createHarness();
   const childRun = (suffix) => ({
@@ -501,6 +576,7 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
       eventId: "event-scheduled",
       at: 10,
       run: runIdentity,
+      maxActiveSubagents: 2,
       jobs: jobs.map((job) => ({
         ...job,
         status: "queued",
@@ -547,6 +623,27 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
           version: null,
         }],
       },
+      {
+        type: "subagent.handoff_delivered",
+        eventId: `event-delivered-${job.id}`,
+        at: 31 + index,
+        run: runIdentity,
+        jobId: job.id,
+        contextEntryId: `child:${job.id}`,
+        evidenceIds: [`evidence-${job.id}`],
+      },
+      ...(index === 0
+        ? [{
+            type: "subagent.handoff_applied",
+            eventId: `event-applied-${job.id}`,
+            at: 32 + index,
+            run: runIdentity,
+            jobId: job.id,
+            sourceEventId: "parent-provider-reference",
+            source: "provider_result",
+            evidenceIds: [`evidence-${job.id}`],
+          }]
+        : []),
     ]),
   ];
   const childAggregate = aggregate({
@@ -580,6 +677,10 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
   assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
   assert.ok(runs.every((run) => run.closedAt));
   assert.ok(runs.every((run) => run.closureAudit?.state === "satisfied"));
+  assert.deepEqual(runs.map((run) => run.childEvidenceCount), [1, 1]);
+  assert.ok(runs.every((run) => run.returnedCount === 1));
+  assert.ok(runs.every((run) => run.deliveredCount === 1));
+  assert.deepEqual(runs.map((run) => run.adoptedCount), [1, 0]);
   assert.equal(
     state.runtimeEvents.filter((event) => event.type === "subagent.created").length,
     2,
@@ -589,10 +690,124 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
     2,
   );
   assert.equal(
+    state.runtimeEvents.filter((event) =>
+      event.type === "subagent.handoff_delivered"
+    ).length,
+    2,
+  );
+  assert.equal(
+    state.runtimeEvents.filter((event) =>
+      event.type === "subagent.handoff_applied"
+    ).length,
+    1,
+  );
+  assert.equal(
     state.runtimeEvents.filter((event) => event.type === "subagent.closed").length,
     2,
   );
   assert.equal(harness.logs.at(-1)?.data?.subagentRecordCount, 2);
+});
+
+test("V2 projects an evidence-bearing incomplete child as degraded handoff", async () => {
+  const harness = createHarness();
+  const job = {
+    id: "job-degraded",
+    run: {
+      ...runIdentity,
+      runId: "child-degraded",
+      parentRunId: runIdentity.runId,
+      attemptId: "child-degraded",
+    },
+    parentRunId: runIdentity.runId,
+    scopeKey: "review-main",
+    objective: "Review src/main.js",
+    allowedPaths: ["src/main.js"],
+    status: "degraded",
+    requestedAt: 10,
+    firstTokenAt: 20,
+    closedAt: 30,
+    summary: "Evidence preserved; parent takeover required.",
+  };
+  const childAggregate = aggregate({
+    events: [{
+      type: "subagents.scheduled",
+      eventId: "event-degraded-scheduled",
+      at: 10,
+      run: runIdentity,
+      maxActiveSubagents: 1,
+      jobs: [{
+        ...job,
+        status: "queued",
+        firstTokenAt: null,
+        closedAt: null,
+        summary: null,
+      }],
+    }, {
+      type: "subagent.telemetry",
+      eventId: "event-degraded-open",
+      at: 12,
+      run: runIdentity,
+      telemetry: {
+        jobId: job.id,
+        phase: "request_opened",
+        at: 12,
+      },
+    }, {
+      type: "subagent.telemetry",
+      eventId: "event-degraded-close",
+      at: 30,
+      run: runIdentity,
+      telemetry: {
+        jobId: job.id,
+        phase: "closed",
+        at: 30,
+      },
+    }, {
+      type: "subagent.completed",
+      eventId: "event-degraded-complete",
+      at: 30,
+      run: runIdentity,
+      jobId: job.id,
+      status: "degraded",
+      summary: job.summary,
+      evidence: [{
+        id: "evidence-degraded",
+        kind: "subagent",
+        target: "src/main.js",
+        version: "sha-main",
+      }],
+    }, {
+      type: "subagent.handoff_delivered",
+      eventId: "event-degraded-delivered",
+      at: 31,
+      run: runIdentity,
+      jobId: job.id,
+      contextEntryId: `child:${job.id}`,
+      evidenceIds: ["evidence-degraded"],
+    }],
+    subagents: [job],
+  });
+
+  await harness.port.publish({
+    aggregate: childAggregate,
+    audience: "capsule_live",
+    projection: projection(
+      "live_action",
+      "主体正在接管未完成的评审。",
+      "turn-a:children:degraded",
+    ),
+  });
+
+  const [run] = projectSubagentRuns(harness.getState().runtimeEvents);
+  assert.equal(run.status, "degraded");
+  assert.equal(run.closureAudit?.state, "partial");
+  assert.equal(run.closureAudit?.reasonCode, "runtime_v2_child_degraded");
+  assert.equal(run.remainingWork, "Review src/main.js");
+  assert.equal(run.childEvidenceCount, 1);
+  assert.equal(run.returnedCount, 1);
+  assert.equal(run.deliveredCount, 1);
+  assert.equal(run.adoptedCount, 0);
+  assert.equal(run.terminalReason?.code, "runtime_v2_child_degraded");
 });
 
 test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", async () => {

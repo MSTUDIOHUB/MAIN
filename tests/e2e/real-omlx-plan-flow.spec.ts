@@ -23,6 +23,7 @@ import { PLAN_AUTHORING_CONTRACT_VERSION } from "../../src/lib/planAuthoringCont
 import { isAcceptanceCapableValidationSpec } from "../../src/lib/validationContract";
 import {
   collectBoundedRealOmlxWorkspaceFiles,
+  checkRealOmlxSourceSyntax,
   createRealOmlxAcceptanceState,
   readBoundedRealOmlxWorkspaceTextFile,
   readBoundedRealOmlxWorkspaceTextFiles,
@@ -64,7 +65,7 @@ const realOmlxRequest =
   (
     realOmlxFixture === "md-viewer"
       ? "问题：1、在编辑界面显示了文件名和未保存的文档名字，这是不合理的。2、打开本地 md 文件后随后会弹出窗口，看起来是文件保存执行路径有关的问题。找到这些问题的根本原因并修复。"
-      : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。"
+      : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改，并运行 npm test 验证直到通过。"
   );
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
 const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
@@ -99,11 +100,16 @@ const realOmlxPlanExpectAll = String(process.env.REAL_OMLX_PLAN_EXPECT_ALL || ""
   .map((pattern) => new RegExp(pattern, "i"));
 const realOmlxPlanEvidenceTargets = String(
   process.env.REAL_OMLX_PLAN_EVIDENCE_TARGETS || (
-    realOmlxFixture === "csv" ? "src/hooks/useCsvParser.ts" : ""
+    realOmlxFixture === "csv"
+      ? "src/hooks/useCsvParser.ts"
+      : realOmlxFixture === "md-viewer"
+        ? "src/main.js"
+        : ""
   ),
 ).split(";;").map((target) => target.trim()).filter(Boolean);
 const requireSemanticTaskQuality =
-  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1";
+  process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1" ||
+  (runExecuteIncidentReplay && realOmlxFixture === "md-viewer");
 if (
   runRealOmlx &&
   realOmlxFixture === "md-viewer" &&
@@ -128,18 +134,13 @@ const realOmlxPlanTimeoutMs = Math.max(
 );
 const realOmlxExecutionTimeoutMs = Math.max(
   30_000,
-  // Runtime v2 owns a 12-minute lifecycle deadline. The outer replay must
-  // outlive that boundary so it observes the canonical partial/success
-  // terminal instead of killing the page while the Run still says "running".
+  // This is a test-harness wait budget, not a product Run deadline. Ordinary
+  // Execute stays open while work progresses; the replay still needs a finite
+  // outer bound so CI can report a missing terminal instead of hanging.
   Number(process.env.REAL_OMLX_EXECUTION_TIMEOUT_MS || 780_000),
 );
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
-const completedTurnStatuses = new Set([
-  "done",
-  "completed",
-  "completed_with_changes",
-]);
 const reviewablePlanStages = new Set(["plan", "design", "bugfix", "ready_to_execute"]);
 const isMdViewerSavePathIncident =
   realOmlxFixture === "md-viewer" &&
@@ -269,6 +270,7 @@ async function inspectFixtureMutation(
     const allowedMutationFiles = new Set([
       "src/main.js",
       "src/components/editor.js",
+      "src/components/toolbar.js",
     ]);
     for (const relativePath of allowedMutationFiles) {
       executionGaps.push(...getNewUndeclaredCallGaps({
@@ -491,6 +493,100 @@ function expectCanonicalRuntimeV2Terminal(
   expect(commands.every((command: { turnId?: string; runId?: string }) =>
     command.turnId === expected.turnId && command.runId === runtime.runId
   )).toBe(true);
+  if (
+    expected.resultKind === "success" &&
+    (expected.strategy || "execute") === "execute"
+  ) {
+    const mutationEvents = events.filter((event: {
+      type?: string;
+      status?: string;
+      evidence?: Array<{ kind?: string }>;
+    }) =>
+      event.type === "tool.completed" &&
+      event.status === "succeeded" &&
+      (event.evidence || []).some((entry) => entry.kind === "mutation")
+    );
+    expect(mutationEvents.length).toBeGreaterThan(0);
+    const finalMutationSequence = Math.max(
+      ...mutationEvents.map((event: { sequence?: number }) =>
+        Number(event.sequence || 0)
+      ),
+    );
+    const passedParentValidations = events.filter((event: {
+      type?: string;
+      passed?: boolean;
+      sequence?: number;
+    }) =>
+      event.type === "validation.completed" &&
+      event.passed === true &&
+      Number(event.sequence || 0) > finalMutationSequence
+    );
+    const passedChildValidations = events.flatMap((event: {
+      type?: string;
+      status?: string;
+      report?: unknown;
+      validationReceipts?: Array<{
+        passed?: boolean;
+        authority?: unknown;
+        mutationBoundarySequence?: number;
+        validatedMutationVersions?: unknown[];
+      }>;
+    }) => {
+      if (
+        event.type === "subagent.completed" &&
+        event.status === "completed" &&
+        !!event.report
+      ) {
+        return (event.validationReceipts || []).filter(
+          (receipt) =>
+            receipt.passed === true &&
+            Number(receipt.mutationBoundarySequence || 0) >=
+              finalMutationSequence,
+        );
+      }
+      return [];
+    });
+    expect(
+      passedParentValidations.length + passedChildValidations.length,
+    ).toBeGreaterThan(0);
+    const passedValidationKeys = new Set(
+      passedParentValidations.map((event: { idempotencyKey?: string }) =>
+        String(event.idempotencyKey || "")
+      ),
+    );
+    expect(commands.some((command: {
+      kind?: string;
+      status?: string;
+      idempotencyKey?: string;
+    }) =>
+      command.kind === "execute_validation" &&
+      command.status === "succeeded" &&
+      passedValidationKeys.has(String(command.idempotencyKey || ""))
+    )).toBe(true);
+
+    if (runtime?.workPlan?.status === "approved") {
+      const authoritativeReceipts = [
+        ...passedParentValidations,
+        ...passedChildValidations,
+      ].filter((receipt: {
+        authority?: unknown;
+        mutationBoundarySequence?: number;
+        validatedMutationVersions?: unknown[];
+      }) =>
+        !!receipt.authority &&
+        Number.isInteger(receipt.mutationBoundarySequence) &&
+        Number(receipt.mutationBoundarySequence) > 0 &&
+        Array.isArray(receipt.validatedMutationVersions) &&
+        receipt.validatedMutationVersions.length > 0
+      );
+      expect(authoritativeReceipts.length).toBeGreaterThan(0);
+    } else {
+      // The minimal direct-Execute kernel preserves the admitted objective
+      // and proves it with a post-mutation behavioral validation. It does not
+      // revive the removed model-authored execution-contract protocol.
+      expect(runtime?.executionContract ?? null).toBeNull();
+    }
+  }
 
   const projections = Array.isArray(runtime?.projections) ? runtime.projections : [];
   const finalProjection = projections.filter(
@@ -516,6 +612,22 @@ function expectCanonicalRuntimeV2Terminal(
   return runtime;
 }
 
+function expectRuntimeV2TurnPresentationStatus(snapshot: any): void {
+  const resultKind = String(
+    snapshot?.runtimeV2?.terminalOutcome?.resultKind || "",
+  );
+  expect([
+    "success",
+    "partial",
+    "blocked",
+    "error",
+    "canceled",
+  ]).toContain(resultKind);
+  expect(snapshot?.currentTurnStatus).toBe(
+    resultKind === "error" ? "error" : "done",
+  );
+}
+
 function expectSuccessfulPlanExecutionOrder(runtime: any): void {
   const events = Array.isArray(runtime?.events) ? runtime.events : [];
   const approvalIndex = events.findIndex(
@@ -533,10 +645,28 @@ function expectSuccessfulPlanExecutionOrder(runtime: any): void {
       (event.evidence || []).some((entry) => entry.kind === "mutation"),
   );
   const validationIndex = events.findIndex(
-    (event: { type?: string; passed?: boolean }, index: number) =>
+    (event: {
+      type?: string;
+      status?: string;
+      report?: unknown;
+      passed?: boolean;
+      validationReceipts?: Array<{ passed?: boolean }>;
+    }, index: number) =>
       index > mutationIndex &&
-      event.type === "validation.completed" &&
-      event.passed === true,
+      (
+        (
+          event.type === "validation.completed" &&
+          event.passed === true
+        ) ||
+        (
+          event.type === "subagent.completed" &&
+          event.status === "completed" &&
+          !!event.report &&
+          (event.validationReceipts || []).some(
+            (receipt) => receipt.passed === true,
+          )
+        )
+      ),
   );
   const runCompletedIndex = events.findIndex(
     (event: { type?: string }, index: number) =>
@@ -789,8 +919,21 @@ test.beforeEach(async ({ page }) => {
     "package.json": JSON.stringify({
       name: "csv-direct-edit-recovery-fixture",
       private: true,
-      scripts: { test: "tsc --noEmit" },
+      scripts: { test: "node tests/creator-mapping.test.mjs" },
     }, null, 2) + "\n",
+    "tests/creator-mapping.test.mjs": [
+      "import assert from 'node:assert/strict';",
+      "import fs from 'node:fs';",
+      "",
+      "const source = fs.readFileSync('src/hooks/useCsvParser.ts', 'utf8');",
+      "const normalized = source.replace(/\\s+/g, '').replaceAll('\"', \"'\");",
+      "assert.equal(",
+      "  normalized.includes(\"creatorName:row.creator||row['创建者']||''\"),",
+      "  true,",
+      "  'normalizeCsvOrder must map the CSV creator column to creatorName',",
+      ");",
+      "",
+    ].join("\n"),
     "src/hooks/useCsvParser.ts": [
       "export interface CsvOrder {",
       "  creator?: string;",
@@ -932,6 +1075,10 @@ test.beforeEach(async ({ page }) => {
     const stat = await fs.stat(absolute);
     return { path: rawPath, sizeBytes: stat.size, modifiedMs: stat.mtimeMs };
   });
+  await page.exposeFunction("__MAIN_E2E_CHECK_SOURCE_SYNTAX", (
+    rawPath: string,
+    content: string,
+  ) => checkRealOmlxSourceSyntax(rawPath, content));
   await page.exposeFunction("__MAIN_E2E_DISK_GLOB", async () => await getWorkspaceInventory());
   await page.exposeFunction("__MAIN_E2E_DISK_SEARCH_FILES", async () => {
     const inventory = await getWorkspaceInventory();
@@ -1006,6 +1153,9 @@ test.beforeEach(async ({ page }) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
+    console.log(`[real-omlx-validation-command] ${JSON.stringify({
+      command: command.slice(0, 1_000),
+    })}`);
     const mutationState = await inspectFixtureMutation(
       workspace,
       fixtureMutationBaseline,
@@ -1058,10 +1208,15 @@ test.beforeEach(async ({ page }) => {
 
   await page.exposeFunction("__MAIN_E2E_PROXY_REQUEST", async (args: Record<string, unknown>) => {
     const url = String(args.url || "");
+    const method = String(args.method || "POST").toUpperCase();
     const response = await fetch(url, {
-      method: String(args.method || "POST"),
+      method,
       headers: args.headers as Record<string, string>,
-      body: String(args.body || ""),
+      body: method === "GET" || method === "HEAD"
+        ? undefined
+        : typeof args.body === "string"
+          ? args.body
+          : undefined,
     });
     const text = await response.text();
     console.log(`[real-omlx-proxy] ${response.status} ${url} ${text.slice(0, 240).replace(/\s+/g, " ")}`);
@@ -1105,24 +1260,246 @@ test.beforeEach(async ({ page }) => {
     chars: number;
     chunks: number;
     preview: string;
-    timeoutMs: number;
-    deadlineAt: number;
+    responseText: string;
+    timeoutMs: number | null;
+    deadlineAt: number | null;
   };
   const chatStreams = new Map<string, RealOmlxChatStream>();
+  const summarizeRuntimeV2ToolCalls = (text: string) => {
+    const calls = new Map<number, { name: string; arguments: string }>();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload);
+        const deltas = parsed?.choices?.[0]?.delta?.tool_calls;
+        if (!Array.isArray(deltas)) continue;
+        for (const delta of deltas) {
+          const index = Number(delta?.index) || 0;
+          const current = calls.get(index) || {
+            name: "",
+            arguments: "",
+          };
+          current.name += String(delta?.function?.name || "");
+          current.arguments += String(delta?.function?.arguments || "");
+          calls.set(index, current);
+        }
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return [...calls.values()].map((call) => {
+      let argumentSummary: unknown = "";
+      try {
+        const parsed = JSON.parse(call.arguments || "{}");
+        argumentSummary =
+          call.name === "read_file"
+            ? Object.fromEntries(
+                [
+                  "path",
+                  "start_line",
+                  "end_line",
+                  "max_lines",
+                  "max_chars",
+                ].flatMap((key) =>
+                  Object.prototype.hasOwnProperty.call(parsed, key)
+                    ? [[key, parsed[key]]]
+                    : []
+                ),
+              )
+            : call.name === "grep_search"
+              ? {
+                  path: String(parsed.path || ".").slice(0, 240),
+                  query: String(parsed.query || parsed.pattern || "")
+                    .slice(0, 500),
+                }
+            : call.name === "run_command"
+              ? {
+                  command: String(parsed.command || parsed.cmd || "")
+                    .slice(0, 1_000),
+                  timeout_ms: parsed.timeout_ms,
+                }
+            : call.name === "record_execution_contract"
+              ? parsed
+              : {
+                  keys: Object.keys(parsed).sort(),
+                };
+      } catch {
+        argumentSummary = {
+          invalidJsonPreview: call.arguments.slice(0, 240),
+        };
+      }
+      return {
+        name: call.name,
+        argumentHash: createHash("sha256")
+          .update(`${call.name}:${call.arguments}`)
+          .digest("hex"),
+        arguments: argumentSummary,
+      };
+    });
+  };
+  const summarizeRuntimeV2ReasoningTail = (text: string) => {
+    let reasoning = "";
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const delta = JSON.parse(payload)?.choices?.[0]?.delta;
+        reasoning += String(
+          delta?.reasoning_content || delta?.reasoning || "",
+        );
+        if (reasoning.length > 8_000) reasoning = reasoning.slice(-8_000);
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return reasoning.replace(/\s+/g, " ").trim().slice(-2_000);
+  };
+  const summarizeRuntimeV2ContentTail = (text: string) => {
+    let content = "";
+    const finishReasons = new Set<string>();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const choice = JSON.parse(payload)?.choices?.[0];
+        content += String(choice?.delta?.content || "");
+        if (content.length > 8_000) content = content.slice(-8_000);
+        if (choice?.finish_reason) finishReasons.add(String(choice.finish_reason));
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return {
+      chars: content.length,
+      finishReasons: [...finishReasons],
+      tail: content.replace(/\s+/g, " ").trim().slice(-2_000),
+    };
+  };
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
     const url = String(args.url || "");
     const bodyText = String(args.body || "");
     let model = "";
+    let parsedBody: Record<string, unknown> | null = null;
     try {
-      model = String(JSON.parse(bodyText).model || "");
+      parsedBody = JSON.parse(bodyText) as Record<string, unknown>;
+      model = String(parsedBody.model || "");
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
-    const requestedTimeoutMs = Number(args.timeoutMs);
-    const timeoutMs = Number.isFinite(requestedTimeoutMs)
-      ? Math.max(1_000, Math.min(600_000, Math.trunc(requestedTimeoutMs)))
-      : 180_000;
+    const requestMessages = Array.isArray(parsedBody?.messages)
+      ? parsedBody.messages as Array<Record<string, unknown>>
+      : [];
+    console.log(`[real-omlx-request] ${JSON.stringify({
+      model,
+      messages: requestMessages.length,
+      approximateMessageChars: requestMessages.reduce(
+        (total, message) =>
+          total + JSON.stringify(message).length,
+        0,
+      ),
+      tools: Array.isArray(parsedBody?.tools)
+        ? parsedBody.tools.length
+        : 0,
+      toolNames: Array.isArray(parsedBody?.tools)
+        ? parsedBody.tools.map((tool) => {
+            const record = tool && typeof tool === "object"
+              ? tool as Record<string, unknown>
+              : {};
+            const fn = record.function &&
+                typeof record.function === "object"
+              ? record.function as Record<string, unknown>
+              : {};
+            return String(fn.name || "");
+          })
+        : [],
+      toolChoice: parsedBody?.tool_choice ?? null,
+      maxTokens: parsedBody?.max_tokens ?? null,
+      thinkingBudget: parsedBody?.thinking_budget ?? null,
+      temperature: parsedBody?.temperature ?? null,
+      topP: parsedBody?.top_p ?? null,
+      chatTemplateKwargs: parsedBody?.chat_template_kwargs ?? null,
+    })}`);
+    const traceContextMode =
+      String(process.env.REAL_OMLX_TRACE_CONTEXT || "");
+    const traceThisContext =
+      traceContextMode === "1" ||
+      (
+        traceContextMode === "tail" &&
+        bodyText.includes("src/main.js") &&
+        bodyText.includes("start_line")
+      );
+    if (
+      traceThisContext ||
+      bodyText.includes("UNCHANGED_SOURCE_COVERAGE_REUSED") ||
+      bodyText.includes("UNCHANGED_SOURCE_REPEAT_REJECTED") ||
+      bodyText.includes("UNCHANGED_OBSERVATION_REPEAT_REJECTED") ||
+      bodyText.includes("REPEATED_ACTION_REJECTED") ||
+      bodyText.includes("ACTION_NOT_EXECUTED")
+    ) {
+      const messages = Array.isArray(parsedBody?.messages)
+        ? parsedBody.messages as Array<Record<string, unknown>>
+        : [];
+      console.log(`[real-omlx-repeat-context] ${JSON.stringify(
+        messages.slice(-8).map((message) => ({
+          role: String(message.role || ""),
+          toolCallId: String(message.tool_call_id || ""),
+          toolCalls: Array.isArray(message.tool_calls)
+            ? message.tool_calls.map((call) => {
+                const record = call && typeof call === "object"
+                  ? call as Record<string, unknown>
+                  : {};
+                const fn = record.function && typeof record.function === "object"
+                  ? record.function as Record<string, unknown>
+                  : {};
+                return {
+                  id: String(record.id || ""),
+                  name: String(fn.name || ""),
+                  argumentsPreview: String(fn.arguments || "")
+                    .slice(0, 1_200),
+                };
+              })
+            : [],
+          repeatCodes: String(message.content || "").match(
+            /UNCHANGED_SOURCE_COVERAGE_REUSED|UNCHANGED_SOURCE_REPEAT_REJECTED|UNCHANGED_OBSERVATION_REPEAT_REJECTED|REPEATED_ACTION_REJECTED|ACTION_NOT_EXECUTED/g,
+          ) || [],
+          systemInstructionTail: String(message.role || "") === "system"
+            ? String(message.content || "").slice(-2_000)
+            : "",
+          toolResultHeader: String(message.role || "") === "tool"
+            ? String(message.content || "")
+              .split("---CONTENT START---", 1)[0]
+              .slice(0, 1_200)
+            : "",
+        })),
+      )}`);
+    }
+    const contractErrors = [
+      ...bodyText.matchAll(
+        /RUNTIME_V2_EXECUTION_CONTRACT_INVALID:[^"\\\n]{1,240}/g,
+      ),
+    ].map((match) => match[0]);
+    if (contractErrors.length > 0) {
+      console.log(
+        `[real-omlx-contract-retry] ${JSON.stringify(
+          [...new Set(contractErrors)].slice(-4),
+        )}`,
+      );
+    }
+    const requestedTimeoutMs = typeof args.timeoutMs === "number"
+      ? args.timeoutMs
+      : Number.NaN;
+    // Mirror the product contract: an omitted provider timeout means no
+    // per-request deadline. The finite Playwright poll/test timeout remains
+    // the outer harness boundary and will close the browser/fetch if needed.
+    const timeoutMs = Number.isFinite(requestedTimeoutMs) &&
+        requestedTimeoutMs > 0
+      ? Math.max(1_000, Math.trunc(requestedTimeoutMs))
+      : null;
     const controller = new AbortController();
     const stream: RealOmlxChatStream = {
       reader: null,
@@ -1133,8 +1510,9 @@ test.beforeEach(async ({ page }) => {
       chars: 0,
       chunks: 0,
       preview: "",
+      responseText: "",
       timeoutMs,
-      deadlineAt: Date.now() + timeoutMs,
+      deadlineAt: timeoutMs === null ? null : Date.now() + timeoutMs,
     };
     // Register the lease before waiting for response headers. OMLX can spend
     // substantial time in prefill, and cancellation must still reach that
@@ -1142,21 +1520,24 @@ test.beforeEach(async ({ page }) => {
     chatStreams.set(streamId, stream);
     let responseHeaderTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const response = await Promise.race([
-        fetch(url, {
-          method: "POST",
-          headers: args.headers as Record<string, string>,
-          body: bodyText,
-          signal: controller.signal,
-        }),
-        new Promise<never>((_resolve, reject) => {
-          responseHeaderTimer = setTimeout(() => {
-            reject(new Error(
-              `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
-            ));
-          }, Math.max(1, stream.deadlineAt - Date.now()));
-        }),
-      ]);
+      const responsePromise = fetch(url, {
+        method: "POST",
+        headers: args.headers as Record<string, string>,
+        body: bodyText,
+        signal: controller.signal,
+      });
+      const response = stream.deadlineAt === null
+        ? await responsePromise
+        : await Promise.race([
+            responsePromise,
+            new Promise<never>((_resolve, reject) => {
+              responseHeaderTimer = setTimeout(() => {
+                reject(new Error(
+                  `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
+                ));
+              }, Math.max(1, stream.deadlineAt! - Date.now()));
+            }),
+          ]);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
@@ -1180,8 +1561,10 @@ test.beforeEach(async ({ page }) => {
     const stream = chatStreams.get(String(streamId));
     if (!stream?.reader) return { done: true, chunk: "" };
     const phase = stream.chunks === 0 ? "first_chunk" : "idle_chunk";
-    const remainingMs = stream.deadlineAt - Date.now();
-    if (remainingMs <= 0) {
+    const remainingMs = stream.deadlineAt === null
+      ? null
+      : stream.deadlineAt - Date.now();
+    if (remainingMs !== null && remainingMs <= 0) {
       chatStreams.delete(String(streamId));
       stream.controller.abort();
       void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
@@ -1191,23 +1574,54 @@ test.beforeEach(async ({ page }) => {
     }
     let chunkTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const { done, value } = await Promise.race([
-        stream.reader.read(),
-        new Promise<never>((_resolve, reject) => {
-          chunkTimer = setTimeout(() => {
-            reject(new Error(
-              `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
-            ));
-          }, Math.max(1, remainingMs));
-        }),
-      ]);
+      const readPromise = stream.reader.read();
+      const { done, value } = remainingMs === null
+        ? await readPromise
+        : await Promise.race([
+            readPromise,
+            new Promise<never>((_resolve, reject) => {
+              chunkTimer = setTimeout(() => {
+                reject(new Error(
+                  `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
+                ));
+              }, Math.max(1, remainingMs));
+            }),
+          ]);
       const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
       stream.chars += chunk.length;
       stream.chunks += 1;
       if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
+      if (stream.responseText.length < 200_000) {
+        stream.responseText = `${stream.responseText}${chunk}`.slice(
+          0,
+          200_000,
+        );
+      }
       if (done) {
         chatStreams.delete(String(streamId));
         console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+        const toolCalls = summarizeRuntimeV2ToolCalls(
+          stream.responseText,
+        );
+        if (toolCalls.length > 0) {
+          console.log(
+            `[real-omlx-tool-calls] ${JSON.stringify(toolCalls)}`,
+          );
+        }
+        if (process.env.REAL_OMLX_LOG_REASONING_TAIL === "1") {
+          const reasoningTail = summarizeRuntimeV2ReasoningTail(
+            stream.responseText,
+          );
+          if (reasoningTail) {
+            console.log(`[real-omlx-reasoning-tail] ${reasoningTail}`);
+          }
+          const contentTail = summarizeRuntimeV2ContentTail(
+            stream.responseText,
+          );
+          console.log(
+            `[real-omlx-content-tail] ${JSON.stringify(contentTail)}`,
+          );
+        }
       }
       return { done, chunk };
     } catch (error) {
@@ -1658,7 +2072,11 @@ test.beforeEach(async ({ page }) => {
             occurrences.push({
               path: filePath,
               language: filePath.endsWith(".tsx") ? "tsx" : "typescript",
-              role: /\b(?:interface|type|class|function|const|let)\s+/.test(line) ? "definition" : "reference",
+              role: /\bimport\b/.test(line)
+                ? "import"
+                : /\b(?:interface|type|class|function|const|let)\s+/.test(line)
+                  ? "definition"
+                  : "reference",
               syntaxKind: "identifier",
               line: index + 1,
               column: column + 1,
@@ -1737,6 +2155,12 @@ test.beforeEach(async ({ page }) => {
         };
       }
       if (cmd === "read_file") return await readText(String(args?.path || ""));
+      if (cmd === "check_source_syntax") {
+        return await (window as any).__MAIN_E2E_CHECK_SOURCE_SYNTAX(
+          String(args?.path || ""),
+          String(args?.content || ""),
+        );
+      }
       if (cmd === "read_file_window") {
         const path = String(args?.path || "");
         const windowResult = await (window as any).__MAIN_E2E_DISK_READ_WINDOW(path, {
@@ -1755,6 +2179,9 @@ test.beforeEach(async ({ page }) => {
           returnedChars: Number(windowResult?.returnedChars || 0),
           truncated: Boolean(windowResult?.truncated),
           nextStartLine: windowResult?.nextStartLine ?? null,
+          ...(windowResult?.contentVersion
+            ? { contentVersion: String(windowResult.contentVersion) }
+            : {}),
         };
       }
       if (cmd === "read_document") {
@@ -1892,6 +2319,13 @@ test.beforeEach(async ({ page }) => {
         const ok = mutationState.satisfied === true &&
           actionRows.every((action) => action.ok) &&
           assertionRows.every((assertion) => assertion.passed);
+        const semanticFailureDetail =
+          mutationState.satisfied === true
+            ? ""
+            : String(
+                mutationState.detail ||
+                  "The fixture mutation does not satisfy the semantic acceptance oracle.",
+              );
         return {
           ok,
           url: String(args?.url || ""),
@@ -1901,7 +2335,14 @@ test.beforeEach(async ({ page }) => {
           actions: actionRows,
           assertions: assertionRows,
           consoleErrors: [],
-          pageErrors: [],
+          // The fixture oracle stands in for concrete DOM/native failures in
+          // this isolated replay. Feed its actionable path:line diagnostics
+          // back through the real validation receipt so Runtime v2 can reopen
+          // the exact corrective source window instead of learning about the
+          // semantic gap only after the Turn has already ended.
+          pageErrors: semanticFailureDetail
+            ? [semanticFailureDetail]
+            : [],
           failedRequests: [],
           textPreview: fixture === "md-viewer" ? "New Open Save" : "creatorName",
           durationMs: 1,
@@ -2114,6 +2555,23 @@ for (const model of models) {
           runtimePhase: snapshot?.runtimeV2?.phase || null,
           workPlanStatus: snapshot?.runtimeV2?.workPlan?.status || null,
           hasReviewCommit: Boolean(snapshot?.runtimeV2?.planReviewCommit),
+          showPlanPanel: snapshot?.showPlanPanel,
+          rightPanelTab: snapshot?.rightPanelTab,
+          showDiff: snapshot?.showDiff,
+          showTerminal: snapshot?.showTerminal,
+          planPanelMounted: snapshot?.planPanelMounted,
+          planPanelDocumentKind: snapshot?.planPanelDocumentKind,
+          planPanelPresentation: snapshot?.planPanelPresentation,
+          planPanelActionKind: snapshot?.planPanelActionKind,
+          viewportWidth: snapshot?.viewportWidth,
+          rightPanelWidth: snapshot?.rightPanelWidth,
+          sidebarWidth: snapshot?.sidebarWidth,
+          markerStatus: snapshot?.harnessRunMarker?.status || null,
+          markerRunId:
+            snapshot?.harnessRunMarker?.activeRunId ||
+            snapshot?.harnessRunMarker?.outerRunId ||
+            null,
+          checkpointCache: snapshot?.runtimeV2CheckpointCache || null,
         };
         const planPollSignature = JSON.stringify(planPollDiagnostic);
         if (planPollSignature !== lastPlanPollSignature) {
@@ -2245,6 +2703,23 @@ for (const model of models) {
     );
     expect(persistedPlan).toBe(plan);
     expect(reviewCommit.artifact.content).toBe(plan);
+    console.log(`[real-omlx-plan-panel:${model}] ${JSON.stringify({
+      showPlanPanel: planSnapshot?.showPlanPanel,
+      rightPanelTab: planSnapshot?.rightPanelTab,
+      showDiff: planSnapshot?.showDiff,
+      showTerminal: planSnapshot?.showTerminal,
+      planPanelMounted: planSnapshot?.planPanelMounted,
+      planPanelDocumentKind: planSnapshot?.planPanelDocumentKind,
+      planPanelPresentation: planSnapshot?.planPanelPresentation,
+      planPanelActionKind: planSnapshot?.planPanelActionKind,
+      viewportWidth: planSnapshot?.viewportWidth,
+      rightPanelWidth: planSnapshot?.rightPanelWidth,
+      sidebarWidth: planSnapshot?.sidebarWidth,
+      harnessRunMarker: planSnapshot?.harnessRunMarker || null,
+      runtimeV2CheckpointCache:
+        planSnapshot?.runtimeV2CheckpointCache || null,
+      transitions: (planSnapshot?.planPanelTransitions || []).slice(-12),
+    })}`);
     await expect(page.getByTestId("plan-review-panel")).toBeVisible();
     await expect(page.getByTestId("plan-review-panel")).toContainText(
       sealedWorkPlan.draft.objective,
@@ -2638,7 +3113,7 @@ for (const model of models) {
       toolBlocks: terminalSnapshot?.toolBlocks,
       debugTail: terminalSnapshot?.debugTail,
     }).slice(-40_000)}`);
-    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    expectRuntimeV2TurnPresentationStatus(terminalSnapshot);
     const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
     expect(terminalTurnId).not.toBe("");
     const finalAssistantMessage = page.locator(
@@ -2664,43 +3139,32 @@ for (const model of models) {
     expect(source).toMatch(/\bsource\s*:\s*["']csv["']/);
 
     const snapshot = terminalSnapshot;
-    const runtimeEvents = (snapshot?.debugTail || []).map((entry: { source?: string; message?: string }) => {
-      try {
-        return { source: entry.source, ...JSON.parse(String(entry.message || "{}")) };
-      } catch {
-        return { source: entry.source, message: entry.message };
-      }
-    });
+    const runtimeEvents = snapshot?.runtimeV2?.events || [];
     const failedValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>) =>
-      entry.source === "store.tool_result" &&
-      entry.toolName === "run_command" &&
-      entry.isError === true
+      entry.type === "validation.completed" && entry.passed === false
     );
     const repairMutationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
       index > failedValidationIndex &&
-      entry.source === "store.tool_result" &&
-      ["apply_patch", "replace_in_file", "write_file"].includes(String(entry.toolName || "")) &&
-      entry.isError === false
+      entry.type === "tool.completed" &&
+      entry.status === "succeeded" &&
+      Array.isArray(entry.evidence) &&
+      entry.evidence.some((evidence: { kind?: string }) => evidence.kind === "mutation")
     );
     const successfulValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
       index > repairMutationIndex &&
-      entry.source === "store.tool_result" &&
-      entry.toolName === "run_command" &&
-      entry.isError === false
+      entry.type === "validation.completed" && entry.passed === true
     );
     expect(failedValidationIndex).toBeGreaterThanOrEqual(0);
     expect(repairMutationIndex).toBeGreaterThan(failedValidationIndex);
     expect(successfulValidationIndex).toBeGreaterThan(repairMutationIndex);
-    expect(runtimeEvents.some((entry: Record<string, unknown>) =>
+    expect((snapshot?.debugTail || []).some((entry: Record<string, unknown>) =>
       entry.source === "agent.tool_calls_detected" &&
       Array.isArray(entry.names) &&
       entry.names.includes("execute_command")
     )).toBe(false);
 
-    const debugText = JSON.stringify(snapshot?.debugTail || []);
-    expect(debugText).toMatch(/direct_edit_finite_validation_requires_repair/);
-    expect(debugText).toMatch(/recovery_mutation_observed/);
-    expect(debugText).not.toMatch(/repeated_failure_policy_no_progress/);
+    expect(snapshot?.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+    expect(snapshot?.runtimeV2?.recovery?.exhausted || null).toBeNull();
   });
 
   test(`real OMLX Execute completes the MD Viewer incident with ${model}`, async ({ page }) => {
@@ -2727,9 +3191,9 @@ for (const model of models) {
     }, {
       text: realOmlxRequest,
       images: replayImages,
-      // This incident is the production collaboration acceptance lane. It
-      // deliberately enables the Runtime v2 read-only scheduler rather than
-      // leaving overlap coverage to an optional environment flag.
+      // Grant collaboration permission for this production incident. Runtime
+      // still exposes spawn_subagent only when the active provider lane has a
+      // real child-request slot after reserving the parent.
       preferSubagents: true,
     });
 
@@ -2896,7 +3360,7 @@ for (const model of models) {
       visibleTimeline: visibleTimeline.slice(-80),
     }).slice(-40_000)}`);
 
-    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    expectRuntimeV2TurnPresentationStatus(terminalSnapshot);
     expect(terminalSnapshot?.currentTurnIntent).toBe("execute");
     expect(String(terminalSnapshot?.currentTurnTitle || "").trim()).not.toBe("");
     const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
@@ -2939,26 +3403,54 @@ for (const model of models) {
     expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
       evidence.kind === "mutation"
     )).toBe(true);
-    const successfulValidations = (runtimeV2.commands || []).filter(
-      (command: { kind?: string; status?: string }) =>
-        command.kind === "execute_validation" &&
-        command.status === "succeeded",
-    );
-    expect(successfulValidations.length).toBeGreaterThan(0);
-    expect((runtimeV2.events || []).some(
+    const passedParentValidations = (runtimeV2.events || []).filter(
       (event: { type?: string; passed?: boolean }) =>
-        event.type === "validation.completed" && event.passed === true,
-    )).toBe(true);
+        event.type === "validation.completed" &&
+        event.passed === true,
+    );
+    const passedChildValidations = (runtimeV2.events || []).flatMap(
+      (event: {
+        type?: string;
+        status?: string;
+        report?: unknown;
+        validationReceipts?: Array<{
+          passed?: boolean;
+          authority?: unknown;
+        }>;
+      }) =>
+        event.type === "subagent.completed" &&
+          event.status === "completed" &&
+          !!event.report
+          ? (event.validationReceipts || []).filter((receipt) =>
+              receipt.passed === true && !!receipt.authority
+            )
+          : [],
+    );
+    expect(
+      passedParentValidations.length + passedChildValidations.length,
+    ).toBeGreaterThan(0);
     expect(runtimeV2.evidence.some((evidence: { kind?: string }) =>
       evidence.kind === "validation"
     )).toBe(true);
-    const finalValidationBlock = [...successfulValidations].reverse().find(
-      (command: { toolName?: string; target?: string }) =>
+    const successfulValidationCommands = (runtimeV2.commands || [])
+      .filter((command: {
+        kind?: string;
+        status?: string;
+      }) =>
+        command.kind === "execute_validation" &&
+        command.status === "succeeded"
+      );
+    const finalFiniteValidation = [...successfulValidationCommands]
+      .reverse()
+      .find((command: { toolName?: string; target?: string }) =>
         command.toolName === "run_command" &&
-        isFinitePlanValidationCommand(String(command.target || "")),
-    );
-    const finalValidationCommand = String(finalValidationBlock?.target || "").trim();
+        isFinitePlanValidationCommand(String(command.target || ""))
+      );
+    const finalValidationCommand = String(
+      finalFiniteValidation?.target || "",
+    ).trim();
     if (requireSemanticTaskQuality) {
+      expect(finalFiniteValidation).toBeTruthy();
       expect(isFinitePlanValidationCommand(finalValidationCommand)).toBe(true);
     }
     if (finalValidationCommand) {

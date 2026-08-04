@@ -132,7 +132,7 @@ export default function SubagentsPanel({
             <div className="mt-0.5 text-[14px] font-semibold">{activeCount} / {capacityPolicy.maxActiveRequests}</div>
           </div>
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "已归档" : "Done"}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "已结束" : "Ended"}</div>
             <div className="mt-0.5 text-[14px] font-semibold">{endedCount}</div>
           </div>
           <div>
@@ -171,7 +171,21 @@ export default function SubagentsPanel({
         </div>
         <div className={`mt-2 truncate text-[10px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`} title={`${capacityPolicy.provider} · ${capacityPolicy.model}`}>
           {capacityPolicy.profile === "local"
-            ? language === "zh" ? "本地主体 + 最多 2 个子流" : "Local parent + up to 2 child streams"
+            ? language === "zh"
+              ? capacityPolicy.modelRequestMode === "serialized"
+                ? `模型请求串行；当前不开放子智能体并行${capacityPolicy.capacitySource === "configured" ? "（已配置）" : "（安全默认）"}`
+                : capacityPolicy.capacitySource === "configured"
+                  ? `模型请求并发 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}，已配置）`
+                  : capacityPolicy.capacitySource === "observed"
+                    ? `已实测并发 ${capacityPolicy.confirmedTotalRequests}，当前开放 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}）`
+                    : `模型请求并发探测中（主体 1 + 探测子流 ${capacityPolicy.maxActiveRequests}）`
+              : capacityPolicy.modelRequestMode === "serialized"
+                ? `Serialized model requests; parallel subagents are unavailable${capacityPolicy.capacitySource === "configured" ? " (configured)" : " (safe default)"}`
+                : capacityPolicy.capacitySource === "configured"
+                  ? `${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children, configured)`
+                  : capacityPolicy.capacitySource === "observed"
+                    ? `Observed ${capacityPolicy.confirmedTotalRequests}; admitting ${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children)`
+                    : `Probing model concurrency (1 parent + ${capacityPolicy.maxActiveRequests} probe child)`
             : language === "zh" ? "云端受控并行" : "Controlled cloud parallelism"}
           {` · ${capacityPolicy.provider} · ${capacityPolicy.model}`}
         </div>
@@ -197,7 +211,7 @@ export default function SubagentsPanel({
                 >
                   {section === "active"
                     ? language === "zh" ? `活跃 ${activeCount}` : `Active ${activeCount}`
-                    : language === "zh" ? `已完成 ${endedCount}` : `Done ${endedCount}`}
+                    : language === "zh" ? `已结束 ${endedCount}` : `Ended ${endedCount}`}
                 </div>
               )}
             <button
@@ -251,13 +265,11 @@ export default function SubagentsPanel({
                   {selected.workItem?.taskKind || "task"} · {selected.collaborationTaskId}
                 </div>
               )}
-              {(selected.observationCount !== undefined || selected.evidenceCount !== undefined) && (
-                <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
-                  {language === "zh"
-                    ? `可信证据 ${selected.evidenceCount || 0} · 观察结果 ${selected.observationCount || 0} · 执行记录 ${selected.activities.length}`
-                    : `Trusted evidence ${selected.evidenceCount || 0} · Observations ${selected.observationCount || 0} · Activity ${selected.activities.length}`}
-                </div>
-              )}
+              <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
+                {language === "zh"
+                  ? `新证据 ${selected.childEvidenceCount} · 返回 ${selected.returnedCount} · 交付 ${selected.deliveredCount} · 采用 ${selected.adoptedCount}`
+                  : `New evidence ${selected.childEvidenceCount} · Returned ${selected.returnedCount} · Delivered ${selected.deliveredCount} · Adopted ${selected.adoptedCount}`}
+              </div>
             </div>
             {isSubagentActiveStatus(selected.status) && (
               <button
@@ -334,15 +346,21 @@ export default function SubagentsPanel({
             </section>
           )}
 
-          {selected.error && selected.status !== "completed" && (
+          {selected.terminalReason && selected.status !== "completed" && (
             <section className={`mt-4 border-t pt-3 ${isLight ? "border-[#e4e4e7]" : "border-[#27272a]"}`}>
               <div className="text-[10px] font-medium uppercase text-[#f87171]">
                 {selected.status === "degraded"
                   ? language === "zh" ? "接管原因" : "Handoff reason"
-                  : language === "zh" ? "阻塞原因" : "Blocker"}
+                  : selected.status === "canceled"
+                    ? language === "zh" ? "取消原因" : "Cancellation reason"
+                    : language === "zh" ? "失败原因" : "Failure reason"}
               </div>
-              <div className={`mt-2 whitespace-pre-wrap break-words rounded-[6px] border px-3 py-2 text-[11px] leading-5 ${isLight ? "border-[#f3c5c5] bg-[#fff7f7] text-[#b3261e]" : "border-[rgba(248,113,113,0.24)] bg-[rgba(248,113,113,0.06)] text-[#fca5a5]"}`}>
-                {selected.error}
+              <div
+                data-testid="subagent-terminal-reason"
+                title={selected.terminalReason.code}
+                className={`mt-2 whitespace-pre-wrap break-words rounded-[6px] border px-3 py-2 text-[11px] leading-5 ${isLight ? "border-[#f3c5c5] bg-[#fff7f7] text-[#b3261e]" : "border-[rgba(248,113,113,0.24)] bg-[rgba(248,113,113,0.06)] text-[#fca5a5]"}`}
+              >
+                {selected.terminalReason.detail}
               </div>
             </section>
           )}

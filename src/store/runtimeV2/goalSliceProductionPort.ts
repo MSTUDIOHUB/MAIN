@@ -8,6 +8,7 @@ import {
   finishRuntimeV2CheckpointTerminal,
   isRuntimeV2TurnTerminallyClosed,
   normalizeRuntimeV2CheckpointMap,
+  runtimeV2GoalSliceExecuteAdmission,
   type RuntimeV2GoalSliceOutcome,
   type RuntimeV2GoalSliceRequest,
   type TurnAggregateV1,
@@ -16,6 +17,7 @@ import {
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
 } from "../../lib/turnIntake";
+import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { createRuntimeV2CheckpointPort } from "./checkpointPort";
 import {
@@ -42,6 +44,7 @@ export interface RuntimeV2GoalProductionSlicePortInput
   readonly scopeKey: string;
   readonly language: "zh" | "en";
   readonly turnInputContextSignals?: TurnInputContextSignals;
+  readonly runtimeContextBudget?: RuntimeContextBudget | null;
   readonly markerLease?: RuntimeV2GoalHarnessMarkerLease;
   readonly execute?: (
     input: RuntimeV2ExecuteRunnerInput,
@@ -279,9 +282,7 @@ function sliceOutcome(input: {
         ? "deadline_exceeded"
         : reachedSliceDeadline
           ? "slice_boundary"
-          : input.aggregate.recovery.exhausted
-            ? "recovery_exhausted"
-            : structurallyAccepted
+          : structurallyAccepted
               ? "objective_satisfied"
               : terminal.resultKind === "blocked"
                 ? "external_blocked"
@@ -386,7 +387,7 @@ export function createRuntimeV2GoalProductionSlicePort(
       sessionId: input.sessionId,
       getSessionRevisionToken: input.getSessionRevisionToken,
       sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
       publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
       persistSessionRecord: input.persistSessionRecord,
       logStoreEvent: input.logStoreEvent,
@@ -546,6 +547,8 @@ export function createRuntimeV2GoalProductionSlicePort(
       turnInputContextSignals: normalizeTurnInputContextSignals(
         input.turnInputContextSignals,
       ),
+      runtimeContextBudget: input.runtimeContextBudget,
+      executeAdmission: runtimeV2GoalSliceExecuteAdmission(request),
     };
     const execution = Promise.resolve()
       .then(() => execute({ ...input, context }))

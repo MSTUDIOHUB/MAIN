@@ -1,10 +1,16 @@
 import {
   appendRuntimeV2Checkpoint,
+  commitRuntimeV2EmergencyTerminalEnvelope,
   normalizeRuntimeV2Checkpoint,
+  normalizeRuntimeV2EmergencyTerminalEnvelope,
+  normalizeRuntimeV2EmergencyTerminalEnvelopeMap,
   type CheckpointPort,
+  type RuntimeV2EmergencyTerminalEnvelopeMap,
+  type RuntimeV2EmergencyTerminalEnvelopeV1,
   type RuntimeV2CheckpointV3,
   type RuntimeV2Event,
   type RuntimeV2TurnIdentity,
+  RuntimeV2CheckpointWriteBoundaryError,
 } from "../../lib/runtime-v2";
 import { persistSubmitRuntimeProjection } from "../persistSubmitRuntimeProjection";
 
@@ -18,7 +24,7 @@ export interface RuntimeV2CheckpointStoreAdapterInput {
   readonly sessionId: number | null | undefined;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
   readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
@@ -35,6 +41,24 @@ function checkpointMapFor(state: any): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value
     : {};
+}
+
+function emergencyEnvelopeMapFor(
+  state: any,
+): RuntimeV2EmergencyTerminalEnvelopeMap {
+  return normalizeRuntimeV2EmergencyTerminalEnvelopeMap(
+    state?.runtimeV2EmergencyTerminalEnvelopes,
+  );
+}
+
+function emergencyEnvelopeForOwner(
+  state: any,
+  owner: RuntimeV2TurnIdentity,
+): RuntimeV2EmergencyTerminalEnvelopeV1 | null {
+  return normalizeRuntimeV2EmergencyTerminalEnvelope(
+    emergencyEnvelopeMapFor(state)[owner.turnId],
+    owner,
+  );
 }
 
 function checkpointForOwner(state: any, owner: RuntimeV2TurnIdentity): RuntimeV2CheckpointV3 | null {
@@ -61,6 +85,11 @@ export function createRuntimeV2CheckpointPort(
 ): CheckpointPort {
   return {
     async load({ owner }) {
+      if (emergencyEnvelopeForOwner(input.get(), owner)) {
+        throw new Error(
+          "RUNTIME_V2_EMERGENCY_TERMINAL_ENVELOPE_PRESENT",
+        );
+      }
       return checkpointForOwner(input.get(), owner);
     },
 
@@ -71,6 +100,9 @@ export function createRuntimeV2CheckpointPort(
         attempt += 1
       ) {
         const state = input.get();
+        if (emergencyEnvelopeForOwner(state, owner)) {
+          return { disposition: "conflict" as const, checkpoint: null };
+        }
         const appended = appendRuntimeV2Checkpoint({
           checkpoint: checkpointForOwner(state, owner),
           owner,
@@ -98,7 +130,7 @@ export function createRuntimeV2CheckpointPort(
             scopeKey: input.scopeKey,
             sessionId: input.sessionId,
             sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-            buildRuntimeSnapshot: (candidate) => input.normalizeSessionRuntimeSnapshot(candidate),
+            buildRuntimeSnapshot: (candidate) => input.buildSessionRuntimeSnapshot(candidate),
             persistSessionRecord: input.persistSessionRecord,
           });
         } catch (error) {
@@ -107,9 +139,14 @@ export function createRuntimeV2CheckpointPort(
             revision: appended.checkpoint.revision,
             error: error instanceof Error ? error.message : String(error),
           });
-          throw error;
+          throw new RuntimeV2CheckpointWriteBoundaryError(
+            "checkpoint_persist_failed",
+          );
         }
         const latestState = input.get();
+        if (emergencyEnvelopeForOwner(latestState, owner)) {
+          return { disposition: "conflict" as const, checkpoint: null };
+        }
         const latestCheckpoint = checkpointForOwner(latestState, owner);
         if (
           latestCheckpoint &&
@@ -189,12 +226,196 @@ export function createRuntimeV2CheckpointPort(
           sequence: event.sequence,
           revision: appended.checkpoint.revision,
           sideEffectFence: event.type === "command.scheduled",
+          ...(event.type === "soft_signal.observed"
+            ? { signal: event.signal }
+            : {}),
+          ...(event.type === "recovery.exhausted"
+            ? { recoveryScope: event.scope }
+            : {}),
           rebasedConcurrentRuntime:
             storeRevisionBeforePersist !== expectedStoreRevision,
         });
         return { disposition: "committed" as const, checkpoint: appended.checkpoint };
       }
       return { disposition: "conflict" as const, checkpoint: null };
+    },
+
+    async commitEmergencyTerminal({
+      owner,
+      run,
+      expectedRevision,
+      envelope,
+    }) {
+      for (
+        let attempt = 1;
+        attempt <= CHECKPOINT_PROJECTION_ATTEMPTS;
+        attempt += 1
+      ) {
+        const state = input.get();
+        const currentEnvelope =
+          emergencyEnvelopeForOwner(state, owner);
+        const committed = commitRuntimeV2EmergencyTerminalEnvelope({
+          checkpoint: checkpointForOwner(state, owner),
+          currentEnvelope,
+          owner,
+          run,
+          expectedRevision,
+          envelope,
+        });
+        if (committed.disposition !== "committed") {
+          return committed;
+        }
+        const nextEnvelopeMap = {
+          ...emergencyEnvelopeMapFor(state),
+          [owner.turnId]: committed.envelope,
+        };
+        const projectedState = {
+          ...state,
+          runtimeV2EmergencyTerminalEnvelopes: nextEnvelopeMap,
+        };
+        let durableState: any = projectedState;
+        const sessions = state.sessionsByWorkspace?.[input.scopeKey] || [];
+        const sessionRecord = input.sessionId == null
+          ? null
+          : sessions.find((candidate: any) =>
+              candidate.id === input.sessionId
+            ) || null;
+        const shouldPersist =
+          input.sessionId != null &&
+          state.config?.sessionRecordingEnabled === true &&
+          sessionRecord?.recordingDisabled !== true;
+        if (shouldPersist) {
+          if (!sessionRecord) {
+            throw new RuntimeV2CheckpointWriteBoundaryError(
+              "checkpoint_persist_failed",
+            );
+          }
+          let saved: any;
+          try {
+            // This intentionally is a partial Session patch. The Project
+            // Session persistence adapter merges it with the last durable
+            // snapshot, so recursive live Store state and the oversized
+            // checkpoint ledger never enter this emergency write.
+            saved = await input.persistSessionRecord(input.scopeKey, {
+              id: sessionRecord.id,
+              storageRevision: sessionRecord.storageRevision,
+              transcriptPartial: true,
+              runtimeSnapshot: {
+                runtimeV2EmergencyTerminalEnvelopes: nextEnvelopeMap,
+              },
+            });
+          } catch (error) {
+            input.logStoreEvent(
+              "runtime_v2_emergency_terminal_persist_failed",
+              {
+                turnId: owner.turnId,
+                runId: run.runId,
+                lastRevision: expectedRevision,
+                reasonCode: envelope.reasonCode,
+                error: error instanceof Error
+                  ? error.message
+                  : String(error),
+              },
+            );
+            throw new RuntimeV2CheckpointWriteBoundaryError(
+              "checkpoint_persist_failed",
+            );
+          }
+          durableState = {
+            ...projectedState,
+            sessionsByWorkspace: {
+              ...state.sessionsByWorkspace,
+              [input.scopeKey]: sessions.map((candidate: any) =>
+                candidate.id === input.sessionId &&
+                  saved &&
+                  typeof saved === "object"
+                  ? { ...candidate, ...saved }
+                  : candidate
+              ),
+            },
+          };
+        }
+
+        const latestState = input.get();
+        const rechecked = commitRuntimeV2EmergencyTerminalEnvelope({
+          checkpoint: checkpointForOwner(latestState, owner),
+          currentEnvelope:
+            emergencyEnvelopeForOwner(latestState, owner),
+          owner,
+          run,
+          expectedRevision,
+          envelope,
+        });
+        if (rechecked.disposition === "idempotent") {
+          return rechecked;
+        }
+        if (rechecked.disposition !== "committed") {
+          input.logStoreEvent(
+            "runtime_v2_emergency_terminal_projection_conflict",
+            {
+              turnId: owner.turnId,
+              runId: run.runId,
+              lastRevision: expectedRevision,
+              disposition: "checkpoint_advanced",
+              attempt,
+            },
+          );
+          return { disposition: "conflict" as const, envelope: null };
+        }
+        const rebasedProjectedState = {
+          ...latestState,
+          runtimeV2EmergencyTerminalEnvelopes: {
+            ...emergencyEnvelopeMapFor(latestState),
+            [owner.turnId]: committed.envelope,
+          },
+        };
+        const rebasedDurableState = durableState &&
+            typeof durableState === "object"
+          ? {
+              ...rebasedProjectedState,
+              ...(durableState.sessionsByWorkspace
+                ? { sessionsByWorkspace: durableState.sessionsByWorkspace }
+                : {}),
+            }
+          : undefined;
+        const expectedStoreRevision = input.getSessionRevisionToken();
+        const published = input.publishOwnerScopedRuntimeProjection({
+          projectedState: rebasedProjectedState,
+          durableState: rebasedDurableState,
+          scopeKey: input.scopeKey,
+          sessionId: input.sessionId,
+          expectedRevisionToken: expectedStoreRevision,
+        });
+        if (!published.published) {
+          input.logStoreEvent(
+            "runtime_v2_emergency_terminal_projection_conflict",
+            {
+              turnId: owner.turnId,
+              runId: run.runId,
+              lastRevision: expectedRevision,
+              disposition: published.disposition,
+              attempt,
+            },
+          );
+          if (
+            published.disposition === "revision_conflict" &&
+            attempt < CHECKPOINT_PROJECTION_ATTEMPTS
+          ) {
+            continue;
+          }
+          return { disposition: "conflict" as const, envelope: null };
+        }
+        input.logStoreEvent("runtime_v2_emergency_terminal_committed", {
+          turnId: owner.turnId,
+          runId: run.runId,
+          lastRevision: expectedRevision,
+          resultKind: committed.envelope.resultKind,
+          reasonCode: committed.envelope.reasonCode,
+          hasMutation: committed.envelope.hasMutation,
+        });
+        return committed;
+      }
+      return { disposition: "conflict" as const, envelope: null };
     },
   };
 }
@@ -204,6 +425,13 @@ export function getRuntimeV2Checkpoint(
   owner: RuntimeV2TurnIdentity,
 ): RuntimeV2CheckpointV3 | null {
   return checkpointForOwner(state, owner);
+}
+
+export function getRuntimeV2EmergencyTerminalEnvelope(
+  state: unknown,
+  owner: RuntimeV2TurnIdentity,
+): RuntimeV2EmergencyTerminalEnvelopeV1 | null {
+  return emergencyEnvelopeForOwner(state, owner);
 }
 
 /** Narrow type-only guard used by adapter tests without importing a Store. */

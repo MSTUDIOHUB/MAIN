@@ -1,6 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { getToolTarget } from "../../lib/toolTarget";
-import { sha256Hex } from "../../lib/sha256";
 import { executeTool } from "../../lib/toolExecutor";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
@@ -13,9 +12,12 @@ import { PlanLedger } from "./planLedger";
 import {
   PLAN_CONTEXT_RESULT_CHARS,
   PLAN_READ_ONLY_TOOL_NAMES,
-  boundedPlanContent,
   compactRetainedPlanObservation,
 } from "./planModelProtocol";
+import {
+  boundedRuntimeV2ToolContent,
+  runtimeV2ContextBoundToolArguments,
+} from "./executionText";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 
@@ -56,10 +58,10 @@ export async function executeReadOnlyPlanTool(input: {
   readonly messages: AgentMessage[];
   readonly evidence: WorkPlanRuntimeEvidence[];
   readonly evidenceContents: Map<string, string>;
+  readonly parallelReadCount: number;
   readonly logStoreEvent: RuntimeV2PlanLog;
-}): Promise<boolean> {
+}): Promise<void> {
   const args = input.call.arguments;
-  const fingerprint = `plan-read:${input.call.name}:${sha256Hex(JSON.stringify(args))}`;
   if (!PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name)) {
     await settlePlanTool({
       ledger: input.ledger,
@@ -72,22 +74,30 @@ export async function executeReadOnlyPlanTool(input: {
       tool_call_id: input.call.id,
       content: "PLAN_TOOL_BLOCKED: use a read-only tool or submit_runtime_v2_work_plan.",
     });
-    return input.ledger.recordRecovery({
-      run: input.run,
-      scope: "action",
-      fingerprint,
-      reason: `Plan 模型重复请求未授权工具 ${input.call.name}，动作恢复预算已耗尽。`,
-    });
+    await input.ledger.recordSoftSignal(
+      input.run,
+      "protocol_drift",
+    );
+    return;
   }
   try {
     const output = await executeTool(
       input.call.name,
-      args,
+      runtimeV2ContextBoundToolArguments(
+        input.call.name,
+        args,
+        input.context.runtimeContextBudget,
+        { parallelReadCount: input.parallelReadCount },
+      ),
       input.context.runWorkspace || "",
       input.context.runSessionKey,
     );
     const target = getToolTarget(input.call.name, args) || input.call.name;
-    const content = boundedPlanContent(output);
+    const content = boundedRuntimeV2ToolContent(
+      input.call.name,
+      output,
+      input.context.runtimeContextBudget,
+    );
     const version = await resolveRuntimeV2SourceEvidenceVersion({
       toolName: input.call.name,
       args,
@@ -169,7 +179,7 @@ export async function executeReadOnlyPlanTool(input: {
       }),
       retainedChars: input.evidenceContents.get(evidenceEntry.id)?.length || 0,
     });
-    return true;
+    return;
   } catch (error) {
     await settlePlanTool({
       ledger: input.ledger,
@@ -182,11 +192,9 @@ export async function executeReadOnlyPlanTool(input: {
       tool_call_id: input.call.id,
       content: `PLAN_READ_FAILED: ${error instanceof Error ? error.message : String(error)}`,
     });
-    return input.ledger.recordRecovery({
-      run: input.run,
-      scope: "action",
-      fingerprint,
-      reason: `读取 ${input.call.name} 的同一结构化目标持续失败，动作恢复预算已耗尽。`,
-    });
+    await input.ledger.recordSoftSignal(
+      input.run,
+      "repeated_action",
+    );
   }
 }

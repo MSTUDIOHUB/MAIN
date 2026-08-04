@@ -1522,6 +1522,7 @@ test("session bootstrap patch is null when no temporary session is needed", () =
     },
     autoApproveTools: true,
     autoApproveToolScopes: ["read"],
+    preferSubagents: true,
     webSearchEnabled: true,
     webSearchProvider: "tavily",
   });
@@ -1557,6 +1558,7 @@ test("session bootstrap patch creates an active temporary session and clears ses
     },
     autoApproveTools: true,
     autoApproveToolScopes: ["read", "mcp_action"],
+    preferSubagents: true,
     webSearchEnabled: true,
     webSearchProvider: "brave",
   });
@@ -1572,6 +1574,7 @@ test("session bootstrap patch creates an active temporary session and clears ses
   assert.deepEqual(patch.sessionsByWorkspace["/tmp/other"], [{ id: 9, active: true, title: "Other" }]);
   assert.equal(patch.autoApproveTools, true);
   assert.deepEqual(patch.autoApproveToolScopes, ["read", "mcp_action"]);
+  assert.equal(patch.preferSubagents, true);
   assert.equal(patch.webSearchEnabled, true);
   assert.equal(patch.webSearchProvider, "brave");
   assert.deepEqual(patch.approvedLocalFileReadPaths, []);

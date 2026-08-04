@@ -173,23 +173,31 @@ test("parses every registered built-in tool from XML without registry drift", ()
   }
 });
 
-test("native collaboration schema keeps model ingress minimal and runtime metadata optional", () => {
+test("native collaboration schema exposes bounded read and transactional write contracts", () => {
   const spawn = TOOL_DEFINITIONS.find((tool) => tool.function.name === "spawn_subagent");
   const wait = TOOL_DEFINITIONS.find((tool) => tool.function.name === "wait_subagents");
   const cancel = TOOL_DEFINITIONS.find((tool) => tool.function.name === "cancel_subagent");
 
   assert.ok(spawn);
-  assert.deepEqual(spawn.function.parameters.required, ["objective"]);
+  assert.deepEqual(
+    spawn.function.parameters.required,
+    ["objective", "required_paths"],
+  );
   assert.deepEqual(spawn.function.parameters.properties.task_kind.enum, [
     "explore",
     "review",
-    "implement",
     "validate",
+    "implement",
   ]);
   assert.deepEqual(spawn.function.parameters.properties.access_mode.enum, [
     "read",
     "write",
   ]);
+  assert.deepEqual(
+    spawn.function.parameters.properties.implementation_operation.enum,
+    ["create", "modify", "delete"],
+  );
+  assert.ok(spawn.function.parameters.properties.implementation_plan);
   assert.ok(wait.function.parameters.properties.collaboration_task_ids);
   assert.ok(cancel.function.parameters.properties.collaboration_task_id);
   assert.equal(

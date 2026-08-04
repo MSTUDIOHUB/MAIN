@@ -9,6 +9,21 @@ export const READ_FILE_TOOL_NAMES = new Set([
   "read_file",
 ]);
 
+const SAFE_WORKSPACE_READ_TOOL_NAMES = new Set([
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "repo_map_search",
+  "repo_map_context",
+  "code_ast_query",
+  "find_symbol_references",
+  "read_file",
+  "get_file_outline",
+  "git_status",
+  "git_diff",
+  "get_project_skeleton",
+]);
+
 export const MUTATION_TOOL_NAMES = new Set([
   "apply_patch",
   "replace_in_file",
@@ -117,10 +132,19 @@ function createRun(event, runIndex) {
     providerTransportFailures: 0,
     providerRequestTimeouts: 0,
     toolDeadlineExceeded: 0,
+    lifecycleDeadlineClosures: 0,
+    providerRecoveryStallClosures: 0,
+    providerActionRejections: 0,
+    maxProviderRecoveryOccurrence: 0,
+    sourceOnlyFrontierContexts: 0,
+    providerActionWindows: 0,
+    correctiveMutationActionWindows: 0,
+    closedRecoveryActionWindows: 0,
     totalToolCalls: 0,
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
     mutationToolCalls: 0,
+    committedMutations: 0,
     validationToolCalls: 0,
     firstMutationIteration: null,
     noActionStops: 0,
@@ -129,9 +153,20 @@ function createRun(event, runIndex) {
     forcedContextPacks: 0,
     actualDroppedMessages: 0,
     subagentRequests: 0,
+    subagentContextHandoffs: 0,
+    subagentAutoJoins: 0,
+    subagentClosedObservationLoops: 0,
     subagentsJoined: 0,
+    completedSubagentsWithoutReport: 0,
+    subagentProviderActions: 0,
+    failedSubagentsWithoutEvidence: 0,
+    providerRequestsAfterFailedSubagentJoin: 0,
+    lastFailedSubagentJoinAt: null,
     recoveryExhaustions: 0,
+    actionRecoveryExhaustions: 0,
     softSignals: 0,
+    protocolDriftSignals: 0,
+    repeatedActionSignals: 0,
     validationPasses: 0,
     validationFailures: 0,
     invalidValidationAttempts: 0,
@@ -145,15 +180,21 @@ function createRun(event, runIndex) {
     oversizedMutationRejections: 0,
     outsideWorkspaceMutationRejections: 0,
     correctiveTargetRejections: 0,
+    mutationSourceTextMismatches: 0,
     investigationMutationSurfaceViolations: 0,
     sourceGapMutationSurfaceViolations: 0,
     mutationRequestsWithoutLease: 0,
     mutationEditorFallbacks: 0,
     maxAvailableContextEntries: 0,
     maxDroppedContextEntries: 0,
+    maxStrategyPivotRevision: 0,
     contextAnchorLosses: 0,
+    discardedSafeReadBatches: 0,
+    semanticProtocolFallbacks: 0,
     terminalResultKind: null,
     terminalReason: null,
+    staticOnlyBehavioralCriterionIds: [],
+    warnings: [],
     toolCallsByName: {},
     stopReasons: {},
     forcedContextReasons: {},
@@ -170,7 +211,11 @@ function extractToolNames(payload) {
     ? payload.names
     : Array.isArray(payload.toolNames)
       ? payload.toolNames
-      : [];
+      : payload.toolNames &&
+          typeof payload.toolNames === "object" &&
+          Array.isArray(payload.toolNames.names)
+        ? payload.toolNames.names
+        : [];
   return names
     .filter((name) => typeof name === "string" && name.trim())
     .map((name) => name.trim());
@@ -229,6 +274,12 @@ function applyEventToRun(run, event) {
 
   if (event.event === "store.runtime_v2_provider_request_opened") {
     run.providerRequests += 1;
+    if (
+      run.lastFailedSubagentJoinAt !== null &&
+      Number(event.timestamp) > run.lastFailedSubagentJoinAt
+    ) {
+      run.providerRequestsAfterFailedSubagentJoin += 1;
+    }
     run.maxIteration = Math.max(run.maxIteration, run.providerRequests);
   }
   if (event.event === "store.runtime_v2_provider_protocol_failed") {
@@ -236,15 +287,52 @@ function applyEventToRun(run, event) {
     if (payload.protocolCode === "tool_arguments_rejected") {
       run.invalidValidationAttempts += 1;
     }
+    if (
+      payload.transportFallbackAllowed === true &&
+      payload.protocolCode !== "required_tool_missing"
+    ) {
+      run.semanticProtocolFallbacks += 1;
+    }
   }
   if (event.event === "store.runtime_v2_provider_transport_failed") {
     run.providerTransportFailures += 1;
-    if (payload.timedOut === true) run.providerRequestTimeouts += 1;
+    if (
+      payload.timedOut === true ||
+      /timeout/i.test(String(payload.error || ""))
+    ) {
+      run.providerRequestTimeouts += 1;
+    }
   }
   if (event.event === "store.runtime_v2_tool_deadline_exceeded") {
     run.toolDeadlineExceeded += 1;
   }
+  if (event.event === "store.runtime_v2_lifecycle_deadline_reached") {
+    run.lifecycleDeadlineClosures += 1;
+  }
+  if (event.event === "store.runtime_v2_provider_recovery_stall_reached") {
+    run.providerRecoveryStallClosures += 1;
+    run.maxProviderRecoveryOccurrence = Math.max(
+      run.maxProviderRecoveryOccurrence,
+      asNonNegativeInteger(payload.occurrence),
+    );
+  }
+  if (event.event === "store.runtime_v2_provider_action_rejected") {
+    run.providerActionRejections += 1;
+  }
   if (event.event === "store.runtime_v2_context_prepared") {
+    if (payload.sourceOnlyFrontier === true) {
+      run.sourceOnlyFrontierContexts += 1;
+    }
+    const providerActionWindow = asString(payload.providerActionWindow);
+    if (providerActionWindow) {
+      run.providerActionWindows += 1;
+      if (providerActionWindow === "corrective_mutation") {
+        run.correctiveMutationActionWindows += 1;
+      }
+      if (providerActionWindow === "closed_recovery") {
+        run.closedRecoveryActionWindows += 1;
+      }
+    }
     run.maxAvailableContextEntries = Math.max(
       run.maxAvailableContextEntries,
       asNonNegativeInteger(payload.availableContextEntries),
@@ -252,6 +340,14 @@ function applyEventToRun(run, event) {
     run.maxDroppedContextEntries = Math.max(
       run.maxDroppedContextEntries,
       asNonNegativeInteger(payload.droppedEvidenceEntries),
+    );
+    run.maxStrategyPivotRevision = Math.max(
+      run.maxStrategyPivotRevision,
+      asNonNegativeInteger(payload.strategyPivotRevision),
+    );
+    run.maxProviderRecoveryOccurrence = Math.max(
+      run.maxProviderRecoveryOccurrence,
+      asNonNegativeInteger(payload.recoveryOccurrence),
     );
     const available = payload.contextSources &&
       typeof payload.contextSources === "object"
@@ -331,6 +427,12 @@ function applyEventToRun(run, event) {
   ) {
     run.correctiveTargetRejections += 1;
   }
+  if (
+    event.event === "store.runtime_v2_tool_execution_blocked" &&
+    payload.reason === "mutation_source_text_mismatch"
+  ) {
+    run.mutationSourceTextMismatches += 1;
+  }
   if (event.event === "store.runtime_v2_validation_fallback_selected") {
     run.validationFallbacks += 1;
   }
@@ -351,6 +453,16 @@ function applyEventToRun(run, event) {
     run.discardedToolCalls += Array.isArray(payload.discardedToolNames)
       ? payload.discardedToolNames.length
       : Math.max(0, asNonNegativeInteger(payload.originalToolCount) - 1);
+    if (
+      !Array.isArray(payload.acceptedToolNames) &&
+      Array.isArray(payload.discardedToolNames) &&
+      payload.discardedToolNames.length > 0 &&
+      payload.discardedToolNames.every((name) =>
+        SAFE_WORKSPACE_READ_TOOL_NAMES.has(name)
+      )
+    ) {
+      run.discardedSafeReadBatches += 1;
+    }
   }
   if (event.event === "store.runtime_v2_mutation_preflight_rejected") {
     run.mutationPreflightRejections += 1;
@@ -365,20 +477,59 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_subagent_request_opened") {
     run.subagentRequests += 1;
   }
+  if (event.event === "store.runtime_v2_subagent_context_handoff") {
+    run.subagentContextHandoffs += 1;
+  }
+  if (event.event === "store.runtime_v2_subagent_auto_join") {
+    run.subagentAutoJoins += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_subagent_closed_observation_loop"
+  ) {
+    run.subagentClosedObservationLoops += 1;
+  }
   if (event.event === "store.runtime_v2_subagent_joined") {
     run.subagentsJoined += 1;
+    if (
+      payload.status === "completed" &&
+      payload.structuredReport !== true
+    ) {
+      run.completedSubagentsWithoutReport += 1;
+    }
+    if (
+      payload.status === "failed" &&
+      (
+        !Array.isArray(payload.evidenceTargets) ||
+        payload.evidenceTargets.length === 0
+      )
+    ) {
+      run.failedSubagentsWithoutEvidence += 1;
+      run.lastFailedSubagentJoinAt = Number(event.timestamp);
+    }
   }
   if (
     event.event === "store.runtime_v2_ledger_committed" &&
     payload.eventType === "recovery.exhausted"
   ) {
     run.recoveryExhaustions += 1;
+    if (
+      payload.recoveryScope === "action" ||
+      payload.recoveryScope === "diagnostic"
+    ) {
+      run.actionRecoveryExhaustions += 1;
+    }
   }
   if (
     event.event === "store.runtime_v2_ledger_committed" &&
     payload.eventType === "soft_signal.observed"
   ) {
     run.softSignals += 1;
+    if (payload.signal === "protocol_drift") {
+      run.protocolDriftSignals += 1;
+    }
+    if (payload.signal === "repeated_action") {
+      run.repeatedActionSignals += 1;
+    }
   }
   if (event.event === "store.runtime_v2_phase_transition") {
     incrementCounter(
@@ -395,6 +546,12 @@ function applyEventToRun(run, event) {
   if (event.event === "store.runtime_v2_execute_terminal") {
     run.terminalResultKind = asString(payload.resultKind);
     run.terminalReason = asString(payload.reason);
+    run.committedMutations = asNonNegativeInteger(payload.mutations);
+    run.staticOnlyBehavioralCriterionIds =
+      Array.isArray(payload.staticOnlyBehavioralCriterionIds)
+        ? payload.staticOnlyBehavioralCriterionIds
+            .filter((id) => typeof id === "string" && id.trim())
+        : [];
     incrementCounter(
       run.stopReasons,
       `runtime_v2:${run.terminalResultKind || "unknown"}`,
@@ -437,6 +594,81 @@ function applyEventToRun(run, event) {
   if (isNoActionStop(event)) run.noActionStops += 1;
 }
 
+function finalizeRunWarnings(run) {
+  const warnings = [];
+  if (run.completedSubagentsWithoutReport > 0) {
+    warnings.push("completed_subagent_without_structured_report");
+  }
+  if (run.subagentRequests > run.subagentContextHandoffs) {
+    warnings.push("subagent_started_without_parent_context_handoff");
+  }
+  if (
+    run.subagentProviderActions > 0 &&
+    run.failedSubagentsWithoutEvidence > 0
+  ) {
+    warnings.push("failed_subagent_discarded_tool_evidence");
+  }
+  if (
+    run.terminalResultKind &&
+    run.failedSubagentsWithoutEvidence > 0 &&
+    run.providerRequestsAfterFailedSubagentJoin === 0
+  ) {
+    warnings.push("parent_did_not_resume_after_subagent_failure");
+  }
+  if (
+    run.terminalResultKind &&
+    run.recoveryExhaustions > 0 &&
+    (
+      run.providerProtocolFailures > 0 ||
+      run.protocolDriftSignals > 0
+    )
+  ) {
+    warnings.push("protocol_drift_caused_action_terminal");
+  }
+  if (run.staticOnlyBehavioralCriterionIds.length > 0) {
+    warnings.push("static_validation_claims_behavior_coverage");
+  }
+  if (
+    run.terminalReason === "provider_transport_exhausted" &&
+    run.providerTransportFailures === 0 &&
+    run.providerProtocolFailures === 0
+  ) {
+    warnings.push("non_provider_failure_marked_transport_exhaustion");
+  }
+  if (run.discardedSafeReadBatches > 0) {
+    warnings.push("safe_read_batch_discarded");
+  }
+  if (run.semanticProtocolFallbacks > 0) {
+    warnings.push("semantic_protocol_used_transport_fallback");
+  }
+  if (
+    run.providerProtocolFailures + run.providerActionRejections >= 3 &&
+    run.providerRequests >= 3 &&
+    run.maxStrategyPivotRevision === 0 &&
+    run.maxProviderRecoveryOccurrence === 0
+  ) {
+    warnings.push("provider_livelock_without_strategy_pivot");
+  }
+  if (
+    run.providerActionRejections >= 3 &&
+    run.committedMutations === 0
+  ) {
+    warnings.push("provider_repeated_actions_without_effect");
+  }
+  if (
+    run.terminalResultKind &&
+    run.terminalResultKind !== "success" &&
+    run.terminalResultKind !== "canceled" &&
+    run.totalToolCalls > 0 &&
+    run.committedMutations === 0 &&
+    run.sourceOnlyFrontierContexts >= 2 &&
+    run.providerRequests >= 2
+  ) {
+    warnings.push("source_only_frontier_ended_without_effect");
+  }
+  run.warnings = warnings;
+}
+
 function buildAggregate(runs) {
   const aggregate = {
     runCount: runs.length,
@@ -446,6 +678,7 @@ function buildAggregate(runs) {
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
     mutationToolCalls: 0,
+    committedMutations: 0,
     validationToolCalls: 0,
     firstMutationIteration: null,
     runsWithMutation: 0,
@@ -459,10 +692,28 @@ function buildAggregate(runs) {
     providerTransportFailures: 0,
     providerRequestTimeouts: 0,
     toolDeadlineExceeded: 0,
+    lifecycleDeadlineClosures: 0,
+    providerRecoveryStallClosures: 0,
+    providerActionRejections: 0,
+    maxProviderRecoveryOccurrence: 0,
+    sourceOnlyFrontierContexts: 0,
+    providerActionWindows: 0,
+    correctiveMutationActionWindows: 0,
+    closedRecoveryActionWindows: 0,
     subagentRequests: 0,
+    subagentContextHandoffs: 0,
+    subagentAutoJoins: 0,
+    subagentClosedObservationLoops: 0,
     subagentsJoined: 0,
+    completedSubagentsWithoutReport: 0,
+    subagentProviderActions: 0,
+    failedSubagentsWithoutEvidence: 0,
+    providerRequestsAfterFailedSubagentJoin: 0,
     recoveryExhaustions: 0,
+    actionRecoveryExhaustions: 0,
     softSignals: 0,
+    protocolDriftSignals: 0,
+    repeatedActionSignals: 0,
     validationPasses: 0,
     validationFailures: 0,
     invalidValidationAttempts: 0,
@@ -476,13 +727,17 @@ function buildAggregate(runs) {
     oversizedMutationRejections: 0,
     outsideWorkspaceMutationRejections: 0,
     correctiveTargetRejections: 0,
+    mutationSourceTextMismatches: 0,
     investigationMutationSurfaceViolations: 0,
     sourceGapMutationSurfaceViolations: 0,
     mutationRequestsWithoutLease: 0,
     mutationEditorFallbacks: 0,
     maxAvailableContextEntries: 0,
     maxDroppedContextEntries: 0,
+    maxStrategyPivotRevision: 0,
     contextAnchorLosses: 0,
+    discardedSafeReadBatches: 0,
+    semanticProtocolFallbacks: 0,
     workflowModes: {},
     runtimeIntents: {},
     runtimeVersions: {},
@@ -493,6 +748,8 @@ function buildAggregate(runs) {
     mutationLeaseAuthorities: {},
     phaseTransitions: {},
     projections: {},
+    warningCounts: {},
+    totalWarnings: 0,
   };
 
   for (const run of runs) {
@@ -503,6 +760,7 @@ function buildAggregate(runs) {
       "unclassifiedToolCalls",
       "readFileCalls",
       "mutationToolCalls",
+      "committedMutations",
       "validationToolCalls",
       "noActionStops",
       "providerCompatibilityRetries",
@@ -514,10 +772,27 @@ function buildAggregate(runs) {
       "providerTransportFailures",
       "providerRequestTimeouts",
       "toolDeadlineExceeded",
+      "lifecycleDeadlineClosures",
+      "providerRecoveryStallClosures",
+      "providerActionRejections",
+      "sourceOnlyFrontierContexts",
+      "providerActionWindows",
+      "correctiveMutationActionWindows",
+      "closedRecoveryActionWindows",
       "subagentRequests",
+      "subagentContextHandoffs",
+      "subagentAutoJoins",
+      "subagentClosedObservationLoops",
       "subagentsJoined",
+      "completedSubagentsWithoutReport",
+      "subagentProviderActions",
+      "failedSubagentsWithoutEvidence",
+      "providerRequestsAfterFailedSubagentJoin",
       "recoveryExhaustions",
+      "actionRecoveryExhaustions",
       "softSignals",
+      "protocolDriftSignals",
+      "repeatedActionSignals",
       "validationPasses",
       "validationFailures",
       "invalidValidationAttempts",
@@ -531,13 +806,20 @@ function buildAggregate(runs) {
       "oversizedMutationRejections",
       "outsideWorkspaceMutationRejections",
       "correctiveTargetRejections",
+      "mutationSourceTextMismatches",
       "investigationMutationSurfaceViolations",
       "sourceGapMutationSurfaceViolations",
       "mutationRequestsWithoutLease",
       "mutationEditorFallbacks",
       "contextAnchorLosses",
+      "discardedSafeReadBatches",
+      "semanticProtocolFallbacks",
     ]) {
       aggregate[field] += run[field];
+    }
+    for (const warning of run.warnings) {
+      aggregate.totalWarnings += 1;
+      incrementCounter(aggregate.warningCounts, warning);
     }
     aggregate.maxAvailableContextEntries = Math.max(
       aggregate.maxAvailableContextEntries,
@@ -546,6 +828,14 @@ function buildAggregate(runs) {
     aggregate.maxDroppedContextEntries = Math.max(
       aggregate.maxDroppedContextEntries,
       run.maxDroppedContextEntries,
+    );
+    aggregate.maxStrategyPivotRevision = Math.max(
+      aggregate.maxStrategyPivotRevision,
+      run.maxStrategyPivotRevision,
+    );
+    aggregate.maxProviderRecoveryOccurrence = Math.max(
+      aggregate.maxProviderRecoveryOccurrence,
+      run.maxProviderRecoveryOccurrence,
     );
     if (run.firstMutationIteration !== null) {
       aggregate.runsWithMutation += 1;
@@ -606,6 +896,18 @@ export function analyzeAgentRuntimeEvents(events) {
       runtimeV2Runs.set(runtimeV2RunId, run);
       runs.push(run);
     }
+    if (
+      runtimeV2RunId &&
+      event.event === "store.runtime_v2_subagent_provider_result" &&
+      runtimeV2RunId.includes(":child:")
+    ) {
+      const parentRunId = runtimeV2RunId.slice(
+        0,
+        runtimeV2RunId.indexOf(":child:"),
+      );
+      const parentRun = runtimeV2Runs.get(parentRunId);
+      if (parentRun) parentRun.subagentProviderActions += 1;
+    }
     const targetRun = runtimeV2RunId
       ? runtimeV2Runs.get(runtimeV2RunId)
       : currentRun;
@@ -613,6 +915,8 @@ export function analyzeAgentRuntimeEvents(events) {
       applyEventToRun(targetRun, event);
     }
   }
+
+  for (const run of runs) finalizeRunWarnings(run);
 
   return {
     schemaVersion: 2,

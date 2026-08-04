@@ -34,18 +34,100 @@ function loadTs(sourcePath) {
 }
 
 const lanes = loadTs(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
+const appConfig = loadTs(path.join(workspaceRoot, "src/lib/appConfig.ts"));
 
-function localConfig() {
+function localConfig(maxActiveRequests) {
   return {
     activeProfile: "local",
-    local: { provider: "OMLX", endpoint: "http://127.0.0.1:8000/v1", model: "qwen" },
+    local: {
+      provider: "local-provider",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "fixture-model",
+      ...(maxActiveRequests ? { maxActiveRequests } : {}),
+    },
     cloud: {},
     cloudServers: [],
     activeCloudServerId: "",
   };
 }
 
-test("local parent and two child model requests overlap after cold-start admission", async () => {
+test("lane identity canonicalizes endpoint routing without retaining credentials", () => {
+  const withSecrets = localConfig();
+  withSecrets.local.endpoint =
+    "HTTP://user:super-secret@127.0.0.1:8000/v1/?api_key=also-secret#fragment";
+  const canonical = localConfig();
+  canonical.local.endpoint = "http://127.0.0.1:8000/v1";
+
+  const secretKey = appConfig.resolveRuntimeLaneKey(withSecrets);
+  assert.equal(secretKey, appConfig.resolveRuntimeLaneKey(canonical));
+  assert.doesNotMatch(secretKey, /super-secret|also-secret|user/i);
+});
+
+test("serialized local lanes expose no fake parallel child capacity", () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const unknown = lanes.getModelLaneCapacityObservation(localConfig());
+  assert.equal(unknown.configured, false);
+  assert.equal(unknown.maxActiveRequests, 1);
+  assert.equal(unknown.maxActiveSubagents, 0);
+  assert.equal(unknown.requestMode, "serialized");
+
+  const configuredSerial =
+    lanes.getModelLaneCapacityObservation(localConfig(1));
+  assert.equal(configuredSerial.configured, true);
+  assert.equal(configuredSerial.maxActiveRequests, 1);
+  assert.equal(configuredSerial.maxActiveSubagents, 0);
+  assert.equal(configuredSerial.requestMode, "serialized");
+
+  const configured =
+    lanes.getModelLaneCapacityObservation(localConfig(4));
+  assert.equal(configured.configured, true);
+  assert.equal(configured.maxActiveRequests, 4);
+  assert.equal(configured.maxActiveSubagents, 3);
+  assert.equal(configured.requestMode, "parallel");
+
+  const oversized =
+    lanes.getModelLaneCapacityObservation(localConfig(99));
+  assert.equal(oversized.configured, true);
+  assert.equal(oversized.requestLimitCeiling, 4);
+  assert.equal(oversized.maxActiveRequests, 4);
+  assert.equal(oversized.maxActiveSubagents, 3);
+});
+
+test("an unknown local child waits for the parent request and then runs on the serial lane", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const events = [];
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "parent",
+  });
+  parent.markFirstToken();
+  let admitted = false;
+  const childPromise = lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-serial",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+  }).then((lease) => {
+    admitted = true;
+    return lease;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitted, false);
+  assert.ok(events.some((entry) =>
+    entry.event === "model_lane_admission" &&
+    entry.data.decision === "queued" &&
+    entry.data.queueReason === "lane_full" &&
+    entry.data.limit === 1
+  ));
+  parent.release();
+  const child = await childPromise;
+  assert.equal(admitted, true);
+  child.release();
+});
+
+test("explicit local capacity allows parent and two child model requests to overlap", async () => {
   lanes.resetModelLaneCoordinatorForTests();
   const events = [];
   lanes.setModelLaneMemoryReaderForTests(async () => ({
@@ -55,14 +137,14 @@ test("local parent and two child model requests overlap after cold-start admissi
     available_bytes: 20 * 1024 ** 3,
   }));
   const parent = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     contextLimit: 131072,
     requestTokenBudget: 10_000,
     agentKind: "parent",
   });
   let admittedChildren = 0;
   const firstChildPromise = lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     contextLimit: 131072,
     requestTokenBudget: 10_000,
     agentKind: "subagent",
@@ -73,7 +155,7 @@ test("local parent and two child model requests overlap after cold-start admissi
     return lease;
   });
   const secondChildPromise = lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     contextLimit: 131072,
     requestTokenBudget: 10_000,
     agentKind: "subagent",
@@ -89,7 +171,12 @@ test("local parent and two child model requests overlap after cold-start admissi
   const firstChild = await firstChildPromise;
   firstChild.markFirstToken();
   const secondChild = await secondChildPromise;
+  secondChild.markFirstToken();
   assert.equal(admittedChildren, 2);
+  const observed =
+    lanes.getModelLaneCapacityObservation(localConfig(4));
+  assert.equal(observed.maxConfirmedActiveRequests, 3);
+  assert.equal(observed.maxActiveSubagents, 3);
   assert.ok(events.some((entry) =>
     entry.event === "model_lane_admission" &&
     entry.data.activeRequests === 3 &&
@@ -106,7 +193,7 @@ test("local parent and two child model requests overlap after cold-start admissi
   parent.release();
 });
 
-test("healthy local overlap exposes an elastic fourth model lane for parent plus three children", async () => {
+test("explicit local capacity admits a fourth model request after healthy overlap", async () => {
   lanes.resetModelLaneCoordinatorForTests();
   const events = [];
   lanes.setModelLaneMemoryReaderForTests(async () => ({
@@ -116,20 +203,20 @@ test("healthy local overlap exposes an elastic fourth model lane for parent plus
     available_bytes: 24 * 1024 ** 3,
   }));
   const parent = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     requestTokenBudget: 10_000,
     agentKind: "parent",
   });
   parent.markFirstToken();
   const firstChild = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     requestTokenBudget: 10_000,
     agentKind: "subagent",
     subagentId: "subagent-burst-1",
   });
   firstChild.markFirstToken();
   const secondChild = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     requestTokenBudget: 10_000,
     agentKind: "subagent",
     subagentId: "subagent-burst-2",
@@ -140,7 +227,7 @@ test("healthy local overlap exposes an elastic fourth model lane for parent plus
   assert.equal(lanes.getModelLaneBurstAdmission(parent.laneKey).allowed, true);
 
   const thirdChild = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(4),
     requestTokenBudget: 10_000,
     agentKind: "subagent",
     subagentId: "subagent-burst-3",
@@ -169,7 +256,7 @@ test("two local subagent streams overlap using measured request demand instead o
     available_bytes: 20 * 1024 ** 3,
   }));
   const first = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(2),
     contextLimit: 131072,
     requestTokenBudget: 12_000,
     agentKind: "subagent",
@@ -177,7 +264,7 @@ test("two local subagent streams overlap using measured request demand instead o
     onDebugEvent: (event, data) => events.push({ event, data }),
   });
   const secondPromise = lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(2),
     contextLimit: 131072,
     requestTokenBudget: 12_000,
     agentKind: "subagent",
@@ -210,14 +297,14 @@ test("critical admission pressure rejects the child while preserving the parent"
     available_bytes: 3 * 1024 ** 3,
   }));
   const parent = await lanes.acquireModelLane({
-    config: localConfig(),
+    config: localConfig(2),
     contextLimit: 32768,
     agentKind: "parent",
   });
   parent.markFirstToken();
   await assert.rejects(
     lanes.acquireModelLane({
-      config: localConfig(),
+      config: localConfig(2),
       contextLimit: 32768,
       agentKind: "subagent",
       subagentId: "subagent-pressure",
@@ -227,7 +314,7 @@ test("critical admission pressure rejects the child while preserving the parent"
   parent.release();
 });
 
-for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "524 gateway timeout"]) {
+for (const failureMessage of ["OOM", "429 rate limited", "concurrency limit reached"]) {
   test(`capacity failure '${failureMessage}' hands the newest child back before the parent`, async () => {
     lanes.resetModelLaneCoordinatorForTests();
     lanes.setModelLaneMemoryReaderForTests(async () => ({
@@ -237,20 +324,20 @@ for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "52
       available_bytes: 30 * 1024 ** 3,
     }));
     const parent = await lanes.acquireModelLane({
-      config: localConfig(),
+      config: localConfig(4),
       contextLimit: 32768,
       agentKind: "parent",
     });
     parent.markFirstToken();
     const firstChild = await lanes.acquireModelLane({
-      config: localConfig(),
+      config: localConfig(4),
       contextLimit: 32768,
       agentKind: "subagent",
       subagentId: "subagent-failure-first",
     });
     firstChild.markFirstToken();
     const secondChild = await lanes.acquireModelLane({
-      config: localConfig(),
+      config: localConfig(4),
       contextLimit: 32768,
       agentKind: "subagent",
       subagentId: "subagent-failure-second",
@@ -268,3 +355,58 @@ for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "52
     parent.release();
   });
 }
+
+test("transport and semantic timeouts do not falsely degrade provider capacity", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    contextLimit: 32768,
+    agentKind: "parent",
+  });
+  for (const message of [
+    "connection reset",
+    "524 gateway timeout",
+    "STREAM_NO_VISIBLE_PROGRESS_TIMEOUT",
+  ]) {
+    assert.equal(parent.reportFailure(new Error(message)), false);
+  }
+  parent.release();
+});
+
+test("a transient memory probe failure recovers without restarting the lane", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  let attempts = 0;
+  lanes.setModelLaneMemoryReaderForTests(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("temporary probe failure");
+    return {
+      total_gb: 64,
+      available_gb: 24,
+      total_bytes: 64 * 1024 ** 3,
+      available_bytes: 24 * 1024 ** 3,
+    };
+  });
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "parent",
+  });
+  parent.markFirstToken();
+  assert.equal(
+    await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000),
+    false,
+  );
+  assert.equal(
+    lanes.getModelLaneBurstAdmission(parent.laneKey).reason,
+    "memory_probe_unavailable",
+  );
+  assert.equal(
+    await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000),
+    true,
+  );
+  assert.notEqual(
+    lanes.getModelLaneBurstAdmission(parent.laneKey).reason,
+    "memory_probe_unavailable",
+  );
+  parent.release();
+});

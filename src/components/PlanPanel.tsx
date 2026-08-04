@@ -298,7 +298,11 @@ export default function PlanPanel({
   const auditedTasks = taskAudit.tasks;
   const doneCount = taskAudit.completedCount;
   const progressPct = taskAudit.totalCount > 0 ? Math.round((doneCount / taskAudit.totalCount) * 100) : 0;
-  const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
+  const activeTurn = (
+    presentation?.turnId
+      ? turns.find((turn) => turn.id === presentation.turnId)
+      : null
+  ) || [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
   const showTaskProgress = (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
   const legacyLifecycle = resolveTurnPresentationLifecycle(
     isAwaitingApproval
@@ -444,7 +448,7 @@ export default function PlanPanel({
           <div>
             <div className="text-[12px] font-semibold tracking-[0.18em] uppercase text-[#71717a]">{copy.workspaceTitle}</div>
             <div className="mt-1 text-[15px] font-semibold text-[#f5f5f5] break-words">
-              {activeTurn?.title || copy.currentPlan}
+              {runtimeV2Review?.title || activeTurn?.title || copy.currentPlan}
             </div>
             <div className="mt-1 text-[12px] leading-relaxed text-[#a1a1aa]">{helperText}</div>
             {isTemporaryWorkspace && (

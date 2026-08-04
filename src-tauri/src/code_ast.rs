@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -10,6 +11,7 @@ const MAX_REFERENCE_FILE_BYTES: u64 = 768 * 1024;
 const MAX_REFERENCE_FILES: usize = 500;
 const DEFAULT_RESULT_LIMIT: usize = 80;
 const MAX_RESULT_LIMIT: usize = 200;
+const MAX_REPORTED_SYNTAX_ERRORS: usize = 32;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +66,34 @@ pub struct SymbolReferencesResult {
     pub occurrences: Vec<SymbolOccurrence>,
     pub truncated: bool,
     pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSyntaxError {
+    pub line: usize,
+    pub column: usize,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSyntaxCheckResult {
+    pub path: String,
+    pub language: Option<String>,
+    pub applicable: bool,
+    pub has_errors: bool,
+    pub error_count: usize,
+    pub first_error_line: Option<usize>,
+    pub first_error_column: Option<usize>,
+    pub errors: Vec<SourceSyntaxError>,
+    pub errors_truncated: bool,
+    /// Exact ES module export names in this in-memory post-image. The
+    /// mutation preflight compares this with the current file and checks real
+    /// workspace imports before permitting a public API removal.
+    pub module_exports: Vec<String>,
 }
 
 fn language_for_path(path: &Path) -> Option<(&'static str, Language)> {
@@ -233,6 +263,221 @@ fn count_errors(root: Node<'_>) -> usize {
         stack.extend(node.children(&mut cursor));
     }
     count
+}
+
+fn module_export_name(node: Node<'_>, source: &[u8]) -> String {
+    node_text(node, source)
+        .trim()
+        .trim_matches(|character| character == '\'' || character == '"')
+        .to_string()
+}
+
+fn declaration_export_names<'a>(
+    declaration: Node<'a>,
+    source: &'a [u8],
+) -> Vec<(String, usize, usize)> {
+    if matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        let mut names = Vec::new();
+        let mut stack = vec![declaration];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "variable_declarator" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let value = module_export_name(name, source);
+                    if !value.is_empty() {
+                        let position = name.start_position();
+                        names.push((value, position.row, position.column));
+                    }
+                }
+                continue;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        return names;
+    }
+
+    declaration
+        .child_by_field_name("name")
+        .map(|name| {
+            let position = name.start_position();
+            (
+                module_export_name(name, source),
+                position.row,
+                position.column,
+            )
+        })
+        .filter(|(name, _, _)| !name.is_empty())
+        .into_iter()
+        .collect()
+}
+
+fn export_statement_names<'a>(
+    statement: Node<'a>,
+    source: &'a [u8],
+) -> Vec<(String, usize, usize)> {
+    let mut cursor = statement.walk();
+    if let Some(default_node) = statement
+        .children(&mut cursor)
+        .find(|child| child.kind() == "default")
+    {
+        let position = default_node.start_position();
+        return vec![("default".to_string(), position.row, position.column)];
+    }
+
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        return declaration_export_names(declaration, source);
+    }
+
+    let mut names = Vec::new();
+    let mut stack = vec![statement];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "export_specifier" {
+            if let Some(name) = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                let value = module_export_name(name, source);
+                if !value.is_empty() {
+                    let position = name.start_position();
+                    names.push((value, position.row, position.column));
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    names
+}
+
+fn duplicate_module_export_positions(
+    root: Node<'_>,
+    source: &[u8],
+    language_name: &str,
+) -> Vec<(usize, usize, String)> {
+    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        for (name, row, column) in export_statement_names(statement, source) {
+            if !seen.insert(name.clone()) {
+                duplicates.push((row, column, name));
+            }
+        }
+    }
+    duplicates
+}
+
+fn module_export_names(root: Node<'_>, source: &[u8], language_name: &str) -> Vec<String> {
+    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        for (name, _, _) in export_statement_names(statement, source) {
+            if !name.is_empty() && seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxCheckResult, String> {
+    if source.len() as u64 > MAX_AST_FILE_BYTES {
+        return Err(format!(
+            "AST_SOURCE_TOO_LARGE: {} bytes exceeds the {} byte parser limit.",
+            source.len(),
+            MAX_AST_FILE_BYTES
+        ));
+    }
+    let Some((language_name, language)) = language_for_path(path) else {
+        return Ok(SourceSyntaxCheckResult {
+            path: path.to_string_lossy().replace('\\', "/"),
+            language: None,
+            applicable: false,
+            has_errors: false,
+            error_count: 0,
+            first_error_line: None,
+            first_error_column: None,
+            errors: Vec::new(),
+            errors_truncated: false,
+            module_exports: Vec::new(),
+        });
+    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|error| format!("AST_LANGUAGE_INIT_FAILED: {error}"))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| "AST_PARSE_FAILED: parser returned no syntax tree.".to_string())?;
+    let root = tree.root_node();
+    let mut errors = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            let position = node.start_position();
+            errors.push((
+                position.row,
+                position.column,
+                if node.is_missing() {
+                    format!("missing_{}", node.kind())
+                } else {
+                    "parse_error".to_string()
+                },
+                None,
+            ));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    errors.extend(
+        duplicate_module_export_positions(root, source, language_name)
+            .into_iter()
+            .map(|(row, column, symbol)| {
+                (row, column, "duplicate_export".to_string(), Some(symbol))
+            }),
+    );
+    errors.sort_unstable();
+    errors.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+    let first = errors.first();
+    let reported_errors = errors
+        .iter()
+        .take(MAX_REPORTED_SYNTAX_ERRORS)
+        .map(|(row, column, kind, symbol)| SourceSyntaxError {
+            line: row + 1,
+            column: column + 1,
+            kind: kind.clone(),
+            symbol: symbol.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(SourceSyntaxCheckResult {
+        path: path.to_string_lossy().replace('\\', "/"),
+        language: Some(language_name.to_string()),
+        applicable: true,
+        has_errors: !errors.is_empty(),
+        error_count: errors.len(),
+        first_error_line: first.map(|position| position.0 + 1),
+        first_error_column: first.map(|position| position.1 + 1),
+        errors_truncated: errors.len() > reported_errors.len(),
+        errors: reported_errors,
+        module_exports: module_export_names(root, source, language_name),
+    })
 }
 
 pub fn query_file(
@@ -509,8 +754,9 @@ pub fn find_references(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_references, query_file};
+    use super::{check_source_syntax, find_references, query_file};
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -536,6 +782,78 @@ mod tests {
             .symbols
             .iter()
             .any(|symbol| symbol.name == "buildGreeter"));
+    }
+
+    #[test]
+    fn source_syntax_check_rejects_the_malformed_md_viewer_edit() {
+        let malformed = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function bindToolbar() { return true; }\n}entFile(filePath) {\n",
+        )
+        .unwrap();
+        assert!(malformed.applicable);
+        assert!(malformed.has_errors);
+        assert!(malformed.error_count > 0);
+        assert_eq!(malformed.first_error_line, Some(2));
+        assert!(malformed.errors.iter().any(|error| error.line == 2));
+
+        let valid = check_source_syntax(
+            Path::new("src/toolbar.tsx"),
+            b"export const Toolbar = () => <button>Save</button>;\n",
+        )
+        .unwrap();
+        assert!(valid.applicable);
+        assert!(!valid.has_errors);
+
+        let unsupported = check_source_syntax(Path::new("README.md"), b"# MAIN\n").unwrap();
+        assert!(!unsupported.applicable);
+    }
+
+    #[test]
+    fn source_syntax_check_rejects_duplicate_module_exports() {
+        let duplicate = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function updateTheme(theme) { return theme; }\nexport function updateTheme(theme) { return theme; }\n",
+        )
+        .unwrap();
+
+        assert!(duplicate.applicable);
+        assert!(duplicate.has_errors);
+        assert!(duplicate.error_count > 0);
+        assert_eq!(duplicate.first_error_line, Some(2));
+        assert!(duplicate
+            .errors
+            .iter()
+            .any(|error| error.kind == "duplicate_export"
+                && error.symbol.as_deref() == Some("updateTheme")));
+        assert_eq!(duplicate.module_exports, vec!["updateTheme"]);
+    }
+
+    #[test]
+    fn source_syntax_check_exposes_independent_md_viewer_errors_for_stepwise_repair() {
+        let broken = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function updateTheme(theme) { return theme; }\n}entFile(filePath) {}\nexport function updateTheme(theme) { return theme; }\n",
+        )
+        .unwrap();
+        assert!(broken
+            .errors
+            .iter()
+            .any(|error| error.kind == "parse_error"));
+        assert!(broken.errors.iter().any(|error| {
+            error.kind == "duplicate_export" && error.symbol.as_deref() == Some("updateTheme")
+        }));
+
+        let parser_repaired = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function updateTheme(theme) { return theme; }\nexport function setCurrentFile(filePath) {}\nexport function updateTheme(theme) { return theme; }\n",
+        )
+        .unwrap();
+        assert!(parser_repaired.error_count < broken.error_count);
+        assert!(parser_repaired
+            .errors
+            .iter()
+            .all(|error| error.kind == "duplicate_export"));
     }
 
     #[test]

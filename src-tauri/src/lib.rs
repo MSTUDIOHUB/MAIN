@@ -79,7 +79,10 @@ const HTTP_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const CURL_FALLBACK_STDERR_LIMIT_BYTES: usize = 64 * 1024;
 const CURL_FALLBACK_SUPERVISOR_GRACE_SECS: u64 = 5;
-const STREAM_PHASE_TIMEOUT_SECS: u64 = 180;
+// This watchdog applies independently to response headers, the first chunk,
+// and each subsequent idle gap. It is not a total model-generation or Turn
+// duration limit; every received chunk opens a fresh phase window.
+const STREAM_PHASE_TIMEOUT_SECS: u64 = 600;
 const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 1_000;
 const READ_FILE_WINDOW_MAX_LINES: usize = 2_000;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 32_000;
@@ -2813,6 +2816,14 @@ fn code_ast_query(
 }
 
 #[tauri::command]
+fn check_source_syntax(
+    path: String,
+    content: String,
+) -> Result<code_ast::SourceSyntaxCheckResult, String> {
+    code_ast::check_source_syntax(Path::new(&path), content.as_bytes())
+}
+
+#[tauri::command]
 async fn find_symbol_references(
     state: State<'_, WorkspaceState>,
     symbol: String,
@@ -3709,6 +3720,9 @@ struct ReadFileWindowResult {
     returned_chars: usize,
     truncated: bool,
     next_start_line: Option<usize>,
+    returned_start_char: Option<usize>,
+    returned_end_char: Option<usize>,
+    next_start_char: Option<usize>,
 }
 
 #[derive(serde::Serialize)]
@@ -3718,23 +3732,154 @@ struct OpenFileExternalResult {
     opened: bool,
 }
 
-fn normalize_read_file_line(mut raw: String) -> String {
-    if raw.ends_with('\n') {
-        raw.pop();
-        if raw.ends_with('\r') {
-            raw.pop();
-        }
-    } else if raw.ends_with('\r') {
-        raw.pop();
-    }
-    raw
-}
+fn read_file_window_from_reader<R: BufRead>(
+    path: String,
+    reader: &mut R,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+    start_char: Option<usize>,
+) -> Result<ReadFileWindowResult, String> {
+    let start = start_line.unwrap_or(1).max(1);
+    let requested_max_lines = max_lines
+        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_LINES)
+        .clamp(1, READ_FILE_WINDOW_MAX_LINES);
+    let requested_end = end_line
+        .filter(|end| *end >= start)
+        .unwrap_or(start.saturating_add(requested_max_lines).saturating_sub(1))
+        .min(start.saturating_add(requested_max_lines).saturating_sub(1));
+    let char_limit = max_chars
+        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_CHARS)
+        .clamp(1, READ_FILE_WINDOW_MAX_CHARS);
+    let requested_start_char = start_char.unwrap_or(0);
+    let requested_end_char = requested_start_char.saturating_add(char_limit);
+    let mut raw = String::new();
+    let mut content = String::new();
+    let mut total_lines = 0usize;
+    let mut total_chars = 0usize;
+    let mut selected_lines = 0usize;
+    let mut selected_chars = 0usize;
+    let mut selection_closed = false;
+    let mut long_line_char_range: Option<(usize, usize)> = None;
+    let mut content_hasher = Sha256::new();
 
-fn take_prefix_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+    loop {
+        raw.clear();
+        let bytes = reader
+            .read_line(&mut raw)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+        content_hasher.update(raw.as_bytes());
+        let line_start_char = total_chars;
+        let line_chars = raw.chars().count();
+        let line_end_char = line_start_char.saturating_add(line_chars);
+        total_lines += 1;
+        total_chars = line_end_char;
+
+        if start_char.is_some() {
+            let overlap_start = requested_start_char.max(line_start_char);
+            let overlap_end = requested_end_char.min(line_end_char);
+            if overlap_start < overlap_end {
+                content.extend(
+                    raw.chars()
+                        .skip(overlap_start - line_start_char)
+                        .take(overlap_end - overlap_start),
+                );
+            }
+            continue;
+        }
+        if total_lines < start || total_lines > requested_end || selection_closed {
+            continue;
+        }
+        if selected_lines == 0 && line_chars > char_limit {
+            content.extend(raw.chars().take(char_limit));
+            selected_chars = char_limit;
+            long_line_char_range =
+                Some((line_start_char, line_start_char.saturating_add(char_limit)));
+            selection_closed = true;
+            continue;
+        }
+        if selected_lines > 0 && selected_chars.saturating_add(line_chars) > char_limit {
+            selection_closed = true;
+            continue;
+        }
+        content.push_str(&raw);
+        selected_lines += 1;
+        selected_chars = selected_chars.saturating_add(line_chars);
     }
-    value.chars().take(max_chars).collect()
+
+    let content_version = format!("sha256-{:x}", content_hasher.finalize());
+    if start_char.is_some() {
+        let returned_start_char = requested_start_char.min(total_chars);
+        let returned_end_char = requested_end_char.min(total_chars);
+        return Ok(ReadFileWindowResult {
+            path,
+            content,
+            content_version,
+            start_line: 0,
+            end_line: 0,
+            total_lines,
+            total_chars,
+            returned_chars: returned_end_char.saturating_sub(returned_start_char),
+            truncated: returned_start_char != 0 || returned_end_char != total_chars,
+            next_start_line: None,
+            returned_start_char: Some(returned_start_char),
+            returned_end_char: Some(returned_end_char),
+            next_start_char: (returned_end_char < total_chars).then_some(returned_end_char),
+        });
+    }
+    if let Some((returned_start_char, returned_end_char)) = long_line_char_range {
+        return Ok(ReadFileWindowResult {
+            path,
+            content,
+            content_version,
+            start_line: 0,
+            end_line: 0,
+            total_lines,
+            total_chars,
+            returned_chars: returned_end_char.saturating_sub(returned_start_char),
+            truncated: true,
+            next_start_line: None,
+            returned_start_char: Some(returned_start_char),
+            returned_end_char: Some(returned_end_char),
+            next_start_char: Some(returned_end_char),
+        });
+    }
+
+    let returned_start = if selected_lines == 0 { 0 } else { start };
+    let returned_end = if selected_lines == 0 {
+        0
+    } else {
+        returned_start + selected_lines.saturating_sub(1)
+    };
+    let more_requested_lines =
+        returned_end > 0 && returned_end < requested_end.min(total_lines.max(1));
+    let more_file_lines = returned_end > 0 && returned_end < total_lines;
+    let not_whole_file = total_lines > 0 && (returned_start != 1 || returned_end != total_lines);
+    let truncated = not_whole_file || more_requested_lines || more_file_lines;
+
+    Ok(ReadFileWindowResult {
+        path,
+        content,
+        content_version,
+        start_line: returned_start,
+        end_line: returned_end,
+        total_lines,
+        total_chars,
+        returned_chars: selected_chars,
+        truncated,
+        next_start_line: if more_file_lines || more_requested_lines {
+            Some(returned_end + 1)
+        } else {
+            None
+        },
+        returned_start_char: None,
+        returned_end_char: None,
+        next_start_char: None,
+    })
 }
 
 #[tauri::command]
@@ -3819,6 +3964,7 @@ fn read_file_window(
     end_line: Option<usize>,
     max_lines: Option<usize>,
     max_chars: Option<usize>,
+    start_char: Option<usize>,
 ) -> Result<ReadFileWindowResult, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
@@ -3826,104 +3972,17 @@ fn read_file_window(
         return Err("read_file_window 目标不是文件".to_string());
     }
 
-    let start = start_line.unwrap_or(1).max(1);
-    let requested_max_lines = max_lines
-        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_LINES)
-        .clamp(1, READ_FILE_WINDOW_MAX_LINES);
-    let requested_end = end_line
-        .unwrap_or(start.saturating_add(requested_max_lines).saturating_sub(1))
-        .min(start.saturating_add(requested_max_lines).saturating_sub(1))
-        .max(start);
-    let char_limit = max_chars
-        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_CHARS)
-        .clamp(1, READ_FILE_WINDOW_MAX_CHARS);
-
-    let file = File::open(&real_path).map_err(|e| e.to_string())?;
+    let file = File::open(&real_path).map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(file);
-    let mut raw = String::new();
-    let mut total_lines = 0usize;
-    let mut total_chars = 0usize;
-    let mut selected: Vec<String> = Vec::new();
-    let mut selected_chars = 0usize;
-    let mut line_truncated = false;
-    let mut content_hasher = Sha256::new();
-
-    loop {
-        raw.clear();
-        let bytes = reader.read_line(&mut raw).map_err(|e| e.to_string())?;
-        if bytes == 0 {
-            break;
-        }
-        let canonical_raw = raw.replace("\r\n", "\n").replace('\r', "\n");
-        content_hasher.update(canonical_raw.as_bytes());
-        total_lines += 1;
-        let line = normalize_read_file_line(raw.clone());
-        let line_chars = line.chars().count();
-        total_chars += line_chars;
-        if total_lines > 1 {
-            total_chars += 1;
-        }
-
-        if total_lines < start || total_lines > requested_end {
-            continue;
-        }
-        if line_truncated {
-            continue;
-        }
-
-        let separator_chars = if selected.is_empty() { 0 } else { 1 };
-        let next_chars = selected_chars + separator_chars + line_chars;
-        if !selected.is_empty() && next_chars > char_limit {
-            line_truncated = true;
-            continue;
-        }
-        if selected.is_empty() && next_chars > char_limit {
-            selected.push(take_prefix_chars(&line, char_limit));
-            selected_chars = char_limit;
-            line_truncated = true;
-            continue;
-        }
-        selected.push(line);
-        selected_chars = next_chars;
-    }
-
-    let returned_start = if total_lines == 0 || selected.is_empty() {
-        0
-    } else {
-        start.min(total_lines)
-    };
-    let returned_end = if total_lines == 0 || selected.is_empty() {
-        0
-    } else {
-        returned_start + selected.len().saturating_sub(1)
-    };
-    let content = selected.join("\n");
-    let not_whole_file = returned_start != 1 || returned_end != total_lines;
-    let more_requested_lines =
-        returned_end > 0 && returned_end < requested_end.min(total_lines.max(1));
-    let more_file_lines = returned_end > 0 && returned_end < total_lines;
-    let truncated = not_whole_file || more_requested_lines || more_file_lines || line_truncated;
-    let next_start_line = if truncated
-        && returned_end > 0
-        && (more_file_lines || more_requested_lines || line_truncated)
-    {
-        Some(returned_end + 1)
-    } else {
-        None
-    };
-
-    Ok(ReadFileWindowResult {
+    read_file_window_from_reader(
         path,
-        content,
-        content_version: format!("sha256-{:x}", content_hasher.finalize()),
-        start_line: returned_start,
-        end_line: returned_end,
-        total_lines,
-        total_chars,
-        returned_chars: selected_chars,
-        truncated,
-        next_start_line,
-    })
+        &mut reader,
+        start_line,
+        end_line,
+        max_lines,
+        max_chars,
+        start_char,
+    )
 }
 
 #[tauri::command]
@@ -9757,7 +9816,19 @@ async fn read_stream_error_body(
     }
 }
 
+fn should_emit_chat_stream_done(status: &str) -> bool {
+    // The frontend settles Abort immediately and unregisters both stream
+    // listeners before asking Rust to cancel. Broadcasting a second
+    // `cancelled` event after that cleanup races Tauri's callback registry and
+    // can target an already-removed callback id. Success and real Rust-owned
+    // errors still use the terminal event channel.
+    status != "cancelled"
+}
+
 fn emit_chat_stream_done(app: &AppHandle, stream_id: &str, status: &str, error: Option<String>) {
+    if !should_emit_chat_stream_done(status) {
+        return;
+    }
     let _ = app.emit(
         "chat-stream-done",
         StreamDonePayload {
@@ -12604,6 +12675,7 @@ pub fn run() {
             shell_permission_preflight,
             build_repository_index,
             code_ast_query,
+            check_source_syntax,
             find_symbol_references,
             load_session_memory,
             record_session_failure,
@@ -12703,10 +12775,11 @@ mod tests {
         looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
         parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
         prepare_pty_agent_input, proxy_network_grant, pty_foreground_state, pty_shell_available,
-        read_pty_current_generation_view, read_pty_generation_since, read_pty_generation_tail,
-        read_session_transcript_with_fallback, resolve_command_working_directory,
-        resolve_existing_path, resolve_open_file_external_path, resolve_write_path,
-        revalidate_write_path, run_cancellable_bounded_process, run_workspace_shell_command,
+        read_file_window_from_reader, read_pty_current_generation_view, read_pty_generation_since,
+        read_pty_generation_tail, read_session_transcript_with_fallback,
+        resolve_command_working_directory, resolve_existing_path, resolve_open_file_external_path,
+        resolve_write_path, revalidate_write_path, run_cancellable_bounded_process,
+        run_workspace_shell_command, should_emit_chat_stream_done,
         should_hide_list_directory_entry, should_skip_recursive_search_dir,
         validate_image_studio_endpoint_for_engine, validate_image_studio_remote_image_url,
         validate_proxy_request_headers, validate_pty_input, ChatStreamLease, FileNode,
@@ -12715,10 +12788,110 @@ mod tests {
     };
     use serde_json::json;
     use std::fs;
+    use std::io::{BufReader, Cursor};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     static CANCELLATION_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cancelled_chat_stream_does_not_emit_after_frontend_cleanup() {
+        assert!(!should_emit_chat_stream_done("cancelled"));
+        assert!(should_emit_chat_stream_done("ok"));
+        assert!(should_emit_chat_stream_done("error"));
+    }
+
+    #[test]
+    fn read_file_window_preserves_exact_source_boundaries() {
+        let source =
+            " \t{\"stdout\":\"source\",\"error\":\"literal\",\"exitCode\":9}\r\n".to_string();
+        let mut reader = BufReader::new(Cursor::new(source.as_bytes()));
+        let result = read_file_window_from_reader(
+            "fixtures/command.json".to_string(),
+            &mut reader,
+            None,
+            None,
+            None,
+            Some(64_000),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.content, source);
+        assert_eq!(result.start_line, 1);
+        assert_eq!(result.end_line, 1);
+        assert_eq!(result.total_lines, 1);
+        assert!(!result.truncated);
+        assert!(result.next_start_line.is_none());
+        assert!(result.next_start_char.is_none());
+    }
+
+    #[test]
+    fn read_file_window_uses_lossless_character_continuations_for_oversized_lines() {
+        let source = format!(" \t{}  \n", "汉🙂x".repeat(31));
+        let mut initial_reader = BufReader::new(Cursor::new(source.as_bytes()));
+        let initial = read_file_window_from_reader(
+            "fixtures/minified.js".to_string(),
+            &mut initial_reader,
+            None,
+            None,
+            None,
+            Some(17),
+            None,
+        )
+        .unwrap();
+        assert_eq!(initial.start_line, 0);
+        assert_eq!(initial.end_line, 0);
+        assert_eq!(initial.returned_start_char, Some(0));
+        assert_eq!(initial.returned_end_char, Some(17));
+        assert_eq!(initial.next_start_char, Some(17));
+        assert!(initial.truncated);
+
+        let mut rebuilt = String::new();
+        let mut start_char = 0usize;
+        loop {
+            let mut reader = BufReader::new(Cursor::new(source.as_bytes()));
+            let result = read_file_window_from_reader(
+                "fixtures/minified.js".to_string(),
+                &mut reader,
+                None,
+                None,
+                None,
+                Some(17),
+                Some(start_char),
+            )
+            .unwrap();
+            rebuilt.push_str(&result.content);
+            match result.next_start_char {
+                Some(next) => start_char = next,
+                None => break,
+            }
+        }
+        assert_eq!(rebuilt, source);
+    }
+
+    #[test]
+    fn read_file_window_empty_source_is_versioned_zero_range() {
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let result = read_file_window_from_reader(
+            "src/empty.ts".to_string(),
+            &mut reader,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.start_line, 0);
+        assert_eq!(result.end_line, 0);
+        assert_eq!(result.total_lines, 0);
+        assert_eq!(result.total_chars, 0);
+        assert_eq!(result.returned_chars, 0);
+        assert!(!result.content_version.is_empty());
+        assert!(!result.truncated);
+    }
 
     #[test]
     fn proxy_redirects_regrant_only_public_origins_and_strip_sensitive_headers() {

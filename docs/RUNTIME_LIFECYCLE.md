@@ -2,6 +2,10 @@
 
 > 状态：现行规范
 > 事实源：`src/lib/turnRuntimeContract.ts`、`src/lib/turnRuntimeCheckpoint.ts`、`src/lib/turnEvents.ts`（兼容事件 schema v2）及其生产调用方。
+>
+> Workspace Turn 的当前执行策略入口是 `src/store/submitRuntimeRunner.ts` 与
+> `src/store/runtimeV2/`。本文件描述 canonical Session/Turn/Run 与 UI 投影；
+> Runtime 内部循环的修改边界见 [最小运行内核与能力边界](RUNTIME_KERNEL_INVARIANTS.md)。
 
 ## 一条提交就是一个 Turn
 
@@ -90,7 +94,7 @@ run.completed(resultKind=canceled) # Run 结论
 turn.completed(resultKind=canceled)# Turn 结论
 ```
 
-`run.aborted` 用于停止控制、清理审批和记录取消原因；消费者不得把它当成 Run 结论。取消投影必须幂等，并且 UI 只能显示一个最终结论。
+`run.aborted` 用于停止控制、清理审批和记录取消原因；消费者不得把它当成 Run 结论。取消投影必须幂等，并且 UI 只能显示一个最终结论。取消事务已经发布并验证终态后，迟到返回的 provider 或 checkpoint callback 必须观察该外部终态并直接退出，不能再追加旧 checkpoint、触发 emergency terminal，或把正常 ownership 交接记录成基础设施故障。
 
 ### 错误收口
 
@@ -104,16 +108,19 @@ turn.completed(resultKind=error)
 
 ## Plan authoring 与审核态
 
-Plan Run 在任何模型起草前创建 frozen `PlanAuthoringContract`：objective、不可变 `G1/G2/...` 分面、上下文目标、可复用证据目标、图片数量、显式 diagnosis requirement 和固定验收条款都在此时确定。后续质量门只能指出同一 contract 的违约，并要求候选按原 contract 修订；修正版必须重新进入 typed ingress，不能只留在 hidden reasoning 或过程文本中。
+Plan Run 保留原始 objective，先用只读工具形成带版本的
+`WorkPlanRuntimeEvidence`，再让模型提交 `WorkPlanDraftV1`。后续校验只能指出
+同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
+WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
 Plan 的 canonical 顺序为：
 
 ```text
 turn.admitted(strategy=plan)
   run.started(phase=planning)
-  understand -> gather -> draft/revise
-  submit_plan_candidate 或 <plan_candidate>
-  typed ingress -> seal -> validate -> Markdown projection -> atomic artifact commit
+  bounded read-only gather
+  submit_runtime_v2_work_plan
+  WorkPlan compiler -> seal -> Markdown/PlanPanel projection -> review commit
   plan.artifact_accepted(path, digest, revision)
     run.status = paused
     run.phase = reviewing
@@ -129,9 +136,9 @@ conversationTurnStatus = awaiting_approval
 isTerminal = false
 ```
 
-`plan.artifact_accepted` 不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。它只有在 `.MAIN/plans/plan.md`、typed candidate/hash、authoring contract、ActionRequest、Plan lifecycle、Run 与 checkpoint identity 全部一致时才具有可批准权威。
+`plan.artifact_accepted` 不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。它只有在 `.MAIN/plans/plan.md`、sealed WorkPlan/digest、ActionRequest、Plan lifecycle、Run 与 checkpoint identity 全部一致时才具有可批准权威。
 
-- `changes_requested`：同一 Run 回到 `planning`，仍使用原 frozen contract；新 typed candidate 通过后替换 review artifact/revision。
+- `changes_requested`：同一 Run 回到 `planning`，保留原始用户目标和已有版本化证据；新的 WorkPlan 通过同一 compiler 后替换 review artifact/revision。
 - `approved`：review Run 转为 `recoverable` 暂停，随后启动 `parentRunId = reviewedRunId` 的执行 child Run；批准不等于执行成功。
 - 取消审核：依照 canonical 取消顺序收口，不把 `pending_review` 留成 done/idle。
 
@@ -139,19 +146,31 @@ Markdown 只负责审核显示。批准后任务和验证从 sealed typed graph 
 
 ## Execute 的稳定工具面
 
-普通工作区 Execute 使用一个稳定且有界的读／改／验核心工具面。恢复状态中的 `nextRequiredCapability` 只表示下一证据优先级，不再通过每回合切换互斥 schema 来撤销相邻的安全能力；模型可以按当前源码事实自然地在精确读取、结构化修改和有限验证之间移动。软 no-progress 计数只负责重提示或诚实暂停，不能再把稳定工具面降级成 mutation-only / validation-only。路径授权、修改前源码版本绑定、批准 Plan scope、命令权限和完成证据仍由 runtime 硬门控制。
+普通工作区 Execute 使用一个稳定且有界的读／改／验核心授权面，安全读取不因 observing/acting/validating 切换消失。成功 mutation 之后会产生验证债务：`validate` provider 目录保留有限验证，也保留由当前 exact source 和实施契约支持的后续 mutation，避免多文件修复被阶段切换截断；任何新 mutation 都把验证债务移动到最新工作区边界，只有该边界之后的有限/行为验收才能完成。这样阶段表达当前重点而不是互斥权限振荡，同时不会靠固定轮数或总耗时强制结束。路径授权、修改前源码版本绑定、批准 WorkPlan scope、命令权限和完成证据仍由 runtime 硬门控制。
 
-浏览器、桌面和长驻进程生命周期保留窄工具面，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。普通工作区阶段不能用这一例外重新引入 `read-only -> mutation-only -> validation-only` 振荡。子智能体证据需要父级复读时，runtime 必须签发显式 `context_restore` lease；即使 child 没有提供源码范围，父级第一次同目标新鲜读取也必须能消费该 lease 并进入修改阶段。
+任务总时长与单次模型决策预算分离。普通 Execute 可以持续任意多步；但一次普通 `execute` 动作解码最多 4096 tokens，action window、`validate`、恢复动作与执行结论最多 2048。动作请求若只生成隐藏 reasoning，达到 4000 字符且仍没有可见语义或工具调用时，只取消该次 stream，关闭 reasoning，并带 `ACTION_OUTPUT_BUDGET_EXHAUSTED` 反馈立即重试一个结构化动作。纯 prose 无论长短都不能清偿 Execute/Validate 的 effect debt。最终恢复请求不再广告工具，只允许模型简短交接已改内容、证据缺口和人工验证步骤；已有真实修改时以 `partial` 正常收口，不能误报 `success`。上述边界只防止单次响应独占本地 lane，不是 Turn、Run 或复杂任务的时间／token 上限。
 
-每批工具结果先由其具体 owner 消费：真实修改、编译／测试诊断、浏览器或桌面结果、Goal checkpoint 都优先形成下一状态；重复次数和“无进展”只在这些 handler 均未形成动作后运行。软启发式不得抢先暂停、改写或重新锁定一个仍有明确修复义务的多文件目标。没有唯一源码归因的工作区校验失败会释放最近文件的 transaction lock，回到 objective-level 修复；此时未租约读取只增加上下文证据，不取得排他 target ownership。只有带结构化 `path:line:column` 等唯一归因的诊断或显式 read lease 才建立新的单文件修复锁。
+provider 的下一动作目录有一个不改变授权的短暂收敛窗口。若 exact source 已物化，且同一无效动作第一次被明确判定为重复、不同参数返回同一非空观察/失败诊断，或同版本缓存源码已经完成一次重物化，编辑阶段的 `closed_recovery` 只广告所有可用 mutation 工具；缓存重放本身仍被允许用于恢复被上下文淘汰的源码，但它返回后 exact source 已重新可见，下一决策不能再次打开读取分支。验证阶段已有 durable mutation boundary，因此第一次无动作／协议拒绝或等价重复观察后就关闭额外读取，只广告有限验证。恢复窗口不广告新建或等待 child：协作不能替代已经闭合的父线程动作，已启动 child 仍在后台继续并会在后续正常边界或终态前被收取。最新 mutation 被 source mismatch 或 parser preflight 拒绝、没有落盘时，只有最新失败目标拥有下一次恢复权；runtime 开放一个 target-locked 的新鲜读取批次，验收回执已有 `path:line` 时还会把读取限制在该行附近。一次成功补读立即进入 `corrective_mutation`，不会等待模型通过整文件翻页重新发现旧失败补丁；新 mutation 仍必须独立通过当前请求 exact source lease。连续三次纠错 mutation 都未执行则以 partial/error 诚实收口，任一真实 mutation 会清零该计数。窗口不设置 Run 截止、不绑定模型名。窗口内创建一个没有当前 source lease 的新文件会被 effect boundary 拒绝，不能用报告/说明文件清偿已有源码的 effect debt。成功 mutation 后恢复完整读／改／验目录；冷恢复时只有 durable ledger 与 canonical transcript 能重新证明未被同目标 mutation 失效的 source，缺少该证明就必须恢复读取，不能拿 process-local 状态制造写权限。
+
+`mutation_committed` 只表示当前 `acting` phase 内出现了新的成功 mutation。若新提议被阻止、但更早的 mutation 尚未得到验证，状态机用独立的 `unvalidated_mutation_pending` 返回验证边界；不得把历史 evidence 冒充成本次工具成功。源码租约缺失、源码文本不匹配和目标范围不匹配都以结构化失败原因持久化。一个被 workset 淘汰但没有被同目标 mutation 失效的真实标准读取可在纠正轮重新物化；缓存 replay 本身仍不产生 source evidence，同目标 mutation 后的旧版本也永远不能恢复写入权。
+
+浏览器、桌面和长驻进程生命周期保留各自的结构化启动、观察、交互和清理边界，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。它们不能被普通文件阶段用来重新引入 `read-only -> mutation-only -> validation-only` 振荡。调查 child 的 finding 只是带 provenance 的参考；实现 child 的写入权也必须由父线程当前版本读取和明确方案建立，并在 join 时重新校验，不能从 child 摘要或另造 `context_restore` lease 获得。
+
+每批工具结果先形成真实 source、mutation、validation、browser/desktop 或 Goal evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
+
+当 mutation 因源码不匹配或 preflight 拒绝而没有落盘时，恢复读取只刷新可见源码，不消费这条失败事实。durable ledger 保留最新可纠正 tool-call identity，关闭更早失败目标的恢复所有权，decision view 脱敏被拒绝的 search/replace 正文，并把有界失败诊断作为尾部因果指令持续投影；只有真实 mutation receipt 才清除这组连续失败。失败后的一次成功目标读取由 ledger 证明，随即关闭读取并要求基于该可见范围提交 materially different mutation；重叠范围、从第一行重新开始和逐段翻完整文件都不能维持读取分支。
+
+provider 在 action window 请求未广告工具时，该调用不会作为一般 request failure 丢回循环。runtime 把它记成一个 `effect: none` 的标准 assistant/tool 拒绝对，明确列出本次真实工具目录，并通过 `repeated_action_rejected` 进入下一次 reasoning-off 动作解码；相同未广告调用只替换自己的拒绝对，不增长上下文。这样模型既看得到“该动作已经尝试但不会执行”，ledger 也能累计真实的无进展恢复次数。
+
+普通 Execute 没有从 Turn 接纳时刻开始计算的总耗时上限。持续流式输出、有效模型决策、工具动作、证据、修改或验证都允许任务继续，无论本地硬件使单步或整轮耗时多久。10 分钟只表示“连续没有形成可执行进展”的恢复停滞窗口；它不取消正在运行的慢请求，并会在下一条有效动作或证据处清零。模型流的无响应头、无首 chunk 或 chunk 间长期静默仍由单请求 watchdog 处理，该请求失败后回到共享恢复循环，不能直接把 Turn 判为超时。
 
 Root objective closure audit 只恢复可选的稳定工作区能力面（有界读／搜／编辑／有限命令），不重新开放长驻进程、PTY、浏览器或桌面能力。后四类能力必须由各自的结构化生命周期 checkpoint 重新开启，避免已经成功的有限验证在最终核对阶段漂移成无关的交互终端循环。
 
 ## Evidence ledger、typed validation 与完成门
 
-Plan 取证先形成带 hash 的 frozen `PlanEvidenceBundle`；runtime 根据用户目标、项目结构和符号 occurrence 产生具体 read/find 义务。只有成功关闭义务的 source observation 可成为 `E`，模型摘要或未验证假设不能替代它。runtime 再从关系义务与精确 observation 派生相互独立的 `B` 组件；每个用户目标必须映射至少一个 `B`，必需 `B` 必须恰好映射一次，诊断型 `B` 必须连接非 hypothesis 的 `R`。source observation 与引用它的 structured facts 是不可分割的 provenance group，裁剪时必须同步保留或同步删除，禁止生成悬空 receipt binding。
+Plan 取证形成带 path/version 的 `WorkPlanRuntimeEvidence`；只有成功的真实只读结果可成为 `E`，模型摘要或未验证假设不能替代它。引用 evidence 的 WorkPlan 与 source observation 是同一个 provenance 链，裁剪或迁移时禁止生成悬空 ID。
 
-批准后的所有真实操作进入 append-only `planExecutionEvidenceLedger`。每条 `PlanExecutionEvidenceEntry` 可携带 transaction、Run、Plan task、requirement、phase、operation、validation obligation、结构化 outcome 与 producer-specific observation。账本顺序本身是因果顺序；相同毫秒时间戳不能重排“修改后验证”。
+批准后的真实操作进入当前 Runtime v2 Turn aggregate。source、mutation 和 validation 保留有序因果关系；相同毫秒时间戳不能重排“修改后验证”。直接 Execute 不借用 Plan 权威，但仍必须保留原始用户目标，并且只有最终修改之后的匹配验证可以形成成功。
 
 typed validation primitive 的完成语义如下：
 
@@ -164,23 +183,33 @@ typed validation primitive 的完成语义如下：
 | `assertion` | 是 | exact target/matcher 和声明 producer 的 typed `assertion_result` |
 | `advisory` | 否 | 仅提示用户、外部或 runtime 后续复核 |
 
-每个 goal 必须同时有 action/decision 覆盖和至少一个 acceptance-capable validation。批准后 success 还要求：task set 非空、所有必需 task evidence 满足、transaction-scoped evidence closure 完成、没有 unreconciled failure/active recovery。模型正文、缓存 task status、无关成功命令、泛化文件读取或长驻服务已启动都不能宣告完成；存在缺口时必须继续恢复、暂停或以 `partial/blocked/error` 诚实收口。
+批准计划的 success 要求所有声明修改目标和 required validation 均有匹配 evidence；直接 Execute 的 success 要求至少有真实 mutation、最终 mutation boundary 后的行为验收以及 provider 的事实说明。未由结构化上游明确分类的直接 Execute criterion 默认是 `behavioral`，因此 build/lint 只能证明静态性质，必须再有真实测试、内联断言或 browser/desktop 观察；只有上游明确声明 `static` 时才可降低该 criterion 的验收类型。模型正文、无关成功命令、泛化文件读取或长驻服务已启动都不能宣告完成；存在缺口时必须继续循环或以 `partial/blocked/error` 诚实收口。
 
 ## 子智能体协作状态
 
-用户启用子智能体偏好后，runtime 只有在 trusted project skeleton 或后续权威只读证据中识别至少两个不重叠 scope 且容量允许时，才冻结 `PreferredDelegationScopeContract`。显式结构化 scope 优先；否则按稳定顶层或最浅可并行项目边界派生，避免按偶然文件读创建大量 child。skeleton 路径可在 parent 第一次模型请求前触发有界并行派发，但不因此授予任何完成权威。
+用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。该指导不制造强制阶段；真正的创建仍只在父 Run 活动、本轮尚有派生预算、provider lane 为父线程之外保留了真实请求容量且工具实际可见时发生。模型可在普通读取、修改或验证阶段按工作量自行决定是否启动，也可以不启动并直接完成；协作不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
 
-每个必需 scope 的状态机是：
+`explore`、`review`、`validate` 保持只读，适合并行调查、独立评审和有限验证。`implement/write` 只在父线程已经通过版本化源码形成证据化方案后可用：调用必须指定 create/modify/delete、具体 `implementation_plan`、成功标准和每个精确文件目标；不能只授权目录再让 child 自行选择写入文件。多个实现 child 的写入范围必须互不重叠；modify/delete 的每个目标还必须在创建请求中拥有当前版本源码权威。实现 child 可以读取自己的范围并形成一个修改事务，但事务先保存在进程内，不立即改变共享工作区。父线程继续处理不依赖子结果的工作，只在结果成为依赖或最终收口时 join。
+
+join 是提交边界：runtime 再检查 child 所有权、父 WorkPlan scope、源版本、工具权限、单次破坏性审批和源码语法预检，然后顺序提交事务并产生普通 mutation evidence。任一版本漂移、越权、审批拒绝或预检失败都会丢弃该事务，不留下部分共享写入。child 持有写范围期间，父线程和其他 child 对重叠路径的修改会被拒绝；最终 validation 也必须等所有实现事务完成或丢弃后再运行，防止验证旧工作区。恢复 action window 仍不把协作当作逃生分支，父线程必须先完成当前闭合动作。普通 Execute 不因总耗时关闭父 Run 或 child；只有用户取消、显式调用方预算或真实停滞/资源边界可以收口。
+
+本地 provider 未显式声明并发容量时，模型请求按 lane 串行，真实 child 请求容量为零；runtime 不再把父/子轮流占用同一个模型包装成并行协作。只有配置或已确认的 provider 请求容量大于一，才会在为父线程保留一个槽位后开放 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+
+父、子 provider 工具调用共享同一 schema normalization：数值/布尔漂移、默认值、路径和编辑别名先规范化，schema 未声明字段直接丢弃，再计算动作 identity 并执行。child 对一个已返回 `CHILD_EVIDENCE_REPEAT` 的同一观察再次命中时，即使模型改变了无效范围或附带字段，也以结构化 `closed_observation_loop` 降级；只有输出窗口或版本真正变化才算进展。该边界由结果语义触发，不是 child 总耗时或固定轮数限制。
+
+每个已派生任务的状态机是：
 
 ```text
-required scope
-  -> spawn_subagent（registration=spawned）
-  -> wait/join
-  -> authoritative closure + provenance audit
-  -> consumed 或 incomplete
+spawn_subagent
+  -> queued / running
+  -> read/search/(finite validation | one staged mutation)
+  -> ordinary final text citing evidence
+  -> parent wait 或终态 join
+  -> revalidate + commit/discard staged mutation
+  -> completed / degraded / failed / canceled
 ```
 
-`consumed` 要求 child 已完成、closure=`satisfied`、存在实质 tool observation、证据 owner/tool-call/observation identity 完整，并且所有 adopted target 位于 frozen `allowedPaths` 内。runtime 随后签发 owner-fenced canonical closure receipt；Turn checkpoint 只保留 ref，完整活动及其 digest 位于独立 Session ledger。冷恢复找不到 exact receipt、digest/owner/Run/scope/path 任一漂移时，该 scope 必须变为 `incomplete` 且不得恢复证据。child summary、协调工具成功、未 join output、partial/unverified closure 都不算证据；`requiresParentReread=true` 的 observation 也不能关闭父级硬读义务或阻止 parent read。未覆盖或未验真的精确路径回到父 runtime 作为定向义务；只有父级按 path/range/version/hash 验真后才能成为可 seal 的 source observation。执行阶段的 mutation 仍需完整版本身份与父级验证。
+runtime 只在普通最终文本和至少一条真实或合法继承 evidence 同时存在时编译合法结构化报告并接受 `completed`；实现 child 还必须在 join 后拥有真正提交的 mutation evidence。已有 evidence 但收口或提交失败时写入 `degraded`，明确由主体接管；没有 evidence 才写入 `failed`，父任务取消则为 `canceled`。child summary、协调工具成功、暂存但未提交的事务和未 join output 都不算验收。父线程始终拥有跨文件整合、最终验证和完成权威；child 非 completed 后父线程继续原目标。
 
 ## 事件接受与幂等
 
@@ -225,15 +254,11 @@ Game Studio `local_fast` slash 也遵守同一可见结论契约：成功、错�
 - `src/lib/turnRuntimeContract.ts`
 - `src/lib/turnRuntimeCheckpoint.ts`
 - `src/lib/runTransitionReducer.ts`
-- `src/lib/planAuthoringContract.ts`
-- `src/lib/planContract.ts`
-- `src/lib/planDraftIngress.ts`
-- `src/lib/planArtifactCommit.ts`
-- `src/lib/validationContract.ts`
-- `src/lib/preferredDelegationScopes.ts`
+- `src/lib/runtime-v2/`
+- `src/store/runtimeV2/`
 - `src/lib/canceledTurnProjection.ts`
 - `src/store/sessionCancellationBarrier.ts`
-- `src/lib/orchestrator/workflowEngine.ts`
+- `src/store/submitRuntimeRunner.ts`
 - `src/store/submitAsyncWorkflowRun.ts`
 
 持久化与接纳细节见 [Session 持久化](SESSION_PERSISTENCE.md)。

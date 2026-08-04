@@ -1,5 +1,9 @@
 import type { AgentMessage, ContentPart } from "../../lib/agentMessages";
-import { deriveStreamSettings } from "../../lib/providerLaneSettings";
+import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
+import {
+  boundRuntimeMessagesToContext,
+  type RuntimeContextBudget,
+} from "../../lib/runtimeContextBudget";
 import {
   abortedAgentLoopOutcome,
   completedAgentLoopOutcome,
@@ -30,6 +34,7 @@ export interface RuntimeV2ChatProviderRequest {
   readonly messages: readonly AgentMessage[];
   readonly config: unknown;
   readonly signal: AbortSignal;
+  readonly runtimeContextBudget?: RuntimeContextBudget | null;
 }
 
 export type RuntimeV2ChatProviderRequester = (
@@ -51,7 +56,7 @@ export interface RuntimeV2ChatRunnerInput {
   readonly context: RuntimeV2SubmissionContext;
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
-  readonly normalizeSessionRuntimeSnapshot: (snapshot: any) => unknown;
+  readonly buildSessionRuntimeSnapshot: (state: any) => unknown;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;
@@ -67,23 +72,20 @@ export interface RuntimeV2ChatRunnerInput {
 }
 
 const CHAT_DEADLINE_MS = 4 * 60_000;
-const CHAT_HISTORY_MESSAGES = 20;
-const CHAT_HISTORY_CHARS = 32_000;
-const CHAT_MESSAGE_CHARS = 10_000;
 
-function boundedText(value: unknown, max = CHAT_MESSAGE_CHARS): string {
+function normalizedText(value: unknown, max?: number): string {
   const text = String(value || "").trim();
-  return text.length <= max
+  return max === undefined || text.length <= max
     ? text
     : `${text.slice(0, Math.max(0, max - 42))}\n[Runtime v2 truncated older context.]`;
 }
 
-function boundedContent(content: AgentMessage["content"]): AgentMessage["content"] {
-  if (typeof content === "string") return boundedText(content);
+function retainedContent(content: AgentMessage["content"]): AgentMessage["content"] {
+  if (typeof content === "string") return normalizedText(content);
   let imageCount = 0;
   return content.flatMap((part): ContentPart[] => {
     if (part.type === "text") {
-      const text = boundedText(part.text);
+      const text = normalizedText(part.text);
       return text ? [{ type: "text", text }] : [];
     }
     if (part.type === "image_url" && imageCount < 4) {
@@ -123,40 +125,29 @@ export function buildRuntimeV2ChatMessages(input: {
     )
     .map((message): AgentMessage => ({
       role: message.role,
-      content: boundedContent(message.content),
+      content: retainedContent(message.content),
       ...(message.runtimeTurnId ? { runtimeTurnId: message.runtimeTurnId } : {}),
     }))
-    .filter((message) => contentChars(message.content) > 0)
-    .slice(-CHAT_HISTORY_MESSAGES);
+    .filter((message) => contentChars(message.content) > 0);
 
-  const retained: AgentMessage[] = [];
-  let retainedChars = 0;
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const message = candidates[index]!;
-    const chars = contentChars(message.content);
-    if (retained.length > 0 && retainedChars + chars > CHAT_HISTORY_CHARS) break;
-    retained.unshift(message);
-    retainedChars += chars;
-  }
-
-  const objective = boundedText(input.objective);
-  const lastUser = [...retained].reverse().find((message) => message.role === "user");
+  const objective = normalizedText(input.objective);
+  const lastUser = [...candidates].reverse().find((message) => message.role === "user");
   const lastUserText = lastUser ? contentText(lastUser.content) : "";
   if (lastUserText !== objective) {
-    retained.push({ role: "user", content: objective });
+    candidates.push({ role: "user", content: objective });
   }
 
   return [{
     role: "system",
     content: [
       "[MAIN RUNTIME V2 CHAT]",
-      `Workspace label: ${boundedText(input.workspace || "global", 2_000)}`,
+      `Workspace label: ${normalizedText(input.workspace || "global", 2_000)}`,
       `Respond in: ${input.language === "en" ? "English" : "简体中文"}`,
       "This is a conversation-only Turn. No tools, shell, browser, validation, child agents, file reads, or workspace mutations are available.",
       "Answer from the supplied conversation context. Do not claim that you inspected, changed, ran, or verified external state.",
       "Return one complete user-facing Markdown reply. Do not emit private reasoning or tool-call envelopes.",
     ].join("\n"),
-  }, ...retained];
+  }, ...candidates];
 }
 
 function parseArguments(value: unknown): Readonly<Record<string, unknown>> {
@@ -177,9 +168,14 @@ async function defaultProviderRequest(
   input: RuntimeV2ChatProviderRequest,
 ): Promise<Awaited<ReturnType<RuntimeV2ChatProviderRequester>>> {
   let streamedText = "";
+  const settings = deriveBudgetedStreamSettings(
+    input.config as Parameters<typeof deriveBudgetedStreamSettings>[0],
+    input.runtimeContextBudget,
+  );
+  const maxOutputTokens = input.runtimeContextBudget?.outputBudget;
   const result = await streamChatCompletion(
     [...input.messages],
-    deriveStreamSettings(input.config as Parameters<typeof deriveStreamSettings>[0]),
+    settings,
     {
       onToken: (token) => { streamedText += token; },
       onDone: () => undefined,
@@ -187,7 +183,7 @@ async function defaultProviderRequest(
     },
     input.signal,
     [],
-    undefined,
+    maxOutputTokens,
     { toolChoice: "none" },
   );
   return {
@@ -237,6 +233,13 @@ export function createRuntimeV2ChatProviderPort(input: {
     workspace: input.context.runWorkspace,
     language: input.context.phaseLanguage,
   });
+  const requestMessages = input.context.runtimeContextBudget
+    ? boundRuntimeMessagesToContext(frozenMessages, {
+        contextLimit: input.context.runtimeContextBudget.contextLimit,
+        reservedOutputTokens:
+          input.context.runtimeContextBudget.outputBudget,
+      })
+    : frozenMessages;
   return {
     async request({ command, signal }) {
       const deadline = createDeadlineSignal(signal, input.deadlineAt, input.now);
@@ -244,21 +247,24 @@ export function createRuntimeV2ChatProviderPort(input: {
         input.logStoreEvent("runtime_v2_chat_provider_request_opened", {
           turnId: command.run.turnId,
           runId: command.run.runId,
-          historyMessages: frozenMessages.length - 1,
+          historyMessages: requestMessages.length - 1,
+          unboundedHistoryMessages: frozenMessages.length - 1,
+          contextLimit:
+            input.context.runtimeContextBudget?.contextLimit ?? null,
           offeredToolCount: 0,
         });
         const result = await input.requestProvider({
-          messages: frozenMessages,
+          messages: requestMessages,
           config: frozenConfig,
           signal: deadline.signal,
+          runtimeContextBudget: input.context.runtimeContextBudget,
         });
         if (deadline.signal.aborted && !signal.aborted) {
           throw new Error("RUNTIME_V2_CHAT_DEADLINE_EXCEEDED");
         }
         const normalized = normalizeProviderResponseV1({
           visibleText: sanitizeAssistantDisplayContent(result.visibleText || "")
-            .trim()
-            .slice(0, 24_000),
+            .trim(),
           toolCalls: (result.toolCalls || []).map((call) => ({
             id: call.id,
             name: call.name,
@@ -292,7 +298,7 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
   return state?.conversationTurns?.find((turn: ConversationTurn) => turn.id === turnId) || null;
 }
 
-function identities(
+export function buildRuntimeV2ChatIdentities(
   state: any,
   context: RuntimeV2SubmissionContext,
   turn: ConversationTurn,
@@ -304,7 +310,7 @@ function identities(
     : `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
   return {
     turn: {
-      workspaceKey: String(context.runWorkspace || "global").trim() || "global",
+      workspaceKey: String(context.runScopeKey).trim(),
       sessionKey: context.runSessionKey,
       sessionEpoch,
       clientSubmissionId: String(turn.clientSubmissionId || turn.id).trim(),
@@ -357,7 +363,7 @@ export async function runSubmitRuntimeV2Chat(
   const initialState = input.get();
   const turn = currentTurn(initialState, input.context.turnId);
   if (!turn) throw new Error(`RUNTIME_V2_CHAT_TURN_MISSING:${input.context.turnId}`);
-  const identity = identities(initialState, input.context, turn);
+  const identity = buildRuntimeV2ChatIdentities(initialState, input.context, turn);
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
   if (existing && existing.aggregate.run?.identity.runId !== identity.run.runId) {
     input.logStoreEvent("runtime_v2_chat_stale_checkpoint_quarantined", {
@@ -375,7 +381,7 @@ export async function runSubmitRuntimeV2Chat(
     sessionId: input.context.runSessionId,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-    normalizeSessionRuntimeSnapshot: input.normalizeSessionRuntimeSnapshot,
+    buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     persistSessionRecord: input.persistSessionRecord,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,

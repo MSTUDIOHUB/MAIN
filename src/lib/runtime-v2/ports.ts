@@ -8,6 +8,9 @@ import type {
   RuntimeV2TurnIdentity,
 } from "./contracts";
 import type { RuntimeV2CheckpointV3 } from "./checkpoint";
+import type {
+  RuntimeV2EmergencyTerminalEnvelopeV1,
+} from "./emergencyTerminal";
 import type { RuntimeV2Event, RuntimeV2EventDraft } from "./events";
 
 export interface CheckpointPort {
@@ -17,6 +20,15 @@ export interface CheckpointPort {
     readonly expectedRevision: number;
     readonly event: RuntimeV2Event;
   }): Promise<{ readonly disposition: "committed" | "idempotent" | "conflict"; readonly checkpoint: RuntimeV2CheckpointV3 | null }>;
+  commitEmergencyTerminal(input: {
+    readonly owner: RuntimeV2TurnIdentity;
+    readonly run: RuntimeV2RunIdentity;
+    readonly expectedRevision: number;
+    readonly envelope: RuntimeV2EmergencyTerminalEnvelopeV1;
+  }): Promise<{
+    readonly disposition: "committed" | "idempotent" | "conflict";
+    readonly envelope: RuntimeV2EmergencyTerminalEnvelopeV1 | null;
+  }>;
 }
 
 export interface ProviderPort {

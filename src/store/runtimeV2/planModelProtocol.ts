@@ -5,14 +5,15 @@ import {
 } from "../../lib/runtime-v2";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import {
+  buildSubagentDelegationGuidance,
+} from "../../lib/turnIntake";
 
 export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
 export const PLAN_MODEL_COMPACTION_INTERVAL = 10;
 export const PLAN_MODEL_DEADLINE_MS = 8 * 60_000;
 export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS = 3 * 60_000;
-export const PLAN_DISCOVERY_DEADLINE_MS = 3 * 60_000;
-export const PLAN_DISCOVERY_ACTION_BUDGET = 8;
 export const PLAN_CONTEXT_RESULT_CHARS = 10_000;
 export const PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS = 4_096;
@@ -115,7 +116,10 @@ export const PLAN_MODEL_TOOLS = [
 ];
 
 export type PlanModelStage = "discovery" | "synthesis";
-export type PlanProviderTransport = "native_tool" | "structured_response";
+export type PlanProviderTransport =
+  | "native_tool"
+  | "text_envelope"
+  | "structured_response";
 
 export function isPlanSubmissionStage(stage: PlanModelStage): boolean {
   return stage === "synthesis";
@@ -152,6 +156,12 @@ export function providerPlanMessages(input: {
   readonly overview: string;
 }): AgentMessage[] {
   const language = input.context.phaseLanguage === "en" ? "English" : "简体中文";
+  const collaborationGuidance = buildSubagentDelegationGuidance({
+    preference:
+      input.context.turnInputContextSignals?.subagentPreference ||
+        "unspecified",
+    language: input.context.phaseLanguage,
+  });
   return [
     {
       role: "system",
@@ -167,6 +177,9 @@ export function providerPlanMessages(input: {
         "The submission only needs a concrete change list and validation list. The runtime owns evidence binding, dependencies, approval identity and rendering.",
         "Use finite_command for a bounded build/test/check command when the workspace provides one. Use browser only for web DOM behavior and desktop for native GUI behavior; put interaction details in expectedOutcome, not command.",
         "Use questions only for a real user-owned decision.",
+        collaborationGuidance
+          ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
+          : "",
       ].join("\n"),
     },
     { role: "user", content: input.turn.userPrompt },
@@ -180,11 +193,7 @@ export function providerPlanMessages(input: {
 export function boundedPlanTranscript(
   messages: readonly AgentMessage[],
 ): AgentMessage[] {
-  if (messages.length <= 24) return [...messages];
-  return [
-    ...messages.slice(0, 3),
-    ...messages.slice(-(24 - Math.min(3, messages.length))),
-  ];
+  return [...messages];
 }
 
 export function compactRetainedPlanObservation(
@@ -308,7 +317,7 @@ export function synthesisPlanTranscript(input: {
       content: [
         ...(input.compactRecovery
           ? [
-              "The preceding synthesis request was closed at the transport deadline. This is the single bounded recovery request: use only this compact evidence packet and submit one complete plan now.",
+              "The preceding synthesis request did not produce a complete submission. Use only this compact evidence packet and submit one complete plan now.",
             ]
           : []),
         [
