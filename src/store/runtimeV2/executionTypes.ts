@@ -34,6 +34,24 @@ export interface RuntimeV2ChildResult {
    * provenance-only and is never counted as evidence produced by the child. */
   readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
   readonly evidence: readonly RuntimeV2EvidenceReference[];
+  /** Process-local child-authored mutation transaction. It has no workspace
+   * effect until the parent scheduler joins the child, revalidates its base
+   * versions, and commits it through the parent Turn authority. */
+  readonly stagedMutations?: readonly RuntimeV2StagedChildMutation[];
+}
+
+export interface RuntimeV2StagedChildMutation {
+  readonly schemaVersion: "runtime-v2-staged-child-mutation.v1";
+  readonly id: string;
+  readonly evidenceId: string;
+  readonly toolName:
+    | "replace_in_file"
+    | "write_file"
+    | "apply_patch"
+    | "delete_workspace_path";
+  readonly arguments: Readonly<Record<string, unknown>>;
+  readonly targets: readonly string[];
+  readonly baseVersions: Readonly<Record<string, string | null>>;
 }
 
 export interface RuntimeV2MaterializedSourceWindow {
@@ -50,17 +68,38 @@ export interface RuntimeV2MaterializedSourceCoverage {
   readonly complete: boolean;
 }
 
+export type RuntimeV2ProviderActionWindow =
+  | "corrective_source"
+  | "corrective_mutation"
+  | "validation_handoff"
+  | "closed_recovery";
+
 export interface RuntimeV2LiveExecutionState {
   readonly messages: AgentMessage[];
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
   readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
+  /** Exclusive path ownership held by active implement children. The child
+   * stages against these paths; parent and sibling writes are rejected until
+   * join commits or discards the transaction. */
+  readonly childWriteScopes: Map<string, readonly string[]>;
   readonly coveredReadToolResults: Map<string, string | null>;
   readonly parallelReadCountByToolCallId: Map<string, number>;
   /** Exact source that survived final request bounding for the most recent
    * provider attempt. It is process-local and is never checkpoint authority. */
   latestProviderRequestSourceCoverage:
     readonly RuntimeV2MaterializedSourceCoverage[];
+  /** Process-local decoding pressure for the next provider request. This
+   * narrows only the advertised next-action catalog after a causally closed
+   * no-effect loop; durable authorization and the full post-mutation surface
+   * remain unchanged. */
+  latestProviderActionWindow: RuntimeV2ProviderActionWindow | null;
+  /** A finite validator recovered from the model's latest rejected shell
+   * wrapper. The next native run_command schema advertises this exact command
+   * so a smaller local model can correct its arguments instead of replaying
+   * cd/pipeline/echo decorations forever. It is cleared by the next committed
+   * mutation or executed validation. */
+  correctiveValidationCommand: string | null;
   /** Request-scoped source authority copied only onto mutation calls returned
    * by that exact provider request. */
   readonly mutationSourceCoverageByToolCallId: Map<
@@ -112,9 +151,12 @@ export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState
     childRuns: new Map(),
     childAbortControllers: new Map(),
     childTelemetry: new Map(),
+    childWriteScopes: new Map(),
     coveredReadToolResults: new Map(),
     parallelReadCountByToolCallId: new Map(),
     latestProviderRequestSourceCoverage: [],
+    latestProviderActionWindow: null,
+    correctiveValidationCommand: null,
     mutationSourceCoverageByToolCallId: new Map(),
     evidenceCounter: 0,
     latestProviderResult: null,

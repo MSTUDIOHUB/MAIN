@@ -4,9 +4,13 @@ import {
   resolveWorkspaceMutationCreationTargets,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
-import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import type {
+  RuntimeV2ExecutionPortsInput,
+  RuntimeV2MaterializedSourceCoverage,
+} from "./executionTypes";
 
 export interface RuntimeV2MutationLease {
   readonly target: string;
@@ -19,6 +23,16 @@ export interface RuntimeV2MutationLease {
     readonly endLine: number;
     readonly content: string;
   }[];
+}
+
+export interface RuntimeV2MutationRecoveryExcerpt {
+  readonly target: string;
+  readonly version: string;
+  readonly startLine: number;
+  readonly endLine: number;
+  /** Exact current-source bytes only. Provider-authored replacement content
+   * is deliberately never copied into this recovery receipt. */
+  readonly content: string;
 }
 
 /**
@@ -114,6 +128,174 @@ function visibleSourceContains(
   );
 }
 
+function matchingTextAt(
+  source: string,
+  searchText: string,
+  sourceStart: number,
+  searchStart = 0,
+): number {
+  const available = Math.min(
+    searchText.length - searchStart,
+    source.length - sourceStart,
+  );
+  let matched = 0;
+  while (
+    matched < available &&
+    source.charCodeAt(sourceStart + matched) ===
+      searchText.charCodeAt(searchStart + matched)
+  ) {
+    matched += 1;
+  }
+  return matched;
+}
+
+function bestSearchPrefixAlignment(
+  source: string,
+  searchText: string,
+): {
+  readonly sourceStart: number;
+  readonly matched: number;
+  readonly focusIndex: number;
+} | null {
+  if (!source || !searchText) return null;
+  const seedLengths = [128, 64, 32, 16, 8]
+    .map((length) => Math.min(length, searchText.length))
+    .filter((length, index, lengths) =>
+      length > 0 && lengths.indexOf(length) === index
+    );
+  let best: {
+    sourceStart: number;
+    matched: number;
+    focusIndex: number;
+  } | null = null;
+  for (const seedLength of seedLengths) {
+    const seed = searchText.slice(0, seedLength);
+    let fromIndex = 0;
+    let occurrenceCount = 0;
+    while (fromIndex <= source.length && occurrenceCount < 64) {
+      const sourceStart = source.indexOf(seed, fromIndex);
+      if (sourceStart < 0) break;
+      occurrenceCount += 1;
+      const matched = matchingTextAt(
+        source,
+        searchText,
+        sourceStart,
+      );
+      if (!best || matched > best.matched) {
+        best = {
+          sourceStart,
+          matched,
+          focusIndex: sourceStart + matched,
+        };
+      }
+      fromIndex = sourceStart + Math.max(1, seed.length);
+    }
+    if (best?.matched === searchText.length) return best;
+  }
+
+  // A reconstructed prefix can align with the wrong copy of a duplicated
+  // declaration. Probe exact later lines as resynchronization anchors and
+  // score the entire continuous suffix from each anchor, rather than choosing
+  // the first or longest single line. This keeps mutation matching exact but
+  // centers recovery on the real discontinuity (for example a damaged token
+  // followed by several verbatim current-source lines).
+  let searchOffset = 0;
+  let alignmentCandidates = 0;
+  for (const line of searchText.split("\n")) {
+    if (line.trim().length >= 8) {
+      let fromIndex = 0;
+      while (fromIndex <= source.length && alignmentCandidates < 512) {
+        const occurrence = source.indexOf(line, fromIndex);
+        if (occurrence < 0) break;
+        alignmentCandidates += 1;
+        const matched = matchingTextAt(
+          source,
+          searchText,
+          occurrence,
+          searchOffset,
+        );
+        if (!best || matched > best.matched) {
+          best = {
+            sourceStart: Math.max(0, occurrence - searchOffset),
+            matched,
+            // For a later resynchronization anchor, show where the exact
+            // provider text rejoins current source. For a true prefix match,
+            // show the first mismatching byte instead.
+            focusIndex: searchOffset > 0
+              ? occurrence
+              : occurrence + matched,
+          };
+        }
+        fromIndex = occurrence + Math.max(1, line.length);
+      }
+    }
+    searchOffset += line.length + 1;
+  }
+  return best;
+}
+
+function buildReplaceMismatchRecoveryExcerpt(
+  lease: RuntimeV2MutationLease,
+  searchText: string,
+): RuntimeV2MutationRecoveryExcerpt | null {
+  let best: {
+    readonly source: ReturnType<typeof joinedVisibleSourceWindows>[number];
+    readonly sourceStart: number;
+    readonly matched: number;
+    readonly focusIndex: number;
+  } | null = null;
+  for (const source of joinedVisibleSourceWindows(lease)) {
+    const alignment = bestSearchPrefixAlignment(
+      source.content,
+      searchText,
+    );
+    if (
+      alignment &&
+      (!best || alignment.matched > best.matched)
+    ) {
+      best = { source, ...alignment };
+    }
+  }
+  if (!best) return null;
+
+  const sourceLines = best.source.content.split("\n");
+  const mismatchIndex = Math.min(
+    best.source.content.length,
+    best.focusIndex,
+  );
+  const centerLineOffset = best.source.content
+    .slice(0, mismatchIndex)
+    .split("\n").length - 1;
+  let startOffset = Math.max(0, centerLineOffset - 8);
+  let endOffset = Math.min(
+    sourceLines.length - 1,
+    centerLineOffset + 12,
+  );
+  let content = sourceLines.slice(startOffset, endOffset + 1).join("\n");
+  while (
+    content.length > 6_000 &&
+    (startOffset < centerLineOffset || endOffset > centerLineOffset)
+  ) {
+    if (
+      centerLineOffset - startOffset >=
+      endOffset - centerLineOffset
+    ) {
+      startOffset += 1;
+    } else {
+      endOffset -= 1;
+    }
+    content = sourceLines.slice(startOffset, endOffset + 1).join("\n");
+  }
+  if (!content) return null;
+  return {
+    target: lease.target,
+    version: lease.version,
+    startLine: best.source.startLine + startOffset,
+    endLine: best.source.startLine + endOffset,
+    content: content.slice(0, 6_000),
+  };
+}
+
 function leaseCoversMutation(
   toolName: string,
   args: Record<string, unknown>,
@@ -151,6 +333,53 @@ function leaseCoversMutation(
   return lease.complete;
 }
 
+/**
+ * Decide whether the exact source that survived the latest provider request
+ * covers the current-source side of a previously rejected mutation. A same-
+ * file prefix is not enough for a focused patch elsewhere in a large file.
+ * This helper never publishes the rejected patch; it only keeps the
+ * target-locked read window open until the required old block is genuinely
+ * visible.
+ */
+export function runtimeV2MaterializedSourceCoversMutation(input: {
+  readonly toolName: string;
+  readonly args: Readonly<Record<string, unknown>>;
+  readonly target?: string;
+  readonly sourceCoverage: readonly RuntimeV2MaterializedSourceCoverage[];
+  readonly workspace?: string;
+}): boolean {
+  const workspace = String(input.workspace || "");
+  const args = input.args as Record<string, unknown>;
+  const requestedTargets = resolveWorkspaceMutationTargets(
+    input.toolName,
+    args,
+    String(input.target || ""),
+  ).map((target) => normalizeRuntimeV2WorkspacePath(target, workspace));
+  if (requestedTargets.length === 0) return false;
+
+  return requestedTargets.every((target) => {
+    const coverage = input.sourceCoverage.find((candidate) =>
+      workspacePathsReferToSameFile(candidate.target, target)
+    );
+    if (!coverage) return false;
+    const lease: RuntimeV2MutationLease = {
+      target,
+      authority: "materialized_provider_source",
+      evidenceId: `provider-request-source:corrective:${target}:${coverage.version}`,
+      version: coverage.version,
+      complete: coverage.complete,
+      windows: coverage.windows,
+    };
+    return leaseCoversMutation(
+      input.toolName,
+      args,
+      target,
+      lease,
+      workspace,
+    );
+  });
+}
+
 export function validateRuntimeV2MutationLease(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly toolCallId: string;
@@ -162,8 +391,10 @@ export function validateRuntimeV2MutationLease(input: {
   readonly lease: RuntimeV2MutationLease | null;
   readonly leases: readonly RuntimeV2MutationLease[];
   readonly unexpectedTargets: readonly string[];
+  readonly recoveryExcerpt: RuntimeV2MutationRecoveryExcerpt | null;
   readonly reasonCode:
     | "mutation_source_lease_missing"
+    | "mutation_source_text_mismatch"
     | "mutation_target_lease_mismatch";
 } | null {
   const leases = runtimeV2MutationLeases(
@@ -198,9 +429,15 @@ export function validateRuntimeV2MutationLease(input: {
   const leasesByTarget = new Map(
     leases.map((lease) => [lease.target, lease]),
   );
+  const requiresLeasedRecoveryMutation =
+    input.ports.live.latestProviderActionWindow !== null;
   const unexpectedTargets = requestedTargets.filter(
     (target) => {
-      if (creationTargets.has(target) && !leasesByTarget.has(target)) {
+      if (
+        creationTargets.has(target) &&
+        !leasesByTarget.has(target) &&
+        !requiresLeasedRecoveryMutation
+      ) {
         return false;
       }
       const lease = leasesByTarget.get(target);
@@ -220,16 +457,36 @@ export function validateRuntimeV2MutationLease(input: {
   ) {
     return null;
   }
+  const searchText = input.toolName === "replace_in_file"
+    ? String(input.args.search_text ?? input.args.old_text ?? "")
+    : "";
+  const sourceTextMismatch = !!searchText &&
+    input.toolName === "replace_in_file" &&
+    unexpectedTargets.length > 0 &&
+    unexpectedTargets.every((target) => leasesByTarget.has(target));
+  const mismatchLease = sourceTextMismatch
+    ? unexpectedTargets
+        .map((target) => leasesByTarget.get(target))
+        .find(Boolean) || null
+    : null;
   return {
     lease: requestedTargets
       .map((target) => leasesByTarget.get(target))
       .find(Boolean) || leases[leases.length - 1] || null,
     leases,
     unexpectedTargets,
+    recoveryExcerpt: mismatchLease
+      ? buildReplaceMismatchRecoveryExcerpt(
+          mismatchLease,
+          searchText,
+        )
+      : null,
     allowed: requestedTargets.length > 0 &&
       unexpectedTargets.length === 0,
     reasonCode: leases.length === 0
       ? "mutation_source_lease_missing"
-      : "mutation_target_lease_mismatch",
+      : sourceTextMismatch
+        ? "mutation_source_text_mismatch"
+        : "mutation_target_lease_mismatch",
   };
 }

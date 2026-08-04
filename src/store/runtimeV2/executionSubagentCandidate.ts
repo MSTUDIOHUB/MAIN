@@ -3,8 +3,9 @@ import type {
   SchedulerPort,
 } from "../../lib/runtime-v2";
 import {
-  READ_ONLY_SUBAGENT_ACCESS_MODES,
-  READ_ONLY_SUBAGENT_TASK_KINDS,
+  RUNTIME_V2_SUBAGENT_ACCESS_MODES,
+  RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS,
+  RUNTIME_V2_SUBAGENT_TASK_KINDS,
 } from "../../lib/toolSchemas";
 
 function boundedArgument(value: unknown, max: number): string {
@@ -27,8 +28,10 @@ function commaSeparatedPaths(value: unknown): string[] {
     .slice(0, 6);
 }
 
-/** Compile the provider-authored collaboration call into one narrow,
- * read-only scheduler candidate. Omitted scope never expands to ".". */
+/** Compile the provider-authored collaboration call into one narrow scheduler
+ * candidate. Omitted scope never expands to ".". Write access is accepted
+ * only for an explicit implement contract with one operation class and a
+ * concrete parent-authored plan. */
 export function runtimeV2ModelSelectedSubagentCandidate(
   command: Parameters<
     NonNullable<SchedulerPort["prepareSchedule"]>
@@ -52,19 +55,48 @@ export function runtimeV2ModelSelectedSubagentCandidate(
   const successCriteria = boundedArgument(args.success_criteria, 1_000);
   const accessMode = boundedArgument(args.access_mode, 32) || "read";
   const taskKind = boundedArgument(args.task_kind, 32) || "explore";
+  const implementationOperation = boundedArgument(
+    args.implementation_operation,
+    32,
+  );
+  const implementationPlan = boundedArgument(
+    args.implementation_plan,
+    4_000,
+  );
   if (!taskKey || !objective) {
     throw new Error(
       "spawn_subagent requires an objective and a stable tool-call identity.",
     );
   }
   if (
-    !(READ_ONLY_SUBAGENT_ACCESS_MODES as readonly string[])
+    !(RUNTIME_V2_SUBAGENT_ACCESS_MODES as readonly string[])
       .includes(accessMode) ||
-    !(READ_ONLY_SUBAGENT_TASK_KINDS as readonly string[])
+    !(RUNTIME_V2_SUBAGENT_TASK_KINDS as readonly string[])
       .includes(taskKind)
   ) {
     throw new Error(
-      "Runtime v2 collaboration currently accepts read-only explore, review, or validation investigations only.",
+      "Runtime v2 collaboration accepts read-only explore/review/validate jobs or an explicitly planned implement write job.",
+    );
+  }
+  const writeJob = accessMode === "write" || taskKind === "implement";
+  if (
+    writeJob &&
+    (
+      accessMode !== "write" ||
+      taskKind !== "implement" ||
+      !(RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS as readonly string[])
+        .includes(implementationOperation) ||
+      !implementationPlan ||
+      !successCriteria
+    )
+  ) {
+    throw new Error(
+      "implement subagents require access_mode=write, implementation_operation, implementation_plan, and success_criteria.",
+    );
+  }
+  if (!writeJob && accessMode !== "read") {
+    throw new Error(
+      "explore, review, and validate subagents must remain read-only.",
     );
   }
   const explicitlyAllowedPaths = commaSeparatedPaths(args.allowed_paths);
@@ -75,7 +107,12 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       : requiredPaths;
   if (allowedPaths.length === 0) {
     throw new Error(
-      "spawn_subagent requires a narrow read scope in allowed_paths or required_paths; Runtime v2 will not widen an omitted scope to the whole workspace.",
+      "spawn_subagent requires a narrow scope in allowed_paths or required_paths; Runtime v2 will not widen an omitted scope to the whole workspace.",
+    );
+  }
+  if (writeJob && allowedPaths.includes(".")) {
+    throw new Error(
+      "implement subagents require narrow file or directory ownership; the workspace root cannot be a write scope.",
     );
   }
   if (
@@ -93,7 +130,15 @@ export function runtimeV2ModelSelectedSubagentCandidate(
   return {
     sourceToolCallId,
     scopeKey: taskKey,
-    taskKind: taskKind as "explore" | "review" | "validate",
+    taskKind: taskKind as "explore" | "review" | "validate" | "implement",
+    accessMode: accessMode as "read" | "write",
+    ...(writeJob
+      ? {
+          implementationOperation:
+            implementationOperation as "create" | "modify" | "delete",
+          implementationPlan,
+        }
+      : {}),
     name,
     role,
     objective,
@@ -110,4 +155,14 @@ export function runtimeV2SubagentCapacityFromCommand(
     0,
     Math.floor(Number(command.payload.maxActiveSubagents) || 0),
   );
+}
+
+export function runtimeV2SubagentTotalBudgetFromCommand(
+  command: RuntimeV2Command,
+): number {
+  const admitted = Number(command.payload.maxChildRuns);
+  if (Number.isSafeInteger(admitted) && admitted >= 0) {
+    return admitted;
+  }
+  return runtimeV2SubagentCapacityFromCommand(command);
 }

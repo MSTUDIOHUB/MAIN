@@ -75,6 +75,7 @@ function toolResultEvent(
   evidence: RuntimeV2EvidenceReference[],
   failureKind?: RuntimeV2ToolFailureKind,
   presentation?: RuntimeV2ToolPresentation,
+  failureReasonCode?: string,
 ): RuntimeV2EventDraft {
   return {
     type: "tool.completed",
@@ -84,6 +85,7 @@ function toolResultEvent(
     evidence,
     ...(presentation ? { presentation } : {}),
     ...(status !== "succeeded" && failureKind ? { failureKind } : {}),
+    ...(status !== "succeeded" && failureReasonCode ? { failureReasonCode } : {}),
   };
 }
 
@@ -307,7 +309,34 @@ export function isRuntimeV2ValidationPassed(
 }
 
 export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
-  const stableDiagnostic = toolResultContentForModel(output)
+  const result = parseResultRecord(output);
+  const exitCode = result && (
+      typeof result.exitCode === "number" ||
+      typeof result.exit_code === "number" ||
+      typeof result.exitCodeAfter === "number"
+    )
+    ? Number(result.exitCode ?? result.exit_code ?? result.exitCodeAfter)
+    : null;
+  const failed = Boolean(
+    result && (
+      result.error ||
+      result.timedOut === true ||
+      result.timeout === true ||
+      result.success === false ||
+      result.passed === false ||
+      (exitCode !== null && exitCode !== 0)
+    ),
+  );
+  const failureDiagnostic = failed && result
+    ? ["error", "message", "stderr"]
+        .map((field) => typeof result[field] === "string"
+          ? String(result[field]).trim()
+          : "")
+        .filter(Boolean)
+        .join("\n")
+    : "";
+  const stableDiagnostic = (failureDiagnostic ||
+    toolResultContentForModel(output))
     .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/:\d+(?::\d+)?\b/g, ":<line>")
     .replace(/\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?)\b/gi, "<duration>")
@@ -316,7 +345,10 @@ export function runtimeV2ValidationEvidenceVersion(output: unknown): string {
     .filter(Boolean)
     .slice(0, 24)
     .join("\n");
-  return runtimeV2EvidenceVersion(stableDiagnostic || output);
+  return runtimeV2EvidenceVersion([
+    exitCode === null ? "" : `exitCode:${exitCode}`,
+    stableDiagnostic,
+  ].filter(Boolean).join("\n") || output);
 }
 
 function boundedPresentationText(value: unknown, max: number): string {
@@ -433,6 +465,7 @@ export function toolCompletionFor(
   failureKind?: RuntimeV2CompletionFailureKind,
   sourceVersion?: string,
   diffPreview?: ToolDiffPreview,
+  failureReasonCode?: string,
 ): RuntimeV2EventDraft {
   const presentation = toolPresentation({
     toolName,
@@ -459,21 +492,20 @@ export function toolCompletionFor(
             target: resolvedTarget,
             version: evidenceKind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
-              : null,
+              : evidenceKind === "tool"
+                ? runtimeV2ValidationEvidenceVersion(output)
+                : null,
           }))
         : [],
       failureKind === "assertion_failed"
         ? "protocol_invalid"
         : failureKind,
       presentation,
+      failureReasonCode,
     );
   }
   const passed = status === "succeeded" &&
-    isRuntimeV2ValidationPassed(
-      toolName,
-      output,
-      undefined,
-    );
+    isRuntimeV2ValidationPassed(toolName, output, undefined);
   const validationFailureKind =
     failureKind === "source_mismatch" ||
       failureKind === "target_invalid" ||

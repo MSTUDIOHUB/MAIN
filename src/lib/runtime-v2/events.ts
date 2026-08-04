@@ -100,6 +100,10 @@ export type RuntimeV2Event =
         | "mutation_rejected"
         | "source_mismatch"
         | "target_invalid";
+      /** Stable machine-readable cause supplied by the effect boundary.
+       * Provider-facing prose is presentation only and must never be parsed
+       * to reconstruct recovery authority after checkpoint restore. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "validation.completed";

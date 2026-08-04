@@ -46,7 +46,7 @@ function loadTsWithMocks(sourcePath, mocks, cache = new Map()) {
   return module.exports;
 }
 
-test("a reasoning-heavy child retains the Run budget through tool use and evidence reporting", async () => {
+test("a child step is bounded to the parent request ceiling and still reports cited evidence", async () => {
   const runtime = loadTsWithMocks(
     path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"),
     new Map(),
@@ -54,7 +54,7 @@ test("a reasoning-heavy child retains the Run budget through tool use and eviden
   const requestedOutputBudgets = [];
   let firstChunkMarks = 0;
   let providerRound = 0;
-  const reasoningTokensBeforeAction = 10_000;
+  const reasoningTokensBeforeAction = 6_000;
   const minimumActionAndReportTokens = 1_024;
   const streamChatCompletion = async (
     _messages,
@@ -195,6 +195,7 @@ test("a reasoning-heavy child retains the Run budget through tool use and eviden
     }],
     ["./executionSubagentContext", {
       buildRuntimeV2SubagentContextCapsule: () => "",
+      runtimeV2SubagentInheritedSourceTargets: () => [],
     }],
     ["./providerToolSurface", {
       boundRuntimeV2ProviderToolCalls: (calls) => ({
@@ -279,7 +280,7 @@ test("a reasoning-heavy child retains the Run budget through tool use and eviden
     result.report?.findings[0]?.evidenceIds,
     ["child:child-qwen:E1"],
   );
-  assert.deepEqual(requestedOutputBudgets, [16_384, 16_384]);
+  assert.deepEqual(requestedOutputBudgets, [8_192, 8_192]);
   assert.equal(firstChunkMarks, 2);
   assert.ok(
     requestedOutputBudgets.every((budget) =>

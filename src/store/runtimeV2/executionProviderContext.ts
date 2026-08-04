@@ -12,6 +12,7 @@ import {
   approvedPlanForCurrentTurn,
 } from "./executionAggregate";
 import { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
+import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 import type {
   RuntimeV2ExecutionPortsInput,
 } from "./executionTypes";
@@ -81,10 +82,11 @@ export function recordApprovedPlanContext(
   });
 }
 
-/** A phase-level hint sourced only from an approved WorkPlan.
- * Workspace manifests cannot silently promote a convenient build command
- * into acceptance evidence. Direct Execute leaves validation selection to the
- * model and checks the resulting finite receipt at completion. */
+/** Resolve only a finite validator that already belongs to the Turn's sealed
+ * authority. Workspace manifests cannot silently promote a convenient build
+ * command into acceptance evidence. A direct Execute contract is as binding
+ * here as an approved WorkPlan: after mutation MAIN can force the model onto
+ * the validator it explicitly promised instead of reopening tool selection. */
 export function preferredFiniteValidationCommand(
   input: RuntimeV2ExecutionPortsInput,
 ): string {
@@ -95,7 +97,15 @@ export function preferredFiniteValidationCommand(
       String(validation.command || "").trim(),
   );
   const approvedCommand = String(approvedValidation?.command || "").trim();
-  return approvedCommand;
+  if (approvedCommand) return approvedCommand;
+  const contract = deriveRuntimeV2ExecutionContract(
+    aggregateForCurrentTurn(input),
+  );
+  const contractedValidation = contract?.validations.find((validation) =>
+    validation.kind === "finite_command" &&
+    String(validation.command || "").trim()
+  );
+  return String(contractedValidation?.command || "").trim();
 }
 
 export function normalizeRuntimeV2WorkspacePath(

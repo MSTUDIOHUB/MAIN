@@ -1,4 +1,7 @@
-import { checkSourceSyntax } from "../../lib/ipc";
+import {
+  checkSourceSyntax,
+  findSymbolReferences,
+} from "../../lib/ipc";
 import {
   executeTool,
   type ToolExecutionOptions,
@@ -91,6 +94,10 @@ export async function prepareRuntimeV2Mutation(input: {
       }),
     ),
     checkSyntax: checkSourceSyntax,
+    findReferences: (symbol) => findSymbolReferences({
+      symbol,
+      maxResults: 80,
+    }, workspace),
   });
   if (!preflight.ok) {
     const rejectedActionIdentity =

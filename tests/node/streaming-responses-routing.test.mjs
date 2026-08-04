@@ -1651,7 +1651,11 @@ test("local Rust streams keep slow genuine visible output and native tool progre
 });
 
 test("active reasoning is transport progress and is not a no-visible timeout", async () => {
-  const { shouldStopNoVisibleStreamStall } = await loadStreamingModule(async () => undefined);
+  const {
+    shouldStopActionlessStream,
+    shouldStopNoVisibleStreamStall,
+    shouldStopReasoningOnlyStream,
+  } = await loadStreamingModule(async () => undefined);
   assert.equal(shouldStopNoVisibleStreamStall({
     elapsedMs: 120_000,
     visibleChars: 0,
@@ -1675,6 +1679,48 @@ test("active reasoning is transport progress and is not a no-visible timeout", a
     visibleChars: 0,
     toolCallCount: 1,
     reasoningChars: 24_000,
+  }), false);
+  assert.equal(shouldStopReasoningOnlyStream({
+    reasoningChars: 23_999,
+    visibleChars: 0,
+    toolCallCount: 0,
+    reasoningOnlyCharLimit: 24_000,
+  }), false);
+  assert.equal(shouldStopReasoningOnlyStream({
+    reasoningChars: 24_000,
+    visibleChars: 0,
+    toolCallCount: 0,
+    reasoningOnlyCharLimit: 24_000,
+  }), true);
+  assert.equal(shouldStopReasoningOnlyStream({
+    reasoningChars: 24_000,
+    visibleChars: 1,
+    toolCallCount: 0,
+    reasoningOnlyCharLimit: 24_000,
+  }), false);
+  assert.equal(shouldStopActionlessStream({
+    reasoningChars: 500,
+    visibleChars: 1_999,
+    toolCallCount: 0,
+    actionOnlyCharLimit: 2_000,
+  }), false);
+  assert.equal(shouldStopActionlessStream({
+    reasoningChars: 500,
+    visibleChars: 2_000,
+    toolCallCount: 0,
+    actionOnlyCharLimit: 2_000,
+  }), true);
+  assert.equal(shouldStopActionlessStream({
+    reasoningChars: 7_999,
+    visibleChars: 0,
+    toolCallCount: 0,
+    actionOnlyCharLimit: 2_000,
+  }), false);
+  assert.equal(shouldStopActionlessStream({
+    reasoningChars: 2_000,
+    visibleChars: 2_000,
+    toolCallCount: 1,
+    actionOnlyCharLimit: 2_000,
   }), false);
 });
 
@@ -1727,6 +1773,7 @@ test("adapter-derived reasoning controls do not leak to unknown endpoints", asyn
   await run("OMLX", "explicit", 4_096);
 
   assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(requests[0].body.thinking_budget, 0);
   assert.equal(requests[1].body.chat_template_kwargs, undefined);
   assert.equal(requests[2].body.chat_template_kwargs, undefined);
   assert.equal(requests[2].body.thinking_budget, undefined);
@@ -1782,6 +1829,69 @@ test("local Rust streams stop reasoning-only runaway output", async () => {
   assert.deepEqual(invokeCalls, ["start_chat_stream", "cancel_chat_stream"]);
   assert.equal(doneCount, 1);
   assert.deepEqual(tokens, []);
+});
+
+test("local Rust streams stop visible actionless prose without cutting hidden reasoning", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const lifecycle = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push(command);
+    if (command === "cancel_chat_stream") return undefined;
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "bounded hidden reasoning" } }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "分析".repeat(1_100) } }] })}\n\n`,
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  let doneCount = 0;
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "提交结构化动作" }],
+    {
+      baseUrl: "http://127.0.0.1:8000/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "OMLX",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => { doneCount += 1; },
+      onError: (error) => { throw error; },
+      onLifecycle: (event) => lifecycle.push(event),
+    },
+    undefined,
+    undefined,
+    4_096,
+    { actionOnlyCharLimit: 2_000 },
+  );
+
+  assert.equal(result.finishReason, "length");
+  assert.equal(result.toolCalls.length, 0);
+  assert.equal(result.semanticContent.length >= 2_000, true);
+  assert.equal(result.reasoningContent, "bounded hidden reasoning");
+  assert.deepEqual(invokeCalls, ["start_chat_stream", "cancel_chat_stream"]);
+  assert.equal(doneCount, 1);
+  assert.equal(tokens.join("").length >= 2_000, true);
+  assert.equal(lifecycle.some((event) => event.status === "action_guard"), true);
 });
 
 test("OpenAI-compatible chat replays assistant reasoning only with a discovered provider capability", async () => {

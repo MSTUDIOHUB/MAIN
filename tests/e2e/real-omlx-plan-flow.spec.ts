@@ -270,6 +270,7 @@ async function inspectFixtureMutation(
     const allowedMutationFiles = new Set([
       "src/main.js",
       "src/components/editor.js",
+      "src/components/toolbar.js",
     ]);
     for (const relativePath of allowedMutationFiles) {
       executionGaps.push(...getNewUndeclaredCallGaps({
@@ -1260,8 +1261,8 @@ test.beforeEach(async ({ page }) => {
     chunks: number;
     preview: string;
     responseText: string;
-    timeoutMs: number;
-    deadlineAt: number;
+    timeoutMs: number | null;
+    deadlineAt: number | null;
   };
   const chatStreams = new Map<string, RealOmlxChatStream>();
   const summarizeRuntimeV2ToolCalls = (text: string) => {
@@ -1319,7 +1320,7 @@ test.beforeEach(async ({ page }) => {
                     .slice(0, 1_000),
                   timeout_ms: parsed.timeout_ms,
                 }
-            : call.name === "submit_execution_contract"
+            : call.name === "record_execution_contract"
               ? parsed
               : {
                   keys: Object.keys(parsed).sort(),
@@ -1355,6 +1356,28 @@ test.beforeEach(async ({ page }) => {
       }
     }
     return reasoning.replace(/\s+/g, " ").trim().slice(-2_000);
+  };
+  const summarizeRuntimeV2ContentTail = (text: string) => {
+    let content = "";
+    const finishReasons = new Set<string>();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const choice = JSON.parse(payload)?.choices?.[0];
+        content += String(choice?.delta?.content || "");
+        if (content.length > 8_000) content = content.slice(-8_000);
+        if (choice?.finish_reason) finishReasons.add(String(choice.finish_reason));
+      } catch {
+        // The diagnostic is best-effort and must never affect the transport.
+      }
+    }
+    return {
+      chars: content.length,
+      finishReasons: [...finishReasons],
+      tail: content.replace(/\s+/g, " ").trim().slice(-2_000),
+    };
   };
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
     const streamId = String(args.streamId || args.stream_id || "");
@@ -1467,10 +1490,16 @@ test.beforeEach(async ({ page }) => {
         )}`,
       );
     }
-    const requestedTimeoutMs = Number(args.timeoutMs);
-    const timeoutMs = Number.isFinite(requestedTimeoutMs)
-      ? Math.max(1_000, Math.min(600_000, Math.trunc(requestedTimeoutMs)))
-      : 180_000;
+    const requestedTimeoutMs = typeof args.timeoutMs === "number"
+      ? args.timeoutMs
+      : Number.NaN;
+    // Mirror the product contract: an omitted provider timeout means no
+    // per-request deadline. The finite Playwright poll/test timeout remains
+    // the outer harness boundary and will close the browser/fetch if needed.
+    const timeoutMs = Number.isFinite(requestedTimeoutMs) &&
+        requestedTimeoutMs > 0
+      ? Math.max(1_000, Math.trunc(requestedTimeoutMs))
+      : null;
     const controller = new AbortController();
     const stream: RealOmlxChatStream = {
       reader: null,
@@ -1483,7 +1512,7 @@ test.beforeEach(async ({ page }) => {
       preview: "",
       responseText: "",
       timeoutMs,
-      deadlineAt: Date.now() + timeoutMs,
+      deadlineAt: timeoutMs === null ? null : Date.now() + timeoutMs,
     };
     // Register the lease before waiting for response headers. OMLX can spend
     // substantial time in prefill, and cancellation must still reach that
@@ -1491,21 +1520,24 @@ test.beforeEach(async ({ page }) => {
     chatStreams.set(streamId, stream);
     let responseHeaderTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const response = await Promise.race([
-        fetch(url, {
-          method: "POST",
-          headers: args.headers as Record<string, string>,
-          body: bodyText,
-          signal: controller.signal,
-        }),
-        new Promise<never>((_resolve, reject) => {
-          responseHeaderTimer = setTimeout(() => {
-            reject(new Error(
-              `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
-            ));
-          }, Math.max(1, stream.deadlineAt - Date.now()));
-        }),
-      ]);
+      const responsePromise = fetch(url, {
+        method: "POST",
+        headers: args.headers as Record<string, string>,
+        body: bodyText,
+        signal: controller.signal,
+      });
+      const response = stream.deadlineAt === null
+        ? await responsePromise
+        : await Promise.race([
+            responsePromise,
+            new Promise<never>((_resolve, reject) => {
+              responseHeaderTimer = setTimeout(() => {
+                reject(new Error(
+                  `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
+                ));
+              }, Math.max(1, stream.deadlineAt! - Date.now()));
+            }),
+          ]);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
@@ -1529,8 +1561,10 @@ test.beforeEach(async ({ page }) => {
     const stream = chatStreams.get(String(streamId));
     if (!stream?.reader) return { done: true, chunk: "" };
     const phase = stream.chunks === 0 ? "first_chunk" : "idle_chunk";
-    const remainingMs = stream.deadlineAt - Date.now();
-    if (remainingMs <= 0) {
+    const remainingMs = stream.deadlineAt === null
+      ? null
+      : stream.deadlineAt - Date.now();
+    if (remainingMs !== null && remainingMs <= 0) {
       chatStreams.delete(String(streamId));
       stream.controller.abort();
       void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
@@ -1540,16 +1574,19 @@ test.beforeEach(async ({ page }) => {
     }
     let chunkTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const { done, value } = await Promise.race([
-        stream.reader.read(),
-        new Promise<never>((_resolve, reject) => {
-          chunkTimer = setTimeout(() => {
-            reject(new Error(
-              `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
-            ));
-          }, Math.max(1, remainingMs));
-        }),
-      ]);
+      const readPromise = stream.reader.read();
+      const { done, value } = remainingMs === null
+        ? await readPromise
+        : await Promise.race([
+            readPromise,
+            new Promise<never>((_resolve, reject) => {
+              chunkTimer = setTimeout(() => {
+                reject(new Error(
+                  `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
+                ));
+              }, Math.max(1, remainingMs));
+            }),
+          ]);
       const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
       stream.chars += chunk.length;
       stream.chunks += 1;
@@ -1578,6 +1615,12 @@ test.beforeEach(async ({ page }) => {
           if (reasoningTail) {
             console.log(`[real-omlx-reasoning-tail] ${reasoningTail}`);
           }
+          const contentTail = summarizeRuntimeV2ContentTail(
+            stream.responseText,
+          );
+          console.log(
+            `[real-omlx-content-tail] ${JSON.stringify(contentTail)}`,
+          );
         }
       }
       return { done, chunk };
@@ -2029,7 +2072,11 @@ test.beforeEach(async ({ page }) => {
             occurrences.push({
               path: filePath,
               language: filePath.endsWith(".tsx") ? "tsx" : "typescript",
-              role: /\b(?:interface|type|class|function|const|let)\s+/.test(line) ? "definition" : "reference",
+              role: /\bimport\b/.test(line)
+                ? "import"
+                : /\b(?:interface|type|class|function|const|let)\s+/.test(line)
+                  ? "definition"
+                  : "reference",
               syntaxKind: "identifier",
               line: index + 1,
               column: column + 1,
@@ -3144,9 +3191,9 @@ for (const model of models) {
     }, {
       text: realOmlxRequest,
       images: replayImages,
-      // This incident is the production collaboration acceptance lane. It
-      // deliberately enables the Runtime v2 read-only scheduler rather than
-      // leaving overlap coverage to an optional environment flag.
+      // Grant collaboration permission for this production incident. Runtime
+      // still exposes spawn_subagent only when the active provider lane has a
+      // real child-request slot after reserving the parent.
       preferSubagents: true,
     });
 

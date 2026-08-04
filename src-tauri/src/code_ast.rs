@@ -74,6 +74,8 @@ pub struct SourceSyntaxError {
     pub line: usize,
     pub column: usize,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +90,10 @@ pub struct SourceSyntaxCheckResult {
     pub first_error_column: Option<usize>,
     pub errors: Vec<SourceSyntaxError>,
     pub errors_truncated: bool,
+    /// Exact ES module export names in this in-memory post-image. The
+    /// mutation preflight compares this with the current file and checks real
+    /// workspace imports before permitting a public API removal.
+    pub module_exports: Vec<String>,
 }
 
 fn language_for_path(path: &Path) -> Option<(&'static str, Language)> {
@@ -351,7 +357,7 @@ fn duplicate_module_export_positions(
     root: Node<'_>,
     source: &[u8],
     language_name: &str,
-) -> Vec<(usize, usize)> {
+) -> Vec<(usize, usize, String)> {
     if !matches!(language_name, "javascript" | "typescript" | "tsx") {
         return Vec::new();
     }
@@ -363,12 +369,32 @@ fn duplicate_module_export_positions(
             continue;
         }
         for (name, row, column) in export_statement_names(statement, source) {
-            if !seen.insert(name) {
-                duplicates.push((row, column));
+            if !seen.insert(name.clone()) {
+                duplicates.push((row, column, name));
             }
         }
     }
     duplicates
+}
+
+fn module_export_names(root: Node<'_>, source: &[u8], language_name: &str) -> Vec<String> {
+    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        for (name, _, _) in export_statement_names(statement, source) {
+            if !name.is_empty() && seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxCheckResult, String> {
@@ -390,6 +416,7 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
             first_error_column: None,
             errors: Vec::new(),
             errors_truncated: false,
+            module_exports: Vec::new(),
         });
     };
     let mut parser = Parser::new();
@@ -413,6 +440,7 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
                 } else {
                     "parse_error".to_string()
                 },
+                None,
             ));
         }
         let mut cursor = node.walk();
@@ -421,7 +449,9 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
     errors.extend(
         duplicate_module_export_positions(root, source, language_name)
             .into_iter()
-            .map(|(row, column)| (row, column, "duplicate_export".to_string())),
+            .map(|(row, column, symbol)| {
+                (row, column, "duplicate_export".to_string(), Some(symbol))
+            }),
     );
     errors.sort_unstable();
     errors.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
@@ -429,10 +459,11 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
     let reported_errors = errors
         .iter()
         .take(MAX_REPORTED_SYNTAX_ERRORS)
-        .map(|(row, column, kind)| SourceSyntaxError {
+        .map(|(row, column, kind, symbol)| SourceSyntaxError {
             line: row + 1,
             column: column + 1,
             kind: kind.clone(),
+            symbol: symbol.clone(),
         })
         .collect::<Vec<_>>();
     Ok(SourceSyntaxCheckResult {
@@ -445,6 +476,7 @@ pub fn check_source_syntax(path: &Path, source: &[u8]) -> Result<SourceSyntaxChe
         first_error_column: first.map(|position| position.1 + 1),
         errors_truncated: errors.len() > reported_errors.len(),
         errors: reported_errors,
+        module_exports: module_export_names(root, source, language_name),
     })
 }
 
@@ -792,7 +824,36 @@ mod tests {
         assert!(duplicate
             .errors
             .iter()
-            .any(|error| error.kind == "duplicate_export"));
+            .any(|error| error.kind == "duplicate_export"
+                && error.symbol.as_deref() == Some("updateTheme")));
+        assert_eq!(duplicate.module_exports, vec!["updateTheme"]);
+    }
+
+    #[test]
+    fn source_syntax_check_exposes_independent_md_viewer_errors_for_stepwise_repair() {
+        let broken = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function updateTheme(theme) { return theme; }\n}entFile(filePath) {}\nexport function updateTheme(theme) { return theme; }\n",
+        )
+        .unwrap();
+        assert!(broken
+            .errors
+            .iter()
+            .any(|error| error.kind == "parse_error"));
+        assert!(broken.errors.iter().any(|error| {
+            error.kind == "duplicate_export" && error.symbol.as_deref() == Some("updateTheme")
+        }));
+
+        let parser_repaired = check_source_syntax(
+            Path::new("src/toolbar.js"),
+            b"export function updateTheme(theme) { return theme; }\nexport function setCurrentFile(filePath) {}\nexport function updateTheme(theme) { return theme; }\n",
+        )
+        .unwrap();
+        assert!(parser_repaired.error_count < broken.error_count);
+        assert!(parser_repaired
+            .errors
+            .iter()
+            .all(|error| error.kind == "duplicate_export"));
     }
 
     #[test]

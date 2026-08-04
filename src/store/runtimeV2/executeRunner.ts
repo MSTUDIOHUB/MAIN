@@ -1,7 +1,5 @@
 import {
   abortedAgentLoopOutcome,
-  completedAgentLoopOutcome,
-  type AgentLoopOutcome,
 } from "../../lib/runOutcome";
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import {
@@ -10,27 +8,23 @@ import {
   createRuntimeV2EmergencyTerminalEnvelope,
   countDistinctRuntimeV2EvidenceFacts,
   decideRuntimeV2ExecutePhaseTransition,
-  decideRuntimeV2TerminalOutcome,
   deriveRuntimeV2ProviderRecoveryWindow,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
-  latestRuntimeV2ProviderConclusionText,
   runtimeV2DirectExecuteReadyForConclusion,
+  runtimeV2ProviderRecoveryOccurrenceLimitReached,
   runtimeV2ProviderRecoveryStallExpired,
+  RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
   runtimeV2CheckpointWriteFailureReason,
   summarizeRuntimeV2ExecuteEvidence,
-  type RuntimeV2ExecutePhaseTransition,
-  type RuntimeV2ResultKind,
   type RuntimeV2ProviderRecoveryStallLease,
-  type RuntimeV2RunIdentity,
-  type RuntimeV2TurnIdentity,
 } from "../../lib/runtime-v2";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
-import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
+import { awaitCanceledTurnTerminalProjection } from "../sessionCancellationBarrier";
 import {
   createRuntimeV2CheckpointPort,
   getRuntimeV2Checkpoint,
@@ -42,6 +36,30 @@ import {
   createRuntimeV2SchedulerPort,
   createRuntimeV2ToolPort,
 } from "./executionPorts";
+import {
+  RUNTIME_V2_EXECUTION_CONTRACT_MAX_REPAIR_ATTEMPTS,
+  deriveRuntimeV2ExecutionContractRepair,
+} from "./executionContract";
+import {
+  runtimeV2ExecuteAcceptanceEvidenceRequirements,
+} from "./executionAcceptance";
+import {
+  deriveRuntimeV2ProviderEffectFacts,
+} from "./executionProviderEffectFacts";
+import {
+  RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
+  runtimeV2CorrectiveMutationFailureLimitReached,
+} from "./executionProviderActionWindow";
+import {
+  runtimeV2ExecuteTerminalDecision,
+  runtimeV2PhaseTransitionMessage,
+  truthfulRuntimeV2RecoveryStallDecision,
+} from "./executionOutcome";
+import {
+  createRuntimeV2RunnerIdentity,
+  createRuntimeV2RunnerSettlement,
+  runtimeV2TerminalOutcomeToLegacy,
+} from "./executionRunnerIdentity";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
@@ -76,169 +94,6 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
   return state?.conversationTurns?.find((turn: ConversationTurn) => turn.id === turnId) || null;
 }
 
-function sessionEpochFor(state: any, context: RuntimeV2SubmissionContext, turn: ConversationTurn): string {
-  const lifecycle = state?.planLifecycle;
-  if (lifecycle?.sessionKey === context.runSessionKey && String(lifecycle.sessionEpoch || "").trim()) {
-    return String(lifecycle.sessionEpoch).trim();
-  }
-  return `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
-}
-
-function identityFor(state: any, context: RuntimeV2SubmissionContext, turn: ConversationTurn): {
-  turn: RuntimeV2TurnIdentity;
-  run: RuntimeV2RunIdentity;
-} {
-  const sessionEpoch = sessionEpochFor(state, context, turn);
-  const workspaceKey = String(context.runWorkspace || "global").trim() || "global";
-  const turnIdentity: RuntimeV2TurnIdentity = {
-    workspaceKey,
-    sessionKey: context.runSessionKey,
-    sessionEpoch,
-    clientSubmissionId: String(turn.clientSubmissionId || turn.id).trim(),
-    turnId: context.turnId,
-  };
-  const run: RuntimeV2RunIdentity = {
-    sessionKey: context.runSessionKey,
-    sessionEpoch,
-    turnId: context.turnId,
-    runId: context.harnessRunId,
-    parentRunId: null,
-    attemptId: context.harnessRunId,
-  };
-  return { turn: turnIdentity, run };
-}
-
-function terminalOutcomeToLegacy(
-  resultKind: RuntimeV2ResultKind,
-  reason: string,
-): AgentLoopOutcome {
-  return resultKind === "canceled"
-    ? abortedAgentLoopOutcome(reason)
-    : completedAgentLoopOutcome(reason, resultKind);
-}
-
-function terminalDecision(input: {
-  aggregate: ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"];
-  signal: AbortSignal;
-}): { resultKind: RuntimeV2ResultKind; resultReason: string; finalMarkdown?: string } | null {
-  const { aggregate, signal } = input;
-  if (!aggregate) return null;
-  const evidence = summarizeRuntimeV2ExecuteEvidence(aggregate, {
-    isMutationToolName: isWorkspaceMutationToolName,
-  });
-  const finalMarkdown = sanitizeAssistantDisplayContent(
-    latestRuntimeV2ProviderConclusionText(aggregate),
-  ).trim().slice(0, 24_000);
-  const decision = decideRuntimeV2TerminalOutcome(aggregate, {
-    canceled: signal.aborted,
-    mutationCount: evidence.mutationCount,
-    passedValidationCount: evidence.passedValidationCount,
-    hasAcceptanceValidation:
-      runtimeV2DirectExecuteReadyForConclusion(aggregate),
-    failedValidationCount: evidence.failedValidationCount,
-    stalledValidationCount: evidence.stalledValidationCount,
-    hasProviderConclusion: !!finalMarkdown,
-  });
-  if (!decision) return null;
-  return {
-    ...decision,
-    ...(finalMarkdown ? { finalMarkdown } : {}),
-  };
-}
-
-function truthfulRecoveryStallDecision(input: {
-  aggregate: NonNullable<
-    ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]
-  >;
-  recoveryOccurrence: number;
-}): { resultKind: "partial" | "error"; resultReason: string } {
-  const hasMutation = input.aggregate.evidence.some(
-    (evidence) => evidence.kind === "mutation",
-  );
-  const evidence = summarizeRuntimeV2ExecuteEvidence(input.aggregate, {
-    isMutationToolName: isWorkspaceMutationToolName,
-  });
-  const planCoverage =
-    deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
-  const missingTargets = planCoverage?.missingMutationTargets || [];
-  const missingValidations =
-    planCoverage?.missingRequiredValidationIndexes.map(
-      (index) => `work-plan-validation-${index + 1}`,
-    ) ||
-    [];
-  const readOnlyEvidenceCount = input.aggregate.evidence.filter(
-    (item) =>
-      item.kind === "source" ||
-      item.kind === "tool" ||
-      item.kind === "subagent",
-  );
-  const distinctReadOnlyEvidenceCount =
-    countDistinctRuntimeV2EvidenceFacts(readOnlyEvidenceCount);
-  const details = [
-    missingTargets.length > 0
-      ? `未修改目标：${missingTargets.join("、")}`
-      : "",
-    missingValidations.length > 0
-      ? `缺少验证：${missingValidations.join("、")}`
-      : "",
-    hasMutation && evidence.passedValidationCount === 0
-      ? "最新修改之后没有通过有限验证"
-      : "",
-    evidence.failedValidationCount > 0
-      ? "最近一次验证仍未通过"
-      : "",
-    !hasMutation && distinctReadOnlyEvidenceCount > 0
-      ? `已完成 ${distinctReadOnlyEvidenceCount} 条只读证据收集`
-      : "",
-    evidence.failedProviderRequestCount > 0
-      ? `模型有 ${evidence.failedProviderRequestCount} 次决策请求未形成可执行结果`
-      : "",
-    evidence.failedOperationCount > 0
-      ? `${evidence.failedOperationCount} 个动作被拒绝或执行失败`
-      : "",
-  ].filter(Boolean);
-  return {
-    resultKind: hasMutation ? "partial" : "error",
-    resultReason: [
-      `模型恢复已连续停滞，最近 ${input.recoveryOccurrence} 次决策没有形成新的可执行进展。`,
-      hasMutation
-        ? "已保留实际修改，但没有把未覆盖目标或条件表述为成功。"
-        : "本轮没有形成可验收的实际修改。",
-      ...details,
-    ].join(" "),
-  };
-}
-
-function phaseTransitionMessage(
-  reason: RuntimeV2ExecutePhaseTransition["reason"],
-): string {
-  const messages = {
-    pending_mutation_call: "模型已经提交结构化修改动作，开始实施最小修复。",
-    pending_validation_call: "模型已经提交验证动作，开始检查当前工作区结果。",
-    mutation_committed: "工作区修改已经真实落账；下一步执行有限验证。",
-    validation_failed: "有限验证未通过；返回修改阶段，根据失败证据进行一次针对性修复。",
-  } as const;
-  return messages[reason];
-}
-
-function settlement(
-  context: RuntimeV2SubmissionContext,
-  outcome: AgentLoopOutcome,
-): RuntimeRunSettlement {
-  return {
-    disposition: "projected",
-    reason: outcome.reason,
-    identity: {
-      sessionKey: context.runSessionKey,
-      turnId: context.turnId,
-      runId: context.harnessRunId,
-      parentRunId: null,
-      outerRunId: context.harnessRunId,
-    },
-    outcome,
-  };
-}
-
 /** Production adapter shared by visible Execute Turns, approved Plan
  * continuations, ordinary Studio workflows, and internal Goal slices. */
 export async function runSubmitRuntimeV2Execute(
@@ -247,7 +102,11 @@ export async function runSubmitRuntimeV2Execute(
   const initialState = input.get();
   const turn = currentTurn(initialState, input.context.turnId);
   if (!turn) throw new Error(`RUNTIME_V2_TURN_MISSING:${input.context.turnId}`);
-  const identity = identityFor(initialState, input.context, turn);
+  const identity = createRuntimeV2RunnerIdentity(
+    initialState,
+    input.context,
+    turn,
+  );
   const live = createRuntimeV2LiveExecutionState();
   const nextId = nowIdFactory();
   const checkpoint = createRuntimeV2CheckpointPort({
@@ -280,9 +139,9 @@ export async function runSubmitRuntimeV2Execute(
         hasMutation: emergencyTerminal.hasMutation,
       },
     );
-    return settlement(
+    return createRuntimeV2RunnerSettlement(
       input.context,
-      terminalOutcomeToLegacy(
+      runtimeV2TerminalOutcomeToLegacy(
         emergencyTerminal.resultKind,
         emergencyTerminal.reason,
       ),
@@ -357,18 +216,17 @@ export async function runSubmitRuntimeV2Execute(
             (criterion) => criterion.id,
           ) || ["criterion-user-objective"],
         acceptanceEvidenceRequirements:
-          input.context.executeAdmission?.acceptanceCriteria.every(
-              (criterion) => !!criterion.evidenceRequirement,
-            )
-            ? input.context.executeAdmission.acceptanceCriteria.map(
-                (criterion) => criterion.evidenceRequirement!,
-              )
-            : undefined,
+          runtimeV2ExecuteAcceptanceEvidenceRequirements(
+            input.context.executeAdmission?.acceptanceCriteria,
+          ),
         initialPhase: "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
-      return settlement(input.context, terminalOutcomeToLegacy(terminal.resultKind, terminal.reason));
+      return createRuntimeV2RunnerSettlement(
+        input.context,
+        runtimeV2TerminalOutcomeToLegacy(terminal.resultKind, terminal.reason),
+      );
     } else if (
       existing.migrationDisposition ===
         "active_uncontracted_mutation"
@@ -473,7 +331,7 @@ export async function runSubmitRuntimeV2Execute(
           continue;
         }
       }
-      const terminal = terminalDecision({
+      const terminal = runtimeV2ExecuteTerminalDecision({
         aggregate: before,
         signal: input.context.abortCtrl.signal,
       });
@@ -482,22 +340,170 @@ export async function runSubmitRuntimeV2Execute(
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
+      const validationProgress = summarizeRuntimeV2ExecuteEvidence(before, {
+        isMutationToolName: isWorkspaceMutationToolName,
+      });
+      if (
+        validationProgress.stalledValidationCount >=
+          RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT
+      ) {
+        const latestFailure = [...before.events].reverse().find(
+          (event): event is Extract<
+            (typeof before.events)[number],
+            { type: "validation.completed" }
+          > => event.type === "validation.completed" && !event.passed,
+        );
+        const latestDetail = String(
+          latestFailure?.presentation?.message || "",
+        ).trim().slice(0, 1_000);
+        input.logStoreEvent(
+          "runtime_v2_stalled_validation_limit_reached",
+          {
+            turnId: identity.turn.turnId,
+            runId: identity.run.runId,
+            phase: before.phase,
+            consecutiveFailures:
+              validationProgress.stalledValidationCount,
+            limit: RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
+            validationTarget:
+              latestFailure?.presentation?.target || null,
+          },
+        );
+        await controller.driveOnce({
+          resultKind: before.evidence.some((evidence) =>
+              evidence.kind === "mutation"
+            )
+            ? "partial"
+            : "error",
+          resultReason: [
+            `连续 ${validationProgress.stalledValidationCount} 次修改后得到相同的验收失败，MAIN 已停止无效的“修改—重试”循环；这不是执行时长限制。`,
+            "已保留实际修改，但没有将尚未通过验收的结果表述为成功。",
+            latestDetail,
+          ].filter(Boolean).join(" "),
+        });
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
+      }
+      const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(before);
+      if (
+        runtimeV2CorrectiveMutationFailureLimitReached(providerEffectFacts)
+      ) {
+        const correctiveFailureCount =
+          providerEffectFacts.correctiveMutationFailureToolCallIds?.size || 0;
+        const latestFailure = [...before.events].reverse().find(
+          (event): event is Extract<
+            (typeof before.events)[number],
+            { type: "tool.completed" }
+          > =>
+            event.type === "tool.completed" &&
+            (
+              event.failureReasonCode === "mutation_source_lease_missing" ||
+              event.failureReasonCode === "mutation_source_text_mismatch" ||
+              event.failureReasonCode === "mutation_target_lease_mismatch"
+            ),
+        );
+        const latestDetail = String(
+          latestFailure?.presentation?.message || "",
+        ).trim().slice(0, 1_000);
+        input.logStoreEvent(
+          "runtime_v2_corrective_mutation_failure_limit_reached",
+          {
+            turnId: identity.turn.turnId,
+            runId: identity.run.runId,
+            phase: before.phase,
+            failures: correctiveFailureCount,
+            limit: RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
+            latestFailureReasonCode:
+              latestFailure?.failureReasonCode || null,
+          },
+        );
+        await controller.driveOnce({
+          resultKind: before.evidence.some((evidence) =>
+              evidence.kind === "mutation"
+            )
+            ? "partial"
+            : "error",
+          resultReason: [
+            `连续 ${correctiveFailureCount} 次源码纠错修改均未执行，MAIN 已停止“补读—重试”循环；正常长任务仍可在产生真实修改或验证进展时继续运行。`,
+            latestDetail,
+          ].filter(Boolean).join(" "),
+        });
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
+      }
+      const executionContractRepair =
+        deriveRuntimeV2ExecutionContractRepair(before);
+      if (
+        executionContractRepair &&
+        executionContractRepair.attempts >=
+          RUNTIME_V2_EXECUTION_CONTRACT_MAX_REPAIR_ATTEMPTS
+      ) {
+        const latestContractFailure = [...before.events].reverse().find(
+          (event): event is Extract<
+            (typeof before.events)[number],
+            { type: "tool.completed" }
+          > =>
+            event.type === "tool.completed" &&
+            event.failureReasonCode === "execution_contract_rejected",
+        );
+        const rejectionDetail = latestContractFailure?.presentation?.message
+          ? ` ${String(latestContractFailure.presentation.message).slice(0, 1_000)}`
+          : "";
+        input.logStoreEvent(
+          "runtime_v2_execution_contract_repair_limit_reached",
+          {
+            turnId: identity.turn.turnId,
+            runId: identity.run.runId,
+            phase: before.phase,
+            attempts: executionContractRepair.attempts,
+            latestSequence: executionContractRepair.latestSequence,
+            rejectionDetail: rejectionDetail.trim() || null,
+          },
+        );
+        await controller.driveOnce({
+          resultKind: before.evidence.some((evidence) =>
+              evidence.kind === "mutation"
+            )
+            ? "partial"
+            : "error",
+          resultReason: [
+            `执行契约连续 ${executionContractRepair.attempts} 次未通过结构或证据校验，MAIN 已停止重复生成，且没有把未获授权的方案当作成功。`,
+            rejectionDetail.trim(),
+          ].filter(Boolean).join(" "),
+        });
+        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        continue;
+      }
       if (
         providerRecoveryPressure &&
-        runtimeV2ProviderRecoveryStallExpired(
-          providerRecoveryLease,
-          Date.now(),
+        (
+          runtimeV2ProviderRecoveryOccurrenceLimitReached(
+            providerRecoveryPressure,
+          ) ||
+          runtimeV2ProviderRecoveryStallExpired(
+            providerRecoveryLease,
+            Date.now(),
+          )
         )
       ) {
-        input.logStoreEvent("runtime_v2_provider_recovery_stall_reached", {
+        const occurrenceLimitReached =
+          runtimeV2ProviderRecoveryOccurrenceLimitReached(
+            providerRecoveryPressure,
+          );
+        input.logStoreEvent(
+          occurrenceLimitReached
+            ? "runtime_v2_provider_recovery_occurrence_limit_reached"
+            : "runtime_v2_provider_recovery_stall_reached",
+          {
           turnId: identity.turn.turnId,
           runId: identity.run.runId,
           phase: before.phase,
           reason: providerRecoveryPressure.reason,
           occurrence: providerRecoveryPressure.occurrence,
           recoveryStartedAt: providerRecoveryLease?.startedAt || null,
-        });
-        await controller.driveOnce(truthfulRecoveryStallDecision({
+          },
+        );
+        await controller.driveOnce(truthfulRuntimeV2RecoveryStallDecision({
           aggregate: before,
           recoveryOccurrence: providerRecoveryPressure.occurrence,
         }));
@@ -520,7 +526,7 @@ export async function runSubmitRuntimeV2Execute(
         });
         await controller.changePhase(
           phaseTransition.to,
-          phaseTransitionMessage(phaseTransition.reason),
+          runtimeV2PhaseTransitionMessage(phaseTransition.reason),
         );
         continue;
       }
@@ -539,13 +545,14 @@ export async function runSubmitRuntimeV2Execute(
         await controller.changePhase("observing", "已完成初始工作区观察，开始基于证据定位问题。");
         continue;
       }
+      const subagentPolicy = resolveSubagentCapacityPolicy(
+        input.get().config,
+      );
       const drove = await controller.driveOnce({
         subagentPreference:
           input.context.turnInputContextSignals.subagentPreference,
-        subagentCapacity:
-          resolveSubagentCapacityPolicy(
-            input.get().config,
-          ).maxActiveRequests,
+        subagentCapacity: subagentPolicy.maxActiveRequests,
+        subagentRequestMode: subagentPolicy.modelRequestMode,
       });
       if (!drove) {
         if (before.phase === "reviewing") {
@@ -607,9 +614,44 @@ export async function runSubmitRuntimeV2Execute(
         ) ||
         [],
     });
-    return settlement(input.context, terminalOutcomeToLegacy(outcome.resultKind, outcome.reason));
+    return createRuntimeV2RunnerSettlement(
+      input.context,
+      runtimeV2TerminalOutcomeToLegacy(outcome.resultKind, outcome.reason),
+    );
   } catch (error) {
     const aggregate = controller.snapshot().aggregate;
+    const externallySettledCancellation =
+      input.context.abortCtrl.signal.aborted &&
+      await awaitCanceledTurnTerminalProjection({
+        sessionKey: identity.turn.sessionKey,
+        turnId: identity.turn.turnId,
+        getProjection: () => {
+          const state = input.get();
+          return {
+            runtimeEvents: state.runtimeEvents || [],
+            taskFlow: state.taskFlow || [],
+          };
+        },
+      });
+    if (externallySettledCancellation) {
+      for (const childAbort of live.childAbortControllers.values()) {
+        childAbort.abort("runtime_v2_parent_canceled");
+      }
+      input.logStoreEvent(
+        "runtime_v2_execute_cancellation_terminal_observed",
+        {
+          turnId: identity.turn.turnId,
+          runId: identity.run.runId,
+          checkpointRevision: controller.snapshot().revision,
+        },
+      );
+      return createRuntimeV2RunnerSettlement(
+        input.context,
+        abortedAgentLoopOutcome(
+          "用户已停止本轮执行；取消事务已完成唯一终态收口。",
+        ),
+      );
+    }
     if (
       aggregate?.run &&
       !isRuntimeV2TurnTerminallyClosed(aggregate)
@@ -710,9 +752,9 @@ export async function runSubmitRuntimeV2Execute(
           );
           throw error;
         }
-        return settlement(
+        return createRuntimeV2RunnerSettlement(
           input.context,
-          terminalOutcomeToLegacy(
+          runtimeV2TerminalOutcomeToLegacy(
             emergency.envelope.resultKind,
             emergency.envelope.reason,
           ),
@@ -720,9 +762,9 @@ export async function runSubmitRuntimeV2Execute(
       }
       const terminal = controller.snapshot().aggregate?.terminalOutcome;
       if (terminal) {
-        return settlement(
+        return createRuntimeV2RunnerSettlement(
           input.context,
-          terminalOutcomeToLegacy(
+          runtimeV2TerminalOutcomeToLegacy(
             terminal.resultKind,
             terminal.reason,
           ),

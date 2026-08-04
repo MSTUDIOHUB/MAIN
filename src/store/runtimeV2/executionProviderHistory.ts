@@ -5,6 +5,9 @@ import type {
 import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import {
+  buildSubagentDelegationGuidance,
+} from "../../lib/turnIntake";
 import type {
   RuntimeV2NormalizedProviderResult,
   RuntimeV2NormalizedToolCall,
@@ -270,8 +273,8 @@ export function appendRuntimeV2ProviderFeedbackHistory(
 export {
   boundRuntimeV2ProviderConversation,
   buildRuntimeV2DecisionView,
-  materializedRuntimeV2SourceCoverage,
 } from "./executionProviderDecisionView";
+export { materializedRuntimeV2SourceCoverage } from "./executionProviderSourceCoverage";
 
 function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const workspace = input.context.runWorkspace || "未绑定工作区";
@@ -287,6 +290,12 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const workspaceInstructions = String(
     input.context.workspaceInstructionContext || "",
   ).trim();
+  const collaborationGuidance = buildSubagentDelegationGuidance({
+    preference:
+      input.context.turnInputContextSignals?.subagentPreference ||
+        "unspecified",
+    language: input.context.phaseLanguage,
+  });
   return [
     "[MAIN RUNTIME V2]",
     `Workspace: ${workspace}`,
@@ -298,6 +307,9 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     readOnlyTurn
       ? "Return one complete evidence-backed Markdown answer and state any remaining uncertainty."
       : "A final answer must state confirmed cause, files changed, validation performed, and any remaining limit. Never claim success merely because a tool call was issued.",
+    collaborationGuidance
+      ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
+      : "",
     workspaceInstructions
       ? [
           "[LIVE WORKSPACE INSTRUCTIONS]",

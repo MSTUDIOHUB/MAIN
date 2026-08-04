@@ -141,6 +141,13 @@ export interface StreamRequestOptions {
   responseFormat?: Record<string, unknown>;
   visualTransportBinding?: VisualTransportRequestBinding;
   timeoutMs?: number;
+  /** Optional per-request guard for reasoning-only output before any semantic
+   * text or tool call. This bounds one decision, not the task or stream wall
+   * clock, and lets action-oriented runtimes recover with a tighter prompt. */
+  reasoningOnlyCharLimit?: number;
+  /** Cancel a decision that emits excessive visible/hidden prose before any
+   * structured action. Tool arguments are unaffected once a call begins. */
+  actionOnlyCharLimit?: number;
   /** The caller already projected and budgeted the exact decision context.
    * Provider adapters must preserve those messages byte-for-byte and must not
    * replace them with an internally compacted fallback. */
@@ -396,15 +403,35 @@ export function shouldStopReasoningOnlyStream(input: {
   visibleChars: number;
   toolCallCount: number;
   settings?: StreamSettings;
+  reasoningOnlyCharLimit?: number;
 }): boolean {
-  const limit = input.settings && isLocalProfile(input.settings)
-    ? 96_000
-    : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
+  const requestedLimit = Math.floor(
+    Number(input.reasoningOnlyCharLimit) || 0,
+  );
+  const limit = requestedLimit > 0
+    ? requestedLimit
+    : input.settings && isLocalProfile(input.settings)
+      ? 96_000
+      : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
   return (
     input.reasoningChars >= limit &&
     input.visibleChars === 0 &&
     input.toolCallCount === 0
   );
+}
+
+export function shouldStopActionlessStream(input: {
+  reasoningChars: number;
+  visibleChars: number;
+  toolCallCount: number;
+  actionOnlyCharLimit?: number;
+}): boolean {
+  const limit = Math.max(0, Math.floor(
+    Number(input.actionOnlyCharLimit) || 0,
+  ));
+  return limit > 0 &&
+    input.toolCallCount === 0 &&
+    input.visibleChars >= limit;
 }
 
 export function shouldStopNoVisibleStreamStall(input: {
@@ -945,7 +972,13 @@ export function buildOpenAiCompatibleReasoningRequestExtras(
   // not send it to arbitrary OpenAI-compatible endpoints: many reject
   // unknown top-level request keys.
   if (settings.reasoningRequest === "off") {
-    return { chat_template_kwargs: { enable_thinking: false } };
+    // Some thinking-capable templates accept enable_thinking=false but still
+    // preserve their model default. The API-level zero budget is the matching
+    // hard boundary; sending both keeps action-only requests deterministic.
+    return {
+      thinking_budget: 0,
+      chat_template_kwargs: { enable_thinking: false },
+    };
   }
   // "auto" means the selected model/provider owns its advertised default.
   // Sending a positive budget here would force thinking on models whose OMLX
@@ -1852,6 +1885,7 @@ async function streamViaRustProxy(
       visibleChars: semanticProgress.semanticVisibleChars,
       toolCallCount: toolCallsMap.size,
       settings,
+      reasoningOnlyCharLimit: options.reasoningOnlyCharLimit,
     })) {
       return false;
     }
@@ -1860,7 +1894,11 @@ async function streamViaRustProxy(
     finishReason = "length";
     closeReasoningBlock();
     reasoningBuffer = "";
-    const dynamicLimit = isLocalProfile(settings) ? 96_000 : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
+    const dynamicLimit = Math.floor(
+      Number(options.reasoningOnlyCharLimit) || 0,
+    ) || (isLocalProfile(settings)
+      ? 96_000
+      : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT);
     emitStreamingConsole(
       "streaming",
       "warn",
@@ -1873,6 +1911,45 @@ async function streamViaRustProxy(
       chunkCount: rustProxyChunkCount,
       byteCount: rustProxyByteCount,
       status: "reasoning_guard",
+    });
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
+    const result = buildCurrentOpenAiCompatibleResult();
+    onDone(result);
+    resolveResult?.(result);
+    cleanup();
+    return true;
+  };
+
+  const stopActionlessRunaway = () => {
+    if (resolved || anthropicProcessor) return false;
+    if (!shouldStopActionlessStream({
+      reasoningChars: providerReasoningContent.length,
+      visibleChars: semanticProgress.semanticVisibleChars,
+      toolCallCount: toolCallsMap.size,
+      actionOnlyCharLimit: options.actionOnlyCharLimit,
+    })) {
+      return false;
+    }
+    resolved = true;
+    finishReason = "length";
+    closeReasoningBlock();
+    reasoningBuffer = "";
+    const dynamicLimit = Math.max(
+      1,
+      Math.floor(Number(options.actionOnlyCharLimit) || 1),
+    );
+    emitStreamingConsole(
+      "streaming",
+      "warn",
+      `Action-oriented stream exceeded ${dynamicLimit} chars without a tool call; cancelling stream.`,
+    );
+    callbacks.onLifecycle?.({
+      phase: "stream_cancelled",
+      streamId,
+      elapsedMs: Date.now() - streamStartedAt,
+      chunkCount: rustProxyChunkCount,
+      byteCount: rustProxyByteCount,
+      status: "action_guard",
     });
     invoke("cancel_chat_stream", { streamId }).catch(() => {});
     const result = buildCurrentOpenAiCompatibleResult();
@@ -2051,6 +2128,7 @@ async function streamViaRustProxy(
               if (firstToolAt === null) firstToolAt = Date.now();
             }
           }
+          if (stopActionlessRunaway()) return;
           if (stopReasoningOnlyRunaway()) return;
           if (stopNoVisibleProgressStall()) return;
       } catch { /* skip */ }
@@ -2741,15 +2819,43 @@ export async function streamChatCompletion(
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               settings,
+              reasoningOnlyCharLimit: options.reasoningOnlyCharLimit,
             })) {
               finishReason = "length";
               closeReasoningBlock();
               reasoningBuffer = "";
-              const dynamicLimit = isLocalProfile(settings) ? 96_000 : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
+              const dynamicLimit = Math.floor(
+                Number(options.reasoningOnlyCharLimit) || 0,
+              ) || (isLocalProfile(settings)
+                ? 96_000
+                : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT);
               emitStreamingConsole(
                 "streaming",
                 "warn",
                 `Reasoning-only stream exceeded ${dynamicLimit} chars without visible output or tool calls; cancelling stream.`,
+              );
+              await reader.cancel().catch(() => {});
+              const result = buildCurrentOpenAiCompatibleResult();
+              onDone(result);
+              return result;
+            }
+            if (shouldStopActionlessStream({
+              reasoningChars: providerReasoningContent.length,
+              visibleChars: semanticProgress.semanticVisibleChars,
+              toolCallCount: toolCallsMap.size,
+              actionOnlyCharLimit: options.actionOnlyCharLimit,
+            })) {
+              finishReason = "length";
+              closeReasoningBlock();
+              reasoningBuffer = "";
+              const dynamicLimit = Math.max(
+                1,
+                Math.floor(Number(options.actionOnlyCharLimit) || 1),
+              );
+              emitStreamingConsole(
+                "streaming",
+                "warn",
+                `Action-oriented stream exceeded ${dynamicLimit} chars without a tool call; cancelling stream.`,
               );
               await reader.cancel().catch(() => {});
               const result = buildCurrentOpenAiCompatibleResult();

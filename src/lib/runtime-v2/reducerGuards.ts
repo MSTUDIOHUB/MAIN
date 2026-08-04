@@ -31,7 +31,7 @@ export function isValidRuntimeV2SubagentCompletion(input: {
     RuntimeV2Event,
     { readonly type: "subagent.completed" }
   >;
-  readonly taskKind: RuntimeV2SubagentJob["taskKind"];
+  readonly job: RuntimeV2SubagentJob;
 }): boolean {
   const inheritedEvidence = input.event.inheritedEvidence || [];
   const known = new Map(input.state.evidence.map((item) => [item.id, item]));
@@ -41,7 +41,24 @@ export function isValidRuntimeV2SubagentCompletion(input: {
       candidate.target === item.target &&
       candidate.version === item.version;
   });
+  const mutationEvidence = input.event.evidence.filter((item) =>
+    item.kind === "mutation"
+  );
+  const writeJob = input.job.taskKind === "implement" &&
+    input.job.accessMode === "write";
+  const mutationScopeValid = mutationEvidence.every((item) =>
+    input.job.allowedPaths.some((path) =>
+      item.target === path || item.target.startsWith(`${path.replace(/\/$/, "")}/`)
+    )
+  );
   return inheritedIsKnown &&
+    mutationScopeValid &&
+    (writeJob || mutationEvidence.length === 0) &&
+    (
+      input.event.status !== "completed" ||
+      !writeJob ||
+      mutationEvidence.length > 0
+    ) &&
     (
       input.event.status !== "completed" ||
       validateRuntimeV2SubagentReport({
@@ -66,6 +83,14 @@ export function isValidRuntimeV2SubagentJob(
     !!job.scopeKey &&
     !!job.objective &&
     job.allowedPaths.length > 0 &&
+    (
+      job.taskKind === "implement"
+        ? job.accessMode === "write" &&
+          !!job.implementationOperation &&
+          !!job.implementationPlan &&
+          !job.allowedPaths.includes(".")
+        : (job.accessMode || "read") === "read"
+    ) &&
     job.status === "queued" &&
     job.firstTokenAt === null &&
     job.closedAt === null &&

@@ -147,6 +147,7 @@ const READ_ONLY_BUILT_INS = new Set([
   // Runtime-control ingress: it never executes a workspace read/write and is
   // consumed before ordinary tool partitioning.
   "submit_plan_candidate",
+  "record_execution_contract",
   "spawn_subagent",
   "wait_subagents",
   "cancel_subagent",

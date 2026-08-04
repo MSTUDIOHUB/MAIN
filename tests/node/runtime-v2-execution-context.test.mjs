@@ -82,6 +82,10 @@ const providerPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderPort.ts",
 ));
+const providerSurfaceRejection = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionProviderSurfaceRejection.ts",
+));
 const providerDeadline = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderDeadline.ts",
@@ -93,6 +97,14 @@ const executionTypes = loadTs(path.join(
 const providerEffectFacts = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderEffectFacts.ts",
+));
+const providerActionWindow = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionProviderActionWindow.ts",
+));
+const executionAcceptance = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionAcceptance.ts",
 ));
 const executionToolPort = loadTs(path.join(
   workspaceRoot,
@@ -110,6 +122,22 @@ const executionToolDefinitions = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolDefinitions.ts",
 ));
+const executionContract = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionContract.ts",
+));
+const executionContractAdvance = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionContractAdvance.ts",
+));
+const executionContractFormation = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionContractFormation.ts",
+));
+const validationCorrection = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionValidationCorrection.ts",
+));
 const subagentContext = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSubagentContext.ts",
@@ -122,6 +150,10 @@ const subagentRunner = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSubagentRunner.ts",
 ));
+const subagentPolicy = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionSubagentPolicy.ts",
+));
 const schedulerPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSchedulerPort.ts",
@@ -130,10 +162,45 @@ const subagentCandidate = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSubagentCandidate.ts",
 ));
+const reducerGuards = loadTs(path.join(
+  workspaceRoot,
+  "src/lib/runtime-v2/reducerGuards.ts",
+));
+const subagentWriteScope = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionSubagentWriteScope.ts",
+));
 const runtime = loadTs(path.join(
   workspaceRoot,
   "src/lib/runtime-v2/index.ts",
 ));
+
+test("an explicit zero child budget cannot fall back to later active capacity", () => {
+  assert.equal(
+    subagentCandidate.runtimeV2SubagentTotalBudgetFromCommand({
+      payload: {
+        maxChildRuns: 0,
+        maxActiveSubagents: 2,
+      },
+    }),
+    0,
+  );
+});
+
+test("unclassified direct Execute acceptance defaults to behavioral evidence", () => {
+  assert.deepEqual(
+    executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements(),
+    ["behavioral"],
+  );
+  assert.deepEqual(
+    executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements([
+      { evidenceRequirement: "static" },
+      {},
+      { evidenceRequirement: "interaction" },
+    ]),
+    ["static", "behavioral", "interaction"],
+  );
+});
 
 test("a shared lifecycle boundary stays distinct from a tool timeout", async () => {
   await assert.rejects(
@@ -529,6 +596,42 @@ test("provider mutation facts come only from committed ledger evidence", () => {
     events: [
       scheduled("failed-command", "failed-mutation"),
       completed("failed-command", "failed", []),
+      scheduled(
+        "mismatch-command",
+        "mismatched-mutation",
+        "replace_in_file",
+        {
+          path: "src/components/toolbar.js",
+          search_text: "imagined old source",
+          replace_text: "new source",
+        },
+      ),
+      {
+        ...completed("mismatch-command", "blocked", []),
+        failureKind: "source_mismatch",
+        presentation: {
+          toolName: "replace_in_file",
+          target: "src/components/toolbar.js",
+        },
+      },
+      scheduled(
+        "preflight-command",
+        "preflight-rejected-mutation",
+        "replace_in_file",
+        {
+          path: "src/components/editor.js",
+          search_text: "old source",
+          replace_text: "duplicate export proposal",
+        },
+      ),
+      {
+        ...completed("preflight-command", "failed", []),
+        failureKind: "mutation_rejected",
+        presentation: {
+          toolName: "replace_in_file",
+          target: "src/components/editor.js",
+        },
+      },
       scheduled("read-command", "read-main"),
       {
         ...completed("read-command", "succeeded", []),
@@ -541,6 +644,16 @@ test("provider mutation facts come only from committed ledger evidence", () => {
         target: "src/main.js",
         version: "v1",
       }]),
+      {
+        type: "subagent.completed",
+        status: "completed",
+        evidence: [{
+          id: "child-mutation",
+          kind: "mutation",
+          target: "src/components/editor.js",
+          version: "editor-v2",
+        }],
+      },
       scheduled("committed-command", "committed-mutation"),
       completed("committed-command", "succeeded", [{
         id: "mutation",
@@ -583,8 +696,435 @@ test("provider mutation facts come only from committed ledger evidence", () => {
     },
   );
   assert.equal(
+    facts.invalidatedSourceReadToolCallIds.has("source-main"),
+    true,
+    "a committed child transaction must invalidate parent source authority even without a parent tool-call pair",
+  );
+  assert.equal(
     facts.failedValidationToolCallIds.has("validate-current"),
     true,
+  );
+  assert.deepEqual(
+    facts.correctiveReplayTargetsByToolCallId.get("mismatched-mutation"),
+    ["src/components/toolbar.js"],
+    "a restart must reconstruct the exact target whose cache replay was reopened",
+  );
+  assert.deepEqual(
+    facts.correctiveReplayTargetsByToolCallId.get(
+      "preflight-rejected-mutation",
+    ),
+    ["src/components/editor.js"],
+    "parser-confirmed preflight failures must reopen the same bounded replay after restart",
+  );
+  assert.equal(
+    facts.correctiveMutationFailureToolCallIds.size,
+    0,
+    "a later committed mutation establishes a new corrective-diagnostic boundary",
+  );
+});
+
+test("different searches with the same non-empty result close one durable observation branch", () => {
+  const scheduled = (id, callId, toolName, argumentsValue) => ({
+    type: "command.scheduled",
+    command: {
+      idempotencyKey: id,
+      kind: "execute_tool",
+      phase: "acting",
+      payload: {
+        toolCallId: callId,
+        toolName,
+        arguments: argumentsValue,
+      },
+    },
+  });
+  const completed = (id, toolName, version, summary) => ({
+    type: "tool.completed",
+    idempotencyKey: id,
+    status: "succeeded",
+    evidence: [{
+      id: `${id}-source`,
+      kind: "source",
+      target: toolName,
+      version,
+    }],
+    presentation: {
+      toolName,
+      target: toolName,
+      observationSummary: summary,
+    },
+  });
+  const duplicateEvents = [
+    scheduled("grep-a", "grep-call-a", "grep_search", {
+      path: "src",
+      query: "function writeFile",
+    }),
+    completed("grep-a", "grep_search", "same-result-version", "src/main.js:268: writeFile"),
+    scheduled("grep-b", "grep-call-b", "grep_search", {
+      path: "src/main.js",
+      query: "writeFile",
+    }),
+    completed("grep-b", "grep_search", "same-result-version", "src/main.js:268: writeFile"),
+  ];
+  const repeated = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: duplicateEvents,
+  });
+  assert.deepEqual(
+    [...repeated.repeatedObservationToolNames],
+    ["grep_search"],
+    "argument churn returning the identical result is one observation, not new progress",
+  );
+
+  const exactRepeat = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [duplicateEvents[0], duplicateEvents[1], duplicateEvents[0], duplicateEvents[1]],
+  });
+  assert.equal(
+    exactRepeat.repeatedObservationToolNames.size,
+    0,
+    "the semantic guard requires materially different action identities",
+  );
+  const emptyResults = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: duplicateEvents.map((event) =>
+      event.type === "tool.completed"
+        ? { ...event, presentation: { ...event.presentation, observationSummary: "" } }
+        : event
+    ),
+  });
+  assert.equal(
+    emptyResults.repeatedObservationToolNames.size,
+    0,
+    "distinct empty searches remain distinct negative facts",
+  );
+
+  const reset = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [
+      ...duplicateEvents,
+      scheduled("edit", "edit-call", "replace_in_file", {
+        path: "src/main.js",
+        search_text: "old",
+        replace_text: "new",
+      }),
+      {
+        type: "tool.completed",
+        idempotencyKey: "edit",
+        status: "succeeded",
+        evidence: [{
+          id: "mutation-main",
+          kind: "mutation",
+          target: "src/main.js",
+          version: "main-v2",
+        }],
+      },
+    ],
+  });
+  assert.equal(
+    reset.repeatedObservationToolNames.size,
+    0,
+    "a real mutation establishes a fresh observation boundary",
+  );
+});
+
+test("equivalent failed validations converge across command wrapper churn", () => {
+  const diagnostic = [
+    "FRESH_FIXTURE_ACCEPTANCE_FAILED: current source violates acceptance:",
+    "src/main.js:408: open files must not trigger Save As",
+  ].join("\n");
+  const firstOutput = JSON.stringify({
+    command: "npm run build 2>&1 | head -100",
+    exitCode: 1,
+    durationMs: 913,
+    stdout: "vite build\n✓ built in 913ms",
+    stderr: diagnostic,
+  });
+  const secondOutput = JSON.stringify({
+    command: "npx vite build",
+    exitCode: 1,
+    durationMs: 1_827,
+    stdout: "vite build\n✓ built in 1.827 seconds",
+    stderr: diagnostic,
+  });
+  const firstVersion = evidence.runtimeV2ValidationEvidenceVersion(
+    firstOutput,
+  );
+  const secondVersion = evidence.runtimeV2ValidationEvidenceVersion(
+    secondOutput,
+  );
+  assert.equal(
+    firstVersion,
+    secondVersion,
+    "wrapper, stdout, and timing churn must not hide an unchanged failure diagnostic",
+  );
+  assert.notEqual(
+    firstVersion,
+    evidence.runtimeV2ValidationEvidenceVersion(JSON.stringify({
+      exitCode: 1,
+      stderr: "src/editor.js:192: a different acceptance failure",
+    })),
+  );
+  const durableCompletion = evidence.toolCompletionFor(
+    { live: executionTypes.createRuntimeV2LiveExecutionState() },
+    {
+      idempotencyKey: "build-versioned",
+      kind: "execute_tool",
+      phase: "acting",
+      run: {},
+      payload: {},
+    },
+    "run_command",
+    { command: "npm run build" },
+    "npm run build",
+    firstOutput,
+    "succeeded",
+  );
+  assert.equal(
+    durableCompletion.evidence[0]?.version,
+    firstVersion,
+    "successful tool completion records a durable result-semantic version",
+  );
+
+  const command = (id, callId, commandText) => ({
+    type: "command.scheduled",
+    command: {
+      idempotencyKey: id,
+      kind: "execute_tool",
+      phase: "acting",
+      payload: {
+        toolCallId: callId,
+        toolName: "run_command",
+        arguments: { command: commandText },
+      },
+    },
+  });
+  const completion = (id, version) => ({
+    type: "tool.completed",
+    idempotencyKey: id,
+    status: "succeeded",
+    evidence: [{
+      id: `${id}-tool`,
+      kind: "tool",
+      target: "build",
+      version,
+    }],
+    presentation: {
+      toolName: "run_command",
+      target: "build",
+      observationSummary: diagnostic,
+    },
+  });
+  const facts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [
+      command("build-a", "build-call-a", "npm run build 2>&1 | head -100"),
+      completion("build-a", firstVersion),
+      command("build-b", "build-call-b", "npx vite build"),
+      completion("build-b", secondVersion),
+    ],
+  });
+  assert.deepEqual(
+    [...facts.repeatedObservationToolNames],
+    ["run_command"],
+    "equivalent failed builds close the same pre-mutation validation branch",
+  );
+});
+
+test("multiple cached source re-materializations close durable workset cycling", () => {
+  const replay = (id, callId, pathValue) => [{
+    type: "command.scheduled",
+    command: {
+      idempotencyKey: id,
+      kind: "execute_tool",
+      phase: "acting",
+      payload: {
+        toolCallId: callId,
+        toolName: "read_file",
+        arguments: { path: pathValue },
+      },
+    },
+  }, {
+    type: "tool.completed",
+    idempotencyKey: id,
+    status: "succeeded",
+    evidence: [],
+    receiptOrigin: "replayed",
+  }];
+  const replayEvents = [
+    ...replay("replay-main", "replay-main-call", "src/main.js"),
+    ...replay("replay-editor", "replay-editor-call", "src/components/editor.js"),
+  ];
+  const cycling = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: replayEvents,
+  });
+  assert.equal(
+    cycling.replayedSourceReceiptCountSinceMutation,
+    2,
+  );
+
+  const reset = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [
+      ...replayEvents,
+      {
+        type: "command.scheduled",
+        command: {
+          idempotencyKey: "mutate-main",
+          kind: "execute_tool",
+          phase: "acting",
+          payload: {
+            toolCallId: "mutate-main-call",
+            toolName: "replace_in_file",
+            arguments: { path: "src/main.js" },
+          },
+        },
+      },
+      {
+        type: "tool.completed",
+        idempotencyKey: "mutate-main",
+        status: "succeeded",
+        evidence: [{
+          id: "mutated-main",
+          kind: "mutation",
+          target: "src/main.js",
+          version: "main-v2",
+        }],
+      },
+    ],
+  });
+  assert.equal(
+    reset.replayedSourceReceiptCountSinceMutation,
+    0,
+  );
+});
+
+test("the durable ledger retains a correctable mutation diagnostic across reads", () => {
+  const mutationCommand = {
+    type: "command.scheduled",
+    command: {
+      idempotencyKey: "rejected-mutation-command",
+      kind: "execute_tool",
+      phase: "acting",
+      payload: {
+        toolCallId: "rejected-mutation-call",
+        toolName: "replace_in_file",
+        arguments: {
+          path: "src/components/toolbar.js",
+          search_text: "imagined source",
+          replace_text: "duplicate proposal",
+        },
+      },
+    },
+  };
+  const rejectedMutation = {
+    type: "tool.completed",
+    idempotencyKey: "rejected-mutation-command",
+    status: "failed",
+    failureKind: "mutation_rejected",
+    evidence: [],
+    presentation: {
+      toolName: "replace_in_file",
+      target: "src/components/toolbar.js",
+    },
+  };
+  const readCommand = {
+    type: "command.scheduled",
+    command: {
+      idempotencyKey: "recovery-read-command",
+      kind: "execute_tool",
+      phase: "acting",
+      payload: {
+        toolCallId: "recovery-read-call",
+        toolName: "read_file",
+        arguments: { path: "src/components/toolbar.js" },
+      },
+    },
+  };
+  const recoveryRead = {
+    type: "tool.completed",
+    idempotencyKey: "recovery-read-command",
+    status: "succeeded",
+    failureKind: null,
+    evidence: [{
+      id: "toolbar-source",
+      kind: "source",
+      target: "src/components/toolbar.js",
+      version: "toolbar-v1",
+    }],
+  };
+
+  const facts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [
+      mutationCommand,
+      rejectedMutation,
+      readCommand,
+      recoveryRead,
+    ],
+  });
+  assert.equal(
+    facts.correctiveMutationFailureToolCallIds.has(
+      "rejected-mutation-call",
+    ),
+    true,
+  );
+  assert.equal(
+    facts.correctiveMutationRequirementsByToolCallId.get(
+      "rejected-mutation-call",
+    )?.toolName,
+    "replace_in_file",
+    "reads do not erase the failed editor requirement; current materialized source decides the next action",
+  );
+});
+
+test("a structured missing-source mutation failure survives restart as corrective recovery", () => {
+  const facts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
+    events: [{
+      type: "command.scheduled",
+      command: {
+        idempotencyKey: "missing-source-command",
+        kind: "execute_tool",
+        phase: "acting",
+        payload: {
+          toolCallId: "missing-source-call",
+          toolName: "replace_in_file",
+          arguments: {
+            path: "src/main.js",
+            search_text: "const stale = true;",
+            replace_text: "const stale = false;",
+          },
+        },
+      },
+    }, {
+      type: "tool.completed",
+      idempotencyKey: "missing-source-command",
+      status: "blocked",
+      failureKind: "protocol_invalid",
+      failureReasonCode: "mutation_target_lease_mismatch",
+      evidence: [],
+      presentation: {
+        toolName: "replace_in_file",
+        target: "src/main.js",
+        message: "presentation text is not recovery authority",
+      },
+    }],
+  });
+
+  assert.deepEqual(
+    facts.correctiveReplayTargetsByToolCallId.get("missing-source-call"),
+    ["src/main.js"],
+  );
+  assert.equal(
+    facts.correctiveMutationFailureToolCallIds.has("missing-source-call"),
+    true,
+  );
+  assert.deepEqual(
+    facts.correctiveMutationRequirementsByToolCallId.get(
+      "missing-source-call",
+    ),
+    {
+      toolName: "replace_in_file",
+      arguments: {
+        path: "src/main.js",
+        search_text: "const stale = true;",
+        replace_text: "const stale = false;",
+      },
+      target: "src/main.js",
+      reasonCode: "mutation_target_lease_mismatch",
+    },
   );
 });
 
@@ -810,7 +1350,7 @@ test("a thrown tool error is visible to both the model and structured presentati
   assert.match(String(live.messages.at(-1)?.content || ""), /TOOL_ERROR:/);
 });
 
-test("Runtime v2 collaboration schema matches its read-only execution contract", () => {
+test("Runtime v2 collaboration schema exposes read investigations and transactional implementation", () => {
   const spawn = {
     type: "function",
     function: {
@@ -834,6 +1374,11 @@ test("Runtime v2 collaboration schema matches its read-only execution contract",
             type: "string",
             enum: ["read", "write"],
           },
+          implementation_operation: {
+            type: "string",
+            enum: ["create", "modify", "delete"],
+          },
+          implementation_plan: { type: "string" },
         },
         required: ["objective"],
       },
@@ -857,11 +1402,15 @@ test("Runtime v2 collaboration schema matches its read-only execution contract",
 
   assert.deepEqual(
     selected.function.parameters.properties.task_kind.enum,
-    ["explore", "review", "validate"],
+    ["explore", "review", "validate", "implement"],
   );
   assert.deepEqual(
     selected.function.parameters.properties.access_mode.enum,
-    ["read"],
+    ["read", "write"],
+  );
+  assert.match(
+    selected.function.description,
+    /exclusive narrow paths|stages and commits/i,
   );
   assert.deepEqual(
     selected.function.parameters.required,
@@ -895,6 +1444,1684 @@ test("Runtime v2 collaboration schema matches its read-only execution contract",
   ]);
 });
 
+test("multi-owner direct Execute records an evidence-bound contract before its first mutation", () => {
+  const turn = {
+    workspaceKey: "/fixture",
+    sessionKey: "session-contract",
+    sessionEpoch: "epoch-contract",
+    clientSubmissionId: "submission-contract",
+    turnId: "turn-contract",
+  };
+  const run = {
+    sessionKey: turn.sessionKey,
+    sessionEpoch: turn.sessionEpoch,
+    turnId: turn.turnId,
+    runId: "run-contract",
+    parentRunId: null,
+    attemptId: "attempt-contract",
+  };
+  let sequence = 0;
+  const event = (type, fields) => ({
+    schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence: sequence++,
+    eventId: `contract-event-${sequence}`,
+    at: sequence,
+    type,
+    ...fields,
+  });
+  let aggregate = runtime.transition(null, event("turn.admitted", {
+    turn,
+    strategy: "execute",
+    objective: "Trace both symptoms to their owners and repair them.",
+    constraints: [],
+    acceptanceCriteria: ["Both observable symptoms are repaired."],
+    acceptanceCriterionIds: ["criterion-user-objective"],
+  }));
+  aggregate = runtime.transition(aggregate, event("run.started", {
+    run,
+    phase: "observing",
+  }));
+  const addSource = (id, target, version) => {
+    const command = {
+      idempotencyKey: `read-${id}`,
+      kind: "execute_tool",
+      phase: "observing",
+      run,
+      payload: {
+        toolCallId: `read-call-${id}`,
+        toolName: "read_file",
+        arguments: { path: target },
+      },
+    };
+    aggregate = runtime.transition(aggregate, event("command.scheduled", {
+      run,
+      command,
+    }));
+    aggregate = runtime.transition(aggregate, event("tool.completed", {
+      run,
+      idempotencyKey: command.idempotencyKey,
+      status: "succeeded",
+      evidence: [{ id, kind: "source", target, version }],
+    }));
+  };
+  addSource("E-main", "src/main.js", "main-v1");
+  addSource("E-editor", "src/components/editor.js", "editor-v1");
+
+  assert.equal(
+    executionContract.runtimeV2ExecutionContractRequired(aggregate),
+    true,
+  );
+  const beforeCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 1,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const ports = {
+    get: () => ({
+      runtimeV2Checkpoints: { [turn.turnId]: beforeCheckpoint },
+    }),
+    context: { turnId: turn.turnId },
+    now: () => 1,
+  };
+  const available = executionToolDefinitions.runtimeV2ToolDefinitions({})
+    .filter((tool) => [
+      "read_file",
+      "grep_search",
+      "replace_in_file",
+      "apply_patch",
+      "run_command",
+      "record_execution_contract",
+    ].includes(tool.function.name));
+  const gated = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: {
+      ...command("observing"),
+      run,
+    },
+    available,
+  });
+  assert.deepEqual(gated.map((tool) => tool.function.name), [
+    "grep_search",
+    "read_file",
+    "record_execution_contract",
+  ]);
+  const gatedContractTool = gated.find((tool) =>
+    tool.function.name === "record_execution_contract"
+  );
+  assert.ok(gatedContractTool);
+  if (
+    aggregate.objective?.acceptanceEvidenceRequirements?.includes(
+      "behavioral",
+    )
+  ) {
+    assert.ok(
+      gatedContractTool.function.parameters.required.includes(
+        "behavioral_validation",
+      ),
+      "runtime-owned behavioral acceptance must be encoded in the provider schema before submission",
+    );
+  }
+  const behavioralAggregate = {
+    ...aggregate,
+    objective: {
+      ...(aggregate.objective && typeof aggregate.objective === "object"
+        ? aggregate.objective
+        : {}),
+      acceptanceEvidenceRequirements: ["behavioral"],
+    },
+  };
+  const behavioralCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 2,
+    aggregate: behavioralAggregate,
+    updatedAt: behavioralAggregate.updatedAt,
+  });
+  const [behavioralContractTool] = providerTools
+    .selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: behavioralCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("observing"),
+        run,
+      },
+      available,
+    })
+    .filter((tool) => tool.function.name === "record_execution_contract");
+  assert.ok(
+    behavioralContractTool.function.parameters.required.includes(
+      "behavioral_validation",
+    ),
+  );
+  assert.match(
+    behavioralContractTool.function.description,
+    /build, lint, and typecheck alone are invalid/i,
+  );
+
+  const parsedBehavioralContract =
+    executionContract.parseRuntimeV2ExecutionContractArguments({
+      summary: "Repair the user-visible state flow.",
+      root_causes: ["A programmatic state transition triggers a user effect."],
+      changes: [{
+        operation: "modify",
+        targets: ["src/main.js"],
+        change: "Separate programmatic loading from user input.",
+        expected_outcome: "Loading stays clean.",
+      }],
+      validations: [{
+        kind: "finite_command",
+        command: "npm run build",
+        expected_outcome: "Static build exits zero.",
+      }],
+      behavioral_validation: {
+        kind: "browser",
+        expected_outcome: "Opening a file does not trigger a save dialog.",
+      },
+    });
+  assert.deepEqual(
+    parsedBehavioralContract.validations.map((entry) => entry.kind),
+    ["finite_command", "browser"],
+  );
+
+  const sequenceAfterInitialSources = sequence;
+  const rejectedInitialContractCommand = {
+    idempotencyKey: "record-initial-contract-rejected",
+    kind: "execute_tool",
+    phase: "observing",
+    run,
+    payload: {
+      toolCallId: "record-initial-contract-rejected-call",
+      toolName: "record_execution_contract",
+      arguments: {
+        summary: "Incomplete initial contract",
+        root_causes: ["A cause without a complete change entry."],
+      },
+    },
+  };
+  let rejectedInitialAggregate = runtime.transition(
+    aggregate,
+    event("command.scheduled", {
+      run,
+      command: rejectedInitialContractCommand,
+    }),
+  );
+  rejectedInitialAggregate = runtime.transition(
+    rejectedInitialAggregate,
+    event("tool.completed", {
+      run,
+      idempotencyKey: rejectedInitialContractCommand.idempotencyKey,
+      status: "blocked",
+      failureKind: "not_authorized",
+      failureReasonCode: "execution_contract_rejected",
+      evidence: [],
+    }),
+  );
+  assert.deepEqual(
+    executionContract.deriveRuntimeV2ExecutionContractRepair(
+      rejectedInitialAggregate,
+    ),
+    {
+      attempts: 1,
+      latestSequence: rejectedInitialAggregate.events.at(-1).sequence,
+    },
+    "an invalid initial contract must enter the same bounded repair window as a revision",
+  );
+  const rejectedInitialCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 2,
+    aggregate: rejectedInitialAggregate,
+    updatedAt: rejectedInitialAggregate.updatedAt,
+  });
+  const initialRepairTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: rejectedInitialCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("observing"),
+        run,
+      },
+      available,
+    });
+  assert.deepEqual(
+    initialRepairTools.map((tool) => tool.function.name),
+    ["record_execution_contract"],
+    "a malformed initial contract cannot reopen source discovery",
+  );
+  const initialRepairPrompt = providerRequest.providerModeInstruction({
+    payload: { mode: "execute" },
+  }, "", {
+    hasReadFile: false,
+    hasMutation: false,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    executionContractRequired: true,
+    executionContractRepairAttempts: 1,
+  });
+  assert.match(initialRepairPrompt, /complete initial object/i);
+  assert.match(initialRepairPrompt, /revision_reason is not needed/i);
+  assert.match(initialRepairPrompt, /expected_outcome/i);
+  sequence = sequenceAfterInitialSources;
+
+  const contractArguments = {
+    summary: "Keep the editor API stable while repairing the caller and owner boundary.",
+    root_causes: [
+      "Programmatic content replacement dispatches a user input event.",
+      "The caller and persistence boundary use inconsistent argument ownership.",
+    ],
+    changes: [{
+      operation: "modify",
+      targets: ["src/main.js", "src/components/editor.js"],
+      change: "Remove only the synthetic input path and align the existing caller boundary.",
+      expected_outcome: "Opening a file remains clean and does not trigger a save dialog.",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm run build",
+      expected_outcome: "The bounded production build exits zero.",
+    }],
+  };
+  const contractCommand = {
+    idempotencyKey: "record-contract-1",
+    kind: "execute_tool",
+    phase: "observing",
+    run,
+    payload: {
+      toolCallId: "record-contract-call-1",
+      toolName: "record_execution_contract",
+      arguments: contractArguments,
+    },
+  };
+  aggregate = runtime.transition(aggregate, event("command.scheduled", {
+    run,
+    command: contractCommand,
+  }));
+  aggregate = runtime.transition(aggregate, event("tool.completed", {
+    run,
+    idempotencyKey: contractCommand.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "E-contract",
+      kind: "tool",
+      target: "record_execution_contract",
+      version: "contract-v1",
+    }],
+  }));
+  const recorded = executionContract.deriveRuntimeV2ExecutionContract(
+    aggregate,
+  );
+  const recordedAggregate = aggregate;
+  assert.equal(recorded.revision, 1);
+  assert.deepEqual(recorded.sourceEvidenceIds.sort(), [
+    "E-editor",
+    "E-main",
+  ]);
+  assert.deepEqual(
+    executionContract.runtimeV2ExecutionContractMutationTargets(recorded),
+    ["src/main.js", "src/components/editor.js"],
+  );
+
+  const afterCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 2,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const afterPorts = {
+    ...ports,
+    get: () => ({
+      runtimeV2Checkpoints: { [turn.turnId]: afterCheckpoint },
+    }),
+  };
+  const reopened = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: afterPorts,
+    command: {
+      ...command("observing"),
+      run,
+    },
+    available,
+  });
+  assert.ok(reopened.some((tool) => tool.function.name === "replace_in_file"));
+  const replace = reopened.find((tool) =>
+    tool.function.name === "replace_in_file"
+  );
+  assert.deepEqual(replace.function.parameters.properties.path.enum, [
+    "src/main.js",
+    "src/components/editor.js",
+  ]);
+
+  const rejectedRevisionCommand = {
+    ...contractCommand,
+    idempotencyKey: "record-contract-revision-rejected",
+    payload: {
+      ...contractCommand.payload,
+      toolCallId: "record-contract-revision-call-rejected",
+      arguments: {
+        summary: "Incomplete revision",
+        root_causes: ["A failed acceptance receipt exposed more work."],
+      },
+    },
+  };
+  aggregate = runtime.transition(aggregate, event("command.scheduled", {
+    run,
+    command: rejectedRevisionCommand,
+  }));
+  aggregate = runtime.transition(aggregate, event("tool.completed", {
+    run,
+    idempotencyKey: rejectedRevisionCommand.idempotencyKey,
+    status: "blocked",
+    failureKind: "not_authorized",
+    failureReasonCode: "execution_contract_rejected",
+    evidence: [],
+  }));
+  assert.deepEqual(
+    executionContract.deriveRuntimeV2ExecutionContractRepair(aggregate),
+    {
+      attempts: 1,
+      latestSequence: aggregate.events.at(-1).sequence,
+    },
+  );
+  const repairCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 3,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const repairTools = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      ...ports,
+      get: () => ({
+        runtimeV2Checkpoints: { [turn.turnId]: repairCheckpoint },
+      }),
+    },
+    command: {
+      ...command("acting"),
+      run,
+    },
+    available,
+  });
+  assert.deepEqual(
+    repairTools.map((tool) => tool.function.name),
+    ["record_execution_contract"],
+    "a malformed revision cannot reopen reading or mutation",
+  );
+  const scopeRejection = authorization.validateToolAgainstPhaseAndPlan({
+    ports: {
+      ...afterPorts,
+      live: executionTypes.createRuntimeV2LiveExecutionState(),
+    },
+    command: {
+      idempotencyKey: "out-of-contract-mutation",
+      kind: "execute_tool",
+      phase: "observing",
+      run,
+      payload: { toolCallId: "out-of-contract-call" },
+    },
+    toolName: "replace_in_file",
+    args: {
+      path: "src/components/statusbar.js",
+      search_text: "old",
+      replace_text: "new",
+    },
+    target: "src/components/statusbar.js",
+  });
+  assert.equal(scopeRejection.allowed, false);
+  assert.equal(
+    scopeRejection.reasonCode,
+    "execution_contract_mutation_scope",
+  );
+  const prompt = providerRequest.providerModeInstruction({
+    payload: { mode: "execute" },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    executionContract: recorded,
+  });
+  assert.match(prompt, /execution_contract_v1/);
+  assert.match(prompt, /do not broaden into cleanup or redesign/i);
+
+  const mutationCommand = {
+    idempotencyKey: "contract-mutation-editor",
+    kind: "execute_tool",
+    phase: "acting",
+    run,
+    payload: {
+      toolCallId: "contract-mutation-editor-call",
+      toolName: "replace_in_file",
+      arguments: {
+        path: "src/components/editor.js",
+        search_text: "old",
+        replace_text: "new",
+      },
+    },
+  };
+  const mutationEvidence = {
+      id: "E-mutation-editor",
+      kind: "mutation",
+      target: "src/components/editor.js",
+      version: null,
+  };
+  const mutatedAggregate = {
+    ...recordedAggregate,
+    evidence: [...recordedAggregate.evidence, mutationEvidence],
+    events: [
+      ...recordedAggregate.events,
+      event("command.scheduled", { run, command: mutationCommand }),
+      event("tool.completed", {
+        run,
+        idempotencyKey: mutationCommand.idempotencyKey,
+        status: "succeeded",
+        evidence: [mutationEvidence],
+      }),
+    ],
+  };
+  const advance =
+    executionContractAdvance.deriveRuntimeV2ExecutionContractAdvance(
+      mutatedAggregate,
+    );
+  assert.equal(advance.required, true);
+  assert.deepEqual(advance.committedTargets, [
+    "src/components/editor.js",
+  ]);
+  assert.deepEqual(advance.pendingTargets, ["src/main.js"]);
+  assert.equal(
+    advance.sourceReviewAvailable,
+    false,
+    "a pending contract target must advance before optional post-edit inspection reopens",
+  );
+  assert.deepEqual(advance.sourceReviewTargets, [
+    "src/components/editor.js",
+  ]);
+  assert.equal(advance.sourceReviewReceiptCount, 0);
+  const advanceCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 4,
+    aggregate: mutatedAggregate,
+    updatedAt: mutatedAggregate.updatedAt,
+  });
+  const advanceTools = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      ...ports,
+      get: () => ({
+        runtimeV2Checkpoints: { [turn.turnId]: advanceCheckpoint },
+      }),
+    },
+    command: {
+      ...command("validating"),
+      run,
+      payload: {
+        ...command("validating").payload,
+        mode: "validate",
+      },
+    },
+    available,
+  });
+  const reviewRead = advanceTools.find((tool) =>
+    tool.function.name === "read_file"
+  );
+  assert.equal(reviewRead, undefined);
+  assert.equal(
+    advanceTools.some((tool) =>
+      ["replace_in_file", "apply_patch", "write_file"].includes(
+        tool.function.name,
+      )
+    ),
+    true,
+    "the next contracted mutation remains directly executable",
+  );
+  assert.equal(
+    advanceTools.some((tool) =>
+      tool.function.name === "run_command" ||
+      tool.function.name === "browser_evaluate"
+    ),
+    false,
+    "validation cannot skip a contract target that has not received its implementation mutation",
+  );
+  const recoveryAdvanceTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: { [turn.turnId]: advanceCheckpoint },
+        }),
+      },
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+      actionWindow: "closed_recovery",
+      correctiveValidationCommand: "npm run build",
+    });
+  assert.equal(
+    recoveryAdvanceTools.some((tool) =>
+      tool.function.name === "run_command" ||
+      tool.function.name === "browser_evaluate"
+    ),
+    false,
+    "closed recovery cannot advertise validation while a contracted mutation is pending",
+  );
+  assert.equal(
+    recoveryAdvanceTools.some((tool) =>
+      ["replace_in_file", "apply_patch", "write_file"].includes(
+        tool.function.name,
+      )
+    ),
+    true,
+  );
+  const advancePorts = {
+    ...ports,
+    live: executionTypes.createRuntimeV2LiveExecutionState(),
+    get: () => ({
+      runtimeV2Checkpoints: { [turn.turnId]: advanceCheckpoint },
+    }),
+  };
+  const prematureValidation = authorization.validateToolAgainstPhaseAndPlan({
+    ports: advancePorts,
+    command: {
+      idempotencyKey: "premature-contract-validation",
+      kind: "execute_validation",
+      phase: "validating",
+      run,
+      payload: {
+        mode: "validate",
+        toolName: "run_command",
+        arguments: { command: "npm run build" },
+      },
+    },
+    toolName: "run_command",
+    args: { command: "npm run build" },
+    target: "npm run build",
+  });
+  assert.equal(prematureValidation.allowed, false);
+  assert.equal(
+    prematureValidation.reasonCode,
+    "execution_contract_pending_mutations",
+  );
+  const outOfReviewRead = authorization.validateToolAgainstPhaseAndPlan({
+    ports: advancePorts,
+    command: {
+      idempotencyKey: "out-of-review-read",
+      kind: "execute_tool",
+      phase: "validating",
+      run,
+      payload: {
+        mode: "validate",
+        toolName: "read_file",
+        arguments: { path: "src/main.js" },
+      },
+    },
+    toolName: "read_file",
+    args: { path: "src/main.js" },
+    target: "src/main.js",
+  });
+  assert.equal(outOfReviewRead.allowed, false);
+  assert.equal(
+    outOfReviewRead.reasonCode,
+    "execution_contract_source_review_scope",
+  );
+
+  const reviewedAggregate = mutatedAggregate;
+  const reviewedAdvance =
+    executionContractAdvance.deriveRuntimeV2ExecutionContractAdvance(
+      reviewedAggregate,
+    );
+  assert.equal(reviewedAdvance.required, true);
+  assert.equal(reviewedAdvance.sourceReviewAvailable, false);
+  assert.equal(reviewedAdvance.sourceReviewReceiptCount, 0);
+  const reviewedCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 5,
+    aggregate: reviewedAggregate,
+    updatedAt: reviewedAggregate.updatedAt,
+  });
+  const reviewedTools = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      ...ports,
+      get: () => ({
+        runtimeV2Checkpoints: { [turn.turnId]: reviewedCheckpoint },
+      }),
+    },
+    command: {
+      ...command("validating"),
+      run,
+      payload: {
+        ...command("validating").payload,
+        mode: "validate",
+      },
+    },
+    available,
+  });
+  assert.equal(
+    reviewedTools.some((tool) => tool.function.name === "read_file"),
+    false,
+    "post-edit inspection remains closed until all contracted mutations commit",
+  );
+
+  const mainMutationCommand = {
+    ...mutationCommand,
+    idempotencyKey: "contract-mutation-main",
+    payload: {
+      ...mutationCommand.payload,
+      toolCallId: "contract-mutation-main-call",
+      arguments: {
+        ...mutationCommand.payload.arguments,
+        path: "src/main.js",
+      },
+    },
+  };
+  const completeAggregate = {
+    ...reviewedAggregate,
+    events: [
+      ...reviewedAggregate.events,
+      event("command.scheduled", { run, command: mainMutationCommand }),
+      event("tool.completed", {
+        run,
+        idempotencyKey: mainMutationCommand.idempotencyKey,
+        status: "succeeded",
+        evidence: [{
+          id: "E-mutation-main",
+          kind: "mutation",
+          target: "src/main.js",
+          version: null,
+        }],
+      }),
+      event("tool.completed", {
+        run,
+        idempotencyKey: "contract-review-main",
+        status: "succeeded",
+        evidence: [{
+          id: "E-review-main",
+          kind: "source",
+          target: "src/main.js",
+          version: "main-v2",
+        }],
+      }),
+    ],
+  };
+  const completeAdvance =
+    executionContractAdvance.deriveRuntimeV2ExecutionContractAdvance(
+      completeAggregate,
+    );
+  assert.deepEqual(completeAdvance.pendingTargets, []);
+  assert.equal(completeAdvance.sourceReviewAvailable, false);
+  const completeCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 6,
+    aggregate: completeAggregate,
+    updatedAt: completeAggregate.updatedAt,
+  });
+  const validationOnlyTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: completeCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+    });
+  assert.deepEqual(
+    validationOnlyTools.map((tool) => tool.function.name),
+    ["run_command"],
+    "once every contract target and the one self-review batch are complete, only a finite validation may advance the boundary",
+  );
+
+  const failedAggregate = {
+    ...completeAggregate,
+    events: [...completeAggregate.events, event("validation.completed", {
+      run,
+      idempotencyKey: "failed-contract-validation",
+      passed: false,
+      failureKind: "assertion_failed",
+      evidence: [],
+      presentation: {
+        message: [
+          "FRESH_ACCEPTANCE_FAILED",
+          "src/components/editor.js:190:1 - programmatic input remains dirty",
+          "src/main.js:389:1 - pristine tab replacement remains incomplete",
+        ].join("\n"),
+      },
+    })],
+  };
+  const failedCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 7,
+    aggregate: failedAggregate,
+    updatedAt: failedAggregate.updatedAt,
+  });
+  const correctionReadTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: failedCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+    });
+  assert.deepEqual(
+    correctionReadTools.map((tool) => tool.function.name),
+    [
+      "grep_search",
+      "read_file",
+      "replace_in_file",
+      "apply_patch",
+    ],
+    "a failed acceptance receipt supersedes the pre-edit outline and returns to one ordinary inspect/edit surface",
+  );
+  assert.equal(
+    correctionReadTools.find((tool) => tool.function.name === "read_file")
+      .function.parameters.properties.path.enum,
+    undefined,
+    "diagnostic locations guide the model but do not become a project-specific path lock",
+  );
+  for (const toolName of ["replace_in_file", "apply_patch"]) {
+    assert.equal(
+      correctionReadTools.find((tool) => tool.function.name === toolName)
+        .function.parameters.properties.path?.enum,
+      undefined,
+      "new acceptance evidence must not retain the stale contract target enum",
+    );
+  }
+  const correctionClosedTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...ports,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: failedCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+      actionWindow: "closed_recovery",
+    });
+  assert.deepEqual(
+    correctionClosedTools.map((tool) => tool.function.name),
+    ["replace_in_file", "apply_patch"],
+  );
+  assert.equal(
+    correctionClosedTools.find((tool) =>
+      tool.function.name === "replace_in_file"
+    ).function.parameters.properties.path.enum,
+    undefined,
+    "closed recovery must force an edit without forcing it back into the stale pre-validation scope",
+  );
+
+  const unavailableValidationCommand = {
+    idempotencyKey: "missing-contract-validator",
+    kind: "execute_validation",
+    phase: "validating",
+    run,
+    payload: {
+      toolCallId: "missing-contract-validator-call",
+      mode: "validate",
+      toolName: "run_command",
+      arguments: { command: "npm run build" },
+    },
+  };
+  const unavailableAggregate = {
+    ...completeAggregate,
+    events: [
+      ...completeAggregate.events,
+      event("command.scheduled", {
+        run,
+        command: unavailableValidationCommand,
+      }),
+      event("validation.completed", {
+        run,
+        idempotencyKey: unavailableValidationCommand.idempotencyKey,
+        passed: false,
+        failureKind: "execution_failed",
+        evidence: [],
+        presentation: {
+          message: 'npm error Missing script: "build"',
+        },
+      }),
+    ],
+  };
+  const unavailableCorrection =
+    validationCorrection.deriveRuntimeV2ValidationCorrectionWindow(
+      unavailableAggregate,
+    );
+  assert.equal(unavailableCorrection.validationCommandUnavailable, true);
+  assert.equal(
+    unavailableCorrection.failedValidationCommand,
+    "npm run build",
+  );
+  assert.deepEqual(unavailableCorrection.diagnosticSourceHints, []);
+  const unavailableCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 8,
+    aggregate: unavailableAggregate,
+    updatedAt: unavailableAggregate.updatedAt,
+  });
+  const unavailablePorts = {
+    ...ports,
+    live: executionTypes.createRuntimeV2LiveExecutionState(),
+    get: () => ({
+      runtimeV2Checkpoints: {
+        [turn.turnId]: unavailableCheckpoint,
+      },
+    }),
+  };
+  const replacementTools =
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: unavailablePorts,
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+    });
+  assert.deepEqual(
+    replacementTools.map((tool) => tool.function.name),
+    ["run_command"],
+    "an unavailable validator opens one alternate finite validation action, not a source or mutation loop",
+  );
+  assert.equal(
+    replacementTools[0].function.parameters.properties.command?.enum,
+    undefined,
+    "the failed sealed command must not remain the only executable enum",
+  );
+  const repeatedValidator = authorization.validateToolAgainstPhaseAndPlan({
+    ports: unavailablePorts,
+    command: unavailableValidationCommand,
+    toolName: "run_command",
+    args: { command: "npm run build" },
+    target: "npm run build",
+  });
+  assert.equal(repeatedValidator.allowed, false);
+  assert.equal(
+    repeatedValidator.reasonCode,
+    "failed_validation_command_repeated",
+  );
+  const alternateValidator = authorization.validateToolAgainstPhaseAndPlan({
+    ports: unavailablePorts,
+    command: {
+      ...unavailableValidationCommand,
+      idempotencyKey: "alternate-validator",
+      payload: {
+        ...unavailableValidationCommand.payload,
+        arguments: { command: "npm test" },
+      },
+    },
+    toolName: "run_command",
+    args: { command: "npm test" },
+    target: "npm test",
+  });
+  assert.equal(
+    alternateValidator.allowed,
+    true,
+    "a materially different finite validator may replace an operationally unavailable sealed command",
+  );
+
+  const alternateFailureCommand = {
+    ...unavailableValidationCommand,
+    idempotencyKey: "alternate-validator-failed",
+    payload: {
+      ...unavailableValidationCommand.payload,
+      toolCallId: "alternate-validator-failed-call",
+      arguments: { command: "npm test" },
+    },
+  };
+  const exhaustedAggregate = {
+    ...unavailableAggregate,
+    events: [
+      ...unavailableAggregate.events,
+      event("command.scheduled", {
+        run,
+        command: alternateFailureCommand,
+      }),
+      event("validation.completed", {
+        run,
+        idempotencyKey: alternateFailureCommand.idempotencyKey,
+        passed: false,
+        failureKind: "execution_failed",
+        evidence: [],
+        presentation: { message: "test runner is unavailable" },
+      }),
+    ],
+  };
+  const exhaustedCheckpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 9,
+    aggregate: exhaustedAggregate,
+    updatedAt: exhaustedAggregate.updatedAt,
+  });
+  assert.deepEqual(
+    providerTools.selectRuntimeV2ProviderToolDefinitions({
+      ports: {
+        ...unavailablePorts,
+        get: () => ({
+          runtimeV2Checkpoints: {
+            [turn.turnId]: exhaustedCheckpoint,
+          },
+        }),
+      },
+      command: {
+        ...command("validating"),
+        run,
+        payload: {
+          ...command("validating").payload,
+          mode: "validate",
+        },
+      },
+      available,
+    }),
+    [],
+    "two source-less operational validator failures must hand off instead of cycling commands",
+  );
+
+  const advancePrompt = providerRequest.providerModeInstruction({
+    payload: { mode: "validate" },
+  }, "npm run build", {
+    hasReadFile: false,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    executionContract: recorded,
+    executionContractAdvanceRequired: true,
+    executionContractCommittedTargets: advance.committedTargets,
+    executionContractPendingTargets: advance.pendingTargets,
+    executionContractSourceReviewAvailable: false,
+    executionContractSourceReviewTargets: advance.sourceReviewTargets,
+  });
+  assert.match(advancePrompt, /open-ended investigation is closed/i);
+  assert.match(advancePrompt, /src\/main\.js/);
+  assert.match(advancePrompt, /Submit one concrete mutation/i);
+  assert.match(
+    advancePrompt,
+    /Validation remains unavailable until every pending contract target/i,
+  );
+  assert.doesNotMatch(
+    advancePrompt,
+    /Validate the latest committed mutation now/i,
+  );
+});
+
+test("an Execute contract rejects unread targets, silent revisions, and scope drift", () => {
+  const aggregate = {
+    strategy: "execute",
+    evidence: [
+      { id: "E1", kind: "source", target: "src/main.js", version: "v1" },
+      { id: "E2", kind: "source", target: "src/editor.js", version: "v1" },
+    ],
+    events: [
+      { sequence: 1, type: "tool.completed", status: "succeeded", evidence: [
+        { id: "E1", kind: "source", target: "src/main.js", version: "v1" },
+      ] },
+      { sequence: 2, type: "tool.completed", status: "succeeded", evidence: [
+        { id: "E2", kind: "source", target: "src/editor.js", version: "v1" },
+      ] },
+    ],
+  };
+  const base = {
+    summary: "Repair the proved two-owner event flow.",
+    root_causes: ["The caller turns a programmatic update into user input."],
+    changes: [{
+      operation: "modify",
+      targets: ["src/main.js"],
+      change: "Preserve the public API and remove only the synthetic event.",
+      expected_outcome: "Programmatic open stays clean.",
+    }],
+    validations: [{
+      kind: "finite_command",
+      command: "npm test",
+      expected_outcome: "The bounded test exits zero.",
+    }],
+  };
+  assert.equal(
+    executionContract.validateRuntimeV2ExecutionContractSubmission({
+      aggregate,
+      args: base,
+    }).allowed,
+    true,
+  );
+  const longRunning =
+    executionContract.validateRuntimeV2ExecutionContractSubmission({
+      aggregate,
+      args: {
+        ...base,
+        validations: [{
+          kind: "finite_command",
+          command: "npm run dev",
+          expected_outcome: "The watcher starts.",
+        }],
+      },
+    });
+  assert.equal(longRunning.allowed, false);
+  assert.match(longRunning.reason, /services and observers/i);
+  const behavioralAggregate = {
+    ...aggregate,
+    objective: {
+      acceptanceEvidenceRequirements: ["behavioral"],
+    },
+  };
+  const staticOnly =
+    executionContract.validateRuntimeV2ExecutionContractSubmission({
+      aggregate: behavioralAggregate,
+      args: {
+        ...base,
+        validations: [{
+          kind: "finite_command",
+          command: "npm run build",
+          expected_outcome: "The build exits zero.",
+        }],
+      },
+    });
+  assert.equal(staticOnly.allowed, false);
+  assert.match(staticOnly.reason, /behavioral acceptance floor/i);
+  assert.equal(
+    executionContract.validateRuntimeV2ExecutionContractSubmission({
+      aggregate: behavioralAggregate,
+      args: base,
+    }).allowed,
+    true,
+    "a finite test can satisfy the behavioral planning floor",
+  );
+  const unread = executionContract.validateRuntimeV2ExecutionContractSubmission({
+    aggregate,
+    args: {
+      ...base,
+      changes: [{
+        ...base.changes[0],
+        targets: ["src/unread.js"],
+      }],
+    },
+  });
+  assert.equal(unread.allowed, false);
+  assert.match(unread.reason, /Unread targets: src\/unread\.js/);
+  const contract = {
+    schemaVersion: "runtime-v2-execution-contract.v1",
+    revision: 1,
+    summary: base.summary,
+    rootCauses: base.root_causes,
+    changes: executionContract.parseRuntimeV2ExecutionContractArguments(base).changes,
+    validations: executionContract.parseRuntimeV2ExecutionContractArguments(base).validations,
+    revisionReason: null,
+    sourceEvidenceIds: ["E1"],
+    recordedAtSequence: 3,
+  };
+  assert.equal(executionContract.runtimeV2ExecutionContractAllowsTargets({
+    contract,
+    targets: ["src/main.js"],
+  }), true);
+  assert.equal(executionContract.runtimeV2ExecutionContractAllowsTargets({
+    contract,
+    targets: ["src/editor.js"],
+  }), false);
+});
+
+test("contract preparation allows two novel supplemental provider batches then closes discovery", () => {
+  const readCommand = (key, callId, target) => ({
+    idempotencyKey: key,
+    kind: "execute_tool",
+    payload: {
+      toolCallId: callId,
+      toolName: "read_file",
+      arguments: { path: target },
+    },
+  });
+  const sourceCompletion = (sequence, key, id, target) => ({
+    sequence,
+    type: "tool.completed",
+    idempotencyKey: key,
+    status: "succeeded",
+    evidence: [{ id, kind: "source", target, version: `${id}-v1` }],
+  });
+  const firstCommands = [
+    readCommand("read-main", "call-main", "src/main.js"),
+    readCommand("read-editor", "call-editor", "src/components/editor.js"),
+  ];
+  const thresholdEvents = [{
+    sequence: 1,
+    type: "provider.responded",
+    result: {
+      toolCalls: firstCommands.map((entry) => ({
+        id: entry.payload.toolCallId,
+        name: "read_file",
+        arguments: entry.payload.arguments,
+      })),
+    },
+  }, ...firstCommands.map((entry, index) => ({
+    sequence: index + 2,
+    type: "command.scheduled",
+    command: entry,
+  })), sourceCompletion(4, "read-main", "E-main", "src/main.js"),
+  sourceCompletion(5, "read-editor", "E-editor", "src/components/editor.js")];
+  const thresholdAggregate = {
+    strategy: "execute",
+    evidence: thresholdEvents.flatMap((entry) => entry.evidence || []),
+    events: thresholdEvents,
+  };
+
+  assert.deepEqual(
+    executionContract.runtimeV2ExecutionContractReadWindow(
+      thresholdAggregate,
+    ),
+    { supplementalReadBatches: 0, closed: false },
+  );
+
+  const supplementalCommand = readCommand(
+    "read-handler",
+    "call-handler",
+    "src-tauri/src/main.rs",
+  );
+  const supplementalEvents = [{
+    sequence: 6,
+    type: "provider.responded",
+    result: {
+      toolCalls: [{
+        id: "call-handler",
+        name: "read_file",
+        arguments: supplementalCommand.payload.arguments,
+      }],
+    },
+  }, {
+    sequence: 7,
+    type: "command.scheduled",
+    command: supplementalCommand,
+  }, sourceCompletion(
+    8,
+    "read-handler",
+    "E-handler",
+    "src-tauri/src/main.rs",
+  )];
+  const firstSupplementalAggregate = {
+    ...thresholdAggregate,
+    evidence: [
+      ...thresholdAggregate.evidence,
+      ...supplementalEvents.flatMap((entry) => entry.evidence || []),
+    ],
+    events: [...thresholdEvents, ...supplementalEvents],
+  };
+
+  assert.deepEqual(
+    executionContract.runtimeV2ExecutionContractReadWindow(
+      firstSupplementalAggregate,
+    ),
+    { supplementalReadBatches: 1, closed: false },
+  );
+  const entryCommand = readCommand(
+    "read-entry",
+    "call-entry",
+    "index.html",
+  );
+  const entryEvents = [{
+    sequence: 9,
+    type: "provider.responded",
+    result: {
+      toolCalls: [{
+        id: "call-entry",
+        name: "read_file",
+        arguments: entryCommand.payload.arguments,
+      }],
+    },
+  }, {
+    sequence: 10,
+    type: "command.scheduled",
+    command: entryCommand,
+  }, sourceCompletion(11, "read-entry", "E-entry", "index.html")];
+  const closedAggregate = {
+    ...firstSupplementalAggregate,
+    evidence: [
+      ...firstSupplementalAggregate.evidence,
+      ...entryEvents.flatMap((entry) => entry.evidence || []),
+    ],
+    events: [...firstSupplementalAggregate.events, ...entryEvents],
+  };
+  assert.deepEqual(
+    executionContract.runtimeV2ExecutionContractReadWindow(closedAggregate),
+    { supplementalReadBatches: 2, closed: true },
+  );
+  const prompt = providerRequest.providerModeInstruction({
+    payload: { mode: "execute" },
+  }, "", {
+    hasReadFile: false,
+    hasMutation: false,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    executionContractRequired: true,
+    executionContractReadWindowClosed: true,
+  });
+  assert.match(prompt, /observation branch is closed/i);
+  assert.match(prompt, /call record_execution_contract now/i);
+});
+
+test("a contract-only native decision locks provider tool choice to the contract", () => {
+  const contractTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
+    .find((tool) => tool.function.name === "record_execution_contract");
+  const readTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
+    .find((tool) => tool.function.name === "read_file");
+  assert.deepEqual(
+    providerRequest.runtimeV2ExecutionEffectiveToolChoice({
+      requested: null,
+      tools: [contractTool],
+      textEnvelope: false,
+    }),
+    {
+      type: "function",
+      function: { name: "record_execution_contract" },
+    },
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionEffectiveToolChoice({
+      requested: null,
+      tools: [contractTool, readTool],
+      textEnvelope: false,
+    }),
+    null,
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionEffectiveToolChoice({
+      requested: null,
+      tools: [contractTool, readTool],
+      textEnvelope: false,
+      forceStructuredAction: true,
+    }),
+    "required",
+  );
+  assert.deepEqual(
+    providerRequest.runtimeV2ExecutionEffectiveToolChoice({
+      requested: null,
+      tools: [readTool],
+      textEnvelope: false,
+      forceStructuredAction: true,
+    }),
+    {
+      type: "function",
+      function: { name: "read_file" },
+    },
+  );
+});
+
+test("every provider decision states the exact current tool surface", () => {
+  const contractTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
+    .find((tool) => tool.function.name === "record_execution_contract");
+  const readTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
+    .find((tool) => tool.function.name === "read_file");
+  assert.match(
+    providerRequest.runtimeV2CurrentToolSurfaceInstruction(
+      [contractTool],
+      true,
+    ),
+    /exactly 1 tool: record_execution_contract.*requires exactly one structured action.*must be record_execution_contract/i,
+  );
+  assert.match(
+    providerRequest.runtimeV2CurrentToolSurfaceInstruction([
+      readTool,
+      contractTool,
+    ]),
+    /exactly 2 tools: read_file, record_execution_contract/i,
+  );
+  assert.match(
+    providerRequest.runtimeV2CurrentToolSurfaceInstruction([]),
+    /exposes no tools.*do not emit a tool name/i,
+  );
+});
+
+test("contract formation keeps committed evidence without executable old tool shapes", () => {
+  const projected = executionContractFormation
+    .runtimeV2ExecutionContractFormationConversation([{
+      role: "system",
+      content: "runtime rules",
+    }, {
+      role: "user",
+      content: "repair the complete incident",
+    }, {
+      role: "assistant",
+      content: "",
+      reasoning_content: "I should read another file",
+      tool_calls: [{
+        id: "old-read",
+        type: "function",
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/main.js" }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "old-read",
+      content: "READ_FILE_RESULT\npath: src/main.js\n---CONTENT START---\ncode\n---CONTENT END---",
+    }, {
+      role: "assistant",
+      content: "A long self-authored reconsideration.",
+    }]);
+
+  assert.deepEqual(projected.map((message) => message.role), ["system", "user"]);
+  assert.equal(projected.some((message) => message.tool_calls?.length), false);
+  assert.equal(projected.some((message) => message.tool_call_id), false);
+  assert.match(String(projected[1].content), /committed_observation_receipts_v1/);
+  assert.match(String(projected[1].content), /path: src\/main\.js/);
+  assert.doesNotMatch(
+    projected.map((message) => String(message.content)).join("\n"),
+    /long self-authored reconsideration/,
+  );
+});
+
+test("forced action evidence projection removes stale tool-call templates", () => {
+  const projected = executionContractFormation
+    .runtimeV2EvidenceOnlyDecisionConversation([{
+      role: "system",
+      content: "runtime rules",
+    }, {
+      role: "user",
+      content: "fix it",
+      runtimeTurnId: "turn-forced-action",
+    }, {
+      role: "assistant",
+      content: "I will read it.",
+      tool_calls: [{
+        id: "old-read",
+        type: "function",
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/main.js" }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "old-read",
+      content: [
+        "READ_FILE_RESULT",
+        "path: src/main.js",
+        "contentVersion: sha256-current",
+        "truncated: false",
+        "totalLines: 1",
+        "totalChars: 18",
+        "returnedLines: 1-1",
+        "returnedChars: 18",
+        "---CONTENT START---",
+        "const ready = true;",
+        "---CONTENT END---",
+      ].join("\n"),
+    }]);
+  assert.equal(
+    projected.some((message) => (message.tool_calls || []).length > 0),
+    false,
+  );
+  assert.equal(
+    projected.some((message) => message.role === "tool"),
+    false,
+  );
+  const text = projected.map((message) => String(message.content || ""))
+    .join("\n");
+  assert.match(text, /committed_source_snapshot_v1/);
+  assert.match(text, /const ready = true/);
+});
+
+test("contract formation emits one latest-version source snapshot without overlapping lines", () => {
+  const readResult = ({ path, version, start, end, total, content }) => [
+    "READ_FILE_RESULT",
+    `path: ${path}`,
+    `contentVersion: ${version}`,
+    `truncated: ${start !== 1 || end !== total}`,
+    `totalLines: ${total}`,
+    `totalChars: 999`,
+    `returnedLines: ${start}-${end}`,
+    `returnedChars: ${content.length}`,
+    "---CONTENT START---",
+    content,
+    "---CONTENT END---",
+  ].join("\n");
+  const readPair = (id, version, start, end, content) => [{
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id,
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({
+          path: "src/main.js",
+          start_line: start,
+          end_line: end,
+        }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: id,
+    content: readResult({
+      path: "src/main.js",
+      version,
+      start,
+      end,
+      total: 5,
+      content,
+    }),
+  }];
+  const projected = executionContractFormation
+    .runtimeV2ExecutionContractFormationConversation([{
+      role: "system",
+      content: "runtime rules",
+    }, {
+      role: "user",
+      runtimeTurnId: "turn-current",
+      content: "repair the complete incident",
+    }, ...readPair("old", "main-v1", 1, 2, "OLD_LINE_1\nOLD_LINE_2"),
+    ...readPair("new-prefix", "main-v2", 1, 3, "NEW_LINE_1\nNEW_LINE_2\nNEW_LINE_3"),
+    ...readPair("new-tail", "main-v2", 3, 5, "NEW_LINE_3\nNEW_LINE_4\nNEW_LINE_5"), {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "rejected-contract",
+        type: "function",
+        function: {
+          name: "record_execution_contract",
+          arguments: JSON.stringify({
+            summary: "KEEP_THIS_REJECTED_SUMMARY",
+            validations: [{ kind: "finite_command", command: "npm run build" }],
+          }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "rejected-contract",
+      content: "EXECUTION_CONTRACT_REJECTED: add behavioral_validation.",
+    }, {
+      role: "assistant",
+      content: "I will narrate the plan instead of submitting it.",
+    }]);
+
+  assert.deepEqual(projected.map((message) => message.role), ["system", "user"]);
+  const snapshot = String(projected[1].content);
+  assert.match(snapshot, /committed_source_snapshot_v1/);
+  assert.match(snapshot, /contentVersion: main-v2/);
+  assert.doesNotMatch(snapshot, /main-v1|OLD_LINE/);
+  for (const line of [1, 2, 3, 4, 5]) {
+    assert.equal(
+      snapshot.match(new RegExp(`NEW_LINE_${line}`, "g"))?.length || 0,
+      1,
+      `source line ${line} should appear exactly once`,
+    );
+  }
+  assert.doesNotMatch(snapshot, /READ_FILE_RESULT|narrate the plan/);
+  assert.match(snapshot, /previous_submission_json \(data only\)/);
+  assert.match(snapshot, /KEEP_THIS_REJECTED_SUMMARY/);
+  assert.match(snapshot, /add behavioral_validation/);
+});
+
+test("a failed validation preserves diagnostic guidance without creating a read sub-state machine", () => {
+  const base = {
+    events: [{
+      sequence: 1,
+      type: "tool.completed",
+      status: "succeeded",
+      evidence: [{
+        id: "E-mutation",
+        kind: "mutation",
+        target: "src/main.js",
+        version: null,
+      }],
+    }, {
+      sequence: 2,
+      type: "validation.completed",
+      passed: false,
+      failureKind: "assertion_failed",
+      evidence: [],
+      presentation: {
+        message: [
+          "FRESH_ACCEPTANCE_FAILED",
+          "file: /workspace/src/main.js:417:15 - duplicate declaration",
+          "src/components/editor.js:190:1 - programmatic input remains dirty",
+          "src/main.js:389 - duplicate open path remains",
+        ].join("\n"),
+      },
+    }],
+  };
+  assert.deepEqual(
+    validationCorrection.deriveRuntimeV2ValidationCorrectionWindow(base),
+    {
+      active: true,
+      failureSequence: 2,
+      repeatedFailedValidations: 0,
+      validationCommandUnavailable: false,
+      failedValidationCommand: null,
+      diagnosticSourceHints: [{
+        target: "/workspace/src/main.js",
+        line: 417,
+        startLine: 393,
+        endLine: 441,
+      }, {
+        target: "src/components/editor.js",
+        line: 190,
+        startLine: 166,
+        endLine: 214,
+      }, {
+        target: "src/main.js",
+        line: 389,
+        startLine: 365,
+        endLine: 413,
+      }],
+    },
+  );
+  const readCommand = {
+    idempotencyKey: "correction-read",
+    kind: "execute_tool",
+    payload: {
+      toolCallId: "correction-read-call",
+      toolName: "read_file",
+      arguments: { path: "src/main.js", start_line: 260, end_line: 420 },
+    },
+  };
+  const afterRead = {
+    events: [...base.events, {
+      sequence: 3,
+      type: "provider.responded",
+      result: {
+        toolCalls: [{
+          id: "correction-read-call",
+          name: "read_file",
+          arguments: readCommand.payload.arguments,
+        }],
+      },
+    }, {
+      sequence: 4,
+      type: "command.scheduled",
+      command: readCommand,
+    }, {
+      sequence: 5,
+      type: "tool.completed",
+      idempotencyKey: readCommand.idempotencyKey,
+      status: "succeeded",
+      evidence: [{
+        id: "E-correction-source",
+        kind: "source",
+        target: "src/main.js",
+        version: "main-v2",
+      }],
+    }],
+  };
+  const afterSource =
+    validationCorrection.deriveRuntimeV2ValidationCorrectionWindow(afterRead);
+  assert.equal(afterSource.active, true);
+  assert.deepEqual(
+    afterSource.diagnosticSourceHints,
+    validationCorrection.deriveRuntimeV2ValidationCorrectionWindow(base)
+      .diagnosticSourceHints,
+    "ordinary source reads neither consume nor manufacture validation authority",
+  );
+  const prompt = providerRequest.providerModeInstruction({
+    payload: { mode: "validate" },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    validationCorrectionActive: true,
+  });
+  assert.match(prompt, /VALIDATION_CORRECTION/);
+  assert.match(prompt, /ordinary focused source reads/i);
+  assert.match(prompt, /Validation remains withheld until a workspace mutation/i);
+  assert.doesNotMatch(prompt, /Validate the latest committed mutation now/i);
+
+  const closedTools = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      get: () => afterRead,
+      context: { runWorkspace: "/workspace" },
+    },
+    command: {
+      payload: { mode: "execute" },
+    },
+    available: [
+      "read_file",
+      "grep_search",
+      "replace_in_file",
+      "apply_patch",
+      "write_file",
+      "run_command",
+    ].map(definition),
+    actionWindow: "closed_recovery",
+  }).map((tool) => tool.function.name);
+  assert.deepEqual(
+    closedTools,
+    ["replace_in_file", "apply_patch", "write_file"],
+    "general no-effect recovery must close reads even while failed-validation guidance remains active",
+  );
+});
+
 test("every task kind advertised by the Runtime v2 child schema is executable", () => {
   const spawn = executionToolDefinitions.runtimeV2ToolDefinitions()
     .find((definition) =>
@@ -903,10 +3130,10 @@ test("every task kind advertised by the Runtime v2 child schema is executable", 
   assert.ok(spawn);
   const taskKinds =
     spawn.function.parameters.properties.task_kind.enum;
-  assert.deepEqual(taskKinds, ["explore", "review", "validate"]);
+  assert.deepEqual(taskKinds, ["explore", "review", "validate", "implement"]);
   assert.deepEqual(
     spawn.function.parameters.properties.access_mode.enum,
-    ["read"],
+    ["read", "write"],
   );
   assert.ok(
     spawn.function.parameters.required.includes("required_paths"),
@@ -940,12 +3167,256 @@ test("every task kind advertised by the Runtime v2 child schema is executable", 
             objective: `Perform ${taskKind}`,
             success_criteria: "Return evidence",
             required_paths: "src/main.js",
-            access_mode: "read",
+            access_mode: taskKind === "implement" ? "write" : "read",
+            ...(taskKind === "implement"
+              ? {
+                  implementation_operation: "modify",
+                  implementation_plan:
+                    "Update the already-inspected startup owner without changing unrelated behavior.",
+                }
+              : {}),
           },
         },
       });
     assert.equal(candidate.taskKind, taskKind);
+    assert.equal(
+      candidate.accessMode,
+      taskKind === "implement" ? "write" : "read",
+    );
   }
+});
+
+test("implementation child admission requires a complete parent-authored contract", () => {
+  const base = {
+    idempotencyKey: "schedule-implementation",
+    kind: "schedule_subagents",
+    phase: "acting",
+    run: {
+      sessionKey: "session",
+      sessionEpoch: "epoch",
+      turnId: "turn",
+      runId: "run",
+      parentRunId: null,
+      attemptId: "attempt",
+    },
+    payload: {
+      toolCallId: "provider-implementation",
+      arguments: {
+        task_key: "implementation",
+        task_kind: "implement",
+        objective: "Implement the proven toolbar repair.",
+        success_criteria: "The scoped source implements the assigned behavior.",
+        required_paths: "src/components/toolbar.js",
+        access_mode: "write",
+        implementation_operation: "modify",
+      },
+    },
+  };
+  assert.throws(
+    () => subagentCandidate.runtimeV2ModelSelectedSubagentCandidate(base),
+    /implementation_plan/,
+  );
+  const accepted =
+    subagentCandidate.runtimeV2ModelSelectedSubagentCandidate({
+      ...base,
+      payload: {
+        ...base.payload,
+        arguments: {
+          ...base.payload.arguments,
+          implementation_plan:
+            "Reuse the existing open-file boundary and remove the duplicate dispatch.",
+        },
+      },
+    });
+  assert.equal(accepted.taskKind, "implement");
+  assert.equal(accepted.accessMode, "write");
+  assert.equal(accepted.implementationOperation, "modify");
+});
+
+test("parallel implementation children require disjoint exclusive scopes", () => {
+  const parentRun = {
+    sessionKey: "session",
+    sessionEpoch: "epoch",
+    turnId: "turn",
+    runId: "run",
+    parentRunId: null,
+    attemptId: "attempt",
+  };
+  let id = 0;
+  const decision = runtime.scheduleReadOnlySubagents({
+    parentRun,
+    candidates: [
+      {
+        scopeKey: "editor-owner",
+        taskKind: "implement",
+        accessMode: "write",
+        implementationOperation: "modify",
+        implementationPlan: "Apply the proven editor-state repair.",
+        objective: "Repair editor ownership.",
+        successCriteria: "Editor state has one owner.",
+        allowedPaths: ["src/components/editor.js"],
+      },
+      {
+        scopeKey: "toolbar-owner",
+        taskKind: "implement",
+        accessMode: "write",
+        implementationOperation: "modify",
+        implementationPlan: "Apply the proven toolbar-boundary repair.",
+        objective: "Repair toolbar ownership.",
+        successCriteria: "Toolbar uses one dialog boundary.",
+        allowedPaths: ["src/components/toolbar.js"],
+      },
+      {
+        scopeKey: "overlapping-editor-owner",
+        taskKind: "implement",
+        accessMode: "write",
+        implementationOperation: "modify",
+        implementationPlan: "Apply another editor repair.",
+        objective: "Also repair editor ownership.",
+        successCriteria: "Editor state changes.",
+        allowedPaths: ["src/components"],
+      },
+    ],
+    maxActiveJobs: 3,
+    requestedAt: 1,
+    nextId: () => `child-${++id}`,
+  });
+  assert.deepEqual(
+    decision.jobs.map((job) => job.scopeKey),
+    ["editor-owner", "toolbar-owner"],
+  );
+  assert.deepEqual(decision.rejectedScopeKeys, ["overlapping-editor-owner"]);
+});
+
+test("implementation ownership names exact mutation files instead of writable directories", () => {
+  const job = {
+    taskKind: "implement",
+    accessMode: "write",
+    allowedPaths: ["src/components"],
+  };
+  assert.equal(
+    subagentWriteScope.runtimeV2JobOwnsMutationTargets({
+      job,
+      targets: ["src/components/editor.js"],
+    }),
+    false,
+  );
+  assert.equal(
+    subagentWriteScope.runtimeV2JobOwnsMutationTargets({
+      job: { ...job, allowedPaths: ["src/components/editor.js"] },
+      targets: ["src/components/editor.js"],
+    }),
+    true,
+  );
+});
+
+test("a completed implementation child must return scoped mutation evidence", () => {
+  const job = {
+    id: "child-editor",
+    taskKind: "implement",
+    accessMode: "write",
+    allowedPaths: ["src/components/editor.js"],
+  };
+  const report = {
+    schemaVersion: "runtime-v2-subagent-report.v1",
+    summary: "Committed child:child-editor:E1.",
+    findings: [{
+      statement: "Committed the assigned editor repair.",
+      evidenceIds: ["child:child-editor:E1"],
+    }],
+    unresolved: [],
+  };
+  const event = {
+    type: "subagent.completed",
+    status: "completed",
+    evidence: [{
+      id: "child:child-editor:E1",
+      kind: "mutation",
+      target: "src/components/editor.js",
+      version: "v2",
+    }],
+    report,
+  };
+  assert.equal(reducerGuards.isValidRuntimeV2SubagentCompletion({
+    state: { evidence: [] },
+    event,
+    job,
+  }), true);
+  assert.equal(reducerGuards.isValidRuntimeV2SubagentCompletion({
+    state: { evidence: [] },
+    event: { ...event, evidence: [] },
+    job,
+  }), false);
+  assert.equal(reducerGuards.isValidRuntimeV2SubagentCompletion({
+    state: { evidence: [] },
+    event: {
+      ...event,
+      evidence: [{
+        ...event.evidence[0],
+        target: "src/components/toolbar.js",
+      }],
+    },
+    job,
+  }), false);
+});
+
+test("active child write ownership blocks overlapping parent writes and final validation", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.childWriteScopes.set("child-editor", ["src/components/editor.js"]);
+  assert.equal(
+    subagentWriteScope.activeRuntimeV2ChildWriteConflict({
+      live,
+      targets: ["src/components/editor.js"],
+    })?.jobId,
+    "child-editor",
+  );
+  assert.equal(
+    subagentWriteScope.activeRuntimeV2ChildWriteConflict({
+      live,
+      targets: ["src/components/toolbar.js"],
+    }),
+    null,
+  );
+  assert.equal(
+    subagentWriteScope.activeRuntimeV2SubagentJobWriteConflict({
+      jobs: [{
+        id: "durable-child",
+        status: "running",
+        taskKind: "implement",
+        accessMode: "write",
+        allowedPaths: ["src/components/toolbar.js"],
+      }],
+      targets: ["src/components/toolbar.js"],
+    })?.jobId,
+    "durable-child",
+    "the write lock must survive process-local child state loss",
+  );
+  const rejected = authorization.validateToolAgainstPhaseAndPlan({
+    ports: {
+      get: () => ({}),
+      context: { turnId: "turn" },
+      live,
+    },
+    command: {
+      idempotencyKey: "validate-with-child",
+      kind: "execute_validation",
+      phase: "validating",
+      run: {
+        sessionKey: "session",
+        sessionEpoch: "epoch",
+        turnId: "turn",
+        runId: "run",
+        parentRunId: null,
+        attemptId: "attempt",
+      },
+      payload: {},
+    },
+    toolName: "run_command",
+    args: { command: "npm test" },
+    target: "npm test",
+  });
+  assert.equal(rejected.allowed, false);
+  assert.equal(rejected.reasonCode, "active_child_write_pending");
 });
 
 test("Runtime v2 mutation adapter leaves size policy to the shared safety gate", () => {
@@ -1016,6 +3487,903 @@ test("Observe, Act, and Validate share one safe inspect-edit-verify surface", ()
     "run_command",
     "browser_evaluate",
   ]);
+});
+
+test("recovery preserves the current executable surface until the bounded stop", () => {
+  const available = [
+    "read_file",
+    "grep_search",
+    "replace_in_file",
+    "apply_patch",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+    "spawn_subagent",
+    "wait_subagents",
+  ].map(definition);
+  const validationCommand = {
+    ...command("validating"),
+    payload: {
+      ...command("validating").payload,
+      mode: "validate",
+      collaborationAllowed: true,
+      remainingSubagentCapacity: 1,
+      activeSubagents: [{ id: "child-validation" }],
+    },
+  };
+  const ports = {
+    now: () => 1,
+    lifecycleDeadlineAt: 200_000,
+  };
+  const ordinary = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: validationCommand,
+    available,
+  }).map((tool) => tool.function.name);
+  assert.deepEqual(ordinary, [
+    "read_file",
+    "grep_search",
+    "replace_in_file",
+    "apply_patch",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+    "spawn_subagent",
+    "wait_subagents",
+  ]);
+
+  const closed = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: validationCommand,
+    available,
+    actionWindow: "closed_recovery",
+  }).map((tool) => tool.function.name);
+  assert.deepEqual(closed, [
+    "replace_in_file",
+    "apply_patch",
+    "write_file",
+  ]);
+
+  const recovery = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: {
+      ...validationCommand,
+      payload: {
+        ...validationCommand.payload,
+        recoveryPressure: {
+          reason: "provider_request_failed",
+          occurrence: 2,
+          stage: "reframe",
+        },
+      },
+    },
+    available,
+  });
+  assert.deepEqual(
+    recovery.map((tool) => tool.function.name),
+    ordinary,
+    "recovery pressure must not erase actions that can still make progress",
+  );
+
+  const validationHandoff = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: {
+      ...validationCommand,
+      payload: {
+        ...validationCommand.payload,
+        recoveryPressure: {
+          reason: "repeated_action_rejected",
+          occurrence: 2,
+          stage: "reframe",
+        },
+      },
+    },
+    available,
+    actionWindow: "validation_handoff",
+    correctiveValidationCommand: "npm run build",
+  });
+  assert.deepEqual(
+    validationHandoff.map((tool) => tool.function.name),
+    ["run_command"],
+    "a failed provider choice must retain the one executable validation action",
+  );
+});
+
+test("one non-actionable validation decision closes inspection", () => {
+  const base = {
+    command: {
+      payload: {
+        mode: "validate",
+        recoveryPressure: null,
+      },
+    },
+    effects: {},
+    sourceCoverage: [],
+  };
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor(base),
+    null,
+    "fresh validation may inspect the committed source before verifying",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      ...base,
+      command: {
+        payload: {
+          mode: "validate",
+          recoveryPressure: {
+            reason: "provider_request_failed",
+            occurrence: 1,
+          },
+        },
+      },
+    }),
+    "closed_recovery",
+    "a non-actionable decision must close inspection while retaining validation and source-backed implementation",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      ...base,
+      effects: {
+        repeatedObservationToolNames: new Set(["grep_search"]),
+      },
+    }),
+    "closed_recovery",
+    "equivalent inspection results cannot postpone validation",
+  );
+});
+
+test("a closed provider decision cannot escape its bounded mutation through reads or collaboration", () => {
+  const available = [
+    "read_file",
+    "grep_search",
+    "replace_in_file",
+    "apply_patch",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+    "spawn_subagent",
+    "wait_subagents",
+  ].map(definition);
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 1,
+      lifecycleDeadlineAt: 200_000,
+    },
+    command: {
+      ...command("acting"),
+      payload: {
+        ...command("acting").payload,
+        collaborationAllowed: true,
+        collaborationAction: "optional",
+        remainingSubagentCapacity: 1,
+        activeSubagents: [{ id: "child-review" }],
+      },
+    },
+    available,
+    actionWindow: "closed_recovery",
+  });
+
+  assert.deepEqual(
+    selected.map((tool) => tool.function.name),
+    [
+      "replace_in_file",
+      "apply_patch",
+      "write_file",
+    ],
+  );
+});
+
+test("a missing mutation source exposes only a target-locked read", () => {
+  const available = [
+    "read_file",
+    "grep_search",
+    "replace_in_file",
+    "run_command",
+    "browser_evaluate",
+    "spawn_subagent",
+  ].map(definition);
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 1,
+      lifecycleDeadlineAt: 200_000,
+    },
+    command: command("acting"),
+    available,
+    actionWindow: "corrective_source",
+    correctiveSourceTargets: ["src-tauri/src/main.rs"],
+  });
+
+  assert.deepEqual(
+    selected.map((tool) => tool.function.name),
+    ["read_file"],
+  );
+  assert.deepEqual(
+    selected[0].function.parameters.properties.path.enum,
+    ["src-tauri/src/main.rs"],
+  );
+  assert.match(
+    selected[0].function.description,
+    /single fresh source-recovery batch/i,
+  );
+
+  const validating = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 1,
+      lifecycleDeadlineAt: 200_000,
+    },
+    command: {
+      ...command("validating"),
+      payload: {
+        ...command("validating").payload,
+        mode: "validate",
+      },
+    },
+    available,
+    actionWindow: "corrective_source",
+    correctiveSourceTargets: ["src-tauri/src/main.rs"],
+  });
+  assert.deepEqual(
+    validating.map((tool) => tool.function.name),
+    ["read_file"],
+    "a corrective source lease outranks the validate-phase tool surface",
+  );
+  assert.deepEqual(
+    validating[0].function.parameters.properties.path.enum,
+    ["src-tauri/src/main.rs"],
+  );
+});
+
+test("a corrective mutation lease outranks validation tools", () => {
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 1,
+      lifecycleDeadlineAt: 200_000,
+    },
+    command: {
+      ...command("validating"),
+      payload: {
+        ...command("validating").payload,
+        mode: "validate",
+      },
+    },
+    available: [
+      "read_file",
+      "replace_in_file",
+      "apply_patch",
+      "run_command",
+      "browser_evaluate",
+    ].map(definition),
+    actionWindow: "corrective_mutation",
+  });
+  assert.deepEqual(
+    selected.map((tool) => tool.function.name),
+    ["replace_in_file", "apply_patch"],
+  );
+});
+
+test("corrective source recovery rejects an unrelated unread file before execution", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.latestProviderActionWindow = "corrective_source";
+  const logs = [];
+  let id = 0;
+  const input = {
+    ports: {
+      live,
+      nextId: () => `corrective-source-${++id}`,
+      logStoreEvent: (event, data) => logs.push({ event, data }),
+    },
+    command: command("acting"),
+    effects: {
+      correctiveMutationFailureToolCallIds: new Set([
+        "older-rust-edit",
+        "failed-main-edit",
+      ]),
+      correctiveReplayTargetsByToolCallId: new Map([
+        ["older-rust-edit", ["src-tauri/src/main.rs"]],
+        ["failed-main-edit", ["src/main.js"]],
+      ]),
+    },
+    result: {
+      visibleText: "I will inspect another file.",
+      toolCalls: [{
+        id: "provider-unrelated-read",
+        name: "read_file",
+        arguments: { path: "src/styles/toolbar.css" },
+      }],
+      diagnostics: [],
+    },
+  };
+  const rejected = providerSurfaceRejection
+    .rejectRuntimeV2InvalidCorrectiveSourceRead(input);
+  assert.deepEqual(rejected.toolCalls, []);
+  assert.match(live.messages.at(-1).content, /CORRECTIVE_SOURCE_REJECTED/);
+  assert.match(live.messages.at(-1).content, /src\/main\.js/);
+  assert.doesNotMatch(
+    live.messages.at(-1).content,
+    /Allowed exact targets?: .*src-tauri/,
+    "an older failed editor cannot keep owning the recovery surface",
+  );
+  assert.ok(logs.some((entry) =>
+    entry.event === "runtime_v2_provider_action_rejected" &&
+    entry.data.reason === "corrective_source_target_mismatch"
+  ));
+
+  assert.equal(
+    providerSurfaceRejection.rejectRuntimeV2InvalidCorrectiveSourceRead({
+      ...input,
+      result: {
+        ...input.result,
+        toolCalls: [{
+          id: "provider-exact-read",
+          name: "read_file",
+          arguments: { path: "src/main.js" },
+        }],
+      },
+    }),
+    null,
+  );
+});
+
+test("an unavailable native tool becomes one causal rejected action instead of a transport retry", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const logs = [];
+  let id = 0;
+  const ports = {
+    live,
+    nextId: () => `rejected-${++id}`,
+    logStoreEvent: (event, data) => logs.push({ event, data }),
+  };
+  const input = {
+    ports,
+    command: command("acting"),
+    tools: [definition("apply_patch")],
+    result: {
+      visibleText: "Let me read it again.",
+      toolCalls: [{
+        id: "provider-read-1",
+        name: "read_file",
+        arguments: { path: "src-tauri/src/main.rs" },
+      }],
+      diagnostics: [],
+    },
+  };
+  const first = providerSurfaceRejection
+    .rejectRuntimeV2UnexpectedProviderTool(input);
+  assert.deepEqual(first.toolCalls, []);
+  assert.equal(first.visibleText, "");
+  assert.equal(first.diagnostics[0].code, "repeated_action_rejected");
+  assert.equal(live.messages.filter((message) => message.role === "tool").length, 1);
+  assert.match(live.messages.at(-1).content, /TOOL_SURFACE_REJECTED/);
+
+  providerSurfaceRejection.rejectRuntimeV2UnexpectedProviderTool({
+    ...input,
+    result: {
+      ...input.result,
+      toolCalls: [{
+        ...input.result.toolCalls[0],
+        id: "provider-read-2",
+      }],
+    },
+  });
+  assert.equal(
+    live.messages.filter((message) => message.role === "tool").length,
+    1,
+    "the same unavailable action replaces its rejection pair instead of growing a replay loop",
+  );
+  assert.ok(logs.some((entry) =>
+    entry.event === "runtime_v2_provider_action_rejected" &&
+    entry.data.reason === "tool_surface_rejected"
+  ));
+
+  providerSurfaceRejection.rejectRuntimeV2UnexpectedProviderTool({
+    ...input,
+    result: {
+      ...input.result,
+      toolCalls: [{
+        ...input.result.toolCalls[0],
+        id: "provider-read-3",
+        arguments: {
+          path: "src-tauri/src/main.rs",
+          start_line: "280",
+        },
+      }],
+    },
+  });
+  assert.equal(
+    live.messages.filter((message) => message.role === "tool").length,
+    1,
+    "paging a hidden read tool remains one semantic surface violation",
+  );
+  assert.equal(
+    providerSurfaceRejection.runtimeV2UnavailableToolSemanticIdentity({
+      name: "read_file",
+      arguments: { path: "src-tauri/src/main.rs", start_line: 280 },
+    }),
+    providerSurfaceRejection.runtimeV2UnavailableToolSemanticIdentity({
+      name: "read_file",
+      arguments: { path: "src-tauri/src/main.rs", start_line: 340 },
+    }),
+  );
+});
+
+test("validation mode rejects source-search shell commands before they can bypass validation evidence", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const logs = [];
+  let id = 0;
+  const ports = {
+    live,
+    nextId: () => `validation-rejected-${++id}`,
+    logStoreEvent: (event, data) => logs.push({ event, data }),
+  };
+  const validationCommand = {
+    ...command("validating"),
+    payload: {
+      ...command("validating").payload,
+      mode: "validate",
+    },
+  };
+  const input = {
+    ports,
+    command: validationCommand,
+    tools: [definition("run_command"), definition("browser_evaluate")],
+    result: {
+      visibleText: "I will inspect the handler.",
+      toolCalls: [{
+        id: "provider-grep",
+        name: "run_command",
+        arguments: { command: "grep -n handleOpenFile src/main.js" },
+      }],
+      diagnostics: [],
+    },
+  };
+  const rejected = providerSurfaceRejection
+    .rejectRuntimeV2InvalidValidationCommand(input);
+  assert.deepEqual(rejected.toolCalls, []);
+  assert.equal(rejected.visibleText, "");
+  assert.match(live.messages.at(-1).content, /VALIDATION_COMMAND_REJECTED/);
+  assert.match(live.messages.at(-1).content, /npm run build/);
+  assert.ok(logs.some((entry) =>
+    entry.event === "runtime_v2_provider_action_rejected" &&
+    entry.data.reason === "validation_command_not_finite"
+  ));
+
+  assert.equal(
+    providerSurfaceRejection.rejectRuntimeV2InvalidValidationCommand({
+      ...input,
+      result: {
+        ...input.result,
+        toolCalls: [{
+          id: "provider-test",
+          name: "run_command",
+          arguments: { command: "npm test" },
+        }],
+      },
+    }),
+    null,
+    "a real finite validation remains executable",
+  );
+});
+
+test("a rejected validation wrapper locks the next native command to its finite validator", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const logs = [];
+  let id = 0;
+  const ports = {
+    live,
+    now: () => 1,
+    lifecycleDeadlineAt: 200_000,
+    nextId: () => `validation-wrapper-${++id}`,
+    logStoreEvent: (event, data) => logs.push({ event, data }),
+  };
+  const validationCommand = {
+    ...command("validating"),
+    payload: {
+      ...command("validating").payload,
+      mode: "validate",
+    },
+  };
+  const rejected = providerSurfaceRejection
+    .rejectRuntimeV2InvalidValidationCommand({
+      ports,
+      command: validationCommand,
+      tools: [definition("run_command"), definition("browser_evaluate")],
+      result: {
+        visibleText: "",
+        toolCalls: [{
+          id: "provider-wrapped-build",
+          name: "run_command",
+          arguments: {
+            command:
+              "cd /workspace && npm run build 2>&1; echo EXIT_CODE=$?",
+          },
+        }],
+        diagnostics: [],
+      },
+    });
+
+  assert.deepEqual(rejected.toolCalls, []);
+  assert.equal(live.correctiveValidationCommand, "npm run build");
+  assert.match(live.messages.at(-1).content, /exactly "npm run build"/);
+  assert.ok(logs.some((entry) =>
+    entry.event === "runtime_v2_provider_action_rejected" &&
+    entry.data.correctiveCommand === "npm run build"
+  ));
+
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports,
+    command: validationCommand,
+    available: [
+      definition("run_command"),
+      definition("browser_evaluate"),
+      definition("read_file"),
+    ],
+    actionWindow: "closed_recovery",
+    correctiveValidationCommand: live.correctiveValidationCommand,
+  });
+  const runCommand = selected.find((tool) =>
+    tool.function.name === "run_command"
+  );
+  assert.deepEqual(
+    runCommand.function.parameters.properties.command.enum,
+    ["npm run build"],
+  );
+  assert.match(runCommand.function.description, /no redirection/i);
+});
+
+test("corrective action pressure reuses materialized target source without a freshness ritual", () => {
+  const commandWithPressure = {
+    payload: {
+      mode: "execute",
+      effectPressure: {
+        reason: "source_only_frontier",
+      },
+      recoveryPressure: null,
+    },
+  };
+  const effects = {
+    correctiveMutationFailureToolCallIds: new Set(["failed-edit"]),
+    correctiveReplayTargetsByToolCallId: new Map([
+      ["failed-edit", ["src/components/toolbar.js"]],
+    ]),
+  };
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: [],
+    }),
+    "corrective_source",
+    "a missing exact target opens only the target-locked source recovery window",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: [{
+        target: "src/components/toolbar.js",
+        version: "sha-toolbar",
+        totalLines: 213,
+        windows: [{ startLine: 1, endLine: 213, content: "source" }],
+        complete: true,
+      }],
+    }),
+    "corrective_mutation",
+    "a rejected mutation changed no files, so already-materialized current source remains valid authority",
+  );
+});
+
+test("a failed optional editor hands a completed contract to validation instead of trapping correction", () => {
+  const commandWithPressure = {
+    payload: {
+      mode: "validate",
+      recoveryPressure: null,
+    },
+  };
+  const effects = {
+    correctiveMutationFailureToolCallIds: new Set(["failed-extra-edit"]),
+    correctiveReplayTargetsByToolCallId: new Map([
+      ["failed-extra-edit", ["src/main.js"]],
+    ]),
+  };
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: [],
+      completedContractAwaitingValidation: true,
+    }),
+    "validation_handoff",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: [],
+      completedContractAwaitingValidation: false,
+    }),
+    "corrective_source",
+    "a failed required edit or post-validation correction still gets exact source recovery",
+  );
+
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 1,
+      lifecycleDeadlineAt: undefined,
+      get: () => null,
+      context: { runWorkspace: "/workspace" },
+    },
+    command: commandWithPressure,
+    available: [
+      "read_file",
+      "replace_in_file",
+      "run_command",
+      "browser_evaluate",
+    ].map(definition),
+    actionWindow: "validation_handoff",
+    correctiveValidationCommand: "npm run build",
+  });
+  assert.deepEqual(
+    selected.map((tool) => tool.function.name),
+    ["run_command"],
+  );
+  assert.deepEqual(
+    selected[0].function.parameters.properties.command.enum,
+    ["npm run build"],
+  );
+});
+
+test("a newer failed validation supersedes only older rejected-editor recovery", () => {
+  const effects = {
+    correctiveMutationFailureToolCallIds: new Set(["failed-edit"]),
+    correctiveReplayTargetsByToolCallId: new Map([
+      ["failed-edit", ["src/main.js"]],
+    ]),
+    correctiveMutationRequirementsByToolCallId: new Map([
+      ["failed-edit", {
+        sequence: 20,
+        toolName: "replace_in_file",
+        arguments: { path: "src/main.js" },
+        target: "src/main.js",
+        reasonCode: "mutation_target_lease_mismatch",
+      }],
+    ]),
+  };
+  const base = {
+    command: {
+      payload: { mode: "validate", recoveryPressure: null },
+    },
+    effects,
+    sourceCoverage: [],
+  };
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      ...base,
+      newerValidationFailureSequence: 30,
+    }),
+    null,
+    "the failed validation owns its full exact diagnostic batch even when an older editor was rejected",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      ...base,
+      newerValidationFailureSequence: 10,
+    }),
+    "corrective_source",
+    "an editor rejected after the validation still owns target-locked recovery",
+  );
+});
+
+test("corrective source recovery closes on fresh target source while the new editor keeps exact lease checks", () => {
+  const commandWithPressure = {
+    payload: {
+      mode: "execute",
+      effectPressure: { reason: "source_only_frontier" },
+      recoveryPressure: null,
+    },
+  };
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/main.js",
+    "@@",
+    "-function switchToTab(index) {",
+    "-  activeTab = index;",
+    "+function switchToTab(index) {",
+    "+  activeTab = Number(index);",
+    "*** End Patch",
+  ].join("\n");
+  const effects = {
+    correctiveMutationFailureToolCallIds: new Set(["failed-range-edit"]),
+    correctiveReplayTargetsByToolCallId: new Map([
+      ["failed-range-edit", ["src/main.js"]],
+    ]),
+    correctiveMutationRequirementsByToolCallId: new Map([
+      ["failed-range-edit", {
+        toolName: "apply_patch",
+        arguments: { patch },
+        target: "",
+        reasonCode: "mutation_target_lease_mismatch",
+      }],
+    ]),
+  };
+  const prefixOnly = [{
+    target: "src/main.js",
+    version: "sha-main",
+    totalLines: 1200,
+    windows: [{
+      startLine: 1,
+      endLine: 100,
+      content: "const prefixOnly = true;\n",
+    }],
+    complete: false,
+  }];
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: prefixOnly,
+      workspace: "/workspace",
+    }),
+    "corrective_mutation",
+    "fresh target source closes recovery reading without reconstructing the rejected patch",
+  );
+  const coveredHunk = [{
+    target: "src/main.js",
+    version: "sha-main",
+    totalLines: 1200,
+    windows: [{
+      startLine: 300,
+      endLine: 303,
+      content: [
+        "function switchToTab(index) {",
+        "  activeTab = index;",
+        "}",
+      ].join("\n"),
+    }],
+    complete: false,
+  }];
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: commandWithPressure,
+      effects,
+      sourceCoverage: coveredHunk,
+      workspace: "/workspace",
+    }),
+    "corrective_mutation",
+    "a focused hunk also closes the target-level recovery window",
+  );
+  assert.equal(
+    correctiveMutationPolicy.runtimeV2MaterializedSourceCoversMutation({
+      toolName: "apply_patch",
+      args: { patch },
+      sourceCoverage: prefixOnly,
+      workspace: "/workspace",
+    }),
+    false,
+    "the independently authorized new editor still cannot reuse an unseen rejected hunk",
+  );
+});
+
+test("three uncommitted corrective mutation failures close the recovery cycle", () => {
+  assert.equal(
+    providerActionWindow.runtimeV2CorrectiveMutationFailureLimitReached({
+      correctiveMutationFailureToolCallIds: new Set(["one", "two"]),
+    }),
+    false,
+  );
+  assert.equal(
+    providerActionWindow.runtimeV2CorrectiveMutationFailureLimitReached({
+      correctiveMutationFailureToolCallIds: new Set([
+        "one",
+        "two",
+        "three",
+      ]),
+    }),
+    true,
+  );
+});
+
+test("the first proven repeated action enters recovery mutation decoding", () => {
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: {
+        payload: {
+          effectPressure: { reason: "source_only_frontier" },
+          recoveryPressure: {
+            reason: "repeated_action_rejected",
+            occurrence: 1,
+          },
+        },
+      },
+      effects: {},
+      sourceCoverage: [{
+        target: "src/main.js",
+        version: "sha-main",
+        totalLines: 12,
+        windows: [{ startLine: 1, endLine: 12, content: "source" }],
+        complete: true,
+      }],
+    }),
+    "closed_recovery",
+  );
+});
+
+test("a repeated semantic observation enters recovery mutation decoding immediately", () => {
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: {
+        payload: {
+          effectPressure: { reason: "source_only_frontier" },
+          recoveryPressure: null,
+        },
+      },
+      effects: {
+        repeatedObservationToolNames: new Set(["grep_search"]),
+      },
+      sourceCoverage: [{
+        target: "src/main.js",
+        version: "sha-main",
+        totalLines: 12,
+        windows: [{ startLine: 1, endLine: 12, content: "source" }],
+        complete: true,
+      }],
+    }),
+    "closed_recovery",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: {
+        payload: {
+          effectPressure: { reason: "source_only_frontier" },
+          recoveryPressure: null,
+        },
+      },
+      effects: {
+        repeatedObservationToolNames: new Set(["grep_search"]),
+      },
+      sourceCoverage: [],
+    }),
+    null,
+    "the guard must not revoke inspection before exact editable source is visible",
+  );
+});
+
+test("the first cache re-materialization restores source then closes inspection", () => {
+  const input = {
+    command: {
+      payload: {
+        effectPressure: { reason: "source_only_frontier" },
+        recoveryPressure: null,
+      },
+    },
+    effects: {
+      repeatedObservationToolNames: new Set(),
+      replayedSourceReceiptCountSinceMutation: 1,
+    },
+    sourceCoverage: [{
+      target: "src/main.js",
+      version: "sha-main",
+      totalLines: 12,
+      windows: [{ startLine: 1, endLine: 12, content: "source" }],
+      complete: true,
+    }],
+  };
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor(input),
+    "closed_recovery",
+    "the replay has already restored exact source, so the next decision must act instead of reading again",
+  );
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      ...input,
+      effects: {
+        ...input.effects,
+        replayedSourceReceiptCountSinceMutation: 0,
+      },
+    }),
+    null,
+    "inspection remains open until a legitimate cache restore actually happens",
+  );
 });
 
 test("global attachment analysis exposes only bounded attachment readers", () => {
@@ -1425,6 +4793,190 @@ test("provider tool arguments normalize schema-equivalent scalar types before id
   );
 });
 
+test("provider tool arguments decode JSON-encoded containers only when the schema requires them", () => {
+  const contract = definition("record_execution_contract");
+  contract.function.parameters.properties = {
+    behavioral_validation: {
+      anyOf: [{
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          kind: { type: "string", enum: ["browser"] },
+          target: { type: "string" },
+        },
+        required: ["kind", "target"],
+      }],
+    },
+  };
+  contract.function.parameters.required = ["behavioral_validation"];
+
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "encoded-behavioral-validation",
+    name: "record_execution_contract",
+    arguments: {
+      behavioral_validation:
+        '{"kind":"browser","target":"opening a file does not open Save As"}',
+    },
+  }], [contract]);
+
+  assert.deepEqual(normalized.arguments.behavioral_validation, {
+    kind: "browser",
+    target: "opening a file does not open Save As",
+  });
+  assert.equal(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [normalized],
+      [contract],
+    ),
+    null,
+  );
+
+  const [malformed] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "malformed-behavioral-validation",
+    name: "record_execution_contract",
+    arguments: { behavioral_validation: '{"kind":"browser"' },
+  }], [contract]);
+  assert.equal(
+    malformed.arguments.behavioral_validation,
+    '{"kind":"browser"',
+  );
+  assert.match(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [malformed],
+      [contract],
+    ).reason,
+    /advertised shape/,
+  );
+
+  const textTool = definition("text_tool");
+  textTool.function.parameters.properties = {
+    payload: {
+      anyOf: [
+        { type: "string" },
+        { type: "object", additionalProperties: true },
+      ],
+    },
+  };
+  const [ambiguous] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "genuine-json-text",
+    name: "text_tool",
+    arguments: { payload: '{"keep":"as text"}' },
+  }], [textTool]);
+  assert.equal(ambiguous.arguments.payload, '{"keep":"as text"}');
+
+  const nested = definition("nested_contract");
+  nested.function.parameters.properties = {
+    changes: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          expected_outcome: { type: "string" },
+        },
+        required: ["expected_outcome"],
+      },
+    },
+  };
+  nested.function.parameters.required = ["changes"];
+  const [camelCaseTransport] =
+    providerTools.normalizeRuntimeV2ProviderToolCalls([{
+      id: "camel-case-nested-field",
+      name: "nested_contract",
+      arguments: {
+        changes: [{ expectedOutcome: "observable result" }],
+      },
+    }], [nested]);
+  assert.deepEqual(camelCaseTransport.arguments, {
+    changes: [{ expected_outcome: "observable result" }],
+  });
+  assert.equal(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [camelCaseTransport],
+      [nested],
+    ),
+    null,
+  );
+});
+
+test("native provider arguments cannot bypass a dynamically enum-locked tool surface", () => {
+  const read = definition("read_file");
+  read.function.parameters.properties = {
+    path: {
+      type: "string",
+      enum: ["src/components/editor.js"],
+    },
+    start_line: { type: "number" },
+    end_line: { type: "number" },
+  };
+  read.function.parameters.required = ["path"];
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "wrong-review-target",
+    name: "read_file",
+    arguments: { path: "src/main.js" },
+  }], [read]);
+  const violation = providerTools.runtimeV2ProviderToolArgumentViolation(
+    [normalized],
+    [read],
+  );
+  assert.equal(violation.call.id, "wrong-review-target");
+  assert.match(violation.reason, /src\/components\/editor\.js/);
+
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  let id = 0;
+  const rejected = providerSurfaceRejection
+    .rejectRuntimeV2InvalidProviderToolArguments({
+      ports: {
+        live,
+        nextId: () => `argument-rejection-${++id}`,
+        logStoreEvent: () => {},
+      },
+      command: command("validating"),
+      tools: [read],
+      result: {
+        visibleText: "I will inspect another target.",
+        toolCalls: [normalized],
+        diagnostics: [],
+      },
+    });
+  assert.deepEqual(rejected.toolCalls, []);
+  assert.equal(rejected.visibleText, "");
+  assert.match(live.messages.at(-1).content, /TOOL_ARGUMENTS_REJECTED/);
+});
+
+test("provider tool identity drops arguments absent from the advertised schema", () => {
+  const read = definition("read_file");
+  read.function.parameters.properties = {
+    path: { type: "string" },
+    start_line: { type: "number", runtimeIdentityDefault: 1 },
+  };
+  const [withTransportNoise, canonical] =
+    providerTools.normalizeRuntimeV2ProviderToolCalls([{
+      id: "read-with-noise",
+      name: "read_file",
+      arguments: {
+        path: "src/components/toolbar.js",
+        start_line: "1",
+        reason: "I am rereading the same source",
+        __provider_nonce: "different on every request",
+      },
+    }, {
+      id: "read-canonical",
+      name: "read_file",
+      arguments: { path: "src/components/toolbar.js" },
+    }], [read]);
+
+  assert.deepEqual(withTransportNoise.arguments, {
+    path: "src/components/toolbar.js",
+  });
+  assert.equal(
+    providerToolSurface.runtimeV2ProviderToolCallIdentity(
+      withTransportNoise,
+    ),
+    providerToolSurface.runtimeV2ProviderToolCallIdentity(canonical),
+  );
+});
+
 test("provider action identity omits schema-declared optional defaults", () => {
   const read = definition("read_file");
   read.function.parameters.properties = {
@@ -1455,6 +5007,16 @@ test("provider action identity omits schema-declared optional defaults", () => {
 
 test("provider mutation aliases are canonical before action identity", () => {
   const replace = definition("replace_in_file");
+  replace.function.parameters.properties = {
+    path: { type: "string" },
+    search_text: { type: "string" },
+    replace_text: { type: "string" },
+  };
+  replace.function.parameters.required = [
+    "path",
+    "search_text",
+    "replace_text",
+  ];
   const [normalized] =
     providerTools.normalizeRuntimeV2ProviderToolCalls([{
       id: "replace-main",
@@ -1648,6 +5210,56 @@ test("direct Execute mutation authority includes every source in its current rea
     "src/components/toolbar.js",
     "src/components/statusbar.js",
   ]);
+});
+
+test("a recovery action window cannot be escaped by creating an unrelated file", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.mutationSourceCoverageByToolCallId.set("recovery-write", [{
+    target: "src/main.js",
+    version: "main-v1",
+    totalLines: 20,
+    complete: true,
+    windows: [{
+      startLine: 1,
+      endLine: 20,
+      content: "export function saveFile() {}",
+    }],
+  }]);
+  const ports = {
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { runWorkspace: "/tmp/runtime-v2-recovery-creation" },
+    live,
+  };
+  const proposal = {
+    ports,
+    toolCallId: "recovery-write",
+    toolName: "write_file",
+    args: {
+      path: "src/code-review-report.js",
+      content: "export const report = true;",
+    },
+    target: "src/code-review-report.js",
+  };
+
+  assert.equal(
+    correctiveMutationPolicy.validateRuntimeV2MutationLease(proposal)
+      ?.allowed,
+    true,
+    "ordinary execution still permits a genuinely requested new file",
+  );
+  live.latestProviderActionWindow = "closed_recovery";
+  const closed =
+    correctiveMutationPolicy.validateRuntimeV2MutationLease(proposal);
+  assert.equal(closed?.allowed, false);
+  assert.deepEqual(
+    closed?.unexpectedTargets,
+    ["src/code-review-report.js"],
+  );
+  assert.equal(
+    closed?.reasonCode,
+    "mutation_target_lease_mismatch",
+    "the bounded recovery decision must mutate visible source instead of manufacturing a progress boundary",
+  );
 });
 
 test("a new source batch evicts unrelated archived source from the decision view", () => {
@@ -2048,6 +5660,575 @@ test("replace_in_file accepts an exact block from any visible source window", ()
   );
 });
 
+test("replace_in_file mismatch returns exact nearby source instead of trapping recovery in a reread", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const currentSource = [
+    "// 设置当前文件",
+    "export function setCurrentFile(file) {",
+    "  toolbarState.currentFile = file;",
+    "  updateToolbar();",
+    "}",
+    "",
+    "// 更新主题",
+    "export function updateTheme(theme) {",
+    "  toolbarState.theme = theme;",
+    "  updateToolbar();",
+    "}entFile(filePath) {",
+    "  toolbarState.currentFile = filePath;",
+    "  const filePathEl = document.getElementById('file-path');",
+    "}",
+    "",
+    "// 渲染工具栏",
+    "export function renderToolbar() {}",
+  ].join("\n");
+  live.mutationSourceCoverageByToolCallId.set("repair-toolbar", [{
+    target: "src/components/toolbar.js",
+    version: "sha-toolbar-broken",
+    totalLines: 108,
+    complete: false,
+    windows: [{
+      startLine: 92,
+      endLine: 108,
+      content: currentSource,
+    }],
+  }]);
+  const ports = {
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { runWorkspace: "/tmp/runtime-v2-mismatch-recovery" },
+    live,
+  };
+  const result = correctiveMutationPolicy.validateRuntimeV2MutationLease({
+    ports,
+    toolCallId: "repair-toolbar",
+    toolName: "replace_in_file",
+    args: {
+      path: "src/components/toolbar.js",
+      search_text: [
+        "// 设置当前文件",
+        "export function setCurrentFile(file) {",
+        "  toolbarState.currentFile = file;",
+        "  updateToolbar();",
+        "}",
+        "",
+        "// 渲染工具栏",
+        "export function renderToolbar() {}",
+      ].join("\n"),
+      replace_text: "provider-authored replacement must not be echoed",
+    },
+    target: "src/components/toolbar.js",
+  });
+
+  assert.equal(result?.allowed, false);
+  assert.equal(result?.reasonCode, "mutation_source_text_mismatch");
+  assert.equal(result?.recoveryExcerpt?.target, "src/components/toolbar.js");
+  assert.equal(result?.recoveryExcerpt?.version, "sha-toolbar-broken");
+  assert.match(result?.recoveryExcerpt?.content || "", /\}entFile\(filePath\)/);
+  assert.ok((result?.recoveryExcerpt?.startLine || 0) <= 102);
+  assert.ok((result?.recoveryExcerpt?.endLine || 0) >= 102);
+
+  const feedback = authorization.runtimeV2MutationLeaseRejectionReason({
+    toolName: "replace_in_file",
+    unexpectedTargets: result?.unexpectedTargets || [],
+    leaseTargets: result?.leases.map((lease) => lease.target) || [],
+    recoveryExcerpt: result?.recoveryExcerpt || null,
+  });
+  assert.match(feedback, /CURRENT_VERSIONED_SOURCE/);
+  assert.match(feedback, /\}entFile\(filePath\)/);
+  assert.match(feedback, /smallest|最小/iu);
+  assert.doesNotMatch(feedback, /provider-authored replacement/);
+});
+
+test("replace_in_file mismatch prefers the longer later source anchor over an ambiguous duplicate prefix", () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const currentSource = [
+    "// 更新主题",
+    "export function updateTheme(theme) {",
+    "  toolbarState.theme = theme;",
+    "  updateToolbar();",
+    "}entFile(filePath) {",
+    "  toolbarState.currentFile = filePath;",
+    "  const filePathEl = document.getElementById('file-path');",
+    "  if (filePathEl) {",
+    "    filePathEl.textContent = filePath ? filePath.split('/').pop() : '';",
+    "    filePathEl.style.display = filePath ? 'inline-block' : 'none';",
+    "  }",
+    "}",
+    "",
+    "// unrelated rendering body",
+    "export function renderToolbar() {}",
+    "",
+    "// 更新主题",
+    "export function updateTheme(theme) {",
+    "  toolbarState.theme = theme;",
+    "  updateThemeButton();",
+    "}",
+  ].join("\n");
+  live.mutationSourceCoverageByToolCallId.set("ambiguous-toolbar", [{
+    target: "src/components/toolbar.js",
+    version: "sha-toolbar-ambiguous",
+    totalLines: 220,
+    complete: false,
+    windows: [{
+      startLine: 110,
+      endLine: 130,
+      content: currentSource,
+    }],
+  }]);
+  const ports = {
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { runWorkspace: "/tmp/runtime-v2-ambiguous-mismatch" },
+    live,
+  };
+  const result = correctiveMutationPolicy.validateRuntimeV2MutationLease({
+    ports,
+    toolCallId: "ambiguous-toolbar",
+    toolName: "replace_in_file",
+    args: {
+      path: "src/components/toolbar.js",
+      search_text: [
+        "// 更新主题",
+        "export function updateTheme(theme) {",
+        "  toolbarState.theme = theme;",
+        "  updateThemeButton();",
+        "}entFile(filePath) {",
+        "  toolbarState.currentFile = filePath;",
+        "  const filePathEl = document.getElementById('file-path');",
+        "  if (filePathEl) {",
+        "    filePathEl.textContent = filePath ? filePath.split('/').pop() : '';",
+        "    filePathEl.style.display = filePath ? 'inline-block' : 'none';",
+        "  }",
+        "}",
+      ].join("\n"),
+      replace_text: "fixed source",
+    },
+    target: "src/components/toolbar.js",
+  });
+
+  assert.equal(result?.reasonCode, "mutation_source_text_mismatch");
+  assert.match(result?.recoveryExcerpt?.content || "", /\}entFile\(filePath\)/);
+  assert.ok(
+    (result?.recoveryExcerpt?.startLine || Number.POSITIVE_INFINITY) <= 114,
+    "the receipt must center the damaged later anchor, not the valid duplicate at EOF",
+  );
+  assert.ok((result?.recoveryExcerpt?.endLine || 0) >= 114);
+});
+
+test("a correctable failed mutation reopens one exact cached read for recovery", () => {
+  const sourceResult = [
+    "READ_FILE_RESULT",
+    "path: src/components/toolbar.js",
+    "contentVersion: sha-toolbar-broken",
+    "truncated: false",
+    "totalLines: 2",
+    "totalChars: 36",
+    "returnedLines: 1-2",
+    "returnedChars: 36",
+    "---CONTENT START---",
+    "export function renderToolbar() {",
+    "}entFile(filePath) {}",
+    "---CONTENT END---",
+  ].join("\n");
+  const readCall = (id) => ({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id,
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({ path: "src/components/toolbar.js" }),
+      },
+    }],
+  });
+  const readResult = (id) => ({
+    role: "tool",
+    tool_call_id: id,
+    content: sourceResult,
+  });
+  const messages = [
+    readCall("read-original"),
+    readResult("read-original"),
+    readCall("read-replay-before-mismatch"),
+    readResult("read-replay-before-mismatch"),
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "mutation-mismatch",
+        type: "function",
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({
+            path: "src/components/toolbar.js",
+            search_text: "imagined source",
+            replace_text: "fixed source",
+          }),
+        },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: "mutation-mismatch",
+      content: "TOOL_BLOCKED: REPLACE_SEARCH_TEXT_NOT_VISIBLE",
+    },
+  ];
+  const candidate = {
+    id: "candidate-read",
+    name: "read_file",
+    arguments: { path: "src/components/toolbar.js" },
+  };
+  const effects = {
+    committedMutationTargetsByToolCallId: new Map(),
+    replayedToolCallIds: new Set(["read-replay-before-mismatch"]),
+    sourceReadVersionsByToolCallId: new Map([[
+      "read-original",
+      {
+        target: "src/components/toolbar.js",
+        version: "sha-toolbar-broken",
+      },
+    ]]),
+    correctiveReplayTargetsByToolCallId: new Map([[
+      "mutation-mismatch",
+      ["src/components/toolbar.js"],
+    ]]),
+    rejectedActionIdentities: new Set(),
+  };
+
+  assert.equal(
+    providerToolSurface.runtimeV2ProviderCoveredSourceReplayIsClosed(
+      candidate,
+      messages,
+      effects,
+    ),
+    false,
+    "the mismatch creates a concrete need to replay the exact source once",
+  );
+
+  messages.push(
+    readCall("read-replay-after-mismatch"),
+    readResult("read-replay-after-mismatch"),
+  );
+  effects.replayedToolCallIds.add("read-replay-after-mismatch");
+  assert.equal(
+    providerToolSurface.runtimeV2ProviderCoveredSourceReplayIsClosed(
+      candidate,
+      messages,
+      effects,
+    ),
+    true,
+    "the recovery replay closes again until another real mismatch or mutation boundary",
+  );
+
+  messages.push({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: "mutation-preflight-rejected",
+      type: "function",
+      function: {
+        name: "replace_in_file",
+        arguments: JSON.stringify({
+          path: "src/components/toolbar.js",
+          search_text: "}entFile(filePath) {}",
+          replace_text: "export function setCurrentFile(filePath) {}",
+        }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: "mutation-preflight-rejected",
+    content: "MUTATION_PREFLIGHT_BLOCKED: duplicate_export(setCurrentFile)",
+  });
+  effects.correctiveReplayTargetsByToolCallId.set(
+    "mutation-preflight-rejected",
+    ["src/components/toolbar.js"],
+  );
+  assert.equal(
+    providerToolSurface.runtimeV2ProviderCoveredSourceReplayIsClosed(
+      candidate,
+      messages,
+      effects,
+    ),
+    false,
+    "a parser-confirmed mutation rejection also reopens one bounded replay",
+  );
+});
+
+test("a correctable mutation diagnostic survives its recovery read until a mutation commits", () => {
+  const messages = [{
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: "preflight-rejected",
+      type: "function",
+      function: {
+        name: "replace_in_file",
+        arguments: JSON.stringify({
+          path: "src/components/toolbar.js",
+          search_text: "an over-broad imagined block",
+          replace_text: "a duplicate declaration proposal",
+        }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: "preflight-rejected",
+    content: [
+      "MUTATION_PREFLIGHT_BLOCKED: duplicate_export(setCurrentFile), duplicate_export(updateTheme)",
+      "Keep the existing valid declarations and remove only the damaged obsolete fragment.",
+    ].join("\n"),
+  }, {
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: "recovery-read",
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({ path: "src/components/toolbar.js" }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: "recovery-read",
+    content: [
+      "READ_FILE_RESULT",
+      "path: src/components/toolbar.js",
+      "contentVersion: toolbar-broken-v1",
+      "truncated: false",
+      "totalLines: 2",
+      "totalChars: 68",
+      "returnedLines: 1-2",
+      "returnedChars: 68",
+      "---CONTENT START---",
+      "export function setCurrentFile(file) {}",
+      "}entFile(filePath) {}",
+      "---CONTENT END---",
+    ].join("\n"),
+  }];
+  const effects = {
+    committedMutationTargetsByToolCallId: new Map(),
+    replayedToolCallIds: new Set(),
+    sourceReadVersionsByToolCallId: new Map([[
+      "recovery-read",
+      {
+        target: "src/components/toolbar.js",
+        version: "toolbar-broken-v1",
+      },
+    ]]),
+    correctiveReplayTargetsByToolCallId: new Map([[
+      "preflight-rejected",
+      ["src/components/toolbar.js"],
+    ]]),
+    correctiveMutationFailureToolCallIds: new Set([
+      "preflight-rejected",
+    ]),
+    rejectedActionIdentities: new Set(),
+  };
+
+  const view = providerHistory.buildRuntimeV2DecisionView(messages, effects);
+  const rendered = view.map((message) =>
+    String(message.content || "")
+  ).join("\n");
+  assert.match(rendered, /MUTATION_PREFLIGHT_BLOCKED/);
+  assert.match(rendered, /remove only the damaged obsolete fragment/);
+  assert.match(rendered, /\}entFile\(filePath\)/);
+  const correctiveCall = view.flatMap((message) =>
+    message.tool_calls || []
+  ).find((call) => call.id === "preflight-rejected");
+  assert.ok(correctiveCall);
+  const correctiveArguments = JSON.parse(
+    correctiveCall.function.arguments,
+  );
+  assert.equal(
+    correctiveArguments.path,
+    "src/components/toolbar.js",
+  );
+  assert.equal(correctiveArguments.effect, "none");
+  assert.equal("search_text" in correctiveArguments, false);
+  assert.equal("replace_text" in correctiveArguments, false);
+
+  const afterCommit = providerHistory.buildRuntimeV2DecisionView(messages, {
+    ...effects,
+    correctiveMutationFailureToolCallIds: new Set(),
+  });
+  assert.doesNotMatch(
+    afterCommit.map((message) => String(message.content || "")).join("\n"),
+    /MUTATION_PREFLIGHT_BLOCKED/,
+  );
+});
+
+test("a missing-source rejection reuses unchanged materialized target source for the corrective action window", () => {
+  const readPair = (id, target, version, source) => [{
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id,
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({ path: target }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: id,
+    content: [
+      "READ_FILE_RESULT",
+      `path: ${target}`,
+      `contentVersion: ${version}`,
+      "truncated: false",
+      `totalLines: ${source.split("\\n").length}`,
+      `totalChars: ${source.length}`,
+      `returnedLines: 1-${source.split("\\n").length}`,
+      `returnedChars: ${source.length}`,
+      "---CONTENT START---",
+      source,
+      "---CONTENT END---",
+    ].join("\n"),
+  }];
+  const messages = [
+    ...readPair(
+      "read-main-before-toolbar-edit",
+      "src/main.js",
+      "main-v1",
+      "let saveDialog;\nsaveDialog = save;",
+    ),
+    ...readPair(
+      "read-unrelated-frontier",
+      "index.html",
+      "index-v1",
+      "<main>unrelated frontier</main>",
+    ),
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "commit-toolbar",
+        type: "function",
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({
+            path: "src/components/toolbar.js",
+            search_text: "broken toolbar",
+            replace_text: "fixed toolbar",
+          }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "commit-toolbar",
+      content: "REPLACE_IN_FILE_RESULT: changed",
+    }, {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "missing-main-source",
+        type: "function",
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({
+            path: "src/main.js",
+            search_text: "provider patch is redacted from recovery",
+            replace_text: "provider replacement is redacted too",
+          }),
+        },
+      }],
+    }, {
+      role: "tool",
+      tool_call_id: "missing-main-source",
+      content: "TOOL_BLOCKED: MUTATION_SOURCE_NOT_VISIBLE",
+    },
+  ];
+  const effects = {
+    committedMutationTargetsByToolCallId: new Map([[
+      "commit-toolbar",
+      ["src/components/toolbar.js"],
+    ]]),
+    replayedToolCallIds: new Set(),
+    sourceReadVersionsByToolCallId: new Map([
+      ["read-main-before-toolbar-edit", {
+        target: "src/main.js",
+        version: "main-v1",
+      }],
+      ["read-unrelated-frontier", {
+        target: "index.html",
+        version: "index-v1",
+      }],
+    ]),
+    correctiveReplayTargetsByToolCallId: new Map([[
+      "missing-main-source",
+      ["src/main.js"],
+    ]]),
+    correctiveMutationFailureToolCallIds: new Set([
+      "missing-main-source",
+    ]),
+    rejectedActionIdentities: new Set(),
+  };
+
+  const view = providerHistory.buildRuntimeV2DecisionView(messages, effects);
+  const rendered = view.map((message) => String(message.content || ""))
+    .join("\n");
+  assert.match(rendered, /let saveDialog;/);
+  const coverage = providerHistory.materializedRuntimeV2SourceCoverage(
+    view,
+    "/workspace",
+    effects,
+  );
+  assert.ok(coverage.some((entry) => entry.target === "src/main.js"));
+  assert.equal(
+    authorization.runtimeV2ProviderActionWindowFor({
+      command: {
+        payload: {
+          effectPressure: { reason: "source_only_frontier" },
+        },
+      },
+      effects,
+      sourceCoverage: coverage,
+    }),
+    "corrective_mutation",
+    "because the rejected editor changed no files, a still-materialized exact source receipt remains current",
+  );
+
+  const invalidatedEffects = {
+    ...effects,
+    committedMutationTargetsByToolCallId: new Map([[
+      "commit-toolbar",
+      ["src/main.js"],
+    ]]),
+  };
+  const invalidatedView = providerHistory.buildRuntimeV2DecisionView(
+    messages,
+    invalidatedEffects,
+  );
+  assert.doesNotMatch(
+    invalidatedView.map((message) => String(message.content || ""))
+      .join("\n"),
+    /let saveDialog;/,
+    "a committed mutation of the same target invalidates older source",
+  );
+});
+
+test("enabled collaboration stays optional at every execution stage", () => {
+  const prompt = providerRequest.providerModeInstruction({
+    payload: {
+      mode: "execute",
+      collaborationPreferred: true,
+      collaborationAction: "optional",
+      maxActiveSubagents: 2,
+    },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: true,
+    hasWaitSubagents: false,
+  });
+
+  assert.match(prompt, /decide adaptively/i);
+  assert.match(prompt, /never mandatory/i);
+  assert.match(prompt, /not a prerequisite for mutation or completion/i);
+});
+
 test("execution prompt stops asking for the same source after versioned evidence exists", () => {
   const surface = {
     hasReadFile: true,
@@ -2136,6 +6317,50 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
   assert.doesNotMatch(prompt, /round|attempt|Gemma|Qwen/i);
 });
 
+test("corrective action window closes observation but not the Run", () => {
+  const prompt = providerRequest.providerModeInstruction({
+    payload: {
+      mode: "execute",
+      hasVersionedSourceEvidence: true,
+    },
+  }, "", {
+    hasReadFile: false,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+    hasMaterializedSourceEvidence: true,
+    sourceOnlyFrontier: true,
+    actionWindow: "corrective_mutation",
+    materializedSourceCoverage: [{
+      target: "src/components/toolbar.js",
+      version: "sha-toolbar",
+      totalLines: 213,
+      complete: true,
+      windows: [{
+        startLine: 1,
+        endLine: 213,
+        content: "source",
+      }],
+    }],
+  });
+
+  assert.match(prompt, /CORRECTIVE_ACTION_WINDOW/);
+  assert.match(prompt, /previous workspace mutation changed no files/i);
+  assert.match(prompt, /observation branch is closed/i);
+  assert.match(prompt, /Inspection and validation reopen/i);
+  assert.doesNotMatch(prompt, /Continue reading|Safe reads remain available/i);
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: true,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      actionWindow: "corrective_mutation",
+    }),
+    "explicit",
+  );
+});
+
 test("execution prompt keeps positive source authority without reprinting rejected executable shapes", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
@@ -2198,7 +6423,12 @@ test("validation prompt asks for evidence instead of another mutation", () => {
   assert.doesNotMatch(prompt, /Make the smallest coherent change/);
 });
 
-test("only a reasoning-only length truncation negotiates adapter action mode", () => {
+test("a truncated reasoning or visible action draft gets one bounded action-mode retry", () => {
+  assert.equal(
+    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT,
+    12_000,
+    "a provider that ignores thinking-off gets one bounded contract runway instead of three identical 4k cancellations",
+  );
   const base = {
     finishReason: "length",
     reasoningChars: 12_000,
@@ -2214,6 +6444,14 @@ test("only a reasoning-only length truncation negotiates adapter action mode", (
   assert.equal(
     providerRequest.shouldRetryRuntimeV2WithoutReasoning({
       ...base,
+      reasoningRequest: "off",
+    }),
+    true,
+    "a provider that ignores the first action-only control still receives one bounded corrective retry",
+  );
+  assert.equal(
+    providerRequest.shouldRetryRuntimeV2WithoutReasoning({
+      ...base,
       finishReason: "tool_calls",
       toolCallCount: 1,
     }),
@@ -2225,6 +6463,27 @@ test("only a reasoning-only length truncation negotiates adapter action mode", (
       reasoningChars: 0,
     }),
     false,
+  );
+  assert.equal(
+    providerRequest.shouldRetryRuntimeV2WithoutReasoning({
+      ...base,
+      reasoningChars: 0,
+      actionChars: 1_200,
+      structuredActionRequired: true,
+      providerSupportsReasoningToggle: false,
+    }),
+    true,
+    "visible prose in a required-action phase is corrected even when the provider has no reasoning toggle",
+  );
+  assert.equal(
+    providerRequest.shouldRetryRuntimeV2WithoutReasoning({
+      ...base,
+      reasoningChars: 0,
+      actionChars: 1_200,
+      structuredActionRequired: false,
+    }),
+    false,
+    "ordinary complete-answer prose does not enter action recovery",
   );
   assert.equal(
     providerRequest.shouldRetryRuntimeV2WithoutReasoning({
@@ -2258,6 +6517,11 @@ test("only a reasoning-only length truncation negotiates adapter action mode", (
     }),
     false,
   );
+  assert.equal(
+    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT,
+    1_200,
+    "a required contract action is redirected before a long visible essay can consume the turn",
+  );
 });
 
 test("child lifecycle uses only the parent lifecycle deadline", () => {
@@ -2266,6 +6530,50 @@ test("child lifecycle uses only the parent lifecycle deadline", () => {
     600_000,
     "a slow local child must not receive an independent 90 second cutoff",
   );
+  assert.equal(
+    subagentRunner.runtimeV2ChildDeadlineAt(undefined),
+    Number.POSITIVE_INFINITY,
+    "ordinary Execute children inherit the absence of a whole-task deadline",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildDeadlineExceeded({
+      signal: new AbortController().signal,
+      deadlineAt: Number.POSITIVE_INFINITY,
+      now: 9_999_999,
+    }),
+    false,
+    "an ordinary child failure must not be mislabeled as a lifecycle deadline",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildDeadlineExceeded({
+      signal: new AbortController().signal,
+      deadlineAt: 10_000,
+      now: 10_000,
+    }),
+    true,
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildOutputTokenLimit({ outputBudget: 32_768 }),
+    8_192,
+    "one child provider step must not monopolize the local lane with the full Run output budget",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildOutputTokenLimit({ outputBudget: 2_048 }),
+    2_048,
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildOutputTokenLimit(null),
+    4_096,
+  );
+  assert.doesNotMatch(
+    runtime.runtimeV2SubagentFailureSummary({
+      canceled: false,
+      deadlineExceeded: false,
+      recoveryStalled: false,
+      evidence: [],
+    }),
+    /显式生命周期截止/,
+  );
   const source = fs.readFileSync(path.join(
     workspaceRoot,
     "src/store/runtimeV2/executionSubagentRunner.ts",
@@ -2273,6 +6581,11 @@ test("child lifecycle uses only the parent lifecycle deadline", () => {
   assert.doesNotMatch(
     source,
     /requiresTool|child_required_tool_missing|investigation window is closed/i,
+  );
+  assert.doesNotMatch(
+    source,
+    /deadlineExceeded:\s*!canceled/,
+    "ordinary child failure cannot be inferred to mean an expired deadline",
   );
 });
 
@@ -2354,6 +6667,70 @@ test("child preserves a provider-selected batch of independent reads", () => {
       ]),
     ),
     [],
+  );
+});
+
+test("a child degrades only when it repeats an already-rejected closed action", () => {
+  const call = {
+    id: "repeat-editor-window",
+    name: "read_file",
+    arguments: {
+      path: "src/components/editor.js",
+      start_line: 30,
+    },
+  };
+  const identity =
+    providerToolSurface.runtimeV2ProviderToolCallIdentity(call);
+
+  assert.equal(
+    subagentRunner.runtimeV2ChildClosedActionLoopDetected({
+      calls: [call],
+      acceptedCallIds: new Set(),
+      previouslyRejectedIdentities: new Set(),
+    }),
+    false,
+    "the first rejection must still give the child one real recovery decision",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildClosedActionLoopDetected({
+      calls: [call],
+      acceptedCallIds: new Set(),
+      previouslyRejectedIdentities: new Set([identity]),
+    }),
+    true,
+    "repeating the same immutable closed action after explicit feedback cannot make progress",
+  );
+});
+
+test("a child closes parameter churn after the same observation repeats past feedback", () => {
+  const fingerprint =
+    "subagent:src/components/toolbar.js:sha256-same-window";
+  assert.equal(
+    subagentRunner.runtimeV2ChildClosedObservationLoopDetected({
+      fingerprint,
+      isNewEvidence: false,
+      previouslyRejectedFingerprints: new Set(),
+    }),
+    false,
+    "the first semantic repeat must return corrective feedback",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildClosedObservationLoopDetected({
+      fingerprint,
+      isNewEvidence: false,
+      previouslyRejectedFingerprints: new Set([fingerprint]),
+    }),
+    true,
+    "changing read arguments cannot keep a child alive when the tool observation is unchanged",
+  );
+  assert.equal(
+    subagentRunner.runtimeV2ChildClosedObservationLoopDetected({
+      fingerprint: `${fingerprint}:new-window`,
+      isNewEvidence: true,
+      previouslyRejectedFingerprints: new Set([fingerprint]),
+    }),
+    false,
+    "a genuinely new source window remains progress regardless of child age",
   );
 });
 
@@ -2552,6 +6929,7 @@ test("joined child evidence gets a delivery receipt only after entering the cano
     firstTokenAt: 20,
     closedAt: 30,
   });
+  const loggedEvents = [];
   const port = schedulerPort.createRuntimeV2SchedulerPort({
     get: () => ({ runtimeV2Checkpoints: {} }),
     context: { turnId: run.turnId },
@@ -2559,7 +6937,7 @@ test("joined child evidence gets a delivery receipt only after entering the cano
     nextId: (scope) => `${scope}-1`,
     now: () => 40,
     lifecycleDeadlineAt: 10_000,
-    logStoreEvent: () => undefined,
+    logStoreEvent: (name, payload) => loggedEvents.push({ name, payload }),
   });
   const command = {
     idempotencyKey: "join-review",
@@ -2569,6 +6947,8 @@ test("joined child evidence gets a delivery receipt only after entering the cano
     payload: {
       toolCallId: "wait-review",
       jobIds: [job.id],
+      automaticJoinReason:
+        "parent_closed_action_while_children_active",
     },
   };
   const events = await port.execute({
@@ -2602,6 +6982,17 @@ test("joined child evidence gets a delivery receipt only after entering the cano
   assert.match(
     String(live.messages.at(-1)?.content || ""),
     /uncited child result remains delivered but not adopted/,
+  );
+  assert.deepEqual(
+    loggedEvents.find((entry) =>
+      entry.name === "runtime_v2_subagent_auto_join"
+    )?.payload,
+    {
+      turnId: run.turnId,
+      runId: run.runId,
+      jobIds: [job.id],
+      reason: "parent_closed_action_while_children_active",
+    },
   );
 });
 
@@ -4660,6 +9051,109 @@ test("a replay restores its same-boundary real source after workset eviction", (
   );
 });
 
+test("alternating cached source recovery converges to one bounded multi-file workset", () => {
+  const sourceResult = (path, version, source) => [
+    "READ_FILE_RESULT",
+    `path: ${path}`,
+    `contentVersion: ${version}`,
+    "truncated: false",
+    "totalLines: 1",
+    `totalChars: ${source.length}`,
+    "returnedLines: 1-1",
+    `returnedChars: ${source.length}`,
+    "---CONTENT START---",
+    source,
+    "---CONTENT END---",
+  ].join("\n");
+  const readPair = (id, path, version, source) => [{
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id,
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({ path }),
+      },
+    }],
+  }, {
+    role: "tool",
+    tool_call_id: id,
+    content: sourceResult(path, version, source),
+  }];
+  const messages = [{
+    role: "system",
+    content: "[MAIN RUNTIME V2]",
+  }, {
+    role: "user",
+    runtimeTurnId: "turn",
+    content: "Repair the editor and backend file lifecycle together.",
+  },
+  ...readPair(
+    "read-editor-original",
+    "src/components/editor.js",
+    "editor-v1",
+    "EDITOR_DISTINCT_SOURCE",
+  ),
+  ...readPair(
+    "read-backend-original",
+    "src-tauri/src/main.rs",
+    "backend-v1",
+    "BACKEND_DISTINCT_SOURCE",
+  ),
+  ...readPair(
+    "read-editor-replay",
+    "src/components/editor.js",
+    "editor-v1",
+    "EDITOR_DISTINCT_SOURCE",
+  ),
+  ...readPair(
+    "read-backend-replay",
+    "src-tauri/src/main.rs",
+    "backend-v1",
+    "BACKEND_DISTINCT_SOURCE",
+  )];
+  const effects = {
+    committedMutationTargetsByToolCallId: new Map(),
+    replayedToolCallIds: new Set([
+      "read-editor-replay",
+      "read-backend-replay",
+    ]),
+    sourceReadVersionsByToolCallId: new Map([
+      ["read-editor-original", {
+        target: "src/components/editor.js",
+        version: "editor-v1",
+      }],
+      ["read-backend-original", {
+        target: "src-tauri/src/main.rs",
+        version: "backend-v1",
+      }],
+    ]),
+  };
+
+  const view = providerHistory.buildRuntimeV2DecisionView(
+    messages,
+    effects,
+  );
+  assert.deepEqual(
+    providerHistory.materializedRuntimeV2SourceCoverage(
+      view,
+      "/tmp/runtime-v2-alternating-source-recovery",
+      effects,
+    ).map((entry) => entry.target).sort(),
+    ["src-tauri/src/main.rs", "src/components/editor.js"].sort(),
+    "replaying two evicted sources must converge instead of alternating which source is visible",
+  );
+  assert.equal(view.some((message) =>
+    message.role === "tool" &&
+    message.tool_call_id === "read-editor-replay"
+  ), false);
+  assert.equal(view.some((message) =>
+    message.role === "tool" &&
+    message.tool_call_id === "read-backend-replay"
+  ), false);
+});
+
 test("a text-envelope fallback does not become sticky Turn capability state", () => {
   const live = executionTypes.createRuntimeV2LiveExecutionState();
 
@@ -4727,6 +9221,24 @@ test("finite validation rejects observers and services but accepts a real test",
       .reasonCode,
     "finite_validation_contract_required",
   );
+  assert.equal(
+    authorization.correctiveFiniteValidationCommand(
+      "cd /workspace && npx vite build 2>&1 | tail -20",
+    ),
+    "npx vite build",
+  );
+  assert.equal(
+    authorization.correctiveFiniteValidationCommand(
+      "cd /workspace && npm run build 2>&1; echo EXIT_CODE=$?",
+    ),
+    "npm run build",
+  );
+  assert.equal(
+    authorization.correctiveFiniteValidationCommand(
+      "grep -n handler src/main.js",
+    ),
+    null,
+  );
 });
 
 test("child scope remains read-only and relative to its declared paths", () => {
@@ -4746,6 +9258,20 @@ test("child scope remains read-only and relative to its declared paths", () => {
     subagentScopes.childScopeAllows(job, { path: "../secret" }),
     false,
   );
+});
+
+test("implementation children receive scoped readers and mutation tools but not final validators", () => {
+  const tools = subagentPolicy.runtimeV2ChildTools({
+    taskKind: "implement",
+    accessMode: "write",
+  }).map((definition) => definition.function.name);
+  assert.ok(tools.includes("read_file"));
+  assert.ok(tools.includes("replace_in_file"));
+  assert.ok(tools.includes("write_file"));
+  assert.ok(tools.includes("apply_patch"));
+  assert.ok(tools.includes("delete_workspace_path"));
+  assert.equal(tools.includes("run_command"), false);
+  assert.equal(tools.includes("browser_evaluate"), false);
 });
 
 test("late child handoff includes current parent context without unrelated paths", () => {

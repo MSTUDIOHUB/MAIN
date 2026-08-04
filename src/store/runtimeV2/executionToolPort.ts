@@ -13,6 +13,7 @@ import {
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
+  aggregateForCurrentTurn,
   authorizationFor,
   boundedRuntimeV2ToolContent,
   boundedToolContent,
@@ -40,6 +41,11 @@ import {
 } from "./providerToolSurface";
 import { runtimeV2MutationFailureContextTarget } from "./correctiveMutationPolicy";
 import { resolveRuntimeV2ToolAuthorization } from "./executionExternalLocalRead";
+import {
+  RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
+  deriveRuntimeV2ExecutionContract,
+  parseRuntimeV2ExecutionContractArguments,
+} from "./executionContract";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -312,6 +318,9 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           `TOOL_BLOCKED: ${phaseAndPlan.reason}`,
           "blocked",
           phaseAndPlan.failureKind || "not_authorized",
+          undefined,
+          undefined,
+          phaseAndPlan.reasonCode || undefined,
         );
       }
       const authorizationResolution =
@@ -356,27 +365,43 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           input.context.runtimeContextBudget,
           { parallelReadCount },
         );
-        const rawOutput = await executeRuntimeV2ToolWithDeadline({
-          toolName,
-          lifecycleDeadlineAt: input.lifecycleDeadlineAt,
-          now: input.now,
-          onTimeout: (timeoutMs, boundary) =>
-            logRuntimeV2ToolDeadline({
-              ports: input,
-              command,
-              toolName,
-              target: target || null,
-              timeoutMs,
-              boundary,
-            }),
-          task: () => executeTool(
-            toolName,
-            executionArgs,
-            input.context.runWorkspace || "",
-            input.context.runSessionKey,
-            toolExecutionOptions,
-          ),
-        });
+        const priorExecutionContract =
+          toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
+            ? deriveRuntimeV2ExecutionContract(
+                aggregateForCurrentTurn(input),
+              )
+            : null;
+        const rawOutput =
+          toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
+            ? JSON.stringify({
+                status: "execution_contract_recorded",
+                revision: (priorExecutionContract?.revision || 0) + 1,
+                ...parseRuntimeV2ExecutionContractArguments(executionArgs),
+                effect: "no_workspace_change",
+                next:
+                  "Advance only a listed exact change or validation; revise explicitly if new evidence changes scope.",
+              })
+            : await executeRuntimeV2ToolWithDeadline({
+                toolName,
+                lifecycleDeadlineAt: input.lifecycleDeadlineAt,
+                now: input.now,
+                onTimeout: (timeoutMs, boundary) =>
+                  logRuntimeV2ToolDeadline({
+                    ports: input,
+                    command,
+                    toolName,
+                    target: target || null,
+                    timeoutMs,
+                    boundary,
+                  }),
+                task: () => executeTool(
+                  toolName,
+                  executionArgs,
+                  input.context.runWorkspace || "",
+                  input.context.runSessionKey,
+                  toolExecutionOptions,
+                ),
+              });
         const sourceVersion = RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)
           ? await resolveRuntimeV2SourceEvidenceVersion({
               toolName,
@@ -432,11 +457,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           diffPreview,
         );
         const semanticStatus = toolResultStatusForCompletion(completion);
+        if (completion.type === "validation.completed") {
+          input.live.correctiveValidationCommand = null;
+        }
         if (
           semanticStatus === "succeeded" &&
           isWorkspaceMutationToolName(toolName)
         ) {
           input.live.hasExecutedMutationEffect = true;
+          input.live.correctiveValidationCommand = null;
           input.live.mutationSourceCoverageByToolCallId.clear();
           input.live.latestProviderRequestSourceCoverage = [];
         }
@@ -457,6 +486,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           status: semanticStatus,
           mutationCommitted: isWorkspaceMutationToolName(toolName),
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
+          executionContractRevision:
+            toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
+              ? (priorExecutionContract?.revision || 0) + 1
+              : null,
           evidenceVersions: completion.type === "tool.completed"
             ? completion.evidence.map((entry) => ({
                 kind: entry.kind,

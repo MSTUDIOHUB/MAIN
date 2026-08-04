@@ -9,8 +9,8 @@ import {
 } from "./executionProviderAnchors";
 import {
   buildRuntimeV2DecisionView,
-  materializedRuntimeV2SourceCoverage,
 } from "./executionProviderDecisionView";
+import { materializedRuntimeV2SourceCoverage } from "./executionProviderSourceCoverage";
 import type {
   RuntimeV2ProviderEffectFacts,
 } from "./executionProviderEffectFacts";
@@ -120,6 +120,17 @@ function canonicalSourceContext(input: {
       ].join("\n"),
     }));
   });
+}
+
+export function runtimeV2SubagentInheritedSourceTargets(input: {
+  readonly messages: readonly AgentMessage[];
+  readonly effectFacts?: RuntimeV2ProviderEffectFacts;
+  readonly workspace: string;
+  readonly allowedPaths: readonly string[];
+}): string[] {
+  return [...new Set(
+    canonicalSourceContext(input).map((entry) => entry.target),
+  )];
 }
 
 function parentContextCapacity(

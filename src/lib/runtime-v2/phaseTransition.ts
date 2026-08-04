@@ -18,6 +18,7 @@ export interface RuntimeV2ExecutePhaseTransition {
     | "pending_mutation_call"
     | "pending_validation_call"
     | "mutation_committed"
+    | "unvalidated_mutation_pending"
     | "validation_failed";
 }
 
@@ -113,13 +114,21 @@ function committedMutationSequences(
       })
       .map((event) => event.command.idempotencyKey),
   );
-  return events
+  const parentMutations = events
     .filter((event): event is Extract<RuntimeV2Event, { type: "tool.completed" }> =>
       event.type === "tool.completed" &&
       event.status === "succeeded" &&
       mutations.has(event.idempotencyKey)
     )
     .map((event) => event.sequence);
+  const childMutations = events
+    .filter((event): event is Extract<RuntimeV2Event, { type: "subagent.completed" }> =>
+      event.type === "subagent.completed" &&
+      event.status === "completed" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+    )
+    .map((event) => event.sequence);
+  return [...parentMutations, ...childMutations];
 }
 
 function latestSequence(values: readonly number[]): number {
@@ -134,6 +143,12 @@ export interface RuntimeV2ExecuteEvidenceSummary {
   readonly failedOperationCount: number;
   readonly failedProviderRequestCount: number;
 }
+
+/** Three identical acceptance failures across mutation boundaries prove that
+ * edits are not changing the observed defect. This is a semantic no-progress
+ * boundary, not a wall-clock or total-step limit: any materially different
+ * validation result resets the consecutive count. */
+export const RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT = 3;
 
 function validationSupportsRequirement(
   event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
@@ -218,8 +233,16 @@ export function runtimeV2DirectExecuteReadyForConclusion(
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
   const latestMutationSequence = state.events.reduce(
     (latest, event) =>
-      event.type === "tool.completed" &&
-        event.status === "succeeded" &&
+      (
+        (
+          event.type === "tool.completed" &&
+          event.status === "succeeded"
+        ) ||
+        (
+          event.type === "subagent.completed" &&
+          event.status === "completed"
+        )
+      ) &&
         event.evidence.some((evidence) => evidence.kind === "mutation")
         ? Math.max(latest, event.sequence)
         : latest,
@@ -477,6 +500,12 @@ export function decideRuntimeV2ExecutePhaseTransition(
   const phaseEvents = currentPhaseEvents(state);
 
   if (state.phase === "acting") {
+    const latestPhaseMutationSequence = latestSequence(
+      committedMutationSequences(
+        phaseEvents,
+        input.isMutationToolName,
+      ),
+    );
     const latestMutationSequence = latestSequence(
       committedMutationSequences(
         state.events,
@@ -498,7 +527,9 @@ export function decideRuntimeV2ExecutePhaseTransition(
       return {
         from: "acting",
         to: "validating",
-        reason: "mutation_committed",
+        reason: latestPhaseMutationSequence >= 0
+          ? "mutation_committed"
+          : "unvalidated_mutation_pending",
       };
     }
   }

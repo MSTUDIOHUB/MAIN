@@ -24,9 +24,9 @@ export type RuntimeV2ToolAuthorizationResolution =
     };
 
 /**
- * Resolve authorization at the effect boundary. External local reads are the
- * only Runtime v2 effect that can pause here for an existing UI decision; all
- * other denials remain ordinary blocked tool completions.
+ * Resolve authorization at the effect boundary. External reads and explicit
+ * per-call destructive operations may pause on the existing ActionRequest UI;
+ * all other denials remain ordinary blocked tool completions.
  */
 export async function resolveRuntimeV2ToolAuthorization(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -45,10 +45,24 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
   if (
     !authorization.allowed &&
     authorization.approvalRequired === true &&
-    authorization.risk === "local_file_read" &&
-    authorization.localFileReadPath
+    authorization.risk
   ) {
-    const requestedPath = authorization.localFileReadPath;
+    const requestedPath = authorization.localFileReadPath || input.target;
+    if (!requestedPath) {
+      return {
+        allowed: false,
+        completion: toolCompletionFor(
+          input.ports,
+          input.command,
+          input.toolName,
+          input.args,
+          input.failureContextTarget,
+          "TOOL_BLOCKED: the per-call approval target is missing.",
+          "blocked",
+          "not_authorized",
+        ),
+      };
+    }
     const review = await requestRuntimeV2ToolPermission({
       ports: input.ports,
       command: input.command,
@@ -56,16 +70,25 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       args: input.args,
       target: input.target,
       risk: authorization.risk,
-      localFileReadPath: requestedPath,
+      permissionTarget: requestedPath,
       signal: input.signal,
     });
     if (review.action === "reject") {
+      const externalRead = authorization.risk === "local_file_read";
       const reason = input.ports.context.phaseLanguage === "en"
-        ? `The user denied access to the local file outside the workspace: ${requestedPath}.`
-        : `用户拒绝了对工作区外本地文件 ${requestedPath} 的读取授权。`;
+        ? externalRead
+          ? `The user denied access to the local file outside the workspace: ${requestedPath}.`
+          : `The user denied the ${authorization.risk} operation on ${requestedPath}.`
+        : externalRead
+          ? `用户拒绝了对工作区外本地文件 ${requestedPath} 的读取授权。`
+          : `用户拒绝了对 ${requestedPath} 执行 ${authorization.risk} 操作。`;
       const finalMarkdown = input.ports.context.phaseLanguage === "en"
-        ? `Did not read \`${requestedPath}\`: permission to access this local file outside the workspace was denied. The file was not ingested or read.`
-        : `未读取 \`${requestedPath}\`：你拒绝了工作区外本地文件访问。本轮未导入或读取该文件。`;
+        ? externalRead
+          ? `Did not read \`${requestedPath}\`: permission to access this local file outside the workspace was denied. The file was not ingested or read.`
+          : `Did not execute \`${input.toolName}\` on \`${requestedPath}\`: the per-call operation was denied.`
+        : externalRead
+          ? `未读取 \`${requestedPath}\`：你拒绝了工作区外本地文件访问。本轮未导入或读取该文件。`
+          : `未对 \`${requestedPath}\` 执行 \`${input.toolName}\`：你拒绝了这次单独授权。`;
       input.ports.live.permissionRejection = { reason, finalMarkdown };
       recordToolResultHistory({
         ports: input.ports,
@@ -97,13 +120,24 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       };
     }
     if (review.action === "accept") {
-      // The UI resolver grants one exact normalized path. Re-read current
-      // authority exactly once before any ingest or read side effect.
-      authorization = await authorizeToolForCurrentTurn(
-        input.ports,
-        input.toolName,
-        input.args,
-      );
+      if (authorization.risk === "local_file_read") {
+        // The UI resolver grants one exact normalized path. Re-read current
+        // authority exactly once before any ingest or read side effect.
+        authorization = await authorizeToolForCurrentTurn(
+          input.ports,
+          input.toolName,
+          input.args,
+        );
+      } else {
+        // Per-call risks are intentionally not persisted in policy. The
+        // accepted ActionRequest authorizes this exact invocation only.
+        authorization = {
+          ...authorization,
+          allowed: true,
+          reason: null,
+          approvalRequired: false,
+        };
+      }
     }
   }
   if (authorization.allowed) {

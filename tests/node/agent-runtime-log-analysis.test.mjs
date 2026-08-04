@@ -85,13 +85,15 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
     '[1785135800.068] [info] [store.runtime_v2_failure_read_window_selected] {"turnId":"turn-v2","runId":"run-v2","path":"src/main.js","failureLine":405,"failureLabel":"replace_in_file"}',
     '[1785135800.069] [info] [store.runtime_v2_source_refresh_fallback_selected] {"turnId":"turn-v2","runId":"run-v2","path":"src/main.js","startLine":381,"endLine":485}',
     '[1785135800.070] [info] [store.runtime_v2_provider_tool_batch_normalized] {"turnId":"turn-v2","runId":"run-v2","originalToolCount":3,"discardedToolNames":["read_file","read_file"]}',
-    '[1785135800.075] [info] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"mutation_required","mutationToolAvailable":true,"sourceReadAvailable":false,"mutationLeaseAuthority":"acceptance_failure","excludedMutationTool":"apply_patch","availableContextEntries":16,"droppedEvidenceEntries":4,"contextSources":{"workspace":1,"tool":12,"subagent":2,"provider":1,"plan":0},"retainedContextSources":{"workspace":1,"tool":3,"subagent":2,"provider":1,"plan":0}}',
+    '[1785135800.075] [info] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"mutation_required","mutationToolAvailable":true,"sourceReadAvailable":false,"providerActionWindow":"corrective_mutation","mutationLeaseAuthority":"acceptance_failure","excludedMutationTool":"apply_patch","availableContextEntries":16,"droppedEvidenceEntries":4,"contextSources":{"workspace":1,"tool":12,"subagent":2,"provider":1,"plan":0},"retainedContextSources":{"workspace":1,"tool":3,"subagent":2,"provider":1,"plan":0}}',
     '[1785135800.076] [warn] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"observe","mutationToolAvailable":true}',
     '[1785135800.077] [warn] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"source_gap_allowed","mutationToolAvailable":true}',
     '[1785135800.078] [warn] [store.runtime_v2_context_prepared] {"turnId":"turn-v2","runId":"run-v2","mode":"execute","executePolicy":"mutation_required","mutationToolAvailable":true}',
     '[1785135800.100] [info] [store.runtime_v2_tool_execution_started] {"turnId":"turn-v2","runId":"run-v2","toolName":"read_file","target":"src/main.js"}',
     '[1785135800.150] [info] [store.runtime_v2_subagent_context_handoff] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a","inheritedContext":true,"parentContextChars":2400}',
     '[1785135800.200] [info] [store.runtime_v2_subagent_request_opened] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a"}',
+    '[1785135800.250] [info] [store.runtime_v2_subagent_auto_join] {"turnId":"turn-v2","runId":"run-v2","jobIds":["child-a"],"reason":"parent_closed_action_while_children_active"}',
+    '[1785135800.275] [info] [store.runtime_v2_subagent_closed_observation_loop] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a","evidenceCount":1}',
     '[1785135800.300] [info] [store.runtime_v2_subagent_joined] {"turnId":"turn-v2","runId":"run-v2","jobId":"child-a","status":"completed","structuredReport":false}',
     '[1785135800.400] [info] [store.runtime_v2_phase_transition] {"turnId":"turn-v2","runId":"run-v2","from":"observing","to":"acting"}',
     '[1785135800.500] [info] [store.runtime_v2_projection_published] {"turnId":"turn-v2","runId":"run-v2","audience":"capsule_live","storeDisposition":"projected"}',
@@ -103,6 +105,7 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
     '[1785135800.715] [warn] [store.runtime_v2_ledger_committed] {"turnId":"turn-v2","runId":"run-v2","eventType":"recovery.exhausted","recoveryScope":"diagnostic"}',
     '[1785135800.725] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","reason":"finite_validation_contract_required"}',
     '[1785135800.730] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_tool","toolName":"replace_in_file","reason":"mutation_target_lease_mismatch"}',
+    '[1785135800.735] [info] [store.runtime_v2_tool_execution_blocked] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_tool","toolName":"replace_in_file","reason":"mutation_source_text_mismatch"}',
     '[1785135800.750] [info] [store.runtime_v2_tool_execution_completed] {"turnId":"turn-v2","runId":"run-v2","commandKind":"execute_validation","toolName":"run_command","validationPassed":true}',
     '[1785135800.800] [info] [store.runtime_v2_execute_terminal] {"turnId":"turn-v2","runId":"run-v2","resultKind":"success","reason":"validated","mutations":1,"verificationComplete":true,"staticOnlyBehavioralCriterionIds":["criterion-visible-behavior"]}',
   ].join("\n"));
@@ -119,6 +122,11 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.runs[0].mutationToolCalls, 1);
   assert.equal(report.runs[0].subagentRequests, 1);
   assert.equal(report.runs[0].subagentContextHandoffs, 1);
+  assert.equal(report.runs[0].subagentAutoJoins, 1);
+  assert.equal(report.runs[0].subagentClosedObservationLoops, 1);
+  assert.equal(report.runs[0].providerActionWindows, 1);
+  assert.equal(report.runs[0].correctiveMutationActionWindows, 1);
+  assert.equal(report.runs[0].closedRecoveryActionWindows, 0);
   assert.equal(report.runs[0].subagentsJoined, 1);
   assert.equal(report.runs[0].completedSubagentsWithoutReport, 1);
   assert.equal(report.runs[0].softSignals, 2);
@@ -137,6 +145,7 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.runs[0].oversizedMutationRejections, 1);
   assert.equal(report.runs[0].outsideWorkspaceMutationRejections, 1);
   assert.equal(report.runs[0].correctiveTargetRejections, 1);
+  assert.equal(report.runs[0].mutationSourceTextMismatches, 1);
   assert.equal(report.runs[0].investigationMutationSurfaceViolations, 1);
   assert.equal(report.runs[0].sourceGapMutationSurfaceViolations, 1);
   assert.equal(report.runs[0].mutationRequestsWithoutLease, 1);
@@ -171,6 +180,12 @@ test("runtime log analysis reconstructs Runtime v2 tools, children, projections,
   assert.equal(report.aggregate.oversizedMutationRejections, 1);
   assert.equal(report.aggregate.outsideWorkspaceMutationRejections, 1);
   assert.equal(report.aggregate.correctiveTargetRejections, 1);
+  assert.equal(report.aggregate.mutationSourceTextMismatches, 1);
+  assert.equal(report.aggregate.subagentAutoJoins, 1);
+  assert.equal(report.aggregate.subagentClosedObservationLoops, 1);
+  assert.equal(report.aggregate.providerActionWindows, 1);
+  assert.equal(report.aggregate.correctiveMutationActionWindows, 1);
+  assert.equal(report.aggregate.closedRecoveryActionWindows, 0);
   assert.equal(report.aggregate.investigationMutationSurfaceViolations, 1);
   assert.equal(report.aggregate.sourceGapMutationSurfaceViolations, 1);
   assert.equal(report.aggregate.mutationRequestsWithoutLease, 1);

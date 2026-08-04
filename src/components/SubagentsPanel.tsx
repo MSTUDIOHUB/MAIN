@@ -172,16 +172,20 @@ export default function SubagentsPanel({
         <div className={`mt-2 truncate text-[10px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`} title={`${capacityPolicy.provider} · ${capacityPolicy.model}`}>
           {capacityPolicy.profile === "local"
             ? language === "zh"
-              ? capacityPolicy.capacitySource === "configured"
-                ? `模型请求并发 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}，已配置）`
-                : capacityPolicy.capacitySource === "observed"
-                  ? `已实测并发 ${capacityPolicy.confirmedTotalRequests}，当前开放 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}）`
-                  : `模型请求并发探测中（主体 1 + 探测子流 ${capacityPolicy.maxActiveRequests}）`
-              : capacityPolicy.capacitySource === "configured"
-                ? `${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children, configured)`
-                : capacityPolicy.capacitySource === "observed"
-                  ? `Observed ${capacityPolicy.confirmedTotalRequests}; admitting ${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children)`
-                  : `Probing model concurrency (1 parent + ${capacityPolicy.maxActiveRequests} probe child)`
+              ? capacityPolicy.modelRequestMode === "serialized"
+                ? `模型请求串行；当前不开放子智能体并行${capacityPolicy.capacitySource === "configured" ? "（已配置）" : "（安全默认）"}`
+                : capacityPolicy.capacitySource === "configured"
+                  ? `模型请求并发 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}，已配置）`
+                  : capacityPolicy.capacitySource === "observed"
+                    ? `已实测并发 ${capacityPolicy.confirmedTotalRequests}，当前开放 ${capacityPolicy.maxTotalRequests}（主体 1 + 子流 ${capacityPolicy.maxActiveRequests}）`
+                    : `模型请求并发探测中（主体 1 + 探测子流 ${capacityPolicy.maxActiveRequests}）`
+              : capacityPolicy.modelRequestMode === "serialized"
+                ? `Serialized model requests; parallel subagents are unavailable${capacityPolicy.capacitySource === "configured" ? " (configured)" : " (safe default)"}`
+                : capacityPolicy.capacitySource === "configured"
+                  ? `${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children, configured)`
+                  : capacityPolicy.capacitySource === "observed"
+                    ? `Observed ${capacityPolicy.confirmedTotalRequests}; admitting ${capacityPolicy.maxTotalRequests} model requests (1 parent + ${capacityPolicy.maxActiveRequests} children)`
+                    : `Probing model concurrency (1 parent + ${capacityPolicy.maxActiveRequests} probe child)`
             : language === "zh" ? "云端受控并行" : "Controlled cloud parallelism"}
           {` · ${capacityPolicy.provider} · ${capacityPolicy.model}`}
         </div>

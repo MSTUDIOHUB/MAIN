@@ -7,6 +7,7 @@ import {
 import type { RuntimeV2NormalizedToolCall } from "../../lib/runtime-v2";
 import { sha256Hex } from "../../lib/sha256";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { isRuntimeV2WorkspaceReadToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
 import type {
   RuntimeV2ProviderEffectFacts,
@@ -99,6 +100,12 @@ export function completedRuntimeV2ProviderToolCallIdentities(
     if (message.role !== "tool" || !message.tool_call_id) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
+    if (
+      call.name === "read_file" &&
+      effects?.invalidatedSourceReadToolCallIds?.has(message.tool_call_id)
+    ) {
+      continue;
+    }
     const mutationTargets = isWorkspaceMutationToolName(call.name)
       ? committedMutationTargets(message.tool_call_id, effects)
       : null;
@@ -177,6 +184,12 @@ export function runtimeV2ProviderReadIsFullyCovered(
     if (message.role !== "tool" || !message.tool_call_id) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
+    if (
+      call.name === "read_file" &&
+      effects?.invalidatedSourceReadToolCallIds?.has(message.tool_call_id)
+    ) {
+      continue;
+    }
     const mutationTargets = isWorkspaceMutationToolName(call.name)
       ? committedMutationTargets(message.tool_call_id, effects)
       : null;
@@ -267,11 +280,33 @@ export function runtimeV2ProviderCoveredSourceReplayIsClosed(
     if (message.role !== "tool" || !message.tool_call_id) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
+    if (
+      call.name === "read_file" &&
+      effects?.invalidatedSourceReadToolCallIds?.has(message.tool_call_id)
+    ) {
+      continue;
+    }
     const mutationTargets = isWorkspaceMutationToolName(call.name)
       ? committedMutationTargets(message.tool_call_id, effects)
       : null;
     if (mutationTargets) {
       currentVersion = "";
+      replayedVersion = "";
+      continue;
+    }
+    const correctiveReplayTargets =
+      effects.correctiveReplayTargetsByToolCallId?.get(
+        message.tool_call_id,
+      ) || [];
+    if (
+      isWorkspaceMutationToolName(call.name) &&
+      correctiveReplayTargets.some((target) =>
+        workspacePathsReferToSameFile(target, candidatePath)
+      )
+    ) {
+      // Correctable source/preflight feedback may depend on another nearby
+      // declaration. Reopen exactly one cached replay for this target without
+      // manufacturing new source evidence or hitting disk.
       replayedVersion = "";
       continue;
     }
@@ -355,6 +390,12 @@ export function runtimeV2ProviderCoveredReadReceipt(
     if (message.role !== "tool" || !message.tool_call_id) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
+    if (
+      call.name === "read_file" &&
+      effects?.invalidatedSourceReadToolCallIds?.has(message.tool_call_id)
+    ) {
+      continue;
+    }
     const mutationTargets = isWorkspaceMutationToolName(call.name)
       ? committedMutationTargets(message.tool_call_id, effects)
       : null;
@@ -409,6 +450,12 @@ export function runtimeV2ProviderExactReadReceipt(
     if (message.role !== "tool" || !message.tool_call_id) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
+    if (
+      call.name === "read_file" &&
+      effects?.invalidatedSourceReadToolCallIds?.has(message.tool_call_id)
+    ) {
+      continue;
+    }
     const mutationTargets = isWorkspaceMutationToolName(call.name)
       ? committedMutationTargets(message.tool_call_id, effects)
       : null;

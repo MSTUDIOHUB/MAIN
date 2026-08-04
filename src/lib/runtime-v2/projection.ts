@@ -92,7 +92,7 @@ export function runtimeV2StructuredActionMarkdown(
     case "execute_validation":
       return "正在运行有限验证，检查本轮修改和验收条件。";
     case "schedule_subagents":
-      return "正在为互不重叠的只读范围启动子智能体，主体会继续处理不依赖这些结果的工作。";
+      return "正在启动范围明确的子智能体协作，主体会继续处理不依赖这些证据或暂存修改的工作。";
     case "join_subagents":
       return "正在汇合子智能体的调查结果，并把可信证据纳入当前判断。";
     case "publish_projection":

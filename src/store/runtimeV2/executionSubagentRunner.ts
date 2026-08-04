@@ -1,28 +1,14 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
-import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
-import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
-import { acquireModelLane } from "../../lib/modelLaneCoordinator";
-import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import { streamChatCompletion } from "../../lib/streaming";
-import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
 import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   advanceRuntimeV2ChildRecoveryStallLease,
   compileRuntimeV2SubagentTextReport,
-  isRuntimeV2ProviderProtocolError,
-  normalizeProviderResponseV1,
-  recordProviderTransportAttempt,
-  RuntimeV2ProviderProtocolError,
-  runtimeV2ProviderProtocolErrorAllowsTransportFallback,
   runtimeV2ChildRecoveryStallExpired,
   runtimeV2EvidenceVersion,
   runtimeV2SubagentFailureSummary,
-  selectNextProviderTransportAttempt,
   type RuntimeV2EvidenceReference,
   type RuntimeV2NormalizedProviderResult,
-  type RuntimeV2NormalizedToolCall,
   type RuntimeV2ChildRecoveryStallLease,
   type RuntimeV2SubagentJob,
 } from "../../lib/runtime-v2";
@@ -30,16 +16,13 @@ import { analyzeValidationCommand } from "../../lib/validationContract";
 import {
   authorizationFor,
   authorizeToolForCurrentTurn,
-  baseProviderProfile,
-  boundedRuntimeV2ToolContent,
   childScopeAllows,
-  compactTextEnvelopeCatalog,
-  containsProviderTextEnvelopePrompt,
   runtimeV2ContextBoundToolArguments,
   runtimeV2ParallelReadCount,
   type RuntimeV2ChildResult,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
+import type { RuntimeV2StagedChildMutation } from "./executionTypes";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   deriveRuntimeV2ProviderEffectFacts,
@@ -48,74 +31,43 @@ import {
   isRuntimeV2ValidationPassed,
   runtimeV2ValidationEvidenceVersion,
 } from "./executionEvidence";
-import { buildRuntimeV2SubagentContextCapsule } from "./executionSubagentContext";
 import {
-  boundRuntimeV2ProviderToolCalls,
+  buildRuntimeV2SubagentContextCapsule,
+  runtimeV2SubagentInheritedSourceTargets,
+} from "./executionSubagentContext";
+import { stageRuntimeV2ChildMutation } from "./executionSubagentMutation";
+import {
+  normalizedRuntimeV2SubagentPath,
+} from "./executionSubagentWriteScope";
+import {
   completedRuntimeV2ProviderToolCallIdentities,
-  scopeRuntimeV2ProviderToolCallIds,
+  runtimeV2ProviderToolCallIdentity,
 } from "./providerToolSurface";
+import {
+  boundRuntimeV2ChildToolCalls,
+  MUTATION_CHILD_TOOL_NAMES,
+  READ_ONLY_CHILD_TOOL_NAMES,
+  runtimeV2ChildClosedActionLoopDetected,
+  runtimeV2ChildClosedObservationLoopDetected,
+  runtimeV2ChildDeadlineAt,
+  runtimeV2ChildDeadlineExceeded,
+  runtimeV2ChildToolOutputContent,
+  runtimeV2ChildTools,
+  RuntimeV2ChildDeadlineError,
+  VALIDATION_CHILD_TOOL_NAMES,
+} from "./executionSubagentPolicy";
+import { requestRuntimeV2ChildStep } from "./executionSubagentProvider";
 
-const READ_ONLY_CHILD_TOOL_NAMES = new Set([
-  "list_directory",
-  "read_file",
-  "grep_search",
-  "get_file_outline",
-  "code_ast_query",
-  "find_symbol_references",
-]);
-const VALIDATION_CHILD_TOOL_NAMES = new Set([
-  "run_command",
-  "browser_evaluate",
-  "computer_use",
-]);
-const CHILD_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((definition) =>
-  READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
-  VALIDATION_CHILD_TOOL_NAMES.has(definition.function.name)
-);
-
-export function runtimeV2ChildDeadlineAt(
-  parentLifecycleDeadlineAt?: number,
-): number {
-  return Number.isFinite(parentLifecycleDeadlineAt)
-    ? Number(parentLifecycleDeadlineAt)
-    : Number.POSITIVE_INFINITY;
-}
-
-class RuntimeV2ChildDeadlineError extends Error {}
-
-export function boundRuntimeV2ChildToolCalls(
-  calls: readonly RuntimeV2NormalizedToolCall[],
-  attemptedIdentities: ReadonlySet<string> = new Set(),
-): RuntimeV2NormalizedToolCall[] {
-  return boundRuntimeV2ProviderToolCalls(
-    calls,
-    attemptedIdentities,
-  ).accepted;
-}
-
-export function runtimeV2ChildToolOutputContent(
-  toolName: string,
-  value: unknown,
-  budget?: RuntimeContextBudget | null,
-): string {
-  return boundedRuntimeV2ToolContent(toolName, value, budget);
-}
-
-export function runtimeV2ChildOutputTokenLimit(
-  budget?: Pick<RuntimeContextBudget, "outputBudget"> | null,
-): number {
-  const admitted = Math.floor(Number(budget?.outputBudget));
-  return Number.isFinite(admitted) && admitted > 0
-    ? admitted
-    : 4_096;
-}
-
-function childTools(job: RuntimeV2SubagentJob): ToolDefinition[] {
-  return CHILD_TOOL_DEFINITIONS.filter((definition) =>
-    READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
-    job.taskKind === "validate"
-  );
-}
+export {
+  boundRuntimeV2ChildToolCalls,
+  normalizeRuntimeV2ChildToolCalls,
+  runtimeV2ChildClosedActionLoopDetected,
+  runtimeV2ChildClosedObservationLoopDetected,
+  runtimeV2ChildDeadlineAt,
+  runtimeV2ChildDeadlineExceeded,
+  runtimeV2ChildOutputTokenLimit,
+  runtimeV2ChildToolOutputContent,
+} from "./executionSubagentPolicy";
 
 async function childToolAllowed(input: {
   readonly job: RuntimeV2SubagentJob;
@@ -125,6 +77,10 @@ async function childToolAllowed(input: {
 }): Promise<boolean> {
   if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
     return childScopeAllows(input.job, input.args);
+  }
+  if (MUTATION_CHILD_TOOL_NAMES.has(input.name)) {
+    return input.job.taskKind === "implement" &&
+      input.job.accessMode === "write";
   }
   if (
     input.job.taskKind !== "validate" ||
@@ -149,257 +105,6 @@ async function childToolAllowed(input: {
     input.name,
     input.args,
   )).allowed;
-}
-
-async function requestChildStep(input: {
-  readonly job: RuntimeV2SubagentJob;
-  readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly messages: readonly AgentMessage[];
-  readonly tools: readonly ToolDefinition[];
-  readonly signal: AbortSignal;
-  readonly deadlineAt: number;
-  readonly recoveryOccurrence: number;
-}): Promise<RuntimeV2NormalizedProviderResult> {
-  const profile = {
-    ...baseProviderProfile(input.ports.get()),
-    requiredToolChoice: false,
-  };
-  let epoch: {
-    actionKey: string;
-    attempted: readonly (
-      "native_required" | "native_auto" | "text_envelope"
-    )[];
-  } = {
-    actionKey: `${input.job.id}:${input.messages.length}`,
-    attempted: [],
-  };
-  let lastError: unknown = null;
-  while (Date.now() < input.deadlineAt) {
-    const attempt = selectNextProviderTransportAttempt(profile, epoch);
-    if (!attempt) break;
-    epoch = recordProviderTransportAttempt(epoch, attempt);
-    const remainingMs = Math.max(1, input.deadlineAt - Date.now());
-    const timeoutMs = Number.isFinite(remainingMs)
-      ? remainingMs
-      : undefined;
-    try {
-      const requestMessages: AgentMessage[] = [
-        ...input.messages,
-        ...(input.recoveryOccurrence > 0
-          ? [{
-              role: "system" as const,
-              content:
-                `CHILD_RECOVERY_PIVOT ${input.recoveryOccurrence}: the previous child step produced no new evidence. Use a genuinely different allowed read/validation action for one named missing fact, or conclude from retained evidence. Do not repeat the closed action.`,
-            }]
-          : []),
-        ...(attempt.textEnvelope
-          ? [{
-            role: "system" as const,
-            content: containsProviderTextEnvelopePrompt(
-              input.ports.context.phaseLanguage,
-              false,
-            ),
-            }, {
-              role: "system" as const,
-              content: compactTextEnvelopeCatalog(input.tools),
-            }]
-          : []),
-      ];
-      const budget = input.ports.context.runtimeContextBudget;
-      const maxOutputTokens = runtimeV2ChildOutputTokenLimit(budget);
-      const boundedRequestMessages = budget
-        ? boundRuntimeMessagesToContext(requestMessages, {
-            contextLimit: budget.contextLimit,
-            reservedOutputTokens: maxOutputTokens,
-          })
-        : requestMessages;
-      let streamedText = "";
-      const state = input.ports.get();
-      const requestTokenBudget = Math.max(
-        2_048,
-        Math.ceil(
-          boundedRequestMessages.reduce(
-            (total, message) =>
-              total + (
-                typeof message.content === "string"
-                  ? message.content.length
-                  : JSON.stringify(message.content).length
-              ),
-            0,
-          ) / 4,
-        ) + maxOutputTokens,
-      );
-      const requestController = new AbortController();
-      const abortRequestFromParent = () =>
-        requestController.abort(input.signal.reason);
-      if (input.signal.aborted) abortRequestFromParent();
-      else {
-        input.signal.addEventListener(
-          "abort",
-          abortRequestFromParent,
-          { once: true },
-        );
-      }
-      const lane = await acquireModelLane({
-        config: state.config,
-        contextLimit: budget?.contextLimit,
-        requestTokenBudget,
-        agentKind: "subagent",
-        subagentId: input.job.id,
-        signal: requestController.signal,
-        onDebugEvent: (event, data) =>
-          input.ports.logStoreEvent(event, {
-            turnId: input.job.run.turnId,
-            runId: input.job.run.runId,
-            jobId: input.job.id,
-            ...data,
-          }),
-      });
-      lane.setPressureHandler((error) =>
-        requestController.abort(error)
-      );
-      let wire: Awaited<ReturnType<typeof streamChatCompletion>>;
-      try {
-        wire = await streamChatCompletion(
-          boundedRequestMessages,
-          deriveBudgetedStreamSettings(
-            state.config,
-            budget,
-          ),
-          {
-            onToken: (token) => {
-              lane.markFirstToken();
-              streamedText += token;
-              const telemetry =
-                input.ports.live.childTelemetry.get(input.job.id);
-              if (telemetry && telemetry.firstTokenAt === null) {
-                telemetry.firstTokenAt = input.ports.now();
-              }
-            },
-            onDone: () => undefined,
-            onError: () => undefined,
-            onLifecycle: (event) => {
-              if (event.phase !== "first_chunk") return;
-              lane.markFirstToken();
-              const telemetry =
-                input.ports.live.childTelemetry.get(input.job.id);
-              if (telemetry && telemetry.firstTokenAt === null) {
-                telemetry.firstTokenAt = input.ports.now();
-              }
-            },
-          },
-          requestController.signal,
-          attempt.textEnvelope ? [] : [...input.tools],
-          maxOutputTokens,
-          {
-            ...(attempt.toolChoice
-              ? { toolChoice: attempt.toolChoice }
-              : {}),
-            timeoutMs,
-            contextOwnership: "caller",
-          },
-        );
-      } catch (error) {
-        lane.reportFailure(error);
-        throw error;
-      } finally {
-        lane.setPressureHandler(undefined);
-        input.signal.removeEventListener(
-          "abort",
-          abortRequestFromParent,
-        );
-        lane.release();
-      }
-      const normalized = normalizeProviderResponseV1({
-        visibleText: wire.semanticContent || streamedText,
-        content: wire.actionableContent || wire.content || streamedText,
-        toolCalls: wire.toolCalls,
-        usage: wire.usage,
-        diagnostics: wire.protocolViolation
-          ? [{
-              code: wire.protocolViolation,
-              message: "Child provider tool protocol mismatch",
-              retryable: true,
-            }]
-          : [],
-      });
-      if (normalized.toolCalls.length > 0) {
-        input.ports.live.provenStructuredToolTransports.add(
-          attempt.variant,
-        );
-      }
-      const allowed = new Set(
-        input.tools.map((tool) => tool.function.name),
-      );
-      const unexpected = normalized.toolCalls.filter(
-        (call) => !allowed.has(call.name),
-      );
-      const visibleText = sanitizeAssistantDisplayContent(
-        normalized.visibleText || "",
-      ).trim();
-      if (
-        unexpected.length > 0 ||
-        normalized.diagnostics.length > 0
-      ) {
-        throw new RuntimeV2ProviderProtocolError(
-          unexpected.length > 0
-            ? "tool_surface_rejected"
-            : "tool_arguments_rejected",
-          unexpected.length > 0
-            ? `child_tool_surface_rejected:${
-                unexpected.map((call) => call.name).join(",")
-              }`
-            : "child_protocol_diagnostic",
-        );
-      }
-      input.ports.logStoreEvent("runtime_v2_subagent_provider_result", {
-        turnId: input.job.run.turnId,
-        runId: input.job.run.runId,
-        jobId: input.job.id,
-        transport: attempt.variant,
-        toolName: normalized.toolCalls[0]?.name || null,
-        toolNames: normalized.toolCalls.map((call) => call.name),
-        concluded: normalized.toolCalls.length === 0,
-      });
-      return {
-        ...normalized,
-        visibleText,
-        toolCalls: scopeRuntimeV2ProviderToolCallIds(
-          normalized.toolCalls,
-          () => input.ports.nextId("subagent-tool-call"),
-        ),
-      };
-    } catch (error) {
-      lastError = error;
-      const fallbackAllowed =
-        runtimeV2ProviderProtocolErrorAllowsTransportFallback(
-          error,
-          {
-            activeTransportProven:
-              input.ports.live.provenStructuredToolTransports.has(
-                attempt.variant,
-              ),
-          },
-        );
-      input.ports.logStoreEvent(
-        isRuntimeV2ProviderProtocolError(error)
-          ? "runtime_v2_subagent_protocol_drift"
-          : "runtime_v2_subagent_transport_failed",
-        {
-          turnId: input.job.run.turnId,
-          runId: input.job.run.runId,
-          jobId: input.job.id,
-          transport: attempt.variant,
-          error: error instanceof Error ? error.message : String(error),
-          transportFallbackAllowed: fallbackAllowed,
-        },
-      );
-      if (!fallbackAllowed) break;
-    }
-  }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Runtime v2 child provider transports exhausted.");
 }
 
 function pathsOverlap(left: string, right: string): boolean {
@@ -428,6 +133,7 @@ function completedChildResult(input: {
   readonly summary: string;
   readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
   readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly stagedMutations: readonly RuntimeV2StagedChildMutation[];
 }): RuntimeV2ChildResult {
   const report = compileRuntimeV2SubagentTextReport({
     summary: input.summary,
@@ -441,6 +147,7 @@ function completedChildResult(input: {
     report,
     inheritedEvidence: input.inheritedEvidence,
     evidence: input.evidence,
+    stagedMutations: input.stagedMutations,
   };
 }
 
@@ -450,7 +157,7 @@ async function runRuntimeV2Child(input: {
   readonly signal: AbortSignal;
 }): Promise<RuntimeV2ChildResult> {
   const telemetry = input.ports.live.childTelemetry.get(input.job.id);
-  const tools = childTools(input.job);
+  const tools = runtimeV2ChildTools(input.job);
   const aggregate = aggregateForCurrentTurn(input.ports);
   const context = buildRuntimeV2SubagentContextCapsule({
     aggregate,
@@ -466,7 +173,14 @@ async function runRuntimeV2Child(input: {
     runId: input.job.parentRunId,
     childRunId: input.job.run.runId,
     jobId: input.job.id,
+    scopeKey: input.job.scopeKey,
     taskKind: input.job.taskKind || "explore",
+    accessMode: input.job.accessMode || "read",
+    implementationOperation: input.job.implementationOperation || null,
+    implementationPlan:
+      input.job.implementationPlan?.slice(0, 2_000) || null,
+    objective: input.job.objective.slice(0, 1_000),
+    allowedPaths: input.job.allowedPaths,
     parentContextChars: context.length,
     inheritedContext: context.length > 0,
   });
@@ -476,18 +190,31 @@ async function runRuntimeV2Child(input: {
   const messages: AgentMessage[] = [{
     role: "system",
     content: [
-      "You are a read-only child of the current MAIN turn.",
+      input.job.taskKind === "implement"
+        ? "You are a transaction-scoped implementation child of the current MAIN turn."
+        : "You are a read-only child of the current MAIN turn.",
       `Task kind: ${input.job.taskKind || "explore"}`,
-      `Role: ${input.job.role || "read-only reviewer"}`,
+      `Access mode: ${input.job.accessMode || "read"}`,
+      `Role: ${input.job.role || (input.job.taskKind === "implement" ? "implementation owner" : "read-only reviewer")}`,
       `Allowed paths: ${input.job.allowedPaths.join(", ")}`,
+      input.job.implementationOperation
+        ? `Implementation operation: ${input.job.implementationOperation}`
+        : "",
+      input.job.implementationPlan
+        ? `Parent implementation plan: ${input.job.implementationPlan}`
+        : "",
       input.job.successCriteria
         ? `Success criteria: ${input.job.successCriteria}`
         : "",
-      "The parent is the only writer. Never request or simulate file changes.",
+      input.job.taskKind === "implement"
+        ? "You may submit exactly one provided mutation tool call matching the assigned operation and exclusive paths. Runtime stages it without changing the live workspace; after CHILD_MUTATION_STAGED, cite its evidence id and conclude. Do not broaden or redesign the parent plan."
+        : "This child is read-only. Never request or simulate file changes.",
       "Use the parent context as current context; do not reread an unchanged fact merely to reconstruct the task.",
       input.job.taskKind === "validate"
         ? "You may use the provided finite validation tools. Your result is advisory until the parent validates the final mutation."
-        : "Use only the provided read/search tools.",
+        : input.job.taskKind === "implement"
+          ? "Use the provided read/search tools only for the assigned source, then stage one coherent mutation transaction. Final project validation remains the parent's responsibility."
+          : "Use only the provided read/search tools.",
       "When the bounded task is answered, return one concise final summary in ordinary text. Name every exact evidence id that supports the summary; uncited context cannot be adopted. There is no report tool.",
       input.ports.context.workspaceInstructionContext
         ? [
@@ -503,6 +230,15 @@ async function runRuntimeV2Child(input: {
   }];
   const inheritedEvidence = inheritedReviewEvidence(input.ports, input.job);
   const evidence: RuntimeV2EvidenceReference[] = [];
+  const stagedMutations: RuntimeV2StagedChildMutation[] = [];
+  const observedTargets = new Set(
+    runtimeV2SubagentInheritedSourceTargets({
+      messages: input.ports.live.messages,
+      effectFacts: deriveRuntimeV2ProviderEffectFacts(aggregate),
+      workspace: input.ports.context.runWorkspace || "",
+      allowedPaths: input.job.allowedPaths,
+    }).map(normalizedRuntimeV2SubagentPath),
+  );
   const fingerprints = new Set(
     inheritedEvidence.map((item) =>
       `${item.kind}:${item.target}:${item.version || "unversioned"}`
@@ -511,14 +247,16 @@ async function runRuntimeV2Child(input: {
   let ordinal = 0;
   let recoveryLease: RuntimeV2ChildRecoveryStallLease | null = null;
   let recoveryStalled = false;
+  const rejectedClosedActionIdentities = new Set<string>();
+  const rejectedClosedObservationFingerprints = new Set<string>();
   try {
     while (!input.signal.aborted && Date.now() < deadlineAt) {
       let result: RuntimeV2NormalizedProviderResult;
       try {
-        result = await requestChildStep({
+        result = await requestRuntimeV2ChildStep({
           ...input,
           messages,
-          tools,
+          tools: stagedMutations.length > 0 ? [] : tools,
           deadlineAt,
           recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
@@ -537,6 +275,7 @@ async function runRuntimeV2Child(input: {
           summary: result.visibleText || "",
           inheritedEvidence,
           evidence,
+          stagedMutations,
         });
       }
       const acceptedCalls = boundRuntimeV2ChildToolCalls(
@@ -546,6 +285,13 @@ async function runRuntimeV2Child(input: {
       const acceptedCallIds = new Set(
         acceptedCalls.map((call) => call.id),
       );
+      const closedActionLoopDetected =
+        runtimeV2ChildClosedActionLoopDetected({
+          calls,
+          acceptedCallIds,
+          previouslyRejectedIdentities:
+            rejectedClosedActionIdentities,
+        });
       messages.push({
         role: "assistant",
         content: result.visibleText || "",
@@ -560,8 +306,12 @@ async function runRuntimeV2Child(input: {
       });
       const parallelReadCount = runtimeV2ParallelReadCount(calls);
       let progressed = false;
+      let closedObservationLoopDetected = false;
       for (const call of calls) {
         if (!acceptedCallIds.has(call.id)) {
+          rejectedClosedActionIdentities.add(
+            runtimeV2ProviderToolCallIdentity(call),
+          );
           messages.push({
             role: "tool",
             tool_call_id: call.id,
@@ -582,6 +332,67 @@ async function runRuntimeV2Child(input: {
             content:
               "TOOL_BLOCKED: this action is outside the child's read-only scope. Choose an allowed bounded action or conclude from inherited evidence.",
           });
+          continue;
+        }
+        if (MUTATION_CHILD_TOOL_NAMES.has(call.name)) {
+          if (stagedMutations.length > 0) {
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content:
+                "CHILD_MUTATION_REJECTED: this implementation child already staged its one transaction. Cite the retained evidence id and conclude.",
+            });
+            continue;
+          }
+          const evidenceId = `child:${input.job.id}:E${++ordinal}`;
+          const stage = await stageRuntimeV2ChildMutation({
+            ports: input.ports,
+            job: input.job,
+            call,
+            observedTargets,
+            evidenceId,
+          });
+          if (!stage.allowed || !stage.staged) {
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: stage.message,
+            });
+            continue;
+          }
+          stagedMutations.push(stage.staged);
+          const stagedEvidence: RuntimeV2EvidenceReference = {
+            id: evidenceId,
+            kind: "subagent",
+            target: stage.staged.targets.join(", "),
+            version: `staged:${runtimeV2EvidenceVersion(JSON.stringify({
+              toolName: stage.staged.toolName,
+              targets: stage.staged.targets,
+              baseVersions: stage.staged.baseVersions,
+            }))}`,
+          };
+          evidence.push(stagedEvidence);
+          fingerprints.add(
+            `${stagedEvidence.kind}:${stagedEvidence.target}:${stagedEvidence.version}`,
+          );
+          progressed = true;
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: stage.message,
+          });
+          input.ports.logStoreEvent(
+            "runtime_v2_subagent_mutation_staged",
+            {
+              turnId: input.job.run.turnId,
+              runId: input.job.run.runId,
+              jobId: input.job.id,
+              evidenceId,
+              operation: input.job.implementationOperation,
+              toolName: stage.staged.toolName,
+              targets: stage.staged.targets,
+            },
+          );
           continue;
         }
         try {
@@ -617,7 +428,20 @@ async function runRuntimeV2Child(input: {
             : runtimeV2EvidenceVersion(output);
           const fingerprint =
             `subagent:${target}:${version || "unversioned"}`;
+          if (call.name === "read_file") {
+            observedTargets.add(normalizedRuntimeV2SubagentPath(target));
+          }
           const isNewEvidence = !fingerprints.has(fingerprint);
+          if (
+            runtimeV2ChildClosedObservationLoopDetected({
+              fingerprint,
+              isNewEvidence,
+              previouslyRejectedFingerprints:
+                rejectedClosedObservationFingerprints,
+            })
+          ) {
+            closedObservationLoopDetected = true;
+          }
           const childEvidence: RuntimeV2EvidenceReference | null =
             isNewEvidence
               ? {
@@ -629,6 +453,7 @@ async function runRuntimeV2Child(input: {
               : null;
           if (childEvidence) {
             progressed = true;
+            rejectedClosedObservationFingerprints.clear();
             fingerprints.add(fingerprint);
             evidence.push(childEvidence);
             input.ports.logStoreEvent(
@@ -642,6 +467,8 @@ async function runRuntimeV2Child(input: {
                 validationPassed: isValidation ? passed : null,
               },
             );
+          } else {
+            rejectedClosedObservationFingerprints.add(fingerprint);
           }
           messages.push({
             role: "tool",
@@ -654,7 +481,12 @@ async function runRuntimeV2Child(input: {
               isValidation
                 ? `VALIDATION_PASSED: ${passed}`
                 : "",
-              output,
+              childEvidence
+                ? output
+                : [
+                    `VERSION: ${version || "unversioned"}`,
+                    "The unchanged result is already retained in this child context; use it or conclude instead of rereading it.",
+                  ].join("\n"),
             ].filter(Boolean).join("\n"),
           });
         } catch (error) {
@@ -666,6 +498,25 @@ async function runRuntimeV2Child(input: {
             }`,
           });
         }
+      }
+      if (closedActionLoopDetected || closedObservationLoopDetected) {
+        recoveryStalled = true;
+        input.ports.logStoreEvent(
+          closedObservationLoopDetected
+            ? "runtime_v2_subagent_closed_observation_loop"
+            : "runtime_v2_subagent_closed_action_loop",
+          {
+            turnId: input.job.run.turnId,
+            runId: input.job.run.runId,
+            jobId: input.job.id,
+            actionIdentities: calls.map(
+              runtimeV2ProviderToolCallIdentity,
+            ),
+            closedObservationLoopDetected,
+            evidenceCount: evidence.length,
+          },
+        );
+        break;
       }
       recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
         current: recoveryLease,
@@ -693,8 +544,11 @@ async function runRuntimeV2Child(input: {
       }
     }
   } catch {
-    const canceled = input.signal.aborted &&
-      !(input.signal.reason instanceof RuntimeV2ChildDeadlineError);
+    const deadlineExceeded = runtimeV2ChildDeadlineExceeded({
+      signal: input.signal,
+      deadlineAt,
+    });
+    const canceled = input.signal.aborted && !deadlineExceeded;
     const status = canceled
       ? "canceled"
       : evidence.length > 0
@@ -707,9 +561,7 @@ async function runRuntimeV2Child(input: {
       summary: runtimeV2SubagentFailureSummary({
         canceled,
         recoveryStalled,
-        deadlineExceeded:
-          input.signal.reason instanceof RuntimeV2ChildDeadlineError ||
-          Date.now() >= deadlineAt,
+        deadlineExceeded,
         evidence,
       }),
       report: null,
@@ -717,8 +569,11 @@ async function runRuntimeV2Child(input: {
       evidence,
     };
   }
-  const canceled = input.signal.aborted &&
-    !(input.signal.reason instanceof RuntimeV2ChildDeadlineError);
+  const deadlineExceeded = runtimeV2ChildDeadlineExceeded({
+    signal: input.signal,
+    deadlineAt,
+  });
+  const canceled = input.signal.aborted && !deadlineExceeded;
   const status = canceled
     ? "canceled"
     : evidence.length > 0
@@ -731,7 +586,7 @@ async function runRuntimeV2Child(input: {
     summary: runtimeV2SubagentFailureSummary({
       canceled,
       recoveryStalled,
-      deadlineExceeded: !canceled && !recoveryStalled,
+      deadlineExceeded,
       evidence,
     }),
     report: null,
@@ -740,7 +595,7 @@ async function runRuntimeV2Child(input: {
   };
 }
 
-export async function startRuntimeV2ReadOnlyChild(
+export async function startRuntimeV2Child(
   input: RuntimeV2ExecutionPortsInput,
   job: RuntimeV2SubagentJob,
   parentSignal: AbortSignal,
@@ -772,3 +627,6 @@ export async function startRuntimeV2ReadOnlyChild(
     input.live.childAbortControllers.delete(job.id);
   }
 }
+
+/** Compatibility alias for callers persisted before implement/write jobs. */
+export const startRuntimeV2ReadOnlyChild = startRuntimeV2Child;

@@ -47,6 +47,8 @@ export interface RuntimeV2DecisionInput {
     | "preferred";
   /** Provider-lane capacity after reserving one request for the parent. */
   readonly subagentCapacity?: number;
+  /** Whether the admitted parent/child provider requests can really overlap. */
+  readonly subagentRequestMode?: "parallel" | "serialized";
 }
 
 function commaSeparatedValues(value: unknown): string[] {
@@ -56,6 +58,34 @@ function commaSeparatedValues(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function currentRunSubagents(state: TurnAggregateV1) {
+  const parentRunId = state.run?.identity.runId;
+  return parentRunId
+    ? state.subagents.filter((job) => job.parentRunId === parentRunId)
+    : [];
+}
+
+function admittedMaxChildRuns(
+  state: TurnAggregateV1,
+  currentCapacity: number,
+): number {
+  const currentRunId = state.run?.identity.runId;
+  for (const event of state.events) {
+    if (
+      event.type !== "command.scheduled" ||
+      event.command.kind !== "request_model" ||
+      event.command.run.runId !== currentRunId
+    ) {
+      continue;
+    }
+    const admitted = Number(event.command.payload.maxChildRuns);
+    if (Number.isSafeInteger(admitted) && admitted >= 0) {
+      return admitted;
+    }
+  }
+  return currentCapacity;
+}
+
 function collaborationPayload(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput,
@@ -63,18 +93,24 @@ function collaborationPayload(
   const collaborationAllowed =
     input.subagentPreference === "allowed" ||
     input.subagentPreference === "preferred";
-  const maxActiveSubagents = Math.max(
+  const currentCapacity = Math.max(
     0,
     Math.floor(Number(input.subagentCapacity) || 0),
   );
-  const activeSubagents = state.subagents
+  // Adaptive lane probing may discover more concurrency during a Run. Freeze
+  // the total child budget in the first durable provider request so that new
+  // capacity cannot turn one parent objective into an unbounded spawn loop.
+  const maxChildRuns = admittedMaxChildRuns(state, currentCapacity);
+  const maxActiveSubagents = Math.min(currentCapacity, maxChildRuns);
+  const runSubagents = currentRunSubagents(state);
+  const activeSubagents = runSubagents
     .filter((job) => job.status === "queued" || job.status === "running")
     .map((job) => ({
       id: runtimeV2SubagentModelHandle(job),
       name: job.name || job.scopeKey,
       objective: job.objective,
     }));
-  const failedSubagents = state.subagents
+  const failedSubagents = runSubagents
     .filter((job) =>
       job.status === "failed" || job.status === "degraded"
     )
@@ -90,6 +126,9 @@ function collaborationPayload(
     collaborationAllowed,
     collaborationPreferred:
       input.subagentPreference === "preferred",
+    collaborationRequestMode:
+      input.subagentRequestMode ||
+      (currentCapacity > 0 ? "parallel" : "serialized"),
     collaborationAction:
       activeSubagents.length > 0
         ? "children_active"
@@ -97,9 +136,13 @@ function collaborationPayload(
     activeSubagents,
     failedSubagents,
     maxActiveSubagents,
+    maxChildRuns,
     remainingSubagentCapacity: Math.max(
       0,
-      maxActiveSubagents - activeSubagents.length,
+      Math.min(
+        maxActiveSubagents - activeSubagents.length,
+        maxChildRuns - runSubagents.length,
+      ),
     ),
   };
 }
@@ -213,6 +256,61 @@ function providerRequestCommandKeys(
   ));
 }
 
+function providerRequestModesByCommandKey(
+  events: readonly RuntimeV2Event[],
+): ReadonlyMap<string, string> {
+  return new Map(events.flatMap((event) =>
+    event.type === "command.scheduled" &&
+      event.command.kind === "request_model"
+      ? [[
+          event.command.idempotencyKey,
+          String(event.command.payload.mode || "").trim(),
+        ] as const]
+      : []
+  ));
+}
+
+function providerToolCallProgress(
+  events: readonly RuntimeV2Event[],
+): {
+  readonly progressed: ReadonlySet<string>;
+  readonly settledWithoutProgress: ReadonlySet<string>;
+} {
+  const toolCallIdByCommandKey = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "command.scheduled") continue;
+    const toolCallId = String(event.command.payload.toolCallId || "").trim();
+    if (toolCallId) {
+      toolCallIdByCommandKey.set(event.command.idempotencyKey, toolCallId);
+    }
+  }
+  const progressed = new Set<string>();
+  const settledWithoutProgress = new Set<string>();
+  for (const event of events) {
+    if (event.type === "tool.completed") {
+      const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
+      if (!toolCallId) continue;
+      if (event.status === "succeeded") progressed.add(toolCallId);
+      else settledWithoutProgress.add(toolCallId);
+      continue;
+    }
+    if (event.type !== "validation.completed") continue;
+    const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
+    if (!toolCallId) continue;
+    if (
+      event.passed ||
+      event.failureKind === "assertion_failed" ||
+      event.failureKind === "execution_failed" ||
+      !event.failureKind
+    ) {
+      progressed.add(toolCallId);
+    } else {
+      settledWithoutProgress.add(toolCallId);
+    }
+  }
+  return { progressed, settledWithoutProgress };
+}
+
 /**
  * Derive one bounded recovery fact from the canonical ledger. The count is not
  * a completion or authorization rule: it selects a materially different next
@@ -223,6 +321,8 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
 ): RuntimeV2ProviderRecoveryWindow | null {
   if (state.pendingToolCalls.length > 0) return null;
   const providerRequestKeys = providerRequestCommandKeys(state.events);
+  const providerRequestModes = providerRequestModesByCommandKey(state.events);
+  const toolCallProgress = providerToolCallProgress(state.events);
   let occurrence = 0;
   let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
   let startedAt = 0;
@@ -230,12 +330,21 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
     const event = state.events[index]!;
     if (event.type === "provider.responded") {
+      const requestMode = providerRequestModes.get(event.idempotencyKey) || "";
+      const executableProgressRequired =
+        requestMode === "execute" || requestMode === "validate";
       const repeated = event.result.diagnostics.some((diagnostic) =>
         diagnostic.code === "repeated_action_rejected"
       );
+      const failedToolDecision = event.result.toolCalls.length > 0 &&
+        event.result.toolCalls.every((call) =>
+          toolCallProgress.settledWithoutProgress.has(call.id) &&
+          !toolCallProgress.progressed.has(call.id)
+        );
       const nonActionable =
-        event.result.toolCalls.length === 0 &&
+        (event.result.toolCalls.length === 0 || failedToolDecision) &&
         (
+          executableProgressRequired ||
           event.result.diagnostics.length > 0 ||
           !String(event.result.visibleText || "").trim()
         );
@@ -259,10 +368,23 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       latestReason ||= "provider_request_failed";
       continue;
     }
+    if (event.type === "tool.completed") {
+      if (event.status === "succeeded") break;
+      continue;
+    }
+    if (event.type === "validation.completed") {
+      if (
+        event.passed ||
+        event.failureKind === "assertion_failed" ||
+        event.failureKind === "execution_failed" ||
+        !event.failureKind
+      ) {
+        break;
+      }
+      continue;
+    }
     if (
       event.type === "observation.recorded" ||
-      event.type === "tool.completed" ||
-      event.type === "validation.completed" ||
       event.type === "work_plan.sealed" ||
       event.type === "work_plan.approved" ||
       event.type === "work_plan.invalidated" ||
@@ -316,6 +438,16 @@ export function deriveRuntimeV2EffectPressure(
   let latestSourceEvidenceId = "";
 
   for (const event of state.events) {
+    if (
+      event.type === "subagent.completed" &&
+      event.status === "completed" &&
+      event.evidence.some((evidence) => evidence.kind === "mutation")
+    ) {
+      mutationBoundarySequence = event.sequence;
+      sourceBoundarySequence = 0;
+      latestSourceEvidenceId = "";
+      continue;
+    }
     if (
       event.type !== "tool.completed" ||
       event.status !== "succeeded"
@@ -392,7 +524,7 @@ export function decideNextCommands(
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
   if (input.resultKind && input.resultReason) {
-    const activeJobIds = state.subagents
+    const activeJobIds = currentRunSubagents(state)
       .filter((job) => job.status === "queued" || job.status === "running")
       .map((job) => job.id);
     if (activeJobIds.length > 0) {
@@ -411,7 +543,7 @@ export function decideNextCommands(
     })];
   }
   if (state.recovery.exhausted) {
-    const activeJobIds = state.subagents
+    const activeJobIds = currentRunSubagents(state)
       .filter((job) => job.status === "queued" || job.status === "running")
       .map((job) => job.id);
     if (activeJobIds.length > 0) {
@@ -431,13 +563,14 @@ export function decideNextCommands(
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
     if (toolCall.name === "spawn_subagent") {
+      const collaboration = collaborationPayload(state, input);
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
-        maxActiveSubagents: Math.max(
-          0,
-          Math.floor(Number(input.subagentCapacity) || 0),
-        ),
+        maxActiveSubagents: collaboration.maxActiveSubagents,
+        maxChildRuns: collaboration.maxChildRuns,
+        collaborationRequestMode:
+          collaboration.collaborationRequestMode,
       })];
     }
     if (toolCall.name === "wait_subagents") {
@@ -445,7 +578,7 @@ export function decideNextCommands(
         ...commaSeparatedValues(toolCall.arguments.subagent_ids),
         ...commaSeparatedValues(toolCall.arguments.collaboration_task_ids),
       ];
-      const activeJobs = state.subagents
+      const activeJobs = currentRunSubagents(state)
         .filter((job) => job.status === "queued" || job.status === "running")
       const resolution = resolveRuntimeV2SubagentReferences({
         jobs: activeJobs,
@@ -509,10 +642,15 @@ export function decideNextCommands(
           ),
         )
       : toolCall.arguments;
+    const collaboration = collaborationPayload(state, input);
     const command = boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
       arguments: executionArguments,
+      collaborationPreferred: collaboration.collaborationPreferred,
+      collaborationAction: collaboration.collaborationAction,
+      maxActiveSubagents: collaboration.maxActiveSubagents,
+      maxChildRuns: collaboration.maxChildRuns,
       ...(validationAuthority ? { validationAuthority } : {}),
     });
     return [command];

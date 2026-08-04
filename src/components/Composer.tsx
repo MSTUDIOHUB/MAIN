@@ -368,11 +368,11 @@ export default function Composer({
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
   const subagentPreferenceTitle = language === "en"
     ? preferSubagents
-      ? "Collaboration is enabled. MAIN may delegate up to two independent read-only tasks when useful; the parent continues working and owns every file change and final validation."
-      : "Allow collaboration for the next turn. MAIN may delegate independent read-only investigation, review, or validation work when it is useful."
+      ? "Collaboration is enabled. MAIN may delegate independent investigation, review, validation, or explicitly planned non-overlapping implementation at any useful stage; delegation is never mandatory."
+      : "Allow adaptive collaboration for the next turn, including scoped investigation and planned non-overlapping implementation when useful."
     : preferSubagents
-      ? "协作已开启：MAIN 可在确有独立工作时委派最多两个只读子任务；主体继续推进，并独占文件修改与最终验收。"
-      : "允许下一轮按需协作；MAIN 可在适合时委派独立的只读调查、评审或验证任务。";
+      ? "协作已开启：MAIN 可在任一适合阶段按需委派独立调查、评审、验证或方案明确且范围互斥的实现任务；绝不强制启动。"
+      : "允许下一轮自适应协作，包括范围明确的调查及方案明确、互不重叠的实现任务。";
   const subagentPreferenceLockedTitle = language === "en"
     ? "Subagent collaboration is captured for the current run and can be changed after it stops."
     : "本轮已捕获子智能体协作设置，执行停止后才能更改。";

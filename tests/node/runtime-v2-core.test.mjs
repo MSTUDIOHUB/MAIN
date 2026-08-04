@@ -113,6 +113,71 @@ test("provider normalization accepts explicit compatibility tool markers only", 
   assert.deepEqual(prose.toolCalls, []);
 });
 
+test("a sole named required tool recovers only exact schema-complete JSON arguments", () => {
+  const requiredSingleTool = {
+    type: "function",
+    function: {
+      name: "record_fixture_contract",
+      description: "Record a fixture contract.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          changes: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              properties: {
+                target: { type: "string" },
+                operation: {
+                  type: "string",
+                  enum: ["modify", "preserve"],
+                },
+              },
+              required: ["target", "operation"],
+            },
+          },
+        },
+        required: ["summary", "changes"],
+      },
+    },
+  };
+  const exact = runtime.normalizeProviderResponseV1({
+    content: JSON.stringify({
+      summary: "Repair the proved owner.",
+      changes: [{ target: "src/main.js", operation: "modify" }],
+    }),
+    toolCalls: [],
+    requiredSingleTool,
+  });
+  assert.equal(exact.toolCalls.length, 1);
+  assert.equal(exact.toolCalls[0].name, "record_fixture_contract");
+  assert.deepEqual(exact.toolCalls[0].arguments, {
+    summary: "Repair the proved owner.",
+    changes: [{ target: "src/main.js", operation: "modify" }],
+  });
+  assert.equal(exact.visibleText, undefined);
+  assert.equal(
+    exact.diagnostics[0]?.code,
+    "required_single_tool_json_normalized",
+  );
+
+  for (const content of [
+    'Here is the contract: {"summary":"x","changes":[]}',
+    '{"summary":"x","changes":[]}',
+    '{"summary":"x","changes":[{"target":"src/main.js","operation":"delete"}]}',
+    '{"summary":"x","changes":[{"target":"src/main.js","operation":"modify","extra":true}]}',
+  ]) {
+    const rejected = runtime.normalizeProviderResponseV1({
+      content,
+      toolCalls: [],
+      requiredSingleTool,
+    });
+    assert.deepEqual(rejected.toolCalls, [], content);
+  }
+});
+
 let eventCounter = 0;
 function event(state, type, fields = {}) {
   return {
@@ -817,7 +882,108 @@ test("failed acceptance remains loop evidence and returns validation to acting",
   });
 });
 
-test("a rejected corrective mutation returns to an earlier unvalidated mutation boundary", () => {
+test("identical acceptance failures remain stalled across successful mutations", () => {
+  const classifier = {
+    isMutationToolName: (name) => name === "apply_patch",
+  };
+  let state = aggregateWithValidation("npm test", false);
+
+  const appendFailedCycle = (attempt) => {
+    state = runtime.transition(state, event(state, "phase.changed", {
+      run: baseRun,
+      phase: "acting",
+      reason: "validation failed",
+    }));
+    state = commitMutation(
+      state,
+      `stalled-mutation-${attempt}`,
+      "src/main.js",
+    );
+    state = runtime.transition(state, event(state, "phase.changed", {
+      run: baseRun,
+      phase: "validating",
+      reason: "mutation committed",
+    }));
+    const validation = commandFor(
+      state,
+      "execute_validation",
+      `stalled-validation-${attempt}`,
+      {
+        toolCallId: `stalled-validation-call-${attempt}`,
+        toolName: "run_command",
+        arguments: { command: "npm test", cwd: "." },
+      },
+    );
+    state = schedule(state, validation);
+    state = runtime.transition(state, event(state, "validation.completed", {
+      run: baseRun,
+      idempotencyKey: validation.idempotencyKey,
+      passed: false,
+      failureKind: "assertion_failed",
+      evidence: [{
+        id: `stalled-validation-evidence-${attempt}`,
+        kind: "validation",
+        target: "npm test",
+        version: "failed",
+      }],
+      presentation: { toolName: "run_command", target: "npm test" },
+    }));
+  };
+
+  appendFailedCycle(2);
+  appendFailedCycle(3);
+  const stalled = runtime.summarizeRuntimeV2ExecuteEvidence(
+    state,
+    classifier,
+  );
+  assert.equal(stalled.failedValidationCount, 3);
+  assert.equal(stalled.stalledValidationCount, 3);
+  assert.equal(runtime.RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT, 3);
+
+  state = runtime.transition(state, event(state, "phase.changed", {
+    run: baseRun,
+    phase: "acting",
+    reason: "validation failed",
+  }));
+  state = commitMutation(state, "progress-mutation", "src/main.js");
+  state = runtime.transition(state, event(state, "phase.changed", {
+    run: baseRun,
+    phase: "validating",
+    reason: "mutation committed",
+  }));
+  const changedValidation = commandFor(
+    state,
+    "execute_validation",
+    "changed-validation",
+    {
+      toolCallId: "changed-validation-call",
+      toolName: "run_command",
+      arguments: { command: "npm test", cwd: "." },
+    },
+  );
+  state = schedule(state, changedValidation);
+  state = runtime.transition(state, event(state, "validation.completed", {
+    run: baseRun,
+    idempotencyKey: changedValidation.idempotencyKey,
+    passed: false,
+    failureKind: "assertion_failed",
+    evidence: [{
+      id: "changed-validation-evidence",
+      kind: "validation",
+      target: "npm test",
+      version: "different-failure",
+    }],
+    presentation: { toolName: "run_command", target: "npm test" },
+  }));
+  assert.equal(
+    runtime.summarizeRuntimeV2ExecuteEvidence(state, classifier)
+      .stalledValidationCount,
+    1,
+    "a materially changed validation result resets the consecutive stall count",
+  );
+});
+
+test("a rejected corrective mutation truthfully returns to an earlier unvalidated mutation boundary", () => {
   const classifier = {
     isMutationToolName: (name) => name === "apply_patch",
   };
@@ -861,7 +1027,7 @@ test("a rejected corrective mutation returns to an earlier unvalidated mutation 
     {
       from: "acting",
       to: "validating",
-      reason: "mutation_committed",
+      reason: "unvalidated_mutation_pending",
     },
   );
 });
@@ -1023,6 +1189,137 @@ test("a duplicate-action adapter diagnostic is not a provider conclusion", () =>
   assert.equal(runtime.latestRuntimeV2ProviderConclusionText(state), "");
 });
 
+test("a rejected parent repeat keeps the parent recovery action on its own lane", () => {
+  let state = executeAggregate();
+  const child = {
+    id: "child-active-during-parent-repeat",
+    run: {
+      ...baseRun,
+      runId: "child-active-during-parent-repeat-run",
+      parentRunId: baseRun.runId,
+    },
+    parentRunId: baseRun.runId,
+    scopeKey: "inspect-toolbar",
+    taskKind: "review",
+    objective: "Inspect the toolbar failure.",
+    allowedPaths: ["src/components/toolbar.js"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+    report: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    maxActiveSubagents: 1,
+    jobs: [child],
+  }));
+  state = providerResult(state, {
+    diagnostics: [{
+      code: "repeated_action_rejected",
+      message: "already_completed:read_file:closed-parent-action",
+      retryable: true,
+    }],
+  });
+
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.equal(
+    next.payload.recoveryPressure.reason,
+    "repeated_action_rejected",
+  );
+  assert.deepEqual(
+    next.payload.activeSubagents.map((entry) => entry.id),
+    ["inspect-toolbar"],
+  );
+  assert.equal(next.payload.remainingSubagentCapacity, 0);
+});
+
+test("collaboration admission and budgets ignore children from a previous parent Run", () => {
+  let state = executeAggregate();
+  const previousRun = {
+    ...baseRun,
+    runId: "run-previous",
+    attemptId: "attempt-previous",
+  };
+  const previousChild = {
+    id: "child-from-previous-run",
+    run: {
+      ...previousRun,
+      runId: "child-from-previous-run-id",
+      parentRunId: previousRun.runId,
+    },
+    parentRunId: previousRun.runId,
+    scopeKey: "previous-review",
+    taskKind: "review",
+    objective: "Review the previous Run.",
+    allowedPaths: ["src/previous.js"],
+    status: "completed",
+    requestedAt: 1,
+    firstTokenAt: 2,
+    closedAt: 3,
+    summary: "Previous Run finished.",
+    report: null,
+  };
+  const previousRequest = {
+    ...commandFor(state, "request_model", "previous-request", {
+      mode: "execute",
+      maxChildRuns: 0,
+    }),
+    run: previousRun,
+  };
+  state = {
+    ...state,
+    subagents: [previousChild],
+    events: [...state.events, {
+      ...event(state, "command.scheduled", {
+        run: previousRun,
+        command: previousRequest,
+      }),
+    }],
+  };
+
+  const next = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 2,
+  })[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.maxChildRuns, 2);
+  assert.equal(next.payload.collaborationAction, "optional");
+  assert.deepEqual(next.payload.activeSubagents, []);
+  assert.deepEqual(next.payload.failedSubagents, []);
+  assert.equal(next.payload.remainingSubagentCapacity, 2);
+
+  const currentChild = {
+    ...previousChild,
+    id: "child-from-current-run",
+    run: {
+      ...baseRun,
+      runId: "child-from-current-run-id",
+      parentRunId: baseRun.runId,
+    },
+    parentRunId: baseRun.runId,
+    scopeKey: "current-review",
+    objective: "Review the current Run.",
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+  };
+  const scheduled = runtime.tryTransition(
+    state,
+    event(state, "subagents.scheduled", {
+      run: baseRun,
+      maxActiveSubagents: 1,
+      jobs: [currentChild],
+    }),
+  );
+  assert.equal(scheduled.disposition, "applied");
+});
+
 test("preferred collaboration remains available after a failed child", () => {
   let state = executeAggregate();
   let next = runtime.decideNextCommands(state, {
@@ -1064,8 +1361,113 @@ test("preferred collaboration remains available after a failed child", () => {
   })[0];
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.collaborationAction, "optional");
-  assert.equal(next.payload.remainingSubagentCapacity, 2);
+  assert.equal(next.payload.remainingSubagentCapacity, 1);
   assert.equal(next.payload.failedSubagents[0].id, "review-main");
+
+  state = {
+    ...state,
+    subagents: [...state.subagents, {
+      ...failedJob,
+      id: "child-failed-second",
+      run: {
+        ...failedJob.run,
+        runId: "child-run-second",
+      },
+      scopeKey: "review-toolbar",
+      name: "review-toolbar",
+    }],
+  };
+  next = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 2,
+  })[0];
+  assert.equal(next.payload.remainingSubagentCapacity, 0);
+});
+
+test("enabled collaboration never gates the first mutation", () => {
+  let state = executeAggregate();
+  const request = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 2,
+  })[0];
+  assert.equal(request.kind, "request_model");
+  assert.equal(
+    request.payload.collaborationAction,
+    "optional",
+  );
+  state = schedule(state, request);
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: request.idempotencyKey,
+    result: {
+      visibleText: "",
+      toolCalls: [{
+        id: "patch-before-child",
+        name: "apply_patch",
+        arguments: {
+          patch:
+            "*** Begin Patch\n*** Update File: src/main.js\n@@\n-old\n+new\n*** End Patch",
+        },
+      }],
+      diagnostics: [],
+    },
+  }));
+
+  const mutation = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 2,
+  })[0];
+  assert.equal(mutation.kind, "execute_tool");
+  assert.equal(mutation.payload.collaborationPreferred, true);
+  assert.equal(mutation.payload.maxActiveSubagents, 2);
+});
+
+test("a Run freezes its total child budget before adaptive lane capacity grows", () => {
+  let state = executeAggregate();
+  const firstRequest = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 1,
+  })[0];
+  assert.equal(firstRequest.payload.maxChildRuns, 1);
+  state = schedule(state, firstRequest);
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: firstRequest.idempotencyKey,
+    result: {
+      visibleText: "",
+      toolCalls: [{
+        id: "read-before-capacity-growth",
+        name: "read_file",
+        arguments: { path: "src/main.js" },
+      }],
+      diagnostics: [],
+    },
+  }));
+  const readCommand = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 3,
+  })[0];
+  state = schedule(state, readCommand);
+  state = runtime.transition(state, event(state, "tool.completed", {
+    run: baseRun,
+    idempotencyKey: readCommand.idempotencyKey,
+    status: "succeeded",
+    evidence: [{
+      id: "source-after-capacity-growth",
+      kind: "source",
+      target: "src/main.js",
+      version: "sha-main",
+    }],
+  }));
+
+  const nextRequest = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred",
+    subagentCapacity: 3,
+  })[0];
+  assert.equal(nextRequest.kind, "request_model");
+  assert.equal(nextRequest.payload.maxChildRuns, 1);
+  assert.equal(nextRequest.payload.maxActiveSubagents, 1);
+  assert.equal(nextRequest.payload.remainingSubagentCapacity, 1);
 });
 
 test("a child with evidence but no report degrades without disabling later delegation", () => {
@@ -1126,7 +1528,7 @@ test("a child with evidence but no report degrades without disabling later deleg
   })[0];
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.collaborationAction, "optional");
-  assert.equal(next.payload.remainingSubagentCapacity, 2);
+  assert.equal(next.payload.remainingSubagentCapacity, 1);
   assert.equal(next.payload.failedSubagents[0].id, "review-main");
 
   state = runtime.transition(state, event(
@@ -2099,6 +2501,24 @@ test("a provider admission rejection stays non-executable and drives soft recove
     ),
     true,
   );
+  assert.equal(
+    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
+      next.payload.recoveryPressure,
+    ),
+    false,
+  );
+  const occurrenceLimited = {
+    ...next.payload.recoveryPressure,
+    occurrence:
+      runtime.RUNTIME_V2_PROVIDER_RECOVERY_MAX_CONSECUTIVE_DECISIONS,
+  };
+  assert.equal(
+    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
+      occurrenceLimited,
+    ),
+    true,
+    "only consecutive no-progress decisions are bounded; task duration is not",
+  );
   lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({
     current: lease,
     pressure: null,
@@ -2109,6 +2529,67 @@ test("a provider admission rejection stays non-executable and drives soft recove
     null,
     "a new actionable decision/evidence boundary clears the stall lease instead of imposing a total task duration",
   );
+});
+
+test("failed tool effects remain consecutive provider no-progress decisions", () => {
+  let state = executeAggregate();
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    state = providerResult(state, {
+      toolCalls: [{
+        id: `failed-read-${attempt}`,
+        name: "read_file",
+        arguments: {
+          path: "src/main.js",
+          start_line: attempt,
+          end_line: attempt + 20,
+        },
+      }],
+    });
+    state = executePendingTool(state, {
+      type: "tool.completed",
+      status: "failed",
+      failureKind: "not_authorized",
+      evidence: [],
+    });
+    const pressure = runtime.deriveRuntimeV2ProviderRecoveryPressure(state);
+    assert.equal(pressure?.occurrence, attempt);
+    assert.equal(
+      pressure?.stage,
+      attempt === 1 ? "reconsider" : attempt === 2 ? "reframe" : "alternative",
+    );
+  }
+  assert.equal(
+    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
+      runtime.deriveRuntimeV2ProviderRecoveryPressure(state),
+    ),
+    true,
+    "alternating rejected tool arguments cannot reset the no-progress limit",
+  );
+});
+
+test("prose without a tool is non-actionable while execute or validate debt remains", () => {
+  for (const phase of ["observing", "validating"]) {
+    let state = {
+      ...executeAggregate(),
+      phase,
+    };
+    state = providerResult(state, {
+      visibleText:
+        "I have reviewed the implementation and would continue fixing it.",
+    });
+    const next = runtime.decideNextCommands(state)[0];
+    assert.equal(next.kind, "request_model");
+    assert.deepEqual(next.payload.recoveryPressure, {
+      schemaVersion: "runtime-v2-provider-recovery.v1",
+      reason: "empty_response",
+      occurrence: 1,
+      stage: "reconsider",
+    });
+    assert.equal(
+      next.payload.mode,
+      phase === "validating" ? "validate" : "execute",
+    );
+  }
 });
 
 test("action fingerprints stay fixed-size regardless of tool payload size", () => {

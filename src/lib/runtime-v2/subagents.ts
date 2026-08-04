@@ -11,7 +11,10 @@ export const RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS = 2 * 60_000;
 
 export interface RuntimeV2SubagentScopeCandidate {
   readonly scopeKey: string;
-  readonly taskKind?: "explore" | "review" | "validate";
+  readonly taskKind?: "explore" | "review" | "validate" | "implement";
+  readonly accessMode?: "read" | "write";
+  readonly implementationOperation?: "create" | "modify" | "delete";
+  readonly implementationPlan?: string;
   readonly sourceToolCallId?: string;
   readonly name?: string;
   readonly role?: string;
@@ -51,7 +54,10 @@ export function runtimeV2SubagentModelHandle(
 }
 
 export function runtimeV2SubagentSemanticIdentity(input: {
-  readonly taskKind?: "explore" | "review" | "validate";
+  readonly taskKind?: "explore" | "review" | "validate" | "implement";
+  readonly accessMode?: "read" | "write";
+  readonly implementationOperation?: "create" | "modify" | "delete";
+  readonly implementationPlan?: string;
   readonly name?: string;
   readonly role?: string;
   readonly objective: string;
@@ -60,6 +66,9 @@ export function runtimeV2SubagentSemanticIdentity(input: {
 }): string {
   return JSON.stringify([
     input.taskKind || "explore",
+    input.accessMode || "read",
+    input.implementationOperation || "",
+    normalizedSemanticText(input.implementationPlan, 4_000),
     normalizedSemanticText(input.name, 128),
     normalizedSemanticText(input.role, 128),
     normalizedSemanticText(input.objective, 2_000),
@@ -111,10 +120,10 @@ export function runtimeV2SubagentFailureSummary(input: {
       .filter(Boolean),
   )].slice(0, 8);
   const retained = input.evidence.length > 0
-    ? `已保留 ${input.evidence.length} 条只读证据供父任务接管${
+    ? `已保留 ${input.evidence.length} 条证据供父任务接管${
         targets.length > 0 ? `（${targets.join("、")}）` : ""
       }。`
-    : "没有形成可交接的只读证据。";
+    : "没有形成可交接的证据。";
   if (input.canceled) {
     return `子任务已因父任务取消而停止；没有提交可确认的结构化报告。${retained}`;
   }
@@ -139,7 +148,7 @@ function pathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-export function areReadOnlySubagentScopesDisjoint(
+export function areRuntimeV2SubagentWriteScopesDisjoint(
   left: readonly string[],
   right: readonly string[],
 ): boolean {
@@ -150,13 +159,12 @@ export function areReadOnlySubagentScopesDisjoint(
 }
 
 /**
- * Materialize frozen read-only jobs from provider-authored spawn_subagent
- * calls within the capacity admitted by the provider lane. Completed jobs
- * release capacity. Read-only jobs may intentionally overlap paths because
- * the parent is the only writer; semantic task identity still prevents
- * accidental duplicate delegation.
+ * Materialize frozen jobs from provider-authored spawn_subagent calls within
+ * the capacity admitted by the provider lane. Read-only jobs may overlap.
+ * Write jobs require an explicit implementation contract and exclusive path
+ * ownership against every active or newly admitted write job.
  */
-export function scheduleReadOnlySubagents(input: {
+export function scheduleRuntimeV2Subagents(input: {
   readonly parentRun: RuntimeV2RunIdentity;
   readonly candidates: readonly RuntimeV2SubagentScopeCandidate[];
   readonly existingJobs?: readonly RuntimeV2SubagentJob[];
@@ -191,6 +199,19 @@ export function scheduleReadOnlySubagents(input: {
       !scopeKey ||
       !objective ||
       allowedPaths.length === 0 ||
+      (
+        candidate.accessMode === "write" &&
+        (
+          candidate.taskKind !== "implement" ||
+          !candidate.implementationOperation ||
+          !text(candidate.implementationPlan, 4_000) ||
+          allowedPaths.includes(".")
+        )
+      ) ||
+      (
+        candidate.taskKind === "implement" &&
+        candidate.accessMode !== "write"
+      ) ||
       seenScopeKeys.has(scopeKey) ||
       seenSemanticIdentities.has(semanticIdentity)
     ) {
@@ -205,6 +226,21 @@ export function scheduleReadOnlySubagents(input: {
     ) {
       rejectedScopeKeys.push(scopeKey);
       continue;
+    }
+    if (candidate.accessMode === "write") {
+      const activeWriteJobs = [
+        ...activeExistingJobs,
+        ...jobs,
+      ].filter((job) => job.accessMode === "write");
+      if (activeWriteJobs.some((job) =>
+        !areRuntimeV2SubagentWriteScopesDisjoint(
+          job.allowedPaths,
+          allowedPaths,
+        )
+      )) {
+        rejectedScopeKeys.push(scopeKey);
+        continue;
+      }
     }
     const id = text(input.nextId("runtime-v2-child"), 256);
     if (!id) throw new Error("Runtime v2 scheduler must provide a child job id.");
@@ -224,6 +260,13 @@ export function scheduleReadOnlySubagents(input: {
         : {}),
       scopeKey,
       taskKind: candidate.taskKind || "explore",
+      accessMode: candidate.accessMode || "read",
+      ...(candidate.implementationOperation
+        ? { implementationOperation: candidate.implementationOperation }
+        : {}),
+      ...(text(candidate.implementationPlan, 4_000)
+        ? { implementationPlan: text(candidate.implementationPlan, 4_000) }
+        : {}),
       ...(text(candidate.name, 128)
         ? { name: text(candidate.name, 128) }
         : {}),
@@ -248,6 +291,13 @@ export function scheduleReadOnlySubagents(input: {
   }
   return { jobs, rejectedScopeKeys };
 }
+
+/** Compatibility aliases for persisted integrations written before scoped
+ * implementation jobs were introduced. New runtime code uses the generic
+ * names above. */
+export const areReadOnlySubagentScopesDisjoint =
+  areRuntimeV2SubagentWriteScopesDisjoint;
+export const scheduleReadOnlySubagents = scheduleRuntimeV2Subagents;
 
 export function applyRuntimeV2SubagentTelemetry(
   job: RuntimeV2SubagentJob,

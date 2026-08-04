@@ -2,6 +2,9 @@ import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
 import {
   RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
+import {
+  RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
+} from "./executionContract";
 
 const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "list_directory",
@@ -19,6 +22,7 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "replace_in_file",
   "write_file",
   "apply_patch",
+  "delete_workspace_path",
   "git_status",
   "git_diff",
   "run_command",
@@ -26,11 +30,15 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "get_project_skeleton",
   "spawn_subagent",
   "wait_subagents",
+  "record_execution_contract",
 ]);
 
 export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
   const includeNetwork = state?.webSearchEnabled === true;
-  const builtIns = TOOL_DEFINITIONS.filter((definition) => {
+  const builtIns = [
+    ...TOOL_DEFINITIONS,
+    RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
+  ].filter((definition) => {
     const name = definition.function.name;
     return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
@@ -41,7 +49,7 @@ export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
         function: {
           ...definition.function,
           description:
-            "Create a fresh, read-only, semantically independent explore, review, or validate child whenever it helps the current lifecycle phase. The parent remains the only writer. You—not Runtime—must provide its task_key, task_kind, name, role, objective, and success_criteria. Paths are a permission boundary and may overlap other read-only jobs.",
+            "Create a fresh, semantically independent child when real overlap helps. Explore, review, and validate children are read-only. After deriving a concrete evidence-backed solution, an implement child may stage one create/modify/delete transaction inside an exclusive narrow path scope; Runtime commits it at join. You must provide the task identity, objective, success criteria, and implementation contract.",
           parameters: {
             ...definition.function.parameters,
             properties: {
@@ -60,6 +68,11 @@ export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
                 type: "string",
                 description:
                   "当前调查可判定的成功标准；必填，必须对应真实目标和可返回证据",
+              },
+              implementation_plan: {
+                type: "string",
+                description:
+                  "implement 子任务必填：父线程已经形成的具体修改方案，含责任边界与预期行为；不得使用泛化的‘修复问题’",
               },
             },
             required: [
@@ -81,7 +94,7 @@ export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
         function: {
           ...definition.function,
           description:
-            "Wait for one or all active read-only child tasks only when their result is now a dependency. Omit ids to wait for all, or pass the exact short task_key handles shown in the current parent context. A failed child never blocks the parent from continuing directly.",
+            "Wait for one or all active child tasks only when their evidence or staged implementation is now a dependency. Omit ids to wait for all, or pass exact task_key handles. A failed child never blocks the parent from continuing directly.",
           parameters: {
             ...definition.function.parameters,
             properties: {

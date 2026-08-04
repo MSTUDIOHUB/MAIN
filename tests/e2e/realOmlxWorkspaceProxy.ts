@@ -34,8 +34,10 @@ export interface RealOmlxSourceSyntaxCheckResult {
     readonly line: number;
     readonly column: number;
     readonly kind: string;
+    readonly symbol?: string;
   }>;
   readonly errorsTruncated: boolean;
+  readonly moduleExports: readonly string[];
 }
 
 function collectBindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
@@ -136,6 +138,7 @@ export function checkRealOmlxSourceSyntax(
       firstErrorColumn: null,
       errors: [],
       errorsTruncated: false,
+      moduleExports: [],
     };
   }
 
@@ -158,6 +161,7 @@ export function checkRealOmlxSourceSyntax(
     .map((diagnostic) => ({
       position: Number(diagnostic.start),
       kind: `typescript_${diagnostic.code}`,
+      symbol: undefined as string | undefined,
     }));
   const seenExports = new Set<string>();
   for (const statement of source.statements) {
@@ -166,6 +170,7 @@ export function checkRealOmlxSourceSyntax(
         diagnostics.push({
           position: exported.position,
           kind: "duplicate_export",
+          symbol: exported.name,
         });
       } else {
         seenExports.add(exported.name);
@@ -201,9 +206,11 @@ export function checkRealOmlxSourceSyntax(
         line: position.line + 1,
         column: position.character + 1,
         kind: diagnostic.kind,
+        ...(diagnostic.symbol ? { symbol: diagnostic.symbol } : {}),
       };
     }),
     errorsTruncated: uniqueDiagnostics.length > 32,
+    moduleExports: [...seenExports],
   };
 }
 

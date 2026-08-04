@@ -259,8 +259,10 @@ test("real OMLX syntax checks preserve duplicate module-export safety", () => {
     line: 2,
     column: 17,
     kind: "duplicate_export",
+    symbol: "updateTheme",
   }]);
   assert.equal(checked.errorsTruncated, false);
+  assert.deepEqual(checked.moduleExports, ["updateTheme"]);
 });
 
 test("real OMLX debug entries retain structured identity while bounding message size", () => {

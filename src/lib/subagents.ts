@@ -474,6 +474,9 @@ export interface SubagentCapacityPolicy {
   /** Highest simultaneous first-token overlap confirmed for this lane. */
   confirmedTotalRequests: number;
   capacitySource: "configured" | "observed" | "probing";
+  /** Whether parent and child provider requests can actually overlap. */
+  modelRequestMode: "parallel" | "serialized";
+  /** Child-request capacity after reserving the parent request. */
   maxActiveRequests: number;
   maxBurstActiveRequests: number;
   /** Safety fuse for simultaneously registered one-shot child workflows. */
@@ -774,9 +777,10 @@ export function resolveSubagentCapacityPolicy(
       maxTotalRequests: 1,
       confirmedTotalRequests: 0,
       capacitySource: "probing",
-      maxActiveRequests: 1,
-      maxBurstActiveRequests: 1,
-      maxConcurrentChildren: 1,
+      modelRequestMode: "serialized",
+      maxActiveRequests: 0,
+      maxBurstActiveRequests: 0,
+      maxConcurrentChildren: 0,
     };
   }
   const profile = config.activeProfile === "cloud" ? "cloud" : "local";
@@ -794,9 +798,10 @@ export function resolveSubagentCapacityPolicy(
       : observed.maxConfirmedActiveRequests > 1
         ? "observed"
         : "probing",
-    // This is the number of child workflows after the model lane has reserved
-    // one request for the parent. Unknown providers expose only the next
-    // empirical probe; a configured capacity is trusted as an upper bound.
+    modelRequestMode: observed.requestMode,
+    // Collaboration capacity is real overlap capacity. A serialized lane does
+    // not advertise a child merely to transfer the parent's critical path to
+    // another context and then make the parent wait for the same model.
     maxActiveRequests: observed.maxActiveSubagents,
     maxBurstActiveRequests: observed.maxActiveSubagents,
     maxConcurrentChildren: observed.maxActiveSubagents,

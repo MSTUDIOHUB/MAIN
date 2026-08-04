@@ -1,10 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
-import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import type { RuntimeV2ProviderEffectFacts } from "./executionProviderEffectFacts";
-import type {
-  RuntimeV2MaterializedSourceCoverage,
-} from "./executionTypes";
 import {
   RUNTIME_V2_CONTEXT_ANCHOR_PREFIX,
 } from "./executionProviderAnchors";
@@ -15,6 +11,11 @@ import {
   type RuntimeV2TranscriptSourceWindow,
   type RuntimeV2TranscriptToolGroup,
 } from "./executionProviderSourceTranscript";
+import {
+  deduplicatedSourceWindows,
+  minimumSourceWindowCover,
+  sourceWindowsExtendContinuousCoverage,
+} from "./executionProviderSourceCover";
 
 const RUNTIME_V2_PROVIDER_FEEDBACK_PREFIX =
   "[runtime-v2 provider feedback:";
@@ -27,185 +28,37 @@ function messageText(message: AgentMessage): string {
     .join("\n");
 }
 
-
-function sourceWindowsExtendContinuousCoverage(
-  left: RuntimeV2TranscriptSourceWindow,
-  right: RuntimeV2TranscriptSourceWindow,
-): boolean {
-  return left.version === right.version &&
-    (
-      (
-        right.startLine <= left.endLine + 1 &&
-        right.endLine > left.endLine
-      ) ||
-      (
-        right.endLine >= left.startLine - 1 &&
-        right.startLine < left.startLine
-      )
-    );
+function parsedToolArguments(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
 }
 
-function deduplicatedSourceWindows(
-  windows: readonly RuntimeV2TranscriptSourceWindow[],
-): RuntimeV2TranscriptSourceWindow[] {
-  const byExactWindow = new Map<string, RuntimeV2TranscriptSourceWindow>();
-  for (const window of windows) {
-    const key = [
-      window.path,
-      window.version,
-      window.startLine,
-      window.endLine,
-    ].join(":");
-    const existing = byExactWindow.get(key);
-    if (
-      !existing ||
-      (existing.replayed && !window.replayed) ||
-      existing.replayed === window.replayed
-    ) {
-      byExactWindow.set(key, window);
-    }
+function boundedCorrectiveFailureTarget(
+  value: unknown,
+): string | null {
+  const target = String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "");
+  if (
+    !target ||
+    target.length > 300 ||
+    /[\u0000-\u001f\u007f]/.test(target) ||
+    target.startsWith("/") ||
+    target.startsWith("../") ||
+    target.split("/").includes("..")
+  ) {
+    return null;
   }
-  return [...byExactWindow.values()]
-    .sort((left, right) => left.order - right.order);
+  return target;
 }
 
-interface RuntimeV2SourceCover {
-  readonly windows: readonly RuntimeV2TranscriptSourceWindow[];
-  readonly coveredLineSpans: number;
-  readonly windowCount: number;
-  readonly contentChars: number;
-  readonly recency: number;
-}
-
-function preferredSourceCover(
-  left: RuntimeV2SourceCover | null,
-  right: RuntimeV2SourceCover,
-): RuntimeV2SourceCover {
-  if (!left) return right;
-  if (left.coveredLineSpans !== right.coveredLineSpans) {
-    return left.coveredLineSpans < right.coveredLineSpans ? left : right;
-  }
-  if (left.windowCount !== right.windowCount) {
-    return left.windowCount < right.windowCount ? left : right;
-  }
-  if (left.contentChars !== right.contentChars) {
-    return left.contentChars < right.contentChars ? left : right;
-  }
-  return left.recency >= right.recency ? left : right;
-}
-
-function minimumSourceCoverForComponent(
-  windows: readonly RuntimeV2TranscriptSourceWindow[],
-  startLine: number,
-  endLine: number,
-): readonly RuntimeV2TranscriptSourceWindow[] {
-  const memo = new Map<number, RuntimeV2SourceCover | null>();
-  const solve = (nextLine: number): RuntimeV2SourceCover | null => {
-    if (nextLine > endLine) {
-      return {
-        windows: [],
-        coveredLineSpans: 0,
-        windowCount: 0,
-        contentChars: 0,
-        recency: 0,
-      };
-    }
-    if (memo.has(nextLine)) return memo.get(nextLine) || null;
-    let best: RuntimeV2SourceCover | null = null;
-    for (const window of windows) {
-      if (
-        window.startLine > nextLine ||
-        window.endLine < nextLine
-      ) {
-        continue;
-      }
-      const tail = solve(window.endLine + 1);
-      if (!tail) continue;
-      best = preferredSourceCover(best, {
-        windows: [window, ...tail.windows],
-        coveredLineSpans:
-          Math.max(0, window.endLine - window.startLine + 1) +
-          tail.coveredLineSpans,
-        windowCount: tail.windowCount + 1,
-        contentChars: window.content.length + tail.contentChars,
-        recency: window.order + tail.recency,
-      });
-    }
-    memo.set(nextLine, best);
-    return best;
-  };
-  return solve(startLine)?.windows || [];
-}
-
-/**
- * Exact source remains complete, but overlapping receipts are not separate
- * facts. Select the smallest interval cover for each path/version so a model
- * can page through a large file without carrying duplicate source bytes into
- * every later decision.
- */
-function minimumSourceWindowCover(
-  windows: readonly RuntimeV2TranscriptSourceWindow[],
-): RuntimeV2TranscriptSourceWindow[] {
-  const selected: RuntimeV2TranscriptSourceWindow[] = [];
-  const bySource = new Map<string, RuntimeV2TranscriptSourceWindow[]>();
-  for (const window of deduplicatedSourceWindows(windows)) {
-    const key = `${window.path}\u0000${window.version}`;
-    const group = bySource.get(key) || [];
-    group.push(window);
-    bySource.set(key, group);
-  }
-  for (const group of bySource.values()) {
-    const ordered = [...group].sort((left, right) =>
-      left.startLine - right.startLine ||
-      left.endLine - right.endLine ||
-      left.order - right.order
-    );
-    if (
-      ordered.length > 0 &&
-      ordered.every((window) =>
-        window.startLine === 0 && window.endLine === 0
-      )
-    ) {
-      selected.push(ordered[ordered.length - 1]!);
-      continue;
-    }
-    let componentStart = -1;
-    let componentEnd = -1;
-    let componentWindows: RuntimeV2TranscriptSourceWindow[] = [];
-    const flush = () => {
-      if (componentWindows.length === 0) return;
-      selected.push(
-        ...minimumSourceCoverForComponent(
-          componentWindows,
-          componentStart,
-          componentEnd,
-        ),
-      );
-      componentWindows = [];
-    };
-    for (const window of ordered) {
-      if (window.startLine <= 0 || window.endLine < window.startLine) {
-        continue;
-      }
-      if (
-        componentWindows.length > 0 &&
-        window.startLine > componentEnd + 1
-      ) {
-        flush();
-        componentStart = window.startLine;
-        componentEnd = window.endLine;
-      } else if (componentWindows.length === 0) {
-        componentStart = window.startLine;
-        componentEnd = window.endLine;
-      } else {
-        componentEnd = Math.max(componentEnd, window.endLine);
-      }
-      componentWindows.push(window);
-    }
-    flush();
-  }
-  return selected.sort((left, right) => left.order - right.order);
-}
 
 function semanticSourceTokens(source: string): Set<string> {
   const tokens = new Set<string>();
@@ -266,6 +119,7 @@ function activeSourceWindows(
   let active: RuntimeV2TranscriptSourceWindow[] = [];
   let realSourcesSinceMutation:
     RuntimeV2TranscriptSourceWindow[] = [];
+  const replayRecoveryVersionsByPath = new Map<string, string>();
   let latestMutationOrder = -1;
   const tokensBySource =
     new Map<RuntimeV2TranscriptSourceWindow, Set<string>>();
@@ -285,6 +139,7 @@ function activeSourceWindows(
         groupCommittedMutation = true;
         latestMutationOrder = group.order;
         realSourcesSinceMutation = [];
+        replayRecoveryVersionsByPath.clear();
         active = active.filter((source) =>
           !mutationTargets.some((target) =>
             sourceTargetsOverlap(source.path, target)
@@ -299,6 +154,11 @@ function activeSourceWindows(
     if (batch.length === 0) continue;
 
     const next = deduplicatedSourceWindows(batch);
+    for (const source of batch) {
+      if (source.replayed) {
+        replayRecoveryVersionsByPath.set(source.path, source.version);
+      }
+    }
     const currentPaths = new Set(batch.map((source) => source.path));
     // Keep every adjacent window needed to preserve complete same-file
     // coverage. Cross-file continuity is only the nearest decision edge:
@@ -381,6 +241,21 @@ function activeSourceWindows(
       }
       for (const token of sharedTokens) admittedBridgeTokens.add(token);
     }
+    // A cached replay means the model explicitly needed a source that the
+    // semantic projection had evicted. Remember every such path until the
+    // next mutation boundary and restore its original real receipt alongside
+    // later replayed paths. This turns A -> B -> A -> B recovery into one
+    // converged multi-file workset. Only explicitly replayed same-version
+    // paths are admitted; ordinary unrelated reads still replace the active
+    // batch, and the shared context budget remains the final byte cap.
+    for (const source of realSourcesSinceMutation) {
+      if (
+        replayRecoveryVersionsByPath.get(source.path) === source.version &&
+        !next.includes(source)
+      ) {
+        next.push(source);
+      }
+    }
     active = deduplicatedSourceWindows(next);
     if (!groupCommittedMutation) {
       realSourcesSinceMutation = deduplicatedSourceWindows([
@@ -392,129 +267,60 @@ function activeSourceWindows(
   return minimumSourceWindowCover(active);
 }
 
-function completeSourceCoverage(
-  totalLines: number,
-  windows: readonly {
-    readonly startLine: number;
-    readonly endLine: number;
-  }[],
-): boolean {
-  if (totalLines === 0) {
-    return windows.some((window) =>
-      window.startLine === 0 && window.endLine === 0
-    );
-  }
-  const ordered = [...windows]
-    .filter((window) =>
-      window.startLine > 0 && window.endLine >= window.startLine
-    )
-    .sort((left, right) =>
-      left.startLine - right.startLine || left.endLine - right.endLine
-    );
-  let coveredThrough = 0;
-  for (const window of ordered) {
-    if (window.startLine > coveredThrough + 1) return false;
-    coveredThrough = Math.max(coveredThrough, window.endLine);
-    if (coveredThrough >= totalLines) return true;
-  }
-  return false;
-}
-
 /**
- * Derive write authority from the exact standard source pairs that survived
- * the final outbound request projection. Metadata-only digests and compacted
- * excerpts are deliberately ignored.
+ * A mutation can be rejected because its target source was evicted from the
+ * final provider workset even though an exact receipt for that unchanged
+ * target still exists in the canonical transcript. Re-materialize only the
+ * target named by the durable corrective failure, and only from source newer
+ * than the latest committed mutation that overlaps that target. The ordinary
+ * context bound remains the final authority; if this source cannot survive
+ * bounding, inspection stays open and no mutation lease is granted.
  */
-export function materializedRuntimeV2SourceCoverage(
-  messages: readonly AgentMessage[],
-  workspace: string,
+function correctiveRecoverySourceWindows(
+  groups: readonly RuntimeV2TranscriptToolGroup[],
+  sourceWindows: readonly RuntimeV2TranscriptSourceWindow[],
   effects?: RuntimeV2ProviderEffectFacts,
-): RuntimeV2MaterializedSourceCoverage[] {
-  const byTarget = new Map<string, {
-    version: string;
-    totalLines: number;
-    windows: Array<{
-      startLine: number;
-      endLine: number;
-      content: string;
-    }>;
-  }>();
-  const ambiguousTargets = new Set<string>();
-  const groups = collectTranscriptToolGroups(messages);
-  const latestMutationOrder = effects
-    ? Math.max(
-        -1,
-        ...groups.flatMap((group) =>
-          group.calls.some((call) =>
-              effects.committedMutationTargetsByToolCallId.has(call.id)
-            )
-            ? [group.order]
-            : []
-        ),
-      )
-    : -1;
-  for (const source of activeSourceWindows(groups, effects)) {
-      // Cached or historical source may remain visible for reasoning, but a
-      // write lease is created only by a real versioned read after the latest
-      // global mutation boundary. Replayed receipts never mint authority.
-      if (
-        effects &&
-        (
-          source.replayed ||
-          source.order <= latestMutationOrder ||
-          !effects.sourceReadVersionsByToolCallId.has(source.callId)
-        )
-      ) {
-        continue;
-      }
-      const target = normalizeRuntimeV2WorkspacePath(
-        source.path,
-        workspace,
-      );
-      const version = source.version;
-      if (
-        !target ||
-        !version ||
-        target.startsWith("/") ||
-        target.startsWith("../") ||
-        target.split("/").includes("..")
-      ) {
-        continue;
-      }
-      const existing = byTarget.get(target);
-      if (existing && existing.version !== version) {
-        byTarget.delete(target);
-        ambiguousTargets.add(target);
-        continue;
-      }
-      if (ambiguousTargets.has(target)) continue;
-      const coverage = existing || {
-        version,
-        totalLines: source.totalLines,
-        windows: [],
-      };
-      if (coverage.totalLines !== source.totalLines) {
-        byTarget.delete(target);
-        ambiguousTargets.add(target);
-        continue;
-      }
-      coverage.windows.push({
-        startLine: source.startLine,
-        endLine: source.endLine,
-        content: source.content,
-      });
-      byTarget.set(target, coverage);
-  }
-  return [...byTarget.entries()].map(([target, coverage]) => ({
-    target,
-    version: coverage.version,
-    totalLines: coverage.totalLines,
-    windows: coverage.windows,
-    complete: completeSourceCoverage(
-      coverage.totalLines,
-      coverage.windows,
+): RuntimeV2TranscriptSourceWindow[] {
+  if (!effects?.correctiveMutationFailureToolCallIds?.size) return [];
+  const targets = [...new Set(
+    [...effects.correctiveMutationFailureToolCallIds].flatMap((callId) =>
+      effects.correctiveReplayTargetsByToolCallId?.get(callId) || []
     ),
-  }));
+  )];
+  const selected: RuntimeV2TranscriptSourceWindow[] = [];
+  for (const target of targets) {
+    let latestTargetMutationOrder = -1;
+    for (const group of groups) {
+      const overlapsCommittedMutation = group.calls.some((call) =>
+        (effects.committedMutationTargetsByToolCallId.get(call.id) || [])
+          .some((mutationTarget) =>
+            sourceTargetsOverlap(mutationTarget, target)
+          )
+      );
+      if (overlapsCommittedMutation) {
+        latestTargetMutationOrder = Math.max(
+          latestTargetMutationOrder,
+          group.order,
+        );
+      }
+    }
+    const eligible = sourceWindows.filter((source) =>
+      source.order > latestTargetMutationOrder &&
+      sourceTargetsOverlap(source.path, target)
+    );
+    const newest = eligible.reduce<RuntimeV2TranscriptSourceWindow | null>(
+      (current, source) =>
+        !current || source.order > current.order ? source : current,
+      null,
+    );
+    if (!newest) continue;
+    selected.push(...eligible.filter((source) =>
+      source.path === newest.path && source.version === newest.version
+    ));
+  }
+  return minimumSourceWindowCover(
+    deduplicatedSourceWindows(selected),
+  );
 }
 
 function transcriptToolGroupMessages(
@@ -527,9 +333,28 @@ function transcriptToolGroupMessages(
     RuntimeV2TranscriptSourceWindow
   > = new Map(),
   preserveProviderReasoning = false,
+  compactCorrectiveFailureCallIds: ReadonlySet<string> = new Set(),
 ): AgentMessage[] {
   const calls = group.calls.filter((call) => callIds.has(call.id));
   if (calls.length === 0) return [];
+  const historyCalls = calls.map((call) => {
+    if (!compactCorrectiveFailureCallIds.has(call.id)) return call;
+    const args = parsedToolArguments(call.function.arguments);
+    const target = boundedCorrectiveFailureTarget(
+      args.path ?? args.file_path ?? args.target,
+    );
+    return {
+      ...call,
+      function: {
+        ...call.function,
+        arguments: JSON.stringify({
+          runtime_v2_corrective_failure: true,
+          ...(target ? { path: target } : {}),
+          effect: "none",
+        }),
+      },
+    };
+  });
   const assistant: AgentMessage = { ...group.assistant };
   if (!preserveProviderReasoning) {
     delete assistant.reasoning_content;
@@ -537,7 +362,7 @@ function transcriptToolGroupMessages(
   }
   return [{
     ...assistant,
-    tool_calls: calls,
+    tool_calls: historyCalls,
   }, ...calls.flatMap((call) => {
     const result = group.resultsByCallId.get(call.id);
     if (!result) return [];
@@ -669,7 +494,16 @@ export function buildRuntimeV2DecisionView(
       return source ? [source] : [];
     })
   );
-  const activeSources = activeSourceWindows(groups, effects);
+  const activeSources = minimumSourceWindowCover(
+    deduplicatedSourceWindows([
+      ...activeSourceWindows(groups, effects),
+      ...correctiveRecoverySourceWindows(
+        groups,
+        sourceWindows,
+        effects,
+      ),
+    ]),
+  );
   const activeSourceCallIds = new Set(
     activeSources.map((source) => source.callId),
   );
@@ -699,6 +533,10 @@ export function buildRuntimeV2DecisionView(
     readonly callId: string;
     readonly order: number;
   } | null = null;
+  let latestCorrectiveMutationFailure: {
+    readonly callId: string;
+    readonly order: number;
+  } | null = null;
   for (const group of groups) {
     if (group.order < latestMutationOrder) continue;
     for (const call of group.calls) {
@@ -708,14 +546,56 @@ export function buildRuntimeV2DecisionView(
           order: group.order,
         };
       }
+      if (
+        effects?.correctiveMutationFailureToolCallIds?.has(call.id)
+      ) {
+        latestCorrectiveMutationFailure = {
+          callId: call.id,
+          order: group.order,
+        };
+      }
     }
   }
+  const correctiveMutationFailureInstruction = (() => {
+    if (!latestCorrectiveMutationFailure) return null;
+    const owner = groups.find((group) =>
+      group.calls.some((call) =>
+        call.id === latestCorrectiveMutationFailure?.callId
+      )
+    );
+    const call = owner?.calls.find((candidate) =>
+      candidate.id === latestCorrectiveMutationFailure?.callId
+    );
+    const result = owner?.resultsByCallId.get(
+      latestCorrectiveMutationFailure.callId,
+    );
+    const diagnostic = result ? messageText(result).trim() : "";
+    if (!call || !diagnostic) return null;
+    const args = parsedToolArguments(call.function.arguments);
+    const target = boundedCorrectiveFailureTarget(
+      args.path ?? args.file_path ?? args.target,
+    );
+    return {
+      role: "system" as const,
+      content: [
+        "[runtime-v2 corrective mutation feedback]",
+        "ACTION_NOT_EXECUTED: the latest workspace mutation was rejected and changed no files.",
+        target ? `target: ${target}` : "",
+        "effect: none",
+        "Keep this exact diagnostic active across recovery reads. Derive a materially different, smaller mutation from the visible current source; do not reconstruct the rejected patch.",
+        diagnostic.slice(0, 6_000),
+      ].filter(Boolean).join("\n"),
+    };
+  })();
   const selectedCallIds = new Set([
     ...activeSourceCallIds,
     ...[...latestCommittedCallIdByTarget.values()]
       .map((entry) => entry.callId),
     ...(latestFailedValidation
       ? [latestFailedValidation.callId]
+      : []),
+    ...(latestCorrectiveMutationFailure
+      ? [latestCorrectiveMutationFailure.callId]
       : []),
     ...[...frontierIds].filter((callId) =>
       !effects?.replayedToolCallIds.has(callId) ||
@@ -752,7 +632,16 @@ export function buildRuntimeV2DecisionView(
         groupSelectedIds,
         compactSourceByCallId,
         group === frontier,
+        latestCorrectiveMutationFailure?.callId
+          ? new Set([latestCorrectiveMutationFailure.callId])
+          : new Set(),
       ),
+    });
+  }
+  if (correctiveMutationFailureInstruction) {
+    orderedParts.push({
+      order: messages.length + 1,
+      messages: [correctiveMutationFailureInstruction],
     });
   }
   orderedParts.sort((left, right) => left.order - right.order);

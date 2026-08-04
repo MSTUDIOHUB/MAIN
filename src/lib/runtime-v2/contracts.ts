@@ -220,8 +220,10 @@ export type RuntimeV2SubagentStatus =
   | "failed"
   | "canceled";
 
-/** Read-only child contract available throughout the parent lifecycle. A child
- * never receives mutation authority and its result is evidence, not state. */
+/** Bounded child contract available throughout the parent lifecycle.
+ * Investigation jobs are read-only. An implement job may stage one mutation
+ * transaction only after the parent provides an explicit plan and exclusive
+ * path ownership; Runtime commits that transaction at the join boundary. */
 export interface RuntimeV2SubagentJob {
   readonly id: string;
   readonly run: RuntimeV2RunIdentity;
@@ -229,7 +231,10 @@ export interface RuntimeV2SubagentJob {
   /** Exact provider tool call that created this one-shot job. */
   readonly sourceToolCallId?: string;
   readonly scopeKey: string;
-  readonly taskKind?: "explore" | "review" | "validate";
+  readonly taskKind?: "explore" | "review" | "validate" | "implement";
+  readonly accessMode?: "read" | "write";
+  readonly implementationOperation?: "create" | "modify" | "delete";
+  readonly implementationPlan?: string;
   /** Provider-selected presentation identity and role. */
   readonly name?: string;
   readonly role?: string;

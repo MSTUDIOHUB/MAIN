@@ -567,12 +567,17 @@ export function tryTransition(
     case "soft_signal.observed":
       return { disposition: "applied", state: append(state, event) };
     case "subagents.scheduled": {
-      const activeCount = state.subagents.filter((job) =>
+      const runSubagents = state.subagents.filter((job) =>
+        job.parentRunId === event.run.runId
+      );
+      const activeCount = runSubagents.filter((job) =>
         job.status === "queued" || job.status === "running").length;
       const maxActiveSubagents = Math.floor(Number(event.maxActiveSubagents) || 0);
       if (
         event.jobs.length === 0 ||
         maxActiveSubagents <= 0 ||
+        runSubagents.length + event.jobs.length >
+          maxActiveSubagents ||
         activeCount + event.jobs.length >
           maxActiveSubagents ||
         event.jobs.some((job) =>
@@ -609,7 +614,7 @@ export function tryTransition(
         !isValidRuntimeV2SubagentCompletion({
           state,
           event,
-          taskKind: current.taskKind,
+          job: current,
         })
       ) {
         return rejection(state, "subagent_invalid");

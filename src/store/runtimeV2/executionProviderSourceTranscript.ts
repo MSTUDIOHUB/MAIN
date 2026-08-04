@@ -118,6 +118,7 @@ export function transcriptSourceWindow(
   effects?: RuntimeV2ProviderEffectFacts,
 ): RuntimeV2TranscriptSourceWindow | null {
   if (call.function.name !== "read_file") return null;
+  if (effects?.invalidatedSourceReadToolCallIds?.has(call.id)) return null;
   const result = group.resultsByCallId.get(call.id);
   if (!result || typeof result.content !== "string") return null;
   const fact = effects?.sourceReadVersionsByToolCallId.get(call.id);

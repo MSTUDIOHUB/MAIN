@@ -100,6 +100,52 @@ export function getPendingSessionCancellation(
 }
 
 /**
+ * Let an in-flight runtime observe the terminal transaction that now owns a
+ * user cancellation. The cancellation publisher may have removed its pending
+ * fence just before a stale provider/checkpoint callback unwinds, so callers
+ * must accept either the exact settlement or its already-published canonical
+ * projection. No second terminal write is attempted here.
+ */
+export async function awaitCanceledTurnTerminalProjection(input: {
+  sessionKey: string;
+  turnId: string;
+  getProjection: () => {
+    runtimeEvents: Array<{
+      type?: string;
+      threadId?: string;
+      turnId?: string;
+      runId?: string;
+      resultKind?: string;
+    }>;
+    taskFlow: Array<{
+      type?: string;
+      turnId?: string;
+      visibility?: string;
+    }>;
+  };
+}): Promise<boolean> {
+  const sessionKey = normalizeSessionKey(input.sessionKey);
+  const turnId = String(input.turnId || "").trim();
+  const pending = getPendingSessionCancellation(sessionKey);
+  if (pending?.turnId === turnId) {
+    try {
+      const settlement = await pending.promise;
+      if (settlement.terminalSettled) return true;
+    } catch {
+      // Reconciliation may have exhausted after another owner already
+      // published the terminal projection. Verify the projection below.
+    }
+  }
+  const projection = input.getProjection();
+  return hasCanceledTurnTerminalProjection({
+    sessionKey,
+    turnId,
+    runtimeEvents: projection.runtimeEvents || [],
+    taskFlow: projection.taskFlow || [],
+  });
+}
+
+/**
  * Publish a Session cancellation fence synchronously, then start its terminal
  * transaction in a microtask. Consumers can therefore accept a user submit
  * synchronously while deferring all new runtime ownership until this promise

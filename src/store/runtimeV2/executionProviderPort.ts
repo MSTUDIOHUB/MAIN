@@ -33,7 +33,6 @@ import {
   runtimeV2ProviderReusableReadReceipt,
   runtimeV2ProviderToolCallIdentity,
   scopeRuntimeV2ProviderToolCallIds,
-  unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
 import {
   assertRuntimeV2ProviderRequestDeadline,
@@ -45,27 +44,22 @@ import {
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ProviderProtocolError,
 } from "./executionProviderRequest";
+import { runtimeV2ExecutionProviderDeadlineAt } from "./executionProviderRequestPolicy";
 import {
   normalizeRuntimeV2ProviderToolCalls,
 } from "./executionProviderTools";
 import {
   runtimeV2RepeatedActionFeedback,
 } from "./executionProviderFeedback";
+import {
+  rejectRuntimeV2InvalidCorrectiveSourceRead,
+  rejectRuntimeV2InvalidProviderToolArguments,
+  rejectRuntimeV2InvalidValidationCommand,
+  rejectRuntimeV2UnexpectedProviderTool,
+} from "./executionProviderSurfaceRejection";
 
 export { runtimeV2RepeatedActionFeedback } from "./executionProviderFeedback";
-
-export function runtimeV2ExecutionProviderDeadlineAt(
-  _now: number,
-  lifecycleDeadlineAt?: number,
-): number | undefined {
-  // Ordinary Execute has no whole-request wall-clock budget. Streaming owns a
-  // phase watchdog, so a slow but active local model can keep producing output
-  // without its request being canceled merely because total generation time is
-  // long. An explicit caller-owned lifecycle budget remains enforceable.
-  return Number.isFinite(lifecycleDeadlineAt)
-    ? Number(lifecycleDeadlineAt)
-    : undefined;
-}
+export { runtimeV2ExecutionProviderDeadlineAt };
 
 export function createRuntimeV2ProviderPort(
   input: RuntimeV2ExecutionPortsInput,
@@ -179,6 +173,10 @@ export function createRuntimeV2ProviderPort(
                   command,
                   attempt.textEnvelope,
                   input.context.runtimeContextBudget,
+                  input.live.latestProviderActionWindow,
+                  tools.length === 1 &&
+                    tools[0]?.function.name ===
+                      "record_execution_contract",
                 ),
               });
               return requestRuntimeV2ProviderOnce({
@@ -238,33 +236,45 @@ export function createRuntimeV2ProviderPort(
             });
             throw protocolError;
           }
-          const unexpected = unexpectedRuntimeV2ProviderToolNames(
+          const surfaceRejection = rejectRuntimeV2UnexpectedProviderTool({
+            ports: input,
+            command,
             tools,
-            result.toolCalls,
-          );
-          if (unexpected.length > 0) {
-            const protocolError = runtimeV2ProviderProtocolError({
+            result,
+          });
+          if (surfaceRejection) return surfaceRejection;
+          const validationCommandRejection =
+            rejectRuntimeV2InvalidValidationCommand({
               ports: input,
               command,
-              code: "tool_surface_rejected",
-              requestedToolNames: unexpected,
-              allowedToolNames,
+              tools,
+              result,
             });
-            appendRuntimeV2ProviderFeedbackHistory(input.live, {
-              visibleText: result.visibleText || "",
-              code: "tool_surface_rejected",
-              feedback: [
-                protocolError.message,
-                `Allowed tools: ${allowedToolNames.join(", ")}.`,
-                "The response did not advance the task. Submit exactly one allowed structured action.",
-              ].join("\n"),
-            });
-            throw protocolError;
+          if (validationCommandRejection) {
+            return validationCommandRejection;
           }
+          const argumentRejection =
+            rejectRuntimeV2InvalidProviderToolArguments({
+              ports: input,
+              command,
+              tools,
+              result,
+            });
+          if (argumentRejection) return argumentRejection;
           const providerEffectFacts =
             deriveRuntimeV2ProviderEffectFacts(
               aggregateForCurrentTurn(input),
             );
+          const correctiveSourceRejection =
+            rejectRuntimeV2InvalidCorrectiveSourceRead({
+              ports: input,
+              command,
+              result,
+              effects: providerEffectFacts,
+            });
+          if (correctiveSourceRejection) {
+            return correctiveSourceRejection;
+          }
           const reusableReadReceipts = new Map(
             result.toolCalls.flatMap((call) => {
               const receipt =

@@ -52,6 +52,25 @@ const evidence = [{
   statement: "The active-file owner is implemented here.",
 }];
 
+test("plan intent analysis receives the collaboration method before decomposition", () => {
+  const messages = protocol.providerPlanMessages({
+    turn: { userPrompt: "Repair the multi-file open flow." },
+    context: {
+      phaseLanguage: "en",
+      runWorkspace: "/tmp/project",
+      turnInputContextSignals: { subagentPreference: "preferred" },
+    },
+    overview: "src/components/editor.js\nsrc/components/toolbar.js",
+  });
+  const system = String(messages[0]?.content || "");
+  assert.match(system, /\[COLLABORATION METHOD\]/);
+  assert.match(system, /During intent analysis/);
+  assert.match(system, /evidence-backed solution/);
+  assert.match(system, /every exact non-overlapping file target/);
+  assert.match(system, /Do not grant a directory/);
+  assert.match(system, /waits only when a child result becomes a dependency/);
+});
+
 function singletonSubmission(overrides = {}) {
   return {
     planMarkdown: "Use the retained evidence to update the active-file owner.",

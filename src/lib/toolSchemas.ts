@@ -477,21 +477,34 @@ export const READ_ONLY_SUBAGENT_TASK_KINDS = [
 
 export const READ_ONLY_SUBAGENT_ACCESS_MODES = ["read"] as const;
 
+export const RUNTIME_V2_SUBAGENT_TASK_KINDS = [
+  ...READ_ONLY_SUBAGENT_TASK_KINDS,
+  "implement",
+] as const;
+
+export const RUNTIME_V2_SUBAGENT_ACCESS_MODES = ["read", "write"] as const;
+
+export const RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS = [
+  "create",
+  "modify",
+  "delete",
+] as const;
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   SUBMIT_PLAN_CANDIDATE_TOOL_DEFINITION,
   {
     type: "function",
     function: {
       name: "spawn_subagent",
-      description: "按需创建一个全新的一次性只读子智能体，执行语义独立且窄于父目标的调查、评审或验证任务。父智能体始终是唯一写入者。仅在并行收益明确时委派；主体继续处理不重叠工作，依赖结果或最终回答前再 wait_subagents。",
+      description: "按需创建一个全新的一次性子智能体。调查、评审和验证任务为只读；父线程形成明确方案后，可把互不重叠的文件所有权交给 implement 子任务并行形成一个受控修改事务。仅在存在真实并行收益时委派，父线程继续处理不重叠工作。",
       parameters: {
         type: "object",
         properties: {
           task_key: { type: "string", description: "当前父回合内稳定、简短且能表达职责的语义任务键" },
           task_kind: {
             type: "string",
-            enum: [...READ_ONLY_SUBAGENT_TASK_KINDS],
-            description: "可选的只读任务类型，默认 explore",
+            enum: [...RUNTIME_V2_SUBAGENT_TASK_KINDS],
+            description: "子任务类型；explore/review/validate 为只读，implement 为明确方案下的受控实现",
           },
           objective: { type: "string", description: "子智能体要独立完成的明确目标" },
           delegation_reason: { type: "string", description: "可选：为什么该任务值得独立委派；省略时由运行时补充中性原因" },
@@ -499,12 +512,21 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
           scope: { type: "string", description: "可选的职责边界说明；不能替代 objective 和 success_criteria" },
-          required_paths: { type: "string", description: "成功标准要求必须覆盖的精确路径；只读任务未提供 allowed_paths 时也作为其最小读取范围" },
-          allowed_paths: { type: "string", description: "只读权限上限，使用逗号分隔；省略时使用 required_paths，本地任务最多 6 个" },
+          required_paths: { type: "string", description: "成功标准要求必须覆盖的精确路径；只读任务未提供 allowed_paths 时也作为其最小读取范围。implement 必须列出每个实际写入文件。" },
+          allowed_paths: { type: "string", description: "权限上限，使用逗号分隔；省略时使用 required_paths，本地任务最多 6 个。write 子任务必须使用互不重叠的精确文件目标，不能用目录授权后再自行选择文件。" },
           access_mode: {
             type: "string",
-            enum: [...READ_ONLY_SUBAGENT_ACCESS_MODES],
-            description: "可选且始终为 read；子智能体不获得文件修改权限",
+            enum: [...RUNTIME_V2_SUBAGENT_ACCESS_MODES],
+            description: "explore/review/validate 使用 read；仅 implement 可使用 write",
+          },
+          implementation_operation: {
+            type: "string",
+            enum: [...RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS],
+            description: "implement 必填：该子任务负责 create、modify 或 delete 中的一类修改",
+          },
+          implementation_plan: {
+            type: "string",
+            description: "implement 必填：父线程基于证据形成的具体修改方案，必须说明责任边界和预期行为，不能只写‘修复问题’",
           },
           expected_output: { type: "string", description: "可选：汇合时需要返回的证据结构或判断；省略时返回带精确目标的来源证据" },
           depends_on: { type: "string", description: "可选，依赖的 collaboration task ID 或 task_key，逗号分隔" },
@@ -864,12 +886,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "replace_in_file",
-      description: "Replace one unique exact text block in an existing file and return a structured diff. Use the schema keys path, search_text, and replace_text exactly; search_text must match the current file verbatim and occur only once.",
+      description: "Replace one unique exact text block in an existing file and return a structured diff. Use the schema keys path, search_text, and replace_text exactly. Copy the smallest block that is still unique directly from current source; never reconstruct a large unchanged region from memory. search_text must match verbatim and occur only once.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" },
-          search_text: { type: "string", description: "旧代码（必须与原文完全一致）" },
+          search_text: { type: "string", description: "直接从当前源码复制的最小唯一旧代码块（必须逐字匹配，不要包含无关的未修改函数）" },
           replace_text: { type: "string", description: "新代码" },
         },
         required: ["path", "search_text", "replace_text"],
@@ -902,6 +924,23 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           patch: { type: "string", description: "Complete patch text. Example: *** Begin Patch\n*** Update File: src/example.ts\n@@\n-old\n+new\n*** End Patch. A standard ---/+++ unified diff is also accepted." },
         },
         required: ["patch"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_workspace_path",
+      description: "Delete one exact workspace-relative file or empty path after explicit destructive-operation review. Never use the workspace root, an absolute path, `..`, a glob, or a broad directory. Prefer a narrower modification when deletion is not required by the approved solution.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Exact workspace-relative deletion target. The runtime revalidates scope and requests one-shot destructive approval before execution.",
+          },
+        },
+        required: ["path"],
       },
     },
   },

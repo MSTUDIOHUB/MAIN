@@ -6,9 +6,10 @@ const GIB = 1024 ** 3;
 const PRESSURE_SAMPLE_MS = 2_000;
 const DEGRADE_DURATION_MS = 5 * 60_000;
 const BURST_HEALTH_TTL_MS = 30_000;
-// Capability discovery is deliberately provider-neutral. An unknown lane
-// opens one probe beyond its last confirmed overlap and never exceeds this
-// product safety ceiling unless the provider/user supplies a smaller bound.
+// Capability discovery is deliberately provider-neutral. Cloud lanes may
+// open one empirical overlap probe. Local lanes stay serial unless the
+// provider/user explicitly supplies a concurrency fact; free memory alone
+// does not prove that a local inference server supports overlapping streams.
 const MODEL_LANE_AUTODISCOVERY_CEILING = 4;
 
 export type ModelLaneAgentKind = "parent" | "subagent";
@@ -82,7 +83,9 @@ export interface ModelLaneCapacityObservation {
   readonly maxConfirmedActiveRequests: number;
   /** Current provider-request admission limit, including the parent. */
   readonly maxActiveRequests: number;
-  /** Current child scheduler limit after reserving one parent request. */
+  /** Whether provider calls can overlap or must take turns on this lane. */
+  readonly requestMode: "parallel" | "serialized";
+  /** Current child-request capacity after reserving one parent request. */
   readonly maxActiveSubagents: number;
 }
 
@@ -138,6 +141,7 @@ function configuredRequestLimit(config: AppConfig): number | null {
 function laneLimit(state: ModelLaneState): number {
   if (state.degradedUntil > Date.now()) return 1;
   if (state.requestLimitConfigured) return state.requestLimitCeiling;
+  if (state.local) return 1;
   // Unknown providers advance one slot at a time. Two requests are the first
   // useful probe: one established stream plus one candidate overlap.
   return Math.min(
@@ -399,11 +403,14 @@ export async function acquireModelLane(input: {
   if (input.signal?.aborted) throw abortError();
   const laneKey = resolveRuntimeLaneKey(input.config);
   const configuredLimit = configuredRequestLimit(input.config);
+  const local = input.config.activeProfile !== "cloud";
   const requestLimitCeiling =
-    configuredLimit || MODEL_LANE_AUTODISCOVERY_CEILING;
+    configuredLimit || (
+      local ? 1 : MODEL_LANE_AUTODISCOVERY_CEILING
+    );
   const state = lanes.get(laneKey) || {
     laneKey,
-    local: input.config.activeProfile !== "cloud",
+    local,
     requestLimitCeiling,
     requestLimitConfigured: configuredLimit !== null,
     maxConfirmedActiveRequests: 0,
@@ -424,7 +431,7 @@ export async function acquireModelLane(input: {
     lastSafeSubagentOverlapAt: 0,
     lastQueueReason: null,
   };
-  state.local = input.config.activeProfile !== "cloud";
+  state.local = local;
   state.requestLimitCeiling = requestLimitCeiling;
   state.requestLimitConfigured = configuredLimit !== null;
   lanes.set(laneKey, state);
@@ -514,22 +521,26 @@ export function getModelLaneCapacityObservation(
 ): ModelLaneCapacityObservation {
   const laneKey = resolveRuntimeLaneKey(config);
   const configuredLimit = configuredRequestLimit(config);
+  const local = config.activeProfile !== "cloud";
   const state = lanes.get(laneKey);
   const requestLimitCeiling =
     configuredLimit ||
     state?.requestLimitCeiling ||
-    MODEL_LANE_AUTODISCOVERY_CEILING;
+    (local ? 1 : MODEL_LANE_AUTODISCOVERY_CEILING);
   const maxConfirmedActiveRequests =
     state?.maxConfirmedActiveRequests || 0;
   const maxActiveRequests = state
     ? laneLimit(state)
-    : configuredLimit || Math.min(requestLimitCeiling, 2);
+    : configuredLimit || (
+        local ? 1 : Math.min(requestLimitCeiling, 2)
+      );
   return {
     laneKey,
     configured: configuredLimit !== null,
     requestLimitCeiling,
     maxConfirmedActiveRequests,
     maxActiveRequests,
+    requestMode: maxActiveRequests > 1 ? "parallel" : "serialized",
     maxActiveSubagents: Math.max(0, maxActiveRequests - 1),
   };
 }

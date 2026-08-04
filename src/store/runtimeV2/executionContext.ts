@@ -7,6 +7,7 @@
 export * from "./executionAggregate";
 export * from "./executionAuthorization";
 export * from "./executionEvidence";
+export * from "./executionContract";
 export * from "./executionProviderContext";
 export * from "./executionProviderAnchors";
 export * from "./executionProviderEffectFacts";

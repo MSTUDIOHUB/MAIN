@@ -137,8 +137,8 @@ function timelineTitle(
     }
     if (command.kind === "execute_validation") return codeTarget ? `Validate with ${codeTarget}` : "Run finite validation";
     if (command.kind === "execute_tool") return codeTarget ? `Run ${commandTool(command)} on ${codeTarget}` : `Run ${commandTool(command)}`;
-    if (command.kind === "schedule_subagents") return "Start scoped read-only child investigations";
-    if (command.kind === "join_subagents") return "Join child investigation evidence";
+    if (command.kind === "schedule_subagents") return "Start scoped child collaboration";
+    if (command.kind === "join_subagents") return "Join child evidence or staged mutations";
     if (command.kind === "finalize_turn") {
       return strategy === "chat"
         ? "Finish the conversation reply"
@@ -158,8 +158,8 @@ function timelineTitle(
   }
   if (command.kind === "execute_validation") return codeTarget ? `使用 ${codeTarget} 执行验证` : "执行有限验证";
   if (command.kind === "execute_tool") return codeTarget ? `对 ${codeTarget} 执行 ${commandTool(command)}` : `执行 ${commandTool(command)}`;
-  if (command.kind === "schedule_subagents") return "启动有明确范围的只读子智能体调查";
-  if (command.kind === "join_subagents") return "汇合子智能体的调查证据";
+  if (command.kind === "schedule_subagents") return "启动范围明确的子智能体协作";
+  if (command.kind === "join_subagents") return "汇合子智能体证据或暂存修改";
   if (command.kind === "finalize_turn") {
     return strategy === "chat"
       ? "整理本轮对话的完整回复"

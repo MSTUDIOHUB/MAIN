@@ -62,12 +62,17 @@ Provider adapter 的职责到“能力检测、请求/响应形状、stream、�
 MAIN 使用同一套结构化证据规则贯穿规划和执行，但保留不同阶段的持久化形状：
 
 - 规划阶段把成功的只读结果规范化为带 path/version 的 `WorkPlanRuntimeEvidence`。模型只能引用 runtime 已签发的 evidence ID；普通摘要和未覆盖路径不成为事实。
-- Execute 把 source、mutation 与 validation 记录进当前 Turn aggregate。批准计划的 scope/validation 仍是 authority；直接 Execute 至少保留不可变用户目标和最终修改后的行为验收要求。
+- Execute 把 source、mutation 与 validation 记录进当前 Turn aggregate。批准计划的 scope/validation 仍是 authority；直接 Execute 至少保留不可变用户目标和最终修改后的行为验收要求。未被结构化上游明确标成 `static` 的 criterion 默认要求 `behavioral` 证据，build/lint 不能单独关闭用户可见行为。
 - 完成由实际 mutation、最终 mutation boundary 后的匹配 validation 和 provider conclusion 共同投影。模型声称“已完成”、泛化工具成功或只启动服务都不能越过证据缺口。
-- Execute 的普通工作区恢复使用稳定的读／改／验核心工具面；阶段状态只表达优先动作，不再把安全的相邻工具调用判成协议错误。软 no-progress 计数不改变工具权限，只能决定继续提示或诚实暂停。路径/权限、源码新鲜度、批准 scope、进程生命周期和证据闭包仍是硬门。
+- Execute 的普通工作区恢复使用稳定的读／改／验核心授权面，安全读取不会因普通阶段切换消失。成功 mutation 会建立验证债务；`validate` 仍可推进有 exact source/契约支持的剩余 mutation，但任何新修改都把债务移动到最新工作区边界。软 no-progress 计数不结束 Run。provider 解码收敛由 durable 结果事实触发：同一动作第一次明确重复、不同参数返回等价非空观察/失败诊断、同版本缓存源码完成一次重物化并重新可见，或最新 mutation 被 source/parser preflight 拒绝。闭合编辑窗口临时只广告有租约的 mutation；验证窗口在无动作／协议拒绝或等价重复观察后只广告有限验证。协作按钮只开放按工作量自主使用的能力，不建立必经阶段或 effect-boundary 前置；已闭合的父动作窗口不再把协作当作逃生分支。它不绑定模型名或任务总时长；真实 mutation/validation、冷恢复或源码淘汰会按因果边界重新开放相应目录。路径/权限、源码新鲜度、批准 scope、进程生命周期和证据闭包仍是硬门。
+- source decision view 保存当前因果工作集而不是完整历史；为多文件任务显式重放的多个 same-version 源码会合并进同一个 context-budgeted 恢复工作集，避免源码 A/B 交替可见。缓存 replay 只恢复原始 receipt 的可见性，不授予新的写权限。
+- 可纠正的 workspace mutation 失败由 durable ledger 以结构化 `failureReasonCode` 标记，恢复不能解析 provider-facing 文案来猜原因。其被拒绝补丁正文不会进入后续提示，但最新失败目标、`effect: none` 和有界解析器／源码诊断会固定在当前 decision view 尾部；更早失败目标不能继续占有恢复工具面。Runtime 只开放一次 post-failure target-locked read，验收回执存在 `path:line` 时强制读取该行附近；成功补读后立刻进入 `corrective_mutation`，新补丁仍按实际可见 exact source 独立授权。连续三次纠错 mutation 都未执行则诚实收口，真实 mutation 清零并建立新边界。未广告工具被记录为一对标准 assistant/tool 拒绝事实，而不是抛成无状态 transport retry。
 - 工具结果的具体因果 handler 先于通用 no-progress policy：真实修改和失败验证必须先推进下一次读取／修正／验证；重复或协议异常只产生软信号。
-- 子智能体偏好只控制 `spawn_subagent` 是否可见以及提示强度。模型可在观察、修改或验证阶段按需派生最多两个活动的只读 `explore/review/validate` 任务；不存在开场自动派生或必需 scope。
-- child 用普通最终文本结束只读工作；runtime 只有在结果引用至少一条真实或合法继承 evidence 时才编译合法报告并记为 `completed`。已有 evidence 但未形成合法报告时记为 `degraded` 并交回主体；无 evidence 才是 `failed`。父线程显式 wait 或终态 join 后接收结果；任何非 completed child 都不能阻断父线程，child 结果不能授权修改或凭自身关闭不匹配的验收。
+- Execute 的任务生命周期没有总生成时限，但每次 provider 决策有阶段化输出预算：普通动作 4096 tokens、action window／验证／恢复 2048、执行结论 4096。reasoning-only 动作流达到 8000 字符仍无工具时只取消本次生成，以明确反馈和 reasoning-off 重试；单步收敛不能结束复杂任务。
+- 子智能体偏好在 Turn admission 就向执行模型注入拆分方法，不等 `spawn_subagent` 出现后才解释规则；hidden intent router 只分类主意图。模型可在普通读取、修改或验证阶段按实际工作量自行决定是否启动，也可不启动；runtime 不把它设为 mutation 或 completion 前置。child 接收自包含目标、相关精确源码/证据、约束和实施契约组成的有界胶囊，不继承父模型私有推理或完整 transcript。`explore/review/validate` 只读分支可并行调查；父线程形成证据化方案后，`implement/write` 可在互不重叠的精确文件目标上暂存一个 create/modify/delete 事务，不能拿目录授权让 child 自行选写入文件。modify/delete 必须继承父线程当前请求中同目标的版本化源码；join 时再校验 base version、WorkPlan scope、权限、破坏性审批和语法，并提交或整体丢弃。写范围活动期间，父线程及 sibling 的重叠修改被拒绝，最终验证必须等待事务汇合。父线程继续不依赖 child 的工作，并保留跨文件整合、最终验证和完成权威。串行 lane 的 child 容量为零，不能把父/子模型步骤轮流占用同一请求通道包装成并行。恢复 action window 不开放新建或等待 child，也不因父线程动作失败自动 join；它要求父线程先完成当前闭合动作，已存在 child 则在后续正常边界收取。协作状态和预算按 parent Run 隔离。
+- child provider 响应必须经过与父线程相同的 advertised-schema 参数规范化后，才参与 identity、授权和执行；未声明字段不能制造新的动作 identity。对不同参数却返回同一 target/version/output 的读取，第一次返回 `CHILD_EVIDENCE_REPEAT` 纠正，下一次仍命中同一关闭观察时立即降级交回父线程，不能用范围或 nonce 抖动占住共享模型 lane；真正的新窗口／新证据仍正常清零停滞状态。
+- 同一父 Run 的 child 总数不超过 admission 时的 child lane 容量；terminal child 不在该 Run 内补充派生配额，避免模型用连续 child 重试替代主体执行。
+- child 用普通最终文本结束有界工作；runtime 只有在结果引用至少一条真实或合法继承 evidence 时才编译合法报告。实现 child 的暂存 evidence 在 join 成功后才替换为 mutation evidence 并可记为 `completed`；提交失败则整体丢弃事务并降级交回主体。父线程显式 wait 或终态 join 后接收结果；任何非 completed child 都不能阻断父线程，child 结果不能凭自身关闭不匹配的验收。
 
 Plan evidence、child evidence 与 Execute evidence 可以有不同持久化形状，但共享 identity、path/version、provenance 和“不从摘要制造事实”的规则。Rust 仍只负责 opaque snapshot CAS。
 

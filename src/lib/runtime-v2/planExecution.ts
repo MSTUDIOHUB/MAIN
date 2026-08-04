@@ -185,8 +185,10 @@ function latestMutationIndex(aggregate: TurnAggregateV1): number {
   let latest = -1;
   for (const event of aggregate.events) {
     if (
-      event.type === "tool.completed" &&
-      event.status === "succeeded" &&
+      (
+        (event.type === "tool.completed" && event.status === "succeeded") ||
+        (event.type === "subagent.completed" && event.status === "completed")
+      ) &&
       event.evidence.some((evidence) => evidence.kind === "mutation")
     ) {
       latest = Math.max(latest, eventIndex(aggregate, event));

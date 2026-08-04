@@ -80,6 +80,7 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
     "executionContext.ts",
     "executionAggregate.ts",
     "executionAuthorization.ts",
+    "executionAuthorizationContext.ts",
     "executionEvidence.ts",
     "executionProviderContext.ts",
     "executionProviderPort.ts",
@@ -153,10 +154,13 @@ test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free respon
     path.join(process.cwd(), "src/lib/runtime-v2/completion.ts"),
     "utf8",
   );
-  const adapterSource = fs.readFileSync(
-    path.join(process.cwd(), "src/store/runtimeV2/executeRunner.ts"),
+  const adapterSource = [
+    "executeRunner.ts",
+    "executionOutcome.ts",
+  ].map((name) => fs.readFileSync(
+    path.join(process.cwd(), "src/store/runtimeV2", name),
     "utf8",
-  );
+  )).join("\n");
   assert.match(coreSource, /latestRuntimeV2ProviderConclusionText/);
   assert.match(coreSource, /\["execute", "validate", "conclude"\]/);
   assert.match(coreSource, /event\.result\.toolCalls\.length > 0/);
@@ -173,10 +177,13 @@ test("ordinary Runtime v2 Execute has no whole-Turn wall-clock deadline", () => 
     path.join(process.cwd(), "src/store/runtimeV2/executeRunner.ts"),
     "utf8",
   );
-  const providerSource = fs.readFileSync(
-    path.join(process.cwd(), "src/store/runtimeV2/executionProviderPort.ts"),
+  const providerSource = [
+    "executionProviderPort.ts",
+    "executionProviderRequestPolicy.ts",
+  ].map((name) => fs.readFileSync(
+    path.join(process.cwd(), "src/store/runtimeV2", name),
     "utf8",
-  );
+  )).join("\n");
   assert.doesNotMatch(
     runnerSource,
     /RUNTIME_V2_EXECUTION_DEADLINE_MS|admittedAt\s*\+|Date\.now\(\)\s*-\s*admittedAt/,

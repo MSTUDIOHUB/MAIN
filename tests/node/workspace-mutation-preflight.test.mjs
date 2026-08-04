@@ -409,7 +409,7 @@ test("mutation preflight rejects parser-confirmed post-images before writing", a
   assert.match(patch.message || "", /No file was changed/);
 });
 
-test("mutation preflight requires a parser-clean postimage for an already-broken file", async () => {
+test("mutation preflight allows only a strictly monotonic repair of an already-broken file", async () => {
   const checkSyntax = async (_path, content) => {
     const errorCount = [...String(content).matchAll(/BROKEN/g)].length;
     return {
@@ -438,12 +438,7 @@ test("mutation preflight requires a parser-clean postimage for an already-broken
     readFile: async () => current,
     checkSyntax,
   });
-  assert.equal(improved.ok, false);
-  assert.equal(improved.reason, "syntax_error");
-  assert.match(
-    improved.message || "",
-    /pre-existing 2 -> proposed 1/,
-  );
+  assert.equal(improved.ok, true);
 
   const equallyBroken = await preflightWorkspaceMutation({
     toolName: "replace_in_file",
@@ -466,6 +461,131 @@ test("mutation preflight requires a parser-clean postimage for an already-broken
     equallyBroken.message || "",
     /src\/toolbar\.js:4:2 parse_1, src\/toolbar\.js:5:2 parse_2/,
   );
+
+  const differentError = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/toolbar.js",
+      search_text: "BROKEN first",
+      replace_text: "fixed first",
+    },
+    language: "en",
+    readFile: async () => current,
+    checkSyntax: async (_path, content) => {
+      const proposed = content.includes("fixed first");
+      return {
+        applicable: true,
+        hasErrors: true,
+        errorCount: proposed ? 1 : 2,
+        firstErrorLine: 1,
+        firstErrorColumn: 1,
+        errors: proposed
+          ? [{ line: 8, column: 3, kind: "new_parse_shape" }]
+          : [
+              { line: 4, column: 2, kind: "parse_1" },
+              { line: 5, column: 2, kind: "parse_2" },
+            ],
+        errorsTruncated: false,
+      };
+    },
+  });
+  assert.equal(differentError.ok, false);
+  assert.equal(differentError.reason, "syntax_error");
+});
+
+test("syntax preflight names duplicate export symbols in corrective feedback", async () => {
+  const source = [
+    "export function updateTheme(theme) { return theme; }",
+    "}entFile(filePath) {}",
+  ].join("\n");
+  const result = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/toolbar.js",
+      search_text: "}entFile(filePath) {}",
+      replace_text: [
+        "export function setCurrentFile(filePath) {}",
+        "export function updateTheme(theme) { return theme; }",
+      ].join("\n"),
+    },
+    language: "en",
+    readFile: async () => source,
+    checkSyntax: async (_path, content) => {
+      const proposed = content.includes("setCurrentFile");
+      return {
+        applicable: true,
+        hasErrors: true,
+        errorCount: proposed ? 2 : 1,
+        firstErrorLine: 2,
+        firstErrorColumn: 17,
+        errors: proposed
+          ? [{
+              line: 2,
+              column: 17,
+              kind: "duplicate_export",
+              symbol: "updateTheme",
+            }]
+          : [{ line: 2, column: 1, kind: "parse_error" }],
+        errorsTruncated: false,
+      };
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryKind, "mutation_rejected");
+  assert.match(result.message || "", /duplicate_export\(updateTheme\)/);
+  assert.match(
+    result.message || "",
+    /already has another declaration for updateTheme/i,
+  );
+  assert.match(result.message || "", /remove only the corrupted or obsolete fragment/i);
+});
+
+test("mutation preflight blocks removing a module export that still has a real importer", async () => {
+  const source = [
+    "export function setEditorContent(content) { return content; }",
+    "export function getEditorContent() { return ''; }",
+  ].join("\n");
+  const result = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "src/components/editor.js",
+      search_text:
+        "export function setEditorContent(content) { return content; }\n",
+      replace_text: "",
+    },
+    language: "en",
+    readFile: async () => source,
+    checkSyntax: async (_path, content) => ({
+      applicable: true,
+      hasErrors: false,
+      errorCount: 0,
+      errors: [],
+      errorsTruncated: false,
+      moduleExports: [
+        ...(content.includes("export function setEditorContent")
+          ? ["setEditorContent"]
+          : []),
+        "getEditorContent",
+      ],
+    }),
+    findReferences: async (symbol) => ({
+      occurrences: symbol === "setEditorContent"
+        ? [{
+            path: "src/main.js",
+            role: "import",
+            line: 9,
+          }]
+        : [],
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "public_contract_break");
+  assert.equal(result.recoveryKind, "mutation_rejected");
+  assert.match(result.message || "", /setEditorContent/);
+  assert.match(result.message || "", /src\/main\.js:9/);
+  assert.match(result.message || "", /No file was changed/);
 });
 
 test("missing mutation targets request workspace reorientation instead of rereading the invented path", async () => {

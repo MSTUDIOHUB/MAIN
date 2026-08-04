@@ -73,6 +73,53 @@ export function resolveEffectiveSubagentDelegationPreference(input: {
   return defaultPreference === "preferred" ? "preferred" : "allowed";
 }
 
+/**
+ * Give the model the collaboration method at Turn admission, before it has
+ * chosen an inspection or implementation action. Tool schemas remain the
+ * effect boundary; this text teaches decomposition and never requires a
+ * spawn at a particular lifecycle stage.
+ */
+export function buildSubagentDelegationGuidance(input: {
+  readonly preference: SubagentDelegationPreference;
+  readonly language: "zh" | "en";
+}): string {
+  if (input.preference === "forbidden") {
+    return input.language === "en"
+      ? "The user explicitly disabled subagents for this turn."
+      : "用户明确要求本轮不使用子智能体。";
+  }
+  if (
+    input.preference !== "preferred" &&
+    input.preference !== "allowed"
+  ) {
+    return "";
+  }
+  const availability = input.preference === "preferred"
+    ? input.language === "en"
+      ? "Collaboration is enabled for this turn."
+      : "本轮已开启协作。"
+    : input.language === "en"
+      ? "Collaboration is available for this turn."
+      : "本轮允许按需协作。";
+  return input.language === "en"
+    ? [
+        availability,
+        "During intent analysis, identify genuinely independent work, dependencies, and exact ownership; invoke spawn_subagent only when that tool is actually exposed. Spawning is optional at every inspect, edit, and verify stage and is never a prerequisite for mutation or completion.",
+        "Parallelize bounded investigation, review, or validation when it can overlap useful parent work.",
+        "Each child receives a curated context capsule—its self-contained objective, relevant exact source/evidence, constraints, and any active implementation contract—not the parent's hidden reasoning or full transcript. Assign enough explicit evidence and boundaries for the child to finish and report independently.",
+        "Delegate implementation only after the parent has an evidence-backed solution: assign a create/modify/delete operation, a concrete implementation plan and success criteria, and every exact non-overlapping file target. Do not grant a directory and let the child choose mutation targets. Each implementation child stages one transaction; Runtime revalidates and commits it at join.",
+        "The parent continues non-dependent work, waits only when a child result becomes a dependency, integrates returned evidence or mutations, and owns final validation and completion. Never delegate merely because the current action failed or is difficult; never split by directory alone or reuse a terminal child.",
+      ].join(" ")
+    : [
+        availability,
+        "分析用户意图时就识别真正独立的工作、依赖关系和精确责任范围；只有实际暴露 spawn_subagent 工具时才可调用。读取、修改或验证任一阶段都可根据实际工作量自行判断是否启动，但绝不强制，也不是写入或完成的前置条件。",
+        "能与主体有效重叠时，可并行委派范围明确的调查、评审或验证。",
+        "每个子智能体只接收父线程整理的上下文胶囊：可独立理解的目标、相关精确源码/证据、约束和现行实施契约；不会继承父线程隐藏推理或完整对话。分配时必须给足证据和边界，使其能独立完成并回报。",
+        "只有父线程已形成证据化方案后才能委派实现：必须指定 create/modify/delete 操作、具体 implementation_plan、成功标准和每个精确且互不重叠的文件目标；不能只授权目录再让子智能体自行选择修改目标。每个实现子智能体只暂存一个事务，由 Runtime 在汇合时重新校验并提交。",
+        "父线程继续推进不依赖子结果的工作，只在结果成为依赖时等待，负责整合返回的证据或修改，并承担最终验证与完成。不得因当前动作失败或困难而甩给子智能体，不得只按目录拆分或复用已终止实例。",
+      ].join("");
+}
+
 type MessageLike = {
   role?: string;
   content?: unknown;
@@ -142,14 +189,12 @@ export function buildTurnIntakeContextBlock(input: {
     lines.push(`@file: ${path}`);
   }
 
-  if (subagentPreference === "preferred") {
-    lines.push(input.language === "en"
-      ? "delegation: Collaboration is preferred for this turn when a genuinely independent investigation, review, or validation can shorten the critical path. It is never a mandatory opening step or a quota: delegate at any useful lifecycle phase, never split work by directory alone, and never reuse a terminal child. Continue non-overlapping parent work, inspect child evidence, and keep all writes, final validation, and completion with the parent."
-      : "delegation: 本轮偏好协作，但只有独立的调查、评审或验证确实能缩短关键路径时才委派。它不是强制开场步骤，也不是数量配额：可在生命周期中任何合适阶段按需创建，绝不能仅按目录拆分，也不得复用已终止实例。主体继续推进不重叠工作，检查子智能体证据，并由主体唯一写入、负责最终验证与完成。");
-  } else if (subagentPreference === "forbidden") {
-    lines.push(input.language === "en"
-      ? "delegation: The user explicitly disabled subagents for this turn."
-      : "delegation: 用户明确要求本轮不使用子智能体。");
+  const delegationGuidance = buildSubagentDelegationGuidance({
+    preference: subagentPreference,
+    language: input.language,
+  });
+  if (delegationGuidance) {
+    lines.push(`delegation: ${delegationGuidance}`);
   }
   lines.push(`attachedFiles: ${signals.attachedFilePaths.length}`);
   for (const path of signals.attachedFilePaths.slice(0, 12)) {

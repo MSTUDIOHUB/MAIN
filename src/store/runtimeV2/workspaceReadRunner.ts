@@ -332,13 +332,14 @@ export async function runSubmitRuntimeV2WorkspaceRead(
         break;
       }
 
+      const subagentPolicy = resolveSubagentCapacityPolicy(
+        input.get().config,
+      );
       const drove = await controller.driveOnce({
         subagentPreference:
           input.context.turnInputContextSignals.subagentPreference,
-        subagentCapacity:
-          resolveSubagentCapacityPolicy(
-            input.get().config,
-          ).maxActiveRequests,
+        subagentCapacity: subagentPolicy.maxActiveRequests,
+        subagentRequestMode: subagentPolicy.modelRequestMode,
       });
       if (!drove) {
         await controller.driveOnce({

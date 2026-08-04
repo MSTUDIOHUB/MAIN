@@ -51,8 +51,10 @@ function mutationEvents(
   aggregate: RuntimeV2ValidationBoundaryAggregate,
 ): readonly RuntimeV2ValidationBoundaryEvent[] {
   return aggregate.events.filter((event) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
+    (
+      (event.type === "tool.completed" && event.status === "succeeded") ||
+      (event.type === "subagent.completed" && event.status === "completed")
+    ) &&
     eventEvidence(event).some((evidence) => evidence.kind === "mutation")
   );
 }

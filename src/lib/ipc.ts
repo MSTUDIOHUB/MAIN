@@ -401,8 +401,10 @@ export interface SourceSyntaxCheckResult {
     line: number;
     column: number;
     kind: string;
+    symbol?: string;
   }>;
   errorsTruncated?: boolean;
+  moduleExports?: string[];
 }
 
 export interface SymbolOccurrence {

@@ -517,7 +517,7 @@ export function buildSystemPrompt(
   sections.push(makeSection("COMPLETION", [
     "Track every requested outcome, not merely whether any tool succeeded. A mutation, command, or read is evidence for only the outcome it actually addresses.",
     "Before reporting completion, confirm that each requested outcome has corresponding artifact/diff evidence and that required validation ran successfully.",
-    "If another safe edit is still needed during validation, request that edit tool; the runtime may reopen the mutation phase for distinct remaining outcomes within a finite runtime limit while retaining the pending validation checkpoint.",
+    "If another safe edit is still needed during validation, request that edit tool; the runtime may reopen the mutation phase for distinct remaining outcomes while each cycle yields new evidence or a materially changed validation result.",
     "If work cannot continue, still close the Turn with an explicit result and state the unresolved outcome, attempted evidence, and blocker. Application lifecycle is completed, paused for a real external action, or aborted; execution errors are completed(error), not a top-level failed state.",
   ]));
 

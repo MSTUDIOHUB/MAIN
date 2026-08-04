@@ -560,6 +560,33 @@ test("native and compatibility tool protocols share a bounded decision output bu
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      { payload: { mode: "execute" } },
+      false,
+      resolved,
+      "closed_recovery",
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS,
+    ),
+    "a closed action window uses the recovery ceiling on its first request",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      { payload: { mode: "execute" } },
+      false,
+      resolved,
+      null,
+      true,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_MAX_OUTPUT_TOKENS,
+    ),
+    "a named contract-only decision has enough room for schema-complete arguments while prose remains separately capped",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
       command,
       true,
       resolved,
@@ -569,9 +596,78 @@ test("native and compatibility tool protocols share a bounded decision output bu
       providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS,
     ),
   );
+
+  for (const [mode, expected] of [
+    ["execute", providerRequest.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS],
+    ["validate", providerRequest.RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS],
+    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS],
+  ]) {
+    assert.equal(
+      providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+        { payload: { mode } },
+        false,
+        resolved,
+      ),
+      Math.min(resolved.outputBudget, expected),
+    );
+  }
+  assert.equal(
+    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
+      {
+        payload: {
+          mode: "execute",
+          recoveryPressure: { reason: "empty_response", occurrence: 1 },
+        },
+      },
+      false,
+      resolved,
+    ),
+    Math.min(
+      resolved.outputBudget,
+      providerRequest.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS,
+    ),
+  );
 });
 
 test("source-only effect pressure uses capability-gated action decoding", () => {
+  assert.ok(
+    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT >
+      providerRequest.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+    "a complete multi-file contract has a bounded but schema-sized envelope while ordinary forced actions stay terse",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "explicit",
+      sourceOnlyFrontier: true,
+      hasMutationTool: false,
+      providerSupportsReasoningToggle: true,
+      contractOnlyAction: true,
+    }),
+    "off",
+    "contract formation decodes committed evidence instead of opening a second hidden analysis phase",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "explicit",
+      sourceOnlyFrontier: true,
+      hasMutationTool: false,
+      providerSupportsReasoningToggle: false,
+      contractOnlyAction: true,
+    }),
+    "explicit",
+    "reasoning policy never invents an unsupported provider toggle",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionReasoningRequest({
+      configured: "auto",
+      sourceOnlyFrontier: false,
+      hasMutationTool: true,
+      providerSupportsReasoningToggle: true,
+      structuredActionRequired: true,
+    }),
+    "off",
+    "a closed state-machine action boundary decodes a tool immediately instead of opening another hidden essay",
+  );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
@@ -609,8 +705,8 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
       recoveringFromRejectedAction: true,
       recoveryStage: "reconsider",
     }),
-    "auto",
-    "recovery restores configured reasoning instead of decoding the same rejected action again",
+    "off",
+    "a rejected structured action switches directly to bounded action decoding",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
@@ -621,8 +717,8 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
       recoveringFromRejectedAction: true,
       recoveryStage: "reframe",
     }),
-    "explicit",
-    "a sustained rejected-action loop upgrades reasoning only through a documented provider capability",
+    "off",
+    "a sustained rejected-action loop cannot reopen long-form reasoning",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({

@@ -137,6 +137,9 @@ function createRun(event, runIndex) {
     providerActionRejections: 0,
     maxProviderRecoveryOccurrence: 0,
     sourceOnlyFrontierContexts: 0,
+    providerActionWindows: 0,
+    correctiveMutationActionWindows: 0,
+    closedRecoveryActionWindows: 0,
     totalToolCalls: 0,
     unclassifiedToolCalls: 0,
     readFileCalls: 0,
@@ -151,6 +154,8 @@ function createRun(event, runIndex) {
     actualDroppedMessages: 0,
     subagentRequests: 0,
     subagentContextHandoffs: 0,
+    subagentAutoJoins: 0,
+    subagentClosedObservationLoops: 0,
     subagentsJoined: 0,
     completedSubagentsWithoutReport: 0,
     subagentProviderActions: 0,
@@ -175,6 +180,7 @@ function createRun(event, runIndex) {
     oversizedMutationRejections: 0,
     outsideWorkspaceMutationRejections: 0,
     correctiveTargetRejections: 0,
+    mutationSourceTextMismatches: 0,
     investigationMutationSurfaceViolations: 0,
     sourceGapMutationSurfaceViolations: 0,
     mutationRequestsWithoutLease: 0,
@@ -317,6 +323,16 @@ function applyEventToRun(run, event) {
     if (payload.sourceOnlyFrontier === true) {
       run.sourceOnlyFrontierContexts += 1;
     }
+    const providerActionWindow = asString(payload.providerActionWindow);
+    if (providerActionWindow) {
+      run.providerActionWindows += 1;
+      if (providerActionWindow === "corrective_mutation") {
+        run.correctiveMutationActionWindows += 1;
+      }
+      if (providerActionWindow === "closed_recovery") {
+        run.closedRecoveryActionWindows += 1;
+      }
+    }
     run.maxAvailableContextEntries = Math.max(
       run.maxAvailableContextEntries,
       asNonNegativeInteger(payload.availableContextEntries),
@@ -411,6 +427,12 @@ function applyEventToRun(run, event) {
   ) {
     run.correctiveTargetRejections += 1;
   }
+  if (
+    event.event === "store.runtime_v2_tool_execution_blocked" &&
+    payload.reason === "mutation_source_text_mismatch"
+  ) {
+    run.mutationSourceTextMismatches += 1;
+  }
   if (event.event === "store.runtime_v2_validation_fallback_selected") {
     run.validationFallbacks += 1;
   }
@@ -457,6 +479,14 @@ function applyEventToRun(run, event) {
   }
   if (event.event === "store.runtime_v2_subagent_context_handoff") {
     run.subagentContextHandoffs += 1;
+  }
+  if (event.event === "store.runtime_v2_subagent_auto_join") {
+    run.subagentAutoJoins += 1;
+  }
+  if (
+    event.event === "store.runtime_v2_subagent_closed_observation_loop"
+  ) {
+    run.subagentClosedObservationLoops += 1;
   }
   if (event.event === "store.runtime_v2_subagent_joined") {
     run.subagentsJoined += 1;
@@ -667,8 +697,13 @@ function buildAggregate(runs) {
     providerActionRejections: 0,
     maxProviderRecoveryOccurrence: 0,
     sourceOnlyFrontierContexts: 0,
+    providerActionWindows: 0,
+    correctiveMutationActionWindows: 0,
+    closedRecoveryActionWindows: 0,
     subagentRequests: 0,
     subagentContextHandoffs: 0,
+    subagentAutoJoins: 0,
+    subagentClosedObservationLoops: 0,
     subagentsJoined: 0,
     completedSubagentsWithoutReport: 0,
     subagentProviderActions: 0,
@@ -692,6 +727,7 @@ function buildAggregate(runs) {
     oversizedMutationRejections: 0,
     outsideWorkspaceMutationRejections: 0,
     correctiveTargetRejections: 0,
+    mutationSourceTextMismatches: 0,
     investigationMutationSurfaceViolations: 0,
     sourceGapMutationSurfaceViolations: 0,
     mutationRequestsWithoutLease: 0,
@@ -740,8 +776,13 @@ function buildAggregate(runs) {
       "providerRecoveryStallClosures",
       "providerActionRejections",
       "sourceOnlyFrontierContexts",
+      "providerActionWindows",
+      "correctiveMutationActionWindows",
+      "closedRecoveryActionWindows",
       "subagentRequests",
       "subagentContextHandoffs",
+      "subagentAutoJoins",
+      "subagentClosedObservationLoops",
       "subagentsJoined",
       "completedSubagentsWithoutReport",
       "subagentProviderActions",
@@ -765,6 +806,7 @@ function buildAggregate(runs) {
       "oversizedMutationRejections",
       "outsideWorkspaceMutationRejections",
       "correctiveTargetRejections",
+      "mutationSourceTextMismatches",
       "investigationMutationSurfaceViolations",
       "sourceGapMutationSurfaceViolations",
       "mutationRequestsWithoutLease",

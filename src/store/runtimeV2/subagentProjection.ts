@@ -132,22 +132,30 @@ export function reconcileRuntimeV2SubagentEvents(
     if (runtimeEvent.type === "subagents.scheduled") {
       for (const job of runtimeEvent.jobs) {
         if (hasSubagentEvent(next, "subagent.created", job.id)) continue;
+        const implementation = job.taskKind === "implement" &&
+          job.accessMode === "write";
         const snapshot: SubagentRunSnapshot = {
           id: job.id,
           parentTurnId: run.turnId,
           threadId: run.sessionKey,
           name: job.name || job.scopeKey,
           role: job.role || (
-            language === "zh" ? "只读调查" : "Read-only investigation"
+            implementation
+              ? language === "zh" ? "实现负责人" : "Implementation owner"
+              : language === "zh" ? "只读调查" : "Read-only investigation"
           ),
           objective: job.objective,
           scopeKey: job.scopeKey,
           scope: job.allowedPaths.join(", "),
           allowedPaths: [...job.allowedPaths],
           expectedOutput: job.expectedOutput || (
-            language === "zh"
-              ? "返回带来源的只读调查证据"
-              : "Return sourced read-only investigation evidence"
+            implementation
+              ? language === "zh"
+                ? "返回一个可在汇合时校验提交的暂存修改事务"
+                : "Return one staged mutation transaction for validated join-time commit"
+              : language === "zh"
+                ? "返回带来源的只读调查证据"
+                : "Return sourced read-only investigation evidence"
           ),
           runId: job.run.runId,
           parentRunId: job.parentRunId,
@@ -180,11 +188,19 @@ export function reconcileRuntimeV2SubagentEvents(
       const activityId = `runtime-v2:${runtimeEvent.eventId}`;
       if (hasSubagentActivity(next, activityId)) continue;
       const phase = runtimeEvent.telemetry.phase;
+      const implementation = job.taskKind === "implement" &&
+        job.accessMode === "write";
       const title = phase === "request_opened"
-        ? language === "zh" ? "已启动只读调查" : "Read-only investigation started"
+        ? implementation
+          ? language === "zh" ? "已启动范围互斥的实现任务" : "Scoped implementation started"
+          : language === "zh" ? "已启动只读调查" : "Read-only investigation started"
         : phase === "first_token"
-          ? language === "zh" ? "正在分析范围内证据" : "Analyzing scoped evidence"
-          : language === "zh" ? "正在整理调查结果" : "Summarizing investigation";
+          ? implementation
+            ? language === "zh" ? "正在形成暂存修改" : "Preparing staged mutation"
+            : language === "zh" ? "正在分析范围内证据" : "Analyzing scoped evidence"
+          : implementation
+            ? language === "zh" ? "正在整理实现回报" : "Summarizing implementation"
+            : language === "zh" ? "正在整理调查结果" : "Summarizing investigation";
       const activity: SubagentActivity = {
         id: activityId,
         timestampMs: runtimeEvent.telemetry.at,

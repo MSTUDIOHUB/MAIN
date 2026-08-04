@@ -64,12 +64,12 @@ export async function requestRuntimeV2ToolPermission(input: {
   readonly args: Record<string, unknown>;
   readonly target: string;
   readonly risk: ToolRiskLevel;
-  readonly localFileReadPath: string;
+  readonly permissionTarget: string;
   readonly signal?: AbortSignal;
 }): Promise<ToolReviewDecision> {
   const set = input.ports.set;
   const normalizedTarget = normalizeLocalFileReadPath(
-    input.localFileReadPath,
+    input.permissionTarget,
   );
   if (!set || !normalizedTarget) {
     return {
