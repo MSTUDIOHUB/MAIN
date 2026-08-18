@@ -10,12 +10,6 @@ import { finiteValidationCommandRejection } from "./executionValidationCommand";
 export const RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME =
   "record_execution_contract";
 
-/** Contract schema repair is a state-bound protocol correction, not an
- * unbounded reasoning phase. Three complete rejected submissions are enough
- * to prove that the current model/request cannot establish safe mutation
- * authority for this Run. */
-export const RUNTIME_V2_EXECUTION_CONTRACT_MAX_REPAIR_ATTEMPTS = 3;
-
 export type RuntimeV2ExecutionContractOperation =
   | "modify"
   | "create"
@@ -49,16 +43,6 @@ export interface RuntimeV2ExecutionContract {
   readonly revisionReason: string | null;
   readonly sourceEvidenceIds: readonly string[];
   readonly recordedAtSequence: number;
-}
-
-export interface RuntimeV2ExecutionContractReadWindow {
-  readonly supplementalReadBatches: number;
-  readonly closed: boolean;
-}
-
-export interface RuntimeV2ExecutionContractRepair {
-  readonly attempts: number;
-  readonly latestSequence: number;
 }
 
 export const RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL: ToolDefinition = {
@@ -361,132 +345,6 @@ export function deriveRuntimeV2ExecutionContract(
     };
   }
   return contract;
-}
-
-/**
- * A malformed initial contract or revision is a closed protocol repair, not
- * a new inspect/edit decision. Keep the model on the contract tool until one
- * complete submission is accepted; otherwise a small schema mistake can
- * reopen broad reads and turn correction into another repository tour.
- */
-export function deriveRuntimeV2ExecutionContractRepair(
-  aggregate: TurnAggregateV1 | null,
-): RuntimeV2ExecutionContractRepair | null {
-  if (!aggregate) return null;
-  const commands = scheduledCommandsByKey(aggregate);
-  let attempts = 0;
-  let latestSequence = 0;
-  for (const event of aggregate.events) {
-    if (event.type !== "tool.completed") continue;
-    const command = commands.get(event.idempotencyKey);
-    if (
-      command?.kind !== "execute_tool" ||
-      command.payload.toolName !==
-        RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
-    ) {
-      continue;
-    }
-    if (event.status === "succeeded") {
-      attempts = 0;
-      latestSequence = 0;
-      continue;
-    }
-    attempts += 1;
-    latestSequence = event.sequence;
-  }
-  return attempts > 0 ? { attempts, latestSequence } : null;
-}
-
-export function runtimeV2ExecutionContractRequired(
-  aggregate: TurnAggregateV1 | null,
-): boolean {
-  if (
-    !aggregate ||
-    aggregate.strategy !== "execute" ||
-    deriveRuntimeV2ExecutionContract(aggregate)
-  ) {
-    return false;
-  }
-  const mutationCommitted = aggregate.evidence.some((evidence) =>
-    evidence.kind === "mutation"
-  );
-  if (mutationCommitted) return false;
-  const targets = versionedSourceEvidenceBefore(aggregate)
-    .map((evidence) => normalizeTarget(evidence.target))
-    .filter(Boolean);
-  const distinctTargets: string[] = [];
-  for (const target of targets) {
-    if (!distinctTargets.some((candidate) =>
-      workspacePathsReferToSameFile(candidate, target)
-    )) {
-      distinctTargets.push(target);
-    }
-  }
-  return distinctTargets.length >= 2;
-}
-
-/**
- * Once a direct Execute has enough independent source owners to require a
- * contract, permit at most two additional provider-selected source batches
- * for specifically missing causal edges. The following decision is
- * contract-only.
- * Counting provider batches rather than individual calls preserves genuine
- * parallel reads without turning plan formation into an unbounded repository
- * tour. The boundary is reconstructed from provider/tool ledger identities.
- */
-export function runtimeV2ExecutionContractReadWindow(
-  aggregate: TurnAggregateV1 | null,
-): RuntimeV2ExecutionContractReadWindow {
-  if (
-    !aggregate ||
-    !runtimeV2ExecutionContractRequired(aggregate)
-  ) {
-    return { supplementalReadBatches: 0, closed: false };
-  }
-  const commands = scheduledCommandsByKey(aggregate);
-  const sourceTargetsByToolCallId = new Map<string, string[]>();
-  for (const event of aggregate.events) {
-    if (event.type !== "tool.completed" || event.status !== "succeeded") {
-      continue;
-    }
-    const command = commands.get(event.idempotencyKey);
-    const toolCallId = boundedString(command?.payload.toolCallId, 256);
-    const targets = event.evidence
-      .filter((evidence) => evidence.kind === "source" && !!evidence.version)
-      .map((evidence) => normalizeTarget(evidence.target))
-      .filter(Boolean);
-    if (toolCallId && targets.length > 0) {
-      sourceTargetsByToolCallId.set(toolCallId, targets);
-    }
-  }
-  const distinctTargets: string[] = [];
-  let thresholdProviderSequence: number | null = null;
-  let supplementalReadBatches = 0;
-  for (const event of aggregate.events) {
-    if (event.type !== "provider.responded") continue;
-    const batchTargets = event.result.toolCalls.flatMap((call) =>
-      sourceTargetsByToolCallId.get(call.id) || []
-    );
-    if (batchTargets.length === 0) continue;
-    if (thresholdProviderSequence !== null) {
-      supplementalReadBatches += 1;
-      continue;
-    }
-    for (const target of batchTargets) {
-      if (!distinctTargets.some((candidate) =>
-        workspacePathsReferToSameFile(candidate, target)
-      )) {
-        distinctTargets.push(target);
-      }
-    }
-    if (distinctTargets.length >= 2) {
-      thresholdProviderSequence = event.sequence;
-    }
-  }
-  return {
-    supplementalReadBatches,
-    closed: supplementalReadBatches >= 2,
-  };
 }
 
 export function validateRuntimeV2ExecutionContractSubmission(input: {

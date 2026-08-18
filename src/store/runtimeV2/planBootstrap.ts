@@ -22,6 +22,7 @@ import {
 } from "./planReviewProjection";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
+import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
 import { planSettlement, terminalPlanOutcome } from "./planSettlement";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
@@ -201,7 +202,8 @@ export async function bootstrapRuntimeV2Plan(
     };
   }
   if (existing?.aggregate.phase === "reviewing") {
-    const review = resolveRuntimeV2PlanReviewFromAggregate(existing.aggregate);
+    await ledger.reconcileSealedPlanHandoffs();
+    const review = resolveRuntimeV2PlanReviewFromAggregate(ledger.snapshot()!);
     if (!review?.pending) {
       throw new Error("RUNTIME_V2_PLAN_REVIEW_AUTHORITY_INVALID");
     }
@@ -209,13 +211,29 @@ export async function bootstrapRuntimeV2Plan(
     return { settlement: planSettlement(input.context) };
   }
   if (!existing) {
+    const admission = resolveRuntimeV2ObjectiveAdmission(
+      input.context,
+      turn.userPrompt,
+    );
     await ledger.append({
       type: "turn.admitted",
       turn: identity.turn,
       strategy: "plan",
-      objective: turn.userPrompt,
-      constraints: [],
-      acceptanceCriteria: [],
+      subagentRequirement:
+        input.context.turnInputContextSignals?.subagentRequirement === "required"
+          ? "required"
+          : "optional",
+      objective: admission.objective,
+      constraints: admission.constraints,
+      acceptanceCriteria: admission.acceptanceCriteria.map(
+        (criterion) => criterion.text,
+      ),
+      acceptanceCriterionIds: admission.acceptanceCriteria.map(
+        (criterion) => criterion.id,
+      ),
+      acceptanceEvidenceRequirements: admission.acceptanceCriteria.map(
+        (criterion) => criterion.evidenceRequirement || "behavioral",
+      ),
     });
     await ledger.append({
       type: "run.started",
@@ -269,6 +287,7 @@ export async function bootstrapRuntimeV2Plan(
       turn,
       context: input.context,
       overview: collected.overview,
+      subagentRequirement: ledger.snapshot()?.subagentRequirement,
     }),
   };
 }

@@ -1650,6 +1650,127 @@ test("local Rust streams keep slow genuine visible output and native tool progre
   assert.equal(result.toolCalls[0]?.name, "read_file");
 });
 
+test("caller-owned Runtime streams survive legal empty keepalives past 120s and mark only model progress", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const lifecycle = [];
+  const errors = [];
+  const originalNow = Date.now;
+  const startedAt = 1_000_000;
+  let now = startedAt;
+  Date.now = () => now;
+
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const emptyKeepalive = (streamId) => `data: ${JSON.stringify({
+    id: streamId,
+    object: "chat.completion.chunk",
+    created: 0,
+    model: "keepalive",
+    choices: [{
+      index: 0,
+      delta: { role: "assistant", content: "" },
+      finish_reason: null,
+    }],
+  })}\n\n`;
+
+  try {
+    const { streamChatCompletion } = await loadStreamingModule(
+      async (command, args) => {
+        invokeCalls.push(command);
+        if (command === "cancel_chat_stream") return undefined;
+        assert.equal(command, "start_chat_stream");
+        const streamId = args.streamId;
+        queueMicrotask(() => {
+          // oMLX emits an immediate protocol-valid empty role chunk and then
+          // another no-op frame every ten seconds while prefill or buffered
+          // native-tool generation is still healthy. These frames prove only
+          // transport liveness; they are not model/semantic progress.
+          for (let elapsedMs = 0; elapsedMs <= 120_000; elapsedMs += 10_000) {
+            now = startedAt + elapsedMs;
+            listeners.get("chat-stream-chunk")?.({
+              payload: {
+                stream_id: streamId,
+                chunk: emptyKeepalive(streamId),
+              },
+            });
+          }
+          now = startedAt + 120_010;
+          listeners.get("chat-stream-chunk")?.({
+            payload: {
+              stream_id: streamId,
+              chunk: `data: ${JSON.stringify({
+                id: streamId,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      index: 0,
+                      id: "call_after_buffered_generation",
+                      function: {
+                        name: "read_file",
+                        arguments: '{"path":"src/main.js"}',
+                      },
+                    }],
+                  },
+                  finish_reason: "tool_calls",
+                }],
+              })}\n\n`,
+            },
+          });
+          listeners.get("chat-stream-done")?.({
+            payload: { stream_id: streamId, status: "ok", error: null },
+          });
+        });
+        return undefined;
+      },
+      listenMock,
+    );
+
+    let result;
+    await assert.doesNotReject(async () => {
+      result = await streamChatCompletion(
+        [{ role: "user", content: "inspect the current source" }],
+        {
+          baseUrl: "http://127.0.0.1:8000/v1",
+          apiKey: "not-needed",
+          model: "local-model",
+          provider: "OMLX",
+          useRustProxy: true,
+        },
+        {
+          onToken: () => {},
+          onDone: () => {},
+          onError: (error) => errors.push(error.message),
+          onLifecycle: (event) => lifecycle.push(event),
+        },
+        undefined,
+        undefined,
+        32_768,
+        { contextOwnership: "caller" },
+      );
+    });
+
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0]?.name, "read_file");
+    assert.deepEqual(errors, []);
+    assert.deepEqual(invokeCalls, ["start_chat_stream"]);
+    const modelProgress = lifecycle.filter((event) =>
+      event.phase === "model_progress"
+    );
+    assert.equal(
+      modelProgress.length,
+      1,
+      "empty role/keepalive frames must not be projected as model progress",
+    );
+    assert.equal(modelProgress[0].elapsedMs, 120_010);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("active reasoning is transport progress and is not a no-visible timeout", async () => {
   const {
     shouldStopActionlessStream,

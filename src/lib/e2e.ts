@@ -73,7 +73,10 @@ import {
 } from "./turnRuntimeContract";
 import { createTurnRuntimeCheckpoint } from "./turnRuntimeCheckpoint";
 import { buildAssistantStageCheckpoint } from "./assistantProgressPresentation";
-import { normalizeRuntimeV2Checkpoint } from "./runtime-v2";
+import {
+  deriveRuntimeV2PlanExecutionFrontier,
+  normalizeRuntimeV2Checkpoint,
+} from "./runtime-v2";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -9571,6 +9574,13 @@ function seedRealOmlxPlanFlowScenario() {
           target: runtimeV2CommandTarget(event.command),
           runtimeOwnedPlanArtifact:
             event.command?.payload?.runtimeOwnedPlanArtifact === true,
+          sourceToolCallId:
+            typeof event.command?.payload?.toolCallId === "string"
+              ? event.command.payload.toolCallId
+              : "",
+          jobIds: Array.isArray(event.command?.payload?.jobIds)
+            ? event.command.payload.jobIds.map(String)
+            : [],
           status: receipt?.status || "scheduled",
           actionFingerprint: receipt?.actionFingerprint || "",
           completedAt: receipt?.completedAt || null,
@@ -9607,11 +9617,13 @@ function seedRealOmlxPlanFlowScenario() {
           ?.telemetry?.at || null;
       return {
         id: job.id,
+        parentRunId: job.parentRunId || "",
         scopeKey: job.scopeKey,
         sourceToolCallId: job.sourceToolCallId || "",
         name: job.name || "",
         role: job.role || "",
         taskKind: job.taskKind || "explore",
+        accessMode: job.accessMode || "read",
         objective: job.objective || "",
         successCriteria: job.successCriteria || "",
         status: job.status,
@@ -9768,7 +9780,10 @@ function seedRealOmlxPlanFlowScenario() {
     const runtimeV2Debug = realOmlxDebugTail
       .flatMap((entry: any) => {
       const source = String(entry?.source || "");
-      if (!source.includes("runtime_v2")) return [];
+      if (
+        !source.includes("runtime_v2") &&
+        !source.endsWith(".model_lane_admission")
+      ) return [];
       let data: unknown = entry?.message;
       if (typeof data === "string") {
         const rawData = data;
@@ -9802,6 +9817,7 @@ function seedRealOmlxPlanFlowScenario() {
       turnIdentity: runtimeV2Aggregate.turn || null,
       runIdentity: runtimeV2Aggregate.run?.identity || null,
       phase: runtimeV2Aggregate.phase || null,
+      objective: runtimeV2Aggregate.objective || null,
       terminalOutcome: runtimeV2Aggregate.terminalOutcome || null,
           evidence: (runtimeV2Aggregate.evidence || []).map(
             (evidence: any) => ({
@@ -9826,6 +9842,13 @@ function seedRealOmlxPlanFlowScenario() {
           ? {
               idempotencyKey: event.command?.idempotencyKey || "",
               commandKind: event.command?.kind || "",
+              sourceToolCallId:
+                typeof event.command?.payload?.toolCallId === "string"
+                  ? event.command.payload.toolCallId
+                  : "",
+              jobIds: Array.isArray(event.command?.payload?.jobIds)
+                ? event.command.payload.jobIds.map(String)
+                : [],
             }
           : {}),
         ...(event.type === "command.completed"
@@ -9836,6 +9859,7 @@ function seedRealOmlxPlanFlowScenario() {
               idempotencyKey: event.idempotencyKey,
               status: event.status,
               evidence: event.evidence || [],
+              receiptOrigin: event.receiptOrigin || null,
             }
           : {}),
         ...(event.type === "validation.completed"
@@ -9853,12 +9877,43 @@ function seedRealOmlxPlanFlowScenario() {
         ...(event.type === "subagent.telemetry"
           ? { telemetry: event.telemetry }
           : {}),
+        ...(event.type === "subagents.scheduled"
+          ? {
+              maxActiveSubagents: event.maxActiveSubagents,
+              jobs: (event.jobs || []).map((job: any) => ({
+                id: job.id,
+                parentRunId: job.parentRunId || "",
+                sourceToolCallId: job.sourceToolCallId || "",
+                scopeKey: job.scopeKey || "",
+                taskKind: job.taskKind || "",
+                accessMode: job.accessMode || "",
+                allowedPaths: job.allowedPaths || [],
+                status: job.status || "",
+                requestedAt: job.requestedAt || null,
+              })),
+            }
+          : {}),
         ...(event.type === "subagent.completed"
           ? {
               jobId: event.jobId,
               status: event.status,
               evidence: event.evidence || [],
               report: event.report || null,
+            }
+          : {}),
+        ...(event.type === "subagent.handoff_delivered"
+          ? {
+              jobId: event.jobId,
+              contextEntryId: event.contextEntryId,
+              evidenceIds: event.evidenceIds || [],
+            }
+          : {}),
+        ...(event.type === "subagent.handoff_applied"
+          ? {
+              jobId: event.jobId,
+              evidenceIds: event.evidenceIds || [],
+              sourceEventId: event.sourceEventId,
+              handoffSource: event.source,
             }
           : {}),
         ...(event.type === "work_plan.sealed" ||
@@ -9902,6 +9957,8 @@ function seedRealOmlxPlanFlowScenario() {
           workPlan: runtimeV2Aggregate.workPlan || null,
           sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
           planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+          planExecutionFrontier:
+            deriveRuntimeV2PlanExecutionFrontier(runtimeV2Aggregate),
           subagents: runtimeV2SubagentTelemetry,
       subagentConcurrency: {
         requestCount: runtimeV2SubagentIntervals.length,

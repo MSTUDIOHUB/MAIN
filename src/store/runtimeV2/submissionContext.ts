@@ -1,4 +1,5 @@
 import type { ResolvedRunIntent } from "../../lib/runIntent";
+import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { TurnInputContextSignals } from "../../lib/turnIntake";
 import type {
@@ -26,6 +27,9 @@ export interface RuntimeV2SubmissionContext {
   readonly runtimeRunIntent: ResolvedRunIntent;
   /** Exact live project rules captured at the Turn safe boundary. */
   readonly workspaceInstructionContext?: string;
+  /** Immutable catalog revision shared by parent, Plan, Goal slices and safe
+   * tool execution for this Run. */
+  readonly skillCatalog?: SkillCatalogSnapshot | null;
   readonly goalCreationAuthorization?: GoalCreationAuthorization | null;
   readonly goalContinuationAuthorization?: GoalContinuationAuthorization | null;
   readonly abortCtrl: AbortController;
@@ -51,6 +55,46 @@ export interface RuntimeV2SubmissionContext {
         | "behavioral"
         | "interaction";
     }[];
+  };
+}
+
+export interface RuntimeV2ObjectiveAdmission {
+  readonly objective: string;
+  readonly constraints: readonly string[];
+  readonly acceptanceCriteria: readonly {
+    readonly id: string;
+    readonly text: string;
+    readonly evidenceRequirement?: "static" | "behavioral" | "interaction";
+  }[];
+}
+
+/**
+ * Preserve an upstream Goal admission when present. An ordinary raw Turn has
+ * no trusted semantic classifier, so Runtime binds the exact user request as
+ * one opaque criterion instead of guessing requirements from prose.
+ */
+export function resolveRuntimeV2ObjectiveAdmission(
+  context: RuntimeV2SubmissionContext,
+  fallbackObjective: string,
+): RuntimeV2ObjectiveAdmission {
+  const supplied = context.executeAdmission;
+  if (supplied?.acceptanceCriteria.length) {
+    return {
+      objective: String(supplied.objective || fallbackObjective).trim(),
+      constraints: [...(supplied.constraints || [])],
+      acceptanceCriteria: supplied.acceptanceCriteria.map((criterion) => ({
+        ...criterion,
+      })),
+    };
+  }
+  const objective = String(fallbackObjective || "").trim();
+  return {
+    objective,
+    constraints: [],
+    acceptanceCriteria: [{
+      id: "criterion-user-objective",
+      text: objective,
+    }],
   };
 }
 

@@ -4,6 +4,8 @@ import {
 } from "../../lib/providerLaneSettings";
 import {
   DEFAULT_PROVIDER_LANE_PROFILE_V1,
+  deriveRuntimeV2PlanExecutionCoverage,
+  deriveRuntimeV2PlanExecutionFrontier,
   deriveRuntimeV2PlanSourceFreshness,
   type ProviderLaneProfileV1,
 } from "../../lib/runtime-v2";
@@ -52,6 +54,7 @@ export function recordApprovedPlanContext(
   const approved = approvedPlanForCurrentTurn(input);
   if (!aggregate || !approved) return;
   const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
+  const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
   const content = [
     "This sealed WorkPlan is the mutation and validation authority for the current Run.",
     JSON.stringify({
@@ -71,10 +74,27 @@ export function recordApprovedPlanContext(
             unversionedTargets: freshness.unversionedTargets,
           }
         : null,
+      executionFrontier: frontier
+        ? {
+            completedStepIndexes: frontier.completedStepIndexes,
+            readyStepIndexes: frontier.readyStepIndexes,
+            blockedStepIndexes: frontier.blockedStepIndexes,
+            readyMutationTargets: frontier.readyMutationTargets,
+            validationReady: frontier.validationReady,
+          }
+        : null,
     }, null, 2),
     freshness && !freshness.allFresh
       ? `Before the first mutation, call read_file for every missing exact target: ${freshness.missingTargets.join(", ") || "none"}. A stale target invalidates this approval.`
       : "",
+    frontier && !frontier.validationReady
+      ? [
+          "Execute only the currently ready WorkPlan steps and exact targets shown in executionFrontier.",
+          "Do not request a blocked step or any validation until Runtime advances the frontier from committed mutation receipts.",
+        ].join(" ")
+      : frontier?.validationReady
+        ? "All mutation stages are complete. Run the sealed required validations exactly as declared."
+        : "",
   ].join("\n\n");
   upsertRuntimeV2ContextAnchor(input.live, {
     key: "approved-work-plan",
@@ -90,16 +110,31 @@ export function recordApprovedPlanContext(
 export function preferredFiniteValidationCommand(
   input: RuntimeV2ExecutionPortsInput,
 ): string {
+  const aggregate = aggregateForCurrentTurn(input);
   const approved = approvedPlanForCurrentTurn(input);
-  const approvedValidation = approved?.plan.draft.validations.find(
-    (validation) =>
+  const coverage = aggregate
+    ? deriveRuntimeV2PlanExecutionCoverage(aggregate)
+    : null;
+  const approvedValidation = approved && coverage
+    ? coverage.missingRequiredValidationIndexes
+      .map((index) => approved.plan.draft.validations[index])
+      .find((validation) =>
+        validation?.kind === "finite_command" &&
+        String(validation.command || "").trim()
+      )
+    : approved?.plan.draft.validations.find((validation) =>
+      validation.required &&
       validation.kind === "finite_command" &&
-      String(validation.command || "").trim(),
-  );
+      String(validation.command || "").trim()
+    );
   const approvedCommand = String(approvedValidation?.command || "").trim();
   if (approvedCommand) return approvedCommand;
+  // Once every required WorkPlan validator has a current passing receipt,
+  // do not reopen the first command merely because it remains in the sealed
+  // catalog. Completion owns the next transition.
+  if (approved && coverage) return "";
   const contract = deriveRuntimeV2ExecutionContract(
-    aggregateForCurrentTurn(input),
+    aggregate,
   );
   const contractedValidation = contract?.validations.find((validation) =>
     validation.kind === "finite_command" &&

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
@@ -113,11 +113,71 @@ function exportedNames(
   return [];
 }
 
+const PYTHON_SYNTAX_PROBE = [
+  "import ast, sys",
+  "source = sys.stdin.read()",
+  "try:",
+  "    ast.parse(source, filename=sys.argv[1], mode='exec')",
+  "except SyntaxError as error:",
+  "    print(f'error\\t{error.lineno or 1}\\t{error.offset or 1}')",
+  "else:",
+  "    print('ok')",
+].join("\n");
+
+function pythonSyntaxResult(
+  rawPath: string,
+  content: string,
+): RealOmlxSourceSyntaxCheckResult {
+  const source = String(content || "");
+  const sourceTooLarge = Buffer.byteLength(source, "utf8") >
+    REAL_OMLX_WORKSPACE_PROXY_LIMITS.maxExplicitReadBytes;
+  const probe = spawnSync(
+    "python3",
+    ["-I", "-S", "-B", "-c", PYTHON_SYNTAX_PROBE, rawPath],
+    {
+      input: sourceTooLarge ? "" : source,
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 256 * 1024,
+    },
+  );
+  const receipt = String(probe.stdout || "").trim().split("\t");
+  const ok = !sourceTooLarge && !probe.error && probe.status === 0 &&
+    receipt.length === 1 && receipt[0] === "ok";
+  const syntaxError = !sourceTooLarge && !probe.error && probe.status === 0 &&
+    receipt.length === 3 && receipt[0] === "error";
+  const line = Math.max(1, Math.floor(Number(receipt[1]) || 1));
+  const column = Math.max(1, Math.floor(Number(receipt[2]) || 1));
+  const checkerFailed = !ok && !syntaxError;
+  const hasErrors = !ok;
+  return {
+    path: rawPath,
+    language: "python",
+    applicable: true,
+    hasErrors,
+    errorCount: hasErrors ? 1 : 0,
+    firstErrorLine: hasErrors ? line : null,
+    firstErrorColumn: hasErrors ? column : null,
+    errors: hasErrors
+      ? [{
+          line,
+          column,
+          kind: checkerFailed ? "python_syntax_checker_failed" : "parse_error",
+        }]
+      : [],
+    errorsTruncated: false,
+    moduleExports: [],
+  };
+}
+
 export function checkRealOmlxSourceSyntax(
   rawPath: string,
   content: string,
 ): RealOmlxSourceSyntaxCheckResult {
   const extension = path.extname(String(rawPath || "")).toLowerCase();
+  if (extension === ".py") {
+    return pythonSyntaxResult(rawPath, content);
+  }
   const scriptKinds: Record<string, ts.ScriptKind> = {
     ".js": ts.ScriptKind.JS,
     ".jsx": ts.ScriptKind.JSX,

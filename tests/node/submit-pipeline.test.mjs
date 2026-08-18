@@ -1733,6 +1733,7 @@ test("semantic metadata decision builds a stable request and callback guard cont
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["Uploads/screen.png"],
       subagentPreference: "unspecified",
+      subagentRequirement: "optional",
     },
     priorTurnContext: {
       userPrompt: "修复编辑器保存失败",

@@ -113,6 +113,14 @@ Plan Run 保留原始 objective，先用只读工具形成带版本的
 同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
 WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
+Plan 的八分钟共享 authoring 截止从 durable `run.started.at` 计算，恢复同一 Run
+不能获得新时限。完整 typed submission 第一次通过 transport/schema ingress、但被
+compiler、criteria 或 child-basis gate 拒绝时，ledger 记录一个固定的一次性
+submit-only repair lease；它不会因第二次拒绝、输出截断、transport fallback 或
+冷恢复而更新，且不会延长 child 生命周期或重新开放 discovery。普通 synthesis
+使用 Runtime context 已核准的输出预算；仅在 adapter 明确支持 reasoning toggle
+时，结构修复请求可关闭 reasoning，把预算留给唯一的 typed submission。
+
 Plan 的 canonical 顺序为：
 
 ```text
@@ -127,6 +135,11 @@ turn.admitted(strategy=plan)
     planReviewStatus = pending
     pause = approval / subject=plan
 ```
+
+child finding 的显式采用发生在 seal 之后：只有 sealed draft 的 exact basis 能产生
+`subagent.handoff_applied(source=work_plan)`。被拒、malformed 或长度截断的 provider
+结果不能靠正文中的 evidence ID 制造 adoption；如果 seal 已持久化而 receipt 尚未
+写入，reviewing 冷恢复按同一 seal event 幂等补齐。
 
 此时唯一合法 UI 兼容投影是：
 
@@ -187,13 +200,17 @@ typed validation primitive 的完成语义如下：
 
 ## 子智能体协作状态
 
-用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。该指导不制造强制阶段；真正的创建仍只在父 Run 活动、本轮尚有派生预算、provider lane 为父线程之外保留了真实请求容量且工具实际可见时发生。模型可在普通读取、修改或验证阶段按工作量自行决定是否启动，也可以不启动并直接完成；协作不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
+用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。用户明确选择“偏好协作”后，只要当前目标包含至少两个可独立、边界明确且能与主体重叠的工作包，并且 provider lane 仍有 child 容量、工具实际可见，执行提示就应优先在容量内派生有用的 child，同时要求父线程继续推进不依赖 child 的工作；普通“允许协作”仍由模型按收益判断。该偏好不制造强制阶段，可在读取、修改或验证任一阶段使用；简单或线性任务直接执行，协作也不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
 
 `explore`、`review`、`validate` 保持只读，适合并行调查、独立评审和有限验证。`implement/write` 只在父线程已经通过版本化源码形成证据化方案后可用：调用必须指定 create/modify/delete、具体 `implementation_plan`、成功标准和每个精确文件目标；不能只授权目录再让 child 自行选择写入文件。多个实现 child 的写入范围必须互不重叠；modify/delete 的每个目标还必须在创建请求中拥有当前版本源码权威。实现 child 可以读取自己的范围并形成一个修改事务，但事务先保存在进程内，不立即改变共享工作区。父线程继续处理不依赖子结果的工作，只在结果成为依赖或最终收口时 join。
 
 join 是提交边界：runtime 再检查 child 所有权、父 WorkPlan scope、源版本、工具权限、单次破坏性审批和源码语法预检，然后顺序提交事务并产生普通 mutation evidence。任一版本漂移、越权、审批拒绝或预检失败都会丢弃该事务，不留下部分共享写入。child 持有写范围期间，父线程和其他 child 对重叠路径的修改会被拒绝；最终 validation 也必须等所有实现事务完成或丢弃后再运行，防止验证旧工作区。恢复 action window 仍不把协作当作逃生分支，父线程必须先完成当前闭合动作。普通 Execute 不因总耗时关闭父 Run 或 child；只有用户取消、显式调用方预算或真实停滞/资源边界可以收口。
 
-本地 provider 未显式声明并发容量时，模型请求按 lane 串行，真实 child 请求容量为零；runtime 不再把父/子轮流占用同一个模型包装成并行协作。只有配置或已确认的 provider 请求容量大于一，才会在为父线程保留一个槽位后开放 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+provider 未显式声明并发容量时，模型 lane 先开放“父线程 + 一个 probe child”，再以真实首 chunk 重叠证明按 2 → 3 → 4 逐级增长；本地 lane 每次重叠准入前还必须通过当前设备内存保留量采样。产品总上限是四个模型请求，即一个父线程加最多三个 child；轮流占用同一 lane 不会被记作并行能力。显式配置可选择更小上限，OOM、HTTP 429、明确并发限制或持续内存压力会收缩 lane，并优先释放最新 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+
+显式要求 Plan 使用 child 时，协作获取是 discovery 中的独立硬门：未 admission 前只能请求精确 `spawn_subagent`，不能提前合成或封印 WorkPlan。该请求超时后只在同一实际 transport/surface 上有一次 90 秒以内且受原 Plan deadline 约束的恢复；失败 command 的稳定 reason code 随 checkpoint 持久化，因此冷启动不能重置次数。第二次同面超时直接 `blocked`，日志必须记录真实 attempted/effective transport，不能把名义 stage 切换冒充 wire fallback。
+
+Plan provider 的单请求 timeout 是 transport 无活动窗口，而不是完整生成的总墙钟：响应头、首个 chunk 与相邻 chunk 间隔分别受限，活跃流可以跨越多个窗口；空 keepalive 只证明连接仍存活，不得伪造模型进展、evidence 或 lane first-token。Plan 的 durable lifecycle deadline 仍是总时长唯一硬边界，compact synthesis recovery 必须同时收窄输出预算并在能力允许时关闭 reasoning。
 
 父、子 provider 工具调用共享同一 schema normalization：数值/布尔漂移、默认值、路径和编辑别名先规范化，schema 未声明字段直接丢弃，再计算动作 identity 并执行。child 对一个已返回 `CHILD_EVIDENCE_REPEAT` 的同一观察再次命中时，即使模型改变了无效范围或附带字段，也以结构化 `closed_observation_loop` 降级；只有输出窗口或版本真正变化才算进展。该边界由结果语义触发，不是 child 总耗时或固定轮数限制。
 

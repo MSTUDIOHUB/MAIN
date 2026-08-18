@@ -1182,7 +1182,9 @@ function TurnProcessDisclosure({
   if (count <= 0) return null;
   const details = [
     language === "zh" ? `${toolCount} 个工具` : `${toolCount} tool${toolCount === 1 ? "" : "s"}`,
-    language === "zh" ? `${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"}`,
+    changedFileCount > 0
+      ? (language === "zh" ? `${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"}`)
+      : "",
     elapsedSeconds > 0 ? `${Math.round(elapsedSeconds)}s` : "",
   ].filter(Boolean).join(" · ");
   const action = collapsed
@@ -3789,7 +3791,8 @@ export default function ChatArea({
     // A response-style turn can still execute real tools. Process visibility is
     // driven by those durable process blocks, not by the conversational intent
     // label; pure chat without tool/progress blocks remains unaffected.
-    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks;
+    // Non-workspace (global) sessions should not display workspace steps cards.
+    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks && !isGlobalChat;
     const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
     const shouldKeepContinuousProcessTimeline =
       !turnPresentation.showStateAnchor &&

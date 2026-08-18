@@ -10,6 +10,7 @@ import type { TaskBlock } from "../lib/taskTypes";
 import {
   normalizeTurnInputContextSignals,
   resolveEffectiveSubagentDelegationPreference,
+  resolveEffectiveSubagentRequirement,
   type SubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../lib/turnIntake";
@@ -104,6 +105,9 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
       rawUserInput: input.text,
       defaultPreference: input.subagentPreference ??
         (input.preferSubagents ? "preferred" : "unspecified"),
+    }),
+    subagentRequirement: resolveEffectiveSubagentRequirement({
+      rawUserInput: input.text,
     }),
     diagnosisRequirement: input.diagnosisRequirement,
   });

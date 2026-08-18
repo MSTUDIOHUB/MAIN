@@ -29,6 +29,50 @@ function strings(value: unknown, max: number, itemMax: number): string[] {
   )].slice(0, max);
 }
 
+const EVIDENCE_ID_ATOM = /[A-Za-z0-9_]/;
+const EVIDENCE_ID_CONNECTOR = /[.:/-]/;
+
+function evidenceIdContinuesAt(
+  value: string,
+  index: number,
+  direction: -1 | 1,
+): boolean {
+  if (index < 0 || index >= value.length) return false;
+  if (EVIDENCE_ID_ATOM.test(value[index]!)) return true;
+  if (!EVIDENCE_ID_CONNECTOR.test(value[index]!)) return false;
+  let cursor = index;
+  while (
+    cursor >= 0 &&
+    cursor < value.length &&
+    EVIDENCE_ID_CONNECTOR.test(value[cursor]!)
+  ) {
+    cursor += direction;
+  }
+  return cursor >= 0 &&
+    cursor < value.length &&
+    EVIDENCE_ID_ATOM.test(value[cursor]!);
+}
+
+function explicitlyReferencesEvidenceId(
+  value: string,
+  evidenceId: string,
+): boolean {
+  if (!evidenceId) return false;
+  let index = value.indexOf(evidenceId);
+  while (index >= 0) {
+    const before = index - 1;
+    const after = index + evidenceId.length;
+    if (
+      !evidenceIdContinuesAt(value, before, -1) &&
+      !evidenceIdContinuesAt(value, after, 1)
+    ) {
+      return true;
+    }
+    index = value.indexOf(evidenceId, index + evidenceId.length);
+  }
+  return false;
+}
+
 /** Compile a child-authored report only when every cited id belongs either to
  * an actual successful child observation or to versioned parent evidence that
  * was explicitly handed to a review child. Keeping the two collections
@@ -102,7 +146,9 @@ export function compileRuntimeV2SubagentTextReport(input: {
   const citedEvidence = [
     ...input.evidence,
     ...(input.inheritedEvidence || []),
-  ].filter((evidence) => input.summary.includes(evidence.id));
+  ].filter((evidence) =>
+    explicitlyReferencesEvidenceId(input.summary, evidence.id)
+  );
   return compileRuntimeV2SubagentReport({
     draft: {
       summary: input.summary,

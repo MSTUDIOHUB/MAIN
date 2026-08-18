@@ -485,7 +485,15 @@ export function buildSystemPrompt(
       : null,
   ]));
 
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const dayNamesEn = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayNamesZh = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+  const dayOfWeek = displayLanguage === "en" ? dayNamesEn[now.getDay()] : dayNamesZh[now.getDay()];
+  const currentDate = `${dateStr} (${dayOfWeek})`;
+
   sections.push(makeSection("ENVIRONMENT", [
+    `Current local date: ${currentDate}. Anchor all relative time references (e.g. today, this week, next week, current year) to this date.`,
     workspace
       ? `Workspace root: ${workspace}. Resolve relative file and command paths from this root.`
       : "No workspace is bound. Do not infer or scan a recent project; use only explicitly supplied context and exposed external readers.",

@@ -41,6 +41,7 @@ export type RuntimeV2Event =
       readonly type: "turn.admitted";
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
+      readonly subagentRequirement?: "optional" | "required";
       readonly objective: string;
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
@@ -75,6 +76,10 @@ export type RuntimeV2Event =
       readonly run: RuntimeV2RunIdentity;
       readonly idempotencyKey: string;
       readonly status: "succeeded" | "failed" | "canceled";
+      /** Stable cause for a failed control-plane command. The durable event,
+       * rather than transient logs or provider prose, owns bounded recovery
+       * decisions across process restarts. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "provider.responded";

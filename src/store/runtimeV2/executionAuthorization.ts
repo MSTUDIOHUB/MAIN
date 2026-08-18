@@ -15,9 +15,6 @@ import {
 } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
-  deriveRuntimeV2PlanSourceFreshness,
-  resolveRuntimeV2PlanMutationScope,
-  resolveRuntimeV2PlanValidationScope,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
@@ -25,7 +22,6 @@ import {
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   aggregateForCurrentTurn,
-  approvedPlanForCurrentTurn,
 } from "./executionAggregate";
 import {
   validateRuntimeV2MutationLease,
@@ -45,7 +41,6 @@ import {
   deriveRuntimeV2ExecutionContract,
   runtimeV2ExecutionContractAllowsTargets,
   runtimeV2ExecutionContractMutationTargets,
-  runtimeV2ExecutionContractRequired,
   validateRuntimeV2ExecutionContractSubmission,
 } from "./executionContract";
 import {
@@ -58,6 +53,10 @@ import {
   authorizationFor,
   type RuntimeV2ToolAuthorizationResult,
 } from "./executionAuthorizationContext";
+import {
+  validateToolAgainstApprovedPlan,
+  type RuntimeV2PlanToolAuthorizationResult,
+} from "./executionPlanAuthorization";
 
 export {
   authorizationFor,
@@ -86,16 +85,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
-}): {
-  readonly allowed: boolean;
-  readonly reason: string | null;
-  readonly failureKind:
-    | "not_authorized"
-    | "protocol_invalid"
-    | "source_mismatch"
-    | null;
-  readonly reasonCode: string | null;
-} {
+}): RuntimeV2PlanToolAuthorizationResult {
   const aggregate = aggregateForCurrentTurn(input.ports);
   const durableChildWritePending = (aggregate?.subagents || []).some(
     (job) =>
@@ -250,18 +240,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
     if (aggregate?.strategy === "execute") {
       const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
       if (
-        !executionContract &&
-        runtimeV2ExecutionContractRequired(aggregate)
-      ) {
-        return {
-          allowed: false,
-          reason:
-            "多个版本化源码责任方已经可见；必须先用 record_execution_contract 固化根因、精确修改范围和验收方法，再执行首次修改。",
-          failureKind: "protocol_invalid",
-          reasonCode: "execution_contract_required",
-        };
-      }
-      if (
         executionContract &&
         !validationCorrection?.active &&
         !runtimeV2ExecutionContractAllowsTargets({
@@ -328,69 +306,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (aggregate?.strategy !== "plan") {
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }
-  const approved = approvedPlanForCurrentTurn(input.ports);
-  if (!approved) {
-    return {
-      allowed: false,
-      reason: "当前 Plan 的批准权威无效或已过期，运行时拒绝执行外部效果。",
-      failureKind: "not_authorized",
-      reasonCode: "approved_plan_authority_missing",
-    };
-  }
-  if (isWorkspaceMutationToolName(input.toolName)) {
-    const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
-    const mutationAlreadyCommitted = aggregate.evidence.some(
-      (evidence) => evidence.kind === "mutation",
-    );
-    if (!mutationAlreadyCommitted && freshness && !freshness.allFresh) {
-      const stale = [...freshness.staleTargets, ...freshness.unversionedTargets];
-      return stale.length > 0
-        ? {
-            allowed: false,
-            reason: `已批准 WorkPlan 的源版本已变化或缺少版本权威：${stale.join(", ")}`,
-            failureKind: "not_authorized",
-            reasonCode: "approved_plan_source_version_stale",
-          }
-        : {
-            allowed: false,
-            reason: `执行已批准 WorkPlan 前必须重新读取当前目标：${freshness.missingTargets.join(", ")}`,
-            failureKind: "protocol_invalid",
-            reasonCode: "approved_plan_source_refresh_required",
-          };
-    }
-    const scope = resolveRuntimeV2PlanMutationScope({
-      plan: approved.plan,
-      requestedTargets: resolveWorkspaceMutationTargets(
-        input.toolName,
-        input.args,
-        input.target,
-      ),
-    });
-    if (!scope.allowed) {
-      return {
-        allowed: false,
-        reason: `修改目标不在已批准 WorkPlan 范围内：${scope.unexpectedTargets.join(", ") || "未解析目标"}`,
-        failureKind: "not_authorized",
-        reasonCode: "approved_plan_mutation_scope",
-      };
-    }
-  }
-  if (input.command.kind === "execute_validation") {
-    const scope = resolveRuntimeV2PlanValidationScope({
-      plan: approved.plan,
-      toolName: input.toolName,
-      args: input.args,
-    });
-    if (!scope.allowed) {
-      return {
-        allowed: false,
-        reason: "该验证调用与已批准 WorkPlan 中的命令或验证类型不一致。",
-        failureKind: "not_authorized",
-        reasonCode: "approved_plan_validation_scope",
-      };
-    }
-  }
-  return { allowed: true, reason: null, failureKind: null, reasonCode: null };
+  return validateToolAgainstApprovedPlan({ ...input, aggregate });
 }
 
 export async function authorizeToolForCurrentTurn(

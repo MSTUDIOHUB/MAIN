@@ -171,7 +171,7 @@
           "path": "skills-and-protocols.md",
           "title": "技能与协议包",
           "sidebarTitle": "技能与协议包",
-          "description": "使用提示词技能、工具型技能和协议包扩展 MAIN。"
+          "description": "使用 Agent Skills、工作区 SKILL.md 和协议包扩展 MAIN。"
         },
         {
           "slug": "feishu-remote-control",

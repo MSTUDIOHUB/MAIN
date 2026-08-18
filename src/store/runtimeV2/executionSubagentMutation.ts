@@ -7,6 +7,7 @@ import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   isWorkspaceMutationToolName,
+  resolveWorkspaceMutationRequests,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
 import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
@@ -97,7 +98,10 @@ async function readRawWorkspaceFile(
     { path, __raw: true },
     ports.context.runWorkspace || "",
     ports.context.runSessionKey,
-    { toolCatalog: authorizationFor(ports).toolCatalog },
+    {
+      toolCatalog: authorizationFor(ports).toolCatalog,
+      skillCatalog: ports.context.skillCatalog,
+    },
   ));
 }
 
@@ -327,12 +331,22 @@ export async function commitRuntimeV2StagedChildMutation(input: {
     }
     const scope = resolveRuntimeV2PlanMutationScope({
       plan: approved.plan,
+      aggregate,
       requestedTargets: input.staged.targets,
+      requestedMutations: resolveWorkspaceMutationRequests(
+        input.staged.toolName,
+        { ...input.staged.arguments },
+        input.staged.targets[0] || "",
+      ),
     });
     if (!scope.allowed) {
       return {
         committed: false,
-        message: `staged targets are outside the approved WorkPlan: ${scope.unexpectedTargets.join(", ")}`,
+        message: scope.blockedTargets.length > 0
+          ? `staged targets are outside the current approved WorkPlan dependency frontier: ${scope.blockedTargets.join(", ")}`
+          : scope.operationMismatchTargets.length > 0
+            ? `staged operations do not match the current approved WorkPlan step: ${scope.operationMismatchTargets.join(", ")}`
+            : `staged targets are outside the approved WorkPlan: ${scope.unexpectedTargets.join(", ")}`,
         evidence: [],
       };
     }
@@ -402,7 +416,10 @@ export async function commitRuntimeV2StagedChildMutation(input: {
     ),
     input.ports.context.runWorkspace || "",
     input.ports.context.runSessionKey,
-    { toolCatalog: authorizationFor(input.ports).toolCatalog },
+    {
+      toolCatalog: authorizationFor(input.ports).toolCatalog,
+      skillCatalog: input.ports.context.skillCatalog,
+    },
   );
   const evidence: RuntimeV2EvidenceReference[] = [];
   for (const [index, target] of input.staged.targets.entries()) {

@@ -23,6 +23,16 @@ async function loadInstructionsModule(ipcStubs) {
     if (specifier === "./ipc") {
       return ipcStubs;
     }
+    if (specifier === "./agentSkills") {
+      return {
+        loadSkillCatalog: ipcStubs.loadSkillCatalog || (async () => ({
+          entries: [],
+          explicitSkillIds: [],
+          warnings: [],
+          loadedAt: 1,
+        })),
+      };
+    }
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   const factory = new Function("exports", "module", "require", transpiled);
@@ -148,4 +158,46 @@ test("resolved project instructions render with complete content and source prov
   assert.ok(rendered.endsWith(longRule));
   assert.doesNotMatch(rendered, /session_memory/i);
   assert.doesNotMatch(rendered, /TRUNCATED/);
+});
+
+test("instruction admission keeps Agent Skills in a progressive catalog instead of rule layers", async () => {
+  let catalogInput = null;
+  const admittedCatalog = {
+    entries: [{ id: "panel:review", name: "review" }],
+    explicitSkillIds: ["panel:review"],
+    warnings: [],
+    loadedAt: 2,
+  };
+  const { loadResolvedInstructions } = await loadInstructionsModule({
+    globSearch: async () => [],
+    readFile: async () => "",
+    loadSkillCatalog: async (input) => {
+      catalogInput = input;
+      return admittedCatalog;
+    },
+  });
+  const skill = {
+    id: "review",
+    name: "review",
+    desc: "Review a change.",
+    content: "SKILL_BODY_SENTINEL",
+    active: true,
+    type: "instruction",
+  };
+
+  const resolved = await loadResolvedInstructions(
+    "/tmp/workspace",
+    [skill],
+    [],
+    "Use $review",
+  );
+
+  assert.equal(resolved.skillCatalog, admittedCatalog);
+  assert.equal(
+    resolved.layers.some((layer) => /SKILL_BODY_SENTINEL/.test(layer.content)),
+    false,
+  );
+  assert.equal(catalogInput.workspace, "/tmp/workspace");
+  assert.equal(catalogInput.userPrompt, "Use $review");
+  assert.equal(catalogInput.skills[0], skill);
 });

@@ -174,6 +174,7 @@ function normalizeDurableTurnInputContextSignals(
     mentionedFilePaths,
     attachedFilePaths,
     subagentPreference: record.subagentPreference as TurnInputContextSignals["subagentPreference"],
+    subagentRequirement: record.subagentRequirement as TurnInputContextSignals["subagentRequirement"],
     diagnosisRequirement: record.diagnosisRequirement as TurnInputContextSignals["diagnosisRequirement"],
   });
 }

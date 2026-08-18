@@ -990,6 +990,27 @@ export function readFile(path: string, workspace?: string): Promise<string> {
   return invoke<string>("read_file", { path, workspace });
 }
 
+export interface DiscoveredPersonalAgentSkill {
+  entryPath: string;
+  basePath: string;
+  content: string;
+  openaiYaml: string | null;
+  supportingFiles: string[];
+}
+
+/** Read only the standard $HOME/.agents/skills root. The Rust side resolves
+ * symlinks and containment before returning any content. */
+export async function discoverPersonalAgentSkills(): Promise<DiscoveredPersonalAgentSkill[]> {
+  const result = await invoke<unknown>("discover_personal_agent_skills");
+  return Array.isArray(result)
+    ? result.filter((entry): entry is DiscoveredPersonalAgentSkill =>
+        !!entry && typeof entry === "object" &&
+        typeof (entry as DiscoveredPersonalAgentSkill).entryPath === "string" &&
+        typeof (entry as DiscoveredPersonalAgentSkill).content === "string"
+      )
+    : [];
+}
+
 export function readFileWindow(
   path: string,
   workspace?: string,

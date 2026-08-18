@@ -1,5 +1,10 @@
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
 import {
+  buildLoadSkillToolDefinition,
+  LOAD_SKILL_TOOL_NAME,
+  type SkillCatalogSnapshot,
+} from "../../lib/agentSkills";
+import {
   RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
@@ -31,13 +36,19 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
   "record_execution_contract",
+  "load_skill",
 ]);
 
-export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
+export function runtimeV2ToolDefinitions(
+  state?: any,
+  skillCatalog?: SkillCatalogSnapshot | null,
+): ToolDefinition[] {
   const includeNetwork = state?.webSearchEnabled === true;
+  const loadSkillDefinition = buildLoadSkillToolDefinition(skillCatalog);
   const builtIns = [
     ...TOOL_DEFINITIONS,
     RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
+    ...(loadSkillDefinition ? [loadSkillDefinition] : []),
   ].filter((definition) => {
     const name = definition.function.name;
     return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
@@ -125,4 +136,31 @@ export function runtimeV2ToolDefinitions(state?: any): ToolDefinition[] {
     };
   });
   return builtIns;
+}
+
+export function logRuntimeV2SkillLoad(input: {
+  readonly toolName: string;
+  readonly succeeded: boolean;
+  readonly rawOutput: unknown;
+  readonly skillId: string;
+  readonly turnId: string;
+  readonly runId: string;
+  readonly logStoreEvent: (type: string, payload: Record<string, unknown>) => void;
+}): void {
+  if (input.toolName !== LOAD_SKILL_TOOL_NAME || !input.succeeded) return;
+  let revision: string | null = null;
+  try {
+    revision = String(
+      JSON.parse(String(input.rawOutput || "")).version || "",
+    ) || null;
+  } catch {
+    revision = null;
+  }
+  input.logStoreEvent("runtime_v2_skill_loaded", {
+    turnId: input.turnId,
+    runId: input.runId,
+    skillId: input.skillId,
+    revision,
+    effect: "instructions_only",
+  });
 }

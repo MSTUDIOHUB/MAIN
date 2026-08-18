@@ -9875,12 +9875,6 @@ async fn start_chat_stream(
         timeout_ms.map(|value| Duration::from_millis(value.clamp(1_000, 600_000)));
     let stream_phase_timeout =
         requested_timeout.unwrap_or(Duration::from_secs(STREAM_PHASE_TIMEOUT_SECS));
-    let stream_deadline = requested_timeout.map(|duration| stream_started_at + duration);
-    let remaining_stream_timeout = || {
-        stream_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(stream_phase_timeout)
-    };
     let stream_phase_timeout_ms = stream_phase_timeout.as_millis();
     let original_url = url.clone();
     let stream_lease = ChatStreamLease::acquire(stream_id.clone())?;
@@ -9973,10 +9967,12 @@ async fn start_chat_stream(
         record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
     }
 
-    // Callers may own a bounded request deadline (for example a Plan synthesis
-    // stage). Without one, each transport phase retains the default watchdog.
-    // The response body remains exactly cancelable in both cases.
-    let response_timeout = remaining_stream_timeout();
+    // `timeout_ms` is an inactivity watchdog for each transport phase, not a
+    // total generation deadline. The Runtime owns total lifecycle deadlines;
+    // this layer only bounds response headers, the first chunk, and each gap
+    // between later chunks so an actively streaming local model is not killed
+    // merely because its complete generation exceeds one phase window.
+    let response_timeout = stream_phase_timeout;
     let response = match send_guarded_proxy_request(
         &url,
         "POST",
@@ -10098,7 +10094,7 @@ async fn start_chat_stream(
             futures_util::future::AbortHandle::new_pair();
         stream_lease.set_abort_handle(Some(chunk_abort_handle));
         let next_chunk = if chunk_count == 0 {
-            let chunk_timeout = remaining_stream_timeout();
+            let chunk_timeout = stream_phase_timeout;
             match tokio::time::timeout(
                 chunk_timeout,
                 futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
@@ -10159,7 +10155,7 @@ async fn start_chat_stream(
                 }
             }
         } else {
-            let chunk_timeout = remaining_stream_timeout();
+            let chunk_timeout = stream_phase_timeout;
             match tokio::time::timeout(
                 chunk_timeout,
                 futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
@@ -10939,6 +10935,102 @@ fn extract_property_signature(line: &str, access: &str, name: &str) -> String {
 // region: Protocol Package 管理
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveredPersonalAgentSkill {
+    entry_path: String,
+    base_path: String,
+    content: String,
+    openai_yaml: Option<String>,
+    supporting_files: Vec<String>,
+}
+
+fn discover_agent_skills_in_root(root: &Path) -> Result<Vec<DiscoveredPersonalAgentSkill>, String> {
+    const MAX_DISCOVERED_SKILLS: usize = 512;
+    const MAX_SKILL_CONTENT_BYTES: u64 = 256_000;
+    const MAX_OPENAI_YAML_BYTES: u64 = 32_000;
+    const MAX_SUPPORTING_FILES: usize = 10;
+
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("无法解析个人 Skill 目录: {error}"))?;
+    if !canonical_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = WalkDir::new(&canonical_root)
+        .min_depth(2)
+        .max_depth(8)
+        // Match Codex/OpenCode discovery: a user may keep a Skill in another
+        // repository and symlink its directory into ~/.agents/skills.
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("SKILL.md")
+        })
+        .take(MAX_DISCOVERED_SKILLS)
+        .filter_map(|entry| {
+            let entry_path = entry.path().canonicalize().ok()?;
+            let metadata = fs::metadata(&entry_path).ok()?;
+            if metadata.len() == 0 || metadata.len() > MAX_SKILL_CONTENT_BYTES {
+                return None;
+            }
+            let base_path = entry_path.parent()?.canonicalize().ok()?;
+            let content = fs::read_to_string(&entry_path).ok()?;
+
+            let openai_yaml_path = base_path.join("agents").join("openai.yaml");
+            let openai_yaml = fs::metadata(&openai_yaml_path)
+                .ok()
+                .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_OPENAI_YAML_BYTES)
+                .and_then(|_| openai_yaml_path.canonicalize().ok())
+                .filter(|path| path.starts_with(&base_path))
+                .and_then(|path| fs::read_to_string(path).ok());
+
+            let mut supporting_files = WalkDir::new(&base_path)
+                .min_depth(1)
+                .max_depth(5)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|support| support.file_type().is_file())
+                .filter_map(|support| support.path().canonicalize().ok())
+                .filter(|path| {
+                    path.starts_with(&base_path) && path != &entry_path && path != &openai_yaml_path
+                })
+                .map(|path| path.to_string_lossy().to_string())
+                .take(MAX_SUPPORTING_FILES)
+                .collect::<Vec<_>>();
+            supporting_files.sort();
+
+            Some(DiscoveredPersonalAgentSkill {
+                entry_path: entry_path.to_string_lossy().to_string(),
+                base_path: base_path.to_string_lossy().to_string(),
+                content,
+                openai_yaml,
+                supporting_files,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.entry_path.cmp(&right.entry_path));
+    Ok(entries)
+}
+
+#[tauri::command]
+fn discover_personal_agent_skills() -> Result<Vec<DiscoveredPersonalAgentSkill>, String> {
+    let Some(home) = user_home_dir() else {
+        return Ok(Vec::new());
+    };
+    discover_agent_skills_in_root(&home.join(".agents").join("skills"))
+}
+
+#[derive(serde::Serialize)]
 pub struct ProtocolPackageMeta {
     pub name: String,
     pub entry_point: String,
@@ -10951,8 +11043,13 @@ pub struct ProtocolPackageMeta {
 fn extract_protocol_package(
     state: State<WorkspaceState>,
     zip_path: String,
+    workspace: Option<String>,
 ) -> Result<ProtocolPackageMeta, String> {
-    let workspace = state.get_root()?;
+    const MAX_PROTOCOL_PACKAGE_ENTRIES: usize = 2_048;
+    const MAX_PROTOCOL_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let zip = PathBuf::from(&zip_path);
     if !zip.exists() || !zip.is_file() {
         return Err("ZIP 文件不存在或不是文件".to_string());
@@ -10961,17 +11058,56 @@ fn extract_protocol_package(
     // Read the ZIP archive
     let file = File::open(&zip).map_err(|e| format!("无法打开 ZIP 文件: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP 解析失败: {e}"))?;
+    if archive.len() == 0 || archive.len() > MAX_PROTOCOL_PACKAGE_ENTRIES {
+        return Err(format!(
+            "协议包条目数必须在 1..={MAX_PROTOCOL_PACKAGE_ENTRIES} 之间"
+        ));
+    }
+    let mut declared_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|e| format!("读取 ZIP 条目失败: {e}"))?;
+        declared_bytes = declared_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| "协议包解压大小溢出".to_string())?;
+        if declared_bytes > MAX_PROTOCOL_PACKAGE_BYTES {
+            return Err(format!(
+                "协议包解压后不得超过 {} MiB",
+                MAX_PROTOCOL_PACKAGE_BYTES / 1024 / 1024
+            ));
+        }
+    }
 
     // Derive package name from the ZIP filename (without extension)
     let package_name = zip
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown-package".to_string());
+    let safe_package_name = package_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let safe_package_name = if safe_package_name.is_empty() {
+        "skill-package".to_string()
+    } else {
+        safe_package_name
+    };
 
     // Generate a unique slot: <name>-<timestamp>
     let slot = format!(
         "{}-{}",
-        package_name,
+        safe_package_name,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -10979,52 +11115,73 @@ fn extract_protocol_package(
     );
 
     let protocols_dir = workspace.join(".protocols");
+    fs::create_dir_all(&protocols_dir).map_err(|e| format!("创建协议目录失败: {e}"))?;
+    let canonical_protocols = protocols_dir
+        .canonicalize()
+        .map_err(|e| format!("无法解析协议目录: {e}"))?;
+    ensure_in_workspace(&canonical_protocols, &workspace)?;
     let target_dir = protocols_dir.join(&slot);
 
     // Create the target directory
     fs::create_dir_all(&target_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
-    // Extract all entries
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("读取 ZIP 条目失败: {e}"))?;
-
-        let out_path = match entry.enclosed_name() {
-            Some(path) => target_dir.join(path),
-            None => continue,
-        };
-
-        // Security: ensure the extracted path stays within target_dir
+    let extraction = (|| -> Result<String, String> {
         let canonical_target = target_dir
             .canonicalize()
-            .unwrap_or_else(|_| target_dir.clone());
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("创建子目录失败: {e}"))?;
-            // Verify the parent is within target_dir after creation
-            if let Ok(canonical_parent) = parent.canonicalize() {
-                if !canonical_parent.starts_with(&canonical_target)
-                    && canonical_parent != canonical_target
-                {
-                    // Parent could be the target_dir itself before canonicalization
-                    let target_parent = canonical_target.parent();
-                    if target_parent.is_none() || canonical_parent != *target_parent.unwrap() {
-                        continue; // Skip suspicious paths (zip slip)
-                    }
+            .map_err(|e| format!("无法解析协议包目录: {e}"))?;
+        if !canonical_target.starts_with(&canonical_protocols) {
+            return Err("协议包目录越界".to_string());
+        }
+        let mut written_bytes = 0_u64;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("读取 ZIP 条目失败: {e}"))?;
+
+            let enclosed = entry
+                .enclosed_name()
+                .ok_or_else(|| format!("ZIP 条目路径越界: {}", entry.name()))?;
+            let out_path = target_dir.join(enclosed);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("创建子目录失败: {e}"))?;
+                let canonical_parent = parent
+                    .canonicalize()
+                    .map_err(|e| format!("无法解析 ZIP 条目父目录: {e}"))?;
+                if !canonical_parent.starts_with(&canonical_target) {
+                    return Err(format!("ZIP 条目父目录越界: {}", entry.name()));
+                }
+            }
+
+            if entry.is_dir() {
+                fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败: {e}"))?;
+            } else {
+                let mut outfile =
+                    File::create(&out_path).map_err(|e| format!("创建文件失败: {e}"))?;
+                let copied = std::io::copy(&mut entry, &mut outfile)
+                    .map_err(|e| format!("写入文件失败: {e}"))?;
+                written_bytes = written_bytes
+                    .checked_add(copied)
+                    .ok_or_else(|| "协议包实际解压大小溢出".to_string())?;
+                if written_bytes > MAX_PROTOCOL_PACKAGE_BYTES {
+                    return Err(format!(
+                        "协议包解压后不得超过 {} MiB",
+                        MAX_PROTOCOL_PACKAGE_BYTES / 1024 / 1024
+                    ));
                 }
             }
         }
 
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败: {e}"))?;
-        } else {
-            let mut outfile = File::create(&out_path).map_err(|e| format!("创建文件失败: {e}"))?;
-            std::io::copy(&mut entry, &mut outfile).map_err(|e| format!("写入文件失败: {e}"))?;
+        find_entry_point(&target_dir).ok_or_else(|| {
+            "协议包必须包含可读取的 SKILL.md（兼容旧包时可使用 program.md）".to_string()
+        })
+    })();
+    let entry_point = match extraction {
+        Ok(entry_point) => entry_point,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&target_dir);
+            return Err(error);
         }
-    }
-
-    // Detect entry point: look for SKILL.md or program.md in the extracted root
-    let entry_point = find_entry_point(&target_dir);
+    };
 
     // Compute the relative path from workspace
     let local_path = target_dir
@@ -11042,53 +11199,37 @@ fn extract_protocol_package(
 
 /// Find the entry point file in an extracted protocol package.
 /// Looks for SKILL.md, program.md, or falls back to the first .md file found.
-fn find_entry_point(dir: &Path) -> String {
-    let candidates = ["SKILL.md", "program.md", "README.md"];
-
-    // Check root level first (or first subdirectory if the ZIP had a top-level folder)
-    let dirs_to_check: Vec<PathBuf> = {
-        let mut dirs = vec![dir.to_path_buf()];
-        // Also check immediate subdirectories (common when ZIP has a top-level folder)
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    dirs.push(entry.path());
-                }
-            }
-        }
-        dirs
-    };
-
-    for check_dir in &dirs_to_check {
-        for candidate in &candidates {
-            let path = check_dir.join(candidate);
-            if path.exists() && path.is_file() {
-                return path
-                    .strip_prefix(dir)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-            }
-        }
-    }
-
-    // Fallback: find the first .md file
-    for check_dir in &dirs_to_check {
-        if let Ok(entries) = fs::read_dir(check_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "md") {
-                    return path
-                        .strip_prefix(dir)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string();
-                }
-            }
-        }
-    }
-
-    "SKILL.md".to_string()
+fn find_entry_point(dir: &Path) -> Option<String> {
+    let mut matches = WalkDir::new(dir)
+        .min_depth(1)
+        .max_depth(5)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy();
+            let rank = if file_name.eq_ignore_ascii_case("SKILL.md") {
+                0_u8
+            } else if file_name.eq_ignore_ascii_case("program.md") {
+                1_u8
+            } else {
+                return None;
+            };
+            let relative = entry.path().strip_prefix(dir).ok()?.to_path_buf();
+            let depth = relative.components().count();
+            Some((rank, depth, relative))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    matches
+        .first()
+        .map(|(_, _, relative)| relative.to_string_lossy().replace('\\', "/"))
 }
 
 #[derive(Serialize)]
@@ -11815,26 +11956,39 @@ fn knowledge_get_excerpt(
     knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id)
 }
 
-/// Delete a protocol package folder when the skill is removed from the UI.
+/// Delete a protocol package folder without trusting persisted relative paths.
+fn delete_protocol_package_at(workspace: &Path, local_path: &str) -> Result<(), String> {
+    let relative = Path::new(local_path);
+    if relative.is_absolute() {
+        return Err("协议包路径必须是工作区相对路径".to_string());
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() != 2
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || components.first().and_then(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        }) != Some(".protocols")
+    {
+        return Err("只能删除 .protocols/<package> 的精确包目录".to_string());
+    }
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("无法解析协议包工作区: {error}"))?;
+    delete_path_within_workspace(&canonical_workspace.join(relative), &canonical_workspace)
+}
+
 #[tauri::command]
-fn delete_protocol_package(state: State<WorkspaceState>, local_path: String) -> Result<(), String> {
-    let workspace = state.get_root()?;
-    let full_path = workspace.join(&local_path);
-
-    // Security: ensure the path is within .protocols/
-    if !local_path.starts_with(".protocols/") && !local_path.starts_with(".protocols\\") {
-        return Err("只能删除 .protocols/ 目录下的包".to_string());
-    }
-
-    if !full_path.exists() {
-        return Ok(()); // Already gone, no error
-    }
-
-    if full_path.is_dir() {
-        fs::remove_dir_all(&full_path).map_err(|e| format!("删除包目录失败: {e}"))?;
-    }
-
-    Ok(())
+fn delete_protocol_package(
+    state: State<WorkspaceState>,
+    local_path: String,
+    workspace: Option<String>,
+) -> Result<(), String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    delete_protocol_package_at(&workspace, &local_path)
 }
 
 #[tauri::command]
@@ -12727,6 +12881,7 @@ pub fn run() {
             knowledge_rebuild_base,
             knowledge_search,
             knowledge_get_excerpt,
+            discover_personal_agent_skills,
             extract_protocol_package,
             delete_protocol_package,
             write_chat_temp_file,
@@ -12770,6 +12925,7 @@ mod tests {
         authorize_proxy_redirect_hop, await_proxy_abortable_phase,
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
         compare_file_nodes, delete_path_within_workspace, delete_plan_files_in_dir,
+        delete_protocol_package_at, discover_agent_skills_in_root, find_entry_point,
         get_proxy_request_registry, get_stream_registry, is_safe_cross_origin_proxy_header,
         is_sensitive_cross_origin_header, is_supported_attachment_path, is_valid_git_branch_name,
         looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
@@ -13543,6 +13699,95 @@ mod tests {
 
         assert!(!target.exists());
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_delete_rejects_traversal_and_keeps_victim() {
+        let workspace = make_temp_workspace("protocol-delete-traversal");
+        let package = workspace.join(".protocols").join("package-one");
+        let victim = workspace.join("victim");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(package.join("SKILL.md"), "# skill").unwrap();
+        fs::write(victim.join("keep.txt"), "keep").unwrap();
+
+        assert!(delete_protocol_package_at(&workspace, ".protocols/../victim",).is_err());
+        assert!(victim.join("keep.txt").exists());
+        assert!(package.exists());
+
+        delete_protocol_package_at(&workspace, ".protocols/package-one").unwrap();
+        assert!(!package.exists());
+        assert!(victim.join("keep.txt").exists());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_entry_must_exist_and_prefers_skill_md() {
+        let workspace = make_temp_workspace("protocol-entry");
+        let package = workspace.join("package");
+        fs::create_dir_all(package.join("nested")).unwrap();
+
+        assert_eq!(find_entry_point(&package), None);
+        fs::write(package.join("program.md"), "# legacy").unwrap();
+        fs::write(package.join("nested").join("SKILL.md"), "# skill").unwrap();
+
+        assert_eq!(
+            find_entry_point(&package).as_deref(),
+            Some("nested/SKILL.md"),
+        );
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn personal_agent_skill_discovery_is_contained_and_lists_supporting_files() {
+        let workspace = make_temp_workspace("personal-skill-discovery");
+        let skill = workspace.join("review");
+        fs::create_dir_all(skill.join("agents")).unwrap();
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: review\n---\n# Review").unwrap();
+        fs::write(
+            skill.join("agents").join("openai.yaml"),
+            "policy:\n  allow_implicit_invocation: false\n",
+        )
+        .unwrap();
+        fs::write(skill.join("references").join("checklist.md"), "# Checklist").unwrap();
+
+        let discovered = discover_agent_skills_in_root(&workspace).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered[0].entry_path.ends_with("review/SKILL.md"));
+        assert!(discovered[0]
+            .openai_yaml
+            .as_deref()
+            .unwrap_or_default()
+            .contains("allow_implicit_invocation: false"));
+        assert_eq!(discovered[0].supporting_files.len(), 1);
+        assert!(discovered[0].supporting_files[0].ends_with("references/checklist.md"));
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personal_agent_skill_discovery_supports_linked_skill_directories() {
+        use std::os::unix::fs::symlink;
+
+        let parent = make_temp_workspace("personal-skill-symlink");
+        let root = parent.join("root");
+        let external = parent.join("external-skill");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            external.join("SKILL.md"),
+            "---\nname: linked\n---\n# Linked",
+        )
+        .unwrap();
+        symlink(&external, root.join("linked")).unwrap();
+
+        let discovered = discover_agent_skills_in_root(&root).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered[0]
+            .entry_path
+            .ends_with("external-skill/SKILL.md"));
+        fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]

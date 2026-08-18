@@ -68,6 +68,12 @@ import {
   resolvePtyCommandAdmission,
 } from "./ptyCommandRuntime";
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
+import {
+  LOAD_SKILL_TOOL_NAME,
+  isSkillVisibleToModel,
+  loadSkillContent,
+  type SkillCatalogSnapshot,
+} from "./agentSkills";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -261,6 +267,7 @@ export interface ToolExecutionOptions {
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
+  skillCatalog?: SkillCatalogSnapshot | null;
 }
 
 async function prepareExternalLocalReadArgs(
@@ -363,6 +370,23 @@ export async function executeTool(
         throw new Error(`Skill tool "${resolution.entry.executionName}" execution failed: ${msg}`);
       }
     }
+  }
+
+  // Runtime-owned Skill loading must win over the legacy process-wide MCP
+  // name map. The Turn catalog already resolved this exact call as built-in.
+  if (executionName === LOAD_SKILL_TOOL_NAME) {
+    const skillId = String(args.skill_id || "").trim();
+    if (!options.skillCatalog) {
+      throw new Error("SKILL_CATALOG_UNAVAILABLE: no Skill catalog was admitted for this Turn.");
+    }
+    if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
+      throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
+    }
+    return JSON.stringify({
+      type: "skill.loaded",
+      ...loadSkillContent(options.skillCatalog, skillId),
+      effect: "instructions_loaded_no_additional_permissions",
+    });
   }
 
   // ── MCP tool routing ────────────────────────────────────────

@@ -35,6 +35,9 @@ export interface Skill {
   packagePath?: string;
   entryPoint?: string;
   workspaceScope?: string | null;
+  /** False keeps the Skill available for explicit activation while hiding it
+   * from model-driven matching. Mirrors agents/openai.yaml semantics. */
+  allowImplicitInvocation?: boolean;
 }
 
 export interface LocalConfig {

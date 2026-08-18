@@ -1490,6 +1490,7 @@ export interface AppState {
     options?: {
       workspace?: string;
       projectToUi?: boolean;
+      userPrompt?: string;
     },
   ) => Promise<ResolvedInstructionSet | null>;
   setResolvedInstructionSet: (resolved: ResolvedInstructionSet | null) => void;
@@ -11291,23 +11292,36 @@ export const useAppStore = create<AppState>()(
   setSkills: (v) => set({ skills: v }),
   toggleSkill: (id) =>
     set((s) => ({ skills: s.skills.map((sk) => (sk.id === id ? { ...sk, active: !sk.active } : sk)) })),
-  deleteSkill: (id) =>
-    set((s) => {
-      const skill = s.skills.find((sk) => sk.id === id);
-      if (skill?.isBuiltIn) return s; // prevent deleting built-in skills
-      // If this is a package skill, delete the extracted folder from disk
-      if (skill?.type === "package" && skill.packagePath) {
-        invoke("delete_protocol_package", { localPath: skill.packagePath }).catch(() => {});
-      }
-      return { skills: s.skills.filter((sk) => sk.id !== id) };
-    }),
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope }) =>
+  deleteSkill: (id) => {
+    const skill = get().skills.find((candidate) => candidate.id === id);
+    if (!skill || skill.isBuiltIn) return;
+    const removeRecord = () => set((state) => ({
+      skills: state.skills.filter((candidate) => candidate.id !== id),
+    }));
+    if (skill.type === "package" && skill.packagePath) {
+      void invoke("delete_protocol_package", {
+        localPath: skill.packagePath,
+        workspace: skill.workspaceScope || null,
+      }).then(removeRecord).catch((error) => {
+        console.error("Protocol package deletion failed; Skill record was retained.", error);
+      });
+      return;
+    }
+    removeRecord();
+  },
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }) =>
     set((s) => ({
-      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope }],
+      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }],
     })),
   updateSkill: (id, patch) =>
     set((s) => ({
-      skills: s.skills.map((sk) => (sk.id === id ? { ...sk, ...patch, content: patch.content ? normalizeSkillContent(patch.content) : sk.content } : sk)),
+      skills: s.skills.map((sk) => (sk.id === id ? {
+        ...sk,
+        ...patch,
+        content: Object.prototype.hasOwnProperty.call(patch, "content")
+          ? normalizeSkillContent(patch.content || "")
+          : sk.content,
+      } : sk)),
     })),
 
   knowledgeBases: defaultKnowledgeBases,
@@ -11349,6 +11363,12 @@ export const useAppStore = create<AppState>()(
       ? workspaceInstructionProjectionOwner.claim(requestedWorkspace)
       : null;
     if (!requestedWorkspace) {
+      const resolved = await loadResolvedInstructions(
+        "",
+        state.skills,
+        associatedPaths,
+        options.userPrompt || "",
+      );
       if (
         workspaceInstructionProjectionOwner.canCommit(
           projectionLease,
@@ -11356,14 +11376,14 @@ export const useAppStore = create<AppState>()(
         )
       ) {
         set({
-          resolvedInstructionSet: null,
+          resolvedInstructionSet: resolved,
           instructionSources: [],
           loadedHookDefinitions: defaultHookDefinitions,
-          instructionLastLoadedAt: null,
+          instructionLastLoadedAt: resolved.loadedAt,
           hookLastLoadedAt: null,
         });
       }
-      return null;
+      return resolved;
     }
 
     const [resolved, hooksConfig] = await Promise.all([
@@ -11371,6 +11391,7 @@ export const useAppStore = create<AppState>()(
         requestedWorkspace,
         state.skills,
         associatedPaths,
+        options.userPrompt || "",
       ),
       loadHooksConfig(requestedWorkspace),
     ]);
@@ -19884,13 +19905,14 @@ export const useAppStore = create<AppState>()(
       acquireHarnessRunMarker,
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
-      refreshWorkspaceContext: (workspace) =>
+      refreshWorkspaceContext: (workspace, userPrompt) =>
         get().refreshInstructionAndHookState([
           ...turnInputContextSignals.mentionedFilePaths,
           ...turnInputContextSignals.attachedFilePaths,
         ], {
           workspace,
           projectToUi: false,
+          userPrompt,
         }),
       nowMs,
       sendStartedAt,

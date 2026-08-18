@@ -17,6 +17,7 @@ export interface RuntimeV2ChatLoopInput {
   readonly now: () => number;
   readonly deadlineMs: number;
   readonly softIterationSignal?: number;
+  readonly allowSkillLoad?: boolean;
 }
 
 export interface RuntimeV2ChatLoopResult {
@@ -27,7 +28,7 @@ export interface RuntimeV2ChatLoopResult {
 
 interface DurableChatResponse {
   readonly visibleText: string;
-  readonly hasToolCalls: boolean;
+  readonly toolNames: readonly string[];
 }
 
 function latestDurableChatResponse(
@@ -38,7 +39,7 @@ function latestDurableChatResponse(
     if (event.type !== "provider.responded") continue;
     return {
       visibleText: String(event.result.visibleText || "").trim().slice(0, 24_000),
-      hasToolCalls: event.result.toolCalls.length > 0,
+      toolNames: event.result.toolCalls.map((call) => call.name),
     };
   }
   return null;
@@ -49,12 +50,12 @@ function runStartedAt(aggregate: TurnAggregateV1, fallback: number): number {
 }
 
 /**
- * Provider-neutral, tool-free Chat strategy.
+ * Provider-neutral Chat strategy with one optional context-only Skill read.
  *
  * A non-empty normalized provider response is a transport fact, not a prose
  * classifier. The loop never inspects the response wording to select a
- * lifecycle transition. Any tool call is a protocol violation and concludes
- * without invoking a Tool or Scheduler port.
+ * lifecycle transition. Any tool call other than load_skill is a protocol
+ * violation and concludes without invoking an external Tool or Scheduler port.
  */
 export async function runRuntimeV2ChatLoop(
   input: RuntimeV2ChatLoopInput,
@@ -71,7 +72,9 @@ export async function runRuntimeV2ChatLoop(
       run: input.run,
       strategy: "chat",
       objective: input.objective,
-      constraints: ["conversation_only", "no_tools", "no_side_effects"],
+      constraints: input.allowSkillLoad
+        ? ["conversation_only", "skill_context_read_only", "no_external_side_effects"]
+        : ["conversation_only", "no_tools", "no_side_effects"],
       acceptanceCriteria: ["one_visible_provider_reply"],
       initialPhase: "preparing",
     });
@@ -109,11 +112,18 @@ export async function runRuntimeV2ChatLoop(
     }
 
     const response = latestDurableChatResponse(aggregate);
-    if (response?.hasToolCalls) {
+    if (
+      response?.toolNames.length &&
+      response.toolNames.some((name) => name !== "load_skill")
+    ) {
       await controller.driveOnce({
         resultKind: "error",
         resultReason: "只读对话通道收到了未授权的工具动作；未执行任何工具或工作区副作用。",
       });
+      continue;
+    }
+    if (response?.toolNames.length) {
+      await controller.driveOnce();
       continue;
     }
     if (response?.visibleText) {

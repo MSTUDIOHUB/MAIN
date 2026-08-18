@@ -3,6 +3,11 @@ import type {
   ContentPart,
 } from "../../lib/agentMessages";
 import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
+import {
+  renderExplicitSkillActivationContext,
+  renderSkillCatalogContext,
+  skillCatalogContextCharBudget,
+} from "../../lib/agentSkills";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
@@ -290,19 +295,38 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const workspaceInstructions = String(
     input.context.workspaceInstructionContext || "",
   ).trim();
+  const skillCatalog = renderSkillCatalogContext(
+    input.context.skillCatalog,
+    skillCatalogContextCharBudget(
+      input.context.runtimeContextBudget?.contextLimit,
+    ),
+  );
+  const explicitSkills = renderExplicitSkillActivationContext(
+    input.context.skillCatalog,
+  );
   const collaborationGuidance = buildSubagentDelegationGuidance({
     preference:
       input.context.turnInputContextSignals?.subagentPreference ||
         "unspecified",
     language: input.context.phaseLanguage,
   });
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const dayNamesEn = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayNamesZh = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+  const dayOfWeek = input.context.phaseLanguage === "en" ? dayNamesEn[now.getDay()] : dayNamesZh[now.getDay()];
+  const currentDate = `${dateStr} (${dayOfWeek})`;
+
   return [
     "[MAIN RUNTIME V2]",
+    `Current Date: ${currentDate}`,
     `Workspace: ${workspace}`,
     `Respond in: ${language}`,
     "Use structured tools for every read, modification, command, and verification. With a native tool call, you may include one brief public progress sentence in normal response content; MAIN routes it only to Capsule and never uses it as control state. Do not expose private reasoning or repeat that sentence in the final answer.",
     readOnlyTurn
-      ? "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect."
+      ? (input.get()?.webSearchEnabled === true
+        ? `This is a bounded task with read-only authority and enabled web search. Inspect relevant admitted context or use exposed web tools (web_search, web_fetch) for external/real-time information. When querying time-sensitive or real-time information (e.g. weather, news, schedules, dates), use the Current Date (${currentDate}) as the reference point and anchor search queries to the current time context. Never request or claim a file mutation, shell command, browser action, or validation effect.`
+        : "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect.")
       : "Before a final answer, use evidence from actual tool results. For a repair, make the smallest justified change and run an appropriate finite validation after a modification.",
     readOnlyTurn
       ? "Return one complete evidence-backed Markdown answer and state any remaining uncertainty."
@@ -317,6 +341,8 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
           workspaceInstructions,
         ].join("\n")
       : "",
+    skillCatalog,
+    explicitSkills,
   ].join("\n");
 }
 

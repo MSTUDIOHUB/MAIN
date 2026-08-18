@@ -568,12 +568,19 @@ test("submit async workflow run keeps stage order from context build to engine l
     associatedPaths: [],
     loadedAt: 1,
     debugSummary: "",
+    skillCatalog: {
+      entries: [{ id: "panel:review", name: "review" }],
+      explicitSkillIds: ["panel:review"],
+      warnings: [],
+      loadedAt: 1,
+    },
   };
   const harness = createHarness({
     input: {
-      refreshWorkspaceContext: async (workspace) => {
+      refreshWorkspaceContext: async (workspace, userPrompt) => {
         harness.calls.push(["instruction_refresh"]);
         assert.equal(workspace, "/tmp/workspace");
+        assert.equal(userPrompt, "继续");
         return runInstructionSnapshot;
       },
       phaseRunners: {
@@ -618,6 +625,7 @@ test("submit async workflow run keeps stage order from context build to engine l
             input.gameStudioConfigForTurn?.engine,
             input.turnAgentMessagesStart,
             input.workspaceInstructionContext,
+            input.skillCatalog,
           ]);
           return {
             ...input,
@@ -671,6 +679,11 @@ test("submit async workflow run keeps stage order from context build to engine l
   assert.equal(harness.calls[7][1], "workspace_tree_ready");
   assert.equal(harness.calls[9][1], "[D] src");
   assert.match(harness.calls[9][4], /Run focused tests/);
+  assert.equal(
+    harness.calls[9][5],
+    runInstructionSnapshot.skillCatalog,
+    "the exact admitted Skill snapshot must reach Runtime context",
+  );
 });
 
 test("an admitted A Run keeps its A instruction snapshot when the UI switches to B", async () => {

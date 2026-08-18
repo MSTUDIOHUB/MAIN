@@ -84,9 +84,6 @@ export function providerModeInstruction(
     }[];
     readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
     readonly executionContract?: RuntimeV2ExecutionContract | null;
-    readonly executionContractRequired?: boolean;
-    readonly executionContractReadWindowClosed?: boolean;
-    readonly executionContractRepairAttempts?: number;
     readonly executionContractAdvanceRequired?: boolean;
     readonly executionContractCommittedTargets?: readonly string[];
     readonly executionContractPendingTargets?: readonly string[];
@@ -105,9 +102,6 @@ export function providerModeInstruction(
     sourceOnlyFrontier: false,
     actionWindow: null,
     executionContract: null,
-    executionContractRequired: false,
-    executionContractReadWindowClosed: false,
-    executionContractRepairAttempts: 0,
     executionContractAdvanceRequired: false,
     executionContractCommittedTargets: [],
     executionContractPendingTargets: [],
@@ -147,6 +141,10 @@ export function providerModeInstruction(
         })
         .filter(Boolean)
     : [];
+  const remainingSubagentCapacity = Math.max(
+    0,
+    Math.floor(Number(command.payload.remainingSubagentCapacity) || 0),
+  );
   const collaborationGuidance = [
     failedSubagents.length > 0
       ? `Previous child work did not complete (${failedSubagents.join("; ")}). Continue the objective directly; child failure is never a blocker.`
@@ -157,7 +155,7 @@ export function providerModeInstruction(
     toolSurface.hasSpawnSubagent
       ? [
           command.payload.collaborationPreferred === true
-              ? "The user enabled collaboration for this Run. Decide adaptively whether a genuinely independent investigation, review, validation, or planned implementation child would create real overlap at the current inspect, edit, or verify stage. Delegation is available but never mandatory and is not a prerequisite for mutation or completion."
+            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. If this objective contains at least two genuinely independent bounded work packages, prioritize issuing up to ${remainingSubagentCapacity} spawn_subagent calls in this decision and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
             : "Delegation is optional.",
           "Use read-only children for parallel investigation. Use implement/write only after the parent has an evidence-backed solution: provide an explicit operation, implementation_plan, success criteria, and every exact non-overlapping file target; never grant a directory and let the child choose writes. The child stages one transaction and Runtime commits it at join; the parent still owns cross-file integration and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
         ].join(" ")
@@ -191,22 +189,12 @@ export function providerModeInstruction(
           toolSurface.materializedSourceCoverage || [],
         )
       : "";
-  const executionContractGuidance = toolSurface.executionContractRequired
+  const executionContractGuidance = toolSurface.executionContract
     ? [
-        "EXECUTION_CONTRACT_REQUIRED: multiple exact versioned source owners are now available before the first workspace mutation.",
-        toolSurface.executionContractReadWindowClosed
-          ? "The two bounded supplemental evidence batches have been consumed. The observation branch is closed: call record_execution_contract now. Do not request another file, search, network read, or unrelated presentation/style entry point."
-          : "You may use at most two bounded supplemental provider decisions for specifically missing causal edges, and should issue all independent necessary source reads together. Every later batch must request a genuinely new exact owner or missing source window; repeated reads remain closed. Prefer exact behavior owners: for cross-process or public-API symptoms compare the caller and handler argument names instead of inferring one side. Do not tour presentation, style, or entry-point files unless they own a stated symptom. Otherwise call record_execution_contract now.",
-          "Connect every user-visible symptom to an evidence-backed root cause; list the smallest coherent exact file operations, investigated preserve boundaries, expected outcomes, and finite or observable acceptance checks. Mutation and validation tools intentionally reopen only after this contract is recorded.",
-          "A finite_command must exit by itself and be a build, test, lint, typecheck, check, or failing inline assertion; never use a dev server, watcher, tail, or other long-running observer. For user-visible behavior, include a real test/inline assertion or browser/desktop check—static build success alone is not behavioral proof.",
-        "This is the parent solution boundary that makes implementation delegation meaningful; do not spawn an implement child before it exists.",
+        runtimeV2ExecutionContractAnchor(toolSurface.executionContract),
+        "The active execution contract is the current parent solution boundary. Advance one listed change or validation at a time, preserve its stated boundaries, and do not broaden into cleanup or redesign. To add or change a target, first obtain the missing exact evidence and explicitly revise record_execution_contract with revision_reason; a parent or implementation child mutation outside the contract will be rejected.",
       ].join(" ")
-    : toolSurface.executionContract
-      ? [
-          runtimeV2ExecutionContractAnchor(toolSurface.executionContract),
-          "The active execution contract is the current parent solution boundary. Advance one listed change or validation at a time, preserve its stated boundaries, and do not broaden into cleanup or redesign. To add or change a target, first obtain the missing exact evidence and explicitly revise record_execution_contract with revision_reason; a parent or implementation child mutation outside the contract will be rejected.",
-        ].join(" ")
-      : "";
+    : "";
   const executionContractAdvanceGuidance =
     toolSurface.executionContractAdvanceRequired
       ? [
@@ -222,17 +210,6 @@ export function providerModeInstruction(
             : (toolSurface.executionContractPendingTargets || []).length > 0
               ? "Submit one concrete mutation for a not-yet-mutated contract target now. Validation and further reading are intentionally unavailable until every contracted target has a committed mutation. If current evidence changes the solution, revise the contract instead of skipping the target."
               : "Run the advertised finite/behavioral validation against the newest workspace. Do not read, search, inspect manifests/presentation files, or spawn another child merely to reconsider the completed edit. A real failed validation will reopen evidence-backed correction.",
-        ].join(" ")
-      : "";
-  const executionContractRepairGuidance =
-    (toolSurface.executionContractRepairAttempts || 0) > 0
-      ? [
-          `EXECUTION_CONTRACT_REPAIR_REQUIRED: the previous contract submission was rejected and changed no files (attempt ${toolSurface.executionContractRepairAttempts}).`,
-          toolSurface.executionContract
-            ? "Submit exactly one complete replacement object with summary, root_causes, changes, validations, and revision_reason. Retain still-valid entries from the active contract and name the newer evidence that requires the revision."
-            : "Submit exactly one complete initial object with summary, root_causes, changes, and validations; revision_reason is not needed until a contract exists.",
-          "Every changes item must include operation, non-empty exact targets, a concrete change, and expected_outcome. Every validations item must include kind and expected_outcome; finite_command also requires one bounded command. Use the latest EXECUTION_CONTRACT_REJECTED reason as the exact correction target instead of reanalyzing the repository.",
-          "Do not submit a partial delta, request another read, narrate, or mutate until the complete contract is accepted.",
         ].join(" ")
       : "";
   const validationCorrectionGuidance = toolSurface.validationCommandUnavailable
@@ -306,7 +283,6 @@ export function providerModeInstruction(
         actionWindowGuidance,
         editableSourceGuidance,
         executionContractGuidance,
-        executionContractRepairGuidance,
         executionContractAdvanceGuidance,
         "Submit the bounded corrective mutation now. Validation debt remains attached to the newest committed workspace version.",
       ].filter(Boolean).join(" ");
@@ -315,7 +291,6 @@ export function providerModeInstruction(
       return [
         recoveryGuidance,
         executionContractGuidance,
-        executionContractRepairGuidance,
         executionContractAdvanceGuidance,
         validationCorrectionGuidance,
         actionWindowGuidance,
@@ -331,7 +306,6 @@ export function providerModeInstruction(
       return [
         recoveryGuidance,
         executionContractGuidance,
-        executionContractRepairGuidance,
         executionContractAdvanceGuidance,
         actionWindowGuidance,
         editableSourceGuidance,
@@ -342,7 +316,6 @@ export function providerModeInstruction(
     return [
       recoveryGuidance,
       executionContractGuidance,
-      executionContractRepairGuidance,
       executionContractAdvanceGuidance,
       validationCorrectionGuidance,
       toolSurface.actionWindow === "validation_handoff"
@@ -365,7 +338,6 @@ export function providerModeInstruction(
     recoveryGuidance,
     "Continue one inspect-edit-verify loop for the user's complete objective.",
     executionContractGuidance,
-    executionContractRepairGuidance,
     executionContractAdvanceGuidance,
     validationCorrectionGuidance,
     actionWindowGuidance,

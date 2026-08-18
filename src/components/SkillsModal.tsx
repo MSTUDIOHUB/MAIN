@@ -15,6 +15,16 @@ function nameToToolName(name: string): string {
     .replace(/_+/g, "_");
 }
 
+function cleanupProtocolPackage(localPath: string | null, workspace: string | null) {
+  if (!localPath) return;
+  void invoke("delete_protocol_package", {
+    localPath,
+    workspace,
+  }).catch((error) => {
+    console.error("Pending protocol package cleanup failed:", error);
+  });
+}
+
 const DEFAULT_TOOL_PARAMS = `{
   "type": "object",
   "properties": {
@@ -25,21 +35,21 @@ const DEFAULT_TOOL_PARAMS = `{
 
 const SKILLS_COPY = {
   zh: {
-    activeDesc: "启用的技能会注入到 Agent 上下文中。",
+    activeDesc: "启用后，下一轮会先向 Agent 展示技能名称和描述；匹配后再加载完整内容。",
     addSkill: "添加技能",
     builtIn: "内置",
-    tool: "工具",
+    tool: "旧版工具描述",
     package: "协议包",
-    prompt: "提示词",
+    prompt: "Agent Skill",
     installedAt: "安装位置：",
     editSkill: "编辑技能",
     createSkill: "创建新技能",
     skillType: "技能类型",
-    instructionDesc: "提示词型技能会注入到系统提示词中，指导模型的行为规范。",
-    toolDesc: "工具型技能会转换为 function schema，适合高级自定义工具入口；真实外部执行建议做成内置工具或 MCP 工具。",
-    packageDesc: "协议包型技能从 ZIP 压缩包导入，包含完整的多文件工作流协议，解压至 .protocols/ 目录后自动注入。",
+    instructionDesc: "Agent Skill 会按需加载完整说明；也可在消息中使用 $技能名 或 @技能名 显式启用。",
+    toolDesc: "兼容旧数据：这里的说明会作为 Agent Skill 按需加载，但参数 schema 不会冒充可执行工具。真实能力请绑定内置工具、MCP 或插件。",
+    packageDesc: "协议包从 ZIP 导入；MAIN 只展示元数据，匹配后通过受控的 load_skill 读取 SKILL.md，并继续使用现有权限工具。",
     skillName: "技能名称",
-    toolFunctionName: "工具函数名：",
+    toolFunctionName: "旧版 schema 标识（不会直接执行）：",
     uploadProtocolPackage: "上传协议包",
     zipArchives: "ZIP 压缩包",
     extracting: "解压中...",
@@ -47,9 +57,12 @@ const SKILLS_COPY = {
     uploadFailed: "上传失败",
     packageUploadHint: "选择一个 .zip 文件，将自动解压至工作区的 .protocols/ 目录。ZIP 应包含 SKILL.md 或 program.md 作为入口文件。",
     description: "描述",
+    modelDiscoverable: "允许模型自动匹配",
+    modelDiscoverableDesc: "关闭后仅能在消息中通过 $技能名或 @技能名显式启用；“自动匹配”表示成为候选，不保证每次调用。",
+    manualOnly: "仅手动",
     descPlaceholderTool: "模型应何时、如何使用这个工具",
     descPlaceholderRule: "简要描述这条规则",
-    systemPromptContent: "系统提示词内容",
+    systemPromptContent: "SKILL.md 内容",
     toolExecutionInstructions: "工具说明（高级入口）",
     edit: "编辑",
     preview: "预览",
@@ -57,28 +70,28 @@ const SKILLS_COPY = {
     contentPlaceholderTool: "描述模型何时应该调用这个工具，以及后端 handler/MCP 应如何执行（支持 Markdown）...",
     nothingToPreview: "暂无可预览内容",
     toolParameters: "工具参数",
-    toolParametersDesc: "定义此工具接受的参数格式，符合 OpenAI function calling 规范。当前 MAIN 只内置 schema 暴露；执行需内置工具、MCP 或自定义 execute_skill 后端。",
+    toolParametersDesc: "仅保留旧版 schema 以兼容已有配置；MAIN 不会把没有真实执行绑定的 schema 暴露给模型。",
     cancel: "取消",
     updateSkill: "更新技能",
     saveSkill: "保存技能",
     done: "完成",
   },
   en: {
-    activeDesc: "Active skills will be injected into the Agent's context.",
+    activeDesc: "On the next Turn, MAIN first shows the Agent each active Skill's name and description, then loads full instructions only when selected.",
     addSkill: "Add Skill",
     builtIn: "Built-in",
-    tool: "Tool",
+    tool: "Legacy Tool Spec",
     package: "Package",
-    prompt: "Prompt",
+    prompt: "Agent Skill",
     installedAt: "Installed at:",
     editSkill: "Edit Skill",
     createSkill: "Create New Skill",
     skillType: "Skill Type",
-    instructionDesc: "Prompt skills are injected into the system prompt to guide model behavior.",
-    toolDesc: "Tool skills become function schemas for advanced custom tools; real external execution should usually live in built-in tools or MCP tools.",
-    packageDesc: "Package skills are imported from ZIP archives, include multi-file workflow protocols, and are extracted into .protocols/ before injection.",
+    instructionDesc: "Agent Skills load their full instructions on demand. Use $skill-name or @skill-name in a message for deterministic activation.",
+    toolDesc: "Compatibility mode: these instructions load as an Agent Skill, but an unbound schema is never advertised as an executable tool. Bind real capabilities through built-ins, MCP, or a plugin.",
+    packageDesc: "ZIP packages expose metadata first, then load SKILL.md through the controlled load_skill path and keep all later actions under ordinary tool permissions.",
     skillName: "Skill Name",
-    toolFunctionName: "Tool function name:",
+    toolFunctionName: "Legacy schema key (not directly executable):",
     uploadProtocolPackage: "Upload Protocol Package",
     zipArchives: "ZIP Archives",
     extracting: "Extracting...",
@@ -86,9 +99,12 @@ const SKILLS_COPY = {
     uploadFailed: "Upload failed",
     packageUploadHint: "Choose a .zip file. It will be extracted into the workspace .protocols/ folder. The ZIP should include SKILL.md or program.md as the entry file.",
     description: "Description",
+    modelDiscoverable: "Allow model matching",
+    modelDiscoverableDesc: "When off, this Skill is available only through an explicit $name or @name message mention. Matching makes it a candidate; it does not guarantee invocation.",
+    manualOnly: "Manual only",
     descPlaceholderTool: "When and how the model should use this tool",
     descPlaceholderRule: "Brief description of the rule",
-    systemPromptContent: "System Prompt Content",
+    systemPromptContent: "SKILL.md Content",
     toolExecutionInstructions: "Tool Instructions (Advanced)",
     edit: "Edit",
     preview: "Preview",
@@ -96,7 +112,7 @@ const SKILLS_COPY = {
     contentPlaceholderTool: "Describe when the model should call this tool and how the backend handler/MCP should execute it (Markdown supported)...",
     nothingToPreview: "Nothing to preview",
     toolParameters: "Tool Parameters",
-    toolParametersDesc: "Define the parameter schema using the OpenAI function calling format. MAIN currently exposes the schema only; execution needs a built-in tool, MCP tool, or custom execute_skill backend.",
+    toolParametersDesc: "Retained only for legacy configuration compatibility. MAIN never advertises an unbound schema as an executable tool.",
     cancel: "Cancel",
     updateSkill: "Update Skill",
     saveSkill: "Save Skill",
@@ -124,10 +140,13 @@ export default function SkillsModal({
   const [formName, setFormName] = useState("");
   const [formDesc, setFormDesc] = useState("");
   const [formContent, setFormContent] = useState("");
+  const [formAllowImplicit, setFormAllowImplicit] = useState(true);
   const [formToolParams, setFormToolParams] = useState(DEFAULT_TOOL_PARAMS);
   const [contentTab, setContentTab] = useState<"edit" | "preview">("edit");
   const [formPackagePath, setFormPackagePath] = useState<string | null>(null);
   const [formEntryPoint, setFormEntryPoint] = useState<string | null>(null);
+  const [originalPackagePath, setOriginalPackagePath] = useState<string | null>(null);
+  const [originalPackageWorkspace, setOriginalPackageWorkspace] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<"idle" | "uploading" | "done" | "error">("idle");
 
   const resetForm = () => {
@@ -135,11 +154,14 @@ export default function SkillsModal({
     setFormName("");
     setFormDesc("");
     setFormContent("");
+    setFormAllowImplicit(true);
     setFormToolParams(DEFAULT_TOOL_PARAMS);
     setEditingId(null);
     setContentTab("edit");
     setFormPackagePath(null);
     setFormEntryPoint(null);
+    setOriginalPackagePath(null);
+    setOriginalPackageWorkspace(null);
     setUploadStatus("idle");
   };
 
@@ -148,30 +170,54 @@ export default function SkillsModal({
   const handleSaveSkill = () => {
     if (!formName.trim()) return;
     if (formType === "package" && !formPackagePath) return;
+    if (formType !== "package" && !formContent.trim()) return;
     const patch = {
       name: formName,
       desc: formDesc,
       content: formContent,
       type: formType,
+      allowImplicitInvocation: formAllowImplicit,
       ...(formType === "tool" ? { toolParameters: formToolParams } : {}),
       ...(formType === "package"
         ? {
             packagePath: formPackagePath,
             entryPoint: formEntryPoint,
-            workspaceScope: currentWorkspace || null,
+            workspaceScope: formPackagePath === originalPackagePath
+              ? originalPackageWorkspace
+              : currentWorkspace || null,
           }
-        : {}),
+        : {
+            packagePath: undefined,
+            entryPoint: undefined,
+            workspaceScope: undefined,
+          }),
     };
     if (isFormEditing) {
       updateSkill(editingId, patch);
     } else {
       addSkill(patch);
     }
+    if (
+      originalPackagePath &&
+      (formType !== "package" || originalPackagePath !== formPackagePath)
+    ) {
+      cleanupProtocolPackage(originalPackagePath, originalPackageWorkspace);
+    }
+    if (
+      formType !== "package" &&
+      formPackagePath &&
+      formPackagePath !== originalPackagePath
+    ) {
+      cleanupProtocolPackage(formPackagePath, currentWorkspace || null);
+    }
     resetForm();
     setIsAddingSkill(false);
   };
 
   const handleCancel = () => {
+    if (formPackagePath && formPackagePath !== originalPackagePath) {
+      cleanupProtocolPackage(formPackagePath, currentWorkspace || null);
+    }
     resetForm();
     setIsAddingSkill(false);
   };
@@ -182,9 +228,12 @@ export default function SkillsModal({
     setFormName(skill.name);
     setFormDesc(skill.desc);
     setFormContent(skill.content);
+    setFormAllowImplicit(skill.allowImplicitInvocation !== false);
     setFormToolParams(skill.toolParameters || DEFAULT_TOOL_PARAMS);
     setFormPackagePath(skill.packagePath || null);
     setFormEntryPoint(skill.entryPoint || null);
+    setOriginalPackagePath(skill.packagePath || null);
+    setOriginalPackageWorkspace(skill.workspaceScope || null);
     setUploadStatus(skill.packagePath ? "done" : "idle");
     setContentTab("edit");
     setIsAddingSkill(true);
@@ -214,6 +263,9 @@ export default function SkillsModal({
                       <div className="flex items-center gap-1.5">
                         <span className={`text-[13px] font-bold truncate ${skill.active ? 'text-white' : 'text-[#e4e4e7]'}`}>{skill.name}</span>
                         {skill.isBuiltIn && <IconShield className="w-3 h-3 text-[#71717a] shrink-0" title={copy.builtIn} />}
+                        {skill.allowImplicitInvocation === false && (
+                          <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider bg-[#18181b] text-[#a1a1aa] border border-[#3f3f46] rounded">{copy.manualOnly}</span>
+                        )}
                         {skill.type === "tool" ? (
                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider bg-[#18181b] text-[#f59e0b] border border-[#292524] rounded">
                             <IconZap className="w-2.5 h-2.5" /> {copy.tool}
@@ -230,7 +282,7 @@ export default function SkillsModal({
                       </div>
                       <div className="text-[11px] text-[#a1a1aa] mt-1.5 line-clamp-2 leading-relaxed">
                         {skill.type === "tool" && (
-                          <span className="text-[#f59e0b] font-mono mr-1.5">fn:{nameToToolName(skill.name)}</span>
+                          <span className="text-[#f59e0b] font-mono mr-1.5">schema:{nameToToolName(skill.name)}</span>
                         )}
                         {skill.desc}
                       </div>
@@ -312,7 +364,14 @@ export default function SkillsModal({
                             return;
                           }
                           const zipPath = typeof selected === "string" ? selected : selected;
-                          const result = await invoke<{ name: string; entry_point: string; local_path: string }>("extract_protocol_package", { zipPath });
+                          const result = await invoke<{ name: string; entry_point: string; local_path: string }>("extract_protocol_package", { zipPath, workspace: currentWorkspace || null });
+                          if (
+                            formPackagePath &&
+                            formPackagePath !== originalPackagePath &&
+                            formPackagePath !== result.local_path
+                          ) {
+                            cleanupProtocolPackage(formPackagePath, currentWorkspace || null);
+                          }
                           setFormPackagePath(result.local_path);
                           setFormEntryPoint(result.entry_point);
                           if (!formName.trim()) setFormName(result.name);
@@ -345,6 +404,19 @@ export default function SkillsModal({
                 <label className="block text-xs font-bold text-[#e4e4e7] mb-2">{copy.description}</label>
                 <input type="text" value={formDesc} onChange={(e) => setFormDesc(e.target.value)} placeholder={formType === "tool" ? copy.descPlaceholderTool : copy.descPlaceholderRule} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[13px] text-white focus:outline-none theme-ring transition-colors" />
               </div>
+
+              <label className="flex items-start gap-3 p-3 rounded-md border border-[#27272a] bg-[#000000] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={formAllowImplicit}
+                  onChange={(event) => setFormAllowImplicit(event.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="block text-xs font-bold text-[#e4e4e7]">{copy.modelDiscoverable}</span>
+                  <span className="block text-[10px] text-[#71717a] mt-1 leading-relaxed">{copy.modelDiscoverableDesc}</span>
+                </span>
+              </label>
 
               {/* Content with Edit / Preview tabs */}
               <div>
@@ -393,7 +465,7 @@ export default function SkillsModal({
 
               <div className="flex gap-3 pt-2">
                 <button onClick={handleCancel} className="flex-1 py-2 text-[12px] font-medium text-[#a1a1aa] border border-[#27272a] bg-[#000000] rounded-md hover:bg-[#18181b] transition-colors">{copy.cancel}</button>
-                <button onClick={handleSaveSkill} disabled={!formName.trim() || (formType === "package" && !formPackagePath)} className="flex-1 py-2 text-[12px] theme-bg theme-bg-hover font-bold rounded-md transition-colors disabled:opacity-50">{isFormEditing ? copy.updateSkill : copy.saveSkill}</button>
+                <button onClick={handleSaveSkill} disabled={!formName.trim() || (formType === "package" ? !formPackagePath : !formContent.trim())} className="flex-1 py-2 text-[12px] theme-bg theme-bg-hover font-bold rounded-md transition-colors disabled:opacity-50">{isFormEditing ? copy.updateSkill : copy.saveSkill}</button>
               </div>
             </div>
           )}

@@ -47,6 +47,7 @@ export type RuntimeV2TransportVariant =
 export type RuntimeV2SubagentHandoffApplicationSource =
   | "provider_result"
   | "command"
+  | "work_plan"
   | "final";
 
 /** Recovery is deliberately scoped to a durable, structural fact. Model prose

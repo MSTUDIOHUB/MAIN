@@ -482,6 +482,7 @@ function parseCompatibilityTokenArgumentBody(
  */
 function extractCompatibilityTokenToolCallBlocks(
   text: string,
+  allowedToolNames?: ReadonlySet<string>,
 ): CompatibilityTokenToolCallBlock[] {
   const blocks: CompatibilityTokenToolCallBlock[] = [];
   const markerRe = /<\|tool_call>\s*call:([a-z_][a-z0-9_]*)\s*\{/gi;
@@ -506,7 +507,7 @@ function extractCompatibilityTokenToolCallBlocks(
     let end = closeBrace + 1;
     const closeToken = text.slice(end).match(/^\s*<\|\/tool_call>/i);
     if (closeToken) end += closeToken[0].length;
-    if (BARE_TOOL_NAMES.has(toolName)) {
+    if (!allowedToolNames || allowedToolNames.has(toolName)) {
       blocks.push({
         start: match.index,
         end,
@@ -528,6 +529,9 @@ function extractCompatibilityTokenToolCallBlocks(
 export function parseExplicitCompatibilityTokenToolCalls(
   text: string,
 ): ParsedToolCall[] {
+  // This boundary validates only the explicit marker grammar. Runtime callers
+  // authorize the parsed name against the tool surface advertised for that
+  // request, which also permits request-scoped tools that are not built-ins.
   return extractCompatibilityTokenToolCallBlocks(text).map((block) => ({
     id: nextCallId(),
     name: block.toolName,
@@ -782,7 +786,7 @@ export function parseTextForTools(text: string): ParsedTextResult {
 
   // Format 5: native-looking calls surfaced through compatibility text.
   const compatibilityTokenToolCallBlocks =
-    extractCompatibilityTokenToolCallBlocks(text);
+    extractCompatibilityTokenToolCallBlocks(text, BARE_TOOL_NAMES);
   for (const block of compatibilityTokenToolCallBlocks) {
     toolCalls.push({
       id: nextCallId(),

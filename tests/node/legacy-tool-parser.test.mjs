@@ -50,7 +50,10 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { parseTextForTools } = loadTranspiledModuleSync(
+const {
+  parseExplicitCompatibilityTokenToolCalls,
+  parseTextForTools,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/textToolParser.ts"),
 );
 const { sanitizeAIOutput } = loadTranspiledModuleSync(
@@ -267,6 +270,48 @@ test("parses Gemma OMLX text tool tokens as executable calls", () => {
     query: "creatorName",
   });
   assert.equal(parsed.cleanText, "");
+});
+
+test("explicit compatibility markers parse request-scoped dynamic tool names without opening prose", () => {
+  const evidenceId = "child:0123456789abcdef0123456789abcdef:E1";
+  const marker = [
+    "<|tool_call>call:submit_runtime_v2_subagent_report{",
+    '"summary":"Reviewed the requested files",',
+    '"findings":[{"statement":"The implementation is present","evidence_ids":["' + evidenceId + '"]}],',
+    '"unresolved":[]',
+    "}<|/tool_call>",
+  ].join("");
+
+  const parsed = parseExplicitCompatibilityTokenToolCalls(marker);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].name, "submit_runtime_v2_subagent_report");
+  assert.deepEqual(parsed[0].arguments, {
+    summary: "Reviewed the requested files",
+    findings: [{
+      statement: "The implementation is present",
+      evidence_ids: [evidenceId],
+    }],
+    unresolved: [],
+  });
+
+  assert.deepEqual(
+    parseExplicitCompatibilityTokenToolCalls(
+      "I would call submit_runtime_v2_subagent_report after reviewing the evidence.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    parseExplicitCompatibilityTokenToolCalls(
+      "<|tool_call>call:submit_runtime_v2_subagent_report{\"summary\":\"unfinished\"",
+    ),
+    [],
+  );
+  assert.equal(
+    parseTextForTools(
+      'submit_runtime_v2_subagent_report(summary="not an explicit marker")',
+    ).toolCalls.length,
+    0,
+  );
 });
 
 test("parses a complete one-shot semantic spawn from plain-text tool tokens", () => {

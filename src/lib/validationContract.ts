@@ -383,7 +383,7 @@ function classifyFiniteSegment(
   if (/\b(?:npx\s+tsc\b|mypy\b|python3?\s+-m\s+mypy\b|dotnet\s+build\b)/i.test(command)) {
     return { capability: "typecheck", inlineMissingAssertion: false };
   }
-  if (/\b(?:cargo\s+check\b|cargo\s+fmt\b[^\n;&|]*--check\b|go\s+vet\b|python3?\s+-m\s+compileall\b|make\s+check\b)/i.test(command)) {
+  if (/\b(?:cargo\s+check\b|cargo\s+fmt\b[^\n;&|]*--check\b|go\s+vet\b|python3?\s+-m\s+(?:compileall|py_compile)\b|make\s+check\b)/i.test(command)) {
     return { capability: "check", inlineMissingAssertion: false };
   }
   if (INLINE_INVOCATION_RE.test(command)) {

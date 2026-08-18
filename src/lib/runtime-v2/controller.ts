@@ -27,9 +27,9 @@ import {
   shouldRecordRuntimeV2SoftSignal,
 } from "./controllerRecovery";
 import {
-  referencedRuntimeV2SubagentEvidenceIds,
-  runtimeV2SubagentHandoffApplicationSource,
+  runtimeV2SubagentHandoffApplicationDrafts,
 } from "./subagentHandoff";
+import { executeRuntimeV2SchedulerLifecycle } from "./schedulerLifecycle";
 export interface RuntimeV2ControllerSnapshot {
   readonly aggregate: TurnAggregateV1 | null;
   readonly revision: number;
@@ -286,47 +286,15 @@ export class RuntimeV2Controller {
   private async recordAppliedSubagentHandoffs(
     sourceEvent: RuntimeV2Event,
   ): Promise<void> {
-    const source = runtimeV2SubagentHandoffApplicationSource(sourceEvent);
-    if (!source) return;
     const state = this.requireAggregate();
-    if (!state.run) return;
-    const alreadyApplied = new Map<string, Set<string>>();
-    for (const event of state.events) {
-      if (event.type !== "subagent.handoff_applied") continue;
-      const evidenceIds = alreadyApplied.get(event.jobId) || new Set<string>();
-      for (const evidenceId of event.evidenceIds) {
-        evidenceIds.add(evidenceId);
-      }
-      alreadyApplied.set(event.jobId, evidenceIds);
-    }
-    const deliveries = state.events.filter(
-      (event): event is Extract<
-        RuntimeV2Event,
-        { readonly type: "subagent.handoff_delivered" }
-      > =>
-        event.type === "subagent.handoff_delivered" &&
-        event.sequence < sourceEvent.sequence,
-    );
-    for (const delivery of deliveries) {
-      const used = alreadyApplied.get(delivery.jobId) || new Set<string>();
-      const evidenceIds = referencedRuntimeV2SubagentEvidenceIds({
-        sourceEvent,
-        evidenceIds: delivery.evidenceIds,
-      }).filter((evidenceId) => !used.has(evidenceId));
-      if (evidenceIds.length === 0) continue;
+    for (const draft of runtimeV2SubagentHandoffApplicationDrafts({
+      state,
+      sourceEvent,
+    })) {
       await this.apply(asEvent({
         ...this.eventBase(),
-        type: "subagent.handoff_applied",
-        run: state.run.identity,
-        jobId: delivery.jobId,
-        evidenceIds,
-        sourceEventId: sourceEvent.eventId,
-        source,
+        ...draft,
       }));
-      alreadyApplied.set(
-        delivery.jobId,
-        new Set([...used, ...evidenceIds]),
-      );
     }
   }
 
@@ -430,52 +398,40 @@ export class RuntimeV2Controller {
       case "collect_observation":
       case "schedule_subagents":
       case "join_subagents": {
-        let event: RuntimeV2EventDraft | readonly RuntimeV2EventDraft[];
+        let events: readonly RuntimeV2EventDraft[];
         if (command.kind === "collect_observation") {
-          event = await this.ports.tool.execute({ run: command.run, command, signal });
-        } else {
-          if (command.kind === "schedule_subagents") {
-            const sourceToolCallId =
-              typeof command.payload.toolCallId === "string"
-                ? command.payload.toolCallId
-                : "";
-            const committedChildren = this.requireAggregate().subagents.filter((job) =>
-              job.parentRunId === command.run.runId &&
-              (job.status === "queued" || job.status === "running") &&
-              (!sourceToolCallId ||
-                job.sourceToolCallId === sourceToolCallId)
-            );
-            if (committedChildren.length === 0) {
-              const prepared = await this.ports.scheduler.prepareSchedule?.({ run: command.run, command, signal });
-              if (prepared) {
-                const applied = await this.apply(this.rebasePortEvent(prepared));
-                await this.publishMilestoneIfEligible(applied.events[applied.events.length - 1]);
-              }
-            }
-          }
-          const scheduledSubagents = command.kind === "schedule_subagents" || command.kind === "join_subagents"
-            ? this.requireAggregate().subagents
-            : undefined;
-          event = await this.ports.scheduler.execute({
+          const observed = await this.ports.tool.execute({
             run: command.run,
             command,
             signal,
-            ...(scheduledSubagents ? { scheduledSubagents } : {}),
+          });
+          events = [{
+            type: "command.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+          }, ...(observed.type === "command.completed" ? [] : [observed])];
+        } else {
+          events = await executeRuntimeV2SchedulerLifecycle({
+            command,
+            signal,
+            scheduler: this.ports.scheduler,
+            getScheduledSubagents: () => this.requireAggregate().subagents,
+            commitPrepared: async (prepared) => {
+              const applied = await this.apply(
+                this.rebasePortEvent(prepared),
+              );
+              await this.publishMilestoneIfEligible(
+                applied.events[applied.events.length - 1],
+              );
+            },
           });
         }
-        await this.apply(asEvent({
-          ...this.eventBase(),
-          type: "command.completed",
-          run: command.run,
-          idempotencyKey: command.idempotencyKey,
-          status: "succeeded",
-        }));
-        const events = Array.isArray(event) ? event : [event];
         for (const emitted of events) {
-          if (emitted.type !== "command.completed") {
-            const applied = await this.apply(this.rebasePortEvent(emitted));
-            await this.publishMilestoneIfEligible(applied.events[applied.events.length - 1]);
-          }
+          const applied = await this.apply(this.rebasePortEvent(emitted));
+          await this.publishMilestoneIfEligible(
+            applied.events[applied.events.length - 1],
+          );
         }
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
         return;

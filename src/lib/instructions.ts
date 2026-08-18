@@ -1,4 +1,8 @@
 import { globSearch, readFile } from "./ipc";
+import {
+  loadSkillCatalog,
+  type SkillCatalogSnapshot,
+} from "./agentSkills";
 
 export type InstructionSourceKind =
   | "legacy"
@@ -43,6 +47,9 @@ export interface ResolvedInstructionSet {
   associatedPaths: string[];
   loadedAt: number;
   debugSummary: string;
+  /** Immutable, progressively disclosed Agent Skill registry admitted beside
+   * project rules. Full Skill bodies are deliberately not instruction layers. */
+  skillCatalog?: SkillCatalogSnapshot;
 }
 
 /**
@@ -72,9 +79,14 @@ export function renderResolvedInstructionContext(
 export interface InstructionSkillLike {
   id: string;
   name: string;
+  desc: string;
   content: string;
   active: boolean;
   type?: "instruction" | "tool" | "package";
+  packagePath?: string;
+  entryPoint?: string;
+  workspaceScope?: string | null;
+  allowImplicitInvocation?: boolean;
 }
 
 type ParsedFrontmatter = {
@@ -227,11 +239,17 @@ async function tryRead(
   path: string,
   workspace: string,
 ): Promise<string | null> {
+  if (!workspace) return null;
   try {
     return await readFile(path, workspace);
   } catch {
     return null;
   }
+}
+
+async function tryGlob(path: string, workspace: string): Promise<string[]> {
+  if (!workspace) return [];
+  return globSearch(path, workspace).catch(() => []);
 }
 
 function matchPatterns(patterns: string[], associatedPaths: string[]): string[] {
@@ -248,6 +266,7 @@ export async function loadResolvedInstructions(
   workspace: string,
   skills: InstructionSkillLike[],
   associatedPaths: string[] = [],
+  userPrompt = "",
 ): Promise<ResolvedInstructionSet> {
   const immutableWorkspace = workspace.trim();
   const normalizedAssociated = associatedPaths.map(normalizePath).filter(Boolean);
@@ -307,10 +326,10 @@ export async function loadResolvedInstructions(
     });
   }
 
-  const cursorRuleFiles = await globSearch(
+  const cursorRuleFiles = await tryGlob(
     ".cursor/rules/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+  );
   for (const rulePath of cursorRuleFiles) {
     const content = await tryRead(rulePath, immutableWorkspace);
     if (!content) continue;
@@ -324,11 +343,9 @@ export async function loadResolvedInstructions(
     pushLayer("AGENT.md", "workspace_agent", agentContent, { path: "AGENT.md" });
   }
 
-  const steeringFiles = await globSearch(
+  const steeringFiles = await tryGlob(
     ".MAIN/steering/*.md",
     immutableWorkspace,
-  ).catch(
-    () => [],
   );
   for (const steeringPath of steeringFiles.sort()) {
     if (/\/README\.md$/i.test(normalizePath(steeringPath))) continue;
@@ -357,10 +374,10 @@ export async function loadResolvedInstructions(
     );
   }
 
-  const scopedRuleFiles = await globSearch(
+  const scopedRuleFiles = await tryGlob(
     ".MAIN/rules/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+  );
   const scopedRules: ScopedRule[] = [];
 
   for (const rulePath of scopedRuleFiles) {
@@ -398,10 +415,10 @@ export async function loadResolvedInstructions(
       });
     });
 
-  const templateFiles = await globSearch(
+  const templateFiles = await tryGlob(
     ".MAIN/templates/**/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+  );
   for (const templatePath of templateFiles) {
     if (normalizePath(templatePath).startsWith(".MAIN/templates/game-studio/")) {
       continue;
@@ -417,13 +434,14 @@ export async function loadResolvedInstructions(
     });
   }
 
-  skills
-    .filter(skill => skill.active && (!skill.type || skill.type === "instruction"))
-    .forEach(skill => {
-      pushLayer(skill.name, "skill", skill.content, {
-        path: `skill:${skill.id}`,
-      });
-    });
+  // Agent Skills are not ordinary always-on project rules. Admit their
+  // metadata and immutable bodies into a separate registry so provider
+  // context can use progressive disclosure through load_skill.
+  const skillCatalog = await loadSkillCatalog({
+    workspace: immutableWorkspace,
+    skills,
+    userPrompt,
+  });
 
   const loadedAt = Date.now();
   const debugSummary = sources.length
@@ -447,5 +465,6 @@ export async function loadResolvedInstructions(
     associatedPaths: normalizedAssociated,
     loadedAt,
     debugSummary,
+    skillCatalog,
   };
 }

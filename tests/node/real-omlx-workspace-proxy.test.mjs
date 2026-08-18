@@ -265,6 +265,42 @@ test("real OMLX syntax checks preserve duplicate module-export safety", () => {
   assert.deepEqual(checked.moduleExports, ["updateTheme"]);
 });
 
+test("real OMLX syntax checks match production for the quote-corrupted Python incident", async () => {
+  const validPython = [
+    '"""Snake game implementation target for the MAIN runtime validation."""',
+    "",
+    "class Snake:",
+    "    def get_head(self):",
+    '        """Return the current head position."""',
+    "        return self.body[-1]",
+    "",
+  ].join("\n");
+  const incidentPostImage = validPython
+    .replace('"""Snake game', '""""Snake game')
+    .replace("return self.body[-1]", 'return self.body[-1]"');
+
+  const malformed = await proxy.checkRealOmlxSourceSyntax(
+    "snake.py",
+    incidentPostImage,
+  );
+  assert.equal(malformed.applicable, true);
+  assert.equal(malformed.language, "python");
+  assert.equal(malformed.hasErrors, true);
+  assert.ok(malformed.errorCount > 0);
+  assert.equal(malformed.firstErrorLine, 6);
+  assert.ok(malformed.errors.some((error) =>
+    error.line === 6 && /error|missing|string/i.test(error.kind)
+  ));
+
+  const valid = await proxy.checkRealOmlxSourceSyntax(
+    "snake.py",
+    validPython,
+  );
+  assert.equal(valid.applicable, true);
+  assert.equal(valid.language, "python");
+  assert.equal(valid.hasErrors, false);
+});
+
 test("real OMLX debug entries retain structured identity while bounding message size", () => {
   const entry = proxy.compactRealOmlxDebugEntry({
     timestamp: "2026-07-22T00:00:00.000Z",

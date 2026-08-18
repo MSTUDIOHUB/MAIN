@@ -12,6 +12,7 @@ import {
   normalizeProviderResponseV1,
   type RuntimeV2Command,
   type RuntimeV2NormalizedProviderResult,
+  type RuntimeV2ProviderRecoveryPressure,
 } from "../../lib/runtime-v2";
 import {
   aggregateForCurrentTurn,
@@ -32,9 +33,6 @@ import {
 } from "./executionProviderTools";
 import {
   deriveRuntimeV2ExecutionContract,
-  deriveRuntimeV2ExecutionContractRepair,
-  runtimeV2ExecutionContractReadWindow,
-  runtimeV2ExecutionContractRequired,
 } from "./executionContract";
 import { deriveRuntimeV2ExecutionContractAdvance } from "./executionContractAdvance";
 import {
@@ -48,8 +46,6 @@ import {
 } from "./executionProviderInstruction";
 import {
   RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT,
-  RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT,
-  RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT,
   RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT,
   RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
   providerMessageChars,
@@ -58,6 +54,7 @@ import {
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ExecutionReasoningRequest,
   runtimeV2ProviderOutputWasTruncated,
+  runtimeV2RecoveryRequiresStructuredAction,
   shouldRetryRuntimeV2WithoutReasoning,
 } from "./executionProviderRequestPolicy";
 
@@ -99,32 +96,18 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const aggregate = aggregateForCurrentTurn(input.ports);
   const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(aggregate);
   const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
-  const executionContractRequired =
-    runtimeV2ExecutionContractRequired(aggregate);
-  const executionContractReadWindow =
-    runtimeV2ExecutionContractReadWindow(aggregate);
   const executionContractAdvance =
     deriveRuntimeV2ExecutionContractAdvance(aggregate);
-  const executionContractRepair =
-    deriveRuntimeV2ExecutionContractRepair(aggregate);
   const validationCorrection =
     deriveRuntimeV2ValidationCorrectionWindow(aggregate);
   const preferredValidation = validationCorrection.validationCommandUnavailable
     ? ""
     : sealedPreferredValidation;
-  const contractFormationDecision =
-    (executionContractRequired && executionContractReadWindow.closed) ||
-    !!executionContractRepair;
-  const contractOnlyAction =
-    contractFormationDecision &&
-    input.tools.length === 1 &&
-    input.tools[0]?.function.name === "record_execution_contract";
   const maxOutputTokens = runtimeV2ExecutionProviderOutputTokenLimit(
     input.command,
     input.textEnvelope,
     budget,
     input.live.latestProviderActionWindow,
-    contractOnlyAction,
   );
   const canonicalDecisionConversation = budget
     ? boundRuntimeV2ProviderConversation(
@@ -177,12 +160,14 @@ export async function requestRuntimeV2ProviderOnce(input: {
     toolNames.has("apply_patch") ||
     toolNames.has("write_file");
   const structuredActionRequired =
-    contractOnlyAction ||
     !!actionWindow ||
     executionContractAdvance.required ||
     validationCorrection.active ||
     validationCorrection.validationCommandUnavailable ||
-    recoveringFromRejectedAction;
+    recoveringFromRejectedAction ||
+    runtimeV2RecoveryRequiresStructuredAction(
+      recoveryPressure as RuntimeV2ProviderRecoveryPressure | null,
+    );
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
   const forceStructuredAction = structuredActionRequired;
   const boundedConversation = structuredActionRequired
@@ -199,9 +184,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const actionOnlyCharLimit =
     requestMode === "execute" || requestMode === "validate"
       ? structuredActionRequired
-        ? contractOnlyAction
-          ? RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT
-          : RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT
+        ? RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT
         : RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT
       : undefined;
   const derivedReasoningRequest = runtimeV2ExecutionReasoningRequest({
@@ -210,7 +193,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     hasMutationTool,
     providerSupportsReasoningToggle:
       adapterCapabilities.reasoningToggle,
-    contractOnlyAction,
     structuredActionRequired,
     recoveringFromRejectedAction,
     recoveryStage,
@@ -244,11 +226,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
           executionContract: validationCorrection.active
             ? null
             : executionContract,
-          executionContractRequired,
-          executionContractReadWindowClosed:
-            executionContractReadWindow.closed,
-          executionContractRepairAttempts:
-            executionContractRepair?.attempts || 0,
           executionContractAdvanceRequired:
             executionContractAdvance.required,
           executionContractCommittedTargets:
@@ -320,6 +297,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
     toolChoice: effectiveToolChoice || null,
     collaborationAllowed:
       input.command.payload.collaborationAllowed === true,
+    collaborationPreferred:
+      input.command.payload.collaborationPreferred === true,
+    spawnSubagentAvailable: toolNames.has("spawn_subagent"),
     collaborationRequestMode:
       String(input.command.payload.collaborationRequestMode || "serialized"),
     remainingSubagentCapacity: Math.max(
@@ -331,13 +311,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     sourceOnlyFrontier,
     providerActionWindow: actionWindow,
     executionContractRevision: executionContract?.revision || null,
-    executionContractRequired,
-    executionContractSupplementalReadBatches:
-      executionContractReadWindow.supplementalReadBatches,
-    executionContractReadWindowClosed:
-      executionContractReadWindow.closed,
-    executionContractRepairAttempts:
-      executionContractRepair?.attempts || 0,
     executionContractAdvanceRequired: executionContractAdvance.required,
     executionContractCommittedTargets:
       executionContractAdvance.committedTargets,
@@ -356,7 +329,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
       validationCorrection.validationCommandUnavailable,
     failedValidationCommand:
       validationCorrection.failedValidationCommand,
-    contractOnlyAction,
     structuredActionRequired,
     forceStructuredAction,
     actionOnlyCharLimit: actionOnlyCharLimit || null,
@@ -413,7 +385,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         onDone: () => undefined,
         onError: () => undefined,
         onLifecycle: (event) => {
-          if (event.phase === "first_chunk") lane.markFirstToken();
+          if (event.phase === "model_progress") lane.markFirstToken();
         },
       },
       input.signal,
@@ -489,7 +461,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
           onDone: () => undefined,
           onError: () => undefined,
           onLifecycle: (event) => {
-            if (event.phase === "first_chunk") lane.markFirstToken();
+            if (event.phase === "model_progress") lane.markFirstToken();
           },
         },
         input.signal,
@@ -499,14 +471,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
           ...(effectiveToolChoice ? { toolChoice: effectiveToolChoice } : {}),
           timeoutMs: input.timeoutMs,
           contextOwnership: "caller",
-          // Some OpenAI-compatible local adapters acknowledge the reasoning
-          // toggle but still emit hidden reasoning. The first 4k guard catches
-          // that capability drift quickly; a sole schema-bound contract gets
-          // one larger bounded retry so MAIN does not cancel the model just
-          // before it emits the required JSON tool arguments.
-          reasoningOnlyCharLimit: contractOnlyAction
-            ? RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT
-            : reasoningOnlyCharLimit,
+          reasoningOnlyCharLimit,
           actionOnlyCharLimit:
             actionOnlyCharLimit === undefined
               ? undefined
@@ -565,11 +530,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     visibleText,
     content: protocolContent,
     toolCalls: result.toolCalls,
-    ...(!input.textEnvelope &&
-        contractOnlyAction &&
-        providerTools.length === 1
-      ? { requiredSingleTool: providerTools[0] }
-      : {}),
     usage: result.usage,
     diagnostics: [
       ...(result.protocolViolation

@@ -12,20 +12,36 @@ function boundedArgument(value: unknown, max: number): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function commaSeparatedPaths(value: unknown): string[] {
-  return String(value || "")
+function commaSeparatedPaths(value: unknown): {
+  paths: string[];
+  invalid: boolean;
+  provided: boolean;
+} {
+  const raw = typeof value === "string" ? value : "";
+  const provided = raw.trim().length > 0;
+  const entries = raw
     .split(/[\n,]/)
     .map((entry) =>
-      entry.trim().replace(/\\/g, "/").replace(/^\.\//, "")
+      entry.trim().replace(/^[`'"]+|[`'"]+$/g, "")
+        .replace(/\\/g, "/").replace(/^\.\//, "")
         .replace(/\/+$/, "")
     )
-    .filter((entry) =>
-      !!entry &&
-      !entry.startsWith("/") &&
-      !/^[A-Za-z]:\//.test(entry) &&
-      !entry.split("/").includes("..")
-    )
-    .slice(0, 6);
+    .filter(Boolean);
+  const invalid =
+    (provided && entries.length === 0) ||
+    entries.length > 6 ||
+    entries.some((entry) =>
+      entry === "." ||
+      entry.startsWith("/") ||
+      /^[A-Za-z]:/.test(entry) ||
+      entry.split("/").includes("..") ||
+      /[\0\r`'"]/.test(entry)
+    );
+  return {
+    paths: [...new Set(entries)],
+    invalid,
+    provided,
+  };
 }
 
 /** Compile the provider-authored collaboration call into one narrow scheduler
@@ -99,15 +115,22 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       "explore, review, and validate subagents must remain read-only.",
     );
   }
-  const explicitlyAllowedPaths = commaSeparatedPaths(args.allowed_paths);
-  const requiredPaths = commaSeparatedPaths(args.required_paths);
+  const explicitlyAllowedScope = commaSeparatedPaths(args.allowed_paths);
+  const requiredScope = commaSeparatedPaths(args.required_paths);
+  if (explicitlyAllowedScope.invalid || requiredScope.invalid) {
+    throw new Error(
+      "spawn_subagent allowed_paths and required_paths must contain at most 6 narrow workspace-relative paths (for example, src/main.js). Do not mix in an absolute path, a drive-qualified path, the workspace root, or `..`.",
+    );
+  }
+  const explicitlyAllowedPaths = explicitlyAllowedScope.paths;
+  const requiredPaths = requiredScope.paths;
   const allowedPaths =
-    explicitlyAllowedPaths.length > 0
+    explicitlyAllowedScope.provided
       ? explicitlyAllowedPaths
       : requiredPaths;
   if (allowedPaths.length === 0) {
     throw new Error(
-      "spawn_subagent requires a narrow scope in allowed_paths or required_paths; Runtime v2 will not widen an omitted scope to the whole workspace.",
+      "spawn_subagent requires a narrow workspace-relative scope in allowed_paths or required_paths (for example, src/main.js). Do not use an absolute path, a drive-qualified path, or `..`; Runtime v2 will not widen an invalid or omitted scope to the whole workspace.",
     );
   }
   if (writeJob && allowedPaths.includes(".")) {

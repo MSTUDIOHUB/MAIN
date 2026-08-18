@@ -70,6 +70,8 @@ function admittedMaxChildRuns(
   currentCapacity: number,
 ): number {
   const currentRunId = state.run?.identity.runId;
+  let admittedMaximum = 0;
+  let foundAdmission = false;
   for (const event of state.events) {
     if (
       event.type !== "command.scheduled" ||
@@ -80,13 +82,16 @@ function admittedMaxChildRuns(
     }
     const admitted = Number(event.command.payload.maxChildRuns);
     if (Number.isSafeInteger(admitted) && admitted >= 0) {
-      return admitted;
+      admittedMaximum = Math.max(admittedMaximum, admitted);
+      foundAdmission = true;
     }
   }
-  return currentCapacity;
+  return foundAdmission
+    ? Math.max(admittedMaximum, currentCapacity)
+    : currentCapacity;
 }
 
-function collaborationPayload(
+export function runtimeV2CollaborationPayload(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput,
 ): Readonly<Record<string, unknown>> {
@@ -97,9 +102,9 @@ function collaborationPayload(
     0,
     Math.floor(Number(input.subagentCapacity) || 0),
   );
-  // Adaptive lane probing may discover more concurrency during a Run. Freeze
-  // the total child budget in the first durable provider request so that new
-  // capacity cannot turn one parent objective into an unbounded spawn loop.
+  // Adaptive lane probing may discover more concurrency during a Run. Grow the
+  // durable child budget only to the currently observed bounded lane capacity;
+  // the provider-neutral ceiling still prevents an unbounded spawn loop.
   const maxChildRuns = admittedMaxChildRuns(state, currentCapacity);
   const maxActiveSubagents = Math.min(currentCapacity, maxChildRuns);
   const runSubagents = currentRunSubagents(state);
@@ -507,7 +512,7 @@ function executeModelRequest(
     ),
     ...(effectPressure ? { effectPressure } : {}),
     ...(recoveryPressure ? { recoveryPressure } : {}),
-    ...collaborationPayload(state, input),
+    ...runtimeV2CollaborationPayload(state, input),
   });
 }
 
@@ -563,7 +568,7 @@ export function decideNextCommands(
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
     if (toolCall.name === "spawn_subagent") {
-      const collaboration = collaborationPayload(state, input);
+      const collaboration = runtimeV2CollaborationPayload(state, input);
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
@@ -607,10 +612,13 @@ export function decideNextCommands(
     ) {
       const scope = resolveRuntimeV2PlanValidationScope({
         plan: state.sealedWorkPlan,
+        aggregate: state,
         toolName: toolCall.name,
         args: toolCall.arguments,
       });
-      const validationIndex = scope.matchingValidationIndexes[0];
+      const validationIndex = scope.allowed
+        ? scope.matchingValidationIndexes[0]
+        : undefined;
       const validation = validationIndex === undefined
         ? undefined
         : state.sealedWorkPlan.draft.validations[validationIndex];
@@ -642,7 +650,7 @@ export function decideNextCommands(
           ),
         )
       : toolCall.arguments;
-    const collaboration = collaborationPayload(state, input);
+    const collaboration = runtimeV2CollaborationPayload(state, input);
     const command = boundedCommand(state, kind, {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
@@ -676,7 +684,7 @@ export function decideNextCommands(
           toolExpectation: "optional",
           objective: state.objective.text,
           evidenceIds: state.evidence.map((item) => item.id),
-          ...collaborationPayload(state, input),
+          ...runtimeV2CollaborationPayload(state, input),
         })];
       }
       return [executeModelRequest(state, input)];
@@ -686,6 +694,7 @@ export function decideNextCommands(
         mode: "plan",
         objective: state.objective.text,
         evidenceIds: state.evidence.map((item) => item.id),
+        ...runtimeV2CollaborationPayload(state, input),
       })];
     case "reviewing":
       return [];

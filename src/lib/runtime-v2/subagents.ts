@@ -9,6 +9,16 @@ import type {
 // takeover window. Near-deadline delegation only steals time from the writer.
 export const RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS = 2 * 60_000;
 
+export function runtimeV2SubagentStartHasRunway(input: {
+  readonly now: number;
+  readonly lifecycleDeadlineAt?: number;
+}): boolean {
+  const deadlineAt = input.lifecycleDeadlineAt;
+  return deadlineAt === undefined ||
+    !Number.isFinite(deadlineAt) ||
+    deadlineAt - input.now >= RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS;
+}
+
 export interface RuntimeV2SubagentScopeCandidate {
   readonly scopeKey: string;
   readonly taskKind?: "explore" | "review" | "validate" | "implement";
@@ -141,8 +151,13 @@ export function runtimeV2SubagentFailureSummary(input: {
 }
 
 function pathsOverlap(left: string, right: string): boolean {
-  const a = normalizedPath(left);
-  const b = normalizedPath(right);
+  // A persisted Run may be resumed on a case-insensitive workspace even when
+  // it was admitted elsewhere.  Write ownership must therefore use the
+  // conservative cross-platform identity; treating case-only variants as
+  // disjoint could authorize two writers for one physical file on Windows or
+  // a default macOS volume.
+  const a = normalizedPath(left).toLocaleLowerCase("en-US");
+  const b = normalizedPath(right).toLocaleLowerCase("en-US");
   if (!a || !b) return true;
   if (a === "." || b === ".") return true;
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);

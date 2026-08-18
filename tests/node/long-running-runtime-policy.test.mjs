@@ -43,6 +43,50 @@ const recoveryTools = loadTs(path.join(workspaceRoot, "src/lib/executeRecoveryTo
 const planEvidence = loadTs(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
 const verificationEvidence = loadTs(path.join(workspaceRoot, "src/lib/verificationEvidence.ts"));
 
+test("load_skill returns the immutable admitted body without executing it", async () => {
+  const snapshot = Object.freeze({
+    entries: Object.freeze([Object.freeze({
+      id: "panel:release",
+      name: "release-check",
+      description: "Check a release.",
+      source: "panel",
+      content: "SKILL_BODY_NO_EXECUTION",
+      entryPath: null,
+      basePath: null,
+      version: "abc12345",
+      allowImplicitInvocation: true,
+      supportingFiles: Object.freeze([]),
+    })]),
+    explicitSkillIds: Object.freeze([]),
+    warnings: Object.freeze([]),
+    loadedAt: 1,
+  });
+
+  const raw = await toolExecutor.executeTool(
+    "load_skill",
+    { skill_id: "panel:release" },
+    "",
+    undefined,
+    { skillCatalog: snapshot },
+  );
+  const loaded = JSON.parse(raw);
+  assert.equal(loaded.type, "skill.loaded");
+  assert.equal(loaded.id, "panel:release");
+  assert.equal(loaded.content, "SKILL_BODY_NO_EXECUTION");
+  assert.equal(loaded.effect, "instructions_loaded_no_additional_permissions");
+
+  await assert.rejects(
+    toolExecutor.executeTool(
+      "load_skill",
+      { skill_id: "panel:not-admitted" },
+      "",
+      undefined,
+      { skillCatalog: snapshot },
+    ),
+    /SKILL_NOT_AUTHORIZED/,
+  );
+});
+
 test("PTY observation analysis distinguishes waiting, readiness, and later failure", () => {
   const waiting = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
     running: true,

@@ -1,4 +1,7 @@
-import { normalizeApplyPatchHeaderPath } from "./applyPatchTool";
+import {
+  normalizeApplyPatchHeaderPath,
+  parseApplyPatch,
+} from "./applyPatchTool";
 
 /**
  * Tools that can durably mutate files in the active workspace.
@@ -26,6 +29,13 @@ export const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
   ...BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES,
   ...EXTERNAL_WORKSPACE_MUTATION_TOOL_NAMES,
 ]);
+
+export type WorkspaceMutationOperation = "create" | "modify" | "delete";
+
+export interface WorkspaceMutationRequest {
+  readonly target: string;
+  readonly operation: WorkspaceMutationOperation | null;
+}
 
 export function isWorkspaceMutationToolName(name: string): boolean {
   return WORKSPACE_MUTATION_TOOL_NAMES.has(String(name || ""));
@@ -66,6 +76,39 @@ function extractApplyPatchTargets(patch: string): string[] {
     if (match[1]) targets.push(normalizeApplyPatchHeaderPath(match[1]));
   }
   return [...new Set(targets.filter(Boolean))];
+}
+
+function extractApplyPatchMutationRequests(
+  patch: string,
+): WorkspaceMutationRequest[] {
+  const parsed = parseApplyPatch(String(patch || ""));
+  if (!parsed.ok) return [];
+  const requests: WorkspaceMutationRequest[] = parsed.operations.flatMap(
+    (operation): WorkspaceMutationRequest[] => {
+      if (operation.kind === "add") {
+        return [{ target: operation.path, operation: "create" as const }];
+      }
+      if (operation.kind === "delete") {
+        return [{ target: operation.path, operation: "delete" as const }];
+      }
+      if (operation.newPath) {
+        // preview/apply materializes a move as removal of the reviewed source
+        // plus creation of a distinct destination. Authorization must reflect
+        // those real effects rather than pretending both paths were modified.
+        return [
+          { target: operation.path, operation: "delete" as const },
+          { target: operation.newPath, operation: "create" as const },
+        ];
+      }
+      return [{ target: operation.path, operation: "modify" as const }];
+    },
+  );
+  return requests.filter((request, index, values) =>
+    values.findIndex((candidate) =>
+      candidate.operation === request.operation &&
+      candidate.target === request.target
+    ) === index
+  );
 }
 
 function extractApplyPatchCreationTargets(patch: string): string[] {
@@ -109,6 +152,46 @@ export function resolveWorkspaceMutationTargets(
   }
 
   return [normalizeMutationPath(args.path || fallbackTarget)].filter(Boolean);
+}
+
+/**
+ * Resolve the semantic operation as well as the exact path for a workspace
+ * mutation. Approved WorkPlan execution uses this lower-level fact to prevent
+ * a provider from satisfying a reviewed create/delete step with a different
+ * mutation primitive that merely happens to name the same path.
+ */
+export function resolveWorkspaceMutationRequests(
+  name: string,
+  args: Record<string, unknown> = {},
+  fallbackTarget = "",
+): WorkspaceMutationRequest[] {
+  if (!isWorkspaceMutationToolCall(name, args)) return [];
+  if (name === "apply_patch") {
+    const requests = extractApplyPatchMutationRequests(String(args.patch || ""));
+    if (requests.length > 0) return requests;
+    return resolveWorkspaceMutationTargets(name, args, fallbackTarget).map(
+      (target) => ({ target, operation: null }),
+    );
+  }
+  const operation: WorkspaceMutationOperation | null =
+    name === "write_file" || name === "create_script"
+      ? "create"
+      : name === "replace_in_file" ||
+          name === "apply_text_edits" ||
+          name === "script_apply_edits"
+        ? "modify"
+        : name === "delete_workspace_path" || name === "delete_script"
+          ? "delete"
+          : name === "manage_script"
+            ? String(args.action || "").trim().toLowerCase() === "create"
+              ? "create"
+              : String(args.action || "").trim().toLowerCase() === "delete"
+                ? "delete"
+                : null
+            : null;
+  return resolveWorkspaceMutationTargets(name, args, fallbackTarget).map(
+    (target) => ({ target, operation }),
+  );
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Event } from "./events";
+import type { RuntimeV2EventDraft } from "./events";
 import type {
   RuntimeV2RunIdentity,
   RuntimeV2SubagentHandoffApplicationSource,
@@ -99,6 +100,7 @@ export function runtimeV2SubagentHandoffApplicationSource(
   event: RuntimeV2Event,
 ): RuntimeV2SubagentHandoffApplicationSource | null {
   if (event.type === "provider.responded") return "provider_result";
+  if (event.type === "work_plan.sealed") return "work_plan";
   if (event.type === "command.scheduled") {
     return event.command.kind === "finalize_turn" ? "final" : "command";
   }
@@ -131,6 +133,12 @@ function referenceValues(event: RuntimeV2Event): readonly string[] {
     }
     return scalarStrings(event.command.payload.arguments);
   }
+  if (event.type === "work_plan.sealed") {
+    return [
+      ...event.sealedPlan.draft.findings.flatMap((finding) => finding.basis),
+      ...event.sealedPlan.draft.steps.flatMap((step) => step.basis),
+    ];
+  }
   if (
     event.type === "projection.published" &&
     event.audience === "final"
@@ -156,6 +164,54 @@ export function referencedRuntimeV2SubagentEvidenceIds(input: {
   return boundedEvidenceIds(input.evidenceIds).filter((evidenceId) =>
     explicitlyReferencesEvidenceId(values, evidenceId)
   );
+}
+
+/** Derive durable adoption receipts from one already-appended parent event.
+ * The caller owns event identity/sequence and appends each returned draft
+ * through its canonical ledger. */
+export function runtimeV2SubagentHandoffApplicationDrafts(input: {
+  readonly state: TurnAggregateV1;
+  readonly sourceEvent: RuntimeV2Event;
+}): readonly RuntimeV2EventDraft[] {
+  const source = runtimeV2SubagentHandoffApplicationSource(
+    input.sourceEvent,
+  );
+  if (!source || !input.state.run) return [];
+  const alreadyApplied = new Map<string, Set<string>>();
+  for (const event of input.state.events) {
+    if (event.type !== "subagent.handoff_applied") continue;
+    const evidenceIds = alreadyApplied.get(event.jobId) || new Set<string>();
+    for (const evidenceId of event.evidenceIds) evidenceIds.add(evidenceId);
+    alreadyApplied.set(event.jobId, evidenceIds);
+  }
+  const drafts: RuntimeV2EventDraft[] = [];
+  for (const delivery of input.state.events) {
+    if (
+      delivery.type !== "subagent.handoff_delivered" ||
+      delivery.sequence >= input.sourceEvent.sequence
+    ) {
+      continue;
+    }
+    const used = alreadyApplied.get(delivery.jobId) || new Set<string>();
+    const evidenceIds = referencedRuntimeV2SubagentEvidenceIds({
+      sourceEvent: input.sourceEvent,
+      evidenceIds: delivery.evidenceIds,
+    }).filter((evidenceId) => !used.has(evidenceId));
+    if (evidenceIds.length === 0) continue;
+    drafts.push({
+      type: "subagent.handoff_applied",
+      run: input.state.run.identity,
+      jobId: delivery.jobId,
+      evidenceIds,
+      sourceEventId: input.sourceEvent.eventId,
+      source,
+    });
+    alreadyApplied.set(
+      delivery.jobId,
+      new Set([...used, ...evidenceIds]),
+    );
+  }
+  return drafts;
 }
 
 export function isValidRuntimeV2SubagentHandoffDelivery(input: {

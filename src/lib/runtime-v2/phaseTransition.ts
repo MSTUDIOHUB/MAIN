@@ -488,7 +488,14 @@ export function decideRuntimeV2ExecutePhaseTransition(
   const pendingValidation = state.pendingToolCalls.some((call) =>
     isRuntimeV2ValidationToolCall(call)
   );
-  if (pendingValidation && state.phase !== "validating") {
+  if (
+    pendingValidation &&
+    state.phase !== "validating" &&
+    (
+      state.strategy !== "plan" ||
+      approvedPlanCoverage?.allMutationTargetsCovered
+    )
+  ) {
     return {
       from: state.phase,
       to: "validating",

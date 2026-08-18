@@ -18,6 +18,12 @@ export const RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES = new Set([
   "web_fetch",
 ]);
 
+/** Reads immutable Turn guidance, not workspace source. Keeping this separate
+ * prevents a Skill body from satisfying source-version or mutation leases. */
+export const RUNTIME_V2_SKILL_READ_TOOL_NAMES = new Set([
+  "load_skill",
+]);
+
 export const RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES = new Set([
   "read_file",
   "read_document",
@@ -37,5 +43,6 @@ export function isRuntimeV2WorkspaceReadToolName(toolName: string): boolean {
 
 export function isRuntimeV2ReadOnlyToolName(toolName: string): boolean {
   return RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName) ||
+    RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(toolName) ||
     RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(toolName);
 }

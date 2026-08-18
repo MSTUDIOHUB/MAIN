@@ -18,6 +18,7 @@ import {
   type TurnInputContextSignals,
 } from "../../lib/turnIntake";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
+import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { createRuntimeV2CheckpointPort } from "./checkpointPort";
 import {
@@ -45,6 +46,8 @@ export interface RuntimeV2GoalProductionSlicePortInput
   readonly language: "zh" | "en";
   readonly turnInputContextSignals?: TurnInputContextSignals;
   readonly runtimeContextBudget?: RuntimeContextBudget | null;
+  readonly workspaceInstructionContext?: string;
+  readonly skillCatalog?: SkillCatalogSnapshot | null;
   readonly markerLease?: RuntimeV2GoalHarnessMarkerLease;
   readonly execute?: (
     input: RuntimeV2ExecuteRunnerInput,
@@ -548,6 +551,8 @@ export function createRuntimeV2GoalProductionSlicePort(
         input.turnInputContextSignals,
       ),
       runtimeContextBudget: input.runtimeContextBudget,
+      workspaceInstructionContext: input.workspaceInstructionContext,
+      skillCatalog: input.skillCatalog,
       executeAdmission: runtimeV2GoalSliceExecuteAdmission(request),
     };
     const execution = Promise.resolve()

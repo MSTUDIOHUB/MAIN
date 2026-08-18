@@ -4,6 +4,11 @@ export type SubagentDelegationPreference =
   | "allowed"
   | "preferred";
 
+/** Whether collaboration is merely available/preferred or explicitly required
+ * by the user's admitted instruction. Preference and requirement are separate
+ * facts: enabling the Composer switch must never manufacture a hard mandate. */
+export type SubagentRequirement = "optional" | "required";
+
 /** Structured Turn-admission authority; never infer this field from model prose. */
 export type DiagnosisOutcomeRequirement = "required" | "optional";
 
@@ -12,6 +17,7 @@ export interface TurnInputContextSignals {
   mentionedFilePaths: string[];
   attachedFilePaths: string[];
   subagentPreference: SubagentDelegationPreference;
+  subagentRequirement: SubagentRequirement;
   diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
@@ -20,22 +26,25 @@ export interface TurnInputContextLike {
   mentionedFilePaths?: string[];
   attachedFilePaths?: string[];
   subagentPreference?: SubagentDelegationPreference;
+  subagentRequirement?: SubagentRequirement;
   diagnosisRequirement?: DiagnosisOutcomeRequirement;
 }
 
-const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
+const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?|multi[\s_-]?agents?|multiple\s+agents?)/i;
 // A negative instruction about what a child may read or mutate is not a ban
 // on delegation. Keep this predicate syntactically tied to enabling/using the
 // child itself instead of treating arbitrary nearby negation as "forbidden".
-const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:再\s*)?(?:使用|启用|开启|调用|创建|启动|派遣|委派)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)\s*(?:参与|介入|协作|工作)?(?=$|[，,。.!！？?；;])|(?:do\s+not|don't)\s+(?:use\s+|spawn\s+|create\s+|enable\s+)(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|without\s+(?:using\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|(?:^|[.!?;]\s*)no\s+(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)(?:\s+(?:for|in|on)\s+(?:this\s+)?(?:turn|task|request))?(?=$|[.!?;]))/i;
-const SUBAGENT_REQUIRED_RE = /(?:(?:必须|务必|需要|请)\s*(?:(?:先|连续|立即|优先)\s*)*(?:调用|使用|启动|创建|派遣|委派)\s*(?:一个|多个|\d+\s*个|[一二三四五六七八九十]+\s*个)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|子智能体|子代理)|(?:must|required\s+to|need\s+to|please)\s+(?:first\s+)?(?:use|spawn|create|start|call)\s+(?:one|two|three|several|multiple|\d+)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|agents?))/i;
-const SUBAGENT_PARALLEL_RE = /(?:(?:多个|两个|多开|并行|协同|分工).{0,32}(?:sub[\s_-]?agents?|子智能体|子代理|智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|智能体).{0,32}(?:多个|两个|多开|并行|协同|分工)|(?:parallel|multiple|two|several|collaborat(?:e|ion)|divide\s+the\s+work).{0,32}(?:sub[\s_-]?agents?|agents?))/i;
-const SUBAGENT_ALLOWED_RE = /(?:(?:可以|可用|允许|同意|可开启|可使用).{0,28}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:may|can|allowed\s+to|feel\s+free\s+to).{0,28}(?:use\s+|spawn\s+)?(?:sub[\s_-]?agents?|agents?))/i;
+const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:再\s*)?(?:使用|启用|开启|调用|创建|启动|派遣|委派)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?)|(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?)\s*(?:参与|介入|协作|工作)?(?=$|[，,。.!！？?；;])|(?:do\s+not|don't)\s+(?:use\s+|spawn\s+|create\s+|enable\s+)(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|without\s+(?:using\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|(?:^|[.!?;]\s*)no\s+(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)(?:\s+(?:for|in|on)\s+(?:this\s+)?(?:turn|task|request))?(?=$|[.!?;]))/i;
+const SUBAGENT_REQUIRED_RE = /(?:(?:必须|务必|需要|请)\s*(?:(?:先|连续|立即|优先)\s*)*(?:调用|使用|启动|创建|派遣|委派)(?:\s*或\s*(?:调用|使用|启动|创建|派遣|委派))?\s*(?:一个|多个|\d+\s*个|[一二三四五六七八九十]+\s*个)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?)|(?:必须|务必|需要|请)\s*把[^。.!！？?]{0,160}?(?:交给|委派给)\s*(?:只读\s*)?(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?)|(?:must|required\s+to|need\s+to|please)\s+(?:first\s+)?(?:use|spawn|create|start|call)(?:\s+or\s+(?:use|spawn|create|start|call))?\s+(?:one|two|three|several|multiple|\d+)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|agents?))/i;
+const SUBAGENT_IMPERATIVE_RE = /(?:^|[，,。.!！？?；;]\s*|(?:过程中|同时|另外|然后|并且|并|也|并行|协同)\s*)(?:也\s*)?(?:请\s*)?(?:使用|启用|开启|调用|创建|启动|派遣|委派)\s*(?:一个|多个|\d+\s*个|[一二三四五六七八九十]+\s*个)?\s*(?:sub[\s_-]?agents?|子智能体|子代理|子\s*agents?|多智能体|多\s*agents?)(?:\s*功能|\s*模式|\s*协作)?/i;
+const SUBAGENT_PARALLEL_RE = /(?:(?:多个|两个|多开|并行|协同|分工).{0,32}(?:sub[\s_-]?agents?|子智能体|子代理|多\s*agents?|智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|多\s*agents?|智能体).{0,32}(?:多个|两个|多开|并行|协同|分工)|(?:parallel|multiple|two|several|collaborat(?:e|ion)|divide\s+the\s+work).{0,32}(?:sub[\s_-]?agents?|agents?))/i;
+const SUBAGENT_ALLOWED_RE = /(?:(?:可以|可用|允许|同意|可开启|可使用).{0,28}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|多\s*agents?)|(?:may|can|allowed\s+to|feel\s+free\s+to).{0,28}(?:use\s+|spawn\s+)?(?:sub[\s_-]?agents?|agents?))/i;
 
 export function resolveSubagentDelegationPreference(input: string): SubagentDelegationPreference {
   const text = String(input || "").replace(/\s+/g, " ").trim();
   if (!text || !SUBAGENT_REFERENCE_RE.test(text)) return "unspecified";
-  const requiredDirective = SUBAGENT_REQUIRED_RE.exec(text);
+  const requiredDirective = SUBAGENT_REQUIRED_RE.exec(text) ||
+    SUBAGENT_IMPERATIVE_RE.exec(text);
   const forbiddenDirective = SUBAGENT_FORBIDDEN_RE.exec(text);
   if (requiredDirective && forbiddenDirective) {
     return requiredDirective.index > forbiddenDirective.index ? "preferred" : "forbidden";
@@ -53,6 +62,38 @@ export function normalizeSubagentDelegationPreference(
   return value === "forbidden" || value === "allowed" || value === "preferred"
     ? value
     : "unspecified";
+}
+
+export function normalizeSubagentRequirement(
+  value: unknown,
+): SubagentRequirement {
+  return value === "required" ? "required" : "optional";
+}
+
+/** Lexical classification is isolated at Turn admission. Downstream Runtime
+ * policy consumes only this typed fact and never reparses user prose. */
+export function resolveSubagentRequirement(input: string): SubagentRequirement {
+  const text = String(input || "").replace(/\s+/g, " ").trim();
+  if (!text || !SUBAGENT_REFERENCE_RE.test(text)) return "optional";
+  const requiredDirective = SUBAGENT_REQUIRED_RE.exec(text) ||
+    SUBAGENT_IMPERATIVE_RE.exec(text);
+  if (!requiredDirective) return "optional";
+  const forbiddenDirective = SUBAGENT_FORBIDDEN_RE.exec(text);
+  return forbiddenDirective && forbiddenDirective.index > requiredDirective.index
+    ? "optional"
+    : "required";
+}
+
+export function resolveEffectiveSubagentRequirement(input: {
+  rawUserInput: string;
+  defaultRequirement?: SubagentRequirement;
+}): SubagentRequirement {
+  const preference = resolveSubagentDelegationPreference(input.rawUserInput);
+  if (preference === "forbidden") return "optional";
+  if (resolveSubagentRequirement(input.rawUserInput) === "required") {
+    return "required";
+  }
+  return normalizeSubagentRequirement(input.defaultRequirement);
 }
 
 export function resolveEffectiveSubagentDelegationPreference(input: {
@@ -96,15 +137,22 @@ export function buildSubagentDelegationGuidance(input: {
   }
   const availability = input.preference === "preferred"
     ? input.language === "en"
-      ? "Collaboration is enabled for this turn."
-      : "本轮已开启协作。"
+      ? "The user explicitly prefers collaboration for this turn."
+      : "用户已明确选择本轮优先使用协作。"
     : input.language === "en"
       ? "Collaboration is available for this turn."
       : "本轮允许按需协作。";
+  const preferenceMethod = input.preference === "preferred"
+    ? input.language === "en"
+      ? "During intent analysis, identify genuinely independent work, dependencies, and exact ownership. When spawn_subagent is exposed and at least two bounded work packages can overlap, prioritize starting as many useful children as the advertised capacity permits while the parent continues non-dependent work. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly."
+      : "分析用户意图时就识别真正独立的工作、依赖关系和精确责任范围。实际暴露 spawn_subagent 且至少两个边界明确的工作包可以重叠时，应优先在公布的容量内启动尽可能多的有用子智能体，同时父线程继续推进不依赖子结果的工作。该偏好可用于读取、修改或验证任一阶段，但不是强制生命周期阶段；简单或线性任务直接执行。"
+    : input.language === "en"
+      ? "During intent analysis, identify genuinely independent work, dependencies, and exact ownership; invoke spawn_subagent only when that tool is exposed and useful. Delegation remains optional at inspect, edit, or verify and is never a prerequisite for mutation or completion."
+      : "分析用户意图时识别真正独立的工作、依赖关系和精确责任范围；只有实际暴露 spawn_subagent 且确有收益时才调用。读取、修改或验证任一阶段均可按需协作，但协作不是写入或完成的前置条件。";
   return input.language === "en"
     ? [
         availability,
-        "During intent analysis, identify genuinely independent work, dependencies, and exact ownership; invoke spawn_subagent only when that tool is actually exposed. Spawning is optional at every inspect, edit, and verify stage and is never a prerequisite for mutation or completion.",
+        preferenceMethod,
         "Parallelize bounded investigation, review, or validation when it can overlap useful parent work.",
         "Each child receives a curated context capsule—its self-contained objective, relevant exact source/evidence, constraints, and any active implementation contract—not the parent's hidden reasoning or full transcript. Assign enough explicit evidence and boundaries for the child to finish and report independently.",
         "Delegate implementation only after the parent has an evidence-backed solution: assign a create/modify/delete operation, a concrete implementation plan and success criteria, and every exact non-overlapping file target. Do not grant a directory and let the child choose mutation targets. Each implementation child stages one transaction; Runtime revalidates and commits it at join.",
@@ -112,7 +160,7 @@ export function buildSubagentDelegationGuidance(input: {
       ].join(" ")
     : [
         availability,
-        "分析用户意图时就识别真正独立的工作、依赖关系和精确责任范围；只有实际暴露 spawn_subagent 工具时才可调用。读取、修改或验证任一阶段都可根据实际工作量自行判断是否启动，但绝不强制，也不是写入或完成的前置条件。",
+        preferenceMethod,
         "能与主体有效重叠时，可并行委派范围明确的调查、评审或验证。",
         "每个子智能体只接收父线程整理的上下文胶囊：可独立理解的目标、相关精确源码/证据、约束和现行实施契约；不会继承父线程隐藏推理或完整对话。分配时必须给足证据和边界，使其能独立完成并回报。",
         "只有父线程已形成证据化方案后才能委派实现：必须指定 create/modify/delete 操作、具体 implementation_plan、成功标准和每个精确且互不重叠的文件目标；不能只授权目录再让子智能体自行选择修改目标。每个实现子智能体只暂存一个事务，由 Runtime 在汇合时重新校验并提交。",
@@ -148,6 +196,7 @@ export function normalizeTurnInputContextSignals(input: TurnInputContextLike = {
     mentionedFilePaths: uniq(input.mentionedFilePaths),
     attachedFilePaths: uniq(input.attachedFilePaths),
     subagentPreference: normalizeSubagentDelegationPreference(input.subagentPreference),
+    subagentRequirement: normalizeSubagentRequirement(input.subagentRequirement),
     ...(diagnosisRequirement ? { diagnosisRequirement } : {}),
   };
 }
@@ -158,6 +207,7 @@ export function hasTurnProvidedContext(signals: TurnInputContextLike = {}): bool
     normalized.imageParts > 0 ||
     normalized.mentionedFilePaths.length > 0 ||
     normalized.attachedFilePaths.length > 0 ||
+    normalized.subagentRequirement === "required" ||
     normalized.diagnosisRequirement !== undefined
   );
 }
@@ -177,9 +227,14 @@ export function buildTurnIntakeContextBlock(input: {
     rawUserInput,
     defaultPreference: signals.subagentPreference,
   });
+  const subagentRequirement = resolveEffectiveSubagentRequirement({
+    rawUserInput,
+    defaultRequirement: signals.subagentRequirement,
+  });
   const lines: string[] = ["[turn_intake]"];
   lines.push(`workflowMode: ${input.workflowMode || "chat"}`);
   lines.push(`subagentPreference: ${subagentPreference}`);
+  lines.push(`subagentRequirement: ${subagentRequirement}`);
   if (signals.diagnosisRequirement) {
     lines.push(`diagnosisRequirement: ${signals.diagnosisRequirement}`);
   }
@@ -294,6 +349,9 @@ export function extractTurnInputContextSignalsFromMessages(messages: MessageLike
   const intakeSubagentPreference = intakeBlock.match(
     /^subagentPreference:\s*(unspecified|forbidden|allowed|preferred)\s*$/mi,
   )?.[1];
+  const intakeSubagentRequirement = intakeBlock.match(
+    /^subagentRequirement:\s*(optional|required)\s*$/mi,
+  )?.[1];
   const intakeDiagnosisRequirement = intakeBlock.match(
     /^diagnosisRequirement:\s*(required|optional)\s*$/mi,
   )?.[1];
@@ -302,6 +360,9 @@ export function extractTurnInputContextSignalsFromMessages(messages: MessageLike
     mentionedFilePaths,
     attachedFilePaths,
     subagentPreference: normalizeSubagentDelegationPreference(intakeSubagentPreference),
+    subagentRequirement: normalizeSubagentRequirement(
+      intakeSubagentRequirement,
+    ),
     diagnosisRequirement: intakeDiagnosisRequirement === "required" || intakeDiagnosisRequirement === "optional"
       ? intakeDiagnosisRequirement
       : undefined,

@@ -1,4 +1,5 @@
 import type { AttachedFile } from "./attachments";
+import type { SkillCatalogSnapshot } from "./agentSkills";
 import type { StudioConfig as GameStudioConfig } from "./gameStudio/catalog";
 import type { PlanExecutionRunProvenance } from "./planExecutionProvenance";
 import type { FeishuRemoteContext } from "./remoteContextTypes";
@@ -74,6 +75,9 @@ export interface SubmissionRuntimeContext {
   /** Exact live workspace instructions captured before Run admission.
    * Conversation summaries and legacy session memory never populate it. */
   workspaceInstructionContext?: string;
+  /** Exact Skill catalog frozen at Turn admission. Full bodies remain outside
+   * provider context until explicit activation or load_skill. */
+  skillCatalog?: SkillCatalogSnapshot | null;
   gameStudioConfigForTurn: GameStudioConfig | null;
   abortCtrl: AbortController;
   timerInterval: any;

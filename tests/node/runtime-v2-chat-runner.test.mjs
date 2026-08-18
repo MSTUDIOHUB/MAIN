@@ -147,8 +147,9 @@ function harness(providerResults, options = {}) {
       },
     },
     tool: {
-      async execute() {
+      async execute(input) {
         toolCalls += 1;
+        if (options.toolExecute) return options.toolExecute(input);
         throw new Error("tool port must be unreachable");
       },
     },
@@ -246,6 +247,62 @@ test("a hallucinated tool call concludes error without invoking the tool", async
   );
 });
 
+test("Chat allows canonical load_skill context reads and still denies every external effect", async () => {
+  const testHarness = harness([
+    {
+      visibleText: "",
+      toolCalls: [{
+        id: "call-skill",
+        name: "load_skill",
+        arguments: { skill_id: "panel:review" },
+      }],
+      diagnostics: [],
+    },
+    {
+      visibleText: "已按 Skill 形成只读回答。",
+      toolCalls: [],
+      diagnostics: [],
+    },
+  ], {
+    toolExecute: async ({ command }) => ({
+      type: "tool.completed",
+      run: command.run,
+      idempotencyKey: command.idempotencyKey,
+      status: "succeeded",
+      evidence: [{
+        id: "skill:1",
+        kind: "tool",
+        target: "panel:review",
+        version: "cafe1234",
+      }],
+    }),
+  });
+  const result = await runRuntimeV2ChatLoop({
+    ports: testHarness.ports,
+    turn,
+    run,
+    objective: "按 review Skill 回答",
+    signal: testHarness.abort.signal,
+    now: testHarness.now,
+    deadlineMs: 1_000,
+    allowSkillLoad: true,
+  });
+
+  assert.equal(result.resultKind, "success");
+  assert.equal(testHarness.read().providerCalls, 2);
+  assert.equal(testHarness.read().toolCalls, 1);
+  assert.equal(testHarness.read().schedulerCalls, 0);
+  assert.deepEqual(
+    result.aggregate.events
+      .filter((event) =>
+        event.type === "command.scheduled" &&
+        event.command.kind === "execute_tool"
+      )
+      .map((event) => event.command.payload.toolName),
+    ["load_skill"],
+  );
+});
+
 test("transient transport failures continue until the lifecycle deadline", async () => {
   const testHarness = harness([
     ({ advance }) => {
@@ -328,7 +385,7 @@ test("deadline and cancellation are distinct canonical conclusions", async (t) =
   });
 });
 
-test("Chat adapter has no legacy runtime import, tools, or prose lifecycle classifier", () => {
+test("Chat adapter has no legacy runtime, external tool executor, or prose lifecycle classifier", () => {
   const source = fs.readFileSync(
     path.join(workspaceRoot, "src/store/runtimeV2/chatRunner.ts"),
     "utf8",
@@ -339,8 +396,9 @@ test("Chat adapter has no legacy runtime import, tools, or prose lifecycle class
     source,
     /visibleText\.(?:includes|match|search|startsWith)|RegExp\([^)]*visibleText/,
   );
-  assert.match(source, /offeredToolCount:\s*0/);
-  assert.match(source, /toolChoice:\s*"none"/);
+  assert.match(source, /buildLoadSkillToolDefinition/);
+  assert.match(source, /toolChoice:\s*input\.tools\?\.length\s*\?\s*"auto"\s*:\s*"none"/);
+  assert.match(source, /toolName !== "load_skill"/);
   assert.match(source, /isRuntimeV2GlobalChatTurn/);
   assert.match(source, /RUNTIME_V2_CHAT_REJECTS_WORKSPACE_SESSION/);
 });

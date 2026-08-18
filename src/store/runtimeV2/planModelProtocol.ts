@@ -1,13 +1,27 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
+import {
+  READ_ONLY_SUBAGENT_ACCESS_MODES,
+  READ_ONLY_SUBAGENT_TASK_KINDS,
+  TOOL_DEFINITIONS,
+  type ToolDefinition,
+} from "../../lib/toolSchemas";
 import {
   type WorkPlanRuntimeEvidence,
 } from "../../lib/runtime-v2";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
 import {
   buildSubagentDelegationGuidance,
 } from "../../lib/turnIntake";
+import {
+  buildLoadSkillToolDefinition,
+  renderExplicitSkillActivationContext,
+  renderSkillCatalogContext,
+  skillCatalogContextCharBudget,
+} from "../../lib/agentSkills";
+import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { latestRuntimeV2PlanProviderAdmissionRejectionHistory } from "./planProviderAdmission";
 
 export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
 export const PLAN_MODEL_COMPACTION_INTERVAL = 10;
@@ -34,6 +48,7 @@ export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "git_status",
   "git_diff",
   "get_project_skeleton",
+  "load_skill",
 ]);
 
 export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
@@ -69,8 +84,24 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
                 description: "The exact code, contract, or behavior change. Include relevant symbols and preserved boundaries.",
               },
               expectedOutcome: { type: "string" },
+              basis: {
+                type: "array",
+                items: { type: "string" },
+                description: "Exact retained evidence IDs supporting this change. Cite child evidence IDs here when adopting a joined subagent finding.",
+              },
+              dependsOn: {
+                type: "array",
+                items: { type: "integer" },
+                description: "Zero-based indexes of earlier changes that must complete before this change. Use [] when independent.",
+              },
+              criterionIds: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string" },
+                description: "Exact admitted criterion IDs this change serves. Do not invent or omit IDs.",
+              },
             },
-            required: ["targets", "change"],
+            required: ["operation", "targets", "change", "dependsOn", "criterionIds"],
           },
         },
         validations: {
@@ -93,8 +124,19 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
                 description: "The observable pass condition. Put browser or desktop interaction details here.",
               },
               required: { type: "boolean" },
+              stepIndexes: {
+                type: "array",
+                items: { type: "integer" },
+                description: "Zero-based change indexes whose outcome this validation proves.",
+              },
+              criterionIds: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string" },
+                description: "Exact admitted criterion IDs this required validation proves.",
+              },
             },
-            required: ["kind", "expectedOutcome"],
+            required: ["kind", "expectedOutcome", "stepIndexes", "criterionIds"],
           },
         },
         questions: {
@@ -114,6 +156,98 @@ export const PLAN_MODEL_TOOLS = [
   ),
   SUBMIT_WORK_PLAN_TOOL,
 ];
+
+export function planModelTools(
+  context: RuntimeV2SubmissionContext,
+  state?: any,
+): ToolDefinition[] {
+  const includeNetwork = state?.webSearchEnabled === true;
+  const loadSkill = buildLoadSkillToolDefinition(context.skillCatalog);
+  const baseTools = TOOL_DEFINITIONS.filter((definition) => {
+    const name = definition.function.name;
+    return PLAN_READ_ONLY_TOOL_NAMES.has(name) ||
+      (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
+  });
+  return [
+    ...baseTools,
+    ...(loadSkill ? [loadSkill] : []),
+    SUBMIT_WORK_PLAN_TOOL,
+  ];
+}
+
+function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
+  ToolDefinition | null {
+  const source = TOOL_DEFINITIONS.find((definition) =>
+    definition.function.name === name
+  );
+  if (!source) return null;
+  if (name === "wait_subagents") return source;
+  const properties = { ...source.function.parameters.properties };
+  delete properties.implementation_operation;
+  delete properties.implementation_plan;
+  return {
+    ...source,
+    function: {
+      ...source.function,
+      description: [
+        "Create one bounded read-only planning child for independent investigation, review, or validation design.",
+        "The parent must continue unrelated discovery and later join the child before submitting the WorkPlan.",
+        "Planning children cannot modify or stage workspace files.",
+      ].join(" "),
+      parameters: {
+        ...source.function.parameters,
+        properties: {
+          ...properties,
+          task_kind: {
+            ...properties.task_kind,
+            enum: [...READ_ONLY_SUBAGENT_TASK_KINDS],
+          },
+          access_mode: {
+            ...properties.access_mode,
+            enum: [...READ_ONLY_SUBAGENT_ACCESS_MODES],
+          },
+        },
+      },
+    },
+  };
+}
+
+const PLAN_SPAWN_SUBAGENT_TOOL = planCollaborationTool("spawn_subagent");
+const PLAN_WAIT_SUBAGENTS_TOOL = planCollaborationTool("wait_subagents");
+
+export function selectPlanModelTools(input: {
+  readonly submissionStage: boolean;
+  readonly collaborationAllowed: boolean;
+  readonly collaborationRequired?: boolean;
+  readonly collaborationRequirementMet?: boolean;
+  readonly remainingSubagentCapacity: number;
+  readonly activeSubagentCount: number;
+  readonly baseTools?: readonly ToolDefinition[];
+}): ToolDefinition[] {
+  if (
+    input.collaborationRequired === true &&
+    input.collaborationRequirementMet !== true
+  ) {
+    return input.collaborationAllowed &&
+        input.remainingSubagentCapacity > 0 &&
+        PLAN_SPAWN_SUBAGENT_TOOL
+      ? [PLAN_SPAWN_SUBAGENT_TOOL]
+      : [];
+  }
+  if (input.submissionStage) return [SUBMIT_WORK_PLAN_TOOL];
+  const tools = [...(input.baseTools || PLAN_MODEL_TOOLS)];
+  if (
+    input.collaborationAllowed &&
+    input.remainingSubagentCapacity > 0 &&
+    PLAN_SPAWN_SUBAGENT_TOOL
+  ) {
+    tools.splice(tools.length - 1, 0, PLAN_SPAWN_SUBAGENT_TOOL);
+  }
+  if (input.activeSubagentCount > 0 && PLAN_WAIT_SUBAGENTS_TOOL) {
+    tools.splice(tools.length - 1, 0, PLAN_WAIT_SUBAGENTS_TOOL);
+  }
+  return tools;
+}
 
 export type PlanModelStage = "discovery" | "synthesis";
 export type PlanProviderTransport =
@@ -154,14 +288,38 @@ export function providerPlanMessages(input: {
   readonly turn: ConversationTurn;
   readonly context: RuntimeV2SubmissionContext;
   readonly overview: string;
+  readonly subagentRequirement?: "optional" | "required";
 }): AgentMessage[] {
   const language = input.context.phaseLanguage === "en" ? "English" : "简体中文";
-  const collaborationGuidance = buildSubagentDelegationGuidance({
-    preference:
-      input.context.turnInputContextSignals?.subagentPreference ||
-        "unspecified",
-    language: input.context.phaseLanguage,
-  });
+  const collaborationRequired = (
+    input.subagentRequirement ??
+    input.context.turnInputContextSignals?.subagentRequirement ??
+    "optional"
+  ) === "required";
+  const collaborationGuidance = collaborationRequired
+    ? ""
+    : buildSubagentDelegationGuidance({
+        preference:
+          input.context.turnInputContextSignals?.subagentPreference ||
+            "unspecified",
+        language: input.context.phaseLanguage,
+      });
+  const skillCatalog = renderSkillCatalogContext(
+    input.context.skillCatalog,
+    skillCatalogContextCharBudget(
+      input.context.runtimeContextBudget?.contextLimit,
+    ),
+  );
+  const explicitSkills = renderExplicitSkillActivationContext(
+    input.context.skillCatalog,
+  );
+  const workspaceInstructions = String(
+    input.context.workspaceInstructionContext || "",
+  ).trim();
+  const admission = resolveRuntimeV2ObjectiveAdmission(
+    input.context,
+    input.turn.userPrompt,
+  );
   return [
     {
       role: "system",
@@ -174,12 +332,22 @@ export function providerPlanMessages(input: {
         "Read every exact modify/delete target before submitting; the runtime binds its versioned evidence automatically.",
         "Trace the complete cause across owners before submitting. If an investigated owner must remain unchanged, say so in the narrative or add a preserve change instead of proposing an unnecessary edit.",
         "When evidence is sufficient, call submit_runtime_v2_work_plan exactly once. Write task-specific Markdown rather than filling a fixed report template.",
-        "The submission only needs a concrete change list and validation list. The runtime owns evidence binding, dependencies, approval identity and rendering.",
-        "Use finite_command for a bounded build/test/check command when the workspace provides one. Use browser only for web DOM behavior and desktop for native GUI behavior; put interaction details in expectedOutcome, not command.",
+        "The submission needs a concrete change list, explicit dependency edges, and a complete validation list. Use zero-based earlier change indexes in changes[].dependsOn; use [] only when a change is genuinely independent. The runtime validates and normalizes these edges but does not infer them from prose or filenames.",
+        "Use finite_command for each bounded build/test/check command explicitly required by the user or promised in your plan. Put every command in a separate validations[] entry and name the zero-based changes it proves in stepIndexes. Use browser only for web DOM behavior and desktop for native GUI behavior; put interaction details in expectedOutcome, not command.",
+        "Every change and every required validation must include criterionIds copied exactly from the admitted criteria below. Each admitted criterion must appear in at least one change and one required validation; mapping an ID is a reviewable claim, not permission to weaken its text.",
+        `[ADMITTED CRITERIA]\n${admission.acceptanceCriteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n")}`,
+        collaborationRequired
+          ? "[REQUIRED COLLABORATION]\nThe user explicitly requires a planning child. Before submitting, admit at least one bounded read-only child through spawn_subagent, later join it, assess its result, and cite any adopted exact evidence ID. This is a hard admission condition, not a collaboration preference."
+          : "",
         "Use questions only for a real user-owned decision.",
         collaborationGuidance
           ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
           : "",
+        workspaceInstructions
+          ? `[LIVE WORKSPACE INSTRUCTIONS]\n${workspaceInstructions}`
+          : "",
+        skillCatalog,
+        explicitSkills,
       ].join("\n"),
     },
     { role: "user", content: input.turn.userPrompt },
@@ -259,9 +427,12 @@ export function synthesisPlanTranscript(input: {
   readonly messages: readonly AgentMessage[];
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
   readonly evidenceContents: ReadonlyMap<string, string>;
+  readonly submissionRepairPending: boolean;
   readonly compactRecovery: boolean;
   readonly transport: PlanProviderTransport;
 }): AgentMessage[] {
+  const latestAdmissionRejection =
+    latestRuntimeV2PlanProviderAdmissionRejectionHistory(input.messages);
   let lastSubmissionOutcomeIndex = -1;
   for (let index = input.messages.length - 1; index >= 0; index -= 1) {
     const message = input.messages[index]!;
@@ -285,20 +456,44 @@ export function synthesisPlanTranscript(input: {
   const rejectedSubmission = lastRejection
     ? latestSubmittedPlanArguments(input.messages, lastSubmissionOutcomeIndex)
     : "";
-  if (lastRejection && rejectedSubmission) {
+  if (
+    input.submissionRepairPending &&
+    lastRejection &&
+    rejectedSubmission
+  ) {
+    const rejectionText = String(lastRejection.content || "");
+    const relatedEvidence = input.evidence.filter((entry) =>
+      rejectionText.includes(entry.id) ||
+      rejectedSubmission.includes(entry.id)
+    );
+    const repairEvidence = relatedEvidence.length > 0
+      ? compactPlanEvidencePacket({
+          evidence: relatedEvidence,
+          evidenceContents: input.evidenceContents,
+          charBudget: PLAN_SYNTHESIS_RECOVERY_EVIDENCE_CHARS,
+        })
+      : "";
     return [
       ...input.messages.slice(0, 2),
       {
         role: "system",
-        content: "Correct the rejected WorkPlan structure and call submit_runtime_v2_work_plan. Do not investigate again.",
+        content: [
+          "Correct the rejected WorkPlan structure and call submit_runtime_v2_work_plan.",
+          "This request exposes only that effect-free submission ingress; do not investigate again.",
+          "When the feedback names completed child evidence, assess its finding and cite the exact ID in changes[].basis. If it does not alter implementation scope, use a preserve change that explains why.",
+        ].join(" "),
       },
       {
         role: "user",
         content: [
-          `Validation feedback:\n${String(lastRejection.content || "").slice(0, 4_000)}`,
+          `Validation feedback:\n${rejectionText.slice(0, 4_000)}`,
           `Rejected submission to correct:\n${rejectedSubmission.slice(0, 12_000)}`,
+          repairEvidence
+            ? `Relevant retained evidence (exact IDs and contents):\n${repairEvidence}`
+            : "",
         ].join("\n\n"),
       },
+      ...latestAdmissionRejection,
     ];
   }
   return [
@@ -312,6 +507,7 @@ export function synthesisPlanTranscript(input: {
           : {}),
       }),
     },
+    ...latestAdmissionRejection,
     {
       role: "system",
       content: [
@@ -325,7 +521,7 @@ export function synthesisPlanTranscript(input: {
             ? "The read-only discovery window is closed. Return exactly one JSON object matching the supplied runtime_v2_work_plan_submission schema. Do not add prose or a Markdown fence."
             : "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
           "Before submitting, reconcile the retained evidence into a concrete causal chain and include only source owners that the evidence supports.",
-          "Use observable bounded validation. Do not put dev servers or manual instructions in finite command fields.",
+          "Preserve every dependency edge and every bounded validation explicitly required by the user or promised in the narrative in the structured dependsOn, stepIndexes, and validations fields. Use observable bounded validation. Do not put dev servers or manual instructions in finite command fields.",
         ].join(" "),
       ].join(" "),
     },

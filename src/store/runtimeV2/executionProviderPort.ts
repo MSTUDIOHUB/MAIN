@@ -40,6 +40,9 @@ import {
   isRuntimeV2ExecutionProviderTimeout,
 } from "./executionProviderDeadline";
 import {
+  requestRuntimeV2ProviderWithEmptySurface,
+} from "./executionProviderEmptySurface";
+import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ProviderProtocolError,
@@ -91,39 +94,12 @@ export function createRuntimeV2ProviderPort(
       });
 
       if (tools.length === 0) {
-        let result;
-        try {
-          result = await executeRuntimeV2ProviderWithDeadline({
-            ports: input,
-            command,
-            requestDeadlineAt,
-            transport: null,
-            signal,
-            task: (request) => requestRuntimeV2ProviderOnce({
-              live: input.live,
-              ports: input,
-              command,
-              tools: [],
-              textEnvelope: false,
-              toolChoice: null,
-              signal: request.signal,
-              timeoutMs: request.timeoutMs,
-            }),
-          });
-        } catch (error) {
-          if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
-          if (isRuntimeV2ProviderProtocolError(error)) throw error;
-          throw runtimeV2ProviderAttemptFailure(error);
-        }
-        result = {
-          ...result,
-          toolCalls: scopeRuntimeV2ProviderToolCallIds(
-            result.toolCalls,
-            () => input.nextId("provider-tool-call"),
-          ),
-        };
-        rememberRuntimeV2ProviderResult(input, result);
-        return result;
+        return requestRuntimeV2ProviderWithEmptySurface({
+          ports: input,
+          command,
+          requestDeadlineAt,
+          signal,
+        });
       }
 
       let epoch: {
@@ -174,9 +150,6 @@ export function createRuntimeV2ProviderPort(
                   attempt.textEnvelope,
                   input.context.runtimeContextBudget,
                   input.live.latestProviderActionWindow,
-                  tools.length === 1 &&
-                    tools[0]?.function.name ===
-                      "record_execution_contract",
                 ),
               });
               return requestRuntimeV2ProviderOnce({

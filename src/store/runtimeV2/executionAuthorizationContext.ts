@@ -52,8 +52,9 @@ export interface RuntimeV2ToolAuthorizationResult {
  * is migrated; an unknown tool can therefore never bypass the catalog. */
 export function createRuntimeV2ExecutionAuthorization(
   state: any,
+  skillCatalog?: import("../../lib/agentSkills").SkillCatalogSnapshot | null,
 ): RuntimeV2ExecutionAuthorization {
-  const toolDefinitions = runtimeV2ToolDefinitions(state);
+  const toolDefinitions = runtimeV2ToolDefinitions(state, skillCatalog);
   const policy = normalizeToolPermissionPolicy(
     state?.config?.toolPermissionPolicy,
   );
@@ -72,6 +73,7 @@ export function authorizationFor(
   if (!input.live.authorization) {
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
       input.get(),
+      input.context.skillCatalog,
     );
   }
   return input.live.authorization;

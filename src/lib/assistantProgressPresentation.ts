@@ -193,8 +193,8 @@ export function buildCapsulePhaseGuidance(
 ): string {
   const copy: Partial<Record<CapsuleStatusKind, { zh: string; en: string }>> = {
     analyzing: {
-      zh: "我正在梳理当前问题，先确认相关代码入口和可验证证据。",
-      en: "I’m framing the current issue and confirming the relevant code paths and verifiable evidence.",
+      zh: "我正在梳理当前问题，先确认相关背景与可验证证据。",
+      en: "I’m framing the current issue and confirming the relevant context and verifiable evidence.",
     },
     planning: {
       zh: "我正在把已确认的证据整理成可执行计划，并检查每一步的验证方式。",

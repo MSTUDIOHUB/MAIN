@@ -46,6 +46,7 @@ import {
   deriveRuntimeV2ExecutionContract,
   parseRuntimeV2ExecutionContractArguments,
 } from "./executionContract";
+import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -104,7 +105,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 {},
                 input.context.runWorkspace || "",
                 input.context.runSessionKey,
-                { toolCatalog: authorizationFor(input).toolCatalog },
+                {
+                  toolCatalog: authorizationFor(input).toolCatalog,
+                  skillCatalog: input.context.skillCatalog,
+                },
               ),
             }),
             12_000,
@@ -341,6 +345,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         let diffPreview;
         const toolExecutionOptions = {
           toolCatalog: authorizationFor(input).toolCatalog,
+          skillCatalog: input.context.skillCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
           ...(authorization.shellPermissionApproval
             ? { shellPermissionApproval: authorization.shellPermissionApproval }
@@ -497,6 +502,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 version: entry.version,
               }))
             : [],
+        });
+        logRuntimeV2SkillLoad({
+          toolName,
+          succeeded: semanticStatus === "succeeded",
+          rawOutput,
+          skillId: String(args.skill_id || ""),
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          logStoreEvent: input.logStoreEvent,
         });
         return completion;
       } catch (error) {

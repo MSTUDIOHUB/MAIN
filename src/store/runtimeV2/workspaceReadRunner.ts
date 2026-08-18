@@ -171,7 +171,8 @@ export async function runSubmitRuntimeV2WorkspaceRead(
   const workspace = String(input.context.runWorkspace || "").trim();
   const hasAttachedFiles =
     input.context.turnInputContextSignals.attachedFilePaths.length > 0;
-  if (!workspace && !hasAttachedFiles) {
+  const hasNetworkAccess = input.get()?.webSearchEnabled === true;
+  if (!workspace && !hasAttachedFiles && !hasNetworkAccess) {
     throw new Error("RUNTIME_V2_BOUNDED_READ_REQUIRES_SOURCE_SCOPE");
   }
   const initialState = input.get();

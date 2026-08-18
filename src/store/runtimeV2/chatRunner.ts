@@ -1,4 +1,14 @@
 import type { AgentMessage, ContentPart } from "../../lib/agentMessages";
+import {
+  buildLoadSkillToolDefinition,
+  isSkillVisibleToModel,
+  loadSkillContent,
+  renderExplicitSkillActivationContext,
+  renderSkillCatalogContext,
+  skillCatalogContextCharBudget,
+  type SkillCatalogSnapshot,
+} from "../../lib/agentSkills";
+import type { ToolDefinition } from "../../lib/toolSchemas";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
 import {
   boundRuntimeMessagesToContext,
@@ -15,6 +25,7 @@ import {
   type ProviderPort,
   type RuntimeV2RunIdentity,
   type RuntimeV2TurnIdentity,
+  type RuntimeV2EventDraft,
 } from "../../lib/runtime-v2";
 import {
   runRuntimeV2ChatLoop,
@@ -35,6 +46,7 @@ export interface RuntimeV2ChatProviderRequest {
   readonly config: unknown;
   readonly signal: AbortSignal;
   readonly runtimeContextBudget?: RuntimeContextBudget | null;
+  readonly tools?: readonly ToolDefinition[];
 }
 
 export type RuntimeV2ChatProviderRequester = (
@@ -117,6 +129,7 @@ export function buildRuntimeV2ChatMessages(input: {
   readonly objective: string;
   readonly workspace: string | undefined;
   readonly language: "zh" | "en";
+  readonly skillCatalog?: SkillCatalogSnapshot | null;
 }): AgentMessage[] {
   const candidates = input.history
     .filter((message) =>
@@ -136,16 +149,39 @@ export function buildRuntimeV2ChatMessages(input: {
   if (lastUserText !== objective) {
     candidates.push({ role: "user", content: objective });
   }
+  const explicitSkills = renderExplicitSkillActivationContext(
+    input.skillCatalog,
+  );
+  const skillCatalog = renderSkillCatalogContext(
+    input.skillCatalog,
+    skillCatalogContextCharBudget(undefined),
+  );
+  const canLoadSkills = !!buildLoadSkillToolDefinition(input.skillCatalog);
+
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const dayNamesEn = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayNamesZh = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+  const dayOfWeek = input.language === "en" ? dayNamesEn[now.getDay()] : dayNamesZh[now.getDay()];
+  const currentDate = `${dateStr} (${dayOfWeek})`;
 
   return [{
     role: "system",
     content: [
       "[MAIN RUNTIME V2 CHAT]",
+      `Current Date: ${currentDate}`,
       `Workspace label: ${normalizedText(input.workspace || "global", 2_000)}`,
       `Respond in: ${input.language === "en" ? "English" : "简体中文"}`,
-      "This is a conversation-only Turn. No tools, shell, browser, validation, child agents, file reads, or workspace mutations are available.",
+      canLoadSkills
+        ? "This is a conversation-only Turn. load_skill is the only available context tool. No shell, browser, validation, child agents, file reads, workspace mutations, or external effects are available."
+        : "This is a conversation-only Turn. No tools, shell, browser, validation, child agents, file reads, or workspace mutations are available.",
       "Answer from the supplied conversation context. Do not claim that you inspected, changed, ran, or verified external state.",
       "Return one complete user-facing Markdown reply. Do not emit private reasoning or tool-call envelopes.",
+      explicitSkills
+        ? "The user explicitly activated the following immutable Skill instructions. Follow them, but do not interpret them as permission to inspect or change external state."
+        : "",
+      explicitSkills,
+      skillCatalog,
     ].join("\n"),
   }, ...candidates];
 }
@@ -182,9 +218,9 @@ async function defaultProviderRequest(
       onError: () => undefined,
     },
     input.signal,
-    [],
+    [...(input.tools || [])],
     maxOutputTokens,
-    { toolChoice: "none" },
+    { toolChoice: input.tools?.length ? "auto" : "none" },
   );
   return {
     visibleText: result.content || streamedText,
@@ -224,6 +260,7 @@ export function createRuntimeV2ChatProviderPort(input: {
   readonly deadlineAt: number;
   readonly now: () => number;
   readonly logStoreEvent: RuntimeV2ChatRunnerInput["logStoreEvent"];
+  readonly skillTranscript?: AgentMessage[];
 }): ProviderPort {
   const frozenState = input.get();
   const frozenConfig = frozenState.config;
@@ -232,16 +269,24 @@ export function createRuntimeV2ChatProviderPort(input: {
     objective: input.objective,
     workspace: input.context.runWorkspace,
     language: input.context.phaseLanguage,
+    skillCatalog: input.context.skillCatalog,
   });
-  const requestMessages = input.context.runtimeContextBudget
-    ? boundRuntimeMessagesToContext(frozenMessages, {
-        contextLimit: input.context.runtimeContextBudget.contextLimit,
-        reservedOutputTokens:
-          input.context.runtimeContextBudget.outputBudget,
-      })
-    : frozenMessages;
+  const loadSkillDefinition = buildLoadSkillToolDefinition(
+    input.context.skillCatalog,
+  );
   return {
     async request({ command, signal }) {
+      const unboundedMessages = [
+        ...frozenMessages,
+        ...(input.skillTranscript || []),
+      ];
+      const requestMessages = input.context.runtimeContextBudget
+        ? boundRuntimeMessagesToContext(unboundedMessages, {
+            contextLimit: input.context.runtimeContextBudget.contextLimit,
+            reservedOutputTokens:
+              input.context.runtimeContextBudget.outputBudget,
+          })
+        : unboundedMessages;
       const deadline = createDeadlineSignal(signal, input.deadlineAt, input.now);
       try {
         input.logStoreEvent("runtime_v2_chat_provider_request_opened", {
@@ -251,13 +296,14 @@ export function createRuntimeV2ChatProviderPort(input: {
           unboundedHistoryMessages: frozenMessages.length - 1,
           contextLimit:
             input.context.runtimeContextBudget?.contextLimit ?? null,
-          offeredToolCount: 0,
+          offeredToolCount: loadSkillDefinition ? 1 : 0,
         });
         const result = await input.requestProvider({
           messages: requestMessages,
           config: frozenConfig,
           signal: deadline.signal,
           runtimeContextBudget: input.context.runtimeContextBudget,
+          tools: loadSkillDefinition ? [loadSkillDefinition] : [],
         });
         if (deadline.signal.aborted && !signal.aborted) {
           throw new Error("RUNTIME_V2_CHAT_DEADLINE_EXCEEDED");
@@ -286,6 +332,20 @@ export function createRuntimeV2ChatProviderPort(input: {
           returnedToolCalls: normalized.toolCalls.length,
           diagnosticCount: normalized.diagnostics.length,
         });
+        if (normalized.toolCalls.length > 0 && input.skillTranscript) {
+          input.skillTranscript.push({
+            role: "assistant",
+            content: normalized.visibleText || "",
+            tool_calls: normalized.toolCalls.map((call) => ({
+              id: call.id,
+              type: "function" as const,
+              function: {
+                name: call.name,
+                arguments: JSON.stringify(call.arguments),
+              },
+            })),
+          });
+        }
         return normalized;
       } finally {
         deadline.dispose();
@@ -389,6 +449,7 @@ export async function runSubmitRuntimeV2Chat(
   const admittedAt = existing?.aggregate.events.find((event) =>
     event.type === "run.started"
   )?.at ?? now();
+  const skillTranscript: AgentMessage[] = [];
   const provider = createRuntimeV2ChatProviderPort({
     get: input.get,
     context: input.context,
@@ -397,9 +458,63 @@ export async function runSubmitRuntimeV2Chat(
     deadlineAt: admittedAt + deadlineMs,
     now,
     logStoreEvent: input.logStoreEvent,
+    skillTranscript,
   });
   const deniedEffect = async () => {
     throw new Error("RUNTIME_V2_CHAT_EFFECT_SURFACE_DENIED");
+  };
+  let skillEvidenceOrdinal = 0;
+  const skillTool = {
+    async execute({ command }: { readonly command: any }): Promise<RuntimeV2EventDraft> {
+      const toolName = String(command.payload.toolName || "");
+      const args = command.payload.arguments &&
+          typeof command.payload.arguments === "object" &&
+          !Array.isArray(command.payload.arguments)
+        ? command.payload.arguments as Record<string, unknown>
+        : {};
+      const skillId = String(args.skill_id || "").trim();
+      if (command.kind !== "execute_tool" || toolName !== "load_skill") {
+        throw new Error("RUNTIME_V2_CHAT_EFFECT_SURFACE_DENIED");
+      }
+      if (!isSkillVisibleToModel(input.context.skillCatalog, skillId)) {
+        throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
+      }
+      const loaded = loadSkillContent(input.context.skillCatalog, skillId);
+      const content = JSON.stringify({
+        type: "skill.loaded",
+        ...loaded,
+        effect: "instructions_loaded_no_additional_permissions",
+      });
+      skillTranscript.push({
+        role: "tool",
+        tool_call_id: String(command.payload.toolCallId || ""),
+        content,
+      });
+      input.logStoreEvent("runtime_v2_skill_loaded", {
+        turnId: command.run.turnId,
+        runId: command.run.runId,
+        skillId,
+        revision: loaded.version,
+        effect: "instructions_only_chat",
+      });
+      return {
+        type: "tool.completed",
+        run: command.run,
+        idempotencyKey: command.idempotencyKey,
+        status: "succeeded",
+        evidence: [{
+          id: `skill:${++skillEvidenceOrdinal}`,
+          kind: "tool",
+          target: skillId,
+          version: loaded.version,
+        }],
+        presentation: {
+          toolName: "load_skill",
+          target: skillId,
+          message: `Skill ${loaded.name} loaded at revision ${loaded.version}.`,
+        },
+      };
+    },
   };
   let ordinal = 0;
   const nextId = (scope: string) => `${scope}:${now().toString(36)}:${++ordinal}`;
@@ -408,7 +523,9 @@ export async function runSubmitRuntimeV2Chat(
     turnId: identity.turn.turnId,
     runId: identity.run.runId,
     strategy: "chat",
-    offeredToolCount: 0,
+    offeredToolCount: buildLoadSkillToolDefinition(
+      input.context.skillCatalog,
+    ) ? 1 : 0,
   });
 
   try {
@@ -416,7 +533,7 @@ export async function runSubmitRuntimeV2Chat(
       ports: {
         checkpoint,
         provider,
-        tool: { execute: deniedEffect },
+        tool: skillTool,
         scheduler: { execute: deniedEffect },
         projection: createRuntimeV2ProjectionPort({
           get: input.get,
@@ -441,6 +558,9 @@ export async function runSubmitRuntimeV2Chat(
         : {}),
       now,
       deadlineMs,
+      allowSkillLoad: !!buildLoadSkillToolDefinition(
+        input.context.skillCatalog,
+      ),
     });
     input.logStoreEvent("runtime_v2_chat_terminal", {
       turnId: identity.turn.turnId,

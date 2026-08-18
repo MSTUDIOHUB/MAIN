@@ -30,6 +30,8 @@ export interface TurnAggregateV1 {
   readonly schemaVersion: "turn-aggregate.v1";
   readonly turn: RuntimeV2TurnIdentity;
   readonly strategy: RuntimeV2Strategy;
+  /** Immutable user admission fact; absent legacy checkpoints mean optional. */
+  readonly subagentRequirement?: "optional" | "required";
   readonly objective: RuntimeV2Objective;
   readonly run: RuntimeV2RunState | null;
   readonly phase: RuntimeV2Phase;

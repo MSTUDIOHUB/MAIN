@@ -81,9 +81,12 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
     "executionAggregate.ts",
     "executionAuthorization.ts",
     "executionAuthorizationContext.ts",
+    "executionPlanAuthorization.ts",
     "executionEvidence.ts",
     "executionProviderContext.ts",
+    "executionProviderEmptySurface.ts",
     "executionProviderPort.ts",
+    "executionSchedulerAdmission.ts",
     "executionSchedulerPort.ts",
     "executionSubagentScopes.ts",
     "executionText.ts",
@@ -190,6 +193,11 @@ test("ordinary Runtime v2 Execute has no whole-Turn wall-clock deadline", () => 
     "ordinary Execute must remain open while real work is still progressing",
   );
   assert.match(runnerSource, /runtimeV2ProviderRecoveryStallExpired/);
+  assert.doesNotMatch(
+    runnerSource,
+    /runtimeV2ProviderRecoveryOccurrenceLimitReached|provider_recovery_occurrence_limit_reached/,
+    "a soft no-action count must not conclude an otherwise achievable Execute Run",
+  );
   assert.match(providerSource, /return Number\.isFinite\(lifecycleDeadlineAt\)/);
   assert.doesNotMatch(providerSource, /PROVIDER_REQUEST_TIMEOUT_MS\s*=/);
 });
@@ -199,8 +207,11 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   const planFiles = [
     "planRunner.ts",
     "planBootstrap.ts",
+    "planCollaborationAcquisition.ts",
     "planModelProtocol.ts",
+    "planProviderAdmission.ts",
     "planProviderPort.ts",
+    "planSubmissionRepair.ts",
     "planSettlement.ts",
     "workPlanSubmission.ts",
   ];

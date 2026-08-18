@@ -453,7 +453,7 @@ interface StreamCallbacks {
   onDone: (result: StreamResult) => void;
   onError: (err: Error) => void;
   onLifecycle?: (event: {
-    phase: "stream_started" | "first_chunk" | "chunk_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled";
+    phase: "stream_started" | "first_chunk" | "chunk_progress" | "model_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled";
     streamId?: string;
     elapsedMs?: number;
     chunkCount?: number;
@@ -1962,12 +1962,15 @@ async function streamViaRustProxy(
   const stopNoVisibleProgressStall = () => {
     if (resolved || anthropicProcessor) return false;
     const elapsedMs = Date.now() - streamStartedAt;
-    if (!shouldStopNoVisibleStreamStall({
+    if (
+      options.contextOwnership === "caller" ||
+      !shouldStopNoVisibleStreamStall({
       elapsedMs,
       visibleChars: semanticProgress.semanticVisibleChars,
       toolCallCount: toolCallsMap.size,
       reasoningChars: providerReasoningContent.length,
-    })) {
+      })
+    ) {
       return false;
     }
 
@@ -2053,7 +2056,6 @@ async function streamViaRustProxy(
         const json = JSON.parse(jsonText);
         providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
         const extracted = extractOpenAiCompatibleDelta(json);
-
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
           // from a llama.cpp server that can't decode the thinking tokens.
@@ -2099,6 +2101,8 @@ async function streamViaRustProxy(
           const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
           emittedOpenAiCompatibleText = resolvedText.emittedText;
           const textDelta = resolvedText.delta;
+          const hasModelProgress =
+            !!reasoningDelta || !!textDelta || extracted.toolCalls.length > 0;
           if (textDelta) {
             // Close reasoning block if we were in one
             closeReasoningBlock();
@@ -2127,6 +2131,16 @@ async function streamViaRustProxy(
               }
               if (firstToolAt === null) firstToolAt = Date.now();
             }
+          }
+          if (hasModelProgress) {
+            callbacks.onLifecycle?.({
+              phase: "model_progress",
+              streamId,
+              elapsedMs: Date.now() - streamStartedAt,
+              chunkCount: rustProxyChunkCount,
+              byteCount: rustProxyByteCount,
+              status: "streaming",
+            });
           }
           if (stopActionlessRunaway()) return;
           if (stopReasoningOnlyRunaway()) return;
@@ -2740,7 +2754,6 @@ export async function streamChatCompletion(
           const json = JSON.parse(jsonText);
           providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
           const extracted = extractOpenAiCompatibleDelta(json);
-
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output
             const resolvedReasoning = resolveOpenAiCompatibleReasoningDelta(extracted, emittedOpenAiCompatibleReasoning);
@@ -2777,6 +2790,8 @@ export async function streamChatCompletion(
             const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
             emittedOpenAiCompatibleText = resolvedText.emittedText;
             const textDelta = resolvedText.delta;
+            const hasModelProgress =
+              !!reasoningDelta || !!textDelta || extracted.toolCalls.length > 0;
             if (textDelta) {
               // Close reasoning block if we were in one
               closeReasoningBlock();
@@ -2813,6 +2828,15 @@ export async function streamChatCompletion(
                 }
                 if (firstToolAt === null) firstToolAt = Date.now();
               }
+            }
+            if (hasModelProgress) {
+              callbacks.onLifecycle?.({
+                phase: "model_progress",
+                elapsedMs: Date.now() - streamStartedAt,
+                chunkCount: frontendChunkCount,
+                byteCount: frontendByteCount,
+                status: "streaming",
+              });
             }
             if (shouldStopReasoningOnlyStream({
               reasoningChars: providerReasoningContent.length,
@@ -2863,12 +2887,15 @@ export async function streamChatCompletion(
               return result;
             }
             const elapsedMs = Date.now() - streamStartedAt;
-            if (shouldStopNoVisibleStreamStall({
+            if (
+              options.contextOwnership !== "caller" &&
+              shouldStopNoVisibleStreamStall({
               elapsedMs,
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               reasoningChars: providerReasoningContent.length,
-            })) {
+              })
+            ) {
               await reader.cancel().catch(() => {});
               throw Object.assign(new Error(
                 `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without semantic-visible output or tool calls.`,

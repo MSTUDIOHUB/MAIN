@@ -32,6 +32,13 @@ export async function settlePlanTool(input: {
   readonly call: RuntimeV2NormalizedProviderResult["toolCalls"][number];
   readonly status: "succeeded" | "failed" | "blocked";
   readonly evidence?: readonly RuntimeV2EvidenceReference[];
+  readonly failureKind?: "protocol_invalid";
+  readonly failureReasonCode?: string;
+  readonly presentation?: {
+    readonly toolName: string;
+    readonly target: string;
+    readonly message?: string;
+  };
 }): Promise<void> {
   const command = await input.ledger.schedule(input.run, "execute_tool", {
     toolCallId: input.call.id,
@@ -47,6 +54,11 @@ export async function settlePlanTool(input: {
     idempotencyKey: command.idempotencyKey,
     status: input.status,
     evidence: input.evidence || [],
+    ...(input.failureKind ? { failureKind: input.failureKind } : {}),
+    ...(input.failureReasonCode
+      ? { failureReasonCode: input.failureReasonCode }
+      : {}),
+    ...(input.presentation ? { presentation: input.presentation } : {}),
   });
 }
 
@@ -91,6 +103,7 @@ export async function executeReadOnlyPlanTool(input: {
       ),
       input.context.runWorkspace || "",
       input.context.runSessionKey,
+      { skillCatalog: input.context.skillCatalog },
     );
     const target = getToolTarget(input.call.name, args) || input.call.name;
     const content = boundedRuntimeV2ToolContent(
@@ -98,17 +111,25 @@ export async function executeReadOnlyPlanTool(input: {
       output,
       input.context.runtimeContextBudget,
     );
-    const version = await resolveRuntimeV2SourceEvidenceVersion({
-      toolName: input.call.name,
-      args,
-      output,
-      readExactFile: () => executeTool(
-        "read_file",
-        { ...args, __raw: true },
-        input.context.runWorkspace || "",
-        input.context.runSessionKey,
-      ),
-    });
+    const version = input.call.name === "load_skill"
+      ? (() => {
+          try {
+            return String(JSON.parse(String(output || "")).version || "");
+          } catch {
+            return "";
+          }
+        })()
+      : await resolveRuntimeV2SourceEvidenceVersion({
+          toolName: input.call.name,
+          args,
+          output,
+          readExactFile: () => executeTool(
+            "read_file",
+            { ...args, __raw: true },
+            input.context.runWorkspace || "",
+            input.context.runSessionKey,
+          ),
+        });
     const existingEvidence = input.evidence.find((entry) =>
       workspacePathsReferToSameFile(entry.target, target) &&
       entry.version === version
@@ -117,7 +138,9 @@ export async function executeReadOnlyPlanTool(input: {
       id: `E${input.evidence.length + 1}`,
       target,
       version,
-      statement: `${input.call.name} 已确认 ${target} 的当前内容。`,
+      statement: input.call.name === "load_skill"
+        ? `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`
+        : `${input.call.name} 已确认 ${target} 的当前内容。`,
     };
     const previousContent = existingEvidence
       ? input.evidenceContents.get(existingEvidence.id) || ""
@@ -149,7 +172,7 @@ export async function executeReadOnlyPlanTool(input: {
       status: "succeeded",
       evidence: [{
         id: evidenceEntry.id,
-        kind: "source",
+        kind: input.call.name === "load_skill" ? "tool" : "source",
         target,
         version,
       }],

@@ -35,7 +35,7 @@ export function boundedRuntimeV2ToolContent(
   value: unknown,
   _budget?: RuntimeContextBudget | null,
 ): string {
-  return toolName === "read_file"
+  return toolName === "read_file" || toolName === "load_skill"
     ? runtimeV2SourceToolContent(value)
     : boundedToolContent(value);
 }

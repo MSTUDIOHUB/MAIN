@@ -238,6 +238,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
    */
   refreshWorkspaceContext?: (
     workspace: string,
+    userPrompt?: string,
   ) => Promise<ResolvedInstructionSet | null>;
   nowMs: () => number;
   sendStartedAt: number;
@@ -1802,11 +1803,15 @@ export async function runSubmitAsyncWorkflowRun<
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
         input.runWorkspace,
+        input.text,
       );
       input.logStoreEvent("workspace_instructions_refreshed", {
         turnId: input.turnId,
         workspace: input.runWorkspace || "global",
         sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
+        skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
+        explicitSkillIds:
+          resolvedInstructionSnapshot?.skillCatalog?.explicitSkillIds || [],
         elapsedMs: Math.round(
           input.nowMs() - instructionRefreshStartedAt,
         ),
@@ -2029,6 +2034,7 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
+    skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
     gameStudioConfigForTurn: gameStudioPreparation.gameStudioConfigForTurn,
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,

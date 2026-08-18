@@ -65,6 +65,8 @@ const realOmlxRequest =
   (
     realOmlxFixture === "md-viewer"
       ? "问题：1、在编辑界面显示了文件名和未保存的文档名字，这是不合理的。2、打开本地 md 文件后随后会弹出窗口，看起来是文件保存执行路径有关的问题。找到这些问题的根本原因并修复。"
+      : realOmlxFixture === "snake"
+        ? "请先生成可审批计划，再严格按依赖阶段实现一个 Python 贪吃蛇游戏：S1 使用 Python 标准库 tkinter 完成 snake.py 的 GUI 与可测试核心逻辑，禁止 pygame 等第三方运行时依赖；S2 在 S1 之后创建 test_snake.py；S3 在 S1、S2 之后更新 README.md。游戏须支持方向键和 WASD、计分、食物增长、撞墙/自身结束、R 键与按钮重启。结构化计划必须显式填写 S1 dependsOn=[]、S2 dependsOn=[0]、S3 dependsOn=[0,1]；分别列出精确且独立的 python3 -m compileall -q . 与 python3 -m unittest -v 两项 required validation，两项的 stepIndexes 都填写 [0,1,2]（测试也检查 README 启动说明）。每个 change 和 required validation 都须用 criterionIds 映射 Runtime 给出的 criterion-user-objective。请把一个边界明确的约束/逻辑/测试设计调查交给只读子 Agent，父线程并行取证，汇合并在可执行 change 的结构化 basis 中采用其证据后再提交计划；批准后按阶段修改，最后依次运行两项验证直到通过。"
       : "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改，并运行 npm test 验证直到通过。"
   );
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
@@ -72,13 +74,25 @@ const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
 const realOmlxImagePath = String(process.env.REAL_OMLX_IMAGE_PATH || "").trim();
 const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
 const runExecuteIncidentReplay = process.env.REAL_OMLX_EXECUTE_INCIDENT === "1";
+const runSnakeExecuteReplay = process.env.REAL_OMLX_SNAKE_EXECUTE === "1";
+const realOmlxMainMode = process.env.REAL_OMLX_MAIN_MODE === "game_studio"
+  ? "game_studio"
+  : "main_mode";
 const realOmlxMutationFile = String(
   process.env.REAL_OMLX_MUTATION_FILE ||
-  (realOmlxFixture === "md-viewer" ? "src/main.js" : "src/hooks/useCsvParser.ts"),
+  (realOmlxFixture === "md-viewer"
+    ? "src/main.js"
+    : realOmlxFixture === "snake"
+      ? "snake.py"
+      : "src/hooks/useCsvParser.ts"),
 ).replace(/^[/\\]+/, "");
 const realOmlxMutationExpectation = new RegExp(
   process.env.REAL_OMLX_MUTATION_EXPECT ||
-  (realOmlxFixture === "md-viewer" ? "btn-new" : "creatorName\\s*:"),
+  (realOmlxFixture === "md-viewer"
+    ? "btn-new"
+    : realOmlxFixture === "snake"
+      ? "class\\s+Snake|tkinter"
+      : "creatorName\\s*:"),
   "i",
 );
 const realOmlxDevServerUrl = String(
@@ -89,6 +103,8 @@ const realOmlxPlanExpectation = new RegExp(
   process.env.REAL_OMLX_PLAN_EXPECT || (
     realOmlxFixture === "md-viewer"
       ? "src/main\\.js|未保存|保存|打开"
+      : realOmlxFixture === "snake"
+        ? "snake\\.py|test_snake\\.py|tkinter|贪吃蛇"
       : "useCsvParser\\.ts|CSV|creator"
   ),
   "i",
@@ -104,12 +120,15 @@ const realOmlxPlanEvidenceTargets = String(
       ? "src/hooks/useCsvParser.ts"
       : realOmlxFixture === "md-viewer"
         ? "src/main.js"
+        : realOmlxFixture === "snake"
+          ? "snake.py;;README.md"
         : ""
   ),
 ).split(";;").map((target) => target.trim()).filter(Boolean);
 const requireSemanticTaskQuality =
   process.env.REAL_OMLX_REQUIRE_TASK_QUALITY === "1" ||
-  (runExecuteIncidentReplay && realOmlxFixture === "md-viewer");
+  (runExecuteIncidentReplay && realOmlxFixture === "md-viewer") ||
+  realOmlxFixture === "snake";
 if (
   runRealOmlx &&
   realOmlxFixture === "md-viewer" &&
@@ -175,6 +194,256 @@ type FixtureMutationState = {
   contents: Record<string, string>;
   detail: string;
 };
+
+type SnakeAcceptanceReport = {
+  gaps: string[];
+  files: string[];
+  compile: Awaited<ReturnType<typeof runRealOmlxWorkspaceCommand>>;
+  tests: Awaited<ReturnType<typeof runRealOmlxWorkspaceCommand>>;
+  importCheck: Awaited<ReturnType<typeof runRealOmlxWorkspaceCommand>>;
+  testCount: number;
+};
+
+async function inspectSnakeAcceptance(
+  workspace: string,
+): Promise<SnakeAcceptanceReport> {
+  const files = (await collectBoundedRealOmlxWorkspaceFiles(workspace, {
+    maxFiles: 400,
+  })).files;
+  const snakePath = path.join(workspace, "snake.py");
+  const testsPath = path.join(workspace, "test_snake.py");
+  const readmePath = path.join(workspace, "README.md");
+  const readOptional = async (absolutePath: string) => {
+    try {
+      return await fs.readFile(absolutePath, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const [snakeSource, testsSource, readmeSource] = await Promise.all([
+    readOptional(snakePath),
+    readOptional(testsPath),
+    readOptional(readmePath),
+  ]);
+  const [compile, tests, importCheck] = await Promise.all([
+    runRealOmlxWorkspaceCommand(workspace, "python3 -m compileall -q ."),
+    runRealOmlxWorkspaceCommand(workspace, "python3 -m unittest -v"),
+    runRealOmlxWorkspaceCommand(
+      workspace,
+      "python3 -c \"import snake; print('SNAKE_IMPORT_OK')\"",
+    ),
+  ]);
+  const testOutput = `${tests.stdout}\n${tests.stderr}`;
+  const testCount = Number(testOutput.match(/Ran\s+(\d+)\s+tests?/i)?.[1] || 0);
+  const gaps: string[] = [];
+  if (!snakeSource.trim()) gaps.push("snake.py is missing or empty");
+  if (!testsSource.trim()) gaps.push("test_snake.py is missing or empty");
+  if (!readmeSource.trim()) gaps.push("README.md is missing or empty");
+  if (compile.exitCode !== 0) gaps.push("python compileall failed");
+  if (tests.exitCode !== 0) gaps.push("python unittest failed");
+  if (importCheck.exitCode !== 0 || !importCheck.stdout.includes("SNAKE_IMPORT_OK")) {
+    gaps.push("snake.py cannot be imported without starting or crashing the GUI");
+  }
+  if (testCount < 4) gaps.push(`expected at least 4 logic tests, observed ${testCount}`);
+  if (!/\b(?:tkinter|turtle)\b/i.test(snakeSource)) {
+    gaps.push("no standard-library GUI implementation was found");
+  }
+  for (const control of ["Up", "Down", "Left", "Right"]) {
+    if (!new RegExp(`<${control}>|[\"']${control.toLowerCase()}[\"']`, "i").test(snakeSource)) {
+      gaps.push(`missing ${control} control binding`);
+    }
+  }
+  for (const control of ["w", "a", "s", "d"]) {
+    if (!new RegExp(`[\"']${control}[\"']`, "i").test(snakeSource)) {
+      gaps.push(`missing ${control.toUpperCase()} control binding`);
+    }
+  }
+  if (!/\bscore\b/i.test(snakeSource)) gaps.push("score handling is not visible in snake.py");
+  if (!/\b(?:restart|reset|new_game)\b/i.test(snakeSource)) {
+    gaps.push("restart/reset behavior is not visible in snake.py");
+  }
+  if (!/\b(?:game_over|collision|hit_wall|hit_self)\b/i.test(snakeSource)) {
+    gaps.push("wall/self collision behavior is not visible in snake.py");
+  }
+  if (!/\b(?:food|apple)\b/i.test(snakeSource)) {
+    gaps.push("food placement/growth behavior is not visible in snake.py");
+  }
+  if (!/python3\s+snake\.py/i.test(readmeSource)) {
+    gaps.push("README.md does not document how to start the game");
+  }
+  return { gaps, files, compile, tests, importCheck, testCount };
+}
+
+function getSnakeWorkPlanGaps(sealedWorkPlan: any): string[] {
+  const draft = sealedWorkPlan?.draft || {};
+  const steps = Array.isArray(draft.steps) ? draft.steps : [];
+  const validations = Array.isArray(draft.validations)
+    ? draft.validations
+    : [];
+  const targetsFor = (step: any) =>
+    (Array.isArray(step?.targets) ? step.targets : [])
+      .map((target: unknown) => String(target || "").replace(/^\.\//, ""));
+  const indexesForTarget = (target: string) => steps
+    .map((step: any, index: number) =>
+      targetsFor(step).includes(target) ? index : -1
+    )
+    .filter((index: number) => index >= 0);
+  const snakeSteps = indexesForTarget("snake.py");
+  const testSteps = indexesForTarget("test_snake.py");
+  const readmeSteps = indexesForTarget("README.md");
+  const rendered = JSON.stringify(draft);
+  const finiteCommands = validations
+    .filter((validation: any) =>
+      validation?.required === true &&
+      validation?.kind === "finite_command"
+    )
+    .map((validation: any) => String(validation.command || ""));
+  const normalizeCommand = (command: unknown) =>
+    String(command || "").replace(/\s+/g, " ").trim();
+  const compileValidations = validations.filter((validation: any) =>
+    validation?.required === true &&
+    validation?.kind === "finite_command" &&
+    normalizeCommand(validation.command) === "python3 -m compileall -q ."
+  );
+  const unittestValidations = validations.filter((validation: any) =>
+    validation?.required === true &&
+    validation?.kind === "finite_command" &&
+    normalizeCommand(validation.command) === "python3 -m unittest -v"
+  );
+  const gaps: string[] = [];
+  if (steps.length < 3) {
+    gaps.push(`expected at least three implementation stages, observed ${steps.length}`);
+  }
+  if (snakeSteps.length === 0) gaps.push("no snake.py implementation stage");
+  if (testSteps.length === 0) gaps.push("no test_snake.py test stage");
+  if (readmeSteps.length === 0) gaps.push("no README.md documentation stage");
+  if (
+    snakeSteps.length !== 1 ||
+    testSteps.length !== 1 ||
+    readmeSteps.length !== 1 ||
+    !(snakeSteps[0] < testSteps[0] && testSteps[0] < readmeSteps[0])
+  ) {
+    gaps.push("Snake stages must be unique and ordered S1 snake, S2 tests, S3 README");
+  }
+  if (
+    snakeSteps.length === 1 &&
+    JSON.stringify(steps[snakeSteps[0]]?.dependsOn || []) !== "[]"
+  ) {
+    gaps.push("the snake implementation stage must have dependsOn=[]");
+  }
+  if (
+    snakeSteps.length > 0 &&
+    testSteps.length > 0 &&
+    !testSteps.some((testIndex: number) =>
+      (Array.isArray(steps[testIndex]?.dependsOn)
+        ? steps[testIndex].dependsOn
+        : []).some((dependency: number) => snakeSteps.includes(dependency))
+    )
+  ) {
+    gaps.push("the test stage does not depend on a snake.py implementation stage");
+  }
+  if (
+    readmeSteps.length > 0 &&
+    !readmeSteps.some((readmeIndex: number) => {
+      const dependencies = Array.isArray(steps[readmeIndex]?.dependsOn)
+        ? steps[readmeIndex].dependsOn
+        : [];
+      return snakeSteps.some((index: number) => dependencies.includes(index)) &&
+        testSteps.some((index: number) => dependencies.includes(index));
+    })
+  ) {
+    gaps.push("the README stage does not depend on both implementation and tests");
+  }
+  if (
+    testSteps.length === 1 && snakeSteps.length === 1 &&
+    JSON.stringify(steps[testSteps[0]]?.dependsOn || []) !==
+      JSON.stringify([snakeSteps[0]])
+  ) {
+    gaps.push("the test stage must depend exactly on the snake stage");
+  }
+  if (
+    readmeSteps.length === 1 &&
+    snakeSteps.length === 1 &&
+    testSteps.length === 1 &&
+    JSON.stringify(steps[readmeSteps[0]]?.dependsOn || []) !==
+      JSON.stringify([snakeSteps[0], testSteps[0]])
+  ) {
+    gaps.push("the README stage must depend exactly on snake and tests");
+  }
+  for (const pattern of [
+    /tkinter/i,
+    /(?:方向键|arrow)/i,
+    /WASD/i,
+    /(?:食物|food)/i,
+    /(?:分数|score)/i,
+    /(?:撞墙|wall)/i,
+    /(?:自身|self)/i,
+    /(?:重启|重新开始|restart|reset)/i,
+    /(?:核心逻辑|logic).*(?:GUI|界面)|(?:GUI|界面).*(?:核心逻辑|logic)/i,
+  ]) {
+    if (!pattern.test(rendered)) {
+      gaps.push(`plan does not cover ${pattern.source}`);
+    }
+  }
+  if (!finiteCommands.some((command: string) =>
+    /python3\s+-m\s+(?:compileall|py_compile)/i.test(command)
+  )) {
+    gaps.push("no required Python compile validation");
+  }
+  if (!finiteCommands.some((command: string) =>
+    /python3\s+-m\s+unittest/i.test(command)
+  )) {
+    gaps.push("no required unittest validation");
+  }
+  if (compileValidations.length !== 1) {
+    gaps.push("compile validation must be one independent exact command");
+  }
+  if (unittestValidations.length !== 1) {
+    gaps.push("unittest validation must be one independent exact command");
+  }
+  const validationCovers = (pattern: RegExp, indexes: number[]) =>
+    validations.some((validation: any) =>
+      validation?.required === true &&
+      validation?.kind === "finite_command" &&
+      pattern.test(String(validation.command || "")) &&
+      indexes.every((index) =>
+        Array.isArray(validation.stepIndexes) &&
+        validation.stepIndexes.includes(index)
+      )
+    );
+  if (!validationCovers(
+    /python3\s+-m\s+(?:compileall|py_compile)/i,
+    [...snakeSteps, ...testSteps, ...readmeSteps],
+  )) {
+    gaps.push("compile validation does not cover every Snake stage");
+  }
+  if (!validationCovers(
+    /python3\s+-m\s+unittest/i,
+    [...snakeSteps, ...testSteps],
+  )) {
+    gaps.push("unittest validation does not cover implementation and tests");
+  }
+  const expectedStepIndexes = [...snakeSteps, ...testSteps, ...readmeSteps];
+  for (const validation of [...compileValidations, ...unittestValidations]) {
+    if (
+      JSON.stringify(validation.stepIndexes || []) !==
+      JSON.stringify(expectedStepIndexes)
+    ) {
+      gaps.push(`${normalizeCommand(validation.command)} does not cover all three stages exactly`);
+    }
+    if (!Array.isArray(validation.criterionIds) ||
+      !validation.criterionIds.includes("criterion-user-objective")) {
+      gaps.push(`${normalizeCommand(validation.command)} does not map the admitted criterion`);
+    }
+  }
+  for (const index of expectedStepIndexes) {
+    if (!Array.isArray(steps[index]?.criterionIds) ||
+      !steps[index].criterionIds.includes("criterion-user-objective")) {
+      gaps.push(`stage ${index + 1} does not map the admitted criterion`);
+    }
+  }
+  return gaps;
+}
 
 function runtimeV2FailureDiagnostic(runtimeV2: any) {
   const diagnosticDebug = (runtimeV2?.debug || []).filter((entry: any) =>
@@ -633,17 +902,24 @@ function expectSuccessfulPlanExecutionOrder(runtime: any): void {
   const approvalIndex = events.findIndex(
     (event: { type?: string }) => event.type === "work_plan.approved",
   );
-  const mutationIndex = events.findIndex(
+  const mutationIndexes = events.flatMap(
     (event: {
       type?: string;
       status?: string;
       evidence?: Array<{ kind?: string }>;
-    }, index: number) =>
+    }, index: number) => (
       index > approvalIndex &&
-      event.type === "tool.completed" &&
-      event.status === "succeeded" &&
-      (event.evidence || []).some((entry) => entry.kind === "mutation"),
+        (
+          (event.type === "tool.completed" && event.status === "succeeded") ||
+          (event.type === "subagent.completed" && event.status === "completed")
+        ) &&
+        (event.evidence || []).some((entry) => entry.kind === "mutation")
+        ? [index]
+        : []
+    ),
   );
+  const mutationIndex = mutationIndexes[0] ?? -1;
+  const lastMutationIndex = mutationIndexes.at(-1) ?? -1;
   const validationIndex = events.findIndex(
     (event: {
       type?: string;
@@ -652,7 +928,7 @@ function expectSuccessfulPlanExecutionOrder(runtime: any): void {
       passed?: boolean;
       validationReceipts?: Array<{ passed?: boolean }>;
     }, index: number) =>
-      index > mutationIndex &&
+      index > lastMutationIndex &&
       (
         (
           event.type === "validation.completed" &&
@@ -685,6 +961,72 @@ function expectSuccessfulPlanExecutionOrder(runtime: any): void {
     .toBeGreaterThan(mutationIndex);
   expect(runCompletedIndex).toBeGreaterThan(validationIndex);
   expect(turnCompletedIndex).toBeGreaterThan(runCompletedIndex);
+
+  const planSteps = Array.isArray(runtime?.sealedWorkPlan?.draft?.steps)
+    ? runtime.sealedWorkPlan.draft.steps
+    : [];
+  const normalizeTarget = (value: unknown) =>
+    String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").trim().toLowerCase();
+  const approvalSequence = Number(events[approvalIndex]?.sequence ?? -1);
+  const receipts = events.flatMap((event: any) => {
+    const successfulMutation =
+      (event.type === "tool.completed" && event.status === "succeeded") ||
+      (event.type === "subagent.completed" && event.status === "completed");
+    if (!successfulMutation) return [];
+    const targets = (event.evidence || [])
+      .filter((entry: any) => entry.kind === "mutation")
+      .map((entry: any) => normalizeTarget(entry.target))
+      .filter(Boolean);
+    return targets.length > 0
+      ? [{ sequence: Number(event.sequence), targets }]
+      : [];
+  });
+  const consumed = new Set<string>();
+  const completionSequences: number[] = [];
+  for (const [stepIndex, step] of planSteps.entries()) {
+    const dependencySequences = (Array.isArray(step?.dependsOn)
+      ? step.dependsOn
+      : []).map((dependency: number) => completionSequences[dependency]);
+    expect(
+      dependencySequences.every(Number.isFinite),
+      `WorkPlan S${stepIndex + 1} must not execute before all declared dependencies complete.`,
+    ).toBe(true);
+    const boundary = Math.max(approvalSequence, ...dependencySequences);
+    if (step?.operation === "preserve") {
+      completionSequences[stepIndex] = boundary;
+      continue;
+    }
+    const targetSequences = (Array.isArray(step?.targets)
+      ? step.targets
+      : []).map((rawTarget: unknown) => {
+        const target = normalizeTarget(rawTarget);
+        for (const receipt of receipts) {
+          if (receipt.sequence <= boundary) continue;
+          const receiptTargetIndex = receipt.targets.findIndex(
+            (candidate: string, index: number) =>
+              candidate === target &&
+              !consumed.has(`${receipt.sequence}:${index}`),
+          );
+          if (receiptTargetIndex < 0) continue;
+          consumed.add(`${receipt.sequence}:${receiptTargetIndex}`);
+          return receipt.sequence;
+        }
+        return Number.NaN;
+      });
+    expect(
+      targetSequences.every(Number.isFinite),
+      `Successful WorkPlan execution must commit S${stepIndex + 1} only after its dependency boundary.`,
+    ).toBe(true);
+    completionSequences[stepIndex] = Math.max(...targetSequences);
+    for (const dependency of Array.isArray(step?.dependsOn)
+      ? step.dependsOn
+      : []) {
+      expect(completionSequences[dependency])
+        .toBeLessThan(completionSequences[stepIndex]);
+    }
+  }
+  expect(Number(events[validationIndex]?.sequence))
+    .toBeGreaterThan(Math.max(...completionSequences));
 }
 
 function expectRuntimeV2PlanReviewContract(
@@ -2634,7 +2976,9 @@ for (const model of models) {
     const plan = String(sealedWorkPlan.markdown || "");
     const planTaskQualityGaps = isMdViewerSavePathIncident
       ? getMdViewerWorkPlanGaps(sealedWorkPlan)
-      : [
+      : realOmlxFixture === "snake"
+        ? getSnakeWorkPlanGaps(sealedWorkPlan)
+        : [
           ...(realOmlxPlanExpectation.test(plan)
             ? []
             : [`plan does not match ${realOmlxPlanExpectation.source}`]),
@@ -2697,6 +3041,39 @@ for (const model of models) {
         "Optional task-quality oracle requires exact configured evidence targets.",
       ).toEqual([]);
     }
+    if (realOmlxFixture === "snake") {
+      console.log(`[real-omlx-plan-collaboration:${model}] ${JSON.stringify({
+        subagents: (planRuntime?.subagents || []).map((job: any) => ({
+          id: job.id,
+          status: job.status,
+          reportSubmitted: job.reportSubmitted,
+          requestOpenedAt: job.requestOpenedAt,
+          firstTokenAt: job.firstTokenAt,
+          closedAt: job.closedAt,
+        })),
+        childEvents: (planRuntime?.events || []).filter((event: any) =>
+          String(event?.type || "").startsWith("subagent")
+        ).map((event: any) => ({
+          type: event.type,
+          sequence: event.sequence,
+          jobId: event.jobId,
+          status: event.status,
+          reportSubmitted: !!event.report,
+          evidenceCount: Array.isArray(event.evidence)
+            ? event.evidence.length
+            : undefined,
+        })),
+      })}`);
+      expectRuntimeV2ReadOnlyCollaboration(
+        planRuntime,
+        {
+          requireObservedChild: true,
+          requireAdoptedChildEvidence: true,
+        },
+      );
+    } else if (realOmlxPreferSubagents) {
+      expectRuntimeV2ReadOnlyCollaboration(planRuntime);
+    }
     const persistedPlan = await fs.readFile(
       path.join(workspace, reviewCommit.artifact.path),
       "utf8",
@@ -2744,6 +3121,8 @@ for (const model of models) {
         ? /read_file|grep_search|code_ast_query|读取|搜索|计划|根因|修复/i
         : realOmlxFixture === "md-viewer"
         ? /read_file|list_directory|读取|计划|main\.js|toolbar|按钮/i
+        : realOmlxFixture === "snake"
+          ? /read_file|list_directory|读取|计划|snake\.py|test_snake\.py|README|贪吃蛇/i
         : /read_file|list_directory|读取|计划|CSV|useCsvParser|creator/i);
     }
     expect(planChatText).not.toMatch(forbiddenChatNoise);
@@ -2751,6 +3130,8 @@ for (const model of models) {
       expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(
         realOmlxFixture === "md-viewer"
           ? /问题|分析|修复|toolbar|按钮|main\.js/i
+          : realOmlxFixture === "snake"
+            ? /分析|实现|计划|snake\.py|test_snake\.py|贪吃蛇/i
           : /问题|分析|修复|Dashboard|CSV|深色|creator/i,
       );
     }
@@ -2874,11 +3255,6 @@ for (const model of models) {
     }
 
     const mutationAfterEarlyOutcome = await inspectFixtureMutation(workspace, originalMutationContents);
-    if (realOmlxPreferSubagents) {
-      expectRuntimeV2ReadOnlyCollaboration(
-        earlyExecutionSnapshot?.runtimeV2,
-      );
-    }
     if (mutationAfterEarlyOutcome.changedFiles.length === 0) {
       expect(mutationAfterEarlyOutcome.contents).toEqual(originalMutationContents);
       const resultKind = String(
@@ -3081,6 +3457,25 @@ for (const model of models) {
       `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
     )).toBeVisible();
     expect(bodyText).not.toMatch(forbiddenChatNoise);
+    if (realOmlxFixture === "snake") {
+      const acceptance = await inspectSnakeAcceptance(workspace);
+      console.log(`[real-omlx-snake-plan-acceptance:${model}] ${JSON.stringify({
+        gaps: acceptance.gaps,
+        files: acceptance.files,
+        testCount: acceptance.testCount,
+        compileExitCode: acceptance.compile.exitCode,
+        testExitCode: acceptance.tests.exitCode,
+        importExitCode: acceptance.importCheck.exitCode,
+      })}`);
+      expect(
+        acceptance.gaps,
+        [
+          "Independent Snake acceptance rejected the approved plan outcome.",
+          acceptance.tests.stdout,
+          acceptance.tests.stderr,
+        ].filter(Boolean).join("\n"),
+      ).toEqual([]);
+    }
   });
 
   test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }) => {
@@ -3165,6 +3560,191 @@ for (const model of models) {
 
     expect(snapshot?.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
     expect(snapshot?.runtimeV2?.recovery?.exhausted || null).toBeNull();
+  });
+
+  test(`real OMLX Snake Execute completes in ${realOmlxMainMode} with ${model}`, async ({ page }) => {
+    test.skip(!runSnakeExecuteReplay);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    page.on("console", (message) => {
+      const text = message.text();
+      if (text.includes("[real-omlx-invoke] append_debug_log")) return;
+      console.log(`[browser:${message.type()}] ${text}`);
+    });
+    page.on("pageerror", (error) => {
+      console.log(`[browser:pageerror] ${error.message}`);
+    });
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(false));
+
+    if (realOmlxMainMode === "game_studio") {
+      await page.getByTestId("main-focus-picker-button").click();
+      await page.getByTestId("main-focus-option-game_studio").click();
+      await expect(page.getByTestId("main-focus-picker-button"))
+        .toContainText(/游戏工作室|Game Studio/i);
+      await expect(page.getByTestId("game-studio-onboarding")).toBeVisible();
+      await page.getByTestId("game-studio-onboarding-init").click();
+      await expect(page.getByTestId("game-studio-onboarding"))
+        .toBeHidden({ timeout: 120_000 });
+      await expect.poll(async () => {
+        try {
+          const config = await fs.readFile(
+            path.join(workspace, ".MAIN/game-studio/studio.config.json"),
+            "utf8",
+          );
+          return config.includes("packVersion") ? "initialized" : "invalid";
+        } catch {
+          return "missing";
+        }
+      }, { timeout: 120_000 }).toBe("initialized");
+    }
+
+    const immediateSnapshot = await page.evaluate(async (text) => {
+      const bridge = (window as any).__CODELY_E2E__;
+      try {
+        await bridge?.sendDirectEditMessage?.(text);
+      } catch (error) {
+        bridge.dispatchError = error instanceof Error ? error.message : String(error);
+      }
+      return bridge?.getSnapshot?.();
+    }, realOmlxRequest);
+    expect(immediateSnapshot?.dispatchError).toBeNull();
+    expect(immediateSnapshot?.lastWorkspaceInstructionAcceptance?.accepted).toBe(true);
+    const admittedTurnId = String(
+      immediateSnapshot?.lastWorkspaceInstructionAcceptance?.receipt?.turnId || "",
+    );
+    expect(admittedTurnId).not.toBe("");
+    const expectedIntent = realOmlxMainMode === "game_studio"
+      ? "studio_workflow"
+      : "execute";
+    const admittedTurn = (immediateSnapshot?.conversationTurnPreview || []).find(
+      (turn: { id?: string }) => turn.id === admittedTurnId,
+    );
+    expect(admittedTurn?.intent).toBe(expectedIntent);
+    expect(admittedTurn?.displayIntent).toBe(expectedIntent);
+    expect(admittedTurn?.runtimeEngineVersion).toBe("v2");
+
+    let terminalSnapshot: any = null;
+    let lastProgressSignature = "";
+    let lastDebugCount = 0;
+    try {
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() =>
+          (window as any).__CODELY_E2E__?.getSnapshot?.()
+        );
+        if (snapshot?.dispatchError) {
+          await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration?.());
+          throw new Error(`dispatch_error:${snapshot.dispatchError}`);
+        }
+        const runtime = snapshot?.runtimeV2;
+        const commands = Array.isArray(runtime?.commands) ? runtime.commands : [];
+        const latestCommand = commands.at(-1) || null;
+        const progress = {
+          mode: realOmlxMainMode,
+          isGenerating: snapshot?.isGenerating,
+          agentStatus: snapshot?.agentStatus,
+          turnStatus: snapshot?.currentTurnStatus,
+          phase: runtime?.phase || null,
+          eventCount: runtime?.events?.length || 0,
+          commandCount: commands.length,
+          latestCommand: latestCommand
+            ? {
+                kind: latestCommand.kind,
+                toolName: latestCommand.toolName,
+                target: String(latestCommand.target || "").slice(0, 240),
+                status: latestCommand.status,
+              }
+            : null,
+          terminal: runtime?.terminalOutcome?.resultKind || null,
+        };
+        const signature = JSON.stringify(progress);
+        if (signature !== lastProgressSignature) {
+          console.log(`[real-omlx-snake-progress:${model}] ${signature}`);
+          lastProgressSignature = signature;
+        }
+        const debugTail = Array.isArray(snapshot?.debugTail) ? snapshot.debugTail : [];
+        if (debugTail.length > lastDebugCount) {
+          const newEntries = debugTail.slice(lastDebugCount)
+            .filter((entry: { source?: string; level?: string }) =>
+              /runtime_v2|provider|tool_execution|mutation|validation|recovery|terminal|workspace_instruction/i
+                .test(String(entry?.source || "")) ||
+              /warn|error/i.test(String(entry?.level || ""))
+            )
+            .slice(-20)
+            .map((entry: { source?: string; level?: string; message?: unknown }) => ({
+              source: String(entry?.source || ""),
+              level: String(entry?.level || ""),
+              message: String(entry?.message || "").slice(0, 900),
+            }));
+          if (newEntries.length > 0) {
+            console.log(
+              `[real-omlx-snake-runtime:${model}] ${JSON.stringify(newEntries).slice(-12_000)}`,
+            );
+          }
+          lastDebugCount = debugTail.length;
+        }
+        if (runtime?.terminal?.exactlyOnce === true) {
+          terminalSnapshot = snapshot;
+          return "terminal";
+        }
+        return "running";
+      }, { timeout: realOmlxExecutionTimeoutMs, intervals: [1_000] }).toBe("terminal");
+    } catch (error) {
+      await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration?.());
+      const stopped = await page.evaluate(() =>
+        (window as any).__CODELY_E2E__?.getSnapshot?.()
+      );
+      console.log(`[real-omlx-snake-stopped:${model}] ${JSON.stringify({
+        mode: realOmlxMainMode,
+        error: error instanceof Error ? error.message : String(error),
+        runtimeV2: stopped?.runtimeV2 || null,
+        debugTail: (stopped?.debugTail || []).slice(-80),
+      }).slice(-80_000)}`);
+      throw error;
+    }
+
+    expect(terminalSnapshot?.currentTurnId).toBe(admittedTurnId);
+    expect(terminalSnapshot?.currentTurnIntent).toBe(expectedIntent);
+    const runtime = expectCanonicalRuntimeV2Terminal(terminalSnapshot, {
+      turnId: admittedTurnId,
+      resultKind: "success",
+    });
+    expect(runtime?.strategy).toBe("execute");
+    expect(runtime?.evidence?.some((entry: { kind?: string }) =>
+      entry.kind === "mutation"
+    )).toBe(true);
+    expect(runtime?.evidence?.some((entry: { kind?: string }) =>
+      entry.kind === "validation"
+    )).toBe(true);
+
+    const acceptance = await inspectSnakeAcceptance(workspace);
+    console.log(`[real-omlx-snake-quality:${model}] ${JSON.stringify({
+      mode: realOmlxMainMode,
+      gaps: acceptance.gaps,
+      files: acceptance.files,
+      testCount: acceptance.testCount,
+      compile: {
+        exitCode: acceptance.compile.exitCode,
+        stdout: acceptance.compile.stdout.slice(-2_000),
+        stderr: acceptance.compile.stderr.slice(-2_000),
+      },
+      tests: {
+        exitCode: acceptance.tests.exitCode,
+        stdout: acceptance.tests.stdout.slice(-4_000),
+        stderr: acceptance.tests.stderr.slice(-4_000),
+      },
+      importCheck: {
+        exitCode: acceptance.importCheck.exitCode,
+        stdout: acceptance.importCheck.stdout.slice(-1_000),
+        stderr: acceptance.importCheck.stderr.slice(-1_000),
+      },
+    }).slice(-30_000)}`);
+    expect(
+      acceptance.gaps,
+      "The independent Python Snake quality gate found missing basic behavior.",
+    ).toEqual([]);
+    await expect(page.locator(
+      `[data-testid="assistant-final"][data-turn-id="${admittedTurnId}"]`,
+    )).toBeVisible();
   });
 
   test(`real OMLX Execute completes the MD Viewer incident with ${model}`, async ({ page }) => {
@@ -3667,6 +4247,7 @@ if (runRealOmlx && explicitSubagentModel && explicitSubagentModel !== models[0])
 const subagentModel = explicitSubagentModel || models[0];
 
 test(`real OMLX starts semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }) => {
+  test.skip(realOmlxFixture !== "csv");
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
 
@@ -3762,6 +4343,7 @@ test(`real OMLX starts semantic collaboration after runtime admission with ${sub
 });
 
 test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }) => {
+  test.skip(realOmlxFixture !== "csv");
   page.on("console", (message) => {
     const text = message.text();
     if (text.includes("[real-omlx-invoke] append_debug_log")) return;

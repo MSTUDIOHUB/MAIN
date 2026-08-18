@@ -29,23 +29,30 @@ export function isRuntimeV2ChatIntent(
     intent === "report";
 }
 
-/** Chat owns only workspace-free Sessions. Workspace-bound read-only intents
- * use the separate `analyze` strategy and its finite read-only capability
- * surface. */
+/** Chat owns only workspace-free Sessions without external tools or network access.
+ * Workspace-bound read-only intents, file attachments, and network-enabled
+ * queries use the separate `analyze` strategy and its finite read-only capability surface. */
 export function isRuntimeV2GlobalChatTurn(
   intent: ResolvedRunIntent | null | undefined,
   runWorkspace: string | null | undefined,
+  options?: { webSearchEnabled?: boolean; hasAttachedFiles?: boolean },
 ): boolean {
   return isRuntimeV2ChatIntent(intent) &&
-    String(runWorkspace || "").trim().length === 0;
+    String(runWorkspace || "").trim().length === 0 &&
+    options?.webSearchEnabled !== true &&
+    options?.hasAttachedFiles !== true;
 }
 
 export function isRuntimeV2WorkspaceReadTurn(
   intent: ResolvedRunIntent | null | undefined,
   runWorkspace: string | null | undefined,
+  options?: { webSearchEnabled?: boolean; hasAttachedFiles?: boolean },
 ): boolean {
-  return isRuntimeV2ChatIntent(intent) &&
-    String(runWorkspace || "").trim().length > 0;
+  return isRuntimeV2ChatIntent(intent) && (
+    String(runWorkspace || "").trim().length > 0 ||
+    options?.webSearchEnabled === true ||
+    options?.hasAttachedFiles === true
+  );
 }
 
 export type RuntimeV2VisibleRunnerKind =
@@ -61,6 +68,7 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   readonly runtimeIntent: ResolvedRunIntent | null | undefined;
   readonly runWorkspace: string | null | undefined;
   readonly hasAttachedFiles?: boolean;
+  readonly webSearchEnabled?: boolean;
 }): RuntimeV2VisibleRunnerKind | null {
   // runtimeIntent is the immutable admission authority. effectiveIntent is
   // retained only as diagnostic input; a later UI projection must never
@@ -72,14 +80,20 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   if (
     isRuntimeV2ChatIntent(input.runtimeIntent) &&
     String(input.runWorkspace || "").trim().length === 0 &&
-    input.hasAttachedFiles === true
+    (input.hasAttachedFiles === true || input.webSearchEnabled === true)
   ) {
     return "workspace_read";
   }
-  if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace)) {
+  if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace, {
+    webSearchEnabled: input.webSearchEnabled,
+    hasAttachedFiles: input.hasAttachedFiles,
+  })) {
     return "chat";
   }
-  if (isRuntimeV2WorkspaceReadTurn(input.runtimeIntent, input.runWorkspace)) {
+  if (isRuntimeV2WorkspaceReadTurn(input.runtimeIntent, input.runWorkspace, {
+    webSearchEnabled: input.webSearchEnabled,
+    hasAttachedFiles: input.hasAttachedFiles,
+  })) {
     return "workspace_read";
   }
   return null;

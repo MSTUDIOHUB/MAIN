@@ -148,6 +148,7 @@ const READ_ONLY_BUILT_INS = new Set([
   // consumed before ordinary tool partitioning.
   "submit_plan_candidate",
   "record_execution_contract",
+  "load_skill",
   "spawn_subagent",
   "wait_subagents",
   "cancel_subagent",

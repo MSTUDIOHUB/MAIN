@@ -512,8 +512,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
           scope: { type: "string", description: "可选的职责边界说明；不能替代 objective 和 success_criteria" },
-          required_paths: { type: "string", description: "成功标准要求必须覆盖的精确路径；只读任务未提供 allowed_paths 时也作为其最小读取范围。implement 必须列出每个实际写入文件。" },
-          allowed_paths: { type: "string", description: "权限上限，使用逗号分隔；省略时使用 required_paths，本地任务最多 6 个。write 子任务必须使用互不重叠的精确文件目标，不能用目录授权后再自行选择文件。" },
+          required_paths: { type: "string", description: "成功标准要求必须覆盖的精确工作区相对路径，多个路径用逗号分隔；不要使用绝对路径。只读任务未提供 allowed_paths 时也作为其最小读取范围。implement 必须列出每个实际写入文件。" },
+          allowed_paths: { type: "string", description: "权限上限，只能填写工作区相对路径，多个路径用逗号分隔；不要使用绝对路径。省略时使用 required_paths，本地任务最多 6 个。write 子任务必须使用互不重叠的精确文件目标，不能用目录授权后再自行选择文件。" },
           access_mode: {
             type: "string",
             enum: [...RUNTIME_V2_SUBAGENT_ACCESS_MODES],

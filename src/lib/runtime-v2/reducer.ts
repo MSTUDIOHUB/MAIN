@@ -174,6 +174,9 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
     schemaVersion: "turn-aggregate.v1",
     turn: event.turn,
     strategy: event.strategy,
+    ...(event.subagentRequirement
+      ? { subagentRequirement: event.subagentRequirement }
+      : {}),
     objective: {
       text: event.objective,
       constraints: [...event.constraints],

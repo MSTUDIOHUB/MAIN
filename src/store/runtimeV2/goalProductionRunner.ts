@@ -348,6 +348,8 @@ export async function runSubmitRuntimeV2Goal(
     language: input.context.phaseLanguage,
     turnInputContextSignals: input.context.turnInputContextSignals,
     runtimeContextBudget: input.context.runtimeContextBudget,
+    workspaceInstructionContext: input.context.workspaceInstructionContext,
+    skillCatalog: input.context.skillCatalog,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
     buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
