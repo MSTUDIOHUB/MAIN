@@ -35,7 +35,7 @@ export function shouldProjectStreamingAssistantToCapsule(input: Pick<
   // the gate and is materialized in PlanPanel.
   if (input.workflowMode === "plan") return false;
   const intent = String(input.runIntent || "");
-  return intent === "execute" || intent === "studio_workflow" || intent === "plan";
+  return intent === "execute" || intent === "plan";
 }
 
 function shouldGateStreamingText(input: StreamingAssistantDisplayInput): boolean {

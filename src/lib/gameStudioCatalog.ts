@@ -1,1 +1,0 @@
-export * from "./gameStudio/catalog";

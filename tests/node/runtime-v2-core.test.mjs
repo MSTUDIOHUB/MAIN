@@ -449,6 +449,11 @@ test("minimal Execute loops through inspect, edit, behavioral validation, and co
       diagnostics: [],
     },
   }));
+  assert.equal(
+    runtime.latestRuntimeV2ProviderConclusionText(state),
+    "Updated src/main.js and verified the repaired behavior.",
+    "only the evidence-ready conclude request may supply terminal provider text",
+  );
   const evidence = runtime.summarizeRuntimeV2ExecuteEvidence(state, {
     isMutationToolName: (name) => name === "apply_patch",
   });
@@ -785,8 +790,8 @@ test("a static build cannot prove a behavioral Execute objective", () => {
   });
 });
 
-test("an unclassified direct Execute criterion accepts a finite static check", () => {
-  const state = aggregateWithValidation("npm run build", true, null);
+test("a durable unclassified direct Execute criterion accepts a finite static check", () => {
+  const state = aggregateWithValidation("npm run build", true, [null]);
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
 });
 
@@ -1202,7 +1207,7 @@ test("approved WorkPlan keeps sealed multi-target and validation authority", () 
   }).allowed, false);
 });
 
-test("a tool-free Execute report truthfully closes an incomplete approved WorkPlan", () => {
+test("a tool-free Execute report remains recovery input for an incomplete approved WorkPlan", () => {
   let state = approvedTwoTargetPlanAggregate();
   state = commitMutation(state, "main-only-mutation", "src/main.js");
   state = providerResult(state, {
@@ -1212,20 +1217,25 @@ test("a tool-free Execute report truthfully closes an incomplete approved WorkPl
 
   assert.equal(
     runtime.latestRuntimeV2ProviderConclusionText(state),
-    "Updated src/main.js, but the remaining target and required validation are incomplete.",
+    "",
   );
-  assert.deepEqual(runtime.decideRuntimeV2TerminalOutcome(state, {
+  assert.equal(runtime.decideRuntimeV2TerminalOutcome(state, {
     canceled: false,
     mutationCount: 1,
     passedValidationCount: 0,
     hasAcceptanceValidation: false,
     failedValidationCount: 0,
     stalledValidationCount: 0,
-    hasProviderConclusion: true,
-  }), {
-    resultKind: "partial",
-    resultReason:
-      "模型已结束本轮；已保留实际修改，但已批准 WorkPlan 尚未完整闭环。未覆盖修改目标：src/editor.js。 未通过必需验证：work-plan-validation-1。",
+    hasProviderConclusion: false,
+  }), null);
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.deepEqual(next.payload.recoveryPressure, {
+    schemaVersion: "runtime-v2-provider-recovery.v1",
+    reason: "empty_response",
+    occurrence: 1,
+    stage: "reconsider",
   });
 });
 
@@ -2802,6 +2812,27 @@ test("persisted Runtime v2 checkpoints contain one canonical event ledger", () =
   assert.deepEqual(
     restored[baseTurn.turnId].aggregate.events,
     aggregate.events,
+  );
+});
+
+test("an unclassified acceptance slot survives checkpoint JSON", () => {
+  const aggregate = executeAggregate("observing", [null]);
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 1,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const wire = JSON.parse(JSON.stringify(
+    runtime.serializeRuntimeV2CheckpointMap({
+      [baseTurn.turnId]: checkpoint,
+    }),
+  ));
+  const restored = runtime.normalizeRuntimeV2CheckpointMap(wire, baseTurn);
+
+  assert.deepEqual(
+    restored[baseTurn.turnId].aggregate.objective
+      .acceptanceEvidenceRequirements,
+    [null],
   );
 });
 

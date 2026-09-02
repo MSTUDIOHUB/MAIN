@@ -455,8 +455,8 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
     timestampMs: 5,
     tool: "read_file",
     field: "path",
-    from: ".claude/docs/workflow-catalog.yaml",
-    to: ".protocols/game-studio/docs/workflow-catalog.yaml",
+    from: ".claude/rules/project.md",
+    to: ".MAIN/rules/project.md",
     rule: "docs",
   });
   assert.equal(alias.type, "path_alias_hit");

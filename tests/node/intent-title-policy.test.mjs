@@ -66,7 +66,7 @@ const {
   shouldSeedSessionTitle,
 } = loadIntentTitlePolicyModule();
 
-test("semantic turn metadata request triggers for every fresh turn in Main and Game Studio", () => {
+test("semantic turn metadata request triggers for every fresh turn in supported MAIN modes", () => {
   assert.equal(
     shouldRequestSemanticTurnMetadataForTurn({
       input: "把登录错误修复掉",
@@ -84,7 +84,7 @@ test("semantic turn metadata request triggers for every fresh turn in Main and G
       hidden: false,
       reuseCurrentTurn: false,
       turnTitle: "",
-      mainModeKey: "game_studio",
+      mainModeKey: "image_studio",
     }),
     true,
   );

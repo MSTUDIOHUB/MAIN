@@ -1,6 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
   type RuntimeV2Projection,
   type RuntimeV2ResultKind,
@@ -46,9 +47,7 @@ export interface RuntimeV2Admission {
   readonly constraints?: readonly string[];
   readonly acceptanceCriteria?: readonly string[];
   readonly acceptanceCriterionIds?: readonly string[];
-  readonly acceptanceEvidenceRequirements?: readonly (
-    "static" | "behavioral" | "interaction"
-  )[];
+  readonly acceptanceEvidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
   readonly initialPhase?: "preparing" | "observing" | "planning" | "acting" | "validating" | "finalizing";
 }
 function asEvent<T extends RuntimeV2Event>(value: T): T { return value; }

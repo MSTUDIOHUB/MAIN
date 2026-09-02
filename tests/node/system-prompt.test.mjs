@@ -101,7 +101,7 @@ function buildPrompt({
   toolDefinitions = tools,
   instructions = null,
   mainMode = "main_mode",
-  gameStudio,
+  gameEngine,
   priority,
   goal,
   model = "qwen3.6",
@@ -116,7 +116,7 @@ function buildPrompt({
     intent === "plan" ? "plan" : intent === "execute" || intent === "goal" ? "edit" : "chat",
     "zh",
     instructions,
-    gameStudio,
+    gameEngine,
     intent,
     "english_core_localized_output",
     available,
@@ -225,9 +225,9 @@ test("no-tool turns contain no executable XML example or fake capability", () =>
   assert.match(prompt, /Do not edit source files or write plan artifacts before approval/);
 });
 
-test("plan, web, tabular, game studio, and goal modules are conditional", () => {
+test("plan, web, tabular, game-engine MCP, and goal modules are conditional", () => {
   const base = buildPrompt({ intent: "respond", available: ["read_file"], toolDefinitions: [tools[0]] });
-  assert.doesNotMatch(base, /\[PLAN\]|\[WEB RESEARCH\]|\[TABULAR\]|\[MAIN GAME STUDIO\]|\[GOAL RUNTIME CONTRACT\]/);
+  assert.doesNotMatch(base, /\[PLAN\]|\[WEB RESEARCH\]|\[TABULAR\]|\[GAME ENGINE MCP\]|\[GOAL RUNTIME CONTRACT\]/);
 
   const plan = buildPrompt({ intent: "plan", available: ["read_file"], toolDefinitions: [tools[0]] });
   assert.match(plan, /\[PLAN\]/);
@@ -250,17 +250,40 @@ test("plan, web, tabular, game studio, and goal modules are conditional", () => 
 
   const game = buildPrompt({
     intent: "respond",
-    mainMode: "game_studio",
-    gameStudio: { initialized: true, activeStudioAgentKey: "godot-specialist", studioConfig: { engine: "godot" } },
-    priority: { gameStudioMcpFirst: true, engine: "godot", connectedServerNames: ["Godot MCP"] },
+    gameEngine: { engine: "godot" },
+    priority: { engineMcpFirst: true, engine: "godot", connectedServerNames: ["Godot MCP"] },
   });
-  assert.match(game, /\[MAIN GAME STUDIO\]/);
-  assert.match(game, /activeStudioAgent: godot-specialist/);
+  assert.match(game, /\[GAME ENGINE MCP\]/);
+  assert.match(game, /engine: godot/);
   assert.match(game, /connectedMcpServers: Godot MCP/);
+  assert.doesNotMatch(game, /Game Studio|activeStudioAgent|protocolEntry|studio_auto/i);
 
   const goal = buildPrompt({ intent: "goal", goal: { context: "GOAL_CONTRACT_SENTINEL" } });
   assert.match(goal, /\[GOAL \(AUTONOMOUS EXECUTION\)\]/);
   assert.match(goal, /GOAL_CONTRACT_SENTINEL/);
+});
+
+test("game-engine MCP production modules contain no removed Studio lifecycle terminology", () => {
+  const targets = [
+    "src/lib/systemPrompt.ts",
+    "src/lib/toolCapabilities.ts",
+    "src/lib/turnProcessArchive.ts",
+    "src/lib/chat/chatToolSummary.ts",
+    "src/lib/runtimeTools.ts",
+    "src/lib/replyOptions.ts",
+    "src/lib/streamDisplayPolicy.ts",
+    "src/lib/executionDigest.ts",
+  ];
+  const source = targets
+    .map((target) => fsSync.readFileSync(path.join(workspaceRoot, target), "utf8"))
+    .join("\n");
+
+  assert.doesNotMatch(
+    source,
+    /GameStudio|gameStudio|game_studio|Game Studio|studio_workflow|activeStudioAgent|studio_auto|game-studio\//i,
+  );
+  assert.match(source, /GameEngine/);
+  assert.match(source, /engine_mcp_first/);
 });
 
 test("workspace rules remain injectable without restoring the old global prompt", () => {

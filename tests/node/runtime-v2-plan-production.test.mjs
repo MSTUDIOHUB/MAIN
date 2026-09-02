@@ -1039,7 +1039,6 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     assert.equal(engineSelection.isRuntimeV2WorkspaceReadTurn(intent, "/workspace"), true);
   }
   assert.equal(engineSelection.selectRuntimeEngineVersionForNewTurn("goal"), "v2");
-  assert.equal(engineSelection.selectRuntimeEngineVersionForNewTurn("studio_workflow"), "v2");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("chat", false), "chat");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("chat", true), "edit");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("plan", true), "plan");
@@ -1074,12 +1073,6 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     runtimeIntent: "goal",
     runWorkspace: "/workspace",
   }), "goal");
-  assert.equal(engineSelection.resolveRuntimeV2VisibleRunnerKind({
-    effectiveIntent: "studio_workflow",
-    runtimeIntent: "studio_workflow",
-    runWorkspace: "/workspace",
-  }), "studio");
-
   const app = fs.readFileSync(
     path.join(workspaceRoot, "src/App.tsx"),
     "utf8",
@@ -1130,15 +1123,19 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     path.join(workspaceRoot, "src/store/runtimeV2/planRunner.ts"),
     "utf8",
   );
+  const planCompletion = fs.readFileSync(
+    path.join(workspaceRoot, "src/store/runtimeV2/planCompletion.ts"),
+    "utf8",
+  );
   const planReviewProjection = fs.readFileSync(
     path.join(workspaceRoot, "src/store/runtimeV2/planReviewProjection.ts"),
     "utf8",
   );
-  const planImplementation = `${planRunner}\n${planReviewProjection}`;
+  const planImplementation = `${planRunner}\n${planCompletion}\n${planReviewProjection}`;
   assert.doesNotMatch(planImplementation, /\bPlanArtifact\b|planMaterialization|extractPlan|parsePlan/);
-  assert.match(planRunner, /createRuntimeV2PlanReviewCommit/);
+  assert.match(planCompletion, /createRuntimeV2PlanReviewCommit/);
   assert.match(planReviewProjection, /content: input\.plan\.markdown/);
-  assert.match(planRunner, /reviewCommit: commit/);
+  assert.match(planCompletion, /reviewCommit: commit/);
   assert.match(planReviewProjection, /markdown: input\.commit\.chat\.markdown/);
   assert.doesNotMatch(planRunner, /plan:soft-round-limit|PLAN_MODEL_ROUND_LIMIT/);
   assert.match(planRunner, /runtime_v2_plan_soft_round_signal/);

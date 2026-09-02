@@ -2533,11 +2533,6 @@ export default function ChatArea({
   selectedMainModeKey,
   setSelectedMainModeKey,
   mainModes,
-  activeStudioAgentKey,
-  setActiveStudioAgentKey,
-  gameStudioInitialized,
-  initializeGameStudioWorkspace,
-  removeGameStudioWorkspace,
   currentWorkspace,
   handleAcceptInline,
   handleRejectInline,
@@ -3475,6 +3470,8 @@ export default function ChatArea({
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
       if (block.variant === "game_studio_local_markdown") {
+        // Preserve previously persisted local Game Studio output as read-only
+        // markdown. It no longer activates a mode or carries live UI state.
         return (
           <div key={`${block.id}-${index}`} className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
             <div className="mt-1 flex-shrink-0">
@@ -3660,7 +3657,7 @@ export default function ChatArea({
     const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
-    const shouldShowIntentBadge = displayTurnIntent === "plan" || displayTurnIntent === "studio_workflow";
+    const shouldShowIntentBadge = displayTurnIntent === "plan";
     const isPlanTurn = turnIntent === "plan";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
@@ -5509,11 +5506,6 @@ export default function ChatArea({
         selectedMainModeKey={selectedMainModeKey}
         setSelectedMainModeKey={setSelectedMainModeKey}
         mainModes={mainModes}
-        activeStudioAgentKey={activeStudioAgentKey}
-        setActiveStudioAgentKey={setActiveStudioAgentKey}
-        gameStudioInitialized={gameStudioInitialized}
-        initializeGameStudioWorkspace={initializeGameStudioWorkspace}
-        removeGameStudioWorkspace={removeGameStudioWorkspace}
         currentWorkspace={currentWorkspace}
         t={t}
         activeDiffTask={activeDiffTask}

@@ -72,8 +72,27 @@ const {
   shouldPauseForReplyOptions,
   shouldRouteUnapprovedPlanReplyOptionsToArtifact,
   shouldSuppressApprovedPlanExecutionReplyOptions,
+  shouldSuppressMutationRuntimeReplyOptions,
   stripReadOnlyPermissionPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/replyOptions.ts"));
+
+test("only active mutation runtimes suppress non-blocking reply options", () => {
+  const replyOptions = [{
+    label: "Continue",
+    value: "Continue",
+    source: "explicit_user_options",
+  }];
+  assert.equal(shouldSuppressMutationRuntimeReplyOptions({
+    replyOptions,
+    runtimeIntent: "execute",
+    toolCallCount: 1,
+  }), true);
+  assert.equal(shouldSuppressMutationRuntimeReplyOptions({
+    replyOptions,
+    runtimeIntent: "report",
+    toolCallCount: 1,
+  }), false);
+});
 
 test("shouldPauseForReplyOptions pauses when the model asks the user to choose", () => {
   const shouldPause = shouldPauseForReplyOptions({
@@ -642,7 +661,7 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
   assert.equal(inferred.replyOptions[0].action, "execute_once");
   assert.equal(inferred.replyOptions[1].action, undefined);
 
-  const gameStudio = extractReplyOptions(`
+  const executionChoices = extractReplyOptions(`
 我需要确认是否进入执行能力继续。
 
 <user_options>
@@ -651,9 +670,9 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
 </user_options>
   `);
 
-  assert.equal(gameStudio.replyOptions[0].value, "立即开始重构并完善");
-  assert.equal(gameStudio.replyOptions[0].action, "execute_once");
-  assert.equal(gameStudio.replyOptions[1].action, undefined);
+  assert.equal(executionChoices.replyOptions[0].value, "立即开始重构并完善");
+  assert.equal(executionChoices.replyOptions[0].action, "execute_once");
+  assert.equal(executionChoices.replyOptions[1].action, undefined);
 
   const explicit = extractReplyOptions(`
 请选择下一步：

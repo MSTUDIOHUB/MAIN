@@ -94,7 +94,7 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
 }
 
 /** Production adapter shared by visible Execute Turns, approved Plan
- * continuations, ordinary Studio workflows, and internal Goal slices. */
+ * continuations, and internal Goal slices. */
 export async function runSubmitRuntimeV2Execute(
   input: RuntimeV2ExecuteRunnerInput,
 ): Promise<RuntimeRunSettlement> {

@@ -290,13 +290,13 @@ test("shell approval rules are deduped across decision and segments", () => {
   assert.deepEqual(buildShellPermissionApproval(decision, "once").rules, ["git", "npm install"]);
 });
 
-test("game studio shell commands use the same auto approval path", async () => {
+test("game-engine shell commands use the shared MAIN auto approval path", async () => {
   const resolution = await resolveShellAutoApproval({
     toolName: "execute_command",
     args: {
       command: "godot --headless --export-release macOS",
       cwd: ".",
-      description: "Export the Godot build from Game Studio workflow.",
+      description: "Export the Godot build from the MAIN workflow.",
     },
     workspace: "/tmp/game-project",
     preflight: async (command) => createDecision({

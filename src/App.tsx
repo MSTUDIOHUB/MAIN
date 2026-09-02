@@ -63,7 +63,7 @@ import {
   getAttachmentDisplayName,
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
-import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
+import { MAIN_MODE_KEYS } from "./lib/mainModes";
 import { createDefaultImageStudioRuntime } from "./lib/imageStudio";
 import {
   resolveSessionModeAffinity,
@@ -492,12 +492,10 @@ function stableRuntimeSignature(value: unknown): string {
     contextMemoryState: compactTextSignature(JSON.stringify(snapshot.contextMemoryState || null)),
     conversationTurns: compactTurnListSignature(snapshot.conversationTurns),
     currentTurnId: snapshot.currentTurnId ?? null,
-    selectedMainModeKey: snapshot.selectedMainModeKey ?? null,
-    selectedNexusModeKey: snapshot.selectedNexusModeKey ?? null,
-    sessionModeAffinity: snapshot.sessionModeAffinity ?? null,
+    sessionModeAffinity: resolveSessionModeAffinity({
+      sessionModeAffinity: snapshot.sessionModeAffinity ?? snapshot.selectedMainModeKey,
+    }, "main_mode"),
     imageStudio: compactTextSignature(JSON.stringify(snapshot.imageStudio || null)),
-    activeStudioAgentKey: snapshot.activeStudioAgentKey ?? null,
-    pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
     planArtifacts: compactJsonListSignature(snapshot.planArtifacts),
     planTasks: compactJsonListSignature(snapshot.planTasks),
     planExecutionEvidenceLedger: compactJsonListSignature(snapshot.planExecutionEvidenceLedger),
@@ -1031,7 +1029,6 @@ export default function App() {
   const showFilePanel = useAppStore((s) => s.showFilePanel);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
   const selectedDiffTaskId = useAppStore((s) => s.selectedDiffTaskId);
-  const pendingSlashCommand = useAppStore((s) => s.pendingSlashCommand);
   const pendingReviewTaskId = useAppStore((s) => s.pendingReviewTaskId);
   const pendingToolCall = useAppStore((s) => s.pendingToolCall);
   const isStreaming = useAppStore((s) => s.isGenerating);
@@ -1045,15 +1042,10 @@ export default function App() {
   const setContextMentions = useAppStore((s) => s.setContextMentions);
   const attachedFiles = useAppStore((s) => s.attachedFiles);
   const setAttachedFiles = useAppStore((s) => s.setAttachedFiles);
-  const selectedMainModeKey = useAppStore((s) => s.selectedMainModeKey);
+  const selectedMainModeKey = useAppStore((s) => resolveSessionModeAffinity({
+    sessionModeAffinity: s.selectedMainModeKey,
+  }, "main_mode"));
   const setSelectedMainModeKey = useAppStore((s) => s.setSelectedMainModeKey);
-  const selectedNexusModeKey = useAppStore((s) => s.selectedNexusModeKey);
-  const activeStudioAgentKey = useAppStore((s) => s.activeStudioAgentKey);
-  const setActiveStudioAgentKey = useAppStore((s) => s.setActiveStudioAgentKey);
-  const gameStudioInitialized = useAppStore((s) => s.gameStudioInitialized);
-  const initializeGameStudioWorkspace = useAppStore((s) => s.initializeGameStudioWorkspace);
-  const removeGameStudioWorkspace = useAppStore((s) => s.removeGameStudioWorkspace);
-  const refreshGameStudioWorkspaceState = useAppStore((s) => s.refreshGameStudioWorkspaceState);
   const selectedWorkspace = useAppStore((s) => s.selectedWorkspace);
   const mainModes = [...MAIN_MODE_KEYS];
   const activeSessionScope = resolveSessionWorkspaceKey(currentWorkspace);
@@ -1504,7 +1496,6 @@ export default function App() {
           error: error instanceof Error ? error.message : String(error),
         });
       })
-      .then(() => refreshGameStudioWorkspaceState())
       .finally(() => {
         appendDebugLog("info", "workspace.root", {
           phase: "set_done",
@@ -1512,7 +1503,7 @@ export default function App() {
           elapsedMs: Math.round(performance.now() - startedAt),
         });
       });
-  }, [currentWorkspace, refreshGameStudioWorkspaceState]);
+  }, [currentWorkspace]);
 
   useEffect(() => {
     if (!currentSessionId) return;
@@ -1562,14 +1553,10 @@ export default function App() {
       conversationTurns,
       currentTurnId,
       selectedMainModeKey,
-      selectedNexusModeKey,
       sessionModeAffinity: resolveSessionModeAffinity(
         activeSessionRecord as SessionModeAffinityLike,
         selectedMainModeKey,
       ),
-      activeStudioAgentKey,
-      gameStudioInitialized,
-      pendingSlashCommand,
       planArtifacts,
       planTasks,
       planExecutionEvidenceLedger,
@@ -1725,19 +1712,15 @@ export default function App() {
     config.sessionRecordingEnabled,
     currentSessionId,
     currentTurnId,
-    gameStudioInitialized,
     goalRuntime,
     isPlanApproved,
-    pendingSlashCommand,
     planArtifacts,
     planExecutionEvidenceLedger,
     planExecutionEvidenceCount,
     planStage,
     planTasks,
-    activeStudioAgentKey,
     rightPanelTab,
     selectedMainModeKey,
-    selectedNexusModeKey,
     selectedDiffTaskId,
     showDiff,
     showFilePanel,
@@ -2075,7 +2058,7 @@ export default function App() {
       : null;
     const hasAuthorizedGoalContinuation =
       shouldContinueExistingGoal && !!goalContinuationEnvelope;
-    const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
+    const executeQuickReplyIntent = "execute" as const;
 
     if (hasAuthorizedGoalContinuation) {
       appendDebugLog("info", "ui.quickReply_goal_continuation", {
@@ -2663,10 +2646,6 @@ export default function App() {
       useAppStore.setState({
         taskFlow: target.messages,
         selectedMainModeKey: restoredMainMode,
-        selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
-        activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
-        gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
-        pendingSlashCommand: null,
         selectedDiffTaskId: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
@@ -2717,11 +2696,7 @@ export default function App() {
     useAppStore.setState({
       taskFlow: [],
       selectedMainModeKey: restoredMainMode,
-      selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
       imageStudio: useAppStore.getState().imageStudio || createDefaultImageStudioRuntime(),
-      activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
-      gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
-      pendingSlashCommand: null,
       selectedDiffTaskId: null,
       conversationTurns: [],
       currentTurnId: null,
@@ -2887,10 +2862,6 @@ export default function App() {
               },
             }
           : {}),
-        // These two are user-selected app capabilities, not ownership
-        // artifacts from the previous Session.
-        activeStudioAgentKey: state.activeStudioAgentKey,
-        gameStudioInitialized: state.gameStudioInitialized,
         currentTurnExecutionConsent: { turnId: null, granted: false },
         agentStatus: "idle",
         isGenerating: false,
@@ -2992,11 +2963,7 @@ export default function App() {
       conversationTurns: [],
       currentTurnId: null,
       selectedMainModeKey: "main_mode",
-      selectedNexusModeKey: "nexus_general",
       sessionModeAffinity: "main_mode",
-      activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
-      gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
-      pendingSlashCommand: null,
       planArtifacts: [],
       planTasks: [],
       planExecutionEvidenceLedger: [],
@@ -3255,11 +3222,8 @@ export default function App() {
           conversationTurns: [],
           currentTurnId: null,
           selectedMainModeKey: "main_mode",
-          selectedNexusModeKey: "nexus_general",
           sessionModeAffinity: "main_mode",
           imageStudio: undefined,
-          gameStudioInitialized: false,
-          pendingSlashCommand: null,
           planArtifacts: [],
           planTasks: [],
           planExecutionEvidenceLedger: [],
@@ -4319,7 +4283,7 @@ export default function App() {
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
       />
-      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} preferSubagents={preferSubagents} onTogglePreferSubagents={setPreferSubagents} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
+      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} preferSubagents={preferSubagents} onTogglePreferSubagents={setPreferSubagents} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <FilePanel width={filePanelWidth} onStartResizing={startFilePanelResizing} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
       {pendingSessionDelete && (

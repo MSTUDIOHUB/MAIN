@@ -23,7 +23,6 @@ const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
   "analyze",
   "summarize",
   "report",
-  "studio_workflow",
 ]);
 
 function deriveStreamSettings(config: PreflightConfig): StreamSettings {
@@ -135,7 +134,7 @@ function normalizePreflightResult(
   const fallbackDirective = inferCommandDirective(input, intent, { source: "preflight" });
   const commandDirective = normalizeCommandDirective(candidate.commandDirective, fallbackDirective) ?? fallbackDirective;
   const riskLevel = normalizeRiskLevel(candidate.riskLevel) ?? (
-    commandDirective.kind === "shell" || commandDirective.kind === "git" || commandDirective.kind === "file_modify" || commandDirective.kind === "studio"
+    commandDirective.kind === "shell" || commandDirective.kind === "git" || commandDirective.kind === "file_modify"
       ? "medium"
       : commandDirective.kind === "none"
       ? "low"
@@ -183,20 +182,19 @@ export async function runIntentPreflight(params: {
     "You are MAIN's hidden intent preflight router.",
     "Return JSON only. No markdown, no prose, no tools.",
     "Classify the user's next-turn intent for MAIN before execution.",
-    "Allowed intents: respond, plan, execute, analyze, summarize, report, studio_workflow. `discuss` is legacy input only; return `respond` for ordinary natural replies.",
-    "Only use studio_workflow if the text clearly belongs to MAIN GAME STUDIO.",
+    "Allowed intents: respond, plan, execute, analyze, summarize, report. `discuss` is legacy input only; return `respond` for ordinary natural replies.",
     "Also provide title: a short clean UI title for sidebar / ExecutionCapsule. Ignore usernames, timestamps, and transcript noise.",
     "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
     "Also provide reason: a brief routing reason for the chosen intent.",
     "Also provide riskLevel: low, medium, or high.",
     "Also provide requiresApproval: true only when this turn is likely to need shell, write, external write, browser, Unity/editor, Git mutation, or destructive tools.",
     "Also provide commandDirective: a second-level command metadata object. Keep top-level intent unchanged; use commandDirective.kind for specific commands.",
-    "Allowed commandDirective.kind values: none, shell, unity, git, file_modify, report, plan_approval, plan_resume, studio, skill, knowledge, mcp.",
+    "Allowed commandDirective.kind values: none, shell, unity, git, file_modify, report, plan_approval, plan_resume, skill, knowledge, mcp.",
     "commandDirective.source should be preflight. commandDirective.action should be short, such as status, commit_push, deploy, workspace_file_change, generate_report, editor_execute.",
     "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
     "Options must be plain user-facing choices, not reasoning.",
     "The JSON shape must be:",
-    "{\"intent\":\"respond|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
+    "{\"intent\":\"respond|plan|execute|analyze|summarize|report\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");

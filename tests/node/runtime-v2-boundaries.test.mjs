@@ -152,7 +152,7 @@ test("Runtime v2 store adapters do not import either legacy execution owner", ()
   }
 });
 
-test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free response as final provider text", () => {
+test("Runtime v2 Execute accepts terminal provider text only from conclude mode", () => {
   const coreSource = fs.readFileSync(
     path.join(process.cwd(), "src/lib/runtime-v2/completion.ts"),
     "utf8",
@@ -165,7 +165,8 @@ test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free respon
     "utf8",
   )).join("\n");
   assert.match(coreSource, /latestRuntimeV2ProviderConclusionText/);
-  assert.match(coreSource, /\["execute", "validate", "conclude"\]/);
+  assert.match(coreSource, /mode !== "conclude"/);
+  assert.doesNotMatch(coreSource, /\["execute", "validate", "conclude"\]/);
   assert.match(coreSource, /event\.result\.toolCalls\.length > 0/);
   assert.match(coreSource, /event\.result\.diagnostics\.length > 0/);
   assert.match(adapterSource, /latestRuntimeV2ProviderConclusionText/);
@@ -208,6 +209,7 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
     "planRunner.ts",
     "planBootstrap.ts",
     "planCollaborationAcquisition.ts",
+    "planCompletion.ts",
     "planModelProtocol.ts",
     "planProviderAdmission.ts",
     "planProviderPort.ts",

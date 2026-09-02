@@ -46,10 +46,6 @@ export default defineConfig(async () => ({
         manualChunks(id) {
           const normalizedId = id.replace(/\\/g, "/");
 
-          if (normalizedId.includes("/src/gameStudioPack/")) {
-            return "game-studio-pack";
-          }
-
           if (normalizedId.includes("/node_modules/@xterm/")) {
             return "xterm";
           }

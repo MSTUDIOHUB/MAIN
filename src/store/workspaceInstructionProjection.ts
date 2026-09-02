@@ -27,7 +27,6 @@ const WORKSPACE_TURN_INTENT_HINTS = new Set<ResolvedRunIntent>([
   "analyze",
   "summarize",
   "report",
-  "studio_workflow",
   "image_studio",
   "goal",
 ]);

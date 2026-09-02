@@ -1,4 +1,3 @@
-import type { PendingSlashCommand } from "./gameStudio/catalog";
 import type { MainModeKey } from "./mainModes";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";
@@ -22,7 +21,6 @@ export type ResolvedUserIntent =
   | "analyze"
   | "summarize"
   | "report"
-  | "studio_workflow"
   | "image_studio"
   | "goal";
 export type ResolvedRunIntent = ResolvedUserIntent;
@@ -31,8 +29,8 @@ export function isMutationRuntimeIntent(intent: ResolvedUserIntent | string | nu
   return intent === "execute" || intent === "goal";
 }
 export type RunIntentRiskLevel = "low" | "medium" | "high";
-export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
-export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";
+export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion";
+export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated";
 export type EffectiveTurnApprovalState = "not_required" | "needs_approval" | "approved";
 export type PlanReviewState = "not_ready" | "awaiting_review" | "approved";
 export type OperationApprovalState = EffectiveTurnApprovalState;
@@ -45,11 +43,6 @@ export type PendingRunDecisionKind = "intent_confirmation" | "execution_consent"
 export type PendingRunDecisionSource = "pre_submit" | "preflight" | "model" | "tool_gate";
 export type PendingRunDecisionChoice =
   | ResolvedUserIntent
-  | "switch_game_studio"
-  | "switch_game_studio_choose_engine"
-  | "switch_game_studio_unity"
-  | "switch_game_studio_godot"
-  | "switch_game_studio_unreal"
   | "stay_main";
 export type RunIntentControlAction = "approve_plan" | "resume_plan_execution";
 export type CommandDirectiveKind =
@@ -61,14 +54,12 @@ export type CommandDirectiveKind =
   | "report"
   | "plan_approval"
   | "plan_resume"
-  | "studio"
   | "skill"
   | "knowledge"
   | "mcp";
 export type CommandDirectiveSource =
   | "natural_language"
   | "main_shortcut"
-  | "studio_slash"
   | "skill_command"
   | "preflight"
   | "continuation"
@@ -149,7 +140,6 @@ export interface ResolveTurnRunIntentContext {
    * must not be used as a pre-Turn chat/task gate.
    */
   hasWorkspace?: boolean;
-  parsedStudioCommand?: PendingSlashCommand | null;
   hasPlanArtifacts: boolean;
   planStage:
     | "idle"
@@ -297,21 +287,6 @@ const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
       en: "Use the chat flow to produce a structured Markdown report.",
     },
   },
-  studio_workflow: {
-    intent: "studio_workflow",
-    workflowMode: "edit",
-    uiCategory: "studio_workflow",
-    toolPolicy: "studio_workflow",
-    requiresPlanApproval: false,
-    generatesPlanArtifacts: false,
-    allowsSourceWritesBeforePlanApproval: true,
-    label: { zh: "Game Studio", en: "Game Studio" },
-    categoryLabel: { zh: "工作室流程", en: "Studio Workflow" },
-    description: {
-      zh: "绕过 MAIN 通用路由，按 Game Studio 协议执行。",
-      en: "Bypass the MAIN router and execute through the Game Studio protocol.",
-    },
-  },
   image_studio: {
     intent: "image_studio",
     workflowMode: "chat",
@@ -393,7 +368,7 @@ const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
   /^(?:(?:please|kindly|now|directly)\s+|(?:can|could|would|will)\s+you\s+)*(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
   /\b(?:find|locate|identify|investigate|diagnose|analy[sz]e|inspect|trace)\b.{0,80}\b(?:root causes?|causes?|issues?|problems?|bugs?|errors?|failures?|faults?)\b.{0,120}\b(?:implement|fix|repair|resolve|update|patch|modify|refactor|remove|replace|change)\b/i,
   /(?:[.!?;,：，。！？；]\s*|\b(?:and|then|next)\s+)(?:please\s+)?(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
-  /^(?:(?:请|帮我|现在|直接|立即|马上|然后|随后|再)\s*)*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
+  /^(?:(?:请|帮我|现在|直接|立即|马上|开始|继续|然后|随后|再)\s*)*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
   /(?:[，。！？；：]\s*|(?:并且|然后|随后|再|并)\s*)(?:请|帮我|现在|直接)?\s*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
 ];
 
@@ -423,13 +398,6 @@ export function looksLikeExplicitWorkspaceMutationRequest(input: string): boolea
     matchesAny(normalizedInput, DIRECT_WORKSPACE_MUTATION_PATTERNS)
   );
 }
-
-const GAME_STUDIO_EXECUTE_PATTERNS = [
-  /(?:立即|马上|现在|直接|开始|继续)(?:开始)?(?:重构|完善|实现|改造|开发|处理|执行|接入|集成)/i,
-  /(?:重构|完善|实现|改造|开发|处理|接入|集成).{0,32}(?:controller|manager|system|SnakeController|SnakeBody|脚本|系统|逻辑|功能|模块)/i,
-  /(?:把|将).{0,32}(?:接入|集成|完善|实现|改造|重构)/i,
-  /\b(?:implement|refactor|complete|continue|integrate|wire up|build|fix)\b.{0,40}\b(?:controller|manager|system|script|feature|logic)\b/i,
-];
 
 const COMPLEX_IMPLEMENTATION_PATTERNS = [
   /生成一套/i,
@@ -567,7 +535,7 @@ const HIGH_RISK_PATTERNS: Array<{ key: string; patterns: RegExp[] }> = [
 
 const CONTINUATION_INTENTS = new Set<RunIntentControlAction>(["approve_plan", "resume_plan_execution"]);
 
-export type MainIntentShortcut = Exclude<ResolvedUserIntent, "respond" | "discuss" | "execute" | "studio_workflow">;
+export type MainIntentShortcut = Exclude<ResolvedUserIntent, "respond" | "discuss" | "execute">;
 
 export interface MainIntentShortcutItem {
   intent: MainIntentShortcut;
@@ -732,7 +700,6 @@ const COMMAND_DIRECTIVE_KINDS = new Set<CommandDirectiveKind>([
   "report",
   "plan_approval",
   "plan_resume",
-  "studio",
   "skill",
   "knowledge",
   "mcp",
@@ -741,7 +708,6 @@ const COMMAND_DIRECTIVE_KINDS = new Set<CommandDirectiveKind>([
 const COMMAND_DIRECTIVE_SOURCES = new Set<CommandDirectiveSource>([
   "natural_language",
   "main_shortcut",
-  "studio_slash",
   "skill_command",
   "preflight",
   "continuation",
@@ -762,7 +728,7 @@ function createCommandDirective(
     kind,
     source: patch.source ?? "natural_language",
     requiresWorkspace: patch.requiresWorkspace ?? kind !== "none",
-    requiresApproval: patch.requiresApproval ?? ["shell", "git", "file_modify", "unity", "studio", "mcp", "skill"].includes(kind),
+    requiresApproval: patch.requiresApproval ?? ["shell", "git", "file_modify", "unity", "mcp", "skill"].includes(kind),
     confidence: patch.confidence ?? (kind === "none" ? 0.5 : 0.86),
     ...(patch.action ? { action: patch.action } : {}),
     ...(patch.target ? { target: patch.target } : {}),
@@ -792,7 +758,6 @@ export function buildEffectiveTurnContract(input: {
     directiveKind === "shell" ||
     directiveKind === "git" ||
     directiveKind === "unity" ||
-    directiveKind === "studio" ||
     directiveKind === "mcp" ||
     directiveKind === "plan_resume" ||
     directiveKind === "plan_approval";
@@ -803,13 +768,11 @@ export function buildEffectiveTurnContract(input: {
   const mutationExpected =
     !isUnapprovedPlanDraft &&
     (
-      runtimeIntent === "studio_workflow" ||
       (
         input.planApproved === true &&
         input.workspaceMutationExpected !== false
       ) ||
-      directiveKind === "file_modify" ||
-      directiveKind === "studio"
+      directiveKind === "file_modify"
     );
   const validationExpected =
     !isUnapprovedPlanDraft &&
@@ -955,7 +918,6 @@ export function inferCommandDirective(
   options: {
     source?: CommandDirectiveSource;
     controlAction?: RunIntentControlAction;
-    parsedStudioCommand?: PendingSlashCommand | null;
   } = {},
 ): CommandDirective {
   const source = options.source ?? "natural_language";
@@ -992,18 +954,6 @@ export function inferCommandDirective(
       requiresApproval: false,
       confidence: 0.96,
       reason: "The user is resuming an approved plan.",
-    });
-  }
-
-  if (options.parsedStudioCommand?.type === "workflow" || intent === "studio_workflow") {
-    return createCommandDirective("studio", {
-      source: source === "natural_language" ? "studio_slash" : source,
-      action: options.parsedStudioCommand?.type === "workflow" ? options.parsedStudioCommand.slug : "studio_workflow",
-      target: options.parsedStudioCommand?.type === "workflow" ? options.parsedStudioCommand.canonicalCommand : undefined,
-      requiresWorkspace: true,
-      requiresApproval: true,
-      confidence: 0.96,
-      reason: "MAIN Game Studio command or workflow.",
     });
   }
 
@@ -1113,7 +1063,7 @@ export function inferCommandDirective(
 
 function finalizeRunIntentResolution(
   input: string,
-  context: ResolveTurnRunIntentContext,
+  _context: ResolveTurnRunIntentContext,
   resolution: Omit<RunIntentResolution, "commandDirective" | "requiresApproval"> & {
     commandDirective?: CommandDirective;
     requiresApproval?: boolean;
@@ -1123,15 +1073,13 @@ function finalizeRunIntentResolution(
     resolution.commandDirective ??
     inferCommandDirective(input, resolution.intent, {
       controlAction: resolution.controlAction,
-      parsedStudioCommand: context.parsedStudioCommand,
-      source: context.parsedStudioCommand?.type === "workflow" ? "studio_slash" : "natural_language",
+      source: "natural_language",
     });
   const operationNeedsApproval =
     commandDirective.requiresApproval === true &&
     !resolution.needsDecision &&
     !resolution.controlAction &&
     resolution.intent !== "execute" &&
-    resolution.intent !== "studio_workflow" &&
     resolution.intent !== "plan";
   return {
     ...resolution,
@@ -1159,8 +1107,7 @@ export function getMainIntentShortcuts(
   return visibleShortcuts.filter((item) => isMainIntentShortcutAllowedInMainMode(item.intent, mainModeKey));
 }
 
-export function isMainIntentShortcutAllowedInMainMode(intent: MainIntentShortcut, mainModeKey: MainModeKey): boolean {
-  if (mainModeKey === "game_studio") return intent === "plan";
+export function isMainIntentShortcutAllowedInMainMode(_intent: MainIntentShortcut, mainModeKey: MainModeKey): boolean {
   if (mainModeKey === "image_studio") return false;
   return true;
 }
@@ -1266,12 +1213,6 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       valueZh: "请整理成结构化正式报告输出",
       valueEn: "Please produce a structured report.",
     },
-    studio_workflow: {
-      zh: "按 Game Studio 工作流处理",
-      en: "Use Game Studio Workflow",
-      valueZh: "请按 MAIN GAME STUDIO 的工作流来处理这个需求",
-      valueEn: "Handle this through the MAIN GAME STUDIO workflow.",
-    },
     image_studio: {
       zh: "生成图片",
       en: "Generate Image",
@@ -1361,7 +1302,7 @@ export function resolveComposerIntentSuggestion(params: {
   const language = params.language === "en" ? "en" : "zh";
   const normalizedInput = params.input.trim();
   if (!normalizedInput) return null;
-  if (params.mainModeKey !== "main_mode" && params.mainModeKey !== "game_studio") return null;
+  if (params.mainModeKey !== "main_mode") return null;
   if (params.lockedComposerIntent) return null;
   if (params.dismissedSuggestedIntentKey === normalizedInput) return null;
 
@@ -1373,7 +1314,6 @@ export function resolveComposerIntentSuggestion(params: {
     const resolution = resolveTurnRunIntent(rest, {
       language,
       mainModeKey: params.mainModeKey,
-      parsedStudioCommand: null,
       hasPlanArtifacts: params.hasPlanArtifacts,
       planStage: params.planStage,
       isPlanApproved: params.isPlanApproved,
@@ -1400,7 +1340,6 @@ export function resolveComposerIntentSuggestion(params: {
   const resolution = resolveTurnRunIntent(normalizedInput, {
     language,
     mainModeKey: params.mainModeKey,
-    parsedStudioCommand: null,
     hasPlanArtifacts: params.hasPlanArtifacts,
     planStage: params.planStage,
     isPlanApproved: params.isPlanApproved,
@@ -1557,20 +1496,6 @@ export function resolveTurnRunIntent(
       confidence: 0.5,
       bypassMainRouter: false,
       riskLevel: "low",
-    });
-  }
-
-  if (context.parsedStudioCommand?.type === "workflow") {
-    return finalize({
-      intent: "studio_workflow",
-      reason: localizeReason(
-        language,
-        "检测到 MAIN GAME STUDIO 工作流命令，本轮会直接进入工作室执行链路。",
-        "Detected a MAIN GAME STUDIO workflow command, so this turn will go directly into the studio workflow.",
-      ),
-      confidence: 0.99,
-      bypassMainRouter: true,
-      riskLevel: "medium",
     });
   }
 
@@ -1766,20 +1691,6 @@ export function resolveTurnRunIntent(
     });
   }
 
-  if (context.mainModeKey === "game_studio" && matchesAny(normalizedInput, GAME_STUDIO_EXECUTE_PATTERNS)) {
-    return finalize({
-      intent: "execute",
-      reason: localizeReason(
-        language,
-        "检测到 Game Studio 中明确的实现、重构或完善请求；本轮直接进入可写入与验证的执行链路。",
-        "Detected an explicit implementation, refactor, or completion request inside Game Studio, so this turn goes directly into the execution-capable workflow.",
-      ),
-      confidence: 0.9,
-      bypassMainRouter: false,
-      riskLevel: "medium",
-    });
-  }
-
   if (hasStrongExecuteSignal) {
     return finalize({
       intent: "execute",
@@ -1858,33 +1769,6 @@ export function resolveTurnRunIntent(
             suggestedIntent: "plan" as const,
             decisionOptions: ["plan", "respond", "execute"] as ResolvedUserIntent[],
           }),
-    });
-  }
-
-  if (context.mainModeKey === "game_studio") {
-    if (context.previousTurnIntent === "studio_workflow") {
-      return finalize({
-        intent: "studio_workflow",
-        reason: localizeReason(
-          language,
-          "上一轮为 Game Studio 工作流，本轮延续工作室流程。",
-          "The previous turn was a Game Studio workflow, so this turn continues the studio workflow.",
-        ),
-        confidence: 0.92,
-        bypassMainRouter: true,
-        riskLevel: "medium",
-      });
-    }
-    return finalize({
-      intent: "respond",
-      reason: localizeReason(
-        language,
-        "Game Studio 普通文本默认按自然回复处理，只有 slash 工作流默认直走执行。",
-        "Game Studio plain text defaults to natural response; only slash workflows go straight to execution.",
-      ),
-      confidence: 0.84,
-      bypassMainRouter: false,
-      riskLevel: "low",
     });
   }
 

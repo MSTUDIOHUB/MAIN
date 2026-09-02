@@ -78,7 +78,6 @@ function baseInput(overrides = {}) {
       warnings: [],
       loadedAt: 1,
     },
-    gameStudioConfigForTurn: { engine: "unity", activeStudioAgent: "unity-specialist" },
     abortCtrl: { signal: { aborted: false } },
     timerInterval: "timer-1",
     sendStartedAt: 123,

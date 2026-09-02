@@ -47,6 +47,7 @@ import {
   parseRuntimeV2ExecutionContractArguments,
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
+import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -149,7 +150,6 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           throw error;
         }
       }
-
       if (command.kind !== "execute_tool" && command.kind !== "execute_validation") {
         throw new Error(`Unsupported Runtime v2 tool command: ${command.kind}`);
       }
@@ -462,17 +462,14 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           diffPreview,
         );
         const semanticStatus = toolResultStatusForCompletion(completion);
+        const effectCommitted = recordRuntimeV2CommittedToolEffect({
+          ports: input,
+          toolName,
+          args,
+          status: semanticStatus,
+        });
         if (completion.type === "validation.completed") {
           input.live.correctiveValidationCommand = null;
-        }
-        if (
-          semanticStatus === "succeeded" &&
-          isWorkspaceMutationToolName(toolName)
-        ) {
-          input.live.hasExecutedMutationEffect = true;
-          input.live.correctiveValidationCommand = null;
-          input.live.mutationSourceCoverageByToolCallId.clear();
-          input.live.latestProviderRequestSourceCoverage = [];
         }
         recordToolResultHistory({
           ports: input,
@@ -489,7 +486,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           toolName,
           target: target || null,
           status: semanticStatus,
-          mutationCommitted: isWorkspaceMutationToolName(toolName),
+          mutationCommitted:
+            semanticStatus === "succeeded" &&
+            isWorkspaceMutationToolName(toolName),
+          effectCommitted,
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
           executionContractRevision:
             toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME

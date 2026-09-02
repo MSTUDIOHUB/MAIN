@@ -54,6 +54,14 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "replace_in_file": return (args.path as string) || "";
     case "write_file": return (args.path as string) || "";
     case "apply_patch": return summarizeApplyPatchTarget((args.patch as string) || "") || "workspace patch";
-    default: return (args.input as string) || name;
+    // Extension tools commonly identify their effect with path/URI/URL/target
+    // rather than the legacy generic input field. Preserve that structured
+    // target in receipts so an MCP effect is not reduced to only its tool name.
+    default: return (args.path as string) ||
+      (args.uri as string) ||
+      (args.url as string) ||
+      (args.target as string) ||
+      (args.input as string) ||
+      name;
   }
 }

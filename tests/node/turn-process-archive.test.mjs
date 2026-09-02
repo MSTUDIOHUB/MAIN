@@ -188,6 +188,28 @@ test("failed mutation attempts remain edit steps even when preflight prevents a 
   assert.equal(live.steps[0].items[0].diff.path, "Assets/Scripts/Player.cs");
 });
 
+test("Unity, Godot, and Unreal MCP calls remain visible as engine-editor activities", () => {
+  for (const [toolName, executionName] of [
+    ["mcp__unity__manage_scene__a1", "manage_scene"],
+    ["mcp__godot__godot_list_nodes__b2", "godot_list_nodes"],
+    ["mcp__unreal__unreal_find_actors__c3", "unreal_find_actors"],
+  ]) {
+    const groups = buildCodexActivityGroups([{
+      id: toolName,
+      type: "tool",
+      toolName,
+      executionName,
+      target: "Editor",
+      toolStatus: "executed",
+      status: "success",
+    }], "en");
+
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].kind, "command");
+    assert.ok(groups[0].summary.length > 0);
+  }
+});
+
 test("persisted tool intent summaries win over deterministic fallback", () => {
   const archive = buildTurnProcessArchiveModel({
     blocks: [

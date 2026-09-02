@@ -2,9 +2,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconGlobe, IconShield, IconSubagent } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
+import MainOnboardingPanel from "./MainOnboardingPanel";
 import MainModeSwitcher from "./composer/MainModeSwitcher";
-import GameStudioOnboardingPanel from "./gameStudio/GameStudioOnboardingPanel";
-import GameStudioSlashMenu from "./gameStudio/GameStudioSlashMenu";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
 import { estimateTokens } from "../lib/contextTrim";
@@ -12,15 +11,8 @@ import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
-import { getGameStudioSlashCatalog } from "../lib/gameStudio/pack";
-import { humanizeSlug } from "../lib/gameStudio/catalog";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
 import { isImageModelName } from "../lib/imageStudio";
-import {
-  getGameStudioOnboardingCopy,
-  resolveGameStudioOnboardingAction,
-  shouldShowGameStudioOnboarding,
-} from "../lib/gameStudio/onboarding";
 import { isPlanTaskTrustedComplete } from "../lib/workflowModels";
 import {
   classifyAttachment,
@@ -189,11 +181,6 @@ export default function Composer({
   setShowAgentPicker,
   selectedMainModeKey,
   mainModes,
-  activeStudioAgentKey,
-  setActiveStudioAgentKey,
-  gameStudioInitialized,
-  initializeGameStudioWorkspace,
-  removeGameStudioWorkspace,
   currentWorkspace,
   t,
   activeDiffTask,
@@ -222,12 +209,10 @@ export default function Composer({
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [highlightedSlashIndex, setHighlightedSlashIndex] = useState(0);
+  const [showMainOnboarding, setShowMainOnboarding] = useState(false);
   const [showWebSearchPanel, setShowWebSearchPanel] = useState(false);
   const [allFiles, setAllFiles] = useState<string[]>([]);
   const [isFilesLoading, setIsFilesLoading] = useState(false);
-  const [dismissedStudioOnboardingByWorkspace, setDismissedStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
-  const [usedStudioOnboardingByWorkspace, setUsedStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
-  const [forceVisibleStudioOnboardingByWorkspace, setForceVisibleStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
   const [isSubmitPending, setIsSubmitPending] = useState(false);
   const [dismissedSuggestedIntentKey, setDismissedSuggestedIntentKey] = useState<string | null>(null);
 
@@ -239,9 +224,9 @@ export default function Composer({
   const mainFocusPickerRef = useRef<HTMLDivElement>(null);
   const webSearchPanelRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
+  const helpButtonRef = useRef<HTMLButtonElement>(null);
   const slashAnchorRef = useRef(-1);
   const previousMainModeRef = useRef(selectedMainModeKey);
-  const previousWorkspaceRef = useRef(currentWorkspace);
   const submitPendingRef = useRef(false);
   const isComposingRef = useRef(false);
   const compositionEndedAtRef = useRef(0);
@@ -283,20 +268,11 @@ export default function Composer({
   const [draftInput, setDraftInput] = useState(storeInput);
   const [debouncedInput, setDebouncedInput] = useState(storeInput);
   const [showImageStudioAdvanced, setShowImageStudioAdvanced] = useState(false);
-  const slashCatalog = useMemo(
-    () => getGameStudioSlashCatalog(language === "en" ? "en" : "zh"),
-    [language],
-  );
   const mainIntentShortcuts = useMemo(
     () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" })
       .filter((item) => currentWorkspace || item.intent !== "goal"),
     [currentWorkspace, language],
   );
-  const gameStudioPlanShortcuts = useMemo(
-    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "game_studio" }),
-    [language],
-  );
-  const isGameStudioMode = selectedMainModeKey === "game_studio";
   const isMainMode = selectedMainModeKey === "main_mode";
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isLightTheme = themeMode === "light";
@@ -314,12 +290,6 @@ export default function Composer({
   const showExecutionProgress =
     planTasks.length > 0 &&
     (planStage === "ready_to_execute" || planStage === "executing" || planStage === "completed" || isPlanApproved);
-  const slashCommandLabel = language === "en" ? "Studio Commands" : "Studio 命令";
-  const slashSearchLabel = slashQuery
-    ? (language === "en" ? `Command: ${slashQuery}` : `命令：${slashQuery}`)
-    : (language === "en" ? "Type / to search plan shortcuts, commands, and agents" : "输入 / 搜索计划入口、工作流命令和专业 Agent");
-  const slashEmptyLabel = language === "en" ? "No matching shortcuts, commands, or agents" : "没有匹配的计划入口、命令或 Agent";
-  const slashHint = language === "en" ? "Select to insert canonical command" : "选择后会插入标准命令";
   const mainIntentSearchLabel = slashQuery
     ? (language === "en" ? `Shortcut: ${slashQuery}` : `快捷入口：${slashQuery}`)
     : (language === "en" ? "Type / for planning and output styles" : "输入 / 选择计划入口和输出方式");
@@ -327,20 +297,10 @@ export default function Composer({
   const mainIntentHint = language === "en"
     ? "Use natural language for direct execution; shortcuts are optional."
     : "直接用自然语言下达执行任务；快捷入口是可选的。";
-  const studioPlanHeading = language === "en" ? "Plan Shortcuts" : "计划入口";
-  const studioWorkflowHeading = language === "en" ? "Workflow Commands" : "工作流命令";
-  const studioAgentHeading = language === "en" ? "Specialist Agents" : "专业 Agent";
-  const planKindLabel = language === "en" ? "plan" : "计划";
-  const workflowKindLabel = language === "en" ? "workflow" : "工作流";
-  const agentKindLabel = language === "en" ? "agent" : "专家";
-  const studioAutoLabel = language === "en" ? "Auto Routing" : "自动专家路由";
   const mainModeDescriptions = {
     main_mode: language === "en"
       ? "Ask naturally for summaries, analysis, reports, extraction, plans, or execution in one place."
       : "直接用自然语言提出总结、分析、报告、提炼、计划或执行需求。",
-    game_studio: language === "en"
-      ? "Run MAIN GAME STUDIO workflows and specialists, with /plan available for large changes."
-      : "运行 MAIN GAME STUDIO 工作流与专业 Agent，并支持用 /plan 进入计划流。",
     image_studio: language === "en"
       ? "Generate images in a dedicated studio with local-first image runtime and an optional HiDream Web fallback."
       : "在独立图像工作室里进行本地优先的图片生成，并可按需切到 HiDream Web fallback。",
@@ -453,11 +413,6 @@ export default function Composer({
   const webSearchButtonTitle = webSearchEnabled
     ? `${language === "en" ? "Web search enabled" : "网络搜索已开启"}: ${activeWebSearchProviderLabel}`
     : "开启后允许模型在网络上搜索答案";
-  const nonPackFiles = useMemo(
-    () => allFiles.filter((path) => !path.startsWith(".MAIN/") && !path.startsWith(".protocols/")),
-    [allFiles],
-  );
-  const currentWorkspaceOnboardingKey = currentWorkspace || "__no_workspace__";
   const composerIntentSuggestion = useMemo(() => {
     return resolveComposerIntentSuggestion({
       input: draftInput,
@@ -488,18 +443,6 @@ export default function Composer({
   const lockedComposerIntentCategoryLabel = lockedComposerIntent
     ? getRunIntentCategoryLabel(lockedComposerIntent, language === "en" ? "en" : "zh")
     : null;
-  const showStudioOnboarding = shouldShowGameStudioOnboarding({
-    isGameStudioMode,
-    hasWorkspace: Boolean(currentWorkspace),
-    gameStudioInitialized,
-    nonPackFileCount: nonPackFiles.length,
-    input: draftInput,
-    hasConversationHistory: conversationTurns.length > 0,
-    showSlashMenu,
-    dismissed: Boolean(dismissedStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
-    used: Boolean(usedStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
-    forceVisible: Boolean(forceVisibleStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
-  });
   const imageStudioAspectOptions = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9", "9:21", "9:7", "7:9"] as const;
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
   const isLocalImageEngine = imageStudio.config.provider === "local_image_service";
@@ -600,35 +543,24 @@ export default function Composer({
 
   useEffect(() => {
     const previousMode = previousMainModeRef.current;
-    const previousWorkspace = previousWorkspaceRef.current;
-    const enteredGameStudio = isGameStudioMode && previousMode !== "game_studio";
     const enteredImageStudio = isImageStudioMode && previousMode !== "image_studio";
-    const changedWorkspaceInGameStudio = isGameStudioMode && Boolean(currentWorkspace) && previousWorkspace !== currentWorkspace;
-
-    if ((enteredGameStudio || changedWorkspaceInGameStudio) && currentWorkspace) {
-      setForceVisibleStudioOnboardingByWorkspace((prev) => ({
-        ...prev,
-        [currentWorkspaceOnboardingKey]: true,
-      }));
-      setDismissedStudioOnboardingByWorkspace((prev) => ({
-        ...prev,
-        [currentWorkspaceOnboardingKey]: false,
-      }));
-    }
 
     if (enteredImageStudio && imageStudio.status.state !== "ready") {
       setImageStudioSetupGuideOpen(true);
     }
 
     previousMainModeRef.current = selectedMainModeKey;
-    previousWorkspaceRef.current = currentWorkspace;
-  }, [currentWorkspace, currentWorkspaceOnboardingKey, imageStudio.status.state, isGameStudioMode, isImageStudioMode, selectedMainModeKey, setImageStudioSetupGuideOpen]);
+  }, [imageStudio.status.state, isImageStudioMode, selectedMainModeKey, setImageStudioSetupGuideOpen]);
 
   useEffect(() => {
     if (!currentWorkspace && lockedComposerIntent === "goal") {
       setLockedComposerIntent(null);
     }
   }, [currentWorkspace, lockedComposerIntent, setLockedComposerIntent]);
+
+  useEffect(() => {
+    if (isImageStudioMode) setShowMainOnboarding(false);
+  }, [isImageStudioMode]);
 
   const currentTokens = useMemo(() => {
     const historyTokens = estimateAgentMessagesTokens(agentMessages);
@@ -699,47 +631,16 @@ export default function Composer({
 
   const filteredSlashItems = useMemo(() => {
     const normalizedQuery = slashQuery.trim().toLowerCase();
-    if (isMainMode) {
-      return mainIntentShortcuts.filter((item) => {
-        if (!normalizedQuery) return true;
-        const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
-        const haystacks = [item.label, item.command, item.description, categoryLabel, ...(item.aliases || [])]
-          .join(" ")
-          .toLowerCase();
-        return haystacks.includes(normalizedQuery);
-      });
-    }
-    if (!isGameStudioMode) return [];
-    const planShortcuts = gameStudioPlanShortcuts
-      .map((item) => ({
-        ...item,
-        id: `main_intent:${item.intent}`,
-        kind: "main_intent" as const,
-        group: studioPlanHeading,
-      }))
-      .filter((item) => {
-        if (!normalizedQuery) return true;
-        const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
-        const haystacks = [item.label, item.command, item.description, categoryLabel, ...(item.aliases || [])]
-          .join(" ")
-          .toLowerCase();
-        return haystacks.includes(normalizedQuery);
-      });
-    const ranked = slashCatalog.filter((item) => {
+    if (!isMainMode) return [];
+    return mainIntentShortcuts.filter((item) => {
       if (!normalizedQuery) return true;
-      const haystacks = [
-        item.label,
-        item.canonicalCommand,
-        item.group,
-        item.description,
-        ...(item.aliases || []),
-      ]
+      const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
+      const haystacks = [item.label, item.command, item.description, categoryLabel, ...(item.aliases || [])]
         .join(" ")
         .toLowerCase();
       return haystacks.includes(normalizedQuery);
     });
-    return [...planShortcuts, ...ranked];
-  }, [gameStudioPlanShortcuts, isGameStudioMode, isMainMode, language, mainIntentShortcuts, slashCatalog, slashQuery, studioPlanHeading]);
+  }, [isMainMode, language, mainIntentShortcuts, slashQuery]);
 
   const mainIntentSlashGroups = useMemo(() => {
     if (!isMainMode || filteredSlashItems.length === 0) return [];
@@ -761,55 +662,19 @@ export default function Composer({
     return mainIntentSlashGroups.flatMap(([, items]) => items);
   }, [isMainMode, mainIntentSlashGroups]);
 
-  const visibleSlashItems = isMainMode ? visibleMainIntentSlashItems : filteredSlashItems;
+  const visibleSlashItems = visibleMainIntentSlashItems;
 
   const groupedSlashItems = useMemo(() => {
     const groups = [];
-    if (isMainMode) {
-      if (mainIntentSlashGroups.length > 0) {
-        groups.push({
-          kind: "main_intent",
-          heading: language === "en" ? "MAIN Shortcuts" : "MAIN 快捷入口",
-          groups: mainIntentSlashGroups,
-        });
-      }
-      return groups;
-    }
-    const planGroups = new Map();
-    const workflowGroups = new Map();
-    const agentGroups = new Map();
-    for (const item of filteredSlashItems) {
-      const target = item.kind === "main_intent"
-        ? planGroups
-        : item.kind === "workflow"
-        ? workflowGroups
-        : agentGroups;
-      if (!target.has(item.group)) target.set(item.group, []);
-      target.get(item.group).push(item);
-    }
-    if (planGroups.size > 0) {
+    if (isMainMode && mainIntentSlashGroups.length > 0) {
       groups.push({
         kind: "main_intent",
-        heading: studioPlanHeading,
-        groups: Array.from(planGroups.entries()),
-      });
-    }
-    if (workflowGroups.size > 0) {
-      groups.push({
-        kind: "workflow",
-        heading: studioWorkflowHeading,
-        groups: Array.from(workflowGroups.entries()),
-      });
-    }
-    if (agentGroups.size > 0) {
-      groups.push({
-        kind: "agent",
-        heading: studioAgentHeading,
-        groups: Array.from(agentGroups.entries()),
+        heading: language === "en" ? "MAIN Shortcuts" : "MAIN 快捷入口",
+        groups: mainIntentSlashGroups,
       });
     }
     return groups;
-  }, [filteredSlashItems, isMainMode, language, mainIntentSlashGroups, studioAgentHeading, studioPlanHeading, studioWorkflowHeading]);
+  }, [isMainMode, language, mainIntentSlashGroups]);
 
   const closeMentionMenu = useCallback(() => {
     setShowMentionMenu(false);
@@ -850,9 +715,14 @@ export default function Composer({
   }, [closeMentionMenu, closeSlashMenu, setShowAgentPicker, showAgentPicker, showWebSearchPanel]);
 
   useEffect(() => {
-    if (isGameStudioMode || isMainMode) return;
+    if (isMainMode) return;
     closeSlashMenu();
-  }, [closeSlashMenu, isGameStudioMode, isMainMode]);
+    setShowMainOnboarding(false);
+  }, [closeSlashMenu, isMainMode]);
+
+  useEffect(() => {
+    setShowMainOnboarding(false);
+  }, [activeSessionKey, currentWorkspace]);
 
   useEffect(() => {
     if (!isImageStudioMode) return;
@@ -1080,76 +950,34 @@ export default function Composer({
     });
   };
 
-  const handleStudioCommandButtonClick = () => {
-    if (!isGameStudioMode) return;
-    markStudioOnboardingUsed();
+  const handleOpenMainGuideSlashCommands = useCallback(() => {
+    setShowMainOnboarding(false);
+    closeMentionMenu();
     setShowSlashMenu(true);
-    const textarea = textareaRef.current;
-    const cursorPos = textarea?.selectionStart ?? draftInput.length;
-    const slashSession = getSlashSession(draftInput, cursorPos);
-    slashAnchorRef.current = slashSession?.anchor ?? -1;
-    setSlashQuery(slashSession?.query ?? "");
-    textareaRef.current?.focus();
-  };
-
-  const reopenStudioOnboarding = useCallback((options?: { resetUsed?: boolean }) => {
-    setForceVisibleStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: true,
-    }));
-    setDismissedStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: false,
-    }));
-    if (options?.resetUsed) {
-      setUsedStudioOnboardingByWorkspace((prev) => ({
-        ...prev,
-        [currentWorkspaceOnboardingKey]: false,
-      }));
-    }
-  }, [currentWorkspaceOnboardingKey]);
-
-  const markStudioOnboardingDismissed = useCallback(() => {
-    setForceVisibleStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: false,
-    }));
-    setDismissedStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: true,
-    }));
-  }, [currentWorkspaceOnboardingKey]);
-
-  const markStudioOnboardingUsed = useCallback(() => {
-    setForceVisibleStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: false,
-    }));
-    setUsedStudioOnboardingByWorkspace((prev) => ({
-      ...prev,
-      [currentWorkspaceOnboardingKey]: true,
-    }));
-  }, [currentWorkspaceOnboardingKey]);
-
-  const applyComposerDraft = useCallback((value: string) => {
-    setDraftInput(value);
-    setStoreInput(value, { preserveLockedComposerIntent: true });
-    setShowSlashMenu(false);
+    setSlashQuery("");
     setHighlightedSlashIndex(0);
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        const position = value.length;
-        textareaRef.current.selectionStart = textareaRef.current.selectionEnd = position;
-        textareaRef.current.focus();
-      }
-    });
-  }, [setStoreInput]);
+    setShowWebSearchPanel(false);
+    setShowAgentPicker(false);
+    slashAnchorRef.current = -1;
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [closeMentionMenu, setShowAgentPicker]);
 
-  const handleSelectSlashItem = (item) => {
-    const value = item.kind === "workflow" ? `${item.canonicalCommand} ` : item.canonicalCommand;
-    markStudioOnboardingUsed();
-    applyComposerDraft(value);
-  };
+  const dismissMainOnboarding = useCallback(() => {
+    setShowMainOnboarding(false);
+    requestAnimationFrame(() => helpButtonRef.current?.focus());
+  }, []);
+
+  const toggleMainOnboarding = useCallback(() => {
+    if (showMainOnboarding) {
+      dismissMainOnboarding();
+      return;
+    }
+    closeMentionMenu();
+    closeSlashMenu();
+    setShowWebSearchPanel(false);
+    setShowAgentPicker(false);
+    setShowMainOnboarding(true);
+  }, [closeMentionMenu, closeSlashMenu, dismissMainOnboarding, setShowAgentPicker, showMainOnboarding]);
 
   const handleSelectMainIntentShortcut = (item) => {
     const parsed = parseMainIntentShortcutForMode(draftInput, selectedMainModeKey);
@@ -1170,53 +998,6 @@ export default function Composer({
       setLockedComposerIntent(item.intent);
     }
     requestAnimationFrame(() => textareaRef.current?.focus());
-  };
-
-  const handleClearStudioAgent = async () => {
-    await setActiveStudioAgentKey("studio_auto", { persistToWorkspace: gameStudioInitialized });
-  };
-
-  const handleStudioOnboardingAction = async (action) => {
-    const resolved = resolveGameStudioOnboardingAction(action);
-
-    if (resolved.kind === "initialize") {
-      try {
-        await initializeGameStudioWorkspace();
-        markStudioOnboardingUsed();
-        workspaceFileIndexController.clearWorkspace(currentWorkspace || "");
-        await ensureWorkspaceFilesLoaded({ forceRefresh: true });
-        setDraftInput("");
-        setStoreInput("");
-      } catch (error) {
-        console.error("Failed to initialize Game Studio workspace:", error);
-      }
-      return;
-    }
-
-    markStudioOnboardingUsed();
-    applyComposerDraft(resolved.value);
-  };
-
-  const handleRemoveGameStudioWorkspace = async () => {
-    const onboardingCopy = getGameStudioOnboardingCopy(language === "en" ? "en" : "zh");
-    const confirmed = await safeConfirmAsync(
-      onboardingCopy.removeConfirmation,
-      { source: "Composer", action: "remove_game_studio_workspace" },
-    );
-
-    if (!confirmed) return;
-
-    try {
-      await removeGameStudioWorkspace();
-      workspaceFileIndexController.clearWorkspace(currentWorkspace || "");
-      setDraftInput("");
-      setStoreInput("");
-      setShowSlashMenu(false);
-      await ensureWorkspaceFilesLoaded({ forceRefresh: true });
-      reopenStudioOnboarding({ resetUsed: true });
-    } catch (error) {
-      console.error("Failed to remove Game Studio workspace assets:", error);
-    }
   };
 
   const handleToggleAutoReview = useCallback(async () => {
@@ -1297,9 +1078,6 @@ export default function Composer({
         return;
       }
 
-      if (isGameStudioMode) {
-        markStudioOnboardingUsed();
-      }
       setDraftInput((currentDraft) => currentDraft === textToSend ? "" : currentDraft);
 
       const latestState = useAppStore.getState();
@@ -1349,7 +1127,7 @@ export default function Composer({
       submitPendingRef.current = false;
       setIsSubmitPending(false);
     }
-  }, [attachedFiles, closeSlashMenu, contextMentions, currentWorkspace, draftInput, isGameStudioMode, language, lockedComposerIntent, markStudioOnboardingUsed, onSendMessage, pendingImages, preferSubagents, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
+  }, [attachedFiles, closeSlashMenu, contextMentions, currentWorkspace, draftInput, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
 
   const handleGuideCurrentRun = useCallback(() => {
     const guidanceText = draftInput.trim();
@@ -1414,7 +1192,7 @@ export default function Composer({
     if (isMainMode && parseMainDebugShortcut(value)) {
       slashAnchorRef.current = -1;
       closeSlashMenu();
-    } else if (!isImageStudioMode && (isGameStudioMode || isMainMode) && slashSession) {
+    } else if (isMainMode && slashSession) {
       slashAnchorRef.current = slashSession.anchor;
       setSlashQuery(slashSession.query);
       setShowSlashMenu(true);
@@ -1495,8 +1273,7 @@ export default function Composer({
     const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
     const isImeKeyInput = isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition;
     if (
-      !isImageStudioMode &&
-      (isMainMode || isGameStudioMode) &&
+      isMainMode &&
       !activeDiffTask &&
       e.key === "Tab" &&
       e.shiftKey &&
@@ -1561,11 +1338,7 @@ export default function Composer({
         e.preventDefault();
         if (visibleSlashItems.length > 0 && highlightedSlashIndex < visibleSlashItems.length) {
           const slashItem = visibleSlashItems[highlightedSlashIndex];
-          if (isMainMode || slashItem?.kind === "main_intent") {
-            handleSelectMainIntentShortcut(slashItem);
-          } else {
-            handleSelectSlashItem(slashItem);
-          }
+          handleSelectMainIntentShortcut(slashItem);
         } else if (e.key === "Enter" && !e.altKey && draftInput.trim().startsWith("/")) {
           handleSubmitComposerMessage();
         }
@@ -1595,8 +1368,6 @@ export default function Composer({
     ? "..."
     : isImageStudioMode
     ? (language === "en" ? "Describe the image you want to generate..." : "描述你想生成的图片...")
-    : isGameStudioMode
-    ? (language === "en" ? "Ask the studio, or type / for plan, workflows, and specialists..." : "询问工作室中枢，或输入 / 打开计划入口、工作流和专家面板...")
     : language === "en"
     ? "Describe what you need, or type / for planning and output styles..."
     : "输入需求，或输入 / 选择计划入口、分析、总结、报告...";
@@ -1673,14 +1444,12 @@ export default function Composer({
           </div>
         )}
 
-        {showStudioOnboarding && (
-          <GameStudioOnboardingPanel
-            language={language}
-            isLightTheme={isLightTheme}
-            initialized={gameStudioInitialized}
-            onDismiss={markStudioOnboardingDismissed}
-            onAction={handleStudioOnboardingAction}
-            onRemove={handleRemoveGameStudioWorkspace}
+        {showMainOnboarding && isMainMode && (
+          <MainOnboardingPanel
+            language={language === "en" ? "en" : "zh"}
+            themeMode={themeMode}
+            onDismiss={dismissMainOnboarding}
+            onOpenSlashCommands={handleOpenMainGuideSlashCommands}
           />
         )}
 
@@ -1982,6 +1751,16 @@ export default function Composer({
             <textarea
               ref={handleTextareaRef}
               data-testid="composer-textarea"
+              role={showSlashMenu ? "combobox" : undefined}
+              aria-haspopup={showSlashMenu ? "listbox" : undefined}
+              aria-controls={showSlashMenu ? "main-slash-command-menu" : undefined}
+              aria-expanded={showSlashMenu}
+              aria-activedescendant={
+                showSlashMenu && visibleSlashItems[highlightedSlashIndex]
+                  ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].intent}`
+                  : undefined
+              }
+              aria-autocomplete={showSlashMenu ? "list" : undefined}
               className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
               style={{ fontSize: `${resolvedComposerFontSize}px` }}
               rows={activeDiffTask ? 1 : 2}
@@ -2056,7 +1835,10 @@ export default function Composer({
 
             {showSlashMenu && isMainMode && (
               <div
+                id="main-slash-command-menu"
                 ref={slashMenuRef}
+                role="listbox"
+                aria-label={language === "en" ? "MAIN slash commands" : "MAIN 斜杠命令"}
                 className={`absolute left-4 bottom-full mb-1 w-[min(34rem,calc(100%-2rem))] max-w-[34rem] rounded-lg border overflow-hidden z-50 flex flex-col ${
                   isLightTheme
                     ? "border-[#d4d4d8] bg-white text-[#111827]"
@@ -2094,6 +1876,9 @@ export default function Composer({
                           return (
                             <button
                               key={item.intent}
+                              id={`main-shortcut-option-${item.intent}`}
+                              role="option"
+                              aria-selected={isActive}
                               data-testid={`main-shortcut-item-${item.intent}`}
                               onClick={() => handleSelectMainIntentShortcut(item)}
                               className="w-full rounded-md px-3 py-2 text-left transition-colors"
@@ -2139,28 +1924,6 @@ export default function Composer({
               </div>
             )}
 
-            {showSlashMenu && isGameStudioMode && (
-              <GameStudioSlashMenu
-                menuRef={slashMenuRef}
-                searchLabel={slashSearchLabel}
-                commandLabel={slashCommandLabel}
-                emptyLabel={slashEmptyLabel}
-                hint={slashHint}
-                navigationHint={mentionHintUpDown}
-                selectHint={mentionHintEnter}
-                closeHint={mentionHintEsc}
-                planKindLabel={planKindLabel}
-                workflowKindLabel={workflowKindLabel}
-                agentKindLabel={agentKindLabel}
-                highlightedIndex={highlightedSlashIndex}
-                sections={groupedSlashItems}
-                onSelect={(item) => (
-                  item.kind === "main_intent"
-                    ? handleSelectMainIntentShortcut(item)
-                    : handleSelectSlashItem(item)
-                )}
-              />
-            )}
           </div>
 
           {!isImageStudioMode && (queuedTurnCount > 0 || activeGuidance) && (
@@ -2256,33 +2019,20 @@ export default function Composer({
 
               <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 
-              {isGameStudioMode && (
-                <>
-                  <button
-                    onClick={handleStudioCommandButtonClick}
-                    data-testid="game-studio-command-button"
-                    className="bg-[#000000] border border-[rgba(34,197,94,0.28)] text-[#e4e4e7] text-[11px] font-bold px-2.5 py-1.5 rounded-md flex shrink-0 items-center justify-center gap-1.5 hover:bg-[#18181b] transition-colors"
-                    title={language === "en" ? "Open Game Studio command hub" : "打开 Game Studio 命令中枢"}
-                  >
-                    <IconCode className="w-3.5 h-3.5 text-[#86efac]" />
-                    <span>/</span>
-                  </button>
-                  {activeStudioAgentKey !== "studio_auto" ? (
-                    <button
-                      onClick={handleClearStudioAgent}
-                      className="bg-[#000000] border border-[rgba(34,197,94,0.22)] text-[#d1fae5] text-[11px] px-2.5 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-[#18181b] transition-colors"
-                      title={language === "en" ? "Clear specialist and return to auto orchestration" : "清除当前专家，回到自动编排"}
-                    >
-                      <span className="max-w-[130px] truncate">{humanizeSlug(activeStudioAgentKey)}</span>
-                      <span className="text-[#86efac]">×</span>
-                    </button>
-                  ) : (
-                    <div className="bg-[#000000] border border-[#27272a] text-[#71717a] text-[11px] px-2.5 py-1.5 rounded-full">
-                      {studioAutoLabel}
-                    </div>
-                  )}
-                  <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
-                </>
+              {isMainMode && (
+                <button
+                  ref={helpButtonRef}
+                  type="button"
+                  data-testid="composer-help-button"
+                  onClick={toggleMainOnboarding}
+                  className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 text-[14px] font-semibold transition-all duration-150 ${showMainOnboarding ? "is-active" : ""}`}
+                  title={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
+                  aria-label={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
+                  aria-controls="main-onboarding-panel"
+                  aria-expanded={showMainOnboarding}
+                >
+                  ?
+                </button>
               )}
 
               {/* @ Mention button — inserts @ and opens the same menu */}

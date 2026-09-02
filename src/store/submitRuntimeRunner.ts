@@ -13,13 +13,7 @@ import { runSubmitRuntimeV2Chat } from "./runtimeV2/chatRunner";
 import { runSubmitRuntimeV2Execute } from "./runtimeV2/executeRunner";
 import { runSubmitRuntimeV2Goal } from "./runtimeV2/goalProductionRunner";
 import { runSubmitRuntimeV2Plan } from "./runtimeV2/planRunner";
-import { runSubmitRuntimeV2Studio } from "./runtimeV2/studioRunner";
-import { createRuntimeV2StudioReceiptFilePort } from "./runtimeV2/studioReceiptFilePort";
 import { runSubmitRuntimeV2WorkspaceRead } from "./runtimeV2/workspaceReadRunner";
-import type {
-  RuntimeV2GameStudioServicePort,
-} from "./runtimeV2/studioAdapter";
-import type { RuntimeV2StudioAction } from "../lib/runtime-v2";
 import { withRuntimeV2ContextBudget } from "./runtimeV2/submissionContext";
 
 type SubmitRuntimeStoreGet = () => any;
@@ -40,8 +34,6 @@ export interface RunSubmitRuntimeInput extends SubmitRuntimePortInputs {
   context: SubmissionRuntimeContext;
   /** Injection seam shared by submission and Runtime v2 checkpoint persistence. */
   persistSessionRecord?: SubmissionRuntimeStorePorts["persistSessionRecord"];
-  runtimeService: RuntimeV2GameStudioServicePort;
-  studioActions?: readonly RuntimeV2StudioAction[];
 }
 
 export async function runSubmitRuntime(
@@ -121,42 +113,6 @@ export async function runSubmitRuntime(
   }
   if (runtimeV2RunnerKind === "goal") {
     return runSubmitRuntimeV2Goal({
-      get: input.get,
-      set: input.set,
-      context: runtimeContext,
-      getSessionRevisionToken: input.getSessionRevisionToken,
-      sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
-      publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
-      persistSessionRecord: input.persistSessionRecord || saveProjectSession,
-      logStoreEvent: input.logStoreEvent,
-    });
-  }
-  if (
-    runtimeV2RunnerKind === "studio" &&
-    input.studioActions &&
-    input.studioActions.length > 0
-  ) {
-    const workspace = String(input.context.runWorkspace || "").trim();
-    return runSubmitRuntimeV2Studio({
-      get: input.get,
-      set: input.set,
-      context: runtimeContext,
-      actions: input.studioActions,
-      runtimeService: input.runtimeService,
-      studioReceipts: createRuntimeV2StudioReceiptFilePort({ workspace }),
-      getSessionRevisionToken: input.getSessionRevisionToken,
-      sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
-      publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
-      persistSessionRecord: input.persistSessionRecord || saveProjectSession,
-      logStoreEvent: input.logStoreEvent,
-    });
-  }
-  if (runtimeV2RunnerKind === "studio") {
-    // Ordinary Game Studio work remains one Execute Turn. Only deterministic
-    // setup/onboarding actions use the dedicated external-effect adapter.
-    return runSubmitRuntimeV2Execute({
       get: input.get,
       set: input.set,
       context: runtimeContext,

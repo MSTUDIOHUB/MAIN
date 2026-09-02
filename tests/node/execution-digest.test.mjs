@@ -95,3 +95,19 @@ test("execution digest reports error-first next step for failures", () => {
   assert.ok(digest.includes("run_command"));
   assert.ok(digest.includes("Diagnose the latest error"));
 });
+
+test("legacy Studio intent receives the provider-neutral implementation label", () => {
+  const digest = buildExecutionDigest({
+    language: "en",
+    turnIntent: "studio_workflow",
+    toolResults: [{
+      name: "godot_read_output",
+      target: "Godot editor",
+      isError: false,
+      content: "ok",
+    }],
+  });
+
+  assert.match(digest, /goal=advance implementation and verification/);
+  assert.doesNotMatch(digest, /Game Studio|Studio workflow/i);
+});

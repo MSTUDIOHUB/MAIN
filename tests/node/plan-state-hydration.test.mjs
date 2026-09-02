@@ -54,17 +54,13 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const hydration = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planStateHydration.ts"));
-const catalog = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gameStudio/catalog.ts"));
-
 const { resolvePlanStateHydrationReason } = hydration;
-const { parseGameStudioSlashCommand } = catalog;
 
 test("plan state hydration prefers explicit existing-plan execution semantics", () => {
   const reason = resolvePlanStateHydrationReason({
     text: "请按照 .MAIN/plans/tasks.md 继续执行",
     hasPlanState: false,
     hasContinuationState: false,
-    slashCommand: null,
   });
   assert.equal(reason, "existing_plan_execution");
 });
@@ -74,45 +70,26 @@ test("plan state hydration recognizes natural plan resume wording", () => {
     text: "继续完成计划方案",
     hasPlanState: false,
     hasContinuationState: false,
-    slashCommand: null,
   });
   assert.equal(reason, "existing_plan_execution");
 });
 
-test("plan state hydration triggers for continuation state and execution studio commands", () => {
+test("plan state hydration triggers for continuation state", () => {
   const continuation = resolvePlanStateHydrationReason({
     text: "继续",
     hasPlanState: false,
     hasContinuationState: true,
-    slashCommand: null,
   });
   assert.equal(continuation, "continuation_state");
-
-  const execCmd = resolvePlanStateHydrationReason({
-    text: "/dev-story",
-    hasPlanState: false,
-    hasContinuationState: false,
-    slashCommand: parseGameStudioSlashCommand("/dev-story"),
-  });
-  assert.equal(execCmd, "studio_execution_command");
 });
 
-test("plan state hydration remains conservative when plan state already exists or command is non-execution", () => {
+test("plan state hydration remains conservative when plan state already exists", () => {
   const alreadyHasState = resolvePlanStateHydrationReason({
     text: "继续执行",
     hasPlanState: true,
     hasContinuationState: true,
-    slashCommand: parseGameStudioSlashCommand("/dev-story"),
   });
   assert.equal(alreadyHasState, null);
-
-  const nonExecStudioCommand = resolvePlanStateHydrationReason({
-    text: "/help",
-    hasPlanState: false,
-    hasContinuationState: false,
-    slashCommand: parseGameStudioSlashCommand("/help"),
-  });
-  assert.equal(nonExecStudioCommand, null);
 });
 
 test("plan panel open path hydrates artifacts without auto-approving execution", () => {

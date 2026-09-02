@@ -1,30 +1,9 @@
-import type { PendingSlashCommand, StudioWorkflowCommandSlug } from "./gameStudio/catalog";
 import { looksLikeExistingPlanExecutionRequest } from "./runIntent";
 
 export type PlanStateHydrationReason =
   | "existing_plan_execution"
   | "resume_plan_semantic"
-  | "continuation_state"
-  | "studio_execution_command";
-
-export const DEFAULT_STUDIO_EXECUTION_HYDRATION_COMMANDS: readonly StudioWorkflowCommandSlug[] = [
-  "dev-story",
-  "story-done",
-  "sprint-status",
-  "story-readiness",
-  "smoke-check",
-  "regression-suite",
-  "release-checklist",
-  "launch-checklist",
-  "milestone-review",
-  "hotfix",
-  "day-one-patch",
-  "team-qa",
-] as const;
-
-const STUDIO_EXECUTION_HYDRATION_COMMAND_SET = new Set<StudioWorkflowCommandSlug>(
-  DEFAULT_STUDIO_EXECUTION_HYDRATION_COMMANDS,
-);
+  | "continuation_state";
 
 const RESUME_PLAN_SEMANTIC_PATTERNS = [
   /(?:继续|恢复|接着).{0,20}(?:执行|计划|任务)/i,
@@ -41,22 +20,14 @@ function looksLikeResumePlanSemantic(input: string): boolean {
   return RESUME_PLAN_SEMANTIC_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
-export function isStudioExecutionHydrationCommand(
-  command: PendingSlashCommand | null | undefined,
-): boolean {
-  return !!command && command.type === "workflow" && STUDIO_EXECUTION_HYDRATION_COMMAND_SET.has(command.slug);
-}
-
 export function resolvePlanStateHydrationReason(input: {
   text: string;
   hasPlanState: boolean;
   hasContinuationState: boolean;
-  slashCommand: PendingSlashCommand | null | undefined;
 }): PlanStateHydrationReason | null {
   if (input.hasPlanState) return null;
   if (looksLikeExistingPlanExecutionRequest(input.text)) return "existing_plan_execution";
   if (looksLikeResumePlanSemantic(input.text)) return "resume_plan_semantic";
   if (input.hasContinuationState) return "continuation_state";
-  if (isStudioExecutionHydrationCommand(input.slashCommand)) return "studio_execution_command";
   return null;
 }

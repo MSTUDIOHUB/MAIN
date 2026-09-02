@@ -27,9 +27,6 @@ import {
   shouldRequestSemanticTurnMetadataForTurn,
   type SessionTitleSeedState,
 } from "../intentTitlePolicy";
-import type { PendingSlashCommand } from "../gameStudio/catalog";
-import { parseGameStudioSlashCommand } from "../gameStudio/catalog";
-import { detectGameDevelopmentIntent, type GameDevelopmentIntentSignal } from "../gameStudio/detection";
 import type { MainModeKey } from "../mainModes";
 import {
   isMainIntentShortcutAllowedInMainMode,
@@ -87,7 +84,6 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   analyze: { zh: "分析", en: "Analyze" },
   summarize: { zh: "总结", en: "Summarize" },
   report: { zh: "报告", en: "Report" },
-  studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
   image_studio: { zh: "生成图片", en: "Generate Image" },
   goal: { zh: "目标", en: "Goal" },
 };
@@ -100,7 +96,6 @@ const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
   "analyze",
   "summarize",
   "report",
-  "studio_workflow",
   "image_studio",
   "goal",
 ]);
@@ -137,16 +132,7 @@ export function buildSubmitInputEnvelope(params: {
       : undefined
   );
   const currentMainModeKey = state.selectedMainModeKey;
-  const preParsedStudioCommand = currentMainModeKey === "game_studio"
-    ? parseGameStudioSlashCommand(text)
-    : null;
-  const preParsedStudioWorkflowArgs = preParsedStudioCommand?.type === "workflow"
-    ? preParsedStudioCommand.args
-    : "";
-  const languageResolutionInput =
-    preParsedStudioCommand?.type === "workflow"
-      ? (preParsedStudioWorkflowArgs || text)
-      : text;
+  const languageResolutionInput = text;
   const systemLanguage = state.config.language === "en" ? "en" : "zh";
   const preferredLanguage = isHidden
     ? state.preferredResponseLanguage
@@ -156,12 +142,6 @@ export function buildSubmitInputEnvelope(params: {
         systemLanguage,
         fallbackLanguage: systemLanguage,
       });
-  const cachedWorkspaceTreeForGameDetection =
-    state.currentWorkspace &&
-    params.cache.workspaceTreeCacheKey === state.currentWorkspace &&
-    params.cache.workspaceTreeCacheVersion === state.workspaceContentVersion
-      ? params.cache.workspaceTreeCache
-      : "";
 
   return {
     isHidden,
@@ -174,13 +154,8 @@ export function buildSubmitInputEnvelope(params: {
     remoteFeishu,
     hasSupplementalInput: mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0,
     currentMainModeKey,
-    preParsedStudioCommand,
-    preParsedStudioWorkflowArgs,
     languageResolutionInput,
     preferredLanguage,
-    cachedWorkspaceTreeForGameDetection,
-    shouldWarmWorkspaceTreeCache:
-      !cachedWorkspaceTreeForGameDetection && !!state.currentWorkspace?.trim(),
   };
 }
 
@@ -278,7 +253,6 @@ export interface SubmitPipelineOptions {
   intentSummary?: string;
   turnTitle?: string;
   skipIntentResolution?: boolean;
-  suppressGameStudioSuggestion?: boolean;
   skipAutoPlanHydration?: boolean;
   executionConsentGranted?: boolean;
   createVisibleTurnForHiddenMessage?: boolean;
@@ -329,14 +303,7 @@ export interface SubmitPipelineInput {
   /** Authorization restored only after matching the current queued message id. */
   validatedQueuedGoalCreationAuthorization?: GoalCreationAuthorization | null;
   snapshot: SubmitPipelineSnapshot;
-  workspaceTreeForGameDetection?: string;
   preferredLanguage?: "zh" | "en";
-  createGameStudioModeSwitchDecision?: (input: {
-    input: string;
-    images?: string[];
-    language: "zh" | "en";
-    signal: GameDevelopmentIntentSignal;
-  }) => PendingRunDecision;
 }
 
 export interface SubmitInputEnvelopeOptions {
@@ -366,11 +333,7 @@ export interface SubmitInputEnvelopeState {
   };
 }
 
-export interface SubmitInputEnvelopeCache {
-  workspaceTreeCacheKey: string;
-  workspaceTreeCacheVersion: number;
-  workspaceTreeCache: string;
-}
+export interface SubmitInputEnvelopeCache {}
 
 export interface SubmitInputEnvelope {
   isHidden: boolean;
@@ -383,12 +346,8 @@ export interface SubmitInputEnvelope {
   remoteFeishu?: FeishuRemoteContext;
   hasSupplementalInput: boolean;
   currentMainModeKey: MainModeKey;
-  preParsedStudioCommand: PendingSlashCommand | null;
-  preParsedStudioWorkflowArgs: string;
   languageResolutionInput: string;
   preferredLanguage: "zh" | "en";
-  cachedWorkspaceTreeForGameDetection: string;
-  shouldWarmWorkspaceTreeCache: boolean;
 }
 
 export interface SubmitPendingReviewDecision {
@@ -930,15 +889,8 @@ export function isExactQueuedMessageReplay(input: {
   );
 }
 
-export interface SubmitGameStudioModeSwitchDecision {
-  shouldConsider: boolean;
-  signal: GameDevelopmentIntentSignal | null;
-  pendingRunDecision: PendingRunDecision | null;
-}
-
 export type SubmitPipelineRouteKind =
   | "plan_hydration"
-  | "mode_switch_decision"
   | "agent_loop";
 
 export interface SubmitPipelineEffects {
@@ -954,12 +906,10 @@ export interface SubmitPipelineDecision {
   originalText: string;
   isHidden: boolean;
   hasSupplementalInput: boolean;
-  parsedStudioCommand: PendingSlashCommand | null;
   turnReuse: SubmitTurnReuseDecision;
   pendingReview: SubmitPendingReviewDecision;
   planHydration: SubmitPlanHydrationDecision;
   shortcuts: SubmitShortcutDecision;
-  gameStudioModeSwitch: SubmitGameStudioModeSwitchDecision;
   effects: SubmitPipelineEffects;
 }
 
@@ -968,7 +918,6 @@ export interface SubmitEffectiveIntentInput {
   preferredLanguage: "zh" | "en";
   options?: SubmitPipelineOptions;
   currentMainModeKey: MainModeKey;
-  parsedStudioCommand: PendingSlashCommand | null;
   isHidden: boolean;
   autoApproveTools: boolean;
   fallbackRunIntent: ResolvedRunIntent;
@@ -985,7 +934,6 @@ export interface SubmitEffectiveIntentInput {
   previousTurnContinuationIntent: ResolvedRunIntent | null;
   shouldReuseExistingTurnIntent: boolean;
   shouldExecuteOnceFromReplyOption: boolean;
-  unitySetupEngineSelected?: boolean;
 }
 
 export interface SubmitEffectiveIntentDecision {
@@ -1096,7 +1044,6 @@ export interface SubmitRunStatePatchInput<TConfig extends object> {
   preferredLanguage: "zh" | "en";
   shouldArchiveChoiceFeedback: boolean;
   currentNormalizedStreamState: NormalizedStreamState;
-  parsedStudioCommand: PendingSlashCommand | null;
   effectiveWorkflowMode: LegacyWorkflowMode;
   preservePlanState: boolean;
   shouldGrantExecutionConsentForTurn: boolean;
@@ -1109,7 +1056,6 @@ export type SubmitRunStatePatch<TConfig extends object> = {
   currentTurnId: string;
   input: string;
   preferredResponseLanguage: "zh" | "en";
-  pendingSlashCommand: PendingSlashCommand | null;
   lockedComposerIntent: null;
   pendingRunDecision: null;
   activeActionRequest: null;
@@ -1290,29 +1236,6 @@ export interface SubmitVisibleTurnPatchInput {
   createdAtMs: number;
 }
 
-export interface SubmitLocalStudioTurnPatchInput {
-  taskFlow: TaskBlock[];
-  conversationTurns: ConversationTurn[];
-  text: string;
-  systemContent: string;
-  turnId: string;
-  userBlockId: number | null;
-  systemBlockId: number;
-  userContextItems?: Extract<TaskBlock, { type: "user" }>["contextItems"];
-  isHidden: boolean;
-  reuseCurrentTurn: boolean;
-  parentPlanTurnId?: string;
-  parentPlanTurnDoneSummary: string;
-  effectiveRunIntent: ResolvedRunIntent;
-  effectiveDisplayIntent: ResolvedRunIntent;
-  effectiveIntentSummary: string;
-  effectiveCommandDirective: CommandDirective | null;
-  effectiveWorkflowMode: LegacyWorkflowMode;
-  turnTitle: string;
-  systemVariant?: Extract<TaskBlock, { type: "system" }>["variant"];
-  createdAtMs: number;
-}
-
 export interface SubmitVisibleTurnPatch {
   taskFlow: TaskBlock[];
   conversationTurns: ConversationTurn[];
@@ -1484,13 +1407,6 @@ export function resolveSubmitExistingTurnAdoptionDecision(params: {
   return { kind: "adopted", turnId, userBlockId };
 }
 
-export interface SubmitLocalStudioTurnPatch {
-  taskFlow: TaskBlock[];
-  conversationTurns: ConversationTurn[];
-  userBlock: Extract<TaskBlock, { type: "user" }> | null;
-  systemBlock: Extract<TaskBlock, { type: "system" }>;
-}
-
 export function resolveSubmitEffectiveIntentDecision(
   input: SubmitEffectiveIntentInput,
 ): SubmitEffectiveIntentDecision {
@@ -1498,8 +1414,6 @@ export function resolveSubmitEffectiveIntentDecision(
     text,
     preferredLanguage,
     options,
-    currentMainModeKey,
-    parsedStudioCommand,
     isHidden,
     autoApproveTools,
     fallbackRunIntent,
@@ -1514,7 +1428,6 @@ export function resolveSubmitEffectiveIntentDecision(
     previousTurnContinuationIntent,
     shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption,
-    unitySetupEngineSelected,
   } = input;
 
   let effectiveRunIntent: ResolvedRunIntent =
@@ -1550,10 +1463,9 @@ export function resolveSubmitEffectiveIntentDecision(
   if (
     shouldExecuteOnceFromReplyOption &&
     !isGoalContinuationAuthorization(input.goalContinuationAuthorization) &&
-    effectiveRunIntent !== "execute" &&
-    effectiveRunIntent !== "studio_workflow"
+    effectiveRunIntent !== "execute"
   ) {
-    effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
+    effectiveRunIntent = "execute";
     effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
       source: "continuation",
     });
@@ -1568,10 +1480,9 @@ export function resolveSubmitEffectiveIntentDecision(
   }
 
   if (shouldForceExecuteForAutoApprove) {
-    effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
+    effectiveRunIntent = "execute";
     effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
       source: "natural_language",
-      parsedStudioCommand,
     });
     effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
       input: text,
@@ -1581,26 +1492,6 @@ export function resolveSubmitEffectiveIntentDecision(
         ? "Auto-approval is enabled, so this turn uses execution semantics instead of natural chat."
         : "自动审批已开启，本轮按执行语义处理，而不是普通聊天。",
     });
-  }
-
-  if (!effectiveCommandDirective && parsedStudioCommand?.type === "workflow") {
-    effectiveCommandDirective = inferCommandDirective(text, "studio_workflow", {
-      source: "studio_slash",
-      parsedStudioCommand,
-    });
-  }
-
-  if (unitySetupEngineSelected) {
-    effectiveCommandDirective = {
-      kind: "unity",
-      action: "setup-engine",
-      target: "unity",
-      source: "studio_slash",
-      requiresWorkspace: true,
-      requiresApproval: false,
-      confidence: 0.98,
-      reason: "Game Studio setup-engine explicitly selected Unity.",
-    };
   }
 
   if (mainDebugShortcut && !effectiveIntentSummary) {
@@ -1665,7 +1556,6 @@ function commandDirectiveLooksOperational(commandDirective: CommandDirective): b
     commandDirective.kind === "shell" ||
     commandDirective.kind === "git" ||
     commandDirective.kind === "unity" ||
-    commandDirective.kind === "studio" ||
     commandDirective.kind === "mcp"
   );
 }
@@ -1676,7 +1566,6 @@ export function resolveSubmitExecutionApprovalDecision(params: {
   preferredLanguage: "zh" | "en";
   resolution: RunIntentResolution;
   effectiveCommandDirective: CommandDirective | null;
-  isLocalFastStudioCommand: boolean;
 }): SubmitExecutionApprovalDecision {
   const {
     text,
@@ -1684,16 +1573,14 @@ export function resolveSubmitExecutionApprovalDecision(params: {
     preferredLanguage,
     resolution,
     effectiveCommandDirective,
-    isLocalFastStudioCommand,
   } = params;
   const locallyRequiresExecutionApproval =
     resolution.requiresApproval === true ||
     (effectiveCommandDirective ? commandDirectiveLooksOperational(effectiveCommandDirective) : false);
 
   if (
-    (resolution.intent === "execute" || resolution.intent === "studio_workflow") &&
-    locallyRequiresExecutionApproval &&
-    !isLocalFastStudioCommand
+    resolution.intent === "execute" &&
+    locallyRequiresExecutionApproval
   ) {
     return {
       locallyRequiresExecutionApproval,
@@ -1726,7 +1613,6 @@ export function resolveSubmitRuntimeDecision(params: {
   executionConsentGranted?: boolean;
   shouldExecuteOnceFromReplyOption: boolean;
   preservePlanState: boolean;
-  isLocalStudioCommand: boolean;
   goalCreationAuthorization?: GoalCreationAuthorization | null;
   goalContinuationAuthorization?: GoalContinuationAuthorization | null;
   /** A reserved Plan attempt must not inherit generic auto-approval. */
@@ -1741,7 +1627,7 @@ export function resolveSubmitRuntimeDecision(params: {
       ? "goal"
       : params.runtimeIntentOverride ||
     (params.shouldExecuteOnceFromReplyOption && params.effectiveRunIntent !== "plan"
-      ? params.currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
+      ? "execute"
       : params.effectiveRunIntent);
   const runtimeRunIntent = requestedRuntimeRunIntent === "goal" &&
     !isGoalCreationAuthorization(params.goalCreationAuthorization) &&
@@ -1767,7 +1653,7 @@ export function resolveSubmitRuntimeDecision(params: {
       params.effectiveRunIntent === "plan" && !params.isPlanApproved
         ? "planning"
         : "executing",
-    shouldResetPlanState: !params.preservePlanState && !params.isLocalStudioCommand,
+    shouldResetPlanState: !params.preservePlanState,
   };
 }
 
@@ -2123,9 +2009,7 @@ export function resolveSubmitPreflightResultDecision(params: {
   preflight: IntentPreflightResult | null;
 }): SubmitPreflightResultDecision {
   const { text, images, preferredLanguage, resolution, preflight } = params;
-  const resolvedByPreflight =
-    preflight?.intent === "studio_workflow" ? resolution.intent : preflight?.intent;
-  const resolvedIntent = (resolvedByPreflight || resolution.intent) as ResolvedRunIntent;
+  const resolvedIntent = (preflight?.intent || resolution.intent) as ResolvedRunIntent;
   const commandDirective =
     preflight?.commandDirective ||
     resolution.commandDirective ||
@@ -2134,7 +2018,6 @@ export function resolveSubmitPreflightResultDecision(params: {
     !!preflight &&
     (
       resolvedIntent === "execute" ||
-      resolvedIntent === "studio_workflow" ||
       commandDirectiveLooksOperational(commandDirective)
     );
 
@@ -2806,129 +2689,6 @@ export function buildSubmitVisibleTurnPatch(
   };
 }
 
-function autoCollapsePreviousTurnForLocalStudioTurn(params: {
-  turns: ConversationTurn[];
-  isHidden: boolean;
-  reuseCurrentTurn: boolean;
-}): ConversationTurn[] {
-  if (params.isHidden || params.reuseCurrentTurn || params.turns.length === 0) return params.turns;
-  const previousTurnIndex = params.turns.length - 1;
-  const previousTurn = params.turns[previousTurnIndex];
-  if (!previousTurn || (previousTurn.processCollapsed ?? previousTurn.collapsed)) return params.turns;
-  return params.turns.map((turn, index) =>
-    index === previousTurnIndex ? { ...turn, processCollapsed: true, collapsed: true } : turn,
-  );
-}
-
-function markParentPlanTurnDoneForLocalStudioTurn(
-  turns: ConversationTurn[],
-  parentPlanTurnId: string | undefined,
-  summary: string,
-): ConversationTurn[] {
-  if (!parentPlanTurnId) return turns;
-  return turns.map((turn) =>
-    turn.id === parentPlanTurnId
-      ? {
-          ...turn,
-          status: "done" as const,
-          summary,
-        }
-      : turn,
-  );
-}
-
-export function buildSubmitLocalStudioTurnPatch(
-  params: SubmitLocalStudioTurnPatchInput,
-): SubmitLocalStudioTurnPatch {
-  if (!params.isHidden && params.userBlockId == null) {
-    throw new Error("userBlockId is required for visible local studio turns");
-  }
-
-  const userBlock: Extract<TaskBlock, { type: "user" }> | null = params.isHidden
-    ? null
-    : {
-        id: params.userBlockId!,
-        turnId: params.turnId,
-        type: "user",
-        content: params.text,
-        ...(params.userContextItems && params.userContextItems.length > 0
-          ? { contextItems: params.userContextItems }
-          : {}),
-      };
-  const systemBlock: Extract<TaskBlock, { type: "system" }> = {
-    id: params.systemBlockId,
-    turnId: params.turnId,
-    type: "system",
-    content: params.systemContent,
-    ...(params.systemVariant ? { variant: params.systemVariant } : {}),
-  };
-
-  const taskFlow = [
-    ...params.taskFlow,
-    ...(userBlock ? [userBlock] : []),
-    systemBlock,
-  ];
-
-  if (params.reuseCurrentTurn) {
-    return {
-      taskFlow,
-      conversationTurns: params.conversationTurns.map((turn) =>
-        turn.id === params.turnId
-          ? {
-              ...turn,
-              status: "done",
-              displayIntent: params.effectiveDisplayIntent,
-              intentSummary: turn.intentSummary || params.effectiveIntentSummary,
-              commandDirective: turn.commandDirective || params.effectiveCommandDirective || undefined,
-              blockIds: [
-                ...turn.blockIds,
-                ...(userBlock ? [userBlock.id] : []),
-                systemBlock.id,
-              ].filter((value, index, array) => array.indexOf(value) === index),
-            }
-          : turn,
-      ),
-      userBlock,
-      systemBlock,
-    };
-  }
-
-  const baseTurns = markParentPlanTurnDoneForLocalStudioTurn(
-    autoCollapsePreviousTurnForLocalStudioTurn({
-      turns: params.conversationTurns,
-      isHidden: params.isHidden,
-      reuseCurrentTurn: params.reuseCurrentTurn,
-    }),
-    params.parentPlanTurnId,
-    params.parentPlanTurnDoneSummary,
-  );
-  return {
-    taskFlow,
-    conversationTurns: [
-      ...baseTurns,
-      {
-        id: params.turnId,
-        userPrompt: params.text,
-        title: params.turnTitle,
-        intentSummary: params.effectiveIntentSummary,
-        commandDirective: params.effectiveCommandDirective || undefined,
-        ...(params.parentPlanTurnId ? { parentPlanTurnId: params.parentPlanTurnId } : {}),
-        mode: params.effectiveWorkflowMode,
-        intent: params.effectiveRunIntent,
-        displayIntent: params.effectiveDisplayIntent,
-        status: "done",
-        summary: params.systemContent,
-        blockIds: [...(userBlock ? [userBlock.id] : []), systemBlock.id],
-        processCollapsed: false,
-        collapsed: false,
-        createdAt: params.createdAtMs,
-      },
-    ],
-    userBlock,
-    systemBlock,
-  };
-}
-
 export function buildSubmitRunStatePatch<TConfig extends object>(
   params: SubmitRunStatePatchInput<TConfig>,
 ): SubmitRunStatePatch<TConfig> {
@@ -2948,8 +2708,6 @@ export function buildSubmitRunStatePatch<TConfig extends object>(
           },
         }
       : {}),
-    pendingSlashCommand:
-      params.parsedStudioCommand?.type === "workflow" ? params.parsedStudioCommand : null,
     lockedComposerIntent: null,
     pendingRunDecision: null,
     activeActionRequest: null,
@@ -3246,10 +3004,7 @@ export function resolveSubmitTurnReuseDecision(input: {
     !input.isHidden &&
     !shouldRouteContinuationToPlanResume &&
     !shouldContinuePlanIntent &&
-    (
-      input.currentMainModeKey === "main_mode" ||
-      (input.currentMainModeKey === "game_studio" && (currentTurnIntent === "plan" || hasPlanArtifacts))
-    );
+    input.currentMainModeKey === "main_mode";
   const previousTurnContinuationTarget =
     shouldAllowPreviousTurnContinuation
       ? findPreviousTurnContinuationTarget(
@@ -3369,7 +3124,6 @@ export function resolveSubmitPlanHydrationDecision(input: {
   planTasksCount: number;
   planStage: PlanStage;
   isPlanApproved: boolean;
-  parsedStudioCommand: PendingSlashCommand | null;
 }): SubmitPlanHydrationDecision {
   const hasRuntimePlanState =
     input.planArtifactsCount > 0 ||
@@ -3386,7 +3140,6 @@ export function resolveSubmitPlanHydrationDecision(input: {
           text: input.text,
           hasPlanState: hasRuntimePlanState,
           hasContinuationState: input.isPlanApproved || input.planStage === "executing",
-          slashCommand: input.parsedStudioCommand,
         })
       : null,
   };
@@ -3458,82 +3211,6 @@ export function resolveSubmitShortcutDecision(input: {
   };
 }
 
-export function shouldConsiderSubmitGameStudioSuggestion(input: {
-  isHidden: boolean;
-  currentMainModeKey: MainModeKey;
-  hasPendingRunDecision: boolean;
-  hasMainDebugShortcut: boolean;
-  hasMainIntentShortcut: boolean;
-  hasLockedComposerIntent: boolean;
-  skipIntentResolution?: boolean;
-  resolvedIntent?: ResolvedRunIntent;
-  shouldContinuePlanIntent: boolean;
-  shouldContinuePreviousTurnIntent: boolean;
-  shouldReuseExistingTurnIntent: boolean;
-  suppressGameStudioSuggestion?: boolean;
-  text: string;
-  hasPlanArtifacts: boolean;
-  planStage: PlanStage;
-  isPlanApproved: boolean;
-}): boolean {
-  if (input.isHidden) return false;
-  if (input.currentMainModeKey !== "main_mode") return false;
-  if (input.hasPendingRunDecision) return false;
-  if (input.hasMainDebugShortcut || input.hasMainIntentShortcut || input.hasLockedComposerIntent) return false;
-  if (input.skipIntentResolution || input.resolvedIntent || input.suppressGameStudioSuggestion) return false;
-  if (input.shouldContinuePlanIntent || input.shouldContinuePreviousTurnIntent || input.shouldReuseExistingTurnIntent) return false;
-  if (looksLikePlanContinuationOrApprovalInput(input.text, {
-    hasPlanArtifacts: input.hasPlanArtifacts,
-    planStage: input.planStage,
-    isPlanApproved: input.isPlanApproved,
-  })) return false;
-  return true;
-}
-
-export function resolveSubmitGameStudioModeSwitchDecision(input: {
-  text: string;
-  images?: string[];
-  language: "zh" | "en";
-  workspaceTreeForGameDetection?: string;
-  createGameStudioModeSwitchDecision?: SubmitPipelineInput["createGameStudioModeSwitchDecision"];
-  isHidden: boolean;
-  currentMainModeKey: MainModeKey;
-  hasPendingRunDecision: boolean;
-  hasMainDebugShortcut: boolean;
-  hasMainIntentShortcut: boolean;
-  hasLockedComposerIntent: boolean;
-  skipIntentResolution?: boolean;
-  resolvedIntent?: ResolvedRunIntent;
-  shouldContinuePlanIntent: boolean;
-  shouldContinuePreviousTurnIntent: boolean;
-  shouldReuseExistingTurnIntent: boolean;
-  suppressGameStudioSuggestion?: boolean;
-  hasPlanArtifacts: boolean;
-  planStage: PlanStage;
-  isPlanApproved: boolean;
-}): SubmitGameStudioModeSwitchDecision {
-  const shouldConsider = shouldConsiderSubmitGameStudioSuggestion(input);
-  if (!shouldConsider) {
-    return { shouldConsider, signal: null, pendingRunDecision: null };
-  }
-  const signal = detectGameDevelopmentIntent(input.text, {
-    workspaceTree: input.workspaceTreeForGameDetection || "",
-  });
-  if (!signal.shouldSuggest || !input.createGameStudioModeSwitchDecision) {
-    return { shouldConsider, signal, pendingRunDecision: null };
-  }
-  return {
-    shouldConsider,
-    signal,
-    pendingRunDecision: input.createGameStudioModeSwitchDecision({
-      input: input.text,
-      images: input.images,
-      language: input.language,
-      signal,
-    }),
-  };
-}
-
 export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitPipelineDecision {
   const snapshot = input.snapshot;
   const options = input.options || {};
@@ -3566,9 +3243,6 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     planStage: snapshot.planStage,
     isPlanApproved: snapshot.isPlanApproved,
   });
-  const parsedStudioCommand = snapshot.selectedMainModeKey === "game_studio"
-    ? parseGameStudioSlashCommand(input.text)
-    : null;
   const planHydration = resolveSubmitPlanHydrationDecision({
     text: input.text,
     isHidden,
@@ -3578,7 +3252,6 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     planTasksCount: snapshot.planTasksCount || 0,
     planStage: snapshot.planStage,
     isPlanApproved: snapshot.isPlanApproved,
-    parsedStudioCommand,
   });
   const shortcuts = resolveSubmitShortcutDecision({
     text: input.text,
@@ -3591,36 +3264,12 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     validatedQueuedGoalCreationAuthorization: input.validatedQueuedGoalCreationAuthorization,
     isQueuedReplay: !!options.queuedUserMessageId,
   });
-  const gameStudioModeSwitch = resolveSubmitGameStudioModeSwitchDecision({
-    text: shortcuts.textAfterIntentShortcut,
-    images: input.images,
-    language: input.preferredLanguage || "zh",
-    workspaceTreeForGameDetection: input.workspaceTreeForGameDetection,
-    createGameStudioModeSwitchDecision: input.createGameStudioModeSwitchDecision,
-    isHidden,
-    currentMainModeKey: snapshot.selectedMainModeKey,
-    hasPendingRunDecision: !!snapshot.pendingRunDecision,
-    hasMainDebugShortcut: !!shortcuts.mainDebugShortcut,
-    hasMainIntentShortcut: !!shortcuts.mainIntentShortcut,
-    hasLockedComposerIntent: !!shortcuts.lockedComposerIntent,
-    skipIntentResolution: options.skipIntentResolution,
-    resolvedIntent: options.resolvedIntent,
-    shouldContinuePlanIntent: turnReuse.shouldContinuePlanIntent,
-    shouldContinuePreviousTurnIntent: turnReuse.shouldContinuePreviousTurnIntent,
-    shouldReuseExistingTurnIntent: turnReuse.shouldReuseExistingTurnIntent,
-    suppressGameStudioSuggestion: options.suppressGameStudioSuggestion,
-    hasPlanArtifacts: turnReuse.hasPlanArtifacts,
-    planStage: snapshot.planStage,
-    isPlanApproved: snapshot.isPlanApproved,
-  });
   const hasSupplementalInput =
     (snapshot.contextMentions?.length || 0) > 0 ||
     (snapshot.attachedFilesCount || 0) > 0;
   const routeKind: SubmitPipelineRouteKind =
     planHydration.reason
       ? "plan_hydration"
-      : gameStudioModeSwitch.pendingRunDecision
-      ? "mode_switch_decision"
       : "agent_loop";
   return {
     routeKind,
@@ -3628,15 +3277,12 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     originalText,
     isHidden,
     hasSupplementalInput,
-    parsedStudioCommand,
     turnReuse,
     pendingReview,
     planHydration,
     shortcuts,
-    gameStudioModeSwitch,
     effects: {
       ...(pendingReview.shouldAbortAndStartNewTurn ? { abortPendingReview: pendingReview } : {}),
-      ...(gameStudioModeSwitch.pendingRunDecision ? { setPendingDecision: gameStudioModeSwitch.pendingRunDecision } : {}),
       ...(planHydration.reason ? { startAutoPlanHydration: planHydration.reason } : {}),
       ...(routeKind === "agent_loop" ? { launchAgentLoop: true } : {}),
     },

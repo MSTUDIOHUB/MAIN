@@ -420,6 +420,9 @@ export async function loadResolvedInstructions(
     immutableWorkspace,
   );
   for (const templatePath of templateFiles) {
+    // Older releases may have copied the removed mode's private template pack
+    // into a user workspace. Preserve those files on disk, but never revive
+    // them as ordinary MAIN instructions after the mode has been removed.
     if (normalizePath(templatePath).startsWith(".MAIN/templates/game-studio/")) {
       continue;
     }

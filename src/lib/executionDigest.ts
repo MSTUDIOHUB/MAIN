@@ -30,7 +30,6 @@ function resolveGoalLabel(intent: ResolvedUserIntent, language: "zh" | "en"): st
       case "analyze": return "完成只读分析与诊断";
       case "summarize": return "提炼关键信息与结论";
       case "report": return "形成结构化报告";
-      case "studio_workflow": return "推进 Game Studio 执行链路";
       case "goal": return "自主迭代推进目标";
       default: return "推进实现与验证";
     }
@@ -40,7 +39,6 @@ function resolveGoalLabel(intent: ResolvedUserIntent, language: "zh" | "en"): st
     case "analyze": return "complete read-only analysis";
     case "summarize": return "deliver concise summary";
     case "report": return "deliver a structured report";
-    case "studio_workflow": return "advance Game Studio execution";
     case "goal": return "autonomous goal iteration";
     default: return "advance implementation and verification";
   }

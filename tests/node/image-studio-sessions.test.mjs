@@ -62,6 +62,19 @@ const {
   findLatestSessionForAffinity,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/imageStudioSessions.ts"));
 
+const {
+  MAIN_MODE_KEYS,
+  mapLegacyNexusModeToMainMode,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/mainModes.ts"));
+
+test("MAIN mode migration accepts legacy Studio values but never writes them", () => {
+  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "image_studio"]);
+  assert.equal(mapLegacyNexusModeToMainMode("game_studio"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("nexus_game_studio"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("role_architect"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("image_studio"), "image_studio");
+});
+
 test("resolveSessionModeAffinity prefers explicit session affinity", () => {
   assert.equal(resolveSessionModeAffinity({ sessionModeAffinity: "image_studio" }, "main_mode"), "image_studio");
   assert.equal(resolveSessionModeAffinity({
@@ -69,7 +82,12 @@ test("resolveSessionModeAffinity prefers explicit session affinity", () => {
       sessionModeAffinity: "game_studio",
       selectedMainModeKey: "main_mode",
     },
-  }, "main_mode"), "game_studio");
+  }, "main_mode"), "main_mode");
+  assert.equal(resolveSessionModeAffinity({
+    runtimeSnapshot: {
+      selectedNexusModeKey: "nexus_game_studio",
+    },
+  }, "image_studio"), "main_mode");
   assert.equal(resolveSessionModeAffinity({}, "main_mode"), "main_mode");
 });
 
@@ -93,5 +111,5 @@ test("findLatestSessionForAffinity returns the most recent matching session and 
 
   assert.equal(findLatestSessionForAffinity(sessions, "image_studio")?.id, 13);
   assert.equal(findLatestSessionForAffinity(sessions, "image_studio", { excludeSessionId: 13 })?.id, 12);
-  assert.equal(findLatestSessionForAffinity(sessions, "main_mode")?.id, 11);
+  assert.equal(findLatestSessionForAffinity(sessions, "main_mode")?.id, 14);
 });

@@ -44,6 +44,18 @@ export type RuntimeV2TransportVariant =
   | "native_auto"
   | "text_envelope";
 
+export type RuntimeV2AcceptanceEvidenceRequirement =
+  | "static"
+  | "behavioral"
+  | "interaction";
+
+/** `null` is the durable JSON representation of an unclassified criterion.
+ * The acceptance gate gives it the same provider-neutral semantics as an
+ * absent requirement: any real finite validator may cover the criterion. */
+export type RuntimeV2AcceptanceEvidenceRequirementSlot =
+  | RuntimeV2AcceptanceEvidenceRequirement
+  | null;
+
 export type RuntimeV2SubagentHandoffApplicationSource =
   | "provider_result"
   | "command"
@@ -97,11 +109,10 @@ export interface RuntimeV2Objective {
    * criterion ids; direct Execute uses one id for the complete user request. */
   readonly acceptanceCriterionIds?: readonly string[];
   /** Runtime-owned lower bound. A provider may request stronger evidence in
-   * the execution contract, but it cannot downgrade a user-visible objective
-   * to a static build receipt. */
-  readonly acceptanceEvidenceRequirements?: readonly (
-    "static" | "behavioral" | "interaction"
-  )[];
+   * the execution contract, but it cannot downgrade an explicitly typed
+   * user-visible objective. `null` preserves an unclassified Direct Execute
+   * criterion without inventing a semantic class from prose. */
+  readonly acceptanceEvidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
 }
 
 export interface RuntimeV2EvidenceReference {

@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@source not "./gameStudioPack/workspace-files/**/*.md";
 
 :root {
   --surface-0: #111112;

@@ -23,7 +23,6 @@ export * from "./subagents";
 export * from "./subagentEvidence";
 export * from "./subagentReport";
 export * from "./subagentHandoff";
-export * from "./studio";
 export * from "./terminal";
 export * from "./validationReceipt";
 export * from "./workPlan";

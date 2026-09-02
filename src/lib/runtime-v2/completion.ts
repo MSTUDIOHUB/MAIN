@@ -21,10 +21,9 @@ export interface RuntimeV2CompletionDecision {
 }
 
 /**
- * A tool-free response is the provider's voluntary loop-completion signal in
- * every Execute decision mode. Protocol diagnostics are deliberately excluded:
- * the adapter may rewrite a rejected duplicate into an empty response, but
- * that feedback receipt is not a provider-authored conclusion.
+ * Only the evidence-ready `conclude` request may supply terminal provider text.
+ * A tool-free `execute` or `validate` response is recovery input, even when it
+ * contains polished prose. Protocol diagnostics are excluded from both paths.
  */
 export function latestRuntimeV2ProviderConclusionText(
   aggregate: TurnAggregateV1,
@@ -46,7 +45,7 @@ export function latestRuntimeV2ProviderConclusionText(
     if (event.type !== "provider.responded") continue;
     const mode = scheduledModes.get(event.idempotencyKey) || "";
     if (
-      !["execute", "validate", "conclude"].includes(mode) ||
+      mode !== "conclude" ||
       event.result.toolCalls.length > 0 ||
       event.result.diagnostics.length > 0
     ) {
@@ -76,10 +75,9 @@ export function exhaustedRuntimeV2ResultKind(
 
 /**
  * Determine only outcomes that the runtime can prove from structured facts.
- * A provider response without a tool call is the ordinary agent-loop finish
- * signal. The Runtime never upgrades its prose into success: structured
- * mutation and validation facts still decide whether that finish is success,
- * partial, or error.
+ * A provider response without a tool call is a finish signal only after the
+ * evidence gate selected `conclude`. The Runtime never upgrades prose into
+ * success: structured mutation and validation facts still decide the outcome.
  */
 export function decideRuntimeV2TerminalOutcome(
   aggregate: TurnAggregateV1,

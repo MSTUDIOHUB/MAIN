@@ -40,10 +40,11 @@ async function loadInstructionsModule(ipcStubs) {
   return module.exports;
 }
 
-test("loadResolvedInstructions keeps normal MAIN templates but skips game-studio templates", async () => {
+test("loadResolvedInstructions keeps ordinary templates but tombstones the removed Studio pack", async () => {
   const files = {
     ".MAIN/templates/plan/design.md": "---\npaths:\n  - src/**\n---\n# Design Template",
-    ".MAIN/templates/game-studio/gdd.md": "# GDD Template",
+    ".MAIN/templates/game/design.md": "# Game Design Template",
+    ".MAIN/templates/game-studio/gdd.md": "# Removed Studio Template",
   };
   const workspaceCalls = [];
 
@@ -66,9 +67,13 @@ test("loadResolvedInstructions keeps normal MAIN templates but skips game-studio
 
   const resolved = await loadResolvedInstructions("/tmp/workspace", [], ["src/main.ts"]);
 
-  assert.equal(resolved.templates.length, 1);
+  assert.equal(resolved.templates.length, 2);
   assert.equal(resolved.templates[0].source.path, ".MAIN/templates/plan/design.md");
   assert.match(resolved.templates[0].content, /Design Template/);
+  assert.equal(
+    resolved.templates.some((template) => template.source.path === ".MAIN/templates/game/design.md"),
+    true,
+  );
   assert.equal(
     resolved.templates.some((template) => template.source.path === ".MAIN/templates/game-studio/gdd.md"),
     false,

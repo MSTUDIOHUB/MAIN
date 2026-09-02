@@ -257,14 +257,6 @@ Plan 审核是 canonical state 的非终态投影：当 checkpoint 表明 `planR
 
 对所有已加载且有权威 `turn.completed` 结论的 Turn，恢复投影都保证 exactly one 非流式、非空 `assistant_final`，不以 Harness marker 是否存在为前提：最后一条 final 是权威，较早的重复 final 降为 `assistant_update`；若 final 缺失，则生成恢复结论并把新块加入该 Turn 的 `blockIds`，同时投影 `done` 与 completed runtime outcome。不得从其他 Turn 的相似文本借用最终答复。
 
-Game Studio `local_fast` slash 也遵守同一可见结论契约：成功、错误和取消都必须产生唯一 `assistant_final`。bridge 在开始时捕获不可变的 Turn、receipt 和 user-block 身份；只有它们仍精确匹配时才在原 Turn 原位收口。如果异步工作期间 adoption 已漂移，bridge 保留原 Turn，另建带父 Run 身份的隔离 presentation-recovery Turn/Run，在其中投影最终说明；不得为补最终块而重跑 slash 命令或其本地副作用。
-
-普通 local-fast append 只在仍拥有 `currentTurnId` 或当前没有 owner 时才清理全局输入、待决策和 generating 等控制面，不得覆盖异步期间新启动的 Turn。bridge 会把唯一 final、runtime outcome、`run.completed` 与 `turn.completed` 组成同一个原子内存投影，再执行有界的 Session 持久化屏障；队头 receipt 在该屏障被验证前保持 `dispatching`。
-
-持久化不会无限占住回合：local-fast 对持久化采用有限次数重试，并让副作用持久化、终态投影与可见修复共享一个整体执行期限；真实 Project Session owner queue 也有独立的五秒 mutation lease，Rust CAS 的写入截止时间早于 JavaScript 队列释放时间。若持久化仍不可用，运行时发布明确标记为 `temporary` 的内存结论并释放当前执行 lease/FIFO，不把局部存储故障提升为应用级 `failed`。停止发生在本地副作用提交前时可以形成 `canceled`；副作用已经提交后，迟到停止不能把已确认结果改写成取消。
-
-同进程若丢失 local-fast lease，分发器只会验证已有结论或生成隔离结论，不会再次调用 handler。真正冷恢复时，当前版本没有副作用前的 durable execution fence，因而无法无损区分“尚未执行”和“已经执行但结论未落盘”；所有仍未解决的 local-fast `queued` / `dispatching` receipt 都按 at-most-once 原则隔离为可见 `error` 结论（身份冲突时使用 recovery child）并退队，绝不自动重放副作用。用户可以用一个新 Turn 明确重试。要实现无损自动重试，必须先增加副作用前的持久化 execution fence，不能从现有快照猜测。
-
 ## 相关代码
 
 - `src/lib/turnEvents.ts`

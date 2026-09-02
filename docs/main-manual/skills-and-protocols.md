@@ -5,7 +5,7 @@ description: "使用 Agent Skills、工作区 SKILL.md 和协议包扩展 MAIN�
 category: "platforms-integrations"
 order: 40
 status: "draft"
-sourceFeature: "SkillsPromptModal、protocol import、Game Studio pack"
+sourceFeature: "SkillsPromptModal、protocol import、load_skill"
 ---
 
 # 技能与协议包
@@ -18,7 +18,7 @@ MAIN 的 Agent Skill 是一组可复用工作流说明。启用后，Runtime 在
 
 - 团队有固定规范。
 - 某类任务经常重复。
-- 需要导入 Game Studio 等协议包。
+- 需要把可复用说明和支持文件作为协议包导入工作区。
 
 ## 前置条件
 
@@ -63,6 +63,5 @@ MAIN 的 Agent Skill 是一组可复用工作流说明。启用后，Runtime 在
 
 ## 下一步
 
-- 阅读 [Game Studio](game-studio.md)，查看协议包例子。
 - 阅读 [MCP 服务器](mcp.md)，为工具能力提供外部执行端。
 - 阅读 [设置参考](settings-reference.md)，找到 Skills 入口。

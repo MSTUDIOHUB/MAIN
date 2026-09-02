@@ -516,7 +516,7 @@ const EXPLORING_TOOL_NAMES = new Set([
   "get_file_outline",
 ]);
 
-const GAME_STUDIO_ACTIVITY_TOOL_NAMES = new Set([
+const GAME_ENGINE_EDITOR_ACTIVITY_TOOL_NAMES = new Set([
   "find_gameobjects",
   "find_in_file",
   "execute_code",
@@ -527,6 +527,17 @@ const GAME_STUDIO_ACTIVITY_TOOL_NAMES = new Set([
   "manage_scene",
   "refresh_unity",
 ]);
+
+function isGameEngineEditorActivityTool(block: any): boolean {
+  const semanticName = getSemanticToolName(block).toLowerCase();
+  if (GAME_ENGINE_EDITOR_ACTIVITY_TOOL_NAMES.has(semanticName)) return true;
+  if (/^(?:unity|godot|unreal)(?:_|$)/.test(semanticName)) return true;
+
+  const canonicalSegments = String(block?.toolName || "").toLowerCase().split("__");
+  return canonicalSegments[0] === "mcp" && canonicalSegments
+    .slice(1, 3)
+    .some((segment) => /(?:^|[-_])(?:unity|godot|unreal)(?:[-_]|$)/.test(segment));
+}
 
 const EDIT_ACTIVITY_TOOL_NAMES = new Set([
   "replace_in_file",
@@ -587,7 +598,10 @@ function classifyBlockActivityKind(block: any): ActivityCellKind {
   if (isReviewablePlanBlock(block)) return "plan";
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
-    return classifyToolActivityKind(getSemanticToolName(block), status);
+    const kind = classifyToolActivityKind(getSemanticToolName(block), status);
+    return kind === "message" && isGameEngineEditorActivityTool(block)
+      ? "command"
+      : kind;
   }
   if (isProgressBlock(block)) {
     const toolName = getSemanticToolName(block);
@@ -1681,8 +1695,8 @@ function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnAr
   if (current.kind === "thinking" || next.kind === "thinking") return false;
   if (current.kind === "message" || next.kind === "message") return false;
   if (
-    current.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(item))) ||
-    next.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(item)))
+    current.items.some(isGameEngineEditorActivityTool) ||
+    next.items.some(isGameEngineEditorActivityTool)
   ) {
     return false;
   }
@@ -1774,18 +1788,18 @@ function makeStep(input: {
       ? "blocked"
       : semanticKind;
     const target = compactTarget(block, language);
-    const isGameStudioTool = GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(getSemanticToolName(block));
+    const isGameEngineTool = isGameEngineEditorActivityTool(block);
     return {
       id: `turn-archive-step-${kind}-${block.id ?? index}`,
-      kind: isGameStudioTool && kind === "message" ? "command" : kind,
+      kind: isGameEngineTool && kind === "message" ? "command" : kind,
       status,
-      intent: resolveToolIntent(block, isGameStudioTool && kind === "message" ? "command" : kind, language),
+      intent: resolveToolIntent(block, isGameEngineTool && kind === "message" ? "command" : kind, language),
       why: "",
       action: "",
       result: "",
       next: "",
       note: "",
-      summary: isGameStudioTool ? getToolPresentationLabel(String(block.toolName || ""), language) : "",
+      summary: isGameEngineTool ? getToolPresentationLabel(getSemanticToolName(block), language) : "",
       ...(phase ? { phase } : {}),
       targets: target ? [target] : [],
       items: [block],

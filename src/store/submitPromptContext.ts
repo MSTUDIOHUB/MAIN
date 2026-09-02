@@ -125,7 +125,7 @@ function applyPreviousTurnContinuationPrompt(input: BuildSubmitPromptContextInpu
   if (!input.shouldContinuePreviousTurnIntent || !target) return userContent;
   const originalPrompt = target.userPrompt?.trim();
   const executionHint =
-    input.effectiveRunIntent === "execute" || input.effectiveRunIntent === "studio_workflow"
+    input.effectiveRunIntent === "execute"
       ? input.preferredLanguage === "en"
         ? "If the unfinished next step is running, testing, verifying, or executing a command, issue the real tool call now: prefer `run_command` for finite checks/tests, and use `execute_command` only for long-running or interactive validation."
         : "如果未完成的下一步是运行、测试、验证或执行命令，现在必须发起真实工具调用：一次性检查/测试优先用 `run_command`，长驻或交互式验证才用 `execute_command`。"
@@ -164,7 +164,7 @@ function applyPreviousTurnContinuationPrompt(input: BuildSubmitPromptContextInpu
 function applyOperationApprovalPrompt(input: BuildSubmitPromptContextInput, userContent: string): string {
   if (
     !input.shouldExecuteOnceFromReplyOption ||
-    (input.effectiveRunIntent !== "execute" && input.effectiveRunIntent !== "studio_workflow")
+    input.effectiveRunIntent !== "execute"
   ) {
     return userContent;
   }

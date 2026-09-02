@@ -26,7 +26,7 @@ const SKIP_ENTRY_NAMES = new Set([
 ]);
 
 export function shouldHideWorkspaceEntry(name: string, isDir: boolean): boolean {
-  // 隐藏目录（例如 .MAIN / .protocols）需要保留给 Game Studio 访问。
+  // 隐藏目录（例如 .MAIN / .protocols）承载 MAIN 的工作区规则与协议。
   if (SKIP_ENTRY_NAMES.has(name)) return true;
   return isDir && SKIP_DIRS.has(name);
 }

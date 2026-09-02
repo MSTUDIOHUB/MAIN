@@ -5,9 +5,7 @@ import {
   TOOL_DEFINITIONS,
   type ToolDefinition,
 } from "../../lib/toolSchemas";
-import {
-  type WorkPlanRuntimeEvidence,
-} from "../../lib/runtime-v2";
+import type { WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";

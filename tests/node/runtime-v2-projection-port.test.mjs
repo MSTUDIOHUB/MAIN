@@ -157,7 +157,7 @@ test("V2 timeline projects scheduled commands into visible process blocks and se
     audience: "timeline",
     projection: projection(
       "timeline",
-      "正在修改 `src/components/editor.js`，落实已经确认的修复方案。",
+      "正在修改 `src/components/editor.js`，落实已经确认的方案。",
       "turn-a:command:edit-1",
     ),
   });
@@ -244,7 +244,7 @@ test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async ()
   const providerCommentary =
     "Now I have a clear picture of all three issues. Let me check the remaining files.";
   const structuredText =
-    "正在修改 `src/components/editor.js`，落实已经确认的修复方案。";
+    "正在修改 `src/components/editor.js`，落实已经确认的方案。";
   const liveText = `${providerCommentary}\n\n${structuredText}`;
 
   await harness.port.publish({

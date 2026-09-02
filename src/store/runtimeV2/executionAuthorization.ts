@@ -1,6 +1,5 @@
 import {
   getLocalFileReadPathForToolCall,
-  getToolRiskLevelForCall,
   isLocalFileReadApproved,
   isPerCallOnlyToolRisk,
 } from "../../lib/toolCapabilities";
@@ -51,6 +50,10 @@ import {
 } from "./executionValidationCorrection";
 import {
   authorizationFor,
+  isRuntimeV2EffectRisk,
+  isRuntimeV2ObservationRisk,
+  runtimeV2CatalogToolSource,
+  runtimeV2ToolRiskForCall,
   type RuntimeV2ToolAuthorizationResult,
 } from "./executionAuthorizationContext";
 import {
@@ -99,6 +102,33 @@ export function validateToolAgainstPhaseAndPlan(input: {
   const validationCorrection = aggregate?.strategy === "execute"
     ? deriveRuntimeV2ValidationCorrectionWindow(aggregate)
     : null;
+  const authorization = authorizationFor(input.ports);
+  const catalogSource = runtimeV2CatalogToolSource(
+    authorization,
+    input.toolName,
+  );
+  const catalogRisk = runtimeV2ToolRiskForCall(
+    authorization,
+    input.toolName,
+    input.args,
+    {
+      workspace: input.ports.context.runWorkspace,
+      approvedLocalFileReadPaths:
+        input.ports.get()?.approvedLocalFileReadPaths,
+    },
+  );
+  if (
+    input.command.kind === "execute_validation" &&
+    catalogSource !== "built_in"
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "当前验收窗口只接受 Runtime 拥有结构化判定契约的内置 validator；MCP transport success 不能作为验收结果。",
+      failureKind: "protocol_invalid",
+      reasonCode: "validation_tool_source_untrusted",
+    };
+  }
   if (
     input.toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
   ) {
@@ -194,7 +224,13 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (
     aggregate?.strategy === "analyze" &&
     (
-      !isRuntimeV2ReadOnlyToolName(input.toolName) ||
+      (
+        !isRuntimeV2ReadOnlyToolName(input.toolName) &&
+        !(
+          catalogSource === "mcp" &&
+          isRuntimeV2ObservationRisk(catalogRisk)
+        )
+      ) ||
       input.command.kind === "execute_validation"
     )
   ) {
@@ -203,6 +239,19 @@ export function validateToolAgainstPhaseAndPlan(input: {
       reason: "工作区只读任务没有修改或验证效果权限。",
       failureKind: "not_authorized",
       reasonCode: "workspace_read_only_authority",
+    };
+  }
+  if (
+    aggregate?.strategy === "plan" &&
+    catalogSource === "mcp" &&
+    isRuntimeV2EffectRisk(catalogRisk)
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "已批准 WorkPlan 只为精确工作区操作授予效果范围；当前 MCP 效果没有可验证的 Plan 目标契约。",
+      failureKind: "not_authorized",
+      reasonCode: "approved_plan_mcp_effect_scope_missing",
     };
   }
   if (
@@ -319,7 +368,10 @@ export async function authorizeToolForCurrentTurn(
   const catalogResolution = authorization.toolCatalog.lookup(name);
   if (
     catalogResolution.status !== "resolved" ||
-    catalogResolution.entry.source !== "built_in"
+    (
+      catalogResolution.entry.source !== "built_in" &&
+      catalogResolution.entry.source !== "mcp"
+    )
   ) {
     return {
       allowed: false,
@@ -327,8 +379,9 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
+  const exposedName = catalogResolution.entry.exposedName;
   const localFileReadPath = getLocalFileReadPathForToolCall(
-    name,
+    exposedName,
     args,
     input.context.runWorkspace,
   );
@@ -338,17 +391,18 @@ export async function authorizeToolForCurrentTurn(
   // for the approved target.
   const risk = localFileReadPath
     ? "local_file_read"
-    : getToolRiskLevelForCall(
-        name,
+    : runtimeV2ToolRiskForCall(
+        authorization,
+        exposedName,
         args,
-        authorization.capabilityRegistry,
         {
           workspace: input.context.runWorkspace,
           approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
         },
       );
-  const capability = authorization.capabilityRegistry.tools[name];
+  const capability = authorization.capabilityRegistry.tools[exposedName];
   if (
+    !risk ||
     !capability?.enabled ||
     authorization.policy.disabledRiskLevels.includes(risk)
   ) {
@@ -362,7 +416,8 @@ export async function authorizeToolForCurrentTurn(
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "external_read") {
-    const networkTool = name === "web_search" || name === "web_fetch";
+    const networkTool = catalogResolution.entry.source === "built_in" &&
+      (exposedName === "web_search" || exposedName === "web_fetch");
     return networkTool && state.webSearchEnabled !== true
       ? {
           allowed: false,
@@ -401,7 +456,7 @@ export async function authorizeToolForCurrentTurn(
   }
   if (risk === "shell") {
     const shell = await resolveShellAutoApproval({
-      toolName: name,
+      toolName: exposedName,
       args,
       workspace: input.context.runWorkspace || "",
       preflight: shellPermissionPreflight,

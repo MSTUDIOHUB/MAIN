@@ -6,11 +6,6 @@ import {
   type HarnessRunMarker,
   type HarnessRunOwner,
 } from "../lib/harnessCrashTelemetry";
-import type {
-  PendingSlashCommand,
-  ParsedSetupEngineArgs,
-  StudioAgentKey,
-} from "../lib/gameStudio/catalog";
 import type { MainModeKey } from "../lib/mainModes";
 import type {
   CommandDirective,
@@ -46,10 +41,6 @@ import {
 } from "./submitAttachmentContext";
 import { buildSubmitPromptContext } from "./submitPromptContext";
 import {
-  runSubmitGameStudioPreparation,
-  type SubmitGameStudioPreparationState,
-} from "./submitGameStudioPreparation";
-import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
   type StartSubmitRunLeaseInput,
@@ -66,11 +57,6 @@ import {
   runSubmitRuntime,
   type RunSubmitRuntimeInput,
 } from "./submitRuntimeRunner";
-import type { GameStudioTurnRuntimeService } from "./gameStudioTurnPreparation";
-import {
-  buildRuntimeV2StudioSetupActionPlan,
-  type RuntimeV2GameStudioServicePort,
-} from "./runtimeV2/studioAdapter";
 import {
   appendRuntimeEvent,
   appendRuntimeEventWithResult,
@@ -98,9 +84,7 @@ import {
 
 type SubmitAsyncWorkflowSet = (patchOrUpdater: any) => void;
 
-export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparationState {
-  activeStudioAgentKey: StudioAgentKey;
-  gameStudioInitialized: boolean;
+export interface SubmitAsyncWorkflowRunState {
   isPlanApproved: boolean;
   planStage: PlanStage;
   planArtifacts: PlanArtifact[];
@@ -141,12 +125,10 @@ export interface SubmitAsyncWorkflowElapsedTimer {
 }
 
 export interface SubmitAsyncWorkflowRunPhaseRunners<
-  TState extends SubmitAsyncWorkflowRunState,
   TAbortController extends AbortController,
 > {
   buildAttachmentContext?: typeof buildSubmitAttachmentContext;
   buildPromptContext?: typeof buildSubmitPromptContext;
-  runGameStudioPreparation?: typeof runSubmitGameStudioPreparation<TState>;
   startRunLease?: typeof startSubmitRunLease<TAbortController>;
   createRuntimeContext?: typeof createSubmitRuntimeContext;
   startStreamingUi?: typeof startSubmitStreamingUi;
@@ -168,9 +150,6 @@ export interface StartSubmitAsyncWorkflowRunInput<
   runSessionId: number | null | undefined;
   runScopeKey: string;
   currentMainModeKey: MainModeKey;
-  parsedSetupEngineCommand?: ParsedSetupEngineArgs | null;
-  parsedStudioCommand: PendingSlashCommand | null;
-  cachedWorkspaceTreeForGameDetection: string;
   preferredLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
@@ -216,9 +195,6 @@ export interface StartSubmitAsyncWorkflowRunInput<
   readFile: SubmitAttachmentContextInput["readFile"];
   readDocument: SubmitAttachmentContextInput["readDocument"];
   analyzeTabularDocument: SubmitAttachmentContextInput["analyzeTabularDocument"];
-  runtimeService: GameStudioTurnRuntimeService & RuntimeV2GameStudioServicePort;
-  logWarning: (event: string, data: Record<string, unknown>) => void;
-  invalidateWorkspaceTreeCache: () => void;
   createAbortController: () => TAbortController;
   getCurrentHarnessInstanceId: () => string;
   readHarnessRunMarker: () => HarnessRunMarker | null;
@@ -245,7 +221,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   getLastTurnToolSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
   getLastVisibleTurnAgentSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
   persistBootstrapProjection: (state: TState) => Promise<TState>;
-  phaseRunners?: SubmitAsyncWorkflowRunPhaseRunners<TState, TAbortController>;
+  phaseRunners?: SubmitAsyncWorkflowRunPhaseRunners<TAbortController>;
   PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: number;
   PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS: number;
   PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK: number;
@@ -496,7 +472,6 @@ export function projectSubmitBootstrapErrorConclusion<
           isGenerating: false,
           abortController: null,
           elapsedTime: input.elapsedTime,
-          pendingSlashCommand: null,
         }
       : {}),
   } as TState;
@@ -1707,9 +1682,6 @@ export async function runSubmitAsyncWorkflowRun<
   let acquiredRunOwner: SubmitBootstrapRunOwner | null = null;
   let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
   let userContent = input.text;
-  const activeStudioAgentKey = input.sessionGet().activeStudioAgentKey;
-  const gameStudioInitialized = input.sessionGet().gameStudioInitialized;
-
   try {
   const attachmentContext = await (phaseRunners.buildAttachmentContext || buildSubmitAttachmentContext)({
     text: input.text,
@@ -1761,27 +1733,6 @@ export async function runSubmitAsyncWorkflowRun<
     selectedChoiceText: input.selectedChoiceText,
     turnInputContextSignals: input.turnInputContextSignals,
   }).userContent;
-
-  const gameStudioPreparation = await (phaseRunners.runGameStudioPreparation || runSubmitGameStudioPreparation)({
-    currentMainModeKey: input.currentMainModeKey,
-    text: input.text,
-    userContent,
-    parsedSetupEngineCommand: input.parsedSetupEngineCommand,
-    parsedStudioCommand: input.parsedStudioCommand,
-    activeStudioAgentKey,
-    gameStudioInitialized,
-    cachedWorkspaceTreeForGameDetection: input.cachedWorkspaceTreeForGameDetection,
-    preferredLanguage: input.preferredLanguage,
-    runtimeService: input.runtimeService,
-    logWarning: input.logWarning,
-    sessionGet: input.sessionGet,
-    sessionSet: input.sessionSet,
-    invalidateWorkspaceTreeCache: input.invalidateWorkspaceTreeCache,
-  });
-  if (!gameStudioPreparation.ok) {
-    throw new Error(gameStudioPreparation.errorMessage || "Game Studio preparation did not complete.");
-  }
-  userContent = gameStudioPreparation.userContent;
 
   input.sessionSet({ contextMentions: [], attachedFiles: [] });
 
@@ -1839,8 +1790,8 @@ export async function runSubmitAsyncWorkflowRun<
   });
 
   // Bootstrap work above intentionally runs without an execution lease. A
-  // workspace clear/delete can remove this Session while an attachment, Game
-  // Studio, or workspace discovery promise is pending. Key presence alone is
+  // workspace clear/delete can remove this Session while an attachment,
+  // instruction refresh, or workspace discovery promise is pending. Key presence alone is
   // insufficient because a recreated Session may reuse it: require the exact
   // runtime generation captured before the first await.
   if (!input.hasSessionRuntimeOwnership(initialRuntimeOwnerToken)) {
@@ -2035,7 +1986,6 @@ export async function runSubmitAsyncWorkflowRun<
       resolvedInstructionSnapshot,
     ),
     skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
-    gameStudioConfigForTurn: gameStudioPreparation.gameStudioConfigForTurn,
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,
     sendStartedAt: input.sendStartedAt,
@@ -2066,10 +2016,6 @@ export async function runSubmitAsyncWorkflowRun<
     set: input.sessionSet,
     getSessionRevisionToken: input.getSessionRevisionToken,
     context,
-    runtimeService: input.runtimeService,
-    studioActions: buildRuntimeV2StudioSetupActionPlan(
-      input.parsedSetupEngineCommand,
-    ),
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
     buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,

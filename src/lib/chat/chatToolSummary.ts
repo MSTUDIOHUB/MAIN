@@ -138,14 +138,6 @@ export function shouldGroupPlanExecutionTools(input: {
   turnStatus?: string;
   isPlanExecutionVisible: boolean;
 }) {
-  if (input.turnIntent === "studio_workflow") {
-    return {
-      enabled: true,
-      includeDiff: false,
-      includeReadContextTools: false,
-      minGroupSize: 2,
-    };
-  }
   const isApprovedPlanExecution =
     input.isPlanTurn &&
     (

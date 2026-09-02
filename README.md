@@ -47,7 +47,7 @@ MAIN 已在多个版本中使用 Codex 参与架构重构、测试补强和文�
 | 加强文件、Shell、网络与进程安全 | `src-tauri/src/trusted_execution.rs`、`src-tauri/src/network_guard.rs` |
 | 定制桌面交互、Diff、计划和终端 | `src/components/`、`src/store/` |
 | 建立可回放的 Agent 评测 | `src-tauri/src/harness/`、`src-tauri/src/runtime/`、`benchmark/` |
-| 扩展技能或行业工作流 | `.MAIN/`、`src/gameStudioPack/`、MCP 配置 |
+| 扩展技能或行业工作流 | `.MAIN/`、Skills 与 MCP 配置 |
 
 ## 架构概览
 
@@ -121,7 +121,6 @@ MAIN/
 ├── benchmark/              # Agent Trace、Replay 与评测夹具
 ├── docs/                   # 架构规范、用户手册与发布说明
 ├── .MAIN/                  # 项目规则、模板、Hooks 和可扩展工作区资产
-├── src/gameStudioPack/     # Game Studio 协议包与工作流资产
 ├── cloud-gateway/          # 可选的云端协议适配示例
 └── scripts/                # 构建、验证和发布脚本
 ```

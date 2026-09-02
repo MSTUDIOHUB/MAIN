@@ -295,8 +295,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
 
   const planAuthoringGateActive =
     input.workflowMode === "plan" &&
-    input.runtimeIntent !== "execute" &&
-    input.runtimeIntent !== "studio_workflow";
+    input.runtimeIntent !== "execute";
   const isSafePlanAuthoringRead =
     risk === "read_only" ||
     risk === "external_read" ||

@@ -75,9 +75,6 @@ const realOmlxImagePath = String(process.env.REAL_OMLX_IMAGE_PATH || "").trim();
 const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
 const runExecuteIncidentReplay = process.env.REAL_OMLX_EXECUTE_INCIDENT === "1";
 const runSnakeExecuteReplay = process.env.REAL_OMLX_SNAKE_EXECUTE === "1";
-const realOmlxMainMode = process.env.REAL_OMLX_MAIN_MODE === "game_studio"
-  ? "game_studio"
-  : "main_mode";
 const realOmlxMutationFile = String(
   process.env.REAL_OMLX_MUTATION_FILE ||
   (realOmlxFixture === "md-viewer"
@@ -3562,7 +3559,7 @@ for (const model of models) {
     expect(snapshot?.runtimeV2?.recovery?.exhausted || null).toBeNull();
   });
 
-  test(`real OMLX Snake Execute completes in ${realOmlxMainMode} with ${model}`, async ({ page }) => {
+  test(`real OMLX Snake Execute completes with ${model}`, async ({ page }) => {
     test.skip(!runSnakeExecuteReplay);
     const workspace = (page as any).__realOmlxWorkspace as string;
     page.on("console", (message) => {
@@ -3575,28 +3572,6 @@ for (const model of models) {
     });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
     await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(false));
-
-    if (realOmlxMainMode === "game_studio") {
-      await page.getByTestId("main-focus-picker-button").click();
-      await page.getByTestId("main-focus-option-game_studio").click();
-      await expect(page.getByTestId("main-focus-picker-button"))
-        .toContainText(/游戏工作室|Game Studio/i);
-      await expect(page.getByTestId("game-studio-onboarding")).toBeVisible();
-      await page.getByTestId("game-studio-onboarding-init").click();
-      await expect(page.getByTestId("game-studio-onboarding"))
-        .toBeHidden({ timeout: 120_000 });
-      await expect.poll(async () => {
-        try {
-          const config = await fs.readFile(
-            path.join(workspace, ".MAIN/game-studio/studio.config.json"),
-            "utf8",
-          );
-          return config.includes("packVersion") ? "initialized" : "invalid";
-        } catch {
-          return "missing";
-        }
-      }, { timeout: 120_000 }).toBe("initialized");
-    }
 
     const immediateSnapshot = await page.evaluate(async (text) => {
       const bridge = (window as any).__CODELY_E2E__;
@@ -3613,9 +3588,7 @@ for (const model of models) {
       immediateSnapshot?.lastWorkspaceInstructionAcceptance?.receipt?.turnId || "",
     );
     expect(admittedTurnId).not.toBe("");
-    const expectedIntent = realOmlxMainMode === "game_studio"
-      ? "studio_workflow"
-      : "execute";
+    const expectedIntent = "execute";
     const admittedTurn = (immediateSnapshot?.conversationTurnPreview || []).find(
       (turn: { id?: string }) => turn.id === admittedTurnId,
     );
@@ -3639,7 +3612,6 @@ for (const model of models) {
         const commands = Array.isArray(runtime?.commands) ? runtime.commands : [];
         const latestCommand = commands.at(-1) || null;
         const progress = {
-          mode: realOmlxMainMode,
           isGenerating: snapshot?.isGenerating,
           agentStatus: snapshot?.agentStatus,
           turnStatus: snapshot?.currentTurnStatus,
@@ -3694,7 +3666,6 @@ for (const model of models) {
         (window as any).__CODELY_E2E__?.getSnapshot?.()
       );
       console.log(`[real-omlx-snake-stopped:${model}] ${JSON.stringify({
-        mode: realOmlxMainMode,
         error: error instanceof Error ? error.message : String(error),
         runtimeV2: stopped?.runtimeV2 || null,
         debugTail: (stopped?.debugTail || []).slice(-80),
@@ -3718,7 +3689,6 @@ for (const model of models) {
 
     const acceptance = await inspectSnakeAcceptance(workspace);
     console.log(`[real-omlx-snake-quality:${model}] ${JSON.stringify({
-      mode: realOmlxMainMode,
       gaps: acceptance.gaps,
       files: acceptance.files,
       testCount: acceptance.testCount,

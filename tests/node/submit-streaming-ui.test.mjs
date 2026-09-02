@@ -73,7 +73,6 @@ function baseContext(overrides = {}) {
     mentionSnapshot: [],
     remoteFeishu: undefined,
     workspaceTree: null,
-    gameStudioConfigForTurn: null,
     abortCtrl: { signal: { aborted: false } },
     timerInterval: null,
     sendStartedAt: 123,

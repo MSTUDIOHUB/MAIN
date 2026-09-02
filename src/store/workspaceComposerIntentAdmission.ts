@@ -84,9 +84,7 @@ export function buildWorkspaceComposerIntentDispatchHints(
       : null;
   const modeIntent: ResolvedRunIntent | null = mainModeKey === "image_studio"
     ? "image_studio"
-    : mainModeKey === "game_studio"
-      ? "studio_workflow"
-      : null;
+    : null;
   const resolvedIntent: ResolvedRunIntent | null = mainDebugShortcut
     ? "plan"
     : lockedComposerIntent || mainIntentShortcut?.intent || modeIntent;

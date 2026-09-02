@@ -542,7 +542,7 @@ test("MCP routing keeps small lists and heuristically selects relevant tools abo
   );
 });
 
-test("Unity MCP-first routing scopes Unity console diagnostics instead of exposing every Unity tool", () => {
+test("engine MCP-first routing scopes Unity console diagnostics instead of exposing every Unity tool", () => {
   const servers = [
     { name: "unityMCP", type: "http", url: "http://127.0.0.1:8080/mcp" },
     { name: "research", type: "http", url: "http://research.test" },
@@ -564,9 +564,10 @@ test("Unity MCP-first routing scopes Unity console diagnostics instead of exposi
     toolServerMap,
     userPrompt: "检查一下 Unity console 报错",
     config: { enabled: true, threshold: 1, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
-    priorityMode: "unity_mcp_first",
+    priorityMode: "engine_mcp_first",
     preferredServerUrls: ["http://127.0.0.1:8080/mcp"],
     forceFirstTools: ["read_console", "set_active_instance"],
+    gameEngineRoutingContext: { engine: "unity" },
   });
 
   assert.equal(routed.telemetry.pickSource, "heuristic");
@@ -577,7 +578,7 @@ test("Unity MCP-first routing scopes Unity console diagnostics instead of exposi
   assert.ok(routed.telemetry.selectedToolCount < tools.length);
 });
 
-test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits for script fixes", () => {
+test("engine MCP-first routing prefers script_apply_edits over apply_text_edits for Unity script fixes", () => {
   const servers = [{ name: "unityMCP", type: "http", url: "http://127.0.0.1:8080/mcp" }];
   const tools = [
     { name: "apply_text_edits", description: "Apply text edits to Unity script using coordinates", inputSchema: {} },
@@ -596,9 +597,9 @@ test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits f
     toolServerMap,
     userPrompt: "请修复 Unity C# 脚本报错",
     config: { enabled: true, threshold: 4, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
-    priorityMode: "unity_mcp_first",
+    priorityMode: "engine_mcp_first",
     preferredServerUrls: ["http://127.0.0.1:8080/mcp"],
-    unityRoutingContext: { preferStructuredScriptEdits: true },
+    gameEngineRoutingContext: { engine: "unity", preferStructuredScriptEdits: true },
   });
 
   const orderedNames = routed.tools.map((item) => item.name);
@@ -610,7 +611,7 @@ test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits f
   assert.ok(routed.telemetry.selectedToolCount <= 4);
 });
 
-test("Game Studio MCP-first routing selects Godot MCP tools for Godot scene and script work", () => {
+test("engine MCP-first routing selects Godot MCP tools for Godot scene and script work", () => {
   const servers = [
     { name: "Godot MCP", type: "http", url: "http://127.0.0.1:9001/mcp" },
     { name: "research", type: "http", url: "http://research.test" },
@@ -634,9 +635,9 @@ test("Game Studio MCP-first routing selects Godot MCP tools for Godot scene and 
     toolServerMap,
     userPrompt: "Godot 场景节点点击后没有响应，检查节点和脚本",
     config: { enabled: true, threshold: 4, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
-    priorityMode: "game_studio_mcp_first",
+    priorityMode: "engine_mcp_first",
     preferredServerUrls: ["http://127.0.0.1:9001/mcp"],
-    gameStudioRoutingContext: { engine: "godot" },
+    gameEngineRoutingContext: { engine: "godot" },
   });
 
   const names = routed.tools.map((item) => item.name);
@@ -649,7 +650,7 @@ test("Game Studio MCP-first routing selects Godot MCP tools for Godot scene and 
   assert.ok(!names.includes("web_search"));
 });
 
-test("Game Studio MCP-first routing selects Unreal MCP tools for Unreal log and actor work", () => {
+test("engine MCP-first routing selects Unreal MCP tools for Unreal log and actor work", () => {
   const servers = [
     { name: "Unreal MCP", type: "http", url: "http://127.0.0.1:9002/mcp" },
     { name: "research", type: "http", url: "http://research.test" },
@@ -673,9 +674,9 @@ test("Game Studio MCP-first routing selects Unreal MCP tools for Unreal log and 
     toolServerMap,
     userPrompt: "UE5 关卡 Actor 行为异常，先看输出日志和关卡 Actor",
     config: { enabled: true, threshold: 3, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
-    priorityMode: "game_studio_mcp_first",
+    priorityMode: "engine_mcp_first",
     preferredServerUrls: ["http://127.0.0.1:9002/mcp"],
-    gameStudioRoutingContext: { engine: "unreal" },
+    gameEngineRoutingContext: { engine: "unreal" },
   });
 
   const names = routed.tools.map((item) => item.name);

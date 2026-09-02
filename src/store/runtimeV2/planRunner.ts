@@ -1,6 +1,5 @@
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import { WORK_PLAN_V1_SCHEMA_VERSION, isRuntimeV2ProviderTransportsUnavailableError, sealWorkPlanV1, type SealedWorkPlanV1 } from "../../lib/runtime-v2";
-import { createRuntimeV2PlanReviewCommit, resolveRuntimeV2PlanReviewFromAggregate } from "./workPlanAdapter";
 import { bootstrapRuntimeV2Plan } from "./planBootstrap";
 import { executeReadOnlyPlanTool, settlePlanTool } from "./planEvidencePort";
 import { requestPlanModel } from "./planProviderPort";
@@ -8,11 +7,10 @@ import { handleRuntimeV2PlanProviderAdmissionRejection } from "./planProviderAdm
 import { requiredPlanCollaborationFailure, type RuntimeV2PlanTerminalFailure } from "./planRequirement";
 import { handleRequiredPlanCollaborationProviderTimeout, requiredPlanCollaborationProviderTimeoutFailure, restoreRequiredPlanCollaborationProviderTimeoutGuidance } from "./planCollaborationAcquisition";
 import { createRuntimeV2PlanCollaboration } from "./planCollaboration";
-import { applyReviewProjection, planReference, publishReviewMilestone, writeReviewArtifact } from "./planReviewProjection";
+import { completeRuntimeV2Plan, recoverRuntimeV2PlanFailure, settleRuntimeV2PlanCompletion } from "./planCompletion";
 import { PLAN_MODEL_COMPACTION_INTERVAL, PLAN_MODEL_DEADLINE_MS, SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, workPlanDraftFromSubmission, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
 import { decodeExactStructuredPlanResponse } from "./workPlanSubmission";
 import { runtimeV2ParallelReadCount } from "./executionText";
-import { finishPlanTerminal, planSettlement as settlement, terminalPlanOutcome as terminalAgentOutcome } from "./planSettlement";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { assertAdmittedPlanCriteriaMapped, assertCompletedPlanChildrenAdopted } from "./planSubmissionPolicy";
 import { createRuntimeV2PlanSubmissionLifecycle, recordRuntimeV2PlanSubmissionRejection } from "./planSubmissionRepair";
@@ -519,124 +517,24 @@ export async function runSubmitRuntimeV2Plan(
         });
       }
     }
-    if (!sealedPlan) {
-      if (!await planCollaboration.abortAndDrain("plan_terminal_boundary")) {
-        throw new Error("RUNTIME_V2_PLAN_ACTIVE_CHILD_TERMINAL_FENCE");
-      }
-      if (!terminalFailure) throw new Error("RUNTIME_V2_PLAN_TERMINAL_DECISION_MISSING");
-      input.logStoreEvent("runtime_v2_plan_review_not_produced", {
-        turnId: identity.turn.turnId,
-        runId: identity.run.runId,
-        evidenceCount: evidence.length,
-        terminal: true,
-        detailCode: terminalFailure.detailCode,
-      });
-      return finishPlanTerminal({
-        runner: input,
-        ledger,
-        run: identity.run,
-        ...terminalFailure,
-      });
-    }
-    if (planCollaboration.activeChildCount() > 0) {
-      throw new Error("RUNTIME_V2_PLAN_ACTIVE_CHILD_REVIEW_FENCE");
-    }
-    const requestId = [
-      "runtime-v2-plan-review",
-      identity.run.runId,
-      sealedPlan.id,
-      sealedPlan.revision,
-      sealedPlan.projectionHash.slice(-16),
-    ].join(":");
-    const commit = createRuntimeV2PlanReviewCommit({
-      plan: sealedPlan,
+    return settleRuntimeV2PlanCompletion(await completeRuntimeV2Plan({
+      runner: input,
+      ledger,
       turn: identity.turn,
       run: identity.run,
-      requestId,
-      createdAt: Date.now(),
-    });
-    await writeReviewArtifact({
-      context: input.context,
-      ledger,
-      run: identity.run,
-      plan: sealedPlan,
-    });
-    await ledger.append({
-      type: "work_plan.sealed",
-      run: identity.run,
-      workPlan: planReference(sealedPlan),
+      evidence,
       sealedPlan,
-      reviewCommit: commit,
-    });
-    await publishReviewMilestone({
-      ledger,
-      commit,
-    });
-    // Expose the approval control only after every ReviewCommit projection is
-    // durably appended, so a fast click cannot race the milestone checkpoint.
-    applyReviewProjection(input, commit);
-    input.logStoreEvent("runtime_v2_plan_review_committed", {
-      turnId: identity.turn.turnId,
-      runId: identity.run.runId,
-      requestId: commit.review.requestId,
-      workPlanId: commit.authority.id,
-      revision: commit.authority.revision,
-      digest: commit.authority.digest,
-      projectionHash: commit.authority.projectionHash,
-    });
-    return settlement(input.context);
+      terminalFailure,
+      collaboration: planCollaboration,
+    }));
   } catch (error) {
-    const aggregate = ledger.snapshot();
-    if (!aggregate?.run || aggregate.phase === "acting") throw error;
-    if (
-      !aggregate.terminalOutcome &&
-      !await planCollaboration.abortAndDrain(
-        input.context.abortCtrl.signal.aborted
-          ? "plan_parent_aborted"
-          : "plan_parent_failure",
-      )
-    ) {
-      throw error;
-    }
-    if (aggregate.terminalOutcome) {
-      return settlement(
-        input.context,
-        terminalAgentOutcome(
-          aggregate.terminalOutcome.resultKind,
-          aggregate.terminalOutcome.reason,
-        ),
-      );
-    }
-    const recoveredReview = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
-    if (recoveredReview?.pending) {
-      applyReviewProjection(input, recoveredReview.commit);
-      return settlement(input.context);
-    }
-    if (input.context.abortCtrl.signal.aborted) {
-      return finishPlanTerminal({
-        runner: input,
-        ledger,
-        run: identity.run,
-        resultKind: "canceled",
-        reason: "用户已停止计划生成；已保留此前收集的证据并结束本轮。",
-        detailCode: "runtime_v2_plan_aborted",
-      });
-    }
-    const detail = error instanceof Error ? error.message : String(error);
-    await ledger.recordSoftSignal(identity.run, "protocol_drift");
-    input.logStoreEvent("runtime_v2_plan_unhandled_failure", {
-      turnId: identity.turn.turnId,
-      runId: identity.run.runId,
-      error: detail,
-    });
-    return finishPlanTerminal({
+    return settleRuntimeV2PlanCompletion(await recoverRuntimeV2PlanFailure({
+      error,
       runner: input,
       ledger,
       run: identity.run,
-      resultKind: aggregate.evidence.length > 0 ? "partial" : "error",
-      reason: "计划生成遇到运行时错误；已保留现有证据并明确结束本轮，没有留下悬空任务。",
-      detailCode: "runtime_v2_plan_unhandled_failure",
-    });
+      collaboration: planCollaboration,
+    }));
   } finally {
     planCollaboration.abortChildren("runtime_v2_plan_runner_closed");
     clearInterval(input.context.timerInterval as ReturnType<typeof setInterval>);

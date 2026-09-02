@@ -1,5 +1,6 @@
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
   type RuntimeV2ExecutionValidationAuthority,
@@ -46,9 +47,7 @@ export type RuntimeV2Event =
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
       readonly acceptanceCriterionIds?: readonly string[];
-      readonly acceptanceEvidenceRequirements?: readonly (
-        "static" | "behavioral" | "interaction"
-      )[];
+      readonly acceptanceEvidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.started";

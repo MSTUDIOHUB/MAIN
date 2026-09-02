@@ -110,6 +110,10 @@ const executionAcceptance = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionAcceptance.ts",
 ));
+const executionOutcome = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionOutcome.ts",
+));
 const executionToolPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolPort.ts",
@@ -212,10 +216,10 @@ test("an explicit zero child budget cannot fall back to later active capacity", 
   );
 });
 
-test("unclassified direct Execute acceptance defaults to behavioral evidence", () => {
+test("unclassified direct Execute acceptance remains durably unclassified", () => {
   assert.deepEqual(
     executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements(),
-    ["behavioral"],
+    [],
   );
   assert.deepEqual(
     executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements([
@@ -223,8 +227,101 @@ test("unclassified direct Execute acceptance defaults to behavioral evidence", (
       {},
       { evidenceRequirement: "interaction" },
     ]),
-    ["static", "behavioral", "interaction"],
+    ["static", null, "interaction"],
   );
+});
+
+test("Execute text-envelope recovery propagates the structured-action requirement", () => {
+  const source = fs.readFileSync(path.join(
+    workspaceRoot,
+    "src/store/runtimeV2/executionProviderRequest.ts",
+  ), "utf8");
+  assert.match(
+    source,
+    /containsProviderTextEnvelopePrompt\(\s*input\.ports\.context\.phaseLanguage,\s*structuredActionRequired,\s*\)/s,
+  );
+  assert.doesNotMatch(
+    source,
+    /containsProviderTextEnvelopePrompt\(\s*input\.ports\.context\.phaseLanguage,\s*false,\s*\)/s,
+  );
+  assert.match(
+    providerContext.containsProviderTextEnvelopePrompt("en", true),
+    /structured tool call is required now/i,
+  );
+});
+
+test("the production terminal adapter keeps execute and validate prose in recovery", () => {
+  for (const [phase, mode] of [
+    ["observing", "execute"],
+    ["validating", "validate"],
+  ]) {
+    const turn = {
+      workspaceKey: "/fixture",
+      sessionKey: `session-${mode}`,
+      sessionEpoch: "epoch",
+      clientSubmissionId: `submission-${mode}`,
+      turnId: `turn-${mode}`,
+    };
+    const run = {
+      sessionKey: turn.sessionKey,
+      sessionEpoch: turn.sessionEpoch,
+      turnId: turn.turnId,
+      runId: `run-${mode}`,
+      parentRunId: null,
+      attemptId: `attempt-${mode}`,
+    };
+    let sequence = 0;
+    const nextEvent = (type, fields) => ({
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence: sequence++,
+      eventId: `${mode}-event-${sequence}`,
+      at: sequence,
+      type,
+      ...fields,
+    });
+    let aggregate = runtime.transition(null, nextEvent("turn.admitted", {
+      turn,
+      strategy: "execute",
+      objective: "Repair the fixture.",
+      constraints: [],
+      acceptanceCriteria: ["The fixture is repaired."],
+      acceptanceCriterionIds: ["criterion-user-objective"],
+      acceptanceEvidenceRequirements: [null],
+    }));
+    aggregate = runtime.transition(aggregate, nextEvent("run.started", {
+      run,
+      phase,
+    }));
+    const command = {
+      idempotencyKey: `${run.runId}:request-model`,
+      kind: "request_model",
+      run,
+      phase,
+      payload: { mode },
+    };
+    aggregate = runtime.transition(aggregate, nextEvent("command.scheduled", {
+      run,
+      command,
+    }));
+    aggregate = runtime.transition(aggregate, nextEvent("provider.responded", {
+      run,
+      idempotencyKey: command.idempotencyKey,
+      result: {
+        visibleText: "I would continue with the available tools.",
+        toolCalls: [],
+        diagnostics: [],
+      },
+    }));
+
+    assert.equal(executionOutcome.runtimeV2ExecuteTerminalDecision({
+      aggregate,
+      signal: new AbortController().signal,
+    }), null);
+    assert.equal(
+      runtime.deriveRuntimeV2ProviderRecoveryPressure(aggregate)?.occurrence,
+      1,
+    );
+  }
 });
 
 test("a shared lifecycle boundary stays distinct from a tool timeout", async () => {

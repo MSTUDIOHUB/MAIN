@@ -1,7 +1,6 @@
 import type { AttachedFile } from "../lib/attachments";
 import type { SkillCatalogSnapshot } from "../lib/agentSkills";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
-import type { StudioConfig } from "../lib/gameStudio/catalog";
 import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { SubmissionRuntimeContext } from "../lib/submissionRuntimeContracts";
 import type { PlanExecutionRunProvenance } from "../lib/planExecutionProvenance";
@@ -34,7 +33,6 @@ export interface CreateSubmitRuntimeContextInput {
   workspaceTree: string | null;
   workspaceInstructionContext?: string;
   skillCatalog?: SkillCatalogSnapshot | null;
-  gameStudioConfigForTurn: StudioConfig | null;
   abortCtrl: AbortController;
   timerInterval: unknown;
   sendStartedAt: number;
@@ -74,7 +72,6 @@ export function createSubmitRuntimeContext(
       input.workspaceInstructionContext || "",
     ),
     skillCatalog: input.skillCatalog || null,
-    gameStudioConfigForTurn: input.gameStudioConfigForTurn,
     abortCtrl: input.abortCtrl,
     timerInterval: input.timerInterval,
     sendStartedAt: input.sendStartedAt,

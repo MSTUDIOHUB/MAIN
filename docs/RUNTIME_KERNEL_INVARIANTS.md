@@ -1,7 +1,7 @@
 # MAIN 最小运行内核与能力边界
 
 > 状态：现行开发约束
-> 按生产调用点核验：2026-08-04
+> 按生产调用点核验：2026-09-02
 > 目的：在修改 Runtime 前先确定唯一所有者、真实能力和验收事实，避免重新堆叠 v1/v2 式特例。
 
 本文严格区分三类陈述：
@@ -17,7 +17,7 @@
 ```text
 submitAsyncWorkflowRun.ts
   -> submitRuntimeRunner.ts
-  -> runtimeV2/{chat,workspaceRead,plan,execute,goal,studio}Runner
+  -> runtimeV2/{chat,workspaceRead,plan,execute,goal}Runner
   -> RuntimeV2Controller + provider/tool/checkpoint/projection ports
   -> streaming.ts / toolExecutor.ts
   -> Rust IPC 受信任执行与 Session 存储
@@ -190,7 +190,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - Rust `SessionMemoryStore` 只有在调用 `load_session_memory` 或 `record_session_failure` IPC 时才会创建或更新 `.MAIN/memory/session_memory.json`。生产端目前只在检测到应用未正常结束的旧 Run 时直接调用 `record_session_failure`；`load_session_memory` 没有生产调用方，文件内容不会进入 Execute、Plan、child 或 Chat 的 provider 上下文。因此删除旧文件不会改变当前执行能力，也不能把“无旧文件回放”解释成记忆已经重建。
 - 该旧 profile 仅凭文件存在推断构建命令，并会累积自由文本失败/反思，不满足来源、版本和失效契约。不得直接注入 provider 上下文。
 - 工作区 `AGENTS.md`、`CLAUDE.md`、`AGENT.md`、`.MAIN/rules`、显式 active instruction skill，以及 `.MAIN/steering` 中 `inclusion: always` / 已知路径匹配的 `fileMatch` 规则，已收敛到同一个 `ResolvedInstructionSet`。每个 Turn 在 Run admission 前刷新一次，随后把带 source provenance 的完整文本冻结到 Runtime v2 admission context；父线程和之后启动的 child 使用同一快照。
-- 上述规则同步与会话压缩互相独立；旧 `session_memory.json`、provider 总结和 conversation summary 都不能填充这个字段。规则刷新失败时保留上一份已解析规则并继续安全读取，不能把一次可选 bootstrap I/O 失败升级为终态。
+- 上述规则同步与会话压缩互相独立；旧 `session_memory.json`、provider 总结和 conversation summary 都不能填充这个字段。当前生产路径为避免借用另一个工作区的 UI 投影，规则刷新失败时会让本 Turn 使用空 instruction snapshot，并继续通过普通源码工具安全读取；它不会把一次可选 bootstrap I/O 失败升级为终态。未来若缓存最后成功快照，必须绑定 canonical workspace identity、来源 hash 与新鲜度，不能直接复用全局 UI 状态。
 - repo map 目前仅在模型调用 `repo_map_*` 工具时构建，且调用会重新扫描；它是按需代码检索，不是 Session bootstrap 项目基线。
 - 因此“每轮默认获得带 manifest/lockfile fingerprint 的完整结构基线”仍是**尚未接线**能力；目前已经接线的是用户维护的项目规则和浅层 workspace observation。实现剩余结构基线时应替换或收敛上述重复存储，不能再增加第三份项目真值。
 

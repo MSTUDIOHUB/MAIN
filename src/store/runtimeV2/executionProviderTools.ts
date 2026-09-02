@@ -3,12 +3,14 @@ import {
   RUNTIME_V2_SUBAGENT_TASK_KINDS,
   type ToolDefinition,
 } from "../../lib/toolSchemas";
+import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   deriveRuntimeV2PlanExecutionFrontier,
   deriveRuntimeV2PlanValidationCorrectionScope,
   runtimeV2SubagentStartHasRunway,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
@@ -85,7 +87,7 @@ function runtimeV2ToolDefinition(
   correctiveValidationCommand = "",
   executionContract: RuntimeV2ExecutionContract | null = null,
   implementationContractMissing = false,
-  acceptanceEvidenceRequirements: readonly string[] = [],
+  acceptanceEvidenceRequirements: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[] = [],
 ): ToolDefinition {
   if (
     definition.function.name === "read_file" &&
@@ -403,11 +405,32 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly available: readonly ToolDefinition[];
+  readonly capabilityRegistry?: ToolCapabilityRegistry;
   readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
   readonly correctiveSourceTargets?: readonly string[];
   readonly correctiveValidationCommand?: string;
 }): ToolDefinition[] {
   const mode = String(input.command.payload.mode || "").trim();
+  const mcpRiskFor = (name: string) => {
+    const capability = input.capabilityRegistry?.tools[name];
+    return capability?.source === "mcp" && capability.enabled
+      ? capability.risk
+      : null;
+  };
+  const isMcpObservation = (name: string) => {
+    const risk = mcpRiskFor(name);
+    return risk === "read_only" ||
+      risk === "external_read" ||
+      risk === "local_file_read";
+  };
+  const isMcpEffect = (name: string) => {
+    const risk = mcpRiskFor(name);
+    return risk === "workspace_write" ||
+      risk === "external_write" ||
+      risk === "browser_control" ||
+      risk === "desktop_control" ||
+      risk === "destructive";
+  };
   const collaboration = collaborationToolNames(input);
   const aggregate = typeof input.ports.get === "function"
     ? aggregateForCurrentTurn(input.ports)
@@ -432,6 +455,9 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const planToolAllowed = (definition: ToolDefinition): boolean => {
     if (!planFrontier) return true;
     const name = definition.function.name;
+    // Approved WorkPlan mutation steps are exact workspace operations. MCP
+    // effects have permission risk but no path-scoped Plan contract yet.
+    if (isMcpEffect(name)) return false;
     if (VALIDATION_TOOL_NAMES.has(name)) {
       return planFrontier.validationReady && !planValidationCorrection?.active;
     }
@@ -499,7 +525,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
         const name = definition.function.name;
         return RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name) ||
           RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
-          RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name);
+          RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+          isMcpObservation(name);
       }).map(adapt);
     }
     return available.filter((definition) => {
@@ -507,6 +534,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
         RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
         RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+        isMcpObservation(name) ||
         collaboration.has(name);
     }).map(adapt);
   }
@@ -646,6 +674,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
         RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
         RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
         RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+        isMcpObservation(name) ||
+        isMcpEffect(name) ||
         collaboration.has(name)
       );
     }).map(adapt);
@@ -657,6 +687,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
       isWorkspaceMutationToolName(name) ||
       VALIDATION_TOOL_NAMES.has(name) ||
+      isMcpObservation(name) ||
+      isMcpEffect(name) ||
       (directExecute &&
         name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) ||
       collaboration.has(name);

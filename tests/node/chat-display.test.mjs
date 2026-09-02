@@ -84,6 +84,10 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/streamDisplayPolicy.ts"));
 
 const {
+  shouldGroupPlanExecutionTools,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatToolSummary.ts"));
+
+const {
   getDisplayAgentContent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatContentPreview.ts"));
 
@@ -521,6 +525,14 @@ test("streaming display policy holds every preapproval Plan candidate outside Ca
     workflowMode: "plan",
     runIntent: "plan",
   }), false);
+  assert.equal(shouldProjectStreamingAssistantToCapsule({
+    workflowMode: "edit",
+    runIntent: "execute",
+  }), true);
+  assert.equal(shouldProjectStreamingAssistantToCapsule({
+    workflowMode: "edit",
+    runIntent: "studio_workflow",
+  }), false);
 
   const continuation = resolveStreamingAssistantDisplay({
     text: " world",
@@ -531,6 +543,18 @@ test("streaming display policy holds every preapproval Plan candidate outside Ca
   });
   assert.equal(continuation.action, "show");
   assert.equal(continuation.text, " world");
+});
+
+test("tool grouping treats engine work like ordinary MAIN execution", () => {
+  const input = {
+    isPlanTurn: false,
+    isPlanApproved: false,
+    planStage: "idle",
+    turnStatus: "executing",
+    isPlanExecutionVisible: false,
+  };
+  assert.equal(shouldGroupPlanExecutionTools({ ...input, turnIntent: "execute" }).enabled, true);
+  assert.equal(shouldGroupPlanExecutionTools({ ...input, turnIntent: "studio_workflow" }).enabled, false);
 });
 
 test("visual observation metadata never appears in streaming or final assistant text", () => {

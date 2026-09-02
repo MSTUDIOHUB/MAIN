@@ -13,7 +13,6 @@ export function selectRuntimeEngineVersionForNewTurn(
   return intent === "execute" ||
       intent === "plan" ||
       intent === "goal" ||
-      intent === "studio_workflow" ||
       isRuntimeV2ChatIntent(intent)
     ? "v2"
     : "legacy";
@@ -59,7 +58,6 @@ export type RuntimeV2VisibleRunnerKind =
   | "execute"
   | "plan"
   | "goal"
-  | "studio"
   | "chat"
   | "workspace_read";
 
@@ -74,7 +72,6 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   // retained only as diagnostic input; a later UI projection must never
   // redirect the admitted Turn or force it back to another executor.
   if (input.runtimeIntent === "execute") return "execute";
-  if (input.runtimeIntent === "studio_workflow") return "studio";
   if (input.runtimeIntent === "plan") return "plan";
   if (input.runtimeIntent === "goal") return "goal";
   if (

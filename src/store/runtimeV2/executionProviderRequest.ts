@@ -257,7 +257,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         role: "system" as const,
         content: containsProviderTextEnvelopePrompt(
           input.ports.context.phaseLanguage,
-          false,
+          structuredActionRequired,
         ),
       }, {
         role: "system" as const,

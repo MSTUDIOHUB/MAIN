@@ -4,7 +4,6 @@
 
 import type { Lang, Skill } from "./appTypes";
 import type { ResolvedInstructionSet } from "./instructions";
-import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudio/catalog";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 import {
   getApplicableProtocolPackagesForWorkspace,
@@ -17,7 +16,7 @@ import {
   type EffectiveTurnContract,
   type ResolvedUserIntent,
 } from "./runIntent";
-import type { PromptLanguageStrategy } from "./toolCapabilities";
+import type { GameEngine, PromptLanguageStrategy } from "./toolCapabilities";
 import type { ToolDefinition } from "./toolSchemas";
 import { buildWebResearchDateContext } from "./webResearchGuard";
 import type { GoalTurnContract } from "./goalState";
@@ -29,21 +28,16 @@ export const SYSTEM_PROMPT_MAX_CHARS = 32_000;
 
 export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: "MAIN coordinates scoped analysis, implementation, validation, and reporting for the current user request.",
-  game_studio: "Game Studio coordinates design, engineering, art, QA, release, and engine-specific editor workflows.",
   image_studio: "Image Studio belongs to the image runtime; do not enter the ordinary code-agent loop.",
 };
 
-export type GameStudioPromptContext = {
-  initialized?: boolean;
-  activeStudioAgentKey?: StudioAgentKey;
-  pendingSlashCommand?: PendingSlashCommand | null;
-  studioConfig?: StudioConfig | null;
+export type GameEnginePromptContext = {
+  engine?: GameEngine | string | null;
 };
 
 export type McpPriorityPromptContext = {
-  gameStudioMcpFirst?: boolean;
-  unityMcpFirst?: boolean;
-  engine?: "unity" | "godot" | "unreal" | string | null;
+  engineMcpFirst?: boolean;
+  engine?: GameEngine | string | null;
   unityConsoleFirst?: boolean;
   connectedServerNames?: string[];
 };
@@ -354,35 +348,28 @@ function buildIntentModule(input: {
   ]);
 }
 
-function buildGameStudioModule(
-  context: GameStudioPromptContext | undefined,
+function buildGameEngineMcpModule(
+  context: GameEnginePromptContext | undefined,
   priority: McpPriorityPromptContext | undefined,
 ): string {
-  const engine = normalizePromptEngine(context?.studioConfig?.engine || priority?.engine);
+  const engine = normalizePromptEngine(context?.engine || priority?.engine);
   const connected = (priority?.connectedServerNames || []).join(", ") || "none";
   const lines = [
-    "protocolEntry: .protocols/game-studio/SKILL.md",
-    `initialized: ${context?.initialized ? "true" : "false"}`,
-    `activeStudioAgent: ${context?.activeStudioAgentKey || "studio_auto"}`,
-    `pendingSlashCommand: ${context?.pendingSlashCommand?.canonicalCommand || "none"}`,
     `engine: ${engine || "unconfigured"}`,
-    "Read the protocol entry and only the relevant on-disk command/agent/template files on demand; do not preload the whole pack.",
-    "Use the active specialist as a working perspective while preserving studio-wide coordination.",
+    `connectedMcpServers: ${connected}`,
+    "Prefer matching engine MCP/editor tools for live scene, asset, console, and editor state; use workspace files for source and configuration evidence.",
+    "Inspect current editor state before mutation and validate the resulting engine state after mutation when the connected tools expose those operations.",
   ];
-  if (priority?.gameStudioMcpFirst || priority?.unityMcpFirst) {
-    lines.push(`connectedMcpServers: ${connected}`);
-    lines.push("Prefer matching engine MCP/editor tools for live scene, asset, console, and editor state; use workspace files for source and configuration evidence.");
-    if (engine === "unity" && priority.unityConsoleFirst) {
-      lines.push("For Unity console diagnostics, call read_console first. Do not start with a project skeleton or local log scan; use script_apply_edits for supported C# edits when available.");
-    }
-    if (engine === "godot") {
-      lines.push("For Godot work, inspect scene trees, nodes, resources, scripts, and editor output before editing `.tscn`, `.tres`, or `.gd` files.");
-    }
-    if (engine === "unreal") {
-      lines.push("For Unreal work, inspect the current Actor, level, asset or Blueprint references and Output Log before editing.");
-    }
+  if (engine === "unity" && priority?.unityConsoleFirst) {
+    lines.push("For Unity console diagnostics, call read_console first. Do not start with a project skeleton or local log scan; use script_apply_edits for supported C# edits when available.");
   }
-  return makeSection("MAIN GAME STUDIO", lines);
+  if (engine === "godot") {
+    lines.push("For Godot work, inspect scene trees, nodes, resources, scripts, and editor output before editing `.tscn`, `.tres`, or `.gd` files.");
+  }
+  if (engine === "unreal") {
+    lines.push("For Unreal work, inspect the current Actor, level, asset or Blueprint references and Output Log before editing.");
+  }
+  return makeSection("GAME ENGINE MCP", lines);
 }
 
 function buildInstructionSections(
@@ -438,7 +425,7 @@ export function buildSystemPrompt(
   workflowMode?: "chat" | "edit" | "plan",
   uiLanguage: Lang = "zh",
   resolvedInstructions?: ResolvedInstructionSet | null,
-  gameStudioContext?: GameStudioPromptContext,
+  gameEngineContext?: GameEnginePromptContext,
   turnIntentOverride?: ResolvedUserIntent,
   promptLanguageStrategy: PromptLanguageStrategy = "english_core_localized_output",
   availableToolNames?: string[],
@@ -543,10 +530,8 @@ export function buildSystemPrompt(
     ]));
   }
 
-  if (normalizedMode === "game_studio") {
-    sections.push(buildGameStudioModule(gameStudioContext, mcpPriorityContext));
-  } else if (mcpPriorityContext?.unityMcpFirst || mcpPriorityContext?.gameStudioMcpFirst) {
-    sections.push(buildGameStudioModule(gameStudioContext, mcpPriorityContext));
+  if (gameEngineContext?.engine || mcpPriorityContext?.engineMcpFirst) {
+    sections.push(buildGameEngineMcpModule(gameEngineContext, mcpPriorityContext));
   }
 
   if (intent === "goal" && goalTurnContract?.context) {

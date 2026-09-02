@@ -1,5 +1,8 @@
 import type { TurnAggregateV1 } from "./aggregate";
-import type { RuntimeV2Command } from "./contracts";
+import type {
+  RuntimeV2AcceptanceEvidenceRequirementSlot,
+  RuntimeV2Command,
+} from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { analyzeValidationCommand } from "../validationContract";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
@@ -152,7 +155,7 @@ export const RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT = 3;
 
 function validationSupportsRequirement(
   event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
-  requirement: "static" | "behavioral" | "interaction" | undefined,
+  requirement: RuntimeV2AcceptanceEvidenceRequirementSlot | undefined,
 ): boolean {
   if (!event.passed) return false;
   const toolName = event.presentation?.toolName || "";
@@ -177,8 +180,8 @@ function validationSupportsRequirement(
   if (requirement === "behavioral") return behavioral;
   // Direct Execute admission preserves the user's objective but does not
   // invent a semantic class from prose. Any real finite validator may cover
-  // an unclassified criterion; typed Goal and WorkPlan criteria retain their
-  // explicit stronger requirement.
+  // an absent or durably null unclassified criterion; typed Goal and WorkPlan
+  // criteria retain their explicit stronger requirement.
   return interaction || finite?.kind === "finite_command";
 }
 

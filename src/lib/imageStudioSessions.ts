@@ -16,9 +16,15 @@ export function normalizeSessionModeAffinity(
   value: unknown,
   fallback: SessionModeAffinity = "main_mode",
 ): SessionModeAffinity {
-  return value === "image_studio" || value === "game_studio" || value === "main_mode"
-    ? value
-    : fallback;
+  if (value === "image_studio") return "image_studio";
+  if (
+    value === "main_mode" ||
+    value === "game_studio" ||
+    value === "nexus_game_studio"
+  ) {
+    return "main_mode";
+  }
+  return fallback;
 }
 
 export function resolveSessionModeAffinity(
@@ -29,7 +35,9 @@ export function resolveSessionModeAffinity(
   return normalizeSessionModeAffinity(
     session.sessionModeAffinity ??
       session.runtimeSnapshot?.sessionModeAffinity ??
-      session.runtimeSnapshot?.selectedMainModeKey,
+      session.runtimeSnapshot?.selectedMainModeKey ??
+      session.runtimeSnapshot?.selectedNexusModeKey ??
+      session.runtimeSnapshot?.selectedAgentKey,
     fallback,
   );
 }

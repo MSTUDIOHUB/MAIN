@@ -1,6 +1,7 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import type {
+  McpRoutingConfig,
   ToolCapabilityRegistry,
   ToolPermissionPolicy,
 } from "../../lib/toolCapabilities";
@@ -23,6 +24,8 @@ export interface RuntimeV2ExecutionAuthorization {
   readonly toolCatalog: ToolCatalog;
   readonly capabilityRegistry: ToolCapabilityRegistry;
   readonly policy: ToolPermissionPolicy;
+  /** Deterministic MCP schema-budget policy captured with the Turn catalog. */
+  readonly mcpRouting: McpRoutingConfig;
 }
 
 export interface RuntimeV2ChildResult {

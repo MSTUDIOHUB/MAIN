@@ -95,16 +95,13 @@ export interface McpRoutingTelemetry {
   schemaChars?: number;
 }
 
-export type GameStudioMcpEngine = "unity" | "godot" | "unreal";
+export type GameEngine = "unity" | "godot" | "unreal";
 
-export type McpRoutingPriorityMode = "none" | "unity_mcp_first" | "game_studio_mcp_first";
+export type McpRoutingPriorityMode = "none" | "engine_mcp_first";
 
-export interface UnityMcpRoutingContext {
+export interface GameEngineMcpRoutingContext {
   preferStructuredScriptEdits?: boolean;
-}
-
-export interface GameStudioMcpRoutingContext extends UnityMcpRoutingContext {
-  engine?: GameStudioMcpEngine | null;
+  engine?: GameEngine | null;
 }
 
 export type McpToolsetIntent =
@@ -1043,7 +1040,7 @@ function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, use
   return score;
 }
 
-function normalizeGameStudioMcpEngine(engine: string | null | undefined): GameStudioMcpEngine | null {
+function normalizeGameEngine(engine: string | null | undefined): GameEngine | null {
   const normalized = String(engine || "").trim().toLowerCase();
   if (normalized === "unity") return "unity";
   if (normalized === "godot") return "godot";
@@ -1051,13 +1048,13 @@ function normalizeGameStudioMcpEngine(engine: string | null | undefined): GameSt
   return null;
 }
 
-function getGameStudioEngineTerms(engine: GameStudioMcpEngine): string[] {
+function getGameEngineTerms(engine: GameEngine): string[] {
   if (engine === "godot") return GODOT_TERMS;
   if (engine === "unreal") return UNREAL_TERMS;
   return UNITY_TERMS;
 }
 
-function scoreGameStudioIntentToolPreference(
+function scoreGameEngineIntentToolPreference(
   tool: MCPTool,
   server: MCPServer | undefined,
   intent: McpToolsetIntent,
@@ -1120,19 +1117,19 @@ function scoreGameStudioIntentToolPreference(
   return 0;
 }
 
-function scoreGameStudioMcpToolPreference(
+function scoreGameEngineMcpToolPreference(
   tool: MCPTool,
   server: MCPServer | undefined,
   userPrompt: string,
-  context?: GameStudioMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): number {
-  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  const engine = normalizeGameEngine(context?.engine);
   if (!engine) return 0;
   const prompt = normalizeText(userPrompt);
   const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
-  const engineTerms = getGameStudioEngineTerms(engine);
-  const selectedIntent = inferGameStudioMcpToolsetIntent(userPrompt, context);
-  const bundle = buildGameStudioMcpToolsetBundle(selectedIntent, context);
+  const engineTerms = getGameEngineTerms(engine);
+  const selectedIntent = inferGameEngineMcpToolsetIntent(userPrompt, context);
+  const bundle = buildGameEngineMcpToolsetBundle(selectedIntent, context);
   let score = 0;
 
   if (containsAny(text, engineTerms)) score += 36;
@@ -1142,7 +1139,7 @@ function scoreGameStudioMcpToolPreference(
   }
   if (bundle?.requiredTools.includes(tool.name)) score += 56;
   if (bundle?.preferredTools.includes(tool.name)) score += 34;
-  score += scoreGameStudioIntentToolPreference(tool, server, selectedIntent);
+  score += scoreGameEngineIntentToolPreference(tool, server, selectedIntent);
   if (engine === "unity") {
     score += scoreUnityStructuredEditPreference(tool, userPrompt, context);
   }
@@ -1152,7 +1149,7 @@ function scoreGameStudioMcpToolPreference(
 function scoreUnityStructuredEditPreference(
   tool: MCPTool,
   userPrompt: string,
-  context?: UnityMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): number {
   if (!context?.preferStructuredScriptEdits) return 0;
   const prompt = normalizeText(userPrompt);
@@ -1162,12 +1159,12 @@ function scoreUnityStructuredEditPreference(
   return 0;
 }
 
-function compareGameStudioPriorityToolNames(
+function compareGameEnginePriorityToolNames(
   left: MCPTool,
   right: MCPTool,
-  context?: GameStudioMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): number {
-  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  const engine = normalizeGameEngine(context?.engine);
   if (engine === "unity") return compareUnityPriorityToolNames(left, right, context);
 
   const rank = (tool: MCPTool): number => {
@@ -1197,7 +1194,7 @@ function compareGameStudioPriorityToolNames(
 function compareUnityPriorityToolNames(
   left: MCPTool,
   right: MCPTool,
-  context?: UnityMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): number {
   if (!context?.preferStructuredScriptEdits) {
     return left.name.localeCompare(right.name);
@@ -1311,7 +1308,7 @@ const UNITY_TOOLSET_BUNDLES: Record<UnityMcpToolsetIntent, McpToolsetBundle> = {
 
 function inferUnityMcpToolsetIntent(
   userPrompt: string,
-  context?: UnityMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): McpToolsetIntent {
   const prompt = normalizeText(userPrompt);
   const hasConsoleIntent = containsAny(prompt, UNITY_CONSOLE_TERMS);
@@ -1350,11 +1347,11 @@ function inferUnityMcpToolsetIntent(
   return "unity_console_diagnostics";
 }
 
-function inferGameStudioMcpToolsetIntent(
+function inferGameEngineMcpToolsetIntent(
   userPrompt: string,
-  context?: GameStudioMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): McpToolsetIntent {
-  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  const engine = normalizeGameEngine(context?.engine);
   if (engine === "unity") return inferUnityMcpToolsetIntent(userPrompt, context);
 
   const prompt = normalizeText(userPrompt);
@@ -1435,11 +1432,11 @@ function inferGameStudioMcpToolsetIntent(
   return "general";
 }
 
-function buildGameStudioMcpToolsetBundle(
+function buildGameEngineMcpToolsetBundle(
   intent: McpToolsetIntent,
-  context?: GameStudioMcpRoutingContext,
+  context?: GameEngineMcpRoutingContext,
 ): McpToolsetBundle | null {
-  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  const engine = normalizeGameEngine(context?.engine);
   if (engine === "unity" && intent !== "general" && intent in UNITY_TOOLSET_BUNDLES) {
     return UNITY_TOOLSET_BUNDLES[intent as UnityMcpToolsetIntent];
   }
@@ -1728,8 +1725,7 @@ export function routeMcpToolsForPrompt(params: {
   priorityMode?: McpRoutingPriorityMode;
   preferredServerUrls?: string[];
   forceFirstTools?: string[];
-  unityRoutingContext?: UnityMcpRoutingContext;
-  gameStudioRoutingContext?: GameStudioMcpRoutingContext;
+  gameEngineRoutingContext?: GameEngineMcpRoutingContext;
 }): { tools: MCPTool[]; telemetry: McpRoutingTelemetry } {
   const startedAt = Date.now();
   const config = normalizeMcpRoutingConfig(params.config);
@@ -1777,15 +1773,11 @@ export function routeMcpToolsForPrompt(params: {
 
   if (!config.enabled) return finish(enabledTools, "disabled");
 
-  if (params.priorityMode === "unity_mcp_first" || params.priorityMode === "game_studio_mcp_first") {
-    const gameStudioRoutingContext: GameStudioMcpRoutingContext = {
-      ...(params.unityRoutingContext ?? {}),
-      ...(params.gameStudioRoutingContext ?? {}),
-      engine: params.gameStudioRoutingContext?.engine ?? (
-        params.priorityMode === "unity_mcp_first" ? "unity" : params.gameStudioRoutingContext?.engine
-      ),
+  if (params.priorityMode === "engine_mcp_first") {
+    const gameEngineRoutingContext: GameEngineMcpRoutingContext = {
+      ...(params.gameEngineRoutingContext ?? {}),
     };
-    const priorityEngine = normalizeGameStudioMcpEngine(gameStudioRoutingContext.engine);
+    const priorityEngine = normalizeGameEngine(gameEngineRoutingContext.engine);
     const preferredServerUrls = new Set(
       (params.preferredServerUrls ?? []).filter((url) => typeof url === "string" && url.trim().length > 0),
     );
@@ -1802,16 +1794,16 @@ export function routeMcpToolsForPrompt(params: {
           tool,
           score:
             scoreMcpToolForPrompt(tool, server, params.userPrompt) +
-            scoreGameStudioMcpToolPreference(tool, server, params.userPrompt, gameStudioRoutingContext),
+            scoreGameEngineMcpToolPreference(tool, server, params.userPrompt, gameEngineRoutingContext),
         };
       });
     const scoredTools = scoredEntries
       .filter((entry) => entry.score > 0 || preferredServerUrls.has(serverUrlFor(entry.tool)))
-      .sort((a, b) => b.score - a.score || compareGameStudioPriorityToolNames(a.tool, b.tool, gameStudioRoutingContext))
+      .sort((a, b) => b.score - a.score || compareGameEnginePriorityToolNames(a.tool, b.tool, gameEngineRoutingContext))
       .map((entry) => entry.tool);
 
-    const selectedIntent = inferGameStudioMcpToolsetIntent(params.userPrompt, gameStudioRoutingContext);
-    const bundle = buildGameStudioMcpToolsetBundle(selectedIntent, gameStudioRoutingContext);
+    const selectedIntent = inferGameEngineMcpToolsetIntent(params.userPrompt, gameEngineRoutingContext);
+    const bundle = buildGameEngineMcpToolsetBundle(selectedIntent, gameEngineRoutingContext);
     const forcedNames = Array.from(new Set([
       ...(params.forceFirstTools ?? []),
       ...(bundle?.requiredTools ?? []),
@@ -1833,7 +1825,7 @@ export function routeMcpToolsForPrompt(params: {
     if (prioritized.length > 0) {
       return finish(prioritized, "heuristic", undefined, {
         selectedIntent,
-        selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
+        selectedBundle: bundle?.id ?? `${priorityEngine ?? "engine_mcp"}_scored`,
       });
     }
 
@@ -1842,16 +1834,16 @@ export function routeMcpToolsForPrompt(params: {
       return finish(
         fallbackTools.length > 0 ? fallbackTools : enabledTools.slice(0, Math.min(config.threshold, 16)),
         "fallback_full_list",
-        `${priorityEngine ?? "game_studio"}_priority_no_candidates`,
+        `${priorityEngine ?? "engine_mcp"}_priority_no_candidates`,
         {
           selectedIntent,
-          selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
+          selectedBundle: bundle?.id ?? `${priorityEngine ?? "engine_mcp"}_scored`,
         },
       );
     }
-    return finish([], "safe_empty", `${priorityEngine ?? "game_studio"}_priority_no_candidates`, {
+    return finish([], "safe_empty", `${priorityEngine ?? "engine_mcp"}_priority_no_candidates`, {
       selectedIntent,
-      selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
+      selectedBundle: bundle?.id ?? `${priorityEngine ?? "engine_mcp"}_scored`,
     });
   }
 

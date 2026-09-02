@@ -7,7 +7,6 @@ import type { TaskBlock } from "../lib/taskTypes";
 import type { UserChoiceResolutionIdentity } from "../lib/actionRequest";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "../lib/runIntent";
-import type { PendingSlashCommand } from "../lib/gameStudio/catalog";
 
 type SubmitVisibleTurnSessionGet = () => any;
 type SubmitVisibleTurnSessionSet = (patch: any) => void;
@@ -46,7 +45,6 @@ export interface ApplySubmitVisibleTurnInput {
   initialTurnStatus: ConversationTurnStatus;
   operationProposalChoiceAction?: unknown;
   turnTitle: string;
-  parsedStudioCommand: PendingSlashCommand | null;
   preferredLanguage: "zh" | "en";
   preservePlanState: boolean;
   shouldGrantExecutionConsentForTurn: boolean;
@@ -169,7 +167,6 @@ export function applySubmitVisibleTurn(
       preferredLanguage: input.preferredLanguage,
       shouldArchiveChoiceFeedback,
       currentNormalizedStreamState: s.normalizedStreamState,
-      parsedStudioCommand: input.parsedStudioCommand,
       effectiveWorkflowMode: input.effectiveWorkflowMode,
       preservePlanState: input.preservePlanState,
       shouldGrantExecutionConsentForTurn: input.shouldGrantExecutionConsentForTurn,

@@ -1,9 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
-import {
-  deriveBudgetedStreamSettings,
-  deriveProviderAdapterCapabilities,
-} from "../../lib/providerLaneSettings";
+import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
 import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { streamChatCompletion } from "../../lib/streaming";
 import {
