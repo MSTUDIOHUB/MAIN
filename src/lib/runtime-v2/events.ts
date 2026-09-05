@@ -52,6 +52,8 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.started";
+      /** An explicit caller-owned budget, never a default Turn-age limit. */
+      readonly lifecycleDeadlineAt?: number;
       readonly run: RuntimeV2RunIdentity;
       readonly phase: Exclude<RuntimeV2Phase, "reviewing" | "completed">;
     })

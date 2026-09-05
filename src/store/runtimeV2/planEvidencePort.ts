@@ -10,9 +10,7 @@ import {
 } from "../../lib/runtime-v2";
 import { PlanLedger } from "./planLedger";
 import {
-  PLAN_CONTEXT_RESULT_CHARS,
   PLAN_READ_ONLY_TOOL_NAMES,
-  compactRetainedPlanObservation,
 } from "./planModelProtocol";
 import {
   boundedRuntimeV2ToolContent,
@@ -34,6 +32,8 @@ export async function settlePlanTool(input: {
   readonly evidence?: readonly RuntimeV2EvidenceReference[];
   readonly failureKind?: "protocol_invalid";
   readonly failureReasonCode?: string;
+  readonly modelContent?: string;
+  readonly receiptOrigin?: "executed" | "replayed";
   readonly presentation?: {
     readonly toolName: string;
     readonly target: string;
@@ -54,6 +54,8 @@ export async function settlePlanTool(input: {
     idempotencyKey: command.idempotencyKey,
     status: input.status,
     evidence: input.evidence || [],
+    ...(input.modelContent !== undefined ? { modelContent: input.modelContent } : {}),
+    ...(input.receiptOrigin ? { receiptOrigin: input.receiptOrigin } : {}),
     ...(input.failureKind ? { failureKind: input.failureKind } : {}),
     ...(input.failureReasonCode
       ? { failureReasonCode: input.failureReasonCode }
@@ -135,7 +137,7 @@ export async function executeReadOnlyPlanTool(input: {
       entry.version === version
     );
     const evidenceEntry = existingEvidence || {
-      id: `E${input.evidence.length + 1}`,
+      id: `E${1 + input.evidence.reduce((max, entry) => Math.max(max, /^E\d+$/.test(entry.id) ? Number(entry.id.slice(1)) : 0), 0)}`,
       target,
       version,
       statement: input.call.name === "load_skill"
@@ -155,22 +157,24 @@ export async function executeReadOnlyPlanTool(input: {
     } else if (!repeatedObservation) {
       input.evidenceContents.set(
         evidenceEntry.id,
-        compactRetainedPlanObservation(
           [
             previousContent,
             `[Additional read window for ${target}]`,
             content,
           ].filter(Boolean).join("\n\n"),
-          PLAN_CONTEXT_RESULT_CHARS * 2,
-        ),
       );
     }
+    const modelContent = existingEvidence && repeatedObservation
+      ? `[${evidenceEntry.id}] ${target}\nRuntime v2 reused this unchanged source and observation.`
+      : `[${evidenceEntry.id}] ${target}\n${content}`;
     await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
       call: input.call,
       status: "succeeded",
-      evidence: [{
+      modelContent,
+      receiptOrigin: "executed",
+      evidence: repeatedObservation ? [] : [{
         id: evidenceEntry.id,
         kind: input.call.name === "load_skill" ? "tool" : "source",
         target,
@@ -180,9 +184,7 @@ export async function executeReadOnlyPlanTool(input: {
     input.messages.push({
       role: "tool",
       tool_call_id: input.call.id,
-      content: existingEvidence && repeatedObservation
-        ? `[${evidenceEntry.id}] ${target}\nRuntime v2 reused this unchanged source and observation.`
-        : `[${evidenceEntry.id}] ${target}\n${content}`,
+      content: modelContent,
     });
     input.logStoreEvent(!existingEvidence
       ? "runtime_v2_plan_read_completed"

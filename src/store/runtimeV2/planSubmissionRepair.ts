@@ -9,7 +9,6 @@ import {
 import { settlePlanTool } from "./planEvidencePort";
 import { PlanLedger } from "./planLedger";
 import {
-  PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS,
   SUBMIT_WORK_PLAN_TOOL_NAME,
 } from "./planModelProtocol";
 
@@ -69,7 +68,7 @@ export function createRuntimeV2PlanSubmissionLifecycle(input: {
   readonly ledger: PlanLedger;
   readonly run: RuntimeV2RunIdentity;
   readonly messages: AgentMessage[];
-  readonly lifecycleMs: number;
+  readonly lifecycleMs?: number;
 }) {
   const fallbackStartedAt = Date.now();
   const current = () => resolveRuntimeV2PlanSubmissionLifecycle({
@@ -86,13 +85,13 @@ export function createRuntimeV2PlanSubmissionLifecycle(input: {
   return { current };
 }
 
-/** Resolve both clocks exclusively from durable events. A process restart may
- * neither reset the Plan lifecycle nor renew its one repair grace. */
+/** Ordinary Plan has no total duration limit. Explicit caller deadlines are
+ * durable and cannot be extended by rejection, progress or a restart. */
 export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
   readonly aggregate: TurnAggregateV1;
   readonly run: RuntimeV2RunIdentity;
   readonly fallbackStartedAt: number;
-  readonly lifecycleMs: number;
+  readonly lifecycleMs?: number;
 }): {
   readonly originalDeadlineAt: number;
   readonly effectiveDeadlineAt: number;
@@ -101,8 +100,11 @@ export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
   const runStarted = input.aggregate.events.find((event) =>
     event.type === "run.started" && sameRun(event.run, input.run)
   );
-  const originalDeadlineAt =
-    (runStarted?.at ?? input.fallbackStartedAt) + input.lifecycleMs;
+  const originalDeadlineAt = runStarted?.type === "run.started" && Number.isFinite(runStarted.lifecycleDeadlineAt)
+    ? runStarted.lifecycleDeadlineAt!
+    : Number.isFinite(input.lifecycleMs)
+      ? (runStarted?.at ?? input.fallbackStartedAt) + input.lifecycleMs!
+      : Number.POSITIVE_INFINITY;
   const rejection = firstTypedSubmissionRejection(
     input.aggregate,
     input.run,
@@ -113,18 +115,13 @@ export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
     );
   return {
     originalDeadlineAt,
-    effectiveDeadlineAt: rejection
-      ? Math.max(
-          originalDeadlineAt,
-          rejection.at + PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS,
-        )
-      : originalDeadlineAt,
+    effectiveDeadlineAt: originalDeadlineAt,
     submissionRepairPending,
   };
 }
 
-/** Persist a compiler/criteria/adoption rejection as the sole authority for a
- * bounded post-deadline repair. Malformed transport input never calls this. */
+/** Compiler/criteria/adoption feedback is durable recovery authority.
+ * Malformed transport input never calls this. */
 export async function recordRuntimeV2PlanSubmissionRejection(input: {
   readonly ledger: PlanLedger;
   readonly run: RuntimeV2RunIdentity;
@@ -140,6 +137,7 @@ export async function recordRuntimeV2PlanSubmissionRejection(input: {
     status: "failed",
     failureKind: "protocol_invalid",
     failureReasonCode: PLAN_SUBMISSION_VALIDATION_REJECTION_CODE,
+    modelContent: feedback,
     presentation: {
       toolName: SUBMIT_WORK_PLAN_TOOL_NAME,
       target: WORK_PLAN_V1_SCHEMA_VERSION,
@@ -169,6 +167,7 @@ export function restoreRuntimeV2PlanSubmissionRepairHistory(input: {
   if (scheduled?.type !== "command.scheduled") return;
   const toolCallId = String(scheduled.command.payload.toolCallId || "").trim();
   if (!toolCallId) return;
+  if (input.messages.some((message) => message.role === "tool" && message.tool_call_id === toolCallId)) return;
   input.messages.push({
     role: "assistant",
     content: "",

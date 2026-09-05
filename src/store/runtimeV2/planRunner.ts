@@ -8,13 +8,15 @@ import { requiredPlanCollaborationFailure, type RuntimeV2PlanTerminalFailure } f
 import { handleRequiredPlanCollaborationProviderTimeout, requiredPlanCollaborationProviderTimeoutFailure, restoreRequiredPlanCollaborationProviderTimeoutGuidance } from "./planCollaborationAcquisition";
 import { createRuntimeV2PlanCollaboration } from "./planCollaboration";
 import { completeRuntimeV2Plan, recoverRuntimeV2PlanFailure, settleRuntimeV2PlanCompletion } from "./planCompletion";
-import { PLAN_MODEL_COMPACTION_INTERVAL, PLAN_MODEL_DEADLINE_MS, SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, workPlanDraftFromSubmission, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
-import { decodeExactStructuredPlanResponse } from "./workPlanSubmission";
+import { SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, workPlanDraftFromSubmission, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
 import { runtimeV2ParallelReadCount } from "./executionText";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { assertAdmittedPlanCriteriaMapped, assertCompletedPlanChildrenAdopted } from "./planSubmissionPolicy";
 import { createRuntimeV2PlanSubmissionLifecycle, recordRuntimeV2PlanSubmissionRejection } from "./planSubmissionRepair";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
+import { deriveReadOnlyRecoveryWindow } from "../../lib/runtime-v2/readOnlyProgress";
+import { isRuntimeV2LifecycleDeadlineError, runtimeV2ProviderRecoveryStallExpired } from "../../lib/runtime-v2/lifecycle";
+import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 export type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 export async function runSubmitRuntimeV2Plan(
   input: RuntimeV2PlanRunnerInput,
@@ -24,7 +26,7 @@ export async function runSubmitRuntimeV2Plan(
   const { turn, identity, ledger, evidence, evidenceContents, messages } =
     bootstrap;
   const planLifecycle = createRuntimeV2PlanSubmissionLifecycle({
-    ledger, run: identity.run, messages, lifecycleMs: PLAN_MODEL_DEADLINE_MS,
+    ledger, run: identity.run, messages,
   });
   const initialLifecycle = planLifecycle.current();
   const originalDeadlineAt = initialLifecycle.originalDeadlineAt;
@@ -56,9 +58,20 @@ export async function runSubmitRuntimeV2Plan(
         collaborationRequirementMet: initialCollaboration.collaborationRequirementMet === true,
       });
     let round = 0;
-    let stage: PlanModelStage = initialLifecycle.submissionRepairPending ? "synthesis" : "discovery";
-    let synthesisTransport: PlanProviderTransport = "native_tool";
-    let synthesisRecoveryCount = 0;
+    const priorEvents = ledger.snapshot()?.events || [];
+    const priorRequest = [...priorEvents].reverse().find((entry) => entry.type === "command.scheduled" && entry.command.kind === "request_model" && entry.run.runId === identity.run.runId);
+    const priorPayload = priorRequest?.type === "command.scheduled" ? priorRequest.command.payload : {};
+    let stage: PlanModelStage = initialLifecycle.submissionRepairPending || priorPayload.stage === "synthesis" ? "synthesis" : "discovery";
+    let synthesisTransport: PlanProviderTransport = priorPayload.transport === "structured_response" ? "structured_response" : "native_tool";
+    let compactRecoveryStarted = priorPayload.compactRecovery === true;
+    let synthesisRecoveryCount = compactRecoveryStarted ? 1 : 0;
+    // A restart after a settled compact failure must select the same next
+    // transport as the live runner. Unsettled requests may retry their lane.
+    if (compactRecoveryStarted && priorRequest?.type === "command.scheduled" && priorEvents.some((entry) =>
+      "idempotencyKey" in entry && entry.idempotencyKey === priorRequest.command.idempotencyKey &&
+      ((entry.type === "command.completed" && entry.status === "failed") ||
+        (entry.type === "provider.responded" && entry.result.toolCalls.length === 0))
+    )) synthesisTransport = synthesisTransport === "structured_response" ? "native_tool" : "structured_response";
     let submissionRepairPending = initialLifecycle.submissionRepairPending;
     while (!sealedPlan && !terminalFailure) {
       if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
@@ -71,28 +84,38 @@ export async function runSubmitRuntimeV2Plan(
       if (Date.now() >= deadlineAt) {
         await ledger.recordSoftSignal(identity.run, "context_pressure");
         terminalFailure = {
-          resultKind: evidence.length > 0 ? "partial" : "error",
-          reason: "计划生成已到达运行时限；已保留现有证据并明确结束本轮，没有留下悬空任务。",
+          resultKind: "error",
+          reason: "计划生成已到达调用方明确指定的截止时间；尚未生成可供审核的计划。",
           detailCode: "runtime_v2_plan_deadline_reached",
         };
         break;
       }
-      if (round > 0 && round % PLAN_MODEL_COMPACTION_INTERVAL === 0) {
-        await ledger.recordSoftSignal(identity.run, "iteration_limit");
-        if (messages.length > 21) {
-          messages.splice(3, messages.length - 21);
-        }
-        messages.push({
-          role: "system",
-          content: "The planning context was compacted at a soft pressure boundary. Continue from retained evidence; this signal is not a terminal decision.",
-        });
-        input.logStoreEvent("runtime_v2_plan_soft_round_signal", {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          round,
-          terminal: false,
-          action: "compact_and_continue",
-        });
+      const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, {
+        finalTextIsProgress: false, includeChildEvidence: true,
+      });
+      const recoveryExpired = recovery && runtimeV2ProviderRecoveryStallExpired({
+        startedAt: recovery.startedAt, reason: recovery.pressure.reason,
+        latestOccurrence: recovery.pressure.occurrence,
+      }, Date.now());
+      if (recoveryExpired && planCollaboration.activeChildCount() > 0) {
+        await planCollaboration.joinActive("plan_recovery_waits_for_active_children");
+        continue;
+      }
+      if (recoveryExpired) {
+        terminalFailure = {
+          resultKind: "error",
+          reason: "计划生成连续未获得新证据或有效提交，恢复窗口已耗尽；尚未生成可供审核的计划。",
+          detailCode: "runtime_v2_plan_recovery_stall_exhausted",
+        };
+        break;
+      }
+      if (recovery) upsertRuntimeV2ContextAnchor(planCollaboration.live, {
+        key: "plan-recovery",
+        content: `The last request did not add new evidence or a valid WorkPlan (${recovery.pressure.reason}). Name one concrete missing path, range or fact before another read; otherwise submit the plan from retained evidence. Cached or unchanged results are not progress.`,
+      });
+      else {
+        const index = messages.findIndex((message) => message.role === "system" && String(message.content).startsWith("[runtime-v2 context: plan-recovery]"));
+        if (index >= 0) messages.splice(index, 1);
       }
       round += 1;
       let response: Awaited<ReturnType<typeof requestPlanModel>>;
@@ -102,16 +125,18 @@ export async function runSubmitRuntimeV2Plan(
       try {
         const collaboration = planCollaboration.current().payload;
         repeatedArgumentRejections = (ledger.snapshot()?.events || []).filter((entry) =>
-          entry.type === "provider.responded" &&
+          recovery && entry.at >= recovery.startedAt && entry.type === "provider.responded" &&
           entry.result.diagnostics?.some((diagnostic) =>
             diagnostic.code === "tool_arguments_rejected"
           )
         ).length >= 2;
         compactRecovery = stage === "synthesis" &&
-          ((!submissionRepairPending && synthesisRecoveryCount > 0) || repeatedArgumentRejections);
-        effectiveTransport = compactRecovery
-          ? "structured_response"
-          : (stage === "synthesis" ? synthesisTransport : "native_tool");
+          (compactRecoveryStarted || (!submissionRepairPending && synthesisRecoveryCount > 0) || repeatedArgumentRejections);
+        if (compactRecovery && !compactRecoveryStarted) {
+          synthesisTransport = "structured_response";
+          compactRecoveryStarted = true;
+        }
+        effectiveTransport = stage === "synthesis" ? synthesisTransport : "native_tool";
         response = await requestPlanModel({
           get: input.get,
           context: input.context,
@@ -130,7 +155,11 @@ export async function runSubmitRuntimeV2Plan(
         });
       } catch (error) {
         if (input.context.abortCtrl.signal.aborted) throw error;
+        if (isRuntimeV2LifecycleDeadlineError(error)) continue;
+        const attempted = [...(ledger.snapshot()?.events || [])].reverse().find((entry) => entry.type === "command.scheduled" && entry.command.kind === "request_model" && entry.run.runId === identity.run.runId);
+        if (attempted?.type === "command.scheduled") effectiveTransport = attempted.command.payload.transport as PlanProviderTransport;
         const detail = error instanceof Error ? error.message : String(error);
+        if (detail === "READ_ONLY_CONTEXT_BUDGET_EXCEEDED") throw error;
         const requirementFailure = requiredPlanCollaborationFailure({ error });
         if (requirementFailure) {
           terminalFailure = requirementFailure;
@@ -151,7 +180,7 @@ export async function runSubmitRuntimeV2Plan(
         }
         if (isRuntimeV2ProviderTransportsUnavailableError(error)) {
           terminalFailure = {
-            resultKind: evidence.length > 0 ? "partial" : "error",
+            resultKind: "error",
             reason: "模型适配器确认当前没有可用的计划传输通道；已保留现有证据并明确结束本轮。",
             detailCode: "runtime_v2_plan_provider_transports_unavailable",
           };
@@ -161,9 +190,7 @@ export async function runSubmitRuntimeV2Plan(
             round,
             evidenceCount: evidence.length,
             stage,
-            transport: isPlanSubmissionStage(stage)
-              ? synthesisTransport
-              : "native_tool",
+            transport: effectiveTransport,
             terminal: true,
             error: detail,
           });
@@ -185,13 +212,13 @@ export async function runSubmitRuntimeV2Plan(
             canContinue: true,
             terminal: false,
             action: "switch_to_synthesis",
-            from: "native_tool",
+            from: effectiveTransport,
             to: synthesisTransport,
             error: detail,
           });
           continue;
         }
-        const previousTransport: PlanProviderTransport = synthesisTransport;
+        const previousTransport: PlanProviderTransport = effectiveTransport;
         synthesisRecoveryCount += 1;
         synthesisTransport = previousTransport === "structured_response"
           ? "native_tool"
@@ -225,14 +252,7 @@ export async function runSubmitRuntimeV2Plan(
         collaboration: planCollaboration.current().payload,
         round, stage, logStoreEvent: input.logStoreEvent,
       })) {
-        if (repeatedArgumentRejections) {
-          terminalFailure = {
-            resultKind: "error",
-            reason: "WorkPlan 结构化恢复失败；未能生成有效的计划。",
-            detailCode: "runtime_v2_plan_submission_transport_recovery_exhausted",
-          };
-          break;
-        }
+        if (compactRecovery) synthesisTransport = response.transport === "structured_response" ? "native_tool" : "structured_response";
         continue;
       }
       if (response.toolCalls.length === 0) {
@@ -272,67 +292,8 @@ export async function runSubmitRuntimeV2Plan(
           continue;
         }
         if (stage === "synthesis") {
-          if (effectiveTransport === "structured_response") {
-            const candidate = decodeExactStructuredPlanResponse(response.visibleText);
-            if (candidate) {
-              try {
-                const compiled = workPlanDraftFromSubmission(
-                  candidate,
-                  evidence,
-                  turn.userPrompt,
-                  admittedCriterionIds,
-                );
-                const draft = compiled.draft;
-                assertAdmittedPlanCriteriaMapped({
-                  draft,
-                  criterionIds: admittedCriterionIds,
-                });
-                assertCompletedPlanChildrenAdopted({
-                  aggregate: ledger.snapshot(),
-                  draft,
-                  collaborationRequired: (ledger.snapshot()?.subagentRequirement ?? input.context.turnInputContextSignals?.subagentRequirement) === "required",
-                });
-                if (compiled.normalized) {
-                  input.logStoreEvent("runtime_v2_plan_submission_normalized", {
-                    turnId: identity.turn.turnId,
-                    runId: identity.run.runId,
-                    round,
-                    evidenceCount: evidence.length,
-                    stepCount: draft.steps.length,
-                    validationCount: draft.validations.length,
-                    reasons: compiled.normalizationReasons,
-                  });
-                }
-                const reviewedPlan = sealWorkPlanV1({
-                  draft,
-                  evidence,
-                  createdAt: Date.now(),
-                });
-                sealedPlan = reviewedPlan;
-                break;
-              } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                if (repeatedArgumentRejections) {
-                  terminalFailure = {
-                    resultKind: "error",
-                    reason: `WorkPlan 结构化校验失败: ${detail}`,
-                    detailCode: "runtime_v2_plan_submission_transport_recovery_exhausted",
-                  };
-                  break;
-                }
-              }
-            }
-            if (repeatedArgumentRejections) {
-              terminalFailure = {
-                resultKind: "error",
-                reason: "WorkPlan 结构化恢复失败；未能生成有效的计划。",
-                detailCode: "runtime_v2_plan_submission_transport_recovery_exhausted",
-              };
-              break;
-            }
-          }
           await ledger.recordSoftSignal(identity.run, "protocol_drift");
-          const previousTransport: PlanProviderTransport = synthesisTransport;
+          const previousTransport: PlanProviderTransport = response.transport;
           synthesisRecoveryCount += 1;
           synthesisTransport = previousTransport === "structured_response"
             ? "native_tool"
@@ -401,14 +362,6 @@ export async function runSubmitRuntimeV2Plan(
             identity.run,
             "protocol_drift",
           );
-          if (repeatedArgumentRejections) {
-            terminalFailure = {
-              resultKind: "error",
-              reason: "WorkPlan 结构化校验失败: submit arguments must be one JSON object.",
-              detailCode: "runtime_v2_plan_submission_transport_recovery_exhausted",
-            };
-            break;
-          }
           stage = "synthesis";
           submissionRepairPending = true;
           continue;
@@ -477,14 +430,6 @@ export async function runSubmitRuntimeV2Plan(
             identity.run,
             "protocol_drift",
           );
-          if (repeatedArgumentRejections) {
-            terminalFailure = {
-              resultKind: "error",
-              reason: `WorkPlan 结构化校验失败: ${detail}`,
-              detailCode: "runtime_v2_plan_submission_transport_recovery_exhausted",
-            };
-            break;
-          }
           stage = "synthesis";
           submissionRepairPending = true;
           continue;

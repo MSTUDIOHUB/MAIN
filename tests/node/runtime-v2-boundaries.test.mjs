@@ -251,7 +251,8 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   assert.doesNotMatch(
     source,
     /PLAN_DISCOVERY_ACTION_BUDGET|PLAN_DISCOVERY_DEADLINE_MS|action_budget|time_budget/,
-    "planning may compact softly but only its shared model-stage deadline may end discovery",
+    "planning must not infer a separate discovery or action-count deadline",
   );
-  assert.match(runner, /PLAN_MODEL_DEADLINE_MS/);
+  assert.doesNotMatch(source, /PLAN_MODEL_DEADLINE_MS|PLAN_MODEL_COMPACTION_INTERVAL/);
+  assert.match(runner, /runtimeV2ProviderRecoveryStallExpired/);
 });

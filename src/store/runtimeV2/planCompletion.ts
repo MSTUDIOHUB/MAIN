@@ -149,6 +149,7 @@ export async function recoverRuntimeV2PlanFailure(input: {
     throw input.error;
   }
   if (aggregate.terminalOutcome) {
+    await input.ledger.finishTerminal({ run: input.run, resultKind: aggregate.terminalOutcome.resultKind, reason: aggregate.terminalOutcome.reason });
     return {
       kind: "settled",
       settlement: planSettlement(
@@ -196,7 +197,7 @@ export async function recoverRuntimeV2PlanFailure(input: {
       runner: input.runner,
       ledger: input.ledger,
       run: input.run,
-      resultKind: aggregate.evidence.length > 0 ? "partial" : "error",
+      resultKind: "error",
       reason: "计划生成遇到运行时错误；已保留现有证据并明确结束本轮，没有留下悬空任务。",
       detailCode: "runtime_v2_plan_unhandled_failure",
     },

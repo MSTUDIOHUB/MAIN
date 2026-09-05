@@ -191,7 +191,7 @@ test("novelty counts cumulative source coverage, not a reshaped overlapping wind
       type: "tool.completed", at: i * 10 + 1, idempotencyKey: `t${i}`, status: "succeeded", evidence: [{ id: `E${i}`, kind: "source", target: "file.ts", version: "v1" }], modelContent: `READ_FILE_RESULT\npath: file.ts\ntotalLines: 20\ntotalChars: 80\nreturnedLines: ${start}-${end}\nreturnedChars: 40\n---CONTENT START---\ncontents`,
     });
   }
-  const state = { events, pendingToolCalls: [], scheduledCommands: [] };
+  const state = { events: events.map((event, sequence) => ({ ...event, sequence })), pendingToolCalls: [], scheduledCommands: [] };
   assert.equal(progress.deriveReadOnlyRecoveryWindow(state).pressure.occurrence, 1);
 });
 

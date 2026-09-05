@@ -63,4 +63,11 @@ test("plan runtime survives reload and can resume execution", async ({ page }) =
     .toBe(true);
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("已完成");
+  await expect.poll(() => page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    return {
+      tasks: (bridge?.getSnapshot?.().planTasks ?? []).map((task: { status: string }) => task.status),
+      rejectedCompletion: bridge?.events?.some((entry: { type: string }) => entry.type === "completion-rejected"),
+    };
+  })).toEqual({ tasks: ["completed", "completed", "completed"], rejectedCompletion: false });
 });

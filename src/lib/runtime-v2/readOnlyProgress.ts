@@ -54,14 +54,23 @@ export function latestReadOnlyAnswer(state: TurnAggregateV1): string {
 
 /** Count settled provider batches, never individual calls in a parallel batch.
  * Receipts and their novelty are reconstructed from the canonical ledger. */
-export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1): RuntimeV2ProviderRecoveryWindow | null {
+export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
+  readonly finalTextIsProgress?: boolean;
+  readonly includeChildEvidence?: boolean;
+} = {}): RuntimeV2ProviderRecoveryWindow | null {
   if (state.pendingToolCalls.length || state.scheduledCommands.length) return null;
   const commands = new Map(state.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
-  const completions = new Map<string, Extract<RuntimeV2Event, { type: "tool.completed" }>>();
+  const completions = new Map<string, Array<Extract<RuntimeV2Event, { type: "tool.completed" }>>>();
   for (const event of state.events) {
-    if (event.type === "tool.completed") completions.set(String(commands.get(event.idempotencyKey)?.payload.toolCallId || ""), event);
+    if (event.type === "tool.completed") {
+      const key = String(commands.get(event.idempotencyKey)?.payload.toolCallId || "");
+      completions.set(key, [...(completions.get(key) || []), event]);
+    }
   }
+  const responses = state.events.filter((event) => event.type === "provider.responded");
+  const nextResponseSequence = new Map(responses.map((event, index) => [event.sequence, responses[index + 1]?.sequence ?? Infinity]));
   const seen = new Set<string>();
+  const providerCallIds = new Set(state.events.flatMap((event) => event.type === "provider.responded" ? event.result.toolCalls.map((call) => call.id) : []));
   const coverage = new Map<string, Array<[number, number]>>();
   let occurrence = 0;
   let startedAt = 0;
@@ -72,19 +81,32 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1): RuntimeV2P
     reason = nextReason;
   };
   for (const event of state.events) {
+    if (policy.includeChildEvidence && event.type === "subagent.handoff_delivered") {
+      const keys = event.evidenceIds.map((id) => `child:${event.jobId}:${id}`);
+      if (keys.some((key) => !seen.has(key))) occurrence = 0;
+      keys.forEach((key) => seen.add(key));
+      continue;
+    }
+    if (policy.finalTextIsProgress === false && event.type === "tool.completed" && event.status === "failed" &&
+      !providerCallIds.has(String(commands.get(event.idempotencyKey)?.payload.toolCallId || ""))) {
+      fail(event.at, "non_novel_evidence");
+      continue;
+    }
     if (event.type === "command.completed" && event.status === "failed" && commands.get(event.idempotencyKey)?.kind === "request_model") {
       fail(event.at, "provider_request_failed");
       continue;
     }
     if (event.type !== "provider.responded") continue;
-    if (!event.result.toolCalls.length && !event.result.diagnostics.length && String(event.result.visibleText || "").trim()) {
+    if (policy.finalTextIsProgress !== false && !event.result.toolCalls.length && !event.result.diagnostics.length && String(event.result.visibleText || "").trim()) {
       occurrence = 0;
       continue;
     }
     let novel = false;
     let settledAt = event.at;
     for (const call of event.result.toolCalls) {
-      const receipt = completions.get(call.id);
+      // Providers may reuse a tool-call ID in a later response. Its receipt
+      // belongs only to this response's interval, never a future replay.
+      const receipt = completions.get(call.id)?.find((item) => item.sequence > event.sequence && item.sequence < nextResponseSequence.get(event.sequence)!);
       if (!receipt) continue;
       settledAt = Math.max(settledAt, receipt.at);
       if (receipt.status !== "succeeded" || receipt.receiptOrigin === "replayed" || !receipt.evidence.length) continue;

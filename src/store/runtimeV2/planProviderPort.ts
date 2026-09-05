@@ -1,7 +1,7 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
-import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
+import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { streamChatCompletion } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
@@ -36,6 +36,7 @@ import {
   runtimeV2ProviderToolArgumentViolation,
 } from "./executionProviderTools";
 import { PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE } from "./planCollaborationAcquisition";
+import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2/lifecycle";
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (event: string, data?: Record<string, unknown>) => void;
 export interface RuntimeV2PlanProviderResult extends
@@ -44,12 +45,7 @@ export interface RuntimeV2PlanProviderResult extends
    * transport. This port enforces it before durable settlement; the runner
    * retains the snapshot for structured recovery telemetry. */
   readonly advertisedToolNames: readonly string[];
-}
-export function isPlanRequiredCollaborationUnavailable(
-  error: unknown,
-): boolean {
-  return error instanceof Error &&
-    error.message === "RUNTIME_V2_PLAN_REQUIRED_COLLABORATION_UNAVAILABLE";
+  readonly transport: PlanProviderTransport;
 }
 export async function requestPlanModel(input: {
   readonly get: StoreGet;
@@ -79,9 +75,7 @@ export async function requestPlanModel(input: {
     budget,
   );
   const requestedTransport = submissionStage
-    ? input.compactRecovery
-      ? "structured_response"
-      : input.transport || "native_tool"
+    ? input.transport || "native_tool"
     : "native_tool";
   const adapterCapabilities = deriveProviderAdapterCapabilities(settings);
   const repairReasoningDisabled = (
@@ -147,6 +141,7 @@ export async function requestPlanModel(input: {
     evidenceIds: input.ledger.snapshot()?.evidence.map((entry) => entry.id) || [],
     transport,
     submissionRepairPending: input.submissionRepairPending,
+    compactRecovery: !!input.compactRecovery,
     ...input.collaboration,
     requiredSpawn,
   });
@@ -160,54 +155,55 @@ export async function requestPlanModel(input: {
   } else {
     input.context.abortCtrl.signal.addEventListener("abort", forwardAbort, { once: true });
   }
-  const requestTimeoutMs = Math.max(1, Math.min(
+  const requestTimeoutMs = Math.max(1,
     submissionStage
-      ? input.compactRecovery
+      ? input.compactRecovery || input.submissionRepairPending
         ? PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS
         : PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS
       : PLAN_MODEL_REQUEST_TIMEOUT_MS,
-    input.deadlineAt - Date.now(),
-  ));
-  const planRequestMessages = submissionStage
-    ? synthesisPlanTranscript({
-        ...input,
-        submissionRepairPending: input.submissionRepairPending,
-        compactRecovery: !!input.compactRecovery,
-        transport,
-      })
-    : boundedPlanTranscript(input.messages);
-  const unboundedRequestMessages = textEnvelope
-    ? [
-        ...planRequestMessages,
-        {
-          role: "system" as const,
-          content: containsProviderTextEnvelopePrompt(
-            input.context.phaseLanguage,
-            true,
-          ),
-        },
-        {
-          role: "system" as const,
-          content: buildRuntimeV2TextEnvelopeCatalog(planTools),
-        },
-      ]
-    : planRequestMessages;
-  const maxOutputTokens = submissionStage
-    ? input.compactRecovery
-      ? Math.min(
-          budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
-          PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
-        )
-      : budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS
-    : budget?.outputBudget;
-  const requestMessages = budget
-    ? boundRuntimeMessagesToContext(unboundedRequestMessages, {
-        contextLimit: budget.contextLimit,
-        reservedOutputTokens:
-          maxOutputTokens || budget.outputBudget,
-      })
-    : unboundedRequestMessages;
+  );
   try {
+    const planRequestMessages = submissionStage
+      ? synthesisPlanTranscript({
+          ...input,
+          submissionRepairPending: input.submissionRepairPending,
+          compactRecovery: !!input.compactRecovery,
+          transport,
+        })
+      : boundedPlanTranscript(input.messages);
+    const unboundedRequestMessages = textEnvelope
+      ? [
+          ...planRequestMessages,
+          {
+            role: "system" as const,
+            content: containsProviderTextEnvelopePrompt(
+              input.context.phaseLanguage,
+              true,
+            ),
+          },
+          {
+            role: "system" as const,
+            content: buildRuntimeV2TextEnvelopeCatalog(planTools),
+          },
+        ]
+      : planRequestMessages;
+    const maxOutputTokens = submissionStage
+      ? input.compactRecovery
+        ? Math.min(
+            budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+            PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
+          )
+        : budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS
+      : budget?.outputBudget;
+    const requestMessages = budget
+      ? boundReadOnlyHistory(unboundedRequestMessages, {
+          contextLimit: budget.contextLimit,
+          reservedOutputTokens:
+            maxOutputTokens || budget.outputBudget,
+          tools: offeredTools,
+          preserveUserMessages: true,
+        })
+      : unboundedRequestMessages;
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
       turnId: input.run.turnId,
       runId: input.run.runId,
@@ -247,9 +243,8 @@ export async function requestPlanModel(input: {
     const lifecycleTimeoutMs = Math.max(1, input.deadlineAt - Date.now());
     const result = await withRuntimeV2HardDeadline({
       timeoutMs: lifecycleTimeoutMs,
-      timeoutError: "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT",
+      timeoutError: RUNTIME_V2_LIFECYCLE_DEADLINE_CODE,
       onTimeout: () => {
-        requestTimedOut = true;
         lifecycleTimedOut = true;
         requestAbort.abort("runtime_v2_plan_lifecycle_deadline");
       },
@@ -274,7 +269,7 @@ export async function requestPlanModel(input: {
         lane.setPressureHandler((error) => requestAbort.abort(error));
         const streamTimeoutMs = Math.max(
           1,
-          Math.min(requestTimeoutMs, input.deadlineAt - Date.now()),
+          requestTimeoutMs,
         );
         try {
           return await withRuntimeV2ProgressDeadline({
@@ -328,6 +323,7 @@ export async function requestPlanModel(input: {
         }
       },
     });
+    if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
     const rawVisibleText = result.content || streamedText;
     const structuredCandidate = structuredResponse
       ? decodeExactStructuredPlanResponse(rawVisibleText)
@@ -510,18 +506,20 @@ export async function requestPlanModel(input: {
     return {
       ...admitted,
       advertisedToolNames,
+      transport,
     };
   } catch (error) {
-    const providerRequestTimedOut = requestTimedOut || isPlanProviderRequestTimeout(
+    const providerRequestTimedOut = !lifecycleTimedOut && (requestTimedOut || isPlanProviderRequestTimeout(
       error,
       requestAbort.signal,
       input.context.abortCtrl.signal,
-    );
+    ));
     await input.ledger.settleCommand({
       type: "command.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
       status: input.context.abortCtrl.signal.aborted ? "canceled" : "failed",
+      ...(lifecycleTimedOut ? { failureReasonCode: RUNTIME_V2_LIFECYCLE_DEADLINE_CODE } : {}),
       ...(providerRequestTimedOut && requiredSpawn && !lifecycleTimedOut
         ? {
             failureReasonCode:
@@ -536,9 +534,11 @@ export async function requestPlanModel(input: {
       transport,
       timeoutMs: requestTimeoutMs,
       timedOut: providerRequestTimedOut,
+      lifecycleTimedOut,
       errorName: error instanceof Error ? error.name : "",
       error: error instanceof Error ? error.message : String(error || ""),
     });
+    if (lifecycleTimedOut) throw new RuntimeV2LifecycleDeadlineError();
     throw providerRequestTimedOut
       ? new Error("RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT")
       : error;

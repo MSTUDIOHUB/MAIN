@@ -25,6 +25,7 @@ import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
 import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { planSettlement, terminalPlanOutcome } from "./planSettlement";
+import { restorePlanHistory } from "./planHistory";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
@@ -128,6 +129,7 @@ async function collectInitialOverview(input: {
     await input.ledger.append({
       type: "observation.recorded",
       run: input.identity.run,
+      modelContent: overview,
       evidence: {
         id: "E1",
         kind: "source",
@@ -200,12 +202,22 @@ export async function bootstrapRuntimeV2Plan(
   );
   if (existing?.aggregate.terminalOutcome) {
     const terminal = existing.aggregate.terminalOutcome;
+    await ledger.finishTerminal({ run: identity.run, resultKind: terminal.resultKind, reason: terminal.reason });
     return {
       settlement: planSettlement(
         input.context,
         terminalPlanOutcome(terminal.resultKind, terminal.reason),
       ),
     };
+  }
+  const preparedTerminal = existing?.aggregate.events.find((entry) => entry.type === "command.scheduled" && entry.command.kind === "finalize_turn" && entry.command.payload.runtimeControlPlane === true);
+  if (preparedTerminal?.type === "command.scheduled") {
+    const payload = preparedTerminal.command.payload;
+    const resultKind = payload.resultKind as import("../../lib/runtime-v2").RuntimeV2ResultKind;
+    if (!["success", "partial", "blocked", "error", "canceled"].includes(resultKind)) throw new Error("RUNTIME_V2_PLAN_TERMINAL_INTENT_INVALID");
+    const reason = String(payload.resultReason || "");
+    await ledger.finishTerminal({ run: identity.run, resultKind, reason, finalMarkdown: typeof payload.finalMarkdown === "string" ? payload.finalMarkdown : undefined });
+    return { settlement: planSettlement(input.context, terminalPlanOutcome(resultKind, reason)) };
   }
   if (existing?.aggregate.phase === "reviewing") {
     await ledger.reconcileSealedPlanHandoffs();
@@ -245,6 +257,8 @@ export async function bootstrapRuntimeV2Plan(
       type: "run.started",
       run: identity.run,
       phase: "planning",
+      ...(Number.isFinite(input.lifecycleDeadlineAt)
+        ? { lifecycleDeadlineAt: input.lifecycleDeadlineAt } : {}),
     });
   } else if (
     existing.aggregate.strategy !== "plan" ||
@@ -271,7 +285,11 @@ export async function bootstrapRuntimeV2Plan(
 
   const evidence: WorkPlanRuntimeEvidence[] = [];
   const evidenceContents = new Map<string, string>();
-  const collected = await collectInitialOverview({
+  const oldOverview = existing?.aggregate.events.find((entry) => entry.type === "observation.recorded" && entry.evidence.id === "E1");
+  const collected = existing ? {
+    overview: oldOverview?.type === "observation.recorded" && oldOverview.modelContent
+      ? oldOverview.modelContent : "Historical workspace overview unavailable; use focused reads if needed.",
+  } : await collectInitialOverview({
     runner: input,
     turn,
     identity,
@@ -282,6 +300,10 @@ export async function bootstrapRuntimeV2Plan(
   if (collected.settlement) {
     return { settlement: collected.settlement };
   }
+  const messages = providerPlanMessages({ turn, context: input.context,
+    overview: collected.overview, subagentRequirement: ledger.snapshot()?.subagentRequirement,
+  });
+  if (existing) restorePlanHistory({ aggregate: ledger.snapshot()!, run: identity.run, messages, evidence, evidenceContents });
   return {
     settlement: null,
     turn,
@@ -289,11 +311,6 @@ export async function bootstrapRuntimeV2Plan(
     ledger,
     evidence,
     evidenceContents,
-    messages: providerPlanMessages({
-      turn,
-      context: input.context,
-      overview: collected.overview,
-      subagentRequirement: ledger.snapshot()?.subagentRequirement,
-    }),
+    messages,
   };
 }

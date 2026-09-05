@@ -2166,11 +2166,11 @@ function seedPlanReloadResumeScenario() {
         content: "# Requirements\n\n- 批准后应允许继续执行剩余任务。\n",
       },
       {
-        kind: "design" as const,
+        kind: "plan" as const,
         path: ".MAIN/plans/plan.md",
-        title: "Design",
+        title: "Plan",
         updatedAt: now - 2_000,
-        content: "# Design\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
+        content: "# Plan\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
       },
       {
         kind: "tasks" as const,
@@ -2381,13 +2381,19 @@ function seedPlanReloadResumeScenario() {
           text: "恢复计划工作区状态",
           status: "completed",
           evidenceStatus: "satisfied",
+          executionKind: "mutation",
+          evidence: [{ kind: "file", value: "src/planWorkspace.ts" }],
         },
         {
           id: "reload-task-2",
           text: "恢复对话与执行任务进度",
           status: "in_progress",
+          executionKind: "mutation",
+          evidence: [{ kind: "file", value: "src/planProgress.ts" }],
         },
-        { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending" },
+        { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending",
+          executionKind: "validation", evidence: [{ kind: "cmd", value: "npm test" }],
+        },
       ],
       planExecutionEvidenceLedger: [
         {
@@ -10705,41 +10711,11 @@ export function getE2EResumeExecutionHandler():
     }));
 
     window.setTimeout(() => {
-      const latest = useAppStore.getState();
-      const lifecycle = latest.planLifecycle;
-      if (!lifecycle.executionLease || !lifecycle.execution) return;
-      const completedAt = Date.now();
-      const completed = reducePlanLifecycle(lifecycle, {
-        type: "complete",
-        expectedVersion: lifecycle.version,
-        at: completedAt,
-        expectedExecutionLeaseId: lifecycle.executionLease.executionLeaseId,
-        expectedExecution: lifecycle.execution,
-      });
-      if (completed.disposition === "rejected") return;
-      finishPlanExecution(
+      const completed = finishPlanExecution(
         "恢复执行完成，剩余任务已全部收尾。",
         "页面重载后的 Plan 已成功恢复，并顺利完成剩余任务。",
       );
-      useAppStore.setState((current) => ({
-        planLifecycle: completed.state,
-        conversationTurns: current.conversationTurns.map((turn) =>
-          turn.id === executionOwner.turnId
-            ? {
-                ...turn,
-                runtimeOutcome: {
-                  status: "completed",
-                  reason: "e2e_plan_reload_completed",
-                  resultKind: "success",
-                  runId: executionOwner.runId,
-                  parentRunId: executionOwner.parentRunId,
-                  updatedAt: completedAt,
-                },
-              }
-            : turn,
-        ),
-      }));
-      appendBridgeEvent("completed");
+      if (completed) appendBridgeEvent("completed");
     }, 80);
 
     return true;

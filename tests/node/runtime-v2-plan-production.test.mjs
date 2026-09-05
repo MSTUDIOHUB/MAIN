@@ -68,6 +68,8 @@ const handoff = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planHandoff
 const engineSelection = loadTs(path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"));
 const runIntent = loadTs(path.join(workspaceRoot, "src/lib/runIntent.ts"));
 const planProtocol = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planModelProtocol.ts"));
+const EXPLICIT_PLAN_TEST_BUDGET_MS = 8 * 60_000;
+const PLAN_RECOVERY_STALL_MS = 10 * 60_000;
 
 const turn = {
   workspaceKey: "/fixture",
@@ -291,7 +293,7 @@ function planningCheckpointWithCompletedChild() {
     acceptanceCriterionIds: ["criterion-user-objective"],
     acceptanceEvidenceRequirements: ["behavioral"],
   }));
-  append(event(1, startedAt, { type: "run.started", run, phase: "planning" }));
+  append(event(1, startedAt, { type: "run.started", run, phase: "planning",  }));
   append(event(2, startedAt + 2, {
     type: "subagents.scheduled",
     run,
@@ -412,7 +414,7 @@ function reviewingCheckpointWithUnreconciledChildHandoff() {
   };
 }
 
-function planningCheckpointWithRequirement(subagentRequirement) {
+function planningCheckpointWithRequirement(subagentRequirement, explicitBudget = false) {
   const startedAt = Date.now();
   let checkpoint = null;
   const append = (value) => {
@@ -436,7 +438,7 @@ function planningCheckpointWithRequirement(subagentRequirement) {
     acceptanceCriterionIds: ["criterion-user-objective"],
     acceptanceEvidenceRequirements: ["behavioral"],
   }));
-  append(event(1, startedAt, { type: "run.started", run, phase: "planning" }));
+  append(event(1, startedAt, { type: "run.started", run, phase: "planning", ...(explicitBudget ? { lifecycleDeadlineAt: startedAt + EXPLICIT_PLAN_TEST_BUDGET_MS } : {}) }));
   return checkpoint;
 }
 
@@ -500,7 +502,7 @@ function planningCheckpointWithRequiredSpawnTimeouts(timeoutCount) {
 
 function planningCheckpointWithTypedSubmissionRejection() {
   const runStartedAt = 1_000_000;
-  const rejectionAt = runStartedAt + planProtocol.PLAN_MODEL_DEADLINE_MS - 10;
+  const rejectionAt = runStartedAt + EXPLICIT_PLAN_TEST_BUDGET_MS - 10;
   const toolCallId = "cold-rejected-work-plan";
   const idempotencyKey = "cold-rejected-work-plan-command";
   const candidate = {
@@ -661,7 +663,7 @@ function planningCheckpointWithRepeatedSubmitOnlyArgumentViolations() {
   };
 }
 
-function planningCheckpointWithActiveChild() {
+function planningCheckpointWithActiveChild(explicitBudget = false) {
   const startedAt = Date.now();
   const scheduled = runtime.scheduleReadOnlySubagents({
     parentRun: run,
@@ -701,7 +703,7 @@ function planningCheckpointWithActiveChild() {
     acceptanceCriterionIds: ["criterion-user-objective"],
     acceptanceEvidenceRequirements: ["behavioral"],
   }));
-  append(event(1, startedAt, { type: "run.started", run, phase: "planning" }));
+  append(event(1, startedAt, { type: "run.started", run, phase: "planning", ...(explicitBudget ? { lifecycleDeadlineAt: startedAt + EXPLICIT_PLAN_TEST_BUDGET_MS } : {}) }));
   append(event(2, startedAt + 2, {
     type: "subagents.scheduled",
     run,
@@ -810,6 +812,7 @@ async function runProductionPlanScenario(
       };
     },
   };
+  let mockProviderCalls = 0;
   const mocks = new Map([
     ["../../lib/providerLaneSettings", {
       deriveStreamSettings: () => ({
@@ -831,7 +834,10 @@ async function runProductionPlanScenario(
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || args.query || ""),
     }],
-    ["../../lib/streaming", { streamChatCompletion: streamCompletion }],
+    ["../../lib/streaming", { streamChatCompletion: (...args) => {
+      if (++mockProviderCalls > 50) { abortCtrl.abort("test mock did not converge"); throw new Error("test mock did not converge"); }
+      return streamCompletion(...args);
+    } }],
     ["../../lib/modelLaneCoordinator", {
       acquireModelLane: options.acquireModelLane || (async () => ({
         markFirstToken() {},
@@ -926,6 +932,7 @@ async function runProductionPlanScenario(
   const abortCtrl = new AbortController();
   options.onAbortCtrl?.(abortCtrl);
   const settlement = await planRunner.runSubmitRuntimeV2Plan({
+    lifecycleDeadlineAt: options.lifecycleDeadlineAt,
     get,
     set,
     context: {
@@ -977,6 +984,37 @@ function testModelLaneLease() {
     setPressureHandler() {},
   };
 }
+
+test("Plan accepts new evidence and a valid submission after more than ten minutes", async () => {
+  const originalNow = Date.now;
+  let now = 3_000_000;
+  let requests = 0;
+  Date.now = () => now;
+  try {
+    const result = await runProductionPlanScenario(async () => {
+      requests += 1;
+      now += 11 * 60_000;
+      return { content: "", toolCalls: requests === 1 ? [{
+        id: "slow-read", name: "read_file", arguments: JSON.stringify({ path: "src/main.js" }),
+      }] : [{
+        id: "slow-submit", name: "submit_runtime_v2_work_plan", arguments: JSON.stringify({
+          planMarkdown: "Use the observed source to repair file opening.",
+          changes: [{ operation: "modify", targets: ["src/main.js"], change: "Unify file opening.", dependsOn: [], criterionIds: ["criterion-user-objective"] }],
+          validations: [{ kind: "finite_command", command: "npm run build", expectedOutcome: "Build passes.", required: true, stepIndexes: [0], criterionIds: ["criterion-user-objective"] }],
+        }),
+      }], usage: {}, protocolViolation: null };
+    }, async (name) => {
+      if (name === "get_project_skeleton") return "src/main.js";
+      if (name === "read_file") return "export const openFile = () => null;";
+      if (name === "write_file") return "written";
+      throw new Error(`unexpected tool ${name}`);
+    });
+    assert.equal(requests, 2);
+    assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+    assert.equal(result.checkpoint.aggregate.terminalOutcome, null);
+    assert.equal(result.checkpoint.aggregate.events.filter((entry) => entry.type === "work_plan.sealed").length, 1);
+  } finally { Date.now = originalNow; }
+});
 
 async function withFakePlanClock(startAt, task) {
   const originalNow = Date.now;
@@ -1138,9 +1176,9 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
   assert.match(planCompletion, /reviewCommit: commit/);
   assert.match(planReviewProjection, /markdown: input\.commit\.chat\.markdown/);
   assert.doesNotMatch(planRunner, /plan:soft-round-limit|PLAN_MODEL_ROUND_LIMIT/);
-  assert.match(planRunner, /runtime_v2_plan_soft_round_signal/);
+  assert.doesNotMatch(planRunner, /runtime_v2_plan_soft_round_signal|messages\.splice\(3/);
   assert.match(planRunner, /terminal:\s*false/);
-  assert.match(planRunner, /PLAN_MODEL_DEADLINE_MS/);
+  assert.doesNotMatch(planRunner, /PLAN_MODEL_DEADLINE_MS/);
 });
 
 test("optional preferred Plan advertises collaboration without the hard spawn gate", async () => {
@@ -2328,8 +2366,8 @@ test("cold-restored reviewing Plan reconciles one missing sealed child handoff e
   assert.equal(secondApplied[0].eventId, firstApplied[0].eventId);
 });
 
-test("cold-restored Plan derives its lifecycle deadline from durable run.started time", async () => {
-  const checkpoint = planningCheckpointWithRequirement("optional");
+test("cold-restored Plan preserves an explicit caller deadline", async () => {
+  const checkpoint = planningCheckpointWithRequirement("optional", true);
   const durableRunStarted = checkpoint.aggregate.events.find((entry) =>
     entry.type === "run.started"
   );
@@ -2339,7 +2377,7 @@ test("cold-restored Plan derives its lifecycle deadline from durable run.started
   let result;
 
   Date.now = () =>
-    durableRunStarted.at + planProtocol.PLAN_MODEL_DEADLINE_MS + 1;
+    durableRunStarted.at + EXPLICIT_PLAN_TEST_BUDGET_MS + 1;
   try {
     result = await runProductionPlanScenario(
       async () => {
@@ -2389,7 +2427,7 @@ test("cold-restored Plan derives its lifecycle deadline from durable run.started
   assert.equal(
     providerCalls,
     0,
-    "cold recovery must not grant a fresh eight-minute Plan lifecycle",
+    "cold recovery must not renew an explicit caller deadline",
   );
   assert.equal(result.settlement.outcome.status, "completed");
   assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
@@ -2518,13 +2556,13 @@ test("Plan applies child handoff only from a sealed WorkPlan basis, not a reject
 
 test("Plan withholds new spawn below the shared child runway while preserving active wait", async () => {
   const originalNow = Date.now;
-  const firstRestored = planningCheckpointWithActiveChild();
+  const firstRestored = planningCheckpointWithActiveChild(true);
   const runStartedAt = firstRestored.checkpoint.aggregate.events.find((entry) =>
     entry.type === "run.started"
   )?.at;
   assert.equal(typeof runStartedAt, "number");
   const now = runStartedAt +
-    planProtocol.PLAN_MODEL_DEADLINE_MS -
+    EXPLICIT_PLAN_TEST_BUDGET_MS -
     runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS +
     1;
   const waitRequests = [];
@@ -2611,13 +2649,13 @@ test("Plan withholds new spawn below the shared child runway while preserving ac
     entry.jobId === firstRestored.child.id
   ));
 
-  const secondRestored = planningCheckpointWithActiveChild();
+  const secondRestored = planningCheckpointWithActiveChild(true);
   const secondRunStartedAt = secondRestored.checkpoint.aggregate.events.find(
     (entry) => entry.type === "run.started",
   )?.at;
   assert.equal(typeof secondRunStartedAt, "number");
   const secondNow = secondRunStartedAt +
-    planProtocol.PLAN_MODEL_DEADLINE_MS -
+    EXPLICIT_PLAN_TEST_BUDGET_MS -
     runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS +
     1;
   const spawnRequests = [];
@@ -2640,7 +2678,7 @@ test("Plan withholds new spawn below the shared child runway while preserving ac
           toolNames: tools.map((tool) => tool.function.name),
           requestOptions,
         });
-        spawnAbortCtrl.abort("near-deadline spawn admission captured");
+        if (spawnRequests.length > 1) spawnAbortCtrl.abort("near-deadline spawn admission captured");
         return {
           content: "",
           toolCalls: [{
@@ -2688,7 +2726,7 @@ test("Plan withholds new spawn below the shared child runway while preserving ac
     if (spawnDiagnosticAbort) clearTimeout(spawnDiagnosticAbort);
   }
 
-  assert.equal(spawnRequests.length, 1);
+  assert.equal(spawnRequests.length, 2);
   assert.equal(spawnRequests[0].toolNames.includes("spawn_subagent"), false);
   assert.equal(spawnRequests[0].toolNames.includes("wait_subagents"), true);
   const quarantined = spawnResult.checkpoint.aggregate.events.find((entry) =>
@@ -3044,7 +3082,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
   const result = await runProductionPlanScenario(
     async (messages, _settings, callbacks, _signal, tools) => {
       const requestTranscript = messages
-        .map((message) => String(message.content || ""))
+        .map((message) => [String(message.content || ""), ...(message.tool_calls || []).map((call) => call.function.arguments)].join("\n"))
         .join("\n");
       if (/read-only child of the current MAIN turn/i.test(requestTranscript)) {
         childRound += 1;
@@ -3065,7 +3103,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
           };
         }
         const transcript = messages
-          .map((message) => String(message.content || ""))
+          .map((message) => [String(message.content || ""), ...(message.tool_calls || []).map((call) => call.function.arguments)].join("\n"))
           .join("\n");
         const evidenceId = transcript.match(/child:[^\s,]+:E1/)?.[0];
         assert.ok(evidenceId, "the child must cite its real tool evidence");
@@ -3185,7 +3223,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         };
       }
       const transcript = messages
-        .map((message) => String(message.content || ""))
+        .map((message) => [String(message.content || ""), ...(message.tool_calls || []).map((call) => call.function.arguments)].join("\n"))
         .join("\n");
       const childEvidenceId = transcript.match(/child:[^\s,]+:E1/)?.[0];
       assert.ok(childEvidenceId, "joined child evidence must reach the parent");
@@ -3232,9 +3270,9 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         ["submit_runtime_v2_work_plan"],
         "a rejected submission must enter the submit-only repair surface",
       );
-      assert.match(transcript, /Correct the rejected WorkPlan structure/);
-      assert.match(transcript, /Rejected submission to correct/);
-      assert.match(transcript, /Child report: The reviewed owner is in src\/main\.js/);
+      assert.match(transcript, /Correct the rejected WorkPlan/);
+      assert.match(transcript, /WORK_PLAN_REJECTED/);
+      assert.match(transcript, /Report: The reviewed owner is in src\/main\.js/);
       assert.match(transcript, /Finding: The reviewed owner is in src\/main\.js/);
       assert.match(transcript, new RegExp(childEvidenceId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       if (parentRound === 5) {
@@ -4256,7 +4294,7 @@ test("WorkPlan compilation removes unsafe finite commands only when another exec
   );
 });
 
-test("cold-restored typed WorkPlan rejection resumes one submit-only repair within its durable grace", async () => {
+test("cold-restored typed WorkPlan rejection restores submit-only repair and never renews a semantic stall", async () => {
   const restored = planningCheckpointWithTypedSubmissionRejection();
   const corrected = structuredClone(restored.candidate);
   corrected.validations[0].stepIndexes = [0];
@@ -4306,7 +4344,7 @@ test("cold-restored typed WorkPlan rejection resumes one submit-only repair with
 
     Date.now = () =>
       restored.rejectionAt +
-      planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS +
+      PLAN_RECOVERY_STALL_MS +
       1;
     expired = await runProductionPlanScenario(
       async () => {
@@ -4331,13 +4369,12 @@ test("cold-restored typed WorkPlan rejection resumes one submit-only repair with
   });
   assert.equal(
     requests[0].requestOptions.timeoutMs,
-    planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS - 1_000,
+    planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS,
   );
   assert.match(requests[0].transcript, /WORK_PLAN_REJECTED:/);
   assert.match(requests[0].transcript, /validations\[0\]\.stepIndexes references an unknown step/);
-  assert.match(requests[0].transcript, /Rejected submission to correct/);
-  assert.match(requests[0].transcript, /src\/cold-repair-owner\.js/);
-  assert.match(requests[0].transcript, /"stepIndexes":\[1\]/);
+  assert.match(requests[0].transcript, /WORK_PLAN_REJECTED/);
+  assert.ok(requests[0].toolNames.includes("submit_runtime_v2_work_plan"));
   const repairOpened = repaired.logs.find((entry) =>
     entry.eventName === "runtime_v2_plan_provider_request_opened"
   );
@@ -4369,10 +4406,10 @@ test("cold-restored typed WorkPlan rejection resumes one submit-only repair with
   const terminal = expired.logs.find((entry) =>
     entry.eventName === "runtime_v2_plan_terminal"
   );
-  assert.equal(terminal?.data?.detailCode, "runtime_v2_plan_deadline_reached");
+  assert.equal(terminal?.data?.detailCode, "runtime_v2_plan_recovery_stall_exhausted");
 });
 
-test("typed WorkPlan rejection receives one bounded submit-only grace past the lifecycle deadline", async () => {
+test("typed WorkPlan rejection cannot renew the semantic recovery window", async () => {
   const originalNow = Date.now;
   const startedAt = 1_000_000;
   let now = startedAt;
@@ -4423,11 +4460,11 @@ test("typed WorkPlan rejection receives one bounded submit-only grace past the l
           settings,
         });
         if (requests.length === 1) {
-          now = startedAt + planProtocol.PLAN_MODEL_DEADLINE_MS - 10;
+          now = startedAt + EXPLICIT_PLAN_TEST_BUDGET_MS - 10;
         } else if (requests.length === 2) {
           now = startedAt +
-            planProtocol.PLAN_MODEL_DEADLINE_MS +
-            planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS +
+            EXPLICIT_PLAN_TEST_BUDGET_MS +
+            PLAN_RECOVERY_STALL_MS +
             1;
         } else {
           abortCtrl.abort("unexpected repeated WorkPlan repair grace");
@@ -4463,7 +4500,7 @@ test("typed WorkPlan rejection receives one bounded submit-only grace past the l
     if (diagnosticAbort) clearTimeout(diagnosticAbort);
   }
 
-  assert.equal(requests.length, 2, "a second rejection must not renew the grace");
+  assert.equal(requests.length, 2, "a second rejection must not renew the recovery window");
   assert.deepEqual(requests[1].toolNames, ["submit_runtime_v2_work_plan"]);
   assert.deepEqual(requests[1].requestOptions.toolChoice, {
     type: "function",
@@ -4501,7 +4538,7 @@ test("typed WorkPlan rejection receives one bounded submit-only grace past the l
   const terminal = result.logs.findIndex((entry, index) =>
     index > secondRejection &&
     entry.eventName === "runtime_v2_plan_terminal" &&
-    entry.data?.detailCode === "runtime_v2_plan_deadline_reached"
+    entry.data?.detailCode === "runtime_v2_plan_recovery_stall_exhausted"
   );
   assert.ok(firstRejection >= 0);
   assert.ok(repairOpened > firstRejection);
@@ -4627,7 +4664,7 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
   );
   assert.equal(compactRecovery.settings.reasoningRequest, "off");
   assert.equal(compactRecovery.settings.preserveAssistantReasoning, false);
-  assert.match(compactRecovery.transcript, /Rejected submission to correct/);
+  assert.match(compactRecovery.transcript, /WORK_PLAN_REJECTED/);
   assert.match(compactRecovery.transcript, /PLAN_TOOL_ARGUMENTS_REJECTED/);
   assert.equal(
     requests.length,
@@ -4743,7 +4780,7 @@ test("cold Plan restore preserves repeated submit-only violations and starts at 
   assert.equal(opened?.data?.transport, "structured_response");
 });
 
-test("an invalid sole structured Plan submission recovery terminates without transport rebound", async () => {
+test("invalid structured Plan submissions recover until semantic stall, never by count", async () => {
   const restored = planningCheckpointWithRepeatedSubmitOnlyArgumentViolations();
   const originalNow = Date.now;
   let now = restored.restoredAt;
@@ -4772,7 +4809,7 @@ test("an invalid sole structured Plan submission recovery terminates without tra
           requestOptions,
         });
         if (requests.length > 1) {
-          now = restored.effectiveDeadlineAt + 1;
+          now = restored.rejectionAt + PLAN_RECOVERY_STALL_MS + 1;
         }
         return {
           content: "{}",
@@ -4803,8 +4840,8 @@ test("an invalid sole structured Plan submission recovery terminates without tra
   assert.equal(requests[0]?.settings.reasoningRequest, "off");
   assert.equal(
     requests.length,
-    1,
-    "an invalid structured recovery must not rebound to native or another request",
+    2,
+    "invalid output permits recovery until the durable stall window expires",
   );
   assert.equal(result.settlement.outcome.status, "completed");
   assert.equal(result.settlement.outcome.resultKind, "error");
@@ -4816,19 +4853,19 @@ test("an invalid sole structured Plan submission recovery terminates without tra
       entry.type === "command.scheduled" &&
       entry.command.kind === "request_model"
     ).length,
-    3,
-    "the durable two native attempts may be followed by only one structured attempt",
+    4,
+    "the durable attempts are retained across recovery",
   );
   const terminal = result.logs.find((entry) =>
     entry.eventName === "runtime_v2_plan_terminal"
   );
   assert.equal(
     terminal?.data?.detailCode,
-    "runtime_v2_plan_submission_transport_recovery_exhausted",
+    "runtime_v2_plan_recovery_stall_exhausted",
   );
 });
 
-test("active Plan stream progress outlives the 90s request watchdog but not the durable lifecycle", async () => {
+test("active Plan streams outlive ten minutes while explicit caller deadlines remain binding", async () => {
   const originalNow = Date.now;
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
@@ -4895,18 +4932,13 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
           };
         }
         const requestStartedAt = now;
-        for (const [elapsedMs, phase, token] of [
-          [30_000, "first_chunk", "bounded semantic progress 1"],
-          [100_000, "chunk_progress", " bounded semantic progress 2"],
-          [170_000, "chunk_progress", " bounded semantic progress 3"],
-          [240_000, "chunk_progress", " bounded semantic progress 4"],
-        ]) {
+        for (const [elapsedMs, phase, token] of Array.from({ length: 11 }, (_, i) => [(i + 1) * 60_000, i === 0 ? "first_chunk" : "chunk_progress", "ongoing model output"])) {
           now = requestStartedAt + elapsedMs;
           runDueTimers();
           callbacks.onLifecycle?.({ phase });
           callbacks.onToken?.(token);
         }
-        now = requestStartedAt + 3 * planProtocol.PLAN_MODEL_REQUEST_TIMEOUT_MS + 1;
+        now = requestStartedAt + 11 * 60_000 + 1;
         runDueTimers();
         await Promise.resolve();
         requestWallClockMs = now - requestStartedAt;
@@ -4958,6 +4990,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
       },
     );
 
+    const explicitDeadline = now + EXPLICIT_PLAN_TEST_BUDGET_MS;
     durableResult = await runProductionPlanScenario(
       async (
         _messages,
@@ -4967,7 +5000,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
       ) => {
         durableProviderCalls += 1;
         const requestStartedAt = now;
-        for (let elapsedMs = 60_000; elapsedMs < planProtocol.PLAN_MODEL_DEADLINE_MS;
+        for (let elapsedMs = 60_000; elapsedMs < EXPLICIT_PLAN_TEST_BUDGET_MS;
           elapsedMs += 60_000) {
           now = requestStartedAt + elapsedMs;
           runDueTimers();
@@ -4976,7 +5009,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
           });
           callbacks.onToken?.("still producing a bounded Plan response");
         }
-        now = requestStartedAt + planProtocol.PLAN_MODEL_DEADLINE_MS + 1;
+        now = requestStartedAt + EXPLICIT_PLAN_TEST_BUDGET_MS + 1;
         runDueTimers();
         await Promise.resolve();
         durableSignalAborted = signal.aborted;
@@ -4992,6 +5025,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
         throw new Error(`unexpected tool ${name}`);
       },
       {
+        lifecycleDeadlineAt: explicitDeadline,
         onAbortCtrl: (controller) => {
           diagnosticAborts.push(originalSetTimeout(
             () => controller.abort("durable Plan deadline test timeout"),
@@ -5045,7 +5079,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
   assert.equal(
     durableResult.logs.some((entry) =>
       entry.eventName === "runtime_v2_plan_provider_request_closed" &&
-      entry.data?.timedOut === true
+      entry.data?.timedOut === false && entry.data?.lifecycleTimedOut === true
     ),
     true,
   );
@@ -5058,7 +5092,7 @@ test("active Plan stream progress outlives the 90s request watchdog but not the 
   );
 });
 
-test("Plan model-lane queue time does not spend the provider inactivity lease and remains durable-deadline bounded", async () => {
+test("Plan lane queue has no default timer and honors only explicit caller deadlines", async () => {
   const submission = {
     planMarkdown: "Create the queued-lane fixture and verify the repository build.",
     changes: [{
@@ -5172,8 +5206,8 @@ test("Plan model-lane queue time does not spend the provider inactivity lease an
       entry.armedAt === queued.laneRequestedAt &&
       entry.delayMs > planProtocol.PLAN_MODEL_REQUEST_TIMEOUT_MS
     ),
-    true,
-    "a separate durable Plan lifecycle timer must own queued wall clock",
+    false,
+    "ordinary Plan queue time has no default total-duration timer",
   );
 
   const deadlineBound = await withFakePlanClock(4_000_000, async (clock) => {
@@ -5189,8 +5223,9 @@ test("Plan model-lane queue time does not spend the provider inactivity lease an
         throw new Error(`unexpected tool ${name}`);
       },
       {
+        lifecycleDeadlineAt: clock.now + EXPLICIT_PLAN_TEST_BUDGET_MS,
         acquireModelLane: async ({ signal }) => {
-          await clock.advanceBy(planProtocol.PLAN_MODEL_DEADLINE_MS + 1);
+          await clock.advanceBy(EXPLICIT_PLAN_TEST_BUDGET_MS + 1);
           queuedSignalAborted = signal.aborted;
           return testModelLaneLease();
         },
@@ -5434,7 +5469,7 @@ test("compact Plan synthesis recovery couples its 90s deadline to bounded output
   assert.equal(opened.data?.repairReasoningDisabled, true);
 });
 
-test("a closed synthesis request gets compact sequential recovery without overlap", async () => {
+test("synthesis recovery preserves affordable evidence without overlapping requests", async () => {
   let providerRound = 0;
   let activeRequests = 0;
   let maxActiveRequests = 0;
@@ -5521,7 +5556,7 @@ test("a closed synthesis request gets compact sequential recovery without overla
     synthesisRequests[1].messages.reduce(
       (total, message) => total + String(message.content || "").length,
       0,
-    ) <
+    ) >=
     synthesisRequests[0].messages.reduce(
       (total, message) => total + String(message.content || "").length,
       0,
@@ -5531,7 +5566,7 @@ test("a closed synthesis request gets compact sequential recovery without overla
     synthesisRequests[1].messages
       .map((message) => String(message.content || ""))
       .join("\n"),
-    /preceding synthesis request did not produce a complete submission/,
+    /Synthesize the retained source receipts/,
   );
   assert.ok(synthesisRequests[1].options.responseFormat);
   assert.equal(result.checkpoint.aggregate.recovery.transportAttempts, 0);
@@ -5756,9 +5791,9 @@ test("only structured provider transport unavailability closes Plan recovery", a
   const aggregate = result.checkpoint.aggregate;
   assert.equal(providerRound, 2);
   assert.equal(result.settlement.outcome.status, "completed");
-  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.settlement.outcome.resultKind, "error");
   assert.equal(aggregate.phase, "completed");
-  assert.equal(aggregate.terminalOutcome?.resultKind, "partial");
+  assert.equal(aggregate.terminalOutcome?.resultKind, "error");
   assert.equal(aggregate.recovery.exhausted, null);
   assert.equal(
     aggregate.events.filter((event) =>
@@ -6097,4 +6132,191 @@ test("a rejected approved-Plan dispatch writes one final error instead of pausin
     current.aggregate.events.filter((event) => event.type === "run.completed").length,
     1,
   );
+});
+
+function simplePlanSubmission(target = "src/new-fixture.js") {
+  return { planMarkdown: "Create one scoped fixture and verify the build.",
+    changes: [{ operation: "create", targets: [target], change: "Create the scoped fixture.", dependsOn: [], criterionIds: ["criterion-user-objective"] }],
+    validations: [{ kind: "finite_command", command: "npm run build", expectedOutcome: "Build passes.", required: true, stepIndexes: [0], criterionIds: ["criterion-user-objective"] }],
+  };
+}
+const planProviderReply = (id, name, args) => ({ content: "", toolCalls: [{ id, name, arguments: JSON.stringify(args) }], usage: {}, protocolViolation: null });
+const planFixtureTool = async (name, args) => {
+  if (name === "get_project_skeleton") return "src/main.js";
+  if (name === "read_file") return `export const source = ${JSON.stringify(args.path)};`;
+  if (name === "write_file") return "written";
+  throw new Error(`unexpected tool ${name}`);
+};
+function checkpointThrough(checkpoint, sequence) {
+  let result = null;
+  for (const event of checkpoint.aggregate.events.filter((event) => event.sequence <= sequence)) {
+    result = runtime.appendRuntimeV2Checkpoint({ checkpoint: result, owner: turn, expectedRevision: result?.revision || 0, event }).checkpoint;
+  }
+  return result;
+}
+
+test("Plan repeated receipts and reused provider call IDs cannot renew semantic progress", async () => {
+  const originalNow = Date.now;
+  let now = 9_000_000;
+  let requests = 0;
+  Date.now = () => now;
+  try {
+    const result = await runProductionPlanScenario(async () => {
+      requests += 1;
+      now += requests === 3 ? PLAN_RECOVERY_STALL_MS + 1 : 1000;
+      return planProviderReply("provider-reuses-this-id", "read_file", { path: "src/main.js" });
+    }, planFixtureTool);
+    assert.equal(requests, 3);
+    assert.equal(result.settlement.outcome.resultKind, "error");
+    assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+    assert.ok(result.logs.some((entry) => entry.data?.detailCode === "runtime_v2_plan_recovery_stall_exhausted"));
+    const lastRead = result.checkpoint.aggregate.events.filter((event) => event.type === "tool.completed").at(-1);
+    const resume = checkpointThrough(result.checkpoint, lastRead.sequence);
+    const restored = await runProductionPlanScenario(async () => { throw new Error("expired recovery must not request a model"); }, async () => { throw new Error("restore must not recollect evidence"); }, { initialCheckpoint: resume });
+    assert.equal(restored.settlement.outcome.resultKind, "error");
+    assert.equal(restored.checkpoint.aggregate.events.filter((event) => event.type === "provider.responded").length, 3);
+  } finally { Date.now = originalNow; }
+});
+
+test("Plan new source progress clears recovery and cold restore retains the exact transcript", async () => {
+  const originalNow = Date.now;
+  let now = 11_000_000;
+  let requests = 0;
+  Date.now = () => now;
+  try {
+    const completed = await runProductionPlanScenario(async () => {
+      requests += 1;
+      now += requests === 3 ? PLAN_RECOVERY_STALL_MS + 1 : 1000;
+      return requests <= 3 ? planProviderReply("same-provider-id", "read_file", { path: requests === 3 ? "src/fresh.js" : "src/main.js" })
+        : planProviderReply("submit", "submit_runtime_v2_work_plan", simplePlanSubmission());
+    }, planFixtureTool);
+    assert.equal(completed.checkpoint.aggregate.phase, "reviewing");
+    const fresh = completed.checkpoint.aggregate.events.find((event) => event.type === "tool.completed" && event.evidence.some((item) => item.target === "src/fresh.js"));
+    const prefix = checkpointThrough(completed.checkpoint, fresh.sequence);
+    now += 30 * 60_000;
+    let restoredRequests = 0;
+    const restored = await runProductionPlanScenario(async (messages) => {
+      restoredRequests += 1;
+      assert.equal(messages.filter((message) => message.role === "tool").length, 3);
+      assert.ok(messages.some((message) => String(message.content).includes('export const source = "src/main.js";')));
+      assert.ok(messages.some((message) => String(message.content).includes('export const source = "src/fresh.js";')));
+      return planProviderReply("restored-submit", "submit_runtime_v2_work_plan", simplePlanSubmission());
+    }, async (name) => { assert.equal(name, "write_file", "cold restore cannot repeat bootstrap or source I/O"); return "written"; }, { initialCheckpoint: prefix });
+    assert.equal(restoredRequests, 1);
+    assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
+    assert.deepEqual(restored.checkpoint.aggregate.evidence.filter((item) => /^E/.test(item.id)).map((item) => item.id), ["E1", "E2", "E3"]);
+  } finally { Date.now = originalNow; }
+});
+
+test("Plan retains affordable evidence after more than ten discovery requests", async () => {
+  let requests = 0;
+  const result = await runProductionPlanScenario(async (messages) => {
+    requests += 1;
+    if (requests <= 12) return planProviderReply(`read-${requests}`, "read_file", { path: `src/marker-${requests}.js` });
+    assert.equal(messages.filter((message) => message.role === "tool").length, 12);
+    assert.ok(messages.some((message) => String(message.content).includes('export const source = "src/marker-1.js";')));
+    return planProviderReply("submit", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, planFixtureTool);
+  assert.equal(requests, 13);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.equal(result.checkpoint.aggregate.events.some((event) => event.type === "soft_signal.observed" && event.signal === "iteration_limit"), false);
+});
+
+test("Plan terminal recovery closes every durable interruption boundary exactly once", async () => {
+  const closed = await runProductionPlanScenario(async () => { throw new Error("explicit deadline already expired"); }, planFixtureTool, { lifecycleDeadlineAt: Date.now() - 1 });
+  assert.equal(closed.settlement.outcome.resultKind, "error");
+  const boundaries = closed.checkpoint.aggregate.events.filter((event) =>
+    (event.type === "command.scheduled" && event.command.kind === "finalize_turn") ||
+    (event.type === "phase.changed" && event.phase === "finalizing") ||
+    event.type === "run.completed" || (event.type === "projection.published" && event.projection.kind === "final"));
+  assert.equal(boundaries.length, 4);
+  for (const boundary of boundaries) {
+    const resumed = await runProductionPlanScenario(async () => { throw new Error("terminal restore must not call provider"); }, async () => { throw new Error("terminal restore must not execute tools"); }, { initialCheckpoint: checkpointThrough(closed.checkpoint, boundary.sequence) });
+    const events = resumed.checkpoint.aggregate.events.filter((event) => event.type === "run.completed" || event.type === "turn.completed" || (event.type === "projection.published" && event.projection.kind === "final"));
+    assert.deepEqual(events.map((event) => event.type), ["run.completed", "projection.published", "turn.completed"]);
+    assert.equal(resumed.settlement.outcome.resultKind, "error");
+    const again = await runProductionPlanScenario(async () => { throw new Error("already closed"); }, async () => { throw new Error("already closed"); }, { initialCheckpoint: resumed.checkpoint });
+    assert.equal(again.checkpoint.revision, resumed.checkpoint.revision);
+  }
+});
+
+test("Plan discards a late valid provider submission after user cancellation", async () => {
+  let stop;
+  const effects = [];
+  const result = await runProductionPlanScenario(async () => {
+    stop.abort("user stopped");
+    return planProviderReply("late-submit", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, async (name, args) => { effects.push(name); return planFixtureTool(name, args); }, { onAbortCtrl: (controller) => { stop = controller; } });
+  assert.equal(result.settlement.outcome.status, "aborted");
+  assert.equal(result.checkpoint.aggregate.terminalOutcome.resultKind, "canceled");
+  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+  assert.equal(effects.includes("write_file"), false);
+});
+
+test("Plan context pressure preserves the objective and complete tool groups", () => {
+  const { boundReadOnlyHistory } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/readOnlyHistory.ts"));
+  const toolCall = (id) => ({ id, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: id }) } });
+  const messages = [
+    { role: "system", content: "Plan remains read-only." },
+    { role: "user", content: "Preserve this exact user objective." },
+    { role: "assistant", content: "", tool_calls: [toolCall("old-a"), toolCall("old-b")] },
+    { role: "tool", tool_call_id: "old-a", content: "old alpha source\n".repeat(2000) },
+    { role: "tool", tool_call_id: "old-b", content: "old beta source\n".repeat(2000) },
+    { role: "assistant", content: "", tool_calls: [toolCall("latest")] },
+    { role: "tool", tool_call_id: "latest", content: "Latest receipt and exact validation feedback." },
+    { role: "system", content: "Submit one complete WorkPlan with the admitted criterion IDs." },
+  ];
+  const bounded = boundReadOnlyHistory(messages, { contextLimit: 4096, reservedOutputTokens: 1024, preserveUserMessages: true });
+  assert.equal(bounded.find((message) => message.role === "user").content, messages[1].content);
+  assert.equal(bounded[0].content, messages[0].content);
+  assert.equal(bounded.at(-1).content, messages.at(-1).content);
+  assert.deepEqual(bounded.filter((message) => message.role === "tool").map((message) => message.tool_call_id), ["latest"]);
+  assert.deepEqual(bounded.filter((message) => message.tool_calls).flatMap((message) => message.tool_calls.map((call) => call.id)), ["latest"]);
+  assert.equal(messages.length, 8, "context projection must not mutate the canonical transcript");
+});
+
+test("Plan compact recovery alternates the actual wire contract and restores that choice", async () => {
+  const attempts = [];
+  const result = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _budget, options) => {
+    attempts.push({ tools: tools.map((tool) => tool.function.name), responseFormat: options.responseFormat });
+    if (attempts.length <= 2) throw new Error("ECONNRESET: fixture transport interrupted");
+    assert.deepEqual(attempts[2].tools, ["submit_runtime_v2_work_plan"]);
+    assert.equal(attempts[2].responseFormat, undefined);
+    return planProviderReply("native-recovery", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, planFixtureTool);
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(attempts[1].tools, []);
+  assert.equal(attempts[1].responseFormat?.type, "json_schema");
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  const fallback = result.logs.find((entry) => entry.eventName === "runtime_v2_plan_provider_transport_fallback");
+  assert.equal(fallback.data.from, "structured_response");
+  assert.equal(fallback.data.to, "native_tool");
+  const failures = result.checkpoint.aggregate.events.filter((event) => event.type === "command.completed" && event.status === "failed");
+  const prefix = checkpointThrough(result.checkpoint, failures.at(-1).sequence);
+  let resumedRequests = 0;
+  const restored = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, budget, options) => {
+    resumedRequests += 1;
+    assert.deepEqual(tools.map((tool) => tool.function.name), ["submit_runtime_v2_work_plan"]);
+    assert.equal(options.responseFormat, undefined);
+    assert.equal(budget, planProtocol.PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS);
+    return planProviderReply("restored-native-recovery", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, planFixtureTool, { initialCheckpoint: prefix });
+  assert.equal(resumedRequests, 1);
+  assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
+});
+
+test("Plan cold history never attaches a future receipt to an interrupted reused call ID", () => {
+  const { restorePlanHistory } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planHistory.ts"));
+  const reply = (path) => ({ visibleText: "", toolCalls: [{ id: "reused", name: "read_file", arguments: { path } }], diagnostics: [], usage: {} });
+  const messages = [];
+  restorePlanHistory({ run, messages, evidence: [], evidenceContents: new Map(), aggregate: { events: [
+    event(0, 100, { type: "provider.responded", run, idempotencyKey: "interrupted-request", result: reply("src/interrupted.js") }),
+    event(1, 101, { type: "provider.responded", run, idempotencyKey: "resumed-request", result: reply("src/resumed.js") }),
+    event(2, 102, { type: "command.scheduled", run, command: { kind: "execute_tool", idempotencyKey: "resumed-tool", payload: { toolCallId: "reused" } } }),
+    event(3, 103, { type: "tool.completed", run, idempotencyKey: "resumed-tool", status: "succeeded", evidence: [], modelContent: "The resumed file's actual source." }),
+  ] } });
+  const tools = messages.filter((message) => message.role === "tool");
+  assert.equal(tools.length, 2);
+  assert.equal(JSON.parse(tools[0].content).historicalContentUnavailable, true);
+  assert.equal(tools[1].content, "The resumed file's actual source.");
 });

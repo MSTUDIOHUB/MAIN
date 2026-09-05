@@ -289,7 +289,7 @@ export function buildRuntimeV2FinalProjection(
   reason: string,
   finalMarkdown?: string,
 ): RuntimeV2Projection {
-  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze") {
+  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze" || (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)) {
     return projection(
       aggregate,
       "final",

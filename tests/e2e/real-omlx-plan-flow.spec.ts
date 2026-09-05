@@ -3181,6 +3181,9 @@ for (const model of models) {
         /plan_generation_failed|plan_evidence_materialization_exhausted/i,
       );
       expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(originalPlanOnlyWorkspaceFingerprint);
+      const artifact = test.info().outputPath("plan-review-lifecycle.json");
+      await fs.writeFile(artifact, JSON.stringify(finalPlanSnapshot, null, 2));
+      await test.info().attach("plan-review-lifecycle", { path: artifact, contentType: "application/json" });
       if (requireSemanticTaskQuality && isMdViewerSavePathIncident) {
         expect(
           getMdViewerWorkPlanGaps(finalPlanRuntime.sealedWorkPlan),

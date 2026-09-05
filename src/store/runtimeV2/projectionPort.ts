@@ -735,7 +735,7 @@ export function createRuntimeV2ProjectionPort(
             currentTurnExecutionConsent: { turnId: null, granted: false },
             activeActionRequest: null,
             pendingToolCall: null,
-            agentStatus: resultKind === "error" && aggregate.strategy !== "chat" && aggregate.strategy !== "analyze" ? "error" : "idle",
+            agentStatus: resultKind === "error" && aggregate.strategy !== "chat" && aggregate.strategy !== "analyze" && !(aggregate.strategy === "plan" && !aggregate.sealedWorkPlan) ? "error" : "idle",
             isGenerating: false,
             abortController: null,
           };

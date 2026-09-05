@@ -115,13 +115,11 @@ Plan Run 保留原始 objective，先用只读工具形成带版本的
 同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
 WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
-Plan 的八分钟共享 authoring 截止从 durable `run.started.at` 计算，恢复同一 Run
-不能获得新时限。完整 typed submission 第一次通过 transport/schema ingress、但被
-compiler、criteria 或 child-basis gate 拒绝时，ledger 记录一个固定的一次性
-submit-only repair lease；它不会因第二次拒绝、输出截断、transport fallback 或
-冷恢复而更新，且不会延长 child 生命周期或重新开放 discovery。普通 synthesis
-使用 Runtime context 已核准的输出预算；仅在 adapter 明确支持 reasoning toggle
-时，结构修复请求可关闭 reasoning，把预算留给唯一的 typed submission。
+Plan authoring 没有默认总时限，也不会将父线程年龄换算成 child 剩余预算。模型流和正在执行的工具可以跨越十分钟；只有调用方明确提供的 `lifecycleDeadlineAt` 才写入 `run.started` 并成为父子共享硬边界，拒绝或恢复都不得延长它。旧 checkpoint 没有该字段时按无默认硬限恢复。
+
+无进展窗口复用只读证据比较，从 canonical provider/tool 回执推导：新版本、同版本新增源码覆盖或新交付的 child 证据清零；重复读取、回放、空响应、提交校验失败和传输失败不能续期。十分钟连续无进展只在请求之间检查，先接收有效提交和新证据，再判断是否耗尽；尚有活跃 child 时先 join，不能因父线程年龄取消它。编译失败仍进入 submit-only 纠错，恢复输出可以缩小并关闭 reasoning，但普通错误次数不直接生成终态。
+
+Plan discovery 与 synthesis 共用完整的 assistant/tool transcript，只在真实上下文压力下压缩完整工具组，并保护目标、末尾指令和最新回执。冷恢复从 ledger 重建实际工具内容，不重新收集概览或伪造缺失的历史正文。未产生 sealed WorkPlan 的停滞、显式预算耗尽及不可恢复传输失败均为 error，权限或必需协作条件不足为 blocked，用户停止为 canceled；已有工具证据不能证明 partial 计划交付。
 
 Plan 的 canonical 顺序为：
 
@@ -215,9 +213,11 @@ join 是提交边界：runtime 再检查 child 所有权、父 WorkPlan scope、
 
 provider 未显式声明并发容量时，模型 lane 先开放“父线程 + 一个 probe child”，再以真实首 chunk 重叠证明按 2 → 3 → 4 逐级增长；本地 lane 每次重叠准入前还必须通过当前设备内存保留量采样。产品总上限是四个模型请求，即一个父线程加最多三个 child；轮流占用同一 lane 不会被记作并行能力。显式配置可选择更小上限，OOM、HTTP 429、明确并发限制或持续内存压力会收缩 lane，并优先释放最新 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
 
-显式要求 Plan 使用 child 时，协作获取是 discovery 中的独立硬门：未 admission 前只能请求精确 `spawn_subagent`，不能提前合成或封印 WorkPlan。该请求超时后只在同一实际 transport/surface 上有一次 90 秒以内且受原 Plan deadline 约束的恢复；失败 command 的稳定 reason code 随 checkpoint 持久化，因此冷启动不能重置次数。第二次同面超时直接 `blocked`，日志必须记录真实 attempted/effective transport，不能把名义 stage 切换冒充 wire fallback。
+显式要求 Plan 使用 child 时，协作获取是 discovery 中的独立硬门：未 admission 前只能请求精确 `spawn_subagent`，不能提前合成或封印 WorkPlan。该请求无活动超时后只在同一实际 transport/surface 上恢复一次；90 秒约束无活动间隔，只有显式调用方截止才约束总时长；失败 command 的稳定 reason code 随 checkpoint 持久化，因此冷启动不能重置次数。第二次同面超时直接 `blocked`，日志必须记录真实 attempted/effective transport，不能把名义 stage 切换冒充 wire fallback。
 
-Plan provider 的单请求 timeout 是 transport 无活动窗口，而不是完整生成的总墙钟：响应头、首个 chunk 与相邻 chunk 间隔分别受限，活跃流可以跨越多个窗口；空 keepalive 只证明连接仍存活，不得伪造模型进展、evidence 或 lane first-token。Plan 的 durable lifecycle deadline 仍是总时长唯一硬边界，compact synthesis recovery 必须同时收窄输出预算并在能力允许时关闭 reasoning。
+Plan provider 的单请求 timeout 是 transport 无活动窗口，而不是完整生成的总墙钟：响应头、首个 chunk 与相邻 chunk 间隔分别受限，活跃流可以跨越多个窗口；空 keepalive 只证明连接仍存活，不得伪造模型进展、evidence 或 lane first-token。Plan 仅在调用方明确提供并持久化 deadline 时才拥有总时长硬边界，compact synthesis recovery 必须同时收窄输出预算并在能力允许时关闭 reasoning。
+
+compact recovery 的输出预算与传输选择独立：首次收敛采用 structured response；失败后可切回 native tool，实际工具目录、日志与 checkpoint 必须一致。冷恢复从已结算的请求还原下一通道，不能重新锁在失败通道。重复的 provider tool-call ID 只能关联本次响应区间内的回执，不得引用后续请求的结果补齐中断历史。
 
 父、子 provider 工具调用共享同一 schema normalization：数值/布尔漂移、默认值、路径和编辑别名先规范化，schema 未声明字段直接丢弃，再计算动作 identity 并执行。child 对一个已返回 `CHILD_EVIDENCE_REPEAT` 的同一观察再次命中时，即使模型改变了无效范围或附带字段，也以结构化 `closed_observation_loop` 降级；只有输出窗口或版本真正变化才算进展。该边界由结果语义触发，不是 child 总耗时或固定轮数限制。
 

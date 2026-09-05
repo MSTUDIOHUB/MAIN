@@ -25,6 +25,7 @@ export function restoreReadOnlyHistory(live: RuntimeV2LiveExecutionState, aggreg
 /** Budget-only projection. Complete call/result groups remain atomic. */
 export function boundReadOnlyHistory(messages: readonly AgentMessage[], input: {
   contextLimit: number; reservedOutputTokens: number; tools?: readonly unknown[];
+  preserveUserMessages?: boolean;
 }): AgentMessage[] {
   const budget = Math.max(0, input.contextLimit - input.reservedOutputTokens - estimateTokens(JSON.stringify(input.tools || [])));
   let result = messages.map((message) => ({ ...message }));
@@ -50,7 +51,14 @@ export function boundReadOnlyHistory(messages: readonly AgentMessage[], input: {
     }
     seen.add(key);
   }
-  while (!fits()) {
+  if (input.preserveUserMessages) {
+    const toolGroups = groups.filter((group) => group[0]?.tool_calls?.length && group.length === group[0].tool_calls.length + 1);
+    for (const group of toolGroups.slice(0, -1)) {
+      if (fits()) break;
+      result = result.filter((item) => !group.includes(item));
+    }
+  }
+  while (!input.preserveUserMessages && !fits()) {
     const first = result.findIndex((item) => item.role === "user");
     const next = result.findIndex((item, index) => index > first && item.role === "user");
     if (first < 0 || next < 0) break;

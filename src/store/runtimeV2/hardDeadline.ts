@@ -12,6 +12,7 @@ export async function withRuntimeV2HardDeadline<T>(input: {
   readonly onTimeout?: () => void;
   readonly timeoutError?: string;
 }): Promise<T> {
+  if (!Number.isFinite(input.timeoutMs)) return input.task();
   let timeout: ReturnType<typeof setTimeout> | null = null;
   const timeoutMs = Math.max(1, Math.floor(input.timeoutMs));
   const deadline = new Promise<never>((_resolve, reject) => {
@@ -41,8 +42,8 @@ export async function withRuntimeV2HardDeadline<T>(input: {
  *
  * Each call to `markProgress` renews the same bounded lease. Callers must use
  * transport progress here (headers/chunks) and keep semantic/model-progress
- * stall policy in the streaming adapter. A separate hard lifecycle deadline
- * must still own the Run's total wall clock.
+ * stall policy in the runtime. A caller may separately supply an explicit
+ * lifecycle budget; ordinary local-model Runs have no total wall clock limit.
  */
 export async function withRuntimeV2ProgressDeadline<T>(input: {
   readonly timeoutMs: number;

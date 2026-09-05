@@ -19,19 +19,13 @@ import {
   skillCatalogContextCharBudget,
 } from "../../lib/agentSkills";
 import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
-import { latestRuntimeV2PlanProviderAdmissionRejectionHistory } from "./planProviderAdmission";
 
 export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
-export const PLAN_MODEL_COMPACTION_INTERVAL = 10;
-export const PLAN_MODEL_DEADLINE_MS = 8 * 60_000;
 export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS = 3 * 60_000;
 export const PLAN_CONTEXT_RESULT_CHARS = 10_000;
 export const PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS = 4_096;
-
-const PLAN_SYNTHESIS_EVIDENCE_CHARS = 36_000;
-const PLAN_SYNTHESIS_RECOVERY_EVIDENCE_CHARS = 18_000;
 
 export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "list_directory",
@@ -378,49 +372,6 @@ export function compactRetainedPlanObservation(
   ].join("\n");
 }
 
-function latestSubmittedPlanArguments(
-  messages: readonly AgentMessage[],
-  beforeIndex = messages.length,
-): string {
-  return messages
-    .slice(0, beforeIndex)
-    .reverse()
-    .flatMap((message) => {
-      if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
-        return [];
-      }
-      const call = [...message.tool_calls].reverse().find(
-        (entry) => entry.function?.name === SUBMIT_WORK_PLAN_TOOL_NAME,
-      );
-      return call ? [String(call.function.arguments || "")] : [];
-    })[0] || "";
-}
-
-function compactPlanEvidencePacket(input: {
-  readonly evidence: readonly WorkPlanRuntimeEvidence[];
-  readonly evidenceContents: ReadonlyMap<string, string>;
-  readonly charBudget?: number;
-}): string {
-  const charBudget = input.charBudget || PLAN_SYNTHESIS_EVIDENCE_CHARS;
-  const perEvidenceBudget = Math.max(
-    input.charBudget ? 1_400 : 2_400,
-    Math.min(
-      8_000,
-      Math.floor(charBudget / Math.max(1, input.evidence.length)),
-    ),
-  );
-  return [
-    "[Runtime v2 evidence packet]",
-    ...input.evidence.map((entry) => {
-      const observed = input.evidenceContents.get(entry.id) || entry.statement;
-      return [
-        `${entry.id} · ${entry.target} · ${entry.version || "unversioned"}`,
-        compactRetainedPlanObservation(observed, perEvidenceBudget),
-      ].join("\n");
-    }),
-  ].join("\n\n");
-}
-
 export function synthesisPlanTranscript(input: {
   readonly messages: readonly AgentMessage[];
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
@@ -429,98 +380,18 @@ export function synthesisPlanTranscript(input: {
   readonly compactRecovery: boolean;
   readonly transport: PlanProviderTransport;
 }): AgentMessage[] {
-  const latestAdmissionRejection =
-    latestRuntimeV2PlanProviderAdmissionRejectionHistory(input.messages);
-  let lastSubmissionOutcomeIndex = -1;
-  for (let index = input.messages.length - 1; index >= 0; index -= 1) {
-    const message = input.messages[index]!;
-    if (
-      message.role === "tool" &&
-      /^WORK_PLAN_REJECTED\b/.test(
-        String(message.content || ""),
-      )
-    ) {
-      lastSubmissionOutcomeIndex = index;
-      break;
-    }
-  }
-  const lastSubmissionOutcome = lastSubmissionOutcomeIndex >= 0
-    ? input.messages[lastSubmissionOutcomeIndex]
-    : null;
-  const lastRejection = lastSubmissionOutcome &&
-    String(lastSubmissionOutcome.content || "").startsWith("WORK_PLAN_REJECTED:")
-    ? lastSubmissionOutcome
-    : null;
-  const rejectedSubmission = lastRejection
-    ? latestSubmittedPlanArguments(input.messages, lastSubmissionOutcomeIndex)
-    : "";
-  if (
-    input.submissionRepairPending &&
-    lastRejection &&
-    rejectedSubmission
-  ) {
-    const rejectionText = String(lastRejection.content || "");
-    const relatedEvidence = input.evidence.filter((entry) =>
-      rejectionText.includes(entry.id) ||
-      rejectedSubmission.includes(entry.id)
-    );
-    const repairEvidence = relatedEvidence.length > 0
-      ? compactPlanEvidencePacket({
-          evidence: relatedEvidence,
-          evidenceContents: input.evidenceContents,
-          charBudget: PLAN_SYNTHESIS_RECOVERY_EVIDENCE_CHARS,
-        })
-      : "";
-    return [
-      ...input.messages.slice(0, 2),
-      {
-        role: "system",
-        content: [
-          "Correct the rejected WorkPlan structure and call submit_runtime_v2_work_plan.",
-          "This request exposes only that effect-free submission ingress; do not investigate again.",
-          "When the feedback names completed child evidence, assess its finding and cite the exact ID in changes[].basis. If it does not alter implementation scope, use a preserve change that explains why.",
-        ].join(" "),
-      },
-      {
-        role: "user",
-        content: [
-          `Validation feedback:\n${rejectionText.slice(0, 4_000)}`,
-          `Rejected submission to correct:\n${rejectedSubmission.slice(0, 12_000)}`,
-          repairEvidence
-            ? `Relevant retained evidence (exact IDs and contents):\n${repairEvidence}`
-            : "",
-        ].join("\n\n"),
-      },
-      ...latestAdmissionRejection,
-    ];
-  }
   return [
-    ...input.messages.slice(0, 3),
-    {
-      role: "user",
-      content: compactPlanEvidencePacket({
-        ...input,
-        ...(input.compactRecovery
-          ? { charBudget: PLAN_SYNTHESIS_RECOVERY_EVIDENCE_CHARS }
-          : {}),
-      }),
-    },
-    ...latestAdmissionRejection,
+    ...input.messages,
     {
       role: "system",
       content: [
-        ...(input.compactRecovery
-          ? [
-              "The preceding synthesis request did not produce a complete submission. Use only this compact evidence packet and submit one complete plan now.",
-            ]
-          : []),
-        [
-          input.transport === "structured_response"
-            ? "The read-only discovery window is closed. Return exactly one JSON object matching the supplied runtime_v2_work_plan_submission schema. Do not add prose or a Markdown fence."
-            : "The read-only discovery window is closed. Call submit_runtime_v2_work_plan now; no other tool is available.",
-          "Before submitting, reconcile the retained evidence into a concrete causal chain and include only source owners that the evidence supports.",
-          "Preserve every dependency edge and every bounded validation explicitly required by the user or promised in the narrative in the structured dependsOn, stepIndexes, and validations fields. Use observable bounded validation. Do not put dev servers or manual instructions in finite command fields.",
-        ].join(" "),
+        input.submissionRepairPending
+          ? "Correct the rejected WorkPlan using the exact feedback and retained source receipts. This request exposes only the effect-free submission ingress; do not investigate again."
+          : "Synthesize the retained source receipts into one evidence-grounded WorkPlan.",
+        input.transport === "structured_response"
+          ? "Return exactly one JSON object matching the supplied runtime_v2_work_plan_submission schema, without prose or Markdown fences."
+          : "Call submit_runtime_v2_work_plan once with the complete plan.",
+        "Preserve every admitted criterion, dependency edge and bounded validation. Cite the exact IDs of any adopted child evidence. A rejected submission is not a new fact or approval.",
       ].join(" "),
     },
   ];
