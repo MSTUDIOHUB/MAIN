@@ -331,6 +331,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          archived_notes="docs/releases/Release_Notes_${VERSION}_ZH.md"
+          if [[ -f "$archived_notes" ]]; then
+            cp "$archived_notes" release-assets/release_notes.md
+            exit 0
+          fi
+
           commit_sha="$(git rev-parse --short HEAD)"
           commit_subject="$(git log -1 --pretty=%s)"
           commit_body="$(git log -1 --pretty=%b)"

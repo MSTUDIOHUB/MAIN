@@ -174,7 +174,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
     ),
   );
   const ordinaryRuntimeRequests = ordinaryRequests
-    .filter((body: string) => body.includes("[MAIN RUNTIME V2 CHAT]"))
+    .filter((body: string) => body.includes("[MAIN RUNTIME V2]"))
     .map(runtimeRequestSummary);
   expect(ordinaryRuntimeRequests).toHaveLength(1);
   expect(ordinaryRuntimeRequests[0].body).not.toContain(SKILL_NAME);
@@ -216,7 +216,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
     ),
   );
   const explicitRuntimeRequests = explicitRequests
-    .filter((body: string) => body.includes("[MAIN RUNTIME V2 CHAT]"))
+    .filter((body: string) => body.includes("[MAIN RUNTIME V2]"))
     .map(runtimeRequestSummary);
   expect(explicitRuntimeRequests).toHaveLength(1);
   expect(explicitRuntimeRequests[0].body).toContain(
