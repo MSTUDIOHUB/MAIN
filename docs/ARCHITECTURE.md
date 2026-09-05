@@ -24,7 +24,7 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 
 ## 生产调用链
 
-工作区提交进入 TypeScript 后，生产执行链为：
+工作区模型提交进入 TypeScript 后，生产执行链为：
 
 1. Workspace 接纳先创建稳定的 `clientSubmissionId`、receipt、`turnId`、用户块和回合标题，并把新 Turn 写入 Session/FIFO。
 2. `startSubmitAsyncWorkflowRun()` / `runSubmitAsyncWorkflowRun()` 接管已持久化的提交，`submitRuntimeRunner.ts` 按 admission intent 选择 Runtime v2 runner。
@@ -34,7 +34,7 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 6. 工具通过 TypeScript IPC 进入 Rust；已经迁移到统一边界的入口再做路径、Shell、网络、超时与进程回收校验。工具结果进入结构化证据账本。
 7. canonical Turn 状态、审批、Plan artifact、证据与兼容事件回到 Session 投影；ChatArea、进度胶囊和时间线只从这些结构化事实渲染。
 
-“Chat / Plan / Fast”只改变策略和工具暴露，不改变工作区提交的身份：工作区会话中每次用户提交都是一个 Turn。
+“Chat / Plan / Fast”只改变策略和工具暴露，不改变工作区模型提交的身份：每次这类提交都是一个 Turn。`/init` 由 Composer 在接纳前截获，只打开本地 `AGENTS.md` 审阅并在确认后走专用 CAS IPC，因此不创建 Turn/Run，也不进入 provider 链。
 
 ## Provider-neutral Plan 边界
 

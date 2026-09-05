@@ -179,6 +179,7 @@ export function buildWorkspaceInstructionConversationTurn(input: {
     id: input.receipt.turnId,
     clientSubmissionId: input.instruction.clientSubmissionId,
     runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(projectedIntent),
+    networkRead: input.receipt.networkRead,
     workspaceInstructionReceiptId: input.receipt.receiptId,
     workspaceInstructionSource: input.instruction.source,
     userPrompt: input.instruction.payload.text,

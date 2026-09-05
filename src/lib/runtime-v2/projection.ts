@@ -100,7 +100,7 @@ export function runtimeV2StructuredActionMarkdown(
     case "publish_projection":
       return "正在同步最新任务状态。";
     case "finalize_turn":
-      return context?.strategy === "chat"
+      return context?.strategy === "chat" || context?.strategy === "analyze"
         ? "正在整理本轮对话的完整回复。"
         : "正在整理已验证的结果与仍需说明的边界。";
   }
@@ -289,7 +289,7 @@ export function buildRuntimeV2FinalProjection(
   reason: string,
   finalMarkdown?: string,
 ): RuntimeV2Projection {
-  if (aggregate.strategy === "chat") {
+  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze") {
     return projection(
       aggregate,
       "final",

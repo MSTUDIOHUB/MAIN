@@ -1,3 +1,4 @@
+import { captureNetworkRead } from "../lib/networkRead";
 // store/useAppStore.ts
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
@@ -56,8 +57,12 @@ import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
   loadResolvedInstructions,
   type InstructionSource,
+  type ResolvedInstructionIo,
   type ResolvedInstructionSet,
 } from "../lib/instructions";
+import { resolveWorkspaceAdmissionSnapshot } from "../lib/workspaceAdmission";
+import { workspaceAdmissionIpcIo } from "../lib/projectBaselineIpc";
+import { parseProjectInitCommand } from "../lib/projectInit";
 import {
   loadHooksConfig,
   type HookDefinition,
@@ -1231,6 +1236,7 @@ export type WorkspaceInstructionAcceptance =
         | "workspace_required"
         | "session_required"
         | "session_changed"
+        | "local_command_requires_composer"
         | "admission_conflict"
         | "persistence_failed";
       retryable: boolean;
@@ -1441,6 +1447,7 @@ export interface AppState {
       workspace?: string;
       projectToUi?: boolean;
       userPrompt?: string;
+      instructionIo?: ResolvedInstructionIo;
     },
   ) => Promise<ResolvedInstructionSet | null>;
   setResolvedInstructionSet: (resolved: ResolvedInstructionSet | null) => void;
@@ -10331,6 +10338,7 @@ export const useAppStore = create<AppState>()(
         state.skills,
         associatedPaths,
         options.userPrompt || "",
+        options.instructionIo,
       ),
       loadHooksConfig(requestedWorkspace),
     ]);
@@ -14606,6 +14614,18 @@ export const useAppStore = create<AppState>()(
     if (!workspace || scopeKey === GLOBAL_CHAT_KEY) {
       return { accepted: false, reason: "workspace_required", retryable: false };
     }
+    if (parseProjectInitCommand(text)) {
+      logStoreEvent("workspace_local_command_rejected_before_turn", {
+        command: text.trim(),
+        source: input.source || "composer",
+        reason: "local_review_required",
+      });
+      return {
+        accepted: false,
+        reason: "local_command_requires_composer",
+        retryable: false,
+      };
+    }
     const requestedAt = Date.now();
     const clientSubmissionId = String(input.clientSubmissionId || "").trim() ||
       createWorkspaceRuntimeIdentity("workspace-submission", requestedAt);
@@ -15129,6 +15149,7 @@ export const useAppStore = create<AppState>()(
         turnId,
         userBlockId,
         acceptedAt: submittedAt,
+        networkRead: captureNetworkRead(state),
       };
       const instruction: WorkspaceInstruction = {
         schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
@@ -16934,6 +16955,22 @@ export const useAppStore = create<AppState>()(
       });
       return false;
     }
+    const isTopLevelProjectInitCommand = !!parseProjectInitCommand(text) &&
+      options?.hidden !== true &&
+      options?.reuseCurrentTurn !== true &&
+      !options?.parentRunIdOverride &&
+      !options?.parentPlanTurnId &&
+      !options?.replyOptionSourceTurnId &&
+      !options?.replyOptionRequestIdentity &&
+      options?.continueExistingGoal !== true;
+    if (isTopLevelProjectInitCommand) {
+      logStoreEvent("workspace_local_command_rejected_before_provider", {
+        command: text.trim(),
+        adoptedTurn: options?.adoptExistingTurn === true,
+        reason: "local_review_required",
+      });
+      return false;
+    }
     const suppliedSubmissionOriginSessionKey = String(
       options?.submissionOriginSessionKey || "",
     ).trim();
@@ -18314,15 +18351,36 @@ export const useAppStore = create<AppState>()(
       acquireHarnessRunMarker,
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
-      refreshWorkspaceContext: (workspace, userPrompt) =>
-        get().refreshInstructionAndHookState([
+      refreshWorkspaceAdmission: async (workspace, userPrompt) => {
+        const associatedPaths = [
           ...turnInputContextSignals.mentionedFilePaths,
           ...turnInputContextSignals.attachedFilePaths,
-        ], {
+        ];
+        if (!String(workspace || "").trim()) {
+          return {
+            instructions: await get().refreshInstructionAndHookState(
+              associatedPaths,
+              { workspace, projectToUi: false, userPrompt },
+            ),
+            baseline: null,
+            warnings: [],
+          };
+        }
+        const snapshot = await resolveWorkspaceAdmissionSnapshot({
           workspace,
-          projectToUi: false,
+          skills: get().skills,
+          associatedPaths,
           userPrompt,
-        }),
+          io: workspaceAdmissionIpcIo,
+        });
+        return {
+          instructions: snapshot.instructions,
+          baseline: snapshot.baseline,
+          warnings: snapshot.warnings.map((warning) =>
+            `${warning.code}: ${warning.message}`
+          ),
+        };
+      },
       nowMs,
       sendStartedAt,
       getLastTurnToolSummary,

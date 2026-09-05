@@ -166,12 +166,29 @@ export interface FileNode {
   name: string;
   path: string;
   is_dir: boolean;
+  is_symlink?: boolean;
 }
 
 export interface FileMetadata {
   path: string;
   sizeBytes: number;
   modifiedMs: number;
+}
+
+export interface ProjectInitTargetSnapshot {
+  canonicalWorkspace: string;
+  targetPath: string;
+  exists: boolean;
+  content: string;
+  contentVersion: string | null;
+}
+
+export interface ProjectInitCommitResult {
+  canonicalWorkspace: string;
+  targetPath: string;
+  created: boolean;
+  unchanged: boolean;
+  contentVersion: string;
 }
 
 export interface ReadFileWindowResult {
@@ -1035,8 +1052,9 @@ export function webSearch(
   query: string,
   provider?: WebSearchProvider | string,
   maxResults?: number,
+  allowFallback?: boolean,
 ): Promise<WebSearchResponse> {
-  return invoke<WebSearchResponse>("web_search", { query, provider, maxResults });
+  return invoke<WebSearchResponse>("web_search", { query, provider, maxResults, ...(allowFallback !== undefined ? { allowFallback } : {}) });
 }
 
 export function webFetch(url: string, maxChars?: number): Promise<WebFetchResponse> {
@@ -1045,6 +1063,21 @@ export function webFetch(url: string, maxChars?: number): Promise<WebFetchRespon
 
 export function getFileMetadata(path: string, workspace?: string): Promise<FileMetadata> {
   return invoke<FileMetadata>("get_file_metadata", { path, workspace });
+}
+
+export function inspectProjectInitTarget(
+  workspace: string,
+): Promise<ProjectInitTargetSnapshot> {
+  return invoke<ProjectInitTargetSnapshot>("inspect_project_init_target", { workspace });
+}
+
+export function commitProjectInit(input: {
+  workspace: string;
+  expectedTargetPath: string;
+  expectedBaseVersion: string | null;
+  content: string;
+}): Promise<ProjectInitCommitResult> {
+  return invoke<ProjectInitCommitResult>("commit_project_init", input);
 }
 
 export function openFileExternal(path: string, workspace?: string): Promise<OpenFileExternalResult> {

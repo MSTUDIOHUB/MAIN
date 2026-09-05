@@ -28,6 +28,7 @@
     "build:windows": "npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis,msi",
     "test:e2e": "playwright test",
     "test:e2e:real-omlx-plan": "node scripts/run-real-omlx-plan-e2e.mjs",
+    "test:e2e:real-omlx-chat": "node scripts/run-real-omlx-chat-e2e.mjs",
     "test:workflow-assets": "node --test tests/node/*.test.mjs",
     "release:bump": "node scripts/release-bump.mjs",
     "release:desktop": "node scripts/release-desktop.mjs",

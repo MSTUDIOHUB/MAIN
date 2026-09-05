@@ -34,7 +34,7 @@ sourceFeature: "Workspace sidebar、session list、Workspace Turn admission"
 4. 先发送只读任务，例如“阅读项目结构，不要修改文件”。
 5. 切换项目时，回到左侧工作区区域。
 
-发送后，这条消息会先成为当前工作区会话中的一个 Turn，再进入 Chat、Plan 或 Fast 策略。即使只是提问，也会保存一个可恢复且最终有结论的回合。
+普通任务发送后会先成为当前工作区会话中的一个 Turn，再进入 Chat、Plan 或 Fast 策略。即使只是提问，也会保存一个可恢复且最终有结论的回合。需要建立项目快速参考时可输入 `/init`；它先打开审阅预览，确认后更新根 `AGENTS.md`，不会创建模型 Turn。
 
 ## 结果确认
 

@@ -1,4 +1,4 @@
-import type { RuntimeV2ProviderRecoveryPressure } from "./decision";
+import type { RuntimeV2ProviderRecoveryPressure } from "./providerRecovery";
 
 export const RUNTIME_V2_LIFECYCLE_DEADLINE_CODE =
   "RUNTIME_V2_LIFECYCLE_DEADLINE_REACHED";

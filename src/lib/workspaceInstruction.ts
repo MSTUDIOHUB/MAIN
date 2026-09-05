@@ -81,6 +81,7 @@ export interface WorkspaceInstructionReceipt {
   /** Exact visible user block adopted by the admitted Turn/Run adapter. */
   readonly userBlockId: number;
   readonly acceptedAt: number;
+  readonly networkRead?: import("./networkRead").NetworkReadPolicy;
 }
 
 /** Durable idempotency tombstone independent from paged conversation history. */

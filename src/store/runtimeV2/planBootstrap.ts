@@ -23,6 +23,7 @@ import {
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
+import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { planSettlement, terminalPlanOutcome } from "./planSettlement";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
@@ -99,12 +100,15 @@ async function collectInitialOverview(input: {
     { objective: input.turn.userPrompt },
   );
   try {
-    const result = await executeTool(
-      "get_project_skeleton",
-      {},
-      input.runner.context.runWorkspace || "",
-      input.runner.context.runSessionKey,
-    );
+    const baseline = input.runner.context.projectBaselineContext;
+    const result = baseline
+      ? renderProjectBaselineContext(baseline, 12_000)
+      : await executeTool(
+          "get_project_skeleton",
+          {},
+          input.runner.context.runWorkspace || "",
+          input.runner.context.runSessionKey,
+        );
     const overview = boundedPlanContent(result, 12_000);
     await input.ledger.settleCommand({
       type: "command.completed",
@@ -115,8 +119,10 @@ async function collectInitialOverview(input: {
     input.evidence.push({
       id: "E1",
       target: input.runner.context.runWorkspace || "workspace",
-      version: runtimeV2EvidenceVersion(result),
-      statement: "已读取工作区结构概览。",
+      version: baseline?.fingerprints.overall || runtimeV2EvidenceVersion(result),
+      statement: baseline
+        ? "已复用本轮 admission 冻结的确定性项目基线。"
+        : "已读取工作区结构概览。",
     });
     input.evidenceContents.set("E1", overview);
     await input.ledger.append({

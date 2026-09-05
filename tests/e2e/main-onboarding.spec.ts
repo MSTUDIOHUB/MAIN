@@ -25,6 +25,8 @@ test("composer help opens the MAIN guide without submitting a turn", async ({ pa
   await expect(dismissButton).toBeFocused();
   await expect(guide).toContainText("MAIN 使用指南");
   await expect(guide).toContainText("斜杠命令");
+  await expect(guide).toContainText("/init");
+  await expect(guide).toContainText("/init --refresh");
   await expect(guide).toContainText("@ 引用文件");
   await expect(guide).toContainText("自动审查");
 

@@ -1204,6 +1204,7 @@ export interface SubmitSemanticMetadataDecision<TConfig extends object> {
 }
 
 export interface SubmitVisibleTurnPatchInput {
+  networkRead?: import("../networkRead").NetworkReadPolicy;
   taskFlow: TaskBlock[];
   conversationTurns: ConversationTurn[];
   text: string;
@@ -2637,6 +2638,7 @@ export function buildSubmitVisibleTurnPatch(
   const newTurn: ConversationTurn = userBlock
     ? {
         id: params.turnId,
+        networkRead: params.networkRead,
         runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,
@@ -2654,6 +2656,7 @@ export function buildSubmitVisibleTurnPatch(
       }
     : {
         id: params.turnId,
+        networkRead: params.networkRead,
         runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(params.effectiveRunIntent),
         userPrompt: params.text,
         title: params.turnTitle,

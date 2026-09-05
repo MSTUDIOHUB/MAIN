@@ -1,3 +1,5 @@
+import { withRuntimeV2ModelReceipt, runtimeV2ToolModelContent } from "./readOnlyToolReceipt";
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   ensureVersionedReadFileResultForModel,
@@ -15,14 +17,11 @@ import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
   aggregateForCurrentTurn,
   authorizationFor,
-  boundedRuntimeV2ToolContent,
   boundedToolContent,
-  toolResultContentForModel,
   toolResultStatusForCompletion,
   nextEvidenceId,
   recordToolResultHistory,
   runtimeV2ContextBoundToolArguments,
-  runtimeV2SourceToolContent,
   stringValue,
   toolCompletionFor,
   toolDefinitionExists,
@@ -76,7 +75,7 @@ function logRuntimeV2ToolDeadline(input: {
 }
 
 export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): ToolPort {
-  return {
+  return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
       if (command.kind === "collect_observation") {
         input.logStoreEvent("runtime_v2_tool_execution_started", {
@@ -129,6 +128,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           });
           return {
             type: "observation.recorded",
+            ...(isReadOnlyContext(input) ? { modelContent: overview } : {}),
             run: command.run,
             evidence: {
               id: evidenceId,
@@ -344,6 +344,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
       try {
         let diffPreview;
         const toolExecutionOptions = {
+          ...(isReadOnlyContext(input) ? { networkRead: readOnlyNetworkPolicy(input) } : {}),
           toolCatalog: authorizationFor(input).toolCatalog,
           skillCatalog: input.context.skillCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
@@ -442,13 +443,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               sourceVersion || "",
             )
           : rawOutput;
-        const output = boundedRuntimeV2ToolContent(
-          toolName,
-          toolName === "read_file"
-            ? runtimeV2SourceToolContent(receiptOutput)
-            : toolResultContentForModel(receiptOutput),
-          input.context.runtimeContextBudget,
-        );
+        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput);
         const completion = toolCompletionFor(
           input,
           command,
@@ -545,5 +540,5 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         );
       }
     },
-  };
+  });
 }

@@ -5,6 +5,7 @@ import {
   renderSkillCatalogContext,
   skillCatalogContextCharBudget,
 } from "../../lib/agentSkills";
+import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
@@ -245,6 +246,9 @@ async function runRuntimeV2Child(input: {
             input.ports.context.workspaceInstructionContext,
           ].join("\n")
         : "",
+      renderProjectBaselineContext(
+        input.ports.context.projectBaselineContext,
+      ),
       renderSkillCatalogContext(
         input.ports.context.skillCatalog,
         skillCatalogContextCharBudget(

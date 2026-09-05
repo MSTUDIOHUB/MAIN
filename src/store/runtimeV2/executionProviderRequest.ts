@@ -1,3 +1,4 @@
+import { boundReadOnlyHistory } from "./readOnlyHistory";
 import {
   deriveBudgetedStreamSettings,
   deriveProviderAdapterCapabilities,
@@ -109,7 +110,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     budget,
     input.live.latestProviderActionWindow,
   );
-  const canonicalDecisionConversation = budget
+  const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
+  const canonicalDecisionConversation = readOnly ? history.messages : budget
     ? boundRuntimeV2ProviderConversation(
         history.messages,
         {
@@ -159,7 +161,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     toolNames.has("replace_in_file") ||
     toolNames.has("apply_patch") ||
     toolNames.has("write_file");
-  const structuredActionRequired =
+  const structuredActionRequired = !readOnly && (
     !!actionWindow ||
     executionContractAdvance.required ||
     validationCorrection.active ||
@@ -167,7 +169,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     recoveringFromRejectedAction ||
     runtimeV2RecoveryRequiresStructuredAction(
       recoveryPressure as RuntimeV2ProviderRecoveryPressure | null,
-    );
+    ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
   const forceStructuredAction = structuredActionRequired;
   const boundedConversation = structuredActionRequired
@@ -270,12 +272,20 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const instructionIndex = firstNonSystemIndex < 0
     ? boundedConversation.length
     : firstNonSystemIndex;
-  const messages = [
+  const unboundedMessages = [
     ...boundedConversation.slice(0, instructionIndex),
     decisionInstruction,
     ...textEnvelopeInstructions,
     ...boundedConversation.slice(instructionIndex),
   ];
+  const messages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
+    contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens, tools: providerTools,
+  }) : unboundedMessages;
+  if (readOnly) {
+    input.live.latestProviderRequestSourceCoverage = materializedRuntimeV2SourceCoverage(
+      messages, input.ports.context.runWorkspace || "", providerEffectFacts,
+    );
+  }
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
@@ -342,11 +352,12 @@ export async function requestRuntimeV2ProviderOnce(input: {
     recoveryReasoningEscalated:
       reasoningRequest === "explicit" &&
       settings.reasoningRequest !== "explicit",
-    decisionViewApplied: true,
+    decisionViewApplied: !readOnly,
+    contextPolicy: readOnly ? "read_only_budget" : "execute_decision",
     canonicalConversationMessages: history.messages.length,
     removedDecisionMessages: Math.max(
       0,
-      history.messages.length - boundedConversation.length,
+      readOnly ? unboundedMessages.length - messages.length : history.messages.length - boundedConversation.length,
     ),
   });
   const requestTokenBudget = Math.max(

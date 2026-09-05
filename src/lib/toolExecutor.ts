@@ -264,6 +264,7 @@ function buildChatTempSuccessMessage(
 }
 
 export interface ToolExecutionOptions {
+  networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
@@ -529,16 +530,19 @@ export async function executeTool(
     }
 
     case "web_search": {
+      if (options.networkRead && !options.networkRead.enabled) throw new Error("NETWORK_READ_NOT_AUTHORIZED");
       const query = parseOptionalString(args.query);
       if (!query) throw new Error("Missing required parameter 'query'.");
       return await webSearch(
         query,
-        parseOptionalString(args.provider),
+        options.networkRead?.provider ?? parseOptionalString(args.provider),
         parseOptionalNumber(args.max_results ?? args.maxResults),
+        options.networkRead ? false : undefined,
       );
     }
 
     case "web_fetch": {
+      if (options.networkRead && !options.networkRead.enabled) throw new Error("NETWORK_READ_NOT_AUTHORIZED");
       const url = parseOptionalString(args.url);
       if (!url) throw new Error("Missing required parameter 'url'.");
       return await webFetch(url, parseOptionalNumber(args.max_chars ?? args.maxChars));

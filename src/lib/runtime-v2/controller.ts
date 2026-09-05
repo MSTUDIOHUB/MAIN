@@ -40,6 +40,7 @@ type RuntimeV2SoftSignal = Extract<
   { readonly type: "soft_signal.observed" }
 >["signal"];
 export interface RuntimeV2Admission {
+  readonly networkRead?: import("../networkRead").NetworkReadPolicy;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
   readonly strategy: RuntimeV2Strategy;
@@ -114,6 +115,7 @@ export class RuntimeV2Controller {
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "turn.admitted",
+      ...(input.networkRead ? { networkRead: input.networkRead } : {}),
       turn: input.turn,
       strategy: input.strategy,
       objective: input.objective,
@@ -658,6 +660,7 @@ export class RuntimeV2Controller {
     finalMarkdown?: string,
   ): Promise<void> {
     const state = this.requireAggregate();
+    if (state.terminalOutcome) { await this.resumeTerminalProjection(); return; }
     const run = state.run;
     if (!run) throw new Error("Runtime v2 Run is not active.");
     for (const command of [...state.scheduledCommands]) {
@@ -705,8 +708,37 @@ export class RuntimeV2Controller {
       type: "run.completed",
       run: run.identity,
       outcome,
+      finalProjection,
     }));
-    await this.publish(finalProjection);
+    await this.resumeTerminalProjection();
+  }
+
+  /** Finish the durable terminal transaction after any interruption boundary.
+   * Replaying an existing projection does not append another final event. */
+  async resumeTerminalProjection(): Promise<boolean> {
+    const state = this.requireAggregate();
+    const run = state.run;
+    const outcome = state.terminalOutcome;
+    if (!run) return false;
+    if (!outcome) {
+      if (state.phase !== "finalizing") return false;
+      const pending = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
+      if (pending?.type !== "command.scheduled") return false;
+      await this.finishTerminal(pending.command.payload.resultKind as RuntimeV2ResultKind,
+        String(pending.command.payload.resultReason || ""), String(pending.command.payload.finalMarkdown || ""));
+      return true;
+    }
+    const completed = state.events.find((event) => event.type === "run.completed");
+    const published = state.events.find((event) => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
+    const finalize = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
+    const finalProjection = completed?.type === "run.completed" && completed.finalProjection ||
+      (published?.type === "projection.published" && published.projection) ||
+      buildRuntimeV2FinalProjection(state, outcome.finalProjectionId, outcome.resultKind, outcome.reason,
+        finalize?.type === "command.scheduled" ? String(finalize.command.payload.finalMarkdown || "") : undefined);
+    if (published?.type === "projection.published") {
+      await this.ports.projection.publish({ aggregate: state, audience: finalProjection.audience, projection: finalProjection, event: published });
+    } else await this.publish(finalProjection);
+    if (state.events.some((event) => event.type === "turn.completed")) return true;
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "turn.completed",
@@ -714,5 +746,6 @@ export class RuntimeV2Controller {
       runId: run.identity.runId,
       outcome,
     }));
+    return true;
   }
 }

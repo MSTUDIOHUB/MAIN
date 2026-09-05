@@ -30,6 +30,7 @@ export interface TurnAggregateV1 {
   readonly schemaVersion: "turn-aggregate.v1";
   readonly turn: RuntimeV2TurnIdentity;
   readonly strategy: RuntimeV2Strategy;
+  readonly networkRead?: import("../networkRead").NetworkReadPolicy;
   /** Immutable user admission fact; absent legacy checkpoints mean optional. */
   readonly subagentRequirement?: "optional" | "required";
   readonly objective: RuntimeV2Objective;

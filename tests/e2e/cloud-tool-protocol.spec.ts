@@ -439,9 +439,7 @@ test("global chat without explicit files does not expose workspace tools", async
             workspaceToolNames.includes(name),
           ),
           listDirectoryCalls: probe?.listDirectoryCalls || [],
-          bodyHasGlobalBoundary:
-            String(latest.body || "").includes("[MAIN RUNTIME V2 CHAT]") &&
-            String(latest.body || "").includes("Workspace label: global"),
+          getProjectSkeletonCalls: probe?.getProjectSkeletonCalls || 0,
           bodyHasFakeWorkspace: String(latest.body || "").includes(
             "/tmp/e2e-global-chat-tool-scope",
           ),
@@ -452,7 +450,7 @@ test("global chat without explicit files does not expose workspace tools", async
       names: [],
       leakedWorkspaceTools: [],
       listDirectoryCalls: [],
-      bodyHasGlobalBoundary: true,
+      getProjectSkeletonCalls: 0,
       bodyHasFakeWorkspace: false,
     });
 });

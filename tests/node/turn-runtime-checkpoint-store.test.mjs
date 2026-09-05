@@ -404,8 +404,14 @@ test("cold restore exposes an exact Plan review without restoring execution auth
     ...snapshot,
     currentWorkspace: workspace,
     currentSessionId: sessionId,
+    projectBaselineContext: { fingerprints: { overall: "must-not-persist" } },
   });
   assert.ok(built.turnRuntimeCheckpoints[turnId]);
+  assert.equal(
+    Object.hasOwn(built, "projectBaselineContext"),
+    false,
+    "rebuildable project baselines must not become per-Session truth",
+  );
   assert.deepEqual(store.buildSessionRuntimeSnapshotFromStoreState({
     ...snapshot,
     currentWorkspace: "/repo/not-the-owner",

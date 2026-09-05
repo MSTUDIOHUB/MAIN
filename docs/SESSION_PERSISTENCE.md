@@ -131,7 +131,7 @@ Rust CAS 只裁决“这是不是基于当前快照的写入”；TypeScript tra
 5. 如果保存已经成功、但 UI owner 在内存 `commit` 前切换，持久化的 `persisting` 条目仍算已接纳；下次精确 Session 恢复会把它协调为 `queued`，调用方不得重发并制造第二个 Turn。
 6. 保存失败时只回滚身份完全匹配且仍为 `persisting` 的条目。只要精确内存 owner 仍存在，就用 `run.completed(error)`、`turn.completed(error)` 和可见最终说明收口；不能生成应用级 `failed` 终态。
 
-Chat、Plan、Fast、Slash command 或模型是否需要工具都不能绕过这条接纳路径。工作区中每次用户提交都是 Turn。
+Chat、Plan、Fast、模型型 Slash command 或模型是否需要工具都不能绕过这条接纳路径。`/init` 是提交前截获的本地审阅命令，不创建 Turn/Run，也不进入 Session；除此之外，工作区中每次模型提交都是 Turn。
 
 ### Queue 与 Guide 的持久化区别
 

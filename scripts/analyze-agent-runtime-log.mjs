@@ -335,11 +335,11 @@ function applyEventToRun(run, event) {
     }
     run.maxAvailableContextEntries = Math.max(
       run.maxAvailableContextEntries,
-      asNonNegativeInteger(payload.availableContextEntries),
+      asNonNegativeInteger(payload.availableContextEntries ?? payload.canonicalConversationMessages),
     );
     run.maxDroppedContextEntries = Math.max(
       run.maxDroppedContextEntries,
-      asNonNegativeInteger(payload.droppedEvidenceEntries),
+      asNonNegativeInteger(payload.droppedEvidenceEntries ?? payload.removedDecisionMessages),
     );
     run.maxStrategyPivotRevision = Math.max(
       run.maxStrategyPivotRevision,
@@ -543,7 +543,7 @@ function applyEventToRun(run, event) {
       `${asString(payload.audience) || "unknown"}:${asString(payload.storeDisposition) || "unknown"}`,
     );
   }
-  if (event.event === "store.runtime_v2_execute_terminal") {
+  if (["store.runtime_v2_execute_terminal", "store.runtime_v2_chat_terminal", "store.runtime_v2_workspace_read_terminal"].includes(event.event)) {
     run.terminalResultKind = asString(payload.resultKind);
     run.terminalReason = asString(payload.reason);
     run.committedMutations = asNonNegativeInteger(payload.mutations);

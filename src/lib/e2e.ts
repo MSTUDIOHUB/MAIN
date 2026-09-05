@@ -8105,10 +8105,12 @@ function seedComposerMainShortcutsScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
+  let providerDispatchAttemptCount = 0;
   const originalDispatchNextWorkspaceInstruction =
     useAppStore.getState().dispatchNextWorkspaceInstruction;
   const holdProviderlessComposerAdmissionInFifo:
     typeof originalDispatchNextWorkspaceInstruction = (expectedSessionKey) => {
+      providerDispatchAttemptCount += 1;
       const state = useAppStore.getState();
       const hints = state.workspaceTurnQueue?.entries[0]?.instruction.payload
         .dispatchHints;
@@ -8143,6 +8145,11 @@ function seedComposerMainShortcutsScenario() {
     agentMessages: [],
     conversationTurns: [],
     currentTurnId: null,
+    workspaceTurnQueue: null,
+    workspaceInstructionLedger: [],
+    workspaceContentVersion: 0,
+    resolvedInstructionSet: null,
+    instructionSources: [],
     input: "",
     attachedFiles: [],
     contextMentions: [],
@@ -8188,6 +8195,12 @@ function seedComposerMainShortcutsScenario() {
       currentTurnTitle: observedTurn?.title ?? null,
       currentTurnPrompt: observedTurn?.userPrompt ?? null,
       currentTurnStatus: observedTurn?.status ?? null,
+      conversationTurnCount: state.conversationTurns.length,
+      workspaceInstructionLedgerCount: state.workspaceInstructionLedger.length,
+      workspaceTurnQueueCount: state.workspaceTurnQueue?.entries.length ?? 0,
+      providerDispatchAttemptCount,
+      workspaceContentVersion: state.workspaceContentVersion,
+      instructionSourcePaths: state.instructionSources.map((source) => source.path || source.name),
       currentWorkspace: state.currentWorkspace,
       activeGoalId: state.activeGoal?.id ?? null,
       isGenerating: state.isGenerating,
@@ -8220,6 +8233,16 @@ function seedComposerMainShortcutsScenario() {
       config: { ...state.config, themeMode: mode },
     }));
   };
+
+  bridge.admitProjectInitDirect = () =>
+    useAppStore.getState().acceptWorkspaceInstruction({
+      text: "/init",
+      source: "composer",
+      clientSubmissionId: "e2e-direct-project-init",
+    });
+
+  bridge.sendProjectInitDirect = () =>
+    useAppStore.getState().sendMessage("/init");
 
   bridge.switchComposerSubmissionWorkspace = (workspace: string) => {
     useAppStore.setState({
@@ -8998,6 +9021,29 @@ function seedRealOmlxPlanFlowScenario() {
       },
     ].slice(-40);
   });
+
+  bridge.prepareReadOnlyChat = (web: boolean, provider: "duckduckgo" | "bing" | "baidu" = "bing") => {
+    applyRealOmlxWorkspaceFixture();
+    const chatSessionKey = `${GLOBAL_CHAT_KEY}:${sessionId}`;
+    useAppStore.setState((state) => ({
+      config: { ...state.config, workflowMode: "chat", workspace: "" },
+      currentWorkspace: "", selectedWorkspace: "", workspaces: [],
+      sessionsByWorkspace: { [GLOBAL_CHAT_KEY]: [{ id: sessionId, planLifecycleEpoch: sessionEpoch, title: "Real model Chat", date: new Date(now).toISOString(), active: true, storageStatus: "temporary", recordingDisabled: true, messages: [] }] },
+      activeSessionByWorkspace: { [GLOBAL_CHAT_KEY]: sessionId },
+      currentSessionId: sessionId, planLifecycle: createPlanLifecycleState({ sessionKey: chatSessionKey, sessionEpoch, updatedAt: now }),
+      runtimeV2Checkpoints: {}, taskFlow: [], agentMessages: [], conversationTurns: [], currentTurnId: null,
+      webSearchEnabled: web, webSearchProvider: provider, showPlanPanel: false,
+    }));
+  };
+  bridge.sendReadOnlyMessage = (text: string) => useAppStore.getState().sendMessage(text, undefined, { resolvedIntent: "respond", skipIntentResolution: true });
+  bridge.readOnlySnapshot = () => {
+    const state = useAppStore.getState();
+    const turn = [...state.conversationTurns].reverse().find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]);
+    return { isGenerating: state.isGenerating, agentStatus: state.agentStatus, turnCount: state.conversationTurns.length,
+      turn, aggregate: turn ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate : null,
+      finals: state.taskFlow.filter((block) => block.turnId === turn?.id && block.type === "agent" && block.visibility === "assistant_final").flatMap((block) => block.type === "agent" ? [block.content] : []),
+    };
+  };
 
   bridge.sendCloudMessage = async (text?: string, images?: string[]) => {
     // Zustand persistence may finish hydration after App's E2E mount effect.

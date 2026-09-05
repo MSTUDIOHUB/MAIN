@@ -284,10 +284,10 @@ test("workspace read runner source does not import or delegate to Chat", () => {
     "utf8",
   );
   assert.doesNotMatch(source, /chatRunner|runSubmitRuntimeV2Chat|strategy:\s*"chat"/);
-  assert.match(source, /strategy:\s*"analyze"/);
+  assert.match(source, /runSubmitRuntimeV2ReadOnly\(input, "analyze"\)/);
 });
 
-test("runtime engine selection routes global turn with webSearchEnabled to workspace_read", () => {
+test("runtime engine selection keeps global Chat independent of webSearchEnabled", () => {
   const engineSelection = loadTs(
     path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"),
   );
@@ -302,7 +302,7 @@ test("runtime engine selection routes global turn with webSearchEnabled to works
     }),
     "chat",
   );
-  // With webSearchEnabled -> workspace_read
+  // Network is a capability, not a routing authority.
   assert.equal(
     engineSelection.resolveRuntimeV2VisibleRunnerKind({
       effectiveIntent: "respond",
@@ -311,23 +311,23 @@ test("runtime engine selection routes global turn with webSearchEnabled to works
       hasAttachedFiles: false,
       webSearchEnabled: true,
     }),
-    "workspace_read",
+    "chat",
   );
   assert.equal(
     engineSelection.isRuntimeV2GlobalChatTurn("respond", "", {
       webSearchEnabled: true,
     }),
-    false,
+    true,
   );
   assert.equal(
     engineSelection.isRuntimeV2WorkspaceReadTurn("respond", "", {
       webSearchEnabled: true,
     }),
-    true,
+    false,
   );
 });
 
-test("workspace read runner permits global session execution when webSearchEnabled is true", async () => {
+test("production global Chat uses shared tools with admission-time network permission", async () => {
   let revision = 0;
   let providerCalls = 0;
   const toolNames = [];
@@ -411,7 +411,7 @@ test("workspace read runner permits global session execution when webSearchEnabl
             status: "succeeded",
             evidence: [{
               id: "web-search-result",
-              kind: "external_read",
+              kind: "tool",
               target: "沈阳天气",
               version: "v1",
             }],
@@ -435,7 +435,7 @@ test("workspace read runner permits global session execution when webSearchEnabl
     },
   };
   const runner = loadTsWithMocks(
-    path.join(workspaceRoot, "src/store/runtimeV2/workspaceReadRunner.ts"),
+    path.join(workspaceRoot, "src/store/runtimeV2/chatRunner.ts"),
     new Map([
       ["../../lib/runtime-v2", runtime],
       ["./checkpointPort", checkpointPort],
@@ -450,10 +450,11 @@ test("workspace read runner permits global session execution when webSearchEnabl
       id: "turn-web-read",
       clientSubmissionId: "submission-web-read",
       userPrompt: "沈阳天气怎么样？",
+      networkRead: { enabled: true, provider: "bing" },
     }],
     _nextTaskId: () => 10,
   };
-  const settlement = await runner.runSubmitRuntimeV2WorkspaceRead({
+  const settlement = await runner.runSubmitRuntimeV2Chat({
     get: () => state,
     set: () => undefined,
     context: {

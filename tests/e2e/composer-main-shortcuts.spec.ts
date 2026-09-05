@@ -38,7 +38,7 @@ test("composer keeps a two-line minimum height and grows until it scrolls", asyn
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   const textarea = page.getByTestId("composer-textarea");
-  await expect(textarea).toHaveAttribute("placeholder", /输入需求，或输入 \/ 选择计划入口、分析、总结、报告/);
+  await expect(textarea).toHaveAttribute("placeholder", /输入需求，或输入 \/ 选择工作流、输出方式和工作区命令/);
 
   const initialBox = await textarea.boundingBox();
   expect(initialBox?.height ?? 0).toBeGreaterThanOrEqual(56);
@@ -152,6 +152,7 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
     "main-shortcut-item-report",
     "main-shortcut-item-analyze",
     "main-shortcut-item-summarize",
+    "main-shortcut-item-init",
   ]);
 
   await page.keyboard.press("Enter");

@@ -660,6 +660,47 @@ test("submit async workflow run keeps stage order from context build to engine l
   );
 });
 
+test("composite workspace admission freezes one baseline and skips the legacy tree prefetch", async () => {
+  const baseline = Object.freeze({
+    kind: "project_baseline_context",
+    workspace: Object.freeze({
+      canonicalPath: "/tmp/workspace",
+      identity: "workspace-a",
+    }),
+    fingerprints: Object.freeze({ overall: "baseline-a" }),
+  });
+  let captured = null;
+  const harness = createHarness({
+    input: {
+      refreshWorkspaceAdmission: async (workspace) => {
+        assert.equal(workspace, "/tmp/workspace");
+        return { instructions: null, baseline, warnings: [] };
+      },
+      phaseRunners: {
+        createRuntimeContext: (input) => {
+          captured = input;
+          return {
+            ...input,
+            streamBuffer: null,
+            thinkingInterceptor: null,
+            agentBlockIdsCreatedThisRun: new Set(),
+          };
+        },
+        runRuntime: () => Promise.resolve(true),
+      },
+    },
+  });
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(captured.projectBaselineContext, baseline);
+  assert.equal(captured.workspaceTree, null);
+  assert.equal(
+    harness.calls.some((entry) => entry[0] === "workspace_tree"),
+    false,
+  );
+});
+
 test("an admitted A Run keeps its A instruction snapshot when the UI switches to B", async () => {
   const instructionSet = (workspace, content) => ({
     layers: [{

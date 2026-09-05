@@ -250,10 +250,12 @@ export function providerModeInstruction(
           "Submit one workspace mutation against an exact source target already visible in this request, or return a concise incomplete report without a tool call. Collaboration cannot replace this parent action, and creating an unrelated file cannot discharge this existing-source effect debt. If a mutation is rejected because one exact target source is missing, Runtime opens a target-locked source recovery window. Inspection and validation reopen immediately after a mutation commits.",
         ].join(" ")
     : "";
-  if (mode === "analyze") {
+  if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
+    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. State information gaps explicitly; never invent facts or claim that unavailable checks succeeded.";
     return [
-      "Perform a bounded read-only analysis of the admitted file context. Use a focused read or search only when a concrete fact is missing, then return one complete evidence-backed Markdown answer.",
-      collaborationGuidance,
+      mode === "chat" ? "Answer the user using the supplied conversation. Only exposed Skill and Web context reads are available." : "Analyze the admitted sources with read-only authority.",
+      command.payload.recoveryPressure ? "The last decision added no new evidence. Read again only for a concrete remaining information gap using a materially different source or reading method; otherwise answer now." : "Use a focused read only when a concrete fact is missing, then return a complete Markdown answer.",
+      mode === "analyze" ? collaborationGuidance : "",
     ].filter(Boolean).join(" ");
   }
   if (mode === "conclude") {

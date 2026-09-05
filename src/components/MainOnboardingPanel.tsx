@@ -73,7 +73,7 @@ export default function MainOnboardingPanel({
           {
             label: "Commands",
             title: "/ Slash commands",
-            description: "Type / to browse Plan, Analyze, Summary, Report, Goal, and Image shortcuts. Natural-language requests still work without a command.",
+            description: "Type / to browse workflows and output styles. /init opens a reviewable AGENTS.md setup; /init --refresh opens a rebuild preview and writes only after confirmation.",
           },
           {
             label: "Context",
@@ -102,7 +102,7 @@ export default function MainOnboardingPanel({
           {
             label: "命令",
             title: "/ 斜杠命令",
-            description: "输入 / 可浏览计划、分析、总结、报告、目标与生图入口；不输入命令也可以直接用自然语言执行任务。",
+            description: "输入 / 可浏览工作流与输出方式；/init 会打开可审阅的 AGENTS.md 初始化预览，/init --refresh 会打开重建预览，确认后才写入。",
           },
           {
             label: "上下文",

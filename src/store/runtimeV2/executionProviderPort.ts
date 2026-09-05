@@ -1,3 +1,4 @@
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
 import {
   providerActionEpochExhausted,
@@ -170,7 +171,9 @@ export function createRuntimeV2ProviderPort(
               result.toolCalls,
               tools,
               input.context.runWorkspace,
-            ),
+            ).map((call) => isReadOnlyContext(input) && call.name === "web_search"
+              ? { ...call, arguments: { ...call.arguments, provider: readOnlyNetworkPolicy(input).provider } }
+              : call),
           };
           if (result.toolCalls.length > 0) {
             input.live.provenStructuredToolTransports.add(attempt.variant);

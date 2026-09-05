@@ -1,3 +1,4 @@
+import { isChatContext } from "./readOnlyPolicy";
 import {
   RUNTIME_V2_SUBAGENT_ACCESS_MODES,
   RUNTIME_V2_SUBAGENT_TASK_KINDS,
@@ -514,10 +515,14 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     return runtimeV2PlanFrontierDefinition(adapted, readyTargets);
   };
   if (mode === "conclude") {
+    if (input.command.payload.conclusionKind === "read_only") return [];
     return available.filter((definition) =>
       definition.function.name === "wait_subagents" &&
       collaboration.has("wait_subagents")
     ).map(adapt);
+  }
+  if (mode === "chat" || isChatContext(input.ports)) {
+    return available.filter((definition) => ["load_skill", "web_search", "web_fetch"].includes(definition.function.name)).map(adapt);
   }
   if (mode === "analyze") {
     if (!String(input.ports.context.runWorkspace || "").trim()) {

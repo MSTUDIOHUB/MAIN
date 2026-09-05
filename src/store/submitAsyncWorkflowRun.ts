@@ -34,6 +34,7 @@ import {
   renderResolvedInstructionContext,
   type ResolvedInstructionSet,
 } from "../lib/instructions";
+import type { ProjectBaselineContext } from "../lib/projectBaseline";
 import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
@@ -216,6 +217,20 @@ export interface StartSubmitAsyncWorkflowRunInput<
     workspace: string,
     userPrompt?: string,
   ) => Promise<ResolvedInstructionSet | null>;
+  /** Preferred composite admission owner. Its implementation must share a
+   * read-through snapshot between instructions and baseline anchors. */
+  refreshWorkspaceAdmission?: (
+    workspace: string,
+    userPrompt?: string,
+  ) => Promise<{
+    instructions: ResolvedInstructionSet | null;
+    baseline: ProjectBaselineContext | null;
+    warnings?: readonly string[];
+  }>;
+  /** Compatibility/testing port used only when no composite owner exists. */
+  refreshProjectBaseline?: (
+    workspace: string,
+  ) => Promise<ProjectBaselineContext | null>;
   nowMs: () => number;
   sendStartedAt: number;
   getLastTurnToolSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
@@ -1749,7 +1764,34 @@ export async function runSubmitAsyncWorkflowRun<
   // Resolve it before marking the harness/run as active so a read failure can
   // be finalized as a pre-run conclusion instead of stranding a running lease.
   let resolvedInstructionSnapshot: ResolvedInstructionSet | null = null;
-  if (input.refreshWorkspaceContext) {
+  let projectBaselineSnapshot: ProjectBaselineContext | null = null;
+  if (input.refreshWorkspaceAdmission) {
+    const admissionRefreshStartedAt = input.nowMs();
+    try {
+      const admission = await input.refreshWorkspaceAdmission(
+        input.runWorkspace,
+        input.text,
+      );
+      resolvedInstructionSnapshot = admission.instructions;
+      projectBaselineSnapshot = admission.baseline;
+      input.logStoreEvent("workspace_admission_refreshed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
+        skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
+        baselineFingerprint:
+          projectBaselineSnapshot?.fingerprints.overall || null,
+        warnings: [...(admission.warnings || [])],
+        elapsedMs: Math.round(input.nowMs() - admissionRefreshStartedAt),
+      });
+    } catch (error) {
+      input.logStoreEvent("workspace_admission_refresh_failed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } else if (input.refreshWorkspaceContext) {
     const instructionRefreshStartedAt = input.nowMs();
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
@@ -1780,14 +1822,41 @@ export async function runSubmitAsyncWorkflowRun<
     }
   }
 
-  const workspaceTreeStartedAt = input.nowMs();
-  const workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
-  input.logStoreEvent("workspace_tree_ready", {
-    turnId: input.turnId,
-    workspace: input.runWorkspace || "global",
-    chars: workspaceTree.length,
-    elapsedMs: Math.round(input.nowMs() - workspaceTreeStartedAt),
-  });
+  if (!input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
+    const baselineRefreshStartedAt = input.nowMs();
+    try {
+      projectBaselineSnapshot = await input.refreshProjectBaseline(
+        input.runWorkspace,
+      );
+      input.logStoreEvent("project_baseline_refreshed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        fingerprint: projectBaselineSnapshot?.fingerprints.overall || null,
+        elapsedMs: Math.round(input.nowMs() - baselineRefreshStartedAt),
+      });
+    } catch (error) {
+      input.logStoreEvent("project_baseline_refresh_failed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Runtime v2 consumes the typed baseline. Keep the legacy tree only as a
+  // compatibility fallback when baseline construction was unavailable.
+  let workspaceTree: string | null = null;
+  if (!projectBaselineSnapshot) {
+    const workspaceTreeStartedAt = input.nowMs();
+    workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
+    input.logStoreEvent("workspace_tree_ready", {
+      turnId: input.turnId,
+      workspace: input.runWorkspace || "global",
+      chars: workspaceTree.length,
+      elapsedMs: Math.round(input.nowMs() - workspaceTreeStartedAt),
+      source: "legacy_fallback",
+    });
+  }
 
   // Bootstrap work above intentionally runs without an execution lease. A
   // workspace clear/delete can remove this Session while an attachment,
@@ -1985,7 +2054,11 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
+    projectBaselineContext: projectBaselineSnapshot,
     skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
+    networkRead: input.sessionGet().conversationTurns.find(
+      (turn: ConversationTurn) => turn.id === input.turnId,
+    )?.networkRead,
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,
     sendStartedAt: input.sendStartedAt,

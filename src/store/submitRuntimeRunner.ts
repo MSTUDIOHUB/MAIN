@@ -47,7 +47,6 @@ export async function runSubmitRuntime(
     runWorkspace: input.context.runWorkspace,
     hasAttachedFiles:
       input.context.turnInputContextSignals.attachedFilePaths.length > 0,
-    webSearchEnabled: input.get().webSearchEnabled === true,
   });
   if (admittedVersion !== "v2") {
     input.logStoreEvent("runtime_v2_turn_marker_missing", {

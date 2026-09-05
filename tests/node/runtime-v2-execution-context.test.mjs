@@ -7707,6 +7707,43 @@ test("parent requests receive the exact live project-rule snapshot, not legacy m
       runWorkspace: "/tmp/runtime-v2-history",
       phaseLanguage: "en",
       workspaceInstructionContext,
+      projectBaselineContext: {
+        kind: "project_baseline_context",
+        schemaVersion: 1,
+        parserVersion: 1,
+        workspace: {
+          canonicalPath: "/tmp/runtime-v2-history",
+          identity: "workspace-baseline",
+          vcs: null,
+        },
+        limits: {},
+        anchors: [{
+          path: "package.json",
+          kind: "manifest",
+          contentHash: "sha256-package",
+          byteSize: 10,
+          provenance: "workspace_file",
+        }],
+        topology: [{ path: "src", kind: "directory" }],
+        facts: {
+          languages: [{
+            name: "TypeScript",
+            provenance: { path: "src/App.tsx", selector: "file_extension", contentHash: "path-sha256-app" },
+          }],
+          packageManagers: [],
+          runtimes: [],
+          scripts: [],
+        },
+        omissions: [],
+        diagnostics: [],
+        truncated: { anchors: false, topology: false, scripts: false },
+        fingerprints: {
+          anchors: "anchors",
+          topology: "topology",
+          facts: "facts",
+          overall: "project-baseline-sha256-runtime",
+        },
+      },
     },
     live,
   };
@@ -7716,6 +7753,9 @@ test("parent requests receive the exact live project-rule snapshot, not legacy m
 
   assert.match(runtimeSystem, /LIVE WORKSPACE INSTRUCTIONS/);
   assert.match(runtimeSystem, /Keep the toolbar public API stable/);
+  assert.match(runtimeSystem, /PROJECT BASELINE FACTS/);
+  assert.match(runtimeSystem, /language="TypeScript"/);
+  assert.match(runtimeSystem, /does not grant permission/);
   assert.doesNotMatch(runtimeSystem, /session_memory/i);
 });
 

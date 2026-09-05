@@ -72,6 +72,11 @@ function baseInput(overrides = {}) {
     workspaceTree: "[F] src/App.tsx",
     workspaceInstructionContext:
       "## AGENTS.md\nSource: AGENTS.md\nRun focused tests.",
+    projectBaselineContext: {
+      kind: "project_baseline_context",
+      workspace: { identity: "workspace-1" },
+      fingerprints: { overall: "baseline-1" },
+    },
     skillCatalog: {
       entries: [],
       explicitSkillIds: [],
@@ -119,6 +124,7 @@ test("submit runtime context carries immutable turn parameters and initializes m
     context.workspaceInstructionContext,
     input.workspaceInstructionContext,
   );
+  assert.equal(context.projectBaselineContext, input.projectBaselineContext);
   assert.equal(context.skillCatalog, input.skillCatalog);
   assert.deepEqual(context.turnInputContextSignals, input.turnInputContextSignals);
   assert.equal(context.turnInputContextSignals.subagentRequirement, "required");

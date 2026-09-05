@@ -92,8 +92,7 @@ export function runtimeV2ProviderOutputWasTruncated(input: {
   readonly toolCallCount: number;
   readonly availableToolCount: number;
 }): boolean {
-  return input.availableToolCount > 0 &&
-    input.finishReason === "length" &&
+  return input.finishReason === "length" &&
     input.toolCallCount === 0;
 }
 

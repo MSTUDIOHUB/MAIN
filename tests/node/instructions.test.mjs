@@ -33,6 +33,11 @@ async function loadInstructionsModule(ipcStubs) {
         })),
       };
     }
+    if (specifier === "./sha256") {
+      return {
+        sha256Hex: (value) => `test-${Buffer.from(String(value)).toString("hex")}`,
+      };
+    }
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   const factory = new Function("exports", "module", "require", transpiled);

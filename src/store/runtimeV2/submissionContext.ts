@@ -1,6 +1,7 @@
 import type { ResolvedRunIntent } from "../../lib/runIntent";
 import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
+import type { ProjectBaselineContext } from "../../lib/projectBaseline";
 import type { TurnInputContextSignals } from "../../lib/turnIntake";
 import type {
   GoalContinuationAuthorization,
@@ -16,6 +17,7 @@ import type {
  * those legacy fields through this boundary.
  */
 export interface RuntimeV2SubmissionContext {
+  readonly networkRead?: import("../../lib/networkRead").NetworkReadPolicy;
   readonly turnId: string;
   readonly uiDisplayTurnId: string;
   readonly runWorkspace: string | undefined;
@@ -27,6 +29,9 @@ export interface RuntimeV2SubmissionContext {
   readonly runtimeRunIntent: ResolvedRunIntent;
   /** Exact live project rules captured at the Turn safe boundary. */
   readonly workspaceInstructionContext?: string;
+  /** Frozen, deterministic workspace facts. This is not an instruction,
+   * capability, validation receipt, or persisted Session truth. */
+  readonly projectBaselineContext?: ProjectBaselineContext | null;
   /** Immutable catalog revision shared by parent, Plan, Goal slices and safe
    * tool execution for this Run. */
   readonly skillCatalog?: SkillCatalogSnapshot | null;

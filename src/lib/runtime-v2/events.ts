@@ -40,6 +40,7 @@ export interface RuntimeV2EventBase {
 export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
+      readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
       readonly subagentRequirement?: "optional" | "required";
@@ -62,6 +63,7 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "observation.recorded";
+      readonly modelContent?: string;
       readonly run: RuntimeV2RunIdentity;
       readonly evidence: RuntimeV2EvidenceReference;
     })
@@ -88,6 +90,8 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "tool.completed";
+      /** Exact bounded model-facing receipt; replay restores the paired transcript. */
+      readonly modelContent?: string;
       readonly run: RuntimeV2RunIdentity;
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
@@ -235,6 +239,7 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.completed";
+      readonly finalProjection?: import("./contracts").RuntimeV2Projection;
       readonly run: RuntimeV2RunIdentity;
       readonly outcome: RuntimeV2TerminalOutcome;
     })

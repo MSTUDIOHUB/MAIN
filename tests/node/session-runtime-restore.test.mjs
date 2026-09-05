@@ -1070,7 +1070,7 @@ test("FIFO acknowledgement saves the live Session without revoking its seeded su
   }
 });
 
-test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a transient OMLX failure at the lifecycle boundary", async () => {
+test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a transient OMLX failure after read-only recovery", async () => {
   const originalState = useAppStore.getState();
   const realSendMessage = originalState.sendMessage;
   const workspace = "/tmp/fifo-omlx-bootstrap-owner";
@@ -1210,7 +1210,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     assert.equal(ownedEvents.filter((event) => event.type === "turn.completed").length, 1);
     assert.equal(
       ownedEvents.find((event) => event.type === "run.completed")?.resultKind,
-      "partial",
+      "error",
       JSON.stringify({
         eventTypes: ownedEvents.map((event) => event.type),
         ownedEvents,
@@ -1218,12 +1218,12 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
         agentStatus: settled.agentStatus,
       }),
     );
-    assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "partial");
-    assert.equal(turn?.status, "done");
-    assert.equal(turn?.runtimeOutcome?.resultKind, "partial");
+    assert.equal(ownedEvents.find((event) => event.type === "turn.completed")?.resultKind, "error");
+    assert.equal(turn?.status, "error");
+    assert.equal(turn?.runtimeOutcome?.resultKind, "error");
     assert.equal(settled.isGenerating, false);
     assert.equal(settled.agentStatus, "idle");
-    assert.match(turn?.summary || "", /生命周期时限|lifecycle/i);
+    assert.match(turn?.summary || "", /恢复租约|recovery/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
         block.type === "agent" &&

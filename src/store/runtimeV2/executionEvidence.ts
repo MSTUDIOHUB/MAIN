@@ -1,3 +1,4 @@
+import { readOnlyEvidenceVersion } from "../../lib/runtime-v2/readOnlyProgress";
 import {
   runtimeV2EvidenceVersion,
   type RuntimeV2Command,
@@ -493,7 +494,7 @@ export function toolCompletionFor(
             version: projection.kind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
               : projection.kind === "tool"
-                ? runtimeV2ValidationEvidenceVersion(output)
+                ? readOnlyEvidenceVersion(toolName, output) || runtimeV2ValidationEvidenceVersion(output)
                 : null,
           }))
         : [],

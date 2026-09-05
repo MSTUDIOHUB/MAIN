@@ -3,6 +3,7 @@ import {
   loadSkillCatalog,
   type SkillCatalogSnapshot,
 } from "./agentSkills";
+import { sha256Hex } from "./sha256";
 
 export type InstructionSourceKind =
   | "legacy"
@@ -20,6 +21,14 @@ export interface InstructionSource {
   enabled: boolean;
   order: number;
   matchedPaths?: string[];
+  /** Exact raw source identity captured at the admission read boundary. */
+  contentHash?: string;
+  byteSize?: number;
+}
+
+export interface ResolvedInstructionIo {
+  readFile(path: string, workspace: string): Promise<string>;
+  globSearch(pattern: string, workspace: string): Promise<string[]>;
 }
 
 export interface InstructionLayer {
@@ -238,18 +247,23 @@ function parseFrontmatter(raw: string): ParsedFrontmatter {
 async function tryRead(
   path: string,
   workspace: string,
+  io: ResolvedInstructionIo,
 ): Promise<string | null> {
   if (!workspace) return null;
   try {
-    return await readFile(path, workspace);
+    return await io.readFile(path, workspace);
   } catch {
     return null;
   }
 }
 
-async function tryGlob(path: string, workspace: string): Promise<string[]> {
+async function tryGlob(
+  path: string,
+  workspace: string,
+  io: ResolvedInstructionIo,
+): Promise<string[]> {
   if (!workspace) return [];
-  return globSearch(path, workspace).catch(() => []);
+  return io.globSearch(path, workspace).catch(() => []);
 }
 
 function matchPatterns(patterns: string[], associatedPaths: string[]): string[] {
@@ -267,6 +281,7 @@ export async function loadResolvedInstructions(
   skills: InstructionSkillLike[],
   associatedPaths: string[] = [],
   userPrompt = "",
+  io: ResolvedInstructionIo = { readFile, globSearch },
 ): Promise<ResolvedInstructionSet> {
   const immutableWorkspace = workspace.trim();
   const normalizedAssociated = associatedPaths.map(normalizePath).filter(Boolean);
@@ -297,6 +312,8 @@ export async function loadResolvedInstructions(
       path: options?.path,
       enabled: true,
       order,
+      contentHash: `sha256-${sha256Hex(content)}`,
+      byteSize: new TextEncoder().encode(content).byteLength,
       ...(options?.matchedPaths && options.matchedPaths.length > 0
         ? { matchedPaths: options.matchedPaths }
         : {}),
@@ -319,7 +336,7 @@ export async function loadResolvedInstructions(
   };
 
   for (const legacyPath of LEGACY_FILES) {
-    const content = await tryRead(legacyPath, immutableWorkspace);
+    const content = await tryRead(legacyPath, immutableWorkspace, io);
     if (!content) continue;
     pushLayer(legacyPath.split("/").pop() || legacyPath, "legacy", content, {
       path: legacyPath,
@@ -329,16 +346,17 @@ export async function loadResolvedInstructions(
   const cursorRuleFiles = await tryGlob(
     ".cursor/rules/*.md",
     immutableWorkspace,
+    io,
   );
   for (const rulePath of cursorRuleFiles) {
-    const content = await tryRead(rulePath, immutableWorkspace);
+    const content = await tryRead(rulePath, immutableWorkspace, io);
     if (!content) continue;
     pushLayer(rulePath.split("/").pop() || rulePath, "legacy", content, {
       path: rulePath,
     });
   }
 
-  const agentContent = await tryRead("AGENT.md", immutableWorkspace);
+  const agentContent = await tryRead("AGENT.md", immutableWorkspace, io);
   if (agentContent) {
     pushLayer("AGENT.md", "workspace_agent", agentContent, { path: "AGENT.md" });
   }
@@ -346,10 +364,11 @@ export async function loadResolvedInstructions(
   const steeringFiles = await tryGlob(
     ".MAIN/steering/*.md",
     immutableWorkspace,
+    io,
   );
   for (const steeringPath of steeringFiles.sort()) {
     if (/\/README\.md$/i.test(normalizePath(steeringPath))) continue;
-    const content = await tryRead(steeringPath, immutableWorkspace);
+    const content = await tryRead(steeringPath, immutableWorkspace, io);
     if (!content) continue;
     const parsed = parseFrontmatter(content);
     const matched = parsed.paths.length > 0
@@ -377,11 +396,12 @@ export async function loadResolvedInstructions(
   const scopedRuleFiles = await tryGlob(
     ".MAIN/rules/*.md",
     immutableWorkspace,
+    io,
   );
   const scopedRules: ScopedRule[] = [];
 
   for (const rulePath of scopedRuleFiles) {
-    const content = await tryRead(rulePath, immutableWorkspace);
+    const content = await tryRead(rulePath, immutableWorkspace, io);
     if (!content) continue;
 
     const parsed = parseFrontmatter(content);
@@ -418,6 +438,7 @@ export async function loadResolvedInstructions(
   const templateFiles = await tryGlob(
     ".MAIN/templates/**/*.md",
     immutableWorkspace,
+    io,
   );
   for (const templatePath of templateFiles) {
     // Older releases may have copied the removed mode's private template pack
@@ -426,7 +447,7 @@ export async function loadResolvedInstructions(
     if (normalizePath(templatePath).startsWith(".MAIN/templates/game-studio/")) {
       continue;
     }
-    const content = await tryRead(templatePath, immutableWorkspace);
+    const content = await tryRead(templatePath, immutableWorkspace, io);
     if (!content) continue;
     const parsed = parseFrontmatter(content);
     const relativeTitle = templatePath.replace(/^\.MAIN\/templates\//, "");

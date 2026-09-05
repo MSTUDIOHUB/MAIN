@@ -63,6 +63,15 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 
 普通 Execute 的时间语义是“进展驱动”，不是“从接纳开始倒计时”：模型推理、持续流式输出、真实工具动作、证据收集、修改和验证无论总耗时多久，都不能因为 Turn 年龄被取消。10 分钟只用于 `provider recovery stall lease`：它从第一次没有形成可执行结果的 provider 决策开始，在模型持续重复已拒绝动作、返回空动作或请求持续失败且没有新进展时累计；任一可执行决策或新的工具/证据边界立即清零。该 lease 只在两次动作之间检查，不中断正在进行的慢模型请求或工具。读取和有限验证仍可有单操作 watchdog；单操作超时是可恢复失败，不是整轮终态。
 
+Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：无本地来源的对话始终为 Chat；工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
+
+只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次累计，第一次无进展要求指出信息缺口，第二次切换 `mode=conclude, conclusionKind=read_only` 并清空工具。历史 `iteration_limit` 仅推动该策略切换；生产不再按固定轮数发出它。总结请求仍未产生完整回答时为 `error`，不能把工具证据投影为生命周期 `partial`。
+
+Chat/analyze 的模型上下文在预算内保留原有对话和当前完整 assistant/tool 对。只有实际超出输入预算（含系统指令和工具 schema）才先移除重复工具组，再移除最早完整历史 Turn；单份超大回执最后以明确缺失标记缩短，保留配对。Execute/validate 继续原有 decision view。只读 `tool.completed.modelContent` 保存模型实际收到的有界回执；恢复从事件重建同一条 transcript 和 evidence ordinal，不能仅恢复 receipt 元数据后继续丢失工具结果。
+
+终态投影是可恢复事务：`run.completed` 保存精确 final projection，随后提交 `projection.published` 和 `turn.completed`。只读恢复补齐缺失步骤，已有步骤按 projection ID 重放，不追加第二个终态或最终消息。
+
+
 ### 2.1 跨模型统一协议，而不是统一思考过程
 
 Qwen 一类模型可能返回很长的 reasoning，Gemma 一类模型可能很短或不返回同形字段；
@@ -179,10 +188,10 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 
 项目基线的正确生命周期：
 
-- 第一次需要工作区上下文时做快速、确定性的 anchor 扫描，不用模型阅读全文，也不阻塞等待全仓库索引。
-- 以 schema version、canonical workspace identity 和 anchor fingerprint 持久化；manifest、lockfile、项目规则或相关配置变化时重建。不能只靠时间戳宣称新鲜。
-- 每个新 Session、Turn 和 child 都接收同一份有界基线；根据任务再从 repo map/AST/文件工具检索具体事实，而不是把整个索引塞进 prompt。
-- 用户维护的 `.MAIN/steering` 或等价项目规则保持独立权威；自动基线只能引用，不能重写它。
+- 每个 Workspace Turn admission 做快速、确定性的 anchor 与浅层拓扑扫描，不用模型阅读全文，也不等待全仓库索引。
+- instructions 与 baseline 共享同一次 read-through；baseline 以 schema/parser version、canonical workspace/VCS identity、anchor、topology 和 facts fingerprint 标识，不依赖 mtime。
+- 本 Run 内 parent、Plan、Execute、Goal 和 child 接收同一份冻结基线；它不进入 Session/checkpoint 持久化。下一 Turn 从当前工作区重新构建，再按任务用 repo map/AST/文件工具读取具体源码。
+- 用户维护的 `.MAIN/steering`、`AGENTS.md` 或等价项目规则保持独立权威；自动 baseline 只能作为非权威事实引用，不能静默重写人工规则。
 - 失败历史、模型推断、临时路径和“上次这样修成功了”不能成为无条件全局记忆。只有带 workspace、目标、版本和验证 provenance 的事实才能跨 Turn 复用，并在来源变化时失效。
 
 当前能力审计：
@@ -192,7 +201,8 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 工作区 `AGENTS.md`、`CLAUDE.md`、`AGENT.md`、`.MAIN/rules`、显式 active instruction skill，以及 `.MAIN/steering` 中 `inclusion: always` / 已知路径匹配的 `fileMatch` 规则，已收敛到同一个 `ResolvedInstructionSet`。每个 Turn 在 Run admission 前刷新一次，随后把带 source provenance 的完整文本冻结到 Runtime v2 admission context；父线程和之后启动的 child 使用同一快照。
 - 上述规则同步与会话压缩互相独立；旧 `session_memory.json`、provider 总结和 conversation summary 都不能填充这个字段。当前生产路径为避免借用另一个工作区的 UI 投影，规则刷新失败时会让本 Turn 使用空 instruction snapshot，并继续通过普通源码工具安全读取；它不会把一次可选 bootstrap I/O 失败升级为终态。未来若缓存最后成功快照，必须绑定 canonical workspace identity、来源 hash 与新鲜度，不能直接复用全局 UI 状态。
 - repo map 目前仅在模型调用 `repo_map_*` 工具时构建，且调用会重新扫描；它是按需代码检索，不是 Session bootstrap 项目基线。
-- 因此“每轮默认获得带 manifest/lockfile fingerprint 的完整结构基线”仍是**尚未接线**能力；目前已经接线的是用户维护的项目规则和浅层 workspace observation。实现剩余结构基线时应替换或收敛上述重复存储，不能再增加第三份项目真值。
+- 每个 Workspace Turn 现在都会尝试取得带 manifest/lockfile、规则 source hash、声明脚本与浅层 topology 的 typed baseline；构建失败时该分支为空并回退到 legacy shallow workspace tree，不影响已成功解析的 instructions。规则 source 原始 hash 不一致时也只丢弃 baseline。
+- `/init` 是显式、可审阅的本地命令：它可创建根 `AGENTS.md` 或用 `--refresh` 重建唯一托管区块，但不自动把每次源码 mutation 写回 Markdown。普通项目事实的新鲜度由下一 Turn 重建的 baseline 提供。
 
 ### OpenCode 公开实现的可采用边界
 

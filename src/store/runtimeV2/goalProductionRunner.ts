@@ -349,6 +349,7 @@ export async function runSubmitRuntimeV2Goal(
     turnInputContextSignals: input.context.turnInputContextSignals,
     runtimeContextBudget: input.context.runtimeContextBudget,
     workspaceInstructionContext: input.context.workspaceInstructionContext,
+    projectBaselineContext: input.context.projectBaselineContext,
     skillCatalog: input.context.skillCatalog,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,

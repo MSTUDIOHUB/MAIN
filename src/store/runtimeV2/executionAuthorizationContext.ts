@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import {
   buildToolCapabilityRegistry,
   getToolRiskLevelForCall,
@@ -265,7 +266,9 @@ export function authorizationFor(
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
-      input.get(),
+      isReadOnlyContext(input)
+        ? { ...input.get(), webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
+        : input.get(),
       input.context.skillCatalog,
     );
   }
@@ -277,6 +280,12 @@ export function providerToolDefinitionsForCommand(
   command: RuntimeV2Command,
 ): ToolDefinition[] {
   const aggregate = aggregateForCurrentTurn(input);
+  if (isReadOnlyContext(input)) {
+    input.live.latestProviderActionWindow = null;
+    const authorization = authorizationFor(input);
+    const available = runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || "");
+    return selectRuntimeV2ProviderToolDefinitions({ ports: input, command, available, capabilityRegistry: authorization.capabilityRegistry });
+  }
   const effects = deriveRuntimeV2ProviderEffectFacts(aggregate);
   const executionContractAdvance =
     deriveRuntimeV2ExecutionContractAdvance(aggregate);

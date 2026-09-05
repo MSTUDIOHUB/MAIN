@@ -303,7 +303,7 @@ test("Chat allows canonical load_skill context reads and still denies every exte
   );
 });
 
-test("transient transport failures continue until the lifecycle deadline", async () => {
+test("transport failures conclude truthfully without publishing partial evidence", async () => {
   const testHarness = harness([
     ({ advance }) => {
       advance(400);
@@ -327,8 +327,8 @@ test("transient transport failures continue until the lifecycle deadline", async
     now: testHarness.now,
     deadlineMs: 1_000,
   });
-  assert.equal(result.resultKind, "partial");
-  assert.match(result.reason, /运行时限/);
+  assert.equal(result.resultKind, "error");
+  assert.match(result.reason, /运行时限|未产生完整/);
   assert.equal(testHarness.read().providerCalls, 3);
   assert.equal(
     result.aggregate.events.filter((event) => event.type === "run.paused").length,
@@ -355,8 +355,8 @@ test("deadline and cancellation are distinct canonical conclusions", async (t) =
       now: testHarness.now,
       deadlineMs: 1_000,
     });
-    assert.equal(result.resultKind, "partial");
-    assert.match(result.reason, /运行时限/);
+    assert.equal(result.resultKind, "error");
+    assert.match(result.reason, /运行时限|未产生完整/);
   });
 
   await t.test("canceled", async () => {
@@ -391,14 +391,8 @@ test("Chat adapter has no legacy runtime, external tool executor, or prose lifec
     "utf8",
   );
   assert.doesNotMatch(source, /orchestrator|workflowEngine|AgentOrchestrator|WorkflowContext/);
-  assert.doesNotMatch(source, /TOOL_DEFINITIONS|executeTool|createRuntimeV2ToolPort/);
-  assert.doesNotMatch(
-    source,
-    /visibleText\.(?:includes|match|search|startsWith)|RegExp\([^)]*visibleText/,
-  );
-  assert.match(source, /buildLoadSkillToolDefinition/);
-  assert.match(source, /toolChoice:\s*input\.tools\?\.length\s*\?\s*"auto"\s*:\s*"none"/);
-  assert.match(source, /toolName !== "load_skill"/);
+  assert.doesNotMatch(source, /streamChatCompletion|CHAT_DEADLINE_MS|setTimeout/);
+  assert.match(source, /runSubmitRuntimeV2ReadOnly/);
   assert.match(source, /isRuntimeV2GlobalChatTurn/);
   assert.match(source, /RUNTIME_V2_CHAT_REJECTS_WORKSPACE_SESSION/);
 });

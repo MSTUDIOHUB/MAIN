@@ -28,9 +28,7 @@ export function isRuntimeV2ChatIntent(
     intent === "report";
 }
 
-/** Chat owns only workspace-free Sessions without external tools or network access.
- * Workspace-bound read-only intents, file attachments, and network-enabled
- * queries use the separate `analyze` strategy and its finite read-only capability surface. */
+/** Network is a capability of Chat; only admitted local sources select analyze. */
 export function isRuntimeV2GlobalChatTurn(
   intent: ResolvedRunIntent | null | undefined,
   runWorkspace: string | null | undefined,
@@ -38,7 +36,6 @@ export function isRuntimeV2GlobalChatTurn(
 ): boolean {
   return isRuntimeV2ChatIntent(intent) &&
     String(runWorkspace || "").trim().length === 0 &&
-    options?.webSearchEnabled !== true &&
     options?.hasAttachedFiles !== true;
 }
 
@@ -49,7 +46,6 @@ export function isRuntimeV2WorkspaceReadTurn(
 ): boolean {
   return isRuntimeV2ChatIntent(intent) && (
     String(runWorkspace || "").trim().length > 0 ||
-    options?.webSearchEnabled === true ||
     options?.hasAttachedFiles === true
   );
 }
@@ -77,7 +73,7 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   if (
     isRuntimeV2ChatIntent(input.runtimeIntent) &&
     String(input.runWorkspace || "").trim().length === 0 &&
-    (input.hasAttachedFiles === true || input.webSearchEnabled === true)
+    input.hasAttachedFiles === true
   ) {
     return "workspace_read";
   }

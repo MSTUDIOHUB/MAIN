@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -1980,6 +1981,23 @@ test.beforeEach(async ({ page }) => {
     return true;
   });
 
+  await page.exposeFunction("__MAIN_E2E_WEB_READ", async (cmd: string, args: unknown) => {
+    const binary = path.resolve("src-tauri/target/debug/examples/read_only_web_bridge");
+    return await new Promise((resolve, reject) => {
+      const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
+      let output = "";
+      let errors = "";
+      child.stdout.on("data", (chunk) => { output += chunk; });
+      child.stderr.on("data", (chunk) => { errors += chunk; });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code !== 0) return reject(new Error(`Web bridge exited ${code}: ${errors.slice(0, 300)}`));
+        try { const result = JSON.parse(output); if (result.ok) resolve(result.body); else reject(new Error(result.error)); } catch (error) { reject(error); }
+      });
+      child.stdin.end(JSON.stringify({ cmd, args }));
+    });
+  });
+
   await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ ??= {
@@ -2102,6 +2120,7 @@ test.beforeEach(async ({ page }) => {
       tail: ptyBuffer.slice(-8_000),
     });
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "web_search" || cmd === "web_fetch") return await (window as any).__MAIN_E2E_WEB_READ(cmd, args);
       if (cmd === "append_debug_log") {
         const raw = args || {};
         const message = String(raw.message || "");
@@ -4593,3 +4612,44 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   expect(snapshot.planArtifacts[0].content).toMatch(/(?:normalizeCsvOrder|归一化)[^\n]{0,180}creatorName|creatorName[^\n]{0,180}(?:normalizeCsvOrder|归一化)/i);
   expect(snapshot.planArtifacts[0].content).not.toMatch(/(?:移除|删除|去掉|remove|delete|drop)[^\n]{0,120}creatorName/i);
 });
+
+
+for (const model of models) {
+  test(`real OMLX Chat web and ordinary multi-turn replies reach idle with ${model}`, async ({ page }, testInfo) => {
+    page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) console.log(`[chat-test-navigation] ${frame.url()}`); });
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.prepareReadOnlyChat)).toBe(true);
+    const send = async (text: string) => {
+      const prior = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().turnCount);
+      await page.evaluate((text) => (window as any).__CODELY_E2E__.sendReadOnlyMessage(text), text);
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
+        return snapshot.turnCount > prior && !!snapshot.aggregate?.terminalOutcome && snapshot.agentStatus === "idle" && !snapshot.isGenerating;
+      }, { timeout: 900_000, intervals: [1000] }).toBe(true);
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
+      const artifact = testInfo.outputPath(`chat-${snapshot.aggregate.networkRead.enabled ? "web" : "offline"}-${snapshot.turnCount}.json`);
+      await fs.writeFile(artifact, JSON.stringify(snapshot, null, 2));
+      await testInfo.attach(path.basename(artifact), { path: artifact, contentType: "application/json" });
+      expect(snapshot.aggregate.strategy).toBe("chat");
+      expect(snapshot.aggregate.terminalOutcome.resultKind).toBe("success");
+      expect(snapshot.finals).toHaveLength(1);
+      expect(snapshot.finals[0].trim().length).toBeGreaterThan(0);
+      const terminalEvents = snapshot.aggregate.events.filter((event: any) => event.type === "run.completed" || event.type === "turn.completed" || (event.type === "projection.published" && event.projection.kind === "final"));
+      expect(terminalEvents.map((event: any) => event.type)).toEqual(["run.completed", "projection.published", "turn.completed"]);
+      return snapshot;
+    };
+    await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(true, "bing"));
+    const web = await send("请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。");
+    const searches = web.aggregate.events.filter((event: any) => event.type === "command.scheduled" && event.command.payload.toolName === "web_search");
+    expect(searches.length).toBeGreaterThan(0);
+    expect(searches.every((event: any) => event.command.payload.arguments.provider === "bing")).toBe(true);
+    expect(web.aggregate.events.some((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "web_fetch" && event.status === "succeeded")).toBe(true);
+    expect(web.finals[0]).toMatch(/developer\.mozilla\.org/);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    await send("本轮我们讨论一个虚构项目，代号是青岚 742。请记住这个代号并简短回复。无需联网。");
+    const ordinary = await send("刚才提到的虚构项目代号是什么？只回答代号。无需联网。");
+    expect(ordinary.finals[0]).toMatch(/青岚\s*742/);
+    expect(ordinary.aggregate.networkRead.enabled).toBe(false);
+    expect(ordinary.aggregate.events.some((event: any) => event.type === "command.scheduled" && ["web_search", "web_fetch"].includes(event.command.payload.toolName))).toBe(false);
+  });
+}

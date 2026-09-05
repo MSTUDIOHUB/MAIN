@@ -3927,6 +3927,122 @@ fn get_file_metadata(
     })
 }
 
+const PROJECT_INIT_TARGET_NAME: &str = "AGENTS.md";
+const PROJECT_INIT_MAX_CONTENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectInitTargetSnapshot {
+    canonical_workspace: String,
+    target_path: String,
+    exists: bool,
+    content: String,
+    content_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectInitCommitResult {
+    canonical_workspace: String,
+    target_path: String,
+    created: bool,
+    unchanged: bool,
+    content_version: String,
+}
+
+fn project_init_content_version(content: &str) -> String {
+    format!("sha256-{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn inspect_project_init_target_in_workspace(
+    workspace: &Path,
+) -> Result<ProjectInitTargetSnapshot, String> {
+    let raw_target = workspace.join(PROJECT_INIT_TARGET_NAME);
+    let metadata = match fs::symlink_metadata(&raw_target) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "PROJECT_INIT_TARGET_UNAVAILABLE: 无法访问 {}: {error}",
+                raw_target.display()
+            ));
+        }
+    };
+
+    if let Some(metadata) = metadata {
+        if metadata.file_type().is_symlink() {
+            return Err(
+                "PROJECT_INIT_TARGET_SYMLINK: AGENTS.md 是符号链接，已拒绝初始化".to_string(),
+            );
+        }
+        if !metadata.is_file() {
+            return Err("PROJECT_INIT_TARGET_INVALID: AGENTS.md 不是普通文件".to_string());
+        }
+        if metadata.len() as usize > PROJECT_INIT_MAX_CONTENT_BYTES {
+            return Err(format!(
+                "PROJECT_INIT_TARGET_TOO_LARGE: AGENTS.md 超过 {} bytes",
+                PROJECT_INIT_MAX_CONTENT_BYTES
+            ));
+        }
+        let real_target = resolve_existing_path(PROJECT_INIT_TARGET_NAME, workspace)?;
+        if real_target != raw_target {
+            return Err(
+                "PROJECT_INIT_TARGET_IDENTITY_CHANGED: AGENTS.md 的真实路径与预期不一致"
+                    .to_string(),
+            );
+        }
+        let bytes = fs::read(&real_target)
+            .map_err(|error| format!("PROJECT_INIT_TARGET_UNAVAILABLE: {error}"))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| "PROJECT_INIT_TARGET_NOT_UTF8: AGENTS.md 必须是 UTF-8 文本".to_string())?;
+        let content_version = Some(project_init_content_version(&content));
+        return Ok(ProjectInitTargetSnapshot {
+            canonical_workspace: workspace.to_string_lossy().to_string(),
+            target_path: real_target.to_string_lossy().to_string(),
+            exists: true,
+            content,
+            content_version,
+        });
+    }
+
+    let target = resolve_write_path(PROJECT_INIT_TARGET_NAME, workspace)?;
+    if target != raw_target {
+        return Err(
+            "PROJECT_INIT_TARGET_IDENTITY_CHANGED: AGENTS.md 的待写入路径与预期不一致".to_string(),
+        );
+    }
+    Ok(ProjectInitTargetSnapshot {
+        canonical_workspace: workspace.to_string_lossy().to_string(),
+        target_path: target.to_string_lossy().to_string(),
+        exists: false,
+        content: String::new(),
+        content_version: None,
+    })
+}
+
+fn resolve_active_project_init_workspace(
+    state: &WorkspaceState,
+    workspace: &str,
+) -> Result<PathBuf, String> {
+    let expected = canonicalize_workspace_dir(workspace.trim())?;
+    let active = state.get_root()?;
+    if active != expected {
+        return Err(
+            "PROJECT_INIT_WORKSPACE_STALE: 当前工作区已切换，请重新生成审阅内容".to_string(),
+        );
+    }
+    Ok(expected)
+}
+
+#[tauri::command]
+fn inspect_project_init_target(
+    state: State<WorkspaceState>,
+    workspace: String,
+) -> Result<ProjectInitTargetSnapshot, String> {
+    let workspace = resolve_active_project_init_workspace(&state, &workspace)?;
+    inspect_project_init_target_in_workspace(&workspace)
+}
+
 fn resolve_open_file_external_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
     let real_path = resolve_existing_path(path, workspace)?;
     if !real_path.is_file() {
@@ -4066,6 +4182,18 @@ fn write_file_atomic(
     if real_path.is_dir() {
         return Err("write_file_atomic 目标是目录，无法写入".to_string());
     }
+    write_file_atomic_resolved(real_path, content, &workspace, || Ok(()))
+}
+
+fn write_file_atomic_resolved<F>(
+    mut real_path: PathBuf,
+    content: String,
+    workspace: &Path,
+    before_swap: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let parent = real_path
         .parent()
         .ok_or_else(|| "无法解析目标父目录".to_string())?
@@ -4077,7 +4205,7 @@ fn write_file_atomic(
         .to_string();
     let temp_path = revalidate_write_path(
         &parent.join(format!(".{file_name}.{}.tmp", now_millis())),
-        &workspace,
+        workspace,
     )?;
     let mut temp_file = OpenOptions::new()
         .write(true)
@@ -4089,10 +4217,25 @@ fn write_file_atomic(
         let _ = fs::remove_file(&temp_path);
         return Err(format!("写入临时文件失败: {error}"));
     }
+    if let Err(error) = temp_file.sync_all() {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("同步临时文件失败: {error}"));
+    }
     drop(temp_file);
 
-    let temp_path = revalidate_existing_write_path(&temp_path, &workspace)?;
-    real_path = revalidate_write_path(&real_path, &workspace)?;
+    let temp_path = match revalidate_existing_write_path(&temp_path, workspace) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = before_swap() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    real_path = revalidate_write_path(&real_path, workspace)?;
 
     if let Err(rename_error) = fs::rename(&temp_path, &real_path) {
         if !real_path.exists() {
@@ -4102,25 +4245,25 @@ fn write_file_atomic(
 
         // Windows does not replace an existing destination with rename. Keep a
         // recoverable backup while swapping the new file into place.
-        real_path = revalidate_existing_write_path(&real_path, &workspace)?;
+        real_path = revalidate_existing_write_path(&real_path, workspace)?;
         let backup_path = revalidate_write_path(
             &parent.join(format!(".{file_name}.{}.bak", now_millis())),
-            &workspace,
+            workspace,
         )?;
         fs::rename(&real_path, &backup_path).map_err(|e| format!("创建原子写入备份失败: {e}"))?;
         let swap_result = (|| -> Result<(), String> {
-            let temp_path = revalidate_existing_write_path(&temp_path, &workspace)?;
-            real_path = revalidate_write_path(&real_path, &workspace)?;
+            let temp_path = revalidate_existing_write_path(&temp_path, workspace)?;
+            real_path = revalidate_write_path(&real_path, workspace)?;
             fs::rename(&temp_path, &real_path).map_err(|error| format!("替换目标文件失败: {error}"))
         })();
         if let Err(swap_error) = swap_result {
             let rollback_result = (|| -> Result<(), String> {
-                let backup_path = revalidate_existing_write_path(&backup_path, &workspace)?;
-                let target_path = revalidate_write_path(&real_path, &workspace)?;
+                let backup_path = revalidate_existing_write_path(&backup_path, workspace)?;
+                let target_path = revalidate_write_path(&real_path, workspace)?;
                 fs::rename(&backup_path, &target_path)
                     .map_err(|error| format!("恢复原文件失败: {error}"))
             })();
-            if let Ok(temp_path) = revalidate_existing_write_path(&temp_path, &workspace) {
+            if let Ok(temp_path) = revalidate_existing_write_path(&temp_path, workspace) {
                 let _ = fs::remove_file(temp_path);
             }
             return Err(match rollback_result {
@@ -4131,6 +4274,140 @@ fn write_file_atomic(
         let _ = fs::remove_file(backup_path);
     }
     Ok(())
+}
+
+fn create_file_atomic_resolved(
+    real_path: PathBuf,
+    content: String,
+    workspace: &Path,
+) -> Result<(), String> {
+    let parent = real_path
+        .parent()
+        .ok_or_else(|| "PROJECT_INIT_WRITE_FAILED: 无法解析目标父目录".to_string())?
+        .to_path_buf();
+    let file_name = real_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(PROJECT_INIT_TARGET_NAME);
+    let temp_path = revalidate_write_path(
+        &parent.join(format!(".{file_name}.{}.tmp", now_millis())),
+        workspace,
+    )?;
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| format!("PROJECT_INIT_WRITE_FAILED: {error}"))?;
+    if let Err(error) = temp_file.write_all(content.as_bytes()) {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("PROJECT_INIT_WRITE_FAILED: {error}"));
+    }
+    if let Err(error) = temp_file.sync_all() {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("PROJECT_INIT_WRITE_FAILED: {error}"));
+    }
+    drop(temp_file);
+
+    let publish_result = (|| -> Result<(), String> {
+        let temp_path = revalidate_existing_write_path(&temp_path, workspace)?;
+        let target_path = revalidate_write_path(&real_path, workspace)?;
+        fs::hard_link(&temp_path, &target_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "PROJECT_INIT_CONTENT_STALE: AGENTS.md 在审阅后已创建，请重新生成 diff".to_string()
+            } else {
+                format!("PROJECT_INIT_WRITE_FAILED: 无法原子发布 AGENTS.md: {error}")
+            }
+        })
+    })();
+    let _ = fs::remove_file(&temp_path);
+    publish_result
+}
+
+fn commit_project_init_in_workspace(
+    workspace: &Path,
+    expected_target_path: &str,
+    expected_base_version: Option<&str>,
+    content: String,
+) -> Result<ProjectInitCommitResult, String> {
+    if content.len() > PROJECT_INIT_MAX_CONTENT_BYTES {
+        return Err(format!(
+            "PROJECT_INIT_CONTENT_TOO_LARGE: 待写入内容超过 {} bytes",
+            PROJECT_INIT_MAX_CONTENT_BYTES
+        ));
+    }
+    let reviewed = inspect_project_init_target_in_workspace(workspace)?;
+    if reviewed.target_path != expected_target_path {
+        return Err("PROJECT_INIT_TARGET_STALE: AGENTS.md 路径在审阅后发生变化".to_string());
+    }
+    if reviewed.content_version.as_deref() != expected_base_version {
+        return Err(
+            "PROJECT_INIT_CONTENT_STALE: AGENTS.md 在审阅后已被修改，请重新生成 diff".to_string(),
+        );
+    }
+    let next_version = project_init_content_version(&content);
+    if reviewed.exists && reviewed.content == content {
+        return Ok(ProjectInitCommitResult {
+            canonical_workspace: reviewed.canonical_workspace,
+            target_path: reviewed.target_path,
+            created: false,
+            unchanged: true,
+            content_version: next_version,
+        });
+    }
+
+    let target_path = PathBuf::from(&reviewed.target_path);
+    if !reviewed.exists {
+        create_file_atomic_resolved(target_path, content, workspace)?;
+        return Ok(ProjectInitCommitResult {
+            canonical_workspace: reviewed.canonical_workspace,
+            target_path: reviewed.target_path,
+            created: true,
+            unchanged: false,
+            content_version: next_version,
+        });
+    }
+
+    let expected_path = reviewed.target_path.clone();
+    let expected_version = reviewed.content_version.clone();
+    write_file_atomic_resolved(target_path, content, workspace, || {
+        // Re-read at the final safe boundary, after the temporary file is
+        // complete but before replacing the reviewed target.
+        let latest = inspect_project_init_target_in_workspace(workspace)?;
+        if latest.target_path != expected_path || latest.content_version != expected_version {
+            return Err(
+                "PROJECT_INIT_CONTENT_STALE: AGENTS.md 在审阅后已被修改，请重新生成 diff"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    })?;
+    Ok(ProjectInitCommitResult {
+        canonical_workspace: reviewed.canonical_workspace,
+        target_path: reviewed.target_path,
+        created: false,
+        unchanged: false,
+        content_version: next_version,
+    })
+}
+
+#[tauri::command]
+fn commit_project_init(
+    state: State<WorkspaceState>,
+    workspace: String,
+    expected_target_path: String,
+    expected_base_version: Option<String>,
+    content: String,
+) -> Result<ProjectInitCommitResult, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_active_project_init_workspace(&state, &workspace)?;
+    commit_project_init_in_workspace(
+        &workspace,
+        &expected_target_path,
+        expected_base_version.as_deref(),
+        content,
+    )
 }
 
 #[tauri::command]
@@ -4935,6 +5212,7 @@ pub struct FileNode {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
 }
 
 const LIST_DIRECTORY_IGNORED_DIRS: &[&str] = &[
@@ -4984,14 +5262,17 @@ fn list_directory(
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let file_name = entry.file_name().to_string_lossy().to_string();
-        let meta = entry.metadata().map_err(|e| e.to_string())?;
-        if should_hide_list_directory_entry(&file_name, meta.is_dir()) {
+        let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        let is_symlink = meta.file_type().is_symlink();
+        let is_dir = !is_symlink && meta.is_dir();
+        if should_hide_list_directory_entry(&file_name, is_dir) {
             continue;
         }
         nodes.push(FileNode {
             name: file_name,
             path: entry.path().to_string_lossy().to_string(),
-            is_dir: meta.is_dir(),
+            is_dir,
+            is_symlink,
         });
     }
     nodes.sort_by(compare_file_nodes);
@@ -12805,6 +13086,8 @@ pub fn run() {
             read_file,
             read_file_window,
             get_file_metadata,
+            inspect_project_init_target,
+            commit_project_init,
             open_file_external,
             write_file,
             write_file_create_new,
@@ -12924,9 +13207,10 @@ mod tests {
     use super::{
         authorize_proxy_redirect_hop, await_proxy_abortable_phase,
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
-        compare_file_nodes, delete_path_within_workspace, delete_plan_files_in_dir,
-        delete_protocol_package_at, discover_agent_skills_in_root, find_entry_point,
-        get_proxy_request_registry, get_stream_registry, is_safe_cross_origin_proxy_header,
+        commit_project_init_in_workspace, compare_file_nodes, delete_path_within_workspace,
+        delete_plan_files_in_dir, delete_protocol_package_at, discover_agent_skills_in_root,
+        find_entry_point, get_proxy_request_registry, get_stream_registry,
+        inspect_project_init_target_in_workspace, is_safe_cross_origin_proxy_header,
         is_sensitive_cross_origin_header, is_supported_attachment_path, is_valid_git_branch_name,
         looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
         parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
@@ -14269,6 +14553,74 @@ mod tests {
     }
 
     #[test]
+    fn project_init_create_and_refresh_are_compare_and_swap_guarded() {
+        let workspace = make_temp_workspace("project-init-cas");
+        let initial = inspect_project_init_target_in_workspace(&workspace).unwrap();
+        assert!(!initial.exists);
+        assert!(initial.content_version.is_none());
+
+        let created = commit_project_init_in_workspace(
+            &workspace,
+            &initial.target_path,
+            None,
+            "# Project rules\n".to_string(),
+        )
+        .unwrap();
+        assert!(created.created);
+        assert!(!created.unchanged);
+
+        let reviewed = inspect_project_init_target_in_workspace(&workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "# Concurrent edit\n").unwrap();
+        let error = commit_project_init_in_workspace(
+            &workspace,
+            &reviewed.target_path,
+            reviewed.content_version.as_deref(),
+            "# Proposed refresh\n".to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("PROJECT_INIT_CONTENT_STALE"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+            "# Concurrent edit\n"
+        );
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn project_init_same_content_is_a_noop() {
+        let workspace = make_temp_workspace("project-init-noop");
+        fs::write(workspace.join("AGENTS.md"), "stable\n").unwrap();
+        let reviewed = inspect_project_init_target_in_workspace(&workspace).unwrap();
+        let result = commit_project_init_in_workspace(
+            &workspace,
+            &reviewed.target_path,
+            reviewed.content_version.as_deref(),
+            reviewed.content.clone(),
+        )
+        .unwrap();
+        assert!(result.unchanged);
+        assert!(!result.created);
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_init_rejects_agents_symlinks() {
+        let parent = make_temp_workspace("project-init-symlink");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let outside = parent.join("outside.md");
+        fs::write(&outside, "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("AGENTS.md")).unwrap();
+
+        let error = inspect_project_init_target_in_workspace(&workspace.canonicalize().unwrap())
+            .unwrap_err();
+        assert!(error.contains("PROJECT_INIT_TARGET_SYMLINK"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
     fn list_directory_hides_common_build_noise_but_keeps_project_metadata() {
         assert!(should_hide_list_directory_entry("target", true));
         assert!(should_hide_list_directory_entry("Library", true));
@@ -14296,21 +14648,25 @@ mod tests {
                 name: "Cargo.toml".to_string(),
                 path: "/tmp/Cargo.toml".to_string(),
                 is_dir: false,
+                is_symlink: false,
             },
             FileNode {
                 name: "Scripts".to_string(),
                 path: "/tmp/Scripts".to_string(),
                 is_dir: true,
+                is_symlink: false,
             },
             FileNode {
                 name: "README.md".to_string(),
                 path: "/tmp/README.md".to_string(),
                 is_dir: false,
+                is_symlink: false,
             },
             FileNode {
                 name: "capabilities".to_string(),
                 path: "/tmp/capabilities".to_string(),
                 is_dir: true,
+                is_symlink: false,
             },
         ];
 

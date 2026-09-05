@@ -4,6 +4,7 @@ import {
   type SubmitExistingTurnAdoptionDecision,
 } from "../lib/submit/turnSubmission";
 import type { TaskBlock } from "../lib/taskTypes";
+import { captureNetworkRead } from "../lib/networkRead";
 import type { UserChoiceResolutionIdentity } from "../lib/actionRequest";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "../lib/runIntent";
@@ -91,6 +92,7 @@ export function applySubmitVisibleTurn(
     : "计划已批准，执行已交接到新的回合。";
   const visibleTurnState = input.sessionGet();
   const visibleTurnPatch = buildSubmitVisibleTurnPatch({
+    networkRead: captureNetworkRead(visibleTurnState),
     taskFlow: visibleTurnState.taskFlow,
     conversationTurns: visibleTurnState.conversationTurns,
     text: input.text,

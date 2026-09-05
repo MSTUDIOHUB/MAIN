@@ -7,9 +7,11 @@
 > `src/store/runtimeV2/`。本文件描述 canonical Session/Turn/Run 与 UI 投影；
 > Runtime 内部循环的修改边界见 [最小运行内核与能力边界](RUNTIME_KERNEL_INVARIANTS.md)。
 
-## 一条提交就是一个 Turn
+## 一条模型提交就是一个 Turn
 
-在工作区会话中，用户每次提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
+在工作区会话中，每条进入模型执行管线的用户提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
+
+`/init` 是明确的本地工作区命令例外：Composer 在提交接纳前截获它，只打开 `AGENTS.md` diff 审阅；预览与取消不创建 user message、Turn 或 Run，也不调用 provider。用户确认后由固定目标的专用 CAS 写入边界完成修改。Plan、Analyze 等模型型 Slash shortcut 仍走普通 Turn。
 
 接纳同时创建用户块与非空回合标题；标题可以随后语义优化，但第一轮日志、侧栏和执行投影不能因为尚未取得模型标题而退化成无 Turn 的聊天消息。
 
@@ -176,6 +178,11 @@ provider 的下一动作目录有一个不改变授权的短暂收敛窗口。�
 provider 在 action window 请求未广告工具时，该调用不会作为一般 request failure 丢回循环。runtime 把它记成一个 `effect: none` 的标准 assistant/tool 拒绝对，明确列出本次真实工具目录，并通过 `repeated_action_rejected` 进入下一次 reasoning-off 动作解码；相同未广告调用只替换自己的拒绝对，不增长上下文。这样模型既看得到“该动作已经尝试但不会执行”，ledger 也能累计真实的无进展恢复次数。
 
 普通 Execute 没有从 Turn 接纳时刻开始计算的总耗时上限。持续流式输出、有效模型决策、工具动作、证据、修改或验证都允许任务继续，无论本地硬件使单步或整轮耗时多久。10 分钟只表示“连续没有形成可执行进展”的恢复停滞窗口；它不取消正在运行的慢请求，并会在下一条有效动作或证据处清零。模型流的无响应头、无首 chunk 或 chunk 间长期静默仍由单请求 watchdog 处理，该请求失败后回到共享恢复循环，不能直接把 Turn 判为超时。
+
+Chat 与工作区/附件只读 analyze 也没有默认整轮时限。Web 能力是 Turn 接纳快照，不是执行策略；排队和恢复不会读取新的 UI 开关。重复结果连续两批没有增加事实时进入无工具总结，完整模型回答才可成功。单请求失败可恢复，但总结失败、无回答的租约耗尽是 error；权限不足是 blocked，用户停止是 canceled。10 分钟是无进展恢复窗口，不是慢模型的生命周期。
+
+只读 checkpoint 的工具回执保留实际有界内容，恢复重建完整调用/结果对。终态提交保存待发布最终消息，允许在 run.completed 或 final projection 后崩溃时补完剩余步骤，维持 run.completed → 最终投影 → turn.completed 的唯一顺序。
+
 
 Root objective closure audit 只恢复可选的稳定工作区能力面（有界读／搜／编辑／有限命令），不重新开放长驻进程、PTY、浏览器或桌面能力。后四类能力必须由各自的结构化生命周期 checkpoint 重新开启，避免已经成功的有限验证在最终核对阶段漂移成无关的交互终端循环。
 

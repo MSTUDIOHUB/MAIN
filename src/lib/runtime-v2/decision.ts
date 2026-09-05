@@ -1,4 +1,7 @@
+import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
+export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
+import { deriveReadOnlyRecoveryWindow, readOnlyConclusionRequired } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
 import type {
   RuntimeV2Command,
@@ -234,22 +237,6 @@ function executeReadyForConclusion(state: TurnAggregateV1): boolean {
   return runtimeV2DirectExecuteReadyForConclusion(state);
 }
 
-export interface RuntimeV2ProviderRecoveryPressure {
-  readonly schemaVersion: "runtime-v2-provider-recovery.v1";
-  readonly reason:
-    | "repeated_action_rejected"
-    | "empty_response"
-    | "provider_request_failed";
-  readonly occurrence: number;
-  readonly stage: "reconsider" | "reframe" | "alternative";
-}
-
-export interface RuntimeV2ProviderRecoveryWindow {
-  readonly pressure: RuntimeV2ProviderRecoveryPressure;
-  /** Time of the first uninterrupted non-actionable provider decision. */
-  readonly startedAt: number;
-}
-
 function providerRequestCommandKeys(
   events: readonly RuntimeV2Event[],
 ): ReadonlySet<string> {
@@ -324,6 +311,7 @@ function providerToolCallProgress(
 export function deriveRuntimeV2ProviderRecoveryWindow(
   state: TurnAggregateV1,
 ): RuntimeV2ProviderRecoveryWindow | null {
+  if (state.strategy === "chat" || state.strategy === "analyze") return deriveReadOnlyRecoveryWindow(state);
   if (state.pendingToolCalls.length > 0) return null;
   const providerRequestKeys = providerRequestCommandKeys(state.events);
   const providerRequestModes = providerRequestModesByCommandKey(state.events);
@@ -671,20 +659,19 @@ export function decideNextCommands(
         acceptanceCriteria: state.objective.acceptanceCriteria,
       })];
     case "observing": {
-      if (state.strategy === "chat") {
+      if (state.strategy === "chat" || state.strategy === "analyze") {
+        const recovery = deriveReadOnlyRecoveryWindow(state);
+        const conclude = readOnlyConclusionRequired(state);
+        const active = currentRunSubagents(state).filter((job) => job.status === "queued" || job.status === "running");
+        if (conclude && active.length) return [boundedCommand(state, "join_subagents", { mode: "read_only", jobIds: active.map((job) => job.id), finalJoin: true })];
         return [boundedCommand(state, "request_model", {
-          mode: "chat",
-          toolExpectation: "optional",
-          objective: state.objective.text,
-        })];
-      }
-      if (state.strategy === "analyze") {
-        return [boundedCommand(state, "request_model", {
-          mode: "analyze",
+          mode: conclude ? "conclude" : state.strategy,
+          ...(conclude ? { conclusionKind: "read_only" } : {}),
           toolExpectation: "optional",
           objective: state.objective.text,
           evidenceIds: state.evidence.map((item) => item.id),
-          ...runtimeV2CollaborationPayload(state, input),
+          ...(recovery ? { recoveryPressure: recovery.pressure } : {}),
+          ...(state.strategy === "analyze" && !conclude ? runtimeV2CollaborationPayload(state, input) : {}),
         })];
       }
       return [executeModelRequest(state, input)];

@@ -60,6 +60,7 @@ export function latestRuntimeV2ProviderConclusionText(
 export function exhaustedRuntimeV2ResultKind(
   aggregate: TurnAggregateV1,
 ): Extract<RuntimeV2ResultKind, "partial" | "error"> {
+  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze") return "error";
   const mutationRequired = aggregate.strategy === "execute" ||
     (
       aggregate.strategy === "plan" &&

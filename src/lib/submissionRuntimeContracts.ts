@@ -1,6 +1,7 @@
 import type { AttachedFile } from "./attachments";
 import type { SkillCatalogSnapshot } from "./agentSkills";
 import type { PlanExecutionRunProvenance } from "./planExecutionProvenance";
+import type { ProjectBaselineContext } from "./projectBaseline";
 import type { FeishuRemoteContext } from "./remoteContextTypes";
 import type { CommandDirective, ResolvedRunIntent } from "./runIntent";
 import type { PlanApprovalHandoff, ProviderCompatibilityRuntimeLaneState } from "./sessionTypes";
@@ -74,9 +75,12 @@ export interface SubmissionRuntimeContext {
   /** Exact live workspace instructions captured before Run admission.
    * Conversation summaries and legacy session memory never populate it. */
   workspaceInstructionContext?: string;
+  /** Rebuildable workspace facts captured once for this Run. */
+  projectBaselineContext?: ProjectBaselineContext | null;
   /** Exact Skill catalog frozen at Turn admission. Full bodies remain outside
    * provider context until explicit activation or load_skill. */
   skillCatalog?: SkillCatalogSnapshot | null;
+  networkRead?: import("./networkRead").NetworkReadPolicy;
   abortCtrl: AbortController;
   timerInterval: any;
   sendStartedAt: number;
