@@ -8,10 +8,11 @@ import {
 } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
+import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import {
-  appendRuntimeV2ToolResultHistory,
-  upsertRuntimeV2ContextAnchor,
-} from "./executionProviderHistory";
+  assertRuntimeV2SubagentScheduleRunway,
+  closeCollaborationToolCall,
+} from "./executionSchedulerAdmission";
 import {
   runtimeV2ModelSelectedSubagentCandidate,
   runtimeV2SubagentCapacityFromCommand,
@@ -19,7 +20,7 @@ import {
 } from "./executionSubagentCandidate";
 import { startRuntimeV2Child } from "./executionSubagentRunner";
 import { commitCompletedRuntimeV2ChildTransaction } from "./executionSubagentJoin";
-import { runtimeV2ParentChildOverlapMs } from "./executionSubagentOverlap";
+import { runtimeV2ParentOverlapDiagnostics } from "./executionSubagentOverlap";
 import {
   parentHasImplementationSourceAuthority,
 } from "./executionSubagentAuthority";
@@ -36,26 +37,13 @@ function boundedArgument(value: unknown, max: number): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function closeCollaborationToolCall(
-  input: RuntimeV2ExecutionPortsInput,
-  command: Parameters<SchedulerPort["execute"]>[0]["command"],
-  content: string,
-): void {
-  appendRuntimeV2ToolResultHistory(
-    input.live,
-    boundedArgument(command.payload.toolCallId, 256),
-    content.trim().slice(0, 8_000),
-  );
-}
-
-
-
 export function createRuntimeV2SchedulerPort(
   input: RuntimeV2ExecutionPortsInput,
 ): SchedulerPort {
   return {
     async prepareSchedule({ command }) {
       if (command.kind !== "schedule_subagents") return null;
+      assertRuntimeV2SubagentScheduleRunway(input, command);
       const existingJobs =
         (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
           job.parentRunId === command.run.runId
@@ -84,6 +72,15 @@ export function createRuntimeV2SchedulerPort(
       try {
         const candidate = runtimeV2ModelSelectedSubagentCandidate(command);
         const aggregate = aggregateForCurrentTurn(input);
+        if (
+          (candidate.taskKind === "implement" ||
+            candidate.accessMode === "write") &&
+          aggregate?.strategy !== "execute"
+        ) {
+          throw new Error(
+            "Only an Execute Run may delegate an implement/write child; planning and analysis children are read-only.",
+          );
+        }
         if (
           candidate.taskKind === "implement" &&
           candidate.accessMode === "write" &&
@@ -134,7 +131,7 @@ export function createRuntimeV2SchedulerPort(
           command,
           `SUBAGENT_SCHEDULE_REJECTED: ${
             error instanceof Error ? error.message : String(error)
-          } Continue the parent task directly or submit a valid, genuinely independent scoped task.`,
+          } If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.`,
         );
         throw error;
       }
@@ -143,7 +140,7 @@ export function createRuntimeV2SchedulerPort(
           `The requested child duplicates an existing semantic task, exceeds ` +
           `the current provider-lane capacity, or violates the access/scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
-          }. Continue the parent task directly or delegate a genuinely different task.`;
+          }. If required collaboration is still pending, delegate a genuinely different task; otherwise continue the parent task.`;
         closeCollaborationToolCall(
           input,
           command,
@@ -188,7 +185,7 @@ export function createRuntimeV2SchedulerPort(
           closeCollaborationToolCall(
             input,
             command,
-            "SUBAGENT_SCHEDULE_REJECTED: no committed child matched this request. Continue the parent task directly.",
+            "SUBAGENT_SCHEDULE_REJECTED: no committed child matched this request. If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.",
           );
           throw new Error(
             "Runtime v2 scheduler could not resolve the child job committed for this spawn_subagent call.",
@@ -495,7 +492,7 @@ export function createRuntimeV2SchedulerPort(
         }
         const concurrency =
           deriveRuntimeV2SubagentConcurrency(allObservedJobs);
-        const parentChildOverlapMs = runtimeV2ParentChildOverlapMs({
+        const overlapDiagnostics = runtimeV2ParentOverlapDiagnostics({
           jobs: allObservedJobs,
           aggregate,
           measuredAt: input.now(),
@@ -506,8 +503,7 @@ export function createRuntimeV2SchedulerPort(
           jobCount: observedJobs.length,
           peakInFlight: concurrency.peakInFlight,
           hasRequestOverlap: concurrency.hasRequestOverlap,
-          parentChildOverlap: parentChildOverlapMs > 0,
-          parentChildOverlapMs,
+          ...overlapDiagnostics,
         });
         closeCollaborationToolCall(
           input,

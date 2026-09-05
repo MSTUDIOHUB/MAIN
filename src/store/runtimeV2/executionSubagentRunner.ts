@@ -1,10 +1,19 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import {
+  isSkillVisibleToModel,
+  renderExplicitSkillActivationContext,
+  renderSkillCatalogContext,
+  skillCatalogContextCharBudget,
+} from "../../lib/agentSkills";
+import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   advanceRuntimeV2ChildRecoveryStallLease,
+  compileRuntimeV2SubagentReport,
   compileRuntimeV2SubagentTextReport,
   runtimeV2ChildRecoveryStallExpired,
+  runtimeV2ChildEvidenceId,
   runtimeV2EvidenceVersion,
   runtimeV2SubagentFailureSummary,
   type RuntimeV2EvidenceReference,
@@ -57,6 +66,11 @@ import {
   VALIDATION_CHILD_TOOL_NAMES,
 } from "./executionSubagentPolicy";
 import { requestRuntimeV2ChildStep } from "./executionSubagentProvider";
+import {
+  runtimeV2ChildReportRejectedFeedback,
+  runtimeV2ChildReportTool,
+  SUBMIT_RUNTIME_V2_SUBAGENT_REPORT_TOOL_NAME,
+} from "./executionSubagentReportRecovery";
 
 export {
   boundRuntimeV2ChildToolCalls,
@@ -76,6 +90,12 @@ async function childToolAllowed(input: {
   readonly args: Record<string, unknown>;
 }): Promise<boolean> {
   if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
+    if (input.name === "load_skill") {
+      return isSkillVisibleToModel(
+        input.ports.context.skillCatalog,
+        String(input.args.skill_id || ""),
+      );
+    }
     return childScopeAllows(input.job, input.args);
   }
   if (MUTATION_CHILD_TOOL_NAMES.has(input.name)) {
@@ -157,7 +177,10 @@ async function runRuntimeV2Child(input: {
   readonly signal: AbortSignal;
 }): Promise<RuntimeV2ChildResult> {
   const telemetry = input.ports.live.childTelemetry.get(input.job.id);
-  const tools = runtimeV2ChildTools(input.job);
+  const tools = runtimeV2ChildTools(
+    input.job,
+    input.ports.context.skillCatalog,
+  );
   const aggregate = aggregateForCurrentTurn(input.ports);
   const context = buildRuntimeV2SubagentContextCapsule({
     aggregate,
@@ -215,13 +238,26 @@ async function runRuntimeV2Child(input: {
         : input.job.taskKind === "implement"
           ? "Use the provided read/search tools only for the assigned source, then stage one coherent mutation transaction. Final project validation remains the parent's responsibility."
           : "Use only the provided read/search tools.",
-      "When the bounded task is answered, return one concise final summary in ordinary text. Name every exact evidence id that supports the summary; uncited context cannot be adopted. There is no report tool.",
+      "When the bounded task is answered, return one concise final summary in ordinary text. Name every exact evidence id that supports the summary; uncited context cannot be adopted.",
+      "Do not invent a report tool during ordinary work. If Runtime rejects an uncited final, it may expose one effect-free structured report submission tool for the repair request.",
       input.ports.context.workspaceInstructionContext
         ? [
             "LIVE_WORKSPACE_INSTRUCTIONS:",
             input.ports.context.workspaceInstructionContext,
           ].join("\n")
         : "",
+      renderProjectBaselineContext(
+        input.ports.context.projectBaselineContext,
+      ),
+      renderSkillCatalogContext(
+        input.ports.context.skillCatalog,
+        skillCatalogContextCharBudget(
+          input.ports.context.runtimeContextBudget?.contextLimit,
+        ),
+      ),
+      renderExplicitSkillActivationContext(
+        input.ports.context.skillCatalog,
+      ),
       context ? `PARENT_CONTEXT_CAPSULE:\n${context}` : "",
     ].filter(Boolean).join("\n"),
   }, {
@@ -247,16 +283,28 @@ async function runRuntimeV2Child(input: {
   let ordinal = 0;
   let recoveryLease: RuntimeV2ChildRecoveryStallLease | null = null;
   let recoveryStalled = false;
+  let reportRepairPending = false;
   const rejectedClosedActionIdentities = new Set<string>();
   const rejectedClosedObservationFingerprints = new Set<string>();
   try {
     while (!input.signal.aborted && Date.now() < deadlineAt) {
       let result: RuntimeV2NormalizedProviderResult;
+      const reportTool = reportRepairPending
+        ? runtimeV2ChildReportTool({ evidence, inheritedEvidence })
+        : null;
+      const reportRepairRequired = reportTool !== null;
       try {
         result = await requestRuntimeV2ChildStep({
           ...input,
           messages,
-          tools: stagedMutations.length > 0 ? [] : tools,
+          tools: reportTool
+            ? [reportTool]
+            : stagedMutations.length > 0
+              ? []
+              : tools,
+          responseMode: reportRepairRequired
+            ? "report_required"
+            : "action_or_final",
           deadlineAt,
           recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
@@ -268,15 +316,102 @@ async function runRuntimeV2Child(input: {
         throw error;
       }
       const calls = result.toolCalls;
+      if (reportRepairRequired) {
+        const reportCall = calls.length === 1 &&
+            calls[0]?.name ===
+              SUBMIT_RUNTIME_V2_SUBAGENT_REPORT_TOOL_NAME
+          ? calls[0]
+          : null;
+        try {
+          if (!reportCall) {
+            throw new Error(
+              "RUNTIME_V2_SUBAGENT_REPORT_INVALID:submission_missing",
+            );
+          }
+          const report = compileRuntimeV2SubagentReport({
+            draft: reportCall.arguments,
+            evidence,
+            inheritedEvidence,
+          });
+          if (telemetry) telemetry.closedAt = input.ports.now();
+          return {
+            job: input.job,
+            status: "completed",
+            summary: report.summary,
+            report,
+            inheritedEvidence,
+            evidence,
+            stagedMutations,
+          };
+        } catch (error) {
+          recoveryStalled = true;
+          input.ports.logStoreEvent(
+            "runtime_v2_subagent_report_repair_exhausted",
+            {
+              turnId: input.job.run.turnId,
+              runId: input.job.run.runId,
+              jobId: input.job.id,
+              evidenceCount: evidence.length,
+              reason: error instanceof Error
+                ? error.message
+                : String(error),
+            },
+          );
+          break;
+        }
+      }
       if (calls.length === 0) {
-        if (telemetry) telemetry.closedAt = input.ports.now();
-        return completedChildResult({
-          job: input.job,
-          summary: result.visibleText || "",
-          inheritedEvidence,
-          evidence,
-          stagedMutations,
-        });
+        const summary = result.visibleText || "";
+        try {
+          const completed = completedChildResult({
+            job: input.job,
+            summary,
+            inheritedEvidence,
+            evidence,
+            stagedMutations,
+          });
+          if (telemetry) telemetry.closedAt = input.ports.now();
+          return completed;
+        } catch (error) {
+          if (reportRepairPending) {
+            recoveryStalled = true;
+            input.ports.logStoreEvent(
+              "runtime_v2_subagent_report_repair_exhausted",
+              {
+                turnId: input.job.run.turnId,
+                runId: input.job.run.runId,
+                jobId: input.job.id,
+                evidenceCount: evidence.length,
+              },
+            );
+            break;
+          }
+          reportRepairPending = true;
+          messages.push({ role: "assistant", content: summary });
+          messages.push({
+            role: "system",
+            content: runtimeV2ChildReportRejectedFeedback({
+              evidence,
+              inheritedEvidence,
+            }),
+          });
+          input.ports.logStoreEvent(
+            "runtime_v2_subagent_report_rejected",
+            {
+              turnId: input.job.run.turnId,
+              runId: input.job.run.runId,
+              jobId: input.job.id,
+              evidenceCount: evidence.length,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          );
+          recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
+            current: recoveryLease,
+            progressed: false,
+            now: input.ports.now(),
+          });
+          continue;
+        }
       }
       const acceptedCalls = boundRuntimeV2ChildToolCalls(
         calls,
@@ -344,7 +479,10 @@ async function runRuntimeV2Child(input: {
             });
             continue;
           }
-          const evidenceId = `child:${input.job.id}:E${++ordinal}`;
+          const evidenceId = runtimeV2ChildEvidenceId(
+            input.job,
+            ++ordinal,
+          );
           const stage = await stageRuntimeV2ChildMutation({
             ports: input.ports,
             job: input.job,
@@ -410,7 +548,10 @@ async function runRuntimeV2Child(input: {
             ),
             input.ports.context.runWorkspace || "",
             input.ports.context.runSessionKey,
-            { toolCatalog: authorizationFor(input.ports).toolCatalog },
+            {
+              toolCatalog: authorizationFor(input.ports).toolCatalog,
+              skillCatalog: input.ports.context.skillCatalog,
+            },
           );
           const output = runtimeV2ChildToolOutputContent(
             call.name,
@@ -445,7 +586,10 @@ async function runRuntimeV2Child(input: {
           const childEvidence: RuntimeV2EvidenceReference | null =
             isNewEvidence
               ? {
-                  id: `child:${input.job.id}:E${++ordinal}`,
+                  id: runtimeV2ChildEvidenceId(
+                    input.job,
+                    ++ordinal,
+                  ),
                   kind: "subagent",
                   target,
                   version,
@@ -518,6 +662,7 @@ async function runRuntimeV2Child(input: {
         );
         break;
       }
+      if (progressed) reportRepairPending = false;
       recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
         current: recoveryLease,
         progressed,

@@ -63,13 +63,13 @@ test("lane identity canonicalizes endpoint routing without retaining credentials
   assert.doesNotMatch(secretKey, /super-secret|also-secret|user/i);
 });
 
-test("serialized local lanes expose no fake parallel child capacity", () => {
+test("unknown local lanes expose one memory-guarded overlap probe", () => {
   lanes.resetModelLaneCoordinatorForTests();
   const unknown = lanes.getModelLaneCapacityObservation(localConfig());
   assert.equal(unknown.configured, false);
-  assert.equal(unknown.maxActiveRequests, 1);
-  assert.equal(unknown.maxActiveSubagents, 0);
-  assert.equal(unknown.requestMode, "serialized");
+  assert.equal(unknown.maxActiveRequests, 2);
+  assert.equal(unknown.maxActiveSubagents, 1);
+  assert.equal(unknown.requestMode, "parallel");
 
   const configuredSerial =
     lanes.getModelLaneCapacityObservation(localConfig(1));
@@ -93,15 +93,20 @@ test("serialized local lanes expose no fake parallel child capacity", () => {
   assert.equal(oversized.maxActiveSubagents, 3);
 });
 
-test("an unknown local child waits for the parent request and then runs on the serial lane", async () => {
+test("an unknown local lane proves overlap before growing 2 to 3 to 4", async () => {
   lanes.resetModelLaneCoordinatorForTests();
   const events = [];
+  lanes.setModelLaneMemoryReaderForTests(async () => ({
+    total_gb: 64,
+    available_gb: 24,
+    total_bytes: 64 * 1024 ** 3,
+    available_bytes: 24 * 1024 ** 3,
+  }));
   const parent = await lanes.acquireModelLane({
     config: localConfig(),
     requestTokenBudget: 10_000,
     agentKind: "parent",
   });
-  parent.markFirstToken();
   let admitted = false;
   const childPromise = lanes.acquireModelLane({
     config: localConfig(),
@@ -118,13 +123,38 @@ test("an unknown local child waits for the parent request and then runs on the s
   assert.ok(events.some((entry) =>
     entry.event === "model_lane_admission" &&
     entry.data.decision === "queued" &&
-    entry.data.queueReason === "lane_full" &&
-    entry.data.limit === 1
+    entry.data.queueReason === "cold_start_first_token" &&
+    entry.data.limit === 2
   ));
-  parent.release();
+  parent.markFirstToken();
   const child = await childPromise;
   assert.equal(admitted, true);
+  child.markFirstToken();
+  assert.equal(
+    lanes.getModelLaneCapacityObservation(localConfig()).maxActiveRequests,
+    3,
+  );
+  const secondChild = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-progressive-2",
+  });
+  secondChild.markFirstToken();
+  const expanded = lanes.getModelLaneCapacityObservation(localConfig());
+  assert.equal(expanded.maxConfirmedActiveRequests, 3);
+  assert.equal(expanded.maxActiveRequests, 4);
+  assert.equal(expanded.maxActiveSubagents, 3);
+  const thirdChild = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-progressive-3",
+  });
+  thirdChild.release();
+  secondChild.release();
   child.release();
+  parent.release();
 });
 
 test("explicit local capacity allows parent and two child model requests to overlap", async () => {

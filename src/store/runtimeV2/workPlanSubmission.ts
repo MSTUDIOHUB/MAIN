@@ -141,10 +141,68 @@ function stringList(value: unknown): string[] {
     : [];
 }
 
+function requiredIndexList(
+  record: unknown,
+  field: "dependsOn" | "stepIndexes",
+  path: string,
+): number[] {
+  if (
+    !record ||
+    typeof record !== "object" ||
+    Array.isArray(record) ||
+    !Object.prototype.hasOwnProperty.call(record, field)
+  ) {
+    throw new Error(`${path}.${field} is required.`);
+  }
+  const value = (record as Record<string, unknown>)[field];
+  if (!Array.isArray(value)) {
+    throw new Error(`${path}.${field} must be an array.`);
+  }
+  // Keep authored values intact. The canonical WorkPlan validator owns
+  // integer and zero-based range checks, so invalid edges remain visible as
+  // rejection feedback instead of being coerced, dropped, or guessed.
+  return [...value] as number[];
+}
+
+function admittedCriterionIds(
+  record: unknown,
+  path: string,
+  knownCriterionIds: ReadonlySet<string>,
+): string[] {
+  if (knownCriterionIds.size === 0) {
+    return record && typeof record === "object" && !Array.isArray(record)
+      ? stringList((record as Record<string, unknown>).criterionIds)
+      : [];
+  }
+  if (
+    !record ||
+    typeof record !== "object" ||
+    Array.isArray(record) ||
+    !Object.prototype.hasOwnProperty.call(record, "criterionIds")
+  ) {
+    throw new Error(`${path}.criterionIds is required.`);
+  }
+  const value = (record as Record<string, unknown>).criterionIds;
+  if (!Array.isArray(value)) {
+    throw new Error(`${path}.criterionIds must be an array.`);
+  }
+  const ids = value.map((entry) => String(entry || "").trim());
+  if (ids.length === 0 || ids.some((id) => !id)) {
+    throw new Error(`${path}.criterionIds must contain at least one ID.`);
+  }
+  const unknown = ids.filter((id) => !knownCriterionIds.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`${path}.criterionIds references unknown IDs: ${unknown.join(", ")}.`);
+  }
+  return [...new Set(ids)];
+}
+
 function compileSteps(input: {
   readonly rawSteps: readonly Record<string, any>[];
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
   readonly knownBasis: (value: unknown) => string[];
+  readonly autoBasisEvidenceIds: ReadonlySet<string>;
+  readonly knownCriterionIds: ReadonlySet<string>;
 }): WorkPlanDraftV1["steps"] {
   return input.rawSteps.map((step, index) => {
     const targets = stringList(
@@ -157,24 +215,24 @@ function compileSteps(input: {
             : [],
     );
     const targetEvidenceIds = input.evidence.filter((entry) =>
+      input.autoBasisEvidenceIds.has(entry.id) &&
       entry.version &&
       targets.some((target) =>
         workspacePathsReferToSameFile(entry.target, target)
       )
     ).map((entry) => entry.id);
+    if (!Object.prototype.hasOwnProperty.call(step, "operation")) {
+      throw new Error(`changes[${index}].operation is required.`);
+    }
     const requestedOperation = String(step?.operation || "").trim();
     const operation = (
       ["modify", "create", "delete", "preserve"] as const
-    ).find((candidate) => candidate === requestedOperation) || (
-      targets.length > 0 &&
-      targets.every((target) =>
-        input.evidence.some((entry) =>
-          !!entry.version && workspacePathsReferToSameFile(entry.target, target)
-        )
-      )
-        ? "modify"
-        : "create"
-    );
+    ).find((candidate) => candidate === requestedOperation);
+    if (!operation) {
+      throw new Error(
+        `changes[${index}].operation must be modify, create, delete, or preserve.`,
+      );
+    }
     const change = String(
       step?.change ||
       step?.approach ||
@@ -186,13 +244,11 @@ function compileSteps(input: {
       step?.outcome ||
       change,
     ).trim();
-    const dependsOn = (Array.isArray(step?.dependsOn) ? step.dependsOn : [])
-      .map((value: unknown) => Number(value))
-      .filter((value: number) => Number.isInteger(value))
-      .map((value: number) =>
-        value >= index && value > 0 && value - 1 < index ? value - 1 : value
-      )
-      .filter((value: number) => value >= 0 && value < index);
+    const dependsOn = requiredIndexList(
+      step,
+      "dependsOn",
+      `changes[${index}]`,
+    );
     return {
       title: String(step?.title || change || targets[0] || `Step ${index + 1}`),
       operation,
@@ -203,25 +259,22 @@ function compileSteps(input: {
       ])],
       change,
       expectedOutcome,
-      dependsOn: [...new Set(dependsOn)],
+      dependsOn,
+      criterionIds: admittedCriterionIds(
+        step,
+        `changes[${index}]`,
+        input.knownCriterionIds,
+      ),
     };
   }) as WorkPlanDraftV1["steps"];
 }
 
 function compileValidations(input: {
   readonly rawValidations: readonly Record<string, any>[];
-  readonly steps: WorkPlanDraftV1["steps"];
   readonly normalizationReasons: string[];
+  readonly knownCriterionIds: ReadonlySet<string>;
 }): WorkPlanDraftV1["validations"] {
-  const rawIndexes = input.rawValidations.flatMap((validation) =>
-    Array.isArray(validation?.stepIndexes)
-      ? validation.stepIndexes.map(Number).filter(Number.isInteger)
-      : []
-  );
-  const oneBasedIndexes = rawIndexes.length > 0 &&
-    !rawIndexes.includes(0) &&
-    rawIndexes.some((index) => index === input.steps.length);
-  const validations = input.rawValidations.map((validation) => {
+  return input.rawValidations.map((validation, index) => {
     const requestedCommand = typeof validation?.command === "string"
       ? validation.command.trim()
       : "";
@@ -232,20 +285,11 @@ function compileValidations(input: {
       requestedCommand ? "finite_command" : "assertion"
     );
     const command = kind === "finite_command" ? requestedCommand : "";
-    const suppliedIndexes = Array.isArray(validation?.stepIndexes)
-      ? validation.stepIndexes
-      : [];
-    const stepIndexes = suppliedIndexes.length > 0
-      ? [...new Set(
-          suppliedIndexes
-            .map((value: unknown) => Number(value))
-            .filter((index: number) => Number.isInteger(index))
-            .map((index: number) => oneBasedIndexes ? index - 1 : index)
-            .filter((index: number) => index >= 0 && index < input.steps.length),
-        )]
-      : input.steps.flatMap((step, index) =>
-          step.operation === "preserve" ? [] : [index]
-        );
+    const stepIndexes = requiredIndexList(
+      validation,
+      "stepIndexes",
+      `validations[${index}]`,
+    );
     return {
       stepIndexes,
       kind,
@@ -263,6 +307,11 @@ function compileValidations(input: {
         validation?.required !== false &&
         kind !== "assertion" &&
         kind !== "advisory",
+      criterionIds: admittedCriterionIds(
+        validation,
+        `validations[${index}]`,
+        input.knownCriterionIds,
+      ),
     };
   }).flatMap((validation, index) => {
     if (
@@ -278,30 +327,13 @@ function compileValidations(input: {
     }
     return [validation];
   }) as Array<WorkPlanDraftV1["validations"][number]>;
-  const executableStepIndexes = input.steps.flatMap((step, index) =>
-    step.operation === "preserve" ? [] : [index]
-  );
-  const firstRequired = validations.findIndex((validation) => validation.required);
-  if (firstRequired >= 0) {
-    const covered = new Set(validations.flatMap((validation) =>
-      validation.required ? validation.stepIndexes : []
-    ));
-    const uncovered = executableStepIndexes.filter((index) => !covered.has(index));
-    if (uncovered.length > 0) {
-      const validation = validations[firstRequired]!;
-      validations[firstRequired] = {
-        ...validation,
-        stepIndexes: [...new Set([...validation.stepIndexes, ...uncovered])],
-      };
-    }
-  }
-  return validations;
 }
 
 export function workPlanDraftFromSubmission(
   candidate: Record<string, unknown>,
   evidence: readonly WorkPlanRuntimeEvidence[],
   objective: string,
+  criterionIds: readonly string[] = [],
 ): {
   readonly draft: WorkPlanDraftV1;
   readonly normalized: boolean;
@@ -359,17 +391,27 @@ export function workPlanDraftFromSubmission(
     ) as WorkPlanDraftV1["blockingQuestions"],
   };
   const knownEvidenceIds = new Set(evidence.map((entry) => entry.id));
+  const knownCriterionIds = new Set(
+    criterionIds.map((id) => String(id || "").trim()).filter(Boolean),
+  );
+  const autoBasisEvidenceIds = new Set(
+    evidence
+      .filter((entry) => !entry.id.startsWith("child:"))
+      .map((entry) => entry.id),
+  );
   const knownBasis = (value: unknown): string[] =>
     stringList(value).filter((id) => knownEvidenceIds.has(id));
   const steps = compileSteps({
     rawSteps: raw.steps,
     evidence,
     knownBasis,
+    autoBasisEvidenceIds,
+    knownCriterionIds,
   });
   const validations = compileValidations({
     rawValidations: raw.validations,
-    steps,
     normalizationReasons,
+    knownCriterionIds,
   });
   const draft: WorkPlanDraftV1 = {
     schemaVersion: WORK_PLAN_V1_SCHEMA_VERSION,

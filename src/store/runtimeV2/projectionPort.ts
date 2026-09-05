@@ -140,7 +140,7 @@ function timelineTitle(
     if (command.kind === "schedule_subagents") return "Start scoped child collaboration";
     if (command.kind === "join_subagents") return "Join child evidence or staged mutations";
     if (command.kind === "finalize_turn") {
-      return strategy === "chat"
+      return strategy === "chat" || strategy === "analyze"
         ? "Finish the conversation reply"
         : "Prepare the verified result";
     }
@@ -161,7 +161,7 @@ function timelineTitle(
   if (command.kind === "schedule_subagents") return "启动范围明确的子智能体协作";
   if (command.kind === "join_subagents") return "汇合子智能体证据或暂存修改";
   if (command.kind === "finalize_turn") {
-    return strategy === "chat"
+    return strategy === "chat" || strategy === "analyze"
       ? "整理本轮对话的完整回复"
       : "整理已验证的执行结果";
   }
@@ -735,7 +735,7 @@ export function createRuntimeV2ProjectionPort(
             currentTurnExecutionConsent: { turnId: null, granted: false },
             activeActionRequest: null,
             pendingToolCall: null,
-            agentStatus: resultKind === "error" ? "error" : "idle",
+            agentStatus: resultKind === "error" && aggregate.strategy !== "chat" && aggregate.strategy !== "analyze" && !(aggregate.strategy === "plan" && !aggregate.sealedWorkPlan) ? "error" : "idle",
             isGenerating: false,
             abortController: null,
           };

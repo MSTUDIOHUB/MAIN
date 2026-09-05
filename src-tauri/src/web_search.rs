@@ -69,6 +69,7 @@ pub async fn web_search(
     query: String,
     provider: Option<String>,
     max_results: Option<usize>,
+    allow_fallback: Option<bool>,
 ) -> Result<WebSearchResponse, String> {
     let query = query.trim().to_string();
     if query.is_empty() {
@@ -82,7 +83,7 @@ pub async fn web_search(
     let mut fallback_provider = None;
     let mut fallback_reason = None;
 
-    if should_fallback_search(&attempt, &results) {
+    if allow_fallback != Some(false) && should_fallback_search(&attempt, &results) {
         let reason = build_search_fallback_reason(&attempt, &results);
         let mut last_reason = reason.clone();
         for fallback in fallback_providers(&provider) {

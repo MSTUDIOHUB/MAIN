@@ -192,7 +192,7 @@ test("the Image Studio shortcut is preserved as a typed intent instead of an unk
   assert.equal(hints.skipIntentResolution, true);
 });
 
-test("ordinary Studio input retains the exact workspace mode while waiting in FIFO", () => {
+test("ordinary Image Studio input retains its exact workspace mode while waiting in FIFO", () => {
   const image = build({
     text: "draw a runtime architecture diagram",
     snapshot: {
@@ -200,18 +200,8 @@ test("ordinary Studio input retains the exact workspace mode while waiting in FI
       lockedComposerIntent: null,
     },
   });
-  const game = build({
-    text: "inspect the active Unity scene",
-    snapshot: {
-      mainModeKey: "game_studio",
-      lockedComposerIntent: null,
-    },
-  });
-
   assert.equal(image.resolvedIntent, "image_studio");
   assert.equal(image.runtimeIntentOverride, "image_studio");
-  assert.equal(game.resolvedIntent, "studio_workflow");
-  assert.equal(game.runtimeIntentOverride, "studio_workflow");
 });
 
 test("MDEBUG is durably classified as Plan with its canonical metadata", () => {
@@ -229,19 +219,19 @@ test("MDEBUG is durably classified as Plan with its canonical metadata", () => {
   });
 });
 
-test("mode policy rejects an incompatible locked intent without phrase heuristics", () => {
+test("MAIN mode preserves a compatible locked output intent without phrase heuristics", () => {
   assert.equal(build({
     text: "Inspect the game runtime",
     snapshot: {
-      mainModeKey: "game_studio",
+      mainModeKey: "main_mode",
       lockedComposerIntent: "report",
     },
-  }).resolvedIntent, "studio_workflow");
+  }).resolvedIntent, "report");
 
   assert.equal(build({
     text: "/plan inspect the game runtime",
     snapshot: {
-      mainModeKey: "game_studio",
+      mainModeKey: "main_mode",
       lockedComposerIntent: null,
     },
   }).resolvedIntent, "plan");

@@ -94,6 +94,16 @@ test("finite command analysis proves every fail-fast shell segment", () => {
     "prelude",
     "validator",
   ]);
+
+  for (const pythonCompile of [
+    "python3 -m compileall -q .",
+    "python3 -m py_compile snake.py test_snake.py",
+  ]) {
+    const compileAnalysis = analyzeValidationCommand(pythonCompile);
+    assert.equal(compileAnalysis.rejectionReason, null, pythonCompile);
+    assert.equal(compileAnalysis.spec?.kind, "finite_command", pythonCompile);
+    assert.equal(compileAnalysis.spec?.capability, "check", pythonCompile);
+  }
 });
 
 test("inline commands require decidable failure semantics and reject resident runtimes", () => {

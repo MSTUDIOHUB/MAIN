@@ -13,7 +13,6 @@ export function selectRuntimeEngineVersionForNewTurn(
   return intent === "execute" ||
       intent === "plan" ||
       intent === "goal" ||
-      intent === "studio_workflow" ||
       isRuntimeV2ChatIntent(intent)
     ? "v2"
     : "legacy";
@@ -29,30 +28,32 @@ export function isRuntimeV2ChatIntent(
     intent === "report";
 }
 
-/** Chat owns only workspace-free Sessions. Workspace-bound read-only intents
- * use the separate `analyze` strategy and its finite read-only capability
- * surface. */
+/** Network is a capability of Chat; only admitted local sources select analyze. */
 export function isRuntimeV2GlobalChatTurn(
   intent: ResolvedRunIntent | null | undefined,
   runWorkspace: string | null | undefined,
+  options?: { webSearchEnabled?: boolean; hasAttachedFiles?: boolean },
 ): boolean {
   return isRuntimeV2ChatIntent(intent) &&
-    String(runWorkspace || "").trim().length === 0;
+    String(runWorkspace || "").trim().length === 0 &&
+    options?.hasAttachedFiles !== true;
 }
 
 export function isRuntimeV2WorkspaceReadTurn(
   intent: ResolvedRunIntent | null | undefined,
   runWorkspace: string | null | undefined,
+  options?: { webSearchEnabled?: boolean; hasAttachedFiles?: boolean },
 ): boolean {
-  return isRuntimeV2ChatIntent(intent) &&
-    String(runWorkspace || "").trim().length > 0;
+  return isRuntimeV2ChatIntent(intent) && (
+    String(runWorkspace || "").trim().length > 0 ||
+    options?.hasAttachedFiles === true
+  );
 }
 
 export type RuntimeV2VisibleRunnerKind =
   | "execute"
   | "plan"
   | "goal"
-  | "studio"
   | "chat"
   | "workspace_read";
 
@@ -61,12 +62,12 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   readonly runtimeIntent: ResolvedRunIntent | null | undefined;
   readonly runWorkspace: string | null | undefined;
   readonly hasAttachedFiles?: boolean;
+  readonly webSearchEnabled?: boolean;
 }): RuntimeV2VisibleRunnerKind | null {
   // runtimeIntent is the immutable admission authority. effectiveIntent is
   // retained only as diagnostic input; a later UI projection must never
   // redirect the admitted Turn or force it back to another executor.
   if (input.runtimeIntent === "execute") return "execute";
-  if (input.runtimeIntent === "studio_workflow") return "studio";
   if (input.runtimeIntent === "plan") return "plan";
   if (input.runtimeIntent === "goal") return "goal";
   if (
@@ -76,10 +77,16 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   ) {
     return "workspace_read";
   }
-  if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace)) {
+  if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace, {
+    webSearchEnabled: input.webSearchEnabled,
+    hasAttachedFiles: input.hasAttachedFiles,
+  })) {
     return "chat";
   }
-  if (isRuntimeV2WorkspaceReadTurn(input.runtimeIntent, input.runWorkspace)) {
+  if (isRuntimeV2WorkspaceReadTurn(input.runtimeIntent, input.runWorkspace, {
+    webSearchEnabled: input.webSearchEnabled,
+    hasAttachedFiles: input.hasAttachedFiles,
+  })) {
     return "workspace_read";
   }
   return null;

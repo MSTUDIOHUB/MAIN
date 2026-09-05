@@ -81,9 +81,12 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
     "executionAggregate.ts",
     "executionAuthorization.ts",
     "executionAuthorizationContext.ts",
+    "executionPlanAuthorization.ts",
     "executionEvidence.ts",
     "executionProviderContext.ts",
+    "executionProviderEmptySurface.ts",
     "executionProviderPort.ts",
+    "executionSchedulerAdmission.ts",
     "executionSchedulerPort.ts",
     "executionSubagentScopes.ts",
     "executionText.ts",
@@ -149,7 +152,7 @@ test("Runtime v2 store adapters do not import either legacy execution owner", ()
   }
 });
 
-test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free response as final provider text", () => {
+test("Runtime v2 Execute accepts terminal provider text only from conclude mode", () => {
   const coreSource = fs.readFileSync(
     path.join(process.cwd(), "src/lib/runtime-v2/completion.ts"),
     "utf8",
@@ -162,7 +165,8 @@ test("Runtime v2 Execute accepts only a durable diagnostic-free tool-free respon
     "utf8",
   )).join("\n");
   assert.match(coreSource, /latestRuntimeV2ProviderConclusionText/);
-  assert.match(coreSource, /\["execute", "validate", "conclude"\]/);
+  assert.match(coreSource, /mode !== "conclude"/);
+  assert.doesNotMatch(coreSource, /\["execute", "validate", "conclude"\]/);
   assert.match(coreSource, /event\.result\.toolCalls\.length > 0/);
   assert.match(coreSource, /event\.result\.diagnostics\.length > 0/);
   assert.match(adapterSource, /latestRuntimeV2ProviderConclusionText/);
@@ -190,6 +194,11 @@ test("ordinary Runtime v2 Execute has no whole-Turn wall-clock deadline", () => 
     "ordinary Execute must remain open while real work is still progressing",
   );
   assert.match(runnerSource, /runtimeV2ProviderRecoveryStallExpired/);
+  assert.doesNotMatch(
+    runnerSource,
+    /runtimeV2ProviderRecoveryOccurrenceLimitReached|provider_recovery_occurrence_limit_reached/,
+    "a soft no-action count must not conclude an otherwise achievable Execute Run",
+  );
   assert.match(providerSource, /return Number\.isFinite\(lifecycleDeadlineAt\)/);
   assert.doesNotMatch(providerSource, /PROVIDER_REQUEST_TIMEOUT_MS\s*=/);
 });
@@ -199,8 +208,12 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   const planFiles = [
     "planRunner.ts",
     "planBootstrap.ts",
+    "planCollaborationAcquisition.ts",
+    "planCompletion.ts",
     "planModelProtocol.ts",
+    "planProviderAdmission.ts",
     "planProviderPort.ts",
+    "planSubmissionRepair.ts",
     "planSettlement.ts",
     "workPlanSubmission.ts",
   ];
@@ -238,7 +251,8 @@ test("Runtime v2 Plan keeps one bounded discovery and synthesis path", () => {
   assert.doesNotMatch(
     source,
     /PLAN_DISCOVERY_ACTION_BUDGET|PLAN_DISCOVERY_DEADLINE_MS|action_budget|time_budget/,
-    "planning may compact softly but only its shared model-stage deadline may end discovery",
+    "planning must not infer a separate discovery or action-count deadline",
   );
-  assert.match(runner, /PLAN_MODEL_DEADLINE_MS/);
+  assert.doesNotMatch(source, /PLAN_MODEL_DEADLINE_MS|PLAN_MODEL_COMPACTION_INTERVAL/);
+  assert.match(runner, /runtimeV2ProviderRecoveryStallExpired/);
 });

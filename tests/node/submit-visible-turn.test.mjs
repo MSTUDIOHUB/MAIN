@@ -65,7 +65,6 @@ function createState(overrides = {}) {
     config: {
       workflowMode: "chat",
     },
-    pendingSlashCommand: { type: "workflow", slug: "help" },
     lockedComposerIntent: "plan",
     pendingRunDecision: { kind: "intent_confirmation" },
     isGenerating: false,
@@ -120,7 +119,6 @@ function baseInput(state, harness, overrides = {}) {
     initialTurnStatus: "executing",
     operationProposalChoiceAction: undefined,
     turnTitle: "Fix the bug",
-    parsedStudioCommand: null,
     preferredLanguage: "zh",
     preservePlanState: false,
     shouldGrantExecutionConsentForTurn: true,
@@ -145,7 +143,6 @@ test("submit visible turn appends a user turn and applies run state", () => {
   assert.equal(state.conversationTurns[0].mode, "edit");
   assert.equal(state.currentTurnId, "turn-1");
   assert.equal(state.input, "");
-  assert.equal(state.pendingSlashCommand, null);
   assert.equal(state.lockedComposerIntent, null);
   assert.equal(state.pendingRunDecision, null);
   assert.equal(state.isGenerating, true);

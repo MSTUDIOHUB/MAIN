@@ -147,8 +147,9 @@ function harness(providerResults, options = {}) {
       },
     },
     tool: {
-      async execute() {
+      async execute(input) {
         toolCalls += 1;
+        if (options.toolExecute) return options.toolExecute(input);
         throw new Error("tool port must be unreachable");
       },
     },
@@ -246,7 +247,63 @@ test("a hallucinated tool call concludes error without invoking the tool", async
   );
 });
 
-test("transient transport failures continue until the lifecycle deadline", async () => {
+test("Chat allows canonical load_skill context reads and still denies every external effect", async () => {
+  const testHarness = harness([
+    {
+      visibleText: "",
+      toolCalls: [{
+        id: "call-skill",
+        name: "load_skill",
+        arguments: { skill_id: "panel:review" },
+      }],
+      diagnostics: [],
+    },
+    {
+      visibleText: "已按 Skill 形成只读回答。",
+      toolCalls: [],
+      diagnostics: [],
+    },
+  ], {
+    toolExecute: async ({ command }) => ({
+      type: "tool.completed",
+      run: command.run,
+      idempotencyKey: command.idempotencyKey,
+      status: "succeeded",
+      evidence: [{
+        id: "skill:1",
+        kind: "tool",
+        target: "panel:review",
+        version: "cafe1234",
+      }],
+    }),
+  });
+  const result = await runRuntimeV2ChatLoop({
+    ports: testHarness.ports,
+    turn,
+    run,
+    objective: "按 review Skill 回答",
+    signal: testHarness.abort.signal,
+    now: testHarness.now,
+    deadlineMs: 1_000,
+    allowSkillLoad: true,
+  });
+
+  assert.equal(result.resultKind, "success");
+  assert.equal(testHarness.read().providerCalls, 2);
+  assert.equal(testHarness.read().toolCalls, 1);
+  assert.equal(testHarness.read().schedulerCalls, 0);
+  assert.deepEqual(
+    result.aggregate.events
+      .filter((event) =>
+        event.type === "command.scheduled" &&
+        event.command.kind === "execute_tool"
+      )
+      .map((event) => event.command.payload.toolName),
+    ["load_skill"],
+  );
+});
+
+test("transport failures conclude truthfully without publishing partial evidence", async () => {
   const testHarness = harness([
     ({ advance }) => {
       advance(400);
@@ -270,8 +327,8 @@ test("transient transport failures continue until the lifecycle deadline", async
     now: testHarness.now,
     deadlineMs: 1_000,
   });
-  assert.equal(result.resultKind, "partial");
-  assert.match(result.reason, /运行时限/);
+  assert.equal(result.resultKind, "error");
+  assert.match(result.reason, /运行时限|未产生完整/);
   assert.equal(testHarness.read().providerCalls, 3);
   assert.equal(
     result.aggregate.events.filter((event) => event.type === "run.paused").length,
@@ -298,8 +355,8 @@ test("deadline and cancellation are distinct canonical conclusions", async (t) =
       now: testHarness.now,
       deadlineMs: 1_000,
     });
-    assert.equal(result.resultKind, "partial");
-    assert.match(result.reason, /运行时限/);
+    assert.equal(result.resultKind, "error");
+    assert.match(result.reason, /运行时限|未产生完整/);
   });
 
   await t.test("canceled", async () => {
@@ -328,19 +385,14 @@ test("deadline and cancellation are distinct canonical conclusions", async (t) =
   });
 });
 
-test("Chat adapter has no legacy runtime import, tools, or prose lifecycle classifier", () => {
+test("Chat adapter has no legacy runtime, external tool executor, or prose lifecycle classifier", () => {
   const source = fs.readFileSync(
     path.join(workspaceRoot, "src/store/runtimeV2/chatRunner.ts"),
     "utf8",
   );
   assert.doesNotMatch(source, /orchestrator|workflowEngine|AgentOrchestrator|WorkflowContext/);
-  assert.doesNotMatch(source, /TOOL_DEFINITIONS|executeTool|createRuntimeV2ToolPort/);
-  assert.doesNotMatch(
-    source,
-    /visibleText\.(?:includes|match|search|startsWith)|RegExp\([^)]*visibleText/,
-  );
-  assert.match(source, /offeredToolCount:\s*0/);
-  assert.match(source, /toolChoice:\s*"none"/);
+  assert.doesNotMatch(source, /streamChatCompletion|CHAT_DEADLINE_MS|setTimeout/);
+  assert.match(source, /runSubmitRuntimeV2ReadOnly/);
   assert.match(source, /isRuntimeV2GlobalChatTurn/);
   assert.match(source, /RUNTIME_V2_CHAT_REJECTS_WORKSPACE_SESSION/);
 });

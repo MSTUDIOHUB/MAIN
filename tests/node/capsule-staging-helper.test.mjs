@@ -99,10 +99,10 @@ test("deriveDynamicFirstPersonText - Tool execution fallback (No intent/why)", (
   const turn = { id: "turn-1", status: "executing" };
 
   const resultZh = deriveDynamicFirstPersonText(turn, blocks, "running", "zh");
-  assert.equal(resultZh, "我正在运行 `npm test` 验证命令，确保修改后的代码能通过所有质量与测试标准...");
+  assert.equal(resultZh, "我正在运行 `npm test` 验证命令，确保符合预期与验证标准...");
 
   const resultEn = deriveDynamicFirstPersonText(turn, blocks, "running", "en");
-  assert.equal(resultEn, "I am running the verification command `npm test` to ensure all quality and test standards are met...");
+  assert.equal(resultEn, "I am running the verification command `npm test` to ensure all quality and validation standards are met...");
 });
 
 test("deriveDynamicFirstPersonText - Awaiting Plan Approval", () => {
@@ -110,10 +110,10 @@ test("deriveDynamicFirstPersonText - Awaiting Plan Approval", () => {
   const turn = { id: "turn-1", status: "awaiting_approval", title: "修复 CSV 字段映射" };
 
   const resultZh = deriveDynamicFirstPersonText(turn, blocks, "pending_review", "zh");
-  assert.equal(resultZh, "我已为您生成了关于【修复 CSV 字段映射】的完整修改计划，正在等待您的审批。批准后我将开始安全的自动代码修改流程...");
+  assert.equal(resultZh, "我已为您生成了关于【修复 CSV 字段映射】的完整实施计划，正在等待您的审批。批准后我将开始安全的执行流程...");
 
   const resultEn = deriveDynamicFirstPersonText(turn, blocks, "pending_review", "en");
-  assert.equal(resultEn, "I have generated the implementation plan for [修复 CSV 字段映射] and am awaiting your approval to safely proceed with the code changes...");
+  assert.equal(resultEn, "I have generated the implementation plan for [修复 CSV 字段映射] and am awaiting your approval to safely proceed with the execution...");
 });
 
 test("deriveDynamicFirstPersonText - Awaiting Input Options", () => {

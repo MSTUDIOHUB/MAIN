@@ -24,6 +24,11 @@ const PATH_ARGUMENT_NAMES = new Set([
   "path",
 ]);
 
+const PATH_LIST_ARGUMENT_NAMES = new Set([
+  "allowed_paths",
+  "required_paths",
+]);
+
 const SHELL_EXECUTION_TOOL_NAMES = new Set([
   "run_command",
   "execute_command",
@@ -57,6 +62,47 @@ function normalizePathValue(value: string, workspace?: string | null): string {
   }
   if (normalizedPath === normalizedWorkspace) return ".";
   return clean;
+}
+
+function relativizeWorkspacePrefixesInPathList(
+  value: string,
+  workspace?: string | null,
+): string {
+  const normalizedValue = value.replace(/\\/g, "/");
+  const normalizedWorkspace = String(workspace || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/g, "");
+  if (!normalizedWorkspace) return normalizedValue;
+  const escapedWorkspace = normalizedWorkspace.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  const workspaceEntry = new RegExp(
+    `(^|[,\\n]\\s*|["']\\s*)${escapedWorkspace}(?:(\\/)|(?=\\s*(?:$|[,\\n"'])))`,
+    "g",
+  );
+  return normalizedValue.replace(
+    workspaceEntry,
+    (_match, entryPrefix: string, trailingSlash: string | undefined) =>
+      `${entryPrefix}${trailingSlash ? "" : "."}`,
+  );
+}
+
+function normalizePathListValue(value: string, workspace?: string | null): string {
+  const seen = new Set<string>();
+  return relativizeWorkspacePrefixesInPathList(value, workspace)
+    .split(/[\n,]/)
+    .map((entry) =>
+      normalizePathValue(entry.trim().replace(/\\/g, "/"), workspace)
+        .replace(/^\.\//, "")
+        .replace(/\/+$/g, "")
+    )
+    .filter((entry) => {
+      if (!entry || seen.has(entry)) return false;
+      seen.add(entry);
+      return true;
+    })
+    .join(",");
 }
 
 function normalizeScalarArgument(key: string, value: unknown, workspace?: string | null): unknown {
@@ -170,7 +216,12 @@ export function normalizeToolCallForExecution(
 
   for (const [key, value] of Object.entries(executionArgs)) {
     if (value === undefined || value === null) continue;
-    normalized[key] = normalizeScalarArgument(key, value, workspace);
+    normalized[key] =
+      toolName === "spawn_subagent" &&
+        PATH_LIST_ARGUMENT_NAMES.has(key) &&
+        typeof value === "string"
+        ? normalizePathListValue(value, workspace)
+        : normalizeScalarArgument(key, value, workspace);
   }
 
   if (toolName === "read_file" && typeof normalized.max_lines === "string") {

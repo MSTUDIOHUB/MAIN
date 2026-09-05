@@ -1,6 +1,6 @@
+import { isChatContext, isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import {
   getLocalFileReadPathForToolCall,
-  getToolRiskLevelForCall,
   isLocalFileReadApproved,
   isPerCallOnlyToolRisk,
 } from "../../lib/toolCapabilities";
@@ -15,9 +15,6 @@ import {
 } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
-  deriveRuntimeV2PlanSourceFreshness,
-  resolveRuntimeV2PlanMutationScope,
-  resolveRuntimeV2PlanValidationScope,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
@@ -25,7 +22,6 @@ import {
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   aggregateForCurrentTurn,
-  approvedPlanForCurrentTurn,
 } from "./executionAggregate";
 import {
   validateRuntimeV2MutationLease,
@@ -45,7 +41,6 @@ import {
   deriveRuntimeV2ExecutionContract,
   runtimeV2ExecutionContractAllowsTargets,
   runtimeV2ExecutionContractMutationTargets,
-  runtimeV2ExecutionContractRequired,
   validateRuntimeV2ExecutionContractSubmission,
 } from "./executionContract";
 import {
@@ -56,8 +51,16 @@ import {
 } from "./executionValidationCorrection";
 import {
   authorizationFor,
+  isRuntimeV2EffectRisk,
+  isRuntimeV2ObservationRisk,
+  runtimeV2CatalogToolSource,
+  runtimeV2ToolRiskForCall,
   type RuntimeV2ToolAuthorizationResult,
 } from "./executionAuthorizationContext";
+import {
+  validateToolAgainstApprovedPlan,
+  type RuntimeV2PlanToolAuthorizationResult,
+} from "./executionPlanAuthorization";
 
 export {
   authorizationFor,
@@ -86,16 +89,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
-}): {
-  readonly allowed: boolean;
-  readonly reason: string | null;
-  readonly failureKind:
-    | "not_authorized"
-    | "protocol_invalid"
-    | "source_mismatch"
-    | null;
-  readonly reasonCode: string | null;
-} {
+}): RuntimeV2PlanToolAuthorizationResult {
   const aggregate = aggregateForCurrentTurn(input.ports);
   const durableChildWritePending = (aggregate?.subagents || []).some(
     (job) =>
@@ -109,6 +103,39 @@ export function validateToolAgainstPhaseAndPlan(input: {
   const validationCorrection = aggregate?.strategy === "execute"
     ? deriveRuntimeV2ValidationCorrectionWindow(aggregate)
     : null;
+  const authorization = authorizationFor(input.ports);
+  const catalogSource = runtimeV2CatalogToolSource(
+    authorization,
+    input.toolName,
+  );
+  const catalogRisk = runtimeV2ToolRiskForCall(
+    authorization,
+    input.toolName,
+    input.args,
+    {
+      workspace: input.ports.context.runWorkspace,
+      approvedLocalFileReadPaths:
+        input.ports.get()?.approvedLocalFileReadPaths,
+    },
+  );
+  if (
+    (aggregate?.strategy === "chat" || isChatContext(input.ports)) &&
+    (catalogSource !== "built_in" || !["load_skill", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
+  ) {
+    return { allowed: false, reason: "Chat 仅允许已接纳的 Skill 与网络读取。", failureKind: "not_authorized", reasonCode: "chat_read_only_authority" };
+  }
+  if (
+    input.command.kind === "execute_validation" &&
+    catalogSource !== "built_in"
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "当前验收窗口只接受 Runtime 拥有结构化判定契约的内置 validator；MCP transport success 不能作为验收结果。",
+      failureKind: "protocol_invalid",
+      reasonCode: "validation_tool_source_untrusted",
+    };
+  }
   if (
     input.toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
   ) {
@@ -204,7 +231,13 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (
     aggregate?.strategy === "analyze" &&
     (
-      !isRuntimeV2ReadOnlyToolName(input.toolName) ||
+      (
+        !isRuntimeV2ReadOnlyToolName(input.toolName) &&
+        !(
+          catalogSource === "mcp" &&
+          isRuntimeV2ObservationRisk(catalogRisk)
+        )
+      ) ||
       input.command.kind === "execute_validation"
     )
   ) {
@@ -213,6 +246,19 @@ export function validateToolAgainstPhaseAndPlan(input: {
       reason: "工作区只读任务没有修改或验证效果权限。",
       failureKind: "not_authorized",
       reasonCode: "workspace_read_only_authority",
+    };
+  }
+  if (
+    aggregate?.strategy === "plan" &&
+    catalogSource === "mcp" &&
+    isRuntimeV2EffectRisk(catalogRisk)
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "已批准 WorkPlan 只为精确工作区操作授予效果范围；当前 MCP 效果没有可验证的 Plan 目标契约。",
+      failureKind: "not_authorized",
+      reasonCode: "approved_plan_mcp_effect_scope_missing",
     };
   }
   if (
@@ -249,18 +295,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
     );
     if (aggregate?.strategy === "execute") {
       const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
-      if (
-        !executionContract &&
-        runtimeV2ExecutionContractRequired(aggregate)
-      ) {
-        return {
-          allowed: false,
-          reason:
-            "多个版本化源码责任方已经可见；必须先用 record_execution_contract 固化根因、精确修改范围和验收方法，再执行首次修改。",
-          failureKind: "protocol_invalid",
-          reasonCode: "execution_contract_required",
-        };
-      }
       if (
         executionContract &&
         !validationCorrection?.active &&
@@ -328,69 +362,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (aggregate?.strategy !== "plan") {
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }
-  const approved = approvedPlanForCurrentTurn(input.ports);
-  if (!approved) {
-    return {
-      allowed: false,
-      reason: "当前 Plan 的批准权威无效或已过期，运行时拒绝执行外部效果。",
-      failureKind: "not_authorized",
-      reasonCode: "approved_plan_authority_missing",
-    };
-  }
-  if (isWorkspaceMutationToolName(input.toolName)) {
-    const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
-    const mutationAlreadyCommitted = aggregate.evidence.some(
-      (evidence) => evidence.kind === "mutation",
-    );
-    if (!mutationAlreadyCommitted && freshness && !freshness.allFresh) {
-      const stale = [...freshness.staleTargets, ...freshness.unversionedTargets];
-      return stale.length > 0
-        ? {
-            allowed: false,
-            reason: `已批准 WorkPlan 的源版本已变化或缺少版本权威：${stale.join(", ")}`,
-            failureKind: "not_authorized",
-            reasonCode: "approved_plan_source_version_stale",
-          }
-        : {
-            allowed: false,
-            reason: `执行已批准 WorkPlan 前必须重新读取当前目标：${freshness.missingTargets.join(", ")}`,
-            failureKind: "protocol_invalid",
-            reasonCode: "approved_plan_source_refresh_required",
-          };
-    }
-    const scope = resolveRuntimeV2PlanMutationScope({
-      plan: approved.plan,
-      requestedTargets: resolveWorkspaceMutationTargets(
-        input.toolName,
-        input.args,
-        input.target,
-      ),
-    });
-    if (!scope.allowed) {
-      return {
-        allowed: false,
-        reason: `修改目标不在已批准 WorkPlan 范围内：${scope.unexpectedTargets.join(", ") || "未解析目标"}`,
-        failureKind: "not_authorized",
-        reasonCode: "approved_plan_mutation_scope",
-      };
-    }
-  }
-  if (input.command.kind === "execute_validation") {
-    const scope = resolveRuntimeV2PlanValidationScope({
-      plan: approved.plan,
-      toolName: input.toolName,
-      args: input.args,
-    });
-    if (!scope.allowed) {
-      return {
-        allowed: false,
-        reason: "该验证调用与已批准 WorkPlan 中的命令或验证类型不一致。",
-        failureKind: "not_authorized",
-        reasonCode: "approved_plan_validation_scope",
-      };
-    }
-  }
-  return { allowed: true, reason: null, failureKind: null, reasonCode: null };
+  return validateToolAgainstApprovedPlan({ ...input, aggregate });
 }
 
 export async function authorizeToolForCurrentTurn(
@@ -403,7 +375,10 @@ export async function authorizeToolForCurrentTurn(
   const catalogResolution = authorization.toolCatalog.lookup(name);
   if (
     catalogResolution.status !== "resolved" ||
-    catalogResolution.entry.source !== "built_in"
+    (
+      catalogResolution.entry.source !== "built_in" &&
+      catalogResolution.entry.source !== "mcp"
+    )
   ) {
     return {
       allowed: false,
@@ -411,8 +386,9 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
+  const exposedName = catalogResolution.entry.exposedName;
   const localFileReadPath = getLocalFileReadPathForToolCall(
-    name,
+    exposedName,
     args,
     input.context.runWorkspace,
   );
@@ -422,17 +398,18 @@ export async function authorizeToolForCurrentTurn(
   // for the approved target.
   const risk = localFileReadPath
     ? "local_file_read"
-    : getToolRiskLevelForCall(
-        name,
+    : runtimeV2ToolRiskForCall(
+        authorization,
+        exposedName,
         args,
-        authorization.capabilityRegistry,
         {
           workspace: input.context.runWorkspace,
           approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
         },
       );
-  const capability = authorization.capabilityRegistry.tools[name];
+  const capability = authorization.capabilityRegistry.tools[exposedName];
   if (
+    !risk ||
     !capability?.enabled ||
     authorization.policy.disabledRiskLevels.includes(risk)
   ) {
@@ -446,8 +423,9 @@ export async function authorizeToolForCurrentTurn(
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "external_read") {
-    const networkTool = name === "web_search" || name === "web_fetch";
-    return networkTool && state.webSearchEnabled !== true
+    const networkTool = catalogResolution.entry.source === "built_in" &&
+      (exposedName === "web_search" || exposedName === "web_fetch");
+    return networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)
       ? {
           allowed: false,
           reason: "当前会话未启用网络访问。",
@@ -485,7 +463,7 @@ export async function authorizeToolForCurrentTurn(
   }
   if (risk === "shell") {
     const shell = await resolveShellAutoApproval({
-      toolName: name,
+      toolName: exposedName,
       args,
       workspace: input.context.runWorkspace || "",
       preflight: shellPermissionPreflight,

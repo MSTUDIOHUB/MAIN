@@ -63,12 +63,15 @@ function parsedToolCallArguments(value: unknown): Record<string, unknown> {
 
 function committedMutationTargets(
   toolCallId: string,
+  toolName: string,
   effects?: RuntimeV2ProviderEffectFacts,
 ): readonly string[] | null {
   // Transcript-only callers predate the durable effect projection and retain
   // their historical all-target interpretation. Production always supplies
   // the projection; an absent entry there cannot manufacture a mutation.
-  if (effects === undefined) return ["*"];
+  if (effects === undefined) {
+    return isWorkspaceMutationToolName(toolName) ? ["*"] : null;
+  }
   return effects.committedMutationTargetsByToolCallId.get(toolCallId) ||
     null;
 }
@@ -106,9 +109,11 @@ export function completedRuntimeV2ProviderToolCallIdentities(
     ) {
       continue;
     }
-    const mutationTargets = isWorkspaceMutationToolName(call.name)
-      ? committedMutationTargets(message.tool_call_id, effects)
-      : null;
+    const mutationTargets = committedMutationTargets(
+      message.tool_call_id,
+      call.name,
+      effects,
+    );
     if (mutationTargets) {
       identities.clear();
     }
@@ -190,9 +195,11 @@ export function runtimeV2ProviderReadIsFullyCovered(
     ) {
       continue;
     }
-    const mutationTargets = isWorkspaceMutationToolName(call.name)
-      ? committedMutationTargets(message.tool_call_id, effects)
-      : null;
+    const mutationTargets = committedMutationTargets(
+      message.tool_call_id,
+      call.name,
+      effects,
+    );
     if (mutationTargets) {
       coverage.clear();
       continue;
@@ -286,9 +293,11 @@ export function runtimeV2ProviderCoveredSourceReplayIsClosed(
     ) {
       continue;
     }
-    const mutationTargets = isWorkspaceMutationToolName(call.name)
-      ? committedMutationTargets(message.tool_call_id, effects)
-      : null;
+    const mutationTargets = committedMutationTargets(
+      message.tool_call_id,
+      call.name,
+      effects,
+    );
     if (mutationTargets) {
       currentVersion = "";
       replayedVersion = "";
@@ -396,9 +405,11 @@ export function runtimeV2ProviderCoveredReadReceipt(
     ) {
       continue;
     }
-    const mutationTargets = isWorkspaceMutationToolName(call.name)
-      ? committedMutationTargets(message.tool_call_id, effects)
-      : null;
+    const mutationTargets = committedMutationTargets(
+      message.tool_call_id,
+      call.name,
+      effects,
+    );
     if (mutationTargets) {
       receipts.length = 0;
       continue;
@@ -456,9 +467,11 @@ export function runtimeV2ProviderExactReadReceipt(
     ) {
       continue;
     }
-    const mutationTargets = isWorkspaceMutationToolName(call.name)
-      ? committedMutationTargets(message.tool_call_id, effects)
-      : null;
+    const mutationTargets = committedMutationTargets(
+      message.tool_call_id,
+      call.name,
+      effects,
+    );
     if (mutationTargets) {
       receipt = null;
       continue;

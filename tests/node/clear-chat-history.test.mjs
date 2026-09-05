@@ -946,9 +946,6 @@ function startDeferredRealBootstrap(controller, input) {
     runSessionId: input.sessionId,
     runScopeKey: input.workspace,
     currentMainModeKey: "main_mode",
-    parsedSetupEngineCommand: null,
-    parsedStudioCommand: null,
-    cachedWorkspaceTreeForGameDetection: "",
     preferredLanguage: "zh",
     effectiveRunIntent: "execute",
     runtimeRunIntent: "execute",
@@ -995,9 +992,6 @@ function startDeferredRealBootstrap(controller, input) {
     readFile: async () => "",
     readDocument: async () => ({ content: "" }),
     analyzeTabularDocument: async () => ({ content: "" }),
-    runtimeService: {},
-    logWarning: () => {},
-    invalidateWorkspaceTreeCache: () => {},
     createAbortController: () => {
       input.capabilityStarts.abortController += 1;
       return new AbortController();
@@ -1036,13 +1030,6 @@ function startDeferredRealBootstrap(controller, input) {
         failedAttachmentCount: 0,
       }),
       buildPromptContext: ({ userContent }) => ({ userContent }),
-      runGameStudioPreparation: async ({ userContent }) => ({
-        ok: true,
-        userContent,
-        activeStudioAgentKey: "studio_auto",
-        gameStudioInitialized: false,
-        gameStudioConfigForTurn: null,
-      }),
       createRuntimeContext: (context) => context,
       startStreamingUi: () => {},
       runRuntime: async () => {
@@ -1274,7 +1261,6 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
   useAppStore.setState((state) => ({
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     config: {
       ...state.config,
       local: { ...state.config.local, model: "" },
@@ -1418,7 +1404,7 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   assert.equal(replayedState.taskFlow.filter((block) => block.type === "user").length, 2);
   assert.equal(replayedState.abortController, null);
   assert.equal(replayedState.harnessRunMarker, null);
-  assert.equal(workspaceTreeInvocations, 2);
+  assert.equal(workspaceTreeInvocations, 1);
 
   useAppStore.setState({
     sendMessage: realSendMessage,
@@ -1441,7 +1427,6 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
   useAppStore.setState((state) => ({
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     config: {
       ...state.config,
       local: { ...state.config.local, model: "" },
@@ -1525,13 +1510,9 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     JSON.stringify(admissionResults[0].result),
   );
   await withTimeout(workspaceTreeStarted.promise, "failed clear replay workspace tree");
-  // The first call is the synchronous cache warm-up. The workflow's own
-  // bootstrap read advances on a later microtask, so under a busy full-suite
-  // runner observing only the first call races the behavior asserted below.
-  await waitFor(
-    () => workspaceTreeInvocations >= 2,
-    "failed clear replay workflow workspace tree",
-  );
+  // The fresh replay reuses the current in-flight workspace-tree request;
+  // strict FIFO admission must not duplicate the same workspace read.
+  assert.equal(workspaceTreeInvocations, 1);
   assert.equal(replayCalls.length, 1);
   assert.equal(replayCalls[0][0], latestText);
   assert.equal(replayCalls[0][2].submissionOriginSessionKey, oldSessionKey);
@@ -1561,7 +1542,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     replayedState.conversationTurns.find((turn) => turn.id !== oldTurnId).userPrompt,
     /清理失败后作为全新回合重放/,
   );
-  assert.equal(workspaceTreeInvocations, 2);
+  assert.equal(workspaceTreeInvocations, 1);
 
   useAppStore.setState({
     sendMessage: realSendMessage,
@@ -1586,7 +1567,6 @@ test("failed clear preserves exact Goal continuation authority for fresh Turn ad
   seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
   useAppStore.setState((state) => ({
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     config: {
       ...state.config,
       local: { ...state.config.local, model: "" },
@@ -2998,7 +2978,6 @@ test("settings reset revokes active and cached runtimes before clearing transien
     "pendingReviewResolve: null",
     "activeActionRequest: null",
     "pendingToolCall: null",
-    "pendingSlashCommand: null",
     "harnessRunMarker: null",
     'agentStatus: "idle"',
     "isGenerating: false",
@@ -3058,11 +3037,6 @@ test("real settings reset settles every live in-memory capability before state d
       target: "npm test",
     },
     pendingToolCall: { name: "run_command", arguments: { command: "npm test" } },
-    pendingSlashCommand: {
-      command: "/test",
-      raw: "/test",
-      source: "composer",
-    },
   });
   const beforeReset = useAppStore.getState();
   assert.deepEqual(
@@ -3090,7 +3064,6 @@ test("real settings reset settles every live in-memory capability before state d
   assert.equal(state.pendingReviewResolve, null);
   assert.equal(state.activeActionRequest, null);
   assert.equal(state.pendingToolCall, null);
-  assert.equal(state.pendingSlashCommand, null);
   assert.equal(state.harnessRunMarker, null);
   assert.equal(state.agentStatus, "idle");
   assert.equal(state.isGenerating, false);

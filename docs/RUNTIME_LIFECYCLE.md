@@ -7,9 +7,11 @@
 > `src/store/runtimeV2/`。本文件描述 canonical Session/Turn/Run 与 UI 投影；
 > Runtime 内部循环的修改边界见 [最小运行内核与能力边界](RUNTIME_KERNEL_INVARIANTS.md)。
 
-## 一条提交就是一个 Turn
+## 一条模型提交就是一个 Turn
 
-在工作区会话中，用户每次提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
+在工作区会话中，每条进入模型执行管线的用户提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
+
+`/init` 是明确的本地工作区命令例外：Composer 在提交接纳前截获它，只打开 `AGENTS.md` diff 审阅；预览与取消不创建 user message、Turn 或 Run，也不调用 provider。用户确认后由固定目标的专用 CAS 写入边界完成修改。Plan、Analyze 等模型型 Slash shortcut 仍走普通 Turn。
 
 接纳同时创建用户块与非空回合标题；标题可以随后语义优化，但第一轮日志、侧栏和执行投影不能因为尚未取得模型标题而退化成无 Turn 的聊天消息。
 
@@ -113,6 +115,12 @@ Plan Run 保留原始 objective，先用只读工具形成带版本的
 同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
 WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
+Plan authoring 没有默认总时限，也不会将父线程年龄换算成 child 剩余预算。模型流和正在执行的工具可以跨越十分钟；只有调用方明确提供的 `lifecycleDeadlineAt` 才写入 `run.started` 并成为父子共享硬边界，拒绝或恢复都不得延长它。旧 checkpoint 没有该字段时按无默认硬限恢复。
+
+无进展窗口复用只读证据比较，从 canonical provider/tool 回执推导：新版本、同版本新增源码覆盖或新交付的 child 证据清零；重复读取、回放、空响应、提交校验失败和传输失败不能续期。十分钟连续无进展只在请求之间检查，先接收有效提交和新证据，再判断是否耗尽；尚有活跃 child 时先 join，不能因父线程年龄取消它。编译失败仍进入 submit-only 纠错，恢复输出可以缩小并关闭 reasoning，但普通错误次数不直接生成终态。
+
+Plan discovery 与 synthesis 共用完整的 assistant/tool transcript，只在真实上下文压力下压缩完整工具组，并保护目标、末尾指令和最新回执。冷恢复从 ledger 重建实际工具内容，不重新收集概览或伪造缺失的历史正文。未产生 sealed WorkPlan 的停滞、显式预算耗尽及不可恢复传输失败均为 error，权限或必需协作条件不足为 blocked，用户停止为 canceled；已有工具证据不能证明 partial 计划交付。
+
 Plan 的 canonical 顺序为：
 
 ```text
@@ -127,6 +135,11 @@ turn.admitted(strategy=plan)
     planReviewStatus = pending
     pause = approval / subject=plan
 ```
+
+child finding 的显式采用发生在 seal 之后：只有 sealed draft 的 exact basis 能产生
+`subagent.handoff_applied(source=work_plan)`。被拒、malformed 或长度截断的 provider
+结果不能靠正文中的 evidence ID 制造 adoption；如果 seal 已持久化而 receipt 尚未
+写入，reviewing 冷恢复按同一 seal event 幂等补齐。
 
 此时唯一合法 UI 兼容投影是：
 
@@ -164,6 +177,11 @@ provider 在 action window 请求未广告工具时，该调用不会作为一�
 
 普通 Execute 没有从 Turn 接纳时刻开始计算的总耗时上限。持续流式输出、有效模型决策、工具动作、证据、修改或验证都允许任务继续，无论本地硬件使单步或整轮耗时多久。10 分钟只表示“连续没有形成可执行进展”的恢复停滞窗口；它不取消正在运行的慢请求，并会在下一条有效动作或证据处清零。模型流的无响应头、无首 chunk 或 chunk 间长期静默仍由单请求 watchdog 处理，该请求失败后回到共享恢复循环，不能直接把 Turn 判为超时。
 
+Chat 与工作区/附件只读 analyze 也没有默认整轮时限。Web 能力是 Turn 接纳快照，不是执行策略；排队和恢复不会读取新的 UI 开关。重复结果连续两批没有增加事实时进入无工具总结，完整模型回答才可成功。单请求失败可恢复，但总结失败、无回答的租约耗尽是 error；权限不足是 blocked，用户停止是 canceled。10 分钟是无进展恢复窗口，不是慢模型的生命周期。
+
+只读 checkpoint 的工具回执保留实际有界内容，恢复重建完整调用/结果对。终态提交保存待发布最终消息，允许在 run.completed 或 final projection 后崩溃时补完剩余步骤，维持 run.completed → 最终投影 → turn.completed 的唯一顺序。
+
+
 Root objective closure audit 只恢复可选的稳定工作区能力面（有界读／搜／编辑／有限命令），不重新开放长驻进程、PTY、浏览器或桌面能力。后四类能力必须由各自的结构化生命周期 checkpoint 重新开启，避免已经成功的有限验证在最终核对阶段漂移成无关的交互终端循环。
 
 ## Evidence ledger、typed validation 与完成门
@@ -187,13 +205,19 @@ typed validation primitive 的完成语义如下：
 
 ## 子智能体协作状态
 
-用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。该指导不制造强制阶段；真正的创建仍只在父 Run 活动、本轮尚有派生预算、provider lane 为父线程之外保留了真实请求容量且工具实际可见时发生。模型可在普通读取、修改或验证阶段按工作量自行决定是否启动，也可以不启动并直接完成；协作不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
+用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。用户明确选择“偏好协作”后，只要当前目标包含至少两个可独立、边界明确且能与主体重叠的工作包，并且 provider lane 仍有 child 容量、工具实际可见，执行提示就应优先在容量内派生有用的 child，同时要求父线程继续推进不依赖 child 的工作；普通“允许协作”仍由模型按收益判断。该偏好不制造强制阶段，可在读取、修改或验证任一阶段使用；简单或线性任务直接执行，协作也不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
 
 `explore`、`review`、`validate` 保持只读，适合并行调查、独立评审和有限验证。`implement/write` 只在父线程已经通过版本化源码形成证据化方案后可用：调用必须指定 create/modify/delete、具体 `implementation_plan`、成功标准和每个精确文件目标；不能只授权目录再让 child 自行选择写入文件。多个实现 child 的写入范围必须互不重叠；modify/delete 的每个目标还必须在创建请求中拥有当前版本源码权威。实现 child 可以读取自己的范围并形成一个修改事务，但事务先保存在进程内，不立即改变共享工作区。父线程继续处理不依赖子结果的工作，只在结果成为依赖或最终收口时 join。
 
 join 是提交边界：runtime 再检查 child 所有权、父 WorkPlan scope、源版本、工具权限、单次破坏性审批和源码语法预检，然后顺序提交事务并产生普通 mutation evidence。任一版本漂移、越权、审批拒绝或预检失败都会丢弃该事务，不留下部分共享写入。child 持有写范围期间，父线程和其他 child 对重叠路径的修改会被拒绝；最终 validation 也必须等所有实现事务完成或丢弃后再运行，防止验证旧工作区。恢复 action window 仍不把协作当作逃生分支，父线程必须先完成当前闭合动作。普通 Execute 不因总耗时关闭父 Run 或 child；只有用户取消、显式调用方预算或真实停滞/资源边界可以收口。
 
-本地 provider 未显式声明并发容量时，模型请求按 lane 串行，真实 child 请求容量为零；runtime 不再把父/子轮流占用同一个模型包装成并行协作。只有配置或已确认的 provider 请求容量大于一，才会在为父线程保留一个槽位后开放 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+provider 未显式声明并发容量时，模型 lane 先开放“父线程 + 一个 probe child”，再以真实首 chunk 重叠证明按 2 → 3 → 4 逐级增长；本地 lane 每次重叠准入前还必须通过当前设备内存保留量采样。产品总上限是四个模型请求，即一个父线程加最多三个 child；轮流占用同一 lane 不会被记作并行能力。显式配置可选择更小上限，OOM、HTTP 429、明确并发限制或持续内存压力会收缩 lane，并优先释放最新 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+
+显式要求 Plan 使用 child 时，协作获取是 discovery 中的独立硬门：未 admission 前只能请求精确 `spawn_subagent`，不能提前合成或封印 WorkPlan。该请求无活动超时后只在同一实际 transport/surface 上恢复一次；90 秒约束无活动间隔，只有显式调用方截止才约束总时长；失败 command 的稳定 reason code 随 checkpoint 持久化，因此冷启动不能重置次数。第二次同面超时直接 `blocked`，日志必须记录真实 attempted/effective transport，不能把名义 stage 切换冒充 wire fallback。
+
+Plan provider 的单请求 timeout 是 transport 无活动窗口，而不是完整生成的总墙钟：响应头、首个 chunk 与相邻 chunk 间隔分别受限，活跃流可以跨越多个窗口；空 keepalive 只证明连接仍存活，不得伪造模型进展、evidence 或 lane first-token。Plan 仅在调用方明确提供并持久化 deadline 时才拥有总时长硬边界，compact synthesis recovery 必须同时收窄输出预算并在能力允许时关闭 reasoning。
+
+compact recovery 的输出预算与传输选择独立：首次收敛采用 structured response；失败后可切回 native tool，实际工具目录、日志与 checkpoint 必须一致。冷恢复从已结算的请求还原下一通道，不能重新锁在失败通道。重复的 provider tool-call ID 只能关联本次响应区间内的回执，不得引用后续请求的结果补齐中断历史。
 
 父、子 provider 工具调用共享同一 schema normalization：数值/布尔漂移、默认值、路径和编辑别名先规范化，schema 未声明字段直接丢弃，再计算动作 identity 并执行。child 对一个已返回 `CHILD_EVIDENCE_REPEAT` 的同一观察再次命中时，即使模型改变了无效范围或附带字段，也以结构化 `closed_observation_loop` 降级；只有输出窗口或版本真正变化才算进展。该边界由结果语义触发，不是 child 总耗时或固定轮数限制。
 
@@ -239,14 +263,6 @@ Plan 审核是 canonical state 的非终态投影：当 checkpoint 表明 `planR
 状态恢复时，先恢复事件与 Run/Turn 身份，再恢复可见投影。历史 `run.aborted` 若缺少 Run 取消结论，读取边界会补成 `run.completed(canceled)`；若对应 Turn 也尚未收口，则必须由精确拥有该 Turn 的取消投影补出 `turn.completed(canceled)`，不能把 `run.aborted` 本身当作结论。
 
 对所有已加载且有权威 `turn.completed` 结论的 Turn，恢复投影都保证 exactly one 非流式、非空 `assistant_final`，不以 Harness marker 是否存在为前提：最后一条 final 是权威，较早的重复 final 降为 `assistant_update`；若 final 缺失，则生成恢复结论并把新块加入该 Turn 的 `blockIds`，同时投影 `done` 与 completed runtime outcome。不得从其他 Turn 的相似文本借用最终答复。
-
-Game Studio `local_fast` slash 也遵守同一可见结论契约：成功、错误和取消都必须产生唯一 `assistant_final`。bridge 在开始时捕获不可变的 Turn、receipt 和 user-block 身份；只有它们仍精确匹配时才在原 Turn 原位收口。如果异步工作期间 adoption 已漂移，bridge 保留原 Turn，另建带父 Run 身份的隔离 presentation-recovery Turn/Run，在其中投影最终说明；不得为补最终块而重跑 slash 命令或其本地副作用。
-
-普通 local-fast append 只在仍拥有 `currentTurnId` 或当前没有 owner 时才清理全局输入、待决策和 generating 等控制面，不得覆盖异步期间新启动的 Turn。bridge 会把唯一 final、runtime outcome、`run.completed` 与 `turn.completed` 组成同一个原子内存投影，再执行有界的 Session 持久化屏障；队头 receipt 在该屏障被验证前保持 `dispatching`。
-
-持久化不会无限占住回合：local-fast 对持久化采用有限次数重试，并让副作用持久化、终态投影与可见修复共享一个整体执行期限；真实 Project Session owner queue 也有独立的五秒 mutation lease，Rust CAS 的写入截止时间早于 JavaScript 队列释放时间。若持久化仍不可用，运行时发布明确标记为 `temporary` 的内存结论并释放当前执行 lease/FIFO，不把局部存储故障提升为应用级 `failed`。停止发生在本地副作用提交前时可以形成 `canceled`；副作用已经提交后，迟到停止不能把已确认结果改写成取消。
-
-同进程若丢失 local-fast lease，分发器只会验证已有结论或生成隔离结论，不会再次调用 handler。真正冷恢复时，当前版本没有副作用前的 durable execution fence，因而无法无损区分“尚未执行”和“已经执行但结论未落盘”；所有仍未解决的 local-fast `queued` / `dispatching` receipt 都按 at-most-once 原则隔离为可见 `error` 结论（身份冲突时使用 recovery child）并退队，绝不自动重放副作用。用户可以用一个新 Turn 明确重试。要实现无损自动重试，必须先增加副作用前的持久化 execution fence，不能从现有快照猜测。
 
 ## 相关代码
 

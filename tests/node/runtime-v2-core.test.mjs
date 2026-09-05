@@ -178,6 +178,41 @@ test("a sole named required tool recovers only exact schema-complete JSON argume
   }
 });
 
+test("required-tool exact JSON recovery supports integer schema leaves", () => {
+  const requiredSingleTool = {
+    type: "function",
+    function: {
+      name: "record_step_edges",
+      description: "Record typed step edges.",
+      parameters: {
+        type: "object",
+        properties: {
+          stepIndexes: {
+            type: "array",
+            items: { type: "integer" },
+          },
+        },
+        required: ["stepIndexes"],
+      },
+    },
+  };
+  const exact = runtime.normalizeProviderResponseV1({
+    content: JSON.stringify({ stepIndexes: [0, 2] }),
+    toolCalls: [],
+    requiredSingleTool,
+  });
+  assert.deepEqual(exact.toolCalls[0]?.arguments, { stepIndexes: [0, 2] });
+
+  for (const stepIndexes of [[0, 1.5], ["0"]]) {
+    const rejected = runtime.normalizeProviderResponseV1({
+      content: JSON.stringify({ stepIndexes }),
+      toolCalls: [],
+      requiredSingleTool,
+    });
+    assert.deepEqual(rejected.toolCalls, [], JSON.stringify(stepIndexes));
+  }
+});
+
 let eventCounter = 0;
 function event(state, type, fields = {}) {
   return {
@@ -414,6 +449,11 @@ test("minimal Execute loops through inspect, edit, behavioral validation, and co
       diagnostics: [],
     },
   }));
+  assert.equal(
+    runtime.latestRuntimeV2ProviderConclusionText(state),
+    "Updated src/main.js and verified the repaired behavior.",
+    "only the evidence-ready conclude request may supply terminal provider text",
+  );
   const evidence = runtime.summarizeRuntimeV2ExecuteEvidence(state, {
     isMutationToolName: (name) => name === "apply_patch",
   });
@@ -750,8 +790,8 @@ test("a static build cannot prove a behavioral Execute objective", () => {
   });
 });
 
-test("an unclassified direct Execute criterion accepts a finite static check", () => {
-  const state = aggregateWithValidation("npm run build", true, null);
+test("a durable unclassified direct Execute criterion accepts a finite static check", () => {
+  const state = aggregateWithValidation("npm run build", true, [null]);
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
 });
 
@@ -1098,10 +1138,27 @@ function approvedTwoTargetPlanAggregate() {
 }
 
 function commitMutation(state, key, target) {
+  const planStep = state.sealedWorkPlan?.draft.steps.find((step) =>
+    step.targets.includes(target)
+  );
+  const planToolName = planStep?.operation === "modify"
+    ? "replace_in_file"
+    : planStep?.operation === "delete"
+      ? "delete_workspace_path"
+      : planStep?.operation === "create"
+        ? "write_file"
+        : "apply_patch";
+  const planArguments = planToolName === "replace_in_file"
+    ? { path: target, old_content: "before", new_content: "after" }
+    : planToolName === "delete_workspace_path"
+      ? { path: target }
+      : planToolName === "write_file"
+        ? { path: target, content: "created" }
+        : { patch: target };
   const command = commandFor(state, "execute_tool", key, {
     toolCallId: `${key}-call`,
-    toolName: "apply_patch",
-    arguments: { patch: target },
+    toolName: planToolName,
+    arguments: planArguments,
   });
   state = schedule(state, command);
   return runtime.transition(state, event(state, "tool.completed", {
@@ -1119,7 +1176,9 @@ function commitMutation(state, key, target) {
 
 test("approved WorkPlan keeps sealed multi-target and validation authority", () => {
   const classifier = {
-    isMutationToolName: (name) => name === "apply_patch",
+    isMutationToolName: (name) =>
+      ["apply_patch", "replace_in_file", "write_file", "delete_workspace_path"]
+        .includes(name),
   };
   let state = approvedTwoTargetPlanAggregate();
   state = commitMutation(state, "main-mutation", "src/main.js");
@@ -1148,7 +1207,7 @@ test("approved WorkPlan keeps sealed multi-target and validation authority", () 
   }).allowed, false);
 });
 
-test("a tool-free Execute report truthfully closes an incomplete approved WorkPlan", () => {
+test("a tool-free Execute report remains recovery input for an incomplete approved WorkPlan", () => {
   let state = approvedTwoTargetPlanAggregate();
   state = commitMutation(state, "main-only-mutation", "src/main.js");
   state = providerResult(state, {
@@ -1158,20 +1217,25 @@ test("a tool-free Execute report truthfully closes an incomplete approved WorkPl
 
   assert.equal(
     runtime.latestRuntimeV2ProviderConclusionText(state),
-    "Updated src/main.js, but the remaining target and required validation are incomplete.",
+    "",
   );
-  assert.deepEqual(runtime.decideRuntimeV2TerminalOutcome(state, {
+  assert.equal(runtime.decideRuntimeV2TerminalOutcome(state, {
     canceled: false,
     mutationCount: 1,
     passedValidationCount: 0,
     hasAcceptanceValidation: false,
     failedValidationCount: 0,
     stalledValidationCount: 0,
-    hasProviderConclusion: true,
-  }), {
-    resultKind: "partial",
-    resultReason:
-      "模型已结束本轮；已保留实际修改，但已批准 WorkPlan 尚未完整闭环。未覆盖修改目标：src/editor.js。 未通过必需验证：work-plan-validation-1。",
+    hasProviderConclusion: false,
+  }), null);
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.deepEqual(next.payload.recoveryPressure, {
+    schemaVersion: "runtime-v2-provider-recovery.v1",
+    reason: "empty_response",
+    occurrence: 1,
+    stage: "reconsider",
   });
 });
 
@@ -1422,7 +1486,7 @@ test("enabled collaboration never gates the first mutation", () => {
   assert.equal(mutation.payload.maxActiveSubagents, 2);
 });
 
-test("a Run freezes its total child budget before adaptive lane capacity grows", () => {
+test("a Run may grow its bounded child budget when overlap capacity is proven", () => {
   let state = executeAggregate();
   const firstRequest = runtime.decideNextCommands(state, {
     subagentPreference: "preferred",
@@ -1465,9 +1529,126 @@ test("a Run freezes its total child budget before adaptive lane capacity grows",
     subagentCapacity: 3,
   })[0];
   assert.equal(nextRequest.kind, "request_model");
-  assert.equal(nextRequest.payload.maxChildRuns, 1);
-  assert.equal(nextRequest.payload.maxActiveSubagents, 1);
-  assert.equal(nextRequest.payload.remainingSubagentCapacity, 1);
+  assert.equal(nextRequest.payload.maxChildRuns, 3);
+  assert.equal(nextRequest.payload.maxActiveSubagents, 3);
+  assert.equal(nextRequest.payload.remainingSubagentCapacity, 3);
+});
+
+function closedReadChildAggregate(state, id) {
+  const child = {
+    id,
+    run: {
+      ...baseRun,
+      runId: `${id}-run`,
+      parentRunId: baseRun.runId,
+    },
+    parentRunId: baseRun.runId,
+    scopeKey: `${id}-scope`,
+    taskKind: "review",
+    objective: "Review one bounded source fact.",
+    allowedPaths: ["src/main.js"],
+    status: "queued",
+    requestedAt: state.updatedAt + 1,
+    firstTokenAt: null,
+    closedAt: null,
+    summary: null,
+    report: null,
+  };
+  state = runtime.transition(state, event(state, "subagents.scheduled", {
+    run: baseRun,
+    maxActiveSubagents: 2,
+    jobs: [child],
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: child.id,
+      phase: "request_opened",
+      at: state.updatedAt + 1,
+    },
+  }));
+  state = runtime.transition(state, event(state, "subagent.telemetry", {
+    run: baseRun,
+    telemetry: {
+      jobId: child.id,
+      phase: "closed",
+      at: state.updatedAt + 1,
+    },
+  }));
+  return { state, child };
+}
+
+test("subagent completion rejects duplicate evidence IDs within one event", () => {
+  const prepared = closedReadChildAggregate(
+    executeAggregate(),
+    "child-duplicate-evidence",
+  );
+  const duplicate = {
+    id: "child-shared-evidence",
+    kind: "subagent",
+    target: "src/main.js",
+    version: "sha-main",
+  };
+  const result = runtime.tryTransition(
+    prepared.state,
+    event(prepared.state, "subagent.completed", {
+      run: baseRun,
+      jobId: prepared.child.id,
+      status: "degraded",
+      summary: "The duplicate receipt must not enter the canonical ledger.",
+      evidence: [duplicate, { ...duplicate }],
+    }),
+  );
+
+  assert.equal(result.disposition, "rejected");
+  assert.equal(result.reason, "subagent_invalid");
+});
+
+test("subagent completion rejects an evidence ID already bound to another fact", () => {
+  let state = executeAggregate();
+  state = runtime.transition(state, event(state, "observation.recorded", {
+    run: baseRun,
+    evidence: {
+      id: "shared-evidence-id",
+      kind: "source",
+      target: "src/main.js",
+      version: "sha-parent",
+    },
+  }));
+  const prepared = closedReadChildAggregate(
+    state,
+    "child-conflicting-evidence",
+  );
+  for (const conflictingEvidence of [{
+    id: "shared-evidence-id",
+    kind: "subagent",
+    target: "src/main.js",
+    version: "sha-parent",
+  }, {
+    id: "shared-evidence-id",
+    kind: "source",
+    target: "src/other.js",
+    version: "sha-parent",
+  }, {
+    id: "shared-evidence-id",
+    kind: "source",
+    target: "src/main.js",
+    version: "sha-child",
+  }]) {
+    const result = runtime.tryTransition(
+      prepared.state,
+      event(prepared.state, "subagent.completed", {
+        run: baseRun,
+        jobId: prepared.child.id,
+        status: "degraded",
+        summary: "A colliding child fact must not replace parent evidence.",
+        evidence: [conflictingEvidence],
+      }),
+    );
+
+    assert.equal(result.disposition, "rejected");
+    assert.equal(result.reason, "subagent_invalid");
+  }
 });
 
 test("a child with evidence but no report degrades without disabling later delegation", () => {
@@ -2501,24 +2682,6 @@ test("a provider admission rejection stays non-executable and drives soft recove
     ),
     true,
   );
-  assert.equal(
-    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
-      next.payload.recoveryPressure,
-    ),
-    false,
-  );
-  const occurrenceLimited = {
-    ...next.payload.recoveryPressure,
-    occurrence:
-      runtime.RUNTIME_V2_PROVIDER_RECOVERY_MAX_CONSECUTIVE_DECISIONS,
-  };
-  assert.equal(
-    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
-      occurrenceLimited,
-    ),
-    true,
-    "only consecutive no-progress decisions are bounded; task duration is not",
-  );
   lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({
     current: lease,
     pressure: null,
@@ -2559,11 +2722,9 @@ test("failed tool effects remain consecutive provider no-progress decisions", ()
     );
   }
   assert.equal(
-    runtime.runtimeV2ProviderRecoveryOccurrenceLimitReached(
-      runtime.deriveRuntimeV2ProviderRecoveryPressure(state),
-    ),
-    true,
-    "alternating rejected tool arguments cannot reset the no-progress limit",
+    runtime.deriveRuntimeV2ProviderRecoveryPressure(state)?.occurrence,
+    3,
+    "the count remains a strategy signal but cannot conclude the parent Run",
   );
 });
 
@@ -2651,6 +2812,54 @@ test("persisted Runtime v2 checkpoints contain one canonical event ledger", () =
   assert.deepEqual(
     restored[baseTurn.turnId].aggregate.events,
     aggregate.events,
+  );
+});
+
+test("an unclassified acceptance slot survives checkpoint JSON", () => {
+  const aggregate = executeAggregate("observing", [null]);
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 1,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const wire = JSON.parse(JSON.stringify(
+    runtime.serializeRuntimeV2CheckpointMap({
+      [baseTurn.turnId]: checkpoint,
+    }),
+  ));
+  const restored = runtime.normalizeRuntimeV2CheckpointMap(wire, baseTurn);
+
+  assert.deepEqual(
+    restored[baseTurn.turnId].aggregate.objective
+      .acceptanceEvidenceRequirements,
+    [null],
+  );
+});
+
+test("Runtime v2 checkpoints retain the typed subagent requirement", () => {
+  const aggregate = runtime.transition(null, event(null, "turn.admitted", {
+    turn: baseTurn,
+    strategy: "plan",
+    subagentRequirement: "required",
+    objective: "Prepare a reviewed change with one planning child.",
+    constraints: [],
+    acceptanceCriteria: [],
+  }));
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    revision: 1,
+    aggregate,
+    updatedAt: aggregate.updatedAt,
+  });
+  const restored = runtime.normalizeRuntimeV2CheckpointMap(
+    runtime.serializeRuntimeV2CheckpointMap({
+      [baseTurn.turnId]: checkpoint,
+    }),
+    baseTurn,
+  );
+
+  assert.equal(
+    restored[baseTurn.turnId].aggregate.subagentRequirement,
+    "required",
   );
 });
 

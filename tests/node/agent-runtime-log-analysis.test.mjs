@@ -297,3 +297,18 @@ test("provider recovery stall is diagnosed without treating ordinary Execute tim
     "source_only_frontier_ended_without_effect",
   ]);
 });
+
+test("Chat and analyze terminal logs retain real context removal metrics", () => {
+  for (const strategy of ["chat", "workspace_read"]) {
+    const fixture = [
+      `[1788490224.000] [info] [store.runtime_v2_${strategy}_admitted] {"turnId":"read-only","runId":"run-read-only","strategy":"${strategy}"}`,
+      '[1788490230.000] [info] [store.runtime_v2_context_prepared] {"turnId":"read-only","runId":"run-read-only","mode":"chat","canonicalConversationMessages":36,"removedDecisionMessages":29,"recoveryOccurrence":2}',
+      `[1788490231.000] [info] [store.runtime_v2_${strategy}_terminal] {"turnId":"read-only","runId":"run-read-only","resultKind":"error","reason":"no answer"}`,
+    ].join("\n");
+    const report = analyzeAgentRuntimeEvents(parseAgentRuntimeLog(fixture));
+    assert.equal(report.runs.length, 1);
+    assert.equal(report.runs[0].terminalResultKind, "error");
+    assert.equal(report.runs[0].maxAvailableContextEntries, 36);
+    assert.equal(report.runs[0].maxDroppedContextEntries, 29);
+  }
+});

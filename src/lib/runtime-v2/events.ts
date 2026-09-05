@@ -1,5 +1,6 @@
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
   type RuntimeV2ExecutionValidationAuthority,
@@ -39,18 +40,20 @@ export interface RuntimeV2EventBase {
 export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
+      readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
+      readonly subagentRequirement?: "optional" | "required";
       readonly objective: string;
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
       readonly acceptanceCriterionIds?: readonly string[];
-      readonly acceptanceEvidenceRequirements?: readonly (
-        "static" | "behavioral" | "interaction"
-      )[];
+      readonly acceptanceEvidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.started";
+      /** An explicit caller-owned budget, never a default Turn-age limit. */
+      readonly lifecycleDeadlineAt?: number;
       readonly run: RuntimeV2RunIdentity;
       readonly phase: Exclude<RuntimeV2Phase, "reviewing" | "completed">;
     })
@@ -62,6 +65,7 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "observation.recorded";
+      readonly modelContent?: string;
       readonly run: RuntimeV2RunIdentity;
       readonly evidence: RuntimeV2EvidenceReference;
     })
@@ -75,6 +79,10 @@ export type RuntimeV2Event =
       readonly run: RuntimeV2RunIdentity;
       readonly idempotencyKey: string;
       readonly status: "succeeded" | "failed" | "canceled";
+      /** Stable cause for a failed control-plane command. The durable event,
+       * rather than transient logs or provider prose, owns bounded recovery
+       * decisions across process restarts. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "provider.responded";
@@ -84,6 +92,8 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "tool.completed";
+      /** Exact bounded model-facing receipt; replay restores the paired transcript. */
+      readonly modelContent?: string;
       readonly run: RuntimeV2RunIdentity;
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
@@ -231,6 +241,7 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.completed";
+      readonly finalProjection?: import("./contracts").RuntimeV2Projection;
       readonly run: RuntimeV2RunIdentity;
       readonly outcome: RuntimeV2TerminalOutcome;
     })

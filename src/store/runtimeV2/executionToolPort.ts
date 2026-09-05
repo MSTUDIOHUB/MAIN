@@ -1,3 +1,5 @@
+import { withRuntimeV2ModelReceipt, runtimeV2ToolModelContent } from "./readOnlyToolReceipt";
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   ensureVersionedReadFileResultForModel,
@@ -15,14 +17,11 @@ import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
   aggregateForCurrentTurn,
   authorizationFor,
-  boundedRuntimeV2ToolContent,
   boundedToolContent,
-  toolResultContentForModel,
   toolResultStatusForCompletion,
   nextEvidenceId,
   recordToolResultHistory,
   runtimeV2ContextBoundToolArguments,
-  runtimeV2SourceToolContent,
   stringValue,
   toolCompletionFor,
   toolDefinitionExists,
@@ -46,6 +45,8 @@ import {
   deriveRuntimeV2ExecutionContract,
   parseRuntimeV2ExecutionContractArguments,
 } from "./executionContract";
+import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
+import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -74,7 +75,7 @@ function logRuntimeV2ToolDeadline(input: {
 }
 
 export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): ToolPort {
-  return {
+  return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
       if (command.kind === "collect_observation") {
         input.logStoreEvent("runtime_v2_tool_execution_started", {
@@ -104,7 +105,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 {},
                 input.context.runWorkspace || "",
                 input.context.runSessionKey,
-                { toolCatalog: authorizationFor(input).toolCatalog },
+                {
+                  toolCatalog: authorizationFor(input).toolCatalog,
+                  skillCatalog: input.context.skillCatalog,
+                },
               ),
             }),
             12_000,
@@ -124,6 +128,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           });
           return {
             type: "observation.recorded",
+            ...(isReadOnlyContext(input) ? { modelContent: overview } : {}),
             run: command.run,
             evidence: {
               id: evidenceId,
@@ -145,7 +150,6 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           throw error;
         }
       }
-
       if (command.kind !== "execute_tool" && command.kind !== "execute_validation") {
         throw new Error(`Unsupported Runtime v2 tool command: ${command.kind}`);
       }
@@ -340,7 +344,9 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
       try {
         let diffPreview;
         const toolExecutionOptions = {
+          ...(isReadOnlyContext(input) ? { networkRead: readOnlyNetworkPolicy(input) } : {}),
           toolCatalog: authorizationFor(input).toolCatalog,
+          skillCatalog: input.context.skillCatalog,
           allowExternalLocalRead: authorization.allowExternalLocalRead,
           ...(authorization.shellPermissionApproval
             ? { shellPermissionApproval: authorization.shellPermissionApproval }
@@ -437,13 +443,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               sourceVersion || "",
             )
           : rawOutput;
-        const output = boundedRuntimeV2ToolContent(
-          toolName,
-          toolName === "read_file"
-            ? runtimeV2SourceToolContent(receiptOutput)
-            : toolResultContentForModel(receiptOutput),
-          input.context.runtimeContextBudget,
-        );
+        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput);
         const completion = toolCompletionFor(
           input,
           command,
@@ -457,17 +457,14 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           diffPreview,
         );
         const semanticStatus = toolResultStatusForCompletion(completion);
+        const effectCommitted = recordRuntimeV2CommittedToolEffect({
+          ports: input,
+          toolName,
+          args,
+          status: semanticStatus,
+        });
         if (completion.type === "validation.completed") {
           input.live.correctiveValidationCommand = null;
-        }
-        if (
-          semanticStatus === "succeeded" &&
-          isWorkspaceMutationToolName(toolName)
-        ) {
-          input.live.hasExecutedMutationEffect = true;
-          input.live.correctiveValidationCommand = null;
-          input.live.mutationSourceCoverageByToolCallId.clear();
-          input.live.latestProviderRequestSourceCoverage = [];
         }
         recordToolResultHistory({
           ports: input,
@@ -484,7 +481,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           toolName,
           target: target || null,
           status: semanticStatus,
-          mutationCommitted: isWorkspaceMutationToolName(toolName),
+          mutationCommitted:
+            semanticStatus === "succeeded" &&
+            isWorkspaceMutationToolName(toolName),
+          effectCommitted,
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
           executionContractRevision:
             toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
@@ -497,6 +497,15 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 version: entry.version,
               }))
             : [],
+        });
+        logRuntimeV2SkillLoad({
+          toolName,
+          succeeded: semanticStatus === "succeeded",
+          rawOutput,
+          skillId: String(args.skill_id || ""),
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          logStoreEvent: input.logStoreEvent,
         });
         return completion;
       } catch (error) {
@@ -531,5 +540,5 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         );
       }
     },
-  };
+  });
 }

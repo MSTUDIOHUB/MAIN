@@ -18,6 +18,7 @@ function loadTranspiledModuleSync(sourcePath) {
   const source = fsSync.readFileSync(normalizedPath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
+      esModuleInterop: true,
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
@@ -56,6 +57,25 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   preflightWorkspaceMutation,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workspaceMutationPreflight.ts"));
+const {
+  checkRealOmlxSourceSyntax,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "tests/e2e/realOmlxWorkspaceProxy.ts"));
+
+const validSnakePython = [
+  '"""Snake game implementation target for the MAIN runtime validation."""',
+  "",
+  "class Snake:",
+  "    def get_head(self):",
+  '        """Return the current head position."""',
+  "        return self.body[-1]",
+  "",
+].join("\n");
+
+// Minimal byte-equivalent form of the real incident post-image: line 1 has
+// four opening quotes and the final return statement has one surplus quote.
+const quoteCorruptedSnakePython = validSnakePython
+  .replace('"""Snake game', '""""Snake game')
+  .replace("return self.body[-1]", 'return self.body[-1]"');
 
 test("replace_in_file preflight blocks mismatched search_text before review", async () => {
   const result = await preflightWorkspaceMutation({
@@ -194,6 +214,11 @@ test("write_file preflight blocks missing or identical content", async () => {
 
   assert.equal(overwrite.ok, false);
   assert.equal(overwrite.reason, "existing_file_requires_patch");
+  assert.equal(
+    overwrite.recoveryKind,
+    "mutation_rejected",
+    "an overwrite-policy rejection must keep the next provider decision in corrective mutation recovery",
+  );
   assert.match(overwrite.message || "", /replace_in_file|apply_patch/);
 
   const create = await preflightWorkspaceMutation({
@@ -407,6 +432,89 @@ test("mutation preflight rejects parser-confirmed post-images before writing", a
   assert.equal(patch.ok, false);
   assert.equal(patch.reason, "syntax_error");
   assert.match(patch.message || "", /No file was changed/);
+});
+
+test("replace_in_file consumes the production Rust Python syntax receipt before writing", async () => {
+  const checkedPostImages = [];
+  const productionRustSyntaxReceipt = async (path, content) => {
+    checkedPostImages.push({ path, content });
+    const malformed = content === quoteCorruptedSnakePython;
+    return {
+      path,
+      language: "python",
+      applicable: true,
+      hasErrors: malformed,
+      errorCount: malformed ? 1 : 0,
+      firstErrorLine: malformed ? 6 : null,
+      firstErrorColumn: malformed ? 29 : null,
+      errors: malformed
+        ? [{ line: 6, column: 29, kind: "parse_error" }]
+        : [],
+      errorsTruncated: false,
+      moduleExports: [],
+    };
+  };
+  const result = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "snake.py",
+      search_text: validSnakePython,
+      replace_text: quoteCorruptedSnakePython,
+    },
+    language: "en",
+    readFile: async () => validSnakePython,
+    checkSyntax: productionRustSyntaxReceipt,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "syntax_error");
+  assert.equal(result.recoveryKind, "mutation_rejected");
+  assert.equal(result.path, "snake.py");
+  assert.match(result.message || "", /snake\.py:6:29 parse_error/);
+  assert.match(result.message || "", /No file was changed/);
+  assert.deepEqual(checkedPostImages.map((entry) => entry.content), [
+    quoteCorruptedSnakePython,
+    validSnakePython,
+  ]);
+});
+
+test("replace_in_file keeps Python syntax safety through the real OMLX proxy", async () => {
+  const valid = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "snake.py",
+      search_text: "return self.body[-1]",
+      replace_text: "return tuple(self.body[-1])",
+    },
+    language: "en",
+    readFile: async () => validSnakePython,
+    checkSyntax: async (path, content) =>
+      checkRealOmlxSourceSyntax(path, content),
+  });
+  assert.equal(valid.ok, true, "valid Python must remain writable");
+
+  const malformed = await preflightWorkspaceMutation({
+    toolName: "replace_in_file",
+    args: {
+      path: "snake.py",
+      search_text: validSnakePython,
+      replace_text: quoteCorruptedSnakePython,
+    },
+    language: "en",
+    readFile: async () => validSnakePython,
+    checkSyntax: async (path, content) =>
+      checkRealOmlxSourceSyntax(path, content),
+  });
+
+  assert.equal(
+    malformed.ok,
+    false,
+    "the E2E syntax proxy must not bypass the production Python post-image gate",
+  );
+  assert.equal(malformed.reason, "syntax_error");
+  assert.equal(malformed.recoveryKind, "mutation_rejected");
+  assert.equal(malformed.path, "snake.py");
+  assert.match(malformed.message || "", /No file was changed/);
 });
 
 test("mutation preflight allows only a strictly monotonic repair of an already-broken file", async () => {

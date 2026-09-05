@@ -65,6 +65,19 @@ export async function finishRuntimeV2CheckpointTerminal(
         status: input.resultKind === "canceled" ? "canceled" : "failed",
       });
     }
+    if (!current.aggregate.events.some((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn" && event.command.payload.runtimeControlPlane === true)) {
+      const phase = current.aggregate.phase;
+      if (!phase || phase === "completed") throw new Error("RUNTIME_V2_TERMINAL_PHASE_INVALID");
+      const command = {
+        idempotencyKey: input.nextId("runtime-v2-terminal-intent"),
+        kind: "finalize_turn" as const,
+        run: input.run,
+        phase,
+        payload: { runtimeControlPlane: true, resultKind: input.resultKind, resultReason: input.reason, finalMarkdown: input.finalMarkdown },
+      };
+      await append({ type: "command.scheduled", run: input.run, command });
+      await append({ type: "command.completed", run: input.run, idempotencyKey: command.idempotencyKey, status: "succeeded" });
+    }
     if (
       input.resultKind === "canceled" &&
       !current.aggregate.events.some((event) => event.type === "run.aborted")
@@ -96,31 +109,35 @@ export async function finishRuntimeV2CheckpointTerminal(
       completedAt: Math.max(input.now(), current.aggregate.updatedAt),
       finalProjectionId: finalProjection.id,
     };
-    await append({ type: "run.completed", run: input.run, outcome });
+    await append({ type: "run.completed", run: input.run, outcome, finalProjection });
   }
 
   const outcome = current.aggregate.terminalOutcome!;
-  if (!current.aggregate.finalProjectionId) {
-    const finalProjection = buildRuntimeV2FinalProjection(
+  let published = current.aggregate.events.find((event) => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
+  if (!published) {
+    const completed = current.aggregate.events.find((event) => event.type === "run.completed");
+    const finalProjection = (completed?.type === "run.completed" && completed.finalProjection) || buildRuntimeV2FinalProjection(
       current.aggregate,
       outcome.finalProjectionId,
       outcome.resultKind,
       outcome.reason,
       input.finalMarkdown,
     );
-    const event = await append({
+    published = await append({
       type: "projection.published",
       run: input.run,
       audience: "final",
       projectionId: finalProjection.id,
       projection: finalProjection,
     });
+  }
+  if (published.type === "projection.published") {
     try {
       await input.projection.publish({
         aggregate: current.aggregate,
         audience: "final",
-        projection: finalProjection,
-        event: event as Extract<RuntimeV2Event, { type: "projection.published" }>,
+        projection: published.projection!,
+        event: published,
       });
     } catch {
       // The event is durable replay authority; UI publication is recoverable.

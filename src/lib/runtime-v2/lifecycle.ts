@@ -1,4 +1,4 @@
-import type { RuntimeV2ProviderRecoveryPressure } from "./decision";
+import type { RuntimeV2ProviderRecoveryPressure } from "./providerRecovery";
 
 export const RUNTIME_V2_LIFECYCLE_DEADLINE_CODE =
   "RUNTIME_V2_LIFECYCLE_DEADLINE_REACHED";
@@ -10,23 +10,6 @@ export const RUNTIME_V2_LIFECYCLE_DEADLINE_CODE =
  * by this lease merely because it is slow.
  */
 export const RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS = 10 * 60_000;
-
-/**
- * A task may run indefinitely while it makes evidence-backed progress. This
- * bound applies only to consecutive provider decisions that produced no tool,
- * observation, mutation, validation, or conclusion. The first repetition is
- * corrected, the second is reframed with a required structured action, and a
- * third miss closes truthfully instead of spinning until the stall lease.
- */
-export const RUNTIME_V2_PROVIDER_RECOVERY_MAX_CONSECUTIVE_DECISIONS = 3;
-
-export function runtimeV2ProviderRecoveryOccurrenceLimitReached(
-  pressure: RuntimeV2ProviderRecoveryPressure | null,
-): boolean {
-  return !!pressure &&
-    pressure.occurrence >=
-      RUNTIME_V2_PROVIDER_RECOVERY_MAX_CONSECUTIVE_DECISIONS;
-}
 
 export interface RuntimeV2ProviderRecoveryStallLease {
   readonly startedAt: number;

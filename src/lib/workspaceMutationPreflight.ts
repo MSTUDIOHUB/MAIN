@@ -722,6 +722,7 @@ export async function preflightWorkspaceMutation(
         toolName,
         path,
         language,
+        recoveryKind: "mutation_rejected",
       });
     } catch {
       return (await blockedSyntaxResult(input, path, content, language)) ||

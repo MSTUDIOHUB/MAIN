@@ -38,6 +38,48 @@ type RuntimeV2MutationPreparation =
       readonly completion: RuntimeV2EventDraft;
     };
 
+type RuntimeV2MutationPreflightFailureKind =
+  | "source_mismatch"
+  | "target_invalid"
+  | "mutation_rejected"
+  | "protocol_invalid";
+
+/** Build the single canonical rejection receipt consumed by provider history,
+ * the durable effect ledger, projections, and terminal diagnostics. */
+export function runtimeV2MutationPreflightFailureReceipt(input: {
+  readonly message?: string | null;
+  readonly reason?: string | null;
+  readonly recoveryKind?: string | null;
+  readonly sourceRefreshHint?: string | null;
+}): {
+  readonly content: string;
+  readonly failureKind: RuntimeV2MutationPreflightFailureKind;
+  readonly failureReasonCode: string;
+} {
+  const reason = String(input.reason || "invalid_mutation").trim() ||
+    "invalid_mutation";
+  const normalizedReason = reason
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "invalid_mutation";
+  const recoveryKind = String(input.recoveryKind || "").trim();
+  return {
+    content: [
+      String(input.message || "").trim() ||
+        `MUTATION_PREFLIGHT_BLOCKED: ${reason}`,
+      String(input.sourceRefreshHint || "").trim(),
+    ].filter(Boolean).join("\n"),
+    failureKind: recoveryKind === "source_mismatch"
+      ? "source_mismatch"
+      : recoveryKind === "target_invalid"
+        ? "target_invalid"
+        : recoveryKind === "mutation_rejected"
+          ? "mutation_rejected"
+          : "protocol_invalid",
+    failureReasonCode: `mutation_preflight_${normalizedReason}`,
+  };
+}
+
 /**
  * Run the source-safety gate and prepare a bounded diff before the Tool port
  * commits a workspace mutation. This module owns mutation preparation only;
@@ -111,7 +153,6 @@ export async function prepareRuntimeV2Mutation(input: {
       preflight.path ||
       input.target;
     const sourceMismatch = preflight.recoveryKind === "source_mismatch";
-    const targetInvalid = preflight.recoveryKind === "target_invalid";
     const mutationRejected = preflight.recoveryKind === "mutation_rejected";
     const refreshLine = mismatchRange?.startLine
       ? Math.floor(
@@ -127,11 +168,13 @@ export async function prepareRuntimeV2Mutation(input: {
         refreshLine
         ? `${mismatchPath}:${refreshLine}:1 - refresh this exact source window before retrying a smaller valid mutation`
         : "";
-    const content = [
-      preflight.message ||
-        `MUTATION_PREFLIGHT_BLOCKED: ${preflight.reason || "invalid mutation"}`,
+    const failureReceipt = runtimeV2MutationPreflightFailureReceipt({
+      message: preflight.message,
+      reason: preflight.reason,
+      recoveryKind: preflight.recoveryKind,
       sourceRefreshHint,
-    ].filter(Boolean).join("\n");
+    });
+    const content = failureReceipt.content;
     recordToolResultHistory({
       ports: input.ports,
       command: input.command,
@@ -162,15 +205,12 @@ export async function prepareRuntimeV2Mutation(input: {
         input.toolName,
         input.args,
         preflight.path || input.failureContextTarget,
-        null,
+        content,
         "failed",
-        sourceMismatch
-          ? "source_mismatch"
-          : targetInvalid
-            ? "target_invalid"
-            : mutationRejected
-              ? "mutation_rejected"
-              : "protocol_invalid",
+        failureReceipt.failureKind,
+        undefined,
+        undefined,
+        failureReceipt.failureReasonCode,
       ),
     };
   }

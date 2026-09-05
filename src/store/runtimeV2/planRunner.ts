@@ -1,106 +1,142 @@
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
-import {
-  WORK_PLAN_V1_SCHEMA_VERSION,
-  isRuntimeV2ProviderTransportsUnavailableError,
-  sealWorkPlanV1,
-  type RuntimeV2NormalizedProviderResult,
-  type RuntimeV2ResultKind,
-  type SealedWorkPlanV1,
-} from "../../lib/runtime-v2";
-import {
-  createRuntimeV2PlanReviewCommit,
-  resolveRuntimeV2PlanReviewFromAggregate,
-} from "./workPlanAdapter";
+import { WORK_PLAN_V1_SCHEMA_VERSION, isRuntimeV2ProviderTransportsUnavailableError, sealWorkPlanV1, type SealedWorkPlanV1 } from "../../lib/runtime-v2";
 import { bootstrapRuntimeV2Plan } from "./planBootstrap";
-import {
-  executeReadOnlyPlanTool,
-  settlePlanTool,
-} from "./planEvidencePort";
+import { executeReadOnlyPlanTool, settlePlanTool } from "./planEvidencePort";
 import { requestPlanModel } from "./planProviderPort";
-import {
-  applyReviewProjection,
-  planReference,
-  publishReviewMilestone,
-  writeReviewArtifact,
-} from "./planReviewProjection";
-import {
-  PLAN_MODEL_COMPACTION_INTERVAL,
-  PLAN_MODEL_DEADLINE_MS,
-  SUBMIT_WORK_PLAN_TOOL_NAME,
-  isPlanSubmissionStage,
-  decodeStructuredPlanArguments,
-  workPlanDraftFromSubmission,
-  type PlanModelStage,
-  type PlanProviderTransport,
-} from "./planModelProtocol";
+import { handleRuntimeV2PlanProviderAdmissionRejection } from "./planProviderAdmission";
+import { requiredPlanCollaborationFailure, type RuntimeV2PlanTerminalFailure } from "./planRequirement";
+import { handleRequiredPlanCollaborationProviderTimeout, requiredPlanCollaborationProviderTimeoutFailure, restoreRequiredPlanCollaborationProviderTimeoutGuidance } from "./planCollaborationAcquisition";
+import { createRuntimeV2PlanCollaboration } from "./planCollaboration";
+import { completeRuntimeV2Plan, recoverRuntimeV2PlanFailure, settleRuntimeV2PlanCompletion } from "./planCompletion";
+import { SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, workPlanDraftFromSubmission, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
 import { runtimeV2ParallelReadCount } from "./executionText";
-import {
-  finishPlanTerminal,
-  planSettlement as settlement,
-  terminalPlanOutcome as terminalAgentOutcome,
-} from "./planSettlement";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
-
+import { assertAdmittedPlanCriteriaMapped, assertCompletedPlanChildrenAdopted } from "./planSubmissionPolicy";
+import { createRuntimeV2PlanSubmissionLifecycle, recordRuntimeV2PlanSubmissionRejection } from "./planSubmissionRepair";
+import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
+import { deriveReadOnlyRecoveryWindow } from "../../lib/runtime-v2/readOnlyProgress";
+import { isRuntimeV2LifecycleDeadlineError, runtimeV2ProviderRecoveryStallExpired } from "../../lib/runtime-v2/lifecycle";
+import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 export type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
-
 export async function runSubmitRuntimeV2Plan(
   input: RuntimeV2PlanRunnerInput,
 ): Promise<RuntimeRunSettlement> {
   const bootstrap = await bootstrapRuntimeV2Plan(input);
   if (bootstrap.settlement) return bootstrap.settlement;
-  const {
-    turn,
-    identity,
+  const { turn, identity, ledger, evidence, evidenceContents, messages } =
+    bootstrap;
+  const planLifecycle = createRuntimeV2PlanSubmissionLifecycle({
+    ledger, run: identity.run, messages,
+  });
+  const initialLifecycle = planLifecycle.current();
+  const originalDeadlineAt = initialLifecycle.originalDeadlineAt;
+  const planCollaboration = createRuntimeV2PlanCollaboration({
+    runner: input,
     ledger,
+    run: identity.run,
+    messages,
     evidence,
     evidenceContents,
-    messages,
-  } = bootstrap;
-
+    deadlineAt: originalDeadlineAt,
+    logStoreEvent: input.logStoreEvent,
+  });
+  const admission = resolveRuntimeV2ObjectiveAdmission(input.context, turn.userPrompt);
+  const admittedCriterionIds = admission.acceptanceCriteria.map((criterion) => criterion.id);
   try {
-    const startedAt = Date.now();
     let sealedPlan: SealedWorkPlanV1 | null = null;
-    let terminalFailure: {
-      readonly resultKind: Extract<RuntimeV2ResultKind, "partial" | "error">;
-      readonly reason: string;
-      readonly detailCode: string;
-    } | null = null;
+    const initialCollaboration = planCollaboration.current().payload;
+    if (initialCollaboration.collaborationRequired === true &&
+      initialCollaboration.collaborationRequirementMet !== true) {
+      restoreRequiredPlanCollaborationProviderTimeoutGuidance({
+        aggregate: ledger.snapshot(), run: identity.run, messages,
+      });
+    }
+    let terminalFailure: RuntimeV2PlanTerminalFailure | null =
+      requiredPlanCollaborationProviderTimeoutFailure({
+        aggregate: ledger.snapshot(), run: identity.run,
+        collaborationRequired: initialCollaboration.collaborationRequired === true,
+        collaborationRequirementMet: initialCollaboration.collaborationRequirementMet === true,
+      });
     let round = 0;
-    let stage: PlanModelStage = "discovery";
-    let synthesisTransport: PlanProviderTransport = "native_tool";
-    let synthesisRecoveryCount = 0;
-    const deadlineAt = startedAt + PLAN_MODEL_DEADLINE_MS;
+    const priorEvents = ledger.snapshot()?.events || [];
+    const priorRequest = [...priorEvents].reverse().find((entry) => entry.type === "command.scheduled" && entry.command.kind === "request_model" && entry.run.runId === identity.run.runId);
+    const priorPayload = priorRequest?.type === "command.scheduled" ? priorRequest.command.payload : {};
+    let stage: PlanModelStage = initialLifecycle.submissionRepairPending || priorPayload.stage === "synthesis" ? "synthesis" : "discovery";
+    let synthesisTransport: PlanProviderTransport = priorPayload.transport === "structured_response" ? "structured_response" : "native_tool";
+    let compactRecoveryStarted = priorPayload.compactRecovery === true;
+    let synthesisRecoveryCount = compactRecoveryStarted ? 1 : 0;
+    // A restart after a settled compact failure must select the same next
+    // transport as the live runner. Unsettled requests may retry their lane.
+    if (compactRecoveryStarted && priorRequest?.type === "command.scheduled" && priorEvents.some((entry) =>
+      "idempotencyKey" in entry && entry.idempotencyKey === priorRequest.command.idempotencyKey &&
+      ((entry.type === "command.completed" && entry.status === "failed") ||
+        (entry.type === "provider.responded" && entry.result.toolCalls.length === 0))
+    )) synthesisTransport = synthesisTransport === "structured_response" ? "native_tool" : "structured_response";
+    let submissionRepairPending = initialLifecycle.submissionRepairPending;
     while (!sealedPlan && !terminalFailure) {
       if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
+      const lifecycle = planLifecycle.current();
+      if (lifecycle.submissionRepairPending) {
+        stage = "synthesis";
+        submissionRepairPending = true;
+      }
+      const deadlineAt = lifecycle.effectiveDeadlineAt;
       if (Date.now() >= deadlineAt) {
         await ledger.recordSoftSignal(identity.run, "context_pressure");
         terminalFailure = {
-          resultKind: evidence.length > 0 ? "partial" : "error",
-          reason: "计划生成已到达运行时限；已保留现有证据并明确结束本轮，没有留下悬空任务。",
+          resultKind: "error",
+          reason: "计划生成已到达调用方明确指定的截止时间；尚未生成可供审核的计划。",
           detailCode: "runtime_v2_plan_deadline_reached",
         };
         break;
       }
-      if (round > 0 && round % PLAN_MODEL_COMPACTION_INTERVAL === 0) {
-        await ledger.recordSoftSignal(identity.run, "iteration_limit");
-        if (messages.length > 21) {
-          messages.splice(3, messages.length - 21);
-        }
-        messages.push({
-          role: "system",
-          content: "The planning context was compacted at a soft pressure boundary. Continue from retained evidence; this signal is not a terminal decision.",
-        });
-        input.logStoreEvent("runtime_v2_plan_soft_round_signal", {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          round,
-          terminal: false,
-          action: "compact_and_continue",
-        });
+      const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, {
+        finalTextIsProgress: false, includeChildEvidence: true,
+      });
+      const recoveryExpired = recovery && runtimeV2ProviderRecoveryStallExpired({
+        startedAt: recovery.startedAt, reason: recovery.pressure.reason,
+        latestOccurrence: recovery.pressure.occurrence,
+      }, Date.now());
+      if (recoveryExpired && planCollaboration.activeChildCount() > 0) {
+        await planCollaboration.joinActive("plan_recovery_waits_for_active_children");
+        continue;
+      }
+      if (recoveryExpired) {
+        terminalFailure = {
+          resultKind: "error",
+          reason: "计划生成连续未获得新证据或有效提交，恢复窗口已耗尽；尚未生成可供审核的计划。",
+          detailCode: "runtime_v2_plan_recovery_stall_exhausted",
+        };
+        break;
+      }
+      if (recovery) upsertRuntimeV2ContextAnchor(planCollaboration.live, {
+        key: "plan-recovery",
+        content: `The last request did not add new evidence or a valid WorkPlan (${recovery.pressure.reason}). Name one concrete missing path, range or fact before another read; otherwise submit the plan from retained evidence. Cached or unchanged results are not progress.`,
+      });
+      else {
+        const index = messages.findIndex((message) => message.role === "system" && String(message.content).startsWith("[runtime-v2 context: plan-recovery]"));
+        if (index >= 0) messages.splice(index, 1);
       }
       round += 1;
-      let response: RuntimeV2NormalizedProviderResult;
+      let response: Awaited<ReturnType<typeof requestPlanModel>>;
+      let effectiveTransport: PlanProviderTransport = "native_tool";
+      let compactRecovery = false;
+      let repeatedArgumentRejections = false;
       try {
+        const collaboration = planCollaboration.current().payload;
+        repeatedArgumentRejections = (ledger.snapshot()?.events || []).filter((entry) =>
+          recovery && entry.at >= recovery.startedAt && entry.type === "provider.responded" &&
+          entry.result.diagnostics?.some((diagnostic) =>
+            diagnostic.code === "tool_arguments_rejected"
+          )
+        ).length >= 2;
+        compactRecovery = stage === "synthesis" &&
+          (compactRecoveryStarted || (!submissionRepairPending && synthesisRecoveryCount > 0) || repeatedArgumentRejections);
+        if (compactRecovery && !compactRecoveryStarted) {
+          synthesisTransport = "structured_response";
+          compactRecoveryStarted = true;
+        }
+        effectiveTransport = stage === "synthesis" ? synthesisTransport : "native_tool";
         response = await requestPlanModel({
           get: input.get,
           context: input.context,
@@ -111,19 +147,40 @@ export async function runSubmitRuntimeV2Plan(
           stage,
           evidence,
           evidenceContents,
-          compactRecovery:
-            stage === "synthesis" && synthesisRecoveryCount > 0,
-          transport: stage === "synthesis"
-            ? synthesisTransport
-            : "native_tool",
+          collaboration,
+          submissionRepairPending,
+          compactRecovery,
+          transport: effectiveTransport,
           logStoreEvent: input.logStoreEvent,
         });
       } catch (error) {
         if (input.context.abortCtrl.signal.aborted) throw error;
+        if (isRuntimeV2LifecycleDeadlineError(error)) continue;
+        const attempted = [...(ledger.snapshot()?.events || [])].reverse().find((entry) => entry.type === "command.scheduled" && entry.command.kind === "request_model" && entry.run.runId === identity.run.runId);
+        if (attempted?.type === "command.scheduled") effectiveTransport = attempted.command.payload.transport as PlanProviderTransport;
         const detail = error instanceof Error ? error.message : String(error);
+        if (detail === "READ_ONLY_CONTEXT_BUDGET_EXCEEDED") throw error;
+        const requirementFailure = requiredPlanCollaborationFailure({ error });
+        if (requirementFailure) {
+          terminalFailure = requirementFailure;
+          break;
+        }
+        const acquisitionTimeout = await handleRequiredPlanCollaborationProviderTimeout({
+          error, aggregate: ledger.snapshot(), run: identity.run,
+          turnId: identity.turn.turnId,
+          collaboration: planCollaboration.current().payload,
+          ledger, messages, logStoreEvent: input.logStoreEvent,
+        });
+        if (acquisitionTimeout) {
+          terminalFailure = acquisitionTimeout.terminalFailure;
+          if (terminalFailure) break;
+          stage = "discovery";
+          synthesisTransport = "native_tool";
+          continue;
+        }
         if (isRuntimeV2ProviderTransportsUnavailableError(error)) {
           terminalFailure = {
-            resultKind: evidence.length > 0 ? "partial" : "error",
+            resultKind: "error",
             reason: "模型适配器确认当前没有可用的计划传输通道；已保留现有证据并明确结束本轮。",
             detailCode: "runtime_v2_plan_provider_transports_unavailable",
           };
@@ -133,9 +190,7 @@ export async function runSubmitRuntimeV2Plan(
             round,
             evidenceCount: evidence.length,
             stage,
-            transport: isPlanSubmissionStage(stage)
-              ? synthesisTransport
-              : "native_tool",
+            transport: effectiveTransport,
             terminal: true,
             error: detail,
           });
@@ -157,13 +212,13 @@ export async function runSubmitRuntimeV2Plan(
             canContinue: true,
             terminal: false,
             action: "switch_to_synthesis",
-            from: "native_tool",
+            from: effectiveTransport,
             to: synthesisTransport,
             error: detail,
           });
           continue;
         }
-        const previousTransport: PlanProviderTransport = synthesisTransport;
+        const previousTransport: PlanProviderTransport = effectiveTransport;
         synthesisRecoveryCount += 1;
         synthesisTransport = previousTransport === "structured_response"
           ? "native_tool"
@@ -192,7 +247,27 @@ export async function runSubmitRuntimeV2Plan(
         );
         continue;
       }
+      if (await handleRuntimeV2PlanProviderAdmissionRejection({
+        ledger, run: identity.run, response,
+        collaboration: planCollaboration.current().payload,
+        round, stage, logStoreEvent: input.logStoreEvent,
+      })) {
+        if (compactRecovery) synthesisTransport = response.transport === "structured_response" ? "native_tool" : "structured_response";
+        continue;
+      }
       if (response.toolCalls.length === 0) {
+        if (planCollaboration.activeChildCount() > 0) {
+          await planCollaboration.joinActive(
+            "plan_parent_closed_action_while_children_active",
+          );
+          messages.push({
+            role: "system",
+            content: "The active planning child is now joined. Continue discovery from the delivered evidence, cite any adopted child evidence ID, or submit the complete WorkPlan.",
+          });
+          stage = "discovery";
+          submissionRepairPending = false;
+          continue;
+        }
         await ledger.recordSoftSignal(identity.run, response.visibleText?.trim()
           ? "no_tool_call"
           : "empty_response");
@@ -218,7 +293,7 @@ export async function runSubmitRuntimeV2Plan(
         }
         if (stage === "synthesis") {
           await ledger.recordSoftSignal(identity.run, "protocol_drift");
-          const previousTransport: PlanProviderTransport = synthesisTransport;
+          const previousTransport: PlanProviderTransport = response.transport;
           synthesisRecoveryCount += 1;
           synthesisTransport = previousTransport === "structured_response"
             ? "native_tool"
@@ -247,6 +322,27 @@ export async function runSubmitRuntimeV2Plan(
         response.toolCalls.length === 1
       ) {
         const call = submitCalls[0]!;
+        if (planCollaboration.activeChildCount() > 0) {
+          const joined = await planCollaboration.joinActive(
+            "plan_submission_requires_joined_children",
+          );
+          await settlePlanTool({
+            ledger,
+            run: identity.run,
+            call,
+            status: "blocked",
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: joined
+              ? `WORK_PLAN_REJECTED: active planning children were joined first. Review the delivered child evidence and cite any adopted exact ID in changes[].basis: ${evidence.filter((entry) => entry.id.startsWith("child:")).map((entry) => entry.id).join(", ") || "none"}. Then submit the complete plan again.`
+              : "WORK_PLAN_REJECTED: active planning children could not be joined safely. Continue parent discovery without relying on unfinished child work.",
+          });
+          stage = joined ? "synthesis" : "discovery";
+          submissionRepairPending = joined;
+          continue;
+        }
         const candidate = decodeStructuredPlanArguments(call.arguments);
         if (!candidate) {
           await settlePlanTool({ ledger, run: identity.run, call, status: "failed" });
@@ -266,6 +362,8 @@ export async function runSubmitRuntimeV2Plan(
             identity.run,
             "protocol_drift",
           );
+          stage = "synthesis";
+          submissionRepairPending = true;
           continue;
         }
         try {
@@ -273,8 +371,18 @@ export async function runSubmitRuntimeV2Plan(
             candidate,
             evidence,
             turn.userPrompt,
+            admittedCriterionIds,
           );
           const draft = compiled.draft;
+          assertAdmittedPlanCriteriaMapped({
+            draft,
+            criterionIds: admittedCriterionIds,
+          });
+          assertCompletedPlanChildrenAdopted({
+            aggregate: ledger.snapshot(),
+            draft,
+            collaborationRequired: (ledger.snapshot()?.subagentRequirement ?? input.context.turnInputContextSignals?.subagentRequirement) === "required",
+          });
           if (compiled.normalized) {
             input.logStoreEvent("runtime_v2_plan_submission_normalized", {
               turnId: identity.turn.turnId,
@@ -307,11 +415,8 @@ export async function runSubmitRuntimeV2Plan(
           break;
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          await settlePlanTool({ ledger, run: identity.run, call, status: "failed" });
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: `WORK_PLAN_REJECTED: ${detail}`.slice(0, 4_000),
+          await recordRuntimeV2PlanSubmissionRejection({
+            ledger, run: identity.run, call, messages, detail,
           });
           input.logStoreEvent("runtime_v2_plan_submission_rejected", {
             turnId: identity.turn.turnId,
@@ -325,6 +430,8 @@ export async function runSubmitRuntimeV2Plan(
             identity.run,
             "protocol_drift",
           );
+          stage = "synthesis";
+          submissionRepairPending = true;
           continue;
         }
       }
@@ -332,6 +439,16 @@ export async function runSubmitRuntimeV2Plan(
         response.toolCalls,
       );
       for (const call of response.toolCalls) {
+        if (
+          call.name === "spawn_subagent" ||
+          call.name === "wait_subagents"
+        ) {
+          await planCollaboration.executeProviderCall(
+            call,
+            planCollaboration.current().decision,
+          );
+          continue;
+        }
         await executeReadOnlyPlanTool({
           context: input.context,
           ledger,
@@ -345,110 +462,26 @@ export async function runSubmitRuntimeV2Plan(
         });
       }
     }
-    if (!sealedPlan) {
-      if (!terminalFailure) throw new Error("RUNTIME_V2_PLAN_TERMINAL_DECISION_MISSING");
-      input.logStoreEvent("runtime_v2_plan_review_not_produced", {
-        turnId: identity.turn.turnId,
-        runId: identity.run.runId,
-        evidenceCount: evidence.length,
-        terminal: true,
-        detailCode: terminalFailure.detailCode,
-      });
-      return finishPlanTerminal({
-        runner: input,
-        ledger,
-        run: identity.run,
-        ...terminalFailure,
-      });
-    }
-
-    const requestId = [
-      "runtime-v2-plan-review",
-      identity.run.runId,
-      sealedPlan.id,
-      sealedPlan.revision,
-      sealedPlan.projectionHash.slice(-16),
-    ].join(":");
-    const commit = createRuntimeV2PlanReviewCommit({
-      plan: sealedPlan,
+    return settleRuntimeV2PlanCompletion(await completeRuntimeV2Plan({
+      runner: input,
+      ledger,
       turn: identity.turn,
       run: identity.run,
-      requestId,
-      createdAt: Date.now(),
-    });
-    await writeReviewArtifact({
-      context: input.context,
-      ledger,
-      run: identity.run,
-      plan: sealedPlan,
-    });
-    await ledger.append({
-      type: "work_plan.sealed",
-      run: identity.run,
-      workPlan: planReference(sealedPlan),
+      evidence,
       sealedPlan,
-      reviewCommit: commit,
-    });
-    await publishReviewMilestone({
-      ledger,
-      commit,
-    });
-    // Expose the approval control only after every ReviewCommit projection is
-    // durably appended, so a fast click cannot race the milestone checkpoint.
-    applyReviewProjection(input, commit);
-    input.logStoreEvent("runtime_v2_plan_review_committed", {
-      turnId: identity.turn.turnId,
-      runId: identity.run.runId,
-      requestId: commit.review.requestId,
-      workPlanId: commit.authority.id,
-      revision: commit.authority.revision,
-      digest: commit.authority.digest,
-      projectionHash: commit.authority.projectionHash,
-    });
-    return settlement(input.context);
+      terminalFailure,
+      collaboration: planCollaboration,
+    }));
   } catch (error) {
-    const aggregate = ledger.snapshot();
-    if (!aggregate?.run || aggregate.phase === "acting") throw error;
-    if (aggregate.terminalOutcome) {
-      return settlement(
-        input.context,
-        terminalAgentOutcome(
-          aggregate.terminalOutcome.resultKind,
-          aggregate.terminalOutcome.reason,
-        ),
-      );
-    }
-    const recoveredReview = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
-    if (recoveredReview?.pending) {
-      applyReviewProjection(input, recoveredReview.commit);
-      return settlement(input.context);
-    }
-    if (input.context.abortCtrl.signal.aborted) {
-      return finishPlanTerminal({
-        runner: input,
-        ledger,
-        run: identity.run,
-        resultKind: "canceled",
-        reason: "用户已停止计划生成；已保留此前收集的证据并结束本轮。",
-        detailCode: "runtime_v2_plan_aborted",
-      });
-    }
-    const detail = error instanceof Error ? error.message : String(error);
-    await ledger.recordSoftSignal(identity.run, "protocol_drift");
-    input.logStoreEvent("runtime_v2_plan_unhandled_failure", {
-      turnId: identity.turn.turnId,
-      runId: identity.run.runId,
-      error: detail,
-    });
-    return finishPlanTerminal({
+    return settleRuntimeV2PlanCompletion(await recoverRuntimeV2PlanFailure({
+      error,
       runner: input,
       ledger,
       run: identity.run,
-      resultKind: aggregate.evidence.length > 0 ? "partial" : "error",
-      reason: "计划生成遇到运行时错误；已保留现有证据并明确结束本轮，没有留下悬空任务。",
-      detailCode: "runtime_v2_plan_unhandled_failure",
-    });
+      collaboration: planCollaboration,
+    }));
   } finally {
+    planCollaboration.abortChildren("runtime_v2_plan_runner_closed");
     clearInterval(input.context.timerInterval as ReturnType<typeof setInterval>);
   }
 }

@@ -573,20 +573,6 @@ test("native and compatibility tool protocols share a bounded decision output bu
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
-      { payload: { mode: "execute" } },
-      false,
-      resolved,
-      null,
-      true,
-    ),
-    Math.min(
-      resolved.outputBudget,
-      providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_MAX_OUTPUT_TOKENS,
-    ),
-    "a named contract-only decision has enough room for schema-complete arguments while prose remains separately capped",
-  );
-  assert.equal(
-    providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
       command,
       true,
       resolved,
@@ -630,21 +616,16 @@ test("native and compatibility tool protocols share a bounded decision output bu
 });
 
 test("source-only effect pressure uses capability-gated action decoding", () => {
-  assert.ok(
-    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT >
-      providerRequest.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
-    "a complete multi-file contract has a bounded but schema-sized envelope while ordinary forced actions stay terse",
-  );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
       sourceOnlyFrontier: true,
       hasMutationTool: false,
       providerSupportsReasoningToggle: true,
-      contractOnlyAction: true,
+      structuredActionRequired: true,
     }),
     "off",
-    "contract formation decodes committed evidence instead of opening a second hidden analysis phase",
+    "a required action decodes committed evidence instead of opening a second hidden analysis phase",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
@@ -652,7 +633,7 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
       sourceOnlyFrontier: true,
       hasMutationTool: false,
       providerSupportsReasoningToggle: false,
-      contractOnlyAction: true,
+      structuredActionRequired: true,
     }),
     "explicit",
     "reasoning policy never invents an unsupported provider toggle",

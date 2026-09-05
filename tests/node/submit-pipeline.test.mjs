@@ -59,7 +59,6 @@ const {
   buildSubmitPreflightResumeOptions,
   buildSubmitSessionBootstrapDecision,
   buildSubmitSessionBootstrapPatch,
-  buildSubmitLocalStudioTurnPatch,
   buildSubmitRunStatePatch,
   buildSubmitVisibleTurnPatch,
   createGoalCreationAuthorization,
@@ -130,7 +129,6 @@ function baseEffectiveIntentInput(overrides = {}) {
     preferredLanguage: "zh",
     options: {},
     currentMainModeKey: "main_mode",
-    parsedStudioCommand: null,
     isHidden: false,
     autoApproveTools: false,
     fallbackRunIntent: "respond",
@@ -183,15 +181,6 @@ function baseEnvelopeState(overrides = {}) {
   };
 }
 
-function baseEnvelopeCache(overrides = {}) {
-  return {
-    workspaceTreeCacheKey: "/tmp/main-project",
-    workspaceTreeCacheVersion: 3,
-    workspaceTreeCache: "[D] src",
-    ...overrides,
-  };
-}
-
 function baseResolution(overrides = {}) {
   return {
     intent: "respond",
@@ -208,7 +197,7 @@ function baseResolution(overrides = {}) {
   };
 }
 
-test("submit input envelope resolves snapshots parents and cached workspace tree", () => {
+test("submit input envelope resolves snapshots and parent turns", () => {
   const envelope = buildSubmitInputEnvelope({
     text: "继续",
     options: {
@@ -218,7 +207,7 @@ test("submit input envelope resolves snapshots parents and cached workspace tree
       attachedFilesSnapshot: ["/tmp/custom.md"],
     },
     state: baseEnvelopeState(),
-    cache: baseEnvelopeCache(),
+    cache: {},
   });
 
   assert.equal(envelope.isHidden, false);
@@ -227,32 +216,6 @@ test("submit input envelope resolves snapshots parents and cached workspace tree
   assert.deepEqual(envelope.mentionSnapshot, ["src/store/useAppStore.ts"]);
   assert.deepEqual(envelope.attachedFilesSnapshot, ["/tmp/custom.md"]);
   assert.equal(envelope.hasSupplementalInput, true);
-  assert.equal(envelope.cachedWorkspaceTreeForGameDetection, "[D] src");
-  assert.equal(envelope.shouldWarmWorkspaceTreeCache, false);
-});
-
-test("submit input envelope uses workflow slash args for language detection", () => {
-  const envelope = buildSubmitInputEnvelope({
-    text: "/start fix camera shake",
-    state: baseEnvelopeState({
-      selectedMainModeKey: "game_studio",
-      config: {
-        language: "zh",
-        responseLanguagePolicy: "follow_input_language",
-      },
-    }),
-    cache: baseEnvelopeCache({
-      workspaceTreeCacheVersion: 2,
-      workspaceTreeCache: "[D] stale",
-    }),
-  });
-
-  assert.equal(envelope.preParsedStudioCommand.type, "workflow");
-  assert.equal(envelope.preParsedStudioWorkflowArgs, "fix camera shake");
-  assert.equal(envelope.languageResolutionInput, "fix camera shake");
-  assert.equal(envelope.preferredLanguage, "en");
-  assert.equal(envelope.cachedWorkspaceTreeForGameDetection, "");
-  assert.equal(envelope.shouldWarmWorkspaceTreeCache, true);
 });
 
 test("submit input envelope preserves hidden language and linked Feishu context", () => {
@@ -273,7 +236,7 @@ test("submit input envelope preserves hidden language and linked Feishu context"
       feishuLinkedSessionId: 7,
       feishuLinkedContext: linkedContext,
     }),
-    cache: baseEnvelopeCache(),
+    cache: {},
   });
 
   assert.equal(envelope.isHidden, true);
@@ -569,18 +532,16 @@ test("submit pipeline exposes plan hydration as an explicit effect", () => {
   assert.equal(decision.effects.launchAgentLoop, undefined);
 });
 
-test("submit pipeline parses shortcuts before Game Studio suggestion", () => {
+test("submit pipeline parses MAIN shortcuts before agent-loop routing", () => {
   const decision = buildSubmitPipelineDecision({
     text: "/计划 先出方案",
-    snapshot: baseSnapshot({
-      selectedMainModeKey: "game_studio",
-    }),
+    snapshot: baseSnapshot(),
   });
 
   assert.equal(decision.shortcuts.mainIntentShortcut.intent, "plan");
   assert.equal(decision.shortcuts.textAfterIntentShortcut, "先出方案");
   assert.equal(decision.shortcuts.lockedComposerIntent, "plan");
-  assert.equal(decision.gameStudioModeSwitch.pendingRunDecision, null);
+  assert.equal(decision.routeKind, "agent_loop");
 });
 
 test("submit pipeline mints Goal creation authority only for visible shortcut text or a captured capsule", () => {
@@ -1058,44 +1019,6 @@ test("queued Goal capsule authority is restored only for the exact queued messag
   assert.equal(staleLegacySlashReplay.shortcuts.goalCreationAuthorization, null);
 });
 
-test("submit pipeline returns Game Studio mode-switch decision as a store effect", () => {
-  const decision = buildSubmitPipelineDecision({
-    text: "帮我修复 Unity MonoBehaviour 的相机抖动问题",
-    preferredLanguage: "zh",
-    workspaceTreeForGameDetection: "[D] Assets\n[D] ProjectSettings\n[D] Packages",
-    createGameStudioModeSwitchDecision: ({ signal }) => ({
-      kind: "mode_switch",
-      source: "pre_submit",
-      originalInput: "game",
-      suggestedIntent: "studio_workflow",
-      reason: `engine:${signal.engine}`,
-      title: "切换到游戏工作室？",
-      target: signal.engine,
-      options: [],
-    }),
-    snapshot: baseSnapshot(),
-  });
-
-  assert.equal(decision.routeKind, "mode_switch_decision");
-  assert.equal(decision.gameStudioModeSwitch.signal.engine, "unity");
-  assert.equal(decision.effects.setPendingDecision.title, "切换到游戏工作室？");
-  assert.equal(decision.effects.launchAgentLoop, undefined);
-});
-
-test("effective intent decision upgrades auto-approve Game Studio turns to studio workflow", () => {
-  const decision = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
-    text: "修复 Unity 摄像机抖动",
-    currentMainModeKey: "game_studio",
-    autoApproveTools: true,
-    parsedStudioCommand: { type: "workflow", slug: "implement", args: "camera shake" },
-  }));
-
-  assert.equal(decision.shouldForceExecuteForAutoApprove, true);
-  assert.equal(decision.effectiveRunIntent, "studio_workflow");
-  assert.equal(decision.effectiveCommandDirective.kind, "studio");
-  assert.match(decision.effectiveIntentSummary, /Game Studio 工作流|自动审批/);
-});
-
 test("effective intent decision keeps an identity-validated choice inside Goal runtime", () => {
   const decision = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
     text: "显示欢迎页",
@@ -1143,21 +1066,6 @@ test("effective intent decision downgrades untrusted Goal intents but preserves 
   assert.equal(explicit.effectiveRunIntent, "goal");
 });
 
-test("effective intent decision preserves explicit Unity setup-engine directive", () => {
-  const decision = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
-    text: "/setup-engine unity",
-    currentMainModeKey: "game_studio",
-    fallbackRunIntent: "studio_workflow",
-    parsedStudioCommand: { type: "workflow", slug: "setup-engine", args: "unity" },
-    unitySetupEngineSelected: true,
-  }));
-
-  assert.equal(decision.effectiveRunIntent, "studio_workflow");
-  assert.equal(decision.effectiveCommandDirective.kind, "unity");
-  assert.equal(decision.effectiveCommandDirective.action, "setup-engine");
-  assert.equal(decision.effectiveCommandDirective.requiresApproval, false);
-});
-
 test("approved-plan child run cannot inherit generic consent before Harness admission", () => {
   const decision = resolveSubmitRuntimeDecision({
     effectiveRunIntent: "execute",
@@ -1167,7 +1075,6 @@ test("approved-plan child run cannot inherit generic consent before Harness admi
     executionConsentGranted: true,
     shouldExecuteOnceFromReplyOption: false,
     preservePlanState: true,
-    isLocalStudioCommand: false,
     requiresPlanExecutionAdmission: true,
   });
 
@@ -1176,44 +1083,6 @@ test("approved-plan child run cannot inherit generic consent before Harness admi
   assert.equal(decision.effectiveDisplayIntent, "execute");
   assert.equal(decision.initialTurnStatus, "executing");
   assert.equal(decision.shouldGrantExecutionConsentForTurn, false);
-  assert.equal(decision.shouldResetPlanState, false);
-});
-
-test("runtime decision resumes Game Studio reply options as studio workflow with execution consent", () => {
-  const decision = resolveSubmitRuntimeDecision({
-    effectiveRunIntent: "respond",
-    currentMainModeKey: "game_studio",
-    isPlanApproved: false,
-    autoApproveTools: false,
-    executionConsentGranted: false,
-    shouldExecuteOnceFromReplyOption: true,
-    preservePlanState: true,
-    isLocalStudioCommand: false,
-  });
-
-  assert.equal(decision.effectiveWorkflowMode, "chat");
-  assert.equal(decision.runtimeRunIntent, "studio_workflow");
-  assert.equal(decision.effectiveDisplayIntent, "respond");
-  assert.equal(decision.initialTurnStatus, "executing");
-  assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
-  assert.equal(decision.shouldResetPlanState, false);
-});
-
-test("runtime decision keeps plan state for local Game Studio commands", () => {
-  const decision = resolveSubmitRuntimeDecision({
-    effectiveRunIntent: "studio_workflow",
-    currentMainModeKey: "game_studio",
-    isPlanApproved: false,
-    autoApproveTools: true,
-    executionConsentGranted: false,
-    shouldExecuteOnceFromReplyOption: false,
-    preservePlanState: false,
-    isLocalStudioCommand: true,
-  });
-
-  assert.equal(decision.effectiveWorkflowMode, "edit");
-  assert.equal(decision.runtimeRunIntent, "studio_workflow");
-  assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
   assert.equal(decision.shouldResetPlanState, false);
 });
 
@@ -1226,8 +1095,6 @@ test("runtime decision cannot enter Goal without creation authority or an existi
     autoApproveTools: false,
     shouldExecuteOnceFromReplyOption: false,
     preservePlanState: false,
-    isLocalStudioCommand: false,
-    hasActiveGoal: true,
   });
   assert.equal(rejected.runtimeRunIntent, "execute");
 
@@ -1239,7 +1106,6 @@ test("runtime decision cannot enter Goal without creation authority or an existi
     autoApproveTools: false,
     shouldExecuteOnceFromReplyOption: false,
     preservePlanState: true,
-    isLocalStudioCommand: false,
     goalContinuationAuthorization: goalContinuationAuthorization(),
   });
   assert.equal(resumed.runtimeRunIntent, "goal");
@@ -1251,7 +1117,6 @@ test("runtime decision cannot enter Goal without creation authority or an existi
     autoApproveTools: false,
     shouldExecuteOnceFromReplyOption: false,
     preservePlanState: true,
-    isLocalStudioCommand: false,
     goalContinuationAuthorization: goalContinuationAuthorization(),
   });
   assert.equal(replayedWithoutDuplicateOverride.runtimeRunIntent, "goal");
@@ -1733,6 +1598,7 @@ test("semantic metadata decision builds a stable request and callback guard cont
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["Uploads/screen.png"],
       subagentPreference: "unspecified",
+      subagentRequirement: "optional",
     },
     priorTurnContext: {
       userPrompt: "修复编辑器保存失败",
@@ -1740,88 +1606,6 @@ test("semantic metadata decision builds a stable request and callback guard cont
       summary: "已定位事件消费端仍未处理保存结果。",
     },
   });
-});
-
-test("local studio turn patch appends user and system blocks for new visible turns", () => {
-  const parentTurn = turn({
-    id: "parent",
-    status: "awaiting_approval",
-    collapsed: false,
-  });
-  const patch = buildSubmitLocalStudioTurnPatch({
-    taskFlow: [{ id: 1, turnId: "parent", type: "user", content: "先规划" }],
-    conversationTurns: [parentTurn],
-    text: "/help",
-    systemContent: "Game Studio help",
-    turnId: "turn-local",
-    userBlockId: 2,
-    systemBlockId: 3,
-    userContextItems: [{ kind: "file", path: "Assets/Main.cs", label: "Assets/Main.cs", status: "ready" }],
-    isHidden: false,
-    reuseCurrentTurn: false,
-    parentPlanTurnId: "parent",
-    parentPlanTurnDoneSummary: "计划已批准，执行已交接到新的回合。",
-    effectiveRunIntent: "studio_workflow",
-    effectiveDisplayIntent: "studio_workflow",
-    effectiveIntentSummary: "Game Studio：帮助",
-    effectiveCommandDirective: { kind: "studio", source: "studio_slash", requiresApproval: false },
-    effectiveWorkflowMode: "edit",
-    turnTitle: "Game Studio Help",
-    systemVariant: "game_studio_local_markdown",
-    createdAtMs: 456,
-  });
-
-  assert.equal(patch.taskFlow.length, 3);
-  assert.equal(patch.userBlock.id, 2);
-  assert.equal(patch.userBlock.content, "/help");
-  assert.equal(patch.userBlock.contextItems.length, 1);
-  assert.equal(patch.systemBlock.id, 3);
-  assert.equal(patch.systemBlock.variant, "game_studio_local_markdown");
-  assert.equal(patch.conversationTurns[0].id, "parent");
-  assert.equal(patch.conversationTurns[0].status, "done");
-  assert.equal(patch.conversationTurns[0].collapsed, true);
-  assert.equal(patch.conversationTurns[0].summary, "计划已批准，执行已交接到新的回合。");
-  assert.equal(patch.conversationTurns[1].id, "turn-local");
-  assert.equal(patch.conversationTurns[1].status, "done");
-  assert.equal(patch.conversationTurns[1].summary, "Game Studio help");
-  assert.deepEqual(patch.conversationTurns[1].blockIds, [2, 3]);
-});
-
-test("local studio turn patch reuses existing turns and keeps block ids unique", () => {
-  const existingTurn = turn({
-    id: "turn-1",
-    status: "awaiting_input",
-    intent: "plan",
-    displayIntent: "plan",
-    intentSummary: "已有摘要",
-    blockIds: [7],
-  });
-  const patch = buildSubmitLocalStudioTurnPatch({
-    taskFlow: [{ id: 7, turnId: "turn-1", type: "user", content: "/agent" }],
-    conversationTurns: [existingTurn],
-    text: "/agent gameplay",
-    systemContent: "Specialist switched",
-    turnId: "turn-1",
-    userBlockId: 7,
-    systemBlockId: 8,
-    isHidden: false,
-    reuseCurrentTurn: true,
-    parentPlanTurnDoneSummary: "done",
-    effectiveRunIntent: "studio_workflow",
-    effectiveDisplayIntent: "studio_workflow",
-    effectiveIntentSummary: "Game Studio：专家",
-    effectiveCommandDirective: null,
-    effectiveWorkflowMode: "edit",
-    turnTitle: "Switch specialist",
-    createdAtMs: 789,
-  });
-
-  assert.equal(patch.taskFlow.length, 3);
-  assert.equal(patch.conversationTurns.length, 1);
-  assert.equal(patch.conversationTurns[0].status, "done");
-  assert.equal(patch.conversationTurns[0].displayIntent, "studio_workflow");
-  assert.equal(patch.conversationTurns[0].intentSummary, "已有摘要");
-  assert.deepEqual(patch.conversationTurns[0].blockIds, [7, 8]);
 });
 
 test("run state patch clears visible input, consumed reply options, plan state, and grants consent", () => {
@@ -1839,7 +1623,6 @@ test("run state patch clears visible input, consumed reply options, plan state, 
       toolCalls: [],
       finishReason: "stop",
     },
-    parsedStudioCommand: { type: "workflow", slug: "implement", args: "camera" },
     effectiveWorkflowMode: "edit",
     preservePlanState: false,
     shouldGrantExecutionConsentForTurn: true,
@@ -1849,7 +1632,6 @@ test("run state patch clears visible input, consumed reply options, plan state, 
   assert.equal(patch.currentTurnId, "turn-1");
   assert.equal(patch.input, "");
   assert.equal(patch.preferredResponseLanguage, "zh");
-  assert.equal(patch.pendingSlashCommand.slug, "implement");
   assert.equal(patch.lockedComposerIntent, null);
   assert.equal(patch.pendingRunDecision, null);
   assert.equal(patch.isGenerating, true);
@@ -1883,7 +1665,6 @@ test("run state patch preserves hidden input and approved plan state when reques
       toolCalls: [],
       finishReason: "stop",
     },
-    parsedStudioCommand: { type: "agent", slug: "gameplay" },
     effectiveWorkflowMode: "plan",
     preservePlanState: true,
     shouldGrantExecutionConsentForTurn: false,
@@ -1891,7 +1672,6 @@ test("run state patch preserves hidden input and approved plan state when reques
   });
 
   assert.equal(patch.input, "draft text");
-  assert.equal(patch.pendingSlashCommand, null);
   assert.equal(patch.config.workflowMode, "plan");
   assert.equal(patch.normalizedStreamState, undefined);
   assert.equal(Object.hasOwn(patch, "isPlanApproved"), false);
@@ -1913,7 +1693,6 @@ test("reserved Plan attempt preserves its handoff until Harness admission", () =
       toolCalls: [],
       finishReason: null,
     },
-    parsedStudioCommand: null,
     effectiveWorkflowMode: "plan",
     preservePlanState: true,
     shouldGrantExecutionConsentForTurn: true,
@@ -1934,7 +1713,7 @@ test("harness run marker draft initializes launch telemetry without store state"
     runWorkspace: "/tmp/game",
     runSessionId: 42,
     turnId: "turn-1",
-    effectiveRunIntent: "studio_workflow",
+    effectiveRunIntent: "execute",
     runtimeRunIntent: "execute",
     planStage: "approved",
     isPlanApproved: true,
@@ -2268,7 +2047,6 @@ test("execution approval decision builds pending confirmation for real operation
       source: "natural_language",
       requiresApproval: true,
     },
-    isLocalFastStudioCommand: false,
   });
 
   assert.equal(decision.locallyRequiresExecutionApproval, true);
@@ -2278,27 +2056,6 @@ test("execution approval decision builds pending confirmation for real operation
     decision.pendingRunDecision.options.map((option) => option.id),
     ["execute", "respond"],
   );
-});
-
-test("execution approval decision skips local-fast Game Studio commands", () => {
-  const decision = resolveSubmitExecutionApprovalDecision({
-    text: "/help",
-    preferredLanguage: "zh",
-    resolution: baseResolution({
-      intent: "studio_workflow",
-      riskLevel: "medium",
-      reason: "local command",
-    }),
-    effectiveCommandDirective: {
-      kind: "studio",
-      source: "studio_slash",
-      requiresApproval: true,
-    },
-    isLocalFastStudioCommand: true,
-  });
-
-  assert.equal(decision.locallyRequiresExecutionApproval, true);
-  assert.equal(decision.pendingRunDecision, null);
 });
 
 test("preflight result decision preserves model-provided user choice options", () => {
@@ -2410,7 +2167,7 @@ test("preflight staleness decision detects changed input mode and locks", () => 
     originalText: "顺手把这个文件改掉",
     latestInput: "   ",
     originalMainModeKey: "main_mode",
-    latestMainModeKey: "game_studio",
+    latestMainModeKey: "image_studio",
     lockedComposerIntent: null,
   });
   assert.equal(changedMode.stale, true);
@@ -2442,7 +2199,7 @@ test("preflight staleness decision detects explicit shortcuts in the latest inpu
 test("blocking preflight effect builds a stable request descriptor only when the gate is active", () => {
   const skipped = buildSubmitBlockingPreflightEffect({
     resolution: baseResolution({ intent: "plan", riskLevel: "medium" }),
-    currentMainModeKey: "game_studio",
+    currentMainModeKey: "image_studio",
     text: "帮我做一个大改动",
     preferredLanguage: "zh",
     currentConfig: { language: "zh" },

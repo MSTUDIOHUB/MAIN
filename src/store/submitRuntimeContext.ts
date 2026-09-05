@@ -1,9 +1,10 @@
 import type { AttachedFile } from "../lib/attachments";
+import type { SkillCatalogSnapshot } from "../lib/agentSkills";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
-import type { StudioConfig } from "../lib/gameStudio/catalog";
 import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { SubmissionRuntimeContext } from "../lib/submissionRuntimeContracts";
 import type { PlanExecutionRunProvenance } from "../lib/planExecutionProvenance";
+import type { ProjectBaselineContext } from "../lib/projectBaseline";
 import type {
   GoalContinuationAuthorization,
   GoalCreationAuthorization,
@@ -32,7 +33,9 @@ export interface CreateSubmitRuntimeContextInput {
   remoteFeishu: FeishuRemoteContext | undefined;
   workspaceTree: string | null;
   workspaceInstructionContext?: string;
-  gameStudioConfigForTurn: StudioConfig | null;
+  projectBaselineContext?: ProjectBaselineContext | null;
+  skillCatalog?: SkillCatalogSnapshot | null;
+  networkRead?: import("../lib/networkRead").NetworkReadPolicy;
   abortCtrl: AbortController;
   timerInterval: unknown;
   sendStartedAt: number;
@@ -71,7 +74,9 @@ export function createSubmitRuntimeContext(
     workspaceInstructionContext: String(
       input.workspaceInstructionContext || "",
     ),
-    gameStudioConfigForTurn: input.gameStudioConfigForTurn,
+    projectBaselineContext: input.projectBaselineContext || null,
+    skillCatalog: input.skillCatalog || null,
+    networkRead: input.networkRead,
     abortCtrl: input.abortCtrl,
     timerInterval: input.timerInterval,
     sendStartedAt: input.sendStartedAt,

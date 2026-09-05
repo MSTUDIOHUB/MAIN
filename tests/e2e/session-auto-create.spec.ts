@@ -6,6 +6,49 @@ test.beforeEach(async ({ page }) => {
       window.localStorage.clear();
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
+
+    let callbackId = 1;
+    const callbacks = new Map<number, unknown>();
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= {
+      unregisterListener: () => {},
+    };
+    internals.transformCallback = (callback: unknown) => {
+      const id = callbackId++;
+      callbacks.set(id, callback);
+      return id;
+    };
+    internals.unregisterCallback = (id: number) => callbacks.delete(Number(id));
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return Number(args?.handler ?? callbackId++);
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "get_workspace_root") return "/tmp/e2e-session-auto-create";
+      if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") {
+        return String(args?.path ?? "/tmp/e2e-session-auto-create");
+      }
+      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
+      if (cmd === "save_project_session") return args?.session ?? {};
+      if (cmd === "load_project_session") return {};
+      if (cmd === "get_project_skeleton") return "README.md\nsrc/\n";
+      if (cmd === "proxy_request") {
+        const body = String(args?.body ?? "{}");
+        if (body.includes("hidden semantic title generator")) {
+          return JSON.stringify({
+            output_text: JSON.stringify({
+              title: "创建首个 MAIN 会话",
+              summary: "验证工作区首次发送会创建并激活会话",
+            }),
+          });
+        }
+        return JSON.stringify({ output_text: "首个 MAIN 会话已创建。" });
+      }
+      return null;
+    };
   });
 });
 
@@ -77,8 +120,6 @@ test("manual project session starts as a top temporary row and never becomes Mis
         }],
         currentTurnId: "old-turn",
         selectedMainModeKey: "main_mode",
-        selectedNexusModeKey: "nexus_general",
-        activeStudioAgentKey: "studio_auto",
       },
       version: 0,
     }));
@@ -136,7 +177,6 @@ test("manual project session starts as a top temporary row and never becomes Mis
             runtimeSnapshot: {
               agentMessages: [],
               selectedMainModeKey: "main_mode",
-              selectedNexusModeKey: "nexus_general",
               planArtifacts: [],
               planTasks: [],
               planExecutionEvidenceLedger: [],
@@ -262,8 +302,8 @@ test("first real send creates and activates a project session", async ({ page })
     )
     .toEqual({
       runtimeTurns: 1,
-      runtimeBlocks: 2,
-      messages: 2,
+      runtimeBlocks: 3,
+      messages: 3,
     });
 });
 
@@ -275,10 +315,10 @@ test("first workspace Composer submission renders one durable Turn title", async
   )).toBe(0);
 
   const textarea = page.getByTestId("composer-textarea");
-  await textarea.fill("/agent writer");
-  // Close the command picker so Enter exercises the Composer submission path.
-  await textarea.press("Escape");
-  await textarea.press("Enter");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-analyze").click();
+  await textarea.fill("创建首个 MAIN 会话。");
+  await page.getByTestId("composer-send-button").click();
 
   const snapshot = await expect.poll(async () => page.evaluate(() => {
     const current = (window as any).__CODELY_E2E__?.getSnapshot?.();
@@ -333,7 +373,7 @@ test("missing currentSessionId creates a new session instead of reusing an old o
       }, staleSessionId),
     )
     .toEqual({
-      sessionCount: 2,
+      sessionCount: 1,
       createdNewSession: true,
       activeCount: 1,
       currentSessionActive: true,

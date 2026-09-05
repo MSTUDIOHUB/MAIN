@@ -299,12 +299,17 @@ test("new, restored, and refreshed Plan reviews share one typed identity boundar
     path.join(workspaceRoot, "src/store/runtimeV2/planRunner.ts"),
     "utf8",
   );
+  const planCompletionSource = fs.readFileSync(
+    path.join(workspaceRoot, "src/store/runtimeV2/planCompletion.ts"),
+    "utf8",
+  );
   const workPlanAdapterSource = fs.readFileSync(
     path.join(workspaceRoot, "src/store/runtimeV2/workPlanAdapter.ts"),
     "utf8",
   );
-  assert.match(planRunnerSource, /createRuntimeV2PlanReviewCommit/);
-  assert.match(planRunnerSource, /reviewCommit/);
+  assert.match(planRunnerSource, /completeRuntimeV2Plan/);
+  assert.match(planCompletionSource, /createRuntimeV2PlanReviewCommit/);
+  assert.match(planCompletionSource, /reviewCommit/);
   assert.match(workPlanAdapterSource, /validateRuntimeV2PlanReviewCommitIntegrity/);
   assert.match(workPlanAdapterSource, /digest/);
   assert.match(workPlanAdapterSource, /projectionHash/);

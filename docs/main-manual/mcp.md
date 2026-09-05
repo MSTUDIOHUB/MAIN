@@ -11,6 +11,8 @@ sourceFeature: "MCP settings、mcpClient、Unity MCP"
 # MCP 服务器
 
 MCP 让 MAIN 连接外部工具服务器，例如 Unity、内部系统或自定义工具。
+游戏开发任务也直接在 MAIN 中完成；只要对应引擎的 MCP Server 已连接并扫描出工具，
+MAIN 就能在普通 Plan 或 Execute 流程中按权限调用它们，不需要切换专用模式。
 
 ![MCP 设置页：默认保留 Unity MCP 地址，也可以添加自己的服务器并扫描工具。](assets/screenshots/mcp-settings.png)
 
@@ -54,6 +56,6 @@ MCP 让 MAIN 连接外部工具服务器，例如 Unity、内部系统或自定�
 
 ## 下一步
 
-- 阅读 [Game Studio](game-studio.md)，了解 Unity 和游戏工作流。
+- 阅读 [MAIN 场景](main-modes.md)，了解通用任务与图像工作室的边界。
 - 阅读 [工具参考](tools-reference.md)，区分内置工具和 MCP 工具。
 - 阅读 [故障排查](troubleshooting.md)，处理 MCP 错误。

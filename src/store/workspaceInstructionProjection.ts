@@ -27,7 +27,6 @@ const WORKSPACE_TURN_INTENT_HINTS = new Set<ResolvedRunIntent>([
   "analyze",
   "summarize",
   "report",
-  "studio_workflow",
   "image_studio",
   "goal",
 ]);
@@ -180,6 +179,7 @@ export function buildWorkspaceInstructionConversationTurn(input: {
     id: input.receipt.turnId,
     clientSubmissionId: input.instruction.clientSubmissionId,
     runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(projectedIntent),
+    networkRead: input.receipt.networkRead,
     workspaceInstructionReceiptId: input.receipt.receiptId,
     workspaceInstructionSource: input.instruction.source,
     userPrompt: input.instruction.payload.text,

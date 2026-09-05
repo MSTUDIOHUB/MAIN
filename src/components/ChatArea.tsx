@@ -1182,7 +1182,9 @@ function TurnProcessDisclosure({
   if (count <= 0) return null;
   const details = [
     language === "zh" ? `${toolCount} 个工具` : `${toolCount} tool${toolCount === 1 ? "" : "s"}`,
-    language === "zh" ? `${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"}`,
+    changedFileCount > 0
+      ? (language === "zh" ? `${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"}`)
+      : "",
     elapsedSeconds > 0 ? `${Math.round(elapsedSeconds)}s` : "",
   ].filter(Boolean).join(" · ");
   const action = collapsed
@@ -2531,11 +2533,6 @@ export default function ChatArea({
   selectedMainModeKey,
   setSelectedMainModeKey,
   mainModes,
-  activeStudioAgentKey,
-  setActiveStudioAgentKey,
-  gameStudioInitialized,
-  initializeGameStudioWorkspace,
-  removeGameStudioWorkspace,
   currentWorkspace,
   handleAcceptInline,
   handleRejectInline,
@@ -3473,6 +3470,8 @@ export default function ChatArea({
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
       if (block.variant === "game_studio_local_markdown") {
+        // Preserve previously persisted local Game Studio output as read-only
+        // markdown. It no longer activates a mode or carries live UI state.
         return (
           <div key={`${block.id}-${index}`} className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
             <div className="mt-1 flex-shrink-0">
@@ -3658,7 +3657,7 @@ export default function ChatArea({
     const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
-    const shouldShowIntentBadge = displayTurnIntent === "plan" || displayTurnIntent === "studio_workflow";
+    const shouldShowIntentBadge = displayTurnIntent === "plan";
     const isPlanTurn = turnIntent === "plan";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
@@ -3789,7 +3788,8 @@ export default function ChatArea({
     // A response-style turn can still execute real tools. Process visibility is
     // driven by those durable process blocks, not by the conversational intent
     // label; pure chat without tool/progress blocks remains unaffected.
-    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks;
+    // Non-workspace (global) sessions should not display workspace steps cards.
+    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks && !isGlobalChat;
     const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
     const shouldKeepContinuousProcessTimeline =
       !turnPresentation.showStateAnchor &&
@@ -5506,11 +5506,6 @@ export default function ChatArea({
         selectedMainModeKey={selectedMainModeKey}
         setSelectedMainModeKey={setSelectedMainModeKey}
         mainModes={mainModes}
-        activeStudioAgentKey={activeStudioAgentKey}
-        setActiveStudioAgentKey={setActiveStudioAgentKey}
-        gameStudioInitialized={gameStudioInitialized}
-        initializeGameStudioWorkspace={initializeGameStudioWorkspace}
-        removeGameStudioWorkspace={removeGameStudioWorkspace}
         currentWorkspace={currentWorkspace}
         t={t}
         activeDiffTask={activeDiffTask}

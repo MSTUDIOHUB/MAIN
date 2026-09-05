@@ -1,16 +1,22 @@
+import { isChatContext } from "./readOnlyPolicy";
 import {
   RUNTIME_V2_SUBAGENT_ACCESS_MODES,
   RUNTIME_V2_SUBAGENT_TASK_KINDS,
   type ToolDefinition,
 } from "../../lib/toolSchemas";
+import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
-  RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS,
+  deriveRuntimeV2PlanExecutionFrontier,
+  deriveRuntimeV2PlanValidationCorrectionScope,
+  runtimeV2SubagentStartHasRunway,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
   RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES,
+  RUNTIME_V2_SKILL_READ_TOOL_NAMES,
   RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
   RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
@@ -18,10 +24,7 @@ import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
   deriveRuntimeV2ExecutionContract,
-  deriveRuntimeV2ExecutionContractRepair,
   runtimeV2ExecutionContractMutationTargets,
-  runtimeV2ExecutionContractReadWindow,
-  runtimeV2ExecutionContractRequired,
   type RuntimeV2ExecutionContract,
 } from "./executionContract";
 import { deriveRuntimeV2ExecutionContractAdvance } from "./executionContractAdvance";
@@ -38,14 +41,11 @@ const VALIDATION_TOOL_NAMES = new Set([
   "browser_evaluate",
 ]);
 
-export function runtimeV2SubagentStartHasRunway(input: {
-  readonly now: number;
-  readonly lifecycleDeadlineAt?: number;
-}): boolean {
-  const deadlineAt = input.lifecycleDeadlineAt;
-  return deadlineAt === undefined ||
-    !Number.isFinite(deadlineAt) ||
-    deadlineAt - input.now >= RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS;
+/** A corrective action window is backed by exact source for an existing
+ * target. `write_file` is create-only in Runtime v2 and would therefore be
+ * rejected for every target authorized by this window. */
+function isExistingSourceMutationToolName(name: string): boolean {
+  return name !== "write_file" && isWorkspaceMutationToolName(name);
 }
 
 function collaborationToolNames(input: {
@@ -87,8 +87,8 @@ function runtimeV2ToolDefinition(
   }[] = [],
   correctiveValidationCommand = "",
   executionContract: RuntimeV2ExecutionContract | null = null,
-  executionContractRequired = false,
-  acceptanceEvidenceRequirements: readonly string[] = [],
+  implementationContractMissing = false,
+  acceptanceEvidenceRequirements: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[] = [],
 ): ToolDefinition {
   if (
     definition.function.name === "read_file" &&
@@ -208,8 +208,8 @@ function runtimeV2ToolDefinition(
         ...definition.function,
         description: [
           definition.function.description,
-          executionContractRequired
-            ? "This action is required now because the parent has materialized multiple exact source owners before its first workspace mutation. Mutation and validation tools reopen after the contract is recorded."
+          implementationContractMissing
+            ? "Direct parent edits may proceed without this action. Record it before delegating an implement/write child so the child receives an evidence-backed exact scope."
             : executionContract
               ? `Revision ${executionContract.revision} is active. Revise only when new source or failed-validation evidence changes the proved solution; revision_reason is required.`
               : "",
@@ -297,17 +297,17 @@ function runtimeV2ToolDefinition(
           ...properties,
           task_kind: {
             ...properties.task_kind,
-            enum: executionContractRequired
+            enum: implementationContractMissing
               ? ["explore", "review", "validate"]
               : [...RUNTIME_V2_SUBAGENT_TASK_KINDS],
             description:
-              executionContractRequired
+              implementationContractMissing
                 ? "The parent implementation contract is not recorded yet, so only read-only explore/review/validate work may be delegated."
                 : "Task kind. explore/review/validate are read-only; implement is a planned scoped mutation.",
           },
           access_mode: {
             ...properties.access_mode,
-            enum: executionContractRequired
+            enum: implementationContractMissing
               ? ["read"]
               : [...RUNTIME_V2_SUBAGENT_ACCESS_MODES],
             description:
@@ -357,6 +357,43 @@ function runtimeV2PostMutationReviewDefinition(
   };
 }
 
+function runtimeV2PlanFrontierDefinition(
+  definition: ToolDefinition,
+  readyTargets: readonly string[],
+): ToolDefinition {
+  if (!isWorkspaceMutationToolName(definition.function.name)) {
+    return definition;
+  }
+  const properties = definition.function.parameters.properties;
+  const path = properties.path;
+  return {
+    ...definition,
+    function: {
+      ...definition.function,
+      description: [
+        definition.function.description,
+        `The approved WorkPlan dependency frontier currently authorizes only: ${readyTargets.join(", ")}.`,
+      ].join(" "),
+      ...(path && readyTargets.length > 0
+        ? {
+            parameters: {
+              ...definition.function.parameters,
+              properties: {
+                ...properties,
+                path: {
+                  ...path,
+                  enum: [...readyTargets],
+                  description:
+                    `Exact current WorkPlan frontier target: ${readyTargets.join(", ")}.`,
+                },
+              },
+            },
+          }
+        : {}),
+    },
+  };
+}
+
 /**
  * Keep safe inspection available throughout Execute while making validation
  * debt executable rather than advisory. Validate also retains mutation tools:
@@ -369,11 +406,32 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
   readonly available: readonly ToolDefinition[];
+  readonly capabilityRegistry?: ToolCapabilityRegistry;
   readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
   readonly correctiveSourceTargets?: readonly string[];
   readonly correctiveValidationCommand?: string;
 }): ToolDefinition[] {
   const mode = String(input.command.payload.mode || "").trim();
+  const mcpRiskFor = (name: string) => {
+    const capability = input.capabilityRegistry?.tools[name];
+    return capability?.source === "mcp" && capability.enabled
+      ? capability.risk
+      : null;
+  };
+  const isMcpObservation = (name: string) => {
+    const risk = mcpRiskFor(name);
+    return risk === "read_only" ||
+      risk === "external_read" ||
+      risk === "local_file_read";
+  };
+  const isMcpEffect = (name: string) => {
+    const risk = mcpRiskFor(name);
+    return risk === "workspace_write" ||
+      risk === "external_write" ||
+      risk === "browser_control" ||
+      risk === "desktop_control" ||
+      risk === "destructive";
+  };
   const collaboration = collaborationToolNames(input);
   const aggregate = typeof input.ports.get === "function"
     ? aggregateForCurrentTurn(input.ports)
@@ -382,16 +440,41 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const executionContract = directExecute
     ? deriveRuntimeV2ExecutionContract(aggregate)
     : null;
-  const executionContractRequired = directExecute &&
-    runtimeV2ExecutionContractRequired(aggregate);
-  const executionContractReadWindow =
-    runtimeV2ExecutionContractReadWindow(aggregate);
   const executionContractAdvance =
     deriveRuntimeV2ExecutionContractAdvance(aggregate);
-  const executionContractRepair =
-    deriveRuntimeV2ExecutionContractRepair(aggregate);
   const validationCorrection =
     deriveRuntimeV2ValidationCorrectionWindow(aggregate);
+  const planFrontier = aggregate
+    ? deriveRuntimeV2PlanExecutionFrontier(aggregate)
+    : null;
+  const planValidationCorrection = aggregate
+    ? deriveRuntimeV2PlanValidationCorrectionScope(aggregate)
+    : null;
+  const readyPlanOperations = new Set(planFrontier?.steps
+    .filter((step) => step.status === "ready")
+    .map((step) => step.operation) || []);
+  const planToolAllowed = (definition: ToolDefinition): boolean => {
+    if (!planFrontier) return true;
+    const name = definition.function.name;
+    // Approved WorkPlan mutation steps are exact workspace operations. MCP
+    // effects have permission risk but no path-scoped Plan contract yet.
+    if (isMcpEffect(name)) return false;
+    if (VALIDATION_TOOL_NAMES.has(name)) {
+      return planFrontier.validationReady && !planValidationCorrection?.active;
+    }
+    if (!isWorkspaceMutationToolName(name)) return true;
+    if (planValidationCorrection?.active) {
+      return name === "replace_in_file" || name === "apply_patch";
+    }
+    if (planFrontier.readyMutationTargets.length === 0) return false;
+    if (name === "write_file") return readyPlanOperations.has("create");
+    if (name === "replace_in_file") return readyPlanOperations.has("modify");
+    if (name === "delete_workspace_path") return readyPlanOperations.has("delete");
+    return true;
+  };
+  const available = input.available.filter(planToolAllowed);
+  const implementationContractMissing = !directExecute ||
+    (!executionContract && !validationCorrection.active);
   // A real failed acceptance receipt is newer evidence than the model's
   // pre-edit implementation outline. Keeping the old contract enum on editor
   // schemas here can make the diagnosed owner impossible to change, so the
@@ -399,8 +482,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const mutationScopeContract = validationCorrection.active
     ? null
     : executionContract;
-  const adapt = (definition: ToolDefinition) =>
-    runtimeV2ToolDefinition(
+  const adapt = (definition: ToolDefinition) => {
+    const adapted = runtimeV2ToolDefinition(
       definition,
       mode,
       input.actionWindow,
@@ -408,27 +491,55 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       validationCorrection.diagnosticSourceHints,
       input.correctiveValidationCommand,
       mutationScopeContract,
-      executionContractRequired,
+      implementationContractMissing,
       aggregate?.objective?.acceptanceEvidenceRequirements || [],
     );
+    if (!planFrontier) return adapted;
+    const name = adapted.function.name;
+    const operation = name === "write_file"
+      ? "create"
+      : name === "replace_in_file"
+        ? "modify"
+        : name === "delete_workspace_path"
+          ? "delete"
+          : null;
+    const readyTargets = planValidationCorrection?.active
+      ? planValidationCorrection.targets
+      : operation
+      ? planFrontier.steps.flatMap((step) =>
+        step.status === "ready" && step.operation === operation
+          ? [...step.targets]
+          : []
+      )
+      : planFrontier.readyMutationTargets;
+    return runtimeV2PlanFrontierDefinition(adapted, readyTargets);
+  };
   if (mode === "conclude") {
-    return input.available.filter((definition) =>
+    if (input.command.payload.conclusionKind === "read_only") return [];
+    return available.filter((definition) =>
       definition.function.name === "wait_subagents" &&
       collaboration.has("wait_subagents")
     ).map(adapt);
   }
+  if (mode === "chat" || isChatContext(input.ports)) {
+    return available.filter((definition) => ["load_skill", "web_search", "web_fetch"].includes(definition.function.name)).map(adapt);
+  }
   if (mode === "analyze") {
     if (!String(input.ports.context.runWorkspace || "").trim()) {
-      return input.available.filter((definition) =>
-        RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(
-          definition.function.name,
-        )
-      ).map(adapt);
+      return available.filter((definition) => {
+        const name = definition.function.name;
+        return RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name) ||
+          RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
+          RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+          isMcpObservation(name);
+      }).map(adapt);
     }
-    return input.available.filter((definition) => {
+    return available.filter((definition) => {
       const name = definition.function.name;
       return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+        RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
         RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+        isMcpObservation(name) ||
         collaboration.has(name);
     }).map(adapt);
   }
@@ -437,11 +548,11 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     input.actionWindow === "validation_handoff"
   ) {
     if (input.correctiveValidationCommand) {
-      return input.available.filter((definition) =>
+      return available.filter((definition) =>
         definition.function.name === "run_command"
       ).map(adapt);
     }
-    return input.available.filter((definition) =>
+    return available.filter((definition) =>
       VALIDATION_TOOL_NAMES.has(definition.function.name)
     ).map(adapt);
   }
@@ -449,7 +560,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     (mode === "execute" || mode === "validate") &&
     input.actionWindow === "corrective_source"
   ) {
-    return input.available.filter((definition) =>
+    return available.filter((definition) =>
       definition.function.name === "read_file"
     ).map(adapt);
   }
@@ -457,36 +568,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     (mode === "execute" || mode === "validate") &&
     input.actionWindow === "corrective_mutation"
   ) {
-    return input.available.filter((definition) =>
-      isWorkspaceMutationToolName(definition.function.name)
-    ).map(adapt);
-  }
-  if (
-    mode === "execute" &&
-    executionContractRequired &&
-    !executionContractRepair
-  ) {
-    return input.available.filter((definition) => {
-      const name = definition.function.name;
-      if (name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) return true;
-      if (executionContractReadWindow.closed) {
-        return name === "wait_subagents" &&
-          collaboration.has("wait_subagents");
-      }
-      return (
-        RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
-        RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
-        collaboration.has(name)
-      );
-    }).map(adapt);
-  }
-  if (
-    (mode === "execute" || mode === "validate") &&
-    executionContractRepair
-  ) {
-    return input.available.filter((definition) =>
-      definition.function.name ===
-      RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
+    return available.filter((definition) =>
+      isExistingSourceMutationToolName(definition.function.name)
     ).map(adapt);
   }
   if (
@@ -498,7 +581,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     // Previously closed_recovery could expose only run_command here, while
     // authorization correctly rejected that same command as premature. Keep
     // the advertised surface and the hard contract boundary consistent.
-    return input.available.filter((definition) => {
+    return available.filter((definition) => {
       const name = definition.function.name;
       return name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME ||
         isWorkspaceMutationToolName(name) ||
@@ -510,12 +593,12 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     input.actionWindow === "closed_recovery"
   ) {
     if (input.correctiveValidationCommand) {
-      return input.available.filter((definition) =>
+      return available.filter((definition) =>
         definition.function.name === "run_command"
       ).map(adapt);
     }
-    return input.available.filter((definition) =>
-      isWorkspaceMutationToolName(definition.function.name)
+    return available.filter((definition) =>
+      isExistingSourceMutationToolName(definition.function.name)
     ).map(adapt);
   }
   if (
@@ -529,7 +612,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
         // handoff report incomplete validation instead of cycling commands.
         return [];
       }
-      return input.available.filter((definition) =>
+      return available.filter((definition) =>
         VALIDATION_TOOL_NAMES.has(definition.function.name)
       ).map(adapt);
     }
@@ -538,9 +621,10 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     // visibility and mutation preflight: that creates contradictory states in
     // which the only advertised read is simultaneously forbidden. Validation
     // remains withheld until a real mutation establishes a new boundary.
-    return input.available.filter((definition) => {
+    return available.filter((definition) => {
       const name = definition.function.name;
       return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+        RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
         isWorkspaceMutationToolName(name) ||
         collaboration.has(name);
     }).map(adapt);
@@ -553,15 +637,15 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       !executionContractAdvance.sourceReviewAvailable
     ) {
       if (input.correctiveValidationCommand) {
-        return input.available.filter((definition) =>
+        return available.filter((definition) =>
           definition.function.name === "run_command"
         ).map(adapt);
       }
-      return input.available.filter((definition) =>
+      return available.filter((definition) =>
         VALIDATION_TOOL_NAMES.has(definition.function.name)
       ).map(adapt);
     }
-    return input.available.filter((definition) => {
+    return available.filter((definition) => {
       const name = definition.function.name;
       return name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME ||
         isWorkspaceMutationToolName(name) ||
@@ -577,7 +661,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     );
   }
   if (mode === "validate") {
-    return input.available.filter((definition) => {
+    return available.filter((definition) => {
       const name = definition.function.name;
       if (VALIDATION_TOOL_NAMES.has(name)) {
         return true;
@@ -593,17 +677,23 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       }
       return !input.actionWindow && (
         RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+        RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
         RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
+        isMcpObservation(name) ||
+        isMcpEffect(name) ||
         collaboration.has(name)
       );
     }).map(adapt);
   }
-  return input.available.filter((definition) => {
+  return available.filter((definition) => {
     const name = definition.function.name;
     return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+      RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
       RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
       isWorkspaceMutationToolName(name) ||
       VALIDATION_TOOL_NAMES.has(name) ||
+      isMcpObservation(name) ||
+      isMcpEffect(name) ||
       (directExecute &&
         name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) ||
       collaboration.has(name);

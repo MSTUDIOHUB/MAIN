@@ -276,6 +276,9 @@ function exactValueMatchesToolSchema(
   if (schema.type === "number") {
     return typeof value === "number" && Number.isFinite(value);
   }
+  if (schema.type === "integer") {
+    return typeof value === "number" && Number.isInteger(value);
+  }
   if (schema.type === "boolean") return typeof value === "boolean";
   if (schema.type === "array") {
     return Array.isArray(value) &&

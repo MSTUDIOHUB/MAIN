@@ -91,7 +91,6 @@ function createContext(overrides = {}) {
     language: "zh",
     mainModeKey: "main_mode",
     hasWorkspace: false,
-    parsedStudioCommand: null,
     hasPlanArtifacts: false,
     planStage: "idle",
     isPlanApproved: false,
@@ -99,9 +98,11 @@ function createContext(overrides = {}) {
   };
 }
 
-test("MAIN mode keys exclude legacy Task Center and migrate old value", () => {
-  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "game_studio", "image_studio"]);
+test("MAIN mode keys exclude removed modes and migrate old values", () => {
+  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "image_studio"]);
   assert.equal(mapLegacyNexusModeToMainMode("task_center"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("game_studio"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("nexus_game_studio"), "main_mode");
   assert.equal(mapLegacyNexusModeToMainMode("image_studio"), "image_studio");
 });
 
@@ -664,29 +665,6 @@ test("MAIN intent shortcuts no longer parse /执行 or /execute", () => {
   assert.equal(parseMainIntentShortcut("/execute fix this issue"), null);
 });
 
-test("game studio only exposes plan shortcut from MAIN shortcut set", () => {
-  const studioShortcutsZh = getMainIntentShortcuts("zh", { mainModeKey: "game_studio" });
-  const studioShortcutsEn = getMainIntentShortcuts("en", { mainModeKey: "game_studio" });
-
-  assert.deepEqual(studioShortcutsZh.map((item) => item.intent), ["plan"]);
-  assert.deepEqual(studioShortcutsEn.map((item) => item.intent), ["plan"]);
-});
-
-test("mode-aware shortcut parsing keeps only /plan in game studio", () => {
-  assert.equal(parseMainIntentShortcutForMode("/报告 输出报告", "game_studio"), null);
-  assert.equal(parseMainIntentShortcutForMode("/report output report", "game_studio"), null);
-  assert.deepEqual(parseMainIntentShortcutForMode("/计划 先出方案", "game_studio"), {
-    intent: "plan",
-    command: "/计划",
-    rest: "先出方案",
-  });
-  assert.deepEqual(parseMainIntentShortcutForMode("/plan write a plan first", "game_studio"), {
-    intent: "plan",
-    command: "/计划",
-    rest: "write a plan first",
-  });
-});
-
 test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", () => {
   assert.deepEqual(parseMainDebugShortcut("/MDEBUG 反馈内容"), {
     command: "/MDEBUG",
@@ -718,21 +696,6 @@ test("composer suggestion keeps explicit slash intent without semantic output-st
   });
 
   assert.equal(parseMainIntentShortcut("/计划 帮我总结这段内容").intent, "plan");
-  assert.equal(suggestion, null);
-});
-
-test("game studio suggestion never upgrades /plan to non-plan output styles", () => {
-  const suggestion = resolveComposerIntentSuggestion({
-    input: "/计划 帮我总结这段内容",
-    language: "zh",
-    mainModeKey: "game_studio",
-    lockedComposerIntent: null,
-    dismissedSuggestedIntentKey: null,
-    hasPlanArtifacts: false,
-    planStage: "idle",
-    isPlanApproved: false,
-  });
-
   assert.equal(suggestion, null);
 });
 
@@ -823,24 +786,7 @@ test("high-risk multi-step implementation suggests planning first", () => {
   assert.equal(result.riskLevel, "high");
 });
 
-test("game studio workflow slash bypasses MAIN plan interception", () => {
-  const result = resolveTurnRunIntent(
-    "/setup-engine unity",
-    createContext({
-      mainModeKey: "game_studio",
-      parsedStudioCommand: {
-        type: "workflow",
-        slug: "setup-engine",
-        args: "unity",
-        canonicalCommand: "/setup-engine",
-      },
-    }),
-  );
-  assert.equal(result.intent, "studio_workflow");
-  assert.equal(result.bypassMainRouter, true);
-});
-
-test("game studio explicit implementation text enters execute workflow", () => {
+test("game-development implementation text enters the shared MAIN execute workflow", () => {
   for (const input of [
     "立即开始重构并完善",
     "继续实现 SnakeController",
@@ -849,21 +795,17 @@ test("game studio explicit implementation text enters execute workflow", () => {
   ]) {
     const result = resolveTurnRunIntent(
       input,
-      createContext({
-        mainModeKey: "game_studio",
-      }),
+      createContext(),
     );
     assert.equal(result.intent, "execute", input);
     assert.equal(result.needsDecision, undefined, input);
   }
 });
 
-test("game studio ordinary explanatory text still defaults to respond", () => {
+test("game-development explanatory text still defaults to respond", () => {
   const result = resolveTurnRunIntent(
     "帮我解释一下当前玩法思路",
-    createContext({
-      mainModeKey: "game_studio",
-    }),
+    createContext(),
   );
   assert.equal(result.intent, "respond");
 });
@@ -965,7 +907,7 @@ test("store forces auto-approved visible turns into execution semantics", () => 
   assert.match(submitIntentRoutingSource, /const shouldForceExecuteForAutoApprove =\s*initialIntentDecision\.shouldForceExecuteForAutoApprove/);
   assert.match(turnSubmissionSource, /const shouldForceExecuteForAutoApprove =/);
   assert.match(turnSubmissionSource, /autoApproveTools === true/);
-  assert.match(turnSubmissionSource, /effectiveRunIntent = currentMainModeKey === "game_studio" \? "studio_workflow" : "execute"/);
+  assert.match(turnSubmissionSource, /effectiveRunIntent = "execute"/);
   assert.match(submitIntentRoutingSource, /!shouldForceExecuteForAutoApprove &&\s*!input\.options\?\.skipIntentResolution/);
   assert.match(source, /const runtimeDecision = resolveSubmitRuntimeDecision/);
   assert.match(source, /shouldExecuteOnceFromReplyOption,\s*preservePlanState,/);

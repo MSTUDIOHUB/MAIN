@@ -60,7 +60,6 @@ import {
   projectSubagentRuns,
   SUBAGENT_CLOSURE_SCHEMA_VERSION,
 } from "./subagents";
-import type { NexusModeKey } from "./gameStudio/catalog";
 import {
   isCloudSettingsScenario,
   seedCloudSettingsScenario,
@@ -73,7 +72,10 @@ import {
 } from "./turnRuntimeContract";
 import { createTurnRuntimeCheckpoint } from "./turnRuntimeCheckpoint";
 import { buildAssistantStageCheckpoint } from "./assistantProgressPresentation";
-import { normalizeRuntimeV2Checkpoint } from "./runtime-v2";
+import {
+  deriveRuntimeV2PlanExecutionFrontier,
+  normalizeRuntimeV2Checkpoint,
+} from "./runtime-v2";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -100,9 +102,7 @@ const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO =
   "read-context-persistent-progress";
 const OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO = "opencode-transcript-display";
 const PROCESS_DISPLAY_SCENARIO = "process-display";
-const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
-const GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO = "game-studio-plan-shortcuts";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const COMPOSER_RUNNING_GUIDANCE_SCENARIO = "composer-running-guidance";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
@@ -126,9 +126,8 @@ const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO =
 const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO =
   "execution-capsule-orphan-pending-review";
 const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "execution-capsule-panel-stability";
-const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO =
-  "game-studio-tool-group-collapse";
-const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
+const TOOL_GROUP_COLLAPSE_SCENARIO = "tool-group-collapse";
+const TOOL_GROUP_AWAITING_CHOICE_SCENARIO = "tool-group-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
 const CAPSULE_PHASE_FALLBACK_SCENARIO = "capsule-phase-fallback";
@@ -2167,11 +2166,11 @@ function seedPlanReloadResumeScenario() {
         content: "# Requirements\n\n- 批准后应允许继续执行剩余任务。\n",
       },
       {
-        kind: "design" as const,
+        kind: "plan" as const,
         path: ".MAIN/plans/plan.md",
-        title: "Design",
+        title: "Plan",
         updatedAt: now - 2_000,
-        content: "# Design\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
+        content: "# Plan\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
       },
       {
         kind: "tasks" as const,
@@ -2382,13 +2381,19 @@ function seedPlanReloadResumeScenario() {
           text: "恢复计划工作区状态",
           status: "completed",
           evidenceStatus: "satisfied",
+          executionKind: "mutation",
+          evidence: [{ kind: "file", value: "src/planWorkspace.ts" }],
         },
         {
           id: "reload-task-2",
           text: "恢复对话与执行任务进度",
           status: "in_progress",
+          executionKind: "mutation",
+          evidence: [{ kind: "file", value: "src/planProgress.ts" }],
         },
-        { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending" },
+        { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending",
+          executionKind: "validation", evidence: [{ kind: "cmd", value: "npm test" }],
+        },
       ],
       planExecutionEvidenceLedger: [
         {
@@ -2912,7 +2917,6 @@ function seedFeishuRemoteAnalysisScenario() {
     currentSessionId: sessionId,
     mcpServers: [],
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [
       {
         id: userBlockId,
@@ -3965,7 +3969,6 @@ function seedProcessDisplayScenario() {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "验证过程显示。" },
       {
@@ -7157,7 +7160,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
   return cleanup;
 }
 
-function seedGameStudioToolGroupScenario(
+function seedToolGroupScenario(
   status: "executing" | "awaiting_input",
 ) {
   const bridge = getBridge();
@@ -7169,14 +7172,14 @@ function seedGameStudioToolGroupScenario(
 
   const workspace =
     status === "executing"
-    ? "/tmp/e2e-game-studio-tool-group"
-    : "/tmp/e2e-game-studio-awaiting-choice";
+    ? "/tmp/e2e-tool-group"
+    : "/tmp/e2e-tool-group-awaiting-choice";
   const sessionId = status === "executing" ? 999611 : 999612;
   const now = Date.now();
   const turnId =
     status === "executing"
-    ? "e2e-game-studio-tool-group-turn"
-    : "e2e-game-studio-awaiting-choice-turn";
+    ? "e2e-tool-group-turn"
+    : "e2e-tool-group-awaiting-choice-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const completedAId = useAppStore.getState()._nextTaskId();
   const thoughtBlockId = useAppStore.getState()._nextTaskId();
@@ -7190,47 +7193,47 @@ function seedGameStudioToolGroupScenario(
       id: userBlockId,
       turnId,
       type: "user" as const,
-      content: "继续排查 Main Camera 行为。",
+      content: "继续排查工作区配置加载行为。",
     },
     {
       id: completedAId,
       turnId,
       type: "tool" as const,
-      toolName: "find_gameobjects",
-      target: "Main Camera",
+      toolName: "read_file",
+      target: "src/config.ts",
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
-      intentSummary: "定位 Main Camera 对象",
+      intentSummary: "定位配置加载入口",
     },
     {
       id: thoughtBlockId,
       turnId,
       type: "thought" as const,
-      content: "我需要先核对 Main Camera 状态，再继续调用相机管理工具。",
+      content: "我需要先核对配置入口，再继续检查加载行为。",
       isStreaming: false,
     },
     {
       id: completedBId,
       turnId,
       type: "tool" as const,
-      toolName: "manage_camera",
-      target: "Main Camera",
+      toolName: "execute_command",
+      target: "node scripts/inspect-config.mjs",
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
-      intentSummary: "核对 Main Camera 当前相机参数",
+      intentSummary: "核对当前配置加载参数",
     },
     {
       id: completedCId,
       turnId,
       type: "tool" as const,
-      toolName: "execute_code",
-      target: "Assets/Scripts/Camera/SnakeCameraController.cs",
+      toolName: "browser_evaluate",
+      target: "http://localhost/config",
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
-      intentSummary: "读取控制脚本确认行为",
+      intentSummary: "运行配置加载验证",
     },
   ];
 
@@ -7239,13 +7242,13 @@ function seedGameStudioToolGroupScenario(
       id: tailToolId,
       turnId,
       type: "tool",
-      toolName: "manage_camera",
-      target: "Main Camera",
+      toolName: "read_file",
+      target: "src/config.ts",
       status: "running",
       toolStatus: "running",
       message: "Executing...",
       intentSummary:
-        "继续调整 Main Camera 视角\n**视角偏移** 需要用工具结果确认后再继续。",
+        "继续检查配置加载顺序\n**加载顺序** 需要用工具结果确认后再继续。",
     });
   } else {
     taskFlow.push({
@@ -7255,8 +7258,8 @@ function seedGameStudioToolGroupScenario(
       content: "请选择下一步。",
       options: [
         {
-          label: "继续分析 Main Camera",
-          value: "继续分析 Main Camera",
+          label: "继续分析配置加载",
+          value: "继续分析配置加载",
           action: "continue_readonly_once",
         },
         {
@@ -7268,10 +7271,10 @@ function seedGameStudioToolGroupScenario(
       choiceRequest: {
         sessionKey: `${workspace}:${sessionId}`,
         turnId,
-        runId: "run-e2e-game-studio-choice",
-        requestId: "request-e2e-game-studio-choice",
+        runId: "run-e2e-tool-group-choice",
+        requestId: "request-e2e-tool-group-choice",
         parentRunId: null,
-        optionValues: ["继续分析 Main Camera", "本会话只读全部允许"],
+        optionValues: ["继续分析配置加载", "本会话只读全部允许"],
         allowCustomReply: true,
         status: "pending",
       },
@@ -7286,8 +7289,7 @@ function seedGameStudioToolGroupScenario(
       language: "zh",
       workflowMode: "edit",
     },
-    selectedMainModeKey: "game_studio",
-    selectedNexusModeKey: "nexus_game_studio",
+    selectedMainModeKey: "main_mode",
     currentWorkspace: workspace,
     sessionsByWorkspace: {
       [workspace]: [
@@ -7295,8 +7297,8 @@ function seedGameStudioToolGroupScenario(
           id: sessionId,
           title:
             status === "executing"
-            ? "E2E Game Studio Tool Group Collapse"
-            : "E2E Game Studio Awaiting Choice",
+            ? "E2E Tool Group Collapse"
+            : "E2E Tool Group Awaiting Choice",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -7308,15 +7310,15 @@ function seedGameStudioToolGroupScenario(
     conversationTurns: [
       {
         id: turnId,
-        userPrompt: "继续排查 Main Camera 行为。",
+        userPrompt: "继续排查工作区配置加载行为。",
         title: status === "executing" ? "工具折叠回归" : "等待选择状态回归",
         mode: "edit",
-        intent: "studio_workflow",
+        intent: "execute",
         status,
         summary:
           status === "executing"
-            ? "Game Studio 连续工具调用中。"
-            : "Game Studio 已暂停等待选择。",
+            ? "MAIN 连续工具调用中。"
+            : "MAIN 已暂停等待选择。",
         blockIds: taskFlow.map((block) => block.id),
         collapsed: false,
         createdAt: now,
@@ -7333,8 +7335,8 @@ function seedGameStudioToolGroupScenario(
 
   bindBridgeSnapshot(
     status === "executing"
-      ? GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO
-      : GAME_STUDIO_AWAITING_CHOICE_SCENARIO,
+      ? TOOL_GROUP_COLLAPSE_SCENARIO
+      : TOOL_GROUP_AWAITING_CHOICE_SCENARIO,
   );
 
   const cleanup = () => {
@@ -7544,7 +7546,6 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       workflowMode: "edit",
     },
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     currentWorkspace: workspace,
     sessionsByWorkspace: {
       [workspace]: [
@@ -7758,7 +7759,6 @@ function seedGoalCapsuleScenario() {
     ...state,
     config: { ...state.config, language: "zh", workflowMode: "edit" },
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
     workspaces: [
@@ -8107,184 +8107,27 @@ function seedGoalCapsuleScenario() {
   return cleanup;
 }
 
-function seedGameStudioOnboardingScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  const workspace = "/tmp/e2e-game-studio";
-  const sessionId = 999005;
-  const now = Date.now();
-
-  const mockSendMessage = (
-    text: string,
-    _images?: string[],
-    _options?: {
-      hidden?: boolean;
-      reuseCurrentTurn?: boolean;
-      preservePlanState?: boolean;
-    },
-  ): boolean => {
-    appendBridgeEvent("send", { text });
-    const userBlockId = useAppStore.getState()._nextTaskId();
-    const turnId = `e2e-game-studio-turn-${userBlockId}`;
-
-    useAppStore.setState((state) => ({
-      ...state,
-      input: "",
-      pendingSlashCommand: null,
-      taskFlow: [
-        ...state.taskFlow,
-        {
-          id: userBlockId,
-          turnId,
-          type: "user",
-          content: text,
-        },
-      ],
-      conversationTurns: [
-        ...state.conversationTurns,
-        {
-          id: turnId,
-          userPrompt: text,
-          title: "E2E Game Studio",
-          mode: "chat",
-          status: "done",
-          summary: "E2E seeded Game Studio send completed.",
-          blockIds: [userBlockId],
-          collapsed: false,
-          createdAt: Date.now(),
-        },
-      ],
-      currentTurnId: turnId,
-    }));
-
-    return true;
-  };
-
-  const mockInitializeGameStudioWorkspace = async () => {
-    appendBridgeEvent("initialized");
-    useAppStore.setState((state) => ({
-      ...state,
-      gameStudioInitialized: true,
-    }));
-  };
-
-  const mockRemoveGameStudioWorkspace = async () => {
-    appendBridgeEvent("removed");
-    useAppStore.setState((state) => ({
-      ...state,
-      gameStudioInitialized: false,
-      activeStudioAgentKey: "studio_auto",
-      pendingSlashCommand: null,
-    }));
-  };
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      themeMode: "dark",
-      workflowMode: "chat",
-    },
-    currentWorkspace: workspace,
-    sessionsByWorkspace: {
-      [workspace]: [
-        {
-          id: sessionId,
-          title: "E2E Game Studio",
-          date: new Date(now).toISOString(),
-          active: true,
-          messages: [],
-          runtimeSnapshot: {
-            taskFlow: [],
-            agentMessages: [],
-            conversationTurns: [],
-            currentTurnId: null,
-            selectedMainModeKey: "game_studio",
-            selectedNexusModeKey: "nexus_game_studio",
-            activeStudioAgentKey: "studio_auto",
-            gameStudioInitialized: false,
-            pendingSlashCommand: null,
-            planArtifacts: [],
-            planTasks: [],
-            planExecutionEvidenceLedger: [],
-            planExecutionEvidenceCount: 0,
-            planStage: "idle",
-            isPlanApproved: false,
-            showPlanPanel: false,
-            showDiff: false,
-            showTerminal: false,
-            showFilePanel: false,
-            rightPanelTab: "plan",
-            selectedDiffTaskId: null,
-          },
-        },
-      ],
-    },
-    currentSessionId: sessionId,
-    selectedMainModeKey: "game_studio",
-    selectedNexusModeKey: "nexus_game_studio",
-    activeStudioAgentKey: "studio_auto",
-    gameStudioInitialized: false,
-    pendingSlashCommand: null,
-    taskFlow: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    showAgentPicker: false,
-    showWorkflowMenu: false,
-    isGenerating: false,
-    agentStatus: "idle",
-    initializeGameStudioWorkspace: mockInitializeGameStudioWorkspace,
-    removeGameStudioWorkspace: mockRemoveGameStudioWorkspace,
-    sendMessage: mockSendMessage,
-  }));
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    return {
-      input: state.input,
-      themeMode: state.config.themeMode,
-      conversationTurns: state.conversationTurns.length,
-      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user")
-        .length,
-      gameStudioInitialized: state.gameStudioInitialized,
-      selectedMainModeKey: state.selectedMainModeKey,
-      selectedNexusModeKey: state.selectedNexusModeKey,
-      seedCount: readSeedCount(GAME_STUDIO_ONBOARDING_SCENARIO),
-    };
-  };
-  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
-    useAppStore.getState().setConfig((prev) => ({
-      ...prev,
-      themeMode: mode,
-    }));
-  };
-  bridge.setNexusMode = (mode: NexusModeKey) => {
-    useAppStore.getState().setSelectedNexusModeKey(mode);
-  };
-  bridge.resetComposer = () => {
-    useAppStore.getState().setInput("");
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
 function seedComposerMainShortcutsScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
+
+  let providerDispatchAttemptCount = 0;
+  const originalDispatchNextWorkspaceInstruction =
+    useAppStore.getState().dispatchNextWorkspaceInstruction;
+  const holdProviderlessComposerAdmissionInFifo:
+    typeof originalDispatchNextWorkspaceInstruction = (expectedSessionKey) => {
+      providerDispatchAttemptCount += 1;
+      const state = useAppStore.getState();
+      const hints = state.workspaceTurnQueue?.entries[0]?.instruction.payload
+        .dispatchHints;
+      if (
+        hints?.resolvedIntent === "goal" ||
+        hints?.runtimeIntentOverride === "goal"
+      ) {
+        return originalDispatchNextWorkspaceInstruction(expectedSessionKey);
+      }
+      return false;
+    };
 
   bridge.events = [{ type: "boot" }];
   bridge.savedDocuments = [];
@@ -8304,14 +8147,15 @@ function seedComposerMainShortcutsScenario() {
     sessionsByWorkspace: {},
     currentSessionId: null,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
-    activeStudioAgentKey: "studio_auto",
-    gameStudioInitialized: false,
-    pendingSlashCommand: null,
     taskFlow: [],
     agentMessages: [],
     conversationTurns: [],
     currentTurnId: null,
+    workspaceTurnQueue: null,
+    workspaceInstructionLedger: [],
+    workspaceContentVersion: 0,
+    resolvedInstructionSet: null,
+    instructionSources: [],
     input: "",
     attachedFiles: [],
     contextMentions: [],
@@ -8333,42 +8177,36 @@ function seedComposerMainShortcutsScenario() {
     rightPanelTab: "plan",
     selectedDiffTaskId: null,
     lockedComposerIntent: null,
+    // Direct and Plan cases here verify Composer input and durable admission
+    // only. They have no provider/tool transport, so keep those Turns in FIFO
+    // instead of feeding immediate null responses into the recovery loop.
+    // Goal cases retain their deterministic Goal admission lifecycle.
+    dispatchNextWorkspaceInstruction: holdProviderlessComposerAdmissionInFifo,
   }));
 
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
+    const observedTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : state.currentWorkspace === "/tmp/e2e-composer-main-shortcuts"
+        ? state.conversationTurns[state.conversationTurns.length - 1] || null
+        : null;
     return {
       input: state.input,
       selectedMainModeKey: state.selectedMainModeKey,
       lockedComposerIntent: state.lockedComposerIntent,
-      currentTurnIntent: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.intent ?? null)
-        : null,
-      currentTurnDisplayIntent: state.currentTurnId
-        ? (() => {
-            const turn = state.conversationTurns.find(
-              (candidate) => candidate.id === state.currentTurnId,
-            );
-            return turn?.displayIntent ?? turn?.intent ?? null;
-          })()
-        : null,
-      currentTurnTitle: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.title ?? null)
-        : null,
-      currentTurnPrompt: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.userPrompt ?? null)
-        : null,
-      currentTurnStatus: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.status ?? null)
-        : null,
+      currentTurnIntent: observedTurn?.intent ?? null,
+      currentTurnDisplayIntent:
+        observedTurn?.displayIntent ?? observedTurn?.intent ?? null,
+      currentTurnTitle: observedTurn?.title ?? null,
+      currentTurnPrompt: observedTurn?.userPrompt ?? null,
+      currentTurnStatus: observedTurn?.status ?? null,
+      conversationTurnCount: state.conversationTurns.length,
+      workspaceInstructionLedgerCount: state.workspaceInstructionLedger.length,
+      workspaceTurnQueueCount: state.workspaceTurnQueue?.entries.length ?? 0,
+      providerDispatchAttemptCount,
+      workspaceContentVersion: state.workspaceContentVersion,
+      instructionSourcePaths: state.instructionSources.map((source) => source.path || source.name),
       currentWorkspace: state.currentWorkspace,
       activeGoalId: state.activeGoal?.id ?? null,
       isGenerating: state.isGenerating,
@@ -8395,6 +8233,22 @@ function seedComposerMainShortcutsScenario() {
       agentStatus: input.agentStatus,
     });
   };
+
+  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
+    useAppStore.setState((state) => ({
+      config: { ...state.config, themeMode: mode },
+    }));
+  };
+
+  bridge.admitProjectInitDirect = () =>
+    useAppStore.getState().acceptWorkspaceInstruction({
+      text: "/init",
+      source: "composer",
+      clientSubmissionId: "e2e-direct-project-init",
+    });
+
+  bridge.sendProjectInitDirect = () =>
+    useAppStore.getState().sendMessage("/init");
 
   bridge.switchComposerSubmissionWorkspace = (workspace: string) => {
     useAppStore.setState({
@@ -8428,158 +8282,9 @@ function seedComposerMainShortcutsScenario() {
   };
 
   const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedGameStudioPlanShortcutsScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO);
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      workflowMode: "chat",
-    },
-    currentWorkspace: "/tmp/e2e-game-studio-plan-shortcuts",
-    selectedWorkspace: "/tmp/e2e-game-studio-plan-shortcuts",
-    sessionsByWorkspace: {},
-    currentSessionId: null,
-    selectedMainModeKey: "game_studio",
-    selectedNexusModeKey: "nexus_game_studio",
-    activeStudioAgentKey: "studio_auto",
-    gameStudioInitialized: false,
-    pendingSlashCommand: null,
-    taskFlow: [],
-    agentMessages: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    showAgentPicker: false,
-    showWorkflowMenu: false,
-    isGenerating: false,
-    agentStatus: "idle",
-    elapsedTime: 0,
-    planArtifacts: [],
-    planTasks: [],
-    planExecutionEvidenceLedger: [],
-    planExecutionEvidenceCount: 0,
-    planStage: "idle",
-    isPlanApproved: false,
-    showPlanPanel: false,
-    showDiff: false,
-    showTerminal: false,
-    showFilePanel: false,
-    rightPanelTab: "plan",
-    selectedDiffTaskId: null,
-    lockedComposerIntent: null,
-  }));
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    return {
-      input: state.input,
-      selectedMainModeKey: state.selectedMainModeKey,
-      lockedComposerIntent: state.lockedComposerIntent,
-      currentTurnId: state.currentTurnId,
-      turnIds: state.conversationTurns.map((turn) => turn.id),
-      currentTurnIntent: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.intent ?? null)
-        : null,
-      currentTurnDisplayIntent: state.currentTurnId
-        ? (() => {
-            const turn = state.conversationTurns.find(
-              (candidate) => candidate.id === state.currentTurnId,
-            );
-            return turn?.displayIntent ?? turn?.intent ?? null;
-          })()
-        : null,
-      currentTurnTitle: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.title ?? null)
-        : null,
-      currentTurnPrompt: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.userPrompt ?? null)
-        : null,
-      currentTurnStatus: state.currentTurnId
-        ? (state.conversationTurns.find(
-            (turn) => turn.id === state.currentTurnId,
-          )?.status ?? null)
-        : null,
-      conversationTurns: state.conversationTurns.length,
-      planStage: state.planStage,
-      seedCount: readSeedCount(GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO),
-    };
-  };
-
-  bridge.seedPlanTurnForContinuation = () => {
-    const now = Date.now();
-    const turnId = "e2e-game-studio-plan-continuation-turn";
-    const userBlockId = useAppStore.getState()._nextTaskId();
-    const agentBlockId = useAppStore.getState()._nextTaskId();
-    useAppStore.setState((state) => ({
-      ...state,
-      taskFlow: [
-        {
-          id: userBlockId,
-          turnId,
-          type: "user",
-          content: "先规划 Game Studio 大整改",
-        },
-        {
-          id: agentBlockId,
-          turnId,
-          type: "agent",
-          content: "计划回合还需要继续推进。",
-          streaming: false,
-        },
-      ],
-      conversationTurns: [
-        {
-          id: turnId,
-          userPrompt: "先规划 Game Studio 大整改",
-          title: "Game Studio 大整改计划",
-          mode: "plan",
-          intent: "plan",
-          status: "stopped_no_action",
-          summary: "等待继续生成计划。",
-          blockIds: [userBlockId, agentBlockId],
-          collapsed: false,
-          createdAt: now,
-        },
-      ],
-      currentTurnId: turnId,
-      planArtifacts: [],
-      planTasks: [],
-      planStage: "design",
-      isPlanApproved: false,
-      lockedComposerIntent: null,
-      input: "",
-      isGenerating: false,
-      agentStatus: "idle",
-      abortController: null,
-    }));
-  };
-
-  const cleanup = () => {
+    useAppStore.setState({
+      dispatchNextWorkspaceInstruction: originalDispatchNextWorkspaceInstruction,
+    });
     bridge.initialized = false;
   };
 
@@ -8798,7 +8503,6 @@ function seedComposerRunningGuidanceScenario() {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [
       {
         id: userBlockId,
@@ -9252,7 +8956,6 @@ function seedRealOmlxPlanFlowScenario() {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [],
     agentMessages: [],
     conversationTurns: [],
@@ -9324,6 +9027,29 @@ function seedRealOmlxPlanFlowScenario() {
       },
     ].slice(-40);
   });
+
+  bridge.prepareReadOnlyChat = (web: boolean, provider: "duckduckgo" | "bing" | "baidu" = "bing") => {
+    applyRealOmlxWorkspaceFixture();
+    const chatSessionKey = `${GLOBAL_CHAT_KEY}:${sessionId}`;
+    useAppStore.setState((state) => ({
+      config: { ...state.config, workflowMode: "chat", workspace: "" },
+      currentWorkspace: "", selectedWorkspace: "", workspaces: [],
+      sessionsByWorkspace: { [GLOBAL_CHAT_KEY]: [{ id: sessionId, planLifecycleEpoch: sessionEpoch, title: "Real model Chat", date: new Date(now).toISOString(), active: true, storageStatus: "temporary", recordingDisabled: true, messages: [] }] },
+      activeSessionByWorkspace: { [GLOBAL_CHAT_KEY]: sessionId },
+      currentSessionId: sessionId, planLifecycle: createPlanLifecycleState({ sessionKey: chatSessionKey, sessionEpoch, updatedAt: now }),
+      runtimeV2Checkpoints: {}, taskFlow: [], agentMessages: [], conversationTurns: [], currentTurnId: null,
+      webSearchEnabled: web, webSearchProvider: provider, showPlanPanel: false,
+    }));
+  };
+  bridge.sendReadOnlyMessage = (text: string) => useAppStore.getState().sendMessage(text, undefined, { resolvedIntent: "respond", skipIntentResolution: true });
+  bridge.readOnlySnapshot = () => {
+    const state = useAppStore.getState();
+    const turn = [...state.conversationTurns].reverse().find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]);
+    return { isGenerating: state.isGenerating, agentStatus: state.agentStatus, turnCount: state.conversationTurns.length,
+      turn, aggregate: turn ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate : null,
+      finals: state.taskFlow.filter((block) => block.turnId === turn?.id && block.type === "agent" && block.visibility === "assistant_final").flatMap((block) => block.type === "agent" ? [block.content] : []),
+    };
+  };
 
   bridge.sendCloudMessage = async (text?: string, images?: string[]) => {
     // Zustand persistence may finish hydration after App's E2E mount effect.
@@ -9571,6 +9297,13 @@ function seedRealOmlxPlanFlowScenario() {
           target: runtimeV2CommandTarget(event.command),
           runtimeOwnedPlanArtifact:
             event.command?.payload?.runtimeOwnedPlanArtifact === true,
+          sourceToolCallId:
+            typeof event.command?.payload?.toolCallId === "string"
+              ? event.command.payload.toolCallId
+              : "",
+          jobIds: Array.isArray(event.command?.payload?.jobIds)
+            ? event.command.payload.jobIds.map(String)
+            : [],
           status: receipt?.status || "scheduled",
           actionFingerprint: receipt?.actionFingerprint || "",
           completedAt: receipt?.completedAt || null,
@@ -9607,11 +9340,13 @@ function seedRealOmlxPlanFlowScenario() {
           ?.telemetry?.at || null;
       return {
         id: job.id,
+        parentRunId: job.parentRunId || "",
         scopeKey: job.scopeKey,
         sourceToolCallId: job.sourceToolCallId || "",
         name: job.name || "",
         role: job.role || "",
         taskKind: job.taskKind || "explore",
+        accessMode: job.accessMode || "read",
         objective: job.objective || "",
         successCriteria: job.successCriteria || "",
         status: job.status,
@@ -9768,7 +9503,10 @@ function seedRealOmlxPlanFlowScenario() {
     const runtimeV2Debug = realOmlxDebugTail
       .flatMap((entry: any) => {
       const source = String(entry?.source || "");
-      if (!source.includes("runtime_v2")) return [];
+      if (
+        !source.includes("runtime_v2") &&
+        !source.endsWith(".model_lane_admission")
+      ) return [];
       let data: unknown = entry?.message;
       if (typeof data === "string") {
         const rawData = data;
@@ -9802,6 +9540,7 @@ function seedRealOmlxPlanFlowScenario() {
       turnIdentity: runtimeV2Aggregate.turn || null,
       runIdentity: runtimeV2Aggregate.run?.identity || null,
       phase: runtimeV2Aggregate.phase || null,
+      objective: runtimeV2Aggregate.objective || null,
       terminalOutcome: runtimeV2Aggregate.terminalOutcome || null,
           evidence: (runtimeV2Aggregate.evidence || []).map(
             (evidence: any) => ({
@@ -9826,6 +9565,13 @@ function seedRealOmlxPlanFlowScenario() {
           ? {
               idempotencyKey: event.command?.idempotencyKey || "",
               commandKind: event.command?.kind || "",
+              sourceToolCallId:
+                typeof event.command?.payload?.toolCallId === "string"
+                  ? event.command.payload.toolCallId
+                  : "",
+              jobIds: Array.isArray(event.command?.payload?.jobIds)
+                ? event.command.payload.jobIds.map(String)
+                : [],
             }
           : {}),
         ...(event.type === "command.completed"
@@ -9836,6 +9582,7 @@ function seedRealOmlxPlanFlowScenario() {
               idempotencyKey: event.idempotencyKey,
               status: event.status,
               evidence: event.evidence || [],
+              receiptOrigin: event.receiptOrigin || null,
             }
           : {}),
         ...(event.type === "validation.completed"
@@ -9853,12 +9600,43 @@ function seedRealOmlxPlanFlowScenario() {
         ...(event.type === "subagent.telemetry"
           ? { telemetry: event.telemetry }
           : {}),
+        ...(event.type === "subagents.scheduled"
+          ? {
+              maxActiveSubagents: event.maxActiveSubagents,
+              jobs: (event.jobs || []).map((job: any) => ({
+                id: job.id,
+                parentRunId: job.parentRunId || "",
+                sourceToolCallId: job.sourceToolCallId || "",
+                scopeKey: job.scopeKey || "",
+                taskKind: job.taskKind || "",
+                accessMode: job.accessMode || "",
+                allowedPaths: job.allowedPaths || [],
+                status: job.status || "",
+                requestedAt: job.requestedAt || null,
+              })),
+            }
+          : {}),
         ...(event.type === "subagent.completed"
           ? {
               jobId: event.jobId,
               status: event.status,
               evidence: event.evidence || [],
               report: event.report || null,
+            }
+          : {}),
+        ...(event.type === "subagent.handoff_delivered"
+          ? {
+              jobId: event.jobId,
+              contextEntryId: event.contextEntryId,
+              evidenceIds: event.evidenceIds || [],
+            }
+          : {}),
+        ...(event.type === "subagent.handoff_applied"
+          ? {
+              jobId: event.jobId,
+              evidenceIds: event.evidenceIds || [],
+              sourceEventId: event.sourceEventId,
+              handoffSource: event.source,
             }
           : {}),
         ...(event.type === "work_plan.sealed" ||
@@ -9902,6 +9680,8 @@ function seedRealOmlxPlanFlowScenario() {
           workPlan: runtimeV2Aggregate.workPlan || null,
           sealedWorkPlan: runtimeV2Aggregate.sealedWorkPlan || null,
           planReviewCommit: runtimeV2Aggregate.planReviewCommit || null,
+          planExecutionFrontier:
+            deriveRuntimeV2PlanExecutionFrontier(runtimeV2Aggregate),
           subagents: runtimeV2SubagentTelemetry,
       subagentConcurrency: {
         requestCount: runtimeV2SubagentIntervals.length,
@@ -10396,7 +10176,6 @@ function seedCloudToolProtocolScenario(scenario: string) {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: ordinaryContinueSeed?.taskFlow ?? [],
     agentMessages: ordinaryContinueSeed?.agentMessages ?? [],
     conversationTurns: ordinaryContinueSeed?.conversationTurns ?? [],
@@ -10552,6 +10331,23 @@ function seedSessionAutoCreateScenario() {
 
   const workspace = "/tmp/e2e-session-auto-create";
   const staleSessionId = 999401;
+  const server = {
+    id: "e2e-session-auto-create-server",
+    name: "E2E Session Auto Create",
+    protocol: "openai" as const,
+    apiFormat: "responses" as const,
+    provider: "OpenAI",
+    endpoint: "https://e2e-session-auto-create.example/v1",
+    model: "e2e-session-model",
+    apiKey: "e2e-key",
+    customHeaders: "",
+    temperature: 0.2,
+    topP: 0.95,
+    disableResponseStorage: true,
+    reasoningEffort: "none" as const,
+    toolProtocol: "auto" as const,
+    auth: { mode: "api_key" as const, status: "disconnected" as const },
+  };
 
   const resetRuntime = (sessions: any[], currentSessionId: number | null) => {
     useAppStore.setState((state) => ({
@@ -10561,6 +10357,10 @@ function seedSessionAutoCreateScenario() {
         language: "zh",
         workflowMode: "chat",
         sessionRecordingEnabled: false,
+        activeProfile: "cloud",
+        cloud: server,
+        cloudServers: [server],
+        activeCloudServerId: server.id,
       },
       currentWorkspace: workspace,
       selectedWorkspace: workspace,
@@ -10568,11 +10368,7 @@ function seedSessionAutoCreateScenario() {
         [workspace]: sessions,
       },
       currentSessionId,
-      selectedMainModeKey: "game_studio",
-      selectedNexusModeKey: "nexus_game_studio",
-      activeStudioAgentKey: "studio_auto",
-      gameStudioInitialized: false,
-      pendingSlashCommand: null,
+      selectedMainModeKey: "main_mode",
       taskFlow: [],
       agentMessages: [],
       conversationTurns: [],
@@ -10617,7 +10413,7 @@ function seedSessionAutoCreateScenario() {
   };
 
   bridge.sendFirstMessage = () => {
-    return useAppStore.getState().sendMessage("/agent writer", undefined, {
+    return useAppStore.getState().sendMessage("创建首个 MAIN 会话。", undefined, {
       resolvedIntent: "respond",
       skipIntentResolution: true,
     });
@@ -10669,7 +10465,6 @@ function seedSessionAutoCreateScenario() {
             (turn) => turn.id === state.currentTurnId,
           )?.status ?? null)
         : null,
-      activeStudioAgentKey: state.activeStudioAgentKey,
       seedCount: readSeedCount(SESSION_AUTO_CREATE_SCENARIO),
     };
   };
@@ -10916,41 +10711,11 @@ export function getE2EResumeExecutionHandler():
     }));
 
     window.setTimeout(() => {
-      const latest = useAppStore.getState();
-      const lifecycle = latest.planLifecycle;
-      if (!lifecycle.executionLease || !lifecycle.execution) return;
-      const completedAt = Date.now();
-      const completed = reducePlanLifecycle(lifecycle, {
-        type: "complete",
-        expectedVersion: lifecycle.version,
-        at: completedAt,
-        expectedExecutionLeaseId: lifecycle.executionLease.executionLeaseId,
-        expectedExecution: lifecycle.execution,
-      });
-      if (completed.disposition === "rejected") return;
-      finishPlanExecution(
+      const completed = finishPlanExecution(
         "恢复执行完成，剩余任务已全部收尾。",
         "页面重载后的 Plan 已成功恢复，并顺利完成剩余任务。",
       );
-      useAppStore.setState((current) => ({
-        planLifecycle: completed.state,
-        conversationTurns: current.conversationTurns.map((turn) =>
-          turn.id === executionOwner.turnId
-            ? {
-                ...turn,
-                runtimeOutcome: {
-                  status: "completed",
-                  reason: "e2e_plan_reload_completed",
-                  resultKind: "success",
-                  runId: executionOwner.runId,
-                  parentRunId: executionOwner.parentRunId,
-                  updatedAt: completedAt,
-                },
-              }
-            : turn,
-        ),
-      }));
-      appendBridgeEvent("completed");
+      if (completed) appendBridgeEvent("completed");
     }, 80);
 
     return true;
@@ -11001,7 +10766,6 @@ function seedUserContextPillsScenario() {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [
       {
         id: userBlockId,
@@ -11202,7 +10966,6 @@ function seedSubagentsPanelScenario() {
     },
     currentSessionId: sessionId,
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
     taskFlow: [
       {
         id: userBlockId,
@@ -11560,10 +11323,6 @@ function seedSidebarRemoveLastWorkspaceScenario() {
     currentTurnId: "e2e-sidebar-turn",
     agentMessages: [],
     selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
-    activeStudioAgentKey: "studio_auto",
-    gameStudioInitialized: false,
-    pendingSlashCommand: null,
     planArtifacts: [],
     planTasks: [],
     planExecutionEvidenceLedger: [],
@@ -11696,16 +11455,8 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedProcessDisplayScenario();
   }
 
-  if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {
-    return seedGameStudioOnboardingScenario();
-  }
-
   if (scenario === COMPOSER_MAIN_SHORTCUTS_SCENARIO) {
     return seedComposerMainShortcutsScenario();
-  }
-
-  if (scenario === GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO) {
-    return seedGameStudioPlanShortcutsScenario();
   }
 
   if (isCloudSettingsScenario(scenario)) {
@@ -11793,12 +11544,12 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedExecutionCapsulePanelStabilityScenario();
   }
 
-  if (scenario === GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO) {
-    return seedGameStudioToolGroupScenario("executing");
+  if (scenario === TOOL_GROUP_COLLAPSE_SCENARIO) {
+    return seedToolGroupScenario("executing");
   }
 
-  if (scenario === GAME_STUDIO_AWAITING_CHOICE_SCENARIO) {
-    return seedGameStudioToolGroupScenario("awaiting_input");
+  if (scenario === TOOL_GROUP_AWAITING_CHOICE_SCENARIO) {
+    return seedToolGroupScenario("awaiting_input");
   }
 
   if (scenario === CAPSULE_MODEL_EXPLANATION_SCENARIO) {

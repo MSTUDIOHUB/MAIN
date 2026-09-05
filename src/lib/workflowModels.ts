@@ -683,6 +683,7 @@ export interface DurableTurnContext {
 
 export interface ConversationTurn {
   id: string;
+  networkRead?: import("./networkRead").NetworkReadPolicy;
   /** Stable admission id for one workspace-visible user submission. */
   clientSubmissionId?: string;
   /** Immutable kernel choice made at admission. Missing historical values mean

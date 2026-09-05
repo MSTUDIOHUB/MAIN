@@ -110,44 +110,63 @@ export function deriveDynamicFirstPersonText(
     const cleanIntent = cleanDynamicIntent(rawIntent);
 
     const toolName = String(runningTool.toolName || "");
+    const webTools = new Set(["web_search", "web_fetch"]);
     const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "get_project_skeleton"]);
     const modifyTools = new Set(["write_file", "replace_in_file", "apply_text_edits", "delete_file"]);
-  const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "computer_use", "send_pty_input"]);
+    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "computer_use", "send_pty_input"]);
 
     if (isZh) {
+      if (webTools.has(toolName)) {
+        return toolName === "web_search"
+          ? (cleanIntent
+            ? `我正在联网搜索 \`${fileBasename}\`，目的是：${cleanIntent}...`
+            : `我正在联网搜索 \`${fileBasename}\`，以获取最新的实时信息...`)
+          : (cleanIntent
+            ? `我正在访问网页 \`${fileBasename}\`，目的是：${cleanIntent}...`
+            : `我正在访问网页 \`${fileBasename}\`，以获取详细内容...`);
+      }
       if (readTools.has(toolName)) {
         return cleanIntent
           ? `我正在读取并探索 \`${fileBasename}\`，目的是：${cleanIntent}...`
-          : `我正在读取并探索 \`${fileBasename}\` 文件，以获取准确的代码上下文信息...`;
+          : `我正在读取并探索 \`${fileBasename}\`，以获取准确的上下文信息...`;
       }
       if (modifyTools.has(toolName)) {
         return cleanIntent
-          ? `我正在对 \`${fileBasename}\` 进行代码修改，以实现：${cleanIntent}...`
-          : `我正在对 \`${fileBasename}\` 进行代码修改，以落实我们方案中商定的改动...`;
+          ? `我正在对 \`${fileBasename}\` 进行修改，以实现：${cleanIntent}...`
+          : `我正在对 \`${fileBasename}\` 进行修改，以落实我们方案中商定的改动...`;
       }
       if (commandTools.has(toolName)) {
         return cleanIntent
           ? `我正在运行 \`${fileBasename}\` 验证命令，目的是：${cleanIntent}...`
-          : `我正在运行 \`${fileBasename}\` 验证命令，确保修改后的代码能通过所有质量与测试标准...`;
+          : `我正在运行 \`${fileBasename}\` 验证命令，确保符合预期与验证标准...`;
       }
       return cleanIntent
         ? `我正在调用 \`${fileBasename}\` 工具，目的是：${cleanIntent}...`
         : `我正在调用 \`${fileBasename}\` 工具以安全高效地推进任务...`;
     } else {
+      if (webTools.has(toolName)) {
+        return toolName === "web_search"
+          ? (cleanIntent
+            ? `I am searching the web for \`${fileBasename}\` to: ${cleanIntent}...`
+            : `I am searching the web for \`${fileBasename}\` to gather real-time information...`)
+          : (cleanIntent
+            ? `I am fetching web page \`${fileBasename}\` to: ${cleanIntent}...`
+            : `I am fetching web page \`${fileBasename}\` to gather detailed content...`);
+      }
       if (readTools.has(toolName)) {
         return cleanIntent
           ? `I am exploring \`${fileBasename}\` to: ${cleanIntent}...`
-          : `I am exploring the \`${fileBasename}\` file to gather precise code context...`;
+          : `I am exploring \`${fileBasename}\` to gather precise context...`;
       }
       if (modifyTools.has(toolName)) {
         return cleanIntent
           ? `I am modifying \`${fileBasename}\` to: ${cleanIntent}...`
-          : `I am modifying the \`${fileBasename}\` file to apply the agreed-upon changes...`;
+          : `I am modifying \`${fileBasename}\` to apply the agreed-upon changes...`;
       }
       if (commandTools.has(toolName)) {
         return cleanIntent
           ? `I am running \`${fileBasename}\` to: ${cleanIntent}...`
-          : `I am running the verification command \`${fileBasename}\` to ensure all quality and test standards are met...`;
+          : `I am running the verification command \`${fileBasename}\` to ensure all quality and validation standards are met...`;
       }
       return cleanIntent
         ? `I am using \`${fileBasename}\` to: ${cleanIntent}...`
@@ -160,11 +179,11 @@ export function deriveDynamicFirstPersonText(
   if (isAwaitingApproval) {
     const planTopic = (turn?.title && !/^(?:Untitled|New Run|Session)/i.test(turn.title))
       ? turn.title
-      : (isZh ? "当前的模块修复" : "the current module changes");
+      : (isZh ? "当前的实施方案" : "the current implementation plan");
 
     return isZh
-      ? `我已为您生成了关于【${planTopic}】的完整修改计划，正在等待您的审批。批准后我将开始安全的自动代码修改流程...`
-      : `I have generated the implementation plan for [${planTopic}] and am awaiting your approval to safely proceed with the code changes...`;
+      ? `我已为您生成了关于【${planTopic}】的完整实施计划，正在等待您的审批。批准后我将开始安全的执行流程...`
+      : `I have generated the implementation plan for [${planTopic}] and am awaiting your approval to safely proceed with the execution...`;
   }
 
   // 3. 等待用户选择/交互选项阶段 (Awaiting Input Options)
@@ -190,8 +209,8 @@ export function deriveDynamicFirstPersonText(
       return dynamicExplanation;
     }
     return isZh
-      ? "我正在深入分析当前工作区中的代码结构与报错日志，规划具体的实施方案..."
-      : "I am deep in thought, analyzing the codebase to plan the best implementation approach...";
+      ? "我正在深入分析当前任务与相关上下文，规划具体的实施方案..."
+      : "I am deep in thought, analyzing the task context to plan the best implementation approach...";
   }
 
   // 5. 流式 Agent 状态优化 (hasStreamingAgent)：动态显示当前的字符大小与重试轮次

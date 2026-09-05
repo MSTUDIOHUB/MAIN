@@ -179,6 +179,33 @@ test("captured subagent preference wins over later mutable Session state", () =>
 
   assert.equal(capturedPreferred.turnInputContextSignals.subagentPreference, "preferred");
   assert.equal(capturedUnspecified.turnInputContextSignals.subagentPreference, "unspecified");
+  assert.equal(capturedPreferred.turnInputContextSignals.subagentRequirement, "optional");
+});
+
+test("submit admission distinguishes explicit subagent requirements from the Composer preference", () => {
+  const required = prepareSubmitTurnDraft(baseInput({
+    text: "请使用一个子智能体独立检查测试策略。",
+    preferSubagents: false,
+  }));
+  const preferredOnly = prepareSubmitTurnDraft(baseInput({
+    text: "检查测试策略",
+    preferSubagents: true,
+  }));
+
+  assert.equal(required.turnInputContextSignals.subagentPreference, "preferred");
+  assert.equal(required.turnInputContextSignals.subagentRequirement, "required");
+  assert.equal(preferredOnly.turnInputContextSignals.subagentPreference, "preferred");
+  assert.equal(preferredOnly.turnInputContextSignals.subagentRequirement, "optional");
+});
+
+test("submit admission preserves the user's multi-Agent imperative", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    text: "过程中也使用多Agent功能看看MAIN的多Agent是否合理并运行正常",
+    preferSubagents: false,
+  }));
+
+  assert.equal(draft.turnInputContextSignals.subagentPreference, "preferred");
+  assert.equal(draft.turnInputContextSignals.subagentRequirement, "required");
 });
 
 test("submit turn draft preserves typed diagnosis outcome authority", () => {
@@ -196,6 +223,7 @@ test("raw user prohibition overrides a captured preferred subagent preference", 
   }));
 
   assert.equal(draft.turnInputContextSignals.subagentPreference, "forbidden");
+  assert.equal(draft.turnInputContextSignals.subagentRequirement, "optional");
 });
 
 test("permissive user wording does not downgrade the captured Composer collaboration switch", () => {
@@ -206,6 +234,7 @@ test("permissive user wording does not downgrade the captured Composer collabora
   }));
 
   assert.equal(draft.turnInputContextSignals.subagentPreference, "preferred");
+  assert.equal(draft.turnInputContextSignals.subagentRequirement, "optional");
 });
 
 test("submit turn draft reuses existing turn title and UI parent", () => {
@@ -228,6 +257,7 @@ test("same-Turn recovery draft inherits first admission metadata without reattac
     mentionedFilePaths: ["src/App.tsx"],
     attachedFilePaths: ["notes/incident.md"],
     subagentPreference: "preferred",
+    subagentRequirement: "required",
     diagnosisRequirement: "required",
   });
   const sessionGet = () => ({

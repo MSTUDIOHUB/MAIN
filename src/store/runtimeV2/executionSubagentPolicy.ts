@@ -1,4 +1,8 @@
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
+import {
+  buildLoadSkillToolDefinition,
+  type SkillCatalogSnapshot,
+} from "../../lib/agentSkills";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
 import type {
   RuntimeV2NormalizedToolCall,
@@ -28,6 +32,7 @@ export const READ_ONLY_CHILD_TOOL_NAMES = new Set([
   "get_file_outline",
   "code_ast_query",
   "find_symbol_references",
+  "load_skill",
 ]);
 
 export const VALIDATION_CHILD_TOOL_NAMES = new Set([
@@ -131,8 +136,13 @@ export function runtimeV2ChildOutputTokenLimit(
 
 export function runtimeV2ChildTools(
   job: RuntimeV2SubagentJob,
+  skillCatalog?: SkillCatalogSnapshot | null,
 ): ToolDefinition[] {
-  return CHILD_TOOL_DEFINITIONS.filter((definition) =>
+  const loadSkill = buildLoadSkillToolDefinition(skillCatalog);
+  return [
+    ...CHILD_TOOL_DEFINITIONS,
+    ...(loadSkill ? [loadSkill] : []),
+  ].filter((definition) =>
     READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
     (job.taskKind === "validate" &&
       VALIDATION_CHILD_TOOL_NAMES.has(definition.function.name)) ||

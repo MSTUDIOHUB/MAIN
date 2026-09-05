@@ -1,6 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
+  type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
   type RuntimeV2Projection,
   type RuntimeV2ResultKind,
@@ -27,9 +28,9 @@ import {
   shouldRecordRuntimeV2SoftSignal,
 } from "./controllerRecovery";
 import {
-  referencedRuntimeV2SubagentEvidenceIds,
-  runtimeV2SubagentHandoffApplicationSource,
+  runtimeV2SubagentHandoffApplicationDrafts,
 } from "./subagentHandoff";
+import { executeRuntimeV2SchedulerLifecycle } from "./schedulerLifecycle";
 export interface RuntimeV2ControllerSnapshot {
   readonly aggregate: TurnAggregateV1 | null;
   readonly revision: number;
@@ -39,6 +40,7 @@ type RuntimeV2SoftSignal = Extract<
   { readonly type: "soft_signal.observed" }
 >["signal"];
 export interface RuntimeV2Admission {
+  readonly networkRead?: import("../networkRead").NetworkReadPolicy;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
   readonly strategy: RuntimeV2Strategy;
@@ -46,9 +48,7 @@ export interface RuntimeV2Admission {
   readonly constraints?: readonly string[];
   readonly acceptanceCriteria?: readonly string[];
   readonly acceptanceCriterionIds?: readonly string[];
-  readonly acceptanceEvidenceRequirements?: readonly (
-    "static" | "behavioral" | "interaction"
-  )[];
+  readonly acceptanceEvidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
   readonly initialPhase?: "preparing" | "observing" | "planning" | "acting" | "validating" | "finalizing";
 }
 function asEvent<T extends RuntimeV2Event>(value: T): T { return value; }
@@ -115,6 +115,7 @@ export class RuntimeV2Controller {
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "turn.admitted",
+      ...(input.networkRead ? { networkRead: input.networkRead } : {}),
       turn: input.turn,
       strategy: input.strategy,
       objective: input.objective,
@@ -286,47 +287,15 @@ export class RuntimeV2Controller {
   private async recordAppliedSubagentHandoffs(
     sourceEvent: RuntimeV2Event,
   ): Promise<void> {
-    const source = runtimeV2SubagentHandoffApplicationSource(sourceEvent);
-    if (!source) return;
     const state = this.requireAggregate();
-    if (!state.run) return;
-    const alreadyApplied = new Map<string, Set<string>>();
-    for (const event of state.events) {
-      if (event.type !== "subagent.handoff_applied") continue;
-      const evidenceIds = alreadyApplied.get(event.jobId) || new Set<string>();
-      for (const evidenceId of event.evidenceIds) {
-        evidenceIds.add(evidenceId);
-      }
-      alreadyApplied.set(event.jobId, evidenceIds);
-    }
-    const deliveries = state.events.filter(
-      (event): event is Extract<
-        RuntimeV2Event,
-        { readonly type: "subagent.handoff_delivered" }
-      > =>
-        event.type === "subagent.handoff_delivered" &&
-        event.sequence < sourceEvent.sequence,
-    );
-    for (const delivery of deliveries) {
-      const used = alreadyApplied.get(delivery.jobId) || new Set<string>();
-      const evidenceIds = referencedRuntimeV2SubagentEvidenceIds({
-        sourceEvent,
-        evidenceIds: delivery.evidenceIds,
-      }).filter((evidenceId) => !used.has(evidenceId));
-      if (evidenceIds.length === 0) continue;
+    for (const draft of runtimeV2SubagentHandoffApplicationDrafts({
+      state,
+      sourceEvent,
+    })) {
       await this.apply(asEvent({
         ...this.eventBase(),
-        type: "subagent.handoff_applied",
-        run: state.run.identity,
-        jobId: delivery.jobId,
-        evidenceIds,
-        sourceEventId: sourceEvent.eventId,
-        source,
+        ...draft,
       }));
-      alreadyApplied.set(
-        delivery.jobId,
-        new Set([...used, ...evidenceIds]),
-      );
     }
   }
 
@@ -430,52 +399,40 @@ export class RuntimeV2Controller {
       case "collect_observation":
       case "schedule_subagents":
       case "join_subagents": {
-        let event: RuntimeV2EventDraft | readonly RuntimeV2EventDraft[];
+        let events: readonly RuntimeV2EventDraft[];
         if (command.kind === "collect_observation") {
-          event = await this.ports.tool.execute({ run: command.run, command, signal });
-        } else {
-          if (command.kind === "schedule_subagents") {
-            const sourceToolCallId =
-              typeof command.payload.toolCallId === "string"
-                ? command.payload.toolCallId
-                : "";
-            const committedChildren = this.requireAggregate().subagents.filter((job) =>
-              job.parentRunId === command.run.runId &&
-              (job.status === "queued" || job.status === "running") &&
-              (!sourceToolCallId ||
-                job.sourceToolCallId === sourceToolCallId)
-            );
-            if (committedChildren.length === 0) {
-              const prepared = await this.ports.scheduler.prepareSchedule?.({ run: command.run, command, signal });
-              if (prepared) {
-                const applied = await this.apply(this.rebasePortEvent(prepared));
-                await this.publishMilestoneIfEligible(applied.events[applied.events.length - 1]);
-              }
-            }
-          }
-          const scheduledSubagents = command.kind === "schedule_subagents" || command.kind === "join_subagents"
-            ? this.requireAggregate().subagents
-            : undefined;
-          event = await this.ports.scheduler.execute({
+          const observed = await this.ports.tool.execute({
             run: command.run,
             command,
             signal,
-            ...(scheduledSubagents ? { scheduledSubagents } : {}),
+          });
+          events = [{
+            type: "command.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+          }, ...(observed.type === "command.completed" ? [] : [observed])];
+        } else {
+          events = await executeRuntimeV2SchedulerLifecycle({
+            command,
+            signal,
+            scheduler: this.ports.scheduler,
+            getScheduledSubagents: () => this.requireAggregate().subagents,
+            commitPrepared: async (prepared) => {
+              const applied = await this.apply(
+                this.rebasePortEvent(prepared),
+              );
+              await this.publishMilestoneIfEligible(
+                applied.events[applied.events.length - 1],
+              );
+            },
           });
         }
-        await this.apply(asEvent({
-          ...this.eventBase(),
-          type: "command.completed",
-          run: command.run,
-          idempotencyKey: command.idempotencyKey,
-          status: "succeeded",
-        }));
-        const events = Array.isArray(event) ? event : [event];
         for (const emitted of events) {
-          if (emitted.type !== "command.completed") {
-            const applied = await this.apply(this.rebasePortEvent(emitted));
-            await this.publishMilestoneIfEligible(applied.events[applied.events.length - 1]);
-          }
+          const applied = await this.apply(this.rebasePortEvent(emitted));
+          await this.publishMilestoneIfEligible(
+            applied.events[applied.events.length - 1],
+          );
         }
         await this.publish(buildRuntimeV2CapsuleProjection(this.requireAggregate(), this.ports.clockId.nextId("capsule")));
         return;
@@ -703,6 +660,7 @@ export class RuntimeV2Controller {
     finalMarkdown?: string,
   ): Promise<void> {
     const state = this.requireAggregate();
+    if (state.terminalOutcome) { await this.resumeTerminalProjection(); return; }
     const run = state.run;
     if (!run) throw new Error("Runtime v2 Run is not active.");
     for (const command of [...state.scheduledCommands]) {
@@ -750,8 +708,37 @@ export class RuntimeV2Controller {
       type: "run.completed",
       run: run.identity,
       outcome,
+      finalProjection,
     }));
-    await this.publish(finalProjection);
+    await this.resumeTerminalProjection();
+  }
+
+  /** Finish the durable terminal transaction after any interruption boundary.
+   * Replaying an existing projection does not append another final event. */
+  async resumeTerminalProjection(): Promise<boolean> {
+    const state = this.requireAggregate();
+    const run = state.run;
+    const outcome = state.terminalOutcome;
+    if (!run) return false;
+    if (!outcome) {
+      if (state.phase !== "finalizing") return false;
+      const pending = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
+      if (pending?.type !== "command.scheduled") return false;
+      await this.finishTerminal(pending.command.payload.resultKind as RuntimeV2ResultKind,
+        String(pending.command.payload.resultReason || ""), String(pending.command.payload.finalMarkdown || ""));
+      return true;
+    }
+    const completed = state.events.find((event) => event.type === "run.completed");
+    const published = state.events.find((event) => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
+    const finalize = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
+    const finalProjection = completed?.type === "run.completed" && completed.finalProjection ||
+      (published?.type === "projection.published" && published.projection) ||
+      buildRuntimeV2FinalProjection(state, outcome.finalProjectionId, outcome.resultKind, outcome.reason,
+        finalize?.type === "command.scheduled" ? String(finalize.command.payload.finalMarkdown || "") : undefined);
+    if (published?.type === "projection.published") {
+      await this.ports.projection.publish({ aggregate: state, audience: finalProjection.audience, projection: finalProjection, event: published });
+    } else await this.publish(finalProjection);
+    if (state.events.some((event) => event.type === "turn.completed")) return true;
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "turn.completed",
@@ -759,5 +746,6 @@ export class RuntimeV2Controller {
       runId: run.identity.runId,
       outcome,
     }));
+    return true;
   }
 }

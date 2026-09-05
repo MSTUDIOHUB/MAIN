@@ -34,6 +34,21 @@ export function isValidRuntimeV2SubagentCompletion(input: {
   readonly job: RuntimeV2SubagentJob;
 }): boolean {
   const inheritedEvidence = input.event.inheritedEvidence || [];
+  const eventEvidence = [...input.event.evidence, ...inheritedEvidence];
+  const eventEvidenceIds = eventEvidence.map((item) => item.id);
+  const eventEvidenceIdsAreUnique =
+    new Set(eventEvidenceIds).size === eventEvidenceIds.length;
+  const childEvidenceIdsKeepExistingMeaning = input.event.evidence.every(
+    (item) =>
+      !input.state.evidence.some((known) =>
+        known.id === item.id &&
+        (
+          known.kind !== item.kind ||
+          known.target !== item.target ||
+          known.version !== item.version
+        )
+      ),
+  );
   const known = new Map(input.state.evidence.map((item) => [item.id, item]));
   const inheritedIsKnown = inheritedEvidence.every((item) => {
     const candidate = known.get(item.id);
@@ -51,7 +66,9 @@ export function isValidRuntimeV2SubagentCompletion(input: {
       item.target === path || item.target.startsWith(`${path.replace(/\/$/, "")}/`)
     )
   );
-  return inheritedIsKnown &&
+  return eventEvidenceIdsAreUnique &&
+    childEvidenceIdsKeepExistingMeaning &&
+    inheritedIsKnown &&
     mutationScopeValid &&
     (writeJob || mutationEvidence.length === 0) &&
     (

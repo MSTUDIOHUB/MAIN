@@ -1,4 +1,9 @@
 import { globSearch, readFile } from "./ipc";
+import {
+  loadSkillCatalog,
+  type SkillCatalogSnapshot,
+} from "./agentSkills";
+import { sha256Hex } from "./sha256";
 
 export type InstructionSourceKind =
   | "legacy"
@@ -16,6 +21,14 @@ export interface InstructionSource {
   enabled: boolean;
   order: number;
   matchedPaths?: string[];
+  /** Exact raw source identity captured at the admission read boundary. */
+  contentHash?: string;
+  byteSize?: number;
+}
+
+export interface ResolvedInstructionIo {
+  readFile(path: string, workspace: string): Promise<string>;
+  globSearch(pattern: string, workspace: string): Promise<string[]>;
 }
 
 export interface InstructionLayer {
@@ -43,6 +56,9 @@ export interface ResolvedInstructionSet {
   associatedPaths: string[];
   loadedAt: number;
   debugSummary: string;
+  /** Immutable, progressively disclosed Agent Skill registry admitted beside
+   * project rules. Full Skill bodies are deliberately not instruction layers. */
+  skillCatalog?: SkillCatalogSnapshot;
 }
 
 /**
@@ -72,9 +88,14 @@ export function renderResolvedInstructionContext(
 export interface InstructionSkillLike {
   id: string;
   name: string;
+  desc: string;
   content: string;
   active: boolean;
   type?: "instruction" | "tool" | "package";
+  packagePath?: string;
+  entryPoint?: string;
+  workspaceScope?: string | null;
+  allowImplicitInvocation?: boolean;
 }
 
 type ParsedFrontmatter = {
@@ -226,12 +247,23 @@ function parseFrontmatter(raw: string): ParsedFrontmatter {
 async function tryRead(
   path: string,
   workspace: string,
+  io: ResolvedInstructionIo,
 ): Promise<string | null> {
+  if (!workspace) return null;
   try {
-    return await readFile(path, workspace);
+    return await io.readFile(path, workspace);
   } catch {
     return null;
   }
+}
+
+async function tryGlob(
+  path: string,
+  workspace: string,
+  io: ResolvedInstructionIo,
+): Promise<string[]> {
+  if (!workspace) return [];
+  return io.globSearch(path, workspace).catch(() => []);
 }
 
 function matchPatterns(patterns: string[], associatedPaths: string[]): string[] {
@@ -248,6 +280,8 @@ export async function loadResolvedInstructions(
   workspace: string,
   skills: InstructionSkillLike[],
   associatedPaths: string[] = [],
+  userPrompt = "",
+  io: ResolvedInstructionIo = { readFile, globSearch },
 ): Promise<ResolvedInstructionSet> {
   const immutableWorkspace = workspace.trim();
   const normalizedAssociated = associatedPaths.map(normalizePath).filter(Boolean);
@@ -278,6 +312,8 @@ export async function loadResolvedInstructions(
       path: options?.path,
       enabled: true,
       order,
+      contentHash: `sha256-${sha256Hex(content)}`,
+      byteSize: new TextEncoder().encode(content).byteLength,
       ...(options?.matchedPaths && options.matchedPaths.length > 0
         ? { matchedPaths: options.matchedPaths }
         : {}),
@@ -300,39 +336,39 @@ export async function loadResolvedInstructions(
   };
 
   for (const legacyPath of LEGACY_FILES) {
-    const content = await tryRead(legacyPath, immutableWorkspace);
+    const content = await tryRead(legacyPath, immutableWorkspace, io);
     if (!content) continue;
     pushLayer(legacyPath.split("/").pop() || legacyPath, "legacy", content, {
       path: legacyPath,
     });
   }
 
-  const cursorRuleFiles = await globSearch(
+  const cursorRuleFiles = await tryGlob(
     ".cursor/rules/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+    io,
+  );
   for (const rulePath of cursorRuleFiles) {
-    const content = await tryRead(rulePath, immutableWorkspace);
+    const content = await tryRead(rulePath, immutableWorkspace, io);
     if (!content) continue;
     pushLayer(rulePath.split("/").pop() || rulePath, "legacy", content, {
       path: rulePath,
     });
   }
 
-  const agentContent = await tryRead("AGENT.md", immutableWorkspace);
+  const agentContent = await tryRead("AGENT.md", immutableWorkspace, io);
   if (agentContent) {
     pushLayer("AGENT.md", "workspace_agent", agentContent, { path: "AGENT.md" });
   }
 
-  const steeringFiles = await globSearch(
+  const steeringFiles = await tryGlob(
     ".MAIN/steering/*.md",
     immutableWorkspace,
-  ).catch(
-    () => [],
+    io,
   );
   for (const steeringPath of steeringFiles.sort()) {
     if (/\/README\.md$/i.test(normalizePath(steeringPath))) continue;
-    const content = await tryRead(steeringPath, immutableWorkspace);
+    const content = await tryRead(steeringPath, immutableWorkspace, io);
     if (!content) continue;
     const parsed = parseFrontmatter(content);
     const matched = parsed.paths.length > 0
@@ -357,14 +393,15 @@ export async function loadResolvedInstructions(
     );
   }
 
-  const scopedRuleFiles = await globSearch(
+  const scopedRuleFiles = await tryGlob(
     ".MAIN/rules/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+    io,
+  );
   const scopedRules: ScopedRule[] = [];
 
   for (const rulePath of scopedRuleFiles) {
-    const content = await tryRead(rulePath, immutableWorkspace);
+    const content = await tryRead(rulePath, immutableWorkspace, io);
     if (!content) continue;
 
     const parsed = parseFrontmatter(content);
@@ -398,15 +435,19 @@ export async function loadResolvedInstructions(
       });
     });
 
-  const templateFiles = await globSearch(
+  const templateFiles = await tryGlob(
     ".MAIN/templates/**/*.md",
     immutableWorkspace,
-  ).catch(() => []);
+    io,
+  );
   for (const templatePath of templateFiles) {
+    // Older releases may have copied the removed mode's private template pack
+    // into a user workspace. Preserve those files on disk, but never revive
+    // them as ordinary MAIN instructions after the mode has been removed.
     if (normalizePath(templatePath).startsWith(".MAIN/templates/game-studio/")) {
       continue;
     }
-    const content = await tryRead(templatePath, immutableWorkspace);
+    const content = await tryRead(templatePath, immutableWorkspace, io);
     if (!content) continue;
     const parsed = parseFrontmatter(content);
     const relativeTitle = templatePath.replace(/^\.MAIN\/templates\//, "");
@@ -417,13 +458,14 @@ export async function loadResolvedInstructions(
     });
   }
 
-  skills
-    .filter(skill => skill.active && (!skill.type || skill.type === "instruction"))
-    .forEach(skill => {
-      pushLayer(skill.name, "skill", skill.content, {
-        path: `skill:${skill.id}`,
-      });
-    });
+  // Agent Skills are not ordinary always-on project rules. Admit their
+  // metadata and immutable bodies into a separate registry so provider
+  // context can use progressive disclosure through load_skill.
+  const skillCatalog = await loadSkillCatalog({
+    workspace: immutableWorkspace,
+    skills,
+    userPrompt,
+  });
 
   const loadedAt = Date.now();
   const debugSummary = sources.length
@@ -447,5 +489,6 @@ export async function loadResolvedInstructions(
     associatedPaths: normalizedAssociated,
     loadedAt,
     debugSummary,
+    skillCatalog,
   };
 }

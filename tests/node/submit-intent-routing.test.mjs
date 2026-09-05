@@ -72,7 +72,6 @@ function createHarness(overrides = {}) {
     options: {},
     currentMainModeKey: "main_mode",
     hasWorkspace: false,
-    parsedStudioCommand: null,
     isHidden: false,
     autoApproveTools: false,
     fallbackRunIntent: "respond",

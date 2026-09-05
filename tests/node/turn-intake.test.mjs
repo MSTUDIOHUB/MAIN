@@ -40,7 +40,9 @@ const {
   extractTurnInputContextSignalsFromMessages,
   hasTurnProvidedContext,
   resolveEffectiveSubagentDelegationPreference,
+  resolveEffectiveSubagentRequirement,
   resolveSubagentDelegationPreference,
+  resolveSubagentRequirement,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnIntake.ts"));
 
 test("turn intake block makes screenshots and files first-class context", () => {
@@ -175,6 +177,37 @@ test("turn intake distinguishes preferred, allowed, and forbidden subagent deleg
   );
 });
 
+test("turn intake separates explicit subagent requirements from collaboration preference", () => {
+  assert.equal(
+    resolveSubagentRequirement("必须使用一个子智能体检查测试设计。"),
+    "required",
+  );
+  assert.equal(
+    resolveSubagentRequirement("请把测试策略调查交给只读子 Agent。"),
+    "required",
+  );
+  assert.equal(
+    resolveSubagentRequirement("请使用或启动子agent检查计划。"),
+    "required",
+  );
+  assert.equal(
+    resolveSubagentRequirement("可以开启多个 subagent 并行分析。"),
+    "optional",
+  );
+  assert.equal(resolveEffectiveSubagentRequirement({
+    rawUserInput: "检查这两个模块",
+    defaultRequirement: "required",
+  }), "required");
+  assert.equal(resolveEffectiveSubagentRequirement({
+    rawUserInput: "这次不要使用子智能体",
+    defaultRequirement: "required",
+  }), "optional");
+  assert.equal(resolveEffectiveSubagentRequirement({
+    rawUserInput: "这次不要使用子 Agent",
+    defaultRequirement: "required",
+  }), "optional");
+});
+
 test("child mutation restrictions do not disable delegation", () => {
   assert.equal(
     resolveSubagentDelegationPreference("可以开启多个子智能体，但禁止子智能体修改文件。"),
@@ -186,7 +219,7 @@ test("child mutation restrictions do not disable delegation", () => {
   );
 });
 
-test("enabled subagent collaboration remains model-directed at every stage", () => {
+test("preferred subagent collaboration prioritizes useful parallel work without a stage gate", () => {
   const block = buildTurnIntakeContextBlock({
     rawUserInput: "修复启动白屏，可以开启多个subagent协同工作",
     signals: {},
@@ -195,10 +228,13 @@ test("enabled subagent collaboration remains model-directed at every stage", () 
   });
 
   assert.match(block, /subagentPreference: preferred/);
+  assert.match(block, /明确选择本轮优先使用协作/);
+  assert.match(block, /至少两个边界明确的工作包可以重叠/);
+  assert.match(block, /应优先在公布的容量内启动尽可能多的有用子智能体/);
+  assert.match(block, /父线程继续推进不依赖子结果的工作/);
   assert.match(block, /读取、修改或验证任一阶段/);
-  assert.match(block, /根据实际工作量自行判断/);
-  assert.match(block, /绝不强制/);
-  assert.match(block, /不是写入或完成的前置条件/);
+  assert.match(block, /不是强制生命周期阶段/);
+  assert.match(block, /简单或线性任务直接执行/);
   assert.match(block, /父线程已形成证据化方案/);
   assert.match(block, /只接收父线程整理的上下文胶囊/);
   assert.match(block, /不会继承父线程隐藏推理或完整对话/);
@@ -241,6 +277,30 @@ test("turn intake persists a session-supplied subagent preference for runtime re
 
   assert.match(block, /subagentPreference: preferred/);
   assert.equal(signals.subagentPreference, "preferred");
+});
+
+test("turn intake round-trips explicit subagent requirement authority", () => {
+  const block = buildTurnIntakeContextBlock({
+    rawUserInput: "请使用一个子智能体独立检查测试策略。",
+    signals: { subagentRequirement: "required" },
+    language: "zh",
+    workflowMode: "plan",
+  });
+  const signals = extractTurnInputContextSignalsFromMessages([
+    { role: "user", content: block },
+  ]);
+
+  assert.match(block, /subagentRequirement: required/);
+  assert.equal(signals.subagentRequirement, "required");
+});
+
+test("turn intake treats the user's multi-Agent imperative as required", () => {
+  const userRequest = "过程中也使用多Agent功能看看MAIN的多Agent是否合理并运行正常";
+  assert.equal(resolveSubagentRequirement(userRequest), "required");
+  assert.equal(resolveEffectiveSubagentRequirement({
+    rawUserInput: userRequest,
+  }), "required");
+  assert.equal(resolveSubagentDelegationPreference(userRequest), "preferred");
 });
 
 test("turn intake round-trips explicit diagnosis outcome authority", () => {

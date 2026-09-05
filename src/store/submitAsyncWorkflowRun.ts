@@ -6,11 +6,6 @@ import {
   type HarnessRunMarker,
   type HarnessRunOwner,
 } from "../lib/harnessCrashTelemetry";
-import type {
-  PendingSlashCommand,
-  ParsedSetupEngineArgs,
-  StudioAgentKey,
-} from "../lib/gameStudio/catalog";
 import type { MainModeKey } from "../lib/mainModes";
 import type {
   CommandDirective,
@@ -39,16 +34,13 @@ import {
   renderResolvedInstructionContext,
   type ResolvedInstructionSet,
 } from "../lib/instructions";
+import type { ProjectBaselineContext } from "../lib/projectBaseline";
 import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
   type SubmitAttachmentContextInput,
 } from "./submitAttachmentContext";
 import { buildSubmitPromptContext } from "./submitPromptContext";
-import {
-  runSubmitGameStudioPreparation,
-  type SubmitGameStudioPreparationState,
-} from "./submitGameStudioPreparation";
 import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
@@ -66,11 +58,6 @@ import {
   runSubmitRuntime,
   type RunSubmitRuntimeInput,
 } from "./submitRuntimeRunner";
-import type { GameStudioTurnRuntimeService } from "./gameStudioTurnPreparation";
-import {
-  buildRuntimeV2StudioSetupActionPlan,
-  type RuntimeV2GameStudioServicePort,
-} from "./runtimeV2/studioAdapter";
 import {
   appendRuntimeEvent,
   appendRuntimeEventWithResult,
@@ -98,9 +85,7 @@ import {
 
 type SubmitAsyncWorkflowSet = (patchOrUpdater: any) => void;
 
-export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparationState {
-  activeStudioAgentKey: StudioAgentKey;
-  gameStudioInitialized: boolean;
+export interface SubmitAsyncWorkflowRunState {
   isPlanApproved: boolean;
   planStage: PlanStage;
   planArtifacts: PlanArtifact[];
@@ -141,12 +126,10 @@ export interface SubmitAsyncWorkflowElapsedTimer {
 }
 
 export interface SubmitAsyncWorkflowRunPhaseRunners<
-  TState extends SubmitAsyncWorkflowRunState,
   TAbortController extends AbortController,
 > {
   buildAttachmentContext?: typeof buildSubmitAttachmentContext;
   buildPromptContext?: typeof buildSubmitPromptContext;
-  runGameStudioPreparation?: typeof runSubmitGameStudioPreparation<TState>;
   startRunLease?: typeof startSubmitRunLease<TAbortController>;
   createRuntimeContext?: typeof createSubmitRuntimeContext;
   startStreamingUi?: typeof startSubmitStreamingUi;
@@ -168,9 +151,6 @@ export interface StartSubmitAsyncWorkflowRunInput<
   runSessionId: number | null | undefined;
   runScopeKey: string;
   currentMainModeKey: MainModeKey;
-  parsedSetupEngineCommand?: ParsedSetupEngineArgs | null;
-  parsedStudioCommand: PendingSlashCommand | null;
-  cachedWorkspaceTreeForGameDetection: string;
   preferredLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
@@ -216,9 +196,6 @@ export interface StartSubmitAsyncWorkflowRunInput<
   readFile: SubmitAttachmentContextInput["readFile"];
   readDocument: SubmitAttachmentContextInput["readDocument"];
   analyzeTabularDocument: SubmitAttachmentContextInput["analyzeTabularDocument"];
-  runtimeService: GameStudioTurnRuntimeService & RuntimeV2GameStudioServicePort;
-  logWarning: (event: string, data: Record<string, unknown>) => void;
-  invalidateWorkspaceTreeCache: () => void;
   createAbortController: () => TAbortController;
   getCurrentHarnessInstanceId: () => string;
   readHarnessRunMarker: () => HarnessRunMarker | null;
@@ -238,13 +215,28 @@ export interface StartSubmitAsyncWorkflowRunInput<
    */
   refreshWorkspaceContext?: (
     workspace: string,
+    userPrompt?: string,
   ) => Promise<ResolvedInstructionSet | null>;
+  /** Preferred composite admission owner. Its implementation must share a
+   * read-through snapshot between instructions and baseline anchors. */
+  refreshWorkspaceAdmission?: (
+    workspace: string,
+    userPrompt?: string,
+  ) => Promise<{
+    instructions: ResolvedInstructionSet | null;
+    baseline: ProjectBaselineContext | null;
+    warnings?: readonly string[];
+  }>;
+  /** Compatibility/testing port used only when no composite owner exists. */
+  refreshProjectBaseline?: (
+    workspace: string,
+  ) => Promise<ProjectBaselineContext | null>;
   nowMs: () => number;
   sendStartedAt: number;
   getLastTurnToolSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
   getLastVisibleTurnAgentSummary: (turnId: string, taskFlow: TaskBlock[]) => string;
   persistBootstrapProjection: (state: TState) => Promise<TState>;
-  phaseRunners?: SubmitAsyncWorkflowRunPhaseRunners<TState, TAbortController>;
+  phaseRunners?: SubmitAsyncWorkflowRunPhaseRunners<TAbortController>;
   PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: number;
   PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS: number;
   PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK: number;
@@ -495,7 +487,6 @@ export function projectSubmitBootstrapErrorConclusion<
           isGenerating: false,
           abortController: null,
           elapsedTime: input.elapsedTime,
-          pendingSlashCommand: null,
         }
       : {}),
   } as TState;
@@ -1706,9 +1697,6 @@ export async function runSubmitAsyncWorkflowRun<
   let acquiredRunOwner: SubmitBootstrapRunOwner | null = null;
   let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
   let userContent = input.text;
-  const activeStudioAgentKey = input.sessionGet().activeStudioAgentKey;
-  const gameStudioInitialized = input.sessionGet().gameStudioInitialized;
-
   try {
   const attachmentContext = await (phaseRunners.buildAttachmentContext || buildSubmitAttachmentContext)({
     text: input.text,
@@ -1761,27 +1749,6 @@ export async function runSubmitAsyncWorkflowRun<
     turnInputContextSignals: input.turnInputContextSignals,
   }).userContent;
 
-  const gameStudioPreparation = await (phaseRunners.runGameStudioPreparation || runSubmitGameStudioPreparation)({
-    currentMainModeKey: input.currentMainModeKey,
-    text: input.text,
-    userContent,
-    parsedSetupEngineCommand: input.parsedSetupEngineCommand,
-    parsedStudioCommand: input.parsedStudioCommand,
-    activeStudioAgentKey,
-    gameStudioInitialized,
-    cachedWorkspaceTreeForGameDetection: input.cachedWorkspaceTreeForGameDetection,
-    preferredLanguage: input.preferredLanguage,
-    runtimeService: input.runtimeService,
-    logWarning: input.logWarning,
-    sessionGet: input.sessionGet,
-    sessionSet: input.sessionSet,
-    invalidateWorkspaceTreeCache: input.invalidateWorkspaceTreeCache,
-  });
-  if (!gameStudioPreparation.ok) {
-    throw new Error(gameStudioPreparation.errorMessage || "Game Studio preparation did not complete.");
-  }
-  userContent = gameStudioPreparation.userContent;
-
   input.sessionSet({ contextMentions: [], attachedFiles: [] });
 
   const goalSourceContext = input.effectiveRunIntent === "goal"
@@ -1797,16 +1764,47 @@ export async function runSubmitAsyncWorkflowRun<
   // Resolve it before marking the harness/run as active so a read failure can
   // be finalized as a pre-run conclusion instead of stranding a running lease.
   let resolvedInstructionSnapshot: ResolvedInstructionSet | null = null;
-  if (input.refreshWorkspaceContext) {
+  let projectBaselineSnapshot: ProjectBaselineContext | null = null;
+  if (input.refreshWorkspaceAdmission) {
+    const admissionRefreshStartedAt = input.nowMs();
+    try {
+      const admission = await input.refreshWorkspaceAdmission(
+        input.runWorkspace,
+        input.text,
+      );
+      resolvedInstructionSnapshot = admission.instructions;
+      projectBaselineSnapshot = admission.baseline;
+      input.logStoreEvent("workspace_admission_refreshed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
+        skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
+        baselineFingerprint:
+          projectBaselineSnapshot?.fingerprints.overall || null,
+        warnings: [...(admission.warnings || [])],
+        elapsedMs: Math.round(input.nowMs() - admissionRefreshStartedAt),
+      });
+    } catch (error) {
+      input.logStoreEvent("workspace_admission_refresh_failed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } else if (input.refreshWorkspaceContext) {
     const instructionRefreshStartedAt = input.nowMs();
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
         input.runWorkspace,
+        input.text,
       );
       input.logStoreEvent("workspace_instructions_refreshed", {
         turnId: input.turnId,
         workspace: input.runWorkspace || "global",
         sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
+        skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
+        explicitSkillIds:
+          resolvedInstructionSnapshot?.skillCatalog?.explicitSkillIds || [],
         elapsedMs: Math.round(
           input.nowMs() - instructionRefreshStartedAt,
         ),
@@ -1824,18 +1822,45 @@ export async function runSubmitAsyncWorkflowRun<
     }
   }
 
-  const workspaceTreeStartedAt = input.nowMs();
-  const workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
-  input.logStoreEvent("workspace_tree_ready", {
-    turnId: input.turnId,
-    workspace: input.runWorkspace || "global",
-    chars: workspaceTree.length,
-    elapsedMs: Math.round(input.nowMs() - workspaceTreeStartedAt),
-  });
+  if (!input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
+    const baselineRefreshStartedAt = input.nowMs();
+    try {
+      projectBaselineSnapshot = await input.refreshProjectBaseline(
+        input.runWorkspace,
+      );
+      input.logStoreEvent("project_baseline_refreshed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        fingerprint: projectBaselineSnapshot?.fingerprints.overall || null,
+        elapsedMs: Math.round(input.nowMs() - baselineRefreshStartedAt),
+      });
+    } catch (error) {
+      input.logStoreEvent("project_baseline_refresh_failed", {
+        turnId: input.turnId,
+        workspace: input.runWorkspace || "global",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Runtime v2 consumes the typed baseline. Keep the legacy tree only as a
+  // compatibility fallback when baseline construction was unavailable.
+  let workspaceTree: string | null = null;
+  if (!projectBaselineSnapshot) {
+    const workspaceTreeStartedAt = input.nowMs();
+    workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
+    input.logStoreEvent("workspace_tree_ready", {
+      turnId: input.turnId,
+      workspace: input.runWorkspace || "global",
+      chars: workspaceTree.length,
+      elapsedMs: Math.round(input.nowMs() - workspaceTreeStartedAt),
+      source: "legacy_fallback",
+    });
+  }
 
   // Bootstrap work above intentionally runs without an execution lease. A
-  // workspace clear/delete can remove this Session while an attachment, Game
-  // Studio, or workspace discovery promise is pending. Key presence alone is
+  // workspace clear/delete can remove this Session while an attachment,
+  // instruction refresh, or workspace discovery promise is pending. Key presence alone is
   // insufficient because a recreated Session may reuse it: require the exact
   // runtime generation captured before the first await.
   if (!input.hasSessionRuntimeOwnership(initialRuntimeOwnerToken)) {
@@ -2029,7 +2054,11 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
-    gameStudioConfigForTurn: gameStudioPreparation.gameStudioConfigForTurn,
+    projectBaselineContext: projectBaselineSnapshot,
+    skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
+    networkRead: input.sessionGet().conversationTurns.find(
+      (turn: ConversationTurn) => turn.id === input.turnId,
+    )?.networkRead,
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,
     sendStartedAt: input.sendStartedAt,
@@ -2060,10 +2089,6 @@ export async function runSubmitAsyncWorkflowRun<
     set: input.sessionSet,
     getSessionRevisionToken: input.getSessionRevisionToken,
     context,
-    runtimeService: input.runtimeService,
-    studioActions: buildRuntimeV2StudioSetupActionPlan(
-      input.parsedSetupEngineCommand,
-    ),
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
     buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,

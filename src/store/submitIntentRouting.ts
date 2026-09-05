@@ -1,4 +1,3 @@
-import type { PendingSlashCommand } from "../lib/gameStudio/catalog";
 import type { MainModeKey } from "../lib/mainModes";
 import {
   inferCommandDirective,
@@ -40,7 +39,6 @@ export interface SubmitIntentRoutingInput<
   options?: TOptions;
   currentMainModeKey: MainModeKey;
   hasWorkspace: boolean;
-  parsedStudioCommand: PendingSlashCommand | null;
   isHidden: boolean;
   autoApproveTools: boolean;
   fallbackRunIntent: ResolvedRunIntent;
@@ -63,8 +61,6 @@ export interface SubmitIntentRoutingInput<
   planStage: PlanStage;
   isPlanApproved: boolean;
   currentTurnId: string | null;
-  isLocalFastStudioCommand: boolean;
-  unitySetupEngineSelected?: boolean;
   dismissedPendingDecisionInputKey?: string | null;
   currentConfig: TConfig;
   sendOriginSessionKey: string | null;
@@ -100,7 +96,6 @@ function looksLikeExecutionIntent(params: {
   return (
     params.shouldExecuteOnceFromReplyOption ||
     resolution.intent === "execute" ||
-    resolution.intent === "studio_workflow" ||
     resolution.commandDirective?.kind === "file_modify" ||
     resolution.commandDirective?.kind === "shell" ||
     resolution.commandDirective?.kind === "git" ||
@@ -130,9 +125,7 @@ export function resolveWorkspaceTurnRuntimeIntent(input: {
       input.resolution.intent === "discuss" ||
       input.resolution.intent === "analyze")
   ) {
-    return input.currentMainModeKey === "game_studio"
-      ? "studio_workflow"
-      : "execute";
+    return "execute";
   }
   return input.resolution.intent;
 }
@@ -175,7 +168,6 @@ export function resolveAndApplySubmitIntentRouting<
     preferredLanguage: input.preferredLanguage,
     options: input.options,
     currentMainModeKey: input.currentMainModeKey,
-    parsedStudioCommand: input.parsedStudioCommand,
     isHidden: input.isHidden,
     autoApproveTools: input.autoApproveTools,
     fallbackRunIntent: input.fallbackRunIntent,
@@ -192,7 +184,6 @@ export function resolveAndApplySubmitIntentRouting<
     previousTurnContinuationIntent: input.previousTurnContinuationIntent,
     shouldReuseExistingTurnIntent: input.shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
-    unitySetupEngineSelected: input.unitySetupEngineSelected,
   });
   let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
@@ -248,7 +239,6 @@ export function resolveAndApplySubmitIntentRouting<
       language: input.preferredLanguage,
       mainModeKey: input.currentMainModeKey,
       hasWorkspace: input.hasWorkspace,
-      parsedStudioCommand: input.parsedStudioCommand,
       hasPlanArtifacts: input.hasPlanArtifacts,
       planStage: input.planStage,
       isPlanApproved: input.isPlanApproved,
@@ -291,7 +281,7 @@ export function resolveAndApplySubmitIntentRouting<
 
     if (
       reuseLooksLikeExecutionIntent &&
-      (reuseResolution.intent === "execute" || reuseResolution.intent === "studio_workflow")
+      reuseResolution.intent === "execute"
     ) {
       effectiveRunIntent = reuseResolution.intent;
       effectiveCommandDirective =
@@ -329,7 +319,6 @@ export function resolveAndApplySubmitIntentRouting<
           language: input.preferredLanguage,
           mainModeKey: input.currentMainModeKey,
           hasWorkspace: input.hasWorkspace,
-          parsedStudioCommand: input.parsedStudioCommand,
           hasPlanArtifacts: input.hasPlanArtifacts,
           planStage: input.planStage,
           isPlanApproved: input.isPlanApproved,
@@ -423,7 +412,6 @@ export function resolveAndApplySubmitIntentRouting<
         preferredLanguage: input.preferredLanguage,
         resolution,
         effectiveCommandDirective,
-        isLocalFastStudioCommand: input.isLocalFastStudioCommand,
       });
       if (executionApprovalDecision.pendingRunDecision) {
         input.applyPreRunSessionPatch({
@@ -459,12 +447,7 @@ export function resolveAndApplySubmitIntentRouting<
   );
   if (!effectiveCommandDirective && shouldInferCommandDirective) {
     effectiveCommandDirective = inferCommandDirective(input.text, effectiveRunIntent, {
-      source: input.mainIntentShortcut
-        ? "main_shortcut"
-        : input.parsedStudioCommand?.type === "workflow"
-        ? "studio_slash"
-        : "natural_language",
-      parsedStudioCommand: input.parsedStudioCommand,
+      source: input.mainIntentShortcut ? "main_shortcut" : "natural_language",
     });
   }
 

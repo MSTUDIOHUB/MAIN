@@ -14,7 +14,6 @@ import {
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
   runtimeV2DirectExecuteReadyForConclusion,
-  runtimeV2ProviderRecoveryOccurrenceLimitReached,
   runtimeV2ProviderRecoveryStallExpired,
   RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
   runtimeV2CheckpointWriteFailureReason,
@@ -37,14 +36,11 @@ import {
   createRuntimeV2ToolPort,
 } from "./executionPorts";
 import {
-  RUNTIME_V2_EXECUTION_CONTRACT_MAX_REPAIR_ATTEMPTS,
-  deriveRuntimeV2ExecutionContractRepair,
-} from "./executionContract";
-import {
   runtimeV2ExecuteAcceptanceEvidenceRequirements,
 } from "./executionAcceptance";
 import {
   deriveRuntimeV2ProviderEffectFacts,
+  latestRuntimeV2CorrectiveMutationFailure,
 } from "./executionProviderEffectFacts";
 import {
   RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
@@ -62,7 +58,10 @@ import {
 } from "./executionRunnerIdentity";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
-import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import {
+  resolveRuntimeV2ObjectiveAdmission,
+  type RuntimeV2SubmissionContext,
+} from "./submissionContext";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -95,7 +94,7 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
 }
 
 /** Production adapter shared by visible Execute Turns, approved Plan
- * continuations, ordinary Studio workflows, and internal Goal slices. */
+ * continuations, and internal Goal slices. */
 export async function runSubmitRuntimeV2Execute(
   input: RuntimeV2ExecuteRunnerInput,
 ): Promise<RuntimeRunSettlement> {
@@ -192,6 +191,10 @@ export async function runSubmitRuntimeV2Execute(
 
   try {
     if (!existing) {
+      const admission = resolveRuntimeV2ObjectiveAdmission(
+        input.context,
+        turn.userPrompt,
+      );
       input.logStoreEvent("runtime_v2_execute_admitted", {
         turnId: identity.turn.turnId,
         runId: identity.run.runId,
@@ -202,22 +205,17 @@ export async function runSubmitRuntimeV2Execute(
         turn: identity.turn,
         run: identity.run,
         strategy: "execute",
-        objective:
-          input.context.executeAdmission?.objective ||
-          turn.userPrompt,
-        constraints:
-          input.context.executeAdmission?.constraints || [],
-        acceptanceCriteria:
-          input.context.executeAdmission?.acceptanceCriteria.map(
-            (criterion) => criterion.text,
-          ) || [turn.userPrompt],
-        acceptanceCriterionIds:
-          input.context.executeAdmission?.acceptanceCriteria.map(
-            (criterion) => criterion.id,
-          ) || ["criterion-user-objective"],
+        objective: admission.objective,
+        constraints: admission.constraints,
+        acceptanceCriteria: admission.acceptanceCriteria.map(
+          (criterion) => criterion.text,
+        ),
+        acceptanceCriterionIds: admission.acceptanceCriteria.map(
+          (criterion) => criterion.id,
+        ),
         acceptanceEvidenceRequirements:
           runtimeV2ExecuteAcceptanceEvidenceRequirements(
-            input.context.executeAdmission?.acceptanceCriteria,
+            admission.acceptanceCriteria,
           ),
         initialPhase: "preparing",
       });
@@ -390,17 +388,19 @@ export async function runSubmitRuntimeV2Execute(
       ) {
         const correctiveFailureCount =
           providerEffectFacts.correctiveMutationFailureToolCallIds?.size || 0;
+        const latestCorrectiveFailure =
+          latestRuntimeV2CorrectiveMutationFailure(providerEffectFacts);
+        const latestCorrectiveFailureSequence = Number(
+          latestCorrectiveFailure?.requirement?.sequence,
+        );
         const latestFailure = [...before.events].reverse().find(
           (event): event is Extract<
             (typeof before.events)[number],
             { type: "tool.completed" }
           > =>
             event.type === "tool.completed" &&
-            (
-              event.failureReasonCode === "mutation_source_lease_missing" ||
-              event.failureReasonCode === "mutation_source_text_mismatch" ||
-              event.failureReasonCode === "mutation_target_lease_mismatch"
-            ),
+            Number.isFinite(latestCorrectiveFailureSequence) &&
+            event.sequence === latestCorrectiveFailureSequence,
         );
         const latestDetail = String(
           latestFailure?.presentation?.message || "",
@@ -414,7 +414,9 @@ export async function runSubmitRuntimeV2Execute(
             failures: correctiveFailureCount,
             limit: RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
             latestFailureReasonCode:
-              latestFailure?.failureReasonCode || null,
+              latestFailure?.failureReasonCode ||
+              latestCorrectiveFailure?.requirement?.reasonCode ||
+              null,
           },
         );
         await controller.driveOnce({
@@ -431,76 +433,22 @@ export async function runSubmitRuntimeV2Execute(
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
-      const executionContractRepair =
-        deriveRuntimeV2ExecutionContractRepair(before);
       if (
-        executionContractRepair &&
-        executionContractRepair.attempts >=
-          RUNTIME_V2_EXECUTION_CONTRACT_MAX_REPAIR_ATTEMPTS
+        providerRecoveryPressure &&
+        runtimeV2ProviderRecoveryStallExpired(
+          providerRecoveryLease,
+          Date.now(),
+        )
       ) {
-        const latestContractFailure = [...before.events].reverse().find(
-          (event): event is Extract<
-            (typeof before.events)[number],
-            { type: "tool.completed" }
-          > =>
-            event.type === "tool.completed" &&
-            event.failureReasonCode === "execution_contract_rejected",
-        );
-        const rejectionDetail = latestContractFailure?.presentation?.message
-          ? ` ${String(latestContractFailure.presentation.message).slice(0, 1_000)}`
-          : "";
         input.logStoreEvent(
-          "runtime_v2_execution_contract_repair_limit_reached",
+          "runtime_v2_provider_recovery_stall_reached",
           {
             turnId: identity.turn.turnId,
             runId: identity.run.runId,
             phase: before.phase,
-            attempts: executionContractRepair.attempts,
-            latestSequence: executionContractRepair.latestSequence,
-            rejectionDetail: rejectionDetail.trim() || null,
-          },
-        );
-        await controller.driveOnce({
-          resultKind: before.evidence.some((evidence) =>
-              evidence.kind === "mutation"
-            )
-            ? "partial"
-            : "error",
-          resultReason: [
-            `执行契约连续 ${executionContractRepair.attempts} 次未通过结构或证据校验，MAIN 已停止重复生成，且没有把未获授权的方案当作成功。`,
-            rejectionDetail.trim(),
-          ].filter(Boolean).join(" "),
-        });
-        if (controller.snapshot().aggregate?.terminalOutcome) break;
-        continue;
-      }
-      if (
-        providerRecoveryPressure &&
-        (
-          runtimeV2ProviderRecoveryOccurrenceLimitReached(
-            providerRecoveryPressure,
-          ) ||
-          runtimeV2ProviderRecoveryStallExpired(
-            providerRecoveryLease,
-            Date.now(),
-          )
-        )
-      ) {
-        const occurrenceLimitReached =
-          runtimeV2ProviderRecoveryOccurrenceLimitReached(
-            providerRecoveryPressure,
-          );
-        input.logStoreEvent(
-          occurrenceLimitReached
-            ? "runtime_v2_provider_recovery_occurrence_limit_reached"
-            : "runtime_v2_provider_recovery_stall_reached",
-          {
-          turnId: identity.turn.turnId,
-          runId: identity.run.runId,
-          phase: before.phase,
-          reason: providerRecoveryPressure.reason,
-          occurrence: providerRecoveryPressure.occurrence,
-          recoveryStartedAt: providerRecoveryLease?.startedAt || null,
+            reason: providerRecoveryPressure.reason,
+            occurrence: providerRecoveryPressure.occurrence,
+            recoveryStartedAt: providerRecoveryLease?.startedAt || null,
           },
         );
         await controller.driveOnce(truthfulRuntimeV2RecoveryStallDecision({

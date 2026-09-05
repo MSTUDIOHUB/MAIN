@@ -48,8 +48,12 @@ impl NetworkGrant {
         allow_authorization: bool,
     ) -> Result<Self, NetworkGuardError> {
         let mut allowed_origins = Vec::new();
+        let mut allow_proxy_virtual_dns = false;
         for raw in urls {
             let url = validate_network_url(raw)?;
+            if matches!(url.host(), Some(Host::Domain(_))) {
+                allow_proxy_virtual_dns = true;
+            }
             let origin = NetworkOrigin::from_url(&url)?;
             if !allowed_origins.contains(&origin) {
                 allowed_origins.push(origin);
@@ -62,7 +66,7 @@ impl NetworkGrant {
             allowed_origins,
             allow_authorization,
             address_policy: NetworkAddressPolicy::PublicOnly,
-            allow_proxy_virtual_dns: false,
+            allow_proxy_virtual_dns,
         })
     }
 
@@ -546,5 +550,23 @@ mod tests {
             true,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn from_urls_accepts_proxy_virtual_dns_for_domain_origins() {
+        let grant = NetworkGrant::from_urls(
+            ["https://wttr.in/Shenyang?format=j1", "https://duckduckgo.com/html"],
+            false,
+        )
+        .unwrap();
+        let target = grant.authorize_url("https://wttr.in/Shenyang?format=j1").unwrap();
+        let proxy_virtual: IpAddr = "198.18.0.99".parse().unwrap();
+        assert!(target.validate_resolved_addresses(&[proxy_virtual]).is_ok());
+
+        let private: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(matches!(
+            target.validate_resolved_addresses(&[private]),
+            Err(NetworkGuardError::ForbiddenAddress(address)) if address == private
+        ));
     }
 }

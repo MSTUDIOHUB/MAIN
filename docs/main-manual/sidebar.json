@@ -50,7 +50,7 @@
           "path": "main-modes.md",
           "title": "MAIN 场景",
           "sidebarTitle": "MAIN 场景",
-          "description": "理解通用协作、创意共创、工程实现、研究分析和游戏工作室。"
+          "description": "理解统一 MAIN 工作流与图像工作室的能力边界。"
         },
         {
           "slug": "run-modes",
@@ -171,7 +171,7 @@
           "path": "skills-and-protocols.md",
           "title": "技能与协议包",
           "sidebarTitle": "技能与协议包",
-          "description": "使用提示词技能、工具型技能和协议包扩展 MAIN。"
+          "description": "使用 Agent Skills、工作区 SKILL.md 和协议包扩展 MAIN。"
         },
         {
           "slug": "feishu-remote-control",
@@ -179,13 +179,6 @@
           "title": "飞书远程控制",
           "sidebarTitle": "飞书远程控制",
           "description": "通过飞书机器人发送任务并远程审批。"
-        },
-        {
-          "slug": "game-studio",
-          "path": "game-studio.md",
-          "title": "Game Studio",
-          "sidebarTitle": "Game Studio",
-          "description": "使用游戏工作室、slash 命令、专业 Agent 和模板。"
         }
       ]
     },

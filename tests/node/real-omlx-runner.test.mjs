@@ -77,6 +77,11 @@ test("real OMLX E2E identity and acceptance are model-neutral and debug-tail ind
   assert.match(structuralAssertionsSource, /sourceToolCallId/);
   assert.match(structuralAssertionsSource, /successCriteria/);
   assert.match(structuralAssertionsSource, /peakInFlight/);
+  assert.match(e2eBridgeSource, /source\.endsWith\("\.model_lane_admission"\)/);
+  assert.match(
+    structuralAssertionsSource,
+    /expect\(\s*diagnostics\.modelLaneOverlapObserved,[\s\S]*?\)\.toBe\(true\)/,
+  );
   assert.doesNotMatch(
     structuralAssertionsSource,
     /### \(\?:已启动并行只读调查\|并行只读调查已汇合\|当前阶段：\)\/\.test[\s\S]*\)\)\.toBe\(true\)/,

@@ -42,7 +42,6 @@ const folderIconByName = {
   assets: "text-[#f59e0b]",
   components: "text-[#38bdf8]",
   docs: "text-[#86d9a3]",
-  gamestudiopack: "text-[#a78bfa]",
   lib: "text-[#38bdf8]",
   public: "text-[#f59e0b]",
   scripts: "text-[#38bdf8]",

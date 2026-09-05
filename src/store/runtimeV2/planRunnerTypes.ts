@@ -4,6 +4,7 @@ type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
 
 export interface RuntimeV2PlanRunnerInput {
+  readonly lifecycleDeadlineAt?: number;
   readonly get: StoreGet;
   readonly set: StoreSet;
   readonly context: RuntimeV2SubmissionContext;

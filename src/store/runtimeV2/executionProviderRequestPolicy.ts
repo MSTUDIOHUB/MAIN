@@ -4,6 +4,7 @@ import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   RuntimeV2ProviderProtocolError,
   type RuntimeV2Command,
+  type RuntimeV2ProviderRecoveryPressure,
 } from "../../lib/runtime-v2";
 import type {
   RuntimeV2ExecutionPortsInput,
@@ -13,15 +14,11 @@ import type {
 export const RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS = 8_192;
 export const RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS = 4_096;
 export const RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS = 2_048;
-export const RUNTIME_V2_EXECUTION_CONTRACT_MAX_OUTPUT_TOKENS = 4_096;
 export const RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS = 2_048;
 export const RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS = 2_048;
 export const RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT = 4_000;
 export const RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT = 3_000;
 export const RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT = 1_000;
-export const RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT = 1_200;
-export const RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT =
-  12_000;
 
 export function runtimeV2CurrentToolSurfaceInstruction(
   tools: readonly ToolDefinition[],
@@ -53,24 +50,20 @@ export function runtimeV2ExecutionEffectiveToolChoice(input: {
   readonly textEnvelope: boolean;
   readonly forceStructuredAction?: boolean;
 }): OpenAiToolChoice | null {
-  if (!input.textEnvelope && input.tools.length === 1) {
-    const name = input.tools[0]?.function.name;
-    if (name === "record_execution_contract") {
-      return { type: "function", function: { name } };
-    }
-  }
   if (
     !input.textEnvelope &&
     input.forceStructuredAction &&
     input.tools.length > 0
   ) {
-    if (input.tools.length === 1) {
-      const name = input.tools[0]!.function.name;
-      return { type: "function", function: { name } };
-    }
     return "required";
   }
   return input.requested;
+}
+
+export function runtimeV2RecoveryRequiresStructuredAction(
+  pressure: RuntimeV2ProviderRecoveryPressure | null | undefined,
+): boolean {
+  return !!pressure;
 }
 
 export function shouldRetryRuntimeV2WithoutReasoning(input: {
@@ -99,8 +92,7 @@ export function runtimeV2ProviderOutputWasTruncated(input: {
   readonly toolCallCount: number;
   readonly availableToolCount: number;
 }): boolean {
-  return input.availableToolCount > 0 &&
-    input.finishReason === "length" &&
+  return input.finishReason === "length" &&
     input.toolCallCount === 0;
 }
 
@@ -130,16 +122,13 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
   _textEnvelope: boolean,
   budget?: Pick<RuntimeContextBudget, "outputBudget"> | null,
   actionWindow?: RuntimeV2ProviderActionWindow | null,
-  contractOnlyAction = false,
 ): number {
   const mode = String(command.payload.mode || "").trim();
   const recoveryPressure = command.payload.recoveryPressure;
   const recovering = !!recoveryPressure &&
     typeof recoveryPressure === "object" &&
     !Array.isArray(recoveryPressure);
-  const modeLimit = contractOnlyAction
-    ? RUNTIME_V2_EXECUTION_CONTRACT_MAX_OUTPUT_TOKENS
-    : actionWindow || recovering
+  const modeLimit = actionWindow || recovering
     ? RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS
     : mode === "validate"
       ? RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS
@@ -168,7 +157,6 @@ export function runtimeV2ExecutionReasoningRequest(input: {
   readonly sourceOnlyFrontier: boolean;
   readonly hasMutationTool: boolean;
   readonly providerSupportsReasoningToggle: boolean;
-  readonly contractOnlyAction?: boolean;
   readonly structuredActionRequired?: boolean;
   readonly recoveringFromRejectedAction?: boolean;
   readonly recoveryStage?: string;
@@ -180,7 +168,7 @@ export function runtimeV2ExecutionReasoningRequest(input: {
   // a required tool schema as prose. Decode the next structured action
   // directly when the adapter exposes a documented reasoning toggle.
   if (
-    (input.contractOnlyAction || input.structuredActionRequired) &&
+    input.structuredActionRequired &&
     input.providerSupportsReasoningToggle
   ) {
     return "off";

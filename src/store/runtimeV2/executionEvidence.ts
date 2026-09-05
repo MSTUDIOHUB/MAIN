@@ -1,3 +1,4 @@
+import { readOnlyEvidenceVersion } from "../../lib/runtime-v2/readOnlyProgress";
 import {
   runtimeV2EvidenceVersion,
   type RuntimeV2Command,
@@ -14,18 +15,17 @@ import {
   type ValidationPrimitiveSpec,
 } from "../../lib/validationContract";
 import type { ToolDiffPreview } from "../../lib/toolDiff";
-import {
-  isWorkspaceMutationToolName,
-  resolveWorkspaceMutationTargets,
-} from "../../lib/workspaceMutationTools";
-import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
-import { authorizationFor } from "./executionAuthorization";
+import { authorizationFor } from "./executionAuthorizationContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
 import type {
   RuntimeV2ExecutionPortsInput,
   RuntimeV2LiveExecutionState,
 } from "./executionTypes";
+import {
+  runtimeV2ToolEvidenceProjection,
+  runtimeV2ToolHasStructuredValidatorContract,
+} from "./executionEffectEvidence";
 
 type RuntimeV2ToolFailureKind = NonNullable<Extract<
   RuntimeV2EventDraft,
@@ -66,7 +66,10 @@ export function toolDefinitionExists(
 ): boolean {
   const resolution = authorizationFor(input).toolCatalog.lookup(name);
   return resolution.status === "resolved" &&
-    resolution.entry.source === "built_in";
+    (
+      resolution.entry.source === "built_in" ||
+      resolution.entry.source === "mcp"
+    );
 }
 
 function toolResultEvent(
@@ -474,26 +477,24 @@ export function toolCompletionFor(
     diffPreview,
   });
   if (command.kind !== "execute_validation") {
-    const targets = isWorkspaceMutationToolName(toolName)
-      ? resolveWorkspaceMutationTargets(toolName, args, target)
-      : [target || toolName];
-    const evidenceKind = isWorkspaceMutationToolName(toolName)
-      ? "mutation" as const
-      : RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)
-        ? "source" as const
-        : "tool" as const;
+    const projection = runtimeV2ToolEvidenceProjection({
+      ports: input,
+      toolName,
+      args,
+      target,
+    });
     return toolResultEvent(
       command,
       status,
       status === "succeeded"
-        ? targets.map((resolvedTarget) => ({
+        ? projection.targets.map((resolvedTarget) => ({
             id: nextEvidenceId(input.live),
-            kind: evidenceKind,
+            kind: projection.kind,
             target: resolvedTarget,
-            version: evidenceKind === "source"
+            version: projection.kind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
-              : evidenceKind === "tool"
-                ? runtimeV2ValidationEvidenceVersion(output)
+              : projection.kind === "tool"
+                ? readOnlyEvidenceVersion(toolName, output) || runtimeV2ValidationEvidenceVersion(output)
                 : null,
           }))
         : [],
@@ -505,6 +506,7 @@ export function toolCompletionFor(
     );
   }
   const passed = status === "succeeded" &&
+    runtimeV2ToolHasStructuredValidatorContract(input, toolName) &&
     isRuntimeV2ValidationPassed(toolName, output, undefined);
   const validationFailureKind =
     failureKind === "source_mismatch" ||

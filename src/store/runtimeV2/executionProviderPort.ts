@@ -1,3 +1,4 @@
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
 import {
   providerActionEpochExhausted,
@@ -39,6 +40,9 @@ import {
   executeRuntimeV2ProviderWithDeadline,
   isRuntimeV2ExecutionProviderTimeout,
 } from "./executionProviderDeadline";
+import {
+  requestRuntimeV2ProviderWithEmptySurface,
+} from "./executionProviderEmptySurface";
 import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
@@ -91,39 +95,12 @@ export function createRuntimeV2ProviderPort(
       });
 
       if (tools.length === 0) {
-        let result;
-        try {
-          result = await executeRuntimeV2ProviderWithDeadline({
-            ports: input,
-            command,
-            requestDeadlineAt,
-            transport: null,
-            signal,
-            task: (request) => requestRuntimeV2ProviderOnce({
-              live: input.live,
-              ports: input,
-              command,
-              tools: [],
-              textEnvelope: false,
-              toolChoice: null,
-              signal: request.signal,
-              timeoutMs: request.timeoutMs,
-            }),
-          });
-        } catch (error) {
-          if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
-          if (isRuntimeV2ProviderProtocolError(error)) throw error;
-          throw runtimeV2ProviderAttemptFailure(error);
-        }
-        result = {
-          ...result,
-          toolCalls: scopeRuntimeV2ProviderToolCallIds(
-            result.toolCalls,
-            () => input.nextId("provider-tool-call"),
-          ),
-        };
-        rememberRuntimeV2ProviderResult(input, result);
-        return result;
+        return requestRuntimeV2ProviderWithEmptySurface({
+          ports: input,
+          command,
+          requestDeadlineAt,
+          signal,
+        });
       }
 
       let epoch: {
@@ -174,9 +151,6 @@ export function createRuntimeV2ProviderPort(
                   attempt.textEnvelope,
                   input.context.runtimeContextBudget,
                   input.live.latestProviderActionWindow,
-                  tools.length === 1 &&
-                    tools[0]?.function.name ===
-                      "record_execution_contract",
                 ),
               });
               return requestRuntimeV2ProviderOnce({
@@ -197,7 +171,9 @@ export function createRuntimeV2ProviderPort(
               result.toolCalls,
               tools,
               input.context.runWorkspace,
-            ),
+            ).map((call) => isReadOnlyContext(input) && call.name === "web_search"
+              ? { ...call, arguments: { ...call.arguments, provider: readOnlyNetworkPolicy(input).provider } }
+              : call),
           };
           if (result.toolCalls.length > 0) {
             input.live.provenStructuredToolTransports.add(attempt.variant);

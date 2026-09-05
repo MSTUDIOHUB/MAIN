@@ -1,3 +1,4 @@
+import { normalizeNetworkRead } from "../lib/networkRead";
 import {
   WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
   WORKSPACE_INSTRUCTION_SOURCES,
@@ -308,6 +309,7 @@ export function normalizeWorkspaceInstructionReceipt(
     turnId: value.turnId,
     userBlockId: Number(value.userBlockId),
     acceptedAt: value.acceptedAt,
+    ...(value.networkRead ? { networkRead: normalizeNetworkRead(value.networkRead) } : {}),
   });
 }
 

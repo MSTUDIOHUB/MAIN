@@ -5,6 +5,7 @@ import {
   createRuntimeV2Checkpoint,
   finishRuntimeV2CheckpointTerminal,
   shouldRecordRuntimeV2SoftSignal,
+  runtimeV2SubagentHandoffApplicationDrafts,
   type CheckpointPort,
   type ProjectionPort,
   type RuntimeV2Command,
@@ -66,7 +67,33 @@ export class PlanLedger {
     }
     this.revision = result.checkpoint.revision;
     this.aggregate = result.checkpoint.aggregate;
+    if (event.type === "work_plan.sealed") {
+      await this.appendSealedPlanHandoffs(event);
+    }
     return event;
+  }
+
+  private async appendSealedPlanHandoffs(
+    sourceEvent: Extract<RuntimeV2Event, { type: "work_plan.sealed" }>,
+  ): Promise<void> {
+    const aggregate = this.aggregate;
+    if (!aggregate) return;
+    for (const handoff of runtimeV2SubagentHandoffApplicationDrafts({
+      state: aggregate,
+      sourceEvent,
+    })) {
+      await this.append(handoff);
+    }
+  }
+
+  async reconcileSealedPlanHandoffs(): Promise<void> {
+    const sourceEvent = [...(this.aggregate?.events || [])]
+      .reverse()
+      .find((event): event is Extract<
+        RuntimeV2Event,
+        { type: "work_plan.sealed" }
+      > => event.type === "work_plan.sealed");
+    if (sourceEvent) await this.appendSealedPlanHandoffs(sourceEvent);
   }
 
   async settleCommand(
@@ -91,6 +118,17 @@ export class PlanLedger {
     return event;
   }
 
+  async appendProgress(draft: RuntimeV2EventDraft): Promise<RuntimeV2Event> {
+    const event = await this.append(draft);
+    if (this.aggregate?.run && !this.aggregate.terminalOutcome) {
+      await this.publish(buildRuntimeV2CapsuleProjection(
+        this.aggregate,
+        this.nextId("runtime-v2-plan-capsule"),
+      ));
+    }
+    return event;
+  }
+
   async schedule(
     run: RuntimeV2RunIdentity,
     kind: RuntimeV2Command["kind"],
@@ -105,9 +143,21 @@ export class PlanLedger {
       phase,
       payload,
     };
+    await this.scheduleCommand(command);
+    return command;
+  }
+
+  async scheduleCommand(command: RuntimeV2Command): Promise<void> {
+    const phase = this.aggregate?.phase;
+    if (!phase || phase === "completed") {
+      throw new Error("RUNTIME_V2_PLAN_RUN_NOT_ACTIVE");
+    }
+    if (command.phase !== phase) {
+      throw new Error("RUNTIME_V2_PLAN_COMMAND_PHASE_MISMATCH");
+    }
     await this.append({
       type: "command.scheduled",
-      run,
+      run: command.run,
       command,
     });
     const aggregate = this.aggregate!;
@@ -120,7 +170,6 @@ export class PlanLedger {
       command,
       this.nextId("runtime-v2-plan-timeline"),
     ));
-    return command;
   }
 
   async publish(projection: RuntimeV2Projection): Promise<void> {

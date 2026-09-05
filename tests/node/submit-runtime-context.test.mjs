@@ -72,7 +72,17 @@ function baseInput(overrides = {}) {
     workspaceTree: "[F] src/App.tsx",
     workspaceInstructionContext:
       "## AGENTS.md\nSource: AGENTS.md\nRun focused tests.",
-    gameStudioConfigForTurn: { engine: "unity", activeStudioAgent: "unity-specialist" },
+    projectBaselineContext: {
+      kind: "project_baseline_context",
+      workspace: { identity: "workspace-1" },
+      fingerprints: { overall: "baseline-1" },
+    },
+    skillCatalog: {
+      entries: [],
+      explicitSkillIds: [],
+      warnings: [],
+      loadedAt: 1,
+    },
     abortCtrl: { signal: { aborted: false } },
     timerInterval: "timer-1",
     sendStartedAt: 123,
@@ -82,6 +92,7 @@ function baseInput(overrides = {}) {
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["README.md"],
       subagentPreference: "preferred",
+      subagentRequirement: "required",
     },
     turnAgentMessagesStart: 4,
     getElapsedSeconds: () => 9,
@@ -113,7 +124,10 @@ test("submit runtime context carries immutable turn parameters and initializes m
     context.workspaceInstructionContext,
     input.workspaceInstructionContext,
   );
+  assert.equal(context.projectBaselineContext, input.projectBaselineContext);
+  assert.equal(context.skillCatalog, input.skillCatalog);
   assert.deepEqual(context.turnInputContextSignals, input.turnInputContextSignals);
+  assert.equal(context.turnInputContextSignals.subagentRequirement, "required");
   assert.equal(context.getElapsedSeconds(), 9);
   assert.equal(context.streamBuffer, null);
   assert.equal(context.thinkingInterceptor, null);

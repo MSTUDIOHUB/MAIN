@@ -47,7 +47,7 @@ export function runtimeV2StructuredActionMarkdown(
 ): string {
   switch (command.kind) {
     case "collect_observation":
-      return "正在收集与当前目标相关的代码证据。";
+      return "正在收集与当前目标相关的上下文与证据。";
     case "request_model": {
       const mode = String(command.payload.mode || "");
       const recoveryPressure =
@@ -65,17 +65,17 @@ export function runtimeV2StructuredActionMarkdown(
       }
       const labels: Record<string, string> = {
         chat: "正在理解当前问题，并结合本轮对话上下文组织完整回复。",
-        analyze: "正在结合工作区的实际只读证据形成完整答复。",
+        analyze: "正在结合实际只读证据形成完整答复。",
         observe: "正在根据已读证据判断根本原因。",
         plan: "正在把已确认的事实整理成可审核的修复计划。",
         execute: context?.strategy === "plan"
           ? "正在依据已批准的计划选择下一项安全修改。"
           : command.payload.executePolicy === "mutation_required"
-            ? "正在把已确认的证据转化为下一项代码修改。"
+            ? "正在把已确认的证据转化为下一项执行修改。"
             : command.payload.executePolicy ===
                 "source_reorientation_required"
-              ? "上一次修改目标不属于当前工作区，正在重新定位真实源码。"
-            : "正在确认实施修复所需的源码细节。",
+              ? "上一次修改目标不属于当前工作区，正在重新定位目标文件。"
+            : "正在确认实施方案所需的关键细节。",
         validate: "正在根据验收条件检查当前实现。",
       };
       return labels[mode] || "正在根据当前证据决定下一步。";
@@ -83,9 +83,11 @@ export function runtimeV2StructuredActionMarkdown(
     case "execute_tool": {
       const tool = String(command.payload.toolName || "").trim();
       const target = readTarget(command, context?.turn.workspaceKey);
-      if (/read|open|outline/i.test(tool)) return `正在读取 ${target}，确认与当前问题相关的实现。`;
-      if (/search|grep|glob|find/i.test(tool)) return `正在搜索 ${target}，收窄需要检查的代码范围。`;
-      if (/patch|replace|write|edit/i.test(tool)) return `正在修改 ${target}，落实已经确认的修复方案。`;
+      if (tool === "web_search") return `正在联网搜索 ${target}，获取最新信息。`;
+      if (tool === "web_fetch") return `正在抓取网页 ${target} 的详细内容。`;
+      if (/read|open|outline/i.test(tool)) return `正在读取 ${target}，确认与当前问题相关的上下文与实现。`;
+      if (/search|grep|glob|find/i.test(tool)) return `正在搜索 ${target}，收窄需要检查的范围。`;
+      if (/patch|replace|write|edit/i.test(tool)) return `正在修改 ${target}，落实已经确认的方案。`;
       if (/command|shell|run|test|build/i.test(tool)) return `正在运行 ${target}，验证最新修改是否符合预期。`;
       return `正在执行 ${markdownCode(tool || "当前工具")}：${target}`;
     }
@@ -98,7 +100,7 @@ export function runtimeV2StructuredActionMarkdown(
     case "publish_projection":
       return "正在同步最新任务状态。";
     case "finalize_turn":
-      return context?.strategy === "chat"
+      return context?.strategy === "chat" || context?.strategy === "analyze"
         ? "正在整理本轮对话的完整回复。"
         : "正在整理已验证的结果与仍需说明的边界。";
   }
@@ -287,7 +289,7 @@ export function buildRuntimeV2FinalProjection(
   reason: string,
   finalMarkdown?: string,
 ): RuntimeV2Projection {
-  if (aggregate.strategy === "chat") {
+  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze" || (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)) {
     return projection(
       aggregate,
       "final",

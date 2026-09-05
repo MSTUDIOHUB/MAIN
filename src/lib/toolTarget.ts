@@ -15,6 +15,7 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
       (args.collaboration_task_ids as string) || "all subagents";
     case "cancel_subagent": return (args.subagent_id as string) ||
       (args.collaboration_task_id as string) || "subagent";
+    case "load_skill": return (args.skill_id as string) || "Skill";
     case "list_directory": return (args.path as string) || ".";
     case "read_file": return (args.path as string) || "";
     case "read_document": return (args.path as string) || "";
@@ -53,6 +54,14 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "replace_in_file": return (args.path as string) || "";
     case "write_file": return (args.path as string) || "";
     case "apply_patch": return summarizeApplyPatchTarget((args.patch as string) || "") || "workspace patch";
-    default: return (args.input as string) || name;
+    // Extension tools commonly identify their effect with path/URI/URL/target
+    // rather than the legacy generic input field. Preserve that structured
+    // target in receipts so an MCP effect is not reduced to only its tool name.
+    default: return (args.path as string) ||
+      (args.uri as string) ||
+      (args.url as string) ||
+      (args.target as string) ||
+      (args.input as string) ||
+      name;
   }
 }

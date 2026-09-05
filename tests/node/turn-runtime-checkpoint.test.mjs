@@ -129,6 +129,11 @@ test("checkpoint v2 migrates v1 collaboration state and rejects unknown schemas 
   });
   assert.equal(migrated?.schemaVersion, "turn-runtime-checkpoint.v2");
   assert.deepEqual(migrated?.planning.collaborationLedger.entries, []);
+  assert.equal(
+    migrated?.input.admittedUserContext.subagentRequirement,
+    "optional",
+    "legacy checkpoints default to optional collaboration instead of inventing a user requirement",
+  );
   const circular = { ...checkpoint };
   circular.self = circular;
   assert.equal(
@@ -171,6 +176,7 @@ test("checkpoint retains typed admitted payload and monotonic visual observation
       mentionedFilePaths: ["src/ChatArea.tsx"],
       attachedFilePaths: ["notes/incident.md"],
       subagentPreference: "preferred",
+      subagentRequirement: "required",
       diagnosisRequirement: "required",
     },
     updatedAt: 102,
@@ -180,6 +186,7 @@ test("checkpoint retains typed admitted payload and monotonic visual observation
     mentionedFilePaths: ["src/ChatArea.tsx"],
     attachedFilePaths: ["notes/incident.md"],
     subagentPreference: "preferred",
+    subagentRequirement: "required",
     diagnosisRequirement: "required",
   });
   assert.equal(checkpoint.input.visualContext.status, "queued");

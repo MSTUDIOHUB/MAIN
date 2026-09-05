@@ -87,8 +87,6 @@ function createHarness(overrides = {}) {
   const runtimeOwnerToken = {};
   let now = 1000;
   const state = {
-    activeStudioAgentKey: "coder",
-    gameStudioInitialized: false,
     isPlanApproved: false,
     planStage: "idle",
     planArtifacts: [],
@@ -118,12 +116,6 @@ function createHarness(overrides = {}) {
       calls.push(["session_set", patch]);
     }
   };
-  const runtimeService = {
-    ensureInitialized: async () => ({ activeStudioAgent: "coder" }),
-    configureEngine: async () => ({ activeStudioAgent: "coder" }),
-    loadConfig: async () => null,
-    buildTurnEnvelope: () => "[studio envelope]",
-  };
   const abortController = new AbortController();
   const baseInput = {
     text: "继续",
@@ -137,9 +129,6 @@ function createHarness(overrides = {}) {
     runSessionId: 7,
     runScopeKey: "/tmp/workspace",
     currentMainModeKey: "main_mode",
-    parsedSetupEngineCommand: null,
-    parsedStudioCommand: null,
-    cachedWorkspaceTreeForGameDetection: "",
     preferredLanguage: "zh",
     effectiveRunIntent: "execute",
     runtimeRunIntent: "execute",
@@ -209,9 +198,6 @@ function createHarness(overrides = {}) {
     analyzeTabularDocument: async () => {
       throw new Error("unexpected analyzeTabularDocument");
     },
-    runtimeService,
-    logWarning: (event, data) => calls.push(["warning", event, data]),
-    invalidateWorkspaceTreeCache: () => calls.push(["invalidate_tree"]),
     createAbortController: () => abortController,
     getCurrentHarnessInstanceId: () => "instance-1",
     readHarnessRunMarker: () => null,
@@ -568,12 +554,19 @@ test("submit async workflow run keeps stage order from context build to engine l
     associatedPaths: [],
     loadedAt: 1,
     debugSummary: "",
+    skillCatalog: {
+      entries: [{ id: "panel:review", name: "review" }],
+      explicitSkillIds: ["panel:review"],
+      warnings: [],
+      loadedAt: 1,
+    },
   };
   const harness = createHarness({
     input: {
-      refreshWorkspaceContext: async (workspace) => {
+      refreshWorkspaceContext: async (workspace, userPrompt) => {
         harness.calls.push(["instruction_refresh"]);
         assert.equal(workspace, "/tmp/workspace");
+        assert.equal(userPrompt, "继续");
         return runInstructionSnapshot;
       },
       phaseRunners: {
@@ -592,16 +585,6 @@ test("submit async workflow run keeps stage order from context build to engine l
           ]);
           return { userContent: "prompt content" };
         },
-        runGameStudioPreparation: async (input) => {
-          harness.calls.push(["studio", input.userContent, input.activeStudioAgentKey, input.gameStudioInitialized]);
-          return {
-            ok: true,
-            userContent: "studio content",
-            activeStudioAgentKey: "coder",
-            gameStudioInitialized: true,
-            gameStudioConfigForTurn: { activeStudioAgent: "coder", engine: "unity" },
-          };
-        },
         startRunLease: (input) => {
           harness.calls.push(["lease", input.userContent, input.runSessionKey]);
           return {
@@ -615,9 +598,9 @@ test("submit async workflow run keeps stage order from context build to engine l
           harness.calls.push([
             "context",
             input.workspaceTree,
-            input.gameStudioConfigForTurn?.engine,
             input.turnAgentMessagesStart,
             input.workspaceInstructionContext,
+            input.skillCatalog,
           ]);
           return {
             ...input,
@@ -644,7 +627,6 @@ test("submit async workflow run keeps stage order from context build to engine l
     [
       "attachment",
       "prompt",
-      "studio",
       "clear_context",
       "instruction_refresh",
       "log",
@@ -665,12 +647,58 @@ test("submit async workflow run keeps stage order from context build to engine l
     "assistant:turn-1",
   ]);
   assert.equal(
-    harness.calls[5][1],
+    harness.calls[4][1],
     "workspace_instructions_refreshed",
   );
-  assert.equal(harness.calls[7][1], "workspace_tree_ready");
-  assert.equal(harness.calls[9][1], "[D] src");
-  assert.match(harness.calls[9][4], /Run focused tests/);
+  assert.equal(harness.calls[6][1], "workspace_tree_ready");
+  assert.equal(harness.calls[8][1], "[D] src");
+  assert.match(harness.calls[8][3], /Run focused tests/);
+  assert.equal(
+    harness.calls[8][4],
+    runInstructionSnapshot.skillCatalog,
+    "the exact admitted Skill snapshot must reach Runtime context",
+  );
+});
+
+test("composite workspace admission freezes one baseline and skips the legacy tree prefetch", async () => {
+  const baseline = Object.freeze({
+    kind: "project_baseline_context",
+    workspace: Object.freeze({
+      canonicalPath: "/tmp/workspace",
+      identity: "workspace-a",
+    }),
+    fingerprints: Object.freeze({ overall: "baseline-a" }),
+  });
+  let captured = null;
+  const harness = createHarness({
+    input: {
+      refreshWorkspaceAdmission: async (workspace) => {
+        assert.equal(workspace, "/tmp/workspace");
+        return { instructions: null, baseline, warnings: [] };
+      },
+      phaseRunners: {
+        createRuntimeContext: (input) => {
+          captured = input;
+          return {
+            ...input,
+            streamBuffer: null,
+            thinkingInterceptor: null,
+            agentBlockIdsCreatedThisRun: new Set(),
+          };
+        },
+        runRuntime: () => Promise.resolve(true),
+      },
+    },
+  });
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(captured.projectBaselineContext, baseline);
+  assert.equal(captured.workspaceTree, null);
+  assert.equal(
+    harness.calls.some((entry) => entry[0] === "workspace_tree"),
+    false,
+  );
 });
 
 test("an admitted A Run keeps its A instruction snapshot when the UI switches to B", async () => {
@@ -740,56 +768,6 @@ test("an admitted A Run keeps its A instruction snapshot when the UI switches to
   assert.equal(harness.state.resolvedInstructionSet, bInstructions);
 });
 
-test("submit async workflow run stops before launch when Game Studio preparation fails", async () => {
-  const harness = createHarness({
-    input: {
-      phaseRunners: {
-        buildAttachmentContext: async () => ({
-          userContent: "attachment content",
-          attachmentRefs: [],
-          failedAttachmentCount: 0,
-        }),
-        buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: false,
-          userContent: "prompt content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: false,
-          gameStudioConfigForTurn: null,
-          errorMessage: "failed",
-        }),
-        startRunLease: () => {
-          throw new Error("should not start lease");
-        },
-        runRuntime: () => {
-          throw new Error("should not start engine");
-        },
-      },
-    },
-  });
-
-  await runSubmitAsyncWorkflowRun(harness.input);
-
-  assert.equal(harness.calls.some((entry) => entry[0] === "clear_context"), false);
-  assert.equal(harness.calls.some((entry) => entry[0] === "workspace_tree"), false);
-  assert.equal(harness.calls.some((entry) => entry[0] === "engine"), false);
-  assert.equal(harness.state.conversationTurns[0].status, "done");
-  assert.equal(harness.state.conversationTurns[0].runtimeOutcome.status, "completed");
-  assert.equal(harness.state.conversationTurns[0].runtimeOutcome.resultKind, "error");
-  assert.match(harness.state.conversationTurns[0].summary, /failed/);
-  assert.deepEqual(harness.state.runtimeEvents.map((event) => event.type), [
-    "run.started",
-    "run.completed",
-    "turn.completed",
-  ]);
-  assert.equal(harness.state.runtimeEvents.at(-2).resultKind, "error");
-  assert.equal(harness.state.runtimeEvents.at(-1).resultKind, "error");
-  assert.equal(
-    harness.state.taskFlow.filter((block) => block.visibility === "assistant_final").length,
-    1,
-  );
-});
-
 test("Goal continuation becomes active only after its exact Run lease is acquired", async () => {
   const authorization = {
     kind: "goal_continuation_authorization",
@@ -812,13 +790,6 @@ test("Goal continuation becomes active only after its exact Run lease is acquire
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "resume" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "resume",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: false,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: () => {
           harness.calls.push(["exact_resume_lease"]);
           return {
@@ -875,16 +846,9 @@ test("submit async workflow run awaits the workflow engine terminal transaction"
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: () => ({
           turnAgentMessagesStart: 0,
-          agentUserMessage: { role: "user", content: "studio content" },
+          agentUserMessage: { role: "user", content: "prompt content" },
           abortController: new AbortController(),
           harnessRunMarker: { runId: "run-1" },
         }),
@@ -965,13 +929,6 @@ test("a projected review pause closes the provider lease and preserves the pendi
       failedAttachmentCount: 0,
     }),
     buildPromptContext: () => ({ userContent: "plan" }),
-    runGameStudioPreparation: async () => ({
-      ok: true,
-      userContent: "plan",
-      activeStudioAgentKey: "coder",
-      gameStudioInitialized: false,
-      gameStudioConfigForTurn: null,
-    }),
     startRunLease: (input) => {
       input.setHarnessRunMarker(marker);
       input.setAbortController(abortController);
@@ -1103,13 +1060,6 @@ test("a failed terminal projection quiesces only its exact workflow owner withou
       failedAttachmentCount: 0,
     }),
     buildPromptContext: () => ({ userContent: "plan" }),
-    runGameStudioPreparation: async () => ({
-      ok: true,
-      userContent: "plan",
-      activeStudioAgentKey: "coder",
-      gameStudioInitialized: false,
-      gameStudioConfigForTurn: null,
-    }),
     startRunLease: (input) => {
       input.setHarnessRunMarker(marker);
       input.setAbortController(abortController);
@@ -1216,13 +1166,6 @@ test("terminal projection reconciliation never clears a newer exact workflow own
       failedAttachmentCount: 0,
     }),
     buildPromptContext: () => ({ userContent: "execute" }),
-    runGameStudioPreparation: async () => ({
-      ok: true,
-      userContent: "execute",
-      activeStudioAgentKey: "coder",
-      gameStudioInitialized: false,
-      gameStudioConfigForTurn: null,
-    }),
     startRunLease: (input) => {
       input.setHarnessRunMarker(oldMarker);
       input.setAbortController(oldAbortController);
@@ -1322,13 +1265,6 @@ test("a Turn canceled during bootstrap cannot acquire a run lease or start tools
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: (input) => {
           leaseStarts += 1;
           input.createAbortController();
@@ -1426,13 +1362,6 @@ test("terminal bootstrap detection cannot strand the exact Plan child in handoff
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: plan.text }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: plan.text,
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: () => {
           throw new Error("terminal Plan Turn must not acquire a Run lease");
         },
@@ -1521,13 +1450,6 @@ test("bulk clear invalidates a deferred bootstrap before lease, marker, engine, 
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         runRuntime: () => {
           engineStarts += 1;
           toolStarts += 1;
@@ -1573,13 +1495,6 @@ test("bootstrap failures produce one visible error conclusion and close the turn
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: () => {
           throw new Error("lease must not start before workspace discovery");
         },
@@ -1618,13 +1533,6 @@ test("a post-lease bootstrap exception durably closes only the acquired owner", 
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
         startRunLease: (input) => {
           const marker = {
             schemaVersion: 1,
@@ -1648,7 +1556,7 @@ test("a post-lease bootstrap exception durably closes only the acquired owner", 
             runId: "run-submit-1",
             parentRunId: "run-parent",
             turnAgentMessagesStart: 0,
-            agentUserMessage: { role: "user", content: "studio content" },
+            agentUserMessage: { role: "user", content: "prompt content" },
             abortController: new AbortController(),
             harnessRunMarker: marker,
           };
@@ -1933,13 +1841,6 @@ test("bootstrap conclusion is not published before durable persistence resolves"
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
       },
     },
   });
@@ -1977,13 +1878,6 @@ test("retry exhaustion falls back to an atomic in-memory conclusion instead of a
           failedAttachmentCount: 0,
         }),
         buildPromptContext: () => ({ userContent: "prompt content" }),
-        runGameStudioPreparation: async () => ({
-          ok: true,
-          userContent: "studio content",
-          activeStudioAgentKey: "coder",
-          gameStudioInitialized: true,
-          gameStudioConfigForTurn: null,
-        }),
       },
     },
   });

@@ -23,24 +23,50 @@ function isAbsoluteFilePath(value: string): boolean {
   return /^\/|^[a-zA-Z]:[\\/]/.test(value);
 }
 
+function hasUnsafePathSegment(value: string): boolean {
+  return normalizeSlashPath(value)
+    .split("/")
+    .some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\0"));
+}
+
+export function isSafeProtocolPackagePath(
+  packagePath: string,
+  entryPoint: string,
+): boolean {
+  const root = trimPathEdges(packagePath || "");
+  const entry = trimPathEdges(entryPoint || "SKILL.md", true);
+  if (!root || !entry || isAbsoluteFilePath(root) || isAbsoluteFilePath(entry)) {
+    return false;
+  }
+  if (!root.startsWith(".protocols/") || hasUnsafePathSegment(root) || hasUnsafePathSegment(entry)) {
+    return false;
+  }
+  return true;
+}
+
 function normalizeWorkspaceScope(value: string | null | undefined): string {
   return normalizeSlashPath(value || "").replace(/\/+$/, "");
 }
 
 export function isProtocolPackageApplicableToWorkspace(
-  pkg: Pick<ProtocolPackageLike, "active" | "type" | "packagePath" | "workspaceScope">,
+  pkg: Pick<ProtocolPackageLike, "active" | "type" | "packagePath" | "entryPoint" | "workspaceScope">,
   workspace: string,
 ): boolean {
   if (!pkg.active || pkg.type !== "package" || !pkg.packagePath) return false;
 
   const workspaceScope = normalizeWorkspaceScope(pkg.workspaceScope);
   if (workspaceScope) {
-    return workspaceScope === normalizeWorkspaceScope(workspace);
+    return workspaceScope === normalizeWorkspaceScope(workspace) &&
+      isSafeProtocolPackagePath(
+        pkg.packagePath,
+        pkg.entryPoint || "SKILL.md",
+      );
   }
 
-  // Legacy package skills stored before workspace scoping used relative
-  // paths under `.protocols/`, which are unsafe to auto-apply globally.
-  return isAbsoluteFilePath(trimPathEdges(pkg.packagePath || ""));
+  // A legacy package without an installation workspace has no trustworthy
+  // authority boundary. Keep the record visible in UI, but fail closed until
+  // the user reinstalls it into an explicit workspace.
+  return false;
 }
 
 export function getApplicableProtocolPackagesForWorkspace<T extends ProtocolPackageLike>(
@@ -53,6 +79,10 @@ export function getApplicableProtocolPackagesForWorkspace<T extends ProtocolPack
 export function getProtocolPackageEntryPath(pkg: Pick<ProtocolPackageLike, "packagePath" | "entryPoint">): string {
   const entry = trimPathEdges(pkg.entryPoint || "SKILL.md", true);
   const root = trimPathEdges(pkg.packagePath || "");
+
+  if (!isSafeProtocolPackagePath(root, entry)) {
+    throw new Error("Invalid protocol package path: entry must stay within .protocols/.");
+  }
 
   if (!entry) return root;
   if (!root || isAbsoluteFilePath(entry)) return entry;

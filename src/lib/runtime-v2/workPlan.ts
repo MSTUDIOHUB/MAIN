@@ -34,6 +34,8 @@ export interface WorkPlanDraftV1 {
     readonly change: string;
     readonly expectedOutcome: string;
     readonly dependsOn: readonly number[];
+    /** Admitted user criteria this reviewed change explicitly serves. */
+    readonly criterionIds?: readonly string[];
   }[];
   readonly validations: readonly {
     readonly stepIndexes: readonly number[];
@@ -42,6 +44,8 @@ export interface WorkPlanDraftV1 {
     readonly cwd?: string;
     readonly expectedOutcome: string;
     readonly required: boolean;
+    /** Admitted user criteria this receipt is expected to prove. */
+    readonly criterionIds?: readonly string[];
   }[];
   readonly risks: readonly string[];
   readonly assumptions: readonly string[];
@@ -264,6 +268,16 @@ export function validateWorkPlanDraftV1(
     if (!normalizeText(step?.expectedOutcome, 2_000)) {
       issues.push({ path: `steps[${index}].expectedOutcome`, message: "Expected outcome is required." });
     }
+    if (
+      step?.criterionIds !== undefined &&
+      (!Array.isArray(step.criterionIds) ||
+        step.criterionIds.some((id) => !normalizeText(id, 128)))
+    ) {
+      issues.push({
+        path: `steps[${index}].criterionIds`,
+        message: "Criterion ids must be non-empty strings.",
+      });
+    }
     for (const basisId of step?.basis || []) {
       if (!evidenceIds.has(basisId)) {
         issues.push({ path: `steps[${index}].basis`, message: `Unknown evidence id: ${basisId}.` });
@@ -319,6 +333,16 @@ export function validateWorkPlanDraftV1(
       issues.push({
         path: `validations[${index}].required`,
         message: "Standalone assertions and advisory notes cannot own required acceptance.",
+      });
+    }
+    if (
+      validation?.criterionIds !== undefined &&
+      (!Array.isArray(validation.criterionIds) ||
+        validation.criterionIds.some((id) => !normalizeText(id, 128)))
+    ) {
+      issues.push({
+        path: `validations[${index}].criterionIds`,
+        message: "Criterion ids must be non-empty strings.",
       });
     }
     for (const stepIndex of validation?.stepIndexes || []) {
@@ -380,6 +404,7 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
     lines.push(`- 操作：${step.operation}`);
     lines.push("- 目标：", markdownCodeList(step.targets));
     if (step.basis.length > 0) lines.push(`- 依据：${step.basis.join("、")}`);
+    if (step.criterionIds?.length) lines.push(`- 验收条件：${step.criterionIds.join("、")}`);
     if (step.dependsOn.length > 0) lines.push(`- 依赖：${step.dependsOn.map(stepId).join("、")}`);
     lines.push(`- 改动：${step.change}`);
     lines.push(`- 预期结果：${step.expectedOutcome}`, "");
@@ -394,6 +419,7 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
       if (validation.command) lines.push(`- 命令：\`${validation.command.replace(/`/g, "")}\``);
       if (validation.cwd) lines.push(`- 工作目录：\`${validation.cwd.replace(/`/g, "")}\``);
       lines.push(`- 要求：${validation.required ? "必须通过" : "建议执行"}`);
+      if (validation.criterionIds?.length) lines.push(`- 验收条件：${validation.criterionIds.join("、")}`);
       lines.push(`- 预期结果：${validation.expectedOutcome}`, "");
     }
   }

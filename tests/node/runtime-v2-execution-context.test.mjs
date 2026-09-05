@@ -82,6 +82,10 @@ const providerPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderPort.ts",
 ));
+const executionContext = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionContext.ts",
+));
 const providerSurfaceRejection = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderSurfaceRejection.ts",
@@ -106,9 +110,17 @@ const executionAcceptance = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionAcceptance.ts",
 ));
+const executionOutcome = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionOutcome.ts",
+));
 const executionToolPort = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolPort.ts",
+));
+const executionMutationPreflight = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionMutationPreflight.ts",
 ));
 const executionToolDeadline = loadTs(path.join(
   workspaceRoot,
@@ -175,6 +187,23 @@ const runtime = loadTs(path.join(
   "src/lib/runtime-v2/index.ts",
 ));
 
+test("the shared child runway includes the exact two-minute boundary", () => {
+  const minimum = runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS;
+  assert.equal(runtime.runtimeV2SubagentStartHasRunway({ now: 10 }), true);
+  assert.equal(runtime.runtimeV2SubagentStartHasRunway({
+    now: 10,
+    lifecycleDeadlineAt: Number.POSITIVE_INFINITY,
+  }), true);
+  assert.equal(runtime.runtimeV2SubagentStartHasRunway({
+    now: 10,
+    lifecycleDeadlineAt: 10 + minimum,
+  }), true);
+  assert.equal(runtime.runtimeV2SubagentStartHasRunway({
+    now: 10,
+    lifecycleDeadlineAt: 10 + minimum - 1,
+  }), false);
+});
+
 test("an explicit zero child budget cannot fall back to later active capacity", () => {
   assert.equal(
     subagentCandidate.runtimeV2SubagentTotalBudgetFromCommand({
@@ -187,10 +216,10 @@ test("an explicit zero child budget cannot fall back to later active capacity", 
   );
 });
 
-test("unclassified direct Execute acceptance defaults to behavioral evidence", () => {
+test("unclassified direct Execute acceptance remains durably unclassified", () => {
   assert.deepEqual(
     executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements(),
-    ["behavioral"],
+    [],
   );
   assert.deepEqual(
     executionAcceptance.runtimeV2ExecuteAcceptanceEvidenceRequirements([
@@ -198,8 +227,101 @@ test("unclassified direct Execute acceptance defaults to behavioral evidence", (
       {},
       { evidenceRequirement: "interaction" },
     ]),
-    ["static", "behavioral", "interaction"],
+    ["static", null, "interaction"],
   );
+});
+
+test("Execute text-envelope recovery propagates the structured-action requirement", () => {
+  const source = fs.readFileSync(path.join(
+    workspaceRoot,
+    "src/store/runtimeV2/executionProviderRequest.ts",
+  ), "utf8");
+  assert.match(
+    source,
+    /containsProviderTextEnvelopePrompt\(\s*input\.ports\.context\.phaseLanguage,\s*structuredActionRequired,\s*\)/s,
+  );
+  assert.doesNotMatch(
+    source,
+    /containsProviderTextEnvelopePrompt\(\s*input\.ports\.context\.phaseLanguage,\s*false,\s*\)/s,
+  );
+  assert.match(
+    providerContext.containsProviderTextEnvelopePrompt("en", true),
+    /structured tool call is required now/i,
+  );
+});
+
+test("the production terminal adapter keeps execute and validate prose in recovery", () => {
+  for (const [phase, mode] of [
+    ["observing", "execute"],
+    ["validating", "validate"],
+  ]) {
+    const turn = {
+      workspaceKey: "/fixture",
+      sessionKey: `session-${mode}`,
+      sessionEpoch: "epoch",
+      clientSubmissionId: `submission-${mode}`,
+      turnId: `turn-${mode}`,
+    };
+    const run = {
+      sessionKey: turn.sessionKey,
+      sessionEpoch: turn.sessionEpoch,
+      turnId: turn.turnId,
+      runId: `run-${mode}`,
+      parentRunId: null,
+      attemptId: `attempt-${mode}`,
+    };
+    let sequence = 0;
+    const nextEvent = (type, fields) => ({
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence: sequence++,
+      eventId: `${mode}-event-${sequence}`,
+      at: sequence,
+      type,
+      ...fields,
+    });
+    let aggregate = runtime.transition(null, nextEvent("turn.admitted", {
+      turn,
+      strategy: "execute",
+      objective: "Repair the fixture.",
+      constraints: [],
+      acceptanceCriteria: ["The fixture is repaired."],
+      acceptanceCriterionIds: ["criterion-user-objective"],
+      acceptanceEvidenceRequirements: [null],
+    }));
+    aggregate = runtime.transition(aggregate, nextEvent("run.started", {
+      run,
+      phase,
+    }));
+    const command = {
+      idempotencyKey: `${run.runId}:request-model`,
+      kind: "request_model",
+      run,
+      phase,
+      payload: { mode },
+    };
+    aggregate = runtime.transition(aggregate, nextEvent("command.scheduled", {
+      run,
+      command,
+    }));
+    aggregate = runtime.transition(aggregate, nextEvent("provider.responded", {
+      run,
+      idempotencyKey: command.idempotencyKey,
+      result: {
+        visibleText: "I would continue with the available tools.",
+        toolCalls: [],
+        diagnostics: [],
+      },
+    }));
+
+    assert.equal(executionOutcome.runtimeV2ExecuteTerminalDecision({
+      aggregate,
+      signal: new AbortController().signal,
+    }), null);
+    assert.equal(
+      runtime.deriveRuntimeV2ProviderRecoveryPressure(aggregate)?.occurrence,
+      1,
+    );
+  }
 });
 
 test("a shared lifecycle boundary stays distinct from a tool timeout", async () => {
@@ -563,8 +685,284 @@ test("Runtime v2 child scope uses required_paths without widening to the workspa
         },
       },
     }),
-    /will not widen/i,
+    /workspace-relative.*allowed_paths or required_paths.*src\/main\.js.*absolute path.*will not widen/i,
   );
+});
+
+test("spawn scope normalization admits mixed relative and in-workspace absolute paths", async () => {
+  const workspace = "/tmp/runtime-v2-snake-workspace";
+  const spawn = executionToolDefinitions.runtimeV2ToolDefinitions()
+    .find((entry) => entry.function.name === "spawn_subagent");
+  assert.ok(spawn);
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "spawn-snake-review",
+    name: "spawn_subagent",
+    arguments: {
+      task_key: "snake-review",
+      task_kind: "review",
+      name: "Snake reviewer",
+      role: "gameplay reviewer",
+      objective: "Review the snake game design boundary.",
+      success_criteria: "Return evidence for the game and test owners.",
+      required_paths:
+        `${workspace}/snake.py,tests/test_snake.py`,
+      allowed_paths:
+        `tests/test_snake.py,${workspace}/snake.py`,
+    },
+  }], [spawn], workspace);
+
+  assert.deepEqual(normalized.arguments, {
+    task_key: "snake-review",
+    task_kind: "review",
+    name: "Snake reviewer",
+    role: "gameplay reviewer",
+    objective: "Review the snake game design boundary.",
+    success_criteria: "Return evidence for the game and test owners.",
+    required_paths: "snake.py,tests/test_snake.py",
+    allowed_paths: "tests/test_snake.py,snake.py",
+  });
+  assert.equal(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [normalized],
+      [spawn],
+    ),
+    null,
+  );
+
+  const run = {
+    sessionKey: "session",
+    sessionEpoch: "epoch",
+    turnId: "turn",
+    runId: "run",
+    parentRunId: null,
+    attemptId: "attempt",
+  };
+  const command = {
+    idempotencyKey: "schedule-snake-review",
+    kind: "schedule_subagents",
+    phase: "observing",
+    run,
+    payload: {
+      toolCallId: normalized.id,
+      arguments: normalized.arguments,
+      maxActiveSubagents: 2,
+      maxChildRuns: 2,
+    },
+  };
+  const candidate =
+    subagentCandidate.runtimeV2ModelSelectedSubagentCandidate(command);
+  assert.deepEqual(candidate.allowedPaths, [
+    "tests/test_snake.py",
+    "snake.py",
+  ]);
+
+  const prepared = await schedulerPort.createRuntimeV2SchedulerPort({
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { turnId: run.turnId, runWorkspace: workspace },
+    live: executionTypes.createRuntimeV2LiveExecutionState(),
+    nextId: () => "child-snake-review",
+    now: () => 100,
+    lifecycleDeadlineAt: 200_000,
+    logStoreEvent: () => undefined,
+  }).prepareSchedule({
+    run,
+    command,
+    signal: new AbortController().signal,
+  });
+  assert.equal(prepared?.type, "subagents.scheduled");
+  assert.deepEqual(prepared?.jobs.map((job) => job.allowedPaths), [[
+    "tests/test_snake.py",
+    "snake.py",
+  ]]);
+});
+
+test("spawn scope normalization preserves and rejects an out-of-workspace absolute path", () => {
+  const workspace = "/tmp/runtime-v2-snake-workspace";
+  const outsidePath = "/tmp/runtime-v2-outside/snake.py";
+  const spawn = executionToolDefinitions.runtimeV2ToolDefinitions()
+    .find((entry) => entry.function.name === "spawn_subagent");
+  assert.ok(spawn);
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "spawn-outside-review",
+    name: "spawn_subagent",
+    arguments: {
+      task_key: "outside-review",
+      task_kind: "review",
+      name: "Outside reviewer",
+      role: "gameplay reviewer",
+      objective: "Review an out-of-workspace file.",
+      success_criteria: "Return evidence from the requested file.",
+      required_paths: outsidePath,
+      allowed_paths: outsidePath,
+    },
+  }], [spawn], workspace);
+
+  assert.equal(normalized.arguments.required_paths, outsidePath);
+  assert.equal(normalized.arguments.allowed_paths, outsidePath);
+  assert.equal(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [normalized],
+      [spawn],
+    ),
+    null,
+    "the provider schema admits strings; the scheduler scope boundary must reject the absolute path",
+  );
+  assert.throws(
+    () => subagentCandidate.runtimeV2ModelSelectedSubagentCandidate({
+      idempotencyKey: "schedule-outside-review",
+      kind: "schedule_subagents",
+      phase: "observing",
+      run: {
+        sessionKey: "session",
+        sessionEpoch: "epoch",
+        turnId: "turn",
+        runId: "run",
+        parentRunId: null,
+        attemptId: "attempt",
+      },
+      payload: {
+        toolCallId: normalized.id,
+        arguments: normalized.arguments,
+        maxActiveSubagents: 2,
+        maxChildRuns: 2,
+      },
+    }),
+    /allowed_paths and required_paths.*workspace-relative.*src\/main\.js.*absolute path/i,
+  );
+});
+
+test("spawn scope normalization is stable across quoted, duplicate, and Windows-style relative entries", () => {
+  const workspace = "/tmp/runtime-v2-snake-workspace";
+  const spawn = executionToolDefinitions.runtimeV2ToolDefinitions()
+    .find((entry) => entry.function.name === "spawn_subagent");
+  assert.ok(spawn);
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "spawn-canonical-scope",
+    name: "spawn_subagent",
+    arguments: {
+      objective: "Review the canonical scope.",
+      required_paths:
+        `"${workspace}/snake.py", src\\engine.py,,src\\engine.py,`,
+      allowed_paths:
+        `src\\engine.py, "${workspace}/snake.py",src/engine.py`,
+    },
+  }], [spawn], workspace);
+
+  assert.equal(normalized.arguments.required_paths, "snake.py,src/engine.py");
+  assert.equal(normalized.arguments.allowed_paths, "src/engine.py,snake.py");
+
+  const commaWorkspace = "/tmp/Runtime Project, Test";
+  const [commaNormalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "spawn-comma-workspace-scope",
+    name: "spawn_subagent",
+    arguments: {
+      objective: "Review paths in a workspace whose name contains a comma.",
+      required_paths:
+        `"${commaWorkspace}/src/main.ts", "${commaWorkspace}/src/test.ts"`,
+      allowed_paths:
+        `${commaWorkspace}/src/main.ts,${commaWorkspace}/src/test.ts`,
+    },
+  }], [spawn], commaWorkspace);
+  assert.equal(
+    commaNormalized.arguments.required_paths,
+    "src/main.ts,src/test.ts",
+  );
+  assert.equal(
+    commaNormalized.arguments.allowed_paths,
+    "src/main.ts,src/test.ts",
+  );
+
+  for (const sibling of [
+    "/tmp/runtime-v2-snake-workspace evil/secret.ts",
+    "/tmp/runtime-v2-snake-workspace\tother/secret.ts",
+    "/tmp/runtime-v2-snake-workspace2/secret.ts",
+  ]) {
+    const [siblingNormalized] =
+      providerTools.normalizeRuntimeV2ProviderToolCalls([{
+        id: "spawn-workspace-prefix-sibling",
+        name: "spawn_subagent",
+        arguments: {
+          objective: "Do not reinterpret a sibling path as workspace scope.",
+          required_paths: sibling,
+        },
+      }], [spawn], workspace);
+    assert.equal(siblingNormalized.arguments.required_paths, sibling);
+    assert.throws(
+      () => subagentCandidate.runtimeV2ModelSelectedSubagentCandidate({
+        idempotencyKey: "schedule-workspace-prefix-sibling",
+        kind: "schedule_subagents",
+        phase: "observing",
+        run: {
+          sessionKey: "session",
+          sessionEpoch: "epoch",
+          turnId: "turn",
+          runId: "run",
+          parentRunId: null,
+          attemptId: "attempt",
+        },
+        payload: {
+          toolCallId: "spawn-workspace-prefix-sibling",
+          arguments: siblingNormalized.arguments,
+          maxActiveSubagents: 2,
+          maxChildRuns: 2,
+        },
+      }),
+      /workspace-relative/i,
+    );
+  }
+});
+
+test("spawn scope rejects a mixed invalid and relative path instead of shrinking required work", () => {
+  const command = {
+    idempotencyKey: "schedule-mixed-invalid-scope",
+    kind: "schedule_subagents",
+    phase: "observing",
+    run: {
+      sessionKey: "session",
+      sessionEpoch: "epoch",
+      turnId: "turn",
+      runId: "run",
+      parentRunId: null,
+      attemptId: "attempt",
+    },
+    payload: {
+      toolCallId: "spawn-mixed-invalid-scope",
+      arguments: {
+        objective: "Review both declared sources.",
+        required_paths: "/tmp/outside/snake.py,src/snake.py",
+        allowed_paths: "/tmp/outside/snake.py,src/snake.py",
+      },
+      maxActiveSubagents: 2,
+      maxChildRuns: 2,
+    },
+  };
+
+  for (const argumentsValue of [{
+    objective: "Review both declared sources.",
+    required_paths: "/tmp/outside/snake.py,src/snake.py",
+    allowed_paths: "/tmp/outside/snake.py,src/snake.py",
+  }, {
+    objective: "Review the source without widening an invalid upper bound.",
+    required_paths: "src/snake.py",
+    allowed_paths: "/tmp/outside/snake.py",
+  }, {
+    objective: "Review the source without accepting the workspace root.",
+    required_paths: ".",
+  }, {
+    objective: "Review the source without accepting drive-relative syntax.",
+    required_paths: "C:outside\\snake.py",
+  }]) {
+    assert.throws(
+      () => subagentCandidate.runtimeV2ModelSelectedSubagentCandidate({
+        ...command,
+        payload: {
+          ...command.payload,
+          arguments: argumentsValue,
+        },
+      }),
+      /workspace-relative.*required_paths|allowed_paths/i,
+    );
+  }
 });
 
 test("provider mutation facts come only from committed ledger evidence", () => {
@@ -1350,6 +1748,72 @@ test("a thrown tool error is visible to both the model and structured presentati
   assert.match(String(live.messages.at(-1)?.content || ""), /TOOL_ERROR:/);
 });
 
+test("a mutation preflight rejection keeps one truthful diagnostic across model history and the durable completion", () => {
+  assert.equal(
+    typeof executionMutationPreflight.runtimeV2MutationPreflightFailureReceipt,
+    "function",
+    "the preflight boundary must build one receipt for both consumers",
+  );
+  const receipt =
+    executionMutationPreflight.runtimeV2MutationPreflightFailureReceipt({
+      message:
+        "MUTATION_PREFLIGHT_BLOCKED: src/main.js has a parser-confirmed syntax error at 168:1.",
+      reason: "syntax_error",
+      recoveryKind: "mutation_rejected",
+    });
+  const completion = evidence.toolCompletionFor(
+    {
+      live: executionTypes.createRuntimeV2LiveExecutionState(),
+    },
+    {
+      idempotencyKey: "syntax-rejected-command",
+      kind: "execute_tool",
+      phase: "acting",
+      run: {
+        sessionKey: "session",
+        sessionEpoch: "epoch",
+        turnId: "turn",
+        runId: "run",
+        parentRunId: null,
+        attemptId: "attempt",
+      },
+      payload: {
+        toolCallId: "syntax-rejected-call",
+        toolName: "replace_in_file",
+        arguments: {
+          path: "src/main.js",
+          search_text: "const before = true;",
+          replace_text: "const after = ;",
+        },
+      },
+    },
+    "replace_in_file",
+    { path: "src/main.js" },
+    "src/main.js",
+    receipt.content,
+    "failed",
+    receipt.failureKind,
+    undefined,
+    undefined,
+    receipt.failureReasonCode,
+  );
+
+  assert.equal(completion.type, "tool.completed");
+  assert.equal(completion.failureKind, "mutation_rejected");
+  assert.equal(
+    completion.failureReasonCode,
+    "mutation_preflight_syntax_error",
+  );
+  assert.match(
+    String(completion.presentation?.message || ""),
+    /parser-confirmed syntax error/,
+  );
+  assert.doesNotMatch(
+    String(completion.presentation?.message || ""),
+    /TOOL_RESULT_EMPTY/,
+  );
+});
+
 test("Runtime v2 collaboration schema exposes read investigations and transactional implementation", () => {
   const spawn = {
     type: "function",
@@ -1402,11 +1866,11 @@ test("Runtime v2 collaboration schema exposes read investigations and transactio
 
   assert.deepEqual(
     selected.function.parameters.properties.task_kind.enum,
-    ["explore", "review", "validate", "implement"],
+    ["explore", "review", "validate"],
   );
   assert.deepEqual(
     selected.function.parameters.properties.access_mode.enum,
-    ["read", "write"],
+    ["read"],
   );
   assert.match(
     selected.function.description,
@@ -1444,7 +1908,101 @@ test("Runtime v2 collaboration schema exposes read investigations and transactio
   ]);
 });
 
-test("multi-owner direct Execute records an evidence-bound contract before its first mutation", () => {
+test("Execute hides late spawn while retaining wait and rejects a raced spawn before scheduling", async () => {
+  const minimum = runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS;
+  const available = ["spawn_subagent", "wait_subagents"].map(definition);
+  const providerCommand = {
+    ...command("acting"),
+    payload: {
+      ...command("acting").payload,
+      collaborationAllowed: true,
+      remainingSubagentCapacity: 1,
+      activeSubagents: [{ id: "active-review" }],
+    },
+  };
+  const atAdmission = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 10,
+      lifecycleDeadlineAt: 10 + minimum,
+    },
+    command: providerCommand,
+    available,
+  }).map((tool) => tool.function.name);
+  assert.deepEqual(atAdmission, ["spawn_subagent", "wait_subagents"]);
+
+  const afterBoundary = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      now: () => 11,
+      lifecycleDeadlineAt: 10 + minimum,
+    },
+    command: providerCommand,
+    available,
+  }).map((tool) => tool.function.name);
+  assert.deepEqual(afterBoundary, ["wait_subagents"]);
+
+  const run = providerCommand.run;
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages.push({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: "spawn-at-runway-race",
+      type: "function",
+      function: {
+        name: "spawn_subagent",
+        arguments: "{}",
+      },
+    }],
+  });
+  let nextIdCalls = 0;
+  const logged = [];
+  const port = schedulerPort.createRuntimeV2SchedulerPort({
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { turnId: run.turnId },
+    live,
+    nextId: () => {
+      nextIdCalls += 1;
+      return "late-child";
+    },
+    now: () => 11,
+    lifecycleDeadlineAt: 10 + minimum,
+    logStoreEvent: (name, payload) => logged.push({ name, payload }),
+  });
+  await assert.rejects(
+    port.prepareSchedule({
+      command: {
+        idempotencyKey: "schedule-at-runway-race",
+        kind: "schedule_subagents",
+        phase: "acting",
+        run,
+        payload: {
+          toolCallId: "spawn-at-runway-race",
+          arguments: {
+            objective: "Review the bounded source before the parent continues.",
+            required_paths: "src/main.js",
+          },
+          maxActiveSubagents: 1,
+          maxChildRuns: 1,
+        },
+      },
+    }),
+    /less than two minutes remaining/i,
+  );
+  assert.equal(nextIdCalls, 0);
+  assert.equal(live.messages.at(-1)?.role, "tool");
+  assert.match(
+    String(live.messages.at(-1)?.content || ""),
+    /SUBAGENT_SCHEDULE_REJECTED.*less than two minutes remaining/i,
+  );
+  assert.equal(
+    logged.find((entry) =>
+      entry.name === "runtime_v2_subagent_schedule_rejected"
+    )?.payload?.reason,
+    "insufficient_lifecycle_runway",
+  );
+});
+
+test("multi-owner direct Execute may edit directly while a recorded contract remains authoritative", () => {
   const turn = {
     workspaceKey: "/fixture",
     sessionKey: "session-contract",
@@ -1507,10 +2065,6 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
   addSource("E-main", "src/main.js", "main-v1");
   addSource("E-editor", "src/components/editor.js", "editor-v1");
 
-  assert.equal(
-    executionContract.runtimeV2ExecutionContractRequired(aggregate),
-    true,
-  );
   const beforeCheckpoint = runtime.createRuntimeV2Checkpoint({
     revision: 1,
     aggregate,
@@ -1540,11 +2094,12 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
     },
     available,
   });
-  assert.deepEqual(gated.map((tool) => tool.function.name), [
-    "grep_search",
-    "read_file",
-    "record_execution_contract",
-  ]);
+  assert.ok(gated.some((tool) => tool.function.name === "read_file"));
+  assert.ok(gated.some((tool) => tool.function.name === "replace_in_file"));
+  assert.ok(gated.some((tool) => tool.function.name === "apply_patch"));
+  assert.ok(gated.some((tool) =>
+    tool.function.name === "record_execution_contract"
+  ));
   const gatedContractTool = gated.find((tool) =>
     tool.function.name === "record_execution_contract"
   );
@@ -1660,16 +2215,6 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
       evidence: [],
     }),
   );
-  assert.deepEqual(
-    executionContract.deriveRuntimeV2ExecutionContractRepair(
-      rejectedInitialAggregate,
-    ),
-    {
-      attempts: 1,
-      latestSequence: rejectedInitialAggregate.events.at(-1).sequence,
-    },
-    "an invalid initial contract must enter the same bounded repair window as a revision",
-  );
   const rejectedInitialCheckpoint = runtime.createRuntimeV2Checkpoint({
     revision: 2,
     aggregate: rejectedInitialAggregate,
@@ -1691,24 +2236,15 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
       },
       available,
     });
-  assert.deepEqual(
-    initialRepairTools.map((tool) => tool.function.name),
-    ["record_execution_contract"],
-    "a malformed initial contract cannot reopen source discovery",
-  );
-  const initialRepairPrompt = providerRequest.providerModeInstruction({
-    payload: { mode: "execute" },
-  }, "", {
-    hasReadFile: false,
-    hasMutation: false,
-    hasSpawnSubagent: false,
-    hasWaitSubagents: false,
-    executionContractRequired: true,
-    executionContractRepairAttempts: 1,
-  });
-  assert.match(initialRepairPrompt, /complete initial object/i);
-  assert.match(initialRepairPrompt, /revision_reason is not needed/i);
-  assert.match(initialRepairPrompt, /expected_outcome/i);
+  assert.ok(initialRepairTools.some((tool) =>
+    tool.function.name === "read_file"
+  ));
+  assert.ok(initialRepairTools.some((tool) =>
+    tool.function.name === "replace_in_file"
+  ));
+  assert.ok(initialRepairTools.some((tool) =>
+    tool.function.name === "record_execution_contract"
+  ));
   sequence = sequenceAfterInitialSources;
 
   const contractArguments = {
@@ -1821,13 +2357,6 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
     failureReasonCode: "execution_contract_rejected",
     evidence: [],
   }));
-  assert.deepEqual(
-    executionContract.deriveRuntimeV2ExecutionContractRepair(aggregate),
-    {
-      attempts: 1,
-      latestSequence: aggregate.events.at(-1).sequence,
-    },
-  );
   const repairCheckpoint = runtime.createRuntimeV2Checkpoint({
     revision: 3,
     aggregate,
@@ -1846,11 +2375,13 @@ test("multi-owner direct Execute records an evidence-bound contract before its f
     },
     available,
   });
-  assert.deepEqual(
-    repairTools.map((tool) => tool.function.name),
-    ["record_execution_contract"],
-    "a malformed revision cannot reopen reading or mutation",
-  );
+  assert.ok(repairTools.some((tool) => tool.function.name === "read_file"));
+  assert.ok(repairTools.some((tool) =>
+    tool.function.name === "replace_in_file"
+  ));
+  assert.ok(repairTools.some((tool) =>
+    tool.function.name === "record_execution_contract"
+  ));
   const scopeRejection = authorization.validateToolAgainstPhaseAndPlan({
     ports: {
       ...afterPorts,
@@ -2592,157 +3123,34 @@ test("an Execute contract rejects unread targets, silent revisions, and scope dr
   }), false);
 });
 
-test("contract preparation allows two novel supplemental provider batches then closes discovery", () => {
-  const readCommand = (key, callId, target) => ({
-    idempotencyKey: key,
-    kind: "execute_tool",
-    payload: {
-      toolCallId: callId,
-      toolName: "read_file",
-      arguments: { path: target },
-    },
-  });
-  const sourceCompletion = (sequence, key, id, target) => ({
-    sequence,
-    type: "tool.completed",
-    idempotencyKey: key,
-    status: "succeeded",
-    evidence: [{ id, kind: "source", target, version: `${id}-v1` }],
-  });
-  const firstCommands = [
-    readCommand("read-main", "call-main", "src/main.js"),
-    readCommand("read-editor", "call-editor", "src/components/editor.js"),
-  ];
-  const thresholdEvents = [{
-    sequence: 1,
-    type: "provider.responded",
-    result: {
-      toolCalls: firstCommands.map((entry) => ({
-        id: entry.payload.toolCallId,
-        name: "read_file",
-        arguments: entry.payload.arguments,
-      })),
-    },
-  }, ...firstCommands.map((entry, index) => ({
-    sequence: index + 2,
-    type: "command.scheduled",
-    command: entry,
-  })), sourceCompletion(4, "read-main", "E-main", "src/main.js"),
-  sourceCompletion(5, "read-editor", "E-editor", "src/components/editor.js")];
-  const thresholdAggregate = {
-    strategy: "execute",
-    evidence: thresholdEvents.flatMap((entry) => entry.evidence || []),
-    events: thresholdEvents,
-  };
-
-  assert.deepEqual(
-    executionContract.runtimeV2ExecutionContractReadWindow(
-      thresholdAggregate,
-    ),
-    { supplementalReadBatches: 0, closed: false },
-  );
-
-  const supplementalCommand = readCommand(
-    "read-handler",
-    "call-handler",
-    "src-tauri/src/main.rs",
-  );
-  const supplementalEvents = [{
-    sequence: 6,
-    type: "provider.responded",
-    result: {
-      toolCalls: [{
-        id: "call-handler",
-        name: "read_file",
-        arguments: supplementalCommand.payload.arguments,
-      }],
-    },
-  }, {
-    sequence: 7,
-    type: "command.scheduled",
-    command: supplementalCommand,
-  }, sourceCompletion(
-    8,
-    "read-handler",
-    "E-handler",
-    "src-tauri/src/main.rs",
-  )];
-  const firstSupplementalAggregate = {
-    ...thresholdAggregate,
-    evidence: [
-      ...thresholdAggregate.evidence,
-      ...supplementalEvents.flatMap((entry) => entry.evidence || []),
-    ],
-    events: [...thresholdEvents, ...supplementalEvents],
-  };
-
-  assert.deepEqual(
-    executionContract.runtimeV2ExecutionContractReadWindow(
-      firstSupplementalAggregate,
-    ),
-    { supplementalReadBatches: 1, closed: false },
-  );
-  const entryCommand = readCommand(
-    "read-entry",
-    "call-entry",
-    "index.html",
-  );
-  const entryEvents = [{
-    sequence: 9,
-    type: "provider.responded",
-    result: {
-      toolCalls: [{
-        id: "call-entry",
-        name: "read_file",
-        arguments: entryCommand.payload.arguments,
-      }],
-    },
-  }, {
-    sequence: 10,
-    type: "command.scheduled",
-    command: entryCommand,
-  }, sourceCompletion(11, "read-entry", "E-entry", "index.html")];
-  const closedAggregate = {
-    ...firstSupplementalAggregate,
-    evidence: [
-      ...firstSupplementalAggregate.evidence,
-      ...entryEvents.flatMap((entry) => entry.evidence || []),
-    ],
-    events: [...firstSupplementalAggregate.events, ...entryEvents],
-  };
-  assert.deepEqual(
-    executionContract.runtimeV2ExecutionContractReadWindow(closedAggregate),
-    { supplementalReadBatches: 2, closed: true },
-  );
+test("source evidence never closes the ordinary inspect-edit surface by batch count", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: { mode: "execute" },
   }, "", {
-    hasReadFile: false,
-    hasMutation: false,
+    hasReadFile: true,
+    hasMutation: true,
     hasSpawnSubagent: false,
     hasWaitSubagents: false,
-    executionContractRequired: true,
-    executionContractReadWindowClosed: true,
+    hasMaterializedSourceEvidence: true,
+    sourceOnlyFrontier: true,
   });
-  assert.match(prompt, /observation branch is closed/i);
-  assert.match(prompt, /call record_execution_contract now/i);
+  assert.match(prompt, /submit the mutation now/i);
+  assert.doesNotMatch(prompt, /observation branch is closed/i);
+  assert.doesNotMatch(prompt, /call record_execution_contract now/i);
 });
 
-test("a contract-only native decision locks provider tool choice to the contract", () => {
+test("structured native recovery uses generic required without a named-tool lock", () => {
   const contractTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
     .find((tool) => tool.function.name === "record_execution_contract");
   const readTool = executionToolDefinitions.runtimeV2ToolDefinitions({})
     .find((tool) => tool.function.name === "read_file");
-  assert.deepEqual(
+  assert.equal(
     providerRequest.runtimeV2ExecutionEffectiveToolChoice({
       requested: null,
       tools: [contractTool],
       textEnvelope: false,
     }),
-    {
-      type: "function",
-      function: { name: "record_execution_contract" },
-    },
+    null,
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionEffectiveToolChoice({
@@ -2761,17 +3169,38 @@ test("a contract-only native decision locks provider tool choice to the contract
     }),
     "required",
   );
-  assert.deepEqual(
+  assert.equal(
     providerRequest.runtimeV2ExecutionEffectiveToolChoice({
       requested: null,
       tools: [readTool],
       textEnvelope: false,
       forceStructuredAction: true,
     }),
-    {
-      type: "function",
-      function: { name: "read_file" },
-    },
+    "required",
+  );
+  assert.equal(
+    providerRequest.runtimeV2ExecutionEffectiveToolChoice({
+      requested: null,
+      tools: [contractTool],
+      textEnvelope: false,
+      forceStructuredAction: true,
+    }),
+    "required",
+  );
+});
+
+test("provider request failure enters structured recovery while tools remain", () => {
+  assert.equal(
+    providerRequest.runtimeV2RecoveryRequiresStructuredAction({
+      reason: "provider_request_failed",
+      occurrence: 1,
+      stage: "reconsider",
+    }),
+    true,
+  );
+  assert.equal(
+    providerRequest.runtimeV2RecoveryRequiresStructuredAction(null),
+    false,
   );
 });
 
@@ -3117,7 +3546,7 @@ test("a failed validation preserves diagnostic guidance without creating a read 
   }).map((tool) => tool.function.name);
   assert.deepEqual(
     closedTools,
-    ["replace_in_file", "apply_patch", "write_file"],
+    ["replace_in_file", "apply_patch"],
     "general no-effect recovery must close reads even while failed-validation guidance remains active",
   );
 });
@@ -3276,8 +3705,18 @@ test("parallel implementation children require disjoint exclusive scopes", () =>
         successCriteria: "Editor state changes.",
         allowedPaths: ["src/components"],
       },
+      {
+        scopeKey: "case-only-toolbar-owner",
+        taskKind: "implement",
+        accessMode: "write",
+        implementationOperation: "modify",
+        implementationPlan: "Apply a case-variant toolbar repair.",
+        objective: "Also repair toolbar ownership through a case-only path.",
+        successCriteria: "Toolbar state changes.",
+        allowedPaths: ["SRC/COMPONENTS/TOOLBAR.JS"],
+      },
     ],
-    maxActiveJobs: 3,
+    maxActiveJobs: 4,
     requestedAt: 1,
     nextId: () => `child-${++id}`,
   });
@@ -3285,7 +3724,10 @@ test("parallel implementation children require disjoint exclusive scopes", () =>
     decision.jobs.map((job) => job.scopeKey),
     ["editor-owner", "toolbar-owner"],
   );
-  assert.deepEqual(decision.rejectedScopeKeys, ["overlapping-editor-owner"]);
+  assert.deepEqual(decision.rejectedScopeKeys, [
+    "overlapping-editor-owner",
+    "case-only-toolbar-owner",
+  ]);
 });
 
 test("implementation ownership names exact mutation files instead of writable directories", () => {
@@ -3459,6 +3901,121 @@ function command(phase) {
   };
 }
 
+test("an empty Execute provider surface quarantines a wire tool call without proving its transport", async () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.providerLaneProfile = {
+    schemaVersion: "provider-lane.v1",
+    nativeTools: true,
+    requiredToolChoice: false,
+    streaming: true,
+    textToolEnvelope: true,
+    reasoning: false,
+    imageInput: false,
+    toolResultRole: "tool",
+  };
+  const logs = [];
+  const requests = [];
+  let nextId = 0;
+  let surfaceRequests = 0;
+  const originalSurface = Object.getOwnPropertyDescriptor(
+    executionContext,
+    "providerToolDefinitionsForCommand",
+  );
+  const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+  Object.defineProperty(
+    executionContext,
+    "providerToolDefinitionsForCommand",
+    {
+      configurable: true,
+      enumerable: true,
+      value: () => {
+        surfaceRequests += 1;
+        return [];
+      },
+    },
+  );
+  providerRequest.requestRuntimeV2ProviderOnce = async (request) => {
+    requests.push({
+      tools: request.tools.map((tool) => tool.function.name),
+      textEnvelope: request.textEnvelope,
+      toolChoice: request.toolChoice,
+    });
+    return runtime.normalizeProviderResponseV1({
+      visibleText: "I will inspect the source.",
+      tool_calls: [{
+        id: "wire-hidden-read",
+        type: "function",
+        function: {
+          name: "read_file",
+          arguments: JSON.stringify({ path: "src/main.js" }),
+        },
+      }],
+    });
+  };
+
+  try {
+    const result = await providerPort.createRuntimeV2ProviderPort({
+      get: () => ({}),
+      context: {
+        turnId: "turn",
+        runWorkspace: "/tmp/runtime-v2-empty-provider-surface",
+        phaseLanguage: "en",
+      },
+      live,
+      nextId: (scope) => `${scope}-${++nextId}`,
+      now: () => 100,
+      logStoreEvent: (event, data) => logs.push({ event, data }),
+    }).request({
+      command: command("acting"),
+      signal: new AbortController().signal,
+    });
+
+    assert.equal(surfaceRequests, 1);
+    assert.deepEqual(requests, [{
+      tools: [],
+      textEnvelope: false,
+      toolChoice: null,
+    }]);
+    assert.deepEqual(
+      result.toolCalls,
+      [],
+      "a provider-authored hidden read must not cross into execution",
+    );
+    assert.deepEqual(
+      result.diagnostics.map((diagnostic) => diagnostic.code),
+      ["repeated_action_rejected"],
+    );
+    assert.equal(result.diagnostics[0]?.retryable, true);
+    assert.equal(live.latestProviderResult, result);
+    assert.deepEqual(live.latestProviderResult?.toolCalls, []);
+    assert.ok(live.messages.some((message) =>
+      message.role === "tool" &&
+      /TOOL_SURFACE_REJECTED/.test(String(message.content || ""))
+    ));
+    assert.deepEqual(
+      [...live.provenStructuredToolTransports],
+      [],
+      "an unadvertised wire call is not structured-transport proof",
+    );
+    assert.equal(live.coveredReadToolResults.size, 0);
+    assert.equal(live.parallelReadCountByToolCallId.size, 0);
+    assert.equal(live.mutationSourceCoverageByToolCallId.size, 0);
+    assert.ok(logs.some((entry) =>
+      entry.event === "runtime_v2_provider_action_rejected" &&
+      entry.data?.reason === "tool_surface_rejected"
+    ));
+  } finally {
+    providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+    if (originalSurface) {
+      Object.defineProperty(
+        executionContext,
+        "providerToolDefinitionsForCommand",
+        originalSurface,
+      );
+    }
+  }
+});
+
 test("Observe, Act, and Validate share one safe inspect-edit-verify surface", () => {
   const available = [
     "read_file",
@@ -3496,6 +4053,7 @@ test("recovery preserves the current executable surface until the bounded stop",
     "replace_in_file",
     "apply_patch",
     "write_file",
+    "delete_workspace_path",
     "run_command",
     "browser_evaluate",
     "spawn_subagent",
@@ -3526,6 +4084,7 @@ test("recovery preserves the current executable surface until the bounded stop",
     "replace_in_file",
     "apply_patch",
     "write_file",
+    "delete_workspace_path",
     "run_command",
     "browser_evaluate",
     "spawn_subagent",
@@ -3541,7 +4100,7 @@ test("recovery preserves the current executable surface until the bounded stop",
   assert.deepEqual(closed, [
     "replace_in_file",
     "apply_patch",
-    "write_file",
+    "delete_workspace_path",
   ]);
 
   const recovery = providerTools.selectRuntimeV2ProviderToolDefinitions({
@@ -3640,6 +4199,7 @@ test("a closed provider decision cannot escape its bounded mutation through read
     "replace_in_file",
     "apply_patch",
     "write_file",
+    "delete_workspace_path",
     "run_command",
     "browser_evaluate",
     "spawn_subagent",
@@ -3669,7 +4229,7 @@ test("a closed provider decision cannot escape its bounded mutation through read
     [
       "replace_in_file",
       "apply_patch",
-      "write_file",
+      "delete_workspace_path",
     ],
   );
 });
@@ -3751,6 +4311,8 @@ test("a corrective mutation lease outranks validation tools", () => {
       "read_file",
       "replace_in_file",
       "apply_patch",
+      "write_file",
+      "delete_workspace_path",
       "run_command",
       "browser_evaluate",
     ].map(definition),
@@ -3758,7 +4320,7 @@ test("a corrective mutation lease outranks validation tools", () => {
   });
   assert.deepEqual(
     selected.map((tool) => tool.function.name),
-    ["replace_in_file", "apply_patch"],
+    ["replace_in_file", "apply_patch", "delete_workspace_path"],
   );
 });
 
@@ -4790,6 +5352,43 @@ test("provider tool arguments normalize schema-equivalent scalar types before id
         end_line: 350,
       },
     }),
+  );
+});
+
+test("provider tool argument normalization and validation support integer leaves", () => {
+  const contract = definition("record_step_edges");
+  contract.function.parameters.properties = {
+    stepIndexes: {
+      type: "array",
+      items: { type: "integer" },
+    },
+  };
+  contract.function.parameters.required = ["stepIndexes"];
+
+  const [normalized] = providerTools.normalizeRuntimeV2ProviderToolCalls([{
+    id: "integer-edges",
+    name: "record_step_edges",
+    arguments: { stepIndexes: ["0", "2"] },
+  }], [contract]);
+  assert.deepEqual(normalized.arguments, { stepIndexes: [0, 2] });
+  assert.equal(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [normalized],
+      [contract],
+    ),
+    null,
+  );
+
+  const fractional = {
+    ...normalized,
+    arguments: { stepIndexes: [0, 1.5] },
+  };
+  assert.match(
+    providerTools.runtimeV2ProviderToolArgumentViolation(
+      [fractional],
+      [contract],
+    ).reason,
+    /must be an integer/,
   );
 });
 
@@ -6209,13 +6808,14 @@ test("a missing-source rejection reuses unchanged materialized target source for
   );
 });
 
-test("enabled collaboration stays optional at every execution stage", () => {
+test("preferred collaboration strongly suggests bounded parallel work without becoming a stage gate", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
       mode: "execute",
       collaborationPreferred: true,
       collaborationAction: "optional",
       maxActiveSubagents: 2,
+      remainingSubagentCapacity: 2,
     },
   }, "", {
     hasReadFile: true,
@@ -6224,9 +6824,12 @@ test("enabled collaboration stays optional at every execution stage", () => {
     hasWaitSubagents: false,
   });
 
-  assert.match(prompt, /decide adaptively/i);
-  assert.match(prompt, /never mandatory/i);
-  assert.match(prompt, /not a prerequisite for mutation or completion/i);
+  assert.match(prompt, /explicitly prefers collaboration/i);
+  assert.match(prompt, /2 new child slot/i);
+  assert.match(prompt, /up to 2 spawn_subagent calls/i);
+  assert.match(prompt, /continue non-dependent parent work in parallel/i);
+  assert.match(prompt, /not a mandatory lifecycle stage/i);
+  assert.match(prompt, /simple or linear task, proceed directly/i);
 });
 
 test("execution prompt stops asking for the same source after versioned evidence exists", () => {
@@ -6424,11 +7027,6 @@ test("validation prompt asks for evidence instead of another mutation", () => {
 });
 
 test("a truncated reasoning or visible action draft gets one bounded action-mode retry", () => {
-  assert.equal(
-    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_REASONING_RECOVERY_CHAR_LIMIT,
-    12_000,
-    "a provider that ignores thinking-off gets one bounded contract runway instead of three identical 4k cancellations",
-  );
   const base = {
     finishReason: "length",
     reasoningChars: 12_000,
@@ -6518,9 +7116,9 @@ test("a truncated reasoning or visible action draft gets one bounded action-mode
     false,
   );
   assert.equal(
-    providerRequest.RUNTIME_V2_EXECUTION_CONTRACT_ACTIONLESS_CHAR_LIMIT,
-    1_200,
-    "a required contract action is redirected before a long visible essay can consume the turn",
+    providerRequest.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+    1_000,
+    "a required structured action is redirected before a long visible essay can consume the turn",
   );
 });
 
@@ -6839,7 +7437,7 @@ test("rejected collaboration calls close their standard tool transcript", async 
     live,
     nextId: () => "child-new",
     now: () => 100,
-    lifecycleDeadlineAt: 10_000,
+    lifecycleDeadlineAt: 200_000,
     logStoreEvent: () => undefined,
   });
   await assert.rejects(
@@ -7109,6 +7707,43 @@ test("parent requests receive the exact live project-rule snapshot, not legacy m
       runWorkspace: "/tmp/runtime-v2-history",
       phaseLanguage: "en",
       workspaceInstructionContext,
+      projectBaselineContext: {
+        kind: "project_baseline_context",
+        schemaVersion: 1,
+        parserVersion: 1,
+        workspace: {
+          canonicalPath: "/tmp/runtime-v2-history",
+          identity: "workspace-baseline",
+          vcs: null,
+        },
+        limits: {},
+        anchors: [{
+          path: "package.json",
+          kind: "manifest",
+          contentHash: "sha256-package",
+          byteSize: 10,
+          provenance: "workspace_file",
+        }],
+        topology: [{ path: "src", kind: "directory" }],
+        facts: {
+          languages: [{
+            name: "TypeScript",
+            provenance: { path: "src/App.tsx", selector: "file_extension", contentHash: "path-sha256-app" },
+          }],
+          packageManagers: [],
+          runtimes: [],
+          scripts: [],
+        },
+        omissions: [],
+        diagnostics: [],
+        truncated: { anchors: false, topology: false, scripts: false },
+        fingerprints: {
+          anchors: "anchors",
+          topology: "topology",
+          facts: "facts",
+          overall: "project-baseline-sha256-runtime",
+        },
+      },
     },
     live,
   };
@@ -7118,6 +7753,9 @@ test("parent requests receive the exact live project-rule snapshot, not legacy m
 
   assert.match(runtimeSystem, /LIVE WORKSPACE INSTRUCTIONS/);
   assert.match(runtimeSystem, /Keep the toolbar public API stable/);
+  assert.match(runtimeSystem, /PROJECT BASELINE FACTS/);
+  assert.match(runtimeSystem, /language="TypeScript"/);
+  assert.match(runtimeSystem, /does not grant permission/);
   assert.doesNotMatch(runtimeSystem, /session_memory/i);
 });
 
@@ -9606,6 +10244,38 @@ test("ordinary child text must explicitly cite evidence before Runtime compiles 
   });
   assert.deepEqual(
     report.findings[0].evidenceIds,
+    ["child:review-1:E1"],
+  );
+});
+
+test("ordinary child text matches exact evidence ids at citation delimiters", () => {
+  const evidence = [{
+    id: "child:review-1:E1",
+    kind: "subagent",
+    target: "src/main.js",
+    version: "v1",
+  }, {
+    id: "child:review-1:E10",
+    kind: "subagent",
+    target: "src/save.js",
+    version: "v10",
+  }];
+
+  const longerIdReport = runtime.compileRuntimeV2SubagentTextReport({
+    summary: "Confirmed (child:review-1:E10), with no other citation.",
+    evidence,
+  });
+  assert.deepEqual(
+    longerIdReport.findings[0].evidenceIds,
+    ["child:review-1:E10"],
+  );
+
+  const punctuationReport = runtime.compileRuntimeV2SubagentTextReport({
+    summary: "Confirmed “child:review-1:E1”.",
+    evidence,
+  });
+  assert.deepEqual(
+    punctuationReport.findings[0].evidenceIds,
     ["child:review-1:E1"],
   );
 });

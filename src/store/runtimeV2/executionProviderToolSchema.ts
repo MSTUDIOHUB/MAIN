@@ -29,14 +29,22 @@ function normalizedSchemaScalar(
     }
     return value;
   }
-  if (schema.type === "number" && typeof value === "string") {
+  if (
+    (schema.type === "number" || schema.type === "integer") &&
+    typeof value === "string"
+  ) {
     const trimmed = value.trim();
     if (
       trimmed &&
       /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(trimmed)
     ) {
       const parsed = Number(trimmed);
-      if (Number.isFinite(parsed)) return parsed;
+      if (
+        Number.isFinite(parsed) &&
+        (schema.type === "number" || Number.isInteger(parsed))
+      ) {
+        return parsed;
+      }
     }
   }
   if (schema.type === "boolean" && typeof value === "string") {
@@ -273,6 +281,11 @@ function runtimeV2ToolSchemaMismatch(
       ? null
       : `${path} must be a finite number`;
   }
+  if (schema.type === "integer") {
+    return typeof value === "number" && Number.isInteger(value)
+      ? null
+      : `${path} must be an integer`;
+  }
   if (schema.type === "boolean") {
     return typeof value === "boolean" ? null : `${path} must be a boolean`;
   }
@@ -363,20 +376,39 @@ export function runtimeV2ProviderToolArgumentViolation(
 export function buildRuntimeV2TextEnvelopeCatalog(
   tools: readonly ToolDefinition[],
 ): string {
+  const compactSchema = (
+    schema: ToolParameterSchema,
+  ): Record<string, unknown> => ({
+    ...(schema.type ? { type: schema.type } : {}),
+    ...(schema.enum ? { enum: [...schema.enum] } : {}),
+    ...(schema.required ? { required: [...schema.required] } : {}),
+    ...(typeof schema.minItems === "number"
+      ? { minItems: schema.minItems }
+      : {}),
+    ...(schema.properties
+      ? {
+          properties: Object.fromEntries(
+            Object.entries(schema.properties).map(([name, property]) => [
+              name,
+              compactSchema(property),
+            ]),
+          ),
+        }
+      : {}),
+    ...(schema.items ? { items: compactSchema(schema.items) } : {}),
+    ...(schema.anyOf
+      ? { anyOf: schema.anyOf.map(compactSchema) }
+      : {}),
+    ...(schema.not ? { not: compactSchema(schema.not) } : {}),
+    ...(typeof schema.additionalProperties === "boolean"
+      ? { additionalProperties: schema.additionalProperties }
+      : schema.additionalProperties
+        ? { additionalProperties: compactSchema(schema.additionalProperties) }
+        : {}),
+  });
   const entries = tools.map((definition) => ({
     name: definition.function.name,
-    required: definition.function.parameters.required,
-    properties: Object.fromEntries(
-      Object.entries(definition.function.parameters.properties).map(
-        ([name, schema]) => [
-          name,
-          {
-            type: schema.type,
-            ...(schema.enum ? { enum: schema.enum } : {}),
-          },
-        ],
-      ),
-    ),
+    ...compactSchema(definition.function.parameters),
   }));
   return [
     "[runtime-v2 allowed tool catalog]",

@@ -28,6 +28,8 @@ async function loadProtocolPackagesModule() {
 
 const {
   getProtocolPackageEntryPath,
+  isProtocolPackageApplicableToWorkspace,
+  isSafeProtocolPackagePath,
   resolveProtocolPackageReadPath,
 } = await loadProtocolPackagesModule();
 
@@ -107,4 +109,49 @@ test("protocol entry lookup does not rewrite normal workspace file paths", () =>
   ], workspace);
 
   assert.equal(resolved, "src/App.tsx");
+});
+
+test("protocol package paths reject traversal and absolute entry points", () => {
+  assert.equal(isSafeProtocolPackagePath(".protocols/reviewer", "SKILL.md"), true);
+  assert.equal(isSafeProtocolPackagePath(".protocols/../src", "SKILL.md"), false);
+  assert.equal(isSafeProtocolPackagePath(".protocols/reviewer", "../secret.md"), false);
+  assert.equal(isSafeProtocolPackagePath(".protocols/reviewer", "/tmp/secret.md"), false);
+  assert.throws(
+    () => getProtocolPackageEntryPath({
+      packagePath: ".protocols/reviewer",
+      entryPoint: "../secret.md",
+    }),
+    /invalid protocol package path/i,
+  );
+});
+
+test("protocol packages fail closed without an exact workspace scope", () => {
+  const base = {
+    active: true,
+    type: "package",
+    packagePath: ".protocols/reviewer",
+    entryPoint: "SKILL.md",
+  };
+  assert.equal(
+    isProtocolPackageApplicableToWorkspace(base, workspace),
+    false,
+  );
+  assert.equal(
+    isProtocolPackageApplicableToWorkspace(
+      { ...base, workspaceScope: workspace },
+      workspace,
+    ),
+    true,
+  );
+  assert.equal(
+    isProtocolPackageApplicableToWorkspace(
+      {
+        ...base,
+        packagePath: ".protocols/../src",
+        workspaceScope: workspace,
+      },
+      workspace,
+    ),
+    false,
+  );
 });

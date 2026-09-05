@@ -151,6 +151,9 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
   assert.equal(Object.prototype.hasOwnProperty.call(persisted, "taskFlow"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(persisted, "conversationTurns"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(persisted, "input"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(persisted, "selectedNexusModeKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(persisted, "activeStudioAgentKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(persisted, "gameStudioInitialized"), false);
   assert.equal(
     Object.prototype.hasOwnProperty.call(persisted.sessionsByWorkspace["/repo"][0], "runtimeSnapshot"),
     false,
@@ -168,6 +171,9 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
     agentMessages: [{ role: "assistant", content: "x" }],
     conversationTurns: [{ id: "t1" }],
     input: "draft",
+    pendingSlashCommand: { type: "workflow", slug: "help" },
+    activeStudioAgentKey: "studio_auto",
+    gameStudioInitialized: true,
     lockedComposerIntent: "goal",
     sessionsByWorkspace: {
       "/repo": [
@@ -195,6 +201,9 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "agentMessages"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "conversationTurns"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "input"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(stripped, "pendingSlashCommand"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(stripped, "activeStudioAgentKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(stripped, "gameStudioInitialized"), false);
   assert.equal(stripped.lockedComposerIntent, null);
   assert.deepEqual(stripped.sessionsByWorkspace, {
     "/repo": [

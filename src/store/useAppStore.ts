@@ -1,3 +1,4 @@
+import { captureNetworkRead } from "../lib/networkRead";
 // store/useAppStore.ts
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
@@ -20,7 +21,6 @@ import {
   getProjectSkeleton,
   ingestAttachmentFile,
   listDirectory,
-  loadProjectSessionMeta,
   readChatTempFile,
   readDocument,
   readFile,
@@ -57,8 +57,12 @@ import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
   loadResolvedInstructions,
   type InstructionSource,
+  type ResolvedInstructionIo,
   type ResolvedInstructionSet,
 } from "../lib/instructions";
+import { resolveWorkspaceAdmissionSnapshot } from "../lib/workspaceAdmission";
+import { workspaceAdmissionIpcIo } from "../lib/projectBaselineIpc";
+import { parseProjectInitCommand } from "../lib/projectInit";
 import {
   loadHooksConfig,
   type HookDefinition,
@@ -278,27 +282,6 @@ import {
   stripLegacyRuntimeFieldsFromPersistedState,
 } from "../lib/persistState";
 import {
-  createGameStudioModeSwitchDecision,
-  ensureGameStudioWorkspaceInitialized,
-  gameStudioRuntimeService,
-  loadGameStudioConfig,
-  removeGameStudioWorkspaceAssets,
-  resolveEngineFromModeSwitchChoice,
-  setGameStudioEngineConfig,
-} from "../lib/gameStudio";
-import {
-  getGameStudioSlashCommandSpec,
-  getDefaultStudioAgentForEngine,
-  parseGameStudioSlashCommand,
-  parseSetupEngineArgs,
-  normalizeStudioAgentKey,
-  type StudioWorkflowCommandSlug,
-  type NexusModeKey,
-  type PendingSlashCommand,
-  type StudioAgentKey,
-  type StudioConfig,
-} from "../lib/gameStudio/catalog";
-import {
   getIntentPolicy,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
@@ -369,7 +352,7 @@ import {
 } from "../lib/goalPersistence";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
-import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
+import { mapLegacyNexusModeToMainMode, type MainModeKey } from "../lib/mainModes";
 import {
   createConfigSlice,
   defaultConfig,
@@ -394,16 +377,10 @@ import {
 import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
 import { startSubmitBlockingPreflightEffect } from "./submitPreflightExecutor";
 import {
-  startGameStudioLocalSlashSubmission,
-  type GameStudioLocalSlashCompletionResult,
-} from "./gameStudioLocalSlashSubmission";
-import {
   applySubmitSeedSessionTitle,
   startSubmitSemanticMetadataEffect,
 } from "./submitTitleEffects";
 import { applySubmitSessionBootstrap } from "./submitSessionBootstrap";
-import { createGameStudioLocalSlashBridge } from "./gameStudioLocalSlashBridge";
-import { commitGameStudioLocalSlashProjection } from "./commitGameStudioLocalSlashProjection";
 import { applySubmitVisibleTurn } from "./submitVisibleTurn";
 import { prepareSubmitTurnDraft } from "./submitTurnDraft";
 import { startSubmitPlanHydrationEffect } from "./submitPlanHydration";
@@ -413,10 +390,7 @@ import { applySubmitPlanStateReset } from "./submitPlanStateReset";
 import { applySubmitSendGateEffects } from "./submitSendGateEffects";
 import { resolveAndApplySubmitIntentRouting } from "./submitIntentRouting";
 import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
-import {
-  buildTemporarySubmitRuntimeProjection,
-  persistSubmitRuntimeProjection,
-} from "./persistSubmitRuntimeProjection";
+import { persistSubmitRuntimeProjection } from "./persistSubmitRuntimeProjection";
 import { commitCanceledTurn } from "./commitCanceledTurn";
 import {
   beginSessionCancellation,
@@ -775,13 +749,11 @@ export const translations = {
     switchMainMode: "MAIN Mode",
     runMode: "Run Mode",
     main_mode: "MAIN",
-    game_studio: "Game Studio",
     image_studio: "Image Studio",
     nexus_general: "General Collaboration",
     nexus_create: "Creative Co-Creation",
     nexus_build: "Engineering Delivery",
     nexus_research: "Research & Analysis",
-    nexus_game_studio: "Game Studio",
     mcpServers: "MCP Servers",
     mcpScanTools: "Scan Tools",
     mcpScanning: "Scanning...",
@@ -883,13 +855,11 @@ export const translations = {
     switchMainMode: "MAIN 模式",
     runMode: "工作方式",
     main_mode: "MAIN",
-    game_studio: "游戏工作室",
     image_studio: "图像工作室",
     nexus_general: "通用协作",
     nexus_create: "创意共创",
     nexus_build: "工程实现",
     nexus_research: "研究分析",
-    nexus_game_studio: "游戏工作室",
     mcpServers: "MCP 服务器",
     mcpScanTools: "扫描工具",
     mcpScanning: "扫描中...",
@@ -1061,12 +1031,8 @@ export interface SessionRuntimeSnapshot {
   conversationTurns: ConversationTurn[];
   currentTurnId: string | null;
   selectedMainModeKey: MainModeKey;
-  selectedNexusModeKey: NexusModeKey;
   sessionModeAffinity?: SessionModeAffinity;
   imageStudio?: ImageStudioRuntime;
-  activeStudioAgentKey: StudioAgentKey;
-  gameStudioInitialized: boolean;
-  pendingSlashCommand: PendingSlashCommand | null;
   planArtifacts: PlanArtifact[];
   planTasks: PlanTask[];
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
@@ -1270,6 +1236,7 @@ export type WorkspaceInstructionAcceptance =
         | "workspace_required"
         | "session_required"
         | "session_changed"
+        | "local_command_requires_composer"
         | "admission_conflict"
         | "persistence_failed";
       retryable: boolean;
@@ -1381,10 +1348,6 @@ export interface AppState {
   contextMentions: string[];
   attachedFiles: AttachedFile[];
   selectedMainModeKey: MainModeKey;
-  selectedNexusModeKey: NexusModeKey;
-  activeStudioAgentKey: StudioAgentKey;
-  gameStudioInitialized: boolean;
-  pendingSlashCommand: PendingSlashCommand | null;
   lockedComposerIntent: MainIntentShortcut | null;
   pendingRunDecision: PendingRunDecision | null;
   dismissedPendingDecisionInputKey: string | null;
@@ -1400,10 +1363,6 @@ export interface AppState {
   switchMainModeWithIsolation: (key: MainModeKey) => Promise<void>;
   createIsolatedImageSession: () => Promise<number | null>;
   returnFromImageSession: (targetMode?: Exclude<MainModeKey, "image_studio">) => Promise<number | null>;
-  setSelectedNexusModeKey: (key: NexusModeKey) => void;
-  setActiveStudioAgentKey: (key: StudioAgentKey, options?: { persistToWorkspace?: boolean }) => Promise<void>;
-  setGameStudioInitialized: (value: boolean) => void;
-  setPendingSlashCommand: (command: PendingSlashCommand | null) => void;
   setLockedComposerIntent: (intent: MainIntentShortcut | null) => void;
   dismissPendingRunDecision: () => void;
   resolvePendingRunDecision: (
@@ -1423,9 +1382,6 @@ export interface AppState {
     images?: string[],
     admittedOwner?: WorkspaceInstructionDispatchClaim,
   ) => boolean;
-  refreshGameStudioWorkspaceState: () => Promise<void>;
-  initializeGameStudioWorkspace: () => Promise<void>;
-  removeGameStudioWorkspace: () => Promise<void>;
 
   // MCP (Model Context Protocol) servers & discovered tools
   mcpServers: MCPServer[];
@@ -1490,6 +1446,8 @@ export interface AppState {
     options?: {
       workspace?: string;
       projectToUi?: boolean;
+      userPrompt?: string;
+      instructionIo?: ResolvedInstructionIo;
     },
   ) => Promise<ResolvedInstructionSet | null>;
   setResolvedInstructionSet: (resolved: ResolvedInstructionSet | null) => void;
@@ -1708,11 +1666,10 @@ export interface AppState {
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
-      commandDirective?: CommandDirective | null;
-      executionConsentGranted?: boolean;
-      skipIntentResolution?: boolean;
-      suppressGameStudioSuggestion?: boolean;
-      turnTitle?: string;
+    commandDirective?: CommandDirective | null;
+    executionConsentGranted?: boolean;
+    skipIntentResolution?: boolean;
+    turnTitle?: string;
       intentSummary?: string;
       uiParentTurnId?: string;
       parentPlanTurnId?: string;
@@ -2032,38 +1989,6 @@ function createDefaultCurrentTurnState() {
     turnId: "",
     remoteFeishu: null as FeishuRemoteContext | null,
   };
-}
-
-function normalizePendingSlashCommand(
-  command: unknown,
-): PendingSlashCommand | null {
-  if (!command || typeof command !== "object") return null;
-  const candidate = command as Partial<PendingSlashCommand>;
-  if (candidate.type === "auto") {
-    return { type: "auto", canonicalCommand: "/auto" };
-  }
-  if (candidate.type === "agent" && typeof candidate.slug === "string") {
-    const slug = normalizeStudioAgentKey(candidate.slug);
-    if (slug === "studio_auto") return null;
-    return {
-      type: "agent",
-      slug,
-      canonicalCommand: `/agent ${slug}`,
-    };
-  }
-  if (
-    candidate.type === "workflow" &&
-    typeof candidate.slug === "string" &&
-    typeof candidate.canonicalCommand === "string"
-  ) {
-    return {
-      type: "workflow",
-      slug: candidate.slug as StudioWorkflowCommandSlug,
-      args: typeof candidate.args === "string" ? candidate.args : "",
-      canonicalCommand: candidate.canonicalCommand,
-    };
-  }
-  return null;
 }
 
 function normalizeLiveConversationTurns(
@@ -3342,191 +3267,6 @@ function concludeWorkspaceInstructionEntry(input: {
   };
 }
 
-function isRestoredLocalFastQueueEntry(
-  entry: WorkspaceTurnQueueEntry,
-): boolean {
-  const command = parseGameStudioSlashCommand(entry.instruction.payload.text);
-  return !!command &&
-    getGameStudioSlashCommandSpec(command)?.executionMode === "local_fast";
-}
-
-function hasCanonicalRestoredLocalFastConclusion(input: {
-  entry: WorkspaceTurnQueueEntry;
-  sessionKey: string;
-  taskFlow: TaskBlock[];
-  conversationTurns: ConversationTurn[];
-  runtimeEvents: MainThreadEvent[];
-  workspacePath?: string | null;
-}): boolean {
-  const sourceTurnId = input.entry.receipt.turnId;
-  const useChinese = /[^\x00-\x7F]/.test(input.entry.instruction.payload.text);
-  const projection = reconcileWorkspaceInstructionProjection({
-    entry: input.entry,
-    taskFlow: input.taskFlow,
-    conversationTurns: input.conversationTurns,
-    userContextItems: buildWorkspaceInstructionUserContext({
-      contextMentions: input.entry.instruction.payload.contextMentions
-        ? [...input.entry.instruction.payload.contextMentions]
-        : [],
-      attachedFiles: input.entry.instruction.payload.attachedFiles
-        ? input.entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
-        : [],
-      images: input.entry.instruction.payload.images
-        ? [...input.entry.instruction.payload.images]
-        : [],
-      workspace: input.workspacePath || "",
-      language: useChinese ? "zh" : "en",
-    }),
-    language: useChinese ? "zh" : "en",
-  });
-  if (
-    projection.disposition === "ready" &&
-    !projection.changed &&
-    projection.turn.createdAt === input.entry.receipt.acceptedAt
-  ) {
-    const turn = projection.turn;
-    const outcome = turn.runtimeOutcome;
-    const sourceStarts = input.runtimeEvents.filter(
-      (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
-        event.type === "run.started" &&
-        event.threadId === input.sessionKey &&
-        event.turnId === sourceTurnId,
-    );
-    const exactSourceStarts = sourceStarts.filter(
-      (event) => event.runId === outcome?.runId,
-    );
-    const allSourceRunConclusions = input.runtimeEvents.filter((event) =>
-      event.type === "run.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId
-    );
-    const runConclusions = allSourceRunConclusions.filter(
-      (event) => event.type === "run.completed" && event.runId === outcome?.runId,
-    );
-    const turnConclusions = input.runtimeEvents.filter((event) =>
-      event.type === "turn.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId
-    );
-    const finals = input.taskFlow.filter(
-      (block): block is Extract<TaskBlock, { type: "agent" }> =>
-        block.type === "agent" &&
-        block.turnId === sourceTurnId &&
-        block.visibility === "assistant_final",
-    );
-    const sourceStart = exactSourceStarts[0];
-    const runConclusion = runConclusions[0];
-    const turnConclusion = turnConclusions[0];
-    const sourceStartIndex = sourceStart
-      ? input.runtimeEvents.indexOf(sourceStart)
-      : -1;
-    const runConclusionIndex = runConclusion
-      ? input.runtimeEvents.indexOf(runConclusion)
-      : -1;
-    const turnConclusionIndex = turnConclusion
-      ? input.runtimeEvents.indexOf(turnConclusion)
-      : -1;
-    if (
-      outcome?.status === "completed" &&
-      !!outcome.resultKind &&
-      sourceStarts.length === 1 &&
-      exactSourceStarts.length === 1 &&
-      sourceStart?.type === "run.started" &&
-      sourceStart.parentRunId === outcome.parentRunId &&
-      sourceStartIndex >= 0 &&
-      sourceStartIndex < runConclusionIndex &&
-      runConclusionIndex < turnConclusionIndex &&
-      allSourceRunConclusions.length === 1 &&
-      runConclusions.length === 1 &&
-      runConclusion?.type === "run.completed" &&
-      runConclusion.parentRunId === outcome.parentRunId &&
-      runConclusion.resultKind === outcome.resultKind &&
-      typeof runConclusion.summary === "string" &&
-      runConclusion.summary === turn.summary &&
-      turnConclusions.length === 1 &&
-      turnConclusion?.type === "turn.completed" &&
-      turnConclusion.resultKind === outcome.resultKind &&
-      finals.length === 1 &&
-      finals[0].streaming !== true &&
-      finals[0].content === runConclusion.summary
-    ) return true;
-  }
-
-  // A same-ID replacement cannot own the source receipt's Turn terminal. The
-  // immutable source Run is closed, while a visible recovery child owns the
-  // final/Turn pair and links back through parentRunId.
-  const sourceRunConclusions = input.runtimeEvents.filter(
-    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
-      event.type === "run.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId,
-  );
-  return sourceRunConclusions.some((sourceConclusion) =>
-    input.runtimeEvents.some((recoveryStart) => {
-      if (
-        recoveryStart.type !== "run.started" ||
-        recoveryStart.threadId !== input.sessionKey ||
-        recoveryStart.turnId === sourceTurnId ||
-        recoveryStart.parentRunId !== sourceConclusion.runId
-      ) return false;
-      const recoveryStarts = input.runtimeEvents.filter(
-        (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
-          event.type === "run.started" &&
-          event.threadId === input.sessionKey &&
-          event.turnId === recoveryStart.turnId,
-      );
-      const recoveryRunConclusions = input.runtimeEvents.filter((event) =>
-        event.type === "run.completed" &&
-        event.threadId === input.sessionKey &&
-        event.turnId === recoveryStart.turnId &&
-        event.runId === recoveryStart.runId
-      );
-      const recoveryTurnConclusions = input.runtimeEvents.filter((event) =>
-        event.type === "turn.completed" &&
-        event.threadId === input.sessionKey &&
-        event.turnId === recoveryStart.turnId
-      );
-      const recoveryTurn = input.conversationTurns.find(
-        (candidate) => candidate.id === recoveryStart.turnId,
-      );
-      const recoveryFinals = input.taskFlow.filter(
-        (block): block is Extract<TaskBlock, { type: "agent" }> =>
-          block.type === "agent" &&
-          block.turnId === recoveryStart.turnId &&
-          block.visibility === "assistant_final",
-      );
-      const recoveryRunConclusion = recoveryRunConclusions[0];
-      const recoveryTurnConclusion = recoveryTurnConclusions[0];
-      const recoveryStartIndex = input.runtimeEvents.indexOf(recoveryStart);
-      const recoveryRunConclusionIndex = recoveryRunConclusion
-        ? input.runtimeEvents.indexOf(recoveryRunConclusion)
-        : -1;
-      const recoveryTurnConclusionIndex = recoveryTurnConclusion
-        ? input.runtimeEvents.indexOf(recoveryTurnConclusion)
-        : -1;
-      return recoveryStarts.length === 1 &&
-        recoveryStarts[0]?.runId === recoveryStart.runId &&
-        recoveryStarts[0]?.parentRunId === sourceConclusion.runId &&
-        recoveryStartIndex >= 0 &&
-        recoveryStartIndex < recoveryRunConclusionIndex &&
-        recoveryRunConclusionIndex < recoveryTurnConclusionIndex &&
-        recoveryRunConclusions.length === 1 &&
-        recoveryTurnConclusions.length === 1 &&
-        recoveryRunConclusion?.type === "run.completed" &&
-        recoveryTurnConclusion?.type === "turn.completed" &&
-        recoveryRunConclusion.resultKind === recoveryTurnConclusion.resultKind &&
-        recoveryRunConclusion.summary === recoveryTurn?.summary &&
-        recoveryTurn?.runtimeOutcome?.status === "completed" &&
-        recoveryTurn.runtimeOutcome.runId === recoveryStart.runId &&
-        recoveryTurn.runtimeOutcome.parentRunId === sourceConclusion.runId &&
-        recoveryTurn.runtimeOutcome.resultKind === recoveryRunConclusion.resultKind &&
-        recoveryFinals.length === 1 &&
-        recoveryFinals[0].streaming !== true &&
-        recoveryFinals[0].content === recoveryRunConclusion.summary;
-    })
-  );
-}
-
 function insertRestoredRunStartBeforeTerminal(input: {
   runtimeEvents: MainThreadEvent[];
   sessionKey: string;
@@ -3739,396 +3479,6 @@ function insertRestoredRunAbortBeforeConclusion(input: {
   ];
 }
 
-function quarantineRestoredLocalFastEntry(input: {
-  entry: WorkspaceTurnQueueEntry;
-  sessionKey: string;
-  taskFlow: TaskBlock[];
-  conversationTurns: ConversationTurn[];
-  runtimeEvents: MainThreadEvent[];
-  at: number;
-  workspacePath?: string | null;
-  reservedTaskBlockIds?: readonly number[];
-}): {
-  taskFlow: TaskBlock[];
-  conversationTurns: ConversationTurn[];
-  runtimeEvents: MainThreadEvent[];
-  presentationTurnId: string;
-} {
-  const sourceTurnId = input.entry.receipt.turnId;
-  const sourceStarts = input.runtimeEvents.filter(
-    (event): event is Extract<MainThreadEvent, { type: "run.started" }> =>
-      event.type === "run.started" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId,
-  );
-  const useChinese = /[^\x00-\x7F]/.test(input.entry.instruction.payload.text);
-  const quarantineSummary = useChinese
-    ? "应用重启时无法确认这条本地命令是否已经执行。为避免重复副作用，MAIN 未自动重放，并将本回合以错误结论收口；请发送一条新指令重试。"
-    : "MAIN could not prove whether this local command already executed before restart. To prevent a duplicate side effect, it was not replayed; this turn is closed with an error. Submit a new instruction to retry.";
-  const projection = reconcileWorkspaceInstructionProjection({
-    entry: input.entry,
-    taskFlow: input.taskFlow,
-    conversationTurns: input.conversationTurns,
-    userContextItems: buildWorkspaceInstructionUserContext({
-      contextMentions: input.entry.instruction.payload.contextMentions
-        ? [...input.entry.instruction.payload.contextMentions]
-        : [],
-      attachedFiles: input.entry.instruction.payload.attachedFiles
-        ? input.entry.instruction.payload.attachedFiles.map((file) => ({ ...file }))
-        : [],
-      images: input.entry.instruction.payload.images
-        ? [...input.entry.instruction.payload.images]
-        : [],
-      workspace: input.workspacePath || "",
-      language: useChinese ? "zh" : "en",
-    }),
-    language: useChinese ? "zh" : "en",
-  });
-  const exactTurn = projection.disposition === "ready" &&
-      projection.turn.createdAt === input.entry.receipt.acceptedAt
-    ? projection.turn
-    : null;
-  const allSourceConclusions = input.runtimeEvents.filter(
-    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
-      event.type === "run.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId,
-  );
-  // A crash may persist the terminal projection while omitting run.started.
-  // Repair that exact immutable Turn using its recorded run owner; do not
-  // invent a second Run and leave the already-completed Run orphaned.
-  const latestSourceStart = sourceStarts[sourceStarts.length - 1] || null;
-  const sourceRunId = latestSourceStart?.runId ||
-    exactTurn?.runtimeOutcome?.runId ||
-    (allSourceConclusions.length === 1 ? allSourceConclusions[0].runId : "") ||
-    `run-local-fast-quarantine-${input.entry.receipt.receiptId}`;
-  const sourceParentRunId = latestSourceStart
-    ? latestSourceStart.parentRunId
-    : exactTurn?.runtimeOutcome
-    ? exactTurn.runtimeOutcome.parentRunId
-    : allSourceConclusions.length === 1
-    ? allSourceConclusions[0].parentRunId
-    : null;
-  const sourceConclusions = allSourceConclusions.filter(
-    (event) => event.runId === sourceRunId,
-  );
-  const existingSourceConclusion = sourceConclusions[0];
-  const turnConclusions = input.runtimeEvents.filter(
-    (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
-      event.type === "turn.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId,
-  );
-  const existingTurnConclusion = turnConclusions[0];
-  const preservedSummary = String(existingSourceConclusion?.summary || "").trim();
-  const resultKind = existingSourceConclusion?.resultKind ||
-    existingTurnConclusion?.resultKind ||
-    "error";
-  const directSummary = preservedSummary || quarantineSummary;
-  const exactOutcome = exactTurn?.runtimeOutcome;
-  const existingSourceParentMatches = !existingSourceConclusion ||
-    existingSourceConclusion.parentRunId === sourceParentRunId;
-  const exactOutcomeOwnerMatches = !exactOutcome ||
-    (
-      exactOutcome.runId === sourceRunId &&
-      exactOutcome.parentRunId === sourceParentRunId
-    );
-  const trustedExactOutcomeSummary = exactOutcome?.status === "completed" &&
-      exactOutcomeOwnerMatches
-    ? String(exactTurn?.summary || "").trim()
-    : "";
-  const canPreserveExactOutcome = !!trustedExactOutcomeSummary &&
-    exactOutcome?.status === "completed" &&
-    exactOutcome.resultKind === resultKind;
-  const allSourceConclusionsMatchOwner = allSourceConclusions.length ===
-      sourceConclusions.length &&
-    allSourceConclusions.every((event) =>
-      event.runId === sourceRunId && event.parentRunId === sourceParentRunId
-    );
-  const existingTerminalOrderIsValid = !existingTurnConclusion ||
-    (
-      !!existingSourceConclusion &&
-      input.runtimeEvents.indexOf(existingSourceConclusion) <
-        input.runtimeEvents.indexOf(existingTurnConclusion)
-    );
-  const canCloseExactTurn = !!exactTurn &&
-    sourceStarts.length <= 1 &&
-    sourceConclusions.length <= 1 &&
-    existingSourceParentMatches &&
-    exactOutcomeOwnerMatches &&
-    allSourceConclusionsMatchOwner &&
-    existingTerminalOrderIsValid &&
-    turnConclusions.length <= 1 &&
-    (!existingTurnConclusion || existingTurnConclusion.resultKind === resultKind) &&
-    (!existingSourceConclusion || !!preservedSummary);
-  let runtimeEvents = input.runtimeEvents;
-  // A terminal record without a start is still useful owner evidence. Insert
-  // the missing start before its first terminal event so replay/golden traces
-  // retain the required start -> run.completed -> turn.completed order.
-  for (const conclusion of allSourceConclusions) {
-    runtimeEvents = insertRestoredRunStartBeforeTerminal({
-      runtimeEvents,
-      sessionKey: input.sessionKey,
-      turnId: sourceTurnId,
-      runId: conclusion.runId,
-      parentRunId: conclusion.parentRunId,
-      timestampMs: Math.min(input.at, conclusion.timestampMs),
-    });
-    runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
-      runtimeEvents,
-      sessionKey: input.sessionKey,
-      turnId: sourceTurnId,
-      runId: conclusion.runId,
-      parentRunId: conclusion.parentRunId,
-      timestampMs: conclusion.timestampMs,
-      resultKind: conclusion.resultKind || "success",
-      summary: String(conclusion.summary || ""),
-    });
-  }
-  if (sourceStarts.length === 0) {
-    const firstSourceTerminalAt = Math.min(
-      ...[
-        ...sourceConclusions.map((event) => event.timestampMs),
-        ...turnConclusions.map((event) => event.timestampMs),
-      ].filter((timestampMs) => Number.isFinite(timestampMs)),
-    );
-    runtimeEvents = insertRestoredRunStartBeforeTerminal({
-      runtimeEvents,
-      sessionKey: input.sessionKey,
-      turnId: sourceTurnId,
-      runId: sourceRunId,
-      parentRunId: sourceParentRunId,
-      timestampMs: Number.isFinite(firstSourceTerminalAt)
-        ? Math.min(input.at, firstSourceTerminalAt)
-        : input.at,
-    });
-  }
-  // Corrupt traces may contain more than one admitted source Run. Every old
-  // Run is closed before the receipt leaves FIFO; none is silently abandoned.
-  for (const sourceStart of sourceStarts) {
-    const hasConclusion = runtimeEvents.some((event) =>
-      event.type === "run.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId &&
-      event.runId === sourceStart.runId
-    );
-    if (hasConclusion) continue;
-    runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
-      runtimeEvents,
-      sessionKey: input.sessionKey,
-      turnId: sourceTurnId,
-      timestampMs: existingTurnConclusion
-        ? Math.min(input.at, existingTurnConclusion.timestampMs)
-        : input.at,
-      runId: sourceStart.runId,
-      parentRunId: sourceStart.parentRunId,
-      resultKind: sourceStart.runId === sourceRunId && canCloseExactTurn
-        ? resultKind
-        : "error",
-      summary: sourceStart.runId === sourceRunId && canCloseExactTurn
-        ? directSummary
-        : quarantineSummary,
-    });
-  }
-  if (!existingSourceConclusion) {
-    const nowHasSourceConclusion = runtimeEvents.some((event) =>
-      event.type === "run.completed" &&
-      event.threadId === input.sessionKey &&
-      event.turnId === sourceTurnId &&
-      event.runId === sourceRunId
-    );
-    if (!nowHasSourceConclusion) {
-      runtimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({
-        runtimeEvents,
-        sessionKey: input.sessionKey,
-        turnId: sourceTurnId,
-        timestampMs: existingTurnConclusion
-          ? Math.min(input.at, existingTurnConclusion.timestampMs)
-          : input.at,
-        runId: sourceRunId,
-        parentRunId: sourceParentRunId,
-        resultKind: canCloseExactTurn || canPreserveExactOutcome
-          ? resultKind
-          : "error",
-        summary: canCloseExactTurn
-          ? directSummary
-          : canPreserveExactOutcome
-          ? trustedExactOutcomeSummary
-          : quarantineSummary,
-      });
-    }
-  }
-
-  if (canCloseExactTurn) {
-    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-      type: "turn.completed",
-      threadId: input.sessionKey,
-      turnId: sourceTurnId,
-      timestampMs: input.at,
-      resultKind,
-    }));
-    const canonical = canonicalizeRestoredTerminalTurnFinal({
-      taskFlow: projection.disposition === "ready" ? projection.taskFlow : input.taskFlow,
-      conversationTurns: projection.disposition === "ready"
-        ? projection.conversationTurns
-        : input.conversationTurns,
-      turnId: sourceTurnId,
-      resultKind,
-      runId: sourceRunId,
-      parentRunId: sourceParentRunId,
-      completedAt: input.at,
-      runSummary: directSummary,
-      finalText: directSummary,
-      forceFinalText: true,
-      markerReason: "local_fast_restart_quarantined",
-      reservedTaskBlockIds: input.reservedTaskBlockIds,
-    });
-    return {
-      ...canonical,
-      runtimeEvents,
-      presentationTurnId: sourceTurnId,
-    };
-  }
-
-  let recoveryBaseTaskFlow = input.taskFlow;
-  let recoveryBaseConversationTurns = input.conversationTurns;
-  if (exactTurn && turnConclusions.length === 0) {
-    // Identity is still the admitted receipt, but its persisted Run set is
-    // corrupt. Close that exact source Turn before adding the diagnostic child
-    // so every admitted Turn retains one terminal lifecycle event.
-    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-      type: "turn.completed",
-      threadId: input.sessionKey,
-      turnId: sourceTurnId,
-      timestampMs: input.at,
-      resultKind: "error",
-    }));
-    const closedSource = canonicalizeRestoredTerminalTurnFinal({
-      taskFlow: projection.disposition === "ready" ? projection.taskFlow : input.taskFlow,
-      conversationTurns: projection.disposition === "ready"
-        ? projection.conversationTurns
-        : input.conversationTurns,
-      turnId: sourceTurnId,
-      resultKind: "error",
-      runId: sourceRunId,
-      parentRunId: sourceParentRunId,
-      completedAt: input.at,
-      runSummary: quarantineSummary,
-      finalText: quarantineSummary,
-      forceFinalText: true,
-      markerReason: "local_fast_restart_source_trace_corrupt",
-      reservedTaskBlockIds: input.reservedTaskBlockIds,
-    });
-    recoveryBaseTaskFlow = closedSource.taskFlow;
-    recoveryBaseConversationTurns = closedSource.conversationTurns;
-  }
-
-  const safeReceiptId = input.entry.receipt.receiptId
-    .replace(/[^A-Za-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "receipt";
-  const baseRecoveryTurnId = `local-slash-recovery-${safeReceiptId}`;
-  let recoveryTurnId = baseRecoveryTurnId;
-  let suffix = 2;
-  const recoveryTurnIdOccupied = (turnId: string) =>
-    recoveryBaseConversationTurns.some((turn) => turn.id === turnId) ||
-    recoveryBaseTaskFlow.some((block) => block.turnId === turnId) ||
-    runtimeEvents.some((event) => "turnId" in event && event.turnId === turnId);
-  while (recoveryTurnIdOccupied(recoveryTurnId)) {
-    recoveryTurnId = `${baseRecoveryTurnId}-${suffix}`;
-    suffix += 1;
-  }
-  const recoveryRunId = `${sourceRunId}-restart-quarantine`;
-  const recoveryUserBlockId = nextRestoredTaskBlockId(
-    recoveryBaseTaskFlow,
-    recoveryBaseConversationTurns,
-    input.reservedTaskBlockIds,
-  );
-  const recoveryFinalBlockId = nextRestoredTaskBlockId(
-    [...recoveryBaseTaskFlow, {
-      id: recoveryUserBlockId,
-      turnId: recoveryTurnId,
-      type: "user",
-      content: input.entry.instruction.payload.text,
-    }],
-    recoveryBaseConversationTurns,
-    input.reservedTaskBlockIds,
-  );
-  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-    type: "run.started",
-    threadId: input.sessionKey,
-    turnId: recoveryTurnId,
-    timestampMs: input.at,
-    runId: recoveryRunId,
-    parentRunId: sourceRunId,
-  }));
-  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-    type: "run.completed",
-    threadId: input.sessionKey,
-    turnId: recoveryTurnId,
-    timestampMs: input.at,
-    runId: recoveryRunId,
-    parentRunId: sourceRunId,
-    resultKind: "error",
-    summary: quarantineSummary,
-  }));
-  runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
-    type: "turn.completed",
-    threadId: input.sessionKey,
-    turnId: recoveryTurnId,
-    timestampMs: input.at,
-    resultKind: "error",
-  }));
-  return {
-    taskFlow: [
-      ...recoveryBaseTaskFlow,
-      {
-        id: recoveryUserBlockId,
-        turnId: recoveryTurnId,
-        type: "user",
-        content: input.entry.instruction.payload.text,
-      },
-      {
-        id: recoveryFinalBlockId,
-        turnId: recoveryTurnId,
-        type: "agent",
-        content: quarantineSummary,
-        streaming: false,
-        visibility: "assistant_final",
-      },
-    ],
-    conversationTurns: [
-      ...recoveryBaseConversationTurns,
-      {
-        id: recoveryTurnId,
-        userPrompt: input.entry.instruction.payload.text,
-        title: useChinese ? "本地命令恢复隔离" : "Local command recovery quarantine",
-        intentSummary: quarantineSummary,
-        mode: "edit",
-        intent: "respond",
-        displayIntent: "respond",
-        status: "error",
-        summary: quarantineSummary,
-        blockIds: [recoveryUserBlockId, recoveryFinalBlockId],
-        processCollapsed: false,
-        collapsed: false,
-        createdAt: input.entry.receipt.acceptedAt,
-        runtimeOutcome: {
-          status: "completed",
-          reason: "local_fast_restart_quarantined",
-          resultKind: "error",
-          runId: recoveryRunId,
-          parentRunId: sourceRunId,
-          updatedAt: input.at,
-        },
-      },
-    ],
-    runtimeEvents,
-    presentationTurnId: recoveryTurnId,
-  };
-}
-
-
-
 function normalizeStoredPlanExecutionProgressSnapshot(
   value: unknown,
   migratedCurrentTaskId?: string,
@@ -4308,7 +3658,7 @@ export function normalizeSessionRuntimeSnapshot(
     expectedSessionKey?: string | null;
     expectedSessionEpoch?: string | null;
     /** True only while hydrating a persisted snapshot after process loss. */
-    quarantineInterruptedLocalFast?: boolean;
+    coldRestore?: boolean;
   },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
@@ -4316,10 +3666,14 @@ export function normalizeSessionRuntimeSnapshot(
   const hasWorkspaceContainer = expectedContainerSessionKey
     ? !expectedContainerSessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
     : resolveSessionWorkspaceKey(options?.workspacePath || "") !== GLOBAL_CHAT_KEY;
+  const legacySnapshot = snapshot as Partial<SessionRuntimeSnapshot> & {
+    selectedNexusModeKey?: string;
+    selectedAgentKey?: string;
+  };
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
-    (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedMainModeKey ||
-      (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
-      (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedAgentKey,
+    legacySnapshot.selectedMainModeKey ||
+      legacySnapshot.selectedNexusModeKey ||
+      legacySnapshot.selectedAgentKey,
   );
   const effectiveAutoApproveToolScopes = buildEffectiveSessionAutoApproveScopes(
     snapshot.autoApproveTools === true,
@@ -5268,16 +4622,6 @@ export function normalizeSessionRuntimeSnapshot(
   // was already cleared before a crash. Project every currently loaded Turn;
   // events for paged-out Turns remain untouched until those Turns are loaded.
   for (const loadedTurn of conversationTurns) {
-    const hasColdLocalFastQueueOwner = !!options?.quarantineInterruptedLocalFast &&
-      !!snapshot.workspaceTurnQueue?.entries.some((entry) =>
-        entry.receipt.turnId === loadedTurn.id &&
-        isRestoredLocalFastQueueEntry(entry)
-      );
-    if (hasColdLocalFastQueueOwner) {
-      // The strict local-fast quarantine below must evaluate the persisted Turn
-      // identity before generic terminal projection can select another Run.
-      continue;
-    }
     const restoredTurnConclusion = [...runtimeEvents].reverse().find(
       (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
         event.type === "turn.completed" && event.turnId === loadedTurn.id,
@@ -5542,47 +4886,6 @@ export function normalizeSessionRuntimeSnapshot(
       });
     }
   }
-  const restoredLocalFastQueueEntries = options?.quarantineInterruptedLocalFast
-    ? restoredQueueCandidate?.entries.filter(isRestoredLocalFastQueueEntry) || []
-    : [];
-
-  // There is no durable pre-execution fence in this schema generation. A disk
-  // snapshot may therefore still say `queued` even if a local side effect ran
-  // and its terminal save later failed. Cold restore cannot distinguish that
-  // case from never-started work without risking duplicate side effects. Close
-  // every noncanonical local-fast receipt visibly and require an explicit new
-  // Turn to retry; model-workflow queue semantics remain unchanged.
-  for (const entry of restoredLocalFastQueueEntries) {
-    if (hasCanonicalRestoredLocalFastConclusion({
-      entry,
-      sessionKey: restoredLifecycleSessionKey,
-      taskFlow,
-      conversationTurns,
-      runtimeEvents,
-      workspacePath: options?.workspacePath,
-    })) continue;
-    const quarantined = quarantineRestoredLocalFastEntry({
-      entry,
-      sessionKey: restoredLifecycleSessionKey,
-      taskFlow,
-      conversationTurns,
-      runtimeEvents,
-      at: restoreAt,
-      workspacePath: options?.workspacePath,
-      reservedTaskBlockIds: reservedWorkspaceInstructionBlockIds,
-    });
-    taskFlow = quarantined.taskFlow;
-    conversationTurns = quarantined.conversationTurns;
-    runtimeEvents = quarantined.runtimeEvents;
-    logStoreEvent("workspace_local_fast_restore_quarantined", {
-      sessionKey: restoredLifecycleSessionKey,
-      sessionEpoch: restoredLifecycleSessionEpoch,
-      receiptId: entry.receipt.receiptId,
-      sourceTurnId: entry.receipt.turnId,
-      presentationTurnId: quarantined.presentationTurnId,
-      reason: "missing_durable_pre_execution_fence",
-    });
-  }
   const restoredTerminalOwners: WorkspaceTurnTerminalOwner[] = [];
   const restoredAdoptedOwners: WorkspaceTurnTerminalOwner[] = [];
   const restoredRecoveryOwners: WorkspaceTurnTerminalOwner[] = [];
@@ -5617,29 +4920,6 @@ export function normalizeSessionRuntimeSnapshot(
 
   for (const entry of restoredQueueCandidate?.entries || []) {
     const ownerIdentity = ownerIdentityForEntry(entry);
-    if (isRestoredLocalFastQueueEntry(entry)) {
-      if (!hasCanonicalRestoredLocalFastConclusion({
-        entry,
-        sessionKey: restoredLifecycleSessionKey,
-        taskFlow,
-        conversationTurns,
-        runtimeEvents,
-        workspacePath: options?.workspacePath,
-      })) continue;
-      const sourceInspection = inspectWorkspaceInstructionTerminalProjection({
-        entry,
-        sessionKey: restoredLifecycleSessionKey,
-        taskFlow,
-        conversationTurns,
-        runtimeEvents,
-      });
-      (sourceInspection.canonical
-        ? restoredTerminalOwners
-        : restoredRecoveryOwners).push(ownerIdentity);
-      settlePausedHarnessOwnerForCompletedEntry(entry);
-      continue;
-    }
-
     let inspection = inspectWorkspaceInstructionTerminalProjection({
       entry,
       sessionKey: restoredLifecycleSessionKey,
@@ -5899,7 +5179,7 @@ export function normalizeSessionRuntimeSnapshot(
       expectedSessionEpoch: suppliedLifecycleSessionEpoch || undefined,
       expectedWorkspaceKey: restoredWorkspaceKey,
       closureReceiptLedger: restoredSubagentClosureReceiptLedger,
-      coldRestore: options?.quarantineInterruptedLocalFast === true,
+      coldRestore: options?.coldRestore === true,
       now: restoreAt,
     },
   );
@@ -6003,12 +5283,8 @@ export function normalizeSessionRuntimeSnapshot(
     conversationTurns: checkpointBackedConversationTurns,
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
     sessionModeAffinity: resolveSessionModeAffinity(snapshot as SessionModeAffinityLike, selectedMainModeKey),
     imageStudio: normalizeImageStudioRuntime(snapshot.imageStudio),
-    activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey),
-    gameStudioInitialized: snapshot.gameStudioInitialized === true,
-    pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
     planArtifacts: restoredPlanArtifacts.artifacts,
     planTasks: restoredPlanTasks,
     planExecutionEvidenceLedger: hasExactRestoredPlanCheckpoint
@@ -6178,7 +5454,7 @@ export function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | 
   const runtimeIntentCandidate = String(record.runtimeIntentOverride || "").trim();
   const runtimeIntentOverride = [
     "respond", "discuss", "plan", "execute", "analyze", "summarize",
-    "report", "studio_workflow", "image_studio", "goal",
+    "report", "image_studio", "goal",
   ].includes(runtimeIntentCandidate)
     ? runtimeIntentCandidate as ResolvedRunIntent
     : undefined;
@@ -6281,12 +5557,8 @@ const sessionRuntimeKeys = [
   "conversationTurns",
   "currentTurnId",
   "selectedMainModeKey",
-  "selectedNexusModeKey",
   "sessionModeAffinity",
   "imageStudio",
-  "activeStudioAgentKey",
-  "gameStudioInitialized",
-  "pendingSlashCommand",
   "planArtifacts",
   "planTasks",
   "planExecutionEvidenceLedger",
@@ -6480,9 +5752,7 @@ function buildQueuedGoalContinuationRemovalPatch(
 }
 
 function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntimeState {
-  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
-    state.selectedMainModeKey || state.selectedNexusModeKey,
-  );
+  const selectedMainModeKey = mapLegacyNexusModeToMainMode(state.selectedMainModeKey);
   const runtimeLaneKey = resolveRuntimeLaneKey(state.config);
   const normalizedContextMemoryLaneMap = normalizeContextMemoryStateByRuntimeKey(state.contextMemoryStateByRuntimeKey);
   const normalizedContextMemoryState = normalizeContextMemoryState(state.contextMemoryState);
@@ -6584,12 +5854,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     conversationTurns: Array.isArray(state.conversationTurns) ? state.conversationTurns : [],
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
     sessionModeAffinity: resolveSessionModeAffinity(state as SessionModeAffinityLike, selectedMainModeKey),
     imageStudio: normalizeImageStudioRuntime(state.imageStudio),
-    activeStudioAgentKey: normalizeStudioAgentKey(state.activeStudioAgentKey),
-    gameStudioInitialized: state.gameStudioInitialized === true,
-    pendingSlashCommand: normalizePendingSlashCommand(state.pendingSlashCommand),
     planArtifacts: state.planArtifacts || [],
     planTasks: state.planTasks || [],
     planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
@@ -7210,7 +6476,7 @@ export function buildRestoredSessionRuntimePatch(input: {
     : input.snapshot;
   const normalized = normalizeSessionRuntimeSnapshot(mergedSnapshot, {
     restoreInterruptedGoal: true,
-    quarantineInterruptedLocalFast: true,
+    coldRestore: true,
     workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
     expectedSessionKey: input.expectedSessionKey,
     expectedSessionEpoch: input.expectedSessionEpoch,
@@ -7291,7 +6557,7 @@ function normalizeSessionsByWorkspace(
         messages: sanitizeTaskBlocksForPersist(session.messages || []),
         runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
           restoreInterruptedGoal: true,
-          quarantineInterruptedLocalFast: true,
+          coldRestore: true,
           workspacePath: scopeKey,
           expectedSessionKey: resolveSessionRuntimeKey(scopeKey, session.id),
           expectedSessionEpoch: planLifecycleEpoch,
@@ -7985,12 +7251,8 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     conversationTurns: normalizeLiveConversationTurns(state.conversationTurns),
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey: state.selectedMainModeKey,
-    selectedNexusModeKey: state.selectedNexusModeKey,
     sessionModeAffinity: resolveCurrentSessionModeAffinityFromState(state),
     imageStudio: normalizeImageStudioRuntime(state.imageStudio),
-    activeStudioAgentKey: state.activeStudioAgentKey,
-    gameStudioInitialized: state.gameStudioInitialized,
-    pendingSlashCommand: state.pendingSlashCommand ?? null,
     planArtifacts: state.planArtifacts || [],
     planTasks: state.planTasks || [],
     planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
@@ -8076,16 +7338,12 @@ export function buildEmptySessionRuntimeSnapshot(
     conversationTurns: [],
     currentTurnId: null,
     selectedMainModeKey,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
     sessionModeAffinity: selectedMainModeKey,
     imageStudio: {
       ...previousImageStudio,
       activeJobId: null,
       activeStreamId: null,
     },
-    activeStudioAgentKey: "studio_auto",
-    gameStudioInitialized: false,
-    pendingSlashCommand: null,
     planArtifacts: [],
     planTasks: [],
     planExecutionEvidenceLedger: [],
@@ -9087,134 +8345,6 @@ function clearWorkspaceInstructionStartingGrace(claimId: string): void {
   workspaceInstructionStartingGraceByClaim.delete(claimId);
 }
 
-interface LocalFastExecutionLease {
-  readonly sessionKey: string;
-  readonly turnId: string;
-  readonly runId: string;
-  readonly clientSubmissionId: string | null;
-  readonly receiptId: string | null;
-  readonly controller: AbortController;
-  readonly claim: WorkspaceInstructionDispatchClaim | null;
-  readonly completion: Promise<GameStudioLocalSlashCompletionResult>;
-  readonly hasRuntimeOwnership: () => boolean;
-  readonly retireWorkspaceClaim: () => boolean;
-  readonly release: () => void;
-  settled: boolean;
-  dispatcherObserved: boolean;
-}
-
-const localFastExecutionLeasesByOwner = new Map<string, LocalFastExecutionLease>();
-const localFastExecutionLeasesByClaim = new Map<string, LocalFastExecutionLease>();
-
-function localFastExecutionOwnerKey(sessionKey: string, turnId: string): string {
-  return `${sessionKey}\u0000${turnId}`;
-}
-
-function readLocalFastOwnerState(
-  state: AppState,
-  sessionKey: string,
-): AppState | null {
-  if (isSessionRuntimeActive(state, sessionKey)) return state;
-  const runtime = state.runtimeBySessionKey[sessionKey];
-  return runtime ? ({ ...state, ...runtime } as AppState) : null;
-}
-
-function hasVerifiedLocalFastConclusion(
-  state: AppState,
-  claim: WorkspaceInstructionDispatchClaim,
-  result: GameStudioLocalSlashCompletionResult,
-): boolean {
-  const ownerState = readLocalFastOwnerState(state, claim.sessionKey);
-  const owner = result.conclusionOwner;
-  if (!ownerState || !result.conclusionAppended || !owner) return false;
-  if (
-    owner.disposition === "recovery_completed"
-      ? owner.parentRunId !== result.runId
-      : owner.runId !== result.runId
-  ) return false;
-  const hasCanonicalProjection = (
-    runtimeEvents: readonly MainThreadEvent[],
-    conversationTurns: readonly ConversationTurn[],
-    taskFlow: readonly TaskBlock[],
-  ) => {
-    const turn = conversationTurns.find((candidate) => candidate.id === owner.turnId);
-    const outcome = turn?.runtimeOutcome;
-    const runConclusions = runtimeEvents.filter((event) =>
-      event.type === "run.completed" &&
-      event.threadId === claim.sessionKey &&
-      event.turnId === owner.turnId &&
-      event.runId === owner.runId
-    );
-    const turnConclusions = runtimeEvents.filter((event) =>
-      event.type === "turn.completed" &&
-      event.threadId === claim.sessionKey &&
-      event.turnId === owner.turnId
-    );
-    const runConclusion = runConclusions[0];
-    const turnConclusion = turnConclusions[0];
-    const finals = taskFlow.filter(
-      (block): block is Extract<TaskBlock, { type: "agent" }> =>
-      block.turnId === owner.turnId &&
-      block.type === "agent" &&
-      block.visibility === "assistant_final"
-    );
-    if (
-      !turn ||
-      outcome?.status !== "completed" ||
-      outcome.runId !== owner.runId ||
-      outcome.parentRunId !== owner.parentRunId ||
-      outcome.resultKind !== owner.resultKind ||
-      runConclusions.length !== 1 ||
-      runConclusion?.type !== "run.completed" ||
-      runConclusion.parentRunId !== owner.parentRunId ||
-      runConclusion.resultKind !== owner.resultKind ||
-      runConclusion.summary !== owner.summary ||
-      turnConclusions.length !== 1 ||
-      turnConclusion?.type !== "turn.completed" ||
-      turnConclusion.resultKind !== owner.resultKind ||
-      finals.length !== 1 ||
-      finals[0].content !== owner.summary ||
-      finals[0].streaming === true
-    ) return false;
-    if (
-      owner.disposition !== "recovery_completed" &&
-      (
-        turn.clientSubmissionId !== claim.clientSubmissionId ||
-        turn.workspaceInstructionReceiptId !== claim.receiptId
-      )
-    ) return false;
-    if (owner.disposition !== "recovery_completed") return true;
-    return runtimeEvents.filter((event) =>
-      event.type === "run.completed" &&
-      event.threadId === claim.sessionKey &&
-      event.turnId === claim.turnId &&
-      event.runId === result.runId
-    ).length === 1;
-  };
-  if (!hasCanonicalProjection(
-    ownerState.runtimeEvents,
-    ownerState.conversationTurns,
-    ownerState.taskFlow,
-  )) {
-    return false;
-  }
-  const queue = ownerState.workspaceTurnQueue;
-  const head = queue?.entries[0];
-  // The durability barrier deliberately persists the terminal projection
-  // while retaining its dispatching FIFO head. This prevents an older generic
-  // autosave from resurrecting a nonterminal snapshot. The dispatcher may
-  // retire the head in memory only after observing both halves together.
-  return !!queue &&
-    queue.sessionKey === claim.sessionKey &&
-    queue.sessionEpoch === claim.sessionEpoch &&
-    head?.status === "dispatching" &&
-    head.claim?.claimId === claim.claimId &&
-    head.receipt.receiptId === claim.receiptId &&
-    head.receipt.clientSubmissionId === claim.clientSubmissionId &&
-    head.receipt.turnId === claim.turnId &&
-    workspaceInstructionEnvelopeIdentity(head) === claim.instructionEnvelopeIdentity;
-}
-
 function createWorkspaceRuntimeIdentity(prefix: string, at = Date.now()): string {
   const randomPart = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -9461,37 +8591,6 @@ export const useAppStore = create<AppState>()(
       } else {
         set({ isGenerating: false, abortController: null, agentStatus: "idle" });
       }
-      return;
-    }
-    const currentSessionKey = get().getCurrentSessionKey();
-    const localFastLease = currentTurnId && currentSessionKey
-      ? localFastExecutionLeasesByOwner.get(
-          localFastExecutionOwnerKey(currentSessionKey, currentTurnId),
-        ) || null
-      : null;
-    const localFastLeaseOwnsCurrentTurn = !!localFastLease && (
-      !localFastLease.claim || get().conversationTurns.some((turn) =>
-        turn.id === currentTurnId &&
-        turn.clientSubmissionId === localFastLease.clientSubmissionId &&
-        turn.workspaceInstructionReceiptId === localFastLease.receiptId
-      )
-    );
-    if (
-      localFastLease &&
-      !localFastLease.settled &&
-      localFastLeaseOwnsCurrentTurn &&
-      get().abortController === localFastLease.controller
-    ) {
-      // The local-fast completion owns the only cancellation conclusion. Do
-      // not let the generic cancel path race it with a second Turn terminal.
-      localFastLease.controller.abort();
-      set((s) => ({
-        taskFlow: s.taskFlow.map((block) =>
-          block.turnId === currentTurnId && block.type === "agent" && block.options?.length
-            ? { ...block, options: undefined }
-            : block
-        ),
-      }));
       return;
     }
     get().abortController?.abort();
@@ -9964,9 +9063,8 @@ export const useAppStore = create<AppState>()(
   setShowFilePicker: (v) => set({ showFilePicker: v }),
   setShowAgentPicker: (v) => set({ showAgentPicker: v }),
 
-      // Workspace Slice
-      ...createWorkspaceSlice(set, get),
-      pendingSlashCommand: null,
+      // Composer / workspace state
+      ...createWorkspaceSlice(set),
       lockedComposerIntent: null,
       pendingRunDecision: null,
       dismissedPendingDecisionInputKey: null,
@@ -10038,104 +9136,6 @@ export const useAppStore = create<AppState>()(
       return;
     }
 
-    if (pending.kind === "mode_switch") {
-      const originalImages = pending.originalImages;
-      const language = resolveTurnResponseLanguage({
-        text: pending.originalInput,
-        policy: state.config.responseLanguagePolicy,
-        systemLanguage: state.config.language === "en" ? "en" : "zh",
-        fallbackLanguage: state.config.language === "en" ? "en" : "zh",
-      });
-
-      if (choice === "cancel") {
-        set({ pendingRunDecision: null });
-        return;
-      }
-
-      if (choice === "stay_main") {
-        set({ pendingRunDecision: null });
-        scheduleRuntimeTask(() => {
-          get().sendMessage(pending.originalInput, originalImages, {
-            suppressGameStudioSuggestion: true,
-          });
-        });
-        return;
-      }
-
-      const selectedEngine = resolveEngineFromModeSwitchChoice(choice, pending);
-      const shouldAskEngine = choice === "switch_game_studio_choose_engine" || !selectedEngine;
-      const nextAgent = selectedEngine ? getDefaultStudioAgentForEngine(selectedEngine) : state.activeStudioAgentKey;
-      set({
-        pendingRunDecision: null,
-        selectedMainModeKey: "game_studio",
-        selectedNexusModeKey: "nexus_game_studio",
-        activeStudioAgentKey: nextAgent,
-        lockedComposerIntent: null,
-      });
-
-      scheduleRuntimeTask(() => {
-        void (async () => {
-          let configuredAgent = nextAgent;
-          try {
-            const initialized = await ensureGameStudioWorkspaceInitialized(configuredAgent);
-            let studioConfig = initialized;
-            if (selectedEngine) {
-              studioConfig = await setGameStudioEngineConfig({
-                engine: selectedEngine,
-                activeStudioAgent: getDefaultStudioAgentForEngine(selectedEngine),
-              });
-            }
-            configuredAgent = normalizeStudioAgentKey(studioConfig.activeStudioAgent);
-            invalidateWorkspaceTreeCache();
-            set({
-              gameStudioInitialized: true,
-              activeStudioAgentKey: configuredAgent,
-              selectedMainModeKey: "game_studio",
-              selectedNexusModeKey: "nexus_game_studio",
-            });
-            get().bumpWorkspaceContentVersion();
-          } catch (error) {
-            appendDebugLog("warn", "game_studio_mode_switch_failed", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-
-          const directive: CommandDirective = {
-            kind: selectedEngine === "unity" ? "unity" : "studio",
-            action: shouldAskEngine ? "confirm_game_engine" : "game_studio_mode_switch",
-            target: selectedEngine || "engine_selection",
-            source: "natural_language",
-            requiresWorkspace: true,
-            requiresApproval: false,
-            confidence: selectedEngine ? 0.9 : 0.7,
-            reason: shouldAskEngine
-              ? "Game-development intent was detected, but the engine is ambiguous; ask the user to choose before configuring engine-specific workflow."
-              : `Game-development intent should continue in Game Studio with ${selectedEngine} engine metadata.`,
-          };
-
-          get().sendMessage(pending.originalInput, originalImages, {
-            resolvedIntent: "studio_workflow",
-            runtimeIntentOverride: "studio_workflow",
-            commandDirective: directive,
-            skipIntentResolution: true,
-            suppressGameStudioSuggestion: true,
-            intentSummary: buildRunIntentSummary({
-              input: pending.originalInput,
-              intent: "studio_workflow",
-              language,
-              reason: shouldAskEngine
-                ? language === "en"
-                  ? "Switch to Game Studio and ask the user to choose the game engine before continuing."
-                  : "切换到游戏工作室，并先确认游戏引擎再继续。"
-                : language === "en"
-                ? `Switch to Game Studio and configure ${selectedEngine}.`
-                : `切换到游戏工作室，并配置 ${selectedEngine} 引擎。`,
-            }),
-          });
-        })();
-      });
-      return;
-    }
 
     if (choice === "cancel") {
       set({ pendingRunDecision: null });
@@ -10152,10 +9152,7 @@ export const useAppStore = create<AppState>()(
       systemLanguage: state.config.language === "en" ? "en" : "zh",
       fallbackLanguage: state.config.language === "en" ? "en" : "zh",
     });
-    const approvedExecutionIntent =
-      intentChoice === "execute" || intentChoice === "studio_workflow"
-        ? intentChoice
-        : null;
+    const approvedExecutionIntent = intentChoice === "execute" ? intentChoice : null;
     set({ pendingRunDecision: null });
     scheduleRuntimeTask(() => {
       get().sendMessage(pending.originalInput, originalImages, {
@@ -10176,12 +9173,6 @@ export const useAppStore = create<AppState>()(
       });
     });
   },
-  setSelectedMainModeKey: (key) => set((s) => ({
-    selectedMainModeKey: key,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
-    lockedComposerIntent: null,
-    rightPanelTab: normalizeStoredRightPanelTab(s.rightPanelTab),
-  })),
   createIsolatedImageSession: async () => {
     const state = get();
     const language = state.config.language === "en" ? "en" : "zh";
@@ -10257,7 +9248,6 @@ export const useAppStore = create<AppState>()(
       currentSessionId: imageSession.id,
       ...getSessionRuntimeUiPatch(imageRuntime, { resetPanels: true }),
       selectedMainModeKey: "image_studio",
-      selectedNexusModeKey: "nexus_general",
       lockedComposerIntent: null,
       pendingRunDecision: null,
       pendingRunDecisionResolver: null,
@@ -10356,7 +9346,6 @@ export const useAppStore = create<AppState>()(
         currentSessionId: created.id,
         ...getSessionRuntimeUiPatch(runtime, { resetPanels: true }),
         selectedMainModeKey: targetMode,
-        selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
         lockedComposerIntent: null,
         pendingRunDecision: null,
         pendingRunDecisionResolver: null,
@@ -10371,12 +9360,8 @@ export const useAppStore = create<AppState>()(
       conversationTurns: [],
       currentTurnId: null,
       selectedMainModeKey: targetMode,
-      selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
       sessionModeAffinity: targetMode,
       imageStudio: state.imageStudio,
-      activeStudioAgentKey: state.activeStudioAgentKey,
-      gameStudioInitialized: state.gameStudioInitialized,
-      pendingSlashCommand: null,
       planArtifacts: [],
       planTasks: [],
       planExecutionEvidenceLedger: [],
@@ -10406,7 +9391,6 @@ export const useAppStore = create<AppState>()(
       currentSessionId: nextSession.id,
       ...getSessionRuntimeUiPatch(runtime, { resetPanels: true }),
       selectedMainModeKey: targetMode,
-      selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
       lockedComposerIntent: null,
       pendingRunDecision: null,
       pendingRunDecisionResolver: null,
@@ -10705,7 +9689,6 @@ export const useAppStore = create<AppState>()(
       contextMentions: [],
       attachedFiles: [],
       selectedMainModeKey: s.selectedMainModeKey,
-      selectedNexusModeKey: s.selectedNexusModeKey,
       lockedComposerIntent: null,
       pendingRunDecision: null,
       isGenerating: true,
@@ -11042,42 +10025,6 @@ export const useAppStore = create<AppState>()(
 
     return true;
   },
-  refreshGameStudioWorkspaceState: async () => {
-    if (!get().currentWorkspace.trim()) {
-      set({ gameStudioInitialized: false, activeStudioAgentKey: "studio_auto" });
-      return;
-    }
-    const config = await loadGameStudioConfig();
-    if (!config) {
-      set({ gameStudioInitialized: false, activeStudioAgentKey: "studio_auto" });
-      return;
-    }
-    set({
-      gameStudioInitialized: true,
-      activeStudioAgentKey: normalizeStudioAgentKey(config.activeStudioAgent),
-    });
-  },
-  initializeGameStudioWorkspace: async () => {
-    const state = get();
-    const config = await ensureGameStudioWorkspaceInitialized(state.activeStudioAgentKey);
-    invalidateWorkspaceTreeCache();
-    set({
-      gameStudioInitialized: true,
-      activeStudioAgentKey: normalizeStudioAgentKey(config.activeStudioAgent),
-    });
-    get().bumpWorkspaceContentVersion();
-  },
-  removeGameStudioWorkspace: async () => {
-    await removeGameStudioWorkspaceAssets();
-    invalidateWorkspaceTreeCache();
-    set({
-      gameStudioInitialized: false,
-      activeStudioAgentKey: "studio_auto",
-      pendingSlashCommand: null,
-    });
-    get().bumpWorkspaceContentVersion();
-  },
-
   // ── Turn Management for Deduplication ────────────────────────────
   currentTurnId: null,
   conversationTurns: [],
@@ -11291,23 +10238,36 @@ export const useAppStore = create<AppState>()(
   setSkills: (v) => set({ skills: v }),
   toggleSkill: (id) =>
     set((s) => ({ skills: s.skills.map((sk) => (sk.id === id ? { ...sk, active: !sk.active } : sk)) })),
-  deleteSkill: (id) =>
-    set((s) => {
-      const skill = s.skills.find((sk) => sk.id === id);
-      if (skill?.isBuiltIn) return s; // prevent deleting built-in skills
-      // If this is a package skill, delete the extracted folder from disk
-      if (skill?.type === "package" && skill.packagePath) {
-        invoke("delete_protocol_package", { localPath: skill.packagePath }).catch(() => {});
-      }
-      return { skills: s.skills.filter((sk) => sk.id !== id) };
-    }),
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope }) =>
+  deleteSkill: (id) => {
+    const skill = get().skills.find((candidate) => candidate.id === id);
+    if (!skill || skill.isBuiltIn) return;
+    const removeRecord = () => set((state) => ({
+      skills: state.skills.filter((candidate) => candidate.id !== id),
+    }));
+    if (skill.type === "package" && skill.packagePath) {
+      void invoke("delete_protocol_package", {
+        localPath: skill.packagePath,
+        workspace: skill.workspaceScope || null,
+      }).then(removeRecord).catch((error) => {
+        console.error("Protocol package deletion failed; Skill record was retained.", error);
+      });
+      return;
+    }
+    removeRecord();
+  },
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }) =>
     set((s) => ({
-      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope }],
+      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }],
     })),
   updateSkill: (id, patch) =>
     set((s) => ({
-      skills: s.skills.map((sk) => (sk.id === id ? { ...sk, ...patch, content: patch.content ? normalizeSkillContent(patch.content) : sk.content } : sk)),
+      skills: s.skills.map((sk) => (sk.id === id ? {
+        ...sk,
+        ...patch,
+        content: Object.prototype.hasOwnProperty.call(patch, "content")
+          ? normalizeSkillContent(patch.content || "")
+          : sk.content,
+      } : sk)),
     })),
 
   knowledgeBases: defaultKnowledgeBases,
@@ -11349,6 +10309,12 @@ export const useAppStore = create<AppState>()(
       ? workspaceInstructionProjectionOwner.claim(requestedWorkspace)
       : null;
     if (!requestedWorkspace) {
+      const resolved = await loadResolvedInstructions(
+        "",
+        state.skills,
+        associatedPaths,
+        options.userPrompt || "",
+      );
       if (
         workspaceInstructionProjectionOwner.canCommit(
           projectionLease,
@@ -11356,14 +10322,14 @@ export const useAppStore = create<AppState>()(
         )
       ) {
         set({
-          resolvedInstructionSet: null,
+          resolvedInstructionSet: resolved,
           instructionSources: [],
           loadedHookDefinitions: defaultHookDefinitions,
-          instructionLastLoadedAt: null,
+          instructionLastLoadedAt: resolved.loadedAt,
           hookLastLoadedAt: null,
         });
       }
-      return null;
+      return resolved;
     }
 
     const [resolved, hooksConfig] = await Promise.all([
@@ -11371,6 +10337,8 @@ export const useAppStore = create<AppState>()(
         requestedWorkspace,
         state.skills,
         associatedPaths,
+        options.userPrompt || "",
+        options.instructionIo,
       ),
       loadHooksConfig(requestedWorkspace),
     ]);
@@ -12754,7 +11722,6 @@ export const useAppStore = create<AppState>()(
         messages: [],
         selectedDiffTaskId: null,
         selectedMainModeKey: "main_mode",
-        selectedNexusModeKey: "nexus_general",
         conversationTurns: [],
         currentTurnId: null,
         currentTurnState: createDefaultCurrentTurnState(),
@@ -12932,7 +11899,6 @@ export const useAppStore = create<AppState>()(
       selectedWorkspace: "",
       currentSessionId: null,
       selectedMainModeKey: "main_mode",
-      selectedNexusModeKey: "nexus_general",
       imageStudio: createDefaultImageStudioRuntime(),
       taskFlow: [],
       runtimeEvents: [],
@@ -12962,7 +11928,6 @@ export const useAppStore = create<AppState>()(
       runtimeV2EmergencyTerminalEnvelopes: {},
       subagentClosureReceiptLedger: null,
       pendingToolCall: null,
-      pendingSlashCommand: null,
       abortController: null,
       agentStatus: "idle",
       isGenerating: false,
@@ -15649,6 +14614,18 @@ export const useAppStore = create<AppState>()(
     if (!workspace || scopeKey === GLOBAL_CHAT_KEY) {
       return { accepted: false, reason: "workspace_required", retryable: false };
     }
+    if (parseProjectInitCommand(text)) {
+      logStoreEvent("workspace_local_command_rejected_before_turn", {
+        command: text.trim(),
+        source: input.source || "composer",
+        reason: "local_review_required",
+      });
+      return {
+        accepted: false,
+        reason: "local_command_requires_composer",
+        retryable: false,
+      };
+    }
     const requestedAt = Date.now();
     const clientSubmissionId = String(input.clientSubmissionId || "").trim() ||
       createWorkspaceRuntimeIdentity("workspace-submission", requestedAt);
@@ -16172,6 +15149,7 @@ export const useAppStore = create<AppState>()(
         turnId,
         userBlockId,
         acceptedAt: submittedAt,
+        networkRead: captureNetworkRead(state),
       };
       const instruction: WorkspaceInstruction = {
         schemaVersion: WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
@@ -16815,118 +15793,6 @@ export const useAppStore = create<AppState>()(
 
     const terminalHead = queue.entries[0];
     if (terminalHead?.status === "dispatching" && terminalHead.claim) {
-      const activeLocalFastLease = localFastExecutionLeasesByClaim.get(
-        terminalHead.claim.claimId,
-      );
-      if (
-        activeLocalFastLease &&
-        !activeLocalFastLease.settled &&
-        activeLocalFastLease.sessionKey === sessionKey &&
-        activeLocalFastLease.turnId === terminalHead.receipt.turnId &&
-        activeLocalFastLease.claim?.receiptId === terminalHead.receipt.receiptId &&
-        activeLocalFastLease.claim.instructionEnvelopeIdentity ===
-          workspaceInstructionEnvelopeIdentity(terminalHead)
-      ) {
-        // A live local-fast lease has accepted the Run but has no recoverable
-        // executor checkpoint. Retain its durable FIFO head until the verified
-        // atomic conclusion callback removes it.
-        return false;
-      }
-      const terminalCommand = parseGameStudioSlashCommand(
-        terminalHead.instruction.payload.text,
-      );
-      const terminalHeadIsLocalFast = !!terminalCommand &&
-        getGameStudioSlashCommandSpec(terminalCommand)?.executionMode === "local_fast";
-      if (terminalHeadIsLocalFast) {
-        const at = Date.now();
-        const alreadyCanonical = hasCanonicalRestoredLocalFastConclusion({
-          entry: terminalHead,
-          sessionKey,
-          taskFlow: state.taskFlow,
-          conversationTurns: state.conversationTurns,
-          runtimeEvents: state.runtimeEvents,
-          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
-        });
-        const quarantined = alreadyCanonical
-          ? {
-              taskFlow: state.taskFlow,
-              conversationTurns: state.conversationTurns,
-              runtimeEvents: state.runtimeEvents,
-              presentationTurnId: terminalHead.receipt.turnId,
-            }
-          : quarantineRestoredLocalFastEntry({
-              entry: terminalHead,
-              sessionKey,
-              taskFlow: state.taskFlow,
-              conversationTurns: state.conversationTurns,
-              runtimeEvents: state.runtimeEvents,
-              at,
-              workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
-              reservedTaskBlockIds: queue.entries.map(
-                (entry) => entry.receipt.userBlockId,
-              ),
-            });
-        const canonicalAfterReconcile = hasCanonicalRestoredLocalFastConclusion({
-          entry: terminalHead,
-          sessionKey,
-          taskFlow: quarantined.taskFlow,
-          conversationTurns: quarantined.conversationTurns,
-          runtimeEvents: quarantined.runtimeEvents,
-          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
-        });
-        const removed = canonicalAfterReconcile
-          ? reduceWorkspaceTurnQueue(queue, {
-          type: "remove",
-          expectedVersion: queue.version,
-          at,
-          claimId: terminalHead.claim.claimId,
-          sessionKey: queue.sessionKey,
-          sessionEpoch: queue.sessionEpoch,
-          terminalOwner: {
-            sessionKey: queue.sessionKey,
-            sessionEpoch: queue.sessionEpoch,
-            turnId: terminalHead.receipt.turnId,
-            receiptId: terminalHead.receipt.receiptId,
-            clientSubmissionId: terminalHead.instruction.clientSubmissionId,
-            instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(terminalHead),
-          },
-        })
-          : null;
-        if (removed?.disposition === "applied") {
-          set({
-            workspaceTurnQueue: removed.state,
-            taskFlow: quarantined.taskFlow,
-            conversationTurns: quarantined.conversationTurns,
-            runtimeEvents: quarantined.runtimeEvents,
-            transcriptLoadedTurns: Math.max(
-              state.transcriptLoadedTurns,
-              quarantined.conversationTurns.length,
-            ),
-            transcriptTotalTurns: Math.max(
-              state.transcriptTotalTurns,
-              quarantined.conversationTurns.length,
-            ),
-          });
-          get().saveCurrentRuntimeToSession();
-          logStoreEvent("workspace_local_fast_lost_lease_quarantined", {
-            sessionKey,
-            receiptId: terminalHead.receipt.receiptId,
-            sourceTurnId: terminalHead.receipt.turnId,
-            presentationTurnId: quarantined.presentationTurnId,
-            preservedCanonicalConclusion: alreadyCanonical,
-          });
-          queue = removed.state;
-          state = get();
-        } else {
-          logStoreEvent("workspace_local_fast_lost_lease_quarantine_rejected", {
-            sessionKey,
-            receiptId: terminalHead.receipt.receiptId,
-            sourceTurnId: terminalHead.receipt.turnId,
-            canonicalAfterReconcile,
-            queueDisposition: removed?.disposition || null,
-          });
-        }
-      } else {
         const inspection = inspectWorkspaceInstructionTerminalProjection({
           entry: terminalHead,
           sessionKey,
@@ -17146,7 +16012,6 @@ export const useAppStore = create<AppState>()(
           queue = transition.state;
           state = get();
         }
-      }
     }
 
     const head = queue.entries[0];
@@ -17429,7 +16294,6 @@ export const useAppStore = create<AppState>()(
         adoptExistingTurn: true,
         admittedUserBlockId: admittedUserBlock!.id,
         workspaceInstructionClaim: exactClaim,
-        suppressGameStudioSuggestion: true,
         skipAutoPlanHydration: true,
         ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
         ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
@@ -17661,70 +16525,6 @@ export const useAppStore = create<AppState>()(
       }
       releaseAdmittedTurnClaim();
       return false;
-    }
-    const localFastLease = localFastExecutionLeasesByClaim.get(claimId);
-    if (
-      localFastLease &&
-      localFastLease.claim?.receiptId === head.receipt.receiptId &&
-      localFastLease.sessionKey === sessionKey &&
-      localFastLease.turnId === head.receipt.turnId
-    ) {
-      if (!localFastLease.dispatcherObserved) {
-        localFastLease.dispatcherObserved = true;
-        const releaseUnverifiedLeaseForFailClosedReconcile = (detail: string) => {
-          logStoreEvent("workspace_local_fast_conclusion_unverified", {
-            sessionKey,
-            turnId: head.receipt.turnId,
-            receiptId: head.receipt.receiptId,
-            runId: localFastLease.runId,
-            detail,
-          });
-          const ownerStillCurrent = localFastLease.hasRuntimeOwnership();
-          // Never retain a rejected completion as a permanent execution lease.
-          // The still-dispatching head is not released back to queued: once the
-          // transient map is gone, the dispatcher's lost-lease branch closes it
-          // through the identity-safe quarantine projection without rerunning
-          // the local handler.
-          localFastLease.release();
-          if (ownerStillCurrent && isSessionRuntimeActive(get(), sessionKey)) {
-            scheduleRuntimeTask(() => {
-              if (isSessionRuntimeActive(get(), sessionKey)) {
-                get().dispatchNextWorkspaceInstruction(sessionKey);
-              }
-            });
-          }
-        };
-        void localFastLease.completion.then(
-          (result) => {
-            if (hasVerifiedLocalFastConclusion(get(), exactClaim, result)) {
-              if (!localFastLease.retireWorkspaceClaim()) {
-                releaseUnverifiedLeaseForFailClosedReconcile(
-                  "terminal_verified_but_fifo_retirement_rejected",
-                );
-                return;
-              }
-              localFastLease.release();
-              if (isSessionRuntimeActive(get(), sessionKey)) {
-                scheduleRuntimeTask(() => {
-                  if (isSessionRuntimeActive(get(), sessionKey)) {
-                    get().dispatchNextWorkspaceInstruction(sessionKey);
-                  }
-                });
-              }
-              return;
-            }
-            releaseUnverifiedLeaseForFailClosedReconcile(
-              result.error?.message || "terminal_projection_unverified",
-            );
-          },
-          (error) => {
-            releaseUnverifiedLeaseForFailClosedReconcile(
-              error instanceof Error ? error.message : String(error),
-            );
-          },
-        );
-      }
-      return true;
     }
     const postDispatch = get();
     const postDispatchInspection = inspectWorkspaceInstructionTerminalProjection({
@@ -17976,10 +16776,6 @@ export const useAppStore = create<AppState>()(
       contextMentions: [],
       attachedFiles: [],
       selectedMainModeKey: "main_mode",
-      selectedNexusModeKey: "nexus_general",
-      activeStudioAgentKey: "studio_auto",
-      gameStudioInitialized: false,
-      pendingSlashCommand: null,
       pendingRunDecision: null,
       pendingRunDecisionResolver: null,
       executionConsentPolicy: "ask_per_turn",
@@ -18093,11 +16889,10 @@ export const useAppStore = create<AppState>()(
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
-    commandDirective?: CommandDirective | null;
-    executionConsentGranted?: boolean;
-    skipIntentResolution?: boolean;
-    suppressGameStudioSuggestion?: boolean;
-    turnTitle?: string;
+      commandDirective?: CommandDirective | null;
+      executionConsentGranted?: boolean;
+      skipIntentResolution?: boolean;
+      turnTitle?: string;
     intentSummary?: string;
     uiParentTurnId?: string;
     parentPlanTurnId?: string;
@@ -18157,6 +16952,22 @@ export const useAppStore = create<AppState>()(
       logStoreEvent("workspace_turn_dispatch_claim_rejected", {
         reason: "claim_without_adoption",
         claimId: options.workspaceInstructionClaim.claimId,
+      });
+      return false;
+    }
+    const isTopLevelProjectInitCommand = !!parseProjectInitCommand(text) &&
+      options?.hidden !== true &&
+      options?.reuseCurrentTurn !== true &&
+      !options?.parentRunIdOverride &&
+      !options?.parentPlanTurnId &&
+      !options?.replyOptionSourceTurnId &&
+      !options?.replyOptionRequestIdentity &&
+      options?.continueExistingGoal !== true;
+    if (isTopLevelProjectInitCommand) {
+      logStoreEvent("workspace_local_command_rejected_before_provider", {
+        command: text.trim(),
+        adoptedTurn: options?.adoptExistingTurn === true,
+        reason: "local_review_required",
       });
       return false;
     }
@@ -18601,11 +17412,7 @@ export const useAppStore = create<AppState>()(
       text,
       options,
       state,
-      cache: {
-        workspaceTreeCacheKey,
-        workspaceTreeCacheVersion,
-        workspaceTreeCache,
-      },
+      cache: {},
     });
     const {
       isHidden,
@@ -18618,11 +17425,7 @@ export const useAppStore = create<AppState>()(
       hasSupplementalInput,
       currentMainModeKey,
       preferredLanguage,
-      cachedWorkspaceTreeForGameDetection,
     } = inputEnvelope;
-    if (inputEnvelope.shouldWarmWorkspaceTreeCache) {
-      void getWorkspaceTree(state.currentWorkspace);
-    }
     if (options?.queuedUserMessageId && !isExactQueuedMessageReplay({
       queuedMessageId: state.queuedUserMessage?.id,
       replayMessageId: options.queuedUserMessageId,
@@ -18689,8 +17492,6 @@ export const useAppStore = create<AppState>()(
       validatedVisibleGoalCreationAuthorization,
       validatedQueuedGoalCreationAuthorization,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
-      workspaceTreeForGameDetection: cachedWorkspaceTreeForGameDetection,
-      createGameStudioModeSwitchDecision,
       snapshot: {
         agentStatus: state.agentStatus,
         currentTurnId: state.currentTurnId,
@@ -18731,17 +17532,6 @@ export const useAppStore = create<AppState>()(
       operationProposalChoiceAction,
       preservePlanState,
     } = submitPipelineDecision.turnReuse;
-    const parsedStudioCommand = submitPipelineDecision.parsedStudioCommand;
-    const isLocalFastStudioCommand =
-      parsedStudioCommand != null &&
-      getGameStudioSlashCommandSpec(parsedStudioCommand)?.executionMode === "local_fast";
-    const parsedStudioWorkflowArgs = parsedStudioCommand?.type === "workflow"
-      ? parsedStudioCommand.args
-      : "";
-    const parsedSetupEngineCommand =
-      parsedStudioCommand?.type === "workflow" && parsedStudioCommand.slug === "setup-engine"
-        ? parseSetupEngineArgs(parsedStudioWorkflowArgs)
-        : null;
     const autoHydrationReason = submitPipelineDecision.planHydration.reason;
     const applyCurrentSendGate = (
       gateState: AppState,
@@ -18963,12 +17753,6 @@ export const useAppStore = create<AppState>()(
       text = submitPipelineDecision.shortcuts.textAfterIntentShortcut;
     }
     const lockedComposerIntent = submitPipelineDecision.shortcuts.lockedComposerIntent;
-    if (submitPipelineDecision.gameStudioModeSwitch.pendingRunDecision) {
-      applyPreRunSessionPatch({
-        pendingRunDecision: submitPipelineDecision.gameStudioModeSwitch.pendingRunDecision,
-      });
-      return true;
-    }
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
@@ -18999,9 +17783,6 @@ export const useAppStore = create<AppState>()(
       preferSubagents: state.preferSubagents,
       mainDebugShortcut: !!mainDebugShortcut,
     });
-    const isLocalStudioCommand =
-      parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
-
     const intentRouting = resolveAndApplySubmitIntentRouting({
       text,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
@@ -19009,7 +17790,6 @@ export const useAppStore = create<AppState>()(
       options,
       currentMainModeKey,
       hasWorkspace: !!state.currentWorkspace?.trim(),
-      parsedStudioCommand,
       isHidden,
       autoApproveTools: state.autoApproveTools,
       fallbackRunIntent: resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode),
@@ -19032,8 +17812,6 @@ export const useAppStore = create<AppState>()(
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
       currentTurnId: state.currentTurnId,
-      isLocalFastStudioCommand,
-      unitySetupEngineSelected: parsedSetupEngineCommand?.engine === "unity",
       dismissedPendingDecisionInputKey: state.dismissedPendingDecisionInputKey,
       currentConfig: get().config,
       sendOriginSessionKey,
@@ -19168,7 +17946,6 @@ export const useAppStore = create<AppState>()(
       executionConsentGranted: options?.executionConsentGranted,
       shouldExecuteOnceFromReplyOption,
       preservePlanState,
-      isLocalStudioCommand,
       goalCreationAuthorization,
       goalContinuationAuthorization,
       requiresPlanExecutionAdmission,
@@ -19337,309 +18114,6 @@ export const useAppStore = create<AppState>()(
       shouldSeedSessionTitleForTurn,
       seededSessionTitleCandidate,
     } = titleDecision;
-    const localSlashRuntimeOwnerToken = getSessionRuntimeOwnerToken();
-    const workspaceInstructionClaim = options?.workspaceInstructionClaim || null;
-    const localSlashAbortController = new AbortController();
-    const localSlashBridge = createGameStudioLocalSlashBridge({
-      sessionGet,
-      sessionSet,
-      nextTaskId: nextId,
-      text,
-      turnId,
-      userContextItems,
-      isHidden,
-      reuseCurrentTurn,
-      adoptExistingTurn: options?.adoptExistingTurn,
-      admittedUserBlockId: options?.admittedUserBlockId,
-      parentPlanTurnId,
-      preferredLanguage,
-      effectiveRunIntent,
-      effectiveDisplayIntent,
-      effectiveIntentSummary,
-      effectiveCommandDirective,
-      effectiveWorkflowMode,
-      turnTitle,
-      shouldSeedSessionTitleForTurn,
-      ensuredSessionId,
-      sessionScopeKey,
-      runSessionKey,
-      titleIntentSignature,
-      sanitizeTaskBlocksForPersist,
-      buildSessionRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
-      commitLocalSlashProjection: (context) => {
-        if (!isHidden && ensuredSessionId != null) {
-          sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
-            storageStatus: "temporary",
-          });
-        }
-        return commitGameStudioLocalSlashProjection({
-          context,
-          claim: workspaceInstructionClaim,
-          sessionGet,
-          getSessionRevisionToken,
-          hasSessionRuntimeOwnership: () =>
-            hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken),
-          scopeKey: sessionScopeKey,
-          sessionId: ensuredSessionId,
-          decorateProjection: (projectedState, commitContext) => {
-            if (isHidden || ensuredSessionId == null) return projectedState;
-            const sessions = projectedState.sessionsByWorkspace[sessionScopeKey] || [];
-            const maySeedTitle = commitContext.includeTitle &&
-              shouldSeedSessionTitleForTurn &&
-              projectedState.currentTurnId === turnId;
-            return {
-              ...projectedState,
-              sessionsByWorkspace: {
-                ...projectedState.sessionsByWorkspace,
-                [sessionScopeKey]: sessions.map((candidate) =>
-                  candidate.id === ensuredSessionId
-                    ? {
-                        ...candidate,
-                        ...(maySeedTitle
-                          ? {
-                              title: turnTitle,
-                              titleSource: "local_seed" as const,
-                              titleIntentSignature,
-                            }
-                          : {}),
-                        // `ok` is owned by the Rust save response. Until that
-                        // boundary this projection is explicitly temporary.
-                        storageStatus: "temporary" as const,
-                        recordingDisabled:
-                          !projectedState.config.sessionRecordingEnabled ||
-                          candidate.recordingDisabled === true,
-                      }
-                    : candidate
-                ),
-              },
-            };
-          },
-          persistProjection: async (projectedState, expectedRevisionToken) =>
-            persistSubmitRuntimeProjection({
-              state: projectedState,
-              scopeKey: sessionScopeKey,
-              sessionId: ensuredSessionId,
-              sanitizeTaskBlocksForPersist,
-              buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
-              persistSessionRecord: async (scopeKey, sessionRecord) => {
-                try {
-                  return await saveProjectSession(scopeKey, sessionRecord, {
-                    isCurrent: () =>
-                      hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken) &&
-                      getSessionRevisionToken() === expectedRevisionToken,
-                  });
-                } catch (error) {
-                  // An external writer may have advanced SQLite's CAS
-                  // revision. Refresh both the IPC cache and the in-memory
-                  // Session metadata before the durability loop retries.
-                  if (ensuredSessionId != null) {
-                    try {
-                      const meta = await loadProjectSessionMeta(scopeKey, ensuredSessionId);
-                      if (typeof meta?.storageRevision === "number") {
-                        sessionGet().updateSession(scopeKey, ensuredSessionId, {
-                          storageRevision: meta.storageRevision,
-                        });
-                      }
-                    } catch {
-                      // Preserve the original persistence error and retry with
-                      // exponential backoff; metadata refresh is best effort.
-                    }
-                  }
-                  throw error;
-                }
-              },
-              nowMs,
-            }),
-          buildMemoryFallbackProjection: (projectedState) =>
-            buildTemporarySubmitRuntimeProjection({
-              state: projectedState,
-              scopeKey: sessionScopeKey,
-              sessionId: ensuredSessionId,
-              sanitizeTaskBlocksForPersist,
-              buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
-              nowMs,
-            }),
-          rememberDurableState: (durableState) => {
-            if (ensuredSessionId == null) return;
-            const durableRecord = (
-              durableState.sessionsByWorkspace[sessionScopeKey] || []
-            ).find((candidate) => candidate.id === ensuredSessionId);
-            const requiresSessionDurability =
-              durableState.config.sessionRecordingEnabled &&
-              durableRecord?.recordingDisabled !== true;
-            if (
-              requiresSessionDurability &&
-              (!durableRecord || !(Number(durableRecord.storageRevision) > 0))
-            ) {
-              throw new Error("LOCAL_SLASH_DURABLE_STORAGE_REVISION_MISSING");
-            }
-            if (!durableRecord) return;
-            const latestRecord = (
-              sessionGet().sessionsByWorkspace[sessionScopeKey] || []
-            ).find((candidate) => candidate.id === ensuredSessionId);
-            sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
-              ...(typeof durableRecord.storageRevision === "number"
-                ? {
-                    storageRevision: Math.max(
-                      Number(latestRecord?.storageRevision) || 0,
-                      durableRecord.storageRevision,
-                    ),
-                  }
-                : {}),
-              storageStatus: requiresSessionDurability ? "ok" : "temporary",
-              recordingDisabled: !requiresSessionDurability,
-            });
-          },
-          publishProjection: publishOwnerScopedRuntimeProjection,
-          abortSignal: localSlashAbortController.signal,
-          log: logStoreEvent,
-        });
-      },
-    });
-
-    const localSlashSubmission = startGameStudioLocalSlashSubmission({
-      command: parsedStudioCommand,
-      preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
-      runSessionKey,
-      turnId,
-      runtimeService: gameStudioRuntimeService,
-      getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
-      commitActiveStudioAgentKey: (agent, commitOptions) => {
-        // JavaScript cannot interleave an AbortSignal event between this check
-        // and the synchronous state mutation at the start of the Store setter.
-        // That call is therefore the local side-effect commit point.
-        if (localSlashAbortController.signal.aborted) {
-          const error = new Error("Local slash command canceled before side-effect commit");
-          error.name = "AbortError";
-          throw error;
-        }
-        return sessionGet().setActiveStudioAgentKey(agent, commitOptions);
-      },
-      appendLocalStudioTurn: localSlashBridge.appendLocalStudioTurn,
-      ensureVisibleConclusion: localSlashBridge.ensureVisibleConclusion,
-      emitRuntimeEvent: localSlashBridge.emitLocalSlashRuntimeEvent,
-      logStoreEvent,
-      runId: options?.runIdOverride,
-      parentRunId: options?.parentRunIdOverride ?? null,
-      abortSignal: localSlashAbortController.signal,
-    });
-    if (localSlashSubmission.handled) {
-      if (!localSlashSubmission.runId || !localSlashSubmission.completion) {
-        throw new Error("Handled local slash submission did not expose an execution lease");
-      }
-      // Local-fast commands may await workspace metadata before appending their
-      // conclusion. Mark the exact admitted Turn as the live owner immediately
-      // so the FIFO dispatcher cannot mistake the accepted command for a
-      // synchronous ActionDecision and close it ahead of its real result.
-      sessionSet((current) => ({
-        currentTurnId: turnId,
-        conversationTurns: current.conversationTurns.map((turn: ConversationTurn) =>
-          turn.id === turnId && !isConversationTurnRuntimeClosed(turn.runtimeOutcome)
-            ? { ...turn, status: "executing" as const }
-            : turn
-        ),
-        isGenerating: true,
-        agentStatus: "running",
-        abortController: localSlashAbortController,
-      }));
-      const claim = workspaceInstructionClaim;
-      const ownerKey = localFastExecutionOwnerKey(runSessionKey, turnId);
-      let lease!: LocalFastExecutionLease;
-      const retireWorkspaceClaim = () => {
-        if (!claim) return true;
-        let retired = false;
-        sessionSet((current) => {
-          const queue = current.workspaceTurnQueue;
-          const activeHead = queue?.entries[0];
-          if (
-            !queue ||
-            queue.sessionKey !== claim.sessionKey ||
-            queue.sessionEpoch !== claim.sessionEpoch ||
-            activeHead?.status !== "dispatching" ||
-            activeHead.claim?.claimId !== claim.claimId ||
-            activeHead.receipt.receiptId !== claim.receiptId ||
-            activeHead.receipt.clientSubmissionId !== claim.clientSubmissionId ||
-            activeHead.receipt.turnId !== claim.turnId ||
-            workspaceInstructionEnvelopeIdentity(activeHead) !==
-              claim.instructionEnvelopeIdentity
-          ) return {};
-          const transition = reduceWorkspaceTurnQueue(queue, {
-            type: "remove",
-            expectedVersion: queue.version,
-            at: Date.now(),
-            claimId: claim.claimId,
-            sessionKey: claim.sessionKey,
-            sessionEpoch: claim.sessionEpoch,
-            terminalOwner: {
-              sessionKey: claim.sessionKey,
-              sessionEpoch: claim.sessionEpoch,
-              turnId: claim.turnId,
-              receiptId: claim.receiptId,
-              clientSubmissionId: claim.clientSubmissionId,
-              instructionEnvelopeIdentity: claim.instructionEnvelopeIdentity,
-            },
-          });
-          if (transition.disposition !== "applied") return {};
-          retired = true;
-          return { workspaceTurnQueue: transition.state };
-        });
-        return retired;
-      };
-      const releaseLease = () => {
-        if (lease.settled) return;
-        lease.settled = true;
-        if (localFastExecutionLeasesByOwner.get(ownerKey) === lease) {
-          localFastExecutionLeasesByOwner.delete(ownerKey);
-        }
-        if (claim && localFastExecutionLeasesByClaim.get(claim.claimId) === lease) {
-          localFastExecutionLeasesByClaim.delete(claim.claimId);
-        }
-        sessionSet((current) => {
-          const exactTurnIdentity = !claim || current.conversationTurns.some(
-            (candidate: ConversationTurn) =>
-              candidate.id === turnId &&
-              candidate.clientSubmissionId === claim.clientSubmissionId &&
-              candidate.workspaceInstructionReceiptId === claim.receiptId,
-          );
-          return exactTurnIdentity &&
-              current.currentTurnId === turnId &&
-              current.abortController === localSlashAbortController
-            ? {
-                abortController: null,
-                isGenerating: false,
-                agentStatus: "idle",
-              }
-            : {};
-        });
-      };
-      lease = {
-        sessionKey: runSessionKey,
-        turnId,
-        runId: localSlashSubmission.runId,
-        clientSubmissionId: claim?.clientSubmissionId || null,
-        receiptId: claim?.receiptId || null,
-        controller: localSlashAbortController,
-        claim,
-        completion: localSlashSubmission.completion,
-        hasRuntimeOwnership: () =>
-          hasSessionRuntimeOwnership(localSlashRuntimeOwnerToken),
-        retireWorkspaceClaim,
-        release: releaseLease,
-        settled: false,
-        dispatcherObserved: false,
-      };
-      localFastExecutionLeasesByOwner.set(ownerKey, lease);
-      if (claim) localFastExecutionLeasesByClaim.set(claim.claimId, lease);
-      // Workspace claims are released only by the dispatcher's owner-scoped
-      // verifier. Registering an eager cleanup here races that verifier because
-      // Promise callbacks run in registration order. Direct (non-workspace)
-      // local-fast submissions have no FIFO owner and may clean themselves up.
-      if (!claim) {
-        void localSlashSubmission.completion.then(releaseLease, releaseLease);
-      }
-      return true;
-    }
-
     const visibleTurnSubmission = applySubmitVisibleTurn({
       sessionGet,
       sessionSet,
@@ -19674,7 +18148,6 @@ export const useAppStore = create<AppState>()(
       initialTurnStatus,
       operationProposalChoiceAction,
       turnTitle,
-      parsedStudioCommand,
       preferredLanguage,
       preservePlanState,
       shouldGrantExecutionConsentForTurn,
@@ -19779,9 +18252,6 @@ export const useAppStore = create<AppState>()(
       runSessionId,
       runScopeKey,
       currentMainModeKey,
-      parsedSetupEngineCommand,
-      parsedStudioCommand,
-      cachedWorkspaceTreeForGameDetection,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
       runtimeRunIntent,
@@ -19875,23 +18345,42 @@ export const useAppStore = create<AppState>()(
       readFile,
       readDocument,
       analyzeTabularDocument,
-      runtimeService: gameStudioRuntimeService,
-      logWarning: (event, data) => appendDebugLog("warn", event, data),
-      invalidateWorkspaceTreeCache,
       createAbortController: () => new AbortController(),
       getCurrentHarnessInstanceId,
       readHarnessRunMarker,
       acquireHarnessRunMarker,
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
-      refreshWorkspaceContext: (workspace) =>
-        get().refreshInstructionAndHookState([
+      refreshWorkspaceAdmission: async (workspace, userPrompt) => {
+        const associatedPaths = [
           ...turnInputContextSignals.mentionedFilePaths,
           ...turnInputContextSignals.attachedFilePaths,
-        ], {
+        ];
+        if (!String(workspace || "").trim()) {
+          return {
+            instructions: await get().refreshInstructionAndHookState(
+              associatedPaths,
+              { workspace, projectToUi: false, userPrompt },
+            ),
+            baseline: null,
+            warnings: [],
+          };
+        }
+        const snapshot = await resolveWorkspaceAdmissionSnapshot({
           workspace,
-          projectToUi: false,
-        }),
+          skills: get().skills,
+          associatedPaths,
+          userPrompt,
+          io: workspaceAdmissionIpcIo,
+        });
+        return {
+          instructions: snapshot.instructions,
+          baseline: snapshot.baseline,
+          warnings: snapshot.warnings.map((warning) =>
+            `${warning.code}: ${warning.message}`
+          ),
+        };
+      },
       nowMs,
       sendStartedAt,
       getLastTurnToolSummary,
@@ -20059,6 +18548,10 @@ export const useAppStore = create<AppState>()(
     merge: (persisted, current) => {
       const persistedState = (persisted as Partial<AppState> & {
         selectedAgentKey?: string;
+        selectedNexusModeKey?: string;
+        activeStudioAgentKey?: unknown;
+        gameStudioInitialized?: unknown;
+        pendingSlashCommand?: unknown;
         rightPanelTab?: unknown;
         showTaskCenterPanel?: unknown;
         taskCenter?: unknown;
@@ -20068,6 +18561,11 @@ export const useAppStore = create<AppState>()(
         showTaskCenterPanel: _legacyShowTaskCenterPanel,
         taskCenter: _legacyTaskCenter,
         taskCenterActiveTaskId: _legacyTaskCenterActiveTaskId,
+        selectedNexusModeKey: legacySelectedNexusModeKey,
+        selectedAgentKey: legacySelectedAgentKey,
+        activeStudioAgentKey: _legacyActiveStudioAgentKey,
+        gameStudioInitialized: _legacyGameStudioInitialized,
+        pendingSlashCommand: _legacyPendingSlashCommand,
         ...persistedStateWithoutTaskCenter
       } = persistedState;
       const persistedConfig = stripLegacyConfigFields(persistedState.config) ?? {};
@@ -20099,7 +18597,7 @@ export const useAppStore = create<AppState>()(
             goalProgress: hydratedCurrentSession?.runtimeSnapshot?.goalProgress || persistedState.goalProgress,
           }, {
             restoreInterruptedGoal: true,
-            quarantineInterruptedLocalFast: true,
+            coldRestore: true,
             workspacePath: hydratedCurrentScopeKey,
             expectedSessionKey: resolveSessionRuntimeKey(
               hydratedCurrentScopeKey,
@@ -20111,8 +18609,8 @@ export const useAppStore = create<AppState>()(
       const hydratedGoalRuntime = normalizedHydratedRuntime?.goalRuntime || null;
       const selectedMainModeKey = mapLegacyNexusModeToMainMode(
         persistedState.selectedMainModeKey ||
-          persistedState.selectedNexusModeKey ||
-          persistedState.selectedAgentKey,
+          legacySelectedNexusModeKey ||
+          legacySelectedAgentKey,
       );
       const rightPanelTab = hasHydratedCurrentSession
         ? normalizeStoredRightPanelTab(persistedState.rightPanelTab)
@@ -20184,11 +18682,7 @@ export const useAppStore = create<AppState>()(
         conversationTurns: normalizedHydratedRuntime?.conversationTurns || [],
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
         selectedMainModeKey,
-        selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
         imageStudio: normalizeImageStudioRuntime(persistedState.imageStudio),
-        activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
-        gameStudioInitialized: persistedState.gameStudioInitialized === true,
-        pendingSlashCommand: normalizedHydratedRuntime?.pendingSlashCommand || null,
         workspaceTurnQueue: normalizedHydratedRuntime?.workspaceTurnQueue || null,
         workspaceInstructionLedger: normalizedHydratedRuntime?.workspaceInstructionLedger || [],
         transcriptPartial: normalizedHydratedRuntime?.transcriptPartial === true,
@@ -20507,7 +19001,6 @@ export {
   normalizePlanExecutionProgressSnapshot,
   resolveStreamingAssistantDisplay,
 };
-export type { StudioConfig as GameStudioConfig };
 export type { CommandDirective };
 export type { ResolvedRunIntent };
 export type { TurnRuntimePhase };

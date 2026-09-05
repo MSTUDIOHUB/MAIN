@@ -1013,7 +1013,7 @@ test("cloud responses compact messages keep small read_file tool content", () =>
 test("responses compact transcript fallback keeps pinned ContextState memory", () => {
   const messages = [
     { role: "system", content: "system" },
-    { role: "user", content: "[System: ContextState\nContextMemoryState v1 id=test updatedAt=1\nLatest user request: continue Game Studio task\n]" },
+    { role: "user", content: "[System: ContextState\nContextMemoryState v1 id=test updatedAt=1\nLatest user request: continue the MAIN task\n]" },
     ...Array.from({ length: 14 }, (_, index) => ({
       role: index % 2 === 0 ? "user" : "assistant",
       content: `history ${index} ${"x".repeat(700)}`,
@@ -1030,7 +1030,7 @@ test("responses compact transcript fallback keeps pinned ContextState memory", (
 
   assert.equal(typeof transcript?.body.input, "string");
   assert.match(String(transcript?.body.input || ""), /ContextMemoryState v1/);
-  assert.match(String(transcript?.body.input || ""), /continue Game Studio task/);
+  assert.match(String(transcript?.body.input || ""), /continue the MAIN task/);
 });
 
 test("responses aggressive compact mode builds a small no-tool gateway fallback", () => {

@@ -30,8 +30,6 @@ test.beforeEach(async ({ page }) => {
         conversationTurns: [],
         currentTurnId: null,
         selectedMainModeKey: "main_mode",
-        selectedNexusModeKey: "nexus_general",
-        activeStudioAgentKey: "studio_auto",
       },
       version: 0,
     }));

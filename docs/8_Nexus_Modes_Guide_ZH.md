@@ -1,126 +1,54 @@
-# MAIN 场景体系说明
+# MAIN 场景兼容与迁移说明
 
-## 为什么从 Persona 升级为 MAIN 场景
+## 当前场景模型
 
-旧的 `Persona / 角色` 心智更像“职业身份切换”，容易让用户误以为必须先决定自己要找的是架构师、设计师或调试专家。
+MAIN 已将旧的 Persona、Nexus 场景和 Game Studio 模式收敛为两个用户可选入口：
 
-对 MAIN 来说，这并不适合真实使用场景：
+- `main_mode`：问答、研究、代码、文档、游戏开发和 MCP 工具调用的统一入口。
+- `image_studio`：图片生成的独立入口。
 
-- 用户可能只是打开了一个空文件夹，想先聊思路。
-- 用户可能只是来问问题、做头脑风暴、写文档或整理方向。
-- 用户也可能准备直接实现代码，或者做系统化研究分析。
+游戏开发不再需要专用场景。Unity、Godot、Unreal 或其他引擎任务直接进入 MAIN 的同一套
+Turn、Plan、Execute、权限和验证流程；引擎能力由当前已连接的 MCP Server 提供。
 
-因此，MAIN 现在把原有的角色入口升级为 `MAIN 场景`。它代表的是“我现在想达成什么目标”，而不是“我现在要扮演哪种职业”。
+## 为什么归并旧 Nexus 场景
 
-## 5 个 MAIN 场景
+旧的 `nexus_general`、`nexus_create`、`nexus_build`、`nexus_research` 和 Persona key
+主要表达工作风格，而不是不同的执行能力。继续把它们作为顶层模式会让用户在描述目标前
+先猜测分类，也会让相同任务走出多套 admission 与运行路径。
 
-### 1. 通用协作 `nexus_general`
+现行 MAIN 改为在每个 Turn 内根据目标选择 respond、analyze、plan、execute、report 或
+goal 等策略。模型能力会影响结果质量，但所有模型面对相同的工具权限、执行循环和完成
+契约。
 
-适合最宽泛的场景：
+## 旧值读取迁移
 
-- 空目录起步
-- 提问答疑
-- 轻量 brainstorm
-- 文档整理
-- 方向探索
+读取旧设置或 Session snapshot 时使用以下规则：
 
-这是默认入口。新会话不再默认把用户推进“架构师”视角。
+| 旧值 | 当前值 |
+| --- | --- |
+| `game_studio`、`nexus_game_studio` | `main_mode` |
+| `nexus_general`、`nexus_create`、`nexus_build`、`nexus_research` | `main_mode` |
+| `role_architect`、`role_debugger`、`role_uidesigner`、`role_dataanalyst` | `main_mode` |
+| 其他未知旧值 | `main_mode` |
+| `image_studio` | `image_studio` |
 
-### 2. 创意共创 `nexus_create`
+这些 key 只在读取边界用于兼容。新状态不再写入 Nexus 或 Game Studio 模式值，也不再
+生成 `selectedNexusModeKey` 兼容投影。
 
-适合：
+## 场景与工作方式
 
-- 概念发想
-- 内容构思
-- 交互方向
-- 产品叙事
-- 视觉和体验方向探索
+- `MAIN 场景` 决定使用通用 agent 工作流还是图片生成入口。
+- Chat、Plan、Fast 等工作方式决定一个 MAIN Turn 的执行节奏。
+- Skill、MCP 和内置工具是能力来源，不是额外顶层场景。
 
-重点是把灵感收束成可继续推进的结构化产物。
+例如：
 
-### 3. 工程实现 `nexus_build`
+- 游戏功能实现：`MAIN + Execute`，按需调用引擎 MCP。
+- 大型重构：`MAIN + Plan`，审阅方案后继续实施。
+- 资料比较：`MAIN + Analyze`。
+- 图片生成：切换到 `image_studio`。
 
-适合：
+## 工作区遗留资产
 
-- 功能开发
-- 调试修复
-- 重构
-- 代码落地
-- 架构分析
-
-它吸收了原先“架构师 + 调试专家”的高价值行为，但不再用职业角色名来限制用户心智。
-
-### 4. 研究分析 `nexus_research`
-
-适合：
-
-- 文档研读
-- 表格分析
-- 数据总结
-- 对比研究
-- 风险与结论提炼
-
-它继承了原数据分析 Persona 的优势，并保留数据/文档只读分析优先、失败自动降级等行为规则。
-
-### 5. 游戏工作室 `nexus_game_studio`
-
-适合：
-
-- 游戏概念启动
-- GDD / UX / 系统设计
-- 引擎配置
-- 跨职能游戏团队协作
-- 使用 Studio slash 命令与 49 个专业 Agent
-
-这是 MAIN 对 [Claude-Code-Game-Studios](https://github.com/Donchitos/Claude-Code-Game-Studios) 的深度整合入口，但交互被压平成更易理解的单一 Studio 中枢。
-
-## MAIN 场景 与 工作方式 的区别
-
-MAIN 现在明确区分两层概念：
-
-- `MAIN 场景`：你想做什么
-- `工作方式 / Run Mode`：AI 怎么执行
-
-工作方式仍保留原有三种执行行为：
-
-- `Chat`
-- `Plan`
-- `Fast`
-
-但这三项不再与 `MAIN 场景` 争夺“模式”心智。
-
-工作方式只改变执行策略。在工作区会话中，无论选择 `Chat`、`Plan` 还是 `Fast`，每次用户发送都先接纳为一个 Turn，并最终形成一个结构化结论；Chat 不绕过回合。
-
-一个典型组合例子：
-
-- `研究分析 + Chat`：读资料、看表格、输出结论
-- `工程实现 + Fast`：直接修改和实现
-- `创意共创 + Plan`：先出方案再审阅
-- `游戏工作室 + Chat / Fast / Plan`：根据当前 Studio 任务选择执行节奏
-
-## 空目录/新工作区的默认体验
-
-在空目录或近空目录里：
-
-- 默认建议从 `通用协作` 开始
-- 如果目标是做游戏项目，切到 `游戏工作室`
-- `游戏工作室` 会显示 `MAIN GAME STUDIO` onboarding 卡片，帮助用户初始化 Studio 包，或把 `/start`、`/brainstorm`、`/setup-engine` 先写成草稿再继续补充上下文
-
-这比旧 Persona 更符合“先开始做事，再逐步收敛”的真实心智。
-
-## 兼容与迁移
-
-旧值会自动迁移：
-
-- `role_architect`、`role_debugger` -> `nexus_build`
-- `role_uidesigner` -> `nexus_create`
-- `role_dataanalyst` -> `nexus_research`
-- 未知值 -> `nexus_general`
-
-这保证了旧状态不会导致会话崩溃，同时把默认入口平滑迁移到新的 MAIN 场景体系。
-
-## 命名与兼容
-
-- 用户可见文案统一使用 `MAIN 场景`
-- `游戏工作室` 的 onboarding 面板固定显示为 `MAIN GAME STUDIO`
-- 内部兼容 key 仍保留 `NexusModeKey`、`selectedNexusModeKey` 与 `nexus_*`，避免破坏旧状态与迁移逻辑
+旧版本可能曾向项目写入已停用模式的隐藏资产。升级不会静默删除用户工作区文件；如需
+清理，应先备份项目并核对精确路径和 hooks 条目。遗留文件本身不会重新启用已删除模式。

@@ -1,13 +1,20 @@
+import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import type {
   AgentMessage,
   ContentPart,
 } from "../../lib/agentMessages";
 import { serializeDurableTurnContextForModel } from "../../lib/durableTurnContext";
+import {
+  renderExplicitSkillActivationContext,
+  renderSkillCatalogContext,
+  skillCatalogContextCharBudget,
+} from "../../lib/agentSkills";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   buildSubagentDelegationGuidance,
 } from "../../lib/turnIntake";
+import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import type {
   RuntimeV2NormalizedProviderResult,
   RuntimeV2NormalizedToolCall,
@@ -290,24 +297,53 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const workspaceInstructions = String(
     input.context.workspaceInstructionContext || "",
   ).trim();
+  const projectBaseline = renderProjectBaselineContext(
+    input.context.projectBaselineContext,
+  );
+  const skillCatalog = renderSkillCatalogContext(
+    input.context.skillCatalog,
+    skillCatalogContextCharBudget(
+      input.context.runtimeContextBudget?.contextLimit,
+    ),
+  );
+  const explicitSkills = renderExplicitSkillActivationContext(
+    input.context.skillCatalog,
+  );
   const collaborationGuidance = buildSubagentDelegationGuidance({
     preference:
       input.context.turnInputContextSignals?.subagentPreference ||
         "unspecified",
     language: input.context.phaseLanguage,
   });
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const dayNamesEn = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayNamesZh = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+  const dayOfWeek = input.context.phaseLanguage === "en" ? dayNamesEn[now.getDay()] : dayNamesZh[now.getDay()];
+  const currentDate = `${dateStr} (${dayOfWeek})`;
+
+  const chat = readOnlyTurn && !input.context.runWorkspace && !input.context.turnInputContextSignals?.attachedFilePaths?.length;
+  if (chat) return [
+    "[MAIN RUNTIME V2]", `Current Date: ${currentDate}`, `Respond in: ${language}`,
+    "This is Chat. Answer from the supplied conversation and admitted context. Never claim a tool was used unless its receipt is present. No workspace, shell, browser control, validation, MCP or child-agent capabilities are available.",
+    readOnlyNetworkPolicy(input).enabled ? `Optional web_search and web_fetch are enabled. Search provider: ${readOnlyNetworkPolicy(input).provider}. Use current dates for time-sensitive questions.` : "Network access is disabled for this Turn.",
+    "Return a complete user-facing Markdown reply. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
+  ].join("\n");
   return [
     "[MAIN RUNTIME V2]",
+    `Current Date: ${currentDate}`,
     `Workspace: ${workspace}`,
     `Respond in: ${language}`,
     "Use structured tools for every read, modification, command, and verification. With a native tool call, you may include one brief public progress sentence in normal response content; MAIN routes it only to Capsule and never uses it as control state. Do not expose private reasoning or repeat that sentence in the final answer.",
     readOnlyTurn
-      ? "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect."
+      ? (readOnlyNetworkPolicy(input).enabled
+        ? `This is a bounded task with read-only authority and enabled web search. Inspect relevant admitted context or use exposed web tools (web_search, web_fetch) for external/real-time information. When querying time-sensitive or real-time information (e.g. weather, news, schedules, dates), use the Current Date (${currentDate}) as the reference point and anchor search queries to the current time context. Never request or claim a file mutation, shell command, browser action, or validation effect.`
+        : "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect.")
       : "Before a final answer, use evidence from actual tool results. For a repair, make the smallest justified change and run an appropriate finite validation after a modification.",
     readOnlyTurn
       ? "Return one complete evidence-backed Markdown answer and state any remaining uncertainty."
       : "A final answer must state confirmed cause, files changed, validation performed, and any remaining limit. Never claim success merely because a tool call was issued.",
-    collaborationGuidance
+    !readOnlyTurn && collaborationGuidance
       ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
       : "",
     workspaceInstructions
@@ -317,6 +353,9 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
           workspaceInstructions,
         ].join("\n")
       : "",
+    projectBaseline,
+    skillCatalog,
+    explicitSkills,
   ].join("\n");
 }
 
@@ -418,6 +457,14 @@ function baseProviderHistory(
         : []),
     ];
     history.push(...pair);
+  }
+  if (isReadOnlyContext(input) && Array.isArray(state.agentMessages)) {
+    const priorMessages = state.agentMessages as AgentMessage[];
+    const reverseIndex = [...priorMessages].reverse().findIndex((message) => message.role === "user");
+    const currentIndex = reverseIndex < 0 ? priorMessages.length : priorMessages.length - 1 - reverseIndex;
+    const suppliedHistory = priorMessages.slice(0, Math.max(0, currentIndex)).filter((message) =>
+      (message.role === "user" || message.role === "assistant") && !message.tool_calls?.length);
+    if (suppliedHistory.length) history.splice(0, history.length, ...suppliedHistory.map((message) => ({ ...message, content: conversationContent(message.content) })));
   }
   live.messages.push(
     { role: "system", content: systemInstruction(input) },

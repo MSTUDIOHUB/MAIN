@@ -284,5 +284,208 @@ test("workspace read runner source does not import or delegate to Chat", () => {
     "utf8",
   );
   assert.doesNotMatch(source, /chatRunner|runSubmitRuntimeV2Chat|strategy:\s*"chat"/);
-  assert.match(source, /strategy:\s*"analyze"/);
+  assert.match(source, /runSubmitRuntimeV2ReadOnly\(input, "analyze"\)/);
+});
+
+test("runtime engine selection keeps global Chat independent of webSearchEnabled", () => {
+  const engineSelection = loadTs(
+    path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"),
+  );
+  // Without webSearchEnabled or workspace -> chat
+  assert.equal(
+    engineSelection.resolveRuntimeV2VisibleRunnerKind({
+      effectiveIntent: "respond",
+      runtimeIntent: "respond",
+      runWorkspace: "",
+      hasAttachedFiles: false,
+      webSearchEnabled: false,
+    }),
+    "chat",
+  );
+  // Network is a capability, not a routing authority.
+  assert.equal(
+    engineSelection.resolveRuntimeV2VisibleRunnerKind({
+      effectiveIntent: "respond",
+      runtimeIntent: "respond",
+      runWorkspace: "",
+      hasAttachedFiles: false,
+      webSearchEnabled: true,
+    }),
+    "chat",
+  );
+  assert.equal(
+    engineSelection.isRuntimeV2GlobalChatTurn("respond", "", {
+      webSearchEnabled: true,
+    }),
+    true,
+  );
+  assert.equal(
+    engineSelection.isRuntimeV2WorkspaceReadTurn("respond", "", {
+      webSearchEnabled: true,
+    }),
+    false,
+  );
+});
+
+test("production global Chat uses shared tools with admission-time network permission", async () => {
+  let revision = 0;
+  let providerCalls = 0;
+  const toolNames = [];
+  const checkpointPort = {
+    getRuntimeV2Checkpoint() {
+      return null;
+    },
+    createRuntimeV2CheckpointPort() {
+      return {
+        async load() {
+          return null;
+        },
+        async append() {
+          revision += 1;
+          return {
+            disposition: "committed",
+            checkpoint: { revision },
+          };
+        },
+      };
+    },
+  };
+  const executionPorts = {
+    createRuntimeV2LiveExecutionState() {
+      return {
+        messages: [],
+        childRuns: new Map(),
+        childAbortControllers: new Map(),
+        childTelemetry: new Map(),
+        subagentCandidates: [],
+        evidenceCounter: 0,
+        latestProviderResult: null,
+        latestVisibleText: "",
+        providerLaneProfile: null,
+        authorization: null,
+      };
+    },
+    createRuntimeV2ProviderPort() {
+      return {
+        async request({ command }) {
+          providerCalls += 1;
+          return providerCalls === 1
+            ? {
+                visibleText: "",
+                commentary: "正在查询沈阳天气。",
+                toolCalls: [{
+                  id: "search-weather",
+                  name: "web_search",
+                  arguments: { query: "沈阳天气" },
+                }],
+                diagnostics: [],
+              }
+            : {
+                visibleText: "### 沈阳天气\n\n沈阳今天晴，气温 18°C ~ 28°C。",
+                toolCalls: [],
+                diagnostics: [],
+              };
+        },
+      };
+    },
+    createRuntimeV2ToolPort() {
+      return {
+        async execute({ command }) {
+          if (command.kind === "collect_observation") {
+            return {
+              type: "observation.recorded",
+              run: command.run,
+              evidence: {
+                id: "workspace-overview",
+                kind: "source",
+                target: "global",
+                version: "overview-v1",
+              },
+            };
+          }
+          toolNames.push(command.payload.toolName);
+          return {
+            type: "tool.completed",
+            run: command.run,
+            idempotencyKey: command.idempotencyKey,
+            status: "succeeded",
+            evidence: [{
+              id: "web-search-result",
+              kind: "tool",
+              target: "沈阳天气",
+              version: "v1",
+            }],
+          };
+        },
+      };
+    },
+    createRuntimeV2SchedulerPort() {
+      return {
+        async execute() {
+          throw new Error("scheduler should not run in this fixture");
+        },
+      };
+    },
+  };
+  const projectionPort = {
+    createRuntimeV2ProjectionPort() {
+      return {
+        async publish() {},
+      };
+    },
+  };
+  const runner = loadTsWithMocks(
+    path.join(workspaceRoot, "src/store/runtimeV2/chatRunner.ts"),
+    new Map([
+      ["../../lib/runtime-v2", runtime],
+      ["./checkpointPort", checkpointPort],
+      ["./executionPorts", executionPorts],
+      ["./projectionPort", projectionPort],
+    ]),
+  );
+  const timerInterval = setInterval(() => undefined, 60_000);
+  const state = {
+    webSearchEnabled: true,
+    conversationTurns: [{
+      id: "turn-web-read",
+      clientSubmissionId: "submission-web-read",
+      userPrompt: "沈阳天气怎么样？",
+      networkRead: { enabled: true, provider: "bing" },
+    }],
+    _nextTaskId: () => 10,
+  };
+  const settlement = await runner.runSubmitRuntimeV2Chat({
+    get: () => state,
+    set: () => undefined,
+    context: {
+      turnId: "turn-web-read",
+      uiDisplayTurnId: "turn-web-read",
+      runWorkspace: "",
+      runSessionKey: "session-global-web",
+      runSessionId: 1,
+      runScopeKey: "__MAIN_GLOBAL_CHAT__",
+      phaseLanguage: "zh",
+      effectiveRunIntent: "respond",
+      runtimeRunIntent: "respond",
+      abortCtrl: new AbortController(),
+      timerInterval,
+      harnessRunId: "run-web-read",
+      turnInputContextSignals: {
+        attachedFilePaths: [],
+        subagentPreference: "forbidden",
+      },
+    },
+    getSessionRevisionToken: () => 1,
+    sanitizeTaskBlocksForPersist: (blocks) => blocks,
+    buildSessionRuntimeSnapshot: (state) => state,
+    publishOwnerScopedRuntimeProjection: () => ({
+      published: true,
+      disposition: "published",
+    }),
+    persistSessionRecord: async () => undefined,
+    logStoreEvent: () => undefined,
+  });
+
+  assert.equal(settlement.outcome.resultKind, "success");
+  assert.deepEqual(toolNames, ["web_search"]);
 });

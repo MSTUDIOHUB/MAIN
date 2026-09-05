@@ -232,6 +232,13 @@ export function createRuntimeV2CheckpointPort(
           ...(event.type === "recovery.exhausted"
             ? { recoveryScope: event.scope }
             : {}),
+          ...(event.type === "subagent.completed"
+            ? {
+                subagentStatus: event.status,
+                evidenceCount: event.evidence.length,
+                reportSubmitted: !!event.report,
+              }
+            : {}),
           rebasedConcurrentRuntime:
             storeRevisionBeforePersist !== expectedStoreRevision,
         });

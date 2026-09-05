@@ -23,6 +23,21 @@ async function loadInstructionsModule(ipcStubs) {
     if (specifier === "./ipc") {
       return ipcStubs;
     }
+    if (specifier === "./agentSkills") {
+      return {
+        loadSkillCatalog: ipcStubs.loadSkillCatalog || (async () => ({
+          entries: [],
+          explicitSkillIds: [],
+          warnings: [],
+          loadedAt: 1,
+        })),
+      };
+    }
+    if (specifier === "./sha256") {
+      return {
+        sha256Hex: (value) => `test-${Buffer.from(String(value)).toString("hex")}`,
+      };
+    }
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   const factory = new Function("exports", "module", "require", transpiled);
@@ -30,10 +45,11 @@ async function loadInstructionsModule(ipcStubs) {
   return module.exports;
 }
 
-test("loadResolvedInstructions keeps normal MAIN templates but skips game-studio templates", async () => {
+test("loadResolvedInstructions keeps ordinary templates but tombstones the removed Studio pack", async () => {
   const files = {
     ".MAIN/templates/plan/design.md": "---\npaths:\n  - src/**\n---\n# Design Template",
-    ".MAIN/templates/game-studio/gdd.md": "# GDD Template",
+    ".MAIN/templates/game/design.md": "# Game Design Template",
+    ".MAIN/templates/game-studio/gdd.md": "# Removed Studio Template",
   };
   const workspaceCalls = [];
 
@@ -56,9 +72,13 @@ test("loadResolvedInstructions keeps normal MAIN templates but skips game-studio
 
   const resolved = await loadResolvedInstructions("/tmp/workspace", [], ["src/main.ts"]);
 
-  assert.equal(resolved.templates.length, 1);
+  assert.equal(resolved.templates.length, 2);
   assert.equal(resolved.templates[0].source.path, ".MAIN/templates/plan/design.md");
   assert.match(resolved.templates[0].content, /Design Template/);
+  assert.equal(
+    resolved.templates.some((template) => template.source.path === ".MAIN/templates/game/design.md"),
+    true,
+  );
   assert.equal(
     resolved.templates.some((template) => template.source.path === ".MAIN/templates/game-studio/gdd.md"),
     false,
@@ -148,4 +168,46 @@ test("resolved project instructions render with complete content and source prov
   assert.ok(rendered.endsWith(longRule));
   assert.doesNotMatch(rendered, /session_memory/i);
   assert.doesNotMatch(rendered, /TRUNCATED/);
+});
+
+test("instruction admission keeps Agent Skills in a progressive catalog instead of rule layers", async () => {
+  let catalogInput = null;
+  const admittedCatalog = {
+    entries: [{ id: "panel:review", name: "review" }],
+    explicitSkillIds: ["panel:review"],
+    warnings: [],
+    loadedAt: 2,
+  };
+  const { loadResolvedInstructions } = await loadInstructionsModule({
+    globSearch: async () => [],
+    readFile: async () => "",
+    loadSkillCatalog: async (input) => {
+      catalogInput = input;
+      return admittedCatalog;
+    },
+  });
+  const skill = {
+    id: "review",
+    name: "review",
+    desc: "Review a change.",
+    content: "SKILL_BODY_SENTINEL",
+    active: true,
+    type: "instruction",
+  };
+
+  const resolved = await loadResolvedInstructions(
+    "/tmp/workspace",
+    [skill],
+    [],
+    "Use $review",
+  );
+
+  assert.equal(resolved.skillCatalog, admittedCatalog);
+  assert.equal(
+    resolved.layers.some((layer) => /SKILL_BODY_SENTINEL/.test(layer.content)),
+    false,
+  );
+  assert.equal(catalogInput.workspace, "/tmp/workspace");
+  assert.equal(catalogInput.userPrompt, "Use $review");
+  assert.equal(catalogInput.skills[0], skill);
 });

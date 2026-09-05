@@ -1,7 +1,7 @@
 # MAIN 最小运行内核与能力边界
 
 > 状态：现行开发约束
-> 按生产调用点核验：2026-07-30
+> 按生产调用点核验：2026-09-02
 > 目的：在修改 Runtime 前先确定唯一所有者、真实能力和验收事实，避免重新堆叠 v1/v2 式特例。
 
 本文严格区分三类陈述：
@@ -17,7 +17,7 @@
 ```text
 submitAsyncWorkflowRun.ts
   -> submitRuntimeRunner.ts
-  -> runtimeV2/{chat,workspaceRead,plan,execute,goal,studio}Runner
+  -> runtimeV2/{chat,workspaceRead,plan,execute,goal}Runner
   -> RuntimeV2Controller + provider/tool/checkpoint/projection ports
   -> streaming.ts / toolExecutor.ts
   -> Rust IPC 受信任执行与 Session 存储
@@ -48,6 +48,7 @@ Execute 只需要一个可重复的核心循环：
 4. provider 正文只负责说明，不能创造 mutation、validation、permission 或 terminal 事实。
 5. 重复读取、无工具响应、协议漂移和弱输出是推进信号，不是任务终态。
 6. 最终 mutation boundary 后的真实证据完整覆盖所有必要验收条件时可以 `success`；普通 Execute 没有整轮 wall-clock 截止。验收尚未完成时，只有用户取消、权限或外部状态阻塞、兼容 transport 全部不可用、调用方显式预算、持续的 provider 恢复停滞和无法满足的真实验收边界可以提前收口，已有改动但覆盖不全时必须是 `partial`。
+7. 流式 provider 的请求级 timeout 约束无活动阶段，不得把持续输出的本地模型按完整生成墙钟误杀；raw keepalive 可以续 transport lease，但只有真实 reasoning、visible text 或 tool delta 才能成为 model-progress/lane 事实。总时长由所属 Run 的 durable lifecycle deadline 单独约束。
 
 “兼容 transport 全部不可用”必须由**没有任何兼容请求可以发出**或所有候选 transport
 都已得到不兼容证据来证明。某个已经发出的 provider 请求发生 HTTP、连接、reset 或
@@ -61,6 +62,15 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 读取是编辑授权和理解证据，不是用户目标已经产生效果。当前 mutation boundary 已物化精确版本源码、但尚无成功 mutation 时，ledger 必须保持 `source_only_frontier`：后续读取可以补充 workset，却不能不断把“仍未产生效果”的状态重置成已推进。普通 request 在**同一完整工具集合**中把现有 mutation 能力排在前面，并要求只有能明确指出一个缺失路径、范围或事实时才继续读取。不得按读取轮数结束、强制单一编辑工具或按 Qwen/Gemma 等模型名分支。若 ledger 证明同一动作第一次明确重复、不同搜索/验证参数返回同一非空语义结果，或同版本缓存源码已完成一次重物化且 exact source 因此重新可见，可临时进入 `closed_recovery`。最新被拒 mutation 只给最新失败目标开放一次 post-failure `corrective_source` 批次；验收诊断带行号时必须读取该行附近，成功一次即进入 `corrective_mutation`，不能逐页扫描整个文件。下一补丁仍按请求级 source lease 独立授权，原失败补丁不会因切换工具面而复活；连续三次纠错 mutation 无效果才诚实收口，真实 mutation 清零。action window 只收敛 provider 下一动作目录，保留父线程 mutation 能力但移除协作逃生分支，不按任务总耗时结束 Run。窗口内的新建文件必须拥有当前 exact source lease，不能用无关报告文件伪造 mutation boundary。
 
 普通 Execute 的时间语义是“进展驱动”，不是“从接纳开始倒计时”：模型推理、持续流式输出、真实工具动作、证据收集、修改和验证无论总耗时多久，都不能因为 Turn 年龄被取消。10 分钟只用于 `provider recovery stall lease`：它从第一次没有形成可执行结果的 provider 决策开始，在模型持续重复已拒绝动作、返回空动作或请求持续失败且没有新进展时累计；任一可执行决策或新的工具/证据边界立即清零。该 lease 只在两次动作之间检查，不中断正在进行的慢模型请求或工具。读取和有限验证仍可有单操作 watchdog；单操作超时是可恢复失败，不是整轮终态。
+
+Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：无本地来源的对话始终为 Chat；工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
+
+只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次累计，第一次无进展要求指出信息缺口，第二次切换 `mode=conclude, conclusionKind=read_only` 并清空工具。历史 `iteration_limit` 仅推动该策略切换；生产不再按固定轮数发出它。总结请求仍未产生完整回答时为 `error`，不能把工具证据投影为生命周期 `partial`。
+
+Chat/analyze 的模型上下文在预算内保留原有对话和当前完整 assistant/tool 对。只有实际超出输入预算（含系统指令和工具 schema）才先移除重复工具组，再移除最早完整历史 Turn；单份超大回执最后以明确缺失标记缩短，保留配对。Execute/validate 继续原有 decision view。只读 `tool.completed.modelContent` 保存模型实际收到的有界回执；恢复从事件重建同一条 transcript 和 evidence ordinal，不能仅恢复 receipt 元数据后继续丢失工具结果。
+
+终态投影是可恢复事务：`run.completed` 保存精确 final projection，随后提交 `projection.published` 和 `turn.completed`。只读恢复补齐缺失步骤，已有步骤按 projection ID 重放，不追加第二个终态或最终消息。
+
 
 ### 2.1 跨模型统一协议，而不是统一思考过程
 
@@ -155,7 +165,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - Execute、Plan 和 child 对同一 provider 响应中的并行 `read_file` 使用同一批次计数，共享上述 Run 窗口。它只控制本请求返回量，不改变模型硬上限，也不妨碍用 `nextStartLine` 对同一版本继续分页。
 - child handoff 也从同一 Run 输入预算派生：按目标路径从 canonical transcript 与 ledger 选取当前 mutation boundary 的相关父上下文；源码窗口整条纳入或明确列为 omitted，不能截成伪完整代码，也不再固定截取“最后六条、每条 2400 字符”。
 - `modelLaneCoordinator` 会读取系统内存来控制本地父/子模型请求的并发准入。
-- 模型请求并发不通过提示词询问模型，也不按 Ollama、LM Studio、OMLX 等产品名猜测数值。若活动配置提供 `maxActiveRequests`，它只能在产品总请求安全上限四以内选择更小上限，并仍受内存保护。未提供并发事实的本地 lane 默认串行，保留父请求后的 child 容量为零；不能把父/子轮流占用同一 lane 记作并行协作。未知云 lane 才允许从一个受控重叠探针逐级观察容量。
+- 模型请求并发不通过提示词询问模型，也不按 Ollama、LM Studio、OMLX 等产品名猜测数值。若活动配置提供 `maxActiveRequests`，它只能在产品总请求安全上限四以内选择更小上限，并仍受内存保护。未提供并发事实的本地或云 lane 从“父线程 + 一个重叠 probe”开始，只有真实首 chunk 证明重叠后才按 2 → 3 → 4 逐级增长；本地每次新重叠还必须通过设备内存保留量检查。轮流占用同一 lane 不会被记作并行能力。
 - 只有明确的容量事实会收缩当前 lane：OOM、HTTP 429/明确并发限制或本机内存压力。连接重置、gateway/stream timeout、长 reasoning 和“暂无可见正文”只是该请求的 transport/协议事实，不得把 provider 并发能力错误降为一。真正收缩时优先释放最新子流而不是中断主体；收缩为串行后不再向后续 provider decision 广告 child 容量。
 
 明确限制：
@@ -163,7 +173,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 旧的 `modelDiscovery.computeDynamicLocalContextLimit()` 依赖猜测模型体积且没有生产调用方，已删除；不得恢复这种“猜模型、再扩大上限”的旁路。
 - Settings 的滑块/内存展示是用户配置与说明，不是运行中的第二预算所有者。
 - provider 未报告能力或未确认所选模型已加载时，runtime 绝不猜测更大的上限；因此这类 provider 只使用用户配置。
-- OpenAI-compatible API 没有标准字段能查询服务端实际并发；服务自身未报告时，本地执行保持串行安全默认，“最多并行多少”只能来自显式配置，不能从空闲内存或模型回答中伪造。受控云 lane 可以使用真实请求重叠观察。
+- OpenAI-compatible API 没有标准字段能查询服务端实际并发；服务自身未报告时，runtime 只能把受控请求的真实首 chunk 重叠当作增长证据。空闲内存只是本地准入保护，模型回答也不是容量事实，两者都不能单独把 lane 提升到更多并发。
 - 设备内存估算是容量保护而非精确 KV 分配器；provider 仍可在请求时返回真实容量错误，后续应把它作为新的资源事实处理，不能静默截断正文。
 - 单次模型可见读取仍有绝对窗口上限。需要全文件语义时必须沿同一版本连续取窗，而不是提高常量或把文件偷偷裁成摘要。
 - reasoning 的专有请求字段只属于 adapter。OMLX 的 `auto` 不发送正向 reasoning 覆盖，保持所选模型声明的默认行为；只有 `explicit` 才依据该次请求的真实输出上限派生 hidden-thinking budget，`off` 用于关闭 thinking 的有界恢复。Execute、Plan 和 child 共用这一 adapter 规则，未知 endpoint 不接收这些字段；Runtime 只消费规范化后的 reasoning-toggle 能力来处理 reasoning-only 的长度截断。
@@ -178,10 +188,10 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 
 项目基线的正确生命周期：
 
-- 第一次需要工作区上下文时做快速、确定性的 anchor 扫描，不用模型阅读全文，也不阻塞等待全仓库索引。
-- 以 schema version、canonical workspace identity 和 anchor fingerprint 持久化；manifest、lockfile、项目规则或相关配置变化时重建。不能只靠时间戳宣称新鲜。
-- 每个新 Session、Turn 和 child 都接收同一份有界基线；根据任务再从 repo map/AST/文件工具检索具体事实，而不是把整个索引塞进 prompt。
-- 用户维护的 `.MAIN/steering` 或等价项目规则保持独立权威；自动基线只能引用，不能重写它。
+- 每个 Workspace Turn admission 做快速、确定性的 anchor 与浅层拓扑扫描，不用模型阅读全文，也不等待全仓库索引。
+- instructions 与 baseline 共享同一次 read-through；baseline 以 schema/parser version、canonical workspace/VCS identity、anchor、topology 和 facts fingerprint 标识，不依赖 mtime。
+- 本 Run 内 parent、Plan、Execute、Goal 和 child 接收同一份冻结基线；它不进入 Session/checkpoint 持久化。下一 Turn 从当前工作区重新构建，再按任务用 repo map/AST/文件工具读取具体源码。
+- 用户维护的 `.MAIN/steering`、`AGENTS.md` 或等价项目规则保持独立权威；自动 baseline 只能作为非权威事实引用，不能静默重写人工规则。
 - 失败历史、模型推断、临时路径和“上次这样修成功了”不能成为无条件全局记忆。只有带 workspace、目标、版本和验证 provenance 的事实才能跨 Turn 复用，并在来源变化时失效。
 
 当前能力审计：
@@ -189,9 +199,10 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - Rust `SessionMemoryStore` 只有在调用 `load_session_memory` 或 `record_session_failure` IPC 时才会创建或更新 `.MAIN/memory/session_memory.json`。生产端目前只在检测到应用未正常结束的旧 Run 时直接调用 `record_session_failure`；`load_session_memory` 没有生产调用方，文件内容不会进入 Execute、Plan、child 或 Chat 的 provider 上下文。因此删除旧文件不会改变当前执行能力，也不能把“无旧文件回放”解释成记忆已经重建。
 - 该旧 profile 仅凭文件存在推断构建命令，并会累积自由文本失败/反思，不满足来源、版本和失效契约。不得直接注入 provider 上下文。
 - 工作区 `AGENTS.md`、`CLAUDE.md`、`AGENT.md`、`.MAIN/rules`、显式 active instruction skill，以及 `.MAIN/steering` 中 `inclusion: always` / 已知路径匹配的 `fileMatch` 规则，已收敛到同一个 `ResolvedInstructionSet`。每个 Turn 在 Run admission 前刷新一次，随后把带 source provenance 的完整文本冻结到 Runtime v2 admission context；父线程和之后启动的 child 使用同一快照。
-- 上述规则同步与会话压缩互相独立；旧 `session_memory.json`、provider 总结和 conversation summary 都不能填充这个字段。规则刷新失败时保留上一份已解析规则并继续安全读取，不能把一次可选 bootstrap I/O 失败升级为终态。
+- 上述规则同步与会话压缩互相独立；旧 `session_memory.json`、provider 总结和 conversation summary 都不能填充这个字段。当前生产路径为避免借用另一个工作区的 UI 投影，规则刷新失败时会让本 Turn 使用空 instruction snapshot，并继续通过普通源码工具安全读取；它不会把一次可选 bootstrap I/O 失败升级为终态。未来若缓存最后成功快照，必须绑定 canonical workspace identity、来源 hash 与新鲜度，不能直接复用全局 UI 状态。
 - repo map 目前仅在模型调用 `repo_map_*` 工具时构建，且调用会重新扫描；它是按需代码检索，不是 Session bootstrap 项目基线。
-- 因此“每轮默认获得带 manifest/lockfile fingerprint 的完整结构基线”仍是**尚未接线**能力；目前已经接线的是用户维护的项目规则和浅层 workspace observation。实现剩余结构基线时应替换或收敛上述重复存储，不能再增加第三份项目真值。
+- 每个 Workspace Turn 现在都会尝试取得带 manifest/lockfile、规则 source hash、声明脚本与浅层 topology 的 typed baseline；构建失败时该分支为空并回退到 legacy shallow workspace tree，不影响已成功解析的 instructions。规则 source 原始 hash 不一致时也只丢弃 baseline。
+- `/init` 是显式、可审阅的本地命令：它可创建根 `AGENTS.md` 或用 `--refresh` 重建唯一托管区块，但不自动把每次源码 mutation 写回 Markdown。普通项目事实的新鲜度由下一 Turn 重建的 baseline 提供。
 
 ### OpenCode 公开实现的可采用边界
 
@@ -211,11 +222,12 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 
 ## 6. 子智能体边界
 
-- `preferred` 表示用户为本轮开启协作能力，不表示强制阶段或数量。拆分规则在 Turn admission 和 Plan 意图分析上下文中就交给模型；只要 child lane 仍有容量且工具实际可见，provider 可在读取、修改或验证任一阶段根据工作量自行决定是否启动，也可以不启动并直接完成。spawn 不是 mutation、validation 或 completion 的 effect-boundary 前置。
+- `subagentPreference=preferred` 表示用户为本轮开启并偏好协作能力，不表示硬性要求、强制阶段或数量。Turn admission 另以 `subagentRequirement=optional|required` 保存用户是否明确要求使用子智能体：只有用户文本中的显式强制指令可产生 `required`，Composer 协作开关和普通偏好只能产生 `optional`；该事实随首轮输入 checkpoint 持久化并进入 Runtime context，后续策略与评测不得再从自然语言重判，也不得把 `preferred` 冒充 `required`。拆分规则在 Turn admission 和 Plan 意图分析上下文中就交给模型；只要 child lane 仍有容量且工具实际可见，provider 可在读取、修改或验证任一阶段根据工作量自行决定是否启动。spawn 不是 mutation、validation 或 completion 的 effect-boundary 前置。
+- Plan 中尚未满足的 `required` 协作只开放精确 `spawn_subagent` 获取面。若该 provider 请求在 child admission 前超时，runtime 只允许在同一真实 discovery/native surface 上重试一次；两次失败由配对的 durable `request_model` command receipt 计数，冷恢复不得续租，也不得谎称已切换到 synthesis/structured transport。第二次超时以专用 `blocked` 原因有限收口；容量不足、provider 超时和用户取消必须保持不同事实。
 - `explore`、`review`、`validate` 只读 child 适合并行调查。父线程已经读取精确源码并形成证据化方案后，`implement/write` child 可获得 create/modify/delete、具体方案、成功标准和每个精确文件目标组成的事务权限。不能把目录作为写授权后让 child 自行选择文件；多个 writer 的目标必须互斥，workspace root 不能成为写范围。
 - 子智能体接收的是有界的父上下文胶囊，而不是整段对话或父模型私有推理：原始目标、验收条件、已批准 WorkPlan、相关父证据目录、当前范围内的完整版本化源码窗口和同一份 workspace instruction snapshot。继承证据必须带 provenance，不能因协议不允许引用而被迫重读。
 - 实现 child 只能暂存一个与分配 operation 相符的修改事务，不直接写共享工作区。join 重新验证独占范围、base version、批准计划 scope、权限/单次审批和语法，再提交并生成 mutation evidence；任一检查失败都整体丢弃。活动 writer 会阻止父线程或 sibling 修改重叠路径，也会阻止最终 validation 在旧版本上运行。父线程继续不依赖 child 的工作，只在出现依赖时 wait，并始终负责整合、最终验证和完成。
-- 当前最小内核不向 child 暴露额外“报告工具”：child 每次请求同时保留其安全工具和普通最终文本能力，不使用 required-tool、不预留固定“强制总结阶段”，也不在取得首条证据后撤掉工具。首次精确重复动作得到标准工具拒绝结果和一次真实恢复决策；若下一次决策只再次提交已经明确关闭的相同 identity，则这是不可执行的语义死锁，child 保留证据并降级交回父线程，而不是再等时间或用轮数决定父任务终态。child 用普通最终文本收口，runtime 只在报告引用子任务真实新证据或明确交付给 `review` 的版本化父证据时记为 `completed`。继承父证据必须单独保存 provenance；它可以支持 review finding，但绝不计入子任务新证据、交付、采用或验收数量。
+- 普通 child 请求不暴露额外“报告工具”：安全工作工具与普通最终文本能力并存，不预留固定“强制总结阶段”，也不在取得首条证据后撤掉工具。child 首先用普通最终文本收口；runtime 只在报告显式引用子任务真实新证据或明确交付给 `review` 的版本化父证据时记为 `completed`。若这段普通 final 因缺少精确引用而被拒，且已经存在可引用 evidence，下一次请求才一次性收窄为唯一、无副作用的 `submit_runtime_v2_subagent_report` required ingress：schema 的 evidence enum 只能来自本 child 的真实证据，或 `review` child 明确继承且保留 provenance 的版本化父证据；模型必须自行选择引用，runtime 不代填 finding 或 citation，该调用也不进入权限、工作区工具或副作用执行层。提交缺失、越界、多调用或 schema 不合法时立即交回父线程：存在 child 新证据则为 `degraded`，只有合法继承上下文而无新证据则为 `failed`；完全没有可引用 evidence 时不得进入该窗口，仍保留安全观察能力。该边界是结构化返回协议纠错，不是 child 工作工具。继承父证据必须单独保存 provenance；它可以支持 review finding，但绝不计入子任务新证据、交付、采用或验收数量。
 - child 原生工具调用在 identity、scope 和执行前必须走父线程相同的 advertised-schema normalization；未声明参数和等于 schema 默认值的可选参数不能让同一读取伪装成新动作。若不同参数实际返回同一 `target + output version`，第一次语义重复给出纠正回执，下一次仍命中该关闭观察则立即以 `closed_observation_loop` 降级；真正不同的源码窗口仍是新 evidence 并清空该关闭集合。这不是固定轮数限制，而是结果已经证明无新信息后的幂等边界。
 - child 取得**新证据**但未形成合法报告时记为 `degraded`，UI 显示“已降级由主体接管”；只有继承上下文但没有合法报告，或根本没有新证据时记为 `failed`。父任务取消时为 `canceled`。这些状态都不能制造验收事实。
 - child 同样没有总耗时截止。只有连续步骤重复、越权、失败或没有产生新证据时才启动 10 分钟恢复停滞租约；任一新证据立即清零，慢速的在途 provider/tool 请求不会被该租约中断。停滞后 child 以 `degraded/failed` 交回父线程，避免父任务最终 join 永久悬挂。
@@ -242,7 +254,10 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 同一个 Runtime authority resolver 生成 Execute 工具面并执行授权；本 Turn consent 可允许 `browser_evaluate`，桌面控制仍保留逐次授权。
 - browser validation 只有在存在因果关联的 passed assertion，且没有 page/console error 时才算通过；静态 build 不能单独覆盖行为 criterion。
 - Goal/WorkPlan 明确声明的 `behavioral`、`interaction`、`static` 证据类型必须严格保持。普通 Execute 没有该类型事实时，Runtime 不从自然语言猜分类，也不把所有目标硬编码为 behavioral；模型选择的真实有限 validator 可以覆盖未分类条件，最终报告必须如实说明实际验证内容。
-- Plan discovery 始终同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。只有 Plan 自己共享的模型阶段截止可以结束该有界合成阶段；provider 无动作和协议漂移只作为软反馈或兼容 transport 协商。该阶段预算不得被误用为普通 Execute 的 Turn 总时限。
+- Plan discovery 同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。普通 Plan 没有默认八分钟硬限，流式请求的 inactivity watchdog 不限制活跃生成总时长；child 不继承凭父线程年龄计算的隐式截止。
+- Plan 的十分钟无进展恢复窗口从 canonical provider/tool/child 回执重建；新版本、同版本新增源码覆盖和新交付证据清零，重复结果、拒绝、回放或进程重启不续期。只在请求之间检查，先接收有效提交或新证据；活跃 child 先 join。只有调用方明确指定的 deadline 写入 run.started 后可成为父子共享硬边界，compiler 拒绝也不能延长它。没有 sealed WorkPlan 时的恢复耗尽或传输失败是 error，不得仅凭工具证据标记 partial。
+- Plan discovery/synthesis 在预算内保留同一完整 assistant/tool transcript；只在真实预算压力下删除完整组，保护用户目标和最新反馈。工具实际有界内容随 ledger 持久化，冷恢复不重读概览、不重新编号证据，也不能把旧 checkpoint 缺失正文的元数据冒充源码内容。终态意图先持久化，恢复补齐唯一的 run.completed → final projection → turn.completed。
+- Plan 对 child evidence 的 durable adoption 只能从已经持久化成功的 `work_plan.sealed` 中按 `findings[].basis`／`steps[].basis` 精确派生，事件顺序为 `handoff_delivered < work_plan.sealed < subagent.handoff_applied(source=work_plan)`。provider 正文、被拒或被截断的提交即使提到 exact evidence ID，也不是采纳权威；reviewing 冷恢复只可幂等补齐 seal 后遗漏的 receipt。
 - 普通副作用按规范化后的 tool+arguments 在同一 mutation boundary 精确拒绝，工具本身和其他参数仍然可用。`read_file` 是 coverage-aware 例外：首次缓存重放后，同一路径、同版本的其他范围只有在该请求范围仍物化于**当前实际发给模型的 decision view** 时才属于“无新信息”；canonical transcript 曾经覆盖过不等于模型现在仍看得到。若有界 workset 已淘汰该源码，允许再次从缓存重放而不访问磁盘。首次 replay 可以返回精确缓存源码；源码仍可见时再次重分片只能返回有界结构化指引，不能附加源码奖励无效读取。durable replay receipt、标准工具对、路径/版本和 mutation receipt 负责恢复关闭事实，但执行拒绝前必须再与当前 decision view 求交，不能只相信 process-local Map 或历史 ledger；成功 mutation 会重新开放新的边界。
 - `replace_in_file` 的目标租约正确但 `search_text` 不属于模型刚看到的精确源码时，这是 source-text mismatch，不是 target mismatch。拒绝回执必须只附带当前版本中最相关的有界精确源码片段（不得回显 provider 拟写入正文），并为该目标重新开放一次缓存读取回放；回放后再次关闭，直到出现新的 source mismatch 或真实 mutation boundary。同名声明形成歧义时，定位必须比较后续连续精确匹配并优先真实重同步点，不能因为文件末尾存在相同函数前缀就把恢复片段指向错误副本。这样弱模型可以从错误复制恢复，同时仍由精确匹配、版本化 source lease 和 mutation preflight 共同阻止猜测式写入。
 - mutation 租约失败的机器原因必须进入 durable event，不能依赖本地化错误字符串。若一个真实标准读取只因 decision workset 收缩而不可见，且从该读取之后没有任何已提交 mutation 与其目标重叠，纠正视图可以重新物化该原始读取并只为精确 `replace_in_file`／`apply_patch` 建立请求级租约；无关文件的内建精确编辑不会使它失效。任何同目标或目录重叠 mutation 都必须使旧读取失效，replayed receipt 仍然永远不能自行制造 source authority。
