@@ -1,4 +1,4 @@
-import { readOnlyEvidenceVersion } from "../../lib/runtime-v2/readOnlyProgress";
+import { readOnlyEvidenceVersion, webEvidenceVersions } from "../../lib/runtime-v2/readOnlyProgress";
 import {
   runtimeV2EvidenceVersion,
   type RuntimeV2Command,
@@ -486,7 +486,7 @@ export function toolCompletionFor(
     return toolResultEvent(
       command,
       status,
-      status === "succeeded"
+      status === "succeeded" && webEvidenceVersions(toolName, output)?.length !== 0
         ? projection.targets.map((resolvedTarget) => ({
             id: nextEvidenceId(input.live),
             kind: projection.kind,

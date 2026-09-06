@@ -11,6 +11,7 @@ import {
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
+  runtimeV2DirectExecuteContractCoverage,
   type RuntimeV2Command,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2ProviderRecoveryPressure,
@@ -211,6 +212,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const decisionInstruction = {
     role: "system" as const,
     content: [
+      aggregate?.strategy === "execute" && executionContract
+        ? `Execution contract coverage (current mutation boundary): ${JSON.stringify(runtimeV2DirectExecuteContractCoverage(aggregate))}. Complete the missing targets and declared checks before a success report.`
+        : "",
       providerModeInstruction(
         input.command,
         preferredValidation,
@@ -272,15 +276,28 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const instructionIndex = firstNonSystemIndex < 0
     ? boundedConversation.length
     : firstNonSystemIndex;
+  const toolsClosed =
+    requestMode === "conclude" ||
+    input.command.payload.conclusionKind === "read_only" ||
+    providerTools.length === 0 ||
+    (Array.isArray(input.command.payload.allowedToolNames) && input.command.payload.allowedToolNames.length === 0);
+  const concludePrompt =
+    "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
   const unboundedMessages = [
     ...boundedConversation.slice(0, instructionIndex),
     decisionInstruction,
     ...textEnvelopeInstructions,
     ...boundedConversation.slice(instructionIndex),
   ];
-  const messages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
-    contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens, tools: providerTools,
+  const boundedMessages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
+    contextLimit: budget.contextLimit,
+    reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
+    tools: providerTools,
   }) : unboundedMessages;
+  const messages =
+    toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
+      ? [...boundedMessages, { role: "user" as const, content: concludePrompt }]
+      : boundedMessages;
   if (readOnly) {
     input.live.latestProviderRequestSourceCoverage = materializedRuntimeV2SourceCoverage(
       messages, input.ports.context.runWorkspace || "", providerEffectFacts,
@@ -537,7 +554,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     toolCallCount: result.toolCalls.length,
     availableToolCount: providerTools.length,
   });
-  return normalizeProviderResponseV1({
+  const normalized = normalizeProviderResponseV1({
     visibleText,
     content: protocolContent,
     toolCalls: result.toolCalls,
@@ -560,4 +577,13 @@ export async function requestRuntimeV2ProviderOnce(input: {
         : []),
     ],
   });
+  input.ports.logStoreEvent("runtime_v2_provider_normalized_shape", {
+    turnId: input.command.run.turnId, runId: input.command.run.runId,
+    mode: input.command.payload.mode,
+    toolNames: normalized.toolCalls.map((call) => call.name),
+    diagnosticCodes: normalized.diagnostics.map((item) => item.code),
+    explicitActionMarkers: [...new Set(protocolContent.match(/<\/?(?:runtime-v2-tools|tool_call|function_call|tool_use|tool_code)\b/gi) || [])],
+    visibleTextChars: normalized.visibleText?.length || 0,
+  });
+  return normalized;
 }

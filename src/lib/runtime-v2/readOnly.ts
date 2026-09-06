@@ -6,6 +6,44 @@ import type { RuntimeV2Ports } from "./ports";
 import type { NetworkReadPolicy } from "../networkRead";
 import { deriveReadOnlyRecoveryWindow, latestReadOnlyAnswer } from "./readOnlyProgress";
 import { RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS } from "./lifecycle";
+import { runtimeV2ProviderAnswerText } from "./providerAnswer";
+
+export const RUNTIME_V2_MAX_CONCLUDE_ATTEMPTS = 3;
+
+export function consecutiveEmptyConcludeAttempts(state: TurnAggregateV1): number {
+  const commands = new Map(
+    state.events.flatMap((event) =>
+      event.type === "command.scheduled"
+        ? [[event.command.idempotencyKey, event.command] as const]
+        : [],
+    ),
+  );
+  let count = 0;
+  for (let i = state.events.length - 1; i >= 0; i--) {
+    const event = state.events[i]!;
+    if (event.type === "tool.completed" || event.type === "run.started") {
+      break;
+    }
+    if (event.type === "provider.responded") {
+      const command = commands.get(event.idempotencyKey);
+      const isConclude =
+        command?.kind === "request_model" &&
+        (command.payload.mode === "conclude" ||
+          command.payload.conclusionKind === "read_only" ||
+          (Array.isArray(command.payload.allowedToolNames) && command.payload.allowedToolNames.length === 0));
+      if (!isConclude) {
+        break;
+      }
+      const answer = runtimeV2ProviderAnswerText(state, event, true);
+      if (!answer) {
+        count++;
+      } else {
+        break;
+      }
+    }
+  }
+  return count;
+}
 
 export interface RuntimeV2ReadOnlyLoopInput {
   readonly ports: RuntimeV2Ports;
@@ -36,7 +74,7 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
   if (!input.initial) await controller.admit({
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
     networkRead: input.networkRead, constraints: ["read_only", "no_external_side_effects"],
-    acceptanceCriteria: ["one_visible_provider_reply"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
+    acceptanceCriteria: ["current_complete_answer_without_unexecuted_actions"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
   });
   const startedAt = controller.snapshot().aggregate?.events.find((event) => event.type === "run.started")?.at ?? input.now();
   if (input.initial?.aggregate?.terminalOutcome || input.initial?.aggregate?.phase === "finalizing") await controller.resumeTerminalProjection();
@@ -68,11 +106,13 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
       await controller.driveOnce({ resultKind: "error", resultReason: "连续无语义进展的恢复租约已耗尽，未生成可发布的回答。" });
       continue;
     }
-    const lastRequest = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "request_model");
-    if (lastRequest?.type === "command.scheduled" && lastRequest.command.payload.conclusionKind === "read_only" && !state.pendingToolCalls.length) {
-      await controller.driveOnce({ resultKind: "error", resultReason: "总结请求未产生完整、可发布的模型回答。" });
+    const concludeAttempts = consecutiveEmptyConcludeAttempts(state);
+    if (concludeAttempts >= RUNTIME_V2_MAX_CONCLUDE_ATTEMPTS) {
+      await controller.driveOnce({ resultKind: "error", resultReason: "连续总结尝试未生成可发布的回答，已达到最大重试次数。" });
       continue;
     }
+    // A malformed conclusion is recoverable protocol evidence. The durable
+    // stall lease bounds retries; an individual weak response is not terminal.
     if (input.deadlineMs !== undefined && input.now() - startedAt >= input.deadlineMs) {
       await controller.driveOnce({ resultKind: "error", resultReason: "调用方指定的运行时限已到，未生成可发布的回答。" });
       continue;

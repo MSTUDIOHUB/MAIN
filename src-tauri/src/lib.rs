@@ -8673,7 +8673,17 @@ pub(crate) async fn send_guarded_public_get(
     user_agent: &str,
     timeout_duration: Duration,
 ) -> Result<reqwest::Response, String> {
-    let headers = HashMap::from([("User-Agent".to_string(), user_agent.to_string())]);
+    let headers = HashMap::from([
+        ("User-Agent".to_string(), user_agent.to_string()),
+        (
+            "Accept".to_string(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".to_string(),
+        ),
+        (
+            "Accept-Language".to_string(),
+            "zh-CN,zh;q=0.9,en;q=0.8".to_string(),
+        ),
+    ]);
     send_guarded_proxy_request(
         url,
         "GET",

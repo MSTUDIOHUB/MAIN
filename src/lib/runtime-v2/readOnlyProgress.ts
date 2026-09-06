@@ -3,10 +3,20 @@ import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Event } from "./events";
 import type { RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import { runtimeV2EvidenceVersion } from "./evidenceVersion";
+import { latestRuntimeV2Answer, runtimeV2ProviderAnswerText } from "./providerAnswer";
 
 export function normalizedEvidenceUrl(value: unknown): string {
   try {
-    const url = new URL(String(value || ""));
+    let url = new URL(String(value || ""));
+    if ((url.hostname === "bing.com" || url.hostname.endsWith(".bing.com")) && url.pathname === "/ck/a") {
+      const encoded = url.searchParams.get("u") || "";
+      const target = encoded.startsWith("a1")
+        ? new TextDecoder().decode(Uint8Array.from(atob(encoded.slice(2).replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0)))
+        : encoded;
+      const destination = new URL(target);
+      if (["http:", "https:"].includes(destination.protocol)) url = destination;
+    }
+    if (url.hostname === "r.jina.ai" && /^\/https?:\/\//.test(url.pathname)) url = new URL(url.pathname.slice(1) + url.search);
     url.hash = "";
     for (const key of [...url.searchParams.keys()]) {
       if (/^(utm_|fbclid$|gclid$)/i.test(key)) url.searchParams.delete(key);
@@ -34,7 +44,7 @@ export function webEvidenceVersions(toolName: string, output: unknown): string[]
     })))].sort();
   }
   if (toolName === "web_fetch") {
-    if (!text(data.content)) return [];
+    if (!text(data.content) || data.retrieval?.usable === false) return [];
     return [runtimeV2EvidenceVersion({ url: normalizedEvidenceUrl(data.finalUrl || data.final_url || data.url), content: text(data.content), truncated: data.truncated === true })];
   }
   return null;
@@ -46,10 +56,7 @@ export function readOnlyEvidenceVersion(toolName: string, output: unknown): stri
 }
 
 export function latestReadOnlyAnswer(state: TurnAggregateV1): string {
-  if (state.pendingToolCalls.length || state.scheduledCommands.length) return "";
-  const event = [...state.events].reverse().find((item) => item.type === "provider.responded");
-  return event?.type === "provider.responded" && !event.result.toolCalls.length && !event.result.diagnostics.length
-    ? String(event.result.visibleText || "").trim() : "";
+  return latestRuntimeV2Answer(state);
 }
 
 /** Count settled provider batches, never individual calls in a parallel batch.
@@ -74,6 +81,9 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
   const coverage = new Map<string, Array<[number, number]>>();
   let occurrence = 0;
   let startedAt = 0;
+  // Search returns candidate locations. Reworded discovery alone cannot
+  // renew the lease forever; a newly read source reopens that frontier.
+  let discoveryPending = false;
   let reason: RuntimeV2ProviderRecoveryWindow["pressure"]["reason"] = "empty_response";
   const fail = (at: number, nextReason: typeof reason) => {
     if (!occurrence) startedAt = at;
@@ -83,7 +93,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
   for (const event of state.events) {
     if (policy.includeChildEvidence && event.type === "subagent.handoff_delivered") {
       const keys = event.evidenceIds.map((id) => `child:${event.jobId}:${id}`);
-      if (keys.some((key) => !seen.has(key))) occurrence = 0;
+      if (keys.some((key) => !seen.has(key))) { occurrence = 0; discoveryPending = false; }
       keys.forEach((key) => seen.add(key));
       continue;
     }
@@ -97,11 +107,13 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
       continue;
     }
     if (event.type !== "provider.responded") continue;
-    if (policy.finalTextIsProgress !== false && !event.result.toolCalls.length && !event.result.diagnostics.length && String(event.result.visibleText || "").trim()) {
+    if (policy.finalTextIsProgress !== false && runtimeV2ProviderAnswerText(state, event)) {
       occurrence = 0;
       continue;
     }
     let novel = false;
+    let sourceProgress = false;
+    let searchCandidates = false;
     let settledAt = event.at;
     for (const call of event.result.toolCalls) {
       // Providers may reuse a tool-call ID in a later response. Its receipt
@@ -111,6 +123,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
       settledAt = Math.max(settledAt, receipt.at);
       if (receipt.status !== "succeeded" || receipt.receiptOrigin === "replayed" || !receipt.evidence.length) continue;
       const web = webEvidenceVersions(call.name, receipt.modelContent);
+      if (call.name === "web_search" && web?.length) searchCandidates = true;
       const keys = web !== null ? web.map((version) => `${call.name}:${version}`) : receipt.evidence.filter((item) => !!item.version).flatMap((item) => {
         const key = `${item.kind}:${item.target}:${item.version}`;
         const window = item.kind === "source" ? extractReadFileWindowMetadata(receipt.modelContent || "") : null;
@@ -125,7 +138,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
           if (left > cursor) break;
           cursor = Math.max(cursor, right);
         }
-        if (end > cursor) novel = true;
+        if (end > cursor) { novel = true; sourceProgress = true; }
         const merged: Array<[number, number]> = [];
         for (const range of [...ranges, [start, end] as [number, number]].sort((a, b) => a[0] - b[0])) {
           const previous = merged[merged.length - 1];
@@ -136,10 +149,17 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
         return [];
       });
       for (const key of keys) {
-        if (!seen.has(key)) novel = true;
+        if (!seen.has(key)) {
+          if (call.name !== "web_search") { novel = true; sourceProgress = true; }
+          else if (!discoveryPending) novel = true;
+        }
         seen.add(key);
       }
     }
+    if (sourceProgress) discoveryPending = false;
+    else if (event.result.toolCalls.some((call) => call.name === "web_fetch" || call.name === "read_file")) {
+      discoveryPending = false;
+    } else if (searchCandidates) discoveryPending = true;
     if (novel) occurrence = 0;
     else fail(settledAt, event.result.toolCalls.length ? "non_novel_evidence" : event.result.diagnostics.some((item) => item.code === "repeated_action_rejected") ? "repeated_action_rejected" : "empty_response");
   }
@@ -147,7 +167,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
 }
 
 export function readOnlyConclusionRequired(state: TurnAggregateV1): boolean {
-  return (deriveReadOnlyRecoveryWindow(state)?.pressure.occurrence || 0) >= 2 || state.events.some((event) =>
-    (event.type === "command.scheduled" && event.command.payload.conclusionKind === "read_only") ||
-    (event.type === "soft_signal.observed" && event.signal === "iteration_limit"));
+  return (deriveReadOnlyRecoveryWindow(state)?.pressure.occurrence || 0) >= 2 ||
+    state.scheduledCommands.some((cmd) => cmd.payload.conclusionKind === "read_only") ||
+    state.events.some((event) => event.type === "soft_signal.observed" && event.signal === "iteration_limit");
 }

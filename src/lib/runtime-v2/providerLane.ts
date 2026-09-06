@@ -449,10 +449,15 @@ function inspectExplicitTextToolEnvelope(
 ): ExplicitTextToolEnvelopeParse {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return { calls: [] };
+  // Parse explicit action blocks before presentation sanitization can erase
+  // them. Quoted documentation is not an executable action surface.
+  const unquoted = raw.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, "");
+  const xmlMarker = /<\/?(?:tool_call|function_call|tool_use|tool_code)\b/i;
   const maxScanChars = 262_144;
   const hasExplicitPrefix =
     /<runtime-v2-tools>/.test(raw) ||
     /<\|tool_call>/i.test(raw) ||
+    xmlMarker.test(unquoted) ||
     /^```(?:json)?\s*/i.test(raw) ||
     raw.startsWith("{");
   if (raw.length > maxScanChars) {
@@ -464,6 +469,27 @@ function inspectExplicitTextToolEnvelope(
         retryable: true,
       },
     } : { calls: [] };
+  }
+  if (xmlMarker.test(unquoted)) {
+    const blocks = [...raw.matchAll(/<(tool_call|function_call|tool_use|tool_code)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/gi)];
+    const residue = raw.replace(/<(tool_call|function_call|tool_use|tool_code)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi, "");
+    const unquotedResidue = residue.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, "");
+    if (!blocks.length || xmlMarker.test(unquotedResidue)) return {
+      calls: [],
+      diagnostic: { code: "explicit_tool_envelope_incomplete", message: "Unconsumed tool markup is not a final answer. Use native calls or one complete runtime-v2-tools JSON envelope.", retryable: true },
+    };
+    const calls: RuntimeV2NormalizedToolCall[] = [];
+    for (const block of blocks) {
+      let blockContent = block[2].trim();
+      const codeFence = blockContent.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+      if (codeFence) {
+        blockContent = codeFence[1].trim();
+      }
+      const parsed = inspectExplicitTextToolEnvelope(`<runtime-v2-tools>${blockContent}</runtime-v2-tools>`);
+      if (!parsed.calls.length || parsed.diagnostic?.retryable) return parsed;
+      calls.push(...parsed.calls.map((call) => ({ ...call, id: `xml-tool-${calls.length + 1}-${call.id}` })));
+    }
+    return { calls };
   }
   const compatibilityCalls =
     parseExplicitCompatibilityTokenToolCalls(raw);
@@ -507,7 +533,6 @@ function inspectExplicitTextToolEnvelope(
   const hasMarker = /<\/?runtime-v2-tools>/.test(raw);
   const fenced = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   const exactJson = raw.startsWith("{");
-  if (matches.length === 0 && !fenced && !exactJson) return { calls: [] };
   if (hasMarker && matches.length === 0) {
     return {
       calls: [],
@@ -518,7 +543,12 @@ function inspectExplicitTextToolEnvelope(
       },
     };
   }
-  const explicitJson = matches[0]?.[1] ?? fenced?.[1] ?? raw;
+  if (matches.length === 0 && !fenced && !exactJson) return { calls: [] };
+  let explicitJson = (matches[0]?.[1] ?? fenced?.[1] ?? raw).trim();
+  const innerFenced = explicitJson.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (innerFenced) {
+    explicitJson = innerFenced[1].trim();
+  }
   let parsed: unknown;
   let repair: ReturnType<typeof repairExplicitJsonSyntax> | null = null;
   try {
@@ -548,6 +578,18 @@ function inspectExplicitTextToolEnvelope(
       };
     }
   }
+  if (Array.isArray(parsed)) {
+    const calls = normalizeToolCalls(parsed);
+    if (calls.length > 0) return { calls };
+    return {
+      calls: [],
+      diagnostic: {
+        code: "explicit_tool_envelope_invalid_calls",
+        message: "Explicit tool envelope contains incomplete or invalid calls; no action from this batch was executed.",
+        retryable: true,
+      },
+    };
+  }
   const record = asRecord(parsed);
   if (!record) {
     return {
@@ -560,15 +602,19 @@ function inspectExplicitTextToolEnvelope(
     };
   }
   const rawCalls = record.toolCalls ?? record.tool_calls;
+  const hasCallShape = rawCalls !== undefined ||
+    ((record.name || record.function) && (record.arguments !== undefined || asRecord(record.function)?.arguments !== undefined));
+  if (!hasMarker && !hasCallShape) return { calls: [] };
   const calls = Array.isArray(rawCalls)
     ? normalizeToolCalls(rawCalls)
     : record.name || record.function
       ? normalizeToolCalls([record])
       : [];
-  const diagnostic = calls.length === 0
+  const incompleteBatch = Array.isArray(rawCalls) && calls.length !== rawCalls.length;
+  const diagnostic = calls.length === 0 || incompleteBatch
     ? {
         code: "explicit_tool_envelope_invalid_calls",
-        message: "Explicit tool envelope contains no valid tool call.",
+        message: "Explicit tool envelope contains incomplete or invalid calls; no action from this batch was executed.",
         retryable: true,
       }
     : repair
@@ -578,7 +624,7 @@ function inspectExplicitTextToolEnvelope(
           retryable: false,
         }
       : undefined;
-  return { calls, ...(diagnostic ? { diagnostic } : {}) };
+  return { calls: incompleteBatch ? [] : calls, ...(diagnostic ? { diagnostic } : {}) };
 }
 
 /**
@@ -594,7 +640,10 @@ export function parseExplicitTextToolEnvelope(value: unknown): RuntimeV2Normaliz
 export function normalizeProviderResponseV1(input: ProviderWireResponse): RuntimeV2NormalizedProviderResult {
   const presentationText = input.visibleText ?? input.content;
   const visibleText = normalizeString(presentationText, 32_000);
-  const nativeToolCalls = normalizeToolCalls(input.toolCalls ?? input.tool_calls);
+  const rawNativeCalls = input.toolCalls ?? input.tool_calls;
+  const nativeToolCalls = normalizeToolCalls(rawNativeCalls);
+  const invalidNativeCalls = rawNativeCalls != null &&
+    (!Array.isArray(rawNativeCalls) || rawNativeCalls.length !== nativeToolCalls.length);
   const requiredJson = nativeToolCalls.length > 0
     ? { calls: [] }
     : inspectRequiredSingleToolJson(
@@ -622,6 +671,7 @@ export function normalizeProviderResponseV1(input: ProviderWireResponse): Runtim
       : selectedEnvelope.calls;
   const diagnostics = [
     ...normalizeDiagnostics(input.diagnostics),
+    ...(invalidNativeCalls ? [{ code: "native_tool_calls_invalid", message: "Native tool calls were incomplete or invalid; no action from this batch was executed. Resubmit complete calls.", retryable: true }] : []),
     ...(requiredJson.diagnostic
       ? [requiredJson.diagnostic]
       : selectedEnvelope.diagnostic
@@ -629,7 +679,7 @@ export function normalizeProviderResponseV1(input: ProviderWireResponse): Runtim
         : []),
   ];
   const result: RuntimeV2NormalizedProviderResult = {
-    toolCalls,
+    toolCalls: invalidNativeCalls ? [] : toolCalls,
     diagnostics,
     ...(visibleText && requiredJson.calls.length === 0
       ? { visibleText }

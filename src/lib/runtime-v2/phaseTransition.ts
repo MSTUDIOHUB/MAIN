@@ -4,6 +4,7 @@ import type {
   RuntimeV2Command,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 import { analyzeValidationCommand } from "../validationContract";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
@@ -230,9 +231,9 @@ function validationAuthorityWasAdmitted(
     );
 }
 
-export function runtimeV2DirectExecuteReadyForConclusion(
+function currentDirectExecuteValidationPasses(
   state: TurnAggregateV1,
-): boolean {
+): Extract<RuntimeV2Event, { type: "validation.completed" }>[] {
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
   const latestMutationSequence = state.events.reduce(
     (latest, event) =>
@@ -251,9 +252,9 @@ export function runtimeV2DirectExecuteReadyForConclusion(
         : latest,
     -1,
   );
-  if (latestMutationSequence < 0) return false;
+  if (latestMutationSequence < 0) return [];
   const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
-  if (criterionIds.length === 0 || mutationTargets.length === 0) return false;
+  if (criterionIds.length === 0 || mutationTargets.length === 0) return [];
   const expectedDigest = runtimeV2DirectExecuteAuthorityDigest({
     turnId: state.turn.turnId,
     objective: state.objective,
@@ -289,7 +290,7 @@ export function runtimeV2DirectExecuteReadyForConclusion(
         validatedMutationVersions: event.validatedMutationVersions,
       });
   });
-  if (validPasses.length === 0) return false;
+  if (validPasses.length === 0) return [];
   const latestPassSequence = Math.max(
     ...validPasses.map((event) => event.sequence),
   );
@@ -298,8 +299,20 @@ export function runtimeV2DirectExecuteReadyForConclusion(
       event.sequence > latestPassSequence && !event.passed
     )
   ) {
-    return false;
+    return [];
   }
+  return validPasses;
+}
+
+export function runtimeV2DirectExecuteContractCoverage(state: TurnAggregateV1) {
+  return deriveRuntimeV2ExecutionContractCoverage(state, currentDirectExecuteValidationPasses(state));
+}
+
+export function runtimeV2DirectExecuteReadyForConclusion(state: TurnAggregateV1): boolean {
+  const validPasses = currentDirectExecuteValidationPasses(state);
+  if (!validPasses.length) return false;
+  const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
   const requirements = state.objective.acceptanceEvidenceRequirements || [];
   const allCriteriaCovered = criterionIds.every((criterionId, index) =>
     validPasses.some((event) =>
@@ -314,7 +327,8 @@ export function runtimeV2DirectExecuteReadyForConclusion(
       )
     )
   );
-  return allCriteriaCovered && allMutationTargetsCovered;
+  return allCriteriaCovered && allMutationTargetsCovered &&
+    deriveRuntimeV2ExecutionContractCoverage(state, validPasses).complete;
 }
 
 function validationFailureFingerprint(

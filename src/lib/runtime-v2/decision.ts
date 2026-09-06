@@ -3,6 +3,7 @@ export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow
 import type { TurnAggregateV1 } from "./aggregate";
 import { deriveReadOnlyRecoveryWindow, readOnlyConclusionRequired } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
+import { runtimeV2ProviderAnswerText } from "./providerAnswer";
 import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
@@ -338,8 +339,7 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
         (event.result.toolCalls.length === 0 || failedToolDecision) &&
         (
           executableProgressRequired ||
-          event.result.diagnostics.length > 0 ||
-          !String(event.result.visibleText || "").trim()
+          !runtimeV2ProviderAnswerText(state, event)
         );
       if (!nonActionable) break;
       occurrence += 1;

@@ -65,9 +65,15 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 
 Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：无本地来源的对话始终为 Chat；工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
 
-只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次累计，第一次无进展要求指出信息缺口，第二次切换 `mode=conclude, conclusionKind=read_only` 并清空工具。历史 `iteration_limit` 仅推动该策略切换；生产不再按固定轮数发出它。总结请求仍未产生完整回答时为 `error`，不能把工具证据投影为生命周期 `partial`。
+只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次累计，第一次无进展要求指出信息缺口，第二次切换 `mode=conclude, conclusionKind=read_only` 并清空工具。历史 `iteration_limit` 仅推动该策略切换；生产不再按固定轮数发出它。总结请求未产生完整回答时保留协议诊断和历史，继续在同一恢复租约内修正；租约耗尽仍无回答时为 `error`，不能把工具证据投影为生命周期 `partial`。搜索结果只提供待核对来源：第一批新候选打开取证分支，持续改写查询不能代替读取来源并无限续租；实际新来源回执重新打开该分支。
 
-Chat/analyze 的模型上下文在预算内保留原有对话和当前完整 assistant/tool 对。只有实际超出输入预算（含系统指令和工具 schema）才先移除重复工具组，再移除最早完整历史 Turn；单份超大回执最后以明确缺失标记缩短，保留配对。Execute/validate 继续原有 decision view。只读 `tool.completed.modelContent` 保存模型实际收到的有界回执；恢复从事件重建同一条 transcript 和 evidence ordinal，不能仅恢复 receipt 元数据后继续丢失工具结果。
+Chat/analyze 的 canonical ledger 保留原有对话和当前完整 assistant/tool 对。出站视图中，相同 Web 回执正文用指向当前请求内首份正文的 `receiptReplayOf` 引用替代，仍保留每个调用与结果的配对；每次裁剪后重新建立引用，不能指向已删除的正文。只有实际超出输入预算（含系统指令和工具 schema）才移除重复工具组，再移除最早完整历史 Turn；单份超大回执最后以明确缺失标记缩短，保留配对。Execute/validate 继续原有 decision view。只读 `tool.completed.modelContent` 保存模型实际收到的有界回执；恢复从事件重建同一条 transcript 和 evidence ordinal，不能仅恢复 receipt 元数据后继续丢失工具结果。
+
+完成候选由 Chat/analyze 与 Execute 共用的 `providerAnswer.ts` 检查：只接受当前 Run 最新已结算响应，不能跨过更新的模型失败、工具/验证结果或子任务交接复用旧报告；有未完成动作、协议诊断、残缺调用或原样重复的工具过程说明时不能成功。展示清洗之前规范化显式动作信封；不支持或残缺的标记保留为可恢复诊断，不能只留下正文后伪造最终回答。此门控检查协议与来源，不以关键词、字数或第二个模型冒充答案质量证明。
+
+直接 Execute 的已记录执行契约由 core 唯一解析和回放；工具声明与接纳仍由 Store adapter 负责。完成门控除了原有的最终修改边界、验收 authority、版本和证据类型校验，还要求覆盖契约中全部非 preserve 目标，以及最终修改之后的每项声明验证。有限命令必须匹配实际已执行的契约命令，下一次验证优先选择尚未覆盖的项。没有契约的历史/简单 Execute 继续遵守原有 typed 或 unclassified 验收规则，不从自然语言猜测行为类别。
+
+Web 工具的代理 HTTP 成功不能证明源站成功：Jina fallback 保留原始失败、代理状态和可观察源站状态；源站状态不能确认时正文仅作未核实上下文，不产生成功来源证据或续租。Bing 解析使用结果标题链接并解包真实目标 URL；历史跟踪 URL 也按真实目标比较版本。外部搜索结果的语义相关性仍需模型核对，Runtime 不使用语言、站点正文关键词或金融问题特判。
 
 终态投影是可恢复事务：`run.completed` 保存精确 final projection，随后提交 `projection.published` 和 `turn.completed`。只读恢复补齐缺失步骤，已有步骤按 projection ID 重放，不追加第二个终态或最终消息。
 

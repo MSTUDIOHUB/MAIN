@@ -67,6 +67,243 @@ const baseRun = {
   attemptId: "attempt-a",
 };
 
+test("display sanitization cannot turn an unexecuted XML action into a final answer", () => {
+  const { sanitizeAssistantDisplayContent } = loadTs(path.join(workspaceRoot, "src/lib/sanitize.ts"));
+  for (const tag of ["tool_call", "function_call"]) {
+    const content = `Let me fetch the source.\n<${tag}>{"name":"web_fetch","arguments":{"url":"https://example.com"}}</${tag}>`;
+    const normalized = runtime.normalizeProviderResponseV1({ content, visibleText: sanitizeAssistantDisplayContent(content) });
+    assert.equal(normalized.toolCalls[0]?.name, "web_fetch");
+  }
+  for (const content of [
+    'Let me fetch it.\n<tool_call>{"name":"web_fetch",',
+    'Let me fetch it.\n<tool_use><tool>web_fetch</tool></tool_use>',
+    'Let me fetch it.\n<runtime-v2-tools>{',
+  ]) {
+    const normalized = runtime.normalizeProviderResponseV1({ content, visibleText: sanitizeAssistantDisplayContent(content) });
+    assert.ok(normalized.diagnostics.some((item) => item.retryable), content);
+  }
+  assert.equal(runtime.normalizeProviderResponseV1({ content: 'Example:\n```xml\n<tool_call>{"name":"web_fetch","arguments":{}}</tool_call>\n```' }).toolCalls.length, 0);
+});
+
+test("invalid native calls cannot silently leave a successful prose response", () => {
+  const result = runtime.normalizeProviderResponseV1({ visibleText: "I will read the file.", toolCalls: [{ id: "broken", function: { name: "read_file", arguments: '{"path":' } }] });
+  assert.ok(result.diagnostics.some((item) => item.retryable));
+});
+
+test("ordinary JSON answers are not tool attempts and partial explicit batches stay unexecuted", () => {
+  for (const content of ['{"name":"Alice","age":30}', '{"ok":true}', '```json\n{"count":2}\n```']) {
+    const result = runtime.normalizeProviderResponseV1({ content });
+    assert.deepEqual(result.diagnostics, []);
+    assert.equal(result.visibleText, content);
+  }
+  const result = runtime.normalizeProviderResponseV1({ content: '<runtime-v2-tools>{"toolCalls":[{"name":"web_fetch","arguments":{"url":"https://example.com"}},{"name":"web_fetch","arguments":"broken"}]}</runtime-v2-tools>' });
+  assert.deepEqual(result.toolCalls, []);
+  assert.ok(result.diagnostics.some((item) => item.retryable));
+});
+
+test("completion only accepts the latest settled report from the current Run", () => {
+  let state = aggregateWithValidation("npm test");
+  state = providerResult(state, { visibleText: "The change and its test are complete.", toolCalls: [], diagnostics: [] });
+  assert.equal(runtime.latestRuntimeV2ProviderConclusionText(state), "The change and its test are complete.");
+  state = providerResult(state, { visibleText: "", toolCalls: [], diagnostics: [{ code: "output_truncated", message: "cut off", retryable: true }] });
+  assert.equal(runtime.latestRuntimeV2ProviderConclusionText(state), "", "a newer failed report invalidates the old report");
+});
+
+test("provider normalization accepts tool_call blocks with markdown code fences inside", () => {
+  const normalized = runtime.normalizeProviderResponseV1({
+    content: [
+      "<tool_call>",
+      "```json",
+      '{"name": "web_fetch", "arguments": {"url": "https://example.com"}}',
+      "```",
+      "</tool_call>",
+    ].join("\n"),
+  });
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "web_fetch");
+  assert.deepEqual(normalized.toolCalls[0].arguments, { url: "https://example.com" });
+  assert.deepEqual(normalized.diagnostics, []);
+});
+
+test("provider answer accepts visibleText in conclude mode by stripping residue tool markup", () => {
+  let state = aggregateWithValidation("npm test");
+  const command = runtime.decideNextCommands(state)[0];
+  state = schedule(state, command);
+  const residueEvent = event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: command.idempotencyKey,
+    result: {
+      visibleText: "汇添富上证科创板芯片ETF联接C净值总结：最新净值为1.2345元。<tool_call>\n```json\n{}\n```\n</tool_call>",
+      toolCalls: [],
+      diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "invalid", retryable: true }],
+    },
+  });
+  const answer = runtime.runtimeV2ProviderAnswerText(state, residueEvent, true);
+  assert.equal(answer, "汇添富上证科创板芯片ETF联接C净值总结：最新净值为1.2345元。");
+});
+
+test("rememberRuntimeV2ProviderResult avoids injecting tool syntax feedback when tools are closed", () => {
+  const { rememberRuntimeV2ProviderResult } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderHistory.ts"));
+  const { createRuntimeV2LiveExecutionState } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionTypes.ts"));
+  const ports = {
+    live: createRuntimeV2LiveExecutionState(),
+    get: () => ({}),
+    context: { runtimeRunIntent: "respond" },
+    nextId: (scope) => `${scope}-1`,
+    now: () => 100,
+    logStoreEvent: () => {},
+  };
+
+  const resultWithDiagnostic = {
+    visibleText: "总结内容<tool_call>\n```json\n{}\n```\n</tool_call>",
+    toolCalls: [],
+    diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "Unconsumed tool markup is not a final answer.", retryable: true }],
+  };
+
+  // When mode is conclude, no feedback message is appended to live.messages, and cleaned text is saved
+  rememberRuntimeV2ProviderResult(ports, resultWithDiagnostic, { payload: { mode: "conclude" } });
+  assert.equal(ports.live.messages.length, 1);
+  assert.equal(ports.live.messages[0].role, "assistant");
+  assert.equal(ports.live.messages[0].content, "总结内容");
+  assert.equal(ports.live.latestVisibleText, "总结内容");
+  assert.ok(!ports.live.messages.some((m) => m.content.includes("runtime-v2 provider feedback")));
+
+  // When model wraps analysis inside tool_call with intro text, the inner analysis is salvaged
+  const salvagePorts = {
+    live: createRuntimeV2LiveExecutionState(),
+    get: () => ({}),
+    context: { runtimeRunIntent: "respond" },
+    nextId: (scope) => `${scope}-1`,
+    now: () => 100,
+    logStoreEvent: () => {},
+  };
+  const resultWithAnalysisInTag = {
+    visibleText: "分析总结：\n<tool_call>\n1. 行业基本面改善。\n2. 资金面趋向积极。\n</tool_call>",
+    toolCalls: [],
+    diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "invalid", retryable: true }],
+  };
+  rememberRuntimeV2ProviderResult(salvagePorts, resultWithAnalysisInTag, { payload: { mode: "conclude" } });
+  assert.equal(salvagePorts.live.messages.length, 1);
+  assert.equal(salvagePorts.live.messages[0].content, "分析总结：\n\n1. 行业基本面改善。\n2. 资金面趋向积极。");
+  assert.equal(salvagePorts.live.latestVisibleText, "分析总结：\n\n1. 行业基本面改善。\n2. 资金面趋向积极。");
+
+  // When mode is open (e.g. execute with tools), feedback IS appended
+  const openPorts = {
+    live: createRuntimeV2LiveExecutionState(),
+    get: () => ({}),
+    context: { runtimeRunIntent: "respond" },
+    nextId: (scope) => `${scope}-1`,
+    now: () => 100,
+    logStoreEvent: () => {},
+  };
+  rememberRuntimeV2ProviderResult(openPorts, resultWithDiagnostic, { payload: { mode: "execute", allowedToolNames: ["web_search"] } }, [{ function: { name: "web_search" } }]);
+  assert.ok(openPorts.live.messages.some((m) => m.content.includes("runtime-v2 provider feedback")));
+  assert.equal(openPorts.live.latestVisibleText, "");
+});
+
+test("stripResidueToolMarkup preserves markdown code blocks and inline code while stripping residue tags", () => {
+  const input = [
+    "Here is how to call a tool:",
+    "```xml",
+    "<tool_call>",
+    '{"name": "web_search", "arguments": {"query": "fund"}}',
+    "</tool_call>",
+    "```",
+    "You can also use `<tool_call>` directly.",
+    "<tool_call>",
+    '{"name": "unwanted_trailing_call"',
+  ].join("\n");
+  const cleaned = runtime.stripResidueToolMarkup(input);
+  assert.ok(cleaned.includes("```xml\n<tool_call>\n"), "code block preserved");
+  assert.ok(cleaned.includes("`<tool_call>`"), "inline code preserved");
+  assert.ok(!cleaned.includes("unwanted_trailing_call"), "trailing unclosed call stripped");
+});
+
+test("stripResidueToolMarkup does not wipe text following a stray closing tag", () => {
+  const input = "汇添富基金最新净值总结如下。</tool_call>投资有风险，入市需谨慎。";
+  const cleaned = runtime.stripResidueToolMarkup(input);
+  assert.equal(cleaned, "汇添富基金最新净值总结如下。投资有风险，入市需谨慎。");
+});
+
+test("stripResidueToolMarkup salvages non-JSON analysis text inside tool tags in concludeMode", () => {
+  const analysis = "结合相关的利好利空新闻分析未来走向：\n1. 利好因素：政策支持，资金流入。\n2. 利空因素：估值偏高，海外波动。";
+  for (const tag of ["tool_call", "function_call", "tool_use", "tool_code", "runtime-v2-tools"]) {
+    const input = `<${tag}>\n${analysis}\n</${tag}>`;
+    const cleaned = runtime.stripResidueToolMarkup(input, { concludeMode: true });
+    assert.equal(cleaned, analysis);
+  }
+
+  // Without concludeMode, it is completely erased
+  const erased = runtime.stripResidueToolMarkup(`<tool_call>\n${analysis}\n</tool_call>`);
+  assert.equal(erased, "");
+
+  // With concludeMode, valid JSON tool call is still erased
+  const jsonCall = '<tool_call>{"name": "web_search", "arguments": {"query": "fund"}}</tool_call>';
+  const jsonCleaned = runtime.stripResidueToolMarkup(jsonCall, { concludeMode: true });
+  assert.equal(jsonCleaned, "");
+
+  // With concludeMode, nested tool tags around JSON are still erased
+  const nestedJsonCall = '<tool_call><tool_code>{"name": "web_search", "arguments": {"query": "fund"}}</tool_code></tool_call>';
+  assert.equal(runtime.stripResidueToolMarkup(nestedJsonCall, { concludeMode: true }), "");
+
+  // Mixed intro/outro text with tool_call analysis is salvaged completely
+  const mixedInput = '市场走势总结：\n<tool_call>\n1. 芯片板块持续走强。\n2. 周期板块震荡整理。\n</tool_call>\n以上为最新分析。';
+  const mixedCleaned = runtime.stripResidueToolMarkup(mixedInput, { concludeMode: true });
+  assert.equal(mixedCleaned, '市场走势总结：\n\n1. 芯片板块持续走强。\n2. 周期板块震荡整理。\n\n以上为最新分析。');
+});
+
+test("provider answer accepts visibleText wrapped in tool tags in conclude mode when JSON parsing fails", () => {
+  let state = aggregateWithValidation("npm test");
+  const command = runtime.decideNextCommands(state)[0];
+  state = schedule(state, command);
+  const residueEvent = event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: command.idempotencyKey,
+    result: {
+      visibleText: "<tool_call>\n结合相关的利好利空新闻分析未来走向：\n1. 利好因素：经济复苏。\n2. 利空因素：通胀压力。\n</tool_call>",
+      toolCalls: [],
+      diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "invalid", retryable: true }],
+    },
+  });
+  const answer = runtime.runtimeV2ProviderAnswerText(state, residueEvent, true);
+  assert.equal(answer, "结合相关的利好利空新闻分析未来走向：\n1. 利好因素：经济复苏。\n2. 利空因素：通胀压力。");
+});
+
+test("provider normalization accepts tool_use, tool_code, and JSON array tool calls", () => {
+  const toolUse = runtime.normalizeProviderResponseV1({
+    content: '<tool_use>{"name": "web_search", "arguments": {"query": "020629"}}</tool_use>',
+  });
+  assert.equal(toolUse.toolCalls.length, 1);
+  assert.equal(toolUse.toolCalls[0].name, "web_search");
+  assert.deepEqual(toolUse.toolCalls[0].arguments, { query: "020629" });
+  assert.deepEqual(toolUse.diagnostics, []);
+
+  const arrayCalls = runtime.normalizeProviderResponseV1({
+    content: '<tool_call>[{"name": "web_search", "arguments": {"query": "020629"}}]</tool_call>',
+  });
+  assert.equal(arrayCalls.toolCalls.length, 1);
+  assert.equal(arrayCalls.toolCalls[0].name, "web_search");
+  assert.deepEqual(arrayCalls.toolCalls[0].arguments, { query: "020629" });
+  assert.deepEqual(arrayCalls.diagnostics, []);
+});
+
+test("deriveRuntimeV2ProviderRecoveryWindow treats conclude responses with residue diagnostics as actionable", () => {
+  let state = aggregateWithValidation("npm test");
+  const command = commandFor(state, "request_model", "conclude-req", { mode: "conclude", conclusionKind: "read_only" });
+  state = schedule(state, command);
+  state = runtime.transition(state, event(state, "provider.responded", {
+    run: baseRun,
+    idempotencyKey: command.idempotencyKey,
+    result: {
+      visibleText: "净值分析已完成。<tool_call>broken</tool_call>",
+      toolCalls: [],
+      diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "invalid", retryable: true }],
+    },
+  }));
+  const recovery = runtime.deriveRuntimeV2ProviderRecoveryWindow(state);
+  assert.equal(recovery, null, "a valid conclude answer with residue diagnostic settles the recovery pressure");
+});
+
 test("native automatic transport omits the optional tool_choice field", () => {
   const attempt = runtime.selectNextProviderTransportAttempt({
     schemaVersion: "provider-lane.v1",
@@ -704,11 +941,17 @@ function aggregateWithValidation(
   command,
   passed = true,
   acceptanceEvidenceRequirements = ["behavioral"],
+  contract,
 ) {
   let state = executeAggregate(
     "acting",
     acceptanceEvidenceRequirements,
   );
+  if (contract) {
+    const record = commandFor(state, "execute_tool", "contract", { toolCallId: "contract-call", toolName: "record_execution_contract", arguments: contract });
+    state = schedule(state, record);
+    state = runtime.transition(state, event(state, "tool.completed", { run: baseRun, idempotencyKey: record.idempotencyKey, status: "succeeded", evidence: [] }));
+  }
   const mutation = commandFor(state, "execute_tool", "mutation", {
     toolCallId: "mutation-call",
     toolName: "apply_patch",
@@ -798,6 +1041,40 @@ test("a durable unclassified direct Execute criterion accepts a finite static ch
 test("a final-boundary behavioral validation can satisfy the runtime-owned scope", () => {
   const state = aggregateWithValidation("npm test");
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+});
+
+test("direct Execute completion covers every contracted target and validation", () => {
+  const contract = {
+    summary: "Repair two owners and verify both checks", root_causes: ["Missing integration"],
+    changes: [{ operation: "modify", targets: ["src/main.js", "src/toolbar.js"], change: "repair", expected_outcome: "both work" }],
+    validations: [{ kind: "finite_command", command: "npm test", expected_outcome: "behavior passes" }, { kind: "finite_command", command: "npm run build", expected_outcome: "build passes" }],
+  };
+  const missingTarget = aggregateWithValidation("npm test", true, ["behavioral"], contract);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(missingTarget), false, "an unmodified contracted owner remains outstanding");
+  const missingCheck = aggregateWithValidation("npm test", true, ["behavioral"], { ...contract, changes: [{ ...contract.changes[0], targets: ["src/main.js"] }] });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(missingCheck), false, "a declared build cannot be silently skipped");
+  const complete = aggregateWithValidation("npm test", true, ["behavioral"], { ...contract, changes: [{ ...contract.changes[0], targets: ["src/main.js"] }], validations: [contract.validations[0]] });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(complete), true);
+  let bothChecks = providerResult(missingCheck, { toolCalls: [{ id: "remaining-build", name: "run_command", arguments: { command: "npm run build" } }] });
+  bothChecks = executePendingTool(bothChecks, { type: "validation.completed", passed: true, evidence: [{ id: "build-evidence", kind: "validation", target: "npm run build", version: "passed" }], presentation: { toolName: "run_command", target: "npm run build" } });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(bothChecks), true, "all declared checks may conclude");
+  bothChecks = providerResult(bothChecks, { toolCalls: [{ id: "later-edit", name: "apply_patch", arguments: { patch: "fixture" } }] });
+  bothChecks = executePendingTool(bothChecks, { type: "tool.completed", status: "succeeded", evidence: [{ id: "newer-edit", kind: "mutation", target: "src/main.js", version: "v3" }] });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(bothChecks), false, "a later edit invalidates both earlier checks");
+  let failedCheck = providerResult(missingCheck, { toolCalls: [{ id: "test-now-fails", name: "run_command", arguments: { command: "npm test" } }] });
+  failedCheck = executePendingTool(failedCheck, { type: "validation.completed", passed: false, failureKind: "assertion_failed", evidence: [{ id: "regressed-test", kind: "validation", target: "npm test", version: "failed" }], presentation: { toolName: "run_command", target: "npm test" } });
+  failedCheck = providerResult(failedCheck, { toolCalls: [{ id: "other-check-passes", name: "run_command", arguments: { command: "npm run build" } }] });
+  failedCheck = executePendingTool(failedCheck, { type: "validation.completed", passed: true, evidence: [{ id: "other-build", kind: "validation", target: "npm run build", version: "passed" }], presentation: { toolName: "run_command", target: "npm run build" } });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(failedCheck), false, "passing a different check cannot revive an older pass for a now-failing obligation");
+});
+
+test("replayed tool commentary in Execute conclusion remains under the recovery lease", () => {
+  let state = aggregateWithValidation("npm test");
+  state = providerResult(state, { visibleText: "I will verify the result.", toolCalls: [{ id: "check-again", name: "run_command", arguments: { command: "npm test" } }] });
+  state = executePendingTool(state, { type: "validation.completed", passed: true, evidence: [{ id: "check-again-evidence", kind: "validation", target: "npm test", version: "passed" }], presentation: { toolName: "run_command", target: "npm test" } });
+  state = providerResult(state, { visibleText: "I will verify the result." });
+  assert.equal(runtime.latestRuntimeV2ProviderConclusionText(state), "");
+  assert.equal(runtime.deriveRuntimeV2ProviderRecoveryWindow(state)?.pressure.occurrence, 1);
 });
 
 test("a provider cannot omit direct Execute criteria or mutation targets", () => {

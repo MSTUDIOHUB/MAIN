@@ -3497,7 +3497,7 @@ for (const model of models) {
     }
   });
 
-  test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }) => {
+  test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }, testInfo) => {
     test.skip(!runDirectEditRecovery || realOmlxFixture !== "csv");
     const workspace = (page as any).__realOmlxWorkspace as string;
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
@@ -3535,6 +3535,9 @@ for (const model of models) {
     );
     await expect(finalAssistantMessage).toBeVisible();
     const finalAssistantText = String(await finalAssistantMessage.textContent() || "").trim();
+    const completionArtifact = testInfo.outputPath("direct-execute-completion.json");
+    await fs.writeFile(completionArtifact, JSON.stringify({ runtimeV2: terminalSnapshot?.runtimeV2, finalAssistantText, currentTurnStatus: terminalSnapshot?.currentTurnStatus, agentStatus: terminalSnapshot?.agentStatus, isGenerating: terminalSnapshot?.isGenerating }, null, 2));
+    await testInfo.attach("direct-execute-completion.json", { path: completionArtifact, contentType: "application/json" });
     expect(finalAssistantText.length).toBeGreaterThan(0);
     expect(finalAssistantText).not.toContain("agent_loop_completed");
     expect((terminalSnapshot?.taskFlowPreview || []).some((block: { turnId?: string; type?: string; visibility?: string; content?: string }) =>
@@ -4648,6 +4651,7 @@ for (const model of models) {
     expect(searches.every((event: any) => event.command.payload.arguments.provider === "bing")).toBe(true);
     expect(web.aggregate.events.some((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "web_fetch" && event.status === "succeeded")).toBe(true);
     expect(web.finals[0]).toMatch(/developer\.mozilla\.org/);
+    expect(web.finals[0]).toMatch(/detach|分离|byteLength|无法.{0,12}(?:访问|使用)|不可.{0,8}(?:访问|使用)/i);
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
     await send("本轮我们讨论一个虚构项目，代号是青岚 742。请记住这个代号并简短回复。无需联网。");
     const ordinary = await send("刚才提到的虚构项目代号是什么？只回答代号。无需联网。");

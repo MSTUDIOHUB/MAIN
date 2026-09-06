@@ -7,6 +7,7 @@ import {
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanExecutionFrontier,
   deriveRuntimeV2PlanSourceFreshness,
+  runtimeV2DirectExecuteContractCoverage,
   type ProviderLaneProfileV1,
 } from "../../lib/runtime-v2";
 import {
@@ -136,8 +137,9 @@ export function preferredFiniteValidationCommand(
   const contract = deriveRuntimeV2ExecutionContract(
     aggregate,
   );
-  const contractedValidation = contract?.validations.find((validation) =>
-    validation.kind === "finite_command" &&
+  const missing = aggregate ? runtimeV2DirectExecuteContractCoverage(aggregate).missingValidationIndexes : [];
+  const contractedValidation = contract?.validations.find((validation, index) =>
+    missing.includes(index) && validation.kind === "finite_command" &&
     String(validation.command || "").trim()
   );
   return String(contractedValidation?.command || "").trim();

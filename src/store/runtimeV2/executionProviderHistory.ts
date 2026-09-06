@@ -23,6 +23,7 @@ import type {
   RuntimeV2ExecutionPortsInput,
   RuntimeV2LiveExecutionState,
 } from "./executionTypes";
+import { stripResidueToolMarkup } from "../../lib/runtime-v2/providerAnswer";
 export { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
 
 export function appendRuntimeV2AssistantTextHistory(
@@ -81,8 +82,38 @@ export function appendRuntimeV2AssistantToolCallHistory(
 export function rememberRuntimeV2ProviderResult(
   ports: RuntimeV2ExecutionPortsInput,
   result: RuntimeV2NormalizedProviderResult,
+  command?: { payload?: { mode?: string; conclusionKind?: string; allowedToolNames?: readonly string[] } } | null,
+  tools?: readonly unknown[] | null,
 ): void {
   ports.live.latestProviderResult = result;
+  const toolsClosed =
+    command?.payload?.mode === "conclude" ||
+    command?.payload?.conclusionKind === "read_only" ||
+    (tools !== undefined && tools !== null && tools.length === 0) ||
+    (Array.isArray(command?.payload?.allowedToolNames) && command.payload.allowedToolNames.length === 0);
+  if (!result.toolCalls.length && result.diagnostics.length) {
+    if (toolsClosed) {
+      const cleaned = stripResidueToolMarkup(result.visibleText || "", { concludeMode: true });
+      const sanitized = sanitizeAssistantDisplayContent(cleaned)
+        .trim()
+        .slice(0, 24_000);
+      ports.live.latestVisibleText = sanitized;
+      if (sanitized) {
+        appendRuntimeV2AssistantTextHistory(ports.live, sanitized);
+      }
+      return;
+    }
+    ports.live.latestVisibleText = "";
+    // Admission rejections already appended the exact rejected action and
+    // corrective feedback. Do not replace that with its diagnostic identity.
+    const feedback = result.diagnostics.filter((item) => item.code !== "repeated_action_rejected");
+    if (feedback.length) appendRuntimeV2ProviderFeedbackHistory(ports.live, {
+      visibleText: result.visibleText,
+      code: feedback.map((item) => item.code).join(","),
+      feedback: feedback.map((item) => item.message).join("\n"),
+    });
+    return;
+  }
   ports.live.latestVisibleText = result.toolCalls.length === 0
     ? sanitizeAssistantDisplayContent(result.visibleText || "")
       .trim()

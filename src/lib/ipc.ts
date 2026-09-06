@@ -986,6 +986,12 @@ export interface WebFetchResponse {
   charCount: number;
   truncated: boolean;
   source: string;
+  retrieval?: {
+    usable: boolean;
+    directError: string;
+    readerStatus: number;
+    originStatus?: number;
+  };
 }
 
 // endregion

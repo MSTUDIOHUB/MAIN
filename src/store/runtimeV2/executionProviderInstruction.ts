@@ -251,10 +251,11 @@ export function providerModeInstruction(
         ].join(" ")
     : "";
   if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
-    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. State information gaps explicitly; never invent facts or claim that unavailable checks succeeded.";
+    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. Deliver the answer itself, not a promise of future work or a replay of tool commentary. Address the user's requested points, distinguishing supported findings from information gaps; never invent facts or claim that unavailable checks succeeded.";
     return [
       mode === "chat" ? "Answer the user using the supplied conversation. Only exposed Skill and Web context reads are available." : "Analyze the admitted sources with read-only authority.",
       command.payload.recoveryPressure ? "The last decision added no new evidence. Read again only for a concrete remaining information gap using a materially different source or reading method; otherwise answer now." : "Use a focused read only when a concrete fact is missing, then return a complete Markdown answer.",
+      "Search hits are discovery leads: check their subject, date and source before using them. Rewording searches alone does not establish source progress. Unrelated results, error pages and retrieval.usable=false receipts do not resolve an information gap. Fetch a relevant direct source or state what could not be verified.",
       mode === "analyze" ? collaborationGuidance : "",
     ].filter(Boolean).join(" ");
   }

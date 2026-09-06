@@ -3901,7 +3901,8 @@ function command(phase) {
   };
 }
 
-test("an empty Execute provider surface quarantines a wire tool call without proving its transport", async () => {
+for (const wireFormat of ["native", "xml"]) {
+test(`an empty Execute provider surface quarantines a ${wireFormat} tool call without proving its transport`, async () => {
   const live = executionTypes.createRuntimeV2LiveExecutionState();
   live.providerLaneProfile = {
     schemaVersion: "provider-lane.v1",
@@ -3942,14 +3943,14 @@ test("an empty Execute provider surface quarantines a wire tool call without pro
     });
     return runtime.normalizeProviderResponseV1({
       visibleText: "I will inspect the source.",
-      tool_calls: [{
+      ...(wireFormat === "xml" ? { content: 'I will inspect the source.\n<tool_call>{"name":"read_file","arguments":{"path":"src/main.js"}}</tool_call>' } : { tool_calls: [{
         id: "wire-hidden-read",
         type: "function",
         function: {
           name: "read_file",
           arguments: JSON.stringify({ path: "src/main.js" }),
         },
-      }],
+      }] }),
     });
   };
 
@@ -4015,6 +4016,7 @@ test("an empty Execute provider surface quarantines a wire tool call without pro
     }
   }
 });
+}
 
 test("Observe, Act, and Validate share one safe inspect-edit-verify surface", () => {
   const available = [
@@ -10279,3 +10281,176 @@ test("ordinary child text matches exact evidence ids at citation delimiters", ()
     ["child:review-1:E1"],
   );
 });
+
+test("requestRuntimeV2ProviderOnce appends prompt frontier conclude instruction when mode is conclude", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  let capturedMessages = [];
+  streaming.streamChatCompletion = async (messages) => {
+    capturedMessages = messages;
+    return {
+      content: "Final markdown answer.",
+      semanticContent: "Final markdown answer.",
+      visibleText: "Final markdown answer.",
+      finishReason: "stop",
+      toolCalls: [],
+      reasoning: null,
+      usage: null,
+      diagnostics: [],
+    };
+  };
+
+  try {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    live.messages = [
+      { role: "system", content: "[MAIN RUNTIME V2] instructions" },
+      { role: "user", content: "What is the analysis?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "File content here" },
+    ];
+    const command = {
+      kind: "request_model",
+      phase: "finalizing",
+      run: { turnId: "t1", runId: "r1" },
+      payload: { mode: "conclude", conclusionKind: "read_only" },
+    };
+    const ports = {
+      get: () => ({
+        agentMessages: [],
+        conversationTurns: [],
+        config: {
+          activeProfile: "local",
+          local: {
+            endpoint: "http://localhost:11434",
+            apiKey: "",
+            model: "test-model",
+            contextLimit: 32000,
+            provider: "ollama",
+            toolProtocol: "native",
+          },
+        },
+      }),
+      context: {
+        turnId: "t1",
+        runtimeContextBudget: null,
+        runWorkspace: "/fixture",
+        phaseLanguage: "en",
+      },
+      live,
+      logStoreEvent: () => {},
+    };
+
+    try {
+      await providerRequest.requestRuntimeV2ProviderOnce({
+        live,
+        ports,
+        command,
+        tools: [],
+        textEnvelope: false,
+        toolChoice: null,
+        signal: new AbortController().signal,
+      });
+    } catch (err) {
+      throw new Error("CAUGHT: " + (err && err.stack ? err.stack : String(err)));
+    }
+
+    const lastMsg = capturedMessages[capturedMessages.length - 1];
+    assert.equal(lastMsg.role, "user");
+    assert.equal(
+      lastMsg.content,
+      "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags."
+    );
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+  }
+});
+
+test("requestRuntimeV2ProviderOnce in conclude mode with context budget preserves user conversation and appends frontier conclude instruction", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  let capturedMessages = [];
+  streaming.streamChatCompletion = async (messages) => {
+    capturedMessages = messages;
+    return {
+      content: "Final markdown answer.",
+      semanticContent: "Final markdown answer.",
+      visibleText: "Final markdown answer.",
+      finishReason: "stop",
+      toolCalls: [],
+      reasoning: null,
+      usage: null,
+      diagnostics: [],
+    };
+  };
+
+  try {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    live.messages = [
+      { role: "system", content: "[MAIN RUNTIME V2] instructions" },
+      { role: "user", content: "Old question from turn 1" },
+      { role: "assistant", content: "Old answer from turn 1" },
+      { role: "user", content: "What is the analysis for fund 020629?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "Receipt data ".repeat(150) },
+    ];
+    const command = {
+      kind: "request_model",
+      phase: "finalizing",
+      run: { turnId: "t1", runId: "r1" },
+      payload: { mode: "conclude", conclusionKind: "read_only" },
+    };
+    const ports = {
+      get: () => ({
+        agentMessages: [],
+        conversationTurns: [],
+        config: {
+          activeProfile: "local",
+          local: {
+            endpoint: "http://localhost:11434",
+            apiKey: "",
+            model: "test-model",
+            contextLimit: 32000,
+            provider: "ollama",
+            toolProtocol: "native",
+          },
+        },
+      }),
+      context: {
+        turnId: "t1",
+        runtimeContextBudget: {
+          contextLimit: 16000,
+          maxOutputTokens: 2000,
+        },
+        runWorkspace: "/fixture",
+        phaseLanguage: "en",
+      },
+      live,
+      logStoreEvent: () => {},
+    };
+
+    await providerRequest.requestRuntimeV2ProviderOnce({
+      live,
+      ports,
+      command,
+      tools: [],
+      textEnvelope: false,
+      toolChoice: null,
+      signal: new AbortController().signal,
+    });
+
+    // The user's original query MUST NOT have been evicted by the conclude instruction!
+    const userQueries = capturedMessages.filter((msg) => msg.role === "user" && msg.content.includes("020629"));
+    assert.equal(userQueries.length, 1, "original user query must remain in context");
+
+    // The last message must be the prompt frontier conclude instruction
+    const lastMsg = capturedMessages[capturedMessages.length - 1];
+    assert.equal(lastMsg.role, "user");
+    assert.equal(
+      lastMsg.content,
+      "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags."
+    );
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+  }
+});
+

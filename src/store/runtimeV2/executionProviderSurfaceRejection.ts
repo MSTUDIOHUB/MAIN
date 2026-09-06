@@ -73,7 +73,7 @@ function rejectedProviderResult(input: {
       },
     ],
   };
-  rememberRuntimeV2ProviderResult(input.ports, rejectedResult);
+  rememberRuntimeV2ProviderResult(input.ports, rejectedResult, input.command);
   input.ports.logStoreEvent("runtime_v2_provider_action_rejected", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,

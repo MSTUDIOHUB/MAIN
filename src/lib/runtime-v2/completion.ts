@@ -1,6 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2ResultKind } from "./contracts";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { latestRuntimeV2Answer } from "./providerAnswer";
 
 /** Facts supplied by a store adapter after it has inspected actual tool and
  * validation receipts. Provider wording is intentionally reduced to a
@@ -28,33 +29,7 @@ export interface RuntimeV2CompletionDecision {
 export function latestRuntimeV2ProviderConclusionText(
   aggregate: TurnAggregateV1,
 ): string {
-  const scheduledModes = new Map<string, string>();
-  for (const event of aggregate.events) {
-    if (
-      event.type === "command.scheduled" &&
-      event.command.kind === "request_model"
-    ) {
-      scheduledModes.set(
-        event.command.idempotencyKey,
-        String(event.command.payload.mode || "").trim(),
-      );
-    }
-  }
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index]!;
-    if (event.type !== "provider.responded") continue;
-    const mode = scheduledModes.get(event.idempotencyKey) || "";
-    if (
-      mode !== "conclude" ||
-      event.result.toolCalls.length > 0 ||
-      event.result.diagnostics.length > 0
-    ) {
-      continue;
-    }
-    const text = String(event.result.visibleText || "").trim();
-    if (text) return text.slice(0, 24_000);
-  }
-  return "";
+  return latestRuntimeV2Answer(aggregate, true).slice(0, 24_000);
 }
 
 export function exhaustedRuntimeV2ResultKind(

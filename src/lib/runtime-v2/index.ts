@@ -15,6 +15,7 @@ export * from "./phaseTransition";
 export * from "./planExecution";
 export * from "./ports";
 export * from "./projection";
+export * from "./providerAnswer";
 export * from "./providerLane";
 export * from "./recovery";
 export * from "./reducer";

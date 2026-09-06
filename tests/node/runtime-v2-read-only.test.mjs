@@ -163,6 +163,22 @@ test("search version ignores query spelling, result order and tracking URLs but 
   assert.notEqual(progress.readOnlyEvidenceVersion("web_fetch", { final_url: "https://example.com", content: "fact", truncated: true }), progress.readOnlyEvidenceVersion("web_fetch", { final_url: "https://example.com", content: "fact", truncated: false }));
 });
 
+test("Bing tracking identity and unverified reader pages cannot mint fresh source versions", () => {
+  const target = "https://example.com/source";
+  const encoded = Buffer.from(target).toString("base64url");
+  assert.equal(progress.normalizedEvidenceUrl(`https://www.bing.com/ck/a?p=first&u=a1${encoded}&ntb=1`), target);
+  assert.equal(progress.readOnlyEvidenceVersion("web_search", resultData("one", "fact", target)), progress.readOnlyEvidenceVersion("web_search", resultData("two", "fact", `https://www.bing.com/ck/a?p=other&u=a1${encoded}`)));
+  const unavailable = { url: target, content: "An error page body", retrieval: { usable: false, readerStatus: 200, originStatus: 404, directError: "HTTP 404" } };
+  assert.deepEqual(progress.webEvidenceVersions("web_fetch", unavailable), []);
+});
+
+test("search discovery without reading a source cannot indefinitely renew semantic progress", async () => {
+  const h = harness([call("s1", "first"), call("s2", "different"), call("s3", "another"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query, "different snippet", `https://example.com/${command.payload.arguments.query}`)) });
+  await runLoop(h);
+  assert.equal(h.requests.at(-1).payload.conclusionKind, "read_only");
+  assert.equal(h.requests.at(-1).payload.recoveryPressure.occurrence, 2);
+});
+
 test("two settled non-novel batches close tools and produce a real answer", async () => {
   const h = harness([call("s1", "one"), call("s2", "two"), call("s3", "three"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query)) });
   const result = await runLoop(h);
@@ -176,7 +192,8 @@ test("two settled non-novel batches close tools and produce a real answer", asyn
 });
 
 test("replayed successes with empty evidence do not clear pressure; new evidence does", async () => {
-  const h = harness([call("s1", "one"), call("s2", "replay"), call("s3", "new"), call("s4", "repeat"), answer], { toolExecute: ({ command }) => receipt(command, resultData("ignored", ["s3", "s4"].includes(command.payload.toolCallId) ? "new fact" : "same fact"), command.payload.toolCallId === "s2" ? { receiptOrigin: "replayed", evidence: [] } : {}) });
+  const fetch = (id) => ({ visibleText: "", diagnostics: [], toolCalls: [{ id, name: "web_fetch", arguments: { url: "https://example.com/source" } }] });
+  const h = harness([call("s1", "one"), call("s2", "replay"), fetch("s3"), fetch("s4"), answer], { toolExecute: ({ command }) => receipt(command, command.payload.toolName === "web_fetch" ? { url: "https://example.com/source", content: "new source fact" } : resultData("ignored"), command.payload.toolCallId === "s2" ? { receiptOrigin: "replayed", evidence: [] } : {}) });
   await runLoop(h);
   assert.equal(h.requests[2].payload.recoveryPressure.occurrence, 1);
   assert.equal(h.requests[3].payload.recoveryPressure, undefined);
@@ -214,24 +231,63 @@ test("recovery lease exhaustion without an answer is error even with evidence", 
   assert.match(result.reason, /恢复租约/);
 });
 
-test("an empty or truncated conclusion is an error, never a successful placeholder", async () => {
+test("an empty or truncated conclusion recovers before a truthful final answer", async () => {
   for (const final of [{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "unfinished", toolCalls: [], diagnostics: [{ code: "output_truncated", message: "length", retryable: false }] }]) {
-    const h = harness([{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "", toolCalls: [], diagnostics: [] }, final]);
-    assert.equal((await runLoop(h)).resultKind, "error");
+    const h = harness([{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "", toolCalls: [], diagnostics: [] }, final, answer]);
+    assert.equal((await runLoop(h)).resultKind, "success");
+    assert.equal(h.requests.length, 4);
     assert.equal(h.requests.at(-1).payload.mode, "conclude");
   }
   assert.equal(requestPolicy.runtimeV2ProviderOutputWasTruncated({ finishReason: "length", toolCallCount: 0, availableToolCount: 0 }), true);
 });
 
-test("history keeps all distinct evidence while affordable and compresses atomic pairs only under pressure", () => {
+test("consecutive empty conclude attempts hit retry cap and stop spinning without waiting 10 minutes", async () => {
+  const emptyConclude = { visibleText: "", toolCalls: [], diagnostics: [] };
+  const h = harness([
+    emptyConclude,
+    emptyConclude,
+    emptyConclude,
+    emptyConclude,
+    emptyConclude,
+    emptyConclude,
+  ]);
+  const result = await runLoop(h);
+  assert.equal(result.resultKind, "error");
+  assert.match(result.reason, /最大重试次数/);
+  // Total requests: 2 chat + 3 conclude attempts = 5 requests total (not 59)
+  assert.equal(h.requests.length, 5);
+  assert.equal(h.requests[2].payload.mode, "conclude");
+  assert.equal(h.requests[3].payload.mode, "conclude");
+  assert.equal(h.requests[4].payload.mode, "conclude");
+});
+
+test("the incident's repeated action commentary cannot finish Chat", async () => {
+  const commentary = "让我尝试从东方财富网获取科创板芯片指数的数据。";
+  const h = harness([{ ...call("s1", "source"), visibleText: commentary }, { ...answer, visibleText: commentary }, answer], { toolExecute: ({ command }) => receipt(command, resultData("source")) });
+  const result = await runLoop(h);
+  assert.equal(h.requests.length, 3);
+  assert.equal(result.aggregate.events.find((event) => event.type === "projection.published" && event.projection.kind === "final").projection.markdown, answer.visibleText);
+  assert.equal(h.requests[2].payload.recoveryPressure.occurrence, 1);
+});
+
+test("history preserves distinct evidence and tool pairs but references duplicate Web bodies even under budget", () => {
   const pair = (id, content) => [{ role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "web_fetch", arguments: "{}" } }] }, { role: "tool", tool_call_id: id, content }];
   const messages = [{ role: "system", content: "instructions" }, { role: "user", content: "old question" }, { role: "assistant", content: "old answer" }, { role: "user", content: "current question" }, ...pair("one", "A ".repeat(1000)), ...pair("two", "B ".repeat(1000)), ...pair("again", "A ".repeat(1000))];
-  assert.deepEqual(history.boundReadOnlyHistory(messages, { contextLimit: 100_000, reservedOutputTokens: 4_000 }), messages);
+  const affordable = history.boundReadOnlyHistory(messages, { contextLimit: 100_000, reservedOutputTokens: 4_000 });
+  assert.equal(affordable.length, messages.length);
+  assert.equal(affordable.find((item) => item.tool_call_id === "one").content, "A ".repeat(1000));
+  assert.equal(affordable.find((item) => item.tool_call_id === "two").content, "B ".repeat(1000));
+  assert.equal(JSON.parse(affordable.find((item) => item.tool_call_id === "again").content).receiptReplayOf, "one");
+  assert.equal(messages.at(-1).content, "A ".repeat(1000), "canonical history remains lossless");
   const bounded = history.boundReadOnlyHistory(messages, { contextLimit: 1500, reservedOutputTokens: 300 });
   assert.ok(token.estimateMessagesTokens(bounded) <= 1200);
   for (const item of bounded.filter((item) => item.role === "tool")) assert.ok(bounded.some((candidate) => candidate.tool_calls?.some((call) => call.id === item.tool_call_id)));
   for (const item of bounded.filter((item) => item.tool_calls?.length)) for (const call of item.tool_calls) assert.ok(bounded.some((candidate) => candidate.tool_call_id === call.id));
   assert.ok(bounded.some((item) => item.content === "current question"));
+  for (const item of bounded.filter((item) => item.role === "tool" && String(item.content).includes('"receiptReplayOf"'))) {
+    const original = bounded.find((candidate) => candidate.tool_call_id === JSON.parse(item.content).receiptReplayOf);
+    assert.ok(original && !original.content.includes('"receiptReplayOf"'), "replay references always point to a retained original body");
+  }
 });
 
 test("cold restore reconstructs exact tool pairs and evidence ordinals from the ledger", async () => {

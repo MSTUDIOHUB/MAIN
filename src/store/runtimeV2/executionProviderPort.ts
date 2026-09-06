@@ -387,7 +387,7 @@ export function createRuntimeV2ProviderPort(
                 },
               ],
             };
-            rememberRuntimeV2ProviderResult(input, result);
+            rememberRuntimeV2ProviderResult(input, result, command, tools);
             input.logStoreEvent("runtime_v2_provider_action_rejected", {
               turnId: command.run.turnId,
               runId: command.run.runId,
@@ -447,7 +447,7 @@ export function createRuntimeV2ProviderPort(
             if (!covered?.receipt) return;
             input.live.coveredReadToolResults.set(call.id, covered.receipt);
           });
-          rememberRuntimeV2ProviderResult(input, result);
+          rememberRuntimeV2ProviderResult(input, result, command, tools);
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,
