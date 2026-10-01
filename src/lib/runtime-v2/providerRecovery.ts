@@ -3,6 +3,9 @@ export interface RuntimeV2ProviderRecoveryPressure {
   readonly reason:
     | "repeated_action_rejected"
     | "empty_response"
+    | "non_actionable_response"
+    | "provider_response_rejected"
+    | "tool_execution_failed"
     | "provider_request_failed"
     | "non_novel_evidence";
   readonly occurrence: number;
@@ -14,4 +17,3 @@ export interface RuntimeV2ProviderRecoveryWindow {
   /** Time of the first uninterrupted non-actionable provider decision. */
   readonly startedAt: number;
 }
-

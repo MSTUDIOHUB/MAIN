@@ -1,4 +1,5 @@
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import type { SubmitSessionPersistence } from "../persistSubmitRuntimeProjection";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -18,10 +19,7 @@ export interface RuntimeV2PlanRunnerInput {
     sessionId: number | string | null | undefined;
     expectedRevisionToken: unknown;
   }) => { published: boolean; disposition: string };
-  readonly persistSessionRecord: (
-    scopeKey: string,
-    session: unknown,
-  ) => Promise<unknown>;
+  readonly persistSessionRecord: SubmitSessionPersistence;
   readonly logStoreEvent: (
     event: string,
     data?: Record<string, unknown>,

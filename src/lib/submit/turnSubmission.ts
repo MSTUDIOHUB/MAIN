@@ -940,7 +940,6 @@ export interface SubmitEffectiveIntentDecision {
   effectiveRunIntent: ResolvedRunIntent;
   effectiveIntentSummary: string;
   effectiveCommandDirective: CommandDirective | null;
-  shouldForceExecuteForAutoApprove: boolean;
 }
 
 export type SubmitPreflightResultDecisionKind =
@@ -1415,8 +1414,6 @@ export function resolveSubmitEffectiveIntentDecision(
     text,
     preferredLanguage,
     options,
-    isHidden,
-    autoApproveTools,
     fallbackRunIntent,
     mainDebugShortcut,
     mainIntentShortcut,
@@ -1450,16 +1447,6 @@ export function resolveSubmitEffectiveIntentDecision(
   }
   let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
   let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
-  const shouldForceExecuteForAutoApprove =
-    !isHidden &&
-    autoApproveTools === true &&
-    !mainDebugShortcut &&
-    !lockedComposerIntent &&
-    !shouldContinuePlanIntent &&
-    !shouldContinuePreviousTurnIntent &&
-    !shouldReuseExistingTurnIntent &&
-    !options?.skipIntentResolution &&
-    !options?.resolvedIntent;
 
   if (
     shouldExecuteOnceFromReplyOption &&
@@ -1480,20 +1467,6 @@ export function resolveSubmitEffectiveIntentDecision(
     });
   }
 
-  if (shouldForceExecuteForAutoApprove) {
-    effectiveRunIntent = "execute";
-    effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
-      source: "natural_language",
-    });
-    effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
-      input: text,
-      intent: effectiveRunIntent,
-      language: preferredLanguage,
-      reason: preferredLanguage === "en"
-        ? "Auto-approval is enabled, so this turn uses execution semantics instead of natural chat."
-        : "自动审批已开启，本轮按执行语义处理，而不是普通聊天。",
-    });
-  }
 
   if (mainDebugShortcut && !effectiveIntentSummary) {
     effectiveIntentSummary = "MDEBUG：用户反馈自修复";
@@ -1546,7 +1519,6 @@ export function resolveSubmitEffectiveIntentDecision(
     effectiveRunIntent,
     effectiveIntentSummary,
     effectiveCommandDirective,
-    shouldForceExecuteForAutoApprove,
   };
 }
 

@@ -131,11 +131,25 @@ export class RuntimeV2Controller {
           }
         : {}),
     }));
+    return this.startRun(
+      input.run,
+      input.initialPhase || (input.strategy === "plan" ? "planning" : "preparing"),
+    );
+  }
+
+  /** Complete an admitted Turn's Run boundary after an interrupted admission.
+   * This is the same primitive used by fresh admission; it grants no effect
+   * authority and cannot create a second Run for an active aggregate. */
+  async startRun(
+    run: RuntimeV2RunIdentity,
+    phase: NonNullable<RuntimeV2Admission["initialPhase"]> = "preparing",
+  ): Promise<TurnAggregateV1> {
+    if (this.requireAggregate().run) throw new Error("Runtime v2 Run is already started.");
     return this.apply(asEvent({
       ...this.eventBase(),
       type: "run.started",
-      run: input.run,
-      phase: input.initialPhase || (input.strategy === "plan" ? "planning" : "preparing"),
+      run,
+      phase,
     }));
   }
 

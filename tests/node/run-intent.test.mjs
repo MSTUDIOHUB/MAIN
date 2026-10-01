@@ -556,7 +556,7 @@ test("unity console diagnostic cue ignores explicit no-error phrasing", () => {
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("检查一下Unity console的报错"), true);
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("Unity 里没有报错，但蛇没有移动"), false);
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("no compile error, only runtime behavior issue"), false);
-  assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").action, "unity_workflow");
+  assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").kind, "none");
 });
 
 test("complex multi-file generation asks for user choice before planning or execution", () => {
@@ -896,7 +896,7 @@ test("store asks before executing when preflight upgrades natural chat to operat
   assert.match(turnSubmissionSource, /decisionOptions: \["execute", "respond", "plan"\]/);
 });
 
-test("store forces auto-approved visible turns into execution semantics", () => {
+test("tool auto-approval grants action consent without deciding the requested intent", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
@@ -904,11 +904,8 @@ test("store forces auto-approved visible turns into execution semantics", () => 
   assert.match(source, /const intentRouting = resolveAndApplySubmitIntentRouting/);
   assert.match(submitIntentRoutingSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);
-  assert.match(submitIntentRoutingSource, /const shouldForceExecuteForAutoApprove =\s*initialIntentDecision\.shouldForceExecuteForAutoApprove/);
-  assert.match(turnSubmissionSource, /const shouldForceExecuteForAutoApprove =/);
-  assert.match(turnSubmissionSource, /autoApproveTools === true/);
-  assert.match(turnSubmissionSource, /effectiveRunIntent = "execute"/);
-  assert.match(submitIntentRoutingSource, /!shouldForceExecuteForAutoApprove &&\s*!input\.options\?\.skipIntentResolution/);
+  assert.doesNotMatch(submitIntentRoutingSource, /shouldForceExecuteForAutoApprove/);
+  assert.doesNotMatch(turnSubmissionSource, /shouldForceExecuteForAutoApprove/);
   assert.match(source, /const runtimeDecision = resolveSubmitRuntimeDecision/);
   assert.match(source, /shouldExecuteOnceFromReplyOption,\s*preservePlanState,/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);

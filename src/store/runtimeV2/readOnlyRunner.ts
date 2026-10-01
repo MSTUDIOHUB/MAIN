@@ -1,4 +1,5 @@
 import { normalizeNetworkRead } from "../../lib/networkRead";
+import type { SubmitSessionPersistence } from "../persistSubmitRuntimeProjection";
 import { buildLoadSkillToolDefinition } from "../../lib/agentSkills";
 import { runRuntimeV2ReadOnlyLoop } from "../../lib/runtime-v2/readOnly";
 import type { RuntimeV2Ports } from "../../lib/runtime-v2/ports";
@@ -42,7 +43,7 @@ export interface RuntimeV2ReadOnlyRunnerInput {
     sessionId: number | string | null | undefined;
     expectedRevisionToken: unknown;
   }) => { published: boolean; disposition: string };
-  readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
+  readonly persistSessionRecord: SubmitSessionPersistence;
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
   readonly now?: () => number;
   readonly deadlineMs?: number;

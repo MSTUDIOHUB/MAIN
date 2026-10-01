@@ -49,7 +49,11 @@ export interface SubmissionRuntimeStorePorts {
     sessionKey: string;
     source: "workflow_fallback";
   }) => void;
-  persistSessionRecord: (workspace: string, session: unknown) => Promise<unknown>;
+  persistSessionRecord: (
+    workspace: string,
+    session: unknown,
+    options?: import("./projectSessionMutationCoordinator").ProjectSessionSaveOptions,
+  ) => Promise<unknown>;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 

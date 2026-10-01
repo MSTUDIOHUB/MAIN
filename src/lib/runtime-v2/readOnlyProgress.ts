@@ -55,8 +55,10 @@ export function readOnlyEvidenceVersion(toolName: string, output: unknown): stri
   return versions ? runtimeV2EvidenceVersion(versions) : null;
 }
 
-export function latestReadOnlyAnswer(state: TurnAggregateV1): string {
-  return latestRuntimeV2Answer(state);
+export function latestReadOnlyAnswer(state: TurnAggregateV1, input: {
+  readonly allowPendingChildJoin?: boolean;
+} = {}): string {
+  return latestRuntimeV2Answer(state, false, input);
 }
 
 /** Count settled provider batches, never individual calls in a parallel batch.
@@ -164,10 +166,4 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
     else fail(settledAt, event.result.toolCalls.length ? "non_novel_evidence" : event.result.diagnostics.some((item) => item.code === "repeated_action_rejected") ? "repeated_action_rejected" : "empty_response");
   }
   return occurrence ? { startedAt, pressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason, occurrence, stage: occurrence >= 2 ? "reframe" : "reconsider" } } : null;
-}
-
-export function readOnlyConclusionRequired(state: TurnAggregateV1): boolean {
-  return (deriveReadOnlyRecoveryWindow(state)?.pressure.occurrence || 0) >= 2 ||
-    state.scheduledCommands.some((cmd) => cmd.payload.conclusionKind === "read_only") ||
-    state.events.some((event) => event.type === "soft_signal.observed" && event.signal === "iteration_limit");
 }

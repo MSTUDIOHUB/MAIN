@@ -38,7 +38,7 @@ export interface IntentTitleCandidate {
 
 export interface IntentTitleParseResult {
   metadata: IntentTitleCandidate | null;
-  source: "json" | "loose_key_value" | "first_line" | "reasoning_json" | "reasoning_loose_key_value" | "reasoning_first_line" | "none";
+  source: "json" | "loose_key_value" | "first_line" | "reasoning_json" | "none";
   failureReason?: string;
 }
 
@@ -108,34 +108,21 @@ export function isSemanticTurnMetadataCallbackCurrent(
 
 function stripJsonFence(text: string): string {
   const trimmed = String(text || "").trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/i);
   return fenced?.[1]?.trim() || trimmed;
-}
-
-function extractJsonObject(text: string): string | null {
-  const cleaned = stripJsonFence(text);
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    return cleaned.slice(start, end + 1);
-  }
-  return null;
 }
 
 function cleanTitleModelText(text: string): string {
   return String(text || "")
-    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/<\/?(?:analysis|thought|thinking|reasoning|think)(?:\s[^>]*)?>/gi, " ")
-    .replace(/```[\s\S]*?```/g, (match) => stripJsonFence(match))
+    // An interrupted thinking block is still hidden, even without its closing tag.
+    .replace(/<(think|analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?(?:<\/\1\s*>|$)/gi, " ")
+    .replace(/<\/(?:analysis|thought|thinking|reasoning|think)\s*>/gi, " ")
     .trim();
 }
 
 function parseTitleJson(text: string): IntentTitleCandidate | null {
-  const jsonText = extractJsonObject(text);
-  if (!jsonText) return null;
   try {
-    const parsed = JSON.parse(jsonText);
+    const parsed = JSON.parse(stripJsonFence(text));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
     const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
@@ -148,6 +135,11 @@ function parseTitleJson(text: string): IntentTitleCandidate | null {
 function parseLooseTitleText(text: string): { metadata: IntentTitleCandidate | null; source: "loose_key_value" | "first_line" | "none" } {
   const normalized = cleanTitleModelText(text);
   if (!normalized) return { metadata: null, source: "none" };
+  // A failed structured response is not a plain title. Do not salvage fragments
+  // from incomplete JSON, arrays, or fences through the permissive local fallback.
+  if (/(?:^|\n)\s*(?:[\[{]|```|["'“‘][^"'“”‘’\r\n]+["'”’]\s*:)/u.test(normalized)) {
+    return { metadata: null, source: "none" };
+  }
 
   const titleMatch = normalized.match(/(?:^|[\n,，])\s*(?:title|标题)\s*[:：=]\s*["“”']?([^\n,"“”'}]+)["“”']?/i);
   const summaryMatch = normalized.match(/(?:^|[\n,，])\s*(?:summary|摘要|总结)\s*[:：=]\s*["“”']?([^\n"“”'}]+)["“”']?/i);
@@ -170,22 +162,17 @@ export function parseIntentTitleCandidate(input: {
   const content = String(input.content || "").trim();
   const reasoning = String(input.reasoning || "").trim();
 
-  const json = parseTitleJson(content);
+  const visibleContent = cleanTitleModelText(content);
+  const json = parseTitleJson(visibleContent);
   if (json) return { metadata: json, source: "json" };
 
-  const loose = parseLooseTitleText(content);
+  const loose = parseLooseTitleText(visibleContent);
   if (loose.metadata) return { metadata: loose.metadata, source: loose.source };
 
+  // Some compatible servers place the complete JSON artifact in reasoning.
+  // Preserve that narrow compatibility path, never free-form hidden deliberation.
   const reasoningJson = parseTitleJson(reasoning);
   if (reasoningJson) return { metadata: reasoningJson, source: "reasoning_json" };
-
-  const reasoningLoose = parseLooseTitleText(reasoning);
-  if (reasoningLoose.metadata) {
-    return {
-      metadata: reasoningLoose.metadata,
-      source: reasoningLoose.source === "loose_key_value" ? "reasoning_loose_key_value" : "reasoning_first_line",
-    };
-  }
 
   return {
     metadata: null,

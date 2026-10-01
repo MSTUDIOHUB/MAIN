@@ -172,8 +172,14 @@ export function providerModeInstruction(
     Math.floor(Number(recoveryPressure?.occurrence) || 0),
   );
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const recoveringCompleteReply = recoveryPressure?.reason === "non_actionable_response";
   const recoveryGuidance = recoveryPressure
-    ? [
+    ? recoveringCompleteReply
+      ? [
+          `RECOVERY_PIVOT ${recoveryOccurrence}: the previous decision returned a complete no-tool reply, with no executable effect (${recoveryPressure.reason}).`,
+          "Continue from the actual reply and its adjacent Runtime feedback. Advance the user's currently authorized effect when supported by the evidence; if an essential decision or authority is missing, explain that exact gap and ask a focused clarification. Do not repeat the same reply or manufacture a workspace mutation.",
+        ].join(" ")
+      : [
         `RECOVERY_PIVOT ${recoveryOccurrence}: the previous provider decision produced no executable progress (${String(recoveryPressure.reason || "non_actionable_response")}).`,
         recoveryStage === "reconsider"
           ? "Re-read the latest structured failure feedback and submit an action whose normalized tool arguments are materially different from the closed action."
@@ -344,7 +350,7 @@ export function providerModeInstruction(
     executionContractAdvanceGuidance,
     validationCorrectionGuidance,
     actionWindowGuidance,
-    toolSurface.sourceOnlyFrontier
+    toolSurface.sourceOnlyFrontier && !recoveringCompleteReply
       ? toolSurface.actionWindow
         ? toolSurface.actionWindow === "corrective_source"
           ? "The next decision must materialize the one exact target named by the mutation-source failure."
@@ -361,7 +367,9 @@ export function providerModeInstruction(
           : "No versioned source evidence is committed yet. Read the exact existing file before changing it. Safe reads remain available after every edit and failed validation."
       : "",
     toolSurface.hasMutation
-      ? "Make the smallest coherent change that addresses all currently supported gaps, preserving unrelated behavior."
+      ? recoveringCompleteReply
+        ? "Source visibility is editing authority, not an obligation to write. Make a workspace change only when the user's current request authorizes that effect."
+        : "Make the smallest coherent change that addresses all currently supported gaps, preserving unrelated behavior."
       : "",
     editableSourceGuidance,
     toolSurface.validationCorrectionActive
@@ -370,7 +378,7 @@ export function providerModeInstruction(
     preferredValidationCommand
       ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
       : "",
-    "If work remains, choose one real structured tool action. A response without a tool call ends the Run and will be judged only by committed mutation and validation evidence; return prose only when you are done.",
+    "If an authorized effect remains, use a real structured tool action when the necessary evidence is available. A no-tool reply does not itself complete the Run or replace required mutation and validation evidence. If essential user input or authority is missing, state the exact unfinished work and needed clarification; never invent an effect to claim progress.",
     collaborationGuidance,
   ].filter(Boolean).join(" ");
 }

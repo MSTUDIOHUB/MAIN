@@ -55,6 +55,9 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitTitleEffects.ts"),
 );
+const { parseIntentTitleCandidate } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/intentTitlePolicy.ts"),
+);
 
 function createDecision(overrides = {}) {
   return {
@@ -196,6 +199,40 @@ test("submit semantic metadata effect ignores stale callback targets", async () 
   await completion;
   assert.equal(turnUpdates.length, 0);
   assert.equal(sessionUpdates.length, 0);
+});
+
+test("submit semantic metadata effect preserves the seed when title output is rejected", async () => {
+  for (const output of [
+    { content: '{"title":"查询 structuredClone transfer' },
+    { reasoning: "我们需要回答用户问题，再选择标题。" },
+  ]) {
+    const updates = [];
+    let snapshotReads = 0;
+    const completion = startSubmitSemanticMetadataEffect({
+      decision: createDecision(),
+      async requestSemanticTurnMetadata() {
+        return parseIntentTitleCandidate(output).metadata;
+      },
+      getLatestSnapshot: () => {
+        snapshotReads += 1;
+        return {
+          conversationTurns: [{ id: "turn-1", userPrompt: "修复标题同步" }],
+          sessionsByWorkspace: {
+            "workspace-a": [{ id: 7, title: "修复标题同步", titleSource: "local_seed" }],
+          },
+        };
+      },
+      updateConversationTurn: (turnId, patch) => updates.push({ turnId, patch }),
+      updateSession: (scopeKey, sessionId, patch) => updates.push({ scopeKey, sessionId, patch }),
+      logStoreEvent: () => {},
+      runSessionKey: "workspace-a:7",
+      runWorkspace: "/repo",
+    });
+
+    await completion;
+    assert.equal(snapshotReads, 0);
+    assert.deepEqual(updates, []);
+  }
 });
 
 test("submit semantic metadata effect keeps manual session titles while updating the turn", async () => {

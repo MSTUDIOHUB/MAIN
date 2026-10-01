@@ -1,4 +1,6 @@
 import { captureNetworkRead } from "../lib/networkRead";
+import { deriveStreamSettings } from "../lib/providerLaneSettings";
+import { buildOpenAiCompatibleReasoningRequestExtras } from "../lib/streaming";
 // store/useAppStore.ts
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
@@ -116,6 +118,7 @@ import {
   type TurnRuntimeCheckpointMap,
 } from "../lib/turnRuntimeCheckpoint";
 import {
+  commitRuntimeV2EmergencyTerminalEnvelope,
   normalizeRuntimeV2Checkpoint,
   normalizeRuntimeV2CheckpointMap,
   serializeRuntimeV2CheckpointMap,
@@ -123,7 +126,6 @@ import {
 } from "../lib/runtime-v2/checkpoint";
 import {
   normalizeRuntimeV2EmergencyTerminalEnvelopeMap,
-  sameRuntimeV2EmergencyTerminalRun,
   type RuntimeV2EmergencyTerminalEnvelopeMap,
 } from "../lib/runtime-v2/emergencyTerminal";
 import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
@@ -4187,13 +4189,11 @@ export function normalizeSessionRuntimeSnapshot(
     if (
       checkpoint &&
       (
-        checkpoint.revision !== envelope.lastRevision ||
         !!checkpoint.aggregate.terminalOutcome ||
-        !checkpoint.aggregate.run ||
-        !sameRuntimeV2EmergencyTerminalRun(
-          checkpoint.aggregate.run.identity,
-          envelope.run,
-        )
+        commitRuntimeV2EmergencyTerminalEnvelope({
+          checkpoint, currentEnvelope: null, owner: envelope.owner,
+          run: envelope.run, expectedRevision: envelope.lastRevision, envelope,
+        }).disposition === "conflict"
       )
     ) {
       continue;
@@ -8428,6 +8428,7 @@ export const useAppStore = create<AppState>()(
       sessionGet,
       sessionSet,
       getSessionRevisionToken,
+      hasSessionRuntimeOwnership,
       publishOwnerScopedRuntimeProjection,
     } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
       get,
@@ -8456,19 +8457,21 @@ export const useAppStore = create<AppState>()(
         nextTaskId: () => get()._nextTaskId(),
         sessionGet,
         getSessionRevisionToken,
-        persistProjection: (projectedState) => persistSubmitRuntimeProjection({
+        isCurrent: hasSessionRuntimeOwnership,
+        persistProjection: (projectedState, options) => persistSubmitRuntimeProjection({
           state: projectedState,
           scopeKey,
           sessionId: current.currentSessionId,
           sanitizeTaskBlocksForPersist,
           buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
           persistSessionRecord: saveProjectSession,
-          nowMs,
+          isCurrent: options?.isCurrent,
+          nowMs: Date.now,
         }),
         publishProjection: publishOwnerScopedRuntimeProjection,
         persistHarnessMarker: settleCanceledTurnHarnessProjection,
         log: logStoreEvent,
-        nowMs,
+        nowMs: Date.now,
       });
       const settledState = sessionGet();
       const hasExistingTerminal = settledState.runtimeEvents.some((event) =>
@@ -18392,7 +18395,8 @@ export const useAppStore = create<AppState>()(
         sanitizeTaskBlocksForPersist,
         buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
         persistSessionRecord: saveProjectSession,
-        nowMs,
+        isCurrent: hasSessionRuntimeOwnership,
+        nowMs: Date.now,
       }),
       PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
       PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
@@ -18867,7 +18871,13 @@ async function requestSemanticTurnMetadata(params: {
             }),
             ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-turn-metadata" } : {}),
           }
-        : { model, messages: msgs, stream: false, max_tokens: 120 };
+        : {
+            model, messages: msgs, stream: false, max_tokens: 120,
+            ...buildOpenAiCompatibleReasoningRequestExtras({
+              ...deriveStreamSettings(params.config),
+              reasoningRequest: "off",
+            }, 120),
+          };
       headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     }
 
@@ -18932,12 +18942,7 @@ async function requestSemanticTurnMetadata(params: {
           reasoningChars: rawReasoningText.length,
         });
       }
-      return normalizeSemanticTurnMetadata({}, {
-        input: params.input,
-        intent: params.intent,
-        language: params.language,
-        contextSignals: params.contextSignals,
-      });
+      return null;
     }
     return normalizeSemanticTurnMetadata(parsedMetadata, {
       input: params.input,

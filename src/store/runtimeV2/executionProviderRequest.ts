@@ -1,4 +1,5 @@
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import {
   deriveBudgetedStreamSettings,
   deriveProviderAdapterCapabilities,
@@ -17,6 +18,7 @@ import {
   type RuntimeV2ProviderRecoveryPressure,
 } from "../../lib/runtime-v2";
 import {
+  appendRuntimeV2ProviderFeedbackHistory,
   aggregateForCurrentTurn,
   compactTextEnvelopeCatalog,
   buildRuntimeV2DecisionView,
@@ -27,6 +29,7 @@ import {
   preferredFiniteValidationCommand,
   providerHistory,
   recordApprovedPlanContext,
+  restoreRuntimeV2ProviderRecoveryHistory,
   type RuntimeV2ExecutionPortsInput,
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
@@ -91,11 +94,12 @@ export async function requestRuntimeV2ProviderOnce(input: {
       : undefined;
   let streamedText = "";
   recordApprovedPlanContext(input.ports);
+  const aggregate = aggregateForCurrentTurn(input.ports);
+  restoreRuntimeV2ProviderRecoveryHistory(input.ports, aggregate, input.command);
   const history = providerHistory(input.live, input.ports);
   const sealedPreferredValidation = String(input.command.payload.mode || "") === "validate"
     ? preferredFiniteValidationCommand(input.ports)
     : "";
-  const aggregate = aggregateForCurrentTurn(input.ports);
   const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(aggregate);
   const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
   const executionContractAdvance =
@@ -173,10 +177,28 @@ export async function requestRuntimeV2ProviderOnce(input: {
     ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
   const forceStructuredAction = structuredActionRequired;
+  const latestFeedbackIndex = canonicalDecisionConversation.map((message) =>
+    message.role === "system" && typeof message.content === "string" &&
+    message.content.startsWith("[runtime-v2 provider feedback:")
+  ).lastIndexOf(true);
+  const feedbackDraft = canonicalDecisionConversation[latestFeedbackIndex - 1];
+  const preserveFeedbackPair = latestFeedbackIndex > 0 &&
+    feedbackDraft?.role === "assistant" && !feedbackDraft.tool_calls?.length;
   const boundedConversation = structuredActionRequired
-    ? runtimeV2EvidenceOnlyDecisionConversation(
-        canonicalDecisionConversation,
-      )
+    ? [
+        ...runtimeV2EvidenceOnlyDecisionConversation(
+          preserveFeedbackPair
+            ? canonicalDecisionConversation.filter((_, index) =>
+                index !== latestFeedbackIndex - 1 && index !== latestFeedbackIndex
+              )
+            : canonicalDecisionConversation,
+        ),
+        // Old executable action templates are omitted from forced decoding,
+        // but the latest failed no-tool draft and its feedback remain causal.
+        ...(preserveFeedbackPair
+          ? canonicalDecisionConversation.slice(latestFeedbackIndex - 1, latestFeedbackIndex + 1)
+          : []),
+      ]
     : canonicalDecisionConversation;
   const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
     requested: input.toolChoice,
@@ -460,27 +482,63 @@ export async function requestRuntimeV2ProviderOnce(input: {
             truncationKind: (result.reasoningContent?.length || 0) > 0
               ? "reasoning_without_action"
               : "visible_prose_without_action",
-            recovery: "provider_reasoning_toggle_off",
+            recovery: adapterCapabilities.reasoningToggle
+              ? "provider_reasoning_toggle_off"
+              : "bounded_structured_action_feedback",
         },
       );
+      const truncatedVisibleText = result.semanticContent || streamedText;
       streamedText = "";
-      const recoveryMessages = [
+      const recoveryRequiresAction = !toolsClosed &&
+        (structuredActionRequired || !readOnly);
+      const recoveryHistoryStart = input.live.messages.length;
+      appendRuntimeV2ProviderFeedbackHistory(input.live, {
+        visibleText: truncatedVisibleText,
+        code: "output_truncated",
+        feedback: recoveryRequiresAction
+          ? [
+              "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
+              "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
+            ].join(" ")
+          : [
+              "ANSWER_OUTPUT_BUDGET_EXHAUSTED: the previous attempt reached the output limit without a complete answer. Its draft is incomplete and is not an accepted conclusion.",
+              "Do not repeat the analysis or continue the unfinished draft. Return one complete concise answer from the available evidence, stating any uncertainty.",
+              toolsClosed
+                ? "No tools are available in this decision."
+                : "If a specific missing fact still requires verification, the currently advertised tools remain available.",
+            ].join(" "),
+      });
+      const unboundedRecoveryMessages = [
         ...messages,
-        {
-          role: "system" as const,
-          content: [
-            "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
-            "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
-          ].join(" "),
-        },
+        ...input.live.messages.slice(recoveryHistoryStart),
       ];
+      const recoveryMessages = budget
+        ? readOnly
+          ? boundReadOnlyHistory(unboundedRecoveryMessages, {
+              contextLimit: budget.contextLimit,
+              reservedOutputTokens: maxOutputTokens,
+              tools: providerTools,
+            })
+          : boundRuntimeMessagesToContext(unboundedRecoveryMessages, {
+              contextLimit: budget.contextLimit,
+              reservedOutputTokens: maxOutputTokens,
+            })
+        : unboundedRecoveryMessages;
+      input.live.latestProviderRequestSourceCoverage =
+        materializedRuntimeV2SourceCoverage(
+          recoveryMessages,
+          input.ports.context.runWorkspace || "",
+          providerEffectFacts,
+        );
       result = await streamChatCompletion(
         recoveryMessages,
-        {
-          ...requestSettings,
-          reasoningRequest: "off",
-          preserveAssistantReasoning: false,
-        },
+        adapterCapabilities.reasoningToggle
+          ? {
+              ...requestSettings,
+              reasoningRequest: "off",
+              preserveAssistantReasoning: false,
+            }
+          : requestSettings,
         {
           onToken: (token) => {
             lane.markFirstToken();
@@ -539,6 +597,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   });
   const providerReasoning = String(result.reasoningContent || "").trim();
   if (
+    !reasoningFallbackApplied &&
     requestSettings.preserveAssistantReasoning === true &&
     providerReasoning
   ) {

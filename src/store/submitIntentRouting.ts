@@ -84,7 +84,6 @@ export type SubmitIntentRoutingResult =
       effectiveRunIntent: ResolvedRunIntent;
       effectiveIntentSummary: string;
       effectiveCommandDirective: CommandDirective | null;
-      shouldForceExecuteForAutoApprove: boolean;
       goalCreationAuthorization: GoalCreationAuthorization | null;
     };
 
@@ -188,8 +187,6 @@ export function resolveAndApplySubmitIntentRouting<
   let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
   let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
-  const shouldForceExecuteForAutoApprove =
-    initialIntentDecision.shouldForceExecuteForAutoApprove;
 
   const normalizedPendingDecisionInputKey = normalizeSubmitPendingDecisionInputKey(input.text);
   const shouldSuppressSameInputDecision =
@@ -306,7 +303,6 @@ export function resolveAndApplySubmitIntentRouting<
     !input.shouldContinuePlanIntent &&
     !input.shouldContinuePreviousTurnIntent &&
     !input.shouldReuseExistingTurnIntent &&
-    !shouldForceExecuteForAutoApprove &&
     !input.options?.skipIntentResolution &&
     !input.options?.resolvedIntent
   ) {
@@ -464,7 +460,6 @@ export function resolveAndApplySubmitIntentRouting<
     effectiveRunIntent,
     effectiveIntentSummary,
     effectiveCommandDirective,
-    shouldForceExecuteForAutoApprove,
     goalCreationAuthorization: effectiveRunIntent === "goal"
       ? input.goalCreationAuthorization
       : null,

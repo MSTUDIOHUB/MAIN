@@ -27,6 +27,10 @@ submitAsyncWorkflowRun.ts
 - 旧 `AgentOrchestrator`、旧恢复辅助函数和 Rust `RuntimeLoop` 可以用于历史对照、Replay 或 Harness，但不能据文件名推断其仍拥有生产策略。
 - 文档、测试或 UI 声称某项能力前，必须能从上述入口追到实际调用点。仅存在导出函数不代表能力已经接线。
 
+工作区自然语言接纳由 `useAppStore` → `resolveAndApplySubmitIntentRouting` → `resolveTurnRunIntent` 决定当前请求，再进入上述统一 Turn 路径。工作区存在、自动审批开启、开发主题或未来产物都不独立构成执行意图；讨论、选择记录、设计评审和聊天内文稿可以正常回答并结束本 Turn，后续用户输入沿同一 Session 继续。具体当前写入、修改代码、shell 或 Editor 操作仍进入执行策略；审批只决定已请求动作的授权方式，不能把讨论升级为 mutation。参考 Codex 公开的 [Turn 生命周期](https://learn.chatgpt.com/docs/app-server) 和 [权限边界](https://learn.chatgpt.com/docs/agent-approvals-security)，这是 MAIN 的接纳合同，不声称复刻 Codex 私有路由算法。
+
+连续对话由 `executionProviderHistory.ts` 的共享生产提示消费同一份 canonical user/assistant 历史，不另建决策记忆。用户明确选择、接受或委托选择才可记录为已确认；模型建议和推断、用户明确待定项应保持独立状态，沉默不构成同意。后续修改替代旧决定，汇总与文档依据用户原文校正模型先前擅自确认的内容。该规则是模型行为契约，不增加 Runtime 审批或终态门控；真实语义质量必须单独核验，不能由 mock 或结构性 success 推定。
+
 ## 2. 最小内核
 
 Execute 只需要一个可重复的核心循环：
@@ -65,11 +69,11 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 
 Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：无本地来源的对话始终为 Chat；工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
 
-只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次累计，第一次无进展要求指出信息缺口，第二次切换 `mode=conclude, conclusionKind=read_only` 并清空工具。历史 `iteration_limit` 仅推动该策略切换；生产不再按固定轮数发出它。总结请求未产生完整回答时保留协议诊断和历史，继续在同一恢复租约内修正；租约耗尽仍无回答时为 `error`，不能把工具证据投影为生命周期 `partial`。搜索结果只提供待核对来源：第一批新候选打开取证分支，持续改写查询不能代替读取来源并无限续租；实际新来源回执重新打开该分支。
+只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次派生 `recoveryPressure`，指导指出信息缺口、重构查询或给出证据化回答；次数与历史 `iteration_limit` 不得切到强制总结或撤掉安全读取工具。回答未完成时保留正文与协议反馈，在同一恢复租约内修正，不按总结尝试次数终止；租约耗尽仍无回答时为 `error`，不能把工具证据投影为生命周期 `partial`。搜索结果只提供待核对来源：第一批新候选打开取证分支，持续改写查询不能代替读取来源并无限续租；实际新来源回执重新打开该分支。实际策略由 [readOnly.ts](../src/lib/runtime-v2/readOnly.ts)、[readOnlyProgress.ts](../src/lib/runtime-v2/readOnlyProgress.ts) 与 [decision.ts](../src/lib/runtime-v2/decision.ts) 共享。
 
 Chat/analyze 的 canonical ledger 保留原有对话和当前完整 assistant/tool 对。出站视图中，相同 Web 回执正文用指向当前请求内首份正文的 `receiptReplayOf` 引用替代，仍保留每个调用与结果的配对；每次裁剪后重新建立引用，不能指向已删除的正文。只有实际超出输入预算（含系统指令和工具 schema）才移除重复工具组，再移除最早完整历史 Turn；单份超大回执最后以明确缺失标记缩短，保留配对。Execute/validate 继续原有 decision view。只读 `tool.completed.modelContent` 保存模型实际收到的有界回执；恢复从事件重建同一条 transcript 和 evidence ordinal，不能仅恢复 receipt 元数据后继续丢失工具结果。
 
-完成候选由 Chat/analyze 与 Execute 共用的 `providerAnswer.ts` 检查：只接受当前 Run 最新已结算响应，不能跨过更新的模型失败、工具/验证结果或子任务交接复用旧报告；有未完成动作、协议诊断、残缺调用或原样重复的工具过程说明时不能成功。展示清洗之前规范化显式动作信封；不支持或残缺的标记保留为可恢复诊断，不能只留下正文后伪造最终回答。此门控检查协议与来源，不以关键词、字数或第二个模型冒充答案质量证明。
+完成候选由 Chat/analyze 与 Execute 共用的 [providerAnswer.ts](../src/lib/runtime-v2/providerAnswer.ts) 检查：只接受当前 Run 最新已结算响应，不能跨过更新的模型失败、工具/验证结果或子任务交接复用旧报告；有未完成动作、协议诊断、残缺调用或原样重复的工具过程说明时不能成功。analyze 已产生合格父线程答复但仍有活动 child 时，该正文只作为 controller 的 join 候选；先 join，再从新交接证据重新生成父答复。`subagent.handoff_applied(source=provider_result)` 只在精确引用当前答复的 `eventId` 时不使这份答复失效，其他新交接仍使旧答复失效。展示清洗之前规范化显式动作信封；不支持或残缺的标记保留为可恢复诊断，不能只留下正文后伪造最终回答。此门控检查协议与来源，不以关键词、字数或第二个模型冒充答案质量证明。
 
 直接 Execute 的已记录执行契约由 core 唯一解析和回放；工具声明与接纳仍由 Store adapter 负责。完成门控除了原有的最终修改边界、验收 authority、版本和证据类型校验，还要求覆盖契约中全部非 preserve 目标，以及最终修改之后的每项声明验证。有限命令必须匹配实际已执行的契约命令，下一次验证优先选择尚未覆盖的项。没有契约的历史/简单 Execute 继续遵守原有 typed 或 unclassified 验收规则，不从自然语言猜测行为类别。
 
@@ -183,7 +187,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 设备内存估算是容量保护而非精确 KV 分配器；provider 仍可在请求时返回真实容量错误，后续应把它作为新的资源事实处理，不能静默截断正文。
 - 单次模型可见读取仍有绝对窗口上限。需要全文件语义时必须沿同一版本连续取窗，而不是提高常量或把文件偷偷裁成摘要。
 - reasoning 的专有请求字段只属于 adapter。OMLX 的 `auto` 不发送正向 reasoning 覆盖，保持所选模型声明的默认行为；只有 `explicit` 才依据该次请求的真实输出上限派生 hidden-thinking budget，`off` 用于关闭 thinking 的有界恢复。Execute、Plan 和 child 共用这一 adapter 规则，未知 endpoint 不接收这些字段；Runtime 只消费规范化后的 reasoning-toggle 能力来处理 reasoning-only 的长度截断。
-- 任务总时长与单次决策输出必须分离：普通 Execute 没有总输出／总步数预算，但一次普通 `execute` 动作解码最多 4096 tokens，action window、`validate`／恢复动作与执行结论最多 2048。动作流在 4000 reasoning 字符内仍未产生可见语义或工具调用时，runtime 只取消该次 stream，追加 `ACTION_OUTPUT_BUDGET_EXHAUSTED` 并以 reasoning-off 重试；不得把这个单步边界投影成 Turn 超时或任务失败。
+- 任务总时长与单次决策输出必须分离：[executionProviderRequestPolicy.ts](../src/store/runtimeV2/executionProviderRequestPolicy.ts) 将普通 `execute` 动作解码封顶 4096 tokens，action window、`validate`／动作恢复封顶 2048；Chat/analyze 与结论请求使用同一 Run 的 `outputBudget`，受父请求 8192 上限约束，缺少 Run 预算的结论才回退 2048。动作流在 4000 reasoning 字符内仍未产生可见语义或工具调用时，runtime 只结束该次 stream并保留失败正文与反馈；[executionProviderRequest.ts](../src/store/runtimeV2/executionProviderRequest.ts) 仅依据 adapter 的 reasoning-toggle 能力关闭思考做有界恢复，无工具结论同样适用。无工具恢复要求完整回答，有工具只读恢复保留读取与回答选择；不得要求不存在的工具动作、重复同一失败上下文，或把单步输出边界投影成 Turn 超时或任务失败。
 
 ## 5. 项目基线不是会话记忆
 
@@ -270,7 +274,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - phase reason 必须描述本次阶段内发生的事实：只有当前 `acting` phase 的 mutation 成功才可记录 `mutation_committed`；新 mutation 被拒而历史 mutation 尚未验证时只能记录 `unvalidated_mutation_pending`。历史 evidence 可以要求回到验证，但不能伪装成本次工具执行成功。
 - source mismatch 或 parser-confirmed preflight rejection 的最新有界诊断必须跨其触发的恢复读取继续可见，直到成功 mutation 建立新边界。canonical ledger 保存失败 call id；decision view 只投影安全目标、`effect: none` 和工具诊断，必须脱敏旧 patch body，并把该诊断置于 context-budget 保护的尾部。不能让一次正确的 `read_file` 把“保留已有声明、删除损坏片段”等纠正事实淘汰，导致模型重新提交旧补丁。
 - 精确重复的安全读取不重新访问工作区：若同一 mutation boundary 已有成功回执，runtime 直接重放原 assistant/tool 结果；provider 同时提出新读取时只执行新部分。失败回执不缓存，成功 mutation 会使全部旧读取回执失效。
-- provider 没有产生合法工具调用时，下一次请求保留完整可见的 assistant 响应和结构化 runtime 反馈。在 `execute`／`validate` 尚有未清偿 effect debt 时，任何无工具的 prose 都是非动作响应，无论文本是否非空或很长；它必须立即形成 recovery pressure，不能用说明文字把执行循环伪装成进展。动作被精确拒绝时，必须用标准 `assistant.tool_calls -> tool(ACTION_NOT_EXECUTED)` 对关闭模型刚提交的原生工具状态，再附加恢复事实；同一 action identity 只保留一对，修改正文必须脱敏。只写一条 system 提示而省略工具结果会让部分本地模型从未观察到决策状态变化，并确定性重放同一动作。重试不能遗忘刚刚失败的尝试，也不能靠固定轮数收口。
+- provider 没有产生合法工具调用时，下一次请求保留完整可见的 assistant 响应和结构化 runtime 反馈。在 `execute`／`validate` 尚有未清偿 effect debt 时，完整无工具答复形成 `non_actionable_response` 恢复事实，不能误记为 `empty_response`，也不能用说明文字把执行循环伪装成进展。该答复与准确反馈在同一 canonical transcript 中成对保留到实际出站视图，保持普通工具选择，不能仅因有正文无动作就强制 required、删成 evidence-only 或关闭读取面；真实空响应、协议诊断和已失败工具仍按各自事实恢复。源码读取提供修改依据，不建立用户必须修改的义务；真正 Execute 的完成仍由效果与验收证据决定。动作被精确拒绝时，必须用标准 `assistant.tool_calls -> tool(ACTION_NOT_EXECUTED)` 对关闭模型刚提交的原生工具状态，再附加恢复事实；同一 action identity 只保留一对，修改正文必须脱敏。只写一条 system 提示而省略工具结果会让部分本地模型从未观察到决策状态变化，并确定性重放同一动作。重试不能遗忘刚刚失败的尝试，也不能靠固定轮数收口。
 - 连续 provider 拒绝使用 ledger 派生的渐进恢复阶段：先重新核对失败事实，再重构完成路径，最后选择真正不同的动作或诚实报告缺口。同一动作第一次被明确判定为重复且 exact source 仍可见时即可进入 `closed_recovery` action window，不等待第二次重复。source/parser 拒绝的 mutation 只保留最新失败目标；一次新鲜、必要时由诊断行约束的读取后立刻进入 `corrective_mutation`，不能用连续/重叠分页把读取伪装成进展。新补丁仍需独立 source lease；连续三次未执行的纠错 mutation 形成结构化 partial/error 边界。最终恢复决策不广告工具，只允许一份简短、未经自动验收的用户验证交接；有真实修改时该交接作为 `partial` 投影，不得变成 success。窗口只能收敛 provider 解码目录，不能改变 durable 权限、强制单一编辑器或按模型名分支。未广告工具必须成为有 assistant/tool 因果对的无效果拒绝结果，不能作为无状态 transport failure 原样重试。真实 mutation 后回到原配置并清零纠错失败。只有持续 10 分钟没有任何可执行进展才触发恢复停滞边界，普通 Execute 总耗时不参与该计时。
 - 已拒绝的标准 assistant/tool 动作对继续存在于 canonical ledger，但从下一次 provider 的决策副本中整体移除，并由有界的结构化拒绝事实替代；真实源码读取回执仍按路径、版本和范围保留。不得删除持久化真值，也不得让失败动作反复占用模型决策上下文。
 - provider 工具参数在生成 action identity 之前按工具 JSON schema 做递归标量规范化；例如数值字段的 `"260"` 与 `260` 必须是同一个动作。工具契约可以用只在 runtime 内可见、发送 provider 前会剥离的 identity-default 注解声明“显式默认值等价于省略”，不得针对模型名或事故参数编写临时修正规则。

@@ -455,6 +455,10 @@ function runtimeDecisionAnchorIndices(
       )
     ) {
       selected.add(index);
+      const draft = messages[index - 1];
+      if (draft?.role === "assistant" && !draft.tool_calls?.length) {
+        selected.add(index - 1);
+      }
       break;
     }
   }

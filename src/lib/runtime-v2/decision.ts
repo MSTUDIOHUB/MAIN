@@ -1,7 +1,7 @@
 import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
-import { deriveReadOnlyRecoveryWindow, readOnlyConclusionRequired } from "./readOnlyProgress";
+import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
 import { runtimeV2ProviderAnswerText } from "./providerAnswer";
 import type {
@@ -335,11 +335,12 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
           toolCallProgress.settledWithoutProgress.has(call.id) &&
           !toolCallProgress.progressed.has(call.id)
         );
+      const answerText = runtimeV2ProviderAnswerText(state, event);
       const nonActionable =
         (event.result.toolCalls.length === 0 || failedToolDecision) &&
         (
           executableProgressRequired ||
-          !runtimeV2ProviderAnswerText(state, event)
+          !answerText
         );
       if (!nonActionable) break;
       occurrence += 1;
@@ -347,7 +348,13 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       if (!latestReason) {
         latestReason = repeated
           ? "repeated_action_rejected"
-          : "empty_response";
+          : failedToolDecision
+            ? "tool_execution_failed"
+            : event.result.diagnostics.length > 0
+              ? "provider_response_rejected"
+              : answerText
+                ? "non_actionable_response"
+                : "empty_response";
       }
       continue;
     }
@@ -661,17 +668,13 @@ export function decideNextCommands(
     case "observing": {
       if (state.strategy === "chat" || state.strategy === "analyze") {
         const recovery = deriveReadOnlyRecoveryWindow(state);
-        const conclude = readOnlyConclusionRequired(state);
-        const active = currentRunSubagents(state).filter((job) => job.status === "queued" || job.status === "running");
-        if (conclude && active.length) return [boundedCommand(state, "join_subagents", { mode: "read_only", jobIds: active.map((job) => job.id), finalJoin: true })];
         return [boundedCommand(state, "request_model", {
-          mode: conclude ? "conclude" : state.strategy,
-          ...(conclude ? { conclusionKind: "read_only" } : {}),
+          mode: state.strategy,
           toolExpectation: "optional",
           objective: state.objective.text,
           evidenceIds: state.evidence.map((item) => item.id),
           ...(recovery ? { recoveryPressure: recovery.pressure } : {}),
-          ...(state.strategy === "analyze" && !conclude ? runtimeV2CollaborationPayload(state, input) : {}),
+          ...(state.strategy === "analyze" ? runtimeV2CollaborationPayload(state, input) : {}),
         })];
       }
       return [executeModelRequest(state, input)];

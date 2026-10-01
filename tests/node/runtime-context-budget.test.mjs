@@ -586,7 +586,9 @@ test("native and compatibility tool protocols share a bounded decision output bu
   for (const [mode, expected] of [
     ["execute", providerRequest.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS],
     ["validate", providerRequest.RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS],
-    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS],
+    // Answer synthesis consumes its Run allocation within the shared parent
+    // request ceiling; it is not bounded by the smaller action-recovery cap.
+    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS],
   ]) {
     assert.equal(
       providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(

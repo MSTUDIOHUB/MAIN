@@ -1,4 +1,6 @@
 import type { AttachedFile } from "../lib/attachments";
+import { saveProjectSession } from "../lib/ipc";
+import { withSubmitSessionPersistenceOwner } from "./persistSubmitRuntimeProjection";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import {
   getHarnessActionRunId,
@@ -2093,6 +2095,10 @@ export async function runSubmitAsyncWorkflowRun<
     buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
     publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     logStoreEvent: input.logStoreEvent,
+    persistSessionRecord: withSubmitSessionPersistenceOwner(
+      saveProjectSession,
+      () => input.hasSessionRuntimeOwnership(initialRuntimeOwnerToken),
+    ),
   } satisfies RunSubmitRuntimeInput);
   if (
     runtimeSettlement?.disposition === "projected" &&

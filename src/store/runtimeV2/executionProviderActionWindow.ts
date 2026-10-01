@@ -101,7 +101,8 @@ export function runtimeV2ProviderActionWindowFor(input: {
     mode === "validate" &&
     (
       repeatedObservation ||
-      Number(recoveryRecord?.occurrence) >= 1
+      (recoveryRecord?.reason !== "non_actionable_response" &&
+        Number(recoveryRecord?.occurrence) >= 1)
     )
   ) {
     // Validation already has a durable mutation boundary to verify. One

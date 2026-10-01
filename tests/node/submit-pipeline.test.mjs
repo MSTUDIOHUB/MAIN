@@ -1036,7 +1036,7 @@ test("effective intent decision keeps an identity-validated choice inside Goal r
   }));
 
   assert.equal(decision.effectiveRunIntent, "goal");
-  assert.equal(decision.shouldForceExecuteForAutoApprove, false);
+  assert.equal(Object.hasOwn(decision, "shouldForceExecuteForAutoApprove"), false);
 });
 
 test("effective intent decision downgrades untrusted Goal intents but preserves explicit creation", () => {

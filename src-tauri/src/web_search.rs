@@ -128,14 +128,27 @@ pub async fn web_search(
         }
     }
 
-    if results.is_empty()
-        && is_search_challenge(&attempt.provider, &attempt.source_url, &attempt.html)
-    {
-        return Err(
-            fallback_reason.unwrap_or_else(|| build_search_fallback_reason(&attempt, &results))
-        );
-    }
-    if results.is_empty() && fallback_reason.is_some() {
+    finalize_search_response(
+        query,
+        provider,
+        max_results,
+        attempt,
+        results,
+        fallback_provider,
+        fallback_reason,
+    )
+}
+
+fn finalize_search_response(
+    query: String,
+    provider: String,
+    max_results: usize,
+    attempt: SearchAttempt,
+    mut results: Vec<WebSearchResultItem>,
+    fallback_provider: Option<String>,
+    fallback_reason: Option<String>,
+) -> Result<WebSearchResponse, String> {
+    if results.is_empty() {
         return Err(
             fallback_reason.unwrap_or_else(|| build_search_fallback_reason(&attempt, &results))
         );
@@ -1035,6 +1048,125 @@ mod tests {
         assert_eq!(results[0].title, "Example & Result");
         assert_eq!(results[0].url, "https://example.com/a");
         assert_eq!(results[0].snippet, "Short summary");
+    }
+
+    #[test]
+    fn empty_selected_provider_pages_return_failure_without_fallback() {
+        let html = r#"<html><head><title>Search results</title></head><body><main><p>No matching documents.</p></main></body></html>"#;
+        for provider in ["bing", "duckduckgo", "baidu"] {
+            let attempt = SearchAttempt {
+                provider: provider.to_string(),
+                source_url: search_url(provider, "missing result"),
+                html: html.to_string(),
+                truncated: false,
+            };
+            let results = parse_search_results(provider, &attempt.html);
+            assert!(results.is_empty());
+            assert!(!is_search_challenge(
+                provider,
+                &attempt.source_url,
+                &attempt.html
+            ));
+            let source_url = attempt.source_url.clone();
+            let error = finalize_search_response(
+                "missing result".to_string(),
+                provider.to_string(),
+                5,
+                attempt,
+                results,
+                None,
+                None,
+            )
+            .expect_err("an empty selected-provider page is failed search evidence");
+            assert!(error.contains("no parseable results"));
+            assert!(error.contains(provider));
+            assert!(error.contains(&source_url));
+        }
+    }
+
+    #[test]
+    fn search_finalization_keeps_challenge_and_exhausted_fallback_reasons() {
+        let challenge = SearchAttempt {
+            provider: "duckduckgo".to_string(),
+            source_url: search_url("duckduckgo", "query"),
+            html: "<form class=\"challenge-form\">Verify you are human</form>".to_string(),
+            truncated: false,
+        };
+        let results = parse_search_results(&challenge.provider, &challenge.html);
+        let error = finalize_search_response(
+            "query".to_string(),
+            "duckduckgo".to_string(),
+            5,
+            challenge,
+            results,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("anti-bot verification"));
+
+        let empty = SearchAttempt {
+            provider: "bing".to_string(),
+            source_url: search_url("bing", "query"),
+            html: "<main><p>No results</p></main>".to_string(),
+            truncated: false,
+        };
+        let results = parse_search_results(&empty.provider, &empty.html);
+        let reason = "bing returned no parseable results; fallback provider duckduckgo failed";
+        let error = finalize_search_response(
+            "query".to_string(),
+            "bing".to_string(),
+            5,
+            empty,
+            results,
+            None,
+            Some(reason.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, reason);
+    }
+
+    #[test]
+    fn search_finalization_keeps_selected_provider_and_explicit_fallback_metadata() {
+        let html = r#"
+          <a class="result__a" href="https://example.com/first">First result</a>
+          <a class="result__snippet">First snippet</a>
+          <a class="result__a" href="https://example.com/second">Second result</a>
+        "#;
+        for fallback_provider in [None, Some("duckduckgo".to_string())] {
+            let selected_provider = if fallback_provider.is_some() {
+                "bing"
+            } else {
+                "duckduckgo"
+            };
+            let fallback_reason = fallback_provider
+                .as_ref()
+                .map(|_| "bing returned no parseable results".to_string());
+            let attempt = SearchAttempt {
+                provider: "duckduckgo".to_string(),
+                source_url: search_url("duckduckgo", "query"),
+                html: html.to_string(),
+                truncated: false,
+            };
+            let results = parse_search_results(&attempt.provider, &attempt.html);
+            let response = finalize_search_response(
+                "query".to_string(),
+                selected_provider.to_string(),
+                1,
+                attempt,
+                results,
+                fallback_provider.clone(),
+                fallback_reason.clone(),
+            )
+            .unwrap();
+            assert_eq!(response.provider, selected_provider);
+            assert_eq!(response.fallback_provider, fallback_provider);
+            assert_eq!(response.fallback_reason, fallback_reason);
+            assert_eq!(response.source_url, search_url("duckduckgo", "query"));
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.results[0].url, "https://example.com/first");
+            assert!(response.truncated);
+        }
     }
 
     #[test]

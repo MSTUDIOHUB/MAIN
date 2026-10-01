@@ -2,6 +2,7 @@ import {
   abortedAgentLoopOutcome,
 } from "../../lib/runOutcome";
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
+import type { SubmitSessionPersistence } from "../persistSubmitRuntimeProjection";
 import {
   RuntimeV2Controller,
   advanceRuntimeV2ProviderRecoveryStallLease,
@@ -80,7 +81,7 @@ export interface RuntimeV2ExecuteRunnerInput {
     sessionId: number | string | null | undefined;
     expectedRevisionToken: unknown;
   }) => { published: boolean; disposition: string };
-  readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
+  readonly persistSessionRecord: SubmitSessionPersistence;
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 

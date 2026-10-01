@@ -142,7 +142,7 @@ test("provider answer accepts visibleText in conclude mode by stripping residue 
   assert.equal(answer, "汇添富上证科创板芯片ETF联接C净值总结：最新净值为1.2345元。");
 });
 
-test("rememberRuntimeV2ProviderResult avoids injecting tool syntax feedback when tools are closed", () => {
+test("rememberRuntimeV2ProviderResult retains cleaned no-tool drafts with their exact failure feedback", () => {
   const { rememberRuntimeV2ProviderResult } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderHistory.ts"));
   const { createRuntimeV2LiveExecutionState } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionTypes.ts"));
   const ports = {
@@ -160,13 +160,18 @@ test("rememberRuntimeV2ProviderResult avoids injecting tool syntax feedback when
     diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "Unconsumed tool markup is not a final answer.", retryable: true }],
   };
 
-  // When mode is conclude, no feedback message is appended to live.messages, and cleaned text is saved
+  // A closed tool surface still retains the failed attempt and correction.
   rememberRuntimeV2ProviderResult(ports, resultWithDiagnostic, { payload: { mode: "conclude" } });
-  assert.equal(ports.live.messages.length, 1);
+  assert.equal(ports.live.messages.length, 2);
   assert.equal(ports.live.messages[0].role, "assistant");
   assert.equal(ports.live.messages[0].content, "总结内容");
-  assert.equal(ports.live.latestVisibleText, "总结内容");
-  assert.ok(!ports.live.messages.some((m) => m.content.includes("runtime-v2 provider feedback")));
+  assert.equal(ports.live.messages[1].role, "system");
+  assert.match(ports.live.messages[1].content, /provider feedback: explicit_tool_envelope_invalid_json/);
+  assert.match(ports.live.messages[1].content, /Unconsumed tool markup is not a final answer/);
+  assert.equal(ports.live.latestVisibleText, "");
+  assert.doesNotMatch(JSON.stringify(ports.live.messages), /<tool_call>/);
+  rememberRuntimeV2ProviderResult(ports, resultWithDiagnostic, { payload: { mode: "conclude" } });
+  assert.equal(ports.live.messages.length, 2, "an identical draft/feedback pair coalesces");
 
   // When model wraps analysis inside tool_call with intro text, the inner analysis is salvaged
   const salvagePorts = {
@@ -183,9 +188,12 @@ test("rememberRuntimeV2ProviderResult avoids injecting tool syntax feedback when
     diagnostics: [{ code: "explicit_tool_envelope_invalid_json", message: "invalid", retryable: true }],
   };
   rememberRuntimeV2ProviderResult(salvagePorts, resultWithAnalysisInTag, { payload: { mode: "conclude" } });
-  assert.equal(salvagePorts.live.messages.length, 1);
+  assert.equal(salvagePorts.live.messages.length, 2);
   assert.equal(salvagePorts.live.messages[0].content, "分析总结：\n\n1. 行业基本面改善。\n2. 资金面趋向积极。");
-  assert.equal(salvagePorts.live.latestVisibleText, "分析总结：\n\n1. 行业基本面改善。\n2. 资金面趋向积极。");
+  assert.equal(salvagePorts.live.messages[1].role, "system");
+  assert.match(salvagePorts.live.messages[1].content, /provider feedback: explicit_tool_envelope_invalid_json/);
+  assert.match(salvagePorts.live.messages[1].content, /invalid/);
+  assert.equal(salvagePorts.live.latestVisibleText, "");
 
   // When mode is open (e.g. execute with tools), feedback IS appended
   const openPorts = {
@@ -1510,7 +1518,7 @@ test("a tool-free Execute report remains recovery input for an incomplete approv
   assert.equal(next.payload.mode, "execute");
   assert.deepEqual(next.payload.recoveryPressure, {
     schemaVersion: "runtime-v2-provider-recovery.v1",
-    reason: "empty_response",
+    reason: "non_actionable_response",
     occurrence: 1,
     stage: "reconsider",
   });
@@ -2993,6 +3001,7 @@ test("failed tool effects remain consecutive provider no-progress decisions", ()
     });
     const pressure = runtime.deriveRuntimeV2ProviderRecoveryPressure(state);
     assert.equal(pressure?.occurrence, attempt);
+    assert.equal(pressure?.reason, "tool_execution_failed");
     assert.equal(
       pressure?.stage,
       attempt === 1 ? "reconsider" : attempt === 2 ? "reframe" : "alternative",
@@ -3019,7 +3028,7 @@ test("prose without a tool is non-actionable while execute or validate debt rema
     assert.equal(next.kind, "request_model");
     assert.deepEqual(next.payload.recoveryPressure, {
       schemaVersion: "runtime-v2-provider-recovery.v1",
-      reason: "empty_response",
+      reason: "non_actionable_response",
       occurrence: 1,
       stage: "reconsider",
     });

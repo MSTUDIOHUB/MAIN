@@ -6235,6 +6235,111 @@ test("an emergency terminal envelope restores through the canonical Turn final a
   );
 });
 
+test("Stop on a full ledger cold-restores one canceled envelope, terminal sequence, and final", async () => {
+  const { commitCanceledTurn } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/commitCanceledTurn.ts"));
+  const { captureCanceledTurnControlPlaneFence } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/canceledTurnProjection.ts"));
+  const workspace = "/tmp/runtime-v2-cancel-capacity";
+  const sessionKey = `${workspace}:99`;
+  const turnId = "turn-cancel-capacity";
+  const owner = { workspaceKey: workspace, sessionKey, sessionEpoch: "cancel-capacity-epoch",
+    clientSubmissionId: "cancel-capacity-submission", turnId };
+  const run = { sessionKey, sessionEpoch: owner.sessionEpoch, turnId, runId: "cancel-capacity-run", parentRunId: null, attemptId: "cancel-capacity-attempt" };
+  let aggregate = null;
+  let ordinal = 0;
+  const append = (type, fields) => {
+    aggregate = runtimeV2.transition(aggregate, {
+      schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: aggregate?.nextSequence || 0,
+      eventId: `capacity-restore-${++ordinal}`, at: ordinal, type, ...fields,
+    });
+  };
+  append("turn.admitted", { turn: owner, strategy: "chat", objective: "Question", constraints: [], acceptanceCriteria: [] });
+  append("run.started", { run, phase: "observing" });
+  while (aggregate.events.length < runtimeV2.MAX_RUNTIME_V2_CHECKPOINT_EVENTS) {
+    const projection = { id: `capacity-view-${ordinal}`, audience: "timeline", markdown: "Progress", kind: "timeline", dedupeKey: `capacity-view-${ordinal}` };
+    append("projection.published", { run, audience: "timeline", projectionId: projection.id, projection });
+  }
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: aggregate.events.length, aggregate, updatedAt: aggregate.updatedAt });
+  let state = {
+    config: useAppStore.getState().config,
+    currentTurnId: turnId, agentStatus: "running", isGenerating: true, abortController: new AbortController(),
+    taskFlow: [{ id: 1, turnId, type: "user", content: "Question" }],
+    conversationTurns: [{ id: turnId, clientSubmissionId: owner.clientSubmissionId,
+      userPrompt: "Question", title: "Question", mode: "chat", intent: "chat", displayIntent: "chat",
+      status: "executing", blockIds: [1], collapsed: false, createdAt: 1, elapsedTime: 0 }],
+    runtimeEvents: [{ schemaVersion: 2, type: "run.started", threadId: sessionKey, turnId,
+      timestampMs: 1, runId: run.runId, parentRunId: null }],
+    runtimeV2Checkpoints: { [turnId]: checkpoint },
+    runtimeV2EmergencyTerminalEnvelopes: {},
+    harnessRunMarker: { schemaVersion: 1, instanceId: "cancel-capacity-instance", runId: run.runId,
+      sessionKey, workspace, sessionId: 99, turnId, activeRunId: run.runId, activeParentRunId: null,
+      parentRunId: null, status: "running", workflowMode: "chat", runtimeIntent: "chat", planStage: "idle",
+      isPlanApproved: false, startedAt: 1, updatedAt: 1, closedAt: null, closeReason: null },
+  };
+  let durableSnapshot;
+  let revisionToken = {};
+  let nextId = 2;
+  const result = await commitCanceledTurn({
+    sessionKey, scopeKey: workspace, sessionId: 99, turnId, runId: run.runId,
+    reason: "user_cancelled", message: "Canceled.", isCurrent: () => true,
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({ state, sessionKey, turnId, runId: run.runId }),
+    nextTaskId: () => nextId++, sessionGet: () => state, getSessionRevisionToken: () => revisionToken,
+    persistProjection: async (projected) => {
+      durableSnapshot = JSON.parse(JSON.stringify({ ...projected,
+        runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap(projected.runtimeV2Checkpoints),
+      }));
+      return projected;
+    },
+    publishProjection: (publication) => {
+      state = publication.durableState || publication.projectedState;
+      revisionToken = {};
+      return { published: true, disposition: "published" };
+    },
+    nowMs: Date.now,
+  });
+  assert.equal(result.disposition, "committed_durable");
+  assert.equal(Object.hasOwn(durableSnapshot.runtimeV2Checkpoints[turnId], "aggregate"), false);
+  const restored = normalizeSessionRuntimeSnapshot(durableSnapshot, {
+    workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: owner.sessionEpoch,
+  });
+  assert.equal(restored.runtimeV2EmergencyTerminalEnvelopes[turnId].resultKind, "canceled");
+  assert.equal(restored.runtimeV2Checkpoints[turnId].aggregate.events.length, 2048);
+  assert.equal(restored.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(restored.harnessRunMarker.terminalResultKind, "canceled");
+  assert.equal(restored.taskFlow.filter((block) => block.turnId === turnId && block.visibility === "assistant_final").length, 1);
+  assert.deepEqual(restored.runtimeEvents.filter((event) =>
+    event.turnId === turnId && ["run.aborted", "run.completed", "turn.completed"].includes(event.type)
+  ).map((event) => event.type), ["run.aborted", "run.completed", "turn.completed"]);
+});
+
+test("restore accepts only owner-matching canceled size envelopes at the admitted/no-Run boundary", () => {
+  const workspace = "/tmp/runtime-v2-admitted-cancel";
+  const sessionKey = `${workspace}:99`;
+  const owner = { workspaceKey: workspace, sessionKey, sessionEpoch: "admitted-cancel-epoch", clientSubmissionId: "admitted-cancel-submission", turnId: "admitted-cancel-turn" };
+  const run = { sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "admitted-cancel-run", parentRunId: null, attemptId: "admitted-cancel-attempt" };
+  const aggregate = runtimeV2.transition(null, { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "admitted-cancel", at: 1,
+    type: "turn.admitted", turn: owner, strategy: "chat", objective: "Question", constraints: [], acceptanceCriteria: [] });
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: 1, aggregate, updatedAt: 1 });
+  const restore = (resultKind, reasonCode, candidateRun = run) => {
+    const envelope = runtimeV2.createRuntimeV2EmergencyTerminalEnvelope({ owner, run: candidateRun, resultKind, reasonCode, language: "en", at: Date.now(), lastRevision: 1, hasMutation: false });
+    return normalizeSessionRuntimeSnapshot({
+      runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap({ [owner.turnId]: checkpoint }),
+      runtimeV2EmergencyTerminalEnvelopes: { [owner.turnId]: envelope },
+      conversationTurns: [{ id: owner.turnId, clientSubmissionId: owner.clientSubmissionId, userPrompt: "Question", title: "Question", mode: "chat", intent: "chat", displayIntent: "chat", status: "executing", blockIds: [], collapsed: false, createdAt: 1 }],
+      taskFlow: [], runtimeEvents: [],
+    }, { workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: owner.sessionEpoch });
+  };
+  const restored = restore("canceled", "checkpoint_size_budget_exceeded");
+  assert.equal(restored.runtimeV2EmergencyTerminalEnvelopes[owner.turnId]?.resultKind, "canceled");
+  assert.equal(restored.runtimeV2Checkpoints[owner.turnId].aggregate.run, null);
+  assert.equal(restored.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
+  assert.equal(restored.taskFlow.filter((block) => block.visibility === "assistant_final").length, 1);
+  assert.deepEqual(restored.runtimeEvents.filter((event) => ["run.aborted", "run.completed", "turn.completed"].includes(event.type)).map((event) => event.type), ["run.aborted", "run.completed", "turn.completed"]);
+  for (const [kind, reason] of [["error", "checkpoint_size_budget_exceeded"], ["canceled", "checkpoint_event_budget_exceeded"]]) {
+    assert.equal(restore(kind, reason).runtimeV2EmergencyTerminalEnvelopes[owner.turnId], undefined);
+  }
+});
+
 test("restore rejects an emergency terminal envelope whose checkpoint revision drifted", () => {
   const workspace = "/tmp/runtime-v2-emergency-revision";
   const sessionKey = `${workspace}:100`;

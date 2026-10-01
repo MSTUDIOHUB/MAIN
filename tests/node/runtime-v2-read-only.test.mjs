@@ -89,6 +89,10 @@ function harness(providerResults, options = {}) {
       async request({ command }) {
         requests.push(command);
         providerCalls += 1;
+        if (!providerResults.length) {
+          abort.abort();
+          throw new Error("Read-only fixture provider responses exhausted.");
+        }
         const value = providerResults.shift();
         if (value instanceof Error) throw value;
         if (typeof value === "function") return value({ abort, advance: (ms) => { clock += ms; } });
@@ -103,8 +107,10 @@ function harness(providerResults, options = {}) {
       },
     },
     scheduler: {
-      async execute() {
+      prepareSchedule: options.prepareSchedule,
+      async execute(input) {
         schedulerCalls += 1;
+        if (options.schedulerExecute) return options.schedulerExecute(input);
         throw new Error("scheduler port must be unreachable");
       },
     },
@@ -144,6 +150,84 @@ function receipt(command, data, extra = {}) {
   return { type: "tool.completed", run: command.run, idempotencyKey: command.idempotencyKey, status: "succeeded", evidence: [{ id: `E${command.payload.toolCallId.replace(/\D/g, "") || 1}`, kind: "tool", target: "query", version: progress.readOnlyEvidenceVersion("web_search", data) }], modelContent: JSON.stringify(data), ...extra };
 }
 
+test("search recovery keeps authorized source reads available until the answer is complete", async () => {
+  const fetch = { visibleText: "", toolCalls: [{ id: "f4", name: "web_fetch", arguments: { url: "https://example.com/source" } }], diagnostics: [] };
+  const h = harness([call("s1", "one"), call("s2", "two"), call("s3", "three"), fetch, answer], {
+    toolExecute: ({ command }) => receipt(command, command.payload.toolName === "web_fetch"
+      ? { url: "https://example.com/source", content: "verified source fact" }
+      : resultData(command.payload.arguments.query)),
+  });
+  const result = await runLoop(h);
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests[3].payload.mode, "chat");
+  assert.equal(h.requests[3].payload.recoveryPressure.reason, "non_novel_evidence");
+  assert.equal(h.requests[3].payload.conclusionKind, undefined);
+  const tools = auth.providerToolDefinitionsForCommand({ get: () => ({ config: {} }), context: { runtimeRunIntent: "respond", runWorkspace: "", networkRead: enabled, turnId: turn.turnId }, live: types.createRuntimeV2LiveExecutionState() }, h.requests[3]);
+  assert.ok(tools.some((tool) => tool.function.name === "web_fetch"));
+  assert.equal(h.read().toolCalls, 4);
+});
+
+test("analyze joins an active child after a valid parent draft and regenerates the answer from its handoff", async () => {
+  let joined = false;
+  let schedulerAttempts = 0;
+  const childEvidence = { id: "child-review:E1", kind: "subagent", target: "src/source.ts", version: "source-v1" };
+  const completedAnswer = { visibleText: "已整合子任务证据 child-review:E1 的最终答复。", toolCalls: [], diagnostics: [] };
+  const h = harness([
+    { visibleText: "", toolCalls: [{ id: "spawn-child", name: "spawn_subagent", arguments: { objective: "Review source" } }], diagnostics: [] },
+    { visibleText: "交接前的完整父线程答复。", toolCalls: [], diagnostics: [] },
+    ({ abort }) => {
+      // Bound the failing fixture: an unnecessary provider request before
+      // joining cannot spin forever while the child is still in flight.
+      if (!joined) abort.abort();
+      return completedAnswer;
+    },
+    ({ abort }) => { abort.abort(); return { visibleText: "", toolCalls: [], diagnostics: [] }; },
+  ], {
+    prepareSchedule: async ({ command }) => ({
+      type: "subagents.scheduled", run: command.run, maxActiveSubagents: 1,
+      jobs: runtime.scheduleRuntimeV2Subagents({
+        parentRun: command.run, maxActiveJobs: 1, requestedAt: 100,
+        nextId: () => "child-review",
+        candidates: [{ scopeKey: "source-review", taskKind: "review", accessMode: "read", objective: "Review source", allowedPaths: ["src/source.ts"], sourceToolCallId: command.payload.toolCallId }],
+      }).jobs,
+    }),
+    schedulerExecute: async ({ command, scheduledSubagents }) => {
+      const job = scheduledSubagents[0];
+      // A broken join adapter must fail this finite fixture promptly too.
+      if (++schedulerAttempts > 2) { h.abort.abort(); return []; }
+      if (command.kind === "schedule_subagents") return [{ type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "request_opened", at: 100 } }];
+      assert.equal(command.kind, "join_subagents");
+      assert.deepEqual(command.payload.jobIds, ["child-review"]);
+      const beforeJoin = { ...h.read().aggregate, scheduledCommands: [] };
+      assert.equal(progress.latestReadOnlyAnswer(beforeJoin), "", "a pending child draft cannot pass the ordinary acceptance gate");
+      assert.equal(progress.latestReadOnlyAnswer(beforeJoin, { allowPendingChildJoin: true }), "交接前的完整父线程答复。");
+      joined = true;
+      return [
+        { type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "closed", at: 100 } },
+        { type: "subagent.completed", run: command.run, jobId: job.id, status: "degraded", summary: "A source fact is ready for the parent.", evidence: [childEvidence] },
+        { type: "subagent.handoff_delivered", run: command.run, jobId: job.id, contextEntryId: `child:${job.id}`, evidenceIds: [childEvidence.id] },
+      ];
+    },
+  });
+  const result = await runLoop(h, { strategy: "analyze", decisionInput: () => ({ subagentPreference: "allowed", subagentCapacity: 1 }) });
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests.length, 3);
+  assert.deepEqual(result.aggregate.events.filter((event) => event.type === "command.scheduled").map((event) => event.command.kind), ["request_model", "schedule_subagents", "request_model", "join_subagents", "request_model", "finalize_turn"]);
+  assert.equal(h.requests.at(-1).payload.mode, "analyze", "joining must preserve ordinary read authority");
+  assert.equal(progress.latestReadOnlyAnswer({ ...result.aggregate, terminalOutcome: null }), completedAnswer.visibleText);
+  const adoption = result.aggregate.events.find((event) => event.type === "subagent.handoff_applied");
+  const parentResponse = result.aggregate.events.find((event) => event.eventId === adoption.sourceEventId);
+  assert.equal(adoption.source, "provider_result");
+  assert.equal(parentResponse.result.visibleText, completedAnswer.visibleText);
+  const mismatchedAdoption = { ...result.aggregate, events: result.aggregate.events.map((event) => event === adoption ? { ...event, sourceEventId: "different-parent-response" } : event) };
+  assert.equal(progress.latestReadOnlyAnswer(mismatchedAdoption), "", "an adoption for another parent response must not validate this answer");
+  const newerDelivery = { ...result.aggregate, events: [...result.aggregate.events, { ...adoption, type: "subagent.handoff_delivered", eventId: "newer-handoff" }] };
+  assert.equal(progress.latestReadOnlyAnswer(newerDelivery), "", "a newer child handoff invalidates the old synthesis");
+  assert.equal(result.aggregate.events.filter((event) => event.type === "run.completed").length, 1);
+  assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
+  assert.equal(result.aggregate.events.filter((event) => event.type === "projection.published" && event.projection.kind === "final").length, 1);
+});
+
 test("network permission is frozen and absent/invalid legacy snapshots stay disabled", () => {
   const state = { webSearchEnabled: true, webSearchProvider: "bing" };
   const policy = network.captureNetworkRead(state);
@@ -175,16 +259,16 @@ test("Bing tracking identity and unverified reader pages cannot mint fresh sourc
 test("search discovery without reading a source cannot indefinitely renew semantic progress", async () => {
   const h = harness([call("s1", "first"), call("s2", "different"), call("s3", "another"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query, "different snippet", `https://example.com/${command.payload.arguments.query}`)) });
   await runLoop(h);
-  assert.equal(h.requests.at(-1).payload.conclusionKind, "read_only");
+  assert.equal(h.requests.at(-1).payload.conclusionKind, undefined);
   assert.equal(h.requests.at(-1).payload.recoveryPressure.occurrence, 2);
 });
 
-test("two settled non-novel batches close tools and produce a real answer", async () => {
+test("settled non-novel batches provide recovery guidance before a real answer", async () => {
   const h = harness([call("s1", "one"), call("s2", "two"), call("s3", "three"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query)) });
   const result = await runLoop(h);
   assert.equal(result.resultKind, "success");
-  assert.deepEqual(h.requests.map((item) => item.payload.mode), ["chat", "chat", "chat", "conclude"]);
-  assert.equal(h.requests.at(-1).payload.conclusionKind, "read_only");
+  assert.deepEqual(h.requests.map((item) => item.payload.mode), ["chat", "chat", "chat", "chat"]);
+  assert.equal(h.requests.at(-1).payload.conclusionKind, undefined);
   assert.equal(h.requests.at(-1).payload.recoveryPressure.reason, "non_novel_evidence");
   assert.equal(h.requests.at(-1).payload.recoveryPressure.occurrence, 2);
   const order = result.aggregate.events.filter((event) => event.type === "run.completed" || (event.type === "projection.published" && event.projection.kind === "final") || event.type === "turn.completed").map((event) => event.type);
@@ -236,29 +320,17 @@ test("an empty or truncated conclusion recovers before a truthful final answer",
     const h = harness([{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "", toolCalls: [], diagnostics: [] }, final, answer]);
     assert.equal((await runLoop(h)).resultKind, "success");
     assert.equal(h.requests.length, 4);
-    assert.equal(h.requests.at(-1).payload.mode, "conclude");
+    assert.equal(h.requests.at(-1).payload.mode, "chat");
   }
   assert.equal(requestPolicy.runtimeV2ProviderOutputWasTruncated({ finishReason: "length", toolCallCount: 0, availableToolCount: 0 }), true);
 });
 
-test("consecutive empty conclude attempts hit retry cap and stop spinning without waiting 10 minutes", async () => {
-  const emptyConclude = { visibleText: "", toolCalls: [], diagnostics: [] };
-  const h = harness([
-    emptyConclude,
-    emptyConclude,
-    emptyConclude,
-    emptyConclude,
-    emptyConclude,
-    emptyConclude,
-  ]);
+test("recovery survives repeated empty responses until a valid answer within its lease", async () => {
+  const h = harness([...Array(6).fill({ visibleText: "", toolCalls: [], diagnostics: [] }), answer]);
   const result = await runLoop(h);
-  assert.equal(result.resultKind, "error");
-  assert.match(result.reason, /最大重试次数/);
-  // Total requests: 2 chat + 3 conclude attempts = 5 requests total (not 59)
-  assert.equal(h.requests.length, 5);
-  assert.equal(h.requests[2].payload.mode, "conclude");
-  assert.equal(h.requests[3].payload.mode, "conclude");
-  assert.equal(h.requests[4].payload.mode, "conclude");
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests.length, 7);
+  assert.ok(h.requests.every((request) => request.payload.mode === "chat"));
 });
 
 test("the incident's repeated action commentary cannot finish Chat", async () => {
@@ -347,7 +419,7 @@ test("executor forces the captured provider and disables Rust cross-provider fal
   } finally { ipc.webSearch = original; }
 });
 
-test("legacy iteration signals select conclusion once without becoming a terminal", async () => {
+test("legacy iteration signals do not withdraw safe read authority", async () => {
   const h = harness([answer]);
   const result = await runLoop(h);
   const last = result.aggregate.events.findIndex((event) => event.type === "command.scheduled" && event.command.kind === "request_model");
@@ -356,7 +428,8 @@ test("legacy iteration signals select conclusion once without becoming a termina
   const next = runtime.decideNextCommands(state);
   assert.equal(state.terminalOutcome, null);
   assert.equal(next[0].kind, "request_model");
-  assert.equal(next[0].payload.conclusionKind, "read_only");
+  assert.equal(next[0].payload.mode, "chat");
+  assert.equal(next[0].payload.conclusionKind, undefined);
 });
 
 test("large Web receipts retain valid JSON and redirect identity for cold replay", () => {

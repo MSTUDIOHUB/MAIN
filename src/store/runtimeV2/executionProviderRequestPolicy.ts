@@ -63,7 +63,10 @@ export function runtimeV2ExecutionEffectiveToolChoice(input: {
 export function runtimeV2RecoveryRequiresStructuredAction(
   pressure: RuntimeV2ProviderRecoveryPressure | null | undefined,
 ): boolean {
-  return !!pressure;
+  // A complete ordinary reply carries a strategy/acceptance gap, not a failed
+  // structured decoding attempt. Keep prose and optional authorized actions
+  // available so recovery can use its exact causal feedback.
+  return !!pressure && pressure.reason !== "non_actionable_response";
 }
 
 export function shouldRetryRuntimeV2WithoutReasoning(input: {
@@ -81,10 +84,10 @@ export function shouldRetryRuntimeV2WithoutReasoning(input: {
   const boundedVisibleDraft =
     input.structuredActionRequired === true &&
     Number(input.actionChars) > 0;
-  return input.availableToolCount > 0 &&
-    input.finishReason === "length" &&
+  return input.finishReason === "length" &&
     input.toolCallCount === 0 &&
-    (boundedReasoningDraft || boundedVisibleDraft);
+    (boundedReasoningDraft ||
+      (input.availableToolCount > 0 && boundedVisibleDraft));
 }
 
 export function runtimeV2ProviderOutputWasTruncated(input: {
@@ -127,16 +130,24 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
   const recoveryPressure = command.payload.recoveryPressure;
   const recovering = !!recoveryPressure &&
     typeof recoveryPressure === "object" &&
-    !Array.isArray(recoveryPressure);
-  const modeLimit = actionWindow || recovering
+    !Array.isArray(recoveryPressure) &&
+    (recoveryPressure as Record<string, unknown>).reason !== "non_actionable_response";
+  const answering = mode === "chat" || mode === "analyze" || mode === "conclude";
+  // Answer synthesis uses the Run's output allocation, bounded by the same
+  // parent-request ceiling as an ordinary observation. An action recovery
+  // cap must not consume the answer budget merely because prior output was
+  // truncated. The smaller conclusion value is only a no-budget fallback.
+  const modeLimit = answering
+    ? mode === "conclude" && !budget
+      ? RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS
+      : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS
+    : actionWindow || recovering
     ? RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS
     : mode === "validate"
       ? RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS
       : mode === "execute"
         ? RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS
-        : mode === "conclude"
-          ? RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS
-          : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS;
+        : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS;
   return Math.max(
     1,
     Math.min(

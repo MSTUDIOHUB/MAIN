@@ -362,14 +362,24 @@ const STRONG_EXECUTE_PATTERNS = [
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 
-const WORKSPACE_MUTATION_REQUEST_RE = /(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i;
+const WORKSPACE_MUTATION_REQUEST_RE = /(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构|加)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i;
+
+// Authoring a reply or revising a decision is not a workspace effect. File
+// creation/update needs a concrete source target; repair/implementation may
+// refer back to an already identified issue without repeating its filename.
+const WORKSPACE_MUTATION_TARGET_RE = /(?:文件|代码|源码|功能|按钮|入口|菜单|组件|页面|字段|接口|回调|脚本)|\b(?:files?|code|source|feature|button|menu|component|field|api|callback|script)\b|(?:[\w.-]+[\\/])+[\w.-]+|\b[\w.-]+\.(?:md|txt|json|ya?ml|tsx?|jsx?|cs|py|rs|html|css)\b/i;
+const WORKSPACE_REPAIR_REQUEST_RE = /(?:实现|修复|解决|改掉|重构)|\b(?:implement|fix|repair|resolve|patch|refactor)\b/i;
+const CURRENT_WORKSPACE_CHANGE_REQUEST_RE = /^(?:我)?(?:希望|想要|需要).{0,16}(?:加|添加|增加|新增|加入|接入|修改|创建)|^(?:i\s+)?(?:want|need|would like)\s+(?:you\s+)?to\s+(?:add|create|implement|update|change|modify)\b/i;
 
 const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
   /^(?:(?:please|kindly|now|directly)\s+|(?:can|could|would|will)\s+you\s+)*(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
   /\b(?:find|locate|identify|investigate|diagnose|analy[sz]e|inspect|trace)\b.{0,80}\b(?:root causes?|causes?|issues?|problems?|bugs?|errors?|failures?|faults?)\b.{0,120}\b(?:implement|fix|repair|resolve|update|patch|modify|refactor|remove|replace|change)\b/i,
+  /(?:找到|定位|找出|排查|诊断|分析|检查).{0,40}(?:问题|bug|错误|异常|故障|原因|root cause).{0,80}(?:修复|解决|改掉)/i,
   /(?:[.!?;,：，。！？；]\s*|\b(?:and|then|next)\s+)(?:please\s+)?(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|remove|replace|add|change)\b/i,
   /^(?:(?:请|帮我|现在|直接|立即|马上|开始|继续|然后|随后|再)\s*)*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
-  /(?:[，。！？；：]\s*|(?:并且|然后|随后|再|并)\s*)(?:请|帮我|现在|直接)?\s*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
+  /(?:[，。！？；：]\s*|(?:并且|然后|随后|并)\s*)(?:请|帮我|现在|直接)?\s*(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)/i,
+  /^(?:请|先|首先|直接|现在)?(?:执行|开始执行|继续执行).{0,32}(?:修复|修改|处理|实现|改动|改造|重构|完善|部署|发布)/i,
+  /(?:把|将).{0,48}(?:写入|创建|修改|删除|替换)/i,
 ];
 
 const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
@@ -380,7 +390,20 @@ const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
 ];
 
 function hasReadOnlyWorkspaceConstraint(input: string): boolean {
-  return matchesAny(input, READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS);
+  // A standalone request to skip planning governs the workflow, not source
+  // write authority. Keep compound prohibitions and filenames such as
+  // plan.md intact so their actual write restrictions still apply.
+  const effectConstraints = input
+    .replace(/(?:不要|无需|不需要|请勿|禁止|别)\s*(?:生成|创建|写|制定)(?:一个|一份)?(?:计划|方案)\s*(?=[，。！？；;,!?]|$)/gi, "")
+    .replace(/\b(?:do not|don't|dont|no need to)\s+(?:generate|create|write|make)\s+(?:(?:a|the)\s+)?(?:plan|proposal)\s*(?=[,;!?]|\.(?:\s|$)|$)/gi, "");
+  return matchesAny(effectConstraints, READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS);
+}
+
+function workspaceMutationRequestClauses(input: string): string[] {
+  // Keep filename dots and paths intact. Coordination with its own subject is
+  // a new clause; noun phrases such as "black and white button" remain whole.
+  return input.split(/[,，。！？；!?;\r\n]+|\.(?=\s|$)|\band\s+(?=(?:[a-z]+\s+){0,2}(?:i|we|you|they|he|she|it)\b)/i)
+    .map((clause) => clause.trim()).filter(Boolean);
 }
 
 /**
@@ -393,10 +416,14 @@ export function looksLikeExplicitWorkspaceMutationRequest(input: string): boolea
   if (!normalizedInput || hasReadOnlyWorkspaceConstraint(normalizedInput)) return false;
   if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) return false;
   if (!WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput)) return false;
-  return (
-    matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS) ||
-    matchesAny(normalizedInput, DIRECT_WORKSPACE_MUTATION_PATTERNS)
-  );
+  return workspaceMutationRequestClauses(normalizedInput).some((clause) => {
+    if (!WORKSPACE_MUTATION_REQUEST_RE.test(clause)) return false;
+    const hasTarget = WORKSPACE_MUTATION_TARGET_RE.test(clause) ||
+      /\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b/.test(clause);
+    return (hasTarget || WORKSPACE_REPAIR_REQUEST_RE.test(clause)) &&
+      (matchesAny(clause, DIRECT_WORKSPACE_MUTATION_PATTERNS) ||
+        (hasTarget && matchesAny(clause, STRONG_EXECUTE_PATTERNS)));
+  });
 }
 
 const COMPLEX_IMPLEMENTATION_PATTERNS = [
@@ -957,7 +984,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (/\bgit\s+(?:add|commit|push|status|diff|log|branch|checkout|switch|merge|rebase)\b/i.test(normalizedInput) || /(?:提交|推送|查看|检查).{0,16}(?:git|代码|改动|变更|状态)/i.test(normalizedInput) || /(?:提交|commit).{0,16}(?:推送|push)|(?:推送|push).{0,16}(?:提交|commit)|^(?:提交|推送)(?:一下)?$/i.test(normalizedInput) || /(?:commit|push)(?: my| the| these| current)?(?: changes| branch| commits)?/i.test(normalizedInput)) {
+  if (/\bgit\s+(?:add|commit|push|status|diff|log|branch|checkout|switch|merge|rebase)\b/i.test(normalizedInput) || /(?:提交|推送).{0,16}(?:git|代码|改动|变更|状态)|(?:查看|检查).{0,16}git/i.test(normalizedInput) || /(?:提交|commit).{0,16}(?:推送|push)|(?:推送|push).{0,16}(?:提交|commit)|^(?:提交|推送)(?:一下)?$/i.test(normalizedInput) || /(?:commit|push)(?: my| the| these| current)?(?: changes| branch| commits)?/i.test(normalizedInput)) {
     return createCommandDirective("git", {
       source,
       action: inferGitAction(normalizedInput),
@@ -969,7 +996,10 @@ export function inferCommandDirective(
     });
   }
 
-  if (/\bunity\b|unity\s*mcp|editor\s*plugin|roslyn|prefab|scene|asset|yaml|\.asmdef\b|\.unity\b|\.prefab\b|预制体|场景|资源|编辑器插件|引用搜索|C#执行|c# 执行/i.test(normalizedInput)) {
+  if (/\bunity\b|unity\s*mcp|editor\s*plugin|roslyn|prefab|scene|asset|yaml|\.asmdef\b|\.unity\b|\.prefab\b|预制体|场景|资源|编辑器插件|引用搜索|C#执行|c# 执行/i.test(normalizedInput) &&
+    (intent === "execute" || intent === "plan" || workspaceMutationExpected ||
+      hasExplicitUnityConsoleDiagnosticCue(normalizedInput) || naturalShellOperation || explicitShellCommand ||
+      /^(?:(?:please|can you|could you)\s+)*(?:run|execute)\b/i.test(normalizedInput))) {
     return createCommandDirective("unity", {
       source,
       action: inferUnityAction(normalizedInput),
@@ -1005,7 +1035,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (intent === "report" || matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
+  if (!workspaceMutationExpected && (intent === "report" || matchesAny(normalizedInput, STRONG_REPORT_PATTERNS))) {
     return createCommandDirective("report", {
       source,
       action: "generate_report",
@@ -1548,7 +1578,8 @@ export function resolveTurnRunIntent(
     });
   }
 
-  if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
+  if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS) &&
+    !looksLikeExplicitWorkspaceMutationRequest(normalizedInput)) {
     return finalize({
       intent: isWorkspaceTurn ? "report" : "respond",
       reason: localizeReason(
@@ -1568,8 +1599,14 @@ export function resolveTurnRunIntent(
 
   const hasStrongSummarizeSignal = matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS);
   const hasStrongExecuteSignal =
-    matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS) ||
-    looksLikeExplicitWorkspaceMutationRequest(normalizedInput);
+    looksLikeExplicitWorkspaceMutationRequest(normalizedInput) ||
+    (isWorkspaceTurn && !hasReadOnlyWorkspaceConstraint(normalizedInput) &&
+      workspaceMutationRequestClauses(normalizedInput).some((clause) =>
+        WORKSPACE_MUTATION_TARGET_RE.test(clause) &&
+        CURRENT_WORKSPACE_CHANGE_REQUEST_RE.test(clause))) ||
+    (!hasReadOnlyWorkspaceConstraint(normalizedInput) &&
+      !WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput) &&
+      matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS));
   const hasStrongAnalyzeSignal = matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS);
 
   if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {
@@ -1702,28 +1739,6 @@ export function resolveTurnRunIntent(
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "medium",
-    });
-  }
-
-  if (isWorkspaceTurn && looksLikeAmbiguousChatExecutionInput(normalizedInput)) {
-    return finalize({
-      intent: "execute",
-      reason: localizeReason(
-        language,
-        "检测到工作区中的功能新增或修改请求；本轮进入执行流程，实际变更仍由工具调用审批约束。",
-        "Detected a feature addition or modification request in the workspace. This turn enters execution while actual changes remain tool-approval gated.",
-      ),
-      confidence: 0.9,
-      bypassMainRouter: false,
-      riskLevel: "medium",
-      commandDirective: createCommandDirective("file_modify", {
-        source: "natural_language",
-        action: "workspace_file_change",
-        requiresWorkspace: true,
-        requiresApproval: true,
-        confidence: 0.9,
-        reason: "Workspace feature modification intent detected.",
-      }),
     });
   }
 

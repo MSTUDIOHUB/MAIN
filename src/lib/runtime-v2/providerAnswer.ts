@@ -119,16 +119,29 @@ export function runtimeV2ProviderAnswerText(
 
 /** Never look past newer work, a failed response, or an in-flight operation
  * to recycle a report authored for an earlier evidence boundary. */
-export function latestRuntimeV2Answer(state: TurnAggregateV1, conclusionOnly = false): string {
+export function latestRuntimeV2Answer(state: TurnAggregateV1, conclusionOnly = false, input: {
+  /** Select a parent draft for the controller's child join, never acceptance. */
+  readonly allowPendingChildJoin?: boolean;
+} = {}): string {
   if (state.pendingToolCalls.length || state.scheduledCommands.length ||
-    state.subagents?.some((job) => job.status === "queued" || job.status === "running")) return "";
+    (!input.allowPendingChildJoin && state.subagents?.some((job) => job.status === "queued" || job.status === "running"))) return "";
+  let adoptedResponseId: string | null = null;
   for (let i = state.events.length - 1; i >= 0; i -= 1) {
     const event = state.events[i]!;
+    if (event.type === "subagent.handoff_applied") {
+      // This receipt acknowledges evidence used by its exact parent answer;
+      // it introduces no newer evidence that would invalidate that answer.
+      if (event.source !== "provider_result" ||
+        (adoptedResponseId !== null && adoptedResponseId !== event.sourceEventId)) return "";
+      adoptedResponseId = event.sourceEventId;
+      continue;
+    }
     if (event.type === "tool.completed" || event.type === "validation.completed" || event.type === "run.started" ||
-      event.type === "observation.recorded" || event.type === "subagent.completed" || event.type === "subagent.handoff_delivered" || event.type === "subagent.handoff_applied" ||
+      event.type === "observation.recorded" || event.type === "subagent.completed" || event.type === "subagent.handoff_delivered" ||
       (event.type === "command.scheduled" && event.command.kind === "request_model")) return "";
     if (event.type !== "provider.responded") continue;
     if (state.run && event.run.runId !== state.run.identity.runId) return "";
+    if (adoptedResponseId !== null && adoptedResponseId !== event.eventId) return "";
     const request = state.events.find((item) => item.type === "command.scheduled" && item.command.idempotencyKey === event.idempotencyKey);
     const isConclude = request?.type === "command.scheduled" &&
       (request.command.payload.mode === "conclude" ||
