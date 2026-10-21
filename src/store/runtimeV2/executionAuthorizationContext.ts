@@ -265,10 +265,11 @@ export function authorizationFor(
   input: RuntimeV2ExecutionPortsInput,
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
+    const state = { ...input.get(), ...(input.context.workspaceMcpSnapshot || {}) };
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
       isReadOnlyContext(input)
-        ? { ...input.get(), webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
-        : input.get(),
+        ? { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
+        : state,
       input.context.skillCatalog,
     );
   }

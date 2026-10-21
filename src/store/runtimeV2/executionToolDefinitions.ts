@@ -150,9 +150,19 @@ export function logRuntimeV2SkillLoad(input: {
   if (input.toolName !== LOAD_SKILL_TOOL_NAME || !input.succeeded) return;
   let revision: string | null = null;
   try {
-    revision = String(
-      JSON.parse(String(input.rawOutput || "")).version || "",
-    ) || null;
+    const result = JSON.parse(String(input.rawOutput || ""));
+    if (result.type === "skill.catalog") {
+      input.logStoreEvent("runtime_v2_skill_catalog_listed", {
+        turnId: input.turnId,
+        runId: input.runId,
+        total: result.total,
+        returned: Array.isArray(result.entries) ? result.entries.length : 0,
+        hasNextPage: !!result.nextCursor,
+        effect: "metadata_only",
+      });
+      return;
+    }
+    revision = String(result.version || "") || null;
   } catch {
     revision = null;
   }

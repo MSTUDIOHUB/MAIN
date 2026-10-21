@@ -518,3 +518,20 @@ test("disabled MCP keys are a hard authorization boundary that explicit prompts 
     assert.match(denied.reason || "", /disabled|禁用/i);
   }
 });
+
+test("Runtime MCP authorization consumes the admitted workspace snapshot rather than a switched UI workspace", () => {
+  const admitted = stateForMcp([mcpTool("admitted_read", "Read admitted workspace")], { admitted_read: "http://fixture.example/mcp" });
+  const switched = stateForMcp([mcpTool("other_workspace_read", "Read another workspace")], { other_workspace_read: "http://fixture.example/mcp" });
+  const ports = portsFor(switched);
+  ports.context.workspaceMcpSnapshot = {
+    workspace: "/workspace-a",
+    mcpServers: admitted.mcpServers,
+    mcpDiscoveredTools: admitted.mcpDiscoveredTools,
+    mcpToolServerMap: admitted.mcpToolServerMap,
+  };
+  const frozen = authorizationContext.authorizationFor(ports);
+  assert.ok(frozen.toolCatalog.entries.some((entry) => entry.executionName === "admitted_read"));
+  assert.ok(!frozen.toolCatalog.entries.some((entry) => entry.executionName === "other_workspace_read"));
+  ports.context.workspaceMcpSnapshot = null;
+  assert.equal(authorizationContext.authorizationFor(ports), frozen);
+});

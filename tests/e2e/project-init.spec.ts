@@ -131,6 +131,8 @@ test("/init is the last workspace shortcut and remains visibly disabled without 
   expect(shortcutIds.at(-1)).toBe("main-shortcut-item-init");
   await expect(page.getByText("工作区命令", { exact: true })).toBeVisible();
   await expect(page.getByTestId("main-shortcut-item-init")).toBeEnabled();
+  await expect(page.getByTestId("main-shortcut-item-init")).toContainText("生成／刷新项目说明");
+  await expect(page.getByTestId("main-shortcut-item-init")).toContainText("可选");
 
   await page.evaluate(() => (window as any).__CODELY_E2E__?.switchComposerSubmissionWorkspace?.(""));
   await expect.poll(async () => (await readRuntimeSnapshot(page))?.currentWorkspace).toBe("");
@@ -167,6 +169,10 @@ test("preview, Cancel, and Escape never create a Turn or commit a file", async (
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   await openReadyPreview(page);
+  await expect(page.getByRole("heading", { name: "生成／刷新项目说明", exact: true })).toBeVisible();
+  await expect(page.locator("#project-init-review-description")).toContainText("每轮都会自动读取项目基线");
+  await expect(page.locator("#project-init-review-description")).toContainText("只有确认后才写入");
+  await expect(page.locator("#project-init-review-description")).toContainText("/init --refresh");
   await expect(page.getByTestId("project-init-review-cancel")).toBeFocused();
   await expect(page.getByTestId("project-init-review-workspace")).toHaveText(WORKSPACE);
   await expect(page.getByTestId("project-init-review-target")).toHaveText(TARGET_PATH);
@@ -291,5 +297,6 @@ test("the review dialog stays visible in light, dark, and black themes", async (
     await expect(dialog).toBeVisible();
     await expect(page.getByTestId("project-init-review-status")).toBeVisible();
     await expect(page.getByTestId("project-init-review-diff")).toBeVisible();
+    await page.screenshot({ path: test.info().outputPath(`project-notes-${themeMode}.png`), fullPage: true });
   }
 });

@@ -59,6 +59,7 @@ function baseInput(overrides = {}) {
     uiDisplayTurnId: "turn-ui",
     runWorkspace: "/repo",
     runSessionKey: "/repo:7",
+    runSessionEpoch: "session-epoch-7",
     runSessionId: 7,
     runScopeKey: "/repo",
     phaseLanguage: "zh",
@@ -111,6 +112,7 @@ test("submit runtime context carries immutable turn parameters and initializes m
   assert.equal(context.uiDisplayTurnId, "turn-ui");
   assert.equal(context.runWorkspace, "/repo");
   assert.equal(context.runSessionKey, "/repo:7");
+  assert.equal(context.runSessionEpoch, "session-epoch-7");
   assert.equal(context.phaseLanguage, "zh");
   assert.equal(context.effectiveRunIntent, "execute");
   assert.deepEqual(context.effectiveCommandDirective, input.effectiveCommandDirective);

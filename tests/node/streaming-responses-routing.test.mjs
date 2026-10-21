@@ -1902,6 +1902,46 @@ test("adapter-derived reasoning controls do not leak to unknown endpoints", asyn
   assert.equal(requests[4].body.thinking_budget, 2048);
 });
 
+test("a failed Rust stream acknowledgement cancels the exact dispatched request and ignores late events", async () => {
+  const listeners = new Map();
+  const calls = [];
+  const errors = [];
+  let active = false;
+  let dispatchedId;
+  let lateDone;
+  let doneCount = 0;
+  const startupError = new Error("IPC acknowledgement failed after dispatch");
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "start_chat_stream") {
+      active = true;
+      dispatchedId = args.streamId;
+      lateDone = listeners.get("chat-stream-done");
+      throw startupError;
+    }
+    assert.equal(command, "cancel_chat_stream");
+    assert.equal(args.streamId, dispatchedId);
+    active = false;
+  }, async (name, handler) => {
+    listeners.set(name, handler);
+    return () => listeners.delete(name);
+  });
+
+  await assert.rejects(streamChatCompletion(
+    [{ role: "user", content: "Summarize this project." }],
+    { baseUrl: "http://127.0.0.1:8000/v1", model: "local-model", provider: "OMLX", useRustProxy: true },
+    { onToken() {}, onDone() { doneCount += 1; }, onError(error) { errors.push(error); } },
+  ), /IPC acknowledgement failed after dispatch/);
+
+  assert.equal(active, false, "a failed acknowledgement does not prove the backend request never started");
+  assert.deepEqual(calls.map(call => call.command), ["start_chat_stream", "cancel_chat_stream"]);
+  assert.equal(listeners.size, 0);
+  lateDone({ payload: { stream_id: dispatchedId, status: "ok" } });
+  assert.equal(doneCount, 0);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].message, startupError.message);
+});
+
 test("local Rust streams stop reasoning-only runaway output", async () => {
   const listeners = new Map();
   const invokeCalls = [];

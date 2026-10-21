@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 
 import ts from "typescript";
 
@@ -18,24 +19,18 @@ async function loadAgentSkillsModule(ipcStubs) {
     fileName: sourcePath,
   }).outputText;
 
+  const protocolPath = path.join(workspaceRoot, "src/lib/protocolPackages.ts");
+  const protocolOutput = ts.transpileModule(await fs.readFile(protocolPath, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+    fileName: protocolPath,
+  }).outputText;
+  const protocolModule = { exports: {} };
+  new Function("exports", "module", protocolOutput)(protocolModule.exports, protocolModule);
   const module = { exports: {} };
   const localRequire = (specifier) => {
+    if (specifier === "yaml") return createRequire(import.meta.url)(specifier);
     if (specifier === "./ipc") return ipcStubs;
-    if (specifier === "./protocolPackages") {
-      return {
-        getApplicableProtocolPackagesForWorkspace: (skills, workspace) =>
-          skills.filter((skill) =>
-            skill.active && skill.type === "package" &&
-            skill.workspaceScope === workspace
-          ),
-        getProtocolPackageEntryPath: (skill) =>
-          `${skill.packagePath}/${skill.entryPoint || "SKILL.md"}`,
-        isSafeProtocolPackagePath: (packagePath, entryPoint) =>
-          packagePath.startsWith(".protocols/") &&
-          !packagePath.includes("..") &&
-          !String(entryPoint || "").includes(".."),
-      };
-    }
+    if (specifier === "./protocolPackages") return protocolModule.exports;
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   new Function("exports", "module", "require", transpiled)(
@@ -138,6 +133,8 @@ test("Skill admission exposes metadata first and loads exact content on demand",
   assert.match(loaded.content, /REPO_SKILL_BODY_SENTINEL/);
   assert.equal(loaded.basePath, ".agents/skills/release");
   assert.match(loaded.version, /^[a-f0-9]{8}$/);
+  assert.match(loaded.hostGuidance, /partial index/);
+  assert.match(loaded.hostGuidance, /advertised/);
 });
 
 test("Skill snapshots are immutable and reject unknown or ambiguous explicit names", async () => {
@@ -249,4 +246,144 @@ test("personal $HOME/.agents/skills documents are admitted in global and workspa
   assert.deepEqual(globalSnapshot.entries[0].supportingFiles, [
     "/Users/test/.agents/skills/personal/references/checklist.md",
   ]);
+});
+
+test("Skill YAML scalars preserve folded paragraphs, literal lines, quoting and exact document bytes", async () => {
+  const cases = [
+    ["folded", ">-\n  First line\n  continues here.\n\n  Another paragraph.", "First line continues here.\nAnother paragraph."],
+    ["literal", "|-\n  First line\n  second line\n\n  Last line", "First line\nsecond line\n\nLast line"],
+    ["indented", ">2- # scalar indicator comment\n  Intro\n    code line\n  Back", "Intro\n  code line\nBack"],
+    ["quoted", '"Keep # hashes and \\"quotes\\"." # comment', 'Keep # hashes and "quotes".'],
+    ["single-quoted", "'It''s # literal.' # comment", "It's # literal."],
+    ["plain", "First line\n  continues with details.", "First line continues with details."],
+  ];
+  const documents = cases.map(([name, scalar]) => ({
+    entryPath: `/skills/${name}/SKILL.md`,
+    basePath: `/skills/${name}`,
+    content: `---\r\nname: ${name}\r\ndescription: ${scalar.replace(/\n/g, "\r\n")}\r\nmetadata:\r\n  description: Must not override the root description\r\n---\r\n# Body\r\n\r\n`,
+    supportingFiles: [],
+  }));
+  const { loadSkillCatalog, loadSkillContent } = await loadAgentSkillsModule({
+    discoverPersonalAgentSkills: async () => documents,
+  });
+  const snapshot = await loadSkillCatalog({ workspace: "", skills: [] });
+  for (const [index, [name, , expected]] of cases.entries()) {
+    const entry = snapshot.entries.find((candidate) => candidate.name === name);
+    assert.equal(entry.description, expected, name);
+    assert.equal(loadSkillContent(snapshot, entry.id).content, documents[index].content);
+  }
+});
+
+test("Skill frontmatter accepts BOM and reports invalid YAML or non-scalar metadata without expanding aliases", async () => {
+  const { parseSkillDocument, loadSkillCatalog } = await loadAgentSkillsModule({
+    discoverPersonalAgentSkills: async () => [{
+      entryPath: "/skills/invalid/SKILL.md", basePath: "/skills/invalid",
+      content: "---\nname: [broken\n---\nUNCHANGED\n", supportingFiles: [],
+    }],
+  });
+  const source = '\uFEFF---\r\nname: "escape-\\u006eame"\r\ndescription: "quoted # value" # comment\r\n---\r\nBody\r\n';
+  const parsed = parseSkillDocument(source, "fallback", "fallback description");
+  assert.equal(parsed.name, "escape-name");
+  assert.equal(parsed.description, "quoted # value");
+  assert.equal(parsed.body, source);
+  assert.deepEqual(parsed.warnings, []);
+  for (const frontmatter of ["- list instead of mapping", "name: first\nname: duplicate", "name: {nested: value}"]) {
+    const invalid = parseSkillDocument(`---\n${frontmatter}\n---\nBODY\n`, "fallback", "fallback description");
+    assert.equal(invalid.name, "fallback");
+    assert.ok(invalid.warnings.length > 0);
+  }
+  const aliases = parseSkillDocument("---\nname: &label scalar\ndescription: *label\n---\nBODY\n", "fallback", "fallback description");
+  assert.equal(aliases.description, "fallback description");
+  assert.ok(aliases.warnings.length > 0);
+  const snapshot = await loadSkillCatalog({ workspace: "", skills: [] });
+  assert.equal(snapshot.entries[0].name, "invalid");
+  assert.match(snapshot.warnings[0], /Invalid YAML frontmatter/);
+  assert.equal(snapshot.entries[0].content, "---\nname: [broken\n---\nUNCHANGED\n");
+});
+
+test("Skill catalog listing pages every visible entry without exposing bodies or manual-only Skills", async () => {
+  const { loadSkillCatalog, listSkillCatalog, renderSkillCatalogContext, buildLoadSkillToolDefinition } =
+    await loadAgentSkillsModule({});
+  const skills = Array.from({ length: 37 }, (_, index) => ({
+    id: `entry-${index}`, name: `unity-workflow-${index}`,
+    desc: `Unity workflow ${index}: ${"long description ".repeat(50)}`,
+    content: `SECRET_BODY_${index}`, active: true, type: "instruction",
+  }));
+  skills.push({ id: "manual", name: "hidden-manual", desc: "Secret workflow", content: "HIDDEN_BODY", active: true, allowImplicitInvocation: false });
+  const snapshot = await loadSkillCatalog({ workspace: "", skills });
+  const seen = [];
+  let cursor;
+  do {
+    const page = listSkillCatalog(snapshot, { limit: 7, cursor });
+    assert.equal(page.type, "skill.catalog");
+    assert.equal(page.total, 37);
+    assert.ok(page.entries.length <= 7);
+    assert.doesNotMatch(JSON.stringify(page), /SECRET_BODY|HIDDEN_BODY|hidden-manual/);
+    seen.push(...page.entries.map((entry) => entry.id));
+    cursor = page.nextCursor;
+  } while (cursor);
+  assert.deepEqual(seen, skills.slice(0, 37).map((skill) => `panel:${skill.id}`));
+  assert.equal(listSkillCatalog(snapshot, { query: "hidden-manual" }).total, 0);
+  assert.deepEqual(listSkillCatalog(snapshot, { query: "unity-workflow-36" }).entries.map((entry) => entry.name), ["unity-workflow-36"]);
+  const firstPage = listSkillCatalog(snapshot, { limit: 1 });
+  assert.throws(() => listSkillCatalog(snapshot, { cursor: firstPage.nextCursor, query: "other" }), /SKILL_CATALOG_CURSOR_INVALID/);
+  assert.throws(() => listSkillCatalog(snapshot, { cursor: "bad-cursor" }), /SKILL_CATALOG_CURSOR_INVALID/);
+  const changed = await loadSkillCatalog({ workspace: "", skills: skills.map((skill, index) => index === 0 ? { ...skill, content: "REVISED_BODY" } : skill) });
+  assert.throws(() => listSkillCatalog(changed, { cursor: firstPage.nextCursor }), /SKILL_CATALOG_CURSOR_INVALID/);
+
+  const context = renderSkillCatalogContext(snapshot, 8_000);
+  assert.match(context, /unity-workflow-36/);
+  assert.match(context, /load_skill/);
+  assert.match(context, /operation.*list/);
+  assert.doesNotMatch(context, /SECRET_BODY|hidden-manual/);
+  assert.ok(context.length <= 8_000);
+  const smallContext = renderSkillCatalogContext(snapshot, 512);
+  assert.ok(smallContext.length <= 512);
+  assert.match(smallContext, /operation.*list/);
+  assert.match(smallContext, /37/);
+  const schema = buildLoadSkillToolDefinition(snapshot).function.parameters;
+  assert.deepEqual(schema.properties.operation.enum, ["load", "list"]);
+  assert.ok(!schema.required?.includes("skill_id"), "list does not need an entry id");
+
+  const explicit = await loadSkillCatalog({ workspace: "", skills, userPrompt: "Use $hidden-manual" });
+  assert.equal(listSkillCatalog(explicit, { query: "hidden-manual" }).entries[0].explicitlyRequested, true);
+});
+
+test("one protocol package admits every safe entry with per-entry bases and combined invocation policy", async () => {
+  const files = {
+    ".protocols/unity/skills/one/SKILL.md": "---\nname: unity-one\ndescription: First Unity workflow\n---\nONE\n",
+    ".protocols/unity/skills/two/SKILL.md": "---\nname: unity-two\ndescription: Second Unity workflow\n---\nTWO\n",
+    ".protocols/unity/skills/two/agents/openai.yaml": "policy:\n  allow_implicit_invocation: false\n",
+  };
+  const reads = [];
+  const { loadSkillCatalog, listSkillCatalog, loadSkillContent } = await loadAgentSkillsModule({
+    globSearch: async () => [],
+    readFile: async (target) => {
+      reads.push(target);
+      if (!(target in files)) throw new Error("missing");
+      return files[target];
+    },
+  });
+  const skill = {
+    id: "unity", name: "Unity bundle", desc: "fallback", content: "", active: true, type: "package",
+    packagePath: ".protocols/unity", entryPoint: "skills/one/SKILL.md",
+    entryPoints: ["skills/one/SKILL.md", "skills/two/SKILL.md", "../escape/SKILL.md", "/escape/SKILL.md", "skills/one/../../../escape/SKILL.md", ""],
+    workspaceScope: "/repo",
+  };
+  const snapshot = await loadSkillCatalog({ workspace: "/repo", skills: [skill] });
+  assert.deepEqual(snapshot.entries.map((entry) => entry.id), [
+    "package:unity:skills/one/SKILL.md", "package:unity:skills/two/SKILL.md",
+  ]);
+  assert.equal(snapshot.entries[1].basePath, ".protocols/unity/skills/two");
+  assert.equal(loadSkillContent(snapshot, snapshot.entries[1].id).content, files[".protocols/unity/skills/two/SKILL.md"]);
+  assert.deepEqual(listSkillCatalog(snapshot).entries.map((entry) => entry.name), ["unity-one"]);
+  assert.ok(snapshot.warnings.some((warning) => /unsafe/.test(warning)));
+  assert.ok(!reads.some((target) => target.includes("escape")));
+
+  const disabled = await loadSkillCatalog({ workspace: "/repo", skills: [{ ...skill, allowImplicitInvocation: false }] });
+  assert.equal(listSkillCatalog(disabled).total, 0);
+  const explicit = await loadSkillCatalog({ workspace: "/repo", skills: [{ ...skill, allowImplicitInvocation: false }], userPrompt: "Use $unity-two" });
+  assert.deepEqual(explicit.explicitSkillIds, ["package:unity:skills/two/SKILL.md"]);
+  const single = await loadSkillCatalog({ workspace: "/repo", skills: [{ ...skill, entryPoints: ["skills/one/SKILL.md"] }] });
+  assert.equal(single.entries[0].id, "package:unity");
 });

@@ -71,6 +71,7 @@ import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 import {
   LOAD_SKILL_TOOL_NAME,
   isSkillVisibleToModel,
+  listSkillCatalog,
   loadSkillContent,
   type SkillCatalogSnapshot,
 } from "./agentSkills";
@@ -376,10 +377,21 @@ export async function executeTool(
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
-    const skillId = String(args.skill_id || "").trim();
     if (!options.skillCatalog) {
       throw new Error("SKILL_CATALOG_UNAVAILABLE: no Skill catalog was admitted for this Turn.");
     }
+    const operation = String(args.operation || "load").trim();
+    if (operation === "list") {
+      return JSON.stringify(listSkillCatalog(options.skillCatalog, {
+        query: parseOptionalString(args.query),
+        cursor: parseOptionalString(args.cursor),
+        limit: parseOptionalNumber(args.limit),
+      }));
+    }
+    if (operation !== "load") {
+      throw new Error(`SKILL_OPERATION_INVALID: ${operation}`);
+    }
+    const skillId = String(args.skill_id || "").trim();
     if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
       throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
     }

@@ -433,7 +433,7 @@ export function createRuntimeV2SchedulerPort(
             })`,
             `Status: ${result.status}`,
             `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-            `Report: ${result.summary.slice(0, 4_000)}`,
+            `Report: ${result.summary}`,
             evidenceIds.length > 0
               ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
               : "No child evidence id is available for parent adoption; continue the objective directly.",
@@ -449,7 +449,7 @@ export function createRuntimeV2SchedulerPort(
               `[runtime-v2 context: ${contextEntryId}]`,
             ) &&
             message.content.includes(
-              `Report: ${result.summary.slice(0, 4_000)}`,
+              `Report: ${result.summary}`,
             ) &&
             message.content.includes(
               `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
@@ -518,7 +518,7 @@ export function createRuntimeV2SchedulerPort(
                     result.evidence.map((evidence) => evidence.id)
                       .join(", ") || "none"
                   }`,
-                  `Summary: ${result.summary.slice(0, 2_000)}`,
+                  `Summary: ${result.summary}`,
                 ]
               : []),
             observedJobs.some((job) => job.status !== "completed")

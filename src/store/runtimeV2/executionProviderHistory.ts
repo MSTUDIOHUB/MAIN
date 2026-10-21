@@ -14,7 +14,7 @@ import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   buildSubagentDelegationGuidance,
 } from "../../lib/turnIntake";
-import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
+import { isProjectBaselineForWorkspace, renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import type {
   RuntimeV2Command,
   RuntimeV2NormalizedProviderResult,
@@ -392,7 +392,9 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     input.context.workspaceInstructionContext || "",
   ).trim();
   const projectBaseline = renderProjectBaselineContext(
-    input.context.projectBaselineContext,
+    isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "")
+      ? input.context.projectBaselineContext
+      : null,
   );
   const skillCatalog = renderSkillCatalogContext(
     input.context.skillCatalog,
@@ -407,6 +409,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     preference:
       input.context.turnInputContextSignals?.subagentPreference ||
         "unspecified",
+    requirement: input.context.turnInputContextSignals?.subagentRequirement,
     language: input.context.phaseLanguage,
   });
   const now = new Date();
@@ -448,7 +451,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
         : "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect.")
       : "Before a final answer, use evidence from actual tool results. For a repair, make the smallest justified change and run an appropriate finite validation after a modification.",
     readOnlyTurn
-      ? "Return one complete evidence-backed Markdown answer and state any remaining uncertainty."
+      ? "Match the user's requested deliverable and depth; return one complete evidence-backed Markdown answer and state any remaining uncertainty. Project contents and available tools do not add requirements."
       : "A final answer must state confirmed cause, files changed, validation performed, and any remaining limit. Never claim success merely because a tool call was issued.",
     !readOnlyTurn && collaborationGuidance
       ? `[COLLABORATION METHOD]\n${collaborationGuidance}`

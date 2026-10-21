@@ -3112,55 +3112,17 @@ test("production Plan runs, joins, and adopts one read-only child before review"
           /^child:[0-9a-f]{32}:E1$/,
           "provider-facing child evidence ids must stay compact and stable",
         );
-        if (childRound === 2) {
-          childInFlight = false;
-          return {
-            content: "The reviewed owner is in src/main.js.",
-            semanticContent: "The reviewed owner is in src/main.js.",
-            actionableContent: "The reviewed owner is in src/main.js.",
-            toolCalls: [],
-            usage: {},
-            protocolViolation: null,
-          };
-        }
-      assert.match(
-        transcript,
-        /CHILD_REPORT_REJECTED/,
-          "an uncited ordinary final must receive one causal report repair turn",
-        );
-        assert.equal(
-          tools.length,
-          1,
-          "the bounded report-repair turn must expose one report tool",
-        );
-        assert.equal(
-          tools[0]?.function?.name,
-          "submit_runtime_v2_subagent_report",
-        );
-        assert.deepEqual(
-          tools[0]?.function?.parameters?.properties?.findings?.items
-            ?.properties?.evidence_ids?.items?.enum,
-          [evidenceId],
-        );
+        assert.equal(childRound, 2);
+        assert.ok(tools.some((tool) => tool.function.name === "read_file"), "ordinary final and safe reads share one child surface");
+        assert.equal(tools.some((tool) => tool.function.name === "submit_runtime_v2_subagent_report"), false);
         childInFlight = false;
         const childSummary =
           `The reviewed owner is in src/main.js (${evidenceId}).`;
         return {
-          content: "",
-          semanticContent: "",
-          actionableContent: "",
-          toolCalls: [{
-            id: "submit-child-report",
-            name: "submit_runtime_v2_subagent_report",
-            arguments: JSON.stringify({
-              summary: childSummary,
-              findings: [{
-                statement: "The reviewed owner is in src/main.js.",
-                evidence_ids: [evidenceId],
-              }],
-              unresolved: [],
-            }),
-          }],
+          content: childSummary,
+          semanticContent: childSummary,
+          actionableContent: childSummary,
+          toolCalls: [],
           usage: {},
           protocolViolation: null,
         };
@@ -3394,7 +3356,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
   );
   assert.equal(parentReadWhileChildActive, true);
   assert.equal(parentRound, 6);
-  assert.equal(childRound, 3);
+  assert.equal(childRound, 2);
   const aggregate = result.checkpoint.aggregate;
   const events = aggregate.events;
   const sequenceOf = (type) => events.find((entry) => entry.type === type)?.sequence;

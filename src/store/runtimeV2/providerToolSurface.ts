@@ -66,10 +66,9 @@ export function unexpectedRuntimeV2ProviderToolNames(
   )];
 }
 
-/** Runtime v2 preserves a bounded provider-selected batch when every call is
- * side-effect-free. Effects remain fenced one at a time, so a mutation,
- * command, validation, or collaboration action can never share a committed
- * batch with reads. */
+/** Independent reads and child scheduling may share a provider decision;
+ * each selected command still passes its own durable Runtime fence. Workspace
+ * effects (including joins that may commit staged work) remain isolated. */
 export function boundRuntimeV2ProviderToolCalls(
   calls: readonly RuntimeV2NormalizedToolCall[],
   attemptedIdentities: ReadonlySet<string> = new Set(),
@@ -147,7 +146,9 @@ export function boundRuntimeV2ProviderToolCalls(
           : "first",
     };
   }
-  if (calls.every((call) => call.name === "spawn_subagent")) {
+  if (calls.every((call) =>
+    call.name === "spawn_subagent" || isRuntimeV2ReadOnlyToolName(call.name)
+  )) {
     const maxSpawnSubagents = Math.max(
       0,
       Math.floor(
@@ -168,9 +169,19 @@ export function boundRuntimeV2ProviderToolCalls(
         selection: "all_attempted",
       };
     }
-    const acceptedIndices = novelEligibleIndices.slice(
-      0,
-      maxSpawnSubagents,
+    const selectedSpawns = new Set(novelEligibleIndices.filter(
+      (index) => calls[index]!.name === "spawn_subagent",
+    ).slice(0, maxSpawnSubagents));
+    if (selectedSpawns.size === 0 && !novelEligibleIndices.some(
+      (index) => isRuntimeV2ReadOnlyToolName(calls[index]!.name),
+    )) {
+      return { accepted: [], discarded: [...calls], selection: "all_rejected" };
+    }
+    // As in a pure read batch, retain cached read companions when the
+    // provider selected a novel observation or delegation. The child limit
+    // constrains scheduling only; it must never discard independent reads.
+    const acceptedIndices = eligibleIndices.filter((index) =>
+      isRuntimeV2ReadOnlyToolName(calls[index]!.name) || selectedSpawns.has(index)
     );
     if (acceptedIndices.length === 0) {
       return {

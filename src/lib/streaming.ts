@@ -2381,6 +2381,9 @@ async function streamViaRustProxy(
   }).catch(err => {
     if (resolved) return;
     resolved = true;
+    // An IPC acknowledgement can fail after Rust has dispatched the request.
+    // Release that exact backend lease before abandoning its event listeners.
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
     const error = toError(err, "Failed to start the cloud stream.");
     onError(error);
     rejectResult?.(error);

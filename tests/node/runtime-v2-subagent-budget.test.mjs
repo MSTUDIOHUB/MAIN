@@ -80,12 +80,16 @@ function fixtureChildReportTool(evidenceIds) {
   };
 }
 
-test("a child step is bounded to the parent request ceiling and still reports cited evidence", async () => {
+async function runChildFixture({ finalKind = "cited", readSource = true, sourceToolName = "read_file", sourceFails = false } = {}) {
   const runtime = loadTsWithMocks(
     path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"),
     new Map(),
   );
   const requestedOutputBudgets = [];
+  const requestedTools = [];
+  const requestedMessages = [];
+  const logs = [];
+  let executedTools = 0;
   let modelProgressMarks = 0;
   let providerRound = 0;
   let reportedEvidenceId = "";
@@ -96,11 +100,14 @@ test("a child step is bounded to the parent request ceiling and still reports ci
     _settings,
     callbacks,
     _signal,
-    _tools,
+    tools,
     maxOutputTokens,
   ) => {
     providerRound += 1;
     requestedOutputBudgets.push(maxOutputTokens);
+    requestedTools.push(tools.map((tool) => tool.function.name));
+    requestedMessages.push(messages.map((message) => ({ ...message })));
+    if (providerRound > 2) throw new Error("Unexpected forced report repair");
     callbacks.onLifecycle?.({
       phase: "model_progress",
       chunkCount: 1,
@@ -121,7 +128,7 @@ test("a child step is bounded to the parent request ceiling and still reports ci
         protocolViolation: null,
       };
     }
-    if (providerRound === 1) {
+    if (providerRound === 1 && readSource) {
       return {
         content: "",
         semanticContent: "",
@@ -130,7 +137,7 @@ test("a child step is bounded to the parent request ceiling and still reports ci
         toolCalls: [{
           index: 0,
           id: "qwen-read",
-          name: "read_file",
+          name: sourceToolName,
           arguments: JSON.stringify({ path: "src/main.js" }),
         }],
         finishReason: "tool_calls",
@@ -145,17 +152,19 @@ test("a child step is bounded to the parent request ceiling and still reports ci
       .map((message) => String(message.content || ""))
       .join("\n")
       .match(/child:[^\s,]+:E1/)?.[0] || "";
-    assert.match(reportedEvidenceId, /^child:[0-9a-f]{32}:E1$/);
+    if (readSource && !sourceFails) assert.match(reportedEvidenceId, /^child:[0-9a-f]{32}:E1$/);
+    const content = finalKind === "uncited"
+      ? "The save behavior appears ready; this is an advisory without a source citation."
+      : finalKind.endsWith("path")
+        ? `${finalKind === "long_path" ? "Project overview. ".repeat(350) : ""}The save path is confirmed by src/main.js.`
+        : `The save path is confirmed by ${reportedEvidenceId}.`;
     return {
-      content:
-        `The save path is confirmed by ${reportedEvidenceId}.`,
-      semanticContent:
-        `The save path is confirmed by ${reportedEvidenceId}.`,
-      actionableContent:
-        `The save path is confirmed by ${reportedEvidenceId}.`,
+      content,
+      semanticContent: content,
+      actionableContent: content,
       reasoningContent: "reasoning completed before the evidence report",
-      toolCalls: [],
-      finishReason: "stop",
+      toolCalls: finalKind === "truncated_action" ? [{ id: "partial-call", name: "read_file", arguments: '{"path":' }] : [],
+      finishReason: finalKind.startsWith("truncated") ? "length" : "stop",
       usage: {
         completion_tokens:
           reasoningTokensBeforeAction + minimumActionAndReportTokens,
@@ -186,7 +195,7 @@ test("a child step is bounded to the parent request ceiling and still reports ci
       TOOL_DEFINITIONS: [{
         type: "function",
         function: {
-          name: "read_file",
+          name: sourceToolName,
           description: "Read one source file.",
           parameters: {
             type: "object",
@@ -197,7 +206,11 @@ test("a child step is bounded to the parent request ceiling and still reports ci
       }],
     }],
     ["../../lib/toolExecutor", {
-      executeTool: async () => "export const saveReady = true;",
+      executeTool: async () => {
+        executedTools += 1;
+        if (sourceFails) throw new Error("source read failed");
+        return "export const saveReady = true;";
+      },
     }],
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || ""),
@@ -287,7 +300,7 @@ test("a child step is bounded to the parent request ceiling and still reports ci
     nextId: () => `child-call-${++nextId}`,
     now: () => Date.now(),
     lifecycleDeadlineAt: Date.now() + 30_000,
-    logStoreEvent() {},
+    logStoreEvent: (eventName, data) => logs.push({ eventName, data }),
   }, {
     id: "child-qwen",
     run: {
@@ -314,6 +327,12 @@ test("a child step is bounded to the parent request ceiling and still reports ci
     summary: null,
   }, new AbortController().signal);
 
+  return { result, requestedOutputBudgets, requestedTools, requestedMessages, executedTools, logs, modelProgressMarks, reportedEvidenceId, reasoningTokensBeforeAction, minimumActionAndReportTokens };
+}
+
+test("a child step is bounded to the parent request ceiling and still reports cited evidence", async () => {
+  const { result, requestedOutputBudgets, reportedEvidenceId, modelProgressMarks, reasoningTokensBeforeAction, minimumActionAndReportTokens } = await runChildFixture();
+
   assert.equal(result.status, "completed");
   assert.equal(result.evidence.length, 1);
   assert.deepEqual(
@@ -327,6 +346,68 @@ test("a child step is bounded to the parent request ceiling and still reports ci
       budget > reasoningTokensBeforeAction + minimumActionAndReportTokens
     ),
   );
+});
+
+test("an uncited child final returns retained evidence without a forced report-tool phase", async () => {
+  for (const readSource of [true, false]) {
+    const { result, requestedTools } = await runChildFixture({ finalKind: "uncited", readSource });
+    assert.equal(result.status, readSource ? "degraded" : "failed");
+    assert.equal(result.report, null);
+    assert.equal(result.evidence.length, readSource ? 1 : 0);
+    assert.equal(requestedTools.length, readSource ? 2 : 1);
+    assert.ok(requestedTools.every((names) => names.includes("read_file")));
+    assert.ok(requestedTools.every((names) => !names.includes("submit_runtime_v2_subagent_report")));
+  }
+});
+
+test("a child receives expected output and can cite the exact successfully read file path", async () => {
+  for (const finalKind of ["path", "long_path"]) {
+    const { result, requestedMessages, requestedTools, reportedEvidenceId } = await runChildFixture({ finalKind });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.report.findings[0].evidenceIds, [reportedEvidenceId]);
+    assert.equal(result.summary, result.report.findings[0].statement);
+    assert.ok(result.summary.endsWith("The save path is confirmed by src/main.js."));
+    if (finalKind === "long_path") assert.ok(result.summary.length > 4_000);
+    assert.match(requestedMessages[0][0].content, /Expected output: One cited finding\./);
+    assert.equal(requestedTools.length, 2);
+    assert.ok(requestedTools.every((names) => names.includes("read_file")));
+  }
+});
+
+test("directory and search observations cannot acquire source provenance from their target path", async () => {
+  for (const sourceToolName of ["list_directory", "grep_search"]) {
+    const { result, requestedTools } = await runChildFixture({ finalKind: "path", sourceToolName });
+    assert.equal(result.status, "degraded");
+    assert.equal(result.report, null);
+    assert.equal(result.evidence.length, 1);
+    assert.equal(requestedTools.length, 2);
+  }
+});
+
+test("a failed source read cannot complete a path-cited child report", async () => {
+  const { result } = await runChildFixture({ finalKind: "path", sourceFails: true });
+  assert.equal(result.status, "failed");
+  assert.equal(result.report, null);
+  assert.deepEqual(result.evidence, []);
+});
+
+test("a truncated child final or partial call is capacity evidence, never an accepted report or protocol fallback", async () => {
+  for (const finalKind of ["truncated", "truncated_action", "truncated_path"]) {
+    for (const readSource of [true, false]) {
+      const { result, requestedTools, logs, executedTools } = await runChildFixture({ finalKind, readSource });
+      assert.equal(result.status, readSource ? "degraded" : "failed");
+      assert.equal(result.report, null);
+      assert.equal(result.evidence.length, readSource ? 1 : 0);
+      assert.equal(executedTools, readSource ? 1 : 0, "only the preceding complete source call executes");
+      assert.equal(requestedTools.length, readSource ? 2 : 1, "capacity exhaustion must not switch transport or force a report");
+      assert.ok(requestedTools.every((names) => names.includes("read_file")));
+      const truncated = logs.find((entry) => entry.eventName === "runtime_v2_subagent_output_truncated");
+      assert.equal(truncated?.data?.finishReason, "length");
+      assert.equal(truncated?.data?.maxOutputTokens, 8_192);
+      assert.ok(truncated?.data?.visibleTextChars > 0);
+      assert.equal(logs.some((entry) => entry.eventName === "runtime_v2_subagent_protocol_drift"), false);
+    }
+  }
 });
 
 test("child evidence ids bind the complete child Run identity", () => {
@@ -368,7 +449,7 @@ test("child evidence ids bind the complete child Run identity", () => {
   );
 });
 
-test("a child report repair exposes one required effect-free report tool", async () => {
+test("a legacy report request uses the admitted child budget and preserves length instead of changing protocol", async () => {
   const runtime = loadTsWithMocks(
     path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"),
     new Map(),
@@ -380,6 +461,8 @@ test("a child report repair exposes one required effect-free report tool", async
   let wireTools = null;
   let wireOptions = null;
   let wireMaxOutputTokens = null;
+  let outputWasTruncated = false;
+  let providerRequests = 0;
   const logs = [];
   const provenStructuredToolTransports = new Set();
   const provider = loadTsWithMocks(
@@ -415,6 +498,7 @@ test("a child report repair exposes one required effect-free report tool", async
           maxOutputTokens,
           options,
         ) => {
+          providerRequests += 1;
           wireMessages = [...messages];
           wireTools = [...tools];
           wireOptions = { ...options };
@@ -433,6 +517,7 @@ test("a child report repair exposes one required effect-free report tool", async
             semanticContent: JSON.stringify(reportArguments),
             actionableContent: JSON.stringify(reportArguments),
             toolCalls: [],
+            finishReason: outputWasTruncated ? "length" : "stop",
             usage: {},
             protocolViolation: null,
           };
@@ -463,7 +548,7 @@ test("a child report repair exposes one required effect-free report tool", async
     ]),
   );
   const startedAt = Date.now();
-  const result = await provider.requestRuntimeV2ChildStep({
+  const input = {
     job: {
       id: "child-report-repair",
       run: {
@@ -512,7 +597,8 @@ test("a child report repair exposes one required effect-free report tool", async
     signal: new AbortController().signal,
     deadlineAt: startedAt + 2_000,
     recoveryOccurrence: 1,
-  });
+  };
+  const result = await provider.requestRuntimeV2ChildStep(input);
 
   assert.deepEqual(
     result.toolCalls.map((call) => call.name),
@@ -528,7 +614,7 @@ test("a child report repair exposes one required effect-free report tool", async
     [evidenceId],
   );
   assert.equal(wireOptions.toolChoice, "required");
-  assert.equal(wireMaxOutputTokens, 4_096);
+  assert.equal(wireMaxOutputTokens, 8_192, "report formatting cannot silently reduce an admitted output allocation");
   const transcript = wireMessages
     .map((message) => String(message.content || ""))
     .join("\n");
@@ -545,6 +631,12 @@ test("a child report repair exposes one required effect-free report tool", async
     [],
     "schema-valid JSON adapted through requiredSingleTool is not raw native tool-call proof",
   );
+  outputWasTruncated = true;
+  const truncated = await provider.requestRuntimeV2ChildStep(input);
+  assert.equal(providerRequests, 2, "one provider request per step; length is not transport incompatibility");
+  assert.deepEqual(truncated.toolCalls, []);
+  assert.ok(truncated.diagnostics.some((item) => item.code === "output_truncated"));
+  assert.equal(logs.some((entry) => entry.eventName === "runtime_v2_subagent_protocol_drift"), false);
 });
 
 test("the child report text-envelope catalog preserves the exact nested evidence enum", () => {

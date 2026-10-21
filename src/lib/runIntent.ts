@@ -385,7 +385,7 @@ const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
 const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
   /(?:不要|无需|不需要|请勿|禁止|别).{0,10}(?:修改|实现|修复|解决|处理|写入|创建|生成|改动|新增|添加|删除|替换|重构|执行)/i,
   /(?:只|仅).{0,8}(?:分析|检查|解释|诊断|审查|评估|排查|总结|报告).{0,32}(?:不要|无需|不需要|请勿|禁止|别).{0,16}(?:修改|改动|写入|执行)?/i,
-  /\b(?:do not|don't|dont|no need to|without)\s+(?:implementing?|fixing?|repairing?|resolving?|writing?|creating?|generating?|updating?|patching?|modifying?|refactoring?|deleting?|removing?|replacing?|adding?|changing?|running|executing)\b/i,
+  /\b(?:do not|don't|dont|no need to|without)\s+(?:implement(?:ing)?|fix(?:ing)?|repair(?:ing)?|resolv(?:e|ing)|writ(?:e|ing)|creat(?:e|ing)|generat(?:e|ing)|updat(?:e|ing)|patch(?:ing)?|modif(?:y|ying)|refactor(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|replac(?:e|ing)|add(?:ing)?|chang(?:e|ing)|run(?:ning)?|execut(?:e|ing))\b/i,
   /\b(?:only|just)\s+(?:analy[sz]e|inspect|explain|diagnose|review|assess|investigate|summari[sz]e|report)\b.{0,48}\b(?:do not|don't|without)\b/i,
 ];
 
@@ -413,10 +413,16 @@ function workspaceMutationRequestClauses(input: string): string[] {
  */
 export function looksLikeExplicitWorkspaceMutationRequest(input: string): boolean {
   const normalizedInput = normalizeInput(input);
-  if (!normalizedInput || hasReadOnlyWorkspaceConstraint(normalizedInput)) return false;
+  if (!normalizedInput) return false;
   if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) return false;
   if (!WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput)) return false;
-  return workspaceMutationRequestClauses(normalizedInput).some((clause) => {
+  const clauses = workspaceMutationRequestClauses(normalizedInput);
+  // A restriction on another operation does not withdraw a requested source
+  // change. A restriction that names source-changing actions still does.
+  if (clauses.some((clause) =>
+    hasReadOnlyWorkspaceConstraint(clause) && WORKSPACE_MUTATION_REQUEST_RE.test(clause))) return false;
+  return clauses.some((clause) => {
+    if (hasReadOnlyWorkspaceConstraint(clause)) return false;
     if (!WORKSPACE_MUTATION_REQUEST_RE.test(clause)) return false;
     const hasTarget = WORKSPACE_MUTATION_TARGET_RE.test(clause) ||
       /\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b/.test(clause);
@@ -779,6 +785,7 @@ export function buildEffectiveTurnContract(input: {
     input.runtimeIntent ??
     (conversationIntent === "plan" && input.planApproved ? "execute" : conversationIntent);
   const runtimePolicy = getIntentPolicy(runtimeIntent);
+  const operationIntent = runtimePolicy.toolPolicy === "write";
   const directiveKind = input.commandDirective?.kind ?? "none";
   const operationDirective =
     directiveKind === "file_modify" ||
@@ -793,6 +800,7 @@ export function buildEffectiveTurnContract(input: {
     runtimeIntent === "plan" &&
     input.planApproved !== true;
   const mutationExpected =
+    operationIntent &&
     !isUnapprovedPlanDraft &&
     (
       (
@@ -802,6 +810,7 @@ export function buildEffectiveTurnContract(input: {
       directiveKind === "file_modify"
     );
   const validationExpected =
+    operationIntent &&
     !isUnapprovedPlanDraft &&
     (
       mutationExpected ||
@@ -815,6 +824,7 @@ export function buildEffectiveTurnContract(input: {
       directiveKind === "mcp"
     );
   const needsApproval =
+    operationIntent &&
     !isUnapprovedPlanDraft &&
     input.executionConsentGranted !== true &&
     (input.commandDirective?.requiresApproval === true || mutationExpected || operationDirective) &&
@@ -822,7 +832,7 @@ export function buildEffectiveTurnContract(input: {
     directiveKind !== "plan_approval" &&
     directiveKind !== "plan_resume";
   const operationApprovalState: OperationApprovalState =
-    isUnapprovedPlanDraft
+    !operationIntent || isUnapprovedPlanDraft
       ? "not_required"
       : input.executionConsentGranted === true || (mutationExpected && input.planApproved === true)
       ? "approved"
@@ -857,23 +867,46 @@ export function buildEffectiveTurnContract(input: {
   };
 }
 
+function scopeCommandDirectiveToIntent(
+  directive: CommandDirective,
+  intent: ResolvedUserIntent,
+): CommandDirective {
+  const toolPolicy = getIntentPolicy(intent).toolPolicy;
+  if (toolPolicy === "write" || toolPolicy === "plan_gated") return directive;
+  const operationDirective =
+    directive.kind === "shell" || directive.kind === "git" || directive.kind === "file_modify" ||
+    directive.kind === "plan_approval" || directive.kind === "plan_resume" ||
+    (directive.kind === "unity" && directive.action !== "console_diagnostics");
+  if (operationDirective) {
+    return createCommandDirective("none", {
+      source: directive.source,
+      requiresWorkspace: false,
+      requiresApproval: false,
+    });
+  }
+  return { ...directive, requiresApproval: false };
+}
+
 export function normalizeCommandDirective(
   value: unknown,
   fallback?: CommandDirective | null,
+  intent?: ResolvedUserIntent,
 ): CommandDirective | undefined {
-  if (!value || typeof value !== "object") return fallback ?? undefined;
+  if (!value || typeof value !== "object") {
+    return fallback && intent ? scopeCommandDirectiveToIntent(fallback, intent) : fallback ?? undefined;
+  }
   const candidate = value as Partial<CommandDirective>;
   const kind = typeof candidate.kind === "string" && COMMAND_DIRECTIVE_KINDS.has(candidate.kind as CommandDirectiveKind)
     ? candidate.kind as CommandDirectiveKind
     : fallback?.kind;
-  if (!kind) return fallback ?? undefined;
+  if (!kind) return fallback && intent ? scopeCommandDirectiveToIntent(fallback, intent) : fallback ?? undefined;
   const source = typeof candidate.source === "string" && COMMAND_DIRECTIVE_SOURCES.has(candidate.source as CommandDirectiveSource)
     ? candidate.source as CommandDirectiveSource
     : fallback?.source;
   const confidence = typeof candidate.confidence === "number"
     ? Math.max(0, Math.min(1, candidate.confidence))
     : fallback?.confidence;
-  return {
+  const directive: CommandDirective = {
     kind,
     ...(source ? { source } : {}),
     ...(normalizeDirectiveString(candidate.action) ?? fallback?.action
@@ -896,6 +929,7 @@ export function normalizeCommandDirective(
       ? { reason: normalizeDirectiveString(candidate.reason, 180) ?? fallback?.reason }
       : {}),
   };
+  return intent ? scopeCommandDirectiveToIntent(directive, intent) : directive;
 }
 
 function inferGitAction(input: string): string {
@@ -918,6 +952,7 @@ function inferShellAction(input: string): string {
 }
 
 const EXPLICIT_SHELL_COMMAND_RE = /^(?:npm|pnpm|yarn|bun|node|python|python3|pytest|cargo|go|rustc|dotnet|bash|sh|make)\b/i;
+const DIRECT_OPERATION_REQUEST_RE = /^(?:(?:please|can you|could you)\s+)*(?:run|execute)\b/i;
 
 export function looksLikeExplicitShellCommandInput(value: unknown): boolean {
   return EXPLICIT_SHELL_COMMAND_RE.test(String(value || "").trim());
@@ -946,6 +981,14 @@ export function inferCommandDirective(
     source?: CommandDirectiveSource;
     controlAction?: RunIntentControlAction;
   } = {},
+): CommandDirective {
+  return scopeCommandDirectiveToIntent(inferCommandMetadata(input, intent, options), intent);
+}
+
+function inferCommandMetadata(
+  input: string,
+  intent: ResolvedUserIntent,
+  options: { source?: CommandDirectiveSource; controlAction?: RunIntentControlAction },
 ): CommandDirective {
   const source = options.source ?? "natural_language";
   const normalizedInput = normalizeInput(input);
@@ -999,7 +1042,7 @@ export function inferCommandDirective(
   if (/\bunity\b|unity\s*mcp|editor\s*plugin|roslyn|prefab|scene|asset|yaml|\.asmdef\b|\.unity\b|\.prefab\b|预制体|场景|资源|编辑器插件|引用搜索|C#执行|c# 执行/i.test(normalizedInput) &&
     (intent === "execute" || intent === "plan" || workspaceMutationExpected ||
       hasExplicitUnityConsoleDiagnosticCue(normalizedInput) || naturalShellOperation || explicitShellCommand ||
-      /^(?:(?:please|can you|could you)\s+)*(?:run|execute)\b/i.test(normalizedInput))) {
+      DIRECT_OPERATION_REQUEST_RE.test(normalizedInput))) {
     return createCommandDirective("unity", {
       source,
       action: inferUnityAction(normalizedInput),
@@ -1599,14 +1642,17 @@ export function resolveTurnRunIntent(
 
   const hasStrongSummarizeSignal = matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS);
   const hasStrongExecuteSignal =
+    looksLikeExplicitShellCommandInput(normalizedInput) ||
     looksLikeExplicitWorkspaceMutationRequest(normalizedInput) ||
     (isWorkspaceTurn && !hasReadOnlyWorkspaceConstraint(normalizedInput) &&
       workspaceMutationRequestClauses(normalizedInput).some((clause) =>
         WORKSPACE_MUTATION_TARGET_RE.test(clause) &&
         CURRENT_WORKSPACE_CHANGE_REQUEST_RE.test(clause))) ||
     (!hasReadOnlyWorkspaceConstraint(normalizedInput) &&
-      !WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput) &&
-      matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS));
+      (DIRECT_OPERATION_REQUEST_RE.test(normalizedInput) ||
+        workspaceMutationRequestClauses(normalizedInput).some((clause) =>
+          !WORKSPACE_MUTATION_REQUEST_RE.test(clause) &&
+          matchesAny(clause, STRONG_EXECUTE_PATTERNS))));
   const hasStrongAnalyzeSignal = matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS);
 
   if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {

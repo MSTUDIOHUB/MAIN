@@ -5635,8 +5635,12 @@ fn glob_search(
     pattern: String,
     workspace: Option<String>,
 ) -> Result<Vec<String>, String> {
-    validate_glob_pattern(&pattern)?;
     let workspace = resolve_workspace_root(&state, workspace)?;
+    glob_search_in_workspace(&workspace, &pattern)
+}
+
+fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<String>, String> {
+    validate_glob_pattern(pattern)?;
     let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
     let mut hits = Vec::new();
 
@@ -5649,11 +5653,14 @@ fn glob_search(
             if !canonical.starts_with(&workspace) {
                 continue;
             }
-            let relative = canonical
-                .strip_prefix(&workspace)
-                .unwrap_or(&canonical)
+            // Keep the matched alias (for example .agents/skills/review),
+            // while using its canonical target only for the workspace check.
+            let Ok(relative) = path.strip_prefix(workspace) else {
+                continue;
+            };
+            let relative = relative
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
             hits.push(relative);
         }
     }
@@ -10143,6 +10150,39 @@ struct StreamDonePayload {
     error: Option<String>,
 }
 
+async fn dispatch_chat_stream_worker<F, Fut, E>(
+    stream_id: String,
+    worker: F,
+    report_error: E,
+) -> Result<(), String>
+where
+    F: FnOnce(Arc<ChatStreamLease>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    E: FnOnce(String) + Send + 'static,
+{
+    let lease = Arc::new(ChatStreamLease::acquire(stream_id)?);
+    // A Tauri invocation acknowledges admission, not the entire SSE lifetime.
+    // Holding its custom-protocol response until generation completes lets a
+    // navigation failure replay the same command through postMessage while
+    // its original network request is still active. The Rust task owns the
+    // lease after this immediate acknowledgement; events own its conclusion.
+    tauri::async_runtime::spawn(async move {
+        use futures_util::FutureExt;
+        let outcome = std::panic::AssertUnwindSafe(worker(lease.clone()))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err("STREAM_WORKER_PANICKED".to_string()));
+        if let Err(error) = outcome {
+            // Cancellation wins over a late worker error, and a worker that
+            // already settled cannot publish a second terminal event.
+            if lease.try_settle_success() {
+                report_error(error);
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Start a streaming chat completion request through Rust (bypasses CORS).
 /// Chunks are emitted as Tauri events `chat-stream-chunk`.
 /// When done, emits `chat-stream-done`.
@@ -10161,6 +10201,33 @@ async fn start_chat_stream(
     if stream_id.is_empty() {
         return Err("STREAM_ID_REQUIRED: stream_id 不能为空".to_string());
     }
+    let error_app = app.clone();
+    let error_stream_id = stream_id.clone();
+    dispatch_chat_stream_worker(
+        stream_id.clone(),
+        move |lease| {
+            run_chat_stream_worker(
+                app, stream_id, url, headers, body, auth_mode, token_ref, timeout_ms, lease,
+            )
+        },
+        move |error| {
+            emit_chat_stream_done(&error_app, &error_stream_id, "error", Some(error));
+        },
+    )
+    .await
+}
+
+async fn run_chat_stream_worker(
+    app: AppHandle,
+    stream_id: String,
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+    auth_mode: Option<String>,
+    token_ref: Option<String>,
+    timeout_ms: Option<u64>,
+    stream_lease: Arc<ChatStreamLease>,
+) -> Result<(), String> {
     let stream_started_at = Instant::now();
     let requested_timeout =
         timeout_ms.map(|value| Duration::from_millis(value.clamp(1_000, 600_000)));
@@ -10168,7 +10235,6 @@ async fn start_chat_stream(
         requested_timeout.unwrap_or(Duration::from_secs(STREAM_PHASE_TIMEOUT_SECS));
     let stream_phase_timeout_ms = stream_phase_timeout.as_millis();
     let original_url = url.clone();
-    let stream_lease = ChatStreamLease::acquire(stream_id.clone())?;
     let cancel_flag = stream_lease.cancel_flag.clone();
     if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
         emit_chat_stream_done(&app, &stream_id, "cancelled", None);
@@ -11325,6 +11391,7 @@ fn discover_personal_agent_skills() -> Result<Vec<DiscoveredPersonalAgentSkill>,
 pub struct ProtocolPackageMeta {
     pub name: String,
     pub entry_point: String,
+    pub entry_points: Vec<String>,
     pub local_path: String,
 }
 
@@ -11336,18 +11403,50 @@ fn extract_protocol_package(
     zip_path: String,
     workspace: Option<String>,
 ) -> Result<ProtocolPackageMeta, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    extract_protocol_package_in_workspace(&workspace, Path::new(&zip_path))
+}
+
+fn extract_protocol_package_in_workspace(
+    workspace: &Path,
+    zip: &Path,
+) -> Result<ProtocolPackageMeta, String> {
+    let extracted = extract_package_archive_in_workspace(workspace, zip)?;
+    let entry_points = find_entry_points(&extracted.target_dir);
+    if entry_points.is_empty() {
+        let _ = fs::remove_dir_all(&extracted.target_dir);
+        return Err("协议包必须包含可读取的 SKILL.md（兼容旧包时可使用 program.md）".to_string());
+    }
+    Ok(ProtocolPackageMeta {
+        name: extracted.name,
+        entry_point: entry_points[0].clone(),
+        entry_points,
+        local_path: extracted.local_path,
+    })
+}
+
+struct ExtractedPackageArchive {
+    name: String,
+    target_dir: PathBuf,
+    local_path: String,
+}
+
+/// Both import formats share the same bounded extraction and rollback path.
+/// Format-specific validation happens only after bytes are safely staged.
+fn extract_package_archive_in_workspace(
+    workspace: &Path,
+    zip: &Path,
+) -> Result<ExtractedPackageArchive, String> {
     const MAX_PROTOCOL_PACKAGE_ENTRIES: usize = 2_048;
     const MAX_PROTOCOL_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
 
-    let _lock = get_workspace_write_lock().lock().unwrap();
-    let workspace = resolve_workspace_root(&state, workspace)?;
-    let zip = PathBuf::from(&zip_path);
     if !zip.exists() || !zip.is_file() {
         return Err("ZIP 文件不存在或不是文件".to_string());
     }
 
     // Read the ZIP archive
-    let file = File::open(&zip).map_err(|e| format!("无法打开 ZIP 文件: {e}"))?;
+    let file = File::open(zip).map_err(|e| format!("无法打开 ZIP 文件: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP 解析失败: {e}"))?;
     if archive.len() == 0 || archive.len() > MAX_PROTOCOL_PACKAGE_ENTRIES {
         return Err(format!(
@@ -11395,14 +11494,15 @@ fn extract_protocol_package(
         safe_package_name
     };
 
-    // Generate a unique slot: <name>-<timestamp>
+    // A fresh slot must never reuse a prior import or follow a pre-existing link.
     let slot = format!(
-        "{}-{}",
+        "{}-{}-{:016x}",
         safe_package_name,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis()
+            .as_millis(),
+        rand::random::<u64>(),
     );
 
     let protocols_dir = workspace.join(".protocols");
@@ -11414,9 +11514,9 @@ fn extract_protocol_package(
     let target_dir = protocols_dir.join(&slot);
 
     // Create the target directory
-    fs::create_dir_all(&target_dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    fs::create_dir(&target_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
-    let extraction = (|| -> Result<String, String> {
+    let extraction = (|| -> Result<(), String> {
         let canonical_target = target_dir
             .canonicalize()
             .map_err(|e| format!("无法解析协议包目录: {e}"))?;
@@ -11424,6 +11524,7 @@ fn extract_protocol_package(
             return Err("协议包目录越界".to_string());
         }
         let mut written_bytes = 0_u64;
+        let mut entry_paths = HashSet::new();
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
@@ -11432,6 +11533,20 @@ fn extract_protocol_package(
             let enclosed = entry
                 .enclosed_name()
                 .ok_or_else(|| format!("ZIP 条目路径越界: {}", entry.name()))?;
+            if entry.name().contains('\\')
+                || enclosed
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+                || entry
+                    .unix_mode()
+                    .is_some_and(|mode| mode & 0o170000 == 0o120000)
+            {
+                return Err(format!("ZIP 条目路径或链接不受支持: {}", entry.name()));
+            }
+            let entry_identity = enclosed.to_string_lossy().to_lowercase();
+            if !entry_paths.insert(entry_identity) {
+                return Err(format!("ZIP 条目路径重复: {}", entry.name()));
+            }
             let out_path = target_dir.join(enclosed);
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("创建子目录失败: {e}"))?;
@@ -11448,8 +11563,10 @@ fn extract_protocol_package(
             } else {
                 let mut outfile =
                     File::create(&out_path).map_err(|e| format!("创建文件失败: {e}"))?;
-                let copied = std::io::copy(&mut entry, &mut outfile)
-                    .map_err(|e| format!("写入文件失败: {e}"))?;
+                let remaining_bytes = MAX_PROTOCOL_PACKAGE_BYTES.saturating_sub(written_bytes);
+                let copied =
+                    std::io::copy(&mut (&mut entry).take(remaining_bytes + 1), &mut outfile)
+                        .map_err(|e| format!("写入文件失败: {e}"))?;
                 written_bytes = written_bytes
                     .checked_add(copied)
                     .ok_or_else(|| "协议包实际解压大小溢出".to_string())?;
@@ -11462,17 +11579,12 @@ fn extract_protocol_package(
             }
         }
 
-        find_entry_point(&target_dir).ok_or_else(|| {
-            "协议包必须包含可读取的 SKILL.md（兼容旧包时可使用 program.md）".to_string()
-        })
+        Ok(())
     })();
-    let entry_point = match extraction {
-        Ok(entry_point) => entry_point,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&target_dir);
-            return Err(error);
-        }
-    };
+    if let Err(error) = extraction {
+        let _ = fs::remove_dir_all(&target_dir);
+        return Err(error);
+    }
 
     // Compute the relative path from workspace
     let local_path = target_dir
@@ -11481,19 +11593,137 @@ fn extract_protocol_package(
         .to_string_lossy()
         .to_string();
 
-    Ok(ProtocolPackageMeta {
+    Ok(ExtractedPackageArchive {
         name: package_name,
-        entry_point,
+        target_dir,
         local_path,
     })
 }
 
-/// Find the entry point file in an extracted protocol package.
-/// Looks for SKILL.md, program.md, or falls back to the first .md file found.
-fn find_entry_point(dir: &Path) -> Option<String> {
+#[derive(Serialize)]
+struct GeminiExtensionArchiveMeta {
+    manifest_json: String,
+    manifest_path: String,
+    files: Vec<String>,
+    entry_points: Vec<String>,
+    package_hash: String,
+    local_path: String,
+    workspace: String,
+}
+
+#[tauri::command]
+fn extract_gemini_extension(
+    state: State<WorkspaceState>,
+    zip_path: String,
+    workspace: Option<String>,
+) -> Result<GeminiExtensionArchiveMeta, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    extract_gemini_extension_in_workspace(&workspace, Path::new(&zip_path))
+}
+
+fn extract_gemini_extension_in_workspace(
+    workspace: &Path,
+    zip: &Path,
+) -> Result<GeminiExtensionArchiveMeta, String> {
+    let extracted = extract_package_archive_in_workspace(workspace, zip)?;
+    let result = (|| -> Result<GeminiExtensionArchiveMeta, String> {
+        let mut files = WalkDir::new(&extracted.target_dir)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("无法检查扩展文件: {e}"))?
+            .into_iter()
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&extracted.target_dir)
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .map_err(|e| format!("扩展文件路径越界: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        files.sort();
+        let manifests = files
+            .iter()
+            .filter(|relative| {
+                let parts = relative.split('/').collect::<Vec<_>>();
+                parts.len() <= 2 && parts.last() == Some(&"gemini-extension.json")
+            })
+            .collect::<Vec<_>>();
+        if manifests.len() != 1 {
+            return Err(
+                "扩展 ZIP 必须在根目录或单层仓库目录中包含唯一 gemini-extension.json".to_string(),
+            );
+        }
+        let manifest_path = manifests[0].to_string();
+        let manifest_file = extracted.target_dir.join(&manifest_path);
+        let manifest_size = fs::metadata(&manifest_file)
+            .map_err(|e| format!("无法检查扩展清单: {e}"))?
+            .len();
+        if manifest_size == 0 || manifest_size > 1024 * 1024 {
+            return Err("扩展清单必须为非空且不超过 1 MiB 的 UTF-8 JSON 文件".to_string());
+        }
+        let manifest_json =
+            fs::read_to_string(&manifest_file).map_err(|e| format!("无法读取扩展清单: {e}"))?;
+        let manifest: Value = serde_json::from_str(&manifest_json)
+            .map_err(|_| "扩展清单不是有效 JSON".to_string())?;
+        if !manifest.is_object()
+            || !manifest
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+            || !manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| !version.trim().is_empty())
+        {
+            return Err("扩展清单缺少有效 name 或 version".to_string());
+        }
+        let root = manifest_path
+            .strip_suffix("gemini-extension.json")
+            .unwrap_or("");
+        let skills_prefix = format!("{root}skills/");
+        let entry_points = files
+            .iter()
+            .filter(|relative| {
+                relative.strip_prefix(&skills_prefix).is_some_and(|suffix| {
+                    suffix.ends_with("/SKILL.md") && suffix.split('/').count() >= 2
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut hasher = Sha256::new();
+        for relative in &files {
+            let bytes = fs::read(extracted.target_dir.join(relative))
+                .map_err(|e| format!("无法计算扩展文件摘要: {e}"))?;
+            hasher.update((relative.len() as u64).to_be_bytes());
+            hasher.update(relative.as_bytes());
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        Ok(GeminiExtensionArchiveMeta {
+            manifest_json,
+            manifest_path,
+            files,
+            entry_points,
+            package_hash: format!("sha256-{:x}", hasher.finalize()),
+            local_path: extracted.local_path.clone(),
+            workspace: workspace.to_string_lossy().replace('\\', "/"),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&extracted.target_dir);
+    }
+    result
+}
+
+/// Discover every Skill entry, including those in repository ZIP wrappers.
+/// Legacy packages without SKILL.md keep a single preferred program.md entry.
+fn find_entry_points(dir: &Path) -> Vec<String> {
     let mut matches = WalkDir::new(dir)
         .min_depth(1)
-        .max_depth(5)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
@@ -11518,9 +11748,13 @@ fn find_entry_point(dir: &Path) -> Option<String> {
             .then(left.1.cmp(&right.1))
             .then(left.2.cmp(&right.2))
     });
+    let has_skills = matches.first().is_some_and(|(rank, _, _)| *rank == 0);
     matches
-        .first()
+        .into_iter()
+        .filter(|(rank, _, _)| !has_skills || *rank == 0)
+        .take(if has_skills { usize::MAX } else { 1 })
         .map(|(_, _, relative)| relative.to_string_lossy().replace('\\', "/"))
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -13176,6 +13410,7 @@ pub fn run() {
             knowledge_get_excerpt,
             discover_personal_agent_skills,
             extract_protocol_package,
+            extract_gemini_extension,
             delete_protocol_package,
             write_chat_temp_file,
             write_chat_temp_file_create_new,
@@ -13219,7 +13454,10 @@ mod tests {
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
         commit_project_init_in_workspace, compare_file_nodes, delete_path_within_workspace,
         delete_plan_files_in_dir, delete_protocol_package_at, discover_agent_skills_in_root,
-        find_entry_point, get_proxy_request_registry, get_stream_registry,
+        dispatch_chat_stream_worker,
+        extract_gemini_extension_in_workspace, extract_protocol_package_in_workspace,
+        find_entry_points, get_proxy_request_registry,
+        get_stream_registry, glob_search_in_workspace,
         inspect_project_init_target_in_workspace, is_safe_cross_origin_proxy_header,
         is_sensitive_cross_origin_header, is_supported_attachment_path, is_valid_git_branch_name,
         looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
@@ -13767,6 +14005,111 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_start_ack_does_not_wait_for_worker_completion() {
+        use futures_util::FutureExt;
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let stream_id = "stream-test-immediate-ack".to_string();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+        let ack = dispatch_chat_stream_worker(
+            stream_id.clone(),
+            move |_lease| async move {
+                let _ = release_rx.await;
+                Err("test worker finished".to_string())
+            },
+            move |error| error_tx.send(error).unwrap(),
+        )
+        .now_or_never();
+
+        assert!(
+            matches!(ack, Some(Ok(()))),
+            "the IPC acknowledgement must complete while the streaming worker is pending"
+        );
+        assert!(get_stream_registry()
+            .lock()
+            .unwrap()
+            .active
+            .contains_key(&stream_id));
+        let duplicate_ack = dispatch_chat_stream_worker(
+            stream_id,
+            move |_lease| async move { Ok(()) },
+            |_| panic!("duplicate admission must not start another worker"),
+        )
+        .now_or_never();
+        assert!(matches!(duplicate_ack, Some(Err(error)) if error.contains("DUPLICATE_STREAM_ID")));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            error_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "test worker finished"
+        );
+        assert!(error_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn chat_stream_worker_admission_preserves_early_cancel() {
+        use futures_util::FutureExt;
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let stream_id = "stream-test-worker-early-cancel".to_string();
+        cancel_chat_stream(Some(stream_id.clone())).unwrap();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+        let ack = dispatch_chat_stream_worker(
+            stream_id.clone(),
+            move |lease| async move {
+                observed_tx.send(lease.is_cancelled()).unwrap();
+                Ok(())
+            },
+            move |error| error_tx.send(error).unwrap(),
+        )
+        .now_or_never();
+        assert!(matches!(ack, Some(Ok(()))));
+        assert!(observed_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(matches!(
+            error_rx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(!get_stream_registry()
+            .lock()
+            .unwrap()
+            .active
+            .contains_key(&stream_id));
+    }
+
+    #[test]
+    fn chat_stream_worker_cancel_after_ack_aborts_without_late_error() {
+        use futures_util::FutureExt;
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let stream_id = "stream-test-worker-cancel-after-ack".to_string();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+        let ack = dispatch_chat_stream_worker(
+            stream_id.clone(),
+            move |lease| async move {
+                let (abort_handle, registration) =
+                    futures_util::future::AbortHandle::new_pair();
+                lease.set_abort_handle(Some(abort_handle));
+                started_tx.send(()).unwrap();
+                let result = futures_util::future::Abortable::new(
+                    std::future::pending::<()>(),
+                    registration,
+                )
+                .await;
+                assert!(result.is_err());
+                Err("a canceled pending transport must not become an error".to_string())
+            },
+            move |error| error_tx.send(error).unwrap(),
+        )
+        .now_or_never();
+        assert!(matches!(ack, Some(Ok(()))));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel_chat_stream(Some(stream_id)).unwrap();
+        assert!(matches!(
+            error_rx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn stream_duplicate_id_is_rejected_and_stale_drop_is_generation_scoped() {
         let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
         let stream_id = "stream-test-duplicate".to_string();
@@ -14021,15 +14364,445 @@ mod tests {
         let package = workspace.join("package");
         fs::create_dir_all(package.join("nested")).unwrap();
 
-        assert_eq!(find_entry_point(&package), None);
+        assert!(find_entry_points(&package).is_empty());
         fs::write(package.join("program.md"), "# legacy").unwrap();
         fs::write(package.join("nested").join("SKILL.md"), "# skill").unwrap();
 
         assert_eq!(
-            find_entry_point(&package).as_deref(),
-            Some("nested/SKILL.md"),
+            find_entry_points(&package),
+            vec!["nested/SKILL.md"],
         );
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    fn write_protocol_zip(path: &std::path::Path, entries: &[(&str, &str)]) {
+        use std::io::Write;
+
+        let file = fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, content) in entries {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(content.as_bytes()).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn gemini_extension_zip_scopes_skills_to_manifest_root_and_preserves_resources() {
+        let workspace = make_temp_workspace("gemini-extension-skills");
+        let archive = workspace.join("extension.zip");
+        write_protocol_zip(
+            &archive,
+            &[
+                (
+                    "repo-main/gemini-extension.json",
+                    r#"{"name":"example","version":"1.0.0"}"#,
+                ),
+                (
+                    "repo-main/skills/review/SKILL.md",
+                    "---\nname: review\n---\nUse references/check.md",
+                ),
+                (
+                    "repo-main/skills/review/references/check.md",
+                    "Check exactly",
+                ),
+                ("repo-main/vendor/other/SKILL.md", "Do not register"),
+                ("SKILL.md", "Do not register either"),
+            ],
+        );
+        let imported = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
+        assert_eq!(
+            imported.entry_points,
+            vec!["repo-main/skills/review/SKILL.md"]
+        );
+        assert_eq!(imported.manifest_path, "repo-main/gemini-extension.json");
+        assert_eq!(
+            fs::read_to_string(
+                workspace
+                    .join(&imported.local_path)
+                    .join("repo-main/skills/review/references/check.md")
+            )
+            .unwrap(),
+            "Check exactly"
+        );
+        assert!(imported
+            .files
+            .contains(&"repo-main/vendor/other/SKILL.md".to_string()));
+        let repeated = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
+        assert_ne!(imported.local_path, repeated.local_path);
+        assert_eq!(imported.package_hash, repeated.package_hash);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn gemini_extension_zip_accepts_mcp_only_and_rolls_back_invalid_manifests() {
+        let workspace = make_temp_workspace("gemini-extension-mcp-only");
+        let archive = workspace.join("extension.zip");
+        write_protocol_zip(
+            &archive,
+            &[(
+                "gemini-extension.json",
+                r#"{"name":"example","version":"1","mcpServers":{"demo":{"httpUrl":"http://127.0.0.1:9000/mcp"}}}"#,
+            )],
+        );
+        let imported = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
+        assert!(imported.entry_points.is_empty());
+        assert_eq!(imported.files, vec!["gemini-extension.json"]);
+        let before = fs::read_dir(workspace.join(".protocols")).unwrap().count();
+        for entries in [
+            vec![("README.md", "no manifest")],
+            vec![("gemini-extension.json", "not JSON")],
+            vec![("gemini-extension.json", r#"{"name":"example"}"#)],
+            vec![
+                (
+                    "gemini-extension.json",
+                    r#"{"name":"example","version":"1"}"#,
+                ),
+                (
+                    "other/gemini-extension.json",
+                    r#"{"name":"other","version":"1"}"#,
+                ),
+            ],
+            vec![(
+                "nested/deep/gemini-extension.json",
+                r#"{"name":"example","version":"1"}"#,
+            )],
+        ] {
+            write_protocol_zip(&archive, &entries);
+            assert!(extract_gemini_extension_in_workspace(&workspace, &archive).is_err());
+            assert_eq!(
+                fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+                before
+            );
+        }
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn gemini_extension_zip_rejects_duplicate_and_escape_paths() {
+        let workspace = make_temp_workspace("gemini-extension-unsafe");
+        let archive = workspace.join("extension.zip");
+        for entries in [
+            vec![("gemini-extension.json", "{}"), ("../outside", "no")],
+            vec![
+                ("gemini-extension.json", "{}"),
+                ("GEMINI-EXTENSION.JSON", "{}"),
+            ],
+            vec![
+                ("gemini-extension.json", "{}"),
+                ("skills\\evil\\SKILL.md", "no"),
+            ],
+        ] {
+            write_protocol_zip(&archive, &entries);
+            assert!(extract_gemini_extension_in_workspace(&workspace, &archive).is_err());
+            assert_eq!(
+                fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+                0
+            );
+        }
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn gemini_extension_zip_rejects_symbolic_links() {
+        use std::io::Write;
+        let workspace = make_temp_workspace("gemini-extension-link");
+        let archive_path = workspace.join("extension.zip");
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "gemini-extension.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"{"name":"example","version":"1"}"#)
+            .unwrap();
+        archive
+            .add_symlink(
+                "skills/link",
+                "/outside",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        assert!(extract_gemini_extension_in_workspace(&workspace, &archive_path).is_err());
+        assert_eq!(
+            fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+            0
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_zip_imports_all_skills_with_complete_support_files() {
+        let workspace = make_temp_workspace("protocol-multi-skill-zip");
+        let archive = workspace.join("unity-skills.zip");
+        write_protocol_zip(
+            &archive,
+            &[
+                (
+                    "skills-main/skills/zeta/SKILL.md",
+                    "---\nname: zeta\n---\n# Zeta",
+                ),
+                (
+                    "skills-main/skills/alpha/SKILL.md",
+                    "---\nname: alpha\n---\n# Alpha",
+                ),
+                ("program.md", "# Legacy must not become an extra skill"),
+                (
+                    "skills-main/skills/alpha/references/deep/guide.md",
+                    "# Guide",
+                ),
+                (
+                    "skills-main/skills/alpha/scripts/Example.cs",
+                    "class Example {}",
+                ),
+                ("skills-main/skills/alpha/resources/icon.svg", "<svg/>"),
+                (
+                    "nested/vendor/owner/repository/skills/deep/SKILL.md",
+                    "# Deep skill",
+                ),
+            ],
+        );
+
+        let imported = extract_protocol_package_in_workspace(&workspace, &archive).unwrap();
+        let metadata = serde_json::to_value(&imported).unwrap();
+        assert_eq!(
+            metadata["entry_points"],
+            json!([
+                "skills-main/skills/alpha/SKILL.md",
+                "skills-main/skills/zeta/SKILL.md",
+                "nested/vendor/owner/repository/skills/deep/SKILL.md",
+            ])
+        );
+        assert_eq!(imported.entry_point, "skills-main/skills/alpha/SKILL.md");
+        let installed = workspace.join(&imported.local_path);
+        for (relative, expected) in [
+            (
+                "skills-main/skills/alpha/references/deep/guide.md",
+                "# Guide",
+            ),
+            (
+                "skills-main/skills/alpha/scripts/Example.cs",
+                "class Example {}",
+            ),
+            ("skills-main/skills/alpha/resources/icon.svg", "<svg/>"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(installed.join(relative)).unwrap(),
+                expected
+            );
+        }
+        let repeated = extract_protocol_package_in_workspace(&workspace, &archive).unwrap();
+        assert_ne!(repeated.local_path, imported.local_path);
+        assert!(installed.join(&imported.entry_point).is_file());
+        assert_eq!(
+            fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+            2
+        );
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_zip_keeps_legacy_program_fallback() {
+        let workspace = make_temp_workspace("protocol-legacy-zip");
+        let archive = workspace.join("legacy.zip");
+        write_protocol_zip(
+            &archive,
+            &[
+                ("nested/program.md", "# Nested legacy"),
+                ("program.md", "# Preferred legacy"),
+                ("README.md", "# Not a skill"),
+            ],
+        );
+
+        let imported = extract_protocol_package_in_workspace(&workspace, &archive).unwrap();
+        let metadata = serde_json::to_value(&imported).unwrap();
+        assert_eq!(metadata["entry_points"], json!(["program.md"]));
+        assert_eq!(imported.entry_point, "program.md");
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_zip_rejects_traversal_and_rolls_back_partial_files() {
+        let workspace = make_temp_workspace("protocol-zip-traversal");
+        let archive = workspace.join("unsafe.zip");
+        fs::write(workspace.join("victim.txt"), "keep").unwrap();
+        write_protocol_zip(
+            &archive,
+            &[
+                ("first/SKILL.md", "# Written before rejection"),
+                ("../victim.txt", "overwrite"),
+            ],
+        );
+
+        let error = extract_protocol_package_in_workspace(&workspace, &archive)
+            .err()
+            .expect("traversal must be rejected");
+        assert!(error.contains("越界"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("victim.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+            0
+        );
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_zip_without_skill_rolls_back_and_preserves_other_packages() {
+        let workspace = make_temp_workspace("protocol-zip-no-skill");
+        let archive = workspace.join("invalid.zip");
+        let existing = workspace.join(".protocols/existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("SKILL.md"), "# Keep").unwrap();
+        write_protocol_zip(&archive, &[("README.md", "# Not a skill")]);
+
+        assert!(extract_protocol_package_in_workspace(&workspace, &archive).is_err());
+        assert_eq!(
+            fs::read_dir(workspace.join(".protocols")).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(existing.join("SKILL.md")).unwrap(),
+            "# Keep"
+        );
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn protocol_package_zip_rejects_empty_and_excessive_entries_before_extracting() {
+        let workspace = make_temp_workspace("protocol-zip-entry-limits");
+        let archive = workspace.join("invalid.zip");
+        write_protocol_zip(&archive, &[]);
+        assert!(extract_protocol_package_in_workspace(&workspace, &archive).is_err());
+        assert!(!workspace.join(".protocols").exists());
+
+        let names = (0..2_049)
+            .map(|index| format!("files/{index}.md"))
+            .collect::<Vec<_>>();
+        let entries = names
+            .iter()
+            .map(|name| (name.as_str(), "entry"))
+            .collect::<Vec<_>>();
+        write_protocol_zip(&archive, &entries);
+        let error = extract_protocol_package_in_workspace(&workspace, &archive)
+            .err()
+            .expect("too many entries must be rejected");
+        assert!(error.contains("条目数"));
+        assert!(!workspace.join(".protocols").exists());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_package_zip_rejects_protocol_directory_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let parent = make_temp_workspace("protocol-zip-directory-escape");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace.join(".protocols")).unwrap();
+        let archive = workspace.join("valid.zip");
+        write_protocol_zip(&archive, &[("SKILL.md", "# Skill")]);
+
+        assert!(extract_protocol_package_in_workspace(&workspace, &archive).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    #[ignore = "set MAIN_SKILLS_ZIP to a local skill repository ZIP for opt-in acceptance"]
+    fn protocol_package_external_zip_preserves_all_skills_and_support_files() {
+        use std::io::Read;
+
+        let archive_path = PathBuf::from(
+            std::env::var("MAIN_SKILLS_ZIP")
+                .expect("MAIN_SKILLS_ZIP must name a local skill repository ZIP"),
+        );
+        let workspace = make_temp_workspace("protocol-external-zip");
+        let imported = extract_protocol_package_in_workspace(&workspace, &archive_path).unwrap();
+        let installed = workspace.join(&imported.local_path);
+        let file = fs::File::open(&archive_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut expected_entries = Vec::new();
+        let mut file_count = 0;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if entry.is_dir() {
+                continue;
+            }
+            let relative = entry.enclosed_name().unwrap();
+            if relative
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("SKILL.md"))
+            {
+                expected_entries.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+            let mut expected_bytes = Vec::new();
+            entry.read_to_end(&mut expected_bytes).unwrap();
+            assert_eq!(
+                fs::read(installed.join(&relative)).unwrap(),
+                expected_bytes,
+                "support file changed: {}",
+                relative.display()
+            );
+            file_count += 1;
+        }
+        expected_entries.sort();
+        let mut actual_entries = imported.entry_points;
+        actual_entries.sort();
+        assert_eq!(actual_entries, expected_entries);
+        println!(
+            "Imported {} Skill entries and preserved all {file_count} archive files",
+            actual_entries.len()
+        );
+        for entry in actual_entries {
+            println!("  {entry}");
+        }
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_skill_glob_preserves_in_workspace_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let parent = make_temp_workspace("workspace-skill-glob");
+        let workspace = parent.join("workspace");
+        let root = workspace.join(".agents/skills");
+        let internal = workspace.join("vendor/review");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(internal.join("references")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(internal.join("SKILL.md"), "# Internal").unwrap();
+        fs::write(internal.join("references/check.md"), "# Checklist").unwrap();
+        fs::write(outside.join("SKILL.md"), "# Outside").unwrap();
+        symlink(&internal, root.join("review")).unwrap();
+        symlink(&outside, root.join("outside")).unwrap();
+
+        assert_eq!(
+            glob_search_in_workspace(&workspace, ".agents/skills/*/SKILL.md").unwrap(),
+            vec![".agents/skills/review/SKILL.md"],
+        );
+        let supporting =
+            glob_search_in_workspace(&workspace, ".agents/skills/review/**/*").unwrap();
+        assert!(supporting.contains(&".agents/skills/review/references/check.md".to_string()));
+        assert!(
+            glob_search_in_workspace(&workspace, ".agents/skills/outside/**/*")
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]

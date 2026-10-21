@@ -141,7 +141,9 @@ export async function executeReadOnlyPlanTool(input: {
       target,
       version,
       statement: input.call.name === "load_skill"
-        ? `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`
+        ? args.operation === "list"
+          ? `已查看 Skill 目录 ${target} 的元数据；未加载正文，不构成项目源码证据。`
+          : `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`
         : `${input.call.name} 已确认 ${target} 的当前内容。`,
     };
     const previousContent = existingEvidence

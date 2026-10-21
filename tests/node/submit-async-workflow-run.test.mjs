@@ -671,9 +671,15 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
   });
   let captured = null;
   const harness = createHarness({
+    state: {
+      sessionsByWorkspace: { "/tmp/workspace": [{ id: 7, planLifecycleEpoch: "metadata-session-epoch" }] },
+      planLifecycle: { sessionKey: "unbound", sessionEpoch: "unbound-epoch" },
+    },
     input: {
+      runSessionKey: "/tmp/workspace:7",
       refreshWorkspaceAdmission: async (workspace) => {
         assert.equal(workspace, "/tmp/workspace");
+        harness.state.planLifecycle = { sessionKey: "another-session", sessionEpoch: "another-epoch" };
         return { instructions: null, baseline, warnings: [] };
       },
       phaseRunners: {
@@ -692,6 +698,8 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
   });
 
   await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(captured.runSessionEpoch, "metadata-session-epoch");
 
   assert.equal(captured.projectBaselineContext, baseline);
   assert.equal(captured.workspaceTree, null);

@@ -19,6 +19,7 @@ export interface CreateSubmitRuntimeContextInput {
   uiDisplayTurnId: string;
   runWorkspace: string | undefined;
   runSessionKey: string;
+  runSessionEpoch?: string;
   runSessionId: number | null | undefined;
   runScopeKey: string;
   phaseLanguage: "zh" | "en";
@@ -35,6 +36,7 @@ export interface CreateSubmitRuntimeContextInput {
   workspaceInstructionContext?: string;
   projectBaselineContext?: ProjectBaselineContext | null;
   skillCatalog?: SkillCatalogSnapshot | null;
+  workspaceMcpSnapshot?: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
   networkRead?: import("../lib/networkRead").NetworkReadPolicy;
   abortCtrl: AbortController;
   timerInterval: unknown;
@@ -58,6 +60,7 @@ export function createSubmitRuntimeContext(
     uiDisplayTurnId: input.uiDisplayTurnId,
     runWorkspace: input.runWorkspace,
     runSessionKey: input.runSessionKey,
+    runSessionEpoch: input.runSessionEpoch,
     runSessionId: input.runSessionId,
     runScopeKey: input.runScopeKey,
     phaseLanguage: input.phaseLanguage,
@@ -76,6 +79,7 @@ export function createSubmitRuntimeContext(
     ),
     projectBaselineContext: input.projectBaselineContext || null,
     skillCatalog: input.skillCatalog || null,
+    workspaceMcpSnapshot: input.workspaceMcpSnapshot || null,
     networkRead: input.networkRead,
     abortCtrl: input.abortCtrl,
     timerInterval: input.timerInterval,

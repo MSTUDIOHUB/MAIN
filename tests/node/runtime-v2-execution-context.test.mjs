@@ -6810,7 +6810,7 @@ test("a missing-source rejection reuses unchanged materialized target source for
   );
 });
 
-test("preferred collaboration strongly suggests bounded parallel work without becoming a stage gate", () => {
+test("preferred collaboration keeps the user's deliverable authoritative instead of filling child capacity", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
       mode: "execute",
@@ -6828,7 +6828,9 @@ test("preferred collaboration strongly suggests bounded parallel work without be
 
   assert.match(prompt, /explicitly prefers collaboration/i);
   assert.match(prompt, /2 new child slot/i);
-  assert.match(prompt, /up to 2 spawn_subagent calls/i);
+  assert.match(prompt, /requested deliverable and depth/i);
+  assert.match(prompt, /independent result.*benefit/i);
+  assert.doesNotMatch(prompt, /prioritize issuing|up to 2 spawn_subagent calls|as many/i);
   assert.match(prompt, /continue non-dependent parent work in parallel/i);
   assert.match(prompt, /not a mandatory lifecycle stage/i);
   assert.match(prompt, /simple or linear task, proceed directly/i);
@@ -7470,6 +7472,7 @@ test("rejected collaboration calls close their standard tool transcript", async 
 });
 
 test("joined child evidence gets a delivery receipt only after entering the canonical parent transcript", async () => {
+  const childSummary = `${"Evidence-backed project findings. ".repeat(170)}COMPLETE_CHILD_REPORT_TAIL`;
   const run = {
     sessionKey: "session",
     sessionEpoch: "epoch",
@@ -7515,7 +7518,7 @@ test("joined child evidence gets a delivery receipt only after entering the cano
   live.childRuns.set(job.id, Promise.resolve({
     job,
     status: "degraded",
-    summary: "The child found one evidence-backed owner for parent review.",
+    summary: childSummary,
     report: null,
     inheritedEvidence: [],
     evidence: [{
@@ -7574,6 +7577,8 @@ test("joined child evidence gets a delivery receipt only after entering the cano
     )
   );
   assert.ok(context);
+  assert.ok(String(context.content).includes(childSummary));
+  assert.ok(String(live.messages.at(-1)?.content || "").includes(childSummary));
   assert.match(String(context.content), /Evidence ids: child-main-owner/);
   assert.match(
     String(context.content),
@@ -10058,6 +10063,78 @@ test("child handoff keeps complete canonical source windows when the run budget 
   assert.match(capsule, /source:src\/main\.js:main-v1/);
   assert.match(capsule, /COMPLETE_PARENT_WINDOW_TAIL/);
   assert.doesNotMatch(capsule, /parent-context-truncated/);
+});
+
+function admittedBaselineFixture(workspace) {
+  return {
+    kind: "project_baseline_context", schemaVersion: 1, parserVersion: 1,
+    workspace: { canonicalPath: workspace, identity: `owner:${workspace}`, vcs: null },
+    limits: {}, anchors: [], topology: [{ path: "src", kind: "directory" }],
+    facts: {
+      languages: [{ name: "TypeScript", provenance: { path: "src/main.ts", selector: "file_extension", contentHash: "path-sha256-main" } }],
+      packageManagers: [], runtimes: [], scripts: [],
+    },
+    omissions: [], diagnostics: [],
+    truncated: { anchors: false, topology: false, scripts: false },
+    fingerprints: { anchors: "anchors", topology: "topology", facts: "facts", overall: "project-baseline-sha256-fixture" },
+  };
+}
+
+test("child baseline orientation replaces only a duplicate overview while retaining source and task authority", () => {
+  const source = "COMPLETE_SOURCE_FOR_CHILD";
+  const messages = [{
+    role: "system", content: "[runtime-v2 context: workspace-overview]\nUNRELATED_ENTIRE_PROJECT_TREE",
+  }, {
+    role: "system", content: "[runtime-v2 context: approved-work-plan]\nAPPROVED_PARENT_SCOPE",
+  }, {
+    role: "assistant", content: "", tool_calls: [{
+      id: "read-child-source", type: "function",
+      function: { name: "read_file", arguments: JSON.stringify({ path: "src/main.ts" }) },
+    }],
+  }, {
+    role: "tool", tool_call_id: "read-child-source",
+    content: `READ_FILE_RESULT\npath: src/main.ts\ncontentVersion: main-v1\ntruncated: false\ntotalLines: 1\ntotalChars: ${source.length}\nreturnedLines: 1-1\nreturnedChars: ${source.length}\n---CONTENT START---\n${source}\n---CONTENT END---`,
+  }];
+  for (const baselineWorkspace of [null, "/fixture/", "/another-workspace"]) {
+    const capsule = subagentContext.buildRuntimeV2SubagentContextCapsule({
+      aggregate: {
+        phase: "observing", objective: { text: "Explain the current project", acceptanceCriteria: ["Only the requested overview"], acceptanceCriterionIds: ["overview"] },
+        workPlan: null, sealedWorkPlan: null,
+        evidence: [{ id: "E-source", kind: "source", target: "src/main.ts", version: "main-v1" }],
+      },
+      job: { taskKind: "explore", allowedPaths: ["src"] },
+      messages, workspace: "/fixture",
+      projectBaselineContext: baselineWorkspace ? admittedBaselineFixture(baselineWorkspace) : null,
+      effectFacts: {
+        committedMutationTargetsByToolCallId: new Map(), replayedToolCallIds: new Set(),
+        sourceReadVersionsByToolCallId: new Map([["read-child-source", { target: "src/main.ts", version: "main-v1" }]]),
+        failedValidationToolCallIds: new Set(), rejectedActionIdentities: new Set(),
+      },
+    });
+    assert.match(capsule, /Explain the current project/);
+    assert.match(capsule, /Only the requested overview/);
+    assert.match(capsule, /APPROVED_PARENT_SCOPE/);
+    assert.match(capsule, /COMPLETE_SOURCE_FOR_CHILD/);
+    assert.match(capsule, /E-source/);
+    if (baselineWorkspace === "/fixture/") assert.doesNotMatch(capsule, /UNRELATED_ENTIRE_PROJECT_TREE/);
+    else assert.match(capsule, /UNRELATED_ENTIRE_PROJECT_TREE/, "missing or foreign baseline cannot replace current orientation");
+  }
+});
+
+test("read-only production history uses only the captured workspace baseline and preserves the user's scope", () => {
+  const userPrompt = "Explain the project purpose; leave the design review for later.";
+  for (const baselineWorkspace of ["/fixture/", "/another-workspace"]) {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    const request = providerHistory.providerHistory(live, {
+      get: () => ({ config: {}, conversationTurns: [{ id: "turn", userPrompt }], agentMessages: [{ role: "user", runtimeTurnId: "turn", content: userPrompt }] }),
+      context: { turnId: "turn", runWorkspace: "/fixture", phaseLanguage: "en", runtimeRunIntent: "summarize", projectBaselineContext: admittedBaselineFixture(baselineWorkspace) },
+      live,
+    });
+    assert.equal(request.messages.find(message => message.role === "user")?.content, userPrompt);
+    assert.match(request.messages[0].content, /requested deliverable and depth/i);
+    if (baselineWorkspace === "/fixture/") assert.match(request.messages[0].content, /PROJECT BASELINE FACTS/);
+    else assert.doesNotMatch(request.messages[0].content, /PROJECT BASELINE FACTS/);
+  }
 });
 
 test("browser validation requires passed assertions and no page errors", () => {

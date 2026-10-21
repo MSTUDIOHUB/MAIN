@@ -1,5 +1,6 @@
 import { getToolTarget } from "../../lib/toolTarget";
 import { buildDurableTurnContext } from "../../lib/durableTurnContext";
+import type { HarnessRunMarker } from "../../lib/harnessCrashTelemetry";
 import {
   appendRuntimeEvent,
   withEventSchema,
@@ -20,7 +21,10 @@ import type {
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import { reconcileRuntimeV2SubagentEvents } from "./subagentProjection";
-import { localizedRuntimeV2FinalProjection } from "./projectionTerminal";
+import {
+  localizedRuntimeV2FinalProjection,
+  syncRuntimeV2TerminalHarnessMarker,
+} from "./projectionTerminal";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -465,6 +469,7 @@ export function createRuntimeV2ProjectionPort(
       const timestampMs = Date.now();
       const run = aggregate.run?.identity;
       if (!run) return;
+      const harnessOwner = input.get()?.harnessRunMarker as HarnessRunMarker | null;
       let storeDisposition:
         | "owner_mismatch"
         | "projected"
@@ -745,6 +750,13 @@ export function createRuntimeV2ProjectionPort(
       });
       const accepted = storeDisposition !== "owner_mismatch";
       const projectedState = input.get();
+      syncRuntimeV2TerminalHarnessMarker({
+        accepted,
+        audience,
+        run,
+        owner: harnessOwner,
+        marker: projectedState?.harnessRunMarker as HarnessRunMarker | null,
+      });
       const projectedRuntimeEvents = Array.isArray(projectedState?.runtimeEvents)
         ? projectedState.runtimeEvents as MainThreadEvent[]
         : [];

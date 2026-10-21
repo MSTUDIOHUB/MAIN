@@ -42,6 +42,13 @@ const {
 const {
   projectSubagentRuns,
 } = loadTs(path.join(workspaceRoot, "src/lib/subagents.ts"));
+const {
+  normalizeHarnessRunMarker,
+  persistHarnessRunMarker,
+  readHarnessRunMarker,
+  markHarnessInstanceStarted,
+  consumePendingUncleanRestartDiagnostic,
+} = loadTs(path.join(workspaceRoot, "src/lib/harnessCrashTelemetry.ts"));
 
 const runIdentity = {
   sessionKey: "session-a",
@@ -119,7 +126,7 @@ function projection(kind, markdown, dedupeKey, id = `${kind}-1`) {
   };
 }
 
-function createHarness(language = "zh") {
+function createHarness(language = "zh", markerOverrides = {}) {
   let nextId = 1;
   const logs = [];
   let state = {
@@ -128,6 +135,7 @@ function createHarness(language = "zh") {
       turnId: "turn-a",
       runId: "run-a",
       status: "running",
+      ...markerOverrides,
     },
     runtimeEvents: [],
     taskFlow: [{ id: 1, turnId: "turn-a", type: "user", content: "Fix it" }],
@@ -147,6 +155,74 @@ function createHarness(language = "zh") {
   });
   return { port, getState: () => state, logs };
 }
+
+async function publishCompletedReadOnly(harness) {
+  const terminalOutcome = {
+    resultKind: "success", reason: "answer_complete", completedAt: 2, finalProjectionId: "read-only-final",
+  };
+  await harness.port.publish({
+    aggregate: aggregate({
+      strategy: "analyze", phase: "completed", terminalOutcome,
+      run: { identity: runIdentity, status: "completed", phase: "completed", terminalOutcome },
+      finalProjectionId: terminalOutcome.finalProjectionId,
+    }),
+    audience: "final",
+    projection: { id: "read-only-final", audience: "final", kind: "final", markdown: "The source-backed answer is complete.", dedupeKey: "turn-a:read-only-final" },
+  });
+}
+
+test("a completed read-only projection closes its global Harness marker before native restart", async () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = { localStorage: {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  } };
+  try {
+    const marker = normalizeHarnessRunMarker({ ...runIdentity, instanceId: "instance-a", startedAt: 1, updatedAt: 1, status: "running", streamStatus: "run_started" });
+    persistHarnessRunMarker(marker);
+    const harness = createHarness("zh", marker);
+    await publishCompletedReadOnly(harness);
+    assert.equal(harness.getState().harnessRunMarker.status, "completed");
+    assert.equal(readHarnessRunMarker().status, "completed");
+    assert.equal(readHarnessRunMarker().terminalResultKind, "success");
+    assert.equal(markHarnessInstanceStarted(), null, "Cmd+Q without pagehide must not turn completed work into an interrupted run");
+    assert.equal(consumePendingUncleanRestartDiagnostic(), null);
+    assert.equal(harness.getState().conversationTurns[0].status, "done");
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+});
+
+test("terminal marker synchronization cannot overwrite another session or Harness generation", async () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = { localStorage: {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  } };
+  try {
+    const marker = normalizeHarnessRunMarker({ ...runIdentity, instanceId: "instance-a", startedAt: 1, updatedAt: 1, status: "running" });
+    for (const overrides of [
+      { sessionKey: "session-b", turnId: "turn-b", runId: "run-b" },
+      { instanceId: "instance-new", startedAt: 2 },
+      { activeRunId: "new-action-run", activeParentRunId: "run-a" },
+    ]) {
+      const newer = normalizeHarnessRunMarker({ ...marker, ...overrides });
+      const persistedNewer = persistHarnessRunMarker(newer);
+      const harness = createHarness("zh", marker);
+      await publishCompletedReadOnly(harness);
+      assert.equal(harness.getState().harnessRunMarker.status, "completed");
+      assert.deepEqual(readHarnessRunMarker(), persistedNewer);
+    }
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+});
 
 test("V2 timeline projects scheduled commands into visible process blocks and settles from receipts", async () => {
   const harness = createHarness();

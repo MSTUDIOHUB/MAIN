@@ -676,13 +676,13 @@ export default function Composer({
       kind: "workspace_command" as const,
       key: "workspace:init",
       command: "/init",
-      label: language === "en" ? "Initialize project context" : "初始化项目上下文",
+      label: language === "en" ? "Generate / refresh project notes" : "生成／刷新项目说明",
       description: !currentWorkspace
-        ? (language === "en" ? "Open a workspace before initializing AGENTS.md." : "请先打开工作区，再初始化 AGENTS.md。")
+        ? (language === "en" ? "Open a workspace before generating AGENTS.md project notes." : "请先打开工作区，再生成 AGENTS.md 项目说明。")
         : composerRunActive
           ? (language === "en" ? "Available after the current run stops." : "当前执行结束后可用。")
-          : (language === "en" ? "Review a deterministic AGENTS.md diff; use /init --refresh to rebuild its managed block." : "审阅确定性的 AGENTS.md diff；使用 /init --refresh 可重建托管区块。"),
-      aliases: ["init", "initialize", "agents", "project", "初始化", "项目"],
+          : (language === "en" ? "Optional: generate / refresh project notes in AGENTS.md after review. Use /init --refresh to update an existing snapshot." : "可选：生成／刷新项目说明（AGENTS.md），审阅后写入；已有事实快照时使用 /init --refresh 更新。"),
+      aliases: ["init", "initialize", "agents", "project", "notes", "refresh", "初始化", "项目", "说明", "刷新"],
       disabled: !currentWorkspace || composerRunActive,
     };
     const query = slashQuery.trim().toLowerCase();

@@ -87,26 +87,10 @@ export type SubmitIntentRoutingResult =
       goalCreationAuthorization: GoalCreationAuthorization | null;
     };
 
-function looksLikeExecutionIntent(params: {
-  shouldExecuteOnceFromReplyOption: boolean;
-  resolution: RunIntentResolution;
-}): boolean {
-  const { resolution } = params;
-  return (
-    params.shouldExecuteOnceFromReplyOption ||
-    resolution.intent === "execute" ||
-    resolution.commandDirective?.kind === "file_modify" ||
-    resolution.commandDirective?.kind === "shell" ||
-    resolution.commandDirective?.kind === "git" ||
-    resolution.commandDirective?.kind === "unity"
-  );
-}
-
 /**
- * In a workspace, semantic "respond" remains a valid Turn intent, but it is
- * never allowed to suppress an independently detected mutation capability.
- * This is provider- and language-neutral because it consumes the normalized
- * command directive rather than model wording.
+ * Semantic intent owns the tool authority. Command metadata describes an
+ * already requested operation; mentioning an operation cannot authorize it.
+ * An explicit execution choice remains a separate user authorization.
  */
 export function resolveWorkspaceTurnRuntimeIntent(input: {
   hasWorkspace: boolean;
@@ -114,12 +98,9 @@ export function resolveWorkspaceTurnRuntimeIntent(input: {
   shouldExecuteOnceFromReplyOption: boolean;
   resolution: RunIntentResolution;
 }): ResolvedRunIntent {
-  const mutationSignal = input.hasWorkspace && looksLikeExecutionIntent({
-    shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
-    resolution: input.resolution,
-  });
   if (
-    mutationSignal &&
+    input.hasWorkspace &&
+    input.shouldExecuteOnceFromReplyOption &&
     (input.resolution.intent === "respond" ||
       input.resolution.intent === "discuss" ||
       input.resolution.intent === "analyze")
@@ -127,6 +108,13 @@ export function resolveWorkspaceTurnRuntimeIntent(input: {
     return "execute";
   }
   return input.resolution.intent;
+}
+
+function looksLikeExecutionIntent(params: {
+  shouldExecuteOnceFromReplyOption: boolean;
+  resolution: RunIntentResolution;
+}): boolean {
+  return params.shouldExecuteOnceFromReplyOption || params.resolution.intent === "execute";
 }
 
 function normalizeSubmitPendingDecisionInputKey(input: string): string {

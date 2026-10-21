@@ -1863,6 +1863,29 @@ function closedReadChildAggregate(state, id) {
   return { state, child };
 }
 
+test("a completed child report replays and normalizes after Rust-style sorted JSON serialization", () => {
+  const prepared = closedReadChildAggregate(executeAggregate(), "sorted-report-child");
+  const evidence = [{ id: "child:sorted:E1", kind: "subagent", target: "src/main.js", version: "v1" }];
+  const report = runtime.compileRuntimeV2SubagentTextReport({ summary: "Confirmed (child:sorted:E1).", evidence });
+  const aggregate = runtime.transition(prepared.state, event(prepared.state, "subagent.completed", {
+    run: baseRun, jobId: prepared.child.id, status: "completed", summary: report.summary, report, evidence,
+  }));
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: aggregate.events.length, aggregate, updatedAt: aggregate.updatedAt });
+  const persisted = runtime.serializeRuntimeV2CheckpointMap({ [baseTurn.turnId]: checkpoint });
+  const sorted = JSON.parse(JSON.stringify(persisted[baseTurn.turnId]), (_key, value) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : 1))
+      : value
+  );
+  const replayed = runtime.replayRuntimeV2Events(sorted.events);
+  assert.ok(replayed, "object key order cannot invalidate an otherwise unchanged completion");
+  const normalized = runtime.normalizeRuntimeV2Checkpoint(sorted, baseTurn);
+  assert.ok(normalized);
+  assert.equal(normalized.aggregate.subagents[0].status, "completed");
+  assert.deepEqual(normalized.aggregate.subagents[0].report, report);
+  assert.equal(normalized.aggregateDigest, checkpoint.aggregateDigest);
+});
+
 test("subagent completion rejects duplicate evidence IDs within one event", () => {
   const prepared = closedReadChildAggregate(
     executeAggregate(),

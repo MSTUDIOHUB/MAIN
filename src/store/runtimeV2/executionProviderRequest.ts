@@ -292,12 +292,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
         content: compactTextEnvelopeCatalog(providerTools),
       }]
     : [];
-  const firstNonSystemIndex = boundedConversation.findIndex((message) =>
-    message.role !== "system"
-  );
-  const instructionIndex = firstNonSystemIndex < 0
-    ? boundedConversation.length
-    : firstNonSystemIndex;
   const toolsClosed =
     requestMode === "conclude" ||
     input.command.payload.conclusionKind === "read_only" ||
@@ -306,10 +300,12 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const concludePrompt =
     "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
   const unboundedMessages = [
-    ...boundedConversation.slice(0, instructionIndex),
+    // Keep stable instructions, objectives and receipt pairs as the cacheable
+    // prefix. Per-decision authority and protocol guidance belong at the
+    // current frontier, after the evidence they govern.
+    ...boundedConversation,
     decisionInstruction,
     ...textEnvelopeInstructions,
-    ...boundedConversation.slice(instructionIndex),
   ];
   const boundedMessages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
     contextLimit: budget.contextLimit,

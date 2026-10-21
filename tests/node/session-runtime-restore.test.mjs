@@ -108,6 +108,66 @@ const runtimeV2 = loadTranspiledModuleSync(
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
 
+test("the first Run after restoring a metadata-only Session keeps its canonical epoch across persistence", () => {
+  const { buildPersistedAppState } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/persistState.ts"));
+  const { createRuntimeV2RunnerIdentity } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionRunnerIdentity.ts"));
+  const { buildRuntimeV2ReadOnlyIdentities } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/readOnlyRunner.ts"));
+  const workspace = "/tmp/metadata-only-session";
+  const sessionId = 731;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "canonical-empty-session-epoch";
+  const original = useAppStore.getState();
+  const persisted = JSON.parse(JSON.stringify(buildPersistedAppState({
+    ...original, currentWorkspace: workspace, currentSessionId: sessionId,
+    sessionsByWorkspace: { [workspace]: [{ id: sessionId, planLifecycleEpoch: sessionEpoch, messages: [], runtimeSnapshot: {} }] },
+  })));
+  assert.equal(persisted.sessionsByWorkspace[workspace][0].runtimeSnapshot, undefined);
+  const turn = { id: "first-turn", clientSubmissionId: "first-submission", userPrompt: "Received?", status: "done", mode: "edit", blockIds: [], createdAt: 1 };
+  const state = { ...original, ...persisted, conversationTurns: [turn] };
+  const context = { turnId: turn.id, runSessionKey: sessionKey, runSessionId: sessionId, runScopeKey: workspace, runWorkspace: workspace, harnessRunId: "first-run" };
+  for (const identities of [buildRuntimeV2ReadOnlyIdentities(state, context, turn), createRuntimeV2RunnerIdentity(state, context, turn)]) {
+    assert.equal(identities.turn.sessionEpoch, sessionEpoch);
+    assert.equal(identities.run.sessionEpoch, sessionEpoch);
+    const aggregate = runtimeV2.transition(null, {
+      schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "first-admission", at: 1,
+      type: "turn.admitted", turn: identities.turn, strategy: "chat", objective: turn.userPrompt, constraints: [], acceptanceCriteria: [],
+    });
+    const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: 1, aggregate, updatedAt: 1 });
+    const serialized = JSON.parse(JSON.stringify(runtimeV2.serializeRuntimeV2CheckpointMap({ [turn.id]: checkpoint })));
+    const restored = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+      workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: sessionEpoch,
+    });
+    assert.equal(restored.runtimeV2Checkpoints[turn.id]?.owner.sessionEpoch, sessionEpoch);
+    const rejected = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+      workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: "replacement-epoch",
+    });
+    assert.equal(rejected.runtimeV2Checkpoints[turn.id], undefined);
+  }
+});
+
+test("runtime Session admission rejects stale exact-turn receipts and ignores foreign owners", () => {
+  const { resolveRuntimeV2SessionEpoch } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/sessionIdentity.ts"));
+  const context = { runSessionKey: "/tmp/owner:9", runScopeKey: "/tmp/owner", runSessionId: 9 };
+  const turn = { id: "owned-turn", clientSubmissionId: "owned-submission", workspaceInstructionReceiptId: "owned-receipt" };
+  const receipt = { ...turn, turnId: turn.id, receiptId: turn.workspaceInstructionReceiptId,
+    sessionKey: context.runSessionKey, sessionEpoch: "epoch-current" };
+  const state = { sessionsByWorkspace: { [context.runScopeKey]: [{ id: 9, planLifecycleEpoch: "epoch-current" }] },
+    planLifecycle: { sessionKey: "/foreign:9", sessionEpoch: "foreign-epoch" },
+    workspaceInstructionLedger: [{ receipt }] };
+  assert.equal(resolveRuntimeV2SessionEpoch(state, context, turn), "epoch-current");
+  assert.throws(() => resolveRuntimeV2SessionEpoch({ ...state,
+    workspaceInstructionLedger: [{ receipt: { ...receipt, sessionEpoch: "epoch-stale" } }],
+  }, context, turn), /RUNTIME_V2_SESSION_OWNER_MISMATCH/);
+  for (const foreign of [{ turnId: "different-turn" }, { sessionKey: "/different:9" }, { clientSubmissionId: "different-submission" }]) {
+    assert.equal(resolveRuntimeV2SessionEpoch({ ...state,
+      workspaceInstructionLedger: [{ receipt: { ...receipt, ...foreign, sessionEpoch: "foreign-epoch" } }],
+    }, context, turn), "epoch-current");
+  }
+  assert.equal(resolveRuntimeV2SessionEpoch({ ...state, planLifecycle: null }, {
+    ...context, runSessionEpoch: "captured-epoch",
+  }, turn), "captured-epoch");
+});
+
 test("workspace Session containers normalize Chat turns to task turns", () => {
   const turns = [{
     id: "turn-chat",

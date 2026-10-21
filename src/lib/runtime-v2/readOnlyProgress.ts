@@ -65,7 +65,6 @@ export function latestReadOnlyAnswer(state: TurnAggregateV1, input: {
  * Receipts and their novelty are reconstructed from the canonical ledger. */
 export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
   readonly finalTextIsProgress?: boolean;
-  readonly includeChildEvidence?: boolean;
 } = {}): RuntimeV2ProviderRecoveryWindow | null {
   if (state.pendingToolCalls.length || state.scheduledCommands.length) return null;
   const commands = new Map(state.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
@@ -93,8 +92,14 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
     reason = nextReason;
   };
   for (const event of state.events) {
-    if (policy.includeChildEvidence && event.type === "subagent.handoff_delivered") {
-      const keys = event.evidenceIds.map((id) => `child:${event.jobId}:${id}`);
+    // Scheduling and settling delegated work are decision boundaries, not
+    // source/acceptance evidence. In particular, time spent joining a child
+    // must not consume the parent's semantic-recovery lease. A failed child
+    // also returns its obligation to the parent, even with no source receipt.
+    if (event.type === "subagents.scheduled" || event.type === "subagent.handoff_delivered") {
+      const keys = event.type === "subagents.scheduled"
+        ? event.jobs.map((job) => `child-scheduled:${job.id}`)
+        : [`child-delivered:${event.jobId}`, ...event.evidenceIds.map((id) => `child:${event.jobId}:${id}`)];
       if (keys.some((key) => !seen.has(key))) { occurrence = 0; discoveryPending = false; }
       keys.forEach((key) => seen.add(key));
       continue;

@@ -85,13 +85,18 @@ test("workspace read policy excludes every effect-capable tool", () => {
   }
 });
 
-test("production workspace read runner uses analyze, reads evidence, and concludes once", async () => {
+for (const discovery of [
+  { name: "without an admitted baseline", baselineWorkspace: null, expectedOverviews: 1 },
+  { name: "with the current workspace baseline", baselineWorkspace: "/fixture/", expectedOverviews: 0 },
+  { name: "with another workspace baseline", baselineWorkspace: "/different-workspace", expectedOverviews: 1 },
+]) test(`production workspace read runner ${discovery.name} reads evidence and concludes once`, async () => {
   let revision = 0;
   let providerCalls = 0;
   const appendedEvents = [];
   const projections = [];
   const providerModes = [];
   const toolNames = [];
+  let overviewCalls = 0;
 
   const checkpointPort = {
     getRuntimeV2Checkpoint() {
@@ -156,6 +161,7 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
       return {
         async execute({ command }) {
           if (command.kind === "collect_observation") {
+            overviewCalls += 1;
             return {
               type: "observation.recorded",
               run: command.run,
@@ -237,6 +243,10 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
       phaseLanguage: "zh",
       effectiveRunIntent: "analyze",
       runtimeRunIntent: "analyze",
+      projectBaselineContext: discovery.baselineWorkspace ? {
+        kind: "project_baseline_context",
+        workspace: { canonicalPath: discovery.baselineWorkspace },
+      } : null,
       abortCtrl: new AbortController(),
       timerInterval,
       harnessRunId: "run-read",
@@ -259,6 +269,8 @@ test("production workspace read runner uses analyze, reads evidence, and conclud
   assert.equal(settlement.outcome.resultKind, "success");
   assert.deepEqual(providerModes, ["analyze", "analyze"]);
   assert.deepEqual(toolNames, ["read_file"]);
+  assert.equal(overviewCalls, discovery.expectedOverviews,
+    "admitted project facts replace repeated discovery only for their captured workspace");
   assert.equal(
     appendedEvents.filter((event) => event.type === "turn.completed").length,
     1,

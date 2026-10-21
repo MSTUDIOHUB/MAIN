@@ -429,6 +429,17 @@ function sortedBy<T>(values: readonly T[], key: (value: T) => string): T[] {
   });
 }
 
+/** Admission facts can replace discovery only for their captured workspace.
+ * A missing or foreign snapshot must never supply another workspace's facts. */
+export function isProjectBaselineForWorkspace(
+  baseline: ProjectBaselineContext | null | undefined,
+  workspace: string,
+): baseline is ProjectBaselineContext {
+  const owner = normalizedWorkspace(workspace);
+  return !!owner && baseline?.kind === "project_baseline_context" &&
+    normalizedWorkspace(baseline.workspace?.canonicalPath || "") === owner;
+}
+
 /**
  * Render bounded deterministic project facts for the canonical Runtime
  * transcript. The renderer never emits raw anchor bodies or package-script

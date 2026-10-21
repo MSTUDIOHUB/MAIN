@@ -5,12 +5,11 @@ import {
   renderSkillCatalogContext,
   skillCatalogContextCharBudget,
 } from "../../lib/agentSkills";
-import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
+import { isProjectBaselineForWorkspace, renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   advanceRuntimeV2ChildRecoveryStallLease,
-  compileRuntimeV2SubagentReport,
   compileRuntimeV2SubagentTextReport,
   runtimeV2ChildRecoveryStallExpired,
   runtimeV2ChildEvidenceId,
@@ -66,11 +65,6 @@ import {
   VALIDATION_CHILD_TOOL_NAMES,
 } from "./executionSubagentPolicy";
 import { requestRuntimeV2ChildStep } from "./executionSubagentProvider";
-import {
-  runtimeV2ChildReportRejectedFeedback,
-  runtimeV2ChildReportTool,
-  SUBMIT_RUNTIME_V2_SUBAGENT_REPORT_TOOL_NAME,
-} from "./executionSubagentReportRecovery";
 
 export {
   boundRuntimeV2ChildToolCalls,
@@ -91,6 +85,11 @@ async function childToolAllowed(input: {
 }): Promise<boolean> {
   if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
     if (input.name === "load_skill") {
+      if (input.args.operation === "list") {
+        return !!input.ports.context.skillCatalog?.entries.some((entry) =>
+          isSkillVisibleToModel(input.ports.context.skillCatalog, entry.id)
+        );
+      }
       return isSkillVisibleToModel(
         input.ports.context.skillCatalog,
         String(input.args.skill_id || ""),
@@ -153,12 +152,14 @@ function completedChildResult(input: {
   readonly summary: string;
   readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
   readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly sourceEvidenceIds: ReadonlySet<string>;
   readonly stagedMutations: readonly RuntimeV2StagedChildMutation[];
 }): RuntimeV2ChildResult {
   const report = compileRuntimeV2SubagentTextReport({
     summary: input.summary,
     evidence: input.evidence,
     inheritedEvidence: input.inheritedEvidence,
+    sourceEvidence: input.evidence.filter((item) => input.sourceEvidenceIds.has(item.id)),
   });
   return {
     job: input.job,
@@ -182,12 +183,17 @@ async function runRuntimeV2Child(input: {
     input.ports.context.skillCatalog,
   );
   const aggregate = aggregateForCurrentTurn(input.ports);
+  const projectBaselineContext = isProjectBaselineForWorkspace(
+    input.ports.context.projectBaselineContext,
+    input.ports.context.runWorkspace || "",
+  ) ? input.ports.context.projectBaselineContext : null;
   const context = buildRuntimeV2SubagentContextCapsule({
     aggregate,
     job: input.job,
     messages: input.ports.live.messages,
     effectFacts: deriveRuntimeV2ProviderEffectFacts(aggregate),
     workspace: input.ports.context.runWorkspace || "",
+    projectBaselineContext,
     contextBudget:
       input.ports.context.runtimeContextBudget || undefined,
   });
@@ -229,6 +235,9 @@ async function runRuntimeV2Child(input: {
       input.job.successCriteria
         ? `Success criteria: ${input.job.successCriteria}`
         : "",
+      input.job.expectedOutput
+        ? `Expected output: ${input.job.expectedOutput}`
+        : "",
       input.job.taskKind === "implement"
         ? "You may submit exactly one provided mutation tool call matching the assigned operation and exclusive paths. Runtime stages it without changing the live workspace; after CHILD_MUTATION_STAGED, cite its evidence id and conclude. Do not broaden or redesign the parent plan."
         : "This child is read-only. Never request or simulate file changes.",
@@ -238,8 +247,7 @@ async function runRuntimeV2Child(input: {
         : input.job.taskKind === "implement"
           ? "Use the provided read/search tools only for the assigned source, then stage one coherent mutation transaction. Final project validation remains the parent's responsibility."
           : "Use only the provided read/search tools.",
-      "When the bounded task is answered, return one concise final summary in ordinary text. Name every exact evidence id that supports the summary; uncited context cannot be adopted.",
-      "Do not invent a report tool during ordinary work. If Runtime rejects an uncited final, it may expose one effect-free structured report submission tool for the repair request.",
+      "When the bounded task is answered, return one concise final summary in ordinary text. Cite supporting sources by their exact file paths or evidence ids. A file path must identify an unambiguous source actually read by this child; cite exact evidence ids for inherited context and other observations.",
       input.ports.context.workspaceInstructionContext
         ? [
             "LIVE_WORKSPACE_INSTRUCTIONS:",
@@ -247,7 +255,7 @@ async function runRuntimeV2Child(input: {
           ].join("\n")
         : "",
       renderProjectBaselineContext(
-        input.ports.context.projectBaselineContext,
+        projectBaselineContext,
       ),
       renderSkillCatalogContext(
         input.ports.context.skillCatalog,
@@ -266,6 +274,7 @@ async function runRuntimeV2Child(input: {
   }];
   const inheritedEvidence = inheritedReviewEvidence(input.ports, input.job);
   const evidence: RuntimeV2EvidenceReference[] = [];
+  const sourceEvidenceIds = new Set<string>();
   const stagedMutations: RuntimeV2StagedChildMutation[] = [];
   const observedTargets = new Set(
     runtimeV2SubagentInheritedSourceTargets({
@@ -283,28 +292,19 @@ async function runRuntimeV2Child(input: {
   let ordinal = 0;
   let recoveryLease: RuntimeV2ChildRecoveryStallLease | null = null;
   let recoveryStalled = false;
-  let reportRepairPending = false;
   const rejectedClosedActionIdentities = new Set<string>();
   const rejectedClosedObservationFingerprints = new Set<string>();
   try {
     while (!input.signal.aborted && Date.now() < deadlineAt) {
       let result: RuntimeV2NormalizedProviderResult;
-      const reportTool = reportRepairPending
-        ? runtimeV2ChildReportTool({ evidence, inheritedEvidence })
-        : null;
-      const reportRepairRequired = reportTool !== null;
       try {
         result = await requestRuntimeV2ChildStep({
           ...input,
           messages,
-          tools: reportTool
-            ? [reportTool]
-            : stagedMutations.length > 0
-              ? []
-              : tools,
-          responseMode: reportRepairRequired
-            ? "report_required"
-            : "action_or_final",
+          tools: stagedMutations.length > 0
+            ? []
+            : tools,
+          responseMode: "action_or_final",
           deadlineAt,
           recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
@@ -316,49 +316,17 @@ async function runRuntimeV2Child(input: {
         throw error;
       }
       const calls = result.toolCalls;
-      if (reportRepairRequired) {
-        const reportCall = calls.length === 1 &&
-            calls[0]?.name ===
-              SUBMIT_RUNTIME_V2_SUBAGENT_REPORT_TOOL_NAME
-          ? calls[0]
-          : null;
-        try {
-          if (!reportCall) {
-            throw new Error(
-              "RUNTIME_V2_SUBAGENT_REPORT_INVALID:submission_missing",
-            );
-          }
-          const report = compileRuntimeV2SubagentReport({
-            draft: reportCall.arguments,
-            evidence,
-            inheritedEvidence,
-          });
-          if (telemetry) telemetry.closedAt = input.ports.now();
-          return {
-            job: input.job,
-            status: "completed",
-            summary: report.summary,
-            report,
-            inheritedEvidence,
-            evidence,
-            stagedMutations,
-          };
-        } catch (error) {
-          recoveryStalled = true;
-          input.ports.logStoreEvent(
-            "runtime_v2_subagent_report_repair_exhausted",
-            {
-              turnId: input.job.run.turnId,
-              runId: input.job.run.runId,
-              jobId: input.job.id,
-              evidenceCount: evidence.length,
-              reason: error instanceof Error
-                ? error.message
-                : String(error),
-            },
-          );
-          break;
-        }
+      if (result.diagnostics.length > 0) {
+        // The child hands incomplete work back without manufacturing a
+        // report or replaying a large context through a report-only surface.
+        input.ports.logStoreEvent("runtime_v2_subagent_incomplete_response", {
+          turnId: input.job.run.turnId,
+          runId: input.job.run.runId,
+          jobId: input.job.id,
+          evidenceCount: evidence.length,
+          diagnosticCodes: result.diagnostics.map((item) => item.code),
+        });
+        break;
       }
       if (calls.length === 0) {
         const summary = result.visibleText || "";
@@ -368,33 +336,12 @@ async function runRuntimeV2Child(input: {
             summary,
             inheritedEvidence,
             evidence,
+            sourceEvidenceIds,
             stagedMutations,
           });
           if (telemetry) telemetry.closedAt = input.ports.now();
           return completed;
         } catch (error) {
-          if (reportRepairPending) {
-            recoveryStalled = true;
-            input.ports.logStoreEvent(
-              "runtime_v2_subagent_report_repair_exhausted",
-              {
-                turnId: input.job.run.turnId,
-                runId: input.job.run.runId,
-                jobId: input.job.id,
-                evidenceCount: evidence.length,
-              },
-            );
-            break;
-          }
-          reportRepairPending = true;
-          messages.push({ role: "assistant", content: summary });
-          messages.push({
-            role: "system",
-            content: runtimeV2ChildReportRejectedFeedback({
-              evidence,
-              inheritedEvidence,
-            }),
-          });
           input.ports.logStoreEvent(
             "runtime_v2_subagent_report_rejected",
             {
@@ -405,12 +352,7 @@ async function runRuntimeV2Child(input: {
               reason: error instanceof Error ? error.message : String(error),
             },
           );
-          recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
-            current: recoveryLease,
-            progressed: false,
-            now: input.ports.now(),
-          });
-          continue;
+          break;
         }
       }
       const acceptedCalls = boundRuntimeV2ChildToolCalls(
@@ -600,6 +542,7 @@ async function runRuntimeV2Child(input: {
             rejectedClosedObservationFingerprints.clear();
             fingerprints.add(fingerprint);
             evidence.push(childEvidence);
+            if (call.name === "read_file") sourceEvidenceIds.add(childEvidence.id);
             input.ports.logStoreEvent(
               "runtime_v2_subagent_evidence_recorded",
               {
@@ -662,7 +605,6 @@ async function runRuntimeV2Child(input: {
         );
         break;
       }
-      if (progressed) reportRepairPending = false;
       recoveryLease = advanceRuntimeV2ChildRecoveryStallLease({
         current: recoveryLease,
         progressed,

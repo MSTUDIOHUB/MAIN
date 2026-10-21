@@ -15,6 +15,7 @@ import {
   type RuntimeV2TurnIdentity,
 } from "../../lib/runtime-v2";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
+import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { getRuntimeV2Checkpoint, createRuntimeV2CheckpointPort } from "./checkpointPort";
 import {
@@ -25,6 +26,7 @@ import {
 } from "./executionPorts";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -55,21 +57,6 @@ function currentTurn(state: any, turnId: string): ConversationTurn | null {
   ) || null;
 }
 
-function sessionEpochFor(
-  state: any,
-  context: RuntimeV2SubmissionContext,
-  turn: ConversationTurn,
-): string {
-  const lifecycle = state?.planLifecycle;
-  if (
-    lifecycle?.sessionKey === context.runSessionKey &&
-    String(lifecycle.sessionEpoch || "").trim()
-  ) {
-    return String(lifecycle.sessionEpoch).trim();
-  }
-  return `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
-}
-
 export function buildRuntimeV2ReadOnlyIdentities(
   state: any,
   context: RuntimeV2SubmissionContext,
@@ -78,7 +65,7 @@ export function buildRuntimeV2ReadOnlyIdentities(
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
 } {
-  const sessionEpoch = sessionEpochFor(state, context, turn);
+  const sessionEpoch = resolveRuntimeV2SessionEpoch(state, context, turn);
   return {
     turn: {
       workspaceKey: String(context.runScopeKey).trim(),
@@ -211,7 +198,12 @@ export async function runSubmitRuntimeV2ReadOnly(
     input.logStoreEvent(`runtime_v2_${strategy === "chat" ? "chat" : "workspace_read"}_${existing ? "resumed" : "admitted"}`, { turnId: identity.turn.turnId, runId: identity.run.runId, strategy });
     const result = await runRuntimeV2ReadOnlyLoop({
       ports, turn: identity.turn, run: identity.run, objective: turn.userPrompt,
-      strategy, collectWorkspace: !!workspace, networkRead: input.context.networkRead,
+      // The admission baseline is already in provider history. Let the model
+      // name any missing source instead of forcing another full project map.
+      strategy, collectWorkspace: !!workspace && !isProjectBaselineForWorkspace(
+        input.context.projectBaselineContext,
+        workspace,
+      ), networkRead: input.context.networkRead,
       allowSkillLoad: !!buildLoadSkillToolDefinition(input.context.skillCatalog),
       signal: input.context.abortCtrl.signal, now, deadlineMs: input.deadlineMs,
       initial: existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined,

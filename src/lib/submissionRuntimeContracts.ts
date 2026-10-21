@@ -63,6 +63,7 @@ export interface SubmissionRuntimeContext {
   uiDisplayTurnId: string;
   runWorkspace: string | undefined;
   runSessionKey: string;
+  runSessionEpoch?: string;
   runSessionId: number | null | undefined;
   runScopeKey: string;
   phaseLanguage: "zh" | "en";
@@ -84,6 +85,7 @@ export interface SubmissionRuntimeContext {
   /** Exact Skill catalog frozen at Turn admission. Full bodies remain outside
    * provider context until explicit activation or load_skill. */
   skillCatalog?: SkillCatalogSnapshot | null;
+  workspaceMcpSnapshot?: import("./workspaceMcp").WorkspaceMcpSnapshot | null;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   abortCtrl: AbortController;
   timerInterval: any;

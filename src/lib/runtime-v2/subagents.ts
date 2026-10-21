@@ -135,7 +135,7 @@ export function runtimeV2SubagentFailureSummary(input: {
       }。`
     : "没有形成可交接的证据。";
   if (input.canceled) {
-    return `子任务已因父任务取消而停止；没有提交可确认的结构化报告。${retained}`;
+    return `子任务已因父任务取消而停止；未形成带来源的可核验结论。${retained}`;
   }
   const boundary = input.recoveryStalled
     ? "子任务在连续恢复步骤未产生新证据后"
@@ -143,11 +143,11 @@ export function runtimeV2SubagentFailureSummary(input: {
       ? "子任务在显式生命周期截止前"
       : "子任务在收口前";
   if (input.evidence.length > 0) {
-    return `${boundary}未提交引用真实证据的结构化报告；已降级由父任务接管。${retained}`;
+    return `${boundary}未形成带来源的可核验结论；已由主体接管。${retained}`;
   }
   return `${input.recoveryStalled || input.deadlineExceeded
     ? boundary
-    : "子任务失败前"}未提交引用真实证据的结构化报告。${retained}`;
+    : "子任务失败前"}未形成带来源的可核验结论。${retained}`;
 }
 
 function pathsOverlap(left: string, right: string): boolean {

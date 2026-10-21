@@ -43,6 +43,7 @@ import {
   type SubmitAttachmentContextInput,
 } from "./submitAttachmentContext";
 import { buildSubmitPromptContext } from "./submitPromptContext";
+import { resolveRuntimeV2SessionEpoch } from "./runtimeV2/sessionIdentity";
 import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
@@ -227,6 +228,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   ) => Promise<{
     instructions: ResolvedInstructionSet | null;
     baseline: ProjectBaselineContext | null;
+    mcpSnapshot?: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
     warnings?: readonly string[];
   }>;
   /** Compatibility/testing port used only when no composite owner exists. */
@@ -1700,6 +1702,9 @@ export async function runSubmitAsyncWorkflowRun<
   let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
   let userContent = input.text;
   try {
+  const admissionState = input.sessionGet();
+  const admissionTurn = admissionState.conversationTurns.find((turn) => turn.id === input.turnId);
+  const runSessionEpoch = resolveRuntimeV2SessionEpoch(admissionState, input, admissionTurn || { id: input.turnId });
   const attachmentContext = await (phaseRunners.buildAttachmentContext || buildSubmitAttachmentContext)({
     text: input.text,
     mentions: input.mentionSnapshot,
@@ -1767,6 +1772,7 @@ export async function runSubmitAsyncWorkflowRun<
   // be finalized as a pre-run conclusion instead of stranding a running lease.
   let resolvedInstructionSnapshot: ResolvedInstructionSet | null = null;
   let projectBaselineSnapshot: ProjectBaselineContext | null = null;
+  let workspaceMcpSnapshot: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null = null;
   if (input.refreshWorkspaceAdmission) {
     const admissionRefreshStartedAt = input.nowMs();
     try {
@@ -1776,6 +1782,7 @@ export async function runSubmitAsyncWorkflowRun<
       );
       resolvedInstructionSnapshot = admission.instructions;
       projectBaselineSnapshot = admission.baseline;
+      workspaceMcpSnapshot = admission.mcpSnapshot || null;
       input.logStoreEvent("workspace_admission_refreshed", {
         turnId: input.turnId,
         workspace: input.runWorkspace || "global",
@@ -2040,6 +2047,7 @@ export async function runSubmitAsyncWorkflowRun<
     uiDisplayTurnId: input.uiDisplayTurnId,
     runWorkspace: input.runWorkspace,
     runSessionKey: input.runSessionKey,
+    runSessionEpoch,
     runSessionId: input.runSessionId,
     runScopeKey: input.runScopeKey,
     phaseLanguage,
@@ -2058,6 +2066,7 @@ export async function runSubmitAsyncWorkflowRun<
     ),
     projectBaselineContext: projectBaselineSnapshot,
     skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
+    workspaceMcpSnapshot,
     networkRead: input.sessionGet().conversationTurns.find(
       (turn: ConversationTurn) => turn.id === input.turnId,
     )?.networkRead,

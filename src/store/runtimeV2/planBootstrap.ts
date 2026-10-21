@@ -25,6 +25,7 @@ import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
 import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { planSettlement, terminalPlanOutcome } from "./planSettlement";
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 import { restorePlanHistory } from "./planHistory";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
@@ -62,11 +63,7 @@ function identities(
   input: RuntimeV2PlanRunnerInput,
   turn: ConversationTurn,
 ): PlanBootstrapReady["identity"] {
-  const lifecycle = state?.planLifecycle;
-  const sessionEpoch = lifecycle?.sessionKey === input.context.runSessionKey &&
-      String(lifecycle.sessionEpoch || "").trim()
-    ? String(lifecycle.sessionEpoch).trim()
-    : `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
+  const sessionEpoch = resolveRuntimeV2SessionEpoch(state, input.context, turn);
   return {
     turn: {
       workspaceKey: String(input.context.runWorkspace || "global").trim() ||

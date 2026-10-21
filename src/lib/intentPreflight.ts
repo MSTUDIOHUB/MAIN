@@ -2,6 +2,7 @@ import { normalizeCloudProtocol, normalizeLocalToolProtocol, resolveEffectiveClo
 import { streamChatCompletion, type StreamSettings } from "./streaming";
 import {
   inferCommandDirective,
+  getIntentPolicy,
   normalizeCommandDirective,
   type PendingRunDecisionOption,
   type IntentPreflightResult,
@@ -132,7 +133,9 @@ function normalizePreflightResult(
   const intent = normalizeIntent(candidate.intent);
   if (!intent) return null;
   const fallbackDirective = inferCommandDirective(input, intent, { source: "preflight" });
-  const commandDirective = normalizeCommandDirective(candidate.commandDirective, fallbackDirective) ?? fallbackDirective;
+  const commandDirective = normalizeCommandDirective(candidate.commandDirective, fallbackDirective, intent) ?? fallbackDirective;
+  const toolPolicy = getIntentPolicy(intent).toolPolicy;
+  const operationIntent = toolPolicy === "write" || toolPolicy === "plan_gated";
   const riskLevel = normalizeRiskLevel(candidate.riskLevel) ?? (
     commandDirective.kind === "shell" || commandDirective.kind === "git" || commandDirective.kind === "file_modify"
       ? "medium"
@@ -162,9 +165,9 @@ function normalizePreflightResult(
     bypassMainRouter: candidate.bypassMainRouter === true,
     needsWorkspaceRead: candidate.needsWorkspaceRead === true,
     ...(riskLevel ? { riskLevel } : {}),
-    requiresApproval: typeof candidate.requiresApproval === "boolean"
+    requiresApproval: operationIntent && (typeof candidate.requiresApproval === "boolean"
       ? candidate.requiresApproval
-      : commandDirective.requiresApproval === true,
+      : commandDirective.requiresApproval === true),
     commandDirective,
   };
 }

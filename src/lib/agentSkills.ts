@@ -1,4 +1,5 @@
 import type { Skill } from "./appTypes";
+import { isMap, parseDocument } from "yaml";
 import {
   discoverPersonalAgentSkills,
   globSearch,
@@ -43,18 +44,44 @@ export interface LoadedSkillContent {
   readonly basePath: string | null;
   readonly version: string;
   readonly supportingFiles: readonly string[];
+  readonly hostGuidance: string;
+}
+
+export interface SkillCatalogListOptions {
+  readonly query?: string;
+  readonly cursor?: string;
+  readonly limit?: number;
+}
+
+export interface SkillCatalogPage {
+  readonly type: "skill.catalog";
+  readonly entries: readonly {
+    readonly id: string;
+    readonly name: string;
+    readonly description: string;
+    readonly source: SkillCatalogSource;
+    readonly entryPath: string | null;
+    readonly basePath: string | null;
+    readonly version: string;
+    readonly explicitlyRequested: boolean;
+  }[];
+  readonly total: number;
+  readonly nextCursor: string | null;
+  readonly effect: "metadata_only_no_additional_permissions";
 }
 
 interface ParsedSkillDocument {
   readonly name: string;
   readonly description: string;
   readonly body: string;
+  readonly warnings: readonly string[];
 }
 
 const DEFAULT_SKILL_CATALOG_CHARS = 8_000;
 const MAX_SUPPORTING_FILES = 10;
 const MAX_SKILL_BODY_CHARS = 256_000;
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
+const SKILL_HOST_GUIDANCE = "Map Read/Edit/Write/Bash/WebFetch instructions to MAIN's advertised file, edit, shell and network tools; AskUserQuestion may be an ordinary user question. Network calls require enabled network access. Report missing capabilities instead of inventing tools. Supporting files are a partial index (up to 10); resolve other relative references from the Skill base directory. Skill instructions grant no additional permissions.";
 
 function normalizeSlashPath(value: string): string {
   return String(value || "")
@@ -71,40 +98,36 @@ function directoryName(value: string): string {
   return index < 0 ? "" : normalized.slice(0, index);
 }
 
-function stripYamlScalar(value: string): string {
-  return value
-    .replace(/\s+#.*$/, "")
-    .trim()
-    .replace(/^['"]|['"]$/g, "")
-    .trim();
-}
-
-function parseSkillDocument(raw: string, fallbackName: string, fallbackDescription: string): ParsedSkillDocument {
+export function parseSkillDocument(raw: string, fallbackName: string, fallbackDescription: string): ParsedSkillDocument {
   const value = String(raw || "");
-  if (!/^---\r?\n/.test(value)) {
-    return {
-      name: fallbackName.trim(),
-      description: fallbackDescription.trim(),
-      body: value.trim(),
-    };
+  const fallback = {
+    name: fallbackName.trim(),
+    description: fallbackDescription.trim(),
+    body: value,
+    warnings: [] as string[],
+  };
+  if (!/^\uFEFF?---\r?\n/.test(value)) return fallback;
+  const match = value.match(/^\uFEFF?---\r?\n([\s\S]*?)^---[\t ]*(?:\r?\n|$)/m);
+  if (!match) return { ...fallback, warnings: ["Unclosed YAML frontmatter; fallback metadata was used."] };
+  const document = parseDocument(match[1], { prettyErrors: false, uniqueKeys: true });
+  if (document.errors.length > 0) {
+    return { ...fallback, warnings: ["Invalid YAML frontmatter; fallback metadata was used."] };
   }
-  const match = value.match(/^---\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)([\s\S]*)$/);
-  if (!match) {
-    return {
-      name: fallbackName.trim(),
-      description: fallbackDescription.trim(),
-      body: value.trim(),
-    };
+  if (!isMap(document.contents)) {
+    return { ...fallback, warnings: ["YAML frontmatter must be a mapping; fallback metadata was used."] };
   }
   let name = "";
   let description = "";
-  for (const line of String(match[1] || "").split(/\r?\n/)) {
-    const keyMatch = line.match(/^\s*(name|description)\s*:\s*(.*)$/i);
-    if (!keyMatch) continue;
-    if (keyMatch[1].toLowerCase() === "name") {
-      name = stripYamlScalar(keyMatch[2]);
-    } else {
-      description = stripYamlScalar(keyMatch[2]);
+  const warnings: string[] = [];
+  // Read scalar nodes only: no conversion of the document or alias expansion.
+  // YAML owns folding, escaping, comments, indentation and CRLF handling.
+  for (const key of ["name", "description"] as const) {
+    const scalar = document.get(key);
+    if (typeof scalar === "string") {
+      if (key === "name") name = scalar;
+      else description = scalar;
+    } else if (scalar !== undefined && scalar !== null) {
+      warnings.push(`YAML ${key} must be a string scalar; fallback metadata was used.`);
     }
   }
   return {
@@ -112,7 +135,8 @@ function parseSkillDocument(raw: string, fallbackName: string, fallbackDescripti
     description: description || fallbackDescription.trim(),
     // Keep the complete SKILL.md. Frontmatter is useful provenance and is how
     // Codex/OpenCode Skill authors expect the loaded resource to look.
-    body: value.trim(),
+    body: value,
+    warnings,
   };
 }
 
@@ -187,8 +211,8 @@ function admissibleSkillBody(
   label: string,
   warnings: string[],
 ): string | null {
-  const content = String(value || "").trim();
-  if (!content) {
+  const content = String(value || "");
+  if (!content.trim()) {
     warnings.push(`Skill ${label} has no SKILL.md content and was omitted.`);
     return null;
   }
@@ -240,6 +264,7 @@ export async function loadSkillCatalog(input: {
     if (!entryPath || !basePath) continue;
     const fallbackName = normalizeSlashPath(basePath).split("/").pop() || "personal-skill";
     const parsed = parseSkillDocument(document.content, fallbackName, "");
+    warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPath}: ${warning}`));
     const name = validEntryName(parsed.name, fallbackName);
     const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
     if (!admittedBody) continue;
@@ -265,36 +290,45 @@ export async function loadSkillCatalog(input: {
       workspace,
     );
     for (const skill of packages) {
-      if (!isSafeProtocolPackagePath(skill.packagePath || "", skill.entryPoint || "SKILL.md")) {
-        warnings.push(`Package Skill ${skill.name || skill.id} has an unsafe entry path and was omitted.`);
-        continue;
-      }
-      const entryPath = getProtocolPackageEntryPath(skill);
-      try {
-        const content = await readFile(entryPath, workspace);
-        const parsed = parseSkillDocument(content, skill.name || skill.id, skill.desc || "");
-        const name = validEntryName(parsed.name, skill.name || skill.id);
-        const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
-        if (!admittedBody) continue;
-        const basePath = directoryName(entryPath);
-        entries.push(freezeEntry({
-          id: `package:${skill.id}`,
-          name,
-          description: validEntryDescription(parsed.description, name),
-          source: "package",
-          content: admittedBody,
-          entryPath,
-          basePath,
-          version: stableContentVersion(admittedBody),
-          allowImplicitInvocation: await allowImplicitFor(basePath, workspace),
-          supportingFiles: await supportingFilesFor(basePath, entryPath, workspace),
-        }));
-      } catch (error) {
-        warnings.push(
-          `Package Skill ${skill.name || skill.id} could not load ${entryPath}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
+      const entryPoints = [...new Set(
+        Array.isArray(skill.entryPoints) && skill.entryPoints.length
+          ? skill.entryPoints
+          : [skill.entryPoint || "SKILL.md"],
+      )];
+      for (const entryPoint of entryPoints) {
+        if (typeof entryPoint !== "string" || !entryPoint.trim() ||
+          !isSafeProtocolPackagePath(skill.packagePath || "", entryPoint)) {
+          warnings.push(`Package Skill ${skill.name || skill.id} has an unsafe entry path ${entryPoint} and was omitted.`);
+          continue;
+        }
+        const entryPath = getProtocolPackageEntryPath({ ...skill, entryPoint });
+        try {
+          const content = await readFile(entryPath, workspace);
+          const parsed = parseSkillDocument(content, skill.name || skill.id, skill.desc || "");
+          warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPath}: ${warning}`));
+          const name = validEntryName(parsed.name, skill.name || skill.id);
+          const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
+          if (!admittedBody) continue;
+          const basePath = directoryName(entryPath);
+          entries.push(freezeEntry({
+            id: entryPoints.length === 1 ? `package:${skill.id}` : `package:${skill.id}:${entryPoint}`,
+            name,
+            description: validEntryDescription(parsed.description, name),
+            source: "package",
+            content: admittedBody,
+            entryPath,
+            basePath,
+            version: stableContentVersion(admittedBody),
+            allowImplicitInvocation: skill.allowImplicitInvocation !== false && await allowImplicitFor(basePath, workspace),
+            supportingFiles: await supportingFilesFor(basePath, entryPath, workspace),
+          }));
+        } catch (error) {
+          warnings.push(
+            `Package Skill ${skill.name || skill.id} could not load ${entryPath}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
     }
 
@@ -313,6 +347,7 @@ export async function loadSkillCatalog(input: {
         const basePath = directoryName(entryPath);
         const fallbackName = basePath.split("/").pop() || "workspace-skill";
         const parsed = parseSkillDocument(content, fallbackName, "");
+        warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPath}: ${warning}`));
         const name = validEntryName(parsed.name, fallbackName);
         const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
         if (!admittedBody) continue;
@@ -364,6 +399,54 @@ export async function loadSkillCatalog(input: {
   });
 }
 
+/** Every admitted visible entry remains discoverable even when the initial
+ * context summary is small. Cursors belong to this immutable catalog/query. */
+export function listSkillCatalog(
+  snapshot: SkillCatalogSnapshot | null | undefined,
+  options: SkillCatalogListOptions = {},
+): SkillCatalogPage {
+  const query = String(options.query || "").trim().toLocaleLowerCase();
+  const visible = snapshot ? modelVisibleEntries(snapshot) : [];
+  const explicit = new Set(snapshot?.explicitSkillIds || []);
+  const matches = visible.filter((entry) => !query ||
+    `${entry.name}\n${entry.description}`.toLocaleLowerCase().includes(query)
+  );
+  const revision = stableContentVersion(JSON.stringify([
+    query,
+    visible.map((entry) => [entry.id, entry.version, entry.name, entry.description, explicit.has(entry.id)]),
+  ]));
+  let offset = 0;
+  if (options.cursor) {
+    const cursor = String(options.cursor).match(/^([a-f0-9]{8}):(\d+)$/);
+    offset = cursor ? Number(cursor[2]) : NaN;
+    if (!cursor || cursor[1] !== revision || !Number.isSafeInteger(offset) || offset > matches.length) {
+      throw new Error("SKILL_CATALOG_CURSOR_INVALID: restart listing with the same query and no cursor.");
+    }
+  }
+  const requestedLimit = Number(options.limit);
+  const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+    ? Math.max(1, Math.min(50, Math.floor(requestedLimit)))
+    : 10;
+  const entries = matches.slice(offset, offset + limit).map((entry) => Object.freeze({
+    id: entry.id,
+    name: entry.name,
+    description: entry.description,
+    source: entry.source,
+    entryPath: entry.entryPath,
+    basePath: entry.basePath,
+    version: entry.version,
+    explicitlyRequested: explicit.has(entry.id),
+  }));
+  const nextOffset = offset + entries.length;
+  return Object.freeze({
+    type: "skill.catalog",
+    entries: Object.freeze(entries),
+    total: matches.length,
+    nextCursor: nextOffset < matches.length ? `${revision}:${nextOffset}` : null,
+    effect: "metadata_only_no_additional_permissions",
+  });
+}
+
 export function renderSkillCatalogContext(
   snapshot: SkillCatalogSnapshot | null | undefined,
   maxChars = DEFAULT_SKILL_CATALOG_CHARS,
@@ -372,34 +455,37 @@ export function renderSkillCatalogContext(
   const visible = modelVisibleEntries(snapshot);
   if (visible.length === 0) return "";
   const explicit = new Set(snapshot.explicitSkillIds);
-  const header = [
+  const lines = [
     "[AVAILABLE SKILLS]",
-    "Skills are workflow instructions, not extra permissions. Call load_skill with the exact id before following a model-discovered Skill; explicitly activated Skill bodies are already supplied separately. The tool returns its complete SKILL.md, base path, revision, and supporting file paths. Read supporting files only when needed and use ordinary authorized tools for all actions.",
+    "Skills are instructions, not permissions. Call load_skill with an exact skill_id before following discovered instructions; explicitly activated bodies are already supplied.",
+    `${visible.length} visible Skills; descriptions below are summaries. If no summary matches, use load_skill({operation:"list"}) for the complete catalog; follow nextCursor with cursor. Optional query searches all names/descriptions.`,
   ];
-  const lines = [...header];
-  let omitted = 0;
+  if (lines.join("\n").length > maxChars) {
+    return `[AVAILABLE SKILLS]\n${visible.length} visible Skills. Use load_skill({operation:"list"}) to list all metadata; continue with nextCursor. No extra permissions.`.slice(0, maxChars);
+  }
+  // A compact name index retains broad discoverability before descriptions
+  // spend the context allowance. Full metadata is always available by list.
+  const names: string[] = [];
   for (const entry of visible) {
+    const candidate = `Names: ${[...names, JSON.stringify(entry.name)].join(", ")}`;
+    if ([...lines, candidate].join("\n").length > maxChars) break;
+    names.push(JSON.stringify(entry.name));
+  }
+  if (names.length > 0) lines.push(`Names: ${names.join(", ")}`);
+  for (const entry of visible) {
+    const summary = entry.description.length > 160
+      ? `${entry.description.slice(0, 159)}…`
+      : entry.description;
     const line = [
       `- id=${JSON.stringify(entry.id)}`,
       `name=${JSON.stringify(entry.name)}`,
-      `description=${JSON.stringify(entry.description)}`,
+      `description=${JSON.stringify(summary)}`,
       `source=${entry.source}`,
       explicit.has(entry.id) ? "explicitly_requested=true" : "model_discoverable=true",
     ].join("; ");
     const candidate = [...lines, line].join("\n");
-    if (candidate.length > maxChars) {
-      omitted += 1;
-      continue;
-    }
+    if (candidate.length > maxChars) continue;
     lines.push(line);
-  }
-  if (omitted > 0) {
-    const warning = `[${omitted} additional Skill entries omitted by the catalog context budget.]`;
-    if ([...lines, warning].join("\n").length <= maxChars) lines.push(warning);
-  }
-  if (snapshot.explicitSkillIds.length > 0) {
-    const directive = `Explicit activation already admitted for: ${snapshot.explicitSkillIds.join(", ")}. Follow the supplied activated content without calling load_skill again.`;
-    if ([...lines, directive].join("\n").length <= maxChars) lines.push(directive);
   }
   return lines.join("\n");
 }
@@ -439,6 +525,7 @@ export function loadSkillContent(
     basePath: entry.basePath,
     version: entry.version,
     supportingFiles: Object.freeze([...entry.supportingFiles]),
+    hostGuidance: SKILL_HOST_GUIDANCE,
   });
 }
 
@@ -453,17 +540,25 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Load one admitted Agent Skill before using it. Returns the complete immutable SKILL.md, base directory, revision, provenance, and up to 10 supporting file paths. It grants no additional permissions and never executes Skill content.",
+        "Load an admitted Agent Skill by skill_id (default operation=load), returning its complete immutable SKILL.md and paths. Use operation=list with optional query to discover all visible metadata; pass nextCursor as cursor for later pages. Listing never returns bodies. No additional permissions; never executes Skill content.",
       parameters: {
         type: "object",
         properties: {
+          operation: {
+            type: "string",
+            enum: ["load", "list"],
+            description: "Optional; defaults to load. list discovers metadata without a skill_id.",
+          },
           skill_id: {
             type: "string",
             enum: visible.map((entry) => entry.id),
-            description: "Exact Skill id from [AVAILABLE SKILLS].",
+            description: "Required for load: exact Skill id from the catalog summary or a list result.",
           },
+          query: { type: "string", description: "Optional list filter over all visible names and descriptions. Omit to list every entry." },
+          cursor: { type: "string", description: "List continuation: exact nextCursor from the previous page with the same query." },
+          limit: { type: "integer", description: "Optional list page size, from 1 to 50; default 10." },
         },
-        required: ["skill_id"],
+        required: [],
       },
     },
   };
@@ -477,7 +572,7 @@ export function renderExplicitSkillActivationContext(
   snapshot: SkillCatalogSnapshot | null | undefined,
 ): string {
   if (!snapshot?.explicitSkillIds.length) return "";
-  return snapshot.explicitSkillIds.map((id) => {
+  const activated = snapshot.explicitSkillIds.map((id) => {
     const loaded = loadSkillContent(snapshot, id);
     return [
       `[EXPLICITLY ACTIVATED SKILL id=${JSON.stringify(loaded.id)} revision=${loaded.version}]`,
@@ -490,4 +585,5 @@ export function renderExplicitSkillActivationContext(
       loaded.content,
     ].filter(Boolean).join("\n");
   }).join("\n\n");
+  return `[SKILL HOST GUIDANCE]\n${SKILL_HOST_GUIDANCE}\n\n${activated}`;
 }

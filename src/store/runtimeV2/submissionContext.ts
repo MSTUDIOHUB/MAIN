@@ -22,6 +22,8 @@ export interface RuntimeV2SubmissionContext {
   readonly uiDisplayTurnId: string;
   readonly runWorkspace: string | undefined;
   readonly runSessionKey: string;
+  /** Canonical Session owner frozen from the accepted admission. */
+  readonly runSessionEpoch?: string;
   readonly runSessionId: number | null | undefined;
   readonly runScopeKey: string;
   readonly phaseLanguage: "zh" | "en";
@@ -35,6 +37,8 @@ export interface RuntimeV2SubmissionContext {
   /** Immutable catalog revision shared by parent, Plan, Goal slices and safe
    * tool execution for this Run. */
   readonly skillCatalog?: SkillCatalogSnapshot | null;
+  /** Connector view resolved for this Run's workspace before execution. */
+  readonly workspaceMcpSnapshot?: import("../../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
   readonly goalCreationAuthorization?: GoalCreationAuthorization | null;
   readonly goalContinuationAuthorization?: GoalContinuationAuthorization | null;
   readonly abortCtrl: AbortController;

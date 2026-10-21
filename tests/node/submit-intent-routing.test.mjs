@@ -235,7 +235,7 @@ test("real compound repair instructions cannot degrade into workspace search", (
   assert.equal(harness.calls.logs[0].data.mutationSurfaceElevated, false);
 });
 
-test("workspace mutation directives reopen execution even when semantic intent says respond", () => {
+test("operation metadata cannot override semantic intent without an explicit execution choice", () => {
   const resolution = {
     intent: "respond",
     reason: "router classified this as ordinary conversation",
@@ -253,10 +253,20 @@ test("workspace mutation directives reopen execution even when semantic intent s
     },
   };
 
+  for (const intent of ["respond", "discuss", "analyze", "summarize", "report"]) {
+    for (const kind of ["file_modify", "shell", "git", "unity"]) {
+      assert.equal(resolveWorkspaceTurnRuntimeIntent({
+        hasWorkspace: true,
+        currentMainModeKey: "main_mode",
+        shouldExecuteOnceFromReplyOption: false,
+        resolution: { ...resolution, intent, commandDirective: { ...resolution.commandDirective, kind } },
+      }), intent, `${intent}: ${kind}`);
+    }
+  }
   assert.equal(resolveWorkspaceTurnRuntimeIntent({
     hasWorkspace: true,
     currentMainModeKey: "main_mode",
-    shouldExecuteOnceFromReplyOption: false,
+    shouldExecuteOnceFromReplyOption: true,
     resolution,
   }), "execute");
   assert.equal(resolveWorkspaceTurnRuntimeIntent({
@@ -265,6 +275,26 @@ test("workspace mutation directives reopen execution even when semantic intent s
     shouldExecuteOnceFromReplyOption: false,
     resolution,
   }), "respond");
+});
+
+test("a source-only follow-up stays read-only through production submit routing", () => {
+  for (const text of [
+    "刚才提到的测试通过，是你本轮实际运行的结果，还是已有文档中的记录？请只说明来源，不要执行测试。",
+    "Were the passing tests run in this turn, or recorded in the documentation? Only explain the source; do not execute tests.",
+    "你说的“运行测试”来自哪里？不要执行测试。",
+    "Please explain the source of 'run test scripts'; do not execute anything.",
+  ]) {
+    const harness = createHarness({ text, hasWorkspace: true });
+    const result = harness.resolve();
+    assert.equal(result.handled, false, text);
+    assert.equal(result.effectiveRunIntent, "respond", text);
+    assert.equal(result.effectiveCommandDirective.kind, "none", text);
+    assert.equal(result.effectiveCommandDirective.requiresApproval, false, text);
+    assert.deepEqual(harness.calls.preRunPatches, [], text);
+    assert.deepEqual(harness.calls.preflights, [], text);
+    assert.equal(harness.calls.logs[0].data.routerIntent, "respond", text);
+    assert.equal(harness.calls.logs[0].data.mutationSurfaceElevated, false, text);
+  }
 });
 
 test("complex workspace submissions enter Plan without a pre-turn decision", () => {

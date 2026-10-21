@@ -171,6 +171,30 @@ test("provider tool batches preserve novel child schedules up to the current lan
   assert.equal(afterFirstCompleted.selection, "collaboration_batch");
 });
 
+test("delegating work preserves the same decision's independent safe reads", () => {
+  const spawn = { id: "spawn-art", name: "spawn_subagent", arguments: { task_key: "art", objective: "Review art", required_paths: "ArtSource" } };
+  const firstRead = { id: "read-readme", name: "read_file", arguments: { path: "README.md" } };
+  const secondRead = { id: "read-code", name: "read_file", arguments: { path: "src/main.ts" } };
+  for (const calls of [[spawn, firstRead, secondRead], [firstRead, spawn, secondRead]]) {
+    const batch = surface.boundRuntimeV2ProviderToolCalls(calls, new Set(), new Set(), { maxSpawnSubagents: 1 });
+    assert.deepEqual(batch.accepted, calls, "Runtime fences each command; scheduling must not erase source reads");
+    assert.deepEqual(batch.discarded, []);
+  }
+  for (const [capacity, attempted] of [[0, new Set()], [1, new Set([surface.runtimeV2ProviderToolCallIdentity(spawn)])]]) {
+    const batch = surface.boundRuntimeV2ProviderToolCalls([spawn, firstRead, secondRead], attempted, new Set(), { maxSpawnSubagents: capacity });
+    assert.deepEqual(batch.accepted, [firstRead, secondRead], "capacity/repetition limits apply to the spawn, not its read companions");
+    assert.deepEqual(batch.discarded, [spawn]);
+  }
+  const rejected = surface.boundRuntimeV2ProviderToolCalls(
+    [spawn, firstRead, secondRead], new Set(), new Set([surface.runtimeV2ProviderToolCallIdentity(firstRead)]), { maxSpawnSubagents: 1 },
+  );
+  assert.deepEqual(rejected.accepted, [spawn, secondRead], "a rejected read identity remains rejected in a mixed batch");
+  const blockedSpawnWithCachedRead = surface.boundRuntimeV2ProviderToolCalls(
+    [spawn, firstRead], new Set([surface.runtimeV2ProviderToolCallIdentity(firstRead)]), new Set(), { maxSpawnSubagents: 0 },
+  );
+  assert.deepEqual(blockedSpawnWithCachedRead.accepted, [], "a capacity-rejected spawn does not make an entirely repeated read batch novel");
+});
+
 test("an already completed safe read is not scheduled again before mutation", () => {
   const read = {
     id: "read-main",

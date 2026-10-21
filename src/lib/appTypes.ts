@@ -34,6 +34,8 @@ export interface Skill {
   toolParameters?: string;
   packagePath?: string;
   entryPoint?: string;
+  /** All Skill entries owned by one imported archive. */
+  entryPoints?: string[];
   workspaceScope?: string | null;
   /** False keeps the Skill available for explicit activation while hiding it
    * from model-driven matching. Mirrors agents/openai.yaml semantics. */

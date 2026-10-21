@@ -54,6 +54,10 @@ const subagentPolicy = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionSubagentPolicy.ts",
 ));
+const skillExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+const toolTargets = loadTs(path.join(workspaceRoot, "src/lib/toolTarget.ts"));
+const skillTelemetry = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionToolDefinitions.ts"));
+const planSkillTools = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"));
 
 function skillCatalog() {
   return Object.freeze({
@@ -149,4 +153,68 @@ test("Runtime v2 children inherit the same frozen Skill ids", () => {
     loadSkill.function.parameters.properties.skill_id.enum,
     ["panel:review"],
   );
+});
+
+test("the production Skill executor can browse every metadata page and load a later Skill", async () => {
+  const base = skillCatalog();
+  const catalog = Object.freeze({
+    ...base,
+    entries: Object.freeze([
+      ...Array.from({ length: 34 }, (_, index) => Object.freeze({
+        ...base.entries[0],
+        id: `package:unity:skills/workflow-${index}/SKILL.md`,
+        name: `workflow-${index}`,
+        content: `EXACT_SKILL_${index}`,
+      })),
+      Object.freeze({ ...base.entries[0], id: "panel:hidden", name: "hidden", allowImplicitInvocation: false }),
+    ]),
+  });
+  const ids = [];
+  let cursor;
+  do {
+    const raw = await skillExecutor.executeTool("load_skill", { operation: "list", limit: "6", cursor }, "/repo", "session", { skillCatalog: catalog });
+    const page = JSON.parse(raw);
+    assert.equal(page.type, "skill.catalog");
+    assert.equal(page.total, 34);
+    assert.ok(page.entries.every((entry) => !("content" in entry)), "listing must not load or execute bodies");
+    ids.push(...page.entries.map((entry) => entry.id));
+    cursor = page.nextCursor;
+  } while (cursor);
+  assert.equal(new Set(ids).size, 34);
+  const loaded = JSON.parse(await skillExecutor.executeTool("load_skill", { skill_id: ids.at(-1) }, "/repo", "session", { skillCatalog: catalog }));
+  assert.equal(loaded.content, "EXACT_SKILL_33");
+  await assert.rejects(() => skillExecutor.executeTool("load_skill", { skill_id: "panel:hidden" }, "/repo", "session", { skillCatalog: catalog }), /SKILL_NOT_AUTHORIZED/);
+  await assert.rejects(() => skillExecutor.executeTool("load_skill", { operation: "list" }, "/repo"), /SKILL_CATALOG_UNAVAILABLE/);
+  await assert.rejects(() => skillExecutor.executeTool("load_skill", { operation: "execute", skill_id: ids[0] }, "/repo", "session", { skillCatalog: catalog }), /SKILL_OPERATION_INVALID/);
+});
+
+test("metadata discovery has its own display target and never logs a Skill body activation", () => {
+  assert.match(toolTargets.getToolTarget("load_skill", { operation: "list", query: "tilemap" }), /tilemap/);
+  const events = [];
+  skillTelemetry.logRuntimeV2SkillLoad({ toolName: "load_skill", succeeded: true, rawOutput: JSON.stringify({ type: "skill.catalog", total: 34, entries: [] }), skillId: "", turnId: "turn", runId: "run", logStoreEvent: (type, payload) => events.push({ type, payload }) });
+  assert.equal(events.some((entry) => entry.type === "runtime_v2_skill_loaded"), false);
+  assert.equal(events[0]?.type, "runtime_v2_skill_catalog_listed");
+});
+
+test("Plan discovery records Skill metadata as tool guidance without claiming a body was loaded", async () => {
+  const settled = [];
+  const evidence = [];
+  const messages = [];
+  await planSkillTools.executeReadOnlyPlanTool({
+    context: { skillCatalog: skillCatalog(), runWorkspace: "/repo", runSessionKey: "session" },
+    ledger: {
+      schedule: async () => ({ idempotencyKey: "skill-page" }),
+      settleCommand: async (receipt) => settled.push(receipt),
+      recordSoftSignal: async () => {},
+    },
+    run: { runId: "run", turnId: "turn" },
+    call: { id: "list-page", name: "load_skill", arguments: { operation: "list" } },
+    messages, evidence, evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent: () => {},
+  });
+  assert.equal(settled[0].status, "succeeded");
+  assert.equal(settled[0].evidence[0].kind, "tool");
+  assert.match(evidence[0].statement, /目录/);
+  assert.doesNotMatch(evidence[0].statement, /已加载 Skill/);
+  assert.equal(messages.length, 1);
+  assert.doesNotMatch(messages[0].content, /EXECUTE_SKILL_BODY_SENTINEL/);
 });

@@ -130,6 +130,7 @@ function harness(providerResults, options = {}) {
     requests,
     read: () => ({ aggregate, providerCalls, toolCalls, schedulerCalls }),
     now: () => clock,
+    advance: (ms) => { clock += ms; },
   };
 }
 
@@ -172,9 +173,18 @@ test("analyze joins an active child after a valid parent draft and regenerates t
   let schedulerAttempts = 0;
   const childEvidence = { id: "child-review:E1", kind: "subagent", target: "src/source.ts", version: "source-v1" };
   const completedAnswer = { visibleText: "已整合子任务证据 child-review:E1 的最终答复。", toolCalls: [], diagnostics: [] };
+  const surface = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/providerToolSurface.ts"));
+  const initialBatch = surface.boundRuntimeV2ProviderToolCalls([
+    { id: "spawn-child", name: "spawn_subagent", arguments: { objective: "Review source" } },
+    { id: "parent-read-1", name: "read_file", arguments: { path: "README.md" } },
+    { id: "parent-read-2", name: "read_file", arguments: { path: "src/main.ts" } },
+  ], new Set(), new Set(), { maxSpawnSubagents: 1 });
   const h = harness([
-    { visibleText: "", toolCalls: [{ id: "spawn-child", name: "spawn_subagent", arguments: { objective: "Review source" } }], diagnostics: [] },
-    { visibleText: "交接前的完整父线程答复。", toolCalls: [], diagnostics: [] },
+    { visibleText: "", toolCalls: initialBatch.accepted, diagnostics: [] },
+    () => {
+      assert.equal(h.read().toolCalls, 2, "the decision's independent reads execute before another provider request");
+      return { visibleText: "交接前的完整父线程答复。", toolCalls: [], diagnostics: [] };
+    },
     ({ abort }) => {
       // Bound the failing fixture: an unnecessary provider request before
       // joining cannot spin forever while the child is still in flight.
@@ -183,6 +193,9 @@ test("analyze joins an active child after a valid parent draft and regenerates t
     },
     ({ abort }) => { abort.abort(); return { visibleText: "", toolCalls: [], diagnostics: [] }; },
   ], {
+    toolExecute: ({ command }) => receipt(command, { content: "Parent source fact" }, {
+      evidence: [{ id: `E-${command.payload.toolCallId}`, kind: "source", target: command.payload.arguments.path, version: "source-v1" }],
+    }),
     prepareSchedule: async ({ command }) => ({
       type: "subagents.scheduled", run: command.run, maxActiveSubagents: 1,
       jobs: runtime.scheduleRuntimeV2Subagents({
@@ -212,7 +225,7 @@ test("analyze joins an active child after a valid parent draft and regenerates t
   const result = await runLoop(h, { strategy: "analyze", decisionInput: () => ({ subagentPreference: "allowed", subagentCapacity: 1 }) });
   assert.equal(result.resultKind, "success");
   assert.equal(h.requests.length, 3);
-  assert.deepEqual(result.aggregate.events.filter((event) => event.type === "command.scheduled").map((event) => event.command.kind), ["request_model", "schedule_subagents", "request_model", "join_subagents", "request_model", "finalize_turn"]);
+  assert.deepEqual(result.aggregate.events.filter((event) => event.type === "command.scheduled").map((event) => event.command.kind), ["request_model", "schedule_subagents", "execute_tool", "execute_tool", "request_model", "join_subagents", "request_model", "finalize_turn"]);
   assert.equal(h.requests.at(-1).payload.mode, "analyze", "joining must preserve ordinary read authority");
   assert.equal(progress.latestReadOnlyAnswer({ ...result.aggregate, terminalOutcome: null }), completedAnswer.visibleText);
   const adoption = result.aggregate.events.find((event) => event.type === "subagent.handoff_applied");
@@ -226,6 +239,62 @@ test("analyze joins an active child after a valid parent draft and regenerates t
   assert.equal(result.aggregate.events.filter((event) => event.type === "run.completed").length, 1);
   assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
   assert.equal(result.aggregate.events.filter((event) => event.type === "projection.published" && event.projection.kind === "final").length, 1);
+});
+
+test("analyze lets the parent take over a slow child handoff without spending the recovery lease on the join", async () => {
+  for (const status of ["degraded", "failed"]) {
+    const evidence = status === "degraded"
+      ? [{ id: "slow-child:E1", kind: "subagent", target: "src/source.ts", version: "v1" }]
+      : [];
+    const h = harness([
+      { visibleText: "", diagnostics: [], toolCalls: [{ id: "spawn", name: "spawn_subagent", arguments: { objective: "Review source" } }] },
+      { visibleText: "", diagnostics: [], toolCalls: [{ id: "wait", name: "wait_subagents", arguments: { subagent_ids: "slow-child" } }] },
+      answer,
+    ], {
+      prepareSchedule: async ({ command }) => ({
+        type: "subagents.scheduled", run: command.run, maxActiveSubagents: 1,
+        jobs: runtime.scheduleRuntimeV2Subagents({
+          parentRun: command.run, maxActiveJobs: 1, requestedAt: h.now(), nextId: () => "slow-child",
+          candidates: [{ scopeKey: "source", taskKind: "explore", accessMode: "read", objective: "Review source", allowedPaths: ["src/source.ts"], sourceToolCallId: command.payload.toolCallId }],
+        }).jobs,
+      }),
+      schedulerExecute: async ({ command, scheduledSubagents }) => {
+        const job = scheduledSubagents[0];
+        if (command.kind === "schedule_subagents") return [{ type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "request_opened", at: h.now() } }];
+        assert.equal(command.kind, "join_subagents");
+        // The production incident waited eleven minutes for report repair.
+        // A failed child still resolves a delegated obligation for takeover.
+        h.advance(11 * 60_000);
+        return [
+          { type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "closed", at: h.now() } },
+          { type: "subagent.completed", run: command.run, jobId: job.id, status, summary: "Parent must take over.", evidence },
+          { type: "subagent.handoff_delivered", run: command.run, jobId: job.id, contextEntryId: `child:${job.id}`, evidenceIds: evidence.map((item) => item.id) },
+        ];
+      },
+    });
+    const result = await runLoop(h, { strategy: "analyze", decisionInput: () => ({ subagentPreference: "allowed", subagentCapacity: 1 }) });
+    assert.equal(result.resultKind, "success", `${status} must return work to the parent`);
+    assert.equal(h.requests.length, 3);
+    assert.equal(h.requests[1].payload.recoveryPressure, undefined, "successful scheduling is orchestration progress");
+    assert.equal(h.requests[2].payload.recoveryPressure, undefined, "the resolved child is a new parent decision boundary");
+    assert.equal(result.aggregate.subagents[0].status, status);
+    assert.equal(result.aggregate.subagents[0].report, null, "takeover does not fabricate a child report");
+    assert.equal(result.aggregate.events.filter((event) => event.type === "run.completed").length, 1);
+    assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
+    assert.equal(result.aggregate.events.filter((event) => event.type === "projection.published" && event.projection.kind === "final").length, 1);
+  }
+});
+
+test("replayed child deliveries cannot repeatedly renew read-only recovery", () => {
+  const handoff = { type: "subagent.handoff_delivered", jobId: "child", evidenceIds: ["child:E1"] };
+  const events = [
+    { ...handoff, at: 1 },
+    { type: "provider.responded", at: 2, result: { visibleText: "", toolCalls: [], diagnostics: [] } },
+    { ...handoff, at: 3 },
+  ].map((event, sequence) => ({ ...event, sequence }));
+  const recovery = progress.deriveReadOnlyRecoveryWindow({ events, pendingToolCalls: [], scheduledCommands: [] });
+  assert.equal(recovery.startedAt, 2);
+  assert.equal(recovery.pressure.occurrence, 1);
 });
 
 test("network permission is frozen and absent/invalid legacy snapshots stay disabled", () => {
