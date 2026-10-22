@@ -36,11 +36,12 @@ const { authorizeToolForCurrentTurn } = loadTs(path.join(root, "src/store/runtim
 const { createRuntimeV2LiveExecutionState } = loadTs(path.join(root, "src/store/runtimeV2/executionTypes.ts"));
 const { buildShellPermissionApproval } = loadTs(path.join(root, "src/lib/shellAutoApproval.ts"));
 
-function fixture({ consent = null, command = "unity --version", decision = "allow", critical = false } = {}) {
+function fixture({ consent = null, command = "unity --version", decision = "allow", critical = false, autoApproveTools = false, autoApproveToolScopes = [] } = {}) {
   const state = {
     config: {},
     currentTurnExecutionConsent: consent,
-    autoApproveTools: false,
+    autoApproveTools,
+    autoApproveToolScopes,
     approvedShellPermissionRules: [],
     approvedLocalFileReadPaths: [],
     taskFlow: [], runtimeEvents: [],
@@ -107,7 +108,7 @@ test("missing and stale Turn consent pause the exact shell call without granting
 
 test("dangerous shell review preserves exact command bytes and the one-call shell approval packet", async () => {
   const command = 'rm "Assets/old\\ sprite.txt"';
-  const f = fixture({ consent: { turnId: "turn", granted: true }, command, decision: "ask", critical: true });
+  const f = fixture({ consent: { turnId: "turn", granted: true }, command, decision: "ask", critical: true, autoApproveTools: true, autoApproveToolScopes: ["shell"] });
   const { pending, resolve } = await pendingReview(f);
   assert.equal(f.state.activeActionRequest.target, command);
   assert.deepEqual(f.state.pendingToolCall.arguments, f.request.args);
@@ -152,15 +153,45 @@ test("cancellation and a replaced Run cannot accept an old shell approval", asyn
 });
 
 test("existing safe shell Auto Review and policy denial keep their boundaries", async () => {
-  const safe = fixture({ consent: { turnId: "turn", granted: true }, decision: "ask" });
+  const safe = fixture({ consent: { turnId: "turn", granted: true }, decision: "ask", autoApproveTools: true, autoApproveToolScopes: ["shell"] });
   const automatic = await resolveRuntimeV2ToolAuthorization(safe.request);
   assert.equal(automatic.allowed, true);
   assert.equal(automatic.authorization.shellPermissionApproval.command, safe.preflight.command);
   assert.equal(safe.state.activeActionRequest, undefined);
 
-  const denied = fixture({ consent: { turnId: "turn", granted: true }, decision: "deny" });
+  const denied = fixture({ consent: { turnId: "turn", granted: true }, decision: "deny", autoApproveTools: true, autoApproveToolScopes: ["shell"] });
   assert.equal((await resolveRuntimeV2ToolAuthorization(denied.request)).allowed, false);
   assert.equal(denied.state.activeActionRequest, undefined);
+});
+
+test("Execute consent cannot enable safe shell ask Auto Review without the session flag and scope", async () => {
+  for (const settings of [
+    { autoApproveTools: false, autoApproveToolScopes: [] },
+    { autoApproveTools: false, autoApproveToolScopes: ["shell"] },
+    { autoApproveTools: true, autoApproveToolScopes: [] },
+    { autoApproveTools: true, autoApproveToolScopes: ["workspace_write"] },
+  ]) {
+    const f = fixture({ consent: { turnId: "turn", granted: true }, decision: "ask", ...settings });
+    const initial = await authorizeToolForCurrentTurn(f.ports, "run_command", f.request.args);
+    assert.equal(initial.allowed, false, "task consent cannot create an Auto Review shell approval");
+    assert.equal(initial.approvalRequired, true);
+    assert.equal(initial.shellPermissionApproval, undefined);
+    const { pending, resolve } = await pendingReview(f);
+    resolve({ action: "accept", shellPermissionApproval: buildShellPermissionApproval(f.preflight, "once") });
+    assert.equal((await pending).allowed, true);
+    assert.equal(f.state.autoApproveTools, settings.autoApproveTools);
+    assert.deepEqual(f.state.autoApproveToolScopes, settings.autoApproveToolScopes);
+    assert.equal((await authorizeToolForCurrentTurn(f.ports, "run_command", f.request.args)).allowed, false,
+      "one-call approval cannot enable review of later commands");
+  }
+});
+
+test("an explicit shell allow rule does not require enabling Auto Review", async () => {
+  const f = fixture({ consent: { turnId: "turn", granted: true }, decision: "allow", autoApproveTools: false });
+  const result = await resolveRuntimeV2ToolAuthorization(f.request);
+  assert.equal(result.allowed, true);
+  assert.equal(result.authorization.shellPermissionApproval, undefined);
+  assert.equal(f.state.activeActionRequest, undefined);
 });
 
 test("external local reads still require the exact normalized path grant", async () => {

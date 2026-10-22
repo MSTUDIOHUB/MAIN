@@ -15,6 +15,7 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
@@ -469,7 +470,17 @@ export async function authorizeToolForCurrentTurn(
         allowExternalLocalRead: false,
       };
     }
-    if (!hasConsent || !canApplyShellAutoReview(shell)) {
+    const autoReviewAllowed = state.autoApproveTools === true &&
+      isAllowedBySessionAutoApprove(
+        risk,
+        catalogResolution.entry.source,
+        state.autoApproveToolScopes,
+        authorization.policy,
+      );
+    // Turn consent authorizes the task, while only the explicit session
+    // Auto Review scope may turn a shell-policy ask into an approval packet.
+    if (!hasConsent || !canApplyShellAutoReview(shell) ||
+      (shell.decision?.decision === "ask" && !autoReviewAllowed)) {
       return {
         allowed: false,
         reason: "该 Shell 命令需要单独审批，未执行。",
