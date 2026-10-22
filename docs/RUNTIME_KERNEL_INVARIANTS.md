@@ -85,6 +85,8 @@ Chat/analyze 的 canonical ledger 保留原有对话和当前完整 assistant/to
 
 接受 canonical final 的公共投影同时把已完成的 Harness marker 同步到全局崩溃观测存储；只读策略不能只更新 Session 内标记、留下全局 `running` 并在下次启动误报中断。同步复用精确 run/session/turn/instance/startedAt 与活动 action/parent 归属保护，不能覆盖其他代次；启动消费者不另行裁定 Runtime 是否完成，也不删除真实历史诊断。
 
+展示文本去重只在同一 canonical 事实边界内成立。新的命令、工具或验证回执、provider 响应与本 Run 的其他事实必须允许同文投影再次同步现有视图；纯 `projection.published` 不推进该边界。工具卡片的完成状态仍由精确 Turn/Run/command 回执派生，不能等下一段不同措辞或最终答复才结清，也不能从展示文本推断执行成功。没有新事实的重复投影继续幂等合并。
+
 直接 Execute 的已记录执行契约由 core 唯一解析和回放；工具声明与接纳仍由 Store adapter 负责。完成门控除了原有的最终修改边界、验收 authority、版本和证据类型校验，还要求覆盖契约中全部非 preserve 目标，以及最终修改之后的每项声明验证。有限命令必须匹配实际已执行的契约命令，下一次验证优先选择尚未覆盖的项。没有契约的历史/简单 Execute 继续遵守原有 typed 或 unclassified 验收规则，不从自然语言猜测行为类别。
 
 Web 工具的代理 HTTP 成功不能证明源站成功：Jina fallback 保留原始失败、代理状态和可观察源站状态；源站状态不能确认时正文仅作未核实上下文，不产生成功来源证据或续租。Bing 解析使用结果标题链接并解包真实目标 URL；历史跟踪 URL 也按真实目标比较版本。外部搜索结果的语义相关性仍需模型核对，Runtime 不使用语言、站点正文关键词或金融问题特判。

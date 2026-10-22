@@ -1159,3 +1159,126 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
     "### 已取消\n\n本轮已按用户请求停止。",
   );
 });
+
+function createControllerProjectionHarness() {
+  const harness = createHarness("en");
+  let checkpoint = null;
+  let receiptCheckpoint = null;
+  let beforeReceiptUi = null;
+  let clock = 1;
+  let id = 0;
+  let providerRequests = 0;
+  let completeSecond;
+  let secondStarted;
+  const pendingSecond = new Promise((resolve) => { secondStarted = resolve; });
+  const secondReceipt = new Promise((resolve) => { completeSecond = resolve; });
+  const calls = ["version", "status", "inspect"].map((argument, index) => ({
+    id: `inspection-${index}`, name: "run_command",
+    arguments: { command: `example ${argument}`, description: "Inspect external state" },
+  }));
+  const ports = {
+    checkpoint: {
+      async append(input) {
+        const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+        if (result.checkpoint) checkpoint = result.checkpoint;
+        if (input.event.type === "tool.completed" && !receiptCheckpoint) {
+          receiptCheckpoint = JSON.parse(JSON.stringify(checkpoint));
+        }
+        return result;
+      },
+    },
+    provider: { async request() {
+      providerRequests += 1;
+      assert.equal(providerRequests, 1, "receipt projection must settle before another model response");
+      return { visibleText: "Inspect the requested external state.", toolCalls: calls, diagnostics: [] };
+    } },
+    tool: { async execute({ command }) {
+      if (command.payload.toolCallId === calls[0].id) beforeReceiptUi = structuredClone(harness.getState());
+      if (command.payload.toolCallId === calls[1].id) { secondStarted(); await secondReceipt; }
+      return {
+        type: "tool.completed", run: runIdentity, idempotencyKey: command.idempotencyKey,
+        status: "succeeded", evidence: [{ id: `receipt-${command.payload.toolCallId}`, kind: "tool", target: command.payload.arguments.command, version: "exit-0" }],
+        presentation: { toolName: "run_command", target: command.payload.arguments.command, message: "Actual operation succeeded." },
+      };
+    } },
+    scheduler: { async execute() { throw new Error("No child task is needed"); } },
+    projection: harness.port,
+    clockId: { now: () => ++clock, nextId: (scope) => `${scope}-${++id}`, nextIdempotencyKey: ({ kind }) => `${kind}-${++id}` },
+  };
+  let controller = new runtime.RuntimeV2Controller(ports);
+  return {
+    harness, calls, pendingSecond, completeSecond,
+    get controller() { return controller; },
+    get providerRequests() { return providerRequests; },
+    async admit() {
+      await controller.admit({ turn: aggregate().turn, run: runIdentity, strategy: "execute", objective: "Inspect three external facts.", initialPhase: "observing" });
+      await controller.driveOnce();
+    },
+    restoreReceiptCheckpoint() {
+      assert.ok(receiptCheckpoint);
+      checkpoint = JSON.parse(JSON.stringify(receiptCheckpoint));
+      harness.setState(structuredClone(beforeReceiptUi));
+      controller = new runtime.RuntimeV2Controller(ports, {
+        aggregate: runtime.replayRuntimeV2Events(checkpoint.events), revision: checkpoint.revision,
+      });
+    },
+  };
+}
+
+test("controller projects each command receipt immediately despite unchanged public markdown", async () => {
+  const fixture = createControllerProjectionHarness();
+  await fixture.admit();
+  const { harness } = fixture;
+  await fixture.controller.driveOnce();
+  let rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].toolStatus, "executed", "the first committed receipt settles before a second tool starts or another model responds");
+  const pending = fixture.controller.driveOnce();
+  await fixture.pendingSecond;
+  rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
+  assert.equal(rows.length, 2, "a new command with identical markdown owns an independent timeline row");
+  assert.equal(rows[0].status, "done");
+  assert.equal(rows[1].toolStatus, "running", "the next tool remains pending without reopening its predecessor");
+  assert.equal(fixture.providerRequests, 1);
+  fixture.completeSecond();
+  await pending;
+  await fixture.controller.driveOnce();
+  rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
+  assert.equal(rows.length, 3);
+  assert.equal(rows.every((row) => row.toolStatus === "executed" && row.status === "done"), true);
+  assert.equal(new Set(rows.map((row) => row.toolCallId)).size, 3);
+  assert.equal(fixture.providerRequests, 1, "all three receipts settle while the next provider response is still absent");
+  const ledger = fixture.controller.snapshot().aggregate;
+  assert.equal(ledger.events.filter((event) => event.type === "tool.completed" && event.status === "succeeded").length, 3);
+  const timelines = ledger.events.filter((event) => event.type === "projection.published" && event.audience === "timeline" && event.projection.markdown.includes("正在运行"));
+  assert.equal(timelines.length, 3);
+  assert.equal(new Set(timelines.map((event) => event.projection.markdown)).size, 1, "the fixture exercises exact content equality across distinct canonical commands");
+  assert.equal(ledger.terminalOutcome, null, "presentation cannot conclude the Run");
+  await fixture.controller.publishLiveStatus("Same public status.", "repeat");
+  await fixture.controller.publishMilestoneStatus("Same public milestone.", "repeat");
+  const eventCount = fixture.controller.snapshot().aggregate.events.length;
+  const state = structuredClone(harness.getState());
+  await fixture.controller.publishLiveStatus("Same public status.", "repeat");
+  await fixture.controller.publishMilestoneStatus("Same public milestone.", "repeat");
+  assert.equal(fixture.controller.snapshot().aggregate.events.length, eventCount, "presentation-only events do not advance the canonical frontier");
+  assert.deepEqual(harness.getState(), state, "same-frontier repeats preserve both ledger and UI content idempotency");
+});
+
+test("cold controller replay settles a committed receipt before the next pending tool returns", async () => {
+  const fixture = createControllerProjectionHarness();
+  await fixture.admit();
+  await fixture.controller.driveOnce();
+  fixture.restoreReceiptCheckpoint();
+  const stale = fixture.harness.getState().taskFlow.find((block) => block.type === "tool");
+  assert.equal(stale.toolStatus, "running", "the serialized checkpoint is newer than the stale UI snapshot");
+  const pending = fixture.controller.driveOnce();
+  await fixture.pendingSecond;
+  const rows = fixture.harness.getState().taskFlow.filter((block) => block.type === "tool");
+  assert.equal(rows[0].toolStatus, "executed", "checkpoint receipt truth reaches reconciliation even when its next command repeats prior markdown");
+  assert.equal(rows[0].status, "done");
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].toolStatus, "running");
+  assert.equal(fixture.providerRequests, 1);
+  fixture.completeSecond();
+  await pending;
+});
