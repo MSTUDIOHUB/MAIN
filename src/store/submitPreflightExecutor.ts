@@ -114,7 +114,9 @@ export interface StartSubmitBlockingPreflightEffectInput<
     text: string,
     images: string[] | undefined,
     options: TOptions & SubmitPreflightResumeOptions,
-  ) => void;
+  ) => boolean;
+  onWorkspaceResumeAccepted?: (options: TOptions & SubmitPreflightResumeOptions) => boolean;
+  onWorkspaceResumeRejected?: (options: TOptions & SubmitPreflightResumeOptions) => void;
   logStoreEvent: (event: string, data: Record<string, unknown>) => void;
   closeTurnAsCanceled?: (turnId: string) => void;
   redispatchWorkspaceInstruction?: (sessionKey: string) => void;
@@ -161,8 +163,12 @@ export function startSubmitBlockingPreflightEffect<
     },
     claimResume: workspace ? () => settle("resume") : undefined,
     resumeSubmission: (text, images, options) => {
-      input.resumeSubmission(text, images, options);
-      if (workspace && input.effect.sendOriginSessionKey) input.redispatchWorkspaceInstruction?.(input.effect.sendOriginSessionKey);
+      const accepted = input.resumeSubmission(text, images, options);
+      // Reuse the dispatcher's synchronous adoption handoff before any queued
+      // UI drain can mistake an asynchronous bootstrap for a stale executor.
+      if (workspace && !(accepted && input.onWorkspaceResumeAccepted?.(options))) {
+        input.onWorkspaceResumeRejected?.(options);
+      }
     },
     logStoreEvent: input.logStoreEvent,
   }).then((action) => {

@@ -2252,6 +2252,40 @@ function workspaceInstructionEnvelopeIdentity(
   return buildWorkspaceTurnQueueEntryIdentity(entry);
 }
 
+/** Synchronous submit acceptance transfers the exact FIFO claim to its Turn. */
+function acknowledgeWorkspaceInstructionClaim(
+  state: AppState,
+  claim: WorkspaceInstructionDispatchClaim,
+): WorkspaceTurnQueueState | null {
+  const queue = state.workspaceTurnQueue;
+  const entry = queue?.entries[0];
+  if (!queue || !entry || !isSessionRuntimeActive(state, claim.sessionKey) ||
+    !isWorkspaceInstructionDispatchClaimCurrent(queue, {
+      adoptExistingTurn: true, workspaceInstructionClaim: claim,
+      turnIdOverride: claim.turnId, admittedUserBlockId: claim.admittedUserBlockId,
+    }) || getPendingSessionCancellation(claim.sessionKey)) return null;
+  const inspection = inspectWorkspaceInstructionTerminalProjection({
+    entry, sessionKey: claim.sessionKey, taskFlow: state.taskFlow,
+    conversationTurns: state.conversationTurns, runtimeEvents: state.runtimeEvents,
+  });
+  if (!inspection.owner || inspection.terminals.length > 0 ||
+    isConversationTurnRuntimeClosed(inspection.owner.turn.runtimeOutcome) ||
+    !(state.currentTurnId === claim.turnId ||
+      (state.harnessRunMarker?.sessionKey === claim.sessionKey &&
+        state.harnessRunMarker.turnId === claim.turnId))) return null;
+  const transition = reduceWorkspaceTurnQueue(queue, {
+    type: "ack", expectedVersion: queue.version, at: Date.now(),
+    claimId: claim.claimId, sessionKey: queue.sessionKey, sessionEpoch: queue.sessionEpoch,
+    turnOwner: {
+      sessionKey: queue.sessionKey, sessionEpoch: queue.sessionEpoch,
+      turnId: entry.receipt.turnId, receiptId: entry.receipt.receiptId,
+      clientSubmissionId: entry.instruction.clientSubmissionId,
+      instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(entry),
+    },
+  });
+  return transition.disposition === "applied" ? transition.state : null;
+}
+
 function sameStringSequence(
   left: readonly string[] | undefined,
   right: readonly string[] | undefined,
@@ -15962,11 +15996,10 @@ export const useAppStore = create<AppState>()(
         );
         const sourceHasTerminalBoundary = inspection.terminals.length > 0 ||
           isConversationTurnRuntimeClosed(inspection.owner?.turn.runtimeOutcome);
-        // Semantic intake is owned by this durable dispatch claim before a
-        // Run exists. A re-entrant drain must neither consume it as a stale
-        // executor nor race the ordinary cancellation terminal boundary.
-        if (terminalHead.claim.phase === "intent_preflight" &&
-          !sourceHasTerminalBoundary &&
+        // Cancellation owns the terminal transaction through intake and its
+        // resumed dispatch. No re-entrant drain may classify the still-open
+        // claim as stale before that transaction settles.
+        if (!sourceHasTerminalBoundary &&
           deferDispatchUntilCancellationSettles("before_claim")) return false;
         if (!sourceHasTerminalBoundary && isSubmitWorkspacePreflightLive(state)) {
           return false;
@@ -16571,35 +16604,10 @@ export const useAppStore = create<AppState>()(
     const acknowledgeAdmittedTurn = () => {
       let acknowledged = false;
       set((current) => {
-        const activeQueue = current.workspaceTurnQueue;
-        const activeHead = activeQueue?.entries[0];
-        if (
-          !activeQueue ||
-          activeHead?.status !== "dispatching" ||
-          activeHead.claim?.claimId !== claimId ||
-          activeHead.receipt.receiptId !== head.receipt.receiptId ||
-          workspaceInstructionEnvelopeIdentity(activeHead) !==
-            exactClaim.instructionEnvelopeIdentity
-        ) return {};
-        const transition = reduceWorkspaceTurnQueue(activeQueue, {
-          type: "ack",
-          expectedVersion: activeQueue.version,
-          at: Date.now(),
-          claimId,
-          sessionKey: activeQueue.sessionKey,
-          sessionEpoch: activeQueue.sessionEpoch,
-          turnOwner: {
-            sessionKey: activeQueue.sessionKey,
-            sessionEpoch: activeQueue.sessionEpoch,
-            turnId: head.receipt.turnId,
-            receiptId: head.receipt.receiptId,
-            clientSubmissionId: head.instruction.clientSubmissionId,
-            instructionEnvelopeIdentity: exactClaim.instructionEnvelopeIdentity,
-          },
-        });
-        if (transition.disposition !== "applied") return {};
+        const acknowledgedQueue = acknowledgeWorkspaceInstructionClaim(current, exactClaim);
+        if (!acknowledgedQueue) return {};
         acknowledged = true;
-        return { workspaceTurnQueue: transition.state };
+        return { workspaceTurnQueue: acknowledgedQueue };
       });
       if (acknowledged) {
         get().saveCurrentRuntimeToSession();
@@ -18065,7 +18073,69 @@ export const useAppStore = create<AppState>()(
             get().dispatchNextWorkspaceInstruction(sessionKey);
           },
           resumeSubmission: (nextText, nextImages, nextOptions) => {
-            get().sendMessage(nextText, nextImages, nextOptions);
+            return get().sendMessage(nextText, nextImages, nextOptions);
+          },
+          onWorkspaceResumeAccepted: (nextOptions) => {
+            const claim = nextOptions.workspaceInstructionClaim;
+            if (!claim) return false;
+            let acknowledged = false;
+            set((current) => {
+              const queue = acknowledgeWorkspaceInstructionClaim(current, claim);
+              if (!queue) return {};
+              acknowledged = true;
+              return { workspaceTurnQueue: queue };
+            });
+            if (acknowledged) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            }
+            return acknowledged;
+          },
+          onWorkspaceResumeRejected: (nextOptions) => {
+            const claim = nextOptions.workspaceInstructionClaim;
+            if (!claim) return;
+            let released = false;
+            let reconcileRejectedClaim = false;
+            set((current) => {
+              const queue = current.workspaceTurnQueue;
+              if (!queue || !isSessionRuntimeActive(current, claim.sessionKey) ||
+                !isWorkspaceInstructionDispatchClaimCurrent(queue, nextOptions)) return {};
+              if (getPendingSessionCancellation(claim.sessionKey) ||
+                hasCanceledTurnTerminalProjection({
+                  sessionKey: claim.sessionKey, turnId: claim.turnId,
+                  taskFlow: current.taskFlow, runtimeEvents: current.runtimeEvents,
+                })) {
+                // Keep cancellation's canonical transaction ahead of removal.
+                reconcileRejectedClaim = true;
+                return {};
+              }
+              if (!current.isGenerating && current.agentStatus !== "running" &&
+                current.agentStatus !== "pending_review") {
+                // A rejected idle submit cannot be retried as another intake.
+                // Let the ordinary dispatcher conclude this exact lost claim.
+                reconcileRejectedClaim = true;
+                return {};
+              }
+              const transition = reduceWorkspaceTurnQueue(queue, {
+                type: "release", expectedVersion: queue.version, at: Date.now(),
+                claimId: claim.claimId, sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+              });
+              if (transition.disposition !== "applied") return {};
+              released = true;
+              return { workspaceTurnQueue: transition.state };
+            });
+            if (released) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            } else if (reconcileRejectedClaim) {
+              scheduleRuntimeTask(() => {
+                const current = get();
+                if (isSessionRuntimeActive(current, claim.sessionKey) &&
+                  isWorkspaceInstructionDispatchClaimCurrent(current.workspaceTurnQueue, nextOptions)) {
+                  current.dispatchNextWorkspaceInstruction(claim.sessionKey);
+                }
+              });
+            }
           },
           logStoreEvent,
         });
