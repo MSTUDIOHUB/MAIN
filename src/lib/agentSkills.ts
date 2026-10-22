@@ -44,6 +44,7 @@ export interface SkillCatalogSnapshot {
 export interface LoadedSkillContent {
   readonly id: string;
   readonly ref: string;
+  readonly readTarget: SkillReadTarget;
   readonly name: string;
   readonly description: string;
   readonly content: string;
@@ -67,6 +68,13 @@ export interface LoadedSkillContent {
   readonly nextSectionCursor: string | null;
   readonly resource?: string;
   readonly resourceReadSupported?: boolean;
+}
+
+/** Reusable identity for one admitted document, independent of read coordinates. */
+export interface SkillReadTarget {
+  readonly skill_id: string;
+  readonly expected_version: string;
+  readonly resource?: string;
 }
 
 /** Source-character offsets use JS UTF-16 indexing, zero-based/end-exclusive.
@@ -136,7 +144,7 @@ const DEFAULT_SKILL_CATALOG_CHARS = 8_000;
 const MAX_SUPPORTING_FILES = 10;
 const MAX_SKILL_BODY_CHARS = 256_000;
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
-const SKILL_HOST_GUIDANCE = "Map Read/Edit/Write/Bash/WebFetch instructions to MAIN's advertised file, edit, shell and network tools; AskUserQuestion may be an ordinary user question. Network calls require enabled network access. Report missing capabilities instead of inventing tools. Supporting files are a partial index (up to 10); resolve other relative references from the Skill base directory. Skill instructions grant no additional permissions.";
+const SKILL_HOST_GUIDANCE = "Map Read/Edit/Write/Bash/WebFetch instructions to MAIN's advertised file, edit, shell and network tools; AskUserQuestion may be an ordinary user question. Network calls require enabled network access. Report missing capabilities instead of inventing tools. Supporting files are a partial index (up to 10); resolve other relative references from the Skill base directory. Reuse readTarget for the same document, then choose relevant section, line or index coordinates. Skill instructions grant no additional permissions.";
 const GLOBAL_SKILL_RESOURCE_GUIDANCE = 'Global package references use load_skill({skill_id, resource:"references/file.md"}), relative to this Skill base. Do not pass main-skill:// locators to ordinary file tools. Resource reads return guidance, grant no source mutation lease or extra permissions, and never execute scripts. Use each resource\'s returned version for its own continuations.';
 
 function normalizeSlashPath(value: string): string {
@@ -733,8 +741,18 @@ export function loadSkillContent(
   if (!entry) {
     throw new Error(`SKILL_NOT_ADMITTED: ${skillId || "missing skill id"}`);
   }
+  return discloseSkillDocument(entry, skillReference(snapshot!, entry.id), options);
+}
+
+function discloseSkillDocument(
+  entry: SkillCatalogEntry,
+  ref: string,
+  options: SkillDisclosureOptions,
+  resource?: string,
+): LoadedSkillContent {
   if (options.expectedVersion !== undefined && options.expectedVersion !== entry.version) {
-    throw new Error(`SKILL_VERSION_MISMATCH: expected ${options.expectedVersion}; admitted ${entry.version}. Restart from this admitted revision.`);
+    const document = resource === undefined ? "Skill body" : `Skill resource ${JSON.stringify(resource)}`;
+    throw new Error(`SKILL_VERSION_MISMATCH: ${document} at ${JSON.stringify(entry.entryPath || entry.id)}: expected ${options.expectedVersion}; admitted document version ${entry.version}. Use the version returned for this exact document.`);
   }
   const lines = sourceLines(entry.content);
   const allSections = documentSections(entry.content, lines);
@@ -776,7 +794,8 @@ export function loadSkillContent(
   const complete = startChar === 0 && endChar === entry.content.length;
   return Object.freeze({
     id: entry.id,
-    ref: skillReference(snapshot!, entry.id),
+    ref,
+    readTarget: Object.freeze({ skill_id: ref, expected_version: entry.version, ...(resource === undefined ? {} : { resource }) }),
     name: entry.name,
     description: entry.description,
     content: entry.content.slice(startChar, endChar),
@@ -787,6 +806,7 @@ export function loadSkillContent(
     supportingFiles: Object.freeze(relativeSupportingPaths(entry)),
     hostGuidance: entry.globalPackageId ? `${SKILL_HOST_GUIDANCE} ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : SKILL_HOST_GUIDANCE,
     ...(entry.globalPackageId ? { resourceReadSupported: true } : {}),
+    ...(resource === undefined ? {} : { resource }),
     disclosure: complete ? "full" : overview ? "overview" : "window",
     complete,
     partial: !complete,
@@ -827,8 +847,7 @@ export async function loadSkillResourceContent(
   if (!entry.globalResourcePaths?.includes(path)) throw new Error("SKILL_RESOURCE_NOT_ADMITTED: path is absent from the captured package manifest.");
   const content = await readGlobalSkillPackageFile(entry.globalPackageId, path);
   const resourceEntry = freezeEntry({ ...entry, content, version: stableContentVersion(content), entryPath: `main-skill://${entry.globalPackageId}/${path}` });
-  const loaded = loadSkillContent({ ...snapshot!, entries: [resourceEntry] }, entry.id, options);
-  return Object.freeze({ ...loaded, ref: skillReference(snapshot!, entry.id), resource });
+  return discloseSkillDocument(resourceEntry, skillReference(snapshot!, entry.id), options, resource);
 }
 
 export function buildLoadSkillToolDefinition(
@@ -842,7 +861,7 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions; continue with nextStartLine/nextStartChar and expected_version. For global package references, set resource to a path relative to the selected Skill base. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
+        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions. Reuse returned readTarget with chosen section, line or index coordinates; nextStartLine/nextStartChar continue source windows. For global package references, set resource relative to the selected Skill base. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
       parameters: {
         type: "object",
         properties: {
@@ -855,13 +874,13 @@ export function buildLoadSkillToolDefinition(
             type: "string",
             description: "Required for load: short ref from the catalog, or an exact canonical id from a list result. Unknown or hidden entries are rejected.",
           },
-          resource: { type: "string", description: "Optional global package reference path relative to this Skill base, e.g. references/setup.md. Rejects absolute paths, traversal and unknown resources; omit for SKILL.md. Guidance only; never executes scripts or grants project/source/write permissions." },
+          resource: { type: "string", description: "Optional global package reference path relative to this Skill base, e.g. references/setup.md. Repeat on every continuation by reusing that resource's readTarget; omit for SKILL.md. Rejects absolute paths, traversal and unknown resources. Guidance only; never executes scripts or grants project/source/write permissions." },
           section: { type: "string", description: "Optional exact section id from the Skill index, such as L15. Returns original source, never a generated summary." },
           start_line: { type: "integer", description: "Optional one-based source line. Use nextStartLine for continuation; with section, it must stay within that section." },
           max_lines: { type: "integer", description: "Optional positive source line window. The Run source budget also bounds the returned content." },
           start_char: { type: "integer", description: "Optional absolute zero-based UTF-16 source offset inside start_line; use nextStartChar when continuing a partial line." },
           max_chars: { type: "integer", description: "Optional smaller source-character window, bounded by the current Run budget." },
-          expected_version: { type: "string", description: "Pass the returned version on subsequent section/window reads; mismatched revisions are rejected." },
+          expected_version: { type: "string", description: "Version belongs to the exact document. On a first resource read omit this field, never use the SKILL.md version. For later section/window/index reads reuse that document's readTarget; mismatched revisions are rejected." },
           section_cursor: { type: "string", description: "Continue a heading index with nextSectionCursor. Returns another index page without repeating source text; do not combine with section or source ranges." },
           query: { type: "string", description: "Optional list filter over all visible names and descriptions. Omit to list every entry." },
           cursor: { type: "string", description: "List continuation: exact nextCursor from the previous page with the same query." },

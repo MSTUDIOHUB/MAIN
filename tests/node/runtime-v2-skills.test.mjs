@@ -55,6 +55,8 @@ const subagentPolicy = loadTs(path.join(
   "src/store/runtimeV2/executionSubagentPolicy.ts",
 ));
 const skillExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+const agentSkillTool = loadTs(path.join(workspaceRoot, "src/lib/agentSkillExecutor.ts"));
+const agentSkills = loadTs(path.join(workspaceRoot, "src/lib/agentSkills.ts"));
 const toolTargets = loadTs(path.join(workspaceRoot, "src/lib/toolTarget.ts"));
 const skillTelemetry = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionToolDefinitions.ts"));
 const planSkillTools = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"));
@@ -67,6 +69,119 @@ function globalSkillCatalog() {
   };
   return Object.freeze({ ...skillCatalog(), entries: Object.freeze([Object.freeze(entry)]) });
 }
+
+async function withReadTargetDocuments(action) {
+  const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
+  const original = ipc.readGlobalSkillPackageFile;
+  const body = `# Body\r\nPreface\r\n## Middle\r\n${"body🙂".repeat(70)}\r\n## Last\r\nBODY END\r\n`;
+  let resource = `# Reference\r\nIntro\r\n## Middle\r\n${"reference🙂".repeat(70)}\r\n## Last\r\nREFERENCE END\r\n`;
+  const base = globalSkillCatalog();
+  const entry = Object.freeze({ ...base.entries[0], content: body });
+  // A non-first entry catches references accidentally rebound in a one-entry resource snapshot.
+  const catalog = Object.freeze({ ...base, entries: Object.freeze([skillCatalog().entries[0], entry]) });
+  const nativeReads = [];
+  ipc.readGlobalSkillPackageFile = async (...args) => { nativeReads.push(args); return resource; };
+  const read = async (args) => JSON.parse(await agentSkillTool.executeAgentSkillTool(catalog, args));
+  try { await action({ body, entry, catalog, read, nativeReads, resource: () => resource, setResource: (text) => { resource = text; } }); }
+  finally { ipc.readGlobalSkillPackageFile = original; }
+}
+
+test("load_skill receipts expose a reusable document-local readTarget for body and resource", async () => {
+  await withReadTargetDocuments(async ({ body, entry, catalog, read, resource }) => {
+    const loadedBody = await read({ skill_id: entry.id });
+    const loadedResource = await read({ skill_id: loadedBody.ref, resource: "references/check.md" });
+    assert.deepEqual(loadedBody.readTarget, { skill_id: loadedBody.ref, expected_version: loadedBody.version });
+    assert.equal(Object.hasOwn(loadedBody.readTarget, "resource"), false);
+    assert.deepEqual(loadedResource.readTarget, {
+      skill_id: loadedBody.ref, expected_version: loadedResource.version, resource: "references/check.md",
+    });
+    assert.notEqual(loadedResource.version, loadedBody.version);
+    assert.equal((await read(loadedBody.readTarget)).content, body);
+    assert.equal((await read(loadedResource.readTarget)).content, resource());
+    assert.match(loadedResource.effect, /resource_guidance_no_additional_permissions/);
+    assert.match(loadedBody.hostGuidance, /readTarget/);
+    assert.ok(Object.isFrozen(agentSkills.loadSkillContent(catalog, entry.id).readTarget));
+    assert.ok(Object.isFrozen((await agentSkills.loadSkillResourceContent(catalog, entry.id, "references/check.md")).readTarget));
+  });
+});
+
+test("readTarget plus independently selected line, character and index coordinates stays lossless", async () => {
+  await withReadTargetDocuments(async ({ body, entry, read, resource }) => {
+    for (const target of [{ skill_id: entry.id }, { skill_id: entry.id, resource: "references/check.md" }]) {
+      let page = await read({ ...target, start_line: 1, max_chars: 37 });
+      let reconstructed = page.content;
+      let pages = 1;
+      while (page.nextStartLine !== null) {
+        page = await read({ ...page.readTarget, start_line: page.nextStartLine, start_char: page.nextStartChar, max_chars: 37 });
+        reconstructed += page.content;
+        assert.ok(++pages < 50, "the exact document continuation must make progress");
+      }
+      assert.equal(reconstructed, target.resource ? resource() : body);
+      let index = await read({ ...page.readTarget, max_chars: 140 });
+      const sections = [...index.sections];
+      while (index.nextSectionCursor) {
+        index = await read({ ...index.readTarget, section_cursor: index.nextSectionCursor, max_chars: 140 });
+        assert.equal(index.content, "");
+        sections.push(...index.sections);
+      }
+      const last = sections.find((section) => section.startLine === 5);
+      assert.ok(last);
+      const selected = await read({ ...index.readTarget, section: last.id, max_chars: 140 });
+      assert.equal(selected.content, target.resource ? "## Last\r\nREFERENCE END\r\n" : "## Last\r\nBODY END\r\n");
+    }
+  });
+});
+
+test("cross-document versions remain rejected and identify the actual body or resource address", async () => {
+  await withReadTargetDocuments(async ({ entry, read, setResource }) => {
+    const body = await read({ skill_id: entry.id });
+    const reference = await read({ skill_id: body.ref, resource: "references/check.md" });
+    await assert.rejects(() => read({ skill_id: body.ref, expected_version: reference.version }), (error) => {
+      assert.match(error.message, /SKILL_VERSION_MISMATCH/);
+      assert.match(error.message, /Skill body/);
+      assert.ok(error.message.includes(entry.entryPath));
+      return true;
+    });
+    await assert.rejects(() => read({ skill_id: reference.ref, resource: "references/check.md", expected_version: body.version }), (error) => {
+      assert.match(error.message, /SKILL_VERSION_MISMATCH/);
+      assert.match(error.message, /Skill resource/);
+      assert.ok(error.message.includes("references/check.md"));
+      assert.ok(error.message.includes(reference.entryPath));
+      return true;
+    });
+    assert.equal((await read(body.readTarget)).version, body.version, "a mistaken resource target does not change the captured body revision");
+    setResource("CHANGED REFERENCE");
+    await assert.rejects(() => read(reference.readTarget), /SKILL_VERSION_MISMATCH/);
+  });
+});
+
+test("load_skill schema distinguishes first resource reads from exact-document continuations", () => {
+  const definition = agentSkills.buildLoadSkillToolDefinition(globalSkillCatalog());
+  const properties = definition.function.parameters.properties;
+  assert.match(properties.expected_version.description, /first resource read.*omit/i);
+  assert.match(properties.expected_version.description, /readTarget/);
+  assert.match(properties.resource.description, /every continuation/i);
+  assert.match(definition.function.description, /readTarget/);
+});
+
+test("resource readTarget keeps empty documents exact and cannot bypass admitted ids or paths", async () => {
+  await withReadTargetDocuments(async ({ entry, catalog, read, nativeReads, setResource }) => {
+    setResource("");
+    const empty = await read({ skill_id: entry.id, resource: "references/check.md" });
+    assert.deepEqual(empty.readTarget, { skill_id: empty.ref, expected_version: empty.version, resource: "references/check.md" });
+    assert.equal((await read(empty.readTarget)).content, "");
+    assert.equal(empty.complete, true);
+    assert.deepEqual(empty.returnedRange, { startLine: 0, endLine: 0, startChar: 0, endChar: 0 });
+    const readsBeforeRejection = nativeReads.length;
+    for (const path of ["", "../other", "/outside", "main-skill://other/ref", "references//check.md", "missing.md"]) {
+      await assert.rejects(() => read({ ...empty.readTarget, resource: path }), /SKILL_RESOURCE/);
+    }
+    await assert.rejects(() => read({ ...empty.readTarget, skill_id: "unknown" }), /SKILL_NOT_AUTHORIZED/);
+    const replaced = Object.freeze({ ...catalog, entries: Object.freeze([Object.freeze({ ...entry, id: entry.id.replace("a".repeat(64), "b".repeat(64)) })]) });
+    await assert.rejects(() => agentSkillTool.executeAgentSkillTool(replaced, empty.readTarget), /SKILL_NOT_AUTHORIZED/);
+    assert.equal(nativeReads.length, readsBeforeRejection, "a returned target is a locator, not fresh authority");
+  });
+});
 
 test("production load_skill reads global resource guidance without invoking project IO or executing content", async () => {
   const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
