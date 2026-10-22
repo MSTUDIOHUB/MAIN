@@ -7010,6 +7010,23 @@ test("execution prompt keeps positive source authority without reprinting reject
   assert.doesNotMatch(prompt, /currently ineligible/i);
 });
 
+test("Execute prompt permits a complete command report while retaining authorization and file validation debt", () => {
+  const prompt = providerRequest.providerModeInstruction({
+    payload: { mode: "execute", toolExpectation: "auto" },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+  });
+  assert.match(prompt, /workspace change only when the user's current request authorizes that effect/i);
+  assert.match(prompt, /command or external-operation task/i);
+  assert.match(prompt, /actual successful receipts cover the user's full request/i);
+  assert.match(prompt, /successful intermediate action does not require you to stop/i);
+  assert.match(prompt, /file mutations still require subsequent matching validation/i);
+  assert.doesNotMatch(prompt, /A no-tool reply does not itself complete the Run/);
+});
+
 test("validation prompt asks for evidence instead of another mutation", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {

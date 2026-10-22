@@ -152,7 +152,7 @@ test("Runtime v2 store adapters do not import either legacy execution owner", ()
   }
 });
 
-test("Runtime v2 Execute accepts terminal provider text only from conclude mode", () => {
+test("Runtime v2 Execute accepts natural final text only through real command receipts or verified mutation conclusion", () => {
   const coreSource = ["completion.ts", "providerAnswer.ts"].map((name) => fs.readFileSync(
     path.join(process.cwd(), "src/lib/runtime-v2", name), "utf8",
   )).join("\n");
@@ -165,6 +165,13 @@ test("Runtime v2 Execute accepts terminal provider text only from conclude mode"
   )).join("\n");
   assert.match(coreSource, /latestRuntimeV2ProviderConclusionText/);
   assert.match(coreSource, /mode !== "conclude"/);
+  assert.match(coreSource, /runtimeV2CommandTaskReadyForConclusion/);
+  assert.match(coreSource, /command\.kind !== "execute_tool" && command\.kind !== "execute_validation"/);
+  assert.match(coreSource, /event\.receiptOrigin !== "replayed"/);
+  assert.match(coreSource, /isRuntimeV2ReadOnlyToolName/);
+  assert.match(coreSource, /deriveRuntimeV2ExecutionContract\(aggregate\)/);
+  assert.match(coreSource, /mutationCount > 0/);
+  assert.match(coreSource, /every\(\(result\) => result\.settled\)/);
   assert.doesNotMatch(coreSource, /\["execute", "validate", "conclude"\]/);
   assert.match(coreSource, /event\.result\.toolCalls\.length/);
   assert.match(coreSource, /event\.result\.diagnostics\.length/);

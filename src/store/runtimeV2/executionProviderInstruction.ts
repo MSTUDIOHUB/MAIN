@@ -367,9 +367,7 @@ export function providerModeInstruction(
           : "No versioned source evidence is committed yet. Read the exact existing file before changing it. Safe reads remain available after every edit and failed validation."
       : "",
     toolSurface.hasMutation
-      ? recoveringCompleteReply
-        ? "Source visibility is editing authority, not an obligation to write. Make a workspace change only when the user's current request authorizes that effect."
-        : "Make the smallest coherent change that addresses all currently supported gaps, preserving unrelated behavior."
+      ? "Source visibility is editing authority, not an obligation to write. Make a workspace change only when the user's current request authorizes that effect; keep any authorized change as small and coherent as the full objective permits, preserving unrelated behavior."
       : "",
     editableSourceGuidance,
     toolSurface.validationCorrectionActive
@@ -378,7 +376,7 @@ export function providerModeInstruction(
     preferredValidationCommand
       ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
       : "",
-    "If an authorized effect remains, use a real structured tool action when the necessary evidence is available. A no-tool reply does not itself complete the Run or replace required mutation and validation evidence. If essential user input or authority is missing, state the exact unfinished work and needed clarification; never invent an effect to claim progress.",
+    "If an authorized effect remains, use a real structured tool action when the necessary evidence is available. For a command or external-operation task without required artifact changes or acceptance debt, return a complete final report when actual successful receipts cover the user's full request. A successful intermediate action does not require you to stop; continue using tools while work remains. File mutations still require subsequent matching validation. If essential user input or authority is missing, state the exact unfinished work and needed clarification; never invent an effect to claim progress.",
     collaborationGuidance,
   ].filter(Boolean).join(" ");
 }

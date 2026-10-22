@@ -1195,6 +1195,224 @@ test("a tool-free Execute conclusion ends truthfully without a mutation", () => 
   });
 });
 
+const executionOutcome = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/executionOutcome.ts",
+));
+
+function commandOnlyOutcome(state) {
+  return executionOutcome.runtimeV2ExecuteTerminalDecision({
+    aggregate: state,
+    signal: new AbortController().signal,
+  });
+}
+
+function operationReceipt(state, command, options = {}) {
+  state = providerResult(state, {
+    toolCalls: [{
+      id: `operation-${++eventCounter}`,
+      name: options.name || "run_command",
+      arguments: options.arguments || { command, cwd: "." },
+    }],
+  });
+  return executePendingTool(state, {
+    type: "tool.completed",
+    status: options.status || "succeeded",
+    evidence: options.evidence ?? [{
+      id: `operation-evidence-${eventCounter}`,
+      kind: "tool",
+      target: command,
+      version: "exit-0",
+    }],
+    ...(options.failureReasonCode
+      ? { failureReasonCode: options.failureReasonCode }
+      : {}),
+    ...(options.receiptOrigin ? { receiptOrigin: options.receiptOrigin } : {}),
+  });
+}
+
+test("command-only Execute keeps tools available through four CLI queries and concludes once on a natural final", async () => {
+  let state = executeAggregate("observing", [null]);
+  state = providerResult(state, {
+    toolCalls: ["--version", "status", "projects list", "editor info"].map(
+      (command, index) => ({
+        id: `cli-query-${index}`,
+        name: "run_command",
+        arguments: { command: `editor-tool ${command}`, cwd: "." },
+      }),
+    ),
+  });
+  for (let index = 0; index < 4; index += 1) {
+    state = executePendingTool(state, {
+      type: "tool.completed",
+      status: "succeeded",
+      evidence: [{ id: `cli-evidence-${index}`, kind: "tool", target: "editor-tool", version: "exit-0" }],
+    });
+    assert.equal(commandOnlyOutcome(state), null, "a receipt alone cannot end the task");
+  }
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.mode, "execute");
+  assert.notDeepEqual(next.payload.allowedToolNames, [], "normal Execute capabilities remain available");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
+
+  const finalMarkdown = "All four requested CLI queries succeeded; the editor and project are ready.";
+  state = providerResult(state, { visibleText: finalMarkdown });
+  const outcome = commandOnlyOutcome(state);
+  assert.equal(outcome?.resultKind, "success");
+  assert.equal(outcome?.finalMarkdown, finalMarkdown);
+
+  let checkpoint = runtime.createRuntimeV2Checkpoint({ revision: 1, aggregate: state, updatedAt: state.updatedAt });
+  assert.deepEqual(commandOnlyOutcome(runtime.replayRuntimeV2Events(state.events)), outcome);
+  let clock = state.updatedAt;
+  let id = 0;
+  const finals = [];
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: {
+      async load() { return checkpoint; },
+      async append(input) {
+        const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+        if (result.checkpoint) checkpoint = result.checkpoint;
+        return result;
+      },
+    },
+    provider: { async request() { throw new Error("finalization must not request another response"); } },
+    tool: { async execute() { throw new Error("finalization must not execute another tool"); } },
+    scheduler: { async execute() { throw new Error("no child task is needed"); } },
+    projection: { async publish(input) { if (input.projection.audience === "final") finals.push(input.projection); } },
+    clockId: {
+      now: () => ++clock,
+      nextId: (scope) => `${scope}-${++id}`,
+      nextIdempotencyKey: ({ kind }) => `${kind}-${++id}`,
+    },
+  }, { aggregate: state, revision: checkpoint.revision });
+  await controller.driveOnce(outcome);
+  await controller.resumeTerminalProjection();
+  const completed = controller.snapshot().aggregate;
+  assert.equal(completed.events.filter((item) => item.type === "run.completed").length, 1);
+  assert.equal(completed.events.filter((item) => item.type === "turn.completed").length, 1);
+  assert.equal(new Set(finals.map((projection) => projection.id)).size, 1);
+});
+
+test("command-only Execute can continue with another tool after one successful command", () => {
+  let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+  assert.equal(runtime.decideNextCommands(state)[0].payload.mode, "execute");
+  state = providerResult(state, {
+    toolCalls: [{ id: "continue-development", name: "write_file", arguments: { path: "Assets/Game.cs", content: "class Game {}" } }],
+  });
+  assert.equal(commandOnlyOutcome(state), null);
+  assert.equal(runtime.decideNextCommands(state)[0].payload.toolName, "write_file");
+});
+
+test("source, skill, replay, or control-plane receipts cannot supply command-only completion evidence", () => {
+  for (const name of ["read_file", "get_project_skeleton", "load_skill", "web_fetch"]) {
+    let state = operationReceipt(executeAggregate("observing", [null]), name, { name });
+    state = providerResult(state, { visibleText: "Done." });
+    assert.equal(commandOnlyOutcome(state), null, name);
+  }
+  let state = executeAggregate("observing", [null]);
+  const command = commandFor(state, "execute_tool", "control-only", {
+    toolName: "run_command", toolCallId: "control-only", arguments: { command: "editor-tool status" },
+  });
+  state = schedule(state, command);
+  state = runtime.transition(state, event(state, "command.completed", { run: baseRun, idempotencyKey: command.idempotencyKey, status: "succeeded" }));
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null);
+  state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status", { receiptOrigin: "replayed" });
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "a replay is not a new executed operation");
+});
+
+test("command-only completion retains file mutation and explicit acceptance debts", () => {
+  for (const requirement of ["static", "behavioral", "interaction"]) {
+    let state = operationReceipt(executeAggregate("observing", [requirement]), "editor-tool status");
+    state = providerResult(state, { visibleText: "Done." });
+    assert.equal(commandOnlyOutcome(state), null, requirement);
+  }
+  let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+  state = operationReceipt(state, "write", {
+    name: "write_file",
+    arguments: { path: "Assets/Game.cs", content: "class Game {}" },
+    evidence: [{ id: "actual-file-mutation", kind: "mutation", target: "Assets/Game.cs", version: "v2" }],
+  });
+  state = providerResult(state, { visibleText: "Game code is done." });
+  assert.equal(commandOnlyOutcome(state), null);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
+
+  state = operationReceipt(executeAggregate("observing", [null]), "contract", {
+    name: "record_execution_contract",
+    arguments: {
+      summary: "Implement the requested game",
+      changes: [{ operation: "create", targets: ["Assets/Game.cs"], change: "Create game logic", expected_outcome: "Game is playable" }],
+      validations: [{ kind: "finite_command", command: "npm test", expected_outcome: "Tests pass" }],
+    },
+  });
+  state = operationReceipt(state, "editor-tool status");
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "an implementation contract retains artifact and validation coverage");
+});
+
+test("command-only completion accepts a real external operation without manufacturing a file mutation", () => {
+  let state = operationReceipt(executeAggregate("observing", [null]), "external-object", {
+    name: "external_create_object",
+    arguments: { object: "GameObject" },
+    evidence: [{ id: "external-effect", kind: "mutation", target: "external-object", version: "created" }],
+  });
+  assert.equal(runtime.summarizeRuntimeV2ExecuteEvidence(state, { isMutationToolName: (name) => name === "write_file" }).mutationCount, 0);
+  state = providerResult(state, { visibleText: "The external object was created." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
+});
+
+test("command-only completion rejects failed, blocked, and skipped actions until that exact action succeeds", () => {
+  for (const status of ["failed", "blocked"]) {
+    for (const failureReasonCode of [undefined, "provider_batch_predecessor_failed", "provider_batch_predecessor_unsettled"]) {
+      let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool inspect", { status, evidence: [], failureReasonCode });
+      state = operationReceipt(state, "editor-tool status");
+      state = providerResult(state, { visibleText: "Done." });
+      assert.equal(commandOnlyOutcome(state), null, `${status}:${failureReasonCode}`);
+      state = operationReceipt(state, "editor-tool inspect", { arguments: { cwd: ".", command: "editor-tool inspect" } });
+      state = providerResult(state, { visibleText: "Both commands now succeeded." });
+      assert.equal(commandOnlyOutcome(state)?.resultKind, "success", `${status}:${failureReasonCode}`);
+    }
+  }
+});
+
+test("command-only completion excludes a diagnostic or truncated natural final", () => {
+  for (const code of ["output_truncated", "protocol_invalid"]) {
+    let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+    state = providerResult(state, { visibleText: "Done.", diagnostics: [{ code, message: code, retryable: true }] });
+    assert.equal(commandOnlyOutcome(state), null, code);
+  }
+});
+
+test("command-only completion requires an executed validation even if a skipped receipt claims passed", () => {
+  let state = executeAggregate("observing", [null]);
+  state = providerResult(state, {
+    toolCalls: [{ id: "unexecuted-validation", name: "run_command", arguments: { command: "npm test", cwd: "." } }],
+  });
+  state = executePendingTool(state, {
+    type: "validation.completed",
+    passed: true,
+    failureKind: "not_executed",
+    failureReasonCode: "provider_batch_predecessor_failed",
+    evidence: [{ id: "invalid-validation-proof", kind: "validation", target: "npm test", version: "passed" }],
+  });
+  state = operationReceipt(state, "editor-tool status");
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "a skipped action cannot be resolved by an unrelated success");
+
+  state = providerResult(state, {
+    toolCalls: [{ id: "executed-validation", name: "run_command", arguments: { cwd: ".", command: "npm test" } }],
+  });
+  state = executePendingTool(state, {
+    type: "validation.completed",
+    passed: true,
+    evidence: [{ id: "executed-validation-proof", kind: "validation", target: "npm test", version: "passed" }],
+  });
+  state = providerResult(state, { visibleText: "Both actions actually succeeded." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
+});
+
 test("failed acceptance remains loop evidence and returns validation to acting", () => {
   const state = aggregateWithValidation("npm test", false);
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
