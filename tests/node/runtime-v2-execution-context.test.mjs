@@ -4723,7 +4723,7 @@ test("three uncommitted corrective mutation failures close the recovery cycle", 
   );
 });
 
-test("the first proven repeated action enters recovery mutation decoding", () => {
+test("a rejected repeated action does not create an Execute file-mutation obligation", () => {
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
       command: {
@@ -4744,11 +4744,11 @@ test("the first proven repeated action enters recovery mutation decoding", () =>
         complete: true,
       }],
     }),
-    "closed_recovery",
+    null,
   );
 });
 
-test("a repeated semantic observation enters recovery mutation decoding immediately", () => {
+test("equivalent observations leave Execute inspection and command capabilities open", () => {
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
       command: {
@@ -4768,7 +4768,7 @@ test("a repeated semantic observation enters recovery mutation decoding immediat
         complete: true,
       }],
     }),
-    "closed_recovery",
+    null,
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -4788,7 +4788,7 @@ test("a repeated semantic observation enters recovery mutation decoding immediat
   );
 });
 
-test("the first cache re-materialization restores source then closes inspection", () => {
+test("cache re-materialization restores source without creating an Execute mutation obligation", () => {
   const input = {
     command: {
       payload: {
@@ -4810,8 +4810,8 @@ test("the first cache re-materialization restores source then closes inspection"
   };
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor(input),
-    "closed_recovery",
-    "the replay has already restored exact source, so the next decision must act instead of reading again",
+    null,
+    "restored source supports the next action but does not require a file edit",
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -10558,6 +10558,63 @@ test("Execute pressure removes raw source authority with its whole receipt while
     const invalidated = await invoke(98_304);
     assert.ok(invalidated.messages.some((message) => message.tool_call_id === "source"), "fits preserves historical source text");
     assert.equal(invalidated.coverage.length, 0, "historical text cannot revive a ledger-invalidated write lease");
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
+test("successful command receipts with equal output cannot turn prior source reads into a forced file edit", async () => {
+  const source = '{"service":"ready"}\n';
+  const outputs = ['exitCode: 0\n{"currentVersion":"1.0-beta.1","latestVersion":"1.0-beta.2"}', 'exitCode: 0\n{"currentVersion":"1.0-beta.1","latestVersion":"1.0-beta.2"}'];
+  const calls = [
+    { id: "config", name: "read_file", arguments: { path: "config.json" }, content: source, evidence: { id: "source", kind: "source", target: "config.json", version: "config-v1" } },
+    ...["service-cli update --check", "service-cli update"].map((command, index) => ({ id: `command-${index}`, name: "run_command", arguments: { command }, content: outputs[index], evidence: { id: `command-evidence-${index}`, kind: "tool", target: command, version: "identical-result-version" } })),
+  ];
+  const events = calls.flatMap((call, index) => [{
+    type: "command.scheduled", sequence: index * 2, command: { idempotencyKey: call.id, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } },
+  }, {
+    type: "tool.completed", sequence: index * 2 + 1, idempotencyKey: call.id, status: "succeeded", evidence: [call.evidence], presentation: { observationSummary: call.content },
+  }]);
+  const effects = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({ events });
+  assert.deepEqual([...effects.repeatedObservationToolNames], ["run_command"], "equivalent receipt detection remains truthful without controlling task obligations");
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages = [{ role: "system", content: "[MAIN RUNTIME V2] workspace authority" }, { role: "user", runtimeTurnId: "t1", content: "Inspect the CLI environment; install only missing dependencies and report the connection state." }, ...calls.flatMap((call) => [
+    { role: "assistant", content: "", tool_calls: [{ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] },
+    { role: "tool", tool_call_id: call.id, content: call.content },
+  ])];
+  const canonical = structuredClone(live.messages);
+  const requestCommand = { kind: "request_model", phase: "observing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute", effectPressure: { reason: "source_only_frontier" } } };
+  const coverage = executionContext.materializedRuntimeV2SourceCoverage(live.messages, "/fixture", effects);
+  assert.equal(coverage.length, 1);
+  const actionWindow = providerActionWindow.runtimeV2ProviderActionWindowFor({ command: requestCommand, effects, sourceCoverage: coverage });
+  assert.equal(actionWindow, null, "reading config plus equal successful command results cannot require replace/apply/delete");
+  live.latestProviderActionWindow = actionWindow;
+  const ports = {
+    get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", apiKey: "", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+    context: { turnId: "t1", runtimeRunIntent: "execute", runtimeContextBudget: { contextLimit: 122_880, inputBudget: 98_304, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live, logStoreEvent() {},
+  };
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({ ports, command: requestCommand, actionWindow,
+    available: ["read_file", "run_command", "replace_in_file", "apply_patch", "delete_workspace_path"].map(definition) });
+  assert.ok(selected.some((tool) => tool.function.name === "read_file"));
+  assert.ok(selected.some((tool) => tool.function.name === "run_command"));
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => effects;
+  let wire;
+  streaming.streamChatCompletion = async (messages, _settings, _callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, tools, options };
+    return { content: "The existing installation is connected; no project file changes were needed.", semanticContent: "The existing installation is connected; no project file changes were needed.", finishReason: "stop", toolCalls: [], usage: null };
+  };
+  try {
+    const result = await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: requestCommand, tools: selected, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+    assert.deepEqual(wire.messages.slice(0, canonical.length), canonical, "fits keeps the original source and successful command pairs");
+    assert.notEqual(wire.options.toolChoice, "required", "a complete evidence report remains a permitted response");
+    assert.equal(result.diagnostics.length, 0);
+    assert.equal(result.toolCalls.length, 0);
+    assert.match(result.visibleText, /connected/);
+    assert.deepEqual(live.messages, canonical);
   } finally {
     streaming.streamChatCompletion = originalStream;
     providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
