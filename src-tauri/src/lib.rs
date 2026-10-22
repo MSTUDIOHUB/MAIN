@@ -3689,14 +3689,82 @@ fn canonicalize_workspace_path(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn read_file(
-    state: State<WorkspaceState>,
+async fn read_file(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     path: String,
     workspace: Option<String>,
 ) -> Result<String, String> {
-    let workspace = resolve_workspace_root(&state, workspace)?;
-    let real_path = resolve_existing_path(&path, &workspace)?;
-    fs::read_to_string(real_path).map_err(|e| e.to_string())
+    let default_root = if workspace
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        PathBuf::new()
+    } else {
+        state.get_root()?
+    };
+    run_file_read_io(move || {
+        let started = Instant::now();
+        let logged_workspace = workspace
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_root.display().to_string());
+        record_debug_log(
+            &app,
+            "info",
+            "read_file.start",
+            json!({
+                "workspace": logged_workspace, "path": path, "elapsedMs": 0, "result": "pending"
+            })
+            .to_string(),
+        );
+        let result = resolve_workspace_root(&WorkspaceState::new(default_root), workspace)
+            .and_then(|workspace| read_file_in_workspace(&path, &workspace));
+        record_debug_log(&app, "info", "read_file.finish", json!({
+            "workspace": logged_workspace, "path": path, "elapsedMs": started.elapsed().as_millis(),
+            "result": if result.is_ok() { "ok" } else { "error" }
+        }).to_string());
+        result
+    })
+    .await
+}
+
+fn read_file_in_workspace(path: &str, workspace: &Path) -> Result<String, String> {
+    let mut file = open_regular_workspace_file(path, workspace)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| error.to_string())?;
+    Ok(content)
+}
+
+fn open_regular_workspace_file(path: &str, workspace: &Path) -> Result<File, String> {
+    let real_path = resolve_existing_path(path, workspace)?;
+    if !fs::metadata(&real_path)
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("FILE_READ_NOT_REGULAR: 目标不是普通文件".to_string());
+    }
+    let file = File::open(&real_path).map_err(|error| error.to_string())?;
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("FILE_READ_NOT_REGULAR: 目标不是普通文件".to_string());
+    }
+    Ok(file)
+}
+
+async fn run_file_read_io<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("FILE_READ_WORKER_FAILED: {error}"))?
 }
 
 #[derive(serde::Serialize)]
@@ -4072,8 +4140,8 @@ fn open_file_external(
 }
 
 #[tauri::command]
-fn read_file_window(
-    state: State<WorkspaceState>,
+async fn read_file_window(
+    state: State<'_, WorkspaceState>,
     path: String,
     workspace: Option<String>,
     start_line: Option<usize>,
@@ -4082,13 +4150,33 @@ fn read_file_window(
     max_chars: Option<usize>,
     start_char: Option<usize>,
 ) -> Result<ReadFileWindowResult, String> {
-    let workspace = resolve_workspace_root(&state, workspace)?;
-    let real_path = resolve_existing_path(&path, &workspace)?;
-    if !real_path.is_file() {
-        return Err("read_file_window 目标不是文件".to_string());
-    }
+    let default_root = if workspace
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        PathBuf::new()
+    } else {
+        state.get_root()?
+    };
+    run_file_read_io(move || {
+        let workspace = resolve_workspace_root(&WorkspaceState::new(default_root), workspace)?;
+        read_file_window_in_workspace(
+            path, &workspace, start_line, end_line, max_lines, max_chars, start_char,
+        )
+    })
+    .await
+}
 
-    let file = File::open(&real_path).map_err(|error| error.to_string())?;
+fn read_file_window_in_workspace(
+    path: String,
+    workspace: &Path,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+    start_char: Option<usize>,
+) -> Result<ReadFileWindowResult, String> {
+    let file = open_regular_workspace_file(&path, workspace)?;
     let mut reader = BufReader::new(file);
     read_file_window_from_reader(
         path,
@@ -13454,19 +13542,19 @@ mod tests {
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
         commit_project_init_in_workspace, compare_file_nodes, delete_path_within_workspace,
         delete_plan_files_in_dir, delete_protocol_package_at, discover_agent_skills_in_root,
-        dispatch_chat_stream_worker,
-        extract_gemini_extension_in_workspace, extract_protocol_package_in_workspace,
-        find_entry_points, get_proxy_request_registry,
-        get_stream_registry, glob_search_in_workspace,
-        inspect_project_init_target_in_workspace, is_safe_cross_origin_proxy_header,
-        is_sensitive_cross_origin_header, is_supported_attachment_path, is_valid_git_branch_name,
-        looks_long_running_shell_command, parse_curl_status_output, parse_git_branch_line,
-        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
-        prepare_pty_agent_input, proxy_network_grant, pty_foreground_state, pty_shell_available,
-        read_file_window_from_reader, read_pty_current_generation_view, read_pty_generation_since,
-        read_pty_generation_tail, read_session_transcript_with_fallback,
-        resolve_command_working_directory, resolve_existing_path, resolve_open_file_external_path,
-        resolve_write_path, revalidate_write_path, run_cancellable_bounded_process,
+        dispatch_chat_stream_worker, extract_gemini_extension_in_workspace,
+        extract_protocol_package_in_workspace, find_entry_points, get_proxy_request_registry,
+        get_stream_registry, glob_search_in_workspace, inspect_project_init_target_in_workspace,
+        is_safe_cross_origin_proxy_header, is_sensitive_cross_origin_header,
+        is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
+        parse_curl_status_output, parse_git_branch_line, parse_git_numstat,
+        parse_git_porcelain_entries, parse_git_porcelain_status, prepare_pty_agent_input,
+        proxy_network_grant, pty_foreground_state, pty_shell_available, read_file_in_workspace,
+        read_file_window_from_reader, read_file_window_in_workspace,
+        read_pty_current_generation_view, read_pty_generation_since, read_pty_generation_tail,
+        read_session_transcript_with_fallback, resolve_command_working_directory,
+        resolve_existing_path, resolve_open_file_external_path, resolve_write_path,
+        revalidate_write_path, run_cancellable_bounded_process, run_file_read_io,
         run_workspace_shell_command, should_emit_chat_stream_done,
         should_hide_list_directory_entry, should_skip_recursive_search_dir,
         validate_image_studio_endpoint_for_engine, validate_image_studio_remote_image_url,
@@ -13512,6 +13600,137 @@ mod tests {
         assert!(!result.truncated);
         assert!(result.next_start_line.is_none());
         assert!(result.next_start_char.is_none());
+    }
+
+    #[test]
+    fn file_read_io_does_not_run_on_the_calling_executor_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let caller = std::thread::current().id();
+        let worker = runtime
+            .block_on(run_file_read_io(|| Ok(std::thread::current().id())))
+            .unwrap();
+        assert_ne!(
+            worker, caller,
+            "filesystem waits cannot own the calling UI/executor thread"
+        );
+    }
+
+    #[test]
+    fn file_read_preserves_utf8_bytes_and_canonical_workspace_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = "\u{feff} \t汉🙂\r\nlast line  \n";
+        fs::write(root.path().join("source.txt"), source).unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        assert_eq!(
+            read_file_in_workspace("source.txt", root.path()).unwrap(),
+            source
+        );
+        assert_eq!(
+            read_file_window_in_workspace(
+                "source.txt".to_string(),
+                root.path(),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .content,
+            source
+        );
+        for path in [
+            "../secret.txt".to_string(),
+            outside.path().join("secret.txt").display().to_string(),
+        ] {
+            assert!(
+                read_file_in_workspace(&path, root.path()).is_err(),
+                "{path}"
+            );
+            assert!(
+                read_file_window_in_workspace(
+                    path.clone(),
+                    root.path(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .is_err(),
+                "{path}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                root.path().join("escape.txt"),
+            )
+            .unwrap();
+            assert!(read_file_in_workspace("escape.txt", root.path()).is_err());
+            assert!(read_file_window_in_workspace(
+                "escape.txt".to_string(),
+                root.path(),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_rejects_fifo_before_open_instead_of_waiting_for_a_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("input.pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let workspace = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(read_file_in_workspace("input.pipe", &workspace))
+                .unwrap();
+        });
+        let timely = receiver.recv_timeout(std::time::Duration::from_millis(250));
+        if timely.is_err() {
+            // Release the old blocking implementation before failing, so the
+            // regression test never leaves a stuck thread or process behind.
+            drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+            let _ = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        }
+        worker.join().unwrap();
+        assert!(
+            timely.is_ok(),
+            "a FIFO must be rejected before its blocking open"
+        );
+        assert!(
+            timely.unwrap().is_err(),
+            "only regular text files are readable"
+        );
+        assert!(read_file_window_in_workspace(
+            "input.pipe".to_string(),
+            root.path(),
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
