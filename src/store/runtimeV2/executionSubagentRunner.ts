@@ -502,6 +502,7 @@ async function runRuntimeV2Child(input: {
             call.name,
             rawOutput,
             input.ports.context.runtimeContextBudget,
+            { parallelReadCount },
           );
           const isValidation = VALIDATION_CHILD_TOOL_NAMES.has(
             call.name,

@@ -4,14 +4,14 @@ import { isChatContext, isReadOnlyContext } from "./readOnlyPolicy";
 import { boundedRuntimeV2ToolContent, runtimeV2SourceToolContent } from "./executionText";
 import { toolResultContentForModel } from "./executionEvidence";
 
-export function runtimeV2ToolModelContent(input: RuntimeV2ExecutionPortsInput, toolName: string, output: unknown): string {
+export function runtimeV2ToolModelContent(input: RuntimeV2ExecutionPortsInput, toolName: string, output: unknown, options: { readonly parallelReadCount?: number } = {}): string {
   // Rust already bounds these structured receipts. Cutting the JSON string a
   // second time loses finalUrl/truncated metadata and breaks novelty on replay.
   if (isReadOnlyContext(input) && ["web_search", "web_fetch"].includes(toolName)) {
     return runtimeV2SourceToolContent(output);
   }
   return boundedRuntimeV2ToolContent(toolName, toolName === "read_file"
-    ? runtimeV2SourceToolContent(output) : toolResultContentForModel(output), input.context.runtimeContextBudget);
+    ? runtimeV2SourceToolContent(output) : toolResultContentForModel(output), input.context.runtimeContextBudget, options);
 }
 
 /** Persist the exact bounded receipt seen by the model, including failures. */

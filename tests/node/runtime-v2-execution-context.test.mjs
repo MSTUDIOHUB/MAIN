@@ -130,6 +130,10 @@ const executionText = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionText.ts",
 ));
+const modelToolReceipt = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/readOnlyToolReceipt.ts",
+));
 const executionToolDefinitions = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolDefinitions.ts",
@@ -427,6 +431,58 @@ test("successful empty tool output is explicit model evidence", () => {
     evidence.toolResultContentForModel(null),
     "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.",
   );
+});
+
+test("production command receipt preserves a complete structured result that fits the Run window", () => {
+  const stdout = JSON.stringify({ success: true, data: { entries: [
+    { name: "related catalog entry", description: "x".repeat(18_000) },
+    { name: "requested target", schema: { required: ["TARGET_SCHEMA_EVIDENCE"] } },
+  ] } });
+  const nativeResult = { exitCode: 0, success: true, stdout, stderr: "", stdoutTruncated: false, stderrTruncated: false };
+  const content = modelToolReceipt.runtimeV2ToolModelContent({ context: {
+    runtimeRunIntent: "execute", runtimeContextBudget: { readWindowChars: 64_000, inputBudget: 101_581, outputBudget: 4096 },
+  } }, "run_command", nativeResult);
+  assert.ok(content.includes("TARGET_SCHEMA_EVIDENCE"), "the result fits the Run window but its tail schema was discarded");
+  assert.equal(content, evidence.toolResultContentForModel(nativeResult));
+  assert.equal(JSON.parse(content.slice("exitCode: 0\n".length)).data.entries[1].schema.required[0], "TARGET_SCHEMA_EVIDENCE");
+});
+
+test("command result windows charge escaped metadata and report the exact original UTF16 prefix", () => {
+  const stdout = JSON.stringify({ data: "quotes\" and slashes\\ and emoji😀\n".repeat(3_000), tail: "OUTSIDE_WINDOW" });
+  const nativeResult = { exitCode: 0, success: true, stdout, stderr: "", stdoutTruncated: false, stderrTruncated: false };
+  const original = evidence.toolResultContentForModel(nativeResult);
+  const content = modelToolReceipt.runtimeV2ToolModelContent({ context: {
+    runtimeRunIntent: "execute", runtimeContextBudget: { readWindowChars: 16_000 },
+  } }, "run_command", nativeResult, { parallelReadCount: 2 });
+  assert.ok(content.length <= 8_000, "serialized partial envelope must fit its shared allocation");
+  const window = JSON.parse(content);
+  assert.equal(window.type, "tool.result_window");
+  assert.equal(window.truncated, true);
+  assert.equal(window.contentFormat, "partial_text", "the prefix is not advertised as a complete JSON document");
+  assert.equal(window.totalChars, original.length);
+  assert.deepEqual(window.returnedRange, { startChar: 0, endChar: window.returnedChars });
+  assert.equal(window.content, original.slice(0, window.returnedChars));
+  assert.equal(window.content.length, window.returnedChars);
+  assert.equal(window.continuationAvailable, false, "no cursor or retained output is promised");
+  assert.equal(/[\uD800-\uDBFF]$/.test(window.content), false, "the result never splits a surrogate pair");
+  assert.doesNotMatch(window.content, /OUTSIDE_WINDOW/);
+  assert.ok(content.length > window.content.length, "escaping and metadata consume the same allocation");
+});
+
+test("command output has a bounded null-budget fallback and preserves empty and lossless source contracts", () => {
+  const text = "x".repeat(20_000);
+  const fallback = executionText.boundedRuntimeV2ToolContent("run_command", text, null);
+  assert.ok(fallback.length <= 12_000);
+  const partial = JSON.parse(fallback);
+  assert.equal(partial.totalChars, text.length);
+  assert.equal(partial.content, text.slice(0, partial.returnedRange.endChar));
+  for (const value of [null, undefined]) {
+    assert.equal(executionText.boundedRuntimeV2ToolContent("run_command", value, { readWindowChars: 64_000 }), "");
+  }
+  for (const name of ["read_file", "load_skill"]) {
+    const lossless = `  ${text}\n`;
+    assert.equal(executionText.boundedRuntimeV2ToolContent(name, lossless, { readWindowChars: 1_000 }, { parallelReadCount: 3 }), lossless);
+  }
 });
 
 test("read_file model context preserves source text without command-result decoding or trimming", () => {
@@ -7272,6 +7328,24 @@ test("child retains the complete admitted read window", () => {
   );
 });
 
+test("child command receipts share the parent Run window without cropping Skill or source envelopes", () => {
+  const budget = { readWindowChars: 18_000 };
+  const calls = ["read_file", "load_skill", "run_command", "run_command"].map((name) => ({ name }));
+  const count = executionText.runtimeV2ParallelReadCount(calls);
+  assert.equal(count, 4);
+  const options = { parallelReadCount: count };
+  for (const name of ["read_file", "load_skill"]) {
+    const source = `  ${"s".repeat(4_000)}\n`;
+    assert.equal(subagentRunner.runtimeV2ChildToolOutputContent(name, source, budget, options), source);
+  }
+  const content = subagentRunner.runtimeV2ChildToolOutputContent("run_command", "x".repeat(9_000), budget, options);
+  assert.ok(content.length <= 4_500);
+  const partial = JSON.parse(content);
+  assert.equal(partial.totalChars, 9_000);
+  assert.equal(partial.returnedRange.endChar, partial.content.length);
+  assert.equal(subagentRunner.runtimeV2ChildToolOutputContent("run_command", "complete", budget, options), "complete");
+});
+
 test("rejected collaboration calls close their standard tool transcript", async () => {
   const turn = {
     workspaceKey: "/fixture",
@@ -10903,5 +10977,80 @@ test("mixed observation shell provider admission replays only the pre-command re
     Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
     toolExecutor.executeTool = originalExecute;
     authorization.authorizeToolForCurrentTurn = originalAuthorize;
+  }
+});
+
+test("real ProviderPort and ToolPort share one Run window across CLI and mixed observation batches", async (t) => {
+  for (const names of [["run_command", "run_command", "run_command"], ["read_file", "load_skill", "run_command"]]) {
+    await t.test(names.join(" + "), async () => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.providerLaneProfile = { schemaVersion: "provider-lane.v1", nativeTools: true, requiredToolChoice: false, streaming: true, textToolEnvelope: true, reasoning: false, imageInput: false, toolResultRole: "tool" };
+      live.messages = [{ role: "system", content: "[MAIN RUNTIME V2] budget fixture" }, { role: "user", content: "Inspect the requested data." }];
+      const calls = names.map((name, index) => ({ id: `wire-${index}`, name, arguments: name === "run_command"
+        ? { command: `example inspect-${index}` }
+        : name === "load_skill" ? { skill_id: "s:fixture" } : { path: "state.json" } }));
+      const definitions = [...new Set(names)].map((name) => ({ ...definition(name), function: { ...definition(name).function,
+        parameters: { type: "object", properties: { command: { type: "string" }, path: { type: "string" }, skill_id: { type: "string" } }, required: [name === "run_command" ? "command" : name === "load_skill" ? "skill_id" : "path"] },
+      } }));
+      const originalSurface = Object.getOwnPropertyDescriptor(executionContext, "providerToolDefinitionsForCommand");
+      const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+      const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+      const originalExecute = toolExecutor.executeTool;
+      const originalAuthorize = authorization.authorizeToolForCurrentTurn;
+      const actualExecutions = [];
+      const source = "s".repeat(500);
+      const skill = "SKILL_GUIDANCE_ONLY\n" + "g".repeat(500);
+      let counter = 0;
+      Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", { configurable: true, enumerable: true, value: () => definitions });
+      providerRequest.requestRuntimeV2ProviderOnce = async () => runtime.normalizeProviderResponseV1({ tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+      authorization.authorizeToolForCurrentTurn = async () => ({ allowed: true, reason: null });
+      toolExecutor.executeTool = async (name, args) => {
+        actualExecutions.push({ name, args });
+        if (name === "read_file") return source;
+        if (name === "load_skill") return skill;
+        return { exitCode: 0, success: true, stdout: JSON.stringify({ data: "q\"\\😀".repeat(8_000) }), stderr: "", stdoutTruncated: false, stderrTruncated: false };
+      };
+      const budget = { readWindowChars: 64_000, contextLimit: 122_880, inputBudget: 101_581, outputBudget: 4_096 };
+      const skillCatalog = { entries: [{ id: "fixture", name: "Fixture", description: "Read guidance", source: "panel", content: skill, entryPath: null, basePath: null, version: "fixture-v1", allowImplicitInvocation: true, supportingFiles: [] }], explicitSkillIds: [], warnings: [], loadedAt: 1 };
+      const ports = { get: () => ({}), context: { turnId: "turn", runtimeRunIntent: "execute", runtimeContextBudget: budget, skillCatalog, runWorkspace: "/tmp/command-budget-fixture", runSessionKey: "session", phaseLanguage: "en" }, live, nextId: (scope) => `${scope}-${++counter}`, now: () => 100, logStoreEvent() {} };
+      try {
+        const selected = await providerPort.createRuntimeV2ProviderPort(ports).request({ command: command("acting"), signal: new AbortController().signal });
+        assert.deepEqual(selected.toolCalls.map((call) => call.name), names);
+        const shared = Math.floor(budget.readWindowChars / names.length);
+        assert.deepEqual([...live.parallelReadCountByToolCallId.values()], names.map(() => names.length));
+        const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+        const receipts = [];
+        for (const [index, call] of selected.toolCalls.entries()) {
+          receipts.push(await toolPort.execute({ command: { ...command("acting"), idempotencyKey: `budget-${index}`, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } }, signal: new AbortController().signal }));
+        }
+        assert.ok(receipts.every((receipt) => receipt.type === "tool.completed" && receipt.status === "succeeded"), JSON.stringify(receipts.map((receipt) => ({ type: receipt.type, status: receipt.status, failureKind: receipt.failureKind, message: receipt.presentation?.message.slice(0, 200) }))));
+        const results = live.messages.filter((message) => message.role === "tool");
+        assert.equal(results.length, names.length);
+        assert.ok(results.reduce((total, message) => total + message.content.length, 0) <= budget.readWindowChars);
+        for (const [index, name] of names.entries()) {
+          if (name === "run_command") {
+            assert.ok(results[index].content.length <= shared);
+            const partial = JSON.parse(results[index].content);
+            assert.equal(partial.truncated, true);
+            assert.equal(partial.content.length, partial.returnedRange.endChar);
+          } else {
+            const execution = actualExecutions.find((entry) => entry.name === name && entry.args.__raw !== true);
+            assert.ok(execution.args.max_chars > 0 && execution.args.max_chars <= shared, "each source contract receives the same allocation once");
+            if (name === "load_skill") {
+              assert.equal(results[index].content, skill);
+              assert.ok(receipts[index].evidence.every((item) => item.kind === "tool"), "Skill guidance grants no source lease or mutation evidence");
+            } else assert.ok(results[index].content.includes(source), "the versioned source envelope is not cropped again");
+          }
+        }
+        assert.equal(live.hasExecutedMutationEffect, false);
+        assert.equal(live.parallelReadCountByToolCallId.size, 0);
+        assert.equal(actualExecutions.filter((entry) => entry.name === "run_command").length, names.filter((name) => name === "run_command").length);
+      } finally {
+        providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+        Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
+        toolExecutor.executeTool = originalExecute;
+        authorization.authorizeToolForCurrentTurn = originalAuthorize;
+      }
+    });
   }
 });

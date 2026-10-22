@@ -422,12 +422,10 @@ export function createRuntimeV2ProviderPort(
           const parallelReadCount =
             runtimeV2ParallelReadCount(scopedCalls);
           scopedCalls.forEach((call) => {
-            if (call.name === "read_file") {
-              input.live.parallelReadCountByToolCallId.set(
-                call.id,
-                parallelReadCount,
-              );
-            }
+            input.live.parallelReadCountByToolCallId.set(
+              call.id,
+              parallelReadCount,
+            );
           });
           result = {
             ...result,

@@ -442,7 +442,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               sourceVersion || "",
             )
           : rawOutput;
-        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput);
+        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput, { parallelReadCount });
         const completion = toolCompletionFor(
           input,
           command,
