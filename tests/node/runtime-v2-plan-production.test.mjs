@@ -61,6 +61,7 @@ function loadTsWithMocks(sourcePath, mocks, scopedCache = new Map()) {
   return module.exports;
 }
 
+const { isStreamOutputLimited } = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
 const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
 const adapter = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/workPlanAdapter.ts"));
 const approval = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planApproval.ts"));
@@ -834,7 +835,7 @@ async function runProductionPlanScenario(
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || args.query || ""),
     }],
-    ["../../lib/streaming", { streamChatCompletion: (...args) => {
+    ["../../lib/streaming", { isStreamOutputLimited, streamChatCompletion: (...args) => {
       if (++mockProviderCalls > 50) { abortCtrl.abort("test mock did not converge"); throw new Error("test mock did not converge"); }
       return streamCompletion(...args);
     } }],
@@ -6281,4 +6282,55 @@ test("Plan cold history never attaches a future receipt to an interrupted reused
   assert.equal(tools.length, 2);
   assert.equal(JSON.parse(tools[0].content).historicalContentUnavailable, true);
   assert.equal(tools[1].content, "The resumed file's actual source.");
+});
+
+
+test("Plan distinguishes client output guards from real provider length without accepting an incomplete response", async () => {
+  for (const cause of ["reasoning_char_limit", "action_char_limit", "provider_length", "stop"]) {
+    const logs = [];
+    const settlements = [];
+    const readTool = {
+      type: "function",
+      function: { name: "read_file", description: "Read source", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    };
+    const isClientStop = cause.endsWith("char_limit");
+    const port = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planProviderPort.ts"), new Map([
+      ["../../lib/streaming", {
+        isStreamOutputLimited,
+        streamChatCompletion: async () => ({
+          content: "An unfinished planning draft.", semanticContent: "An unfinished planning draft.",
+          toolCalls: [], usage: {}, protocolViolation: null,
+          finishReason: isClientStop ? null : cause === "provider_length" ? "length" : "stop",
+          ...(isClientStop ? { clientStopReason: cause } : {}),
+        }),
+      }],
+      ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, reportFailure() {}, release() {}, setPressureHandler() {} }) }],
+      ["../../lib/providerLaneSettings", {
+        deriveBudgetedStreamSettings: () => ({}),
+        deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+      }],
+      ["./planModelProtocol", { ...planProtocol, planModelTools: () => [readTool], selectPlanModelTools: () => [readTool] }],
+    ]));
+    const result = await port.requestPlanModel({
+      get: () => ({ config: {} }),
+      context: { abortCtrl: new AbortController(), phaseLanguage: "en", runWorkspace: "/fixture" },
+      ledger: {
+        snapshot: () => ({ objective: { text: "Inspect before planning" }, evidence: [] }),
+        schedule: async () => ({ idempotencyKey: "plan-limited" }),
+        settleCommand: async (event) => { settlements.push(event); },
+      },
+      run, messages: [{ role: "user", content: "Inspect source before planning." }],
+      deadlineAt: Date.now() + 30_000, stage: "discovery", evidence: [], evidenceContents: new Map(), collaboration: {}, submissionRepairPending: false,
+      logStoreEvent: (eventName, data) => logs.push({ eventName, data }),
+    });
+    const diagnostic = result.diagnostics.find((item) => item.code === "output_truncated");
+    assert.equal(!!diagnostic, cause !== "stop", cause);
+    assert.deepEqual(result.toolCalls, []);
+    assert.deepEqual(settlements.at(-1).result.diagnostics, result.diagnostics);
+    const shape = logs.find((entry) => entry.eventName === "runtime_v2_plan_provider_response_shape").data;
+    assert.equal(shape.finishReason, isClientStop ? null : cause === "provider_length" ? "length" : "stop");
+    assert.equal(shape.clientStopReason, isClientStop ? cause : null);
+    assert.equal(shape.stopSource, isClientStop ? "client_guard" : cause === "provider_length" ? "provider" : null);
+    if (isClientStop) assert.match(diagnostic.message, new RegExp(cause));
+  }
 });

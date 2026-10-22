@@ -84,10 +84,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
   );
   input.live.latestProviderAssistantReasoning = null;
   const requestMode = String(input.command.payload.mode || "").trim();
-  const reasoningOnlyCharLimit =
-    requestMode === "execute" || requestMode === "validate"
-      ? RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT
-      : undefined;
   let streamedText = "";
   recordApprovedPlanContext(input.ports);
   const aggregate = aggregateForCurrentTurn(input.ports);
@@ -160,6 +156,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
       recoveryPressure as RuntimeV2ProviderRecoveryPressure | null,
     ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const reasoningOnlyCharLimit = structuredActionRequired
+    ? RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT
+    : null;
   const forceStructuredAction = structuredActionRequired;
   const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
     requested: input.toolChoice,
@@ -447,6 +446,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     if (
       shouldRetryRuntimeV2WithoutReasoning({
         finishReason: result.finishReason,
+        clientStopReason: result.clientStopReason,
         reasoningChars: result.reasoningContent?.length || 0,
         actionChars:
           result.actionableContent?.length ||
@@ -469,6 +469,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
           phase: input.command.phase,
           mode: String(input.command.payload.mode || ""),
           finishReason: result.finishReason,
+          stopSource: result.clientStopReason ? "client_guard" : "provider",
+          clientStopReason: result.clientStopReason || null,
           reasoningChars: result.reasoningContent?.length || 0,
             actionChars:
               result.actionableContent?.length ||
@@ -492,11 +494,15 @@ export async function requestRuntimeV2ProviderOnce(input: {
         code: "output_truncated",
         feedback: recoveryRequiresAction
           ? [
-              "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
+              result.clientStopReason
+                ? `CLIENT_OUTPUT_GUARD_REACHED: the client's ${result.clientStopReason} guard ended the previous decision before a tool call.`
+                : "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
               "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
             ].join(" ")
           : [
-              "ANSWER_OUTPUT_BUDGET_EXHAUSTED: the previous attempt reached the output limit without a complete answer. Its draft is incomplete and is not an accepted conclusion.",
+              result.clientStopReason
+                ? `CLIENT_OUTPUT_GUARD_REACHED: the client's ${result.clientStopReason} guard ended the previous incomplete answer.`
+                : "ANSWER_OUTPUT_BUDGET_EXHAUSTED: the previous attempt reached the output limit without a complete answer. Its draft is incomplete and is not an accepted conclusion.",
               "Do not repeat the analysis or continue the unfinished draft. Return one complete concise answer from the available evidence, stating any uncertainty.",
               toolsClosed
                 ? "No tools are available in this decision."
@@ -575,6 +581,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     mode: String(input.command.payload.mode || ""),
     textEnvelope: input.textEnvelope,
     finishReason: result.finishReason || null,
+    clientStopReason: result.clientStopReason || null,
     rawContentChars: result.content.length,
     actionableContentChars: result.actionableContent?.length || 0,
     semanticContentChars: result.semanticContent?.length || 0,
@@ -603,6 +610,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   }
   const outputTruncated = runtimeV2ProviderOutputWasTruncated({
     finishReason: result.finishReason,
+    clientStopReason: result.clientStopReason,
     toolCallCount: result.toolCalls.length,
     availableToolCount: providerTools.length,
   });
@@ -623,7 +631,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
         ? [{
           code: "output_truncated",
           message:
-            "Provider output reached its token limit before a structured action or complete conclusion.",
+            result.clientStopReason
+              ? `Client ${result.clientStopReason} guard ended output before a structured action or complete conclusion.`
+              : "Provider output reached its token limit before a structured action or complete conclusion.",
           retryable: true,
         }]
         : []),

@@ -10590,6 +10590,7 @@ test("ordinary reference requests retain reasoning across source windows and inp
           assert.equal(result.event.structuredActionRequired, false);
           assert.equal(result.event.effectPressureActionDecoding, false);
           assert.equal(result.options.toolChoice, undefined);
+          assert.equal(result.options.reasoningOnlyCharLimit, null, "ordinary progress uses the provider token budget without an implicit client character guard");
           assert.equal(result.coverage.length > 0, windowKind !== "none");
         }
         assert.equal(roomy.event.decisionViewApplied, false);
@@ -10601,6 +10602,7 @@ test("ordinary reference requests retain reasoning across source windows and inp
     assert.equal(recovery.settings.reasoningRequest, "off");
     assert.equal(recovery.event.structuredActionRequired, true);
     assert.equal(recovery.options.toolChoice, "required");
+    assert.equal(recovery.options.reasoningOnlyCharLimit, 4_000, "real required-action recovery retains its explicit client guard");
   } finally {
     streaming.streamChatCompletion = originalStream;
     laneSettings.deriveBudgetedStreamSettings = originalSettings;

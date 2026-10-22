@@ -1,5 +1,5 @@
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
-import type { OpenAiToolChoice, StreamSettings } from "../../lib/streaming";
+import { isStreamOutputLimited, type OpenAiToolChoice, type StreamResult, type StreamSettings } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   RuntimeV2ProviderProtocolError,
@@ -71,6 +71,7 @@ export function runtimeV2RecoveryRequiresStructuredAction(
 
 export function shouldRetryRuntimeV2WithoutReasoning(input: {
   readonly finishReason: string | null | undefined;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
   readonly reasoningChars: number;
   readonly actionChars?: number;
   readonly toolCallCount: number;
@@ -84,7 +85,7 @@ export function shouldRetryRuntimeV2WithoutReasoning(input: {
   const boundedVisibleDraft =
     input.structuredActionRequired === true &&
     Number(input.actionChars) > 0;
-  return input.finishReason === "length" &&
+  return isStreamOutputLimited(input) &&
     input.toolCallCount === 0 &&
     (boundedReasoningDraft ||
       (input.availableToolCount > 0 && boundedVisibleDraft));
@@ -92,10 +93,11 @@ export function shouldRetryRuntimeV2WithoutReasoning(input: {
 
 export function runtimeV2ProviderOutputWasTruncated(input: {
   readonly finishReason: string | null | undefined;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
   readonly toolCallCount: number;
   readonly availableToolCount: number;
 }): boolean {
-  return input.finishReason === "length" &&
+  return isStreamOutputLimited(input) &&
     input.toolCallCount === 0;
 }
 

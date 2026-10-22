@@ -46,6 +46,10 @@ function loadTsWithMocks(sourcePath, mocks, cache = new Map()) {
   return module.exports;
 }
 
+const { isStreamOutputLimited } = loadTsWithMocks(
+  path.join(workspaceRoot, "src/lib/streaming.ts"), new Map(),
+);
+
 function fixtureChildReportTool(evidenceIds) {
   return {
     type: "function",
@@ -190,7 +194,7 @@ async function runChildFixture({ finalKind = "cited", readSource = true, sourceT
     ["../../lib/sanitize", {
       sanitizeAssistantDisplayContent: (value) => String(value || ""),
     }],
-    ["../../lib/streaming", { streamChatCompletion }],
+    ["../../lib/streaming", { streamChatCompletion, isStreamOutputLimited }],
     ["../../lib/toolSchemas", {
       TOOL_DEFINITIONS: [{
         type: "function",
@@ -462,6 +466,7 @@ test("a legacy report request uses the admitted child budget and preserves lengt
   let wireOptions = null;
   let wireMaxOutputTokens = null;
   let outputWasTruncated = false;
+  let clientStopReason;
   let providerRequests = 0;
   const logs = [];
   const provenStructuredToolTransports = new Set();
@@ -489,6 +494,7 @@ test("a legacy report request uses the admitted child budget and preserves lengt
         sanitizeAssistantDisplayContent: (value) => String(value || ""),
       }],
       ["../../lib/streaming", {
+        isStreamOutputLimited,
         streamChatCompletion: async (
           messages,
           _settings,
@@ -517,7 +523,8 @@ test("a legacy report request uses the admitted child budget and preserves lengt
             semanticContent: JSON.stringify(reportArguments),
             actionableContent: JSON.stringify(reportArguments),
             toolCalls: [],
-            finishReason: outputWasTruncated ? "length" : "stop",
+            finishReason: clientStopReason ? null : outputWasTruncated ? "length" : "stop",
+            ...(clientStopReason ? { clientStopReason } : {}),
             usage: {},
             protocolViolation: null,
           };
@@ -637,6 +644,24 @@ test("a legacy report request uses the admitted child budget and preserves lengt
   assert.deepEqual(truncated.toolCalls, []);
   assert.ok(truncated.diagnostics.some((item) => item.code === "output_truncated"));
   assert.equal(logs.some((entry) => entry.eventName === "runtime_v2_subagent_protocol_drift"), false);
+  outputWasTruncated = false;
+  for (const cause of ["reasoning_char_limit", "action_char_limit"]) {
+    clientStopReason = cause;
+    const limited = await provider.requestRuntimeV2ChildStep(input);
+    assert.deepEqual(limited.toolCalls, [], "client-limited report text cannot become an accepted report action");
+    const diagnostic = limited.diagnostics.find((item) => item.code === "output_truncated");
+    assert.ok(diagnostic, `${cause} must retain the incomplete-output diagnostic`);
+    assert.match(diagnostic.message, new RegExp(cause));
+    const event = logs.filter((entry) => entry.eventName === "runtime_v2_subagent_output_truncated").at(-1);
+    assert.equal(event.data.finishReason, null);
+    assert.equal(event.data.clientStopReason, cause);
+    assert.equal(event.data.stopSource, "client_guard");
+    const providerEvent = logs.filter((entry) => entry.eventName === "runtime_v2_subagent_provider_result").at(-1);
+    assert.equal(providerEvent.data.concluded, false);
+    assert.equal(providerEvent.data.clientStopReason, cause);
+  }
+  assert.equal(providerRequests, 4, "local limits do not trigger transport fallback");
+  assert.equal(logs.some((entry) => entry.eventName === "runtime_v2_subagent_protocol_drift"), false);
 });
 
 test("the child report text-envelope catalog preserves the exact nested evidence enum", () => {
@@ -738,6 +763,7 @@ test("a missing native child report falls back to a required text envelope", asy
         sanitizeAssistantDisplayContent: (value) => String(value || ""),
       }],
       ["../../lib/streaming", {
+        isStreamOutputLimited,
         streamChatCompletion: async (
           messages,
           _settings,
@@ -939,6 +965,7 @@ test("a required tool_choice compatibility rejection falls directly back to the 
         sanitizeAssistantDisplayContent: (value) => String(value || ""),
       }],
       ["../../lib/streaming", {
+        isStreamOutputLimited,
         streamChatCompletion: async (
           messages,
           _settings,
@@ -1132,6 +1159,7 @@ test("a child provider request hard-stops when the transport ignores abort", asy
         sanitizeAssistantDisplayContent: (value) => String(value || ""),
       }],
       ["../../lib/streaming", {
+        isStreamOutputLimited,
         streamChatCompletion: async (
           _messages,
           _settings,

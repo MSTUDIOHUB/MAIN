@@ -3,7 +3,7 @@ import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
 import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import { streamChatCompletion } from "../../lib/streaming";
+import { isStreamOutputLimited, streamChatCompletion } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   isRequiredToolChoiceCompatibilityErrorMessage,
@@ -219,17 +219,19 @@ export async function requestRuntimeV2ChildStep(input: {
           },
         });
 
-        // A length boundary is capacity evidence, not evidence that the
+        // An output limit is capacity evidence, not evidence that the
         // transport cannot express tools. Never parse or execute an action
         // from an incomplete response, including a partially streamed call.
-        const outputTruncated = wire.finishReason === "length";
+        const outputTruncated = isStreamOutputLimited(wire);
         let normalized: RuntimeV2NormalizedProviderResult = outputTruncated ? {
           visibleText: wire.semanticContent || streamedText,
           toolCalls: [],
           usage: wire.usage,
           diagnostics: [{
             code: "output_truncated",
-            message: "Child output reached its admitted token allocation before a complete response.",
+            message: wire.clientStopReason
+              ? `Client ${wire.clientStopReason} guard ended child output before a complete response.`
+              : "Child output reached its admitted token allocation before a complete response.",
             retryable: true,
           }],
         } : normalizeProviderResponseV1({
@@ -282,7 +284,9 @@ export async function requestRuntimeV2ChildStep(input: {
             runId: input.job.run.runId,
             jobId: input.job.id,
             transport: attempt.variant,
-            finishReason: wire.finishReason,
+            finishReason: wire.finishReason || null,
+            clientStopReason: wire.clientStopReason || null,
+            stopSource: wire.clientStopReason ? "client_guard" : "provider",
             maxOutputTokens,
             visibleTextChars: visibleText.length,
             reasoningChars: String(wire.reasoningContent || "").length,
@@ -335,6 +339,8 @@ export async function requestRuntimeV2ChildStep(input: {
           toolNames: normalized.toolCalls.map((call) => call.name),
           concluded: normalized.toolCalls.length === 0 && normalized.diagnostics.length === 0,
           finishReason: wire.finishReason || null,
+          clientStopReason: wire.clientStopReason || null,
+          stopSource: wire.clientStopReason ? "client_guard" : outputTruncated ? "provider" : null,
           maxOutputTokens,
           visibleTextChars: visibleText.length,
           reasoningChars: String(wire.reasoningContent || "").length,

@@ -222,6 +222,8 @@ test("Execute action recovery still submits an advertised tool after a reasoning
     fixture.context.runtimeRunIntent = "execute";
     const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute"), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls.length, 2);
+    assert.equal(calls[0].options.reasoningOnlyCharLimit, null);
+    assert.equal(calls[1].options.reasoningOnlyCharLimit, null, "the same ordinary request recovery must also bypass the adapter default character guard");
     const { feedback, authority } = assertOutboundRecoveryPair(calls[1].messages, "##");
     assert.match(feedback.content, /Submit exactly one.*structured tool action/);
     assert.equal(calls[1].messages.at(-1), authority, "the actual tool surface is the final phase instruction");
@@ -230,6 +232,46 @@ test("Execute action recovery still submits an advertised tool after a reasoning
     assert.deepEqual(calls[1].tools, [tool]);
     assert.equal(result.toolCalls[0].name, "read_file");
   });
+});
+
+test("ordinary request modes delegate active reasoning to the provider output budget", async () => {
+  for (const mode of ["execute", "validate", "chat", "analyze", "conclude"]) {
+    await withStreamFixture("omlx", completedStream, async (fixture, calls) => {
+      await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command(mode), tools: [], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.equal(calls[0].settings.reasoningRequest, "auto");
+      assert.equal(calls[0].options.reasoningOnlyCharLimit, null, mode);
+    });
+  }
+});
+
+test("client action guards retain canonical recovery and accurately distinguish provider limits", async () => {
+  const tool = { type: "function", function: { name: "read_file", description: "read", parameters: { type: "object", properties: {} } } };
+  for (const clientStopReason of ["reasoning_char_limit", "action_char_limit"]) {
+    await withStreamFixture("omlx", (attempt) => attempt === 1
+      ? { content: "", semanticContent: "", finishReason: null, clientStopReason, toolCalls: [], reasoningContent: "r".repeat(4_012), usage: null }
+      : { content: "", semanticContent: "", finishReason: "tool_calls", toolCalls: [{ id: "read", name: "read_file", arguments: { path: "a.ts" } }], usage: null }, async (fixture, calls) => {
+      fixture.live.messages[2].content = "Inspect the existing source.";
+      const canonical = structuredClone(fixture.live.messages);
+      const events = [];
+      fixture.logStoreEvent = (name, data) => events.push({ name, data });
+      const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "tool_execution_failed" } }), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.equal(calls.length, 2);
+      assert.equal(calls[1].settings.reasoningRequest, "off");
+      assert.equal(calls[0].options.reasoningOnlyCharLimit, 4_000);
+      assert.equal(calls[1].options.reasoningOnlyCharLimit, 4_000);
+      assert.deepEqual(calls[1].messages.slice(0, canonical.length), canonical);
+      const { feedback } = assertOutboundRecoveryPair(calls[1].messages, "");
+      assert.match(feedback.content, /CLIENT_OUTPUT_GUARD_REACHED/);
+      assert.match(feedback.content, new RegExp(clientStopReason));
+      assert.doesNotMatch(feedback.content, /BUDGET_EXHAUSTED|reached.*token limit/i);
+      const event = events.find((item) => item.name === "runtime_v2_provider_reasoning_truncated")?.data;
+      assert.equal(event.stopSource, "client_guard");
+      assert.equal(event.finishReason, null);
+      assert.equal(event.clientStopReason, clientStopReason);
+      assert.equal(result.toolCalls[0].name, "read_file");
+      assert.deepEqual(result.diagnostics, []);
+    });
+  }
 });
 
 test("Execute outbound recovery preserves canonical history and the adjacent latest draft/feedback pair", async () => {

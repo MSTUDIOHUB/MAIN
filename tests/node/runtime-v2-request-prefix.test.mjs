@@ -31,9 +31,10 @@ function loadTs(sourcePath, mocks, cache = new Map()) {
 
 test("changing decision guidance leaves the canonical conversation as a stable request prefix", async () => {
   const requests = [];
+  const { isStreamOutputLimited } = loadTs(path.join(process.cwd(), "src/lib/streaming.ts"), new Map());
   const mocks = new Map([
     ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, release() {}, reportFailure() {} }) }],
-    ["../../lib/streaming", { streamChatCompletion: async (messages, _settings, _callbacks, _signal, _tools, _limit, options) => {
+    ["../../lib/streaming", { isStreamOutputLimited, streamChatCompletion: async (messages, _settings, _callbacks, _signal, _tools, _limit, options) => {
       requests.push({ messages: structuredClone(messages), options });
       return { content: "Answer", semanticContent: "Answer", toolCalls: [], finishReason: "stop", protocolViolation: null };
     } }],

@@ -1,11 +1,12 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import type { StreamResult } from "../../lib/streaming";
 import {
   READ_ONLY_SUBAGENT_ACCESS_MODES,
   READ_ONLY_SUBAGENT_TASK_KINDS,
   TOOL_DEFINITIONS,
   type ToolDefinition,
 } from "../../lib/toolSchemas";
-import type { WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
+import type { RuntimeV2ProviderDiagnostic, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
@@ -417,4 +418,35 @@ export function isPlanProviderRequestTimeout(
   return name === "AbortError" ||
     /\b(?:STREAM|HTTP|PROVIDER)[A-Z0-9_ -]*TIMEOUT\b/i.test(detail) ||
     /\b(?:timed?\s*out|timeout)\b/i.test(detail);
+}
+
+
+export function planProviderResponseDiagnostics(input: {
+  readonly protocolViolation: StreamResult["protocolViolation"];
+  readonly clientStopReason: StreamResult["clientStopReason"];
+  readonly outputTruncated: boolean;
+  readonly adaptedToolCallCount: number;
+  readonly structuredResponseAdapted: boolean;
+}): RuntimeV2ProviderDiagnostic[] {
+  return [
+    ...(input.protocolViolation
+      ? [{ code: input.protocolViolation, message: "Plan tool protocol mismatch", retryable: true }]
+      : []),
+    ...(input.outputTruncated && input.adaptedToolCallCount === 0
+      ? [{
+          code: "output_truncated",
+          message: input.clientStopReason
+            ? `Client ${input.clientStopReason} guard ended Plan output before a complete structured submission.`
+            : "Plan output reached its token limit before a complete structured submission.",
+          retryable: true,
+        }]
+      : []),
+    ...(input.structuredResponseAdapted
+      ? [{
+          code: "structured_response_adapted",
+          message: "A complete schema-bound response was normalized as the sole Plan submission.",
+          retryable: false,
+        }]
+      : []),
+  ];
 }

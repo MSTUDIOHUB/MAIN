@@ -143,8 +143,10 @@ export interface StreamRequestOptions {
   timeoutMs?: number;
   /** Optional per-request guard for reasoning-only output before any semantic
    * text or tool call. This bounds one decision, not the task or stream wall
-   * clock, and lets action-oriented runtimes recover with a tighter prompt. */
-  reasoningOnlyCharLimit?: number;
+   * clock, and lets action-oriented runtimes recover with a tighter prompt.
+   * null explicitly delegates active reasoning to the provider token budget;
+   * undefined retains the legacy adapter character guard. */
+  reasoningOnlyCharLimit?: number | null;
   /** Cancel a decision that emits excessive visible/hidden prose before any
    * structured action. Tool arguments are unaffected once a call begins. */
   actionOnlyCharLimit?: number;
@@ -171,6 +173,8 @@ export interface StreamResult {
   semanticContent?: string;
   toolCalls: StreamedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
+  /** A client character guard is distinct from a provider finish_reason. */
+  clientStopReason?: "reasoning_char_limit" | "action_char_limit";
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
   /** Provider returned a terminal response that violated the requested tool protocol. */
@@ -398,13 +402,24 @@ export function isLocalProfile(settings: StreamSettings): boolean {
   return url.includes("localhost") || url.includes("127.0.0.1") || url.includes("::1") || url.includes("ollama") || url.includes(":11434");
 }
 
+/** Provider capacity and client output guards share recovery, not provenance. */
+export function isStreamOutputLimited(input: {
+  readonly finishReason?: string | null;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
+}): boolean {
+  return input.finishReason === "length" ||
+    input.clientStopReason === "reasoning_char_limit" ||
+    input.clientStopReason === "action_char_limit";
+}
+
 export function shouldStopReasoningOnlyStream(input: {
   reasoningChars: number;
   visibleChars: number;
   toolCallCount: number;
   settings?: StreamSettings;
-  reasoningOnlyCharLimit?: number;
+  reasoningOnlyCharLimit?: number | null;
 }): boolean {
+  if (input.reasoningOnlyCharLimit === null) return false;
   const requestedLimit = Math.floor(
     Number(input.reasoningOnlyCharLimit) || 0,
   );
@@ -1783,6 +1798,7 @@ async function streamViaRustProxy(
   let firstToolAt: number | null = null;
   let emittedMirrorSemanticContent = "";
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let clientStopReason: StreamResult["clientStopReason"];
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
   let unlistenChunk: UnlistenFn | null = null;
@@ -1868,6 +1884,7 @@ async function streamViaRustProxy(
     semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
@@ -1879,7 +1896,7 @@ async function streamViaRustProxy(
   }, messages, body, visualProtocol, options.visualTransportBinding);
 
   const stopReasoningOnlyRunaway = () => {
-    if (resolved || anthropicProcessor) return false;
+    if (resolved || anthropicProcessor || finishReason !== null) return false;
     if (!shouldStopReasoningOnlyStream({
       reasoningChars: providerReasoningContent.length,
       visibleChars: semanticProgress.semanticVisibleChars,
@@ -1891,7 +1908,7 @@ async function streamViaRustProxy(
     }
 
     resolved = true;
-    finishReason = "length";
+    clientStopReason = "reasoning_char_limit";
     closeReasoningBlock();
     reasoningBuffer = "";
     const dynamicLimit = Math.floor(
@@ -1921,7 +1938,7 @@ async function streamViaRustProxy(
   };
 
   const stopActionlessRunaway = () => {
-    if (resolved || anthropicProcessor) return false;
+    if (resolved || anthropicProcessor || finishReason !== null) return false;
     if (!shouldStopActionlessStream({
       reasoningChars: providerReasoningContent.length,
       visibleChars: semanticProgress.semanticVisibleChars,
@@ -1931,7 +1948,7 @@ async function streamViaRustProxy(
       return false;
     }
     resolved = true;
-    finishReason = "length";
+    clientStopReason = "action_char_limit";
     closeReasoningBlock();
     reasoningBuffer = "";
     const dynamicLimit = Math.max(
@@ -2605,6 +2622,7 @@ export async function streamChatCompletion(
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let clientStopReason: StreamResult["clientStopReason"];
 
   // Track reasoning phase for thinking models (e.g., Qwen3.5 with reasoning_content)
   let reasoningActive = false;
@@ -2677,6 +2695,7 @@ export async function streamChatCompletion(
     semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
@@ -2841,14 +2860,14 @@ export async function streamChatCompletion(
                 status: "streaming",
               });
             }
-            if (shouldStopReasoningOnlyStream({
+            if (finishReason === null && shouldStopReasoningOnlyStream({
               reasoningChars: providerReasoningContent.length,
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               settings,
               reasoningOnlyCharLimit: options.reasoningOnlyCharLimit,
             })) {
-              finishReason = "length";
+              clientStopReason = "reasoning_char_limit";
               closeReasoningBlock();
               reasoningBuffer = "";
               const dynamicLimit = Math.floor(
@@ -2866,13 +2885,13 @@ export async function streamChatCompletion(
               onDone(result);
               return result;
             }
-            if (shouldStopActionlessStream({
+            if (finishReason === null && shouldStopActionlessStream({
               reasoningChars: providerReasoningContent.length,
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               actionOnlyCharLimit: options.actionOnlyCharLimit,
             })) {
-              finishReason = "length";
+              clientStopReason = "action_char_limit";
               closeReasoningBlock();
               reasoningBuffer = "";
               const dynamicLimit = Math.max(

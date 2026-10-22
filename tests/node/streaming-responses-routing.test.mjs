@@ -1942,7 +1942,73 @@ test("a failed Rust stream acknowledgement cancels the exact dispatched request 
   assert.equal(errors[0].message, startupError.message);
 });
 
-test("local Rust streams stop reasoning-only runaway output", async () => {
+for (const transport of ["Rust", "fetch"]) {
+  test(`${transport} provider-budget reasoning streams bypass implicit character guards and retain real finish reasons`, async () => {
+    for (const scenario of [
+      { limit: null, finish: "tool_calls" },
+      { limit: null, finish: "length" },
+      { limit: 4_000, finish: "tool_calls" },
+      { limit: null, actionLimit: 4, finish: "tool_calls" },
+      { limit: 4_000, finish: "length", sameFrame: true },
+      { limit: 4_000, finish: "stop", sameFrame: true },
+    ]) {
+      const listeners = new Map();
+      const calls = [];
+      let readerCanceled = 0;
+      let doneCount = 0;
+      const reasoning = "thinking ".repeat(12_500);
+      const frames = [
+        `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning }, ...(scenario.sameFrame ? { finish_reason: scenario.finish } : {}) }] })}\n\n`,
+        ...(scenario.actionLimit ? [`data: ${JSON.stringify({ choices: [{ delta: { content: "unfinished action prose" } }] })}\n\n`] : []),
+        ...(scenario.sameFrame ? [] : [`data: ${JSON.stringify({ choices: [{ delta: scenario.finish === "tool_calls" ? { tool_calls: [{ index: 0, id: "read", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] } : {}, finish_reason: scenario.finish }] })}\n\n`]),
+      ];
+      const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+        calls.push({ command, streamId: args.streamId });
+        if (command === "cancel_chat_stream") return;
+        assert.equal(command, "start_chat_stream");
+        queueMicrotask(() => {
+          for (const chunk of frames) listeners.get("chat-stream-chunk")?.({ payload: { stream_id: args.streamId, chunk } });
+          listeners.get("chat-stream-done")?.({ payload: { stream_id: args.streamId, status: "ok", error: null } });
+        });
+      }, async (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name); });
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({ ok: true, status: 200, statusText: "OK", body: { getReader() {
+        let index = 0;
+        return { async read() { return index < frames.length ? { done: false, value: new TextEncoder().encode(frames[index++]) } : { done: true }; }, async cancel() { readerCanceled += 1; } };
+      } } });
+      try {
+        const result = await streamChatCompletion(
+          [{ role: "user", content: "Inspect the requested target." }],
+          { baseUrl: "http://127.0.0.1:8000/v1", model: "fixture", provider: "OMLX", useRustProxy: transport === "Rust", reasoningRequest: "auto" },
+          { onToken() {}, onDone() { doneCount += 1; }, onError(error) { throw error; } },
+          undefined,
+          [{ type: "function", function: { name: "read_file", description: "read", parameters: { type: "object", properties: {} } } }],
+          32_768,
+          { reasoningOnlyCharLimit: scenario.limit, actionOnlyCharLimit: scenario.actionLimit, contextOwnership: "caller" },
+        );
+        assert.equal(result.reasoningContent, reasoning);
+        assert.equal(doneCount, 1);
+        if (scenario.sameFrame || (scenario.limit === null && !scenario.actionLimit)) {
+          assert.equal(result.finishReason, scenario.finish, "only the provider terminal frame supplies its finish reason");
+          assert.equal(result.clientStopReason, undefined);
+          assert.equal(result.toolCalls.length, scenario.finish === "tool_calls" ? 1 : 0);
+          assert.equal(calls.filter((call) => call.command === "cancel_chat_stream").length, 0);
+          assert.equal(readerCanceled, 0);
+        } else {
+          assert.equal(result.finishReason, null, "a client guard cannot fabricate provider token exhaustion");
+          assert.equal(result.clientStopReason, scenario.actionLimit ? "action_char_limit" : "reasoning_char_limit");
+          assert.equal(result.toolCalls.length, 0);
+          if (transport === "Rust") {
+            assert.deepEqual(calls.map((call) => call.command), ["start_chat_stream", "cancel_chat_stream"]);
+            assert.equal(calls[1].streamId, calls[0].streamId);
+          } else assert.equal(readerCanceled, 1);
+        }
+      } finally { globalThis.fetch = originalFetch; }
+    }
+  });
+}
+
+test("legacy local Rust reasoning guard reports a client stop instead of provider length", async () => {
   const listeners = new Map();
   const invokeCalls = [];
   const listenMock = async (eventName, handler) => {
@@ -1983,7 +2049,8 @@ test("local Rust streams stop reasoning-only runaway output", async () => {
     },
   );
 
-  assert.equal(result.finishReason, "length");
+  assert.equal(result.finishReason, null);
+  assert.equal(result.clientStopReason, "reasoning_char_limit");
   assert.equal(result.toolCalls.length, 0);
   assert.equal(result.content, "");
   assert.equal(result.reasoningContent.length > 12_000, true);
@@ -2045,7 +2112,8 @@ test("local Rust streams stop visible actionless prose without cutting hidden re
     { actionOnlyCharLimit: 2_000 },
   );
 
-  assert.equal(result.finishReason, "length");
+  assert.equal(result.finishReason, null);
+  assert.equal(result.clientStopReason, "action_char_limit");
   assert.equal(result.toolCalls.length, 0);
   assert.equal(result.semanticContent.length >= 2_000, true);
   assert.equal(result.reasoningContent, "bounded hidden reasoning");
