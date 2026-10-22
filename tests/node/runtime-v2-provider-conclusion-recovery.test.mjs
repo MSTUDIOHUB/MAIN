@@ -126,6 +126,19 @@ async function withStreamFixture(provider, responseFactory, task) {
 const truncatedStream = () => ({ content: "##", semanticContent: "##", finishReason: "length", toolCalls: [], reasoningContent: "r".repeat(8097), usage: null });
 const completedStream = () => ({ content: "A complete answer from SOURCE_RECEIPT.", semanticContent: "A complete answer from SOURCE_RECEIPT.", finishReason: "stop", toolCalls: [], usage: null });
 
+function assertOutboundRecoveryPair(messages, draft) {
+  const drafts = messages.filter((message) => message.role === "assistant" && message.content === draft);
+  assert.equal(drafts.length, 1, "the exact failed draft remains once in canonical wire history");
+  const feedbackIndices = messages.flatMap((message, index) =>
+    message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: output_truncated]") ? [index] : []);
+  assert.equal(feedbackIndices.length, 1, "one causal feedback entry owns the failed draft");
+  const index = feedbackIndices[0];
+  assert.equal(messages[index - 1], drafts[0], "feedback immediately follows its original assistant draft");
+  const authority = messages.slice(index + 1).filter((message) => message.role === "system" && message.content.includes("CURRENT_TOOL_SURFACE:"));
+  assert.equal(authority.length, 1, "current phase authority follows the preserved recovery pair");
+  return { feedback: messages[index], authority: authority[0] };
+}
+
 for (const surface of ["Chat", "workspace"]) {
 test(`${surface} cold requests preserve decision provenance and carry the shared continuity contract on the wire`, async () => {
   await withStreamFixture("omlx", completedStream, async (fixture, calls) => {
@@ -175,10 +188,12 @@ test("empty-surface live request retries as a complete answer and includes the f
     assert.equal(calls[1].settings.reasoningRequest, "off");
     assert.equal(calls[1].maxOutputTokens, 8192);
     assert.deepEqual(calls[1].tools, []);
-    assert.equal(calls[1].messages.at(-2).role, "assistant");
-    assert.equal(calls[1].messages.at(-2).content, "##");
-    assert.match(calls[1].messages.at(-1).content, /complete.*answer/i);
-    assert.doesNotMatch(calls[1].messages.at(-1).content, /Submit exactly one.*tool/);
+    const { feedback, authority } = assertOutboundRecoveryPair(calls[1].messages, "##");
+    assert.match(feedback.content, /complete.*answer/i);
+    assert.doesNotMatch(feedback.content, /Submit exactly one.*tool/);
+    assert.match(authority.content, /CURRENT_TOOL_SURFACE: this decision exposes no tools/);
+    assert.equal(calls[1].messages.at(-1).role, "user");
+    assert.match(calls[1].messages.at(-1).content, /^All tools are closed\. Deliver the final Markdown answer/);
     assert.doesNotMatch(JSON.stringify(calls[1].messages), /rrrrrrrr/);
     assert.equal(result.diagnostics.length, 0);
     assert.equal(fixture.live.latestVisibleText, completedStream().content);
@@ -207,7 +222,10 @@ test("Execute action recovery still submits an advertised tool after a reasoning
     fixture.context.runtimeRunIntent = "execute";
     const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute"), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls.length, 2);
-    assert.match(calls[1].messages.at(-1).content, /Submit exactly one.*structured tool action/);
+    const { feedback, authority } = assertOutboundRecoveryPair(calls[1].messages, "##");
+    assert.match(feedback.content, /Submit exactly one.*structured tool action/);
+    assert.equal(calls[1].messages.at(-1), authority, "the actual tool surface is the final phase instruction");
+    assert.match(authority.content, /CURRENT_TOOL_SURFACE: this decision exposes exactly 1 tool: read_file/);
     assert.equal(calls[1].maxOutputTokens, 4096);
     assert.deepEqual(calls[1].tools, [tool]);
     assert.equal(result.toolCalls[0].name, "read_file");
@@ -256,8 +274,10 @@ test("visible required-action recovery preserves settings for an adapter without
     const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "output_truncated" } }), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls.length, 2);
     assert.equal(calls[1].settings.reasoningRequest, "auto");
-    assert.equal(calls[1].messages.at(-2).content, "visible incomplete action draft");
-    assert.match(calls[1].messages.at(-1).content, /Submit exactly one/);
+    const { feedback, authority } = assertOutboundRecoveryPair(calls[1].messages, "visible incomplete action draft");
+    assert.match(feedback.content, /Submit exactly one/);
+    assert.equal(calls[1].messages.at(-1), authority, "required-action authority follows the causal draft/feedback pair");
+    assert.match(authority.content, /requires exactly one structured action, and it must be read_file/);
     assert.equal(calls[1].maxOutputTokens, 2048);
     assert.equal(result.toolCalls[0].name, "read_file");
   });
