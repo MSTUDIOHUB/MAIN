@@ -2306,7 +2306,7 @@ test("preflight effect action discards stale composer state before applying deci
   assert.equal(action.log.hasExplicitShortcut, true);
 });
 
-test("preflight effect action applies pending decisions before inactive-session checks", () => {
+test("preflight effect action rejects inactive owners before applying pending decisions", () => {
   const effect = buildSubmitBlockingPreflightEffect({
     resolution: baseResolution({ intent: "plan", riskLevel: "high", reason: "ambiguous scope" }),
     currentMainModeKey: "main_mode",
@@ -2335,9 +2335,8 @@ test("preflight effect action applies pending decisions before inactive-session 
     isOriginSessionActive: false,
   });
 
-  assert.equal(action.kind, "set_pending_decision");
-  assert.equal(action.pendingRunDecision.source, "preflight");
-  assert.equal(action.pendingRunDecision.title, "先规划还是直接执行？");
+  assert.equal(action.kind, "skip_inactive_session");
+  assert.equal(action.sessionKey, "workspace:1");
 });
 
 test("preflight effect action skips inactive sessions or resumes with forced skip-intent options", () => {

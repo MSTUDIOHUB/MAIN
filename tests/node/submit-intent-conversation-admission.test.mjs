@@ -30,10 +30,11 @@ function load(file) {
 
 const { resolveAndApplySubmitIntentRouting } = load("src/store/submitIntentRouting.ts");
 const { resolveTurnRunIntent, getIntentPolicy, buildEffectiveTurnContract } = load("src/lib/runIntent.ts");
-const { resolveSubmitRuntimeDecision } = load("src/lib/submit/turnSubmission.ts");
+const { resolveSubmitRuntimeDecision, resolveSubmitPreflightEffectAction } = load("src/lib/submit/turnSubmission.ts");
 
 function route(text, autoApproveTools = false) {
-  return resolveAndApplySubmitIntentRouting({
+  const effects = [];
+  const input = {
     text, preferredLanguage: "en", options: {}, currentMainModeKey: "main_mode", hasWorkspace: true,
     isHidden: false, autoApproveTools, fallbackRunIntent: "respond", mainDebugShortcut: null,
     mainIntentShortcut: null, lockedComposerIntent: null, currentTurn: null, currentTurnIntent: "respond",
@@ -43,8 +44,19 @@ function route(text, autoApproveTools = false) {
     planExecutionResumeContinuationTarget: null, planStage: "idle", isPlanApproved: false,
     currentTurnId: null, dismissedPendingDecisionInputKey: null, currentConfig: {}, sendOriginSessionKey: "/tmp/discussion:1",
     setState: () => {}, applyPreRunSessionPatch: () => {}, approvePlan: () => {}, startPlanExecutionResume: () => {},
-    startBlockingPreflight: () => {}, logStoreEvent: () => {},
+    startBlockingPreflight: (effect) => effects.push(effect), logStoreEvent: () => {},
+  };
+  const result = resolveAndApplySubmitIntentRouting(input);
+  if (!result.handled || effects.length === 0) return result;
+  // A natural output-style hint may now receive a semantic check. A typed
+  // read-only result must retain the same conversational authority afterward.
+  assert.equal(effects.length, 1);
+  const action = resolveSubmitPreflightEffectAction({
+    effect: effects[0], preflight: { intent: effects[0].resolution.intent, confidence: 0.98 },
+    latestInput: text, latestMainModeKey: "main_mode", isOriginSessionActive: true, isOriginOwnerCurrent: true,
   });
+  assert.equal(action.kind, "resume");
+  return resolveAndApplySubmitIntentRouting({ ...input, options: action.options });
 }
 
 const discussions = [

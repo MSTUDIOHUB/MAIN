@@ -383,6 +383,8 @@ const DIRECT_WORKSPACE_MUTATION_PATTERNS = [
 ];
 
 const READ_ONLY_WORKSPACE_CONSTRAINT_PATTERNS = [
+  /(?:^|[\r\n。！？；.!?;])\s*(?:请\s*)?只读/i,
+  /(?:^|[\r\n.!?;])\s*(?:please\s+)?read[ -]only\b/i,
   /(?:不要|无需|不需要|请勿|禁止|别).{0,10}(?:修改|实现|修复|解决|处理|写入|创建|生成|改动|新增|添加|删除|替换|重构|执行)/i,
   /(?:只|仅).{0,8}(?:分析|检查|解释|诊断|审查|评估|排查|总结|报告).{0,32}(?:不要|无需|不需要|请勿|禁止|别).{0,16}(?:修改|改动|写入|执行)?/i,
   /\b(?:do not|don't|dont|no need to|without)\s+(?:implement(?:ing)?|fix(?:ing)?|repair(?:ing)?|resolv(?:e|ing)|writ(?:e|ing)|creat(?:e|ing)|generat(?:e|ing)|updat(?:e|ing)|patch(?:ing)?|modif(?:y|ying)|refactor(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|replac(?:e|ing)|add(?:ing)?|chang(?:e|ing)|run(?:ning)?|execut(?:e|ing))\b/i,
@@ -1467,11 +1469,19 @@ export function shouldUseBlockingIntentPreflight(
   resolution: RunIntentResolution,
   mainModeKey: MainModeKey,
   input = "",
+  hasWorkspace = false,
 ): boolean {
   if (mainModeKey !== "main_mode") return false;
   if (resolution.bypassMainRouter) return false;
   if (resolution.needsDecision) return false;
   if (resolution.confidence >= 0.9) return false;
+  if (hasWorkspace) {
+    // A natural analysis/report cue describes the reply format, but cannot
+    // establish whether live command or external application tools are needed.
+    // Calibrate that ambiguity without widening explicit read-only authority.
+    return (resolution.intent === "analyze" || resolution.intent === "report") &&
+      !hasReadOnlyWorkspaceConstraint(input);
+  }
   if (getIntentPolicy(resolution.intent).uiCategory === "output_style") return false;
 
   // region: 热路径保护

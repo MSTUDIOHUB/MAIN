@@ -287,6 +287,7 @@ export function resolveAndApplySubmitIntentRouting<
   if (
     !input.isHidden &&
     !input.mainDebugShortcut &&
+    !input.mainIntentShortcut &&
     !input.lockedComposerIntent &&
     !input.shouldContinuePlanIntent &&
     !input.shouldContinuePreviousTurnIntent &&
@@ -405,10 +406,11 @@ export function resolveAndApplySubmitIntentRouting<
       }
     }
 
-    if (!input.hasWorkspace) {
+    {
       const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
         resolution,
         currentMainModeKey: input.currentMainModeKey,
+        hasWorkspace: input.hasWorkspace,
         text: input.text,
         images: input.images,
         options: input.options,

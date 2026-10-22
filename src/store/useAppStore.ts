@@ -381,6 +381,7 @@ import {
 } from "./submitRuntimeFacade";
 import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
 import { startSubmitBlockingPreflightEffect } from "./submitPreflightExecutor";
+import { isSubmitWorkspacePreflightLive } from "./submitWorkspacePreflight";
 import {
   applySubmitSeedSessionTitle,
   startSubmitSemanticMetadataEffect,
@@ -506,6 +507,7 @@ import type {
 import {
   WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
   type WorkspaceInstruction,
+  type WorkspaceInstructionDispatchClaim,
   type WorkspaceInstructionLedgerEntry,
   type WorkspaceInstructionReceipt,
   type WorkspaceInstructionSource,
@@ -533,6 +535,7 @@ import { compactThoughtContent } from "../lib/thoughtCompaction";
 import {
   buildWorkspaceTurnQueueEntryIdentity,
   createWorkspaceTurnQueueState,
+  isWorkspaceInstructionDispatchClaimCurrent,
   normalizeWorkspaceInstructionLedger,
   reconcileWorkspaceTurnQueueOnRestore,
   reduceWorkspaceTurnQueue,
@@ -1247,17 +1250,7 @@ export type WorkspaceInstructionAcceptance =
       retryable: boolean;
     };
 
-export interface WorkspaceInstructionDispatchClaim {
-  claimId: string;
-  receiptId: string;
-  clientSubmissionId: string;
-  sessionKey: string;
-  sessionEpoch: string;
-  turnId: string;
-  admittedUserBlockId: number;
-  /** Canonical immutable instruction+receipt envelope captured at claim time. */
-  instructionEnvelopeIdentity: string;
-}
+export type { WorkspaceInstructionDispatchClaim } from "../lib/workspaceInstruction";
 
 type CapsuleExplanationSource = "model" | "runtime";
 type CapsuleExplanationState = {
@@ -15969,6 +15962,15 @@ export const useAppStore = create<AppState>()(
         );
         const sourceHasTerminalBoundary = inspection.terminals.length > 0 ||
           isConversationTurnRuntimeClosed(inspection.owner?.turn.runtimeOutcome);
+        // Semantic intake is owned by this durable dispatch claim before a
+        // Run exists. A re-entrant drain must neither consume it as a stale
+        // executor nor race the ordinary cancellation terminal boundary.
+        if (terminalHead.claim.phase === "intent_preflight" &&
+          !sourceHasTerminalBoundary &&
+          deferDispatchUntilCancellationSettles("before_claim")) return false;
+        if (!sourceHasTerminalBoundary && isSubmitWorkspacePreflightLive(state)) {
+          return false;
+        }
         const liveMarkerRunId = getHarnessActionRunId(state.harnessRunMarker);
         const liveMarkerParentRunId = state.harnessRunMarker?.activeParentRunId ||
           state.harnessRunMarker?.parentRunId ||
@@ -16718,6 +16720,14 @@ export const useAppStore = create<AppState>()(
       completeAdmittedTurn(durableResultKind, terminalSummary);
       return true;
     }
+    if (isWorkspaceInstructionDispatchClaimCurrent(postDispatch.workspaceTurnQueue, {
+      adoptExistingTurn: true,
+      workspaceInstructionClaim: exactClaim,
+      turnIdOverride: head.receipt.turnId,
+      admittedUserBlockId: head.receipt.userBlockId,
+    }) && isSubmitWorkspacePreflightLive(postDispatch)) {
+      return true;
+    }
     if (adoptedTurnOwnsRuntime) {
       acknowledgeAdmittedTurn();
       return true;
@@ -17079,17 +17089,7 @@ export const useAppStore = create<AppState>()(
     if (options?.adoptExistingTurn) {
       const claim = options.workspaceInstructionClaim;
       const head = state.workspaceTurnQueue?.entries[0];
-      const exactClaimMatches = !!claim &&
-        state.workspaceTurnQueue?.sessionKey === claim.sessionKey &&
-        state.workspaceTurnQueue?.sessionEpoch === claim.sessionEpoch &&
-        head?.status === "dispatching" &&
-        head.claim?.claimId === claim.claimId &&
-        head.receipt.receiptId === claim.receiptId &&
-        head.receipt.turnId === claim.turnId &&
-        head.receipt.userBlockId === claim.admittedUserBlockId &&
-        head.instruction.clientSubmissionId === claim.clientSubmissionId &&
-        options.turnIdOverride === claim.turnId &&
-        options.admittedUserBlockId === claim.admittedUserBlockId;
+      const exactClaimMatches = isWorkspaceInstructionDispatchClaimCurrent(state.workspaceTurnQueue, options);
       if (!exactClaimMatches) {
         logStoreEvent("workspace_turn_dispatch_claim_rejected", {
           expectedSessionKey: claim?.sessionKey || null,
@@ -18055,8 +18055,15 @@ export const useAppStore = create<AppState>()(
           effect: blockingPreflightEffect,
           runIntentPreflight,
           getState: get,
+          setState: set,
           isSessionRuntimeActive,
           applyPreRunSessionPatch,
+          closeTurnAsCanceled: (turnId) => {
+            get().closeTurnAsCanceled(turnId, { reason: "intent_preflight_superseded" });
+          },
+          redispatchWorkspaceInstruction: (sessionKey) => {
+            get().dispatchNextWorkspaceInstruction(sessionKey);
+          },
           resumeSubmission: (nextText, nextImages, nextOptions) => {
             get().sendMessage(nextText, nextImages, nextOptions);
           },

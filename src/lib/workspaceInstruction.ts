@@ -101,6 +101,20 @@ export interface WorkspaceTurnQueueClaim {
   readonly sessionKey: string;
   readonly sessionEpoch: string;
   readonly claimedAt: number;
+  /** The same durable dispatch owner may await semantic intake before a Run. */
+  readonly phase?: "dispatch" | "intent_preflight";
+}
+
+export interface WorkspaceInstructionDispatchClaim {
+  claimId: string;
+  receiptId: string;
+  clientSubmissionId: string;
+  sessionKey: string;
+  sessionEpoch: string;
+  turnId: string;
+  admittedUserBlockId: number;
+  /** Canonical immutable instruction+receipt envelope captured at claim time. */
+  instructionEnvelopeIdentity: string;
 }
 
 export interface WorkspaceTurnQueueEntry {

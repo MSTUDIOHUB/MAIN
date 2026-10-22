@@ -31,6 +31,8 @@ submitAsyncWorkflowRun.ts
 
 `commandDirective` 是上述意图的操作描述，不是独立授权。问句、引用、历史记录或禁止执行的说明中出现命令词，不能从二级元数据反向把只读意图升级为 Execute；真正的明确命令须由顶层意图接纳，显式执行选项及已批准计划仍按原授权继续。
 
+自然语言的 Analyze/Report 输出风格猜测不能独立证明所需工具范围。主模式中的低置信工作区请求可以通过现有无工具、短输入的语义预检校准；显式模式与只读约束保持优先，预检不批准工具。预检归属于已接纳 FIFO claim 的 `intent_preflight` 阶段，不伪造 Run；只有同一 claim、epoch、不可变 envelope 和控制器仍有效时才可接续同一 Turn。不确定结果保留原安全意图，取消后的迟到结果不能重排已取消任务，恢复后的新 claim 不能采用旧结果。
+
 Session epoch 来自 accepted instruction receipt 与 canonical Session metadata，不能由每个 Turn 临时生成。async admission 在首次异步操作前冻结 `runSessionEpoch`，readOnly、Execute、Plan、Goal 与 Goal slice 共用身份投影；receipt 与当前 Session 冲突时拒绝。空会话即使没有 runtimeSnapshot，也必须从保留的 Session metadata 取得同一代次；checkpoint 恢复归属校验不为此放宽。
 
 连续对话由 `executionProviderHistory.ts` 的共享生产提示消费同一份 canonical user/assistant 历史，不另建决策记忆。用户明确选择、接受或委托选择才可记录为已确认；模型建议和推断、用户明确待定项应保持独立状态，沉默不构成同意。后续修改替代旧决定，汇总与文档依据用户原文校正模型先前擅自确认的内容。该规则是模型行为契约，不增加 Runtime 审批或终态门控；真实语义质量必须单独核验，不能由 mock 或结构性 success 推定。

@@ -237,6 +237,7 @@ export function buildMainDebugPrompt(feedback: string): string {
 }
 
 export interface SubmitPipelineOptions {
+  workspaceInstructionClaim?: import("../workspaceInstruction").WorkspaceInstructionDispatchClaim;
   hidden?: boolean;
   reuseCurrentTurn?: boolean;
   /**
@@ -982,6 +983,8 @@ export interface SubmitBlockingPreflightEffect<
     input: string;
     language: "zh" | "en";
     mainModeKey: MainModeKey;
+    hasWorkspace?: boolean;
+    signal?: AbortSignal;
     config: TConfig;
   };
   originalText: string;
@@ -2124,6 +2127,7 @@ export function buildSubmitBlockingPreflightEffect<
 >(params: {
   resolution: RunIntentResolution;
   currentMainModeKey: MainModeKey;
+  hasWorkspace?: boolean;
   text: string;
   images?: string[];
   options?: TOptions;
@@ -2131,7 +2135,7 @@ export function buildSubmitBlockingPreflightEffect<
   currentConfig: TConfig;
   sendOriginSessionKey: string | null;
 }): SubmitBlockingPreflightEffect<TConfig, TOptions> | null {
-  if (!shouldUseBlockingIntentPreflight(params.resolution, params.currentMainModeKey, params.text)) {
+  if (!shouldUseBlockingIntentPreflight(params.resolution, params.currentMainModeKey, params.text, params.hasWorkspace)) {
     return null;
   }
 
@@ -2140,6 +2144,7 @@ export function buildSubmitBlockingPreflightEffect<
       input: params.text,
       language: params.preferredLanguage,
       mainModeKey: params.currentMainModeKey,
+      ...(params.hasWorkspace ? { hasWorkspace: true } : {}),
       config: params.currentConfig,
     },
     originalText: params.text,
@@ -2178,6 +2183,7 @@ export function resolveSubmitPreflightEffectAction<
   latestMainModeKey: MainModeKey;
   lockedComposerIntent?: MainIntentShortcut | null;
   isOriginSessionActive: boolean;
+  isOriginOwnerCurrent?: boolean;
 }): SubmitPreflightEffectAction<TOptions> {
   const staleness = resolveSubmitPreflightStalenessDecision({
     originalText: params.effect.originalText,
@@ -2200,12 +2206,27 @@ export function resolveSubmitPreflightEffectAction<
     };
   }
 
+  if (
+    (params.effect.sendOriginSessionKey && !params.isOriginSessionActive) ||
+    (params.effect.request.hasWorkspace && params.isOriginOwnerCurrent !== true)
+  ) {
+    return {
+      kind: "skip_inactive_session",
+      phase: "intent_preflight",
+      sessionKey: params.effect.sendOriginSessionKey || "",
+    };
+  }
+
   const preflightDecision = resolveSubmitPreflightResultDecision({
     text: params.effect.originalText,
     images: params.effect.originalImages,
     preferredLanguage: params.effect.preferredLanguage,
     resolution: params.effect.resolution,
-    preflight: params.preflight,
+    // Workspace intake already owns an admitted Turn. Uncertain semantics
+    // continue through its safe original capability surface for clarification.
+    preflight: params.effect.request.hasWorkspace &&
+      (params.preflight?.needsUserChoice || (params.preflight?.confidence ?? 0) < 0.9)
+      ? null : params.preflight,
   });
 
   if (
@@ -2215,14 +2236,6 @@ export function resolveSubmitPreflightEffectAction<
     return {
       kind: "set_pending_decision",
       pendingRunDecision: preflightDecision.pendingRunDecision!,
-    };
-  }
-
-  if (params.effect.sendOriginSessionKey && !params.isOriginSessionActive) {
-    return {
-      kind: "skip_inactive_session",
-      phase: "intent_preflight",
-      sessionKey: params.effect.sendOriginSessionKey,
     };
   }
 

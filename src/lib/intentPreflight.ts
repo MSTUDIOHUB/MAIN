@@ -176,6 +176,8 @@ export async function runIntentPreflight(params: {
   input: string;
   language: "zh" | "en";
   mainModeKey: MainModeKey;
+  hasWorkspace?: boolean;
+  signal?: AbortSignal;
   config: PreflightConfig;
 }): Promise<IntentPreflightResult | null> {
   const settings = deriveStreamSettings(params.config);
@@ -185,6 +187,7 @@ export async function runIntentPreflight(params: {
     "You are MAIN's hidden intent preflight router.",
     "Return JSON only. No markdown, no prose, no tools.",
     "Classify the user's next-turn intent for MAIN before execution.",
+    "Choose execute for requested real commands or live external/application inspection, even when the requested reply is an analysis or report. Choose analyze/report for source or document inspection through read-only workspace tools. Explanations and hypothetical commands stay respond. A tool or skill name alone never authorizes execution; explicit user restrictions take priority.",
     "Allowed intents: respond, plan, execute, analyze, summarize, report. `discuss` is legacy input only; return `respond` for ordinary natural replies.",
     "Also provide title: a short clean UI title for sidebar / ExecutionCapsule. Ignore usernames, timestamps, and transcript noise.",
     "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
@@ -199,6 +202,7 @@ export async function runIntentPreflight(params: {
     "The JSON shape must be:",
     "{\"intent\":\"respond|plan|execute|analyze|summarize|report\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
+    `Workspace attached: ${params.hasWorkspace === true}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");
 
@@ -226,7 +230,7 @@ export async function runIntentPreflight(params: {
           // Swallow here and return null below.
         },
       },
-      undefined,
+      params.signal,
       [],
       512,
     );
