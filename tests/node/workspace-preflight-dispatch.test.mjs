@@ -12,6 +12,7 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
   const requests = [];
   const workflows = [];
   const pending = [];
+  const pendingRejections = [];
   const pendingBootstraps = [];
   const pendingCancellationWrites = [];
   function load(sourcePath) {
@@ -30,9 +31,16 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
         if (base === path.resolve("src/lib/streaming")) return {
           buildOpenAiCompatibleReasoningRequestExtras: () => ({}),
           streamChatCompletion: (...args) => {
-            assert.match(args[0][0].content, /hidden intent preflight router/);
+            assert.equal(args[0].length, 2);
+            assert.deepEqual(args[0].map((message) => message.role), ["system", "user"]);
+            assert.equal(typeof JSON.parse(args[0][1].content).currentRequest, "string");
+            assert.deepEqual(args[4], []);
+            assert.equal(args[5], 512);
             requests.push(args);
-            return new Promise((resolve) => pending.push(resolve));
+            return new Promise((resolve, reject) => {
+              pending.push(resolve);
+              pendingRejections.push(reject);
+            });
           },
         };
         if (base === path.resolve("src/store/submitAsyncWorkflowRun")) return {
@@ -69,6 +77,7 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
   }
   const { useAppStore: store, buildEmptySessionRuntimeSnapshot } = load("src/store/useAppStore.ts");
   const queueModule = load("src/store/workspaceTurnQueue.ts");
+  const { acceptWorkspaceComposerInstruction } = load("src/store/workspaceComposerIntentAdmission.ts");
   const { getPendingSessionCancellation } = load("src/store/sessionCancellationBarrier.ts");
   const workspace = `/tmp/preflight-dispatch-${suffix}`;
   const sessionId = 83;
@@ -95,6 +104,19 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
   return {
     store, requests, workflows, pending, pendingBootstraps, pendingCancellationWrites, sessionKey, sessionEpoch, queueModule, buildEmptySessionRuntimeSnapshot,
     getCancellation: () => getPendingSessionCancellation(sessionKey),
+    makeGlobal() {
+      const { GLOBAL_CHAT_KEY, resolveGlobalChatSessionKey } = load("src/lib/sessionTypes.ts");
+      const state = store.getState();
+      const session = state.sessionsByWorkspace[workspace][0];
+      store.setState({ currentWorkspace: null, selectedWorkspace: null, currentSessionId: sessionId,
+        activeSessionByWorkspace: { [GLOBAL_CHAT_KEY]: sessionId },
+        sessionsByWorkspace: { [GLOBAL_CHAT_KEY]: [{ ...session, active: true }] },
+        config: { ...state.config, workspace: "" }, runtimeBySessionKey: {}, workspaceTurnQueue: null,
+        workspaceInstructionLedger: [], currentTurnId: null,
+        currentTurnExecutionConsent: { turnId: null, granted: false }, autoApproveTools: false,
+      });
+      return resolveGlobalChatSessionKey(sessionId);
+    },
     async accept(text = "Inspect the current local service and report its live state.") {
       const accepted = await store.getState().acceptWorkspaceInstruction({
         text,
@@ -105,15 +127,70 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
       assert.equal(requests.length, 1, "real sendMessage must reach exactly one preflight request");
       return accepted.receipt;
     },
+    async acceptComposer(text, explicitIntent) {
+      store.setState({ lockedComposerIntent: explicitIntent });
+      const intentSnapshot = Object.freeze({ mainModeKey: "main_mode", lockedComposerIntent: explicitIntent,
+        subagentPreference: "unspecified" });
+      const accepted = await acceptWorkspaceComposerInstruction({
+        text, language: "en", intentSnapshot,
+        payloadSnapshot: { contextMentions: [], attachedFiles: [] },
+        acceptWorkspaceInstruction: (input) => store.getState().acceptWorkspaceInstruction({ ...input,
+          clientSubmissionId: `composer-submission-${suffix}` }),
+      });
+      assert.equal(accepted.accepted, true, accepted.reason);
+      // Composer clears its one-shot UI lock after durable acceptance. Only
+      // the captured dispatch boundary can constrain the delayed result now.
+      store.setState({ lockedComposerIntent: null });
+      await waitFor(() => requests.length === 1);
+      assert.equal(requests.length, 1);
+      return accepted.receipt;
+    },
     resolve(index = 0, result = { intent: "execute", confidence: 0.98, title: "Inspect service", requiresApproval: true,
       commandDirective: { kind: "shell", source: "preflight", requiresApproval: true } }) {
-      pending[index]({ content: JSON.stringify(result), toolCalls: [], finishReason: "stop" });
+      pending[index]({ content: JSON.stringify(semanticFixture(result)), toolCalls: [], finishReason: "stop" });
     },
+    resolveRaw(index, response) { pending[index](response); },
+    reject(index = 0, error = new Error("Fixture preflight transport failed")) { pendingRejections[index](error); },
     cleanup() {
       store.getState().abortController?.abort();
       for (const workflow of workflows) workflow.elapsedTimer.dispose();
       store.setState({ ...initial, dispatchNextWorkspaceInstruction: () => false }, true);
     },
+  };
+}
+
+// Existing test cases may name a convenient intent, but the mocked provider
+// sends the actual semantic wire contract. Invalid-wire cases use resolveRaw.
+function semanticFixture(result) {
+  if (!result || result.semantic) return result;
+  const intent = result.intent;
+  const workType = intent === "execute" ? "operate" : intent === "plan" ? "plan"
+    : ["analyze", "report"].includes(intent) ? "investigate" : "answer";
+  const answerFormat = intent === "analyze" ? "analysis" : intent === "summarize" ? "summary"
+    : intent === "report" ? "report" : intent === "plan" ? "plan" : "answer";
+  return {
+    semantic: {
+      objective: result.title || "Handle the current user request",
+      workType,
+      answerFormat,
+      requiredCapabilities: intent === "execute" ? ["command"]
+        : ["analyze", "report", "plan"].includes(intent) ? ["workspace_read"] : [],
+      forbiddenCapabilities: [],
+    },
+    confidence: result.confidence ?? 0.98,
+    needsUserChoice: result.needsUserChoice === true,
+    ...(result.title ? { title: result.title } : {}),
+    ...(result.question ? { question: result.question } : {}),
+  };
+}
+
+function semanticResult(workType, requiredCapabilities, answerFormat = "answer", forbiddenCapabilities = []) {
+  return {
+    semantic: { objective: "Handle exactly the current user request", workType, answerFormat,
+      requiredCapabilities, forbiddenCapabilities },
+    confidence: 0.98,
+    needsUserChoice: false,
+    title: "Current request",
   };
 }
 
@@ -123,6 +200,45 @@ async function waitFor(predicate, attempts = 50) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
+
+// The provider is a controlled classification fixture. These tests prove the
+// production admission/handoff boundary, not a model's semantic accuracy.
+test("high-confidence natural execution still waits for exactly one semantic preflight", async () => {
+  const harness = createHarness("high-confidence-semantic");
+  try {
+    const receipt = await harness.accept("Please modify src/app.ts to fix the broken save button and run its tests.");
+    assert.equal(harness.workflows.length, 0, "lexical confidence cannot start a workflow before semantic classification");
+    assert.equal(harness.requests[0][0].length, 2);
+    assert.deepEqual(harness.requests[0][4], []);
+    assert.equal(harness.requests[0][5], 512);
+    harness.resolve();
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.workflows.length, 1);
+    assert.equal(harness.workflows[0].turnId, receipt.turnId);
+    assert.equal(harness.workflows[0].effectiveRunIntent, "execute");
+    assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("a missing semantic result concludes the exact admitted Turn without lexical fallback", async () => {
+  const harness = createHarness("missing-semantic-result");
+  try {
+    const receipt = await harness.accept();
+    harness.resolve(0, null);
+    await waitFor(() => harness.workflows.length > 0 || harness.store.getState().runtimeEvents.some((event) =>
+      event.type === "turn.completed" && event.turnId === receipt.turnId));
+    const state = harness.store.getState();
+    assert.equal(harness.workflows.length, 0, "invalid semantic output must not reuse the lexical route");
+    const terminals = state.runtimeEvents.filter((event) => event.type === "turn.completed" && event.turnId === receipt.turnId);
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0].resultKind, "error");
+    assert.equal(state.workspaceTurnQueue.entries.length, 0);
+    assert.equal(state.activeActionRequest, null);
+    assert.equal(state.isGenerating, false);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
 
 test("a deferred workspace preflight keeps its exact durable claim until one same-Turn workflow adopts it", async () => {
   const harness = createHarness("handoff");
@@ -404,20 +520,31 @@ test("a restored workspace preflight creates a fresh claim and fences the old pr
 });
 
 for (const candidate of [
-  { intent: "execute", confidence: 0.65 },
+  { ...semanticResult("operate", ["command"], "report", ["workspace_write"]), confidence: 0.6 },
   { intent: "execute", confidence: 0.98, needsUserChoice: true, question: "Run it?" },
 ]) {
-  test(`uncertain workspace preflight keeps one safe workflow instead of a detached modal (${candidate.needsUserChoice ? "choice" : "confidence"})`, async () => {
+  test(`semantic workspace preflight preserves its result without a lexical substitute (${candidate.needsUserChoice ? "choice" : "confidence"})`, async () => {
     const harness = createHarness(candidate.needsUserChoice ? "choice" : "uncertain");
     try {
       const receipt = await harness.accept();
       harness.resolve(0, candidate);
-      await waitFor(() => harness.workflows.length > 0);
-      assert.equal(harness.workflows.length, 1);
-      assert.equal(harness.workflows[0].turnId, receipt.turnId);
-      assert.ok(["analyze", "report"].includes(harness.workflows[0].effectiveRunIntent));
-      assert.equal(harness.workflows[0].effectiveCommandDirective.requiresApproval, false);
-      assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+      await waitFor(() => harness.workflows.length > 0 || harness.store.getState().runtimeEvents.some((event) =>
+        event.type === "turn.completed" && event.turnId === receipt.turnId));
+      if (candidate.needsUserChoice) {
+        assert.equal(harness.workflows.length, 0, "clarification concludes without opening any workflow tools");
+        const terminals = harness.store.getState().runtimeEvents.filter((event) => event.type === "turn.completed" && event.turnId === receipt.turnId);
+        assert.equal(terminals.length, 1);
+        assert.equal(terminals[0].resultKind, "blocked");
+        assert.ok(harness.store.getState().taskFlow.some((block) => block.turnId === receipt.turnId &&
+          block.type === "agent" && block.visibility === "assistant_final" && /Run it\?/.test(block.content)));
+        assert.equal(harness.store.getState().workspaceTurnQueue.entries.length, 0);
+      } else {
+        assert.equal(harness.workflows.length, 1);
+        assert.equal(harness.workflows[0].turnId, receipt.turnId);
+        assert.equal(harness.workflows[0].effectiveRunIntent, "execute", "valid semantic intent survives a confidence of 0.6");
+        assert.deepEqual(harness.workflows[0].options.semanticIntent, semanticFixture(candidate).semantic);
+        assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+      }
       assert.equal(harness.store.getState().pendingRunDecision, null);
       assert.equal(harness.requests.length, 1);
     } finally { harness.cleanup(); }
@@ -473,8 +600,8 @@ for (const [suffix, text, intent] of [
       assert.equal(harness.workflows.length, 0, "the heuristic alone cannot freeze the tool authority before semantic calibration");
       const request = harness.requests[0];
       assert.equal(request[0].length, 2);
-      assert.ok(request[0][1].content.includes(text), "preflight receives the full current request, including historical context and current restrictions");
-      assert.match(request[0][0].content, /explicit user restrictions take priority/);
+      assert.equal(JSON.parse(request[0][1].content).currentRequest, text, "preflight receives the full current request, including historical context and current restrictions");
+      assert.match(request[0][0].content, /forbiddenCapabilities/);
       assert.deepEqual(request[4], [], "semantic calibration has no tools");
       assert.equal(request[5], 512);
       harness.resolve(0, { intent, confidence: 0.98, requiresApproval: true,
@@ -497,3 +624,222 @@ for (const [suffix, text, intent] of [
     } finally { harness.cleanup(); }
   });
 }
+
+for (const fixture of [
+  { suffix: "mixed-language", text: "请 implement src/Feature.cs, run its tests，然后用中文分析结果。",
+    result: semanticResult("implement", ["workspace_read", "workspace_write", "command"], "analysis"), intent: "execute" },
+  { suffix: "quoted-delete", text: "Explain the quoted example 'delete_workspace_path(Assets/Old.cs)'. Do not execute it or modify files.",
+    result: semanticResult("answer", [], "answer", ["workspace_write", "command", "external_interaction"]), intent: "respond" },
+  { suffix: "historical-readonly", text: "历史上下文：上轮只读 baseline 证明工具可用。这轮请实现控制器并运行测试，最后报告真实结果。",
+    result: semanticResult("implement", ["workspace_read", "workspace_write", "command"], "report"), intent: "execute" },
+  { suffix: "separate-files", text: "把运行时 Collector 和 Editor 构建器分成两份文件分别生成，然后检查编译。",
+    result: semanticResult("implement", ["workspace_read", "workspace_write", "command"]), intent: "execute" },
+  { suffix: "analyze-then-repair", text: "First analyze the defect, then fix src/app.ts and run the relevant test. Explain the change afterwards.",
+    result: semanticResult("implement", ["workspace_read", "workspace_write", "command"], "analysis"), intent: "execute" },
+  { suffix: "analysis-only", text: "先分析修复方案，不要修改文件或执行命令；给我一个计划。",
+    result: semanticResult("plan", ["workspace_read"], "plan", ["workspace_write", "command"]), intent: "plan" },
+  { suffix: "live-report", text: "Inspect the live Editor with the CLI and give me a report. Do not modify project files.",
+    result: semanticResult("operate", ["command", "external_interaction"], "report", ["workspace_write"]), intent: "execute" },
+]) {
+  test(`every natural request reaches one tool-free semantic admission: ${fixture.suffix}`, async () => {
+    const harness = createHarness(`semantic-${fixture.suffix}`);
+    try {
+      const receipt = await harness.accept(fixture.text);
+      assert.equal(harness.workflows.length, 0);
+      assert.equal(harness.requests[0][0].length, 2);
+      assert.equal(JSON.parse(harness.requests[0][0][1].content).currentRequest, fixture.text);
+      assert.deepEqual(harness.requests[0][4], []);
+      assert.equal(harness.requests[0][5], 512);
+      harness.resolve(0, fixture.result);
+      await waitFor(() => harness.workflows.length === 1);
+      assert.equal(harness.workflows.length, 1);
+      const workflow = harness.workflows[0];
+      assert.equal(workflow.turnId, receipt.turnId);
+      assert.equal(workflow.effectiveRunIntent, fixture.intent);
+      assert.deepEqual(workflow.options.semanticIntent, fixture.result.semantic);
+      assert.equal(workflow.options.executionConsentGranted, undefined, "semantic routing never grants tool execution permission");
+      assert.equal(workflow.options.workspaceInstructionClaim.turnId, receipt.turnId);
+      assert.equal(harness.requests.length, 1);
+      assert.equal(harness.store.getState().conversationTurns.filter((turn) => turn.id === receipt.turnId).length, 1);
+    } finally { harness.cleanup(); }
+  });
+}
+
+const validWireFixture = semanticResult("implement", ["workspace_read", "workspace_write", "command"]);
+for (const fixture of [
+  { suffix: "empty", response: { content: "", toolCalls: [], finishReason: "stop" } },
+  { suffix: "malformed", response: { content: '{"semantic":', toolCalls: [], finishReason: "stop" } },
+  { suffix: "legacy-intent", response: { content: '{"intent":"execute","confidence":0.99}', toolCalls: [], finishReason: "stop" } },
+  { suffix: "missing-capabilities", response: { content: JSON.stringify({ semantic: { objective: "Implement the request", workType: "implement", answerFormat: "answer" }, confidence: 0.99 }), toolCalls: [], finishReason: "stop" } },
+  { suffix: "unknown-capability", response: { content: JSON.stringify({ ...validWireFixture, semantic: { ...validWireFixture.semantic, requiredCapabilities: ["unrestricted_shell"] } }), toolCalls: [], finishReason: "stop" } },
+  { suffix: "provider-length", response: { content: JSON.stringify(validWireFixture), toolCalls: [], finishReason: "length" } },
+  { suffix: "transport-error", transportError: true },
+]) {
+  test(`invalid semantic calibration error-closes its exact Turn without workflow or lexical fallback: ${fixture.suffix}`, async () => {
+    const harness = createHarness(`semantic-invalid-${fixture.suffix}`);
+    try {
+      const receipt = await harness.accept("Please repair src/app.ts and run tests.");
+      if (fixture.transportError) harness.reject();
+      else harness.resolveRaw(0, fixture.response);
+      await waitFor(() => harness.store.getState().runtimeEvents.some((event) => event.type === "turn.completed" && event.turnId === receipt.turnId));
+      const state = harness.store.getState();
+      assert.equal(harness.workflows.length, 0);
+      const terminals = state.runtimeEvents.filter((event) => event.type === "turn.completed" && event.turnId === receipt.turnId);
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0].resultKind, "error");
+      assert.ok(state.taskFlow.some((block) => block.turnId === receipt.turnId && block.type === "agent" &&
+        block.visibility === "assistant_final" && block.content.length > 0));
+      assert.equal(state.workspaceTurnQueue.entries.length, 0);
+      assert.equal(state.activeActionRequest, null);
+      assert.equal(state.pendingRunDecision, null);
+      assert.equal(state.isGenerating, false);
+      assert.equal(harness.requests.length, 1, "calibration failure is not another model request");
+    } finally { harness.cleanup(); }
+  });
+}
+
+test("a semantic answer result prevents execution of a quoted deletion even under the Execute composer ceiling", async () => {
+  const harness = createHarness("explicit-execute-ceiling");
+  try {
+    harness.store.setState({ lockedComposerIntent: "execute" });
+    const receipt = await harness.accept("Only explain the quoted delete_workspace_path example; do not execute it.");
+    const result = semanticResult("answer", [], "answer", ["workspace_write", "command", "external_interaction"]);
+    harness.resolve(0, result);
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.workflows.length, 1);
+    assert.equal(harness.workflows[0].turnId, receipt.turnId);
+    assert.equal(harness.workflows[0].effectiveRunIntent, "respond");
+    assert.deepEqual(harness.workflows[0].options.semanticIntent, result.semantic);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("an Analyze composer ceiling cannot be raised by a semantic operation result", async () => {
+  const harness = createHarness("explicit-readonly-ceiling");
+  try {
+    harness.store.setState({ lockedComposerIntent: "analyze" });
+    const receipt = await harness.accept("Review the current files and explain the proposed repair.");
+    harness.resolve(0, semanticResult("operate", ["workspace_write", "command", "external_interaction"]));
+    await waitFor(() => harness.workflows.length > 0 || harness.store.getState().runtimeEvents.some((event) =>
+      event.type === "turn.completed" && event.turnId === receipt.turnId));
+    if (harness.workflows.length) {
+      assert.equal(harness.workflows.length, 1);
+      assert.equal(harness.workflows[0].effectiveRunIntent, "analyze");
+      assert.equal(harness.workflows[0].effectiveCommandDirective.requiresApproval, false);
+    } else {
+      assert.equal(harness.store.getState().runtimeEvents.find((event) => event.type === "turn.completed" &&
+        event.turnId === receipt.turnId)?.resultKind, "blocked");
+    }
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("a natural continuation is semantically classified before it can inherit a previous Execute route", async () => {
+  const harness = createHarness("semantic-continuation");
+  try {
+    harness.store.setState({ conversationTurns: [{ id: "previous-execution", createdAt: 1, userPrompt: "Repair the service", intent: "execute",
+      status: "done", blockIds: [], runtimeOutcome: { status: "completed", resultKind: "blocked", reason: "operator stopped", updatedAt: 1 } }] });
+    const receipt = await harness.accept("继续解释你准备怎么修复；这次不要执行操作。 Continue with an explanation only.");
+    assert.equal(harness.workflows.length, 0, "an old Execute turn is not current semantic authority");
+    const result = semanticResult("answer", [], "analysis", ["workspace_write", "command", "external_interaction"]);
+    harness.resolve(0, result);
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.workflows.length, 1);
+    assert.equal(harness.workflows[0].turnId, receipt.turnId);
+    assert.equal(harness.workflows[0].effectiveRunIntent, "respond");
+    assert.deepEqual(harness.workflows[0].options.semanticIntent, result.semantic);
+    assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+for (const completion of ["valid", "invalid", "transport-error"]) {
+test(`a late semantic ${completion} cannot adopt a replacement controller with the same Turn id`, async () => {
+  const harness = createHarness(`semantic-same-turn-replacement-${completion}`);
+  try {
+    const receipt = await harness.accept();
+    const state = harness.store.getState();
+    const replacement = new AbortController();
+    const sameClaimId = state.workspaceTurnQueue.entries[0].claim.claimId;
+    harness.store.setState({ abortController: replacement, currentTurnId: receipt.turnId });
+    if (completion === "transport-error") harness.reject();
+    else harness.resolve(0, completion === "invalid" ? null : undefined);
+    for (let flush = 0; flush < 8; flush += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    const after = harness.store.getState();
+    assert.equal(harness.workflows.length, 0);
+    assert.equal(after.abortController, replacement);
+    assert.equal(after.workspaceTurnQueue.entries[0].claim.claimId, sameClaimId, "matching Turn and claim ids do not make a different controller the old inference owner");
+    assert.equal(after.runtimeEvents.some((event) => event.type === "turn.completed" && event.turnId === receipt.turnId), false);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+}
+
+test("captured Analyze Composer ingress survives clearing its UI lock before semantic completion", async () => {
+  const harness = createHarness("captured-analyze-composer");
+  try {
+    const receipt = await harness.acceptComposer("Explain the proposed repair after inspecting the source.", "analyze");
+    assert.equal(harness.store.getState().lockedComposerIntent, null);
+    assert.equal(harness.workflows.length, 0);
+    harness.resolve(0, semanticResult("operate", ["command", "workspace_write"]));
+    await waitFor(() => harness.workflows.length > 0 || harness.store.getState().runtimeEvents.some((event) =>
+      event.type === "turn.completed" && event.turnId === receipt.turnId));
+    if (harness.workflows.length) {
+      assert.equal(harness.workflows.length, 1);
+      assert.equal(harness.workflows[0].turnId, receipt.turnId);
+      assert.equal(harness.workflows[0].effectiveRunIntent, "analyze", "captured Analyze authority cannot become Execute after the lock clears");
+      assert.equal(harness.workflows[0].effectiveCommandDirective.requiresApproval, false);
+      assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+    } else {
+      assert.equal(harness.store.getState().runtimeEvents.find((event) => event.type === "turn.completed" &&
+        event.turnId === receipt.turnId)?.resultKind, "blocked");
+    }
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("captured Execute Composer ingress still parses a quoted deletion as answer-only body semantics", async () => {
+  const harness = createHarness("captured-execute-composer");
+  try {
+    const receipt = await harness.acceptComposer("Explain this quoted example: 'delete_workspace_path(Assets/Old.cs)'. Do not run it.", "execute");
+    assert.equal(harness.store.getState().lockedComposerIntent, null);
+    const result = semanticResult("answer", [], "answer", ["command", "workspace_write", "external_interaction"]);
+    harness.resolve(0, result);
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.workflows.length, 1);
+    assert.equal(harness.workflows[0].turnId, receipt.turnId);
+    assert.equal(harness.workflows[0].effectiveRunIntent, "respond");
+    assert.deepEqual(harness.workflows[0].options.semanticIntent, result.semantic);
+    assert.equal(harness.requests.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("a global mode-choice recovery reclassifies the original restricted body without granting execution consent", async () => {
+  const harness = createHarness("global-mode-choice-semantic");
+  try {
+    const globalSessionKey = harness.makeGlobal();
+    assert.ok(globalSessionKey);
+    const originalInput = "Only inspect and explain the requested behavior; no writes or commands.";
+    harness.store.setState({ pendingRunDecision: {
+      id: "global-intent-choice", kind: "intent_confirmation", source: "preflight", originalInput,
+      suggestedIntent: "execute", reason: "Choose a mode for the current request", options: [], createdAt: Date.now(),
+    } });
+    harness.store.getState().resolvePendingRunDecision("execute");
+    await waitFor(() => harness.requests.length === 1);
+    assert.equal(harness.requests.length, 1, "a mode-choice result must parse the original body rather than skip calibration");
+    assert.equal(harness.workflows.length, 0);
+    assert.equal(JSON.parse(harness.requests[0][0][1].content).currentRequest, originalInput);
+    assert.equal(harness.store.getState().currentTurnExecutionConsent?.granted, false);
+    const result = semanticResult("answer", [], "analysis", ["workspace_write", "command", "external_interaction"]);
+    harness.resolve(0, result);
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.workflows.length, 1);
+    assert.equal(harness.workflows[0].effectiveRunIntent, "respond");
+    assert.deepEqual(harness.workflows[0].options.semanticIntent, result.semantic);
+    assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
+    assert.notEqual(harness.store.getState().currentTurnExecutionConsent?.granted, true);
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.store.getState().pendingRunDecision, null);
+    assert.equal(harness.store.getState().currentWorkspace, null);
+  } finally { harness.cleanup(); }
+});

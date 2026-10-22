@@ -1,4 +1,5 @@
 import type { RuntimeV2RunState, TurnAggregateV1 } from "./aggregate";
+import { normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command, type RuntimeV2CommandReceipt,
@@ -181,6 +182,9 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
       : {}),
     objective: {
       text: event.objective,
+      ...(event.capabilityRestrictions !== undefined ? {
+        capabilityRestrictions: normalizeTurnCapabilityRestrictions(event.capabilityRestrictions),
+      } : {}),
       constraints: [...event.constraints],
       acceptanceCriteria: [...event.acceptanceCriteria],
       ...(event.acceptanceCriterionIds

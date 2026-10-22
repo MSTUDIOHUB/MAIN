@@ -32,7 +32,7 @@ const { resolveAndApplySubmitIntentRouting } = load("src/store/submitIntentRouti
 const { resolveTurnRunIntent, getIntentPolicy, buildEffectiveTurnContract } = load("src/lib/runIntent.ts");
 const { resolveSubmitRuntimeDecision, resolveSubmitPreflightEffectAction } = load("src/lib/submit/turnSubmission.ts");
 
-function route(text, autoApproveTools = false) {
+function route(text, autoApproveTools = false, expectedIntent = "respond") {
   const effects = [];
   const input = {
     text, preferredLanguage: "en", options: {}, currentMainModeKey: "main_mode", hasWorkspace: true,
@@ -48,11 +48,16 @@ function route(text, autoApproveTools = false) {
   };
   const result = resolveAndApplySubmitIntentRouting(input);
   if (!result.handled || effects.length === 0) return result;
-  // A natural output-style hint may now receive a semantic check. A typed
-  // read-only result must retain the same conversational authority afterward.
+  // Supply an independently expected semantic fixture. This lane checks
+  // approval independence and handoff, not the model's natural-language quality.
   assert.equal(effects.length, 1);
   const action = resolveSubmitPreflightEffectAction({
-    effect: effects[0], preflight: { intent: effects[0].resolution.intent, confidence: 0.98 },
+    effect: effects[0], preflight: {
+      intent: expectedIntent, confidence: 0.98,
+      semantic: { objective: text, workType: expectedIntent === "execute" ? "implement" : expectedIntent === "plan" ? "plan" : "answer",
+        answerFormat: "answer", requiredCapabilities: expectedIntent === "execute" ? ["workspace_read", "workspace_write"] : [], forbiddenCapabilities: [] },
+      commandDirective: { kind: expectedIntent === "execute" ? "file_modify" : "none", source: "preflight", requiresApproval: expectedIntent === "execute" },
+    },
     latestInput: text, latestMainModeKey: "main_mode", isOriginSessionActive: true, isOriginOwnerCurrent: true,
   });
   assert.equal(action.kind, "resume");
@@ -129,7 +134,7 @@ for (const text of [
 ]) {
   test(`explicit operation retains Execute and approval independence: ${text}`, () => {
     for (const enabled of [false, true]) {
-      const result = route(text, enabled);
+      const result = route(text, enabled, "execute");
       assert.equal(result.handled, false);
       assert.equal(result.effectiveRunIntent, "execute");
       const contract = buildEffectiveTurnContract({ conversationIntent: result.effectiveRunIntent, commandDirective: result.effectiveCommandDirective });
@@ -140,7 +145,7 @@ for (const text of [
 
 test("explicit Plan remains Plan independently of approval preferences", () => {
   for (const enabled of [false, true]) {
-    assert.equal(route("Give me a plan first, then implement the new feature.", enabled).effectiveRunIntent, "plan");
+    assert.equal(route("Give me a plan first, then implement the new feature.", enabled, "plan").effectiveRunIntent, "plan");
   }
 });
 

@@ -6,6 +6,14 @@ import { createRequire } from "node:module";
 import ts from "typescript";
 
 function createHarness(candidate) {
+  const intent = candidate?.intent;
+  const capabilities = intent === "execute" ? ["workspace_read", "command"] : intent === "analyze" ? ["workspace_read"] : [];
+  const semanticResponse = candidate && {
+    confidence: candidate.confidence, needsUserChoice: candidate.needsUserChoice === true,
+    title: candidate.title, question: candidate.question ?? (candidate.needsUserChoice ? "Please clarify the requested work." : undefined),
+    semantic: { objective: "Handle the requested task", workType: intent === "execute" ? "operate" : intent === "analyze" ? "investigate" : intent === "plan" ? "plan" : "answer",
+      answerFormat: "answer", requiredCapabilities: capabilities, forbiddenCapabilities: [] },
+  };
   const cache = new Map();
   const requests = [];
   function load(file) {
@@ -18,7 +26,7 @@ function createHarness(candidate) {
       if (name === "./streaming") return {
         streamChatCompletion: async (...args) => {
           requests.push(args);
-          return { content: JSON.stringify(candidate) };
+          return { content: JSON.stringify(semanticResponse), finishReason: "stop", toolCalls: [] };
         },
       };
       if (name.startsWith(".")) {
@@ -123,12 +131,12 @@ for (const text of [
 }
 
 for (const text of ["请修改 src/Settings.cs 并把属性改成只读。", "Make the field read-only.", "Please modify src/Settings.cs to make the field read-only."]) {
-  test(`requesting a read-only property still authorizes the requested source change: ${text}`, () => {
+  test(`property wording is interpreted by semantics: ${text}`, async () => {
     const harness = createHarness(operation);
-    const result = harness.route(text);
-    assert.equal(result.handled, false);
-    assert.equal(result.effectiveRunIntent, "execute");
-    assert.equal(harness.effects.length, 0);
+    assert.equal(harness.route(text).handled, true);
+    await harness.complete();
+    assert.equal(harness.resumes[0].options.resolvedIntent, "execute");
+    assert.equal(harness.requests.length, 1);
   });
 }
 
@@ -149,24 +157,30 @@ test("semantic calibration returns explanation requests to respond without grant
   assert.equal(harness.resumes[0].options.commandDirective.requiresApproval, false);
 });
 
-test("uncertain workspace calibration stays inside the original safe Turn instead of opening a global decision", async () => {
-  for (const candidate of [{ ...operation, needsUserChoice: true }, { ...operation, confidence: 0.6 }, null]) {
+test("missing or ambiguous semantic results cannot resume a lexical fallback", async () => {
+  for (const [candidate, kind] of [[{ ...operation, needsUserChoice: true }, "blocked"], [null, "error"]]) {
     const harness = createHarness(candidate);
     assert.equal(harness.route("Inspect the current service.").handled, true);
     const action = await harness.complete();
-    assert.equal(action.kind, "resume");
-    assert.equal(harness.resumes[0].options.resolvedIntent, "analyze");
+    assert.equal(action.kind, "conclude_without_execution");
+    assert.equal(action.resultKind, kind);
+    assert.equal(harness.resumes.length, 0);
     assert.equal(harness.pending.length, 0);
   }
 });
 
-for (const text of [
-  "Hello!", "Explain how docker ps works.", "请解释这个命令的含义。", "npm test",
-]) {
-  test(`clear workspace requests avoid semantic preflight: ${text}`, () => {
+test("valid low confidence semantics retain their capability decision", async () => {
+  const harness = createHarness({ ...operation, confidence: 0.6 });
+  harness.route("Hello, inspect the service as requested.");
+  await harness.complete();
+  assert.equal(harness.resumes[0].options.resolvedIntent, "execute");
+});
+
+for (const text of ["Hello!", "Explain how docker ps works.", "请解释这个命令的含义。", "npm test"]) {
+  test(`natural input has no lexical bypass: ${text}`, () => {
     const harness = createHarness(operation);
-    assert.equal(harness.route(text).handled, false);
-    assert.equal(harness.effects.length, 0);
+    assert.equal(harness.route(text).handled, true);
+    assert.equal(harness.effects.length, 1);
   });
 }
 
@@ -187,16 +201,18 @@ for (const text of [
   });
 }
 
-test("explicit composer and slash intents bypass semantic calibration", () => {
+test("explicit modes bound the semantic request; other products keep their router", () => {
   for (const overrides of [
     { lockedComposerIntent: "analyze" },
     { text: "/analyze inspect the local service", mainIntentShortcut: { intent: "analyze", command: "/analyze", rest: "inspect the local service" } },
-    { currentMainModeKey: "image_studio" },
   ]) {
     const harness = createHarness(operation);
-    assert.equal(harness.route("Inspect the current local service.", overrides).handled, false);
-    assert.equal(harness.effects.length, 0);
+    assert.equal(harness.route("Inspect the current local service.", overrides).handled, true);
+    assert.equal(harness.effects[0].request.explicitIntent, "analyze");
   }
+  const harness = createHarness(operation);
+  assert.equal(harness.route("Inspect the current local service.", { currentMainModeKey: "image_studio" }).handled, false);
+  assert.equal(harness.effects.length, 0);
 });
 
 test("late workspace preflight cannot resume a changed draft or inactive origin", async () => {
@@ -259,4 +275,20 @@ test("a pending cancellation fences workspace preflight before its terminal proj
   assert.equal(action.kind, "skip_inactive_session");
   assert.equal(harness.pending.length, 0);
   assert.equal(harness.resumes.length, 0);
+});
+
+test("a global slash submission compares the unchanged raw composer identity while interpreting its body", async () => {
+  const original = "/analyze Inspect README.md";
+  for (const [latest, expected] of [[original, "resume"], ["/plan A different request", "stale_discard"]]) {
+    const harness = createHarness({ ...operation, intent: "analyze" });
+    assert.equal(harness.route("Inspect README.md", {
+      submittedText: original, hasWorkspace: false,
+      mainIntentShortcut: { intent: "analyze", command: "/analyze", rest: "Inspect README.md" },
+      lockedComposerIntent: "analyze",
+    }).handled, true);
+    const action = await harness.complete({ input: latest, lockedComposerIntent: "analyze" });
+    assert.equal(action.kind, expected);
+    assert.equal(harness.effects[0].request.input, "Inspect README.md");
+    assert.equal(harness.effects[0].originalComposerInput, original);
+  }
 });

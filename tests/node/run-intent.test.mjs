@@ -811,9 +811,9 @@ test("composer suggestion ignore and locked intent do not override explicit user
   );
 });
 
-test("ordinary low-risk respond requests should not block on preflight", () => {
+test("ordinary natural requests use the shared semantic preflight", () => {
   const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
-  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), false);
+  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), true);
 });
 
 test("ambiguous chat-versus-execute requests use blocking preflight", () => {
@@ -841,7 +841,7 @@ test("low-confidence non-respond requests can still opt into blocking preflight"
   );
 });
 
-test("output-style intents do not block on preflight", () => {
+test("response style cannot bypass semantic preflight", () => {
   assert.equal(
     shouldUseBlockingIntentPreflight(
       {
@@ -853,8 +853,18 @@ test("output-style intents do not block on preflight", () => {
       },
       "main_mode",
     ),
-    false,
+    true,
   );
+});
+
+test("lexical confidence and suggested controls never bypass natural semantic calibration", () => {
+  for (const intent of ["respond", "analyze", "report", "execute", "plan"]) {
+    for (const hasWorkspace of [false, true]) {
+      const hint = { intent, reason: "lexical hint", confidence: 1, riskLevel: "low", bypassMainRouter: true, needsDecision: true };
+      assert.equal(shouldUseBlockingIntentPreflight(hint, "main_mode", "full natural request", hasWorkspace), true);
+      assert.equal(shouldUseBlockingIntentPreflight(hint, "plan_mode", "full natural request", hasWorkspace), false);
+    }
+  }
 });
 
 test("high-risk multi-step implementation suggests planning first", () => {
@@ -956,26 +966,6 @@ test("continuation resumes an unfinished execute turn", () => {
     }),
     true,
   );
-});
-
-test("store asks before executing when preflight upgrades natural chat to operations", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
-  const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
-  const preflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
-
-  assert.match(source, /startBlockingPreflight: \(blockingPreflightEffect\) =>/);
-  assert.match(submitIntentRoutingSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
-  assert.match(source, /void startSubmitBlockingPreflightEffect\(\{/);
-  assert.match(preflightExecutorSource, /return executeSubmitBlockingPreflight\(\{/);
-  assert.match(preflightExecutorSource, /const action = resolveSubmitPreflightEffectAction/);
-  assert.match(preflightExecutorSource, /action\.kind === "set_pending_decision"/);
-  assert.match(turnSubmissionSource, /const preflightDecision = resolveSubmitPreflightResultDecision/);
-  assert.match(turnSubmissionSource, /preflightDecision\.kind === "ask_execution_confirmation"/);
-  assert.match(turnSubmissionSource, /pendingRunDecision: preflightDecision\.pendingRunDecision!/);
-  assert.match(turnSubmissionSource, /const shouldAskForPreflightExecutionDecision =/);
-  assert.match(turnSubmissionSource, /localWasNatural[\s\S]*preflightSuggestsOperation[\s\S]*pendingRunDecision/);
-  assert.match(turnSubmissionSource, /decisionOptions: \["execute", "respond", "plan"\]/);
 });
 
 test("tool auto-approval grants action consent without deciding the requested intent", () => {

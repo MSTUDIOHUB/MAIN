@@ -875,6 +875,47 @@ test("production Goal supervisor runs a finite Execute slice and closes one oute
   );
 });
 
+test("cold Goal supervisor gives new Execute slices the durable restrictions rather than mutable context", async () => {
+  const goal = goalState.createGoalDefinition({ objective: "Inspect only", definitionOfDone: ["Evidence retained"], sessionKey: "session-a", ownerTurnId: "goal-owner-turn" });
+  const progress = goalState.createGoalProgress(goal.id, ".MAIN/goals/progress.md");
+  const legacyRuntime = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+  const turn = { workspaceKey: "/fixture", sessionKey: "session-a", sessionEpoch: "epoch-a", clientSubmissionId: "goal-submission", turnId: "goal-owner-turn" };
+  const run = { sessionKey: "session-a", sessionEpoch: "epoch-a", turnId: turn.turnId, runId: "goal-run-a", parentRunId: null, attemptId: "goal-run-a" };
+  let checkpoint = null;
+  let ordinal = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: { async append(input) {
+      const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+      if (result.checkpoint) checkpoint = result.checkpoint;
+      return result;
+    } }, projection: { async publish() {} }, clockId: { now: () => goal.createdAt, nextId: () => `event-${++ordinal}` },
+  });
+  await controller.admit({ turn, run, strategy: "goal", objective: goal.objective, capabilityRestrictions: ["workspace_write", "command"], initialPhase: "acting" });
+  const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(checkpoint)));
+  const state = {
+    conversationTurns: [{ id: turn.turnId, clientSubmissionId: turn.clientSubmissionId, runtimeEngineVersion: "v2", userPrompt: goal.objective, status: "executing", blockIds: [] }],
+    activeGoal: goal, goalProgress: progress, goalRuntime: legacyRuntime,
+    planLifecycle: { sessionKey: "session-a", sessionEpoch: "epoch-a" },
+    runtimeV2Checkpoints: { [turn.turnId]: restored },
+  };
+  let sliceRestrictions;
+  const production = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/goalProductionRunner.ts"), new Map([
+    ["../../lib/runtime-v2", runtime],
+    ["./checkpointPort", { getRuntimeV2Checkpoint: () => restored, createRuntimeV2CheckpointPort: () => ({}) }],
+    ["./projectionPort", { createRuntimeV2ProjectionPort: () => ({ async publish() {} }) }],
+    ["./goalSliceProductionPort", { createRuntimeV2GoalProductionSlicePort(input) { sliceRestrictions = input.capabilityRestrictions; throw new Error("SLICE_BOUNDARY_CAPTURED"); } }],
+  ]));
+  await assert.rejects(production.runSubmitRuntimeV2Goal({
+    get: () => state, set() {}, context: {
+      turnId: turn.turnId, uiDisplayTurnId: turn.turnId, runWorkspace: "/fixture", runSessionKey: "session-a", runSessionId: 1, runScopeKey: "/fixture", phaseLanguage: "en",
+      effectiveRunIntent: "goal", runtimeRunIntent: "goal", capabilityRestrictions: [], harnessRunId: run.runId,
+      goalCreationAuthorization: { kind: "goal_creation_authorization", intent: "goal", source: "visible_goal_composer_capsule" },
+      abortCtrl: new AbortController(), turnInputContextSignals: { subagentPreference: "forbidden" },
+    }, goalCheckpoint: inMemoryCheckpointPort().port, now: () => goal.createdAt + 1,
+  }), /SLICE_BOUNDARY_CAPTURED/);
+  assert.deepEqual(sliceRestrictions, ["workspace_write", "command"]);
+});
+
 test("Goal v2 source boundary excludes legacy executors, Store/UI and prose lifecycle rules", () => {
   const core = fs.readFileSync(
     path.join(workspaceRoot, "src/lib/runtime-v2/goalSaga.ts"),

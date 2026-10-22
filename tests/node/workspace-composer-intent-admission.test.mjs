@@ -123,9 +123,7 @@ test("production Composer ingress passes immutable snapshots to the durable work
     source: "composer",
     dispatchHints: {
       subagentPreference: "preferred",
-      resolvedIntent: "plan",
-      runtimeIntentOverride: "plan",
-      skipIntentResolution: true,
+      explicitIntent: "plan",
       turnTitle: "Inspect the runtime before changing it",
       intentSummary: "Plan: Inspect the runtime before changing it",
     },
@@ -162,9 +160,9 @@ test("a locked Composer intent becomes an immutable dispatch decision", () => {
     },
   });
 
-  assert.equal(hints.resolvedIntent, "plan");
-  assert.equal(hints.runtimeIntentOverride, "plan");
-  assert.equal(hints.skipIntentResolution, true);
+  assert.equal(hints.explicitIntent, "plan");
+  assert.equal(hints.runtimeIntentOverride, undefined);
+  assert.equal(hints.skipIntentResolution, undefined);
   assert.equal(hints.turnTitle, "Inspect the runtime before changing it");
   assert.match(hints.intentSummary, /^Plan:/);
 });
@@ -176,10 +174,10 @@ test("Chinese and English Plan shortcuts converge on the same structured intent"
     language: "zh",
   });
 
-  assert.equal(english.resolvedIntent, "plan");
-  assert.equal(chinese.resolvedIntent, "plan");
-  assert.equal(english.skipIntentResolution, true);
-  assert.equal(chinese.skipIntentResolution, true);
+  assert.equal(english.explicitIntent, "plan");
+  assert.equal(chinese.explicitIntent, "plan");
+  assert.equal(english.skipIntentResolution, undefined);
+  assert.equal(chinese.skipIntentResolution, undefined);
   assert.doesNotMatch(english.turnTitle, /^\/plan/i);
   assert.doesNotMatch(chinese.turnTitle, /^\/计划/);
 });
@@ -226,7 +224,7 @@ test("MAIN mode preserves a compatible locked output intent without phrase heuri
       mainModeKey: "main_mode",
       lockedComposerIntent: "report",
     },
-  }).resolvedIntent, "report");
+  }).explicitIntent, "report");
 
   assert.equal(build({
     text: "/plan inspect the game runtime",
@@ -234,5 +232,5 @@ test("MAIN mode preserves a compatible locked output intent without phrase heuri
       mainModeKey: "main_mode",
       lockedComposerIntent: null,
     },
-  }).resolvedIntent, "plan");
+  }).explicitIntent, "plan");
 });

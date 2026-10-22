@@ -207,3 +207,157 @@ test("external local reads still require the exact normalized path grant", async
   assert.equal(result.allowed, true);
   assert.equal(result.authorization.allowExternalLocalRead, true);
 });
+
+test("canonical Turn capability restrictions survive checkpoint replay", async () => {
+  const runtime = loadTs(path.join(root, "src/lib/runtime-v2/index.ts"));
+  let checkpoint = null;
+  let sequence = 0;
+  const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" };
+  const run = { sessionKey: "/fixture:1", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" };
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: { append: async (input) => {
+      const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+      if (result.checkpoint) checkpoint = result.checkpoint;
+      return result;
+    } },
+    projection: { publish: async () => {} },
+    clockId: { now: () => ++sequence, nextId: (scope) => `${scope}-${++sequence}` },
+  });
+  await controller.admit({ turn, run, strategy: "execute", objective: "Inspect and report without writes or commands.", capabilityRestrictions: ["workspace_write", "command"], initialPhase: "observing" });
+  assert.deepEqual(controller.snapshot().aggregate.objective.capabilityRestrictions, ["workspace_write", "command"]);
+  assert.deepEqual(checkpoint.events[0].capabilityRestrictions, ["workspace_write", "command"]);
+  const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(checkpoint)));
+  assert.deepEqual(restored.aggregate.objective.capabilityRestrictions, ["workspace_write", "command"]);
+});
+
+test("current no-write contract cannot be overridden by task consent, shell allow or auto review", async () => {
+  const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true, autoApproveToolScopes: ["shell"] });
+  f.ports.context.capabilityRestrictions = ["workspace_write"];
+  let inspections = 0;
+  ipc.shellPermissionPreflight = async () => { inspections += 1; return f.preflight; };
+  const decision = await authorizeToolForCurrentTurn(f.ports, "run_command", f.request.args);
+  assert.equal(decision.allowed, false, "an opaque command can write and cannot bypass current no-write authority");
+  assert.equal(decision.approvalRequired, undefined, "approval cannot undo the current explicit restriction");
+  assert.match(decision.reason, /workspace_write/);
+  assert.equal(inspections, 0, "the restriction is enforced before native shell approval");
+});
+
+test("current no-command contract filters the actual provider surface and rejects a forged call", async () => {
+  const { providerToolDefinitionsForCommand } = loadTs(path.join(root, "src/store/runtimeV2/executionAuthorizationContext.ts"));
+  const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true });
+  f.ports.context.capabilityRestrictions = ["command"];
+  const definitions = providerToolDefinitionsForCommand(f.ports, { ...f.request.command, kind: "request_model", payload: { mode: "execute" } });
+  assert.equal(definitions.some((tool) => tool.function.name === "run_command"), false);
+  assert.equal(definitions.some((tool) => tool.function.name === "read_file"), true, "unrelated safe workspace reads remain available");
+  const decision = await authorizeToolForCurrentTurn(f.ports, "run_command", f.request.args);
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.approvalRequired, undefined);
+  assert.match(decision.reason, /command/);
+});
+
+async function restrictedCheckpoint(restrictions) {
+  const runtime = loadTs(path.join(root, "src/lib/runtime-v2/index.ts"));
+  let checkpoint = null;
+  let sequence = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: { append: async (input) => {
+      const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+      if (result.checkpoint) checkpoint = result.checkpoint;
+      return result;
+    } },
+    projection: { publish: async () => {} },
+    clockId: { now: () => ++sequence, nextId: (scope) => `${scope}-${++sequence}` },
+  });
+  await controller.admit({
+    turn: { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" },
+    run: { sessionKey: "/fixture:1", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" },
+    strategy: "execute", objective: "Respect this Turn's explicit capability restrictions.",
+    capabilityRestrictions: restrictions, initialPhase: "observing",
+  });
+  return JSON.parse(JSON.stringify(checkpoint));
+}
+
+test("ExecutionToolPort enforces restored restrictions before approvals, execution and cached receipt replay", async () => {
+  const { createRuntimeV2ToolPort } = loadTs(path.join(root, "src/store/runtimeV2/executionToolPort.ts"));
+  const { providerToolDefinitionsForCommand } = loadTs(path.join(root, "src/store/runtimeV2/executionAuthorizationContext.ts"));
+  for (const [restriction, toolName, args] of [
+    ["workspace_write", "run_command", { command: "example --inspect", cwd: "." }],
+    ["workspace_write", "write_file", { path: "result.txt", content: "forbidden" }],
+    ["command", "run_command", { command: "example --inspect", cwd: "." }],
+    ["workspace_read", "read_file", { path: "private.txt" }],
+  ]) {
+    const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true, autoApproveToolScopes: ["shell", "workspace_write"] });
+    f.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint([restriction]) };
+    f.ports.context.capabilityRestrictions = [];
+    f.ports.live.coveredReadToolResults.set("restricted-call", "previously approved cached source");
+    f.ports.live.messages.push({ role: "assistant", content: "", tool_calls: [{ id: "restricted-call", type: "function", function: { name: toolName, arguments: JSON.stringify(args) } }] });
+    let inspections = 0;
+    ipc.shellPermissionPreflight = async () => { inspections++; return f.preflight; };
+    const definitions = providerToolDefinitionsForCommand(f.ports, { ...f.request.command, kind: "request_model", payload: { mode: "execute" } });
+    const event = await createRuntimeV2ToolPort(f.ports).execute({
+      command: { ...f.request.command, payload: { toolName, arguments: args, toolCallId: "restricted-call" } }, signal: f.abort.signal,
+    });
+    assert.equal(event.type, "tool.completed");
+    assert.equal(event.status, "blocked");
+    assert.equal(event.failureKind, "not_authorized");
+    assert.equal(event.failureReasonCode, "turn_capability_restricted");
+    assert.equal(definitions.some((tool) => tool.function.name === toolName), false, `${restriction} is absent from the actual restored provider surface`);
+    assert.equal(event.receiptOrigin, undefined, "an old source receipt cannot become a successful restricted read");
+    assert.deepEqual(event.evidence, []);
+    assert.match(f.ports.live.messages.at(-1).content, new RegExp(restriction));
+    assert.equal(inspections, 0, "approval cannot override the durable restriction");
+    assert.equal(f.state.activeActionRequest, undefined);
+  }
+});
+
+test("child advertised tools and forged calls inherit the parent's restored capability restrictions", async () => {
+  const childProvider = loadTs(path.join(root, "src/store/runtimeV2/executionSubagentProvider.ts"));
+  const executor = loadTs(path.join(root, "src/lib/toolExecutor.ts"));
+  const { startRuntimeV2Child } = loadTs(path.join(root, "src/store/runtimeV2/executionSubagentRunner.ts"));
+  const originalRequest = childProvider.requestRuntimeV2ChildStep;
+  const originalExecute = executor.executeTool;
+  let executed = 0;
+  const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true, autoApproveToolScopes: ["shell"] });
+  f.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint(["workspace_read", "command"]) };
+  f.ports.context.capabilityRestrictions = [];
+  executor.executeTool = async () => { executed++; throw new Error("Restricted child action reached execution"); };
+  try {
+    for (const call of [
+      { id: "forged-read", name: "read_file", arguments: { path: "private.txt" } },
+      { id: "forged-command", name: "run_command", arguments: { command: "npm test", cwd: "." } },
+    ]) {
+    const requests = [];
+    childProvider.requestRuntimeV2ChildStep = async (input) => {
+      requests.push({ tools: input.tools.map((tool) => tool.function.name), messages: structuredClone(input.messages) });
+      return requests.length === 1
+        ? { toolCalls: [call], diagnostics: [], visibleText: "" }
+        : { toolCalls: [], diagnostics: [{ code: "fixture_done" }], visibleText: "" };
+    };
+    await startRuntimeV2Child(f.ports, {
+      id: "child-job", parentRunId: "run", scopeKey: "scope", taskKind: "validate", accessMode: "read", allowedPaths: ["."], objective: "Validate without the forbidden capabilities.",
+      run: { ...f.request.command.run, runId: "child-run", parentRunId: "run" },
+    }, f.abort.signal);
+    assert.equal(requests.length, 2);
+    assert.equal(executed, 0);
+    assert.equal(requests[0].tools.includes("run_command"), false);
+    assert.equal(requests[0].tools.includes("read_file"), false);
+    assert.deepEqual(requests[1].messages.filter((message) => message.role === "tool").map((message) => message.tool_call_id), [call.id]);
+    for (const message of requests[1].messages.filter((message) => message.role === "tool")) assert.match(message.content, /TOOL_BLOCKED/);
+    }
+  } finally {
+    childProvider.requestRuntimeV2ChildStep = originalRequest;
+    executor.executeTool = originalExecute;
+  }
+});
+
+test("a capability-blocked validator has no attempted validation evidence", async () => {
+  const { createRuntimeV2ToolPort } = loadTs(path.join(root, "src/store/runtimeV2/executionToolPort.ts"));
+  const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true });
+  f.ports.context.capabilityRestrictions = ["command"];
+  const event = await createRuntimeV2ToolPort(f.ports).execute({ command: { ...f.request.command, kind: "execute_validation" }, signal: f.abort.signal });
+  assert.equal(event.type, "validation.completed");
+  assert.equal(event.passed, false);
+  assert.equal(event.failureKind, "not_executed");
+  assert.equal(event.failureReasonCode, "turn_capability_restricted");
+  assert.deepEqual(event.evidence, []);
+});

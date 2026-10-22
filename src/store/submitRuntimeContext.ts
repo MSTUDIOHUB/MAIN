@@ -25,6 +25,8 @@ export interface CreateSubmitRuntimeContextInput {
   phaseLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
+  capabilityRestrictions?: readonly import("../lib/turnCapabilities").TurnCapability[];
+  requiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveCommandDirective: CommandDirective | null;
@@ -66,6 +68,8 @@ export function createSubmitRuntimeContext(
     phaseLanguage: input.phaseLanguage,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
+    capabilityRestrictions: input.capabilityRestrictions,
+    requiredCapabilities: input.requiredCapabilities,
     goalCreationAuthorization: input.goalCreationAuthorization,
     goalContinuationAuthorization: input.goalContinuationAuthorization,
     effectiveCommandDirective: input.effectiveCommandDirective,

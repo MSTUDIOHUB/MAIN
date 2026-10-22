@@ -53,6 +53,7 @@ import {
 } from "./executionValidationCorrection";
 import {
   authorizationFor,
+  runtimeV2ToolCapabilityRestriction,
   isRuntimeV2EffectRisk,
   isRuntimeV2ObservationRisk,
   runtimeV2CatalogToolSource,
@@ -388,6 +389,12 @@ export async function authorizeToolForCurrentTurn(
     };
   }
   const exposedName = catalogResolution.entry.exposedName;
+  const restriction = runtimeV2ToolCapabilityRestriction(input, exposedName, args);
+  if (restriction) return {
+    allowed: false,
+    reason: `TURN_CAPABILITY_RESTRICTED: ${restriction}`,
+    allowExternalLocalRead: false,
+  };
   const localFileReadPath = getLocalFileReadPathForToolCall(
     exposedName,
     args,

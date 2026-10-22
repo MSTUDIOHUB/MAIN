@@ -208,6 +208,7 @@ export async function runSubmitRuntimeV2Execute(
         run: identity.run,
         strategy: "execute",
         objective: admission.objective,
+        capabilityRestrictions: admission.capabilityRestrictions,
         constraints: admission.constraints,
         acceptanceCriteria: admission.acceptanceCriteria.map(
           (criterion) => criterion.text,
@@ -219,7 +220,7 @@ export async function runSubmitRuntimeV2Execute(
           runtimeV2ExecuteAcceptanceEvidenceRequirements(
             admission.acceptanceCriteria,
           ),
-        initialPhase: "preparing",
+        initialPhase: admission.capabilityRestrictions?.includes("workspace_read") ? "observing" : "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;

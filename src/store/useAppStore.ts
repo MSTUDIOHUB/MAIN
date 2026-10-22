@@ -293,6 +293,7 @@ import {
   resolveWorkspaceAwareWorkflowMode,
   type ExecutionConsentPolicy,
   type CommandDirective,
+  type SemanticTaskIntent,
   type MainIntentShortcut,
   type PendingRunDecision,
   type PendingRunDecisionChoice,
@@ -1667,6 +1668,8 @@ export interface AppState {
       reuseCurrentTurn?: boolean;
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
+      explicitIntent?: ResolvedUserIntent;
+      semanticIntent?: SemanticTaskIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -9211,18 +9214,14 @@ export const useAppStore = create<AppState>()(
       systemLanguage: state.config.language === "en" ? "en" : "zh",
       fallbackLanguage: state.config.language === "en" ? "en" : "zh",
     });
-    const approvedExecutionIntent = intentChoice === "execute" ? intentChoice : null;
     set({ pendingRunDecision: null });
     scheduleRuntimeTask(() => {
       get().sendMessage(pending.originalInput, originalImages, {
-        resolvedIntent: intentChoice,
-        ...(approvedExecutionIntent
-          ? {
-              runtimeIntentOverride: approvedExecutionIntent,
-              executionConsentGranted: true,
-            }
-          : {}),
-        skipIntentResolution: true,
+        // A mode choice constrains task interpretation. It is not approval of
+        // a concrete tool, and must not erase restrictions in the original body.
+        ...(intentChoice === "image_studio"
+          ? { resolvedIntent: intentChoice, skipIntentResolution: true }
+          : { explicitIntent: intentChoice }),
         intentSummary: buildRunIntentSummary({
           input: pending.originalInput,
           intent: intentChoice,
@@ -16484,6 +16483,9 @@ export const useAppStore = create<AppState>()(
         workspaceInstructionClaim: exactClaim,
         skipAutoPlanHydration: true,
         ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
+        ...(normalizeWorkspaceInstructionIntentHint(hints.explicitIntent)
+          ? { explicitIntent: normalizeWorkspaceInstructionIntentHint(hints.explicitIntent)! }
+          : {}),
         ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
         ...(hintedSubagentPreference !== undefined
           ? { subagentPreferenceOverride: hintedSubagentPreference }
@@ -17057,6 +17059,8 @@ export const useAppStore = create<AppState>()(
     reuseCurrentTurn?: boolean;
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
+    explicitIntent?: ResolvedUserIntent;
+    semanticIntent?: SemanticTaskIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -17946,6 +17950,7 @@ export const useAppStore = create<AppState>()(
     });
     const intentRouting = resolveAndApplySubmitIntentRouting({
       text,
+      submittedText: submitPipelineDecision.originalText,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       images,
       options,
@@ -18066,6 +18071,51 @@ export const useAppStore = create<AppState>()(
           setState: set,
           isSessionRuntimeActive,
           applyPreRunSessionPatch,
+          concludeWithoutExecution: (action) => {
+            const originalOptions = blockingPreflightEffect.originalOptions;
+            const claim = originalOptions?.workspaceInstructionClaim;
+            if (!claim) return;
+            let concluded = false;
+            set((current) => {
+              if (!isSessionRuntimeActive(current, claim.sessionKey) ||
+                !isWorkspaceInstructionDispatchClaimCurrent(current.workspaceTurnQueue, originalOptions) ||
+                getPendingSessionCancellation(claim.sessionKey)) return {};
+              const queue = current.workspaceTurnQueue!;
+              const head = queue.entries[0];
+              const timestampMs = Date.now();
+              const removed = reduceWorkspaceTurnQueue(queue, {
+                type: "remove", expectedVersion: queue.version, at: timestampMs,
+                claimId: claim.claimId, sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+                terminalOwner: {
+                  sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+                  turnId: claim.turnId, receiptId: claim.receiptId,
+                  clientSubmissionId: claim.clientSubmissionId,
+                  instructionEnvelopeIdentity: claim.instructionEnvelopeIdentity,
+                },
+              });
+              if (removed.disposition !== "applied") return {};
+              const conclusion = concludeWorkspaceInstructionEntry({
+                entry: head, sessionKey: claim.sessionKey,
+                taskFlow: current.taskFlow, conversationTurns: current.conversationTurns,
+                runtimeEvents: current.runtimeEvents,
+                resultKind: action.resultKind, summary: action.summary, timestampMs,
+                language: current.config.language === "en" ? "en" : "zh",
+                reservedTaskBlockIds: queue.entries.map((entry) => entry.receipt.userBlockId),
+              });
+              concluded = true;
+              return {
+                workspaceTurnQueue: removed.state,
+                taskFlow: conclusion.taskFlow, conversationTurns: conclusion.conversationTurns,
+                runtimeEvents: conclusion.runtimeEvents,
+                transcriptLoadedTurns: Math.max(current.transcriptLoadedTurns, conclusion.conversationTurns.length),
+                transcriptTotalTurns: Math.max(current.transcriptTotalTurns, conclusion.conversationTurns.length),
+              };
+            });
+            if (concluded) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            }
+          },
           closeTurnAsCanceled: (turnId) => {
             get().closeTurnAsCanceled(turnId, { reason: "intent_preflight_superseded" });
           },
@@ -18484,6 +18534,7 @@ export const useAppStore = create<AppState>()(
       currentMainModeKey,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
+      semanticIntent: options?.semanticIntent,
       runtimeRunIntent,
       goalCreationAuthorization,
       goalContinuationAuthorization,

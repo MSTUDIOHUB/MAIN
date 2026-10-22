@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
 import {
   buildToolCapabilityRegistry,
   getToolRiskLevelForCall,
@@ -277,6 +278,26 @@ export function authorizationFor(
   return input.live.authorization;
 }
 
+export function runtimeV2ToolCapabilityRestriction(
+  input: RuntimeV2ExecutionPortsInput, name: string, args: Record<string, unknown> = {},
+) {
+  const authorization = authorizationFor(input);
+  return runtimeV2ForbiddenToolCapability({
+    restrictions: runtimeV2CapabilityRestrictions(input), toolName: name,
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, {
+      workspace: input.context.runWorkspace,
+      approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths,
+    }),
+    source: runtimeV2CatalogToolSource(authorization, name),
+  });
+}
+
+export function filterRuntimeV2CapabilityRestrictedTools(
+  input: RuntimeV2ExecutionPortsInput, tools: readonly ToolDefinition[],
+): ToolDefinition[] {
+  return tools.filter((tool) => !runtimeV2ToolCapabilityRestriction(input, tool.function.name));
+}
+
 export function providerToolDefinitionsForCommand(
   input: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
@@ -285,7 +306,7 @@ export function providerToolDefinitionsForCommand(
   if (isReadOnlyContext(input)) {
     input.live.latestProviderActionWindow = null;
     const authorization = authorizationFor(input);
-    const available = runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || "");
+    const available = filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || ""));
     return selectRuntimeV2ProviderToolDefinitions({ ports: input, command, available, capabilityRegistry: authorization.capabilityRegistry });
   }
   const effects = deriveRuntimeV2ProviderEffectFacts(aggregate);
@@ -327,10 +348,10 @@ export function providerToolDefinitionsForCommand(
   return selectRuntimeV2ProviderToolDefinitions({
     ports: input,
     command,
-    available: runtimeV2ProviderToolDefinitionsForPrompt(
+    available: filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(
       authorization,
       aggregate?.objective?.text || "",
-    ),
+    )),
     capabilityRegistry: authorization.capabilityRegistry,
     actionWindow,
     correctiveSourceTargets,

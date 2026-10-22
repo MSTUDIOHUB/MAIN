@@ -46,6 +46,7 @@ export interface SubmitBlockingPreflightExecutorInput<
   ) => void;
   logStoreEvent: (event: string, data: Record<string, unknown>) => void;
   claimResume?: () => boolean;
+  concludeWithoutExecution?: (action: Extract<SubmitPreflightEffectAction<TOptions>, { kind: "conclude_without_execution" }>) => void;
 }
 
 export async function executeSubmitBlockingPreflight<
@@ -54,7 +55,7 @@ export async function executeSubmitBlockingPreflight<
 >(
   input: SubmitBlockingPreflightExecutorInput<TConfig, TOptions>,
 ): Promise<SubmitPreflightEffectAction<TOptions>> {
-  const preflight = await input.runIntentPreflight(input.effect.request);
+  const preflight = await input.runIntentPreflight(input.effect.request).catch(() => null);
   const latestSnapshot = input.getLatestSnapshot(input.effect);
   const action = resolveSubmitPreflightEffectAction({
     effect: input.effect,
@@ -90,6 +91,18 @@ export async function executeSubmitBlockingPreflight<
     return action;
   }
 
+  if (action.kind === "conclude_without_execution") {
+    if (input.claimResume && !input.claimResume()) {
+      return { kind: "skip_inactive_session", phase: "intent_preflight", sessionKey: input.effect.sendOriginSessionKey || "" };
+    }
+    input.logStoreEvent("intent_preflight_concluded_without_execution", {
+      resultKind: action.resultKind,
+      turnId: input.effect.originalOptions?.workspaceInstructionClaim?.turnId ?? null,
+    });
+    input.concludeWithoutExecution?.(action);
+    return action;
+  }
+
   if (input.claimResume && !input.claimResume()) {
     return { kind: "skip_inactive_session", phase: "intent_preflight", sessionKey: input.effect.sendOriginSessionKey || "" };
   }
@@ -117,6 +130,7 @@ export interface StartSubmitBlockingPreflightEffectInput<
   ) => boolean;
   onWorkspaceResumeAccepted?: (options: TOptions & SubmitPreflightResumeOptions) => boolean;
   onWorkspaceResumeRejected?: (options: TOptions & SubmitPreflightResumeOptions) => void;
+  concludeWithoutExecution?: (action: Extract<SubmitPreflightEffectAction<TOptions>, { kind: "conclude_without_execution" }>) => void;
   logStoreEvent: (event: string, data: Record<string, unknown>) => void;
   closeTurnAsCanceled?: (turnId: string) => void;
   redispatchWorkspaceInstruction?: (sessionKey: string) => void;
@@ -162,6 +176,7 @@ export function startSubmitBlockingPreflightEffect<
       input.applyPreRunSessionPatch({ pendingRunDecision });
     },
     claimResume: workspace ? () => settle("resume") : undefined,
+    concludeWithoutExecution: input.concludeWithoutExecution,
     resumeSubmission: (text, images, options) => {
       const accepted = input.resumeSubmission(text, images, options);
       // Reuse the dispatcher's synchronous adoption handoff before any queued
@@ -172,11 +187,19 @@ export function startSubmitBlockingPreflightEffect<
     },
     logStoreEvent: input.logStoreEvent,
   }).then((action) => {
-    if (workspace && action.kind !== "resume" && settle("release")) {
+    if (workspace && action.kind !== "resume") {
+      const released = settle("release");
       const claim = input.effect.originalOptions?.workspaceInstructionClaim;
-      if (action.kind === "stale_discard" && claim &&
+      if (released && action.kind === "stale_discard" && claim &&
         input.isSessionRuntimeActive(input.getState(), claim.sessionKey)) input.closeTurnAsCanceled?.(claim.turnId);
-      if (input.effect.sendOriginSessionKey) input.redispatchWorkspaceInstruction?.(input.effect.sendOriginSessionKey);
+      // Even if cancellation already cleared the controller, its exact queue
+      // claim still needs the canonical dispatcher to observe the terminal
+      // transaction. That dispatcher owns waiting for cancellation and removal.
+      const current = input.getState();
+      if (claim && input.isSessionRuntimeActive(current, claim.sessionKey) &&
+        isWorkspaceInstructionDispatchClaimCurrent(current.workspaceTurnQueue, input.effect.originalOptions)) {
+        input.redispatchWorkspaceInstruction?.(claim.sessionKey);
+      }
     }
     return action;
   });

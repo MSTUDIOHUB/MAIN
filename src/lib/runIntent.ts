@@ -1,4 +1,6 @@
 import type { MainModeKey } from "./mainModes";
+import type { SemanticCapability } from "./turnCapabilities";
+export type { SemanticCapability } from "./turnCapabilities";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";
 
@@ -98,7 +100,17 @@ export interface RunIntentResolution {
   controlAction?: RunIntentControlAction;
 }
 
+/** Task semantics describe the current request, never permission or completion. */
+export interface SemanticTaskIntent {
+  objective: string;
+  workType: "answer" | "investigate" | "implement" | "operate" | "plan";
+  answerFormat: "answer" | "analysis" | "summary" | "report" | "plan";
+  requiredCapabilities: readonly SemanticCapability[];
+  forbiddenCapabilities: readonly SemanticCapability[];
+}
+
 export interface IntentPreflightResult {
+  semantic: SemanticTaskIntent;
   intent: ResolvedUserIntent;
   confidence: number;
   title?: string;
@@ -1460,40 +1472,15 @@ export function resolveConversationTurnIntent(
   return resolveRunIntentFromLegacyWorkflowMode(turn?.mode ?? "chat");
 }
 
-/**
- * preflight 会额外触发一次模型请求。
- * 普通低风险自然回复如果在发送前被它阻塞，会让按钮/回车看起来像“卡住”。
- * 因此这里只让真正可能改变后续流程的低置信度请求进入阻塞 preflight。
- */
+/** Natural MAIN input is calibrated once; lexical resolution is only a hint.
+ * Submission owns deterministic typed controls and trusted replay bypasses. */
 export function shouldUseBlockingIntentPreflight(
-  resolution: RunIntentResolution,
+  _resolution: RunIntentResolution,
   mainModeKey: MainModeKey,
-  input = "",
-  hasWorkspace = false,
+  _input = "",
+  _hasWorkspace = false,
 ): boolean {
-  if (mainModeKey !== "main_mode") return false;
-  if (resolution.bypassMainRouter) return false;
-  if (resolution.needsDecision) return false;
-  if (resolution.confidence >= 0.9) return false;
-  if (hasWorkspace) {
-    // A natural analysis/report cue describes the reply format, but cannot
-    // establish whether live command or external application tools are needed.
-    // Calibrate the complete request, including the scope of restrictions and
-    // historical references. Text fragments are not a typed whole-Turn lock;
-    // explicit composer/shortcut/resolved choices bypass this at submission.
-    return resolution.intent === "analyze" || resolution.intent === "report";
-  }
-  if (getIntentPolicy(resolution.intent).uiCategory === "output_style") return false;
-
-  // region: 热路径保护
-  // 普通自然回复已经会由主模型在系统提示里继续判断真实任务类型，
-  // 不值得为了一次额外 preflight 阻塞用户点击发送或回车。
-  if ((resolution.intent === "respond" || resolution.intent === "discuss") && resolution.riskLevel === "low") {
-    return looksLikeAmbiguousChatExecutionInput(input);
-  }
-  // endregion
-
-  return true;
+  return mainModeKey === "main_mode";
 }
 
 export function looksLikeAmbiguousChatExecutionInput(input: string): boolean {

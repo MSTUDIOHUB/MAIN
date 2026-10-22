@@ -92,16 +92,20 @@ export function settleSubmitWorkspacePreflight<TState extends SubmitWorkspacePre
     // dispatching head for canonical removal; queuing it again would replay it.
     const canceled = input.disposition === "release" &&
       (input.controller.signal.aborted || isPreflightCanceled(runtime, claim.sessionKey, claim.turnId));
-    const transition = canceled ? null : reduceWorkspaceTurnQueue(queue, {
+    // Cancellation owns both transient cleanup and durable terminal state.
+    // A late provider result may request reconciliation, but cannot publish
+    // idle or clear that transaction's controller before its commit.
+    if (canceled) return {};
+    const transition = reduceWorkspaceTurnQueue(queue, {
       ...(input.disposition === "resume"
         ? { type: "set_dispatch_phase" as const, fromPhase: "intent_preflight" as const, phase: "dispatch" as const }
         : { type: "release" as const }),
       expectedVersion: queue.version, at: Date.now(), claimId: claim.claimId,
       sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
     });
-    if (transition && transition.disposition !== "applied") return {};
+    if (transition.disposition !== "applied") return {};
     settled = true;
-    const patch = { workspaceTurnQueue: transition?.state || queue, abortController: null, isGenerating: false, agentStatus: "idle" };
+    const patch = { workspaceTurnQueue: transition.state, abortController: null, isGenerating: false, agentStatus: "idle" };
     return (active ? patch : { runtimeBySessionKey: { ...state.runtimeBySessionKey,
       [claim.sessionKey]: { ...runtime, ...patch } } }) as Partial<TState>;
   });

@@ -123,6 +123,7 @@ test("Plan preserves an admitted read_file window without a second truncation", 
       },
     },
     ledger: {
+      snapshot: () => null,
       schedule: async () => ({ idempotencyKey: "plan-read-large" }),
       settleCommand: async (event) => settlements.push(event),
       recordSoftSignal: async () => undefined,
@@ -144,6 +145,29 @@ test("Plan preserves an admitted read_file window without a second truncation", 
   assert.equal(evidenceContents.get("E1"), sourceWindow);
   assert.match(messages[0]?.content || "", /TAIL_MARKER$/);
   assert.equal(messages[0]?.content.includes(sourceWindow), true);
+});
+
+test("Plan actual read execution honors durable capability restrictions despite permissive context", async () => {
+  let executed = 0;
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => { executed++; return "must not execute"; } }],
+  ]));
+  const messages = [];
+  const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { runWorkspace: "/fixture", runSessionKey: "session", capabilityRestrictions: [] },
+    ledger: {
+      snapshot: () => ({ objective: { capabilityRestrictions: ["workspace_read"] } }),
+      schedule: async () => ({ idempotencyKey: "restricted-plan-read" }),
+      settleCommand: async (event) => settlements.push(event),
+      recordSoftSignal: async () => undefined,
+    }, run, call: { id: "restricted-read", name: "read_file", arguments: { path: "private.txt" } },
+    messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(executed, 0);
+  assert.equal(settlements[0].status, "blocked");
+  assert.deepEqual(settlements[0].evidence, []);
+  assert.match(messages[0].content, /TURN_CAPABILITY_RESTRICTED: workspace_read/);
 });
 
 function plan() {

@@ -7,6 +7,7 @@ import ts from "typescript";
 
 const moduleCache = new Map();
 let tauriInvoke = async () => "";
+let semanticPreflightStream = null;
 
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
@@ -60,6 +61,11 @@ function loadTranspiledModuleSync(sourcePath) {
     module,
     runtimeRequire,
   );
+  if (normalizedPath === path.join(process.cwd(), "src/lib/streaming.ts")) {
+    const realStream = module.exports.streamChatCompletion;
+    module.exports.streamChatCompletion = (...args) => semanticPreflightStream
+      ? semanticPreflightStream(...args) : realStream(...args);
+  }
   moduleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
@@ -112,6 +118,36 @@ function installFakeLocalStorageWindow() {
 
 function readSource(relativePath) {
   return fsSync.readFileSync(path.join(process.cwd(), relativePath), "utf8");
+}
+
+function installReadOnlySemanticFixture(useAppStore, t) {
+  const requests = [];
+  const previousConfig = useAppStore.getState().config;
+  semanticPreflightStream = async (messages, settings, _callbacks, _signal, tools, maxTokens) => {
+    assert.equal(maxTokens, 512);
+    assert.deepEqual(tools, []);
+    assert.equal(settings.reasoningRequest, "off");
+    requests.push(messages);
+    return {
+      content: JSON.stringify({
+        semantic: { objective: "Inspect the replayed user request", workType: "investigate",
+          answerFormat: "analysis", requiredCapabilities: ["workspace_read"],
+          forbiddenCapabilities: ["workspace_write", "command", "external_interaction"] },
+        confidence: 0.99, needsUserChoice: false,
+      }),
+      toolCalls: [], finishReason: "stop",
+    };
+  };
+  useAppStore.setState((state) => ({
+    selectedMainModeKey: "main_mode",
+    config: { ...state.config, activeProfile: "local",
+      local: { ...state.config.local, model: "semantic-fixture", endpoint: "http://fixture.invalid/v1" } },
+  }));
+  t.after(() => {
+    semanticPreflightStream = null;
+    useAppStore.setState({ config: previousConfig });
+  });
+  return requests;
 }
 
 test("an auto-created workspace session keeps the submitted composer preferences", async () => {
@@ -1250,7 +1286,7 @@ test("failed in-flight clear cannot restore an old runtime after workspace remov
   assert.equal(terminalSaveInvocations, 0);
 });
 
-test("successful deferred clear replays every visible user input in strict FIFO order", async () => {
+test("successful deferred clear replays every visible user input in strict FIFO order", async (t) => {
   const { useAppStore } = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/useAppStore.ts"),
   );
@@ -1259,13 +1295,7 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   const sessionId = 706;
   const oldTurnId = "turn-clear-submit-success-old";
   seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
-  useAppStore.setState((state) => ({
-    selectedMainModeKey: "main_mode",
-    config: {
-      ...state.config,
-      local: { ...state.config.local, model: "" },
-    },
-  }));
+  const semanticRequests = installReadOnlySemanticFixture(useAppStore, t);
 
   const durableClear = deferred();
   const workspaceTree = deferred();
@@ -1380,6 +1410,8 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   assert.equal(admissionCalls.length, 2);
   assert.deepEqual(admissionCalls.map((call) => call.text), [firstText, secondText]);
   await withTimeout(workspaceTreeStarted.promise, "success clear replay workspace tree");
+  assert.equal(semanticRequests.length, 1, "the FIFO head is interpreted once before context loading");
+  assert.equal(JSON.parse(semanticRequests[0][1].content).currentRequest, "第一条用户输入必须保留");
   const replayOptions = admissionCalls[1];
   for (const staleKey of [
     "resolvedIntent",
@@ -1415,7 +1447,7 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("failed deferred clear replays a fresh Turn only after exact workspace and Session reactivation", async () => {
+test("failed deferred clear replays a fresh Turn only after exact workspace and Session reactivation", async (t) => {
   const { useAppStore } = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/useAppStore.ts"),
   );
@@ -1425,13 +1457,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   const oldTurnId = "turn-clear-submit-failure-old";
   const oldSessionKey = `${workspace}:${sessionId}`;
   seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
-  useAppStore.setState((state) => ({
-    selectedMainModeKey: "main_mode",
-    config: {
-      ...state.config,
-      local: { ...state.config.local, model: "" },
-    },
-  }));
+  const semanticRequests = installReadOnlySemanticFixture(useAppStore, t);
 
   const durableClear = deferred();
   const workspaceTree = deferred();
@@ -1510,13 +1536,23 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     JSON.stringify(admissionResults[0].result),
   );
   await withTimeout(workspaceTreeStarted.promise, "failed clear replay workspace tree");
+  assert.equal(semanticRequests.length, 1, "exact reactivation admits one semantic request");
+  assert.equal(JSON.parse(semanticRequests[0][1].content).currentRequest, "清理失败后作为全新回合重放");
   // The fresh replay reuses the current in-flight workspace-tree request;
   // strict FIFO admission must not duplicate the same workspace read.
   assert.equal(workspaceTreeInvocations, 1);
-  assert.equal(replayCalls.length, 1);
+  assert.equal(admissionResults.length, 1, "clear recovery creates exactly one fresh admission");
+  assert.equal(replayCalls.length, 2, "one dispatch and its same-claim semantic resume");
   assert.equal(replayCalls[0][0], latestText);
   assert.equal(replayCalls[0][2].submissionOriginSessionKey, oldSessionKey);
   assert.notEqual(replayCalls[0][2].turnIdOverride, oldTurnId);
+  assert.equal(replayCalls[1][0], "清理失败后作为全新回合重放");
+  assert.equal(replayCalls[1][2].submissionOriginSessionKey, oldSessionKey);
+  assert.equal(replayCalls[1][2].turnIdOverride, replayCalls[0][2].turnIdOverride);
+  assert.deepEqual(replayCalls[1][2].workspaceInstructionClaim, replayCalls[0][2].workspaceInstructionClaim);
+  assert.equal(replayCalls[1][2].admittedUserBlockId, replayCalls[0][2].admittedUserBlockId);
+  assert.equal(replayCalls[1][2].resolvedIntent, "analyze");
+  assert.equal(replayCalls[1][2].executionConsentGranted, undefined);
   assert.equal(Object.hasOwn(admissionResults[0].input, "goalContinuationEnvelope"), false);
   for (const staleKey of [
     "hidden",

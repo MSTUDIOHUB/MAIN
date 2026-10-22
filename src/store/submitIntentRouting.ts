@@ -9,9 +9,7 @@ import {
 import {
   buildRunIntentSummary,
   buildSubmitBlockingPreflightEffect,
-  buildSubmitIntentConfirmationPendingDecision,
   resolveSubmitEffectiveIntentDecision,
-  resolveSubmitExecutionApprovalDecision,
   type SubmitBlockingPreflightEffect,
   type SubmitEffectiveIntentInput,
   type GoalCreationAuthorization,
@@ -37,6 +35,7 @@ export interface SubmitIntentRoutingInput<
   images?: string[];
   preferredLanguage: "zh" | "en";
   options?: TOptions;
+  submittedText?: string;
   currentMainModeKey: MainModeKey;
   hasWorkspace: boolean;
   isHidden: boolean;
@@ -88,8 +87,8 @@ export type SubmitIntentRoutingResult =
     };
 
 /**
- * Semantic intent owns the tool authority. Command metadata describes an
- * already requested operation; mentioning an operation cannot authorize it.
+ * Semantic intent describes the work and required capabilities. The existing
+ * application contract owns authority; operation metadata cannot approve it.
  * An explicit execution choice remains a separate user authorization.
  */
 export function resolveWorkspaceTurnRuntimeIntent(input: {
@@ -108,40 +107,6 @@ export function resolveWorkspaceTurnRuntimeIntent(input: {
     return "execute";
   }
   return input.resolution.intent;
-}
-
-function looksLikeExecutionIntent(params: {
-  shouldExecuteOnceFromReplyOption: boolean;
-  resolution: RunIntentResolution;
-}): boolean {
-  return params.shouldExecuteOnceFromReplyOption || params.resolution.intent === "execute";
-}
-
-function normalizeSubmitPendingDecisionInputKey(input: string): string {
-  return String(input || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function buildPlanResumeResolution(input: {
-  text: string;
-  preferredLanguage: "zh" | "en";
-}): RunIntentResolution {
-  return {
-    intent: "plan",
-    reason: input.preferredLanguage === "en"
-      ? "Continuation input is attached to an approved/executing or recently misrouted plan context, so MAIN resumes plan execution instead of ordinary chat."
-      : "短继续指令关联到已批准/执行中计划或上一轮误路由的计划上下文，因此恢复计划执行而不是普通聊天续跑。",
-    confidence: 0.95,
-    bypassMainRouter: false,
-    riskLevel: "low",
-    controlAction: "resume_plan_execution",
-    commandDirective: inferCommandDirective(input.text, "plan", {
-      source: "continuation",
-      controlAction: "resume_plan_execution",
-    }),
-  };
 }
 
 export function resolveAndApplySubmitIntentRouting<
@@ -172,55 +137,20 @@ export function resolveAndApplySubmitIntentRouting<
     shouldReuseExistingTurnIntent: input.shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
   });
-  let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
+  const effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
   let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
 
-  const normalizedPendingDecisionInputKey = normalizeSubmitPendingDecisionInputKey(input.text);
-  const shouldSuppressSameInputDecision =
-    !input.isHidden &&
-    normalizedPendingDecisionInputKey.length > 0 &&
-    input.dismissedPendingDecisionInputKey === normalizedPendingDecisionInputKey;
-  let decisionSuppressionConsumed = false;
-  const consumeDecisionSuppression = () => {
-    if (!shouldSuppressSameInputDecision || decisionSuppressionConsumed) return false;
-    decisionSuppressionConsumed = true;
-    input.setState({ dismissedPendingDecisionInputKey: null });
-    return true;
-  };
-
-  const applyDecisionSuppressedFallback = (
-    source: "reuse_resolution" | "resolution",
-    reason: string,
-  ) => {
-    effectiveRunIntent = "respond";
-    effectiveIntentSummary = buildRunIntentSummary({
-      input: input.text,
-      intent: "respond",
-      language: input.preferredLanguage,
-      reason,
-    });
-    effectiveCommandDirective = inferCommandDirective(input.text, "respond", {
-      source: source === "reuse_resolution" ? "continuation" : "natural_language",
-    });
-    input.logStoreEvent("intent_decision_suppressed_for_same_input", {
-      source,
-      inputChars: input.text.trim().length,
-    });
-  };
-
-  const shouldReevaluateReuseTurnIntent =
-    !input.isHidden &&
-    input.shouldReuseExistingTurnIntent &&
-    !input.mainDebugShortcut &&
-    !input.lockedComposerIntent &&
-    !input.shouldContinuePlanIntent &&
-    !input.shouldContinuePreviousTurnIntent &&
-    !input.options?.skipIntentResolution &&
-    !input.options?.resolvedIntent;
-
-  if (shouldReevaluateReuseTurnIntent) {
-    const reuseResolution = resolveTurnRunIntent(input.text, {
+  // Deterministic control stays with explicit modes and trusted resumptions.
+  // Every new natural-language request is interpreted once, including a short
+  // continuation: lexical matches may supply relevant context, never authority.
+  const trustedSubmission = input.isHidden || !!input.mainDebugShortcut ||
+    input.lockedComposerIntent === "image_studio" || input.mainIntentShortcut?.intent === "image_studio" ||
+    input.options?.skipIntentResolution === true || !!input.options?.resolvedIntent ||
+    input.shouldExecuteOnceFromReplyOption || !!input.goalCreationAuthorization ||
+    !!input.goalContinuationAuthorization;
+  if (input.currentMainModeKey === "main_mode" && !trustedSubmission) {
+    const resolution = resolveTurnRunIntent(input.text, {
       language: input.preferredLanguage,
       mainModeKey: input.currentMainModeKey,
       hasWorkspace: input.hasWorkspace,
@@ -229,202 +159,36 @@ export function resolveAndApplySubmitIntentRouting<
       isPlanApproved: input.isPlanApproved,
       previousTurnIntent: input.currentTurnIntent,
     });
-    const reuseLooksLikeExecutionIntent = looksLikeExecutionIntent({
-      shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
-      resolution: reuseResolution,
-    });
-    const shouldRequestPlanDecision =
-      reuseResolution.needsDecision === true ||
-      (reuseLooksLikeExecutionIntent &&
-        (reuseResolution.riskLevel === "high" || reuseResolution.intent === "plan"));
-
-    if (shouldRequestPlanDecision && !input.hasWorkspace) {
-      if (consumeDecisionSuppression()) {
-        applyDecisionSuppressedFallback(
-          "reuse_resolution",
-          input.preferredLanguage === "en"
-            ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
-            : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
-        );
-      } else {
-        input.applyPreRunSessionPatch({
-          pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
-            text: input.text,
-            images: input.images,
-            preferredLanguage: input.preferredLanguage,
-            decision: {
-              suggestedIntent: "plan",
-              decisionOptions: ["plan", "respond", "execute"],
-              riskLevel: reuseResolution.riskLevel,
-              reason: reuseResolution.reason,
-            },
-          }),
-        });
-        return { handled: true, returnValue: true };
-      }
-    }
-
-    if (
-      reuseLooksLikeExecutionIntent &&
-      reuseResolution.intent === "execute"
-    ) {
-      effectiveRunIntent = reuseResolution.intent;
-      effectiveCommandDirective =
-        reuseResolution.commandDirective ||
-        effectiveCommandDirective ||
-        inferCommandDirective(input.text, reuseResolution.intent, { source: "continuation" });
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: input.text,
-        intent: reuseResolution.intent,
-        language: input.preferredLanguage,
-        reason: input.preferredLanguage === "en"
-          ? "The user selected a fix/implement continuation option, so this reused turn is auto-upgraded to execution."
-          : "用户在复用回合中选择了修复/实现型选项，本轮自动升级为执行模式。",
-      });
-    }
-  }
-
-  if (
-    !input.isHidden &&
-    !input.mainDebugShortcut &&
-    !input.mainIntentShortcut &&
-    !input.lockedComposerIntent &&
-    !input.shouldContinuePlanIntent &&
-    !input.shouldContinuePreviousTurnIntent &&
-    !input.shouldReuseExistingTurnIntent &&
-    !input.options?.skipIntentResolution &&
-    !input.options?.resolvedIntent
-  ) {
-    const resolution: RunIntentResolution = input.shouldRouteContinuationToPlanResume
-      ? buildPlanResumeResolution({
-          text: input.text,
-          preferredLanguage: input.preferredLanguage,
-        })
-      : resolveTurnRunIntent(input.text, {
-          language: input.preferredLanguage,
-          mainModeKey: input.currentMainModeKey,
-          hasWorkspace: input.hasWorkspace,
-          hasPlanArtifacts: input.hasPlanArtifacts,
-          planStage: input.planStage,
-          isPlanApproved: input.isPlanApproved,
-        previousTurnIntent: input.currentTurnIntent,
-      });
-    const workspaceResolvedIntent = resolveWorkspaceTurnRuntimeIntent({
-      hasWorkspace: input.hasWorkspace,
-      currentMainModeKey: input.currentMainModeKey,
-      shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
+    const previousRequest = input.shouldContinuePreviousTurnIntent
+      ? input.previousTurnContinuationTarget?.userPrompt
+      : input.shouldContinuePlanIntent || input.shouldReuseExistingTurnIntent || input.shouldRouteContinuationToPlanResume
+      ? input.currentTurn?.userPrompt
+      : undefined;
+    const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
       resolution,
+      currentMainModeKey: input.currentMainModeKey,
+      hasWorkspace: input.hasWorkspace,
+      explicitIntent: input.options?.explicitIntent || input.lockedComposerIntent || input.mainIntentShortcut?.intent || undefined,
+      previousRequest,
+      text: input.text,
+      originalComposerInput: input.submittedText,
+      images: input.images,
+      options: input.options,
+      preferredLanguage: input.preferredLanguage,
+      currentConfig: input.currentConfig,
+      sendOriginSessionKey: input.sendOriginSessionKey,
     });
-    effectiveIntentSummary = buildRunIntentSummary({
-      input: input.text,
-      intent: workspaceResolvedIntent,
-      language: input.preferredLanguage,
-      reason: resolution.reason,
-    });
-    effectiveCommandDirective =
-      resolution.commandDirective || inferCommandDirective(input.text, resolution.intent);
-
-    if (input.hasWorkspace) {
-      input.logStoreEvent("workspace_turn_intent_resolved", {
-        intent: workspaceResolvedIntent,
-        routerIntent: resolution.intent,
-        mutationSurfaceElevated: workspaceResolvedIntent !== resolution.intent,
-        riskLevel: resolution.riskLevel,
-        confidence: resolution.confidence,
-        controlAction: resolution.controlAction ?? null,
-        inputChars: input.text.trim().length,
+    if (blockingPreflightEffect) {
+      input.logStoreEvent("turn_intent_semantic_requested", {
+        heuristicHint: resolution.intent,
+        heuristicConfidence: resolution.confidence,
+        explicitIntent: blockingPreflightEffect.request.explicitIntent ?? null,
+        hasPreviousRequest: !!previousRequest,
+        inputChars: input.text.length,
       });
-    }
-
-    if (resolution.controlAction === "approve_plan") {
-      input.applyPreRunSessionPatch({
-        input: "",
-        contextMentions: [],
-        attachedFiles: [],
-        lockedComposerIntent: null,
-        pendingRunDecision: null,
-      });
-      input.approvePlan();
+      input.startBlockingPreflight(blockingPreflightEffect);
       return { handled: true, returnValue: true };
     }
-
-    if (resolution.controlAction === "resume_plan_execution") {
-      input.startPlanExecutionResume({
-        text: input.text,
-        images: input.images,
-        preferredLanguage: input.preferredLanguage,
-        shouldRouteContinuationToPlanResume: input.shouldRouteContinuationToPlanResume,
-        uiParentTurnId:
-          input.planExecutionResumeContinuationTarget?.id ||
-          input.currentTurnId ||
-          undefined,
-        commandDirective:
-          resolution.commandDirective ||
-          inferCommandDirective(input.text, "plan", {
-            source: "continuation",
-            controlAction: "resume_plan_execution",
-          }),
-      });
-      return { handled: true, returnValue: true };
-    }
-
-    if (resolution.needsDecision && !input.hasWorkspace) {
-      if (consumeDecisionSuppression()) {
-        applyDecisionSuppressedFallback(
-          "resolution",
-          input.preferredLanguage === "en"
-            ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
-            : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
-        );
-      } else {
-        input.applyPreRunSessionPatch({
-          pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
-            text: input.text,
-            images: input.images,
-            preferredLanguage: input.preferredLanguage,
-            decision: resolution,
-            suggestedIntentFallback: "plan",
-          }),
-        });
-        return { handled: true, returnValue: true };
-      }
-    }
-
-    if (!input.hasWorkspace) {
-      const executionApprovalDecision = resolveSubmitExecutionApprovalDecision({
-        text: input.text,
-        images: input.images,
-        preferredLanguage: input.preferredLanguage,
-        resolution,
-        effectiveCommandDirective,
-      });
-      if (executionApprovalDecision.pendingRunDecision) {
-        input.applyPreRunSessionPatch({
-          pendingRunDecision: executionApprovalDecision.pendingRunDecision,
-        });
-        return { handled: true, returnValue: true };
-      }
-    }
-
-    {
-      const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
-        resolution,
-        currentMainModeKey: input.currentMainModeKey,
-        hasWorkspace: input.hasWorkspace,
-        text: input.text,
-        images: input.images,
-        options: input.options,
-        preferredLanguage: input.preferredLanguage,
-        currentConfig: input.currentConfig,
-        sendOriginSessionKey: input.sendOriginSessionKey,
-      });
-      if (blockingPreflightEffect) {
-        input.startBlockingPreflight(blockingPreflightEffect);
-        return { handled: true, returnValue: true };
-      }
-    }
-
-    effectiveRunIntent = workspaceResolvedIntent;
   }
 
   const shouldInferCommandDirective = !(

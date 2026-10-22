@@ -1,4 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
+import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
@@ -111,7 +113,11 @@ export async function requestPlanModel(input: {
       ),
     ),
     activeSubagentCount: activeSubagents.length,
-    baseTools: planModelTools(input.context, input.get()),
+    baseTools: planModelTools(input.context, input.get()).filter((tool) =>
+      !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
+        input.ledger.snapshot()?.objective.capabilityRestrictions,
+      ), tool.function.name)
+    ),
   });
   const requiredSpawn = requiredCollaborationPending &&
     planTools.length === 1 &&

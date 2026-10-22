@@ -1,30 +1,19 @@
 import { normalizeCloudProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
 import { streamChatCompletion, type StreamSettings } from "./streaming";
 import {
-  inferCommandDirective,
   getIntentPolicy,
-  normalizeCommandDirective,
-  type PendingRunDecisionOption,
   type IntentPreflightResult,
   type ResolvedUserIntent,
-  type RunIntentRiskLevel,
+  type SemanticTaskIntent,
+  type CommandDirectiveKind,
 } from "./runIntent";
 import type { MainModeKey } from "./mainModes";
 import type { AppConfig } from "./appTypes";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
 import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
+import { TURN_CAPABILITIES, type SemanticCapability } from "./turnCapabilities";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
-
-const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
-  "respond",
-  "discuss",
-  "plan",
-  "execute",
-  "analyze",
-  "summarize",
-  "report",
-]);
 
 function deriveStreamSettings(config: PreflightConfig): StreamSettings {
   if (config.activeProfile === "local") {
@@ -66,109 +55,97 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
   };
 }
 
-function stripJsonFence(text: string): string {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  return fenced?.[1]?.trim() || trimmed;
+function normalizeCapabilities(value: unknown): SemanticCapability[] | null {
+  if (!Array.isArray(value) || value.some((entry) =>
+    typeof entry !== "string" || !(TURN_CAPABILITIES as readonly string[]).includes(entry)
+  )) return null;
+  return [...new Set(value)] as SemanticCapability[];
 }
 
-function extractJsonObject(text: string): string | null {
-  const cleaned = stripJsonFence(text);
-  const directStart = cleaned.indexOf("{");
-  const directEnd = cleaned.lastIndexOf("}");
-  if (directStart >= 0 && directEnd > directStart) {
-    return cleaned.slice(directStart, directEnd + 1);
-  }
-  return null;
+function normalizeSemanticIntent(raw: unknown): SemanticTaskIntent | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.objective !== "string" || !value.objective.trim()) return null;
+  if (!["answer", "investigate", "implement", "operate", "plan"].includes(value.workType as string)) return null;
+  if (!["answer", "analysis", "summary", "report", "plan"].includes(value.answerFormat as string)) return null;
+  const requiredCapabilities = normalizeCapabilities(value.requiredCapabilities);
+  const forbiddenCapabilities = normalizeCapabilities(value.forbiddenCapabilities);
+  if (!requiredCapabilities || !forbiddenCapabilities) return null;
+  return {
+    objective: value.objective.trim(),
+    workType: value.workType as SemanticTaskIntent["workType"],
+    answerFormat: value.answerFormat as SemanticTaskIntent["answerFormat"],
+    requiredCapabilities,
+    forbiddenCapabilities,
+  };
 }
 
-function normalizeIntent(value: unknown): ResolvedUserIntent | null {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim().toLowerCase() as ResolvedUserIntent;
-  if (normalized === "discuss") return "respond";
-  return ALLOWED_INTENTS.has(normalized) ? normalized : null;
-}
-
-function normalizeRiskLevel(value: unknown): RunIntentRiskLevel | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  return normalized === "low" || normalized === "medium" || normalized === "high"
-    ? normalized
-    : undefined;
-}
-
-function normalizeOption(option: unknown, language: "zh" | "en"): PendingRunDecisionOption | null {
-  if (typeof option === "string") {
-    const intent = normalizeIntent(option);
-    if (!intent) return null;
-    return {
-      id: intent,
-      label: intent,
-      value: language === "en" ? `Please handle this as ${intent}.` : `请按 ${intent} 处理这轮请求。`,
-    };
-  }
-
-  if (!option || typeof option !== "object") return null;
-  const candidate = option as Partial<PendingRunDecisionOption> & { intent?: string };
-  const intent = normalizeIntent(candidate.id || candidate.intent);
-  if (!intent) return null;
-  const label = typeof candidate.label === "string" && candidate.label.trim()
-    ? candidate.label.trim()
-    : intent;
-  const value = typeof candidate.value === "string" && candidate.value.trim()
-    ? candidate.value.trim()
-    : language === "en"
-    ? `Please handle this as ${intent}.`
-    : `请按 ${intent} 处理这轮请求。`;
-  return { id: intent, label, value };
+function deriveSemanticIntent(semantic: SemanticTaskIntent): ResolvedUserIntent {
+  if (semantic.workType === "plan") return "plan";
+  if (semantic.workType === "implement" || semantic.workType === "operate" ||
+    semantic.requiredCapabilities.some((capability) =>
+      capability === "workspace_write" || capability === "command" || capability === "external_interaction"
+    )) return "execute";
+  return semantic.workType === "investigate" || semantic.requiredCapabilities.includes("workspace_read")
+    ? "analyze" : "respond";
 }
 
 function normalizePreflightResult(
   raw: unknown,
   language: "zh" | "en",
-  input: string,
+  explicitIntent?: ResolvedUserIntent,
 ): IntentPreflightResult | null {
-  if (!raw || typeof raw !== "object") return null;
-  const candidate = raw as Partial<IntentPreflightResult> & { options?: unknown[] };
-  const intent = normalizeIntent(candidate.intent);
-  if (!intent) return null;
-  const fallbackDirective = inferCommandDirective(input, intent, { source: "preflight" });
-  const commandDirective = normalizeCommandDirective(candidate.commandDirective, fallbackDirective, intent) ?? fallbackDirective;
-  const toolPolicy = getIntentPolicy(intent).toolPolicy;
-  const operationIntent = toolPolicy === "write" || toolPolicy === "plan_gated";
-  const riskLevel = normalizeRiskLevel(candidate.riskLevel) ?? (
-    commandDirective.kind === "shell" || commandDirective.kind === "git" || commandDirective.kind === "file_modify"
-      ? "medium"
-      : commandDirective.kind === "none"
-      ? "low"
-      : undefined
-  );
-
-  const options = Array.isArray(candidate.options)
-    ? candidate.options
-        .map((option) => normalizeOption(option, language))
-        .filter(Boolean) as PendingRunDecisionOption[]
-    : undefined;
-
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const candidate = raw as Record<string, unknown>;
+  const semantic = normalizeSemanticIntent(candidate.semantic);
+  if (!semantic || typeof candidate.confidence !== "number" || !Number.isFinite(candidate.confidence) ||
+    candidate.confidence < 0 || candidate.confidence > 1 || typeof candidate.needsUserChoice !== "boolean") return null;
+  const question = typeof candidate.question === "string" ? candidate.question.trim() : undefined;
+  if (candidate.needsUserChoice && !question) return null;
+  const required = semantic.requiredCapabilities;
+  const implementation = semantic.workType === "implement" || required.includes("workspace_write");
+  const forbidden = semantic.forbiddenCapabilities;
+  const explicitPolicy = explicitIntent ? getIntentPolicy(explicitIntent).toolPolicy : undefined;
+  const operationRequired = implementation || semantic.workType === "operate" ||
+    required.includes("command") || required.includes("external_interaction");
+  const conflicts = required.some((capability) => forbidden.includes(capability)) ||
+    (semantic.workType === "implement" && forbidden.includes("workspace_write")) ||
+    ((explicitPolicy === "none" || explicitPolicy === "read_only") && operationRequired) ||
+    (explicitPolicy === "none" && required.includes("workspace_read"));
+  const needsUserChoice = candidate.needsUserChoice || conflicts;
+  const intent = explicitIntent && explicitIntent !== "execute"
+    ? explicitIntent : deriveSemanticIntent(semantic);
+  const operationPolicy = getIntentPolicy(intent).toolPolicy;
+  const canDescribeOperation = !needsUserChoice && (operationPolicy === "write" || operationPolicy === "plan_gated");
+  const kind: CommandDirectiveKind = !canDescribeOperation ? "none"
+    : implementation ? "file_modify"
+    : required.includes("command") ? "shell"
+    : required.includes("external_interaction") ? "mcp" : "none";
+  const requiresApproval = kind !== "none";
   return {
+    semantic,
     intent,
-    confidence: typeof candidate.confidence === "number" ? Math.max(0, Math.min(1, candidate.confidence)) : 0.6,
+    confidence: candidate.confidence,
     title: typeof candidate.title === "string"
       ? normalizeConversationDisplayTitle(candidate.title, language === "en" ? 48 : 32, language === "en" ? "New task" : "新的任务")
       : undefined,
-    summary: typeof candidate.summary === "string" ? candidate.summary.trim() : undefined,
-    reason: typeof candidate.reason === "string" ? candidate.reason.trim() : undefined,
-    needsUserChoice: candidate.needsUserChoice === true,
-    question: typeof candidate.question === "string" ? candidate.question.trim() : undefined,
-    options: options && options.length > 0 ? options : undefined,
-    outputFormat: candidate.outputFormat,
-    bypassMainRouter: candidate.bypassMainRouter === true,
-    needsWorkspaceRead: candidate.needsWorkspaceRead === true,
-    ...(riskLevel ? { riskLevel } : {}),
-    requiresApproval: operationIntent && (typeof candidate.requiresApproval === "boolean"
-      ? candidate.requiresApproval
-      : commandDirective.requiresApproval === true),
-    commandDirective,
+    summary: semantic.objective,
+    needsUserChoice,
+    question: question ?? (conflicts
+      ? language === "en" ? "The requested capabilities conflict with the current limits. Please clarify the permitted scope."
+        : "任务所需能力与本轮限制冲突，请明确允许的操作范围。"
+      : undefined),
+    outputFormat: semantic.answerFormat,
+    needsWorkspaceRead: required.includes("workspace_read"),
+    riskLevel: requiresApproval ? "medium" : "low",
+    requiresApproval,
+    commandDirective: {
+      kind,
+      source: "preflight",
+      requiresWorkspace: required.includes("workspace_read") || implementation,
+      requiresApproval,
+      confidence: candidate.confidence,
+    },
   };
 }
 
@@ -177,74 +154,44 @@ export async function runIntentPreflight(params: {
   language: "zh" | "en";
   mainModeKey: MainModeKey;
   hasWorkspace?: boolean;
+  explicitIntent?: ResolvedUserIntent;
+  previousRequest?: string;
   signal?: AbortSignal;
   config: PreflightConfig;
 }): Promise<IntentPreflightResult | null> {
   const settings = deriveStreamSettings(params.config);
-  if (!settings.baseUrl || !settings.model) return null;
+  if (!settings.baseUrl || !settings.model || params.signal?.aborted) return null;
 
   const systemPrompt = [
-    "You are MAIN's hidden intent preflight router.",
-    "Return JSON only. No markdown, no prose, no tools.",
-    "Classify the user's next-turn intent for MAIN before execution.",
-    "Choose execute for requested real commands or live external/application inspection, even when the requested reply is an analysis or report. Choose analyze/report for source or document inspection through read-only workspace tools. Explanations and hypothetical commands stay respond. A tool or skill name alone never authorizes execution; explicit user restrictions take priority.",
-    "Allowed intents: respond, plan, execute, analyze, summarize, report. `discuss` is legacy input only; return `respond` for ordinary natural replies.",
-    "Also provide title: a short clean UI title for sidebar / ExecutionCapsule. Ignore usernames, timestamps, and transcript noise.",
-    "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
-    "Also provide reason: a brief routing reason for the chosen intent.",
-    "Also provide riskLevel: low, medium, or high.",
-    "Also provide requiresApproval: true only when this turn is likely to need shell, write, external write, browser, Unity/editor, Git mutation, or destructive tools.",
-    "Also provide commandDirective: a second-level command metadata object. Keep top-level intent unchanged; use commandDirective.kind for specific commands.",
-    "Allowed commandDirective.kind values: none, shell, unity, git, file_modify, report, plan_approval, plan_resume, skill, knowledge, mcp.",
-    "commandDirective.source should be preflight. commandDirective.action should be short, such as status, commit_push, deploy, workspace_file_change, generate_report, editor_execute.",
-    "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
-    "Options must be plain user-facing choices, not reasoning.",
-    "The JSON shape must be:",
-    "{\"intent\":\"respond|plan|execute|analyze|summarize|report\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
-    `Current visible mode: ${params.mainModeKey}`,
-    `Workspace attached: ${params.hasWorkspace === true}`,
-    `Preferred user language: ${params.language}`,
+    "Interpret MAIN's current user request. Return one complete JSON object only; no prose, markdown or tools.",
+    "Separate the work from its answer format. Analysis/report/summary can accompany implementation or live inspection. Explaining a command does not request running it.",
+    "Identify only capabilities needed for the current work, not hypothetical examples or future plan execution. requiredCapabilities describe needs, never approval.",
+    "forbiddenCapabilities contain only explicit CURRENT operational restrictions. Read-only forbids workspace_write; no commands forbids command separately. Historical baselines, quotations and examples are reference context, not current restrictions.",
+    "An explicit mode is a capability upper bound; still interpret restrictions in its natural-language body. Never approve tools, widen paths, invent exact commands or claim completion.",
+    "Use previousRequest only to understand an actual continuation; the current request always controls. If materially ambiguous, set needsUserChoice true and provide a brief question.",
+    "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[]},\"confidence\":0.0,\"needsUserChoice\":false}. Optional title and question are short strings; question is required when needsUserChoice is true.",
+    `Capability values: ${TURN_CAPABILITIES.join(", ")}.`,
+    `Mode: ${params.mainModeKey}; explicit intent: ${params.explicitIntent ?? "none"}; workspace: ${params.hasWorkspace === true}; language: ${params.language}.`,
   ].join("\n");
+  const userPrompt = JSON.stringify({
+    currentRequest: params.input,
+    ...(params.previousRequest ? { previousRequest: params.previousRequest } : {}),
+  });
 
-  const userPrompt = [
-    `User input: ${params.input}`,
-    "Return strict JSON now.",
-  ].join("\n");
-
-  let fullText = "";
+  let streamFailed = false;
   try {
     const result = await streamChatCompletion(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
+      [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
       settings,
-      {
-        onToken: (token) => {
-          fullText += token;
-        },
-        onDone: (result) => {
-          fullText = result.content || fullText;
-        },
-        onError: () => {
-          // Swallow here and return null below.
-        },
-      },
+      { onToken: () => {}, onDone: () => {}, onError: () => { streamFailed = true; } },
       params.signal,
       [],
       512,
     );
-
-    const jsonText = extractJsonObject(result.content || fullText);
-    if (!jsonText) return null;
-    return normalizePreflightResult(JSON.parse(jsonText), params.language, params.input);
+    if (streamFailed || params.signal?.aborted || result.finishReason !== "stop" ||
+      result.clientStopReason || result.protocolViolation || result.toolCalls?.length) return null;
+    return normalizePreflightResult(JSON.parse(result.content.trim()), params.language, params.explicitIntent);
   } catch {
-    const jsonText = extractJsonObject(fullText);
-    if (!jsonText) return null;
-    try {
-      return normalizePreflightResult(JSON.parse(jsonText), params.language, params.input);
-    } catch {
-      return null;
-    }
+    return null;
   }
 }

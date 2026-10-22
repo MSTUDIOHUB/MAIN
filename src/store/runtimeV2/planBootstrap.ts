@@ -239,6 +239,7 @@ export async function bootstrapRuntimeV2Plan(
           ? "required"
           : "optional",
       objective: admission.objective,
+      capabilityRestrictions: admission.capabilityRestrictions,
       constraints: admission.constraints,
       acceptanceCriteria: admission.acceptanceCriteria.map(
         (criterion) => criterion.text,

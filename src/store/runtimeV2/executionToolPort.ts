@@ -47,7 +47,8 @@ import {
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
-import { interruptedRuntimeV2ShellBatchReceipt } from "./executionSequentialShellBatchReceipt";
+import { runtimeV2ToolPreExecutionReceipt } from "./executionToolGateReceipt";
+import { runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -79,6 +80,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
   return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
       if (command.kind === "collect_observation") {
+        const restriction = runtimeV2ToolCapabilityRestriction(input, "get_project_skeleton");
+        if (restriction) throw new Error(`TURN_CAPABILITY_RESTRICTED: ${restriction}`);
         input.logStoreEvent("runtime_v2_tool_execution_started", {
           turnId: command.run.turnId,
           runId: command.run.runId,
@@ -174,17 +177,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           toolName,
           requestedTarget: target,
         });
-      input.logStoreEvent("runtime_v2_tool_execution_started", {
-        turnId: command.run.turnId,
-        runId: command.run.runId,
-        commandKind: command.kind,
-        toolName,
-        target: target || null,
-      });
-      const skippedBatchReceipt = interruptedRuntimeV2ShellBatchReceipt({
-        ports: input, command, toolName, args, target,
-      });
-      if (skippedBatchReceipt) return skippedBatchReceipt;
+      const blockedReceipt = runtimeV2ToolPreExecutionReceipt({ ports: input, command, toolName, args, target });
+      if (blockedReceipt) return blockedReceipt;
       const hasCoveredSourceReceipt =
         !!toolCallId &&
         input.live.coveredReadToolResults.has(toolCallId);

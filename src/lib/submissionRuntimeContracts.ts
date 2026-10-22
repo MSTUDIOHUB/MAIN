@@ -69,6 +69,8 @@ export interface SubmissionRuntimeContext {
   phaseLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
+  capabilityRestrictions?: readonly import("./turnCapabilities").TurnCapability[];
+  requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveCommandDirective: CommandDirective | null;

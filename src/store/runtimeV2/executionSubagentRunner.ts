@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { filterRuntimeV2CapabilityRestrictedTools, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
 import {
   isSkillVisibleToModel,
   renderExplicitSkillActivationContext,
@@ -83,6 +84,7 @@ async function childToolAllowed(input: {
   readonly name: string;
   readonly args: Record<string, unknown>;
 }): Promise<boolean> {
+  if (runtimeV2ToolCapabilityRestriction(input.ports, input.name, input.args)) return false;
   if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
     if (input.name === "load_skill") {
       if (input.args.operation === "list") {
@@ -178,10 +180,10 @@ async function runRuntimeV2Child(input: {
   readonly signal: AbortSignal;
 }): Promise<RuntimeV2ChildResult> {
   const telemetry = input.ports.live.childTelemetry.get(input.job.id);
-  const tools = runtimeV2ChildTools(
+  const tools = filterRuntimeV2CapabilityRestrictedTools(input.ports, runtimeV2ChildTools(
     input.job,
     input.ports.context.skillCatalog,
-  );
+  ));
   const aggregate = aggregateForCurrentTurn(input.ports);
   const projectBaselineContext = isProjectBaselineForWorkspace(
     input.ports.context.projectBaselineContext,

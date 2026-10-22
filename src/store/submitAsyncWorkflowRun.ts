@@ -156,6 +156,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   currentMainModeKey: MainModeKey;
   preferredLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
+  semanticIntent?: import("../lib/runIntent").SemanticTaskIntent;
   runtimeRunIntent: ResolvedRunIntent;
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
@@ -2053,6 +2054,8 @@ export async function runSubmitAsyncWorkflowRun<
     phaseLanguage,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
+    capabilityRestrictions: input.semanticIntent?.forbiddenCapabilities,
+    requiredCapabilities: input.semanticIntent?.requiredCapabilities,
     goalCreationAuthorization: input.goalCreationAuthorization,
     goalContinuationAuthorization: input.goalContinuationAuthorization,
     effectiveCommandDirective: input.effectiveCommandDirective,

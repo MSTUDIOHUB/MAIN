@@ -269,6 +269,7 @@ test("Plan discovery records Skill metadata as tool guidance without claiming a 
   await planSkillTools.executeReadOnlyPlanTool({
     context: { skillCatalog: skillCatalog(), runWorkspace: "/repo", runSessionKey: "session" },
     ledger: {
+      snapshot: () => null,
       schedule: async () => ({ idempotencyKey: "skill-page" }),
       settleCommand: async (receipt) => settled.push(receipt),
       recordSoftSignal: async () => {},

@@ -2136,7 +2136,7 @@ test("preflight result decision preserves model-provided user choice options", (
   );
 });
 
-test("preflight result decision asks before upgrading natural chat to execution", () => {
+test("preflight result decision hands semantic execution to the ordinary tool approval contract", () => {
   const decision = resolveSubmitPreflightResultDecision({
     text: "顺手把这个文件改掉",
     preferredLanguage: "zh",
@@ -2155,17 +2155,13 @@ test("preflight result decision asks before upgrading natural chat to execution"
     },
   });
 
-  assert.equal(decision.kind, "ask_execution_confirmation");
+  assert.equal(decision.kind, "resume_with_preflight");
   assert.equal(decision.resolvedIntent, "execute");
   assert.equal(decision.preflightSuggestsOperation, true);
-  assert.equal(decision.pendingRunDecision.suggestedIntent, "execute");
-  assert.deepEqual(
-    decision.pendingRunDecision.options.map((option) => option.id),
-    ["execute", "respond", "plan"],
-  );
+  assert.equal(decision.pendingRunDecision, null);
 });
 
-test("preflight result decision resumes with local resolution when preflight returns nothing", () => {
+test("missing semantics open recovery instead of resuming the lexical result", () => {
   const decision = resolveSubmitPreflightResultDecision({
     text: "解释一下这个设计",
     preferredLanguage: "en",
@@ -2176,12 +2172,12 @@ test("preflight result decision resumes with local resolution when preflight ret
     preflight: null,
   });
 
-  assert.equal(decision.kind, "resume_with_preflight");
-  assert.equal(decision.pendingRunDecision, null);
+  assert.equal(decision.kind, "ask_user_choice");
+  assert.equal(decision.pendingRunDecision.source, "preflight");
   assert.equal(decision.resolvedIntent, "respond");
   assert.equal(decision.commandDirective.kind, "none");
   assert.equal(decision.preflightSuggestsOperation, false);
-  assert.match(decision.intentSummary, /Respond|natural reply/i);
+  assert.match(decision.intentSummary, /could not interpret|no tools/i);
 });
 
 test("preflight staleness decision ignores unchanged empty composer input", () => {

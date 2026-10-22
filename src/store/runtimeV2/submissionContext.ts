@@ -1,4 +1,5 @@
 import type { ResolvedRunIntent } from "../../lib/runIntent";
+import { normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
 import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { ProjectBaselineContext } from "../../lib/projectBaseline";
@@ -29,6 +30,8 @@ export interface RuntimeV2SubmissionContext {
   readonly phaseLanguage: "zh" | "en";
   readonly effectiveRunIntent: ResolvedRunIntent;
   readonly runtimeRunIntent: ResolvedRunIntent;
+  readonly requiredCapabilities?: readonly TurnCapability[];
+  readonly capabilityRestrictions?: readonly TurnCapability[];
   /** Exact live project rules captured at the Turn safe boundary. */
   readonly workspaceInstructionContext?: string;
   /** Frozen, deterministic workspace facts. This is not an instruction,
@@ -69,6 +72,7 @@ export interface RuntimeV2SubmissionContext {
 
 export interface RuntimeV2ObjectiveAdmission {
   readonly objective: string;
+  readonly capabilityRestrictions?: readonly TurnCapability[];
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly {
     readonly id: string;
@@ -78,18 +82,22 @@ export interface RuntimeV2ObjectiveAdmission {
 }
 
 /**
- * Preserve an upstream Goal admission when present. An ordinary raw Turn has
- * no trusted semantic classifier, so Runtime binds the exact user request as
- * one opaque criterion instead of guessing requirements from prose.
+ * Preserve an upstream Goal admission when present. Task routing does not
+ * classify acceptance evidence, so an ordinary Turn binds the exact user
+ * request as one opaque criterion instead of guessing requirements from prose.
  */
 export function resolveRuntimeV2ObjectiveAdmission(
   context: RuntimeV2SubmissionContext,
   fallbackObjective: string,
 ): RuntimeV2ObjectiveAdmission {
   const supplied = context.executeAdmission;
+  const restrictions = context.capabilityRestrictions === undefined ? {} : {
+    capabilityRestrictions: normalizeTurnCapabilityRestrictions(context.capabilityRestrictions),
+  };
   if (supplied?.acceptanceCriteria.length) {
     return {
       objective: String(supplied.objective || fallbackObjective).trim(),
+      ...restrictions,
       constraints: [...(supplied.constraints || [])],
       acceptanceCriteria: supplied.acceptanceCriteria.map((criterion) => ({
         ...criterion,
@@ -99,6 +107,7 @@ export function resolveRuntimeV2ObjectiveAdmission(
   const objective = String(fallbackObjective || "").trim();
   return {
     objective,
+    ...restrictions,
     constraints: [],
     acceptanceCriteria: [{
       id: "criterion-user-objective",

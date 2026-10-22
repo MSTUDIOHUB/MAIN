@@ -9,6 +9,7 @@ import ts from "typescript";
 const workspaceRoot = process.cwd();
 const moduleCache = new Map();
 let tauriInvoke = async () => "";
+let semanticPreflightStream = null;
 
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
@@ -57,6 +58,12 @@ function loadTranspiledModuleSync(sourcePath) {
   };
 
   new Function("exports", "module", "require", transpiled)(module.exports, module, runtimeRequire);
+  if (normalizedPath === path.join(workspaceRoot, "src/lib/streaming.ts")) {
+    const realStream = module.exports.streamChatCompletion;
+    module.exports.streamChatCompletion = (...args) => semanticPreflightStream &&
+      args[5] === 512 && Array.isArray(args[4]) && args[4].length === 0
+      ? semanticPreflightStream(...args) : realStream(...args);
+  }
   moduleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
@@ -1159,8 +1166,23 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     releaseTree = resolve;
   });
   const streamInvocations = [];
+  const semanticRequests = [];
 
   try {
+    semanticPreflightStream = async (messages, settings) => {
+      semanticRequests.push(messages);
+      assert.equal(settings.reasoningRequest, "off");
+      assert.equal(JSON.parse(messages[1].content).currentRequest, queue.entries[0].instruction.payload.text);
+      return {
+        content: JSON.stringify({
+          semantic: { objective: "Summarize this workspace in one sentence", workType: "investigate",
+            answerFormat: "summary", requiredCapabilities: ["workspace_read"],
+            forbiddenCapabilities: ["workspace_write", "command", "external_interaction"] },
+          confidence: 0.99, needsUserChoice: false,
+        }),
+        toolCalls: [], finishReason: "stop",
+      };
+    };
     globalThis.window = {
       localStorage: {
         getItem: (key) => localStorageValues.get(String(key)) ?? null,
@@ -1235,6 +1257,8 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
 
     assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
     await treeStarted;
+    assert.equal(semanticRequests.length, 1, "the admitted FIFO head is interpreted exactly once");
+    assert.equal(streamInvocations.length, 0, "the runtime failure fixture starts only after semantic admission and discovery");
     assert.equal(
       useAppStore.getState().workspaceTurnQueue.entries.length,
       0,
@@ -1283,6 +1307,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     assert.equal(turn?.runtimeOutcome?.resultKind, "error");
     assert.equal(settled.isGenerating, false);
     assert.equal(settled.agentStatus, "idle");
+    assert.equal(semanticRequests.length, 1, "read-only recovery does not start a second routing request");
     assert.match(turn?.summary || "", /恢复租约|recovery/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
@@ -1294,6 +1319,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     );
   } finally {
     releaseTree?.();
+    semanticPreflightStream = null;
     Date.now = defaultDateNow;
     tauriInvoke = defaultTauriInvoke;
     if (originalWindow === undefined) delete globalThis.window;

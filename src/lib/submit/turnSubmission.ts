@@ -52,6 +52,7 @@ import {
   type ResolvedRunIntent,
   type ResolvedUserIntent,
   type RunIntentResolution,
+  type SemanticTaskIntent,
 } from "../runIntent";
 import { shouldReuseLogicalTurnForSubmission } from "../runIdentity";
 import {
@@ -250,6 +251,10 @@ export interface SubmitPipelineOptions {
   turnIdOverride?: string;
   preservePlanState?: boolean;
   resolvedIntent?: ResolvedRunIntent;
+  /** Immutable user-selected mode; natural task restrictions still need interpretation. */
+  explicitIntent?: ResolvedUserIntent;
+  /** Validated task semantics; capability needs never carry approval. */
+  semanticIntent?: SemanticTaskIntent;
   commandDirective?: CommandDirective | null;
   intentSummary?: string;
   turnTitle?: string;
@@ -956,6 +961,7 @@ export interface SubmitPreflightResultDecision {
   turnTitle?: string;
   intentSummary: string;
   preflightSuggestsOperation: boolean;
+  semanticIntent?: SemanticTaskIntent;
 }
 
 export interface SubmitPreflightStalenessDecision {
@@ -984,10 +990,13 @@ export interface SubmitBlockingPreflightEffect<
     language: "zh" | "en";
     mainModeKey: MainModeKey;
     hasWorkspace?: boolean;
+    explicitIntent?: ResolvedUserIntent;
+    previousRequest?: string;
     signal?: AbortSignal;
     config: TConfig;
   };
   originalText: string;
+  originalComposerInput?: string;
   originalImages?: string[];
   originalOptions?: TOptions;
   originalMainModeKey: MainModeKey;
@@ -1017,6 +1026,11 @@ export type SubmitPreflightEffectAction<
       kind: "skip_inactive_session";
       phase: "intent_preflight";
       sessionKey: string;
+    }
+  | {
+      kind: "conclude_without_execution";
+      resultKind: "error" | "blocked";
+      summary: string;
     }
   | {
       kind: "resume";
@@ -1988,18 +2002,28 @@ export function resolveSubmitPreflightResultDecision(params: {
   resolution: RunIntentResolution;
   preflight: IntentPreflightResult | null;
 }): SubmitPreflightResultDecision {
-  const { text, images, preferredLanguage, resolution, preflight } = params;
-  const resolvedIntent = (preflight?.intent || resolution.intent) as ResolvedRunIntent;
-  const commandDirective =
-    preflight?.commandDirective ||
-    resolution.commandDirective ||
-    inferCommandDirective(text, resolvedIntent);
-  const preflightSuggestsOperation =
-    !!preflight &&
-    (
-      resolvedIntent === "execute" ||
-      commandDirectiveLooksOperational(commandDirective)
-    );
+  const { text, images, preferredLanguage, preflight } = params;
+  // This boundary consumes a validated semantic result, never a lexical
+  // suggestion. Missing semantics remain a visible recovery decision.
+  const resolvedIntent: ResolvedRunIntent = preflight?.intent ?? "respond";
+  const commandDirective: CommandDirective = preflight?.commandDirective ?? {
+    kind: "none", source: "preflight", requiresApproval: false,
+  };
+  const preflightSuggestsOperation = preflight?.intent === "execute";
+  if (!preflight) {
+    const reason = preferredLanguage === "en"
+      ? "MAIN could not interpret this request. Retry or select a mode; no tools have run."
+      : "MAIN 未能解析这条请求。请重试或选择模式；尚未执行工具。";
+    return {
+      kind: "ask_user_choice",
+      pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
+        text, images, source: "preflight", preferredLanguage,
+        decision: { suggestedIntent: "respond", decisionOptions: ["respond", "plan", "execute"], riskLevel: "low", reason },
+        titleOverride: reason,
+      }),
+      resolvedIntent, commandDirective, intentSummary: reason, preflightSuggestsOperation: false,
+    };
+  }
 
   if (preflight?.needsUserChoice) {
     const decisionOptions = preflight.options
@@ -2015,11 +2039,11 @@ export function resolveSubmitPreflightResultDecision(params: {
         decision: {
           suggestedIntent: preflight.intent,
           decisionOptions,
-          riskLevel: resolution.riskLevel,
-          reason: resolution.reason,
+          riskLevel: preflight.riskLevel ?? "low",
+          reason: preflight.reason ?? "",
         },
         titleOverride: preflight.question,
-        reasonOverride: resolution.reason,
+        reasonOverride: preflight.reason,
         optionsOverride: preflight.options,
       }),
       resolvedIntent,
@@ -2030,50 +2054,10 @@ export function resolveSubmitPreflightResultDecision(params: {
         intent: resolvedIntent,
         language: preferredLanguage,
         preflightSummary: preflight.summary,
-        reason: preflight.reason || resolution.reason,
+        reason: preflight.reason,
       }),
       preflightSuggestsOperation,
-    };
-  }
-
-  const localWasNatural =
-    (resolution.intent === "respond" || resolution.intent === "discuss") &&
-    resolution.riskLevel === "low";
-  const shouldAskForPreflightExecutionDecision =
-    localWasNatural &&
-    preflightSuggestsOperation &&
-    (
-      preflight?.intent !== resolution.intent ||
-      preflight?.requiresApproval === true ||
-      (preflight?.confidence ?? 0) < 0.92
-    );
-
-  if (shouldAskForPreflightExecutionDecision) {
-    return {
-      kind: "ask_execution_confirmation",
-      pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
-        text,
-        images,
-        source: "preflight",
-        preferredLanguage,
-        decision: {
-          suggestedIntent: "execute",
-          decisionOptions: ["execute", "respond", "plan"],
-          riskLevel: preflight?.riskLevel || "medium",
-          reason: preflight?.reason || resolution.reason,
-        },
-      }),
-      resolvedIntent,
-      commandDirective,
-      turnTitle: preflight?.title,
-      intentSummary: buildRunIntentSummary({
-        input: text,
-        intent: resolvedIntent,
-        language: preferredLanguage,
-        preflightSummary: preflight?.summary,
-        reason: preflight?.reason || resolution.reason,
-      }),
-      preflightSuggestsOperation,
+      semanticIntent: preflight.semantic,
     };
   }
 
@@ -2088,9 +2072,10 @@ export function resolveSubmitPreflightResultDecision(params: {
       intent: resolvedIntent,
       language: preferredLanguage,
       preflightSummary: preflight?.summary,
-      reason: preflight?.reason || resolution.reason,
+      reason: preflight?.reason,
     }),
     preflightSuggestsOperation,
+    semanticIntent: preflight.semantic,
   };
 }
 
@@ -2100,6 +2085,7 @@ export function resolveSubmitPreflightStalenessDecision(params: {
   originalMainModeKey: MainModeKey;
   latestMainModeKey: MainModeKey;
   lockedComposerIntent?: MainIntentShortcut | null;
+  originalExplicitIntent?: ResolvedUserIntent;
 }): SubmitPreflightStalenessDecision {
   const latestInput = params.latestInput.trim();
   const hasComparableLatestInput = latestInput.length > 0;
@@ -2111,8 +2097,7 @@ export function resolveSubmitPreflightStalenessDecision(params: {
     stale:
       (hasComparableLatestInput && latestInput !== params.originalText.trim()) ||
       params.latestMainModeKey !== params.originalMainModeKey ||
-      hasLockedComposerIntent ||
-      hasExplicitShortcut,
+      (hasLockedComposerIntent && params.lockedComposerIntent !== params.originalExplicitIntent),
     latestInput,
     latestChars: latestInput.length,
     selectedMainModeKey: params.latestMainModeKey,
@@ -2128,7 +2113,10 @@ export function buildSubmitBlockingPreflightEffect<
   resolution: RunIntentResolution;
   currentMainModeKey: MainModeKey;
   hasWorkspace?: boolean;
+  explicitIntent?: ResolvedUserIntent;
+  previousRequest?: string;
   text: string;
+  originalComposerInput?: string;
   images?: string[];
   options?: TOptions;
   preferredLanguage: "zh" | "en";
@@ -2145,9 +2133,12 @@ export function buildSubmitBlockingPreflightEffect<
       language: params.preferredLanguage,
       mainModeKey: params.currentMainModeKey,
       ...(params.hasWorkspace ? { hasWorkspace: true } : {}),
+      ...(params.explicitIntent ? { explicitIntent: params.explicitIntent } : {}),
+      ...(params.previousRequest ? { previousRequest: params.previousRequest } : {}),
       config: params.currentConfig,
     },
     originalText: params.text,
+    originalComposerInput: params.originalComposerInput,
     originalImages: params.images,
     originalOptions: params.options,
     originalMainModeKey: params.currentMainModeKey,
@@ -2166,6 +2157,7 @@ export function buildSubmitPreflightResumeOptions<
   return {
     ...(params.options || {}),
     resolvedIntent: params.decision.resolvedIntent,
+    semanticIntent: params.decision.semanticIntent,
     commandDirective: params.decision.commandDirective,
     skipIntentResolution: true,
     turnTitle: params.decision.turnTitle,
@@ -2186,11 +2178,12 @@ export function resolveSubmitPreflightEffectAction<
   isOriginOwnerCurrent?: boolean;
 }): SubmitPreflightEffectAction<TOptions> {
   const staleness = resolveSubmitPreflightStalenessDecision({
-    originalText: params.effect.originalText,
+    originalText: params.effect.originalComposerInput ?? params.effect.originalText,
     latestInput: params.latestInput,
     originalMainModeKey: params.effect.originalMainModeKey,
     latestMainModeKey: params.latestMainModeKey,
     lockedComposerIntent: params.lockedComposerIntent,
+    originalExplicitIntent: params.effect.request.explicitIntent,
   });
 
   if (staleness.stale) {
@@ -2217,16 +2210,25 @@ export function resolveSubmitPreflightEffectAction<
     };
   }
 
+  if (params.effect.request.hasWorkspace && (!params.preflight || params.preflight.needsUserChoice)) {
+    return {
+      kind: "conclude_without_execution",
+      resultKind: params.preflight ? "blocked" : "error",
+      summary: params.preflight
+        ? params.preflight.question || (params.effect.preferredLanguage === "en"
+          ? "Please clarify the requested work and restrictions before MAIN uses tools."
+          : "请明确本轮目标与操作限制，MAIN 尚未执行工具。")
+        : params.effect.preferredLanguage === "en"
+          ? "MAIN could not interpret this request because semantic routing failed or returned an incomplete result. No tools ran. Please retry."
+          : "语义解析请求失败或返回不完整结果，MAIN 未能确定本轮目标，尚未执行工具。请重试。",
+    };
+  }
   const preflightDecision = resolveSubmitPreflightResultDecision({
     text: params.effect.originalText,
     images: params.effect.originalImages,
     preferredLanguage: params.effect.preferredLanguage,
     resolution: params.effect.resolution,
-    // Workspace intake already owns an admitted Turn. Uncertain semantics
-    // continue through its safe original capability surface for clarification.
-    preflight: params.effect.request.hasWorkspace &&
-      (params.preflight?.needsUserChoice || (params.preflight?.confidence ?? 0) < 0.9)
-      ? null : params.preflight,
+    preflight: params.preflight,
   });
 
   if (
