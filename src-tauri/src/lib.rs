@@ -5335,13 +5335,49 @@ fn compare_file_nodes(a: &FileNode, b: &FileNode) -> Ordering {
 }
 
 #[tauri::command]
-fn list_directory(
-    state: State<WorkspaceState>,
+async fn list_directory(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     path: String,
     workspace: Option<String>,
 ) -> Result<Vec<FileNode>, String> {
-    let workspace = resolve_workspace_root(&state, workspace)?;
-    let real_path = resolve_existing_path(&path, &workspace)?;
+    let default_root = if workspace
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        PathBuf::new()
+    } else {
+        state.get_root()?
+    };
+    run_file_read_io(move || {
+        let started = Instant::now();
+        let logged_workspace = workspace
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_root.display().to_string());
+        record_debug_log(
+            &app,
+            "info",
+            "list_directory.start",
+            json!({
+                "workspace": logged_workspace, "path": path, "elapsedMs": 0, "result": "pending"
+            })
+            .to_string(),
+        );
+        let result = resolve_workspace_root(&WorkspaceState::new(default_root), workspace)
+            .and_then(|workspace| list_directory_in_workspace(&path, &workspace));
+        record_debug_log(&app, "info", "list_directory.finish", json!({
+            "workspace": logged_workspace, "path": path, "elapsedMs": started.elapsed().as_millis(),
+            "result": if result.is_ok() { "ok" } else { "error" }
+        }).to_string());
+        result
+    })
+    .await
+}
+
+fn list_directory_in_workspace(path: &str, workspace: &Path) -> Result<Vec<FileNode>, String> {
+    let real_path = resolve_existing_path(path, workspace)?;
     if !real_path.is_dir() {
         return Err("list_directory 目标不是目录".to_string());
     }
@@ -5746,9 +5782,7 @@ fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<Strin
             let Ok(relative) = path.strip_prefix(workspace) else {
                 continue;
             };
-            let relative = relative
-                .to_string_lossy()
-                .replace('\\', "/");
+            let relative = relative.to_string_lossy().replace('\\', "/");
             hits.push(relative);
         }
     }
@@ -8772,7 +8806,8 @@ pub(crate) async fn send_guarded_public_get(
         ("User-Agent".to_string(), user_agent.to_string()),
         (
             "Accept".to_string(),
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".to_string(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                .to_string(),
         ),
         (
             "Accept-Language".to_string(),
@@ -14304,8 +14339,7 @@ mod tests {
         let ack = dispatch_chat_stream_worker(
             stream_id.clone(),
             move |lease| async move {
-                let (abort_handle, registration) =
-                    futures_util::future::AbortHandle::new_pair();
+                let (abort_handle, registration) = futures_util::future::AbortHandle::new_pair();
                 lease.set_abort_handle(Some(abort_handle));
                 started_tx.send(()).unwrap();
                 let result = futures_util::future::Abortable::new(
@@ -14587,10 +14621,7 @@ mod tests {
         fs::write(package.join("program.md"), "# legacy").unwrap();
         fs::write(package.join("nested").join("SKILL.md"), "# skill").unwrap();
 
-        assert_eq!(
-            find_entry_points(&package),
-            vec!["nested/SKILL.md"],
-        );
+        assert_eq!(find_entry_points(&package), vec!["nested/SKILL.md"],);
         fs::remove_dir_all(&workspace).unwrap();
     }
 
@@ -15630,6 +15661,54 @@ mod tests {
         assert!(!should_hide_list_directory_entry("Scripts", true));
         assert!(!should_hide_list_directory_entry(".MAIN", true));
         assert!(!should_hide_list_directory_entry(".protocols", true));
+    }
+
+    #[test]
+    fn list_directory_worker_preserves_scope_sorting_and_symlink_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("Scripts")).unwrap();
+        fs::create_dir(root.path().join("Library")).unwrap();
+        fs::write(root.path().join("README.md"), "project").unwrap();
+        fs::write(root.path().join(".DS_Store"), "noise").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside-link")).unwrap();
+        let workspace = root.path().to_path_buf();
+        let caller = std::thread::current().id();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (worker, nodes) = runtime
+            .block_on(run_file_read_io(move || {
+                Ok((
+                    std::thread::current().id(),
+                    super::list_directory_in_workspace(".", &workspace)?,
+                ))
+            }))
+            .unwrap();
+        assert_ne!(worker, caller);
+        assert_eq!(nodes[0].name, "Scripts");
+        assert!(nodes
+            .iter()
+            .any(|node| node.name == "README.md" && !node.is_dir));
+        assert!(!nodes
+            .iter()
+            .any(|node| node.name == "Library" || node.name == ".DS_Store"));
+        assert!(super::list_directory_in_workspace("README.md", root.path()).is_err());
+        assert!(super::list_directory_in_workspace("../", root.path()).is_err());
+        assert!(super::list_directory_in_workspace(
+            &outside.path().display().to_string(),
+            root.path()
+        )
+        .is_err());
+        #[cfg(unix)]
+        {
+            assert!(nodes
+                .iter()
+                .any(|node| node.name == "outside-link" && node.is_symlink && !node.is_dir));
+            assert!(super::list_directory_in_workspace("outside-link", root.path()).is_err());
+        }
     }
 
     #[test]
