@@ -120,6 +120,8 @@ cargo run --bin main -- eval
 
 成功后用 `node scripts/verify-install-native-app.mjs --verify-only` 只读复核源码指纹、前端嵌入、签名和 build/installed 全文件树哈希；该模式必须已有成功 manifest，且不会重新构建、签名、安装或写文件。默认 manifest 为忽略的 `test-results/native-app-install/build-manifest.json`，可用 `--manifest test-results/<本轮目录>/build-manifest.json` 留存每轮证据。构建期间源码变化会中止安装；仅 `--no-sign` 构建成功或仅比较主二进制哈希，均不足以确认可测试安装包。
 
+本地 ad-hoc 测试包启动后，若 macOS 日志出现旧 `code requirement` 不匹配或 Documents 项目读取受阻，先通过 MAIN 的“新项目”原生选择器重新选择本次已授权的项目目录，再核对读取和取消状态。文件选择器表达项目访问意图（参见 [Apple NSOpenPanel](https://developer.apple.com/documentation/appkit/nsopenpanel)）；测试脚本不修改 TCC，也不自动授予完全磁盘访问权限。每轮真实模型测试前先备份日志，再用设置里的“清空日志”同时清理前端和原生日志。
+
 ```bash
 cargo fmt --check --manifest-path src-tauri/Cargo.toml
 cargo check --all-targets --manifest-path src-tauri/Cargo.toml
