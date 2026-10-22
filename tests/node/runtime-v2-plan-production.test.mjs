@@ -170,6 +170,27 @@ test("Plan actual read execution honors durable capability restrictions despite 
   assert.match(messages[0].content, /TURN_CAPABILITY_RESTRICTED: workspace_read/);
 });
 
+test("Plan direct reads cannot bypass durable individual review requirements", async () => {
+  let executed = 0;
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => { executed++; return "must not execute"; } }],
+  ]));
+  const messages = []; const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { runWorkspace: "/fixture", runSessionKey: "session", approvalRequiredCapabilities: [] },
+    ledger: {
+      snapshot: () => ({ objective: { approvalRequiredCapabilities: ["workspace_read"] } }),
+      schedule: async () => ({ idempotencyKey: "manual-plan-read" }),
+      settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined,
+    }, run, call: { id: "manual-read", name: "read_file", arguments: { path: "private.txt" } },
+    messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(executed, 0);
+  assert.equal(settlements[0].status, "blocked");
+  assert.deepEqual(settlements[0].evidence, []);
+  assert.match(messages[0].content, /TURN_TOOL_REVIEW_REQUIRED: workspace_read/);
+});
+
 function plan() {
   return runtime.sealWorkPlanV1({
     draft: {

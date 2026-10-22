@@ -1177,7 +1177,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
         content: JSON.stringify({
           semantic: { objective: "Summarize this workspace in one sentence", workType: "investigate",
             answerFormat: "summary", requiredCapabilities: ["workspace_read"],
-            forbiddenCapabilities: ["workspace_write", "command", "external_interaction"] },
+            forbiddenCapabilities: ["workspace_write", "command", "external_interaction"], approvalRequiredCapabilities: [] },
           confidence: 0.99, needsUserChoice: false,
         }),
         toolCalls: [], finishReason: "stop",

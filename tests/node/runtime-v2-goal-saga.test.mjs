@@ -890,7 +890,7 @@ test("cold Goal supervisor gives new Execute slices the durable restrictions rat
       return result;
     } }, projection: { async publish() {} }, clockId: { now: () => goal.createdAt, nextId: () => `event-${++ordinal}` },
   });
-  await controller.admit({ turn, run, strategy: "goal", objective: goal.objective, capabilityRestrictions: ["workspace_write", "command"], initialPhase: "acting" });
+  await controller.admit({ turn, run, strategy: "goal", objective: goal.objective, capabilityRestrictions: ["workspace_write", "command"], approvalRequiredCapabilities: ["network"], initialPhase: "acting" });
   const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(checkpoint)));
   const state = {
     conversationTurns: [{ id: turn.turnId, clientSubmissionId: turn.clientSubmissionId, runtimeEngineVersion: "v2", userPrompt: goal.objective, status: "executing", blockIds: [] }],
@@ -899,11 +899,12 @@ test("cold Goal supervisor gives new Execute slices the durable restrictions rat
     runtimeV2Checkpoints: { [turn.turnId]: restored },
   };
   let sliceRestrictions;
+  let sliceReview;
   const production = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/goalProductionRunner.ts"), new Map([
     ["../../lib/runtime-v2", runtime],
     ["./checkpointPort", { getRuntimeV2Checkpoint: () => restored, createRuntimeV2CheckpointPort: () => ({}) }],
     ["./projectionPort", { createRuntimeV2ProjectionPort: () => ({ async publish() {} }) }],
-    ["./goalSliceProductionPort", { createRuntimeV2GoalProductionSlicePort(input) { sliceRestrictions = input.capabilityRestrictions; throw new Error("SLICE_BOUNDARY_CAPTURED"); } }],
+    ["./goalSliceProductionPort", { createRuntimeV2GoalProductionSlicePort(input) { sliceRestrictions = input.capabilityRestrictions; sliceReview = input.approvalRequiredCapabilities; throw new Error("SLICE_BOUNDARY_CAPTURED"); } }],
   ]));
   await assert.rejects(production.runSubmitRuntimeV2Goal({
     get: () => state, set() {}, context: {
@@ -914,6 +915,7 @@ test("cold Goal supervisor gives new Execute slices the durable restrictions rat
     }, goalCheckpoint: inMemoryCheckpointPort().port, now: () => goal.createdAt + 1,
   }), /SLICE_BOUNDARY_CAPTURED/);
   assert.deepEqual(sliceRestrictions, ["workspace_write", "command"]);
+  assert.deepEqual(sliceReview, ["network"]);
 });
 
 test("Goal v2 source boundary excludes legacy executors, Store/UI and prose lifecycle rules", () => {

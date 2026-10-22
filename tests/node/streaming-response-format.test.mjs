@@ -132,7 +132,7 @@ test('frontend OpenAI and Ollama sends the same protocol-specific formatting con
 });
 test('actual preflight preserves JSON mode and approval semantics through a native format compatibility retry', async () => {
   const listeners = new Map(); const bodies = [];
-  const semantic = { semantic: { objective: 'Run pwd after individual approval', workType: 'operate', answerFormat: 'report', requiredCapabilities: ['workspace_read', 'command'], forbiddenCapabilities: [] }, confidence: 0.98, needsUserChoice: false };
+  const semantic = { semantic: { objective: 'Run pwd after individual approval', workType: 'operate', answerFormat: 'report', requiredCapabilities: ['workspace_read', 'command'], forbiddenCapabilities: [], approvalRequiredCapabilities: [] }, confidence: 0.98, needsUserChoice: false };
   const api = loadStreaming(async (name, args) => {
     assert.equal(name, 'start_chat_stream'); bodies.push(JSON.parse(args.body));
     if (bodies.length === 1) {
@@ -172,7 +172,7 @@ test('non-streaming compatibility Chat sends the requested output format', async
 
 test('actual preflight Responses wire keeps a long current request complete with the same explicit cap', async () => {
   const bodies = []; const input = 'Only run the requested command after approval. '.repeat(200) + 'CURRENT_REQUEST_TAIL_SENTINEL';
-  const semantic = { semantic: { objective: 'Inspect after approval', workType: 'operate', answerFormat: 'report', requiredCapabilities: ['command'], forbiddenCapabilities: [] }, confidence: 0.95, needsUserChoice: false };
+  const semantic = { semantic: { objective: 'Inspect after approval', workType: 'operate', answerFormat: 'report', requiredCapabilities: ['command'], forbiddenCapabilities: [], approvalRequiredCapabilities: [] }, confidence: 0.95, needsUserChoice: false };
   const api = loadStreaming(async (name, args) => { assert.equal(name, 'proxy_request'); bodies.push(JSON.parse(args.body)); return JSON.stringify({ status: 'completed', output_text: JSON.stringify(semantic) }); }, async () => () => {}, 'src/lib/intentPreflight.ts');
   const result = await api.runIntentPreflight({ input, language: 'en', mainModeKey: 'main_mode', hasWorkspace: true, config: { activeProfile: 'cloud', cloud: { endpoint: 'https://fixture.invalid/v1', apiKey: '', model: 'fixture', protocol: 'openai', apiFormat: 'responses' } } });
   assert.equal(result.intent, 'execute'); assert.equal(result.requiresApproval, true); assert.equal(bodies.length, 1);

@@ -16818,7 +16818,7 @@ export const useAppStore = create<AppState>()(
     if (taskId == null) return;
     if (
       isToolPermissionActionRequest(state.activeActionRequest) &&
-      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk)
+      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk, state.activeActionRequest.approvalRequiredCapability)
     ) {
       logStoreEvent("tool_permission_session_approval_blocked", {
         taskId,

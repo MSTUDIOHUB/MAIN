@@ -49,6 +49,7 @@ export interface RuntimeV2GoalProductionSlicePortInput
   readonly turnInputContextSignals?: TurnInputContextSignals;
   readonly runtimeContextBudget?: RuntimeContextBudget | null;
   readonly capabilityRestrictions?: readonly import("../../lib/turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../../lib/turnCapabilities").TurnCapability[];
   readonly workspaceInstructionContext?: string;
   readonly projectBaselineContext?: ProjectBaselineContext | null;
   readonly skillCatalog?: SkillCatalogSnapshot | null;
@@ -553,6 +554,7 @@ export function createRuntimeV2GoalProductionSlicePort(
       effectiveRunIntent: "execute",
       runtimeRunIntent: "execute",
       capabilityRestrictions: input.capabilityRestrictions,
+      approvalRequiredCapabilities: input.approvalRequiredCapabilities,
       abortCtrl: abortController,
       timerInterval,
       harnessRunId: request.run.runId,

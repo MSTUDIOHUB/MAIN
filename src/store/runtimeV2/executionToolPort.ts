@@ -47,8 +47,7 @@ import {
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
-import { runtimeV2ToolPreExecutionReceipt } from "./executionToolGateReceipt";
-import { runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
+import { runtimeV2AutomaticObservationDeferredReceipt, runtimeV2ToolPreExecutionReceipt } from "./executionToolGateReceipt";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -80,8 +79,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
   return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
       if (command.kind === "collect_observation") {
-        const restriction = runtimeV2ToolCapabilityRestriction(input, "get_project_skeleton");
-        if (restriction) throw new Error(`TURN_CAPABILITY_RESTRICTED: ${restriction}`);
+        const deferred = runtimeV2AutomaticObservationDeferredReceipt(input, command);
+        if (deferred) return deferred;
         input.logStoreEvent("runtime_v2_tool_execution_started", {
           turnId: command.run.turnId,
           runId: command.run.runId,
@@ -187,50 +186,6 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         : null;
       if (hasCoveredSourceReceipt) {
         input.live.coveredReadToolResults.delete(toolCallId);
-      }
-      if (cachedSourceReceipt) {
-        const replayedActionIdentity =
-          runtimeV2ProviderToolCallIdentity({
-            name: toolName,
-            arguments: args,
-          });
-        recordToolResultHistory({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "succeeded",
-          content: cachedSourceReceipt,
-        });
-        input.logStoreEvent("runtime_v2_source_receipt_replayed", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          toolName,
-          target: target || null,
-          sourceVersion:
-            extractReadFileWindowMetadata(cachedSourceReceipt)
-              ?.contentVersion || null,
-          actionIdentity: replayedActionIdentity,
-        });
-        const replayCompletion = toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          cachedSourceReceipt,
-          "succeeded",
-          undefined,
-          extractReadFileWindowMetadata(cachedSourceReceipt)
-            ?.contentVersion,
-        );
-        return replayCompletion.type === "tool.completed"
-          ? {
-              ...replayCompletion,
-              evidence: [],
-              receiptOrigin: "replayed",
-            }
-          : replayCompletion;
       }
       if (!toolDefinitionExists(input, toolName)) {
         recordToolResultHistory({
@@ -340,6 +295,50 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         return authorizationResolution.completion;
       }
       const authorization = authorizationResolution.authorization;
+      if (cachedSourceReceipt) {
+        const replayedActionIdentity =
+          runtimeV2ProviderToolCallIdentity({
+            name: toolName,
+            arguments: args,
+          });
+        recordToolResultHistory({
+          ports: input,
+          command,
+          toolName,
+          target,
+          status: "succeeded",
+          content: cachedSourceReceipt,
+        });
+        input.logStoreEvent("runtime_v2_source_receipt_replayed", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          toolName,
+          target: target || null,
+          sourceVersion:
+            extractReadFileWindowMetadata(cachedSourceReceipt)
+              ?.contentVersion || null,
+          actionIdentity: replayedActionIdentity,
+        });
+        const replayCompletion = toolCompletionFor(
+          input,
+          command,
+          toolName,
+          args,
+          target,
+          cachedSourceReceipt,
+          "succeeded",
+          undefined,
+          extractReadFileWindowMetadata(cachedSourceReceipt)
+            ?.contentVersion,
+        );
+        return replayCompletion.type === "tool.completed"
+          ? {
+              ...replayCompletion,
+              evidence: [],
+              receiptOrigin: "replayed",
+            }
+          : replayCompletion;
+      }
       try {
         let diffPreview;
         const toolExecutionOptions = {

@@ -83,6 +83,7 @@ interface ActionCardProps {
   diff?: { old: string; new: string; path?: string };
   shellPermissionDecision?: { requiresApproval?: boolean };
   permissionRisk?: ToolPermissionActionRequest["risk"];
+  permissionApprovalRequiredCapability?: ToolPermissionActionRequest["approvalRequiredCapability"];
   intentSummary?: string;
   why?: string;
   evidence?: string;
@@ -146,7 +147,7 @@ function compactExplanation(text?: string, maxChars = 180) {
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, permissionRisk, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
+export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, permissionRisk, permissionApprovalRequiredCapability, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
   const language = useAppStore((s) => s.config.language);
   const activeProfile = useAppStore((s) => s.config.activeProfile);
   const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
@@ -166,7 +167,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const isDone = isExecuted || isRejected || isFailed;
   const isSystemErrorCard = toolName === "Error";
   const isShellApprovalGated = !!shellPermissionDecision?.requiresApproval;
-  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk);
+  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk, permissionApprovalRequiredCapability);
 
   // ── Collapsible state: expanded while pending/running, collapsed when done ──
   const [expanded, setExpanded] = useState(!isDone);
@@ -557,6 +558,11 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           </div>
         )}
 
+        {isPending && permissionApprovalRequiredCapability && (
+          <p className="mt-2 text-[11px] text-[var(--text-secondary)]">
+            {language === "zh" ? "本轮要求这类操作逐次单独批准；自动审查不能代替此次批准。" : "This Turn requires separate approval for each matching action; Auto Review cannot replace it."}
+          </p>
+        )}
         {/* Auto-approve toggle — only when pending */}
         {isPending && onToggleAutoApprove && !isShellApprovalGated && !requiresPerCallApproval && (
           <div data-testid="action-card-auto-approve" className="mt-2.5 pt-2.5 border-t border-[#27272a] flex items-center gap-2">

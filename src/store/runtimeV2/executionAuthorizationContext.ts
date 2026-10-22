@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
-import { runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
+import { runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
 import {
   buildToolCapabilityRegistry,
   getToolRiskLevelForCall,
@@ -53,6 +53,7 @@ export interface RuntimeV2ToolAuthorizationResult {
   readonly shellPermissionApproval?: import("../../lib/ipc").ShellPermissionApproval;
   readonly shellPermissionDecision?: import("../../lib/ipc").ShellPermissionDecision;
   readonly approvalRequired?: boolean;
+  readonly approvalRequiredCapability?: import("../../lib/turnCapabilities").TurnCapability;
   readonly risk?: ToolRiskLevel;
   readonly localFileReadPath?: string;
 }
@@ -288,6 +289,17 @@ export function runtimeV2ToolCapabilityRestriction(
       workspace: input.context.runWorkspace,
       approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths,
     }),
+    source: runtimeV2CatalogToolSource(authorization, name),
+  });
+}
+
+export function runtimeV2ToolApprovalCapability(
+  input: RuntimeV2ExecutionPortsInput, name: string, args: Record<string, unknown> = {},
+) {
+  const authorization = authorizationFor(input);
+  return runtimeV2ForbiddenToolCapability({
+    restrictions: runtimeV2ApprovalRequiredCapabilities(input), toolName: name,
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths }),
     source: runtimeV2CatalogToolSource(authorization, name),
   });
 }

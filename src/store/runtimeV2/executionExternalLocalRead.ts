@@ -71,6 +71,7 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       args: input.args,
       target: input.target,
       risk: authorization.risk,
+      approvalRequiredCapability: authorization.approvalRequiredCapability,
       permissionTarget: requestedPath,
       shellPermissionDecision: authorization.shellPermissionDecision,
       signal: input.signal,
@@ -122,16 +123,20 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       };
     }
     if (review.action === "accept") {
-      if (authorization.risk === "local_file_read") {
-        // The UI resolver grants one exact normalized path. Re-read current
-        // authority exactly once before any ingest or read side effect.
-        authorization = await authorizeToolForCurrentTurn(
-          input.ports,
-          input.toolName,
-          input.args,
-        );
-      } else if (authorization.shellPermissionDecision) {
-        const decision = authorization.shellPermissionDecision;
+      const pendingAuthorization = authorization;
+      authorization = await authorizeToolForCurrentTurn(input.ports, input.toolName, input.args);
+      const sameReview = authorization.approvalRequired === true &&
+        authorization.risk === pendingAuthorization.risk &&
+        authorization.approvalRequiredCapability === pendingAuthorization.approvalRequiredCapability;
+      // The existing permission adapter has fenced this exact Run, command,
+      // arguments and (when external) granted path. A new policy denial wins;
+      // only that invocation's still-required review is satisfied here.
+      if (!authorization.allowed && !sameReview) {
+        // Preserve the new denial for the ordinary blocked receipt below.
+      } else if (pendingAuthorization.risk === "local_file_read") {
+        authorization = { ...authorization, allowed: true, reason: null, approvalRequired: false, allowExternalLocalRead: true };
+      } else if (authorization.shellPermissionDecision || pendingAuthorization.shellPermissionDecision) {
+        const decision = authorization.shellPermissionDecision || pendingAuthorization.shellPermissionDecision!;
         const command = getShellPermissionCommandForTool(input.toolName, input.args);
         const packet = review.shellPermissionApproval;
         const approved = !!command && decision.command === command &&

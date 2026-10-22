@@ -1,5 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
-import { normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2AcceptanceEvidenceRequirementSlot,
@@ -47,6 +47,7 @@ export interface RuntimeV2Admission {
   readonly strategy: RuntimeV2Strategy;
   readonly objective: string;
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly constraints?: readonly string[];
   readonly acceptanceCriteria?: readonly string[];
   readonly acceptanceCriterionIds?: readonly string[];
@@ -123,6 +124,9 @@ export class RuntimeV2Controller {
       objective: input.objective,
       ...(input.capabilityRestrictions !== undefined ? {
         capabilityRestrictions: normalizeTurnCapabilityRestrictions(input.capabilityRestrictions),
+      } : {}),
+      ...(input.approvalRequiredCapabilities !== undefined ? {
+        approvalRequiredCapabilities: normalizeTurnApprovalCapabilities(input.approvalRequiredCapabilities),
       } : {}),
       constraints: input.constraints || [],
       acceptanceCriteria: input.acceptanceCriteria || [],

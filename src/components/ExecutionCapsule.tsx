@@ -24,6 +24,7 @@ interface ExecutionCapsuleProps {
   requestId?: string;
   permissionIdentity?: ToolPermissionResolutionIdentity;
   permissionRisk?: ToolPermissionActionRequest["risk"];
+  permissionApprovalRequiredCapability?: ToolPermissionActionRequest["approvalRequiredCapability"];
   permissionToolName?: string;
   permissionTarget?: string;
   permissionArgumentDisclosure?: {
@@ -147,6 +148,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   requestId,
   permissionIdentity,
   permissionRisk,
+  permissionApprovalRequiredCapability,
   permissionToolName,
   permissionTarget,
   permissionArgumentDisclosure,
@@ -331,7 +333,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     ? reviewTaskCandidate
     : null;
   const hasPendingToolReview = !!activeReviewTask;
-  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk);
+  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk, permissionApprovalRequiredCapability);
   const reviewTarget = String(permissionTarget || activeReviewTask?.target || "").trim();
   const reviewToolName = String(permissionToolName || activeReviewTask?.toolName || "").trim();
   const reviewRiskLabel = getToolPermissionRiskLabel(permissionRisk, language);
@@ -401,7 +403,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     showOptions: language === "zh" ? "展开选项" : "Show Options",
     collapseOptions: language === "zh" ? "收起选项" : "Collapse Options",
     diffRequest: language === "zh" ? "待确认变更" : "Pending Change",
-    chooseApproval: requiresPerCallApproval
+    chooseApproval: permissionApprovalRequiredCapability
+      ? language === "zh"
+        ? "本轮要求逐次单独审批"
+        : "This Turn requires separate approval for each call"
+      : requiresPerCallApproval
       ? language === "zh"
         ? "此风险级别每次只能单独审批"
         : "This risk level requires approval for every call"
@@ -1002,6 +1008,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                           <div data-testid="execution-capsule-tool-review-risk" className={permissionRisk === "destructive" ? "text-[#f87171]" : secondaryText}>
                             {language === "zh" ? "风险" : "Risk"}：{reviewRiskLabel}
                           </div>
+                          {permissionApprovalRequiredCapability && (
+                            <div data-testid="execution-capsule-required-human-review" className={secondaryText}>
+                              {language === "zh" ? "本轮要求这类操作逐次单独批准；自动审查不能代替此次批准。" : "This Turn requires separate approval for each matching action; Auto Review cannot replace it."}
+                            </div>
+                          )}
                           {reviewToolName && (
                             <div data-testid="execution-capsule-tool-review-name" className={secondaryText}>
                               {language === "zh" ? "工具" : "Tool"}：<span className={primaryText}>{reviewToolName}</span>

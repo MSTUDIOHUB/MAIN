@@ -15,7 +15,7 @@ import { TURN_CAPABILITIES, type SemanticCapability } from "./turnCapabilities";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
 type DiagnosticField = "result" | "semantic" | "semantic.objective" | "semantic.workType" | "semantic.answerFormat" |
-  "semantic.requiredCapabilities" | "semantic.forbiddenCapabilities" | "confidence" | "needsUserChoice" | "question" |
+  "semantic.requiredCapabilities" | "semantic.forbiddenCapabilities" | "semantic.approvalRequiredCapabilities" | "confidence" | "needsUserChoice" | "question" |
   "settings.baseUrl" | "settings.model";
 const DIAGNOSTIC_FINISH_REASONS = ["stop", "length", "tool_calls", "function_call", "content_filter"] as const;
 
@@ -83,14 +83,17 @@ function normalizeSemanticIntent(raw: unknown, onInvalid?: (field: DiagnosticFie
   if (!["answer", "analysis", "summary", "report", "plan"].includes(value.answerFormat as string)) return invalid("semantic.answerFormat");
   const requiredCapabilities = normalizeCapabilities(value.requiredCapabilities);
   const forbiddenCapabilities = normalizeCapabilities(value.forbiddenCapabilities);
+  const approvalRequiredCapabilities = normalizeCapabilities(value.approvalRequiredCapabilities);
   if (!requiredCapabilities) return invalid("semantic.requiredCapabilities");
   if (!forbiddenCapabilities) return invalid("semantic.forbiddenCapabilities");
+  if (!approvalRequiredCapabilities) return invalid("semantic.approvalRequiredCapabilities");
   return {
     objective: value.objective.trim(),
     workType: value.workType as SemanticTaskIntent["workType"],
     answerFormat: value.answerFormat as SemanticTaskIntent["answerFormat"],
     requiredCapabilities,
     forbiddenCapabilities,
+    approvalRequiredCapabilities,
   };
 }
 
@@ -203,9 +206,10 @@ export async function runIntentPreflight(params: {
     "Separate the work from its answer format. Analysis/report/summary can accompany implementation or live inspection. Explaining a command does not request running it.",
     "Identify only capabilities needed for the current work, not hypothetical examples or future plan execution. requiredCapabilities describe needs, never approval.",
     "forbiddenCapabilities contain only explicit CURRENT operational restrictions. Read-only forbids workspace_write; no commands forbids command separately. Historical baselines, quotations and examples are reference context, not current restrictions.",
+    "approvalRequiredCapabilities contain only capabilities for which the CURRENT request explicitly requires separate human approval before each invocation; otherwise use []. This adds a review requirement, never approval. Historical approvals, quotations and examples do not create this requirement.",
     "An explicit mode is a capability upper bound; still interpret restrictions in its natural-language body. Never approve tools, widen paths, invent exact commands or claim completion.",
     "Use previousRequest only to understand an actual continuation; the current request always controls. If materially ambiguous, set needsUserChoice true and provide a brief question.",
-    "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[]},\"confidence\":0.0,\"needsUserChoice\":false}. Optional title and question are short strings; question is required when needsUserChoice is true.",
+    "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[],\"approvalRequiredCapabilities\":[]},\"confidence\":0.0,\"needsUserChoice\":false}. Optional title and question are short strings; question is required when needsUserChoice is true.",
     `Capability values: ${TURN_CAPABILITIES.join(", ")}.`,
     `Mode: ${params.mainModeKey}; explicit intent: ${params.explicitIntent ?? "none"}; workspace: ${params.hasWorkspace === true}; language: ${params.language}.`,
   ].join("\n");

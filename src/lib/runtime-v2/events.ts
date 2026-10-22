@@ -46,6 +46,7 @@ export type RuntimeV2Event =
       readonly subagentRequirement?: "optional" | "required";
       readonly objective: string;
       readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+      readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
       readonly acceptanceCriterionIds?: readonly string[];

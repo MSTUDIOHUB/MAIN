@@ -240,6 +240,7 @@ export async function bootstrapRuntimeV2Plan(
           : "optional",
       objective: admission.objective,
       capabilityRestrictions: admission.capabilityRestrictions,
+      approvalRequiredCapabilities: admission.approvalRequiredCapabilities,
       constraints: admission.constraints,
       acceptanceCriteria: admission.acceptanceCriteria.map(
         (criterion) => criterion.text,
@@ -283,10 +284,15 @@ export async function bootstrapRuntimeV2Plan(
 
   const evidence: WorkPlanRuntimeEvidence[] = [];
   const evidenceContents = new Map<string, string>();
+  const objective = ledger.snapshot()!.objective;
+  const canCollectWorkspace = !objective.capabilityRestrictions?.includes("workspace_read") &&
+    !objective.approvalRequiredCapabilities?.includes("workspace_read");
   const oldOverview = existing?.aggregate.events.find((entry) => entry.type === "observation.recorded" && entry.evidence.id === "E1");
   const collected = existing ? {
     overview: oldOverview?.type === "observation.recorded" && oldOverview.modelContent
       ? oldOverview.modelContent : "Historical workspace overview unavailable; use focused reads if needed.",
+  } : !canCollectWorkspace ? {
+    overview: "Workspace discovery requires an individually authorized read tool; no automatic workspace overview was collected.",
   } : await collectInitialOverview({
     runner: input,
     turn,

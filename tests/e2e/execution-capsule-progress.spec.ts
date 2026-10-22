@@ -581,6 +581,40 @@ test("destructive approval shows exact risk and target and cannot enable session
   await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
 });
 
+test("explicit manual command approval suppresses session automation and keeps once and End Turn available", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+  await page.evaluate(async () => {
+    (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.();
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    useAppStore.setState((state: any) => ({
+      activeActionRequest: { ...state.activeActionRequest, risk: "shell", approvalRequiredCapability: "command" },
+      pendingToolCall: { ...state.pendingToolCall, risk: "shell", approvalRequiredCapability: "command" },
+    }));
+  });
+  await expect(page.getByTestId("execution-capsule-tool-review-risk")).toContainText("Shell 命令");
+  await expect(page.getByTestId("execution-capsule-required-human-review")).toContainText("逐次单独批准");
+  await expect(page.getByText("本轮要求逐次单独审批", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-tool-approve-session")).toHaveCount(0);
+  await expect(page.getByTestId("action-card-approve-session")).toHaveCount(0);
+  await expect(page.getByTestId("action-card-auto-approve")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-tool-approve-once")).toBeEnabled();
+  await expect(page.getByTestId("execution-capsule-tool-cancel-turn")).toBeEnabled();
+  const identity = await page.evaluate(() => (window as any).__CODELY_E2E__?.getPendingToolReviewIdentity?.());
+  await page.evaluate(exactIdentity => (window as any).__CODELY_E2E__?.resolvePendingToolReviewWithIdentity?.("approve_session", exactIdentity), identity);
+  await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
+  const unchanged = await page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    return { autoReview: bridge.getSnapshot().autoApproveTools, resolutions: bridge.events.filter((event: any) => event.type === "pending_tool_review_resolved").length };
+  });
+  expect(unchanged).toEqual({ autoReview: false, resolutions: 0 });
+  await page.getByTestId("execution-capsule-tool-approve-once").click();
+  await expect.poll(async () => page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    const events = bridge.events.filter((event: any) => event.type === "pending_tool_review_resolved");
+    return { autoReview: bridge.getSnapshot().autoApproveTools, actions: events.map((event: any) => event.decision?.action) };
+  })).toEqual({ autoReview: false, actions: ["accept"] });
+});
+
 type PermissionIdentity = {
   sessionKey: string;
   turnId: string;

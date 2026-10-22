@@ -1,5 +1,5 @@
 import type { RuntimeV2Command, RuntimeV2EventDraft } from "../../lib/runtime-v2";
-import { runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
+import { runtimeV2ToolApprovalCapability, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
 import { recordToolResultHistory, toolCompletionFor } from "./executionEvidence";
 import { interruptedRuntimeV2ShellBatchReceipt } from "./executionSequentialShellBatchReceipt";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
@@ -29,4 +29,22 @@ export function runtimeV2ToolPreExecutionReceipt(input: {
   return receipt.type === "validation.completed"
     ? { ...receipt, evidence: [], failureKind: "not_executed", failureReasonCode: "turn_capability_restricted" }
     : receipt;
+}
+
+/** Automatic preparation cannot exercise a capability requiring an explicit
+ * proposal. Settle preparation without claiming an observation; subsequent
+ * model-proposed reads still pass the ordinary exact deny/review gate. */
+export function runtimeV2AutomaticObservationDeferredReceipt(
+  ports: RuntimeV2ExecutionPortsInput,
+  command: RuntimeV2Command,
+): RuntimeV2EventDraft | null {
+  const restriction = runtimeV2ToolCapabilityRestriction(ports, "get_project_skeleton");
+  const requiredReview = runtimeV2ToolApprovalCapability(ports, "get_project_skeleton");
+  if (!restriction && !requiredReview) return null;
+  ports.logStoreEvent("runtime_v2_automatic_observation_deferred", {
+    turnId: command.run.turnId, runId: command.run.runId,
+    reason: restriction ? "turn_capability_restricted" : "turn_requires_human_review",
+    capability: restriction || requiredReview,
+  });
+  return { type: "command.completed", run: command.run, idempotencyKey: command.idempotencyKey, status: "succeeded" };
 }

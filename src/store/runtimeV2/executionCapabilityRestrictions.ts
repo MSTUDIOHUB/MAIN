@@ -1,4 +1,4 @@
-import { normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
 import { classifyKnownBuiltInTool, type ToolRiskLevel } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
@@ -12,6 +12,14 @@ export function runtimeV2CapabilityRestrictions(input: RuntimeV2ExecutionPortsIn
   return normalizeTurnCapabilityRestrictions(aggregate
     ? aggregate.objective.capabilityRestrictions
     : input.context.capabilityRestrictions);
+}
+
+/** A manual-review requirement only narrows the admitted invocation. */
+export function runtimeV2ApprovalRequiredCapabilities(input: RuntimeV2ExecutionPortsInput): readonly TurnCapability[] {
+  const aggregate = aggregateForCurrentTurn(input);
+  return normalizeTurnApprovalCapabilities(aggregate
+    ? aggregate.objective.approvalRequiredCapabilities
+    : input.context.approvalRequiredCapabilities);
 }
 
 /** Reuse the catalog's risk classification. Opaque executors cannot prove

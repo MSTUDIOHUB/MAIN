@@ -12,7 +12,7 @@ function createHarness(candidate) {
     confidence: candidate.confidence, needsUserChoice: candidate.needsUserChoice === true,
     title: candidate.title, question: candidate.question ?? (candidate.needsUserChoice ? "Please clarify the requested work." : undefined),
     semantic: { objective: "Handle the requested task", workType: intent === "execute" ? "operate" : intent === "analyze" ? "investigate" : intent === "plan" ? "plan" : "answer",
-      answerFormat: "answer", requiredCapabilities: capabilities, forbiddenCapabilities: [] },
+      answerFormat: "answer", requiredCapabilities: capabilities, forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
   };
   const cache = new Map();
   const requests = [];

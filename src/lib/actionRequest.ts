@@ -41,14 +41,17 @@ export interface ToolPermissionActionRequest extends ActionRequestBase {
   toolName: string;
   target: string;
   risk?: ToolRiskLevel | "write" | "unknown";
+  /** Disclosure only; execution rechecks the canonical Turn requirement. */
+  readonly approvalRequiredCapability?: import("./turnCapabilities").TurnCapability;
   /** Immutable Plan-attempt provenance; once present this request may never downgrade to a generic continuation. */
   readonly planExecution?: ToolPermissionPlanExecutionIdentity;
 }
 
 export function requiresPerCallToolPermissionApproval(
   risk: ToolPermissionActionRequest["risk"],
+  approvalRequiredCapability?: import("./turnCapabilities").TurnCapability,
 ): boolean {
-  return isPerCallOnlyToolRisk(risk);
+  return approvalRequiredCapability !== undefined || isPerCallOnlyToolRisk(risk);
 }
 
 export type ToolPermissionPlanExecutionIdentity = PlanExecutionRunProvenance;

@@ -1,5 +1,5 @@
 import type { ResolvedRunIntent } from "../../lib/runIntent";
-import { normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
 import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { ProjectBaselineContext } from "../../lib/projectBaseline";
@@ -32,6 +32,7 @@ export interface RuntimeV2SubmissionContext {
   readonly runtimeRunIntent: ResolvedRunIntent;
   readonly requiredCapabilities?: readonly TurnCapability[];
   readonly capabilityRestrictions?: readonly TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly TurnCapability[];
   /** Exact live project rules captured at the Turn safe boundary. */
   readonly workspaceInstructionContext?: string;
   /** Frozen, deterministic workspace facts. This is not an instruction,
@@ -73,6 +74,7 @@ export interface RuntimeV2SubmissionContext {
 export interface RuntimeV2ObjectiveAdmission {
   readonly objective: string;
   readonly capabilityRestrictions?: readonly TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly TurnCapability[];
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly {
     readonly id: string;
@@ -94,10 +96,14 @@ export function resolveRuntimeV2ObjectiveAdmission(
   const restrictions = context.capabilityRestrictions === undefined ? {} : {
     capabilityRestrictions: normalizeTurnCapabilityRestrictions(context.capabilityRestrictions),
   };
+  const review = context.approvalRequiredCapabilities === undefined ? {} : {
+    approvalRequiredCapabilities: normalizeTurnApprovalCapabilities(context.approvalRequiredCapabilities),
+  };
   if (supplied?.acceptanceCriteria.length) {
     return {
       objective: String(supplied.objective || fallbackObjective).trim(),
       ...restrictions,
+      ...review,
       constraints: [...(supplied.constraints || [])],
       acceptanceCriteria: supplied.acceptanceCriteria.map((criterion) => ({
         ...criterion,
@@ -108,6 +114,7 @@ export function resolveRuntimeV2ObjectiveAdmission(
   return {
     objective,
     ...restrictions,
+    ...review,
     constraints: [],
     acceptanceCriteria: [{
       id: "criterion-user-objective",

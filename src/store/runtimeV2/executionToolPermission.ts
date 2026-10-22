@@ -14,6 +14,7 @@ import type { TaskBlock } from "../../lib/taskTypes";
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import type { ShellPermissionDecision } from "../../lib/ipc";
+import type { TurnCapability } from "../../lib/turnCapabilities";
 
 function ownsRuntimeV2PermissionRun(
   state: any,
@@ -66,6 +67,8 @@ export async function requestRuntimeV2ToolPermission(input: {
   readonly args: Record<string, unknown>;
   readonly target: string;
   readonly risk: ToolRiskLevel;
+  /** Disclosure from the canonical authorization result; this adapter grants no authority. */
+  readonly approvalRequiredCapability?: TurnCapability;
   readonly permissionTarget: string;
   readonly shellPermissionDecision?: ShellPermissionDecision;
   readonly signal?: AbortSignal;
@@ -117,6 +120,7 @@ export async function requestRuntimeV2ToolPermission(input: {
     name: input.toolName,
     arguments: { ...input.args },
     risk: input.risk,
+    ...(input.approvalRequiredCapability ? { approvalRequiredCapability: input.approvalRequiredCapability } : {}),
     ...(externalRead ? { localFileReadPath: normalizedTarget } : {}),
     ...(input.shellPermissionDecision
       ? { shellPermissionDecision: input.shellPermissionDecision }

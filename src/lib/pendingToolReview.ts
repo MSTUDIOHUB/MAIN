@@ -13,6 +13,7 @@ type PendingToolCallLike = {
   risk?: ToolPermissionActionRequest["risk"];
   localFileReadPath?: string;
   shellPermissionDecision?: unknown;
+  approvalRequiredCapability?: ToolPermissionActionRequest["approvalRequiredCapability"];
 } | null | undefined;
 
 type ToolTaskBlock = Extract<TaskBlock, { type: "tool" }>;
@@ -226,6 +227,7 @@ export function buildToolPermissionActionRequest(input: {
     toolName,
     target: derivePendingReviewTarget(toolName, args, input.toolCall.localFileReadPath),
     risk,
+    ...(input.toolCall.approvalRequiredCapability ? { approvalRequiredCapability: input.toolCall.approvalRequiredCapability } : {}),
     ...(input.planExecution ? { planExecution: { ...input.planExecution } } : {}),
   };
 }

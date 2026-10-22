@@ -281,6 +281,7 @@ async function authorizeStagedMutation(input: {
       args: { ...input.staged.arguments },
       target,
       risk: authorization.risk,
+      approvalRequiredCapability: authorization.approvalRequiredCapability,
       permissionTarget: target,
       signal: input.signal,
     });

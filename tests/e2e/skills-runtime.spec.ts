@@ -168,7 +168,7 @@ test.beforeEach(async ({ page }) => {
             semantic: {
               objective: "提供技能工作流建议",
               workType: (window as any).__SKILLS_RUNTIME_E2E__.providerFlow === "list-load" ? "investigate" : "answer",
-              answerFormat: "answer", requiredCapabilities: [], forbiddenCapabilities: [],
+              answerFormat: "answer", requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: [],
             }, confidence: 0.99, needsUserChoice: false,
           }) });
         }

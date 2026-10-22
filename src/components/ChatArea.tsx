@@ -3587,6 +3587,7 @@ export default function ChatArea({
             diff={block.diff}
             shellPermissionDecision={block.shellPermissionDecision}
             permissionRisk={blockPermissionIdentity ? permissionActionRequest?.risk : undefined}
+            permissionApprovalRequiredCapability={blockPermissionIdentity ? permissionActionRequest?.approvalRequiredCapability : undefined}
             intentSummary={block.intentSummary}
             why={block.why}
             evidence={block.evidence}
@@ -3595,6 +3596,7 @@ export default function ChatArea({
               ? () => allowToolAction?.(block.id, blockPermissionIdentity)
               : undefined}
             onAllowForSession={blockPermissionIdentity
+              && !permissionActionRequest?.approvalRequiredCapability
               ? () => approvePendingReviewForSession?.(blockPermissionIdentity)
               : undefined}
             onReject={blockPermissionIdentity
@@ -4610,6 +4612,7 @@ export default function ChatArea({
       requestId={permissionActionRequest?.requestId || undefined}
       permissionIdentity={permissionResolutionIdentity || undefined}
       permissionRisk={permissionActionRequest?.risk}
+      permissionApprovalRequiredCapability={permissionActionRequest?.approvalRequiredCapability}
       permissionToolName={permissionActionRequest?.toolName}
       permissionTarget={permissionActionRequest?.target}
       permissionArgumentDisclosure={pendingToolArgumentDisclosure}

@@ -105,6 +105,7 @@ export interface RuntimeV2Objective {
   readonly text: string;
   /** Immutable current-request restrictions; never tool approval or scope. */
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly string[];
   /** Stable runtime-owned identities. Goal slices preserve their original

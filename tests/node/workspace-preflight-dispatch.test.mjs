@@ -188,7 +188,7 @@ function semanticFixture(result) {
       answerFormat,
       requiredCapabilities: intent === "execute" ? ["command"]
         : ["analyze", "report", "plan"].includes(intent) ? ["workspace_read"] : [],
-      forbiddenCapabilities: [],
+      forbiddenCapabilities: [], approvalRequiredCapabilities: [],
     },
     confidence: result.confidence ?? 0.98,
     needsUserChoice: result.needsUserChoice === true,
@@ -200,7 +200,7 @@ function semanticFixture(result) {
 function semanticResult(workType, requiredCapabilities, answerFormat = "answer", forbiddenCapabilities = []) {
   return {
     semantic: { objective: "Handle exactly the current user request", workType, answerFormat,
-      requiredCapabilities, forbiddenCapabilities },
+      requiredCapabilities, forbiddenCapabilities, approvalRequiredCapabilities: [] },
     confidence: 0.98,
     needsUserChoice: false,
     title: "Current request",

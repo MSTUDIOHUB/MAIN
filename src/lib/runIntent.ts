@@ -107,6 +107,8 @@ export interface SemanticTaskIntent {
   answerFormat: "answer" | "analysis" | "summary" | "report" | "plan";
   requiredCapabilities: readonly SemanticCapability[];
   forbiddenCapabilities: readonly SemanticCapability[];
+  /** Current request requires human approval for each matching invocation. */
+  approvalRequiredCapabilities: readonly SemanticCapability[];
 }
 
 export interface IntentPreflightResult {

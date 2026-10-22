@@ -12,12 +12,22 @@ export type TurnCapability = typeof TURN_CAPABILITIES[number];
 export type SemanticCapability = TurnCapability;
 
 export function normalizeTurnCapabilityRestrictions(value: unknown): TurnCapability[] {
+  return normalizeCapabilityList(value, "TURN_CAPABILITY_RESTRICTIONS_INVALID");
+}
+
+/** Current-request manual review requirements only narrow existing authority.
+ * A missing field is accepted solely for trusted legacy admissions/replay. */
+export function normalizeTurnApprovalCapabilities(value: unknown): TurnCapability[] {
+  return normalizeCapabilityList(value, "TURN_APPROVAL_CAPABILITIES_INVALID");
+}
+
+function normalizeCapabilityList(value: unknown, errorCode: string): TurnCapability[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((entry) =>
     typeof entry !== "string" ||
     !(TURN_CAPABILITIES as readonly string[]).includes(entry)
   )) {
-    throw new Error("TURN_CAPABILITY_RESTRICTIONS_INVALID");
+    throw new Error(errorCode);
   }
   return [...new Set(value)] as TurnCapability[];
 }

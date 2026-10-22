@@ -36,7 +36,7 @@ const { authorizeToolForCurrentTurn } = loadTs(path.join(root, "src/store/runtim
 const { createRuntimeV2LiveExecutionState } = loadTs(path.join(root, "src/store/runtimeV2/executionTypes.ts"));
 const { buildShellPermissionApproval } = loadTs(path.join(root, "src/lib/shellAutoApproval.ts"));
 
-function fixture({ consent = null, command = "unity --version", decision = "allow", critical = false, autoApproveTools = false, autoApproveToolScopes = [] } = {}) {
+function fixture({ consent = null, command = "unity --version", decision = "allow", critical = false, autoApproveTools = false, autoApproveToolScopes = [], approvalRequiredCapabilities = [] } = {}) {
   const state = {
     config: {},
     currentTurnExecutionConsent: consent,
@@ -63,7 +63,7 @@ function fixture({ consent = null, command = "unity --version", decision = "allo
     get: () => state,
     set: (value) => Object.assign(state, typeof value === "function" ? value(state) : value),
     live: createRuntimeV2LiveExecutionState(),
-    context: { turnId: "turn", runWorkspace: "/fixture", runSessionKey: "/fixture:1", runtimeRunIntent: "execute", phaseLanguage: "en" },
+    context: { turnId: "turn", runWorkspace: "/fixture", runSessionKey: "/fixture:1", runtimeRunIntent: "execute", phaseLanguage: "en", approvalRequiredCapabilities },
     now: () => 100,
     logStoreEvent: () => {},
   };
@@ -255,7 +255,7 @@ test("current no-command contract filters the actual provider surface and reject
   assert.match(decision.reason, /command/);
 });
 
-async function restrictedCheckpoint(restrictions) {
+async function restrictedCheckpoint(restrictions, approvalRequiredCapabilities) {
   const runtime = loadTs(path.join(root, "src/lib/runtime-v2/index.ts"));
   let checkpoint = null;
   let sequence = 0;
@@ -272,7 +272,7 @@ async function restrictedCheckpoint(restrictions) {
     turn: { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" },
     run: { sessionKey: "/fixture:1", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" },
     strategy: "execute", objective: "Respect this Turn's explicit capability restrictions.",
-    capabilityRestrictions: restrictions, initialPhase: "observing",
+    capabilityRestrictions: restrictions, approvalRequiredCapabilities, initialPhase: "observing",
   });
   return JSON.parse(JSON.stringify(checkpoint));
 }
@@ -350,6 +350,44 @@ test("child advertised tools and forged calls inherit the parent's restored capa
   }
 });
 
+test('children cannot bypass restored manual review or inherit an automatic source baseline', async () => {
+  const childProvider = loadTs(path.join(root, 'src/store/runtimeV2/executionSubagentProvider.ts'));
+  const executor = loadTs(path.join(root, 'src/lib/toolExecutor.ts'));
+  const { startRuntimeV2Child } = loadTs(path.join(root, 'src/store/runtimeV2/executionSubagentRunner.ts'));
+  const originalRequest = childProvider.requestRuntimeV2ChildStep; const originalExecute = executor.executeTool;
+  let executed = 0;
+  const f = fixture({ consent: { turnId: 'turn', granted: true }, autoApproveTools: true, autoApproveToolScopes: ['shell'] });
+  f.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint([], ['workspace_read', 'command']) };
+  f.ports.context.workspaceInstructionContext = 'UNREVIEWED_WORKSPACE_INSTRUCTIONS';
+  f.ports.context.projectBaselineContext = {
+    kind: 'project_baseline_context', schemaVersion: 1, parserVersion: 1,
+    workspace: { canonicalPath: '/fixture', identity: 'source-baseline', vcs: null },
+    limits: {}, anchors: [], topology: [{ path: 'UNREVIEWED_BASELINE_PATH', kind: 'directory' }],
+    facts: { languages: [], packageManagers: [], runtimes: [], scripts: [] }, omissions: [], diagnostics: [],
+    truncated: { anchors: false, topology: false, scripts: false }, fingerprints: { anchors: 'a', topology: 't', facts: 'f', overall: 'o' },
+  };
+  executor.executeTool = async () => { executed++; throw new Error('Manual child action executed without a parent review'); };
+  try {
+    for (const call of [
+      { id: 'child-manual-read', name: 'read_file', arguments: { path: 'private.txt' } },
+      { id: 'child-manual-command', name: 'run_command', arguments: { command: 'npm test', cwd: '.' } },
+    ]) {
+      const requests = [];
+      childProvider.requestRuntimeV2ChildStep = async input => {
+        requests.push(structuredClone(input.messages));
+        return requests.length === 1 ? { toolCalls: [call], diagnostics: [], visibleText: '' }
+          : { toolCalls: [], diagnostics: [{ code: 'fixture_done' }], visibleText: '' };
+      };
+      await startRuntimeV2Child(f.ports, { id: call.id, parentRunId: 'run', scopeKey: 'scope', taskKind: 'validate', accessMode: 'read', allowedPaths: ['.'], objective: 'Inspect only after parent review.', run: { ...f.request.command.run, runId: `${call.id}-run`, parentRunId: 'run' } }, f.abort.signal);
+      assert.equal(executed, 0); assert.equal(requests.length, 2);
+      assert.doesNotMatch(JSON.stringify(requests[0]), /UNREVIEWED_WORKSPACE_INSTRUCTIONS|UNREVIEWED_BASELINE_PATH/);
+      assert.deepEqual(requests[1].filter(message => message.role === 'tool').map(message => message.tool_call_id), [call.id]);
+      for (const message of requests[1].filter(message => message.role === 'tool')) assert.match(message.content, /TOOL_BLOCKED/);
+    }
+    assert.equal(f.state.activeActionRequest, undefined, 'a child cannot manufacture a parent review owner');
+  } finally { childProvider.requestRuntimeV2ChildStep = originalRequest; executor.executeTool = originalExecute; }
+});
+
 test("a capability-blocked validator has no attempted validation evidence", async () => {
   const { createRuntimeV2ToolPort } = loadTs(path.join(root, "src/store/runtimeV2/executionToolPort.ts"));
   const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true });
@@ -382,4 +420,172 @@ test("global Skill resource reads remain guidance and grant no external file, wr
   const external = await authorizeToolForCurrentTurn(f.ports, "read_file", { path: "/outside/reference.md" });
   assert.equal(external.allowed, false);
   assert.equal(external.approvalRequired, true);
+});
+
+test('explicit per-action review overrides native allow, task consent and session automation', async () => {
+  for (const decision of ['allow', 'ask']) {
+    const f = fixture({ consent: { turnId: 'turn', granted: true }, command: 'pwd', decision, autoApproveTools: true, autoApproveToolScopes: ['shell'], approvalRequiredCapabilities: ['command'] });
+    f.state.approvedShellPermissionRules = ['pwd'];
+    const { pending, resolve } = await pendingReview(f);
+    assert.equal(f.state.activeActionRequest.approvalRequiredCapability, 'command');
+    resolve({ action: 'accept', ...(decision === 'ask' ? { shellPermissionApproval: buildShellPermissionApproval(f.preflight, 'once') } : {}) });
+    const result = await pending;
+    assert.equal(result.allowed, true);
+    if (decision === 'allow') assert.equal(result.authorization.shellPermissionApproval, undefined, 'safe native allow needs no fabricated ask approval');
+    assert.equal((await authorizeToolForCurrentTurn(f.ports, 'run_command', f.request.args)).approvalRequired, true, 'the next exact call still requires its own review');
+  }
+});
+test('explicit review also applies to source reads, writes and enabled network tools', async () => {
+  for (const [capability, toolName, args] of [['workspace_read', 'read_file', { path: 'private.txt' }], ['workspace_write', 'write_file', { path: 'result.txt', content: 'value' }], ['network', 'web_search', { query: 'fixture' }]]) {
+    const f = fixture({ consent: { turnId: 'turn', granted: true }, autoApproveTools: true, autoApproveToolScopes: ['workspace_write', 'external_read'], approvalRequiredCapabilities: [capability] });
+    f.state.webSearchEnabled = true;
+    Object.assign(f.request, { toolName, args, target: args.path || 'fixture', failureContextTarget: args.path || 'fixture' });
+    const { pending, resolve } = await pendingReview(f);
+    assert.equal(f.state.activeActionRequest.approvalRequiredCapability, capability);
+    resolve({ action: 'accept' });
+    assert.equal((await pending).allowed, true);
+    assert.equal((await authorizeToolForCurrentTurn(f.ports, toolName, args)).approvalRequired, true);
+  }
+});
+test('deny precedes explicit review and cancelling or rejecting review never authorizes execution', async () => {
+  const denied = fixture({ consent: { turnId: 'turn', granted: true }, decision: 'deny', approvalRequiredCapabilities: ['command'] });
+  const refusal = await resolveRuntimeV2ToolAuthorization(denied.request);
+  assert.equal(refusal.allowed, false); assert.equal(denied.state.activeActionRequest, undefined);
+  for (const action of ['reject', 'cancel']) {
+    const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: ['command'] });
+    const { pending, resolve } = await pendingReview(f);
+    if (action === 'cancel') f.abort.abort(); else resolve({ action: 'reject' });
+    const result = await pending;
+    assert.equal(result.allowed, false); resolve({ action: 'accept' });
+    assert.equal((await authorizeToolForCurrentTurn(f.ports, 'run_command', f.request.args)).approvalRequired, true);
+  }
+});
+
+test('restored canonical review requirements override mutable context and legacy empty requirements stay empty', async () => {
+  const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: [] });
+  f.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint([], ['command']) };
+  const { pending, resolve } = await pendingReview(f); resolve({ action: 'accept' }); assert.equal((await pending).allowed, true);
+  assert.equal((await authorizeToolForCurrentTurn(f.ports, 'run_command', f.request.args)).approvalRequiredCapability, 'command');
+  const legacy = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: ['command'] });
+  legacy.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint([]) };
+  assert.equal((await authorizeToolForCurrentTurn(legacy.ports, 'run_command', legacy.request.args)).allowed, true, 'a new mutable context cannot rewrite admitted legacy policy');
+});
+test('review cancellation and owner or argument replacement prevent a late manual acceptance', async () => {
+  for (const mutate of [f => f.abort.abort(), f => { f.state.harnessRunMarker = { ...f.state.harnessRunMarker, runId: 'replacement' }; }, f => { f.request.args.command = 'different command'; }]) {
+    const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: ['command'] });
+    const { pending, resolve } = await pendingReview(f); mutate(f); resolve({ action: 'accept' });
+    assert.equal((await pending).allowed, false);
+  }
+});
+test('a new hard policy denial wins over an already waiting manual review', async () => {
+  const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: ['command'] });
+  const { pending, resolve } = await pendingReview(f);
+  const prior = f.ports.live.authorization;
+  f.ports.live.authorization = { ...prior, policy: { ...prior.policy, disabledRiskLevels: ['shell'] } };
+  resolve({ action: 'accept' }); assert.equal((await pending).allowed, false);
+});
+test('cached source replay waits for exact manual review before replaying any bytes', async () => {
+  const { createRuntimeV2ToolPort } = loadTs(path.join(root, 'src/store/runtimeV2/executionToolPort.ts'));
+  const executor = loadTs(path.join(root, 'src/lib/toolExecutor.ts')); const original = executor.executeTool;
+  let executed = 0; executor.executeTool = async () => { executed++; throw new Error('Cached read reached IPC'); };
+  try {
+    for (const action of ['accept', 'reject']) {
+      const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: [] });
+      f.state.runtimeV2Checkpoints = { turn: await restrictedCheckpoint([], ['workspace_read']) };
+      f.ports.live.coveredReadToolResults.set('manual-source', 'CACHED_SOURCE_BYTES');
+      const command = { ...f.request.command, payload: { toolName: 'read_file', toolCallId: 'manual-source', arguments: { path: 'private.txt' } } };
+      const pending = createRuntimeV2ToolPort(f.ports).execute({ command, signal: f.abort.signal });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      assert.equal(f.state.activeActionRequest?.approvalRequiredCapability, 'workspace_read');
+      assert.equal(executed, 0); assert.equal(f.ports.live.messages.some(x => String(x.content).includes('CACHED_SOURCE_BYTES')), false);
+      f.state.pendingReviewResolve({ action }); const result = await pending;
+      if (action === 'accept') { assert.equal(result.status, 'succeeded'); assert.equal(result.receiptOrigin, 'replayed'); }
+      else { assert.equal(result.status, 'blocked'); assert.deepEqual(result.evidence, []); }
+      assert.equal(executed, 0);
+    }
+  } finally { executor.executeTool = original; }
+});
+test('cold automatic observation defers manual or forbidden reads through the real controller without source evidence', async () => {
+  const runtime = loadTs(path.join(root, 'src/lib/runtime-v2/index.ts'));
+  const { createRuntimeV2ToolPort } = loadTs(path.join(root, 'src/store/runtimeV2/executionToolPort.ts'));
+  const executor = loadTs(path.join(root, 'src/lib/toolExecutor.ts')); const original = executor.executeTool;
+  let executed = 0; executor.executeTool = async () => { executed++; throw new Error('Unreviewed bootstrap reached IPC'); };
+  try {
+    for (const manual of [true, false]) {
+      const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: [] });
+      const logs = []; f.ports.logStoreEvent = (name, detail) => logs.push({ name, ...detail });
+      let checkpoint = null; let sequence = 0;
+      const controllerPorts = {
+        checkpoint: { append: async (input) => {
+          const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, ...input });
+          if (result.checkpoint) { checkpoint = result.checkpoint; f.state.runtimeV2Checkpoints = { turn: JSON.parse(JSON.stringify(checkpoint)) }; }
+          return result;
+        } },
+        projection: { publish: async () => {} }, tool: createRuntimeV2ToolPort(f.ports),
+        provider: { request: async () => { throw new Error('This preparation step must not request a model'); } },
+        clockId: { now: () => ++sequence, nextId: scope => `${scope}-${++sequence}` },
+      };
+      const controller = new runtime.RuntimeV2Controller(controllerPorts);
+      await controller.admit({
+        turn: { workspaceKey: '/fixture', sessionKey: '/fixture:1', sessionEpoch: 'epoch', clientSubmissionId: 'submission', turnId: 'turn' },
+        run: { ...f.request.command.run, attemptId: 'attempt' }, strategy: 'execute', objective: 'Read only after approval.',
+        capabilityRestrictions: manual ? [] : ['workspace_read'], approvalRequiredCapabilities: manual ? ['workspace_read'] : [], initialPhase: 'preparing',
+      });
+      // Serialize the admitted checkpoint and restore a new controller as production cold resume does.
+      const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(checkpoint)));
+      const resumed = new runtime.RuntimeV2Controller(controllerPorts, { aggregate: restored.aggregate, revision: checkpoint.revision });
+      assert.equal(await resumed.driveOnce(), true);
+      const aggregate = resumed.snapshot().aggregate;
+      assert.equal(executed, 0); assert.equal(f.state.activeActionRequest, undefined);
+      assert.deepEqual(aggregate.evidence, []); assert.deepEqual(aggregate.scheduledCommands, []);
+      assert.equal(aggregate.events.some(event => ['observation.recorded', 'tool.completed', 'validation.completed'].includes(event.type)), false);
+      assert.equal(aggregate.events.filter(event => event.type === 'command.completed').at(-1).status, 'succeeded', 'only the automatic preparation step is settled');
+      assert.equal(runtime.hasCompletedRuntimeV2InitialObservation(aggregate), true);
+      await resumed.changePhase('observing', 'initial_observation_completed');
+      assert.equal(resumed.snapshot().aggregate.phase, 'observing');
+      const next = runtime.decideNextCommands(resumed.snapshot().aggregate, {});
+      assert.equal(next[0]?.kind, 'request_model');
+      assert.equal(next[0]?.phase, 'observing', 'the existing phase transition advances deferred preparation to observation');
+      assert.equal(logs.at(-1).name, 'runtime_v2_automatic_observation_deferred');
+      assert.equal(logs.at(-1).reason, manual ? 'turn_requires_human_review' : 'turn_capability_restricted');
+    }
+  } finally { executor.executeTool = original; }
+});
+test('a pre-approved external path still needs each required manual review', async () => {
+  const f = fixture({ consent: { turnId: 'turn', granted: true }, approvalRequiredCapabilities: ['workspace_read'] });
+  f.state.approvedLocalFileReadPaths = ['/outside/secret.txt'];
+  Object.assign(f.request, { toolName: 'read_file', args: { path: '/outside/secret.txt' }, target: '/outside/secret.txt', failureContextTarget: '/outside/secret.txt' });
+  const { pending, resolve } = await pendingReview(f); resolve({ action: 'accept', grantLocalFileReadPath: '/outside/secret.txt' });
+  const result = await pending; assert.equal(result.allowed, true); assert.equal(result.authorization.allowExternalLocalRead, true);
+  assert.equal((await authorizeToolForCurrentTurn(f.ports, 'read_file', f.request.args)).approvalRequiredCapability, 'workspace_read');
+});
+test('manual disclosure metadata suppresses session approval without changing ordinary policy', () => {
+  const { requiresPerCallToolPermissionApproval } = loadTs(path.join(root, 'src/lib/actionRequest.ts'));
+  assert.equal(requiresPerCallToolPermissionApproval('shell', 'command'), true);
+  assert.equal(requiresPerCallToolPermissionApproval('read_only', 'workspace_read'), true);
+  assert.equal(requiresPerCallToolPermissionApproval('shell'), false);
+  assert.equal(requiresPerCallToolPermissionApproval('read_only'), false);
+});
+
+test('the permission presentation adapter discloses optional canonical review metadata without constructing authorization', async () => {
+  const { requestRuntimeV2ToolPermission } = loadTs(path.join(root, 'src/store/runtimeV2/executionToolPermission.ts'));
+  for (const capability of [undefined, 'command']) {
+    const f = fixture();
+    delete f.state.config;
+    const presentationPorts = {
+      get: f.ports.get, set: f.ports.set, now: f.ports.now, logStoreEvent: f.ports.logStoreEvent,
+      context: { phaseLanguage: 'en', turnId: 'turn' },
+    };
+    assert.equal(presentationPorts.live, undefined);
+    const review = requestRuntimeV2ToolPermission({
+      ports: presentationPorts, command: f.request.command, toolName: 'run_command', args: f.request.args,
+      target: f.request.target, permissionTarget: f.request.target, risk: 'shell', approvalRequiredCapability: capability,
+    });
+    assert.equal(f.state.activeActionRequest.status, 'pending');
+    assert.equal(f.state.activeActionRequest.approvalRequiredCapability, capability);
+    assert.equal(f.state.pendingToolCall.approvalRequiredCapability, capability);
+    f.state.pendingReviewResolve({ action: 'accept' });
+    assert.equal((await review).action, 'accept');
+    assert.equal(f.state.currentTurnExecutionConsent, null, 'presentation metadata cannot grant Turn consent');
+  }
 });

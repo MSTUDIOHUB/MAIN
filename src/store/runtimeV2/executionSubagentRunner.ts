@@ -1,5 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { filterRuntimeV2CapabilityRestrictedTools, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
+import { filterRuntimeV2CapabilityRestrictedTools, runtimeV2ToolCapabilityRestriction, runtimeV2ToolApprovalCapability } from "./executionAuthorizationContext";
 import {
   isSkillVisibleToModel,
   renderExplicitSkillActivationContext,
@@ -85,6 +85,9 @@ async function childToolAllowed(input: {
   readonly args: Record<string, unknown>;
 }): Promise<boolean> {
   if (runtimeV2ToolCapabilityRestriction(input.ports, input.name, input.args)) return false;
+  // Child effects have no independent human ActionRequest owner. A matching
+  // action must return to the parent and use its exact per-call review gate.
+  if (runtimeV2ToolApprovalCapability(input.ports, input.name, input.args)) return false;
   if (READ_ONLY_CHILD_TOOL_NAMES.has(input.name)) {
     if (input.name === "load_skill") {
       if (input.args.operation === "list") {
@@ -185,7 +188,9 @@ async function runRuntimeV2Child(input: {
     input.ports.context.skillCatalog,
   ));
   const aggregate = aggregateForCurrentTurn(input.ports);
-  const projectBaselineContext = isProjectBaselineForWorkspace(
+  const allowAutomaticWorkspaceContext = !runtimeV2ToolCapabilityRestriction(input.ports, "get_project_skeleton") &&
+    !runtimeV2ToolApprovalCapability(input.ports, "get_project_skeleton");
+  const projectBaselineContext = allowAutomaticWorkspaceContext && isProjectBaselineForWorkspace(
     input.ports.context.projectBaselineContext,
     input.ports.context.runWorkspace || "",
   ) ? input.ports.context.projectBaselineContext : null;
@@ -250,7 +255,7 @@ async function runRuntimeV2Child(input: {
           ? "Use the provided read/search tools only for the assigned source, then stage one coherent mutation transaction. Final project validation remains the parent's responsibility."
           : "Use only the provided read/search tools.",
       "When the bounded task is answered, return one concise final summary in ordinary text. Cite supporting sources by their exact file paths or evidence ids. A file path must identify an unambiguous source actually read by this child; cite exact evidence ids for inherited context and other observations.",
-      input.ports.context.workspaceInstructionContext
+      allowAutomaticWorkspaceContext && input.ports.context.workspaceInstructionContext
         ? [
             "LIVE_WORKSPACE_INSTRUCTIONS:",
             input.ports.context.workspaceInstructionContext,

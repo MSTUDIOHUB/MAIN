@@ -54,6 +54,7 @@ import {
 import {
   authorizationFor,
   runtimeV2ToolCapabilityRestriction,
+  runtimeV2ToolApprovalCapability,
   isRuntimeV2EffectRisk,
   isRuntimeV2ObservationRisk,
   runtimeV2CatalogToolSource,
@@ -427,19 +428,29 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
+  const approvalRequiredCapability = runtimeV2ToolApprovalCapability(input, exposedName, args);
+  const manualReview = approvalRequiredCapability ? {
+    allowed: false as const,
+    reason: "This Turn requires separate human approval for this action.",
+    allowExternalLocalRead: false,
+    approvalRequired: true,
+    approvalRequiredCapability,
+    risk,
+    ...(localFileReadPath ? { localFileReadPath } : {}),
+  } : null;
+  if (risk === "external_read") {
+    const networkTool = catalogResolution.entry.source === "built_in" && (exposedName === "web_search" || exposedName === "web_fetch");
+    if (networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)) {
+      return { allowed: false, reason: "当前会话未启用网络访问。", allowExternalLocalRead: false };
+    }
+  }
+  const shellCommand = risk === "shell" || getShellPermissionCommandForTool(exposedName, args);
+  if (manualReview && !shellCommand) return manualReview;
   if (risk === "read_only") {
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "external_read") {
-    const networkTool = catalogResolution.entry.source === "built_in" &&
-      (exposedName === "web_search" || exposedName === "web_fetch");
-    return networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)
-      ? {
-          allowed: false,
-          reason: "当前会话未启用网络访问。",
-          allowExternalLocalRead: false,
-        }
-      : { allowed: true, reason: null, allowExternalLocalRead: false };
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "local_file_read") {
     const approved = !!localFileReadPath &&
@@ -462,7 +473,7 @@ export async function authorizeToolForCurrentTurn(
   const hasConsent = consent?.turnId === input.context.turnId && consent.granted === true;
   // A dangerous shell command is classified as destructive, but still needs
   // the shell guard's exact decision/approval packet at the execution boundary.
-  if (risk === "shell" || getShellPermissionCommandForTool(exposedName, args)) {
+  if (shellCommand) {
     const shell = await resolveShellAutoApproval({
       toolName: exposedName,
       args,
@@ -476,6 +487,7 @@ export async function authorizeToolForCurrentTurn(
         allowExternalLocalRead: false,
       };
     }
+    if (manualReview) return { ...manualReview, ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}) };
     const autoReviewAllowed = state.autoApproveTools === true &&
       isAllowedBySessionAutoApprove(
         risk,

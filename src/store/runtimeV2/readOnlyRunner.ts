@@ -199,9 +199,10 @@ export async function runSubmitRuntimeV2ReadOnly(
     const result = await runRuntimeV2ReadOnlyLoop({
       ports, turn: identity.turn, run: identity.run, objective: turn.userPrompt,
       capabilityRestrictions: input.context.capabilityRestrictions,
+      approvalRequiredCapabilities: input.context.approvalRequiredCapabilities,
       // The admission baseline is already in provider history. Let the model
       // name any missing source instead of forcing another full project map.
-      strategy, collectWorkspace: !(existing?.aggregate.objective.capabilityRestrictions || input.context.capabilityRestrictions)?.includes("workspace_read") && !!workspace && !isProjectBaselineForWorkspace(
+      strategy, collectWorkspace: !(existing?.aggregate.objective.capabilityRestrictions || input.context.capabilityRestrictions)?.includes("workspace_read") && !(existing ? existing.aggregate.objective.approvalRequiredCapabilities : input.context.approvalRequiredCapabilities)?.includes("workspace_read") && !!workspace && !isProjectBaselineForWorkspace(
         input.context.projectBaselineContext,
         workspace,
       ), networkRead: input.context.networkRead,

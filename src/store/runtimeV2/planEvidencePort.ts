@@ -1,6 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
-import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
@@ -81,7 +81,10 @@ export async function executeReadOnlyPlanTool(input: {
   const restriction = runtimeV2BuiltinCapabilityRestriction(
     normalizeTurnCapabilityRestrictions(input.ledger.snapshot()?.objective.capabilityRestrictions), input.call.name,
   );
-  if (restriction || !PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name)) {
+  const review = runtimeV2BuiltinCapabilityRestriction(
+    normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities), input.call.name,
+  );
+  if (restriction || review || !PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name)) {
     await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
@@ -91,7 +94,9 @@ export async function executeReadOnlyPlanTool(input: {
     input.messages.push({
       role: "tool",
       tool_call_id: input.call.id,
-      content: restriction ? `TURN_CAPABILITY_RESTRICTED: ${restriction}` : "PLAN_TOOL_BLOCKED: use a read-only tool or submit_runtime_v2_work_plan.",
+      content: restriction ? `TURN_CAPABILITY_RESTRICTED: ${restriction}` : review
+        ? `TURN_TOOL_REVIEW_REQUIRED: ${review}. This Plan read adapter cannot approve an invocation; use Execute for individually reviewed tools.`
+        : "PLAN_TOOL_BLOCKED: use a read-only tool or submit_runtime_v2_work_plan.",
     });
     await input.ledger.recordSoftSignal(
       input.run,

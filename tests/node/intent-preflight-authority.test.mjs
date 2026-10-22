@@ -51,6 +51,7 @@ function candidate(overrides = {}) {
       answerFormat: "answer",
       requiredCapabilities: [],
       forbiddenCapabilities: ["workspace_write", "command"],
+      approvalRequiredCapabilities: [],
       ...overrides,
     },
     confidence: 0.97,
@@ -73,6 +74,22 @@ test("semantic preflight drops model authority, commands, and completion claims"
   assert.equal(result.riskLevel, "low");
   assert.equal(result.summary, "Explain the previous result");
   assert.deepEqual(result.semantic.forbiddenCapabilities, ["workspace_write", "command"]);
+});
+
+test("current manual review requirements are restrictive semantics, never model approval", async () => {
+  const wire = candidate({ workType: "operate", requiredCapabilities: ["command"], forbiddenCapabilities: [], approvalRequiredCapabilities: ["command", "command"] });
+  wire.approved = true;
+  const result = await loadPreflight(wire)({ ...params, input: "Run one command only after I approve that exact invocation." });
+  assert.deepEqual(result.semantic.approvalRequiredCapabilities, ["command"]);
+  assert.equal(result.intent, "execute");
+  assert.equal(result.approved, undefined);
+  assert.equal(result.commandDirective.exactCommand, undefined);
+  for (const value of [undefined, null, "command", ["unknown"], [true]]) {
+    const invalid = candidate({ approvalRequiredCapabilities: value });
+    const diagnostics = [];
+    assert.equal(await loadPreflight(invalid)({ ...params, onDiagnostic: (event) => diagnostics.push(event) }), null);
+    assert.equal(diagnostics[0].field, "semantic.approvalRequiredCapabilities");
+  }
 });
 
 test("valid semantic objectives supply missing display titles without changing semantics", async () => {

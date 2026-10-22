@@ -209,6 +209,7 @@ export async function runSubmitRuntimeV2Execute(
         strategy: "execute",
         objective: admission.objective,
         capabilityRestrictions: admission.capabilityRestrictions,
+        approvalRequiredCapabilities: admission.approvalRequiredCapabilities,
         constraints: admission.constraints,
         acceptanceCriteria: admission.acceptanceCriteria.map(
           (criterion) => criterion.text,
@@ -220,7 +221,7 @@ export async function runSubmitRuntimeV2Execute(
           runtimeV2ExecuteAcceptanceEvidenceRequirements(
             admission.acceptanceCriteria,
           ),
-        initialPhase: admission.capabilityRestrictions?.includes("workspace_read") ? "observing" : "preparing",
+        initialPhase: admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
@@ -493,7 +494,7 @@ export async function runSubmitRuntimeV2Execute(
           reasonCode: "initial_observation_committed",
           evidenceCount: before.evidence.length,
         });
-        await controller.changePhase("observing", "已完成初始工作区观察，开始基于证据定位问题。");
+        await controller.changePhase("observing", "初始准备已处理，继续获取本轮任务所需的信息。");
         continue;
       }
       const subagentPolicy = resolveSubagentCapacityPolicy(

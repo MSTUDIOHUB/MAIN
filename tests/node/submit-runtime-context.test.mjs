@@ -105,7 +105,7 @@ function baseInput(overrides = {}) {
 }
 
 test("submit runtime context carries immutable turn parameters and initializes mutable state", () => {
-  const input = baseInput();
+  const input = baseInput({ approvalRequiredCapabilities: ["command"] });
   const context = createSubmitRuntimeContext(input);
 
   assert.equal(context.turnId, "turn-1");
@@ -115,6 +115,7 @@ test("submit runtime context carries immutable turn parameters and initializes m
   assert.equal(context.runSessionEpoch, "session-epoch-7");
   assert.equal(context.phaseLanguage, "zh");
   assert.equal(context.effectiveRunIntent, "execute");
+  assert.deepEqual(context.approvalRequiredCapabilities, ["command"]);
   assert.deepEqual(context.effectiveCommandDirective, input.effectiveCommandDirective);
   assert.deepEqual(context.options, input.options);
   assert.deepEqual(context.attachedFilesSnapshot, ["README.md"]);

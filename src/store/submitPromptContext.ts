@@ -46,6 +46,7 @@ export function buildOperationApprovalContinuationPrompt(params: {
   if (params.language === "en") {
     return [
       "The user approved real operations for this turn.",
+      "Task-level consent is not approval of a specific tool invocation; every call still follows its canonical review requirements and tool permissions.",
       summary ? `Reuse the previous proposal summary exactly as execution context: ${summary}` : "Reuse the immediately preceding proposal in this turn as execution context.",
       "Do not re-plan from scratch. Start the smallest necessary real tool actions now, then verify with actual tool results.",
       "Do not claim the work is fixed or complete unless there is tool evidence, a file diff/write result, a command result, or an explicit blocker.",
@@ -54,6 +55,7 @@ export function buildOperationApprovalContinuationPrompt(params: {
   }
   return [
     "用户已批准本轮真实操作。",
+    "任务级授权不代表任何具体工具调用已获批准；每次调用仍须遵守本轮规范审批要求与工具权限。",
     summary ? `请严格复用上一轮方案摘要作为执行上下文：${summary}` : "请复用本回合紧邻上一条方案作为执行上下文。",
     "不要重新从零规划。现在开始调用最小必要的真实工具操作，然后用实际工具结果验证。",
     "没有工具证据、文件 diff/写入结果、命令结果或明确阻塞时，不得声称已修复或已完成。",

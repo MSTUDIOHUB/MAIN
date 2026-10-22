@@ -1,4 +1,4 @@
-import type { AttachedFile } from "../lib/attachments";
+import { normalizeAttachedFile, type AttachedFile } from "../lib/attachments";
 import { saveProjectSession } from "../lib/ipc";
 import { withSubmitSessionPersistenceOwner } from "./persistSubmitRuntimeProjection";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
@@ -44,6 +44,8 @@ import {
 } from "./submitAttachmentContext";
 import { buildSubmitPromptContext } from "./submitPromptContext";
 import { resolveRuntimeV2SessionEpoch } from "./runtimeV2/sessionIdentity";
+import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2/checkpoint";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
 import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
@@ -119,6 +121,7 @@ export interface SubmitAsyncWorkflowRunState {
     reasoningDisplay?: string;
   };
   resolvedInstructionSet?: ResolvedInstructionSet | null;
+  runtimeV2Checkpoints?: unknown;
   startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
 }
 
@@ -1706,7 +1709,36 @@ export async function runSubmitAsyncWorkflowRun<
   const admissionState = input.sessionGet();
   const admissionTurn = admissionState.conversationTurns.find((turn) => turn.id === input.turnId);
   const runSessionEpoch = resolveRuntimeV2SessionEpoch(admissionState, input, admissionTurn || { id: input.turnId });
-  const attachmentContext = await (phaseRunners.buildAttachmentContext || buildSubmitAttachmentContext)({
+  const checkpointMap = admissionState.runtimeV2Checkpoints;
+  const checkpointCandidate = checkpointMap && typeof checkpointMap === "object" && !Array.isArray(checkpointMap)
+    ? (checkpointMap as Record<string, unknown>)[input.turnId] : undefined;
+  const checkpoint = normalizeRuntimeV2Checkpoint(checkpointCandidate, {
+    sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch, turnId: input.turnId,
+  });
+  if (checkpointCandidate !== undefined && !checkpoint) throw new Error("SUBMIT_BOOTSTRAP_CHECKPOINT_INVALID");
+  // A restored Turn's immutable objective wins over a missing or looser
+  // resubmission context. Legacy objective fields stay absent, never borrowed.
+  const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : input.semanticIntent?.forbiddenCapabilities;
+  const approvalRequiredCapabilities = checkpoint ? checkpoint.aggregate.objective.approvalRequiredCapabilities : input.semanticIntent?.approvalRequiredCapabilities;
+  // Bootstrap reads have no exact-call approval resolver. Defer project and
+  // attachment content to ordinary authorized tools when this Turn requires it.
+  const deferWorkspaceReads = normalizeTurnCapabilityRestrictions(capabilityRestrictions).includes("workspace_read") ||
+    normalizeTurnApprovalCapabilities(approvalRequiredCapabilities).includes("workspace_read");
+  const deferredReferences = deferWorkspaceReads ? [
+    ...input.mentionSnapshot.map((path) => ({ path })),
+    ...input.attachedFilesSnapshot.map((entry) => {
+      const file = normalizeAttachedFile(entry);
+      return { path: file.path, ...(file.workspace ? { workspace: file.workspace } : {}), ...(file.sourcePath ? { sourcePath: file.sourcePath } : {}) };
+    }),
+  ] : [];
+  const attachmentContext = deferWorkspaceReads ? {
+    userContent: deferredReferences.length ? [
+      input.text,
+      "[deferred_user_context]",
+      "These are file references only. Their contents have not been read. Ordinary tool authorization, including this Turn's restrictions and review requirements, still applies.",
+      JSON.stringify(deferredReferences),
+    ].join("\n\n") : input.text,
+  } : await (phaseRunners.buildAttachmentContext || buildSubmitAttachmentContext)({
     text: input.text,
     mentions: input.mentionSnapshot,
     files: input.attachedFilesSnapshot,
@@ -1774,19 +1806,24 @@ export async function runSubmitAsyncWorkflowRun<
   let resolvedInstructionSnapshot: ResolvedInstructionSet | null = null;
   let projectBaselineSnapshot: ProjectBaselineContext | null = null;
   let workspaceMcpSnapshot: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null = null;
+  const bootstrapWorkspace = deferWorkspaceReads ? "" : input.runWorkspace;
+  if (deferWorkspaceReads) input.logStoreEvent("workspace_read_bootstrap_deferred", {
+    turnId: input.turnId,
+    referenceCount: deferredReferences.length,
+  });
   if (input.refreshWorkspaceAdmission) {
     const admissionRefreshStartedAt = input.nowMs();
     try {
       const admission = await input.refreshWorkspaceAdmission(
-        input.runWorkspace,
+        bootstrapWorkspace,
         input.text,
       );
       resolvedInstructionSnapshot = admission.instructions;
-      projectBaselineSnapshot = admission.baseline;
+      projectBaselineSnapshot = deferWorkspaceReads ? null : admission.baseline;
       workspaceMcpSnapshot = admission.mcpSnapshot || null;
       input.logStoreEvent("workspace_admission_refreshed", {
         turnId: input.turnId,
-        workspace: input.runWorkspace || "global",
+        workspace: bootstrapWorkspace || "global",
         sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
         skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
         baselineFingerprint:
@@ -1805,12 +1842,12 @@ export async function runSubmitAsyncWorkflowRun<
     const instructionRefreshStartedAt = input.nowMs();
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
-        input.runWorkspace,
+        bootstrapWorkspace,
         input.text,
       );
       input.logStoreEvent("workspace_instructions_refreshed", {
         turnId: input.turnId,
-        workspace: input.runWorkspace || "global",
+        workspace: bootstrapWorkspace || "global",
         sourceCount: resolvedInstructionSnapshot?.sources.length || 0,
         skillCount: resolvedInstructionSnapshot?.skillCatalog?.entries.length || 0,
         explicitSkillIds:
@@ -1832,7 +1869,7 @@ export async function runSubmitAsyncWorkflowRun<
     }
   }
 
-  if (!input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
+  if (!deferWorkspaceReads && !input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
     const baselineRefreshStartedAt = input.nowMs();
     try {
       projectBaselineSnapshot = await input.refreshProjectBaseline(
@@ -1856,7 +1893,7 @@ export async function runSubmitAsyncWorkflowRun<
   // Runtime v2 consumes the typed baseline. Keep the legacy tree only as a
   // compatibility fallback when baseline construction was unavailable.
   let workspaceTree: string | null = null;
-  if (!projectBaselineSnapshot) {
+  if (!deferWorkspaceReads && !projectBaselineSnapshot) {
     const workspaceTreeStartedAt = input.nowMs();
     workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
     input.logStoreEvent("workspace_tree_ready", {
@@ -2054,7 +2091,8 @@ export async function runSubmitAsyncWorkflowRun<
     phaseLanguage,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
-    capabilityRestrictions: input.semanticIntent?.forbiddenCapabilities,
+    capabilityRestrictions,
+    approvalRequiredCapabilities,
     requiredCapabilities: input.semanticIntent?.requiredCapabilities,
     goalCreationAuthorization: input.goalCreationAuthorization,
     goalContinuationAuthorization: input.goalContinuationAuthorization,

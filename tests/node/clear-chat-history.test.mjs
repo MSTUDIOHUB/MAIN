@@ -132,7 +132,7 @@ function installReadOnlySemanticFixture(useAppStore, t) {
       content: JSON.stringify({
         semantic: { objective: "Inspect the replayed user request", workType: "investigate",
           answerFormat: "analysis", requiredCapabilities: ["workspace_read"],
-          forbiddenCapabilities: ["workspace_write", "command", "external_interaction"] },
+          forbiddenCapabilities: ["workspace_write", "command", "external_interaction"], approvalRequiredCapabilities: [] },
         confidence: 0.99, needsUserChoice: false,
       }),
       toolCalls: [], finishReason: "stop",

@@ -13,6 +13,7 @@ export interface RuntimeV2ReadOnlyLoopInput {
   readonly run: RuntimeV2RunIdentity;
   readonly objective: string;
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly signal: AbortSignal;
   readonly initial?: RuntimeV2ControllerSnapshot;
   readonly now: () => number;
@@ -37,6 +38,7 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
   if (!input.initial) await controller.admit({
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
     capabilityRestrictions: input.capabilityRestrictions,
+    approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     networkRead: input.networkRead, constraints: ["read_only", "no_external_side_effects"],
     acceptanceCriteria: ["current_complete_answer_without_unexecuted_actions"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
   });

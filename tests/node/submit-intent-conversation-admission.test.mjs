@@ -55,7 +55,7 @@ function route(text, autoApproveTools = false, expectedIntent = "respond") {
     effect: effects[0], preflight: {
       intent: expectedIntent, confidence: 0.98,
       semantic: { objective: text, workType: expectedIntent === "execute" ? "implement" : expectedIntent === "plan" ? "plan" : "answer",
-        answerFormat: "answer", requiredCapabilities: expectedIntent === "execute" ? ["workspace_read", "workspace_write"] : [], forbiddenCapabilities: [] },
+        answerFormat: "answer", requiredCapabilities: expectedIntent === "execute" ? ["workspace_read", "workspace_write"] : [], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
       commandDirective: { kind: expectedIntent === "execute" ? "file_modify" : "none", source: "preflight", requiresApproval: expectedIntent === "execute" },
     },
     latestInput: text, latestMainModeKey: "main_mode", isOriginSessionActive: true, isOriginOwnerCurrent: true,
