@@ -58,7 +58,6 @@ import {
 import {
   rejectRuntimeV2InvalidCorrectiveSourceRead,
   rejectRuntimeV2InvalidProviderToolArguments,
-  rejectRuntimeV2InvalidValidationCommand,
   rejectRuntimeV2UnexpectedProviderTool,
 } from "./executionProviderSurfaceRejection";
 
@@ -219,16 +218,6 @@ export function createRuntimeV2ProviderPort(
             result,
           });
           if (surfaceRejection) return surfaceRejection;
-          const validationCommandRejection =
-            rejectRuntimeV2InvalidValidationCommand({
-              ports: input,
-              command,
-              tools,
-              result,
-            });
-          if (validationCommandRejection) {
-            return validationCommandRejection;
-          }
           const argumentRejection =
             rejectRuntimeV2InvalidProviderToolArguments({
               ports: input,

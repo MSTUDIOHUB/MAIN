@@ -161,13 +161,12 @@ function runtimeV2ToolDefinition(
       function: {
         ...definition.function,
         description: [
-          "Run exactly one bounded acceptance command and wait for its exit status.",
+          "Run an authorized shell command and wait for its actual result; ordinary external actions remain available while validation is pending.",
           "The workspace root is already the execution directory; use cwd for a relative subdirectory and never prepend cd.",
-          "Use build, test, lint, typecheck, check, or a bounded inline assertion.",
+          "Only a finite build, test, lint, typecheck, check, or bounded inline assertion can provide acceptance validation. Ordinary actions and source inspections do not discharge file mutation validation debt.",
           exactValidationCommand
             ? `Use exactly the finite command sealed by the current validation authority: ${JSON.stringify(exactValidationCommand)}, with no redirection, pipe, tail, semicolon, echo, or wrapper.`
-            : "Do not append redirection, a pipe, tail, semicolon, echo, or an exit-code wrapper.",
-          "grep/find/cat/sed and other source inspection commands are not validation and will be rejected; use the dedicated read/search tools while they are advertised.",
+            : "Keep acceptance commands finite and preserve their failure exit status; do not append redirection, a pipe, tail, semicolon, echo, or an exit-code wrapper to a validator.",
         ].join(" "),
         parameters: exactValidationCommand
           ? {

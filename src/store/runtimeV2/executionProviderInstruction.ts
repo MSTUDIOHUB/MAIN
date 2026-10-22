@@ -333,6 +333,7 @@ export function providerModeInstruction(
         ? "VALIDATION_ACTION_WINDOW: repeated inspection or a no-effect attempt has closed the observation branch. Submit one advertised finite validation, or—only when the visible current source proves the implementation is incomplete—one bounded workspace mutation against that source. Collaboration and more inspection cannot replace this parent action."
         : "",
       "Validate the latest committed mutation now with a finite test, assertion, build, lint, typecheck, browser, or desktop interaction appropriate to the user's observable acceptance criteria.",
+      "Continue any still-needed authorized external actions through their advertised tools before the final check. Ordinary shell actions produce tool results and do not discharge the latest file mutation's validation debt.",
       toolSurface.executionContractAdvanceRequired
         ? "If the repair spans more files, continue with one contracted mutation now; otherwise validate. Runtime keeps validation debt attached to the newest commit."
         : "If the repair spans more files or the visible post-edit source proves work remains, continue with one exact source-backed mutation; Runtime returns to editing and keeps validation debt attached to the newest commit. Do not mutate merely to avoid a failing check. Safe reads remain available when a genuinely missing post-edit fact is required; a read or diff alone is not validation.",

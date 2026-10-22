@@ -77,7 +77,6 @@ export {
   runtimeV2ProviderActionWindowFor,
 } from "./executionProviderActionWindow";
 export {
-  correctiveFiniteValidationCommand,
   finiteValidationCommandRejection,
   type RuntimeV2FiniteValidationRejection,
 } from "./executionValidationCommand";

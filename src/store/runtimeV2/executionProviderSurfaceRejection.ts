@@ -19,16 +19,11 @@ import {
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
 import {
-  correctiveFiniteValidationCommand,
-  finiteValidationCommandRejection,
-} from "./executionValidationCommand";
-import {
   latestRuntimeV2CorrectiveMutationFailure,
   type RuntimeV2ProviderEffectFacts,
 } from "./executionProviderEffectFacts";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { deriveRuntimeV2ValidationCorrectionWindow } from "./executionValidationCorrection";
-import { preferredFiniteValidationCommand } from "./executionProviderContext";
 import {
   runtimeV2ProviderToolArgumentViolation,
 } from "./executionProviderTools";
@@ -185,56 +180,6 @@ export function rejectRuntimeV2InvalidProviderToolArguments(input: {
     reason: "tool_arguments_rejected",
     logData: {
       schemaViolation: violation.reason,
-    },
-  });
-}
-
-/** A validation-mode run_command is admitted by argument semantics, not by
- * its broad tool name. Source searches must not enter the ledger as ordinary
- * execute_tool effects while the phase is waiting for validation; otherwise
- * no validation.completed event exists to return a failed check to editing. */
-export function rejectRuntimeV2InvalidValidationCommand(input: {
-  readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly command: RuntimeV2Command;
-  readonly tools: readonly ToolDefinition[];
-  readonly result: RuntimeV2NormalizedProviderResult;
-}): RuntimeV2NormalizedProviderResult | null {
-  if (String(input.command.payload.mode || "").trim() !== "validate") {
-    return null;
-  }
-  const invalid = input.result.toolCalls.flatMap((call) => {
-    if (call.name !== "run_command") return [];
-    const command = String(
-      call.arguments.command || call.arguments.cmd || "",
-    ).trim();
-    const rejection = finiteValidationCommandRejection(command);
-    return rejection ? [{ call, command, rejection }] : [];
-  })[0];
-  if (!invalid) return null;
-  const correctiveCommand =
-    correctiveFiniteValidationCommand(invalid.command) ||
-    input.ports.live.correctiveValidationCommand ||
-    (typeof input.ports.get === "function"
-      ? preferredFiniteValidationCommand(input.ports)
-      : "");
-  input.ports.live.correctiveValidationCommand = correctiveCommand;
-  const feedback = [
-    "VALIDATION_COMMAND_REJECTED: this run_command does not preserve one finite acceptance exit status; no command ran.",
-    invalid.rejection.message,
-    correctiveCommand
-      ? `The workspace is already bound. Submit exactly ${JSON.stringify(correctiveCommand)} as command next, without cd, redirection, pipe, tail, semicolon, echo, or another wrapper.`
-      : "Use one bounded build, test, lint, typecheck, check, or inline assertion command (for example npm test, npm run build, cargo test, or a bounded node assertion), or use browser_evaluate for observable UI behavior.",
-    "Do not use grep/find/cat/sed to discharge validation debt and do not repeat the mutation while validation tools are the only advertised actions.",
-  ].join("\n");
-  return rejectedProviderResult({
-    ...input,
-    rejectedCall: invalid.call,
-    feedbackCode: "validation_command_rejected",
-    feedback,
-    reason: "validation_command_not_finite",
-    logData: {
-      rejectionReason: invalid.rejection.rejectionReason,
-      correctiveCommand: correctiveCommand || null,
     },
   });
 }
