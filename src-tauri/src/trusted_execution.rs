@@ -173,15 +173,9 @@ fn inspect_shell_command_with_workspace(
             "NUL bytes are not valid shell input",
         ));
     }
-    if command.contains(['\n', '\r']) {
-        return Err(ShellValidationError::critical(
-            ShellViolationKind::Newline,
-            None::<String>,
-            "multi-line shell input is not permitted",
-        ));
-    }
-
-    let raw_segments = split_structured_segments(trimmed)?;
+    // Scan the original bytes so leading/trailing shell newlines cannot be
+    // hidden by trim. Quoted line breaks are ordinary argument data.
+    let raw_segments = split_structured_segments(command)?;
     let mut segments = Vec::with_capacity(raw_segments.len());
     let mut overall_risk = TrustedExecutionRisk::Low;
     for (raw, connector_after) in raw_segments {
@@ -223,6 +217,13 @@ fn split_structured_segments(
 
     while index < chars.len() {
         let ch = chars[index];
+        if matches!(ch, '\n' | '\r') && (quote.is_none() || escaped) {
+            return Err(ShellValidationError::critical(
+                ShellViolationKind::Newline,
+                Some(current),
+                "unquoted shell line breaks and escaped line continuations are not permitted",
+            ));
+        }
         if escaped {
             current.push(ch);
             escaped = false;
@@ -1603,6 +1604,78 @@ mod tests {
                 fs::read_to_string(root.path().join("captured.txt")).unwrap(),
                 ""
             );
+        });
+    }
+
+    #[test]
+    fn quoted_newline_is_literal_argv_without_additional_shell_segments() {
+        for quote in ['\'', '"'] {
+            let body = "first line\nsecond line\r\nthird line";
+            let command = format!("printf '%s' {quote}{body}{quote}");
+            let inspection =
+                inspect_shell_command(&command).expect("quoted line breaks are argv data");
+            assert_eq!(inspection.segments.len(), 1);
+            assert_eq!(inspection.segments[0].words, ["printf", "%s", body]);
+            assert_eq!(inspection.command, command);
+        }
+        let script = "var score = 0;\nscore += 1;\n";
+        let inspection = inspect_shell_command(&format!("tool --eval '{script}'"))
+            .expect("multiline language snippets remain one argument");
+        assert_eq!(inspection.segments[0].words, ["tool", "--eval", script]);
+    }
+
+    #[test]
+    fn quoted_newline_keeps_unquoted_controls_and_expansion_rejected() {
+        for command in [
+            "printf ok\nprintf bad",
+            "printf ok\r\nprintf bad",
+            "\nprintf ok",
+            "printf ok\n",
+            "printf 'literal\nnewline'\nprintf bad",
+            "printf ok \\\nprintf bad",
+            "printf \"literal\\\ncontinuation\"",
+            "printf \"literal\n$(pwd)\"",
+            "printf \"literal\n$HOME\"",
+            "printf \"literal\n`pwd`\"",
+            "printf 'literal\n\0'",
+            "printf 'unterminated\n",
+            "printf \"unterminated\n",
+        ] {
+            inspect_shell_command(command).expect_err(command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quoted_newline_executes_literal_bytes_and_a_multiline_python_filter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = workspace();
+        runtime.block_on(async {
+            let body = "first line\nsecond line\r\nthird line";
+            let output = execute_trusted_shell(root.path(), root.path(), &format!("printf '%s' '{body}'"),
+                Duration::from_secs(2), None).await.expect("quoted bytes reach the real process unchanged");
+            assert!(output.success);
+            assert_eq!(output.stdout, body);
+            assert_eq!(output.stderr, "");
+            let command = r#"printf '%s' '{"data":{"items":[{"name":"pipeline","version":"0.9"}]}}' | python3 -c "
+import json,sys
+for item in json.load(sys.stdin)['data']['items']:
+    if 'pipeline' in item['name']:
+        print(item['name'] + ': ' + item['version'])
+""#;
+            let inspection = inspect_shell_command(command).expect("quoted Python is not a multiline shell program");
+            assert_eq!(inspection.segments.len(), 2);
+            assert_eq!(inspection.segments[0].connector_after, Some(ShellConnector::Pipe));
+            assert_eq!(inspection.segments[1].words[0..2], ["python3", "-c"]);
+            assert!(inspection.segments[1].words[2].starts_with("\nimport json,sys\n"));
+            let output = execute_trusted_shell(root.path(), root.path(), command,
+                Duration::from_secs(3), None).await.expect("a real Python filter can consume the pipeline");
+            assert!(output.success, "{}", output.stderr);
+            assert_eq!(output.stdout, "pipeline: 0.9\n");
+            assert_eq!(output.stderr, "");
         });
     }
 
