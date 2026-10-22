@@ -36,6 +36,7 @@ export interface SkillCatalogSnapshot {
 
 export interface LoadedSkillContent {
   readonly id: string;
+  readonly ref: string;
   readonly name: string;
   readonly description: string;
   readonly content: string;
@@ -45,6 +46,50 @@ export interface LoadedSkillContent {
   readonly version: string;
   readonly supportingFiles: readonly string[];
   readonly hostGuidance: string;
+  readonly disclosure: "full" | "overview" | "window";
+  readonly complete: boolean;
+  readonly partial: boolean;
+  readonly totalLines: number;
+  readonly totalChars: number;
+  readonly returnedRange: SkillSourceRange;
+  readonly requestedRangeComplete: boolean;
+  readonly nextStartLine: number | null;
+  readonly nextStartChar: number | null;
+  readonly sections: readonly SkillDocumentSection[];
+  readonly sectionCount: number;
+  readonly nextSectionCursor: string | null;
+}
+
+/** Source-character offsets use JS UTF-16 indexing, zero-based/end-exclusive.
+ * Line numbers are one-based and include every touched line, even a partial one. */
+export interface SkillSourceRange {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly startChar: number;
+  readonly endChar: number;
+}
+
+export interface SkillDocumentSection {
+  readonly id: string;
+  readonly title: string;
+  readonly level: number;
+  readonly startLine: number;
+  readonly endLine: number;
+  /** An unusually long heading may have an explicitly marked exact prefix. */
+  readonly titleTruncated?: boolean;
+}
+
+export interface SkillDisclosureOptions {
+  /** Run-owned source window/explicit-body budget; omission preserves full reads. */
+  readonly maxChars?: number;
+  readonly section?: string;
+  readonly startLine?: number;
+  readonly maxLines?: number;
+  /** Absolute source offset; use nextStartChar for continuation inside long lines. */
+  readonly startChar?: number;
+  readonly expectedVersion?: string;
+  /** Continue the revision-bound heading index without repeating source text. */
+  readonly sectionCursor?: string;
 }
 
 export interface SkillCatalogListOptions {
@@ -57,6 +102,7 @@ export interface SkillCatalogPage {
   readonly type: "skill.catalog";
   readonly entries: readonly {
     readonly id: string;
+    readonly ref: string;
     readonly name: string;
     readonly description: string;
     readonly source: SkillCatalogSource;
@@ -147,6 +193,132 @@ function stableContentVersion(content: string): string {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Compact model references resolve only against this immutable admission.
+ * Canonical ids remain the persistence/telemetry identity and stay accepted. */
+export function skillReference(snapshot: SkillCatalogSnapshot, skillId: string): string {
+  const hash = stableContentVersion(skillId);
+  const collisions = [...new Set(snapshot.entries
+    .filter((entry) => stableContentVersion(entry.id) === hash)
+    .map((entry) => entry.id))].sort();
+  return `s:${hash}${collisions.length > 1 ? `:${collisions.indexOf(skillId) + 1}` : ""}`;
+}
+
+export function resolveSkillId(
+  snapshot: SkillCatalogSnapshot | null | undefined,
+  reference: string,
+): string | null {
+  if (!snapshot) return null;
+  const value = String(reference || "").trim();
+  const exact = snapshot.entries.find((entry) => entry.id === value);
+  if (exact) return exact.id;
+  return snapshot.entries.find((entry) => skillReference(snapshot, entry.id) === value)?.id || null;
+}
+
+interface SkillSourceLine { readonly start: number; readonly end: number }
+
+function sourceLines(content: string): SkillSourceLine[] {
+  const lines: SkillSourceLine[] = [];
+  const endings = /\r\n|\n|\r/g;
+  let start = 0;
+  for (let match = endings.exec(content); match; match = endings.exec(content)) {
+    const end = match.index + match[0].length;
+    lines.push({ start, end });
+    start = end;
+  }
+  if (start < content.length) lines.push({ start, end: content.length });
+  return lines;
+}
+
+function documentSections(content: string, lines: readonly SkillSourceLine[]): SkillDocumentSection[] {
+  const headings: Array<Omit<SkillDocumentSection, "endLine">> = [];
+  let fence: { marker: string; length: number } | null = null;
+  let frontmatter = /^\uFEFF?---(?:\r?\n|\r)/.test(content);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = content.slice(lines[index]!.start, lines[index]!.end).replace(/[\r\n]+$/, "");
+    if (frontmatter) {
+      if (index > 0 && /^(?:---|\.\.\.)\s*$/.test(line)) frontmatter = false;
+      continue;
+    }
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (marker) {
+      if (!fence) fence = { marker: marker[1]![0]!, length: marker[1]!.length };
+      else if (marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^ {0,3}(#{1,6})[\t ]+(.+?)\s*$/);
+    if (!heading) continue;
+    headings.push({
+      id: `L${index + 1}`,
+      title: heading[2]!.replace(/[\t ]+#+[\t ]*$/, ""),
+      level: heading[1]!.length,
+      startLine: index + 1,
+    });
+  }
+  const sections = headings.map((heading) => ({ ...heading, endLine: lines.length }));
+  const parents: number[] = [];
+  for (let index = 0; index < sections.length; index += 1) {
+    while (parents.length && sections[parents[parents.length - 1]!]!.level >= sections[index]!.level) {
+      sections[parents.pop()!]!.endLine = sections[index]!.startLine - 1;
+    }
+    parents.push(index);
+  }
+  return sections;
+}
+
+function positiveSourceInteger(value: number | undefined, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`SKILL_RANGE_INVALID: ${label} must be a positive integer.`);
+  return value;
+}
+
+function relativeSupportingPaths(entry: SkillCatalogEntry): string[] {
+  const base = normalizeSlashPath(entry.basePath || "");
+  return entry.supportingFiles.map((raw) => {
+    const value = normalizeSlashPath(raw);
+    return base && value.startsWith(`${base}/`) ? value.slice(base.length + 1) : value;
+  });
+}
+
+function sectionIndexPage(
+  sections: readonly SkillDocumentSection[],
+  version: string,
+  maxChars: number | undefined,
+  cursor?: string,
+): { sections: SkillDocumentSection[]; nextSectionCursor: string | null } {
+  let start = 0;
+  if (cursor) {
+    const match = cursor.match(/^([a-f0-9]{8}):(\d+)$/);
+    start = match ? Number(match[2]) : NaN;
+    if (!match || match[1] !== version || !Number.isSafeInteger(start) || start >= sections.length) {
+      throw new Error("SKILL_SECTION_CURSOR_INVALID: restart the index from this admitted revision.");
+    }
+  }
+  const selected: SkillDocumentSection[] = [];
+  const limit = maxChars ?? Infinity;
+  for (const section of sections.slice(start)) {
+    const candidate = [...selected, section];
+    if (JSON.stringify(candidate).length <= limit) {
+      selected.push(section);
+      continue;
+    }
+    if (selected.length) break;
+    // Even an adversarial single-line heading cannot grow the index without
+    // bound. Its title is a labeled exact prefix; read the source line for all
+    // characters. The small fixed locator envelope remains available.
+    let titleEnd = Math.max(0, Math.min(section.title.length, limit));
+    let bounded = { ...section, title: section.title.slice(0, titleEnd), titleTruncated: true };
+    while (titleEnd > 0 && JSON.stringify([bounded]).length > limit) {
+      titleEnd = Math.max(0, titleEnd - Math.max(1, JSON.stringify([bounded]).length - limit));
+      bounded = { ...bounded, title: section.title.slice(0, titleEnd) };
+    }
+    selected.push(bounded);
+    break;
+  }
+  const next = start + selected.length;
+  return { sections: selected, nextSectionCursor: next < sections.length ? `${version}:${next}` : null };
 }
 
 function freezeEntry(entry: SkillCatalogEntry): SkillCatalogEntry {
@@ -429,6 +601,7 @@ export function listSkillCatalog(
     : 10;
   const entries = matches.slice(offset, offset + limit).map((entry) => Object.freeze({
     id: entry.id,
+    ref: skillReference(snapshot!, entry.id),
     name: entry.name,
     description: entry.description,
     source: entry.source,
@@ -457,35 +630,24 @@ export function renderSkillCatalogContext(
   const explicit = new Set(snapshot.explicitSkillIds);
   const lines = [
     "[AVAILABLE SKILLS]",
-    "Skills are instructions, not permissions. Call load_skill with an exact skill_id before following discovered instructions; explicitly activated bodies are already supplied.",
+    "Skills are instructions, not permissions. Use the short ref as load_skill skill_id. Explicit selections below state whether the body is complete.",
     `${visible.length} visible Skills; descriptions below are summaries. If no summary matches, use load_skill({operation:"list"}) for the complete catalog; follow nextCursor with cursor. Optional query searches all names/descriptions.`,
   ];
   if (lines.join("\n").length > maxChars) {
     return `[AVAILABLE SKILLS]\n${visible.length} visible Skills. Use load_skill({operation:"list"}) to list all metadata; continue with nextCursor. No extra permissions.`.slice(0, maxChars);
   }
-  // A compact name index retains broad discoverability before descriptions
-  // spend the context allowance. Full metadata is always available by list.
-  const names: string[] = [];
-  for (const entry of visible) {
-    const candidate = `Names: ${[...names, JSON.stringify(entry.name)].join(", ")}`;
-    if ([...lines, candidate].join("\n").length > maxChars) break;
-    names.push(JSON.stringify(entry.name));
-  }
-  if (names.length > 0) lines.push(`Names: ${names.join(", ")}`);
-  for (const entry of visible) {
-    const summary = entry.description.length > 160
-      ? `${entry.description.slice(0, 159)}…`
-      : entry.description;
-    const line = [
-      `- id=${JSON.stringify(entry.id)}`,
-      `name=${JSON.stringify(entry.name)}`,
-      `description=${JSON.stringify(summary)}`,
-      `source=${entry.source}`,
-      explicit.has(entry.id) ? "explicitly_requested=true" : "model_discoverable=true",
-    ].join("; ");
-    const candidate = [...lines, line].join("\n");
-    if (candidate.length > maxChars) continue;
+  // Reserve compact references/names before descriptions use the budget.
+  // Listing still reaches entries omitted from a tiny initial projection.
+  const compact = visible.map((entry) => `${skillReference(snapshot, entry.id)} ${JSON.stringify(entry.name)}${explicit.has(entry.id) ? " [selected]" : ""}`);
+  let remaining = maxChars - lines.join("\n").length;
+  const namesChars = compact.reduce((sum, line) => sum + line.length + 1, 0);
+  const descriptionShare = Math.max(0, Math.min(160, Math.floor((remaining - namesChars) / visible.length) - 3));
+  for (const [index, entry] of visible.entries()) {
+    const summary = entry.description.slice(0, descriptionShare);
+    const line = `${compact[index]}${summary ? `: ${summary}${summary.length < entry.description.length ? "…" : ""}` : ""}`;
+    if (line.length + 1 > remaining) continue;
     lines.push(line);
+    remaining -= line.length + 1;
   }
   return lines.join("\n");
 }
@@ -503,29 +665,84 @@ export function isSkillVisibleToModel(
   skillId: string,
 ): boolean {
   if (!snapshot) return false;
-  return modelVisibleEntries(snapshot).some((entry) => entry.id === skillId);
+  const id = resolveSkillId(snapshot, skillId);
+  return modelVisibleEntries(snapshot).some((entry) => entry.id === id);
 }
 
 export function loadSkillContent(
   snapshot: SkillCatalogSnapshot | null | undefined,
   skillId: string,
+  options: SkillDisclosureOptions = {},
 ): LoadedSkillContent {
-  const id = String(skillId || "").trim();
+  const id = resolveSkillId(snapshot, skillId);
   const entry = snapshot?.entries.find((candidate) => candidate.id === id);
   if (!entry) {
-    throw new Error(`SKILL_NOT_ADMITTED: ${id || "missing skill id"}`);
+    throw new Error(`SKILL_NOT_ADMITTED: ${skillId || "missing skill id"}`);
   }
+  if (options.expectedVersion !== undefined && options.expectedVersion !== entry.version) {
+    throw new Error(`SKILL_VERSION_MISMATCH: expected ${options.expectedVersion}; admitted ${entry.version}. Restart from this admitted revision.`);
+  }
+  const lines = sourceLines(entry.content);
+  const allSections = documentSections(entry.content, lines);
+  const maxChars = positiveSourceInteger(options.maxChars, "maxChars");
+  const maxLines = positiveSourceInteger(options.maxLines, "maxLines");
+  const requestedStartLine = positiveSourceInteger(options.startLine, "startLine");
+  const section = options.section ? allSections.find((candidate) => candidate.id === options.section) : null;
+  if (options.section && !section) throw new Error(`SKILL_SECTION_NOT_FOUND: ${options.section}`);
+  const windowRequested = !!section || requestedStartLine !== undefined || options.startChar !== undefined || maxLines !== undefined;
+  const indexOnly = options.sectionCursor !== undefined;
+  if (indexOnly && windowRequested) throw new Error("SKILL_RANGE_INVALID: read either a section index page or a source window.");
+  const overview = indexOnly || (!windowRequested && maxChars !== undefined && entry.content.length > maxChars);
+  const indexBudget = maxChars === undefined ? undefined : indexOnly ? maxChars : Math.floor(maxChars / 3);
+  const index = overview ? sectionIndexPage(allSections, entry.version, indexBudget, options.sectionCursor) : { sections: [], nextSectionCursor: null };
+  const indexChars = index.sections.length ? JSON.stringify(index.sections).length : 0;
+  const sourceBudget = maxChars === undefined ? undefined : Math.max(1, maxChars - indexChars);
+  const startLine = requestedStartLine ?? section?.startLine ?? 1;
+  if (startLine > lines.length) throw new Error(`SKILL_RANGE_INVALID: startLine exceeds ${lines.length} source lines.`);
+  if (section && (startLine < section.startLine || startLine > section.endLine)) {
+    throw new Error("SKILL_RANGE_INVALID: startLine is outside the requested section.");
+  }
+  const lineStart = lines[startLine - 1]?.start || 0;
+  const startChar = options.startChar ?? lineStart;
+  if (!Number.isSafeInteger(startChar) || startChar < lineStart || startChar >= (lines[startLine - 1]?.end ?? 0)) {
+    throw new Error("SKILL_RANGE_INVALID: startChar must be an absolute offset inside startLine; use the returned continuation.");
+  }
+  const firstBodySection = allSections.find((candidate) => candidate.level > 1) || allSections.find((candidate) => candidate.startLine > 1);
+  let desiredEnd = overview && firstBodySection
+    ? lines[firstBodySection.startLine - 1]!.start
+    : lines[(section?.endLine ?? lines.length) - 1]?.end ?? 0;
+  if (maxLines !== undefined) desiredEnd = Math.min(desiredEnd, lines[Math.min(lines.length, startLine + maxLines - 1) - 1]!.end);
+  // Without a preface, provide an initial exact source window, never an empty
+  // overview whose continuation cannot make progress.
+  if (desiredEnd <= startChar) desiredEnd = section ? lines[section.endLine - 1]!.end : entry.content.length;
+  const endChar = indexOnly ? startChar : Math.min(desiredEnd, startChar + (sourceBudget ?? entry.content.length));
+  const touchedEnd = endChar === startChar ? 0 : lines.findIndex((line) => line.end >= endChar) + 1;
+  const nextLine = endChar < entry.content.length ? lines.findIndex((line) => line.end > endChar) + 1 : null;
+  const complete = startChar === 0 && endChar === entry.content.length;
   return Object.freeze({
     id: entry.id,
+    ref: skillReference(snapshot!, entry.id),
     name: entry.name,
     description: entry.description,
-    content: entry.content,
+    content: entry.content.slice(startChar, endChar),
     source: entry.source,
     entryPath: entry.entryPath,
     basePath: entry.basePath,
     version: entry.version,
-    supportingFiles: Object.freeze([...entry.supportingFiles]),
+    supportingFiles: Object.freeze(relativeSupportingPaths(entry)),
     hostGuidance: SKILL_HOST_GUIDANCE,
+    disclosure: complete ? "full" : overview ? "overview" : "window",
+    complete,
+    partial: !complete,
+    totalLines: lines.length,
+    totalChars: entry.content.length,
+    returnedRange: Object.freeze({ startLine, endLine: touchedEnd, startChar, endChar }),
+    requestedRangeComplete: !indexOnly && endChar === desiredEnd,
+    nextStartLine: nextLine,
+    nextStartChar: nextLine === null ? null : endChar,
+    sections: Object.freeze(index.sections.map((heading) => Object.freeze(heading))),
+    sectionCount: allSections.length,
+    nextSectionCursor: index.nextSectionCursor,
   });
 }
 
@@ -540,7 +757,7 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Load an admitted Agent Skill by skill_id (default operation=load), returning its complete immutable SKILL.md and paths. Use operation=list with optional query to discover all visible metadata; pass nextCursor as cursor for later pages. Listing never returns bodies. No additional permissions; never executes Skill content.",
+        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions; continue with nextStartLine/nextStartChar and expected_version. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
       parameters: {
         type: "object",
         properties: {
@@ -551,9 +768,15 @@ export function buildLoadSkillToolDefinition(
           },
           skill_id: {
             type: "string",
-            enum: visible.map((entry) => entry.id),
-            description: "Required for load: exact Skill id from the catalog summary or a list result.",
+            description: "Required for load: short ref from the catalog, or an exact canonical id from a list result. Unknown or hidden entries are rejected.",
           },
+          section: { type: "string", description: "Optional exact section id from the Skill index, such as L15. Returns original source, never a generated summary." },
+          start_line: { type: "integer", description: "Optional one-based source line. Use nextStartLine for continuation; with section, it must stay within that section." },
+          max_lines: { type: "integer", description: "Optional positive source line window. The Run source budget also bounds the returned content." },
+          start_char: { type: "integer", description: "Optional absolute zero-based UTF-16 source offset inside start_line; use nextStartChar when continuing a partial line." },
+          max_chars: { type: "integer", description: "Optional smaller source-character window, bounded by the current Run budget." },
+          expected_version: { type: "string", description: "Pass the returned version on subsequent section/window reads; mismatched revisions are rejected." },
+          section_cursor: { type: "string", description: "Continue a heading index with nextSectionCursor. Returns another index page without repeating source text; do not combine with section or source ranges." },
           query: { type: "string", description: "Optional list filter over all visible names and descriptions. Omit to list every entry." },
           cursor: { type: "string", description: "List continuation: exact nextCursor from the previous page with the same query." },
           limit: { type: "integer", description: "Optional list page size, from 1 to 50; default 10." },
@@ -570,18 +793,36 @@ export function buildLoadSkillToolDefinition(
  * user-selected Skill. */
 export function renderExplicitSkillActivationContext(
   snapshot: SkillCatalogSnapshot | null | undefined,
+  options: Pick<SkillDisclosureOptions, "maxChars"> = {},
 ): string {
   if (!snapshot?.explicitSkillIds.length) return "";
-  const activated = snapshot.explicitSkillIds.map((id) => {
-    const loaded = loadSkillContent(snapshot, id);
+  let remaining = positiveSourceInteger(options.maxChars, "maxChars");
+  const activated = snapshot.explicitSkillIds.map((id, index) => {
+    const share = remaining === undefined ? undefined : Math.floor(remaining / (snapshot.explicitSkillIds.length - index));
+    const source = loadSkillContent(snapshot, id, { maxChars: share === 0 ? 1 : share });
+    const loaded = share === 0 ? {
+      ...source, content: "", complete: false, partial: true,
+      returnedRange: { startLine: 1, endLine: 0, startChar: 0, endChar: 0 },
+      nextStartLine: 1, nextStartChar: 0,
+      sections: [], nextSectionCursor: source.sectionCount ? `${source.version}:0` : null,
+    } : source;
+    if (remaining !== undefined) remaining = Math.max(0, remaining - loaded.content.length - (loaded.sections.length ? JSON.stringify(loaded.sections).length : 0));
     return [
-      `[EXPLICITLY ACTIVATED SKILL id=${JSON.stringify(loaded.id)} revision=${loaded.version}]`,
+      `[EXPLICITLY ACTIVATED SKILL ref=${loaded.ref} revision=${loaded.version} state=${loaded.complete ? "fully-loaded" : "selected-not-fully-loaded"}]`,
       `Name: ${loaded.name}`,
-      loaded.entryPath ? `Entry: ${loaded.entryPath}` : "Entry: panel-managed SKILL.md",
+      loaded.entryPath ? `Entry: ${loaded.entryPath.split(/[\\/]/).pop()}` : "Entry: panel-managed SKILL.md",
       loaded.basePath ? `Base directory: ${loaded.basePath}` : "Base directory: none",
       loaded.supportingFiles.length > 0
-        ? `Supporting files (read only when needed): ${loaded.supportingFiles.join(", ")}`
+        ? `Supporting files (partial index; relative to base, read only when needed): ${loaded.supportingFiles.join(", ")}`
         : "",
+      !loaded.complete ? [
+        `This Skill is selected, but its full instructions are not loaded. Total ${loaded.totalLines} lines / ${loaded.totalChars} UTF-16 characters. Read the relevant original sections with load_skill before applying them; this index is not a summary or proof of a full read.`,
+        `Source preface/window: lines ${loaded.returnedRange.startLine}-${loaded.returnedRange.endLine}; chars [${loaded.returnedRange.startChar},${loaded.returnedRange.endChar}). Continue with skill_id=${loaded.ref}, start_line=${loaded.nextStartLine}, start_char=${loaded.nextStartChar}, expected_version=${loaded.version}.`,
+        "Sections (id | lines | heading; nested ranges may overlap):",
+        ...loaded.sections.map((section) => `${section.id} | ${section.startLine}-${section.endLine} | ${section.title}${section.titleTruncated ? " [heading prefix; read source for complete heading]" : ""}`),
+        loaded.nextSectionCursor ? `More headings: load_skill skill_id=${loaded.ref}, section_cursor=${loaded.nextSectionCursor}, expected_version=${loaded.version}.` : "",
+        "[EXACT SOURCE PREFACE/WINDOW]",
+      ].join("\n") : "",
       loaded.content,
     ].filter(Boolean).join("\n");
   }).join("\n\n");

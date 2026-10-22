@@ -1,4 +1,5 @@
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
+import { skillCatalogContextCharBudget } from "../../lib/agentSkills";
 
 export function stringValue(value: unknown, max = 24_000): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
@@ -48,6 +49,20 @@ export function runtimeV2ContextBoundToolArguments(
     readonly parallelReadCount?: number;
   } = {},
 ): Record<string, unknown> {
+  if (toolName === "load_skill" && args.operation !== "list") {
+    const parallelReadCount = Math.max(1, Math.floor(Number(options.parallelReadCount) || 1));
+    const defaultWindow = skillCatalogContextCharBudget(budget?.contextLimit);
+    const sharedWindow = budget
+      ? Math.max(1, Math.floor(budget.readWindowChars / parallelReadCount))
+      : defaultWindow;
+    const requested = Number(args.max_chars);
+    return {
+      ...args,
+      max_chars: Number.isFinite(requested) && requested > 0
+        ? Math.min(Math.floor(requested), sharedWindow)
+        : Math.min(defaultWindow, sharedWindow),
+    };
+  }
   if (
     toolName !== "read_file" ||
     args.__raw === true ||
@@ -78,6 +93,6 @@ export function runtimeV2ParallelReadCount(
 ): number {
   return Math.max(
     1,
-    calls.filter((call) => call.name === "read_file").length,
+    calls.filter((call) => call.name === "read_file" || call.name === "load_skill").length,
   );
 }

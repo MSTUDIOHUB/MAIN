@@ -508,6 +508,26 @@ test("one resolved Run budget drives provider settings and read_file windows", (
   assert.ok(args.max_chars > 32_000);
 });
 
+test("Skill reference windows share the Run read budget and support explicit continuation", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768, providerContextLimit: 262_144,
+    modelLoaded: true, availableMemoryBytes: 12 * GIB,
+  });
+  const initial = executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" }, resolved);
+  assert.ok(initial.max_chars < resolved.readWindowChars, "the default reference entry should leave room for task evidence");
+  const calls = [{ name: "read_file" }, { name: "load_skill" }];
+  const parallelReadCount = executionText.runtimeV2ParallelReadCount(calls);
+  assert.equal(parallelReadCount, 2);
+  const continuation = executionText.runtimeV2ContextBoundToolArguments("load_skill", {
+    skill_id: "s:12345678", start_line: 100, expected_version: "12345678", max_chars: resolved.readWindowChars,
+  }, resolved, { parallelReadCount });
+  assert.equal(continuation.start_line, 100);
+  assert.equal(continuation.expected_version, "12345678");
+  assert.equal(continuation.max_chars, Math.floor(resolved.readWindowChars / 2));
+  const providerManaged = executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" });
+  assert.ok(providerManaged.max_chars > 0);
+});
+
 test("Runtime v2 preserves a complete admitted read window instead of truncating it again", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768,

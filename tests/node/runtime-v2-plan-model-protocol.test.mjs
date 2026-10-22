@@ -137,10 +137,9 @@ test("Plan discovers Skill metadata without preloading the body and offers load_
     (tool) => tool.function.name === "load_skill",
   );
   assert.ok(loadSkill);
-  assert.deepEqual(
-    loadSkill.function.parameters.properties.skill_id.enum,
-    ["panel:review"],
-  );
+  assert.equal(loadSkill.function.parameters.properties.skill_id.type, "string");
+  assert.equal(loadSkill.function.parameters.properties.skill_id.enum, undefined,
+    "Plan shares compact references and validates the admitted identity at execution");
 });
 
 test("Plan exposes only bounded read-only collaboration tools from live capacity", () => {

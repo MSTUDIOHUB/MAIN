@@ -265,6 +265,7 @@ async function runRuntimeV2Child(input: {
       ),
       renderExplicitSkillActivationContext(
         input.ports.context.skillCatalog,
+        { maxChars: skillCatalogContextCharBudget(input.ports.context.runtimeContextBudget?.contextLimit) },
       ),
       context ? `PARENT_CONTEXT_CAPSULE:\n${context}` : "",
     ].filter(Boolean).join("\n"),

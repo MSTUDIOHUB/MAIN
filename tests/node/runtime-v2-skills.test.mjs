@@ -107,6 +107,61 @@ test("Runtime v2 Execute provider receives Skill metadata but not the body befor
   assert.doesNotMatch(system, /EXECUTE_SKILL_BODY_SENTINEL/);
 });
 
+function longSkillCatalog() {
+  const base = skillCatalog();
+  return Object.freeze({
+    ...base,
+    entries: Object.freeze([Object.freeze({
+      ...base.entries[0],
+      content: "# Review workflow\nRead only the task-relevant reference sections.\n\n## Inspect\nInspect the actual result before claiming completion.\n\n## Reference\n" +
+        "UNRELATED_REFERENCE_BODY ".repeat(3_000),
+    })]),
+    explicitSkillIds: Object.freeze([base.entries[0].id]),
+  });
+}
+
+test("explicit long Skills enter Execute as transparent disclosure rather than an eager reference manual", () => {
+  const history = providerHistory.providerHistory({ messages: [] }, {
+    get: () => ({ conversationTurns: [{ id: "turn-skill", userPrompt: "Use $review-workflow to inspect the result.", uiVisibility: "visible" }] }),
+    context: {
+      turnId: "turn-skill", runWorkspace: "/repo", phaseLanguage: "en",
+      runtimeRunIntent: "execute", turnInputContextSignals: {},
+      skillCatalog: longSkillCatalog(),
+      runtimeContextBudget: { contextLimit: 32_000, inputBudget: 24_000, readWindowChars: 8_000 },
+    },
+  });
+  const system = String(history.messages[0]?.content || "");
+  assert.ok(system.length < 16_000, "a selected reference manual must not dominate the first decision");
+  assert.match(system, /review-workflow/);
+  assert.match(system, /Inspect/);
+  assert.match(system, /partial|not.fully.loaded|overview/i);
+  assert.doesNotMatch(system, /UNRELATED_REFERENCE_BODY/);
+});
+
+test("production load_skill returns bounded, versioned disclosure and loads an exact requested section", async () => {
+  const catalog = longSkillCatalog();
+  const raw = await skillExecutor.executeTool("load_skill", {
+    skill_id: catalog.entries[0].id, max_chars: 2_000,
+  }, "/repo", "session", { skillCatalog: catalog });
+  const overview = JSON.parse(raw);
+  assert.equal(overview.disclosure, "overview");
+  assert.equal(overview.complete, false);
+  assert.equal(overview.version, "cafe1234");
+  assert.ok(overview.sections.some((section) => section.title === "Inspect"));
+  assert.doesNotMatch(overview.content, /UNRELATED_REFERENCE_BODY/);
+  const section = overview.sections.find((entry) => entry.title === "Inspect");
+  const loaded = JSON.parse(await skillExecutor.executeTool("load_skill", {
+    skill_id: catalog.entries[0].id, section: section.id,
+    max_chars: 2_000, expected_version: overview.version,
+  }, "/repo", "session", { skillCatalog: catalog }));
+  assert.match(loaded.content, /Inspect the actual result before claiming completion/);
+  assert.doesNotMatch(loaded.content, /UNRELATED_REFERENCE_BODY/);
+  await assert.rejects(() => skillExecutor.executeTool("load_skill", {
+    skill_id: catalog.entries[0].id, start_line: 1,
+    max_chars: 2_000, expected_version: "stale",
+  }, "/repo", "session", { skillCatalog: catalog }), /VERSION/);
+});
+
 test("Runtime v2 authorization freezes load_skill as a read-only built-in for the admitted ids", () => {
   const frozen = authorization.createRuntimeV2ExecutionAuthorization(
     {
@@ -127,10 +182,9 @@ test("Runtime v2 authorization freezes load_skill as a read-only built-in for th
     (tool) => tool.function.name === "load_skill",
   );
   assert.ok(definition);
-  assert.deepEqual(
-    definition.function.parameters.properties.skill_id.enum,
-    ["panel:review"],
-  );
+  assert.equal(definition.function.parameters.properties.skill_id.type, "string");
+  assert.equal(definition.function.parameters.properties.skill_id.enum, undefined,
+    "the frozen catalog is enforced at execution, without duplicating every long id in the schema");
   const resolution = frozen.toolCatalog.lookup("load_skill");
   assert.equal(resolution.status, "resolved");
   assert.equal(resolution.entry.source, "built_in");
@@ -149,10 +203,8 @@ test("Runtime v2 children inherit the same frozen Skill ids", () => {
   }, skillCatalog());
   const loadSkill = tools.find((tool) => tool.function.name === "load_skill");
   assert.ok(loadSkill);
-  assert.deepEqual(
-    loadSkill.function.parameters.properties.skill_id.enum,
-    ["panel:review"],
-  );
+  assert.equal(loadSkill.function.parameters.properties.skill_id.type, "string");
+  assert.equal(loadSkill.function.parameters.properties.skill_id.enum, undefined);
 });
 
 test("the production Skill executor can browse every metadata page and load a later Skill", async () => {
@@ -194,6 +246,20 @@ test("metadata discovery has its own display target and never logs a Skill body 
   skillTelemetry.logRuntimeV2SkillLoad({ toolName: "load_skill", succeeded: true, rawOutput: JSON.stringify({ type: "skill.catalog", total: 34, entries: [] }), skillId: "", turnId: "turn", runId: "run", logStoreEvent: (type, payload) => events.push({ type, payload }) });
   assert.equal(events.some((entry) => entry.type === "runtime_v2_skill_loaded"), false);
   assert.equal(events[0]?.type, "runtime_v2_skill_catalog_listed");
+});
+
+test("partial Skill windows retain their canonical identity without claiming a complete activation", () => {
+  const events = [];
+  skillTelemetry.logRuntimeV2SkillLoad({
+    toolName: "load_skill", succeeded: true,
+    rawOutput: JSON.stringify({ type: "skill.loaded", id: "package:canonical", version: "12345678", complete: false, disclosure: "window", returnedRange: { startLine: 20, endLine: 30 } }),
+    skillId: "s:short", turnId: "turn", runId: "run",
+    logStoreEvent: (type, payload) => events.push({ type, payload }),
+  });
+  assert.equal(events[0].type, "runtime_v2_skill_disclosed");
+  assert.equal(events[0].payload.skillId, "package:canonical");
+  assert.equal(events[0].payload.complete, false);
+  assert.equal(events[0].payload.returnedRange.startLine, 20);
 });
 
 test("Plan discovery records Skill metadata as tool guidance without claiming a body was loaded", async () => {

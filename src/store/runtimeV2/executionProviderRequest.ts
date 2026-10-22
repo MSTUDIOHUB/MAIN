@@ -335,6 +335,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
       (total, message) => total + providerMessageChars(message),
       0,
     ),
+    approximateToolSchemaChars: JSON.stringify(providerTools).length,
     preferredValidationCommand: preferredValidation || null,
     allowedToolCount: providerTools.length,
     nativeToolCount: input.textEnvelope ? 0 : providerTools.length,

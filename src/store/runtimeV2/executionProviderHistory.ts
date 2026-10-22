@@ -404,6 +404,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   );
   const explicitSkills = renderExplicitSkillActivationContext(
     input.context.skillCatalog,
+    { maxChars: skillCatalogContextCharBudget(input.context.runtimeContextBudget?.contextLimit) },
   );
   const collaborationGuidance = buildSubagentDelegationGuidance({
     preference:

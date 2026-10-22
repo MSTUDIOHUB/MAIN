@@ -387,3 +387,182 @@ test("one protocol package admits every safe entry with per-entry bases and comb
   const single = await loadSkillCatalog({ workspace: "/repo", skills: [{ ...skill, entryPoints: ["skills/one/SKILL.md"] }] });
   assert.equal(single.entries[0].id, "package:unity");
 });
+
+test("explicit long Skills disclose their exact preface and section index without claiming a full load", async () => {
+  const api = await loadAgentSkillsModule({});
+  const lines = Array.from({ length: 632 }, (_, index) => `Original instruction ${index + 1}.`);
+  lines[0] = "# Reference workflow";
+  lines[4] = "## Inspect";
+  lines[9] = "```csharp";
+  lines[10] = "## THIS_IS_CODE_NOT_A_SECTION";
+  lines[11] = "```";
+  lines[299] = "## Modify";
+  lines[599] = "## Verify";
+  const content = `${lines.join("\r\n")}\r\n`;
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [{
+    id: "long", name: "reference-workflow", desc: "Inspect and modify a project.",
+    content, active: true,
+  }], userPrompt: "Please use $reference-workflow" });
+  const selected = api.renderExplicitSkillActivationContext(snapshot, { maxChars: 300 });
+  assert.match(selected, /selected-not-fully-loaded/);
+  assert.match(selected, /Sections|section_cursor/);
+  assert.doesNotMatch(selected, /THIS_IS_CODE_NOT_A_SECTION|Original instruction 632/);
+  assert.ok(selected.length < content.length / 4);
+  const loaded = api.loadSkillContent(snapshot, snapshot.entries[0].id, { maxChars: 300 });
+  assert.equal(loaded.disclosure, "overview");
+  assert.equal(loaded.complete, false);
+  assert.equal(loaded.partial, true);
+  assert.equal(loaded.totalLines, 632);
+  assert.equal(loaded.content, lines.slice(0, 4).join("\r\n") + "\r\n");
+  assert.ok(!loaded.sections.some((section) => section.title.includes("THIS_IS_CODE")));
+  const indexed = [...loaded.sections];
+  let sectionCursor = loaded.nextSectionCursor;
+  while (sectionCursor) {
+    const page = api.loadSkillContent(snapshot, snapshot.entries[0].id, { maxChars: 300, sectionCursor });
+    assert.equal(page.content, "", "index continuation must not repeat the source preface");
+    indexed.push(...page.sections);
+    sectionCursor = page.nextSectionCursor;
+  }
+  assert.ok(indexed.some((section) => section.id === "L300" && section.title === "Modify"));
+  assert.equal(api.loadSkillContent(snapshot, snapshot.entries[0].id).content, content,
+    "an unbudgeted legacy full read remains lossless");
+});
+
+test("budgeted Skill windows reconstruct CRLF source and long lines without loss, with revision checks", async () => {
+  const api = await loadAgentSkillsModule({});
+  const content = `# Workflow\r\n${"超长行🙂".repeat(180)}\r\n## Verify\r\nKeep final newline.\r\n`;
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [{
+    id: "crlf", name: "crlf", desc: "Lossless source.", content, active: true,
+  }] });
+  const entry = snapshot.entries[0];
+  let startLine = 1;
+  let startChar;
+  let reconstructed = "";
+  let reads = 0;
+  do {
+    const part = api.loadSkillContent(snapshot, entry.id, {
+      maxChars: 137, startLine, startChar, expectedVersion: entry.version,
+    });
+    assert.equal(part.version, entry.version);
+    assert.ok(part.content.length <= 137);
+    assert.equal(part.content, content.slice(part.returnedRange.startChar, part.returnedRange.endChar));
+    assert.equal(part.returnedRange.startChar, reconstructed.length);
+    reconstructed += part.content;
+    startLine = part.nextStartLine;
+    startChar = part.nextStartChar;
+    assert.ok(++reads < 40, "continuation must make forward progress");
+  } while (startChar !== null);
+  assert.equal(reconstructed, content);
+  assert.throws(() => api.loadSkillContent(snapshot, entry.id, {
+    maxChars: 137, startLine: 1, expectedVersion: "stale-revision",
+  }), /SKILL_VERSION_MISMATCH/);
+  assert.throws(() => api.loadSkillContent(snapshot, entry.id, { section: "L999" }), /SKILL_SECTION_NOT_FOUND/);
+  const section = api.loadSkillContent(snapshot, entry.id, { section: "L3", maxChars: 137 });
+  assert.equal(section.content, "## Verify\r\nKeep final newline.\r\n");
+  assert.equal(section.requestedRangeComplete, true);
+  assert.equal(section.complete, false);
+});
+
+test("oversized Skill prefaces report exact continuation and small Skills remain fully activated", async () => {
+  const api = await loadAgentSkillsModule({});
+  const long = `${"PREFACE ".repeat(150)}\n## Reference\nTAIL\n`;
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [
+    { id: "preface", name: "preface", desc: "Large preface.", content: long, active: true },
+    { id: "small", name: "small", desc: "Small workflow.", content: "EXACT_SMALL_BODY\r\n", active: true },
+  ], userPrompt: "Use $small and $preface" });
+  const overview = api.loadSkillContent(snapshot, "panel:preface", { maxChars: 100 });
+  assert.equal(overview.content, long.slice(0, overview.returnedRange.endChar));
+  assert.ok(overview.content.length > 0 && overview.content.length <= 100);
+  assert.equal(overview.nextStartChar, overview.content.length);
+  assert.equal(overview.nextStartLine, 1);
+  assert.equal(overview.requestedRangeComplete, false);
+  const activation = api.renderExplicitSkillActivationContext(snapshot, { maxChars: 100 });
+  assert.match(activation, /fully-loaded/);
+  assert.equal(activation.split("EXACT_SMALL_BODY").length - 1, 1);
+});
+
+test("compact Skill references preserve canonical identity and do not expose hidden skills or expand permissions", async () => {
+  const api = await loadAgentSkillsModule({});
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [
+    { id: "a".repeat(180), name: "duplicate", desc: "First.", content: "FIRST", active: true },
+    { id: "b".repeat(180), name: "duplicate", desc: "Second.", content: "SECOND", active: true },
+    { id: "hidden", name: "hidden", desc: "Manual.", content: "HIDDEN", active: true, allowImplicitInvocation: false },
+  ], userPrompt: "Use $duplicate" });
+  assert.deepEqual(snapshot.explicitSkillIds, [], "duplicate names are never guessed");
+  const page = api.listSkillCatalog(snapshot);
+  assert.equal(new Set(page.entries.map((entry) => entry.ref)).size, 2);
+  for (const listed of page.entries) {
+    assert.ok(listed.ref.length < 24);
+    assert.equal(api.loadSkillContent(snapshot, listed.ref).id, listed.id);
+    assert.equal(api.isSkillVisibleToModel(snapshot, listed.ref), true);
+  }
+  assert.equal(api.isSkillVisibleToModel(snapshot, "panel:hidden"), false);
+  assert.equal(api.isSkillVisibleToModel(snapshot, "s:unknown"), false);
+  const context = api.renderSkillCatalogContext(snapshot);
+  assert.doesNotMatch(context, /a{100}|b{100}|HIDDEN|Names:|model_discoverable/);
+  assert.match(context, /No additional permissions|not permissions/);
+  const schema = api.buildLoadSkillToolDefinition(snapshot).function.parameters;
+  assert.equal(schema.properties.skill_id.enum, undefined);
+  assert.ok(schema.properties.section && schema.properties.start_line && schema.properties.expected_version);
+});
+
+test("Skill model projections show supporting paths relative to their declared base", async () => {
+  const api = await loadAgentSkillsModule({
+    discoverPersonalAgentSkills: async () => [{
+      entryPath: "/personal/workflow/SKILL.md", basePath: "/personal/workflow",
+      content: "---\nname: path-workflow\ndescription: Test paths\n---\nBODY",
+      supportingFiles: ["/personal/workflow/references/deep.md", "/personal/workflow/scripts/check.js"],
+    }],
+  });
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [], userPrompt: "Use $path-workflow" });
+  const activation = api.renderExplicitSkillActivationContext(snapshot);
+  assert.match(activation, /Base directory: \/personal\/workflow/);
+  assert.match(activation, /references\/deep.md/);
+  assert.equal(activation.split("/personal/workflow").length - 1, 1);
+  assert.deepEqual(snapshot.entries[0].supportingFiles,
+    ["/personal/workflow/references/deep.md", "/personal/workflow/scripts/check.js"],
+    "canonical supporting paths remain unchanged in the frozen catalog");
+});
+
+test("large Skill section indexes are budgeted and paginated without hiding source", async () => {
+  const api = await loadAgentSkillsModule({});
+  const content = `# Workflow\nPreface\n${Array.from({ length: 300 }, (_, index) => `## Section ${index}: ${"title ".repeat(30)}\nExact body ${index}\n`).join("")}`;
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [{ id: "many", name: "many", desc: "Many sections.", content, active: true }], userPrompt: "Use $many" });
+  const overview = api.loadSkillContent(snapshot, "panel:many", { maxChars: 800 });
+  assert.ok(JSON.stringify(overview.sections).length + overview.content.length <= 800);
+  assert.equal(overview.sectionCount, 301);
+  assert.ok(overview.nextSectionCursor);
+  assert.ok(api.renderExplicitSkillActivationContext(snapshot, { maxChars: 800 }).length < 3000);
+  const seen = [...overview.sections];
+  let cursor = overview.nextSectionCursor;
+  while (cursor) {
+    const page = api.loadSkillContent(snapshot, "panel:many", { maxChars: 800, sectionCursor: cursor });
+    assert.ok(JSON.stringify(page.sections).length <= 800);
+    seen.push(...page.sections);
+    cursor = page.nextSectionCursor;
+    assert.ok(seen.length <= 301);
+  }
+  assert.equal(new Set(seen.map((section) => section.id)).size, 301);
+  assert.equal(api.loadSkillContent(snapshot, "panel:many", { section: seen.at(-1).id, maxChars: 800 }).content,
+    content.slice(content.indexOf("## Section 299:")));
+  assert.throws(() => api.loadSkillContent(snapshot, "panel:many", { sectionCursor: "ffffffff:2", maxChars: 800 }), /SKILL_SECTION_CURSOR_INVALID/);
+});
+
+test("short Skill reference collisions resolve deterministically and explicit selections share one source budget", async () => {
+  const api = await loadAgentSkillsModule({});
+  const skills = ["1t9y1uh", "1jton3x"].map((id, index) => ({
+    id, name: `selected-${index}`, desc: "Selected.", content: "Z".repeat(200), active: true,
+  }));
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: "Use $selected-0 and $selected-1" });
+  const refs = api.listSkillCatalog(snapshot).entries.map((entry) => entry.ref);
+  assert.notEqual(refs[0], refs[1]);
+  assert.ok(refs.every((ref) => ref.startsWith("s:507f6898:")));
+  const reordered = await api.loadSkillCatalog({ workspace: "", skills: [...skills].reverse() });
+  for (const entry of snapshot.entries) {
+    assert.equal(api.skillReference(snapshot, entry.id), api.skillReference(reordered, entry.id));
+  }
+  const activation = api.renderExplicitSkillActivationContext(snapshot, { maxChars: 50 });
+  assert.equal((activation.match(/Z/g) || []).length, 50);
+  const tiny = api.renderExplicitSkillActivationContext(snapshot, { maxChars: 1 });
+  assert.equal((tiny.match(/Z/g) || []).length, 1);
+});

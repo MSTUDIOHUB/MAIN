@@ -395,10 +395,21 @@ export async function executeTool(
     if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
       throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
     }
+    const loaded = loadSkillContent(options.skillCatalog, skillId, {
+      maxChars: parseOptionalNumber(args.max_chars),
+      section: parseOptionalString(args.section),
+      startLine: parseOptionalNumber(args.start_line),
+      maxLines: parseOptionalNumber(args.max_lines),
+      startChar: parseOptionalNumber(args.start_char),
+      expectedVersion: parseOptionalString(args.expected_version),
+      sectionCursor: parseOptionalString(args.section_cursor),
+    });
     return JSON.stringify({
       type: "skill.loaded",
-      ...loadSkillContent(options.skillCatalog, skillId),
-      effect: "instructions_loaded_no_additional_permissions",
+      ...loaded,
+      effect: loaded.complete === false
+        ? "instructions_partially_read_no_additional_permissions"
+        : "instructions_loaded_no_additional_permissions",
     });
   }
 

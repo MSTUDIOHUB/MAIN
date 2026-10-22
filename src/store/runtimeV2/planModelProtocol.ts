@@ -304,6 +304,7 @@ export function providerPlanMessages(input: {
   );
   const explicitSkills = renderExplicitSkillActivationContext(
     input.context.skillCatalog,
+    { maxChars: skillCatalogContextCharBudget(input.context.runtimeContextBudget?.contextLimit) },
   );
   const workspaceInstructions = String(
     input.context.workspaceInstructionContext || "",

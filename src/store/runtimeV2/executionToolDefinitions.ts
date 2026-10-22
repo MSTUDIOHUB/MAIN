@@ -149,6 +149,10 @@ export function logRuntimeV2SkillLoad(input: {
 }): void {
   if (input.toolName !== LOAD_SKILL_TOOL_NAME || !input.succeeded) return;
   let revision: string | null = null;
+  let skillId = input.skillId;
+  let complete = true;
+  let disclosure: string | null = null;
+  let returnedRange: unknown = null;
   try {
     const result = JSON.parse(String(input.rawOutput || ""));
     if (result.type === "skill.catalog") {
@@ -163,14 +167,21 @@ export function logRuntimeV2SkillLoad(input: {
       return;
     }
     revision = String(result.version || "") || null;
+    skillId = String(result.id || skillId);
+    complete = result.complete !== false;
+    disclosure = typeof result.disclosure === "string" ? result.disclosure : null;
+    returnedRange = result.returnedRange || null;
   } catch {
     revision = null;
   }
-  input.logStoreEvent("runtime_v2_skill_loaded", {
+  input.logStoreEvent(complete ? "runtime_v2_skill_loaded" : "runtime_v2_skill_disclosed", {
     turnId: input.turnId,
     runId: input.runId,
-    skillId: input.skillId,
+    skillId,
     revision,
-    effect: "instructions_only",
+    complete,
+    disclosure,
+    returnedRange,
+    effect: complete ? "instructions_only" : "partial_instructions_only",
   });
 }
