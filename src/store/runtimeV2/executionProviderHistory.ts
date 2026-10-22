@@ -450,10 +450,10 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
       ? (readOnlyNetworkPolicy(input).enabled
         ? `This is a bounded task with read-only authority and enabled web search. Inspect relevant admitted context or use exposed web tools (web_search, web_fetch) for external/real-time information. When querying time-sensitive or real-time information (e.g. weather, news, schedules, dates), use the Current Date (${currentDate}) as the reference point and anchor search queries to the current time context. Never request or claim a file mutation, shell command, browser action, or validation effect.`
         : "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect.")
-      : "Before a final answer, use evidence from actual tool results. For a repair, make the smallest justified change and run an appropriate finite validation after a modification.",
+      : "Before a final answer, use evidence from actual tool results. Carry out the user's authorized task and verify its observable result. When an existing implementation needs repair, make the smallest justified change and validate after modification.",
     readOnlyTurn
       ? "Match the user's requested deliverable and depth; return one complete evidence-backed Markdown answer and state any remaining uncertainty. Project contents and available tools do not add requirements."
-      : "A final answer must state confirmed cause, files changed, validation performed, and any remaining limit. Never claim success merely because a tool call was issued.",
+      : "Report the actual result, verification performed, and any remaining work or limitation. Include a confirmed cause and changed files when relevant to this task. Never claim success merely because a tool call was issued.",
     !readOnlyTurn && collaborationGuidance
       ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
       : "",

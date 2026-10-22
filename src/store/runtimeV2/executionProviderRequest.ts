@@ -203,6 +203,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         {
           hasReadFile: toolNames.has("read_file"),
           hasMutation: hasMutationTool,
+          hasCreateFile: toolNames.has("write_file"),
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
           hasMaterializedSourceEvidence:

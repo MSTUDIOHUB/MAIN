@@ -65,6 +65,12 @@ Skills remain supported for actual project-specific instructions.
   cannot reconstruct missing instructions. Restoring guidance does not restore
   a source lease, approval, or an old mutation request; pending Skill reads still
   pass through the ordinary tool execution and authorization path.
+- Existing-file source leases and new-file creation are different preconditions.
+  Reading project metadata does not select that file as an implementation
+  target. Ordinary creation uses the advertised file tool and its path/existence
+  checks; commands and Editor operations keep their own authorization checks.
+  Model instructions must not apply an existing-file edit lease to all of these
+  actions or imply that a new artifact needs nonexistent old source text.
 
 R21 demonstrated excessive up-front discovery and four document-target/version
 mistakes before cancellation, with no game mutation. A separate production
@@ -82,3 +88,14 @@ outbound HTTP body. The operator canceled at a pending discovery approval;
 no game was implemented or accepted. Loss of guidance is a confirmed harness
 defect, but it does not establish that every preceding discovery call was caused
 by compression.
+
+R27 verified that the first real pressure boundary retained all ten loaded
+Skill windows, including the bulk-builder section. It still performed extensive
+capability discovery before any artifact mutation. Inspection identified an
+instruction/executor mismatch: ordinary Execute guidance said to use only
+visible source for a mutation or validation, while the executor allows ordinary
+new-file creation without an existing-source lease. This mismatch is a concrete
+contract defect; it does not prove the cause of every model query. The operator
+canceled the last in-flight request after 196 ms to audit an approval setting
+change, later confirmed as the user's action. Its next decision was not observed,
+so this is not evidence of a natural infinite loop or failed game conclusion.

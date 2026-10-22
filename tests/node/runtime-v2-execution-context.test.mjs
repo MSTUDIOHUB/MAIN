@@ -3190,7 +3190,8 @@ test("source evidence never closes the ordinary inspect-edit surface by batch co
     hasMaterializedSourceEvidence: true,
     sourceOnlyFrontier: true,
   });
-  assert.match(prompt, /submit the mutation now/i);
+  assert.match(prompt, /advance the user's complete objective/i);
+  assert.match(prompt, /do not select the implementation targets or require a repair to the files already read/i);
   assert.doesNotMatch(prompt, /observation branch is closed/i);
   assert.doesNotMatch(prompt, /call record_execution_contract now/i);
 });
@@ -6800,13 +6801,14 @@ test("execution prompt stops asking for the same source after versioned evidence
     },
   }, "", surface);
 
-  assert.match(missing, /Read the exact existing file before changing it/);
-  assert.match(present, /Exact versioned source is visible/);
+  assert.match(missing, /Read the exact current target before modifying an existing file/);
+  assert.match(present, /For modifications to an existing file, use only its exact current source visible in this decision request/);
   assert.doesNotMatch(
     present,
-    /Read the exact existing file before changing it/,
+    /No existing-file source is visible yet/,
   );
-  assert.match(cachedOnly, /runtime cache but is not visible/);
+  assert.match(cachedOnly, /source is cached but is not visible/);
+  assert.match(cachedOnly, /does not authorize edits to those files/);
   assert.match(cachedOnly, /replay it without another disk read/);
 });
 
@@ -6841,9 +6843,9 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
     }],
   });
 
-  assert.match(prompt, /no committed workspace effect/i);
-  assert.match(prompt, /submit the mutation now/i);
-  assert.match(prompt, /missing path, range, or fact/i);
+  assert.match(prompt, /no recorded file mutation/i);
+  assert.match(prompt, /advance the user's complete objective/i);
+  assert.match(prompt, /specific missing fact that blocks the next authorized action/i);
   assert.match(prompt, /Safe reads remain available/i);
   assert.match(prompt, /editable_source/i);
   assert.match(prompt, /src\/main\.js/);
