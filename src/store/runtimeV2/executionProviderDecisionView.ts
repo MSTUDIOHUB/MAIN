@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
+import { boundRuntimeMessageGroupsToInputBudget } from "../../lib/runtimeContextBudget";
+import { computeContextBudgets, estimateMessagesTokens, type TrimMessage } from "../../lib/contextTrim";
 import type { RuntimeV2ProviderEffectFacts } from "./executionProviderEffectFacts";
 import {
   RUNTIME_V2_CONTEXT_ANCHOR_PREFIX,
@@ -653,20 +654,21 @@ export function buildRuntimeV2DecisionView(
 }
 
 /**
- * Build the semantic decision view first. The shared token budget is only a
- * final hard-cap guard for genuinely large current facts, never the target
- * size of the model's working set.
+ * Canonical history remains verbatim while it fits. Under real input pressure,
+ * select the semantic workset and evict complete groups without cropping bytes.
  */
 export function boundRuntimeV2ProviderConversation(
   messages: readonly AgentMessage[],
   options: {
     readonly contextLimit: number;
     readonly reservedOutputTokens: number;
+    readonly inputBudget?: number;
   },
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
-  return boundRuntimeMessagesToContext(
-    buildRuntimeV2DecisionView(messages, effects),
-    options,
-  );
+  const inputBudget = options.inputBudget ?? computeContextBudgets(
+    options.contextLimit, options.reservedOutputTokens,
+  ).inputBudget;
+  if (estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
+  return boundRuntimeMessageGroupsToInputBudget(buildRuntimeV2DecisionView(messages, effects), inputBudget);
 }

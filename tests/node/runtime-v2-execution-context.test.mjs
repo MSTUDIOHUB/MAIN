@@ -9002,6 +9002,9 @@ test("rejected actions retain one bounded causal anchor without executable templ
     ]),
     failedValidationToolCallIds: new Set(["validation-current"]),
   };
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  options.inputBudget = trim.estimateMessagesTokens(providerHistory.buildRuntimeV2DecisionView(buildMessages(50), effects));
+  assert.ok(trim.estimateMessagesTokens(buildMessages(50)) > options.inputBudget, "causal workset eviction requires actual pressure");
   const afterFifty =
     providerHistory.boundRuntimeV2ProviderConversation(
       buildMessages(50),
@@ -10404,6 +10407,160 @@ test("requestRuntimeV2ProviderOnce in conclude mode with context budget preserve
     );
   } finally {
     streaming.streamChatCompletion = originalStream;
+  }
+});
+
+function twoBatchCommandHistory() {
+  const batch = (prefix, commands, outputs) => [{
+    role: "assistant", content: `${prefix} command batch`, reasoning_content: `${prefix} reasoning`,
+    tool_calls: commands.map((command, index) => ({
+      id: `${prefix}-${index}`, type: "function",
+      function: { name: "run_command", arguments: JSON.stringify({ command }) },
+    })),
+  }, ...outputs.map((content, index) => ({ role: "tool", tool_call_id: `${prefix}-${index}`, content }))];
+  return [
+    { role: "system", content: "[MAIN RUNTIME V2] Keep original command output." },
+    { role: "user", runtimeTurnId: "t1", content: "Run the four commands and report their original output." },
+    ...batch("first", ["example --version", "example status --format json"], [
+      "exitCode: 0\n1.0.0-beta.13\n",
+      'exitCode: 0\n{"success":true,"data":{"count":1,"instances":[{"state":"ready"}]}}\n',
+    ]),
+    ...batch("second", ["example editor status", "example scene hierarchy"], [
+      'exitCode: 0\n{"compiling":false,"playMode":"stopped"}',
+      'exitCode: 0\n{"scene":"SampleScene","objects":["Main Camera"]}',
+    ]),
+  ];
+}
+
+test("provider conversation keeps every original command batch while the Run input allowance fits", () => {
+  const messages = twoBatchCommandHistory();
+  const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, {
+    contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 98_304,
+  });
+  assert.deepEqual(bounded, messages, "prior command facts and reasoning are canonical input, not pressure garbage");
+});
+
+test("provider conversation applies semantic workset only after its explicit input allowance is exceeded", () => {
+  const messages = twoBatchCommandHistory();
+  messages[3] = { ...messages[3], content: `${messages[3].content}${"old-output ".repeat(1_000)}` };
+  const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, {
+    contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 1_000,
+  });
+  assert.ok(!bounded.some((message) => message.tool_call_id === "first-0"));
+  assert.ok(bounded.some((message) => message.tool_call_id === "second-0"));
+  assert.ok(bounded.some((message) => message.role === "user" && message.runtimeTurnId === "t1"));
+  for (const message of bounded.filter((item) => item.role === "tool")) {
+    assert.ok(bounded.some((item) => item.tool_calls?.some((call) => call.id === message.tool_call_id)));
+  }
+});
+
+test("Execute request budgets the full wire shape before compacting canonical command receipts", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const captures = [];
+  let truncateNext = false;
+  streaming.streamChatCompletion = async (messages) => {
+    captures.push(messages);
+    if (truncateNext) {
+      truncateNext = false;
+      return { content: "Unfinished draft", semanticContent: "Unfinished draft", visibleText: "Unfinished draft", finishReason: "length", toolCalls: [], reasoningContent: "Incomplete internal reasoning", usage: null, diagnostics: [] };
+    }
+    return { content: "Reported.", semanticContent: "Reported.", visibleText: "Reported.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  try {
+    const tools = [{ type: "function", function: { name: "run_command", description: "A command tool. ".repeat(160), parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+    const original = twoBatchCommandHistory();
+    const invoke = async (inputBudget, recover = false) => {
+      truncateNext = recover;
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = structuredClone(original);
+      const events = [];
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://localhost:11434", apiKey: "", model: "test-model", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" },
+        live, logStoreEvent: (name, data) => events.push({ name, data }),
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "executing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute" } }, tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages.slice(0, original.length), original, "request projection never mutates canonical receipts");
+      return { messages: captures.at(-1), event: events.find((event) => event.name === "runtime_v2_context_prepared")?.data };
+    };
+    const roomy = await invoke(98_304);
+    assert.deepEqual(roomy.messages.slice(0, original.length), original);
+    assert.equal(roomy.event.removedDecisionMessages, 0);
+    const fullTokens = trim.estimateMessagesTokens(roomy.messages) + trim.estimateTokens(JSON.stringify(tools));
+    const conversationTokens = trim.estimateMessagesTokens(original);
+    const limitedBudget = fullTokens - 50;
+    assert.ok(conversationTokens < limitedBudget, "only the complete wire shape creates pressure");
+    const limited = await invoke(limitedBudget);
+    assert.ok(trim.estimateMessagesTokens(limited.messages) + trim.estimateTokens(JSON.stringify(tools)) <= limitedBudget);
+    assert.ok(!limited.messages.some((message) => message.tool_call_id === "first-0"));
+    assert.ok(limited.messages.some((message) => message.tool_call_id === "second-0"));
+    const recoveredBudget = fullTokens + 50;
+    const recovered = await invoke(recoveredBudget, true);
+    assert.ok(trim.estimateMessagesTokens(recovered.messages) + trim.estimateTokens(JSON.stringify(tools)) <= recoveredBudget, "same-request truncation recovery shares the complete Run allowance");
+    assert.match(recovered.messages.map((message) => message.content).join("\n"), /ACTION_OUTPUT_BUDGET_EXHAUSTED/);
+    for (const message of recovered.messages.filter((item) => item.role === "tool")) {
+      const canonical = original.find((item) => item.tool_call_id === message.tool_call_id);
+      assert.equal(message.content, canonical.content, "recovery pressure never crops retained receipts");
+    }
+  } finally { streaming.streamChatCompletion = originalStream; }
+});
+
+test("Execute pressure removes raw source authority with its whole receipt while forced snapshots keep surviving leases", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const facts = { ...originalFacts(null), sourceReadVersionsByToolCallId: new Map([["source", { target: "a.ts", version: "original-version" }]]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  let captured = [];
+  streaming.streamChatCompletion = async (messages) => {
+    captured = messages;
+    return { content: "Reported.", semanticContent: "Reported.", visibleText: "Reported.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  const source = "const a = 1;\r\n".repeat(1_200);
+  const original = [
+    { role: "system", content: "[MAIN RUNTIME V2] workspace authority" },
+    { role: "user", runtimeTurnId: "t1", content: "Inspect a.ts, run the command, then fix only with current source." },
+    { role: "assistant", content: "read source", tool_calls: [{ id: "source", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "source", content: source },
+    ...twoBatchCommandHistory().slice(-3),
+  ];
+  try {
+    const invoke = async (inputBudget, forced = false, envelope = false) => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = structuredClone(original);
+      if (envelope) live.messages[3].content = loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts")).formatReadFileWindowPayloadForModel("a.ts", {
+        content: source, contentVersion: "original-version", startLine: 1, endLine: 1_200, totalLines: 1_200, totalChars: source.length, returnedChars: source.length, truncated: false,
+      });
+      const canonical = structuredClone(live.messages);
+      if (forced) live.latestProviderActionWindow = "corrective_mutation";
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://localhost:11434", apiKey: "", model: "test-model", contextLimit: 122_880, provider: "ollama", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live, logStoreEvent: () => {},
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "executing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute" } }, tools: ["read_file", "replace_in_file", "run_command"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } })), textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages, canonical);
+      return { messages: captured, coverage: live.latestProviderRequestSourceCoverage };
+    };
+    const roomy = await invoke(98_304);
+    assert.equal(roomy.coverage[0]?.version, "original-version");
+    assert.equal(roomy.coverage[0]?.windows[0]?.content, source);
+    const limited = await invoke(2_000);
+    assert.equal(limited.coverage.length, 0);
+    assert.ok(!limited.messages.some((message) => message.tool_call_id === "source"));
+    assert.doesNotMatch(limited.messages.map((message) => message.content).join("\n"), /editable_source_v1|original-version/);
+    const forced = await invoke(98_304, true, true);
+    assert.equal(forced.coverage[0]?.version, "original-version", "presentation-only snapshots retain the surviving standard-pair lease");
+    assert.match(forced.messages.map((message) => message.content).join("\n"), /committed_source_snapshot_v1/);
+    assert.match(forced.messages.map((message) => message.content).join("\n"), /editable_source_v1/);
+    facts.invalidatedSourceReadToolCallIds.add("source");
+    const invalidated = await invoke(98_304);
+    assert.ok(invalidated.messages.some((message) => message.tool_call_id === "source"), "fits preserves historical source text");
+    assert.equal(invalidated.coverage.length, 0, "historical text cannot revive a ledger-invalidated write lease");
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
   }
 });
 

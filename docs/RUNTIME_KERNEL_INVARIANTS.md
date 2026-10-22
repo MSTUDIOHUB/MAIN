@@ -174,7 +174,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - `submitRuntimeRunner` 在 admission 后只解析一次 `RuntimeContextBudget`；Execute、Plan、Goal slice、Chat 和 child 共享同一个不可变对象。
 - 本地 Run 只有在 provider 同时报告所选模型的 context 上限且确认模型已加载时，才可在显式配置之上扩展；当前可用内存可以在该硬上限内降低容量。探测失败回退配置，不阻断 Turn。
 - 云 Run 保持 provider-managed context，不套用本机 KV 内存估算。
-- 输入未达到本轮 token 预算时不压缩消息；达到压力后按完整 assistant/tool 组回收旧上下文，并保留当前目标、最新证据包和尾部 phase authority。
+- 完整请求（消息、工具 schema 和尾部指令）未达到本轮输入 token 预算时，保留 canonical 消息原文；达到压力后才选择语义 workset，并按完整 assistant/tool 组回收旧上下文。保留当前目标、最新证据包和尾部 phase authority，不能裁短工具或源码正文后仍沿用原版本的完整读取授权。实际源码可见性和尾部授权说明必须依据最终发出的内容；同请求恢复也遵守此预算与保真边界。工具输出追加到后续请求、按上下文压力管理历史的参考见 [Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/)。
 - provider 的活动源码 workset 与 canonical transcript 分离：同一文件为获得完整语义而连续分页的窗口全部保留；跨文件为每个不同的语义桥保留最新前驱，使 caller→controller→view 链不会被裁成一条边，同时避免一个高频标识符把整个项目档案拖入每次请求。无关精确回执留在 ledger 中供缓存重放；最终仍由同一个 Run input-token budget 裁定，不使用固定文件数、轮次或模型名分支。
 - 同一 mutation boundary 内，如果模型显式缓存重放多个已被 workset 逐出的 same-version 源码，这些路径的真实原始 receipt 必须收敛进同一个受 Run input-token budget 约束的恢复工作集。不得在 A/B 文件之间交替逐出和重放，使多文件任务永远无法同时获得修改上下文；replay receipt 本身仍不产生新证据或 mutation authority。
 - Runtime 计算 materialized source、coverage 和 mutation lease 的 decision view 是一次请求的精确 wire payload。该请求必须标记为 caller-owned，provider adapter 不得在 gateway retry 时静默再截断或 aggressive compact；若精确 payload 无法发出，应把原始 provider 错误留作可恢复请求证据，不能根据未到达 wire 的源码授予写入。稳定的目标、规则与工具回执保留为请求前缀，当前决策 authority 与协议说明放在证据之后，不插断 assistant/tool 配对。只有 adapter-owned 的旧 Chat 请求可以继续使用 adapter 自有压缩。

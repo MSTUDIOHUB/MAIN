@@ -1,5 +1,5 @@
 import { boundReadOnlyHistory } from "./readOnlyHistory";
-import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
+import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
   deriveBudgetedStreamSettings,
   deriveProviderAdapterCapabilities,
@@ -21,7 +21,6 @@ import {
   appendRuntimeV2ProviderFeedbackHistory,
   aggregateForCurrentTurn,
   compactTextEnvelopeCatalog,
-  buildRuntimeV2DecisionView,
   boundRuntimeV2ProviderConversation,
   containsProviderTextEnvelopePrompt,
   deriveRuntimeV2ProviderEffectFacts,
@@ -116,19 +115,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     input.live.latestProviderActionWindow,
   );
   const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
-  const canonicalDecisionConversation = readOnly ? history.messages : budget
-    ? boundRuntimeV2ProviderConversation(
-        history.messages,
-        {
-          contextLimit: budget.contextLimit,
-          reservedOutputTokens: maxOutputTokens,
-        },
-        providerEffectFacts,
-      )
-    : buildRuntimeV2DecisionView(
-        history.messages,
-        providerEffectFacts,
-      );
+  const canonicalDecisionConversation = history.messages;
   input.live.latestProviderRequestSourceCoverage =
     materializedRuntimeV2SourceCoverage(
       canonicalDecisionConversation,
@@ -150,7 +137,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
       !Array.isArray(input.command.payload.effectPressure)
       ? input.command.payload.effectPressure as Record<string, unknown>
       : null;
-  const sourceOnlyFrontier =
+  let sourceOnlyFrontier =
     effectPressure?.reason === "source_only_frontier" &&
     input.live.latestProviderRequestSourceCoverage.length > 0;
   const recoveryPressure =
@@ -177,29 +164,30 @@ export async function requestRuntimeV2ProviderOnce(input: {
     ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
   const forceStructuredAction = structuredActionRequired;
-  const latestFeedbackIndex = canonicalDecisionConversation.map((message) =>
-    message.role === "system" && typeof message.content === "string" &&
-    message.content.startsWith("[runtime-v2 provider feedback:")
-  ).lastIndexOf(true);
-  const feedbackDraft = canonicalDecisionConversation[latestFeedbackIndex - 1];
-  const preserveFeedbackPair = latestFeedbackIndex > 0 &&
-    feedbackDraft?.role === "assistant" && !feedbackDraft.tool_calls?.length;
-  const boundedConversation = structuredActionRequired
-    ? [
+  const presentConversation = (conversation: typeof canonicalDecisionConversation) => {
+    const latestFeedbackIndex = conversation.map((message) =>
+      message.role === "system" && typeof message.content === "string" &&
+      message.content.startsWith("[runtime-v2 provider feedback:")
+    ).lastIndexOf(true);
+    const feedbackDraft = conversation[latestFeedbackIndex - 1];
+    const preserveFeedbackPair = latestFeedbackIndex > 0 &&
+      feedbackDraft?.role === "assistant" && !feedbackDraft.tool_calls?.length;
+    return structuredActionRequired ? [
         ...runtimeV2EvidenceOnlyDecisionConversation(
           preserveFeedbackPair
-            ? canonicalDecisionConversation.filter((_, index) =>
+            ? conversation.filter((_, index) =>
                 index !== latestFeedbackIndex - 1 && index !== latestFeedbackIndex
               )
-            : canonicalDecisionConversation,
+            : conversation,
         ),
         // Old executable action templates are omitted from forced decoding,
         // but the latest failed no-tool draft and its feedback remain causal.
         ...(preserveFeedbackPair
-          ? canonicalDecisionConversation.slice(latestFeedbackIndex - 1, latestFeedbackIndex + 1)
+          ? conversation.slice(latestFeedbackIndex - 1, latestFeedbackIndex + 1)
           : []),
       ]
-    : canonicalDecisionConversation;
+    : conversation;
+  };
   const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
     requested: input.toolChoice,
     tools: providerTools,
@@ -231,7 +219,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         reasoningRequest,
         preserveAssistantReasoning: false,
       };
-  const decisionInstruction = {
+  const decisionInstructionFor = (coverage: typeof input.live.latestProviderRequestSourceCoverage) => ({
     role: "system" as const,
     content: [
       aggregate?.strategy === "execute" && executionContract
@@ -246,10 +234,10 @@ export async function requestRuntimeV2ProviderOnce(input: {
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
           hasMaterializedSourceEvidence:
-            input.live.latestProviderRequestSourceCoverage.length > 0,
-          sourceOnlyFrontier,
+            coverage.length > 0,
+          sourceOnlyFrontier: effectPressure?.reason === "source_only_frontier" && coverage.length > 0,
           materializedSourceCoverage:
-            input.live.latestProviderRequestSourceCoverage,
+            coverage,
           actionWindow,
           executionContract: validationCorrection.active
             ? null
@@ -279,7 +267,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         structuredActionRequired,
       ),
     ].join(" "),
-  };
+  });
   const textEnvelopeInstructions = input.textEnvelope
     ? [{
         role: "system" as const,
@@ -299,6 +287,47 @@ export async function requestRuntimeV2ProviderOnce(input: {
     (Array.isArray(input.command.payload.allowedToolNames) && input.command.payload.allowedToolNames.length === 0);
   const concludePrompt =
     "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
+  const concludeInstructions = toolsClosed ? [{ role: "user" as const, content: concludePrompt }] : [];
+  const initialCoverage = input.live.latestProviderRequestSourceCoverage;
+  const inputBudget = budget ? budget.inputBudget ?? computeContextBudgets(budget.contextLimit, maxOutputTokens).inputBudget : null;
+  const toolSchemaTokens = estimateTokens(JSON.stringify(input.textEnvelope ? [] : providerTools));
+  const assembleExecuteRequest = (conversation: typeof canonicalDecisionConversation) => {
+    const sourceCoverage = materializedRuntimeV2SourceCoverage(
+      conversation, input.ports.context.runWorkspace || "", providerEffectFacts,
+    );
+    // Reserve both guidance shapes before pressure eviction. The empty-source
+    // branch may be longer than a short source anchor.
+    const fixedTokens = Math.max(...[sourceCoverage, []].map((coverage) =>
+      estimateMessagesTokens([decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions] as TrimMessage[])
+    ));
+    const presentationOverhead = Math.max(0,
+      estimateMessagesTokens(presentConversation(conversation) as TrimMessage[]) -
+      estimateMessagesTokens(conversation as TrimMessage[]),
+    );
+    const standard = budget && inputBudget !== null
+      ? boundRuntimeV2ProviderConversation(conversation, {
+          contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens,
+          inputBudget: inputBudget - toolSchemaTokens - fixedTokens - presentationOverhead,
+        }, providerEffectFacts)
+      : conversation;
+    const coverage = materializedRuntimeV2SourceCoverage(
+      standard, input.ports.context.runWorkspace || "", providerEffectFacts,
+    );
+    // All eviction precedes the existing exact-source snapshot presentation.
+    // No later Execute layer crops source bytes or revives omitted coverage.
+    const presented = presentConversation(standard);
+    const assembled = [...presented, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions];
+    const tokens = estimateMessagesTokens(assembled as TrimMessage[]) + toolSchemaTokens;
+    if (inputBudget !== null && tokens > inputBudget) {
+      input.live.latestProviderRequestSourceCoverage = [];
+      throw new Error("RUNTIME_CONTEXT_BUDGET_EXCEEDED: complete provider request exceeds the Run input budget");
+    }
+    return { standard, presented, messages: assembled, coverage, tokens };
+  };
+  const executeRequest = readOnly ? null : assembleExecuteRequest(canonicalDecisionConversation);
+  const standardConversation = executeRequest?.standard || canonicalDecisionConversation;
+  const boundedConversation = executeRequest?.presented || canonicalDecisionConversation;
+  const decisionInstruction = decisionInstructionFor(initialCoverage);
   const unboundedMessages = [
     // Keep stable instructions, objectives and receipt pairs as the cacheable
     // prefix. Per-decision authority and protocol guidance belong at the
@@ -312,15 +341,15 @@ export async function requestRuntimeV2ProviderOnce(input: {
     reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
     tools: providerTools,
   }) : unboundedMessages;
-  const messages =
+  const messages = executeRequest?.messages || (
     toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
       ? [...boundedMessages, { role: "user" as const, content: concludePrompt }]
-      : boundedMessages;
-  if (readOnly) {
-    input.live.latestProviderRequestSourceCoverage = materializedRuntimeV2SourceCoverage(
+      : boundedMessages);
+  input.live.latestProviderRequestSourceCoverage = executeRequest?.coverage || materializedRuntimeV2SourceCoverage(
       messages, input.ports.context.runWorkspace || "", providerEffectFacts,
     );
-  }
+  sourceOnlyFrontier = effectPressure?.reason === "source_only_frontier" && input.live.latestProviderRequestSourceCoverage.length > 0;
+  const estimatedInputTokens = estimateMessagesTokens(messages as TrimMessage[]) + toolSchemaTokens;
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
@@ -379,6 +408,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     forceStructuredAction,
     actionOnlyCharLimit: actionOnlyCharLimit || null,
     maxOutputTokens,
+    inputBudget,
+    estimatedInputTokens,
     reasoningRequest: requestSettings.reasoningRequest || null,
     effectPressureActionDecoding:
       reasoningRequest === "off" &&
@@ -388,7 +419,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     recoveryReasoningEscalated:
       reasoningRequest === "explicit" &&
       settings.reasoningRequest !== "explicit",
-    decisionViewApplied: !readOnly,
+    decisionViewApplied: !readOnly && (standardConversation.length !== canonicalDecisionConversation.length || standardConversation.some((message, index) => message !== canonicalDecisionConversation[index])),
     contextPolicy: readOnly ? "read_only_budget" : "execute_decision",
     canonicalConversationMessages: history.messages.length,
     removedDecisionMessages: Math.max(
@@ -509,19 +540,17 @@ export async function requestRuntimeV2ProviderOnce(input: {
         ...messages,
         ...input.live.messages.slice(recoveryHistoryStart),
       ];
-      const recoveryMessages = budget
-        ? readOnly
+      const recoveredExecuteRequest = readOnly ? null : assembleExecuteRequest([
+        ...canonicalDecisionConversation, ...input.live.messages.slice(recoveryHistoryStart),
+      ]);
+      const recoveryMessages = recoveredExecuteRequest?.messages || (budget
           ? boundReadOnlyHistory(unboundedRecoveryMessages, {
               contextLimit: budget.contextLimit,
               reservedOutputTokens: maxOutputTokens,
               tools: providerTools,
             })
-          : boundRuntimeMessagesToContext(unboundedRecoveryMessages, {
-              contextLimit: budget.contextLimit,
-              reservedOutputTokens: maxOutputTokens,
-            })
-        : unboundedRecoveryMessages;
-      input.live.latestProviderRequestSourceCoverage =
+        : unboundedRecoveryMessages);
+      input.live.latestProviderRequestSourceCoverage = recoveredExecuteRequest?.coverage ||
         materializedRuntimeV2SourceCoverage(
           recoveryMessages,
           input.ports.context.runWorkspace || "",

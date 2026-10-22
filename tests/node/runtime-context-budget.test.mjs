@@ -798,3 +798,38 @@ test("pressure compaction never drops a trailing phase authority instruction", (
     message.content === "fix the complete objective"
   ));
 });
+
+test("lossless Run pressure evicts complete tool batches across intervening anchors", () => {
+  const messages = [
+    { role: "system", content: "root authority" },
+    { role: "user", content: "current objective" },
+    { role: "assistant", content: "old batch", tool_calls: [
+      { id: "old-a", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+      { id: "old-b", type: "function", function: { name: "read_file", arguments: '{"path":"b.ts"}' } },
+    ] },
+    { role: "tool", tool_call_id: "old-a", content: "const a = 1;\r\n".repeat(1_200) },
+    { role: "system", content: "workspace authority anchor" },
+    { role: "tool", tool_call_id: "old-b", content: "const b = 2;\r\n".repeat(1_200) },
+    { role: "assistant", content: "latest command", tool_calls: [
+      { id: "current", type: "function", function: { name: "run_command", arguments: '{"command":"test"}' } },
+    ] },
+    { role: "tool", tool_call_id: "current", content: "exitCode: 0\noriginal receipt\r\n" },
+    { role: "system", content: "current phase authority" },
+  ];
+  const before = structuredClone(messages);
+  const bounded = budget.boundRuntimeMessageGroupsToInputBudget(messages, 1_000);
+  assert.deepEqual(messages, before);
+  assert.deepEqual(bounded, messages.filter((message) => message.content !== "old batch" && !["old-a", "old-b"].includes(message.tool_call_id)));
+  assert.equal(bounded.at(-2), messages.at(-2), "retained tool bytes remain identical objects");
+});
+
+test("lossless Run pressure rejects an oversized latest evidence packet instead of cropping source", () => {
+  const messages = [
+    { role: "system", content: "root authority" },
+    { role: "user", content: "current objective" },
+    { role: "assistant", content: "", tool_calls: [{ id: "source", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "source", content: "const a = 1;\r\n".repeat(1_200) },
+  ];
+  assert.throws(() => budget.boundRuntimeMessageGroupsToInputBudget(messages, 100), /RUNTIME_CONTEXT_BUDGET_EXCEEDED/);
+  assert.equal(messages.at(-1).content, "const a = 1;\r\n".repeat(1_200));
+});
